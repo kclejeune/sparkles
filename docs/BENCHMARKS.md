@@ -1671,7 +1671,9 @@ the offered schedule ([roadmap](ROADMAP.md) item 171).
 *The serial, writer and memory cells were measured on forge on 2026-10-23 at commit
 5b40d0ec, and the mixed cells on 2026-10-24 with the bounded full-text checkpoint.*
 
-**Serial commits.** The serial scenarios commit 2,000 single changes after 200 warmup
+#### Serial commits
+
+The serial scenarios commit 2,000 single changes after 200 warmup
 changes. A serial commit finds the group idle and takes the ordinary path, so both columns
 measure the same code. The paired ratio is the median over the ten pairs of a grouped
 process with its neighbouring ordinary process in the same block, and the gate asks for at
@@ -1710,7 +1712,9 @@ spatial literals at 10.5M, 0.240 against 0.213 ms, the cell that misses. Of the 
 medians, 19 are above 1.0, with a median of 1.001 and a sign test p value of 0.43, so the
 single-writer path shows no general cost.
 
-**Four writers.** The writer scenario sends 50,000 changes from four clients. The paired
+#### Four writers
+
+The writer scenario sends 50,000 changes from four clients. The paired
 ratio takes the median over the ten pairs of a grouped process with its neighbour in the
 same block, and the gate asks it to reach the required gain, which is 1.5 when the
 ordinary path's mean commit synchronization takes 1.2 ms or longer and falls in proportion
@@ -1735,7 +1739,9 @@ ordinary writer ran at 950 to 1,010 transactions/s in the first position of a bl
 spatial processes at 3,634 and 4,106 transactions/s ran in the fast state of the drive,
 where the mean synchronization was 0.44 ms, and barely move the medians.
 
-**Readers during writes.** The mixed scenario paces four writers at 60% of the slowest
+#### Readers during writes
+
+The mixed scenario paces four writers at 60% of the slowest
 unpaced process, the same offered rate for both settings, and two readers run the index
 query throughout, counting the matches of a text query or a spatial window. The medians
 pool the ten processes of each setting, the ratios are the paired medians of grouped to
@@ -1755,12 +1761,16 @@ averaged the drive's fast and slow states, and [roadmap](ROADMAP.md) item 171 co
 The text readers' paired ratios of 1.001 and 1.008 are within the gate and the spread of
 the runs, and [roadmap](ROADMAP.md) item 170 measures them with more rounds.
 
-**Memory.** Every cell stayed under the 64 MiB limit. The certified peak resident memory
+#### Memory
+
+Every cell stayed under the 64 MiB limit. The certified peak resident memory
 difference was between −3.4 and 19.6 MiB for the writer scenarios and between 0.3 and
 5.6 MiB for the mixed scenarios, where both settings run for the same time. The
 certificate subtracts the lower sampled bound of the ordinary process, so it errs upward.
 
-**Limits.** A block carries over its state. The drive's flush time lasts for minutes and
+#### Limits of these runs
+
+A block carries over its state. The drive's flush time lasts for minutes and
 crosses blocks, so ten processes are not ten independent draws, and the order of
 ordinary, grouped, grouped and ordinary cancels a linear drift but not what the previous
 process wrote. The embedding cell has no reader gate, and its worker called a
@@ -2313,7 +2323,9 @@ estimated thousand rows. The scans read `foaf:name` with `LIMIT` and `ex:city`, 
 
 <a id="batch-kernels-and-disk-spill"></a>
 
-**Batch kernels and disk spill.** The cursor's merge and hash joins, counts, groupings and
+#### Batch kernels and disk spill
+
+The cursor's merge and hash joins, counts, groupings and
 DISTINCT run on column kernels, and sorts, groupings, unordered DISTINCT, hash joins,
 merge-join runs and a DISTINCT below its ORDER BY can spill (X08 Phase 2). Spill is
 opt-in. A probe binary interleaved eager and cursor runs of each query in one process,
@@ -2350,7 +2362,9 @@ whole input with decoded keys, 580 MB in the ledger against 31 MB eagerly.
 
 <a id="automatic-exists"></a>
 
-**Groupings with EXISTS.** The cursor answers a FILTER EXISTS or NOT EXISTS from a key set
+#### Groupings with EXISTS
+
+The cursor answers a FILTER EXISTS or NOT EXISTS from a key set
 of its pattern. This comparison of eager and automatic execution ran with one Rayon thread,
 four A, B, B, A rounds and fresh servers per round, and both modes returned the same
 answers. The table gives the median server execution time of automatic execution divided
@@ -2417,7 +2431,9 @@ at the root. The spilled joins wrote 95 to 150 MB a second. `--spill encrypted` 
 
 <a id="parallel-cursor-filters"></a>
 
-**Parallel cursor filters.** A cursor filter over an index scan reads the scan in morsels
+#### Parallel cursor filters
+
+A cursor filter over an index scan reads the scan in morsels
 of whole blocks and filters each morsel in parallel
 ([X05](specs/X05-streaming-query-execution.md#parallel-cursor-filters-2026-10-18)). The
 table gives the cursor's time divided by the eager time over 10.5M triples, the median of

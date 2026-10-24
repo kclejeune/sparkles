@@ -367,13 +367,17 @@ The options are the ones of `scripts/bench.sh`, which are `ENGINES`, `QUERIES`, 
 sample. The suites default to the ports from 28300, and the long write harness to the
 ports from 28400, below the ephemeral range.
 
-**Timeouts.** `MAX_TIME` is the longest a request may take, and each suite sets its own
+#### Timeouts
+
+`MAX_TIME` is the longest a request may take, and each suite sets its own
 default. The clients give up after `MAX_TIME`, and every server's query timeout is
 `MAX_TIME` plus a margin of 15 seconds (`TIMEOUT_MARGIN`), so a server stops a query that
 the client has abandoned. A run that fails after taking as long as `MAX_TIME` is recorded
 as a `timeout`, whichever side stopped it.
 
-**Probes and restarts.** After the start of each engine's server, every selected query runs
+#### Probes and restarts
+
+After the start of each engine's server, every selected query runs
 once untimed, and then hyperfine's warm-ups and timed runs follow. Every timing loop, in
 these suites and in `scripts/bench.sh`, `scripts/bench-watdiv.sh` and
 `scripts/bench-billion.sh`, also sends each query once more untimed just before hyperfine
