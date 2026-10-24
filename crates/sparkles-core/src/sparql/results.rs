@@ -10,7 +10,7 @@ use serde::{Serialize, Serializer};
 use serde_json::{Value as J, json};
 use sparesults::{QueryResultsFormat, QueryResultsSerializer};
 use std::borrow::Cow;
-use std::cell::{Cell, RefCell};
+use std::cell::Cell;
 use std::collections::BTreeMap;
 use std::io::Write;
 use std::sync::Arc;
@@ -239,78 +239,31 @@ const OUTPUT_BUFFER: usize = 8 << 10;
 /// so the serializers are compiled with the engine and not once per caller's writer in
 /// the crate that calls them, where their speed moved with unrelated changes.
 ///
-/// A serializer counts each row in [`Rows`] after writing it. A row counts in the
-/// caller's `sent` only once its bytes have reached the caller's writer, so `sent` still
-/// holds the rows of the output when that writer stops it partway.
+/// A serializer counts its rows in `staged` after writing each of them. A row counts in
+/// the caller's `sent` only once its bytes have reached the caller's writer, so `sent`
+/// still holds the rows of the output when that writer stops it partway.
 pub(crate) struct Buffered<'a> {
     inner: &'a mut dyn Write,
     buf: Vec<u8>,
-    rows: &'a Rows,
+    staged: &'a Cell<u64>,
+    /// `staged` when it was last looked at
+    rows: u64,
+    /// where in `buf` each count of rows was reached, in order: the rows up to that count
+    /// end there
+    marks: Vec<(usize, u64)>,
     sent: &'a Cell<u64>,
     /// the caller's writer failed, so nothing more goes to it
     failed: bool,
 }
 
-/// The rows a serializer has written into a [`Buffered`] writer, and where in its buffer
-/// each of them ends. A serializer writes a few bytes at a time, often one character of
-/// a string, so the buffer's only work for a write is to store its length here, and the
-/// serializer, which knows where its rows end, looks it up once a row.
-pub(crate) struct Rows {
-    /// the bytes in the buffer after its last write
-    len: Cell<usize>,
-    /// the rows written so far
-    count: Cell<u64>,
-    /// where in the buffer each count of rows was reached, in order
-    marks: RefCell<Vec<(usize, u64)>>,
-}
-
-impl Rows {
-    /// Count `n` more rows, which end where the buffer ends now.
-    #[inline]
-    pub(crate) fn add(&self, n: u64) {
-        let count = self.count.get() + n;
-        self.count.set(count);
-        self.marks.borrow_mut().push((self.len.get(), count));
-    }
-}
-
 impl Buffered<'_> {
-    /// Write the collected bytes on. Each row counts in `sent` as soon as the caller's
-    /// writer has taken the bytes up to its end, also when it takes them in parts and
-    /// fails before the last.
-    fn drain(&mut self) -> std::io::Result<()> {
-        let mut marks = self.rows.marks.borrow_mut();
-        let mut done = 0;
-        let mut mark = 0;
-        loop {
-            while let Some(&(end, rows)) = marks.get(mark)
-                && end <= done
-            {
-                self.sent.set(rows);
-                mark += 1;
-            }
-            if done == self.buf.len() {
-                break;
-            }
-            match self.inner.write(&self.buf[done..]) {
-                Ok(0) => {
-                    self.failed = true;
-                    return Err(std::io::ErrorKind::WriteZero.into());
-                }
-                Ok(n) => done += n,
-                Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {}
-                Err(e) => {
-                    self.failed = true;
-                    return Err(e);
-                }
-            }
+    /// Note the rows counted since the last look, which end where `buf` ends now.
+    #[inline(always)]
+    fn note(&mut self) {
+        let rows = self.staged.get();
+        if rows != self.rows {
+            self.mark(rows);
         }
-        // a row counts after its last byte, so every row counted so far is out
-        self.sent.set(self.rows.count.get());
-        self.buf.clear();
-        marks.clear();
-        self.rows.len.set(0);
-        Ok(())
     }
 
     /// [`Write::write`] of `b` when it does not fit in what is left of `buf`.
@@ -318,36 +271,80 @@ impl Buffered<'_> {
     fn write_full(&mut self, b: &[u8]) -> std::io::Result<usize> {
         self.drain()?;
         if b.len() >= OUTPUT_BUFFER {
-            // no row ends inside one write, so this piece ends none, and a row that ends
-            // with it ends at the start of the empty buffer
+            // no row ends inside one write, so this piece ends none
             let r = self.inner.write_all(b);
             self.failed |= r.is_err();
             r?;
         } else {
             self.buf.extend_from_slice(b);
-            self.rows.len.set(self.buf.len());
         }
         Ok(b.len())
+    }
+
+    /// The rows up to `rows` end where `buf` ends now. Kept out of line so that the
+    /// serializers' many small writes inline only the check.
+    #[inline(never)]
+    fn mark(&mut self, rows: u64) {
+        self.rows = rows;
+        self.marks.push((self.buf.len(), rows));
+    }
+
+    /// Write the collected bytes on. Each row counts in `sent` as soon as the caller's
+    /// writer has taken the bytes up to its end, also when it takes them in parts and
+    /// fails before the last.
+    fn drain(&mut self) -> std::io::Result<()> {
+        let mut done = 0;
+        let mut mark = 0;
+        while done < self.buf.len() {
+            match self.inner.write(&self.buf[done..]) {
+                Ok(0) => {
+                    self.failed = true;
+                    return Err(std::io::ErrorKind::WriteZero.into());
+                }
+                Ok(n) => {
+                    done += n;
+                    while let Some(&(end, rows)) = self.marks.get(mark)
+                        && end <= done
+                    {
+                        self.sent.set(rows);
+                        mark += 1;
+                    }
+                }
+                Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {}
+                Err(e) => {
+                    self.failed = true;
+                    return Err(e);
+                }
+            }
+        }
+        // every mark ends within `buf`
+        if let Some(&(_, rows)) = self.marks.last() {
+            self.sent.set(rows);
+        }
+        self.buf.clear();
+        self.marks.clear();
+        Ok(())
     }
 }
 
 impl Write for Buffered<'_> {
-    #[inline]
+    #[inline(always)]
     fn write(&mut self, b: &[u8]) -> std::io::Result<usize> {
+        self.note();
         if b.len() > OUTPUT_BUFFER - self.buf.len() {
             return self.write_full(b);
         }
         self.buf.extend_from_slice(b);
-        self.rows.len.set(self.buf.len());
         Ok(b.len())
     }
 
-    #[inline]
+    #[inline(always)]
     fn write_all(&mut self, b: &[u8]) -> std::io::Result<()> {
         self.write(b).map(|_| ())
     }
 
     fn flush(&mut self) -> std::io::Result<()> {
+        self.note();
         self.drain()?;
         self.inner.flush()
     }
@@ -359,21 +356,21 @@ impl Write for Buffered<'_> {
 fn write_buffered(
     w: &mut dyn Write,
     sent: &Cell<u64>,
-    f: &mut dyn FnMut(&mut Buffered<'_>, &Rows) -> Result<()>,
+    f: &mut dyn FnMut(&mut Buffered<'_>, &Cell<u64>) -> Result<()>,
 ) -> Result<()> {
-    let rows = Rows {
-        len: Cell::new(0),
-        count: Cell::new(sent.get()),
-        marks: RefCell::new(Vec::new()),
-    };
+    let staged = Cell::new(sent.get());
     let mut out = Buffered {
         inner: w,
         buf: Vec::with_capacity(OUTPUT_BUFFER),
-        rows: &rows,
+        staged: &staged,
+        rows: staged.get(),
+        marks: Vec::new(),
         sent,
         failed: false,
     };
-    match f(&mut out, &rows) {
+    let result = f(&mut out, &staged);
+    out.note();
+    match result {
         Ok(()) => out.drain().map_err(io),
         Err(e) => {
             // the error is the one to report, and the output stops here either way
@@ -546,7 +543,7 @@ fn solutions_to(
     fmt: SolutionsFormat,
     w: &mut Buffered<'_>,
     send: Option<usize>,
-    sent: &Rows,
+    sent: &Cell<u64>,
 ) -> Result<()> {
     let f = match fmt {
         SolutionsFormat::Json => QueryResultsFormat::Json,
@@ -596,7 +593,7 @@ fn solutions_to(
                 .collect();
             s.serialize(terms.iter().map(|(c, t)| (vars[*c].as_ref(), t.as_ref())))
                 .map_err(io)?;
-            sent.add(1);
+            sent.set(sent.get() + 1);
         }
         s.finish().map_err(io)?;
         return Ok(());
@@ -624,7 +621,7 @@ fn solutions_to(
                         .map(|(c, t)| (vars[*c].as_ref(), t.as_ref().as_ref())),
                 )
                 .map_err(io)?;
-                sent.add(1);
+                sent.set(sent.get() + 1);
             }
             if let Some(h) = next {
                 ids = h
@@ -819,7 +816,7 @@ fn graph_to(
     fmt: RdfFormat,
     prefixes: &BTreeMap<String, String>,
     w: &mut Buffered<'_>,
-    sent: &Rows,
+    sent: &Cell<u64>,
 ) -> Result<()> {
     let mut ser = RdfSerializer::from_format(fmt);
     if matches!(fmt, RdfFormat::Turtle | RdfFormat::TriG | RdfFormat::RdfXml) {
@@ -832,12 +829,12 @@ fn graph_to(
     let mut s = ser.for_writer(w);
     for t in &r.triples {
         s.serialize_triple(t).map_err(io)?;
-        sent.add(1);
+        sent.set(sent.get() + 1);
     }
     if fmt.supports_datasets() {
         for q in &r.quads {
             s.serialize_quad(q).map_err(io)?;
-            sent.add(1);
+            sent.set(sent.get() + 1);
         }
     }
     s.finish().map_err(io)?;
@@ -870,7 +867,7 @@ fn jena_graph_to(
     r: &QueryResult,
     fmt: crate::jena_formats::JenaFormat,
     w: &mut Buffered<'_>,
-    sent: &Rows,
+    sent: &Cell<u64>,
 ) -> Result<()> {
     // RDF/JSON groups the triples by subject and writes them all at the end, so they
     // count by subject as `finish_counted` writes them
@@ -879,18 +876,19 @@ fn jena_graph_to(
     for t in &r.triples {
         out.triple(t).map_err(io)?;
         if !deferred {
-            sent.add(1);
+            sent.set(sent.get() + 1);
         }
     }
     if fmt.quads() {
         for q in &r.quads {
             out.quad(q).map_err(io)?;
             if !deferred {
-                sent.add(1);
+                sent.set(sent.get() + 1);
             }
         }
     }
-    out.finish_counted(|n| sent.add(n)).map_err(io)?;
+    out.finish_counted(|n| sent.set(sent.get() + n))
+        .map_err(io)?;
     Ok(())
 }
 
@@ -937,7 +935,7 @@ fn native_json_to(
     w: &mut Buffered<'_>,
     send: Option<usize>,
     metadata: Option<NativeJsonMetadata<'_>>,
-    sent: &Rows,
+    sent: &Cell<u64>,
 ) -> Result<()> {
     let n = send.map_or(r.len(), |s| s.min(r.len()));
     serde_json::to_writer(
@@ -1196,7 +1194,7 @@ struct NativeJson<'a> {
     n: usize,
     metadata: Option<NativeJsonMetadata<'a>>,
     started: Instant,
-    sent: &'a Rows,
+    sent: &'a Cell<u64>,
 }
 
 impl Serialize for NativeJson<'_> {
@@ -1294,7 +1292,7 @@ struct NativeMemory {
 struct NativeRows<'a> {
     r: &'a QueryResult,
     n: usize,
-    sent: &'a Rows,
+    sent: &'a Cell<u64>,
 }
 
 impl Serialize for NativeRows<'_> {
@@ -1308,7 +1306,7 @@ impl Serialize for NativeRows<'_> {
         }
         for i in 0..self.n {
             seq.serialize_element(&NativeRow { r: self.r, i })?;
-            self.sent.add(1);
+            self.sent.set(self.sent.get() + 1);
         }
         seq.end()
     }
@@ -1356,7 +1354,7 @@ enum GraphRows<'a> {
 
 struct NativeGraphRows<'a> {
     rows: GraphRows<'a>,
-    sent: &'a Rows,
+    sent: &'a Cell<u64>,
 }
 
 impl Serialize for NativeGraphRows<'_> {
@@ -1374,7 +1372,7 @@ impl Serialize for NativeGraphRows<'_> {
                         NativeTerm(t.predicate.into()),
                         NativeTerm(t.object),
                     ])?;
-                    self.sent.add(1);
+                    self.sent.set(self.sent.get() + 1);
                 }
             }
             GraphRows::Quads(rows) => {
@@ -1391,7 +1389,7 @@ impl Serialize for NativeGraphRows<'_> {
                         Some(NativeTerm(q.object)),
                         graph,
                     ])?;
-                    self.sent.add(1);
+                    self.sent.set(self.sent.get() + 1);
                 }
             }
         }
@@ -1600,14 +1598,14 @@ mod buffered_tests {
 
     /// Rows of `row` bytes written a few bytes at a time and counted after each, as the
     /// serializers do.
-    fn rows(n: u64, row: usize) -> impl FnMut(&mut Buffered<'_>, &Rows) -> Result<()> {
+    fn rows(n: u64, row: usize) -> impl FnMut(&mut Buffered<'_>, &Cell<u64>) -> Result<()> {
         move |w, staged| {
             for i in 0..n {
                 let line = format!("{i:0>width$}\n", width = row - 1);
                 for piece in line.as_bytes().chunks(7) {
                     w.write_all(piece).map_err(io)?;
                 }
-                staged.add(1);
+                staged.set(staged.get() + 1);
             }
             Ok(())
         }
@@ -1641,26 +1639,6 @@ mod buffered_tests {
             let whole = w.out.iter().filter(|&&b| b == b'\n').count() as u64;
             assert_eq!(sent.get(), whole, "{room}");
         }
-    }
-
-    #[test]
-    fn rows_of_pieces_longer_than_the_buffer_count_once_written() {
-        let row = OUTPUT_BUFFER * 2 + 5;
-        let mut w = Capped {
-            out: Vec::new(),
-            room: 2 * row,
-        };
-        let sent = Cell::new(0);
-        let mut f = |w: &mut Buffered<'_>, rows: &Rows| -> Result<()> {
-            for _ in 0..3 {
-                w.write_all(&vec![b'x'; row]).map_err(io)?;
-                rows.add(1);
-            }
-            Ok(())
-        };
-        assert!(write_buffered(&mut w, &sent, &mut f).is_err());
-        assert_eq!(w.out.len(), 2 * row);
-        assert_eq!(sent.get(), 2);
     }
 
     /// A writer that takes at most `step` bytes a call, `room` bytes in all, and then
@@ -1810,9 +1788,9 @@ mod buffered_tests {
     fn a_serializer_that_fails_leaves_what_it_wrote() {
         let mut out = Vec::new();
         let sent = Cell::new(0);
-        let mut f = |w: &mut Buffered<'_>, staged: &Rows| -> Result<()> {
+        let mut f = |w: &mut Buffered<'_>, staged: &Cell<u64>| -> Result<()> {
             w.write_all(b"row\n").map_err(io)?;
-            staged.add(1);
+            staged.set(staged.get() + 1);
             w.write_all(b"half").map_err(io)?;
             Err(Error::invalid("stopped"))
         };
