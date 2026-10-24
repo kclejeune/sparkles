@@ -141,19 +141,25 @@ type Link = { source: string; target: string; paths?: number[] };
 type Point = { x: number; y: number };
 
 /**
- * Where the nodes a path adds go in a view that is already laid out. Each new node with a
- * neighbour on a path, laid out or new, starts at the mean of its laid-out neighbours and
- * then moves to the mean of all its path neighbours a few dozen times, so a chain of new
- * nodes between two drawn ones spreads evenly along the way between them. A new node with no
- * path neighbour keeps its fallback. Only the edges on a path are read, once, so a large
- * graph without paths costs one pass over its edges.
+ * Where the nodes a path adds go in a view that is already laid out. The added nodes that
+ * path edges join form groups, and each group is placed by the drawn nodes it touches:
+ *
+ * - With two or more, each node moves to the mean of its path neighbours a few dozen times,
+ *   so a chain between two drawn nodes spreads evenly along the way between them.
+ * - With one, the group fans out from it, one `gap` per edge away from it, towards where
+ *   the group's fallbacks lie.
+ * - With none, the nodes keep their fallbacks, which are apart.
+ *
+ * Only the edges on a path are read, once, so a large graph without paths costs one pass
+ * over its edges, and every new node keeps its fallback.
  */
 export function placeAdded(
   added: readonly { id: string; fallback: Point }[],
   edges: readonly Link[],
   at: (id: string) => Point | undefined,
+  gap = 20,
 ): Map<string, Point> {
-  const fresh = new Set(added.map((n) => n.id));
+  const fallback = new Map(added.map((n) => [n.id, n.fallback]));
   const near = new Map<string, string[]>();
   const link = (a: string, b: string) => {
     let l = near.get(a);
@@ -162,37 +168,107 @@ export function placeAdded(
   };
   for (const e of edges) {
     if (!e.paths?.length || e.source === e.target) continue;
-    if (fresh.has(e.source)) link(e.source, e.target);
-    if (fresh.has(e.target)) link(e.target, e.source);
+    if (fallback.has(e.source)) link(e.source, e.target);
+    if (fallback.has(e.target)) link(e.target, e.source);
   }
   const out = new Map<string, Point>();
-  const moving: string[] = [];
+  const seen = new Set<string>();
+  // how many nodes each ring around a drawn node holds, across the groups hanging from it
+  const rings = new Map<string, number>();
   for (const n of added) {
-    const l = near.get(n.id);
-    const fixed = l?.map(at).filter((p): p is Point => !!p) ?? [];
-    if (!l?.some((k) => fresh.has(k) || at(k))) {
-      out.set(n.id, n.fallback);
-      continue;
+    if (seen.has(n.id)) continue;
+    // the group of added nodes that path edges join, and the drawn nodes it touches
+    const group: string[] = [];
+    const anchors = new Map<string, Point>();
+    const todo = [n.id];
+    seen.add(n.id);
+    while (todo.length) {
+      const id = todo.pop()!;
+      group.push(id);
+      for (const k of near.get(id) ?? []) {
+        if (fallback.has(k)) {
+          if (!seen.has(k)) {
+            seen.add(k);
+            todo.push(k);
+          }
+        } else {
+          const p = at(k);
+          if (p) anchors.set(k, p);
+        }
+      }
     }
-    out.set(n.id, fixed.length ? mean(fixed) : n.fallback);
-    moving.push(n.id);
+    if (anchors.size >= 2) between(group, near, fallback, at, out);
+    else if (anchors.size === 1) {
+      const [[anchor, p]] = [...anchors];
+      fanOut(group, anchor, p, near, fallback, gap, rings, out);
+    } else for (const id of group) out.set(id, fallback.get(id)!);
   }
-  const where = (k: string) => (fresh.has(k) ? out.get(k) : at(k));
-  for (let round = 0; round < 60 && moving.length; round++) {
-    for (const id of moving) {
-      const ps = near
-        .get(id)!
-        .map(where)
-        .filter((p): p is Point => !!p);
+  return out;
+}
+
+/** A group between two or more drawn nodes, by repeated means. */
+function between(
+  group: string[],
+  near: Map<string, string[]>,
+  fallback: Map<string, Point>,
+  at: (id: string) => Point | undefined,
+  out: Map<string, Point>,
+) {
+  for (const id of group) {
+    const fixed = (near.get(id) ?? []).map(at).filter((p): p is Point => !!p);
+    out.set(id, fixed.length ? mean(fixed) : fallback.get(id)!);
+  }
+  const where = (k: string) => (fallback.has(k) ? out.get(k) : at(k));
+  for (let round = 0; round < 60; round++)
+    for (const id of group) {
+      const ps = (near.get(id) ?? []).map(where).filter((p): p is Point => !!p);
       if (ps.length) out.set(id, mean(ps));
     }
-  }
   // a small offset, so that a node between two others does not sit on their edge
-  for (const id of moving) {
+  for (const id of group) {
     const p = out.get(id)!;
     out.set(id, { x: p.x + 3, y: p.y + 3 });
   }
-  return out;
+}
+
+/** A group hanging from one drawn node: rings of `gap` per edge, side by side within one. */
+function fanOut(
+  group: string[],
+  anchor: string,
+  from: Point,
+  near: Map<string, string[]>,
+  fallback: Map<string, Point>,
+  gap: number,
+  rings: Map<string, number>,
+  out: Map<string, Point>,
+) {
+  const c = mean(group.map((id) => fallback.get(id)!));
+  let dx = c.x - from.x;
+  let dy = c.y - from.y;
+  const len = Math.hypot(dx, dy);
+  [dx, dy] = len > 1e-9 ? [dx / len, dy / len] : [1, 0];
+  // hops from the anchor, breadth first
+  const hops = new Map<string, number>();
+  let ring = group.filter((id) => near.get(id)?.includes(anchor));
+  for (const id of ring) hops.set(id, 1);
+  for (let h = 2; ring.length; h++) {
+    const next: string[] = [];
+    for (const id of ring)
+      for (const k of near.get(id) ?? [])
+        if (fallback.has(k) && !hops.has(k)) {
+          hops.set(k, h);
+          next.push(k);
+        }
+    ring = next;
+  }
+  for (const id of group) {
+    const h = hops.get(id) ?? 1;
+    const k = rings.get(`${anchor}|${h}`) ?? 0;
+    rings.set(`${anchor}|${h}`, k + 1);
+    // the k-th node of a ring sits beside the others, alternately on either side
+    const side = k === 0 ? 0 : (k % 2 ? 1 : -1) * Math.ceil(k / 2) * gap;
+    out.set(id, { x: from.x + dx * gap * h - dy * side, y: from.y + dy * gap * h + dx * side });
+  }
 }
 
 function mean(ps: Point[]): Point {

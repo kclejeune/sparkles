@@ -174,6 +174,39 @@ describe('placeAdded', () => {
     expect(Math.round(p.get('n1')!.x)).toBe(336);
     expect(Math.round(p.get('n2')!.x)).toBe(670);
   });
+  it('keeps a path between two nodes the result lacks apart, at their fallbacks', () => {
+    const p = placeAdded(
+      [
+        { id: 's', fallback: { x: 0, y: 0 } },
+        { id: 't', fallback: { x: 100, y: 50 } },
+      ],
+      [{ source: 's', target: 't', paths: [1] }],
+      at,
+    );
+    expect(p.get('s')).toEqual({ x: 0, y: 0 });
+    expect(p.get('t')).toEqual({ x: 100, y: 50 });
+  });
+  it('fans a group with one drawn neighbour out from it, one gap per edge', () => {
+    const p = placeAdded(
+      [
+        { id: 'n1', fallback: { x: 500, y: 0 } },
+        { id: 'n2', fallback: { x: 600, y: 0 } },
+        { id: 'm', fallback: { x: 500, y: 10 } },
+      ],
+      [
+        { source: 'a', target: 'n1', paths: [1] },
+        { source: 'n1', target: 'n2', paths: [1] },
+        { source: 'a', target: 'm', paths: [2] },
+      ],
+      at,
+      20,
+    );
+    const pts = ['n1', 'n2', 'm'].map((k) => p.get(k)!);
+    // n1 and m are one edge from a, n2 two, and no two of them share a place
+    expect(Math.round(Math.hypot(pts[1].x, pts[1].y))).toBe(40);
+    expect(new Set(pts.map((q) => `${Math.round(q.x)},${Math.round(q.y)}`)).size).toBe(3);
+    for (const q of pts) expect(Math.hypot(q.x, q.y)).toBeGreaterThan(10);
+  });
   it('keeps the fallback of a node with no neighbour on a path, without reading other edges', () => {
     const edges = Array.from({ length: 1000 }, (_, i) => ({ source: 'q', target: `x${i}` }));
     expect(placeAdded([{ id: 'q', fallback: far }], edges, at).get('q')).toEqual(far);

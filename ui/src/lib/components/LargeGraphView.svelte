@@ -752,6 +752,12 @@
     startLayout(true);
   }
 
+  /** A twenty-fifth of the larger side of the picture, or 20 for an empty one. */
+  function gapOf(b: { x: [number, number]; y: [number, number] }): number {
+    const side = Math.max(b.x[1] - b.x[0], b.y[1] - b.y[0]);
+    return Number.isFinite(side) && side > 0 ? side / 25 : 20;
+  }
+
   /** The props' sizes, colours and labels on the drawn graph, positions kept and no layout. */
   function update() {
     if (!graph || !renderer) return;
@@ -780,6 +786,8 @@
         const a = g.getNodeAttributes(k);
         return { x: a.x as number, y: a.y as number };
       },
+      // a group that hangs from one drawn node fans out by a step of the picture's size
+      gapOf(renderer.getBBox()),
     );
     for (const n of fresh) {
       const p = place.get(n.key)!;
