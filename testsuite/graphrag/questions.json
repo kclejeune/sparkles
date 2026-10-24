@@ -1,0 +1,219 @@
+{
+ "description": "Global questions over the demo organisation graph, generated as C22 §9 says by claude-opus-5-5 on 2026-10-24 from the dataset description below: five users, three tasks each and two questions per task. The lane's agent checked all 30 and kept them unchanged, since each asks about the dataset as a whole and none names one record whose fields answer it. No person has checked them.",
+ "dataset": "org",
+ "generator": "claude-opus-5-5",
+ "datasetDescription": "A knowledge graph of a small software and research organisation: its people, teams, projects, publications, skills, companies, universities and cities, with meeting notes and project updates folded in as facts.\n\nClasses and instance counts:\n- Engineer: 21\n- Publication: 18\n- Concept: 18\n- Class: 15\n- ObjectProperty: 12\n- Project: 8\n- Researcher: 8\n- Skill: 8\n- Team: 8\n- Employee: 7\n- City: 6\n- DatatypeProperty: 6\n- Manager: 5\n- Company: 4\n- University: 3\n- Ontology: 1\n- SymmetricProperty: 1\n- TransitiveProperty: 1\n\nProperties and their use counts:\n- type: 150\n- knows: 133\n- label: 105\n- hasSkill: 84\n- contributesTo: 71\n- basedIn: 52\n- memberOf: 47\n- name: 44\n- age: 40\n- familyName: 40\n- givenName: 40\n- mbox: 40\n- startDate: 34\n- worksFor: 33\n- salary: 32\n- author: 31\n- prefLabel: 26\n- about: 18\n- citations: 18\n- issued: 18\n- title: 18\n- comment: 17\n- range: 17\n- domain: 15\n- subClassOf: 13\n- alumnusOf: 10\n- partOf: 9\n- manages: 7\n- description: 6\n- addressCountry: 6\n- latitude: 6\n- longitude: 6\n- founded: 4\n- homepage: 4\n- creator: 1\n- inverseOf: 1\n- versionInfo: 1\n\nLabels by class:\n- City: Berlin, Kyoto, Lisbon, Montréal, Nairobi, Portland\n- Class: Agent, City, Company, Employee, Engineer, Manager, Organization, Person, Personne, Place, Project, Publication, Researcher, Skill, Team, University\n- Company: Lattice & Co, Northwind Graph, Quadrant Labs, Tessellate\n- DatatypeProperty: age, citations, founded, name, salary, start date\n- Employee: Anita Borg, Barbara Liskov, Donald Knuth, Fran Bilas, Ivan Sutherland, Ole Dahl, Shafi Goldwasser\n- Engineer: Adele Goldberg, Alan Turing, Ari Moreau, Bjarne Stroustrup, Carla Ellis, Evelyn Boyd, Frances Allen, Grace Hopper, Hedy Lamarr, Jean Sammet, Joan Clarke, John McCarthy, Karen Spärck Jones, Katherine Johnson, Ken Thompson, Leslie Lamport, Lynn Conway, Margaret Hamilton, Rasmus Lerdorf, Robin Milner\n- Manager: Ada Lovelace, Linus Torvalds, Mary Shaw, Radia Perlman, Whitfield Diffie\n- ObjectProperty: alumnus of, author, authored, based in, contributes to, has skill, knows, mailbox, manages, member of, part of, works for\n- Ontology: Sparkles example organisation ontology\n- Project: Cardinality Estimator, Delta Merge, Graph Diff, OWL-RL Rules, Permutation Index, Result Cache, Sparkles, Vector Search\n- Researcher: Dennis Ritchie, Edsger Dijkstra, Guido van Rossum, Jim Gray, Niklaus Wirth, Tim Berners-Lee, Tony Hoare, Yukihiro Matsumoto\n- SymmetricProperty: knows\n- Team: Billing team, Search team, Ingest team, Query Engine team, Reasoner team, Research team, Storage team, Web UI team\n- TransitiveProperty: part of\n- University: Institute of Formal Methods, Open Semantics University, Polytechnic of the North",
+ "questions": [
+  {
+   "id": "g111",
+   "kind": "global",
+   "persona": "Engineering director overseeing all teams and projects",
+   "task": "Assess how staff effort is distributed across projects and teams",
+   "question": "Which projects attract the most contributors overall, and which appear under-resourced compared with the rest?"
+  },
+  {
+   "id": "g112",
+   "kind": "global",
+   "persona": "Engineering director overseeing all teams and projects",
+   "task": "Assess how staff effort is distributed across projects and teams",
+   "question": "How evenly are people spread across teams, and which teams look overloaded or thin?"
+  },
+  {
+   "id": "g121",
+   "kind": "global",
+   "persona": "Engineering director overseeing all teams and projects",
+   "task": "Identify organisational risks such as single points of failure",
+   "question": "Are there projects or teams whose work depends on only a few people or a narrow set of skills?"
+  },
+  {
+   "id": "g122",
+   "kind": "global",
+   "persona": "Engineering director overseeing all teams and projects",
+   "task": "Identify organisational risks such as single points of failure",
+   "question": "What patterns of management coverage exist, and are some groups of staff left without a clear manager?"
+  },
+  {
+   "id": "g131",
+   "kind": "global",
+   "persona": "Engineering director overseeing all teams and projects",
+   "task": "Understand how the organisation is structured across locations",
+   "question": "How are people, teams and companies distributed across the cities, and which locations dominate?"
+  },
+  {
+   "id": "g132",
+   "kind": "global",
+   "persona": "Engineering director overseeing all teams and projects",
+   "task": "Understand how the organisation is structured across locations",
+   "question": "Do teams tend to be co-located, or is work commonly split across several cities?"
+  },
+  {
+   "id": "g211",
+   "kind": "global",
+   "persona": "HR and talent manager",
+   "task": "Map the skill landscape of the workforce",
+   "question": "Which skills are most common across the organisation, and which are rare?"
+  },
+  {
+   "id": "g212",
+   "kind": "global",
+   "persona": "HR and talent manager",
+   "task": "Map the skill landscape of the workforce",
+   "question": "How do skill profiles differ between engineers, researchers, managers and other employees?"
+  },
+  {
+   "id": "g221",
+   "kind": "global",
+   "persona": "HR and talent manager",
+   "task": "Review compensation and tenure patterns",
+   "question": "What overall patterns relate salary to role, age and start date across the staff?"
+  },
+  {
+   "id": "g222",
+   "kind": "global",
+   "persona": "HR and talent manager",
+   "task": "Review compensation and tenure patterns",
+   "question": "Are there noticeable salary or tenure differences between teams, locations or employers?"
+  },
+  {
+   "id": "g231",
+   "kind": "global",
+   "persona": "HR and talent manager",
+   "task": "Plan recruiting and university partnerships",
+   "question": "Which universities supply the most alumni, and how are those alumni spread across roles and teams?"
+  },
+  {
+   "id": "g232",
+   "kind": "global",
+   "persona": "HR and talent manager",
+   "task": "Plan recruiting and university partnerships",
+   "question": "Which skill gaps across projects suggest where future hiring should focus?"
+  },
+  {
+   "id": "g311",
+   "kind": "global",
+   "persona": "Research lead tracking publication output",
+   "task": "Evaluate overall research productivity and impact",
+   "question": "What are the main topics covered by the publications, and which receive the most citations?"
+  },
+  {
+   "id": "g312",
+   "kind": "global",
+   "persona": "Research lead tracking publication output",
+   "task": "Evaluate overall research productivity and impact",
+   "question": "How has publication output and citation impact changed over the years covered?"
+  },
+  {
+   "id": "g321",
+   "kind": "global",
+   "persona": "Research lead tracking publication output",
+   "task": "Connect research to engineering projects",
+   "question": "To what extent do publication topics line up with the projects the organisation is running?"
+  },
+  {
+   "id": "g322",
+   "kind": "global",
+   "persona": "Research lead tracking publication output",
+   "task": "Connect research to engineering projects",
+   "question": "Which projects or concept areas are supported by published research, and which have none?"
+  },
+  {
+   "id": "g331",
+   "kind": "global",
+   "persona": "Research lead tracking publication output",
+   "task": "Understand authorship and collaboration patterns",
+   "question": "Is authorship concentrated among a few people, or spread widely across researchers and engineers?"
+  },
+  {
+   "id": "g332",
+   "kind": "global",
+   "persona": "Research lead tracking publication output",
+   "task": "Understand authorship and collaboration patterns",
+   "question": "Do co-authors tend to come from the same team, the same university, or different parts of the organisation?"
+  },
+  {
+   "id": "g411",
+   "kind": "global",
+   "persona": "Organisational network analyst studying collaboration",
+   "task": "Analyse the social network formed by acquaintance links",
+   "question": "What are the main clusters in the network of who knows whom, and how do they relate to teams or cities?"
+  },
+  {
+   "id": "g412",
+   "kind": "global",
+   "persona": "Organisational network analyst studying collaboration",
+   "task": "Analyse the social network formed by acquaintance links",
+   "question": "Which kinds of people act as bridges between otherwise separate groups?"
+  },
+  {
+   "id": "g421",
+   "kind": "global",
+   "persona": "Organisational network analyst studying collaboration",
+   "task": "Compare formal structure with informal ties",
+   "question": "How closely do acquaintance links follow team membership and reporting lines?"
+  },
+  {
+   "id": "g422",
+   "kind": "global",
+   "persona": "Organisational network analyst studying collaboration",
+   "task": "Compare formal structure with informal ties",
+   "question": "Are cross-team collaborations on projects backed by social ties, or do they occur between people who do not know each other?"
+  },
+  {
+   "id": "g431",
+   "kind": "global",
+   "persona": "Organisational network analyst studying collaboration",
+   "task": "Find silos and isolated groups",
+   "question": "Which teams, locations or companies appear most isolated from the rest of the organisation?"
+  },
+  {
+   "id": "g432",
+   "kind": "global",
+   "persona": "Organisational network analyst studying collaboration",
+   "task": "Find silos and isolated groups",
+   "question": "How connected are researchers overall to the engineering population?"
+  },
+  {
+   "id": "g511",
+   "kind": "global",
+   "persona": "Knowledge engineer maintaining the ontology and data quality",
+   "task": "Audit how well the data conforms to the ontology",
+   "question": "Which classes and properties are heavily used and which are defined but rarely or never used?"
+  },
+  {
+   "id": "g512",
+   "kind": "global",
+   "persona": "Knowledge engineer maintaining the ontology and data quality",
+   "task": "Audit how well the data conforms to the ontology",
+   "question": "What inconsistencies appear between declared domains and ranges and how properties are actually used?"
+  },
+  {
+   "id": "g521",
+   "kind": "global",
+   "persona": "Knowledge engineer maintaining the ontology and data quality",
+   "task": "Assess completeness of entity descriptions",
+   "question": "Which classes of entities tend to have incomplete attributes, such as missing names, emails, salaries or dates?"
+  },
+  {
+   "id": "g522",
+   "kind": "global",
+   "persona": "Knowledge engineer maintaining the ontology and data quality",
+   "task": "Assess completeness of entity descriptions",
+   "question": "How consistently are labels and preferred labels provided across classes, including multilingual labels?"
+  },
+  {
+   "id": "g531",
+   "kind": "global",
+   "persona": "Knowledge engineer maintaining the ontology and data quality",
+   "task": "Review the class hierarchy and modelling choices",
+   "question": "What does the overall class hierarchy look like, and are there redundant or overlapping classes?"
+  },
+  {
+   "id": "g532",
+   "kind": "global",
+   "persona": "Knowledge engineer maintaining the ontology and data quality",
+   "task": "Review the class hierarchy and modelling choices",
+   "question": "How are special property types such as symmetric and transitive ones used across the dataset, and do the data follow their semantics?"
+  }
+ ],
+ "checkedBy": "the lane's agent, not a person"
+}
