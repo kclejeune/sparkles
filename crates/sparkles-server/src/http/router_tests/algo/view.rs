@@ -274,3 +274,153 @@ async fn a_branch_has_its_own_kept_results_and_refuses_write_back() {
     .await;
     assert_eq!(st, StatusCode::BAD_REQUEST, "{j}");
 }
+
+#[tokio::test]
+async fn a_queued_run_cancelled_before_it_starts_leaves_the_running_list() {
+    let s = algo_server();
+    s.state.task_queue.set_max(1);
+    let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let spin = super::super::tasks::spin(&s.state, "g", true, stop.clone());
+    let body = json!({
+        "algorithm": "wcc",
+        "projection": {"predicates": ["http://ex/p"]},
+        "nodes": ["http://ex/a"],
+        "keep": true,
+        "async": true,
+    });
+    let (st, t) = run(&s, "g", &body).await;
+    assert_eq!(st, StatusCode::ACCEPTED, "{t}");
+    assert_eq!(t["state"], task_state::QUEUED, "{t}");
+    let id = t["id"].as_str().unwrap().to_string();
+    assert!(view::running_ids().contains(&id));
+    let r = send(
+        &s.app,
+        Request::delete(format!("/$/tasks/{id}"))
+            .body(Body::empty())
+            .unwrap(),
+    )
+    .await;
+    assert_eq!(r.status, StatusCode::ACCEPTED, "{}", r.text());
+    assert!(
+        !view::running_ids().contains(&id),
+        "a cancelled queued run still holds its running entry"
+    );
+    stop.store(true, std::sync::atomic::Ordering::Relaxed);
+    super::super::tasks::wait_done(&s.state, &spin).await;
+}
+
+/// A chain of `n` nodes whose IRIs are `len` characters long.
+fn long_chain(n: usize, len: usize) -> String {
+    let iri = |i: usize| format!("<http://ex/{:0>width$}>", i, width = len);
+    (0..n)
+        .map(|i| format!("{} <http://ex/p> {} .\n", iri(i), iri(i + 1)))
+        .collect()
+}
+
+#[tokio::test]
+async fn the_decoded_rows_count_against_the_memory_budget() {
+    let s = algo_server();
+    s.state.create("long", DbType::Mem).unwrap();
+    s.state
+        .get("long")
+        .unwrap()
+        .store
+        .load(&[Source::from_bytes(
+            long_chain(3000, 2000).into_bytes(),
+            oxrdfio::RdfFormat::NTriples,
+            None,
+        )])
+        .unwrap();
+    let body = json!({
+        "algorithm": "wcc",
+        "projection": {"predicates": ["http://ex/p"]},
+        "nodes": ["http://ex/1"],
+    });
+    // the engine's own peak is small, the decoded IRIs are about 6 MB
+    let (st, j) = run(&s, "long?memory-mb=64", &body).await;
+    assert_eq!(st, StatusCode::OK, "{j}");
+    let (st, j) = run(&s, "long?memory-mb=2", &body).await;
+    assert_eq!(st, StatusCode::INSUFFICIENT_STORAGE, "{j}");
+    assert_eq!(j["budget"], "memory", "{j}");
+}
+
+#[tokio::test]
+async fn the_result_byte_limit_bounds_the_answer() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut state =
+        AppState::new(dir.path(), StoreOptions::default(), Duration::from_secs(30)).unwrap();
+    state.limits.max_result_bytes = Some(800);
+    let state = Arc::new(state);
+    state.create("g", DbType::Mem).unwrap();
+    state
+        .get("g")
+        .unwrap()
+        .store
+        .load(&[Source::from_bytes(
+            GRAPH.as_bytes().to_vec(),
+            oxrdfio::RdfFormat::Turtle,
+            None,
+        )])
+        .unwrap();
+    let s = Server {
+        _dir: dir,
+        app: router(state.clone()),
+        state,
+    };
+    let body = json!({
+        "algorithm": "wcc",
+        "projection": {"predicates": ["http://ex/p"]},
+        "keep": true,
+    });
+    let (st, j) = run(&s, "g", &body).await;
+    assert_eq!(st, StatusCode::INSUFFICIENT_STORAGE, "{j}");
+    assert_eq!(j["budget"], "result-bytes", "{j}");
+    // the kept result answers the same way, and a small answer from it fits
+    let (st, j) = run(&s, "g", &body).await;
+    assert_eq!(st, StatusCode::INSUFFICIENT_STORAGE, "{j}");
+    let mut one = body.clone();
+    one["nodes"] = json!(["http://ex/a"]);
+    let (st, j) = run(&s, "g", &one).await;
+    assert_eq!(st, StatusCode::OK, "{j}");
+    assert_eq!(j["run"]["cached"], true, "{j}");
+}
+
+#[tokio::test]
+async fn a_changed_prefix_is_another_key() {
+    let s = algo_server();
+    let ds = s.state.get("g").unwrap();
+    ds.store.set_prefix("pp", "http://ex/").unwrap();
+    let body = json!({
+        "algorithm": "wcc",
+        "projection": {"predicates": ["pp:p"]},
+        "nodes": ["http://ex/a"],
+        "keep": true,
+    });
+    let (st, j) = run(&s, "g", &body).await;
+    assert_eq!(st, StatusCode::OK, "{j}");
+    assert_eq!(j["results"]["bindings"][0]["communitySize"]["value"], "3");
+    let (_, j) = run(&s, "g", &body).await;
+    assert_eq!(j["run"]["cached"], true);
+    // the prefix now names another namespace, without a commit
+    ds.store.set_prefix("pp", "http://other/").unwrap();
+    let (st, j) = run(&s, "g", &body).await;
+    assert_eq!(st, StatusCode::OK, "{j}");
+    assert_eq!(j["run"]["cached"], false, "{j}");
+    assert_eq!(j["results"]["bindings"], json!([]), "{j}");
+}
+
+#[tokio::test]
+async fn caller_records_stay_while_their_tasks_are_listed() {
+    let s = algo_server();
+    let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let first = super::super::tasks::spin(&s.state, "g", true, stop.clone());
+    let p = crate::auth::Principal::local();
+    view::add_caller(&s.state, &first, "g", &p);
+    // many runs that ended and are no longer listed
+    for i in 0..5000 {
+        view::add_caller(&s.state, &format!("gone-{i}"), "g", &p);
+    }
+    assert!(view::follows(&s.state, &first, "g", &p));
+    stop.store(true, std::sync::atomic::Ordering::Relaxed);
+    super::super::tasks::wait_done(&s.state, &first).await;
+}

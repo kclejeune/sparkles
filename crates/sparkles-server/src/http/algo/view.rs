@@ -12,8 +12,12 @@
 //! same key while it runs joins it.
 //!
 //! The cache keeps at most [`MAX_ENTRIES`] results and [`MAX_BYTES`] of their estimated
-//! size, drops the oldest first, and charges each result to the server memory pool for as
-//! long as it is kept. A result the pool has no room for is answered but not kept.
+//! size, and never more than half of the server memory pool, so that the other half stays
+//! for the admission of queries. It drops the oldest first, and charges each result to the
+//! pool for as long as the cache or a reader holds it. A result the pool has no room for is
+//! answered but not kept. The decoded rows of a run count against the request's memory
+//! budget and pool grant as they are decoded, and the answer against its result-byte
+//! limit.
 
 use super::super::graph::cache::{Key, view_key};
 use super::super::{ApiError, ApiResult, Params, St, blocking, err};
@@ -31,8 +35,8 @@ use sparkles::sparql::algorun::{AlgoRequest, ProjectionRef};
 use sparkles::sparql::pool::PoolGrant;
 use sparkles::store::Snapshot;
 use std::collections::{HashMap, HashSet, VecDeque};
-use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, OnceLock};
 use std::time::Instant;
 
 /// The kind of the task of a background view-only run.
@@ -152,6 +156,33 @@ pub(crate) struct Kept {
     sizes: Option<Sizes>,
     commit: u64,
     bytes: u64,
+    /// the pool memory the result holds while the cache keeps it, or a reader still has
+    /// it after the cache dropped it
+    grant: OnceLock<PoolGrant>,
+}
+
+/// The heap of one decoded cell, estimated.
+fn cell_bytes(t: &Option<Term>) -> u64 {
+    match t {
+        Some(Term::NamedNode(n)) => n.as_str().len() as u64,
+        Some(Term::BlankNode(b)) => b.as_str().len() as u64,
+        Some(Term::Literal(l)) => l.value().len() as u64 + 16,
+        Some(Term::Triple(_)) => 256,
+        None => 0,
+    }
+}
+
+/// The heap of one decoded row, estimated: the row vector and its terms.
+fn row_bytes(r: &[Option<Term>]) -> u64 {
+    let cell = std::mem::size_of::<Option<Term>>() as u64;
+    24 + cell * r.len() as u64 + r.iter().map(cell_bytes).sum::<u64>()
+}
+
+/// The heap a row adds to the index and the group sizes at most, estimated.
+fn row_index_bytes(r: &[Option<Term>]) -> u64 {
+    let cell = std::mem::size_of::<Option<Term>>() as u64;
+    let iri = r.first().map_or(0, cell_bytes);
+    iri + 64 + 2 * cell + 32
 }
 
 impl Kept {
@@ -185,17 +216,7 @@ impl Kept {
         // An estimate of the heap the result holds: the row vectors and their terms, the
         // index and the group sizes.
         let cell = std::mem::size_of::<Option<Term>>() as u64;
-        let term = |t: &Option<Term>| match t {
-            Some(Term::NamedNode(n)) => n.as_str().len() as u64,
-            Some(Term::BlankNode(b)) => b.as_str().len() as u64,
-            Some(Term::Literal(l)) => l.value().len() as u64 + 16,
-            Some(Term::Triple(_)) => 256,
-            None => 0,
-        };
-        let mut bytes = 0u64;
-        for r in &rows {
-            bytes += 24 + cell * r.len() as u64 + r.iter().map(term).sum::<u64>();
-        }
+        let mut bytes: u64 = rows.iter().map(|r| row_bytes(r)).sum();
         bytes += index.keys().map(|k| k.len() as u64 + 64).sum::<u64>();
         if let Some((_, _, m)) = &sizes {
             bytes += m.len() as u64 * (2 * cell + 32);
@@ -209,6 +230,7 @@ impl Kept {
             sizes,
             commit,
             bytes,
+            grant: OnceLock::new(),
         }
     }
 
@@ -296,33 +318,112 @@ impl Kept {
     }
 }
 
-/// Run `req` at `snap` under `opts` and keep every row.
-fn compute(
-    ds: &Dataset,
-    snap: Arc<Snapshot>,
-    req: &AlgoRequest,
-    opts: &QueryOptions,
-) -> sparkles::Result<Kept> {
-    let commit = snap.commit;
-    let q = ds.dataset.algorithms().query_text_with_summary(req)?;
-    let r = sparkles::sparql::query(snap, &q, opts)?;
-    let mut vars = r.vars.clone();
-    let mut rows = r.rows();
-    drop(r);
-    // the summary is the last column, the same literal in every row
-    let mut summary = None;
-    if vars.last().map(String::as_str) == Some("summary") {
-        vars.pop();
-        for row in &mut rows {
-            let s = row.pop().flatten();
-            if summary.is_none()
-                && let Some(Term::Literal(l)) = s
-            {
-                summary = Some(serde_json::from_str(l.value()).unwrap_or(J::from(l.value())));
-            }
+/// The decoded bytes a run holds, charged to the request's pool grant and checked
+/// against its memory budget as they grow, and given back when the run's answer is
+/// written.
+pub(crate) struct Held {
+    grant: Option<Arc<PoolGrant>>,
+    limit: Option<u64>,
+    held: u64,
+}
+
+impl Held {
+    pub(crate) fn new(opts: &QueryOptions) -> Held {
+        Held {
+            grant: opts.grant.clone(),
+            limit: opts.max_memory_bytes,
+            held: 0,
         }
     }
-    Ok(Kept::new(vars, rows, summary, commit))
+
+    /// Account for `n` more bytes: `507` with `budget: "memory"` past the request's
+    /// budget, and the pool's own refusal when it cannot give them.
+    fn charge(&mut self, n: u64) -> sparkles::Result<()> {
+        let total = self.held.saturating_add(n);
+        if let Some(limit) = self.limit
+            && total > limit
+        {
+            return Err(sparkles::Error::BudgetExceeded(sparkles::Budget {
+                kind: sparkles::BudgetKind::Memory,
+                limit,
+                requested: total,
+            }));
+        }
+        if let Some(g) = &self.grant {
+            g.charge(n)?;
+        }
+        self.held = total;
+        Ok(())
+    }
+
+    /// Make the bytes held `n`, charging or giving back the difference.
+    fn settle(&mut self, n: u64) -> sparkles::Result<()> {
+        if n > self.held {
+            self.charge(n - self.held)
+        } else {
+            let less = self.held - n;
+            if let Some(g) = &self.grant {
+                g.release(less);
+            }
+            self.held = n;
+            Ok(())
+        }
+    }
+}
+
+impl Drop for Held {
+    fn drop(&mut self) {
+        if let Some(g) = &self.grant {
+            g.release(self.held);
+        }
+    }
+}
+
+/// Rows decoded between two charges.
+const CHARGE_EVERY: usize = 1024;
+
+/// Run the query `q` at `snap` under `opts` and keep every row. The decoded rows are
+/// charged to `held` as they are decoded, before they can grow past the request's
+/// budget or the pool, and the index and group sizes before they are built.
+fn compute(
+    snap: Arc<Snapshot>,
+    q: &str,
+    opts: &QueryOptions,
+    held: &mut Held,
+) -> sparkles::Result<Kept> {
+    let commit = snap.commit;
+    let r = sparkles::sparql::query(snap, q, opts)?;
+    let mut vars = r.vars.clone();
+    // the summary is the last column, the same literal in every row: decoded once
+    let summary_col = (vars.last().map(String::as_str) == Some("summary")).then(|| {
+        vars.pop();
+        vars.len()
+    });
+    let n = r.table.len();
+    let width = vars.len();
+    let mut summary = None;
+    if let Some(c) = summary_col
+        && n > 0
+        && let Some(Term::Literal(l)) = r.term(r.table.cols[c][0])
+    {
+        summary = Some(serde_json::from_str(l.value()).unwrap_or(J::from(l.value())));
+    }
+    let mut rows: Vec<Vec<Option<Term>>> = Vec::new();
+    let mut pending = 0u64;
+    for i in 0..n {
+        let row: Vec<Option<Term>> = r.table.cols[..width].iter().map(|c| r.term(c[i])).collect();
+        pending += row_bytes(&row) + row_index_bytes(&row);
+        rows.push(row);
+        if rows.len().is_multiple_of(CHARGE_EVERY) {
+            held.charge(pending)?;
+            pending = 0;
+        }
+    }
+    held.charge(pending)?;
+    drop(r);
+    let kept = Kept::new(vars, rows, summary, commit);
+    held.settle(kept.bytes)?;
+    Ok(kept)
 }
 
 // ---------------------------------------------------------------- the cache ------
@@ -330,8 +431,6 @@ fn compute(
 struct Entry {
     key: Key,
     kept: Arc<Kept>,
-    /// the pool memory the result holds while it is kept
-    _grant: Option<PoolGrant>,
 }
 
 /// A bounded cache of results. The server has one, [`CACHE`].
@@ -363,6 +462,11 @@ impl ViewCache {
 
     /// Keep `kept` for `key`, dropping the oldest results until it fits the cache's
     /// bounds and the pool grants its bytes. `false` when it could not be kept.
+    ///
+    /// The cache holds at most half of the pool, so that at least half stays for the
+    /// admission of queries, and a result larger than that is answered but not kept. The
+    /// grant lives with the result, so a reader that still holds a result the cache
+    /// dropped keeps it charged until it lets go.
     fn put(
         &self,
         pool: Option<&Arc<sparkles::sparql::pool::QueryPool>>,
@@ -370,7 +474,8 @@ impl ViewCache {
         kept: Arc<Kept>,
     ) -> bool {
         let bytes = kept.bytes;
-        if bytes > MAX_BYTES {
+        let share = pool.map_or(MAX_BYTES, |p| (p.capacity() / 2).min(MAX_BYTES));
+        if bytes > share {
             REFUSED.fetch_add(1, Ordering::Relaxed);
             return false;
         }
@@ -378,15 +483,21 @@ impl ViewCache {
         if let Some(i) = c.iter().position(|e| e.key == key) {
             c.remove(i);
         }
-        let total = |c: &VecDeque<Entry>| c.iter().map(|e| e.kept.bytes).sum::<u64>();
-        while c.len() >= MAX_ENTRIES || (!c.is_empty() && total(&c) + bytes > MAX_BYTES) {
+        // what the kept results hold of the pool, or their estimate without one
+        let held = |e: &Entry| e.kept.grant.get().map_or(e.kept.bytes, |g| g.granted());
+        let total = |c: &VecDeque<Entry>| c.iter().map(held).sum::<u64>();
+        while c.len() >= MAX_ENTRIES || (!c.is_empty() && total(&c) + bytes > share) {
             c.pop_front();
         }
-        let grant = match pool {
-            None => None,
-            Some(pool) => loop {
-                match pool.try_grant(bytes).filter(|g| g.granted() >= bytes) {
-                    Some(g) => break Some(g),
+        if let Some(pool) = pool
+            && kept.grant.get().is_none()
+        {
+            let grant = loop {
+                match pool
+                    .try_grant(bytes)
+                    .filter(|g| g.granted() >= bytes && total(&c) + g.granted() <= share)
+                {
+                    Some(g) => break g,
                     // the oldest results give their memory back for a newer one
                     None if !c.is_empty() => {
                         c.pop_front();
@@ -396,13 +507,11 @@ impl ViewCache {
                         return false;
                     }
                 }
-            },
-        };
-        c.push_back(Entry {
-            key,
-            kept,
-            _grant: grant,
-        });
+            };
+            // another thread that kept the same result first holds its grant
+            let _ = kept.grant.set(grant);
+        }
+        c.push_back(Entry { key, kept });
         true
     }
 
@@ -486,15 +595,25 @@ pub(crate) fn metrics(out: &mut String) {
 
 /// The runs in progress, by key, with their task.
 static RUNNING: Mutex<Vec<(Key, String)>> = parking_lot::const_mutex(Vec::new());
-/// The callers of each background run's task: the one that started it first. They may
-/// follow the task even when their view of the dataset is restricted, and the first may
-/// cancel it.
-static CALLERS: Mutex<VecDeque<(String, Vec<String>)>> = parking_lot::const_mutex(VecDeque::new());
-/// Tasks whose callers are remembered at most.
-const MAX_CALLERS: usize = 256;
+/// A caller of a background run: who it is and its read view.
+type Caller = (String, String);
+
+/// The callers of each background run's task, the one that started it first, each with
+/// the read view it had then. They may follow the task even when their view of the
+/// dataset is restricted, and the first may cancel it, for as long as they can still
+/// read the dataset through the same view.
+static CALLERS: Mutex<VecDeque<(String, Vec<Caller>)>> = parking_lot::const_mutex(VecDeque::new());
+/// Tasks whose callers are remembered at most. Records of tasks the server still lists
+/// are kept below this, and only past it does the oldest go.
+const MAX_CALLERS: usize = 4096;
 
 fn who(p: &Principal) -> String {
     format!("{:?}\u{1f}{}", p.kind, p.name)
+}
+
+/// The read view of `p` on `ds`, as the cache keys it.
+fn read_view(p: &Principal, ds: &str) -> String {
+    view_key(p.view(ds, Endpoint::Query).as_ref())
 }
 
 /// A task's key among every server's: task ids count per server.
@@ -502,9 +621,9 @@ fn task_key(st: &AppState, id: &str) -> String {
     format!("{:p}/{id}", st)
 }
 
-fn add_caller(st: &AppState, id: &str, p: &Principal) {
+pub(crate) fn add_caller(st: &AppState, id: &str, ds: &str, p: &Principal) {
     let id = &task_key(st, id);
-    let me = who(p);
+    let me = (who(p), read_view(p, ds));
     let mut c = CALLERS.lock();
     if let Some((_, v)) = c.iter_mut().find(|(t, _)| t == id) {
         if !v.contains(&me) {
@@ -513,29 +632,52 @@ fn add_caller(st: &AppState, id: &str, p: &Principal) {
         return;
     }
     if c.len() >= MAX_CALLERS {
-        c.pop_front();
+        // the records of this server's tasks that it no longer lists go first
+        let mine = format!("{:p}/", st);
+        let listed: HashSet<String> = st
+            .tasks
+            .lock()
+            .iter()
+            .map(|t| task_key(st, &t.id))
+            .collect();
+        c.retain(|(t, _)| !t.starts_with(&mine) || listed.contains(t));
+        while c.len() >= MAX_CALLERS {
+            c.pop_front();
+        }
     }
     c.push_back((id.to_string(), vec![me]));
 }
 
-/// Whether `p` started or joined the background run of task `id`.
-pub(crate) fn follows(st: &AppState, id: &str, p: &Principal) -> bool {
+/// The callers of task `id`, if `p` may still act as one: it reads `ds` now, and through
+/// the same view as when it started or joined the run.
+fn caller_pos(st: &AppState, id: &str, ds: &str, p: &Principal) -> Option<usize> {
+    if !p.can(ds, crate::auth::Level::Read) {
+        return None;
+    }
     let id = task_key(st, id);
-    let me = who(p);
+    let me = (who(p), read_view(p, ds));
     CALLERS
         .lock()
         .iter()
-        .any(|(t, v)| *t == id && v.contains(&me))
+        .find(|(t, _)| *t == id)
+        .and_then(|(_, v)| v.iter().position(|c| *c == me))
 }
 
-/// Whether `p` started the background run of task `id`.
-pub(crate) fn started(st: &AppState, id: &str, p: &Principal) -> bool {
-    let id = task_key(st, id);
-    let me = who(p);
-    CALLERS
-        .lock()
-        .iter()
-        .any(|(t, v)| *t == id && v.first() == Some(&me))
+/// Whether `p` started or joined the background run of task `id` on `ds`, and may still
+/// follow it.
+pub(crate) fn follows(st: &AppState, id: &str, ds: &str, p: &Principal) -> bool {
+    caller_pos(st, id, ds, p).is_some()
+}
+
+/// Whether `p` started the background run of task `id` on `ds`, and may still cancel it.
+pub(crate) fn started(st: &AppState, id: &str, ds: &str, p: &Principal) -> bool {
+    caller_pos(st, id, ds, p) == Some(0)
+}
+
+/// The tasks of the runs in progress, for tests.
+#[cfg(test)]
+pub(crate) fn running_ids() -> Vec<String> {
+    RUNNING.lock().iter().map(|(_, id)| id.clone()).collect()
 }
 
 /// Datasets whose background runs wait before they compute, so that tests can join and
@@ -556,10 +698,17 @@ impl Drop for Running {
 
 // ------------------------------------------------------------- the route ------
 
-/// The part of the key that names the request: the request without its view-only
-/// members, and the definition of a named projection, which can change without a commit.
-fn request_key(ds: &Dataset, req: &AlgoRequest) -> String {
-    let mut k = serde_json::to_string(req).unwrap_or_default();
+/// The part of the key that names the request: the query text it stands for, with every
+/// prefixed name expanded by the dataset's prefixes as they are now, and the definition
+/// of a named projection, which can change without a commit. The run computes this same
+/// text, so a changed prefix is a different key.
+fn request_key(ds: &Dataset, req: &AlgoRequest) -> Result<(String, String), ApiError> {
+    let q = ds
+        .dataset
+        .algorithms()
+        .query_text_with_summary(req)
+        .map_err(ApiError::from)?;
+    let mut k = q.clone();
     if let Some(ProjectionRef::Named(n)) = &req.projection {
         let def = ds.dataset.algorithms().projections().get(n);
         k.push('\u{1f}');
@@ -568,7 +717,7 @@ fn request_key(ds: &Dataset, req: &AlgoRequest) -> String {
                 .unwrap_or_default(),
         );
     }
-    k
+    Ok((q, k))
 }
 
 fn key(ds: &Dataset, commit: u64, opts: &QueryOptions, request: String) -> Key {
@@ -587,6 +736,32 @@ fn key(ds: &Dataset, commit: u64, opts: &QueryOptions, request: String) -> Key {
     }
 }
 
+/// The answer as a response, `507` with `budget: "result-bytes"` when its JSON is larger
+/// than `limit`.
+fn respond(answer: J, limit: Option<u64>) -> ApiResult {
+    let body = serde_json::to_vec(&answer).map_err(|e| {
+        err(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("could not write the answer: {e}"),
+        )
+    })?;
+    if let Some(limit) = limit
+        && body.len() as u64 > limit
+    {
+        return Err(sparkles::Error::BudgetExceeded(sparkles::Budget {
+            kind: sparkles::BudgetKind::ResultBytes,
+            limit,
+            requested: body.len() as u64,
+        })
+        .into());
+    }
+    Ok((
+        [(axum::http::header::CONTENT_TYPE, "application/json")],
+        body,
+    )
+        .into_response())
+}
+
 /// A view-only run: answered at once, or with `async` started (or joined) as a task.
 pub(crate) async fn run(
     State(st): St,
@@ -598,12 +773,22 @@ pub(crate) async fn run(
 ) -> ApiResult {
     let at = super::super::history::at_param(&params)?;
     let mut opts = super::super::query_options(&st, &ds, &params);
+    // budgets the request asked for, never above the server's
+    let asked = super::super::budgets::Overrides::parse(&params)?;
+    asked.apply(&mut opts);
+    let limit = asked.result_limit(st.limits.max_result_bytes);
     crate::auth::restrict(&mut opts, &p, &ds.name, Endpoint::Query);
-    // the whole result is computed, and the answer is cut to the server's row limit
+    // the whole result is computed, and the answer is cut to the request's row limit
     let max_rows = opts.max_rows.take().unwrap_or(usize::MAX);
-    let request = request_key(&ds, &req);
+    let (q, request) = request_key(&ds, &req)?;
     if view.background {
-        return background(st, ds, p, params, req, view, at, opts, request, max_rows).await;
+        let run = Background {
+            q,
+            request,
+            max_rows,
+            limit,
+        };
+        return background(st, ds, p, params, req, view, at, opts, run).await;
     }
     let timeout = opts.timeout;
     let (cancel, _cancel_on_drop) = super::super::cancel_on_drop();
@@ -614,11 +799,13 @@ pub(crate) async fn run(
         let key = key(&ds, snap.commit, &opts, request);
         if let Some(kept) = get(&key) {
             HITS.fetch_add(1, Ordering::Relaxed);
-            return Ok(Json(kept.answer(&view, true, max_rows)).into_response());
+            return respond(kept.answer(&view, true, max_rows), limit);
         }
         MISSES.fetch_add(1, Ordering::Relaxed);
+        // the decoded rows stay charged until the answer is written
+        let mut held = Held::new(&opts);
         let kept = Arc::new(
-            compute(&ds, snap, &req, &opts)
+            compute(snap, &q, &opts, &mut held)
                 .map_err(|e| super::super::with_timeout(e.into(), timeout))?,
         );
         tracing::debug!(
@@ -630,9 +817,22 @@ pub(crate) async fn run(
         if view.keep {
             put(st.catalog.pool(), key, kept.clone());
         }
-        Ok(Json(kept.answer(&view, false, max_rows)).into_response())
+        let out = respond(kept.answer(&view, false, max_rows), limit);
+        drop(held);
+        out
     })
     .await
+}
+
+/// What a background run computes and how its answer is bounded.
+struct Background {
+    /// the query text the request stands for
+    q: String,
+    /// the request's part of the key
+    request: String,
+    max_rows: usize,
+    /// the result-byte limit of an answer from the cache
+    limit: Option<u64>,
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -645,9 +845,14 @@ async fn background(
     view: ViewOpts,
     at: Option<sparkles::history::At>,
     mut opts: QueryOptions,
-    request: String,
-    max_rows: usize,
+    run: Background,
 ) -> ApiResult {
+    let Background {
+        q,
+        request,
+        max_rows,
+        limit,
+    } = run;
     // A background run is not bound to the request: it has the deadline of an update,
     // none unless the request or `--update-timeout` gives one, and takes its grant of
     // the memory pool when its task starts, as a write-back run does.
@@ -658,7 +863,7 @@ async fn background(
         let key = key(&ds, snap.commit, &opts, request);
         if let Some(kept) = get(&key) {
             HITS.fetch_add(1, Ordering::Relaxed);
-            return Ok(Json(kept.answer(&view, true, max_rows)).into_response());
+            return respond(kept.answer(&view, true, max_rows), limit);
         }
         let mut running = RUNNING.lock();
         // a run that was cancelled is not joined: it is ending, and a new one starts
@@ -678,13 +883,13 @@ async fn background(
         if let Some(task) = live {
             let id = &task.id;
             JOINS.fetch_add(1, Ordering::Relaxed);
-            add_caller(&st, id, &p);
+            add_caller(&st, id, &ds.name, &p);
             return Ok(task_answer(&task, true));
         }
         // a result kept between the check above and taking the lock
         if let Some(kept) = get(&key) {
             HITS.fetch_add(1, Ordering::Relaxed);
-            return Ok(Json(kept.answer(&view, true, max_rows)).into_response());
+            return respond(kept.answer(&view, true, max_rows), limit);
         }
         super::super::task_start_check(&st, None, &ds.name)?;
         MISSES.fetch_add(1, Ordering::Relaxed);
@@ -697,12 +902,14 @@ async fn background(
         });
         let id = st.next_task_id();
         running.push((key.clone(), id.clone()));
-        add_caller(&st, &id, &p);
+        // made before the task is queued, so that a task cancelled before it starts,
+        // whose closure is dropped without running, still leaves the list
+        let cleanup = Running(key.clone(), id.clone());
+        add_caller(&st, &id, &ds.name, &p);
         let state = st.clone();
         let d = ds.clone();
-        let task_id = id.clone();
         let task = st.start_task_opts(id, TASK, &ds.name, None, true, move |h| {
-            let _running = Running(key.clone(), task_id);
+            let _running = cleanup;
             let mut opts = opts;
             opts.cancel = Some(h.cancel_flag());
             if let Some((pool, want, wait)) = admission {
@@ -719,13 +926,15 @@ async fn background(
             }
             // F14's algorithms report no iterations, so progress is by phase
             h.progress(0.05, "computing");
-            let kept = Arc::new(compute(&d, snap, &req, &opts)?);
-            opts.grant = None;
+            let mut held = Held::new(&opts);
+            let kept = Arc::new(compute(snap, &q, &opts, &mut held)?);
             h.progress(0.95, "keeping the result");
             let rows = kept.rows.len();
             let commit = kept.commit;
             let summary = kept.summary.clone();
             let stored = put(state.catalog.pool(), key, kept);
+            drop(held);
+            opts.grant = None;
             h.set_detail(json!({
                 "algorithm": req.algorithm,
                 "commit": commit,
@@ -919,25 +1128,63 @@ mod tests {
         let pool = sparkles::sparql::pool::QueryPool::new(64 << 20);
         {
             let cache = ViewCache::new();
-            assert!(cache.put(Some(&pool), key(1, "pool"), k.clone()));
+            assert!(cache.put(Some(&pool), key(1, "pool"), Arc::new(communities())));
             assert!(pool.granted() >= k.bytes);
+            // the result holds the grant, so it is given back when the cache drops it
         }
         assert_eq!(pool.granted(), 0);
         // a pool without room keeps nothing
         let held = pool.try_grant(64 << 20).unwrap();
         let cache = ViewCache::new();
-        assert!(!cache.put(Some(&pool), key(2, "pool"), k.clone()));
+        assert!(!cache.put(Some(&pool), key(2, "pool"), Arc::new(communities())));
         assert!(cache.get(&key(2, "pool")).is_none());
         drop(held);
         // a newer result takes the memory of older ones when the pool is short
-        let small = sparkles::sparql::pool::QueryPool::new(1 << 20);
-        assert!(cache.put(Some(&small), key(3, "pool"), k.clone()));
-        assert!(cache.put(Some(&small), key(4, "pool"), k.clone()));
+        // (8 MiB: half of it is one 4 MiB granule, room for one result)
+        let small = sparkles::sparql::pool::QueryPool::new(8 << 20);
+        assert!(cache.put(Some(&small), key(3, "pool"), Arc::new(communities())));
+        assert!(cache.put(Some(&small), key(4, "pool"), Arc::new(communities())));
         assert!(cache.get(&key(3, "pool")).is_none());
         assert!(cache.get(&key(4, "pool")).is_some());
         // a result larger than the whole cache is never kept
         let mut big = communities();
         big.bytes = MAX_BYTES + 1;
         assert!(!cache.put(None, key(5, "pool"), Arc::new(big)));
+    }
+
+    fn sized(mb: u64) -> Arc<Kept> {
+        let mut k = communities();
+        k.bytes = mb << 20;
+        Arc::new(k)
+    }
+
+    #[test]
+    fn the_cache_holds_at_most_half_the_pool() {
+        let pool = sparkles::sparql::pool::QueryPool::new(64 << 20);
+        let cache = ViewCache::new();
+        assert!(!cache.put(Some(&pool), key(1, "half"), sized(40)));
+        assert_eq!(pool.granted(), 0);
+        assert!(cache.put(Some(&pool), key(2, "half"), sized(20)));
+        assert!(cache.put(Some(&pool), key(3, "half"), sized(20)));
+        assert!(pool.granted() <= 32 << 20, "{}", pool.granted());
+        assert!(
+            cache.get(&key(2, "half")).is_none(),
+            "the older one gave way"
+        );
+        assert!(cache.get(&key(3, "half")).is_some());
+    }
+
+    #[test]
+    fn a_reader_keeps_a_dropped_result_charged() {
+        let pool = sparkles::sparql::pool::QueryPool::new(64 << 20);
+        let cache = ViewCache::new();
+        assert!(cache.put(Some(&pool), key(1, "reader"), sized(20)));
+        let reading = cache.get(&key(1, "reader")).unwrap();
+        // a newer result pushes it out of the cache while it is read
+        assert!(cache.put(Some(&pool), key(2, "reader"), sized(20)));
+        assert!(cache.get(&key(1, "reader")).is_none());
+        assert!(pool.granted() >= 40 << 20, "{}", pool.granted());
+        drop(reading);
+        assert!(pool.granted() < 40 << 20, "{}", pool.granted());
     }
 }

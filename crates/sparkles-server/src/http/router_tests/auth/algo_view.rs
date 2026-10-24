@@ -12,7 +12,13 @@ const DATA: &str = r#"@prefix ex: <http://ex/> .
 "#;
 
 fn users() -> String {
+    users_with("http://ex/ga", true)
+}
+
+/// The users, with the graph `aga` reads and whether `aga2` may read `av` at all.
+fn users_with(aga_graph: &str, aga2: bool) -> String {
     let h = |pw: &str| hash_password_with(pw, 8, 1, 1).unwrap();
+    let aga2_ds = if aga2 { "av" } else { "elsewhere" };
     format!(
         r#"
 [[users]]
@@ -26,13 +32,13 @@ password = "{aga}"
 [[users.grants]]
 dataset = "av"
 level = "read"
-graphs = ["http://ex/ga"]
+graphs = ["{aga_graph}"]
 
 [[users]]
 name = "aga2"
 password = "{aga2}"
 [[users.grants]]
-dataset = "av"
+dataset = "{aga2_ds}"
 level = "read"
 graphs = ["http://ex/ga"]
 "#,
@@ -175,5 +181,49 @@ async fn a_restricted_caller_follows_and_cancels_its_own_background_run() {
     let done = crate::http::router_tests::tasks::wait_done(&st, &id).await;
     assert_eq!(done.state, "cancelled", "{:?}", done.message);
     let done = crate::http::router_tests::tasks::wait_done(&st, &fid).await;
+    assert_eq!(done.state, "done", "{:?}", done.message);
+}
+
+#[tokio::test]
+async fn followers_lose_the_task_when_their_access_changes() {
+    let (dir, st, app) = server();
+    crate::http::algo::view::PAUSED.lock().push("av".into());
+    let body = json!({
+        "algorithm": "wcc",
+        "projection": {"predicates": ["http://ex/p"]},
+        "nodes": ["http://ex/a"],
+        "keep": true,
+        "async": true,
+    });
+    let r = run(&app, "aga", &body).await;
+    assert_eq!(r.status, StatusCode::ACCEPTED, "{}", r.text());
+    let id = r.json()["id"].as_str().unwrap().to_string();
+    let uri = format!("/$/tasks/{id}");
+    let j = run(&app, "aga2", &body).await;
+    assert_eq!(j.json()["joined"], true, "{}", j.text());
+    assert_eq!(
+        get_as(&app, &uri, Some(&b("aga"))).await.status,
+        StatusCode::OK
+    );
+    // aga now reads another graph, and aga2 nothing
+    let f = Fixture {
+        extra: users_with("http://ex/gb", false),
+        ..Default::default()
+    };
+    std::fs::write(dir.path().join("auth.toml"), config_text(&f)).unwrap();
+    st.auth.as_ref().unwrap().reload().unwrap();
+    for user in ["aga", "aga2"] {
+        let r = get_as(&app, &uri, Some(&b(user))).await;
+        assert_ne!(
+            r.status,
+            StatusCode::OK,
+            "{user} still follows: {}",
+            r.text()
+        );
+    }
+    let r = call(&app, "DELETE", &uri, &[("authorization", &b("aga"))], "").await;
+    assert_ne!(r.status, StatusCode::ACCEPTED, "{}", r.text());
+    crate::http::algo::view::PAUSED.lock().retain(|d| d != "av");
+    let done = crate::http::router_tests::tasks::wait_done(&st, &id).await;
     assert_eq!(done.state, "done", "{:?}", done.message);
 }

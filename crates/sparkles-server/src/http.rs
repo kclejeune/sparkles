@@ -4965,7 +4965,7 @@ pub(crate) fn algo_view_metrics(out: &mut String) {
 fn task_visible(st: &AppState, p: &Principal, t: &crate::state::Task) -> bool {
     // a background view-only run is followed by the callers that started or joined it,
     // whose view may be restricted
-    if t.kind == algo::view::TASK && algo::view::follows(st, &t.id, p) {
+    if t.kind == algo::view::TASK && algo::view::follows(st, &t.id, &t.dataset, p) {
         return true;
     }
     if t.dataset.is_empty() {
@@ -5083,7 +5083,7 @@ async fn cancel_task(
     } else {
         p.can(&t.dataset, Level::Admin)
             // the caller that started a background view-only run may cancel it
-            || (t.kind == algo::view::TASK && algo::view::started(&st, &t.id, &p))
+            || (t.kind == algo::view::TASK && algo::view::started(&st, &t.id, &t.dataset, &p))
     };
     if !allowed {
         let msg = if t.dataset.is_empty() {
