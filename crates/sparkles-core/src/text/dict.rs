@@ -365,6 +365,13 @@ fn parse_mecab(dir: &Path, layout: Layout) -> Result<Parts> {
         };
         unk[c].push(entry_of(&f[0], &f[1..], layout, &mut strings, &at)?);
     }
+    // a character of a category without unknown words could end no path
+    if let Some(c) = unk.iter().position(Vec::is_empty) {
+        return Err(bad(format!(
+            "unk.def has no entry for the category {}",
+            categories[c].name
+        )));
+    }
     let check = |e: &Entry| (e.right as usize) < r && (e.left as usize) < l;
     if !words
         .values()
@@ -790,6 +797,9 @@ impl Dictionary {
         if !ok {
             return Err(bad("an entry refers past the end of a table"));
         }
+        if unknown.iter().any(|&(_, n)| n == 0) {
+            return Err(bad("a character category has no unknown words"));
+        }
         let kanji = categories
             .iter()
             .enumerate()
@@ -1092,10 +1102,17 @@ pub fn install(name: &str, bytes: &[u8]) -> Result<String> {
         return Err(bad(format!("the dictionary's layout does not suit {name}")));
     }
     let path = path_of(name);
-    if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent)?;
-    }
-    crate::store::write_atomic(&path, bytes)?;
+    let parent = path.parent().unwrap_or(Path::new("."));
+    std::fs::create_dir_all(parent)?;
+    // a temporary file of its own, so that concurrent installs each rename a whole file
+    let mut tmp = tempfile::Builder::new()
+        .prefix(&format!(".{name}."))
+        .suffix(".tmp")
+        .tempfile_in(parent)?;
+    std::io::Write::write_all(&mut tmp, bytes)?;
+    tmp.as_file().sync_all()?;
+    tmp.persist(&path).map_err(|e| Error::from(e.error))?;
+    crate::store::sync_dir(parent)?;
     Ok(d.sha256)
 }
 
@@ -1289,6 +1306,56 @@ pub(crate) mod tests {
         );
         // other words pass through
         assert_eq!(texts(&d, "Tokyo 2024 東京"), ["Tokyo", "2024", "東京"]);
+    }
+
+    #[test]
+    fn categories_need_unknown_words() {
+        let tmp = tempfile::tempdir().unwrap();
+        write_ipadic(tmp.path());
+        // DEFAULT has no unknown words, so a Latin word could end no path
+        std::fs::write(
+            tmp.path().join("unk.def"),
+            "SPACE,2,2,9000,記号,空白,*,*,*,*,*\nKANJI,1,1,9000,名詞,一般,*,*,*,*,*\n\
+             HIRAGANA,1,1,9000,名詞,一般,*,*,*,*,*\nKATAKANA,1,1,4000,名詞,一般,*,*,*,*,*\n",
+        )
+        .unwrap();
+        let e = compile(tmp.path(), Layout::Ipadic).unwrap_err().to_string();
+        assert!(
+            e.contains("unk.def has no entry for the category DEFAULT"),
+            "{e}"
+        );
+    }
+
+    /// Two readings of `a`: a noun that is cheap but costly to end the text with, and a
+    /// particle (dropped from the tokens) that costs 1 and ends the text for free.
+    /// Switching between them costs 10,000.
+    fn write_homographs(dir: &Path) {
+        std::fs::write(
+            dir.join("lex.csv"),
+            "a,1,1,0,NNG,*,F,a,*,*,*,*\na,2,2,1,JKS,*,F,a,*,*,*,*\n",
+        )
+        .unwrap();
+        std::fs::write(
+            dir.join("matrix.def"),
+            "3 3\n0 0 0\n0 1 0\n0 2 0\n1 0 30000\n1 1 0\n1 2 10000\n\
+             2 0 0\n2 1 10000\n2 2 0\n",
+        )
+        .unwrap();
+        std::fs::write(dir.join("char.def"), "DEFAULT 0 1 0\n").unwrap();
+        std::fs::write(dir.join("unk.def"), "DEFAULT,1,1,9000,SY,*,*,*,*,*,*,*\n").unwrap();
+    }
+
+    #[test]
+    fn a_long_ambiguous_text_commits_to_the_cheapest_path_so_far() {
+        let tmp = tempfile::tempdir().unwrap();
+        write_homographs(tmp.path());
+        let d = Dictionary::from_bytes(&compile(tmp.path(), Layout::KoDic).unwrap()).unwrap();
+        // within 1,024 UTF-16 units the best path of the whole text wins: particles
+        assert!(texts(&d, &"a".repeat(1000)).is_empty());
+        // past them, the tokenizer commits to the cheapest path so far, the nouns, as
+        // Nori does
+        let t = texts(&d, &"a".repeat(1025));
+        assert_eq!(t.len(), 1024);
     }
 
     #[test]

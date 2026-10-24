@@ -42,8 +42,11 @@ const NON_SPACING_MARK: u16 = 4;
 const DIGIT: u16 = 8;
 const SCRIPT_COMMON: u16 = 1;
 const SCRIPT_INHERITED: u16 = 2;
-/// Kuromoji's and Nori's longest unknown word, in characters.
-const MAX_UNKNOWN: usize = 1024;
+/// Kuromoji's and Nori's longest unknown word, in UTF-16 code units.
+const MAX_UNKNOWN: u32 = 1024;
+/// How far, in UTF-16 code units, the tokenizers search past the committed prefix
+/// before they commit to the cheapest path so far.
+const MAX_BACKTRACE_GAP: u32 = 1024;
 
 /// The Java properties of `c`, or of its high surrogate above U+FFFF.
 fn java(c: char) -> u16 {
@@ -66,6 +69,8 @@ struct Ch {
     class: u8,
     java: u16,
     units: u8,
+    /// its offset in UTF-16 code units
+    unit: u32,
 }
 
 impl Ch {
@@ -98,6 +103,8 @@ type Word = (usize, usize, u32);
 struct Lattice<'a> {
     d: &'a Dictionary,
     text: &'a str,
+    /// the length of `text` in UTF-16 code units
+    units: u32,
     cs: Vec<Ch>,
     /// the character at each byte offset of `text` where one starts
     char_at: Vec<u32>,
@@ -114,6 +121,7 @@ impl<'a> Lattice<'a> {
     fn new(d: &'a Dictionary, text: &'a str) -> Self {
         let mut cs = Vec::with_capacity(text.len());
         let mut char_at = vec![u32::MAX; text.len() + 1];
+        let mut unit = 0;
         for (at, c) in text.char_indices() {
             char_at[at] = cs.len() as u32;
             cs.push(Ch {
@@ -121,8 +129,11 @@ impl<'a> Lattice<'a> {
                 class: d.lucene_class(c),
                 java: java(c),
                 units: c.len_utf16() as u8,
+                unit,
             });
+            unit += c.len_utf16() as u32;
         }
+        let units = unit;
         char_at[text.len()] = cs.len() as u32;
         let mut nodes = vec![Vec::new(); cs.len() + 1];
         nodes[0].push(Node {
@@ -136,6 +147,7 @@ impl<'a> Lattice<'a> {
         Lattice {
             d,
             text,
+            units,
             cs,
             char_at,
             nodes,
@@ -148,6 +160,49 @@ impl<'a> Lattice<'a> {
 
     fn byte(&self, i: usize) -> usize {
         self.cs.get(i).map_or(self.text.len(), |c| c.at)
+    }
+
+    /// The UTF-16 offset of position `i`.
+    fn unit(&self, i: usize) -> u32 {
+        self.cs.get(i).map_or(self.units, |c| c.unit)
+    }
+
+    /// Whether the search has gone `MAX_BACKTRACE_GAP` units past the committed prefix.
+    fn gap(&self, pos: usize) -> bool {
+        self.unit(pos) - self.unit(self.committed) >= MAX_BACKTRACE_GAP
+    }
+
+    /// Keeps only the cheapest node at or after `pos`, as Lucene does before it forces a
+    /// backtrace, and returns its position, where it is now the only node.
+    fn prune_to_cheapest(&mut self, pos: usize) -> usize {
+        let mut least: Option<(i64, usize, usize)> = None;
+        for p in pos..=self.max_end {
+            for (k, n) in self.nodes[p].iter().enumerate() {
+                if least.is_none_or(|l| n.cost < l.0) {
+                    least = Some((n.cost, p, k));
+                }
+            }
+        }
+        // a node always ends at `pos`, which the caller checked
+        let (_, at, k) = least.expect("a live path");
+        for p in pos..=self.max_end {
+            if p == at {
+                let n = self.nodes[p][k];
+                self.nodes[p].clear();
+                self.nodes[p].push(n);
+            } else {
+                self.nodes[p] = Vec::new();
+            }
+        }
+        at
+    }
+
+    /// Frees the nodes of the positions before the committed prefix's end, which no path
+    /// reads again.
+    fn release(&mut self, from: usize) {
+        for p in from..self.committed {
+            self.nodes[p] = Vec::new();
+        }
     }
 
     /// The dictionary words that start at character `i`: (end, entry).
@@ -213,6 +268,17 @@ impl<'a> Lattice<'a> {
                 self.backtrace_ja(pos, 0);
                 self.nodes[pos][0].cost = 0;
             }
+            if self.gap(pos) {
+                // Lucene's safety: commit to the cheapest path so far, which may not be
+                // the best path of the whole text
+                let at = self.prune_to_cheapest(pos);
+                self.backtrace_ja(at, 0);
+                for n in &mut self.nodes[at] {
+                    n.cost = 0;
+                }
+                pos = at;
+                continue;
+            }
             let known = self.known(pos);
             for &(end, e) in &known {
                 self.add_ja(pos, end, e, false);
@@ -220,13 +286,16 @@ impl<'a> Lattice<'a> {
             let first = self.cs[pos];
             let cat = &self.d.categories[first.class as usize];
             if known.is_empty() || cat.invoke {
-                let mut len = 1;
+                // Lucene counts the length in UTF-16 units, and a run whose limit falls
+                // inside a surrogate pair ends before that pair here
+                let (mut len, mut units) = (1, first.units as u32);
                 if cat.group {
                     while pos + len < n
-                        && len < MAX_UNKNOWN
+                        && units + self.cs[pos + len].units as u32 <= MAX_UNKNOWN
                         && self.cs[pos + len].class == first.class
                         && self.cs[pos + len].punct() == first.punct()
                     {
+                        units += self.cs[pos + len].units as u32;
                         len += 1;
                     }
                 }
@@ -333,7 +402,9 @@ impl<'a> Lattice<'a> {
             pos = back;
             best = next;
         }
+        let from = self.committed;
         self.committed = end;
+        self.release(from);
         words.reverse();
         self.words.extend(words);
     }
@@ -401,6 +472,15 @@ impl<'a> Lattice<'a> {
                 self.backtrace_ko(pos, 0);
                 self.nodes[pos][0].cost = 0;
             }
+            if self.gap(pos) {
+                let at = self.prune_to_cheapest(pos);
+                self.backtrace_ko(at, 0);
+                for n in &mut self.nodes[at] {
+                    n.cost = 0;
+                }
+                pos = at;
+                continue;
+            }
             let from = pos;
             // one space before the word is skipped
             if self.cs[pos].java & SPACE_SEPARATOR != 0 {
@@ -417,11 +497,11 @@ impl<'a> Lattice<'a> {
             let cat = &self.d.categories[first.class as usize];
             if known.is_empty() || cat.invoke {
                 let mut class = first.class;
-                let mut len = 1;
+                let (mut len, mut units) = (1, first.units as u32);
                 if cat.group {
                     let mut script = first.script();
                     let common = |s: u16| s == SCRIPT_COMMON || s == SCRIPT_INHERITED;
-                    while pos + len < n && len < MAX_UNKNOWN {
+                    while pos + len < n && units + self.cs[pos + len].units as u32 <= MAX_UNKNOWN {
                         let ch = self.cs[pos + len];
                         let sc = ch.script();
                         let same = script == sc
@@ -433,6 +513,7 @@ impl<'a> Lattice<'a> {
                             && (ch.java & DIGIT) == (first.java & DIGIT)
                             && self.d.categories[ch.class as usize].group
                         {
+                            units += ch.units as u32;
                             len += 1;
                         } else {
                             break;
@@ -489,7 +570,9 @@ impl<'a> Lattice<'a> {
             pos = node.back;
             best = node.back_index;
         }
+        let from = self.committed;
         self.committed = end;
+        self.release(from);
         words.reverse();
         self.words.extend(words);
     }
