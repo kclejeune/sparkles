@@ -282,7 +282,7 @@
                   <button
                     class="btn sm"
                     disabled={busy[d.name]}
-                    title="Merge the updates into a new sorted index generation"
+                    title="Merge pending updates into a new index generation"
                     onclick={() => compactNow(d.name)}
                     ><Icon name="layers" size={13} /> Compact</button
                   >
@@ -341,9 +341,9 @@
         </table>
       </div>
       <p class="note faint">
-        Rates cover the last {STATUS_POLL_MS / 1000} s. Latency percentiles do too when that interval
-        had traffic, and otherwise the time since the server started. Health checks, metrics and the UI's
-        own files are not counted.
+        Rates cover the last {STATUS_POLL_MS / 1000} s. Latency percentiles cover the same window when
+        it had traffic, and otherwise the time since the server started. Health checks, metrics and the
+        UI's own files are not counted.
       </p>
     {:else}
       <div class="panel-body faint">Loading…</div>

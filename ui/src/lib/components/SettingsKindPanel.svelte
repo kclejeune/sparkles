@@ -74,7 +74,7 @@
     url,
     fields,
     canEdit = false,
-    forbiddenText = 'Changing these settings needs admin on the dataset.',
+    forbiddenText = 'Changing these settings requires admin on the dataset.',
     declaredName = "the server's settings file",
     groupExtra,
     confirmWrite,
@@ -243,8 +243,8 @@
           await load();
           toasts.push(
             'info',
-            `Someone else changed the ${lower} settings`,
-            'The section shows their version now. Make your change again.',
+            `The ${lower} settings changed elsewhere`,
+            'They now show the latest version. Make your change again.',
           );
           break;
         case 'locked':
@@ -263,7 +263,7 @@
           }
           break;
         default:
-          toasts.error(`The ${lower} settings were not saved`, e);
+          toasts.error(`Could not save the ${lower} settings`, e);
       }
       return false;
     } finally {
@@ -310,7 +310,7 @@
     const fields = overrides.map((o) => o.path);
     if (
       await write(
-        `The ${lower} settings use the server config for ${fields.length} field${fields.length === 1 ? '' : 's'}`,
+        `Restored ${fields.length} ${lower} field${fields.length === 1 ? '' : 's'} from the server config`,
         (etag) => resetFields(url, fields, etag),
       )
     )
@@ -388,7 +388,7 @@
         class="btn sm"
         disabled={busy}
         onclick={() => (resetAllOpen = true)}
-        title="Remove every runtime change of this kind">Reset all</button
+        title="Remove every runtime change in this section">Reset all</button
       >
     {/if}
     <button class="btn ghost icon sm" aria-label="Reload {title}" onclick={load} disabled={busy}
@@ -407,8 +407,8 @@
       {#if !k.status.valid}
         <div class="error-box" role="alert">
           <strong>The effective {lower} settings are not valid.</strong>
-          {k.status.error ?? ''} The features that read them treat the problem as a missing provider or
-          setting until it is fixed.
+          {k.status.error ?? ''} Until this is fixed, features that use these settings treat the problem
+          as a missing provider or setting.
         </div>
       {/if}
       {#if overrides.length}
@@ -570,7 +570,7 @@
         {/each}
         {#if writeError}
           <div class="error-box" role="alert">
-            <strong>The {lower} settings were not saved.</strong>
+            <strong>Could not save the {lower} settings.</strong>
             {writeError}
           </div>
         {/if}
@@ -593,14 +593,14 @@
       </form>
 
       <details class="advanced">
-        <summary>Advanced: the runtime layer as JSON</summary>
+        <summary>Advanced: edit runtime changes as JSON</summary>
         <div class="layers">
           <label class="field">
             Runtime layer
             <span class="faint small"
-              >The fields changed at runtime, with the form's unsaved changes. An edit here shows in
-              the form, and members the form does not show are kept. Saving makes the runtime layer
-              equal to this object, so removing a member resets it.</span
+              >Fields changed at runtime, including unsaved changes from the form. Edits here also
+              update the form, and members the form does not show are kept. Saving replaces the
+              runtime layer with this object, so removing a member resets that field.</span
             >
             <textarea
               class="textarea"
@@ -617,7 +617,7 @@
             <span class="faint small">
               {k.locked.length
                 ? `Locked: ${k.locked.join(', ')}.`
-                : 'The settings file locks no field of this kind.'}
+                : 'No fields in this section are locked by the settings file.'}
             </span>
             <pre class="declared">{JSON.stringify(k.declared ?? {}, null, 2)}</pre>
           </div>
@@ -641,8 +641,8 @@
 
 <Modal bind:open={resetAllOpen} title="Reset the {lower} settings?">
   <p>
-    This removes every change made at runtime to the {lower} settings, so each field takes the value of
-    {declaredName} or the default.
+    This removes every runtime change to the {lower} settings. Each field goes back to the value from
+    {declaredName} or its default.
   </p>
   {#if k}<pre class="declared">{runtimeText(k)}</pre>{/if}
   {#snippet actions()}
@@ -656,7 +656,7 @@
 <Modal bind:open={useConfigOpen} title="Use the server config for these fields?" width={520}>
   <p>
     These {lower} fields were changed at runtime and override the server's configuration. Their runtime
-    values are removed, so each field takes the server config's value again. Other changes stay.
+    values are removed and each field goes back to the server config's value. Other changes stay.
   </p>
   <table class="data overrides-list">
     <thead><tr><th>Field</th><th>Now</th><th>Server config</th></tr></thead>

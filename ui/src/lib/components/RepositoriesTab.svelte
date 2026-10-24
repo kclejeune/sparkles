@@ -62,7 +62,7 @@
   }
 
   async function remove(r: b.Repository) {
-    const msg = `Unregister ${r.name}? Its contents at ${repoLocation(r)} stay untouched, and it can be added again later.`;
+    const msg = `Unregister ${r.name}? Its contents at ${repoLocation(r)} are left untouched, and you can add it again later.`;
     if (!confirm(msg)) return;
     try {
       await b.removeRepository(r.name);
@@ -90,7 +90,8 @@
 {#if admin}
   <div class="bar">
     <p class="muted small">
-      Where backups go. Use one writing server per repository and attach it read-only elsewhere.
+      Where backups are stored. Let only one server write to each repository, and attach it
+      read-only elsewhere.
     </p>
     <span class="spacer"></span>
     <button
@@ -112,7 +113,7 @@
         ><Icon name="plus" size={14} /> Add the first repository</button
       >
     {:else if !admin}
-      <p class="faint small">A server admin registers them.</p>
+      <p class="faint small">Ask a server admin to add one.</p>
     {/if}
   </div>
 {:else if !admin}
@@ -146,7 +147,7 @@
           {#if r.readonly}<span class="badge iri">read-only</span>{/if}
           {#if r.status.singleWriter}<span
               class="badge warn"
-              title="No conditional writes: only one server may write to it">single writer</span
+              title="No conditional writes, so only one server may write to it">single writer</span
             >{/if}
           {#if insecureEndpoint(r)}<span class="badge danger" title="Plain http:// endpoint"
               >http</span
@@ -230,7 +231,7 @@
               class="btn sm"
               onclick={() => (gc = r)}
               disabled={!r.status.reachable}
-              title="Delete blobs no backup references (dry run first)">Run GC</button
+              title="Delete blobs that no backup uses, after a dry run">Run GC</button
             >
             <button class="btn sm" onclick={() => (locks = r.name)} disabled={!r.status.reachable}
               >Locks</button

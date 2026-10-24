@@ -61,7 +61,7 @@
     {/if}
     {#if conflict}
       <p class="note bad">
-        The operator locked this field in the server's settings file, so the change was refused.
+        This field is locked in the server's settings file, so the change was not saved.
       </p>
     {/if}
     {#if error}<p class="note bad">{error}</p>{/if}

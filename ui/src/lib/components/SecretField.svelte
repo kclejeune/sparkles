@@ -76,14 +76,14 @@
         <span class="faint" title={view.title}>{view.label}</span>
       {:else}
         <span class="badge danger"><Icon name="key" size={11} /> no key</span>
-        <span class="faint">{view ? view.title : `No key is stored under ${name} yet.`}</span>
+        <span class="faint">{view ? view.title : `No key saved for ${name} yet.`}</span>
       {/if}
       {#if onstore && !disabled && !view?.locked}
         <button
           type="button"
           class="btn sm"
           aria-expanded={setting}
-          aria-label="{view?.set ? 'Replace' : 'Set'} the key of {name}"
+          aria-label="{view?.set ? 'Replace' : 'Set'} the key for {name}"
           onclick={() => (setting = !setting)}>{view?.set ? 'Replace key' : 'Set key'}</button
         >
       {/if}
