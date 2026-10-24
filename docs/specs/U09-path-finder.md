@@ -398,7 +398,7 @@ a C12b protection on `ex:worksFor` for members of `ex:Founder` rather than with 
 grant.
 
 **Phase 3 tests.** `ui/src/lib/paths.test.ts` has 20 Vitest tests, four of them for the
-weight, and `ui/src/lib/path-overlay.test.ts` has 6 for merging paths into a drawn result.
+weight, and `ui/src/lib/path-overlay.test.ts` has 9 for merging paths into a drawn result and placing the nodes they add.
 `ui/tests/mock/paths-phase3.spec.ts` checks the weighted search in Explore, a weight list
 that follows the state and drops a weight the state lacks, the panel on the query page's
 canvas with the added nodes, the node menu, **Open in editor** and the reset on a new
