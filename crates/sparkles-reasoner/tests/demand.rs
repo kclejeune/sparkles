@@ -752,3 +752,27 @@ fn distinct_list_heads_are_not_a_cycle() {
         vec!["<http://ex.org/b>"]
     );
 }
+
+/// Second Codex re-review of F17-P1, #2: a noValue on a cycle through a list stays
+/// refused when the program is made again without the stage of derived lists.
+#[test]
+fn negation_through_lists_is_refused() {
+    let s = store("ex:a ex:p ex:b .");
+    let rules = Profile::Rules(
+        "@prefix ex: <http://ex.org/>.
+         [l: (?x ex:p ?y), noValue(ex:a, ex:q, ex:b) -> (ex:L rdf:first ex:b), (ex:L rdf:rest rdf:nil)]
+         [m: (?x ex:p ?y), listMember(ex:L, ?m) -> (ex:a ex:q ?m)]"
+            .into(),
+    );
+    let qr = reasoner(&rules);
+    for q in [
+        "SELECT ?m { ex:a ex:q ?m }",
+        "SELECT ?m { ex:a ex:q ?m . ex:L rdf:first ?m }",
+    ] {
+        match query(s.snapshot(), q, &demand(&qr)) {
+            Err(sparkles_core::Error::Component(c)) => assert_eq!(c.code, "reasoning-rules"),
+            Err(e) => panic!("{q}: {e}"),
+            Ok(r) => panic!("{q}: answered {:?}", rows(&r)),
+        }
+    }
+}

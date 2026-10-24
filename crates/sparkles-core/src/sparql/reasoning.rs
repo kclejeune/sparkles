@@ -922,15 +922,31 @@ impl Overlay {
             .collect();
         // The facts come from the session's tables, which a cache hit shares without a
         // charge, so the overlay's growth is charged here (Codex review F17-P1 #4). Tables
-        // of several demands can hold the same facts, which the overlay keeps once, so
-        // the charge is the growth of its inserted keys rather than the facts received.
-        let before = self.snap.delta.ins[Perm::Spo.index()].len();
+        // of several demands can hold the same facts, which the overlay keeps once. The
+        // facts the overlay does not hold yet are reserved before it grows, and the
+        // reservation then shrinks to the keys it grew by, which leaves out those the
+        // base index holds.
+        let spo = Perm::Spo.index();
+        let held = &self.snap.delta.ins[spo];
+        let mut seen: rustc_hash::FxHashSet<_> = rustc_hash::FxHashSet::default();
+        let upper = quads
+            .iter()
+            .filter(|q| {
+                let k = Perm::Spo.to_key(q);
+                !held.contains(&k) && seen.insert(k)
+            })
+            .count();
+        drop(seen);
+        let bytes = |n: usize| (n as u64).saturating_mul(OVERLAY_QUAD_BYTES);
+        let mut lease = ctx.output_lease(bytes(upper))?;
+        let before = held.len();
         let snap = self.snap.with_overlay(&quads, d.absent_from_default)?;
-        let grown = snap.delta.ins[Perm::Spo.index()]
-            .len()
-            .saturating_sub(before);
-        self.leases
-            .push(ctx.output_lease((grown as u64).saturating_mul(OVERLAY_QUAD_BYTES))?);
+        let grown = snap.delta.ins[spo].len().saturating_sub(before);
+        if grown < upper {
+            drop(lease);
+            lease = ctx.output_lease(bytes(grown))?;
+        }
+        self.leases.push(lease);
         self.snap = Arc::new(snap);
         Ok(())
     }

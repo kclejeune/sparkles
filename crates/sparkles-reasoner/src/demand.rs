@@ -1256,10 +1256,91 @@ pub(crate) fn transform(
     // A lower stage of every derived list can depend on itself when a rule reads one
     // list to build another, which the keys cannot tell apart. The program is then made
     // again with lists read as the stage holds them (Codex re-review F17-P1 #3).
+    // A program whose noValue lies on a cycle stays refused (second Codex re-review of
+    // F17-P1, #2).
     match transform_in(rules, terms, roots, est, pass, true) {
-        Err(TransformError::NotStratified) => transform_in(rules, terms, roots, est, pass, false),
+        Err(TransformError::NotStratified) if !negation_on_a_cycle(rules, terms) => {
+            transform_in(rules, terms, roots, est, pass, false)
+        }
         r => r,
     }
+}
+
+/// Whether a `noValue` of `rules` reads a predicate that depends on the predicate of its
+/// own rule's head, over the dependencies of predicates: those of body atoms, of
+/// `noValue` patterns, and the `rdf:first` and `rdf:rest` of the lists that builtins and
+/// head actions read. A variable predicate stands for every predicate.
+fn negation_on_a_cycle(rules: &[CRule], terms: &Terms) -> bool {
+    // node 0 reads every predicate (an atom whose predicate is a variable), node 1
+    // gives every predicate (such a head), and the others are constants
+    const READS_ALL: usize = 0;
+    const GIVES_ALL: usize = 1;
+    let mut ids: FxHashMap<u64, usize> = FxHashMap::default();
+    let node = |s: Slot, var: usize, ids: &mut FxHashMap<u64, usize>| match s {
+        Slot::Const(p) => {
+            let n = ids.len() + 2;
+            *ids.entry(p).or_insert(n)
+        }
+        _ => var,
+    };
+    let mut edges: Vec<(usize, usize)> = Vec::new();
+    let mut negative: Vec<(usize, usize)> = Vec::new();
+    for r in rules {
+        let heads: Vec<usize> = r
+            .head
+            .iter()
+            .map(|h| node(head_slots(h).1, GIVES_ALL, &mut ids))
+            .collect();
+        let mut deps: Vec<(usize, bool)> = r
+            .atoms
+            .iter()
+            .map(|a| (node(a.p, READS_ALL, &mut ids), false))
+            .collect();
+        for b in &r.builtins {
+            if b.kind == BuiltinKind::NoValue {
+                let p = b.args.get(1).copied().unwrap_or(Slot::Any);
+                deps.push((node(p, READS_ALL, &mut ids), true));
+            }
+        }
+        if reads_lists(r) {
+            for p in [terms.rdf_first, terms.rdf_rest] {
+                deps.push((node(Slot::Const(p), READS_ALL, &mut ids), false));
+            }
+        }
+        for &h in &heads {
+            for &(d, neg) in &deps {
+                edges.push((h, d));
+                if neg {
+                    negative.push((h, d));
+                }
+            }
+        }
+    }
+    let n = ids.len() + 2;
+    let mut adj: Vec<Vec<usize>> = vec![Vec::new(); n];
+    for (h, d) in edges {
+        adj[h].push(d);
+    }
+    // every predicate depends on what a head of a variable predicate reads, and an atom
+    // of a variable predicate reads every predicate
+    for a in adj.iter_mut().skip(2) {
+        a.push(GIVES_ALL);
+    }
+    adj[READS_ALL].extend(2..n);
+    let reaches = |from: usize, to: usize| {
+        let mut seen = vec![false; n];
+        let mut stack = vec![from];
+        while let Some(x) = stack.pop() {
+            if x == to {
+                return true;
+            }
+            if !std::mem::replace(&mut seen[x], true) {
+                stack.extend(adj[x].iter().copied());
+            }
+        }
+        false
+    };
+    negative.iter().any(|&(h, d)| reaches(d, h))
 }
 
 fn transform_in(
