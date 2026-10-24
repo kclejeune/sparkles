@@ -55,7 +55,7 @@ test('formats in the browser when the build has the module, loading it once', as
   // a syntax error reads as the endpoint's
   await setText(page, editor, 'PREFIX ex: <http://example.org/>\nSELECT * WHERE { ?s ?p ?o ) }');
   await page.keyboard.press('Shift+Alt+F');
-  await expect(page.getByText("Can't format: syntax error at line 2")).toBeVisible();
+  await expect(page.getByText('Cannot format: syntax error at line 2')).toBeVisible();
   await expect(page.locator('.cm-error-line')).toContainText('SELECT * WHERE { ?s ?p ?o ) }');
 
   // the shapes editor of the dataset page formats Turtle with it too
@@ -80,7 +80,7 @@ test('formats through the endpoint when the module does not load', async ({ page
 
   await setText(page, editor, 'PREFIX ex: <http://example.org/>\nSELECT * WHERE { ?s ?p ?o ) }');
   await page.keyboard.press('Shift+Alt+F');
-  await expect(page.getByText("Can't format: syntax error at line 2")).toBeVisible();
+  await expect(page.getByText('Cannot format: syntax error at line 2')).toBeVisible();
   expect(seen.endpoint).toBe(2);
 
   await page.goto(`/ui/datasets/${DATASET}`);

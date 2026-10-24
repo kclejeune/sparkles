@@ -28,7 +28,7 @@
         class="badge {report.conditionalWrites ? 'ok' : 'warn'}"
         title={report.conditionalWrites
           ? 'Backup names are unique even with several writing servers'
-          : 'The service ignores conditional writes: use one writing server only'}
+          : 'The service ignores conditional writes. Use only one server that writes backups.'}
       >
         {report.conditionalWrites ? 'conditional writes' : 'no conditional writes: single writer'}
       </span>

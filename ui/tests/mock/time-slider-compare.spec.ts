@@ -207,7 +207,7 @@ test('a read that cut its rows compares counts only, with no marks', async ({ pa
   await page.getByRole('button', { name: 'History', exact: true }).click();
   await right(page).focus();
   await page.keyboard.press('c');
-  await expect(page.getByText('The read cut the rows')).toBeVisible();
+  await expect(page.getByText('The results were truncated')).toBeVisible();
   await expect(page.getByText('so only the counts are compared')).toBeVisible();
   // a prefix of the rows says nothing about the rest, so no row carries a mark
   await expect(grid(page).getByRole('gridcell', { name: /^(added|removed)$/ })).toHaveCount(0);

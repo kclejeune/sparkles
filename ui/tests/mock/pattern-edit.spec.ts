@@ -289,7 +289,7 @@ test('the strip edits the projection and modifiers, and Count matches counts', a
   await expect.poll(() => textOf(page)).toContain('SELECT DISTINCT ?person ?org WHERE');
   await strip.getByRole('button', { name: 'Count matches' }).click();
   await expect(pane(page).getByTestId('pattern-count')).toHaveText(
-    'More than the count could finish',
+    'The count timed out after 5 seconds',
   );
 });
 
@@ -301,7 +301,7 @@ test('a schema that does not load leaves typed IRIs, and the picker says why', a
   await pane(page).getByRole('button', { name: 'Edge', exact: true }).click();
   await pane(page).getByLabel('From', { exact: true }).fill('?b');
   await pane(page).getByLabel('Predicate', { exact: true }).focus();
-  await expect(pane(page).getByRole('note')).toContainText('The schema did not load');
+  await expect(pane(page).getByRole('note')).toContainText('Could not load the schema');
   await pane(page).getByLabel('Predicate', { exact: true }).fill('<http://xmlns.com/foaf/0.1/age>');
   await pane(page).getByLabel('To', { exact: true }).fill('?age');
   await pane(page).getByRole('button', { name: 'Add', exact: true }).click();

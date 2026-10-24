@@ -35,6 +35,6 @@ test('Shift+Alt+F formats with the server, one undo restores, a syntax error is 
   // the reference parser reports where it got furthest: here, the last line
   await setText(page, 'PREFIX ex: <http://example.org/>\nSELECT * WHERE { ?s ?p ?o ) }');
   await page.keyboard.press('Shift+Alt+F');
-  await expect(page.getByText("Can't format: syntax error at line 2")).toBeVisible();
+  await expect(page.getByText('Cannot format: syntax error at line 2')).toBeVisible();
   await expect(page.locator('.cm-error-line')).toContainText('SELECT * WHERE { ?s ?p ?o ) }');
 });

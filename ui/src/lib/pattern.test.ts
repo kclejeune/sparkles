@@ -556,7 +556,7 @@ describe('edits as splices', () => {
     expect(checkTerm('<http://x/a>', 'p')).toBe('<http://x/a>');
     const { text, p } = fx('a3');
     expect(() => edit(text, p, { kind: 'delete', edge: 'e:gone' })).toThrow(
-      'The pattern changed, select the edge again',
+      'The pattern changed. Select the edge again',
     );
     const describe_ = fixtures.update.answer as PatternAnswer;
     expect(describe_.ok).toBe(false);

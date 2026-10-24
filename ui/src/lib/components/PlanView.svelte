@@ -276,7 +276,7 @@
               {#if h != null}<span class="badge spark">#{h + 1} slowest</span>{/if}
             </div>
             {#if r.node.estimatedRows < 0}
-              <span class="num faint" title="Estimates are hidden for your view">hidden</span>
+              <span class="num faint" title="Hidden because your access is restricted">hidden</span>
             {:else}
               <span
                 class="num faint"

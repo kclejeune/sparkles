@@ -340,7 +340,7 @@ export function editAny(text: string, p: PatternOk, e: AnyEdit, parse?: Parse): 
       return filterAdd(text, p, e);
     case 'filter-edit': {
       const f = filterKeys(p).find((x) => x.key === e.filter);
-      if (!f) throw new EditError('The pattern changed, select the filter again');
+      if (!f) throw new EditError('The pattern changed. Select the filter again');
       const declare = declarations(p, e);
       for (const prefix of pathPrefixes(e.expr)) checkDeclared(p, prefix, declare);
       return [
@@ -350,14 +350,14 @@ export function editAny(text: string, p: PatternOk, e: AnyEdit, parse?: Parse): 
     }
     case 'filter-delete': {
       const f = filterKeys(p).find((x) => x.key === e.filter);
-      if (!f) throw new EditError('The pattern changed, select the filter again');
+      if (!f) throw new EditError('The pattern changed. Select the filter again');
       return optionalRemoval(text, f.filter.range, f.filter.dot);
     }
     case 'rename':
       return rename(text, p, e);
     case 'delete-locked': {
       const b = lockedBlocks(p).find((x) => x.key === e.block);
-      if (!b) throw new EditError('The pattern changed, select the block again');
+      if (!b) throw new EditError('The pattern changed. Select the block again');
       return optionalRemoval(text, b.block.range, b.block.dot);
     }
     case 'delete-node':
@@ -450,7 +450,7 @@ function predicate(
   e: { edge: string; p: string; declare?: Prefixes },
 ): Change[] {
   const placed = resolveEdit(p, e.edge);
-  if (!placed) throw new EditError('The pattern changed, select the edge again');
+  if (!placed) throw new EditError('The pattern changed. Select the edge again');
   const np = checkPredicate(e.p);
   const declare = declarations(p, e);
   for (const x of [...prefixesIn(np), ...pathPrefixes(np)]) checkDeclared(p, x, declare);

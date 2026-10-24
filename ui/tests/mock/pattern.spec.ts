@@ -290,7 +290,7 @@ test('error states: broken text, updates and disconnected parts', async ({ page 
   await expect(pane(page)).toContainText('does not parse at line 6');
   await expect(pane(page).getByRole('button', { name: 'Edge', exact: true })).toHaveCount(0);
   await setText(page, 'INSERT DATA { <http://x/a> <http://x/b> 1 }');
-  await expect(pane(page)).toContainText('Updates are not drawn. The builder edits queries.');
+  await expect(pane(page)).toContainText('The Pattern pane draws queries, not updates.');
   await setText(page, 'SELECT * { ?a <http://x/p> ?b . ?c <http://x/q> ?d }');
   await expect(pane(page)).toContainText('These parts are not connected');
   await setText(page, 'SELECT * WHERE { }');

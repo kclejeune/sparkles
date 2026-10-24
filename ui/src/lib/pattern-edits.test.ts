@@ -128,7 +128,7 @@ LIMIT 1000
       'SELECT * {\n  ?s <http://p> ?n .\n  ?s <http://q> ?m .\n}\n',
     );
     expect(() => editAny(q, ok(q), { kind: 'filter-delete', filter: 'f:gone:0' })).toThrow(
-      'select the filter again',
+      'Select the filter again',
     );
   });
 
