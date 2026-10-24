@@ -631,7 +631,8 @@ impl Vocab {
             return;
         }
         let last = 31 - wanted.leading_zeros() as usize;
-        if !F {
+        if !F || wanted == (2u32 << last) - 1 {
+            // every key decoded whole: front coding, and FSST when each key is wanted
             for i in 0..=last {
                 let e = self.entry::<F>(data, &mut pos, i == 0);
                 key.truncate(e.shared);
