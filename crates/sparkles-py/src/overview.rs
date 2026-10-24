@@ -3,6 +3,7 @@
 use crate::dataset::{QueryArgs, apply_defaults, query_options};
 use crate::{admin, errors::EngineResult, handles::handle, interrupt};
 use pyo3::prelude::*;
+use pyo3::types::PyList;
 use sparkles::history::At;
 use sparkles::overview::{FacetsRequest, GroupsRequest};
 use std::collections::BTreeMap;
@@ -118,11 +119,22 @@ impl PyGraphOverview {
         let ds = self.ds(py)?;
         let mut body = serde_json::Map::new();
         body.insert("within".into(), admin::from_py(within, "within")?);
+        // any iterable, a generator too, becomes a list before it is written as JSON
+        let list = |v: &Bound<'py, PyAny>| -> PyResult<Bound<'py, PyList>> {
+            let items = v.try_iter()?.collect::<PyResult<Vec<_>>>()?;
+            PyList::new(py, items)
+        };
         if let Some(f) = facets.filter(|f| !f.is_none()) {
-            body.insert("facets".into(), admin::from_py(f, "facets")?);
+            body.insert(
+                "facets".into(),
+                admin::from_py(list(f)?.as_any(), "facets")?,
+            );
         }
         if let Some(f) = filters.filter(|f| !f.is_none()) {
-            body.insert("filters".into(), admin::from_py(f, "filters")?);
+            body.insert(
+                "filters".into(),
+                admin::from_py(list(f)?.as_any(), "filters")?,
+            );
         }
         if candidates {
             body.insert("candidates".into(), true.into());

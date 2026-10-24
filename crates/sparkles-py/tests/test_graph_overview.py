@@ -218,3 +218,13 @@ def test_facets_count_a_class_and_its_brushes(ds: Dataset) -> None:
     assert any(c["property"] == EX + "livesIn" for c in with_candidates["candidates"])
     with pytest.raises(InvalidInputError):
         ds.graph.facets({"class": EX + "Person"}, facets=[{"property": EX + "x", "bins": 1}])
+
+
+def test_facets_take_any_iterable(ds: Dataset) -> None:
+    facets = ({"property": EX + "livesIn"} for _ in range(1))
+    filters = iter(
+        [{"property": EX + "livesIn", "kind": "values", "values": [{"type": "uri", "value": EX + "p2"}]}]
+    )
+    answer = ds.graph.facets({"class": EX + "Person"}, facets=facets, filters=filters)
+    assert answer["matching"] == 2
+    assert len(answer["facets"]) == 1
