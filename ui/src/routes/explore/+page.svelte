@@ -388,6 +388,14 @@
   let graphSlider: TimeSlider | undefined = $state();
   /** Either slider is open, so the properties are read at the state they name. */
   const timeActive = $derived(stripOpen || graphTimeOpen);
+  /**
+   * The canvas shows a past state, where the route's tree of the latest inferences may not
+   * hold, so the panel says so and the premises it drew are no longer marked.
+   */
+  const whyAtPast = $derived(timeActive && exAt !== '');
+  $effect(() => {
+    if (whyAtPast) untrack(() => (whyMarked = null));
+  });
   type EntityHistory = {
     iri: string;
     changes: EntityChange[];
@@ -2478,6 +2486,7 @@
               {ds}
               triple={whyFor}
               {prefixes}
+              past={whyAtPast}
               onshow={showWhy}
               onopen={(iri) => focusOn(iri)}
               onclose={closeWhy}

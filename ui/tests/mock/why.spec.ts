@@ -157,6 +157,39 @@ test('stale inferences say so above the tree', async ({ page, request }) => {
   );
 });
 
+test('at a past state Why? says that it explains the latest commit', async ({ page, request }) => {
+  // why2 has a commit after its run (the stale test above), so the run's commit is past
+  const asked0 = await request.post('/$/reason/why2/explain', {
+    data: {
+      triple: {
+        s: { type: 'uri', value: `${EX}alice` },
+        p: { type: 'uri', value: 'http://www.w3.org/1999/02/22-rdf-syntax-ns#type' },
+        o: { type: 'uri', value: `${EX}Manager` },
+      },
+      mode: 'why',
+    },
+  });
+  const commit = (await asked0.json()).commit;
+  expect(typeof commit).toBe('number');
+  await page.addInitScript((d) => localStorage.setItem('sparkles.dataset', d), 'why2');
+  await page.goto(`/ui/explore?ds=why2&iri=${encodeURIComponent(`${EX}alice`)}&at=${commit}`);
+  await expect.poll(async () => (await drawn(page)).nodes.length).toBeGreaterThan(3);
+  const why = page.getByRole('button', { name: /Why is rdf:type inferred\?/ }).first();
+  await expect(why).toBeVisible();
+  let asked = 0;
+  await page.route('**/$/reason/why2/explain', (route) => {
+    asked++;
+    return route.continue();
+  });
+  await why.click();
+  await expect(panel(page).getByRole('status')).toContainText(
+    'Why? explains the inferences of the latest commit',
+  );
+  await expect(panel(page).getByRole('tree')).toHaveCount(0);
+  await expect(panel(page).getByRole('button', { name: 'Show on graph' })).toBeDisabled();
+  expect(asked).toBe(0);
+});
+
 test('a triple with no visible derivation says only that', async ({ page }) => {
   await page.route('**/$/reason/why1/explain', (route) =>
     route.fulfill({
@@ -222,7 +255,7 @@ test('A12: at 390 px Why? is a full-height sheet opened by a tap, without scroll
   expect(box?.height).toBeGreaterThan(800);
   expect(box?.width).toBeLessThanOrEqual(390);
   await expect(panel(page).getByRole('tree')).toBeVisible();
-  await expectNoSidewaysScroll(page);
+  await expectNoSidewaysScroll(page, 'the Why? sheet');
   await panel(page).getByRole('button', { name: 'Close Why?' }).tap();
   await expect(panel(page)).toHaveCount(0);
   await ctx.close();

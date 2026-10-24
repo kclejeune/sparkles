@@ -23,6 +23,7 @@
     ds,
     triple,
     prefixes,
+    past = false,
     onshow,
     onopen,
     onclose,
@@ -31,6 +32,11 @@
     ds: string;
     triple: WhyTriple;
     prefixes: PrefixMap;
+    /**
+     * The canvas shows a past state. The route explains the current inferences only, so
+     * the panel says so instead of a tree that may not hold at that state.
+     */
+    past?: boolean;
     /** Draw these triples on the canvas and highlight them. */
     onshow?: (triples: WhyTriple[]) => void;
     /** Open a resource the tree names. */
@@ -48,10 +54,22 @@
   let refError = $state('');
   let announce = $state('');
   let ctl: AbortController | null = null;
+  /** The requests of **Expand**, stopped when the explanation they belong to goes. */
+  let refCtls = new Set<AbortController>();
+  /** Counts the explanations loaded, so an expansion of an earlier one is dropped. */
+  let generation = 0;
   let heading: HTMLHeadingElement | undefined = $state();
 
-  async function load(t: WhyTriple) {
+  function stopAll() {
     ctl?.abort();
+    for (const c of refCtls) c.abort();
+    refCtls = new Set();
+    generation++;
+    expanding = new Set();
+  }
+
+  async function load(t: WhyTriple) {
+    stopAll();
     const c = (ctl = new AbortController());
     result = null;
     index = 0;
@@ -75,13 +93,23 @@
   $effect(() => {
     const t = triple;
     void ds;
-    untrack(() => void load(t));
+    const atPast = past;
+    untrack(() => {
+      if (!atPast) return void load(t);
+      stopAll();
+      trees = [];
+      index = 0;
+      result = { ok: false, kind: 'unavailable', message: PAST };
+      announce = PAST;
+    });
   });
   $effect(() => {
     if (heading) heading.focus();
   });
-  onDestroy(() => ctl?.abort());
+  onDestroy(stopAll);
 
+  const PAST =
+    "Why? explains the inferences of the latest commit. Move the time slider to the latest commit to see this edge's derivation.";
   const explanation = $derived(result?.ok ? result.explanation : null);
   const tree = $derived(trees[index] ?? null);
   const stale = $derived(explanation ? staleNote(explanation) : null);
@@ -107,17 +135,29 @@
   /** A `ref` node: ask for its own derivation and put it in place. */
   async function expandRef(d: Derivation) {
     if (expanding.has(d.id)) return;
+    // the tree the ref belongs to, which Next may leave while the request runs
+    const at = index;
+    const gen = generation;
+    const c = new AbortController();
+    refCtls.add(c);
     expanding = new Set([...expanding, d.id]);
     refError = '';
     try {
-      const r = await explainTriple(ds, d.triple, { maxTrees: 1 });
+      const r = await explainTriple(ds, d.triple, { maxTrees: 1, signal: c.signal });
+      if (gen !== generation) return;
       if (r.ok && r.explanation.trees[0]) {
-        trees = trees.map((t, i) => (i === index ? graft(t, d.id, r.explanation.trees[0]) : t));
+        const sub = r.explanation.trees[0];
+        trees = trees.map((t, i) => (i === at ? graft(t, d.id, sub) : t));
       } else if (!r.ok) refError = r.message;
+    } catch (e) {
+      if (!(e instanceof DOMException && e.name === 'AbortError')) throw e;
     } finally {
-      const e = new Set(expanding);
-      e.delete(d.id);
-      expanding = e;
+      refCtls.delete(c);
+      if (gen === generation) {
+        const e = new Set(expanding);
+        e.delete(d.id);
+        expanding = e;
+      }
     }
   }
 

@@ -169,11 +169,26 @@ export function how(d: Derivation, graphLabel: (g: string) => string = (g) => g)
   }
 }
 
-/** Replace the node with id `id` in `tree` by `sub` (a `ref` expanded on request). */
+/**
+ * Replace the node with id `id` in `tree` by `sub` (a `ref` expanded on request). The
+ * expansion's answer numbers its nodes from 1 again, so its nodes, and the shared nodes
+ * that point at them, move past the tree's largest id, and its root takes `id`.
+ */
 export function graft(tree: Derivation, id: number, sub: Derivation): Derivation {
-  if (tree.id === id) return { ...sub, id };
-  if (!tree.premises) return tree;
-  return { ...tree, premises: tree.premises.map((p) => graft(p, id, sub)) };
+  const offset = Math.max(...walk(tree).map((d) => d.id));
+  const renumber = (d: Derivation, root: boolean): Derivation => ({
+    ...d,
+    id: root ? id : d.id + offset,
+    premises: d.premises?.map((p) => renumber(p, false)),
+  });
+  // a root is never among its own premises, so no shared node points at it
+  const moved = renumber(sub, true);
+  const put = (d: Derivation): Derivation => {
+    if (d.id === id && !d.shared) return moved;
+    if (!d.premises) return d;
+    return { ...d, premises: d.premises.map(put) };
+  };
+  return put(tree);
 }
 
 /** The panel's footer: which derivation of how many, its depth and its commit. */
@@ -187,6 +202,9 @@ export function footer(e: Explanation, index: number): string {
 /** The note above a stale tree (§2.4), or null for fresh inferences. */
 export function staleNote(e: Explanation): string | null {
   if (e.source !== 'materialized') return null;
+  // a read at the head describes the current data, whatever the run's freshness
+  if (e.readAtHead)
+    return 'The history no longer has the commit the inferences were computed at, so the tree reads the current data.';
   if (e.stale) {
     const since =
       e.commitsSince != null
@@ -194,7 +212,5 @@ export function staleNote(e: Explanation): string | null {
         : '';
     return `The inferences are stale: this tree explains the closure as it was computed at commit ${e.commit}.${since}`;
   }
-  if (e.readAtHead)
-    return 'The history no longer has the commit the inferences were computed at, so the tree reads the current data.';
   return null;
 }

@@ -9,6 +9,7 @@ import {
   premiseTriples,
   staleNote,
   tripleKey,
+  walk,
   type Derivation,
   type Explanation,
   type WhyTriple,
@@ -113,6 +114,36 @@ describe('derivation trees (U10 §2.4)', () => {
     expect(back.premises![0].premises).toHaveLength(2);
   });
 
+  it("gives an expanded subtree ids of its own, so they never meet the tree's", () => {
+    // the expansion's answer numbers its nodes from 1 again, and shares one of them
+    const sub: Derivation = {
+      ...A7.premises![0],
+      id: 1,
+      premises: [
+        { ...A7.premises![0].premises![0], id: 2 },
+        { ...A7.premises![0].premises![1], id: 3 },
+        { ...A7.premises![0].premises![0], id: 2, shared: true },
+      ],
+    };
+    const cut: Derivation = {
+      ...A7,
+      premises: [{ ...A7.premises![0], kind: 'ref', premises: undefined }, A7.premises![1]],
+    };
+    const back = graft(cut, 2, sub);
+    const ids = walk(back)
+      .filter((d) => !d.shared)
+      .map((d) => d.id);
+    expect(new Set(ids).size).toBe(ids.length);
+    const g = back.premises![0];
+    expect(g.id).toBe(2);
+    expect(g.premises![2].id).toBe(g.premises![0].id);
+    // a second expansion inside the first still lands on its own node
+    const again = graft(back, g.premises![1].id, { ...A7.premises![1], id: 1 });
+    expect(again.premises![0].premises![1].triple).toEqual(A7.premises![1].triple);
+    expect(again.premises![1].triple).toEqual(A7.premises![1].triple);
+    expect(again.premises![0].premises![0].triple).toEqual(A7.premises![0].premises![0].triple);
+  });
+
   it('counts the derivations and notes stale inferences', () => {
     expect(footer(explanation(), 0)).toBe('1 of 1 derivation · depth 2 · from commit 318');
     expect(footer(explanation({ trees: [A7, A7], more: true }), 1)).toBe(
@@ -124,6 +155,10 @@ describe('derivation trees (U10 §2.4)', () => {
     );
     expect(staleNote(explanation({ source: 'rdfsOnRead', stale: true }))).toBeNull();
     expect(staleNote(explanation({ readAtHead: true }))).toContain('current data');
+    // a stale run whose commit the history no longer has reads the head: say that
+    expect(staleNote(explanation({ readAtHead: true, stale: true, commitsSince: 3 }))).toContain(
+      'current data',
+    );
   });
 });
 

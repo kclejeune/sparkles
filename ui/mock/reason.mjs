@@ -119,7 +119,7 @@ function explainer(store) {
   return { asserted, instances, prove };
 }
 
-/** Number a tree's nodes as the server does: a repeated triple is shared by id. */
+/** Number the trees' nodes as the server does: a repeated triple is shared by id within a tree. */
 function render(proofs, profile, maxDepth) {
   const ids = new Map();
   let next = 0;
@@ -147,7 +147,11 @@ function render(proofs, profile, maxDepth) {
       premises: p.premises.map((x) => node(x, level + 1, false)),
     };
   };
-  return proofs.map((p) => node(p, 0, true));
+  // a tree shares repeated triples within itself only, as the server's trees do
+  return proofs.map((p) => {
+    ids.clear();
+    return node(p, 0, true);
+  });
 }
 
 export async function handleReason(req, res, seg, ctx) {
