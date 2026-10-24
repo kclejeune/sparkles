@@ -197,6 +197,7 @@ pub(super) async fn write(
             grant: grant.as_ref(),
             lookup,
             only_graph: graph.clone(),
+            dir: tmp.path(),
         };
         let mut files = vec![path];
         let reports = tabular::convert(&mut files, &mappings, &params, &cx)?;

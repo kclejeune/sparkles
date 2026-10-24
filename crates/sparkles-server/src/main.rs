@@ -3326,6 +3326,7 @@ fn run() -> Result<()> {
                     prefixes: db.prefixes().into_iter().collect(),
                     commit: db.head_commit().seq,
                     snapshot,
+                    graphs: None,
                 }
             });
             // tables become temporary N-Triples files, kept until the load is done, and

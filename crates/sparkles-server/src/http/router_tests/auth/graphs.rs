@@ -1194,3 +1194,35 @@ async fn grouped_diffs_read_classes_in_the_callers_graphs() {
     let r = get("gep").await;
     assert_ne!(r.status, StatusCode::OK, "{}", r.text());
 }
+
+/// A template lookup reads only the graphs the caller may read (spec F19 §7.2): a
+/// writer of `http://ex/a/1` cannot copy values out of `http://ex/b/1` with `GRAPH`.
+#[tokio::test]
+async fn template_lookups_follow_the_graph_grants() {
+    let s = server();
+    let template = "PREFIX ex: <http://ex/>\nCONSTRUCT { ?r ex:copied ?v } WHERE { BIND(IRI(CONCAT(\"http://ex/row/\", ?id)) AS ?r) OPTIONAL { GRAPH ?g { ?x ex:p ?v } } }";
+    let body = format!(
+        "--X\r\nContent-Disposition: form-data; name=\"template\"\r\n\r\n{template}\r\n--X\r\nContent-Disposition: form-data; name=\"file\"; filename=\"rows.csv\"\r\n\r\nid\n1\n\r\n--X--\r\n"
+    );
+    let r = call(
+        &s.app,
+        "POST",
+        &format!("/graphs/upload?graph={}&lookup=true", enc("http://ex/a/1")),
+        &[
+            ("authorization", &b("grad")),
+            ("content-type", "multipart/form-data; boundary=X"),
+        ],
+        &body,
+    )
+    .await;
+    assert_eq!(r.status, StatusCode::OK, "{}", r.text());
+    let copied = column(
+        &s.app,
+        "gfull",
+        "SELECT ?v { GRAPH <http://ex/a/1> { <http://ex/row/1> <http://ex/copied> ?v } }",
+    )
+    .await
+    .unwrap();
+    assert!(!copied.is_empty(), "the readable graphs were copied");
+    assert!(!copied.iter().any(|v| v.contains("secret")), "{copied:?}");
+}

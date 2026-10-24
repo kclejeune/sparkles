@@ -100,6 +100,9 @@ pub(super) struct Ctx<'a> {
     pub grant: Option<&'a Arc<sparkles::sparql::pool::PoolGrant>>,
     pub lookup: Option<tabular::template::Lookup>,
     pub only_graph: Option<oxrdf::NamedNode>,
+    /// The request's working directory, removed with the request. Converted output is
+    /// written there.
+    pub dir: &'a Path,
 }
 
 /// Read a `mapping` or `template` part as text.
@@ -317,30 +320,47 @@ pub(super) fn convert(
         )));
     }
     let mut reports = Vec::new();
+    // in standard mode the tables share one file, so that the table group's blank node
+    // is one node when the file is loaded
+    let mut shared: Option<PathBuf> = None;
     for i in order {
         let f = &mut files[i];
         let kind = tabular::tabular_kind(f).expect("a table");
         let mut o = options(i, f, kind);
         o.keys = registry.clone();
         let name = o.name.clone();
-        let out = f.with_extension("nt");
         let io = |e: std::io::Error| err(StatusCode::INTERNAL_SERVER_ERROR, e.to_string());
+        let (out, file) = match &shared {
+            Some(p) if standard => (
+                None,
+                std::fs::OpenOptions::new()
+                    .append(true)
+                    .open(p)
+                    .map_err(io)?,
+            ),
+            _ => {
+                let out = f.with_extension("nt");
+                let file = std::fs::File::create(&out).map_err(io)?;
+                if standard {
+                    shared = Some(out.clone());
+                }
+                (Some(out), file)
+            }
+        };
         let input = tabular::open(f, st.limits.max_decompressed_bytes)?;
         let w = Reserve {
-            inner: std::io::BufWriter::with_capacity(
-                1 << 20,
-                std::fs::File::create(&out).map_err(io)?,
-            ),
-            dir: out.parent().map(Path::to_path_buf).unwrap_or_default(),
+            inner: std::io::BufWriter::with_capacity(1 << 20, file),
+            dir: cx.dir.to_path_buf(),
             reserve: st.limits.min_free_disk_bytes,
             since: 0,
         };
-        let stats = match tabular::write(input, &o, w, oxrdfio::RdfFormat::NTriples, None) {
-            Err(sparkles::Error::Io(e)) if e.to_string().contains("not enough free disk space") => {
-                return Err(sparkles::Error::StorageFull(e.to_string()).into());
-            }
-            r => r?,
-        };
+        let stats = storage_full(tabular::write(
+            input,
+            &o,
+            w,
+            oxrdfio::RdfFormat::NTriples,
+            None,
+        ))?;
         let mut r = json!({
             "file": name,
             "rows": stats.rows,
@@ -354,9 +374,21 @@ pub(super) fn convert(
             r["mapping"] = json!({ "name": n, "version": v });
         }
         reports.push(r);
-        *f = out;
+        // a table written into the shared file is no longer a file of its own
+        *f = out.unwrap_or_default();
     }
+    files.retain(|f| !f.as_os_str().is_empty());
     Ok(reports)
+}
+
+/// A write that ran out of the free-disk reserve as `StorageFull` (507).
+fn storage_full<T>(r: sparkles::Result<T>) -> sparkles::Result<T> {
+    match r {
+        Err(sparkles::Error::Io(e)) if e.to_string().contains("not enough free disk space") => {
+            Err(sparkles::Error::StorageFull(e.to_string()))
+        }
+        r => r,
+    }
 }
 
 /// Run an R2RML, RML or YARRRML mapping over the uploaded files that its logical
@@ -408,15 +440,27 @@ fn run_engine(
         max_output_bytes: st.limits.max_decompressed_bytes,
         only_graph: cx.only_graph.clone(),
     };
-    let dir = files
-        .first()
-        .and_then(|f| f.parent())
-        .map(Path::to_path_buf);
-    let (path, stats) =
-        engine::to_nquads_file(&mapping, &inputs, &opts, dir.as_deref()).map_err(mapping_error)?;
-    let kept = path
-        .keep()
-        .map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+    // the output goes into the request's directory, which the request removes, and
+    // keeps the server's free-disk reserve
+    let kept = engine_output_path(cx.dir);
+    let io = |e: std::io::Error| err(StatusCode::INTERNAL_SERVER_ERROR, e.to_string());
+    let w = Reserve {
+        inner: std::io::BufWriter::with_capacity(
+            1 << 20,
+            std::fs::File::create(&kept).map_err(io)?,
+        ),
+        dir: cx.dir.to_path_buf(),
+        reserve: st.limits.min_free_disk_bytes,
+        since: 0,
+    };
+    let stats = storage_full(engine::write(
+        &mapping,
+        &inputs,
+        &opts,
+        w,
+        oxrdfio::RdfFormat::NQuads,
+    ))
+    .map_err(mapping_error)?;
     files.retain(|f| !used.contains(f));
     // a metadata file of a CSV source is read with it, not loaded
     files.retain(|f| !client_name(f).ends_with("-metadata.json"));
@@ -431,6 +475,18 @@ fn run_engine(
         r["mapping"] = json!({ "name": n, "version": v });
     }
     Ok(r)
+}
+
+/// A new file name for an engine's output in the request directory `dir`.
+fn engine_output_path(dir: &Path) -> PathBuf {
+    let mut n = 0;
+    loop {
+        let p = dir.join(format!("mapping-output-{n}.nq"));
+        if !p.exists() {
+            return p;
+        }
+        n += 1;
+    }
 }
 
 /// The engine's errors with the codes of spec F19: a missing source and a graph map

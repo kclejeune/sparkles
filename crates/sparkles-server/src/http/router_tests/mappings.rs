@@ -371,6 +371,15 @@ async fn uploads_check_csvw_keys_in_standard_mode() {
         .await,
         2
     );
+    // one table group for the two tables of the load
+    assert_eq!(
+        select_rows(
+            &s.app,
+            "SELECT DISTINCT ?g { ?g a <http://www.w3.org/ns/csvw#TableGroup> }"
+        )
+        .await,
+        1
+    );
     // keys without standard mode, and a duplicate primary key
     let dup = [
         ("mapping", None, META),

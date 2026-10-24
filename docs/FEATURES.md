@@ -508,8 +508,10 @@ that work by priority and links each item to its design spec.
   Parquet file in an object store. RML join conditions written as expression
   maps are not read, and function maps call 20 of SPARQL's functions. Stored mapping runs
   are not tasks, the web UI has no Mappings page, the JVM and Node.js bindings cannot run
-  mappings, and the W3C CSVW test suite does not run. Tables and databases are imported,
-  not queried in place. [Roadmap](ROADMAP.md) items 43 and 230 to 237.
+  mappings, and the W3C CSVW test suite does not run. A template lookup that binds a
+  blank node of the dataset writes a new node, and a JSON number with a fraction or an
+  exponent loses its source form. Tables and databases are imported, not queried in
+  place. [Roadmap](ROADMAP.md) items 43 and 230 to 239.
 * **GraphQL.** There are no mutations or subscriptions, and no stored GraphQL queries,
   `persistedOnly` or UI page for it. Nested lists are not connections. A
   nested `first` limits the response, while the engine still produces every value of

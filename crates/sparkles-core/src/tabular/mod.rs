@@ -1396,7 +1396,10 @@ impl KeyCheck {
         }
         for (names, cols, set) in &mut self.collect {
             let key: Option<Vec<String>> = cols.iter().map(|&i| key_value(&r.cells[i])).collect();
-            if let Some(key) = key {
+            // only a value the set does not hold yet is charged
+            if let Some(key) = key
+                && !set.contains(&key)
+            {
                 let bytes: usize = key.iter().map(|k| k.len() + 32).sum::<usize>() + 48;
                 self.reg.charge(
                     bytes as u64,

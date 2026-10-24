@@ -518,27 +518,54 @@ pub fn prepare(
     }
     let (jobs, keys) = order_for_keys(jobs(files, args)?, args)?;
     let mut converted = std::collections::HashMap::new();
+    // in standard mode the tables share one file, so that the table group's blank node
+    // is one node when the file is loaded
+    let mut shared: Option<PathBuf> = None;
     for (i, job) in jobs.iter().enumerate() {
         let name = job.path.display().to_string();
         let input = tabular::open(&job.path, None)?;
         let mut o = options(job, args, i);
         o.keys = keys.clone();
         o.lookup = lookup.clone();
-        let (path, stats) = tabular::to_ntriples_file(input, &o, None)?;
+        let (path, stats) = match &shared {
+            Some(p) if args.standard() => {
+                let f = std::fs::OpenOptions::new().append(true).open(p)?;
+                let stats = tabular::write(
+                    input,
+                    &o,
+                    std::io::BufWriter::with_capacity(1 << 20, f),
+                    oxrdfio::RdfFormat::NTriples,
+                    None,
+                )?;
+                (p.clone(), stats)
+            }
+            _ => {
+                let (temp, stats) = tabular::to_ntriples_file(input, &o, None)?;
+                let p = temp.to_path_buf();
+                out._temps.push(temp);
+                if args.standard() {
+                    shared = Some(p.clone());
+                }
+                (p, stats)
+            }
+        };
         report(&name, &stats, job.note.as_deref());
         if let Some(c) = stats.lookup_commit {
             eprintln!("{name}: the template read commit {c}");
         }
-        converted.insert(job.path.clone(), path.to_path_buf());
-        if !files.contains(&job.path) {
-            out.files.push(path.to_path_buf());
+        converted.insert(job.path.clone(), path.clone());
+        if !files.contains(&job.path) && !out.files.contains(&path) {
+            out.files.push(path);
             out.names.push(name);
             out.converted.push(true);
         }
-        out._temps.push(path);
     }
     for f in files {
         if let Some(p) = converted.get(f) {
+            // the shared file of standard mode is loaded once
+            if out.files.contains(p) {
+                continue;
+            }
             out.files.push(p.clone());
             out.converted.push(true);
         } else if let Some(j) = crate::http::jena_formats::JenaFormat::from_path(f) {

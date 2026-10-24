@@ -1342,6 +1342,10 @@ sparkles load --loc db people.csv --template link.rq --lookup
 # people.csv: the template read commit 12
 ```
 
+A lookup links to resources with IRIs. A blank node that the WHERE clause binds becomes a
+new blank node in the load ([roadmap](ROADMAP.md) item 238). On a server, a lookup reads
+only the graphs the caller may read.
+
 CSVW's standard mode, with `--csvw-mode standard`, adds a description of the table
 group, of each table and of each row, with its row number and source URL, around the
 triples of the default minimal mode. In standard mode, or with `--csvw-check keys`, the
@@ -1413,7 +1417,8 @@ row, for all the triples maps that read it. Values keep the types of their sourc
 SQLite `INTEGER` column gives `xsd:integer` literals, and a CSV source gives strings
 unless a CSVW description named `FILE-metadata.json` next to the file gives its columns
 datatypes. A JSON document is parsed whole, up to `--max-json-mb` (512 MiB), and JSON
-Lines a line at a time. `--base` sets the base of relative IRIs the mapping generates.
+Lines a line at a time. `--base` sets the base of relative IRIs the mapping generates,
+and a triples map's own `rml:baseIRI` wins over it.
 `sparkles load --graph G` writes every quad into G, and refuses a mapping whose graph maps
 name another graph.
 

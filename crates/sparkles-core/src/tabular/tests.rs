@@ -899,6 +899,7 @@ fn templates_read_the_target_dataset_with_a_lookup() {
         snapshot: store.snapshot(),
         prefixes: vec![("x".into(), "http://ex.org/x/".into())],
         commit: head,
+        graphs: None,
     });
     let got = run("id,code\n7,NO\n8,SE\n", &o).unwrap();
     assert_eq!(
@@ -923,4 +924,39 @@ fn templates_read_the_target_dataset_with_a_lookup() {
         run("id\n7\n", &o2).unwrap(),
         ["<http://ex.org/x/7> <http://ex.org/p> \"1\"^^<http://www.w3.org/2001/XMLSchema#integer>"]
     );
+}
+
+/// Review round 1: a referenced value that repeats is charged once.
+#[test]
+fn repeated_referenced_values_are_charged_once() {
+    // orders reference customer.name, which repeats and is not the primary key
+    let g = GROUP
+        .replace(
+            "\"primaryKey\": \"id\",\n        \"columns\": [{ \"name\": \"id\", \"datatype\": \"integer\" }, { \"name\": \"name\" }]",
+            "\"columns\": [{ \"name\": \"id\", \"datatype\": \"integer\" }, { \"name\": \"name\" }]",
+        )
+        .replace(
+            "\"columnReference\": \"customer\",\n                          \"reference\": { \"resource\": \"customer.csv\", \"columnReference\": \"id\" }",
+            "\"columnReference\": \"customer\",\n                          \"reference\": { \"resource\": \"customer.csv\", \"columnReference\": \"name\" }",
+        )
+        .replace("{ \"name\": \"customer\", \"datatype\": \"integer\" }", "{ \"name\": \"customer\" }");
+    assert!(g.contains("\"columnReference\": \"name\""), "{g}");
+    let meta = Arc::new(csvw::parse(&g, Some("file:///data/meta.json")).unwrap());
+    let mut o = Options::new(Mapping::Csvw(meta), "customer.csv");
+    o.table = Some(0);
+    let reg = Arc::new(KeyRegistry::new(Some(200)));
+    o.keys = Some(reg);
+    run("id,name\n1,Ann\n2,Ann\n3,Ann\n4,Ann\n5,Ann\n", &o).unwrap();
+}
+
+/// Review round 1: every CONSTRUCT query after the first gets the shared prologue.
+#[test]
+fn three_constructs_share_the_prologue() {
+    let q = "PREFIX ex: <http://ex.org/>
+CONSTRUCT { ?s ex:a ?v } WHERE { BIND(IRI(CONCAT(\"http://ex.org/\", ?v)) AS ?s) }
+CONSTRUCT { ?s ex:b ?v } WHERE { BIND(IRI(CONCAT(\"http://ex.org/\", ?v)) AS ?s) }
+CONSTRUCT { ?s ex:c ?v } WHERE { BIND(IRI(CONCAT(\"http://ex.org/\", ?v)) AS ?s) }";
+    let t = Template::parse(q, None).unwrap();
+    assert_eq!(t.len(), 3);
+    assert_eq!(run("v\nx\n", &template(q, None)).unwrap().len(), 3);
 }

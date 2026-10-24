@@ -32,6 +32,9 @@ pub struct Lookup {
     pub snapshot: Arc<Snapshot>,
     pub prefixes: Vec<(String, String)>,
     pub commit: u64,
+    /// The graphs the caller may read, when its grants cover some graphs only. The
+    /// template's WHERE clause reads no other graph.
+    pub graphs: Option<Arc<crate::access::GraphAccess>>,
 }
 
 /// The texts of the queries of a file: one, or several CONSTRUCT queries one after
@@ -55,7 +58,12 @@ fn split_queries(text: &str) -> Vec<String> {
     let mut out = Vec::new();
     let mut from = 0;
     for &s in &starts {
-        out.push(text[from..s].to_string());
+        // the first segment holds the prologue already
+        if from == 0 {
+            out.push(text[..s].to_string());
+        } else {
+            out.push(format!("{prologue}\n{}", &text[from..s]));
+        }
         from = s;
     }
     out.push(format!("{prologue}\n{}", &text[from..]));
@@ -256,6 +264,7 @@ impl<'a> Runner<'a> {
         // the template's prefixes first, then the dataset's (C20)
         let mut prefixes = template.prefixes.clone();
         if let Some(l) = lookup {
+            opts.graphs = l.graphs.clone();
             for (p, ns) in &l.prefixes {
                 if !prefixes.iter().any(|(q, _)| q == p) {
                     prefixes.push((p.clone(), ns.clone()));

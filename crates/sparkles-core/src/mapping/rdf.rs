@@ -208,6 +208,7 @@ pub fn parse(text: &str, base: Option<&str>) -> Result<Mapping> {
         g,
         tms: tms.clone(),
         sources: Vec::new(),
+        depth: std::cell::Cell::new(0),
     };
     let mut maps = Vec::new();
     for t in &tms {
@@ -249,7 +250,14 @@ struct Reader {
     g: G,
     tms: Vec<NamedOrBlankNode>,
     sources: Vec<SourceDecl>,
+    /// how deep term maps nest while one is read, through datatype, language and
+    /// function maps, so that a term map that refers to itself fails instead of
+    /// recursing without end
+    depth: std::cell::Cell<u32>,
 }
+
+/// The deepest term maps may nest.
+const MAX_TERM_MAP_DEPTH: u32 = 32;
 
 impl Reader {
     fn bad<T>(&self, s: &NamedOrBlankNode, m: impl std::fmt::Display) -> Result<T> {
@@ -394,6 +402,22 @@ impl Reader {
     }
 
     fn term_map(&self, n: &NamedOrBlankNode, role: Role) -> Result<TermMap> {
+        let d = self.depth.get();
+        if d >= MAX_TERM_MAP_DEPTH {
+            return self.bad(
+                n,
+                format!(
+                    "term maps nest more than {MAX_TERM_MAP_DEPTH} deep or refer to themselves"
+                ),
+            );
+        }
+        self.depth.set(d + 1);
+        let r = self.read_term_map(n, role);
+        self.depth.set(d);
+        r
+    }
+
+    fn read_term_map(&self, n: &NamedOrBlankNode, role: Role) -> Result<TermMap> {
         let constant = self.g.one(n, "constant")?;
         let reference = if self.g.core {
             self.g.string(n, "reference")?

@@ -69,14 +69,10 @@ fn push<'a>(v: &'a J, out: &mut Vec<Cell<'a>>) -> std::result::Result<(), ()> {
             dt: Dt::Boolean,
         }),
         J::Number(n) => {
+            // serde_json keeps an integer exactly and reads every other number as a
+            // double, whose printed form may differ from the source's (ROADMAP item 239)
             let lex = n.to_string();
-            let dt = if lex.contains(['e', 'E']) {
-                Dt::Double
-            } else if lex.contains('.') {
-                Dt::Decimal
-            } else {
-                Dt::Integer
-            };
+            let dt = if n.is_f64() { Dt::Double } else { Dt::Integer };
             out.push(Cell {
                 lex: Cow::Owned(lex),
                 dt,

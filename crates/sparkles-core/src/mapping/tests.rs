@@ -639,3 +639,240 @@ mod parquet_source {
 }
 
 use std::io::Write as _;
+
+// ------------------------------------------------- review round 1 regressions ----
+
+const RML: &str = "@prefix rml: <http://w3id.org/rml/> . @prefix ex: <http://ex.org/> .\n";
+
+#[test]
+fn a_term_map_that_refers_to_itself_fails() {
+    let m = format!(
+        r#"{RML}<http://ex.org/m> a rml:TriplesMap ;
+          rml:logicalSource [ rml:source "a.csv" ; rml:referenceFormulation rml:CSV ] ;
+          rml:subjectMap [ rml:template "http://ex.org/{{id}}" ] ;
+          rml:predicateObjectMap [ rml:predicate ex:p ; rml:objectMap _:o ] .
+        _:o rml:reference "id" ; rml:datatypeMap _:o ."#
+    );
+    let e = parse(&m, MappingKind::Rml, None).unwrap_err().to_string();
+    assert!(e.contains("refer to themselves"), "{e}");
+}
+
+#[test]
+fn a_template_product_past_the_cap_fails() {
+    let m = format!(
+        r#"{RML}<http://ex.org/m> a rml:TriplesMap ;
+          rml:logicalSource [ rml:source "a.json" ; rml:referenceFormulation rml:JSONPath ; rml:iterator "$" ] ;
+          rml:subjectMap [ rml:template "http://ex.org/{{a[*]}}/{{b[*]}}" ] ;
+          rml:predicateObjectMap [ rml:predicate ex:p ; rml:objectMap [ rml:constant "x" ] ] ."#
+    );
+    let arr = |n: usize| (0..n).map(|i| i.to_string()).collect::<Vec<_>>().join(",");
+    let big = format!("{{\"a\":[{}],\"b\":[{}]}}", arr(400), arr(400));
+    let e = run_text(MappingKind::Rml, &m, &[("a.json", &big)])
+        .unwrap_err()
+        .to_string();
+    assert!(e.contains("more than 100000 values"), "{e}");
+    let ok = format!("{{\"a\":[{}],\"b\":[{}]}}", arr(300), arr(300));
+    assert_eq!(
+        run_text(MappingKind::Rml, &m, &[("a.json", &ok)])
+            .unwrap()
+            .len(),
+        90_000
+    );
+}
+
+#[test]
+fn a_blank_parent_subject_is_the_same_node_in_joins() {
+    // the same row, and a hash join over another source
+    let m = format!(
+        r#"{RML}<http://ex.org/P> a rml:TriplesMap ;
+          rml:logicalSource [ rml:source "p.csv" ; rml:referenceFormulation rml:CSV ] ;
+          rml:subjectMap [ rml:termType rml:BlankNode ] ;
+          rml:predicateObjectMap [ rml:predicate ex:name ; rml:objectMap [ rml:reference "name" ] ] .
+        <http://ex.org/C> a rml:TriplesMap ;
+          rml:logicalSource [ rml:source "p.csv" ; rml:referenceFormulation rml:CSV ] ;
+          rml:subjectMap [ rml:template "http://ex.org/c/{{id}}" ] ;
+          rml:predicateObjectMap [ rml:predicate ex:same ; rml:objectMap [ rml:parentTriplesMap <http://ex.org/P> ] ] .
+        <http://ex.org/D> a rml:TriplesMap ;
+          rml:logicalSource [ rml:source "d.csv" ; rml:referenceFormulation rml:CSV ] ;
+          rml:subjectMap [ rml:template "http://ex.org/d/{{id}}" ] ;
+          rml:predicateObjectMap [ rml:predicate ex:joined ; rml:objectMap [ rml:parentTriplesMap <http://ex.org/P> ;
+            rml:joinCondition [ rml:child "pid" ; rml:parent "id" ] ] ] ."#
+    );
+    let out = run_text(
+        MappingKind::Rml,
+        &m,
+        &[
+            ("p.csv", "id,name\n1,Ann\n2,Bob\n"),
+            ("d.csv", "id,pid\n9,2\n"),
+        ],
+    )
+    .unwrap();
+    let node_of = |name: &str| {
+        out.iter()
+            .find(|l| l.contains(&format!("\"{name}\"")))
+            .map(|l| l.split(' ').next().unwrap().to_string())
+            .unwrap()
+    };
+    let (ann, bob) = (node_of("Ann"), node_of("Bob"));
+    assert_ne!(ann, bob);
+    assert!(
+        out.contains(&format!("<http://ex.org/c/1> <http://ex.org/same> {ann} .")),
+        "{out:?}"
+    );
+    assert!(
+        out.contains(&format!(
+            "<http://ex.org/d/9> <http://ex.org/joined> {bob} ."
+        )),
+        "{out:?}"
+    );
+}
+
+#[test]
+fn every_value_of_a_multi_valued_parent_key_joins() {
+    let m = format!(
+        r#"{RML}<http://ex.org/P> a rml:TriplesMap ;
+          rml:logicalSource [ rml:source "p.json" ; rml:referenceFormulation rml:JSONPath ; rml:iterator "$[*]" ] ;
+          rml:subjectMap [ rml:template "http://ex.org/p/{{id}}" ] .
+        <http://ex.org/C> a rml:TriplesMap ;
+          rml:logicalSource [ rml:source "c.csv" ; rml:referenceFormulation rml:CSV ] ;
+          rml:subjectMap [ rml:template "http://ex.org/c/{{id}}" ] ;
+          rml:predicateObjectMap [ rml:predicate ex:p ; rml:objectMap [ rml:parentTriplesMap <http://ex.org/P> ;
+            rml:joinCondition [ rml:child "k" ; rml:parent "k[*]" ] ] ] ."#
+    );
+    let out = run_text(
+        MappingKind::Rml,
+        &m,
+        &[
+            ("p.json", r#"[{"id":1,"k":["a","b"]}]"#),
+            ("c.csv", "id,k\n7,b\n"),
+        ],
+    )
+    .unwrap();
+    assert!(
+        out.contains("<http://ex.org/c/7> <http://ex.org/p> <http://ex.org/p/1> ."),
+        "{out:?}"
+    );
+}
+
+#[test]
+fn a_null_graph_value_gives_no_triple() {
+    let m = format!(
+        r#"{RML}<http://ex.org/m> a rml:TriplesMap ;
+          rml:logicalSource [ rml:source "a.csv" ; rml:referenceFormulation rml:CSV ] ;
+          rml:subjectMap [ rml:template "http://ex.org/{{id}}" ; rml:class ex:T ;
+                           rml:graphMap [ rml:template "http://ex.org/g/{{g}}" ] ] ;
+          rml:predicateObjectMap [ rml:predicate ex:p ; rml:objectMap [ rml:reference "v" ] ] ."#
+    );
+    let out = run_text(MappingKind::Rml, &m, &[("a.csv", "id,g,v\n1,x,a\n2,,b\n")]).unwrap();
+    assert_eq!(out.len(), 2, "{out:?}");
+    assert!(
+        out.iter().all(|l| l.contains("<http://ex.org/g/x>")),
+        "{out:?}"
+    );
+}
+
+#[test]
+fn yarrrml_constants_keep_their_language_and_datatype() {
+    let y = r#"
+prefixes:
+  ex: "http://ex.org/"
+  xsd: "http://www.w3.org/2001/XMLSchema#"
+mappings:
+  m:
+    sources: [a.csv~csv]
+    s: ex:$(id)
+    po:
+      - [ex:label, hello, en~lang]
+      - [ex:n, '42', xsd:integer]
+"#;
+    let out = run_text(MappingKind::Yarrrml, y, &[("a.csv", "id\n1\n")]).unwrap();
+    assert!(
+        out.contains("<http://ex.org/1> <http://ex.org/label> \"hello\"@en ."),
+        "{out:?}"
+    );
+    assert!(
+        out.contains(
+            "<http://ex.org/1> <http://ex.org/n> \"42\"^^<http://www.w3.org/2001/XMLSchema#integer> ."
+        ),
+        "{out:?}"
+    );
+}
+
+#[test]
+fn json_numbers_with_a_fraction_or_exponent_are_doubles() {
+    let m = format!(
+        r#"{RML}<http://ex.org/m> a rml:TriplesMap ;
+          rml:logicalSource [ rml:source "a.json" ; rml:referenceFormulation rml:JSONPath ; rml:iterator "$[*]" ] ;
+          rml:subjectMap [ rml:template "http://ex.org/{{id}}" ] ;
+          rml:predicateObjectMap [ rml:predicate ex:v ; rml:objectMap [ rml:reference "v" ] ] ."#
+    );
+    let out = run_text(
+        MappingKind::Rml,
+        &m,
+        &[(
+            "a.json",
+            r#"[{"id":1,"v":1e0},{"id":2,"v":1.5},{"id":3,"v":4}]"#,
+        )],
+    )
+    .unwrap();
+    let dbl = "<http://www.w3.org/2001/XMLSchema#double>";
+    assert!(
+        out.iter()
+            .any(|l| l.starts_with("<http://ex.org/1>") && l.contains(dbl)),
+        "{out:?}"
+    );
+    assert!(
+        out.iter()
+            .any(|l| l.starts_with("<http://ex.org/2>") && l.contains(dbl)),
+        "{out:?}"
+    );
+    assert!(
+        out.iter()
+            .any(|l| l.starts_with("<http://ex.org/3>") && l.contains("#integer>")),
+        "{out:?}"
+    );
+}
+
+#[test]
+fn a_map_base_wins_over_the_run_base_which_wins_over_the_document_base() {
+    let m = format!(
+        r#"@base <http://doc/> . {RML}<http://ex.org/m> a rml:TriplesMap ; rml:baseIRI <http://old/> ;
+          rml:logicalSource [ rml:source "a.csv" ; rml:referenceFormulation rml:CSV ] ;
+          rml:subjectMap [ rml:template "s/{{id}}" ] ;
+          rml:predicateObjectMap [ rml:predicate ex:p ; rml:objectMap [ rml:reference "id" ] ] ."#
+    );
+    let dir = tempfile::tempdir().unwrap();
+    let inputs = files(dir.path(), &[("a.csv", "id\n1\n")]);
+    let parsed = parse(&m, MappingKind::Rml, None).unwrap();
+    let old = nquads(&parsed, &inputs, &RunOptions::default()).unwrap();
+    assert!(
+        old.iter().all(|l| l.starts_with("<http://old/s/1>")),
+        "{old:?}"
+    );
+    let opts = RunOptions {
+        base: Some("http://new/".into()),
+        ..Default::default()
+    };
+    let new = nquads(&parsed, &inputs, &opts).unwrap();
+    assert!(
+        new.iter().all(|l| l.starts_with("<http://old/s/1>")),
+        "{new:?}"
+    );
+    // without the map's base, the run's base wins over the document's @base
+    let parsed = parse(
+        &m.replace("rml:baseIRI <http://old/> ;", ""),
+        MappingKind::Rml,
+        None,
+    )
+    .unwrap();
+    let doc = nquads(&parsed, &inputs, &RunOptions::default()).unwrap();
+    assert!(
+        doc.iter().all(|l| l.starts_with("<http://doc/s/1>")),
+        "{doc:?}"
+    );
+    let new = nquads(&parsed, &inputs, &opts).unwrap();
+    assert!(
+        new.iter().all(|l| l.starts_with("<http://new/s/1>")),
+        "{new:?}"
+    );
+}

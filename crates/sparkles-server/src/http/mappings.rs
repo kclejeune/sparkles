@@ -468,6 +468,7 @@ pub(super) async fn run(
             grant: grant.as_ref(),
             lookup,
             only_graph: graph.clone(),
+            dir: tmp.path(),
         };
         let given = files.clone();
         let mut files = files;

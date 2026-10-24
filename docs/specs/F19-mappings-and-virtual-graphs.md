@@ -1019,7 +1019,8 @@ Decisions this spec left open, made during implementation:
 * The command line parses a mapping file with the file's URL as the base of its own
   relative IRIs, and stored and uploaded mappings with `urn:x-sparkles:mapping`. Only a
   document's `@base`, a triples map's `rml:baseIRI` or `--base` sets the base of
-  generated IRIs, and `--base` wins over the mapping's own.
+  generated IRIs. A triples map's `rml:baseIRI` wins, as RML-Core requires, and
+  `--base` wins over the document's `@base`.
 * An R2RML logical table reads the default connection, which is the only connection or
   the one named `default`. `convert` prints that connection as
   `urn:x-sparkles:connection:default`.
@@ -1034,7 +1035,28 @@ Decisions this spec left open, made during implementation:
   triples map per entry. `a` takes IRIs, and the predefined prefixes of the YARRRML
   specification apply.
 * The blank node label of a value is `m` and the value escaped, so equal values give one
-  node within a run. A blank node subject map without a value gives a new node per row.
+  node within a run. A blank node subject map without a value gives a new node per row,
+  labelled by its triples map and the row's number in its source. A join that reads the
+  parent's subject again gets the same node, and such a join is never pushed into SQL,
+  whose joined rows have no row number of the parent's source. Across a hash join over
+  a SQL source, the node depends on the database returning the parent's rows in the
+  same order to both reads.
+* A term map generates at most 100,000 values for one row, and a join probes or indexes
+  at most 100,000 key combinations for one row. Multi-valued JSON references multiply,
+  and past the bound the run fails with the triples map and the row. Term maps nest at
+  most 32 deep through datatype, language and function maps, so a term map that refers
+  to itself fails when the mapping is read.
+* A triples map whose graph maps generate no graph for a row generates no triple for
+  that row. The default graph applies only when no graph map is declared.
+* A JSON number without a fraction or exponent is an `xsd:integer` with its exact
+  digits. Any other number is an `xsd:double`, and serde_json prints it in its own form,
+  so `1e0` becomes `"1.0"^^xsd:double`. §4.2 asked for the source's lexical form, which
+  roadmap item 239 adds.
+* In CSVW standard mode the tables of one load are written into one N-Triples file, so
+  a table group without an `@id` is one blank node for all its tables.
+* A template lookup that binds a blank node of the dataset writes a new blank node,
+  because the loader scopes blank node labels per file. Roadmap item 238 keeps the
+  dataset's nodes.
 * A Graph Store request's body is the file its mapping reads, named by `source=NAME` or
   the mapping's only file source. A `DELETE` with a body removes the mapped triples and
   cannot remove triples with blank nodes. A request on the default graph refuses a

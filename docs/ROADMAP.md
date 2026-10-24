@@ -268,6 +268,8 @@ These items are smaller or narrower. Each has a design sketch in the linked spec
 | 235 | The W3C CSVW test suite, vendored as test data for the RDF tests in minimal and standard mode. | [F19](specs/F19-mappings-and-virtual-graphs.md#131-conformance-and-equivalence) | S–M |
 | 236 | The remaining SPARQL functions as `urn:x-sparkles:fn:` functions in RML and YARRRML function maps, such as the date, numeric and term functions. | [F19](specs/F19-mappings-and-virtual-graphs.md#outcome) | S |
 | 237 | Parquet sources in object stores (`s3`, `gcs`, `azure`) through `object_store`, as F19 §4.4 lists. Parquet files are read from the local disk today. | [F19](specs/F19-mappings-and-virtual-graphs.md#outcome) | M |
+| 238 | Template lookups that keep the dataset's blank nodes. A lookup that binds an existing blank node writes a new one today, because the loader scopes blank node labels per file. | [F19](specs/F19-mappings-and-virtual-graphs.md#outcome) | S–M |
+| 239 | JSON numbers in mappings with their source lexical form, as F19 §4.2 asks. serde_json prints a non-integral number in its own form today. | [F19](specs/F19-mappings-and-virtual-graphs.md#outcome) | S |
 
 ## Tier 6: release work
 

@@ -380,6 +380,18 @@ fn csvw_standard_mode_checks_foreign_keys() {
         0,
     );
     assert!(out(&o).trim() == "yes", "{}", out(&o));
+    // the two tables belong to one table group
+    let o = expect(
+        d,
+        &[
+            "query",
+            "--loc",
+            "db",
+            "ASK { ?g a <http://www.w3.org/ns/csvw#TableGroup> ; <http://www.w3.org/ns/csvw#table> ?a , ?b . FILTER (?a != ?b) }",
+        ],
+        0,
+    );
+    assert!(out(&o).trim() == "yes", "{}", out(&o));
 }
 
 #[test]

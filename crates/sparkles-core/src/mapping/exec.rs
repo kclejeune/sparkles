@@ -10,7 +10,7 @@
 
 use super::functions;
 use super::model::{Dt, Lang, Mapping, ObjectMap, SourceKind, TermMap, TermType, Value};
-use super::source::{self, Cell, Dt as Nat, Row};
+use super::source::{self, Dt as Nat, Row};
 use super::template::{Part, iri_safe, uri_safe};
 use super::{DEFAULT_GRAPH_RML, DEFAULT_GRAPH_RR, Inputs, RunOptions};
 use crate::error::{Error, Result};
@@ -21,6 +21,18 @@ use std::rc::Rc;
 
 fn base_of(b: &Option<String>) -> Option<Rc<str>> {
     b.as_deref().map(Rc::from)
+}
+
+/// The most values one term map may generate for one row, and the most key combinations
+/// a join probes or indexes for one row. Multi-valued references multiply, so the bound
+/// stops a small row from allocating a huge product before anything is written.
+pub const MAX_ROW_VALUES: usize = 100_000;
+
+fn too_many(map: &str, row: &dyn Row, what: &str) -> Error {
+    Error::invalid(format!(
+        "triples map {map}: {}: {what} would generate more than {MAX_ROW_VALUES} values for one row",
+        row.position()
+    ))
 }
 
 /// What a run did.
@@ -157,7 +169,9 @@ enum CValue {
     /// the parts, and whether values are URI-safe rather than IRI-safe encoded
     Tpl(Vec<CPart>, bool),
     Fn(String, Vec<(usize, CTerm)>),
-    Fresh,
+    /// a blank node per row, labelled by the generating site and the row number, so that
+    /// a parent's subject read again for a join is the same node
+    Fresh(usize),
 }
 
 #[derive(Clone, Debug)]
@@ -189,7 +203,10 @@ enum CLang {
     Map(Box<CTerm>),
 }
 
-fn compile(t: &TermMap, refs: &mut Refs, side: u8) -> CTerm {
+/// Compile a term map. `site` names the term map for blank nodes made per row: a
+/// subject map's site is its triples map's index, so that the parent's subject compiled
+/// again for a join gives the same node.
+fn compile(t: &TermMap, refs: &mut Refs, side: u8, site: usize) -> CTerm {
     let value = match &t.value {
         Value::Constant(c) => CValue::Const(c.clone()),
         Value::Reference(r) => CValue::Ref(refs.get(side, r)),
@@ -213,13 +230,13 @@ fn compile(t: &TermMap, refs: &mut Refs, side: u8) -> CTerm {
                     .map(|(p, v)| {
                         (
                             params.iter().position(|q| q == p.as_str()).unwrap_or(0),
-                            compile(v, refs, side),
+                            compile(v, refs, side, site),
                         )
                     })
                     .collect(),
             )
         }
-        Value::Fresh => CValue::Fresh,
+        Value::Fresh => CValue::Fresh(site),
     };
     CTerm {
         natural: matches!(t.value, Value::Reference(_) | Value::Function(_)),
@@ -227,11 +244,11 @@ fn compile(t: &TermMap, refs: &mut Refs, side: u8) -> CTerm {
         tt: t.term_type,
         dt: t.datatype.as_ref().map(|d| match d {
             Dt::Constant(n) => CDt::Const(n.clone()),
-            Dt::Map(m) => CDt::Map(Box::new(compile(m, refs, side))),
+            Dt::Map(m) => CDt::Map(Box::new(compile(m, refs, side, site))),
         }),
         lang: t.language.as_ref().map(|l| match l {
             Lang::Constant(s) => CLang::Const(s.clone()),
-            Lang::Map(m) => CLang::Map(Box::new(compile(m, refs, side))),
+            Lang::Map(m) => CLang::Map(Box::new(compile(m, refs, side, site))),
         }),
         desc: t.describe(),
     }
@@ -312,7 +329,12 @@ struct Plan {
     joins: Vec<String>,
 }
 
+/// No term map has this site: predicates and graphs are never blank nodes.
+const NO_SITE: usize = usize::MAX;
+
 fn plan(m: &Mapping) -> Plan {
+    // object maps that make a blank node per row get sites after the triples maps
+    let mut next_site = m.maps.len();
     let mut tables: Vec<Table> = Vec::new();
     let mut joins = Vec::new();
     let mut scans: Vec<Scan> = Vec::new();
@@ -320,20 +342,31 @@ fn plan(m: &Mapping) -> Plan {
         let mut refs = Refs::default();
         let mut maps = Vec::new();
         for (mi, tm) in m.maps.iter().enumerate().filter(|(_, t)| t.source == s) {
-            let subject = compile(&tm.subject, &mut refs, 0);
-            let graphs = tm.graphs.iter().map(|g| compile(g, &mut refs, 0)).collect();
+            let subject = compile(&tm.subject, &mut refs, 0, mi);
+            let graphs = tm
+                .graphs
+                .iter()
+                .map(|g| compile(g, &mut refs, 0, NO_SITE))
+                .collect();
             let mut pos = Vec::new();
             for (pi, po) in tm.predicate_objects.iter().enumerate() {
                 let preds = po
                     .predicates
                     .iter()
-                    .map(|p| compile(p, &mut refs, 0))
+                    .map(|p| compile(p, &mut refs, 0, NO_SITE))
                     .collect();
-                let pgraphs = po.graphs.iter().map(|g| compile(g, &mut refs, 0)).collect();
+                let pgraphs = po
+                    .graphs
+                    .iter()
+                    .map(|g| compile(g, &mut refs, 0, NO_SITE))
+                    .collect();
                 let mut objs = Vec::new();
                 for o in &po.objects {
                     objs.push(match o {
-                        ObjectMap::Term(t) => CObj::Term(compile(t, &mut refs, 0)),
+                        ObjectMap::Term(t) => {
+                            next_site += 1;
+                            CObj::Term(compile(t, &mut refs, 0, next_site - 1))
+                        }
                         ObjectMap::Join { parent, conditions } => {
                             let p = &m.maps[*parent];
                             if conditions.is_empty() && p.source == s {
@@ -341,9 +374,16 @@ fn plan(m: &Mapping) -> Plan {
                                     "{} → {}: the parent's subject from the same row",
                                     tm.id, p.id
                                 ));
-                                CObj::SameRow(compile(&p.subject, &mut refs, 0), base_of(&p.base))
+                                CObj::SameRow(
+                                    compile(&p.subject, &mut refs, 0, *parent),
+                                    base_of(&p.base),
+                                )
                             } else if let (Some(a), Some(b)) = (is_sql(m, s), is_sql(m, p.source))
                                 && a == b
+                                // a blank node per row is labelled by the row of its own
+                                // source, which a joined statement does not keep
+                                && !matches!(tm.subject.value, Value::Fresh)
+                                && !matches!(p.subject.value, Value::Fresh)
                             {
                                 joins.push(format!(
                                     "{} → {}: one SQL statement on connection {}: {}",
@@ -430,17 +470,25 @@ fn join_scan(
     let po = &tm.predicate_objects[pi];
     let p = &m.maps[parent];
     let mut refs = Refs::default();
-    let subject = compile(&tm.subject, &mut refs, 0);
-    let graphs = tm.graphs.iter().map(|g| compile(g, &mut refs, 0)).collect();
+    let subject = compile(&tm.subject, &mut refs, 0, mi);
+    let graphs = tm
+        .graphs
+        .iter()
+        .map(|g| compile(g, &mut refs, 0, NO_SITE))
+        .collect();
     let preds = po
         .predicates
         .iter()
-        .map(|x| compile(x, &mut refs, 0))
+        .map(|x| compile(x, &mut refs, 0, NO_SITE))
         .collect();
-    let pgraphs = po.graphs.iter().map(|g| compile(g, &mut refs, 0)).collect();
+    let pgraphs = po
+        .graphs
+        .iter()
+        .map(|g| compile(g, &mut refs, 0, NO_SITE))
+        .collect();
     // the child's references come first in the statement
     let child_refs = refs.list.len();
-    let obj = compile(&p.subject, &mut refs, 1);
+    let obj = compile(&p.subject, &mut refs, 1, parent);
     Scan {
         kind: ScanKind::Join {
             child_source: tm.source,
@@ -501,10 +549,12 @@ pub fn describe_joins(m: &Mapping) -> Vec<String> {
 // ------------------------------------------------------------------- generating ----
 
 struct Gen<'a> {
+    /// the run's base (`--base`) or else the mapping document's
     base: Option<&'a str>,
     /// the base of the triples map being generated, over `base`
     map_base: Option<Rc<str>>,
-    fresh: u64,
+    /// the number of the current row in its source, from 1
+    row_no: u64,
     only_graph: Option<&'a NamedNode>,
 }
 
@@ -568,6 +618,9 @@ impl Gen<'_> {
                             if cells.is_empty() {
                                 return Ok(());
                             }
+                            if acc.len().saturating_mul(cells.len()) > MAX_ROW_VALUES {
+                                return Err(too_many(map, row, &t.desc));
+                            }
                             let mut next = Vec::with_capacity(acc.len() * cells.len());
                             for a in &acc {
                                 for c in &cells {
@@ -601,9 +654,8 @@ impl Gen<'_> {
                     out.push((c.lex.into_owned(), c.dt));
                 }
             }
-            CValue::Fresh => {
-                self.fresh += 1;
-                out.push((format!("f{}", self.fresh), Nat::Str));
+            CValue::Fresh(site) => {
+                out.push((format!("f{site}r{}", self.row_no), Nat::Str));
             }
         }
         Ok(())
@@ -612,15 +664,19 @@ impl Gen<'_> {
     /// The terms a term map generates for a row.
     fn terms(&mut self, t: &CTerm, row: &dyn Row, map: &str, out: &mut Vec<Term>) -> Result<()> {
         if let CValue::Const(c) = &t.value {
-            out.push(c.clone());
-            return Ok(());
+            // a constant literal with a datatype or language of its own, as YARRRML
+            // writes them, takes them through the literal path
+            if !(matches!(c, Term::Literal(_)) && (t.dt.is_some() || t.lang.is_some())) {
+                out.push(c.clone());
+                return Ok(());
+            }
         }
         let mut vals = Vec::new();
         self.values(t, row, map, &mut vals)?;
         for (s, nat) in vals {
             out.push(match t.tt {
                 TermType::Iri => Term::NamedNode(self.iri(s, t, row, map)?),
-                TermType::BlankNode => Term::BlankNode(if matches!(t.value, CValue::Fresh) {
+                TermType::BlankNode => Term::BlankNode(if matches!(t.value, CValue::Fresh(_)) {
                     BlankNode::new_unchecked(s)
                 } else {
                     BlankNode::new_unchecked(blank_label(&s))
@@ -635,6 +691,7 @@ impl Gen<'_> {
         if oxiri::Iri::parse(s.as_str()).is_ok() {
             return NamedNode::new(s).map_err(|e| data_error(map, row, t, e));
         }
+        // a triples map's own base wins, as RML-Core requires
         let Some(base) = self.map_base.as_deref().or(self.base) else {
             return Err(data_error(
                 map,
@@ -800,8 +857,10 @@ impl Gen<'_> {
             stats.quads += 1;
             sink(Quad::new(s.clone(), p.clone(), o.clone(), g))
         };
+        // with no graph map the default graph, and with graph maps that generate nothing
+        // for this row no triple
         let default = [GraphName::DefaultGraph];
-        let class_graphs: &[GraphName] = if sgraphs.is_empty() {
+        let class_graphs: &[GraphName] = if cm.graphs.is_empty() {
             &default
         } else {
             &sgraphs
@@ -817,7 +876,7 @@ impl Gen<'_> {
         let mut preds = Vec::new();
         let mut objs = Vec::new();
         let mut graphs = Vec::new();
-        let mut keyvals: Vec<Vec<Cell<'_>>> = Vec::new();
+        let mut keyvals: Vec<Vec<String>> = Vec::new();
         for po in &cm.pos {
             preds.clear();
             for p in &po.preds {
@@ -842,24 +901,13 @@ impl Gen<'_> {
                         for k in keys {
                             let mut v = Vec::new();
                             row.get(*k, &mut v)?;
-                            keyvals.push(v);
+                            keyvals.push(v.into_iter().map(|c| c.lex.into_owned()).collect());
                         }
                         if keyvals.iter().any(Vec::is_empty) {
                             continue;
                         }
-                        // every combination of the values of multi-valued keys
-                        let mut combos: Vec<Vec<String>> = vec![Vec::new()];
-                        for v in &keyvals {
-                            let mut next = Vec::new();
-                            for c in &combos {
-                                for x in v {
-                                    let mut c = c.clone();
-                                    c.push(x.lex.to_string());
-                                    next.push(c);
-                                }
-                            }
-                            combos = next;
-                        }
+                        let combos = combinations(&keyvals)
+                            .ok_or_else(|| too_many(&cm.id, row, "the join's key values"))?;
                         for c in combos {
                             if let Some(ts) = tables[*table].rows.get(&c) {
                                 objs.extend(ts.iter().cloned());
@@ -876,6 +924,9 @@ impl Gen<'_> {
             graphs.extend(sgraphs.iter().cloned());
             self.graph_names(&po.graphs, row, &cm.id, &mut graphs)?;
             if graphs.is_empty() {
+                if !cm.graphs.is_empty() || !po.graphs.is_empty() {
+                    continue;
+                }
                 graphs.push(GraphName::DefaultGraph);
             }
             for s in &subjects {
@@ -893,6 +944,27 @@ impl Gen<'_> {
         }
         Ok(())
     }
+}
+
+/// Every combination of the values of multi-valued join keys, none past
+/// [`MAX_ROW_VALUES`].
+fn combinations(keyvals: &[Vec<String>]) -> Option<Vec<Vec<String>>> {
+    let mut combos: Vec<Vec<String>> = vec![Vec::new()];
+    for v in keyvals {
+        if combos.len().saturating_mul(v.len()) > MAX_ROW_VALUES {
+            return None;
+        }
+        let mut next = Vec::with_capacity(combos.len() * v.len());
+        for c in &combos {
+            for x in v {
+                let mut c = c.clone();
+                c.push(x.clone());
+                next.push(c);
+            }
+        }
+        combos = next;
+    }
+    Some(combos)
 }
 
 /// The bytes a parent table's entry is charged: its key, its subjects and a fixed
@@ -922,11 +994,10 @@ pub fn run(
         joins: p.joins.clone(),
         ..Default::default()
     };
-    let base = opts.base.as_deref().or(m.base.as_deref());
     let mut g = Gen {
-        base,
+        base: opts.base.as_deref().or(m.base.as_deref()),
         map_base: None,
-        fresh: 0,
+        row_no: 0,
         only_graph: opts.only_graph.as_ref(),
     };
     // the parent tables of in-memory joins, before the children
@@ -935,7 +1006,7 @@ pub fn run(
         let parent = p.tables[ti].parent;
         let pm = &m.maps[parent];
         let mut refs = Refs::default();
-        let subject = compile(&pm.subject, &mut refs, 0);
+        let subject = compile(&pm.subject, &mut refs, 0, parent);
         g.map_base = base_of(&pm.base);
         let keys: Vec<usize> = p.tables[ti].keys.iter().map(|k| refs.get(0, k)).collect();
         let mut src = source::open(&m.sources[pm.source], &refs.list, inputs, opts)?;
@@ -944,35 +1015,42 @@ pub fn run(
         let desc = p.tables[ti].desc.clone();
         let budget = opts.memory_budget;
         let mut terms = Vec::new();
+        let mut keyvals: Vec<Vec<String>> = Vec::new();
         src.scan(&mut |row| {
             n += 1;
+            g.row_no = n;
             terms.clear();
             g.terms(&subject, row, &pm.id, &mut terms)?;
             if terms.is_empty() {
                 return Ok(());
             }
-            let mut key = Vec::with_capacity(keys.len());
+            keyvals.clear();
             for k in &keys {
                 let mut v = Vec::new();
                 row.get(*k, &mut v)?;
-                // NULL never joins; a multi-valued key keeps its first value
-                let Some(c) = v.into_iter().next() else {
+                // NULL never joins
+                if v.is_empty() {
                     return Ok(());
-                };
-                key.push(c.lex.into_owned());
+                }
+                keyvals.push(v.into_iter().map(|c| c.lex.into_owned()).collect());
             }
-            for t in &terms {
-                used += entry_bytes(&key, t);
+            // a multi-valued key indexes every combination of its values
+            let combos =
+                combinations(&keyvals).ok_or_else(|| too_many(&pm.id, row, "the join's key values"))?;
+            for key in combos {
+                for t in &terms {
+                    used += entry_bytes(&key, t);
+                }
+                if let Some(b) = budget
+                    && used > b
+                {
+                    return Err(Error::invalid(format!(
+                        "{desc} needs more than the memory budget of {} for the parent's subjects, after {n} parent rows; put both sides on one database so the join runs there, or raise the budget",
+                        crate::error::human_bytes(b)
+                    )));
+                }
+                rows.entry(key).or_default().extend(terms.iter().cloned());
             }
-            if let Some(b) = budget
-                && used > b
-            {
-                return Err(Error::invalid(format!(
-                    "{desc} needs more than the memory budget of {} for the parent's subjects, after {n} parent rows; put both sides on one database so the join runs there, or raise the budget",
-                    crate::error::human_bytes(b)
-                )));
-            }
-            rows.entry(key).or_default().append(&mut terms);
             Ok(())
         })?;
         stats.rows += n;
@@ -1001,6 +1079,7 @@ pub fn run(
         let mut n = 0u64;
         src.scan(&mut |row| {
             n += 1;
+            g.row_no = n;
             for cm in &scan.maps {
                 g.row(cm, row, &tables, sink, &mut stats)?;
             }

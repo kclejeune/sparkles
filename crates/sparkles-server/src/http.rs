@@ -3762,6 +3762,7 @@ async fn upload(
             grant: grant.as_ref(),
             lookup,
             only_graph: g.clone(),
+            dir: tmp.path(),
         };
         let tables = tabular::convert(&mut files, &mappings, &params, &cx)?;
         let sources = files
@@ -3827,14 +3828,22 @@ pub(super) fn tabular_lookup(
 ) -> ApiResult<sparkles::tabular::template::Lookup> {
     let snap = ds.store.snapshot();
     let commit = snap.commit;
-    let snapshot = match view {
-        Some(v) => v.bound(&snap).masked(&snap)?,
-        None => snap,
+    let (snapshot, graphs) = match view {
+        Some(v) => {
+            let bound = v.bound(&snap);
+            let masked = bound.masked(&snap)?;
+            // the masked snapshot hides protected triples, and the grants keep the
+            // template out of the graphs the caller may not read
+            let graphs = (!bound.reads_all()).then_some(bound);
+            (masked, graphs)
+        }
+        None => (snap, None),
     };
     Ok(sparkles::tabular::template::Lookup {
         snapshot,
         prefixes: ds.store.prefixes().into_iter().collect(),
         commit,
+        graphs,
     })
 }
 
