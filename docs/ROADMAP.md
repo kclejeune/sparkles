@@ -100,6 +100,8 @@ These items are cheap or foundational.
 ### Remaining work for item 7
 
 * Spill stays opt-in until all X08 Phase 2b acceptance gates pass, which item 93 tracks.
+* LIMIT propagation into fallbacks, running state for FOLD and registered aggregates,
+  and earlier first bytes remain from the X05 follow-ups.
 * An EXISTS evaluated once per outer key, in BIND or an OPTIONAL condition, stays eager
   because the cursor was slower, and DESCRIBE does not stream.
 * The UI's result table still asks for eager execution until it can show a streamed
@@ -118,7 +120,7 @@ openCypher comes last.
 
 | # | Item | Spec | Size | Value |
 |---|---|---|---|---|
-| 19 | **Query-time reasoning.** Phase 2 adds `auto` with its cost model, the dataset setting and hybrid rules. Phase 3 adds OWL 2 QL rewriting, reuse of tables across commits, the MCP argument, the UI and tables kept current by F13. Items 190 to 193 cover what Phase 1 left. | [F17](specs/F17-query-time-reasoning.md#outcome) | L | High |
+| 19 | **Query-time reasoning.** Phase 2 adds `auto` with its cost model, the dataset setting, hybrid Jena rules, OWL 2 QL rewriting, reuse of tables across commits, the MCP argument, the UI and the G08 mapping. Phase 3 keeps tables current through F13 and adds `why` provenance on tables for F18. Items 190 to 193 cover what Phase 1 left. | [F17](specs/F17-query-time-reasoning.md#outcome) | L | High |
 | 18 | **Explanations.** Derivation trees, "why not?" answers, entailment diffs on branches and minimal justifications, with protections that track provenance and `reviewedOnly` extended to derived facts. Phases 1 and 2 need only F17 Phase 1, and Phase 3 needs F13. | [F18](specs/F18-explanations-and-entailment-diffs.md) | M–L | High |
 | 17 | **Incremental computation core.** Materialized SPARQL views, live queries that push result changes, and provenance per fact. | [F13](specs/F13-incremental-views-and-provenance.md) | XL | Very high |
 | 23 | **Full-text parity.** Lucene analyzers, CJK segmentation, online reindexing, search after uncommitted writes, and historical search. | [F03](specs/F03-full-text-search.md#roadmap-follow-ups-2026-10-12) | M each | Medium |
@@ -211,7 +213,7 @@ Rows that need backend work name it first.
 | 101 | **Visual query builder, Phase 3.** `UNION`, `GRAPH`, inline `VALUES`, `MINUS` and `FILTER NOT EXISTS` join the editable subset, and **Build a query** opens the pane from a class of the Explore overview. | [U08](specs/U08-visual-query-builder.md#outcome) | L |
 | 120 | **The validation overlay on the quality record.** Once item 31 Phase 1 records the guard's results per commit, add `focus=` to `GET /$/validation/{ds}/results` and read the record at the head instead of validating. | [U07](specs/U07-data-quality-and-schema-diagram.md#outcome) §11 | S |
 | 121 | **Conclusive previews of a suggested fix.** Let a dry run name focus nodes to validate in full against the candidate state, so that the overlay can say a fix resolves a result while other results remain. | [U07](specs/U07-data-quality-and-schema-diagram.md#outcome) §11, [C15](specs/C15-write-previews.md) | S |
-| 140 | **Linked views remainder in the UI.** Colour the embedding map by a kept Leiden run, count date facets by month for short spans, give the facets a full-screen tab on phones, and let Explore's map and facets read a branch. | [U11](specs/U11-linked-views.md#outcome) | M |
+| 140 | **Linked views remainder in the UI.** Colour the embedding map by a kept Leiden run and open it with `Shift+M`, count date facets by month for short spans, give the facets a full-screen tab on phones, and let Explore's map and facets read a branch. | [U11](specs/U11-linked-views.md#outcome) | M |
 | 141 | **Frame times of the linked views on a GPU.** Run U11's A9 frame-rate and lasso targets in a Playwright performance project on a GPU runner, since they were measured only in software rendering. | [U11](specs/U11-linked-views.md#outcome) | S |
 | 142 | **Projections on disk and for partial callers.** Decide whether to write projections beside the index in a versioned file, and whether to serve a projection filtered to what a caller can read instead of answering `403`. | [U11](specs/U11-linked-views.md#10-open-questions) | M |
 | 150 | **Bidirectional weighted path search.** A weighted search runs Dijkstra's algorithm from the source alone and is far slower than an unweighted one. Search from both ends, run Yen's spur searches on it, and bound them by the best cost found so far. | [F07](specs/F07-path-search.md), [U09](specs/U09-path-finder.md#outcome) | M |
