@@ -383,7 +383,7 @@ geometric mean of 0.93 for the new build over the old one and no query above the
 since the engine did not change. It also timed the weighted searches the panel now sends.
 A weighted pair search takes 0.68 s on the 10.5M-triple data against 1.2 ms unweighted,
 and the five cheapest paths stop at the default limit of 10 million visited nodes.
-[BENCHMARKS](../BENCHMARKS.md#weighted-pair-searches) has the table,
+[BENCHMARKS](../BENCHMARKS.md#weighted-pair-searches) has the figures,
 and ROADMAP item 150 makes weighted searches bidirectional.
 
 **Phase 3 decisions.** The spec left these open, and each was decided here. The weight

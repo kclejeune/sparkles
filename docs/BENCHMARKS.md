@@ -1149,7 +1149,11 @@ person to everyone costs 1.4–1.8× the `+` count, since it also keeps path par
 levels, and weighted search costs 5.6–6.3× the unweighted search.
 
 `path:excludePredicate` and `path:maxDegree` add no measurable cost to searches that use
-neither parameter. Searches backward and both ways do not pass through literals.
+neither parameter. In a screen of the path searches above at 10.5M, on an 8-vCPU Namespace
+instance on 2026-10-23 with four A, B, B, A rounds, the geometric mean of server time with
+the parameters' code against without it was 0.97, and medians of one build varied by up to
+77% between server processes, so no change was above the noise. Searches backward and both
+ways do not pass through literals.
 
 ### Weighted pair searches
 
@@ -1782,8 +1786,10 @@ deterministic local provider.
 
 The full-text index checkpoints in the background. A checkpoint synchronizes only the
 files written since its last pass, from eight threads so that ext4 commits them together,
-and repeats its unlocked pass until no file is left, so no tick takes the live writer lock
-for its I/O. This trace ran the mixed scenario of the full-text cell at 1.05M, one block of
+and repeats its unlocked pass up to four times while new files remain before it takes the
+live writer lock for a final locked pass. Commits written faster than they can be
+synchronized therefore still end in a locked pass. In this trace no tick needed the lock for
+its I/O. The trace ran the mixed scenario of the full-text cell at 1.05M, one block of
 an ordinary, two grouped and an ordinary process at a fixed 500 transactions/s and two
 readers, with the debug target `sparkles::text::checkpoint`. A stall is a run of writes
 slower than 25 ms that starts within 1 s of the last.
@@ -2312,7 +2318,14 @@ by eager time at 10.5M, where under 1 means streaming is faster
 
 Small scans stream faster too, which is why automatic execution streams scans from an
 estimated thousand rows. The scans read `foaf:name` with `LIMIT` and `ex:city`, which has
-20,000 triples.
+20,000 triples. The first table measures the probe binary in one process, and the second
+measures automatic execution over HTTP, each line the median of three rounds of the median
+wall time of 60 TSV requests from curl to a fresh server at 10.5M with one Rayon thread, the
+server and client pinned to their own cores. A first run sets `SPARKLES_NO_IN_PLACE`, so
+that every request is planned and runs as a first one does. A repeat lets a query that
+answered in under 10 ms run eagerly in place, which a streamed answer also earns. The wall
+times include a constant floor of about 1.97 ms in the client path, which hides
+differences at 1,000 and 5,000 rows.
 
 | 10.5M, TSV, ms | Eager, 12 threads | Streaming, 12 threads | Eager, 1 thread | Streaming, 1 thread |
 |---|---:|---:|---:|---:|
@@ -2320,6 +2333,15 @@ estimated thousand rows. The scans read `foaf:name` with `LIMIT` and `ex:city`, 
 | 5,000 triples | 1.604 | **1.126** | 1.610 | **1.229** |
 | 50,000 triples | 15.590 | **8.057** | 15.676 | **12.034** |
 | 100,000 names | 19.151 | **16.888** | 30.216 | **23.228** |
+
+| 10.5M, TSV over HTTP, ms | First run | Repeated |
+|---|---:|---:|
+| 1,000 rows | 2.014 | 2.013 |
+| 5,000 rows | 3.149 | 3.155 |
+| 20,000 rows | 5.461 | 6.443 |
+| 50,000 rows | 14.007 | 14.004 |
+
+*Measured on forge.*
 
 <a id="batch-kernels-and-disk-spill"></a>
 
