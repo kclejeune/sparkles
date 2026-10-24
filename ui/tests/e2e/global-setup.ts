@@ -35,6 +35,10 @@ import {
   DECLARED_KEY,
   MODELS,
   PASSWORD,
+  PATHS_DATA,
+  PATHS_DATASET,
+  PATHS_EX,
+  PATHS_PROTECTION,
   PATTERN_DATA,
   PATTERN_DATASET,
   PATTERN_PREDICATE,
@@ -171,9 +175,24 @@ dataset = "${PATTERN_DATASET}"
 level = "write"
 lifts = ["work"]
 
+[[roles.pattern-writer.grants]]
+dataset = "${PATHS_DATASET}"
+level = "read"
+lifts = ["${PATHS_PROTECTION}"]
+
 [[roles.pattern-reader.grants]]
 dataset = "${PATTERN_DATASET}"
 level = "read"
+
+[[roles.pattern-reader.grants]]
+dataset = "${PATHS_DATASET}"
+level = "read"
+
+[[protections]]
+name = "${PATHS_PROTECTION}"
+dataset = "${PATHS_DATASET}"
+predicates = ["${PATHS_EX}worksFor"]
+classes = ["${PATHS_EX}Founder"]
 
 [[protections]]
 name = "work"
@@ -247,6 +266,24 @@ graphs = ["urn:x-arq:DefaultGraph"]
       }),
       'loading the Pattern dataset',
     );
+    // the path finder's dataset, in two commits
+    await check(
+      await fetch(`${url}/$/datasets`, {
+        method: 'POST',
+        headers: { ...auth, 'Content-Type': 'application/json' },
+        body: JSON.stringify({ dbName: PATHS_DATASET, dbType: 'persistent' }),
+      }),
+      'creating the path finder dataset',
+    );
+    for (const [i, part] of PATHS_DATA.entries())
+      await check(
+        await fetch(`${url}/${PATHS_DATASET}/data`, {
+          method: 'POST',
+          headers: { ...auth, 'Content-Type': 'text/turtle' },
+          body: part,
+        }),
+        `loading part ${i + 1} of the path finder dataset`,
+      );
     for (let i = 0; ; i++) {
       const s = await (await fetch(`${url}/$/text/${DATASET}`, { headers: auth })).json();
       if (s.state === 'ready' && s.seq === s.storeSeq && s.docs > 0) break;

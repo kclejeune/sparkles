@@ -81,8 +81,10 @@ test('weights: the cheapest path by a reifier property comes first, with its cos
   await expect(list(page).getByRole('option').first()).toHaveAccessibleName(
     'path 1, length 2, Alpha road Bravo, Bravo road Delta',
   );
-  // the picker offers the numeric properties of the reifiers
+  // the picker offers the numeric properties of the reifiers once it is used
   const weight = panel(page).getByRole('combobox', { name: 'Weight' });
+  await expect(panel(page)).toContainText('Choose a property of the reifiers');
+  await weight.focus();
   await expect(weight.locator(`option[value="${EX}km"]`)).toHaveCount(1);
   await expect(panel(page)).toContainText('1 property on reifiers can weigh the edges');
   await weight.selectOption(`${EX}km`);
@@ -117,6 +119,7 @@ test('the query page draws the paths on its result graph, adding what it lacks',
   await choose(page, 'From', 'Alpha', /^Alpha\b/);
   await choose(page, 'To', 'Delta', /^Delta\b/);
   await panel(page).getByLabel('k shortest').check();
+  await panel(page).getByRole('combobox', { name: 'Weight' }).focus();
   await panel(page).getByRole('combobox', { name: 'Weight' }).selectOption(`${EX}km`);
   await panel(page).getByRole('button', { name: 'Find paths' }).click();
   await expect(list(page).getByRole('option')).toHaveCount(2);
@@ -189,6 +192,7 @@ test('the WebGL view draws the paths over the result and focuses one', async ({ 
   await choose(page, 'From', 'Alpha', /^Alpha\b/);
   await choose(page, 'To', 'Delta', /^Delta\b/);
   await panel(page).getByLabel('k shortest').check();
+  await panel(page).getByRole('combobox', { name: 'Weight' }).focus();
   await panel(page).getByRole('combobox', { name: 'Weight' }).selectOption(`${EX}km`);
   await panel(page).getByRole('button', { name: 'Find paths' }).click();
   await expect(list(page).getByRole('option')).toHaveCount(2);

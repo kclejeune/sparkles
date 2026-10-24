@@ -86,7 +86,7 @@
   /** The weight properties of the dataset at the page's state, once read. */
   let weights = $state<pf.WeightProperty[] | null>(null);
   let weightsErr = $state('');
-  let weightsFor = '';
+  let weightsFor = $state('');
   let weightCtl: AbortController | undefined;
   function loadWeights() {
     const key = `${ds}|${at}`;
@@ -133,11 +133,17 @@
   /** The filters are folded on a phone. */
   const wide = typeof matchMedia === 'function' ? !matchMedia('(max-width: 600px)').matches : true;
   let filtersOpen = $state(wide);
-  // the weight picker is filled when the filters are first shown, and again at a new state
+  // the weight picker is filled when it is first used, since listing the weight properties
+  // reads every reifier of the dataset, and again at a new state
   $effect(() => {
     void ds;
     void at;
-    if (filtersOpen) untrack(loadWeights);
+    untrack(() => {
+      if (weightsFor) {
+        weightsFor = '';
+        weights = null;
+      }
+    });
   });
   /** On a phone, after a search the sheet shows the first path only until it is swiped up. */
   let sheetFull = $state(true);
@@ -448,7 +454,12 @@
         >
         <label
           title="Add up a property of each edge's reifier instead of counting edges. An edge without one weighs 1."
-          >Weight <select bind:value={weight} aria-describedby="path-weight-note">
+          >Weight <select
+            bind:value={weight}
+            aria-describedby="path-weight-note"
+            onfocus={loadWeights}
+            onpointerdown={loadWeights}
+          >
             <option value={null}>none, count edges</option>
             {#each weights ?? [] as w (w.iri)}<option value={w.iri}
                 >{displayIri(w.iri, prefixes)}</option
@@ -457,8 +468,10 @@
         >
       </div>
       <p class="faint small" id="path-weight-note">
-        {#if weights == null}
+        {#if weights == null && weightsFor}
           Reading the weight properties…
+        {:else if weights == null}
+          Choose a property of the reifiers to add up instead of counting edges.
         {:else if weightsErr}
           {weightsErr}.
         {:else if !weights.length}
