@@ -268,8 +268,12 @@ ex:${id}Geom geo:asWKT ${point(c.lon, c.lat)} .
     // a little apart from the city's own marker, and from a colleague in the same city
     const lon = +(c.lon + 0.02 + (i % 3) * 0.01).toFixed(4);
     const lat = +(c.lat + 0.01 + (i % 2) * 0.01).toFixed(4);
+    // an invented age and date joined, for the facet histograms of U11 Phase 2
+    const age = 24 + ((i * 13) % 11) + ((i * 7) % 13) + ((i * 5) % 9);
+    const joined = `${2003 + ((i * 3) % 7) + ((i * 5) % 9) + ((i * 11) % 5)}-${String((i % 12) + 1).padStart(2, '0')}-${String((i % 27) + 1).padStart(2, '0')}`;
     ttl += `ex:${id} a ex:Person ; rdfs:label "${label}"@en ; ex:jobTitle "${role}"@en ;
-  ex:livesIn ex:${city} ; ex:worksFor ex:${employer} ; geo:hasDefaultGeometry ex:${id}Geom .
+  ex:livesIn ex:${city} ; ex:worksFor ex:${employer} ; geo:hasDefaultGeometry ex:${id}Geom ;
+  ex:age "${age}"^^xsd:integer ; ex:joined "${joined}"^^xsd:date .
 ex:${id}Geom geo:asWKT ${point(lon, lat)} .
 `;
   });

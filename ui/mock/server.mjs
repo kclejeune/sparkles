@@ -39,6 +39,7 @@ import { PathError, pathSearch } from './paths.mjs';
 import { handleModels } from './models.mjs';
 import { handleAsk, isAdmin, ORG_MEMORY, ORG_PREFIXES, orgTrig, whoamiFor } from './memory.mjs';
 import { handleAssistant } from './assistant.mjs';
+import { handleFacets } from './facets.mjs';
 import { handleGraphrag } from './graphrag.mjs';
 import { handleExplain, timedOutPlan } from './explain.mjs';
 import { handleReview, INGEST_BRANCH } from './review.mjs';
@@ -2375,6 +2376,8 @@ const server = http.createServer(async (req, res) => {
     if (await handleExplain(req, res, url, seg, { datasets, send, fail, readBody })) return;
     // the model configuration of a server without one (mock/models.mjs)
     if (handleModels(req, res, seg, { send, fail })) return;
+    // the facets of a set (mock/facets.mjs)
+    if (await handleFacets(req, res, seg, { datasets, send, fail, readBody })) return;
     // GraphRAG community reports (mock/graphrag.mjs)
     if (await handleGraphrag(req, res, url, seg, { datasets, send, fail, readBody })) return;
     // asking the server, the assistant settings and the history (mock/assistant.mjs)

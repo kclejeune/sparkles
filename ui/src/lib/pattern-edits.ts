@@ -68,7 +68,9 @@ export type Phase2Edit =
   | { kind: 'delete-locked'; block: string }
   | { kind: 'projection'; var: string; on: boolean }
   | { kind: 'distinct'; on: boolean }
-  | { kind: 'limit' | 'offset'; value: number | null };
+  | { kind: 'limit' | 'offset'; value: number | null }
+  /** `VALUES ?var { … }` at the start of the WHERE group (U11 §2.4, **Use in query**) */
+  | { kind: 'values-add'; var: string; terms: string[] };
 
 export type AnyEdit = Edit | Phase2Edit;
 
@@ -365,7 +367,32 @@ export function editAny(text: string, p: PatternOk, e: AnyEdit, parse?: Parse): 
     case 'limit':
     case 'offset':
       return modifier(text, p, e.kind, e.value);
+    case 'values-add':
+      return valuesAdd(text, p, e);
   }
+}
+
+/** Terms a line of a written `VALUES` block holds. */
+const VALUES_PER_LINE = 6;
+
+/** The text of a `VALUES` block over `terms`, a line per few terms in a long one. */
+export function valuesBlock(v: string, terms: string[], indent: string): string {
+  if (terms.length <= VALUES_PER_LINE) return `VALUES ?${v} { ${terms.join(' ')} }`;
+  const lines: string[] = [];
+  for (let i = 0; i < terms.length; i += VALUES_PER_LINE)
+    lines.push(`${indent}  ${terms.slice(i, i + VALUES_PER_LINE).join(' ')}`);
+  return `VALUES ?${v} {\n${lines.join('\n')}\n${indent}}`;
+}
+
+function valuesAdd(text: string, p: PatternOk, e: { var: string; terms: string[] }): Change[] {
+  if (!p.root) throw new EditError('this query has no WHERE group to edit');
+  const v = checkVarName(e.var);
+  if (e.terms.length === 0) throw new EditError('nothing to add');
+  for (const t of e.terms)
+    if (!/^<[^<>"{}|^`\\\s]*>$/.test(t)) throw new EditError(`${t} is not an IRI`);
+  // first in the group, so the block seeds the joins of the patterns after it
+  const indent = itemIndent(text, p.root);
+  return insertItem(text, p.root, null, valuesBlock(v, e.terms, indent), false);
 }
 
 function checkDeclared(p: PatternOk, prefix: string, declare: Prefixes) {
@@ -839,6 +866,17 @@ export function agreesWith(before: PatternOk, e: AnyEdit, after: PatternOk): boo
         same(locked) &&
         sameMods()
       );
+    case 'values-add': {
+      const added = minus(locked(after), locked(before)).map(normalized);
+      const want = normalized(valuesBlock(e.var.replace(/^[?$]/, ''), e.terms, ''));
+      return (
+        eq(added, [want]) &&
+        minus(locked(before), locked(after)).length === 0 &&
+        same(triples) &&
+        same(filters) &&
+        rest()
+      );
+    }
     case 'limit':
     case 'offset': {
       const other = e.kind === 'limit' ? 'offset' : 'limit';
@@ -902,6 +940,8 @@ export function describeEdit(e: Phase2Edit): string {
       return e.value === null
         ? `Removed ${e.kind.toUpperCase()}`
         : `Set ${e.kind.toUpperCase()} ${e.value}`;
+    case 'values-add':
+      return `Added VALUES ?${e.var.replace(/^[?$]/, '')} with ${e.terms.length} ${e.terms.length === 1 ? 'entity' : 'entities'}`;
   }
 }
 

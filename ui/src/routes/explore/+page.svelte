@@ -38,6 +38,9 @@
   import GraphMap from '$components/GraphMap.svelte';
   import GraphView, { type GEdge, type GNode } from '$components/GraphView.svelte';
   import SelectionBar from '$components/SelectionBar.svelte';
+  import FacetPanel from '$components/FacetPanel.svelte';
+  import { selectionQuery, setQuery, VALUES_CAP, type Brush } from '$lib/facets';
+  import type { FacetSetSpec } from '$lib/api';
   import { selection } from '$lib/selection.svelte';
   import Icon from '$components/Icon.svelte';
   import SchemaDiffDialog from '$components/SchemaDiffDialog.svelte';
@@ -118,6 +121,10 @@
   let canvasMode = $state<'graph' | 'map'>(
     page.url.searchParams.get('map') === '1' ? 'map' : 'graph',
   );
+  /** The facet panel beside the canvas (`&facets=1`, Shift+F, U11 section 2.3). */
+  let facetsOpen = $state(page.url.searchParams.get('facets') === '1');
+  /** The set the facets count: `class:` and a class IRI, or `drawn`; empty for the default. */
+  let facetSetKey = $state('');
 
   // The overview grouped by the GraphRAG communities (`&overview=communities`), opened
   // down to a community (`&community=`), with the report of the community it shows in the
@@ -1259,6 +1266,7 @@
     if (iri) p.set('iri', iri);
     if (tab !== 'graph') p.set('tab', tab);
     if (canvasMode === 'map' && tab === 'graph') p.set('map', '1');
+    if (facetsOpen && tab === 'graph') p.set('facets', '1');
     if (tab === 'search' && textQuery.trim()) p.set('q', textQuery.trim());
     if (iri && sideTab === 'memory') p.set('view', 'memory');
     if (!iri && tab === 'graph' && overviewMode === 'communities') {
@@ -1423,6 +1431,79 @@
     return Object.entries(by).sort((a, b) => order(a[0]) - order(b[0]) || a[0].localeCompare(b[0]));
   });
   const types = $derived(grouped.find(([p]) => p === RDF_TYPE)?.[1] ?? []);
+
+  // --- facets -------------------------------------------------------------------
+
+  /** The drawn entities, as the term keys the selection and the facets use. */
+  const drawnIds = $derived(gNodes.filter((n) => n.id.startsWith('<')).map((n) => n.id));
+  /** The sets the facets can count: each class of the selected entity, and the drawn ones. */
+  const facetSets = $derived.by(() => {
+    const out: { key: string; label: string; within: FacetSetSpec; name: string }[] = [];
+    for (const t of types)
+      if (t.type === 'uri')
+        out.push({
+          key: `class:${t.value}`,
+          label: `Instances of ${shortLabel(t.value, prefixes)}`,
+          within: { class: t.value },
+          name: `instances of ${shortLabel(t.value, prefixes)}`,
+        });
+    if (drawnIds.length)
+      out.push({
+        key: 'drawn',
+        label: `The ${drawnIds.length} drawn entities`,
+        within: { nodes: drawnIds.slice(0, 20_000).map((id) => id.slice(1, -1)) },
+        name: 'drawn entities',
+      });
+    return out;
+  });
+  /** The chosen set: the one picked, else the class of the selected entity when it has
+   * exactly one, else the drawn entities. */
+  const facetSet = $derived.by(() => {
+    const picked = facetSets.find((x) => x.key === facetSetKey);
+    if (picked) return picked;
+    const classes = facetSets.filter((x) => x.key.startsWith('class:'));
+    return classes.length === 1 ? classes[0] : facetSets.find((x) => x.key === 'drawn');
+  });
+  // the drawn set's IRIs, kept stable while the same nodes are drawn so the panel does not
+  // count again for an unrelated change
+  let facetWithin = $state<FacetSetSpec | null>(null);
+  $effect(() => {
+    const w = facetsOpen ? (facetSet?.within ?? null) : null;
+    if (JSON.stringify(w) !== JSON.stringify(untrack(() => facetWithin))) facetWithin = w;
+  });
+
+  function toggleFacets() {
+    facetsOpen = !facetsOpen;
+    if (!facetsOpen && selection.source === 'the facets') selection.clear();
+    syncUrl(selected?.term.type === 'uri' ? selected.iri : null);
+  }
+
+  /** The drawn entities the brushes keep become the selection, which dims the rest. */
+  function facetMatch(ids: Set<string> | null) {
+    if (ids) selection.set(ids, 'the facets');
+    else if (selection.source === 'the facets') selection.clear();
+  }
+
+  /** Use in query: the selected entities as the VALUES block of a new query, 1,000 at most. */
+  function useSelection(ids: string[]) {
+    const list = ids.slice(0, VALUES_CAP);
+    if (ids.length > list.length)
+      toasts.push(
+        'info',
+        `The query names the first ${VALUES_CAP.toLocaleString('en-US')} entities`,
+        `${(ids.length - list.length).toLocaleString('en-US')} more were left out.`,
+      );
+    app.pendingQuery = { query: selectionQuery(list), title: 'Selection' };
+    goto(resolve('/query'));
+  }
+
+  /** Explore's Apply to query: a query for the set under the brushes, in a new Query tab. */
+  function applyFacets(brushes: Brush[]) {
+    if (!facetWithin) return;
+    const list = Object.entries(prefixes).map(([prefix, iri]) => ({ prefix, iri }));
+    app.pendingQuery = { query: setQuery(facetWithin, brushes, list), title: 'Facets' };
+    goto(resolve('/query'));
+  }
   const comment = $derived(grouped.find(([p]) => p === RDFS_COMMENT)?.[1]);
 
   // --- search -------------------------------------------------------------------
@@ -1837,6 +1918,13 @@
         setCanvasMode(canvasMode === 'map' ? 'graph' : 'map');
         return;
       }
+      // Shift+F opens and closes the facet panel
+      if (e.key === 'F' && e.shiftKey) {
+        if (tab !== 'graph' || (!nodeCount && !facetsOpen)) return;
+        e.preventDefault();
+        toggleFacets();
+        return;
+      }
       // Shift+P opens the path finder; with it open, the graph takes its keys too
       if (e.key === 'P' && e.shiftKey && ds && tab !== 'schema') {
         e.preventDefault();
@@ -2010,6 +2098,7 @@
       class:overview={nodeCount === 0 && !graphTimeOpen && !community && !pathsOpen}
       class:reporting={nodeCount === 0 && !!community && !pathsOpen}
       class:mapmode={canvasMode === 'map' && nodeCount > 0 && !pathsOpen}
+      class:faceted={facetsOpen && nodeCount > 0 && !pathsOpen}
     >
       <div class="canvas">
         {#if nodeCount > 0 || graphTimeOpen || pathsOpen}
@@ -2073,6 +2162,12 @@
               {/if}
               <button
                 class="btn sm"
+                aria-pressed={facetsOpen}
+                title="Histograms of the properties of the entities, which brush the graph (Shift+F)"
+                onclick={toggleFacets}><Icon name="filter" size={13} /> Facets</button
+              >
+              <button
+                class="btn sm"
                 aria-pressed={graphTimeOpen}
                 aria-label="Graph history"
                 title="Move the whole graph through the commits (Shift+H)"
@@ -2084,7 +2179,7 @@
               >
             {/if}
           </div>
-          <SelectionBar onopengraph={openSelectionAsGraph} />
+          <SelectionBar onopengraph={openSelectionAsGraph} onuse={useSelection} />
           {#if ds && vItems.length}
             <ValidationOverlay
               bind:this={overlay}
@@ -2266,6 +2361,39 @@
         {/if}
       </div>
 
+      {#if facetsOpen && nodeCount > 0 && !pathsOpen && ds}
+        <aside class="side side-facets" aria-label="Facets">
+          <FacetPanel
+            {ds}
+            within={facetWithin}
+            setLabel={facetSet?.name ?? 'entities'}
+            at={timeActive ? exAt : ''}
+            {prefixes}
+            drawn={drawnIds}
+            onmatch={facetMatch}
+            onapply={applyFacets}
+            onclose={toggleFacets}
+          >
+            {#snippet header()}
+              {#if facetSets.length > 1}
+                <label class="row facet-set"
+                  >Count
+                  <select
+                    value={facetSet?.key ?? ''}
+                    onchange={(e) => (facetSetKey = (e.currentTarget as HTMLSelectElement).value)}
+                  >
+                    {#each facetSets as x (x.key)}
+                      <option value={x.key}>{x.label}</option>
+                    {/each}
+                  </select></label
+                >
+              {:else if facetSet}
+                <span class="faint">{facetSet.label}</span>
+              {/if}
+            {/snippet}
+          </FacetPanel>
+        </aside>
+      {/if}
       {#if pathsOpen && ds}
         <aside class="side side-paths" aria-label="Path finder">
           {#key ds}
@@ -3178,6 +3306,13 @@
     display: grid;
     grid-template-columns: minmax(0, 1fr) 380px;
   }
+  /* the facets beside the properties on a wide screen */
+  .split.faceted {
+    grid-template-columns: minmax(0, 1fr) 320px 380px;
+  }
+  .facet-set select {
+    max-width: 100%;
+  }
   .canvas {
     position: relative;
     display: flex;
@@ -3700,9 +3835,24 @@
     .bar > .tabs {
       flex-shrink: 1;
     }
-    .split {
+    .split,
+    .split.faceted {
       grid-template-columns: minmax(0, 1fr);
       grid-template-rows: minmax(320px, 1fr) auto;
+    }
+    .split.faceted {
+      grid-template-rows: minmax(320px, 1fr) auto auto;
+    }
+    /* the facets take the height they need and the page scrolls to them */
+    .side-facets {
+      max-height: none;
+    }
+    .side-facets :global(.facets) {
+      height: auto;
+    }
+    .side-facets :global(.fbody) {
+      flex: none;
+      overflow: visible;
     }
     /* the map takes the height it needs and the page scrolls to the details below it */
     .split.mapmode {

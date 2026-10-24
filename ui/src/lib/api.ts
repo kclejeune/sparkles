@@ -3276,6 +3276,73 @@ export type GroupsAnswer = {
 export const graphGroups = (ds: string, req: GroupsRequest, signal?: AbortSignal) =>
   json<GroupsAnswer>(`/$/graph/${enc(ds)}/groups`, { ...jsonBody(req), signal });
 
+// ------------------------------------------------------------------- facets ------
+
+/** What a facet counts by: ranges of numbers, ranges of years, or the frequent values. */
+export type FacetKind = 'numeric' | 'date' | 'values';
+
+/** The set `POST /$/graph/{ds}/facets` counts. */
+export type FacetSetSpec =
+  | { class: string }
+  | { nodes: string[] }
+  | { query: string; variable: string };
+
+export type FacetSpec = {
+  property: string;
+  bins?: number;
+  top?: number;
+  kind?: FacetKind;
+  /** The edges of an earlier answer's ranges, kept as they are. */
+  edges?: number[];
+  /** The values of an earlier answer's bar list. */
+  bars?: Term[];
+};
+
+/** A brush: `[from, to)`, in whole years for a date facet, or values of a bar list. */
+export type FacetFilter =
+  | { property: string; range: [number, number]; kind?: 'numeric' | 'date' }
+  | { property: string; values: Term[] };
+
+export type FacetsRequest = {
+  within: FacetSetSpec;
+  facets?: FacetSpec[];
+  filters?: FacetFilter[];
+  candidates?: boolean;
+  at?: string;
+};
+
+export type FacetBin = { from: number; to: number; count: number };
+
+export type FacetAnswer = {
+  property: string;
+  kind?: FacetKind;
+  bins?: FacetBin[];
+  values?: { value: Term; count: number; label?: string }[];
+  other?: number;
+  missing?: number;
+  /** A facet over its budget, while the others stay. */
+  error?: { budget: string; message: string };
+};
+
+export type FacetsAnswer = {
+  commit: number;
+  size: number;
+  matching: number;
+  facets: FacetAnswer[];
+  candidates?: { property: string; share: number; kind: FacetKind }[];
+  truncated: boolean;
+};
+
+/** `POST /$/graph/{ds}/facets`, on the branch of a `ds@branch` target. */
+export function graphFacets(target: string, req: FacetsRequest, signal?: AbortSignal) {
+  const at = target.indexOf('@');
+  const path =
+    at < 0
+      ? `/$/graph/${enc(target)}/facets`
+      : `/$/graph/${enc(target.slice(0, at))}/facets?branch=${enc(target.slice(at + 1))}`;
+  return json<FacetsAnswer>(path, { ...jsonBody(req), signal });
+}
+
 /** One difference of a field between two reports: a value, or members of a list. */
 export type SchemaChange =
   | { path: string; from: unknown; to: unknown }
