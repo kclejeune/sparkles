@@ -108,12 +108,15 @@ pub struct Options {
     pub lookup: Option<template::Lookup>,
 }
 
+/// The key sets of a load, by table and key columns.
+type KeySets = std::collections::HashMap<(usize, Vec<String>), Arc<KeySet>>;
+
 /// The values of the columns that foreign keys reference, collected while their tables
 /// convert and read while the referencing tables convert. The tables of a group must
 /// convert in the order of [`key_order`].
 #[derive(Default)]
 pub struct KeyRegistry {
-    sets: parking_lot::Mutex<std::collections::HashMap<(usize, Vec<String>), Arc<KeySet>>>,
+    sets: parking_lot::Mutex<KeySets>,
     used: std::sync::atomic::AtomicU64,
     /// the bytes the key sets of a load may hold (`None`: unbounded, as on the command
     /// line)

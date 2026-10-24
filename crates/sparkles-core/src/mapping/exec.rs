@@ -972,7 +972,7 @@ pub fn run(
                     crate::error::human_bytes(b)
                 )));
             }
-            rows.entry(key).or_default().extend(terms.drain(..));
+            rows.entry(key).or_default().append(&mut terms);
             Ok(())
         })?;
         stats.rows += n;

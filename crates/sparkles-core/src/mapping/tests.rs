@@ -167,8 +167,7 @@ fn a3_nulls_and_relative_iris() {
           rr:predicateObjectMap [ rr:predicate ex:link ; rr:objectMap [ rr:template "rel/{customer}" ] ] ."#;
     let orders = "id,customer\n12,\n13,7\n";
     let e = run_text(MappingKind::Rml, m, &[("orders.csv", orders)])
-        .err()
-        .expect("a relative IRI fails")
+        .expect_err("a relative IRI fails")
         .to_string();
     assert!(e.contains("<http://ex.org/map/O>"), "{e}");
     assert!(e.contains("row 3"), "{e}");
@@ -258,8 +257,7 @@ fn a6_in_memory_join_over_the_budget_fails_and_names_the_join() {
             ..Default::default()
         },
     )
-    .err()
-    .expect("over the budget")
+    .expect_err("over the budget")
     .to_string();
     assert!(
         e.contains("the join of <http://ex.org/map/O> with <http://ex.org/map/C>"),

@@ -215,13 +215,13 @@ impl Cx {
                     Some((a, f)) => (a.to_string(), Some(f.to_string())),
                     None => (first.clone(), None),
                 };
-                if access.starts_with(CONNECTION_PREFIX) {
+                if let Some(conn) = access.strip_prefix(CONNECTION_PREFIX) {
                     let q = iterator.ok_or_else(|| {
                         Error::invalid(format!(
                             "YARRRML {path}: a database source needs a query or table"
                         ))
                     })?;
-                    return Ok(sql(&access[CONNECTION_PREFIX.len()..], &q, f.as_deref()));
+                    return Ok(sql(conn, &q, f.as_deref()));
                 }
                 file_decl(&access, f.as_deref(), iterator, path)
             }
@@ -393,11 +393,14 @@ fn file_decl(
 
 /// One translated mapping before its joins are resolved: the triples maps of each
 /// (source, subject) pair, and the joins of its objects by mapping name.
+/// A join by name: the parent mapping and the (child, parent) references.
+type NamedJoin = (String, Vec<(String, String)>);
+
 struct Pending {
     name: String,
     maps: Vec<TriplesMap>,
     /// for each map, for each predicate-object, for each object: a join by name
-    joins: Vec<(usize, usize, String, Vec<(String, String)>)>,
+    joins: Vec<(usize, usize, NamedJoin)>,
 }
 
 /// Parse a YARRRML document.
@@ -491,7 +494,7 @@ pub fn parse(text: &str, _base: Option<&str>) -> Result<Mapping> {
     for (pi, p) in pending.iter().enumerate() {
         for (mi, m) in p.maps.iter().enumerate() {
             let mut m = m.clone();
-            for (jm, jpo, target, conds) in &p.joins {
+            for (jm, jpo, (target, conds)) in &p.joins {
                 if *jm != mi {
                     continue;
                 }
@@ -544,7 +547,7 @@ fn mapping(cx: &Cx, name: &str, y: &Yaml, sources: &mut Vec<SourceDecl>) -> Resu
     let mut subjects: Vec<TermMap> = Vec::new();
     let mut graphs = Vec::new();
     let mut pos: Vec<PredicateObject> = Vec::new();
-    let mut joins: Vec<(usize, String, Vec<(String, String)>)> = Vec::new();
+    let mut joins: Vec<(usize, NamedJoin)> = Vec::new();
     for (k, v) in &es {
         let p = format!("{path}.{k}");
         match *k {
@@ -579,7 +582,7 @@ fn mapping(cx: &Cx, name: &str, y: &Yaml, sources: &mut Vec<SourceDecl>) -> Resu
                     let (po, js) = predicate_object(cx, po, &format!("{p}[{i}]"))?;
                     let at = pos.len();
                     for (target, conds) in js {
-                        joins.push((at, target, conds));
+                        joins.push((at, (target, conds)));
                     }
                     pos.push(po);
                 }
@@ -619,8 +622,8 @@ fn mapping(cx: &Cx, name: &str, y: &Yaml, sources: &mut Vec<SourceDecl>) -> Resu
                 predicate_objects: pos.clone(),
                 base: None,
             });
-            for (po, target, conds) in &joins {
-                out_joins.push((i, *po, target.clone(), conds.clone()));
+            for (po, join) in &joins {
+                out_joins.push((i, *po, join.clone()));
             }
         }
     }

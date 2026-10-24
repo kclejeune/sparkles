@@ -45,31 +45,31 @@ pub fn table() -> Vec<Function> {
     let mut out = vec![
         f(
             g("toUpperCase"),
-            &[v.clone()],
+            std::slice::from_ref(&v),
             1,
             "the string in upper case",
         ),
         f(
             g("toLowerCase"),
-            &[v.clone()],
+            std::slice::from_ref(&v),
             1,
             "the string in lower case",
         ),
         f(
             g("string_toTitlecase"),
-            &[v.clone()],
+            std::slice::from_ref(&v),
             1,
             "each word with an upper-case first letter",
         ),
         f(
             g("string_trim"),
-            &[v.clone()],
+            std::slice::from_ref(&v),
             1,
             "the string without leading and trailing white space",
         ),
         f(
             g("string_length"),
-            &[v.clone()],
+            std::slice::from_ref(&v),
             1,
             "the number of characters, as xsd:integer",
         ),
@@ -129,13 +129,13 @@ pub fn table() -> Vec<Function> {
         ),
         f(
             g("string_md5"),
-            &[v.clone()],
+            std::slice::from_ref(&v),
             1,
             "the MD5 digest in hexadecimal",
         ),
         f(
             g("string_sha1"),
-            &[v.clone()],
+            std::slice::from_ref(&v),
             1,
             "the SHA-1 digest in hexadecimal",
         ),
@@ -542,10 +542,7 @@ pub fn call(iri: &str, args: &[Vec<String>]) -> Result<Vec<Cell<'static>>, Strin
                     };
                 }
                 let re = b.build().map_err(|e| format!("REPLACE pattern: {e}"))?;
-                let rep = need(2)?
-                    .replace("$$", "\u{0}")
-                    .replace('$', "$")
-                    .replace('\u{0}', "$$");
+                let rep = xpath_replacement(need(2)?)?;
                 vec![text(re.replace_all(s0()?, rep.as_str()).into_owned())]
             }
             "STRBEFORE" => {
@@ -597,9 +594,55 @@ pub fn call(iri: &str, args: &[Vec<String>]) -> Result<Vec<Cell<'static>>, Strin
     Err(format!("unknown function <{iri}>"))
 }
 
+/// An XPath `fn:replace` replacement string (SPARQL's REPLACE) in the regex crate's
+/// syntax: `$N` names group N, and `\$` and `\\` are a literal dollar and backslash.
+fn xpath_replacement(r: &str) -> Result<String, String> {
+    let mut out = String::with_capacity(r.len());
+    let mut chars = r.chars().peekable();
+    while let Some(c) = chars.next() {
+        match c {
+            '\\' => match chars.next() {
+                Some('$') => out.push_str("$$"),
+                Some('\\') => out.push('\\'),
+                _ => {
+                    return Err(format!(
+                        "REPLACE replacement {r:?}: a backslash escapes $ or \\ only"
+                    ));
+                }
+            },
+            '$' => {
+                let mut n = String::new();
+                while let Some(d) = chars.peek().filter(|d| d.is_ascii_digit()) {
+                    n.push(*d);
+                    chars.next();
+                }
+                if n.is_empty() {
+                    return Err(format!(
+                        "REPLACE replacement {r:?}: $ must be followed by a group number"
+                    ));
+                }
+                out.push_str(&format!("${{{n}}}"));
+            }
+            c => out.push(c),
+        }
+    }
+    Ok(out)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn xpath_replacements() {
+        let r = |s| super::xpath_replacement(s);
+        assert_eq!(r("$1a").unwrap(), "${1}a");
+        assert_eq!(r(r"\$x\\").unwrap(), r"$$x\");
+        assert!(r("$x").is_err());
+        assert!(r(r"\n").is_err());
+        let re = regex::Regex::new("(a)(b)").unwrap();
+        assert_eq!(re.replace_all("ab", r("$2$1x").unwrap().as_str()), "bax");
+    }
 
     fn one(iri: &str, args: &[&[&str]]) -> Vec<String> {
         let args: Vec<Vec<String>> = args

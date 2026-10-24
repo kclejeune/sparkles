@@ -230,8 +230,7 @@ pub(super) async fn write(
                 };
                 let r = ds
                     .store
-                    .replace_with(t, &[src()?], CommitKind::GspPut, &wopts)
-                    .map(|(n, r)| (n, r));
+                    .replace_with(t, &[src()?], CommitKind::GspPut, &wopts);
                 match r {
                     Ok((n, r)) => (StatusCode::OK, n, Ok(r)),
                     Err(e) => (StatusCode::OK, 0, Err(e)),

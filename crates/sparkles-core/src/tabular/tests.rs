@@ -727,7 +727,7 @@ fn standard_mode_describes_the_group_table_and_rows() {
         format!("_:tg <{cw}table> _:t0"),
         format!("_:t0 {rdf_type} <{cw}Table>"),
         format!("_:t0 <{cw}url> <file:///data/people.csv>"),
-        format!("_:t0 <http://purl.org/dc/terms/title> \"People\""),
+        "_:t0 <http://purl.org/dc/terms/title> \"People\"".to_string(),
         format!("_:t0 <{cw}note> \"checked\""),
         format!("_:t0 <{cw}row> _:t0row2"),
         format!("_:t0row2 {rdf_type} <{cw}Row>"),

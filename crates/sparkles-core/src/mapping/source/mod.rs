@@ -14,7 +14,6 @@ use super::{Inputs, RunOptions};
 use crate::error::{Error, Result};
 use oxrdf::NamedNode;
 use std::borrow::Cow;
-use std::path::PathBuf;
 
 /// The natural datatype of a value (R2RML §10.2), or another datatype a CSVW
 /// description gave.
@@ -175,7 +174,7 @@ pub fn open(
 }
 
 /// A file source's path, checked to be a file.
-pub(super) fn check_file(p: &PathBuf, name: &str) -> Result<()> {
+pub(super) fn check_file(p: &std::path::Path, name: &str) -> Result<()> {
     if !p.is_file() {
         return Err(Error::invalid(format!(
             "mapping-source-missing: the source {name} is not a readable file ({})",

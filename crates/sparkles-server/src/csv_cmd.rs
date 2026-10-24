@@ -577,6 +577,8 @@ pub struct CsvCmdArgs {
     pub cmd: CsvCmd,
 }
 
+// one command runs per process, so the size of a variant does not matter
+#[allow(clippy::large_enum_variant)]
 #[derive(Subcommand, Debug)]
 pub enum CsvCmd {
     /// Convert CSV and TSV files to RDF without loading them
