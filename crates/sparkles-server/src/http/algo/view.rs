@@ -948,6 +948,7 @@ async fn background(
         let cleanup = Running(key.clone(), id.clone());
         add_caller(&st, &id, &ds.name, &p);
         let state = st.clone();
+        #[cfg(test)]
         let d = ds.clone();
         let task = st.start_task_opts(id, TASK, &ds.name, None, true, move |h| {
             let _running = cleanup;
