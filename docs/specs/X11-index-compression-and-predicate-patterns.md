@@ -720,14 +720,18 @@ of the branch's FSST against main's front coding is 1.004 at 10.5M and 1.041 on 
 where main's FSST measured 1.000 and 1.062. The branch's front coding measured 0.992 and
 1.019 against main's. On DBpedia the difference comes from queries under 1 ms in a single
 round, and perf on atlas counted the same or fewer instructions for the branch's front
-coding on each of the nine DBpedia queries that moved most, so front coding did not get
-slower.
+coding on each of the nine DBpedia queries that moved most, so the front-coded path does
+no more work than before. Roadmap item 161 confirms this with a pinned forge rerun of
+several rounds.
 
-Cold, the branch's FSST meets the gate. Its geometric means against main's front coding
-are 0.999 at 10.5M and 0.958 on DBpedia. Cold `export-500k` takes 134.1 ms against
-131.4 ms with front coding, a ratio of 1.02 where Phase 2a measured 1.11, and the cold
-DBpedia export is 7% faster than with front coding. Cold `entity-summary-1` on DBpedia
-took 3.52 ms against 3.00 ms, with round medians from 3.29 to 3.76 ms.
+Cold, the branch's FSST meets the gate on its geometric means and on the export, but not
+on every query. Its geometric means against main's front coding are 0.999 at 10.5M and
+0.958 on DBpedia. Cold `export-500k` takes 134.1 ms against 131.4 ms with front coding, a
+ratio of 1.02 where Phase 2a measured 1.11, and the cold DBpedia export is 7% faster than
+with front coding. Cold `entity-summary-1` on DBpedia took 3.52 ms against 3.00 ms with the
+branch's front coding, a ratio of 1.17 above the cold limit of 15%, and the round medians
+of 3.29 to 3.76 ms and 2.94 to 3.06 ms do not overlap. The query looks up long literals one
+at a time, which is the path that roadmap item 160 covers.
 
 FSST still misses §4.4's warm limit of 5% on the queries that decode many strings and on
 the warm export, so it stays an option and front coding stays the default. The remaining
@@ -740,7 +744,8 @@ against 29.18 ms, with ranges that do not overlap. It looks up its terms one at 
 and perf on atlas counted 20% more cycles in that lookup than main spends decoding every
 key before the wanted one in full. Copying plain suffixes whole instead of up to the next
 key's shared prefix removed a tenth of the branch misses but added 5% of instructions and
-saved no cycles, so it was dropped. Roadmap item 160 follows up on this lookup.
+saved no cycles, so it was dropped. Roadmap item 160 follows up on this lookup and on
+cold `entity-summary-1`.
 
 ### Phases not built
 

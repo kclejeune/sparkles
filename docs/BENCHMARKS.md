@@ -1643,11 +1643,13 @@ cells of two runs of five cold samples.
 The DBpedia export took 2.69 times as long with main's FSST as with front coding, and it
 takes 1.05 times as long with the branch's. The branch's front coding measured 1.019 on
 DBpedia because of queries under 1 ms in a single round, and perf on atlas counted the same
-or fewer instructions for it on each of the nine DBpedia queries that moved most. Cold `export-500k` now meets the gate, at 1.02
-times front coding. Warm `contains`, `lang-filter` and the export at 10.5M still run 4% to
+or fewer instructions for it on each of the nine DBpedia queries that moved most, and
+roadmap item 161 confirms this with a pinned forge rerun. Cold `export-500k` now meets the gate, at 1.02
+times front coding, but cold `entity-summary-1` on DBpedia took 1.17 times as long as with
+front coding, above the cold limit of 15%. Warm `contains`, `lang-filter` and the export at 10.5M still run 4% to
 10% slower than front coding, and DBpedia's `abstract-contains` and `label-regex` 12%
 slower, so FSST stays an option. `star-join` runs 4% slower with the branch's FSST than
-with main's, which roadmap item 160 follows up.
+with main's, and roadmap item 160 follows up on it and on cold `entity-summary-1`.
 
 ## Loading and index builds
 
