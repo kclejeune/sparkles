@@ -5,6 +5,11 @@
 // names, and ex:p4 has the email "a@x".
 
 import { expect, test, type Page } from '@playwright/test';
+import { mkdirSync } from 'node:fs';
+import { expectNoSidewaysScroll } from '../phone';
+
+const SHOTS = '../target/audits/u07-row120';
+mkdirSync(SHOTS, { recursive: true });
 
 test.describe.configure({ mode: 'serial', timeout: 90_000 });
 
@@ -74,6 +79,7 @@ test('A10: the people without names have one violation each', async ({ page }) =
   await expect(menu.getByRole('combobox', { name: 'Badges' })).toHaveValue('validation');
   await expect(menu.getByRole('combobox', { name: 'Validation source' })).toHaveValue('guard');
   await expect(menu.getByTestId('lens-status-badge')).toContainText('4 nodes have results');
+  await page.screenshot({ path: `${SHOTS}/desktop-lens-menu.png` });
   await page.keyboard.press('Escape');
   await expect(page.getByText('nodes whose worst result is a violation')).toBeVisible();
   // the badge is a button that names the node and its results
@@ -271,4 +277,10 @@ test('at 390 px the results panel is a bottom sheet', async ({ page }) => {
   expect(Math.round(box.x)).toBe(0);
   expect(Math.round(box.width)).toBe(390);
   expect(Math.round(box.y + box.height)).toBe(844);
+  await page.screenshot({ path: `${SHOTS}/phone-390-results.png` });
+  await panel.getByRole('button', { name: /Close/ }).first().click();
+  await page.getByRole('button', { name: /^Lenses/ }).click();
+  await expect(page.getByRole('combobox', { name: 'Validation source' })).toBeVisible();
+  await expectNoSidewaysScroll(page, 'the lens menu');
+  await page.screenshot({ path: `${SHOTS}/phone-390-lens-menu.png` });
 });
