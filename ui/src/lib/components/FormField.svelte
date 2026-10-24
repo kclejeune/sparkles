@@ -150,6 +150,10 @@
 
   /** Whether the option `t` is among the values (radio groups and checkbox lists). */
   const chosen = (t: Term) => entries.some((e) => e.term && sameTerm(e.term, t));
+  /** Whether the option `t` is a value in a graph the person cannot write. */
+  const locked = (t: Term) => entries.some((e) => e.readOnly && e.term && sameTerm(e.term, t));
+  /** A radio group whose value the person cannot write cannot change. */
+  const radioLocked = $derived(entries.some((e) => e.readOnly));
 
   function toggle(t: Term, on: boolean) {
     if (on && !chosen(t)) entries = [...entries.filter((e) => e.term), { ...entryOf(t, widget) }];
@@ -212,6 +216,7 @@
               type="checkbox"
               id={i === 0 ? base : `${base}-o${i}`}
               checked={chosen(o)}
+              disabled={locked(o)}
               onchange={(e) => toggle(o, e.currentTarget.checked)}
             />
             {optionText(o)}
@@ -233,12 +238,13 @@
               name={base}
               id={i === 0 ? base : `${base}-o${i}`}
               checked={chosen(o)}
+              disabled={radioLocked}
               onchange={() => choose(o)}
             />
             {optionText(o)}
           </label>
         {/each}
-        {#if !req && entries.some((e) => e.term)}
+        {#if !req && !radioLocked && entries.some((e) => e.term)}
           <button type="button" class="btn sm ghost" onclick={() => choose(null)}>Clear</button>
         {/if}
       </div>
