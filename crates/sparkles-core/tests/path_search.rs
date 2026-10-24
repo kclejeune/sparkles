@@ -422,6 +422,35 @@ fn one_search_per_named_graph() {
     assert_eq!(lens, ["1", "2"]);
 }
 
+/// Weights of very different sizes: a search from both ends adds a path's weights in two
+/// orders, and in plain floating point the four unit weights of `s a b c t` vanish into
+/// 1e16 when they are added to it one at a time. The costs are kept with twice the
+/// precision, so the cheaper path `s q t` is still found (ROADMAP item 150).
+#[test]
+fn weights_of_mixed_magnitudes_from_both_ends() {
+    let s = store_of(
+        "ex:s ex:p ex:a {| ex:w 1 |} . ex:a ex:p ex:b {| ex:w 1 |} .
+         ex:b ex:p ex:c {| ex:w 1 |} . ex:c ex:p ex:t {| ex:w 1e16 |} .
+         ex:s ex:p ex:q {| ex:w 1e16 |} . ex:q ex:p ex:t {| ex:w 2 |} .
+         ex:s ex:p ex:x {| ex:w 1e16 |} . ex:s ex:p ex:y {| ex:w 1e16 |} .",
+    );
+    for dir in ["path:forward", "path:both"] {
+        let r = rows(
+            &s,
+            &format!(
+                "SELECT ?path ?i ?s ?o ?c WHERE {{ SERVICE path:search {{ [] path:source ex:s ; \
+                 path:target ex:t ; path:predicate ex:p ; path:direction {dir} ; path:weight ex:w ; \
+                 path:cost ?c ; path:pathIndex ?path ; path:edgeIndex ?i ; path:edgeSubject ?s ; \
+                 path:edgeObject ?o }} }}"
+            ),
+        );
+        let paths = node_paths(&r);
+        assert_eq!(paths.len(), 1, "{dir}");
+        assert_eq!(paths.values().next().unwrap().join(" "), "s q t", "{dir}");
+        assert_eq!(r[0]["c"].parse::<f64>().unwrap(), 1e16 + 2.0, "{dir}");
+    }
+}
+
 #[test]
 fn weights_from_reifiers() {
     // A8: the weights sit on the reifiers of the edges

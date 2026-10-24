@@ -1114,6 +1114,55 @@ impl Tree {
 #[derive(Clone, Copy, Debug, PartialEq)]
 struct OrdF64(f64);
 
+/// A sum of non-negative weights kept as a double-double: the rounded sum and the error
+/// of rounding it, from Knuth's TwoSum. A search from both ends adds a path's weights from
+/// each end, and plain floating point can round the two orders apart enough to rank a
+/// dearer path first when the weights differ greatly in size. With about 106 bits the
+/// orders agree unless two costs differ by less than about 2^-106 of their size.
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct Cost {
+    hi: f64,
+    lo: f64,
+}
+
+impl Cost {
+    const ZERO: Cost = Cost { hi: 0.0, lo: 0.0 };
+
+    fn of(w: f64) -> Cost {
+        Cost { hi: w, lo: 0.0 }
+    }
+
+    fn add(self, o: Cost) -> Cost {
+        let s = self.hi + o.hi;
+        if !s.is_finite() {
+            return Cost { hi: s, lo: 0.0 };
+        }
+        // TwoSum: s + e is exactly self.hi + o.hi
+        let bb = s - self.hi;
+        let e = (self.hi - (s - bb)) + (o.hi - bb) + self.lo + o.lo;
+        // Fast2Sum renormalizes, since |s| ≥ |e|
+        let hi = s + e;
+        Cost {
+            hi,
+            lo: e - (hi - s),
+        }
+    }
+}
+
+impl Eq for Cost {}
+
+impl PartialOrd for Cost {
+    fn partial_cmp(&self, o: &Self) -> Option<Ordering> {
+        Some(self.cmp(o))
+    }
+}
+
+impl Ord for Cost {
+    fn cmp(&self, o: &Self) -> Ordering {
+        self.hi.total_cmp(&o.hi).then(self.lo.total_cmp(&o.lo))
+    }
+}
+
 /// A path from `s` with every cycle cut out, so each node appears once. Two halves of a
 /// bidirectional search can share a node only through edges of weight zero, so the cut
 /// path costs the same.
@@ -2243,15 +2292,16 @@ impl<'a> Engine<'a> {
         debug_assert!(s != t && s != VIRT && t != VIRT);
         self.set_roots(&[s, t]);
         let mut trees = [Tree::new(s, true), Tree::new(t, false)];
-        let mut dist: [FxHashMap<u64, f64>; 2] = Default::default();
+        // the costs are double-doubles, so both ends add a path's weights alike
+        let mut dist: [FxHashMap<u64, Cost>; 2] = Default::default();
         let mut settled: [FxHashSet<u64>; 2] = Default::default();
-        let mut heaps: [BinaryHeap<Reverse<(OrdF64, u64)>>; 2] = Default::default();
+        let mut heaps: [BinaryHeap<Reverse<(Cost, u64)>>; 2] = Default::default();
         for (i, r) in [s, t].into_iter().enumerate() {
-            dist[i].insert(r, 0.0);
-            heaps[i].push(Reverse((OrdF64(0.0), r)));
+            dist[i].insert(r, Cost::ZERO);
+            heaps[i].push(Reverse((Cost::ZERO, r)));
         }
         // the cheapest path found so far, by its cost and the node where the sides meet
-        let mut best: Option<(f64, u64)> = None;
+        let mut best: Option<(Cost, u64)> = None;
         let mut n = 0u64;
         loop {
             for i in 0..2 {
@@ -2262,18 +2312,18 @@ impl<'a> Engine<'a> {
                     heaps[i].pop();
                 }
             }
-            let (Some(&Reverse((OrdF64(df), _))), Some(&Reverse((OrdF64(db), _)))) =
+            let (Some(&Reverse((df, _))), Some(&Reverse((db, _)))) =
                 (heaps[0].peek(), heaps[1].peek())
             else {
                 // one side has settled everything it can reach
                 break;
             };
-            if best.is_some_and(|(mu, _)| df + db >= mu) {
+            if best.is_some_and(|(mu, _)| df.add(db) >= mu) {
                 break;
             }
             let side = usize::from(heaps[0].len() > heaps[1].len());
             let forward = side == 0;
-            let Reverse((OrdF64(d), u)) = heaps[side].pop().unwrap();
+            let Reverse((d, u)) = heaps[side].pop().unwrap();
             settled[side].insert(u);
             if u != trees[side].root {
                 trees[side].order.push((u, 0));
@@ -2314,7 +2364,7 @@ impl<'a> Engine<'a> {
                 if banned_edges.is_some_and(|b| b.contains(&e)) {
                     continue;
                 }
-                let nd = d + self.weight(&e)?;
+                let nd = d.add(Cost::of(self.weight(&e)?));
                 if dist[side].get(&y).is_some_and(|&c| nd >= c) {
                     continue;
                 }
@@ -2330,12 +2380,12 @@ impl<'a> Engine<'a> {
                         0,
                     ),
                 );
-                heaps[side].push(Reverse((OrdF64(nd), y)));
+                heaps[side].push(Reverse((nd, y)));
                 if let Some(&o) = dist[1 - side].get(&y)
-                    && best.is_none_or(|(mu, _)| nd + o < mu)
+                    && best.is_none_or(|(mu, _)| nd.add(o) < mu)
                     && (y == s || y == t || !(self.sink(y, true) || self.blocked(y)?))
                 {
-                    best = Some((nd + o, y));
+                    best = Some((nd.add(o), y));
                 }
             }
         }
@@ -3142,6 +3192,20 @@ mod tree_tests {
         }
         t.order = (1..=len).map(|i| (i, 0)).collect();
         t
+    }
+
+    #[test]
+    fn costs_add_up_alike_from_either_end() {
+        let w = [1.0, 1.0, 1.0, 1e16];
+        let fwd = w.iter().fold(Cost::ZERO, |c, &x| c.add(Cost::of(x)));
+        let bwd = w.iter().rev().fold(Cost::ZERO, |c, &x| c.add(Cost::of(x)));
+        assert_eq!(fwd, bwd);
+        // the unit weights are kept, so this path is dearer than 1e16 + 2
+        assert!(fwd > Cost::of(1e16).add(Cost::of(2.0)));
+        // halves met in the middle add up to the whole
+        let half = Cost::of(1.0).add(Cost::of(1.0));
+        assert_eq!(half.add(Cost::of(1.0).add(Cost::of(1e16))), fwd);
+        assert_eq!(Cost::of(f64::MAX).add(Cost::of(f64::MAX)).hi, f64::INFINITY);
     }
 
     #[test]
