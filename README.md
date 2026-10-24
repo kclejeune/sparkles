@@ -240,11 +240,11 @@ orders every item by difficulty and impact and links each to its design spec.
 ## Web UI
 
 The web UI is embedded in the server. It has a query editor with results as tables,
-graphs and maps, with arcs for the relations between located entities and facet histograms that brush them, a visual query builder that draws each query and edits it as text, a path finder that draws the shortest or cheapest paths between entities in the explorer and on query results, schema and validation views, branch history and
+graphs and maps, with arcs for the relations between located entities and facet histograms that brush them, an embedding map of each vector index whose lasso selects entities for a query, a visual query builder that draws each query and edits it as text, a path finder that draws the shortest or cheapest paths between entities in the explorer and on query results, schema and validation views, branch history and
 merges, a time slider over past commits with commit diffs drawn as graphs, the Ask bar, and agent memory. The screenshots
 below start with time travel over commits, branches and merges, GraphRAG communities, the
 Ask bar and agent memory, path finding, inference on the canvas, maps of relations,
-validation on the graph, facets that brush the graph, and the visual query builder.
+validation on the graph, facets that brush the graph, the embedding map, and the visual query builder.
 
 <table>
   <tr>
@@ -289,11 +289,19 @@ validation on the graph, facets that brush the graph, and the visual query build
   </tr>
   <tr>
     <td><img src="docs/images/explore-facets.png" alt="The resource explorer with the Facets panel beside a person's graph, brushing an age range on a histogram and one employer on a bar list, so that the other facets count the 41 people under both brushes and the drawn people outside them are dimmed"></td>
-    <td><img src="docs/images/pattern.png" alt="The query editor with the Pattern pane beside it, drawing the query's variables as nodes joined by its triple patterns, an optional part in a dashed hull, a filter as a chip under its variable and a BIND as a locked block, with the projection checkboxes, the count of matches and seven result rows"></td>
+    <td><img src="docs/images/embedding-map.png" alt="The embedding map of 6,000 freight shipments projected from 64-dimensional vectors to two dimensions and coloured by cargo class, with the legend counting each class and a lasso around one cluster whose 1,054 shipments form the shared selection, ready for Use in query or Open as graph"></td>
   </tr>
   <tr>
     <td>Facet histograms whose brushes filter the graph</td>
+    <td>A vector index's embedding map, where a lasso selects entities for a query</td>
+  </tr>
+  <tr>
+    <td><img src="docs/images/pattern.png" alt="The query editor with the Pattern pane beside it, drawing the query's variables as nodes joined by its triple patterns, an optional part in a dashed hull, a filter as a chip under its variable and a BIND as a locked block, with the projection checkboxes, the count of matches and seven result rows"></td>
+    <td><img src="docs/images/pattern-edit.png" alt="The Pattern pane adding an edge from ?person, with the predicate picker listing the predicates that instances of ex:Person use, with their counts"></td>
+  </tr>
+  <tr>
     <td>A query's pattern drawn beside its text</td>
+    <td>A query built on the canvas from the schema</td>
   </tr>
 </table>
 
@@ -335,11 +343,11 @@ validation on the graph, facets that brush the graph, and the visual query build
   </tr>
   <tr>
     <td><img src="docs/images/query-facets.png" alt="The query page's Facets tab counting the values of ?person in every solution, with a brush on the years people joined and the editor above holding the triple and FILTER that Apply to query added"></td>
-    <td><img src="docs/images/pattern-edit.png" alt="The Pattern pane adding an edge from ?person, with the predicate picker listing the predicates that instances of ex:Person use, with their counts"></td>
+    <td><img src="docs/images/path-finder.png" alt="The resource explorer with the Paths panel open, listing the three shortest foaf:knows paths from Freya Lindqvist to Lukáš Novák, which pass through ten different people, and drawing them over her neighbourhood with each edge numbered by the paths that use it"></td>
   </tr>
   <tr>
     <td>A brush on a result's facets written into the query</td>
-    <td>A query built on the canvas from the schema</td>
+    <td>The k shortest paths between two people</td>
   </tr>
   <tr>
     <td><img src="docs/images/query.png" alt="The query editor with a SPARQL query and its results"></td>
@@ -351,11 +359,11 @@ validation on the graph, facets that brush the graph, and the visual query build
   </tr>
   <tr>
     <td><img src="docs/images/schema.png" alt="The schema browser with a class hierarchy, instance counts and the properties of the selected class"></td>
-    <td><img src="docs/images/path-finder.png" alt="The resource explorer with the Paths panel open, listing the three shortest foaf:knows paths from Freya Lindqvist to Lukáš Novák, which pass through ten different people, and drawing them over her neighbourhood with each edge numbered by the paths that use it"></td>
+    <td></td>
   </tr>
   <tr>
     <td>The schema browser</td>
-    <td>The k shortest paths between two people</td>
+    <td></td>
   </tr>
 </table>
 

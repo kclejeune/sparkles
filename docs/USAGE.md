@@ -35,6 +35,7 @@ without a migration path, so keep backups of anything you cannot regenerate.
 * [The Explore overview](#the-explore-overview)
 * [Arcs on the map](#arcs-on-the-map)
 * [Facets and Use in query](#facets-and-use-in-query)
+* [The embedding map](#the-embedding-map)
 * [Lenses on the graph](#lenses-on-the-graph)
 * [The validation overlay](#the-validation-overlay)
 * [The time slider](#the-time-slider)
@@ -1610,6 +1611,49 @@ editor and binds the variable chosen beside the button, which starts as the resu
 that holds the most selected entities. In Explore it opens a new query with the selected
 entities and their labels. A block holds at most 1,000 entities, the first ones selected,
 and a note says how many were left out.
+
+## The embedding map
+
+The embedding map draws the entities of a vector index as points on a plane, so that
+entities with alike vectors sit close together. **Embedding map** on an index's card on the
+dataset page, in Explore's graph toolbar and on the Similar page opens it at
+`/ui/embedding?ds=…&index=…`. The server computes the projection the first time the map is
+opened and keeps it in memory, so later visits draw at once.
+
+**Layout** chooses how the points are placed. **PCA** projects every vector onto the two
+directions along which the index's vectors vary most, and the line above the map says how
+much of the variance those two directions explain. It runs in the request for an index of up
+to a million vectors. **Neighbours** starts from the PCA positions and lays out the index's
+own neighbour graph with a force layout, which pulls alike entities together and separates
+clusters better. It runs as a task, and the map shows a progress bar with **Cancel** while
+the last projection stays dimmed beneath it. An entity with several vectors sits at the mean
+of their positions.
+
+**Colour by** colours the points by their class, which is the first `rdf:type` of each
+entity, or by the first value of a predicate you type, such as a community predicate that a
+graph algorithm wrote back. Numbers with more than eight distinct values are coloured in up
+to five ranges of equal count. The legend names the eight largest categories with their
+counts and puts the rest under "other".
+
+A plain drag pans and the wheel zooms, and **Fit**, **+** and **−** do the same from
+buttons. **Lasso** (`L`) and **Box** (`B`) make a drag draw a shape instead, and the points
+inside it become the shared selection. `Shift` adds to the selection and `Alt` takes the
+shape's points out of it. Hovering a point shows its label, its class and its five nearest
+neighbours in the index, and a click opens it in Explore. **Use in query** in the selection
+bar opens a new query with the selected entities in a `VALUES` block and their labels. A
+block holds at most 1,000 entities, the ones nearest the selection's centre, and a note says
+how many were left out. **Open as graph** draws the selection in Explore. **List** shows the
+points in view as a table, with a checkbox per row that selects the entity.
+
+An index of more than 50,000 entities is drawn as a density shading of every entity with a
+sample of 50,000 on top. Zooming into a region fetches that region's entities, again at most
+50,000, and a lasso in a sampled view selects every entity inside it, not only the drawn
+ones. When the data changes after the projection was built, the line above the map shows
+**Stale** and **Recompute** builds a new one. The map always shows the head of the dataset,
+because vector indexes answer only at the head. A caller whose access covers only part of
+the dataset gets no map, since the projection places entities whose triples that caller
+cannot read. At a phone's width the pointer modes give way to a **Lasso** toggle, so that a
+plain drag still pans.
 
 ## The Pattern pane
 
