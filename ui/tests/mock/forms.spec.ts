@@ -39,6 +39,7 @@ test.beforeAll(async ({ request }) => {
       ex:valentina a ex:Person ; rdfs:label "Valentina Ruiz"@en ; ex:worksFor ex:andes .
       ex:sofia a ex:Person ; rdfs:label "Sofía Martínez"@en ; ex:worksFor ex:andes .
       ex:route1 rdfs:label "Dubai to Lima" .
+      GRAPH <urn:x-mock:readonly> { ex:andes ex:hasOffice ex:dubai }
     }`,
   );
 });
@@ -188,6 +189,8 @@ test('A9: the error summary links each problem to its field', async ({ page }) =
   await page.keyboard.press('Tab');
   const link = summary.getByRole('link', { name: /Email: must match/ });
   await expect(link).toBeFocused();
+  // the input's accessible description carries its problem
+  await expect(email).toHaveAccessibleDescription(/must match/);
   await page.keyboard.press('Enter');
   await expect(email).toBeFocused();
   await page.keyboard.press('ControlOrMeta+a');
@@ -254,4 +257,51 @@ test('New instance in the schema tab makes a resource with a minted IRI', async 
     'Lucía Moreno',
   );
   await expect(edit).toContainText('Person');
+});
+
+const openCompany = async (page: Page, which: string) => {
+  await page.goto(`/ui/datasets/${DS}/edit?iri=${encodeURIComponent(W + which)}`);
+  const form = page.getByRole('region', { name: /^Edit / });
+  await expect(form.locator(`[data-field="<${W}sector>"]`)).toBeVisible({ timeout: 30_000 });
+  return form;
+};
+
+test('an empty scalar list of more than six values is a select that sets the value', async ({
+  page,
+}) => {
+  const form = await openCompany(page, 'meridian');
+  const sector = form.getByLabel('Sector', { exact: true });
+  await expect(sector).toHaveJSProperty('tagName', 'SELECT');
+  await sector.selectOption({ label: 'Sea' });
+  await expect(form.getByText(/^0 problems · 1 change/)).toBeVisible();
+  await form.getByRole('button', { name: 'Save', exact: true }).click();
+  await expect(page.getByText(/Saved commit \d+ to main/)).toBeVisible();
+  await expect(form.getByLabel('Sector', { exact: true })).toHaveValue(/Sea/);
+});
+
+test('a value in a graph the person cannot write is shown read-only', async ({ page }) => {
+  const form = await openCompany(page, 'andes');
+  const offices = form.locator(`[data-field="<${W}hasOffice>"]`);
+  await expect(offices.getByText('in a graph you cannot write')).toBeVisible();
+  await expect(offices.getByRole('button', { name: /^Remove/ })).toHaveCount(0);
+  await expect(offices.getByRole('button', { name: /Add Offices/ })).toBeEnabled();
+});
+
+test('the fields wait while a save is in flight', async ({ page }) => {
+  let release = () => {};
+  const held = new Promise<void>((r) => (release = r));
+  await page.route(`**/$/forms/${DS}/save*`, async (route) => {
+    await held;
+    await route.continue();
+  });
+  const form = await openEdit(page, 'valentina');
+  const email = form.getByLabel('Email', { exact: true });
+  await email.fill('valentina@andes.example');
+  await form.getByRole('button', { name: 'Save', exact: true }).click();
+  await expect(email).toBeDisabled();
+  await expect(form.getByLabel('Age', { exact: true })).toBeDisabled();
+  release();
+  await expect(page.getByText(/Saved commit \d+ to main/)).toBeVisible();
+  await expect(email).toBeEnabled();
+  await expect(email).toHaveValue('valentina@andes.example');
 });

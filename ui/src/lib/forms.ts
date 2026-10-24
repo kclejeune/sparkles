@@ -183,6 +183,20 @@ export function viewerOf(f: Pick<FormField, 'viewer'>): Viewer {
 /** Whether a field takes several values (no `sh:maxCount`, or one above 1). */
 export const multiValued = (f: FormField) => (f.constraints.maxCount ?? Infinity) > 1;
 
+/**
+ * How a field with a list of allowed values renders them all at once: checkboxes when
+ * the shapes allow several values (`sh:maxCount` above 1) or the resource has several,
+ * else a radio group for the radio widget. A select and every other widget render one
+ * input per value instead (`null`).
+ */
+export function choiceGroup(f: FormField, widget: Widget): 'checks' | 'radio' | null {
+  if (!(f.constraints.in?.length ?? 0)) return null;
+  const max = f.constraints.maxCount;
+  const several = (max !== undefined && max > 1) || f.values.length > 1;
+  if ((widget === 'radio' || widget === 'select') && several) return 'checks';
+  return widget === 'radio' ? 'radio' : null;
+}
+
 /** Whether a field is required (`sh:minCount` 1 or more). */
 export const required = (f: FormField) => (f.constraints.minCount ?? 0) >= 1;
 
@@ -215,9 +229,10 @@ export type Problem = { index: number | null; message: string };
 
 /** Compile a `sh:pattern` the way the browser checks it, or null when it cannot. */
 export function compilePattern(p: { pattern: string; flags?: string }): RegExp | null {
-  const flags = [...new Set(`u${(p.flags ?? '').replace(/[^imsx]/g, '')}`)]
-    .filter((f) => f !== 'x')
-    .join('');
+  // `x` drops whitespace from the pattern and `q` quotes it, which JavaScript cannot do
+  // with the same meaning: the server checks such patterns
+  if (/[xq]/.test(p.flags ?? '')) return null;
+  const flags = [...new Set(`u${(p.flags ?? '').replace(/[^ims]/g, '')}`)].join('');
   try {
     return new RegExp(p.pattern, flags);
   } catch {
@@ -334,18 +349,30 @@ export type Entry = {
   error?: string;
   /** the label of an IRI value, for the entity picker */
   label?: string;
+  /** the timezone of a date-time value, which the input does not show */
+  zone?: string;
+  /** the value sits in a graph the person cannot write, so it is shown and kept */
+  readOnly?: boolean;
 };
 
 let entryKey = 0;
 
 /** A new entry for a term (or an empty one). */
-export function entryOf(term: Term | null, widget: Widget, label?: string): Entry {
+export function entryOf(
+  term: Term | null,
+  widget: Widget,
+  label?: string,
+  readOnly?: boolean,
+): Entry {
   entryKey += 1;
   const key = `e${entryKey}`;
   if (!term) return { key, term: null, text: '', lang: '' };
   let text = term.type === 'triple' ? '' : term.value;
-  if (widget === 'datetime' && term.type === 'literal')
-    text = text.replace(/(Z|[+-]\d\d:\d\d)$/, '');
+  let zone: string | undefined;
+  if (widget === 'datetime' && term.type === 'literal') {
+    zone = /(Z|[+-]\d\d:\d\d)$/.exec(text)?.[1];
+    if (zone) text = text.slice(0, -zone.length);
+  }
   if (widget === 'term' && term.type === 'literal') text = termText(term);
   return {
     key,
@@ -353,7 +380,20 @@ export function entryOf(term: Term | null, widget: Widget, label?: string): Entr
     text,
     lang: term.type === 'literal' ? (term['xml:lang'] ?? '') : '',
     ...(label ? { label } : {}),
+    ...(zone ? { zone } : {}),
+    ...(readOnly ? { readOnly } : {}),
   };
+}
+
+/** The offset of the browser's timezone at a local date-time, as `+hh:mm` or `Z`. */
+export function localZone(text: string): string {
+  const d = new Date(text);
+  const m = Number.isNaN(d.getTime()) ? new Date().getTimezoneOffset() : d.getTimezoneOffset();
+  if (m === 0) return 'Z';
+  const a = Math.abs(m);
+  const hh = String(Math.floor(a / 60)).padStart(2, '0');
+  const mm = String(a % 60).padStart(2, '0');
+  return `${m > 0 ? '-' : '+'}${hh}:${mm}`;
 }
 
 /** A literal in SPARQL syntax for the term input. */
@@ -425,6 +465,7 @@ export function entryTerm(
   text: string,
   lang: string,
   prefixes: PrefixMap,
+  zone?: string,
 ): { term: Term | null; error?: string } {
   if (widget === 'term' || widget === 'iri') {
     if (!text.trim()) return { term: null };
@@ -440,7 +481,12 @@ export function entryTerm(
     return { term: { type: 'literal', value: text, 'xml:lang': lang.trim() } };
   }
   let value = text;
-  if (widget === 'datetime' && /T\d\d:\d\d$/.test(value)) value += ':00';
+  if (widget === 'datetime') {
+    if (/T\d\d:\d\d$/.test(value)) value += ':00';
+    // the value keeps its timezone; a new time stamp takes the browser's
+    const z = zone ?? (dt === `${XSD}dateTimeStamp` ? localZone(value) : undefined);
+    if (z) value += z;
+  }
   if (!dt || dt === `${XSD}string`) return { term: { type: 'literal', value } };
   return { term: { type: 'literal', value, datatype: dt } };
 }

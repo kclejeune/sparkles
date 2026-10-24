@@ -180,6 +180,17 @@ const LAYOUTS = new Map([
           widget: 'entity',
           constraints: { class: [`${WORLD}Company`] },
         },
+        {
+          path: `${WORLD}sector`,
+          label: 'Sector',
+          group: null,
+          order: 5,
+          widget: 'select',
+          constraints: {
+            maxCount: 1,
+            in: ['Air', 'Rail', 'Road', 'Sea', 'Storage', 'Customs', 'Couriers'].map((v) => lit(v)),
+          },
+        },
       ],
     },
   ],
@@ -256,6 +267,8 @@ function model(ds, focusIri, opts) {
           term: termJson(q.object),
           graph: q.graph.termType === 'DefaultGraph' ? null : q.graph.value,
           ...(labelOf(store, q.object) ? { label: labelOf(store, q.object) } : {}),
+          // the mock's stand-in for a graph the caller cannot write
+          ...(q.graph.value.includes('readonly') ? { readOnly: true } : {}),
         })),
       });
     }

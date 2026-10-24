@@ -19,6 +19,7 @@
     changeCount,
     changeSet,
     checkField,
+    choiceGroup,
     entryOf,
     fieldDomId,
     grouped,
@@ -103,9 +104,9 @@
 
   function entriesOf(f: Field, m: FormModel): Entry[] {
     const w = widgetOf(f);
-    const out = f.values.map((v) => entryOf(v.term, w, v.label));
-    const list = (w === 'radio' || w === 'select') && (f.constraints.in?.length ?? 0) > 0;
-    if (!out.length && f.editable && m.editable && !list) {
+    const out = f.values.map((v) => entryOf(v.term, w, v.label, v.readOnly));
+    // radio groups and checkbox lists render from the options, not from the entries
+    if (!out.length && f.editable && m.editable && !choiceGroup(f, w)) {
       const e = entryOf(null, w);
       if (w === 'text-lang') e.lang = f.constraints.languageIn?.[0] ?? lang;
       out.push(e);
@@ -555,7 +556,7 @@
       }}
     >
       {#each grouped(m) as g (g.group?.iri ?? '')}
-        <fieldset class="group">
+        <fieldset class="group" disabled={saving}>
           {#if g.group}<legend>{g.group.label}</legend>{:else}<legend class="sr">Fields</legend
             >{/if}
           {#each g.fields as f (f.id)}

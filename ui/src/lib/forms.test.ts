@@ -4,9 +4,12 @@ import {
   changeCount,
   changeSet,
   checkField,
+  choiceGroup,
   compilePattern,
   diffValues,
+  entryOf,
   entryTerm,
+  localZone,
   grouped,
   langMatches,
   parseTermText,
@@ -289,5 +292,56 @@ describe('grouped', () => {
       [null, ['b']],
       ['One', ['a']],
     ]);
+  });
+});
+
+describe('review fixes', () => {
+  it('leaves patterns with the x and q flags to the server', () => {
+    expect(compilePattern({ pattern: '^ A B $', flags: 'x' })).toBeNull();
+    expect(compilePattern({ pattern: 'a.b', flags: 'q' })).toBeNull();
+    expect(compilePattern({ pattern: '^ab$', flags: 'i' })?.test('AB')).toBe(true);
+    expect(
+      serverPatterns(field({ constraints: { pattern: [{ pattern: 'a b', flags: 'x' }] } })),
+    ).toEqual(['a b']);
+  });
+
+  it('keeps the timezone of an edited date-time', () => {
+    const f = field({ constraints: { datatype: `${XSD}dateTimeStamp` } });
+    const e = entryOf(lit('2026-10-24T10:00:00Z', `${XSD}dateTimeStamp`), 'datetime');
+    expect(e.text).toBe('2026-10-24T10:00:00');
+    expect(e.zone).toBe('Z');
+    const r = entryTerm(f, 'datetime', '2026-10-24T11:00', '', {}, e.zone);
+    expect(r.term).toEqual(lit('2026-10-24T11:00:00Z', `${XSD}dateTimeStamp`));
+    const z = entryOf(lit('2026-10-24T10:00:00+02:00', `${XSD}dateTime`), 'datetime');
+    expect(z.zone).toBe('+02:00');
+  });
+
+  it('gives a new time stamp the browser timezone and a new date-time none', () => {
+    const stamp = field({ constraints: { datatype: `${XSD}dateTimeStamp` } });
+    const r = entryTerm(stamp, 'datetime', '2026-10-24T11:00', '', {});
+    const zone = localZone('2026-10-24T11:00');
+    expect(zone).toMatch(/^(Z|[+-]\d\d:\d\d)$/);
+    expect(r.term).toEqual(lit(`2026-10-24T11:00:00${zone}`, `${XSD}dateTimeStamp`));
+    const plain = field({ constraints: { datatype: `${XSD}dateTime` } });
+    expect(entryTerm(plain, 'datetime', '2026-10-24T11:00', '', {}).term).toEqual(
+      lit('2026-10-24T11:00:00', `${XSD}dateTime`),
+    );
+  });
+
+  it('marks values in graphs the person cannot write', () => {
+    expect(entryOf(lit('x'), 'text', undefined, true).readOnly).toBe(true);
+    expect(entryOf(lit('x'), 'text').readOnly).toBeUndefined();
+  });
+
+  it('renders a scalar select per value and long lists of several values as checkboxes', () => {
+    const seven = ['a', 'b', 'c', 'd', 'e', 'f', 'g'].map((v) => lit(v));
+    const scalar = field({ widget: 'select', constraints: { in: seven, maxCount: 1 } });
+    expect(widgetOf(scalar)).toBe('select');
+    expect(choiceGroup(scalar, 'select')).toBeNull();
+    const several = field({ constraints: { in: seven, maxCount: 3 } });
+    expect(choiceGroup(several, 'select')).toBe('checks');
+    const few = field({ widget: 'radio', constraints: { in: seven.slice(0, 3) } });
+    expect(choiceGroup(few, widgetOf(few))).toBe('radio');
+    expect(choiceGroup(field(), 'text')).toBeNull();
   });
 });

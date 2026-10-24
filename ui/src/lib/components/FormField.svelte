@@ -4,6 +4,7 @@
   // problems of the browser's checks and the server's check under it.
   import type { Term } from '$lib/api';
   import {
+    choiceGroup,
     entryOf,
     entryTerm,
     fieldDomId,
@@ -66,21 +67,30 @@
   const many = $derived(multiValued(field));
   const req = $derived(required(field));
   const options = $derived(c.in ?? []);
-  /**
-   * A list of allowed values takes checkboxes when the shapes allow several values
-   * (`sh:maxCount` above 1) or the resource has several. Without `sh:maxCount` and with
-   * at most one value it is a radio group, as the spec's table says.
-   */
-  const checkList = $derived(
-    (c.maxCount !== undefined && c.maxCount > 1) || field.values.length > 1,
-  );
+  /** Checkboxes or a radio group for a list of allowed values (`choiceGroup`). */
+  const group = $derived(choiceGroup(field, widget));
   const errId = $derived(`${base}-problems`);
   const helpId = $derived(`${base}-help`);
   const hasProblems = $derived(problems.length > 0 || results.length > 0);
+  /**
+   * The problems listed under the field rather than under a value: those of the field
+   * as a whole, and all of them for checkboxes and radio groups, which list no values.
+   */
+  const fieldProblems = $derived(group ? problems : problems.filter((p) => p.index === null));
+  const hasFieldProblems = $derived(fieldProblems.length > 0 || results.length > 0);
   const describedby = $derived(
-    [field.description ? helpId : '', hasProblems ? errId : ''].filter(Boolean).join(' ') ||
+    [field.description ? helpId : '', hasFieldProblems ? errId : ''].filter(Boolean).join(' ') ||
       undefined,
   );
+  /** The description of an entry's input: the help, its own problems, the field's. */
+  const entryDescribedby = (i: number) =>
+    [
+      field.description ? helpId : '',
+      entries[i]?.error || entryProblems(i).length ? `${inputId(i)}-problems` : '',
+      hasFieldProblems ? errId : '',
+    ]
+      .filter(Boolean)
+      .join(' ') || undefined;
   const full = $derived(
     c.maxCount !== undefined && entries.filter((e) => e.term).length >= c.maxCount,
   );
@@ -111,7 +121,7 @@
     many && entries.length > 1 ? `${field.label} ${i + 1}` : field.label;
 
   function setText(i: number, text: string, langTag = entries[i].lang) {
-    const r = entryTerm(field, widget, text, langTag, prefixes);
+    const r = entryTerm(field, widget, text, langTag, prefixes, entries[i].zone);
     entries[i] = { ...entries[i], text, lang: langTag, term: r.term, error: r.error };
   }
 
@@ -189,7 +199,7 @@
       {/each}
       {#if field.truncated}<span class="faint small">More values are not listed.</span>{/if}
     </div>
-  {:else if (widget === 'radio' || widget === 'select') && options.length && checkList}
+  {:else if group === 'checks'}
     <fieldset class="ff-set" aria-describedby={describedby}>
       <legend class="ff-label"
         >{field.label}{#if req}<span class="req"> required</span>{/if}</legend
@@ -209,7 +219,7 @@
         {/each}
       </div>
     </fieldset>
-  {:else if widget === 'radio' && options.length}
+  {:else if group === 'radio'}
     <fieldset class="ff-set" aria-describedby={describedby}>
       <legend class="ff-label"
         >{field.label}{#if req}<span class="req"> required</span>{/if}</legend
@@ -250,12 +260,17 @@
     >
       {#each entries as e, i (e.key)}
         <div class="value-row">
-          {#if widget === 'select' && options.length}
+          {#if e.readOnly && e.term}
+            <div class="ro-value" id={inputId(i)} tabindex="-1" aria-describedby="{inputId(i)}-ro">
+              <TermView term={e.term} {prefixes} />
+              <span class="faint small" id="{inputId(i)}-ro">in a graph you cannot write</span>
+            </div>
+          {:else if widget === 'select' && options.length}
             <select
               class="select"
               id={inputId(i)}
               aria-label={many ? nameOf(i) : undefined}
-              aria-describedby={describedby}
+              aria-describedby={entryDescribedby(i)}
               aria-invalid={hasProblems || undefined}
               value={selectValue(e)}
               onchange={(ev) => {
@@ -272,7 +287,7 @@
             <input
               type="checkbox"
               id={inputId(i)}
-              aria-describedby={describedby}
+              aria-describedby={entryDescribedby(i)}
               checked={e.term?.type === 'literal' &&
                 (e.term.value === 'true' || e.term.value === '1')}
               onchange={(ev) => setTerm(i, boolTerm(ev.currentTarget.checked))}
@@ -282,7 +297,7 @@
               class="select"
               id={inputId(i)}
               aria-label={many ? nameOf(i) : undefined}
-              aria-describedby={describedby}
+              aria-describedby={entryDescribedby(i)}
               value={e.term?.type === 'literal'
                 ? e.term.value === '1'
                   ? 'true'
@@ -306,7 +321,7 @@
               hideLabel
               {ds}
               {prefixes}
-              {describedby}
+              describedby={entryDescribedby(i)}
               invalid={hasProblems}
               search={searchHits}
               bind:value={
@@ -321,7 +336,7 @@
               id={inputId(i)}
               rows="3"
               aria-label={many ? nameOf(i) : undefined}
-              aria-describedby={describedby}
+              aria-describedby={entryDescribedby(i)}
               aria-invalid={hasProblems || undefined}
               value={e.text}
               oninput={(ev) => setText(i, ev.currentTarget.value)}></textarea>
@@ -332,7 +347,7 @@
               type={inputType}
               id={inputId(i)}
               aria-label={many ? nameOf(i) : undefined}
-              aria-describedby={describedby}
+              aria-describedby={entryDescribedby(i)}
               aria-invalid={hasProblems || e.error ? true : undefined}
               step={widget === 'number'
                 ? numberStep(c.datatype)
@@ -372,7 +387,7 @@
               {/if}
             {/if}
           {/if}
-          {#if many || (!req && widget === 'entity' && e.term)}
+          {#if !e.readOnly && (many || (!req && widget === 'entity' && e.term))}
             <button
               type="button"
               class="btn sm ghost icon"
@@ -382,14 +397,18 @@
             >
           {/if}
         </div>
-        {#if e.error}<p class="problem small">{e.error}</p>{/if}
-        {#each entryProblems(i) as p (p.message)}
-          <p class="problem small">
-            <span aria-hidden="true">⚠</span>
-            {e.text || optionText(e.term ?? { type: 'literal', value: '' })}
-            {p.message}
-          </p>
-        {/each}
+        {#if e.error || entryProblems(i).length}
+          <div id="{inputId(i)}-problems">
+            {#if e.error}<p class="problem small">{e.error}</p>{/if}
+            {#each entryProblems(i) as p (p.message)}
+              <p class="problem small">
+                <span aria-hidden="true">⚠</span>
+                {e.text || optionText(e.term ?? { type: 'literal', value: '' })}
+                {p.message}
+              </p>
+            {/each}
+          </div>
+        {/if}
       {/each}
       {#if many}
         <button
@@ -403,9 +422,9 @@
       {/if}
     </div>
   {/if}
-  {#if hasProblems}
+  {#if hasFieldProblems}
     <div class="problems" id={errId}>
-      {#each problems.filter((p) => p.index === null) as p (p.message)}
+      {#each fieldProblems as p, j (j)}
         <p class="problem small"><span aria-hidden="true">⚠</span> {field.label} {p.message}</p>
       {/each}
       {#each results as r, i (i)}
