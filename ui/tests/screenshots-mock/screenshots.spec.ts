@@ -551,3 +551,45 @@ SELECT ?person ?name WHERE {
   await page.waitForTimeout(500);
   await page.screenshot({ path: join(OUT, 'pattern-edit.png'), animations: 'disabled' });
 });
+
+// the validation overlay (docs/specs/U07-data-quality-and-schema-diagram.md §11): a team
+// whose SHACL guard wants a name for every person and a valid email address
+const Q = 'http://example.org/quality/';
+
+test('validation-overlay', async ({ page, request }) => {
+  const made = await request.post('/$/datasets', { data: { dbName: 'team', dbType: 'mem' } });
+  expect(made.ok() || made.status() === 409).toBe(true);
+  const u = await request.post('/team/update', {
+    headers: { 'Content-Type': 'application/sparql-update' },
+    data: `PREFIX q: <${Q}> PREFIX rdfs: <http://www.w3.org/2000/01/rdf-schema#> INSERT DATA {
+      q:acme a q:Organization ; rdfs:label "Acme Robotics" .
+      q:lea a q:Person ; q:name "Léa Martin" ; q:email "lea@acme.example" ; q:worksFor q:acme .
+      q:omar a q:Person ; q:name "Omar Haddad" ; q:email "omar@acme" ; q:worksFor q:acme .
+      q:p17 a q:Person ; q:email "p17@acme.example" ; q:worksFor q:acme .
+      q:p18 a q:Person ; q:worksFor q:acme .
+      q:sara a q:Person ; q:name "Sara Lind" ; q:email "sara@acme.example" ; q:worksFor q:acme . }`,
+  });
+  expect(u.ok()).toBe(true);
+  const shapes = `@prefix sh: <http://www.w3.org/ns/shacl#> . @prefix q: <${Q}> .
+q:PersonShape a sh:NodeShape ; sh:targetClass q:Person ;
+  sh:property [ sh:path q:name ; sh:minCount 1 ] ;
+  sh:property [ sh:path q:email ; sh:pattern "^[^@]+@[^@]+[.][^@]+$" ; sh:message "not an email address" ] .`;
+  const g = await request.put('/$/validation/team', {
+    data: { mode: 'warn', shapes: { inline: shapes } },
+  });
+  expect(g.ok()).toBe(true);
+  await page.goto(`/ui/explore?ds=team&iri=${encodeURIComponent(`${Q}acme`)}`);
+  await expect(page.getByRole('button', { name: /p17, 1 violation/ })).toBeVisible({
+    timeout: 30_000,
+  });
+  await page.getByRole('button', { name: /omar, 1 violation/i }).click();
+  const panel = page.getByRole('dialog', { name: /Validation results of/ });
+  await panel.getByRole('button', { name: 'Show triples' }).click();
+  await page.getByRole('button', { name: /p17, 1 violation/ }).click();
+  await panel.getByRole('button', { name: 'Suggest fix' }).click();
+  const editor = panel.getByRole('textbox', { name: 'Suggested update' });
+  await editor.fill((await editor.inputValue()).replace('?value .', '"Priya Shah" .'));
+  await panel.getByRole('button', { name: 'Preview' }).click();
+  await expect(panel).toContainText('The guard would resolve this result.');
+  await shoot(page, 'validation-overlay');
+});

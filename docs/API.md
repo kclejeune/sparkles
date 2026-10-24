@@ -6983,7 +6983,7 @@ selectors are refused because every validated write would run them.
 
 | Method | Path | Description |
 |---|---|---|
-| GET | `/$/validation/{ds}` | `{ language, config, status }`, or `{ config: null }`. `status` holds the mode, the shape count, the `baseline` of the last commit with its counts by severity, counters and warnings. It also holds `lastCheck`, the last validated write, and `recentRejections`, the last ten rejected writes. Each of these has the time, the commit kind, the status, the strategy, the counts, the focus nodes validated, the fallback reason and the first result. SHACL adds `incremental`, with the number of shapes validated incrementally and the shapes validated in full on every write. ShEx adds `associations`, the size of the result map. |
+| GET | `/$/validation/{ds}` | `{ language, config, unionDefaultGraph, status }`, or `{ config: null, unionDefaultGraph }`. `unionDefaultGraph` says whether the server serves the union of the graphs as the default graph, which a `default` data graph then validates. `status` holds the mode, the shape count, the `baseline` of the last commit with its counts by severity, counters and warnings. It also holds `lastCheck`, the last validated write, and `recentRejections`, the last ten rejected writes. Each of these has the time, the commit kind, the status, the strategy, the counts, the focus nodes validated, the fallback reason and the first result. SHACL adds `incremental`, with the number of shapes validated incrementally and the shapes validated in full on every write. ShEx adds `associations`, the size of the result map. |
 | PUT | `/$/validation/{ds}` | Sets the configuration, in either language, and replaces the other language's files. The current data is validated under the writer lock. A `reject` configuration on data that does not pass is refused with `409` and the summary. `400` for a bad configuration, or for shapes or a schema that cannot be used. `501` for a language this binary was built without. |
 | DELETE | `/$/validation/{ds}` | Turns validation off (`204`) and removes every validation file. |
 
@@ -7154,7 +7154,20 @@ the shapes graph in the request body, with Fuseki's semantics:
   does not exist. Jena's special IRIs `urn:x-arq:DefaultGraph` and `urn:x-arq:UnionGraph`
   are accepted as well.
 * **`target`.** Fuseki's `?target=` validates one node against the shapes whose targets
-  select it. It is an IRI, or a prefixed name of the dataset's prefixes such as `ex:bob`.
+  select it. It is an IRI, an IRI in angle brackets, a prefixed name of the dataset's
+  prefixes such as `ex:bob`, or the label of a stored blank node such as `_:b12`. The
+  parameter may repeat up to 1,000 times, and the report then holds the results of every
+  node named. More than 1,000 is a `400`.
+* **`shapes`.** `shapes=guard` takes the shapes of the dataset's write-time SHACL guard as
+  they are now and validates the guard's data graph, so `graph` is a `400` with it.
+  `shapes=<graph IRI>` takes the shapes of a graph of the dataset at the state read, and
+  leaves that graph out of the data graph. With either, the body is empty or a form
+  (`application/x-www-form-urlencoded`) whose fields are further parameters, which keeps a
+  long list of `target` values out of the URL. A named source with any other body is a
+  `400`. `shapes=guard` answers `404` when the dataset has no write-time validation and
+  `400` when its guard is ShEx, and a missing shapes graph is a `404`. The Explore
+  validation overlay uses these forms
+  ([U07 §11](specs/U07-data-quality-and-schema-diagram.md#11-phase-4-a-validation-overlay-on-the-graph-2026-10-23)).
 * **`reasoning=true|false`.** When the dataset has materialized inferences, validation
   runs over data ∪ `urn:x-sparkles:inferred` unless `reasoning=false`. With `false`, the
   inferred graph is also left out of `graph=union`.
@@ -7360,6 +7373,21 @@ report. `semact-trace=true` adds the Test extension's `print` output to each res
 | `semact-trace` | `true` / `false` | `false` |
 | `stats` | `true` adds the typing's counters to the JSON report. | `false` |
 | `base` | The base IRI of the schema. | none |
+| `at` | A past state, as for queries (`commit:42`, `time:…`, `snapshot:NAME`). | the head |
+| `schema` | `guard` validates against the write-time ShEx guard's schema on the guard's data graph. See below. | none |
+
+**The guard's schema.** With `schema=guard` the body is empty or a form
+(`application/x-www-form-urlencoded`) whose fields are further parameters, such as a long
+`map`. A schema in the body is a `400`, and so are `graph`, `schema-format` and `base`,
+because the guard names its data graph and its schema. The shape map may hold up to 1,000
+associations, and each must name a node. An association with `START` takes the shapes
+that the guard's shape map gives that node: a node selector that names it, or a
+`{FOCUS p o}` or `{s p FOCUS}` pattern that it matches in the guard's data graph, checked
+for that node alone. An association with a label keeps it. A node that the guard's map
+does not select gets no result. `schema=guard` answers `404` when the dataset has no
+write-time validation and `400` when its guard is SHACL. The Explore validation overlay
+uses this form
+([U07 §11](specs/U07-data-quality-and-schema-diagram.md#11-phase-4-a-validation-overlay-on-the-graph-2026-10-23)).
 
 **Response.** The status is `200` whether or not the nodes conform, and the response
 carries `Sparkles-Commit`. When inferences were included, it also carries the inference

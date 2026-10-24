@@ -3487,7 +3487,7 @@ export interface paths {
         put?: never;
         /**
          * Validate with SHACL
-         * @description Validates a data graph of the dataset against the shapes graph in the body, as Fuseki's `/{ds}/shacl` does. The report answers `200` whether or not the data conforms.
+         * @description Validates a data graph of the dataset against the shapes graph in the body, as Fuseki's `/{ds}/shacl` does. The report answers `200` whether or not the data conforms. With `shapes=guard` or `shapes=<graph IRI>` the shapes come from the write-time guard or from a graph of the dataset, and the body is empty or a form of further parameters. A named source with any other body is a `400`.
          */
         post: operations["shacl"];
         delete?: never;
@@ -8516,6 +8516,7 @@ export interface components {
         /** @description `{language, config, status}`, or `{config: null}` without validation. */
         ValidationStatus: {
             config: null;
+            unionDefaultGraph?: boolean;
         } | {
             config: components["schemas"]["ValidationConfig"];
             /** @enum {string} */
@@ -8557,6 +8558,7 @@ export interface components {
                 shapeCount?: number;
                 warnings: string[];
             };
+            unionDefaultGraph?: boolean;
         };
         /** @description What write-time validation found about a write. */
         ValidationSummary: {
@@ -18433,8 +18435,10 @@ export interface operations {
             query?: {
                 /** @description `default`, `union` or a graph IRI. `urn:x-arq:DefaultGraph` and `urn:x-arq:UnionGraph` work too. */
                 graph?: components["parameters"]["graphSel"];
-                /** @description Validate one node, an IRI or prefixed name. */
-                target?: string;
+                /** @description Validate these nodes against the shapes whose targets select them. Each is an IRI, a prefixed name or a blank node label, and the parameter may repeat up to 1,000 times. */
+                target?: string[];
+                /** @description `guard` for the write-time guard's shapes on its data graph, or the IRI of a shapes graph of the dataset. */
+                shapes?: string;
                 /** @description Include materialized inferences. The default is true when the dataset has any. False also turns RDFS on read off. */
                 reasoning?: components["parameters"]["reasoning"];
                 /** @description Seconds. Capped at the server's `--max-timeout`. */
@@ -18451,14 +18455,15 @@ export interface operations {
             };
             cookie?: never;
         };
-        /** @description The shapes graph. */
-        requestBody: {
+        /** @description The shapes graph, or with `shapes` an empty body or a form of parameters. */
+        requestBody?: {
             content: {
                 "application/ld+json": string;
                 "application/n-quads": string;
                 "application/n-triples": string;
                 "application/rdf+xml": string;
                 "application/trig": string;
+                "application/x-www-form-urlencoded": string;
                 "text/shaclc": string;
                 "text/turtle": string;
             };
@@ -18501,12 +18506,16 @@ export interface operations {
                 "schema-format"?: "shexc" | "shexj" | "shexr";
                 /** @description The base IRI of the schema. */
                 base?: string;
+                /** @description `guard` validates against the write-time guard's schema on its data graph. The body is then empty or a form of parameters, and the shape map names up to 1,000 nodes, where `START` takes the shapes the guard's shape map gives each node. */
+                schema?: "guard";
                 /** @description `default`, `union` or a graph IRI. `urn:x-arq:DefaultGraph` and `urn:x-arq:UnionGraph` work too. */
                 graph?: components["parameters"]["graphSel"];
                 /** @description Include materialized inferences. The default is true when the dataset has any. False also turns RDFS on read off. */
                 reasoning?: components["parameters"]["reasoning"];
                 /** @description Seconds. Capped at the server's `--max-timeout`. */
                 timeout?: components["parameters"]["timeout"];
+                /** @description The state to read: `head`, `42`, `commit:42`, `time:<RFC 3339>` or `snapshot:NAME`. */
+                at?: components["parameters"]["at"];
                 /** @description The response format, in place of `Accept`. Fuseki's `output` and `results` are the same parameter. */
                 format?: components["parameters"]["format"];
             };
@@ -18517,11 +18526,12 @@ export interface operations {
             };
             cookie?: never;
         };
-        /** @description The schema, or a JSON envelope. */
-        requestBody: {
+        /** @description The schema, or a JSON envelope, or with `schema=guard` an empty body or a form of parameters. */
+        requestBody?: {
             content: {
                 "application/json": components["schemas"]["ShexRequest"] | Record<string, never>;
                 "application/shex+json": Record<string, never>;
+                "application/x-www-form-urlencoded": string;
                 "text/shex": string;
                 "text/turtle": string;
             };

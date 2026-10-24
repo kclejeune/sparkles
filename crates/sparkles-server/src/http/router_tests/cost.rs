@@ -325,6 +325,65 @@ async fn shacl_reports_are_bounded_by_the_result_budget() {
     assert!(r.text().contains("MaxCountConstraintComponent"));
 }
 
+/// Spec U07 §11.7: a focus set against a stored shapes graph runs under the same
+/// result budget.
+#[cfg(feature = "shacl")]
+#[tokio::test]
+async fn shacl_focus_sets_are_bounded_by_the_result_budget() {
+    let s = limited(&[], |st| st.limits.max_result_bytes = Some(64 << 10));
+    let mut nt = String::new();
+    for i in 0..2000 {
+        nt.push_str(&format!(
+            "<http://example.org/n{i}> <http://example.org/v> \"x\" .\n"
+        ));
+    }
+    let r = send(
+        &s.app,
+        put("/ds/data?default", "application/n-triples", &nt),
+    )
+    .await;
+    assert!(r.status.is_success(), "{}", r.text());
+    let shapes = "<http://example.org/S> <http://www.w3.org/1999/02/22-rdf-syntax-ns#type> <http://www.w3.org/ns/shacl#NodeShape> .
+        <http://example.org/S> <http://www.w3.org/ns/shacl#targetSubjectsOf> <http://example.org/v> .
+        <http://example.org/S> <http://www.w3.org/ns/shacl#property> _:p .
+        _:p <http://www.w3.org/ns/shacl#path> <http://example.org/v> .
+        _:p <http://www.w3.org/ns/shacl#maxCount> \"0\"^^<http://www.w3.org/2001/XMLSchema#integer> .";
+    let r = send(
+        &s.app,
+        put(
+            "/ds/data?graph=http://example.org/sh",
+            "application/n-triples",
+            shapes,
+        ),
+    )
+    .await;
+    assert!(r.status.is_success(), "{}", r.text());
+    let form = |n: usize| -> String {
+        (0..n)
+            .map(|i| format!("target=http%3A%2F%2Fexample.org%2Fn{i}"))
+            .collect::<Vec<_>>()
+            .join("&")
+    };
+    let validate = |n: usize| {
+        Request::post("/ds/shacl?shapes=http%3A%2F%2Fexample.org%2Fsh")
+            .header(header::CONTENT_TYPE, "application/x-www-form-urlencoded")
+            .header(header::ACCEPT, TTL)
+            .body(Body::from(form(n)))
+            .unwrap()
+    };
+    let r = send(&s.app, validate(1000)).await;
+    assert_eq!(r.status, StatusCode::INSUFFICIENT_STORAGE, "{}", r.text());
+    assert_eq!(r.json()["budget"], "result-bytes");
+    let r = send(&s.app, validate(5)).await;
+    assert_eq!(r.status, StatusCode::OK, "{}", r.text());
+    assert_eq!(
+        r.text().matches("MaxCountConstraintComponent").count(),
+        5,
+        "{}",
+        r.text()
+    );
+}
+
 fn task(st: &AppState, id: &str) -> crate::state::Task {
     st.tasks
         .lock()

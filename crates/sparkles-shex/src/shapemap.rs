@@ -922,6 +922,81 @@ pub fn expand(
     Ok((out, warnings))
 }
 
+/// The associations of `map` that select one of `nodes`, as a fixed map over `data`: for
+/// each node in order, each association whose selector selects it, with the node in
+/// place of the selector. A node selector selects the node it names, and a `{FOCUS p o}`
+/// or `{s p FOCUS}` pattern the nodes with that triple in the data graph, each node
+/// checked by itself so the cost follows `nodes` and not the data. `SPARQL` selectors are
+/// left out. Duplicate (node, label) pairs appear once.
+pub fn focus_map(map: &ShapeMap, nodes: &[Term], data: &DataGraph) -> anyhow::Result<ShapeMap> {
+    let snap = &data.snap;
+    let id_of = |t: &Term| -> Option<Id> {
+        match t {
+            Term::BlankNode(b) => parse_bnode_label(b.as_str()),
+            t => snap.lookup_term(t),
+        }
+    };
+    let mut out = Vec::new();
+    let mut seen: FxHashSet<(Term, ShapeLabel)> = FxHashSet::default();
+    for node in nodes {
+        let nid = id_of(node);
+        for a in &map.0 {
+            let selected = match &a.node {
+                NodeSelector::Term(t) => t == node,
+                NodeSelector::Sparql(_) => false,
+                NodeSelector::Focus {
+                    subject,
+                    predicate,
+                    object,
+                    focus_is_subject,
+                } => {
+                    let (Some(n), Some(p)) = (nid, snap.lookup_iri(predicate.as_str())) else {
+                        continue;
+                    };
+                    let mut hit = false;
+                    if *focus_is_subject {
+                        match object {
+                            None => data.scan_objects(n, p, |_| {
+                                hit = true;
+                                false
+                            })?,
+                            Some(o) => {
+                                let Some(o) = id_of(o) else { continue };
+                                data.scan_objects(n, p, |x| {
+                                    hit = x == o;
+                                    !hit
+                                })?
+                            }
+                        }
+                    } else {
+                        match subject {
+                            None => data.scan_subjects(p, n, |_| {
+                                hit = true;
+                                false
+                            })?,
+                            Some(s) => {
+                                let Some(s) = id_of(s) else { continue };
+                                data.scan_subjects(p, n, |x| {
+                                    hit = x == s;
+                                    !hit
+                                })?
+                            }
+                        }
+                    }
+                    hit
+                }
+            };
+            if selected && seen.insert((node.clone(), a.shape.clone())) {
+                out.push(Association {
+                    node: NodeSelector::Term(node.clone()),
+                    shape: a.shape.clone(),
+                });
+            }
+        }
+    }
+    Ok(ShapeMap(out))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1184,6 +1259,67 @@ mod tests {
     fn sorted(mut v: Vec<String>) -> Vec<String> {
         v.sort();
         v
+    }
+
+    /// `focus_map`: each selector checked for the given nodes alone (spec U07 §11.3).
+    #[test]
+    fn focus_map_checks_each_node() {
+        let store = store();
+        let snap = store.snapshot();
+        let data = DataGraph::new(snap.clone(), None, &[], &[]).unwrap();
+        let map = parse(
+            "{FOCUS a ex:Person}@ex:Person, ex:acme@ex:Org, {ex:bob ex:knows FOCUS}@ex:Knows,
+             {_ ex:knows FOCUS}@START, {FOCUS ex:knows _}@ex:Knower, {FOCUS a ex:Person}@ex:Person",
+            &schema_prefixes(),
+            None,
+        )
+        .unwrap();
+        let pairs = |nodes: &[Term]| -> Vec<(String, String)> {
+            focus_map(&map, nodes, &data)
+                .unwrap()
+                .0
+                .into_iter()
+                .map(|a| {
+                    let NodeSelector::Term(Term::NamedNode(n)) = a.node else {
+                        panic!("{a:?}")
+                    };
+                    let shape = match a.shape {
+                        ShapeLabel::Iri(i) => i.trim_start_matches(EX).to_string(),
+                        l => format!("{l:?}"),
+                    };
+                    (n.as_str().trim_start_matches(EX).to_string(), shape)
+                })
+                .collect()
+        };
+        let p = |a: &str, b: &str| (a.to_string(), b.to_string());
+        // carol is in ex:g1, outside the default graph, but bob knows her there
+        assert_eq!(
+            pairs(&[iri("alice"), iri("carol"), iri("acme"), iri("nobody")]),
+            vec![
+                p("alice", "Person"),
+                p("alice", "Knows"),
+                p("alice", "Start"),
+                p("alice", "Knower"),
+                p("carol", "Knows"),
+                p("carol", "Start"),
+                p("acme", "Org"),
+            ]
+        );
+        // a node given twice appears once per shape
+        assert_eq!(pairs(&[iri("acme"), iri("acme")]), vec![p("acme", "Org")]);
+        // SPARQL selectors are left out
+        let sparql = parse(
+            "SPARQL 'SELECT ?x { ?x ?p ?o }'@ex:S",
+            &schema_prefixes(),
+            None,
+        )
+        .unwrap();
+        assert!(
+            focus_map(&sparql, &[iri("alice")], &data)
+                .unwrap()
+                .0
+                .is_empty()
+        );
     }
 
     #[test]

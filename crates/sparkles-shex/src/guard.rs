@@ -432,6 +432,27 @@ impl ShexGuard {
         self.model.read().clone()
     }
 
+    /// What a validation of `snap` under this guard reads: the compiled schema, the shape
+    /// map, and the data graph as validation options without limits (`None` when the
+    /// configuration lists data graphs none of which exists in `snap`).
+    pub fn validation_inputs(
+        &self,
+        snap: &Snapshot,
+    ) -> (Arc<CompiledSchema>, ShapeMap, Option<ValidateOptions>) {
+        let m = self.model();
+        let opts = self
+            .cfg
+            .data_graph
+            .graphs(snap, self.cfg.include_inferences, self.cfg.schema_graphs())
+            .map(|g| ValidateOptions {
+                data_graph: g.data_graph,
+                extra_graphs: g.extra_graphs,
+                exclude_graphs: g.exclude_graphs,
+                ..Default::default()
+            });
+        (m.schema.clone(), m.map.clone(), opts)
+    }
+
     /// The schema copy of an in-memory dataset: its file name in a database directory
     /// (`schema.file` of the configuration) and its text. `None` for a persistent
     /// dataset, whose copy is in its directory.

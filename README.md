@@ -339,6 +339,14 @@ agent memory, the map view and a merge preview.
     <td>A query built on the canvas from the schema</td>
     <td>A query's plan drawn on its pattern, with misestimates marked</td>
   </tr>
+  <tr>
+    <td><img src="docs/images/validation-overlay.png" alt="The resource explorer with validation badges on three people, a bad email address and its edge marked, and a results panel previewing an update that adds a missing name"></td>
+    <td></td>
+  </tr>
+  <tr>
+    <td>SHACL results badged on the graph, with a suggested fix previewed</td>
+    <td></td>
+  </tr>
 </table>
 
 </details>
