@@ -1,8 +1,11 @@
 # Sparkles HTTP API
 
-The server speaks the Fuseki protocol, so existing Jena tooling (`rdfconnection`,
-`s-query`, YASGUI and others) works unchanged. The `/$/…` extensions provide dataset
-administration, history, search configuration, validation and agent services.
+This document is the reference for the Sparkles HTTP API. The server speaks the Fuseki
+protocol, so existing Jena tooling such as `rdfconnection`, `s-query` and YASGUI works
+unchanged. The `/$/…` extensions provide dataset administration, history, search
+configuration, validation and agent services. The sections below are grouped by area,
+from the server and its datasets through queries, history, search, reasoning and
+validation, to access control and the agent endpoints.
 
 [USAGE.md](USAGE.md) provides workflows and CLI and binding examples. This document owns
 the HTTP contracts. [openapi.json](openapi.json) is their machine-readable description.
@@ -17,34 +20,59 @@ every route needs credentials or a grant to `anonymous`. See
 A machine-readable description of this API is served at `/$/openapi.json`. See
 [OpenAPI description](#openapi-description).
 
+**Server and datasets**
+
 * [OpenAPI description](#openapi-description)
 * [Server](#server)
 * [Datasets (admin)](#datasets-admin)
 * [Schema discovery](#schema-discovery)
+
+**Queries and updates**
+
 * [Per-dataset SPARQL protocol (Fuseki compatible)](#per-dataset-sparql-protocol-fuseki-compatible)
 * [Stored queries](#stored-queries)
 * [GraphQL](#graphql)
+* [`application/x-sparkles+json` (UI result format)](#applicationx-sparklesjson-ui-result-format)
+* [Explain](#explain)
+* [Compression](#compression)
+
+**History, branches and backups**
+
 * [Commits](#commits)
 * [Branches and merges](#branches-and-merges)
 * [Point-in-time reads and snapshots](#point-in-time-reads-and-snapshots)
 * [Backup repositories](#backup-repositories)
+
+**Search and graph analytics**
+
 * [Full-text search](#full-text-search)
 * [Vector similarity](#vector-similarity)
 * [Path search](#path-search)
 * [Graph algorithms](#graph-algorithms)
 * [GeoSPARQL](#geosparql)
+
+**Reasoning and validation**
+
 * [Reasoning status and diagnostics](#reasoning-status-and-diagnostics)
 * [RDFS on read](#rdfs-on-read)
+* [Query-time reasoning](#query-time-reasoning)
 * [Write-time validation](#write-time-validation)
 * [SHACL validation](#shacl-validation)
+* [Editing forms](#editing-forms)
 * [ShEx validation](#shex-validation)
+
+**Formatting and linting**
+
 * [Formatting](#formatting)
 * [Linting](#linting)
-* [`application/x-sparkles+json` (UI result format)](#applicationx-sparklesjson-ui-result-format)
-* [Explain](#explain)
-* [Compression](#compression)
+
+**Errors and access control**
+
 * [Errors](#errors)
 * [Authentication and access control](#authentication-and-access-control)
+
+**Agents and models**
+
 * [MCP server](#mcp-server)
 * [Natural-language questions](#natural-language-questions)
 
@@ -72,8 +100,8 @@ results and the dataset information to diffs, the change feed, write previews, t
 metrics snapshot, Fuseki's services, reasoning diagnostics, ShEx reports and backup
 policies. Members that this page calls free-form stay open objects inside them, such as
 the results of a validation summary, a stored query's parameters and a GeoJSON geometry.
-A few answers are still plain objects described inline: the JSON form of drafted shapes,
-class profiles, schema diffs, the linter's result, MCP's JSON-RPC messages and the
+A few answers are plain objects described inline. These are the JSON form of drafted
+shapes, class profiles, schema diffs, the linter's result, MCP's JSON-RPC messages and the
 explanation of a query. A test sends requests to a server and checks their JSON bodies
 and the answers against the schemas.
 
@@ -3022,6 +3050,327 @@ document hash and the number of groups, and are counted in the histogram
 `sparkles graphql --loc DB run|schema get|put|delete|versions|draft` runs documents and
 manages the configuration of a database directory (see [Usage](USAGE.md#graphql)). The
 Rust API is the crate `sparkles-graphql`.
+
+## `application/x-sparkles+json` (UI result format)
+
+This result format is modelled on QLever's `qlever-json`. The UI uses it to render results
+and draw query plans:
+
+```ts
+type SparklesResult = {
+  queryType: "SELECT" | "ASK" | "CONSTRUCT" | "DESCRIBE";
+  vars?: string[];                        // SELECT
+  rows?: (Term | null)[][];               // SELECT; null = unbound
+  boolean?: boolean;                      // ASK
+  triples?: [Term, Term, Term][];         // CONSTRUCT / DESCRIBE
+  quads?: [Term, Term, Term, Term | null][]; // streaming graph results; null default graph
+  meta: {
+    totalRows: number | null; sentRows: number;
+    status?: "complete" | "stopped";        // streaming only; totalRows null when stopped
+    timing: { parseMs: number; planMs: number; execMs: number; serializeMs: number; totalMs: number };
+    plan: PlanNode | CursorPlan;           // eager or streaming operator tree
+    memory: { peakBytes: number };         // peak estimated memory of intermediate results
+    rowsProduced: number;                  // rows produced by all operators, summed
+  };
+};
+type Term =
+  | { type: "uri"; value: string }
+  | { type: "bnode"; value: string }
+  | { type: "literal"; value: string; datatype?: string; "xml:lang"?: string }
+  | { type: "triple"; value: { subject: Term; predicate: Term; object: Term } };
+type PlanNode = {
+  planFormat?: 2;            // root only: a plan deeper than 256 levels, whose nodes have no id
+  id?: string;               // the path of child indexes from the root, such as "0.1.2"
+  operator: string;          // "IndexScan", "Join", "Sort", "Filter", ...
+  description: string;       // human readable, e.g. "PSO ?s <p> ?o"
+  columns: string[];         // variables produced
+  sortedOn: string[];
+  estimatedRows: number; estimatedCost: number;
+  actualRows: number; timeMs: number;       // wall time incl. children
+  cached: boolean;
+  children: PlanNode[];
+  counters?: Record<string, number | string | boolean>;  // spatial operators: candidates, rechecked,
+                             // refined, matched, treeNodesVisited, index ("ready", "building (37%)",
+                             // "feature-links", …), fallback (see GeoSPARQL); expressions evaluated
+                             // once per distinct value: exprCacheHits (rows that reused a result),
+                             // exprCacheMisses (evaluations), exprCacheSkipped (ran row by row)
+  warnings?: { code: string; message: string }[];       // root only: notes about the plan
+};
+```
+
+A native streaming response puts `rows` before `meta`. It includes the final counts and
+capabilities only when the query has produced every row successfully. When the query or
+the serialization fails, the response carries no success metadata. `commit` and
+`datasetId` identify the snapshot the query read, as they do on eager HTTP responses. A
+graph query's response has an empty `triples` array and puts every result in `quads`,
+with a null graph for statements in the default graph. A streaming plan has this shape:
+
+```ts
+type CursorPlan = {
+  operator: PlanNode;
+  materializes: boolean; fullInputBeforeOutput: boolean; growingState: boolean;
+  complete: boolean; reason: string | null;
+  children: CursorPlan[];
+};
+```
+
+`complete` says whether an operator's counts cover its entire execution. The counts on a
+stopped cursor are partial. `materializes` marks a subtree that fell back to eager
+execution. A native ORDER BY reads its whole input into budgeted memory before its
+first row. It reports `fullInputBeforeOutput` and a `reason`, but `materializes` stays
+false, so the strict policy that refuses eager fallback still accepts the sort.
+`growingState` warns that an operator keeps state that grows as it runs, such as
+generated strings. The batch size alone does not limit that state.
+
+### The I/O profile
+
+With `profile=io`, the metadata of a native result has an `io` object. It reports what the
+query read from the index and vocabulary files, which helps explain the time of a first
+query after a restart. The counters cover the whole process, so the profile needs the
+`metrics` permission, as `/$/metrics` does. A caller without it gets a `403`, and a value
+of `profile` other than `io` gets a `400`. A streaming response keeps the profile running
+until its body ends.
+
+```ts
+type IoProfile = {
+  index: Record<string, {                  // by permutation: spo, sop, pso, pos, osp, ops, gspo
+    columnsDecoded: number; decodedBytes: number; compressedBytes: number }>;
+  readahead: Record<string, {              // by file: the permutations, vocab.dat, vocab.off, vocab.num
+    requests: number; bytes: number }>;    // WILLNEED requests to the kernel
+  vocab: { finds: number; groupsHinted: number; blocksScanned: number };
+  numericPagesRequested: number;
+  timeMs?: { vocabLookup: number; vocabRead: number; indexDecode: number; indexWait: number };
+  majorFaults?: number; minorFaults?: number;
+  pages?: Record<string, { touched: number; residentBefore: number;
+                           residentAfter: number; broughtIn: number }>;
+  pagesTruncated?: boolean;
+  events?: { atUs: number; file: string; what: string; bytes: number }[];
+};
+```
+
+The counters are process-wide, so they include the reads of any query that runs at the
+same time. The profile is meant for one query on a quiet server. `vocab.finds` and
+`vocab.blocksScanned` are counted only while a profile runs, because a scan of the
+vocabulary adds to them millions of times from many threads. `vocabLookup` is the time
+in key lookups, which resolve the constants of the query. `vocabRead` is the time reading
+terms by id. `indexDecode` is the time decompressing index columns, and `indexWait` is the
+time to read their pages into memory before decoding. In a segmented index (format 3), a
+read of a few rows decodes single segments of a column, and each counts as one entry of
+`columnsDecoded`, with its own rows in `decodedBytes`. The times are summed over threads.
+`pages` comes from `mincore(2)` on the pages the query asked for or read, and `events`
+lists the first 512 requests in order. Overlapping profiles share one epoch inventory
+of at most 65,536 distinct file, mapping and page entries. It retains the first admitted
+pages and bounds report scratch storage by that sample. `pagesTruncated` is true when
+an inventory or range cap omitted pages. It is false when no cap omission was recorded,
+which does not guarantee complete coverage. Process counter snapshots omit the flag.
+
+All `pages` fields describe the retained best-effort sample. `touched`, `residentBefore`
+and `residentAfter` are additive lower bounds on those counts for the full observed set.
+`broughtIn` is `max(residentAfter - residentBefore, 0)` for the sample. It is neither a
+lower bound on the full-set delta nor a physical-I/O count, especially when pages are
+evicted. Platforms without mapped page observations report a false truncation flag and
+no page entries. The bounded shared inventory and event log add memory while profiles
+are active, outside any one query's grant. Their allocation size depends on the allocator.
+Profiling adds observation work, whose corrected-source cost remains to be measured.
+Numeric profiles record mapped value loads in both single and bulk lookup paths. Kinds
+and rank entries are observed before access only when read from the mapping, rather
+than a resident copy. These observations work with hints disabled or already issued.
+`numericPagesRequested` keeps counting numeric advice pages and does not count actual
+loads. Observation adds no advice and does not reset the mapping's once-only hint bits.
+
+The same counters are in `/$/metrics` as `sparkles_index_columns_decoded_total`,
+`sparkles_index_readahead_bytes_total` and `sparkles_vocab_groups_read_total`.
+
+## Explain
+
+`GET|POST /{ds}/explain?query=…` returns `{ "algebra": string /* SSE */, "plan": PlanNode }`.
+The plan is not executed, so `actualRows` is -1. The root `PlanNode` lists `warnings` when
+something in the query did not run the way it reads, although the answer is the same:
+
+* `geo-not-pushed`: a spatial FILTER is evaluated row by row. The warning says why.
+* `geo-index-building`: the spatial index is being built, and plans run without it.
+* `geo-not-built`: the query uses `geof:` functions in a build without the `geo` feature.
+
+The plan of an executed query, which the `application/x-sparkles+json` result includes,
+also lists the warnings that came up while it ran:
+
+* `geo-crs-approximate`: a geometry in a CRS whose datum shift is approximate. See
+  [Accuracy of datum shifts](#accuracy-of-datum-shifts).
+* `geo-crs-unsupported`: a geometry in an EPSG CRS that the build refused, with the
+  reason.
+
+Every node of a returned plan has an `id`, the path of child indexes from the root, such
+as `0.1.2`. A `CursorPlan` node and its operator share the id. Ids are valid only for
+the plan of the same response. A plan deeper than 256 levels is written in plan format 2
+instead, whose root has `"planFormat": 2` and whose nodes have no `id`, because ids that
+are paths would make the JSON grow with the square of the depth. A client that needs the
+ids of such a plan derives them from its shape. A plan without `planFormat` is in format
+1, and a reader refuses a format it does not know. The OpenAPI description lists
+`planFormat` on `PlanNode` and `CursorPlan`, and the plan view of the UI shows plans in
+formats 1 and 2 and says that it cannot show a plan in any other. The estimated plan of
+`/{ds}/explain` and the plan of an executed query have the same shape, so an `ASK` has
+its `Slice` root and a `CONSTRUCT` or `DESCRIBE` has a `CONSTRUCT` or `DESCRIBE` root in
+both. A node can also carry these members.
+
+| Member | Meaning |
+|---|---|
+| `skipped` | Why the node did not run, such as "the left side produced no rows". Its rows are `-1` and its time is 0. |
+| `stoppedEarly` | A `LIMIT`, `ASK` or `EXISTS` stopped the node once it had enough rows. |
+| `runs` | How often the node ran when a `LIMIT` made the executor grow its input in rounds. Its time spans every round, and its children add up their rounds too. |
+| `cached` | The node's result came from the result cache. Its children are the subtree the result was computed from, each `skipped`. |
+| `pushedFilters` | The filters a range scan or an index join applies itself. |
+| `estimateGuessed` | The estimate is a constant guess, as for `SERVICE`. |
+| `complete` | `false` on the nodes whose counts a failure cut short. |
+| `patterns` | The triple patterns and paths of the query that the node reads, in query order, as `PlanPattern` objects. Scans, index joins, star joins, paths and counts from the index carry it. |
+| `filterVars` | On a filter, the query variables its expression reads. |
+| `joinVars` | On a join, the query variables it joins on. |
+
+A `PlanPattern` has `s`, `p` and `o`, each an N-Triples term or a variable of the query
+written as `?name`. A blank node and a variable that the planner made, such as the middle
+of a path, are written as `?_`. A path is written in `p` with full IRIs in angle brackets
+and no spaces, such as `<http://example.org/partOf>+` or
+`(<http://example.org/a>|^<http://example.org/b>)*`. A pattern inside `GRAPH` also has
+`graph`, the graph term, and every pattern has `occurrence`, its index among equal
+patterns of the query, counted from 0 in query order. These members carry only terms that
+the query itself contains, so a caller whose view C12 limits learns nothing new from
+them. The UI uses them to draw the plan on the query's pattern graph. The parser writes a
+sequence such as `ex:a/ex:b` as its steps joined by a blank node, so each step is a
+pattern of its own with `?_` between them. It writes an outer inverse such as `^ex:a` or
+`^ex:a+` as the path inside it with the subject and object swapped. Any other path that the planner splits into operators, such as
+an alternative, lists the whole path on each of them.
+
+A query that a budget or its timeout stopped answers with its error as before. In the
+`application/x-sparkles+json` format the error body also carries `plan`, the plan as it
+stood when the query stopped, and `commit`. The nodes that were still running have
+`complete: false`, and their counts are those reached so far. The UI's **Explain why**
+sends that plan to `/{ds}/sparql/explain`.
+
+## Compression
+
+The design and its rationale are in [X01 Compression codecs](specs/X01-compression-codecs.md).
+
+**Responses** are compressed when the client sends `Accept-Encoding` with `zstd`, `br`,
+`gzip` or `deflate`. This includes streamed bodies. Bodies under 256 bytes and images are
+sent uncompressed. The UI's larger assets are built with brotli and gzip copies. Those
+copies are served as they are, with `Vary: Accept-Encoding`, rather than compressed per
+request.
+
+| `sparkles serve` flag | Default | |
+|---|---|---|
+| `--http-compression auto\|off` | `auto` | |
+| `--http-compression-level fastest\|default\|best\|N` | `default` | zstd 3, brotli 4, gzip 6. A number applies to whichever algorithm is chosen. |
+| `--http-compression-algorithms` | `zstd,br,gzip,deflate` | The encodings offered. |
+| `--max-decompressed-mb` | `65536` | Cap on compressed request bodies after decompression and on RDF source bytes, including plain RDF. `0` means none. |
+| `--max-query-body-mb` | `16` | Largest body of a SPARQL query, `/{ds}/explain`, `/{ds}/shacl` or `/{ds}/shex` request. `0` means none. |
+| `--max-update-body-mb` | `256` | Largest body of a SPARQL update. `0` means none. |
+| `--max-admin-body-mb` | `16` | Largest body of an admin request (`/$/…`) or a `/{ds}/prefixes` change. `0` means none. |
+| `--max-upload-mb` | `4096` | Largest Graph Store write or upload body, after HTTP decompression. `0` means none. |
+| `--min-free-disk-mb` | `1024` | Free space that must remain in the temporary directory after a spooled request body, and on the data directory's file system after a commit, rebuild, clone or N-Quads backup. `0` turns the check off. |
+| `--max-mem-dataset-mb` | `4096` | Largest in-memory (`dbType=mem`) dataset. A commit that would grow one past it fails with `507`. `0` means none. |
+
+**Request bodies** of updates, queries, Graph Store PUT/POST and uploads may be sent with
+`Content-Encoding: gzip`, `br`, `zstd` or `deflate`. Another encoding gets `415` with an
+`Accept-Encoding` header naming the supported ones. RDF bodies and uploaded files are also
+recognised as compressed by their first bytes (gzip, xz, bzip2, zstd, LZ4 frames).
+Uploads are also recognised by file name (`.gz`, `.xz`, `.bz2`, `.zst`, `.br`, `.lz4`).
+A body that decompresses past `--max-decompressed-mb` fails with `413` and commits
+nothing.
+
+**Body ceilings.** A body that is read whole has the ceiling of its request class:
+
+* `--max-query-body-mb` for queries, `/{ds}/explain`, the shapes graph of `/{ds}/shacl`
+  and the schema of `/{ds}/shex`
+* `--max-update-body-mb` for updates
+* `--max-admin-body-mb` for `/$/…` requests and prefix changes
+* a fixed 64 KiB for `/$/auth/*`
+
+The ceiling counts decompressed bytes and is checked while the body is read, so the server
+never holds more than the ceiling. A declared `Content-Length` over it is refused before
+anything is read. Past the ceiling, the request fails with `413`. A form POST to `/{ds}`
+may hold either operation, so it is read up to the larger of the query and update
+ceilings.
+
+Graph Store PUT/POST, including through `/{ds}`, and `/{ds}/upload` are the bulk
+endpoints. Their bodies stream to a temporary file instead, up to `--max-upload-mb`, or
+the request fails with `413`. That limit counts bytes after HTTP decompression. Its
+default of 4096 (4 GiB) is the body limit of the bundled NixOS nginx virtual host, and `0`
+means unlimited. `--max-decompressed-mb` caps the RDF sources separately as they are
+parsed, both files compressed inside the body and plain RDF. A body in RDF Thrift, RDF
+Protobuf, RDF/JSON or TriX is translated to N-Quads, and the translation counts against
+that cap as it is written. Before each 64 MiB of a spooled body is written to the
+temporary directory, the server checks that the file system keeps `--min-free-disk-mb`
+free (default 1024, `0` for no check). Otherwise the request fails with `507`.
+
+**Storage.** A commit to a persistent dataset is refused with `507 {code: "storage-full"}`
+when it would leave less than `--min-free-disk-mb` free on the data directory's file
+system. Free space is measured with `statvfs` and cached for a second between small
+commits. A rebuild (a large load or compaction) or a clone checks the free space while it
+builds. Once the file system goes below the limit, it stops and removes what it wrote.
+Nothing is committed in either case. An in-memory dataset (`dbType=mem`) holds at most
+`--max-mem-dataset-mb` (default 4096), estimated from its index files, delta and
+vocabulary. A commit that would grow it past that fails the same way, but deletes always
+pass. A persistent dataset can also have a storage quota of its own (see
+[Storage quotas](#storage-quotas)).
+
+**Files.** `sparkles load` reads the same codecs, chosen with
+`--compression auto|none|gzip|xz|bzip2|zstd|brotli|lz4`. `auto` goes by magic bytes, then by the
+extension. Brotli has no magic bytes, so it needs `.br` or `--compression brotli`. When a
+file's name and its data disagree, the data wins and a warning is logged. An explicit
+`--compression` that disagrees is an error.
+
+Every supported RDF syntax can be parsed incrementally from a reader. With
+`--parse-mode auto`, plain N-Triples, N-Quads and Turtle are still parsed in parallel
+from a memory-mapped file, and compressed line formats in bounded parallel blocks.
+Other compressed documents are read whole into memory and parsed there when their
+actual decompressed size is below 128 MiB for Turtle and TriG, or 8 MiB for other
+syntaxes. At or above that size, they are parsed from a reader. Plain files that
+cannot be split use the same cutoffs. A reader parses from a 128 KiB buffer and keeps
+the syntax parser's token limits. `--auto-buffer-bytes BYTES` changes the cutoff for
+each source, as do `Source.auto_buffer_bytes` in Rust and `auto_buffer_bytes` in
+Python. Zero skips the size check. The cutoff applies to each load, so concurrent loads
+can each use that much memory. Lower it or choose streaming when several loads share a
+memory budget. Plain bytes that the caller already holds in memory are parsed without a
+copy. In automatic mode, small transactional loads and Python file objects are parsed
+from a reader. `--parse-mode streaming` always uses a sequential reader, and
+`--parse-mode buffered` always reads the whole document into memory first. A buffered
+compressed input needs RAM for its full decompressed size. These modes only affect
+parsing. Transactional changes, the vocabulary, the map of blank-node labels and
+index-building batches take memory of their own. `Source.max_decompressed` limits the
+input bytes of plain files as well as decompressed ones.
+
+Ordinary JSON-LD allows keys in any order, so its reader may hold a large object in
+memory while it waits for a context that comes late. For ordered streaming JSON-LD,
+use `load --jsonld-streaming`, `convert --syntax jsonld-streaming`, or the RDF content
+type `application/ld+json; profile="http://www.w3.org/ns/json-ld#streaming"`. This
+profile checks the key order and is never applied silently to ordinary JSON-LD. See the
+[W3C streaming JSON-LD note](https://www.w3.org/TR/json-ld11-streaming/). Single
+literals, contexts and the map of blank-node labels can still be large. RDF/JSON input
+yields statements as it reads them instead of building the whole subject and predicate
+tree. The format requires unique keys, but the lenient decoder accepts a repeated
+subject or predicate key and keeps the statements from every occurrence.
+
+XZ files are decoded incrementally, and the decoder uses at most 256 MiB of memory,
+separately from the input-byte ceiling. Bzip2 files are also decoded incrementally.
+Both accept several concatenated streams in one file. They are codecs for files and
+payloads, not additional HTTP `Content-Encoding` values. A large Graph Store body that
+is translated to another syntax spills to disk once its translated output is large
+enough.
+
+`sparkles load --lenient` skips the validation of IRIs and language tags. It is meant for
+data whose IRIs are not all valid RFC 3987 IRIs; DBpedia, for example, has some that
+contain U+FFFD. Syntax errors still fail the load.
+
+`sparkles dump --out FILE` and `sparkles backup` take `--compress CODEC`, `--level N` and
+`--threads N` (zstd). `sparkles backup` and `/$/backup` write zstd (level 3) by default,
+which is about five times faster than gzip for a slightly larger file. `--compress gzip`
+(`?compression=gzip`) gives `.nq.gz`, as Fuseki writes. `sparkles dump --out FILE` goes by
+the file's extension, and writes uncompressed without one. The extension before the
+compression one, as in `dump.ttl.zst`, picks the syntax unless `--format` names it.
+
+**Full-text documents** keep their terms in columns of the index, so the Tantivy doc
+store holds no fields and its codec does not change the index size. The doc store uses
+zstd (level 3) by default, and the text configuration accepts `"docstoreCompression":
+"lz4"` or `"none"`. Changing it rebuilds the index.
 
 ## Commits
 
@@ -7223,7 +7572,7 @@ beyond the schema, where a materialization derives 10.9 million.
 * With [RDFS on read](#rdfs-on-read) set, `reasoning=demand` applies instead and EXPLAIN
   says so.
 * `reasoning=auto`, the cost-based choice between the inferred graph and derivation,
-  answers `400` until F17 Phase 2.
+  answers `400`. F17 Phase 2 specifies it, and it is not built.
 * A DESCRIBE with `reasoning=demand` fails with `501` and the code `unsupported`, since
   the description reads facts that no pattern asks for. CONSTRUCT with the description's
   patterns gives the derived facts.
@@ -7765,7 +8114,7 @@ The Rust library gives the same answers through `ds.forms().model`, `check` and 
 Python binds them as `ds.forms.model(focus, class_=…, settings=…, at=…)`,
 `ds.forms.check(change, settings=…)` and `ds.forms.save(change, settings=…)`, which
 return dicts with the members above. A conflicting save raises `ConflictError` with the
-code `form-conflict` and the fields in `fields`. The Node.js and JVM bindings are planned.
+code `form-conflict` and the fields in `fields`. The Node.js and JVM bindings do not expose forms.
 
 `save` compares `expect` with the stored values of the changed fields while it holds the
 writer lock. When one differs, it answers `409` with code `form-conflict` and the current
@@ -7818,7 +8167,7 @@ kept in `<db>/forms.json`. Its fields are these.
 | `saveTo` | `auto` | Where saves of a form on `main` go, which is `auto`, `main` or `branch`. |
 | `branchTemplate` | `edits.{user}.{date}` | The name of the session branch. It must hold `{user}`. |
 | `targetGraph` | `type` | The graph new values go to. `type` is the graph of the focus node's `rdf:type` triple, `default` the default graph, and an IRI that graph. |
-| `newIri` | `urn:uuid` | How new instances get IRIs, either `urn:uuid` or a template that holds `{uuid}`. Phase 2 of the forms uses it. |
+| `newIri` | `urn:uuid` | How new instances get IRIs, either `urn:uuid` or a template that holds `{uuid}`. The first save of a form for a new instance mints its IRI this way. |
 
 ```sh
 curl -X PATCH 'localhost:3030/$/settings/people/forms' \
@@ -8170,327 +8519,6 @@ body that is not JSON. The endpoint follows `--format-endpoint`, `--format-max-m
 same cases, and it shares the formatter's slots. With authentication, it needs no dataset permission, and rate limits
 count it in the `query` class.
 
-## `application/x-sparkles+json` (UI result format)
-
-This result format is modelled on QLever's `qlever-json`. The UI uses it to render results
-and draw query plans:
-
-```ts
-type SparklesResult = {
-  queryType: "SELECT" | "ASK" | "CONSTRUCT" | "DESCRIBE";
-  vars?: string[];                        // SELECT
-  rows?: (Term | null)[][];               // SELECT; null = unbound
-  boolean?: boolean;                      // ASK
-  triples?: [Term, Term, Term][];         // CONSTRUCT / DESCRIBE
-  quads?: [Term, Term, Term, Term | null][]; // streaming graph results; null default graph
-  meta: {
-    totalRows: number | null; sentRows: number;
-    status?: "complete" | "stopped";        // streaming only; totalRows null when stopped
-    timing: { parseMs: number; planMs: number; execMs: number; serializeMs: number; totalMs: number };
-    plan: PlanNode | CursorPlan;           // eager or streaming operator tree
-    memory: { peakBytes: number };         // peak estimated memory of intermediate results
-    rowsProduced: number;                  // rows produced by all operators, summed
-  };
-};
-type Term =
-  | { type: "uri"; value: string }
-  | { type: "bnode"; value: string }
-  | { type: "literal"; value: string; datatype?: string; "xml:lang"?: string }
-  | { type: "triple"; value: { subject: Term; predicate: Term; object: Term } };
-type PlanNode = {
-  planFormat?: 2;            // root only: a plan deeper than 256 levels, whose nodes have no id
-  id?: string;               // the path of child indexes from the root, such as "0.1.2"
-  operator: string;          // "IndexScan", "Join", "Sort", "Filter", ...
-  description: string;       // human readable, e.g. "PSO ?s <p> ?o"
-  columns: string[];         // variables produced
-  sortedOn: string[];
-  estimatedRows: number; estimatedCost: number;
-  actualRows: number; timeMs: number;       // wall time incl. children
-  cached: boolean;
-  children: PlanNode[];
-  counters?: Record<string, number | string | boolean>;  // spatial operators: candidates, rechecked,
-                             // refined, matched, treeNodesVisited, index ("ready", "building (37%)",
-                             // "feature-links", …), fallback (see GeoSPARQL); expressions evaluated
-                             // once per distinct value: exprCacheHits (rows that reused a result),
-                             // exprCacheMisses (evaluations), exprCacheSkipped (ran row by row)
-  warnings?: { code: string; message: string }[];       // root only: notes about the plan
-};
-```
-
-A native streaming response puts `rows` before `meta`. It includes the final counts and
-capabilities only when the query has produced every row successfully. When the query or
-the serialization fails, the response carries no success metadata. `commit` and
-`datasetId` identify the snapshot the query read, as they do on eager HTTP responses. A
-graph query's response has an empty `triples` array and puts every result in `quads`,
-with a null graph for statements in the default graph. A streaming plan has this shape:
-
-```ts
-type CursorPlan = {
-  operator: PlanNode;
-  materializes: boolean; fullInputBeforeOutput: boolean; growingState: boolean;
-  complete: boolean; reason: string | null;
-  children: CursorPlan[];
-};
-```
-
-`complete` says whether an operator's counts cover its entire execution. The counts on a
-stopped cursor are partial. `materializes` marks a subtree that fell back to eager
-execution. A native ORDER BY reads its whole input into budgeted memory before its
-first row. It reports `fullInputBeforeOutput` and a `reason`, but `materializes` stays
-false, so the strict policy that refuses eager fallback still accepts the sort.
-`growingState` warns that an operator keeps state that grows as it runs, such as
-generated strings. The batch size alone does not limit that state.
-
-### The I/O profile
-
-With `profile=io`, the metadata of a native result has an `io` object. It reports what the
-query read from the index and vocabulary files, which helps explain the time of a first
-query after a restart. The counters cover the whole process, so the profile needs the
-`metrics` permission, as `/$/metrics` does. A caller without it gets a `403`, and a value
-of `profile` other than `io` gets a `400`. A streaming response keeps the profile running
-until its body ends.
-
-```ts
-type IoProfile = {
-  index: Record<string, {                  // by permutation: spo, sop, pso, pos, osp, ops, gspo
-    columnsDecoded: number; decodedBytes: number; compressedBytes: number }>;
-  readahead: Record<string, {              // by file: the permutations, vocab.dat, vocab.off, vocab.num
-    requests: number; bytes: number }>;    // WILLNEED requests to the kernel
-  vocab: { finds: number; groupsHinted: number; blocksScanned: number };
-  numericPagesRequested: number;
-  timeMs?: { vocabLookup: number; vocabRead: number; indexDecode: number; indexWait: number };
-  majorFaults?: number; minorFaults?: number;
-  pages?: Record<string, { touched: number; residentBefore: number;
-                           residentAfter: number; broughtIn: number }>;
-  pagesTruncated?: boolean;
-  events?: { atUs: number; file: string; what: string; bytes: number }[];
-};
-```
-
-The counters are process-wide, so they include the reads of any query that runs at the
-same time. The profile is meant for one query on a quiet server. `vocab.finds` and
-`vocab.blocksScanned` are counted only while a profile runs, because a scan of the
-vocabulary adds to them millions of times from many threads. `vocabLookup` is the time
-in key lookups, which resolve the constants of the query. `vocabRead` is the time reading
-terms by id. `indexDecode` is the time decompressing index columns, and `indexWait` is the
-time to read their pages into memory before decoding. In a segmented index (format 3), a
-read of a few rows decodes single segments of a column, and each counts as one entry of
-`columnsDecoded`, with its own rows in `decodedBytes`. The times are summed over threads.
-`pages` comes from `mincore(2)` on the pages the query asked for or read, and `events`
-lists the first 512 requests in order. Overlapping profiles share one epoch inventory
-of at most 65,536 distinct file, mapping and page entries. It retains the first admitted
-pages and bounds report scratch storage by that sample. `pagesTruncated` is true when
-an inventory or range cap omitted pages. It is false when no cap omission was recorded,
-which does not guarantee complete coverage. Process counter snapshots omit the flag.
-
-All `pages` fields describe the retained best-effort sample. `touched`, `residentBefore`
-and `residentAfter` are additive lower bounds on those counts for the full observed set.
-`broughtIn` is `max(residentAfter - residentBefore, 0)` for the sample. It is neither a
-lower bound on the full-set delta nor a physical-I/O count, especially when pages are
-evicted. Platforms without mapped page observations report a false truncation flag and
-no page entries. The bounded shared inventory and event log add memory while profiles
-are active, outside any one query's grant. Their allocation size depends on the allocator.
-Profiling adds observation work, whose corrected-source cost remains to be measured.
-Numeric profiles record mapped value loads in both single and bulk lookup paths. Kinds
-and rank entries are observed before access only when read from the mapping, rather
-than a resident copy. These observations work with hints disabled or already issued.
-`numericPagesRequested` keeps counting numeric advice pages and does not count actual
-loads. Observation adds no advice and does not reset the mapping's once-only hint bits.
-
-The same counters are in `/$/metrics` as `sparkles_index_columns_decoded_total`,
-`sparkles_index_readahead_bytes_total` and `sparkles_vocab_groups_read_total`.
-
-## Explain
-
-`GET|POST /{ds}/explain?query=…` returns `{ "algebra": string /* SSE */, "plan": PlanNode }`.
-The plan is not executed, so `actualRows` is -1. The root `PlanNode` lists `warnings` when
-something in the query did not run the way it reads, although the answer is the same:
-
-* `geo-not-pushed`: a spatial FILTER is evaluated row by row. The warning says why.
-* `geo-index-building`: the spatial index is being built, and plans run without it.
-* `geo-not-built`: the query uses `geof:` functions in a build without the `geo` feature.
-
-The plan of an executed query, which the `application/x-sparkles+json` result includes,
-also lists the warnings that came up while it ran:
-
-* `geo-crs-approximate`: a geometry in a CRS whose datum shift is approximate. See
-  [Accuracy of datum shifts](#accuracy-of-datum-shifts).
-* `geo-crs-unsupported`: a geometry in an EPSG CRS that the build refused, with the
-  reason.
-
-Every node of a returned plan has an `id`, the path of child indexes from the root, such
-as `0.1.2`. A `CursorPlan` node and its operator share the id. Ids are valid only for
-the plan of the same response. A plan deeper than 256 levels is written in plan format 2
-instead, whose root has `"planFormat": 2` and whose nodes have no `id`, because ids that
-are paths would make the JSON grow with the square of the depth. A client that needs the
-ids of such a plan derives them from its shape. A plan without `planFormat` is in format
-1, and a reader refuses a format it does not know. The OpenAPI description lists
-`planFormat` on `PlanNode` and `CursorPlan`, and the plan view of the UI shows plans in
-formats 1 and 2 and says that it cannot show a plan in any other. The estimated plan of
-`/{ds}/explain` and the plan of an executed query have the same shape, so an `ASK` has
-its `Slice` root and a `CONSTRUCT` or `DESCRIBE` has a `CONSTRUCT` or `DESCRIBE` root in
-both. A node can also carry these members.
-
-| Member | Meaning |
-|---|---|
-| `skipped` | Why the node did not run, such as "the left side produced no rows". Its rows are `-1` and its time is 0. |
-| `stoppedEarly` | A `LIMIT`, `ASK` or `EXISTS` stopped the node once it had enough rows. |
-| `runs` | How often the node ran when a `LIMIT` made the executor grow its input in rounds. Its time spans every round, and its children add up their rounds too. |
-| `cached` | The node's result came from the result cache. Its children are the subtree the result was computed from, each `skipped`. |
-| `pushedFilters` | The filters a range scan or an index join applies itself. |
-| `estimateGuessed` | The estimate is a constant guess, as for `SERVICE`. |
-| `complete` | `false` on the nodes whose counts a failure cut short. |
-| `patterns` | The triple patterns and paths of the query that the node reads, in query order, as `PlanPattern` objects. Scans, index joins, star joins, paths and counts from the index carry it. |
-| `filterVars` | On a filter, the query variables its expression reads. |
-| `joinVars` | On a join, the query variables it joins on. |
-
-A `PlanPattern` has `s`, `p` and `o`, each an N-Triples term or a variable of the query
-written as `?name`. A blank node and a variable that the planner made, such as the middle
-of a path, are written as `?_`. A path is written in `p` with full IRIs in angle brackets
-and no spaces, such as `<http://example.org/partOf>+` or
-`(<http://example.org/a>|^<http://example.org/b>)*`. A pattern inside `GRAPH` also has
-`graph`, the graph term, and every pattern has `occurrence`, its index among equal
-patterns of the query, counted from 0 in query order. These members carry only terms that
-the query itself contains, so a caller whose view C12 limits learns nothing new from
-them. The UI uses them to draw the plan on the query's pattern graph. The parser writes a
-sequence such as `ex:a/ex:b` as its steps joined by a blank node, so each step is a
-pattern of its own with `?_` between them. It writes an outer inverse such as `^ex:a` or
-`^ex:a+` as the path inside it with the subject and object swapped. Any other path that the planner splits into operators, such as
-an alternative, lists the whole path on each of them.
-
-A query that a budget or its timeout stopped answers with its error as before. In the
-`application/x-sparkles+json` format the error body also carries `plan`, the plan as it
-stood when the query stopped, and `commit`. The nodes that were still running have
-`complete: false`, and their counts are those reached so far. The UI's **Explain why**
-sends that plan to `/{ds}/sparql/explain`.
-
-## Compression
-
-The design and its rationale are in [X01 Compression codecs](specs/X01-compression-codecs.md).
-
-**Responses** are compressed when the client sends `Accept-Encoding` with `zstd`, `br`,
-`gzip` or `deflate`. This includes streamed bodies. Bodies under 256 bytes and images are
-sent uncompressed. The UI's larger assets are built with brotli and gzip copies. Those
-copies are served as they are, with `Vary: Accept-Encoding`, rather than compressed per
-request.
-
-| `sparkles serve` flag | Default | |
-|---|---|---|
-| `--http-compression auto\|off` | `auto` | |
-| `--http-compression-level fastest\|default\|best\|N` | `default` | zstd 3, brotli 4, gzip 6. A number applies to whichever algorithm is chosen. |
-| `--http-compression-algorithms` | `zstd,br,gzip,deflate` | The encodings offered. |
-| `--max-decompressed-mb` | `65536` | Cap on compressed request bodies after decompression and on RDF source bytes, including plain RDF. `0` means none. |
-| `--max-query-body-mb` | `16` | Largest body of a SPARQL query, `/{ds}/explain`, `/{ds}/shacl` or `/{ds}/shex` request. `0` means none. |
-| `--max-update-body-mb` | `256` | Largest body of a SPARQL update. `0` means none. |
-| `--max-admin-body-mb` | `16` | Largest body of an admin request (`/$/…`) or a `/{ds}/prefixes` change. `0` means none. |
-| `--max-upload-mb` | `4096` | Largest Graph Store write or upload body, after HTTP decompression. `0` means none. |
-| `--min-free-disk-mb` | `1024` | Free space that must remain in the temporary directory after a spooled request body, and on the data directory's file system after a commit, rebuild, clone or N-Quads backup. `0` turns the check off. |
-| `--max-mem-dataset-mb` | `4096` | Largest in-memory (`dbType=mem`) dataset. A commit that would grow one past it fails with `507`. `0` means none. |
-
-**Request bodies** of updates, queries, Graph Store PUT/POST and uploads may be sent with
-`Content-Encoding: gzip`, `br`, `zstd` or `deflate`. Another encoding gets `415` with an
-`Accept-Encoding` header naming the supported ones. RDF bodies and uploaded files are also
-recognised as compressed by their first bytes (gzip, xz, bzip2, zstd, LZ4 frames).
-Uploads are also recognised by file name (`.gz`, `.xz`, `.bz2`, `.zst`, `.br`, `.lz4`).
-A body that decompresses past `--max-decompressed-mb` fails with `413` and commits
-nothing.
-
-**Body ceilings.** A body that is read whole has the ceiling of its request class:
-
-* `--max-query-body-mb` for queries, `/{ds}/explain`, the shapes graph of `/{ds}/shacl`
-  and the schema of `/{ds}/shex`
-* `--max-update-body-mb` for updates
-* `--max-admin-body-mb` for `/$/…` requests and prefix changes
-* a fixed 64 KiB for `/$/auth/*`
-
-The ceiling counts decompressed bytes and is checked while the body is read, so the server
-never holds more than the ceiling. A declared `Content-Length` over it is refused before
-anything is read. Past the ceiling, the request fails with `413`. A form POST to `/{ds}`
-may hold either operation, so it is read up to the larger of the query and update
-ceilings.
-
-Graph Store PUT/POST, including through `/{ds}`, and `/{ds}/upload` are the bulk
-endpoints. Their bodies stream to a temporary file instead, up to `--max-upload-mb`, or
-the request fails with `413`. That limit counts bytes after HTTP decompression. Its
-default of 4096 (4 GiB) is the body limit of the bundled NixOS nginx virtual host, and `0`
-means unlimited. `--max-decompressed-mb` caps the RDF sources separately as they are
-parsed, both files compressed inside the body and plain RDF. A body in RDF Thrift, RDF
-Protobuf, RDF/JSON or TriX is translated to N-Quads, and the translation counts against
-that cap as it is written. Before each 64 MiB of a spooled body is written to the
-temporary directory, the server checks that the file system keeps `--min-free-disk-mb`
-free (default 1024, `0` for no check). Otherwise the request fails with `507`.
-
-**Storage.** A commit to a persistent dataset is refused with `507 {code: "storage-full"}`
-when it would leave less than `--min-free-disk-mb` free on the data directory's file
-system. Free space is measured with `statvfs` and cached for a second between small
-commits. A rebuild (a large load or compaction) or a clone checks the free space while it
-builds. Once the file system goes below the limit, it stops and removes what it wrote.
-Nothing is committed in either case. An in-memory dataset (`dbType=mem`) holds at most
-`--max-mem-dataset-mb` (default 4096), estimated from its index files, delta and
-vocabulary. A commit that would grow it past that fails the same way, but deletes always
-pass. A persistent dataset can also have a storage quota of its own (see
-[Storage quotas](#storage-quotas)).
-
-**Files.** `sparkles load` reads the same codecs, chosen with
-`--compression auto|none|gzip|xz|bzip2|zstd|brotli|lz4`. `auto` goes by magic bytes, then by the
-extension. Brotli has no magic bytes, so it needs `.br` or `--compression brotli`. When a
-file's name and its data disagree, the data wins and a warning is logged. An explicit
-`--compression` that disagrees is an error.
-
-Every supported RDF syntax can be parsed incrementally from a reader. With
-`--parse-mode auto`, plain N-Triples, N-Quads and Turtle are still parsed in parallel
-from a memory-mapped file, and compressed line formats in bounded parallel blocks.
-Other compressed documents are read whole into memory and parsed there when their
-actual decompressed size is below 128 MiB for Turtle and TriG, or 8 MiB for other
-syntaxes. At or above that size, they are parsed from a reader. Plain files that
-cannot be split use the same cutoffs. A reader parses from a 128 KiB buffer and keeps
-the syntax parser's token limits. `--auto-buffer-bytes BYTES` changes the cutoff for
-each source, as do `Source.auto_buffer_bytes` in Rust and `auto_buffer_bytes` in
-Python. Zero skips the size check. The cutoff applies to each load, so concurrent loads
-can each use that much memory. Lower it or choose streaming when several loads share a
-memory budget. Plain bytes that the caller already holds in memory are parsed without a
-copy. In automatic mode, small transactional loads and Python file objects are parsed
-from a reader. `--parse-mode streaming` always uses a sequential reader, and
-`--parse-mode buffered` always reads the whole document into memory first. A buffered
-compressed input needs RAM for its full decompressed size. These modes only affect
-parsing. Transactional changes, the vocabulary, the map of blank-node labels and
-index-building batches take memory of their own. `Source.max_decompressed` limits the
-input bytes of plain files as well as decompressed ones.
-
-Ordinary JSON-LD allows keys in any order, so its reader may hold a large object in
-memory while it waits for a context that comes late. For ordered streaming JSON-LD,
-use `load --jsonld-streaming`, `convert --syntax jsonld-streaming`, or the RDF content
-type `application/ld+json; profile="http://www.w3.org/ns/json-ld#streaming"`. This
-profile checks the key order and is never applied silently to ordinary JSON-LD. See the
-[W3C streaming JSON-LD note](https://www.w3.org/TR/json-ld11-streaming/). Single
-literals, contexts and the map of blank-node labels can still be large. RDF/JSON input
-yields statements as it reads them instead of building the whole subject and predicate
-tree. The format requires unique keys, but the lenient decoder accepts a repeated
-subject or predicate key and keeps the statements from every occurrence.
-
-XZ files are decoded incrementally, and the decoder uses at most 256 MiB of memory,
-separately from the input-byte ceiling. Bzip2 files are also decoded incrementally.
-Both accept several concatenated streams in one file. They are codecs for files and
-payloads, not additional HTTP `Content-Encoding` values. A large Graph Store body that
-is translated to another syntax spills to disk once its translated output is large
-enough.
-
-`sparkles load --lenient` skips the validation of IRIs and language tags. It is meant for
-data whose IRIs are not all valid RFC 3987 IRIs; DBpedia, for example, has some that
-contain U+FFFD. Syntax errors still fail the load.
-
-`sparkles dump --out FILE` and `sparkles backup` take `--compress CODEC`, `--level N` and
-`--threads N` (zstd). `sparkles backup` and `/$/backup` write zstd (level 3) by default,
-which is about five times faster than gzip for a slightly larger file. `--compress gzip`
-(`?compression=gzip`) gives `.nq.gz`, as Fuseki writes. `sparkles dump --out FILE` goes by
-the file's extension, and writes uncompressed without one. The extension before the
-compression one, as in `dump.ttl.zst`, picks the syntax unless `--format` names it.
-
-**Full-text documents** keep their terms in columns of the index since index format 2, so
-the Tantivy doc store holds no fields and its codec no longer changes the index size. The
-doc store still uses zstd (level 3) by default, and `"docstoreCompression": "lz4"` or
-`"none"` in the text configuration is still accepted. Changing it rebuilds the index.
-
 ## Errors
 
 Non-2xx responses carry `{ "error": string, "detail"?: string, "line"?: number, "column"?: number, "requestId": string }`.
@@ -8587,8 +8615,8 @@ explains a plain chain of 1998 triple patterns in about 0.35 s. The other shapes
 measured take from 34 ms to 0.8 s. The slowest are an OPTIONAL after each of 799
 patterns, in about 0.5 s, and a star or a hub of 1998 patterns, in about 0.75 s over a
 dataset of four triples. The cost of a star depends on the data too. A star of 1998
-patterns on one frequent predicate took about 2.7 s to explain over a dataset of 31,815
-triples, against about 3 s before item 84. Running a query at the limit takes about 1 s on
+patterns on one frequent predicate takes about 2.7 s to explain over a dataset of 31,815
+triples. Running a query at the limit takes about 1 s on
 the small dataset. Planning and the description of the plan observe the request's
 timeout and cancellation, so every shape stops close to its timeout. The JSON plan of a
 query at the limit, as `/{ds}/explain` and the Sparkles result format write it, is up to
@@ -8743,7 +8771,7 @@ short.
 
 The design is in [X08 Disk spill and server-wide memory](specs/X08-disk-spill-and-server-memory.md).
 Spill lets a streamed query finish within its memory budget by writing to disk what does
-not fit. It is off by default until all Phase 2b acceptance gates pass.
+not fit. It is off by default.
 `sparkles serve --spill on` enables it, and `--spill encrypted` also encrypts every
 spill file. These operators spill when it is enabled.
 
