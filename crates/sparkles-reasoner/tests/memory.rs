@@ -669,3 +669,48 @@ fn f16_keeping_after_commit_stays_within_limit() {
         "the largest limit does not keep the closure"
     );
 }
+
+/// A rule whose first atom has few shares and many candidates is split at its second
+/// atom over tens of thousands of bindings. The vector that gathers them and the batches
+/// that take them over are charged, so the run allocates little beyond its charged peak.
+#[test]
+fn split_bindings_are_charged() {
+    let _one = one_at_a_time();
+    // the store's blocks the run decodes, the threads' evaluation state and the report
+    const SLACK: usize = 512 << 10;
+    let rules = Profile::Rules(
+        "@prefix ex: <http://ex.org/> .
+         [join: (?x ex:p ?y) (?y ex:q ex:z) -> (?x ex:r ex:z)]"
+            .into(),
+    );
+    let s = Store::in_memory(StoreOptions::default());
+    let mut ttl = String::new();
+    for i in 0..40_000 {
+        ttl.push_str(&format!("ex:a{i} ex:p ex:b{i} .\n"));
+    }
+    for i in 0..50_000 {
+        ttl.push_str(&format!("ex:c{i} ex:q ex:z .\n"));
+    }
+    load(&s, &ttl);
+    s.flush_change_log().unwrap();
+    // on 4 threads the ten shares of the first atom are fewer than the 16 a run splits
+    // into, and few blocks are decoded at once. Before the vectors were charged the run
+    // allocated 1.4 MB more than it charged, and now it allocates less than it charges.
+    let opts = ReasonOptions {
+        threads: Some(4),
+        ..Default::default()
+    };
+    let snap = s.snapshot();
+    let _ = infer(snap.clone(), &rules, &opts).unwrap();
+    let before = NOW.load(Ordering::SeqCst);
+    PEAK.store(before, Ordering::SeqCst);
+    let (ts, r) = infer(snap, &rules, &opts).unwrap();
+    let over = PEAK.load(Ordering::SeqCst) - before;
+    assert!(ts.is_empty());
+    let charged = r.peak_bytes as usize;
+    eprintln!("the run allocated {over} bytes beyond what it started with, charged {charged}");
+    assert!(
+        over <= charged + SLACK,
+        "the run allocated {over} bytes and charged {charged}"
+    );
+}

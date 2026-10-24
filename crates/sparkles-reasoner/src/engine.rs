@@ -1288,23 +1288,41 @@ fn split_at<'g>(
             Ok((collected.len() < MAX_SPLIT_BINDINGS).then_some((collected, held)))
         })
         .collect();
-    let mut bindings = Vec::new();
     let mut held = Held::new(&limits.budget);
+    let mut collected = Vec::with_capacity(parts.len());
     for p in parts {
         match p? {
             Some((v, h)) => {
-                bindings.extend(v);
+                collected.push(v);
                 held.absorb(h);
             }
             None => return Ok(None),
         }
-        if bindings.len() >= MAX_SPLIT_BINDINGS {
-            return Ok(None);
-        }
     }
-    let per_item = bindings.len().div_ceil(items_wanted.max(1)).max(MIN_BATCH);
+    let total: usize = collected.iter().map(Vec::len).sum();
+    if total >= MAX_SPLIT_BINDINGS {
+        return Ok(None);
+    }
+    // the slots of all bindings in one vector, alive until the loop below ends, while
+    // the batches take the bindings over
+    let slot = size_of::<Vec<u64>>();
+    held.try_grow(total * slot)?;
+    let mut bindings = Vec::with_capacity(total);
+    for v in collected {
+        bindings.extend(v);
+    }
+    let per_item = total.div_ceil(items_wanted.max(1)).max(MIN_BATCH);
     let mut items = Vec::new();
     let mut batch: Vec<Vec<u64>> = Vec::new();
+    // a batch holds at most `per_item` bindings, and its slots are charged when it starts
+    let push = |batch: &mut Vec<Vec<u64>>, held: &mut Held, b: Vec<u64>| {
+        if batch.capacity() == 0 {
+            held.try_grow(per_item * slot)?;
+            batch.reserve_exact(per_item);
+        }
+        batch.push(b);
+        Ok::<(), MemoryExceeded>(())
+    };
     let flush = |batch: &mut Vec<Vec<u64>>, items: &mut Vec<Item<'g>>, held: &mut Held| {
         if batch.is_empty() {
             return Ok::<(), MemoryExceeded>(());
@@ -1321,7 +1339,7 @@ fn split_at<'g>(
     };
     for b in bindings {
         if !many_at(g, r, steps, d, &b) {
-            batch.push(b);
+            push(&mut batch, &mut held, b)?;
             if batch.len() >= per_item {
                 flush(&mut batch, &mut items, &mut held)?;
             }
@@ -1340,6 +1358,8 @@ fn split_at<'g>(
         }
     }
     flush(&mut batch, &mut items, &mut held)?;
+    // the vector of all bindings has gone
+    held.shrink(total * slot);
     Ok(Some((items, held)))
 }
 
