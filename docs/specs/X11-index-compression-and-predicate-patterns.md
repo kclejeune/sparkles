@@ -661,9 +661,31 @@ Roadmap item 108 follows up on two of these results. It looks for a faster FSST 
 
 §4.5 records that no IRI prefix covers even 1% of the DBpedia
 slice's IRIs, so `auto` would encode nothing there and §4.4's gate of 10% on DBpedia
-cannot pass. The 10.5M data would encode almost every IRI. Built as an option, the phase
-would serve datasets like Wikidata and the synthetic data, at the cost of a new id tag,
-string order across encoded and plain IRIs, and prefix filters.
+cannot pass. Built as an option, the phase would serve datasets whose IRIs are mostly a
+few prefixes followed by numbers, at the cost of a new id tag, string order across
+encoded and plain IRIs, and prefix filters.
+
+Roadmap item 108 measured what `auto` would save on four datasets where a few prefixes
+dominate. `scripts/x11-iri-encoding.py` read each front-coded generation's keys, chose the prefixes as §4.2
+does, and front-coded the keys it would not encode again with the writer's rules. Run on
+the keys unchanged, the same script reproduced each `vocab.dat` to the byte.
+
+| Dataset | Triples | Prefixes taken | IRIs encoded | `vocab.dat` before | After |
+|---|---:|---:|---:|---:|---:|
+| Synthetic, 1M people | 10.5M | 3 | 100% | 25.9 MB | 18.4 MB, 28.9% smaller |
+| WatDiv, scale 100 | 10.9M | 5 | 98.7% | 41.6 MB | 38.5 MB, 7.4% smaller |
+| Wikidata truthy, first 20M lines | 20.0M | 7 | 63.5% | 104.9 MB | 99.8 MB, 4.9% smaller |
+| Wikidata lexemes, first 20M lines | 20.0M | 2 | 8.6% | 68.0 MB | 66.5 MB, 2.1% smaller |
+| DBpedia 50M slice | 41.1M | 0 | 0% | 485.1 MB | unchanged |
+
+Only the synthetic data would pass the gate of 10%. On WatDiv and Wikidata almost every
+entity IRI is encodable, but literals hold most of the vocabulary's bytes. In the
+Wikidata truthy slice IRIs are 15% of the 8.2 million keys, since labels and
+descriptions come in many languages, and the IRIs that front coding already stores as a
+few digits after a shared prefix save little more when encoded. Lexemes name their forms
+and senses `L123-F1` and `L123-S2`, so their prefixes up to the last non-digit are one
+per lexeme and none but the two entity prefixes reaches 1%. Phase 2b therefore stays
+unbuilt.
 
 #### Phase 3, column codecs
 
