@@ -422,6 +422,127 @@ fn one_search_per_named_graph() {
     assert_eq!(lens, ["1", "2"]);
 }
 
+/// Weights of very different sizes: a search from both ends adds a path's weights in two
+/// orders, and in plain floating point the four unit weights of `s a b c t` vanish into
+/// 1e16 when they are added to it one at a time. The costs are kept with twice the
+/// precision, so the cheaper path `s q t` is still found (ROADMAP item 150).
+#[test]
+fn weights_of_mixed_magnitudes_from_both_ends() {
+    let s = store_of(
+        "ex:s ex:p ex:a {| ex:w 1 |} . ex:a ex:p ex:b {| ex:w 1 |} .
+         ex:b ex:p ex:c {| ex:w 1 |} . ex:c ex:p ex:t {| ex:w 1e16 |} .
+         ex:s ex:p ex:q {| ex:w 1e16 |} . ex:q ex:p ex:t {| ex:w 2 |} .
+         ex:s ex:p ex:x {| ex:w 1e16 |} . ex:s ex:p ex:y {| ex:w 1e16 |} .",
+    );
+    for dir in ["path:forward", "path:both"] {
+        let r = rows(
+            &s,
+            &format!(
+                "SELECT ?path ?i ?s ?o ?c WHERE {{ SERVICE path:search {{ [] path:source ex:s ; \
+                 path:target ex:t ; path:predicate ex:p ; path:direction {dir} ; path:weight ex:w ; \
+                 path:cost ?c ; path:pathIndex ?path ; path:edgeIndex ?i ; path:edgeSubject ?s ; \
+                 path:edgeObject ?o }} }}"
+            ),
+        );
+        let paths = node_paths(&r);
+        assert_eq!(paths.len(), 1, "{dir}");
+        assert_eq!(paths.values().next().unwrap().join(" "), "s q t", "{dir}");
+        assert_eq!(r[0]["c"].parse::<f64>().unwrap(), 1e16 + 2.0, "{dir}");
+    }
+}
+
+/// Yen's candidates of mixed magnitudes: `s b t` costs M+9, while `s c a t` and `s c b a t`
+/// cost M+8. The spurs from `c` and `b` round differently when a candidate's cost is the
+/// root's plus the spur's in plain floating point, so candidates are ranked by their whole
+/// cost in double-double (ROADMAP item 150).
+#[test]
+fn yen_candidates_of_mixed_magnitudes_rank_by_their_exact_cost() {
+    let s = store_of(
+        "ex:s ex:p ex:a {| ex:w 5 |} . ex:a ex:p ex:t {| ex:w 2 |} .
+         ex:s ex:p ex:b {| ex:w 10000000000000004 |} . ex:b ex:p ex:a {| ex:w 1 |} .
+         ex:b ex:p ex:t {| ex:w 5 |} .
+         ex:s ex:p ex:c {| ex:w 10000000000000004 |} . ex:c ex:p ex:b {| ex:w 1 |} .
+         ex:c ex:p ex:a {| ex:w 2 |} .",
+    );
+    let r = rows(
+        &s,
+        "SELECT ?path ?i ?s ?o WHERE { SERVICE path:search { [] path:source ex:s ; \
+         path:target ex:t ; path:predicate ex:p ; path:algorithm path:kShortest ; path:k 3 ; \
+         path:weight ex:w ; path:pathIndex ?path ; path:edgeIndex ?i ; path:edgeSubject ?s ; \
+         path:edgeObject ?o } }",
+    );
+    let paths: Vec<String> = node_paths(&r).values().map(|p| p.join(" ")).collect();
+    assert_eq!(paths.len(), 3, "{paths:?}");
+    assert_eq!(paths[0], "s a t", "{paths:?}");
+    assert_eq!(paths[1], "s b a t", "{paths:?}");
+    assert!(
+        paths[2] == "s c a t" || paths[2] == "s c b a t",
+        "{paths:?}"
+    );
+}
+
+/// Costs at the top of the floating-point range: a sum whose rounded part reaches past the
+/// largest double while its rounding error brings it back under is still finite, so the
+/// route through `y` beats the one through `x`, whose cost is about twice the largest double.
+#[test]
+fn weights_near_the_largest_double_from_both_ends() {
+    let m = f64::MAX;
+    let u = 2f64.powi(969);
+    let w = |x: f64| format!("{x:e}");
+    let s = store_of(&format!(
+        "ex:s ex:p ex:a {{| ex:w {} |}} . ex:a ex:p ex:b {{| ex:w {} |}} .
+         ex:b ex:p ex:x {{| ex:w {} |}} . ex:x ex:p ex:t {{| ex:w {} |}} .
+         ex:b ex:p ex:y {{| ex:w {} |}} . ex:y ex:p ex:t {{| ex:w {} |}} .",
+        w(m - 4.0 * u),
+        w(2.0 * u),
+        w(m - 4.0 * u),
+        w(u),
+        w(u),
+        w(2.0 * u),
+    ));
+    let r = rows(
+        &s,
+        "SELECT ?path ?i ?s ?o WHERE { SERVICE path:search { [] path:source ex:s ; \
+         path:target ex:t ; path:predicate ex:p ; path:weight ex:w ; path:pathIndex ?path ; \
+         path:edgeIndex ?i ; path:edgeSubject ?s ; path:edgeObject ?o } }",
+    );
+    assert_eq!(
+        node_paths(&r).values().next().unwrap().join(" "),
+        "s a b y t"
+    );
+}
+
+/// Two large halves met in the middle: the route through the `a` nodes costs about
+/// `MAX + u/2` and the one through `b` about `MAX + u/4`. Both round to the largest
+/// double, and only the rounding errors tell them apart.
+#[test]
+fn large_halves_near_the_largest_double_from_both_ends() {
+    let m = f64::MAX;
+    let u = 2f64.powi(969);
+    let a = 2f64.powi(1023);
+    let w = |x: f64| format!("{x:e}");
+    let s = store_of(&format!(
+        "ex:s ex:p ex:a1 {{| ex:w {} |}} . ex:a1 ex:p ex:a2 {{| ex:w {} |}} .
+         ex:a2 ex:p ex:a3 {{| ex:w {} |}} . ex:a3 ex:p ex:t {{| ex:w {} |}} .
+         ex:a1 ex:p ex:z {{| ex:w {} |}} .
+         ex:s ex:p ex:b1 {{| ex:w {} |}} . ex:b1 ex:p ex:t {{| ex:w {} |}} .",
+        w(a - 2.0 * u),
+        w(u),
+        w(1.5 * u),
+        w(a - 4.0 * u),
+        w(m),
+        w(m - 4.0 * u),
+        w(4.25 * u),
+    ));
+    let r = rows(
+        &s,
+        "SELECT ?path ?i ?s ?o WHERE { SERVICE path:search { [] path:source ex:s ; \
+         path:target ex:t ; path:predicate ex:p ; path:weight ex:w ; path:pathIndex ?path ; \
+         path:edgeIndex ?i ; path:edgeSubject ?s ; path:edgeObject ?o } }",
+    );
+    assert_eq!(node_paths(&r).values().next().unwrap().join(" "), "s b1 t");
+}
+
 #[test]
 fn weights_from_reifiers() {
     // A8: the weights sit on the reifiers of the edges
@@ -998,6 +1119,149 @@ fn random_weighted_graphs_against_brute_force() {
                 ties,
                 "{ctx}: all cheapest within 4"
             );
+        }
+    }
+}
+
+/// The cheapest path and the k cheapest paths with weights, which search from both ends
+/// (ROADMAP item 150), on random graphs in every direction, with skipped predicates and
+/// hubs, against every simple path enumerated by brute force. Each path found must be one
+/// of them, and the costs must be the cheapest in order.
+#[test]
+fn random_weighted_graphs_from_both_ends_against_brute_force() {
+    let mut r = Rng(0x0b1d_1ec7_ed00);
+    for case in 0..60 {
+        let n = 6 + r.below(5);
+        let m = n + r.below(2 * n);
+        let mut triples: BTreeMap<E, Option<usize>> = BTreeMap::new();
+        for _ in 0..m {
+            let w = match r.below(6) {
+                0 => None,
+                1 => Some(0),
+                w => Some(w - 1),
+            };
+            triples.insert((r.below(n), r.below(3), r.below(n)), w);
+        }
+        let ttl: String = triples
+            .iter()
+            .map(|((a, p, b), w)| match w {
+                Some(w) => format!("ex:n{a} ex:p{p} ex:n{b} {{| ex:w {w} |}} .\n"),
+                None => format!("ex:n{a} ex:p{p} ex:n{b} .\n"),
+            })
+            .collect();
+        let s = store_of(&ttl);
+        let weight = |t: &E| triples[t].unwrap_or(1);
+        let skip_p2 = r.below(2) == 0;
+        let max_degree = [None, Some(2), Some(3)][r.below(3)];
+        let (dir, back, both) = [
+            ("path:forward", false, false),
+            ("path:backward", true, false),
+            ("path:both", false, true),
+        ][r.below(3)];
+        let mut adj: BTreeMap<usize, Vec<(usize, usize, E)>> = BTreeMap::new();
+        for &(a, p, b) in triples.keys() {
+            if skip_p2 && p == 2 {
+                continue;
+            }
+            let t = (a, p, b);
+            if back || both {
+                adj.entry(b).or_default().push((p, a, t));
+            }
+            if !back && !(both && a == b) {
+                adj.entry(a).or_default().push((p, b, t));
+            }
+        }
+        let degree = |x: usize| adj.get(&x).map_or(0, Vec::len);
+        let src = r.below(n);
+        // the nodes of a path in path order, from the stored triples
+        let nodes_of = |path: &[E]| -> Vec<usize> {
+            let mut out = vec![src];
+            for &(a, _, b) in path {
+                let x = *out.last().unwrap();
+                let fwd = !back && a == x;
+                out.push(if fwd || (both && a == x) { b } else { a });
+            }
+            out
+        };
+        let all: Vec<(usize, Vec<E>)> = brute(&adj, src, n)
+            .into_iter()
+            .filter(|(_, p)| {
+                let ns = nodes_of(p);
+                // a hub may be an end of a path but no node in between
+                ns[1..ns.len() - 1]
+                    .iter()
+                    .all(|&x| max_degree.is_none_or(|l| degree(x) <= l))
+            })
+            .collect();
+        let mut extra = format!("path:direction {dir}");
+        if skip_p2 {
+            extra.push_str(" ; path:excludePredicate ex:p2");
+        }
+        if let Some(l) = max_degree {
+            extra.push_str(&format!(" ; path:maxDegree {l}"));
+        }
+        for t in 0..n {
+            let ctx = format!("case {case} {extra} n{src}→n{t}");
+            let want: BTreeSet<&Vec<E>> = all
+                .iter()
+                .filter(|(e, _)| *e == t)
+                .map(|(_, p)| p)
+                .collect();
+            let mut costs: Vec<usize> = want.iter().map(|p| p.iter().map(weight).sum()).collect();
+            costs.sort();
+            let found = |alg: &str| -> Vec<(Vec<E>, usize)> {
+                let mut by: BTreeMap<usize, (BTreeMap<usize, E>, f64)> = BTreeMap::new();
+                for row in rows(
+                    &s,
+                    &format!(
+                        "SELECT * WHERE {{ SERVICE path:search {{ [] path:source ex:n{src} ; \
+                         path:target ex:n{t} ; path:weight ex:w ; {extra} ; {alg} path:cost ?c ; \
+                         path:pathIndex ?path ; path:edgeIndex ?i ; path:edgeSubject ?s ; \
+                         path:edgePredicate ?p ; path:edgeObject ?o }} }}"
+                    ),
+                ) {
+                    let num = |k: &str| {
+                        row[k]
+                            .trim_start_matches(|c: char| !c.is_ascii_digit())
+                            .parse::<usize>()
+                            .unwrap()
+                    };
+                    let e = by
+                        .entry(row["path"].parse().unwrap())
+                        .or_insert_with(|| (BTreeMap::new(), row["c"].parse().unwrap()));
+                    e.0.insert(row["i"].parse().unwrap(), (num("s"), num("p"), num("o")));
+                }
+                by.into_values()
+                    .map(|(es, c)| {
+                        let p: Vec<E> = es.into_values().collect();
+                        let sum: usize = p.iter().map(weight).sum();
+                        assert_eq!(c, sum as f64, "{ctx}: the cost of {p:?}");
+                        (p, sum)
+                    })
+                    .collect()
+            };
+            let one = found("");
+            assert_eq!(
+                one.len(),
+                usize::from(!costs.is_empty()),
+                "{ctx}: one cheapest"
+            );
+            if let Some((p, c)) = one.first() {
+                assert!(want.contains(p), "{ctx}: {p:?} is a path");
+                assert_eq!(Some(c), costs.first(), "{ctx}: cheapest");
+            }
+            let k = 4;
+            let ks = found(&format!("path:algorithm path:kShortest ; path:k {k} ;"));
+            let mut got: Vec<usize> = ks.iter().map(|(_, c)| *c).collect();
+            got.sort();
+            let mut best = costs.clone();
+            best.truncate(k);
+            assert_eq!(got, best, "{ctx}: {k} cheapest");
+            let distinct: BTreeSet<&Vec<E>> = ks.iter().map(|(p, _)| p).collect();
+            assert_eq!(distinct.len(), ks.len(), "{ctx}: distinct paths");
+            for (p, _) in &ks {
+                assert!(want.contains(p), "{ctx}: {p:?} is a path");
+            }
         }
     }
 }
