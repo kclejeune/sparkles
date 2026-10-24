@@ -246,40 +246,73 @@ pub(crate) struct Buffered<'a> {
     inner: &'a mut dyn Write,
     buf: Vec<u8>,
     staged: &'a Cell<u64>,
-    /// `staged` at the last write, which every row before it ends inside `buf`
+    /// `staged` when it was last looked at
     rows: u64,
+    /// where in `buf` each count of rows was reached, in order: the rows up to that count
+    /// end there
+    marks: Vec<(usize, u64)>,
     sent: &'a Cell<u64>,
-    /// the caller's writer refused a write, so nothing more goes to it
+    /// the caller's writer failed, so nothing more goes to it
     failed: bool,
 }
 
 impl Buffered<'_> {
-    /// Write the collected bytes on, and with them the rows they end.
-    fn drain(&mut self) -> std::io::Result<()> {
-        if !self.buf.is_empty() {
-            self.pass(self.buf.len())?;
-            self.buf.clear();
+    /// Note the rows counted since the last look, which end where `buf` ends now.
+    #[inline]
+    fn note(&mut self) {
+        let rows = self.staged.get();
+        if rows != self.rows {
+            self.rows = rows;
+            self.marks.push((self.buf.len(), rows));
         }
-        self.sent.set(self.rows);
-        Ok(())
     }
 
-    /// Write the first `n` bytes of `buf` on, or remember that the caller's writer failed.
-    fn pass(&mut self, n: usize) -> std::io::Result<()> {
-        let r = self.inner.write_all(&self.buf[..n]);
-        self.failed |= r.is_err();
-        r
+    /// Write the collected bytes on. Each row counts in `sent` as soon as the caller's
+    /// writer has taken the bytes up to its end, also when it takes them in parts and
+    /// fails before the last.
+    fn drain(&mut self) -> std::io::Result<()> {
+        let mut done = 0;
+        let mut mark = 0;
+        while done < self.buf.len() {
+            match self.inner.write(&self.buf[done..]) {
+                Ok(0) => {
+                    self.failed = true;
+                    return Err(std::io::ErrorKind::WriteZero.into());
+                }
+                Ok(n) => {
+                    done += n;
+                    while let Some(&(end, rows)) = self.marks.get(mark)
+                        && end <= done
+                    {
+                        self.sent.set(rows);
+                        mark += 1;
+                    }
+                }
+                Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {}
+                Err(e) => {
+                    self.failed = true;
+                    return Err(e);
+                }
+            }
+        }
+        // every mark ends within `buf`
+        if let Some(&(_, rows)) = self.marks.last() {
+            self.sent.set(rows);
+        }
+        self.buf.clear();
+        self.marks.clear();
+        Ok(())
     }
 }
 
 impl Write for Buffered<'_> {
     #[inline]
     fn write(&mut self, b: &[u8]) -> std::io::Result<usize> {
-        // the rows counted since the last write end where `buf` ends now
-        self.rows = self.staged.get();
+        self.note();
         if b.len() > OUTPUT_BUFFER - self.buf.len() {
             self.drain()?;
             if b.len() >= OUTPUT_BUFFER {
+                // no row ends inside one write, so this piece ends none
                 let r = self.inner.write_all(b);
                 self.failed |= r.is_err();
                 r?;
@@ -296,7 +329,7 @@ impl Write for Buffered<'_> {
     }
 
     fn flush(&mut self) -> std::io::Result<()> {
-        self.rows = self.staged.get();
+        self.note();
         self.drain()?;
         self.inner.flush()
     }
@@ -316,11 +349,12 @@ fn write_buffered(
         buf: Vec::with_capacity(OUTPUT_BUFFER),
         staged: &staged,
         rows: staged.get(),
+        marks: Vec::new(),
         sent,
         failed: false,
     };
     let result = f(&mut out, &staged);
-    out.rows = staged.get();
+    out.note();
     match result {
         Ok(()) => out.drain().map_err(io),
         Err(e) => {
@@ -1581,6 +1615,44 @@ mod buffered_tests {
             assert!(w.out.len() <= room);
             let whole = w.out.iter().filter(|&&b| b == b'\n').count() as u64;
             assert_eq!(sent.get(), whole, "{room}");
+        }
+    }
+
+    /// A writer that takes at most `step` bytes a call, `room` bytes in all, and then
+    /// fails, as a response writer filling its chunk and then losing its client does.
+    struct Short {
+        out: Vec<u8>,
+        step: usize,
+        room: usize,
+    }
+
+    impl Write for Short {
+        fn write(&mut self, b: &[u8]) -> std::io::Result<usize> {
+            let n = b.len().min(self.step).min(self.room - self.out.len());
+            if n == 0 {
+                return Err(std::io::Error::other("the client went away"));
+            }
+            self.out.extend_from_slice(&b[..n]);
+            Ok(n)
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn a_writer_that_takes_part_and_then_fails_has_its_whole_rows_counted() {
+        for (step, room) in [(100, 100), (37, 1000), (4096, 10_000), (1, 333)] {
+            let mut w = Short {
+                out: Vec::new(),
+                step,
+                room,
+            };
+            let sent = Cell::new(0);
+            assert!(write_buffered(&mut w, &sent, &mut rows(5000, 40)).is_err());
+            assert_eq!(w.out.len(), room);
+            let whole = w.out.iter().filter(|&&b| b == b'\n').count() as u64;
+            assert_eq!(sent.get(), whole, "{step} {room}");
         }
     }
 

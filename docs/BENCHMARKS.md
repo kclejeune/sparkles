@@ -1257,26 +1257,29 @@ rounds of 50 requests for times.*
 ### The cost of plan pattern references
 
 The planner records the triple patterns each plan node reads, for live query profiling
-([U04](specs/U04-live-query-profiling.md#phase-4-2026-10-23) Phase 4). The table gives
-`instructions:u` per request over 2,000 warm requests at 10.5M without the references and
-with them, both built in the Nix development shell.
+([U04](specs/U04-live-query-profiling.md#phase-4-2026-10-23) Phase 4). It does so only when
+the answer shows the plan, which on the query route means the Sparkles format. The table
+gives `instructions:u` per request of a plain SPARQL JSON request at 10.5M, over 2,000
+warm requests in two passes that agreed within 0.1%, for a build that still named the
+patterns for every request and for the current one.
 
-| Query | Instructions without references | Instructions with references |
+| Query | Naming patterns for every request | Naming them only for a shown plan |
 |---|--:|--:|
-| `count-all` | 326.5 thousand | 329.2 thousand |
-| `path-plus` | 318.0 thousand | 321.3 thousand |
-| `types-grouped` | 659.8 thousand | 662.3 thousand |
-| `values-star` | 1,156.7 thousand | 1,161.6 thousand |
-| `star-lookup` | 2,439.1 thousand | 2,445.9 thousand |
+| `count-all` | 329.6 thousand | 329.0 thousand |
+| `path-plus` | 321.4 thousand | 320.0 thousand |
+| `types-grouped` | 659.8 thousand | 659.1 thousand |
+| `values-star` | 1,154.2 thousand | 1,150.9 thousand |
+| `star-lookup` | 2,439.0 thousand | 2,433.9 thousand |
 
-*Instructions were counted on atlas on 2026-10-23 and 2026-10-24.*
+*Instructions were counted on atlas, an Intel Core i5-13500, with both binaries built in
+the Nix development shell.*
 
-In 16 pinned rounds on forge, the references added 2 to 9% of server time to the smallest
-queries, such as `star-lookup` at 47.8 µs against 45.5 µs and `values-star` at 14.4 µs
-against 13.2 µs, and at most 1.9% of client time. Larger queries such as `star-join` and `exists-join` moved
-by 1.6% or less.
-[Roadmap](ROADMAP.md) item 180 measures the remaining cost again with two builds from the
-same host.
+In 16 pinned rounds of 200 SPARQL JSON requests on forge, `star-lookup` took 2.0% less
+client time without the references, 0.559 ms against 0.570 ms, and was faster in all 16
+rounds. `values-star` took 0.6% less, and `count-all`, `path-plus` and `types-grouped`
+moved by 0.7% or less, which is within their noise at about 0.27 ms of client time. A
+request in the Sparkles format names its patterns and pays these instructions, since its
+answer shows them.
 
 ### The cost of the query memory pool
 
