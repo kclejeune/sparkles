@@ -854,18 +854,31 @@ fn jena_graph_to(
     w: &mut Buffered<'_>,
     sent: &Cell<u64>,
 ) -> Result<()> {
+    // RDF/JSON groups the triples by subject and writes them all at the end, so they
+    // count once they are written
+    let deferred = fmt == crate::jena_formats::JenaFormat::RdfJson;
     let mut out = crate::jena_formats::RdfWriter::new(fmt, w);
+    let mut held = 0;
     for t in &r.triples {
         out.triple(t).map_err(io)?;
-        sent.set(sent.get() + 1);
+        if deferred {
+            held += 1;
+        } else {
+            sent.set(sent.get() + 1);
+        }
     }
     if fmt.quads() {
         for q in &r.quads {
             out.quad(q).map_err(io)?;
-            sent.set(sent.get() + 1);
+            if deferred {
+                held += 1;
+            } else {
+                sent.set(sent.get() + 1);
+            }
         }
     }
     out.finish().map_err(io)?;
+    sent.set(sent.get() + held);
     Ok(())
 }
 
@@ -1654,6 +1667,39 @@ mod buffered_tests {
             let whole = w.out.iter().filter(|&&b| b == b'\n').count() as u64;
             assert_eq!(sent.get(), whole, "{step} {room}");
         }
+    }
+
+    #[test]
+    fn rdf_json_counts_its_triples_only_once_they_are_written() {
+        use crate::io::{RdfFormat as In, Source};
+        use crate::jena_formats::JenaFormat;
+        use crate::store::{Store, StoreOptions};
+        let store = Store::in_memory(StoreOptions::default());
+        store
+            .load(&[Source::from_bytes(
+                b"<http://ex.org/s> <http://ex.org/p> \"o\" .\n".to_vec(),
+                In::NTriples,
+                None,
+            )])
+            .unwrap();
+        let r = super::super::query(
+            store.snapshot(),
+            "CONSTRUCT WHERE { ?s ?p ?o }",
+            &Default::default(),
+        )
+        .unwrap();
+        let mut short = Short {
+            out: Vec::new(),
+            step: 1,
+            room: 1,
+        };
+        let sent = Cell::new(0);
+        assert!(write_jena_graph_counted(&r, JenaFormat::RdfJson, &mut short, &sent).is_err());
+        assert_eq!(short.out, b"{");
+        assert_eq!(sent.get(), 0);
+        let sent = Cell::new(0);
+        write_jena_graph_counted(&r, JenaFormat::RdfJson, Vec::new(), &sent).unwrap();
+        assert_eq!(sent.get(), 1);
     }
 
     #[test]
