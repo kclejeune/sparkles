@@ -1,17 +1,12 @@
 # Sparkles ✨
 
-Sparkles is a fast RDF, SPARQL and OWL database in Rust, compatible with Apache Jena and
-Fuseki.
-
-It implements the protocols, semantics and operational model of
-[Apache Jena](https://jena.apache.org/) and Fuseki on the index and execution architecture
-of [QLever](https://github.com/ad-freiburg/qlever). Applications that talk to Fuseki keep
-working, Java and Kotlin programs keep using Jena's APIs through a `DatasetGraph` backed by
-Sparkles, and queries run on sorted, compressed indexes with a cost-based, column-at-a-time
-executor. Sparkles adds MVCC transactions, durable commits, online compaction and a history
-that can be queried, diffed and branched. The engine is a library, and the server, the CLI
-and the Python, JVM and Node.js bindings are built on it. The RDF term model, the parsers
-and the SPARQL algebra come from the Oxigraph project's crates.
+Sparkles is a fast RDF, SPARQL and OWL database written in Rust. It reimplements
+[Apache Jena](https://jena.apache.org/) and Fuseki, with their protocols, semantics and
+operational model, on the index and execution architecture of
+[QLever](https://github.com/ad-freiburg/qlever). It ships as an embeddable library with
+Rust, Python, JVM and JavaScript APIs, a Fuseki-compatible server and CLI, and a web UI.
+The JVM binding implements Jena's `DatasetGraph`, letting Java and Kotlin applications
+use Sparkles through Jena's existing query, model and transaction APIs.
 
 > [!WARNING]
 > Sparkles is experimental. There are no releases, and the on-disk format, HTTP API, CLI
@@ -23,6 +18,28 @@ and the SPARQL algebra come from the Oxigraph project's crates.
 > main safeguard, but expect bugs. Issues and bug reports are welcome.
 
 ![A CONSTRUCT query's results drawn as a graph of people, who they know and where they work, with one person's neighborhood highlighted](docs/images/graph.png)
+
+## Why Sparkles
+
+Jena and Fuseki have the protocols, tools and operational model that RDF applications
+depend on, and QLever has an index and executor built for speed. Sparkles puts the first
+on top of the second:
+
+1. **Jena-compatible where users can see it.** Anything that talks to Fuseki keeps
+   working. Sparkles implements the SPARQL 1.1 Query, Update and Graph Store protocols,
+   Fuseki's endpoints and `/$/` admin API, Jena's formats and dataset semantics, and
+   TDB2's model of bulk loads, transactions, compaction and backups. The JVM binding
+   brings that compatibility into the application: open a Sparkles dataset and keep
+   using Jena's `Model`, RIOT, `Txn` and `QueryExecution` APIs.
+2. **QLever-style internals where performance matters.** Terms are 64-bit ids with
+   numbers and dates stored inline, indexes are sorted and compressed permutations, and
+   a cost-based planner drives column-at-a-time execution. Sparkles adds MVCC
+   transactions, durable commits, online compaction and a history that can be read,
+   diffed and branched.
+3. **Library first.** The engine is a library with no HTTP server. The server, the CLI
+   and the Python, JVM and Node.js bindings are built on its public API, so an embedded
+   program gets the same features as the server. The term model, parsers and SPARQL
+   algebra come from the Oxigraph project's crates.
 
 ## Highlights
 
