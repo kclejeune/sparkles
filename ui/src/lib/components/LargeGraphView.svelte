@@ -787,7 +787,8 @@
         return { x: a.x as number, y: a.y as number };
       },
       // a group that hangs from one drawn node fans out by a step of the picture's size
-      gapOf(renderer.getBBox()),
+      // the pinned bounds, which a previous overlay's nodes do not widen
+      gapOf(renderer.getCustomBBox() ?? renderer.getBBox()),
     );
     for (const n of fresh) {
       const p = place.get(n.key)!;

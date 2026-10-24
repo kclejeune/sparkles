@@ -139,6 +139,7 @@ export function mergePaths(
 
 type Link = { source: string; target: string; paths?: number[] };
 type Point = { x: number; y: number };
+type Rings = { count: Map<string, number>; dir: Map<string, Point> };
 
 /**
  * Where the nodes a path adds go in a view that is already laid out. The added nodes that
@@ -173,8 +174,9 @@ export function placeAdded(
   }
   const out = new Map<string, Point>();
   const seen = new Set<string>();
-  // how many nodes each ring around a drawn node holds, across the groups hanging from it
-  const rings = new Map<string, number>();
+  // the groups hanging from one drawn node share its direction and its rings, so that none
+  // of their nodes takes another's place
+  const rings: Rings = { count: new Map(), dir: new Map() };
   for (const n of added) {
     if (seen.has(n.id)) continue;
     // the group of added nodes that path edges join, and the drawn nodes it touches
@@ -239,14 +241,18 @@ function fanOut(
   near: Map<string, string[]>,
   fallback: Map<string, Point>,
   gap: number,
-  rings: Map<string, number>,
+  rings: Rings,
   out: Map<string, Point>,
 ) {
-  const c = mean(group.map((id) => fallback.get(id)!));
-  let dx = c.x - from.x;
-  let dy = c.y - from.y;
-  const len = Math.hypot(dx, dy);
-  [dx, dy] = len > 1e-9 ? [dx / len, dy / len] : [1, 0];
+  // the first group to hang from the anchor sets the direction, towards its fallbacks
+  let d = rings.dir.get(anchor);
+  if (!d) {
+    const c = mean(group.map((id) => fallback.get(id)!));
+    const len = Math.hypot(c.x - from.x, c.y - from.y);
+    d = len > 1e-9 ? { x: (c.x - from.x) / len, y: (c.y - from.y) / len } : { x: 1, y: 0 };
+    rings.dir.set(anchor, d);
+  }
+  const { x: dx, y: dy } = d;
   // hops from the anchor, breadth first
   const hops = new Map<string, number>();
   let ring = group.filter((id) => near.get(id)?.includes(anchor));
@@ -263,8 +269,8 @@ function fanOut(
   }
   for (const id of group) {
     const h = hops.get(id) ?? 1;
-    const k = rings.get(`${anchor}|${h}`) ?? 0;
-    rings.set(`${anchor}|${h}`, k + 1);
+    const k = rings.count.get(`${anchor}|${h}`) ?? 0;
+    rings.count.set(`${anchor}|${h}`, k + 1);
     // the k-th node of a ring sits beside the others, alternately on either side
     const side = k === 0 ? 0 : (k % 2 ? 1 : -1) * Math.ceil(k / 2) * gap;
     out.set(id, { x: from.x + dx * gap * h - dy * side, y: from.y + dy * gap * h + dx * side });

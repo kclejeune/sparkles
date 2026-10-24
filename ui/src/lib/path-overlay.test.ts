@@ -207,6 +207,20 @@ describe('placeAdded', () => {
     expect(new Set(pts.map((q) => `${Math.round(q.x)},${Math.round(q.y)}`)).size).toBe(3);
     for (const q of pts) expect(Math.hypot(q.x, q.y)).toBeGreaterThan(10);
   });
+  it('keeps groups that hang from one drawn node in different directions apart', () => {
+    const p = placeAdded(
+      [
+        { id: 'p', fallback: { x: 100, y: 0 } },
+        { id: 'q', fallback: { x: 200, y: 0 } },
+        { id: 'r', fallback: { x: 0, y: 100 } },
+      ],
+      ['p', 'q', 'r'].map((k, i) => ({ source: 'a', target: k, paths: [i + 1] })),
+      at,
+      20,
+    );
+    const pts = ['p', 'q', 'r'].map((k) => p.get(k)!);
+    expect(new Set(pts.map((q) => `${Math.round(q.x)},${Math.round(q.y)}`)).size).toBe(3);
+  });
   it('keeps the fallback of a node with no neighbour on a path, without reading other edges', () => {
     const edges = Array.from({ length: 1000 }, (_, i) => ({ source: 'q', target: `x${i}` }));
     expect(placeAdded([{ id: 'q', fallback: far }], edges, at).get('q')).toEqual(far);
