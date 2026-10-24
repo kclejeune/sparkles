@@ -1266,22 +1266,46 @@ pub(crate) fn transform(
     }
 }
 
-/// Whether a `noValue` of `rules` reads a predicate that depends on the predicate of its
-/// own rule's head, over the dependencies of predicates: those of body atoms, of
-/// `noValue` patterns, and the `rdf:first` and `rdf:rest` of the lists that builtins and
-/// head actions read. A variable predicate stands for every predicate.
+/// Whether a `noValue` of `rules` reads a pattern that depends on the head of its own
+/// rule, over the dependencies of predicates, with `rdf:type` split by its constant class:
+/// those of body atoms, of `noValue` patterns, and the `rdf:first` and `rdf:rest` of the
+/// lists that builtins and head actions read. A variable predicate stands for every
+/// predicate, and a variable class for every class.
 fn negation_on_a_cycle(rules: &[CRule], terms: &Terms) -> bool {
-    // node 0 reads every predicate (an atom whose predicate is a variable), node 1
-    // gives every predicate (such a head), and the others are constants
+    // the nodes that read or give every predicate, and every class; the others are
+    // constant predicates and classes
     const READS_ALL: usize = 0;
     const GIVES_ALL: usize = 1;
-    let mut ids: FxHashMap<u64, usize> = FxHashMap::default();
-    let node = |s: Slot, var: usize, ids: &mut FxHashMap<u64, usize>| match s {
-        Slot::Const(p) => {
-            let n = ids.len() + 2;
-            *ids.entry(p).or_insert(n)
+    const READS_TYPES: usize = 2;
+    const GIVES_TYPES: usize = 3;
+    const SPECIAL: usize = 4;
+    let rdf_type = terms
+        .try_id_for(&oxrdf::Term::NamedNode(
+            oxrdf::vocab::rdf::TYPE.into_owned(),
+        ))
+        .ok();
+    let mut ids: FxHashMap<(u64, Option<u64>), usize> = FxHashMap::default();
+    let mut classes: Vec<usize> = Vec::new();
+    let mut node = |p: Slot, o: Slot, head: bool| -> usize {
+        let (all, types) = if head {
+            (GIVES_ALL, GIVES_TYPES)
+        } else {
+            (READS_ALL, READS_TYPES)
+        };
+        let key = match p {
+            Slot::Const(t) if Some(t) == rdf_type => match o {
+                Slot::Const(c) => (t, Some(c)),
+                _ => return types,
+            },
+            Slot::Const(p) => (p, None),
+            _ => return all,
+        };
+        let n = ids.len() + SPECIAL;
+        let id = *ids.entry(key).or_insert(n);
+        if id == n && key.1.is_some() {
+            classes.push(id);
         }
-        _ => var,
+        id
     };
     let mut edges: Vec<(usize, usize)> = Vec::new();
     let mut negative: Vec<(usize, usize)> = Vec::new();
@@ -1289,22 +1313,26 @@ fn negation_on_a_cycle(rules: &[CRule], terms: &Terms) -> bool {
         let heads: Vec<usize> = r
             .head
             .iter()
-            .map(|h| node(head_slots(h).1, GIVES_ALL, &mut ids))
+            .map(|h| {
+                let (_, p, o) = head_slots(h);
+                node(p, o, true)
+            })
             .collect();
         let mut deps: Vec<(usize, bool)> = r
             .atoms
             .iter()
-            .map(|a| (node(a.p, READS_ALL, &mut ids), false))
+            .map(|a| (node(a.p, a.o, false), false))
             .collect();
         for b in &r.builtins {
             if b.kind == BuiltinKind::NoValue {
                 let p = b.args.get(1).copied().unwrap_or(Slot::Any);
-                deps.push((node(p, READS_ALL, &mut ids), true));
+                let o = b.args.get(2).copied().unwrap_or(Slot::Any);
+                deps.push((node(p, o, false), true));
             }
         }
         if reads_lists(r) {
             for p in [terms.rdf_first, terms.rdf_rest] {
-                deps.push((node(Slot::Const(p), READS_ALL, &mut ids), false));
+                deps.push((node(Slot::Const(p), Slot::Any, false), false));
             }
         }
         for &h in &heads {
@@ -1316,17 +1344,25 @@ fn negation_on_a_cycle(rules: &[CRule], terms: &Terms) -> bool {
             }
         }
     }
-    let n = ids.len() + 2;
+    let n = ids.len() + SPECIAL;
     let mut adj: Vec<Vec<usize>> = vec![Vec::new(); n];
     for (h, d) in edges {
         adj[h].push(d);
     }
-    // every predicate depends on what a head of a variable predicate reads, and an atom
-    // of a variable predicate reads every predicate
-    for a in adj.iter_mut().skip(2) {
+    // every constant depends on what a head of a variable predicate reads, and an atom
+    // of a variable predicate reads every constant; a class likewise for heads and atoms
+    // of `rdf:type` with a variable class
+    for a in adj.iter_mut().skip(SPECIAL) {
         a.push(GIVES_ALL);
     }
-    adj[READS_ALL].extend(2..n);
+    adj[READS_ALL].extend(SPECIAL..n);
+    adj[READS_ALL].push(READS_TYPES);
+    for &c in &classes {
+        adj[c].push(GIVES_TYPES);
+    }
+    adj[READS_TYPES].extend(classes.iter().copied());
+    adj[READS_TYPES].push(GIVES_TYPES);
+    adj[GIVES_TYPES].push(GIVES_ALL);
     let reaches = |from: usize, to: usize| {
         let mut seen = vec![false; n];
         let mut stack = vec![from];

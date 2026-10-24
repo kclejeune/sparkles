@@ -596,7 +596,8 @@ read did not apply.
   constant predicate, a lower stage therefore derives every such list before the stage
   that reads it. When that stage would depend on itself, as when a rule reads one list
   to build another, the program is made again with lists read as the stage holds them,
-  unless a `noValue` lies on a cycle of the rules' predicates, which stays refused. The facts a `listForAll` reads are asked for behind the copy's guard,
+  unless a `noValue` lies on a cycle of the rules' predicates, with `rdf:type` split by
+  its constant class, which stays refused. The facts a `listForAll` reads are asked for behind the copy's guard,
   unless an atom of the rule already matches them as in `cls-int1`.
 * **Evaluation.** `crates/sparkles-reasoner/src/query.rs` evaluates the program with the
   semi-naive engine over the base tier of the caller's input graphs, under the query's
@@ -766,7 +767,8 @@ list and builds another was refused as unstratified
 (`distinct_list_heads_are_not_a_cycle`). A third review found that the overlay grew
 before its charge was admitted, which now reserves first, and that the retry without
 list stages accepted a `noValue` on a cycle through a list
-(`negation_through_lists_is_refused`).
+(`negation_through_lists_is_refused`). A fourth review found that this check merged all
+classes of `rdf:type`, which it now keeps apart (`negation_check_keeps_classes_apart`).
 
 **Limitations.** Schema facts that follow only from derived instance facts can be missing
 from a query that reads them, as decision 3 describes, and `owl:sameAs` that rules derive

@@ -776,3 +776,21 @@ fn negation_through_lists_is_refused() {
         }
     }
 }
+
+/// Third Codex re-review of F17-P1: the check for a noValue on a cycle keeps classes
+/// apart, so a class-stratified negation next to a list copy is not refused.
+#[test]
+fn negation_check_keeps_classes_apart() {
+    let s = store("ex:L0 rdf:first ex:b ; rdf:rest rdf:nil . ex:a ex:p ex:c .");
+    let rules = Profile::Rules(
+        "@prefix ex: <http://ex.org/>.
+         [copy: (?x ex:p ?y), listMember(ex:L0, ?m) -> (ex:L1 rdf:first ?m), (ex:L1 rdf:rest rdf:nil)]
+         [use: (?x ex:p ?y), listMember(ex:L0, ?m), noValue(?x, rdf:type, ex:Lower) -> (?x rdf:type ex:Upper)]"
+            .into(),
+    );
+    let qr = reasoner(&rules);
+    assert_eq!(
+        rows(&run(&s, "SELECT ?x { ?x a ex:Upper }", &demand(&qr))),
+        vec!["<http://ex.org/a>"]
+    );
+}
