@@ -385,32 +385,61 @@ export function overlay(
     have.push(stat(list));
     classes.set(id, have);
   }
-  // filters: a chip of the root group takes the unused filter operator with the fewest
-  // variables that holds all of its own. A filter in an OPTIONAL becomes its join's
-  // condition, and one in a nested group may be planned anywhere, so their chips and a
-  // chip with no unused operator left show no numbers rather than another's.
+  // filters: a chip of the root group takes a filter operator that reads exactly its
+  // variables, and then a chip left over takes the one with the fewest variables that holds
+  // all of its own, but never one that reads exactly another chip's. A filter in an
+  // OPTIONAL becomes its join's condition, and one in a nested group may be planned
+  // anywhere, so their chips, and a chip with no operator left, show no numbers rather
+  // than another filter's. Each operator serves one chip.
   const filterOps = ops.filter((o) => o.node.filterVars?.length && o.node.operator === 'Filter');
-  const used = new Set<Op>();
-  const filters = new Map<string, FilterStat>();
+  const varsKey = (vs: string[]) => [...new Set(vs)].sort().join(' ');
+  const chips: { key: string; vars: string[] }[] = [];
   const fseen = new Map<string, number>();
   for (const { filter, group } of filtersOf(a)) {
     const fh = hash(normalized(filter.text));
     const fn = fseen.get(fh) ?? 0;
     fseen.set(fh, fn + 1);
     if (!filter.vars.length || group.range.from !== a.root?.range.from) continue;
-    const fits = filterOps
-      .filter((o) => !used.has(o) && filter.vars.every((v) => o.node.filterVars!.includes(v)))
+    chips.push({ key: `f:${fh}:${fn}`, vars: filter.vars });
+  }
+  const reserved = new Set(chips.map((c) => varsKey(c.vars)));
+  const used = new Set<Op>();
+  const chosen = new Map<string, Op>();
+  for (const c of chips) {
+    const op = filterOps.find(
+      (o) => !used.has(o) && varsKey(o.node.filterVars!) === varsKey(c.vars),
+    );
+    if (op) {
+      used.add(op);
+      chosen.set(c.key, op);
+    }
+  }
+  for (const c of chips) {
+    if (chosen.has(c.key)) continue;
+    const op = filterOps
+      .filter(
+        (o) =>
+          !used.has(o) &&
+          !reserved.has(varsKey(o.node.filterVars!)) &&
+          c.vars.every((v) => o.node.filterVars!.includes(v)),
+      )
       .sort(
         (x, y) =>
           x.node.filterVars!.length - y.node.filterVars!.length || ops.indexOf(x) - ops.indexOf(y),
-      );
-    const op = fits[0];
+      )[0];
+    if (op) {
+      used.add(op);
+      chosen.set(c.key, op);
+    }
+  }
+  const filters = new Map<string, FilterStat>();
+  for (const c of chips) {
+    const op = chosen.get(c.key);
     if (!op) continue;
-    used.add(op);
     const reached = executed
       ? op.node.children.reduce((s, c) => s + Math.max(0, c.actualRows), 0)
       : -1;
-    filters.set(`f:${fh}:${fn}`, {
+    filters.set(c.key, {
       op,
       reached,
       passed: executed ? op.node.actualRows : -1,

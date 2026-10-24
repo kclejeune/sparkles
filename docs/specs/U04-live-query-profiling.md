@@ -567,5 +567,10 @@ than the join key, the predicate-pattern operators named no pattern, a filter ch
 newer explanation, inverses of modified paths, literals with control characters, datatypes
 under `BASE`, boolean keywords in capitals and non-canonical ranges failed to match,
 patterns inside `GRAPH` vanished from the list, the second of two join badges on one
-variable had no keyboard stop, and `T` switched an estimate to empty times.
+variable had no keyboard stop, and `T` switched an estimate to empty times. The second
+review found three more, all fixed. A chip whose operator another chip had taken borrowed
+the numbers of a filter on more variables, so a chip now takes an operator on exactly its
+variables first. A selection made on the second of two join badges fell back to the first
+once the focus left the canvas, and moving between the Plan and Pattern tabs cleared the
+selected operator although the plan was the same.
 

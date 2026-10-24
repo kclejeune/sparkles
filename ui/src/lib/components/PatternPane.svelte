@@ -252,6 +252,8 @@
   let hovered = $state<string | null>(null);
   /** the operator of the join badge `J` moved to, of the hovered node */
   let activeJoin = $state<string | null>(null);
+  /** the join badge the selection was made on, which outlives the focus */
+  let selectedJoin = $state<string | null>(null);
   let notDrawnOpen = $state(false);
 
   /** The plan matched with the drawing, when the pane draws the text the plan is of. */
@@ -291,11 +293,11 @@
   }
 
   /** The operator an element of the canvas stands for: an edge's, a badge's, a chip's. */
-  function opOf(m: Overlay, el: Focusable): string | null {
+  function opOf(m: Overlay, el: Focusable, join0: string | null = activeJoin): string | null {
     if ('edge' in el) return m.edges.get(el.edge.id)?.op.id ?? null;
     const n = el.node;
     const joins = m.joins.filter((j) => j.drawnVars.some((v) => n.id === `v:${v}`));
-    const join = joins.find((j) => j.op.id === activeJoin) ?? joins[0];
+    const join = joins.find((j) => j.op.id === join0) ?? joins[0];
     if (join) return join.op.id;
     for (const key of n.filters ?? []) {
       const f = m.filters.get(key);
@@ -408,7 +410,7 @@
   const planInfo = $derived.by(() => {
     const m = planMatch;
     if (!m || !selected) return null;
-    const id = opOf(m, selected);
+    const id = opOf(m, selected, selectedJoin);
     const op = id ? m.ops.find((o) => o.id === id) : undefined;
     if (!op) return null;
     const n = op.node;
@@ -999,6 +1001,7 @@
       return;
     }
     selected = el;
+    selectedJoin = el && 'node' in el ? activeJoin : null;
     intent = null;
     const m = planMatch;
     if (m && el) {

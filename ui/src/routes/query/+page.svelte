@@ -255,9 +255,11 @@
       };
     return null;
   });
-  // a new plan starts with nothing selected
+  // a new plan starts with nothing selected; the source is a new object whenever the view
+  // changes, so the reset follows the plan itself
+  const planShown = $derived(planSource?.plan);
   $effect(() => {
-    void planSource?.plan;
+    void planShown;
     planSel = null;
     planHover = null;
   });

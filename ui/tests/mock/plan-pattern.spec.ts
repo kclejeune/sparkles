@@ -231,6 +231,44 @@ SELECT * WHERE { ?a foaf:knows ?b . ?a foaf:name ?n . ?a foaf:mbox ?m }`,
   // and round again
   await page.keyboard.press('j');
   await expect(focus).toContainText('join 1,');
+  // the join a selection was made on stays selected once the focus leaves the canvas
+  await page.keyboard.press('j');
+  await expect(focus).toContainText('join 2,');
+  const rows = Number(/join 2, \w+ on \?a, (\d+) rows/.exec((await focus.textContent()) ?? '')![1]);
+  await page.keyboard.press('Enter');
+  const info = ran(page).getByTestId('pattern-plan-info');
+  const actual = `Actual ${rows.toLocaleString('en-US')} rows`;
+  await expect(info).toContainText(actual);
+  await editor(page).focus();
+  await expect(c).not.toBeFocused();
+  await expect(info).toContainText(actual);
+});
+
+test('an operator selected in the Plan tab stays selected in the Pattern tab after an Explain', async ({
+  page,
+}) => {
+  await runAndOpenPattern(page);
+  await page.getByRole('button', { name: 'Explain', exact: true }).click();
+  await expect(results(page).getByRole('tab', { name: /Explain/ })).toHaveAttribute(
+    'aria-selected',
+    'true',
+  );
+  await results(page).getByRole('tab', { name: /Plan/ }).click();
+  await results(page)
+    .locator('.tr')
+    .filter({ hasText: 'HashJoin' })
+    .getByRole('button', { name: 'HashJoin' })
+    .click();
+  await results(page)
+    .getByRole('tab', { name: /Pattern/ })
+    .click();
+  await expect(
+    results(page).locator('.result-pattern-tree .tr[aria-current="true"]'),
+  ).toContainText('HashJoin');
+  const c = ran(page).locator('.pcanvas');
+  await expect
+    .poll(async () => (await overlayOf(c))?.lit?.filter((x) => x.startsWith('foaf:')).sort())
+    .toEqual(['foaf:knows', 'foaf:name']);
 });
 
 test('a pattern the canvas does not draw is listed with its operator', async ({ page }) => {

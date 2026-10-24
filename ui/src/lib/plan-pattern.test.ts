@@ -305,6 +305,26 @@ describe.skipIf(!existsSync(built))('matching a plan with the pattern', async ()
     expect(overlay(two, drawing(two), one, true).filters.size).toBe(1);
   });
 
+  it('keeps an exact match for its own chip and leaves a chip over without numbers', () => {
+    const a = ok(
+      `${P}SELECT * WHERE { ?s ex:p ?n ; ex:q ?m FILTER(CONTAINS(STR(?n), "a")) FILTER(STRLEN(STR(?n)) > 1) FILTER(?n != ?m) }`,
+    );
+    // the two filters on ?n are one operator under the join, the third is above it
+    const plan = node('Filter', 1, 1, { filterVars: ['m', 'n'] }, [
+      node('Join', 2, 2, { joinVars: ['s'] }, [
+        node('Filter', 3, 3, { filterVars: ['n'] }, [
+          node('IndexScan', 9, 9, { patterns: [pat('?s', 'p', '?n')] }),
+        ]),
+        node('IndexScan', 9, 9, { patterns: [pat('?s', 'q', '?m')] }),
+      ]),
+    ]);
+    const o = overlay(a, drawing(a), plan, true);
+    const keys = filtersOf(a).map(({ filter }) => `f:${hash(normalized(filter.text))}:0`);
+    expect(o.filters.get(keys[0])?.op.id).toBe('0.0.0');
+    expect(o.filters.has(keys[1])).toBe(false);
+    expect(o.filters.get(keys[2])?.op.id).toBe('0');
+  });
+
   it('keeps every join on a variable, one badge each, in run order', () => {
     const a = ok(
       `${P}SELECT * WHERE { ?s ex:p ?a OPTIONAL { ?s ex:q ?b } OPTIONAL { ?s ex:r ?c } }`,
