@@ -73,6 +73,13 @@ describe('dataset targets', () => {
     expect(branchPath('/prod/sparql')).toBe('/prod/sparql');
   });
 
+  it('moves the branch of an algorithm run into branch=, but not of its projections', () => {
+    expect(branchPath('/$/algo/prod%40dev/run?at=commit%3A3')).toBe(
+      '/$/algo/prod/run?at=commit%3A3&branch=dev',
+    );
+    expect(branchPath('/$/algo/prod%40dev/projections')).toBe('/$/algo/prod%40dev/projections');
+  });
+
   it('moves the branch of an admin route into branch=', () => {
     expect(branchPath('/$/stats/prod%40dev')).toBe('/$/stats/prod?branch=dev');
     expect(branchPath('/$/stats/prod%40dev?at=commit%3A3')).toBe(

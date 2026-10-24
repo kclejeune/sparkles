@@ -161,3 +161,143 @@ describe('resultState', () => {
     expect(resultState({ meta: {} })).toBeUndefined();
   });
 });
+
+describe('algorithm lenses (Phase 2)', () => {
+  const people = ['hub', 'a', 'b', 'c'].map(node);
+  const settleLong = () => new Promise((r) => setTimeout(r, 80));
+
+  it('runs a drawn-graph algorithm once the canvas is still, over the drawn nodes', async () => {
+    const { l, calls } = lenses((s) =>
+      s.includes('SERVICE algo:pageRank')
+        ? [
+            {
+              node: iri(`${EX}hub`),
+              score: lit('0.4'),
+              summary: lit('{"iterations":9,"converged":true}'),
+            },
+            {
+              node: iri(`${EX}a`),
+              score: lit('0.2'),
+              summary: lit('{"iterations":9,"converged":true}'),
+            },
+          ]
+        : [],
+    );
+    l.stillDelay = 40;
+    l.setInput(input({ nodes: people }));
+    l.set('size', { lens: 'pageRank' });
+    await settleLong();
+    const q = calls.find((c) => c.sparql.includes('SERVICE algo:pageRank'))!.sparql;
+    expect(q).toContain(`VALUES ?s { <${EX}hub> <${EX}a> <${EX}b> <${EX}c> }`);
+    const r = l.results.size!;
+    expect(r.values.get(`<${EX}hub>`)).toBe(0.4);
+    expect(r.values.get(`<${EX}b>`)).toBeNull();
+    expect(r.summary).toBe('9 iterations, converged');
+    expect(r.name).toBe('PageRank in the drawn graph');
+    // a redrawn graph waits for the canvas to be still again
+    const n = calls.length;
+    l.setInput(input({ nodes: [...people, node('d')] }));
+    await settle();
+    expect(calls.length).toBe(n);
+    await settleLong();
+    expect(calls.length).toBe(n + 1);
+    l.destroy();
+  });
+
+  it('keeps community colours across runs with another seed (A4)', async () => {
+    let seed42 = true;
+    const { l } = lenses((s) => {
+      if (!s.includes('SERVICE algo:leiden')) return [];
+      seed42 = s.includes('algo:seed 42');
+      const of = seed42
+        ? { hub: '1', a: '1', b: '2', c: '2' }
+        : { hub: '8', a: '8', b: '5', c: '5' };
+      return Object.entries(of).map(([n, c]) => ({
+        node: iri(EX + n),
+        community: lit(c),
+        level: lit('0'),
+      }));
+    });
+    l.stillDelay = 0;
+    l.setInput(input({ nodes: people }));
+    l.set('colour', { lens: 'leiden' });
+    await settleLong();
+    const before = new Map(l.results.colour!.codes);
+    l.set('colour', { lens: 'leiden', params: { seed: 43 } });
+    await settleLong();
+    expect(seed42).toBe(false);
+    expect(new Map(l.results.colour!.codes)).toEqual(before);
+    expect(l.results.colour!.legend[0].text).toMatch(/^community \d, 2 nodes$/);
+    l.destroy();
+  });
+
+  it('pauses a projection run while the slider plays and runs again when it stops (§4.3)', async () => {
+    const { l } = lenses(() => []);
+    const posts: unknown[] = [];
+    l.projectionHooks = {
+      post: async (_path, body) => {
+        posts.push(body);
+        return {
+          answer: {
+            head: { vars: ['node', 'score'] },
+            results: { bindings: [{ node: iri(`${EX}a`), score: lit('3') }] },
+            summary: null,
+            run: { commit: 1, cached: true, rows: 1 },
+          },
+        };
+      },
+    };
+    l.setInput(input({ nodes: people, playing: true }));
+    l.set('size', { lens: 'pageRank', scope: 'projection', projection: 'name:people' });
+    await settle();
+    expect(l.status.size.note).toBe('paused while playing');
+    expect(posts).toHaveLength(0);
+    l.setInput(input({ nodes: people, playing: false }));
+    await settle();
+    expect(posts).toHaveLength(1);
+    expect(l.results.size?.values.get(`<${EX}a>`)).toBe(3);
+    expect(l.results.size?.summary).toContain("server's kept run");
+    l.destroy();
+  });
+
+  it('shows the change since the left handle in compare mode (§4.3)', async () => {
+    const { l } = lenses((s, o) =>
+      s.includes('COUNT(*)') ? [{ n: iri(`${EX}a`), c: lit(o.at === 'commit:1' ? '2' : '5') }] : [],
+    );
+    l.setInput(input({ at: 'commit:3', compareAt: 'commit:1' }));
+    l.set('size', { lens: 'degree-dataset' });
+    await settle();
+    expect(l.results.size?.values.get(`<${EX}a>`)).toBe(5);
+    expect(l.results.size?.text.get(`<${EX}a>`)).toBe('5, +3 since the left handle');
+    l.destroy();
+  });
+
+  it('above 20,000 drawn nodes runs only a numeric projection lens, for the top 1,000 (§5)', async () => {
+    const many = Array.from({ length: 20_001 }, (_, i) => node(`n${i}`));
+    const { l } = lenses(() => []);
+    const tops: unknown[] = [];
+    l.projectionHooks = {
+      post: async (_p, body) => {
+        tops.push((body as { top?: number }).top);
+        return {
+          answer: {
+            head: { vars: ['node', 'score'] },
+            results: { bindings: [{ node: iri(`${EX}n7`), score: lit('9') }] },
+            summary: null,
+            run: { commit: 1, cached: false, rows: 1 },
+          },
+        };
+      },
+    };
+    l.setInput(input({ nodes: many }));
+    l.set('colour', { lens: 'class' });
+    l.set('size', { lens: 'pageRank', scope: 'projection', projection: 'name:p' });
+    await settleLong();
+    expect(l.status.colour.note).toMatch(/at most 20,000/);
+    // two requests a run (the background start and the read), each for the top 1,000
+    expect(tops.length).toBeGreaterThanOrEqual(2);
+    expect(tops.every((t) => t === 1000)).toBe(true);
+    expect(l.results.size?.summary).toMatch(/^the top 1 of 20,001 drawn nodes/);
+    l.destroy();
+  });
+});

@@ -4,6 +4,7 @@
 // `POST …/build` and `…/refresh` answer 501.
 
 import { isAdmin } from './memory.mjs';
+import { memberships } from './algo.mjs';
 
 const RES = 'http://example.org/resource/';
 const GRAPH = 'urn:x-sparkles:graphrag:reports';
@@ -335,6 +336,29 @@ export async function handleGraphrag(req, res, url, seg, ctx) {
       }),
       true
     );
+  }
+  if (req.method === 'POST' && action === 'memberships') {
+    let b;
+    try {
+      b = JSON.parse((await readBody(req)).toString('utf8') || '{}');
+    } catch {
+      return (fail(res, 400, 'invalid JSON'), true);
+    }
+    if (!Array.isArray(b.nodes)) return (fail(res, 400, 'nodes takes an array of IRIs'), true);
+    if (ds.branchName && ds.branchName !== 'main')
+      return (
+        send(res, 200, {
+          available: false,
+          reason: 'GraphRAG communities are read on main',
+          memberships: [],
+          communities: [],
+        }),
+        true
+      );
+    const out = enabled
+      ? memberships(communities, b.nodes, b.level ?? null)
+      : { available: true, reportsGraph: GRAPH, memberships: [], communities: [] };
+    return (send(res, 200, out), true);
   }
   if (req.method === 'POST' && action === 'review') {
     let b;
