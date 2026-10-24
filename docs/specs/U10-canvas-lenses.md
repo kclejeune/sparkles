@@ -659,7 +659,7 @@ Phase 3 shipped the server prerequisite of §3.3, `POST /$/reason/{ds}/explain` 
 mode over a materialized closure and over RDFS on read, and the Why? panel of §2.4 with
 **Show on graph**, **Next**, **Expand** and the stale note. Open question 1 is settled in
 favour of building the search before F17. With this phase every part of
-[ROADMAP](../ROADMAP.md) item 105 has shipped, and items 135 to 137 carry what it left out.
+[ROADMAP](../ROADMAP.md) item 105 has shipped, and items 135 to 138 carry what it left out.
 
 **What was built in the engine.** `crates/sparkles-reasoner/src/explain.rs` reads the
 closure as the input graphs plus the inferred graph through one masked snapshot, and walks
@@ -717,9 +717,11 @@ rules by iterative deepening, so the mock suites run the panel.
   limit answers `422` with `code: "reasoning-budget"`. The CLI exits with 2 there and with 1
   when no derivation is found. `maxDepth` is 32 by default and at most 64.
 - *Memory.* The search holds each fact it reached with its depth and the instances that
-  derive it, about 10 MB at the instance limit. The library call charges that state and
-  the rule evaluations to an optional memory limit, and the server leaves it unset and
-  takes no pool grant, because the instance limit already bounds it.
+  derive it, about 10 MB at the instance limit. The library call charges that state, the
+  rule evaluations and the decoded terms of the answer to an optional memory limit. The
+  route and the MCP tool set it to the query memory budget and take no pool grant, and the
+  route holds its answer to the result-byte limit of a query. Passing the memory limit
+  answers `422` as the other limits do.
 - *Deadline.* The timeout is checked between rules and inside each rule's evaluation, so a
   rule whose candidates all fail stops at it, and a stale run's history replay and the
   RDFS on read search stop at it and at a cancelled request too. A timeout too large to
@@ -732,8 +734,9 @@ rules by iterative deepening, so the mock suites run the panel.
   shows a past commit, the panel says so instead of loading a tree, and the premises it
   marked are cleared.
 - *Expand.* A `ref` node asks the route for its own first tree and grafts it in place,
-  with the subtree's ids moved past the tree's, so a deep chain costs one request per
-  level the person opens. An expansion whose explanation was replaced is dropped.
+  with the subtree's ids moved past every tree's, so a deep chain costs one request per
+  level the person opens. An expansion whose explanation was replaced is dropped, and one
+  that reads inferences of another commit is refused with a note to open Why? again.
 - *Show on graph.* The panel turns off **Hide rdf:type** and turns on **Literals** when the
   premises need them, so the drawn chain is complete.
 
@@ -741,7 +744,10 @@ rules by iterative deepening, so the mock suites run the panel.
 derivation through a generalized triple, such as one with a literal subject that the
 closure uses but the store does not hold, or through a GeoSPARQL default geometry, is not
 found and answers `404`, which item 136 covers. A tree leaves out the builtins and the
-bindings of the rule that fired, which item 137 adds. The search reads only what the caller
+bindings of the rule that fired, which item 137 adds. The RDFS on read schema that a
+search needs is built, as for a query, without the request's timeout or cancellation,
+which are checked before and after it, and item 138 makes that build interruptible. A
+schema the caller cannot read is not built. The search reads only what the caller
 reads, so its answer and its time cannot tell a hidden derivation from none. `whyNot` answers `501` until F18 Phase 1.
 
 **What F18 can build on.** The answer types and `finish` are F18 §2.1's `Derivation` with

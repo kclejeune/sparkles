@@ -7163,6 +7163,9 @@ triple from itself, even when another top rule's premises could only be derived 
 it. A search visits at most 100,000 rule instances and holds them until it answers, about
 10 MB at that limit. Its timeout is checked inside each rule's evaluation, so a rule whose
 candidates all fail stops at it too. A `timeout` too large to represent answers `400`.
+The search and the answer it builds are held to the query memory budget, which answers
+`422` with code `reasoning-budget` when passed, and the answer to the result-byte limit of
+a query.
 
 With RDFS on read and no materialized derivation, the trees come from the schema, with
 `source: "rdfsOnRead"` and rules of the profile `rdfs-on-read`. A type comes from `rdfs9`
