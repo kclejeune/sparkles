@@ -1177,9 +1177,9 @@ every `foaf:knows` triple. The pair is person 0 and the last person, and every q
 
 Times are medians of the server's execution time. With every edge weighing 1 the weighted
 pair search costs about 1.5 times the unweighted `ps-pair`, which took 2.3 ms in the same
-runs. Weighted `path:allShortest` still runs from the source alone and got 2.3% slower from
-the double-double sums of costs, and [Roadmap](ROADMAP.md) item 242 would run it from both
-ends. Between equally cheap paths the two builds returned different ones in one case, which
+runs. Weighted `path:allShortest` without `path:maxLength` still runs from the source
+alone and measured 2.3% slower, although its search did not change, which item 241 covers.
+[Roadmap](ROADMAP.md) item 242 would run it from both ends. Between equally cheap paths the two builds returned different ones in one case, which
 the spec allows, and every other answer matched.
 
 A weighted shortest search with `path:maxLength 6`, as the UI's path finder sends, failed

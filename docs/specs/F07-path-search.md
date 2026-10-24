@@ -710,10 +710,11 @@ at least the cheapest meeting. Like the unweighted search, it never meets at a h
 ends. The two halves are joined at the meeting node and any loop is
 cut out, so the result is always a simple path.
 
-Weighted `path:allShortest`, cycles through the source and searches to several or unbound
-targets still run from the source alone. `path:shortest` with weights and `path:maxLength`
-lists paths by Yen's algorithm in order of cost until one is short enough, so its spur
-searches now run from both ends. A pair with no path short enough still runs until the
+Weighted `path:allShortest` without `path:maxLength`, cycles through the source and
+searches to several or unbound targets still run from the source alone. With weights and
+`path:maxLength`, `path:shortest` and `path:allShortest` list paths by Yen's algorithm in
+order of cost until they pass the cheapest short enough, so their spur searches now run
+from both ends. A pair with no path short enough still runs until the
 visit limit, which item 240 addresses with a search bounded by the length.
 
 The search adds weights in double-double arithmetic, where a cost is the sum of two
@@ -721,7 +722,11 @@ doubles, so that a path's cost is the same to about 2^-106 of its value from eit
 plain double ranked paths by the end it came from when the weights differed greatly in
 size, as a review found with one weight of 10^16 beside weights of 1. When the sum of the
 high parts would overflow, both costs are halved, added and doubled, and a cost is
-infinite only when the exact sum rounds past the largest double. Among paths of equal cost
+infinite only when the exact sum rounds past the largest double. Yen's algorithm ranks each
+candidate by its whole cost in double-double, added from the source, and not by the root's
+cost plus the spur's, which a later review found could put a dearer candidate first. The
+search for every cheapest path from the source alone still adds plain doubles, as before
+this change. Among paths of equal cost
 the search can return a different one than before, which §4.2 allows.
 
 A differential test in `crates/sparkles-core/tests/path_search.rs` compares the cheapest path and the four
@@ -735,7 +740,6 @@ data, a weighted pair search went from 820 ms to 3.5 ms with every edge weighing
 4.9 s to 29 ms with weights from 1 to 100. The five cheapest weighted paths had failed at
 the limit of 10 million visited nodes, and they now take 69 ms and 656 ms.
 [BENCHMARKS](../BENCHMARKS.md#weighted-pair-searches) has the figures. The unweighted pair,
-k-shortest and `VALUES` searches measured 3 to 4% slower in every round although the change
-does not touch their search, and weighted `path:allShortest` measured 2.3% slower from the
-double-double sums. Item 241 looks for the
-cause, and item 242 would run weighted `path:allShortest` from both ends.
+k-shortest and `VALUES` searches measured 3 to 4% slower in every round, and weighted
+`path:allShortest` 2.3% slower, although the change does not touch their searches. Item 241
+looks for the cause, and item 242 would run weighted `path:allShortest` from both ends.
