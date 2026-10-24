@@ -135,6 +135,10 @@ impl Ripple {
             self.sides[s].want = want.saturating_mul(4).min(options.batch_rows.max(1));
             let Some(batch) = children[s].next(ctx, options, want)? else {
                 self.sides[s].done = true;
+                // an empty input meets no row of the other one
+                if self.sides[s].rows() == 0 {
+                    self.sides[1 - s].done = true;
+                }
                 continue;
             };
             let n = batch.table.len;
