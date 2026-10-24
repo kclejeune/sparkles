@@ -1311,6 +1311,39 @@ less time on the replica than making them took on the primary. The numbers go to
 14. **Graph terms on prefix rows.** Accepted and not narrowing, as in Jena. Should Sparkles
     refuse them instead, since it cannot honour them?
 
+The questions below came after the spec, as later features added derived state and
+deployment options that it does not cover. Roadmap item 280 answers them in this spec
+before Phase 2 starts.
+
+15. **Derived state on a replica.** For each kind of derived state, does a replica follow
+    the primary's result or rebuild it locally? This covers incremental views
+    ([F13](F13-incremental-views-and-provenance.md)), projections, algorithm views
+    ([F14](F14-graph-algorithms.md)), materialized inference
+    ([F16](F16-materialization-at-scale.md)), query-time reasoning settings
+    ([F17](F17-query-time-reasoning.md)), mappings and virtual graphs
+    ([F19](F19-mappings-and-virtual-graphs.md)), and full-text analyzer dictionaries.
+    §4.5 and §4.6 answer this only for the full-text, vector and spatial indexes.
+16. **Branches.** Open question 1 waited for the branches spec, which is now
+    [F09](F09-branches-and-merges.md). Does a replica follow every branch, a chosen set,
+    or only the main lineage, and how do branch commits appear in the commit stream?
+17. **Encryption at rest.** How do captures, the commit stream and archive segments carry
+    data from an encrypted dataset ([F11](F11-encryption-at-rest.md)), and which keys does
+    a replica need?
+18. **Fencing and data-loss guarantees of automated failover.** Phase 3 elects the primary
+    through an external lease, as Patroni does for PostgreSQL. The old primary refuses
+    writes before its lease expires, which assumes bounded clock drift. With
+    `--sync-replicas`, a commit is acknowledged as degraded after a timeout, so no lost
+    writes holds only in strict mode. The spec should give a table of failure modes, such
+    as a partition, a paused process, clock drift and a lost lease store, with the
+    guarantee in each.
+19. **Kubernetes deployment.** The Helm chart runs a single-replica StatefulSet. How do
+    roles, readiness, promotion and the lease map onto the chart?
+20. **Scope.** Replication gives read scaling and high availability. Writes and data size
+    still scale only with one node. Should the spec state sharding as a non-goal, or name
+    where it would go?
+21. **Estimate.** Phase 2 was estimated at about two weeks before the features in
+    question 15 existed. What is the estimate now?
+
 ## 12. Sources
 
 * **Sparkles repository, read for this spec:**

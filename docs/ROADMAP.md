@@ -293,6 +293,7 @@ early.
 | 63 | **Authentication additions.** Mutual TLS, OCSP, opaque-token introspection, front-channel logout and Cloudflare group lookup. | [C09](specs/C09-dataset-access-control.md#roadmap-follow-ups-2026-10-12) | M |
 | 64 | **Startup resilience.** Binding the listener before datasets open, and degraded startup when a dataset fails to open. | [C01](specs/C01-observability-and-budgets.md#roadmap-follow-ups-2026-10-12) | M |
 | 65 | **Encryption.** Key management workflows, Vault and cloud KMS, recovery export, and encryption of live datasets and derived indexes. | [F11](specs/F11-encryption-at-rest.md#roadmap-follow-ups-2026-10-12) | L–XL |
+| 280 | **Replication spec refresh.** Answer F10's open questions 15 to 21 before Phase 2 starts. They cover derived state on replicas, branches, encryption, the fencing and data-loss guarantees of lease-based failover, Kubernetes, scope and the estimate. | [F10](specs/F10-replication.md#11-open-questions) | S |
 | 66 | **Replication.** Read replicas, preserved primary IDs, promotion, failover, synchronous replication, and a patch log or continuous archive. | [F10](specs/F10-replication.md#roadmap-follow-ups-2026-10-12) | XL |
 
 ## Tier 7: compatibility leftovers
