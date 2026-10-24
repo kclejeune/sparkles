@@ -433,6 +433,11 @@ struct Entry {
     kept: Arc<Kept>,
 }
 
+/// The most the cache holds: [`MAX_BYTES`], and never more than half of the pool.
+fn share(pool: Option<&Arc<sparkles::sparql::pool::QueryPool>>) -> u64 {
+    pool.map_or(MAX_BYTES, |p| (p.capacity() / 2).min(MAX_BYTES))
+}
+
 /// A bounded cache of results. The server has one, [`CACHE`].
 pub(crate) struct ViewCache {
     entries: Mutex<VecDeque<Entry>>,
@@ -474,7 +479,7 @@ impl ViewCache {
         kept: Arc<Kept>,
     ) -> bool {
         let bytes = kept.bytes;
-        let share = pool.map_or(MAX_BYTES, |p| (p.capacity() / 2).min(MAX_BYTES));
+        let share = share(pool);
         if bytes > share {
             REFUSED.fetch_add(1, Ordering::Relaxed);
             return false;
@@ -821,19 +826,43 @@ pub(crate) async fn run(
             req.algorithm,
             started.elapsed()
         );
-        // a kept result moves its bytes from the request's grant to its own, instead of
-        // holding both while the cache asks the pool
         if view.keep {
-            held.settle(0)?;
-            if !put(st.catalog.pool(), key, kept.clone()) {
-                held.settle(kept.bytes)?;
-            }
+            keep_answered(st.catalog.pool(), key, kept.clone(), &mut held);
         }
         let out = respond(kept.answer(&view, false, max_rows), limit);
         drop(held);
         out
     })
     .await
+}
+
+/// Keep the result of a request that still answers with it. A result the cache can hold
+/// moves its bytes from the request's grant to its own, instead of holding both while the
+/// cache asks the pool. One larger than the cache's share of the pool keeps its charge on
+/// the request and is not kept. When the cache refuses it after all, the request charges
+/// it again where the pool lets it; a refusal there only leaves the bytes uncounted until
+/// the answer is written, since the result is already decoded and the answer must not fail
+/// for keeping. Whether the result was kept.
+fn keep_answered(
+    pool: Option<&Arc<sparkles::sparql::pool::QueryPool>>,
+    key: Key,
+    kept: Arc<Kept>,
+    held: &mut Held,
+) -> bool {
+    if kept.bytes > share(pool) {
+        REFUSED.fetch_add(1, Ordering::Relaxed);
+        return false;
+    }
+    let bytes = kept.bytes;
+    // giving bytes back cannot fail
+    let _ = held.settle(0);
+    if put(pool, key, kept) {
+        return true;
+    }
+    if held.settle(bytes).is_err() {
+        tracing::debug!("a view-only result the cache refused could not be charged again");
+    }
+    false
 }
 
 /// What a background run computes and how its answer is bounded.
@@ -1199,5 +1228,28 @@ mod tests {
         assert!(pool.granted() >= 40 << 20, "{}", pool.granted());
         drop(reading);
         assert!(pool.granted() < 40 << 20, "{}", pool.granted());
+    }
+
+    #[test]
+    fn an_answered_result_too_large_to_keep_keeps_its_charge() {
+        let pool = sparkles::sparql::pool::QueryPool::new(64 << 20);
+        let request = Arc::new(pool.try_grant(16 << 20).unwrap());
+        let opts = QueryOptions {
+            grant: Some(request.clone()),
+            ..Default::default()
+        };
+        let mut held = Held::new(&opts);
+        held.charge(40 << 20).unwrap();
+        // another query holds the rest, and one more waits for admission
+        let _other = pool.try_grant(16 << 20).unwrap();
+        let _waiting = pool.enter(16 << 20, None);
+        assert!(!keep_answered(
+            Some(&pool),
+            key(1, "big"),
+            sized(40),
+            &mut held
+        ));
+        assert_eq!(held.held, 40 << 20);
+        assert!(request.granted() >= 40 << 20, "{}", request.granted());
     }
 }
