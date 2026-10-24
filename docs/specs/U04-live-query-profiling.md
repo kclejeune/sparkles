@@ -560,6 +560,15 @@ the hot operator and A20, whose 200 patterns match in well under 50 ms. The mock
 Playwright spec covers A14 to A16, A19, the keyboard, the list of operators not drawn and
 the 390 px sheet, and the real-server spec covers A14, A15 and A17.
 
+**Cost.** Every query pays for the references, because the planner records them and an
+executed plan carries them whether or not anything reads it. On forge they added 4 to 9%
+of server time to queries under 50 µs, such as 45.5 µs against 47.8 µs on `star-lookup`,
+and about 1.8% of client time. A follow-up on 2026-10-24 keys the occurrence count by the
+recorded pattern and writes IRIs and variables directly, which removed 28 to 48% of the
+added instructions with the same output. Forge did not see that saving in time. [Roadmap](../ROADMAP.md) item 180 tracks
+the rest, and [Benchmarks](../BENCHMARKS.md#the-cost-of-plan-pattern-references) has the
+numbers.
+
 **Review.** The Codex review of the phase reported twelve findings, and all twelve were
 confirmed and fixed with a regression test each. Count joins named the aggregate rather
 than the join key, the predicate-pattern operators named no pattern, a filter chip in an
