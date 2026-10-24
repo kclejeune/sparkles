@@ -697,10 +697,14 @@ on atlas with six jobs.
   C compilers differ on every request. The baseline of the screen of 2026-10-24 was built
   outside the Nix development shell with GCC 16.2 and Clang 21 and ran 11 to 33 thousand
   fewer instructions per request than the same source built in the shell, which made the
-  pushed commit look slower on small queries. Build both revisions in `nix develop`, and
-  check the `.comment` section of each binary (`readelf -p .comment`) when a screen of
-  small queries flags something. [Roadmap](ROADMAP.md) item 181 records the compilers
-  with each cached binary.
+  pushed commit look slower on small queries. The script therefore reads the compilers
+  of each binary from its `.comment` section, which names rustc, the linker and the C and
+  C++ compilers of its native dependencies, and writes them to `manifest.txt`. It refuses
+  to compare two binaries whose compilers differ or cannot be read, unless
+  `--allow-mixed-compilers` is given. A revision it builds also gets a `build.txt` beside
+  the cached binary with the shell's `cc`, `c++` and `rustc` versions and the cargo
+  flags. Build both revisions in `nix develop`, and remove a cache entry that an earlier
+  build outside the shell left behind.
 * `scripts/nsc-writes.sh` stages write workloads before creating a capped Namespace
   instance. Its revision builds use `SPARKLES_NSC_CACHE/writes-v1`, separately from
   the query harness. Each source commit and exact `--cargo-args` string has its own
