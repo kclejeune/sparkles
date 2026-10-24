@@ -240,7 +240,7 @@ orders every item by difficulty and impact and links each to its design spec.
 ## Web UI
 
 The web UI is embedded in the server. It has a query editor with results as tables,
-graphs and maps, with arcs for the relations between located entities and facet histograms that brush them, a visual query builder that draws each query and edits it as text, a resource explorer that finds and draws paths between entities, schema and validation views, branch history and
+graphs and maps, with arcs for the relations between located entities and facet histograms that brush them, a visual query builder that draws each query and edits it as text, a path finder that draws the shortest or cheapest paths between entities in the explorer and on query results, schema and validation views, branch history and
 merges, a time slider over past commits with commit diffs drawn as graphs, the Ask bar, and agent memory. The screenshots
 below start with time travel over commits, branches and merges, GraphRAG communities, the
 Ask bar and agent memory, path finding, inference on the canvas, maps of relations,
@@ -272,11 +272,11 @@ validation on the graph, facets that brush the graph, and the visual query build
     <td>Agent memory with sources and review status</td>
   </tr>
   <tr>
-    <td><img src="docs/images/path-finder.png" alt="The resource explorer with the Paths panel open, listing the three shortest foaf:knows paths from Freya Lindqvist to Lukáš Novák, which pass through ten different people, and drawing them over her neighbourhood with each edge numbered by the paths that use it"></td>
+    <td><img src="docs/images/query-paths.png" alt="A query's graph of 37 freight flights between cities, with the Paths panel beside it listing the three shortest routes from Vancouver to Auckland by distance, each with its cost summed from the ex:km values on the reifiers of its flights, and the routes drawn over the result with each edge numbered by the paths that use it"></td>
     <td><img src="docs/images/explore-lenses.png" alt="The resource explorer with lenses on, sizing nodes by their degree in the dataset, colouring them by class, badging the nodes with inferred edges and drawing those edges dashed, with the legend beside the graph"></td>
   </tr>
   <tr>
-    <td>The k shortest paths between two people</td>
+    <td>The shortest routes by a distance on the edges' reifiers, drawn on a query's graph</td>
     <td>Inferred edges and lenses on the canvas</td>
   </tr>
   <tr>
@@ -351,11 +351,11 @@ validation on the graph, facets that brush the graph, and the visual query build
   </tr>
   <tr>
     <td><img src="docs/images/schema.png" alt="The schema browser with a class hierarchy, instance counts and the properties of the selected class"></td>
-    <td></td>
+    <td><img src="docs/images/path-finder.png" alt="The resource explorer with the Paths panel open, listing the three shortest foaf:knows paths from Freya Lindqvist to Lukáš Novák, which pass through ten different people, and drawing them over her neighbourhood with each edge numbered by the paths that use it"></td>
   </tr>
   <tr>
     <td>The schema browser</td>
-    <td></td>
+    <td>The k shortest paths between two people</td>
   </tr>
 </table>
 

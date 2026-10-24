@@ -1218,6 +1218,42 @@ search never makes it. `ps-every-both` returns a different path of the same leng
 before, because skipping literal predecessors changes the order in which ties are found.
 Both answers pass through `rdf:type` classes and no literal.
 
+#### Weighted paths for the path finder (2026-10-24)
+
+[U09](specs/U09-path-finder.md) Phase 3 lets the path finder weigh paths by a property of
+the reifiers, through F07's `path:weight`, and lists the weight properties with one
+aggregate query. The engine did not change, so a Namespace screen of the same setup as
+above checked the path searches again and timed the queries the panel now sends. A is the
+build before Phase 3 and B the lane's tip. `ps-pair-w` is `ps-pair` with
+`path:weight` and `path:cost`, `ps-pair-k5-w` is `ps-pair-k5` with the same, and
+`weight-props` is the panel's query for the weight properties. The data has no reifiers, so
+every edge weighs 1.
+
+| query | A median | B median | B/A |
+|---|---:|---:|---:|
+| `ps-pair` | 1.24 | 1.23 | 0.99 |
+| `ps-pair-all` | 1.44 | 1.24 | 0.86 |
+| `ps-pair-both` | 0.51 | 0.44 | 0.86 |
+| `ps-pair-k5` | 44.5 | 44.4 | 1.00 |
+| `ps-values10` | 8.13 | 7.96 | 0.98 |
+| `ps-all4` | 0.033 | 0.028 | 0.85 |
+| `ps-any` | 267 | 261 | 0.97 |
+| `ps-every-both` | 11.1 | 10.9 | 0.98 |
+| `ps-pair-w` | 679 | 674 | 0.99 |
+| `weight-props` | 0.017 | 0.014 | 0.83 |
+| `ps-pair-k5-w` | error | error | |
+
+Times are the server's execution times in milliseconds, and the geometric mean of B/A is
+0.93. The medians of one build varied by up to 128% between server processes on the
+fastest queries, so no change is above the noise, as expected with no engine change. The
+weighted searches show a gap instead. `ps-pair-w` takes 0.68 s where `ps-pair` takes
+1.2 ms, because a weighted search runs Dijkstra's algorithm from the source alone where an
+unweighted pair runs a breadth-first search from both ends. `ps-pair-k5-w` fails on both
+builds after about 7 s, when Yen's algorithm over Dijkstra visits more than the default
+10 million nodes. The path finder sends a limit of a million visits, so on a graph of
+this size a weighted search stops at the limit and the panel says so.
+[Roadmap](ROADMAP.md) item 150 makes weighted searches bidirectional.
+
 ### Graph algorithm polling
 
 Roadmap item 8 moved the cancellation and deadline checks of the graph algorithms

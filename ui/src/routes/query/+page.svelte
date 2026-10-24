@@ -29,7 +29,7 @@
   import { locateEntities } from '$lib/locate';
   import { entityColumns, readAt } from '$lib/result-arcs';
   import { shortLabel, triplesToGraph, type Triple } from '$lib/graph';
-  import { addMissingPrefixes, applyMissingPrefixes, queryKind, RDF_TYPE } from '$lib/rdf';
+  import { addMissingPrefixes, applyMissingPrefixes, queryKind, RDF_TYPE, termKey } from '$lib/rdf';
   import { formatEditor } from '$lib/fmt-edit';
   import { formatAny, lintAny, patternLocal, patternNow } from '$lib/fmt-wasm';
   import FacetPanel from '$components/FacetPanel.svelte';
@@ -44,7 +44,11 @@
   import { rejectionReport } from '$lib/write-validation';
   import GuardReportView from '$components/GuardReportView.svelte';
   import GraphView from '$components/GraphView.svelte';
-  import LargeGraphView, { type LNode } from '$components/LargeGraphView.svelte';
+  import LargeGraphView, { type LEdge, type LNode } from '$components/LargeGraphView.svelte';
+  import PathPanel from '$components/PathPanel.svelte';
+  import type { Picked } from '$components/EntityPicker.svelte';
+  import * as pf from '$lib/paths';
+  import { mergePaths, type PathOverlay } from '$lib/path-overlay';
   import { chooseRenderer, hasWebGL2, seed, type Renderer } from '$lib/overview';
   import Icon from '$components/Icon.svelte';
   import ExplainedPlan from '$components/ExplainedPlan.svelte';
@@ -2143,6 +2147,158 @@
   const lensMarked = $derived(entryIds(lenses.results, lensPick));
   /** The graph on the canvas: the WebGL view's or the canvas renderer's. */
   const drawnGraph = $derived(choice.renderer === 'webgl' ? graph : canvasGraph);
+
+  // --- the path finder on the result graph (docs/specs/U09-path-finder.md, Phase 3) -------
+
+  let pathsOpen = $state(false);
+  let pathFrom = $state<Picked | null>(null);
+  let pathTo = $state<Picked | null>(null);
+  /** The path the graph highlights, null for every path. */
+  let pathFocus = $state<number | null>(null);
+  let pathOverlay = $state<PathOverlay | null>(null);
+  let pathLabels = $state(new Map<string, string>());
+  let pathPanel: PathPanel | undefined = $state();
+  let largeView: LargeGraphView | undefined = $state();
+  let pathMenu = $state<{ id: string; x: number; y: number } | null>(null);
+  /** The result the paths were found for: a new result clears them. */
+  let pathsFor: Outcome | undefined;
+  $effect(() => {
+    const o = outcome;
+    if (o === pathsFor) return;
+    pathsFor = o;
+    untrack(() => {
+      pathsOpen = false;
+      pathOverlay = null;
+      pathFocus = null;
+      pathMenu = null;
+    });
+  });
+  /**
+   * The WebGL graph the paths were last shown or cleared on: while it is still the one
+   * drawn, showing or clearing paths updates the picture in place, without a new layout.
+   */
+  let pathBase = $state.raw<LNode[] | null>(null);
+  /**
+   * Whether the WebGL view's layout of the drawn graph has settled: paths that arrive while
+   * it still runs are drawn by a new layout, since there is no settled picture to keep.
+   */
+  let largeSettled = $state(false);
+  $effect(() => {
+    void largeNodes;
+    largeSettled = false;
+  });
+  const pickedOf = (id: string | null): Picked | null => {
+    // the nodes the paths added can start a search too
+    const n = id ? (pathGraph?.nodes ?? drawnGraph.nodes).find((x) => x.id === id) : undefined;
+    return n?.term && n.term.type === 'uri' ? { term: n.term, label: n.label } : null;
+  };
+  function openPaths(opts: { from?: string; to?: string } = {}) {
+    if (opts.from) pathFrom = pickedOf(opts.from) ?? pathFrom;
+    if (opts.to) pathTo = pickedOf(opts.to) ?? pathTo;
+    // the selected node of the WebGL view starts the path
+    if (!opts.from && !opts.to && !pathFrom) pathFrom = pickedOf(largeSelected);
+    graphList = false;
+    pathsOpen = true;
+    pathMenu = null;
+    queueMicrotask(() => pathPanel?.focus());
+  }
+  function closePaths() {
+    pathBase = largeNodes;
+    pathsOpen = false;
+    pathOverlay = null;
+    pathFocus = null;
+  }
+  function clearPaths() {
+    pathBase = largeNodes;
+    pathOverlay = null;
+    pathFocus = null;
+  }
+  function showPaths(r: { paths: pf.FoundPath[]; labels: Map<string, string> } | null) {
+    pathBase = largeNodes;
+    pathFocus = null;
+    if (!r) {
+      pathOverlay = null;
+      return;
+    }
+    pathLabels = r.labels;
+    pathOverlay = pf.overlay(r.paths);
+  }
+  const pathLabel = (t: api.Term) =>
+    t.type === 'uri'
+      ? (pathLabels.get(t.value) ?? shortLabel(t.value, prefixes))
+      : t.type === 'literal'
+        ? String(t.value)
+        : termKey(t);
+  /** The drawn graph with the paths on it, for the renderer in use. */
+  const pathGraph = $derived(
+    pathOverlay
+      ? mergePaths(drawnGraph.nodes, drawnGraph.edges, pathOverlay, pathLabel, (p) =>
+          shortLabel(p, prefixes),
+        )
+      : null,
+  );
+  /**
+   * The WebGL view's nodes and edges with the paths on them. The view places the nodes the
+   * paths add between their neighbours already laid out, so the seed is only a fallback.
+   */
+  const largePathNodes: LNode[] = $derived.by(() => {
+    if (!pathGraph || choice.renderer !== 'webgl') return largeNodes;
+    const colors = graphColors();
+    const known = new Map(largeNodes.map((n) => [n.key, n]));
+    return pathGraph.nodes.map((n) => {
+      const base = known.get(n.id);
+      if (base) return n.paths ? { ...base, paths: n.paths } : base;
+      const p = seed(n.id, undefined, 100);
+      return {
+        key: n.id,
+        label: n.label,
+        size: n.kind === 'literal' ? 2.5 : 3.5,
+        color: colors[n.kind] ?? colors.iri,
+        x: p.x,
+        y: p.y,
+        paths: n.paths,
+      };
+    });
+  });
+  const largePathEdges: LEdge[] = $derived(
+    pathGraph && choice.renderer === 'webgl'
+      ? pathGraph.edges.map((e) => ({
+          key: e.id,
+          source: e.source,
+          target: e.target,
+          size: 0.6,
+          ...(e.paths ? { paths: e.paths } : {}),
+        }))
+      : largeEdges,
+  );
+  function fitPath(p: pf.FoundPath) {
+    if (choice.renderer === 'webgl') largeView?.fitPath(p.n);
+  }
+  /** Shift+P opens the path finder, and while it is open the graph takes its keys too. */
+  function onGraphKey(e: KeyboardEvent) {
+    if (e.metaKey || e.ctrlKey || e.altKey) return;
+    const el = e.target as HTMLElement | null;
+    if (el?.closest?.('input, select, textarea, .cm-editor, .gpaths')) return;
+    if (e.key === 'P' && e.shiftKey) {
+      e.preventDefault();
+      openPaths();
+      return;
+    }
+    if (!pathsOpen) return;
+    const count = pathOverlay ? new Set(pathOverlay.edges.flatMap((x) => x.paths)).size : 0;
+    if (/^[1-9]$/.test(e.key) && Number(e.key) <= count) {
+      e.preventDefault();
+      pathFocus = Number(e.key);
+    } else if ((e.key === 'a' || e.key === 'A') && pathOverlay) {
+      e.preventDefault();
+      pathFocus = null;
+    } else if (e.key === 'Escape') {
+      e.preventDefault();
+      if (pathMenu) pathMenu = null;
+      else if (pathFocus != null) pathFocus = null;
+      else closePaths();
+    }
+  }
   $effect(() => {
     const o = outcome;
     if (!o || o.view !== 'graph' || o.status !== 'done' || !o.result) return;
@@ -3439,7 +3595,8 @@
               </div>
             {/if}
           {:else if outcome.view === 'graph'}
-            <div class="graph-view">
+            <!-- svelte-ignore a11y_no_static_element_interactions -->
+            <div class="graph-view" onkeydown={onGraphKey}>
               <div class="gopts">
                 {#if r.queryType === 'SELECT'}
                   {#each ['s', 'p', 'o'] as const as role (role)}
@@ -3490,6 +3647,13 @@
                 </label>
                 <span class="spacer"></span>
                 {#if drawnGraph.nodes.length}
+                  <button
+                    class="btn sm"
+                    aria-pressed={pathsOpen}
+                    title="Find paths between two entities (Shift+P)"
+                    onclick={() => (pathsOpen ? closePaths() : openPaths())}
+                    ><Icon name="route" size={13} /> Paths</button
+                  >
                   <LensMenu
                     {lenses}
                     short={(iri) => shortLabel(iri, prefixes)}
@@ -3535,54 +3699,111 @@
                   {choice.reason}.
                 </div>
               {/if}
-              <div class="gcanvas">
-                {#if graphList}
-                  <GraphListView
-                    rows={graphRows}
-                    plain
-                    label="Drawn nodes"
-                    lensColumns={lenses.columns}
-                    selected={largeSelected}
-                    onselect={(k) => (largeSelected = k)}
-                    openLabel="Explore"
-                    onopen={(k) => k.startsWith('<') && openIri(k.slice(1, -1))}
+              <div class="gbody" class:with-paths={pathsOpen}>
+                <div class="gcanvas">
+                  {#if graphList}
+                    <GraphListView
+                      rows={graphRows}
+                      plain
+                      label="Drawn nodes"
+                      lensColumns={lenses.columns}
+                      selected={largeSelected}
+                      onselect={(k) => (largeSelected = k)}
+                      openLabel="Explore"
+                      onopen={(k) => k.startsWith('<') && openIri(k.slice(1, -1))}
+                    />
+                  {:else if choice.renderer === 'webgl'}
+                    <LargeGraphView
+                      bind:this={largeView}
+                      nodes={largePathNodes}
+                      edges={largePathEdges}
+                      {pathFocus}
+                      still={pathBase === largeNodes && largeSettled}
+                      onlayout={() => (largeSettled = true)}
+                      selected={largeSelected}
+                      label="Result graph"
+                      onselect={(k) => {
+                        largeSelected = k;
+                        if (k) selection.set([k], 'the graph');
+                        else selection.clear();
+                      }}
+                      onopen={(k) => (largeSelected = k)}
+                      onfail={(reason) => (webglReason = reason)}
+                      lens={lenses.encoding}
+                      marked={lensMarked ?? (selection.active ? [...selection.ids] : null)}
+                      dimEmpty={lensMarked == null && selection.active}
+                    />
+                  {:else}
+                    <GraphView
+                      lens={lenses.encoding}
+                      marked={lensMarked}
+                      highlight={selection.active ? selection.ids : null}
+                      onselect={(id) => (id ? selection.set([id], 'the graph') : selection.clear())}
+                      nodes={pathGraph?.nodes ?? canvasGraph.nodes}
+                      edges={pathGraph?.edges ?? canvasGraph.edges}
+                      {pathFocus}
+                      onmenu={(id, at) => (pathMenu = pickedOf(id) ? { id, ...at } : null)}
+                      onexpand={(id) => id.startsWith('<') && openIri(id.slice(1, -1))}
+                      emptyText={r.queryType === 'SELECT'
+                        ? 'Pick subject and object columns to draw a graph'
+                        : 'No triples to draw'}
+                    />
+                  {/if}
+                  {#if pathMenu && choice.renderer !== 'webgl' && !graphList}
+                    <div
+                      class="node-menu"
+                      role="menu"
+                      aria-label="Node actions"
+                      style="left: {pathMenu.x}px; top: {pathMenu.y}px"
+                    >
+                      <button
+                        role="menuitem"
+                        class="btn sm ghost"
+                        onclick={() => openPaths({ from: pathMenu!.id })}>Paths from here</button
+                      >
+                      <button
+                        role="menuitem"
+                        class="btn sm ghost"
+                        onclick={() => openPaths({ to: pathMenu!.id })}>Paths to here</button
+                      >
+                    </div>
+                  {/if}
+                  <LensLegend
+                    results={lenses.results}
+                    selected={lensMarked ? lensPick : null}
+                    onselect={(key) => (lensPick = key)}
                   />
-                {:else if choice.renderer === 'webgl'}
-                  <LargeGraphView
-                    nodes={largeNodes}
-                    edges={largeEdges}
-                    selected={largeSelected}
-                    label="Result graph"
-                    onselect={(k) => {
-                      largeSelected = k;
-                      if (k) selection.set([k], 'the graph');
-                      else selection.clear();
-                    }}
-                    onopen={(k) => (largeSelected = k)}
-                    onfail={(reason) => (webglReason = reason)}
-                    lens={lenses.encoding}
-                    marked={lensMarked ?? (selection.active ? [...selection.ids] : null)}
-                    dimEmpty={lensMarked == null && selection.active}
-                  />
-                {:else}
-                  <GraphView
-                    lens={lenses.encoding}
-                    marked={lensMarked}
-                    highlight={selection.active ? selection.ids : null}
-                    onselect={(id) => (id ? selection.set([id], 'the graph') : selection.clear())}
-                    nodes={canvasGraph.nodes}
-                    edges={canvasGraph.edges}
-                    onexpand={(id) => id.startsWith('<') && openIri(id.slice(1, -1))}
-                    emptyText={r.queryType === 'SELECT'
-                      ? 'Pick subject and object columns to draw a graph'
-                      : 'No triples to draw'}
-                  />
+                </div>
+                {#if pathsOpen}
+                  <aside class="gpaths" aria-label="Path finder">
+                    {#key onBranch(outcome.ds, outcome.branch)}
+                      <PathPanel
+                        bind:this={pathPanel}
+                        ds={onBranch(outcome.ds, outcome.branch)}
+                        branch={outcome.branch ?? 'main'}
+                        {prefixes}
+                        at={(outcome.result && resultState(outcome.result)) ?? ''}
+                        bind:from={pathFrom}
+                        bind:to={pathTo}
+                        bind:highlight={pathFocus}
+                        onresult={showPaths}
+                        onopenquery={(query, at) => {
+                          // the new tab reads the dataset, branch and state the paths came from
+                          const o = outcome;
+                          addTab(query, 'Paths');
+                          if (o) {
+                            app.setDataset(o.ds);
+                            app.queryBranch = !o.branch || o.branch === MAIN ? '' : o.branch;
+                          }
+                          app.queryAt = at;
+                        }}
+                        onclear={clearPaths}
+                        onclose={closePaths}
+                        onfit={fitPath}
+                      />
+                    {/key}
+                  </aside>
                 {/if}
-                <LensLegend
-                  results={lenses.results}
-                  selected={lensMarked ? lensPick : null}
-                  onselect={(key) => (lensPick = key)}
-                />
               </div>
               {#if choice.renderer === 'webgl'}
                 <div class="ghint faint">
@@ -4546,11 +4767,55 @@
   .check.disabled {
     opacity: 0.5;
   }
-  .gcanvas {
+  .gbody {
     flex: 1;
     min-height: 0;
+    display: flex;
+    position: relative;
+  }
+  .gcanvas {
+    flex: 1;
+    min-width: 0;
+    min-height: 0;
+    overflow: hidden;
     /* the lens legend docks in its corner */
     position: relative;
+  }
+  .gpaths {
+    width: min(380px, 42%);
+    min-height: 0;
+    display: flex;
+    flex-direction: column;
+    border-left: 1px solid var(--border);
+  }
+  .node-menu {
+    position: absolute;
+    z-index: 20;
+    display: grid;
+    padding: 4px;
+    background: var(--surface);
+    border: 1px solid var(--border-strong);
+    border-radius: 6px;
+    box-shadow: var(--shadow, 0 6px 18px rgb(0 0 0 / 0.15));
+  }
+  .node-menu .btn {
+    justify-content: flex-start;
+  }
+  @media (max-width: 600px) {
+    .gpaths {
+      position: absolute;
+      left: 0;
+      right: 0;
+      bottom: 0;
+      width: auto;
+      z-index: 15;
+      max-height: 85%;
+      border-left: 0;
+      border-top: 1px solid var(--border-strong);
+      border-radius: 12px 12px 0 0;
+      box-shadow: 0 -6px 18px rgb(0 0 0 / 0.12);
+      background: var(--surface);
+    }
   }
   .ghint {
     padding: 4px 12px;

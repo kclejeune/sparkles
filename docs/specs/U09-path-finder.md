@@ -1,13 +1,13 @@
 # U09: A path finder between two entities
 
-> **Status:** partly implemented
+> **Status:** implemented
 >
-> **Phases:** Phases 1 and 2 shipped on 2026-10-23. Phase 1 adds two parameters to F07's
-> path search, excluded predicates and a degree limit for the nodes a search passes
-> through. Phase 2 is the path finder in Explore, which draws the shortest path or the k
-> shortest paths between two entities and animates them, with predicate, direction and
-> length filters. Phase 3, which adds weights from reifiers, paths in the query page's
-> graph results and the WebGL view, is not built.
+> **Phases:** Phases 1 and 2 shipped on 2026-10-23 and Phase 3 on 2026-10-24. Phase 1 adds
+> two parameters to F07's path search, excluded predicates and a degree limit for the nodes
+> a search passes through. Phase 2 is the path finder in Explore, which draws the shortest
+> path or the k shortest paths between two entities and animates them, with predicate,
+> direction and length filters. Phase 3 adds weights from reifiers and draws the paths on
+> the query page's graph results, in the canvas and in the WebGL view.
 >
 > **User docs:** [API: Path search](../API.md#path-search) ·
 > [Usage: Finding paths](../USAGE.md#finding-paths) · [Features](../FEATURES.md#web-ui)
@@ -306,8 +306,8 @@ how.
 
 ## Outcome
 
-Phases 1 and 2 shipped on 2026-10-23 under [ROADMAP](../ROADMAP.md) item 103. Phase 3 is
-not built and stays under item 103.
+Phases 1 and 2 shipped on 2026-10-23 and Phase 3 on 2026-10-24, which completes
+[ROADMAP](../ROADMAP.md) item 103.
 
 **Decisions.** The default excluded predicates are a dataset setting, as question 1
 proposed. C19 gained the settings kind `paths`, kept in `paths.json` at version 1, whose
@@ -345,8 +345,8 @@ paths are drawn alone. At 390 px the panel is a bottom sheet that folds to a han
 Vitest tests, and `ui/tests/mock/paths.spec.ts` runs A4, A5 and A7 to A10, the empty states
 and **Open in editor** against the mock server, whose path search is a breadth-first
 search with Yen's algorithm for k shortest. The Playwright tests against a real server
-that §9 lists for A1, A4, A6 and A7 are not written, and ROADMAP item 103 keeps them
-with Phase 3. The Rust and router tests cover A1, A2, A3 and A6 on the engine.
+that §9 lists for A1, A4, A6 and A7 came with Phase 3, which the Phase 3 tests below
+describe. The Rust and router tests cover A1, A2, A3 and A6 on the engine.
 `mise run docs:screenshots` writes `docs/images/path-finder.png`, the three shortest paths
 between two people of the demo dataset, which the README shows.
 
@@ -354,3 +354,59 @@ between two people of the demo dataset, which the README shows.
 found no change above the noise, with a geometric mean of 0.97 for the new build over the
 old one. [BENCHMARKS](../BENCHMARKS.md#skipped-predicates-and-hubs-2026-10-23) has the
 table. A forge A/B is a follow-up after the merge.
+
+**Phase 3.** The engine needed no change, because F07 already weighs edges by a reifier
+property with `path:weight` and binds a path's sum with `path:cost`, and its Dijkstra and
+Yen searches already honour the Phase 1 filters. The Rust test
+`weights_with_skipped_predicates_and_hubs` checks that they combine. The panel gained a
+**Weight** select whose options come from one query for the properties that reifiers carry
+with numeric values of zero or more, grouped and counted, at most 20. That query reads every
+reifier, so the list loads when the select is first focused rather than when the filters
+open, and again at a new dataset or state. With a weight chosen the panel's query adds
+`path:weight` and `path:cost`, the rows show each path's cost, and the announcement names
+the cheapest. On the query page the **Paths** button of the graph toolbar and `Shift+P`
+open the same panel beside the result graph, at the result's state and branch. A node menu
+on the canvas offers **Paths from here** and **Paths to here**, and in the WebGL view the
+selected node fills **From**. The paths are matched to the result's edges by their triples,
+and the nodes and edges a path needs that the result lacks are added while the paths are
+shown, placed between their neighbours on the path. A literal gets a node per triple, as
+the result graph draws literals, so two triples that end in the same literal are marked
+apart. The WebGL view draws path edges thicker in the path colour, forces the labels of
+path nodes, dims the rest when one path is focused and draws the path numbers at the
+edges' midpoints, at most 400 of them. Showing or clearing paths updates the WebGL picture
+in place, so its layout and camera stay where they were. The keys of §2.3 work with the
+focus on the graph as well as in the list, and **Open in editor** opens the query in a new
+tab of the same page, since the query page is already open.
+
+**Phase 3 measurements.** A Namespace screen found the path searches unchanged, with a
+geometric mean of 0.93 for the new build over the old one and no query above the noise,
+since the engine did not change. It also timed the weighted searches the panel now sends.
+A weighted pair search takes 0.68 s on the 10.5M-triple data against 1.2 ms unweighted,
+and the five cheapest paths stop at the default limit of 10 million visited nodes.
+[BENCHMARKS](../BENCHMARKS.md#weighted-paths-for-the-path-finder-2026-10-24) has the table,
+and ROADMAP item 150 makes weighted searches bidirectional.
+
+**Phase 3 decisions.** The spec left these open, and each was decided here. The weight
+picker offers reifier properties only, with no free IRI field, since a weight that no
+reifier carries makes every edge weigh 1. The WebGL view does not animate the paths,
+because its layout runs in a worker and the overlay is redrawn by sigma's reducers, so the
+paths appear at once as with reduced motion. The query page offers no **Add to graph**,
+because a result graph is the query's answer, and a new result or closing the panel
+removes the paths and the nodes they added. On the real server the default graph is not the
+union of the named graphs, so A6 hides `ex:alice ex:worksFor ex:acme` from the reader with
+a C12b protection on `ex:worksFor` for members of `ex:Founder` rather than with a graph
+grant.
+
+**Phase 3 tests.** `ui/src/lib/paths.test.ts` has 20 Vitest tests, four of them for the
+weight, and `ui/src/lib/path-overlay.test.ts` has 9 for merging paths into a drawn result and placing the nodes they add.
+`ui/tests/mock/paths-phase3.spec.ts` checks the weighted search in Explore, a weight list
+that follows the state and drops a weight the state lacks, the panel on the query page's
+canvas with the added nodes, the node menu, **Open in editor** and the reset on a new
+result, the WebGL overlay's edge count with and without a focused path, the keys with the
+focus on the graph, a layout that does not restart, and the phone sheet at 390 px with no
+sideways scroll. The mock's path search enumerates simple paths by cost
+when a weight is set. `ui/tests/e2e/paths.spec.ts` runs A1, A4, A6 and A7 against the real
+server on a dataset loaded in two commits. `mise run docs:screenshots` writes
+`docs/images/query-paths.png`, the three shortest flight routes from Vancouver to Auckland
+by distance over a query's graph, which leads the README's path entry, and
+`path-finder.png` moved to the README's further screenshots.

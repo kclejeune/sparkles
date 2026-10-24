@@ -10,6 +10,8 @@
     y: number;
     /** Kept in place while the layout runs (it was laid out before). */
     fixed?: boolean;
+    /** The numbers of the found paths through the node (U09 Phase 3). */
+    paths?: number[];
   };
   export type LEdge = {
     key: string;
@@ -17,6 +19,8 @@
     target: string;
     size?: number;
     color?: string;
+    /** The numbers of the found paths along the edge. */
+    paths?: number[];
   };
 </script>
 
@@ -35,6 +39,7 @@
   import type Sigma from 'sigma';
   import type { LayoutStart, LayoutTick } from '$lib/layout.worker';
   import { NO_ENCODING, OTHER, readPalette, sizeFactor, type Encoding } from '$lib/lens';
+  import { placeAdded } from '$lib/path-overlay';
 
   let {
     nodes,
@@ -50,6 +55,7 @@
     dimEmpty = false,
     still = false,
     lens = NO_ENCODING,
+    pathFocus = null,
   }: {
     nodes: LNode[];
     edges: LEdge[];
@@ -77,6 +83,11 @@
      * drawn on the overlay, since sigma's edge programs have no dashes.
      */
     lens?: Encoding;
+    /**
+     * The path the path finder highlights (U09 Phase 3): its nodes and edges stand out and
+     * the rest is dimmed. Null shows every path, drawn in the accent colour over the graph.
+     */
+    pathFocus?: number | null;
   } = $props();
 
   let host: HTMLDivElement;
@@ -158,6 +169,13 @@
 
   let near: Set<string> | null = null;
   const markSet = $derived(new Set(marked ?? []));
+  /** The path elements of the drawn graph, nodes and edges. */
+  let pathCount = 0;
+  /** Whether an element on these paths is shown as a path: on the focused one, or on any. */
+  function onPath(paths: number[] | undefined): boolean {
+    if (!paths?.length) return false;
+    return pathFocus == null || paths.includes(pathFocus);
+  }
 
   function setFocusSet() {
     const k = hovered ?? selected;
@@ -201,6 +219,7 @@
       ctx.stroke();
     };
     drawInferred(ctx, w, h);
+    drawPathNumbers(ctx, w, h);
     ring(selected, false);
     if (focusKey !== selected) ring(focusKey, true);
     for (const m of marked ?? []) if (m !== selected) ring(m, true);
@@ -309,6 +328,52 @@
     overlay.dataset.pairs = String(pairs);
   }
 
+  /** Path edges whose numbers the overlay writes at most. */
+  const MAX_PATH_LABELS = 400;
+
+  /** The numbers of the paths along each shown path edge, at its middle. */
+  function drawPathNumbers(ctx: CanvasRenderingContext2D, w: number, h: number) {
+    if (!graph || !pathCount) {
+      overlay.dataset.pathEdges = '0';
+      overlay.dataset.pathFocus = '';
+      return;
+    }
+    let shown = 0;
+    let labelled = 0;
+    ctx.save();
+    ctx.font = `600 10px ${renderer?.getSetting('labelFont') ?? 'sans-serif'}`;
+    ctx.textAlign = 'center';
+    ctx.textBaseline = 'middle';
+    graph.forEachEdge((_k, a, s, t) => {
+      const paths = a.paths as number[] | undefined;
+      if (!onPath(paths)) return;
+      shown++;
+      if (labelled >= MAX_PATH_LABELS) return;
+      const p = place(s);
+      const q = place(t);
+      if (!p || !q) return;
+      const mx = (p.x + q.x) / 2;
+      const my = (p.y + q.y) / 2;
+      if (mx < -20 || my < -20 || mx > w + 20 || my > h + 20) return;
+      const text = paths!.join(',');
+      const bw = 8 + text.length * 6;
+      ctx.fillStyle = colors.spark;
+      ctx.strokeStyle = colors.surface;
+      ctx.lineWidth = 1.5;
+      ctx.beginPath();
+      ctx.roundRect(mx - bw / 2, my - 7, bw, 14, 7);
+      ctx.fill();
+      ctx.stroke();
+      ctx.fillStyle = colors.onSpark;
+      ctx.fillText(text, mx, my + 0.5);
+      labelled++;
+    });
+    ctx.restore();
+    // for the tests: the overlay has no elements to find
+    overlay.dataset.pathEdges = String(shown);
+    overlay.dataset.pathFocus = pathFocus == null ? '' : String(pathFocus);
+  }
+
   /** The badges: a pill with "i" and the count at the upper right of each badged node. */
   function drawBadges(ctx: CanvasRenderingContext2D, w: number, h: number) {
     if (!lens.badge || !lens.nodes.size) return;
@@ -389,6 +454,19 @@
             res.forceLabel = true;
             res.zIndex = 2;
           }
+          if (pathCount) {
+            const on = onPath(data.paths as number[] | undefined);
+            if (on) {
+              res.forceLabel = true;
+              res.zIndex = 3;
+              res.color = data.color as string;
+              res.label = data.label as string;
+            } else if (pathFocus != null) {
+              res.color = colors.edge;
+              res.label = '';
+              res.zIndex = 0;
+            }
+          }
           return res;
         },
         edgeReducer: (key, data) => {
@@ -397,6 +475,20 @@
           if (dashOverlay() && lens.inferred.has(key)) {
             res.hidden = true;
             return res;
+          }
+          if (pathCount) {
+            if (onPath(data.paths as number[] | undefined)) {
+              res.color = colors.spark;
+              res.size = Math.max(2.5, (data.size as number) ?? 1);
+              res.zIndex = 3;
+              res.hidden = false;
+              return res;
+            }
+            if (pathFocus != null) {
+              res.color = colors.edge;
+              res.hidden = edges.length > 2000;
+              return res;
+            }
           }
           if (near && graph) {
             const [s, t] = graph.extremities(key);
@@ -443,6 +535,17 @@
     });
     renderer.on('afterRender', drawOverlay);
     ready = true;
+    // sigma follows the window's size only, and a panel beside the view, such as the path
+    // finder's, narrows the host without resizing the window
+    if (typeof ResizeObserver === 'function') {
+      sizeObserver = new ResizeObserver(() => {
+        if (renderer && !destroyed) {
+          renderer.resize();
+          renderer.refresh();
+        }
+      });
+      sizeObserver.observe(host);
+    }
     sync();
   }
 
@@ -548,6 +651,9 @@
       weights.push((a.weight as number) ?? 1);
     });
     layoutId++;
+    // how many layouts this view has started, for tests that check it holds still
+    layoutRuns++;
+    if (overlay) overlay.dataset.layoutRuns = String(layoutRuns);
     fitAfter = fit;
     const msg: LayoutStart = {
       type: 'start',
@@ -567,6 +673,8 @@
   }
 
   let fitAfter = false;
+  let layoutRuns = 0;
+  let sizeObserver: ResizeObserver | undefined;
   /** Whether every node shows its label (a small picture). */
   let allLabels = false;
 
@@ -582,10 +690,34 @@
     return Math.round(Math.min(Math.max(60, 30 + chars * 7), side / 4));
   }
 
+  /** Add `paths` to the path numbers of a drawn edge. */
+  function mergePaths(key: string, paths: number[]) {
+    if (!graph) return;
+    const had = (graph.getEdgeAttribute(key, 'paths') as number[] | undefined) ?? [];
+    graph.setEdgeAttribute(
+      key,
+      'paths',
+      [...new Set([...had, ...paths])].sort((a, b) => a - b),
+    );
+  }
+
+  function countPaths() {
+    let n = 0;
+    graph?.forEachNode((_k, a) => {
+      if ((a.paths as number[] | undefined)?.length) n++;
+    });
+    graph?.forEachEdge((_k, a) => {
+      if ((a.paths as number[] | undefined)?.length) n++;
+    });
+    pathCount = n;
+  }
+
   /** Rebuild the graph from the props, keeping the positions of nodes already drawn. */
   function sync() {
     if (!graph || !renderer) return;
     const before = positions();
+    // a new level is normalized by its own bounds
+    renderer.setCustomBBox(null);
     graph.clear();
     for (const n of nodes) {
       const p = before.get(n.key);
@@ -596,17 +728,24 @@
         x: p?.x ?? n.x,
         y: p?.y ?? n.y,
         fixed: !!n.fixed,
+        ...(n.paths?.length ? { paths: n.paths } : {}),
       });
     }
     for (const e of edges) {
       if (e.source === e.target || !graph.hasNode(e.source) || !graph.hasNode(e.target)) continue;
-      if (graph.hasEdge(e.source, e.target)) continue;
+      if (graph.hasEdge(e.source, e.target)) {
+        // one edge per pair is drawn: it carries the paths of the others
+        if (e.paths?.length) mergePaths(graph.edge(e.source, e.target)!, e.paths);
+        continue;
+      }
       graph.addEdgeWithKey(e.key, e.source, e.target, {
         size: e.size ?? 1,
         weight: e.size ?? 1,
         ...(e.color ? { color: e.color } : {}),
+        ...(e.paths?.length ? { paths: e.paths } : {}),
       });
     }
+    countPaths();
     renderer.setSetting('defaultEdgeType', edgeType());
     renderer.setSetting('hideEdgesOnMove', edges.length > 50000);
     renderer.setSetting('stagePadding', stagePadding());
@@ -614,6 +753,12 @@
     setFocusSet();
     // a new level is fitted into view once it has settled
     startLayout(true);
+  }
+
+  /** A twenty-fifth of the larger side of the picture, or 20 for an empty one. */
+  function gapOf(b: { x: [number, number]; y: [number, number] }): number {
+    const side = Math.max(b.x[1] - b.x[0], b.y[1] - b.y[0]);
+    return Number.isFinite(side) && side > 0 ? side / 25 : 20;
   }
 
   /** The props' sizes, colours and labels on the drawn graph, positions kept and no layout. */
@@ -624,21 +769,64 @@
     g.forEachNode((k) => {
       if (!want.has(k)) g.dropNode(k);
     });
+    // the paths change the picture in place: sigma's bounds stay as they were, so the nodes
+    // a path adds do not rescale the picture and move the nodes already drawn
+    const paths = pathCount > 0 || nodes.some((n) => n.paths?.length);
+    if (paths && !renderer.getCustomBBox()) renderer.setCustomBBox(renderer.getBBox());
+    // a node new to the picture, such as one a path adds, is placed among its neighbours on
+    // the paths, and any other at its own coordinates
+    const fresh: LNode[] = [];
     for (const n of nodes) {
-      const a = { label: n.label, size: n.size, color: n.color };
+      const a = { label: n.label, size: n.size, color: n.color, paths: n.paths };
       if (g.hasNode(n.key)) g.mergeNodeAttributes(n.key, a);
-      else g.addNode(n.key, { ...a, x: n.x, y: n.y, fixed: true });
+      else fresh.push(n);
+    }
+    const place = placeAdded(
+      fresh.map((n) => ({ id: n.key, fallback: { x: n.x, y: n.y } })),
+      edges,
+      (k) => {
+        if (!g.hasNode(k)) return undefined;
+        const a = g.getNodeAttributes(k);
+        return { x: a.x as number, y: a.y as number };
+      },
+      // a group that hangs from one drawn node fans out by a step of the picture's size
+      // the pinned bounds, which a previous overlay's nodes do not widen
+      gapOf(renderer.getCustomBBox() ?? renderer.getBBox()),
+    );
+    for (const n of fresh) {
+      const p = place.get(n.key)!;
+      g.addNode(n.key, {
+        label: n.label,
+        size: n.size,
+        color: n.color,
+        paths: n.paths,
+        x: p.x,
+        y: p.y,
+        fixed: true,
+      });
     }
     const wantE = new Set(edges.map((e) => e.key));
     g.forEachEdge((k) => {
       if (!wantE.has(k)) g.dropEdge(k);
+      else g.removeEdgeAttribute(k, 'paths');
     });
+    // the drawn edges first, then the paths of the other edges of the same pair, so that
+    // the one drawn edge of a pair carries the paths of all of them in any order
+    const merge: LEdge[] = [];
     for (const e of edges) {
       if (e.source === e.target || !g.hasNode(e.source) || !g.hasNode(e.target)) continue;
-      const a = { size: e.size ?? 1, weight: e.size ?? 1, ...(e.color ? { color: e.color } : {}) };
+      const a = {
+        size: e.size ?? 1,
+        weight: e.size ?? 1,
+        ...(e.paths?.length ? { paths: e.paths } : {}),
+        ...(e.color ? { color: e.color } : {}),
+      };
       if (g.hasEdge(e.key)) g.mergeEdgeAttributes(e.key, a);
       else if (!g.hasEdge(e.source, e.target)) g.addEdgeWithKey(e.key, e.source, e.target, a);
+      else if (e.paths?.length) merge.push(e);
     }
+    for (const e of merge) mergePaths(g.edge(e.source, e.target)!, e.paths!);
+    countPaths();
     setFocusSet();
     renderer.refresh();
   }
@@ -656,8 +844,34 @@
     void selected;
     void marked;
     void dimEmpty;
+    void pathFocus;
     if (ready) setFocusSet();
   });
+
+  /** Fit the nodes of a path, or of every path, into view. */
+  export function fitPath(n: number | null) {
+    if (!renderer || !graph) return;
+    const keys: string[] = [];
+    graph.forEachNode((k, a) => {
+      const p = a.paths as number[] | undefined;
+      if (p?.length && (n == null || p.includes(n))) keys.push(k);
+    });
+    if (!keys.length) return;
+    let [x0, y0, x1, y1] = [Infinity, Infinity, -Infinity, -Infinity];
+    for (const k of keys) {
+      const d = renderer.getNodeDisplayData(k);
+      if (!d) continue;
+      x0 = Math.min(x0, d.x);
+      y0 = Math.min(y0, d.y);
+      x1 = Math.max(x1, d.x);
+      y1 = Math.max(y1, d.y);
+    }
+    if (!Number.isFinite(x0)) return;
+    const ratio = Math.min(1, Math.max(0.05, Math.max(x1 - x0, y1 - y0) * 1.6));
+    renderer
+      .getCamera()
+      .animate({ x: (x0 + x1) / 2, y: (y0 + y1) / 2, ratio }, { duration: reduced() ? 0 : 300 });
+  }
 
   // a lens's new look is drawn in place, without a layout
   $effect(() => {
@@ -837,6 +1051,7 @@
 
   onDestroy(() => {
     themeObserver?.disconnect();
+    sizeObserver?.disconnect();
     media?.removeEventListener('change', readColors);
     stopLayout();
     worker?.terminate();

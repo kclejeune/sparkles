@@ -19,6 +19,29 @@ ex:bob a ex:Person ; ex:worksFor ex:acme ; ex:name "Bob" .
 ex:acme a ex:Org ; ex:locatedIn ex:lyon ; ex:name "Acme" .
 `;
 
+/**
+ * The path finder's dataset (spec U09 A1, A4, A6 and A7): U03 §7's people, organizations
+ * and cities, every one typed, loaded in two commits. The second adds
+ * `ex:alice ex:knows ex:bob`. The protection `PATHS_PROTECTION` covers the employer of a
+ * founder, which is `ex:alice ex:worksFor ex:acme`: `USER` lifts it and `READER` does not.
+ */
+export const PATHS_DATASET = 'paths-e2e';
+export const PATHS_EX = 'http://example.org/paths/';
+export const PATHS_PROTECTION = 'founders-work';
+export const PATHS_DATA = [
+  `@prefix ex: <${PATHS_EX}> .
+@prefix rdfs: <http://www.w3.org/2000/01/rdf-schema#> .
+ex:alice a ex:Person , ex:Founder ; rdfs:label "Alice" ; ex:worksFor ex:acme .
+ex:bob a ex:Person ; rdfs:label "Bob" ; ex:worksFor ex:beta .
+ex:acme a ex:Org ; rdfs:label "Acme" ; ex:locatedIn ex:lyon .
+ex:beta a ex:Org ; rdfs:label "Beta" ; ex:locatedIn ex:lyon .
+ex:lyon a ex:City ; rdfs:label "Lyon" .
+`,
+  `@prefix ex: <${PATHS_EX}> .
+ex:alice ex:knows ex:bob .
+`,
+];
+
 /** The dataset the server without auth is started with (`--mem`), so it is declared. */
 export const DECLARED_DATASET = 'declared-e2e';
 

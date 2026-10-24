@@ -839,3 +839,76 @@ fn literals_end_paths_and_are_not_passed_through() {
     .collect();
     assert_eq!(from, ["a".to_string(), "b".to_string()].into());
 }
+
+/// Weights from reifiers (U09 Phase 3) together with skipped predicates and a hub limit:
+/// the cheapest path that avoids hubs and skipped triples, in every weighted mode.
+#[test]
+fn weights_with_skipped_predicates_and_hubs() {
+    // a cheap way through the hub h, a typed way through the class C, and dearer plain
+    // ways through b and c
+    let mut ttl = String::from(
+        "ex:a ex:p ex:h {| ex:w 0.1 |} . ex:h ex:p ex:t {| ex:w 0.1 |} .
+         ex:a a ex:C . ex:t a ex:C .
+         ex:a ex:p ex:b {| ex:w 0.5 |} . ex:b ex:p ex:t {| ex:w 0.5 |} .
+         ex:a ex:p ex:c {| ex:w 1 |} . ex:c ex:p ex:t {| ex:w 1 |} .\n",
+    );
+    for i in 0..10 {
+        ttl.push_str(&format!("ex:h ex:p ex:x{i} .\n"));
+    }
+    let s = store_of(&ttl);
+    let base = "path:source ex:a ; path:target ex:t ; path:direction path:both ; path:weight ex:w";
+    let cost = |params: &str| -> Vec<(String, String)> {
+        let q = format!(
+            "SELECT ?path ?c ?len WHERE {{ SERVICE path:search {{ [] {base} ; {params} ; \
+             path:pathIndex ?path ; path:cost ?c ; path:length ?len }} }} ORDER BY ?path"
+        );
+        rows(&s, &q)
+            .into_iter()
+            .map(|r| (r["c"].clone(), r["len"].clone()))
+            .collect()
+    };
+    let found = |params: &str| -> BTreeSet<String> {
+        paths(&rows(&s, &search(&format!("{base} ; {params}"))), "a")
+    };
+    // without filters the hub is the cheapest way
+    assert_eq!(
+        found("path:algorithm path:shortest"),
+        ["a h t".to_string()].into()
+    );
+    // without the hub the way through b is the cheapest
+    assert_eq!(
+        found("path:algorithm path:allShortest ; path:maxDegree 5"),
+        ["a b t".to_string()].into()
+    );
+    // the typed triples weigh the default 1, so the class ties with the way through c
+    assert_eq!(
+        found("path:algorithm path:kShortest ; path:k 3 ; path:maxDegree 5"),
+        [
+            "a b t".to_string(),
+            "a C t".to_string(),
+            "a c t".to_string()
+        ]
+        .into()
+    );
+    assert_eq!(
+        cost("path:algorithm path:kShortest ; path:k 3 ; path:maxDegree 5"),
+        [
+            ("1".to_string(), "2".to_string()),
+            ("2".to_string(), "2".to_string()),
+            ("2".to_string(), "2".to_string())
+        ]
+    );
+    // k shortest in cost order, without the hub and the class
+    assert_eq!(
+        cost(
+            "path:algorithm path:kShortest ; path:k 3 ; path:maxDegree 5 ; \
+             path:excludePredicate rdf:type"
+        ),
+        [
+            ("1".to_string(), "2".to_string()),
+            ("2".to_string(), "2".to_string())
+        ]
+    );
+    // a maximum length keeps the weighted search within it
+    assert!(cost("path:algorithm path:shortest ; path:maxLength 1").is_empty());
+}
