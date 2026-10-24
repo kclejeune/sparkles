@@ -615,20 +615,30 @@ fn anthropic_schema(s: &Value) -> Value {
         "exclusiveMaximum",
         "multipleOf",
     ];
-    match s {
-        Value::Object(m) => Value::Object(
-            m.iter()
-                .filter(|(k, v)| {
-                    !BOUNDS.contains(&k.as_str())
-                        // only a minItems of 0 or 1 is accepted
-                        && !(k.as_str() == "minItems" && v.as_u64().is_some_and(|n| n > 1))
-                })
-                .map(|(k, v)| (k.clone(), anthropic_schema(v)))
-                .collect(),
-        ),
-        Value::Array(a) => Value::Array(a.iter().map(anthropic_schema).collect()),
-        v => v.clone(),
+    let Value::Object(m) = s else {
+        return s.clone();
+    };
+    let mut out = serde_json::Map::new();
+    for (k, v) in m {
+        // only a minItems of 0 or 1 is accepted
+        if BOUNDS.contains(&k.as_str())
+            || (k.as_str() == "minItems" && v.as_u64().is_some_and(|n| n > 1))
+        {
+            continue;
+        }
+        let v = match (k.as_str(), v) {
+            // the members are named schemas, so a member called `maximum` stays
+            ("properties", Value::Object(p)) => Value::Object(
+                p.iter()
+                    .map(|(name, sub)| (name.clone(), anthropic_schema(sub)))
+                    .collect(),
+            ),
+            ("items", sub) => anthropic_schema(sub),
+            _ => v.clone(),
+        };
+        out.insert(k.clone(), v);
     }
+    Value::Object(out)
 }
 
 #[cfg(test)]
@@ -668,6 +678,22 @@ mod tests {
                 "additionalProperties": false
             })
         );
+        // a member named after a bound is a member, not a bound
+        r.schema = Some((
+            "M".into(),
+            json!({ "type": "object",
+                    "properties": { "maximum": { "type": "integer", "maximum": 3 } },
+                    "required": ["maximum"], "additionalProperties": false }),
+        ));
+        let (_, b) = build(&provider(Kind::Anthropic), &r);
+        assert_eq!(
+            b["output_config"]["format"]["schema"]["properties"],
+            json!({ "maximum": { "type": "integer" } })
+        );
+        r.schema = Some((
+            "Report".into(),
+            json!({ "type": "object", "properties": { "rating": { "type": "integer", "maximum": 10 } } }),
+        ));
         // other kinds keep the schema as written
         let (_, b) = build(&provider(Kind::Openai), &r);
         assert_eq!(

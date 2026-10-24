@@ -6,8 +6,10 @@
 //!
 //! The schemas use a small common subset of JSON Schema that local servers accept:
 //! `type`, `properties`, `required`, `additionalProperties: false`, `items`, `enum`,
-//! `maxLength`, `minItems` and `maxItems`, with no `$ref`, no `anyOf` or `oneOf`, no
-//! `patternProperties` and no numeric bounds.
+//! `maxLength`, `minItems`, `maxItems`, `minimum` and `maximum`, with no `$ref`, no
+//! `anyOf` or `oneOf` and no `patternProperties`. A provider that refuses some of these
+//! receives the schema without them, and the answer is still validated here against the
+//! whole schema.
 
 use super::client::{CallError, ChatResponse, Message};
 use super::config::Level;
@@ -93,6 +95,19 @@ fn check(s: &Value, v: &Value, at: &str, out: &mut Vec<String>) {
                 for (i, x) in a.iter().enumerate() {
                     check(items, x, &format!("{at}[{i}]"), out);
                 }
+            }
+        }
+        Value::Number(x) => {
+            let x = x.as_f64().unwrap_or(f64::NAN);
+            if let Some(n) = s.get("minimum").and_then(Value::as_f64)
+                && !(x >= n)
+            {
+                out.push(format!("{at} is below {n}"));
+            }
+            if let Some(n) = s.get("maximum").and_then(Value::as_f64)
+                && !(x <= n)
+            {
+                out.push(format!("{at} is above {n}"));
             }
         }
         Value::String(t) => {
@@ -234,6 +249,10 @@ mod tests {
         assert!(e.iter().any(|m| m.contains("unexpected member z")));
         assert!(e.iter().any(|m| m.contains("one of")));
         assert_eq!(validate(&s, &json!({})), vec!["$ lacks the member q"]);
+        let r = json!({"type": "number", "minimum": 0, "maximum": 10});
+        assert!(validate(&r, &json!(10)).is_empty());
+        assert_eq!(validate(&r, &json!(11)), vec!["$ is above 10"]);
+        assert_eq!(validate(&r, &json!(-0.5)), vec!["$ is below 0"]);
     }
 
     #[test]
