@@ -353,7 +353,7 @@ between two people of the demo dataset, which the README shows.
 **Measurements.** A Namespace screen of the path searches that use neither new parameter
 found no change above the noise, with a geometric mean of 0.97 for the new build over the
 old one. [BENCHMARKS](../BENCHMARKS.md#path-search) has the
-table. A forge A/B is a follow-up after the merge.
+result. A forge A/B is a follow-up after the merge.
 
 **Phase 3.** The engine needed no change, because F07 already weighs edges by a reifier
 property with `path:weight` and binds a path's sum with `path:cost`, and its Dijkstra and
