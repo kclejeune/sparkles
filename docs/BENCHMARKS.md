@@ -2161,6 +2161,31 @@ for build A, 3.8% higher over four processes each, which is within the spread of
 runs but is followed up as [roadmap](ROADMAP.md) item 170, since eight synchronizing
 threads could compete with readers for the drive.
 
+### Indexed mixed cells after item 110 on forge
+
+The text and spatial mixed cells of [X09 section 17.9](specs/X09-group-commit-by-default.md#179-performance-gates)
+ran again on `forge` on 2026-10-24 with build D of the section above, under the host's bench
+and heavy locks. Each cell ran five blocks of an ordinary, a grouped, a grouped and an
+ordinary process, four writers and two readers, at 60% of the slowest unpaced process
+instead of 80%, through `--rate-fraction 0.6`. The medians pool the ten processes of each
+setting, and the ratios are the paired medians of grouped to ordinary that
+`scripts/bench-indexed-report.py` prints.
+
+| Cell | Rate (tx/s) | Reader p50, ordinary and grouped (ms) | Reader p99, ordinary and grouped (ms) | Paired p50 and p99 ratios | Max schedule lag, ordinary and grouped (ms) | Gate |
+|---|---:|---|---|---|---|---|
+| Text at 1.05M | 414 | 4.85, 4.84 | 7.94, 7.72 | 1.001, 0.993 | 6.3–30.1, 4.2–12.1 | Met. |
+| Text at 10.5M | 354 | 4.87, 4.83 | 8.00, 8.10 | 0.987, 1.008 | 3.7–6.4, 2.2–10.1 | Met. |
+| Spatial at 1.05M | 583 | 1.04, 0.98 | 1.66, 1.35 | 0.947, 0.813 | 136.1–271.7, 8.0–11.7 | Not established. |
+| Spatial at 10.5M | 444 | 1.03, 1.02 | 1.48, 1.45 | 0.999, 0.988 | 3.5–12.3, 4.0–8.8 | Met. |
+
+No text process stalled, and the longest ordinary lag of the text cell at 1.05M fell from
+150 to 584 ms on 2026-10-23 to 30.1 ms. The ordinary spatial processes at 1.05M had no slow
+request, but in 36 to 56 of their 86 seconds four queued commit synchronizations took about
+7 ms, so they sustained about 570 transactions/s against the offered 583. The unpaced
+calibration averaged the drive's fast and slow states, and [roadmap](ROADMAP.md) item 171
+corrects it. The grouped spatial processes stayed under 12 ms of lag. Memory and the achieved
+rate passed in every cell.
+
 ### Reader tail of group commit on forge
 
 Four writers and two readers ran against the 10.5M dataset on `forge` with its NVMe device,

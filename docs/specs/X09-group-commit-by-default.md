@@ -1530,13 +1530,14 @@ amended gates without a rerun. The results are the following.
 |---|---|
 | Serial commits, p50 and p90 no more than 5% slower | 35 of 36 checks met. The miss is the p90 of spatial literal inserts at 10.5M, with a paired ratio of 1.077. |
 | Four writers, at least the required gain | Met in all six cells. The paired ratios and the requirements are 1.50 and 1.41 for full-text at 1.05M, 1.68 and 1.48 at 10.5M, 1.52 and 1.45 for spatial at 1.05M, 1.59 and 1.41 at 10.5M, and 2.38 and 1.43 and 2.06 and 1.46 for embedding. |
-| Text query p50 and p99 during four writers | Ratios of 0.987 and 1.000 at 1.05M and 0.997 and 0.982 at 10.5M. Not established, because the schedule lag requirement failed for both settings. |
-| Spatial query p50 and p99 during four writers | Ratios of 0.964 and 0.925 at 1.05M and 1.002 and 1.044 at 10.5M. Not established, because the schedule lag requirement failed for the ordinary writer at both sizes and for one grouped process at 10.5M. |
+| Text query p50 and p99 during four writers | Ratios of 0.987 and 1.000 at 1.05M and 0.997 and 0.982 at 10.5M. Not established, because the schedule lag requirement failed for both settings. Met in the rerun after item 110, described below. |
+| Spatial query p50 and p99 during four writers | Ratios of 0.964 and 0.925 at 1.05M and 1.002 and 1.044 at 10.5M. Not established, because the schedule lag requirement failed for the ordinary writer at both sizes and for one grouped process at 10.5M. The rerun after item 110 met it at 10.5M and not at 1.05M. |
 | Peak resident memory within 64 MiB | Met in all ten cells. The largest certified difference was 19.6 MiB, for embedding at 1.05M. |
 
 Every gate is therefore met except the p90 of spatial serial inserts at 10.5M and the two
-reader gates, which are not established. The text mixed cells also need a rerun once the
-stall below is bounded.
+reader gates, which are not established. The rerun of the mixed cells after item 110,
+described below, established the text reader gate at both sizes and the spatial one at
+10.5M.
 
 The serial and throughput misses of the first judgement follow the drive more than the
 engine. The server's own counters show the mean time of a commit synchronization at about
@@ -1560,8 +1561,8 @@ requirement, so the cells pass because each one mixes drive states.
 
 Every mixed process in the text cells stopped all four writers together for a median of 70
 to 150 ms about every 5.4 s, with grouping and without. That is the period of the locked
-fallback of the background checkpoint, and the run recorded no ticks, so the cause is probable
-and not confirmed. The longest stall of most processes was 150 to 190 ms, and the extremes
+fallback of the background checkpoint, and the run recorded no ticks, so the cause was probable
+and not confirmed until item 110 traced it. The longest stall of most processes was 150 to 190 ms, and the extremes
 were 575 ms for a grouped process and 584 ms for an ordinary one. It fails the 50 ms schedule
 lag of the load-quality rule in both settings, so no text reader comparison can be
 certified. Grouping did not cause it, and the ordinary path shows the same cadence and larger
@@ -1581,24 +1582,53 @@ campaign, which is why section 17.9 names the breakpoint as chosen afterwards an
 sensitivities. It asked for the Fisher and sign tests above, and for a follow-up item for
 each measured slowdown that the amended gates let through.
 
+**Reader gates after item 110.** Item 110 reran the text and spatial mixed cells on `forge`
+on 2026-10-24 with a release binary of its branch at a0718d43, the bounded checkpoint with
+parallel synchronization, built on `forge` before timing. The fix that review round 3 asked
+for later changed only the paths of a failed or panicking pass. Each cell ran five blocks of an
+ordinary, a grouped, a grouped and an ordinary process, as before, and the offered rate was
+60% of the slowest unpaced process instead of 80%, through the new `--rate-fraction` option
+of `scripts/bench-indexed-commit.py`. Every process met the memory and achieved rate
+requirements and checked its acknowledgements and index answers live and after a cold
+reopen. The table gives the paired ratios of grouped to ordinary.
+
+| Cell | Rate (tx/s) | Max schedule lag, ordinary and grouped (ms) | Reader p50 ratio | Reader p99 ratio | Gate |
+|---|---:|---|---:|---:|---|
+| Text at 1.05M | 414 | 6.3 to 30.1 and 4.2 to 12.1 | 1.001 | 0.993 | Met. |
+| Text at 10.5M | 354 | 3.7 to 6.4 and 2.2 to 10.1 | 0.987 | 1.008 | Met. |
+| Spatial at 1.05M | 583 | 136.1 to 271.7 and 8.0 to 11.7 | 0.947 | 0.813 | Not established, because every ordinary process missed the 50 ms lag. |
+| Spatial at 10.5M | 444 | 3.5 to 12.3 and 4.0 to 8.8 | 0.999 | 0.988 | Met. |
+
+No text process stalled. The longest ordinary lag at 1.05M fell from 150 to 584 ms in the
+campaign of 2026-10-23 to 30.1 ms. The ordinary spatial processes at 1.05M had no slow
+request either, with a longest write of 16.6 to 26.8 ms. In 36 to 56 of their 86 seconds,
+however, their write p90 was about 7 ms, the time of four commit synchronizations queued
+behind each other, and in the other seconds it was about 2 ms. No grouped process had such a
+second. The calibration measured 972 transactions/s unpaced for the ordinary writer, an
+average over the drive's fast and slow states. In the slow state four ordinary writers
+complete about four commits every 7 ms, or 570 transactions/s, which is less than the
+offered 583. The miss is therefore the capacity of the ordinary path in the drive's slow
+state against a calibration that averages both states, and not a stall in the engine.
+[ROADMAP](../ROADMAP.md) item 171 makes the calibration account for it.
+
 **Open under item 86.** Item 86 stays partly done. The p90 of spatial serial inserts at 10.5M
-missed its amended gate, the reader gates are not established, and the text mixed cells need
-a rerun. The follow-ups are [ROADMAP](../ROADMAP.md) items 110 to 112, which the standing
-rule that every accepted regression gets its own item produced. Item 110 bounds the write
-stall of the locked checkpoint, confirms it by tracing the ticks and ends by rerunning the
-reader gates of the text and spatial cells with more headroom in the mixed rate. Item 111
-investigates the spatial serial slowdowns at 10.5M, which are the missed p90, an accepted p50
-at 1.025 and an accepted IRI p90 at 1.032, an engine overhead of 0.240 against 0.213 ms and a
-reader p99 ratio of 1.044. Item 112 investigates the cost of a fence for indexed datasets,
-whose synchronization takes 1.4 to 1.5 ms against about 1.0 ms for one ordinary commit and
-which carries only 1.9 to 2.0 commits with four writers, so that the gain of 1.50 to 1.68 for
-full-text and spatial datasets stays near the original bar of 1.5. A later campaign should
-quiet the drive and probe its flush time before each process, randomize the order and leave
-more headroom in the mixed rate. Three smaller items wait for that work. Staged documents
-could count their bytes in the queue's limit, since a queue of long literals now holds more
-than 4 MiB of them. The leader applies a prefix's text changes, a Tantivy commit included
-when the batch is full, while its fence is still active, which delays the next fence and is
-question 4 of section 17.10. The forge runs showed no text stall that this causes beyond the
-locked checkpoint's, but they do not rule it out, since the mixed cells cannot be certified.
-The model test has no write transaction that searches text, so the wait of a search on a
-speculative head has only unit tests.
+missed its amended gate, and the spatial reader gate at 1.05M is not established. The
+follow-ups are [ROADMAP](../ROADMAP.md) items 111, 112 and 171, which the standing rule that
+every accepted regression gets its own item produced. Item 110 bounded the write stall of the
+locked checkpoint and established the text reader gate at both sizes and the spatial one at
+10.5M. Item 111 investigates the spatial serial slowdowns at 10.5M, which are the missed
+p90, an accepted p50 at 1.025 and an accepted IRI p90 at 1.032, an engine overhead of 0.240
+against 0.213 ms and a reader p99 ratio of 1.044. Item 112 investigates the cost of a fence
+for indexed datasets, whose synchronization takes 1.4 to 1.5 ms against about 1.0 ms for one
+ordinary commit and which carries only 1.9 to 2.0 commits with four writers, so that the gain
+of 1.50 to 1.68 for full-text and spatial datasets stays near the original bar of 1.5. Item
+171 reruns the spatial mixed cell at 1.05M with a rate that the ordinary writer sustains in
+the drive's slow state. A later campaign should quiet the drive, probe its flush time before
+each process and randomize the order. Three smaller items wait for that work. Staged
+documents could count their bytes in the queue's limit, since a queue of long literals now
+holds more than 4 MiB of them. The leader applies a prefix's text changes, a Tantivy commit
+included when the batch is full, while its fence is still active, which delays the next fence
+and is question 4 of section 17.10. The rerun after item 110 had no text process above the
+50 ms lag at either size, so this delay stays within the load-quality rule there. The model
+test has no write transaction that searches text, so the wait of a search on a speculative
+head has only unit tests.

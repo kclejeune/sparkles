@@ -407,10 +407,10 @@ that work by priority and links each item to its design spec.
   four-writer throughput and for 35 of 36 serial checks. The p90 of spatial serial inserts
   at 10.5M was 1.077 times its ordinary neighbour, which is [roadmap](ROADMAP.md) item
   111, and a fence synchronizes in 1.4 to 1.5 ms against about 1.0 ms for one commit, which
-  is item 112. The text and spatial reader latency gates are not established, because every
-  mixed cell failed the 50 ms schedule lag requirement. The full-text cells stop all
-  writers for 70 to 150 ms about every 5.4 s, with grouping and without it, probably in the
-  locked background checkpoint, and item 110 covers that stall and the rerun. The serial
+  is item 112. After item 110 bounded the locked checkpoint's write stall, a rerun on
+  2026-10-24 met the text reader gates at both sizes and the spatial one at 10.5M. The
+  spatial reader gate at 1.05M is not established, because the ordinary writer could not
+  hold the offered rate while the drive was in its slow state, which is item 171. The serial
   and throughput gates were amended after the campaign, so the next forge run is the first
   to judge them blind. [X09 section 17.9](specs/X09-group-commit-by-default.md#179-performance-gates)
   has the gates and the [Phase 4 Outcome](specs/X09-group-commit-by-default.md#phase-4) the
