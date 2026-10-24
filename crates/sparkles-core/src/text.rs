@@ -34,6 +34,8 @@ use crate::error::{Error, Result};
 
 #[cfg(feature = "text")]
 mod cjk;
+#[cfg(feature = "text-cjk-dict")]
+pub mod dict;
 #[cfg(feature = "text")]
 mod filters;
 #[cfg(feature = "text")]
@@ -131,6 +133,40 @@ pub struct TextConfig {
     /// stemmed, and a search with that language searches the stemmed text
     #[serde(default, skip_serializing_if = "Languages::is_none")]
     pub languages: Languages,
+    /// the SHA-256 of the installed dictionary of each dictionary analyzer the index
+    /// uses (`ja-dict`, …), which [`TextConfig::with_dictionaries`] fills in
+    #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
+    pub dictionaries: std::collections::BTreeMap<String, String>,
+}
+
+impl TextConfig {
+    /// The configuration with `dictionaries` naming the installed dictionary of each
+    /// dictionary analyzer its languages use. Fails when one is missing or this build
+    /// has no `text-cjk-dict` feature.
+    pub fn with_dictionaries(mut self) -> Result<TextConfig> {
+        let names: std::collections::BTreeSet<&'static str> = self
+            .languages
+            .resolve()
+            .into_iter()
+            .filter(|(_, a)| a.needs_dictionary())
+            .map(|(_, a)| a.name())
+            .collect();
+        #[cfg(not(feature = "text-cjk-dict"))]
+        if let Some(name) = names.first() {
+            return Err(Error::Unsupported(format!(
+                "the {name} analyzer needs a build with the text-cjk-dict feature"
+            )));
+        }
+        #[cfg(feature = "text-cjk-dict")]
+        let used = names
+            .into_iter()
+            .map(|name| Ok((name.to_string(), dict::load(name)?.sha256.clone())))
+            .collect::<Result<_>>()?;
+        #[cfg(not(feature = "text-cjk-dict"))]
+        let used = Default::default();
+        self.dictionaries = used;
+        Ok(self)
+    }
 }
 
 /// A language analyzer: Tantivy's Snowball stemmer for the language, after the stop
@@ -203,6 +239,18 @@ pub enum Analyzer {
     /// Lucene's `CJKAnalyzer`: the bigrams of `cjk` without its stop words
     #[serde(rename = "cjk-lucene")]
     CjkLucene,
+    /// Japanese words found in an installed MeCab IPADIC dictionary, after Lucene's
+    /// Kuromoji (feature `text-cjk-dict`)
+    #[serde(rename = "ja-dict")]
+    JaDict,
+    /// Chinese words found in an installed word list with frequencies, after Lucene's
+    /// SmartChineseAnalyzer (feature `text-cjk-dict`)
+    #[serde(rename = "zh-dict")]
+    ZhDict,
+    /// Korean words found in an installed mecab-ko-dic dictionary, after Lucene's Nori
+    /// (feature `text-cjk-dict`)
+    #[serde(rename = "ko-dict")]
+    KoDict,
 }
 
 impl Analyzer {
@@ -247,7 +295,7 @@ impl Analyzer {
 
     /// The analyzers that no tag has by default: `cjk`, which the CJK tags have, and
     /// the analyzers that follow Lucene's.
-    pub const NAMED: [Analyzer; 12] = [
+    pub const NAMED: [Analyzer; 15] = [
         Analyzer::Cjk,
         Analyzer::Porter,
         Analyzer::EnglishLucene,
@@ -260,7 +308,15 @@ impl Analyzer {
         Analyzer::RussianLucene,
         Analyzer::SwedishLucene,
         Analyzer::CjkLucene,
+        Analyzer::JaDict,
+        Analyzer::ZhDict,
+        Analyzer::KoDict,
     ];
+
+    /// Whether the analyzer reads an installed dictionary.
+    pub fn needs_dictionary(self) -> bool {
+        matches!(self, Analyzer::JaDict | Analyzer::ZhDict | Analyzer::KoDict)
+    }
 
     /// The analyzer that follows Lucene's analyzer of a primary language tag, as
     /// jena-text picks it with `text:multilingualSupport`, where this build has one.
@@ -323,6 +379,9 @@ impl Analyzer {
             Analyzer::RussianLucene => "russian-lucene",
             Analyzer::SwedishLucene => "swedish-lucene",
             Analyzer::CjkLucene => "cjk-lucene",
+            Analyzer::JaDict => "ja-dict",
+            Analyzer::ZhDict => "zh-dict",
+            Analyzer::KoDict => "ko-dict",
         }
     }
 }
@@ -518,6 +577,7 @@ impl Default for TextConfig {
             max_hits: default_max_hits(),
             docstore_compression: None,
             languages: Languages::None,
+            dictionaries: Default::default(),
         }
     }
 }
@@ -993,7 +1053,7 @@ mod imp {
         format!("sparkles_{}", a.name())
     }
 
-    fn register_tokenizer(index: &Index) {
+    fn register_tokenizer(index: &Index, config: &TextConfig) -> Result<()> {
         index.tokenizers().register(
             TOKENIZER,
             TextAnalyzer::builder(SimpleTokenizer::default())
@@ -1002,11 +1062,45 @@ mod imp {
                 .filter(AsciiFoldingFilter)
                 .build(),
         );
-        for a in Analyzer::every() {
+        for a in Analyzer::every().filter(|a| !a.needs_dictionary()) {
             index
                 .tokenizers()
                 .register(&tokenizer_name(a), language_analyzer(a));
         }
+        for (_, a) in config.languages.resolve() {
+            if a.needs_dictionary() {
+                index
+                    .tokenizers()
+                    .register(&tokenizer_name(a), dictionary_analyzer(a, config)?);
+            }
+        }
+        Ok(())
+    }
+
+    /// A dictionary analyzer: the installed dictionary, which must be the one the
+    /// configuration recorded, then lowercasing.
+    #[cfg(feature = "text-cjk-dict")]
+    fn dictionary_analyzer(a: Analyzer, config: &TextConfig) -> Result<TextAnalyzer> {
+        let d = super::dict::load(a.name())?;
+        if config.dictionaries.get(a.name()) != Some(&d.sha256) {
+            return Err(Error::Invalid(format!(
+                "full-text index: the installed {} dictionary is not the one this index was \
+                 configured with; the index adopts it when the store next opens, or when it is \
+                 configured again",
+                a.name()
+            )));
+        }
+        Ok(TextAnalyzer::builder(super::dict::DictTokenizer(d))
+            .filter(super::filters::MapFilter(super::filters::lowercase))
+            .build())
+    }
+
+    #[cfg(not(feature = "text-cjk-dict"))]
+    fn dictionary_analyzer(a: Analyzer, _config: &TextConfig) -> Result<TextAnalyzer> {
+        Err(Error::Unsupported(format!(
+            "the {} analyzer needs a build with the text-cjk-dict feature",
+            a.name()
+        )))
     }
 
     /// A language's analyzer: the standard tokens, lowercased, without the language's
@@ -1048,6 +1142,9 @@ mod imp {
             | Analyzer::DutchLucene
             | Analyzer::RussianLucene
             | Analyzer::SwedishLucene => return lucene_analyzer(a),
+            Analyzer::JaDict | Analyzer::ZhDict | Analyzer::KoDict => {
+                unreachable!("a dictionary analyzer is built by dictionary_analyzer")
+            }
             Analyzer::Arabic => L::Arabic,
             Analyzer::Danish => L::Danish,
             Analyzer::Dutch => L::Dutch,
@@ -1518,7 +1615,7 @@ mod imp {
                 builder.create_in_dir(d).map_err(text_err)?
             }
         };
-        register_tokenizer(&index);
+        register_tokenizer(&index, config)?;
         Ok((index, fields))
     }
 
@@ -1531,7 +1628,7 @@ mod imp {
     fn open_index(root: &Path, config: &TextConfig) -> Result<(Index, Fields, LazySyncDir)> {
         let dir = LazySyncDir::open(&root.join("text"), marker(root))?;
         let index = Index::open(dir.clone()).map_err(text_err)?;
-        register_tokenizer(&index);
+        register_tokenizer(&index, config)?;
         let (expected, fields) = schema(config);
         if index.schema() != expected {
             return Err(text_err("unexpected index schema"));

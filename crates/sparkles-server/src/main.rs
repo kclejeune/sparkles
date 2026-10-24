@@ -79,6 +79,8 @@ mod shacl;
 mod shex_cmd;
 mod shutdown;
 mod state;
+#[cfg(feature = "text-cjk-dict")]
+mod text_dict_cmd;
 #[cfg(feature = "tls")]
 mod tls;
 mod tools;
@@ -1002,6 +1004,11 @@ enum Cmd {
         /// Serve an existing database directory, e.g. --loc ds=/path/to/db
         #[arg(long)]
         loc: Vec<String>,
+        /// The directory of the dictionaries of the ja-dict, zh-dict and ko-dict
+        /// full-text analyzers, which `sparkles text-dict` installs [default:
+        /// DATA/text-dicts]
+        #[arg(long, value_name = "DIR", env = "SPARKLES_TEXT_DICTS")]
+        text_dicts: Option<PathBuf>,
         /// Default query timeout in seconds [default: 60]
         #[arg(long, value_name = "TIMEOUT")]
         timeout: Option<f64>,
@@ -1469,7 +1476,15 @@ enum Cmd {
         /// turn full-text search off and delete the index
         #[arg(long)]
         disable: bool,
+        /// the directory of the dictionaries of ja-dict, zh-dict and ko-dict (default
+        /// $SPARKLES_TEXT_DICTS, else ./data/text-dicts)
+        #[arg(long, value_name = "DIR")]
+        text_dicts: Option<PathBuf>,
     },
+    /// The dictionaries of the ja-dict, zh-dict and ko-dict full-text analyzers: fetch
+    /// a pinned source with a verified hash, install a local one, or list them
+    #[cfg(feature = "text-cjk-dict")]
+    TextDict(text_dict_cmd::TextDictArgs),
     /// Vector indexes for spk:vectorSearch: create, drop, rebuild, list, status (locally
     /// with --loc, or with --server)
     Vector(vector_cmd::VectorArgs),
@@ -2227,6 +2242,7 @@ fn enable_text_for(_: &state::AppState, _: &str) -> Result<()> {
 #[cfg(feature = "text")]
 #[allow(clippy::too_many_arguments)]
 fn text_index(
+    text_dicts: Option<PathBuf>,
     loc: &std::path::Path,
     opts: StoreOptions,
     predicates: Vec<String>,
@@ -2237,6 +2253,12 @@ fn text_index(
     disable: bool,
 ) -> Result<()> {
     use sparkles::text::{Languages, PredicateSet, TextConfig};
+    #[cfg(feature = "text-cjk-dict")]
+    if let Some(d) = text_dicts {
+        sparkles::text::dict::set_dir(d);
+    }
+    #[cfg(not(feature = "text-cjk-dict"))]
+    let _ = text_dicts;
     let store = Store::open(loc, opts)?;
     if disable {
         store.disable_text()?;
@@ -2290,6 +2312,7 @@ fn text_index(
 #[cfg(not(feature = "text"))]
 #[allow(clippy::too_many_arguments)]
 fn text_index(
+    _: Option<PathBuf>,
     _: &std::path::Path,
     _: StoreOptions,
     _: Vec<String>,
@@ -2716,8 +2739,13 @@ fn run() -> Result<()> {
             format_timeout,
             #[cfg(feature = "mcp")]
             mcp,
+            text_dicts,
             ..
         } => {
+            #[cfg(feature = "text-cjk-dict")]
+            sparkles::text::dict::set_dir(text_dicts.unwrap_or_else(|| data.join("text-dicts")));
+            #[cfg(not(feature = "text-cjk-dict"))]
+            let _ = text_dicts;
             // a Fuseki configuration adds datasets, settings and access rules; the flags
             // given on the command line win
             let mut fuseki = None;
@@ -3863,7 +3891,9 @@ fn run() -> Result<()> {
             rebuild,
             status,
             disable,
+            text_dicts,
         } => text_index(
+            text_dicts,
             &loc,
             opts,
             predicate,
@@ -3936,6 +3966,8 @@ fn run() -> Result<()> {
         Cmd::Secrets(args) => secrets_cmd::run(args),
         Cmd::Notify(args) => notify_cmd::run(args),
         Cmd::Models(args) => models_cmd::run(args),
+        #[cfg(feature = "text-cjk-dict")]
+        Cmd::TextDict(args) => text_dict_cmd::run(args),
         Cmd::Dataset { cmd } => dataset_cmd::run(cmd, opts),
         Cmd::Compaction(args) => compaction_cmd::run(args, opts),
         Cmd::Views(args) => views_cmd::run(args, opts),

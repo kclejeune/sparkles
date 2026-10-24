@@ -22,6 +22,17 @@ pub(crate) struct CjkTokenStream {
     token: Token,
 }
 
+impl CjkTokenStream {
+    /// A stream over tokens already made.
+    #[cfg_attr(not(feature = "text-cjk-dict"), allow(dead_code))]
+    pub(super) fn of(tokens: Vec<Token>) -> Self {
+        CjkTokenStream {
+            tokens: tokens.into_iter(),
+            token: Token::default(),
+        }
+    }
+}
+
 impl Tokenizer for CjkTokenizer {
     type TokenStream<'a> = CjkTokenStream;
 
@@ -74,7 +85,7 @@ impl Tokenizer for CjkLuceneTokenizer {
 }
 
 /// A word with its widths folded, a voiced mark joined to the kana before it.
-fn fold_word(word: &str) -> String {
+pub(super) fn fold_word(word: &str) -> String {
     let mut out: Vec<char> = Vec::with_capacity(word.len());
     for c in word.chars() {
         let f = fold(c);
@@ -169,7 +180,7 @@ const KANA: [u32; 59] = [
 
 /// `c` with its width folded: full-width ASCII to ASCII, half-width Katakana to
 /// full-width.
-fn fold(c: char) -> char {
+pub(super) fn fold(c: char) -> char {
     let u = c as u32;
     let f = match u {
         0xFF01..=0xFF5E => u - 0xFEE0,
@@ -181,7 +192,7 @@ fn fold(c: char) -> char {
 
 /// The voiced (`mark` U+3099) or semi-voiced (U+309A) form of the Katakana `k`, if it
 /// has one.
-fn voiced(k: char, mark: char) -> Option<char> {
+pub(super) fn voiced(k: char, mark: char) -> Option<char> {
     let u = k as u32;
     let v = match mark as u32 {
         0x3099 => match u {

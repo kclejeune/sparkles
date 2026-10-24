@@ -479,8 +479,14 @@ fn indexes(put: &mut dyn FnMut(&str, J)) {
                         "oneOf": [
                             { "const": "all" },
                             strings(),
-                            { "type": "object", "additionalProperties": string(), "description": "A language tag's analyzer, such as `english` or `cjk`." },
+                            { "type": "object", "additionalProperties": string(), "description": "A language tag's analyzer, such as `english`, `english-lucene`, `cjk` or `ja-dict`." },
                         ],
+                    },
+                    "dictionaries": {
+                        "type": "object",
+                        "additionalProperties": string(),
+                        "readOnly": true,
+                        "description": "The SHA-256 of the installed dictionary of each dictionary analyzer the index uses. The server fills it in when the index is configured.",
                     },
                 }),
             ),

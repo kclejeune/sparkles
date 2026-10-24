@@ -5612,6 +5612,7 @@ dependencies = [
  "bzip2",
  "crs-definitions",
  "csv",
+ "encoding_rs",
  "flate2",
  "fsst-rs",
  "geo",

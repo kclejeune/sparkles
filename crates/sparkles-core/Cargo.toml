@@ -64,6 +64,8 @@ tantivy-fst = { version = "0.5", optional = true }
 # the Snowball Dutch stemmer under the `dutch-lucene` analyzer's stem dictionary (the
 # version Tantivy's `stemmer` feature uses)
 rust-stemmers = { version = "1.2.0", optional = true }
+# EUC-JP, the encoding of IPADIC's source files (feature `text-cjk-dict`)
+encoding_rs = { version = "0.8", optional = true }
 tempfile = "3"
 # GeoSPARQL (feature `geo`)
 georust = { workspace = true, optional = true }
@@ -101,6 +103,9 @@ geo-proj4 = ["geo", "dep:proj4rs"]
 # EPSG codes resolved through the EPSG-derived proj4 table of `crs-definitions`. Off in
 # the library, so an embedder opts in to the EPSG terms of use; the server turns it on
 geo-epsg = ["geo-proj4", "dep:crs-definitions"]
+# Dictionary segmentation of Chinese, Japanese and Korean text: the `ja-dict`, `zh-dict` and
+# `ko-dict` analyzers, which read dictionaries that are installed separately
+text-cjk-dict = ["text", "dep:encoding_rs"]
 # zstd inputs, dumps and backups (libzstd, a C build), and zstd for the text doc store
 zstd = ["dep:zstd", "tantivy?/zstd-compression"]
 # brotli inputs, dumps and backups (pure Rust)
