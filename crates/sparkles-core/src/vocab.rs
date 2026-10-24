@@ -345,6 +345,20 @@ struct Entry {
     coded: bool,
 }
 
+impl Entry {
+    /// The most bytes this entry's suffix can stand for: its length, or eight bytes per
+    /// code. A partial decode reserves no more than this, so a damaged shared-prefix
+    /// length in the next entry cannot ask for more room than the suffix could fill.
+    #[inline(always)]
+    fn most(&self) -> usize {
+        if self.coded {
+            self.len.saturating_mul(8)
+        } else {
+            self.len
+        }
+    }
+}
+
 impl Vocab {
     pub fn empty() -> Vocab {
         Vocab {
@@ -835,7 +849,7 @@ impl Vocab {
                     let add = if nd == usize::MAX {
                         self.suffix_len(data, e, id)
                     } else {
-                        nd - e.shared
+                        (nd - e.shared).min(e.most())
                     };
                     let total = key.len().min(e.shared).saturating_add(add);
                     if total > key.capacity() {
@@ -1305,7 +1319,7 @@ impl Vocab {
                 let add = if nd == usize::MAX {
                     self.suffix_len(data, e, id)
                 } else {
-                    nd - e.shared
+                    (nd - e.shared).min(e.most())
                 };
                 let total =
                     key.len().min(e.shared).checked_add(add).ok_or_else(|| {
@@ -2790,6 +2804,52 @@ mod tests {
                     );
                 }
             }
+        }
+    }
+
+    /// A damaged shared-prefix length in the entry after a key does not make a checked
+    /// decode of the later key reserve room for it (Codex review of item 108): the
+    /// partial decode of the key before reserves at most what its suffix can fill.
+    #[test]
+    fn a_damaged_shared_prefix_reserves_no_more_than_the_suffix() {
+        let keys = [b"\"a".to_vec(), b"\"ab".to_vec()];
+        for fsst in [false, true] {
+            let d = tempfile::tempdir().unwrap();
+            write_codec(d.path(), &keys, fsst);
+            let path = d.path().join("vocab.dat");
+            let data = std::fs::read(&path).unwrap();
+            // the second entry's shared length becomes 2^62
+            let mut pos = 0;
+            read_varint(&data, &mut pos);
+            let len = read_varint(&data, &mut pos) as usize;
+            let second = pos + len;
+            let mut at = second;
+            read_varint(&data, &mut at);
+            let mut out = data[..second].to_vec();
+            write_varint(&mut out, 1 << 62);
+            out.extend_from_slice(&data[at..]);
+            std::fs::write(&path, &out).unwrap();
+            let v = Vocab::open(d.path()).unwrap();
+            let most = std::cell::Cell::new(0usize);
+            let got = v.get_with_checked(
+                1,
+                |need| {
+                    most.set(most.get().max(need));
+                    if need > 1 << 20 { Err(need) } else { Ok(()) }
+                },
+                |k| k.len(),
+            );
+            assert!(
+                most.get() <= 1 << 20,
+                "fsst {fsst}: asked for {}",
+                most.get()
+            );
+            assert!(got.is_ok(), "fsst {fsst}: {got:?}");
+            let got = v.get_with_fallible(1, |_| Ok(()), |k| k.len());
+            assert!(got.is_ok(), "fsst {fsst}");
+            // the unchecked decoders do not panic either
+            v.get(1);
+            v.get_sorted(&[0, 1], |_, _| {});
         }
     }
 
