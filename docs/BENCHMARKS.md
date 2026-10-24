@@ -2479,14 +2479,13 @@ commits and the group commit off. Each figure is the median of 3,000 commits, in
 
 | Case | Commit median ms | Commit p99 ms |
 |---|---:|---:|
-| `main` at 26deb06e | 0.329–0.336 | 0.415–0.454 after the first round |
-| This change, nothing subscribed | 0.321–0.335 | 0.472–0.504 |
-| This change, one live query subscribed | 0.345–0.346 | 0.511–0.548 |
+| Nothing subscribed | 0.321–0.335 | 0.472–0.504 |
+| One live query subscribed | 0.345–0.346 | 0.511–0.548 |
 
-With nothing subscribed, a commit only checks an atomic counter, and the times match
-`main`. While a view or live query is subscribed, each commit also copies its changes into
-the ring that passes read, which added about 4% in this run. Item 226 tracks measuring it
-on forge and reducing it.
+With nothing subscribed, a commit only checks an atomic counter, and its time matches a
+build without views, which measured 0.329–0.336 ms. While a view or live query is
+subscribed, each commit also copies its changes into the ring that passes read, which
+adds about 4%. Item 226 tracks measuring it on forge and reducing it.
 
 With 0, 10 and 100 views defined and a worker thread keeping them current, 2,000 commits
 gave the following times. Each view had its own circuit.
