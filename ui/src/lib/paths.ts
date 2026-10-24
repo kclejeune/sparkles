@@ -37,6 +37,11 @@ export type PathSettings = {
   /** Follow every predicate except `predicates`, or only `predicates`. */
   follow: 'except' | 'only';
   predicates: string[];
+  /**
+   * The property of an edge's reifier that holds its weight (U09 Phase 3), or null to count
+   * edges. An edge without one weighs 1.
+   */
+  weight?: string | null;
 };
 
 export function defaultSettings(source: Term, target: Term): PathSettings {
@@ -97,13 +102,14 @@ export function pathQuery(s: PathSettings, phase1 = true): string {
   if (preds.length && s.follow === 'only') lines.push(`path:predicate ${preds.join(' , ')} ;`);
   if (preds.length && s.follow === 'except' && phase1)
     lines.push(`path:excludePredicate ${preds.join(' , ')} ;`);
+  if (s.weight) lines.push(`path:weight ${sparqlIri(s.weight)} ;`);
   lines.push(`path:maxVisited ${MAX_VISITED} ; path:limit ${pathLimit(s)} ;`);
   lines.push(
     'path:pathIndex ?path ; path:edgeIndex ?i ;',
-    'path:edgeSubject ?s ; path:edgePredicate ?p ; path:edgeObject ?o ; path:length ?len .',
+    `path:edgeSubject ?s ; path:edgePredicate ?p ; path:edgeObject ?o ; path:length ?len${s.weight ? ' ; path:cost ?cost' : ''} .`,
   );
   return `PREFIX path: <urn:x-sparkles:path#>
-SELECT ?path ?i ?s ?p ?o ?len WHERE {
+SELECT ?path ?i ?s ?p ?o ?len${s.weight ? ' ?cost' : ''} WHERE {
   SERVICE path:search {
     [] ${lines.join('\n       ')}
   }
@@ -130,6 +136,8 @@ export type FoundPath = {
   /** 1 for the first path. */
   n: number;
   length: number;
+  /** The sum of the edges' weights, when the search had weights. */
+  cost?: number;
   nodes: Term[];
   edges: PathEdge[];
 };
@@ -142,12 +150,12 @@ const num = (t: Term | undefined) => (t && t.type === 'literal' ? Number(t.value
 
 /** The rows of a search as paths, in order, each edge oriented from `source`. */
 export function groupPaths(rows: Row[], source: Term): FoundPath[] {
-  const by = new Map<number, { len: number; edges: Map<number, Row> }>();
+  const by = new Map<number, { len: number; cost: number; edges: Map<number, Row> }>();
   for (const r of rows) {
     const k = num(r.path);
     if (!Number.isFinite(k)) continue;
     let g = by.get(k);
-    if (!g) by.set(k, (g = { len: num(r.len), edges: new Map() }));
+    if (!g) by.set(k, (g = { len: num(r.len), cost: num(r.cost), edges: new Map() }));
     const i = num(r.i);
     if (Number.isFinite(i) && r.s && r.p && r.o) g.edges.set(i, r);
   }
@@ -171,6 +179,7 @@ export function groupPaths(rows: Row[], source: Term): FoundPath[] {
     out.push({
       n: out.length + 1,
       length: Number.isFinite(g.len) ? g.len : edges.length,
+      ...(Number.isFinite(g.cost) ? { cost: g.cost } : {}),
       nodes,
       edges,
     });
@@ -235,17 +244,70 @@ export function predicateWords(iri: string): string {
     .trim();
 }
 
+/** A cost as the list shows it: at most three decimals, without trailing zeros. */
+export function fmtCost(n: number): string {
+  return Number.isInteger(n) ? String(n) : String(Number(n.toFixed(3)));
+}
+
 /** A path in words, for its row in the list and for screen readers. */
 export function describePath(path: FoundPath, label: (t: Term) => string): string {
   const parts = path.edges.map((e) => `${label(e.s)} ${predicateWords(e.p)} ${label(e.o)}`);
-  return [`path ${path.n}`, `length ${path.length}`, ...parts].join(', ');
+  const cost = path.cost != null ? [`cost ${fmtCost(path.cost)}`] : [];
+  return [`path ${path.n}`, `length ${path.length}`, ...cost, ...parts].join(', ');
 }
 
 /** What the live region says after a search. */
 export function announcement(paths: FoundPath[]): string {
   if (!paths.length) return 'No path found';
+  const found = `${paths.length} ${paths.length === 1 ? 'path' : 'paths'} found`;
+  const costs = paths.flatMap((p) => (p.cost != null ? [p.cost] : []));
+  if (costs.length === paths.length)
+    return `${found}, the cheapest of cost ${fmtCost(Math.min(...costs))}`;
   const shortest = Math.min(...paths.map((p) => p.length));
-  return `${paths.length} ${paths.length === 1 ? 'path' : 'paths'} found, the shortest of length ${shortest}`;
+  return `${found}, the shortest of length ${shortest}`;
+}
+
+/** A property that holds edge weights on reifiers, with the number of values it has. */
+export type WeightProperty = { iri: string; count: number };
+
+/**
+ * The query that lists the weight properties: properties with numeric values on the
+ * reifiers of the caller's view, the most used first.
+ */
+export function weightQuery(limit = 20): string {
+  return `PREFIX rdf: <http://www.w3.org/1999/02/22-rdf-syntax-ns#>
+SELECT ?w (COUNT(*) AS ?n) WHERE {
+  ?r rdf:reifies ?t .
+  ?r ?w ?v .
+  FILTER(isNumeric(?v) && ?v >= 0)
+}
+GROUP BY ?w
+ORDER BY DESC(?n) ?w
+LIMIT ${limit}
+`;
+}
+
+/** The weight properties of a dataset at a state, for the weight picker. */
+export async function weightProperties(
+  ds: string,
+  opts: { at?: string; signal?: AbortSignal } = {},
+): Promise<WeightProperty[]> {
+  const r = await api.query(ds, weightQuery(), {
+    timeout: TIMEOUT_S,
+    send: 100,
+    ...(opts.at ? { at: opts.at } : {}),
+    signal: opts.signal,
+  });
+  const vars = r.vars ?? [];
+  const wi = vars.indexOf('w');
+  const ni = vars.indexOf('n');
+  const out: WeightProperty[] = [];
+  for (const row of r.rows ?? []) {
+    const w = row[wi];
+    if (w?.type !== 'uri') continue;
+    out.push({ iri: w.value, count: num(row[ni] ?? undefined) || 0 });
+  }
+  return out;
 }
 
 export type SearchFailure = {
