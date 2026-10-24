@@ -6,7 +6,7 @@
 > `--check` report (also `sparkles config check fuseki`), and `serve --fuseki-config`.
 >
 > **User docs:** [Usage: Migrating from Fuseki](../USAGE.md#migrating-from-fuseki) ·
-> [Features](../FEATURES.md#server-fuseki-equivalent) ·
+> [Features](../FEATURES.md#server-and-protocols) ·
 > [Comparison with Jena](../COMPARISON.md#vs-apache-jena--fuseki)
 >
 > This is the design as written before implementation. The [Outcome](#outcome) section at
