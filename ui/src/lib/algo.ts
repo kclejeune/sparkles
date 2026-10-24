@@ -235,7 +235,11 @@ export function readRows(spec: AlgoSpec, rows: readonly Row[], level?: number): 
 }
 
 /** A run's summary in a few words, such as "20 iterations, converged" or "modularity 0.41". */
-export function summaryText(s: Record<string, unknown> | null): string | undefined {
+export function summaryText(
+  s: Record<string, unknown> | null,
+  /** Whether to give the count of communities or components in the whole projection. */
+  total = true,
+): string | undefined {
   if (!s) return undefined;
   const parts: string[] = [];
   const num = (k: string) => (typeof s[k] === 'number' ? (s[k] as number) : undefined);
@@ -245,7 +249,7 @@ export function summaryText(s: Record<string, unknown> | null): string | undefin
   const mod = num('modularity');
   if (mod != null) parts.push(`modularity ${mod.toFixed(2)}`);
   const c = num('communities') ?? num('components');
-  if (c != null) parts.push(`${c.toLocaleString('en-US')} in all`);
+  if (c != null && total) parts.push(`${c.toLocaleString('en-US')} in all`);
   return parts.length ? parts.join(', ') : undefined;
 }
 

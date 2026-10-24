@@ -869,7 +869,8 @@ export class Lenses {
           ? ` at level ${choice.level != null && rows.levels.includes(choice.level) ? choice.level : rows.levels.at(-1)}`
           : '';
       const lensName = `${spec.name}${level} ${scope}`;
-      const said = summaryText(rows.summary);
+      // over the drawn graph the legend already counts the communities
+      const said = summaryText(rows.summary, choice.scope === 'projection');
       let r: LensResult;
       if (spec.channel === 'size') {
         const values = this.#byId(input, rows.values as Map<string, number>);
