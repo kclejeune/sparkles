@@ -24,6 +24,11 @@
     executed = true,
     prefixes = {},
     open = false,
+    onPattern = undefined,
+    onpattern,
+    select = null,
+    onselectop,
+    onhoverop,
   }: {
     /** The dataset, with `@branch` when not on `main`. */
     ds: string;
@@ -37,6 +42,15 @@
     prefixes?: PrefixMap;
     /** Whether the panel starts open. */
     open?: boolean;
+    /** **Plan on pattern** (U04 §11): shown as a switch when the page draws the plan there */
+    onPattern?: boolean;
+    onpattern?: (on: boolean) => void;
+    /** an operator to select, chosen on the pattern */
+    select?: string | null;
+    /** an operator was selected in the tree */
+    onselectop?: (id: string) => void;
+    /** the operator under the pointer in the tree, or null */
+    onhoverop?: (id: string | null) => void;
   } = $props();
 
   let shown = $state(false);
@@ -50,6 +64,10 @@
   let nodes = $state<NodeFacts[]>([]);
   let shownNotes = $state(12);
   let selected = $state<string | null>(null);
+  // an operator chosen on the pattern is selected here too
+  $effect.pre(() => {
+    if (select) selected = select;
+  });
   let hovered = $state<string | null>(null);
   let lit = $state<Set<string> | null>(null);
   let asked: PlanNode | CursorPlan | null = null;
@@ -102,10 +120,26 @@
       {selected}
       marks={shown ? marks : undefined}
       {lit}
-      onhover={(id) => (hovered = id)}
-      onselect={(id) => (selected = id)}
+      onhover={(id) => {
+        hovered = id;
+        onhoverop?.(id);
+      }}
+      onselect={(id) => {
+        selected = id;
+        onselectop?.(id);
+      }}
     >
       {#snippet toolbar()}
+        {#if onpattern}
+          <label class="switch" title="Draw this plan's rows on the query's pattern">
+            <input
+              type="checkbox"
+              checked={onPattern}
+              onchange={(e) => onpattern?.(e.currentTarget.checked)}
+            />
+            Plan on pattern
+          </label>
+        {/if}
         {#if query}
           <label class="switch">
             <input type="checkbox" bind:checked={shown} />

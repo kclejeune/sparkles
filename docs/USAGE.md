@@ -1653,6 +1653,43 @@ the predicate picker on the whole screen. The pane needs the formatter's WebAsse
 [ui/README.md](../ui/README.md#formatting-in-the-browser)). Without it the pane says so
 and draws nothing.
 
+### The plan on the pattern
+
+**Plan on pattern** draws the plan of the query that ran on its pattern. The switch is in
+the toolbar of the Plan tab and in the header of the Pattern tab and the Pattern pane, and
+it is one setting for all three, kept per viewer. With it on, each edge carries the
+estimated and actual rows of the operator that reads its triple pattern, such as
+`est 214 · rows 214`, and grows wider with the logarithm of its rows. An edge whose actual
+rows are over ten times its estimate, or under a tenth of it, turns orange and shows `⚠`
+with the ratio, such as `×1,338` or `÷40`, which is the rule the plan tree uses for its red
+counts. A class under a node shows the numbers of its `?x a C` pattern, and a filter chip
+shows how many rows reached the filter and how many passed it. Each join is a numbered
+badge on the variable it joins on, numbered in the order the plan runs the joins, with its
+operator and rows. A locked block shows the numbers of the operator that evaluates it when
+it is the only block of its kind and the plan has one such operator.
+
+**Rows** and **Time** in the bar above the drawing switch between rows and each
+operator's own time, and in time the operator with the largest share is marked `●`. On
+the Pattern tab the plan tree sits beside the drawing. Clicking an edge, a badge or a chip
+selects its operator in the tree, and selecting an operator in the tree lights the edges
+and nodes it reads while the rest fade. Hovering a join badge, or focusing it, lights the
+edges below that join. The panel of a selected element names its operator with its
+numbers. Patterns of the plan that match nothing on the drawing, such as those inside a
+locked block or those the planner rewrote, are listed under **N operators not drawn**, so
+nothing in the plan is hidden. A star join that reads several triples shows its numbers on
+each of their edges and says it is shared.
+
+The numbers come from the plan the page already has, with no further request. An
+**Explain** shows estimates only. The bar names the commit and branch the plan was read
+at. A reader whose view a graph grant limits gets no estimates in plans, so the edges show
+actual rows only and no `⚠`. The Pattern pane beside the editor draws the plan only while
+its text is the text that ran, and says so when the text has changed since, while the
+result's Pattern tab always draws the text that ran. With the canvas focused, `J` moves
+through the join badges in plan order and `T` switches between rows and time, and the
+screen reader hears each element's numbers after its description. On a phone the tree is
+the Plan tab, and a tap on an edge opens a sheet whose **Show in plan** switches to the
+tree with the operator selected. Labels shorten there to `214 / 1.2M ⚠`.
+
 ## Lenses on the graph
 
 A lens changes how the graph draws its nodes and edges from data about them. The resource

@@ -383,6 +383,7 @@ test('each editor tab keeps its own positions', async ({ page }) => {
   const tabs = page.locator('.qtab-btn');
   // move ?person in the first tab
   await c.focus();
+  await expect(pane(page).getByTestId('pattern-focus')).toContainText('?person');
   for (let i = 0; i < 5; i++) await page.keyboard.press('Shift+ArrowRight');
   await expect.poll(async () => (await positions(c))['v:person']?.[0]).toBeDefined();
   const first = (await positions(c))['v:person'];
@@ -396,9 +397,13 @@ test('each editor tab keeps its own positions', async ({ page }) => {
   await redrawn(canvas(page), empty);
   await expect.poll(async () => (await positions(canvas(page)))['v:person']?.[0]).toBeDefined();
   await canvas(page).focus();
+  // the keys move the focused node, so wait until the focus is on ?person
+  await expect(pane(page).getByTestId('pattern-focus')).toContainText('?person');
   for (let i = 0; i < 10; i++) await page.keyboard.press('Shift+ArrowLeft');
+  await expect
+    .poll(async () => Math.abs((await positions(canvas(page)))['v:person'][0] - first[0]))
+    .toBeGreaterThan(100);
   const second = (await positions(canvas(page)))['v:person'];
-  expect(Math.abs(second[0] - first[0])).toBeGreaterThan(100);
   // back and forth: each tab draws its own picture
   await tabs.nth(0).click();
   await expect.poll(() => settled(canvas(page))).toBeGreaterThan(0);

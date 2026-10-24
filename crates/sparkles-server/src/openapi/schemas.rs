@@ -1011,9 +1011,28 @@ pub(super) fn schemas() -> Map<String, J> {
                 "runs": { "type": "integer", "description": "How often the node ran, when more than once. Its counts are of the last run and its time spans all of them." },
                 "pushedFilters": array(json!({ "type": "string" })),
                 "estimateGuessed": { "type": "boolean", "description": "The estimate is a constant guess, as for `SERVICE`." },
+                "patterns": array(sref("PlanPattern")),
+                "filterVars": { "type": "array", "items": { "type": "string" }, "description": "On a filter, the query variables its expression reads." },
+                "joinVars": { "type": "array", "items": { "type": "string" }, "description": "On a join, the query variables it joins on." },
                 "children": array(sref("PlanNode")),
                 "counters": { "type": "object" },
                 "warnings": array(obj(&["code", "message"], json!({ "code": { "type": "string" }, "message": { "type": "string" } }))),
+            },
+        }),
+    );
+    put(
+        "PlanPattern",
+        json!({
+            "type": "object",
+            "required": ["s", "p", "o", "occurrence"],
+            "additionalProperties": false,
+            "description": "A triple pattern or path of the query that a plan node reads, listed in query order on the node's `patterns`. A variable of the query is written `?name`, and a blank node or a variable the planner made is written `?_`.",
+            "properties": {
+                "s": { "type": "string", "description": "The subject as an N-Triples term or a variable." },
+                "p": { "type": "string", "description": "The predicate, or a path with full IRIs in angle brackets and no spaces, such as `<http://example.org/partOf>+`." },
+                "o": { "type": "string", "description": "The object as an N-Triples term or a variable." },
+                "graph": { "type": "string", "description": "The graph term of the `GRAPH` around the pattern." },
+                "occurrence": { "type": "integer", "minimum": 0, "description": "The pattern's index among equal patterns of the query, from 0." },
             },
         }),
     );

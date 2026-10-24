@@ -333,11 +333,11 @@ agent memory, the map view and a merge preview.
   </tr>
   <tr>
     <td><img src="docs/images/pattern-edit.png" alt="The Pattern pane adding an edge from ?person, with the predicate picker listing the predicates that instances of ex:Person use, with their counts"></td>
-    <td></td>
+    <td><img src="docs/images/plan-pattern.png" alt="The Pattern tab of a query that ran with Plan on pattern, each edge labelled with its estimated and actual rows, ex:memberOf marked as a misestimate, numbered join badges on the variables and the plan tree beside it"></td>
   </tr>
   <tr>
     <td>A query built on the canvas from the schema</td>
-    <td></td>
+    <td>A query's plan drawn on its pattern, with misestimates marked</td>
   </tr>
 </table>
 

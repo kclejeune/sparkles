@@ -26,6 +26,8 @@
     short,
     note = null,
     datatypes,
+    planInfo = null,
+    onshowplan,
     onedit,
     onrename,
     onedge,
@@ -51,6 +53,10 @@
     note?: string | null;
     /** the datatypes a variable's values were seen with, or null */
     datatypes: (v: string) => string[] | null;
+    /** the operator of the plan this element stands for, with its numbers (U04 §11) */
+    planInfo?: { id: string; operator: string; description: string; lines: string[] } | null;
+    /** show the operator in the plan tree */
+    onshowplan?: (id: string) => void;
     onedit: (e: AnyEdit) => void;
     /** a rename, which the pane confirms when locked blocks use the variable */
     onrename: (from: string, to: string) => void;
@@ -156,6 +162,18 @@
       ><Icon name="x" size={12} /></button
     >
   </div>
+  {#if planInfo}
+    <div class="plan" data-testid="pattern-plan-info">
+      <p>
+        <strong>{planInfo.operator}</strong>
+        <span class="faint mono small">{planInfo.description}</span>
+      </p>
+      {#each planInfo.lines as line, i (i)}<p class="small">{line}</p>{/each}
+      {#if onshowplan}
+        <button class="btn sm" onclick={() => onshowplan?.(planInfo!.id)}>Show in plan</button>
+      {/if}
+    </div>
+  {/if}
   {#if edge && triple}
     <p class="faint small">
       Line {lineOf(triple.triple.range.from)}:
@@ -308,6 +326,21 @@
 </div>
 
 <style>
+  .plan {
+    display: flex;
+    flex-direction: column;
+    gap: 2px;
+    padding: 6px 8px;
+    border-radius: 6px;
+    background: var(--surface-2);
+  }
+  .plan p {
+    margin: 0;
+  }
+  .plan .btn {
+    align-self: flex-start;
+    margin-top: 4px;
+  }
   .panel {
     position: absolute;
     right: 10px;
