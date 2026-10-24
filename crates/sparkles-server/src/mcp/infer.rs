@@ -68,6 +68,13 @@ impl Tools<'_> {
             req.max_depth = n as u32;
         }
         req.timeout = Some(timeout);
+        // the search and its answer are held to a query's memory budget
+        req.max_memory = self
+            .server
+            .state
+            .limits
+            .query_memory_bytes
+            .map(|m| usize::try_from(m).unwrap_or(usize::MAX));
         // the caller's view, as a query of the caller reads it
         if !self.call.principal.can_at(
             &ds.name,

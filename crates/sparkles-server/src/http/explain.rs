@@ -6,7 +6,7 @@ use crate::auth::{Endpoint, Principal};
 use axum::Extension;
 use axum::extract::{Path, State};
 use axum::http::StatusCode;
-use axum::response::{IntoResponse, Json, Response};
+use axum::response::{IntoResponse, Response};
 use sparkles::reasoning::explain::{
     self, DEFAULT_TIMEOUT, ExplainMode, NO_VISIBLE_DERIVATION, REASONING_BUDGET,
 };
@@ -33,6 +33,12 @@ pub(super) async fn explain(
     let asked = timeout.unwrap_or(DEFAULT_TIMEOUT);
     req.timeout = Some(st.limits.cap_timeout(asked, Some(DEFAULT_TIMEOUT)));
     req.access = p.view(&ds.name, Endpoint::Query);
+    // the search and the answer it builds are held to a query's memory budget
+    req.max_memory = st
+        .limits
+        .query_memory_bytes
+        .map(|m| usize::try_from(m).unwrap_or(usize::MAX));
+    let max_bytes = st.limits.max_result_bytes;
     let (cancel, _guard) = super::cancel_on_drop();
     req.cancel = Some(cancel);
     blocking(move || {
@@ -54,7 +60,24 @@ pub(super) async fn explain(
                 "no derivation from facts you can read was found",
             ));
         }
-        Ok(Json(explain::explanation_json(&e)).into_response())
+        // the answer is held to the result-byte limit of a query's
+        let body = serde_json::to_vec(&explain::explanation_json(&e))
+            .map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+        if let Some(limit) = max_bytes
+            && body.len() as u64 > limit
+        {
+            return Err(sparkles::Error::BudgetExceeded(sparkles::Budget {
+                kind: sparkles::BudgetKind::ResultBytes,
+                limit,
+                requested: body.len() as u64,
+            })
+            .into());
+        }
+        Ok((
+            [(axum::http::header::CONTENT_TYPE, "application/json")],
+            body,
+        )
+            .into_response())
     })
     .await
 }

@@ -452,9 +452,25 @@ impl<'a> Search<'a> {
     }
 }
 
+/// The heap a decoded term holds.
+fn term_bytes(t: &Term) -> usize {
+    std::mem::size_of::<Term>()
+        + match t {
+            Term::NamedNode(n) => n.as_str().len(),
+            Term::BlankNode(b) => b.as_str().len(),
+            Term::Literal(l) => {
+                l.value().len() + l.datatype().as_str().len() + l.language().map_or(0, str::len)
+            }
+            #[allow(unreachable_patterns)]
+            _ => 64,
+        }
+}
+
 /// Builds the answer's trees, numbering facts once across them.
 struct Builder<'s, 'a> {
     s: &'s Search<'a>,
+    /// charged with the answer's nodes and decoded terms, which it holds until it returns
+    budget: &'s Arc<Budget>,
     sources: &'s [String],
     max_depth: u32,
     ids: FxHashMap<u32, u32>,
@@ -471,7 +487,14 @@ impl Builder<'_, '_> {
 
     fn triple(&self, f: u32) -> anyhow::Result<[Term; 3]> {
         let t = self.s.facts[f as usize];
-        Ok([self.term(t[0])?, self.term(t[1])?, self.term(t[2])?])
+        let triple = [self.term(t[0])?, self.term(t[1])?, self.term(t[2])?];
+        // the node and its decoded terms, which a large literal can make large
+        let bytes =
+            std::mem::size_of::<Derivation>() + triple.iter().map(term_bytes).sum::<usize>();
+        self.budget
+            .try_charge(bytes)
+            .map_err(|e| e.with_context(" while building an explanation".to_string()))?;
+        Ok(triple)
     }
 
     fn graph(&self, g: Id) -> anyhow::Result<String> {
@@ -561,6 +584,21 @@ impl Builder<'_, '_> {
 /// facts of `input.inputs`, whose top rules differ. Fails with [`ExplainBudgetExceeded`]
 /// when the search passes its limits before it finds the first one.
 pub fn explain(
+    input: &ExplainInput<'_>,
+    triple: &[Term; 3],
+    opts: &ExplainOptions,
+) -> anyhow::Result<Explained> {
+    // the memory limit is one of the explanation's limits, answered as the others are
+    search(input, triple, opts).map_err(|e| {
+        if e.chain().any(|c| c.is::<crate::budget::MemoryExceeded>()) {
+            ExplainBudgetExceeded(format!("{e:#}")).into()
+        } else {
+            e
+        }
+    })
+}
+
+fn search(
     input: &ExplainInput<'_>,
     triple: &[Term; 3],
     opts: &ExplainOptions,
@@ -691,6 +729,7 @@ pub fn explain(
     s.via = via;
     let mut b = Builder {
         s: &s,
+        budget: &budget,
         sources: &sources,
         max_depth: opts.max_depth.min(MAX_DEPTH_LIMIT),
         ids: FxHashMap::default(),

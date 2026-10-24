@@ -1346,3 +1346,41 @@ async fn explain_route_answers_why() {
     assert_eq!(j["stale"], true);
     assert_eq!(j["commit"], s["commit"]);
 }
+
+/// An explanation's answer is held to the result-byte limit, and its search to the query
+/// memory budget.
+#[tokio::test]
+async fn explain_route_keeps_the_query_limits() {
+    for (bytes, memory, status) in [
+        (Some(200u64), None, StatusCode::OK),
+        (None, Some(256u64), StatusCode::UNPROCESSABLE_ENTITY),
+    ] {
+        let dir = tempfile::tempdir().unwrap();
+        let mut st =
+            AppState::new(dir.path(), StoreOptions::default(), Duration::from_secs(30)).unwrap();
+        st.limits.max_result_bytes = bytes;
+        st.limits.query_memory_bytes = memory;
+        let st = Arc::new(st);
+        st.create("t", DbType::Persistent).unwrap();
+        load(
+            &st,
+            "t",
+            "ex:Manager rdfs:subClassOf ex:Employee . ex:manages rdfs:domain ex:Manager .
+             ex:alice ex:manages ex:team7 .",
+        );
+        let app = router(st.clone());
+        let r = post_json(&app, "/$/reason/t", r#"{"profile":"rdfs"}"#).await;
+        assert_eq!(r.status, StatusCode::ACCEPTED);
+        wait_tasks(&st).await;
+        let why = explain_body("http://ex.org/alice", TYPE, "http://ex.org/Employee", "");
+        let r = post_json(&app, "/$/reason/t/explain", &why).await;
+        if bytes.is_some() {
+            // the tree is larger than 200 bytes
+            assert_ne!(r.status, status, "{}", r.text());
+            assert!(r.text().contains("result-bytes"), "{}", r.text());
+        } else {
+            assert_eq!(r.status, status, "{}", r.text());
+            assert_eq!(r.json()["code"], "reasoning-budget", "{}", r.text());
+        }
+    }
+}

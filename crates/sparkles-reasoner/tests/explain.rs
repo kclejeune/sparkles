@@ -684,3 +684,36 @@ fn a_deep_chain_fits_a_memory_limit_its_facts_fit() {
     );
     assert_eq!(rule(&ts[0]), "c119");
 }
+
+#[test]
+fn the_memory_limit_counts_the_terms_of_the_answer() {
+    // one instance with ten premises, each holding a literal of 100,000 bytes
+    let big = "x".repeat(100_000);
+    let mut trig = String::from("@prefix ex: <http://ex.org/> .\n");
+    let mut body = String::new();
+    for i in 0..10 {
+        trig.push_str(&format!("ex:a ex:p{i} \"{big}{i}\" .\n"));
+        body.push_str(&format!("(ex:a ex:p{i} ?l{i}) "));
+    }
+    let s = store(&trig);
+    let p = Profile::Rules(format!(
+        "@prefix ex: <http://ex.org/> .\n[r: {body}-> (ex:a ex:t ex:y)]\n"
+    ));
+    reason(&s, &p, &["default"], None);
+    let t = [ex("a"), ex("t"), ex("y")];
+    let (ts, _) = trees(why(&s, &p, &["default"], t.clone(), &ExplainOptions::default()).unwrap());
+    assert_eq!(ts[0].premises.len(), 10);
+    let e = why(
+        &s,
+        &p,
+        &["default"],
+        t,
+        &ExplainOptions {
+            max_memory: Some(500_000),
+            ..Default::default()
+        },
+    )
+    .map(|_| ())
+    .expect_err("a million bytes of terms fit in 500,000");
+    assert!(e.downcast_ref::<ExplainBudgetExceeded>().is_some(), "{e:#}");
+}

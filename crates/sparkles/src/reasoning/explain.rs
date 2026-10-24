@@ -101,12 +101,28 @@ pub struct Explanation {
     pub freshness: Option<super::Freshness>,
 }
 
-#[cfg(feature = "reasoning")]
 fn budget_error(m: String) -> crate::Error {
     crate::Error::Component(Box::new(
         crate::error::ComponentError::new("reasoner", REASONING_BUDGET, m.clone())
             .with_source(crate::explain::ExplainBudgetExceeded(m)),
     ))
+}
+
+/// Fail when the request was cancelled or passed its deadline.
+fn check_controls(req: &ExplainRequest, deadline: Option<Instant>) -> Result<()> {
+    if req
+        .cancel
+        .as_ref()
+        .is_some_and(|c| c.load(std::sync::atomic::Ordering::Relaxed))
+    {
+        return Err(sparkles_core::error::Error::Cancelled);
+    }
+    if deadline.is_some_and(|d| Instant::now() >= d) {
+        return Err(budget_error(
+            "the explanation passed its timeout".to_string(),
+        ));
+    }
+    Ok(())
 }
 
 /// The snapshot of the caller's view.
@@ -210,8 +226,6 @@ pub fn explain(ds: &Dataset, req: &ExplainRequest) -> Result<Explanation> {
         }
     }
     if let Some(on) = ds.reasoning().rdfs().get() {
-        let view = view_of(access, &head)?;
-        let schema = on.schema(&view)?;
         let leaves = match &on.source {
             SchemaSource::Fixed(_) => SchemaLeaves::Document,
             SchemaSource::Graph(g) => {
@@ -225,6 +239,17 @@ pub fn explain(ds: &Dataset, req: &ExplainRequest) -> Result<Explanation> {
                 }
             }
         };
+        // every RDFS derivation needs a schema fact, so a schema the caller cannot read
+        // explains nothing and is not built
+        if leaves == SchemaLeaves::Hidden {
+            return Ok(not_found(head.commit));
+        }
+        let view = view_of(access, &head)?;
+        // the schema is shared with queries and built without the request's controls, so
+        // they are checked on both sides of it
+        check_controls(req, deadline)?;
+        let schema = on.schema(&view)?;
+        check_controls(req, deadline)?;
         let inferred = head.lookup_iri(super::INFERRED_GRAPH);
         let mut graphs = vec![Id::DEFAULT_GRAPH];
         graphs.extend(head.graph_ids()?);
@@ -251,13 +276,18 @@ pub fn explain(ds: &Dataset, req: &ExplainRequest) -> Result<Explanation> {
             });
         }
     }
-    Ok(Explanation {
+    Ok(not_found(head.commit))
+}
+
+/// The answer when no derivation was found, read at `commit`.
+fn not_found(commit: u64) -> Explanation {
+    Explanation {
         explained: Explained::NotFound,
-        commit: head.commit,
+        commit,
         source: None,
         read_at_head: false,
         freshness: None,
-    })
+    }
 }
 
 fn bad(m: impl Into<String>) -> crate::Error {
