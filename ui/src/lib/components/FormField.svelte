@@ -444,7 +444,8 @@
   {/if}
   {#if noted.length && editable}
     <p class="faint small">
-      The server checks the pattern {noted.join(', ')} when you save.
+      The browser cannot check the pattern {noted.join(', ')}. Use Preview to check it on the
+      server.
     </p>
   {/if}
 </div>

@@ -39,7 +39,7 @@ export const ASSISTANT_FIELDS: readonly FieldDef[] = [
     label: 'What may leave the server',
     type: 'enum',
     options: SEND,
-    help: 'schema sends only the vocabulary. rows also sends result rows for summaries. documents also sends document text for ingestion.',
+    help: 'schema sends the vocabulary and query context, such as entity labels, example queries and counts, but no result rows or documents. rows also sends result rows for summaries. documents also sends document text for ingestion.',
   },
   {
     path: 'sendByProvider',
