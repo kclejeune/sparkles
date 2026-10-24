@@ -71,15 +71,8 @@ impl Host for ServerHost {
             .unwrap_or_default()
     }
 
-    fn refusal(&self) -> Option<&'static str> {
-        let s = self.state.upgrade()?;
-        if s.rdfs.read().is_some() {
-            Some("RDFS on read")
-        } else if s.reasoning.read().is_some() {
-            Some("a default graph with materialized inferences")
-        } else {
-            None
-        }
+    fn inference(&self) -> Option<sparkles::incr::Inference> {
+        sparkles::handles::views::inference(&*self.state.upgrade()?)
     }
 
     fn stored_query(&self, name: &str) -> sparkles::Result<String> {
@@ -207,6 +200,8 @@ pub(super) async fn put_view(
             "skipped",
             "passMs",
             "recomputeMs",
+            "evaluation",
+            "evaluationReason",
             "plan",
             "reason",
             "error",

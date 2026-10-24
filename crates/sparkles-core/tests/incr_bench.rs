@@ -312,3 +312,140 @@ fn pass_breakdown() {
         );
     }
 }
+
+/// Views on a dataset with inference (spec F13 §4.5): RDFS on read, and the graph of
+/// materialized inferences in the default graph. Each view evaluates its whole query
+/// again with the inference, so a pass that the changes touch costs about one query,
+/// and a commit outside the footprint skips the view.
+#[test]
+#[ignore]
+fn inferred_pass_against_query() {
+    use sparkles_core::access::GraphAccess;
+    use sparkles_core::incr::{Host, Inference};
+    use sparkles_core::sparql::rdfs::{RdfsOnRead, SchemaSource};
+    struct Inferring(Inference);
+    impl Host for Inferring {
+        fn access(&self, _: Option<&str>) -> sparkles_core::Result<Option<Arc<GraphAccess>>> {
+            Ok(None)
+        }
+        fn stored_query(&self, _: &str) -> sparkles_core::Result<String> {
+            Err(sparkles_core::Error::NotFound("none".into()))
+        }
+        fn inference(&self) -> Option<Inference> {
+            Some(self.0.clone())
+        }
+    }
+    const INFERRED: &str = "urn:x-sparkles:inferred";
+    let n = people();
+    let s = store(n, None);
+    // the schema, and for the materialized case the inferred types of every person
+    upd(
+        &s,
+        "INSERT DATA { :memberOf rdfs:subPropertyOf :belongsTo . :memberOf rdfs:domain :Member . \
+         :Member rdfs:subClassOf :Agent }",
+    );
+    let mut nt = String::with_capacity(n * 80);
+    for i in 0..n {
+        nt.push_str(&format!(
+            "<http://ex/p{i}> <http://www.w3.org/1999/02/22-rdf-syntax-ns#type> <http://ex/Agent> .\n"
+        ));
+    }
+    s.load(&[Source::from_bytes(
+        nt.into_bytes(),
+        RdfFormat::NTriples,
+        Some(oxrdf::NamedNode::new_unchecked(INFERRED)),
+    )])
+    .unwrap();
+    let cases: &[(&str, Inference, &str)] = &[
+        (
+            "rdfs team-sizes",
+            Inference::new(
+                Some(Arc::new(RdfsOnRead::new(SchemaSource::Graph(None)))),
+                Vec::new(),
+            )
+            .unwrap(),
+            "SELECT ?t (COUNT(?p) AS ?n) WHERE { ?p :belongsTo ?t } GROUP BY ?t",
+        ),
+        (
+            "rdfs agents",
+            Inference::new(
+                Some(Arc::new(RdfsOnRead::new(SchemaSource::Graph(None)))),
+                Vec::new(),
+            )
+            .unwrap(),
+            "SELECT (COUNT(?p) AS ?n) WHERE { ?p a :Agent }",
+        ),
+        (
+            "materialized agents",
+            Inference::new(None, vec![INFERRED.to_string()]).unwrap(),
+            "SELECT (COUNT(?p) AS ?n) WHERE { ?p a :Agent }",
+        ),
+        (
+            "materialized team-sizes",
+            Inference::new(None, vec![INFERRED.to_string()]).unwrap(),
+            "SELECT ?t (COUNT(?p) AS ?n) WHERE { ?p :memberOf ?t } GROUP BY ?t",
+        ),
+    ];
+    println!(
+        "| view | query ms | round median ms | round p95 ms | round / query | unrelated commit median ms | passes | skipped |"
+    );
+    println!("|---|---|---|---|---|---|---|---|");
+    for (name, inf, q) in cases {
+        let text = format!("{PREFIX}{q}");
+        let rt = Runtime::open(None, s.dataset_id(), RuntimeOptions::default());
+        rt.set_host(Arc::new(Inferring(inf.clone())));
+        rt.put(&s, "v", ViewDef::table(text.clone())).unwrap();
+        rt.round(&s);
+        let mut query = Vec::new();
+        for _ in 0..5 {
+            let t = Instant::now();
+            let r = sparql::query(
+                s.snapshot(),
+                &text,
+                &QueryOptions {
+                    no_cache: true,
+                    rdfs: inf.rdfs.clone(),
+                    default_graph_extra: inf.default_graph_extra.clone(),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+            std::hint::black_box(r.len());
+            query.push(t.elapsed().as_secs_f64() * 1e3);
+        }
+        let (mut passes, mut skips) = (Vec::new(), Vec::new());
+        for i in 0..100 {
+            let f = fresh();
+            let who = (f * 7919) % n;
+            // a touching commit, then one outside the footprint
+            let u = match i % 3 {
+                0 => format!(
+                    "INSERT DATA {{ :new{f} :memberOf :t{} . GRAPH <{INFERRED}> {{ :new{f} a :Agent }} }}",
+                    who % 50
+                ),
+                1 => format!("DELETE WHERE {{ :p{who} :memberOf ?t }}"),
+                _ => format!("INSERT DATA {{ :p{who} :memberOf :t{} }}", f % 50),
+            };
+            upd(&s, &u);
+            let t = Instant::now();
+            rt.round(&s);
+            passes.push(t.elapsed().as_secs_f64() * 1e3);
+            upd(&s, &format!("INSERT DATA {{ :p{who} :knows :x{f} }}"));
+            let t = Instant::now();
+            rt.round(&s);
+            skips.push(t.elapsed().as_secs_f64() * 1e3);
+        }
+        let info = rt.get(&s, "v").unwrap();
+        let qm = pct(&mut query, 0.5);
+        let pm = pct(&mut passes, 0.5);
+        let p95 = pct(&mut passes, 0.95);
+        println!(
+            "| {name} | {qm:.1} | {pm:.1} | {p95:.1} | {:.2} | {:.3} | {} | {} |",
+            pm / qm,
+            pct(&mut skips, 0.5),
+            info.passes,
+            info.skipped
+        );
+        rt.close(&s);
+    }
+}

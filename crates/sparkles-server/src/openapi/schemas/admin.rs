@@ -331,6 +331,8 @@ fn views(put: &mut dyn FnMut(&str, J)) {
         "skipped": { "type": "integer", "description": "Passes its footprint skipped." },
         "passMs": { "type": "number" },
         "recomputeMs": { "type": "number", "description": "Time spent in its recompute nodes." },
+        "evaluation": with_desc(string_enum(&["incremental", "recompute"]), "`recompute` when every relevant commit evaluates the whole query again, as on a dataset with RDFS on read or materialized inferences. Absent while the view has no circuit."),
+        "evaluationReason": with_desc(string(), "With `recompute`: why the whole query is evaluated again."),
         "plan": plan,
         "task": with_desc(string(), "On a PUT: the task of the first evaluation."),
     });

@@ -988,42 +988,239 @@ fn an_overflowed_queue_recovers_while_passes_run() {
     reader.join().unwrap();
 }
 
-/// Materialized inferences in the default graph refuse views and live queries, and
-/// end the live queries running when they appear.
-#[test]
-fn inferences_in_the_default_graph_refuse_views() {
-    struct Inferring(std::sync::atomic::AtomicBool);
-    impl Host for Inferring {
-        fn access(&self, _: Option<&str>) -> crate::Result<Option<Arc<GraphAccess>>> {
-            Ok(None)
-        }
-        fn stored_query(&self, _: &str) -> crate::Result<String> {
-            Err(crate::Error::NotFound("none".into()))
-        }
-        fn refusal(&self) -> Option<&'static str> {
-            self.0
-                .load(std::sync::atomic::Ordering::Relaxed)
-                .then_some("a default graph with materialized inferences")
+/// A host whose dataset's inference a test switches.
+struct Inferring(parking_lot::Mutex<Option<super::Inference>>);
+
+impl Host for Inferring {
+    fn access(&self, _: Option<&str>) -> crate::Result<Option<Arc<GraphAccess>>> {
+        Ok(None)
+    }
+    fn stored_query(&self, _: &str) -> crate::Result<String> {
+        Err(crate::Error::NotFound("none".into()))
+    }
+    fn inference(&self) -> Option<super::Inference> {
+        self.0.lock().clone()
+    }
+}
+
+fn inferred_oracle(s: &Store, query: &str, inf: Option<&super::Inference>) -> Vec<String> {
+    let r = sparql::query(
+        s.snapshot(),
+        &q(query),
+        &QueryOptions {
+            no_cache: true,
+            rdfs: inf.and_then(|i| i.rdfs.clone()),
+            default_graph_extra: inf
+                .map(|i| i.default_graph_extra.clone())
+                .unwrap_or_default(),
+            ..Default::default()
+        },
+    )
+    .expect("oracle");
+    let rows: Vec<(Vec<Option<Term>>, i64)> = r.rows().into_iter().map(|r| (r, 1)).collect();
+    rows_of(&rows)
+}
+
+/// Apply a live query's events to `rows`.
+fn follow(l: &super::live::LiveQuery, rows: &mut Vec<String>) {
+    while let Some(e) = l.try_next() {
+        match &e {
+            LiveEvent::Snapshot { .. } => *rows = live_rows(&e).1,
+            LiveEvent::Diff { .. } => {
+                let (removed, added) = live_rows(&e);
+                for r in removed {
+                    let i = rows.iter().position(|x| *x == r).expect("a removed row");
+                    rows.remove(i);
+                }
+                rows.extend(added);
+                rows.sort();
+            }
+            e => panic!("the live query ended: {e:?}"),
         }
     }
+}
+
+/// With RDFS on read or materialized inferences, a view and a live query evaluate the
+/// whole query again with them, and turning them on and off switches the circuits
+/// between the two modes without detaching the view or ending the live query.
+#[test]
+fn inference_switches_views_to_recompute() {
+    use crate::sparql::rdfs::{RdfsOnRead, SchemaSource};
+    const PEOPLE: &str = "SELECT ?x WHERE { ?x a foaf:Person }";
     let s = Store::in_memory(StoreOptions::default());
     load(&s);
+    upd(
+        &s,
+        "INSERT DATA { :Student rdfs:subClassOf foaf:Person . :a a :Student . :b a foaf:Person . \
+         GRAPH <urn:x-sparkles:inferred> { :c a foaf:Person } }",
+    );
     let rt = Runtime::open(None, s.dataset_id(), RuntimeOptions::default());
-    let host = Arc::new(Inferring(false.into()));
+    let host = Arc::new(Inferring(parking_lot::Mutex::new(None)));
+    rt.set_host(host.clone());
+    rt.put(&s, "people", ViewDef::table(q(PEOPLE))).unwrap();
+    rt.put(&s, "sizes", ViewDef::table(q(TEAM_SIZES))).unwrap();
+    rt.round(&s);
+    let l = rt
+        .live(&s, &q(PEOPLE), None, &LiveOptions::default())
+        .unwrap();
+    let mut live = Vec::new();
+    let check = |live: &mut Vec<String>, inf: Option<&super::Inference>| {
+        rt.round(&s);
+        assert_eq!(
+            read(&rt, &s, "people", None).unwrap(),
+            inferred_oracle(&s, PEOPLE, inf)
+        );
+        assert_eq!(
+            read(&rt, &s, "sizes", None).unwrap(),
+            inferred_oracle(&s, TEAM_SIZES, inf)
+        );
+        follow(&l, live);
+        assert_eq!(*live, inferred_oracle(&s, PEOPLE, inf));
+    };
+    check(&mut live, None);
+    assert_eq!(live, ["b"]);
+    let mode = |name: &str| {
+        let v = rt.get(&s, name).unwrap();
+        (v.evaluation, v.evaluation_reason)
+    };
+    assert_eq!(mode("people"), (Some(super::Mode::Incremental), None));
+
+    let rdfs = super::Inference::new(
+        Some(Arc::new(RdfsOnRead::new(SchemaSource::Graph(None)))),
+        Vec::new(),
+    );
+    *host.0.lock() = rdfs.clone();
+    check(&mut live, rdfs.as_ref());
+    assert_eq!(live, ["a", "b"]);
+    assert_eq!(
+        mode("people"),
+        (Some(super::Mode::Recompute), Some("RDFS on read".into()))
+    );
+    upd(&s, "INSERT DATA { :d a :Student }");
+    check(&mut live, rdfs.as_ref());
+    upd(&s, "DELETE DATA { :Student rdfs:subClassOf foaf:Person }");
+    check(&mut live, rdfs.as_ref());
+    assert_eq!(live, ["b"]);
+
+    let both = super::Inference::new(
+        rdfs.as_ref().and_then(|i| i.rdfs.clone()),
+        vec!["urn:x-sparkles:inferred".into()],
+    );
+    *host.0.lock() = both.clone();
+    check(&mut live, both.as_ref());
+    assert_eq!(live, ["b", "c"]);
+    upd(&s, "INSERT DATA { :Student rdfs:subClassOf foaf:Person }");
+    check(&mut live, both.as_ref());
+    assert_eq!(live, ["a", "b", "c", "d"]);
+
+    *host.0.lock() = None;
+    check(&mut live, None);
+    assert_eq!(live, ["b"]);
+    assert_eq!(mode("people"), (Some(super::Mode::Incremental), None));
+    upd(&s, "INSERT DATA { :e a foaf:Person }");
+    check(&mut live, None);
+    assert_eq!(live, ["b", "e"]);
+}
+
+/// A live query resumed at the commit of a switch of the inference gets the whole
+/// result, since the switch changed the rows without a commit.
+#[test]
+fn a_resume_across_a_switch_resets() {
+    use crate::sparql::rdfs::{RdfsOnRead, SchemaSource};
+    const PEOPLE: &str = "SELECT ?x WHERE { ?x a foaf:Person }";
+    let s = Store::in_memory(StoreOptions::default());
+    upd(
+        &s,
+        "INSERT DATA { :Student rdfs:subClassOf foaf:Person . :a a :Student . :b a foaf:Person }",
+    );
+    let rt = Runtime::open(None, s.dataset_id(), RuntimeOptions::default());
+    let host = Arc::new(Inferring(parking_lot::Mutex::new(None)));
     rt.set_host(host.clone());
     let l = rt
-        .live(&s, &q(TEAM_SIZES), None, &LiveOptions::default())
+        .live(&s, &q(PEOPLE), None, &LiveOptions::default())
         .unwrap();
-    l.try_next().unwrap();
-    host.0.store(true, std::sync::atomic::Ordering::Relaxed);
-    rt.round(&s);
-    assert!(
-        matches!(l.try_next(), Some(LiveEvent::Error { code, .. }) if code == "not-incremental")
+    let Some(LiveEvent::Snapshot { commit, .. }) = l.try_next() else {
+        panic!("a snapshot first");
+    };
+    *host.0.lock() = super::Inference::new(
+        Some(Arc::new(RdfsOnRead::new(SchemaSource::Graph(None)))),
+        Vec::new(),
     );
-    assert!(rt.put(&s, "v", ViewDef::table(q(TEAM_SIZES))).is_err());
+    rt.round(&s);
+    let again = rt
+        .live(
+            &s,
+            &q(PEOPLE),
+            None,
+            &LiveOptions {
+                after: Some(commit),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+    let e = again.try_next().unwrap();
     assert!(
-        rt.live(&s, &q(TEAM_SIZES), None, &LiveOptions::default())
-            .is_err()
+        matches!(e, LiveEvent::Snapshot { reset: true, .. }),
+        "{e:?}"
+    );
+    assert_eq!(live_rows(&e).1, ["a", "b"]);
+    drop(l);
+}
+
+/// A circuit over inferred data skips a commit outside its footprint, and runs on a
+/// change of a schema predicate or of the inferred graph.
+#[test]
+fn inferred_footprints_skip_unrelated_commits() {
+    use crate::sparql::rdfs::{RdfsOnRead, SchemaSource};
+    const PEOPLE: &str = "SELECT ?x WHERE { ?x a foaf:Person }";
+    let s = Store::in_memory(StoreOptions::default());
+    upd(
+        &s,
+        "INSERT DATA { :Student rdfs:subClassOf foaf:Person . :a a :Student }",
+    );
+    let rt = Runtime::open(None, s.dataset_id(), RuntimeOptions::default());
+    let inf = super::Inference::new(
+        Some(Arc::new(RdfsOnRead::new(SchemaSource::Graph(None)))),
+        vec!["urn:x-sparkles:inferred".into()],
+    );
+    rt.set_host(Arc::new(Inferring(parking_lot::Mutex::new(inf.clone()))));
+    rt.put(&s, "people", ViewDef::table(q(PEOPLE))).unwrap();
+    rt.round(&s);
+    let passes = |rt: &Runtime| {
+        let v = rt.get(&s, "people").unwrap();
+        (v.passes, v.skipped)
+    };
+    let (p0, k0) = passes(&rt);
+    // unrelated: another predicate, a class outside the hierarchy
+    upd(&s, "INSERT DATA { :z :knows :y . :t a :Teacher }");
+    rt.round(&s);
+    assert_eq!(passes(&rt), (p0, k0 + 1));
+    // a schema change runs the pass, and brings :t in
+    upd(
+        &s,
+        "INSERT DATA { :Teacher rdfs:subClassOf :Staff . :Staff rdfs:subClassOf foaf:Person }",
+    );
+    rt.round(&s);
+    assert_eq!(passes(&rt), (p0 + 1, k0 + 1));
+    assert_eq!(read(&rt, &s, "people", None).unwrap(), ["a", "t"]);
+    // a subclass of the new hierarchy is in the footprint now
+    upd(&s, "INSERT DATA { :u a :Staff }");
+    rt.round(&s);
+    assert_eq!(passes(&rt), (p0 + 2, k0 + 1));
+    // the inferred graph counts as the default graph
+    upd(
+        &s,
+        "INSERT DATA { GRAPH <urn:x-sparkles:inferred> { :v a foaf:Person } }",
+    );
+    rt.round(&s);
+    assert_eq!(passes(&rt), (p0 + 3, k0 + 1));
+    // another named graph does not
+    upd(&s, "INSERT DATA { GRAPH :other { :w a foaf:Person } }");
+    rt.round(&s);
+    assert_eq!(passes(&rt), (p0 + 3, k0 + 2));
+    assert_eq!(
+        read(&rt, &s, "people", None).unwrap(),
+        inferred_oracle(&s, PEOPLE, inf.as_ref())
     );
 }
 

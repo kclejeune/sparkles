@@ -138,6 +138,8 @@ pub struct Pass<'a> {
     pub max_memory_bytes: Option<u64>,
     /// the query's base IRI
     pub base: Option<oxiri::Iri<String>>,
+    /// the dataset's inference, which evaluations read with
+    pub inference: Option<Arc<super::inference::Inference>>,
     ctx: Option<Ctx>,
     union_changes: Option<Vec<([Id; 3], i64)>>,
     work: u64,
@@ -171,6 +173,7 @@ impl<'a> Pass<'a> {
             full,
             max_memory_bytes: None,
             base: None,
+            inference: None,
             ctx: None,
             union_changes: None,
             work: 0,
@@ -449,8 +452,8 @@ impl<'a> Pass<'a> {
     }
 
     /// Evaluate `pattern` with the query engine at the new snapshot, as the circuit's
-    /// principal: its solutions over the variables `vars`, as rows of this circuit's
-    /// id space with their multiplicities.
+    /// principal and with the dataset's inference: its solutions over the variables
+    /// `vars`, as rows of this circuit's id space with their multiplicities.
     pub fn evaluate(
         &mut self,
         pattern: &GraphPattern,
@@ -479,6 +482,12 @@ impl<'a> Pass<'a> {
             allow_service: false,
             forbid_service: true,
             defaults_applied: true,
+            rdfs: self.inference.as_ref().and_then(|i| i.rdfs.clone()),
+            default_graph_extra: self
+                .inference
+                .as_ref()
+                .map(|i| i.default_graph_extra.clone())
+                .unwrap_or_default(),
             ..Default::default()
         };
         let r = crate::sparql::execute_query(self.new.clone(), &q, &opts, 0.0)?;

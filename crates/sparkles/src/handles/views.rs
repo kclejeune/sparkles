@@ -26,7 +26,7 @@ use crate::Dataset;
 use crate::access::GraphAccess;
 use crate::dataset::{DatasetState, StoreHandle};
 use crate::error::{Error, Result};
-use crate::incr::{Host, Kind, LiveOptions, LiveQuery, PlanNode, ViewDef, ViewInfo};
+use crate::incr::{Host, Inference, Kind, LiveOptions, LiveQuery, PlanNode, ViewDef, ViewInfo};
 use crate::sparql::viewsvc::{ViewRead, ViewRows, ViewSource};
 use std::sync::{Arc, Weak};
 use std::time::Duration;
@@ -55,15 +55,8 @@ impl Host for LibraryHost {
             .unwrap_or_default()
     }
 
-    fn refusal(&self) -> Option<&'static str> {
-        let s = self.state.upgrade()?;
-        if s.rdfs.read().is_some() {
-            Some("RDFS on read")
-        } else if s.reasoning.read().is_some() {
-            Some("a default graph with materialized inferences")
-        } else {
-            None
-        }
+    fn inference(&self) -> Option<Inference> {
+        inference(&*self.state.upgrade()?)
     }
 
     fn stored_query(&self, name: &str) -> Result<String> {
@@ -77,6 +70,22 @@ impl Host for LibraryHost {
             .map(|s| s.definition.query)
             .ok_or_else(|| crate::incr::error("invalid-view", format!("no stored query {name:?}")))
     }
+}
+
+/// What the dataset's queries read beyond the stored quads, as
+/// [`Dataset::query_options`] sets it: RDFS on read, and the graph of materialized
+/// inferences while the dataset has a reasoning record. Views and live queries evaluate
+/// their whole query again with it.
+#[doc(hidden)]
+pub fn inference(state: &DatasetState) -> Option<Inference> {
+    Inference::new(
+        state.rdfs.read().clone(),
+        if state.reasoning.read().is_some() {
+            vec![crate::reasoning::INFERRED_GRAPH.to_string()]
+        } else {
+            Vec::new()
+        },
+    )
 }
 
 /// Answers `SERVICE view:read` for a dataset's queries.
@@ -268,15 +277,28 @@ mod tests {
     use crate::incr::LiveOptions;
     use crate::sparql::rdfs::{RdfsOnRead, SchemaSource};
 
-    /// Views and live queries read stored quads, so RDFS on read refuses them.
+    /// With RDFS on read, a view and a live query evaluate the whole query again with
+    /// it, so they answer as the query does.
     #[test]
-    fn rdfs_on_read_refuses_views_and_live_queries() {
+    fn rdfs_on_read_views_and_live_queries_recompute() {
         let ds = Dataset::memory();
+        ds.update(
+            "INSERT DATA { <urn:D> <http://www.w3.org/2000/01/rdf-schema#subClassOf> <urn:C> . \
+             <urn:a> a <urn:D> }",
+        )
+        .unwrap();
         *ds.state().rdfs.write() = Some(Arc::new(RdfsOnRead::new(SchemaSource::Graph(None))));
         let q = "SELECT ?s WHERE { ?s a <urn:C> }";
-        let e = ds.views().put("v", ViewDef::table(q)).unwrap_err();
-        assert!(e.to_string().contains("RDFS on read"), "{e}");
-        assert!(ds.live(q, &LiveOptions::default()).is_err());
+        let v = ds.views().put("v", ViewDef::table(q)).unwrap();
+        assert_eq!(v.evaluation_reason.as_deref(), Some("RDFS on read"));
+        ds.views().wait_built("v", Duration::from_secs(10)).unwrap();
+        assert_eq!(ds.views().read("v").unwrap().rows.len(), 1);
+        let live = ds.live(q, &LiveOptions::default()).unwrap();
+        let first = live.next_timeout(Duration::from_secs(10));
+        assert!(
+            matches!(&first, Some(crate::incr::LiveEvent::Snapshot { rows, .. }) if rows.len() == 1),
+            "{first:?}"
+        );
     }
 
     /// The last handle of a dataset with running views closes it on its own thread, so

@@ -14,6 +14,7 @@
 
 use super::circuit::{Advance, Circuit, DeltaSet};
 use super::compile::{Kind, compile};
+use super::inference::Inference;
 use super::live::{Count, LiveEvent, LiveOptions, LiveQuery, LiveRow, Shared};
 use super::ops::PlanNode;
 use super::persist;
@@ -101,10 +102,11 @@ pub trait Host: Send + Sync {
     fn epoch(&self) -> u64 {
         0
     }
-    /// What makes the dataset's queries read more than the stored quads, which views
-    /// and live queries then refuse (spec F13 §4.5): RDFS on read, or materialized
-    /// inferences added to the default graph.
-    fn refusal(&self) -> Option<&'static str> {
+    /// What makes the dataset's queries read more than the stored quads: RDFS on read,
+    /// or materialized inferences added to the default graph. Views and live queries
+    /// then evaluate the whole query again with it on each relevant commit (spec F13
+    /// §4.5), and a change of it switches them between the two modes.
+    fn inference(&self) -> Option<Inference> {
         None
     }
 }
@@ -149,6 +151,8 @@ struct Info {
     recompute_time: Duration,
     columns: Vec<String>,
     plan: PlanNode,
+    /// why the whole query is evaluated again, when it is
+    whole: Option<String>,
 }
 
 struct Hist {
@@ -168,6 +172,7 @@ struct Sub {
 pub(crate) struct Slot {
     circuit: Circuit,
     query: Query,
+    /// why the access makes the whole query be evaluated again, when it does
     whole: Option<String>,
     vars: Arc<[String]>,
     history: VecDeque<Hist>,
@@ -175,9 +180,47 @@ pub(crate) struct Slot {
     subs: Vec<Sub>,
     /// the views attached to the circuit
     views: usize,
+    /// the commit at which the circuit last switched between incremental maintenance and
+    /// evaluating again (0: never). The switch changes the result without a commit, so
+    /// a live query resumed at or before it gets the whole result.
+    switched: u64,
 }
 
 impl Slot {
+    /// Why the whole query is evaluated again: protections that depend on the data, or
+    /// the dataset's inference.
+    fn whole_reason(&self, inference: Option<&Inference>) -> Option<String> {
+        self.whole
+            .clone()
+            .or_else(|| inference.map(|i| i.reason().to_string()))
+    }
+
+    /// A circuit of the slot's query, access and inference without state.
+    fn fresh(&self, inference: Option<Arc<Inference>>) -> Result<Circuit> {
+        let whole = self.whole_reason(inference.as_deref());
+        let mut c = Circuit::new(
+            compile(&self.query, whole.as_deref())?,
+            self.circuit.access.clone(),
+        );
+        c.max_memory_bytes = self.circuit.max_memory_bytes;
+        c.inference = inference;
+        Ok(c)
+    }
+
+    /// The fingerprint of the circuit's checkpoints: the cell's key, and the inference
+    /// its state was built with.
+    fn fingerprint(&self, key: u64) -> u64 {
+        match &self.circuit.inference {
+            None => key,
+            Some(i) => {
+                let mut h = Sha256::new();
+                h.update(key.to_le_bytes());
+                h.update(i.key().as_bytes());
+                u64::from_le_bytes(h.finalize()[..8].try_into().expect("8 bytes"))
+            }
+        }
+    }
+
     fn live_rows(&self, rows: Vec<(Vec<Option<Term>>, i64)>) -> Vec<LiveRow> {
         rows.into_iter()
             .map(|(terms, w)| LiveRow {
@@ -326,6 +369,8 @@ struct ViewEntry {
 #[derive(Default)]
 struct Registry {
     cells: FxHashMap<u64, Arc<Cell>>,
+    /// the dataset's inference that every circuit is compiled for
+    inference: Option<Arc<Inference>>,
     views: BTreeMap<String, ViewEntry>,
     /// why the definitions could not be read; views cannot be changed until it is fixed
     broken: Option<String>,
@@ -621,7 +666,9 @@ impl Runtime {
             .clone()
             .unwrap_or_else(|| Arc::new(OpenHost));
         let q = self.parse(host.as_ref(), query)?;
-        let c = compile(&q, whole_reason(access.as_ref()))?;
+        let inference = host.inference();
+        let whole = whole_reason(access.as_ref()).or(inference.as_ref().map(Inference::reason));
+        let c = compile(&q, whole)?;
         let circuit = Circuit::new(c, access);
         Ok((circuit.kind, circuit.plan()))
     }
@@ -647,9 +694,14 @@ impl Runtime {
         if let Some(c) = reg.cells.get(&key) {
             return Ok((c.clone(), false));
         }
-        let compiled = compile(&q, whole.as_deref())?;
+        let inference = reg.inference.clone();
+        let mode = whole
+            .clone()
+            .or_else(|| inference.as_ref().map(|i| i.reason().to_string()));
+        let compiled = compile(&q, mode.as_deref())?;
         let mut circuit = Circuit::new(compiled, access);
         circuit.max_memory_bytes = max_memory_bytes;
+        circuit.inference = inference;
         let info = Info {
             status: Status::Building,
             applied: 0,
@@ -661,6 +713,7 @@ impl Runtime {
             recompute_time: Duration::ZERO,
             columns: circuit.columns(),
             plan: circuit.plan(),
+            whole: mode,
         };
         let vars: Arc<[String]> = circuit.columns().into();
         let cell = Arc::new(Cell {
@@ -674,6 +727,7 @@ impl Runtime {
                 history_rows: 0,
                 subs: Vec::new(),
                 views: 0,
+                switched: 0,
             }),
             info: Mutex::new(info),
             pending: AtomicUsize::new(0),
@@ -690,9 +744,6 @@ impl Runtime {
         };
         if entry.cell.is_some() || entry.suspended.is_some() {
             return Ok(());
-        }
-        if let Some(why) = host.refusal() {
-            return Err(super::compile::not_incremental(why));
         }
         let def = entry.def.clone();
         let text = Self::view_text(host.as_ref(), &def)?;
@@ -731,10 +782,13 @@ impl Runtime {
                     continue;
                 }
             };
-            if h.dataset != self.dataset || h.fingerprint != cell.key || commit > snap.commit {
+            let mut st = cell.state.lock();
+            if h.dataset != self.dataset
+                || h.fingerprint != st.fingerprint(cell.key)
+                || commit > snap.commit
+            {
                 continue;
             }
-            let mut st = cell.state.lock();
             match st.circuit.decode(body, &snap) {
                 Ok(()) => {
                     st.circuit.applied = h.commit;
@@ -769,24 +823,9 @@ impl Runtime {
             return;
         };
         let mut reg = self.reg.lock();
-        // the low bit says whether the dataset's queries now read more than the stored
-        // quads, which detaches every view and ends every live query
-        let refusal = host.refusal();
-        let epoch = host.epoch().wrapping_shl(1) | u64::from(refusal.is_some());
+        self.sync_inference(&mut reg, host.as_ref());
+        let epoch = host.epoch();
         if self.host_epoch.swap(epoch, Ordering::AcqRel) != epoch {
-            if let Some(why) = refusal {
-                for c in reg.cells.values() {
-                    let st = c.state.lock();
-                    for sub in &st.subs {
-                        if let Some(sh) = sub.shared.upgrade() {
-                            sh.push(LiveEvent::Error {
-                                code: "not-incremental".into(),
-                                message: format!("{why} cannot be used in a view or a live query"),
-                            });
-                        }
-                    }
-                }
-            }
             // grants may have changed: resolve every view's principal again
             for e in reg.views.values_mut() {
                 e.error = None;
@@ -809,6 +848,64 @@ impl Runtime {
                     entry.error = Some(e.to_string());
                 }
             }
+        }
+    }
+
+    /// Compile every circuit for the host's inference when it has changed. Each circuit
+    /// then evaluates its query again in the new mode on the next round, and the
+    /// difference reaches its live queries as a diff or a `reset`, so views stay
+    /// attached and live queries keep running.
+    fn sync_inference(&self, reg: &mut Registry, host: &dyn Host) {
+        let now = host.inference();
+        if Inference::same(reg.inference.as_deref(), now.as_ref()) {
+            return;
+        }
+        let now = now.map(Arc::new);
+        tracing::info!(
+            target: "sparkles::incr::runtime",
+            "the dataset's inference changed ({}): {} circuits evaluate again",
+            now.as_ref().map_or("none", |i| i.reason()),
+            reg.cells.len()
+        );
+        reg.inference = now.clone();
+        for cell in reg.cells.values() {
+            let mut st = cell.state.lock();
+            let fresh = st.fresh(now.clone());
+            let mut c = match fresh {
+                Ok(c) => c,
+                Err(e) => {
+                    self.fail(cell, &mut st, &e);
+                    continue;
+                }
+            };
+            // the old result stays, for the first evaluation in the new mode to be
+            // compared with
+            let old = &mut st.circuit;
+            c.result = std::mem::take(&mut old.result);
+            c.terms = std::mem::take(&mut old.terms);
+            c.snap = old.snap.take();
+            c.applied = old.applied;
+            st.circuit = c;
+            // diffs of the old mode do not lead to rows of the new one
+            st.history.clear();
+            st.history_rows = 0;
+            if st.circuit.snap.is_some() {
+                st.switched = st.circuit.applied;
+            }
+            let mut info = cell.info.lock();
+            info.plan = st.circuit.plan();
+            info.whole = st.whole_reason(now.as_deref());
+            if info.status == Status::Ready {
+                info.status = Status::Building;
+            }
+        }
+    }
+
+    /// [`sync_inference`](Self::sync_inference) for a reader, so that a read after a
+    /// change of the setting never sees a circuit of the old mode as current.
+    fn sync_for_read(&self, reg: &mut Registry) {
+        if let Some(host) = self.host.read().clone() {
+            self.sync_inference(reg, host.as_ref());
         }
     }
 
@@ -1170,7 +1267,7 @@ impl Runtime {
                     &persist::Header {
                         dataset: self.dataset,
                         commit: applied,
-                        fingerprint: cell.key,
+                        fingerprint: st.fingerprint(cell.key),
                     },
                     &body,
                 )
@@ -1319,9 +1416,6 @@ impl Runtime {
         }
         def.check()?;
         let host = self.host()?;
-        if let Some(why) = host.refusal() {
-            return Err(super::compile::not_incremental(why));
-        }
         let text = Self::view_text(host.as_ref(), &def)?;
         let q = self.parse(host.as_ref(), &text)?;
         if matches!(q, Query::Ask { .. } | Query::Describe { .. }) {
@@ -1334,6 +1428,7 @@ impl Runtime {
         compile(&q, whole_reason(access.as_ref()))?;
         let mut reg = self.reg.lock();
         self.broken(&reg)?;
+        self.sync_inference(&mut reg, host.as_ref());
         if let Some(root) = &self.root {
             views::write(root, name, &def)?;
         }
@@ -1409,6 +1504,8 @@ impl Runtime {
             skipped: 0,
             pass_ms: 0.0,
             recompute_ms: 0.0,
+            evaluation: None,
+            evaluation_reason: None,
             plan: None,
         };
         if let Some(why) = &e.suspended {
@@ -1426,6 +1523,12 @@ impl Runtime {
             v.commit = Some(i.applied);
         }
         v.columns = i.columns;
+        v.evaluation = Some(if i.whole.is_some() {
+            super::ops::Mode::Recompute
+        } else {
+            super::ops::Mode::Incremental
+        });
+        v.evaluation_reason = i.whole;
         v.plan = Some(i.plan);
         v.rows = i.rows;
         v.state_bytes = i.bytes;
@@ -1459,7 +1562,8 @@ impl Runtime {
 
     pub fn get(&self, store: &Store, name: &str) -> Result<ViewInfo> {
         let head = store.snapshot().commit;
-        let reg = self.reg.lock();
+        let mut reg = self.reg.lock();
+        self.sync_for_read(&mut reg);
         let e = reg
             .views
             .get(name)
@@ -1470,7 +1574,8 @@ impl Runtime {
     /// Every view with its state, by name.
     pub fn list(&self, store: &Store) -> Vec<ViewInfo> {
         let head = store.snapshot().commit;
-        let reg = self.reg.lock();
+        let mut reg = self.reg.lock();
+        self.sync_for_read(&mut reg);
         reg.views
             .iter()
             .map(|(n, e)| self.info(n, e, head))
@@ -1492,7 +1597,8 @@ impl Runtime {
         let until = Instant::now() + timeout;
         loop {
             let (cell, err) = {
-                let reg = self.reg.lock();
+                let mut reg = self.reg.lock();
+                self.sync_for_read(&mut reg);
                 let e = reg
                     .views
                     .get(name)
@@ -1528,7 +1634,8 @@ impl Runtime {
         let until = r.deadline.map_or(wait, |d| d.min(wait));
         loop {
             let (cell, access, suspended, error) = {
-                let reg = self.reg.lock();
+                let mut reg = self.reg.lock();
+                self.sync_for_read(&mut reg);
                 let e = reg.views.get(r.name).ok_or_else(|| {
                     super::error("view-not-found", format!("no view {:?}", r.name))
                 })?;
@@ -1649,8 +1756,7 @@ impl Runtime {
             s.union_default_graph = union;
             Arc::new(s)
         };
-        let compiled = compile(&st.query, st.whole.as_deref())?;
-        let mut c = Circuit::new(compiled, st.circuit.access.clone());
+        let mut c = st.fresh(st.circuit.inference.clone())?;
         drop(st);
         let control = Control {
             deadline: r.deadline.or(self.control().deadline),
@@ -1680,9 +1786,6 @@ impl Runtime {
             .read()
             .clone()
             .unwrap_or_else(|| Arc::new(OpenHost));
-        if let Some(why) = host.refusal() {
-            return Err(super::compile::not_incremental(why));
-        }
         let q = self.parse(host.as_ref(), query)?;
         if matches!(q, Query::Describe { .. }) {
             return Err(super::compile::not_incremental("DESCRIBE"));
@@ -1725,6 +1828,7 @@ impl Runtime {
             if self.is_closed() {
                 return Err(super::error("views-unavailable", "the dataset is closing"));
             }
+            self.sync_inference(&mut reg, host.as_ref());
             let (cell, new) = self.cell_for(&mut reg, q, query, access, Some(budget))?;
             cell.pending.fetch_add(1, Ordering::AcqRel);
             (cell, new)
@@ -1811,6 +1915,9 @@ impl Runtime {
     /// since, or a `reset` (spec F13 §2.3).
     fn resume(&self, store: &Store, st: &Slot, after: u64) -> Option<LiveEvent> {
         let applied = st.circuit.applied;
+        if st.switched > 0 && after <= st.switched {
+            return Some(st.event(true));
+        }
         if after == applied {
             return None;
         }
@@ -1824,8 +1931,7 @@ impl Runtime {
                 return None;
             }
             let old = d.old().ok()?;
-            let compiled = compile(&st.query, st.whole.as_deref()).ok()?;
-            let mut c = Circuit::new(compiled, st.circuit.access.clone());
+            let mut c = st.fresh(st.circuit.inference.clone()).ok()?;
             c.build(old, &self.control()).ok()?;
             if ask {
                 let delta = st.circuit.result.total() - c.result.total();
