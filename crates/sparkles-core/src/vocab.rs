@@ -2884,6 +2884,62 @@ mod tests {
     /// An FSST-coded vocabulary answers every read as the front-coded one of the same
     /// keys does (X11 A7), and is smaller.
     #[test]
+    fn fsst_decodes_any_subset_of_a_block_like_front() {
+        // keys whose shared prefixes rise and fall, so that a key the next one takes
+        // few bytes of limits what every key before it must give
+        let mut keys: Vec<Vec<u8>> = Vec::new();
+        for i in 0..400u32 {
+            let long = "x".repeat((i % 7 * 9) as usize);
+            keys.push(format!("<http://example.org/{:03}/{long}{}>", i / 5, i % 5).into_bytes());
+            keys.push(format!("\"{:03} {long} {}\"", i / 3, i).into_bytes());
+        }
+        keys.sort();
+        keys.dedup();
+        let (fd, sd) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
+        write_codec(fd.path(), &keys, false);
+        write_codec(sd.path(), &keys, true);
+        let (f, s) = (
+            Vocab::open(fd.path()).unwrap(),
+            Vocab::open(sd.path()).unwrap(),
+        );
+        assert!(s.is_fsst());
+        let mut x = 0x9E37_79B9_7F4A_7C15u64;
+        for _ in 0..2000 {
+            x ^= x << 13;
+            x ^= x >> 7;
+            x ^= x << 17;
+            let b = (x >> 20) % (keys.len() as u64 / FC_BLOCK as u64);
+            let mask = (x & 0xffff) | 1 << (x >> 40 & 15);
+            let ids: Vec<u64> = (0..FC_BLOCK as u64)
+                .filter(|i| mask >> i & 1 == 1)
+                .map(|i| b * FC_BLOCK as u64 + i)
+                .collect();
+            let (mut a, mut c, mut d) = (Vec::new(), Vec::new(), Vec::new());
+            f.get_sorted(&ids, |i, k| a.push((i, k.to_vec())));
+            s.get_sorted(&ids, |i, k| c.push((i, k.to_vec())));
+            s.get_sorted_checked::<()>(
+                &ids,
+                |_| Ok(()),
+                |i, k| {
+                    d.push((i, k.to_vec()));
+                    Ok(())
+                },
+            )
+            .unwrap();
+            assert_eq!(a, c, "{ids:?}");
+            assert_eq!(a, d, "{ids:?}");
+            let last = *ids.last().unwrap();
+            assert_eq!(s.get(last).as_ref(), Some(&keys[last as usize]));
+            assert_eq!(
+                s.get_with_fallible(last, |_| Ok(()), |k| k.to_vec())
+                    .unwrap()
+                    .as_ref(),
+                Some(&keys[last as usize])
+            );
+        }
+    }
+
+    #[test]
     fn fsst_reads_like_front() {
         let keys = mixed_keys(3000);
         let (fd, sd) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
