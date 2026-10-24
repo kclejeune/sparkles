@@ -432,17 +432,17 @@ jvm = "SparklesHelpers.lint"
 node = "lint"
 
 ["forms.check"]
-python = "planned: Dataset.forms.check, after the form editor settles"
+python = "Dataset.forms.check"
 jvm = "planned: DatasetGraphSparkles.forms().check, after the Python and Node.js ones"
 node = "planned: Dataset.forms.check, after the form editor settles"
 
 ["forms.model"]
-python = "planned: Dataset.forms.model, after the form editor settles"
+python = "Dataset.forms.model"
 jvm = "planned: DatasetGraphSparkles.forms().model, after the Python and Node.js ones"
 node = "planned: Dataset.forms.model, after the form editor settles"
 
 ["forms.save"]
-python = "planned: Dataset.forms.save, after the form editor settles"
+python = "Dataset.forms.save"
 jvm = "planned: DatasetGraphSparkles.forms().save, after the Python and Node.js ones"
 node = "planned: Dataset.forms.save, after the form editor settles"
 
