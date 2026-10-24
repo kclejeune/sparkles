@@ -245,7 +245,10 @@ test("the check skips graph names, but not a variable or a prefixed name that en
   const check = async (query: string) => {
     const r = await request.post('/org/check', { data: { query, terms: true } });
     expect(r.ok()).toBe(true);
-    return (await r.json()) as { issues: { code: string }[]; terms: { term: string }[] };
+    return (await r.json()) as {
+      issues: { code: string }[];
+      terms: { term: string; iri: string }[];
+    };
   };
   const ex = 'PREFIX ex: <http://example.org/ontology#>\n';
   const named = await check(
@@ -264,4 +267,16 @@ test("the check skips graph names, but not a variable or a prefixed name that en
   expect(compact.terms.map((t) => t.term)).toEqual(['ex:startDate']);
   const compared = await check('SELECT * WHERE { ?s ?p ?o FILTER(?o<STRLEN("#")&&?o>0) }');
   expect(compared.terms).toEqual([]);
+  // a long string's lines are not read as IRIs or keywords
+  const long = await check(
+    'SELECT ?t WHERE { BIND("""first\n<relative>\nDELETE WHERE { }\nlast""" AS ?t) }',
+  );
+  expect(long.issues.map((i) => i.code)).not.toContain('not-a-query');
+  expect(long.terms).toEqual([]);
+  // GRAPH at the end of a prefixed name, with a letter outside ASCII or an escaped dot,
+  // is part of the name
+  for (const name of ['ex:café.GRAPH', 'ex:a\\.GRAPH']) {
+    const dotted = await check(`${ex}SELECT * WHERE { ?s ${name} <http://example.org/typo> }`);
+    expect(dotted.terms.map((t) => t.iri)).toContain('http://example.org/typo');
+  }
 });
