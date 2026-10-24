@@ -67,7 +67,9 @@ the first policy.
 the saved answers of a run again under the current policy, or the first one with
 `--scoring-policy`. It runs only `sparkles query` on the set's data. It refuses a set, a
 data file or a binary whose SHA256 differs from the run's, and a case file whose
-question differs from its report row. The new report records the query timeout, each
+question differs from its report row. A run on a database directory is rescored with
+`--loc` at the path the run used. A directory has no digest, so the caller vouches that
+nothing wrote to it since the run. The new report records the query timeout, each
 case file's SHA256 and each row's execution accuracy before and after.
 
 Every query the evaluator runs starts with PREFIX lines for the well-known prefixes of
