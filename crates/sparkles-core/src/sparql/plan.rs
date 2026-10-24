@@ -360,6 +360,15 @@ pub enum Kind {
         left: VarId,
         right: VarId,
     },
+    /// The inner join of two parts of a group that share no variable, linked by a FILTER
+    /// conjunct `?left = ?right` over a variable of each. The candidate pairs are those of
+    /// [`Kind::KeyedLeftJoin`], and `expr`, the conjunction of the FILTERs that need both
+    /// sides, is tested on them, so the result is the filtered product's.
+    KeyedJoin {
+        expr: Expr,
+        left: VarId,
+        right: VarId,
+    },
     Minus,
     /// ARQ's SEMIJOIN (`anti`: ANTIJOIN): the rows of child 0 compatible with a row of
     /// child 1 (with none)
@@ -598,6 +607,7 @@ impl Node {
                 ..
             } => "CartesianProduct",
             Kind::LeftJoin { .. } | Kind::KeyedLeftJoin { .. } => "OptionalJoin",
+            Kind::KeyedJoin { .. } => "KeyedJoin",
             Kind::Minus => "Minus",
             Kind::HalfJoin { anti: false } => "SemiJoin",
             Kind::HalfJoin { anti: true } => "AntiJoin",
@@ -3144,9 +3154,60 @@ impl<'a> Planner<'a> {
         let mut it = parts.into_iter();
         let mut acc = it.next().unwrap();
         for p in it {
-            acc = self.place_filters(join(acc, p, self.ctx), filters);
+            acc = match self.keyed_join(acc, p, filters) {
+                Ok(keyed) => keyed,
+                Err((acc, p)) => self.place_filters(join(acc, p, self.ctx), filters),
+            };
         }
         Ok(super::indexjoin::fuse_stars(acc, self.ctx))
+    }
+
+    /// The join of `a` and `b`, which share no variable, keyed on a conjunct `?x = ?y` of
+    /// a remaining FILTER with one variable on each side (see [`Kind::KeyedJoin`]). Every
+    /// FILTER that both sides together bind is tested on the candidates and removed from
+    /// `filters`. `Err` gives the inputs back when no FILTER links them so.
+    fn keyed_join(
+        &self,
+        a: Node,
+        b: Node,
+        filters: &mut Vec<Expr>,
+    ) -> std::result::Result<Node, (Node, Node)> {
+        // An application callback in the condition may count or depend on its calls,
+        // which the candidates change, so it keeps the product.
+        if !self.ctx.opt.keyed_join
+            || self.ctx.calls_extensions
+            || a.is_empty()
+            || b.is_empty()
+            || a.vars.iter().any(|v| b.vars.contains(v))
+        {
+            return Err((a, b));
+        }
+        let bound = |f: &Expr| {
+            !f.has_exists() && {
+                let vs = f.var_set();
+                !vs.is_empty() && vs.iter().all(|v| a.vars.contains(v) || b.vars.contains(v))
+            }
+        };
+        let Some((x, y)) = filters
+            .iter()
+            .filter(|f| bound(f))
+            .find_map(|f| equality_key(f, &a, &b))
+        else {
+            return Err((a, b));
+        };
+        let (now, later): (Vec<Expr>, Vec<Expr>) =
+            std::mem::take(filters).into_iter().partition(|f| bound(f));
+        *filters = later;
+        let expr = now
+            .into_iter()
+            .reduce(|l, r| Expr::And(Box::new(l), Box::new(r)))
+            .expect("the linking FILTER");
+        // The larger input is streamed and the smaller one indexed.
+        Ok(if a.est >= b.est {
+            keyed_inner_join(a, b, expr, (x, y), self.ctx)
+        } else {
+            keyed_inner_join(b, a, expr, (y, x), self.ctx)
+        })
     }
 
     /// Apply (and remove) filters whose variables are all bound by `n`.
@@ -4000,6 +4061,42 @@ fn keyed_left_join(l: Node, r: Node, expr: Expr, (a, b): (VarId, VarId), ctx: &C
         sorted: Vec::new(),
         est,
         cost: l.cost + r.cost + base + est,
+        dist,
+        desc,
+        children: vec![l, r],
+    }
+}
+
+/// The inner join of `l` and `r` keyed on the equality of `a` (left) and `b` (right),
+/// with the condition `expr` tested on the candidates (see [`Kind::KeyedJoin`]). It is
+/// estimated as a join on one variable whose result the rest of the condition filters.
+fn keyed_inner_join(l: Node, r: Node, expr: Expr, (a, b): (VarId, VarId), ctx: &Ctx) -> Node {
+    let joined = join_est_from(l.est, r.est, l.d(a).max(r.d(b)));
+    let conjuncts = expr.clone().conjuncts().len().max(1);
+    let est = (joined * FILTER_SELECTIVITY.powi(conjuncts as i32 - 1)).max(1.0);
+    let mut vars = l.vars.clone();
+    vars.extend(r.vars.iter().filter(|v| !l.vars.contains(v)));
+    let mut certain = l.certain.clone();
+    certain.extend(r.certain.iter().filter(|v| !l.certain.contains(v)));
+    let desc = format!(
+        "on ?{} = ?{} filter {}",
+        ctx.var_name(a),
+        ctx.var_name(b),
+        expr.display(ctx)
+    );
+    let dist = merge_dist(&l, &r, est, None);
+    let base = hash_base(Costing::of(ctx).hash_build, r.est, l.est);
+    Node {
+        kind: Kind::KeyedJoin {
+            expr,
+            left: a,
+            right: b,
+        },
+        vars,
+        certain,
+        sorted: Vec::new(),
+        est,
+        cost: l.cost + r.cost + base + joined + est,
         dist,
         desc,
         children: vec![l, r],

@@ -15,6 +15,7 @@ mod cursor_regex;
 pub mod depth;
 pub mod describe;
 pub mod enhancer;
+mod eqkey;
 pub mod exec;
 mod exists;
 pub mod expr;
