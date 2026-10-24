@@ -447,6 +447,11 @@ pub struct PlanWarning {
 
 pub struct Ctx {
     pub extensions: Option<Arc<super::extensions::ExtensionRegistry>>,
+    /// what query-time reasoning derived for this query (see [`super::reasoning`])
+    pub reasoning: Option<Arc<super::reasoning::Applied>>,
+    /// The snapshot holds facts with query-local terms, which query-time reasoning
+    /// derived (spec F17). A pattern constant the store does not have may then match.
+    pub local_facts: bool,
     pub snap: Arc<Snapshot>,
     local: RwLock<AppendVocab>,
     values: Vec<RwLock<FxHashMap<Id, Value>>>,
@@ -819,6 +824,8 @@ impl Ctx {
 
     pub fn new(snap: Arc<Snapshot>) -> Ctx {
         Ctx {
+            reasoning: None,
+            local_facts: false,
             extension_families: Vec::new(),
             extension_writers: Vec::new(),
             extension_ancestors: Vec::new(),
@@ -1739,6 +1746,12 @@ impl Ctx {
         }
     }
 
+    /// Whether `id` is a constant no fact of the snapshot holds: a query-local term,
+    /// unless query-time reasoning derived facts with such terms.
+    pub fn unknown_const(&self, id: Id) -> bool {
+        id.tag() == Tag::Local && !self.local_facts
+    }
+
     pub fn intern_key(&self, key: &[u8]) -> Id {
         if let Some(id) = self.snap.lookup_key(key) {
             return id;
@@ -1809,6 +1822,14 @@ impl Ctx {
             },
             _ => self.intern_term(&v.to_term()),
         }
+    }
+
+    /// Take the local terms and minted blank nodes of `other`, so that this context reads
+    /// the ids `other` gave them (a query that reads a view with derived facts).
+    pub(crate) fn share_local(&self, other: &Ctx) {
+        *self.local.write() = other.local.read().clone();
+        self.next_bnode
+            .store(other.next_bnode.load(Ordering::Relaxed), Ordering::Relaxed);
     }
 
     pub fn fresh_bnode(&self) -> Id {

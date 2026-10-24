@@ -1653,7 +1653,7 @@ pub fn add_numeric_column(dir: &Path) -> Result<u64> {
 
 /// An append-only dictionary; used for the persisted delta vocabulary and for per-query
 /// local vocabularies.
-#[derive(Default)]
+#[derive(Clone, Default)]
 pub struct AppendVocab {
     keys: Vec<Arc<[u8]>>,
     map: FxHashMap<Arc<[u8]>, u64>,

@@ -206,6 +206,10 @@ impl GraphCursor {
     pub fn cancellation_token(&self) -> Arc<std::sync::atomic::AtomicBool> {
         self.where_cursor.cancellation_token()
     }
+    /// What query-time reasoning derived for the query (spec F17).
+    pub fn reasoning(&self) -> Option<Arc<crate::sparql::reasoning::Applied>> {
+        self.where_cursor.reasoning()
+    }
     pub fn deadline(&self) -> Option<Instant> {
         self.where_cursor.deadline()
     }

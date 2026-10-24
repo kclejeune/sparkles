@@ -947,6 +947,37 @@ impl Snapshot {
         self.perm(Perm::Spo).contains(&self.cache, &k)
     }
 
+    /// This snapshot with `quads` added, as a view for one query (spec F17 §3.2): the
+    /// facts query-time reasoning derived. The view is not cacheable, so the result cache
+    /// neither reads nor fills entries for it, and its counts start empty. With `absent`,
+    /// the caller knows that none of the quads is in the base index unless the delta
+    /// deleted it there, so no base probe is made. Ids tagged local are the query's own
+    /// terms, which only the query that made them reads.
+    pub fn with_overlay(&self, quads: &[[Id; 4]], absent: bool) -> Result<Snapshot> {
+        let mut delta = self.delta.clone();
+        let spo = Perm::Spo.index();
+        for q in quads {
+            let k = Perm::Spo.to_key(q);
+            if delta.ins[spo].contains(&k) {
+                continue;
+            }
+            if delta.del[spo].contains(&k) {
+                apply(&mut delta, q, true, true);
+                continue;
+            }
+            if !absent && self.perm(Perm::Spo).contains(&self.cache, &k)? {
+                continue;
+            }
+            apply(&mut delta, q, true, false);
+        }
+        Ok(Snapshot {
+            delta,
+            counts: Default::default(),
+            cacheable: false,
+            ..self.clone()
+        })
+    }
+
     /// Distinct values of the first key column (e.g. graph names from GSPO), by skipping.
     fn distinct_first_checked(
         &self,
