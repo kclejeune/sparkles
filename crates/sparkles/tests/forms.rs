@@ -598,9 +598,9 @@ fn a_new_instance_whose_iri_is_taken_while_it_waits_is_refused() {
     let saved = ds.forms().save(&c, &Default::default());
     ds.store().set_failpoint("writer-acquiring", None);
     assert!(fired.load(Ordering::SeqCst));
-    let e = saved
-        .err()
-        .expect("the save went ahead on a resource that exists");
+    let Err(e) = saved else {
+        panic!("the save went ahead on a resource that exists");
+    };
     assert!(e.to_string().contains("already describes"), "{e}");
     assert!(!ds.ask(&format!("ASK {{ <{focus}> a ?c }}")).unwrap());
 }
