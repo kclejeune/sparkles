@@ -2575,10 +2575,13 @@ result's branch, and the header names it. The paths are drawn on the result's ow
 edges where the result has them, with each edge labelled by the paths that use it, and the
 nodes and edges a path needs that the result lacks are added for as long as the paths are
 shown. The WebGL view colours and thickens the path edges, labels the path nodes and draws
-the path numbers at the edges' midpoints, without the step-by-step animation. The keys `1`
-to `9` and `A` work as in Explore. **Add to graph** is not offered, because a result
-graph is the query's answer and not a graph to build on. Closing the panel, or running a
-query again, removes the paths and the nodes they added.
+the path numbers at the edges' midpoints, without the step-by-step animation, and it keeps
+its layout and its view while paths are shown and cleared. The keys `1` to `9`, `A` and
+`Escape` work as in Explore, with the focus in the list or on the graph. **Open in editor**
+opens the paths' query in a new tab of the query page, at the result's state. **Add to
+graph** is not offered, because a result graph is the query's answer and not a graph to
+build on. Closing the panel, or running a query again, removes the paths and the nodes
+they added.
 
 ## Graph algorithms
 

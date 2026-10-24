@@ -369,9 +369,14 @@ open the same panel beside the result graph, at the result's state and branch. A
 on the canvas offers **Paths from here** and **Paths to here**, and in the WebGL view the
 selected node fills **From**. The paths are matched to the result's edges by their triples,
 and the nodes and edges a path needs that the result lacks are added while the paths are
-shown, placed between their neighbours on the path. The WebGL view draws path edges thicker
-in the path colour, forces the labels of path nodes, dims the rest when one path is
-focused and draws the path numbers at the edges' midpoints, at most 400 of them.
+shown, placed between their neighbours on the path. A literal gets a node per triple, as
+the result graph draws literals, so two triples that end in the same literal are marked
+apart. The WebGL view draws path edges thicker in the path colour, forces the labels of
+path nodes, dims the rest when one path is focused and draws the path numbers at the
+edges' midpoints, at most 400 of them. Showing or clearing paths updates the WebGL picture
+in place, so its layout and camera stay where they were. The keys of §2.3 work with the
+focus on the graph as well as in the list, and **Open in editor** opens the query in a new
+tab of the same page, since the query page is already open.
 
 **Phase 3 decisions.** The spec left these open, and each was decided here. The weight
 picker offers reifier properties only, with no free IRI field, since a weight that no
@@ -385,10 +390,13 @@ a C12b protection on `ex:worksFor` for members of `ex:Founder` rather than with 
 grant.
 
 **Phase 3 tests.** `ui/src/lib/paths.test.ts` has 20 Vitest tests, four of them for the
-weight. `ui/tests/mock/paths-phase3.spec.ts` checks the weighted search in Explore, the
-panel on the query page's canvas with the added nodes, the node menu and the reset on a new
-result, the WebGL overlay's edge count with and without a focused path, and the phone sheet
-at 390 px with no sideways scroll. The mock's path search enumerates simple paths by cost
+weight, and `ui/src/lib/path-overlay.test.ts` has 6 for merging paths into a drawn result.
+`ui/tests/mock/paths-phase3.spec.ts` checks the weighted search in Explore, a weight list
+that follows the state and drops a weight the state lacks, the panel on the query page's
+canvas with the added nodes, the node menu, **Open in editor** and the reset on a new
+result, the WebGL overlay's edge count with and without a focused path, the keys with the
+focus on the graph, a layout that does not restart, and the phone sheet at 390 px with no
+sideways scroll. The mock's path search enumerates simple paths by cost
 when a weight is set. `ui/tests/e2e/paths.spec.ts` runs A1, A4, A6 and A7 against the real
 server on a dataset loaded in two commits. `mise run docs:screenshots` writes
 `docs/images/query-paths.png`, the three shortest flight routes from Vancouver to Auckland

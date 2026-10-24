@@ -27,6 +27,7 @@
     highlight = $bindable(null),
     onresult,
     onadd,
+    onopenquery,
     onclear,
     onclose,
     onfit,
@@ -45,6 +46,11 @@
     onresult?: (r: { paths: pf.FoundPath[]; labels: Map<string, string> } | null) => void;
     /** Keeps the paths in the page's graph; without it there is no **Add to graph**. */
     onadd?: () => void;
+    /**
+     * Opens the query that found the paths, at its state, on the page itself; without it
+     * **Open in editor** goes to the query page.
+     */
+    onopenquery?: (query: string, at: string) => void;
     onclear?: () => void;
     onclose?: () => void;
     onfit?: (path: pf.FoundPath) => void;
@@ -139,10 +145,15 @@
     void ds;
     void at;
     untrack(() => {
+      // a list in flight belongs to the old state, so nothing it returns is shown
+      weightCtl?.abort();
+      weightCtl = undefined;
       if (weightsFor) {
         weightsFor = '';
         weights = null;
       }
+      // a chosen weight is checked against the new state at once, and dropped if it has none
+      if (weight) loadWeights();
     });
   });
   /** On a phone, after a search the sheet shows the first path only until it is swiped up. */
@@ -249,6 +260,7 @@
   /** The query page opens with the query that found the paths shown, at its state. */
   function openInEditor() {
     if (!result) return;
+    if (onopenquery) return onopenquery(result.query, result.at);
     app.pendingQuery = { query: result.query, title: 'Paths' };
     app.queryAt = result.at;
     void goto(resolve('/query'));
@@ -461,6 +473,9 @@
             onpointerdown={loadWeights}
           >
             <option value={null}>none, count edges</option>
+            {#if weight && !weights?.some((w) => w.iri === weight)}<option value={weight}
+                >{displayIri(weight, prefixes)}</option
+              >{/if}
             {#each weights ?? [] as w (w.iri)}<option value={w.iri}
                 >{displayIri(w.iri, prefixes)}</option
               >{/each}

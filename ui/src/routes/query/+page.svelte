@@ -42,7 +42,7 @@
   import PathPanel from '$components/PathPanel.svelte';
   import type { Picked } from '$components/EntityPicker.svelte';
   import * as pf from '$lib/paths';
-  import { mergePaths, placeBetween, type PathOverlay } from '$lib/path-overlay';
+  import { mergePaths, type PathOverlay } from '$lib/path-overlay';
   import { chooseRenderer, hasWebGL2, seed, type Renderer } from '$lib/overview';
   import Icon from '$components/Icon.svelte';
   import ExplainedPlan from '$components/ExplainedPlan.svelte';
@@ -2004,8 +2004,14 @@
       pathMenu = null;
     });
   });
+  /**
+   * The WebGL graph the paths were last shown or cleared on: while it is still the one
+   * drawn, showing or clearing paths updates the picture in place, without a new layout.
+   */
+  let pathBase = $state.raw<LNode[] | null>(null);
   const pickedOf = (id: string | null): Picked | null => {
-    const n = id ? drawnGraph.nodes.find((x) => x.id === id) : undefined;
+    // the nodes the paths added can start a search too
+    const n = id ? (pathGraph?.nodes ?? drawnGraph.nodes).find((x) => x.id === id) : undefined;
     return n?.term && n.term.type === 'uri' ? { term: n.term, label: n.label } : null;
   };
   function openPaths(opts: { from?: string; to?: string } = {}) {
@@ -2019,11 +2025,18 @@
     queueMicrotask(() => pathPanel?.focus());
   }
   function closePaths() {
+    pathBase = largeNodes;
     pathsOpen = false;
     pathOverlay = null;
     pathFocus = null;
   }
+  function clearPaths() {
+    pathBase = largeNodes;
+    pathOverlay = null;
+    pathFocus = null;
+  }
   function showPaths(r: { paths: pf.FoundPath[]; labels: Map<string, string> } | null) {
+    pathBase = largeNodes;
     pathFocus = null;
     if (!r) {
       pathOverlay = null;
@@ -2046,20 +2059,22 @@
         )
       : null,
   );
-  /** The WebGL view's nodes and edges, with the paths' own placed between their neighbours. */
+  /**
+   * The WebGL view's nodes and edges with the paths on them. The view places the nodes the
+   * paths add between their neighbours already laid out, so the seed is only a fallback.
+   */
   const largePathNodes: LNode[] = $derived.by(() => {
     if (!pathGraph || choice.renderer !== 'webgl') return largeNodes;
-    const at = new Map(largeNodes.map((n) => [n.key, { x: n.x, y: n.y }]));
     const colors = graphColors();
     const known = new Map(largeNodes.map((n) => [n.key, n]));
     return pathGraph.nodes.map((n) => {
       const base = known.get(n.id);
       if (base) return n.paths ? { ...base, paths: n.paths } : base;
-      const p = placeBetween(n.id, pathGraph.edges, (k) => at.get(k), seed(n.id, undefined, 100));
+      const p = seed(n.id, undefined, 100);
       return {
         key: n.id,
         label: n.label,
-        size: 3.5,
+        size: n.kind === 'literal' ? 2.5 : 3.5,
         color: colors[n.kind] ?? colors.iri,
         x: p.x,
         y: p.y,
@@ -2081,11 +2096,30 @@
   function fitPath(p: pf.FoundPath) {
     if (choice.renderer === 'webgl') largeView?.fitPath(p.n);
   }
+  /** Shift+P opens the path finder, and while it is open the graph takes its keys too. */
   function onGraphKey(e: KeyboardEvent) {
-    if (e.key !== 'P' || !e.shiftKey || e.metaKey || e.ctrlKey || e.altKey) return;
-    if ((e.target as HTMLElement)?.closest?.('input, select, textarea, .cm-editor')) return;
-    e.preventDefault();
-    openPaths();
+    if (e.metaKey || e.ctrlKey || e.altKey) return;
+    const el = e.target as HTMLElement | null;
+    if (el?.closest?.('input, select, textarea, .cm-editor, .gpaths')) return;
+    if (e.key === 'P' && e.shiftKey) {
+      e.preventDefault();
+      openPaths();
+      return;
+    }
+    if (!pathsOpen) return;
+    const count = pathOverlay ? new Set(pathOverlay.edges.flatMap((x) => x.paths)).size : 0;
+    if (/^[1-9]$/.test(e.key) && Number(e.key) <= count) {
+      e.preventDefault();
+      pathFocus = Number(e.key);
+    } else if ((e.key === 'a' || e.key === 'A') && pathOverlay) {
+      e.preventDefault();
+      pathFocus = null;
+    } else if (e.key === 'Escape') {
+      e.preventDefault();
+      if (pathMenu) pathMenu = null;
+      else if (pathFocus != null) pathFocus = null;
+      else closePaths();
+    }
   }
   $effect(() => {
     const o = outcome;
@@ -3487,6 +3521,7 @@
                       nodes={largePathNodes}
                       edges={largePathEdges}
                       {pathFocus}
+                      still={pathBase === largeNodes}
                       selected={largeSelected}
                       label="Result graph"
                       onselect={(k) => (largeSelected = k)}
@@ -3547,10 +3582,11 @@
                         bind:to={pathTo}
                         bind:highlight={pathFocus}
                         onresult={showPaths}
-                        onclear={() => {
-                          pathOverlay = null;
-                          pathFocus = null;
+                        onopenquery={(query, at) => {
+                          addTab(query, 'Paths');
+                          app.queryAt = at;
                         }}
+                        onclear={clearPaths}
                         onclose={closePaths}
                         onfit={fitPath}
                       />
@@ -4492,6 +4528,7 @@
     flex: 1;
     min-width: 0;
     min-height: 0;
+    overflow: hidden;
     /* the lens legend docks in its corner */
     position: relative;
   }

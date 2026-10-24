@@ -39,6 +39,7 @@
   import type Sigma from 'sigma';
   import type { LayoutStart, LayoutTick } from '$lib/layout.worker';
   import { NO_ENCODING, OTHER, readPalette, sizeFactor, type Encoding } from '$lib/lens';
+  import { placeBetween } from '$lib/path-overlay';
 
   let {
     nodes,
@@ -531,6 +532,17 @@
     });
     renderer.on('afterRender', drawOverlay);
     ready = true;
+    // sigma follows the window's size only, and a panel beside the view, such as the path
+    // finder's, narrows the host without resizing the window
+    if (typeof ResizeObserver === 'function') {
+      sizeObserver = new ResizeObserver(() => {
+        if (renderer && !destroyed) {
+          renderer.resize();
+          renderer.refresh();
+        }
+      });
+      sizeObserver.observe(host);
+    }
     sync();
   }
 
@@ -636,6 +648,9 @@
       weights.push((a.weight as number) ?? 1);
     });
     layoutId++;
+    // how many layouts this view has started, for tests that check it holds still
+    layoutRuns++;
+    if (overlay) overlay.dataset.layoutRuns = String(layoutRuns);
     fitAfter = fit;
     const msg: LayoutStart = {
       type: 'start',
@@ -655,6 +670,8 @@
   }
 
   let fitAfter = false;
+  let layoutRuns = 0;
+  let sizeObserver: ResizeObserver | undefined;
   /** Whether every node shows its label (a small picture). */
   let allLabels = false;
 
@@ -741,27 +758,64 @@
     g.forEachNode((k) => {
       if (!want.has(k)) g.dropNode(k);
     });
+    // a node new to the picture, such as one a path adds, is placed between its neighbours
+    // already drawn, in passes so that a chain of new nodes is placed too
+    let fresh: LNode[] = [];
     for (const n of nodes) {
       const a = { label: n.label, size: n.size, color: n.color, paths: n.paths };
       if (g.hasNode(n.key)) g.mergeNodeAttributes(n.key, a);
-      else g.addNode(n.key, { ...a, x: n.x, y: n.y, fixed: true });
+      else fresh.push(n);
+    }
+    const at = (k: string) => {
+      if (!g.hasNode(k)) return undefined;
+      const a = g.getNodeAttributes(k);
+      return { x: a.x as number, y: a.y as number };
+    };
+    while (fresh.length) {
+      const later: LNode[] = [];
+      const placed: [LNode, { x: number; y: number }][] = [];
+      for (const n of fresh) {
+        const p = placeBetween(n.key, edges, at, { x: NaN, y: NaN });
+        if (Number.isNaN(p.x)) later.push(n);
+        else placed.push([n, p]);
+      }
+      const last = !placed.length;
+      for (const [n, p] of placed) addFixed(n, p);
+      if (last) for (const n of later) addFixed(n, { x: n.x, y: n.y });
+      fresh = last ? [] : later;
+    }
+    function addFixed(n: LNode, p: { x: number; y: number }) {
+      g.addNode(n.key, {
+        label: n.label,
+        size: n.size,
+        color: n.color,
+        paths: n.paths,
+        x: p.x,
+        y: p.y,
+        fixed: true,
+      });
     }
     const wantE = new Set(edges.map((e) => e.key));
     g.forEachEdge((k) => {
       if (!wantE.has(k)) g.dropEdge(k);
+      else g.removeEdgeAttribute(k, 'paths');
     });
+    // the drawn edges first, then the paths of the other edges of the same pair, so that
+    // the one drawn edge of a pair carries the paths of all of them in any order
+    const merge: LEdge[] = [];
     for (const e of edges) {
       if (e.source === e.target || !g.hasNode(e.source) || !g.hasNode(e.target)) continue;
       const a = {
         size: e.size ?? 1,
         weight: e.size ?? 1,
-        paths: e.paths,
+        ...(e.paths?.length ? { paths: e.paths } : {}),
         ...(e.color ? { color: e.color } : {}),
       };
       if (g.hasEdge(e.key)) g.mergeEdgeAttributes(e.key, a);
       else if (!g.hasEdge(e.source, e.target)) g.addEdgeWithKey(e.key, e.source, e.target, a);
-      else if (e.paths?.length) mergePaths(g.edge(e.source, e.target)!, e.paths);
+      else if (e.paths?.length) merge.push(e);
     }
+    for (const e of merge) mergePaths(g.edge(e.source, e.target)!, e.paths!);
     countPaths();
     setFocusSet();
     renderer.refresh();
@@ -986,6 +1040,7 @@
 
   onDestroy(() => {
     themeObserver?.disconnect();
+    sizeObserver?.disconnect();
     media?.removeEventListener('change', readColors);
     stopLayout();
     worker?.terminate();

@@ -89,6 +89,63 @@ describe('mergePaths', () => {
     expect(nodes.every((n) => n.paths === undefined)).toBe(true);
   });
 
+  it('marks each literal node of the result by the triple that reaches it', () => {
+    // the result draws a node per literal object: "x" of a and "x" of b are two nodes
+    const ns: GNode[] = [
+      { id: termKey(iri('a')), label: 'a', kind: 'iri', term: iri('a') },
+      { id: termKey(iri('b')), label: 'b', kind: 'iri', term: iri('b') },
+      { id: 'lit:a', label: '"x"', kind: 'literal', term: lit('x') },
+      { id: 'lit:b', label: '"x"', kind: 'literal', term: lit('x') },
+    ];
+    const es: GEdge[] = [
+      {
+        id: 'e0',
+        source: termKey(iri('a')),
+        target: 'lit:a',
+        label: 'p',
+        triple: [iri('a'), { type: 'uri', value: P }, lit('x')],
+      },
+      {
+        id: 'e1',
+        source: termKey(iri('b')),
+        target: 'lit:b',
+        label: 'p',
+        triple: [iri('b'), { type: 'uri', value: P }, lit('x')],
+      },
+    ];
+    const m = mergePaths(
+      ns,
+      es,
+      {
+        nodes: [oNode(iri('a'), [1], 0), oNode(iri('b'), [2], 0), oNode(lit('x'), [1, 2], 1)],
+        edges: [oEdge(iri('a'), lit('x'), [1], 0), oEdge(iri('b'), lit('x'), [2], 1)],
+      },
+      String,
+      String,
+    );
+    expect(m.nodes.find((n) => n.id === 'lit:a')?.paths).toEqual([1]);
+    expect(m.nodes.find((n) => n.id === 'lit:b')?.paths).toEqual([2]);
+    expect([...m.members.get(1)!.nodes].sort()).toEqual(['lit:a', termKey(iri('a'))].sort());
+    expect(m.added).toEqual({ nodes: 0, edges: 0 });
+  });
+
+  it('gives a literal that a path adds a node of its own per triple', () => {
+    const m = mergePaths(
+      nodes.slice(0, 2),
+      edges.slice(0, 1),
+      {
+        nodes: [oNode(iri('a'), [1, 2], 0), oNode(iri('b'), [2], 0), oNode(lit('y'), [1, 2], 1)],
+        edges: [oEdge(iri('a'), lit('y'), [1], 0), oEdge(iri('b'), lit('y'), [2], 1)],
+      },
+      String,
+      String,
+    );
+    const added = m.nodes.filter((n) => n.kind === 'literal');
+    expect(added.map((n) => n.paths)).toEqual([[1], [2]]);
+    expect(new Set(added.map((n) => n.id)).size).toBe(2);
+    expect(m.added).toEqual({ nodes: 2, edges: 2 });
+  });
+
   it('leaves the graph as drawn when there are no paths', () => {
     const m = mergePaths(nodes, edges, { nodes: [], edges: [] }, String, String);
     expect(m.nodes).toEqual(nodes);
