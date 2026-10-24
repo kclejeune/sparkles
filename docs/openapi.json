@@ -234,7 +234,7 @@
         }
       },
       "kind": {
-        "description": "The settings kind: `assistant`, `memory`, `ingest` or `graphrag` of a dataset, or `models` or `notifications` of the server.",
+        "description": "The settings kind: `assistant`, `memory`, `ingest`, `graphrag` or `forms` of a dataset, or `models` or `notifications` of the server.",
         "in": "path",
         "name": "kind",
         "required": true,
@@ -244,6 +244,7 @@
             "memory",
             "ingest",
             "graphrag",
+            "forms",
             "models",
             "notifications"
           ],
@@ -15281,7 +15282,8 @@
               "ingest",
               "prefixes",
               "graphrag",
-              "paths"
+              "paths",
+              "forms"
             ],
             "type": "string"
           },
@@ -23846,6 +23848,565 @@
           "Formatting"
         ],
         "x-sparkles-permission": "any caller"
+      }
+    },
+    "/$/forms/{ds}": {
+      "get": {
+        "description": "The fields that the property shapes of the node shapes targeting `focus` describe, laid out by `sh:group` and `sh:order` and labelled by `sh:name`, with the resource's values read under the caller's view, the widget of each field, the constraints the browser checks and the triples no property shape covers. Fields the caller's protections hide from reads are absent, and fields it cannot write are read-only with a `reason`. Reads follow the caller's query endpoint grants and writeability its update endpoint grants on the branch saves go to. A focus no shape targets answers `200` with no fields. With `class` instead of `focus`, the form is that of a new instance of the class, with the fields of the node shapes whose class targets select it and no values, and `focus` is `null`. `save` says where a save goes, and `guard` gives the write guard's mode.",
+        "externalDocs": {
+          "url": "https://github.com/kclejeune/sparkles/blob/main/docs/API.md#editing-forms"
+        },
+        "operationId": "getForm",
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/ds"
+          },
+          {
+            "description": "The IRI of the resource. Give either `focus` or `class`.",
+            "in": "query",
+            "name": "focus",
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "The class of a new instance.",
+            "in": "query",
+            "name": "class",
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "Where the shapes come from, when not the dataset's `forms` setting.",
+            "in": "query",
+            "name": "shapes",
+            "schema": {
+              "enum": [
+                "guard",
+                "graphs",
+                "drafted"
+              ],
+              "type": "string"
+            }
+          },
+          {
+            "description": "The language labels are picked in, then English, then untagged.",
+            "in": "query",
+            "name": "lang",
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "$ref": "#/components/parameters/branch"
+          },
+          {
+            "$ref": "#/components/parameters/at"
+          },
+          {
+            "$ref": "#/components/parameters/timeout"
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "properties": {
+                    "branch": {
+                      "type": "string"
+                    },
+                    "closed": {
+                      "type": "boolean"
+                    },
+                    "commit": {
+                      "type": "integer"
+                    },
+                    "editable": {
+                      "description": "The caller may save changes through this form.",
+                      "type": "boolean"
+                    },
+                    "fields": {
+                      "items": {
+                        "description": "`{id, path, inverse, editable, reason?, label, description?, group, order, widget, editor?, viewer?, constraints, sources, values}`, where each value is `{term, graph, label?, readOnly?}`.",
+                        "type": "object"
+                      },
+                      "type": "array"
+                    },
+                    "focus": {
+                      "type": [
+                        "string",
+                        "null"
+                      ]
+                    },
+                    "formFormat": {
+                      "enum": [
+                        1
+                      ],
+                      "type": "integer"
+                    },
+                    "graph": {
+                      "description": "The graph new values go into, `null` for the default graph.",
+                      "type": [
+                        "string",
+                        "null"
+                      ]
+                    },
+                    "groups": {
+                      "items": {
+                        "description": "`{iri, label, order}`.",
+                        "type": "object"
+                      },
+                      "type": "array"
+                    },
+                    "guard": {
+                      "description": "`{language, mode}` of the write guard.",
+                      "type": [
+                        "object",
+                        "null"
+                      ]
+                    },
+                    "other": {
+                      "items": {
+                        "description": "`{predicate, values}`.",
+                        "type": "object"
+                      },
+                      "type": "array"
+                    },
+                    "save": {
+                      "description": "`{to, branch, exists, mainProtected}`: `to` is `main` or `branch`.",
+                      "type": "object"
+                    },
+                    "shapes": {
+                      "description": "`{source, nodeShapes, missing?, unknownHints}`.",
+                      "type": "object"
+                    },
+                    "types": {
+                      "items": {
+                        "type": "string"
+                      },
+                      "type": "array"
+                    }
+                  },
+                  "required": [
+                    "formFormat",
+                    "focus",
+                    "types",
+                    "commit",
+                    "branch",
+                    "editable",
+                    "shapes",
+                    "groups",
+                    "fields",
+                    "other",
+                    "graph",
+                    "closed",
+                    "save"
+                  ],
+                  "type": "object"
+                }
+              }
+            },
+            "description": "The form model."
+          },
+          "400": {
+            "$ref": "#/components/responses/BadRequest"
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "403": {
+            "$ref": "#/components/responses/Forbidden"
+          },
+          "404": {
+            "$ref": "#/components/responses/NotFound"
+          },
+          "408": {
+            "$ref": "#/components/responses/Timeout"
+          },
+          "501": {
+            "$ref": "#/components/responses/NotImplemented"
+          },
+          "default": {
+            "$ref": "#/components/responses/Error"
+          }
+        },
+        "summary": "The form of a resource",
+        "tags": [
+          "Validation"
+        ],
+        "x-sparkles-permission": "read"
+      }
+    },
+    "/$/forms/{ds}/check": {
+      "post": {
+        "description": "Turns the changes into one update of `DELETE DATA` and `INSERT DATA`, runs it as a dry run and validates the nodes it touches at the state it would make against the form's shapes, whether or not the dataset has a guard. The answer is `200` with the write preview, the update, the fields another commit changed since the form loaded them (`conflicts`, which a save would refuse), and the validation results, each with the `field` it belongs to or `null`. A check of a session branch that does not exist yet previews its first commit on `main`'s head, which `main`'s protection does not refuse. A caller whose view hides part of the data gets no validation (`withheld`), as the validation routes refuse such callers. It needs write on the branch, through the update endpoint.",
+        "externalDocs": {
+          "url": "https://github.com/kclejeune/sparkles/blob/main/docs/API.md#editing-forms"
+        },
+        "operationId": "checkForm",
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/ds"
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "additionalProperties": false,
+                "properties": {
+                  "branch": {
+                    "description": "The branch the form was opened on. A form opened on `main` saves where the dataset's `forms` setting says, which may be the caller's session branch.",
+                    "type": "string"
+                  },
+                  "changes": {
+                    "items": {
+                      "properties": {
+                        "add": {
+                          "items": {
+                            "description": "A term in the SPARQL JSON results form: `{\"type\": \"uri\", \"value\": …}` or `{\"type\": \"literal\", \"value\": …, \"datatype\"?: …, \"xml:lang\"?: …}`.",
+                            "type": "object"
+                          },
+                          "type": "array"
+                        },
+                        "field": {
+                          "description": "The field's id, its path in SPARQL syntax.",
+                          "type": "string"
+                        },
+                        "remove": {
+                          "items": {
+                            "description": "A term in the SPARQL JSON results form: `{\"type\": \"uri\", \"value\": …}` or `{\"type\": \"literal\", \"value\": …, \"datatype\"?: …, \"xml:lang\"?: …}`.",
+                            "type": "object"
+                          },
+                          "type": "array"
+                        }
+                      },
+                      "required": [
+                        "field"
+                      ],
+                      "type": "object"
+                    },
+                    "type": "array"
+                  },
+                  "class": {
+                    "description": "The class of a new instance, whose IRI the server mints from the `forms` setting's `newIri`. The change also adds the instance's `rdf:type`.",
+                    "type": "string"
+                  },
+                  "expect": {
+                    "additionalProperties": {
+                      "items": {
+                        "description": "A term in the SPARQL JSON results form: `{\"type\": \"uri\", \"value\": …}` or `{\"type\": \"literal\", \"value\": …, \"datatype\"?: …, \"xml:lang\"?: …}`.",
+                        "type": "object"
+                      },
+                      "type": "array"
+                    },
+                    "description": "The values the form loaded, by field id, for every changed field.",
+                    "type": "object"
+                  },
+                  "focus": {
+                    "description": "The IRI of the resource. Give either `focus` or `class`.",
+                    "type": "string"
+                  },
+                  "message": {
+                    "description": "The commit message.",
+                    "type": "string"
+                  },
+                  "shapes": {
+                    "description": "The shapes the form was built from, when not the setting's.",
+                    "enum": [
+                      "guard",
+                      "graphs",
+                      "drafted"
+                    ],
+                    "type": "string"
+                  }
+                },
+                "required": [
+                  "changes"
+                ],
+                "type": "object"
+              }
+            }
+          },
+          "description": "The changes.",
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "properties": {
+                    "branch": {
+                      "type": "string"
+                    },
+                    "conflicts": {
+                      "description": "`{id, now}` of each changed field whose stored values differ from `expect`.",
+                      "items": {
+                        "type": "object"
+                      },
+                      "type": "array"
+                    },
+                    "preview": {
+                      "description": "The dry run, as a write preview answers it.",
+                      "type": "object"
+                    },
+                    "update": {
+                      "type": "string"
+                    },
+                    "validation": {
+                      "description": "`{checked, withheld, timedOut, conforms, results}`.",
+                      "type": "object"
+                    }
+                  },
+                  "required": [
+                    "branch",
+                    "preview",
+                    "update",
+                    "conflicts",
+                    "validation"
+                  ],
+                  "type": "object"
+                }
+              }
+            },
+            "description": "The preview and the validation."
+          },
+          "400": {
+            "$ref": "#/components/responses/BadRequest"
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "403": {
+            "$ref": "#/components/responses/Forbidden"
+          },
+          "404": {
+            "$ref": "#/components/responses/NotFound"
+          },
+          "408": {
+            "$ref": "#/components/responses/Timeout"
+          },
+          "default": {
+            "$ref": "#/components/responses/Error"
+          }
+        },
+        "security": [
+          {
+            "basicAuth": []
+          },
+          {
+            "apiToken": []
+          },
+          {
+            "oidcAccessToken": []
+          },
+          {
+            "csrfToken": [],
+            "sessionCookie": []
+          },
+          {
+            "cloudflareAccess": []
+          }
+        ],
+        "summary": "Check a form's changes",
+        "tags": [
+          "Validation"
+        ],
+        "x-sparkles-permission": "read"
+      }
+    },
+    "/$/forms/{ds}/save": {
+      "post": {
+        "description": "Commits the changes as one update with the message, when the stored values of every changed field are still those `expect` names, compared under the writer lock. Otherwise it answers `409` with code `form-conflict` and the fields with their stored values `now`. The write guard runs as for any write. A save of a form opened on `main` while the `forms` setting sends saves to a branch creates the caller's session branch from `main`'s head when it does not exist.",
+        "externalDocs": {
+          "url": "https://github.com/kclejeune/sparkles/blob/main/docs/API.md#editing-forms"
+        },
+        "operationId": "saveForm",
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/ds"
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "additionalProperties": false,
+                "properties": {
+                  "branch": {
+                    "description": "The branch the form was opened on. A form opened on `main` saves where the dataset's `forms` setting says, which may be the caller's session branch.",
+                    "type": "string"
+                  },
+                  "changes": {
+                    "items": {
+                      "properties": {
+                        "add": {
+                          "items": {
+                            "description": "A term in the SPARQL JSON results form: `{\"type\": \"uri\", \"value\": …}` or `{\"type\": \"literal\", \"value\": …, \"datatype\"?: …, \"xml:lang\"?: …}`.",
+                            "type": "object"
+                          },
+                          "type": "array"
+                        },
+                        "field": {
+                          "description": "The field's id, its path in SPARQL syntax.",
+                          "type": "string"
+                        },
+                        "remove": {
+                          "items": {
+                            "description": "A term in the SPARQL JSON results form: `{\"type\": \"uri\", \"value\": …}` or `{\"type\": \"literal\", \"value\": …, \"datatype\"?: …, \"xml:lang\"?: …}`.",
+                            "type": "object"
+                          },
+                          "type": "array"
+                        }
+                      },
+                      "required": [
+                        "field"
+                      ],
+                      "type": "object"
+                    },
+                    "type": "array"
+                  },
+                  "class": {
+                    "description": "The class of a new instance, whose IRI the server mints from the `forms` setting's `newIri`. The change also adds the instance's `rdf:type`.",
+                    "type": "string"
+                  },
+                  "expect": {
+                    "additionalProperties": {
+                      "items": {
+                        "description": "A term in the SPARQL JSON results form: `{\"type\": \"uri\", \"value\": …}` or `{\"type\": \"literal\", \"value\": …, \"datatype\"?: …, \"xml:lang\"?: …}`.",
+                        "type": "object"
+                      },
+                      "type": "array"
+                    },
+                    "description": "The values the form loaded, by field id, for every changed field.",
+                    "type": "object"
+                  },
+                  "focus": {
+                    "description": "The IRI of the resource. Give either `focus` or `class`.",
+                    "type": "string"
+                  },
+                  "message": {
+                    "description": "The commit message.",
+                    "type": "string"
+                  },
+                  "shapes": {
+                    "description": "The shapes the form was built from, when not the setting's.",
+                    "enum": [
+                      "guard",
+                      "graphs",
+                      "drafted"
+                    ],
+                    "type": "string"
+                  }
+                },
+                "required": [
+                  "changes"
+                ],
+                "type": "object"
+              }
+            }
+          },
+          "description": "The changes.",
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "properties": {
+                    "branch": {
+                      "type": "string"
+                    },
+                    "branchCreated": {
+                      "type": "boolean"
+                    },
+                    "commit": {
+                      "type": "object"
+                    },
+                    "committed": {
+                      "type": "boolean"
+                    },
+                    "dataset": {
+                      "type": "string"
+                    },
+                    "datasetId": {
+                      "type": "string"
+                    },
+                    "focus": {
+                      "description": "The resource saved, which for a new instance is the IRI minted for it.",
+                      "type": "string"
+                    },
+                    "validation": {
+                      "type": "object"
+                    }
+                  },
+                  "required": [
+                    "committed",
+                    "commit",
+                    "branch",
+                    "branchCreated"
+                  ],
+                  "type": "object"
+                }
+              }
+            },
+            "description": "The commit receipt."
+          },
+          "400": {
+            "$ref": "#/components/responses/BadRequest"
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "403": {
+            "$ref": "#/components/responses/Forbidden"
+          },
+          "404": {
+            "$ref": "#/components/responses/NotFound"
+          },
+          "408": {
+            "$ref": "#/components/responses/Timeout"
+          },
+          "409": {
+            "$ref": "#/components/responses/Conflict"
+          },
+          "422": {
+            "$ref": "#/components/responses/Unprocessable"
+          },
+          "507": {
+            "$ref": "#/components/responses/InsufficientStorage"
+          },
+          "default": {
+            "$ref": "#/components/responses/Error"
+          }
+        },
+        "security": [
+          {
+            "basicAuth": []
+          },
+          {
+            "apiToken": []
+          },
+          {
+            "oidcAccessToken": []
+          },
+          {
+            "csrfToken": [],
+            "sessionCookie": []
+          },
+          {
+            "cloudflareAccess": []
+          }
+        ],
+        "summary": "Save a form's changes",
+        "tags": [
+          "Validation"
+        ],
+        "x-sparkles-permission": "read"
       }
     },
     "/$/geo/convert": {
@@ -41249,7 +41810,7 @@
       "name": "Reasoning"
     },
     {
-      "description": "SHACL and ShEx validation, and write-time validation.",
+      "description": "SHACL and ShEx validation, write-time validation and editing forms generated from shapes.",
       "externalDocs": {
         "url": "https://github.com/kclejeune/sparkles/blob/main/docs/API.md#write-time-validation"
       },

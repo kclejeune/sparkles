@@ -378,12 +378,67 @@ const PATHS_FIELDS: readonly FieldDef[] = [
   },
 ];
 
+/** Editing forms generated from SHACL shapes (U02). */
+const FORMS_FIELDS: readonly FieldDef[] = [
+  {
+    path: 'shapes',
+    group: 'Shapes',
+    label: 'Shapes of the forms',
+    type: 'enum',
+    options: ['guard', 'graphs', 'drafted'],
+    fallback: 'guard',
+    help: 'guard reads the write-time SHACL guard, graphs reads the shapes graphs below, and drafted drafts shapes from the data.',
+  },
+  {
+    path: 'graphs',
+    group: 'Shapes',
+    label: 'Shapes graphs',
+    type: 'lines',
+    placeholder: 'http://example.org/shapes',
+    help: 'Graph IRIs, one per line, that hold the shapes when the source is graphs.',
+  },
+  {
+    path: 'saveTo',
+    group: 'Saves',
+    label: 'Saves of a form on main go to',
+    type: 'enum',
+    options: ['auto', 'main', 'branch'],
+    fallback: 'auto',
+    help: 'auto saves to main unless main is protected, and to a branch of the editor then.',
+  },
+  {
+    path: 'branchTemplate',
+    group: 'Saves',
+    label: 'Branch name',
+    type: 'text',
+    fallback: 'edits.{user}.{date}',
+    help: 'The name of the branch of an editor. It must hold {user}, and {date} is the day as yyyymmdd.',
+  },
+  {
+    path: 'targetGraph',
+    group: 'Saves',
+    label: 'Graph of new values',
+    type: 'text',
+    fallback: 'type',
+    help: 'type writes into the graph of the resource’s rdf:type triple, default into the default graph, and an IRI into that graph.',
+  },
+  {
+    path: 'newIri',
+    group: 'New instances',
+    label: 'IRIs of new instances',
+    type: 'text',
+    fallback: 'urn:uuid',
+    help: 'urn:uuid, or a template that holds {uuid}, such as http://example.org/person/{uuid}.',
+  },
+];
+
 export const DATASET_FIELDS: Record<DatasetKind, readonly FieldDef[]> = {
   assistant: ASSISTANT_FIELDS,
   memory: MEMORY_FIELDS,
   ingest: INGEST_FIELDS,
   graphrag: GRAPHRAG_FIELDS,
   paths: PATHS_FIELDS,
+  forms: FORMS_FIELDS,
 };
 
 export const KIND_TITLES: Record<DatasetKind, { title: string; text: string }> = {
@@ -406,5 +461,9 @@ export const KIND_TITLES: Record<DatasetKind, { title: string; text: string }> =
   paths: {
     title: 'Paths',
     text: 'The predicates the path finder in Explore skips unless the reader changes the list.',
+  },
+  forms: {
+    title: 'Forms',
+    text: 'The shapes that editing forms read, and where their saves go.',
   },
 };

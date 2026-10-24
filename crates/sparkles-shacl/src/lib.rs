@@ -34,6 +34,7 @@
 pub mod compact;
 pub mod constraints;
 mod data;
+pub mod form;
 pub mod guard;
 pub mod incremental;
 mod localize;
@@ -51,10 +52,13 @@ pub use nodeeval::{eval_expression, eval_expression_in_graph};
 pub use nodeexpr::ExprId;
 pub use path::PropertyPath;
 pub use report::{ValidationReport, ValidationResult};
-pub use shapes::{Constraint, NodeKind, Shape, Shapes, Target};
+pub use shapes::{Constraint, GroupInfo, NodeKind, Shape, ShapeInfo, Shapes, Target};
 pub use sparkles_core::io::RdfFormat;
 pub use syntax::ShapesSyntax;
-pub use validate::{TooManyResults, ValidateOptions, validate, validate_node, validate_nodes};
+pub use validate::{
+    TooManyResults, ValidateOptions, shapes_for_class, shapes_for_node, validate, validate_node,
+    validate_nodes,
+};
 
 /// Lexical validity of an XSD literal (as used by `sh:datatype`; see [`sparkles_core::xsd`]).
 pub use sparkles_core::xsd::is_valid as is_valid_literal;

@@ -202,6 +202,7 @@ impl Tools<'_> {
             author: crate::http::author(&self.call.principal),
             precondition: a.if_head.map(if_head),
             no_wait: false,
+            preview_as_new_branch: false,
             graphs: opts.graphs.clone(),
             dry_run: dry_run.then_some(sparkles::preview::DryRun {
                 changes,

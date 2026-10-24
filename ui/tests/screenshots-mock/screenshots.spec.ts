@@ -802,3 +802,55 @@ q:PersonShape a sh:NodeShape ; sh:targetClass q:Person ;
   await expect(panel).toContainText('The guard would resolve this result.');
   await shoot(page, 'validation-overlay');
 });
+
+test('forms', async ({ page }) => {
+  // the editing form of a person of `world` in the explorer's panel, generated from the
+  // shapes (mock/forms.mjs): a mistyped email that the browser checks at once, and a
+  // previewed move to a city in Works for, which the server's check reports under the field
+  await page.goto(`/ui/explore?ds=world&iri=${encodeURIComponent(`${WORLD}priya-nair`)}`);
+  const edit = page.getByRole('button', { name: 'Edit', exact: true });
+  await expect(edit).toBeVisible({ timeout: 30_000 });
+  await edit.click();
+  const form = page.getByRole('region', { name: /^Edit Priya Nair/ });
+  await form.getByLabel('Email', { exact: true }).fill('priya.nair@meridian');
+  await form.getByRole('button', { name: 'Clear Lives in' }).click();
+  await form.getByRole('combobox', { name: 'Lives in' }).fill(`<${WORLD}delhi>`);
+  await page.getByRole('option', { name: /Use/ }).click();
+  await form.getByRole('button', { name: 'Clear Works for' }).click();
+  await form.getByRole('combobox', { name: 'Works for' }).fill(`<${WORLD}mumbai>`);
+  await page.getByRole('option', { name: /Use/ }).click();
+  await form.getByRole('button', { name: 'Preview' }).click();
+  await expect(form.locator(`[data-field="<${WORLD}worksFor>"]`)).toContainText('server check');
+  await form
+    .locator(`[data-field="<${WORLD}worksFor>"]`)
+    .evaluate((e) => e.scrollIntoView({ block: 'center' }));
+  await shoot(page, 'forms');
+});
+
+test('forms-branch', async ({ page, request }) => {
+  // the form on its own page after a save while main is protected: the save went to the
+  // editor's session branch, which the banner links to the merge page
+  const p = await request.patch('/$/branches/world/main', { data: { protected: true } });
+  expect(p.ok()).toBe(true);
+  await page.addInitScript(() => localStorage.setItem('sparkles.dataset', 'world'));
+  try {
+    await page.goto(`/ui/datasets/world/edit?iri=${encodeURIComponent(`${WORLD}wei-lin-tan`)}`);
+    const form = page.getByRole('region', { name: /^Edit / });
+    await expect(form.getByRole('note').filter({ hasText: /main is protected/ })).toBeVisible({
+      timeout: 30_000,
+    });
+    await form.getByLabel('Email', { exact: true }).fill('weilin.tan@meridian.example');
+    await form.getByRole('radio', { name: 'Active' }).check();
+    await form
+      .getByLabel('Message', { exact: true })
+      .fill('Add the email and status of Wei Lin Tan');
+    await form.getByRole('button', { name: 'Save', exact: true }).click();
+    await expect(form.getByRole('status').filter({ hasText: 'Editing on branch' })).toBeVisible();
+    await form.getByLabel('Age', { exact: true }).fill('17');
+    // the save's toast goes before the picture
+    await expect(page.getByText(/^Saved commit/)).toHaveCount(0, { timeout: 15_000 });
+    await shoot(page, 'forms-branch');
+  } finally {
+    await request.patch('/$/branches/world/main', { data: { protected: false } });
+  }
+});

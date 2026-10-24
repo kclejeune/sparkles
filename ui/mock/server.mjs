@@ -47,6 +47,7 @@ import { handleReview, INGEST_BRANCH } from './review.mjs';
 import { geoQuery, handleGeo } from './geo.mjs';
 import { handleVector, seedVectors, touchPacked, vectorIndexFor } from './vector.mjs';
 import { WORLD, worldTurtle } from './world.mjs';
+import { handleForms } from './forms.mjs';
 import { PREFIXES, buildTurtle, provenanceTrig, scratchTurtle, vectorTurtle } from './data.mjs';
 
 const PORT = Number(process.env.PORT ?? 3030);
@@ -2409,6 +2410,21 @@ const server = http.createServer(async (req, res) => {
         fail,
         readBody,
         sparklesResult,
+      })
+    )
+      return;
+    // editing forms generated from shapes (mock/forms.mjs)
+    if (
+      await handleForms(req, res, url, seg, {
+        datasets,
+        send,
+        fail,
+        readBody,
+        headCommit,
+        quadSet,
+        commitWrite,
+        createBranch,
+        mainOf: (n) => allDatasets.get(n),
       })
     )
       return;

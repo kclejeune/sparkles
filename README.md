@@ -240,9 +240,10 @@ orders every item by difficulty and impact and links each to its design spec.
 ## Web UI
 
 The web UI is embedded in the server. It has a query editor with results as tables,
-graphs and maps, with arcs for the relations between located entities and facet histograms that brush them, a visual query builder that draws each query and edits it as text, a path finder that draws the shortest or cheapest paths between entities in the explorer and on query results, schema and validation views, branch history and
+graphs and maps, with arcs for the relations between located entities and facet histograms that brush them, a visual query builder that draws each query and edits it as text, a path finder that draws the shortest or cheapest paths between entities in the explorer and on query results, schema and validation views, editing forms generated from SHACL shapes, branch history and
 merges, a time slider over past commits with commit diffs drawn as graphs, the Ask bar, and agent memory. The screenshots
-below start with time travel over commits, branches and merges, GraphRAG communities, the
+below start with time travel over commits, branches and merges, editing forms generated from
+SHACL shapes, GraphRAG communities, the
 Ask bar and agent memory, path finding, inference on the canvas, maps of relations,
 validation on the graph, graph algorithms as lenses, and facets that brush the graph.
 
@@ -257,43 +258,51 @@ validation on the graph, graph algorithms as lenses, and facets that brush the g
   </tr>
   <tr>
     <td><img src="docs/images/merge.png" alt="The merge page previewing a merge of one branch into main, with two conflicts and a choice of which side to take for each"></td>
-    <td><img src="docs/images/explore-communities.png" alt="The Explore overview drawing seven GraphRAG communities of a freight network as circles sized by their members and coloured by report status, with the head office selected and its report, findings, sub-communities and members beside the picture"></td>
+    <td><img src="docs/images/forms.png" alt="The resource explorer with a person's graph and an editing form generated from SHACL shapes in the side panel, showing an email that fails the shape's pattern under its field and a server check that reports an employer which is not a company"></td>
   </tr>
   <tr>
     <td>Branch merges with conflicts to resolve</td>
-    <td>GraphRAG communities with their reports</td>
+    <td>An editing form generated from SHACL shapes, checked in the browser and on the server</td>
   </tr>
   <tr>
+    <td><img src="docs/images/explore-communities.png" alt="The Explore overview drawing seven GraphRAG communities of a freight network as circles sized by their members and coloured by report status, with the head office selected and its report, findings, sub-communities and members beside the picture"></td>
     <td><img src="docs/images/ask-answer.png" alt="The Ask bar with a drafted SPARQL query, its results and a summary whose numbered citations point to result rows"></td>
-    <td><img src="docs/images/memory.png" alt="The Memory page listing facts that agents recorded, each with its source and review status, and a conflict between two values"></td>
   </tr>
   <tr>
+    <td>GraphRAG communities with their reports</td>
     <td>A question answered with a checked query and a cited summary</td>
-    <td>Agent memory with sources and review status</td>
   </tr>
   <tr>
+    <td><img src="docs/images/memory.png" alt="The Memory page listing facts that agents recorded, each with its source and review status, and a conflict between two values"></td>
     <td><img src="docs/images/query-paths.png" alt="A query's graph of 37 freight flights between cities, with the Paths panel beside it listing the three shortest routes from Vancouver to Auckland by distance, each with its cost summed from the ex:km values on the reifiers of its flights, and the routes drawn over the result with each edge numbered by the paths that use it"></td>
-    <td><img src="docs/images/explore-lenses.png" alt="The resource explorer with lenses on, sizing nodes by their degree in the dataset, colouring them by class, badging the nodes with inferred edges and drawing those edges dashed, with the legend beside the graph"></td>
   </tr>
   <tr>
+    <td>Agent memory with sources and review status</td>
     <td>The shortest routes by a distance on the edges' reifiers, drawn on a query's graph</td>
-    <td>Inferred edges and lenses on the canvas</td>
   </tr>
   <tr>
+    <td><img src="docs/images/explore-lenses.png" alt="The resource explorer with lenses on, sizing nodes by their degree in the dataset, colouring them by class, badging the nodes with inferred edges and drawing those edges dashed, with the legend beside the graph"></td>
     <td><img src="docs/images/map-arcs.png" alt="The resource explorer showing a freight company's graph as a world map, with arcs from its head office in Dubai to its offices, partners and employees on six continents, coloured by predicate"></td>
-    <td><img src="docs/images/validation-overlay.png" alt="The resource explorer with validation badges on three people, the validation lens's legend grouping the nodes by their worst severity, and a results panel previewing an update that adds a missing name"></td>
   </tr>
   <tr>
+    <td>Inferred edges and lenses on the canvas</td>
     <td>A graph's relations drawn as arcs on a map</td>
-    <td>SHACL results on the graph, with a suggested fix previewed</td>
   </tr>
   <tr>
+    <td><img src="docs/images/validation-overlay.png" alt="The resource explorer with validation badges on three people, the validation lens's legend grouping the nodes by their worst severity, and a results panel previewing an update that adds a missing name"></td>
     <td><img src="docs/images/explore-algo-lenses.png" alt="The resource explorer with algorithm lenses, sizing nodes by PageRank over the drawn graph and colouring them by Leiden communities, with the legend giving the score ranges and each community's size"></td>
-    <td><img src="docs/images/explore-facets.png" alt="The resource explorer with the Facets panel beside a person's graph, brushing an age range on a histogram and one employer on a bar list, so that the other facets count the 41 people under both brushes and the drawn people outside them are dimmed"></td>
   </tr>
   <tr>
+    <td>SHACL results on the graph, with a suggested fix previewed</td>
     <td>Lenses that size nodes by PageRank and colour them by community</td>
+  </tr>
+  <tr>
+    <td><img src="docs/images/explore-facets.png" alt="The resource explorer with the Facets panel beside a person's graph, brushing an age range on a histogram and one employer on a bar list, so that the other facets count the 41 people under both brushes and the drawn people outside them are dimmed"></td>
+    <td><img src="docs/images/pattern.png" alt="The query editor with the Pattern pane beside it, drawing the query's variables as nodes joined by its triple patterns, an optional part in a dashed hull, a filter as a chip under its variable and a BIND as a locked block, with the projection checkboxes, the count of matches and seven result rows"></td>
+  </tr>
+  <tr>
     <td>Facet histograms whose brushes filter the graph</td>
+    <td>A query's pattern drawn beside its text</td>
   </tr>
 </table>
 
@@ -302,68 +311,66 @@ validation on the graph, graph algorithms as lenses, and facets that brush the g
 
 <table>
   <tr>
+    <td><img src="docs/images/forms-branch.png" alt="An editing form on its own page after a save while main is protected, with a banner saying it edits the session branch edits.anonymous.20261024 with one commit and a Review and merge button, and an age below the shape's minimum marked under its field"></td>
     <td><img src="docs/images/branches.png" alt="A dataset page listing its branches above a commit history graph that includes a merge"></td>
-    <td><img src="docs/images/diff-lapse.png" alt="A time-lapse over four commits with ghosts kept, showing the changes of each commit added in green and removed ones as dashed ghosts, with a running total of changes since the start"></td>
   </tr>
   <tr>
+    <td>A form whose saves go to the editor's session branch, with a link to review and merge it</td>
     <td>Branches and their commit graph</td>
-    <td>A time-lapse that applies one commit's diff per step</td>
   </tr>
   <tr>
+    <td><img src="docs/images/diff-lapse.png" alt="A time-lapse over four commits with ghosts kept, showing the changes of each commit added in green and removed ones as dashed ghosts, with a running total of changes since the start"></td>
     <td><img src="docs/images/time-slider-graph.png" alt="The resource explorer with the time slider in compare mode, drawing a new edge in green and a removed one as a dashed ghost"></td>
-    <td><img src="docs/images/handoff.png" alt="A query handed over by an agent, open in the query editor with its question, assumptions, the terms it uses and a clean check"></td>
   </tr>
   <tr>
+    <td>A time-lapse that applies one commit's diff per step</td>
     <td>A graph compared between two commits</td>
-    <td>A query an agent handed over for review</td>
   </tr>
   <tr>
+    <td><img src="docs/images/handoff.png" alt="A query handed over by an agent, open in the query editor with its question, assumptions, the terms it uses and a clean check"></td>
     <td><img src="docs/images/ask-steps.png" alt="The Ask bar while it works, showing Summarizing after the query results have arrived"></td>
-    <td><img src="docs/images/plan-pattern.png" alt="The Pattern tab of a query that ran with Plan on pattern, each edge labelled with its estimated and actual rows, ex:memberOf marked as a misestimate, numbered join badges on the variables and the plan tree beside it"></td>
   </tr>
   <tr>
+    <td>A query an agent handed over for review</td>
     <td>An answer in progress, at the summary step</td>
-    <td>A query's plan drawn on its pattern, with misestimates marked</td>
   </tr>
   <tr>
+    <td><img src="docs/images/plan-pattern.png" alt="The Pattern tab of a query that ran with Plan on pattern, each edge labelled with its estimated and actual rows, ex:memberOf marked as a misestimate, numbered join badges on the variables and the plan tree beside it"></td>
     <td><img src="docs/images/result-arcs.png" alt="A query result drawn as labelled great-circle arcs for 37 freight routes between cities on six continents, beside the list of rows"></td>
-    <td><img src="docs/images/map.png" alt="GeoSPARQL query results drawn on a map beside a list of the places"></td>
   </tr>
   <tr>
+    <td>A query's plan drawn on its pattern, with misestimates marked</td>
     <td>Result rows drawn as arcs between places</td>
-    <td>GeoSPARQL results on a map</td>
   </tr>
   <tr>
+    <td><img src="docs/images/map.png" alt="GeoSPARQL query results drawn on a map beside a list of the places"></td>
     <td><img src="docs/images/query-facets.png" alt="The query page's Facets tab counting the values of ?person in every solution, with a brush on the years people joined and the editor above holding the triple and FILTER that Apply to query added"></td>
-    <td><img src="docs/images/pattern-edit.png" alt="The Pattern pane adding an edge from ?person, with the predicate picker listing the predicates that instances of ex:Person use, with their counts"></td>
   </tr>
   <tr>
+    <td>GeoSPARQL results on a map</td>
     <td>A brush on a result's facets written into the query</td>
-    <td>A query built on the canvas from the schema</td>
   </tr>
   <tr>
+    <td><img src="docs/images/pattern-edit.png" alt="The Pattern pane adding an edge from ?person, with the predicate picker listing the predicates that instances of ex:Person use, with their counts"></td>
     <td><img src="docs/images/query.png" alt="The query editor with a SPARQL query and its results"></td>
-    <td><img src="docs/images/explore.png" alt="The resource explorer showing one resource as a graph, with its properties and the resources that refer to it"></td>
   </tr>
   <tr>
+    <td>A query built on the canvas from the schema</td>
     <td>The query editor and its results</td>
-    <td>The resource explorer</td>
   </tr>
   <tr>
+    <td><img src="docs/images/explore.png" alt="The resource explorer showing one resource as a graph, with its properties and the resources that refer to it"></td>
     <td><img src="docs/images/schema.png" alt="The schema browser with a class hierarchy, instance counts and the properties of the selected class"></td>
+  </tr>
+  <tr>
+    <td>The resource explorer</td>
+    <td>The schema browser</td>
+  </tr>
+  <tr>
     <td><img src="docs/images/path-finder.png" alt="The resource explorer with the Paths panel open, listing the three shortest foaf:knows paths from Freya Lindqvist to Lukáš Novák, which pass through ten different people, and drawing them over her neighbourhood with each edge numbered by the paths that use it"></td>
   </tr>
   <tr>
-    <td>The schema browser</td>
     <td>The k shortest paths between two people</td>
-  </tr>
-  <tr>
-    <td><img src="docs/images/pattern.png" alt="The query editor with the Pattern pane beside it, drawing the query's variables as nodes joined by its triple patterns, an optional part in a dashed hull, a filter as a chip under its variable and a BIND as a locked block, with the projection checkboxes, the count of matches and seven result rows"></td>
-    <td></td>
-  </tr>
-  <tr>
-    <td>A query's pattern drawn beside its text</td>
-    <td></td>
   </tr>
 </table>
 
