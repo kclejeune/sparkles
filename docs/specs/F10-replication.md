@@ -1432,6 +1432,74 @@ The maintainer accepted this direction on 2026-10-24. Item 280 turns it into the
   adds join tokens and the built-in CA with automatic renewal. Phase 3 adds the cluster
   state store, key wrapping and Kubernetes identity next to lease failover.
 
+### Proposed direction for questions 18 and 23
+
+This is a proposal for item 280 to confirm or change. It follows Patroni's design for
+PostgreSQL where the problems are the same, and adds fencing tokens so that a stale
+primary cannot have a write acknowledged.
+
+* **Leadership scope.** One lease per cluster names the primary server, which takes the
+  writes of every dataset. Per-dataset leases would spread write load across servers, but
+  they multiply leases, fencing and client routing, so they wait for a measured need.
+* **Topology.** The recommended cluster is three Sparkles nodes: the primary, one
+  synchronous replica and one asynchronous replica. The lease lives in a store that has
+  its own quorum, which is the Kubernetes API, a three-member etcd or a Consul cluster.
+  Two Sparkles nodes work with an external lease store but cannot keep both no data loss
+  and write availability through a failure.
+* **Synchronous quorum.** `--sync-replicas 1` with two replicas acknowledges a commit when
+  either replica has applied it, as PostgreSQL's `ANY 1` does. One node can then fail
+  without losing an acknowledged commit and without blocking writes.
+* **Fencing tokens.** Each lease acquisition has an epoch that only grows, taken from the
+  lease store's revision. The primary writes its epoch into every commit's WAL record and
+  stream page. A replica refuses commits from an epoch older than the newest it has seen,
+  and acknowledges only commits of the current epoch. A primary that paused and woke
+  after losing its lease therefore cannot get a strict synchronous commit acknowledged,
+  whatever its clock says. The primary also fences itself. It stops taking writes when
+  its renewal deadline passes on its monotonic clock, before the lease's TTL can expire
+  in the store, which assumes only that clock rates drift by a bounded amount.
+* **Timing and targets.** The defaults are a 10-second lease, renewal every 3 seconds and
+  self-fencing at 7 seconds. Writes return 10 to 20 seconds after the primary fails,
+  which is detection plus a bounded catch-up. In strict synchronous mode no acknowledged
+  commit is lost. In asynchronous mode the loss is at most the lag of the promoted
+  replica.
+* **Choosing the new primary.** A replica can take the lease only when it is healthy,
+  its lag is under `failover_max_lag`, and it is not marked `nofailover`, as Patroni's
+  `maximum_lag_on_failover` and tags work. A synchronous replica is preferred, then the
+  highest applied commit, then a configured priority. It takes the lease, applies the
+  rest of what it received and then accepts writes under the new epoch.
+* **Client routing.** Health endpoints serve load balancers. `GET /$/health/primary`
+  answers 200 only on the primary that holds the lease, and `GET /$/health/replica`
+  answers 200 on a replica within its lag limits, as Patroni's REST API does for HAProxy.
+  On Kubernetes the leader labels its pod with `sparkles.io/role=primary`, one Service
+  selects that label for writes and another selects every ready pod for reads. Write
+  forwarding from a replica stays optional, because the replica must forward the
+  caller's identity over mutual TLS. `minCommit` keeps reading your own writes across the
+  switch.
+* **Planned switchover.** `sparkles cluster switchover --to NODE` stops writes on the
+  primary, waits until the target has applied the head, and hands it the lease. It loses
+  nothing and pauses writes for a few seconds. Rolling upgrades use it after upgrading
+  the replicas first, which the logical stream allows because replicas may run a newer
+  version.
+* **A former primary.** When it starts and sees a newer epoch in the lease store, it
+  becomes a replica. If it holds commits after the fork, they were never acknowledged in
+  strict synchronous mode, so it re-seeds automatically and keeps the old directory for
+  salvage, as `pg_rewind` does for PostgreSQL. In asynchronous mode those commits may
+  have been acknowledged, so it stops in `diverged` and waits for an operator, as §2.7
+  describes.
+* **Replacing a node.** A new node joins with a join token or as a recreated StatefulSet
+  pod, bootstraps from the newest backup and catches up from the archive of §8 Phase 3 or
+  from the primary's holds.
+* **Losing the lease store.** No primary can renew, so the primary fences itself and
+  writes stop, while every node keeps serving reads. An opt-in failsafe mode, like
+  Patroni's `failsafe_mode`, lets the primary keep writing while it can reach every
+  member over mutual TLS and each one confirms it as primary.
+* **Observability.** The epoch, lease holder, renewal age and failover count are metrics,
+  and every promotion, demotion, switchover and fence is an audit event.
+* **Testing.** NixOS VM tests inject faults in the manner of Jepsen. They partition the
+  network, pause the primary with SIGSTOP, skew clocks, and stop the lease store, while a
+  client records its writes. A checker then proves that no acknowledged write was lost
+  in strict mode, and that no two primaries accepted writes in the same epoch.
+
 ## 12. Sources
 
 * **Sparkles repository, read for this spec:**
