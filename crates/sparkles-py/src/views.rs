@@ -232,12 +232,16 @@ impl PyLiveQuery {
         };
         e.map(|e| event_py(py, &e)).transpose()
     }
-    /// End the subscription.
+    /// End the subscription. A thread waiting in `next` returns `None`.
     fn close(&self) {
-        self.live
+        let live = self
+            .live
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .take();
+        if let Some(l) = live {
+            l.close();
+        }
     }
     fn __enter__(slf: PyRef<'_, Self>) -> PyRef<'_, Self> {
         slf

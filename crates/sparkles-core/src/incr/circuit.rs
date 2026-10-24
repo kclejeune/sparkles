@@ -155,10 +155,16 @@ pub struct Circuit {
     /// counters of the latest pass
     pub last: PassStats,
     pub max_memory_bytes: Option<u64>,
+    /// the query's base IRI, for expressions and evaluations
+    pub base: Option<oxiri::Iri<String>>,
 }
 
 impl Circuit {
+    /// A circuit of `c` read with `access`. Guards that a request decides at its
+    /// snapshot keep their graphs out, since a circuit cannot decide them again at each
+    /// commit.
     pub fn new(c: Compiled, access: Option<Arc<GraphAccess>>) -> Circuit {
+        let access = access.map(|a| a.settled());
         Circuit {
             kind: c.kind,
             vars: c.vars,
@@ -172,6 +178,7 @@ impl Circuit {
             access,
             last: PassStats::default(),
             max_memory_bytes: None,
+            base: c.base,
         }
     }
 
@@ -214,6 +221,7 @@ impl Circuit {
             &self.vars,
         );
         p.max_memory_bytes = self.max_memory_bytes;
+        p.base = self.base.clone();
         (p, &mut self.root)
     }
 
@@ -311,6 +319,29 @@ impl Circuit {
             }
         }
         let vis = Vis::new(self.access.as_ref(), &snap);
+        // protections that depend on the data make the whole query one `recompute`
+        // node, and a change anywhere, even in a graph the principal cannot read, can
+        // change what they hide: every change runs the pass
+        if super::runtime::whole_reason(self.access.as_ref()).is_some() {
+            if d.added.is_empty() && d.removed.is_empty() {
+                self.applied = snap.commit;
+                self.snap = Some(snap);
+                return Ok(Advance::Skipped);
+            }
+            let old = d.old()?;
+            let (mut p, root) =
+                self.pass(snap.clone(), Some(old), &d.added, &d.removed, &vis, control);
+            p.full = true;
+            let out = root.delta(&mut p)?;
+            let stats = p.stats;
+            drop(p);
+            let out = consolidate(out);
+            self.result.apply(&out);
+            self.applied = snap.commit;
+            self.snap = Some(snap);
+            self.last = stats;
+            return Ok(Advance::Changed(out));
+        }
         let (added, removed): (Vec<[Id; 4]>, Vec<[Id; 4]>) = if vis.everything() {
             (d.added.clone(), d.removed.clone())
         } else {

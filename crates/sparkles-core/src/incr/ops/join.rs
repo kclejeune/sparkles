@@ -45,10 +45,13 @@ impl Join {
     pub fn init(&mut self, p: &mut Pass) -> Result<Changes> {
         let l = consolidate(self.left.init(p)?);
         let r = consolidate(self.right.init(p)?);
+        // a rebuild starts from nothing: the old rows hold ids of the old term space
         if let Some(a) = &mut self.larr {
+            a.clear();
             a.apply(&l);
         }
         if let Some(a) = &mut self.rarr {
+            a.clear();
             a.apply(&r);
         }
         let mut by_key: FxHashMap<_, Vec<usize>> = FxHashMap::default();

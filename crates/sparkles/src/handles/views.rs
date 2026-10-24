@@ -55,10 +55,15 @@ impl Host for LibraryHost {
             .unwrap_or_default()
     }
 
-    fn rdfs_on_read(&self) -> bool {
-        self.state
-            .upgrade()
-            .is_some_and(|s| s.rdfs.read().is_some())
+    fn refusal(&self) -> Option<&'static str> {
+        let s = self.state.upgrade()?;
+        if s.rdfs.read().is_some() {
+            Some("RDFS on read")
+        } else if s.reasoning.read().is_some() {
+            Some("a default graph with materialized inferences")
+        } else {
+            None
+        }
     }
 
     fn stored_query(&self, name: &str) -> Result<String> {
@@ -190,6 +195,12 @@ impl Views {
     }
 
     /// View `name` with its state, or `None`.
+    /// Whether a reader with `access` may read view `name`'s rows and what they
+    /// disclose, such as their count (`None`: every graph).
+    pub fn readable_by(&self, name: &str, access: Option<&Arc<GraphAccess>>) -> bool {
+        self.rt().readable_by(name, access)
+    }
+
     pub fn get(&self, name: &str) -> Option<ViewInfo> {
         self.rt().get(&self.ds.inner.store, name).ok()
     }
@@ -228,10 +239,11 @@ impl Views {
     /// The rows of view `name` at the head commit, waiting for it as `SERVICE
     /// view:read` does.
     pub fn read(&self, name: &str) -> Result<ViewRows> {
-        let at = self.ds.inner.store.snapshot().commit;
+        let snap = self.ds.inner.store.snapshot();
         self.rt().read(&ViewRead {
             name,
-            at,
+            at: snap.commit,
+            snap: Some(&snap),
             allow_stale: false,
             caller: None,
             deadline: None,

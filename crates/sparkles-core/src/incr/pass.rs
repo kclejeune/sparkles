@@ -136,6 +136,8 @@ pub struct Pass<'a> {
     pub full: bool,
     /// the budget of one evaluation's intermediate results
     pub max_memory_bytes: Option<u64>,
+    /// the query's base IRI
+    pub base: Option<oxiri::Iri<String>>,
     ctx: Option<Ctx>,
     union_changes: Option<Vec<([Id; 3], i64)>>,
     work: u64,
@@ -168,6 +170,7 @@ impl<'a> Pass<'a> {
             stats: PassStats::default(),
             full,
             max_memory_bytes: None,
+            base: None,
             ctx: None,
             union_changes: None,
             work: 0,
@@ -304,6 +307,7 @@ impl<'a> Pass<'a> {
         if self.ctx.is_none() {
             let mut c = Ctx::new(self.new.clone());
             c.use_cache = false;
+            c.base_iri = self.base.clone();
             self.ctx = Some(c);
         }
         self.ctx.as_ref().expect("made above")
@@ -464,7 +468,7 @@ impl<'a> Pass<'a> {
                 inner: Box::new(pattern.clone()),
                 variables,
             },
-            base_iri: None,
+            base_iri: self.base.clone(),
         };
         let opts = crate::sparql::QueryOptions {
             graphs: self.access.clone(),

@@ -9,7 +9,7 @@
 
 use super::compile::Kind;
 use oxrdf::Term;
-use parking_lot::{Condvar, Mutex};
+use parking_lot::{Condvar, Mutex, MutexGuard};
 use std::collections::VecDeque;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -205,7 +205,7 @@ pub struct LiveOptions {
 
 /// The most rows a subscription's queue holds before its events are replaced by a
 /// `reset` taken when the subscriber reads again.
-const QUEUE_ROWS: usize = 1_000_000;
+const QUEUE_ROWS: usize = if cfg!(test) { 1_000 } else { 1_000_000 };
 
 #[derive(Default)]
 struct Queue {
@@ -309,12 +309,24 @@ impl LiveQuery {
         &self.vars
     }
 
-    fn take(&self, q: &mut Queue) -> Option<LiveEvent> {
+    fn take(&self, q: &mut MutexGuard<'_, Queue>) -> Option<LiveEvent> {
         if q.overflow {
-            q.overflow = false;
-            q.rows = 0;
-            let slot = self.slot.state.lock();
-            return Some(slot.reset_event());
+            // passes hold the circuit's lock while they queue events, so the queue's
+            // lock is let go and taken again after the circuit's
+            let e = MutexGuard::unlocked(q, || {
+                let mut slot = self.slot.state.lock();
+                let mut q = self.shared.queue.lock();
+                if !q.overflow {
+                    return None;
+                }
+                q.overflow = false;
+                q.rows = 0;
+                q.events.clear();
+                Some(slot.resync(&self.shared))
+            });
+            if e.is_some() {
+                return e;
+            }
         }
         let e = q.events.pop_front()?;
         q.rows = q.rows.saturating_sub(e.rows());
@@ -374,6 +386,19 @@ impl LiveQuery {
             }
             notified.await;
         }
+    }
+
+    /// End the subscription and wake every thread waiting for its next event.
+    /// Events still queued are dropped.
+    pub fn close(&self) {
+        let mut q = self.shared.queue.lock();
+        q.closed = true;
+        q.events.clear();
+        q.rows = 0;
+        q.overflow = false;
+        drop(q);
+        self.shared.cv.notify_all();
+        self.shared.notify.notify_one();
     }
 
     /// Whether the subscription has ended and its queue is empty.

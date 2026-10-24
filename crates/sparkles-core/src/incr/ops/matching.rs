@@ -173,6 +173,7 @@ impl MatchOp {
         );
         rindex.apply(&r);
         if let Some(a) = &mut self.rarr {
+            a.clear();
             a.apply(&r);
         }
         self.lstate.clear();

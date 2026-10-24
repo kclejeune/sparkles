@@ -23,7 +23,7 @@ pub(super) fn status(code: &str) -> StatusCode {
         "view-not-found" => StatusCode::NOT_FOUND,
         "invalid-view" | "unsupported-option" | "not-incremental" => StatusCode::BAD_REQUEST,
         "view-access" | "forbidden" => StatusCode::FORBIDDEN,
-        "view-behind" | "view-suspended" | "views-unavailable" | "pass-timeout" => {
+        "view-behind" | "view-ahead" | "view-suspended" | "views-unavailable" | "pass-timeout" => {
             StatusCode::SERVICE_UNAVAILABLE
         }
         "too-many-live-queries" => StatusCode::TOO_MANY_REQUESTS,
@@ -71,10 +71,15 @@ impl Host for ServerHost {
             .unwrap_or_default()
     }
 
-    fn rdfs_on_read(&self) -> bool {
-        self.state
-            .upgrade()
-            .is_some_and(|s| s.rdfs.read().is_some())
+    fn refusal(&self) -> Option<&'static str> {
+        let s = self.state.upgrade()?;
+        if s.rdfs.read().is_some() {
+            Some("RDFS on read")
+        } else if s.reasoning.read().is_some() {
+            Some("a default graph with materialized inferences")
+        } else {
+            None
+        }
     }
 
     fn stored_query(&self, name: &str) -> sparkles::Result<String> {
@@ -119,8 +124,23 @@ fn info_json(ds: &str, v: &sparkles::incr::ViewInfo) -> J {
     j
 }
 
+/// Leave out what a view's data discloses for a caller who may not read the view.
+fn redact(j: &mut J, ds: &crate::state::Dataset, name: &str, p: &Principal) {
+    let access = p.view(&ds.name, Endpoint::Query);
+    if !ds.dataset.views().readable_by(name, access.as_ref())
+        && let Some(o) = j.as_object_mut()
+    {
+        o.remove("rows");
+        o.remove("stateBytes");
+    }
+}
+
 /// `GET /$/views/{ds}`
-pub(super) async fn list(st: St, Path(ds_name): Path<String>) -> ApiResult<Json<J>> {
+pub(super) async fn list(
+    st: St,
+    Path(ds_name): Path<String>,
+    Extension(p): Extension<Principal>,
+) -> ApiResult<Json<J>> {
     let ds = dataset(&st, &ds_name)?;
     let views: Vec<J> = ds
         .dataset
@@ -133,6 +153,7 @@ pub(super) async fn list(st: St, Path(ds_name): Path<String>) -> ApiResult<Json<
                 o.remove("plan");
                 o.remove("dataset");
             }
+            redact(&mut j, &ds, &v.name, &p);
             j
         })
         .collect();
@@ -143,6 +164,7 @@ pub(super) async fn list(st: St, Path(ds_name): Path<String>) -> ApiResult<Json<
 pub(super) async fn get_view(
     st: St,
     Path((ds_name, name)): Path<(String, String)>,
+    Extension(p): Extension<Principal>,
 ) -> ApiResult<Json<J>> {
     let ds = dataset(&st, &ds_name)?;
     let v = ds.dataset.views().get(&name).ok_or_else(|| {
@@ -151,7 +173,9 @@ pub(super) async fn get_view(
             format!("no view '{name}' in /{}", ds.name),
         ))
     })?;
-    Ok(Json(info_json(&ds.name, &v)))
+    let mut j = info_json(&ds.name, &v);
+    redact(&mut j, &ds, &name, &p);
+    Ok(Json(j))
 }
 
 /// `PUT /$/views/{ds}/{name}`: the view's definition. Without `principal`, the view

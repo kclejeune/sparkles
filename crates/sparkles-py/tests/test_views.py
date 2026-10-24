@@ -32,3 +32,18 @@ def test_live_queries_send_diffs() -> None:
         assert diff is not None and diff["event"] == "diff"
         (terms, count) = diff["added"][0]
         assert str(terms[0]) == "<urn:b>" and count == 1
+
+
+def test_close_wakes_a_waiting_iterator() -> None:
+    import threading
+
+    ds = sparkles.Dataset.memory()
+    live = ds.live("SELECT ?p WHERE { ?p <urn:in> <urn:t> }")
+    next(live)
+    out: list[object] = []
+    t = threading.Thread(target=lambda: out.append(live.next()))
+    t.start()
+    live.close()
+    t.join(timeout=10)
+    assert not t.is_alive()
+    assert out == [None]

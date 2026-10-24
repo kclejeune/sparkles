@@ -3,10 +3,14 @@
 //!
 //! A template's blank node becomes a node per solution. It is minted from a hash of the
 //! template's label and the solution's terms (spec F13 §4.6), so a solution that
-//! disappears and returns gives the same node, and a diff never churns it.
+//! disappears and returns gives the same node, and a diff never churns it. A solution
+//! that occurs more than once gives one node per occurrence, as a one-off evaluation
+//! does: the template keeps each solution's count and hashes the occurrence's number
+//! after the first.
 
 use super::super::pass::Pass;
-use super::super::zset::{Changes, Row};
+use super::super::persist::{Reader, Writer};
+use super::super::zset::{Changes, Row, ZSet};
 use super::Node;
 use crate::error::Result;
 use crate::id::{Id, Tag};
@@ -29,6 +33,8 @@ pub struct Template {
     pub triples: Vec<[TSlot; 3]>,
     /// what blank node hashes start from, so that two views mint different nodes
     pub seed: String,
+    /// each solution's count, when the template has blank nodes
+    pub counts: ZSet,
 }
 
 impl Template {
@@ -45,7 +51,7 @@ impl Template {
         }
     }
 
-    fn apply(&self, p: &mut Pass, c: Changes) -> Result<Changes> {
+    fn apply(&mut self, p: &mut Pass, c: Changes) -> Result<Changes> {
         let mut out = Changes::new();
         let blanks = self
             .triples
@@ -53,14 +59,42 @@ impl Template {
             .any(|t| t.iter().any(|s| matches!(s, TSlot::Blank(_))));
         for (row, w) in c {
             p.tick()?;
+            if !blanks {
+                self.emit(p, &row, &[], None, w, &mut out);
+                continue;
+            }
             // the solution's terms, which blank nodes hash
-            let keys: Vec<Vec<u8>> = if blanks {
-                row.iter()
-                    .map(|&i| p.terms.key(&p.new, i).unwrap_or_default())
-                    .collect()
+            let keys: Vec<Vec<u8>> = row
+                .iter()
+                .map(|&i| p.terms.key(&p.new, i).unwrap_or_default())
+                .collect();
+            // the occurrences added or removed, the newest removed first
+            let before = self.counts.get(&row);
+            self.counts.add(row.clone(), w);
+            let (range, sign) = if w > 0 {
+                (before..before + w, 1)
             } else {
-                Vec::new()
+                (before + w..before, -1)
             };
+            for k in range {
+                let k = (k > 0).then_some(k);
+                self.emit(p, &row, &keys, k, sign, &mut out);
+            }
+        }
+        Ok(out)
+    }
+
+    /// The triples of occurrence `k` of a solution (`None`: the first), with weight `w`.
+    fn emit(
+        &self,
+        p: &mut Pass,
+        row: &Row,
+        keys: &[Vec<u8>],
+        occurrence: Option<i64>,
+        w: i64,
+        out: &mut Changes,
+    ) {
+        {
             let mut minted: Vec<(String, Id)> = Vec::new();
             for t in &self.triples {
                 let mut ids = [Id::UNDEF; 3];
@@ -76,9 +110,13 @@ impl Template {
                                 h.update(self.seed.as_bytes());
                                 h.update([0]);
                                 h.update(label.as_bytes());
-                                for k in &keys {
+                                for k in keys {
                                     h.update((k.len() as u64).to_le_bytes());
                                     h.update(k);
+                                }
+                                if let Some(n) = occurrence {
+                                    h.update([1]);
+                                    h.update(n.to_le_bytes());
                                 }
                                 let d = h.finalize();
                                 let hex: String =
@@ -106,10 +144,23 @@ impl Template {
                 }
             }
         }
-        Ok(out)
+    }
+
+    pub fn bytes(&self) -> u64 {
+        self.counts.bytes(self.inner.schema.len())
+    }
+
+    pub fn save(&self, w: &mut Writer) -> Result<()> {
+        w.zset(&self.counts)
+    }
+
+    pub fn load(&mut self, r: &mut Reader) -> Result<()> {
+        self.counts = r.zset()?;
+        Ok(())
     }
 
     pub fn init(&mut self, p: &mut Pass) -> Result<Changes> {
+        self.counts = ZSet::new();
         let c = self.inner.init(p)?;
         self.apply(p, c)
     }

@@ -39,6 +39,9 @@ pub struct ViewRead<'a> {
     pub name: &'a str,
     /// the commit of the query's snapshot
     pub at: u64,
+    /// the query's snapshot, to evaluate the view at when it has moved past `at` and
+    /// its history does not reach back
+    pub snap: Option<&'a Arc<crate::store::Snapshot>>,
     pub allow_stale: bool,
     /// the reader's view of the dataset (`None`: every graph)
     pub caller: Option<&'a Arc<GraphAccess>>,
@@ -145,6 +148,7 @@ pub(super) fn run(ctx: &Ctx, spec: &ViewSpec, vars: &[VarId]) -> Result<Table> {
     let rows = source.read_view(&ViewRead {
         name: &spec.name,
         at: ctx.snap.commit,
+        snap: Some(&ctx.snap),
         allow_stale: spec.allow_stale,
         caller: ctx.graphs.as_ref(),
         deadline: ctx.current_deadline(),

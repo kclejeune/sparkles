@@ -24,7 +24,7 @@ use rustc_hash::FxHashMap;
 use spargebra::Query;
 use spargebra::algebra::{
     AggregateExpression, AggregateFunction, Expression, Function, GraphPattern as GP,
-    PropertyPathExpression as PPE, QueryDataset,
+    OrderExpression, PropertyPathExpression as PPE, QueryDataset,
 };
 use spargebra::term::{GroundTerm, NamedNodePattern, TermPattern, TriplePattern};
 
@@ -50,6 +50,8 @@ pub struct Compiled {
     pub vars: Vec<String>,
     pub root: Node,
     pub footprint: Footprint,
+    /// the query's base IRI
+    pub base: Option<oxiri::Iri<String>>,
 }
 
 /// The error of a query that cannot be a view or a live query (`400 not-incremental`).
@@ -173,6 +175,15 @@ fn refused_expr(e: &Expression, found: &mut Option<String>) {
         }
         _ => {}
     }
+}
+
+/// Whether `iri` names a property function, which computes its answers instead of
+/// matching stored triples.
+fn property_function(iri: &str) -> bool {
+    iri == crate::sparql::arqpf::RDFS_MEMBER
+        || crate::sparql::catalog::property_functions()
+            .iter()
+            .any(|f| f == iri)
 }
 
 /// The search property functions, which read indexes built after the commit.
@@ -302,6 +313,27 @@ fn footprint_of(gp: &GP, scope: &Scope, fp: &mut Footprint) {
             _ => None,
         }
     }
+    /// Whether a path matches the empty path, which joins every node of the graph
+    /// to itself.
+    fn nullable(p: &PPE) -> bool {
+        match p {
+            PPE::ZeroOrMore(_) | PPE::ZeroOrOne(_) => true,
+            PPE::Range { min, path, .. } => *min == 0 || nullable(path),
+            PPE::Reverse(a) | PPE::Distinct(a) | PPE::Multi(a) | PPE::Shortest(a) => nullable(a),
+            PPE::OneOrMore(a) => nullable(a),
+            PPE::Sequence(a, b) => nullable(a) && nullable(b),
+            PPE::Alternative(a, b) => nullable(a) || nullable(b),
+            PPE::NamedNode(_) | PPE::NegatedPropertySet(_) => false,
+        }
+    }
+    fn any_quad(scope: &Scope, fp: &mut Footprint) {
+        fp.add(Entry {
+            g: scope.fgraph(),
+            s: None,
+            p: None,
+            o: None,
+        });
+    }
     fn path(p: &PPE, scope: &Scope, fp: &mut Footprint) {
         match p {
             PPE::NamedNode(n) => fp.add(Entry {
@@ -366,6 +398,12 @@ fn footprint_of(gp: &GP, scope: &Scope, fp: &mut Footprint) {
     match gp {
         GP::Bgp { patterns } => {
             for t in patterns {
+                // a property function reads triples its pattern does not name
+                if let NamedNodePattern::NamedNode(n) = &t.predicate
+                    && property_function(n.as_str())
+                {
+                    fp.all = true;
+                }
                 fp.add(Entry {
                     g: scope.fgraph(),
                     s: term(&t.subject),
@@ -377,13 +415,23 @@ fn footprint_of(gp: &GP, scope: &Scope, fp: &mut Footprint) {
                 });
             }
         }
-        GP::Path { path: p, .. } => path(p, scope, fp),
+        GP::Path { path: p, .. } => {
+            path(p, scope, fp);
+            if nullable(p) {
+                any_quad(scope, fp);
+            }
+        }
         GP::Graph { name, inner } => {
             let s = match name {
                 NamedNodePattern::NamedNode(n) => Scope::Graph(n.clone()),
                 NamedNodePattern::Variable(v) => Scope::Var(v.clone()),
             };
+            let before = (fp.entries.len(), fp.all);
             footprint_of(inner, &s, fp);
+            // a group that reads no triple still depends on which graphs exist
+            if (fp.entries.len(), fp.all) == before {
+                any_quad(&s, fp);
+            }
             // the special graphs of ARQ read other graphs
             if let NamedNodePattern::NamedNode(n) = name
                 && n.as_str().starts_with("urn:x-arq:")
@@ -439,8 +487,15 @@ fn footprint_of(gp: &GP, scope: &Scope, fp: &mut Footprint) {
             }
             footprint_of(inner, scope, fp);
         }
-        GP::OrderBy { inner, .. }
-        | GP::Project { inner, .. }
+        GP::OrderBy { inner, expression } => {
+            for o in expression {
+                match o {
+                    OrderExpression::Asc(e) | OrderExpression::Desc(e) => expr(e, scope, fp),
+                }
+            }
+            footprint_of(inner, scope, fp);
+        }
+        GP::Project { inner, .. }
         | GP::Distinct { inner }
         | GP::Reduced { inner }
         | GP::Slice { inner, .. } => footprint_of(inner, scope, fp),
@@ -828,13 +883,7 @@ impl C {
                     let triple_term = matches!(t.subject, TermPattern::Triple(_))
                         || matches!(t.object, TermPattern::Triple(_));
                     let pf = match &t.predicate {
-                        NamedNodePattern::NamedNode(p) => {
-                            let p = p.as_str();
-                            p == crate::sparql::arqpf::RDFS_MEMBER
-                                || crate::sparql::catalog::property_functions()
-                                    .iter()
-                                    .any(|f| f == p)
-                        }
+                        NamedNodePattern::NamedNode(p) => property_function(p.as_str()),
                         NamedNodePattern::Variable(_) => false,
                     };
                     if triple_term || pf {
@@ -998,10 +1047,10 @@ impl C {
             if self.factors(gp, scope, &mut f) {
                 if f.is_empty() {
                     return match scope {
-                        Scope::Var(_) => {
-                            self.recompute(gp, scope, "an empty group under GRAPH ?g", None)
+                        Scope::Var(_) | Scope::Graph(_) => {
+                            self.recompute(gp, scope, "an empty group under GRAPH", None)
                         }
-                        _ => C::unit(),
+                        Scope::Default => C::unit(),
                     };
                 }
                 return self.bgp(f);
@@ -1485,6 +1534,7 @@ pub fn compile(q: &Query, whole: Option<&str>) -> Result<Compiled> {
                     inner: root,
                     triples,
                     seed: String::new(),
+                    counts: ZSet::new(),
                 })),
                 schema: schema.clone(),
                 certain: schema.clone(),
@@ -1500,10 +1550,17 @@ pub fn compile(q: &Query, whole: Option<&str>) -> Result<Compiled> {
         }
         _ => {}
     }
+    let base = match q {
+        Query::Select { base_iri, .. }
+        | Query::Ask { base_iri, .. }
+        | Query::Construct { base_iri, .. }
+        | Query::Describe { base_iri, .. } => base_iri.clone(),
+    };
     Ok(Compiled {
         kind,
         vars: c.vars,
         root,
         footprint,
+        base,
     })
 }

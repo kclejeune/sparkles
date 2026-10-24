@@ -4,7 +4,8 @@
 //! Integer and decimal sums are kept exactly, so removing a value is exact. Float and
 //! double values are kept as value counts, and a changed group sums them again: such a
 //! sum can differ in its last bits from a one-off evaluation, which adds the values in
-//! the order the rows arrive. A sum whose integer part leaves the 64-bit range is
+//! the order the rows arrive. A sum whose integer part leaves the 64-bit range, or
+//! whose positive or negative decimal values sum past the decimal range, is
 //! unbound, as an overflow in a one-off evaluation is. `DISTINCT` aggregates keep the
 //! counts of the group's distinct values.
 
@@ -41,9 +42,10 @@ pub struct AggSpec {
 struct SumState {
     rows: i64,
     errs: i64,
+    /// the integer sum, in wrapping arithmetic so that removals stay exact
     int: i128,
-    dec: i128,
-    ndec: i64,
+    /// the decimal values as counts by their 128-bit encoding
+    decs: FxHashMap<i128, i64>,
     floats: FxHashMap<u32, i64>,
     doubles: FxHashMap<u64, i64>,
 }
@@ -53,10 +55,18 @@ impl SumState {
     fn add(&mut self, v: Option<&Value>, w: i64) {
         self.rows += w;
         match v {
-            Some(Value::Integer(i)) => self.int += i64::from(*i) as i128 * w as i128,
+            Some(Value::Integer(i)) => {
+                self.int = self
+                    .int
+                    .wrapping_add((i64::from(*i) as i128).wrapping_mul(w as i128))
+            }
             Some(Value::Decimal(d)) => {
-                self.dec += i128::from_be_bytes(d.to_be_bytes()) * w as i128;
-                self.ndec += w;
+                let k = i128::from_be_bytes(d.to_be_bytes());
+                let n = self.decs.entry(k).or_insert(0);
+                *n += w;
+                if *n == 0 {
+                    self.decs.remove(&k);
+                }
             }
             Some(Value::Float(f)) => *self.floats.entry(f32::from(*f).to_bits()).or_insert(0) += w,
             Some(Value::Double(d)) => {
@@ -72,12 +82,24 @@ impl SumState {
         if self.errs != 0 {
             return None;
         }
-        let int = i64::try_from(self.int).ok()?;
-        let mut acc = if self.ndec != 0 {
-            let dec = Decimal::from_be_bytes(self.dec.to_be_bytes());
-            Value::Decimal(Decimal::from(int).checked_add(dec)?)
+        let mut acc = if !self.decs.is_empty() {
+            // the positive and negative parts, each summed with checks: a part that
+            // leaves the decimal range makes the sum unbound
+            let (mut pos, mut neg) = (0i128, 0i128);
+            for (k, n) in &self.decs {
+                let v = k.checked_mul(i128::from(*n))?;
+                if v >= 0 {
+                    pos = pos.checked_add(v)?;
+                } else {
+                    neg = neg.checked_add(v)?;
+                }
+            }
+            // the integers join the decimals, as a one-off evaluation promotes them
+            let int = self.int.checked_mul(1_000_000_000_000_000_000)?;
+            let raw = pos.checked_add(neg)?.checked_add(int)?;
+            Value::Decimal(Decimal::from_be_bytes(raw.to_be_bytes()))
         } else {
-            Value::Integer(int.into())
+            Value::Integer(i64::try_from(self.int).ok()?.into())
         };
         let mut floats: Vec<(f32, i64)> = self
             .floats
@@ -374,7 +396,10 @@ impl Group {
                             AState::Count(_) => 8,
                             AState::Rows(m) => m.len() as u64 * row_bytes(self.inner.schema.len()),
                             AState::Values { vals, .. } => vals.len() as u64 * 24 + 96,
-                            AState::Sum(s) => 96 + (s.floats.len() + s.doubles.len()) as u64 * 24,
+                            AState::Sum(s) => {
+                                96 + (s.floats.len() + s.doubles.len()) as u64 * 24
+                                    + s.decs.len() as u64 * 40
+                            }
                         })
                         .sum::<u64>()
             })
@@ -386,8 +411,11 @@ impl Group {
             w.i64(s.rows);
             w.i64(s.errs);
             w.i128(s.int);
-            w.i128(s.dec);
-            w.i64(s.ndec);
+            w.u64(s.decs.len() as u64);
+            for (k, n) in &s.decs {
+                w.i128(*k);
+                w.i64(*n);
+            }
             w.u64(s.floats.len() as u64);
             for (b, n) in &s.floats {
                 w.u64(*b as u64);
@@ -442,10 +470,12 @@ impl Group {
                 rows: r.i64()?,
                 errs: r.i64()?,
                 int: r.i128()?,
-                dec: r.i128()?,
-                ndec: r.i64()?,
                 ..Default::default()
             };
+            for _ in 0..r.u64()? {
+                let k = r.i128()?;
+                s.decs.insert(k, r.i64()?);
+            }
             for _ in 0..r.u64()? {
                 let b = r.u64()? as u32;
                 s.floats.insert(b, r.i64()?);

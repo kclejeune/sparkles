@@ -76,9 +76,11 @@ fn read(
     name: &str,
     caller: Option<&Arc<GraphAccess>>,
 ) -> crate::Result<Vec<String>> {
+    let snap = s.snapshot();
     let r = rt.read(&ViewRead {
         name,
-        at: s.snapshot().commit,
+        at: snap.commit,
+        snap: Some(&snap),
         allow_stale: false,
         caller,
         deadline: None,
@@ -742,4 +744,285 @@ fn service_view_read_reads_rows() {
     let bad = q("PREFIX view: <urn:x-sparkles:view#> SELECT * WHERE { \
                  SERVICE view:read { [] view:name \"team-sizes\" ; view:bind ?nope } }");
     assert!(sparql::query(s.snapshot(), &bad, &o).is_err());
+}
+
+struct Fixed(Vec<String>);
+
+impl crate::access::GuardDecision for Fixed {
+    fn exempt(&self, _: &Arc<crate::store::Snapshot>) -> Vec<String> {
+        self.0.clone()
+    }
+}
+
+/// Guards that a request decides keep their graphs out of circuits, so two readers
+/// whose deciders differ share one circuit and neither reads the guarded graph.
+#[test]
+fn guarded_graphs_stay_out_of_circuits() {
+    use crate::access::Decider;
+    let s = Store::in_memory(StoreOptions::default());
+    load(&s);
+    upd(&s, "INSERT DATA { GRAPH :r1 { :x :secret 1 } }");
+    let guarded = |exempt: Vec<String>| {
+        Arc::new(GraphAccess::graphs(
+            Graphs::All.guarded_by("http://ex/r*", Decider(Arc::new(Fixed(exempt)))),
+            Graphs::none(),
+        ))
+    };
+    let allow = guarded(vec!["http://ex/r1".into()]);
+    let deny = guarded(Vec::new());
+    assert_eq!(
+        super::runtime::access_fingerprint(Some(&allow)),
+        super::runtime::access_fingerprint(Some(&deny))
+    );
+    let rt = runtime(&s, None);
+    let query = q("SELECT ?s WHERE { GRAPH ?g { ?s :secret ?o } }");
+    for a in [allow, deny] {
+        let l = rt
+            .live(&s, &query, Some(a), &LiveOptions::default())
+            .unwrap();
+        assert_eq!(live_rows(&l.try_next().unwrap()).1, Vec::<String>::new());
+        upd(&s, "INSERT DATA { GRAPH :r1 { :y :secret 2 } }");
+        rt.round(&s);
+        assert!(l.try_next().is_none());
+    }
+}
+
+/// A protection that depends on the data reacts to changes the query's patterns do
+/// not name, and to changes in graphs the reader cannot read.
+#[test]
+fn data_dependent_protections_see_every_change() {
+    let s = Store::in_memory(StoreOptions::default());
+    load(&s);
+    let protection = Protection {
+        name: "hide".into(),
+        predicates: Some(vec!["http://ex/age".into()]),
+        classes: Some(vec!["http://ex/Secret".into()]),
+        subclasses: false,
+        graphs: None,
+        pattern: None,
+        prefixes: Default::default(),
+        hide_inferences: false,
+    };
+    let access = Arc::new(GraphAccess::with_triples(
+        Graphs::Only(GraphRule::new(["default"], &[])),
+        Graphs::none(),
+        TripleRules {
+            rules: vec![Rule {
+                protection: Arc::new(protection),
+                read: Graphs::none(),
+                write: Graphs::none(),
+            }],
+            caller: Caller::default(),
+            limits: Limits::default(),
+        },
+    ));
+    let rt = runtime(&s, None);
+    let query = "SELECT ?p ?a WHERE { ?p :age ?a }";
+    let l = rt
+        .live(&s, &q(query), Some(access.clone()), &LiveOptions::default())
+        .unwrap();
+    let mut state = Vec::new();
+    apply(&mut state, &l.try_next().unwrap());
+    for u in [
+        "INSERT DATA { :a a :Secret }",
+        "INSERT DATA { GRAPH :hidden { :b a :Secret } }",
+        "DELETE DATA { :a a :Secret }",
+    ] {
+        upd(&s, u);
+        rt.round(&s);
+        while let Some(e) = l.try_next() {
+            apply(&mut state, &e);
+        }
+        state.sort();
+        assert_eq!(state, oracle(&s, query, Some(access.clone())), "{u}");
+    }
+}
+
+/// A view read at a commit its circuit has passed gives the rows of that commit.
+#[test]
+fn a_view_reads_at_the_query_commit() {
+    let s = Store::in_memory(StoreOptions::default());
+    load(&s);
+    let rt = runtime(&s, None);
+    rt.put(&s, "team-sizes", ViewDef::table(q(TEAM_SIZES)))
+        .unwrap();
+    rt.round(&s);
+    let at = |snap: &Arc<crate::store::Snapshot>| {
+        rt.read(&ViewRead {
+            name: "team-sizes",
+            at: snap.commit,
+            snap: Some(snap),
+            allow_stale: false,
+            caller: None,
+            deadline: None,
+        })
+        .map(|r| (r.commit, rows_of(&r.rows)))
+    };
+    let first = s.snapshot();
+    upd(&s, "INSERT DATA { :d org:memberOf :t2 }");
+    rt.round(&s);
+    // from the history
+    assert_eq!(
+        at(&first).unwrap(),
+        (first.commit, vec!["t1 2".to_string(), "t2 1".into()])
+    );
+    // past the history: evaluated at the snapshot
+    for i in 0..20 {
+        upd(&s, &format!("INSERT DATA {{ :n{i} org:memberOf :t3 }}"));
+        rt.round(&s);
+    }
+    assert_eq!(
+        at(&first).unwrap(),
+        (first.commit, vec!["t1 2".to_string(), "t2 1".into()])
+    );
+    // and without the snapshot it is refused
+    let Err(e) = rt.read(&ViewRead {
+        name: "team-sizes",
+        at: first.commit,
+        snap: None,
+        allow_stale: false,
+        caller: None,
+        deadline: None,
+    }) else {
+        panic!("a read past the history without the snapshot");
+    };
+    assert!(format!("{e:?}").contains("view-ahead"), "{e:?}");
+}
+
+/// A diff starts from the subscriber's previous event, past commits that left the
+/// result alone.
+#[test]
+fn a_diff_starts_from_the_previous_event() {
+    let s = Store::in_memory(StoreOptions::default());
+    load(&s);
+    let rt = runtime(&s, None);
+    let l = rt
+        .live(&s, &q(TEAM_SIZES), None, &LiveOptions::default())
+        .unwrap();
+    let LiveEvent::Snapshot { commit: first, .. } = l.try_next().unwrap() else {
+        panic!("a snapshot first");
+    };
+    upd(&s, "INSERT DATA { :a :age 31 }");
+    rt.round(&s);
+    upd(
+        &s,
+        "DELETE DATA { :a org:memberOf :t1 } ; INSERT DATA { :a org:memberOf :t1 }",
+    );
+    rt.round(&s);
+    upd(&s, "INSERT DATA { :d org:memberOf :t2 }");
+    rt.round(&s);
+    let e = l.try_next().unwrap();
+    assert!(
+        matches!(e, LiveEvent::Diff { from, .. } if from == first),
+        "{e:?}"
+    );
+}
+
+/// Closing a live query wakes a thread waiting for its next event.
+#[test]
+fn closing_wakes_a_waiting_reader() {
+    let s = Store::in_memory(StoreOptions::default());
+    load(&s);
+    let rt = runtime(&s, None);
+    let l = Arc::new(
+        rt.live(&s, &q(TEAM_SIZES), None, &LiveOptions::default())
+            .unwrap(),
+    );
+    l.try_next().unwrap();
+    let (tx, rx) = std::sync::mpsc::channel();
+    let l2 = l.clone();
+    let t = std::thread::spawn(move || tx.send(l2.next().is_none()).unwrap());
+    std::thread::sleep(Duration::from_millis(50));
+    l.close();
+    assert_eq!(rx.recv_timeout(Duration::from_secs(10)), Ok(true));
+    t.join().unwrap();
+}
+
+/// A queue that overflowed recovers with a reset while passes publish, without a
+/// deadlock between the queue and the circuit.
+#[test]
+fn an_overflowed_queue_recovers_while_passes_run() {
+    let s = Arc::new(Store::in_memory(StoreOptions::default()));
+    load(&s);
+    let rt = runtime(&s, None);
+    let l = Arc::new(
+        rt.live(
+            &s,
+            &q("SELECT ?s ?o WHERE { ?s :n ?o }"),
+            None,
+            &LiveOptions::default(),
+        )
+        .unwrap(),
+    );
+    l.try_next().unwrap();
+    let mut data = String::from("INSERT DATA { ");
+    for i in 0..1500 {
+        data.push_str(&format!(":s{i} :n {i} . "));
+    }
+    data.push('}');
+    upd(&s, &data);
+    rt.round(&s);
+    let (tx, rx) = std::sync::mpsc::channel();
+    let (s2, rt2) = (s.clone(), rt.clone());
+    let writer = std::thread::spawn(move || {
+        for i in 0..200 {
+            upd(&s2, &format!("INSERT DATA {{ :w{i} :n {i} }}"));
+            rt2.round(&s2);
+        }
+    });
+    let l2 = l.clone();
+    let reader = std::thread::spawn(move || {
+        let mut resets = 0;
+        while let Some(e) = l2.next_timeout(Duration::from_secs(2)) {
+            if matches!(e, LiveEvent::Snapshot { reset: true, .. }) {
+                resets += 1;
+            }
+        }
+        tx.send(resets).unwrap();
+    });
+    let resets = rx
+        .recv_timeout(Duration::from_secs(60))
+        .expect("no deadlock");
+    assert!(resets >= 1);
+    writer.join().unwrap();
+    reader.join().unwrap();
+}
+
+/// Materialized inferences in the default graph refuse views and live queries, and
+/// end the live queries running when they appear.
+#[test]
+fn inferences_in_the_default_graph_refuse_views() {
+    struct Inferring(std::sync::atomic::AtomicBool);
+    impl Host for Inferring {
+        fn access(&self, _: Option<&str>) -> crate::Result<Option<Arc<GraphAccess>>> {
+            Ok(None)
+        }
+        fn stored_query(&self, _: &str) -> crate::Result<String> {
+            Err(crate::Error::NotFound("none".into()))
+        }
+        fn refusal(&self) -> Option<&'static str> {
+            self.0
+                .load(std::sync::atomic::Ordering::Relaxed)
+                .then_some("a default graph with materialized inferences")
+        }
+    }
+    let s = Store::in_memory(StoreOptions::default());
+    load(&s);
+    let rt = Runtime::open(None, s.dataset_id(), RuntimeOptions::default());
+    let host = Arc::new(Inferring(false.into()));
+    rt.set_host(host.clone());
+    let l = rt
+        .live(&s, &q(TEAM_SIZES), None, &LiveOptions::default())
+        .unwrap();
+    l.try_next().unwrap();
+    host.0.store(true, std::sync::atomic::Ordering::Relaxed);
+    rt.round(&s);
+    assert!(
+        matches!(l.try_next(), Some(LiveEvent::Error { code, .. }) if code == "not-incremental")
+    );
+    assert!(rt.put(&s, "v", ViewDef::table(q(TEAM_SIZES))).is_err());
+    assert!(
+        rt.live(&s, &q(TEAM_SIZES), None, &LiveOptions::default())
+            .is_err()
+    );
 }

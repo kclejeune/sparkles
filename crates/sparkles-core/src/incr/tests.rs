@@ -335,3 +335,114 @@ fn random_histories_follow_the_oracle() {
         }
     }
 }
+
+/// Queries whose circuits once missed changes or disagreed with the engine: each runs
+/// from an empty store through its updates and is checked after every commit.
+#[test]
+fn edge_cases_follow_the_oracle() {
+    let cases: &[(&str, &[&str])] = &[
+        // a decimal sum past the decimal range is unbound
+        (
+            "SELECT (SUM(?v) AS ?s) WHERE { ?x :v ?v }",
+            &[
+                "INSERT DATA { :a :v 99999999999999999999.0 }",
+                "INSERT DATA { :b :v 99999999999999999999.0 }",
+                "DELETE DATA { :b :v 99999999999999999999.0 }",
+                "INSERT DATA { :c :v 9223372036854775807 . :d :v 9223372036854775807 }",
+            ],
+        ),
+        // the base IRI reaches expressions
+        (
+            "BASE <http://example.org/> SELECT (IRI(\"relative\") AS ?i) WHERE {}",
+            &["INSERT DATA { :a :p 1 }"],
+        ),
+        // a property function's footprint covers the triples it reads
+        (
+            "PREFIX list: <http://jena.apache.org/ARQ/list#> SELECT ?x WHERE { :l list:member ?x }",
+            &[
+                "INSERT DATA { :l <http://www.w3.org/1999/02/22-rdf-syntax-ns#first> 1 ; <http://www.w3.org/1999/02/22-rdf-syntax-ns#rest> <http://www.w3.org/1999/02/22-rdf-syntax-ns#nil> }",
+                "DELETE DATA { :l <http://www.w3.org/1999/02/22-rdf-syntax-ns#first> 1 } ; INSERT DATA { :l <http://www.w3.org/1999/02/22-rdf-syntax-ns#first> 2 }",
+            ],
+        ),
+        // the empty path joins every node of the graph to itself
+        (
+            "SELECT ?s ?o WHERE { ?s :p* ?o }",
+            &[
+                "INSERT DATA { :a :other :b }",
+                "DELETE DATA { :a :other :b }",
+            ],
+        ),
+        // ORDER BY expressions are part of the footprint
+        (
+            "SELECT ?s WHERE { ?s :r ?x } ORDER BY DESC(EXISTS { ?s :q ?y }) LIMIT 1",
+            &[
+                "INSERT DATA { :a :r 1 . :b :r 1 . :a :q 1 }",
+                "DELETE DATA { :a :q 1 } ; INSERT DATA { :b :q 1 }",
+            ],
+        ),
+        // an empty group under a named graph needs the graph to exist
+        (
+            "SELECT ?n WHERE { GRAPH :g { BIND(1 AS ?n) } }",
+            &[
+                "INSERT DATA { GRAPH :g { :a :p 1 } }",
+                "DELETE DATA { GRAPH :g { :a :p 1 } }",
+            ],
+        ),
+        // graph enumeration follows the named graphs
+        (
+            "SELECT ?g WHERE { GRAPH ?g {} }",
+            &[
+                "INSERT DATA { GRAPH :g { :a :p 1 } }",
+                "DELETE DATA { GRAPH :g { :a :p 1 } }",
+            ],
+        ),
+        // a template's blank node is one node per occurrence of a solution
+        (
+            "CONSTRUCT { [] :p ?o } WHERE { ?s :v ?o }",
+            &[
+                "INSERT DATA { :a :v 1 . :b :v 1 }",
+                "DELETE DATA { :a :v 1 }",
+                "INSERT DATA { :c :v 1 . :d :v 2 }",
+            ],
+        ),
+    ];
+    for (q, updates) in cases {
+        let s = Store::in_memory(StoreOptions::default());
+        let mut c = circuit(&s, q);
+        check(&s, &c, q, "after the build");
+        for u in *updates {
+            upd(&s, &format!("{PREFIX}{u}")).expect("update");
+            step(&s, &mut c);
+            check(&s, &c, q, u);
+        }
+    }
+    // the two occurrences of one solution give two triples
+    let s = Store::in_memory(StoreOptions::default());
+    let q = "CONSTRUCT { [] :p ?o } WHERE { VALUES ?o { 1 1 } }";
+    let c = circuit(&s, q);
+    check(&s, &c, q, "after the build");
+    assert_eq!(result(&c).len(), 2);
+}
+
+/// A rebuild starts the operators' state from nothing.
+#[test]
+fn a_rebuild_clears_the_operators_state() {
+    for q in [
+        "SELECT ?s WHERE { VALUES ?k { 1 } ?s :p ?k }",
+        "SELECT ?s WHERE { ?s :p ?k MINUS { VALUES ?k { 2 } } }",
+        "CONSTRUCT { [] :p ?k } WHERE { ?s :p ?k }",
+    ] {
+        let s = Store::in_memory(StoreOptions::default());
+        upd(&s, &format!("{PREFIX}INSERT DATA {{ :a :p 1 }}")).unwrap();
+        let mut c = circuit(&s, q);
+        c.reset(&DeltaSet::at(s.snapshot()), &Control::none())
+            .unwrap();
+        check(&s, &c, q, "after the rebuild");
+        upd(&s, &format!("{PREFIX}INSERT DATA {{ :b :p 1 }}")).unwrap();
+        step(&s, &mut c);
+        check(&s, &c, q, "after an insert");
+        upd(&s, &format!("{PREFIX}DELETE DATA {{ :a :p 1 }}")).unwrap();
+        step(&s, &mut c);
+        check(&s, &c, q, "after a delete");
+    }
+}

@@ -153,6 +153,7 @@ impl Node {
             Op::Distinct(o) => o.bytes(),
             Op::Group(o) => o.bytes(),
             Op::Recompute(o) => o.bytes(self.schema.len()),
+            Op::Template(o) => o.bytes(),
             _ => 0,
         };
         own + self.children().iter().map(|c| c.bytes()).sum::<u64>()
@@ -166,6 +167,7 @@ impl Node {
             Op::Distinct(o) => o.save(w)?,
             Op::Group(o) => o.save(w)?,
             Op::Recompute(o) => o.save(w)?,
+            Op::Template(o) => o.save(w)?,
             _ => {}
         }
         for c in self.children() {
@@ -182,6 +184,7 @@ impl Node {
             Op::Distinct(o) => o.load(r)?,
             Op::Group(o) => o.load(r)?,
             Op::Recompute(o) => o.load(r)?,
+            Op::Template(o) => o.load(r)?,
             _ => {}
         }
         for c in self.children_mut() {
@@ -364,6 +367,12 @@ impl Arrangement {
             map: FxHashMap::default(),
             len: 0,
         }
+    }
+
+    /// Remove every row.
+    pub fn clear(&mut self) {
+        self.map.clear();
+        self.len = 0;
     }
 
     pub fn key_of(&self, r: &[Id]) -> Row {

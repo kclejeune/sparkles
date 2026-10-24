@@ -42,6 +42,9 @@ const COMPILER: &str = "f13-phase1-1";
 const BRANCH: &str = "main";
 /// The most rows a circuit's diff history keeps for resumed live queries.
 const HISTORY_ROWS: usize = 1_000_000;
+/// The commits of history a circuit with views and no live queries keeps, so that a
+/// query whose snapshot a pass overtook reads the view at its own commit.
+const VIEW_HISTORY_COMMITS: usize = 16;
 /// The upper bounds of the pass-time histogram, in seconds.
 pub const PASS_BUCKETS: [f64; 9] = [0.001, 0.005, 0.01, 0.05, 0.1, 0.5, 1.0, 5.0, 30.0];
 
@@ -98,10 +101,11 @@ pub trait Host: Send + Sync {
     fn epoch(&self) -> u64 {
         0
     }
-    /// Whether the dataset's queries read with RDFS on read, which views and live
-    /// queries refuse (spec F13 §4.5).
-    fn rdfs_on_read(&self) -> bool {
-        false
+    /// What makes the dataset's queries read more than the stored quads, which views
+    /// and live queries then refuse (spec F13 §4.5): RDFS on read, or materialized
+    /// inferences added to the default graph.
+    fn refusal(&self) -> Option<&'static str> {
+        None
     }
 }
 
@@ -156,6 +160,8 @@ struct Hist {
 struct Sub {
     shared: Weak<Shared>,
     budget: u64,
+    /// the commit of the subscriber's latest event, which its next diff starts from
+    last: u64,
 }
 
 /// A circuit's state, shared by its views and live queries.
@@ -196,14 +202,21 @@ impl Slot {
         }
     }
 
-    /// The whole result as a `reset` event.
-    pub(crate) fn reset_event(&self) -> LiveEvent {
+    /// The whole result as a `reset` event for the subscriber of `shared`, whose next
+    /// diff then starts from the circuit's commit.
+    pub(crate) fn resync(&mut self, shared: &Arc<Shared>) -> LiveEvent {
+        let applied = self.circuit.applied;
+        for s in &mut self.subs {
+            if std::ptr::eq(s.shared.as_ptr(), Arc::as_ptr(shared)) {
+                s.last = applied;
+            }
+        }
         self.event(true)
     }
 
     fn alive(&mut self) -> bool {
         self.subs.retain(|s| s.shared.strong_count() > 0);
-        if self.subs.is_empty() {
+        if self.subs.is_empty() && self.views == 0 {
             self.history.clear();
             self.history_rows = 0;
         }
@@ -211,9 +224,14 @@ impl Slot {
     }
 
     fn remember(&mut self, from: u64, to: u64, rows: Arc<[(Vec<Option<Term>>, i64)]>, max: usize) {
-        if self.subs.is_empty() {
-            return;
-        }
+        let max = if self.subs.is_empty() {
+            if self.views == 0 {
+                return;
+            }
+            VIEW_HISTORY_COMMITS
+        } else {
+            max
+        };
         if rows.is_empty()
             && let Some(last) = self.history.back_mut()
             && last.rows.is_empty()
@@ -280,6 +298,18 @@ pub(crate) struct Cell {
     key: u64,
     pub(crate) state: Mutex<Slot>,
     info: Mutex<Info>,
+    /// live queries joining the cell, which keep it from collection until they are
+    /// among its subscribers
+    pending: AtomicUsize,
+}
+
+/// A live query's claim on a cell until it subscribes.
+struct Joining<'a>(&'a Cell);
+
+impl Drop for Joining<'_> {
+    fn drop(&mut self) {
+        self.0.pending.fetch_sub(1, Ordering::AcqRel);
+    }
 }
 
 struct ViewEntry {
@@ -379,9 +409,12 @@ pub fn whole_reason(access: Option<&Arc<GraphAccess>>) -> Option<&'static str> {
         .map(|_| "protections that depend on the data")
 }
 
-/// A stable hash of what `access` lets a reader see: equal for equal grants.
+/// A stable hash of what `access` lets a reader see: equal for equal grants. Guards a
+/// request decides at its snapshot count as keeping their graphs out, as they do in a
+/// circuit ([`Circuit::new`]).
 pub fn access_fingerprint(access: Option<&Arc<GraphAccess>>) -> u64 {
-    match access {
+    let settled = access.map(|a| a.settled());
+    match settled.as_ref() {
         None => 0,
         Some(a) if a.reads_everything() => 0,
         Some(a) => {
@@ -643,6 +676,7 @@ impl Runtime {
                 views: 0,
             }),
             info: Mutex::new(info),
+            pending: AtomicUsize::new(0),
         });
         reg.cells.insert(key, cell.clone());
         Ok((cell, true))
@@ -656,6 +690,9 @@ impl Runtime {
         };
         if entry.cell.is_some() || entry.suspended.is_some() {
             return Ok(());
+        }
+        if let Some(why) = host.refusal() {
+            return Err(super::compile::not_incremental(why));
         }
         let def = entry.def.clone();
         let text = Self::view_text(host.as_ref(), &def)?;
@@ -732,8 +769,24 @@ impl Runtime {
             return;
         };
         let mut reg = self.reg.lock();
-        let epoch = host.epoch();
+        // the low bit says whether the dataset's queries now read more than the stored
+        // quads, which detaches every view and ends every live query
+        let refusal = host.refusal();
+        let epoch = host.epoch().wrapping_shl(1) | u64::from(refusal.is_some());
         if self.host_epoch.swap(epoch, Ordering::AcqRel) != epoch {
+            if let Some(why) = refusal {
+                for c in reg.cells.values() {
+                    let st = c.state.lock();
+                    for sub in &st.subs {
+                        if let Some(sh) = sub.shared.upgrade() {
+                            sh.push(LiveEvent::Error {
+                                code: "not-incremental".into(),
+                                message: format!("{why} cannot be used in a view or a live query"),
+                            });
+                        }
+                    }
+                }
+            }
             // grants may have changed: resolve every view's principal again
             for e in reg.views.values_mut() {
                 e.error = None;
@@ -974,12 +1027,17 @@ impl Runtime {
     /// subscribers.
     fn publish(&self, st: &mut Slot, from: u64, c: Changes, reset: bool) {
         st.subs.retain(|s| s.shared.strong_count() > 0);
+        let to = st.circuit.applied;
         if st.subs.is_empty() {
-            st.history.clear();
-            st.history_rows = 0;
+            if st.views == 0 || (reset && c.len() > self.opts.read().reset_rows) {
+                st.history.clear();
+                st.history_rows = 0;
+            } else {
+                let rows = st.circuit.decode_rows(&c).into();
+                st.remember(from, to, rows, VIEW_HISTORY_COMMITS);
+            }
             return;
         }
-        let to = st.circuit.applied;
         let max = self.opts.read().history_commits;
         let event = if st.circuit.kind == Kind::Ask {
             let delta: i64 = c.iter().map(|x| x.1).sum();
@@ -1005,9 +1063,17 @@ impl Runtime {
             }
             diff_event(from, to, rows.iter().cloned())
         };
-        for s in &st.subs {
+        for s in &mut st.subs {
             if let Some(sh) = s.shared.upgrade() {
-                sh.push(event.clone());
+                // a diff starts from the subscriber's latest event, which commits that
+                // left the result alone may have left behind
+                let mut e = event.clone();
+                match &mut e {
+                    LiveEvent::Diff { from, .. } | LiveEvent::Value { from, .. } => *from = s.last,
+                    _ => {}
+                }
+                s.last = to;
+                sh.push(e);
                 self.counters.live_events.fetch_add(1, Ordering::Relaxed);
             }
         }
@@ -1060,9 +1126,12 @@ impl Runtime {
     /// Drop the circuits nobody uses.
     fn gc(&self) {
         let mut reg = self.reg.lock();
-        reg.cells.retain(|_, c| match c.state.try_lock() {
-            Some(mut st) => st.alive(),
-            None => true,
+        reg.cells.retain(|_, c| {
+            c.pending.load(Ordering::Acquire) > 0
+                || match c.state.try_lock() {
+                    Some(mut st) => st.alive(),
+                    None => true,
+                }
         });
         if reg.cells.is_empty() {
             *self.subscription.lock() = None;
@@ -1250,8 +1319,8 @@ impl Runtime {
         }
         def.check()?;
         let host = self.host()?;
-        if host.rdfs_on_read() {
-            return Err(super::compile::not_incremental("RDFS on read"));
+        if let Some(why) = host.refusal() {
+            return Err(super::compile::not_incremental(why));
         }
         let text = Self::view_text(host.as_ref(), &def)?;
         let q = self.parse(host.as_ref(), &text)?;
@@ -1379,6 +1448,15 @@ impl Runtime {
     }
 
     /// View `name` with its state.
+    /// Whether a reader with `caller` may read view `name`'s rows and what they
+    /// disclose, such as their count.
+    pub fn readable_by(&self, name: &str, caller: Option<&Arc<GraphAccess>>) -> bool {
+        let reg = self.reg.lock();
+        reg.views
+            .get(name)
+            .is_some_and(|e| covers(caller, e.access.as_ref()))
+    }
+
     pub fn get(&self, store: &Store, name: &str) -> Result<ViewInfo> {
         let head = store.snapshot().commit;
         let reg = self.reg.lock();
@@ -1495,12 +1573,15 @@ impl Runtime {
                     }
                     Status::Ready => {
                         let st = cell.state.lock();
-                        if st.circuit.applied >= r.at || r.allow_stale {
+                        if st.circuit.applied == r.at || r.allow_stale {
                             return Ok(ViewRows {
                                 columns: st.circuit.columns(),
                                 rows: st.circuit.rows(),
                                 commit: st.circuit.applied,
                             });
+                        }
+                        if st.circuit.applied > r.at {
+                            return self.read_back(st, r);
                         }
                     }
                     Status::Building => {}
@@ -1519,6 +1600,57 @@ impl Runtime {
         }
     }
 
+    /// The rows of a view at `r.at` when its circuit has moved past it: the current
+    /// rows less the changes since, from the history, or else the view's query
+    /// evaluated at the query's snapshot.
+    fn read_back(
+        &self,
+        st: parking_lot::MutexGuard<'_, Slot>,
+        r: &ViewRead<'_>,
+    ) -> Result<ViewRows> {
+        let columns = st.circuit.columns();
+        if let Some(change) = st.history_since(r.at) {
+            let rows = net(st
+                .circuit
+                .rows()
+                .into_iter()
+                .chain(change.into_iter().map(|(t, w)| (t, -w))))
+            .into_iter()
+            .filter(|(_, w)| *w > 0)
+            .collect();
+            return Ok(ViewRows {
+                columns,
+                rows,
+                commit: r.at,
+            });
+        }
+        let ahead = || {
+            super::error(
+                "view-ahead",
+                format!(
+                    "the view {:?} has moved past commit {} and cannot read it again; retry, or read it with view:allowStale true",
+                    r.name, r.at
+                ),
+            )
+        };
+        let Some(snap) = r.snap.filter(|s| s.commit == r.at) else {
+            return Err(ahead());
+        };
+        let compiled = compile(&st.query, st.whole.as_deref())?;
+        let mut c = Circuit::new(compiled, st.circuit.access.clone());
+        drop(st);
+        let control = Control {
+            deadline: r.deadline.or(self.control().deadline),
+            ..Control::none()
+        };
+        c.build(snap.clone(), &control)?;
+        Ok(ViewRows {
+            columns,
+            rows: c.rows(),
+            commit: r.at,
+        })
+    }
+
     // ----- live queries -----
 
     /// Subscribe to `query` read with `access` (spec F13 §2.3). The first event is
@@ -1535,8 +1667,8 @@ impl Runtime {
             .read()
             .clone()
             .unwrap_or_else(|| Arc::new(OpenHost));
-        if host.rdfs_on_read() {
-            return Err(super::compile::not_incremental("RDFS on read"));
+        if let Some(why) = host.refusal() {
+            return Err(super::compile::not_incremental(why));
         }
         let q = self.parse(host.as_ref(), query)?;
         if matches!(q, Query::Describe { .. }) {
@@ -1580,11 +1712,14 @@ impl Runtime {
             if self.is_closed() {
                 return Err(super::error("views-unavailable", "the dataset is closing"));
             }
-            self.cell_for(&mut reg, q, query, access, Some(budget))?
+            let (cell, new) = self.cell_for(&mut reg, q, query, access, Some(budget))?;
+            cell.pending.fetch_add(1, Ordering::AcqRel);
+            (cell, new)
         };
+        let joining = Joining(&cell);
         self.ensure_subscription(store);
         let shared = Arc::new(Shared::default());
-        let first = {
+        {
             let mut st = cell.state.lock();
             let status = cell.info.lock().status.clone();
             if status != Status::Ready {
@@ -1599,21 +1734,26 @@ impl Runtime {
                 };
                 if let Err(e) = r {
                     drop(st);
+                    drop(joining);
                     self.gc();
                     return Err(e);
                 }
                 cell.info.lock().status = Status::Ready;
                 self.note_pass(&cell, &st, t0.elapsed(), false);
                 // other subscribers see the new result as a reset
-                for s in &st.subs {
+                let applied = st.circuit.applied;
+                let reset = st.event(true);
+                for s in &mut st.subs {
                     if let Some(sh) = s.shared.upgrade() {
-                        sh.push(st.event(true));
+                        s.last = applied;
+                        sh.push(reset.clone());
                     }
                 }
             }
             if st.circuit.bytes() > budget {
                 let bytes = st.circuit.bytes();
                 drop(st);
+                drop(joining);
                 self.gc();
                 return Err(super::error(
                     "over-budget",
@@ -1626,15 +1766,19 @@ impl Runtime {
                 None => Some(st.event(false)),
                 Some(after) => self.resume(store, &st, after),
             };
+            // queued before a pass can see the subscriber, so that no later diff
+            // overtakes it
+            if let Some(e) = first {
+                shared.push(e);
+            }
+            let last = st.circuit.applied;
             st.subs.push(Sub {
                 shared: Arc::downgrade(&shared),
                 budget,
+                last,
             });
-            first
-        };
-        if let Some(e) = first {
-            shared.push(e);
         }
+        drop(joining);
         let (kind, vars) = {
             let st = cell.state.lock();
             (st.circuit.kind, st.vars.clone())
