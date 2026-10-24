@@ -5080,7 +5080,12 @@ async fn cancel_task(
     let allowed = if t.dataset.is_empty() {
         p.has(crate::auth::ServerPerm::ServerAdmin)
     } else {
+        // a projection may be cancelled by anyone who could have started it: `read` on
+        // the whole dataset
         p.can(&t.dataset, Level::Admin)
+            || (t.kind == crate::projection::TASK
+                && p.can(&t.dataset, Level::Read)
+                && !p.restricted(&t.dataset))
     };
     if !allowed {
         let msg = if t.dataset.is_empty() {

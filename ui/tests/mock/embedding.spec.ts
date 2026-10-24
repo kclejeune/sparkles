@@ -108,6 +108,45 @@ test('A7. A lasso selects the points it holds, and Use in query writes them as a
   for (const iri of want) expect(text).not.toContain(iri);
 });
 
+test('In a sampled view a lasso selects the whole region, and a late answer cannot undo a newer selection', async ({
+  page,
+}) => {
+  // the map draws 20 of foaf's 57 entities, and region answers come late
+  await page.route('**/$/vector/foaf/embedding/projection*', async (r) => {
+    const u = new URL(r.request().url());
+    if (r.request().method() !== 'GET') return r.continue();
+    if (u.searchParams.has('bbox')) {
+      await new Promise((ok) => setTimeout(ok, 1500));
+      return r.continue();
+    }
+    u.searchParams.set('limit', '20');
+    return r.continue({ url: u.toString() });
+  });
+  await openMap(page, 'foaf', 'embedding');
+  await expect(page.locator('.emap')).toHaveAttribute('data-points', '20');
+  await expect(page.getByTestId('facts')).toContainText('showing 20 of 57');
+  const drag = async () => {
+    const b = (await page.locator('.emap').boundingBox())!;
+    await page.mouse.move(b.x + 2, b.y + 2);
+    await page.mouse.down();
+    await page.mouse.move(b.x + b.width - 2, b.y + b.height - 2, { steps: 4 });
+    await page.mouse.up();
+  };
+  await page.getByRole('radio', { name: 'Box' }).click();
+  await drag();
+  const bar = page.getByRole('region', { name: 'Selection' });
+  // the drawn points at once, then every entity of the region
+  await expect(bar).toContainText('20 selected by the embedding map');
+  await expect(bar).toContainText('57 selected by the embedding map');
+  // a selection cleared while the region's answer is on its way stays cleared
+  await drag();
+  await expect(bar).toContainText('20 selected by the embedding map');
+  await bar.getByRole('button', { name: 'Clear' }).click();
+  await expect(bar).toHaveCount(0);
+  await page.waitForTimeout(2000);
+  await expect(bar).toHaveCount(0);
+});
+
 test('Open as graph draws the selected entities in Explore', async ({ page }) => {
   await openMap(page, 'foaf', 'embedding');
   const box = (await page.locator('.emap').boundingBox())!;

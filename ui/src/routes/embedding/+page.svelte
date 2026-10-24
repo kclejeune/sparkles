@@ -20,6 +20,7 @@
     boxed,
     NONE,
     numericBuckets,
+    positions,
     VALUES_CAP,
     valuesQuery,
     type Category,
@@ -238,12 +239,19 @@
     untrack(() => {
       task = null;
       clearTimeout(polling);
+      // positions of another index or layout mean nothing here
+      selectedAt.clear();
+      selectRun++;
       syncUrl();
       void load();
     });
   });
 
+  /** Aborted when the page goes. */
+  const pageAbort = new AbortController();
+
   onMount(() => () => {
+    pageAbort.abort();
     ctl?.abort();
     clearTimeout(polling);
     clearTimeout(hoverTimer);
@@ -331,11 +339,27 @@
   type Shape = { kind: 'lasso'; poly: Pt[] } | { kind: 'box'; a: Pt; b: Pt };
 
   /**
+   * The positions of the entities the map selected, kept apart from the drawn points, so
+   * that the order of Use in query sees entities fetched for a sampled region, or left
+   * out of the points drawn after a pan.
+   */
+  const selectedAt = new Map<string, Pt>();
+  /** Counts the map's selections, so that a region's late answer cannot overwrite a newer one. */
+  let selectRun = 0;
+
+  /**
    * Change the shared selection. A selection above its cap keeps the entities nearest the
    * centre of what was drawn, so the selection keeps its core.
    */
   function applySelection(keys: string[], how: 'set' | 'add' | 'remove', from: Points) {
-    const list = keys.length > SELECTION_CAP ? byDistance(keys, from).ordered : keys;
+    const at = positions(from);
+    if (how === 'set') selectedAt.clear();
+    for (const k of keys) {
+      const p = at.get(k);
+      if (how === 'remove') selectedAt.delete(k);
+      else if (p) selectedAt.set(k, p);
+    }
+    const list = keys.length > SELECTION_CAP ? byDistance(keys, at).ordered : keys;
     if (how === 'add') selection.add(list, SOURCE);
     else if (how === 'remove') selection.remove(list);
     else selection.set(list, SOURCE, { keepEmpty: true });
@@ -343,17 +367,21 @@
 
   /**
    * Select the points of a lasso or a box. In a sampled view the drawn points are only a
-   * part of the region, so the shape's region is fetched in full and selected again.
+   * part of the region, so the shape's region is fetched in full and selected again,
+   * unless the selection, the index or the page changed meanwhile.
    */
   async function onselect(found: number[], how: 'set' | 'add' | 'remove', shape: Shape) {
     const p = proj;
     if (!p) return;
+    const run = ++selectRun;
     applySelection(
       found.map((i) => keyOf(p.points.entities[i])),
       how,
       p.points,
     );
     if (!p.head.region.sampled || !ds || !indexName) return;
+    const mine = selection.ids;
+    const context = `${ds}\n${indexName}\n${method}`;
     const pts = shape.kind === 'lasso' ? shape.poly : [shape.a, shape.b];
     const bbox: [number, number, number, number] = [
       Math.min(...pts.map((q) => q.x)),
@@ -362,7 +390,18 @@
       Math.max(...pts.map((q) => q.y)),
     ];
     try {
-      const full = await api.vectorProjection(ds, indexName, { method, bbox, limit: LIMIT });
+      const full = await api.vectorProjection(ds, indexName, {
+        method,
+        bbox,
+        limit: LIMIT,
+        signal: pageAbort.signal,
+      });
+      if (
+        run !== selectRun ||
+        selection.ids !== mine ||
+        context !== `${ds}\n${indexName}\n${method}`
+      )
+        return;
       const inside =
         shape.kind === 'lasso'
           ? lassoed(full.points, shape.poly)
@@ -376,13 +415,17 @@
           'Zoom in to select every entity of a dense region.',
         );
     } catch (e) {
+      if (pageAbort.signal.aborted || run !== selectRun) return;
       toasts.error('Could not select the whole region', e);
     }
   }
 
   function useSelection(ids: string[]) {
     if (!proj) return;
-    const { ordered } = byDistance(ids, proj.points);
+    // the positions the map selected, then those of the points drawn now
+    const at = positions(proj.points);
+    for (const [k, p] of selectedAt) at.set(k, p);
+    const { ordered } = byDistance(ids, at);
     const kept = ordered.slice(0, VALUES_CAP);
     if (ordered.length > VALUES_CAP)
       toasts.push(

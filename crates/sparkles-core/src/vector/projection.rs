@@ -44,8 +44,49 @@ pub const NO_CLASS: u32 = u32::MAX;
 /// Bytes a projection keeps per entity: subject, position, class and priority.
 pub const BYTES_PER_POINT: u64 = 24;
 
+/// An upper bound of the bytes a projection's computation holds at once: the rows and
+/// their projections, the sample the PCA learns from, the points, and for the neighbour
+/// layout its edges and adjacency. `rows` counts every vector, `inserted` those read from
+/// the snapshot's delta rather than the index file, and `links` the bottom-layer links of
+/// a graph node.
+pub fn working_bytes(
+    rows: usize,
+    inserted: usize,
+    dim: usize,
+    sample: usize,
+    method: ProjectionMethod,
+    links: usize,
+) -> u64 {
+    let rows = rows as u64;
+    let dim = dim as u64;
+    // a row, its projection, its order, its point and its place among the base rows
+    let per_row = 32 + 16 + 8 + 4 + 8;
+    // a point's subject, sums, position, priority and class
+    let per_point = 8 + 24 + 8 + 4 + 4;
+    let mut bytes = rows * (per_row + per_point)
+        + inserted as u64 * dim * 4
+        + (sample as u64).min(rows) * dim * 8;
+    if method == ProjectionMethod::Neighbours {
+        // an edge kept, both directions of the adjacency, and the layout's positions
+        bytes += rows * (links as u64 * (8 + 8) + 32);
+    }
+    bytes
+}
+
 /// The bottom-layer neighbours of a graph node, written to the vector given.
 pub type Links<'a> = &'a (dyn Fn(u32, &mut Vec<u32>) + Sync);
+
+/// The neighbour graph of an index for the neighbour layout: its frozen nodes, each the
+/// first base row of a (subject, vector) pair, and the live nodes inserted since the
+/// build, each known by its (subject, object) pair.
+pub struct Neighbours<'a> {
+    /// the bottom-layer links of any node, frozen or live, as searches read them
+    pub links: Links<'a>,
+    /// the first base row of each frozen node; nodes past its end are live
+    pub node_rows: &'a [u32],
+    /// the (subject, object) pair of each live node, in node order after the frozen ones
+    pub live_keys: &'a [(u64, u64)],
+}
 
 const RDF_TYPE: &str = "http://www.w3.org/1999/02/22-rdf-syntax-ns#type";
 
@@ -203,9 +244,9 @@ struct Row<'a> {
 }
 
 /// Compute the projection of `seg` (the base rows of index `name` over predicate `pred`)
-/// and the vectors that `snap` inserted, minus those it deleted. `graph_links` gives the
-/// bottom-layer neighbours of each graph node and `node_rows` the first row of each node,
-/// for the neighbour layout. `check` is called now and then, and its error stops the work;
+/// and the vectors that `snap` inserted, minus those it deleted. `neighbours` is the
+/// index's graph, for the neighbour layout. A live node counts only when `snap`'s delta
+/// holds its pair, as a search would see it. `check` is called now and then, and its error stops the work;
 /// `progress` hears the share done.
 #[allow(clippy::too_many_arguments)]
 pub fn project(
@@ -215,8 +256,7 @@ pub fn project(
     seg: &Segment,
     metric: Metric,
     cfg: &ProjectionConfig,
-    neighbours: Option<Links<'_>>,
-    node_rows: &[u32],
+    neighbours: Option<&Neighbours<'_>>,
     check: &(dyn Fn() -> Result<()> + Sync),
     progress: &(dyn Fn(f64) + Sync),
 ) -> Result<Projection> {
@@ -245,7 +285,7 @@ pub fn project(
         }
     }
     let mut based: Vec<usize> = Vec::new();
-    if !node_rows.is_empty() {
+    if neighbours.is_some() {
         // the row index of each base row kept, for the graph's nodes
         based = vec![usize::MAX; seg.rows()];
         let mut k = 0;
@@ -256,10 +296,15 @@ pub fn project(
             }
         }
     }
+    // the row of each inserted pair, for the graph's live nodes
+    let mut inserted: rustc_hash::FxHashMap<(u64, u64), usize> = Default::default();
     for k in snap.delta.ins[pi].range(lo..=hi) {
         if let Some(v) = snap.key(Id(k[2])).and_then(|key| from_key(&key))
             && v.len() == dim
         {
+            if neighbours.is_some() {
+                inserted.insert((k[1], k[2]), rows.len());
+            }
             rows.push(Row {
                 s: k[1],
                 v: std::borrow::Cow::Owned(v),
@@ -354,36 +399,12 @@ pub fn project(
         .collect();
     progress(0.4);
     if cfg.method == ProjectionMethod::Neighbours {
-        let links = neighbours.ok_or_else(|| {
+        let g = neighbours.ok_or_else(|| {
             Error::invalid(format!(
                 "vector index {name} has no neighbour graph ready: the neighbour layout needs its HNSW graph"
             ))
         })?;
-        // the entity edges of the graph's bottom layer
-        let mut edges: Vec<(u32, u32)> = Vec::new();
-        let mut out = Vec::new();
-        for (x, &row) in node_rows.iter().enumerate() {
-            let Some(&a) = based.get(row as usize).filter(|&&k| k != usize::MAX) else {
-                continue;
-            };
-            out.clear();
-            links(x as u32, &mut out);
-            for &y in &out {
-                let Some(&b) = node_rows
-                    .get(y as usize)
-                    .and_then(|&r| based.get(r as usize))
-                    .filter(|&&k| k != usize::MAX)
-                else {
-                    continue;
-                };
-                let (pa, pb) = (point_of_row[a], point_of_row[b]);
-                if pa != pb {
-                    edges.push((pa.min(pb), pa.max(pb)));
-                }
-            }
-        }
-        edges.sort_unstable();
-        edges.dedup();
+        let edges = layout_edges(g, &based, &inserted, &point_of_row);
         layout(&mut xy, &edges, cfg, check, progress)?;
     }
     progress(0.9);
@@ -410,6 +431,52 @@ pub fn project(
         explained,
         built_ms: started.elapsed().as_secs_f64() * 1e3,
     })
+}
+
+/// The entity edges of the graph's bottom layer, sorted and without repeats. A frozen
+/// node stands for its first base row when `based` kept it, and a live node for the row of
+/// its pair in `inserted`, so nodes outside the snapshot drop out with their links.
+fn layout_edges(
+    g: &Neighbours<'_>,
+    based: &[usize],
+    inserted: &rustc_hash::FxHashMap<(u64, u64), usize>,
+    point_of_row: &[u32],
+) -> Vec<(u32, u32)> {
+    let frozen = g.node_rows.len();
+    let row_of = |x: u32| -> Option<usize> {
+        let x = x as usize;
+        if x < frozen {
+            based
+                .get(g.node_rows[x] as usize)
+                .copied()
+                .filter(|&k| k != usize::MAX)
+        } else {
+            g.live_keys
+                .get(x - frozen)
+                .and_then(|key| inserted.get(key).copied())
+        }
+    };
+    let mut edges: Vec<(u32, u32)> = Vec::new();
+    let mut out = Vec::new();
+    for x in 0..(frozen + g.live_keys.len()) as u32 {
+        let Some(a) = row_of(x) else {
+            continue;
+        };
+        out.clear();
+        (g.links)(x, &mut out);
+        for &y in &out {
+            let Some(b) = row_of(y) else {
+                continue;
+            };
+            let (pa, pb) = (point_of_row[a], point_of_row[b]);
+            if pa != pb {
+                edges.push((pa.min(pb), pa.max(pb)));
+            }
+        }
+    }
+    edges.sort_unstable();
+    edges.dedup();
+    edges
 }
 
 fn bounds_of(xy: &[[f32; 2]]) -> [f32; 4] {
@@ -761,6 +828,28 @@ mod tests {
 
     fn none() -> Result<()> {
         Ok(())
+    }
+
+    /// The layout's edges join live nodes to the rows of their pairs in the snapshot, and
+    /// leave out nodes whose rows the snapshot lacks: a deleted base row, or a live node
+    /// inserted after the snapshot.
+    #[test]
+    fn layout_edges_include_live_nodes_of_the_snapshot() {
+        // frozen nodes 0 and 1 are base rows 0 and 1, and base row 1 was deleted; live
+        // nodes 2 and 3 are pairs (7, 70) and (8, 80), and only (7, 70) is in the snapshot
+        let links: [&[u32]; 4] = [&[1, 2], &[0, 3], &[0, 3], &[1, 2]];
+        let f = |x: u32, out: &mut Vec<u32>| out.extend_from_slice(links[x as usize]);
+        let g = Neighbours {
+            links: &f,
+            node_rows: &[0, 1],
+            live_keys: &[(7, 70), (8, 80)],
+        };
+        let based = vec![0, usize::MAX];
+        let mut inserted = rustc_hash::FxHashMap::default();
+        inserted.insert((7, 70), 1);
+        // rows 0 and 1 are points 0 and 1
+        let edges = layout_edges(&g, &based, &inserted, &[0, 1]);
+        assert_eq!(edges, vec![(0, 1)]);
     }
 
     #[test]

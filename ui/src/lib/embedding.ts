@@ -178,37 +178,46 @@ export function boxed(points: Points, a: Pt, b: Pt): number[] {
   return out;
 }
 
+/** The position of each entity of `points`, by term key. */
+export function positions(points: Points, into = new Map<string, Pt>()): Map<string, Pt> {
+  points.entities.forEach((e, i) => into.set(keyOf(e), { x: points.x[i], y: points.y[i] }));
+  return into;
+}
+
 /**
  * The selected entities (term keys) in the order a VALUES block takes them: by distance
  * from the selection's centre, nearest first, so that a selection above the cap keeps its
- * core. Entities without a point keep their order after those with one.
+ * core. `at` gives the positions known, as points or by key. Entities without a position
+ * keep their order after those with one.
  */
 export function byDistance(
   selected: readonly string[],
-  points: Points,
+  at: Points | ReadonlyMap<string, Pt>,
 ): { ordered: string[]; centre: Pt | null } {
-  const at = new Map<string, number>();
-  points.entities.forEach((e, i) => at.set(keyOf(e), i));
-  const placed = selected.filter((k) => at.has(k));
+  const where = at instanceof Map ? at : positions(at as Points);
+  const placed = selected.filter((k) => where.has(k));
   if (!placed.length) return { ordered: [...selected], centre: null };
   let cx = 0;
   let cy = 0;
   for (const k of placed) {
-    const i = at.get(k)!;
-    cx += points.x[i];
-    cy += points.y[i];
+    const p = where.get(k)!;
+    cx += p.x;
+    cy += p.y;
   }
   cx /= placed.length;
   cy /= placed.length;
   const dist = new Map<string, number>();
   for (const k of placed) {
-    const i = at.get(k)!;
-    dist.set(k, (points.x[i] - cx) ** 2 + (points.y[i] - cy) ** 2);
+    const p = where.get(k)!;
+    dist.set(k, (p.x - cx) ** 2 + (p.y - cy) ** 2);
   }
   const ordered = [...placed].sort(
     (a, b) => dist.get(a)! - dist.get(b)! || (a < b ? -1 : a > b ? 1 : 0),
   );
-  return { ordered: [...ordered, ...selected.filter((k) => !at.has(k))], centre: { x: cx, y: cy } };
+  return {
+    ordered: [...ordered, ...selected.filter((k) => !where.has(k))],
+    centre: { x: cx, y: cy },
+  };
 }
 
 export type Category = { key: string; label: string; count: number; colour: number };

@@ -55,10 +55,26 @@ struct Key {
     method: ProjectionMethod,
 }
 
+/// A kept projection with the pool grant that pays for it. Readers hold the `Arc`, so the
+/// grant goes back to the pool only once the last reader is done.
+pub(crate) struct Held {
+    projection: Projection,
+    /// the index's predicate, dimension and metric when the projection was built: an
+    /// index replaced under the same name no longer matches
+    fingerprint: String,
+    _grant: Option<sparkles::sparql::pool::PoolGrant>,
+}
+
+impl std::ops::Deref for Held {
+    type Target = Projection;
+    fn deref(&self) -> &Projection {
+        &self.projection
+    }
+}
+
 struct Kept {
     key: Key,
-    projection: Arc<Projection>,
-    _grant: Option<sparkles::sparql::pool::PoolGrant>,
+    projection: Arc<Held>,
     used: Instant,
 }
 
@@ -88,7 +104,8 @@ pub fn metrics(st: &crate::state::AppState, out: &mut String) {
 
 fn key_of(ds: &crate::state::Dataset, index: &str, method: ProjectionMethod) -> Key {
     Key {
-        dataset: ds.store.dataset_id(),
+        // a branch store's own id is its branch's
+        dataset: ds.store.owner_dataset_id(),
         branch: ds.store.branch_id(),
         name: ds.name.clone(),
         index: index.to_string(),
@@ -96,22 +113,103 @@ fn key_of(ds: &crate::state::Dataset, index: &str, method: ProjectionMethod) -> 
     }
 }
 
-/// Drop the kept projections of datasets that are gone or were replaced.
+/// Drop the kept projections of datasets that are gone or were replaced. A branch's
+/// projection stays: a deleted branch's ages out with the least recently used.
 fn sweep(st: &crate::state::AppState, kept: &mut Vec<Kept>) {
     kept.retain(|e| {
-        st.datasets().get(&e.key.name).is_some_and(|d| {
-            d.store.dataset_id() == e.key.dataset && d.store.branch_id() == e.key.branch
-        })
+        st.datasets()
+            .get(&e.key.name)
+            .is_some_and(|d| d.store.owner_dataset_id() == e.key.dataset)
     });
 }
 
+/// The identity of index `name`'s configuration that a projection depends on, or `None`
+/// when the index is gone.
+fn fingerprint(ds: &crate::state::Dataset, name: &str) -> Option<String> {
+    let s = ds.dataset.indexes().vector().get(name)?;
+    Some(format!("{}|{}|{:?}", s.predicate, s.dimension, s.metric))
+}
+
+fn refused(bytes: u64) -> crate::http::ApiError {
+    err(
+        StatusCode::INSUFFICIENT_STORAGE,
+        format!(
+            "the query memory pool cannot hold the {bytes} bytes the projection's computation needs now; try again when fewer queries run"
+        ),
+    )
+}
+
+/// Gives back a charge on the request's grant when dropped, also on an error.
+struct Release(Option<Arc<sparkles::sparql::pool::PoolGrant>>, u64);
+
+impl Drop for Release {
+    fn drop(&mut self) {
+        if let Some(g) = &self.0 {
+            g.release(self.1);
+        }
+    }
+}
+
+/// A grant of the query memory pool that covers `bytes` in full, or `507`. `None` when
+/// the server has no pool. The pool clamps an initial grant to its capacity, so the bytes
+/// are charged as well, which refuses what the pool cannot hold.
+fn reserve(
+    st: &crate::state::AppState,
+    bytes: u64,
+    what: &str,
+) -> ApiResult<Option<sparkles::sparql::pool::PoolGrant>> {
+    let Some(pool) = st.catalog.pool() else {
+        return Ok(None);
+    };
+    let refuse = || {
+        err(
+            StatusCode::INSUFFICIENT_STORAGE,
+            format!(
+                "the query memory pool cannot hold the {bytes} bytes {what} needs now; try again when fewer queries run"
+            ),
+        )
+    };
+    let grant = pool.try_grant(bytes).ok_or_else(refuse)?;
+    grant.charge(bytes).map_err(|_| refuse())?;
+    Ok(Some(grant))
+}
+
 /// Keep `p` under `key`, replacing the one there and dropping the least recently used
-/// ones past the limits.
-fn keep(st: &crate::state::AppState, key: Key, p: Arc<Projection>) -> ApiResult<()> {
+/// ones past the limits. `grant` covers the computation's working memory, and keeping
+/// gives back all of it but the projection's own bytes.
+fn keep(
+    st: &crate::state::AppState,
+    key: Key,
+    fingerprint: String,
+    p: Projection,
+    grant: Option<sparkles::sparql::pool::PoolGrant>,
+) -> ApiResult<Arc<Held>> {
     let bytes = p.bytes();
     if bytes > KEEP_BYTES {
         return Err(too_big(bytes));
     }
+    let grant = match grant {
+        Some(g) if g.used() >= bytes => {
+            g.release(g.used() - bytes);
+            Some(g)
+        }
+        // the estimate fell short: charge the rest, or refuse
+        Some(g) => {
+            g.charge(bytes - g.used()).map_err(|_| {
+                err(
+                    StatusCode::INSUFFICIENT_STORAGE,
+                    format!("the query memory pool cannot hold the projection's {bytes} bytes now"),
+                )
+            })?;
+            Some(g)
+        }
+        None => reserve(st, bytes, "the projection")?,
+    };
+    let held = Arc::new(Held {
+        projection: p,
+        fingerprint,
+        _grant: grant,
+    });
     let mut kept = st.projections.0.lock();
     sweep(st, &mut kept);
     kept.retain(|e| e.key != key);
@@ -128,24 +226,12 @@ fn keep(st: &crate::state::AppState, key: Key, p: Arc<Projection>) -> ApiResult<
         };
         kept.remove(oldest);
     }
-    let grant = match st.catalog.pool() {
-        None => None,
-        Some(pool) => Some(pool.try_grant(bytes).ok_or_else(|| {
-            err(
-                StatusCode::INSUFFICIENT_STORAGE,
-                format!(
-                    "the query memory pool cannot hold the projection's {bytes} bytes now; try again when fewer queries run"
-                ),
-            )
-        })?),
-    };
     kept.push(Kept {
         key,
-        projection: p,
-        _grant: grant,
+        projection: held.clone(),
         used: Instant::now(),
     });
-    Ok(())
+    Ok(held)
 }
 
 fn too_big(bytes: u64) -> crate::http::ApiError {
@@ -158,23 +244,25 @@ fn too_big(bytes: u64) -> crate::http::ApiError {
 }
 
 /// The kept projection of `key`'s index: of `method`, or the most recent of any method.
+/// A projection of an index since replaced or dropped is forgotten.
 fn find(
     st: &crate::state::AppState,
     ds: &crate::state::Dataset,
     index: &str,
     method: Option<ProjectionMethod>,
-) -> Option<Arc<Projection>> {
+) -> Option<Arc<Held>> {
+    let current = fingerprint(ds, index);
     let mut kept = st.projections.0.lock();
     sweep(st, &mut kept);
-    let want = |k: &Key| {
-        k.dataset == ds.store.dataset_id()
+    let mine = |k: &Key| {
+        k.dataset == ds.store.owner_dataset_id()
             && k.branch == ds.store.branch_id()
             && k.index == index
-            && method.is_none_or(|m| k.method == m)
     };
+    kept.retain(|e| !mine(&e.key) || current.as_deref() == Some(&e.projection.fingerprint));
     let e = kept
         .iter_mut()
-        .filter(|e| want(&e.key))
+        .filter(|e| mine(&e.key) && method.is_none_or(|m| e.key.method == m))
         .max_by_key(|e| e.used)?;
     e.used = Instant::now();
     Some(e.projection.clone())
@@ -202,14 +290,16 @@ fn method_param(p: &[(String, String)]) -> ApiResult<Option<ProjectionMethod>> {
     }
 }
 
-fn unknown_index(st: &crate::state::Dataset, name: &str) -> ApiResult<usize> {
-    let s = st
-        .dataset
+/// The index's status, or `404`.
+fn index_status(
+    st: &crate::state::Dataset,
+    name: &str,
+) -> ApiResult<sparkles::vector::config::VectorIndexStatus> {
+    st.dataset
         .indexes()
         .vector()
         .get(name)
-        .ok_or_else(|| err(StatusCode::NOT_FOUND, format!("no vector index {name}")))?;
-    Ok(s.rows as usize)
+        .ok_or_else(|| err(StatusCode::NOT_FOUND, format!("no vector index {name}")))
 }
 
 /// `POST /$/vector/{ds}/{name}/projection?method=pca|neighbours&timeout=`: compute the
@@ -265,13 +355,39 @@ pub async fn compute(
             }
         }
     }
-    let rows = unknown_index(&ds, &name)?;
+    let status = index_status(&ds, &name)?;
+    let print = format!(
+        "{}|{}|{:?}",
+        status.predicate, status.dimension, status.metric
+    );
+    // the base rows and the rows inserted since, which the projection reads as well
+    let rows = (status.rows + status.overlay.inserts) as usize;
     let estimate = rows as u64 * sparkles::vector::projection::BYTES_PER_POINT;
     if estimate > KEEP_BYTES {
         return Err(too_big(estimate));
     }
+    // the working memory is charged before the work starts, and kept for the projection
+    let links = status.hnsw.as_ref().map_or(0, |h| 2 * h.m);
+    let working = sparkles::vector::projection::working_bytes(
+        rows,
+        status.overlay.inserts as usize,
+        status.dimension,
+        cfg.sample,
+        method,
+        links,
+    );
     let key = key_of(&ds, &name, method);
     if method == ProjectionMethod::Pca && rows <= IN_REQUEST {
+        // in the request, its admission grant pays for the computation; the kept
+        // projection then takes a grant of its own, which outlives the request
+        let (request, grant) = match crate::server_memory::current_grant() {
+            Some(g) => {
+                g.charge(working).map_err(|_| refused(working))?;
+                (Some(g), None)
+            }
+            None => (None, reserve(&st, working, "the projection's computation")?),
+        };
+        let release = Release(request, working);
         let params = crate::http::Params::from_query(&uri);
         let timeout = crate::http::timeout_param(&st, &params);
         let (cancel, _guard) = crate::http::cancel_on_drop();
@@ -291,11 +407,13 @@ pub async fn compute(
         })
         .await
         .map_err(|e| crate::http::with_timeout(e, Some(timeout)))?;
-        let p = Arc::new(p);
-        keep(&st2, key, p.clone())?;
-        return Ok(Json(summary(&p, &ds)).into_response());
+        drop(release);
+        let held = keep(&st2, key, print, p, grant)?;
+        return Ok(Json(summary(&held, &ds)).into_response());
     }
     crate::http::task_start_check(&st, Some(TASK), &ds_name)?;
+    // a task outlives the request, so it holds a grant of its own
+    let grant = reserve(&st, working, "the projection's computation")?;
     let st2 = st.clone();
     let ds2 = ds.clone();
     let task = st.start_task_opts(st.next_task_id(), TASK, &ds_name, None, true, move |h| {
@@ -308,14 +426,13 @@ pub async fn compute(
             progress,
             deadline: None,
         };
-        let p = Arc::new(
-            ds2.dataset
-                .indexes()
-                .vector()
-                .projection(&name, &cfg, &ctl)?,
-        );
+        let p = ds2
+            .dataset
+            .indexes()
+            .vector()
+            .projection(&name, &cfg, &ctl)?;
         let n = p.len();
-        keep(&st2, key, p).map_err(|e| anyhow::anyhow!("{}", e.message()))?;
+        keep(&st2, key, print, p, grant).map_err(|e| anyhow::anyhow!("{}", e.message()))?;
         Ok(format!(
             "vector index {name}: {} projection of {n} entities",
             method.name()
@@ -455,7 +572,7 @@ pub async fn answer(
     let ds = dataset(&st, &ds_name)?;
     let p = params(&uri);
     let method = method_param(&p)?;
-    unknown_index(&ds, &name)?;
+    index_status(&ds, &name)?;
     let bbox = param(&p, "bbox").map(parse_bbox).transpose()?;
     let limit = match param(&p, "limit") {
         None => MAX_POINTS,

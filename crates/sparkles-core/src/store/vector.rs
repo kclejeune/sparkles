@@ -309,20 +309,27 @@ impl Store {
                 Error::NotFound(format!("no vector index {name}"))
             }
         })?;
-        let Some(pred) = b.pred else {
+        // an index built before its predicate had a vector names it from the snapshot
+        let Some(pred) = crate::vector::live::pred_in(&b, &snap) else {
             return Err(Error::invalid(format!(
                 "vector index {name} has no vectors to project"
             )));
         };
         let graph = b.graph.clone();
-        let links = graph.as_ref().map(|g| {
-            let g = g.clone();
-            move |x: u32, out: &mut Vec<u32>| g.links(0, x, out)
-        });
-        let links_ref: Option<crate::vector::projection::Links<'_>> = links
-            .as_ref()
-            .map(|f| f as &(dyn Fn(u32, &mut Vec<u32>) + Sync));
-        let node_rows: &[u32] = if graph.is_some() { &b.node_rows } else { &[] };
+        // the live layer's bottom layer, copied so the layout holds no lock
+        let layer = graph.as_ref().map(|_| b.live.read().layer0());
+        let links = match (graph.as_ref(), layer.as_ref()) {
+            (Some(g), Some(l)) => Some(move |x: u32, out: &mut Vec<u32>| l.links(g, x, out)),
+            _ => None,
+        };
+        let neighbours = match (&links, &layer) {
+            (Some(f), Some(l)) => Some(crate::vector::projection::Neighbours {
+                links: f as &(dyn Fn(u32, &mut Vec<u32>) + Sync),
+                node_rows: &b.node_rows,
+                live_keys: &l.keys,
+            }),
+            _ => None,
+        };
         crate::vector::projection::project(
             &snap,
             name,
@@ -330,8 +337,7 @@ impl Store {
             &b.segment,
             b.config.metric,
             cfg,
-            links_ref,
-            node_rows,
+            neighbours.as_ref(),
             check,
             progress,
         )

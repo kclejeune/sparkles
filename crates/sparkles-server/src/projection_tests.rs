@@ -74,16 +74,20 @@ struct Server {
 }
 
 async fn server(per: usize) -> Server {
+    server_with(per, DbType::Mem, None).await
+}
+
+async fn server_with(per: usize, kind: DbType, pool: Option<u64>) -> Server {
     let dir = tempfile::tempdir().unwrap();
     let state = AppState::with_memory(
         dir.path(),
         StoreOptions::default(),
         Duration::from_secs(30),
-        None,
+        pool,
     )
     .unwrap();
     let state = Arc::new(state);
-    let ds = state.attach("d", DbType::Mem, None).unwrap();
+    let ds = state.attach("d", kind, None).unwrap();
     ds.store
         .load(&[Source::from_bytes(
             data(per).into_bytes(),
@@ -487,4 +491,98 @@ async fn requests_are_checked() {
         assert!(j.to_string().contains(why), "{why}: {j}");
     }
     let _ = json!({});
+}
+
+/// A projection of a branch is kept for that branch, not swept as a stale dataset.
+#[tokio::test]
+async fn a_branch_keeps_its_projection() {
+    let s = server_with(20, DbType::Persistent, None).await;
+    let (st, j) = json_of(&s.app, post("/$/branches/d", r#"{"name":"dev"}"#)).await;
+    assert_eq!(st, StatusCode::CREATED, "{j}");
+    let (st, j) = json_of(&s.app, post("/$/vector/d/e/projection?branch=dev", "")).await;
+    assert_eq!(st, StatusCode::OK, "{j}");
+    let (st, j) = json_of(&s.app, get("/$/vector/d/e/projection?branch=dev")).await;
+    assert_eq!(st, StatusCode::OK, "{j}");
+    assert_eq!(j["entities"], 60);
+}
+
+/// An index replaced under the same name, with another configuration, forgets the old
+/// index's projection.
+#[tokio::test]
+async fn a_replaced_index_forgets_its_projection() {
+    let s = server(20).await;
+    let (st, _) = json_of(&s.app, post("/$/vector/d/e/projection", "")).await;
+    assert_eq!(st, StatusCode::OK);
+    let (st, j) = json_of(
+        &s.app,
+        Request::put("/$/vector/d/e")
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(Body::from(format!(
+                r#"{{"predicate":"{EX}emb","dimension":{DIM},"metric":"cosine","hnsw":{{"m":8}},"exactThreshold":0}}"#
+            )))
+            .unwrap(),
+    )
+    .await;
+    assert!(st.is_success(), "{j}");
+    let t = wait_task(&s.app, j["task"]["id"].as_str().unwrap()).await;
+    assert_eq!(t["state"], "done", "{t}");
+    let (st, j) = json_of(&s.app, get("/$/vector/d/e/projection")).await;
+    assert_eq!(st, StatusCode::NOT_FOUND, "{j}");
+}
+
+/// An index created before its predicate had a vector projects the vectors inserted
+/// since.
+#[tokio::test]
+async fn an_index_built_before_its_vectors_projects_them() {
+    let s = server(5).await;
+    index(&s, "late", "late").await;
+    let v: Vec<String> = (0..DIM).map(|d| format!("{d}")).collect();
+    s.state
+        .get("d")
+        .unwrap()
+        .store
+        .load(&[Source::from_bytes(
+            format!(
+                "<{EX}x> <{EX}late> \"[{}]\"^^<urn:x-sparkles:vector> .\n",
+                v.join(", ")
+            )
+            .into_bytes(),
+            oxrdfio::RdfFormat::Turtle,
+            None,
+        )])
+        .unwrap();
+    let (st, j) = json_of(&s.app, post("/$/vector/d/late/projection", "")).await;
+    assert_eq!(st, StatusCode::OK, "{j}");
+    assert_eq!(j["entities"], 1);
+}
+
+/// The query memory pool pays for a projection: one the pool cannot hold is refused with
+/// `507` before it is computed, and a kept one holds about its own bytes.
+#[tokio::test]
+async fn the_memory_pool_pays_for_projections() {
+    // 6,000 vectors need about 1.4 MB to compute, more than the whole pool
+    let s = server_with(2000, DbType::Mem, Some(1 << 20)).await;
+    let pool = s.state.catalog.pool().unwrap().clone();
+    let (st, j) = json_of(&s.app, post("/$/vector/d/e/projection", "")).await;
+    assert_eq!(st, StatusCode::INSUFFICIENT_STORAGE, "{j}");
+    assert_eq!(pool.granted(), 0);
+    // a neighbour layout's task is refused before it starts
+    let (st, j) = json_of(
+        &s.app,
+        post("/$/vector/d/e/projection?method=neighbours", ""),
+    )
+    .await;
+    assert_eq!(st, StatusCode::INSUFFICIENT_STORAGE, "{j}");
+    assert_eq!(pool.granted(), 0);
+    // a kept projection holds a grant until it is dropped
+    let s = server_with(200, DbType::Mem, Some(64 << 20)).await;
+    let pool = s.state.catalog.pool().unwrap().clone();
+    let (st, j) = json_of(&s.app, post("/$/vector/d/e/projection", "")).await;
+    assert_eq!(st, StatusCode::OK, "{j}");
+    assert!(pool.granted() >= j["bytes"].as_u64().unwrap());
+    assert!(
+        pool.granted() <= sparkles::sparql::pool::GRANULE,
+        "{}",
+        pool.granted()
+    );
 }

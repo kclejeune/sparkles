@@ -660,7 +660,7 @@ per-dataset form and no concurrency caps. `preauth=off` turns it off.
 | DELETE | `/$/describe/{ds}`           | *Extension.* Restores the DESCRIBE defaults. Needs `admin`. |
 | GET    | `/$/tasks`                   | `[Task]` |
 | GET    | `/$/tasks/{id}`              | `Task` |
-| DELETE | `/$/tasks/{id}`              | *Extension.* Cancels a task that accepts cancellation: a queued task, a clone until it is in place, an N-Quads backup, or a reasoning run. Returns `202` with the `Task`, which ends `cancelled`. Other tasks and finished ones get `409 {code: "not-cancellable"}`. Needs `admin` on the task's dataset, or `server-admin` for a server-wide task. |
+| DELETE | `/$/tasks/{id}`              | *Extension.* Cancels a task that accepts cancellation: a queued task, a clone until it is in place, an N-Quads backup, a reasoning run or a vector projection. Returns `202` with the `Task`, which ends `cancelled`. Other tasks and finished ones get `409 {code: "not-cancellable"}`. Needs `admin` on the task's dataset, `read` on the whole dataset for a `vector-projection`, or `server-admin` for a server-wide task. |
 | POST   | `/$/cache/clear/{ds}`        | *Extension (no Fuseki equivalent).* Drops the dataset's cached query results and its cached remote SERVICE results ([SERVICE options](#service-options-loop-bulk-and-cache)). Returns `{ "cleared": number /* entries */, "bytes": number, "serviceCleared": number, "serviceBytes": number }`. |
 | GET    | `/$/prefixes/{ds}`           | `{ "prefixes": { "rdf": "http://…#", … } }`: the dataset's effective prefixes, which are the well-known ones, the prefixes the settings file declares and the dataset's own, as the [prefixes kind](#prefixes) computes them. |
 | GET    | `/{ds}/prefixes`             | Modelled on Fuseki's prefixes service. `?prefix=p` returns `{ prefix, uri }`, or `404` if `p` is unbound. `?uri=u` returns `{ uri, prefixes: [...] }`. With neither, the response is `{ prefixes: {...} }` with the stored prefixes only. Declared and well-known prefixes are not listed here, and `?prefix=` and `?uri=` look only at the stored ones. |
@@ -5320,7 +5320,11 @@ of their projections. A PCA of an index of up to 1,000,000 vectors runs in the r
 under its `timeout`, and a larger one runs as a task. `method=neighbours` starts from the
 PCA positions and lays out the index's HNSW neighbour graph, moving each entity toward its
 neighbours and away from crowded regions. It always runs as a cancellable task of kind
-`vector-projection`, and the `POST` answers `202` with the task. The optional body is
+`vector-projection`, and the `POST` answers `202` with the task. Anyone with `read` on the
+whole dataset may cancel it with `DELETE /$/tasks/{id}`, since anyone who can start one
+can. The projection reads the index's base rows and the vectors inserted since, and the
+layout also follows the links of nodes that were added to the graph after its build. The
+optional body is
 `{ "sample": n, "seed": n, "iterations": n }`, where `iterations` counts the layout's
 steps, 100 by default. The same seed gives the same projection.
 
@@ -5355,8 +5359,13 @@ no value.
 
 The server keeps four projections, 1 GiB in all, keyed by dataset, branch, index and
 method, and drops the least recently used first. A projection takes 24 bytes per entity,
-so ten million entities take 240 MB. Each one holds a grant of the query memory pool for
-its bytes, and a projection the pool or the limit cannot hold is refused with `507`. A
+so ten million entities take 240 MB. The query memory pool pays for the computation before
+it starts, through the request's own grant in the request and through a grant of the task's
+own for a task, and a computation the pool cannot hold is refused with `507` before it
+reads a vector. A kept projection then holds a grant for its own bytes until it is dropped
+and its last reader is done, and a projection the pool or the limit cannot hold is refused
+with `507`. An index replaced under the same name with another predicate, dimension or
+metric forgets its projections. A
 kept projection holds the snapshot it read, so after a compaction the replaced generation's
 files stay open until the projection is replaced or dropped. Projections are not written to
 disk, and a restart forgets them. A projection read at an older commit than the head has

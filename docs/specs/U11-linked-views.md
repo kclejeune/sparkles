@@ -660,8 +660,14 @@ that the 202 answer names with a `Location` header. The neighbour layout always 
 task. It starts from the PCA positions and runs a force layout over the bottom layer of the
 index's HNSW graph, with springs along the links and a repulsion from the mass of the cells
 of a grid, for 100 rounds by default. It is a simplified ForceAtlas2 that needs no new
-dependency, and it gives the same positions for the same seed. A task can be cancelled, and
-a request's projection stops when its client goes away.
+dependency, and it gives the same positions for the same seed. Its edges include the links
+of nodes that the live layer added to the graph after its build, as far as the snapshot
+holds their rows, so an entity inserted since is pulled toward its neighbours as well. A
+task can be cancelled by anyone with `read` on the whole dataset, which is who can start
+one, and a request's projection stops when its client goes away. An index created before
+its predicate had any vector finds the predicate in the snapshot, so the vectors inserted
+since are projected. The choice between the request and a task counts the vectors inserted
+since the index's base as well as the base rows.
 
 **The answer.** `GET` returns the method, the commit and generation, `stale`, the counts,
 the bounds, the variance the two PCA axes explain, a 256 by 256 density grid of every entity
@@ -679,8 +685,17 @@ pairs, `Uint32` class indexes and, with `colour=`, `Uint32` value indexes, where
 the first `rdf:type` of an entity in the store's order.
 
 **Keeping projections.** The server keeps at most four projections and 1 GiB of them, the
-least recently used dropped first. Each holds a grant from the server memory pool, so a
-projection that does not fit answers `507` before it is computed. A projection takes 24
+least recently used dropped first. The query memory pool pays for the computation before
+it starts, from an upper bound of its working memory that counts the rows, the sample, the
+points and, for the neighbour layout, the edges. In the request the request's admission
+grant is charged, and a task reserves a grant of its own that it hands to the kept
+projection, which gives back all of it but the projection's own bytes. The bytes are
+charged and not only granted, because the pool clamps a grant to its capacity, so a
+computation the pool cannot hold answers `507` before it reads a vector. A kept projection
+and its grant are one shared value, so a reader still answering from a projection that was
+just replaced keeps its memory paid for until it is done. A projection is keyed by the
+dataset, the branch, the index and the method, and it also records the index's predicate,
+dimension and metric, so an index replaced under the same name forgets it. A projection takes 24
 bytes per entity, not the 12 the spec estimated, because each point keeps its subject's id
 and its sampling priority beside its coordinates and class, so ten million entities take
 about 230 MiB. That is memory spent so that a region and its sample are answered without a

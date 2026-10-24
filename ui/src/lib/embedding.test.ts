@@ -12,6 +12,7 @@ import {
   numericBuckets,
   parsePoints,
   pointsOf,
+  positions,
   valuesQuery,
   type Points,
 } from './embedding';
@@ -145,6 +146,24 @@ describe('byDistance', () => {
       '<http://ex/far>',
       '<http://ex/missing>',
     ]);
+  });
+
+  it('orders by the positions it is given, not only the points drawn', () => {
+    // a sampled view draws only `drawn`; the entities fetched for the region sit nearer
+    // the centre and must come first
+    const drawn = pointsOf(
+      [
+        { entity: 'http://ex/edge1', x: -10, y: 0 },
+        { entity: 'http://ex/edge2', x: 10, y: 0 },
+      ],
+      false,
+    );
+    const at = positions(drawn);
+    at.set('<http://ex/core>', { x: 0, y: 0.5 });
+    const ids = ['<http://ex/edge1>', '<http://ex/edge2>', '<http://ex/core>'];
+    expect(byDistance(ids, at).ordered[0]).toBe('<http://ex/core>');
+    // without the fetched position the core falls behind the drawn points
+    expect(byDistance(ids, drawn).ordered.at(-1)).toBe('<http://ex/core>');
   });
 
   it('keys IRIs and blank nodes as the selection does', () => {
