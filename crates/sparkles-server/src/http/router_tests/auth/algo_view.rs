@@ -163,8 +163,13 @@ async fn a_restricted_view_never_reads_a_wider_kept_result() {
     assert_eq!(rows(&again), rows(&full));
 }
 
+/// The pause list is keyed by dataset name, and both background-run tests use "av", so
+/// they take turns: one test's release would otherwise let the other's run finish early.
+static AV_PAUSE: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
 #[tokio::test]
 async fn a_restricted_caller_follows_and_cancels_its_own_background_run() {
+    let _paused = AV_PAUSE.lock().await;
     let (_dir, st, app) = server();
     crate::http::algo::view::PAUSED.lock().push("av".into());
     let body = json!({
@@ -210,6 +215,7 @@ async fn a_restricted_caller_follows_and_cancels_its_own_background_run() {
 
 #[tokio::test]
 async fn followers_lose_the_task_when_their_access_changes() {
+    let _paused = AV_PAUSE.lock().await;
     let (dir, st, app) = server();
     crate::http::algo::view::PAUSED.lock().push("av".into());
     let body = json!({

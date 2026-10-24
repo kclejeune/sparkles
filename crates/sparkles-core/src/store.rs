@@ -4591,6 +4591,19 @@ impl Store {
                         "replacing the whole dataset needs write access to every graph".into(),
                     ));
                 }
+                ReplaceTarget::Graphs(gs) => {
+                    for g in gs {
+                        match g {
+                            None if !a.writable(None) => {
+                                return Err(crate::access::GraphAccess::refused(None));
+                            }
+                            Some(n) if !a.writable_iri(n.as_str()) => {
+                                return Err(crate::access::GraphAccess::refused_iri(n.as_str()));
+                            }
+                            _ => {}
+                        }
+                    }
+                }
                 _ => {}
             }
         } else if estimated_quads(sources) > self.opts.bulk_threshold {
@@ -4618,6 +4631,13 @@ impl Store {
                 v.push(Id::DEFAULT_GRAPH);
                 v
             }
+            ReplaceTarget::Graphs(gs) => gs
+                .iter()
+                .filter_map(|g| match g {
+                    None => Some(Id::DEFAULT_GRAPH),
+                    Some(n) => view.lookup_term(&Term::NamedNode(n.clone())),
+                })
+                .collect(),
         };
         let mut ids = Vec::new();
         for quads in &parsed {
@@ -4675,6 +4695,13 @@ impl Store {
                 v.push(Id::DEFAULT_GRAPH);
                 v
             }
+            ReplaceTarget::Graphs(gs) => gs
+                .iter()
+                .filter_map(|g| match g {
+                    None => Some(Id::DEFAULT_GRAPH),
+                    Some(n) => snap.lookup_iri(n.as_str()),
+                })
+                .collect(),
         };
         let mut dropped = 0;
         for g in &graphs {
@@ -6472,6 +6499,8 @@ pub enum ReplaceTarget {
     Named(NamedNode),
     /// every graph, default included
     All,
+    /// These graphs, the default graph as `None` (a stored mapping's run in replace mode)
+    Graphs(Vec<Option<NamedNode>>),
 }
 
 /// Convenience helper for tests and the CLI.

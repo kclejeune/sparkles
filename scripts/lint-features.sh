@@ -32,6 +32,8 @@ server=(
   pdf-ocr
   office
   embed-local
+  mapping-sqlite
+  mapping-parquet
   "mcp,shacl"
   "mcp,shex"
   "mcp,fmt"
@@ -53,6 +55,8 @@ for f in "${server[@]}"; do
   run "sparkles-server [${f:-no features}]" -p sparkles-server --all-targets --features "$f"
 done
 run "sparkles-core [no features]" -p sparkles-core --all-targets
+run "sparkles-core [mapping-sqlite]" -p sparkles-core --all-targets --features mapping-sqlite
+run "sparkles-core [mapping-parquet]" -p sparkles-core --all-targets --features mapping-parquet
 run "sparkles [no features]" -p sparkles --all-targets
 run "sparkles-fmt [no features]" -p sparkles-fmt --all-targets
 # the Rust client without its blocking facade

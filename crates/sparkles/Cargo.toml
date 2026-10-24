@@ -71,6 +71,10 @@ backup-s3 = ["backup", "sparkles-backup/s3"]
 backup-encryption = ["backup", "sparkles-backup/encryption"]
 backup-gcs = ["backup", "sparkles-backup/gcs"]
 backup-azure = ["backup", "sparkles-backup/azure"]
+# SQLite sources of R2RML and RML mappings (bundles SQLite's C sources)
+mapping-sqlite = ["sparkles-core/mapping-sqlite"]
+# Parquet sources of RML mappings
+mapping-parquet = ["sparkles-core/mapping-parquet"]
 # the formatter and linter: `sparkles::fmt`
 fmt = ["dep:sparkles-fmt"]
 # what the server has: every feature but geo-epsg and the cloud backends other than S3
@@ -87,4 +91,6 @@ full = [
     "backup-s3",
     "graphql",
     "fmt",
+    "mapping-sqlite",
+    "mapping-parquet",
 ]

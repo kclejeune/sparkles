@@ -42,6 +42,7 @@ mod http;
 mod ingest;
 #[cfg(feature = "fmt")]
 mod lsp;
+mod map_cmd;
 #[cfg(feature = "mcp")]
 mod mcp;
 #[cfg(feature = "memory")]
@@ -2154,6 +2155,9 @@ enum Cmd {
     /// CSV and TSV tables: convert them to RDF without loading, or print the CSVW
     /// metadata of the default mapping
     Csv(csv_cmd::CsvCmdArgs),
+    /// R2RML, RML and YARRRML mappings: run, check and convert them, draft one from a
+    /// SQLite database, and manage the mappings stored with a dataset
+    Map(map_cmd::MapArgs),
 }
 
 fn store_opts(cli: &Cli) -> StoreOptions {
@@ -3353,6 +3357,7 @@ fn run() -> Result<()> {
         Cmd::Tools(cmd) => tools::run(cmd, opts),
         Cmd::Config(args) => config_cmd::run(args),
         Cmd::Csv(args) => csv_cmd::run(args),
+        Cmd::Map(args) => map_cmd::run(args, opts),
         Cmd::Load {
             loc,
             graph,
@@ -3375,8 +3380,25 @@ fn run() -> Result<()> {
                 .map(sparkles::annotations::validate_message)
                 .transpose()?
                 .flatten();
-            // tables become temporary N-Triples files, kept until the load is done
-            let prepared = csv_cmd::prepare(&files, &csv)?;
+            // a template with --lookup reads the database's head before the load
+            let early = match (&loc, csv.lookup) {
+                (Some(loc), true) => Some(open_for_write(loc, opts.clone(), no_validate)?),
+                _ => None,
+            };
+            let lookup = early.as_ref().map(|db| {
+                let snapshot = db.snapshot();
+                sparkles::tabular::template::Lookup {
+                    prefixes: db.prefixes().into_iter().collect(),
+                    commit: db.head_commit().seq,
+                    snapshot,
+                    graphs: None,
+                }
+            });
+            // tables become temporary N-Triples files, kept until the load is done, and
+            // a mapping's quads go into --graph when it is given
+            let mut csv = csv;
+            csv.graph = graph.clone();
+            let prepared = csv_cmd::prepare(&files, &csv, lookup)?;
             let files = &prepared.files;
             // the term checks read the files once before anything is written
             if check {
@@ -3414,7 +3436,10 @@ fn run() -> Result<()> {
             if files.is_empty() {
                 bail!("no files given");
             }
-            let store = open_for_write(&loc, opts, no_validate)?;
+            let store = match early {
+                Some(db) => db,
+                None => open_for_write(&loc, opts, no_validate)?,
+            };
             let g = graph.map(oxrdf::NamedNode::new).transpose()?;
             let explicit = match compression.as_str() {
                 "auto" => None,

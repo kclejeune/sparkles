@@ -1402,9 +1402,44 @@ EOF
 sparkles load --loc db people.csv --template people.rq
 ```
 
-With `--mapping` as well, the template sees the mapping's typed values. The template
-runs against an empty dataset, and `LIMIT`, `ORDER BY`, aggregates, `FROM` and `SERVICE`
-are refused, because rows are mapped in batches of 10,000.
+With `--mapping` as well, the template sees the mapping's typed values. `LIMIT`,
+`ORDER BY`, aggregates, `FROM` and `SERVICE` are refused, because rows are mapped in
+batches of 10,000. A file may hold several CONSTRUCT queries, and each runs for every
+batch. Tarql's `tarql:expandPrefix("ex")` gives the namespace of a prefix as a string and
+`tarql:expandPrefixedName("ex:a")` the IRI, from the template's prefixes and then the
+dataset's, and `apf:strSplit` splits a cell into several values.
+
+A template runs against an empty dataset unless `--lookup` lets its WHERE clause read the
+database it loads into, as it was when the conversion started. That links rows to
+resources the database already has:
+
+```sh
+cat > link.rq <<'EOF'
+PREFIX ex: <http://ex.org/>
+CONSTRUCT { ?person ex:country ?c }
+WHERE { BIND (IRI(CONCAT("http://ex.org/person/", ?id)) AS ?person) ?c ex:isoCode ?code }
+EOF
+sparkles load --loc db people.csv --template link.rq --lookup
+# people.csv: the template read commit 12
+```
+
+A lookup links to resources with IRIs. A blank node that the WHERE clause binds becomes a
+new blank node in the load ([roadmap](ROADMAP.md) item 238). On a server, a lookup reads
+only the graphs the caller may read.
+
+CSVW's standard mode, with `--csvw-mode standard`, adds a description of the table
+group, of each table and of each row, with its row number and source URL, around the
+triples of the default minimal mode. In standard mode, or with `--csvw-check keys`, the
+metadata's `primaryKey` and `foreignKeys` are checked across the tables of the load. The
+tables are converted in the order their foreign keys need, a duplicate key fails with
+both rows, and a reference that matches no row fails with its row, column and value:
+
+```sh
+sparkles load --loc db --mapping shop-metadata.json --csvw-mode standard
+# Error: …/orders.csv: row 3, column 2 (customer): the value "2" is not among the values of column id of table customer.csv
+```
+
+The key values are held in memory while the load runs.
 
 A cell that does not match its datatype, or a row with the wrong number of cells, stops
 the load with the file, row and column, and nothing is committed. `sparkles csv convert`
@@ -1414,6 +1449,94 @@ input given as the output is refused.
 `--server` loads into a running server: the CLI converts the tables and sends the
 triples. On a server, `POST /{ds}/upload` takes tables too
 ([API](API.md#csv-and-tsv-uploads)).
+
+### Mappings (R2RML, RML and YARRRML)
+
+`sparkles map` and `sparkles load --mapping` run R2RML, RML and YARRRML mappings over CSV,
+TSV, JSON, JSON Lines, Parquet and SQLite sources
+([spec F19](specs/F19-mappings-and-virtual-graphs.md)). The kind of a mapping file is read
+from its content, and `--mapping-kind` names it when the content does not tell. A
+YARRRML mapping of two CSV files with a join looks like this:
+
+```yaml
+prefixes:
+  ex: http://ex.org/
+mappings:
+  person:
+    sources:
+      - [people.csv~csv]
+    s: ex:person/$(id)
+    po:
+      - [a, ex:Person]
+      - [ex:name, $(name)]
+      - p: ex:city
+        o:
+          mapping: city
+          condition:
+            function: equal
+            parameters:
+              - [str1, $(city)]
+              - [str2, $(id)]
+  city:
+    sources:
+      - [cities.csv~csv]
+    s: ex:city/$(id)
+    po:
+      - [ex:label, $(label)]
+```
+
+```sh
+sparkles map check people.yml            # triples maps, sources, joins, missing columns
+sparkles map run people.yml -o people.nq # the quads, without loading them
+sparkles load --loc db --mapping people.yml
+sparkles map convert people.yml          # the same mapping as RML-Core Turtle
+```
+
+A file source resolves against the mapping file's directory, and `--source NAME=PATH`
+gives the path of a source by the name the mapping uses. Each source is read once, row by
+row, for all the triples maps that read it. Values keep the types of their source, so a
+SQLite `INTEGER` column gives `xsd:integer` literals, and a CSV source gives strings
+unless a CSVW description named `FILE-metadata.json` next to the file gives its columns
+datatypes. A JSON document is parsed whole, up to `--max-json-mb` (512 MiB), and JSON
+Lines a line at a time. `--base` sets the base of relative IRIs the mapping generates,
+and a triples map's own `rml:baseIRI` wins over it.
+`sparkles load --graph G` writes every quad into G, and refuses a mapping whose graph maps
+name another graph.
+
+R2RML logical tables and RML database sources read connections given with
+`--connection NAME=URL`, where the URL is `sqlite:PATH`. An R2RML mapping reads the only
+connection, or the one named `default`, and an RML source names one as
+`urn:x-sparkles:connection:NAME`. A mapping never holds a password. Two tables of one
+connection join in one SQL statement, and other joins hold the parent's rows in memory.
+`sparkles map draft` prints an R2RML mapping in the shape of the W3C Direct Mapping for
+the tables of a SQLite database, to edit:
+
+```sh
+sparkles map draft --connection shop=sqlite:shop.sqlite --base http://ex.org/shop/ > shop.ttl
+sparkles load --loc db --mapping shop.ttl --connection shop=sqlite:shop.sqlite
+```
+
+Function maps call the GREL and IDLab functions of RML's function descriptions and
+Sparkles' own `urn:x-sparkles:fn:` functions, which `sparkles map check --functions`
+lists. A function the list lacks fails, and a CONSTRUCT template can then do the job with
+any SPARQL function.
+
+A database keeps stored mappings of every kind in `mappings.json`, with versions, and a
+stored R2RML, RML or YARRRML mapping runs again by name. `--mode replace` replaces the
+graphs the mapping writes in one commit, so a run over sources that did not change
+changes nothing:
+
+```sh
+sparkles map put people people.yml --loc db --description "People and cities"
+sparkles map list --loc db
+sparkles map run people --loc db --mode replace --dry-run
+sparkles map run people --loc db --mode replace
+```
+
+With `--server URL --dataset ds` instead of `--loc`, `put`, `get`, `list`, `delete` and
+`run` act on a server, and `run` sends the `--source` files. On a server, uploads take
+mappings as a part or by name, and the Graph Store protocol takes CSV bodies
+([API](API.md#stored-mappings)).
 
 ## Formatting
 
@@ -5513,6 +5636,19 @@ default mapping's namespace and `key` names the column of each row's subject. `m
 names a CSVW metadata file, and `template` a SPARQL CONSTRUCT query run for each row. A
 `-metadata.json` file next to the table is used when none of them is given. Warnings of
 the conversion are Python warnings.
+
+`Dataset.run_mapping` runs an R2RML, RML or YARRRML mapping text and loads its quads in
+one commit, and `Dataset.mappings` stores mappings and runs them by name. `sources` maps
+the names a mapping gives its files to paths, `directory` resolves the other names, and
+`connections` maps connection names to `sqlite:PATH` URLs. The wheel is built without
+SQLite and Parquet sources, so these read CSV, TSV, JSON and JSON Lines
+([Mappings](#mappings-r2rml-rml-and-yarrrml)).
+
+```python
+ds.run_mapping(open("people.yml").read(), directory="data")
+ds.mappings.put("people", open("people.yml").read(), description="People")
+ds.mappings.run("people", sources={"people.csv": "data/people.csv"}, replace=True)
+```
 
 `sparkles.parse` parses as it reads, from a path, bytes or a file object, so the first
 quads come before the input has been read to the end. A syntax error is raised by the

@@ -134,7 +134,12 @@ sparkles-office = { workspace = true, features = ["fixtures"] }
 sparkles-client = { workspace = true, features = ["blocking"] }
 
 [features]
-default = ["reasoning", "shacl", "shex", "mimalloc", "text", "text-cjk-dict", "geo", "geo-epsg", "otel", "auth", "mcp", "memory", "backup", "fmt", "tls", "graphql", "pdf", "office"]
+default = ["reasoning", "shacl", "shex", "mimalloc", "text", "text-cjk-dict", "geo", "geo-epsg", "otel", "auth", "mcp", "memory", "backup", "fmt", "tls", "graphql", "pdf", "office", "mapping-sqlite", "mapping-parquet"]
+# SQLite connections of R2RML and RML mappings (`sparkles map`, `--connection`, the
+# `connections` settings kind); bundles SQLite's C sources
+mapping-sqlite = ["sparkles/mapping-sqlite"]
+# Parquet files as sources of RML and YARRRML mappings
+mapping-parquet = ["sparkles/mapping-parquet"]
 # RDFS / OWL RL / Jena-rules materialization (`/$/reason`, `sparkles infer`)
 reasoning = ["dep:sparkles-reasoner", "sparkles/reasoning"]
 # SHACL validation (`/{ds}/shacl`, `sparkles shacl`)

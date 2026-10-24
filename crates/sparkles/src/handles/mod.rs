@@ -30,6 +30,7 @@ pub mod graph;
 pub mod graphql;
 pub mod history;
 pub mod indexes;
+pub mod mappings;
 pub mod queries;
 pub mod reasoning;
 pub mod schema;
@@ -47,6 +48,7 @@ pub use history::{CommitDetail, CommitRef, History, Snapshots};
 pub use indexes::{
     GeoIndex, Indexes, RecallOptions, TextHit, TextHits, TextIndex, TextSearch, VectorIndexes,
 };
+pub use mappings::{MappingRun, StoredMappings};
 pub use queries::StoredQueries;
 pub use reasoning::{RdfsSetting, Reasoning};
 pub use schema::{

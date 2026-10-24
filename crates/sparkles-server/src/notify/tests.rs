@@ -605,7 +605,10 @@ async fn the_settings_kind_has_layers_and_locks() {
     let saved = std::fs::read_to_string(f.st.data_dir.join(config::NOTIFICATIONS_FILE)).unwrap();
     assert!(saved.contains("hooks.example.org"), "{saved}");
     let (_, v) = f.send("GET", "/$/settings", None).await;
-    assert_eq!(v["serverKinds"], json!(["models", "notifications"]));
+    assert_eq!(
+        v["serverKinds"],
+        json!(["models", "notifications", "connections"])
+    );
 }
 
 #[test]
