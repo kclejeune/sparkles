@@ -645,6 +645,7 @@ sparkles infer   --loc db --profile rdfs --max-inferred 200000000   # allow 200 
 sparkles infer   --loc db --vocab geosparql --geo-default-geometry   # + GeoSPARQL axioms, default geometries
 sparkles infer   --loc db --ontology-graph http://ex.org/onto --imports fetch   # input graphs and owl:imports
 sparkles text-index --loc db                  # full-text index: --predicate, --exclude-graph, --language en|all,
+                                              #   --language fr=french-light (a tag with an analyzer),
                                               #   --rebuild, --status, --disable
 sparkles geo-index  --loc db                  # spatial index: --predicate, --feature-link, --exclude-graph, --wgs84,
                                               #   --distance geodesic|haversine, --rebuild, --status (JSON), --disable

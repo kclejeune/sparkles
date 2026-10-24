@@ -5477,12 +5477,25 @@ SELECT ?s ?score ?label WHERE {
     `ar`, `da`, `nl`, `en`, `fi`, `fr`, `de`, `el`, `hu`, `it`, `no` (and `nb` and `nn`),
     `pt`, `ro`, `ru`, `es`, `sv`, `ta` and `tr`, and `zh`, `ja` and `ko` for `cjk`.
     `"all"` names the 18 stemmed languages, so CJK is listed on its own, as in
-    `["en", "zh", "ja", "ko"]`.
+    `["en", "zh", "ja", "ko"]`. Analyzer names are read in any case.
   * `porter` stems English with Porter's algorithm after the English stop words, as
     Lucene's English analyzer, and so jena-text, does, where `english` uses the
     Snowball English stemmer. The two differ on words such as `relativity`, which
     Porter stems to `rel`, as it does `relative`, and Snowball to `relat`. No tag takes
     it by default: `{"en": "porter"}` selects it.
+  * The analyzers `english-lucene`, `french-light`, `spanish-light`, `italian-light`,
+    `portuguese-light`, `german-light`, `dutch-lucene`, `russian-lucene`,
+    `swedish-lucene` and `cjk-lucene` reproduce the Lucene analyzers that jena-text uses
+    for those languages, so a stemmed search finds the literals it finds in Jena. They
+    split words as Lucene does, so `aren't` and `3,14` stay whole. French and Italian
+    remove elided articles such as `l'`, English removes a possessive `'s`, and the stop
+    words are Lucene's. French, Spanish, Italian, Portuguese and German use Savoy's light
+    stemmers, which merge fewer forms than Snowball's, English uses Porter's stemmer,
+    Dutch adds Lucene's stem dictionary, and Russian reads `ё` as `е`. `cjk-lucene` pairs
+    CJK characters as `cjk` does, keeps words that mix Hangul and Latin letters whole and
+    removes Lucene's CJK stop words, such as `the` and `www`. No tag takes them by
+    default: `{"fr": "french-light", "ja": "cjk-lucene"}` selects them. A configuration
+    imported from Fuseki selects them for its languages.
   * `cjk` segments Chinese, Japanese and Korean text without a dictionary, as Lucene's
     `CJKAnalyzer` does. A run of Han, Hiragana, Katakana or Hangul characters becomes its
     overlapping pairs of characters, so `東京都` is indexed as `東京` and `京都`, and a

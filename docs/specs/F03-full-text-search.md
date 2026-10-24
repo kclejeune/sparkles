@@ -848,18 +848,18 @@ literal is indexed a second time with its language's analyzer and a search with
   queries. German ones also lose umlauts and ß, as Lucene's German normalization and
   the Snowball German stems do. Highlighting uses the same analyzer, so stemmed matches
   are marked.
-- *Comparison with Jena.* A corpus of 2,700 literals in nine languages (English, French,
-  German, Spanish, Italian, Portuguese, Dutch, Russian and Swedish), with inflected forms
-  and stop words, was loaded into Sparkles and into Fuseki 5.1.0 with jena-text
-  configured the same way. Of 1,590 stemmed queries (words, conjunctions, stop words,
-  prefixes, fuzzy words, wildcards and phrases), 1,235 matched the same literals. German,
-  Dutch, Russian and Swedish, where Lucene also uses Snowball, agreed on 662 of 671. The
-  rest differ by Lucene's Dutch stem dictionary and by `ё` in Russian stems. English
-  agreed on 172 of 191, because Lucene uses the original Porter stemmer and Tantivy the
-  Snowball English stemmer (`relativity` is `rel` in one and `relat` in the other).
-  French, Spanish, Italian and Portuguese agreed on 401 of 728, because Lucene uses light
-  stemmers for them that merge fewer forms than Snowball does. A query of stop words only
-  gives `400` in Sparkles, and Jena then returns every literal of the language.
+- *Comparison with Jena.* `scripts/text-lucene-compare/compare.sh` loads 2,700 literals
+  in nine languages (English, French, German, Spanish, Italian, Portuguese, Dutch,
+  Russian and Swedish) into Sparkles and into Fuseki 5.1.0, whose jena-text has
+  multilingual support. The literals mix inflected forms with stop words, and each word
+  family is a set of forms that Lucene's analyzer or Snowball's stemmer reduces to one
+  stem. Of 1,590 stemmed queries (words, conjunctions, stop words, prefixes, fuzzy
+  words, wildcards and phrases), 1,300 match the same literals with the default
+  Snowball analyzers. German, Dutch, Russian and Swedish agree on 634 of 671, English on
+  172 of 191, and French, Spanish, Italian and Portuguese on 494 of 728, because Lucene
+  uses Porter's stemmer for English and light stemmers for French, Spanish, Italian,
+  Portuguese and German. With the analyzers that follow Lucene's, described below, 1,573
+  queries agree.
 - *Benchmark.* `scripts/bench-text.sh` indexes the English titles stemmed in both engines
   and has a seventh query, `"+theories +42"` with `lang:en`. On 210,509 triples Sparkles
   and Jena returned the same 10 literals, and every other query kept its answer.
@@ -878,7 +878,8 @@ character a unigram. Other letters and digits form words, split as the standard
 tokenizer splits them, and the Katakana middle dot separates words. Before that,
 full-width ASCII is folded to ASCII and half-width Katakana to full-width, with a
 following voiced or semi-voiced mark joined to its kana, as Lucene's `CJKWidthFilter`
-does. The tokens are then lowercased. Unlike Lucene, the analyzer removes no stop words.
+does. The tokens are then lowercased. Unlike Lucene, the analyzer removes no stop words,
+and `cjk-lucene`, described below, does.
 The tags `zh`, `ja` and `ko` take it by default, `{"yue": "cjk"}` names it for another
 tag, and `"all"` still means the stemmed languages, so an index configured with `"all"`
 keeps its fields. A word in a query is the OR of its bigrams, as Lucene's query parser
@@ -886,9 +887,8 @@ reads a word the analyzer splits, and a phrase keeps them in order. `text_lang.r
 searches Japanese, Chinese and Korean literals by words, phrases, folded widths and
 half-width Katakana, and unit tests cover the bigrams, offsets and width folding.
 
-**Not built at first.** Online rebuilds with a journal, `text` on dataset creation, Lucene's Porter
-and light stemmers, dictionary-based CJK segmentation, and the rest of Phase 3 apart from
-hybrid retrieval.
+**Not built.** Dictionary-based CJK segmentation and the other Phase 3 items that the
+follow-ups below list.
 
 **Phase 2 and 3 additions (2026-10-03).**
 * *`text` on dataset creation.* `POST /$/datasets` takes `text`, `true` or a
@@ -947,7 +947,7 @@ hybrid retrieval.
   differences of the comparison above, such as `relativity`, which Porter stems to
   `rel` and Snowball to `relat`, go away for such an index. The tokens still come from
   the standard tokenizer, which splits a possessive `'s` off where Lucene removes it.
-  Lucene's light stemmers for French, Spanish, Italian and Portuguese are not built.
+  `english-lucene`, described below, removes it.
 * *Tests.* `crates/sparkles-core/tests/text.rs` covers a rebuild against the index that
   maintenance kept, bulk loads and replacements that update the index by their changes
   and survive a reopen, a rebuild running while writes go on (with a compaction during
@@ -972,25 +972,69 @@ hybrid retrieval.
   6.1 ms over 30 runs, and the titles of one organization's authors for `theory` 5.6 ms
   and 2.0 ms of CPU against 20.6 ms and 9.7 ms.
 
+**Analyzers that follow Lucene's.** Ten analyzers reproduce the Lucene 9.11 analyzers
+that jena-text's multilingual support picks for its languages. They are `english-lucene`,
+`french-light`, `spanish-light`, `italian-light`, `portuguese-light`, `german-light`,
+`dutch-lucene`, `russian-lucene`, `swedish-lucene` and `cjk-lucene`, selected per tag
+in `languages` as `porter` is, for example `{"fr": "french-light"}`, or with
+`sparkles text-index --language fr=french-light`. No tag takes them by default, so
+existing indexes keep their configuration hash and their tokens.
+
+- *Analysis.* The words come from `text/standard.rs`, which applies the word boundary
+  rules of UAX #29 as Lucene's `StandardTokenizer` does. Letters around an apostrophe,
+  period or colon stay one word (`aren't`, `l'homme`, `u.s.a`), and so do digits around
+  a comma or period (`3,14`). A word longer than 255 characters is cut into pieces, as
+  Lucene cuts it, where the other analyzers drop tokens over 40 bytes. Lowercasing goes
+  character by character, as Java's does, so `İ` becomes `i`. French and Italian remove
+  elided articles (`l'`, `dell'`), and English removes a possessive `'s`. The stop words
+  are Lucene's lists, which are the Snowball ones apart from Swedish `sitta`. The
+  stemmers are Savoy's light stemmers for French, Spanish, Italian, Portuguese and
+  German (`text/light.rs`, from "Report on CLEF-2001 experiments" and "Light stemming
+  approaches for the French, Portuguese, German and Hungarian languages"), with German
+  normalization of umlauts and `ae`, `oe` and `ue` before it. English uses Porter's
+  stemmer, Dutch the Snowball stemmer behind Lucene's stem dictionary (`kind` is
+  `kinder`, `ei` is `eier`), and Russian and Swedish the Snowball stemmers, with Russian
+  `ё` read as `е`. `cjk-lucene` takes Lucene's typed words and pairs the characters of
+  adjacent Han, Hiragana, Katakana and Hangul words, so a word that mixes Hangul with
+  Latin letters stays whole, and then removes `CJKAnalyzer`'s stop words, which are
+  English words and `s`, `t` and `www`. Prefixes, wildcards, fuzzy words and regular
+  expressions are normalized as Lucene's analyzers normalize them, with elision for
+  French and Italian and German normalization for German. No new crate is needed, as
+  the Snowball stemmers are those of Tantivy's `rust-stemmers`.
+- *Checks.* Lucene's own tokens of 16,800 lines, words of the Snowball test
+  vocabularies and of the OpenTaal and DSSO dictionaries plus generated lines with
+  punctuation, numbers and CJK text, are fixtures in
+  `crates/sparkles-core/tests/data/lucene-analyzers`, made by
+  `scripts/text-lucene-compare/tokens.sh`. Every analyzer produces the same tokens and
+  positions as Lucene on every line. Over the full vocabularies, about 320,000 words, no
+  stem differs.
+- *Agreement.* With these analyzers selected, 1,573 of the 1,590 queries of the
+  comparison above match the same literals as Fuseki. Each language agrees except on
+  queries whose words are all stop words: `it`, `"as they"`, `seriez`, `"serai ces"`,
+  `"quel aurait"`, `hayas`, `faremmo`, `"avessero contro"`, `delas`, `hin`,
+  `"muss ihrem"`, `ben`, `говорил`, `åt`, `"nu åt"`, `"när ni"` and `"här kan"`.
+  jena-text then searches the language field alone and returns every literal of the
+  language, where Sparkles answers `400` because no word is left to search for. This
+  difference is kept on purpose.
+- *Fuseki configurations.* `sparkles fuseki-config` maps `text:multilingualSupport` to
+  the 20 languages that jena-text analyzes and Sparkles can, and a
+  `text:LocalizedAnalyzer` to its language, each with the analyzer closest to Lucene's.
+- *Decisions.* The plan named the light stemmers and `dutch-lucene`. German, Russian and
+  Swedish have analyzers of their own as well, because Lucene's German analyzer uses
+  the light German stemmer rather than Snowball's, which alone made 25 German queries
+  differ, and because the Russian `ё` and the Swedish stop word would otherwise stay
+  apart. The possessive filter and the CJK stop words went into the new
+  `english-lucene` and `cjk-lucene` rather than into `porter` and `cjk`, since changing
+  an analyzer under an existing index would leave its indexed tokens out of step with
+  its queries without a change of its configuration hash.
+
 ### Roadmap follow-ups (2026-10-12)
 
 **Full-text parity** (item 23, Tier 3, [ROADMAP](../ROADMAP.md)). Each part below is
 sized at about one to two weeks.
 
-* **Lucene analyzer parity.** The comparison with Jena above found 1,235 of 1,590
-  stemmed queries in agreement. The remaining differences have known causes: Lucene's
-  light stemmers for French, Spanish, Italian and Portuguese (401 of 728 agreed), which
-  *Porter's stemmer* above records as not built; Lucene's Dutch stem dictionary; `ё`
-  in Russian stems; the possessive `'s`, which the standard tokenizer splits off where
-  Lucene's `EnglishPossessiveFilter` removes it; and stop words in the `cjk` analyzer,
-  which Lucene removes and Sparkles does not. Each becomes an analyzer named after its
-  Lucene counterpart (`french-light`, `spanish-light`, `italian-light`,
-  `portuguese-light`, `dutch-lucene`), written from the published algorithms (Savoy's
-  light stemmers) in `text/` as `porter.rs` was, with no new crate, and selected per
-  tag in `languages` as `porter` is. The defaults stay Snowball, so existing indexes
-  keep their configuration hash. Acceptance: the nine-language corpus rerun against
-  Fuseki with the Lucene analyzers selected agrees on at least 1,550 of the 1,590
-  queries, and each remaining difference is listed.
+* **Lucene analyzer parity** is built, as *Analyzers that follow Lucene's* above
+  describes.
 * **CJK dictionary segmentation.** The `cjk` analyzer makes overlapping bigrams, which
   index more terms and match across word boundaries. A dictionary analyzer per language
   (`ja-dict` after Lucene's Kuromoji, `zh-dict` after SmartChineseAnalyzer, `ko-dict`

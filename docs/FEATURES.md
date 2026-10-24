@@ -447,6 +447,10 @@ rest of a query.
   rest of the group binds, and a join can pass a search the subjects it already has.
 * The index stems the literals of configured languages with Tantivy's Snowball stemmers
   and stop words, and `lang:` searches use them, as with jena-text's multilingual support.
+  Analyzers that reproduce Lucene's for English, French, Spanish, Italian, Portuguese,
+  German, Dutch, Russian, Swedish and CJK text can be selected per language instead. With
+  them, 1,573 of 1,590 stemmed searches in nine languages find the same literals as
+  Fuseki, and the other 17 consist of stop words alone.
 * An index can be enabled when a dataset is created. A missing or damaged index recovers
   in the background at open while the RDF data stays usable, and text searches answer
   `503` until recovery succeeds. Reconfiguring an index waits for old writers and
@@ -1478,8 +1482,9 @@ links each item to its design spec.
 
 ### Search and graph algorithms
 
-* Full-text search uses Tantivy's Snowball stemmers rather than Lucene's analyzers, apart
-  from Porter's stemmer for English. CJK text is cut into bigrams with no
+* Full-text search uses Tantivy's Snowball stemmers by default, and the analyzers that
+  reproduce Lucene's are selected per language. Lucene's analyzers for other languages,
+  such as Greek and Arabic, have no counterpart. CJK text is cut into bigrams with no
   dictionary-based segmentation. Roadmap item 23.
 * Full-text documents have one field. Roadmap item 35.
 * Enabling or reconfiguring a full-text index builds it while writes wait. A write
