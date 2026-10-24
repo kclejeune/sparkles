@@ -1439,8 +1439,9 @@ PostgreSQL where the problems are the same, and adds fencing tokens so that a st
 primary cannot have a write acknowledged.
 
 * **Leadership scope.** One lease per cluster names the primary server, which takes the
-  writes of every dataset. Per-dataset leases would spread write load across servers, but
-  they multiply leases, fencing and client routing, so they wait for a measured need.
+  writes of every dataset. The maintainer chose this on 2026-10-24. Per-dataset leases
+  would spread write load across servers, but they multiply leases, fencing and client
+  routing, so they wait for a measured need.
 * **Topology.** The recommended cluster is three Sparkles nodes: the primary, one
   synchronous replica and one asynchronous replica. The lease lives in a store that has
   its own quorum, which is the Kubernetes API, a three-member etcd or a Consul cluster.
@@ -1490,15 +1491,47 @@ primary cannot have a write acknowledged.
   pod, bootstraps from the newest backup and catches up from the archive of §8 Phase 3 or
   from the primary's holds.
 * **Losing the lease store.** No primary can renew, so the primary fences itself and
-  writes stop, while every node keeps serving reads. An opt-in failsafe mode, like
-  Patroni's `failsafe_mode`, lets the primary keep writing while it can reach every
-  member over mutual TLS and each one confirms it as primary.
+  writes stop, while every node keeps serving reads. A failsafe mode could keep writes
+  going through such an outage. It is an open choice, described under the options below.
 * **Observability.** The epoch, lease holder, renewal age and failover count are metrics,
   and every promotion, demotion, switchover and fence is an audit event.
 * **Testing.** NixOS VM tests inject faults in the manner of Jepsen. They partition the
   network, pause the primary with SIGSTOP, skew clocks, and stop the lease store, while a
   client records its writes. A checker then proves that no acknowledged write was lost
   in strict mode, and that no two primaries accepted writes in the same epoch.
+
+The maintainer has not settled the following choices. Item 280 lays out the tradeoffs of
+each and asks before Phase 3 is designed in full.
+
+* **The default synchronous mode.** The maintainer leans toward strict, and the decision
+  waits until Phase 3.
+  * Strict by default never acknowledges a commit that no replica has applied, so a
+    failover loses nothing that a client was told succeeded. Writes block, and fail at
+    the timeout, when no synchronous replica is reachable, so a three-node cluster stops
+    writing if both replicas are down.
+  * Degrading by default acknowledges a commit after the timeout with
+    `Sparkles-Replication: degraded`, so writes continue with one node, but a failover
+    during the degraded period can lose those commits. This matches PostgreSQL with
+    `synchronous_standby_names` cleared by hand, and Patroni's
+    `synchronous_mode` without `synchronous_mode_strict`.
+  * Asynchronous by default has the lowest write latency and the largest loss window, and
+    leaves synchronous replication to deployments that ask for it.
+* **Failsafe mode when the lease store is lost.**
+  * Without it, losing the lease store stops writes cluster-wide until the store returns,
+    even though every Sparkles node is healthy. The store is then as critical as the
+    primary, which pushes operators toward a highly available store such as the
+    Kubernetes API or a three-member etcd.
+  * With it, a primary that cannot renew asks every member it knows of, over mutual TLS,
+    to confirm it as primary, and keeps writing while all of them answer within the
+    renewal interval. A member that confirms promises not to take the lease, or follow
+    anyone else, until the store returns. If any member does not answer, the primary
+    fences itself as it would without the mode. Patroni's `failsafe_mode` works this way.
+    It is safe only when the member list is complete and current, which ties it to
+    the cluster state of question 22, and it adds a second path to leadership that the
+    fault-injection tests must cover.
+  * A middle option keeps the mode off by default and enables it only where the lease
+    store is known to be less available than the Sparkles nodes, such as a single etcd
+    member.
 
 ## 12. Sources
 
