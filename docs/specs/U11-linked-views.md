@@ -757,7 +757,13 @@ exact eigenvectors of a fixed sample and the Jacobi step. The router tests in
 `crates/sparkles-server/src/projection_tests.rs` build three clusters in 16 dimensions and
 check that PCA separates the classes (A6), the density grid, regions, limits and colours, the
 binary answer against the JSON one, staleness after a commit, the neighbour task's
-determinism, the cap of four projections with `/metrics`, and the request checks.
+determinism, the cap of four projections with `/metrics`, the request checks, a branch's
+projection, a replaced index, an index created before its vectors, and the memory pool's
+refusals and grants, including the PCA workspace of one vector of 16,384 dimensions.
+`crates/sparkles-core/tests/projection_memory.rs` measures the PCA's peak memory with a
+counting allocator on 16 threads against the bound it is admitted with, and a unit test
+checks that the layout's edges include the live nodes the snapshot holds.
+`router_tests::auth::tasks` checks that a reader may cancel a projection task.
 `router_tests::auth::overview` checks the `403` of the `whole_dataset` rule. The Python
 binding is checked in `test_admin.py`. The Vitest suite `embedding.test.ts` covers the binary
 format and its version refusal, the lasso and the box, the order by distance, the legend, the
