@@ -70,6 +70,14 @@ data file or a binary whose SHA256 differs from the run's, and a case file whose
 question differs from its report row. The new report records the query timeout, each
 case file's SHA256 and each row's execution accuracy before and after.
 
+Every query the evaluator runs starts with PREFIX lines for the well-known prefixes of
+C20 §3.1, such as `rdfs:`, `skos:` and `dcterms:`, followed by the set's own prefixes,
+which replace a well-known one of the same name. Ask runs its drafts with the well-known
+prefixes and `sparkles query --loc` does not, so before 2026-10-24 a correct answer that
+wrote `rdfs:label` without declaring it failed when it was scored. The DBpedia sets
+declare no prefixes of their own, and the first paid run of them was scored again with
+these lines.
+
 When an answerable question ends at a clarification, the evaluator answers it as a person
 who means the gold query would, and scores a second Ask that carries the answer. The
 answer is always the value of one of the choices the pipeline offered, so nothing from the

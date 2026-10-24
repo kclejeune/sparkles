@@ -106,6 +106,38 @@ class OfflinePolicy(Invalid):
     pass
 
 
+# The well-known prefixes that every dataset resolves before its own (C20 §3.1), as
+# `sparkles::io::well_known_prefixes` lists them. Ask runs a draft with them, and
+# `sparkles query --loc` does not, so the scorer declares them before the set's own.
+WELL_KNOWN_PREFIXES = {
+    "rdf": "http://www.w3.org/1999/02/22-rdf-syntax-ns#",
+    "rdfs": "http://www.w3.org/2000/01/rdf-schema#",
+    "owl": "http://www.w3.org/2002/07/owl#",
+    "xsd": "http://www.w3.org/2001/XMLSchema#",
+    "dc": "http://purl.org/dc/elements/1.1/",
+    "dcterms": "http://purl.org/dc/terms/",
+    "foaf": "http://xmlns.com/foaf/0.1/",
+    "skos": "http://www.w3.org/2004/02/skos/core#",
+    "schema": "http://schema.org/",
+    "sh": "http://www.w3.org/ns/shacl#",
+    "prov": "http://www.w3.org/ns/prov#",
+    "spk": "urn:x-sparkles:",
+    "hist": "urn:x-sparkles:history#",
+    "path": "urn:x-sparkles:path#",
+    "mem": "urn:x-sparkles:mem:",
+    "sparkles": "urn:x-sparkles:assembler#",
+    "text": "http://jena.apache.org/text#",
+}
+
+
+def prefix_header(own):
+    """The PREFIX lines a scored query starts with: the well-known prefixes, then the
+    set's own, which replace a well-known one of the same name."""
+    merged = {k: v for k, v in WELL_KNOWN_PREFIXES.items() if k not in own}
+    merged.update(own)
+    return "".join(f"PREFIX {k}: <{v}>\n" for k, v in merged.items())
+
+
 def offline_query(text):
     """Conservative lexical SERVICE refusal before the read-only CLI is spawned.
 

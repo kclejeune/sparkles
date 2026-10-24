@@ -23,6 +23,8 @@ from evaluator import (
     gold_terms,
     norm_term,
     parse_child,
+    WELL_KNOWN_PREFIXES,
+    prefix_header,
     prf,
     score_sets,
     strict_json,
@@ -47,6 +49,23 @@ def result(rows, names=("x", "y")):
 
 def iri(value):
     return {"type": "uri", "value": value}
+
+
+class Prefixes(unittest.TestCase):
+    def test_the_well_known_prefixes_match_the_engine(self):
+        src = (HERE.parents[1] / "crates/sparkles-core/src/io.rs").read_text()
+        body = src[src.index("pub fn standard_prefixes") : src.index("pub fn well_known_prefixes")]
+        import re
+
+        pairs = dict(re.findall(r'\("([a-z]+)",\s*"([^"]+)"\)', body))
+        self.assertEqual(pairs, WELL_KNOWN_PREFIXES)
+
+    def test_the_set_overrides_a_well_known_name(self):
+        header = prefix_header({"dc": "http://purl.org/dc/terms/", "ex": "http://e/"})
+        self.assertIn("PREFIX rdfs: <http://www.w3.org/2000/01/rdf-schema#>\n", header)
+        self.assertIn("PREFIX dc: <http://purl.org/dc/terms/>\n", header)
+        self.assertNotIn("http://purl.org/dc/elements/1.1/", header)
+        self.assertTrue(header.endswith("PREFIX ex: <http://e/>\n"))
 
 
 class Scoring(unittest.TestCase):
@@ -1163,7 +1182,7 @@ class FirstDraft(unittest.TestCase):
         b.write_text(
             "#!"
             + PYTHON
-            + '\nimport json,sys\nprint(json.dumps({"head":{"vars":["x"]},"results":{"bindings":[] if sys.argv[-1]=="EMPTY" else [{"x":{"type":"literal","value":"wrong"}}]}}))\n'
+            + '\nimport json,sys\nprint(json.dumps({"head":{"vars":["x"]},"results":{"bindings":[] if sys.argv[-1].endswith("EMPTY") else [{"x":{"type":"literal","value":"wrong"}}]}}))\n'
         )
 
         def answer(first, check=None):

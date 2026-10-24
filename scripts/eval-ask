@@ -31,6 +31,7 @@ from evaluator import (
     capture_child,
     choose_clarification,
     digest,
+    prefix_header,
     finite_positive,
     leaf_environment,
     offline_query,
@@ -183,9 +184,7 @@ class Runner:
             if self.loc
             else (pathlib.Path(args.set).parent / qset["data"]).resolve()
         )
-        self.header = "".join(
-            f"PREFIX {k}: <{v}>\n" for k, v in qset.get("prefixes", {}).items()
-        )
+        self.header = prefix_header(qset.get("prefixes", {}))
         self.gold_cache, self.serial, self.last_record = {}, 0, None
         self.policy = getattr(args, "scoring_policy", None) or POLICY
         if self.policy not in POLICIES:
