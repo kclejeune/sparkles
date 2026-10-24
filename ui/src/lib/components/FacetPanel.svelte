@@ -40,6 +40,7 @@
     at = '',
     prefixes = {},
     drawn = null,
+    reasoning = null,
     onmatch,
     onapply,
     applyLabel = 'Apply to query',
@@ -56,6 +57,8 @@
     prefixes?: PrefixMap;
     /** The term keys of the drawn entities, whose values decide what the canvas dims. */
     drawn?: string[] | null;
+    /** False to count the asserted data alone, as a result read with `reasoning=false`. */
+    reasoning?: boolean | null;
     /** The drawn entities every brush keeps, or null when nothing is brushed. */
     onmatch?: (ids: Set<string> | null, text: string) => void;
     onapply?: (brushes: Brush[]) => void;
@@ -94,7 +97,7 @@
     controller = c;
     loading = true;
     try {
-      const a = await api.graphFacets(ds, req, c.signal);
+      const a = await api.graphFacets(ds, req, c.signal, { reasoning: reasoning ?? undefined });
       if (controller !== c) return null;
       error = null;
       return a;
@@ -238,6 +241,7 @@
       const batch = missing.slice(i, i + 200);
       const rows = await api.select(ds, valuesQuery(property, batch), {
         at: at || undefined,
+        reasoning: reasoning ?? undefined,
         signal,
       });
       for (const id of batch) m.set(id, []);

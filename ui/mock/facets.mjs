@@ -130,6 +130,7 @@ function parse(body) {
     kind: f.kind,
     edges: f.edges,
     bars: f.bars ? f.bars.map(termText) : undefined,
+    barTerms: f.bars,
   }));
   if (facets.length > 6) throw new Bad('facets must be an array of at most 6 facets');
   for (const f of facets)
@@ -235,16 +236,15 @@ function compute(store, req, opts) {
           `SELECT ?s (SAMPLE(?l) AS ?label) WHERE { VALUES ?s { ${iris.join(' ')} } ?s ${`(${LABELS.map((l) => `<${l}>`).join('|')})`} ?l . FILTER(isLiteral(?l)) } GROUP BY ?s`,
         ))
           labels.set(r.get('s').value, r.get('label').value);
-      const values = bars
-        .map((b, i) => {
-          const c = counts.get(b);
-          const t = c?.t ?? terms[i];
-          if (!t) return null;
-          const o = { value: termJson(t), count: c?.n ?? 0 };
-          if (t.termType === 'NamedNode' && labels.has(t.value)) o.label = labels.get(t.value);
-          return o;
-        })
-        .filter(Boolean);
+      const values = bars.map((b, i) => {
+        // every bar is answered, with 0 when no entity names it
+        const c = counts.get(b);
+        const t = c?.t ?? terms[i];
+        const value = t ? termJson(t) : spec.barTerms[i];
+        const o = { value, count: c?.n ?? 0 };
+        if (value.type === 'uri' && labels.has(value.value)) o.label = labels.get(value.value);
+        return o;
+      });
       return {
         property: p,
         kind: 'values',

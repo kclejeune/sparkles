@@ -1480,7 +1480,7 @@
 
   /** The drawn entities the brushes keep become the selection, which dims the rest. */
   function facetMatch(ids: Set<string> | null) {
-    if (ids) selection.set(ids, 'the facets');
+    if (ids) selection.set(ids, 'the facets', { keepEmpty: true });
     else if (selection.source === 'the facets') selection.clear();
   }
 
@@ -2309,7 +2309,7 @@
                   selected={selectedId}
                   onselect={select}
                   onexpand={expand}
-                  highlight={selection.ids}
+                  highlight={selection.active ? selection.ids : null}
                   pathFocus={pathHighlight}
                   onmenu={(id, at) =>
                     (menu = nodes[id]?.term.type === 'uri' ? { id, ...at } : null)}

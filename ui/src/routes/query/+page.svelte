@@ -1703,10 +1703,13 @@
     });
     return best;
   });
+  // Use in query binds the column that holds the selection until the person picks another
   let useVar = $state('');
+  let useVarPicked = $state(false);
   $effect(() => {
     const v = selectionVar;
-    if (!resultVars.includes(untrack(() => useVar))) useVar = v;
+    if (!selection.active) useVarPicked = false;
+    if (!untrack(() => useVarPicked) || !resultVars.includes(untrack(() => useVar))) useVar = v;
   });
   let facetVar = $state('');
   const facetVarShown = $derived(resultVars.includes(facetVar) ? facetVar : selectionVar);
@@ -1715,6 +1718,25 @@
       ? { query: outcome.query, variable: facetVarShown }
       : null,
   );
+
+  /** The IRIs of the facets' column in the rows the result holds, which the brushes select. */
+  const facetDrawn = $derived.by(() => {
+    const r = outcome?.result;
+    const i = resultVars.indexOf(facetVarShown);
+    if (!r || i < 0) return null;
+    const out = new Set<string>();
+    for (const row of r.rows ?? []) {
+      const t = row[i];
+      if (t?.type === 'uri') out.add(toSparql(t));
+    }
+    return [...out];
+  });
+
+  /** The result entities every brush keeps become the selection the other views dim by. */
+  function facetMatch(ids: Set<string> | null) {
+    if (ids) selection.set(ids, 'the facets', { keepEmpty: true });
+    else if (selection.source === 'the facets') selection.clear();
+  }
 
   const parseNow = (t: string) =>
     patternNow(t) ?? {
@@ -1735,14 +1757,18 @@
 
   /** Make U08 edits on the editor's text as one change, or say why not. */
   async function editQuery(
-    make: (p: import('$lib/pattern').PatternOk) => AnyEdit[],
+    make: (p: import('$lib/pattern').PatternOk, text: string) => AnyEdit[],
     done: string,
   ): Promise<boolean> {
-    const text = active.query;
+    const text = editor?.snapshot().text ?? active.query;
+    const tab = active.id;
     try {
       const first = await patternLocal(text);
+      // the person may have typed or switched tabs while the parser loaded
+      if (active.id !== tab || (editor?.snapshot().text ?? active.query) !== text)
+        throw new Error('The query changed while the edit was being prepared. Try again');
       if (!first.ok) throw new Error(`The query does not parse: ${first.error}`);
-      const changes = composeEdits(text, parseNow, parseStrict, make(first));
+      const changes = composeEdits(text, parseNow, parseStrict, make(first, text));
       if (!changes.length || !editor) return false;
       editor.applyPattern(changes);
       toasts.push('success', done);
@@ -1759,7 +1785,7 @@
     const v = facetVarShown;
     if (!v) return;
     void editQuery(
-      (p) => brushEdits(p, v, brushes),
+      (p, text) => brushEdits(text, p, v, brushes),
       `Added ${brushes.length === 1 ? 'the brush' : `${brushes.length} brushes`} to the query`,
     );
   }
@@ -3115,7 +3141,12 @@
       {/if}
 
       {#if outcome.result && ['table', 'graph', 'map', 'facets'].includes(outcome.view)}
-        <SelectionBar onuse={useSelection} vars={resultVars} bind:usevar={useVar} />
+        <SelectionBar
+          onuse={useSelection}
+          vars={resultVars}
+          bind:usevar={useVar}
+          onvarpick={() => (useVarPicked = true)}
+        />
       {/if}
       {#if outcome.result && outcome.result.meta.sentRows < outcome.result.meta.totalRows && outcome.view !== 'explain'}
         <div class="notice">
@@ -3509,13 +3540,14 @@
                     onopen={(k) => (largeSelected = k)}
                     onfail={(reason) => (webglReason = reason)}
                     lens={lenses.encoding}
-                    marked={lensMarked ?? (selection.size ? [...selection.ids] : null)}
+                    marked={lensMarked ?? (selection.active ? [...selection.ids] : null)}
+                    dimEmpty={lensMarked == null && selection.active}
                   />
                 {:else}
                   <GraphView
                     lens={lenses.encoding}
                     marked={lensMarked}
-                    highlight={selection.ids}
+                    highlight={selection.active ? selection.ids : null}
                     onselect={(id) => (id ? selection.set([id], 'the graph') : selection.clear())}
                     nodes={canvasGraph.nodes}
                     edges={canvasGraph.edges}
@@ -3576,6 +3608,9 @@
                 setLabel={`values of ?${facetVarShown}`}
                 at={readAt(r.at)}
                 {prefixes}
+                drawn={facetDrawn}
+                reasoning={outcome.reasoning}
+                onmatch={facetMatch}
                 onapply={applyFacets}
               >
                 {#snippet header()}

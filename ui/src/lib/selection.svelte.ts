@@ -18,6 +18,12 @@ export class SharedSelection {
   dropped = $state(0);
   /** What a screen reader hears after the last change. */
   announcement = $state('');
+  /**
+   * Whether the selection filters the views. It is true whenever it holds entities, and
+   * also for an empty selection that a source keeps, such as brushes that match none of
+   * the drawn entities, so that the views dim everything rather than nothing.
+   */
+  active = $state(false);
 
   get size() {
     return this.ids.size;
@@ -27,15 +33,20 @@ export class SharedSelection {
     return this.ids.has(id);
   }
 
-  private apply(next: Set<string>, source: string, dropped = 0) {
+  private apply(next: Set<string>, source: string, dropped = 0, keepEmpty = false) {
+    const active = next.size > 0 || keepEmpty;
     this.ids = next;
-    this.source = next.size ? source : '';
+    this.active = active;
+    this.source = active ? source : '';
     this.dropped = next.size ? dropped : 0;
     this.announcement = this.describe();
   }
 
-  /** Replace the selection. Entities past the cap are left out and counted. */
-  set(ids: Iterable<string>, source: string) {
+  /**
+   * Replace the selection. Entities past the cap are left out and counted. With
+   * `keepEmpty`, an empty selection stays active and dims every entity.
+   */
+  set(ids: Iterable<string>, source: string, opts: { keepEmpty?: boolean } = {}) {
     const next = new Set<string>();
     let dropped = 0;
     for (const id of ids) {
@@ -43,7 +54,7 @@ export class SharedSelection {
       if (next.size >= SELECTION_CAP) dropped++;
       else next.add(id);
     }
-    this.apply(next, source, dropped);
+    this.apply(next, source, dropped, opts.keepEmpty);
   }
 
   /** Add entities (shift-click, shift-enter). */
@@ -82,7 +93,7 @@ export class SharedSelection {
 
   clear() {
     untrack(() => {
-      if (!this.ids.size && !this.source) return;
+      if (!this.ids.size && !this.source && !this.active) return;
       this.apply(new Set(), '');
     });
   }
@@ -90,8 +101,8 @@ export class SharedSelection {
   /** "41 selected by the map", with the cap named when it cut the selection short. */
   describe(): string {
     const n = this.ids.size;
-    if (!n) return 'Selection cleared';
     const by = this.source ? ` by ${this.source}` : '';
+    if (!n) return this.active ? `None selected${by}` : 'Selection cleared';
     const cut = this.dropped ? `, ${this.dropped.toLocaleString('en-US')} more left out` : '';
     return `${n.toLocaleString('en-US')} selected${by}${cut}`;
   }

@@ -3334,13 +3334,19 @@ export type FacetsAnswer = {
 };
 
 /** `POST /$/graph/{ds}/facets`, on the branch of a `ds@branch` target. */
-export function graphFacets(target: string, req: FacetsRequest, signal?: AbortSignal) {
+export function graphFacets(
+  target: string,
+  req: FacetsRequest,
+  signal?: AbortSignal,
+  opts: { reasoning?: boolean } = {},
+) {
   const at = target.indexOf('@');
-  const path =
-    at < 0
-      ? `/$/graph/${enc(target)}/facets`
-      : `/$/graph/${enc(target.slice(0, at))}/facets?branch=${enc(target.slice(at + 1))}`;
-  return json<FacetsAnswer>(path, { ...jsonBody(req), signal });
+  const p = new URLSearchParams();
+  if (at >= 0) p.set('branch', target.slice(at + 1));
+  if (opts.reasoning === false) p.set('reasoning', 'false');
+  const q = p.size ? `?${p}` : '';
+  const name = at < 0 ? target : target.slice(0, at);
+  return json<FacetsAnswer>(`/$/graph/${enc(name)}/facets${q}`, { ...jsonBody(req), signal });
 }
 
 /** One difference of a field between two reports: a value, or members of a list. */

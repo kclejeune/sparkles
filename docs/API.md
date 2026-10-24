@@ -1359,7 +1359,8 @@ an entity whose value the caller may not read counts as missing. An entity with 
 values counts once in each bin or value it has. The ranges and the list come from the
 whole set, so they stay the same while other facets are brushed. A request can hand back
 the `edges` or `bars` of an earlier answer, with the facet's `kind`, which keeps the bins
-and skips the queries that find them.
+and skips the queries that find them. Every handed-back bar is answered, with a count of 0
+when no entity of the brushed set has that value.
 
 A brush keeps the entities with a value in its range, or among its values. Each facet
 counts the set kept by every brush except its own, so the facets filter each other and a
@@ -1367,7 +1368,8 @@ brushed facet still shows what a wider brush would add. `matching` counts the se
 every brush. A brush on a numeric facet is applied as `FILTER(?v >= from && ?v < to)`, a
 brush on a date facet as `FILTER(YEAR(?v) >= from && YEAR(?v) < to)` and a brush of values
 as `FILTER(?v IN (…))`. The UI's **Apply to query** writes the same text, so the applied
-query's `COUNT(DISTINCT ?x)` equals `matching`.
+query's `COUNT(DISTINCT ?x)` equals `matching` for a query without `LIMIT`, `OFFSET`,
+`GROUP BY` or `HAVING`, which the UI refuses to edit.
 
 A `query` set must be a `SELECT` without `FROM` or `FROM NAMED` that projects the
 variable, and it runs inside each count as a subquery, under the request's prefixes and

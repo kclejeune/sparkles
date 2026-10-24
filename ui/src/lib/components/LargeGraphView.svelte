@@ -47,6 +47,7 @@
     iterations = 300,
     label = 'Graph',
     marked = null,
+    dimEmpty = false,
     still = false,
     lens = NO_ENCODING,
   }: {
@@ -55,6 +56,8 @@
     selected?: string | null;
     /** Nodes to mark with a ring and keep in colour, such as the entities of a finding. */
     marked?: string[] | null;
+    /** An empty `marked` dims every node, for an active selection that holds nothing. */
+    dimEmpty?: boolean;
     onselect?: (key: string | null) => void;
     onopen?: (key: string) => void;
     /** Positions after the layout ends or is paused. */
@@ -160,7 +163,7 @@
     const k = hovered ?? selected;
     // marked nodes stand out on their own while nothing is hovered
     const marks = (marked ?? []).filter((m) => graph?.hasNode(m));
-    if (!hovered && marks.length) {
+    if (!hovered && (marks.length || (dimEmpty && marked && !marked.length))) {
       near = new Set(marks);
       if (selected && graph?.hasNode(selected)) near.add(selected);
     } else {
@@ -652,6 +655,7 @@
   $effect(() => {
     void selected;
     void marked;
+    void dimEmpty;
     if (ready) setFocusSet();
   });
 

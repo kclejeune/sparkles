@@ -13,7 +13,14 @@ import type {
   FacetsRequest,
   Term,
 } from './api';
-import { applyChanges, compact, EditError, type Change, type PatternOk } from './pattern';
+import {
+  applyChanges,
+  compact,
+  EditError,
+  type Change,
+  type Group,
+  type PatternOk,
+} from './pattern';
 import { agreesWith, editAny, patternVars, type AnyEdit, type Parse } from './pattern-edits';
 import { localName, toSparql } from './rdf';
 
@@ -39,12 +46,20 @@ export function binsFor(size: number): number {
 }
 
 /**
- * A number as SPARQL text: the shortest form that reads back as the same number, as the
- * route writes it. A very large or small number may come out with an exponent here and
- * without one there, which SPARQL reads as the same value.
+ * A number as SPARQL text, as the route writes it: the shortest digits that read back as
+ * the same number, in plain decimal notation. An exponent would make the literal an
+ * `xsd:double`, which compares differently from the route's `xsd:decimal` against a float.
  */
 export function numberText(x: number): string {
-  return String(x);
+  const s = String(x);
+  const m = /^(-?)(\d+)(?:\.(\d+))?e([+-]\d+)$/.exec(s);
+  if (!m) return s;
+  const [, sign, int, frac = '', exp] = m;
+  const digits = int + frac;
+  const point = int.length + Number(exp);
+  if (point <= 0) return `${sign}0.${'0'.repeat(-point)}${digits}`;
+  if (point >= digits.length) return `${sign}${digits}${'0'.repeat(point - digits.length)}`;
+  return `${sign}${digits.slice(0, point)}.${digits.slice(point)}`;
 }
 
 /** The condition a brush puts on its variable, the same text as the route's. */
@@ -242,12 +257,59 @@ export function varFor(property: string, taken: Set<string>): string {
   for (let i = 2; ; i++) if (!taken.has(`${base}${i}`)) return `${base}${i}`;
 }
 
+/** Every variable name written anywhere in a query's text, in filters and modifiers too. */
+export function varTokens(text: string): Set<string> {
+  const out = new Set<string>();
+  for (const m of text.matchAll(/[?$]([\p{L}\p{N}_\u00B7\u0300-\u036F\u203F-\u2040]+)/gu))
+    out.add(m[1]);
+  return out;
+}
+
+/**
+ * Why **Apply to query** cannot add brushes to a query, or null when it can. A brush
+ * added inside the WHERE group filters before the query's own result boundary, so a
+ * `LIMIT`, `OFFSET`, `GROUP BY` or `HAVING` would admit other entities than the facets
+ * counted, and the variable must be bound by the WHERE group itself.
+ */
+export function brushRefusal(p: PatternOk, v: string): string | null {
+  if (p.form !== 'select' || !p.root) return 'Apply to query needs a SELECT query';
+  if (p.limit || p.offset)
+    return 'Apply to query cannot keep the counts of a query with LIMIT or OFFSET. Remove them first';
+  const m = p.modifiers.find((x) => x.kind === 'GROUP BY' || x.kind === 'HAVING');
+  if (m) return `Apply to query cannot keep the counts of a query with ${m.kind}`;
+  const bound = p.root.items.some((it) => {
+    if (it.type === 'triple')
+      return [it.s, it.p, it.o].some((t) => t.kind === 'var' && t.value === v);
+    if (it.type === 'locked') return (it.binds ?? []).includes(v);
+    return it.type === 'group' && it.kind === 'group' && patternVarsOf(it).includes(v);
+  });
+  if (!bound) return `Apply to query needs ?${v} bound by the WHERE group, outside OPTIONAL`;
+  return null;
+}
+
+/** The variables the triples of a nested plain group bind. */
+function patternVarsOf(g: Group): string[] {
+  const out: string[] = [];
+  for (const it of g.items) {
+    if (it.type === 'triple')
+      for (const t of [it.s, it.p, it.o]) if (t.kind === 'var') out.push(t.value);
+    if (it.type === 'locked') out.push(...(it.binds ?? []));
+    if (it.type === 'group' && it.kind === 'group') out.push(...patternVarsOf(it));
+  }
+  return out;
+}
+
 /**
  * The edits **Apply to query** makes for a variable `v` of a query: for each brush, a
- * triple that binds the property to a new variable and a `FILTER` over it.
+ * triple that binds the property to a new variable and a `FILTER` over it. The new names
+ * avoid every variable the text names. It throws when the query's shape cannot keep the
+ * facets' counts (see `brushRefusal`).
  */
-export function brushEdits(p: PatternOk, v: string, brushes: Brush[]): AnyEdit[] {
-  const taken = new Set(patternVars(p));
+export function brushEdits(text: string, p: PatternOk, v: string, brushes: Brush[]): AnyEdit[] {
+  const why = brushRefusal(p, v);
+  if (why) throw new EditError(why);
+  const taken = varTokens(text);
+  for (const x of patternVars(p)) taken.add(x);
   if (p.projection?.vars) for (const x of p.projection.vars) taken.add(x);
   const prefixes = p.prologue.prefixes;
   const triples: { s: string; p: string; o: string }[] = [];

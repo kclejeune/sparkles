@@ -570,8 +570,18 @@ chosen variable of the query that ran. **Apply to query** edits the editor's tex
 U08's edits, an `add-many` of one triple per brush followed by a `filter-add` per brush,
 made one after another with a parse between them. Each step must parse strictly and pass
 U08's R3 check, or nothing is changed, and the composed change goes to the editor as one
-undoable edit. A new variable takes the property's local name and a number when the query
-uses it. The graph views now read and write the shared selection. The canvas dims what the
+undoable edit. A new variable takes the property's local name and a number when any
+variable token of the text has that name, including those that only a filter or a modifier
+names. A brush written inside the `WHERE` group filters before the query's own result
+boundary, so **Apply to query** refuses a query with `LIMIT`, `OFFSET`, `GROUP BY` or
+`HAVING`, and a variable that the `WHERE` group does not bind outside `OPTIONAL`, and says
+why. The editor's text and tab are read again after the parser loads, and a change made
+in between cancels the edit. The panel reads with the result's `reasoning=false` when the
+result was read without inferences. The result entities of the chosen variable that every
+brush keeps become the shared selection, so the graph and map tabs dim the rest. A brush
+that keeps none of them leaves an empty selection that stays active, so that the views dim
+every entity rather than none, and the selection bar reads "None selected by the facets".
+The graph views now read and write the shared selection. The canvas dims what the
 selection does not hold, the WebGL view rings the selected nodes, and a click on a node
 selects it. The selection lasts across the result's views and ends with the next run, so
 the result map no longer clears it when its tab closes, and its own selection bar gave way
@@ -584,24 +594,29 @@ that one block. The Pattern canvas shows it as a locked block until Phase 3 of U
 a form. The selection bar's **Use in query** takes the first 1,000 selected IRIs in the
 order they were selected, since only the embedding map has a centre to measure distance
 from, and says how many were left out. On the query page it binds the variable chosen
-beside the button, which starts as the result column that holds the most selected
-entities. In Explore it opens a new query of the entities and their labels.
+beside the button. The choice follows the result column that holds the most selected
+entities until the person picks a variable, and follows it again once the selection is
+cleared. In Explore it opens a new query of the entities and their labels.
 
 **Tests.** The router tests in `crates/sparkles-server/src/http/graph/facets_tests.rs`
 compare every bin with a SPARQL count of the same range (A3), check cross-filtering against
 a `GROUP BY` over the brushed people (A4), the count of the applied filter text against
 `matching` (A5), date and bar list facets, handed-back frames, node and query sets with
 their errors, candidates, the request checks, a facet over its budget, the `507` and the
-`408`. `router_tests::auth::overview` runs A8's part for the facets: a caller limited to
+`408`, a handed-back bar list that keeps its zero bars, and a query set that projects the
+helper variable's name. `router_tests::auth::overview` runs A8's part for the facets: a caller limited to
 one graph counts its half, a protected predicate counts as missing and offers no
 candidate, and a grant of the info endpoint gets `403`. The Vitest suite `facets.test.ts`
 covers the filter text, the bins, the toggles, the test of drawn values, the requests and
-the variable names, and against the browser module Apply to query and Use in query, with
-the original text kept byte for byte. The Playwright suite `ui/tests/mock/facets.spec.ts`
+the variable names, numbers without exponents, and against the browser module Apply to
+query and Use in query, with the original text kept byte for byte, variables that only a
+filter names and the refused query shapes. `selection.test.ts` covers an empty selection
+that stays active. The Playwright suite `ui/tests/mock/facets.spec.ts`
 runs A4 and the keyboard part of A10 in Explore, a bar list, the table, Apply to query from
 Explore and from the query page with the count of the applied query, Use in query from a
-result map's selection, the selection reaching the graph tab, the empty state and A10 at
-390 px with taps. The mock counts the facets with the route's queries through oxigraph.
+result map's selection and the variable that follows it, the selection reaching the
+graph tab from a map and from the query page's facets, the empty state and A10 at 390 px
+with taps. The mock counts the facets with the route's queries through oxigraph.
 `ui/tests/e2e/facets.spec.ts` runs A3 and A5 against a real server.
 
 **Limits.** Date facets count whole years, so a set whose dates fall within one year gets
@@ -613,4 +628,9 @@ estimate from 1,000 entities. Explore's facets read the dataset and not a branch
 map does. Brushes on several values of one property use `IN`, which compares literals by
 value where the bar list counts terms, so two spellings of one number would count apart
 but filter together. Open question 3, facets of IRI values by the class of the value, is
-still open.
+still open. The panel keeps its brushes while it stays open on one set. In Explore a new
+set, such as another class or a change to the drawn entities when they are the set,
+clears the brushes, and on the query page the brushes end when another tab of the result
+opens, while the selection they made stays. **Apply to query** on the query page cannot
+keep the counts of a query with `LIMIT`, `OFFSET`, `GROUP BY` or `HAVING`, so it refuses
+those queries rather than wrapping them in a subquery.

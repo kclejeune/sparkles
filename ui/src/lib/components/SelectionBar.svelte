@@ -11,6 +11,7 @@
     onuse,
     vars = [],
     usevar = $bindable(''),
+    onvarpick,
   }: {
     /** Draw the selected entities (term keys) in Explore. */
     onopengraph?: (ids: string[]) => void;
@@ -20,12 +21,14 @@
     vars?: string[];
     /** The variable chosen. */
     usevar?: string;
+    /** The person chose the variable, which then stops following the selection. */
+    onvarpick?: () => void;
   } = $props();
 
   const iris = $derived([...selection.ids].filter((id) => id.startsWith('<')));
 
   function onkey(e: KeyboardEvent) {
-    if (e.key !== 'Escape' || e.defaultPrevented || !selection.size) return;
+    if (e.key !== 'Escape' || e.defaultPrevented || !selection.active) return;
     const t = e.target as HTMLElement | null;
     if (t?.closest?.('input, textarea, select, [contenteditable], dialog, [role="dialog"]')) return;
     selection.clear();
@@ -34,10 +37,10 @@
 
 <svelte:window onkeydown={onkey} />
 
-{#if selection.size}
+{#if selection.active}
   <div class="selbar" role="region" aria-label="Selection" data-size={selection.size}>
     <span class="what"
-      ><strong>{fmtInt(selection.size)}</strong> selected{selection.source
+      ><strong>{selection.size ? fmtInt(selection.size) : 'None'}</strong> selected{selection.source
         ? ` by ${selection.source}`
         : ''}{#if selection.dropped}
         <span class="faint"
@@ -57,7 +60,11 @@
         {#if vars.length}
           <label class="as"
             >as
-            <select aria-label="The variable of the VALUES block" bind:value={usevar}>
+            <select
+              aria-label="The variable of the VALUES block"
+              bind:value={usevar}
+              onchange={() => onvarpick?.()}
+            >
               {#each vars as v (v)}<option value={v}>?{v}</option>{/each}
             </select></label
           >

@@ -381,6 +381,31 @@ async fn edges_and_bars_handed_back_give_the_same_counts() {
 }
 
 #[tokio::test]
+async fn handed_back_bars_stay_at_zero() {
+    // a set of people from France still answers every handed-back bar, so the frame keeps
+    // its bars and their toggles
+    let s = server();
+    let bars: Vec<J> = COUNTRIES
+        .iter()
+        .map(|c| json!({ "type": "literal", "value": c }))
+        .collect();
+    let nodes: Vec<String> = (0..5).map(|i| format!("{EX}p{}", i * 4)).collect();
+    let a = facets(
+        &s.app,
+        json!({ "within": { "nodes": nodes }, "facets": [
+            { "property": format!("{EX}country"), "kind": "values", "bars": bars }
+        ], "filters": [{ "property": format!("{EX}age"), "range": [0, 1000] }] }),
+    )
+    .await;
+    let v = values(facet(&a, "country"));
+    assert_eq!(v.len(), 4, "{a}");
+    assert_eq!(v["DE"], 0);
+    assert_eq!(v["IT"], 0);
+    assert_eq!(v["ES"], 0);
+    assert_eq!(v["FR"], a["matching"].as_u64().unwrap());
+}
+
+#[tokio::test]
 async fn node_and_query_sets() {
     let s = server();
     let nodes: Vec<String> = (0..20).map(|i| format!("{EX}p{i}")).collect();
@@ -405,6 +430,22 @@ async fn node_and_query_sets() {
         values(facet(&b, "country"))["IT"],
         b["matching"].as_u64().unwrap()
     );
+
+    // the query projects the helper's own name beside the chosen variable
+    let q = "PREFIX ex: <http://ex/>\nSELECT ?who ?sparkles_set WHERE { ?who a ex:Person ; ex:country \"IT\" . BIND(1 AS ?sparkles_set) }";
+    let c = facets(
+        &s.app,
+        json!({ "within": { "query": q, "variable": "who" }, "facets": [{ "property": format!("{EX}country") }] }),
+    )
+    .await;
+    assert_eq!(c["size"], 50, "{c}");
+    let q = "PREFIX ex: <http://ex/>\nSELECT ?sparkles_set WHERE { ?sparkles_set a ex:Person ; ex:country \"IT\" }";
+    let c = facets(
+        &s.app,
+        json!({ "within": { "query": q, "variable": "sparkles_set" }, "facets": [{ "property": format!("{EX}country") }] }),
+    )
+    .await;
+    assert_eq!(c["size"], 50, "{c}");
 
     for (body, why) in [
         (

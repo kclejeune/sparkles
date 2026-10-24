@@ -102,8 +102,8 @@ pub struct FacetSpec {
     pub kind: Option<Kind>,
     /// the edges of the ranges from an earlier answer, kept as they are
     pub edges: Option<Vec<f64>>,
-    /// the values of a bar list from an earlier answer, as SPARQL terms
-    pub bars: Option<Vec<String>>,
+    /// the values of a bar list from an earlier answer
+    pub bars: Option<Vec<Term>>,
 }
 
 /// A brush: a range of a numeric or date facet, or values of a bar list.
@@ -158,6 +158,11 @@ fn check_keys(o: &serde_json::Map<String, J>, allowed: &[&str], what: &str) -> R
 /// A term of the SPARQL JSON results format, `{"type": "uri", "value": …}` or
 /// `{"type": "literal", "value": …, "datatype"?: …, "xml:lang"?: …}`, as SPARQL text.
 pub fn term_from_json(v: &J, what: &str) -> Result<String> {
+    rdf_term_from_json(v, what).map(|t| t.to_string())
+}
+
+/// A term of the SPARQL JSON results format as an RDF term.
+pub fn rdf_term_from_json(v: &J, what: &str) -> Result<Term> {
     let o = v.as_object().ok_or_else(|| {
         bad(format!(
             "{what} must be a term such as {{\"type\": \"literal\", \"value\": \"FR\"}}"
@@ -171,7 +176,7 @@ pub fn term_from_json(v: &J, what: &str) -> Result<String> {
         Some("uri") => {
             let n = oxrdf::NamedNode::new(value)
                 .map_err(|e| bad(format!("{what}: invalid IRI '{value}': {e}")))?;
-            Ok(n.to_string())
+            Ok(Term::NamedNode(n))
         }
         Some("literal") | Some("typed-literal") => {
             let lit = match (
@@ -187,7 +192,7 @@ pub fn term_from_json(v: &J, what: &str) -> Result<String> {
                 }
                 (None, None) => oxrdf::Literal::new_simple_literal(value),
             };
-            Ok(lit.to_string())
+            Ok(Term::Literal(lit))
         }
         _ => Err(bad(format!(
             "{what}.type must be \"uri\" or \"literal\": blank nodes cannot be named in a request"
@@ -404,7 +409,7 @@ fn facet_spec(v: &J) -> Result<FacetSpec> {
             }
             Some(
                 a.iter()
-                    .map(|t| term_from_json(t, "facets[].bars[]"))
+                    .map(|t| rdf_term_from_json(t, "facets[].bars[]"))
                     .collect::<Result<Vec<_>>>()?,
             )
         }
@@ -729,9 +734,9 @@ fn set_pattern(set: &FacetSet, opts: &QueryOptions) -> Result<String> {
                     "within.query may not have FROM or FROM NAMED: name the graphs with default-graph-uri and named-graph-uri",
                 ));
             }
-            let mut projected = false;
-            pattern.on_in_scope_variable(|v| projected |= v.as_str() == variable);
-            if !projected {
+            let mut names: Vec<String> = Vec::new();
+            pattern.on_in_scope_variable(|v| names.push(v.as_str().to_string()));
+            if !names.iter().any(|n| n == variable) {
                 return Err(bad(format!("within.query does not project ?{variable}")));
             }
             // the query as text with every IRI written out, so that it needs no prologue,
@@ -742,13 +747,20 @@ fn set_pattern(set: &FacetSet, opts: &QueryOptions) -> Result<String> {
                 base_iri: None,
             }
             .to_string();
-            let inner = if variable == "sparkles_set" {
-                "?sparkles_set".to_string()
+            // a helper name that none of the query's own variables takes
+            let mut helper = "sparkles_set".to_string();
+            let mut n = 2;
+            while names.iter().any(|x| *x == helper && x != variable) {
+                helper = format!("sparkles_set{n}");
+                n += 1;
+            }
+            let inner = if variable == helper.as_str() {
+                format!("?{helper}")
             } else {
-                format!("(?{variable} AS ?sparkles_set)")
+                format!("(?{variable} AS ?{helper})")
             };
             format!(
-                "{{ SELECT (?sparkles_set AS ?s) WHERE {{ {{ SELECT DISTINCT {inner} WHERE {{ {text} }} }} FILTER(BOUND(?sparkles_set)) }} }}\n"
+                "{{ SELECT (?{helper} AS ?s) WHERE {{ {{ SELECT DISTINCT {inner} WHERE {{ {text} }} }} FILTER(BOUND(?{helper})) }} }}\n"
             )
         }
     })
@@ -845,8 +857,8 @@ fn facet(ctx: &Ctx, spec: &FacetSpec, others: &str) -> Result<J> {
 
 fn values_facet(ctx: &Ctx, spec: &FacetSpec, others: &str) -> Result<J> {
     let p = &spec.property;
-    let (bars, terms): (Vec<String>, Vec<Option<Term>>) = match &spec.bars {
-        Some(b) => (b.clone(), vec![None; b.len()]),
+    let terms: Vec<Term> = match &spec.bars {
+        Some(b) => b.clone(),
         None => {
             let q = format!(
                 "SELECT ?v (COUNT(DISTINCT ?s) AS ?n) WHERE {{\n{}?s <{p}> ?v .\nFILTER(isIRI(?v) || isLiteral(?v))\n}} GROUP BY ?v ORDER BY DESC(?n) ?v LIMIT {}",
@@ -854,17 +866,13 @@ fn values_facet(ctx: &Ctx, spec: &FacetSpec, others: &str) -> Result<J> {
             );
             let r = ctx.select(&q)?;
             let c = r.col("v");
-            let t: Vec<Term> = r
-                .rows
+            r.rows
                 .iter()
                 .filter_map(|row| get(row, c).cloned())
-                .collect();
-            (
-                t.iter().map(Term::to_string).collect(),
-                t.into_iter().map(Some).collect(),
-            )
+                .collect()
         }
     };
+    let bars: Vec<String> = terms.iter().map(Term::to_string).collect();
     let base = ctx.count(others)?;
     let q = format!(
         "SELECT (COUNT(DISTINCT ?s) AS ?n) WHERE {{\n{}{others}FILTER NOT EXISTS {{ ?s <{p}> ?any }}\n}}",
@@ -894,20 +902,24 @@ fn values_facet(ctx: &Ctx, spec: &FacetSpec, others: &str) -> Result<J> {
     } else {
         unbound = base;
     }
-    let iris: Vec<String> = bars
+    let iris: Vec<String> = terms
         .iter()
-        .filter_map(|b| b.strip_prefix('<').and_then(|x| x.strip_suffix('>')))
-        .map(str::to_string)
+        .filter_map(|t| match t {
+            Term::NamedNode(n) => Some(n.as_str().to_string()),
+            _ => None,
+        })
         .collect();
     let refs: Vec<&str> = iris.iter().map(String::as_str).collect();
     let names = ctx.run.labels(&refs)?;
+    // every bar is answered, with 0 when no entity names it, so that a handed-back frame
+    // keeps its bars and their toggles
     let values: Vec<J> = bars
         .iter()
         .zip(terms)
-        .filter_map(|(b, t)| {
+        .map(|(b, t)| {
             let (term, c) = match counts.get(b) {
                 Some((t, c)) => (t.clone(), *c),
-                None => (t?, 0),
+                None => (t, 0),
             };
             let mut o = json!({ "value": term_json(&term), "count": c });
             if let Term::NamedNode(n) = &term
@@ -915,7 +927,7 @@ fn values_facet(ctx: &Ctx, spec: &FacetSpec, others: &str) -> Result<J> {
             {
                 o["label"] = l.clone().into();
             }
-            Some(o)
+            o
         })
         .collect();
     Ok(json!({

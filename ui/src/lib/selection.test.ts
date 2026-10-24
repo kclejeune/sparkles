@@ -30,6 +30,26 @@ describe('the shared selection', () => {
     expect(s.source).toBe('');
   });
 
+  it('keeps an empty selection active when its source asks, so the views dim everything', () => {
+    const s = new SharedSelection();
+    s.set([], 'the facets');
+    expect(s.active).toBe(false);
+    s.set([], 'the facets', { keepEmpty: true });
+    expect(s.active).toBe(true);
+    expect(s.size).toBe(0);
+    expect(s.source).toBe('the facets');
+    expect(s.announcement).toBe('None selected by the facets');
+    s.set(['<a>'], 'the facets', { keepEmpty: true });
+    expect(s.active).toBe(true);
+    s.clear();
+    expect(s.active).toBe(false);
+    expect(s.source).toBe('');
+    s.set([], 'the facets', { keepEmpty: true });
+    s.clear();
+    expect(s.active).toBe(false);
+    expect(s.announcement).toBe('Selection cleared');
+  });
+
   it('clears, and says so', () => {
     const s = new SharedSelection();
     s.set(['<a>'], 'the map');

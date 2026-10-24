@@ -1592,7 +1592,10 @@ values of** chooses the variable. **Apply to query** adds to the editor's query,
 brush, a triple that binds the property to a new variable and a `FILTER` over it, such as
 `?person ex:age ?age .` and `FILTER(?age >= 30 && ?age < 45)`, and leaves the rest of the
 text as it was. The filter is the one the server applied, so the query's distinct count of
-the variable equals the panel's count. `Mod+Z` undoes the edit.
+the variable equals the panel's count. `Mod+Z` undoes the edit. A query with `LIMIT`,
+`OFFSET`, `GROUP BY` or `HAVING` would count other entities once the filters sit inside its
+`WHERE` group, so **Apply to query** refuses it and says why. The result entities that the
+brushes keep become the selection, so the **Graph** and **Map** tabs dim the others.
 
 With a histogram focused, the arrow keys move a cursor over the bins, `Shift` with an arrow
 brushes from where the cursor was, `Enter` brushes the bin under the cursor, and `Escape`

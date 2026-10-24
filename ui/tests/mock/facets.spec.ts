@@ -171,6 +171,9 @@ test('A5 on the query page: the facets of a variable, Apply to query, and the co
   await expect(count).toContainText(/of 41 match/);
   await page.waitForTimeout(400);
   const matching = Number((await count.locator('strong').innerText()).replace(/,/g, ''));
+  // the people of the result the brushes keep become the selection, which the graph dims by
+  const bar = page.getByRole('region', { name: 'Selection' });
+  await expect(bar).toContainText('selected by the facets');
   await panel.getByRole('button', { name: 'Apply to query' }).click();
   await expect(editor).toContainText('?person ex:worksFor ?worksFor .');
   await expect(editor).toContainText('?person ex:age ?age .');
@@ -182,6 +185,10 @@ test('A5 on the query page: the facets of a variable, Apply to query, and the co
   );
   expect(now.startsWith(`${PREFIXES}SELECT ?person ?city WHERE {`)).toBe(true);
   expect(now.trimEnd().endsWith('ORDER BY ?person')).toBe(true);
+  // the selection stays when the Graph tab opens, and the graph dims what it does not hold
+  await results.getByRole('tab', { name: 'Graph' }).click();
+  await expect(bar).toContainText('selected by the facets');
+  await expect(page.locator('.wrap[data-muted]')).not.toHaveAttribute('data-muted', '0');
   // the applied query counts what the panel said
   await page.getByRole('button', { name: /^Run\b/ }).click();
   await expect(results.getByRole('tab', { name: /Table/ })).toContainText(String(matching));
@@ -214,7 +221,19 @@ test('a selection on a result map reaches its graph and becomes a VALUES block w
   await expect(bar).toContainText(`${size} selected by the map`);
   // Use in query writes the selected entities as VALUES on the chosen variable
   const as = bar.getByRole('combobox', { name: /variable of the VALUES block/ });
-  await expect(as).toHaveValue(/person|city/);
+  // the variable follows the column that holds the selection until the person picks one,
+  // and follows it again once the selection is cleared
+  const first = await as.inputValue();
+  const other = first === 'person' ? 'city' : 'person';
+  await as.selectOption(other);
+  await bar.getByRole('button', { name: 'Clear' }).click();
+  await expect(bar).toHaveCount(0);
+  await results.getByRole('tab', { name: 'Map' }).click();
+  await arcmap.locator('details.list summary').click();
+  await arcmap.getByRole('list', { name: 'Markers in view' }).getByRole('button').first().click();
+  await expect(bar).toContainText('selected by the map');
+  await expect(as).toHaveValue(first);
+  await results.getByRole('tab', { name: 'Graph' }).click();
   await as.selectOption('person');
   await bar.getByRole('button', { name: 'Use in query' }).click();
   await expect(editor).toContainText('VALUES ?person {');
