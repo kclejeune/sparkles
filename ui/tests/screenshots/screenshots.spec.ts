@@ -154,21 +154,26 @@ test('explore', async ({ page }) => {
 });
 
 test('path-finder', async ({ page }) => {
-  // without the step-by-step animation, so the picture shows every path at once
+  // without the step-by-step animation, so the picture shows every path at once; along
+  // foaf:knows only, in its direction, the three shortest paths share no one in between
   await page.emulateMedia({ reducedMotion: 'reduce' });
   await page.goto(
-    `/ui/explore?ds=${DATASET}&iri=${encodeURIComponent('http://example.org/person/ada-okafor')}`,
+    `/ui/explore?ds=${DATASET}&iri=${encodeURIComponent('http://example.org/person/freya-lindqvist')}`,
   );
   await expect(page.locator('canvas').first()).toBeVisible();
   await page.getByRole('button', { name: 'Paths', exact: true }).click();
   const panel = page.getByRole('region', { name: 'Paths' });
-  await expect(panel.locator('#path-from').locator('..')).toContainText('Ada Okafor');
-  await panel.getByRole('combobox', { name: 'To' }).fill('Carlos');
+  await expect(panel.locator('#path-from').locator('..')).toContainText('Freya Lindqvist');
+  await panel.getByRole('combobox', { name: 'To' }).fill('Luk');
   await panel
-    .getByRole('option', { name: /Carlos Mendes/ })
+    .getByRole('option', { name: /Lukáš Novák/ })
     .first()
     .click();
   await panel.getByLabel('k shortest').check();
+  await panel.getByLabel('Direction').selectOption('forward');
+  await panel.getByLabel('only', { exact: true }).check();
+  await panel.getByRole('combobox', { name: 'Add a predicate' }).fill('foaf:knows');
+  await panel.getByRole('combobox', { name: 'Add a predicate' }).press('Enter');
   await panel.getByRole('button', { name: 'Find paths' }).click();
   await expect(panel.getByRole('listbox', { name: 'Paths found' }).getByRole('option')).toHaveCount(
     3,
