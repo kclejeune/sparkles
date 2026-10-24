@@ -296,7 +296,7 @@ export function modelFields(k: SettingsKind | null): FieldDef[] {
     for (const d of fieldsOf(roles, ['roles'], { set: MODELS_SCHEMA, group: 'Roles' })) {
       if (d.type === 'records') {
         d.entry = d.entry?.map((f) =>
-          f.path === 'provider' ? { ...f, type: 'enum', options: chat } : f,
+          f.path === 'provider' ? { ...f, type: 'enum', options: chat, openOptions: true } : f,
         );
         d.emptyText = 'Empty list: the role is off.';
         d.keyLabel = 'entry';
@@ -334,22 +334,18 @@ export function modelSuggestions(
 }
 
 /**
- * The checks of the role lists that need the rest of the form, as the server makes them:
- * a provider that answers prompts, and a model its allowed models permit. The answer is
- * keyed by the dotted path of the member, such as `roles.draft.1.model`.
+ * The checks of the role lists that need the rest of the configuration, as the server
+ * makes them: a provider that is defined and answers prompts, and a model its allowed
+ * models permit. `effective` is the configuration the pending change gives, so a change
+ * that adds a provider and a role entry naming it passes. The answer is keyed by the
+ * dotted path of the member, such as `roles.draft.1.model`.
  */
 export function roleErrors(
-  k: SettingsKind | null,
+  effective: JsonObject | undefined,
   form: Record<string, unknown>,
 ): Record<string, string> {
   const out: Record<string, string> = {};
-  const kinds = providerKinds(k);
-  const allowed = (provider: string): unknown => {
-    const path = pathString(['providers', provider, 'allowedModels']);
-    return path in form
-      ? form[path]
-      : getAt(k?.effective, ['providers', provider, 'allowedModels']);
-  };
+  const providers = (effective?.providers as Record<string, JsonObject> | undefined) ?? {};
   for (const role of ROLES) {
     const list = form[pathString(['roles', role])];
     if (!Array.isArray(list)) continue;
@@ -359,14 +355,13 @@ export function roleErrors(
       const model = typeof entry.model === 'string' ? entry.model.trim() : '';
       const at = (m: string) => pathString(['roles', role, String(i), m]);
       if (!provider) return;
-      if (!(provider in kinds)) out[at('provider')] = `No provider named ${provider} is defined`;
-      else if (kinds[provider] === 'local')
+      const p = providers[provider];
+      if (!p || typeof p !== 'object')
+        out[at('provider')] = `No provider named ${provider} is defined`;
+      else if (p.kind === 'local')
         out[at('provider')] = `${provider} computes embeddings and does not answer prompts`;
-      else {
-        const a = allowed(provider);
-        if (model && Array.isArray(a) && !a.includes(model))
-          out[at('model')] = `${provider} does not allow ${model} (allowed models)`;
-      }
+      else if (model && Array.isArray(p.allowedModels) && !p.allowedModels.includes(model))
+        out[at('model')] = `${provider} does not allow ${model} (allowed models)`;
     });
   }
   return out;

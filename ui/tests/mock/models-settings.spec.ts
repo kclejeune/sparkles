@@ -137,6 +137,16 @@ test('a server refusal shows beside the field it names', async ({ page }) => {
   await expect(headers.getByLabel('Headers header 2')).toHaveAttribute('aria-invalid', 'true');
   await headers.getByRole('button', { name: 'Remove Authorization' }).click();
   await expect(headers.getByText('carries a key')).toHaveCount(0);
+  // a rename onto another header's name, in any case, is refused and keeps both
+  await headers.getByPlaceholder('New header').fill('X-Other');
+  await headers.getByLabel('Value of the new header').fill('b');
+  await headers.getByRole('button', { name: 'Add', exact: true }).click();
+  await headers.getByLabel('Headers header 2').fill('x-team');
+  await headers.getByLabel('Headers header 2').press('Tab');
+  await expect(headers.getByText('X-Team is set already')).toBeVisible();
+  await expect(headers.getByLabel('Value of X-Team')).toHaveValue('search');
+  await expect(headers.getByLabel('Value of X-Other')).toHaveValue('b');
+  await headers.getByRole('button', { name: 'Remove X-Other' }).click();
 
   // a role entry the server refuses names its row
   const draft = row('roles.draft');

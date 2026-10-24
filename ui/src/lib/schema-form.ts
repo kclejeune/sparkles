@@ -152,6 +152,7 @@ export function fieldsOf(
   base: readonly string[],
   ctx: SchemaContext,
   section?: string,
+  optionalParent = false,
 ): FieldDef[] {
   const s = deref(ctx.set, raw);
   const required = new Set(s.required ?? []);
@@ -165,10 +166,12 @@ export function fieldsOf(
     if (control === 'object') {
       // the outermost object of several members names the section of its fields
       const several = members(ms).filter(([, x]) => applies(x, ctx)).length > 1;
-      out.push(...fieldsOf(ms, path, ctx, at ?? (several ? ms.title : undefined)));
+      // the members of an optional object are optional, since the object may go
+      const optional = optionalParent || !required.has(name);
+      out.push(...fieldsOf(ms, path, ctx, at ?? (several ? ms.title : undefined), optional));
       continue;
     }
-    out.push(fieldOf(ms, path, ctx, !required.has(name), at));
+    out.push(fieldOf(ms, path, ctx, optionalParent || !required.has(name), at));
   }
   return out;
 }
@@ -205,6 +208,8 @@ export function fieldOf(
     def.pattern = s.pattern;
     def.patternText = patternText(label, s);
   }
+  // free text, such as an embedding prefix, keeps its spaces
+  if (def.type === 'text' && !s.pattern && !s.format) def.literal = true;
   switch (def.type) {
     case 'enum':
       def.options = enumValues(s, ctx);

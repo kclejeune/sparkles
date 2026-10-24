@@ -11,6 +11,7 @@
     getAt,
     parsePath,
     pathString,
+    inheritedFor,
     valueText,
     withAt,
     type FieldDef,
@@ -110,10 +111,13 @@
     return parts.length ? parts.join(' · ') : 'no options';
   }
 
-  const placeholderOf = (f: FieldDef) => {
-    const v = inherited[f.path];
-    if (v !== undefined) return `${valueText(v, 24)} (provider)`;
-    return undefined;
+  const placeholderOf = (f: FieldDef, entry: unknown) => {
+    const own = inheritedFor(fields, entry, inherited);
+    const v = own[f.path];
+    if (v === undefined) return undefined;
+    return inherited[f.path] === v && v !== f.fallback
+      ? `${valueText(v, 24)} (provider)`
+      : valueText(v, 24);
   };
 </script>
 
@@ -149,7 +153,7 @@
                     )}"
                     {disabled}
                     error={err(name, f)}
-                    placeholder={placeholderOf(f)}
+                    placeholder={placeholderOf(f, x)}
                     onchange={(v) => setMember(name, f, v)}
                   />
                 {/each}

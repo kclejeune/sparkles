@@ -546,6 +546,13 @@ describe('the form and the JSON editor share one change', () => {
       endpoint: 'http://r',
     });
     expect(previewEffective(kk, kk.runtime)).toBe(kk.effective);
+    // the preview never changes the kind it starts from
+    const before = JSON.stringify(kk.effective);
+    const freeze = (v: unknown): unknown =>
+      v && typeof v === 'object' ? Object.freeze(Object.values(v).forEach(freeze) ?? v) : v;
+    freeze(kk.effective);
+    previewEffective(kk, withAt(kk.runtime, ['zzz'], 9));
+    expect(JSON.stringify(kk.effective)).toBe(before);
   });
 
   it('applies merge patches and drops empty objects as the server does', () => {

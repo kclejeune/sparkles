@@ -91,7 +91,7 @@
   const removed = $derived(removedProviders(kind));
 
   /** The checks of the role lists against the providers and their allowed models. */
-  const checkRoles = (form: FormValues) => roleErrors(kind, form);
+  const checkRoles = (form: FormValues, effective: JsonObject) => roleErrors(effective, form);
 
   /** Suggestions, inherited values and declared names for the structured fields. */
   function extras(d: FieldDef): FieldExtras {

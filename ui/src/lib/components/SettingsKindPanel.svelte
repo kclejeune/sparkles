@@ -43,6 +43,7 @@
     patchKind,
     pathString,
     pendingLayer,
+    previewEffective,
     readKind,
     rebase,
     resetFields,
@@ -103,8 +104,11 @@
      * that needs an acknowledgement first.
      */
     confirmWrite?: (patch: JsonObject, effective: JsonObject) => Promise<boolean>;
-    /** Checks that need several fields, by the dotted path of the member they concern. */
-    check?: (form: FormValues) => Record<string, string>;
+    /**
+     * Checks that need several fields, by the dotted path of the member they concern,
+     * given the form and the effective object the pending change gives.
+     */
+    check?: (form: FormValues, effective: JsonObject) => Record<string, string>;
     /** What a structured field's editor needs, by field. */
     extras?: (def: FieldDef) => FieldExtras;
     /** The secrets a `secret` field names, and how to store a key under one. */
@@ -143,7 +147,9 @@
   const dirty = $derived(dirtyFields(fields, initial, st.form));
   /** The runtime layer a save would leave, and what does not read. */
   const pending = $derived(k ? pendingLayer(fields, k, st) : null);
-  const crossErrors = $derived(check ? check(st.form) : {});
+  const crossErrors = $derived(
+    check && k && pending ? check(st.form, previewEffective(k, pending.layer)) : {},
+  );
   /** Every member error, by its whole dotted path. */
   const memberErrors = $derived({
     ...(pending?.entryErrors ?? {}),

@@ -126,8 +126,8 @@ fn model_options() -> (Vec<&'static str>, J) {
             "additionalProperties": false,
             "x-sparkles-order": ["inputPerMTok", "outputPerMTok"],
             "properties": {
-                "inputPerMTok": at_least(titled(num(), "Input price", "The price of a million input tokens."), 0.0),
-                "outputPerMTok": at_least(titled(num(), "Output price", "The price of a million output tokens."), 0.0),
+                "inputPerMTok": default(at_least(titled(num(), "Input price", "The price of a million input tokens. A model's prices replace the provider's both at once."), 0.0), json!(0)),
+                "outputPerMTok": default(at_least(titled(num(), "Output price", "The price of a million output tokens. A model's prices replace the provider's both at once."), 0.0), json!(0)),
             },
         },
         "repo": kinds(titled(string(), "Repository", "The Hugging Face repository of the model's snapshot."), local),

@@ -33,7 +33,19 @@
   let addError = $state<string | null>(null);
   const what = $derived(def.keyLabel ?? 'name');
 
+  /** Why a row's new name was refused, by row. */
+  let renameError = $state<Record<number, string>>({});
+
   function rename(i: number, to: string) {
+    const clash = pairs.find(([n], j) => j !== i && n.toLowerCase() === to.toLowerCase());
+    if (!to || clash) {
+      renameError = {
+        ...renameError,
+        [i]: to ? `${clash![0]} is set already` : `A ${what} needs a name`,
+      };
+      return;
+    }
+    renameError = Object.fromEntries(Object.entries(renameError).filter(([j]) => Number(j) !== i));
     const next: JsonObject = {};
     pairs.forEach(([n, v], j) => (next[j === i ? to : n] = v));
     onchange(next);
@@ -64,7 +76,7 @@
   {:else}
     <ul class="rows" aria-label={def.label}>
       {#each pairs as [n, v], i (i)}
-        {@const e = errors[pathString([n])]}
+        {@const e = renameError[i] ?? errors[pathString([n])]}
         <li>
           <div class="row">
             <input

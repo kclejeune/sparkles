@@ -20,7 +20,15 @@ import {
   secretState,
   type SecretInfo,
 } from './models-settings';
-import { fieldInfo, formOf, formPatch, fromForm, type SettingsKind } from './settings';
+import {
+  checkStructured,
+  fieldInfo,
+  formOf,
+  formPatch,
+  fromForm,
+  inheritedFor,
+  type SettingsKind,
+} from './settings';
 
 /** A `models` kind: claude declared with its endpoint locked, local removed at runtime. */
 const models = (over: Partial<SettingsKind> = {}): SettingsKind => ({
@@ -153,17 +161,64 @@ describe('the form of the models kind', () => {
   it('checks role entries against the providers and their allowed models', () => {
     const k = models();
     const form = {
-      'providers.claude.allowedModels': ['a'],
       'roles.draft': [
         { provider: 'claude', model: 'c' },
         { provider: 'nope', model: 'm' },
         { provider: 'claude', model: 'a' },
+        { provider: 'q', model: 'm' },
       ],
     };
-    expect(roleErrors(k, form)).toEqual({
+    const providers = k.effective.providers as Record<string, Record<string, unknown>>;
+    const pending = {
+      ...k.effective,
+      providers: {
+        ...providers,
+        claude: { ...providers.claude, allowedModels: ['a'] },
+        // a provider that the pending change adds, as an Advanced JSON edit can
+        q: { kind: 'openai', endpoint: 'http://q/v1' },
+      },
+    };
+    expect(roleErrors(pending, form)).toEqual({
       'roles.draft.0.model': 'claude does not allow c (allowed models)',
       'roles.draft.1.provider': 'No provider named nope is defined',
     });
+    // the provider select lists the loaded providers, but a new one is not refused there
+    const draft = modelFields(k).find((d) => d.path === 'roles.draft')!;
+    expect(checkStructured(draft, [{ provider: 'q', model: 'm' }])).toEqual({});
+  });
+
+  it('keeps the spaces of free text, and trims formatted text', () => {
+    const k = models();
+    k.effective.providers = { emb: { kind: 'local' } };
+    const f = Object.fromEntries(modelFields(k).map((d) => [d.path, d]));
+    expect(f['providers.emb.queryPrefix'].literal).toBe(true);
+    expect(fromForm(f['providers.emb.queryPrefix'], 'query: ')).toEqual({ ok: 'query: ' });
+    expect(fromForm(f['providers.emb.queryPrefix'], '   ')).toEqual({ ok: undefined });
+    const claude = Object.fromEntries(modelFields(models()).map((d) => [d.path, d]));
+    expect(claude['providers.claude.endpoint'].literal).toBeUndefined();
+    expect(fromForm(claude['providers.claude.endpoint'], ' https://x ')).toEqual({
+      ok: 'https://x',
+    });
+  });
+
+  it('lets an optional key reference go', () => {
+    const k = models();
+    const defs = modelFields(k);
+    const key = defs.find((d) => d.path === 'providers.claude.apiKey.secret')!;
+    expect(key.optional).toBe(true);
+    const initial = formOf(defs, k.effective);
+    const form = { ...initial, 'providers.claude.apiKey.secret': '' };
+    const r = formPatch(defs, initial, form, k.effective);
+    expect(r.errors).toEqual({});
+    expect(r.patch).toEqual({ providers: { claude: { apiKey: { secret: null } } } });
+  });
+
+  it('shows what a model inherits, and the default of a price its entry replaces', () => {
+    const perModel = modelFields(models()).find((d) => d.path === 'providers.claude.models')!;
+    const inherited = { temperature: 0.4, 'pricing.inputPerMTok': 1, 'pricing.outputPerMTok': 10 };
+    expect(inheritedFor(perModel.entry!, {}, inherited)).toMatchObject(inherited);
+    const own = inheritedFor(perModel.entry!, { pricing: { inputPerMTok: 2 } }, inherited);
+    expect(own).toMatchObject({ temperature: 0.4, 'pricing.outputPerMTok': 0 });
   });
 
   it('suggests the models a provider names anywhere', () => {

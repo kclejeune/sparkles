@@ -402,6 +402,10 @@ export type FieldDef = {
   unit?: string;
   /** A field the server leaves unset by default: an empty input removes the value. */
   optional?: boolean;
+  /** `text`: the value is kept as typed, with its leading and trailing spaces. */
+  literal?: boolean;
+  /** `enum`: the options are the known values, and other values are checked elsewhere. */
+  openOptions?: boolean;
   placeholder?: string;
   /** The heading of the group of fields the field belongs to. */
   group?: string;
@@ -488,7 +492,7 @@ export function checkValue(def: FieldDef, v: unknown): string | null {
       return null;
     }
     case 'enum':
-      return typeof v === 'string' && (def.options ?? []).includes(v)
+      return typeof v === 'string' && (def.openOptions || (def.options ?? []).includes(v))
         ? null
         : `${def.label} is not one of the values`;
     case 'text':
@@ -608,10 +612,31 @@ export function fromForm(
         return { error: `${def.label} is not JSON: ${e instanceof Error ? e.message : e}` };
       }
     default: {
-      const e = checkValue(def, t);
-      return e ? { error: e } : { ok: t };
+      const v = def.literal ? String(f) : t;
+      const e = checkValue(def, v);
+      return e ? { error: e } : { ok: v };
     }
   }
+}
+
+/**
+ * The placeholders of a map entry's members: the value each inherits from `inherited`,
+ * except for a member of a nested object the entry sets itself, which the entry's object
+ * replaces whole on the server, so it takes its own default.
+ */
+export function inheritedFor(
+  fields: readonly FieldDef[],
+  entry: unknown,
+  inherited: Record<string, unknown>,
+): Record<string, unknown> {
+  const out: Record<string, unknown> = {};
+  for (const f of fields) {
+    const p = parsePath(f.path);
+    if (p.length > 1 && getAt(entry, p.slice(0, -1)) !== undefined) {
+      if (f.fallback !== undefined) out[f.path] = f.fallback;
+    } else if (inherited[f.path] !== undefined) out[f.path] = inherited[f.path];
+  }
+  return out;
 }
 
 /**
@@ -732,11 +757,12 @@ export function previewEffective(k: SettingsKind, layer: JsonObject): JsonObject
     }
     return out;
   };
-  const out = walk(k.effective, patch, k.declared, layer) as JsonObject;
+  let out = walk(k.effective, patch, k.declared, layer) as JsonObject;
+  // copies along the path, since the members the patch leaves alone are the kind's own
   for (const l of k.locked) {
     const p = parsePath(l);
     const v = getAt(k.effective, p);
-    if (v !== undefined) setAt(out, p, clone(v));
+    if (v !== undefined) out = withAt(out, p, clone(v));
   }
   return out;
 }

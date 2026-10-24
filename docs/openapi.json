@@ -10855,13 +10855,15 @@
             "description": "Prices per million tokens, for cost estimates only.",
             "properties": {
               "inputPerMTok": {
-                "description": "The price of a million input tokens.",
+                "default": 0,
+                "description": "The price of a million input tokens. A model's prices replace the provider's both at once.",
                 "minimum": 0.0,
                 "title": "Input price",
                 "type": "number"
               },
               "outputPerMTok": {
-                "description": "The price of a million output tokens.",
+                "default": 0,
+                "description": "The price of a million output tokens. A model's prices replace the provider's both at once.",
                 "minimum": 0.0,
                 "title": "Output price",
                 "type": "number"
@@ -11213,13 +11215,15 @@
             "description": "Prices per million tokens, for cost estimates only.",
             "properties": {
               "inputPerMTok": {
-                "description": "The price of a million input tokens.",
+                "default": 0,
+                "description": "The price of a million input tokens. A model's prices replace the provider's both at once.",
                 "minimum": 0.0,
                 "title": "Input price",
                 "type": "number"
               },
               "outputPerMTok": {
-                "description": "The price of a million output tokens.",
+                "default": 0,
+                "description": "The price of a million output tokens. A model's prices replace the provider's both at once.",
                 "minimum": 0.0,
                 "title": "Output price",
                 "type": "number"

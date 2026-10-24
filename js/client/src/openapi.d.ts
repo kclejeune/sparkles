@@ -6870,14 +6870,16 @@ export interface components {
             pricing?: {
                 /**
                  * Input price
-                 * @description The price of a million input tokens.
+                 * @description The price of a million input tokens. A model's prices replace the provider's both at once.
+                 * @default 0
                  */
-                inputPerMTok?: number;
+                inputPerMTok: number;
                 /**
                  * Output price
-                 * @description The price of a million output tokens.
+                 * @description The price of a million output tokens. A model's prices replace the provider's both at once.
+                 * @default 0
                  */
-                outputPerMTok?: number;
+                outputPerMTok: number;
             };
             /**
              * Query prefix
@@ -7045,14 +7047,16 @@ export interface components {
             pricing?: {
                 /**
                  * Input price
-                 * @description The price of a million input tokens.
+                 * @description The price of a million input tokens. A model's prices replace the provider's both at once.
+                 * @default 0
                  */
-                inputPerMTok?: number;
+                inputPerMTok: number;
                 /**
                  * Output price
-                 * @description The price of a million output tokens.
+                 * @description The price of a million output tokens. A model's prices replace the provider's both at once.
+                 * @default 0
                  */
-                outputPerMTok?: number;
+                outputPerMTok: number;
             };
             /**
              * Query prefix
