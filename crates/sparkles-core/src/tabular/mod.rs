@@ -98,6 +98,139 @@ pub struct Options {
     /// Columns (by name or header) whose cell values are counted into
     /// [`Stats::tallies`], with at most [`TALLY_DISTINCT`] distinct values for each.
     pub tally: Vec<String>,
+    /// CSVW's standard mode: the table group, table and row descriptions around the
+    /// minimal-mode triples (spec F19 §6.1).
+    pub standard: bool,
+    /// Check primary and foreign keys (spec F19 §6.2, §6.3), with the values of
+    /// referenced columns shared through this registry by the tables of one load.
+    pub keys: Option<Arc<KeyRegistry>>,
+    /// The target dataset a template reads (spec F19 §7.2).
+    pub lookup: Option<template::Lookup>,
+}
+
+/// The values of the columns that foreign keys reference, collected while their tables
+/// convert and read while the referencing tables convert. The tables of a group must
+/// convert in the order of [`key_order`].
+#[derive(Default)]
+pub struct KeyRegistry {
+    sets: parking_lot::Mutex<std::collections::HashMap<(usize, Vec<String>), Arc<KeySet>>>,
+    used: std::sync::atomic::AtomicU64,
+    /// the bytes the key sets of a load may hold (`None`: unbounded, as on the command
+    /// line)
+    pub budget: Option<u64>,
+}
+
+type KeySet = std::collections::HashSet<Vec<String>>;
+
+impl KeyRegistry {
+    pub fn new(budget: Option<u64>) -> KeyRegistry {
+        KeyRegistry {
+            budget,
+            ..Default::default()
+        }
+    }
+
+    /// Charge `n` bytes of key values; fails past the budget.
+    fn charge(&self, n: u64, what: &str) -> std::result::Result<(), String> {
+        let used = self.used.fetch_add(n, std::sync::atomic::Ordering::Relaxed) + n;
+        match self.budget {
+            Some(b) if used > b => Err(format!(
+                "{what} needs more than the memory budget of {} for the key values",
+                crate::error::human_bytes(b)
+            )),
+            _ => Ok(()),
+        }
+    }
+}
+
+/// The table of `m` that a foreign key references: by its `resource` URL, or by the
+/// `@id` of its schema.
+fn referenced_table(m: &Metadata, fk: &csvw::ForeignKey) -> Option<usize> {
+    let file = |s: &str| {
+        let s = s.split(['?', '#']).next().unwrap_or(s);
+        uritemplate::decode(s.rsplit('/').next().unwrap_or(s))
+    };
+    if let Some(r) = &fk.resource {
+        return m.tables.iter().position(|t| {
+            t.url_text.as_deref() == Some(r.as_str())
+                || t.url.as_deref() == Some(r.as_str())
+                || t.url_text.as_deref().is_some_and(|u| file(u) == file(r))
+        });
+    }
+    let s = fk.schema_reference.as_deref()?;
+    m.tables.iter().position(|t| {
+        t.schema_id
+            .as_deref()
+            .is_some_and(|id| id == s || file(id) == file(s))
+    })
+}
+
+/// The order in which the tables `tables` (indexes into the metadata's tables) convert
+/// so that each referenced table comes before the tables whose foreign keys reference
+/// it. A cycle fails, and so does a foreign key whose table is not among `tables`.
+pub fn key_order(m: &Metadata, tables: &[usize]) -> Result<Vec<usize>> {
+    let mut deps: Vec<(usize, Vec<usize>)> = Vec::new();
+    for &t in tables {
+        let desc = m
+            .tables
+            .get(t)
+            .ok_or_else(|| Error::invalid(format!("the mapping has no table {}", t + 1)))?;
+        let mut d = Vec::new();
+        for fk in &desc.foreign_keys {
+            let r = referenced_table(m, fk).ok_or_else(|| {
+                Error::invalid(format!(
+                    "table {}: a foreign key references {}, which is not a table of the group",
+                    table_name(desc, t),
+                    fk.resource
+                        .as_deref()
+                        .or(fk.schema_reference.as_deref())
+                        .unwrap_or("?")
+                ))
+            })?;
+            if !tables.contains(&r) {
+                return Err(Error::invalid(format!(
+                    "table {}: a foreign key references table {}, whose file is not part of this load",
+                    table_name(desc, t),
+                    table_name(&m.tables[r], r)
+                )));
+            }
+            if r != t && !d.contains(&r) {
+                d.push(r);
+            }
+        }
+        deps.push((t, d));
+    }
+    let mut out = Vec::new();
+    while out.len() < deps.len() {
+        let next = deps
+            .iter()
+            .find(|(t, d)| !out.contains(t) && d.iter().all(|x| out.contains(x)))
+            .map(|(t, _)| *t);
+        match next {
+            Some(t) => out.push(t),
+            None => {
+                let left: Vec<String> = deps
+                    .iter()
+                    .filter(|(t, _)| !out.contains(t))
+                    .map(|(t, _)| table_name(&m.tables[*t], *t))
+                    .collect();
+                return Err(Error::invalid(format!(
+                    "the foreign keys of tables {} form a cycle, so no table can be checked first",
+                    left.join(", ")
+                )));
+            }
+        }
+    }
+    Ok(out)
+}
+
+fn table_name(t: &TableDesc, i: usize) -> String {
+    t.url_text.clone().unwrap_or_else(|| format!("{}", i + 1))
+}
+
+/// The index of the table of `m` that a conversion with `opts` reads.
+pub fn table_index(m: &Metadata, opts: &Options) -> Result<usize> {
+    pick_table(m, opts).map(|(i, _)| i)
 }
 
 /// The most distinct values a tallied column keeps.
@@ -117,6 +250,9 @@ impl Options {
             query: QueryOptions::default(),
             check: None,
             tally: Vec::new(),
+            standard: false,
+            keys: None,
+            lookup: None,
         }
     }
 
@@ -138,6 +274,8 @@ pub struct Stats {
     /// The values of the columns of [`Options::tally`], in that order: each as the
     /// converter sees it after the cell steps of C05 §3.3, with its count.
     pub tallies: Vec<Tally>,
+    /// The commit a template with a lookup read.
+    pub lookup_commit: Option<u64>,
 }
 
 /// The distinct cell values of one column.
@@ -787,6 +925,7 @@ pub fn convert(
     let mut stats = Stats::default();
     let name = opts.name.clone();
     let fail = |m: String| Error::invalid(format!("{name}: {m}"));
+    let mut table_ix: Option<usize> = None;
     // the table's description
     let (desc, metadata, template, key) = match &opts.mapping {
         Mapping::Default { key } => {
@@ -818,10 +957,14 @@ pub fn convert(
                 key.clone().map(|k| (k, ns)),
             )
         }
-        Mapping::Csvw(m) => (pick_table(m, opts)?.clone(), Some(m.clone()), None, None),
+        Mapping::Csvw(m) => {
+            let (i, t) = pick_table(m, opts)?;
+            table_ix = Some(i);
+            (t.clone(), Some(m.clone()), None, None)
+        }
         Mapping::Template { template, metadata } => (
             match metadata {
-                Some(m) => pick_table(m, opts)?.clone(),
+                Some(m) => pick_table(m, opts)?.1.clone(),
                 None => TableDesc::default(),
             },
             metadata.clone(),
@@ -943,9 +1086,30 @@ pub fn convert(
         index: opts.part,
         skip_columns: dialect.skip_columns,
     };
+    if opts.standard && template.is_some() {
+        return Err(fail(
+            "standard mode applies to CSVW metadata and the default mapping, not to a CONSTRUCT template".into(),
+        ));
+    }
+    let mut keys = match (&opts.keys, &metadata, table_ix) {
+        (Some(reg), Some(m), Some(ti)) => {
+            Some(KeyCheck::new(reg.clone(), m, ti, &desc, &table.columns).map_err(&fail)?)
+        }
+        _ => None,
+    };
+    let standard = if opts.standard {
+        let s = Standard::new(metadata.as_deref(), &desc, &table, opts.part).map_err(&fail)?;
+        for t in s.head.clone() {
+            stats.triples += 1;
+            sink(t)?;
+        }
+        Some(s)
+    } else {
+        None
+    };
     let mut runner = template
         .as_ref()
-        .map(|t| template::Runner::new(t, &opts.query, opts.part));
+        .map(|t| template::Runner::new(t, &opts.query, opts.part, opts.lookup.as_ref()));
     let vars: Vec<Variable> = table
         .columns
         .iter()
@@ -1010,7 +1174,24 @@ pub fn convert(
             source_row,
             line,
         };
+        if let Some(k) = &mut keys {
+            k.row(&table, &r).map_err(&fail)?;
+        }
         match &mut runner {
+            None if standard.is_some() => {
+                let mut subjects = Vec::new();
+                emit_row(&table, &r, &name, &mut |t| {
+                    if !subjects.contains(&t.subject) {
+                        subjects.push(t.subject.clone());
+                    }
+                    emit(t, &mut stats)
+                })?;
+                if let Some(s) = &standard {
+                    for t in s.row(&r, &subjects) {
+                        emit(t, &mut stats)?;
+                    }
+                }
+            }
             None => emit_row(&table, &r, &name, &mut |t| emit(t, &mut stats))?,
             Some(run) => {
                 let mut values = Vec::with_capacity(vars.len());
@@ -1042,8 +1223,396 @@ pub fn convert(
             emit(t, &mut stats)
         })?;
     }
+    if let Some(k) = keys {
+        k.finish();
+    }
     stats.rows = row;
+    if template.is_some() {
+        stats.lookup_commit = opts.lookup.as_ref().map(|l| l.commit);
+    }
     Ok(stats)
+}
+
+/// The key checks of one table (spec F19 §6.2, §6.3).
+struct KeyCheck {
+    reg: Arc<KeyRegistry>,
+    name: String,
+    pk: Option<(Vec<usize>, Vec<String>)>,
+    seen: std::collections::HashMap<Vec<String>, u64>,
+    /// the columns of each foreign key, the referenced values, and a description
+    fks: Vec<(Vec<usize>, Arc<KeySet>, String)>,
+    /// the columns of this table that other tables reference, with their values
+    collect: Vec<(Vec<String>, Vec<usize>, KeySet)>,
+    table: usize,
+}
+
+fn key_columns(
+    cols: &[Column],
+    names: &[String],
+    what: &str,
+) -> std::result::Result<Vec<usize>, String> {
+    names
+        .iter()
+        .map(|n| {
+            cols.iter()
+                .position(|c| !c.is_virtual && (&c.name == n || &c.decoded == n))
+                .ok_or_else(|| {
+                    format!("{what} names the column {n:?}, which the table does not have")
+                })
+        })
+        .collect()
+}
+
+fn key_value(cell: &Cell) -> Option<String> {
+    match cell {
+        Cell::Null => None,
+        Cell::One(s) => Some(s.clone()),
+        Cell::List(_, raw) => Some(raw.clone()),
+    }
+}
+
+impl KeyCheck {
+    fn new(
+        reg: Arc<KeyRegistry>,
+        m: &Metadata,
+        ti: usize,
+        desc: &TableDesc,
+        cols: &[Column],
+    ) -> std::result::Result<KeyCheck, String> {
+        let pk = if desc.primary_key.is_empty() {
+            None
+        } else {
+            Some((
+                key_columns(cols, &desc.primary_key, "the primary key")?,
+                desc.primary_key.clone(),
+            ))
+        };
+        let mut fks = Vec::new();
+        for fk in &desc.foreign_keys {
+            let r = referenced_table(m, fk).ok_or_else(|| {
+                "a foreign key references a table that is not in the group".to_string()
+            })?;
+            let set = reg
+                .sets
+                .lock()
+                .get(&(r, fk.ref_columns.clone()))
+                .cloned()
+                .ok_or_else(|| {
+                    format!(
+                        "a foreign key references table {}, which must be converted first in the same load",
+                        table_name(&m.tables[r], r)
+                    )
+                })?;
+            fks.push((
+                key_columns(cols, &fk.columns, "a foreign key")?,
+                set,
+                format!(
+                    "column{} {} of table {}",
+                    if fk.ref_columns.len() > 1 { "s" } else { "" },
+                    fk.ref_columns.join(", "),
+                    table_name(&m.tables[r], r)
+                ),
+            ));
+        }
+        let mut collect: Vec<(Vec<String>, Vec<usize>, KeySet)> = Vec::new();
+        for t in &m.tables {
+            for fk in &t.foreign_keys {
+                if referenced_table(m, fk) == Some(ti)
+                    && !collect.iter().any(|(c, _, _)| *c == fk.ref_columns)
+                {
+                    collect.push((
+                        fk.ref_columns.clone(),
+                        key_columns(cols, &fk.ref_columns, "a foreign key's reference")?,
+                        KeySet::new(),
+                    ));
+                }
+            }
+        }
+        Ok(KeyCheck {
+            reg,
+            name: table_name(desc, ti),
+            pk,
+            seen: Default::default(),
+            fks,
+            collect,
+            table: ti,
+        })
+    }
+
+    fn row(&mut self, table: &Table, r: &RowCtx<'_>) -> std::result::Result<(), String> {
+        let at = |i: usize| {
+            format!(
+                "row {}{}",
+                r.source_row,
+                line_note(r.source_row, Some(r.line))
+            ) + &format!(", column {} ({})", i + 1, table.columns[i].decoded)
+        };
+        if let Some((cols, names)) = &self.pk {
+            let mut key = Vec::with_capacity(cols.len());
+            for &i in cols {
+                match key_value(&r.cells[i]) {
+                    Some(v) => key.push(v),
+                    None => return Err(format!("{}: a primary key cell is empty", at(i))),
+                }
+            }
+            let bytes: usize = key.iter().map(|k| k.len() + 32).sum::<usize>() + 48;
+            self.reg
+                .charge(bytes as u64, &format!("the primary key of {}", self.name))?;
+            if let Some(first) = self.seen.insert(key.clone(), r.source_row) {
+                return Err(format!(
+                    "rows {first} and {} have the same primary key ({})",
+                    r.source_row,
+                    names
+                        .iter()
+                        .zip(&key)
+                        .map(|(n, v)| format!("{n} = {v:?}"))
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                ));
+            }
+        }
+        for (cols, set, desc) in &self.fks {
+            let mut key = Vec::with_capacity(cols.len());
+            for &i in cols {
+                match key_value(&r.cells[i]) {
+                    Some(v) => key.push(v),
+                    // a null in the reference passes
+                    None => break,
+                }
+            }
+            if key.len() == cols.len() && !set.contains(&key) {
+                return Err(format!(
+                    "{}: the value {} is not among the values of {desc}",
+                    at(cols[0]),
+                    key.iter()
+                        .map(|v| format!("{v:?}"))
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                ));
+            }
+        }
+        for (names, cols, set) in &mut self.collect {
+            let key: Option<Vec<String>> = cols.iter().map(|&i| key_value(&r.cells[i])).collect();
+            if let Some(key) = key {
+                let bytes: usize = key.iter().map(|k| k.len() + 32).sum::<usize>() + 48;
+                self.reg.charge(
+                    bytes as u64,
+                    &format!(
+                        "the values of {} referenced by foreign keys",
+                        names.join(", ")
+                    ),
+                )?;
+                set.insert(key);
+            }
+        }
+        Ok(())
+    }
+
+    /// Hand the collected values to the tables that reference them.
+    fn finish(self) {
+        let mut sets = self.reg.sets.lock();
+        for (names, _, set) in self.collect {
+            sets.insert((self.table, names), Arc::new(set));
+        }
+    }
+}
+
+/// The triples of standard mode around a table's rows (spec F19 §6.1).
+struct Standard {
+    /// the table group's and the table's triples
+    head: Vec<Triple>,
+    table: NamedOrBlankNode,
+    url: Option<String>,
+    part: usize,
+}
+
+const CSVW_NS: &str = "http://www.w3.org/ns/csvw#";
+
+fn csvw_iri(local: &str) -> NamedNode {
+    NamedNode::new_unchecked(format!("{CSVW_NS}{local}"))
+}
+
+/// The terms of a note or a common property's JSON-LD value: a string, a number, a
+/// boolean, `{"@id"}`, `{"@value"}` with `@language` or `@type`, a language map or an
+/// array of these. Anything else needs JSON-LD processing and fails.
+fn jsonld_terms(
+    v: &serde_json::Value,
+    base: Option<&oxiri::Iri<String>>,
+    out: &mut Vec<Term>,
+) -> std::result::Result<(), String> {
+    use serde_json::Value as J;
+    match v {
+        J::String(s) => out.push(Literal::new_simple_literal(s.clone()).into()),
+        J::Bool(b) => out.push(Literal::from(*b).into()),
+        J::Number(n) => out.push(if n.is_i64() || n.is_u64() {
+            Literal::new_typed_literal(n.to_string(), oxrdf::vocab::xsd::INTEGER).into()
+        } else {
+            Literal::new_typed_literal(n.to_string(), oxrdf::vocab::xsd::DOUBLE).into()
+        }),
+        J::Array(a) => {
+            for x in a {
+                jsonld_terms(x, base, out)?;
+            }
+        }
+        J::Object(o) if o.len() == 1 && o.contains_key("@id") => {
+            let id = o["@id"].as_str().ok_or("@id must be a string")?;
+            let id = csvw::expand_prefixed(id).unwrap_or_else(|| id.to_string());
+            let abs = match (oxiri::Iri::parse(id.clone()), base) {
+                (Ok(i), _) => i.into_inner(),
+                (Err(_), Some(b)) => b
+                    .resolve(&id)
+                    .map_err(|e| format!("@id {id:?}: {e}"))?
+                    .into_inner(),
+                (Err(e), None) => return Err(format!("@id {id:?}: {e}")),
+            };
+            out.push(NamedNode::new(abs).map_err(|e| e.to_string())?.into());
+        }
+        J::Object(o) if o.contains_key("@value") => {
+            let val = match &o["@value"] {
+                J::String(s) => s.clone(),
+                J::Number(n) => n.to_string(),
+                J::Bool(b) => b.to_string(),
+                _ => return Err("@value must be a string, a number or a boolean".into()),
+            };
+            if o.keys()
+                .any(|k| !matches!(k.as_str(), "@value" | "@language" | "@type"))
+            {
+                return Err("a value object may hold only @value, @language and @type".into());
+            }
+            if let Some(l) = o.get("@language").and_then(|l| l.as_str()) {
+                out.push(
+                    Literal::new_language_tagged_literal(val, l)
+                        .map_err(|e| format!("@language {l:?}: {e}"))?
+                        .into(),
+                );
+            } else if let Some(t) = o.get("@type").and_then(|t| t.as_str()) {
+                let t = csvw::expand_prefixed(t).unwrap_or_else(|| t.to_string());
+                out.push(
+                    Literal::new_typed_literal(val, NamedNode::new(t).map_err(|e| e.to_string())?)
+                        .into(),
+                );
+            } else {
+                out.push(Literal::new_simple_literal(val).into());
+            }
+        }
+        J::Object(o)
+            if o.keys().all(|k| {
+                !k.starts_with('@') && oxrdf::Literal::new_language_tagged_literal("", k).is_ok()
+            }) =>
+        {
+            // a language map
+            for (lang, s) in o {
+                let s = s.as_str().ok_or("a language map holds strings")?;
+                out.push(
+                    Literal::new_language_tagged_literal_unchecked(s, lang.to_ascii_lowercase())
+                        .into(),
+                );
+            }
+        }
+        _ => {
+            return Err(
+                "a note or common property is a JSON-LD object that needs JSON-LD processing, which Sparkles does not do".into(),
+            );
+        }
+    }
+    Ok(())
+}
+
+impl Standard {
+    fn new(
+        m: Option<&Metadata>,
+        desc: &TableDesc,
+        table: &Table,
+        part: usize,
+    ) -> std::result::Result<Standard, String> {
+        let base = table.url.as_ref();
+        let node =
+            |id: &Option<String>, label: String| -> std::result::Result<NamedOrBlankNode, String> {
+                match id {
+                    Some(i) => {
+                        let mut t = Vec::new();
+                        jsonld_terms(&serde_json::json!({ "@id": i }), base, &mut t)?;
+                        match t.pop() {
+                            Some(Term::NamedNode(n)) => Ok(n.into()),
+                            _ => Err(format!("@id {i:?} is not an IRI")),
+                        }
+                    }
+                    None => Ok(BlankNode::new_unchecked(label).into()),
+                }
+            };
+        let group = m.map(|m| m.group.clone()).unwrap_or_default();
+        let g = node(&group.id, "tg".into())?;
+        let t = node(&desc.described.id, format!("t{part}"))?;
+        let mut head = vec![
+            Triple::new(g.clone(), rdf::TYPE, csvw_iri("TableGroup")),
+            Triple::new(g.clone(), csvw_iri("table"), t.clone()),
+            Triple::new(t.clone(), rdf::TYPE, csvw_iri("Table")),
+        ];
+        if let Some(u) = &table.url {
+            head.push(Triple::new(
+                t.clone(),
+                csvw_iri("url"),
+                NamedNode::new_unchecked(u.as_str()),
+            ));
+        }
+        for (subject, d) in [(&g, &group), (&t, &desc.described)] {
+            let mut terms = Vec::new();
+            for n in &d.notes {
+                terms.clear();
+                jsonld_terms(n, base, &mut terms).map_err(|e| format!("notes: {e}"))?;
+                for o in terms.drain(..) {
+                    head.push(Triple::new(subject.clone(), csvw_iri("note"), o));
+                }
+            }
+            for (k, v) in &d.common {
+                let p = csvw::expand_prefixed(k).unwrap_or_else(|| k.clone());
+                let p = NamedNode::new(p).map_err(|e| format!("common property {k:?}: {e}"))?;
+                terms.clear();
+                jsonld_terms(v, base, &mut terms).map_err(|e| format!("{k}: {e}"))?;
+                for o in terms.drain(..) {
+                    head.push(Triple::new(subject.clone(), p.clone(), o));
+                }
+            }
+        }
+        Ok(Standard {
+            head,
+            table: t,
+            url: table
+                .url
+                .as_ref()
+                .map(|u| u.as_str().split('#').next().unwrap_or("").to_string()),
+            part,
+        })
+    }
+
+    /// The row description: `csvw:Row`, its number, its URL and the subjects it
+    /// describes.
+    fn row(&self, r: &RowCtx<'_>, subjects: &[NamedOrBlankNode]) -> Vec<Triple> {
+        let node = NamedOrBlankNode::from(BlankNode::new_unchecked(format!(
+            "t{}row{}",
+            self.part, r.source_row
+        )));
+        let mut out = vec![
+            Triple::new(self.table.clone(), csvw_iri("row"), node.clone()),
+            Triple::new(node.clone(), rdf::TYPE, csvw_iri("Row")),
+            Triple::new(
+                node.clone(),
+                csvw_iri("rownum"),
+                Literal::new_typed_literal(r.row.to_string(), oxrdf::vocab::xsd::INTEGER),
+            ),
+        ];
+        if let Some(u) = &self.url {
+            out.push(Triple::new(
+                node.clone(),
+                csvw_iri("url"),
+                NamedNode::new_unchecked(format!("{u}#row={}", r.source_row)),
+            ));
+        }
+        for s in subjects {
+            out.push(Triple::new(node.clone(), csvw_iri("describes"), s.clone()));
+        }
+        out
+    }
 }
 
 fn run_batch(
@@ -1184,15 +1753,16 @@ fn emit_row(
     Ok(())
 }
 
-fn pick_table<'a>(m: &'a Metadata, opts: &Options) -> Result<&'a TableDesc> {
+fn pick_table<'a>(m: &'a Metadata, opts: &Options) -> Result<(usize, &'a TableDesc)> {
     if let Some(i) = opts.table {
         return m
             .tables
             .get(i)
+            .map(|t| (i, t))
             .ok_or_else(|| Error::invalid(format!("the mapping has no table {}", i + 1)));
     }
     if m.tables.len() == 1 {
-        return Ok(&m.tables[0]);
+        return Ok((0, &m.tables[0]));
     }
     let file = |s: &str| {
         let s = s.split(['?', '#']).next().unwrap_or(s);
@@ -1202,7 +1772,8 @@ fn pick_table<'a>(m: &'a Metadata, opts: &Options) -> Result<&'a TableDesc> {
     let mine = crate::codec::Codec::strip_extension(&mine).to_string();
     m.tables
         .iter()
-        .find(|t| t.url_text.as_deref().is_some_and(|u| file(u) == mine))
+        .enumerate()
+        .find(|(_, t)| t.url_text.as_deref().is_some_and(|u| file(u) == mine))
         .ok_or_else(|| {
             Error::invalid(format!(
                 "{}: the mapping has {} tables and none has the url {mine:?}",
