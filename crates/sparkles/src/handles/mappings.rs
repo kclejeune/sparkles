@@ -104,4 +104,31 @@ impl Dataset {
         let receipt = self.load_sources_receipt(vec![mapping::source(&tmp, g, "mapping")])?;
         Ok(MappingRun { receipt, stats })
     }
+
+    /// Load the N-Quads file of a mapping run in one commit. With `graphs`, the run
+    /// replaces those graphs (the default graph as `None`), and the quads the file lacks
+    /// are removed from them in the same commit. `o` carries the commit message, the
+    /// author, the deadline and a precondition.
+    pub fn load_mapping_output(
+        &self,
+        file: &std::path::Path,
+        graphs: Option<&[Option<oxrdf::NamedNode>]>,
+        o: &crate::guard::WriteOptions,
+    ) -> Result<Receipt> {
+        let src = vec![mapping::source(file, None, "mapping")];
+        match graphs {
+            None => self
+                .store()
+                .load_with(&src, crate::commit::CommitKind::Load, o),
+            Some(gs) => Ok(self
+                .store()
+                .replace_with(
+                    crate::store::ReplaceTarget::Graphs(gs.to_vec()),
+                    &src,
+                    crate::commit::CommitKind::Load,
+                    o,
+                )?
+                .1),
+        }
+    }
 }

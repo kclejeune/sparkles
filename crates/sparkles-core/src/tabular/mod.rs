@@ -1994,6 +1994,17 @@ pub fn default_metadata(
 
 // ------------------------------------------------------------ rows for mappings ----
 
+/// The column titles of a table file, read with its dialect (for `sparkles map check`).
+pub fn header(
+    path: &Path,
+    tsv: bool,
+    dialect: &csvw::DialectDesc,
+    name: &str,
+) -> Result<Vec<String>> {
+    let input = open(path, None)?;
+    Ok(RowReader::new(input, tsv, dialect, name, &Limits::default())?.header)
+}
+
 /// The records of a table after its dialect's skipped rows, header and skipped columns,
 /// for the CSV sources of RML mappings (spec F19 §4.1). It reads with the same reader,
 /// dialects, record limit and BOM rule as [`convert`].
