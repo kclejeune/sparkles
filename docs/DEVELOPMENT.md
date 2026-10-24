@@ -276,6 +276,16 @@ a Chromium that matches the pinned `@playwright/test`, so run the task as
 `playwright install chromium`. The task is not part of `mise run ci`. On Linux, the
 flake runs the same tests as its `ui-e2e` check (see [Nix](#nix)).
 
+`mise run ui:e2e:mock` runs the Playwright tests in `ui/tests/mock` against the mock
+server in `ui/mock`, which covers pages and states that a real server reaches only with
+effort. The mock keeps its state across tests, so the suite runs in one worker and takes
+about eleven minutes. A test that needs a dataset in a known state makes its own, because
+other tests write to the seeded `foaf` dataset and a backup restore replaces its history.
+The Pattern pane, the visual query builder and the facets of a query have no server
+fallback and need the formatter's WebAssembly module. The task builds it with `ui:wasm`
+first, and a direct `pnpm e2e:mock` stops with a message when the module is missing. The
+task is not part of `mise run ci`.
+
 ### Crash tests
 
 `scripts/power-loss.sh` runs the crash tests of
