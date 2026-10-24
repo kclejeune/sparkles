@@ -9,6 +9,7 @@ const uiPort = String(Number(mockPort) + 1);
 
 export default defineConfig({
   testDir: 'tests/mock',
+  globalSetup: './tests/mock/global-setup.ts',
   fullyParallel: false,
   workers: 1,
   forbidOnly: !!process.env.CI,
