@@ -13,10 +13,10 @@ method behind every measurement is in [BENCHMARKING.md](BENCHMARKING.md).
 ## How to add an entry
 
 Add an entry in the same change that drops or reverts the experiment. Keep the code
-reachable: a reverted commit stays in the history of `main`, and an experiment that never
-reached `main` gets a tag named `experiment/<slug>` that is pushed with the change. Each
-entry gives the idea, the roadmap item, the code, the measurement with its host and
-dataset size, the result, and when it could matter.
+reachable by landing the experiment and its revert on `main` as two commits, so the
+history holds it, and name the experiment's commit in the entry. Each entry gives the idea,
+the roadmap item, the code, the measurement with its host and dataset size, the result,
+and when it could matter.
 
 ## Entries
 

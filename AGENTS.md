@@ -42,7 +42,8 @@ work, and each item links to its design spec in [docs/specs](docs/specs/README.m
   or slower, gets an entry in
   [docs/PERFORMANCE-EXPERIMENTS.md](docs/PERFORMANCE-EXPERIMENTS.md) in the same change.
   The entry records the measurement and when the idea could still pay off, such as at a
-  larger scale, and the code stays reachable as a reverted commit or an `experiment/` tag.
+  larger scale. The code stays reachable as a commit and its revert on `main`. Experiment
+  tags are never pushed.
 
 ## Commits and documentation
 
