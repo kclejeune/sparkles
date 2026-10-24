@@ -938,6 +938,11 @@ fn tags() -> J {
             "stored-mappings"
         ),
         t(
+            "Views",
+            "Incremental views kept current after every commit, and live queries.",
+            "incremental-views"
+        ),
+        t(
             "Graph algorithms",
             "PageRank, communities, similarity and embeddings on projections of a dataset.",
             "graph-algorithms"

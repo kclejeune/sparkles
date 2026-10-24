@@ -411,6 +411,7 @@ impl Store {
         if p.validation.is_some() {
             self.guard_committed(c.seq);
         }
+        self.deltas.noted(c.seq, generation, &p.changes);
         self.current.store(p.snapshot.clone());
         self.commits.send_replace(c.seq);
         // after the publication: a worker that takes these pairs reads this state

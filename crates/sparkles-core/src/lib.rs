@@ -13,6 +13,7 @@ pub mod geo;
 pub mod guard;
 pub mod history;
 pub mod id;
+pub mod incr;
 pub mod index;
 pub mod io;
 pub mod ioacct;

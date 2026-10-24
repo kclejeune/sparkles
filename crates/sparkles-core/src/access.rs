@@ -417,6 +417,33 @@ impl GraphAccess {
         })
     }
 
+    /// This view with every undecided guard keeping all its graphs out, for readers
+    /// that cannot decide a guard at each snapshot, such as incremental views. A view
+    /// without undecided guards is returned as it is.
+    pub fn settled(self: &Arc<Self>) -> Arc<GraphAccess> {
+        if !self.read.undecided() && !self.write.undecided() {
+            return self.clone();
+        }
+        let settle = |g: &Graphs| match g {
+            Graphs::Only(r) => {
+                let mut r = r.clone();
+                for g in &mut r.guards {
+                    if g.decide.take().is_some() {
+                        g.exempt.clear();
+                    }
+                }
+                r.normalize();
+                Graphs::Only(r)
+            }
+            Graphs::All => Graphs::All,
+        };
+        Arc::new(GraphAccess {
+            read: settle(&self.read),
+            write: settle(&self.write),
+            triples: self.triples.clone(),
+        })
+    }
+
     /// Whether some protection hides triples from reads.
     pub fn hides_triples(&self) -> bool {
         self.triples.as_ref().is_some_and(|t| t.hides())

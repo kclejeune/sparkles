@@ -49,6 +49,7 @@ mod mcp;
 mod memory_cmd;
 mod migrate_cmd;
 mod model_store;
+mod views_cmd;
 // the pipeline that uses most of the model clients (`ask`) needs the `mcp` feature
 #[cfg_attr(not(feature = "mcp"), allow(dead_code, unused_imports))]
 mod models;
@@ -1214,6 +1215,19 @@ enum Cmd {
         /// none; a run then reads it back from a persistent dataset)
         #[arg(long, value_name = "N", default_value_t = state::DEFAULT_REASON_CACHE_TRIPLES)]
         reason_cache_triples: usize,
+        /// The most live queries (`GET /{ds}/live`) running at once on one dataset
+        #[arg(long, value_name = "N", default_value_t = 1000)]
+        max_live_queries: usize,
+        /// The most live queries one principal runs on a dataset at once
+        #[arg(long, value_name = "N", default_value_t = 20)]
+        max_live_queries_per_principal: usize,
+        /// A view's maintenance pass that runs longer suspends the view
+        #[arg(long, value_name = "SECS", default_value_t = 30.0)]
+        view_pass_timeout: f64,
+        /// The memory all views of a dataset may keep together, in MiB (default: no
+        /// limit beyond each view's memoryBytes)
+        #[arg(long, value_name = "MB")]
+        views_memory: Option<u64>,
         /// Threads that materializations evaluate rules on, shared by all runs (default:
         /// half the cores; 0: all of them, on the pool queries also use)
         #[arg(long, value_name = "N")]
@@ -1565,6 +1579,10 @@ enum Cmd {
         /// Print the query plan instead of executing
         #[arg(long)]
         explain: bool,
+        /// Follow the query on --server as a live query: print the result, then the rows
+        /// each commit adds (+) and removes (-), or JSON lines with --results json
+        #[arg(long, requires = "server", conflicts_with_all = ["explain", "at"])]
+        live: bool,
         /// Print the executed plan and timing after the results
         #[arg(long)]
         time: bool,
@@ -1688,6 +1706,8 @@ enum Cmd {
     /// Show or change a dataset's automatic compaction settings, on a local database or
     /// on a server
     Compaction(compaction_cmd::CompactionArgs),
+    /// Manage incremental views, on a local database or on a server
+    Views(views_cmd::ViewsArgs),
     /// Ask a server whether it is ready (GET /$/ready), over HTTPS or HTTP: exit status 0
     /// when it answers 200. The container image's health check runs it.
     #[cfg(feature = "auth")]
@@ -2654,6 +2674,10 @@ fn run() -> Result<()> {
             mut auto_reason,
             auto_reason_max_delay,
             reason_cache_triples,
+            max_live_queries,
+            max_live_queries_per_principal,
+            view_pass_timeout,
+            views_memory,
             reason_threads,
             reason_max_inferred,
             reason_max_derived,
@@ -2955,6 +2979,19 @@ fn run() -> Result<()> {
                 );
             }
             st.reason_cache_triples = reason_cache_triples;
+            if !(view_pass_timeout.is_finite() && view_pass_timeout > 0.0) {
+                anyhow::bail!("--view-pass-timeout must be a positive number of seconds");
+            }
+            st.views_options = sparkles::incr::RuntimeOptions {
+                max_live: max_live_queries,
+                max_live_per_principal: max_live_queries_per_principal,
+                pass_timeout: Duration::from_secs_f64(view_pass_timeout),
+                views_memory: views_memory.map(|m| m << 20),
+                ..Default::default()
+            };
+            for (_, ds) in st.open_datasets() {
+                ds.views.set_options(st.views_options.clone());
+            }
             st.reason_max_inferred = no_limit_if_zero(reason_max_inferred);
             st.reason_max_derived = no_limit_if_zero(reason_max_derived);
             #[cfg(feature = "reasoning")]
@@ -3428,6 +3465,7 @@ fn run() -> Result<()> {
             results: fmt,
             execution,
             explain,
+            live,
             time,
             timeout,
             at,
@@ -3454,8 +3492,17 @@ fn run() -> Result<()> {
                 (None, Some(t)) => t,
                 _ => bail!("no query given"),
             };
+            if live && (loc.is_some() || !data.is_empty()) {
+                bail!("--live follows a query on --server, not on --loc or --data");
+            }
             if loc.is_none() && data.is_empty() && server.is_some() {
                 let ds = remote_dataset(server.as_deref(), dataset.as_deref())?;
+                if live {
+                    #[cfg(feature = "auth")]
+                    return views_cmd::live(server.as_deref(), insecure_http, &ds, &q, &fmt);
+                    #[cfg(not(feature = "auth"))]
+                    return no_remote(&ds, insecure_http);
+                }
                 // the server's DESCRIBE request parameters, over the dataset's setting
                 let mut params: Vec<(&str, String)> = Vec::new();
                 if let Some(execution) = &execution {
@@ -3507,6 +3554,10 @@ fn run() -> Result<()> {
             // the dataset's query defaults (RDFS on read, the inferred overlay and
             // DESCRIBE), as a server and the library apply them
             let (ds, _main) = open_or_load(loc, &data, opts)?.into_dataset();
+            // a query that reads views waits for them to be recovered or built
+            if q.contains(sparkles::incr::VIEW_NS) && ds.state().views.has_views() {
+                ds.views().settle(Duration::from_secs(3600));
+            }
             let store = ds.store();
             let defaults = ds.query_options();
             use sparkles::sparql::rdfs::{RdfsOnRead, RdfsSchema, SchemaSource};
@@ -3912,6 +3963,7 @@ fn run() -> Result<()> {
         Cmd::Models(args) => models_cmd::run(args),
         Cmd::Dataset { cmd } => dataset_cmd::run(cmd, opts),
         Cmd::Compaction(args) => compaction_cmd::run(args, opts),
+        Cmd::Views(args) => views_cmd::run(args, opts),
         #[cfg(feature = "auth")]
         Cmd::Ping(args) => ping_cmd::run(args),
         Cmd::VocabIndex { loc } => {

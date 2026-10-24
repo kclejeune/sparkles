@@ -32,6 +32,7 @@ fn last_build(count: &str) -> J {
 pub(super) fn put_all(put: &mut dyn FnMut(&str, J)) {
     history(put);
     queries(put);
+    views(put);
     algorithms(put);
     indexes(put);
     reasoning(put);
@@ -372,6 +373,87 @@ fn queries(put: &mut dyn FnMut(&str, J)) {
             ),
             "What a stored mapping's run made and committed.",
             "stored-mappings",
+        ),
+    );
+}
+
+// ------------------------------------------------------------------ views --
+
+fn views(put: &mut dyn FnMut(&str, J)) {
+    let definition = json!({
+        "query": with_desc(string(), "A SELECT or CONSTRUCT query; the dataset's prefixes apply."),
+        "storedQuery": with_desc(string(), "A stored query by name, in place of `query`."),
+        "mode": string_enum(&["table", "graph"]),
+        "graph": string(),
+        "principal": with_desc(string(), "The user whose view of the dataset the query reads; the definer by default."),
+        "provenance": string_enum(&["none", "count", "why", "lineage"]),
+        "maintenance": string_enum(&["async", "commit"]),
+        "branches": array(string()),
+        "memoryBytes": { "type": "integer", "minimum": 1, "description": "The budget of the view's state." },
+        "keepCommits": { "type": "integer", "minimum": 0 },
+    });
+    put(
+        "ViewDefinition",
+        doc(
+            obj(&[], definition.clone()),
+            "A view's definition. Phase 1 takes `table` views maintained `async` on `main`, without provenance and with `keepCommits` 0.",
+            "incremental-views",
+        ),
+    );
+    let plan = json!({
+        "type": "object",
+        "additionalProperties": true,
+        "description": "The view's plan: each node has its `operator`, its `mode` (`incremental` or `recompute`), its `vars`, a `detail` that gives a recompute node's reason, and its `children`.",
+    });
+    let members = json!({
+        "name": string(),
+        "dataset": string(),
+        "definition": sref("ViewDefinition"),
+        "state": string_enum(&["building", "current", "behind", "suspended", "failed"]),
+        "commits": { "type": "integer", "description": "With `behind`: the commits it lags." },
+        "reason": with_desc(string(), "With `suspended`: why."),
+        "error": with_desc(string(), "With `failed`: why."),
+        "commit": { "type": "integer", "description": "The commit its rows reflect." },
+        "columns": array(string()),
+        "rows": { "type": "integer", "description": "Its rows, multiplicities counted." },
+        "stateBytes": { "type": "integer" },
+        "passes": { "type": "integer" },
+        "skipped": { "type": "integer", "description": "Passes its footprint skipped." },
+        "passMs": { "type": "number" },
+        "recomputeMs": { "type": "number", "description": "Time spent in its recompute nodes." },
+        "plan": plan,
+        "task": with_desc(string(), "On a PUT: the task of the first evaluation."),
+    });
+    put(
+        "View",
+        doc(
+            obj(&["name", "definition", "state"], members.clone()),
+            "A view with its state.",
+            "incremental-views",
+        ),
+    );
+    let mut brief = members;
+    brief.as_object_mut().expect("an object").remove("plan");
+    put(
+        "ViewList",
+        doc(
+            obj(
+                &["dataset", "views"],
+                json!({ "dataset": string(), "views": array(obj(&["name", "state"], brief)) }),
+            ),
+            "A dataset's views without their plans.",
+            "incremental-views",
+        ),
+    );
+    put(
+        "ViewTask",
+        doc(
+            obj(
+                &["dataset", "name", "task"],
+                json!({ "dataset": string(), "name": string(), "task": string() }),
+            ),
+            "A view's rebuild and the task that runs it.",
+            "incremental-views",
         ),
     );
 }

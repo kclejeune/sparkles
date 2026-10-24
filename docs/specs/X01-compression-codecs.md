@@ -10,7 +10,7 @@
 > option. Phase 3's blobs shipped with [F05](F05-snapshot-repositories.md), compressed
 > with LZ4 rather than zstd.
 >
-> **User docs:** [API: Compression](../API.md#compression) · [Features](../FEATURES.md#storage-tdb2-equivalent) · [Benchmarks: Compression](../BENCHMARKS.md#compression-105m-triples)
+> **User docs:** [API: Compression](../API.md#compression) · [Features](../FEATURES.md#storage-and-indexes) · [Benchmarks: Compression](../BENCHMARKS.md#compression-105m-triples)
 >
 > This is the design as written before implementation; the [Outcome](#outcome) section at
 > the end records how it landed.

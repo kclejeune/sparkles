@@ -70,6 +70,11 @@ impl CommitChanges {
             .filter_map(|(k, op)| key_quad(k).map(|q| (*op, q)))
     }
 
+    /// The changes as vocabulary keys, in the order of [`iter`](Self::iter).
+    pub(crate) fn keys(&self) -> impl Iterator<Item = (&QuadKey, DiffOp)> + '_ {
+        self.changes.iter().flatten().map(|(k, op)| (k, *op))
+    }
+
     fn from_net(commit: CommitInfo, net: FxHashMap<QuadKey, bool>) -> CommitChanges {
         let mut changes: Vec<(QuadKey, DiffOp)> = net
             .into_iter()

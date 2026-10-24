@@ -47,6 +47,7 @@ mod rename;
 mod sd;
 mod tabular;
 mod tasks;
+mod views;
 
 const DATA: &str = r#"
 @prefix ex: <http://example.org/> .

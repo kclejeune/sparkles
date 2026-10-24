@@ -45,18 +45,18 @@ on top of the second:
 
 * **Query performance.** Sparkles is the fastest engine on most of the published
   comparisons. See [Performance](#performance) and
-  [SPARQL](docs/FEATURES.md#sparql-arq-equivalent).
+  [SPARQL](docs/FEATURES.md#sparql-queries-and-updates).
 * **Standards conformance.** Sparkles passes the W3C suites for SPARQL 1.0, 1.1 Query,
   1.1 Update and 1.2, SHACL Core and SHACL-SPARQL, and supports RDF 1.2, Jena's ARQ
-  extensions and GeoSPARQL 1.1. See [SPARQL](docs/FEATURES.md#sparql-arq-equivalent) and
+  extensions and GeoSPARQL 1.1. See [Standards conformance](docs/FEATURES.md#standards-conformance) and
   [GeoSPARQL](docs/FEATURES.md#geosparql).
 * **Fuseki compatibility.** The server speaks the SPARQL 1.1 Protocol, the Graph Store
   Protocol and Fuseki's `/$/` admin API, and converts Fuseki configurations. See
-  [Server](docs/FEATURES.md#server-fuseki-equivalent).
+  [Server and protocols](docs/FEATURES.md#server-and-protocols).
 * **Branches and time travel.** Queries can read any commit that compaction has retained,
   two retained commits can be diffed, and a branch can start from one and merge back with
   conflict review. Full-text search reads only the head. See
-  [Storage](docs/FEATURES.md#storage-tdb2-equivalent).
+  [Versioning and history](docs/FEATURES.md#versioning-and-history).
 * **Vector and full-text search.** BM25 full-text search compatible with jena-text, HNSW
   vector indexes with embeddings computed on write, hybrid ranking, path search and graph
   algorithms all run inside SPARQL. See [Search](docs/FEATURES.md#search).
@@ -66,7 +66,7 @@ on top of the second:
 * **GraphRAG and agent memory.** An MCP server gives agents grant-checked tools, questions
   are answered with checked queries and cited summaries, and agent memory records each
   fact with its source for review on a branch. GraphRAG builds write reports for Leiden
-  communities. See [Agents](docs/FEATURES.md#agents-and-questions-in-plain-language).
+  communities. See [AI and agents](docs/FEATURES.md#ai-and-agents).
 * **Web UI.** The embedded UI has a query editor with table, graph and map views, a
   resource explorer, a visual query builder, forms generated from SHACL shapes, and views
   of history, branches and agent memory. See [Web UI](#web-ui) and
@@ -75,7 +75,7 @@ on top of the second:
   and the JVM binding implements Jena's `DatasetGraph`. See
   [Libraries and bindings](docs/FEATURES.md#libraries-and-bindings).
 * **Access control.** Grants apply per dataset, named graph and endpoint, with rate
-  limits and query budgets. See [Server](docs/FEATURES.md#server-fuseki-equivalent).
+  limits and query budgets. See [Access control](docs/FEATURES.md#access-control-and-security).
 
 [docs/FEATURES.md](docs/FEATURES.md) lists every feature and the
 [known gaps](docs/FEATURES.md#known-gaps).

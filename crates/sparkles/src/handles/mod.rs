@@ -36,6 +36,7 @@ pub mod reasoning;
 pub mod schema;
 pub mod settings;
 pub mod validation;
+pub mod views;
 
 pub use algorithms::{Algorithms, Projections};
 #[cfg(feature = "backup")]
@@ -62,6 +63,7 @@ pub use settings::{
     CompactionReadings, CompactionState, CompactionStatus, DescribeStatus, SettingSource,
 };
 pub use validation::{GuardOutcome, GuardSetting, Validation};
+pub use views::Views;
 
 use crate::Dataset;
 

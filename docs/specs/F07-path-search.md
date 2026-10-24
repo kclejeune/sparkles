@@ -687,7 +687,7 @@ and both ways. This changes answers of earlier releases for searches with `path:
 or `path:both` over predicates with literal objects, which were wrong. The checks run only
 when a lane can leave a literal, which is a lane read by the object on the successor side
 or by the subject on the predecessor side, so a forward search never makes them. The
-[Namespace screen](../BENCHMARKS.md#skipped-predicates-and-hubs-2026-10-23) found no
+[Namespace screen](../BENCHMARKS.md#path-search) found no
 change above the noise in the searches that use neither new parameter.
 
 `crates/sparkles-core/tests/path_search_filters.rs` tests both parameters in every mode,

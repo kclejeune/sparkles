@@ -151,6 +151,12 @@ pub const ROUTES: &[(&str, &[&str])] = &[
     ("/$/mappings/{ds}/{name}", &["GET", "PUT", "DELETE"]),
     ("/$/mappings/{ds}/{name}/versions", &["GET"]),
     ("/{ds}/mappings/{name}/run", &["POST"]),
+    // incremental views and live queries (F13): readers list views and subscribe,
+    // admins define them
+    ("/$/views/{ds}", &["GET"]),
+    ("/$/views/{ds}/{name}", &["GET", "PUT", "DELETE"]),
+    ("/$/views/{ds}/{name}/rebuild", &["POST"]),
+    ("/{ds}/live", &["GET"]),
     // graph algorithms (F14): a run that writes also needs write on the dataset
     ("/$/algo/{ds}/run", &["POST"]),
     ("/$/algo/{ds}/projections", &["GET"]),
@@ -338,6 +344,9 @@ pub fn need(route: &str, method: &Method, uri: &Uri, headers: &HeaderMap) -> Opt
         "/$/algo/{ds}/run" | "/$/algo/{ds}/projections" => Dataset(Read),
         "/$/algo/{ds}/projections/{name}" if get => Dataset(Read),
         "/$/algo/{ds}/projections/{name}" => Dataset(Admin),
+        "/$/views/{ds}" | "/{ds}/live" => Dataset(Read),
+        "/$/views/{ds}/{name}" if get => Dataset(Read),
+        "/$/views/{ds}/{name}" | "/$/views/{ds}/{name}/rebuild" => Dataset(Admin),
         "/$/queries/{ds}/suggestions" if *method == Method::POST => Dataset(Read),
         "/$/queries/{ds}/suggestions" => Dataset(Admin),
         "/$/memory/{ds}" if get => Dataset(Read),
@@ -571,6 +580,7 @@ pub fn endpoint(route: &str, method: &Method, uri: &Uri, headers: &HeaderMap) ->
         | "/{ds}/text"
         | "/{ds}/geo"
         | "/{ds}/queries/{name}"
+        | "/{ds}/live"
         | "/$/graph/{ds}/groups"
         | "/$/graph/{ds}/facets"
         | "/$/graphrag/{ds}/memberships"

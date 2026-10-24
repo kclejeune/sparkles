@@ -1442,6 +1442,58 @@ fn queries(p: &mut Paths) {
             "StoredQueryVersions",
         ),
     );
+    p.add(
+        op(GET, "/$/views/{ds}", "listViews", "Views", "List views")
+            .doc("The dataset's incremental views with their state: `building`, `current`, `behind` with the commits it lags, `suspended` with a reason, or `failed`.")
+            .see("incremental-views")
+            .json("200", "The views without their plans.", "ViewList"),
+    );
+    p.add(
+        op(GET, "/$/views/{ds}/{name}", "getView", "Views", "Get a view")
+            .see("incremental-views")
+            .json("200", "The view with its state and its plan, each operator marked `incremental` or `recompute`.", "View")
+            .errors(&[404]),
+    );
+    p.add(
+        op(PUT, "/$/views/{ds}/{name}", "putView", "Views", "Define a view")
+            .doc("Compiles the query, keeps the definition and starts the first evaluation as a task in `/$/tasks`. Needs `admin` on the dataset. A query outside the incremental fragment is refused with `400 not-incremental`, and Phase 2 options with `400 unsupported-option`.")
+            .see("incremental-views")
+            .json_body(true, "ViewDefinition")
+            .json("200", "Replaced.", "View")
+            .json("201", "Created.", "View")
+            .errors(&[400]),
+    );
+    p.add(
+        op(
+            DELETE,
+            "/$/views/{ds}/{name}",
+            "deleteView",
+            "Views",
+            "Delete a view",
+        )
+        .doc("Removes the view and its state. Needs `admin` on the dataset.")
+        .see("incremental-views")
+        .no_content("Deleted.")
+        .errors(&[404]),
+    );
+    p.add(
+        op(POST, "/$/views/{ds}/{name}/rebuild", "rebuildView", "Views", "Rebuild a view")
+            .doc("Evaluates the view again from scratch as a task, and lifts a suspension. Needs `admin` on the dataset.")
+            .see("incremental-views")
+            .json("202", "The rebuild's task.", "ViewTask")
+            .errors(&[404]),
+    );
+    p.add(
+        op(GET, "/{ds}/live", "liveQuery", "Views", "Live query")
+            .doc("A SELECT, ASK or CONSTRUCT query that a view could be, as server-sent events: `snapshot` pages of the result, then a `diff` after each commit that changes it, `reset` when the server evaluated the query again, and `error` when the stream ends. Each event's id is a commit.")
+            .see("live-queries")
+            .query("query", s(), "The query.")
+            .query("after", s(), "Resume after this commit (`commit:N`): the first event is the change since it, or a `reset`.")
+            .query("coalesceMs", json!({ "type": "integer", "minimum": 0, "default": 0 }), "Merge the diffs of commits that arrive within this many milliseconds.")
+            .header("Last-Event-ID", s(), "Resume after this commit.")
+            .resp("200", "The events.", Some(json!({ "text/event-stream": text() })))
+            .errors(&[400, 403, 429]),
+    );
     for (m, id, summary) in [
         (GET, "runStoredQuery", "Run a stored query"),
         (POST, "runStoredQueryPost", "Run a stored query (POST)"),

@@ -1218,6 +1218,44 @@ every stored query as a tool named `<dataset>__<query>`, and the UI's query page
 them with a form for their parameters. [API.md](API.md#stored-queries) describes the
 definitions, the parameter types and the versions.
 
+### Incremental views
+
+A view keeps the result of a SELECT or CONSTRUCT query current after every commit. A
+commit updates the view by the rows its changes affect, so a dashboard query over a large
+dataset costs little to keep current. A live query sends a client the same changes as
+they happen.
+
+```sh
+sparkles views put --loc db team-sizes \
+    'PREFIX org: <http://www.w3.org/ns/org#> SELECT ?team (COUNT(?p) AS ?n) WHERE { ?p org:memberOf ?team } GROUP BY ?team'
+sparkles views list --loc db
+sparkles views get --loc db team-sizes
+sparkles views explain --loc db 'SELECT ?p ?q WHERE { ?p <http://xmlns.com/foaf/0.1/knows>+ ?q }'
+sparkles query --loc db 'PREFIX view: <urn:x-sparkles:view#> SELECT * WHERE { SERVICE view:read { [] view:name "team-sizes" ; view:bind ?team, ?n } }'
+```
+
+`put` defines the view and waits for its first evaluation, and `get` shows its state, its
+size and its plan, with each operator marked `incremental` or `recompute`. `explain`
+shows the plan a query would have without defining it. The same commands work on a
+server with `--server URL --dataset NAME`, where `put`, `delete` and `rebuild` need
+`admin` on the dataset.
+
+`sparkles query --live` follows a query on a server. It prints the result, then a block
+for each commit that changes it, with `+` before the rows the commit added and `-` before
+the rows it removed. `--results json` prints one JSON object per event instead.
+
+```sh
+sparkles query --live --server http://localhost:3030 --dataset books \
+    'SELECT ?book WHERE { ?book a <http://ex.org/Book> }'
+curl -N 'localhost:3030/books/live?query=SELECT%20%3Fb%20WHERE%20%7B%20%3Fb%20a%20%3Chttp%3A%2F%2Fex.org%2FBook%3E%20%7D'
+```
+
+`serve --max-live-queries` and `--max-live-queries-per-principal` limit the live queries
+of a dataset, 1,000 and 20 by default. `--view-pass-timeout` suspends a view whose pass
+runs longer, 30 seconds by default, and `--views-memory` bounds the state of a dataset's
+views together. [API.md](API.md#incremental-views) describes the definitions, the
+states, `SERVICE view:read` and the events of a live query.
+
 ### DESCRIBE modes
 
 A DESCRIBE query returns the concise bounded description of each resource by default.
