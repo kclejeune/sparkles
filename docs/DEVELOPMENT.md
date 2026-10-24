@@ -136,9 +136,10 @@ build that runs both at once needs about 20 GB. `mise run test` therefore first 
 and only then runs nextest. That keeps the peak near 10 GB and costs a few minutes of build
 time, because the second server compile no longer overlaps the first.
 
-Persistent stores and offline migrations hold an exclusive file lock through their
-owned cleanup. The lock guard explicitly unlocks before closing its descriptor, so an
-unrelated child between fork and exec cannot delay reopening the database. Store fields
+Persistent stores, offline migrations, the offline restore swap and the catalog hold an
+exclusive file lock through their owned cleanup. The lock guard explicitly unlocks
+before closing its descriptor, so an unrelated child between fork and exec cannot delay
+reopening the database or the data directory. Store fields
 that own writers must be declared before the lock guard so their destructors finish
 while exclusion still holds.
 

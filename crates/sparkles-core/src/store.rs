@@ -1359,7 +1359,7 @@ fn sources_reach_default_graph(sources: &[Source]) -> bool {
 
 type Clock = Arc<dyn Fn() -> i64 + Send + Sync>;
 
-pub(crate) use lock::ProcessLock;
+pub use lock::ProcessLock;
 
 pub struct Store {
     root: Option<PathBuf>,

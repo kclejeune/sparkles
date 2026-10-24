@@ -1590,10 +1590,14 @@ pub(crate) async fn run_query(
     // attempt; a bounded trial can retry without cloning its tables.
     let dataset_id = ds.store.dataset_id().to_string();
     let attempted_ms = std::cell::Cell::new(0.0);
+    // the rows the last attempt wrote whole, for the report of a body it stopped partway
+    let sent_rows = Arc::new(std::sync::atomic::AtomicU64::new(0));
+    let rows_written = sent_rows.clone();
     let write = move |w: &mut LimitedWriter<stream::SwitchWriter>| -> sparkles::Result<()> {
         let ts = std::time::Instant::now();
+        let sent = std::cell::Cell::new(0);
         let written = if thrift {
-            write_thrift_results(&r, w, send)
+            write_thrift_results(&r, w, send, &sent)
         } else {
             serialize_result(
                 &r,
@@ -1607,8 +1611,10 @@ pub(crate) async fn run_query(
                 seq,
                 &dataset_id,
                 io.as_deref(),
+                &sent,
             )
         };
+        rows_written.store(sent.get(), std::sync::atomic::Ordering::Relaxed);
         // phase spans once serialization has ended (the request span is current here)
         attempted_ms.set(attempted_ms.get() + ts.elapsed().as_secs_f64() * 1000.0);
         if !w.get_ref().deferred() {
@@ -1616,15 +1622,28 @@ pub(crate) async fn run_query(
         }
         written
     };
-    // weak: the serializer thread must not keep the server state (and its stores' locks)
-    // alive after the response
-    let (metrics_st, name) = (Arc::downgrade(&st), ds.name.clone());
+    // A streamed body is reported once it ends, as a cursor's is, so that a body that
+    // the result-size budget or an error stopped partway is logged with its outcome and
+    // the rows it holds instead of as a complete answer.
+    let deferred = crate::obs::DeferredReport::default();
+    let stream_report = deferred.clone();
+    let streamed_base = report.clone();
     let on_stream_end = move |end: stream::StreamEnd| {
-        if let Some(st) = metrics_st.upgrade() {
-            st.metrics
-                .add_response_bytes(Some(&name), Op::Query, end.bytes);
-        }
         stream_end_log("query", &end);
+        let (outcome, budget) = end.outcome();
+        let rows = if end.error.is_some() {
+            Some(sent_rows.load(std::sync::atomic::Ordering::Relaxed))
+        } else {
+            streamed_base.rows
+        };
+        stream_report.producer_done(RequestReport {
+            outcome,
+            budget,
+            rows,
+            response_bytes: Some(end.bytes),
+            serialize_ms: Some(end.serialize_ms),
+            ..streamed_base
+        });
     };
     // Try small answers in place; actual encoded bytes decide whether the answer
     // must switch to the blocking serializer, even with very few result cells.
@@ -1635,7 +1654,7 @@ pub(crate) async fn run_query(
     };
     // a run whose answer could not be written is not known to be quick any more
     let body = body.inspect_err(|_| QUICK.record(quick_key, f64::INFINITY))?;
-    let (body, report) = match body {
+    let (body, report, deferred) = match body {
         stream::Serialized::Whole { body, serialize_ms } => {
             let ms = if algorithmic {
                 f64::INFINITY
@@ -1652,11 +1671,11 @@ pub(crate) async fn run_query(
                 serialize_ms: Some(serialize_ms),
                 ..report
             };
-            (axum::body::Body::from(body), report)
+            (axum::body::Body::from(body), report, None)
         }
         stream::Serialized::Streamed(body) => {
             QUICK.record(quick_key, f64::INFINITY);
-            (body, report)
+            (body, report, Some(deferred))
         }
     };
     let mut resp = with_commit(
@@ -1672,11 +1691,17 @@ pub(crate) async fn run_query(
     }
     let resp = history::history_headers(resp, resolved.as_ref(), &uri);
     // freshness is reported for the live state only
-    let resp = match &resolved {
+    let mut resp = match &resolved {
         Some(r) if r.historical => resp,
         _ => with_inferences(resp, &ds, with_extra, seq),
     };
-    Ok(report.attach(resp))
+    match deferred {
+        Some(deferred) => {
+            resp.extensions_mut().insert(deferred);
+            Ok(resp)
+        }
+        None => Ok(report.attach(resp)),
+    }
 }
 
 /// The I/O profile a request asked for with `profile=io`, started before the query is
@@ -1720,9 +1745,10 @@ fn serialize_result(
     seq: u64,
     dataset_id: &str,
     io: Option<&sparkles::ioacct::Profile>,
+    sent: &std::cell::Cell<u64>,
 ) -> sparkles::Result<()> {
     if sparkles_doc {
-        results::write_native_json(
+        results::write_native_json_counted(
             r,
             w,
             send,
@@ -1731,22 +1757,25 @@ fn serialize_result(
                 dataset_id,
                 io,
             }),
+            sent,
         )
     } else if is_graph {
         match rfmt {
-            OutFormat::Rdf(f) => results::write_graph(r, f, prefixes, w),
-            OutFormat::Jena(j) => results::write_jena_graph(r, j, w),
+            OutFormat::Rdf(f) => results::write_graph_counted(r, f, prefixes, w, sent),
+            OutFormat::Jena(j) => results::write_jena_graph_counted(r, j, w, sent),
         }
     } else {
-        results::write_solutions(r, sfmt, w, send)
+        results::write_solutions_counted(r, sfmt, w, send, sent)
     }
 }
 
-/// SELECT results in SPARQL Results Thrift, `send` rows at most.
+/// SELECT results in SPARQL Results Thrift, `send` rows at most, counting in `sent` the
+/// rows written whole.
 fn write_thrift_results(
     r: &sparkles::sparql::QueryResult,
     w: &mut LimitedWriter<stream::SwitchWriter>,
     send: Option<usize>,
+    sent: &std::cell::Cell<u64>,
 ) -> sparkles::Result<()> {
     let mut out = jena_formats::ThriftResults::new(w, &r.vars)?;
     let n = send.map_or(r.table.len(), |s| s.min(r.table.len()));
@@ -1755,6 +1784,7 @@ fn write_thrift_results(
         row.clear();
         row.extend(r.table.cols.iter().map(|c| r.term(c[i])));
         out.row(&row)?;
+        sent.set(sent.get() + 1);
     }
     out.finish()?;
     Ok(())

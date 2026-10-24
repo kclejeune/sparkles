@@ -1104,7 +1104,11 @@ TSV takes 1,955,839,207 bytes. That is larger than the default response budget o
 1 GiB, so with the default settings the response stops at 1 GiB and the client sees an
 incomplete body. No default budget can hold this answer, and `q4` keeps its error in
 the benchmark table. With `--max-result-mb 4096` it answers within the other default
-budgets.
+budgets. The access log recorded that truncated response as a complete answer, with the
+outcome `ok` and all 41,073,618 rows. Item 99 fixed this on 2026-10-24. A streamed eager
+body that reaches the budget sends what it had buffered, aborts the chunked transfer as
+a cursor's body does, and is logged when it ends with the outcome `budget`, the bytes
+sent and the rows written whole.
 
 The comparison in `q4` was also slow. An eager filter decoded both name columns before
 comparing them, and at one thread that took 2.0 s of the 2.4 s eager run at 1M. Two

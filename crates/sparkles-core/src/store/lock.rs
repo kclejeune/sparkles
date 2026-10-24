@@ -11,13 +11,20 @@ use std::ops::Deref;
 /// A forked child shares the open file description and so the lock itself. Only the
 /// process that acquired the lock unlocks it, so a child that drops an inherited
 /// guard, such as a Python worker started with `fork`, leaves the parent's lock held.
-pub(crate) struct ProcessLock {
+///
+/// Every exclusive lock in a database or data directory uses this guard: the store's
+/// `sparkles.lock`, the offline restore's hold on that file and the catalog's
+/// `catalog.lock`. The file is opened with `O_CLOEXEC`, as the standard library opens
+/// every file, so a child that execs does not inherit it at all.
+#[derive(Debug)]
+pub struct ProcessLock {
     file: File,
     owner: u32,
 }
 
 impl ProcessLock {
-    pub(crate) fn from_locked_file(file: File) -> Self {
+    /// Take ownership of `file`, which the calling process has just locked exclusively.
+    pub fn from_locked_file(file: File) -> Self {
         Self {
             file,
             owner: std::process::id(),
