@@ -1857,10 +1857,20 @@ radio buttons or a select for `sh:in`, a checkbox or a three-way select for bool
 inputs, number inputs with the type's step and the shape's bounds, a text input with a
 language for `rdf:langString`, a text area for long strings, an entity picker for
 `sh:class` and IRIs, and a term input for a field without constraints. A known
-`dash:editor` such as `dash:TextAreaEditor` replaces the choice. Triples of the resource
-that no shape describes are listed under **Other properties**, read-only. A field the
-caller's grants hide is absent, and one marked `dash:readOnly`, protected from the caller's
-writes or with a complex path is read-only with the reason beside it.
+`dash:editor` such as `dash:TextAreaEditor` replaces the choice, and a known `dash:viewer`
+such as `dash:LabelViewer` or `dash:URIViewer` chooses how a read-only value is shown. The
+entity picker searches the instances of the field's `sh:class` by label, through the
+full-text index when the dataset has one. Triples of the resource that no shape describes
+are listed under **Other properties**, read-only. A field the caller's grants hide is
+absent, and one marked `dash:readOnly`, protected from the caller's writes or with a
+complex path is read-only with the reason beside it. A value stored in a graph the caller
+cannot write is shown read-only inside an editable field. Date-time values keep their
+timezone when edited, and a new `xsd:dateTimeStamp` takes the browser's offset.
+
+A class that a node shape targets gets **New instance** in the schema tab, which opens an
+empty form at `/ui/datasets/{name}/edit?class=…`. The first save mints the resource's IRI
+from the `forms` setting's `newIri`, a `urn:uuid:` IRI by default, writes its `rdf:type`
+with the values, and opens the form of the new resource.
 
 The browser checks values as they are typed: XSD lexical forms, patterns with their flags,
 lengths, numeric and date ranges, allowed values, counts, `sh:languageIn` and
@@ -1872,7 +1882,9 @@ preview lists the triples the save would remove and add. **Save** commits the ch
 commit with the message typed beside it. With a guard in `reject` mode, Save checks first
 and writes nothing when the guard would reject the change. Otherwise a save with problems
 asks once more with **Save with problems**. After a failed save, an error summary at the
-top of the form lists every problem, and each entry moves the focus to its field.
+top of the form lists every problem, and each entry moves the focus to its field. The
+fields are disabled while a save and the reload after it run, so nothing typed meanwhile
+is lost.
 
 Saves go to `main` when the caller may write it and it is not protected. When `main` is
 protected, or the `forms` setting's `saveTo` is `branch`, the first save creates the

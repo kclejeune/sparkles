@@ -7374,7 +7374,7 @@ need the `shacl` cargo feature, which is on by default, and return `501` without
 
 | Route | Permission | Use |
 |---|---|---|
-| `GET /$/forms/{ds}?focus=IRI` | `read` | The form model of a resource. |
+| `GET /$/forms/{ds}?focus=IRI` | `read` | The form model of a resource, or with `class=IRI` the empty form of a new instance. |
 | `POST /$/forms/{ds}/check` | `write` | A dry run of a change and its validation against the form's shapes. |
 | `POST /$/forms/{ds}/save` | `write` | The commit of a change, unless another commit changed its fields. |
 
@@ -7382,8 +7382,10 @@ need the `shacl` cargo feature, which is on by default, and return `501` without
 
 `GET /$/forms/{ds}` takes these parameters.
 
-* **`focus`** is the IRI of the resource, bare or in angle brackets. It is required.
-  Forms for new instances (`class=`) answer `501` in this release.
+* **`focus`** is the IRI of the resource, bare or in angle brackets.
+* **`class`** asks for the form of a new instance of that class instead, built from the
+  node shapes that target the class or one of its superclasses, with no values and a
+  `focus` of `null`. A request names `focus` or `class`, and a `class` form takes no `at`.
 * **`shapes`** is `guard`, `graphs` or `drafted` and overrides the `forms` setting's
   source. `guard` reads the shapes of the dataset's write-time SHACL guard, `graphs` reads
   the shapes graphs the setting names, and `drafted` drafts shapes from the data as the
@@ -7456,7 +7458,12 @@ keeps the predicate from writes (`protected`), when new values would go to a gra
 caller cannot write (`graph`), when it holds more than 200 values (`too-many`), and when
 the whole form cannot be saved (`state`). Fields whose predicate a protection hides from
 reads are left out, as are the values in graphs the caller cannot read and the values of
-the inferred graph. A focus that no shape targets answers `200` with no fields.
+the inferred graph. What the caller may write follows its grants on the update endpoint of
+the branch saves go to, and what it reads follows the query endpoint. A value in a graph
+the caller cannot write has `readOnly: true`. Only protections that name predicates and
+graphs alone make a field `protected`, and a protection scoped by classes or a pattern is
+enforced by the save itself. Shapes read from shapes graphs leave out the triples that the
+caller's protections hide. A focus that no shape targets answers `200` with no fields.
 
 ### Checks and saves
 
@@ -7464,7 +7471,8 @@ the inferred graph. A focus that no shape targets answers `200` with no fields.
 
 ```ts
 type FormChangeBody = {
-  focus: string;                    // the IRI of the resource
+  focus?: string;                   // the IRI of the resource
+  class?: string;                   // or the class of a new instance, instead of focus
   branch?: string;                  // the branch the form was opened on, main by default
   shapes?: "guard" | "graphs" | "drafted";
   changes: { field: string; remove?: Term[]; add?: Term[] }[];
@@ -7479,10 +7487,17 @@ name its triple. A change to a
 read-only field is a `403`. A change of more than 1,000 terms is a `400`. A removed value is
 deleted from every graph that holds it, and an added value goes to the model's `graph`.
 `expect` must name every changed field. It may be empty for a field that had no values.
+A change with `class` makes a new instance. The server mints its IRI from the setting's
+`newIri`, refuses an IRI that already describes a resource, and adds its `rdf:type`.
+The middleware admits a check or a save on any branch the caller can see, and the handler
+checks write on the branch the body or the query names.
 
 `check` runs the change as a write preview (see [Write previews](#write-previews)) and then
 validates the nodes the change touches against the form's shapes, whether or not the
-dataset has a guard. The validation holds the dataset's writer lock and stops after 10
+dataset has a guard. The nodes it validates are the resource, the IRIs added or removed,
+and up to 500 nodes that reach one of them through one or two triples, whose shapes can
+read the change along a path. The check plans the change on the state its dry run starts
+from. The validation holds the dataset's writer lock and stops after 10
 seconds. The answer is the preview, the validation and the fields whose stored values
 already differ from `expect`, which a save would refuse with a conflict. A check of a
 session branch that does not exist yet previews its first commit on `main`'s head, and
@@ -7511,7 +7526,9 @@ results, as the validation routes withhold reports from such callers.
 
 `save` compares `expect` with the stored values of the changed fields while it holds the
 writer lock. When one differs, it answers `409` with code `form-conflict` and the current
-values, and writes nothing.
+values, and writes nothing. When the values are the same but another commit moved one of
+them to another graph while the save waited, the save plans its update again on the new
+head, up to three times.
 
 ```json
 {
@@ -7524,8 +7541,8 @@ values, and writes nothing.
 
 Otherwise the change is committed as one commit of kind `update`, with the caller as author
 and `message` as its message, and the write-time guard runs as it does for any write. The
-answer is the commit receipt of `POST /{ds}/update` plus `dataset`, `branch` and
-`branchCreated`. A rejected write answers as an update does, such as `422` with the guard's
+answer is the commit receipt of `POST /{ds}/update` plus `dataset`, `focus`, `branch` and
+`branchCreated`, where `focus` is the IRI minted for a new instance. A rejected write answers as an update does, such as `422` with the guard's
 report.
 
 ### Where saves go

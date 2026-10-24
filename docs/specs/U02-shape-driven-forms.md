@@ -1,12 +1,13 @@
 # U02: Editing forms generated from SHACL shapes
 
-> **Status:** implemented (Phase 1)
+> **Status:** implemented (Phase 1 and most of Phase 2)
 >
 > **Phases:** Phase 1 shipped on 2026-10-24. It is the form model endpoint, view and edit
 > forms for literal and IRI values, checks in the browser, previews and saves on a branch
 > or `main`, and review through the merge page. Phase 2 adds DASH editor and viewer hints,
-> nested forms, new instances and value search. Phase 3 adds SHACL 1.2 lists and
-> alternatives with `sh:or` and `sh:xone`.
+> nested forms, new instances and value search, and all of it except nested forms shipped
+> on the same day. Phase 3 adds SHACL 1.2 lists and alternatives with `sh:or` and
+> `sh:xone`.
 >
 > **User docs:** [USAGE: Editing forms](../USAGE.md#editing-forms) and
 > [API: Editing forms](../API.md#editing-forms).
@@ -400,8 +401,12 @@ ex:PersonShape a sh:NodeShape ; sh:targetClass ex:Person ;
 
 ## Outcome
 
-Phase 1 shipped on 2026-10-24 under [ROADMAP](../ROADMAP.md) item 21. Phases 2 and 3
-remain.
+Phase 1 shipped on 2026-10-24 under [ROADMAP](../ROADMAP.md) item 21. Phase 2 shipped
+on the same day without nested forms. The DASH editors and viewers of §2.3 choose the
+widgets and the read-only display, **New instance** in the schema tab opens the form of a
+class and the first save mints the IRI, and the entity picker searches the instances of a
+field's `sh:class` by label, through the full-text index when the dataset has one. Nested
+forms for blank node values and Phase 3 remain.
 
 **Where it lives.** `sparkles-shacl` reads the non-validating characteristics of property
 shapes (`sh:name`, `sh:description`, `sh:order`, `sh:group`, `sh:defaultValue`), the labels
@@ -448,7 +453,32 @@ button in Explore and the page `/datasets/{name}/edit`.
   validation results (`withheld: true`) and redacted receipts, as the validation routes and
   previews treat such callers.
 * Values in the inferred graph `urn:x-sparkles:inferred` are neither shown nor edited.
-* Forms open only for an IRI focus. `class=` for new instances answers `501` until Phase 2.
+* Forms open only for an IRI focus. A form for a new instance takes `class=` and has no
+  values, its node shapes are those whose class targets select the class or a
+  superclass, and its save mints the IRI from `newIri`, refuses one that already
+  describes a resource and adds the `rdf:type` to the target graph.
+* The model reads through the caller's query endpoint grants and decides what is writable
+  from its update endpoint grants on the branch saves go to. A value in a graph the caller
+  cannot write is read-only inside an editable field. A protection scoped by classes or a
+  pattern does not make a field read-only, because it depends on the data, and the save
+  enforces it.
+* Shapes from shapes graphs are parsed from the state masked by the caller's protections.
+* A save plans its update on the head before it waits for the writer lock. When another
+  commit moved a changed field's values to other graphs or changed the graph new values go
+  to, without changing the values, the save plans again on the new head, up to three
+  times. A check plans on the state its dry run starts from, and is a dry run from the
+  moment it opens, so a failed check leaves no terms behind.
+* The check validates the resource, the IRIs a change adds or removes, and up to 500 nodes
+  that reach one of them through one or two triples. With a guard on, the preview's guard
+  verdict covers every other node. Without one, a shape that reaches the resource through
+  a longer path is not validated by the check.
+* The model, the check and the save stop when the request is cancelled or its deadline
+  passes, also while they read values.
+* The check and save routes are admitted on any branch the caller can see, as the branch
+  routes are, and the handler checks write on the branch the body or the query names.
+* A date-time keeps its timezone when edited, and a new `xsd:dateTimeStamp` takes the
+  browser's offset for that date. Patterns with the `x` or `q` flag are checked only by the
+  server. The fields are disabled while a save and its reload run.
 * The check's validation holds the writer lock while it runs and stops after 10 seconds,
   after which the answer says `timedOut` and Save follows the guard's mode.
 * A field with more than 200 values is read-only with reason `too-many`, the other
@@ -477,8 +507,17 @@ runs A1 to A5, A7 and A9 against a real server in `tests/e2e/forms.spec.ts` and 
 the checks, branch saves, conflicts, the error summary, the empty state and the phone
 layout against the mock in `tests/mock/forms.spec.ts`.
 
-**Limits.** Nested forms, new instances, DASH viewers and full-text value search are Phase
-2, and list editors and `sh:or` or `sh:xone` alternatives are Phase 3, all under item 21.
+The review fixes added library tests for a value that moves between graphs while a save
+waits, a failed check that must leave no terms, the dependents a check validates and a
+cancelled model request. Server tests cover shapes graphs under a protection, a writer of
+some branches that names its branch in the body, grants split between the query and update
+endpoints, and a class-scoped protection. The mock tests cover a select with seven
+choices, a value in a graph the caller cannot write, the accessible description of a
+value's problem and edits during a save.
+
+**Limits.** Nested forms for blank node values with `dash:DetailsEditor` remain from
+Phase 2, and list editors and `sh:or` or `sh:xone` alternatives are Phase 3, all under
+item 21. The check's validation of other nodes stops at two triples from the resource.
 The entity picker searches labels as Explore's search does and does not limit its hits to
 the field's `sh:class`, which the server's check reports instead. Complex paths are shown
 without values. See the [screenshot](../images/forms.png) of a form in Explore and the
