@@ -1,593 +1,1660 @@
 # Features
 
-This page lists what Sparkles implements, area by area, and the known gaps.
-[API.md](API.md) documents the HTTP details and [USAGE.md](USAGE.md) the command line
-and the bindings. [COMPARISON.md](COMPARISON.md) compares the gaps with Jena/Fuseki,
-QLever, Fluree and Oxigraph, and
-[BENCHMARKS.md](BENCHMARKS.md) has the performance figures. The design specs in
+This page lists what Sparkles can do, grouped by area, so that you can check whether it
+supports a feature and find where that feature is documented. Each entry describes the
+current behaviour. [USAGE.md](USAGE.md) documents the command line and the bindings,
+[API.md](API.md) documents the HTTP interface, and the design specs in
 [specs/](specs/README.md) explain why each larger feature is built the way it is.
+[Known gaps](#known-gaps) lists what Sparkles does not do, and each gap names the
+[roadmap](ROADMAP.md) item that addresses it. [COMPARISON.md](COMPARISON.md) compares
+Sparkles with Jena and Fuseki, QLever, Fluree and Oxigraph, and
+[BENCHMARKS.md](BENCHMARKS.md) has the performance figures.
 
-* [Storage (TDB2 equivalent)](#storage-tdb2-equivalent)
-* [SPARQL (ARQ equivalent)](#sparql-arq-equivalent)
+* [Standards conformance](#standards-conformance)
+* [Storage and indexes](#storage-and-indexes)
+* [Versioning and history](#versioning-and-history)
+* [SPARQL queries and updates](#sparql-queries-and-updates)
 * [Search](#search)
 * [GeoSPARQL](#geosparql)
 * [Reasoning, validation and schema](#reasoning-validation-and-schema)
-* [Server (Fuseki equivalent)](#server-fuseki-equivalent)
-* [Agents and questions in plain language](#agents-and-questions-in-plain-language)
-* [Libraries and bindings](#libraries-and-bindings)
+* [Server and protocols](#server-and-protocols)
+* [Access control and security](#access-control-and-security)
+* [AI and agents](#ai-and-agents)
 * [Web UI](#web-ui)
+* [Libraries and bindings](#libraries-and-bindings)
 * [Command line](#command-line)
 * [Formatter and editor support](#formatter-and-editor-support)
+* [Operations](#operations)
 * [Known gaps](#known-gaps)
 
-## Storage (TDB2 equivalent)
+## Standards conformance
 
-The store follows TDB2's model of bulk loads, transactions, compaction and backups, on QLever-style sorted and compressed permutations, and keeps its history readable.
+Sparkles runs the W3C and community test suites in its own harness. `mise run test:w3c`,
+`test:shacl` and `test:shex` run them, as [DEVELOPMENT.md](DEVELOPMENT.md) describes.
 
-* 64-bit tagged ids. `xsd:integer`, `xsd:decimal`, `xsd:double`, `xsd:boolean`, `xsd:dateTime` and `xsd:date` values are stored inline when their lexical form is canonical.
-* A bulk write path. Large update and inference batches are merged into a rebuilt generation, published by an atomic `CURRENT` switch.
-* A sorted, front-coded, memory-mapped base vocabulary, and an append-only delta vocabulary. With `--vocab-codec fsst`, a load or compaction also compresses each key's suffix with FSST, which shrinks `vocab.dat` by about 30% and makes the generation index format 4. It stays off by default. Roadmap item 108 made FSST reads faster, so the DBpedia export now takes 1.05 times as long as with front coding instead of 2.7 times, but warm queries that decode many strings still run 4% to 12% slower, and item 160 follows up on single-term lookups ([X11](specs/X11-index-compression-and-predicate-patterns.md#item-108-faster-fsst-reads)).
-* A numeric column next to the base vocabulary (`vocab.num`). It holds the exact value of every numeric literal whose lexical form is not canonical, such as DBpedia's `xsd:float` coordinates or any `xsd:int`, so range filters, sorts and aggregates over them read 8 bytes per value instead of decoding the key. Loads and compactions write it, and `sparkles vocab-index` adds it to a database without one ([USAGE.md](USAGE.md#command-line-tools)).
-* 7 permutations (SPO, SOP, PSO, POS, OSP, OPS, GSPO) in compressed blocks of 32k rows.
-* Cold-read tuning ([X07](specs/X07-cold-sparse-reads.md)). A query hints the vocabulary groups of all its constants in one batch, requests the blocks of its first scans at plan time, and reads each scan pass with its own read-ahead window that grows from 1 MiB to a limit set by `SPARKLES_READ_WINDOW_KB`. A warm repeat of a query makes no read hint. Index joins decode the columns they asked for on a separate pool, and optional warmup checks cancellation and deadlines. `profile=io` on a query returns its phase times, index columns decoded, bytes requested and sampled page residency to callers with the `metrics` permission, and `/$/metrics` counts decoded columns, read-ahead bytes and vocabulary groups read. Each step has an `Optimizations` flag. Index format 3 splits each block column into frames of 2,048 rows with a directory of their first keys, so a point lookup, short range scan or index join decodes only the frames that can hold its rows. Format 2 stores open as before and are rewritten at the next compaction. See [API.md](API.md#the-io-profile).
-* A parallel bulk loader for Turtle, N-Triples, N-Quads, TriG, RDF/XML and JSON-LD. Reader-based loading is available for every supported format, with automatic selection and explicit streaming or buffered modes. Input can be compressed with gzip, xz, bzip2, zstd, brotli or LZ4. `sparkles load` and the library's `Dataset::load_file` also take Jena's TriX, RDF Thrift, RDF Protobuf and RDF/JSON, which they read into N-Quads first.
-* External sort for inputs larger than the memory budget.
-* CSV and TSV imports ([C05](specs/C05-tabular-imports.md)). `sparkles load`, `sparkles csv`, `POST /{ds}/upload` and the web UI's upload form map tables to triples with a default mapping (a key column or the row number names each row), with W3C CSVW metadata (datatypes and formats, null values, defaults, lists, virtual columns and RFC 6570 URI templates), or with Tarql-style CONSTRUCT templates run in batches by the SPARQL engine. Tables stream, compressed or not, and an invalid cell stops the load with its row and column ([USAGE.md](USAGE.md#loading-csv-and-tsv)).
-* Planner statistics for predicates (counts, distinct subjects and objects), classes and graphs.
-* Predicate patterns, QLever's pattern trick ([X11](specs/X11-index-compression-and-predicate-patterns.md#outcome)). Each generation keeps every subject's set of predicates by number, for the default graph and for the union of the named graphs. `GROUP BY ?p` with `COUNT(DISTINCT ?s)` over `?s ?p ?o` and an input that binds `?s`, `SELECT DISTINCT ?p` over the same shape, and `spk:hasPredicate` with its QLever name `ql:has-predicate` and a variable predicate read the patterns, corrected for the snapshot's delta per subject. Class profiles skip the subjects of predicates that no profiled instance has. Under a protection of triples, RDFS on read, a set of named graphs or a large delta, the same queries read the permutations.
-* MVCC snapshots with a single writer (MR+SW), and a WAL with crash-safe replay.
-* Durable commits. A commit is acknowledged after its WAL record and any new vocabulary
-  entries are synchronized, with the two writes issued in parallel. The update vocabulary
-  is written in checksummed chunks, so a torn tail is detected and trimmed at open.
-  Group commit, on by default for persistent stores, shares one synchronization among
-  concurrent writers. `--no-group-commit` or `SPARKLES_GROUP_COMMIT=off` turns it off, and
-  the Node and Python bindings take a `groupCommit` and a `group_commit` option. The JVM
-  library follows the default and has no option. A persistent dataset holds up to 64
-  commits or 4 MiB of log records in its queue, plus the speculative snapshots of the
-  commits in flight, which is the memory this speed costs. On an indexed 10.5M-triple
-  dataset with sixteen writers, that state raised the peak resident memory by 15 to 21 MiB.
-  It takes SPARQL updates, Graph Store writes, uploads, RDF Patch, commit
-  messages and change digests, preconditions, graph-restricted writes, SHACL-guarded
-  writes and writes during a compaction. ShEx-guarded datasets commit
-  through the group path one commit at a time. Datasets with a full-text, spatial or
-  embedding index group their commits as well. A commit's spatial view rides in its
-  speculative snapshot, its full-text changes reach the live index only after its fence,
-  and its embedding work is scheduled when it publishes, so no index on disk names a
-  commit the log could lose. A commit that does not qualify takes the ordinary path, as do
-  commits while a full-text index recovers or rebuilds and while a spatial index builds or
-  after its build failed. A commit by the only writer, with no fence running, is
-  synchronized as the default writer synchronizes it. `/$/metrics` reports the synchronization time, the
-  commits per fence, the wait, and why commits fell back or failed, and `/$/stats/{ds}`
-  whether the dataset groups commits.
-  [X09](specs/X09-group-commit-by-default.md) has the design.
-* Strict framing of old logs. A WAL written before logs had a header record is strictly
-  framed from the offset where this release first opened it for writing. The offset is
-  recorded in the generation's `commit.json` once the log, its vocabulary and its
-  annotations are durable, so a torn modern record after it is never read as a legacy one.
-* Durable commit ids. Each dataset has a UUID and a gap-free commit sequence with timestamps and net counts. Writes return receipts and `Sparkles-Commit` headers, and the commit catalog is available through `/$/commits` and `sparkles log`.
-* Commit messages and change digests. A write's `Sparkles-Commit-Message` header, or `--message` on `update` and `load`, is stored with its commit and shown in receipts, `/$/commits` and `sparkles log`. An optional SHA-256 digest chains each commit's net changes (`--commit-digests`).
-* Entity tags on Graph Store GET and HEAD, named after the commit read. `If-None-Match` answers `304`, and `If-Match` on PUT, POST and DELETE is an optimistic-concurrency check made under the writer lock (`412` on a mismatch).
-* Write previews. `dryRun=true` or `Sparkles-Dry-Run: true` on an update, a Graph Store write or an upload runs the write up to its commit and rolls it back. The response gives the commit it would create, the net counts per graph, optionally the changed quads as JSON or an RDF Patch, the validation summary, the quota effect and the outcome of `If-Match`, with the status the write would get. Nothing is written, no commit number is used, and indexes and inference status do not change. A Graph Store `PUT` through the write-ahead log records only the quads that change. See [API.md](API.md#write-previews).
-* Point-in-time reads with `?at=commit:N`, `time:…` or `snapshot:NAME` on queries, explain, Graph Store GET, SHACL validation, stats and schema discovery, with Memento headers and `Accept-Datetime` negotiation on the Graph Store. Named snapshots keep a commit readable across compaction, can expire or be made on a schedule, and can be kept materialized (warm). A retention window keeps older commits readable within a disk cap. A past state starts from the nearest known state in the write-ahead log, found through a sparse index, and replays forward or undoes changes backward. In-memory datasets keep the states their snapshots and window hold. The commands and endpoints are `/$/snapshots`, `/$/history`, `sparkles snapshot`, and `--at` on `query`, `dump` and `clone`.
-* Diffs between any two readable commits (`GET /{ds}/diff`, `sparkles diff`, `Store::diff`), as JSON counts and quads, as N-Quads lines marked `+` and `-`, or as RDF Patch in text or RDF Thrift, for one graph or all. Within the retained write-ahead logs a diff reads only the changes between the two commits. Across a bulk commit it compares the two states with a sorted merge. A diff can name a branch on either side (`fromBranch`, `toBranch`) and can keep only the changes whose subject or object is one of up to 1,000 `term` values. With `group=class` it returns the counts grouped by the class of the subject, the predicate and the class or datatype of the object, up to 5,000 groups, with classes read under the caller's view in the state where each change was seen ([API.md](API.md#diffs-between-commits)).
-* `GET /$/commits/{ds}/timeline` lists a branch's commits in buckets with the size of their changes, for a track over a long history. `POST /{ds}/sparql/diff` runs a SELECT query at two states and returns the rows only one of them has, comparing 128-bit row hashes so that large results fit the memory budget ([API.md](API.md#comparing-a-query-between-two-states)).
-* A change feed (`GET /{ds}/changes`, `Store::changes`): the commits after a given one with their changes, as JSON or one RDF Patch per commit, in pages bounded by commits and quads. It resumes from any readable commit, long-polls with `wait=`, and streams server-sent events that resume with `Last-Event-ID`.
-* History queries across commits (`SERVICE hist:changes` in SPARQL, `GET /{ds}/history`, `sparkles history`, `Store::history_changes`). Each change is a quad added or removed, with its commit's number, time, kind, author and message, and the triple pattern is written as an RDF 1.2 reifier. Its terms and its commit range can take their values from the rest of the join group, one lookup per distinct binding. They read a per-dataset change log that outlives compactions. The log is written off the commit path, indexed by subject, predicate, object and graph, recovered from the write-ahead log after a crash, and trimmed by commit count, age or size. Diffs and the change feed read it where the retained generations no longer can. Graph views and protections of triples apply. See [API.md](API.md#history-queries).
-* Applying RDF Patch ([F10](specs/F10-replication.md)). `POST` and `PATCH /{ds}/patch`, a patch sent to `/{ds}`, `sparkles patch`, `Store::apply_patch` and the Python `Dataset.apply_patch` apply a patch in the text or the binary form as one commit of kind `patch`, as Fuseki's `patch` operation does. `TA` aborts the whole patch, `PA` and `PD` change the prefixes, and a `prev` header that names a commit of the dataset applies the patch only while that commit is the head. Write-time validation, quotas, graph-limited grants, dry runs and receipts apply as to other writes ([API.md](API.md#applying-rdf-patch)).
-* Branches and merges ([F09](specs/F09-branches-and-merges.md)). A persistent branch starts from any readable commit of another branch and shares that generation's index files until it compacts, so creating one writes a few kilobytes. Memory branches share immutable base state and copy their inherited append vocabulary. Branches have their own commits, history, snapshots, write guard and writer lock, and requests choose one with `?branch=`, the path form `/{ds}@{branch}/…` or `--branch`. A merge finds the merge base, fast-forwards or merges quad sets three ways, reports conflicts by cell or subject with the base, ours and theirs objects, and takes resolutions per graph, subject or cell, a rule for the rest, and the heads the caller saw. It is one commit of kind `merge` that passes the target's write-time validation, and a dry run previews it. Blank nodes keep their labels across branches. Merges can also squash a branch into one commit, replay its commits one by one, run as cancellable tasks, and keep both sides' changes to exempt predicates. Reverts and cherry-picks are merges of one commit. Branches can be protected, renamed, deleted (re-parenting the branches created from them) and limited by grants, and `/$/branches`, `/$/merge`, `/$/revert`, `/$/cherry-pick`, `sparkles branch`, `sparkles merge`, `sparkles revert`, `sparkles cherry-pick`, and the web UI's Branches panel and merge page manage them ([API.md](API.md#branches-and-merges)). The History panel draws every branch as a commit graph. In-memory branches share immutable state and keep their writes and validation state separate. A branch backup restores as an independent dataset.
-* A commit catalog horizon (`catalog` in `PUT /$/history/{ds}`, `sparkles snapshot catalog`) that prunes the records, messages and digests of commits older than both the readable history and the horizon.
-* Compaction into a new generation (`gen-NNNN`), published by an atomic `CURRENT` switch. The build reads a snapshot while writes go on. The commits made meanwhile are carried into the new generation's log, and the writer lock is held only for the switch. A power loss during a compaction or a bulk load can leave the new generation's directory behind while `CURRENT` still names the old one. `sparkles check` reports it as a leftover warning. The next open deletes such a directory when it is an unfinished build and sets any other directory above `CURRENT` aside under a new name, and it refuses a directory that holds generations but no `CURRENT`.
-* Automatic compaction ([C13](specs/C13-automatic-compaction.md)). A server compacts a dataset when its delta reaches a share of the base index or a size, its log a size, its oldest change an age, or after a quiet period. Flags set the policy, and `compaction.json` (`/$/compaction/{ds}`, `sparkles compaction`) overrides it per dataset. It waits for bulk loads, backups, restores, the retention window and free disk space, takes a task slot only when one is free, and builds with fewer threads at a lower priority. A delta that adds no terms is compacted partially, rewriting only the index blocks it touches. The spatial index's base is built with the new generation, so the writer lock is held for a few milliseconds. The status is in `/$/stats`, the metrics and the dataset page. See [API.md](API.md#automatic-compaction).
-* Clone a dataset into an independent sandbox from one snapshot (`POST /$/datasets/{ds}/clone`, `sparkles clone`). The clone has the same quads and blank-node ids, and a new dataset id with `forkedFrom`. Inferences are copied or dropped. A source with no changes since its last compaction is cloned by sharing its index files, by reflink where the file system supports it, by copy otherwise, or by hard link on request. Other clones are rebuilt. A clone can copy some graphs only, can be an in-memory dataset, and waits for one of the `--max-clones` slots.
-* N-Quads backups (`/$/backup`) and dumps, compressed with zstd by default or with gzip, xz, bzip2, brotli or LZ4. Request bodies and responses can be compressed with `zstd`, `br` or `gzip`.
-* A read-only integrity check (`sparkles check`, `sparkles::check`). It checks the layout, every block of the 7 permutations, consistency across permutations, vocabulary order and id ranges, WAL checksums and commit continuity, the catalog, full-text segment checksums, and the spatial index's `geo.json` and index files. It is safe to run next to a running server ([USAGE.md](USAGE.md#checking-a-database)).
-* In-memory datasets, on the same engine with the base in a temporary directory.
+| Standard | Result |
+|---|---|
+| SPARQL 1.1 Query | All 328 W3C tests pass. |
+| SPARQL 1.1 Update | All 157 W3C tests pass. |
+| SPARQL 1.0 | All 482 W3C tests pass. |
+| SPARQL 1.2 | All 269 tests pass. |
+| Jena SPARQL-CDTs | All 655 tests of Jena's composite datatype suite pass. |
+| Jena ARQ property functions | All of ARQ's PropertyFunctions tests pass. |
+| SHACL Core and SHACL-SPARQL | All 98 Core tests and all 20 SPARQL tests of the W3C suites pass. |
+| SHACL 1.2 | The eight list constraint tests and all 146 node expression tests pass. |
+| SHACL Compact Syntax | Every test pair of the Working Group's suite reads and writes back to the expected graph. |
+| ShEx 2.2 | Every syntax, structure and representation test of shexTest passes, and 99.9% of the validation tests. The 42 tests that check blank-node labels are skipped. |
+| GeoSPARQL 1.1 | 37 of Oxigraph's 44 tests pass, and the other 7 are listed with reasons. Tests derived from Jena's also pass. |
+| Apache Jena | Jena's contract tests pass on the `sparkles-jena` dataset, and Jena's HTTP clients are tested against the server. |
 
-## SPARQL (ARQ equivalent)
+The SPARQL parser is a vendored, patched `spargebra`
+([`vendor/spargebra/PATCHED.md`](../vendor/spargebra/PATCHED.md)).
 
-Queries and updates follow the W3C recommendations and Jena ARQ's extensions, checked against the W3C suites and Jena's own answers.
+## Storage and indexes
 
-* SPARQL 1.1 Query: BGP, OPTIONAL, UNION, MINUS, FILTER, BIND, VALUES, subqueries, GROUP BY and aggregates, ORDER BY, DISTINCT, LIMIT/OFFSET and EXISTS.
-* The planner moves an eligible small basic graph pattern into pure UNION branches so each branch can use its bindings when choosing its join order. A bounded screen checks repeated unbound scan relations and estimated ordinary work before allocating eligibility data. Further guards require shared anchor variables and keep hidden anchor columns on the ordinary path. It preserves duplicate solutions and FILTER scope, retains the ordinary plan for outer FILTERs, bounds both the anchor estimate and copied patterns, and chooses the cheaper estimated complete plan. This avoids enumerating unrelated coauthor walks in SP²Bench `q8` and `q12b` ([roadmap](ROADMAP.md) item 91).
-* An OPTIONAL whose sides share no variable, but whose condition has a conjunct `?a = ?b` with one variable from each side, pairs its rows through that equality instead of forming their product. IRIs and blank nodes meet only the same id, other values meet the other side's values of other kinds, and the whole condition is then tested on those candidates, so errors, unbound values and duplicates are kept. SP²Bench `q6` at 10M tests 7.4 million candidate pairs where its product had 1.6 × 10¹² rows ([internals](internals/OPTIMIZATIONS.md), [roadmap](ROADMAP.md) item 91).
-* RDF 1.2 and SPARQL 1.2 in every RDF syntax. This covers triple terms (`<<( s p o )>>`), the reification syntax `<< >>`, annotations, base-direction literals (`"x"@en--rtl`), and the functions `TRIPLE`, `SUBJECT`, `PREDICATE`, `OBJECT`, `isTRIPLE`, `LANGDIR`, `hasLANG`, `hasLANGDIR` and `STRLANGDIR`.
-* Property paths. `p*`, `p+` and `p?` run as a breadth-first search over the index, starting from the side the join input binds.
-* The value space: numeric promotion, comparisons, effective boolean values and the total order for ORDER BY.
-* Jena ARQ's syntax extensions, accepted by default as Fuseki accepts them ([API.md](API.md#arq-syntax-extensions), spec [G06](specs/G06-arq-query-extensions.md)). `LATERAL` substitutes each outer solution into its group, respects the scope of sub-selects and runs as a join when substitution cannot change the result. Path ranges (`p{n}`, `p{n,m}`, `p{n,}`, `p{,m}`, `p{*}`, `p{+}`) count each way through the graph, as ARQ does. CONSTRUCT templates with `GRAPH` blocks return quads in TriG, N-Quads and the other dataset formats. `LET` assigns a variable that may be bound, `SEMIJOIN` and `ANTIJOIN` keep the solutions compatible with a group or with none of its solutions, and the paths `distinct(…)`, `multi(…)` and `:p^:q` follow ARQ's evaluation. ARQ's tests and Jena 6.2.0's answers check them.
-* Jena's composite datatypes `cdt:List` and `cdt:Map` ([API.md](API.md#arq-syntax-extensions)). Their literals, equality and order, the 16 `cdt:` functions, the `FOLD` aggregate and the `UNFOLD` operator follow Jena 5 and 6. Jena's SPARQL-CDTs suite runs with the W3C harness, and all 655 of its tests pass. A blank node label inside a literal names the node that the label names in the literal's file or query, as in Jena.
-* ARQ's property function library ([API.md](API.md#arqs-property-functions)): `list:member`, `list:index` and `list:length` over RDF collections, `apf:container`, `apf:bag`, `apf:seq`, `apf:alt` and `rdfs:member` over RDF containers, and `apf:strSplit`, `apf:concat`, `apf:str`, `apf:splitIRI`, `apf:assign`, `apf:bnode` and `apf:versionARQ`. A call reads the variables that the patterns before it bind, as in ARQ, and runs as a `PropertyFunction` operator, a leaf of the join order when it reads none. ARQ's PropertyFunctions tests run with the W3C harness and all pass. `rdfs:member` is an ordinary triple pattern while the store holds no container.
-* Configurable DESCRIBE ([API.md](API.md#describe), spec [G06](specs/G06-arq-query-extensions.md)). The default is the W3C concise bounded description, read from the default graph and each named graph as Jena's default handler reads them, with the reifiers of described triples. `scbd` adds the triples that point at the resource, and `outgoing` keeps the resource's own triples. Options add the labels of linked IRIs and limit the triples and the depth of a description. A dataset keeps its setting (`/$/describe/{ds}`, `sparkles describe-settings`), a request can choose another, and the service description lists it. Without reifiers in the data, the default gives Jena 6.2.0's answers.
-* The function library: the SPARQL 1.1 built-ins, the XSD casts (the derived integer types with their ranges, `anyURI` and the Gregorian types included), and ARQ's `fn:`, `afn:` and `math:` functions, such as `fn:round-half-to-even`, `fn:numeric-mod`, `fn:format-number`, `fn:apply`, the duration accessors, timezone adjustment, `fn:normalize-unicode`, `afn:sprintf`, `afn:substr` and `afn:sha1sum`, and ARQ's arithmetic on dates, times and durations ([API.md](API.md#extension-functions-and-aggregates)). Tests compare them with Jena's answers.
-* Jena ARQ's statistical aggregates `MEDIAN`, `MODE`, `STDEV`, `STDEV_SAMP`, `STDEV_POP`, `VARIANCE`, `VAR_SAMP` and `VAR_POP`, with `DISTINCT`, as keywords, by their `agg:` and `afn:` IRIs and through `AGG <iri>(…)`. Their results, types, empty groups and errors are ARQ's, and tests compare them with Jena's answers on the same data. The variance and deviation aggregates run in the incremental GROUP BY.
+The store follows TDB2's model of bulk loads, transactions, compaction and backups. Its
+index is a set of QLever-style sorted and compressed permutations.
+
+### Indexes and vocabulary
+
+* Terms are 64-bit tagged ids. `xsd:integer`, `xsd:decimal`, `xsd:double`,
+  `xsd:boolean`, `xsd:dateTime` and `xsd:date` values are stored inline when their
+  lexical form is canonical.
+* The index holds 7 permutations (SPO, SOP, PSO, POS, OSP, OPS and GSPO) in compressed
+  blocks of 32k rows. Index format 3 splits each block column into frames of 2,048 rows
+  with a directory of their first keys, so a point lookup, a short range scan or an index
+  join decodes only the frames that can hold its rows. Stores in format 2 open as they
+  are and are rewritten at the next compaction.
+* The base vocabulary is sorted, front-coded and memory-mapped, and an append-only delta
+  vocabulary holds the terms added since. With `--vocab-codec fsst`, a load or compaction
+  also compresses each key's suffix with FSST, which shrinks `vocab.dat` by about 30% and
+  writes generation index format 4. FSST is off by default because it slows queries that
+  decode many strings
+  ([X11](specs/X11-index-compression-and-predicate-patterns.md#item-108-faster-fsst-reads)).
+* A numeric column beside the base vocabulary, `vocab.num`, holds the exact value of
+  every numeric literal whose lexical form is not canonical, such as DBpedia's
+  `xsd:float` coordinates or any `xsd:int`. Range filters, sorts and aggregates over these
+  values read 8 bytes per value instead of decoding the key. Loads and compactions write
+  the column, and `sparkles vocab-index` adds it to a database that lacks it
+  ([USAGE.md](USAGE.md#command-line-tools)).
+* The planner keeps statistics for predicates, with their counts and distinct subjects
+  and objects, and for classes and graphs.
+* Predicate patterns implement QLever's pattern trick
+  ([X11](specs/X11-index-compression-and-predicate-patterns.md#outcome)). Each generation
+  stores every subject's set of predicates by number, for the default graph and for the
+  union of the named graphs. The patterns answer `GROUP BY ?p` with `COUNT(DISTINCT ?s)`
+  over `?s ?p ?o`, `SELECT DISTINCT ?p` over the same shape, and `spk:hasPredicate` with
+  its QLever name `ql:has-predicate`, corrected for the snapshot's delta. Class profiles
+  use them to skip predicates that no profiled instance has. Under a protection of
+  triples, RDFS on read, a set of named graphs or a large delta, the same queries read the
+  permutations.
+
+### Cold reads
+
+These read paths are tuned for queries over data that is not yet in memory
+([X07](specs/X07-cold-sparse-reads.md), [API.md](API.md#the-io-profile)).
+
+* A query hints the vocabulary groups of all its constants in one batch and requests
+  the blocks of its first scans at plan time. Each scan pass has its own read-ahead
+  window that grows from 1 MiB to the limit that `SPARKLES_READ_WINDOW_KB` sets. A warm
+  repeat of a query makes no read hint.
+* Index joins decode the columns they need on a separate pool, and optional warmup
+  observes cancellation and deadlines. Each step has its own `Optimizations` flag.
+* `profile=io` on a query returns its phase times, the index columns it decoded, the
+  bytes it requested and sampled page residency, for callers with the `metrics`
+  permission. `/$/metrics` counts decoded columns, read-ahead bytes and vocabulary
+  groups read.
+
+### Loading data
+
+* The parallel bulk loader reads Turtle, N-Triples, N-Quads, TriG, RDF/XML and JSON-LD,
+  streaming or buffered, and chooses the mode itself unless told. Input can be
+  compressed with gzip, xz, bzip2, zstd, brotli or LZ4. `sparkles load` and the library's
+  `Dataset::load_file` also read Jena's TriX, RDF Thrift, RDF Protobuf and RDF/JSON.
+* Inputs larger than the memory budget are sorted externally.
+* Large updates and inference batches take a bulk write path that merges them into a
+  rebuilt generation and publishes it by an atomic switch of `CURRENT`.
+* CSV and TSV tables map to triples ([C05](specs/C05-tabular-imports.md),
+  [USAGE.md](USAGE.md#loading-csv-and-tsv)). `sparkles load`, `sparkles csv`,
+  `POST /{ds}/upload` and the web UI's upload form accept them. A table maps with a
+  default mapping in which a key column or the row number names each row, with W3C CSVW
+  metadata, or with Tarql-style CONSTRUCT templates that the SPARQL engine runs in
+  batches. CSVW covers datatypes and formats, null values, defaults, lists, virtual
+  columns and RFC 6570 URI templates. Tables stream, compressed or not, and an invalid
+  cell stops the load and names its row and column.
+
+### Transactions and durability
+
+* Reads use MVCC snapshots with a single writer, and a write-ahead log replays safely
+  after a crash.
+* A commit is acknowledged once its WAL record and any new vocabulary entries are
+  synchronized. The two writes are issued in parallel, and the update vocabulary is
+  written in checksummed chunks, so a torn tail is detected and trimmed at open.
+* Group commit shares one synchronization among concurrent writers and is on by default
+  for persistent stores ([X09](specs/X09-group-commit-by-default.md)).
+  `--no-group-commit` or `SPARKLES_GROUP_COMMIT=off` turns it off, and the Node and
+  Python bindings take a `groupCommit` or `group_commit` option. The JVM library follows
+  the default.
+* Group commit covers SPARQL updates, Graph Store writes, uploads, RDF Patch, commit
+  messages and digests, preconditions, graph-restricted writes, SHACL-guarded writes,
+  writes during a compaction, and datasets with a full-text, spatial or embedding index.
+  ShEx-guarded datasets go through the group path one commit at a time. No index on disk
+  ever names a commit that the log could lose. A commit that does not qualify, or one made
+  while a full-text index recovers or rebuilds or while a spatial index builds, takes the
+  ordinary path.
+* Group commit costs memory. A persistent dataset queues up to 64 commits or 4 MiB of
+  log records, plus the speculative snapshots of the commits in flight. On an indexed
+  10.5M-triple dataset with sixteen writers, that state raised peak resident memory by
+  15 to 21 MiB.
+* `/$/metrics` reports the synchronization time, the commits per fence, the wait, and why
+  commits fell back or failed. `/$/stats/{ds}` says whether the dataset groups commits.
+* A WAL written before logs had a header record is framed strictly from the offset where
+  the current release first opened it for writing. The offset is recorded in the
+  generation's `commit.json` once the log, its vocabulary and its annotations are durable,
+  so a torn modern record after it is never read as a legacy one.
+
+### Compaction, clones and integrity
+
+* Compaction writes a new generation, `gen-NNNN`, and publishes it by an atomic switch of
+  `CURRENT`. The build reads a snapshot while writes continue, the commits made meanwhile
+  are carried into the new generation's log, and the writer lock is held only for the
+  switch. After a power loss during a compaction or bulk load, the next open deletes an
+  unfinished build directory, sets any other directory above `CURRENT` aside under a new
+  name, and refuses a directory that holds generations but no `CURRENT`. `sparkles check`
+  reports such a leftover as a warning.
+* Automatic compaction runs on a server ([C13](specs/C13-automatic-compaction.md),
+  [API.md](API.md#automatic-compaction)). It starts when a dataset's delta reaches a share
+  of the base index or a size, its log reaches a size, its oldest change reaches an age, or
+  after a quiet period. Flags set the policy, and `compaction.json`,
+  `/$/compaction/{ds}` and `sparkles compaction` override it per dataset. It waits for
+  bulk loads, backups, restores, the retention window and free disk space, takes a task
+  slot only when one is free, and builds with fewer threads at a lower priority. A delta
+  that adds no terms is compacted partially, rewriting only the blocks it touches.
+* `POST /$/datasets/{ds}/clone` and `sparkles clone` copy a dataset into an independent
+  sandbox from one snapshot. The clone has the same quads and blank-node ids and a new
+  dataset id with `forkedFrom`. A source with no changes since its last compaction is
+  cloned by sharing its index files, by reflink where the file system supports it, by
+  copy otherwise, or by hard link on request. A clone can copy only some graphs, can be an
+  in-memory dataset, and waits for one of the `--max-clones` slots.
+* `/$/backup` and dumps write N-Quads, compressed with zstd by default or with gzip, xz,
+  bzip2, brotli or LZ4. Request and response bodies can be compressed with `zstd`, `br`
+  or `gzip`. Incremental backup repositories are described under [Operations](#backups).
+* `sparkles check` and `sparkles::check` run a read-only integrity check that is safe
+  beside a running server ([USAGE.md](USAGE.md#checking-a-database)). It checks the
+  layout, every block of the 7 permutations and their consistency, vocabulary order and
+  id ranges, WAL checksums and commit continuity, the catalog, full-text segment
+  checksums, and the spatial index files.
+* In-memory datasets run on the same engine, with the base in a temporary directory.
+
+## Versioning and history
+
+Every write is a numbered commit, and past states, diffs, branches and the change history
+stay readable.
+
+### Commits
+
+* Each dataset has a UUID and a gap-free commit sequence with timestamps and net counts.
+  Writes return receipts and `Sparkles-Commit` headers, and `/$/commits` and
+  `sparkles log` list the commit catalog.
+* A write's `Sparkles-Commit-Message` header, or `--message` on `update` and `load`, is
+  stored with its commit and shown in receipts, `/$/commits` and `sparkles log`. With
+  `--commit-digests`, a SHA-256 digest chains each commit's net changes.
+* Graph Store GET and HEAD return entity tags named after the commit read.
+  `If-None-Match` answers `304`, and `If-Match` on PUT, POST and DELETE is an optimistic
+  concurrency check made under the writer lock that answers `412` on a mismatch.
+* `dryRun=true` or `Sparkles-Dry-Run: true` previews an update, Graph Store write or
+  upload by running it up to its commit and rolling it back
+  ([API.md](API.md#write-previews)). The response gives the commit it would create, net
+  counts per graph, optionally the changed quads as JSON or RDF Patch, the validation
+  summary, the quota effect and the outcome of `If-Match`, with the status the write would
+  get. Nothing is written and no commit number is used.
+* A Graph Store `PUT` through the write-ahead log records only the quads that change.
+* A commit catalog horizon, set by `catalog` in `PUT /$/history/{ds}` or
+  `sparkles snapshot catalog`, prunes the records, messages and digests of commits older
+  than both the readable history and the horizon.
+
+### Time travel
+
+* `?at=commit:N`, `time:…` or `snapshot:NAME` reads a past state in queries, explain,
+  Graph Store GET, SHACL validation, stats and schema discovery. The Graph Store adds
+  Memento headers and `Accept-Datetime` negotiation. `--at` does the same on `query`,
+  `dump` and `clone`.
+* Named snapshots keep a commit readable across compaction. They can expire, be taken on
+  a schedule and be kept materialized for fast reads. A retention window keeps older
+  commits readable within a disk cap. `/$/snapshots`, `/$/history` and
+  `sparkles snapshot` manage them.
+* A past state is rebuilt from the nearest known state in the write-ahead log, found
+  through a sparse index, by replaying forward or undoing backward. In-memory datasets
+  keep the states their snapshots and window hold.
+
+### Diffs, change feed and history queries
+
+* `GET /{ds}/diff`, `sparkles diff` and `Store::diff` compare any two readable commits
+  ([API.md](API.md#diffs-between-commits)). A diff comes as JSON counts and quads, as
+  N-Quads lines marked `+` and `-`, or as RDF Patch in text or RDF Thrift, for one graph
+  or all. Within the retained logs a diff reads only the changes between the commits, and
+  across a bulk commit it compares the two states with a sorted merge.
+* A diff can name a branch on either side with `fromBranch` and `toBranch`, and can keep
+  only changes whose subject or object is one of up to 1,000 `term` values. With
+  `group=class` it returns counts grouped by subject class, predicate and object class or
+  datatype, up to 5,000 groups.
+* `GET /$/commits/{ds}/timeline` lists a branch's commits in buckets with the size of
+  their changes. `POST /{ds}/sparql/diff` runs a SELECT query at two states and returns the
+  rows only one of them has, comparing 128-bit row hashes so that large results fit the
+  memory budget ([API.md](API.md#comparing-a-query-between-two-states)).
+* `GET /{ds}/changes` and `Store::changes` serve a change feed of the commits after a given
+  one, as JSON or one RDF Patch per commit, in pages bounded by commits and quads. It
+  resumes from any readable commit, long-polls with `wait=`, and streams server-sent
+  events that resume with `Last-Event-ID`.
+* History queries search the changes across commits ([API.md](API.md#history-queries)).
+  `SERVICE hist:changes` in SPARQL, `GET /{ds}/history`, `sparkles history` and
+  `Store::history_changes` return each added or removed quad with its commit's number,
+  time, kind, author and message, and write the triple pattern as an RDF 1.2 reifier. The
+  pattern's terms and the commit range can come from the rest of the join group.
+* History queries read a per-dataset change log that outlives compactions. It is written
+  off the commit path, indexed by subject, predicate, object and graph, recovered from the
+  write-ahead log after a crash, and trimmed by commit count, age or size. Diffs and the
+  change feed read it where the retained generations no longer can. Graph views and
+  protections of triples apply.
+
+### Branches and merges
+
+Branches work like git branches on the quad store
+([F09](specs/F09-branches-and-merges.md), [API.md](API.md#branches-and-merges)).
+
+* A persistent branch starts from any readable commit of another branch and shares that
+  generation's index files until it compacts, so creating one writes a few kilobytes.
+  In-memory branches share immutable base state and keep their writes and validation
+  state separate.
+* A branch has its own commits, history, snapshots, write guard and writer lock. Requests
+  choose one with `?branch=`, the path form `/{ds}@{branch}/…` or `--branch`.
+* A merge finds the merge base and either fast-forwards or merges quad sets three ways.
+  It reports conflicts by cell or subject with the base, ours and theirs objects, and takes
+  resolutions per graph, subject or cell, a rule for the rest, and the heads the caller
+  saw. The merge is one commit of kind `merge` that passes the target's write-time
+  validation, and a dry run previews it.
+* Merges can also squash a branch into one commit, replay its commits one by one, run as
+  cancellable tasks, and keep both sides' changes to exempt predicates. Reverts and
+  cherry-picks are merges of one commit. Blank nodes keep their labels across branches.
+* Branches can be protected, renamed, deleted, which re-parents the branches created from
+  them, and limited by grants. `/$/branches`, `/$/merge`, `/$/revert`, `/$/cherry-pick`,
+  `sparkles branch`, `merge`, `revert` and `cherry-pick` manage them, as do the web UI's
+  Branches panel and merge page. A branch backup restores as an independent dataset.
+
+### RDF Patch
+
+* `POST` and `PATCH /{ds}/patch`, a patch sent to `/{ds}`, `sparkles patch`,
+  `Store::apply_patch` and the Python `Dataset.apply_patch` apply a patch in text or
+  binary form as one commit of kind `patch`, as Fuseki's `patch` operation does
+  ([F10](specs/F10-replication.md), [API.md](API.md#applying-rdf-patch)).
+* `TA` aborts the whole patch, and `PA` and `PD` change the prefixes. A `prev` header that
+  names a commit of the dataset applies the patch only while that commit is the head.
+  Write-time validation, quotas, graph-limited grants, dry runs and receipts apply as to
+  other writes.
+
+## SPARQL queries and updates
+
+Queries and updates follow the W3C recommendations and Jena ARQ's extensions, and tests
+check them against the W3C suites and Jena's own answers.
+
+### Query and update language
+
+* SPARQL 1.1 Query covers BGP, OPTIONAL, UNION, MINUS, FILTER, BIND, VALUES, subqueries,
+  GROUP BY and aggregates, ORDER BY, DISTINCT, LIMIT and OFFSET, and EXISTS.
+* SPARQL 1.1 Update covers INSERT DATA, DELETE DATA, DELETE/INSERT WHERE, LOAD, CLEAR,
+  DROP, CREATE, ADD, COPY and MOVE.
+* RDF 1.2 and SPARQL 1.2 work in every RDF syntax. This covers triple terms
+  (`<<( s p o )>>`), the reification syntax `<< >>`, annotations, base-direction literals
+  such as `"x"@en--rtl`, and the functions `TRIPLE`, `SUBJECT`, `PREDICATE`, `OBJECT`,
+  `isTRIPLE`, `LANGDIR`, `hasLANG`, `hasLANGDIR` and `STRLANGDIR`.
+* The property paths `p*`, `p+` and `p?` run as a breadth-first search over the index,
+  starting from the side the join input binds.
+* The value space follows the specification for numeric promotion, comparisons, effective
+  boolean values and the total order of ORDER BY.
+* The function library has the SPARQL 1.1 built-ins, the XSD casts, including the
+  derived integer types with their ranges, `anyURI` and the Gregorian types, and ARQ's
+  `fn:`, `afn:` and `math:` functions ([API.md](API.md#extension-functions-and-aggregates)).
+  Examples are `fn:round-half-to-even`, `fn:format-number`, `fn:apply`, the duration
+  accessors, timezone adjustment, `fn:normalize-unicode`, `afn:sprintf` and
+  `afn:sha1sum`, as well as ARQ's arithmetic on dates, times and durations. Tests compare
+  them with Jena's answers.
+* Jena ARQ's statistical aggregates `MEDIAN`, `MODE`, `STDEV`, `STDEV_SAMP`, `STDEV_POP`,
+  `VARIANCE`, `VAR_SAMP` and `VAR_POP` work with `DISTINCT`, as keywords, by their `agg:`
+  and `afn:` IRIs and through `AGG <iri>(…)`. Their results, types, empty groups and errors
+  match ARQ's.
+* Results come as JSON, XML, CSV, TSV and `x-sparkles+json`, which includes the executed
+  plan. Graphs come as Turtle, N-Triples, N-Quads, TriG, JSON-LD and RDF/XML, and as
+  Jena's TriX, RDF Thrift, RDF Protobuf and RDF/JSON.
+
+### Jena ARQ extensions
+
+* ARQ's syntax extensions are accepted by default, as Fuseki accepts them
+  ([API.md](API.md#arq-syntax-extensions), [G06](specs/G06-arq-query-extensions.md)).
+  `LATERAL` substitutes each outer solution into its group and runs as a join when
+  substitution cannot change the result. Path ranges such as `p{n,m}` count each way
+  through the graph, as ARQ does. CONSTRUCT templates with `GRAPH` blocks return quads.
+  `LET`, `SEMIJOIN`, `ANTIJOIN` and the paths `distinct(…)`, `multi(…)` and `:p^:q` follow
+  ARQ's evaluation, and Jena 6.2.0's answers check them.
+* Jena's composite datatypes `cdt:List` and `cdt:Map` follow Jena 5 and 6, with their
+  literals, equality and order, the 16 `cdt:` functions, the `FOLD` aggregate and the
+  `UNFOLD` operator. A blank node label inside a literal names the same node as that label
+  in the literal's file or query.
+* ARQ's property function library is supported ([API.md](API.md#arqs-property-functions)).
+  It has `list:member`, `list:index` and `list:length` over RDF collections, `apf:container`,
+  `apf:bag`, `apf:seq`, `apf:alt` and `rdfs:member` over RDF containers, and `apf:strSplit`,
+  `apf:concat`, `apf:str`, `apf:splitIRI`, `apf:assign`, `apf:bnode` and
+  `apf:versionARQ`. A call reads the variables that earlier patterns bind, as in ARQ.
+  `rdfs:member` acts as an ordinary triple pattern while the store holds no container.
+* DESCRIBE is configurable ([API.md](API.md#describe)). The default is the W3C concise
+  bounded description, read from each graph as Jena's default handler reads them and
+  extended with the reifiers of described triples. `scbd` adds the triples that point at
+  the resource, and `outgoing` keeps only the resource's own triples. Options add labels
+  of linked IRIs and limit the size and depth. A dataset keeps its setting through
+  `/$/describe/{ds}` and `sparkles describe-settings`, and a request can choose another.
+
+### Federated queries
+
+* SERVICE, with SILENT, runs under an outbound network policy
+  ([USAGE.md](USAGE.md#outbound-requests-service-and-load)). A server allows only public
+  destinations by default, while the local `query` and `update` commands can also reach
+  private ones. The policy has allowlists, DNS pinning, checked redirects, timeouts and a
+  response ceiling.
+* Jena's service enhancer options work on SERVICE
+  ([API.md](API.md#service-options-loop-bulk-and-cache),
+  [G10](specs/G10-service-enhancer.md)). `loop:` runs a SERVICE once per solution of the
+  patterns before it. `bulk+n:` sends `n` solutions per request and retries one at a time
+  when an endpoint cuts a response short. `cache:` keeps each solution's remote result in a
+  per-dataset cache with a memory budget, separate for each caller, with `cache+clear` and
+  `cache+off`. `urn:x-arq:self` reads the dataset itself.
+
+### Planning and execution
+
+* The planner can move a small basic graph pattern into the branches of a pure UNION, so
+  that each branch uses its bindings to choose a join order. It keeps duplicates and
+  FILTER scope, and it keeps the ordinary plan when that plan is estimated to be cheaper.
+  This avoids enumerating unrelated coauthor walks in SP²Bench `q8` and `q12b`.
+* An OPTIONAL whose sides share no variable, but whose condition contains `?a = ?b` with
+  one variable from each side, pairs its rows through that equality instead of forming
+  their product ([internals](internals/OPTIMIZATIONS.md)). SP²Bench `q6` at 10M tests 7.4
+  million candidate pairs where the product had 1.6 × 10¹² rows.
+* Queries can run eagerly or as streaming cursors
+  ([X05](specs/X05-streaming-query-execution.md)). Automatic execution, the default over
+  HTTP, in the CLI, in Node and in the JVM library, streams scans expected to return at
+  least a thousand rows, groupings of an estimated 20,000 input rows or more, and bounded
+  ASK products whose eager candidates would exceed a budget. Other plans run eagerly, and
+  `execution=eager` or `execution=streaming` overrides the choice.
+* Rust, Python and Node have snapshot-owning SELECT and graph cursors, and the JVM
+  library pulls SELECT results. Result writers use bounded buffers with backpressure and
+  stop when the client disconnects.
+* Streaming joins run batch by batch with column kernels. ORDER BY with LIMIT keeps only
+  its best rows in a bounded heap. A cursor filter over an index scan filters whole blocks
+  in parallel, and a range top-k ranks its range a part at a time. A full sort and the
+  shapes the cursor does not support materialize within the budget and fail explicitly
+  when they exceed it.
+* Disk spill lets large queries finish within their memory budget
+  ([X08](specs/X08-disk-spill-and-server-memory.md)). It is off by default, and
+  `serve --spill on` or `encrypted` and `QueryOptions::spill` turn it on.
+  * A streamed sort without LIMIT writes sorted runs and merges them. A grouping or a
+    DISTINCT keeps what fits and handles the rest in later passes over hash-partitioned
+    files.
+  * A hash join whose build input outgrows its share partitions both inputs by key, up to
+    three levels, and joins a heavy key as a block nested loop. A merge join spools a long
+    run of equal keys to a file.
+  * `--spill encrypted` seals every frame with AES-256-GCM under a per-file key held only
+    in memory. Spill files are versioned, CRC-checked, unnamed while written and removed
+    with their query or process.
+  * Disk is reserved per query with `--query-spill-mb` or `spill-mb=`, and for the server
+    with `--spill-max-mb`. With spill on, automatic execution streams a query that eager
+    execution would hold in more than half its budget, and reruns an eager query that
+    exceeds its budget as a cursor unless it calls SERVICE.
+  * The server refuses to start with an unusable spill directory, one on tmpfs or ramfs, or
+    one that other users can write.
+
+### Explaining queries
+
+* Every node of a returned plan has an id and its path from the root, and the estimated,
+  eager and streamed plans have the same shape
+  ([USAGE.md](USAGE.md#explaining-a-query), [API.md](API.md#explaining-a-query)). Nodes
+  say when they did not run and why, when a `LIMIT` stopped them, how often they reran,
+  which filters a scan applied itself, and when a result came from the cache.
+* A query that a budget or its timeout stopped keeps its plan in the error body of the
+  `application/x-sparkles+json` format.
+* `POST /{ds}/sparql/explain` explains an estimated plan, a read-only run or a plan the
+  client gives. Its notes cover the slowest operator, misestimates, blowups, late filters,
+  large sorts, open paths, skipped nodes and the budget, together with a description of
+  what the query asks, all computed without a model. A configured `explain` model role can
+  rewrite them as prose, which the server checks against the plan. MCP's `explain_query`
+  takes `profile`, `notes` and `useServerModel`, which needs the `serverModels` grant.
+
+### Incremental views and live queries
+
 * Incremental views and live queries ([API.md](API.md#incremental-views), spec [F13](specs/F13-incremental-views-and-provenance.md) Phase 1). A `table` view keeps a SELECT or CONSTRUCT query's result current after every commit, through a circuit of Z-set operators compiled from the query that joins each commit's net changes against the store's own indexes. Basic graph patterns, `GRAPH`, `FILTER`, `BIND`, `UNION`, `OPTIONAL`, `MINUS`, `EXISTS`, `VALUES`, `DISTINCT`, subqueries and `GROUP BY` with `COUNT`, `SUM` and `AVG` are maintained, and other operators are evaluated again as `recompute` nodes. A commit that misses a view's patterns skips it. Queries read a view with `SERVICE view:read`, and `GET /{ds}/live` streams a query's result and then its changes as server-sent events, resuming after a commit with `Last-Event-ID`. Views and live queries with the same query and access share one circuit. View state is checkpointed and recovered from the change log, views read as their principal, and `Dataset::views`, `Dataset::live`, `sparkles views`, `sparkles query --live` and Python's `Dataset.views` and `Dataset.live` expose them.
-* SPARQL 1.1 Update: INSERT DATA, DELETE DATA, DELETE/INSERT WHERE, LOAD, CLEAR, DROP, CREATE, ADD, COPY and MOVE.
-* SERVICE (federated query, with SILENT) under an outbound network policy. On a server, only public destinations are allowed by default. The local `query` and `update` commands also reach private ones. The policy has allowlists, DNS pinning, checked redirects, timeouts and a response ceiling ([USAGE.md](USAGE.md#outbound-requests-service-and-load)).
-* Jena's service enhancer options on SERVICE ([API.md](API.md#service-options-loop-bulk-and-cache), spec [G10](specs/G10-service-enhancer.md)). `loop:` runs a SERVICE once per solution of the patterns before it, on the `LATERAL` operator with Jena's substitution. `bulk+n:` sends `n` solutions per request, as one VALUES block or as Jena's UNION, and asks again one at a time when an endpoint cuts a response short. `cache:` keeps each solution's remote result in a per-dataset cache with a memory budget, apart for each caller, with `cache+clear` and `cache+off`. `urn:x-arq:self` reads the dataset itself. Jena's tests of the module run against an endpoint in process.
-* Snapshot-owning SELECT and graph cursors in Rust, Python and Node, JVM SELECT pulls, and HTTP/CLI execution selection. Direct result writers use bounded output buffers, backpressure, cumulative budgets and body-lifetime cancellation. Joins resume across batches and are computed batch by batch with column kernels. Hash joins, DISTINCT and eligible aggregates retain charged state. ORDER BY with LIMIT keeps only its best rows in a bounded heap. A full sort and unsupported shapes expose budgeted materialization, failing explicitly when the budget is exceeded. Automatic execution, the default over HTTP, in the CLI, in Node and in the JVM library, streams immutable scans expected to return at least a thousand rows and groupings of an estimated 20,000 input rows or more, and bounded pure ASK products whose eager candidates exceed a row or memory budget. Other plans run eagerly. Cursor result writers decode the next batch ahead, and cursor filters and top-k read growing inputs. A cursor filter over an index scan reads the scan in morsels of whole blocks and filters each morsel in parallel, and a cursor range top-k ranks the parts of its range without value order a morsel at a time, holding only its best rows. `execution=eager` opts out, and explicit streaming can cost more on some workloads.
-* Disk spill ([X08](specs/X08-disk-spill-and-server-memory.md) Phase 2b, `serve --spill on` or `encrypted`, `QueryOptions::spill`). A streamed sort without LIMIT writes sorted runs and merges them, and a grouping or a DISTINCT keeps what fits and handles the rest in later passes over files partitioned by a hash, so each finishes within its memory budget. In `SELECT DISTINCT … ORDER BY` the DISTINCT runs below the sort and numbers its rows, so it may spill and the order holds. A hash join whose build input outgrows its share partitions both inputs by a hash of the key, up to three levels, joins a heavy key as a block nested loop, and keeps its probe input's order only when an operator above relies on it. A merge join spools a long run of equal keys to a file. `--spill encrypted` seals every frame with AES-256-GCM under a key per file held only in memory. Spill files are versioned, CRC-checked, nameless while written and removed with their query or process, and a start removes what dead processes left. Disk is reserved per query (`--query-spill-mb`, `spill-mb=`) and for the server (`--spill-max-mb`), and a query over it fails with the `spill` budget. With spill on, automatic execution streams a query that eager execution would hold in more than half its budget and runs an eager query that exceeds its budget again as a cursor, unless it calls SERVICE. Spill is off by default until all Phase 2b acceptance gates pass. Enabling it with an unusable directory, one on tmpfs or ramfs or one that other users can write fails the start.
-* Result formats: JSON, XML, CSV, TSV and `x-sparkles+json` (with the executed plan). RDF formats: Turtle, N-Triples, N-Quads, TriG, JSON-LD and RDF/XML, and Jena's TriX, RDF Thrift, RDF Protobuf and RDF/JSON.
-* W3C conformance: SPARQL 1.1 query 328/328, SPARQL 1.1 update 157/157, SPARQL 1.0 482/482 and SPARQL 1.2 269/269, with the vendored, patched `spargebra` ([`vendor/spargebra/PATCHED.md`](../vendor/spargebra/PATCHED.md)).
 
 ## Search
 
-Full-text, vector and path search run inside SPARQL and join with the rest of a query.
+Full-text, vector, path and graph-algorithm search run inside SPARQL and join with the
+rest of a query.
 
-* Full-text search with a subset of Jena's `text:query`, ranked by BM25 through Tantivy. Each quad is a document, kept current in each commit: a write stages its documents, and the next search or a 1 s tick commits them. A search returns the top k within a graph. The query string can be a variable that the rest of the group binds, and a join can pass a search the subjects it already has. A bulk commit updates the index by the documents it changes, and `POST /$/text/{ds}/rebuild` rebuilds it while writes go on. An index can be enabled when a dataset is created. Missing or damaged configured indexes recover in the background at open while RDF remains usable; text searches return `503` until recovery succeeds. Document publication can continue while a background checkpoint synchronizes segment files, and index reconfiguration waits for old writers and checkpoints before reusing their paths. A checkpoint synchronizes only the files written since the last one, from several threads. Under steady writes it repeats its unlocked pass over the newest files and takes the writer lock only for a last short pass when those repetitions keep being raced. It needs the `text` cargo feature, which the server enables.
-* Stemming per language for full-text search. The index stems the literals of configured languages with Tantivy's Snowball stemmers and stop words, and `lang:` searches use them, as with jena-text's multilingual support ([API.md](API.md#full-text-search)).
-* Vector similarity over `spk:vector` literals and their compact base64 form `spk:vectorB64`, with `spk:cosine`, `spk:dot` and `spk:euclidean`. `spk:vectorSearch` returns the top k within the active graph. Its query can be a literal, an entity or a variable bound by the rest of the group, and it takes `ef:`, `exact:true`, `distinct:subject` and `candidates:join`. `ORDER BY DESC(spk:cosine(?v, C)) LIMIT k` over one pattern runs as an exact vector search.
-* Vector indexes (`vector.json`, `/$/vector/{ds}/{name}`, `sparkles vector`). An index packs one predicate's vectors and builds an HNSW graph over them in the background, written to a file of the generation and mapped after a restart. Rows that commits add are inserted into the graph in the background after each commit, and a compaction carries the graph over to the new generation, so neither waits for a full rebuild. Searches overlay each snapshot's deleted vectors and the inserted ones the graph does not hold yet exactly, past commits are searched exactly, and `M`, `efConstruction` and `efSearch` are set per index and `ef:` per query ([API.md](API.md#vector-indexes)).
-* Embeddings computed on write. A vector index can name the literals to embed (predicates, languages, classes or a SELECT query) and an OpenAI-compatible embeddings endpoint, such as OpenAI, Ollama or vLLM. A background worker embeds new and changed text after each commit, removes the vectors of deleted text, and catches up after restarts and bulk loads without sending unchanged text again. `spk:vectorSearch` accepts a text for such an index. Long texts can be split into overlapping chunks with a vector each, and requests can be limited per minute by count and by estimated tokens. Requests go through the outbound policy, and API keys come from operator-defined secrets ([API.md](API.md#embeddings-on-write)). Prometheus metrics report requests, inputs, vectors, failures by kind, the backlog and the lag.
-* Local embedding models. With the `embed-local` build feature, which the flake's packages include, the server runs BERT, XLM-RoBERTa, NomicBERT and Qwen3 sentence-embedding models itself with Candle, on a small thread pool at a lower priority than queries, loading the weights at first use and dropping them when idle. Models come from a store of pinned, hash-verified snapshots that `sparkles models pull` fills from the Hugging Face Hub or a Nix build provides read-only. A vector index names a provider of the model configuration instead of a URL, and an `openai` or `ollama` provider works the same way with its own endpoint and key ([API.md](API.md#model-providers), [spec F12](specs/F12-local-embeddings.md)).
-* Hybrid search with `spk:hybridSearch`. It fuses a `text:query` ranking and a `spk:vectorSearch` ranking by reciprocal rank fusion and returns the fused score and both ranks ([API.md](API.md#hybrid-text-and-vector-search)).
-* Graph algorithms with `SERVICE algo:<name>`, `sparkles algo` and `POST /$/algo/{ds}/run`. PageRank (also personalized), betweenness, weakly and strongly connected components, label propagation, Louvain and Leiden with hierarchy levels, node similarity, triangle counts and clustering, k-core, breadth-first search, single-source shortest paths, and FastRP and node2vec embeddings run on a compressed sparse row projection that is built from chosen predicates, directions, node classes and reifier weights, or from a nested pattern. Results are rows, so they join with the rest of the query, and the projection holds only what the caller may read. Built projections are cached for committed views, while pending transaction views neither read nor populate that cache. A thread pool is shared by all calls, and each call has a memory budget. Node similarity reuses a bounded set of charged workspaces, selects topK with a bounded heap and admits output growth and merging before allocation. Sum aggregation preserves multiplicity weights for unit edges. PageRank requires finite non-negative stored weights and treats zero outgoing sums as dangling nodes. Applicable projection weights and aggregated sums must remain finite in f32 storage. Graphalytics clustering defaults to forward edges and returns coefficients without triangle counts. Summary-only runs also report statistics for empty projections and result sets. A named projection is kept in `algo.json`. A run can write its results back in batched commits with a run record, as a cancellable task, and embeddings reach a vector index the same way. Run counter replacement stays within the destination graph and preserves values in other graphs. Write-back tasks share cancellation sources and one deadline across computation and writes, decode their result one batch at a time, and skip a busy writer when they record a partial status. Every long loop of an algorithm over nodes, rows or heap entries checks cancellation and the deadline within a bounded amount of work, a sort runs as one uninterrupted step, and every workspace, including the shortest-path heap, is charged to the call before it grows. Under `GRAPH ?g`, the call of each graph uses only that graph's edges and reads that graph's own quads when they are fewer than its predicates' quads in all graphs. HTTP runs refuse a caller that can neither query nor update the dataset before reading the body, then select Query or Update endpoint grants and rate limits from the bounded body before dataset or restore access. A read run waits for the query memory pool as a query does, and a write-back run takes its grant when its task starts. Query permits cover blocking and streaming work. Update HTTP permits cover the `202` body, and background runs use the existing task queue. The MCP tool `graph_algorithm` and the Python and Node.js bindings expose the runs ([API.md](API.md#graph-algorithms), [F14](specs/F14-graph-algorithms.md#outcome)).
-* Path search with `SERVICE path:search`. It returns paths as solutions, one row per edge or per path: one shortest path per pair, every shortest path, the k shortest paths (Yen's algorithm) or every path up to a length. Edges come from a set of predicates, each followed forward, backward or both ways, from every triple, or from the solutions of a nested graph pattern. Each edge can be bound as a triple term. Sources and targets are constants or variables bound by the rest of the group. Weights on RDF 1.2 reifiers switch to Dijkstra's algorithm. A single pair runs as a bidirectional breadth-first search over the PSO and POS permutations, and paths never use triples the caller cannot see. `path:excludePredicate` skips predicates such as `rdf:type` while the search reads triples, and `path:maxDegree` keeps paths from passing through hubs, with each node's degree taken from the index's counts in the caller's view ([API.md](API.md#path-search), [U09](specs/U09-path-finder.md#outcome)).
+### Full-text search
+
+* Full-text search supports a subset of Jena's `text:query`, ranked by BM25 through
+  Tantivy ([API.md](API.md#full-text-search)). It needs the `text` cargo feature, which
+  the server enables.
+* Each quad is a document, kept current with each commit. A write stages its documents,
+  and the next search or a 1 s tick commits them. A bulk commit updates only the documents
+  it changes, and `POST /$/text/{ds}/rebuild` rebuilds the index while writes continue.
+* A search returns the top k within a graph. The query string can be a variable that the
+  rest of the group binds, and a join can pass a search the subjects it already has.
+* The index stems the literals of configured languages with Tantivy's Snowball stemmers
+  and stop words, and `lang:` searches use them, as with jena-text's multilingual support.
+* An index can be enabled when a dataset is created. A missing or damaged index recovers
+  in the background at open while the RDF data stays usable, and text searches answer
+  `503` until recovery succeeds. Reconfiguring an index waits for old writers and
+  checkpoints before it reuses their paths.
+* A background checkpoint synchronizes only the segment files written since the last
+  one, from several threads, while documents continue to publish. Under steady writes it
+  repeats its unlocked pass over the newest files and takes the writer lock only for a
+  short last pass when those repetitions keep being raced.
+
+### Vector search and embeddings
+
+* Vectors are `spk:vector` literals or their compact base64 form `spk:vectorB64`, compared
+  with `spk:cosine`, `spk:dot` and `spk:euclidean`.
+* `spk:vectorSearch` returns the top k within the active graph. Its query can be a
+  literal, an entity, a variable bound by the rest of the group, or a text for an index
+  that embeds on write. It takes `ef:`, `exact:true`, `distinct:subject` and
+  `candidates:join`. `ORDER BY DESC(spk:cosine(?v, C)) LIMIT k` over one pattern runs as
+  an exact vector search.
+* Vector indexes pack one predicate's vectors and build an HNSW graph over them in the
+  background ([API.md](API.md#vector-indexes)). `vector.json`, `/$/vector/{ds}/{name}` and
+  `sparkles vector` manage them. The graph is a file of the generation that is mapped
+  after a restart. New rows are inserted into it after each commit, and a compaction
+  carries it over, so neither waits for a full rebuild. Searches overlay deleted and
+  not-yet-inserted vectors exactly, past commits are searched exactly, and `M`,
+  `efConstruction` and `efSearch` are set per index.
+* An index can compute embeddings on write ([API.md](API.md#embeddings-on-write)). It
+  names the literals to embed, by predicate, language, class or a SELECT query, and an
+  OpenAI-compatible endpoint such as OpenAI, Ollama or vLLM. A background worker embeds
+  new and changed text after each commit, removes the vectors of deleted text, and catches
+  up after restarts and bulk loads without resending unchanged text. Long texts can be
+  split into overlapping chunks, and requests can be rate-limited by count and by
+  estimated tokens. API keys come from operator-defined secrets, and Prometheus metrics
+  report requests, failures, the backlog and the lag.
+* With the `embed-local` build feature, which the flake's packages include, the server
+  runs BERT, XLM-RoBERTa, NomicBERT and Qwen3 sentence-embedding models itself with Candle
+  ([API.md](API.md#model-providers), [F12](specs/F12-local-embeddings.md)). Models run on
+  a small thread pool at a lower priority than queries, load at first use and unload when
+  idle. They come from a store of pinned, hash-verified snapshots that
+  `sparkles models pull` fills from the Hugging Face Hub or a Nix build provides.
+* `spk:hybridSearch` fuses a `text:query` ranking and a `spk:vectorSearch` ranking by
+  reciprocal rank fusion and returns the fused score and both ranks
+  ([API.md](API.md#hybrid-text-and-vector-search)).
+
+### Path search
+
+* `SERVICE path:search` returns paths as solutions, one row per edge or per path
+  ([API.md](API.md#path-search), [U09](specs/U09-path-finder.md#outcome)). It finds one
+  shortest path per pair, every shortest path, the k shortest paths with Yen's algorithm,
+  or every path up to a length.
+* Edges come from a set of predicates, each followed forward, backward or both ways, from
+  every triple, or from the solutions of a nested graph pattern. Each edge can be bound as
+  a triple term. Sources and targets are constants or variables bound by the rest of the
+  group.
+* Weights on RDF 1.2 reifiers switch the search to Dijkstra's algorithm. An unweighted
+  single pair runs as a bidirectional breadth-first search over the PSO and POS
+  permutations.
+* `path:excludePredicate` skips predicates such as `rdf:type`, and `path:maxDegree` keeps
+  paths from passing through hubs. Paths never use triples the caller cannot see.
+
+### Graph algorithms
+
+* `SERVICE algo:<name>`, `sparkles algo` and `POST /$/algo/{ds}/run` run graph
+  algorithms ([API.md](API.md#graph-algorithms), [F14](specs/F14-graph-algorithms.md#outcome)).
+  The MCP tool `graph_algorithm` and the Python and Node.js bindings expose them too.
+* The algorithms are PageRank and personalized PageRank, betweenness, weakly and strongly
+  connected components, label propagation, Louvain and Leiden with hierarchy levels, node
+  similarity, triangle counts and clustering, k-core, breadth-first search, single-source
+  shortest paths, and FastRP and node2vec embeddings.
+* They run on a compressed sparse row projection built from chosen predicates,
+  directions, node classes and reifier weights, or from a nested pattern. Results are
+  rows that join with the rest of the query, and the projection holds only what the
+  caller may read. Under `GRAPH ?g`, each graph's call uses only that graph's edges.
+* A named projection is kept in `algo.json`, and built projections are cached for
+  committed views.
+* Weights follow each algorithm's domain. PageRank requires finite non-negative weights
+  and treats nodes with no outgoing weight as dangling, and weights and sums must stay
+  finite in f32. Graphalytics clustering defaults to forward edges.
+* A run can write its results back in batched commits with a run record, as a
+  cancellable task, and embeddings can go to a vector index the same way. Write-back
+  replaces counters only within the destination graph.
+* All calls share a thread pool, and each has a memory budget that charges every
+  workspace before it grows. Long loops check cancellation and the deadline within a
+  bounded amount of work.
+* HTTP runs check the caller's Query or Update grants and rate limits before they read
+  the dataset. A read run waits for the query memory pool as a query does, and a
+  write-back run takes its grant when its task starts.
 
 ## GeoSPARQL
 
-GeoSPARQL 1.1 and Jena's spatial functions run over a spatial index that is exact for every snapshot.
+GeoSPARQL 1.1 and Jena's spatial functions run over a spatial index that is exact for
+every snapshot. They need the `geo` cargo feature, which the server enables.
 
-* GeoSPARQL 1.1 functions, with the `geo` cargo feature (on in the server). Literals are `geo:wktLiteral`, `geo:geoJSONLiteral`, `geo:gmlLiteral` (GML 3.2 Simple Features levels 0 and 1, and linear curves and surfaces) and `geo:kmlLiteral` (KML 2.2), with Z/M layouts and EMPTY, and parse errors give byte offsets. `asGML` and `asKML` write GML and KML. The built-in CRSs are CRS84, CRS84h, EPSG:4326 and EPSG:4979 (with their latitude-first axes) and Web Mercator, with OGC, QUDT and EPSG units. The functions cover the 24 topological relations and `relate` on DE-9IM, `convexHull`, `envelope`, `boundary`, `centroid`, the four overlay operations and the accessors. `distance` is geodesic on WGS 84 by default, haversine if a dataset asks for it, and Euclidean for projected CRSs. `buffer` makes metric buffers through a local projection, and `area`, `length` and `perimeter` are geodesic. See [API.md](API.md#geosparql).
-* A spatial index per dataset (`geo.json`, `/$/geo/{ds}`, `sparkles geo-index`, `serve --geo`). It is a packed Hilbert R-tree over a generation's geometry literals, plus an overlay of committed writes, and it is exact for every MVCC snapshot. It stays within a memory budget (`--geo-mb`), reports its status, rows, skipped literals and CRSs, and exports `sparkles_geo_*` metrics.
-* Spatial index files (`gen-NNNN/geo/`) are checksummed and read in place. Opening a database, or re-enabling the same configuration, parses no literals. Damaged or foreign files are rebuilt, and compactions and bulk loads parse only new literals. The files are never part of backups or clones.
-* W3C Basic Geo. With `"wgs84": true` in `geo.json`, `wgs84_pos:lat`/`long` pairs are indexed as points for the `spatial:` functions and the map view.
-* `GET /{ds}/geo?bbox=…` returns the indexed geometries in a box as simplified CRS84 GeoJSON, for map views.
-* Jena's `spatial:` property functions: `nearby`, `withinCircle`, `withinBox`, `intersectBox`, the cardinal directions and their `…Geom` forms. Arguments can be constants or variables that the rest of the group binds, which run one search per binding. The index answers these and spatial FILTERs. EXPLAIN shows them as `SpatialScan` and `SpatialPf`, with per-operator counters and plan warnings.
-* GeoSPARQL's `boundingCircle`, `concaveHull` and `isSimple`, and the six `geof:agg…` aggregates (with GROUP BY and DISTINCT). Jena's 15 `spatialF:` filter functions. The 120 UTM zones (EPSG:326NN/327NN), using Krüger's series. Projected CRSs from proj4 definitions in a `--geo-crs` file, transformed by `proj4rs`. The server also resolves 4,916 projected EPSG codes from an EPSG-derived table. Queries warn when a CRS shifts its datum by approximate Helmert parameters, and definitions that need grid files are refused. `POST /$/geo/convert` returns literals as CRS84 GeoJSON for maps. Sparkles passes 37 of Oxigraph's 44 GeoSPARQL tests, with the other 7 listed with reasons, and tests derived from Jena's. See [API.md](API.md#hulls-aggregates-jena-filter-functions-utm-and-conversion).
-* Spatial joins and nearest neighbours. A GeoSPARQL relation, `relate` or a distance bound between the geometries of two parts of a group runs as an index nested loop, or over trees packed per query, instead of a cross product. A cell grid over each large region decides most points and small regions without the exact test. The index answers `ORDER BY geof:metricDistance(?w, C) LIMIT k`. EXPLAIN shows `SpatialJoin` and `SpatialKnn`, with `geo-not-joined` and `geo-not-knn` warnings. See [API.md](API.md#spatial-joins-and-nearest-neighbours).
-* GeoSPARQL query rewrite of the 24 topological properties, over asserted triples and those derived through default geometries and serializations. It is opt-in per dataset (`queryRewrite`), and `serve --no-geo-rewrite` turns it off for the server. Jena's `spatial:equals` is supported. `infer --vocab geosparql` adds RDFS entailment of the GeoSPARQL, Simple Features and GML vocabularies, and types each geometry (`sf:Polygon`, `gml:Polygon`, …) from its serializations, and `infer --geo-default-geometry` materializes default geometries. See [API.md](API.md#query-rewrite-spatialequals-and-rdfs-entailment).
+### Geometry literals and functions
+
+* Literals can be `geo:wktLiteral`, `geo:geoJSONLiteral`, `geo:gmlLiteral` and
+  `geo:kmlLiteral` ([API.md](API.md#geosparql)). GML covers the Simple Features levels 0
+  and 1 of GML 3.2 with linear curves and surfaces, and KML is version 2.2. Z and M
+  layouts and EMPTY are supported, and parse errors give byte offsets. `asGML` and `asKML`
+  write GML and KML.
+* The built-in CRSs are CRS84, CRS84h, EPSG:4326 and EPSG:4979 with their latitude-first
+  axes, and Web Mercator, with OGC, QUDT and EPSG units. The 120 UTM zones use Krüger's
+  series. A `--geo-crs` file adds projected CRSs from proj4 definitions, and the server
+  resolves 4,916 projected EPSG codes from an EPSG-derived table. Definitions that need
+  grid files are refused, and queries warn when a CRS shifts its datum by approximate
+  Helmert parameters.
+* The functions cover the 24 topological relations and `relate` on DE-9IM, `convexHull`,
+  `envelope`, `boundary`, `centroid`, the four overlay operations, the accessors,
+  `boundingCircle`, `concaveHull`, `isSimple` and the six `geof:agg…` aggregates
+  ([API.md](API.md#hulls-aggregates-jena-filter-functions-utm-and-conversion)).
+* `distance` is geodesic on WGS 84 by default, haversine if a dataset asks for it, and
+  Euclidean for projected CRSs. `buffer` makes metric buffers through a local projection,
+  and `area`, `length` and `perimeter` are geodesic.
+* With `"wgs84": true` in `geo.json`, W3C Basic Geo `wgs84_pos:lat` and `long` pairs are
+  indexed as points.
+
+### Spatial index and queries
+
+* Each dataset can have a spatial index, configured by `geo.json`, `/$/geo/{ds}`,
+  `sparkles geo-index` or `serve --geo`. It is a packed Hilbert R-tree over a generation's
+  geometry literals plus an overlay of committed writes. It stays within the `--geo-mb`
+  memory budget and reports its status, rows, skipped literals and CRSs in
+  `sparkles_geo_*` metrics.
+* The index files in `gen-NNNN/geo/` are checksummed and read in place, so opening a
+  database parses no literals. Damaged or foreign files are rebuilt, and compactions and
+  bulk loads parse only new literals. The files are not part of backups or clones.
+* Jena's `spatial:` property functions `nearby`, `withinCircle`, `withinBox`,
+  `intersectBox`, the cardinal directions and their `…Geom` forms use the index, and so do
+  spatial FILTERs. Arguments can be variables that the rest of the group binds. Jena's 15
+  `spatialF:` filter functions and `spatial:equals` are supported.
+* A GeoSPARQL relation, `relate` or a distance bound between two parts of a group runs as
+  a spatial join instead of a cross product, and the index answers
+  `ORDER BY geof:metricDistance(?w, C) LIMIT k`
+  ([API.md](API.md#spatial-joins-and-nearest-neighbours)). EXPLAIN shows `SpatialScan`,
+  `SpatialPf`, `SpatialJoin` and `SpatialKnn`, and warns when a query misses a join or
+  nearest-neighbour plan.
+* Query rewrite of the 24 topological properties, over asserted triples and those derived
+  through default geometries and serializations, is opt-in per dataset with
+  `queryRewrite` ([API.md](API.md#query-rewrite-spatialequals-and-rdfs-entailment)).
+  `infer --vocab geosparql` adds RDFS entailment of the GeoSPARQL, Simple Features and GML
+  vocabularies and types each geometry from its serializations, and
+  `infer --geo-default-geometry` materializes default geometries.
+* `GET /{ds}/geo?bbox=…` returns the indexed geometries in a box as simplified CRS84
+  GeoJSON, and `POST /$/geo/convert` converts literals to CRS84 GeoJSON for maps.
 
 ## Reasoning, validation and schema
 
-Inferences are materialized and kept current, shapes validate on request or on every write, and the schema report counts what the data holds.
+Inferences are materialized and kept current or derived on demand, shapes validate on
+request or on every write, and the schema report counts what the data holds.
 
-* RDFS and OWL 2 RL materialization, and Jena rule syntax (`sparkles-reasoner`, `/$/reason`, `sparkles infer`). The rules read the input graphs from the store's compressed indexes instead of a copy in memory, so a run's memory follows the facts it derives. Each iteration's results are merged in parallel, on a reasoning pool of half the cores by default (`serve --reason-threads`) that admits runs in arrival order while their threads fit. A run records its peak memory estimate and thread count. A run stops at 50 million derived triples unless `sparkles infer --max-inferred`, `serve --reason-max-inferred`, a request's `maxInferred` or the bindings set another limit, and it then fails with the code `inferred-limit` and commits nothing. LUBM(1000) under RDFS, 138 million triples, materializes in 91 s at 15.2 GiB of RSS on 16 cores, where the engine before the index-based rules needed 360 s and at least 34.1 GiB. `ReasonOptions::max_memory` bounds the estimated heap of the whole run, including the local terms rules make, the previous closure of an incremental run and the buffers that write the inferred graph, and fails a run before its commit when it would need more. The closure a dataset keeps for incremental runs holds only the derived facts, which took 41% to 47% of the memory of the previous closure on LUBM-style data. Small incremental runs over a kept closure read the input graphs from the indexes, and the closure remembers the answers of those reads between runs, charged to the memory budget and capped at 64 MiB. On LUBM-style data with 100 universities, a change of 1,000 triples at 16 threads takes 0.90 to 1.12 times its time before the closure dropped the explicit facts for RDFS and 1.00 to 1.18 times for OWL 2 RL, by the medians on forge.
-* Incremental materialization. A re-run, an automatic run or `sparkles infer` updates the previous materialization from its input graphs' changes since its commit, with the backward/forward algorithm, and writes what a full run would. Rules that are not monotonic or create blank nodes, RDF list changes under OWL 2 RL, large deletions and a changed set of input graphs run in full.
-* Input graphs and `owl:imports`. A materialization reads the default graph unless data and ontology graphs are named, and follows `owl:imports` to graphs of the dataset through a Jena-style location mapping. With `imports: fetch`, missing imports are loaded under the `LOAD` rules into the graph of the import IRI, so later runs work offline. See [API.md](API.md#input-graphs-and-imports).
-* RDFS on read, as Fuseki's `--rdfs` and Jena's `ja:DatasetRDFS`. Queries match the RDFS closure of each graph with respect to a schema graph or an uploaded schema, computed by rewriting the query. The answers equal Jena 6.2's on 55 fixture queries. It is set with `/$/rdfs/{ds}`, `serve --rdfs` or `query --rdfs`. See [API.md](API.md#rdfs-on-read).
-* Query-time reasoning with `reasoning=demand`. A query derives the facts its patterns need from the rules of RDFS, RDFS simple, OWL 2 RL or a Jena rule file as it runs, without the inferred graph, and Jena backward rules (`<-`) answer this way. The demand (magic sets) transformation starts from each pattern's constants and from the values earlier patterns bind, and the rules are first specialized to the dataset's schema, so a selective query derives only what reaches its answers. LUBM query 1 at 100 universities under OWL 2 RL derives no facts beyond the schema, where a materialization derives 10.9 million. `noValue` is evaluated in lower strata and equality in a stage of its own. Derived tables are cached per snapshot and view, a derivation reads the caller's view, and `maxDerived`, the query's deadline and its memory budget bound it. EXPLAIN shows a `Derive` node per pattern. It is `reasoning=demand` on the SPARQL endpoints, `sparkles query --reasoning demand` and `QueryOptions::reasoning` in the library. See [API.md](API.md#query-time-reasoning) and [F17](specs/F17-query-time-reasoning.md#outcome).
-* Inference freshness. Sparkles records the commit the inferences were made at, and only a later change to one of the graphs the run read makes them stale. `GET /$/reason/{ds}`, dataset info, `/$/stats` and a `Sparkles-Inferences` header report it. Automatic re-runs are opt-in, server-wide with `serve --auto-reason` or per dataset with `PUT /$/reason/{ds}/auto`.
-* Inconsistency diagnostics: 17 checks cover every OWL 2 RL rule with a `false` conclusion. `literal-not-in-datatype` checks `dt-not-type` for the datatypes whose value spaces it can decide. It finds ill-typed literals by a scan of the vocabulary that it remembers per generation, at most 262,145 of them, and with the inferences it also reads the literal typings of the closure a dataset keeps or saved, for the literals that the checked graphs hold. They run through `GET /$/reason/{ds}/diagnostics`, in JSON or Turtle, and `sparkles infer --check`. The checks never prove consistency.
-* SHACL Core and SHACL-SPARQL validation (`sparkles-shacl`), parallel and index-backed. It passes the W3C suites: 98/98 for Core and 20/20 for SPARQL. It also selects focus nodes with SHACL 1.2's `sh:targetWhere`, and checks SHACL 1.2's list constraints `sh:memberShape`, `sh:minListLength`, `sh:maxListLength` and `sh:uniqueMembers`, with `sh:detail` results, passing the eight SHACL 1.2 list tests. SHACL 1.2 node expressions (the Working Group's `shnex:` vocabulary: paths, filters, set operations, aggregates, ordering, conditionals and custom functions) are read as targets, as constraint parameters, in `sh:deactivated`, in `sh:values` and `sh:defaultValue` (derived during validation, not stored) and as constraints, passing all 146 tests of the Working Group's node expression suite. Write-time validation tracks the predicates an expression reads.
-* The SHACL Compact Syntax (SHACLC, `text/shaclc`). Shapes are read from it in `/{ds}/shacl`, write-time validation, `sparkles shacl`, `sparkles validation`, the MCP tool `validate_shacl`, the Python bindings and the UI's shapes editor. Drafted shapes are written in it by `/$/schema/{ds}/shapes`, `sparkles schema --draft-shapes`, the MCP tool `draft_shapes` and the UI's draft dialog. `sparkles shacl parse` converts shapes files between SHACLC and the RDF syntaxes. Every test pair of the Working Group's SHACLC suite reads to the expected graph and writes back to it. The writer refuses a graph that SHACLC cannot express and names the triples. See [API.md](API.md#shacl-compact-syntax-shaclc).
-* Write-time SHACL and ShEx validation. The post-state of every commit is validated before anything is written. In `reject` mode the write is refused with `422`; in `warn` mode it is committed and the results are reported. SHACL shapes come from dataset graphs, a file, or both. ShEx uses a schema and a query shape map that is expanded per write. When the schema is set, its imports are resolved and copied into the database. The configuration is `validation.json` format 2, and format 1 is also read. Validation is skipped for writes that touch no relevant graph or only predicates no shape reads. If a dataset's guard cannot be loaded, its writes are refused rather than accepted unvalidated. Validation is configured through `/$/validation/{ds}` and `sparkles validation`, and the CLI's `--no-validate` skips it. Results show in `sparkles_validation_*` metrics, the `validation` and `validation_ms` access-log fields, CLI summaries and `sparkles stats`. A write validates only the focus nodes or associations it can affect, against the exact result counts of the head, which are kept in `validation-status.json`. It falls back to a full validation when the head's state is unknown, the shapes change, or too much is affected. SHACL-SPARQL constraints whose queries are anchored at the focus node, `sh:targetWhere` targets (SHACL 1.2) and `rdfs:subClassOf` changes are validated incrementally. SHACL-SPARQL queries that are not anchored and recursive SHACL shapes are validated in full on every write. For recursive ShEx schemas the guard keeps the typing of the head and validates only where typings change. Grandfather mode, in both languages, blocks only the results a write introduces. A ShEx schema can also live in ShExR graphs of the dataset, which are read from the state each write leaves, as SHACL shapes graphs are. Writes that bypass validation are flagged `unvalidated` in the commit log. `serve --validate` sets or checks a dataset's configuration at startup. The dataset page edits SHACL and ShEx guard settings and sources, and shows the validation state, the last write and recent rejections. Rejected writes show their validation results in the query editor.
-* Fuseki's `/{ds}/shacl` endpoint (`graph=default|union|<iri>`) and the `sparkles shacl` command. The report comes as Turtle, N-Triples, JSON-LD or JSON. Validation covers the data and the inferences.
-* ShEx 2.2 validation (`sparkles-shex`, with the `shex` cargo feature, on by default). Schemas can be ShExC, ShExJ or ShExR. ShExR can be in any RDF syntax Sparkles reads, named by media type (`text/turtle`, N-Triples, RDF/XML, TriG, N-Quads) or file extension (`.ttl`, `.nt`, …). Imports can be inline, files under `--load-dir`, or http(s) URLs fetched through the outbound policy. `EXTERNAL` shapes, annotations and the Test semantic-action extension are supported. Shape maps can be compact or JSON, with `{FOCUS p o}` selectors and `SPARQL """SELECT …"""` selectors. SPARQL selectors run on the data graph within the query's row and memory budgets, without SERVICE. Recursion and negation use stratified greatest-fixed-point typing, without deep stacks. Validation is parallel and index-backed. On shexTest, Sparkles passes 100% of the syntax, negative-syntax, negative-structure and representation tests. It passes 100% of the ShExR tests, reading each `.ttl` schema as ShExJ and writing each `.shex` as the `.ttl` graph. It passes 99.9% of the validation tests from ShExC, ShExJ and ShExR. The store does not keep blank-node labels, so the 42 tests that check them are skipped and one more is listed as a known failure. `POST /{ds}/shex` (a Sparkles extension) returns JSON, ShapeMap JSON, compact or text reports. `sparkles shex validate|parse` accepts Jena's flag names as aliases, and `parse --out shexr` writes Turtle. See [API.md](API.md#shex-validation). ShEx 2.2's `EXTENDS` and `ABSTRACT` are supported in ShExC, ShExJ and ShExR, and the 2.2 cases of shexTest pass (100 of 100 validation cases and every syntax and representation case), but `RESTRICTS` and the `EXACTLY` reference syntax are not. In the UI, the dataset page's Validate panel runs it.
-* Schema discovery (`GET /$/schema/{ds}`, `sparkles schema`, `sparkles::schema`). It lists classes and predicates with exact counts per graph: triples, distinct subjects and objects, object kinds, datatypes, languages, and the most objects per subject. These counts are kept apart from the RDFS and OWL declarations. It reports subClassOf roots and cycles. Pagination uses cursors bound to one snapshot. Time and entry budgets make it fail rather than truncate. An RDF `Accept` header or `sparkles schema --format void|turtle` gives the report as a VoID description with class and property partitions, followed by the declarations. A third layer lists the SHACL constraints per class, from the write-time validation's shapes or from named shapes graphs, and says whether each is enforced on write, reported on write, or checked only on request. `detail=subjectClasses` lists the classes of each predicate's subjects with triple counts. Anonymous superclasses, equivalent classes, domains and ranges are rendered in the OWL 2 Manchester Syntax. After a write, the server brings its kept report up to date from the changes instead of recounting, up to one change per 500 triples, and a small named graph is read from GSPO instead of filtering the whole store. See [API.md](API.md#constraints-layer).
-* Class profiles and schema diffs (`GET /$/schema/{ds}/profiles` and `/$/schema/{ds}/diff`, `sparkles schema --profiles` and `--diff`, `describe_schema` with `section: "profiles"` and the MCP tool `diff_schema`). A profile lists, for each class, the predicates its instances use, with how many instances have a value, the values per instance, the object kinds and datatypes and the classes of the values, and the predicates that point at its instances. A diff compares the reports of two commits, times or named snapshots, and lists the classes and predicates added, removed and changed, field by field. The UI's class panel shows the profile, and its **Compare** dialog shows a diff. See [API.md](API.md#class-profiles).
-* Shapes drafted from the data (`GET /$/schema/{ds}/shapes`, `sparkles schema --draft-shapes`, the MCP tool `draft_shapes`, `sparkles::schema::draft_shapes`). Each class gets a SHACL node shape, or a ShEx shape with a query shape map, with `sh:minCount`, `sh:maxCount`, `sh:nodeKind`, `sh:datatype` (or an `sh:or` of two or three datatypes when the values mix them), `sh:class` with an `sh:node` reference to the class's own shape at support 1, `sh:in`, `sh:languageIn`, `sh:uniqueLang`, `sh:pattern` (a fixed prefix or a character-class skeleton), observed `sh:minInclusive` and `sh:maxInclusive`, inverse property shapes, sequence paths through blank nodes such as an address, and optionally `sh:closed`, computed from exact per-class profiles of the SHACL instances. A constraint is drafted when the share of the instances it applies to that satisfy it reaches a support threshold, and the draft reports how many instances each constraint excludes. At support 1 the current data conforms, which randomized tests check in both languages. Drafts read only the caller's visible graphs. See [API.md](API.md#drafted-shapes).
+### Reasoning
 
-## Server (Fuseki equivalent)
+* RDFS, OWL 2 RL and Jena rule syntax materialize through `sparkles-reasoner`,
+  `/$/reason` and `sparkles infer`. The rules read their input graphs from the
+  compressed indexes, so a run's memory follows the facts it derives. LUBM(1000) under
+  RDFS, 138 million triples, materializes in 91 s at 15.2 GiB of RSS on 16 cores
+  ([F16](specs/F16-materialization-at-scale.md#outcome), [BENCHMARKS.md](BENCHMARKS.md)).
+* Each iteration merges its results in parallel on a reasoning pool, half the cores by
+  default with `serve --reason-threads`, that admits runs in arrival order. A run stops at
+  50 million derived triples by default, and `sparkles infer --max-inferred`,
+  `serve --reason-max-inferred`, a request's `maxInferred` and the bindings change the
+  limit. A run past the limit fails with the code `inferred-limit` and commits nothing.
+  `ReasonOptions::max_memory` bounds the estimated heap of the whole run.
+* Re-runs, automatic runs and `sparkles infer` update the previous materialization
+  incrementally with the backward/forward algorithm, and write what a full run would.
+  Rules that are not monotonic or create blank nodes, large deletions and a changed set of
+  input graphs run in full. The kept closure holds only the derived facts, which takes 41%
+  to 47% of the memory of a closure with the explicit facts on LUBM-style data.
+* A materialization reads the default graph unless data and ontology graphs are named,
+  and follows `owl:imports` to graphs of the dataset through a Jena-style location
+  mapping ([API.md](API.md#input-graphs-and-imports)). With `imports: fetch`, missing
+  imports are loaded into the graph of the import IRI, so later runs work offline.
+* RDFS on read matches Fuseki's `--rdfs` and Jena's `ja:DatasetRDFS`
+  ([API.md](API.md#rdfs-on-read)). Queries see the RDFS closure of each graph against a
+  schema graph by rewriting the query, and the answers equal Jena 6.2's on 55 fixture
+  queries. `/$/rdfs/{ds}`, `serve --rdfs` and `query --rdfs` turn it on.
+* Query-time reasoning with `reasoning=demand` derives the facts a query's patterns need
+  as it runs, from RDFS, RDFS simple, OWL 2 RL or a Jena rule file, without the inferred
+  graph ([API.md](API.md#query-time-reasoning), [F17](specs/F17-query-time-reasoning.md#outcome)).
+  Jena backward rules answer this way. A demand (magic sets) transformation starts from
+  the query's constants and bindings over rules specialized to the schema, so LUBM query 1
+  under OWL 2 RL derives no facts beyond the schema. Derived tables are cached per
+  snapshot and view, and `maxDerived`, the deadline and the memory budget bound them.
+  EXPLAIN shows a `Derive` node per pattern.
+* Sparkles records the commit at which inferences were made, and only a later change to a
+  graph the run read makes them stale. `GET /$/reason/{ds}`, dataset info, `/$/stats` and
+  the `Sparkles-Inferences` header report freshness. Automatic re-runs are opt-in with
+  `serve --auto-reason` or `PUT /$/reason/{ds}/auto`.
+* `GET /$/reason/{ds}/diagnostics` and `sparkles infer --check` run 17 inconsistency
+  checks that cover every OWL 2 RL rule with a `false` conclusion, in JSON or Turtle.
+  `literal-not-in-datatype` finds ill-typed literals for the datatypes whose value spaces
+  it can decide. The checks never prove consistency.
 
-The server speaks Fuseki's protocols and admin API and adds authentication, access control, budgets and observability.
+### SHACL
 
-* The SPARQL protocol, GSP, upload, the `/$/` admin API (datasets, stats, compact, backup, tasks) and Jena's special graphs (`urn:x-arq:DefaultGraph` and `UnionGraph`).
-* A SPARQL 1.1 Service Description at `/{ds}/sparql` and `/{ds}/query` for a GET without a query. It describes the query and update services, their languages, formats and features, every extension function, aggregate and property function, the entailment regime of materialized inferences and the default dataset, and links the VoID description. Named graphs and counts follow the caller's grants ([API.md](API.md#service-description)).
-* Fuseki compatibility beyond the endpoints. The admin API has Fuseki's `/$/backups` alias (an N-Quads dump unless the body is JSON), `/$/backups-list`, `/$/stats` with request counters, `?state=offline|active`, `deleteOld`, the `/$/validate/*` services and assembler bodies on `POST /$/datasets` for the part of a `config.ttl` that maps to a dataset. Dataset, task and server JSON carry Fuseki's members (`ds.name`, `ds.services`, `taskId`, `finished`, `success`). The protocol has `using-graph-uri`, `?graph=union`, `?target=` on `/shacl`, direct Graph Store naming (`--gsp-direct-naming`), `output=`, `results=` and `force-accept`, and Jena's RDF Thrift, RDF Protobuf, RDF/JSON, TriX and SPARQL Results Thrift. Fuseki's `patch` operation applies RDF Patch at `/{ds}/patch` and `/{ds}`. Jena's own clients (`RDFConnectionRemote`, `RDFConnectionFuseki`, `GSP`, `DSP`, `QueryExecHTTP`, `UpdateExecHTTP`) and patches written by Jena's patch writers are tested against the server with `mise run test:jena-clients`.
-* Fuseki configurations convert to Sparkles. `sparkles config import fuseki` reads a `config.ttl`, the service files of `run/configuration/` and `shiro.ini` or the `fuseki:passwd` file. It writes a `serve` script, a data migration script with `tdb2.tdbdump` steps, an auth configuration with argon2id hashes and grants from `fuseki:allowedUsers`, Shiro's URL rules and graph access control, and the text, spatial, RDFS and inference settings of each dataset. A report gives each element as converted, approximated, a manual step, ignored or unsupported, and the exit status is 1 when something important is unsupported. `serve --fuseki-config` converts at each start and loads `ja:data` into memory, as Fuseki does ([G08](specs/G08-fuseki-configuration.md)).
-* An OpenAPI 3.1 description of the whole HTTP API at `/$/openapi.json` and `/$/openapi.yaml`, also printed by `sparkles openapi` and checked in as `docs/openapi.json`. A test keeps its paths and methods equal to the server's route table, and each operation's security and permission come from the code that authorizes it ([spec X03](specs/X03-openapi-and-completions.md), [API.md](API.md#openapi-description)).
-* Query result cache controls: `--result-cache-mb`, `nocache=true`, cache statistics in `/$/stats` and `POST /$/cache/clear/{ds}`.
-* Server-wide memory. The block, result, SERVICE and history caches are sized once for the server and shared by all datasets, with per-dataset bytes, hits and misses, and a `small` memory profile (`--memory-profile`) that saves about 70 MiB of RSS at 10.5M and matches the default profile's warm and cold times within 1%. A query memory pool (`--total-query-memory-mb`) bounds the estimated memory of all queries and updates together. A finished eager SELECT or ASK keeps only its result's estimate in the pool. Other eager contexts retain their admitted high-water estimates until their last owner drops, and contexts sharing a grant add their contributions. That includes decoded CONSTRUCT and DESCRIBE output. Cursor charges release with their live state. Requests wait in arrival order for a share of it, answer `503` with `Retry-After` after `--query-admission-wait`, and a query the pool cannot cover fails with the `server-memory` budget. `GET /$/server/memory` and the `sparkles_query_pool_*` and `sparkles_query_admission_*` metrics report it. Embedded catalogs share their datasets' caches and take a pool through `MemoryOptions`. The pool adds at most 0.5 µs to a query of a few microseconds. A server with ten datasets stays under the amended A1 memory bound, at 0.946 of it with a 256 MiB block cache and 1.027 with 32 MiB, within the 10% the gate allows. The bound counts one dataset's anonymous memory, 1.25 bytes for each further cached byte and 228 KiB for each further idle dataset ([X08](specs/X08-disk-spill-and-server-memory.md#gates)). Opt-in disk spill covers sorts, groupings, DISTINCT and joins ([X08](specs/X08-disk-spill-and-server-memory.md) Phase 2b).
-* Stored, parameterized queries (`/$/queries/{ds}`, `/{ds}/queries/{name}`, `sparkles queries`, `sparkles::stored`). Named queries per dataset with typed parameters, defaults, allowed values, a description, example questions and a default result format, kept in `queries.json`, which backups and clones include. A run binds each value as one RDF term through initial bindings, never as query text, and goes through the code path of `/{ds}/sparql`, with the caller's graph view, budgets and rate limits. Every change is a version with its author, message, the dataset's head commit and a chained digest, and `If-Match` makes changes conditional. The MCP server offers each stored query as a tool with a JSON Schema of its parameters. See [API.md](API.md#stored-queries).
-* A read-only GraphQL endpoint per dataset (`/{ds}/graphql`, `/$/graphql/{ds}`, `sparkles graphql`, the crate `sparkles-graphql`). An administrator installs a mapping schema in GraphQL SDL whose `@rdf` directives name classes, predicates (inverse ones too) and enum IRIs, with `@prefix`, `@lang` and `@single`. Drafts come from the write-time guard's SHACL shapes or from the shapes the data supports, and write a non-null field only where a guard enforces it. The server generates lookups, cursor connections with `totalCount`, `node(id:)`, filters with `and`, `or`, `not` and nested object filters, and orders with an id tie-break. A request runs as a number of SPARQL queries fixed by the document, built as algebra on one snapshot: single values as `OPTIONAL`s, the multi-valued values of a level as one `UNION`, and each object field as one query seeded with its parents' ids. Cursors name their commit and read it again. Depth, fetch groups and estimated nodes are limited before a request runs, and its groups share one deadline and one count of rows. Every group runs with the caller's graph view and protections of triples, and grants may name the `graphql` endpoint, which a `query` grant covers. Introspection, the GraphQL over HTTP media types and status codes, and execution errors with null propagation follow the specifications. See [API.md](API.md#graphql).
-* Per-query budgets for estimated intermediate-result memory, response size, rows, and the rows all operators produce. A request can lower each budget with a parameter but never raise it. A query over budget fails with `507`. Queries and writes stop when their client disconnects.
-* Storage quotas for persistent datasets: a default (`--max-dataset-mb`) and a quota per dataset (`/$/quota/{ds}`, `sparkles quota`). A write that would take a dataset over its quota is refused with `507` before it commits, while reads and deletes go on. Usage against the quota shows in `/$/stats`, the metrics and the dataset page. See [API.md](API.md#storage-quotas).
-* Authentication and per-dataset access control (`serve --auth-config`, off by default). The access levels are `read` < `write` < `admin`, granted by dataset name or pattern, plus `metrics`, `federate` and `server-admin`. Access is denied by default, and hidden datasets answer `404`. Callers sign in as HTTP Basic users (argon2id), with API tokens, with OIDC in the UI, or through a trusted forward-auth proxy. API tokens (`Authorization: Bearer spk_…`) are scoped, expiring and revocable, hashed at rest, and never have more access than their owner. OIDC sign-in for the UI is native (authorization code with PKCE), with back-channel logout and optional idle timeouts for sessions. API clients can also send the OIDC provider's access tokens (JWTs checked against its JWKS, with key rotation), and Cloudflare Access assertions are verified. Proxy headers are trusted from configured CIDRs or a Unix socket. Groups map to roles, and the groups a provider asserts are recorded in the owner's tokens. Device logins survive restarts. `serve --tls-cert --tls-key` serves HTTPS natively (rustls, HTTP/2 through ALPN, certificates reloaded when they change), though a reverse proxy usually terminates TLS. Cookies follow CSRF and CORS rules. `sparkles auth login` signs the CLI in (browser loopback or device code) for remote `query`, `update` and `load --server`. See [API.md](API.md#authentication-and-access-control).
-* Graph-level access control and endpoint permissions. A grant can cover only some named graphs of a dataset (by IRI, by `*` pattern, or the default graph), only some of its endpoints (Fuseki's `query`, `update`, `gsp-r`, `gsp-rw`, `upload` and `shacl`, and Sparkles' `shex`, `diff` and `info`), or both, for reading or for writing. The engine runs each query on a filtered view of the dataset, so `GRAPH ?g`, `FROM`, paths, counts from statistics, full-text, vector, hybrid and spatial search, schema discovery, diffs, the change feed and the Graph Store see only the covered graphs, and a hidden graph behaves like a missing one. Writes outside the writable graphs fail before anything changes. Callers with access to every graph keep the same plans and caches. See [API.md](API.md#graph-level-access-control).
-* Protections of triples. A protection hides some triples of a dataset by predicate, by the class of their subject (with its subclasses), by graph, or by a SPARQL pattern with the caller's name, roles and groups bound, such as `?s ex:owner ?user`. Grants lift protections by name, for reading or for writing, in some graphs. The engine works out the hidden quads once per commit and caller view as sets and reads a masked snapshot, so every query form, count from statistics, path, full-text, vector, hybrid and spatial search, `DESCRIBE`, Graph Store read, schema report, drafted shape, diff, stored query, MCP tool and RDFS on read sees only the visible triples. Writes of protected triples fail before anything changes, whether or not they exist. Materialized inferences are hidden from callers with a protection in force. Callers without protections in force keep the same plans and caches. See [API.md](API.md#protections-of-triples).
-* Rate limiting, off by default. Each request class (`auth`, `query`, `update`, `admin`) gets per-client GCRA buckets and concurrency caps, with per-dataset overrides. Signed-in callers are counted per owner, and client addresses can come from trusted proxies. A limited request gets `429` or `503` with `Retry-After` and `RateLimit` headers. Client tracking is bounded and remembers the debts of evicted clients. SIGHUP reloads the configuration and keeps client state and in-flight counts. A `preauth` stage, on by default with auth, limits failed credential checks per address and per IPv6 /48 before any password is hashed. Once its budget is spent, it refuses only password checks and unknown tokens.
-* Observability: `X-Request-Id`, one structured access-log line per request (text or JSON), Prometheus `/$/metrics` and readiness at `/$/ready`. The metrics include the rows each query produces, its peak memory, and index rebuilds by reason and duration. Fuseki's request metric names are available with `--metrics-fuseki-names`, and `--metrics-addr` serves the metrics on a second address.
-* OpenTelemetry, with the `otel` cargo feature. It is off at run time unless `--otel` or `OTEL_*` variables enable it. Traces go out over OTLP. W3C `traceparent` is read from incoming requests and sent on SERVICE and LOAD requests. Spans carry the HTTP and database semantic-convention attributes. They cover commits, background tasks, query phases and the operator tree, whose spans are synthesized from recorded timings. Metrics include `http.server.request.duration` and the Prometheus registry, bridged. OTLP logs with trace correlation are optional.
-* Shutdown with a grace period. On SIGTERM or SIGINT the server stops accepting connections and gives requests in flight `--shutdown-grace` seconds to finish. It then cancels the rest, and a cancelled write commits nothing.
-* Backup repositories (`sparkles-backup`, with the `backup` cargo feature, on by default). Online backups go to a file system or S3 (AWS, MinIO, R2, Ceph RGW) and hold the writer lock for only a few system calls. An in-memory dataset is backed up through a temporary generation that the bulk builder writes from its snapshot. Backups are incremental and deduplicated: data is stored as content-addressed 32 MiB pieces, only the appended bytes of the WAL and catalog are copied, and the manifest is written last. A restore goes to a new dataset or replaces one in place. It follows dataset-id rules (`auto`, `new`, `keep`) and runs an integrity check before publishing. During an in-place swap, requests get `503` with `Retry-After`, never `404`. Backups can be verified (`exists`, `data`, `restore`). Lifecycle policies run on cron or `every` schedules in an IANA time zone, with catch-up, retention and optional GC. GC runs in two phases with a grace period. Lease locks are judged by the storage server's clock, so several servers and the CLI can share a repository. Repositories come from a config file or are registered through the API, within operator limits on named credential sources, the outbound policy and `fs` roots. The interfaces are `/$/repositories`, `/$/backups/{ds}`, `/$/backup-policies`, `sparkles repo`, `sparkles backup create|list|show|restore|verify|delete|policy` and a Backups page in the UI. Backups report `sparkles_backup_*` metrics and audit events. See [API.md](API.md#backup-repositories) and [USAGE.md](USAGE.md#backup-repositories). Repositories can be encrypted with a local key or passphrase, set through the CLI or the server configuration, and encryption is off by default. Configured policies can run offline against a stopped catalog.
-* Versioned on-disk formats ([X12](specs/X12-release-engineering.md) Phase 3). One registry in `sparkles-core` (`formats.rs`) lists every kind of file with the version this build writes and the versions it reads, and `GET /$/server` reports it. Write-ahead logs start with a header record, the catalog's `config.json` and the settings files carry a `format` member, and `dataset.json` records the release that last wrote the database in `writtenBy`. A file without a marker reads as the version before markers existed, and a newer version is refused with a message that names what to do. The generation index is read from a set of formats, so a format change can land at the next compaction, and backups restore when their index format is in that set. `sparkles migrate` lists a stopped server's file versions and runs upgrade steps on a checked copy that it swaps in, keeping the dataset id and history. A dataset in a format the server does not read is left closed while the others are served. Fixtures written by earlier commits in `testsuite/formats/` are opened, queried, written, compacted and restored by the tests ([USAGE.md](USAGE.md#upgrading-databases)).
-* Packages for deployment. The Nix flake builds the `sparkles` package with the web UI, the formatter's WebAssembly module, shell completions and man pages, and its NixOS module (`services.sparkles`) runs the server as a hardened systemd service with datasets, authentication, backups, TLS, metrics, OpenTelemetry and an optional nginx virtual host ([USAGE.md](USAGE.md#deploying-on-nixos)). Its Home Manager module (`programs.sparkles`) installs the CLI for one user and writes the memory, backup and formatter config files from Nix options, and it can declare the memory hooks and skill of Claude Code and Codex ([USAGE.md](USAGE.md#home-manager)). The repository's `Dockerfile` builds an image with the server and its UI, which runs as an unprivileged user, and `compose.yaml` serves it on the host's loopback address with the data in a named volume ([USAGE.md](USAGE.md#docker)). An `ocr` build target adds PDFium and ONNX Runtime at pinned, checksummed versions, Compose profiles run that variant and a one-shot model fetch, and the flake builds both images as OCI images (`.#image`, `.#image-ocr`). A Helm chart (`deploy/helm/sparkles`) runs the server as a single-replica StatefulSet with a read-only root filesystem, configuration from values and Secrets, three ways to deliver local models, and reloads on ConfigMap changes through `serve --watch-config` ([USAGE.md](USAGE.md#kubernetes-helm)).
+* `sparkles-shacl` validates SHACL Core and SHACL-SPARQL in parallel over the indexes.
+* SHACL 1.2 support covers `sh:targetWhere`, the list constraints `sh:memberShape`,
+  `sh:minListLength`, `sh:maxListLength` and `sh:uniqueMembers` with `sh:detail` results,
+  and node expressions in the Working Group's `shnex:` vocabulary. Node expressions work as
+  targets, constraint parameters, `sh:deactivated`, `sh:values` and `sh:defaultValue`,
+  and as constraints.
+* Fuseki's `/{ds}/shacl` endpoint, with `graph=default|union|<iri>`, and `sparkles shacl`
+  return the report as Turtle, N-Triples, JSON-LD or JSON. Validation covers the data and
+  the inferences.
+* The SHACL Compact Syntax, `text/shaclc`, works wherever shapes are read or drafted
+  ([API.md](API.md#shacl-compact-syntax-shaclc)). That includes `/{ds}/shacl`,
+  write-time validation, the CLI, the MCP tools `validate_shacl` and `draft_shapes`, the
+  Python bindings and the UI's shapes editor. `sparkles shacl parse` converts shapes files
+  between SHACLC and the RDF syntaxes, and the writer refuses a graph that SHACLC cannot
+  express and names the triples.
 
-## Agents and questions in plain language
+### ShEx
 
-An MCP server gives agents bounded, grant-checked access to the data, and the server and the web UI turn questions into checked queries.
+* `sparkles-shex` validates ShEx 2.2 with the `shex` cargo feature, which is on by default
+  ([API.md](API.md#shex-validation)). Schemas can be ShExC, ShExJ or ShExR, and ShExR can
+  be in any RDF syntax Sparkles reads. `EXTENDS` and `ABSTRACT` are supported.
+* Imports can be inline, files under `--load-dir`, or http(s) URLs fetched through the
+  outbound policy. `EXTERNAL` shapes, annotations and the Test semantic-action extension
+  are supported.
+* Shape maps can be compact or JSON, with `{FOCUS p o}` selectors and
+  `SPARQL """SELECT …"""` selectors that run within the query budgets and without
+  SERVICE. Recursion and negation use stratified greatest-fixed-point typing without deep
+  stacks.
+* `POST /{ds}/shex` returns JSON, ShapeMap JSON, compact or text reports.
+  `sparkles shex validate|parse` accepts Jena's flag names, and `parse --out shexr`
+  writes Turtle.
 
-* An MCP server for LLM agents, over stdio (`sparkles mcp`) and over Streamable HTTP at `/$/mcp` (`serve --mcp`), with the `mcp` cargo feature, on by default. Its tools list datasets, describe the schema, run bounded SPARQL, explain queries with warnings, describe a resource with an optional DESCRIBE mode, find paths between nodes, list commits and the recorded changes of a range of commits, run full-text and vector similarity search, validate with SHACL and ShEx, draft shapes from the data, compare the schema of two commits, format SPARQL and RDF text, and run read-only GraphQL on datasets with a GraphQL schema. Four tools serve agent memory. `check_query` checks a query against the schema without running it, `similar_queries` finds stored queries for a question, `link_entities` maps names to entities, and `recall` returns the facts around a question with a citation for each fact. Each stored query of a dataset is a tool of its own. SPARQL results come as a compact table or JSON, and truncation is announced with the exact total. Validation returns compact counts and the first results. `atCommit` keeps several calls on one snapshot, and `at` reads a past state by commit, time or snapshot name from the dataset's history. Every call runs under the engine's budgets, with SERVICE off. It supports MCP revisions `2026-07-28`, `2025-11-25` and `2025-06-18`, with completions, `subscriptions/listen` for tool and resource changes, and the tasks extension for long calls. `sparkles mcp --url` bridges stdio to the endpoint of a running server with the saved login. See [USAGE.md](USAGE.md#mcp-server-llm-agents).
-* MCP over HTTP runs each call as the request's caller. Tools, resources and prompts see only the datasets that caller may read, and the server's rate limits and budgets apply as for the SPARQL endpoints. Legacy clients get sessions bound to their caller.
-* The `sparql_update` MCP tool, off unless the operator enables it and listed only for callers that may write. Writes pass write-time validation and carry a commit message, and `LOAD` is refused. `dryRun` previews an update without committing it, `ifHead` makes it conditional on the head commit, and `patch` applies an RDF Patch instead.
-* Agent memory writes over MCP. `assert_facts` writes facts into one named graph per source or session, each with an RDF 1.2 reifier that records its provenance in PROV-O, the source, the time, the caller and an optional confidence and quote. It mints IRIs for new entities, refuses unknown predicates and classes, invented IRIs and likely duplicates with suggestions, supersedes old values while keeping their record, retracts facts, and makes retries with an idempotency key write nothing. Each call is one commit on the normal write path with the caller's graph grants, write-time validation and an optional dry run. See [API.md](API.md#memory-writes).
-* Branches over MCP. Every MCP tool that reads or writes a dataset takes `branch`, and `list_branches`, `create_branch`, `merge_branch` and `delete_branch` manage scratch branches. A caller whose grants cover only some graphs may create scratch branches and merge or delete its own, but never merge a change to a graph it may not write. Merges preview by default, need the previewed heads, and refuse conflicts. `--mcp-scratch-branch-ttl` deletes idle scratch branches. See [API.md](API.md#memory-writes).
-* MCP resources and prompts. Each dataset has a schema summary resource and a prefixes resource, and each stored query offered as a tool has a resource with its definition. The prompts `explore_dataset` and `answer_question` start an exploration with the tool workflow, `run_stored_query` runs a stored query with its parameters explained, `explain_term` explains a class, predicate or resource, and `agent_memory` sets out the loop of an agent that answers from a dataset and remembers what it learns.
-* Questions in plain language ([C18](specs/C18-natural-language-questions-and-ingest.md)). An agent hands the query it wrote to the web UI with the `share_query` MCP tool, and the query page opens it with the question, the explanation and a list of the terms the query uses, without running it. `why_empty` and `POST /{ds}/sparql/diagnose` name the first pattern, join or filter of a query without solutions, and `POST /{ds}/check` and `POST /{ds}/recall` run `check_query` and `recall` over HTTP. The `ask_graph` prompt gives an agent the steps from grounding to the handoff. The query page keeps a local history of asked questions, saves a question and its query as a stored example, and takes suggested examples from readers (`/$/queries/{ds}/suggestions`). `memory.json` names a dataset's agent memory graphs, `recall` marks the facts found only there as unreviewed, and the UI's Memory page and the Explore page's Memory tab show what memory holds about an entity with each fact's source, quote and history. `sparkles auth grant --template agent` prints the grants of an agent that writes its own graphs and proposes changes to curated ones on branches. The server knows model providers of three kinds, Ollama, the OpenAI protocol and Anthropic, with keys read from named secrets, structured output detected per model with fallbacks to JSON mode and plain text, and an ordered list of models for each role (`--model-config`, `GET /$/models`, `POST /$/models/{name}/test`). `sparkles ask` runs the whole pipeline from the command line, and `scripts/eval-ask` measures each model on the 68 questions of `testsuite/ask/demo.json`. On a store of more than ten million quads, the schema that grounds a question and checks its query comes from the index statistics, so an Ask on DBpedia's billion quads takes about two seconds with under 512 MiB of anonymous memory ([API.md](API.md#schema-reports-from-statistics)). See [USAGE.md](USAGE.md#asking-questions-with-a-model) and [API.md](API.md#natural-language-questions).
-* Asking in the server. `POST /{ds}/ask` runs the question pipeline in the server as the caller and streams each step as a server-sent event, or answers one JSON object. `assistant.json` (`/$/assistant/{ds}`) turns the assistant on for a dataset, overrides the role lists, and sets what may leave the server, per provider, with token budgets, a deadline and the history's retention. Each role moves from a cheaper pair to a stronger one only on signals the server checks: a repair that still fails, an empty result that `why_empty` blames on the query, a failed call, a complex query, or **Try harder**. `why_empty` gains a `verdict` of `query`, `data` or `unknown`. The server keeps each person's questions for `historyDays` (`/$/asks/{ds}`), records feedback, and counts answers, escalations, tokens and cost in `GET /$/models/usage` and `/$/metrics`. `reviewedOnly` hides agent memory graphs from an ask. The query page has an Ask bar with **Preview first** and **Run, then show**, a step indicator, summaries whose `[n]` markers select table rows, clarification choices, graph variables, follow-up questions and **Summarize again**, and Explore hands its search text to it. `scripts/eval-ask` computes its cascade row from the per-pair runs, moving a question on when the server sees a failed Ask. See [USAGE.md](USAGE.md#the-ask-bar) and [API.md](API.md#asking-in-the-server).
-* Layered dataset settings ([C19](specs/C19-layered-settings.md)). The assistant, memory and ingest settings of a dataset combine built-in defaults, the declared settings file of `serve --settings` and the changes made through `/$/settings/{ds}/{kind}`, which keep only the fields they change. The file declares defaults for every dataset and entries by name, which apply to datasets created later too, and locks fields such as `assistant.send`. Each answer gives the source of every field, writes take `If-Match`, and SIGHUP reads the settings file and the model configuration again. Datasets of `--loc` and `--mem` are marked `declared`, and the API does not delete them. `sparkles settings` reads them with each field's source, sets fields, edits the runtime layer in an editor with `If-Match`, resets fields, lists the runtime values that differ from the declared ones, and applies a settings file to a server that runs without one. The NixOS module's `services.sparkles.settings` generates the file, checks it with `sparkles settings check` at build time, and reloads the server instead of restarting it when the file or the model configuration changes ([USAGE.md](USAGE.md#declarative-dataset-settings)). The model configuration is a server-wide kind: server administrators add and change providers, role lists and budgets through `/$/server/settings/models` and store write-only keys through `/$/server/secrets/{name}` without a restart, sealed, in builds with the default `backup` feature, with the key of `serve --secrets-key`, the systemd credential `sparkles-secrets-key` or a key the server generates in its data directory, while the settings file's `server.locked` keeps chosen fields, providers and secrets with the operator. `sparkles settings --global` and `sparkles secrets` make the same changes from the command line, and the server page of the UI has a Models section with the providers, a form for the model configuration and write-only key fields. Every settings answer names the declared values that runtime values override, and the CLI and UI show them next to the field with a reset to the server config. Presets fill in a new Anthropic, OpenAI or Ollama provider in the UI's Add provider form and in `sparkles settings set --global --preset`. A provider with an `https` endpoint can trust an internal CA through `tls.caCert`, named by a file or a secret, or turn certificate checks off with `tls.insecureSkipVerify`, which the server logs, `GET /$/models` and the UI mark as unverified, the UI saves only after an acknowledgement, and the settings file can lock ([USAGE.md](USAGE.md#internal-certificates-and-tls-options)). See [API.md](API.md#settings), [API.md](API.md#server-settings) and [USAGE.md](USAGE.md#changing-dataset-settings-from-the-command-line).
-* Outbound notifications ([C21](specs/C21-outbound-notifications.md)). The server pushes a JSON envelope to webhooks, signed as Standard Webhooks specifies, and to ntfy topics when a dataset's memory review branches wait longer than its `memory.review.notifyAfter`, when a backup policy run fails, and when a model provider's daily token budget is used up. Channels, routes from event types to channels and retries are the server-wide settings kind `notifications`, declared in the settings file and changed at runtime unless locked, with credentials named only by secret. Requests go through the outbound policy, transient failures are retried with backoff, and a lasting condition is notified again at most once per repeat interval. `GET /$/notifications` and `sparkles notify status` show each channel's last success and failure, `sparkles notify test CHANNEL` sends a test, and `sparkles_notifications_sent_total` counts deliveries. See [API.md](API.md#notifications) and [USAGE.md](USAGE.md#sending-notifications).
-* Declared prefixes ([C20](specs/C20-declared-prefixes.md)). A dataset's prefixes are a settings kind whose defaults are the well-known prefixes, including the namespaces Sparkles defines. The settings file and the NixOS module declare prefixes for every dataset or for one, and may lock them. A dataset admin adds, changes and removes prefixes through `/$/settings/{ds}/prefixes`, `sparkles settings`, the Prefixes section of the Settings tab and Fuseki's `/{ds}/prefixes`, and a removal of a declared prefix persists until a reset. Loaded data never replaces a declared or locked prefix. A prefix that shadows a well-known one is reported by `sparkles settings check` and in the settings answer. The query editor completes the effective prefixes and inserts their `PREFIX` lines (see [USAGE.md](USAGE.md#declared-prefixes)).
-* Explaining a query. Every node of a returned plan has an id, its path from the root, and the estimated, eager and streamed plans have the same shape. Nodes say when they did not run and why, when a `LIMIT` stopped them, how often they reran, which filters a scan applied itself, and when a result came from the cache, whose subtree stays in the plan. A query that a budget or its timeout stopped keeps its plan in the error body of the `application/x-sparkles+json` format. `POST /{ds}/sparql/explain` explains an estimated plan, a read-only run or a plan the client gives, with notes on the slowest operator, misestimates, blowups, late filters, large sorts, open paths, skipped nodes and the budget, and a description of what the query asks, all computed without a model. The `explain` role rewrites them as prose that the server checks against the plan. The query page shows the explanation beside the plan tree, with links that select operators, and offers **Explain why** on a query that stopped. MCP's `explain_query` takes `profile`, `notes` and `useServerModel`, which needs the `serverModels` grant. See [USAGE.md](USAGE.md#explaining-a-query) and [API.md](API.md#explaining-a-query).
-* Coding agents' memory in the graph. `sparkles memory import` and `sync` read Claude Code's memory files, `MEMORY.md` index, `CLAUDE.md` files and rules, Codex's `AGENTS.md` files and generated memories, `GEMINI.md`, Cursor rules and GitHub Copilot's instructions, redact secrets, register each file's text as a source, and write each file into its own graph as structural facts that cite the span of their line and stay unreviewed until a person promotes them. A sync writes only what changed, with replaced values, retracted links, moves, renames and deletions, and a cache and a lock keep hook bursts cheap. An edit re-anchors the facts that cite the old text to where their quotes now occur and retracts the rest, and a rename carries them to the new file. `POST` and `GET /{ds}/sources` run `register_source` and `list_sources` over HTTP, `register_source` keeps a file's original bytes and refuses a text under the import base that matches a secret pattern (`secret-detected`), and `list_sources` reports which sources still need extraction, which the extraction skill for Claude Code and Codex works through. With `imports.extract: "server"`, a sync starts a server extraction of each changed memory file instead, and its facts land in the file's graph as unreviewed memory. Session transcripts of Claude Code, Codex, Gemini CLI, Cursor, the GitHub Copilot CLI and Aider, and of any file that the generic adapter can read, become searchable episodes when both the dataset and the person opt in, with redaction, size limits and links from the memory files a session wrote. `inbox`, `review`, `promote` and `reject` review imported facts from the terminal, and `export --sources` writes the stored files back as byte-identical copies or converted to another harness, which a later import records as `mem:copyOf` the original so corroboration counts them once. `sparkles memory brief` and `POST /{ds}/memory/brief` print a ranked, bounded and cited brief of a project, an entity or a recall query, and `setup claude-code|codex` installs the hooks that sync on writes and print the brief when a session starts. `POST /{ds}/facts` runs `assert_facts` over HTTP. `init` also turns on server-side ingestion for the assistant fields that still have their default. The commands also cover `init`, `sources`, `status`, `recall`, `query`, `assert` and `forget`, with `--json`, `--loc` and `--if-reachable`. See [USAGE.md](USAGE.md#agent-memory) and [API.md](API.md#importing-agent-memory).
-* Ingesting documents and reviewing memory. An agent registers a document's text as a source with `register_source`, which stores it as chunks with stable offsets, reads it back with `read_chunks`, extracts in the vocabulary of `ingest_profile`, and writes facts with `assert_facts` and a `span` whose quote the server checks against the text. A changed text makes a new rendition, and `retractStale` retracts the facts it no longer supports. `list_sources` lists the sources, and the `ingest_document` and `consolidate_memory` prompts run ingestion and consolidation on proposal branches. Ingest profiles and `keepText` live in `/$/ingest/{ds}`. The review inbox (`GET /$/memory/{ds}/inbox`) lists unreviewed agent facts with span, link, guard and corroboration signals and the open review branches, and `promote`, `reject`, `relink` and `edit` act on them as the caller. The web UI has an Inbox tab on the Memory page with **Accept all that pass**, a review page per branch with the cited passages highlighted and **Use existing**, and an Ingest card for the settings. `conversationFacts: "review"` holds an agent's writes on `proposals.{agent}.inbox`, `recall` marks branch-only facts as `proposed`, and `assert_facts` asks a client that supports elicitation to choose between possible duplicates. `scripts/eval-ingest` scores an ingestion of the labelled sample in `testsuite/ingest/sample.json`. See [USAGE.md](USAGE.md#ingesting-documents-and-reviewing-memory) and [API.md](API.md#review-inbox).
-* Ingestion in the server. `POST /$/ingest/{ds}` takes a Markdown, HTML, plain-text, PDF, Word, PowerPoint or OpenDocument document, an upload or a URL, and runs it as a task that reports its progress, model usage and result at `GET /$/ingest/{ds}/{task}`. The server converts the document to Markdown, registers it as a source, asks the `extract` role of the model configuration for the facts in the ingest profile's vocabulary, and moves to the next model of the role's list when an answer fails. It finds each quote in the text to compute the span, links names to existing entities, and writes the facts on a review branch, or holds them for an approval with `mode: "preview"`, or merges them into `main` with `mode: "auto"` when every check passes. A task whose estimated tokens exceed the dataset's `confirmTokens` waits for a confirmation. PDF conversion uses pdf-inspector with the `pdf` cargo feature, on by default. It marks each page in the rendition so the review page shows a fact's page, and refuses scanned pages with `needs-ocr` unless `allowPartial` leaves them out. The `pdf-ocr` cargo feature, off by default, reads scanned pages with OCR models that the operator provides. Word, PowerPoint and OpenDocument files are read from their XML parts by the `sparkles-office` crate under the `office` cargo feature, on by default, under limits on the input and one output budget per conversion, and a cargo-fuzz target. On Linux each PDF and Office conversion runs in a child process under an address-space limit, with a cleared environment, and the server kills it at the task's deadline. This limits resources and is not a sandbox. A slide of a presentation is a page of the rendition. A CSV, TSV, Excel or OpenDocument spreadsheet file gets a CSVW mapping draft for `sparkles csv`, one for each sheet of a workbook, written by a model from its header and 20 sample rows, with the triples of a dry run. The draft links the values of IRI columns to existing entities through a lookup in the mapping, and lists the ambiguous ones for a person to choose. The dataset page of the web UI uploads a document, shows the task, and links to the review page. `sparkles ingest` runs the same pipeline on a database, and `scripts/eval-text2kg` runs Text2KGBench through it. `source` extracts from a source that is already registered, such as an imported memory file, and `mode: "memory"` writes those facts on `main` into the source's agent graph. See [USAGE.md](USAGE.md#ingesting-documents-in-the-server) and [API.md](API.md#ingestion).
-* Community reports ([C22](specs/C22-graph-rag-community-summaries.md)). A GraphRAG build groups the resources of a dataset's projection into the Leiden hierarchy and has the `community` model role write one report per community, with findings that cite the facts and child findings they come from. Reports are triples with provenance and review status in a reports graph, which a reader sees only when its access covers everything the build read, decided against the footprints in the snapshot it reads. A build reports an upper bound of its tokens and waits for a confirmation, reserves every request against per-build and daily budgets, and leaves the rest pending when a budget or an accounting anomaly stops it. A refresh rewrites only the reports of communities that changed, and with `refresh.mode` set to `auto` the server starts one itself when the change feed shows that enough facts changed. The dataset page's Communities tab shows the hierarchy, each community's members and report, and the review actions, the Explore overview draws the communities as a grouping of the dataset with their reports beside it, the review inbox lists unreviewed reports, and `sparkles graphrag` builds and reads them from the command line. Ask answers a question about the whole dataset from the reports by mapping them to scored points and reducing the points to a cited answer, and falls back to a query for callers who may not read them. The MCP tool `community_reports`, `recall` with `communities` and the project brief give agents the same reports. See [USAGE.md](USAGE.md#community-reports-graphrag) and [API.md](API.md#graphrag).
-* Maintenance of agent memory. A consolidation task asserts once, in the consolidated graph, the facts that several agent graphs repeat and no reviewed graph asserts, each citing the session facts it summarizes, and lists duplicate entities and conflicts for a person. It needs no model, proposes on a `consolidation.*` branch that the inbox lists, or merges in `auto` mode when every fact passes. A retention task deletes session graphs older than a duration whose facts all appear in reviewed graphs. Both run on demand (`POST /$/memory/{ds}/consolidate` and `/retention`) or on a schedule from the memory settings, report through the ingestion task routes, and support dry runs, and `GET /$/memory/{ds}/maintenance` shows the last and next runs. `sparkles memory consolidate`, `retention` and `maintenance` do the same from the terminal. So that a forgotten review does not stall maintenance unnoticed, the server counts what waits in each inbox and reports it in the metrics `sparkles_memory_review_pending` and `sparkles_memory_review_oldest_seconds`, the maintenance answer, a count badge on the UI's Memory entry and dataset page, the brief's `# review:` lines and the MCP resource `sparkles://{ds}/memory/review`. `recall` takes `recency`, a half-life that ranks recent facts and facts that several graphs assert first. See [USAGE.md](USAGE.md#maintaining-agent-memory) and [API.md](API.md#memory-maintenance).
+### Write-time validation
 
-## Libraries and bindings
+* SHACL and ShEx can validate the post-state of every commit before anything is written.
+  In `reject` mode a failing write is refused with `422`, and in `warn` mode it is
+  committed and the results are reported. Grandfather mode, in both languages, blocks only
+  the results a write introduces.
+* SHACL shapes come from dataset graphs, a file, or both. ShEx uses a schema, which can
+  also live in ShExR graphs of the dataset, and a query shape map expanded per write.
+  When a schema is set, its imports are resolved and copied into the database.
+* `/$/validation/{ds}`, `sparkles validation` and `serve --validate` configure it in
+  `validation.json`. The CLI's `--no-validate` skips it, and writes that bypass
+  validation are flagged `unvalidated` in the commit log. If a dataset's guard cannot be
+  loaded, its writes are refused rather than accepted unvalidated.
+* A write validates only the focus nodes or associations it can affect, against the
+  exact result counts of the head kept in `validation-status.json`. It skips writes that
+  touch no relevant graph or only predicates no shape reads, and falls back to a full
+  validation when the head's state is unknown, the shapes change or too much is affected.
+  SHACL-SPARQL constraints anchored at the focus node, `sh:targetWhere` targets and
+  `rdfs:subClassOf` changes validate incrementally. For recursive ShEx schemas the guard
+  keeps the head's typing and validates only where typings change.
+* Results show in `sparkles_validation_*` metrics, the `validation` and `validation_ms`
+  access-log fields, CLI summaries and `sparkles stats`.
 
-The engine is a Rust library, and the Python, JVM and Node.js packages embed the same engine in process.
+### Schema discovery and drafted shapes
 
-* The embedded Rust API (`sparkles::Dataset`) and a fluent query builder (`sparkles::querybuilder`). Opening a dataset installs its write-time validation, RDFS on read, stored queries and GraphQL schema as the server does. Handles on `Dataset` manage snapshots and history, the text, vector and spatial indexes, settings, schema reports, stored queries, reasoning, validation, GraphQL and backups, with one `Control` for cancellation and progress. The reasoner, validators, backups and GraphQL are cargo features of the `sparkles` crate, off by default and all on with `full`. A catalog manages datasets, restores and clones through the same library API. See [USAGE.md](USAGE.md#embedding-the-library) and [spec P06](specs/P06-library-admin-api.md).
-* Python bindings: the `sparkles` package (`crates/sparkles-py`, abi3 wheels for CPython 3.10 and later, built and tested for Linux and macOS by a GitHub Actions workflow). It covers datasets, loads, SPARQL, transactions, history, search indexes, reasoning and validation, and has an rdflib store plugin and the query builder. Calls release the GIL, and Ctrl-C stops a running query. See [USAGE.md](USAGE.md#python) and [spec P01](specs/P01-python-bindings.md).
-* A Jena `DatasetGraph` backed by Sparkles for JVM programs (`sparkles-jena`), with Jena's transactions, query and update engines that run in Sparkles with ARQ as the fallback, bulk loads, historical reads, dumps, typed administration, a Fuseki assembler and an import of TDB2 databases. It passes Jena's contract tests for datasets, graphs, transactions, updates and prefixes; see [USAGE.md](USAGE.md#jvm-apache-jena).
-* JavaScript and TypeScript packages: `@sparkles-rdf/engine` embeds the database through Node-API, with RDF/JS terms, bounded async results, streams, controlled transactions, catalog and dataset administration, and a Comunica source. `@sparkles-rdf/client` provides streaming SPARQL and Graph Store operations plus typed Sparkles administration over Fetch. Both share terms, result types and errors through `@sparkles-rdf/common`. See [USAGE.md](USAGE.md#javascript-and-typescript).
-* A Rust client of remote servers (`crates/sparkles-client`), async on tokio with a blocking form. It speaks the SPARQL 1.1 Protocol and the Graph Store Protocol to Sparkles, Fuseki, QLever, Oxigraph or Wikidata, streams SELECT results and graphs as `oxrdf` terms, and returns receipts with the commit of each write. On a Sparkles server it adds point-in-time reads, stored queries, uploads, batches that commit together, commits, datasets, tasks, backups, statistics and the schema report. It sends Basic credentials, API tokens, OIDC access tokens or the CLI's saved login, and retries as `Retry-After` and the `RateLimit` field direct, never repeating a write whose outcome is unknown. A test checks every route it calls against the OpenAPI description. See [USAGE.md](USAGE.md#rust-client) and [spec P02](specs/P02-rust-client.md).
+* `GET /$/schema/{ds}`, `sparkles schema` and `sparkles::schema` list classes and
+  predicates with exact counts per graph ([API.md](API.md#constraints-layer)). The counts
+  cover triples, distinct subjects and objects, object kinds, datatypes, languages and the
+  most objects per subject, kept apart from the RDFS and OWL declarations. The report
+  also gives subClassOf roots and cycles, and `detail=subjectClasses` lists the classes of
+  each predicate's subjects.
+* Pagination uses cursors bound to one snapshot, and time and entry budgets make the
+  report fail rather than truncate. An RDF `Accept` header or
+  `sparkles schema --format void|turtle` returns a VoID description with class and
+  property partitions.
+* A constraints layer lists the SHACL constraints per class and says whether each is
+  enforced on write, reported on write, or checked only on request. Anonymous
+  superclasses, equivalent classes, domains and ranges are rendered in the OWL 2
+  Manchester Syntax.
+* After a write, the server updates its kept report from the changes instead of
+  recounting. On stores above ten million quads, the schema that grounds an Ask comes
+  from the index statistics ([API.md](API.md#schema-reports-from-statistics)).
+* Class profiles list, for each class, the predicates its instances use, with how many
+  instances have a value, values per instance, object kinds, datatypes and value classes,
+  and the predicates that point at its instances ([API.md](API.md#class-profiles)).
+  Schema diffs compare the reports of two commits, times or snapshots field by field.
+  `/$/schema/{ds}/profiles`, `/$/schema/{ds}/diff`, `sparkles schema --profiles` and
+  `--diff` and the MCP tools `describe_schema` and `diff_schema` serve them.
+* Drafted shapes give each class a SHACL node shape, or a ShEx shape with a query shape
+  map, computed from exact per-class profiles ([API.md](API.md#drafted-shapes)). A draft
+  can use cardinalities, node kinds, datatypes, `sh:class`, `sh:in`, language
+  constraints, patterns, observed ranges, inverse property shapes, sequence paths through
+  blank nodes and optionally `sh:closed`. A constraint is drafted when the share of
+  instances that satisfy it reaches a support threshold, and at support 1 the current
+  data conforms. `GET /$/schema/{ds}/shapes`, `sparkles schema --draft-shapes` and the MCP
+  tool `draft_shapes` draft them, reading only the caller's visible graphs.
+
+## Server and protocols
+
+The server speaks Fuseki's protocols and admin API, and adds GraphQL, stored queries and
+an OpenAPI description. The MCP server for agents is described under
+[AI and agents](#mcp-server).
+
+### SPARQL protocol and Fuseki compatibility
+
+* The server implements the SPARQL protocol, the Graph Store Protocol, upload, the `/$/`
+  admin API for datasets, stats, compaction, backups and tasks, and Jena's special graphs
+  `urn:x-arq:DefaultGraph` and `urn:x-arq:UnionGraph`.
+* A GET without a query at `/{ds}/sparql` or `/{ds}/query` returns a SPARQL 1.1 Service
+  Description ([API.md](API.md#service-description)). It describes the services, their
+  languages, formats and features, every extension function, aggregate and property
+  function, the entailment regime and the default dataset, and links the VoID
+  description. Named graphs and counts follow the caller's grants.
+* The admin API has Fuseki's `/$/backups` alias, `/$/backups-list`, `/$/stats` with
+  request counters, `?state=offline|active`, `deleteOld`, the `/$/validate/*` services and
+  assembler bodies on `POST /$/datasets`. Dataset, task and server JSON carry Fuseki's
+  members.
+* The protocol supports `using-graph-uri`, `?graph=union`, `?target=` on `/shacl`, direct
+  Graph Store naming with `--gsp-direct-naming`, `output=`, `results=` and `force-accept`,
+  and Jena's RDF Thrift, RDF Protobuf, RDF/JSON, TriX and SPARQL Results Thrift formats.
+* `mise run test:jena-clients` tests Jena's own clients against the server. These are
+  `RDFConnectionRemote`, `RDFConnectionFuseki`, `GSP`, `DSP`, `QueryExecHTTP`,
+  `UpdateExecHTTP` and Jena's RDF Patch writers.
+* `sparkles config import fuseki` converts a Fuseki installation
+  ([G08](specs/G08-fuseki-configuration.md)). It reads a `config.ttl`, the service files
+  of `run/configuration/` and `shiro.ini` or the `fuseki:passwd` file. It writes a `serve`
+  script, a data migration script with `tdb2.tdbdump` steps, an auth configuration with
+  argon2id hashes and grants, and each dataset's text, spatial, RDFS and inference
+  settings. A report marks each element as converted, approximated, manual, ignored or
+  unsupported. `serve --fuseki-config` converts at each start and loads `ja:data` into
+  memory, as Fuseki does.
+* `/$/openapi.json` and `/$/openapi.yaml` serve an OpenAPI 3.1 description of the whole
+  HTTP API, which `sparkles openapi` prints and `docs/openapi.json` checks in
+  ([X03](specs/X03-openapi-and-completions.md), [API.md](API.md#openapi-description)). A
+  test keeps it equal to the server's route table.
+* The query result cache has `--result-cache-mb`, `nocache=true`, statistics in
+  `/$/stats` and `POST /$/cache/clear/{ds}`.
+
+### GraphQL
+
+* Each dataset can serve read-only GraphQL at `/{ds}/graphql`, configured through
+  `/$/graphql/{ds}` and `sparkles graphql` and implemented in the crate
+  `sparkles-graphql` ([API.md](API.md#graphql)).
+* An administrator installs a mapping schema in GraphQL SDL whose `@rdf` directives name
+  classes, predicates and enum IRIs, with `@prefix`, `@lang` and `@single`. Drafts come
+  from the write-time guard's SHACL shapes or from the shapes the data supports.
+* The server generates lookups, cursor connections with `totalCount`, `node(id:)`,
+  filters with `and`, `or`, `not` and nested object filters, and orders with an id
+  tie-break.
+* A request runs as a fixed number of SPARQL queries on one snapshot, and its cursors name
+  their commit. Depth, fetch groups and estimated nodes are limited before a request runs.
+  Every query runs with the caller's graph view and protections of triples.
+* Introspection, the GraphQL over HTTP media types and status codes, and execution errors
+  with null propagation follow the specifications.
+
+### Stored queries
+
+* Named, parameterized queries are stored per dataset in `queries.json`, which backups
+  and clones include ([API.md](API.md#stored-queries)). `/$/queries/{ds}`,
+  `/{ds}/queries/{name}`, `sparkles queries` and `sparkles::stored` manage and run them.
+* Parameters are typed, with defaults and allowed values, and each query has a
+  description, example questions and a default result format.
+* A run binds each value as one RDF term through initial bindings, never as query text,
+  and goes through the same path as `/{ds}/sparql`, with the caller's view, budgets and
+  rate limits.
+* Every change is a version with its author, message, the dataset's head commit and a
+  chained digest, and `If-Match` makes changes conditional. The MCP server offers each
+  stored query as a tool.
+
+## Access control and security
+
+Authentication is off by default. Once it is on, access is denied unless a grant allows it.
+
+* `serve --auth-config` turns on authentication and per-dataset access control
+  ([API.md](API.md#authentication-and-access-control),
+  [C09](specs/C09-dataset-access-control.md)). The access levels are `read`, `write` and
+  `admin`, granted by dataset name or pattern, plus `metrics`, `federate` and
+  `server-admin`. Hidden datasets answer `404`.
+* Callers sign in as HTTP Basic users with argon2id hashes, with API tokens, with OIDC in
+  the UI, or through a trusted forward-auth proxy. API tokens are scoped, expiring and
+  revocable, hashed at rest, and never have more access than their owner.
+* OIDC sign-in for the UI is native, using the authorization code flow with PKCE, with
+  back-channel logout and optional idle timeouts. API clients can send the provider's JWT
+  access tokens, checked against its JWKS with key rotation, and Cloudflare Access
+  assertions are verified. Groups map to roles.
+* `serve --tls-cert --tls-key` serves HTTPS with rustls, HTTP/2 through ALPN and
+  certificate reload. Cookies follow CSRF and CORS rules. `sparkles auth login` signs the
+  CLI in with a browser loopback or a device code.
+* A grant can cover only some named graphs of a dataset, only some endpoints, or both
+  ([API.md](API.md#graph-level-access-control), [C12](specs/C12-graph-access-control.md)).
+  Each query runs on a filtered view, so every query form, search, schema report, diff,
+  change feed and Graph Store request sees only the covered graphs, and a hidden graph
+  behaves like a missing one. Writes outside the writable graphs fail before anything
+  changes.
+* Protections of triples hide triples by predicate, by subject class, by graph, or by a
+  SPARQL pattern with the caller's name, roles and groups bound
+  ([API.md](API.md#protections-of-triples), [C12b](specs/C12b-triple-access-control.md)).
+  Grants lift protections by name. Every read path, including statistics, paths, search,
+  `DESCRIBE`, schema reports, diffs, stored queries, MCP tools and RDFS on read, sees only
+  the visible triples, and writes of protected triples fail.
+* Callers with access to every graph and no protections in force keep the same plans and
+  caches.
+* Rate limiting is off by default. Each request class gets per-client GCRA buckets and
+  concurrency caps, with per-dataset overrides, and a limited request gets `429` or `503`
+  with `Retry-After` and `RateLimit` headers. SIGHUP reloads the configuration. With
+  auth, a `preauth` stage limits failed credential checks per address and per IPv6 /48
+  before any password is hashed.
+* Outbound requests from SERVICE, LOAD, imports, embeddings, model providers and
+  notifications go through one
+  [outbound network policy](USAGE.md#outbound-requests-service-and-load).
+
+## AI and agents
+
+An MCP server gives agents bounded, grant-checked access to the data. The server and the
+web UI turn questions into checked queries, keep cited agent memory, ingest documents and
+build community reports.
+
+### MCP server
+
+* `sparkles mcp` serves MCP over stdio, and `serve --mcp` serves it over Streamable HTTP
+  at `/$/mcp`, with the `mcp` cargo feature, which is on by default
+  ([USAGE.md](USAGE.md#mcp-server-llm-agents)). It supports MCP revisions `2026-07-28`,
+  `2025-11-25` and `2025-06-18`, with completions, `subscriptions/listen` and the tasks
+  extension. `sparkles mcp --url` bridges stdio to a running server with the saved login.
+* Its tools list datasets, describe the schema, run bounded SPARQL, explain queries,
+  describe resources, find paths, list commits and changes, run full-text and vector
+  search, validate with SHACL and ShEx, draft shapes, compare schemas, format SPARQL and
+  RDF, run graph algorithms, and run GraphQL. Each stored query is a tool of its own.
+* `check_query` checks a query against the schema without running it,
+  `similar_queries` finds stored queries for a question, `link_entities` maps names to
+  entities, and `recall` returns the facts around a question with a citation for each.
+* Results come as a compact table or JSON, and truncation reports the exact total.
+  `atCommit` keeps several calls on one snapshot, and `at` reads a past state. Every call
+  runs under the engine's budgets with SERVICE off.
+* Over HTTP each call runs as the request's caller, so tools, resources and prompts see
+  only the datasets that caller may read, and the server's rate limits apply.
+* The `sparql_update` tool is off unless the operator enables it, and is listed only for
+  callers that may write. Writes pass write-time validation and carry a commit message,
+  `LOAD` is refused, `dryRun` previews, `ifHead` makes a write conditional, and `patch`
+  applies an RDF Patch.
+* Every tool that reads or writes takes `branch`, and `list_branches`, `create_branch`,
+  `merge_branch` and `delete_branch` manage scratch branches. Merges preview by default,
+  need the previewed heads and refuse conflicts. `--mcp-scratch-branch-ttl` deletes idle
+  scratch branches.
+* Resources give each dataset's schema summary and prefixes and each stored query's
+  definition. The prompts `explore_dataset`, `answer_question`, `run_stored_query`,
+  `explain_term`, `agent_memory` and `ask_graph` start common workflows.
+
+### Questions in plain language
+
+* `sparkles ask`, `POST /{ds}/ask` and the query page's Ask bar turn a question into a
+  checked SPARQL query ([C18](specs/C18-natural-language-questions-and-ingest.md),
+  [USAGE.md](USAGE.md#asking-questions-with-a-model),
+  [API.md](API.md#natural-language-questions)). On DBpedia's billion quads, an Ask takes
+  about two seconds with under 512 MiB of anonymous memory.
+* The server knows model providers of three kinds, Ollama, the OpenAI protocol and
+  Anthropic, with keys from named secrets and an ordered list of models for each role.
+  `--model-config`, `GET /$/models` and `POST /$/models/{name}/test` configure and test
+  them. The server detects structured output per model and falls back to JSON mode and
+  plain text.
+* `POST /{ds}/ask` runs as the caller and streams each step as a server-sent event, or
+  answers one JSON object ([API.md](API.md#asking-in-the-server)). `assistant.json`,
+  through `/$/assistant/{ds}`, turns the assistant on for a dataset and sets what may leave
+  the server per provider, with token budgets, a deadline and history retention.
+* Each role moves from a cheaper model pair to a stronger one only on signals the server
+  checks, such as a repair that still fails, an empty result that `why_empty` blames on
+  the query, a failed call, a complex query, or **Try harder**.
+* `why_empty` and `POST /{ds}/sparql/diagnose` name the first pattern, join or filter of a
+  query without solutions, with a verdict of `query`, `data` or `unknown`.
+  `POST /{ds}/check` and `POST /{ds}/recall` run `check_query` and `recall` over HTTP.
+* An agent hands a query it wrote to the web UI with the `share_query` tool, and the
+  query page opens it with the question, the explanation and the terms it uses, without
+  running it.
+* The server keeps each person's questions for `historyDays` in `/$/asks/{ds}`, records
+  feedback, and counts answers, escalations, tokens and cost in `GET /$/models/usage` and
+  `/$/metrics`. `scripts/eval-ask` measures each model on the 68 questions of
+  `testsuite/ask/demo.json`.
+
+### Agent memory
+
+* `assert_facts`, over MCP or `POST /{ds}/facts`, writes facts into one named graph per
+  source or session, each with an RDF 1.2 reifier that records PROV-O provenance, the
+  source, time, caller and an optional confidence and quote
+  ([API.md](API.md#memory-writes)). It mints IRIs for new entities, refuses unknown
+  predicates and classes, invented IRIs and likely duplicates with suggestions,
+  supersedes old values while keeping their record, and makes retries with an idempotency
+  key write nothing. Each call is one commit on the normal write path.
+* `memory.json` names a dataset's memory graphs, and `recall` marks facts found only there
+  as unreviewed. `reviewedOnly` hides memory graphs from an Ask.
+  `sparkles auth grant --template agent` prints grants for an agent that writes its own
+  graphs and proposes changes to curated ones on branches.
+* `sparkles memory import` and `sync` read the memory files of coding agents
+  ([USAGE.md](USAGE.md#agent-memory), [API.md](API.md#importing-agent-memory)). They cover
+  Claude Code's memory files, `MEMORY.md`, `CLAUDE.md` and rules, Codex's `AGENTS.md` and
+  generated memories, `GEMINI.md`, Cursor rules and GitHub Copilot's instructions. Secrets
+  are redacted, each file becomes a source, and its facts cite their line span and stay
+  unreviewed until a person promotes them.
+* A sync writes only what changed. An edit re-anchors facts to where their quotes now
+  occur and retracts the rest, and a rename carries them to the new file. With
+  `imports.extract: "server"`, a sync starts a server extraction of each changed file.
+* Session transcripts of Claude Code, Codex, Gemini CLI, Cursor, the GitHub Copilot CLI
+  and Aider, and any file the generic adapter can read, become searchable episodes when
+  both the dataset and the person opt in.
+* `sparkles memory brief` and `POST /{ds}/memory/brief` print a ranked, bounded and cited
+  brief, and `sparkles memory setup claude-code|codex` installs hooks that sync on writes
+  and print the brief when a session starts. The `memory` subcommands also cover `init`,
+  `sources`, `status`, `recall`, `query`, `assert`, `forget`, `inbox`, `review`,
+  `promote`, `reject` and `export --sources`.
+* A consolidation task asserts once, in the consolidated graph, the facts that several
+  agent graphs repeat and no reviewed graph asserts, and lists duplicates and conflicts
+  ([USAGE.md](USAGE.md#maintaining-agent-memory), [API.md](API.md#memory-maintenance)). A
+  retention task deletes old session graphs whose facts all appear in reviewed graphs.
+  Both run on demand or on a schedule and support dry runs.
+* The server counts what waits in each review inbox and reports it in metrics, the
+  maintenance answer, a badge in the UI, the brief and the MCP resource
+  `sparkles://{ds}/memory/review`. `recall` takes `recency`, a half-life that ranks recent
+  and corroborated facts first.
+
+### Document ingestion
+
+* An agent registers a document's text as a source with `register_source`, reads it back
+  with `read_chunks`, and writes facts with `assert_facts` and a `span` whose quote the
+  server checks against the text
+  ([USAGE.md](USAGE.md#ingesting-documents-and-reviewing-memory),
+  [API.md](API.md#review-inbox)). A changed text makes a new rendition, and `retractStale`
+  retracts facts it no longer supports. Ingest profiles live in `/$/ingest/{ds}`.
+* The review inbox, `GET /$/memory/{ds}/inbox`, lists unreviewed agent facts with span,
+  link, guard and corroboration signals and the open review branches. `promote`,
+  `reject`, `relink` and `edit` act on them as the caller.
+* `POST /$/ingest/{ds}` and `sparkles ingest` ingest a Markdown, HTML, plain-text, PDF,
+  Word, PowerPoint or OpenDocument document as a task
+  ([USAGE.md](USAGE.md#ingesting-documents-in-the-server), [API.md](API.md#ingestion)).
+  The server converts it to Markdown, asks the `extract` model role for facts in the
+  profile's vocabulary, finds each quote to compute its span, links names to existing
+  entities, and writes the facts on a review branch. `mode: "preview"` holds them for
+  approval, and `mode: "auto"` merges them when every check passes.
+* PDF conversion uses pdf-inspector with the `pdf` cargo feature, on by default, and the
+  `pdf-ocr` feature reads scanned pages with OCR models that the operator provides. Office
+  files are read by `sparkles-office` under the `office` feature, on by default. On Linux
+  each conversion runs in a child process with an address-space limit, which limits
+  resources but is not a sandbox.
+* A CSV, TSV, Excel or OpenDocument spreadsheet gets a CSVW mapping draft for
+  `sparkles csv` per sheet, written by a model from the header and 20 sample rows, with
+  the triples of a dry run. IRI columns are linked to existing entities through a lookup.
+* `scripts/eval-ingest` scores an ingestion of `testsuite/ingest/sample.json`, and
+  `scripts/eval-text2kg` runs Text2KGBench.
+
+### Community reports (GraphRAG)
+
+* A GraphRAG build groups a projection's resources into the Leiden hierarchy and has the
+  `community` model role write one report per community, with findings that cite their
+  facts ([C22](specs/C22-graph-rag-community-summaries.md),
+  [USAGE.md](USAGE.md#community-reports-graphrag), [API.md](API.md#graphrag)).
+* Reports are triples with provenance and review status in a reports graph, which a reader
+  sees only when its access covers everything the build read.
+* A build reports an upper bound of its tokens and waits for confirmation, and reserves
+  every request against per-build and daily budgets. A refresh rewrites only the reports
+  of communities that changed, and `refresh.mode: auto` starts one when enough facts
+  change.
+* Ask answers questions about the whole dataset from the reports by map-reduce, and falls
+  back to a query for callers who may not read them. The MCP tool `community_reports`,
+  `recall` with `communities`, the brief, `sparkles graphrag` and the UI's Communities tab
+  expose them.
 
 ## Web UI
 
 The SvelteKit UI is embedded in the server binary.
 
-* A SvelteKit UI, embedded in the server binary. It has datasets, a query editor, results as a table, graph or plan, an explorer, and a server page with readiness, request and cache panels. The schema browser reads `/$/schema`, with graph selection, an inference toggle, and observed counts and object kinds next to the declarations and the SHACL constraints. The UI shows commit history and write receipts, the changes of each commit, named snapshots, and query results and figures of a past state. A time slider moves the query results, an entity's properties, the Explore graph, the schema tab and the Memory tab through the commits, compares two commits or the heads of two branches with added and removed rows, nodes, edges, classes and map features marked, plays through the commits, and follows new ones ([USAGE.md](USAGE.md#the-time-slider)). The changes between two commits can be drawn as a graph of their own, grouped by class when they are many, and played as a time-lapse that applies one commit's diff per step on the diff graph, the Explore graph and the overview ([USAGE.md](USAGE.md#commit-diffs-on-the-graph), with screenshots of [a diff graph](images/diff-graph.png) and [a time-lapse](images/diff-lapse.png)). It also has full-text search (an index admin panel and ranked `text:query` search in Explore) and vector similarity. The explorer lists an entity's nearest neighbours, and the Similar page searches from an entity or a pasted vector with `ef` and exact controls. The dataset page has a card for each vector index, with create, edit, rebuild, drop and a recall measurement. Vector literals are shown in a compact form. It has Vitest unit tests, Playwright end-to-end smoke tests against a real server, and a mock server for UI development. The smoke tests cover sign-in with a password, that the login page offers no API-token sign-in by default, query, explore, Similar, text search and history.
-* UI validation. The dataset page's Validate panel switches between SHACL and ShEx, remembered per dataset. The ShEx side validates a schema against a shape map. It builds an example map from the dataset's classes and keeps drafts in localStorage. It lists node, shape, status and reason, and each row expands into its failures. The results download as ShapeMap JSON. A Write-time validation panel configures the mode, baseline, shapes or schema, data graphs and limits for SHACL and ShEx, including memory datasets. It shows the result counts of the head, how shapes are validated, the last validated write, the decision counters and the last rejected writes. The query editor shows the validation results of a rejected write. The SHACL editor takes Turtle or SHACLC. The schema browser's **Draft shapes** dialog drafts SHACL shapes (in Turtle or SHACLC) or ShEx shapes for the selected graph and support, lists the constraints that exclude instances, and opens the draft in the shapes editor or installs it as a guard in `warn` mode.
-* UI stored queries. The query page's **Saved** menu lists the dataset's stored queries. Opening one shows a form for its parameters, and **Run saved query** runs it by name with the page's result views. An admin can save the editor's query with parameters picked from its variables, or delete one.
-* The Explore overview and large graphs ([U06](specs/U06-large-graph-rendering.md)). Explore opens on a picture of the dataset's classes and the predicates between them, drawn from the class profiles with sigma.js on WebGL and laid out with ForceAtlas2 in a web worker. A click or tap opens a class into its members, or, above 5,000 instances, into the communities F14 wrote back or into groups by the property that splits it best, and those groups open the same way. `POST /$/graph/{ds}/groups` computes the groups and the edges between them with queries under the caller's view, timeout and memory budget, and caches its answers per commit and view. **Group by** also draws the GraphRAG communities of [C22](specs/C22-graph-rag-community-summaries.md) instead of the classes, sized by their members and coloured by their report status, opens them level by level into their members, and shows a selected community's report beside the picture, where choosing a finding rings its entities. A reader whose access does not cover the reports graph learns only that the grouping is unavailable, and [a screenshot](images/explore-communities.png) shows the view. A breadcrumb and `Backspace` close levels, a list view (`L`) is the accessible companion, and without WebGL the overview falls back to Cytoscape. The query page draws graph results of more than 2,000 nodes with the same WebGL view, up to 100,000 nodes. See [USAGE.md](USAGE.md#the-explore-overview) and [API.md](API.md#graph-overview).
-* The path finder ([U09](specs/U09-path-finder.md)). Explore's **Paths** panel (`Shift+P`) finds the shortest path, every shortest path or the k shortest paths between two entities at the explored commit, with filters for length, direction, predicates and hubs. The paths are drawn over the graph one step at a time, unless reduced motion is set, and listed in a listbox that the keyboard and screen readers can use. A path opens as a query in the editor or joins the drawn graph. The skipped predicates default to the dataset's `paths` setting. A weight picker lists the numeric properties of the dataset's RDF 1.2 reifiers and orders the paths by their sum, showing each path's cost. The same panel works on the query page over a result graph, in the canvas and in the WebGL view, and adds the nodes a path needs that the result lacks. At phone width the panel is a bottom sheet. See [USAGE.md](USAGE.md#finding-paths-in-explore), [the query page](USAGE.md#finding-paths-on-the-query-page) and the screenshots of [Explore](images/path-finder.png) and [a query's graph](images/query-paths.png).
-* The Pattern pane of the query page ([U08](specs/U08-visual-query-builder.md)). `Alt+P` or **Pattern** opens a canvas beside the editor that draws the query's graph pattern from the formatter's lossless parser in the browser, with classes as subtitles, filters as chips, `OPTIONAL` parts as hulls and everything outside the editable subset as locked blocks that keep their text. Queries are built and edited on the canvas as splices of the text, which one undo reverts in either view. Nodes and edges come from pickers fed by the schema under the reader's view, with predicates ranked by the source's class profile. Filters come from forms chosen by datatype, and the pane changes predicates and paths, renames variables, deletes nodes and locked blocks after a confirmation, edits the projection, `DISTINCT`, `LIMIT` and `OFFSET`, and counts matches under a five-second timeout. A layout map keeps every node in place while the text changes. A list view and the keyboard reach every element, a result's Pattern tab draws the query that ran, and a phone gets Text and Pattern tabs, a Query options sheet and a two-tap edge. **Plan on pattern** ([U04](specs/U04-live-query-profiling.md#11-phase-4-the-plan-drawn-on-the-querys-pattern-2026-10-23) Phase 4) draws the plan of the query that ran on its pattern, with estimated and actual rows on each edge, misestimates marked, the rows that passed each filter chip, numbered join badges in run order, selection shared with the plan tree beside it, and the plan's patterns that the drawing lacks listed. Plan nodes name the patterns, filter variables and join variables they read for it. See [USAGE.md](USAGE.md#the-pattern-pane), [this screenshot](images/pattern.png) of the pane beside a query, [this one](images/pattern-edit.png) of the predicate picker and [this one](images/plan-pattern.png) of a plan on its pattern.
-* Lenses on the graph canvas ([U10](specs/U10-canvas-lenses.md) Phase 1). The resource graph in Explore and the query page's graph view, on the canvas and the WebGL renderer, have a **Lenses** menu (`Shift+L`) with a size, a colour, a badge and an edge channel. Size steps a node's area by quantile over its degree in the drawn graph, its degree in the dataset or a numeric property. Colour gives twelve colours by category size to its class, its named graph or a property's values, with the rest on "other". A badge counts a node's inferred edges, and the edge lens draws the edges the reasoner added dashed with an `i` marker, on by default where the dataset has reasoning. An edge counts as inferred when a read with `reasoning=false` does not find it, which covers materialized inferences and RDFS on read alike. Each lens has a legend whose entries select their nodes, a column in the list view and a live announcement, and the lenses read in batches of 200 at the state the canvas shows. [A screenshot](images/explore-lenses.png) shows them. See [USAGE.md](USAGE.md#lenses-on-the-graph).
-* Algorithm lenses ([U10](specs/U10-canvas-lenses.md) Phase 2). Size can show PageRank, betweenness, BFS depth from a node, k-core or triangles, and colour can show WCC, label propagation, Louvain, Leiden or GraphRAG communities. A lens runs over the drawn graph through `SERVICE algo:`, or over a projection of the dataset as a view-only run of `POST /$/algo/{ds}/run`, in the background with progress and **Cancel**. The server keeps the whole result of such a run in a cache of 8 results and 512 MiB, keyed by branch, commit and the caller's view and charged to at most half of the memory pool, so that later requests for other nodes read it. Its decoded rows count against the request's memory budget, and its answer against the result-byte limit. Community colours stay with communities across runs by member overlap, projection runs pause while the time slider plays, numeric dataset lenses show the change since the left handle in compare mode, and above 20,000 drawn nodes a projection size lens shows the top 1,000. [A screenshot](images/explore-algo-lenses.png) shows PageRank and Leiden. See [USAGE.md](USAGE.md#algorithm-lenses) and [API.md](API.md#view-only-runs).
-* UI maps for GeoSPARQL. Results with geometry literals get a Map tab, with a popup per row. The browser reads CRS84, EPSG:4326 and Web Mercator. Other CRSs go through `POST /$/geo/convert`, and literals that cannot be drawn are listed. The explorer has a map card with Nearby (`spatial:nearbyGeom`). The dataset page has a Spatial index panel. It shows the status, CRSs and memory, enables, configures, rebuilds or disables the index, and maps the indexed geometries in view (from `GET /{ds}/geo`). The maps use MapLibre GL JS, loaded when a map first opens, over a bundled Natural Earth 1:110m basemap. Explore's **Map** (`Shift+M`) and a result's **Arcs** draw the relations between located entities as great-circle arcs coloured by predicate, with an arrowhead at the target and a cut at the antimeridian. Markers closer than 20 px merge, and the arcs that join the same two markers merge into one whose width and label give the count. The map looks entities up with `VALUES` queries under the caller's view, branch and `at`, draws at most 20,000 places and 20,000 links, lists the entities it could not locate, and has a list of its markers and arcs for keyboards and screen readers ([U11](specs/U11-linked-views.md#outcome)). A selection shared by the maps and the graph canvases of Explore and the query page shows in all of them, and `Escape` clears it. See [USAGE.md](USAGE.md#arcs-on-the-map). Nothing is fetched from elsewhere unless `serve --map-style-url URL` names a MapLibre style. The pages' Content Security Policy then allows that style's origin, and the style's tiles, glyphs and sprites must come from it too.
-* Facet histograms beside the graph ([U11](specs/U11-linked-views.md#outcome) Phase 2). Explore's **Facets** (`Shift+F`) and a `SELECT` result's **Facets** tab count a class, the drawn entities or a query variable's values by round ranges of a property's numbers or years, or by its 12 most frequent values, for every entity of the set, from `POST /$/graph/{ds}/facets` ([API.md](API.md#facets)). Dragging, the keyboard or two slider handles brush a histogram, clicks brush a list, and each facet counts the set under the other brushes. The drawn entities outside the brushes are dimmed, and **Apply to query** writes a triple and a `FILTER` per brush whose query counts what the panel says. **Use in query** writes up to 1,000 selected entities as a `VALUES` block. See [USAGE.md](USAGE.md#facets-and-use-in-query) and the [screenshot](images/explore-facets.png).
-* The embedding map of a vector index ([U11](specs/U11-linked-views.md#outcome) Phase 3). `/ui/embedding` draws the index's entities on a plane from `POST` and `GET /$/vector/{ds}/{name}/projection` ([API.md](API.md#embedding-map)), placed by PCA in the request or by a force layout of the index's neighbour graph as a task. Points are coloured by class or by a predicate's values, over a density shading of every entity, and an index above 50,000 entities is sampled with full detail on zoom. A lasso or a box selects entities into the shared selection, **Use in query** writes up to 1,000 of them nearest the selection's centre as a `VALUES` block, and **Open as graph** draws them in Explore. A kept projection costs about 24 bytes per entity of server memory, at most four of them and 1 GiB in all. See [USAGE.md](USAGE.md#the-embedding-map) and the [screenshot](images/embedding-map.png).
-* A validation overlay in Explore. It badges the SHACL and ShEx results of the drawn nodes, from the write-time guard, a shapes graph of the dataset or the Validate panel's shapes, with the count and the worst severity, and marks a literal value drawn as its own node. A node's results open with the shape, the constraint, the path, the value and the messages, and **Show triples** marks the triples involved. **Suggest fix** writes an update for the common constraints with placeholders for what the result does not say, previews it as a dry run that says whether the guard would still report the result, and runs it only after that preview. It validates only the drawn nodes, at the slider's state, through repeated `target` and `shapes=guard` on `/{ds}/shacl` and `schema=guard` on `/{ds}/shex`. Callers whose grants cover some graphs get no overlay. The overlay is the **validation results** lens of the badge channel, with its source picker in the lens menu, a legend by worst severity and a column in the list view. Reading the U07 Phase 1 record instead of validating waits for that record (roadmap item 120). Under an incremental guard with other results in the dataset, a preview cannot say whether a fix resolves its result (roadmap item 121). See [USAGE.md](USAGE.md#the-validation-overlay), [U07 §11](specs/U07-data-quality-and-schema-diagram.md#outcome) and the [screenshot](images/validation-overlay.png).
-* Editing forms generated from SHACL shapes ([U02](specs/U02-shape-driven-forms.md#outcome) Phase 1 and most of Phase 2). Explore's **Edit** and the page `/datasets/{name}/edit?iri=…` open a form for a resource that a node shape targets, with the fields of every applying shape merged by path, grouped by `sh:group`, ordered by `sh:order` and labelled by `sh:name`. Each field's widget follows its constraints, and a known `dash:editor` overrides it. The browser checks datatypes, patterns, lengths, ranges, `sh:in`, counts, languages and `sh:uniqueLang` as the person types, **Preview** runs the save as a dry run with the shapes' full validation mapped to the fields, and **Save** commits one update with a message. Saves go to `main`, or to the editor's session branch `edits.{user}.{date}` when `main` is protected or the `forms` setting asks, with **Review and merge** on the merge page. A save names the values the form loaded, so a concurrent change to the same field shows a conflict view instead of being lost. Fields the caller's grants hide are absent, and fields it cannot write are read-only. Known DASH editors and viewers choose the widgets and the read-only display, the entity picker searches a field's class by label with full text when the dataset has it, and **New instance** in the schema tab opens an empty form whose save mints the IRI. The routes are `GET /$/forms/{ds}` and `POST /$/forms/{ds}/check` and `/save`, and the library has `Dataset::forms()`, which Python binds as `Dataset.forms`. See [USAGE.md](USAGE.md#editing-forms), [API.md](API.md#editing-forms) and the [screenshot](images/forms.png).
+### Query page
+
+* The query page has an editor with completion of declared prefixes, linting and
+  formatting in the browser, and results as a table, graph or plan.
+* The **Saved** menu lists the dataset's stored queries, shows a form for a query's
+  parameters and runs it. An admin can save the editor's query with parameters picked from
+  its variables, or delete one.
+* The Ask bar has **Preview first** and **Run, then show**, a step indicator, summaries
+  whose `[n]` markers select table rows, clarification choices, follow-up questions and
+  **Summarize again** ([USAGE.md](USAGE.md#the-ask-bar)). The page keeps a local history
+  of questions, saves a question and its query as a stored example, and takes suggested
+  examples from readers.
+* The explanation of a plan shows beside the plan tree, with links that select
+  operators, and a stopped query offers **Explain why**.
+* The Pattern pane, opened with `Alt+P`, draws the query's graph pattern beside the editor
+  and edits it ([U08](specs/U08-visual-query-builder.md),
+  [USAGE.md](USAGE.md#the-pattern-pane)). Classes show as subtitles, filters as chips,
+  `OPTIONAL` parts as hulls, and the rest as locked blocks that keep their text. Edits on
+  the canvas are splices of the text that one undo reverts. Pickers fed by the schema
+  supply nodes and edges, and forms chosen by datatype supply filters. See the
+  [pane beside a query](images/pattern.png) and the
+  [predicate picker](images/pattern-edit.png).
+* **Plan on pattern** draws the plan of the query that ran on its pattern, with estimated
+  and actual rows on each edge, misestimates marked, the rows that passed each filter and
+  join badges in run order ([U04](specs/U04-live-query-profiling.md),
+  [screenshot](images/plan-pattern.png)).
+* Graph results above 2,000 nodes draw with the WebGL view, up to 100,000 nodes.
+* The path finder also works over a result graph and adds the nodes a path needs
+  ([USAGE.md](USAGE.md#finding-paths-on-the-query-page),
+  [screenshot](images/query-paths.png)).
+
+### Explore
+
+* The explorer shows an entity's properties, its nearest vector neighbours, ranked
+  `text:query` search and a map card with Nearby. The Similar page searches from an entity
+  or a pasted vector.
+* Explore opens on an overview of the dataset's classes and the predicates between them,
+  drawn with sigma.js on WebGL and laid out with ForceAtlas2 in a web worker
+  ([U06](specs/U06-large-graph-rendering.md), [USAGE.md](USAGE.md#the-explore-overview),
+  [API.md](API.md#graph-overview)). A class opens into its members, or above 5,000
+  instances into communities or groups by its best splitting property. **Group by** can
+  draw the GraphRAG communities instead, with a community's report beside the picture
+  ([screenshot](images/explore-communities.png)). A list view (`L`) is the accessible
+  companion, and without WebGL the overview falls back to Cytoscape.
+* The **Paths** panel (`Shift+P`) finds the shortest path, every shortest path or the k
+  shortest paths between two entities, with filters for length, direction, predicates and
+  hubs and an optional weight from reifier properties
+  ([U09](specs/U09-path-finder.md), [USAGE.md](USAGE.md#finding-paths-in-explore),
+  [screenshot](images/path-finder.png)). A path opens as a query or joins the drawn graph.
+* The **Lenses** menu (`Shift+L`) sets a node's size, colour and badge and an edge channel
+  on the canvas and the WebGL view ([U10](specs/U10-canvas-lenses.md),
+  [USAGE.md](USAGE.md#lenses-on-the-graph), [screenshot](images/explore-lenses.png)).
+  Size follows degree or a numeric property, colour follows class, graph or a property's
+  values, and the edge lens draws inferred edges dashed. Each lens has a legend whose
+  entries select their nodes.
+* Algorithm lenses size nodes by PageRank, betweenness, BFS depth, k-core or triangles,
+  and colour them by WCC, label propagation, Louvain, Leiden or GraphRAG communities
+  ([USAGE.md](USAGE.md#algorithm-lenses), [API.md](API.md#view-only-runs),
+  [screenshot](images/explore-algo-lenses.png)). A lens runs over the drawn graph or over
+  a projection of the dataset, in the background with progress and **Cancel**.
+* **Facets** (`Shift+F`), in Explore and as a tab of `SELECT` results, count a set's
+  values by numeric or year ranges or by the 12 most frequent values
+  ([U11](specs/U11-linked-views.md#outcome), [USAGE.md](USAGE.md#facets-and-use-in-query),
+  [API.md](API.md#facets), [screenshot](images/explore-facets.png)). Brushing a histogram
+  dims the entities outside it, **Apply to query** writes the matching triple and
+  `FILTER`, and **Use in query** writes up to 1,000 selected entities as a `VALUES` block.
+* Explore's **Map** (`Shift+M`) and a result's **Arcs** draw relations between located
+  entities as great-circle arcs coloured by predicate
+  ([USAGE.md](USAGE.md#arcs-on-the-map)). Close markers and parallel arcs merge, and a
+  list of markers and arcs serves keyboards and screen readers. A selection is shared by
+  the maps and the graph canvases.
+* `/ui/embedding` draws a vector index's entities on a plane, placed by PCA or a force
+  layout of the neighbour graph and coloured by class or a predicate's values
+  ([USAGE.md](USAGE.md#the-embedding-map), [API.md](API.md#embedding-map),
+  [screenshot](images/embedding-map.png)). An index above 50,000 entities is sampled, a
+  lasso selects entities, and **Open as graph** draws them in Explore. A kept projection
+  costs about 24 bytes of server memory per entity, with at most four and 1 GiB in all.
+* The validation overlay badges the SHACL and ShEx results of the drawn nodes as a lens,
+  from the write-time guard, a shapes graph or the Validate panel's shapes
+  ([USAGE.md](USAGE.md#the-validation-overlay),
+  [U07](specs/U07-data-quality-and-schema-diagram.md#outcome),
+  [screenshot](images/validation-overlay.png)). **Show triples** marks the triples
+  involved, and **Suggest fix** writes an update, previews it as a dry run and runs it only
+  after that preview.
+
+### Maps
+
+* Results with geometry literals get a Map tab with a popup per row. The browser reads
+  CRS84, EPSG:4326 and Web Mercator, and other CRSs go through `POST /$/geo/convert`.
+* The dataset page's Spatial index panel shows the index's status, CRSs and memory,
+  configures or rebuilds it, and maps the indexed geometries in view.
+* The maps use MapLibre GL JS over a bundled Natural Earth basemap, and fetch nothing from
+  elsewhere unless `serve --map-style-url URL` names a MapLibre style.
+
+### History and time travel
+
+* The UI shows commit history, write receipts, the changes of each commit, named
+  snapshots, and query results of a past state.
+* A time slider moves the query results, an entity's properties, the Explore graph, the
+  schema tab and the Memory tab through the commits, compares two commits or two branch
+  heads with changes marked, plays through the commits and follows new ones
+  ([USAGE.md](USAGE.md#the-time-slider)).
+* The changes between two commits can be drawn as a graph, grouped by class when they are
+  many, and played as a time-lapse of one commit's diff per step
+  ([USAGE.md](USAGE.md#commit-diffs-on-the-graph)). See the screenshots of
+  [a diff graph](images/diff-graph.png) and [a time-lapse](images/diff-lapse.png).
+* The History panel draws every branch as a commit graph, and the Branches panel and merge
+  page manage branches.
+
+### Datasets, validation and editing
+
+* The dataset page has cards for the full-text, vector and spatial indexes, with create,
+  edit, rebuild, drop and a recall measurement for vector indexes. It uploads documents
+  for ingestion, edits settings with each field's source, and shows quotas and compaction.
+* The schema browser reads `/$/schema`, with graph selection, an inference toggle, and
+  observed counts and object kinds beside the declarations and SHACL constraints. Its
+  class panel shows profiles, **Compare** shows a schema diff, and **Draft shapes** drafts
+  SHACL or ShEx shapes and installs them as a guard in `warn` mode.
+* The Validate panel switches between SHACL, in Turtle or SHACLC, and ShEx with a shape
+  map, lists each failure, and downloads ShapeMap JSON. The Write-time validation panel
+  configures the guard and shows the head's results, the last validated write and recent
+  rejections. The query editor shows the results of a rejected write.
+* Editing forms generated from SHACL shapes open from Explore's **Edit** or
+  `/datasets/{name}/edit?iri=…` ([U02](specs/U02-shape-driven-forms.md#outcome),
+  [USAGE.md](USAGE.md#editing-forms), [API.md](API.md#editing-forms),
+  [screenshot](images/forms.png)). Fields merge every applying shape and follow
+  `sh:group`, `sh:order`, `sh:name` and known DASH editors. The browser checks values as
+  the person types, **Preview** runs a dry run, and **Save** commits one update, to `main`
+  or to a session branch when `main` is protected. A concurrent change to a field shows a
+  conflict view. `Dataset::forms()` and Python's `Dataset.forms` expose the same forms.
+* The Memory page shows what memory holds about an entity with each fact's source, quote
+  and history, and its Inbox tab reviews facts with **Accept all that pass**. The
+  Communities tab shows the GraphRAG hierarchy and reports.
+* The server page shows readiness, requests, caches, backups and a Models section for
+  providers, the model configuration and write-only keys.
+
+## Libraries and bindings
+
+The engine is a Rust library, and the Python, JVM and Node.js packages embed the same
+engine in process.
+
+* The embedded Rust API is `sparkles::Dataset`, with a fluent query builder in
+  `sparkles::querybuilder` ([USAGE.md](USAGE.md#embedding-the-library),
+  [P06](specs/P06-library-admin-api.md)). Opening a dataset installs its write-time
+  validation, RDFS on read, stored queries and GraphQL schema as the server does. Handles
+  on `Dataset` manage snapshots and history, indexes, settings, schema reports, stored
+  queries, reasoning, validation, GraphQL and backups, with one `Control` for
+  cancellation and progress. A catalog manages datasets, restores and clones. The
+  reasoner, validators, backups and GraphQL are cargo features of the `sparkles` crate,
+  off by default and all on with `full`.
+* The Python package `sparkles` in `crates/sparkles-py` ships abi3 wheels for CPython 3.10
+  and later on Linux and macOS ([USAGE.md](USAGE.md#python),
+  [P01](specs/P01-python-bindings.md)). It covers datasets, loads, SPARQL, transactions,
+  history, search indexes, reasoning and validation, and has an rdflib store plugin and
+  the query builder. Calls release the GIL, and Ctrl-C stops a running query.
+* `sparkles-jena` is a Jena `DatasetGraph` backed by Sparkles for JVM programs
+  ([USAGE.md](USAGE.md#jvm-apache-jena)). It has Jena's transactions, query and update
+  engines that run in Sparkles with ARQ as the fallback, bulk loads, historical reads,
+  dumps, typed administration, a Fuseki assembler and an import of TDB2 databases. It
+  passes Jena's contract tests for datasets, graphs, transactions, updates and prefixes.
+* `@sparkles-rdf/engine` embeds the database in Node.js through Node-API, with RDF/JS
+  terms, bounded async results, streams, transactions, administration and a Comunica
+  source ([USAGE.md](USAGE.md#javascript-and-typescript)). `@sparkles-rdf/client` gives
+  streaming SPARQL, Graph Store operations and typed administration over Fetch. Both
+  share terms, result types and errors through `@sparkles-rdf/common`.
+* `crates/sparkles-client` is a Rust client of remote servers, async on tokio with a
+  blocking form ([USAGE.md](USAGE.md#rust-client), [P02](specs/P02-rust-client.md)). It
+  speaks the SPARQL 1.1 Protocol and the Graph Store Protocol to Sparkles, Fuseki,
+  QLever, Oxigraph or Wikidata and streams results as `oxrdf` terms. On a Sparkles server
+  it adds point-in-time reads, stored queries, uploads, batches, commits, datasets, tasks,
+  backups, statistics and the schema report. It retries as `Retry-After` and `RateLimit`
+  direct, and never repeats a write whose outcome is unknown.
 
 ## Command line
 
-One `sparkles` binary carries the server, Jena-style database commands and Jena's file tools.
+One `sparkles` binary carries the server, Jena-style database commands and Jena's file
+tools.
 
-* A Jena-style CLI that works on the database directory: `load`, `query`, `update`, `patch`, `dump`, `compact`, `compaction`, `clone`, `stats`, `log`, `check`, `diff`, `snapshot`, `backup`, `repo`, `infer`, `shacl`, `shex`, `validation`, `schema`, `queries`, `graphql`, `text-index`, `vector`, `geo-index`, `quota`, `describe-settings` and `vocab-index`. `load`, `query`, `update`, `patch`, `vector`, `compaction`, `quota` and `describe-settings` also work on a remote server with `--server`.
-* Jena's file tools ([spec G05](specs/G05-command-line-tools.md), [USAGE.md](USAGE.md#file-tools)). `convert` (alias `riot`) parses, validates, counts and converts RDF files, streaming, with compressed inputs and outputs and exact error positions. `qparse` and `uparse` print a query or update formatted, as SPARQL algebra in SSE, or as the physical plan. `compare` (aliases `rdfdiff` and `rdfcompare`) compares two files up to blank-node isomorphism with RDFC-1.0, exits with 0, 1 or 2, and keeps its diff local to the blank-node groups that changed. `rsparql` and `rupdate` query and update any SPARQL 1.1 Protocol endpoint, and `rset` converts result sets. `rdfpatch` reads RDF Patch files and prints their rows and counts, as Jena's `rdfpatch` does.
-* IRI and language-tag checks. `iri` and `langtag` show components, normal forms, canonical case and problems. Scheme and normalization rules (`http`, `https`, `urn`, `uuid`, `oid`, `file`, `did`, case, percent-encoding, ports, dot segments) and language-tag rules (grandfathered tags, extended language subtags) give warnings in `convert --check`, `load --check` and `/$/validate/iri`. `--strict` turns them into failures.
-* Shell completions for bash, zsh, fish, elvish and PowerShell (`sparkles completions`) and man pages for every subcommand (`sparkles man`), installed by the Nix package ([USAGE.md](USAGE.md#shell-completions-and-man-pages)).
+* The database commands work on the database directory. They are `load`, `query`,
+  `update`, `patch`, `dump`, `compact`, `compaction`, `clone`, `stats`, `log`, `check`,
+  `diff`, `snapshot`, `backup`, `repo`, `infer`, `shacl`, `shex`, `validation`, `schema`,
+  `queries`, `graphql`, `text-index`, `vector`, `geo-index`, `quota`, `describe-settings`
+  and `vocab-index`. `load`, `query`, `update`, `patch`, `vector`, `compaction`, `quota`
+  and `describe-settings` also work on a remote server with `--server`.
+* Jena's file tools are built in ([G05](specs/G05-command-line-tools.md),
+  [USAGE.md](USAGE.md#file-tools)). `convert`, alias `riot`, parses, validates, counts and
+  converts RDF files as a stream with exact error positions. `qparse` and `uparse` print a
+  query or update formatted, as SPARQL algebra in SSE, or as the physical plan. `compare`,
+  alias `rdfdiff`, compares two files up to blank-node isomorphism with RDFC-1.0.
+  `rsparql` and `rupdate` query and update any SPARQL 1.1 Protocol endpoint, `rset`
+  converts result sets, and `rdfpatch` prints the rows and counts of RDF Patch files.
+* `iri` and `langtag` show components, normal forms, canonical case and problems. Their
+  rules give warnings in `convert --check`, `load --check` and `/$/validate/iri`, and
+  `--strict` turns the warnings into failures.
+* `sparkles completions` prints shell completions for bash, zsh, fish, elvish and
+  PowerShell, and `sparkles man` prints man pages for every subcommand
+  ([USAGE.md](USAGE.md#shell-completions-and-man-pages)).
 
 ## Formatter and editor support
 
-The formatter and linter check their own output and serve the command line, the server, the UI and editors.
+The formatter and linter check their own output and serve the command line, the server,
+the UI and editors.
 
-* A formatter for SPARQL queries and updates, Turtle, TriG, N-Triples, N-Quads and JSON-LD (`sparkles-fmt`, `sparkles fmt`, `POST /$/format`, with the `fmt` cargo feature, on by default). It keeps comments and checks itself: the output must parse to the same SPARQL algebra, RDF dataset or JSON, keep every comment, and format to itself. Style options cover line width, indentation, prefix groups, the `a` shorthand, IRI compaction, quote style, operator position, aligned `VALUES`, `prune-prefixes` and directive style. The endpoint takes JSON and raw bodies, carries the editor's cursor across in UTF-16 units, and refuses input with `422` (see [API.md](API.md#formatting)). The command line walks directories with ignore files, discovers config files, and has `--check`, `--write`, `--diff` and Prettier's exit codes (see [USAGE.md](USAGE.md#formatting)).
-* Turtle and TriG support `sort`, `prune-prefixes`, `turtle-layout = "conventional"` next to the default diff-friendly layout, and the ignore pragma. `sort` orders statements, entries and objects within each run between directives and detached comments. Files over `--max-bytes` are formatted statement by statement in bounded memory, unless they are sorted.
-* N-Triples and N-Quads get canonical term spelling with comments kept, and are formatted in bounded memory on every core. `--sort` merges identical statements and switches to an external sort past `--sort-memory`. `--canonicalize` writes RDFC-1.0 blank node labels in sorted canonical form.
-* JSON-LD uses Prettier's JSON layout, with keywords first in a fixed order, and `--sort` sorts terms. Duplicate keys and comments are refused.
-* `sparkles lsp` is a language server over stdio for every language `sparkles fmt` formats. It formats documents and ranges, reports syntax errors, the formatter's warnings and the lint findings as diagnostics, offers the lint's safe fixes as quick fixes, and reads options from the nearest `.sparklesfmt.toml`. [editors.md](editors.md) has setups for Neovim, Helix, Emacs and VS Code.
-* A linter for SPARQL, Turtle and TriG ([X04](specs/X04-linter.md)). Seventeen rules cover undefined and unused prefixes, unused, single-use and unbound variables, cartesian products, `SELECT *` with grouping, ungrouped variables, FILTER scope and equality, IRIs with spaces, language-tag case and deprecated tags, suspicious and redundant datatypes, and deprecated names. Severities are set per rule in the `[lint]` table of `.sparklesfmt.toml` or with `--rule`. `--fix` applies the safe fixes and checks that the meaning is unchanged. It runs as `sparkles lint` with text or JSON output, in `sparkles lsp`, as `POST /$/lint`, and in the query editor while you type (see [USAGE.md](USAGE.md#linting)).
-* Formatting in the browser. The UI's query and shapes editors use a WebAssembly build of the formatter (`sparkles-fmt-wasm`). They fall back to `POST /$/format` when the build has no module or the module fails. The module is optional for `mise run ui:build` (build it with `mise run ui:wasm`) and always included in the Nix `sparkles` and `sparkles-ui` packages (see [ui/README.md](../ui/README.md#formatting-in-the-browser)).
+* `sparkles-fmt` formats SPARQL queries and updates, Turtle, TriG, N-Triples, N-Quads and
+  JSON-LD, through `sparkles fmt` and `POST /$/format` with the `fmt` cargo feature, on by
+  default ([USAGE.md](USAGE.md#formatting), [API.md](API.md#formatting)). It keeps
+  comments, and its output must parse to the same SPARQL algebra, RDF dataset or JSON and
+  format to itself. Style options cover line width, indentation, prefix groups, the `a`
+  shorthand, IRI compaction, quote style, operator position, aligned `VALUES`,
+  `prune-prefixes` and directive style. The command line walks directories with ignore
+  files, discovers config files, and has `--check`, `--write`, `--diff` and Prettier's
+  exit codes.
+* Turtle and TriG support `sort`, `prune-prefixes`, `turtle-layout = "conventional"` next
+  to the default diff-friendly layout, and the ignore pragma. Files over `--max-bytes`
+  format statement by statement in bounded memory, unless they are sorted.
+* N-Triples and N-Quads get canonical term spelling with comments kept, in bounded memory
+  on every core. `--sort` merges identical statements with an external sort past
+  `--sort-memory`, and `--canonicalize` writes RDFC-1.0 blank node labels.
+* JSON-LD uses Prettier's JSON layout with keywords first, and `--sort` sorts terms.
+* `sparkles lint` checks SPARQL, Turtle and TriG with seventeen rules
+  ([X04](specs/X04-linter.md), [USAGE.md](USAGE.md#linting)). They cover undefined and
+  unused prefixes, unused, single-use and unbound variables, cartesian products,
+  `SELECT *` with grouping, ungrouped variables, FILTER scope and equality, IRIs with
+  spaces, language tags, suspicious and redundant datatypes, and deprecated names.
+  Severities are set in `.sparklesfmt.toml` or with `--rule`, and `--fix` applies safe
+  fixes after checking that the meaning is unchanged. The linter also runs as
+  `POST /$/lint` and in the query editor.
+* `sparkles lsp` is a language server for every language the formatter handles. It
+  formats documents and ranges, reports syntax errors and lint findings, and offers safe
+  fixes as quick fixes. [editors.md](editors.md) has setups for Neovim, Helix, Emacs and
+  VS Code.
+* The UI's editors use a WebAssembly build of the formatter, `sparkles-fmt-wasm`, and fall
+  back to `POST /$/format` when it is missing
+  ([ui/README.md](../ui/README.md#formatting-in-the-browser)). The Nix `sparkles` and
+  `sparkles-ui` packages always include it.
+
+## Operations
+
+### Deployment
+
+* The Nix flake builds the `sparkles` package with the web UI, the formatter's
+  WebAssembly module, shell completions and man pages. Its NixOS module
+  `services.sparkles` runs the server as a hardened systemd service with datasets,
+  authentication, backups, TLS, metrics, OpenTelemetry and an optional nginx virtual host
+  ([USAGE.md](USAGE.md#deploying-on-nixos)).
+* The Home Manager module `programs.sparkles` installs the CLI for one user, writes the
+  memory, backup and formatter config files, and can declare the memory hooks and skill
+  of Claude Code and Codex ([USAGE.md](USAGE.md#home-manager)).
+* The `Dockerfile` builds an image with the server and UI that runs as an unprivileged
+  user, and `compose.yaml` serves it on the loopback address with the data in a named
+  volume ([USAGE.md](USAGE.md#docker)). An `ocr` target adds PDFium and ONNX Runtime at
+  pinned, checksummed versions, and the flake builds both images as OCI images.
+* A Helm chart in `deploy/helm/sparkles` runs the server as a single-replica StatefulSet
+  with a read-only root filesystem, configuration from values and Secrets, three ways to
+  deliver local models, and reloads through `serve --watch-config`
+  ([USAGE.md](USAGE.md#kubernetes-helm)).
+
+### Settings and notifications
+
+* A dataset's assistant, memory, ingest and prefix settings combine built-in defaults,
+  the declared settings file of `serve --settings`, and runtime changes through
+  `/$/settings/{ds}/{kind}` ([C19](specs/C19-layered-settings.md),
+  [API.md](API.md#settings), [USAGE.md](USAGE.md#declarative-dataset-settings)). The file
+  declares defaults and per-dataset entries and can lock fields. Each answer names the
+  source of every field, writes take `If-Match`, and SIGHUP reloads the file.
+* `sparkles settings` reads settings with each field's source, sets and resets fields,
+  edits the runtime layer, lists overrides, and applies a settings file
+  ([USAGE.md](USAGE.md#changing-dataset-settings-from-the-command-line)). The NixOS
+  module generates the file, checks it at build time, and reloads the server when it
+  changes.
+* Server administrators change model providers, role lists and budgets through
+  `/$/server/settings/models` and store write-only keys through
+  `/$/server/secrets/{name}` without a restart ([API.md](API.md#server-settings)). Keys
+  are sealed with the key of `serve --secrets-key`, the systemd credential
+  `sparkles-secrets-key`, or a key generated in the data directory.
+  `sparkles settings --global`, `sparkles secrets` and the UI make the same changes, and
+  presets fill in Anthropic, OpenAI and Ollama providers.
+* A provider with an `https` endpoint can trust an internal CA through `tls.caCert`, or
+  turn certificate checks off with `tls.insecureSkipVerify`, which the server logs and the
+  UI marks as unverified ([USAGE.md](USAGE.md#internal-certificates-and-tls-options)).
+* Declared prefixes default to the well-known prefixes and the namespaces Sparkles
+  defines ([C20](specs/C20-declared-prefixes.md), [USAGE.md](USAGE.md#declared-prefixes)).
+  The settings file declares and locks them, and a dataset admin changes them through the
+  settings API, the Settings tab or Fuseki's `/{ds}/prefixes`. Loaded data never replaces
+  a declared prefix.
+* The server pushes signed Standard Webhooks and ntfy notifications when memory review
+  waits too long, a backup policy run fails, or a provider's daily token budget is used
+  up ([C21](specs/C21-outbound-notifications.md), [API.md](API.md#notifications),
+  [USAGE.md](USAGE.md#sending-notifications)). Channels and routes are a server settings
+  kind, failures are retried with backoff, and `sparkles notify status` and
+  `sparkles notify test` show and test channels.
+
+### Memory and resource limits
+
+* The block, result, SERVICE and history caches are sized once for the server and shared
+  by all datasets, with per-dataset bytes, hits and misses
+  ([X08](specs/X08-disk-spill-and-server-memory.md#gates)). The `small` memory profile,
+  set with `--memory-profile`, saves about 70 MiB of RSS at 10.5M triples.
+* A query memory pool, set with `--total-query-memory-mb`, bounds the estimated memory of
+  all queries and updates together. Requests wait in arrival order for a share, answer
+  `503` with `Retry-After` after `--query-admission-wait`, and fail with the
+  `server-memory` budget when the pool cannot cover them. A finished eager SELECT or ASK
+  keeps only its result's estimate, and cursor charges release with their live state.
+  `GET /$/server/memory` and the `sparkles_query_pool_*` and
+  `sparkles_query_admission_*` metrics report it. Embedded catalogs take a pool through
+  `MemoryOptions`.
+* Per-query budgets cap estimated intermediate memory, response size, rows, and the rows
+  all operators produce ([C01](specs/C01-observability-and-budgets.md)). A request can
+  lower a budget but never raise it, and a query over budget fails with `507`. Queries and
+  writes stop when their client disconnects.
+* Persistent datasets have storage quotas, a default with `--max-dataset-mb` and per
+  dataset through `/$/quota/{ds}` and `sparkles quota` ([API.md](API.md#storage-quotas)).
+  A write that would exceed the quota is refused with `507` before it commits, while
+  reads and deletes continue.
+
+### Observability
+
+* Every request gets an `X-Request-Id` and one structured access-log line in text or
+  JSON. `/$/metrics` serves Prometheus metrics and `/$/ready` readiness. The metrics
+  include each query's rows and peak memory and index rebuilds by reason and duration.
+  `--metrics-fuseki-names` adds Fuseki's request metric names, and `--metrics-addr` serves
+  the metrics on a second address.
+* OpenTelemetry, with the `otel` cargo feature, is off at run time unless `--otel` or
+  `OTEL_*` variables enable it. Traces go out over OTLP, W3C `traceparent` is read from
+  requests and sent on SERVICE and LOAD, and spans cover commits, background tasks, query
+  phases and the operator tree. The Prometheus registry is bridged, and OTLP logs with
+  trace correlation are optional.
+
+### Backups
+
+* `sparkles-backup`, with the `backup` cargo feature, on by default, keeps online backups
+  in a file system or S3, including AWS, MinIO, R2 and Ceph RGW
+  ([API.md](API.md#backup-repositories), [USAGE.md](USAGE.md#backup-repositories),
+  [F05](specs/F05-snapshot-repositories.md)). A backup holds the writer lock for only a few
+  system calls, and an in-memory dataset is backed up through a temporary generation.
+* Backups are incremental and deduplicated in content-addressed 32 MiB pieces, and only
+  the appended bytes of the WAL and catalog are copied. Repositories can be encrypted with
+  a local key or passphrase, and encryption is off by default.
+* A restore goes to a new dataset or replaces one in place, follows dataset-id rules, and
+  runs an integrity check before publishing. During an in-place swap, requests get `503`
+  with `Retry-After`. Backups can be verified at three levels.
+* Lifecycle policies run on cron or `every` schedules in an IANA time zone, with catch-up,
+  retention and two-phase GC, and can run offline against a stopped catalog. Lease locks
+  use the storage server's clock, so several servers and the CLI can share a repository.
+* `/$/repositories`, `/$/backups/{ds}`, `/$/backup-policies`, `sparkles repo`,
+  `sparkles backup` and the UI's Backups page manage backups, which report
+  `sparkles_backup_*` metrics and audit events.
+
+### Upgrades and on-disk formats
+
+* One registry in `sparkles-core` lists every kind of file with the version a build
+  writes and the versions it reads, and `GET /$/server` reports it
+  ([X12](specs/X12-release-engineering.md), [USAGE.md](USAGE.md#upgrading-databases)). A
+  newer version is refused with a message that says what to do, and a dataset in an
+  unreadable format stays closed while the others are served.
+* The generation index is read from a set of formats, so a format change lands at the
+  next compaction, and backups restore when their index format is in that set.
+* `sparkles migrate` lists a stopped server's file versions and runs upgrade steps on a
+  checked copy that it swaps in, keeping the dataset id and history. Fixtures in
+  `testsuite/formats/` test that older files open, query, write, compact and restore.
+* On SIGTERM or SIGINT the server stops accepting connections and gives requests in
+  flight `--shutdown-grace` seconds to finish. It then cancels the rest, and a cancelled
+  write commits nothing.
+
 ## Known gaps
 
-These are implementation limits, missing configuration controls, and features that
-other RDF stores have and Sparkles does not.
-[COMPARISON.md](COMPARISON.md) covers each engine, and
-[BENCHMARKS.md](BENCHMARKS.md#where-sparkles-loses) covers performance.
-Each gap ends with the [roadmap](ROADMAP.md) items that address it. The roadmap orders
-that work by priority and links each item to its design spec.
+These are implementation limits, missing controls, and features that other RDF stores
+have and Sparkles does not. [COMPARISON.md](COMPARISON.md) covers each engine, and
+[BENCHMARKS.md](BENCHMARKS.md#where-sparkles-loses) covers performance. Each gap names
+the [roadmap](ROADMAP.md) items that address it, and the roadmap orders that work and
+links each item to its design spec.
 
-* **Graph algorithm remainder.** An adapter in `scripts/graphalytics-reference.py`
-  prepares the two small official Graphalytics example graphs and compares saved BFS,
-  WCC and PageRank results with their reference outputs, and a debug build of Sparkles
-  matched all six reference sets on 2026-10-22. There is no full Graphalytics driver, no
-  run on the benchmark's larger datasets, no run of CDLP, LCC or SSSP against reference
-  outputs and no official certification. The web UI cannot complete `algo:` names, the JVM binding has no typed algorithm handle, and
-  openCypher procedures wait for an openCypher frontend. Write-back commits through the
-  store's own writer loop rather than a dedicated bulk writer. A write-back run has no
-  deadline unless the request or `--update-timeout` gives one, so a run that waits for
-  `--algo-threads` waits until a thread is free or the run is cancelled. Thread admission
-  has no queue order, so a call that needs several threads can wait while one-thread
-  calls keep taking the free slots. A background view-only run's progress moves by phase,
-  since the algorithms report no iterations. [Roadmap](ROADMAP.md) item 8.
+### Storage and execution
 
-* **Incremental views remainder.** Views are `table` views on `main`, maintained after
-  the commit. `graph` views, maintenance inside the commit, the WebSocket, MCP, the Node
-  and JVM APIs, the UI, views per branch, ordered windows and provenance are later phases
-  of F13. Backups and clones do not carry view definitions, a dataset whose materialized
-  inferences join the default graph refuses views, a caller reads a view only with the
-  principal's exact access or full access, passes run on one thread per dataset, the
-  live query limits count per dataset, and circuits never read graphs that a disclosure
-  guard protects. [Roadmap](ROADMAP.md) items 17, 220 to 224 and 227.
+* The largest measured dataset is English DBpedia, 1.24 billion triples on one machine.
+  Nothing larger, such as Wikidata, has been tried. Roadmap item 1.
+* FSST vocabulary compression is off by default. With it, a DBpedia export takes 1.05
+  times as long as with front coding, and warm queries that decode many strings run 4% to
+  12% slower. Single-term lookups are the follow-up in roadmap item 160.
+* IRI encoding and zstd or frame-of-reference block codecs were measured and are not
+  built, because they saved less than their targets on DBpedia. Predicate patterns do not
+  answer `COUNT(*)` per predicate, which counts triples. Roadmap item 16.
+* Cold `values-star` and `path-plus` were slower than Oxigraph at 1.05M and 10.5M, as was
+  cold `star-lookup` at 10.5M, and that comparison has not been repeated on index format
+  3. Index format 3 makes cold `star-join` at 10.5M 6% to 8% slower. Dense reads on the
+  1.01B dataset are unmeasured. Roadmap item 4.
+* Group commit on datasets with a full-text, spatial or embedding index has measured
+  costs ([X09](specs/X09-group-commit-by-default.md#179-performance-gates)). The p90 of
+  single spatial inserts at 10.5M is 1.077 times the ordinary path's, which is roadmap
+  item 111. A fence synchronizes in 1.4 to 1.5 ms against about 1.0 ms for one ordinary
+  commit, which is item 112. Reader latency on a spatial dataset at 1.05M under mixed load
+  is not established, item 171.
+* A headerless WAL that the current release has never opened for writing keeps the mixed
+  legacy rules for the bytes it holds, so a torn record that an older build left there can
+  be read as a legacy commit or refused
+  ([X09](specs/X09-group-commit-by-default.md#phase-3)). Roadmap item 3.
+* Most plans run eagerly unless the caller asks for `execution=streaming`. Sorts without
+  LIMIT and DESCRIBE collect their whole input, and an EXISTS evaluated once per outer key
+  stays eager because the cursor is slower there. The UI's result table, the MCP tools and
+  the Python and JVM query calls run eagerly, because they report exact totals or return
+  collected results. Roadmap item 7.
+* Disk spill is off by default. With spill on, a DISTINCT over an ordered input other than
+  an ORDER BY keeps its whole set, a grouping's single group can outgrow the budget, and
+  eager operators still fail at their budget. A spilled join that must keep its order
+  writes its output once more to merge it, which made one join under 4 MiB 8.9 times
+  slower than the same cursor without a memory limit. Grouping above an ordered spilled
+  join is slow. Roadmap item 93.
+* There are no pinned results, materialized views or live query monitoring. Roadmap items
+  17 and 27.
+* A query whose plan would nest deeper than 4000 levels is refused, so a basic graph
+  pattern holds at most 1998 triple patterns ([nesting limits](API.md#nesting-limits)).
+  Planning time grows with the square of the number of triple patterns, and a star of
+  1998 patterns on one frequent predicate takes about 3 s to plan. The explanation of
+  `/{ds}/sparql/explain` reads plans of at most 256 levels. Roadmap item 84.
+* A SERVICE call to this server runs in process only from the SPARQL query and update
+  endpoints, so one from an MCP tool or GraphQL waits behind its caller's grant. SHACL,
+  ShEx validation outside its selectors, diff, and the `/$/stats`, `/$/schema` and
+  `/$/validate` reads hold their admitted grant idle while their own query takes a second
+  one. An eager CONSTRUCT or DESCRIBE result keeps its query's peak estimate in the pool
+  until it is released. Roadmap item 7.
+* The server-wide caches count the bytes of the values they hold, and the process uses
+  more. The heap behind the result cache is about 1.2 times the bytes it counts, and
+  evicted entries leave free pages in thread heaps. Ten datasets at `--cache-mb 32` use
+  1.157 times the anonymous memory that one dataset and the cache bytes predict. Roadmap
+  item 88.
+* SP²Bench `q4` at 10M answers 1.96 GB of TSV, more than the default response budget of
+  1 GiB, so it answers only with a larger `--max-result-mb`. Jena is faster on `q12a`
+  and Oxigraph on `q12b`. Roadmap item 91.
 
-* **Editing forms remainder.** Forms edit predicate and inverse paths with literal and IRI
-  values. Blank node values with `dash:DetailsEditor`, list editors for `sh:memberShape`
-  and choices for `sh:or` and `sh:xone` are not built, and ShEx schemas do not drive
-  forms. A check without a guard does not validate shapes that reach the resource through
-  more than two triples. [Roadmap](ROADMAP.md) item 21.
+### Versioning and history
 
-* **Visual query builder remainder.** The Pattern pane of U08 builds and edits basic
-  graph patterns, filters, one level of `OPTIONAL`, simple paths, the projection and the
-  modifiers. `UNION`, `GRAPH`, inline `VALUES`, `MINUS` and `FILTER NOT EXISTS` on the
-  canvas are Phase 3, and a waiting node is not kept across a reload. The pane needs the formatter's browser module and has no server
-  fallback. [Roadmap](ROADMAP.md) item 101.
+* A past state can be read only while a retained generation holds it, even when the
+  change log has its changes. Full-text search works at the head only. Roadmap items 23
+  and 52.
+* A bulk commit into a non-empty dataset is recorded in the change log with counts only
+  when it loads or drops more than 1,000,000 quads, even if few of them change. After a
+  crash right after a bulk commit, the log can lack that commit's changes. Roadmap item
+  52.
+* A patch is applied as one commit even when it holds several `TX … TC` transactions, and
+  a patch from another dataset cannot name its existing blank nodes. There are no patch
+  logs and no replicas that follow a server. Roadmap items 66 and 74.
 
-* **Plan on pattern remainder.** The plan drawn on the pattern shows the numbers of a plan
-  after it ran or was explained. Counts that update while a query runs wait for U04's
-  progress registry of Phases 1 and 2. [Roadmap](ROADMAP.md) item 27.
+### SPARQL and formats
 
-* **Large graph rendering remainder.** The Explore overview and the WebGL view shipped
-  with U06 Phases 1 and 2, but layouts computed and cached on the server and the binary
-  transfer format of Phase 3 are not built, so a WebGL view lays out every result in the
-  browser. The frame-rate and main-thread acceptance examples (A2 and A3) have no
-  Playwright performance project on a GPU runner, and the overview opens one path
-  below one class at a time, with no grouping by named graph.
-  [Roadmap](ROADMAP.md) item 29.
+* Sparkles lacks ARQ's JavaScript functions, `afn:context`, the Leviathan `lfn:` library
+  and the `JSON` query form, and `afn:collation` orders by code point instead of by
+  locale. Roadmap item 69.
+* Sparkles does not evaluate `shortest(…)` paths, which ARQ does not evaluate either.
+  Roadmap item 51.
+* Jena's service enhancer has no slice-aware cache and no `se:cacheRm` or `se:cacheLs`
+  functions. Roadmap item 38.
+* There is no openCypher frontend and no JSON query language. Roadmap items 20 and 72.
+* The loader reads TriX, RDF Thrift, RDF Protobuf and RDF/JSON by first rewriting each
+  file as N-Quads in a temporary file. The library's `load_str` and `dump_graph` take only
+  the W3C syntaxes, and SPARQL `LOAD` reads TriX but not the other three. Roadmap item 73.
+* CSV and TSV import supports CSVW in its minimal mode and CONSTRUCT templates. There are
+  no RML or R2RML mappings, no CSVW standard mode and no primary-key or foreign-key
+  checks, and a template cannot read the target dataset. Roadmap item 22.
+* Tables are imported, not queried in place, and the Graph Store endpoint does not read
+  CSV. Roadmap item 43.
 
-* **Linked views remainder.** The map's arcs, the shared selection, the facet histograms,
-  **Use in query** and the embedding map shipped with U11 Phases 1 to 3. The embedding map
-  cannot colour by a kept Leiden run of the lens menu, `Shift+M` does not open it, date
-  facets count whole years only, and at a phone's width the facets sit below the graph
-  instead of in a tab of their own. The Explore map and facets read one dataset on its main
-  branch. The `VALUES` block of **Use in query** is a locked block on the Pattern canvas
-  until the query builder's inline `VALUES` ships. [Roadmap](ROADMAP.md) item 140. The frame
-  rate of arcs and of the embedding map was measured only in software rendering, item 141.
-  Projections are kept in memory only and are not offered to callers with partial access,
-  item 142.
+* Incremental views are `table` views on `main`, maintained after the commit. There are
+  no `graph` views, no maintenance inside the commit, no WebSocket or MCP access, no Node
+  or JVM API, no UI, no views per branch, no ordered windows and no provenance per fact.
+  Roadmap item 17.
+* Backups and clones do not carry view definitions. Roadmap item 220.
+* A dataset whose materialized inferences join the default graph refuses views and live
+  queries. Roadmap item 221.
+* A caller reads a view only with full access or the principal's exact access. Roadmap
+  item 222.
+* View passes run on one thread per dataset, and the live query limits count per
+  dataset. Roadmap items 223 and 224.
+* Views and live queries never read the graphs that a disclosure guard protects. Roadmap
+  item 227.
 
-* **Weighted path search speed.** A search weighted by `path:weight` runs Dijkstra's
-  algorithm from the source alone. On the 10.5M-triple benchmark data a weighted pair
-  search takes 0.68 s where the unweighted one takes 1.2 ms, and the five cheapest paths
-  exceed the default limit of 10 million visited nodes. The path finder's weighted
-  searches on large graphs stop at its limit of a million visits.
-  [Roadmap](ROADMAP.md) item 150.
+### Search and graph algorithms
 
-* **Community summaries.** A dataset has one GraphRAG configuration, so readers with
-  different views cannot each have reports built from their own view. The evaluation
-  of global answering against local answers and text retrieval has not run, and an
-  automatic refresh counts changes from the change feed rather than from an F13 view.
-  The byte bound's default allowances are unmeasured. [Roadmap](ROADMAP.md) item 12, and
-  item 100 for several configurations.
+* Full-text search uses Tantivy's Snowball stemmers rather than Lucene's analyzers, apart
+  from Porter's stemmer for English. CJK text is cut into bigrams with no
+  dictionary-based segmentation. Roadmap item 23.
+* Full-text documents have one field. Roadmap item 35.
+* Enabling or reconfiguring a full-text index builds it while writes wait. A write
+  transaction cannot search the full-text index after it changes data, because the index
+  covers committed data only. Roadmap item 23.
+* A vector index has no quantization, so its packed vectors take 4 bytes per dimension,
+  roadmap item 34. Each pass that inserts new rows into a vector index's graph scans all
+  rows inserted since the last compaction, item 82.
+* A search weighted by `path:weight` runs Dijkstra's algorithm from the source alone. On
+  the 10.5M-triple benchmark data a weighted pair search takes 0.68 s where the
+  unweighted one takes 1.2 ms, and the five cheapest paths exceed the default limit of 10
+  million visited nodes. The UI's weighted searches stop at a million visits. Roadmap item
+  150.
+* Graph algorithms match the Graphalytics reference outputs for BFS, WCC and PageRank on
+  the two small official example graphs, through `scripts/graphalytics-reference.py`.
+  There is no full Graphalytics driver, no run on the larger datasets, no reference check
+  of CDLP, LCC or SSSP, and no certification. Roadmap item 8.
+* The UI cannot complete `algo:` names, the JVM binding has no typed algorithm handle,
+  and openCypher procedures wait for an openCypher frontend. Write-back commits through
+  the ordinary writer rather than a bulk writer. A write-back run has no deadline unless
+  the request or `--update-timeout` gives one. Thread admission has no queue order, so a
+  call that needs several threads can wait while one-thread calls take the free slots. A
+  background view-only run reports progress by phase only. Roadmap item 8.
+* Betweenness requires finite, strictly positive edge weights, while SSSP accepts zero
+  weights and PageRank non-negative ones. Roadmap item 79.
+* Weighted betweenness refuses a distance addition that cannot keep a strict increase at
+  `f64` precision and refuses non-finite distances. Accepted distances and path counts are
+  approximate, including rounded path ties, and sampling checks only the selected source
+  searches. Roadmap item 80.
 
-* **Cold sparse reads.** The constant, scan and result-term prefetch paths and I/O
-  profiling are implemented and pass the warm instruction, warm read-hint and concurrent
-  policy gates. Cold `values-star` and `path-plus` remain slower than Oxigraph at 1.05M
-  and 10.5M, and `star-lookup` at 10.5M. The 1.01B dense-read gate and window sweep are
-  not measured. Planning takes a predicate's row count from the statistics instead of
-  decoding blocks. The remaining cold time of the point lookups is spent decoding whole
-  columns, so a segmented block layout is the next step. [Roadmap](ROADMAP.md) item 4.
+### GeoSPARQL
 
-* **Weighted betweenness.** Betweenness requires finite, strictly positive stored edge
-  weights. Zero-weight shortest-path counting needs defined cycle semantics and a
-  validated algorithm. SSSP still accepts zero weights, and PageRank retains its
-  nonnegative weight domain. [Roadmap](ROADMAP.md) item 79.
+* EPSG codes come from a table of proj4 definitions rather than the EPSG database, and
+  the library includes the table only with its `geo-epsg` feature. Geographic CRSs on
+  datums other than WGS 84, grid-based datum shifts, and curved GML segments or solids
+  are not supported, and Helmert datum shifts are approximate. Roadmap item 24.
+* Geometry constructions return 2D results. Unions of crossing lines keep the covered
+  points but do not split the lines at each crossing, unlike Jena's JTS engine. Roadmap
+  item 70.
 
-* **Positive-weight numerical limits.** Weighted betweenness refuses a competitive
-  distance addition that cannot retain a strict increase at `f64` precision, and
-  refuses nonfinite computed distances. Accepted distances and path counts remain
-  approximate, including rounded path ties. Sampling checks only the selected
-  source searches. [Roadmap](ROADMAP.md) item 80.
+### Reasoning and validation
 
-* **Scale and execution.** The largest measured dataset is English DBpedia, 1.24 billion
-  triples on one machine. Nothing larger, such as Wikidata, has been tried. Most queries
-  run eagerly, and each operator then materializes its result within budgets. Automatic
-  execution, the default over HTTP, in the CLI, in Node and in the JVM library, streams
-  plain scans of a thousand rows or more and groupings of an estimated 20,000 input rows
-  or more, including groupings over a FILTER EXISTS or NOT EXISTS that a key set
-  answers. A bounded pure ASK with an equality-filtered Cartesian product also streams
-  when its estimated candidate table exceeds an existing row or memory budget. It stops
-  at the first qualifying pair and keeps the actual work limits. Eager execution can
-  prune an oversized independent string-equality product before its residual filter.
-  It preserves matching bags and uses the ordinary kernel for mixed or other value
-  types and expression-bearing inputs. Other plans stream only when the caller asks for
-  `execution=streaming` ([X05](specs/X05-streaming-query-execution.md)). Streaming runs scans,
-  joins, DISTINCT and eligible aggregates batch by batch. ORDER BY with LIMIT reads its
-  input batch by batch into a heap of the rows it returns. Sorts without LIMIT and
-  DESCRIBE still collect their whole input, and the operators it does not support run
-  eagerly. EXISTS streams in every position, but automatic execution keeps an EXISTS
-  that is evaluated once per outer key eager, because the cursor was slower there. With `--spill on` or `encrypted`, sorts, groupings, DISTINCT and joins finish
-  within their budget, but a DISTINCT over an ordered input other than an ORDER BY keeps
-  its whole set, a grouping's single group can outgrow the budget, and eager operators
-  still fail at their budget. Completed hash joins release their working memory
-  at EOF. Grouping above an ordered spilled join remains a performance follow-up.
-  A build without a usable shared key keeps its real memory budget when spill is
-  enabled. Build rows that leave a spilled join's key unbound go to a file of their own
-  once they fill a quarter of a chunk, so they no longer make every partition partition
-  again or fail the join's budget. Ordered join output consolidates as it is produced, with at most 128
-  finished output files and one active writer. A spilled join that must keep its
-  order writes its output once more to merge it. In the initial implementation's
-  measurements, this made one join under 4 MiB 8.9 times slower than the same cursor
-  without a memory limit. The full-scale
-  20-million-row sort and 10-million-group aggregate and DISTINCT matrix now pass
-  in plain and encrypted modes under 64 MiB. Item 93 retains the execution
-  follow-ups, performance investigation and review of enabling spill by default.
-  The UI's result table, the MCP tools and the Python and JVM query calls
-  run eagerly, because they report exact totals or return collected results. FSST
-  vocabulary compression is an option that is off by default. There is no IRI encoding,
-  zstd or frame-of-reference index block codec, pinned results, materialized views or live
-  query monitoring. Predicate patterns do not answer `COUNT(*)` per predicate, which
-  counts triples. [Roadmap](ROADMAP.md) items 1, 7, 16, 17, 27, 40, 93, 160.
-* **Large basic graph patterns.** A query whose plan would nest deeper than 4000 levels
-  is refused. A basic graph pattern counts two levels per triple pattern, so it holds at
-  most 1998 of them, and a path range counts its unrolled steps, multiplied through
-  nested ranges. The [nesting limits](API.md#nesting-limits) give the rules. Planning
-  time grows with the square of the number of triple patterns. A basic graph pattern at
-  the limit takes from 34 ms to 0.8 s to plan in a release build, and a star of 1998
-  patterns on one frequent predicate takes about 3 s over a dataset of 31,815 triples,
-  because the pairs of plans that share one variable stay quadratic. Planning observes
-  the timeout and cancellation. The explanation of `/{ds}/sparql/explain` reads plans of
-  at most 256 levels. [Roadmap](ROADMAP.md) item 84.
-* **Query memory pool.** A SERVICE call to this server runs in process only from the
-  SPARQL query and update endpoints, so one from an MCP tool or GraphQL still waits
-  behind its caller's grant. Routes such as SHACL, ShEx
-  validation outside its selectors, diff and the `/$/stats`, `/$/schema` and
-  `/$/validate` reads hold their admitted grant idle while their own query takes a
-  second one. With a pool set, an eager
-  CONSTRUCT or DESCRIBE result keeps its query's peak estimate until the result object is
-  released. A SELECT or ASK result keeps only its own estimate.
-  [Roadmap](ROADMAP.md) item 7.
-* **Cache memory overhead.** The server-wide caches count the bytes of the values they
-  hold, and the process uses more. The heap behind the result cache is about 1.2 times
-  the bytes it counts, and evicted entries leave free pages in the heaps of the tokio and
-  Rayon threads until those threads allocate again. Ten datasets at `--cache-mb 32` used
-  1.157 times the anonymous memory that one dataset and the cache bytes predict.
-  [Roadmap](ROADMAP.md) item 88.
-* **Memory profiles at scale.** The default and `small` memory profiles were measured at
-  1.05M and 10.5M triples and on the DBpedia 50M slice, warm and cold, but without the
-  control run with the defaults from before the profiles that the X08 Phase 1a gate asks
-  for. The `small` profile saves about 100 MiB of RSS at 10.5M, but its cold `star-lookup`
-  at 10.5M is 79% slower than the default profile's and several other cold queries are 7%
-  to 10% slower, past the gate's 5%. [Roadmap](ROADMAP.md) item 97.
-* **Materialization limit.** `sparkles infer` stops a run that would derive more than 50
-  million triples, and no flag or setting raises the limit. LUBM(1000) reaches it under
-  RDFS in the first iteration, and OWL2Bench reaches it under OWL 2 RL from five
-  universities on. [Roadmap](ROADMAP.md) item 98.
-* A headerless WAL that this release has never opened for writing keeps the mixed legacy
-  rules for the bytes it already holds. A torn record that an older build left there can
-  still be read as a legacy commit or refused. [Roadmap](ROADMAP.md) item 3 and
-  [X09 Phase 3](specs/X09-group-commit-by-default.md#phase-3).
-* Group commit on datasets with a full-text, spatial or embedding index has passed its
-  crash runs. Its forge acceptance of 2026-10-23 met the amended gates for memory, for
-  four-writer throughput and for 35 of 36 serial checks. The p90 of spatial serial inserts
-  at 10.5M was 1.077 times its ordinary neighbour, which is [roadmap](ROADMAP.md) item
-  111, and a fence synchronizes in 1.4 to 1.5 ms against about 1.0 ms for one commit, which
-  is item 112. After item 110 bounded the locked checkpoint's write stall, a rerun on
-  2026-10-24 met the text reader gates at both sizes and the spatial one at 10.5M. The
-  spatial reader gate at 1.05M is not established, because the ordinary writer could not
-  hold the offered rate while the drive was in its slow state, which is item 171. The serial
-  and throughput gates were amended after the campaign, so the next forge run is the first
-  to judge them blind. [X09 section 17.9](specs/X09-group-commit-by-default.md#179-performance-gates)
-  has the gates and the [Phase 4 Outcome](specs/X09-group-commit-by-default.md#phase-4) the
-  results.
-* **SP²Bench query budgets.** The selective UNION rewrite covers `q8` and `q12b`.
-  The bounded automatic ASK policy covers `q12a`, string equality pruning lets `q5a`
-  answer at 10M within the default budgets, and keyed left joins do the same for `q6`.
-  An eager `q4` that outgrows the query memory pool runs again as a cursor without
-  spill. Its answer at 10M is 1.96 GB of TSV, which is more than the default response
-  budget of 1 GiB, so it answers only with a larger `--max-result-mb`. Jena stays
-  faster on `q12a` and Oxigraph on `q12b`. [Roadmap](ROADMAP.md) item 91.
-* **Inference.** Inference is forward materialization, Jena's RDFS on read and
-  derivation on demand. Derivation on demand has no cost-based choice against a
-  materialization (`reasoning=auto`), no OWL 2 QL rewriting, no reuse of tables across
-  commits and no dataset setting for it, and Jena's hybrid rules are flattened as in
-  materialization. With cached tables, the selective LUBM queries take 1.4 to 2.5 times
-  as long as over a materialization under RDFS and 2.5 to 17 times under OWL 2 RL, and
-  queries that read millions of facts take tens to over a hundred times as long. A query that reads
-  schema facts uses the rules unspecialized, and schema facts that follow only from
-  derived instance facts, such as the `rdfs:Class` typing of a class whose instances are
-  all derived, may be missing from its answers. DESCRIBE is refused under derivation on
-  demand. Derived facts still use
-  the ordinary inferred graph. A separate derived-fact layer and canonical
-  `owl:sameAs` representatives are not built. Incremental maintenance does not cover rules with `noValue`,
-  `now` or new blank nodes, or RDF lists that change under OWL 2 RL. Those runs, and the
-  first run after a compaction without retained history, compute everything again.
-  Inconsistency checks cover a fixed subset of OWL 2 RL. Over a kept closure, changes of 100 triples at 16 threads take 1.6 to 2.3 times their time before the closure dropped the explicit facts, and undos at 1 thread take 1.3 to 1.8 times, on LUBM-style data. [Roadmap](ROADMAP.md) items 9, 17, 19, 53, 113, 190, 191, 192, 193.
-* **SPARQL extensions.** Sparkles has ARQ's query language and function library apart
-  from JavaScript functions, `afn:context`, the Leviathan `lfn:` library, the `JSON`
-  query form and evaluation of `shortest(…)` paths, which ARQ does not evaluate either.
-  `afn:collation` orders by code point instead of by locale. Jena's service enhancer has no slice-aware cache and no
-  `se:cacheRm` or `se:cacheLs` functions. [Roadmap](ROADMAP.md) items 38, 51, 69.
-* **Search.** Full-text search has no multi-field documents, and its stemmers are
-  Tantivy's Snowball stemmers rather than Lucene's analyzers, apart from Porter's
-  stemmer for English. CJK text is cut into
-  bigrams, with no dictionary-based segmentation.
-  Enabling or reconfiguring a full-text index builds it while writes wait. A write
-  transaction cannot search the full-text index after it has changed data, because the
-  index covers committed data only ([API.md](API.md#full-text-search)). A vector index has no quantization,
-  so its packed vectors take 4 bytes per dimension. Each pass that inserts new rows into
-  a vector index's graph scans all rows inserted since the last compaction, so its cost
-  grows until the next compaction. [Roadmap](ROADMAP.md) items 23, 34, 35, 82.
-* **Query languages.** There is no openCypher frontend and no JSON query language. [Roadmap](ROADMAP.md) items 20, 72.
-* **GeoSPARQL.** EPSG codes come from a table of proj4 definitions rather than the EPSG
-  database, and the library includes the table only with its `geo-epsg` feature.
-  Geographic CRSs on datums other than WGS 84, grid-based datum shifts and curved GML
-  segments or solids are not supported, and Helmert datum shifts are approximate.
-  Geometry constructions return 2D results. Unions of crossing lines preserve the
-  covered points but do not split the lines at each crossing, unlike Jena's JTS engine. [Roadmap](ROADMAP.md) items 24, 70.
-* **Shapes.** ShEx 2.2 has no `RESTRICTS` and no `EXACTLY` syntax, and SHACL 1.2's
-  reifier constraints, `sh:uniqueValuesFor`, `sh:subsetOf`, `sh:someValue`, `sh:rootClass`,
-  `sh:singleLine` and custom functions called from SPARQL are not supported.
-  `sparkles fmt` and the UI's Format button do not format SHACLC.
-  Drafted shapes reference other class shapes only at support 1, have patterns only for
-  properties whose values are all strings and ranges only for inline numbers and dates,
-  go one level deep in sequence paths, and write sequence paths and date ranges into the
-  ShEx draft as comments.
-  Write-time validation validates recursive SHACL shapes, and SHACL-SPARQL constraints
-  whose queries are not anchored at the focus node, in full on every write. ShEx keeps no
-  typing when the process is killed or exits without closing the store, so after that the
-  first writes to a recursive schema over a large connected graph may be validated in
-  full. A typing file is used only for the schema copy it was written for, and a file of
-  another version is discarded. A ShEx schema copy that is edited outside Sparkles is
-  compiled and trusted, because the guard does not check the copy against the digest that
-  it recorded. [Roadmap](ROADMAP.md) items 48, 54, 78, 83.
-* **Formats and change logs.** TriX, RDF Thrift, RDF Protobuf and RDF/JSON are read and
-  written by the server, `sparkles load`, `sparkles convert`, the Python bindings and the
-  library's `Dataset::load_file` and `dump`. The loader reads them by rewriting each file
-  as N-Quads in a temporary file first. The library's `load_str` and `dump_graph` take
-  only the W3C syntaxes, and SPARQL `LOAD` reads TriX but not the other three. A patch
-  is applied as one commit, even when it holds several `TX … TC` transactions, and a
-  patch from another dataset cannot name its existing blank nodes. There are no patch
-  logs and no replicas that follow a server. [Roadmap](ROADMAP.md) items 66, 73, 74.
-* **Tabular imports.** CSV and TSV tables are mapped by CSVW metadata in its minimal
-  mode or by CONSTRUCT templates. There are no RML or R2RML mappings, no CSVW standard
-  mode, and no primary-key or foreign-key checks, and a template cannot read the target
-  dataset. Tables are imported, not queried in place. The Graph Store endpoint does not read CSV. [Roadmap](ROADMAP.md) items 22, 43.
-* **GraphQL.** There are no mutations or subscriptions, and no stored GraphQL queries,
-  `persistedOnly` or UI page for it. Nested lists are not connections. A
-  nested `first` limits the response, while the engine still produces every value of
-  the field. Parent ids reach a child query as terms rather than engine ids, and blank
-  node parents each take a `UNION` branch. [Roadmap](ROADMAP.md) item 37.
-* **Stored queries.** There are no stored updates, no parameters bound to several values
-  at once, and no private queries per user. [Roadmap](ROADMAP.md) item 39.
-* **Operations.** There are no JVM metrics and no ontology object API. Assembler bodies
-  are read only for the part that maps to a dataset, and direct Graph Store naming is
-  chosen per dataset at start with `--gsp-direct-naming` and not through the settings
-  API. Validation endpoints refuse callers whose grants cover only
-  some graphs or triples. The change feed refuses callers whose protections depend on the
-  data, and protections hide triples, not the IRIs that visible triples mention. Backups
-  cover individual datasets. There is no whole-server backup, and encryption keys for
-  backup repositories cannot be managed through the API, Vault or a cloud KMS. [Roadmap](ROADMAP.md) items 61, 65, 71, 75, 76.
-* **Ask evaluation.** The first paid run covers only the demo set and CK25. Its
-  whole-row policy scored Haiku 5.5, Sonnet 5.5 and Opus 5.5 at 47, 14 and 13 of 59
-  demo questions and 10, 4 and 5 of 49 CK25 questions. The projected-column policy,
-  which was chosen after those results were seen, scores the same saved answers at 52,
-  48 and 56 of 59 and 20, 26 and 27 of 49. Of those correct answers 5, 34 and 43 on the
-  demo set and 10, 22 and 22 on CK25 match only once their extra columns are set aside,
-  so the projected policy favors answers that name each result beside its IRI. With 59
-  and 49 questions, a difference of a few questions between models is within noise.
-  [C18](specs/C18-natural-language-questions-and-ingest.md#roadmap-follow-ups-2026-10-12)
-  records both. The evaluation cannot answer the pipeline's clarification questions,
-  which cost CK25 seven questions for every model. The initial hosted demo pilot's $1.002560
-  stays in the cost ledger until it is reconciled with the billed amount. The harness converts
-  QALD-9-plus, Text2SPARQL'25 and LC-QuAD 2.0, with gold recomputed on DBpedia
-  2022.12.01 and on CK25. An Ask on the DBpedia database now takes about two
-  seconds, but most DBpedia questions stop at a clarification, because `link_entities`
-  offers a category or a namesake beside the main resource. LC-QuAD 2.0 needs a Wikidata load from the full dump, and
-  independent-role evaluation remains. [Roadmap](ROADMAP.md) item 6.
-* **Assistant configuration.** Dataset assistant settings, including `enabled`,
-  `ingest` and `send: "documents"`, can be declared for every dataset or by name in the
-  settings file of `serve --settings`, which can also lock them, and changed through
-  `/$/settings/{dataset}/assistant`, `sparkles settings` or the dataset page's Settings
-  tab, which shows each field's source, locks and resets. `sparkles memory init` turns
-  on ingestion for the fields that still have their default. The NixOS module declares
-  the settings file with `services.sparkles.settings`, checks it at build time and
-  reloads the server when it changes. The UI's ingestion controls do not turn on
-  assistant ingestion. Keys that server administrators store at runtime are sealed by
-  default, but without `--secrets-key` the key is one the server generated in the data
-  directory, which does not protect them from someone who can read that directory. An
-  operator who does not want keys on disk at all locks the secrets in the settings file.
-  See [USAGE.md](USAGE.md#ingesting-documents-in-the-server) for the setup routes.
-  [Roadmap](ROADMAP.md) item 77.
-* **Agents.** Agent memory imports transcripts from Claude Code, Codex, Gemini CLI, Cursor, the Copilot CLI and Aider,
-  but not from Cursor's SQLite store or the editors' Copilot Chat storage, and
-  redaction finds only the secrets its patterns describe. The server converts Markdown, HTML, PDF and Office documents, but not
-  images or audio. Scanned PDF pages need a build with `pdf-ocr` and
-  OCR models from the operator. A CSV mapping draft links the values of an IRI column
-  only to entities whose labels match exactly or after folding case and spacing, and a
-  value with several matches keeps a minted IRI until a person chooses, and the lookup reports only the first variant of an
-  ambiguous group. The Office converter is not registered with the query memory pool, and a workbook's token estimate for
-  `confirmTokens` is not taken over all its sheets. [Roadmap](ROADMAP.md) items 15, 77.
-* **Memory representation.** Sources, cited assertions, sessions and imported memory
-  already have a representation. There is no shared profile connecting these to personal
-  notes, decisions and tasks with explicit evidence, dependency and validity semantics.
-  [Roadmap](ROADMAP.md) item 81.
-* **History.** A past state can be read only while a
-  retained generation holds it, even when the change log has its changes. A bulk
-  commit into a non-empty dataset is recorded in the change log with its counts only when
-  the quads it loads and the graphs it drops hold more than 1,000,000 quads, even if few
-  of them change. After a crash right after a bulk commit, the log can lack that commit's
-  changes. Full-text search works at the head only. [Roadmap](ROADMAP.md) items 23, 52.
-* **Deployment.** Sparkles runs as a single node on local disk. There is no clustering,
-  no replicas, and live RDF data stays on local disk without encryption at rest.
-  Backup repositories can use object storage and optional encryption. [Roadmap](ROADMAP.md) items 65, 66.
-* **Embedding.** The database has Rust, Python, JVM and Node.js APIs and no WebAssembly build of the engine. The
-  Python package is not on PyPI and has no PyPy or free-threaded wheels. The release
+* Inference is forward materialization, RDFS on read and derivation on demand.
+  Derivation on demand has no cost-based choice against a materialization, no OWL 2 QL
+  rewriting, no reuse of tables across commits and no dataset setting, and Jena's hybrid
+  rules are flattened. Roadmap item 19.
+* With cached tables, the selective LUBM queries take 1.4 to 2.5 times as long on demand
+  as over a materialization under RDFS and 2.5 to 17 times under OWL 2 RL, and queries
+  that read millions of facts take tens to over a hundred times as long. Roadmap item 190.
+* A query on demand that reads schema facts uses the rules unspecialized, and schema facts
+  that follow only from derived instance facts may be missing from its answers, item 191.
+  The derived-table cache's budget accounting is item 192. DESCRIBE is refused under
+  derivation on demand, item 193.
+* Derived facts use the ordinary inferred graph. A separate derived-fact layer and
+  canonical `owl:sameAs` representatives are not built. Roadmap item 9.
+* Incremental maintenance does not cover rules with `noValue`, `now` or new blank nodes,
+  or RDF lists that change under OWL 2 RL. Those runs, and the first run after a
+  compaction without retained history, recompute everything. Inconsistency checks cover a
+  fixed subset of OWL 2 RL. Roadmap items 9 and 53.
+* Because the kept closure holds only derived facts, changes of 100 triples at 16 threads
+  over it take 1.6 to 2.3 times as long as with a closure that also holds the explicit
+  facts, and undos at 1 thread take 1.3 to 1.8 times, on LUBM-style data. Roadmap item
+  113.
+* ShEx 2.2 has no `RESTRICTS` and no `EXACTLY` reference syntax. SHACL 1.2's reifier
+  constraints, `sh:uniqueValuesFor`, `sh:subsetOf`, `sh:someValue`, `sh:rootClass`,
+  `sh:singleLine` and custom functions called from SPARQL are not supported. Roadmap item
+  13 keeps them out of scope, and the Outcome sections of
+  [G02](specs/G02-shex.md#roadmap-follow-ups-2026-10-12) and
+  [G03](specs/G03-shaclc.md#roadmap-follow-ups-2026-10-12) list them.
+* `sparkles fmt` and the UI's Format button do not format SHACLC. Roadmap item 48.
+* Drafted shapes reference other class shapes only at support 1, have patterns only for
+  all-string properties and ranges only for inline numbers and dates, go one level deep in
+  sequence paths, and write sequence paths and date ranges into ShEx drafts as comments.
+  Roadmap item 13 and [C02](specs/C02-schema-discovery.md#roadmap-follow-ups-2026-10-12).
+* Write-time validation validates recursive SHACL shapes, and SHACL-SPARQL constraints not
+  anchored at the focus node, in full on every write. Roadmap item 78.
+* ShEx keeps no typing when the process is killed or exits without closing the store, so
+  the first writes afterwards to a recursive schema over a large connected graph may
+  validate in full. A ShEx schema copy edited outside Sparkles is trusted without a digest
+  check. Roadmap items 54 and 83.
+* Validation endpoints refuse callers whose grants cover only some graphs or triples.
+  Roadmap item 75.
+
+### Server, access control and operations
+
+* There are no JVM metrics. Assembler bodies are read only for the part that maps to a
+  dataset. Direct Graph Store naming is chosen per dataset at start with
+  `--gsp-direct-naming` and not through the settings API. Roadmap item 76.
+* There is no ontology object API. Roadmap item 71.
+* The change feed refuses callers whose protections depend on the data, and protections
+  hide triples, not the IRIs that visible triples mention. Roadmap item 75.
+* GraphQL has no mutations, subscriptions, stored GraphQL queries, `persistedOnly` or UI
+  page. Nested lists are not connections, and a nested `first` limits the response while
+  the engine still produces every value of the field. Parent ids reach a child query as
+  terms rather than engine ids, and blank node parents each take a `UNION` branch.
+  Roadmap item 37.
+* Stored queries have no stored updates, no parameters bound to several values at once,
+  and no private queries per user. Roadmap item 39.
+* Sparkles runs as a single node on local disk. There is no clustering and there are no
+  replicas, roadmap item 66. Live RDF data on local disk is not encrypted at rest, item 65.
+* Backups cover individual datasets, with no whole-server backup, roadmap item 61.
+  Encryption keys for backup repositories cannot be managed through the API, Vault or a
+  cloud KMS, item 65.
+* Without `--secrets-key`, runtime keys are sealed with a key that the server generated in
+  the data directory, which does not protect them from someone who can read that
+  directory. An operator who wants no keys on disk locks the secrets in the settings file.
+  Roadmap item 77.
+
+### AI and agents
+
+* Ask has been evaluated on the demo set and CK25, with 59 and 49 questions, which is too
+  few to separate models that differ by a few questions
+  ([C18](specs/C18-natural-language-questions-and-ingest.md#roadmap-follow-ups-2026-10-12),
+  [BENCHMARKS.md](BENCHMARKS.md)). The evaluation cannot answer the pipeline's
+  clarification questions, which cost every model seven CK25 questions. Most DBpedia
+  questions stop at a clarification, because `link_entities` offers a category or a
+  namesake beside the main resource. The harness converts QALD-9-plus, Text2SPARQL'25 and
+  LC-QuAD 2.0, and LC-QuAD 2.0 needs a Wikidata load from the full dump. Independent-role
+  evaluation has not run. Roadmap item 6.
+* The UI's ingestion controls do not turn on assistant ingestion. Roadmap item 77.
+* Agent memory does not import from Cursor's SQLite store or the editors' Copilot Chat
+  storage, and redaction finds only the secrets its patterns describe. Roadmap item 15.
+* The server does not convert images or audio. Scanned PDF pages need a build with
+  `pdf-ocr` and OCR models from the operator. The Office converter is not registered with
+  the query memory pool, and a workbook's token estimate for `confirmTokens` does not
+  cover all its sheets. Roadmap items 15 and 77.
+* A CSV mapping draft links an IRI column's values only to entities whose labels match
+  exactly or after folding case and spacing. A value with several matches keeps a minted
+  IRI until a person chooses, and the lookup reports only the first variant of an
+  ambiguous group. Roadmap item 15.
+* There is no shared profile that connects sources, cited assertions, sessions and
+  imported memory to personal notes, decisions and tasks with evidence, dependency and
+  validity semantics. Roadmap item 81.
+* A dataset has one GraphRAG configuration, so readers with different views cannot each
+  have reports built from their own view, roadmap item 100. Global answering has not been
+  evaluated against local answers and text retrieval, an automatic refresh counts changes
+  from the change feed rather than from an incremental view, and the byte bound's default
+  allowances are unmeasured, item 12.
+
+### Web UI
+
+* Forms edit predicate and inverse paths with literal and IRI values. Blank node values
+  with `dash:DetailsEditor`, list editors for `sh:memberShape` and choices for `sh:or` and
+  `sh:xone` are not built, and ShEx schemas do not drive forms. A check without a guard
+  does not validate shapes that reach the resource through more than two triples.
+  Roadmap item 21.
+* The Pattern pane builds and edits basic graph patterns, filters, one level of
+  `OPTIONAL`, simple paths, the projection and the modifiers. `UNION`, `GRAPH`, inline
+  `VALUES`, `MINUS` and `FILTER NOT EXISTS` are not editable on the canvas, a waiting node
+  is not kept across a reload, and the pane needs the formatter's browser module with no
+  server fallback. Roadmap item 101.
+* The plan drawn on the pattern shows the numbers of a plan after it ran or was
+  explained, and does not update while a query runs. Roadmap item 27.
+* Layouts are not computed or cached on the server and there is no binary transfer
+  format, so a WebGL view lays out every result in the browser. Frame-rate and main-thread
+  targets have no automated test on a GPU runner, and the overview opens one path below
+  one class at a time, with no grouping by named graph. Roadmap item 29.
+* The embedding map cannot colour by a kept Leiden run, `Shift+M` does not open it, date
+  facets count whole years only, and at phone width the facets sit below the graph. The
+  Explore map and facets read one dataset on its main branch. The `VALUES` block of
+  **Use in query** is a locked block on the Pattern canvas. Roadmap item 140.
+* The frame rate of arcs and of the embedding map has been measured only in software
+  rendering, roadmap item 141. Projections are kept in memory only and are not offered to
+  callers with partial access, item 142.
+* The validation overlay validates the drawn nodes instead of reading a recorded result,
+  roadmap item 120. Under an incremental guard with other results in the dataset, a
+  preview cannot say whether a fix resolves its result, item 121. Callers whose grants
+  cover only some graphs get no overlay, item 75.
+
+### Bindings and packaging
+
+* There is no WebAssembly build of the engine. Roadmap item 44.
+* The Python package is not on PyPI and has no PyPy or free-threaded wheels. The JVM
+  library is not on Maven Central, and the JavaScript packages are not on npm. Release
   workflows build for Linux on x86_64 and arm64 and for macOS on Apple silicon only, with
-  no Windows or Intel macOS packages. The JVM library is not on Maven Central, and the JavaScript packages are not on npm.
-  Their gated release workflows build native platform artifacts, and Linux is the platform
-  tested locally. JVM functions registered in Java still run through ARQ, and the
-  JVM library has no musl build. [Roadmap](ROADMAP.md) items 25, 44, 58.
+  no Windows or Intel macOS packages, and Linux is the platform tested locally. The JVM
+  library has no musl build. Roadmap item 58.
+* JVM functions registered in Java run through ARQ. Roadmap item 25.
