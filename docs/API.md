@@ -5360,11 +5360,13 @@ no value.
 The server keeps four projections, 1 GiB in all, keyed by dataset, branch, index and
 method, and drops the least recently used first. A projection takes 24 bytes per entity,
 so ten million entities take 240 MB. The query memory pool pays for the computation before
-it starts, through the request's own grant in the request and through a grant of the task's
-own for a task, and a computation the pool cannot hold is refused with `507` before it
-reads a vector. A kept projection then holds a grant for its own bytes until it is dropped
-and its last reader is done, and a projection the pool or the limit cannot hold is refused
-with `507`. An index replaced under the same name with another predicate, dimension or
+it allocates, from a bound of its working memory taken from the snapshot it reads. In the
+request the request's own grant is charged, and a task waits in the pool's queue for a
+grant of its own. A computation that needs more than the whole pool is refused with `507`,
+and one that finds the memory in use past the admission wait gets `503`, or a failed task.
+A kept projection then holds a grant for its own bytes until it is dropped and its last
+reader is done, and a projection the pool or the limit cannot hold is refused with
+`507`. An index replaced under the same name with another predicate, dimension or
 metric forgets its projections. A
 kept projection holds the snapshot it read, so after a compaction the replaced generation's
 files stay open until the projection is replaced or dropped. Projections are not written to

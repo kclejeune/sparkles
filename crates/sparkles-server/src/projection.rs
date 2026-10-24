@@ -127,27 +127,11 @@ fn sweep(st: &crate::state::AppState, kept: &mut Vec<Kept>) {
 /// when the index is gone.
 fn fingerprint(ds: &crate::state::Dataset, name: &str) -> Option<String> {
     let s = ds.dataset.indexes().vector().get(name)?;
-    Some(format!("{}|{}|{:?}", s.predicate, s.dimension, s.metric))
+    Some(print_of(&s.predicate, s.dimension, s.metric))
 }
 
-fn refused(bytes: u64) -> crate::http::ApiError {
-    err(
-        StatusCode::INSUFFICIENT_STORAGE,
-        format!(
-            "the query memory pool cannot hold the {bytes} bytes the projection's computation needs now; try again when fewer queries run"
-        ),
-    )
-}
-
-/// Gives back a charge on the request's grant when dropped, also on an error.
-struct Release(Option<Arc<sparkles::sparql::pool::PoolGrant>>, u64);
-
-impl Drop for Release {
-    fn drop(&mut self) {
-        if let Some(g) = &self.0 {
-            g.release(self.1);
-        }
-    }
+fn print_of(predicate: &str, dimension: usize, metric: sparkles::vector::Metric) -> String {
+    format!("{predicate}|{dimension}|{metric:?}")
 }
 
 /// A grant of the query memory pool that covers `bytes` in full, or `507`. `None` when
@@ -180,11 +164,12 @@ fn reserve(
 fn keep(
     st: &crate::state::AppState,
     key: Key,
-    fingerprint: String,
     p: Projection,
     grant: Option<sparkles::sparql::pool::PoolGrant>,
 ) -> ApiResult<Arc<Held>> {
     let bytes = p.bytes();
+    // the configuration of the build the projection read, not the status before it
+    let fingerprint = print_of(&p.predicate, p.dimension, p.metric);
     if bytes > KEEP_BYTES {
         return Err(too_big(bytes));
     }
@@ -355,65 +340,46 @@ pub async fn compute(
             }
         }
     }
+    // the request or task choice and the size check read the index's status; the memory
+    // the computation holds is admitted inside it, from the snapshot it reads
     let status = index_status(&ds, &name)?;
-    let print = format!(
-        "{}|{}|{:?}",
-        status.predicate, status.dimension, status.metric
-    );
-    // the base rows and the rows inserted since, which the projection reads as well
     let rows = (status.rows + status.overlay.inserts) as usize;
     let estimate = rows as u64 * sparkles::vector::projection::BYTES_PER_POINT;
     if estimate > KEEP_BYTES {
         return Err(too_big(estimate));
     }
-    // the working memory is charged before the work starts, and kept for the projection
-    let links = status.hnsw.as_ref().map_or(0, |h| 2 * h.m);
-    let working = sparkles::vector::projection::working_bytes(
-        rows,
-        status.overlay.inserts as usize,
-        status.dimension,
-        cfg.sample,
-        method,
-        links,
-    );
     let key = key_of(&ds, &name, method);
     if method == ProjectionMethod::Pca && rows <= IN_REQUEST {
-        // in the request, its admission grant pays for the computation; the kept
-        // projection then takes a grant of its own, which outlives the request
-        let (request, grant) = match crate::server_memory::current_grant() {
-            Some(g) => {
-                g.charge(working).map_err(|_| refused(working))?;
-                (Some(g), None)
-            }
-            None => (None, reserve(&st, working, "the projection's computation")?),
-        };
-        let release = Release(request, working);
         let params = crate::http::Params::from_query(&uri);
         let timeout = crate::http::timeout_param(&st, &params);
         let (cancel, _guard) = crate::http::cancel_on_drop();
         let st2 = st.clone();
         let ds2 = ds.clone();
-        let p = blocking(move || {
+        // in the request, its admission grant pays for the computation, and the charge
+        // lives in the worker, which may outlast a client that went away
+        let request = crate::server_memory::current_grant();
+        let (p, grant) = blocking(move || {
             let ctl = sparkles::task::Control {
                 cancel: sparkles::task::Cancel::from_flag(cancel),
                 deadline: Some(Instant::now() + timeout),
                 ..Default::default()
             };
-            Ok(ds2
-                .dataset
-                .indexes()
-                .vector()
-                .projection(&name, &cfg, &ctl)?)
+            let flag = ctl.cancel.clone();
+            let paid = Paid::new(&st2, request, move || flag.is_cancelled());
+            let p = ds2.dataset.indexes().vector().projection_admitted(
+                &name,
+                &cfg,
+                &|b| paid.admit(b),
+                &ctl,
+            )?;
+            Ok((p, paid.into_grant()))
         })
         .await
         .map_err(|e| crate::http::with_timeout(e, Some(timeout)))?;
-        drop(release);
-        let held = keep(&st2, key, print, p, grant)?;
+        let held = keep(&st, key, p, grant)?;
         return Ok(Json(summary(&held, &ds)).into_response());
     }
     crate::http::task_start_check(&st, Some(TASK), &ds_name)?;
-    // a task outlives the request, so it holds a grant of its own
-    let grant = reserve(&st, working, "the projection's computation")?;
     let st2 = st.clone();
     let ds2 = ds.clone();
     let task = st.start_task_opts(st.next_task_id(), TASK, &ds_name, None, true, move |h| {
@@ -426,13 +392,18 @@ pub async fn compute(
             progress,
             deadline: None,
         };
-        let p = ds2
-            .dataset
-            .indexes()
-            .vector()
-            .projection(&name, &cfg, &ctl)?;
+        // a task outlives the request and its admission grant, so it takes a grant of
+        // its own once it runs, and hands it to the kept projection
+        let flag = ctl.cancel.clone();
+        let paid = Paid::new(&st2, None, move || flag.is_cancelled());
+        let p = ds2.dataset.indexes().vector().projection_admitted(
+            &name,
+            &cfg,
+            &|b| paid.admit(b),
+            &ctl,
+        )?;
         let n = p.len();
-        keep(&st2, key, print, p, grant).map_err(|e| anyhow::anyhow!("{}", e.message()))?;
+        keep(&st2, key, p, paid.into_grant()).map_err(|e| anyhow::anyhow!("{}", e.message()))?;
         Ok(format!(
             "vector index {name}: {} projection of {n} entities",
             method.name()
@@ -445,6 +416,74 @@ pub async fn compute(
         Json(task),
     )
         .into_response())
+}
+
+/// How a computation pays for its working memory: a charge on the request's admission
+/// grant, given back when the computation ends, or a grant of its own, which the kept
+/// projection then takes. Without a pool nothing is charged.
+struct Paid {
+    pool: Option<Arc<sparkles::sparql::pool::QueryPool>>,
+    request: Option<Arc<sparkles::sparql::pool::PoolGrant>>,
+    charged: std::sync::atomic::AtomicU64,
+    own: Mutex<Option<sparkles::sparql::pool::PoolGrant>>,
+    /// how long a grant of its own waits for memory that queries hold
+    wait: std::time::Duration,
+    cancelled: Box<dyn Fn() -> bool + Send + Sync>,
+}
+
+impl Paid {
+    fn new(
+        st: &crate::state::AppState,
+        request: Option<Arc<sparkles::sparql::pool::PoolGrant>>,
+        cancelled: impl Fn() -> bool + Send + Sync + 'static,
+    ) -> Paid {
+        Paid {
+            pool: st.catalog.pool().cloned(),
+            request,
+            charged: Default::default(),
+            own: Mutex::new(None),
+            wait: st.admission.wait,
+            cancelled: Box::new(cancelled),
+        }
+    }
+
+    /// Pay for `bytes`, or refuse with the pool's error: `507` for more than the whole
+    /// pool, `503` when the memory stays in use past the admission wait.
+    fn admit(&self, bytes: u64) -> sparkles::Result<()> {
+        let Some(pool) = &self.pool else {
+            return Ok(());
+        };
+        if let Some(g) = &self.request {
+            g.charge(bytes)?;
+            self.charged
+                .fetch_add(bytes, std::sync::atomic::Ordering::SeqCst);
+            return Ok(());
+        }
+        if bytes > pool.capacity() {
+            return Err(pool.exhausted(bytes));
+        }
+        // a task may start before the request that started it lets go of its admission
+        // grant, so it waits in the pool's queue; the pool clamps a grant to its
+        // capacity, so the bytes are charged as well
+        let g = pool.admit_blocking(bytes, self.wait, || (self.cancelled)())?;
+        g.charge(bytes)?;
+        *self.own.lock() = Some(g);
+        Ok(())
+    }
+
+    /// The grant of its own, for the kept projection; the charge on the request's grant
+    /// goes back.
+    fn into_grant(self) -> Option<sparkles::sparql::pool::PoolGrant> {
+        self.own.lock().take()
+    }
+}
+
+impl Drop for Paid {
+    fn drop(&mut self) {
+        if let Some(g) = &self.request {
+            g.release(self.charged.load(std::sync::atomic::Ordering::SeqCst));
+        }
+    }
 }
 
 /// The projection's facts, without its points.

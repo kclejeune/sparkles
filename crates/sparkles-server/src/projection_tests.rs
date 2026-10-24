@@ -566,13 +566,16 @@ async fn the_memory_pool_pays_for_projections() {
     let (st, j) = json_of(&s.app, post("/$/vector/d/e/projection", "")).await;
     assert_eq!(st, StatusCode::INSUFFICIENT_STORAGE, "{j}");
     assert_eq!(pool.granted(), 0);
-    // a neighbour layout's task is refused before it starts
+    // a neighbour layout's task takes its grant once it runs, after the request's
+    // admission grant is gone, and fails before it reads a vector
     let (st, j) = json_of(
         &s.app,
         post("/$/vector/d/e/projection?method=neighbours", ""),
     )
     .await;
-    assert_eq!(st, StatusCode::INSUFFICIENT_STORAGE, "{j}");
+    assert_eq!(st, StatusCode::ACCEPTED, "{j}");
+    let t = wait_task(&s.app, j["id"].as_str().unwrap()).await;
+    assert_eq!(t["state"], "failed", "{t}");
     assert_eq!(pool.granted(), 0);
     // a kept projection holds a grant until it is dropped
     let s = server_with(200, DbType::Mem, Some(64 << 20)).await;
@@ -585,4 +588,61 @@ async fn the_memory_pool_pays_for_projections() {
         "{}",
         pool.granted()
     );
+}
+
+/// A small neighbour layout runs in a small pool: its task does not need a grant beside the
+/// request's admission grant.
+#[tokio::test]
+async fn a_small_layout_runs_in_a_small_pool() {
+    let s = server_with(20, DbType::Mem, Some(16 << 20)).await;
+    let (st, j) = json_of(
+        &s.app,
+        post("/$/vector/d/e/projection?method=neighbours", ""),
+    )
+    .await;
+    assert_eq!(st, StatusCode::ACCEPTED, "{j}");
+    let t = wait_task(&s.app, j["id"].as_str().unwrap()).await;
+    assert_eq!(t["state"], "done", "{t}");
+}
+
+/// The PCA's workspaces grow with the dimension, so one vector of 16,384 dimensions needs
+/// more than a 1 MiB pool even with a sample of one.
+#[tokio::test]
+async fn the_pca_workspace_counts_against_the_pool() {
+    let s = server_with(2, DbType::Mem, Some(1 << 20)).await;
+    let dim = 16_384;
+    let v: Vec<String> = (0..dim).map(|d| format!("{}", d % 7)).collect();
+    s.state
+        .get("d")
+        .unwrap()
+        .store
+        .load(&[Source::from_bytes(
+            format!(
+                "<{EX}x> <{EX}big> \"[{}]\"^^<urn:x-sparkles:vector> .\n",
+                v.join(",")
+            )
+            .into_bytes(),
+            oxrdfio::RdfFormat::Turtle,
+            None,
+        )])
+        .unwrap();
+    let (st, j) = json_of(
+        &s.app,
+        Request::put("/$/vector/d/big")
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(Body::from(format!(
+                r#"{{"predicate":"{EX}big","dimension":{dim},"metric":"euclidean","hnsw":false}}"#
+            )))
+            .unwrap(),
+    )
+    .await;
+    assert!(st.is_success(), "{j}");
+    let t = wait_task(&s.app, j["task"]["id"].as_str().unwrap()).await;
+    assert_eq!(t["state"], "done", "{t}");
+    let (st, j) = json_of(
+        &s.app,
+        post("/$/vector/d/big/projection", r#"{"sample": 1}"#),
+    )
+    .await;
+    assert_eq!(st, StatusCode::INSUFFICIENT_STORAGE, "{j}");
 }

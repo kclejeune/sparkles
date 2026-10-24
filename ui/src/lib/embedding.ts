@@ -184,6 +184,11 @@ export function positions(points: Points, into = new Map<string, Pt>()): Map<str
   return into;
 }
 
+/** Drop the positions of entities that `ids` does not hold. */
+export function keepSelected(at: Map<string, Pt>, ids: ReadonlySet<string>): void {
+  for (const k of [...at.keys()]) if (!ids.has(k)) at.delete(k);
+}
+
 /**
  * The selected entities (term keys) in the order a VALUES block takes them: by distance
  * from the selection's centre, nearest first, so that a selection above the cap keeps its

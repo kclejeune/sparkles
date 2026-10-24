@@ -15,6 +15,7 @@
     byDistance,
     categories,
     densityCounts,
+    keepSelected,
     keyOf,
     lassoed,
     boxed,
@@ -344,6 +345,14 @@
    * out of the points drawn after a pan.
    */
   const selectedAt = new Map<string, Pt>();
+  // the positions follow the shared selection: entities it left out at its cap, cleared or
+  // took out elsewhere lose theirs
+  $effect(() => {
+    const ids = selection.ids;
+    untrack(() => {
+      keepSelected(selectedAt, ids);
+    });
+  });
   /** Counts the map's selections, so that a region's late answer cannot overwrite a newer one. */
   let selectRun = 0;
 

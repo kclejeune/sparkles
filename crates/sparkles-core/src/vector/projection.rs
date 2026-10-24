@@ -44,34 +44,59 @@ pub const NO_CLASS: u32 = u32::MAX;
 /// Bytes a projection keeps per entity: subject, position, class and priority.
 pub const BYTES_PER_POINT: u64 = 24;
 
+/// The sizes a projection's working memory depends on, for [`working_bytes`].
+#[derive(Clone, Copy, Debug, Default)]
+pub struct Work {
+    /// every vector projected: the base rows and those inserted since
+    pub rows: usize,
+    /// the vectors read from the snapshot's delta rather than the index file
+    pub inserted: usize,
+    pub dim: usize,
+    /// the vectors the PCA learns from, at most [`MAX_SAMPLE`]
+    pub sample: usize,
+    pub method: Option<ProjectionMethod>,
+    /// the bottom-layer links of a graph node, `2M`
+    pub links: usize,
+    /// the nodes of the graph's live layer, whose bottom layer the layout copies
+    pub live_nodes: usize,
+    /// the threads the parallel steps run on
+    pub threads: usize,
+}
+
 /// An upper bound of the bytes a projection's computation holds at once: the rows and
-/// their projections, the sample the PCA learns from, the points, and for the neighbour
-/// layout its edges and adjacency. `rows` counts every vector, `inserted` those read from
-/// the snapshot's delta rather than the index file, and `links` the bottom-layer links of
-/// a graph node.
-pub fn working_bytes(
-    rows: usize,
-    inserted: usize,
-    dim: usize,
-    sample: usize,
-    method: ProjectionMethod,
-    links: usize,
-) -> u64 {
-    let rows = rows as u64;
-    let dim = dim as u64;
+/// their projections, the sample the PCA learns from and its workspaces, the points, and
+/// for the neighbour layout the copy of the live layer, the edges and the adjacency.
+pub fn working_bytes(w: Work) -> u64 {
+    let rows = w.rows as u64;
+    let dim = w.dim as u64;
+    let threads = w.threads.max(1) as u64;
     // a row, its projection, its order, its point and its place among the base rows
     let per_row = 32 + 16 + 8 + 4 + 8;
     // a point's subject, sums, position, priority and class
     let per_point = 8 + 24 + 8 + 4 + 4;
+    let k = (BLOCK as u64).min(dim.max(1));
     let mut bytes = rows * (per_row + per_point)
-        + inserted as u64 * dim * 4
-        + (sample as u64).min(rows) * dim * 8;
-    if method == ProjectionMethod::Neighbours {
-        // an edge kept, both directions of the adjacency, and the layout's positions
-        bytes += rows * (links as u64 * (8 + 8) + 32);
+        + w.inserted as u64 * dim * 4
+        + (w.sample as u64).min(rows) * dim * 8
+        // the PCA's blocks of directions and the accumulators of its parallel folds, and a
+        // row's buffer per thread when every row is projected
+        + (2 * threads + 4) * k * dim * 8
+        + threads * dim * 8
+        + 64 * 64 * 8;
+    if w.method == Some(ProjectionMethod::Neighbours) {
+        let links = w.links as u64;
+        // the live layer's copy, an edge kept, both directions of the adjacency, and the
+        // layout's positions and grid
+        bytes += w.live_nodes as u64 * (16 + links * 4 + 24)
+            + rows * (links * (8 + 8) + 32)
+            + 512 * 512 * 12;
     }
     bytes
 }
+
+/// Called with the bytes a computation will hold before it allocates them: an error
+/// refuses the computation.
+pub type Admit<'a> = &'a (dyn Fn(u64) -> Result<()> + Sync);
 
 /// The bottom-layer neighbours of a graph node, written to the vector given.
 pub type Links<'a> = &'a (dyn Fn(u32, &mut Vec<u32>) + Sync);
@@ -145,6 +170,10 @@ impl Default for ProjectionConfig {
 pub struct Projection {
     pub index: String,
     pub method: ProjectionMethod,
+    /// the index's predicate and metric when it was projected: an index replaced under
+    /// the same name has others
+    pub predicate: String,
+    pub metric: Metric,
     /// the snapshot the projection read, whose dictionary names its subjects
     pub snapshot: Snapshot,
     /// vectors (rows) projected
@@ -418,6 +447,14 @@ pub fn project(
     Ok(Projection {
         index: name.to_string(),
         method: cfg.method,
+        predicate: snap
+            .term(Id(pred))
+            .map(|t| match t {
+                oxrdf::Term::NamedNode(n) => n.into_string(),
+                t => t.to_string(),
+            })
+            .unwrap_or_default(),
+        metric,
         snapshot: snap.clone(),
         vectors: n as u64,
         dimension: dim,

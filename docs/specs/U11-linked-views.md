@@ -686,16 +686,23 @@ the first `rdf:type` of an entity in the store's order.
 
 **Keeping projections.** The server keeps at most four projections and 1 GiB of them, the
 least recently used dropped first. The query memory pool pays for the computation before
-it starts, from an upper bound of its working memory that counts the rows, the sample, the
-points and, for the neighbour layout, the edges. In the request the request's admission
-grant is charged, and a task reserves a grant of its own that it hands to the kept
-projection, which gives back all of it but the projection's own bytes. The bytes are
-charged and not only granted, because the pool clamps a grant to its capacity, so a
-computation the pool cannot hold answers `507` before it reads a vector. A kept projection
+it allocates. The store computes an upper bound of the working memory from the same
+snapshot and build that the computation then reads, counting the rows, the sample, the
+PCA's blocks and fold accumulators per thread, the points and, for the neighbour layout,
+the copy of the live layer and the edges, and passes it to an admission callback. In the
+request the callback charges the request's admission grant, and the charge lives in the
+blocking worker, so it stays paid for while a computation whose client went away runs to
+its next cancellation check. A task waits in the pool's queue for a grant of its own,
+since it may start before the request that started it lets go of its admission grant, and
+hands that grant to the kept projection, which gives back all of it but the projection's
+own bytes. The bytes are charged and not only granted, because the pool clamps a grant to
+its capacity, so a computation larger than the pool answers `507` before it reads a
+vector. A kept projection
 and its grant are one shared value, so a reader still answering from a projection that was
 just replaced keeps its memory paid for until it is done. A projection is keyed by the
-dataset, the branch, the index and the method, and it also records the index's predicate,
-dimension and metric, so an index replaced under the same name forgets it. A projection takes 24
+dataset, the branch, the index and the method, and it also records the predicate,
+dimension and metric of the build it read, so an index replaced under the same name
+forgets it. PCA copies no part of the live layer, which only the neighbour layout reads. A projection takes 24
 bytes per entity, not the 12 the spec estimated, because each point keeps its subject's id
 and its sampling priority beside its coordinates and class, so ten million entities take
 about 230 MiB. That is memory spent so that a region and its sample are answered without a

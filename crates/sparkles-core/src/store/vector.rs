@@ -298,6 +298,7 @@ impl Store {
         &self,
         name: &str,
         cfg: &crate::vector::ProjectionConfig,
+        admit: crate::vector::projection::Admit<'_>,
         check: &(dyn Fn() -> Result<()> + Sync),
         progress: &(dyn Fn(f64) + Sync),
     ) -> Result<crate::vector::Projection> {
@@ -316,8 +317,35 @@ impl Store {
             )));
         };
         let graph = b.graph.clone();
-        // the live layer's bottom layer, copied so the layout holds no lock
-        let layer = graph.as_ref().map(|_| b.live.read().layer0());
+        let neighbours_wanted = cfg.method == crate::vector::ProjectionMethod::Neighbours;
+        // the memory the computation holds, admitted before it is allocated, from the
+        // same snapshot and build the computation reads
+        let pi = crate::index::Perm::Pso.index();
+        let inserted = snap.delta.ins[pi]
+            .range([pred, 0, 0, 0]..=[pred, u64::MAX, u64::MAX, u64::MAX])
+            .count();
+        admit(crate::vector::projection::working_bytes(
+            crate::vector::projection::Work {
+                rows: b.segment.rows() + inserted,
+                inserted,
+                dim: b.segment.dim,
+                sample: cfg.sample,
+                method: Some(cfg.method),
+                links: graph.as_ref().map_or(0, |g| 2 * g.m),
+                live_nodes: if neighbours_wanted {
+                    b.live.read().nodes()
+                } else {
+                    0
+                },
+                threads: rayon::current_num_threads(),
+            },
+        ))?;
+        // the live layer's bottom layer, copied for the neighbour layout only, so that the
+        // layout holds no lock
+        let layer = graph
+            .as_ref()
+            .filter(|_| neighbours_wanted)
+            .map(|_| b.live.read().layer0());
         let links = match (graph.as_ref(), layer.as_ref()) {
             (Some(g), Some(l)) => Some(move |x: u32, out: &mut Vec<u32>| l.links(g, x, out)),
             _ => None,

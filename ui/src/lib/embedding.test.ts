@@ -5,6 +5,7 @@ import {
   categories,
   densityCounts,
   inPolygon,
+  keepSelected,
   keyOf,
   lassoed,
   MAX_CATEGORIES,
@@ -164,6 +165,17 @@ describe('byDistance', () => {
     expect(byDistance(ids, at).ordered[0]).toBe('<http://ex/core>');
     // without the fetched position the core falls behind the drawn points
     expect(byDistance(ids, drawn).ordered.at(-1)).toBe('<http://ex/core>');
+  });
+
+  it('keeps only the positions of selected entities', () => {
+    const at = new Map([
+      ['<a>', { x: 0, y: 0 }],
+      ['<b>', { x: 1, y: 1 }],
+    ]);
+    keepSelected(at, new Set(['<b>']));
+    expect([...at.keys()]).toEqual(['<b>']);
+    keepSelected(at, new Set());
+    expect(at.size).toBe(0);
   });
 
   it('keys IRIs and blank nodes as the selection does', () => {
