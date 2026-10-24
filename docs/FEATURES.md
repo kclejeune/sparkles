@@ -1680,15 +1680,15 @@ links each item to its design spec.
 
 ### AI and agents
 
-* Ask has been evaluated on the demo set and CK25, with 59 and 49 questions, which is too
-  few to separate models that differ by a few questions
+* Ask has been evaluated with Anthropic models only, on the demo set, CK25, QALD-9-plus
+  and 74 DBpedia-only questions
   ([C18](specs/C18-natural-language-questions-and-ingest.md#roadmap-follow-ups-2026-10-12),
-  [BENCHMARKS.md](BENCHMARKS.md)). The evaluation cannot answer the pipeline's
-  clarification questions, which cost every model seven CK25 questions. Most DBpedia
-  questions stop at a clarification, because `link_entities` offers a category or a
-  namesake beside the main resource. The harness converts QALD-9-plus, Text2SPARQL'25 and
-  LC-QuAD 2.0, and LC-QuAD 2.0 needs a Wikidata load from the full dump. Independent-role
-  evaluation has not run. Roadmap item 6.
+  [BENCHMARKS.md](BENCHMARKS.md#natural-language-questions)). On DBpedia the best model
+  answers 40 of 107 QALD-9-plus questions. Most DBpedia questions stop at a
+  clarification, because `link_entities` offers a category or a namesake beside the main
+  resource, and the grounding seldom lists the predicate a question needs, roadmap item
+  263. Local and OpenAI-compatible models, LC-QuAD 2.0, which needs a Wikidata load from
+  the full dump, and an evaluation of independent roles have not run. Roadmap item 6.
 * The UI's ingestion controls do not turn on assistant ingestion. Roadmap item 77.
 * An MCP tool operation that needs admin, such as deleting a protected branch, refuses an
   OAuth token without `sparkles:admin` as a tool error instead of a scope challenge.
@@ -1707,10 +1707,12 @@ links each item to its design spec.
   imported memory to personal notes, decisions and tasks with evidence, dependency and
   validity semantics. Roadmap item 81.
 * A dataset has one GraphRAG configuration, so readers with different views cannot each
-  have reports built from their own view, roadmap item 100. Global answering has not been
-  evaluated against local answers and text retrieval, an automatic refresh counts changes
-  from the change feed rather than from an incremental view, and the byte bound's default
-  allowances are unmeasured, item 12.
+  have reports built from their own view, roadmap item 100. The evaluation of global
+  answering covers one generated question set on the demo graph, compares it with BM25
+  rather than vector retrieval and has no samples checked by a person, items 260 and 261.
+  `auto` mode answers about half of the questions about the whole graph locally, item
+  262. An automatic refresh counts changes from the change feed rather than from an
+  incremental view, item 12.
 
 ### Web UI
 
