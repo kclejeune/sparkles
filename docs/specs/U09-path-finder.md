@@ -392,7 +392,7 @@ the weighted pair search now takes 3.5 ms on the 10.5M-triple data and the five 
 paths 69 ms. The panel always sends `path:maxLength`, so its weighted shortest search lists
 paths by cost until one is short enough. It answers quickly when the cheapest path is
 within the limit, and a pair whose short paths are all dear still runs to the panel's
-limit of a million visits, which ROADMAP item 240 addresses.
+limit of a million visits, which ROADMAP item 275 addresses.
 
 **Phase 3 decisions.** The spec left these open, and each was decided here. The weight
 picker offers reifier properties only, with no free IRI field, since a weight that no

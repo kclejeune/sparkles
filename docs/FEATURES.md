@@ -1517,10 +1517,10 @@ links each item to its design spec.
 * A weighted shortest search with `path:maxLength` lists paths in order of cost until one
   is short enough, so a pair whose short paths are all dear runs until the visit limit.
   The UI's path finder always sends a length limit and stops at a million visits. Roadmap
-  item 240.
+  item 275.
 * Weighted `path:allShortest` without `path:maxLength`, cycles through the source and
   weighted searches to several targets run Dijkstra's algorithm from the source alone. Every cheapest path of one pair
-  takes 0.9 s on the 10.5M-triple benchmark data. Roadmap item 242.
+  takes 0.9 s on the 10.5M-triple benchmark data. Roadmap item 277.
 * Graph algorithms match the Graphalytics reference outputs for BFS, WCC and PageRank on
   the two small official example graphs, through `scripts/graphalytics-reference.py`.
   There is no full Graphalytics driver, no run on the larger datasets, no reference check

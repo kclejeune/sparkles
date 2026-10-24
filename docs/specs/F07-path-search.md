@@ -715,7 +715,7 @@ searches to several or unbound targets still run from the source alone. With wei
 `path:maxLength`, `path:shortest` and `path:allShortest` list paths by Yen's algorithm in
 order of cost until they pass the cheapest short enough, so their spur searches now run
 from both ends. A pair with no path short enough still runs until the
-visit limit, which item 240 addresses with a search bounded by the length.
+visit limit, which item 275 addresses with a search bounded by the length.
 
 The search adds weights in double-double arithmetic, where a cost is the sum of two
 doubles, so that a path's cost is the same to about 2^-106 of its value from either end. A
@@ -741,5 +741,5 @@ data, a weighted pair search went from 820 ms to 3.5 ms with every edge weighing
 the limit of 10 million visited nodes, and they now take 69 ms and 656 ms.
 [BENCHMARKS](../BENCHMARKS.md#weighted-pair-searches) has the figures. The unweighted pair,
 k-shortest and `VALUES` searches measured 3 to 4% slower in every round, and weighted
-`path:allShortest` 2.3% slower, although the change does not touch their searches. Item 241
-looks for the cause, and item 242 would run weighted `path:allShortest` from both ends.
+`path:allShortest` 2.3% slower, although the change does not touch their searches. Item 276
+looks for the cause, and item 277 would run weighted `path:allShortest` from both ends.
