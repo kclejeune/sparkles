@@ -394,3 +394,89 @@ fn templates_read_the_target_database_with_lookup() {
     );
     assert!(err(&o).contains("--loc"), "{}", err(&o));
 }
+
+#[cfg(feature = "auth")]
+#[test]
+fn stored_mappings_on_a_server() {
+    use std::process::{Child, Stdio};
+    use std::time::{Duration, Instant};
+    struct Server(Child);
+    impl Drop for Server {
+        fn drop(&mut self) {
+            let _ = self.0.kill();
+            let _ = self.0.wait();
+        }
+    }
+    let dir = setup();
+    let d = dir.path();
+    let port = std::net::TcpListener::bind("127.0.0.1:0")
+        .unwrap()
+        .local_addr()
+        .unwrap()
+        .port();
+    let mut server = Server(
+        Command::new(BIN)
+            .current_dir(d)
+            .args([
+                "serve",
+                "--host",
+                "127.0.0.1",
+                "--port",
+                &port.to_string(),
+                "--data",
+                "data",
+            ])
+            .env_remove("SPARKLES_AUTH_CONFIG")
+            .env_remove("SPARKLES_BACKUP_CONFIG")
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .unwrap(),
+    );
+    let start = Instant::now();
+    while std::net::TcpStream::connect(("127.0.0.1", port)).is_err() {
+        assert!(server.0.try_wait().unwrap().is_none(), "server exited");
+        assert!(
+            start.elapsed() < Duration::from_secs(30),
+            "server did not start"
+        );
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    let url = format!("http://127.0.0.1:{port}");
+    expect(d, &["dataset", "create", "ds", "--server", &url], 0);
+    let at = ["--server", url.as_str(), "--dataset", "ds"];
+    let with = |args: &[&'static str]| -> Vec<String> {
+        args.iter()
+            .map(|s| s.to_string())
+            .chain(at.iter().map(|s| s.to_string()))
+            .collect()
+    };
+    let run = |args: Vec<String>, code: i32| {
+        let a: Vec<&str> = args.iter().map(String::as_str).collect();
+        expect(d, &a, code)
+    };
+    let o = run(
+        with(&["map", "put", "people", "map.yml", "--message", "first café"]),
+        0,
+    );
+    assert!(out(&o).contains("version 1"), "{}", out(&o));
+    let o = run(with(&["map", "list"]), 0);
+    assert!(out(&o).contains("people  v1  yarrrml"), "{}", out(&o));
+    let o = run(with(&["map", "get", "people"]), 0);
+    assert_eq!(out(&o), YARRRML);
+    let o = run(
+        with(&[
+            "map",
+            "run",
+            "people",
+            "--source",
+            "people.csv=people.csv",
+            "--source",
+            "cities.csv=cities.csv",
+        ]),
+        0,
+    );
+    assert!(out(&o).contains("\"quads\": 8"), "{}", out(&o));
+    run(with(&["map", "delete", "people"]), 0);
+    run(with(&["map", "get", "people"]), 1);
+}

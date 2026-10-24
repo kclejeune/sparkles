@@ -587,6 +587,7 @@ pub const SETTINGS: &[SettingsFile] = &[
     server("models.json", 1),
     server("notifications.json", 1),
     server("notifications-state.json", 1),
+    server("connections.json", 1),
     server("tokens.json", 1),
     server("sessions.json", 1),
     server("device-grants.json", 1),

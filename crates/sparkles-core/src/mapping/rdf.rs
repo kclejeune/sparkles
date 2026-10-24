@@ -112,15 +112,19 @@ impl G {
     }
 }
 
+/// The base that resolves the relative IRIs of a mapping text without one, such as the
+/// `<#TriplesMap1>` names of R2RML examples, for stored and uploaded mappings.
+pub const TEXT_BASE: &str = "urn:x-sparkles:mapping";
+
 /// Parse an R2RML or RML mapping in Turtle (N-Triples is Turtle). `base` resolves the
-/// mapping's relative IRIs.
+/// mapping's relative IRIs, and [`TEXT_BASE`] does without one. Only the document's own
+/// `@base` becomes the base of generated IRIs, since the place a mapping file is kept
+/// says nothing about the IRIs it makes.
 pub fn parse(text: &str, base: Option<&str>) -> Result<Mapping> {
-    let mut parser = TurtleParser::new();
-    if let Some(b) = base {
-        parser = parser
-            .with_base_iri(b)
-            .map_err(|e| Error::invalid(format!("the mapping's base {b:?}: {e}")))?;
-    }
+    let given = base.unwrap_or(TEXT_BASE);
+    let parser = TurtleParser::new()
+        .with_base_iri(given)
+        .map_err(|e| Error::invalid(format!("the mapping's base {given:?}: {e}")))?;
     let mut reader = parser.for_slice(text);
     let mut idx: Index = HashMap::new();
     let mut order: Vec<NamedOrBlankNode> = Vec::new();
@@ -136,7 +140,10 @@ pub fn parse(text: &str, base: Option<&str>) -> Result<Mapping> {
         .prefixes()
         .map(|(p, ns)| (p.to_string(), ns.to_string()))
         .collect();
-    let doc_base = reader.base_iri().map(str::to_string);
+    let doc_base = reader
+        .base_iri()
+        .filter(|b| *b != given)
+        .map(str::to_string);
     let (mut core, mut legacy, mut io) = (false, false, false);
     for props in idx.values() {
         for (p, _) in props {

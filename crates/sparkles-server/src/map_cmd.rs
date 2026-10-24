@@ -652,7 +652,10 @@ fn remote_put(
         .header("content-type", kind.media_type())
         .header("accept", "application/json");
     if let Some(m) = message {
-        req = req.header("sparkles-commit-message", enc(m));
+        req = req.header(
+            "sparkles-commit-message",
+            crate::remote::client::message_header(m),
+        );
     }
     let j = r
         .check(req.body(text.to_string()).send(), Some(ds))?
@@ -785,7 +788,10 @@ fn remote_run(
         .req(reqwest::Method::POST, &path)
         .header("accept", "application/json");
     if let Some(m) = message {
-        req = req.header("sparkles-commit-message", enc(m));
+        req = req.header(
+            "sparkles-commit-message",
+            crate::remote::client::message_header(m),
+        );
     }
     let req = if inputs.source.is_empty() {
         req

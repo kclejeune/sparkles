@@ -8,6 +8,10 @@
 
 #[cfg(feature = "mapping-sqlite")]
 pub mod draft;
+/// The SQLite binding, for tests of other crates that build databases to map.
+#[cfg(feature = "mapping-sqlite")]
+#[doc(hidden)]
+pub use rusqlite;
 pub mod exec;
 pub mod functions;
 pub mod jsonpath;

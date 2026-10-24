@@ -84,6 +84,10 @@ fn s() -> J {
     json!({ "type": "string" })
 }
 
+fn str_enum(values: &[&str]) -> J {
+    json!({ "type": "string", "enum": values })
+}
+
 fn int() -> J {
     json!({ "type": "integer" })
 }
@@ -260,12 +264,17 @@ pub(super) fn shared_responses() -> Map<String, J> {
 /// The shared request bodies of `components.requestBodies`.
 pub(super) fn shared_bodies() -> Map<String, J> {
     let mut m = Map::new();
+    let mut rdf_and_tables = rdf_in();
+    if let Some(m) = rdf_and_tables.as_object_mut() {
+        m.insert("text/csv".into(), text());
+        m.insert("text/tab-separated-values".into(), text());
+    }
     m.insert(
         "RdfData".into(),
         json!({
             "required": true,
-            "description": "RDF data in the syntax its `Content-Type` names. Jena's N3 media types are read as Turtle.",
-            "content": rdf_in(),
+            "description": "RDF data in the syntax its `Content-Type` names. Jena's N3 media types are read as Turtle. A `text/csv` or `text/tab-separated-values` body is a table that `mapping` or `base` maps into the graph.",
+            "content": rdf_and_tables,
         }),
     );
     m.insert(
@@ -284,6 +293,45 @@ pub(super) fn shared_bodies() -> Map<String, J> {
 
 fn write_errors(o: Op) -> Op {
     o.errors(&[400, 408, 412, 413, 415, 422, 503, 507])
+}
+
+/// The parameters of a Graph Store write whose body is a CSV or TSV table (F19 §2.3).
+fn table_params(o: Op) -> Op {
+    o.query(
+        "mapping",
+        s(),
+        "A CSV or TSV body: the stored mapping that maps it.",
+    )
+    .query(
+        "base",
+        s(),
+        "A CSV or TSV body: the default mapping's namespace.",
+    )
+    .query(
+        "key",
+        s(),
+        "A CSV or TSV body: the column that names each row in the default mapping.",
+    )
+    .query(
+        "source",
+        s(),
+        "A CSV or TSV body: the file name the mapping reads it as, when the mapping reads several.",
+    )
+    .query(
+        "csvwMode",
+        str_enum(&["minimal", "standard"]),
+        "A CSVW mapping: standard mode adds the table group, table and row descriptions.",
+    )
+    .query(
+        "csvwCheck",
+        str_enum(&["keys", "none"]),
+        "A CSVW mapping: check primary and foreign keys (the default in standard mode).",
+    )
+    .query(
+        "lookup",
+        boolean(),
+        "A CONSTRUCT template: read the dataset's head while mapping.",
+    )
 }
 
 /// The Graph Store operations of one route, with operation ids `{prefix}Get` and so on.
@@ -327,6 +375,7 @@ fn graph_store(p: &mut Paths, route: &'static str, prefix: &str, methods: &[Meth
                 .see("per-dataset-sparql-protocol-fuseki-compatible")
                 .params(&["ifMatch", "ifNoneMatch"])
                 .body_ref("RdfData");
+                let o = table_params(o);
                 let o = write_ok(selector(o), "200").resp("201", "The graph was created.", None);
                 write_errors(write_params(o))
             }
@@ -341,6 +390,7 @@ fn graph_store(p: &mut Paths, route: &'static str, prefix: &str, methods: &[Meth
                 .see("per-dataset-sparql-protocol-fuseki-compatible")
                 .params(&["ifMatch", "ifNoneMatch"])
                 .body_ref("RdfData");
+                let o = table_params(o);
                 let o = write_ok(selector(o), "200").resp("201", "The graph was created.", None);
                 write_errors(write_params(o))
             }
@@ -352,8 +402,15 @@ fn graph_store(p: &mut Paths, route: &'static str, prefix: &str, methods: &[Meth
                     "Graph Store",
                     "Delete a graph",
                 )
+                .doc("Deletes the graph. With a `text/csv` or `text/tab-separated-values` body and `mapping` or `base`, removes the mapped triples from the graph instead.")
                 .see("per-dataset-sparql-protocol-fuseki-compatible")
-                .params(&["ifMatch", "ifNoneMatch"]);
+                .params(&["ifMatch", "ifNoneMatch"])
+                .body(
+                    false,
+                    "A table whose mapped triples are removed.",
+                    json!({ "text/csv": text(), "text/tab-separated-values": text() }),
+                );
+                let o = table_params(o);
                 let o = write_ok(selector(o), "200").resp("204", "The graph was deleted.", None);
                 write_errors(write_params(o))
             }
@@ -425,6 +482,7 @@ pub(super) fn add_all(p: &mut Paths) {
     forms(p);
     admin(p);
     queries(p);
+    mappings(p);
     algorithms(p);
     graphql(p);
     history(p);
@@ -1413,6 +1471,117 @@ fn queries(p: &mut Paths) {
             .errors(&[400, 408, 507]),
         );
     }
+}
+
+fn mappings(p: &mut Paths) {
+    let text_kinds = || {
+        json!({
+            "text/turtle": text(),
+            "application/yaml": text(),
+            "application/csvm+json": text(),
+            "application/sparql-query": text(),
+        })
+    };
+    p.add(
+        op(
+            GET,
+            "/$/mappings/{ds}",
+            "listStoredMappings",
+            "Stored mappings",
+            "List stored mappings",
+        )
+        .see("stored-mappings")
+        .json(
+            "200",
+            "The mappings without their text.",
+            "StoredMappingList",
+        ),
+    );
+    p.add(
+        op(GET, "/$/mappings/{ds}/{name}", "getStoredMapping", "Stored mappings", "Get a stored mapping")
+            .doc("The mapping with its text and metadata, or the text alone when `Accept` names the kind's media type.")
+            .see("stored-mappings")
+            .query("version", int(), "An older version, while it is kept.")
+            .resp_h(
+                "200",
+                "The mapping.",
+                Some({
+                    let mut c = text_kinds();
+                    c["application/json"] = json!({ "schema": sref("StoredMapping") });
+                    c
+                }),
+                json!({ "ETag": { "description": "`\"v<N>\"`", "schema": { "type": "string" } } }),
+            )
+            .errors(&[404]),
+    );
+    p.add(
+        op(PUT, "/$/mappings/{ds}/{name}", "putStoredMapping", "Stored mappings", "Store a mapping")
+            .doc("Stores the mapping text as the next version, after parsing and checking it. `Content-Type` names the kind: `text/turtle` for R2RML and RML, `application/yaml` for YARRRML, `application/csvm+json` for CSVW metadata and `application/sparql-query` for a CONSTRUCT template. A connection the server does not declare is a warning. `If-Match: \"v<N>\"` stores only over version N, and `If-None-Match: *` only when the mapping does not exist.")
+            .see("stored-mappings")
+            .params(&["ifMatch", "ifNoneMatch", "commitMessage"])
+            .query("kind", str_enum(&["rml", "yarrrml", "csvw", "template"]), "The kind, instead of the media type.")
+            .query("description", s(), "A description of at most 1024 bytes.")
+            .body(true, "The mapping text.", text_kinds())
+            .json("200", "Stored as a new version, or unchanged (`changed: false`).", "StoredMapping")
+            .json("201", "Created.", "StoredMapping")
+            .errors(&[400, 409, 412, 415]),
+    );
+    p.add(
+        op(
+            DELETE,
+            "/$/mappings/{ds}/{name}",
+            "deleteStoredMapping",
+            "Stored mappings",
+            "Delete a stored mapping",
+        )
+        .see("stored-mappings")
+        .param("ifMatch")
+        .no_content("Deleted with its versions.")
+        .errors(&[404, 412]),
+    );
+    p.add(
+        op(
+            GET,
+            "/$/mappings/{ds}/{name}/versions",
+            "listStoredMappingVersions",
+            "Stored mappings",
+            "List the versions of a stored mapping",
+        )
+        .see("stored-mappings")
+        .json(
+            "200",
+            "The kept versions, newest first.",
+            "StoredMappingVersions",
+        )
+        .errors(&[404]),
+    );
+    let o = op(POST, "/{ds}/mappings/{name}/run", "runStoredMapping", "Stored mappings", "Run a stored mapping")
+        .doc("Runs the mapping over the file parts its sources name and the server's connections, and commits once. `mode=replace` replaces the constant graphs the mapping writes in that commit, and is `400` with code `mapping-graphs-unknown` for a template graph map. The commit message defaults to `mapping NAME (version V)`, and the mapping records the run.")
+        .see("stored-mappings")
+        .query("mode", str_enum(&["add", "replace"]), "Add the triples (the default), or replace the graphs the mapping writes.")
+        .query("version", int(), "Run an older version.")
+        .query("graph", s(), "Write every triple into this graph. A mapping whose graph maps name another graph is `400` with code `mapping-graph-conflict`.")
+        .query("base", s(), "The base IRI of generated relative IRIs.")
+        .query("lookup", boolean(), "A CONSTRUCT template: read the dataset's head while mapping.")
+        .query("csvwMode", str_enum(&["minimal", "standard"]), "A CSVW mapping: standard mode.")
+        .query("csvwCheck", str_enum(&["keys", "none"]), "A CSVW mapping: check primary and foreign keys.")
+        .params(&["ifMatch"])
+        .body(
+            false,
+            "The files the mapping reads, each a part whose file name is the one the mapping names.",
+            json!({ "multipart/form-data": { "schema": {
+                "type": "object",
+                "additionalProperties": true,
+                "properties": { "file": { "type": "array", "items": { "type": "string", "contentMediaType": "application/octet-stream" } } },
+            } } }),
+        );
+    let mut o = write_params(o).json(
+        "200",
+        "The run's counts, with the commit receipt when asked for.",
+        "MappingRun",
+    );
+    o = write_errors(o);
+    p.add(o.errors(&[404]));
 }
 
 fn graphql_response() -> J {
@@ -3899,11 +4068,18 @@ fn protocol(p: &mut Paths) {
     );
     graph_store(p, "/{ds}/get", "gspRead", &[GET, HEAD], false);
     let o = op(POST, "/{ds}/upload", "upload", "Graph Store", "Upload files")
-        .doc("A multipart upload of RDF files, and CSV or TSV tables mapped to triples, in one commit. The format comes from each file name or content type. A plain `text/csv` or `text/tab-separated-values` body is one table.")
+        .doc("A multipart upload of RDF files, CSV or TSV tables mapped to triples, and the files an R2RML, RML or YARRRML mapping reads, in one commit. The format comes from each file name or content type. A plain `text/csv` or `text/tab-separated-values` body is one table. A mapping file source without its part is `400` with code `mapping-source-missing`.")
         .see("csv-and-tsv-uploads")
         .query("graph", s(), "The target graph.")
         .query("base", s(), "The default mapping's namespace for tables.")
         .query("key", s(), "The column that names each row in the default mapping.")
+        .query("mapping", s(), "A stored mapping to use instead of a `mapping` part.")
+        .query("mappingVersion", int(), "The stored mapping's version (the latest by default).")
+        .query("mappingKind", str_enum(&["rml", "yarrrml", "csvw", "template"]), "The kind of the `mapping` part when its content does not tell.")
+        .query("csvwMode", str_enum(&["minimal", "standard"]), "A CSVW mapping: standard mode adds the table group, table and row descriptions.")
+        .query("csvwCheck", str_enum(&["keys", "none"]), "A CSVW mapping: check primary and foreign keys (the default in standard mode).")
+        .query("lookup", boolean(), "A CONSTRUCT template: read the dataset's head while mapping. The report gives `lookupCommit`, and `If-Match` makes the commit fail when the head moved.")
+        .param("ifMatch")
         .body(
             true,
             "The files.",
@@ -3914,7 +4090,7 @@ fn protocol(p: &mut Paths) {
                     "properties": {
                         "file": { "type": "array", "items": { "type": "string", "contentMediaType": "application/octet-stream" } },
                         "graph": { "type": "string" },
-                        "mapping": { "type": "string", "description": "A CSVW metadata document." },
+                        "mapping": { "type": "string", "description": "CSVW metadata, an R2RML, RML or YARRRML mapping, or a CONSTRUCT template. The file parts its sources name are read by it." },
                         "template": { "type": "string", "description": "A SPARQL CONSTRUCT template for tables." },
                     },
                 } },
