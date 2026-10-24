@@ -212,7 +212,7 @@ test('a merge with conflicts opens the merge page, and merges nothing on its own
   await expect(conflicts).toContainText('"150"^^');
   await expect(page.getByRole('button', { name: 'Merge into main' })).toBeDisabled();
   const origin = new URL(page.url()).origin;
-  await page.getByText('The same from the command line').click();
+  await page.getByText('Command line equivalent').click();
   await expect(page.locator('details.cli')).toContainText(
     `sparkles merge --server ${origin} --dataset ledger clash --into main --on-conflict theirs`,
   );

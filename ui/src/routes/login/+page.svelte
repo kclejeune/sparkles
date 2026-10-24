@@ -56,7 +56,7 @@
 
 <AuthCard title="Sign in">
   {#snippet subtitle()}
-    to use the datasets of this server
+    to use this server's datasets
   {/snippet}
 
   {#if urlError}<div class="error-box" role="alert">{urlError}</div>{/if}

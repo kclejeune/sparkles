@@ -704,8 +704,8 @@
     <div class="group" role="group" aria-label="Move through commits">
       <button
         class="btn ghost icon sm"
-        title="Oldest readable commit (Home)"
-        aria-label="Oldest readable commit"
+        title="Oldest available commit (Home)"
+        aria-label="Oldest available commit"
         disabled={oneCommit}
         onclick={() => moveTo(compare ? 'left' : 'right', first(track), true)}
         ><Icon name="skipBack" size={13} /></button
@@ -728,8 +728,8 @@
       >
       <button
         class="btn ghost icon sm"
-        title="Head (End)"
-        aria-label="Head"
+        title="Latest commit (End)"
+        aria-label="Latest commit"
         disabled={oneCommit}
         onclick={() => moveTo('right', track.head, true)}
         ><Icon name="skipForward" size={13} /></button
@@ -760,7 +760,7 @@
       <select
         class="select sm"
         aria-label="Play mode"
-        title="Read the view again at each commit, or apply each commit's changes (a time-lapse)"
+        title="Reload the view at each commit, or apply each commit's changes as a time-lapse"
         bind:value={playMode}
       >
         <option value="reread">Re-read</option>
@@ -788,7 +788,7 @@
         {#each branches as b (b)}<option value={b}>head of {b}</option>{/each}
       </select>
     {/if}
-    <span class="faint small branch mono" title="The branch the view reads">{ds}</span>
+    <span class="faint small branch mono" title="Branch">{ds}</span>
     <span class="spacer"></span>
     <select
       class="select sm"
@@ -816,14 +816,14 @@
     {#if canFollow && !given}
       <label
         class="check small"
-        title="Re-read the view when a commit is made, while it rests on the head"
+        title="Refresh the view on each new commit while it shows the latest one"
       >
         <input type="checkbox" bind:checked={follow} /> Follow
       </label>
     {/if}
     <button
       class="btn ghost icon sm"
-      title="Read the commits again"
+      title="Reload commits"
       aria-label="Refresh"
       disabled={loading}
       onclick={() => (given ? emit() : load().then(emit))}
@@ -832,14 +832,14 @@
     </button>
     <button
       class="btn ghost icon sm"
-      title="Close and read the head (Esc)"
+      title="Close and return to the latest commit (Esc)"
       aria-label="Close the time slider"
       onclick={close}><Icon name="x" size={13} /></button
     >
   </div>
 
   {#if loadError}
-    <div class="note error-text">Could not read the commits. {loadError}</div>
+    <div class="note error-text">Could not load the commits. {loadError}</div>
   {:else if noPast}
     <div class="note">
       Past states of this in-memory dataset are not kept. Set a retention window or pin snapshots in

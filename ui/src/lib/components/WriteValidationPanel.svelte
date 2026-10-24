@@ -165,7 +165,7 @@
     {:else if !loaded}
       <p class="faint"><span class="spinner"></span> Loading…</p>
     {:else if loaded.kind === 'unsupported'}
-      <p class="faint">This server does not offer write-time validation.</p>
+      <p class="faint">This server does not support write-time validation.</p>
     {:else if loaded.kind === 'off'}
       <p class="faint">
         Writes are not validated.{#if canEdit}

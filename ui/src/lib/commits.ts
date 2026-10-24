@@ -80,13 +80,9 @@ export function historyNotes(
 ): string[] {
   const out: string[] = [];
   if (page.firstRetained > 0 && oldestShown != null && oldestShown <= page.firstRetained)
-    out.push(
-      `Commits before ${page.firstRetained} are no longer retained; history starts at commit ${page.firstRetained}.`,
-    );
+    out.push(`History starts at commit ${page.firstRetained}. Older commits are no longer kept.`);
   if (!page.complete)
-    out.push(
-      'The commit catalog is behind the write-ahead log after a write error, so the newest commits may be missing.',
-    );
+    out.push('After a write error, the newest commits may be missing from this list.');
   return out;
 }
 

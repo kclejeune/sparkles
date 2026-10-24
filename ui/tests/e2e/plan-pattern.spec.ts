@@ -116,7 +116,7 @@ anonymous(
     expect(edge[1]).toMatch(/^rows \d+$/);
     expect(edge[2]).toBe(false);
     await expect(ran(page).getByTestId('plan-bar')).toContainText(
-      'Estimates are hidden from your view.',
+      'Row estimates are hidden because your access is restricted.',
     );
   },
 );

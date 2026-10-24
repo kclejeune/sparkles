@@ -80,7 +80,7 @@
     busy[p.name] = true;
     try {
       const t = await b.runPolicy(p.name);
-      toasts.push('info', `Running ${p.name}`, `Task ${t.id}; the schedule is unchanged`);
+      toasts.push('info', `Running ${p.name}`, `Task ${t.id}. The schedule is unchanged.`);
       onstarted?.(t);
       await load();
     } catch (e) {
@@ -93,7 +93,7 @@
   async function remove(p: b.Policy) {
     if (
       !confirm(
-        `Delete the policy ${p.name}? Its backups stay; retention no longer applies to them.`,
+        `Delete the policy ${p.name}? Its backups are kept, but retention no longer applies to them.`,
       )
     )
       return;
@@ -126,7 +126,8 @@
     try {
       const r = await b.applyRetention(p.name, false);
       toasts.push('success', `Retention of ${p.name}: deleted ${r.delete.length}`);
-      if (r.errors?.length) toasts.push('error', 'Some deletions failed', r.errors.join('; '));
+      if (r.errors?.length)
+        toasts.push('error', 'Could not delete some backups', r.errors.join('; '));
       retention = null;
       await load();
     } catch (e) {
@@ -236,7 +237,7 @@
                   class="btn sm"
                   onclick={() => run(p)}
                   disabled={readOnly || busy[p.name]}
-                  title={readOnly ? 'The server is read-only: policies do not run' : undefined}
+                  title={readOnly ? 'Policies do not run while the server is read-only' : undefined}
                   >Run now</button
                 >
                 <button class="btn sm" onclick={() => previewRetention(p)}>Retention</button>
@@ -308,7 +309,7 @@
           {/each}
         </ul>
       {:else}
-        <p class="faint small">Nothing: every backup is within the rules.</p>
+        <p class="faint small">Nothing to delete. Every backup is within the retention rules.</p>
       {/if}
       <h3>Keeps <span class="faint">{r.keep.length}</span></h3>
       <ul class="list keep">

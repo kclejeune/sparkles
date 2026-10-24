@@ -864,7 +864,7 @@ export function checkTerm(text: string, role: 's' | 'p' | 'o'): string {
         t === 'false'));
   if (!ok) {
     const what = role === 's' ? 'subject' : role === 'p' ? 'predicate' : 'object';
-    throw new EditError(`"${t}" is not a ${what} the builder writes`);
+    throw new EditError(`"${t}" cannot be used as a ${what}`);
   }
   return t;
 }
@@ -1054,7 +1054,7 @@ export function edit(text: string, p: PatternOk, e: Edit): Change[] {
     return changes;
   }
   const placed = resolveEdit(p, e.edge);
-  if (!placed) throw new EditError('The pattern changed, select the edge again');
+  if (!placed) throw new EditError('The pattern changed. Select the edge again');
   const { triple, path } = placed;
   const g = path[path.length - 1];
   const removal = removalRange(text, placed);

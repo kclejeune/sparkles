@@ -129,11 +129,11 @@
     store: async (name: string, key: string) => {
       try {
         await putSecret(name, key);
-        toasts.push('success', `Stored a new key for ${name}`);
+        toasts.push('success', `Saved a new key for ${name}`);
         await loadStatus();
         return true;
       } catch (e) {
-        toasts.error(`The key for ${name} was not stored`, e);
+        toasts.error(`Could not save the key for ${name}`, e);
         return false;
       }
     },
@@ -190,8 +190,8 @@
         await loadKind();
         toasts.push(
           'info',
-          'Someone else changed the model configuration',
-          'The section shows their version now. Make your change again.',
+          'The model configuration changed elsewhere',
+          'It now shows the latest version. Make your change again.',
         );
       } else toasts.error(failed, e);
       return false;
@@ -247,7 +247,7 @@
     addError = null;
     const name = addName.trim();
     if (
-      await write(`Added provider ${name}`, `Provider ${name} was not added`, (etag) =>
+      await write(`Added provider ${name}`, `Could not add provider ${name}`, (etag) =>
         patchKind(MODELS_URL, r.patch, etag),
       )
     ) {
@@ -259,8 +259,10 @@
   async function confirmRemoveProvider() {
     const name = removeProvider;
     if (!name) return;
-    const ok = await write(`Removed provider ${name}`, `Provider ${name} was not removed`, (etag) =>
-      patchKind(MODELS_URL, { providers: { [name]: null } }, etag),
+    const ok = await write(
+      `Removed provider ${name}`,
+      `Could not remove provider ${name}`,
+      (etag) => patchKind(MODELS_URL, { providers: { [name]: null } }, etag),
     );
     if (ok) removeProvider = null;
   }
@@ -268,7 +270,7 @@
   function restoreProvider(path: string, name: string) {
     void write(
       `Provider ${name} uses the server config again`,
-      `Provider ${name} was not restored`,
+      `Could not restore provider ${name}`,
       (etag) => resetKind(MODELS_URL, path, etag),
     );
   }
@@ -289,11 +291,11 @@
     busy = true;
     try {
       await putSecret(name, input.value);
-      toasts.push('success', `Stored a new key for ${name}`);
+      toasts.push('success', `Saved a new key for ${name}`);
       replacing = null;
       await loadStatus();
     } catch (err) {
-      toasts.error(`The key for ${name} was not stored`, err);
+      toasts.error(`Could not save the key for ${name}`, err);
     } finally {
       input.value = '';
       form.reset();
@@ -311,12 +313,12 @@
         'success',
         s.declared
           ? `${s.name} uses the server config's key again`
-          : `Removed the stored key of ${s.name}`,
+          : `Removed the stored key for ${s.name}`,
       );
       removeSecret = null;
       await loadStatus();
     } catch (e) {
-      toasts.error(`The key of ${s.name} was not removed`, e);
+      toasts.error(`Could not remove the key for ${s.name}`, e);
     } finally {
       busy = false;
     }
@@ -343,7 +345,7 @@
       >
       <button
         class="btn ghost icon sm"
-        aria-label="Reload the models"
+        aria-label="Reload models"
         onclick={() => {
           void loadKind();
           void loadStatus();
@@ -352,9 +354,9 @@
     </div>
     <div class="panel-body">
       <p class="faint intro">
-        The model providers, role lists and keys of the server. A change here applies to the next
-        request without a restart and overrides the server's model configuration until it is reset.
-        Fields the operator locked cannot be changed.
+        Model providers, role lists and API keys. Changes apply to the next request without a
+        restart and override the server's model configuration until you reset them. Fields locked by
+        the operator cannot be changed.
       </p>
       {#if addOpen}
         <form class="add" onsubmit={addProvider} aria-label="Add a provider">
@@ -401,24 +403,24 @@
           </div>
           {#if addError}<p class="bad small">{addError}</p>{/if}
           <p class="faint small">
-            A preset fills the fields for a provider with a well-known endpoint, and each stays
-            editable. An OpenAI-compatible gateway uses Custom with the openai protocol. The model
-            is added to the provider's models. Its other fields, its per-model options, TLS options
-            and the role lists that use it can be set below once it is added.
+            Presets fill in the fields for well-known providers, and every field stays editable. For
+            an OpenAI-compatible gateway, choose Custom with the openai protocol. The model you
+            enter is added to the provider's models. After you add the provider, set its other
+            fields, per-model options, TLS options and role lists below.
           </p>
         </form>
       {/if}
       {#if statusError}
         <div class="error-box">
-          <strong>The providers' status is not available.</strong>
+          <strong>Could not load provider status.</strong>
           {statusError}
         </div>
       {:else if !status}
         <p class="faint"><span class="spinner"></span> Loading…</p>
       {:else if status.providers.length === 0}
         <p class="faint">
-          No provider is configured. Add one, or give the server a model configuration with
-          --model-config.
+          No providers configured. Add one, or start the server with a model configuration
+          (--model-config).
         </p>
       {:else}
         <div class="scroll-x">
@@ -443,7 +445,7 @@
                     {:else if p.tls?.caCert?.status === 'unreadable'}
                       <span class="badge danger" title={p.tls.caCert.message}>CA unreadable</span>
                     {:else if p.tls?.verification === 'custom-ca'}
-                      <span class="badge" title="Its certificate is checked against tls.caCert too"
+                      <span class="badge" title="The certificate is also checked against tls.caCert"
                         >custom CA</span
                       >
                     {/if}
@@ -451,7 +453,9 @@
                   <td>
                     <span
                       class="badge {p.status === 'ok' ? 'ok' : 'danger'}"
-                      title={p.status === 'ok' ? 'The key can be read' : 'The key cannot be read'}
+                      title={p.status === 'ok'
+                        ? 'The API key is available'
+                        : 'The API key is missing or cannot be read'}
                       >{p.status === 'ok' ? 'ok' : 'key missing'}</span
                     >
                     <span class="faint small">{keyOf(p)}</span>
@@ -475,7 +479,7 @@
             <div class="removed-row" data-removed={r.name}>
               <Icon name="alert" size={13} />
               <span
-                >The provider <span class="mono">{r.name}</span> of the server config is removed here.</span
+                >Provider <span class="mono">{r.name}</span> from the server config is removed here.</span
               >
               <span class="spacer"></span>
               <button
@@ -500,12 +504,12 @@
     {#key fieldsKey}
       <SettingsKindPanel
         title="Model configuration"
-        text="Providers, their per-model options, the role lists and routing. Each field shows whether it comes from the server's model configuration or was changed here, and is checked as it is edited."
+        text="Providers, per-model options, role lists and routing. Each field shows whether it comes from the server's model configuration or was changed here. Fields are checked as you edit them."
         url={MODELS_URL}
         {fields}
         canEdit
         declaredName="the server's model configuration"
-        forbiddenText="Changing the model configuration needs the server-admin permission, and the server must not be read-only."
+        forbiddenText="Changing the model configuration requires the server-admin permission on a server that is not read-only."
         onchange={onKind}
         {confirmWrite}
         check={checkRoles}
@@ -523,8 +527,8 @@
                 class="btn danger sm"
                 disabled={busy || lock}
                 title={lock
-                  ? 'The operator locked this provider, or some of its fields, in the settings file'
-                  : 'Remove the provider at runtime'}
+                  ? 'This provider, or some of its fields, is locked in the settings file'
+                  : 'Remove this provider'}
                 onclick={() => (removeProvider = name)}
                 aria-label="Remove provider {name}"><Icon name="trash" size={12} /> Remove</button
               >
@@ -539,16 +543,16 @@
     <div class="panel-head"><h2>API keys</h2></div>
     <div class="panel-body">
       <p class="faint intro">
-        Keys are write-only: the server never sends one back. A key stored here is kept in the data
-        directory and overrides the server config's key until it is removed.
+        Keys are write-only, and the server never sends them back. A key saved here is stored in the
+        data directory and overrides the server config's key until you remove it.
       </p>
       {#if storage === 'sealed' && keySource === 'generated'}
         <p class="faint" data-testid="secrets-storage">
-          Stored keys are encrypted with a key that the server generated in its data directory (<code
+          Stored keys are encrypted with a key the server generated in its data directory (<code
             >secrets.key</code
-          >). It protects copies of the stored keys made without that file, such as backups, but not
-          against someone who can read the whole data directory. Start the server with
-          <code>--secrets-key</code> to keep the key elsewhere.
+          >). This protects copies made without that file, such as backups, but not against someone
+          who can read the whole data directory. To keep the key elsewhere, start the server with
+          <code>--secrets-key</code>.
         </p>
       {:else if storage === 'sealed'}
         <p class="faint" data-testid="secrets-storage">
@@ -556,19 +560,18 @@
         </p>
       {:else if storage === 'plaintext'}
         <p class="faint" data-testid="secrets-storage">
-          Stored keys are kept unencrypted and are readable by anyone who can read the data
-          directory.
+          Stored keys are not encrypted. Anyone who can read the data directory can read them.
         </p>
       {/if}
       {#if secretsError}
         <div class="error-box">
-          <strong>The keys are not available.</strong>
+          <strong>Could not load API keys.</strong>
           {secretsError}
         </div>
       {:else if !secrets}
         <p class="faint"><span class="spinner"></span> Loading…</p>
       {:else if secrets.length === 0}
-        <p class="faint">No provider names a key.</p>
+        <p class="faint">No provider uses an API key.</p>
       {:else}
         <ul class="keys">
           {#each secrets as s (s.name)}
@@ -581,14 +584,14 @@
                 {#if s.locked}
                   <span
                     class="src"
-                    title="The operator locked this secret in the settings file, so only the server config's key is used"
+                    title="Locked in the settings file, so only the server config's key is used"
                     ><Icon name="lock" size={11} /> locked</span
                   >
                 {/if}
                 {#if s.overridden}
                   <span
                     class="src warn"
-                    title="A stored key is ignored because the secret is locked"
+                    title="The stored key is ignored because this key is locked"
                     ><Icon name="alert" size={11} /> stored key ignored</span
                   >
                 {/if}
@@ -598,7 +601,7 @@
                     class="btn sm"
                     disabled={busy}
                     onclick={() => (replacing = replacing === s.name ? null : s.name)}
-                    aria-label="Replace the key of {s.name}">Replace</button
+                    aria-label="Replace the key for {s.name}">Replace</button
                   >
                 {/if}
                 {#if s.setAt}
@@ -608,15 +611,15 @@
                     onclick={() => (removeSecret = s)}
                     aria-label="{s.declared
                       ? 'Use server config for'
-                      : 'Remove the runtime value of'} {s.name}"
-                    >{s.declared ? 'Use server config' : 'Remove runtime value'}</button
+                      : 'Remove the stored key for'} {s.name}"
+                    >{s.declared ? 'Use server config' : 'Remove stored key'}</button
                   >
                 {/if}
               </div>
               <div class="faint small">
                 {s.setAt ? `Set ${fmtTime(s.setAt)}. ` : ''}{s.providers.length
                   ? `Used by ${s.providers.join(', ')}.`
-                  : 'No provider uses it.'}
+                  : 'Not used by any provider.'}
               </div>
               {#if replacing === s.name}
                 <form class="replace" onsubmit={(e) => replaceKey(e, s.name)}>
@@ -652,9 +655,8 @@
   onclose={() => (removeProvider = null)}
 >
   <p>
-    The provider is removed for the requests that start after this. A provider of the server config
-    stays removed until it is restored with Use server config. Role lists that name it must be
-    changed first.
+    New requests stop using this provider. If it comes from the server config, it stays removed
+    until you choose Use server config. Remove it from any role lists first.
   </p>
   {#snippet actions()}
     <button class="btn" onclick={() => (removeProvider = null)}>Cancel</button>
@@ -672,15 +674,14 @@
   <p>
     Without certificate verification for <span class="mono"
       >{insecureAsk?.names.join(', ') ?? ''}</span
-    >, the server cannot tell the provider from anyone who intercepts the connection. The API key
-    and every prompt sent to the provider, which can hold data from your datasets, can then be read
-    and changed by anyone on the network path.
+    >, the server cannot tell the provider apart from someone intercepting the connection. Anyone on
+    the network path could then read and change the API key and every prompt, including data from
+    your datasets.
   </p>
-  <p>Prefer a CA certificate (tls.caCert) for an internal CA or a self-signed certificate.</p>
+  <p>For an internal CA or a self-signed certificate, set a CA certificate (tls.caCert) instead.</p>
   <label class="ack">
     <input type="checkbox" bind:checked={insecureAck} />
-    I understand that the API key and the prompts sent to this provider can be read by anyone on the network
-    path.
+    I understand that anyone on the network path can read the API key and the prompts sent to this provider.
   </label>
   {#snippet actions()}
     <button class="btn" onclick={() => answerInsecure(false)}>Cancel</button>
@@ -694,15 +695,14 @@
   open={removeSecret != null}
   title={removeSecret?.declared
     ? `Use the server config's key for ${removeSecret?.name}?`
-    : `Remove the key of ${removeSecret?.name ?? ''}?`}
+    : `Remove the key for ${removeSecret?.name ?? ''}?`}
   onclose={() => (removeSecret = null)}
 >
   <p>
     {#if removeSecret?.declared}
-      The key stored here is removed, and the key of the server's configuration is used again.
+      The stored key is removed, and the key from the server config is used again.
     {:else}
-      The key stored here is removed. The providers that use it cannot be called until a key is set
-      again.
+      The stored key is removed. Providers that use it cannot be called until a new key is set.
     {/if}
   </p>
   {#snippet actions()}

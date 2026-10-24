@@ -330,7 +330,7 @@ describe('text', () => {
   it('explains a hatched stretch', () => {
     const t = buildTrack([commit(1, { reconstructable: false }), commit(2)]);
     expect(goneTitle(t, t.gone[0])).toBe(
-      'Commit 1 can no longer be read. The oldest commit that can be read is 2.',
+      'Commit 1 is no longer available. The oldest available commit is 2.',
     );
     expect(goneRanges(t.stops)).toEqual(t.gone);
   });
@@ -351,8 +351,8 @@ describe('timeFailure', () => {
     expect(f).toEqual({
       seq: 1,
       readable: [{ from: 40, to: 57 }],
-      title: 'Commit 1 can no longer be read',
-      detail: 'Readable commits: 40–57.',
+      title: 'Commit 1 is no longer available',
+      detail: 'Available commits: 40–57.',
     });
   });
 
@@ -361,7 +361,7 @@ describe('timeFailure', () => {
       status: 410,
       body: { code: 'history-gone', commit: 3, oldestReconstructable: 9 },
     });
-    expect(f?.detail).toBe('The oldest readable commit is 9.');
+    expect(f?.detail).toBe('The oldest available commit is 9.');
   });
 
   it('reads the history cache budget', () => {

@@ -96,7 +96,10 @@
   }
 
   async function remove(s: api.NamedSnapshot) {
-    if (!confirm(`Delete snapshot ${s.name}? History only it keeps is removed.`)) return;
+    if (
+      !confirm(`Delete snapshot ${s.name}? History that only this snapshot keeps will be removed.`)
+    )
+      return;
     busy = true;
     try {
       await api.deleteSnapshot(target, s.name);
@@ -218,7 +221,7 @@
 
     {#if list.snapshots.length === 0}
       <p class="faint pad">
-        No named snapshots. A snapshot keeps a commit readable after compaction.
+        No named snapshots. A snapshot keeps a commit queryable after compaction.
       </p>
     {:else}
       <div class="list">
@@ -238,7 +241,9 @@
                 <td class="mono name">
                   {s.name}
                   {#if !s.reconstructable}
-                    <span class="badge warn" title="Its data is gone (external damage)"
+                    <span
+                      class="badge warn"
+                      title="Its data is missing because of damage outside Sparkles"
                       >unreadable</span
                     >
                   {/if}

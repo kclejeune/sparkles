@@ -76,11 +76,11 @@
   const canReplace = $derived(!!live && live.type === 'persistent' && auth.can(live.name, 'admin'));
   const replaceWhy = $derived(
     !live
-      ? `No dataset named ${cur?.dataset.name} on this server.`
+      ? `This server has no dataset named ${cur?.dataset.name}.`
       : live.type !== 'persistent'
         ? 'In-memory datasets cannot be replaced.'
         : !auth.can(live.name, 'admin')
-          ? `Replacing needs admin on ${live.name}.`
+          ? `You need admin access to ${live.name} to replace it.`
           : '',
   );
   const loss = $derived(cur && live ? restoreLoss(live.head, cur.commit.seq, sameLineage) : null);
@@ -106,7 +106,7 @@
     idElsewhere
       ? 'Another dataset on this server has this id.'
       : replacesSource && live?.head != null && cur && live.head > cur.commit.seq
-        ? `${live.name} has commits after ${cur.commit.seq}; keeping the id would issue their numbers again.`
+        ? `${live.name} has commits after ${cur.commit.seq}. Keeping the id would reuse their commit numbers.`
         : '',
   );
   $effect(() => {
@@ -207,8 +207,8 @@
       </dl>
       {#if cur.verified?.status === 'error'}
         <p class="note bad">
-          <Icon name="alert" size={13} /> Its last verify ({cur.verified.level}) found errors. The
-          restore checks every blob and fails cleanly if one is damaged.
+          <Icon name="alert" size={13} /> Its last verification ({cur.verified.level}) found errors.
+          The restore checks every blob and stops if one is damaged.
         </p>
       {/if}
     {:else if step === 1}
@@ -218,7 +218,7 @@
           <input type="radio" bind:group={mode} value="new" />
           <span
             ><strong>A new dataset</strong><span class="muted"
-              >Leaves everything else untouched. Also a way to clone from a backup.</span
+              >Existing datasets are not touched. You can also use this to clone from a backup.</span
             ></span
           >
         </label>
@@ -228,7 +228,7 @@
             ><strong>Replace <span class="mono">{cur.dataset.name}</span></strong><span
               class="muted"
               >{canReplace
-                ? 'Swaps the dataset for the restored copy. Requests to it wait for a few seconds.'
+                ? 'Replaces the dataset with the restored copy. Requests to it pause for a few seconds.'
                 : replaceWhy}</span
             ></span
           >
@@ -288,8 +288,8 @@
           <input type="radio" bind:group={identity} value="auto" />
           <span
             ><strong>Automatic</strong><span class="muted"
-              >Keeps the backup's id unless another dataset here has it (such as its live source);
-              then it gets a new one. Here: <strong
+              >Keeps the backup's id, unless another dataset on this server already has it, such as
+              the dataset it was taken from. Then it gets a new id. This restore: <strong
                 >{autoKeeps ? 'keeps the id' : 'a new id'}</strong
               >.</span
             ></span
@@ -299,7 +299,7 @@
           <input type="radio" bind:group={identity} value="new" />
           <span
             ><strong>New id</strong><span class="muted"
-              >A new lineage that records the backup as where it forked from. Its commit numbers
+              >Starts a new lineage that records the backup as its fork point. Commit numbers
               continue after {cur.commit.seq}.</span
             ></span
           >
@@ -309,7 +309,7 @@
           <span
             ><strong>Keep the id</strong><span class="muted"
               >{keepWhy ||
-                'For disaster recovery: the restored dataset continues the lineage.'}</span
+                'For disaster recovery. The restored dataset continues the same lineage.'}</span
             ></span
           >
         </label>
@@ -325,7 +325,7 @@
         </div>
         <span class="hint"
           >{check === 'full'
-            ? 'Reads every index file: slower, for suspect storage.'
+            ? 'Reads every index file. Slower, for storage you suspect is damaged.'
             : check === 'quick'
               ? 'Checks the structure and the commit catalog. Every blob is hashed either way.'
               : 'Only the blob hashes and the head commit are checked.'}</span
@@ -345,7 +345,7 @@
           : 'into a new dataset'}
         <span class="mono">/{finalTarget}</span>.
       </p>
-      {#if readOnly}<p class="note bad">The server is read-only: it refuses restores.</p>{/if}
+      {#if readOnly}<p class="note bad">The server is read-only, so it cannot restore.</p>{/if}
       {#if error}<div class="error-box">{error}</div>{/if}
     {:else if task}
       {#key task.id}

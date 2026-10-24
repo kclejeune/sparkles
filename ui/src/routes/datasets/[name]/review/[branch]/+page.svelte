@@ -78,7 +78,7 @@
       editing = null;
       await load();
     } catch (e) {
-      toasts.error('The change was not made', e);
+      toasts.error('Could not apply the change', e);
     } finally {
       busy = null;
     }
@@ -102,7 +102,7 @@
     act(
       `relink ${e.iri}`,
       () => review.relink(name, branch, e.iri, bare(to)),
-      `${e.label ?? e.shown} now names ${to}`,
+      `Linked ${e.label ?? e.shown} to ${to}`,
     );
 
   /** Each source's text in pieces, with the indexes of the facts citing each piece. */
@@ -161,9 +161,7 @@
     <div class="error-box">{error}</div>
   {:else if data}
     {#if data.facts.length === 0 && data.retracts.length === 0}
-      <p class="faint">
-        The branch proposes no fact with a reifier. The merge page shows every change.
-      </p>
+      <p class="faint">This branch has no facts to review here. Open Merge to see every change.</p>
     {/if}
 
     <div class="cols">
@@ -198,7 +196,7 @@
                     {/each}
                   {/if}
                   {#if f.confidence}<span class="faint small">confidence {f.confidence}</span>{/if}
-                  {#if factPage(f) != null}<span class="badge" title="The page of the quote"
+                  {#if factPage(f) != null}<span class="badge" title="Page of the quote"
                       >page {factPage(f)}</span
                     >{/if}
                   <span class="mono small faint">{f.shown.graph}</span>
@@ -340,12 +338,12 @@
               {:else if t.src.textOmitted}
                 <p class="faint small">The text is too long to show here.</p>
               {:else}
-                <p class="faint small">The dataset keeps no text of this source.</p>
+                <p class="faint small">The text of this source is not stored.</p>
               {/if}
             </div>
           </section>
         {:else}
-          <p class="faint small">The facts cite no registered source.</p>
+          <p class="faint small">No sources cited.</p>
         {/each}
       </div>
     </div>

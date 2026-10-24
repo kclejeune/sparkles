@@ -72,7 +72,7 @@
         </h4>
       {/if}
       {#if groups.length === 0 && gone.length === 0}
-        <p class="faint small">No facts you can read.</p>
+        <p class="faint small">No facts to show.</p>
       {/if}
       <table class="facts">
         <tbody>
@@ -175,7 +175,7 @@
                 </div>
               {/if}
               {#if !c.reifier}
-                <div class="faint small">No reifier: the fact is cited by its graph alone.</div>
+                <div class="faint small">Cited by graph only. No other details were recorded.</div>
               {/if}
             </dd>
           </dl>

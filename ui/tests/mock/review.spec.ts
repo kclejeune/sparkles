@@ -22,7 +22,7 @@ test('the inbox selects the facts that pass, rejects and promotes', async ({ pag
   await expect(actions).toContainText('1 selected');
   await expect(inbox.getByRole('checkbox', { name: /^Select Kai Ito/ })).toBeChecked();
   // requiring corroboration selects nothing here
-  await actions.getByRole('checkbox', { name: 'require corroboration' }).check();
+  await actions.getByRole('checkbox', { name: 'Require corroboration' }).check();
   await actions.getByRole('button', { name: 'Accept all that pass' }).click();
   await expect(actions).toContainText('0 selected');
 
@@ -89,9 +89,9 @@ test('the Memory page edits the ingest settings', async ({ page }) => {
   await page.goto('/ui/memory?ds=org');
   const ingest = page.getByRole('region', { name: 'Ingest settings' });
   await expect(ingest).toContainText('people');
-  await ingest.getByRole('checkbox', { name: 'Keep the text of sources' }).uncheck();
-  await expect(ingest).toContainText('every fact from them needs a quote');
-  await ingest.getByRole('checkbox', { name: 'Keep the text of sources' }).check();
+  await ingest.getByRole('checkbox', { name: 'Keep source text' }).uncheck();
+  await expect(ingest).toContainText('so every fact needs a quote');
+  await ingest.getByRole('checkbox', { name: 'Keep source text' }).check();
 
   await ingest.getByRole('button', { name: 'New profile' }).click();
   const form = ingest.getByRole('form', { name: 'Ingest profile' });
@@ -99,7 +99,7 @@ test('the Memory page edits the ingest settings', async ({ page }) => {
   await form.getByRole('textbox', { name: 'Classes' }).fill('http://example.org/ontology#Project');
   await form.getByRole('button', { name: 'Save profile' }).click();
   await expect(ingest).toContainText('projects');
-  await expect(ingest).toContainText('1 classes');
-  await ingest.getByRole('button', { name: 'Remove the profile projects' }).click();
+  await expect(ingest).toContainText('1 class ·');
+  await ingest.getByRole('button', { name: 'Remove profile projects' }).click();
   await expect(ingest).not.toContainText('projects');
 });

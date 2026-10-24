@@ -376,7 +376,7 @@ export function restoreLoss(
   if (!sameLineage)
     return {
       lost: head,
-      text: `It is a different lineage: all of its current data (head commit ${head}) will be replaced`,
+      text: `The backup is from a different lineage. All current data (head commit ${head}) will be replaced`,
     };
   if (head <= seq) return { lost: 0, text: 'No commits will be lost' };
   const lost = head - seq;

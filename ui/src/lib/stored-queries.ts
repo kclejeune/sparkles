@@ -189,9 +189,9 @@ export function buildDefinition(
 export function saveProblems(name: string, rows: ParamRow[]): string[] {
   const out: string[] = [];
   if (!validName(name))
-    out.push('The name has 1–64 letters, digits, _ or -, and starts with a letter or digit.');
+    out.push('Use 1 to 64 letters, digits, _ or - for the name, starting with a letter or digit.');
   const names = rows.map((r) => r.name).filter(Boolean);
-  if (new Set(names).size !== names.length) out.push('A variable is a parameter twice.');
-  for (const n of names) if (RESERVED.has(n)) out.push(`?${n} has a reserved name.`);
+  if (new Set(names).size !== names.length) out.push('Each variable can be a parameter only once.');
+  for (const n of names) if (RESERVED.has(n)) out.push(`?${n} is a reserved name.`);
   return out;
 }

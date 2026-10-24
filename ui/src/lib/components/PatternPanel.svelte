@@ -233,8 +233,8 @@
     {/if}
   {:else if locked}
     <p class="faint small">
-      Line {lineOf(locked.range.from)}. Locked parts are edited in the editor, and canvas edits
-      leave them as they are.
+      Line {lineOf(locked.range.from)}. Edit locked parts in the text editor. Canvas edits leave
+      them unchanged.
     </p>
     <pre class="mono locked-text">{locked.text}</pre>
     {#if node?.warn}
@@ -256,7 +256,7 @@
   {:else if node}
     <p class="faint small">{node.title}</p>
     {#if node.waiting}
-      <p class="small">This node waits for an edge, since SPARQL has no free variables.</p>
+      <p class="small">This node is added to the query once an edge connects it.</p>
     {/if}
     {#if !readonly}
       <div class="actions">

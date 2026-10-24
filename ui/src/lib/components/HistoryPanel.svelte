@@ -344,8 +344,8 @@
                 <td
                   class="num mono seq"
                   title={readable(c)
-                    ? `${c.ref}: a point-in-time read can see it`
-                    : `${c.ref}: its data is no longer kept`}>{c.seq}</td
+                    ? `${c.ref}: available for point-in-time queries`
+                    : `${c.ref}: data no longer kept`}>{c.seq}</td
                 >
                 <td
                   ><div class="kind">
@@ -480,7 +480,7 @@
             <p class="faint diff-sum">
               commit {diff.from.commit.seq} → commit {diff.to.commit.seq}:
               <span class="mono">{diffSummary(diff)}</span>
-              {#if diff.method === 'compare'}· compared state against state{/if}
+              {#if diff.method === 'compare'}· compared full states{/if}
             </p>
             {#if diff.quads}
               <DiffLines quads={diff.quads} total={diff.added + diff.removed} />
@@ -524,7 +524,7 @@
       {#if histError}
         <div class="diff">
           <div class="error-box">
-            <strong>Could not read the change log.</strong>
+            <strong>Could not load the change log.</strong>
             <span class="muted">{api.errorMessage(histError)}</span>
           </div>
         </div>

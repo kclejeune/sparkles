@@ -357,7 +357,7 @@ export function composeEdits(text: string, parse: Parse, check: Parse, edits: An
     const strict = check(next);
     if (!strict.ok) throw new EditError(`The edit would not parse: ${strict.error}`);
     if (!agreesWith(a, e, strict))
-      throw new EditError('The edit would change more of the query than it names');
+      throw new EditError('The edit would change other parts of the query');
     const cs = ChangeSet.of(
       changes.map((c) => ({ from: c.from, to: c.to, insert: c.insert })),
       cur.length,

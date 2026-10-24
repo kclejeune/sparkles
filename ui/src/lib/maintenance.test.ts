@@ -64,7 +64,7 @@ describe('memory maintenance', () => {
       'Nothing to consolidate in 120 facts',
     );
     expect(r({ outcome: 'pending-review', branch: 'consolidation.x' })).toBe(
-      'An earlier consolidation on consolidation.x waits for review',
+      'An earlier consolidation on consolidation.x is waiting for review',
     );
     expect(r({ outcome: 'deleted', deleted: [{ graph: 'g' }, { graph: 'h' }] }, 'retention')).toBe(
       'Deleted 2 session graphs',

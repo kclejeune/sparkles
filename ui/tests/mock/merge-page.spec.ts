@@ -111,7 +111,7 @@ test('a branch that moved makes the page read it again', async ({ page, request 
   const before = await mainHead(request, 'grove');
   await update(request, 'grove', 'INSERT DATA { <urn:c> <urn:height> 7 }');
   await page.getByRole('button', { name: 'Merge into main' }).click();
-  await expect(page.getByRole('status').first()).toContainText('changed since the page read them');
+  await expect(page.getByRole('status').first()).toContainText('changed while you were reviewing');
   await expect(page.getByRole('region', { name: 'Summary' })).toContainText(`main@${before + 1}`);
   expect(await mainHead(request, 'grove')).toBe(before + 1);
   // the choice still holds for the conflict, so the merge goes through now

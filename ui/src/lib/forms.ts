@@ -113,11 +113,11 @@ export type FieldResult = {
 /** The words a read-only field shows for its reason. */
 export const REASONS: Record<ReadOnlyReason, string> = {
   readOnly: 'The shape marks this field read-only (dash:readOnly).',
-  protected: 'Your access protects this property from changes.',
-  graph: 'New values would go to a graph you cannot write.',
-  'complex-path': 'The path of this field has no single triple to write.',
-  'too-many': 'The field holds more values than a form lists.',
-  state: 'This form shows a past state, or you may not save changes.',
+  protected: 'You do not have permission to change this property.',
+  graph: 'New values would go to a graph you cannot write to.',
+  'complex-path': "This field's path is too complex to edit in a form.",
+  'too-many': 'This field has more values than a form can list.',
+  state: 'This form shows a past state, or you do not have permission to save.',
 };
 
 const DASH = 'http://datashapes.org/dash#';

@@ -95,7 +95,7 @@
   let summaryEl = $state<HTMLElement>();
   let ctl: AbortController | undefined;
 
-  const STATE_MSG = 'The form shows a state you cannot save.';
+  const STATE_MSG = 'This form cannot be saved.';
 
   /** The widget of each field, by id. */
   const widgets = $derived(
@@ -251,7 +251,7 @@
       check = { answer, key };
       if (answer.conflicts?.length) {
         conflicts = answer.conflicts;
-        showSummary('Another commit changed some of these fields since the form loaded them.');
+        showSummary('Some of these fields changed since you opened the form.');
       }
       return answer;
     } catch (e) {
@@ -271,8 +271,7 @@
   async function onSave() {
     if (!model || !nChanges || saving) return;
     if (!editable) return showSummary(STATE_MSG);
-    if (conflicts?.length)
-      return showSummary('Choose a value for each field another commit changed.');
+    if (conflicts?.length) return showSummary('Choose a value for each field that changed.');
     let p = plan;
     if (p === 'check') {
       const a = await runCheck();
@@ -299,7 +298,7 @@
       const r = await saveForm(ds, body());
       if ('conflict' in r) {
         conflicts = r.conflict;
-        showSummary('Another commit changed some of these fields since the form loaded them.');
+        showSummary('Some of these fields changed since you opened the form.');
         return;
       }
       const a = r.saved;
@@ -422,7 +421,7 @@
         </ul>
         {#if m.shapes.unknownHints.length}
           <p class="faint">
-            Editors and viewers the form does not know, shown with the default widget:
+            Unsupported editors and viewers, shown with the default widget:
             {m.shapes.unknownHints.map((h) => displayIri(h, prefixes)).join(', ')}
           </p>
         {/if}
@@ -463,7 +462,7 @@
     {/if}
     {#if !editable}
       <p class="faint small">
-        This form is read-only: you may not save changes here, or it shows a past state.
+        This form is read-only because it shows a past state or you do not have permission to save.
       </p>
     {/if}
 
@@ -512,7 +511,7 @@
           {#each conflicts ?? [] as c (c.id)}
             <li>
               <a href="#conflict-{fieldDomId(c.id)}"
-                >{fieldOf(c.id)?.label}: changed by another commit</a
+                >{fieldOf(c.id)?.label}: changed since you opened the form</a
               >
             </li>
           {/each}
@@ -522,7 +521,7 @@
 
     {#if conflicts?.length}
       <section class="conflicts" aria-label="Conflicting changes">
-        <h3>Changed by another commit</h3>
+        <h3>Changed since you opened the form</h3>
         {#each conflicts as c (c.id)}
           {@const f = fieldOf(c.id)}
           <div class="conflict" id="conflict-{fieldDomId(c.id)}" tabindex="-1">
@@ -623,11 +622,11 @@
           {/if}
           {#if a.validation.withheld}
             <p class="faint">
-              Your access hides part of the dataset, so the validation results are withheld.
+              Validation results are hidden because you cannot read the whole dataset.
             </p>
           {:else if a.validation.timedOut}
             <p class="warn-text">
-              The shapes could not be checked within 10 s. Save follows the guard's mode.
+              Validation did not finish within 10 s. Saving follows the guard's mode.
             </p>
           {:else if a.validation.conforms}
             <p class="ok-text">The resource conforms to its shapes after the change.</p>

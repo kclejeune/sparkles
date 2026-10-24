@@ -76,7 +76,7 @@
     </div>
   {/if}
   {#if t.message}<p class="msg">{t.message}</p>{/if}
-  {#if error}<p class="msg bad">Lost track of the task: {error}</p>{/if}
+  {#if error}<p class="msg bad">Could not follow the task: {error}</p>{/if}
 </div>
 
 <style>

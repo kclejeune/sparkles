@@ -442,7 +442,7 @@
     if (playing) slider?.pause();
     if (timeOpen && (ovAt || ovCompare || lapsed) && !key.startsWith('m:')) {
       await closeTime();
-      timeNote = 'Groups are read at the head, so the overview went back to it.';
+      timeNote = 'Groups are only available at the latest commit, so the overview returned to it.';
     }
     if (key.startsWith('m:')) {
       onresource(key.slice(2), byKey.get(key)?.label);
@@ -636,7 +636,7 @@
         marks = c;
         timeAnnounce = `Commit ${g.to.commit.seq}: ${fmtInt(g.added)} added, ${fmtInt(g.removed)} removed`;
         if (g.truncated)
-          timeNote = `The step has ${fmtInt(g.groupCount)} groups, of which the ${fmtInt(g.groups.length)} largest are counted.`;
+          timeNote = `Only the ${fmtInt(g.groups.length)} largest of ${fmtInt(g.groupCount)} groups are counted.`;
       } else {
         path = [];
         // a failed read rejects the move instead of drawing the state before it
@@ -652,7 +652,7 @@
         } else {
           timeAnnounce = at
             ? `Class overview at commit ${at.replace(/^commit:/, '')}`
-            : 'Class overview at the head';
+            : 'Class overview at the latest commit';
         }
       }
       if (signal.aborted) return;
@@ -939,9 +939,7 @@
       {#if timeNote}<p class="faint" role="status">{timeNote}</p>{/if}
       {#if openError}<p class="err" role="alert">{openError}</p>{/if}
       {#if changed}<p class="faint">
-          The dataset changed since the overview was read, so its {communities
-            ? 'communities'
-            : 'classes'} were read again.
+          The dataset changed, so the {communities ? 'communities' : 'classes'} were reloaded.
         </p>{/if}
       {#if note}<p class="faint">{note}</p>{/if}
       {#if legend.length}
@@ -963,7 +961,7 @@
         </p>
       {/if}
       {#if failReason && !listView}<p class="faint">
-          {failReason}; the overview is drawn with Cytoscape.
+          {failReason}. Showing the overview with the fallback renderer.
         </p>{/if}
     </div>
   {/if}
@@ -974,16 +972,16 @@
       <div class="ov-empty" data-testid="overview-communities-off-main">
         <Icon name="branch" size={20} />
         <p>
-          The GraphRAG communities belong to main, and this page shows the
-          <span class="mono">{branch}</span> branch. Switch to main to draw them.
+          GraphRAG communities exist only on main, and you are on
+          <span class="mono">{branch}</span>. Switch to main to draw them.
         </p>
       </div>
     {:else if communities && reportsLoading && !reports}
-      <div class="ov-empty"><span class="spinner"></span> Reading the communities…</div>
+      <div class="ov-empty"><span class="spinner"></span> Loading communities…</div>
     {:else if communities && reportsError}
       <div class="ov-empty">
         <Icon name="alert" size={20} />
-        <p>The communities could not be read: {reportsError}</p>
+        <p>Could not load the communities: {reportsError}</p>
         <button class="btn sm" onclick={() => loadCommunities()}
           ><Icon name="refresh" size={13} /> Retry</button
         >
@@ -993,23 +991,23 @@
         <Icon name={reports.unavailable === 'access' ? 'lock' : 'sparkle'} size={22} />
         <h2>
           {reports.unavailable === 'access'
-            ? 'The communities are not available to you'
+            ? 'You do not have access to these communities'
             : 'No GraphRAG communities'}
         </h2>
         <p class="muted">{reports.reason}</p>
         {#if reports.unavailable === 'none'}
           <p class="muted">
-            A dataset admin builds them in the <a href={communitiesHref}>Communities tab</a>.
+            A dataset admin can build them in the <a href={communitiesHref}>Communities tab</a>.
           </p>
         {/if}
         <button class="btn sm" onclick={() => setMode('classes')}>Show the classes</button>
       </div>
     {:else if !communities && loading && !profiles}
-      <div class="ov-empty"><span class="spinner"></span> Reading the classes…</div>
+      <div class="ov-empty"><span class="spinner"></span> Loading classes…</div>
     {:else if !communities && loadError}
       <div class="ov-empty">
         <Icon name="alert" size={20} />
-        <p>The overview could not be read: {loadError}</p>
+        <p>Could not load the overview: {loadError}</p>
         <button class="btn sm" onclick={() => load(ovAt || undefined)}
           ><Icon name="refresh" size={13} /> Retry</button
         >
@@ -1019,7 +1017,7 @@
         <Icon name="explore" size={24} />
         <h2>No classes to draw</h2>
         <p class="muted">
-          The overview draws the classes of the dataset, and no resource in it has an
+          No resource in this dataset has an
           <span class="mono">rdf:type</span>{builtins ? '' : ' outside the built-in vocabularies'}.
           Search above or paste an IRI to start from a resource.
         </p>

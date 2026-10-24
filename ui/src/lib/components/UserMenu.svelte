@@ -15,7 +15,7 @@
     try {
       await auth.logout();
     } catch (e) {
-      toasts.error('Sign out failed', e);
+      toasts.error('Could not sign out', e);
     }
   }
 </script>

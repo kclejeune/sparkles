@@ -83,7 +83,7 @@
         ? 'union of all graphs'
         : displayIri(graph, prefixes)}. A state is a commit number,
     <span class="mono">time:</span>&lt;RFC 3339&gt; or
-    <span class="mono">snapshot:</span>&lt;name&gt;, and must still be readable.
+    <span class="mono">snapshot:</span>&lt;name&gt;, and must still be in the history.
   </p>
   <div class="opts">
     <label class="row small">
@@ -170,8 +170,8 @@
       {/if}
     {/each}
     <p class="faint small">
-      {fmtInt(diff.classes.changed.length + diff.predicates.changed.length)} changed entries. Counts are
-      observations of each state, not constraints.
+      {fmtInt(diff.classes.changed.length + diff.predicates.changed.length)} changed entries. Counts describe
+      the data in each state, not schema constraints.
     </p>
   {/if}
 </Modal>

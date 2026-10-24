@@ -367,7 +367,7 @@ check them against the W3C suites and Jena's own answers.
   `rdfs:member` acts as an ordinary triple pattern while the store holds no container.
 * DESCRIBE is configurable ([API.md](API.md#describe)). The default is the W3C concise
   bounded description, read from each graph as Jena's default handler reads them and
-  extended with the reifiers of described triples. `scbd` adds the triples that point at
+  extended with the reifiers that annotate the described triples. `scbd` adds the triples that point at
   the resource, and `outgoing` keeps only the resource's own triples. Options add labels
   of linked IRIs and limit the size and depth. A dataset keeps its setting through
   `/$/describe/{ds}` and `sparkles describe-settings`, and a request can choose another.

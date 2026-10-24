@@ -204,7 +204,7 @@
         <div class="notice">
           <Icon name="alert" size={14} /> The index is {status.state}{status.message
             ? ` (${status.message})`
-            : ''}. Searches answer 503 until it is rebuilt.
+            : ''}. Search is unavailable until the index is rebuilt.
           {#if status.state === 'failed'}
             <a href={datasetHref}>Retry the rebuild in the Full-text search panel.</a>
           {/if}

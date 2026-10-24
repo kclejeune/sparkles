@@ -80,7 +80,7 @@ export function termDetail(t: CheckTerm): string {
   if (t.kind === 'property' && t.count != null) parts.push(plural(t.count, 'triple'));
   if (t.kind === 'class' && t.count != null) parts.push(plural(t.count, 'instance'));
   if (t.kind === 'entity' && t.types?.length) parts.push(t.types.join(', '));
-  if (!t.occurs) parts.push('not in the data you can read');
+  if (!t.occurs) parts.push('not found in the data');
   return parts.join(' · ');
 }
 
@@ -297,7 +297,7 @@ export function rememberAsked(
 
 // --- an empty result ------------------------------------------------------------------
 
-export const EMPTY_HEADLINE = 'No data you can read matched.';
+export const EMPTY_HEADLINE = 'Nothing matched.';
 
 /** What the result area says about an empty result, from its diagnosis. */
 export type EmptyExplanation = {
@@ -384,7 +384,7 @@ export function nextStep(e: AskEvent, o: { run: boolean; summary: boolean }): st
     case 'check':
       return e.data.ok ? (o.run ? 'Running' : 'Finishing') : 'Repairing';
     case 'run':
-      return e.data.error || !e.data.rows ? 'Looking for what matched nothing' : 'Finishing';
+      return e.data.error || !e.data.rows ? 'Checking why nothing matched' : 'Finishing';
     case 'diagnosis':
       return `Repairing (${Math.min(e.data.attempt ?? 1, 2)} of 2)`;
     case 'result':

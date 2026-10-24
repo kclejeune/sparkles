@@ -155,7 +155,8 @@
     {#if freshness}
       <span
         class="badge {freshness.cls}"
-        title={status?.staleReason ?? (stale === null ? 'No recorded store position' : '')}
+        title={status?.staleReason ??
+          (stale === null ? 'No commit was recorded for these inferences' : '')}
       >
         <Icon name={stale === false ? 'check' : 'alert'} size={12} />
         {freshness.label}
@@ -180,10 +181,10 @@
               {status?.staleReason
                 ? `${status.staleReason[0].toUpperCase()}${status.staleReason.slice(1)}.`
                 : 'The data changed since the inferences were materialized.'}
-              Queries may miss new entailments or keep ones of deleted data.
+              Queries may miss new inferences or return ones based on deleted data.
             {:else}
-              These inferences were recorded without a store position, so it is unknown whether they
-              are up to date.
+              These inferences do not record the commit they were computed at, so their freshness is
+              unknown.
             {/if}
           </span>
           <button
@@ -206,7 +207,7 @@
             class="btn"
             disabled={savingAuto}
             onclick={() => setAuto(!status?.auto.enabled)}
-            title="This dataset's own setting; it takes precedence over the server's --auto-reason"
+            title="Applies to this dataset and overrides the server's --auto-reason"
           >
             {status.auto.enabled ? 'Turn auto re-run off' : 'Turn auto re-run on'}
           </button>
@@ -215,7 +216,7 @@
               class="btn"
               disabled={savingAuto}
               onclick={() => setAuto(null)}
-              title="Follow the server's --auto-reason again"
+              title="Go back to the server's --auto-reason setting"
             >
               Use server setting
             </button>

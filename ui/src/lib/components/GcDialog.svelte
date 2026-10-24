@@ -80,8 +80,8 @@
   onclose={() => (repository = null)}
 >
   <p class="small muted">
-    Deletes blobs no backup references. A dry run first shows what would go; the real run holds an
-    exclusive repository lock only while it deletes, and backups into this repository wait for it.
+    Deletes blobs that no backup references. Start with a dry run to see what would be deleted.
+    While the real run deletes, it locks the repository and new backups into it wait.
   </p>
   {#if repository?.lastGc}
     <p class="small faint">
@@ -94,7 +94,7 @@
       Grace period (hours)
       <input class="input" type="number" min="0" bind:value={graceHours} />
       <span class="hint"
-        >Unreferenced blobs younger than this stay, for writers that do not take locks.</span
+        >Unreferenced blobs newer than this are kept, to protect writers that do not take locks.</span
       >
     </label>
   {:else}
