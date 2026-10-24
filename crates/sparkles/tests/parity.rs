@@ -429,6 +429,10 @@ fn entries() -> Vec<(&'static str, Entry)> {
         op!("getGraphGroups", "graph.groups", |ds| {
             ds.graph().groups(&any(), &Default::default());
         }),
+        // ------------------------------------------------ facets (U11)
+        op!("getGraphFacets", "graph.facets", |ds| {
+            ds.graph().facets(&any(), &Default::default());
+        }),
         // ------------------------------------------------ graph algorithms
         op!("runAlgorithm", "algorithms.run", |ds| {
             ds.algorithms().run(&any(), &Default::default());

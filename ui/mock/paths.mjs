@@ -3,7 +3,9 @@
 // the service, so the block's parameters are read here and the search runs over the
 // default graph: a breadth-first search for the shortest paths, and an enumeration of the
 // simple paths within the length for the k shortest, which the mock's small graphs allow.
-// Only the parameters the Explore path finder writes are understood.
+// With `path:weight` (U09 Phase 3) every simple path within the length is enumerated and
+// ordered by its cost, the sum of the smallest weight on a reifier of each edge, else 1.
+// Only the parameters the path finder writes are understood.
 
 import ox from 'oxigraph';
 
@@ -47,7 +49,7 @@ export class PathError extends Error {}
 function parse(src) {
   const one = (name) => values(src, name)[0];
   const known =
-    /^(source|target|algorithm|k|minLength|maxLength|direction|maxDegree|excludePredicate|predicate|maxVisited|limit|pathIndex|edgeIndex|edgeSubject|edgePredicate|edgeObject|length|cost)$/;
+    /^(source|target|algorithm|k|minLength|maxLength|direction|maxDegree|excludePredicate|predicate|maxVisited|limit|pathIndex|edgeIndex|edgeSubject|edgePredicate|edgeObject|length|cost|weight)$/;
   for (const m of src.matchAll(/path:(\w+)\s/g))
     if (
       !known.test(m[1]) &&
@@ -73,6 +75,7 @@ function parse(src) {
     'edgePredicate',
     'edgeObject',
     'length',
+    'cost',
   ])
     out[n] = one(n)?.value;
   return {
@@ -88,6 +91,7 @@ function parse(src) {
     only: only.length ? new Set(only) : null,
     maxVisited: one('maxVisited')?.value ?? 10_000_000,
     limit: one('limit')?.value ?? Infinity,
+    weight: one('weight')?.value ?? null,
     out,
   };
 }
@@ -107,6 +111,8 @@ function adjacency(store, c) {
     l.push(v);
   };
   for (const q of store.match(null, null, null, ox.defaultGraph())) {
+    // the triple terms of reifiers are not nodes of the mock's searches
+    if (q.object.termType === 'Quad') continue;
     const p = q.predicate.value;
     if (c.excluded.has(p) || (c.only && !c.only.has(p))) continue;
     const s = keyOf(q.subject);
@@ -151,6 +157,8 @@ export function pathSearch(store, query) {
     return l;
   };
   let paths = [];
+  /** The cost of each path, by its position in `paths`, with weights. */
+  let costs = null;
   // the shortest path from `from` that avoids banned nodes and edges, as [node key, quad]
   // steps, by breadth-first search within `max` edges
   const bfs = (from, bannedNodes, bannedEdges, max) => {
@@ -177,7 +185,50 @@ export function pathSearch(store, query) {
     }
     return null;
   };
-  if (c.algorithm === 'kShortest') {
+  if (c.weight) {
+    const W = ox.namedNode(c.weight);
+    const REIFIES = ox.namedNode('http://www.w3.org/1999/02/22-rdf-syntax-ns#reifies');
+    const weightOf = (q) => {
+      let w = Infinity;
+      const t = ox.triple(q.subject, q.predicate, q.object);
+      for (const r of store.match(null, REIFIES, t, null))
+        for (const v of store.match(r.subject, W, null, null)) {
+          const n = Number(v.object.value);
+          if (v.object.termType === 'Literal' && Number.isFinite(n) && n >= 0) w = Math.min(w, n);
+        }
+      return Number.isFinite(w) ? w : 1;
+    };
+    // every simple path within the length, by depth-first search
+    const all = [];
+    const onPath = new Set([sk]);
+    const walk = (k, steps, cost) => {
+      if (k === tk && steps.length) {
+        all.push({ steps: [...steps], cost });
+        return;
+      }
+      if (steps.length >= Math.min(c.maxLength, 8)) return;
+      for (const [n, q] of next(k)) {
+        const nk = keyOf(n);
+        if (onPath.has(nk) && nk !== tk) continue;
+        if (nk === tk && onPath.has(nk)) continue;
+        visit();
+        onPath.add(nk);
+        steps.push(q);
+        walk(nk, steps, cost + weightOf(q));
+        steps.pop();
+        onPath.delete(nk);
+      }
+    };
+    walk(sk, [], 0);
+    all.sort((a, b) => a.cost - b.cost || a.steps.length - b.steps.length);
+    let chosen = all.filter((p) => p.steps.length >= c.minLength);
+    if (c.algorithm === 'shortest') chosen = chosen.slice(0, 1);
+    else if (c.algorithm === 'allShortest')
+      chosen = chosen.filter((p) => p.cost === chosen[0].cost);
+    else chosen = chosen.slice(0, c.k);
+    paths = chosen.map((p) => p.steps);
+    costs = chosen.map((p) => p.cost);
+  } else if (c.algorithm === 'kShortest') {
     // Yen's algorithm over the breadth-first search; a step is [node, quad, previous node]
     const first = bfs(sk, new Set(), new Set(), c.maxLength);
     const found = first ? [first] : [];
@@ -281,6 +332,10 @@ export function pathSearch(store, query) {
         [c.out.length]: ox.literal(
           String(p.length),
           ox.namedNode('http://www.w3.org/2001/XMLSchema#integer'),
+        ),
+        [c.out.cost]: ox.literal(
+          String(costs ? costs[n] : p.length),
+          ox.namedNode('http://www.w3.org/2001/XMLSchema#double'),
         ),
       };
       rows.push(vars.map((v) => row[v] ?? null));

@@ -4,7 +4,7 @@
   // as a listbox that the graph follows.
   import { goto } from '$app/navigation';
   import { resolve } from '$app/paths';
-  import { onDestroy } from 'svelte';
+  import { onDestroy, untrack } from 'svelte';
   import * as api from '$lib/api';
   import type { Term } from '$lib/api';
   import { app } from '$lib/app.svelte';
@@ -21,26 +21,36 @@
     ds,
     prefixes,
     at = '',
+    branch = 'main',
     from = $bindable(null),
     to = $bindable(null),
     highlight = $bindable(null),
     onresult,
     onadd,
+    onopenquery,
     onclear,
     onclose,
     onfit,
   }: {
     ds: string;
     prefixes: Record<string, string>;
-    /** Explore's state (`at=`), empty for the head. */
+    /** The state of the page (`at=`), empty for the head. */
     at?: string;
+    /** The branch the page reads, for the header. */
+    branch?: string;
     from?: Picked | null;
     to?: Picked | null;
     /** The path the graph highlights, null for all. */
     highlight?: number | null;
     /** The paths found, with the labels of their nodes, or null when cleared. */
     onresult?: (r: { paths: pf.FoundPath[]; labels: Map<string, string> } | null) => void;
+    /** Keeps the paths in the page's graph; without it there is no **Add to graph**. */
     onadd?: () => void;
+    /**
+     * Opens the query that found the paths, at its state, on the page itself; without it
+     * **Open in editor** goes to the query page.
+     */
+    onopenquery?: (query: string, at: string) => void;
     onclear?: () => void;
     onclose?: () => void;
     onfit?: (path: pf.FoundPath) => void;
@@ -75,6 +85,39 @@
   /** False once the server refused the Phase 1 parameters. */
   let phase1 = $state(true);
 
+  // --- weights from reifiers (U09 Phase 3) ------------------------------------------------
+
+  /** The reifier property whose values weigh the edges, or null to count edges. */
+  let weight = $state<string | null>(null);
+  /** The weight properties of the dataset at the page's state, once read. */
+  let weights = $state<pf.WeightProperty[] | null>(null);
+  let weightsErr = $state('');
+  let weightsFor = $state('');
+  let weightCtl: AbortController | undefined;
+  function loadWeights() {
+    const key = `${ds}|${at}`;
+    if (weightsFor === key || !ds) return;
+    weightsFor = key;
+    weights = null;
+    weightsErr = '';
+    const c = new AbortController();
+    weightCtl?.abort();
+    weightCtl = c;
+    pf.weightProperties(ds, { at: at || undefined, signal: c.signal })
+      .then((w) => {
+        if (weightCtl !== c) return;
+        weights = w;
+        // a property the state no longer has is dropped
+        if (weight && !w.some((x) => x.iri === weight)) weight = null;
+      })
+      .catch((e) => {
+        if (weightCtl !== c || (e instanceof DOMException && e.name === 'AbortError')) return;
+        weights = [];
+        weightsErr = 'The weight properties could not be read';
+      });
+  }
+  onDestroy(() => weightCtl?.abort());
+
   let running = $state(false);
   let failure = $state<pf.SearchFailure | null>(null);
   /** The paths found, with the state, the settings and the query that found them. */
@@ -96,6 +139,23 @@
   /** The filters are folded on a phone. */
   const wide = typeof matchMedia === 'function' ? !matchMedia('(max-width: 600px)').matches : true;
   let filtersOpen = $state(wide);
+  // the weight picker is filled when it is first used, since listing the weight properties
+  // reads every reifier of the dataset, and again at a new state
+  $effect(() => {
+    void ds;
+    void at;
+    untrack(() => {
+      // a list in flight belongs to the old state, so nothing it returns is shown
+      weightCtl?.abort();
+      weightCtl = undefined;
+      if (weightsFor) {
+        weightsFor = '';
+        weights = null;
+      }
+      // a chosen weight is checked against the new state at once, and dropped if it has none
+      if (weight) loadWeights();
+    });
+  });
   /** On a phone, after a search the sheet shows the first path only until it is swiped up. */
   let sheetFull = $state(true);
 
@@ -112,6 +172,7 @@
       maxDegree: phase1 ? maxDegree : null,
       follow: phase1 ? follow : 'only',
       predicates: phase1 && follow === 'except' ? excluded : only,
+      weight,
     };
   });
   const blocked = $derived(
@@ -199,6 +260,7 @@
   /** The query page opens with the query that found the paths shown, at its state. */
   function openInEditor() {
     if (!result) return;
+    if (onopenquery) return onopenquery(result.query, result.at);
     app.pendingQuery = { query: result.query, title: 'Paths' };
     app.queryAt = result.at;
     void goto(resolve('/query'));
@@ -402,7 +464,41 @@
             {#each pf.HUB_LIMITS as n (n ?? 'off')}<option value={n}>{hubText(n)}</option>{/each}
           </select></label
         >
+        <label
+          title="Add up a property of each edge's reifier instead of counting edges. An edge without one weighs 1."
+          >Weight <select
+            bind:value={weight}
+            aria-describedby="path-weight-note"
+            onfocus={loadWeights}
+            onpointerdown={loadWeights}
+          >
+            <option value={null}>none, count edges</option>
+            {#if weight && !weights?.some((w) => w.iri === weight)}<option value={weight}
+                >{displayIri(weight, prefixes)}</option
+              >{/if}
+            {#each weights ?? [] as w (w.iri)}<option value={w.iri}
+                >{displayIri(w.iri, prefixes)}</option
+              >{/each}
+          </select></label
+        >
       </div>
+      <p class="faint small" id="path-weight-note">
+        {#if weights == null && weightsFor}
+          Reading the weight properties…
+        {:else if weights == null}
+          Choose a property of the reifiers to add up instead of counting edges.
+        {:else if weightsErr}
+          {weightsErr}.
+        {:else if !weights.length}
+          No reifier has a numeric property to weigh edges by.
+        {:else if weight}
+          Paths are ordered by the sum of {displayIri(weight, prefixes)} on their edges' reifiers, and
+          an edge without one weighs 1.
+        {:else}
+          {weights.length}
+          {weights.length === 1 ? 'property' : 'properties'} on reifiers can weigh the edges.
+        {/if}
+      </p>
       <fieldset class="follow">
         <legend class="sr-only">Predicates</legend>
         <label
@@ -464,7 +560,7 @@
       {#if blocked && from && to}<span class="faint small">{blocked}</span>{/if}
       {#if result}
         <span class="faint small at"
-          >at commit {result.commit ?? '?'} · main{result.at ? ` (${result.at})` : ''}</span
+          >at commit {result.commit ?? '?'} · {branch}{result.at ? ` (${result.at})` : ''}</span
         >
       {/if}
     </div>
@@ -548,7 +644,11 @@
               onkeydown={() => {}}
             >
               <span class="num">{p.n}</span>
-              <span class="len">length {p.length}</span>
+              <span class="len"
+                >length {p.length}{#if p.cost != null}<span class="cost">
+                    · cost {pf.fmtCost(p.cost)}</span
+                  >{/if}</span
+              >
               <span class="steps">
                 {#each p.edges as e, i (i)}
                   {#if i === 0}<span class="node">{labelOf(p.nodes[0])}</span>{/if}
@@ -574,7 +674,7 @@
         <button type="button" class="btn sm" onclick={openInEditor}
           ><Icon name="query" size={13} /> Open in editor</button
         >
-        {#if result.paths.length}
+        {#if result.paths.length && onadd}
           <button type="button" class="btn sm" onclick={onadd}
             ><Icon name="plus" size={13} /> Add to graph</button
           >

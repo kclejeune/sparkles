@@ -4,11 +4,14 @@
 // gets a branch whose changes clash with main, so that the dataset page shows branches and
 // the commit graph and the merge page shows conflicts. The Ask bar runs the scripted
 // pipeline of mock/assistant.mjs, and a handoff link stands in for an agent's
-// `share_query`. Run with `mise run docs:screenshots`.
+// `share_query`. The maps of relations, the communities, the Pattern pane, the diff graph
+// and the path finder on a query's graph use the `world` showcase dataset of
+// mock/world.mjs. Run with `mise run docs:screenshots`.
 
 import { test as base, expect, type APIRequestContext, type Page } from '@playwright/test';
 import { encodeHandoff } from '../../src/lib/handoff';
-import { OUT, shoot } from '../shoot';
+import { OUT, settle, shoot } from '../shoot';
+import { worldFlights } from '../../mock/world.mjs';
 import { join } from 'node:path';
 
 const DATASET = 'org';
@@ -109,7 +112,7 @@ test('branches', async ({ page }) => {
   await expect(panel.getByRole('row').filter({ hasText: 'reorg-2027' })).toBeVisible({
     timeout: 30_000,
   });
-  const toggle = history(page).getByRole('button', { name: 'Graph' });
+  const toggle = history(page).getByRole('button', { name: 'Graph', exact: true });
   await toggle.click();
   await expect(toggle).toHaveAttribute('aria-pressed', 'true');
   await expect(history(page)).toContainText('commits of');
@@ -254,12 +257,12 @@ test('time-slider-graph', async ({ page }) => {
   await shoot(page, 'time-slider-graph');
 });
 
-// the mock's `flows` dataset (mock/geo.mjs): people in Lyon and Paris who work for an
-// organization in Paris, and routes between airports
-const FLOWS = 'http://example.org/flows/';
+// the mock's `world` dataset (mock/world.mjs): a freight company with its head office in
+// Dubai, its offices, partners and people around the world, and routes between cities
+const WORLD = 'http://example.org/world/';
 
 test('map-arcs', async ({ page }) => {
-  await page.goto(`/ui/explore?ds=flows&iri=${encodeURIComponent(`${FLOWS}acme`)}`);
+  await page.goto(`/ui/explore?ds=world&iri=${encodeURIComponent(`${WORLD}meridian`)}`);
   await expect(page.getByText(/\d+ nodes, \d+ edges/)).toBeVisible({ timeout: 30_000 });
   await page
     .getByRole('group', { name: 'Show the graph as' })
@@ -269,17 +272,12 @@ test('map-arcs', async ({ page }) => {
   await expect(arcmap).toHaveAttribute('data-loading', 'false', { timeout: 30_000 });
   const region = page.getByRole('region', { name: 'Graph map' });
   await expect(region).toHaveAttribute('data-state', 'ready');
-  // the ten people of Lyon, selected with the keyboard
-  await region.locator('canvas.maplibregl-canvas').focus();
-  await page.keyboard.press('Tab');
-  await page.keyboard.press('Enter');
-  await expect(page.getByRole('region', { name: 'Selection' })).toContainText('selected');
   await shoot(page, 'map-arcs');
 });
 
 test('result-arcs', async ({ page }) => {
-  await page.addInitScript(() => localStorage.setItem('sparkles.dataset', 'flows'));
-  const query = `PREFIX ex: <${FLOWS}>
+  await page.addInitScript(() => localStorage.setItem('sparkles.dataset', 'world'));
+  const query = `PREFIX ex: <${WORLD}>
 PREFIX rdfs: <http://www.w3.org/2000/01/rdf-schema#>
 SELECT ?label ?from ?to WHERE {
   ?route a ex:Route ; rdfs:label ?label ; ex:fromGeom ?from ; ex:toGeom ?to .
@@ -292,7 +290,14 @@ SELECT ?label ?from ?to WHERE {
       ),
     [query],
   );
-  await page.goto('/ui/query?ds=flows');
+  await page.goto('/ui/query?ds=world');
+  // a short editor, so the map has room
+  const top = (await page.locator('.cm-editor').boundingBox())!.y;
+  const split = (await page.getByRole('separator', { name: 'Resize editor' }).boundingBox())!;
+  await page.mouse.move(split.x + split.width / 2, split.y + split.height / 2);
+  await page.mouse.down();
+  await page.mouse.move(split.x + split.width / 2, top + 150, { steps: 5 });
+  await page.mouse.up();
   await page.getByRole('button', { name: /^Run/ }).click();
   const results = page.getByRole('region', { name: 'Results' });
   await expect(results.getByRole('grid')).toBeVisible({ timeout: 30_000 });
@@ -308,59 +313,186 @@ SELECT ?label ?from ?to WHERE {
   await shoot(page, 'result-arcs');
 });
 
+test('explore-facets', async ({ page }) => {
+  // the facets of the people of `world` beside the graph of the chief executive, with a
+  // brush on their ages and their employer, which dims the drawn people outside it
+  await page.goto(
+    `/ui/explore?ds=world&iri=${encodeURIComponent(`${WORLD}amira-haddad`)}&facets=1`,
+  );
+  const panel = page.getByTestId('facet-panel');
+  await expect(panel.getByTestId('facet')).toHaveCount(3, { timeout: 30_000 });
+  const facet = (local: string) =>
+    panel.locator(`[data-testid="facet"][data-property="${WORLD}${local}"]`);
+  await expect(facet('age').locator('.bin').first()).toBeVisible();
+  await facet('worksFor')
+    .getByRole('button', { name: /Meridian Logistics/ })
+    .click();
+  await facet('age')
+    .getByRole('group', { name: /age histogram/ })
+    .focus();
+  await page.keyboard.press('Home');
+  for (let i = 0; i < 3; i++) await page.keyboard.press('ArrowRight');
+  for (let i = 0; i < 6; i++) await page.keyboard.press('Shift+ArrowRight');
+  await expect(panel.getByTestId('facet-count')).toContainText(/of 41 match/);
+  await expect(page.getByRole('region', { name: 'Selection' })).toContainText(
+    'selected by the facets',
+  );
+  await shoot(page, 'explore-facets');
+});
+
+test('query-facets', async ({ page }) => {
+  // the query page's facets of a variable, with the brushes Apply to query writes
+  await page.addInitScript(() => localStorage.setItem('sparkles.dataset', 'world'));
+  const query = `PREFIX ex: <${WORLD}>
+SELECT ?person ?city WHERE {
+  ?person a ex:Person ;
+    ex:livesIn ?city .
+}
+ORDER BY ?person`;
+  await page.addInitScript(
+    ([q]) =>
+      localStorage.setItem(
+        'sparkles.queryTabs',
+        JSON.stringify({ tabs: [{ id: 't1', title: 'People', query: q }], active: 't1' }),
+      ),
+    [query],
+  );
+  await page.goto('/ui/query?ds=world');
+  await page.getByRole('button', { name: /^Run/ }).click();
+  const results = page.getByRole('region', { name: 'Results' });
+  await expect(results.getByRole('grid')).toBeVisible({ timeout: 30_000 });
+  await results.getByRole('tab', { name: 'Facets' }).click();
+  const panel = page.getByTestId('facet-panel');
+  await expect(panel.getByTestId('facet')).toHaveCount(3, { timeout: 30_000 });
+  const facet = (local: string) =>
+    panel.locator(`[data-testid="facet"][data-property="${WORLD}${local}"]`);
+  await expect(facet('joined').locator('.bin').first()).toBeVisible();
+  await facet('joined')
+    .getByRole('group', { name: /joined histogram/ })
+    .focus();
+  await page.keyboard.press('End');
+  for (let i = 0; i < 4; i++) await page.keyboard.press('Shift+ArrowLeft');
+  await expect(panel.getByTestId('facet-count')).toContainText(/of 41 match/);
+  await panel.getByRole('button', { name: 'Apply to query' }).click();
+  await expect(page.locator('.cm-content')).toContainText('FILTER(YEAR(?joined)');
+  // the toast that confirms the edit would cover the facets
+  await page.getByRole('button', { name: 'Dismiss' }).click();
+  await page.waitForTimeout(400);
+  await shoot(page, 'query-facets');
+});
+
 test('explore-communities', async ({ page }) => {
-  // the overview grouped by the GraphRAG communities of mock/graphrag.mjs, opened at
-  // Engineering, with the payments team's report beside it and a finding's entities marked
-  await page.goto(`/ui/explore?ds=${DATASET}&overview=communities`);
+  // the overview of `world` grouped by its GraphRAG communities (mock/world.mjs), with the
+  // report of the head office, which links every region, beside it
+  await page.goto(`/ui/explore?ds=world&overview=communities`);
   const ov = page.getByTestId('overview');
   await expect(ov).toHaveAttribute('data-mode', 'communities');
   await ov.getByRole('button', { name: 'List' }).click();
   const row = (name: RegExp) =>
     ov.locator('tbody tr').filter({ has: page.getByRole('button', { name }) });
-  await row(/^Engineering/)
-    .getByRole('button', { name: 'Open' })
-    .click();
-  await row(/^The payments team/)
-    .getByRole('button', { name: /^The payments team/ })
+  await row(/^Gulf head office/)
+    .getByRole('button', { name: /^Gulf head office/ })
     .click();
   const side = page.getByTestId('community-side');
-  await expect(side.getByRole('heading', { name: 'The payments team' })).toBeVisible();
-  await side.getByRole('button', { name: /Kai works with the rest/ }).click();
+  await expect(side.getByRole('heading', { name: 'Gulf head office' })).toBeVisible();
   await ov.getByRole('button', { name: 'List' }).click();
   await expect(ov.locator('canvas').first()).toBeVisible();
   await shoot(page, 'explore-communities');
 });
 
-test('pattern', async ({ page }) => {
-  // the Pattern pane beside the editor: required triples, an optional one in its hull, a
-  // filter as a chip on its variable and a BIND as a locked block
-  const query = `PREFIX ex: <http://example.org/ontology#>
-PREFIX foaf: <http://xmlns.com/foaf/0.1/>
+test('query-paths', async ({ page, request }) => {
+  // the freight routes of `world` as a result graph on the query page, with the three
+  // shortest ways from Vancouver to Auckland by distance, which the reifiers of the flights
+  // carry in ex:km, drawn over it
+  await update(request, 'world', `INSERT DATA {\n${worldFlights()}\n}`, 'Add the flight distances');
+  const query = `PREFIX ex: <${WORLD}>
 PREFIX rdfs: <http://www.w3.org/2000/01/rdf-schema#>
 
-# Who is on which team, and since when
-SELECT ?name ?teamName ?year WHERE {
-  ?person a ex:Person ;
-          foaf:name ?name ;
-          ex:memberOf ?team .
-  ?team rdfs:label ?teamName .
-  OPTIONAL { ?person ex:startDate ?start }
-  FILTER(STRSTARTS(?name, "L"))
-  BIND(YEAR(?start) AS ?year) # the year they joined
-}
-ORDER BY ?name`;
+# The flights between the cities, named by their labels
+CONSTRUCT { ?a ex:flight ?b . ?a rdfs:label ?from . ?b rdfs:label ?to }
+WHERE { ?a ex:flight ?b ; rdfs:label ?from . ?b rdfs:label ?to }`;
   await page.addInitScript(
     ([q]) => {
       localStorage.setItem(
         'sparkles.queryTabs',
-        JSON.stringify({ tabs: [{ id: 't1', title: 'Teams', query: q }], active: 't1' }),
+        JSON.stringify({ tabs: [{ id: 't1', title: 'Flights', query: q }], active: 't1' }),
       );
-      localStorage.removeItem('sparkles.patternLayouts');
-      localStorage.setItem('sparkles.patternPane', JSON.stringify({ open: true, w: 620 }));
+      localStorage.setItem('sparkles.dataset', 'world');
     },
     [query],
   );
-  await page.goto(`/ui/query?ds=${DATASET}`);
+  await page.emulateMedia({ reducedMotion: 'reduce' });
+  await page.goto('/ui/query?ds=world');
+  // a short editor, so the graph has room
+  const top = (await page.locator('.cm-editor').boundingBox())!.y;
+  const split = (await page.getByRole('separator', { name: 'Resize editor' }).boundingBox())!;
+  await page.mouse.move(split.x + split.width / 2, split.y + split.height / 2);
+  await page.mouse.down();
+  await page.mouse.move(split.x + split.width / 2, top + 150, { steps: 5 });
+  await page.mouse.up();
+  await page.getByRole('button', { name: /^Run/ }).click();
+  const results = page.getByRole('region', { name: 'Results' });
+  await results.getByRole('tab', { name: 'Graph' }).click();
+  await expect(results.locator('.wrap[data-graph]')).toBeAttached({ timeout: 30_000 });
+  await results.getByRole('button', { name: 'Paths', exact: true }).click();
+  const panel = page.getByRole('region', { name: 'Paths' });
+  for (const [end, text, name] of [
+    ['From', 'Vanc', /^Vancouver\b/],
+    ['To', 'Auck', /^Auckland\b/],
+  ] as const) {
+    await panel.getByRole('combobox', { name: end }).fill(text);
+    await panel.getByRole('option', { name }).first().click();
+  }
+  await panel.getByLabel('k shortest').check();
+  await panel.getByLabel('only', { exact: true }).check();
+  await panel.getByRole('combobox', { name: 'Add a predicate' }).fill('ex:flight');
+  await panel.getByRole('combobox', { name: 'Add a predicate' }).press('Enter');
+  const weight = panel.getByRole('combobox', { name: 'Weight' });
+  await weight.focus();
+  await expect(weight.locator(`option[value="${WORLD}km"]`)).toHaveCount(1);
+  await weight.selectOption(`${WORLD}km`);
+  await panel.getByRole('button', { name: 'Find paths' }).click();
+  await expect(panel.getByRole('listbox', { name: 'Paths found' }).getByRole('option')).toHaveCount(
+    3,
+  );
+  // the filters folded away, so the list shows the three paths with their costs
+  await panel.locator('summary', { hasText: 'Filters' }).click();
+  await page.waitForTimeout(1000);
+  await results.getByRole('button', { name: 'Fit to view' }).click();
+  await shoot(page, 'query-paths');
+});
+
+test('pattern', async ({ page }) => {
+  // the Pattern pane beside the editor: required triples, an optional one in its hull, a
+  // filter as a chip on its variable and a BIND as a locked block
+  const query = `PREFIX ex: <${WORLD}>
+PREFIX rdfs: <http://www.w3.org/2000/01/rdf-schema#>
+
+# The heads of the regions, and the company they work for
+SELECT ?name ?region ?company ?home WHERE {
+  ?person a ex:Person ;
+          rdfs:label ?name ;
+          ex:jobTitle ?title ;
+          ex:worksFor ?org .
+  ?org rdfs:label ?company .
+  OPTIONAL { ?person ex:livesIn ?home }
+  FILTER(STRSTARTS(?title, "Head of"))
+  BIND(STRAFTER(?title, "Head of ") AS ?region) # the region they lead
+}
+ORDER BY ?region`;
+  await page.addInitScript(
+    ([q]) => {
+      localStorage.setItem(
+        'sparkles.queryTabs',
+        JSON.stringify({ tabs: [{ id: 't1', title: 'Heads of regions', query: q }], active: 't1' }),
+      );
+      localStorage.removeItem('sparkles.patternLayouts');
+      localStorage.setItem('sparkles.patternPane', JSON.stringify({ open: true, w: 620 }));
+      localStorage.setItem('sparkles.dataset', 'world');
+    },
+    [query],
+  );
+  await page.goto('/ui/query?ds=world');
   const pane = page.getByRole('region', { name: 'Pattern', exact: true });
   await expect(pane).toHaveAttribute('data-state', 'ok');
   // a taller editor, so the drawing has room
@@ -376,10 +508,11 @@ ORDER BY ?name`;
   await expect
     .poll(async () => Number(await canvas.getAttribute('data-settled')))
     .toBeGreaterThan(0);
-  await pane.getByRole('button', { name: 'Fit to view' }).click();
   // the strip's count of the pattern's matches
   await pane.getByRole('button', { name: 'Count matches' }).click();
-  await expect(pane.getByTestId('pattern-count')).toBeVisible();
+  // the seven heads of regions, which the README's alt text names
+  await expect(pane.getByTestId('pattern-count')).toContainText('7 matches');
+  await pane.getByRole('button', { name: 'Fit to view' }).click();
   await shoot(page, 'pattern');
 });
 
@@ -433,13 +566,31 @@ SELECT ?name ?teamName WHERE {
   await shoot(page, 'plan-pattern');
 });
 
-test('diff-graph', async ({ page }) => {
-  // the last commit of main drawn as a graph of its own, with the triples around it
-  await page.goto(`/ui/explore?ds=${DATASET}&diff=head`);
+test('diff-graph', async ({ page, request }) => {
+  // a commit of `world` that adds and removes triples, drawn as a graph of its own
+  await update(
+    request,
+    'world',
+    `PREFIX w: <${WORLD}>
+DELETE DATA {
+  w:marcus-hill w:jobTitle "Terminal manager"@en .
+  w:olivia-chen w:livesIn w:vancouver .
+  w:diego-alvarez w:knows w:sam-ortiz .
+} ;
+INSERT DATA {
+  w:marcus-hill w:jobTitle "Head of terminals"@en .
+  w:olivia-chen w:livesIn w:losangeles .
+  w:nora-quinn a w:Person ; rdfs:label "Nora Quinn"@en ; w:jobTitle "Terminal manager"@en ;
+    w:worksFor w:northgate ; w:livesIn w:toronto ; w:knows w:marcus-hill .
+}`,
+    'Northgate Rail reorganises its terminals',
+  );
+  await page.addInitScript(() => localStorage.setItem('sparkles.dataset', 'world'));
+  await page.goto('/ui/explore?ds=world&diff=head');
   const view = page.locator('.dg');
   await expect(view.locator('.wrap[data-graph]')).toBeAttached({ timeout: 30_000 });
-  await page.keyboard.press('x');
   await page.waitForTimeout(1500);
+  await view.getByRole('button', { name: 'Fit to view' }).click();
   await shoot(page, 'diff-graph');
 });
 
@@ -492,6 +643,34 @@ GROUP BY ?p ORDER BY DESC(?n) ?p LIMIT 1`,
   await expect(page.getByTestId('lens-status-edge')).toContainText('inferred');
   await page.keyboard.press('Escape');
   await page.getByRole('button', { name: 'Fit to view' }).click();
+  await settle(page, page.locator('.wrap[data-graph]'));
+  // the drawing fitted into the room right of the legend
+  await page
+    .locator('.wrap[data-graph] canvas')
+    .first()
+    .evaluate((canvas) => {
+      type Box = { x1: number; y1: number; w: number; h: number };
+      type Cy = {
+        zoom(z: number): void;
+        pan(p: { x: number; y: number }): void;
+        nodes(): { boundingBox(o: object): Box };
+        width(): number;
+        height(): number;
+      };
+      let el: HTMLElement | null = canvas.parentElement;
+      while (el && !('_cyreg' in el)) el = el.parentElement;
+      const cy = (el as unknown as { _cyreg: { cy: Cy } })._cyreg.cy;
+      const bb = cy.nodes().boundingBox({ includeLabels: false, includeOverlays: false });
+      const left = 250;
+      // room for the labels around the nodes
+      const [w, h] = [cy.width() - left - 110, cy.height() - 90];
+      const z = Math.min(w / bb.w, h / bb.h);
+      cy.zoom(z);
+      cy.pan({
+        x: left + 50 + w / 2 - z * (bb.x1 + bb.w / 2),
+        y: 45 + h / 2 - z * (bb.y1 + bb.h / 2),
+      });
+    });
   await shoot(page, 'explore-lenses');
 });
 
@@ -580,4 +759,46 @@ SELECT ?person ?name WHERE {
   await page.evaluate(() => document.fonts.ready.then(() => undefined));
   await page.waitForTimeout(500);
   await page.screenshot({ path: join(OUT, 'pattern-edit.png'), animations: 'disabled' });
+});
+
+// the validation overlay (docs/specs/U07-data-quality-and-schema-diagram.md §11): a team
+// whose SHACL guard wants a name for every person and a valid email address
+const Q = 'http://example.org/quality/';
+
+test('validation-overlay', async ({ page, request }) => {
+  const made = await request.post('/$/datasets', { data: { dbName: 'team', dbType: 'mem' } });
+  expect(made.ok() || made.status() === 409).toBe(true);
+  const u = await request.post('/team/update', {
+    headers: { 'Content-Type': 'application/sparql-update' },
+    data: `PREFIX q: <${Q}> PREFIX rdfs: <http://www.w3.org/2000/01/rdf-schema#> INSERT DATA {
+      q:acme a q:Organization ; rdfs:label "Acme Robotics" .
+      q:lea a q:Person ; q:name "Léa Martin" ; q:email "lea@acme.example" ; q:worksFor q:acme .
+      q:omar a q:Person ; q:name "Omar Haddad" ; q:email "omar@acme" ; q:worksFor q:acme .
+      q:p17 a q:Person ; q:email "p17@acme.example" ; q:worksFor q:acme .
+      q:p18 a q:Person ; q:worksFor q:acme .
+      q:sara a q:Person ; q:name "Sara Lind" ; q:email "sara@acme.example" ; q:worksFor q:acme . }`,
+  });
+  expect(u.ok()).toBe(true);
+  const shapes = `@prefix sh: <http://www.w3.org/ns/shacl#> . @prefix q: <${Q}> .
+q:PersonShape a sh:NodeShape ; sh:targetClass q:Person ;
+  sh:property [ sh:path q:name ; sh:minCount 1 ] ;
+  sh:property [ sh:path q:email ; sh:pattern "^[^@]+@[^@]+[.][^@]+$" ; sh:message "not an email address" ] .`;
+  const g = await request.put('/$/validation/team', {
+    data: { mode: 'warn', shapes: { inline: shapes } },
+  });
+  expect(g.ok()).toBe(true);
+  await page.goto(`/ui/explore?ds=team&iri=${encodeURIComponent(`${Q}acme`)}`);
+  await expect(page.getByRole('button', { name: /p17, 1 violation/ })).toBeVisible({
+    timeout: 30_000,
+  });
+  await page.getByRole('button', { name: /omar, 1 violation/i }).click();
+  const panel = page.getByRole('dialog', { name: /Validation results of/ });
+  await panel.getByRole('button', { name: 'Show triples' }).click();
+  await page.getByRole('button', { name: /p17, 1 violation/ }).click();
+  await panel.getByRole('button', { name: 'Suggest fix' }).click();
+  const editor = panel.getByRole('textbox', { name: 'Suggested update' });
+  await editor.fill((await editor.inputValue()).replace('?value .', '"Priya Shah" .'));
+  await panel.getByRole('button', { name: 'Preview' }).click();
+  await expect(panel).toContainText('The guard would resolve this result.');
+  await shoot(page, 'validation-overlay');
 });

@@ -367,6 +367,66 @@ export function badgeResult(c: Common & { values: Map<string, number> }): LensRe
   };
 }
 
+/** A node's validation results for the badge channel: the count, the worst severity and both in words. */
+export type ValidationBadge = {
+  count: number;
+  worst: 'violation' | 'warning' | 'info';
+  /** Such as `2 violations` or `1 violation, 1 warning`. */
+  words: string;
+};
+
+const SEVERITY_ORDER = ['violation', 'warning', 'info'] as const;
+const SEVERITY_MARK = { violation: '✕', warning: '⚠', info: 'ⓘ' } as const;
+
+/**
+ * The validation lens of the badge channel (U07 §11.2): the validation overlay's results
+ * per drawn node. The overlay draws these badges itself, with the worst severity's mark
+ * and a button that opens the results, so `encode` leaves them out of the canvas encoding,
+ * and the result serves the legend, the list column and the descriptions.
+ */
+export function validationResult(
+  c: Common & { values: ReadonlyMap<string, ValidationBadge> },
+): LensResult {
+  const values = new Map<string, LensValue>();
+  const codes = new Map<string, number>();
+  const text = new Map<string, string>();
+  const by = new Map<string, string[]>();
+  for (const [id, b] of c.values) {
+    if (b.count <= 0) continue;
+    values.set(id, b.count);
+    codes.set(id, b.count);
+    text.set(id, `${SEVERITY_MARK[b.worst]} ${b.words}`);
+    const ids = by.get(b.worst) ?? [];
+    ids.push(id);
+    by.set(b.worst, ids);
+  }
+  const legend: LegendEntry[] = SEVERITY_ORDER.flatMap((s) => {
+    const ids = by.get(s);
+    if (!ids) return [];
+    return [
+      {
+        key: s,
+        text: `${SEVERITY_MARK[s]} nodes whose worst result is ${s === 'info' ? 'an info' : `a ${s}`}`,
+        count: ids.length,
+        ids,
+      },
+    ];
+  });
+  const n = codes.size;
+  return {
+    channel: 'badge',
+    lens: 'validation',
+    name: c.name,
+    title: 'badges count the validation results of each node, marked by the worst severity',
+    values,
+    codes,
+    text,
+    legend,
+    summary: `${n.toLocaleString('en-US')} ${n === 1 ? 'node has' : 'nodes have'} results`,
+    computedAt: c.computedAt,
+  };
+}
+
 export type EdgeEnd = { id: string; source: string; target: string };
 
 /**
@@ -472,13 +532,15 @@ export function encode(results: Results): Encoding {
   const edge = results.edge;
   if (size) for (const [id, s] of size.codes) look(id).size = s;
   if (colour) for (const [id, c] of colour.codes) look(id).colour = c;
-  if (badge) for (const [id, b] of badge.codes) look(id).badge = b;
+  // the validation overlay draws its own badges, with their severity and a button
+  const drawnBadge = badge && badge.lens !== 'validation' ? badge : null;
+  if (drawnBadge) for (const [id, b] of drawnBadge.codes) look(id).badge = b;
   return {
     nodes,
     inferred: new Set(edge ? edge.codes.keys() : []),
     size: !!size,
     colour: !!colour,
-    badge: !!badge,
+    badge: !!drawnBadge,
     edge: !!edge,
   };
 }

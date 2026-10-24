@@ -35,6 +35,10 @@ import {
   DECLARED_KEY,
   MODELS,
   PASSWORD,
+  PATHS_DATA,
+  PATHS_DATASET,
+  PATHS_EX,
+  PATHS_PROTECTION,
   PATTERN_DATA,
   PATTERN_DATASET,
   PATTERN_PREDICATE,
@@ -145,6 +149,9 @@ export default async function globalSetup(_config: FullConfig) {
 
   // A static token (spk_ + 43 base64url characters), stored in the config as its sha256.
   const token = `spk_${randomBytes(32).toString('base64url')}`;
+  // a static token whose grant covers only the default graph of overlay-limited, for
+  // the validation overlay's restricted caller (U07 §11.8, A13)
+  const limited = `spk_${randomBytes(32).toString('base64url')}`;
   const hashed = spawnSync(bin, ['auth', 'hash'], { input: `${PASSWORD}\n`, encoding: 'utf8' });
   if (hashed.status !== 0) throw new Error(`sparkles auth hash failed: ${hashed.stderr}`);
   const authConfig = join(dir, 'auth.toml');
@@ -168,9 +175,24 @@ dataset = "${PATTERN_DATASET}"
 level = "write"
 lifts = ["work"]
 
+[[roles.pattern-writer.grants]]
+dataset = "${PATHS_DATASET}"
+level = "read"
+lifts = ["${PATHS_PROTECTION}"]
+
 [[roles.pattern-reader.grants]]
 dataset = "${PATTERN_DATASET}"
 level = "read"
+
+[[roles.pattern-reader.grants]]
+dataset = "${PATHS_DATASET}"
+level = "read"
+
+[[protections]]
+name = "${PATHS_PROTECTION}"
+dataset = "${PATHS_DATASET}"
+predicates = ["${PATHS_EX}worksFor"]
+classes = ["${PATHS_EX}Founder"]
 
 [[protections]]
 name = "work"
@@ -181,6 +203,15 @@ predicates = ["${PATTERN_PREDICATE}"]
 name = "e2e-setup"
 hash = "sha256:${createHash('sha256').update(token).digest('hex')}"
 server = ["server-admin"]
+
+[[tokens]]
+name = "e2e-limited"
+hash = "sha256:${createHash('sha256').update(limited).digest('hex')}"
+
+[[tokens.grants]]
+dataset = "overlay-limited"
+level = "read"
+graphs = ["urn:x-arq:DefaultGraph"]
 `,
     { mode: 0o600 },
   );
@@ -235,6 +266,24 @@ server = ["server-admin"]
       }),
       'loading the Pattern dataset',
     );
+    // the path finder's dataset, in two commits
+    await check(
+      await fetch(`${url}/$/datasets`, {
+        method: 'POST',
+        headers: { ...auth, 'Content-Type': 'application/json' },
+        body: JSON.stringify({ dbName: PATHS_DATASET, dbType: 'persistent' }),
+      }),
+      'creating the path finder dataset',
+    );
+    for (const [i, part] of PATHS_DATA.entries())
+      await check(
+        await fetch(`${url}/${PATHS_DATASET}/data`, {
+          method: 'POST',
+          headers: { ...auth, 'Content-Type': 'text/turtle' },
+          body: part,
+        }),
+        `loading part ${i + 1} of the path finder dataset`,
+      );
     for (let i = 0; ; i++) {
       const s = await (await fetch(`${url}/$/text/${DATASET}`, { headers: auth })).json();
       if (s.state === 'ready' && s.seq === s.storeSeq && s.docs > 0) break;
@@ -252,6 +301,7 @@ server = ["server-admin"]
 
     process.env.SPARKLES_E2E_URL = url;
     process.env.SPARKLES_E2E_TOKEN = token;
+    process.env.SPARKLES_E2E_LIMITED_TOKEN = limited;
     process.env.SPARKLES_E2E_STATE = state;
 
     // backup repositories registered through its API must lie under repos/ (the config

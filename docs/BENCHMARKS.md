@@ -446,6 +446,47 @@ memory the baseline needed, which meets A1. These are development numbers from a
 Namespace instance, not forge. [F16's Outcome](specs/F16-materialization-at-scale.md#outcome)
 has the method and the decision.
 
+### Small incremental runs on LUBM-style data
+
+Roadmap item 87 measured small incremental runs over a kept closure on forge on
+2026-10-23. The data is LUBM-style data with 100 universities from the generator of
+`examples/lubm.rs`, 13.1 million triples, not the UBA data of the LUBM section, and each run
+materializes the closure, then changes 1,000 triples, undoes the change and makes it again,
+each time from the closure kept in memory. Commit 534a7ad3 ran against a6179e58, the commit
+before the kept closure dropped the explicit facts, in six interleaved rounds at 16 threads,
+each run alone under the bench lock on a fresh copy of the dataset. The table gives the
+medians.
+
+| Run, 16 threads | a6179e58 | 534a7ad3 |
+|---|---|---|
+| RDFS, change, undo, change again | 17.5, 13, 15 ms | 19, 14.5, 13.5 ms |
+| OWL 2 RL, change, undo, change again | 37, 43, 26 ms | 43.5, 48.5, 26 ms |
+| RDFS, kept closure | 2,267 MiB | 927 MiB |
+| OWL 2 RL, kept closure | 2,654 MiB | 1,244 MiB |
+| RDFS, full run | 16.0 s | 14.8 s |
+| OWL 2 RL, full run | 21.9 s | 20.9 s |
+
+The changes stay within 1.2 times their earlier time while the kept closure needs 41% and
+47% of the memory. Changes of 100 triples at 16 threads and undos at 1 thread are still
+slower, by 1.3 to 2.3 times.
+
+The dataset above is in index format 2, the one format a6179e58 reads. A recheck on the
+dataset in index format 3, whose blocks have segments, compared 77789822, the work merged
+onto main, with main at dc95359c in six more rounds. Main holds the first pass of item 87.
+
+| Run, 16 threads, format 3 | dc95359c | 77789822 |
+|---|---|---|
+| RDFS, change, undo, change again | 36.5, 16.5, 13 ms | 18, 13.5, 12 ms |
+| OWL 2 RL, change, undo, change again | 111.5, 51.5, 44.5 ms | 40.5, 44.5, 25 ms |
+| RDFS, full run | 14.6 s | 14.7 s |
+| OWL 2 RL, full run | 19.9 s | 20.8 s |
+
+The change takes half its time on main for RDFS and about a third for OWL 2 RL. Full runs
+are 1% slower for RDFS and 5% slower for OWL 2 RL, which roadmap item 113 follows up.
+These are development A/B numbers rather than a refreshed
+benchmark. [F16's follow-ups](specs/F16-materialization-at-scale.md#roadmap-follow-ups-2026-10-18)
+give the ranges, the other sizes and the 1-thread runs.
+
 ### DBpedia at the 50M slice
 
 The subject-hash slice of DBpedia 2022.12.01 contains 50,143,058 input statements.
@@ -1176,6 +1217,42 @@ search with a lane read by the object, forward ones included, and made `ps-every
 search never makes it. `ps-every-both` returns a different path of the same length as
 before, because skipping literal predecessors changes the order in which ties are found.
 Both answers pass through `rdf:type` classes and no literal.
+
+#### Weighted paths for the path finder (2026-10-24)
+
+[U09](specs/U09-path-finder.md) Phase 3 lets the path finder weigh paths by a property of
+the reifiers, through F07's `path:weight`, and lists the weight properties with one
+aggregate query. The engine did not change, so a Namespace screen of the same setup as
+above checked the path searches again and timed the queries the panel now sends. A is the
+build before Phase 3 and B the lane's tip. `ps-pair-w` is `ps-pair` with
+`path:weight` and `path:cost`, `ps-pair-k5-w` is `ps-pair-k5` with the same, and
+`weight-props` is the panel's query for the weight properties. The data has no reifiers, so
+every edge weighs 1.
+
+| query | A median | B median | B/A |
+|---|---:|---:|---:|
+| `ps-pair` | 1.24 | 1.23 | 0.99 |
+| `ps-pair-all` | 1.44 | 1.24 | 0.86 |
+| `ps-pair-both` | 0.51 | 0.44 | 0.86 |
+| `ps-pair-k5` | 44.5 | 44.4 | 1.00 |
+| `ps-values10` | 8.13 | 7.96 | 0.98 |
+| `ps-all4` | 0.033 | 0.028 | 0.85 |
+| `ps-any` | 267 | 261 | 0.97 |
+| `ps-every-both` | 11.1 | 10.9 | 0.98 |
+| `ps-pair-w` | 679 | 674 | 0.99 |
+| `weight-props` | 0.017 | 0.014 | 0.83 |
+| `ps-pair-k5-w` | error | error | |
+
+Times are the server's execution times in milliseconds, and the geometric mean of B/A is
+0.93. The medians of one build varied by up to 128% between server processes on the
+fastest queries, so no change is above the noise, as expected with no engine change. The
+weighted searches show a gap instead. `ps-pair-w` takes 0.68 s where `ps-pair` takes
+1.2 ms, because a weighted search runs Dijkstra's algorithm from the source alone where an
+unweighted pair runs a breadth-first search from both ends. `ps-pair-k5-w` fails on both
+builds after about 7 s, when Yen's algorithm over Dijkstra visits more than the default
+10 million nodes. The path finder sends a limit of a million visits, so on a graph of
+this size a weighted search stops at the limit and the panel says so.
+[Roadmap](ROADMAP.md) item 150 makes weighted searches bidirectional.
 
 ### Graph algorithm polling
 

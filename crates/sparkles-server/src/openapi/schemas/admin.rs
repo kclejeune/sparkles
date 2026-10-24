@@ -774,12 +774,16 @@ fn validation(put: &mut dyn FnMut(&str, J)) {
         doc(
             json!({
                 "anyOf": [
-                    obj(&["config"], json!({ "config": { "type": "null" } })),
+                    obj(
+                        &["config"],
+                        json!({ "config": { "type": "null" }, "unionDefaultGraph": boolean() }),
+                    ),
                     obj(
                         &["language", "config", "status"],
                         json!({
                             "language": string_enum(&["shacl", "shex"]),
                             "config": sref("ValidationConfig"),
+                            "unionDefaultGraph": boolean(),
                             "status": obj(
                                 &["mode", "counters", "warnings", "recentRejections"],
                                 json!({

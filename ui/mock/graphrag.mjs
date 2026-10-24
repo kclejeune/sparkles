@@ -1,12 +1,15 @@
 // C22 in the mock: the GraphRAG routes of `/$/graphrag/{ds}` for the `org` dataset, with
-// two canned communities under one parent and their reports. Reviews change the canned
+// two canned communities under one parent and their reports, and for the `world` showcase
+// dataset of mock/world.mjs, with a tree of 25 communities in three levels. Reviews change the canned
 // reports. The mock does not run builds: the server's own tests cover them, and
 // `POST …/build` and `…/refresh` answer 501.
 
 import { isAdmin } from './memory.mjs';
 import { memberships } from './algo.mjs';
+import { WORLD, WORLD_KNOWS, WORLD_PEOPLE, worldCommunities } from './world.mjs';
 
-const RES = 'http://example.org/resource/';
+const ORG_RES = 'http://example.org/resource/';
+let RES = ORG_RES;
 const GRAPH = 'urn:x-sparkles:graphrag:reports';
 const C = (n) => `urn:x-sparkles:graphrag:org:${n}`;
 
@@ -31,9 +34,9 @@ function seed() {
     findings: [
       {
         text: `${about} works with the rest of the group every week.`,
-        about: [`${RES}${about.toLowerCase()}`],
+        about: [`${ORG_RES}${about.toLowerCase()}`],
         cites: [
-          `<<( <${RES}${about.toLowerCase()}> <http://example.org/ontology#memberOf> <${RES}payments> )>>`,
+          `<<( <${ORG_RES}${about.toLowerCase()}> <http://example.org/ontology#memberOf> <${ORG_RES}payments> )>>`,
         ],
         unmatchedNames: [],
       },
@@ -85,21 +88,58 @@ function seed() {
   };
 }
 
-let communities = seed();
+/** Each dataset with communities: its seed, the namespace of its members, their links. */
+const DATASETS = {
+  org: {
+    seed,
+    res: ORG_RES,
+    links: [
+      ['ana', 'kai'],
+      ['kai', 'lee'],
+      ['lee', 'mo'],
+    ],
+    knows: 'http://xmlns.com/foaf/0.1/knows',
+    label: (m) => m[0].toUpperCase() + m.slice(1),
+    sourceCommit: 3,
+  },
+  world: {
+    seed: worldCommunities,
+    res: WORLD,
+    links: WORLD_KNOWS,
+    knows: `${WORLD}knows`,
+    label: (m) => WORLD_PEOPLE.get(m) ?? m,
+    sourceCommit: 1,
+  },
+};
+const state = {};
+
+let communities = {};
+// The links among the members, which the overview counts between communities.
+let LINKS = DATASETS.org.links;
+let KNOWS = DATASETS.org.knows;
+let label = DATASETS.org.label;
+
+/** Points the handlers at the communities of dataset `name`; false when it has none. */
+function use(name) {
+  const d = Object.hasOwn(DATASETS, name) ? DATASETS[name] : null;
+  if (!d) return false;
+  communities = state[name] ??= d.seed();
+  ({ res: RES, links: LINKS, knows: KNOWS, label } = d);
+  return true;
+}
+
+/** The number of communities at each level. */
+const levelsOf = () => {
+  const n = [];
+  for (const c of Object.values(communities)) n[c.level] = (n[c.level] ?? 0) + 1;
+  return n.map((communities, level) => ({ level, communities }));
+};
 
 const counts = () => {
   const out = { unreviewed: 0, reviewed: 0, rejected: 0, stale: 0, failed: 0 };
   for (const c of Object.values(communities)) if (c.report) out[c.report.status]++;
   return out;
 };
-
-// The links among the members, which the overview counts between communities.
-const LINKS = [
-  ['ana', 'kai'],
-  ['kai', 'lee'],
-  ['lee', 'mo'],
-];
-const KNOWS = 'http://xmlns.com/foaf/0.1/knows';
 
 const groupId = (path, folded = false) =>
   'r1.' +
@@ -137,7 +177,7 @@ async function handleGroups(req, res, ds, ctx) {
     (b.by && typeof b.by === 'object' && 'reports' in b.by) || id?.startsWith('r1.');
   if (!isReports) return false;
   const commit = ds.commits?.length ?? 1;
-  if (ds.name !== 'org')
+  if (!use(ds.name))
     return (
       send(res, 200, {
         commit,
@@ -153,16 +193,12 @@ async function handleGroups(req, res, ds, ctx) {
       }),
       true
     );
-  const levels = [
-    { level: 0, communities: Object.values(communities).filter((c) => c.level === 0).length },
-    { level: 1, communities: Object.values(communities).filter((c) => c.level === 1).length },
-  ];
+  const levels = levelsOf();
   const set = id ? parseId(id) : { g: GRAPH, l: 0, p: [] };
   if (!set) return (fail(res, 400, 'the group id is malformed'), true);
   const last = set.p.length ? communities[set.p[set.p.length - 1]] : null;
   if (set.p.length && !last)
     return (fail(res, 400, 'the group names communities the reports do not hold'), true);
-  const label = (m) => m[0].toUpperCase() + m.slice(1);
   const top = (members) => members.slice(0, 3).map((m) => ({ iri: `${RES}${m}`, label: label(m) }));
   const within = { reports: { graph: GRAPH, level: 0 }, size: 0 };
   if (id) within.group = id;
@@ -268,7 +304,7 @@ export async function handleGraphrag(req, res, url, seg, ctx) {
   if (seg[0] !== '$' || seg[1] !== 'graphrag' || !seg[2]) return false;
   const ds = datasets.get(seg[2]);
   if (!ds) return (fail(res, 404, `No such dataset: ${seg[2]}`), true);
-  const enabled = ds.name === 'org';
+  const enabled = use(ds.name);
   const action = seg[3] ?? '';
   if (req.method === 'GET' && action === '') {
     const s = {
@@ -281,12 +317,9 @@ export async function handleGraphrag(req, res, url, seg, ctx) {
     if (enabled) {
       Object.assign(s, {
         reports: counts(),
-        levels: [
-          { level: 0, communities: 1 },
-          { level: 1, communities: 2 },
-        ],
+        levels: levelsOf(),
         lastBuild: {
-          sourceCommit: 3,
+          sourceCommit: DATASETS[ds.name].sourceCommit,
           branch: 'main',
           finishedAt: '2026-10-20T09:01:00Z',
           tokens: 6156,
@@ -329,7 +362,7 @@ export async function handleGraphrag(req, res, url, seg, ctx) {
         factCount: c.members.length * 4,
         members: c.members.map((m) => ({
           iri: `${RES}${m}`,
-          label: m[0].toUpperCase() + m.slice(1),
+          label: label(m),
         })),
         children: c.children.map((k) => ({ iri: k, title: communities[k]?.report?.title ?? null })),
         report: c.report,
@@ -367,6 +400,7 @@ export async function handleGraphrag(req, res, url, seg, ctx) {
     } catch {
       return (fail(res, 400, 'invalid JSON'), true);
     }
+    use(ds.name);
     const c = Object.values(communities).find((x) => x.report?.iri === b.report);
     if (!c) return (fail(res, 404, 'no such report'), true);
     if (b.title || b.summary) {

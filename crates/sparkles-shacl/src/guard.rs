@@ -379,6 +379,13 @@ impl ShaclGuard {
         self.loaded.read().shapes.clone()
     }
 
+    /// The data graph a validation of `snap` reads under this guard's configuration, as
+    /// validation options (no limits set): `None` when the configuration lists data
+    /// graphs none of which exists in `snap`.
+    pub fn data_graph_options(&self, snap: &Snapshot) -> Option<ValidateOptions> {
+        self.cfg.validate_options(snap)
+    }
+
     /// The limits past which a write is validated in full.
     pub fn tuning(&self) -> Tuning {
         *self.tuning.read()

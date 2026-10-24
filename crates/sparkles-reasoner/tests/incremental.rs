@@ -607,3 +607,149 @@ fn kept_lookups_follow_commits_undos_and_failed_runs() {
         }
     }
 }
+
+/// A kept closure over input graphs in a segmented generation, whose lookups read a
+/// segment of a block at a time, and whose insertions split their work into batches of
+/// bindings: random inserts and deletes, of the loaded triples among them, match a
+/// full run on one thread and on six.
+#[test]
+fn closure_kept_over_a_segmented_generation() {
+    for threads in [1, 6] {
+        for (p, owl) in [(Profile::Rdfs, false), (Profile::OwlRl, true)] {
+            let (_d, s) = persistent();
+            // individuals of the classes `random_triple` uses, with properties of their
+            // own whose domain, range and inverse are fixed, loaded in bulk so that they
+            // are in the generation's blocks. No rule makes those properties transitive,
+            // so the closure stays small.
+            let mut r = Rng(threads as u64 * 31 + owl as u64);
+            let mut nt = String::new();
+            for (s, p, o) in [
+                ("q0", format!("{RDFS}domain"), "C0"),
+                ("q1", format!("{RDFS}range"), "C1"),
+                ("q2", format!("{OWL}inverseOf"), "q3"),
+            ] {
+                nt.push_str(&format!("<{EX}{s}> <{p}> <{EX}{o}> .\n"));
+            }
+            for n in 0..4_000 {
+                let f = format!("<{EX}f{n}>");
+                nt.push_str(&format!("{f} <{RDF}type> <{EX}C{}> .\n", r.below(6)));
+                for _ in 0..3 {
+                    let o = match r.below(4) {
+                        0 => format!("<{EX}i{}>", r.below(10)),
+                        _ => format!("<{EX}f{}>", r.below(4_000)),
+                    };
+                    nt.push_str(&format!("{f} <{EX}q{}> {o} .\n", r.below(4)));
+                }
+            }
+            s.load(&[Source::from_bytes(
+                nt.into_bytes(),
+                RdfFormat::NTriples,
+                None,
+            )])
+            .unwrap();
+            assert!(s.snapshot().perm(Perm::Gspo).segmented());
+            let opts = ReasonOptions {
+                threads: Some(threads),
+                ..Default::default()
+            };
+            let cache = Cache::default();
+            let go = |since: Option<u64>| {
+                materialize_incremental(
+                    &s,
+                    &p,
+                    &Extras::default(),
+                    Incremental {
+                        since,
+                        cache: Some(&cache),
+                    },
+                    &opts,
+                )
+                .unwrap_or_else(|e| panic!("{e:#}"))
+            };
+            let rep = go(None);
+            check(&s, &p, &rep, "first run");
+            let mut since = rep.receipt.unwrap().commit.seq;
+            let mut memory = 0;
+            for step in 0..5 {
+                let now = base(&s);
+                let del: Vec<Triple> = (0..1 + r.below(20))
+                    .map(|_| now[r.below(now.len())].clone())
+                    .collect();
+                let add: Vec<Triple> = (0..1 + r.below(20))
+                    .map(|_| random_triple(&mut r, owl))
+                    .collect();
+                change(&s, &add, &del);
+                let rep = go(Some(since));
+                if rep.changes.as_ref().is_some_and(|c| c.source == "memory") {
+                    memory += 1;
+                }
+                check(&s, &p, &rep, &format!("{p} threads {threads} step {step}"));
+                since = rep.receipt.unwrap().commit.seq;
+            }
+            assert!(
+                memory > 0,
+                "{p} threads {threads}: no run continued from memory"
+            );
+        }
+    }
+}
+
+/// The backward search reads only a few derived rows before a long lookup of the input
+/// graphs. Every derived `ex:p` fact here depends on `ex:t ex:q ex:r`, so a search that
+/// read all 40,000 of them before the explicit `ex:e2 ex:p ex:o` would scan the input
+/// graphs once per derived fact before it found the proof of `ex:t ex:q ex:r`.
+#[test]
+fn backward_search_reaches_an_explicit_proof_past_many_derived_rows() {
+    let (_d, s) = persistent();
+    let rules = Profile::Rules(
+        "@prefix ex: <http://ex.org/>.
+         [a: (?x ex:p ex:o) -> (ex:t ex:q ex:r)]
+         [b: (ex:t ex:q ex:r), (?x ex:seed ex:v) -> (?x ex:p ex:o)]"
+            .into(),
+    );
+    let mut nt = String::new();
+    for n in 0..40_000 {
+        nt.push_str(&format!("<{EX}s{n}> <{EX}seed> <{EX}v> .\n"));
+    }
+    for e in ["e1", "e2"] {
+        nt.push_str(&format!("<{EX}{e}> <{EX}p> <{EX}o> .\n"));
+    }
+    s.load(&[Source::from_bytes(
+        nt.into_bytes(),
+        RdfFormat::NTriples,
+        None,
+    )])
+    .unwrap();
+    let cache = Cache::default();
+    let rep = run(&s, &rules, None, Some(&cache));
+    check(&s, &rules, &rep, "first run");
+    // the derived facts move into the generation's blocks, where they share the input
+    // graphs' permutations, and a run after the compaction keeps a closure over them
+    s.compact().unwrap();
+    change(&s, &[t("ex:z", "ex:seed", "ex:w")], &[]);
+    let rep = run(
+        &s,
+        &rules,
+        Some(rep.receipt.unwrap().commit.seq),
+        Some(&cache),
+    );
+    check(&s, &rules, &rep, "after the compaction");
+    change(&s, &[], &[t("ex:e1", "ex:p", "ex:o")]);
+    let rep = run(
+        &s,
+        &rules,
+        Some(rep.receipt.unwrap().commit.seq),
+        Some(&cache),
+    );
+    check(&s, &rules, &rep, "one deletion");
+    assert_eq!(rep.method, Method::Incremental, "{:?}", rep.fallback);
+    assert_eq!(
+        rep.changes.as_ref().map(|c| c.source.as_str()),
+        Some("memory")
+    );
+    assert!(
+        rep.base_scans < 1_000,
+        "{} scans of the input graphs",
+        rep.base_scans
+    );
+}

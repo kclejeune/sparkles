@@ -4,7 +4,7 @@
 use crate::Dataset;
 use crate::error::Result;
 use crate::history::HistoryOptions;
-use crate::overview::{GroupsRequest, groups_at};
+use crate::overview::{FacetsRequest, GroupsRequest, facets_at, groups_at};
 use crate::sparql::QueryOptions;
 
 /// The dataset's graph overview (from [`Dataset::graph`]).
@@ -51,6 +51,46 @@ impl Graph {
             }
         };
         groups_at(snap, req, &opts)
+    }
+
+    /// Count the entities of a class, of a list of IRIs or of the values of a query's
+    /// variable by ranges or values of their properties (spec U11 §3.2), with each facet
+    /// filtered by the brushes on the other facets. The queries run at `req.at` (the head
+    /// when `None`) with the dataset's query defaults and the view, budgets, deadline and
+    /// cancellation of `opts`. The answer is the JSON object that API.md describes under
+    /// "Facets".
+    ///
+    /// ```
+    /// use sparkles::Dataset;
+    /// use sparkles::overview::FacetsRequest;
+    ///
+    /// let ds = Dataset::memory();
+    /// ds.update("PREFIX ex: <http://ex/> INSERT DATA { ex:a a ex:T ; ex:age 31 . ex:b a ex:T ; ex:age 44 . ex:c a ex:T }")?;
+    /// let req = FacetsRequest::from_json(&serde_json::json!({
+    ///     "within": { "class": "http://ex/T" },
+    ///     "facets": [{ "property": "http://ex/age" }],
+    ///     "filters": [{ "property": "http://ex/age", "range": [30, 40] }],
+    /// }))?;
+    /// let answer = ds.graph().facets(&req, &Default::default())?;
+    /// assert_eq!(answer["size"], 3);
+    /// assert_eq!(answer["matching"], 1);
+    /// assert_eq!(answer["facets"][0]["missing"], 1);
+    /// # Ok::<_, sparkles::Error>(())
+    /// ```
+    pub fn facets(&self, req: &FacetsRequest, opts: &QueryOptions) -> Result<serde_json::Value> {
+        let store = self.ds.store();
+        let opts = self.ds.with_query_defaults(opts);
+        let snap = match &req.at {
+            None => store.snapshot(),
+            Some(at) => {
+                let o = HistoryOptions {
+                    cancel: opts.cancel.clone(),
+                    deadline: opts.deadline,
+                };
+                store.snapshot_at(at, &o)?.0
+            }
+        };
+        facets_at(snap, req, &opts)
     }
 }
 

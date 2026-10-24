@@ -108,6 +108,30 @@ pub fn validate(
     engine.run(None)
 }
 
+/// Validate a set of nodes, each against the shapes whose targets select it, in one
+/// report: [`validate_node`] for many nodes over one data graph. Duplicate nodes are
+/// validated once.
+pub fn validate_nodes(
+    snap: &Arc<Snapshot>,
+    shapes: &Shapes,
+    nodes: &[Term],
+    opts: &ValidateOptions,
+) -> Result<ValidationReport> {
+    let (mut data, ids) = DataGraph::new(
+        snap.clone(),
+        opts.data_graph.as_deref(),
+        &opts.extra_graphs,
+        &opts.exclude_graphs,
+        shapes,
+    )?;
+    let focus: Vec<Id> = nodes
+        .iter()
+        .map(|n| resolve_focus(&mut data, n, shapes))
+        .collect();
+    let engine = Engine::new(shapes, &data, ids, opts)?;
+    engine.run_nodes(&focus)
+}
+
 /// Validate a single node against the shapes whose targets select it (Jena
 /// `ShaclValidator.validate(shapes, graph, node)`).
 pub fn validate_node(
@@ -123,9 +147,21 @@ pub fn validate_node(
         &opts.exclude_graphs,
         shapes,
     )?;
-    let focus = data.resolve(node, shapes.bnodes_in_store);
+    let focus = resolve_focus(&mut data, node, shapes);
     let engine = Engine::new(shapes, &data, ids, opts)?;
-    engine.run(Some(focus))
+    engine.run_nodes(&[focus])
+}
+
+/// The id of a focus node named by a caller: a blank node with the label of a stored one
+/// (`b…`) is that stored node, whatever the scope of the shapes' own blank nodes, and any
+/// other term resolves as the shapes' terms do.
+fn resolve_focus(data: &mut DataGraph, node: &Term, shapes: &Shapes) -> Id {
+    if let Term::BlankNode(b) = node
+        && let Some(id) = sparkles_core::store::parse_bnode_label(b.as_str())
+    {
+        return id;
+    }
+    data.resolve(node, shapes.bnodes_in_store)
 }
 
 /// The focus nodes a shape is validated on (see [`validate_selected`]).
@@ -362,14 +398,20 @@ impl<'a> Engine<'a> {
     }
 
     fn run(&self, only: Option<Id>) -> Result<ValidationReport> {
-        let sel: Vec<Sel> = (0..self.shapes.shapes.len())
-            .map(|_| match only {
-                None => Sel::All,
-                Some(f) => Sel::Nodes(vec![f]),
-            })
-            .collect();
+        match only {
+            Some(f) => self.run_nodes(&[f]),
+            None => self.run_sel(&vec![Sel::All; self.shapes.shapes.len()]),
+        }
+    }
+
+    /// Validate `nodes` against the shapes whose targets select them.
+    fn run_nodes(&self, nodes: &[Id]) -> Result<ValidationReport> {
+        self.run_sel(&vec![Sel::Nodes(nodes.to_vec()); self.shapes.shapes.len()])
+    }
+
+    fn run_sel(&self, sel: &[Sel]) -> Result<ValidationReport> {
         let results: Vec<ValidationResult> = self
-            .run_shapes(&sel)?
+            .run_shapes(sel)?
             .into_iter()
             .flat_map(|r| r.results)
             .collect();

@@ -34,8 +34,10 @@ without a migration path, so keep backups of anything you cannot regenerate.
 * [Branches and merges](#branches-and-merges)
 * [The Explore overview](#the-explore-overview)
 * [Arcs on the map](#arcs-on-the-map)
+* [Facets and Use in query](#facets-and-use-in-query)
 * [Lenses on the graph](#lenses-on-the-graph)
   * [Algorithm lenses](#algorithm-lenses)
+* [The validation overlay](#the-validation-overlay)
 * [The time slider](#the-time-slider)
 * [Automatic compaction](#automatic-compaction)
 * [Formatting](#formatting)
@@ -1550,9 +1552,11 @@ The lookups run on the result's branch and at the state the result was read at. 
 compare two states, the entities that only removed rows use are looked up at the earlier one. Picking a row in the list beside the map highlights its arc.
 
 A click on a marker or an arc selects the entities it stands for, and the selection bar
-names the count and the source, with **Clear** and, in Explore, **Open as graph**, which
-draws the selected entities as the graph. The selection dims everything else on the map,
-and Explore's graph canvas dims the nodes outside it too. `Escape` clears it. With the map
+names the count and the source, with **Clear**, **Use in query** and, in Explore, **Open
+as graph**, which draws the selected entities as the graph. The selection dims everything
+else on the map, and the graph canvas dims the nodes outside it too, in Explore and on the
+query page, where the selection lasts across the result's views until the next run.
+`Escape` clears it. With the map
 focused, `Tab` moves through the markers in view, the largest first, `Enter` selects one,
 and `Shift+Enter` adds it to the selection. **List of places and links in view** below the
 map lists the same markers and arcs with their counts, for a screen reader and for taps. At
@@ -1560,6 +1564,53 @@ a phone's width the controls grow to 44 px and the map takes the page's width.
 
 A map draws at most 20,000 places and 20,000 links before merging, and says when a result
 had more. [U11](specs/U11-linked-views.md#outcome) records the measurements.
+
+## Facets and Use in query
+
+**Facets** beside the graph show how the values of the entities' properties are spread, and
+brushing a facet narrows the graph to the entities in the brush. In Explore, the **Facets**
+button in the graph toolbar, or `Shift+F`, opens the panel beside the properties panel. It
+counts the instances of the selected entity's class, or the drawn entities when that
+entity has no single class, and **Count** switches between the two when both apply. The
+counts come from the server for every entity of the set, not only the drawn ones.
+
+The panel opens with the three properties that the most entities of the set have, and
+**+ facet** adds others, up to six. A property whose values are numbers or dates becomes a
+histogram of up to 40 bins of round width, with dates counted by year. Any other property
+becomes a list of its 12 most frequent values, with how many entities have other values or
+none. Dragging across a histogram brushes a range, and so does moving one of the two
+handles under it. A click on a value of a list adds it to the brush or takes it out. Every
+other facet then counts only the entities in the brush, while the brushed facet keeps its
+own counts, so you can see what a wider brush would add. Faint bars behind a histogram show
+its counts before any other facet was brushed. The line at the bottom says how many of the
+set every brush keeps, and the drawn entities outside the brushes are dimmed through the
+selection, which then reads "selected by the facets". **Apply to query** opens a new query
+for the set with a triple and a `FILTER` per brush.
+
+On the query page, a `SELECT` result has a **Facets** tab. It counts the values of a
+variable of the query in every solution, not only the rows on screen, and **Count the
+values of** chooses the variable. **Apply to query** adds to the editor's query, for each
+brush, a triple that binds the property to a new variable and a `FILTER` over it, such as
+`?person ex:age ?age .` and `FILTER(?age >= 30 && ?age < 45)`, and leaves the rest of the
+text as it was. The filter is the one the server applied, so the query's distinct count of
+the variable equals the panel's count. `Mod+Z` undoes the edit. A query with `LIMIT`,
+`OFFSET`, `GROUP BY` or `HAVING` would count other entities once the filters sit inside its
+`WHERE` group, so **Apply to query** refuses it and says why. The result entities that the
+brushes keep become the selection, so the **Graph** and **Map** tabs dim the others.
+
+With a histogram focused, the arrow keys move a cursor over the bins, `Shift` with an arrow
+brushes from where the cursor was, `Enter` brushes the bin under the cursor, and `Escape`
+clears the brush. The handles are sliders that the arrow keys move by a bin, and they read
+out the brush and its count. **Table** lists the bins with their counts, and `Space` toggles
+the focused value of a list. At a phone's width the facets sit below the graph, and the
+values and handles are 44 px targets.
+
+**Use in query** in the selection bar writes the selected entities into the query as a
+`VALUES` block at the start of the `WHERE` group. On the query page it edits the query in the
+editor and binds the variable chosen beside the button, which starts as the result column
+that holds the most selected entities. In Explore it opens a new query with the selected
+entities and their labels. A block holds at most 1,000 entities, the first ones selected,
+and a note says how many were left out.
 
 ## The Pattern pane
 
@@ -1707,7 +1758,8 @@ a time.
   The class lens reads the asserted classes, since with reasoning every node would also
   be in each superclass. A node with several values takes the one most drawn nodes share.
 * **Badges** puts a pill with an `i` and a count in the corner of each node that has
-  inferred edges.
+  inferred edges. In Explore it also offers **validation results**, the
+  [validation overlay](#the-validation-overlay).
 * **Edges** draws the edges that the reasoner added dashed, with an `i` before their
   label. An edge counts as inferred when the graph shows it and a read without reasoning
   does not, which covers materialized inferences and RDFS on read alike. A triple that is
@@ -1777,6 +1829,61 @@ and runs when play stops. Above 20,000 drawn nodes only a size lens with project
 runs, and it shows the top 1,000 drawn nodes by value, with the rest at the smallest size.
 A server older than the view-only runs leaves projection scope disabled with the reason,
 and drawn-graph scope still works.
+
+## The validation overlay
+
+Explore can badge the SHACL and ShEx results of the nodes it draws. When the dataset has a
+write-time guard ([Write-time validation](API.md#write-time-validation)), the overlay is on
+by default. It is the **validation results** lens of the badge channel in the **Lenses**
+menu ([Lenses on the graph](#lenses-on-the-graph)), which turns it on or off, and the
+choice is remembered in the browser. `Shift+3` turns it on again after it was turned off.
+When the caller's grants cover only some graphs of the dataset, the menu does not offer
+the lens and says that validation needs access to every graph. The overlay validates only the drawn nodes, in requests of up
+to 500 nodes with one in flight, so its cost follows the picture and not the dataset. It
+validates the first 1,500 drawn nodes.
+
+While the lens is on, the **Shapes** picker under the menu's channels chooses where the
+shapes come from. The write-time guard is the
+default, and a ShEx guard validates with its own schema and shape map. A shapes graph of
+the dataset can be named by its IRI. The shapes the Validate panel of the dataset page
+last validated with can be used too, and without a guard they are the default. A node
+with results gets a badge with its count and its worst severity, `✕` for a violation,
+`⚠` for a warning and `ⓘ` for an info. A literal drawn as the value of a result gets the
+same mark. The overlay validates every node the canvas draws, including the nodes the
+path finder adds. The legend groups the nodes by their worst severity, and a click on an
+entry selects its nodes. The canvas's **List** view has a **validation results** column,
+such as "✕ 1 violation".
+
+A click on a badge opens the node's results, grouped by shape and constraint, with the
+path, the value and the messages. `V` opens the results of the selected node, and
+`Shift+V` selects the next node with results. **Show triples** draws the focus node, the
+edge of the result's path and the value, and marks them. At 390 px the results open as a
+sheet at the bottom of the screen.
+
+**Suggest fix** writes a SPARQL Update for the common constraints: `sh:minCount`,
+`sh:maxCount`, `sh:datatype`, `sh:class`, `sh:in`, `sh:hasValue` and `sh:closed`, and the
+ShEx cardinality, datatype, value set and closed failures. The update holds the result's
+terms, and what the result does not say is a placeholder such as `?value`, which must be
+filled in before **Preview** runs. When the guard's data graph is one named graph, the
+update writes that graph. When it is several graphs, or the default graph of a server
+started with `--union-default-graph`, the update holds `GRAPH ?graph` for the graph that
+holds the triple. A shapes graph or the Validate panel's shapes validate the default
+graph, so on such a server their updates hold `GRAPH ?graph` too. Preview is a dry run of the update
+([C15](specs/C15-write-previews.md)). It lists the changes and says whether the guard
+would still report the result, or that the guard's answer does not tell, as when it
+validated only some of the shapes and the state still has results it did not list. **Run** commits the update only after a preview of the same
+text, and the overlay then validates the drawn nodes again, so a fixed badge goes away.
+**Open in Query** takes the update to the query editor instead. Constraints that are not
+on one predicate, `sh:pattern`, `sh:sparql`, `sh:node` and qualified shapes get no
+suggestion.
+
+With the graph's **History** open, the overlay validates the state the slider shows, and it
+pauses while the history plays. It validates the drawn nodes as focus nodes, so a
+SHACL-SPARQL constraint that is not anchored at its focus node can give other results in a
+full validation, and the overlay says so when such a result appears. A caller whose
+grants cover only some graphs of the dataset cannot validate it, and the overlay shows
+"Validation needs access to every graph". A validation over the server's result budget
+shows the error and no badges.
 
 ## The time slider
 
@@ -2545,6 +2652,32 @@ removes the overlay. The search reads the commit of `main` that Explore shows. W
 its limit of a million visited nodes or ten seconds, the panel says so and suggests a
 shorter length, a lower hub limit or fewer predicates. At phone width the panel is a sheet
 at the bottom of the screen that folds to its handle.
+
+**Weight** in the filters orders the paths by a number on the reifiers of their edges
+instead of by their length. When the list is first opened, it asks the dataset for the
+properties that reifiers carry with numeric values of zero or more, most used first, and
+offers up to 20 of them. With a weight chosen, the search adds up that property along each
+path, as `path:weight` does, and an edge without a reifier or without the property weighs
+1. Each path in the list then shows its cost after its length, and the announcement names
+the cheapest cost. The default, **none, count edges**, counts the edges as before.
+
+### Finding paths on the query page
+
+The same panel opens over a query's graph results, from the **Paths** button of the graph
+toolbar or `Shift+P` while the graph has the focus. A right click or a long press on a node
+of the canvas offers **Paths from here** and **Paths to here**, and in the WebGL view the
+selected node fills **From**. The search reads the state the result was read at, on the
+result's branch, and the header names it. The paths are drawn on the result's own nodes and
+edges where the result has them, with each edge labelled by the paths that use it, and the
+nodes and edges a path needs that the result lacks are added for as long as the paths are
+shown. The WebGL view colours and thickens the path edges, labels the path nodes and draws
+the path numbers at the edges' midpoints, without the step-by-step animation, and it keeps
+its layout and its view while paths are shown and cleared. The keys `1` to `9`, `A` and
+`Escape` work as in Explore, with the focus in the list or on the graph. **Open in editor**
+opens the paths' query in a new tab of the query page, at the result's state. **Add to
+graph** is not offered, because a result graph is the query's answer and not a graph to
+build on. Closing the panel, or running a query again, removes the paths and the nodes
+they added.
 
 ## Graph algorithms
 

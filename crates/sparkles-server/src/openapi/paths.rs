@@ -900,6 +900,52 @@ fn schema(p: &mut Paths) {
     );
     p.add(
         op(
+            POST,
+            "/$/graph/{ds}/facets",
+            "getGraphFacets",
+            "Schema",
+            "Facet histograms of a set",
+        )
+        .doc("Counts the entities of a set by ranges of round width of a property's numbers or of the years of its dates, or by its 12 most frequent values, with the entities that have no value. The set is a class, up to 20,000 IRIs, or the distinct values of a variable of a `SELECT` query, and a set above 1,000,000 entities is refused with `507`. Each brush in `filters` keeps the entities with a value in its range or among its values, and each facet counts the set filtered by every brush but its own, so the facets filter each other. `matching` counts the set under every brush. A facet over a budget carries an `error` while the others stay. `candidates: true` also lists the properties of a sample of the set, ranked by the share that has a value. Every count comes from queries run under the caller's view, timeout and memory budget, so it needs read through the query endpoint and fails with `507` like a query.")
+        .see("facets")
+        .param("timeout")
+        .param("reasoning")
+        .body(
+            true,
+            "The set, its facets and the brushes.",
+            json!({ "application/json": { "schema": {
+                "type": "object",
+                "additionalProperties": false,
+                "required": ["within"],
+                "properties": {
+                    "within": { "type": "object", "description": "`{\"class\": IRI}`, `{\"nodes\": [IRI, …]}` with up to 20,000 IRIs, or `{\"query\": SELECT, \"variable\": name}`." },
+                    "facets": { "type": "array", "maxItems": 6, "items": { "type": "object", "description": "`{\"property\": IRI, \"bins\"?: 2–40, \"top\"?: 1–12, \"kind\"?: \"numeric\" | \"date\" | \"values\", \"edges\"?: [number, …], \"bars\"?: [term, …]}`. `edges` and `bars` hand back the ranges or values of an earlier answer." } },
+                    "filters": { "type": "array", "maxItems": 6, "items": { "type": "object", "description": "`{\"property\": IRI, \"range\": [from, to], \"kind\"?: \"numeric\" | \"date\"}`, where a date range is in whole years and `to` is excluded, or `{\"property\": IRI, \"values\": [term, …]}` with terms in the SPARQL JSON results form." } },
+                    "candidates": { "type": "boolean", "description": "Also list the properties of the set." },
+                    "at": { "type": "string", "description": "A commit, time or named snapshot." }
+                }
+            } } }),
+        )
+        .resp(
+            "200",
+            "The counts of each facet.",
+            Some(json!({ "application/json": { "schema": {
+                "type": "object",
+                "required": ["commit", "size", "matching", "facets", "truncated"],
+                "properties": {
+                    "commit": { "type": "integer" },
+                    "size": { "type": "integer", "description": "Entities in the set." },
+                    "matching": { "type": "integer", "description": "Entities of the set under every brush." },
+                    "facets": { "type": "array", "items": { "type": "object", "description": "`property`, `kind`, `missing`, and `bins` of `{from, to, count}` for a range facet or `values` of `{value, count, label?}` and `other` for a bar list, or `error` with its `budget` and `message`." } },
+                    "candidates": { "type": "array", "items": { "type": "object", "description": "`{property, share, kind}`." } },
+                    "truncated": { "type": "boolean", "description": "The candidates come from a sample of the set or were cut to 40." }
+                }
+            } } })),
+        )
+        .errors(&[400, 403, 404, 408, 503, 507]),
+    );
+    p.add(
+        op(
             GET,
             "/$/schema/{ds}/diff",
             "getSchemaDiff",
@@ -3735,6 +3781,7 @@ fn protocol(p: &mut Paths) {
     let mut shapes = Map::new();
     media(&RDF[..6], &mut shapes);
     shapes.insert("text/shaclc".into(), text());
+    shapes.insert("application/x-www-form-urlencoded".into(), text());
     let mut report = Map::new();
     media(&RDF[..6], &mut report);
     report.insert(
@@ -3743,12 +3790,13 @@ fn protocol(p: &mut Paths) {
     );
     p.add(
         op(POST, "/{ds}/shacl", "shacl", "Validation", "Validate with SHACL")
-            .doc("Validates a data graph of the dataset against the shapes graph in the body, as Fuseki's `/{ds}/shacl` does. The report answers `200` whether or not the data conforms.")
+            .doc("Validates a data graph of the dataset against the shapes graph in the body, as Fuseki's `/{ds}/shacl` does. The report answers `200` whether or not the data conforms. With `shapes=guard` or `shapes=<graph IRI>` the shapes come from the write-time guard or from a graph of the dataset, and the body is empty or a form of further parameters. A named source with any other body is a `400`.")
             .see("shacl-validation")
             .param("graphSel")
-            .query("target", s(), "Validate one node, an IRI or prefixed name.")
+            .query("target", json!({ "type": "array", "items": { "type": "string" }, "maxItems": 1000 }), "Validate these nodes against the shapes whose targets select them. Each is an IRI, a prefixed name or a blank node label, and the parameter may repeat up to 1,000 times.")
+            .query("shapes", s(), "`guard` for the write-time guard's shapes on its data graph, or the IRI of a shapes graph of the dataset.")
             .params(&["reasoning", "timeout", "at", "format"])
-            .body(true, "The shapes graph.", J::Object(shapes))
+            .body(false, "The shapes graph, or with `shapes` an empty body or a form of parameters.", J::Object(shapes))
             .resp("200", "The validation report.", Some(J::Object(report)))
             .errors(&[400, 408, 507]),
     );
@@ -3761,15 +3809,17 @@ fn protocol(p: &mut Paths) {
             .query("shape", s(), "A shape label; `START` by default.")
             .query("schema-format", json!({ "type": "string", "enum": ["shexc", "shexj", "shexr"] }), "The schema's syntax when the media type does not say.")
             .query("base", s(), "The base IRI of the schema.")
-            .params(&["graphSel", "reasoning", "timeout", "format"])
+            .query("schema", json!({ "type": "string", "enum": ["guard"] }), "`guard` validates against the write-time guard's schema on its data graph. The body is then empty or a form of parameters, and the shape map names up to 1,000 nodes, where `START` takes the shapes the guard's shape map gives each node.")
+            .params(&["graphSel", "reasoning", "timeout", "at", "format"])
             .body(
-                true,
-                "The schema, or a JSON envelope.",
+                false,
+                "The schema, or a JSON envelope, or with `schema=guard` an empty body or a form of parameters.",
                 json!({
                     "text/shex": text(),
                     "application/shex+json": { "schema": { "type": "object" } },
                     "application/json": { "schema": { "anyOf": [sref("ShexRequest"), { "type": "object", "description": "A ShExJ schema." }] } },
                     "text/turtle": text(),
+                    "application/x-www-form-urlencoded": text(),
                 }),
             )
             .resp(

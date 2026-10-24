@@ -1317,6 +1317,7 @@ class Algorithms:
 @final
 class GraphOverview:
     def groups(self, /, within: Mapping[str, str] | None = None, *, by: str | Mapping[str, Any] | None = None, limit: int | None = None, at: int | str | None = None, base_iri: str | None = None, prefixes: Mapping[str, str] | None = None, default_graph: Iterable[NamedNode | str] | None = None, named_graphs: Iterable[NamedNode | str] | None = None, include_inferred: bool = False, timeout: float | None = None, max_rows: int | None = None, max_memory_bytes: int | None = None, max_rows_produced: int | None = None, cancel: CancelToken | None = None) -> dict[str, Any]: ...
+    def facets(self, /, within: Mapping[str, Any], *, facets: Iterable[Mapping[str, Any]] | None = None, filters: Iterable[Mapping[str, Any]] | None = None, candidates: bool = False, at: int | str | None = None, base_iri: str | None = None, prefixes: Mapping[str, str] | None = None, default_graph: Iterable[NamedNode | str] | None = None, named_graphs: Iterable[NamedNode | str] | None = None, include_inferred: bool = False, timeout: float | None = None, max_rows: int | None = None, max_memory_bytes: int | None = None, max_rows_produced: int | None = None, cancel: CancelToken | None = None) -> dict[str, Any]: ...
 
 @final
 class Projections:

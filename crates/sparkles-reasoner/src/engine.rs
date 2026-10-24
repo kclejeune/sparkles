@@ -683,6 +683,22 @@ impl<'a> Eval<'a> {
         }
     }
 
+    /// Read the base tier's remembered lookups through `memo`, the blocks a caller's
+    /// earlier evaluations read last (see [`take_memo`](Self::take_memo)).
+    pub fn lend_memo(&mut self, memo: Memo) {
+        self.bmemo = memo;
+    }
+
+    /// The memo lent with [`lend_memo`](Self::lend_memo), its scans counted.
+    pub fn take_memo(&mut self) -> Memo {
+        let mut memo = std::mem::take(&mut self.bmemo);
+        if let Some(b) = self.g.base() {
+            b.add_scans(memo.scans);
+        }
+        memo.scans = 0;
+        memo
+    }
+
     /// The members of the RDF list at `head` among the visible rows, or `None` when it
     /// is not a well-formed list.
     pub fn list(&mut self, head: u64) -> Option<std::rc::Rc<[u64]>> {
@@ -861,19 +877,54 @@ impl<'a> Eval<'a> {
                     Some(First::Rows(c)) => self.rows(k, atom, b, c),
                     Some(First::Base(r)) => self.base_facts(k, atom, b, Some(&r), [s, p, o]),
                     None => {
-                        if self.g.reads_base(lo, hi) {
+                        let c = self.g.cands(s, p, o, lo, hi);
+                        let base = self.g.reads_base(lo, hi);
+                        if base && self.rows_first(c.len(), [s, p, o]) {
+                            let (head, rest) = c.split_at(ROWS_FIRST);
+                            self.rows(k, atom, b, head);
+                            if self.stop {
+                                return;
+                            }
+                            self.base_facts(k, atom, b, None, [s, p, o]);
+                            if self.stop {
+                                return;
+                            }
+                            self.rows(k, atom, b, rest);
+                            return;
+                        }
+                        if base {
                             self.base_facts(k, atom, b, None, [s, p, o]);
                             if self.stop {
                                 return;
                             }
                         }
-                        let c = self.g.cands(s, p, o, lo, hi);
                         self.rows(k, atom, b, c);
                     }
                 }
             }
             Step::Builtin(j) => crate::builtins::eval(self, j, k, b),
         }
+    }
+
+    /// Whether a backward search reads the first [`ROWS_FIRST`] of an atom's in-memory
+    /// candidates before its facts in the base tier, and the other candidates after them:
+    /// when there are some, and the base tier's lookup is long. The facts of the inferred
+    /// graph share the input graphs' permutations, so a lookup without a bound subject can
+    /// read many blocks of the store's own inferences to find few input facts, or none,
+    /// while the derived tier often holds an instance that proves the head at once. The
+    /// bound keeps a search from exploring a large derived relation, whose instances may
+    /// all depend on the fact being proved, before an explicit fact that proves it. A
+    /// search explores every instance before it calls a fact unprovable, so the order
+    /// changes how soon it stops and never its answer. Rules evaluated forward keep the
+    /// base tier first, the order of their output.
+    #[inline]
+    fn rows_first(&self, rows: usize, [s, p, o]: [Option<u64>; 3]) -> bool {
+        rows > 0
+            && self.collecting()
+            && self
+                .g
+                .base()
+                .is_some_and(|b| b.lookups().is_some() && b.blocks(s, p, o) > 1)
     }
 
     /// Match the atom of step `k` against in-memory rows.
@@ -1123,14 +1174,14 @@ const CHUNK: usize = 2048;
 /// Base-tier rows per work item.
 const BASE_CHUNK: usize = 4096;
 
-/// A share of an iteration's evaluation: rule `ri`'s plan from step `k`, with the
-/// bindings `b` (none bound when `None`), and the candidates of step `k` restricted to
-/// `first`.
+/// A share of an iteration's evaluation: rule `ri`'s plan from step `k`, with each of
+/// the bindings `b` in turn (none bound when there are none), and the candidates of step
+/// `k` restricted to `first`.
 struct Item<'a> {
     ri: usize,
     steps: &'a [Step],
     k: usize,
-    b: Option<Vec<u64>>,
+    b: Vec<Vec<u64>>,
     first: Option<First<'a>>,
 }
 
@@ -1175,13 +1226,26 @@ fn shares<'g>(
     Ok(out)
 }
 
+/// The in-memory candidates a backward search reads before a long base-tier lookup (see
+/// [`Eval::rows_first`]).
+const ROWS_FIRST: usize = 64;
+
 /// Bindings worked out up to plan step `d` before the work is split there.
 const MAX_SPLIT_BINDINGS: usize = 1 << 16;
 
+/// The fewest bindings a work item of a split evaluates in turn.
+const MIN_BATCH: usize = 8;
+
 /// The work of a plan split at step `d` (an atom): the bindings of the steps before it,
-/// from the shares `first` of step 0, each with the shares of step `d`'s candidates, in
-/// the order a sequential evaluation visits them, and the charge of the bindings. `None`
-/// when there are too many bindings.
+/// from the shares `first` of step 0, in the order a sequential evaluation visits them,
+/// and the charge of the bindings. `None` when there are too many bindings.
+///
+/// A binding whose candidates at step `d` are many gets an item per share of them. The
+/// others are evaluated in turn by items of [`MIN_BATCH`] or more consecutive bindings,
+/// about `per_item` each, which read step `d` as any later step does: through the
+/// remembered lookups and the blocks the item read last. Cutting each binding's
+/// candidates into shares would cost a read of the index for each, and an evaluation of
+/// its own for each share, which is most of the time of a small incremental run.
 #[allow(clippy::too_many_arguments)]
 fn split_at<'g>(
     g: &'g Graph,
@@ -1193,6 +1257,7 @@ fn split_at<'g>(
     first: &[Option<First<'g>>],
     abort: &AtomicBool,
     limits: &Limits,
+    items_wanted: usize,
 ) -> anyhow::Result<Option<(Vec<Item<'g>>, Held)>> {
     let per = r.nvars * 8 + 2 * size_of::<Vec<u64>>();
     type Part = anyhow::Result<Option<(Vec<Vec<u64>>, Held)>>;
@@ -1223,34 +1288,115 @@ fn split_at<'g>(
             Ok((collected.len() < MAX_SPLIT_BINDINGS).then_some((collected, held)))
         })
         .collect();
-    let mut bindings = Vec::new();
     let mut held = Held::new(&limits.budget);
+    let mut collected = Vec::with_capacity(parts.len());
     for p in parts {
         match p? {
             Some((v, h)) => {
-                bindings.extend(v);
+                collected.push(v);
                 held.absorb(h);
             }
             None => return Ok(None),
         }
-        if bindings.len() >= MAX_SPLIT_BINDINGS {
-            return Ok(None);
-        }
     }
+    let total: usize = collected.iter().map(Vec::len).sum();
+    if total >= MAX_SPLIT_BINDINGS {
+        return Ok(None);
+    }
+    // the slots of all bindings in one vector, alive until the loop below ends, while
+    // the batches take the bindings over
+    let slot = size_of::<Vec<u64>>();
+    held.try_grow(total * slot)?;
+    let mut bindings = Vec::with_capacity(total);
+    for v in collected {
+        bindings.extend(v);
+    }
+    let per_item = total.div_ceil(items_wanted.max(1)).max(MIN_BATCH);
     let mut items = Vec::new();
+    let mut batch: Vec<Vec<u64>> = Vec::new();
+    // a batch holds at most `per_item` bindings, and its slots are charged when it starts
+    let push = |batch: &mut Vec<Vec<u64>>, held: &mut Held, b: Vec<u64>| {
+        if batch.capacity() == 0 {
+            held.try_grow(per_item * slot)?;
+            batch.reserve_exact(per_item);
+        }
+        batch.push(b);
+        Ok::<(), MemoryExceeded>(())
+    };
+    let flush = |batch: &mut Vec<Vec<u64>>, items: &mut Vec<Item<'g>>, held: &mut Held| {
+        if batch.is_empty() {
+            return Ok::<(), MemoryExceeded>(());
+        }
+        held.try_grow(size_of::<Item<'_>>())?;
+        let b = seal_batch(std::mem::take(batch), held);
+        items.push(Item {
+            ri,
+            steps,
+            k: d,
+            b,
+            first: None,
+        });
+        Ok(())
+    };
     for b in bindings {
+        if !many_at(g, r, steps, d, &b) {
+            push(&mut batch, &mut held, b)?;
+            if batch.len() >= per_item {
+                flush(&mut batch, &mut items, &mut held)?;
+            }
+            continue;
+        }
+        flush(&mut batch, &mut items, &mut held)?;
         for f in shares(g, r, steps, d, &b)? {
             held.try_grow(size_of::<Item<'_>>() + per)?;
             items.push(Item {
                 ri,
                 steps,
                 k: d,
-                b: Some(b.clone()),
+                b: vec![b.clone()],
                 first: f,
             });
         }
     }
+    flush(&mut batch, &mut items, &mut held)?;
+    // the vector of all bindings has gone
+    held.shrink(total * slot);
     Ok(Some((items, held)))
+}
+
+/// A batch of [`split_at`] as it becomes a work item. One cut short by a binding of many
+/// candidates gives back the slots it reserved and did not fill, so that bindings of few
+/// and many candidates in turn do not hold `per_item` slots for each binding.
+fn seal_batch(mut b: Vec<Vec<u64>>, held: &mut Held) -> Vec<Vec<u64>> {
+    let cap = b.capacity();
+    if cap > b.len() {
+        b.shrink_to_fit();
+        held.shrink((cap - b.capacity()) * size_of::<Vec<u64>>());
+    }
+    b
+}
+
+/// Whether the candidates of plan step `k` (an atom) with the bindings `b` may be many:
+/// the base tier's key range spans more than one block, or the in-memory rows are more
+/// than a share of them.
+fn many_at(g: &Graph, r: &CRule, steps: &[Step], k: usize, b: &[u64]) -> bool {
+    let Some(&Step::Atom { atom, lo, hi }) = steps.get(k) else {
+        return false;
+    };
+    let a = &r.atoms[atom];
+    let v = |s: Slot| match s {
+        Slot::Const(c) => Some(c),
+        Slot::Var(x) if b[x] != 0 => Some(b[x]),
+        _ => None,
+    };
+    let (s, p, o) = (v(a.s), v(a.p), v(a.o));
+    if let Some(base) = g.base()
+        && g.reads_base(lo, hi)
+        && base.blocks(s, p, o) > 1
+    {
+        return true;
+    }
+    g.cands(s, p, o, lo, hi).len() > CHUNK
 }
 
 /// What a work item gave: its rule, its candidates with their charge, and its error.
@@ -1388,12 +1534,10 @@ pub(crate) fn run(
                 .flatten()
                 .map(|d| d + 1);
             if let Some(d) = deeper {
-                let split =
-                    split_at(gr, terms, r, p, *ri, d, &first, &abort, limits).map_err(|e| {
-                        match e.downcast::<MemoryExceeded>() {
-                            Ok(m) => memory(m, iteration),
-                            Err(e) => e,
-                        }
+                let split = split_at(gr, terms, r, p, *ri, d, &first, &abort, limits, split_min)
+                    .map_err(|e| match e.downcast::<MemoryExceeded>() {
+                        Ok(m) => memory(m, iteration),
+                        Err(e) => e,
                     })?;
                 if let Some((items, held)) = split {
                     work.extend(items);
@@ -1405,7 +1549,7 @@ pub(crate) fn run(
                 ri: *ri,
                 steps: p.as_slice(),
                 k: 0,
-                b: None,
+                b: Vec::new(),
                 first: f,
             }));
         }
@@ -1446,8 +1590,15 @@ pub(crate) fn run(
                     Mode::New,
                     &limits.budget,
                 );
-                let mut b = item.b.clone().unwrap_or_else(|| vec![0u64; r.nvars]);
-                ev.run(item.k, &mut b, item.first);
+                if item.b.is_empty() {
+                    ev.run(item.k, &mut vec![0u64; r.nvars], item.first);
+                }
+                for b in &item.b {
+                    if ev.err.is_some() || abort.load(Ordering::Relaxed) {
+                        break;
+                    }
+                    ev.run(item.k, &mut b.clone(), item.first);
+                }
                 let total = produced.fetch_add(ev.out.len(), Ordering::Relaxed) + ev.out.len();
                 if total > max_out || ev.err.is_some() {
                     abort.store(true, Ordering::Relaxed);
@@ -1656,4 +1807,29 @@ pub(crate) fn reads_lists(r: &CRule) -> bool {
                 | B::ListForAll
         )
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Batches cut short in turn by bindings of many candidates hold only their own
+    /// slots and charge: a thousand singleton batches of a reservation of 250 slots
+    /// keep the charge of a thousand slots.
+    #[test]
+    fn short_batches_give_back_their_spare_slots() {
+        let budget = Budget::unlimited();
+        let mut held = Held::new(&budget);
+        let slot = size_of::<Vec<u64>>();
+        let mut kept = Vec::new();
+        for i in 0..1_000u64 {
+            held.try_grow(250 * slot).unwrap();
+            let mut b: Vec<Vec<u64>> = Vec::with_capacity(250);
+            b.push(vec![i]);
+            let b = seal_batch(b, &mut held);
+            assert_eq!(b.capacity(), 1);
+            kept.push(b);
+        }
+        assert_eq!(held.bytes(), 1_000 * slot);
+    }
 }

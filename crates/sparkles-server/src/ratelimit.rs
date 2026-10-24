@@ -132,6 +132,7 @@ pub fn classify(
             || admin.starts_with("validate/")
             || admin.starts_with("schema/")
             || admin == "graph/{ds}/groups"
+            || admin == "graph/{ds}/facets"
             || admin.starts_with("stats/")
             || admin == "reason/{ds}/diagnostics"
             || admin == "graphql/{ds}/draft"

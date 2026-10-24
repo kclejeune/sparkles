@@ -376,6 +376,14 @@
     border-bottom: 1px solid var(--border);
     font-size: var(--fs-sm);
   }
+  /* on a phone the legend and the switches go on to further lines rather than past the edge */
+  @media (max-width: 720px) {
+    .toolbar {
+      flex-wrap: wrap;
+      row-gap: 4px;
+      padding-bottom: 4px;
+    }
+  }
   .legend {
     display: inline-flex;
     align-items: center;

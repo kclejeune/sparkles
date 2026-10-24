@@ -130,6 +130,7 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route("/$/schema/{ds}/profiles", get(schema::profiles))
         .route("/$/schema/{ds}/diff", get(schema::diff))
         .route("/$/graph/{ds}/groups", post(graph::groups))
+        .route("/$/graph/{ds}/facets", post(graph::facets))
         .route("/$/compact/{ds}", post(compact))
         .route("/$/backup/{ds}", post(backup))
         .route(
@@ -5114,6 +5115,11 @@ async fn cancel_task(
 
 /// Fuseki's SHACL service: `POST /{ds}/shacl?graph=default|union|<iri>` with the
 /// shapes graph as the body; answers with the validation report.
+///
+/// `target` may repeat, up to [`MAX_FOCUS_NODES`] times, to validate a set of nodes.
+/// `shapes=guard` or `shapes=<graph IRI>` takes the shapes from the write-time guard or
+/// from a graph of the dataset instead of the body, which must then be empty or a form
+/// of further parameters (spec U07 §11.3).
 #[cfg(feature = "shacl")]
 async fn shacl(
     State(st): St,
@@ -5125,8 +5131,22 @@ async fn shacl(
     use crate::shacl::ReportFormat;
     use crate::validation_common::GraphParam;
     let ds = dataset(&st, &name)?;
-    let params = Params::from_query(&uri);
+    let mut params = Params::from_query(&uri);
     let ct = content_type(&headers);
+    // a named source: the body holds no shapes, at most a form of parameters
+    let source = params.get("shapes").map(str::to_string);
+    let mut body = body;
+    if source.is_some() {
+        if ct == "application/x-www-form-urlencoded" {
+            params.extend_form(&body);
+            body = Default::default();
+        } else if !body.iter().all(u8::is_ascii_whitespace) {
+            return Err(err(
+                StatusCode::BAD_REQUEST,
+                "give the shapes in the body or name them with shapes=, not both",
+            ));
+        }
+    }
     // Turtle unless the content type names another RDF syntax or SHACLC
     // (`text/shaclc`); curl's default `application/x-www-form-urlencoded` is Turtle, and
     // so is `text/plain`, as Turtle is a superset of N-Triples
@@ -5134,14 +5154,65 @@ async fn shacl(
         "text/plain" => sparkles_shacl::ShapesSyntax::default(),
         ct => sparkles_shacl::ShapesSyntax::from_media_type(ct).unwrap_or_default(),
     };
+    let guard_shapes = match source.as_deref() {
+        None => None,
+        Some("guard") => {
+            if params.has("graph") {
+                return Err(err(
+                    StatusCode::BAD_REQUEST,
+                    "shapes=guard validates the guard's data graph: leave out graph",
+                ));
+            }
+            match ds.validation.read().clone() {
+                Some(crate::write_validation::Validation::Shacl(g)) => Some(g),
+                #[cfg(feature = "shex")]
+                Some(crate::write_validation::Validation::Shex(_)) => {
+                    return Err(err(
+                        StatusCode::BAD_REQUEST,
+                        format!(
+                            "the write-time guard of /{} validates ShEx: use /{}/shex?schema=guard",
+                            ds.name, ds.name
+                        ),
+                    ));
+                }
+                None => {
+                    return Err(err(
+                        StatusCode::NOT_FOUND,
+                        format!("/{} has no write-time validation", ds.name),
+                    ));
+                }
+            }
+        }
+        Some(iri) => {
+            oxrdf::NamedNode::new(iri).map_err(|e| {
+                err(
+                    StatusCode::BAD_REQUEST,
+                    format!("invalid shapes '{iri}' (guard or a graph IRI): {e}"),
+                )
+            })?;
+            None
+        }
+    };
+    let shapes_graph = source.filter(|s| s != "guard");
     let graph = GraphParam::parse(params.get("graph").unwrap_or("default"))
         .map_err(|e| err(StatusCode::BAD_REQUEST, format!("{e:#}")))?;
     // Fuseki's `?target=`: validate one node, an IRI or a prefixed name of the dataset's
-    // prefixes
-    let target = params
-        .get("target")
-        .map(|t| shacl_target(t, &crate::settings::prefixes::bound(&st, &ds)))
-        .transpose()?;
+    // prefixes; repeated, a set of nodes
+    let given = params.all("target");
+    if given.len() > MAX_FOCUS_NODES {
+        return Err(err(
+            StatusCode::BAD_REQUEST,
+            format!(
+                "too many targets: {} (at most {MAX_FOCUS_NODES})",
+                given.len()
+            ),
+        ));
+    }
+    let bound = crate::settings::prefixes::bound(&st, &ds);
+    let targets = given
+        .iter()
+        .map(|t| shacl_target(t, &bound))
+        .collect::<ApiResult<Vec<_>>>()?;
     let rfmt = match params.get("format") {
         Some(f) => ReportFormat::from_name(f).ok_or_else(|| {
             err(
@@ -5176,35 +5247,76 @@ async fn shacl(
         .into()
     };
     blocking(move || {
-        let text = std::str::from_utf8(&body)
-            .map_err(|_| err(StatusCode::BAD_REQUEST, "shapes graph is not UTF-8"))?;
-        let shapes = sparkles_shacl::Shapes::parse(text, format, None)
-            .map_err(|e| err(StatusCode::BAD_REQUEST, format!("{e:#}")))?;
         let past = QueryOptions {
             timeout: Some(timeout),
             cancel: Some(cancel.clone()),
             ..Default::default()
         };
         let (snap, resolved) = history::snapshot_for(&ds, at.as_ref(), &past)?;
-        if let GraphParam::Named(iri) = &graph
-            && !crate::validation_common::graph_exists(&snap, iri)
-        {
-            return Err(err(
-                StatusCode::NOT_FOUND,
-                format!("no such graph: <{iri}>"),
-            ));
-        }
         let inferred = has_inferred.then_some(INFERRED_GRAPH);
-        let mut opts = crate::shacl::validate_options(&snap, &graph, inferred, use_inferred)?;
+        // the shapes, and the data graph they are validated on
+        let (shapes, mut opts) = if let Some(g) = &guard_shapes {
+            // the guard's shapes as they are now, on its data graph at the state read
+            let Some(o) = g.data_graph_options(&snap) else {
+                // none of the guard's data graphs exists: nothing to validate
+                let empty = sparkles_shacl::ValidationReport {
+                    conforms: true,
+                    results: Vec::new(),
+                };
+                let buf = crate::shacl::write_report(&empty, rfmt)?;
+                let resp = ([(header::CONTENT_TYPE, rfmt.media_type())], buf).into_response();
+                let resp = with_commit(resp, &ds, snap.commit);
+                return Ok(history::history_headers(resp, resolved.as_ref(), &uri));
+            };
+            (g.shapes(), o)
+        } else {
+            let shapes = match &shapes_graph {
+                Some(iri) => {
+                    if !crate::validation_common::graph_exists(&snap, iri) {
+                        return Err(err(
+                            StatusCode::NOT_FOUND,
+                            format!("no such shapes graph: <{iri}>"),
+                        ));
+                    }
+                    sparkles_shacl::Shapes::from_store_graphs_with(
+                        &snap,
+                        std::slice::from_ref(iri),
+                        None,
+                    )
+                    .map_err(|e| err(StatusCode::BAD_REQUEST, format!("{e:#}")))?
+                }
+                None => {
+                    let text = std::str::from_utf8(&body)
+                        .map_err(|_| err(StatusCode::BAD_REQUEST, "shapes graph is not UTF-8"))?;
+                    sparkles_shacl::Shapes::parse(text, format, None)
+                        .map_err(|e| err(StatusCode::BAD_REQUEST, format!("{e:#}")))?
+                }
+            };
+            if let GraphParam::Named(iri) = &graph
+                && !crate::validation_common::graph_exists(&snap, iri)
+            {
+                return Err(err(
+                    StatusCode::NOT_FOUND,
+                    format!("no such graph: <{iri}>"),
+                ));
+            }
+            let mut opts = crate::shacl::validate_options(&snap, &graph, inferred, use_inferred)?;
+            // a shapes graph of the dataset is not part of the data it validates
+            if let Some(iri) = &shapes_graph {
+                opts.exclude_graphs.push(iri.clone());
+            }
+            (std::sync::Arc::new(shapes), opts)
+        };
         opts.timeout = Some(timeout);
         opts.cancel = Some(cancel);
         opts.max_results = max_results;
         opts.pool = crate::validation_common::validation_pool();
         let t = std::time::Instant::now();
         let _validate = tracing::info_span!("shacl.validate").entered();
-        let report = match &target {
-            Some(node) => sparkles_shacl::validate_node(&snap, &shapes, node, &opts),
-            None => sparkles_shacl::validate(&snap, &shapes, &opts),
+        let report = match targets.as_slice() {
+            [] => sparkles_shacl::validate(&snap, &shapes, &opts),
+            [node] => sparkles_shacl::validate_node(&snap, &shapes, node, &opts),
+            nodes => sparkles_shacl::validate_nodes(&snap, &shapes, nodes, &opts),
         }
         .map_err(|e| {
             let msg = format!("{e:#}");
@@ -5235,28 +5347,48 @@ async fn shacl(
         let resp = ([(header::CONTENT_TYPE, rfmt.media_type())], buf).into_response();
         let resp = with_commit(resp, &ds, snap.commit);
         let resp = history::history_headers(resp, resolved.as_ref(), &uri);
-        Ok(with_inferences(
-            resp,
-            &ds,
-            has_inferred && use_inferred,
-            snap.commit,
-        ))
+        let inferences = if guard_shapes.is_some() {
+            opts.extra_graphs.iter().any(|g| g == INFERRED_GRAPH)
+        } else {
+            has_inferred && use_inferred
+        };
+        Ok(with_inferences(resp, &ds, inferences, snap.commit))
     })
     .await
 }
 
-/// The node of a SHACL `?target=`: a prefixed name of `prefixes` expanded, else the IRI.
+/// The most focus nodes one validation request may name (`target` of `/{ds}/shacl`, the
+/// associations of a `/{ds}/shex` shape map under `schema=guard`).
+#[cfg_attr(not(any(feature = "shacl", feature = "shex")), allow(dead_code))]
+pub(crate) const MAX_FOCUS_NODES: usize = 1000;
+
+/// The node of a SHACL `?target=`: a prefixed name of `prefixes` expanded, an IRI in
+/// angle brackets or bare, or a blank node label `_:b…` of a stored blank node.
 #[cfg(feature = "shacl")]
 fn shacl_target(
     t: &str,
     prefixes: &std::collections::BTreeMap<String, String>,
 ) -> ApiResult<oxrdf::Term> {
-    let iri = match t.split_once(':') {
-        Some((p, local)) if !local.starts_with("//") => match prefixes.get(p) {
-            Some(ns) => format!("{ns}{local}"),
-            None => t.to_string(),
-        },
-        _ => t.to_string(),
+    if let Some(label) = t.strip_prefix("_:") {
+        return oxrdf::BlankNode::new(label)
+            .map(oxrdf::Term::BlankNode)
+            .map_err(|e| {
+                err(
+                    StatusCode::BAD_REQUEST,
+                    format!("invalid target '{t}': {e}"),
+                )
+            });
+    }
+    let iri = if let Some(inner) = t.strip_prefix('<').and_then(|r| r.strip_suffix('>')) {
+        inner.to_string()
+    } else {
+        match t.split_once(':') {
+            Some((p, local)) if !local.starts_with("//") => match prefixes.get(p) {
+                Some(ns) => format!("{ns}{local}"),
+                None => t.to_string(),
+            },
+            _ => t.to_string(),
+        }
     };
     oxrdf::NamedNode::new(iri)
         .map(oxrdf::Term::NamedNode)

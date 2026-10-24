@@ -17533,6 +17533,9 @@
             "properties": {
               "config": {
                 "type": "null"
+              },
+              "unionDefaultGraph": {
+                "type": "boolean"
               }
             },
             "required": [
@@ -17674,6 +17677,9 @@
                   "recentRejections"
                 ],
                 "type": "object"
+              },
+              "unionDefaultGraph": {
+                "type": "boolean"
               }
             },
             "required": [
@@ -24131,6 +24137,168 @@
           "Search"
         ],
         "x-sparkles-permission": "admin"
+      }
+    },
+    "/$/graph/{ds}/facets": {
+      "post": {
+        "description": "Counts the entities of a set by ranges of round width of a property's numbers or of the years of its dates, or by its 12 most frequent values, with the entities that have no value. The set is a class, up to 20,000 IRIs, or the distinct values of a variable of a `SELECT` query, and a set above 1,000,000 entities is refused with `507`. Each brush in `filters` keeps the entities with a value in its range or among its values, and each facet counts the set filtered by every brush but its own, so the facets filter each other. `matching` counts the set under every brush. A facet over a budget carries an `error` while the others stay. `candidates: true` also lists the properties of a sample of the set, ranked by the share that has a value. Every count comes from queries run under the caller's view, timeout and memory budget, so it needs read through the query endpoint and fails with `507` like a query.",
+        "externalDocs": {
+          "url": "https://github.com/kclejeune/sparkles/blob/main/docs/API.md#facets"
+        },
+        "operationId": "getGraphFacets",
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/ds"
+          },
+          {
+            "$ref": "#/components/parameters/timeout"
+          },
+          {
+            "$ref": "#/components/parameters/reasoning"
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "additionalProperties": false,
+                "properties": {
+                  "at": {
+                    "description": "A commit, time or named snapshot.",
+                    "type": "string"
+                  },
+                  "candidates": {
+                    "description": "Also list the properties of the set.",
+                    "type": "boolean"
+                  },
+                  "facets": {
+                    "items": {
+                      "description": "`{\"property\": IRI, \"bins\"?: 2–40, \"top\"?: 1–12, \"kind\"?: \"numeric\" | \"date\" | \"values\", \"edges\"?: [number, …], \"bars\"?: [term, …]}`. `edges` and `bars` hand back the ranges or values of an earlier answer.",
+                      "type": "object"
+                    },
+                    "maxItems": 6,
+                    "type": "array"
+                  },
+                  "filters": {
+                    "items": {
+                      "description": "`{\"property\": IRI, \"range\": [from, to], \"kind\"?: \"numeric\" | \"date\"}`, where a date range is in whole years and `to` is excluded, or `{\"property\": IRI, \"values\": [term, …]}` with terms in the SPARQL JSON results form.",
+                      "type": "object"
+                    },
+                    "maxItems": 6,
+                    "type": "array"
+                  },
+                  "within": {
+                    "description": "`{\"class\": IRI}`, `{\"nodes\": [IRI, …]}` with up to 20,000 IRIs, or `{\"query\": SELECT, \"variable\": name}`.",
+                    "type": "object"
+                  }
+                },
+                "required": [
+                  "within"
+                ],
+                "type": "object"
+              }
+            }
+          },
+          "description": "The set, its facets and the brushes.",
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "properties": {
+                    "candidates": {
+                      "items": {
+                        "description": "`{property, share, kind}`.",
+                        "type": "object"
+                      },
+                      "type": "array"
+                    },
+                    "commit": {
+                      "type": "integer"
+                    },
+                    "facets": {
+                      "items": {
+                        "description": "`property`, `kind`, `missing`, and `bins` of `{from, to, count}` for a range facet or `values` of `{value, count, label?}` and `other` for a bar list, or `error` with its `budget` and `message`.",
+                        "type": "object"
+                      },
+                      "type": "array"
+                    },
+                    "matching": {
+                      "description": "Entities of the set under every brush.",
+                      "type": "integer"
+                    },
+                    "size": {
+                      "description": "Entities in the set.",
+                      "type": "integer"
+                    },
+                    "truncated": {
+                      "description": "The candidates come from a sample of the set or were cut to 40.",
+                      "type": "boolean"
+                    }
+                  },
+                  "required": [
+                    "commit",
+                    "size",
+                    "matching",
+                    "facets",
+                    "truncated"
+                  ],
+                  "type": "object"
+                }
+              }
+            },
+            "description": "The counts of each facet."
+          },
+          "400": {
+            "$ref": "#/components/responses/BadRequest"
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "403": {
+            "$ref": "#/components/responses/Forbidden"
+          },
+          "404": {
+            "$ref": "#/components/responses/NotFound"
+          },
+          "408": {
+            "$ref": "#/components/responses/Timeout"
+          },
+          "503": {
+            "$ref": "#/components/responses/Unavailable"
+          },
+          "507": {
+            "$ref": "#/components/responses/InsufficientStorage"
+          },
+          "default": {
+            "$ref": "#/components/responses/Error"
+          }
+        },
+        "security": [
+          {
+            "basicAuth": []
+          },
+          {
+            "apiToken": []
+          },
+          {
+            "oidcAccessToken": []
+          },
+          {
+            "csrfToken": [],
+            "sessionCookie": []
+          },
+          {
+            "cloudflareAccess": []
+          }
+        ],
+        "summary": "Facet histograms of a set",
+        "tags": [
+          "Schema"
+        ],
+        "x-sparkles-permission": "read"
       }
     },
     "/$/graph/{ds}/groups": {
@@ -38692,7 +38860,7 @@
     },
     "/{ds}/shacl": {
       "post": {
-        "description": "Validates a data graph of the dataset against the shapes graph in the body, as Fuseki's `/{ds}/shacl` does. The report answers `200` whether or not the data conforms.",
+        "description": "Validates a data graph of the dataset against the shapes graph in the body, as Fuseki's `/{ds}/shacl` does. The report answers `200` whether or not the data conforms. With `shapes=guard` or `shapes=<graph IRI>` the shapes come from the write-time guard or from a graph of the dataset, and the body is empty or a form of further parameters. A named source with any other body is a `400`.",
         "externalDocs": {
           "url": "https://github.com/kclejeune/sparkles/blob/main/docs/API.md#shacl-validation"
         },
@@ -38705,9 +38873,21 @@
             "$ref": "#/components/parameters/graphSel"
           },
           {
-            "description": "Validate one node, an IRI or prefixed name.",
+            "description": "Validate these nodes against the shapes whose targets select them. Each is an IRI, a prefixed name or a blank node label, and the parameter may repeat up to 1,000 times.",
             "in": "query",
             "name": "target",
+            "schema": {
+              "items": {
+                "type": "string"
+              },
+              "maxItems": 1000,
+              "type": "array"
+            }
+          },
+          {
+            "description": "`guard` for the write-time guard's shapes on its data graph, or the IRI of a shapes graph of the dataset.",
+            "in": "query",
+            "name": "shapes",
             "schema": {
               "type": "string"
             }
@@ -38752,6 +38932,11 @@
                 "type": "string"
               }
             },
+            "application/x-www-form-urlencoded": {
+              "schema": {
+                "type": "string"
+              }
+            },
             "text/shaclc": {
               "schema": {
                 "type": "string"
@@ -38763,8 +38948,8 @@
               }
             }
           },
-          "description": "The shapes graph.",
-          "required": true
+          "description": "The shapes graph, or with `shapes` an empty body or a form of parameters.",
+          "required": false
         },
         "responses": {
           "200": {
@@ -38911,6 +39096,17 @@
             }
           },
           {
+            "description": "`guard` validates against the write-time guard's schema on its data graph. The body is then empty or a form of parameters, and the shape map names up to 1,000 nodes, where `START` takes the shapes the guard's shape map gives each node.",
+            "in": "query",
+            "name": "schema",
+            "schema": {
+              "enum": [
+                "guard"
+              ],
+              "type": "string"
+            }
+          },
+          {
             "$ref": "#/components/parameters/graphSel"
           },
           {
@@ -38918,6 +39114,9 @@
           },
           {
             "$ref": "#/components/parameters/timeout"
+          },
+          {
+            "$ref": "#/components/parameters/at"
           },
           {
             "$ref": "#/components/parameters/format"
@@ -38943,6 +39142,11 @@
                 "type": "object"
               }
             },
+            "application/x-www-form-urlencoded": {
+              "schema": {
+                "type": "string"
+              }
+            },
             "text/shex": {
               "schema": {
                 "type": "string"
@@ -38954,8 +39158,8 @@
               }
             }
           },
-          "description": "The schema, or a JSON envelope.",
-          "required": true
+          "description": "The schema, or a JSON envelope, or with `schema=guard` an empty body or a form of parameters.",
+          "required": false
         },
         "responses": {
           "200": {

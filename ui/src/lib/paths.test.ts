@@ -5,12 +5,14 @@ import {
   classifyFailure,
   defaultSettings,
   describePath,
+  fmtCost,
   groupPaths,
   invalidReason,
   overlay,
   pathLimit,
   pathQuery,
   predicateWords,
+  weightQuery,
 } from './paths';
 import { RDF_TYPE } from './rdf';
 
@@ -209,5 +211,59 @@ describe('classifyFailure', () => {
         .kind,
     ).toBe('unsupported');
     expect(classifyFailure(new Error('boom')).kind).toBe('other');
+  });
+});
+
+describe('weights (Phase 3)', () => {
+  const base = defaultSettings(iri('alice'), iri('lyon'));
+  const dbl = (n: number): Term => ({
+    type: 'literal',
+    value: String(n),
+    datatype: 'http://www.w3.org/2001/XMLSchema#double',
+  });
+
+  it('writes path:weight and binds the cost only with a weight', () => {
+    const q = pathQuery({ ...base, weight: EX + 'km' });
+    expect(q).toContain('path:weight <http://example.org/km> ;');
+    expect(q).toContain('path:length ?len ; path:cost ?cost .');
+    expect(q).toContain('SELECT ?path ?i ?s ?p ?o ?len ?cost WHERE');
+    const plain = pathQuery(base);
+    expect(plain).not.toContain('path:weight');
+    expect(plain).not.toContain('?cost');
+  });
+
+  it('reads each path’s cost and tells it in words', () => {
+    const rows = [
+      { ...row(0, 0, 'alice', 'worksFor', 'acme', 2), cost: dbl(3.5) },
+      { ...row(0, 1, 'acme', 'locatedIn', 'lyon', 2), cost: dbl(3.5) },
+      { ...row(1, 0, 'alice', 'livesIn', 'lyon', 1), cost: dbl(7) },
+    ];
+    const paths = groupPaths(rows, iri('alice'));
+    expect(paths.map((p) => [p.length, p.cost])).toEqual([
+      [2, 3.5],
+      [1, 7],
+    ]);
+    expect(describePath(paths[0], local)).toBe(
+      'path 1, length 2, cost 3.5, alice works for acme, acme located in lyon',
+    );
+    expect(announcement(paths)).toBe('2 paths found, the cheapest of cost 3.5');
+    // without weights no cost is read
+    expect(groupPaths([row(0, 0, 'alice', 'livesIn', 'lyon', 1)], iri('alice'))[0].cost).toBe(
+      undefined,
+    );
+  });
+
+  it('formats costs with at most three decimals', () => {
+    expect(fmtCost(3)).toBe('3');
+    expect(fmtCost(0.1 + 0.2)).toBe('0.3');
+    expect(fmtCost(1.23456)).toBe('1.235');
+  });
+
+  it('lists the numeric properties of reifiers, the most used first', () => {
+    const q = weightQuery(5);
+    expect(q).toContain('?r rdf:reifies ?t .');
+    expect(q).toContain('FILTER(isNumeric(?v) && ?v >= 0)');
+    expect(q).toContain('ORDER BY DESC(?n) ?w');
+    expect(q).toContain('LIMIT 5');
   });
 });

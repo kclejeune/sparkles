@@ -38,6 +38,9 @@
   import GraphMap from '$components/GraphMap.svelte';
   import GraphView, { type GEdge, type GNode } from '$components/GraphView.svelte';
   import SelectionBar from '$components/SelectionBar.svelte';
+  import FacetPanel from '$components/FacetPanel.svelte';
+  import { selectionQuery, setQuery, VALUES_CAP, type Brush } from '$lib/facets';
+  import type { FacetSetSpec } from '$lib/api';
   import { selection } from '$lib/selection.svelte';
   import Icon from '$components/Icon.svelte';
   import SchemaDiffDialog from '$components/SchemaDiffDialog.svelte';
@@ -62,6 +65,10 @@
   import LensLegend from '$components/LensLegend.svelte';
   import { describe as lensDescribe, entryIds, OTHER } from '$lib/lens';
   import { Lenses } from '$lib/lenses.svelte';
+  import ValidationOverlay from '$components/ValidationOverlay.svelte';
+  import ValidationSource from '$components/ValidationSource.svelte';
+  import { type Badge, type GuardProbe, type VResult } from '$lib/validation-overlay';
+  import { load as loadPref, save as savePref } from '$lib/storage';
 
   type ENode = {
     id: string;
@@ -114,6 +121,10 @@
   let canvasMode = $state<'graph' | 'map'>(
     page.url.searchParams.get('map') === '1' ? 'map' : 'graph',
   );
+  /** The facet panel beside the canvas (`&facets=1`, Shift+F, U11 section 2.3). */
+  let facetsOpen = $state(page.url.searchParams.get('facets') === '1');
+  /** The set the facets count: `class:` and a class IRI, or `drawn`; empty for the default. */
+  let facetSetKey = $state('');
 
   // The overview grouped by the GraphRAG communities (`&overview=communities`), opened
   // down to a community (`&community=`), with the report of the community it shows in the
@@ -185,9 +196,55 @@
     changes = null;
     selection.clear();
     lensPick = null;
+    vShown = new Set();
     graphEpoch++;
   }
   let graphView: GraphView | undefined = $state();
+
+  // --- the validation overlay (docs/specs/U07-data-quality-and-schema-diagram.md §11) ---
+  /**
+   * The person's last choice of the validation lens, on or off, or `null` for the default:
+   * on when the dataset has a write-time guard (U07 §11.2).
+   */
+  let vChoice = $state<boolean | null>(
+    loadPref<boolean | null>('sparkles.explore.validation', null),
+  );
+  let vLive = $state(false);
+  /** The lens's source, which the lens menu's picker sets and the overlay validates with. */
+  let vSource = $state<'guard' | 'graph' | 'editor'>('guard');
+  let vGraphIri = $state('');
+  let vProbe = $state<GuardProbe | null>(null);
+  let vProbeFor = $state('');
+  let vHasEditor = $state(false);
+  let vBadges = $state(new Map<string, Badge>());
+  let vMarked = $state<{ nodes: string[]; edges: string[] } | null>(null);
+  let vPlaying = $state(false);
+  /** The elements Show triples drew, which stay drawn while the paths are drawn alone. */
+  let vShown = $state(new Set<string>());
+  let overlay: ValidationOverlay | undefined = $state();
+  /** Show triples: draw the result's focus node, path edge and value, and mark them. */
+  function showResultTriples(r: VResult) {
+    const sid = termKey(r.focus);
+    // a node the path finder drew joins the graph, so that its triples can be drawn
+    const drawnNode = gNodes.find((n) => n.id === sid && n.change !== 'removed');
+    if (!nodes[sid] && drawnNode) ensureNode(r.focus, drawnNode.label);
+    const out = { nodes: nodes[sid] ? [sid] : [], edges: [] as string[] };
+    const shown = () => {
+      // paths alone hide the explored graph, but not the triples of a result
+      vShown = new Set([...vShown, ...out.nodes, ...out.edges]);
+      return out;
+    };
+    if (!r.path || !r.value || !nodes[sid]) return shown();
+    const lit = r.value.type === 'literal';
+    if (lit) showLiterals = true;
+    const oid = lit ? `lit:${sid}|${r.path}|${termKey(r.value)}` : termKey(r.value);
+    ensureNode(r.value, undefined, oid);
+    const [s, o] = r.inverse ? [oid, sid] : [sid, oid];
+    addEdge(s, r.path, o, lit);
+    out.nodes.push(oid);
+    out.edges.push(`${s}|${r.path}|${o}`);
+    return shown();
+  }
   // the reads of a view that goes away stop with it
   onDestroy(() => {
     selection.clear();
@@ -380,6 +437,7 @@
 
   function closeGraphTime() {
     graphTimeOpen = false;
+    vPlaying = false;
     resetTime();
   }
 
@@ -424,7 +482,7 @@
     if (!pathOverlay) return [...real, ...ghosts];
     // the path finder's overlay: on the drawn nodes, plus the nodes it adds
     const on = new Map(pathOverlay.nodes.map((n) => [n.key, n]));
-    const drawn = pathsAlone ? [] : [...real, ...ghosts];
+    const drawn = pathsAlone ? real.filter((n) => vShown.has(n.id)) : [...real, ...ghosts];
     const have = new Set(drawn.map((n) => n.id));
     const marked = drawn.map((n) => (on.has(n.id) ? { ...n, paths: on.get(n.id)!.paths } : n));
     const extra = pathOverlay.nodes
@@ -461,7 +519,7 @@
       .map((e) => ({ ...e, change: 'removed' as const }));
     if (!pathOverlay) return [...real, ...ghosts];
     const on = new Map(pathOverlay.edges.map((e) => [e.id, e]));
-    const drawn = pathsAlone ? [] : [...real, ...ghosts];
+    const drawn = pathsAlone ? real.filter((e) => vShown.has(e.id)) : [...real, ...ghosts];
     const have = new Set(drawn.map((e) => e.id));
     const marked = drawn.map((e) => (on.has(e.id) ? { ...e, paths: on.get(e.id)!.paths } : e));
     const extra = pathOverlay.edges
@@ -481,6 +539,14 @@
     return [...marked, ...extra];
   });
   const nodeCount = $derived(Object.keys(nodes).length);
+
+  // --- the validation overlay's drawn nodes and list column ---
+  // the nodes the canvas draws, path finder nodes included and ghosts left out
+  const vItems = $derived(
+    gNodes.flatMap((n) =>
+      n.term && n.change !== 'removed' ? [{ id: n.id, term: n.term, label: n.label }] : [],
+    ),
+  );
 
   // --- the path finder (docs/specs/U09-path-finder.md) ----------------------------------
 
@@ -673,6 +739,48 @@
       playing: graphPlaying,
     });
   });
+  // the validation lens of the badge channel (U07 §11.2): the overlay validates, and the
+  // lens carries its badges to the legend, the list column and the descriptions
+  const vOn = $derived(lenses.choice.badge.lens === 'validation');
+  lenses.onchoose = (ch, c, remember) => {
+    if (ch !== 'badge') return;
+    vChoice = c.lens === 'validation';
+    savePref('sparkles.explore.validation', vChoice);
+    // Shift+3 turns this lens on again, also after the page opens again
+    savePref('sparkles.explore.badgeLens', remember.lens);
+    if (!vChoice) vMarked = null;
+  };
+  {
+    const last = loadPref<string | null>('sparkles.explore.badgeLens', null);
+    if (last === 'validation' || last === 'inferred') lenses.setLast('badge', { lens: last });
+  }
+  $effect(() => {
+    const p = vProbe;
+    const name = ds;
+    const forDs = vProbeFor;
+    const choice = vChoice;
+    untrack(() => {
+      // until the overlay has probed this dataset, the lens is not offered
+      if (!p || !name || forDs !== name) {
+        lenses.setValidation(false, null);
+        return;
+      }
+      const ok = p.state !== 'restricted' && p.state !== 'unavailable';
+      lenses.setValidation(ok, ok ? null : `${p.message}.`);
+      if (!ok) return;
+      const guard = p.state === 'shacl' || p.state === 'shex';
+      // the person's own choice comes back where the lens exists again
+      if (choice === true) lenses.restore('badge', { lens: 'validation' });
+      else if (choice === null && guard) lenses.suggest('badge', { lens: 'validation' });
+    });
+  });
+  $effect(() => {
+    lenses.setValidationBadges(vBadges);
+  });
+  $effect(() => {
+    if (!vOn) vMarked = null;
+  });
+
   /** The list view's rows: the drawn nodes, ordered by the size lens when one is on. */
   const listRows = $derived.by((): ListRow[] => {
     const size = lenses.results.size;
@@ -1161,6 +1269,7 @@
     if (iri) p.set('iri', iri);
     if (tab !== 'graph') p.set('tab', tab);
     if (canvasMode === 'map' && tab === 'graph') p.set('map', '1');
+    if (facetsOpen && tab === 'graph') p.set('facets', '1');
     if (tab === 'search' && textQuery.trim()) p.set('q', textQuery.trim());
     if (iri && sideTab === 'memory') p.set('view', 'memory');
     if (!iri && tab === 'graph' && overviewMode === 'communities') {
@@ -1325,6 +1434,79 @@
     return Object.entries(by).sort((a, b) => order(a[0]) - order(b[0]) || a[0].localeCompare(b[0]));
   });
   const types = $derived(grouped.find(([p]) => p === RDF_TYPE)?.[1] ?? []);
+
+  // --- facets -------------------------------------------------------------------
+
+  /** The drawn entities, as the term keys the selection and the facets use. */
+  const drawnIds = $derived(gNodes.filter((n) => n.id.startsWith('<')).map((n) => n.id));
+  /** The sets the facets can count: each class of the selected entity, and the drawn ones. */
+  const facetSets = $derived.by(() => {
+    const out: { key: string; label: string; within: FacetSetSpec; name: string }[] = [];
+    for (const t of types)
+      if (t.type === 'uri')
+        out.push({
+          key: `class:${t.value}`,
+          label: `Instances of ${shortLabel(t.value, prefixes)}`,
+          within: { class: t.value },
+          name: `instances of ${shortLabel(t.value, prefixes)}`,
+        });
+    if (drawnIds.length)
+      out.push({
+        key: 'drawn',
+        label: `The ${drawnIds.length} drawn entities`,
+        within: { nodes: drawnIds.slice(0, 20_000).map((id) => id.slice(1, -1)) },
+        name: 'drawn entities',
+      });
+    return out;
+  });
+  /** The chosen set: the one picked, else the class of the selected entity when it has
+   * exactly one, else the drawn entities. */
+  const facetSet = $derived.by(() => {
+    const picked = facetSets.find((x) => x.key === facetSetKey);
+    if (picked) return picked;
+    const classes = facetSets.filter((x) => x.key.startsWith('class:'));
+    return classes.length === 1 ? classes[0] : facetSets.find((x) => x.key === 'drawn');
+  });
+  // the drawn set's IRIs, kept stable while the same nodes are drawn so the panel does not
+  // count again for an unrelated change
+  let facetWithin = $state<FacetSetSpec | null>(null);
+  $effect(() => {
+    const w = facetsOpen ? (facetSet?.within ?? null) : null;
+    if (JSON.stringify(w) !== JSON.stringify(untrack(() => facetWithin))) facetWithin = w;
+  });
+
+  function toggleFacets() {
+    facetsOpen = !facetsOpen;
+    if (!facetsOpen && selection.source === 'the facets') selection.clear();
+    syncUrl(selected?.term.type === 'uri' ? selected.iri : null);
+  }
+
+  /** The drawn entities the brushes keep become the selection, which dims the rest. */
+  function facetMatch(ids: Set<string> | null) {
+    if (ids) selection.set(ids, 'the facets', { keepEmpty: true });
+    else if (selection.source === 'the facets') selection.clear();
+  }
+
+  /** Use in query: the selected entities as the VALUES block of a new query, 1,000 at most. */
+  function useSelection(ids: string[]) {
+    const list = ids.slice(0, VALUES_CAP);
+    if (ids.length > list.length)
+      toasts.push(
+        'info',
+        `The query names the first ${VALUES_CAP.toLocaleString('en-US')} entities`,
+        `${(ids.length - list.length).toLocaleString('en-US')} more were left out.`,
+      );
+    app.pendingQuery = { query: selectionQuery(list), title: 'Selection' };
+    goto(resolve('/query'));
+  }
+
+  /** Explore's Apply to query: a query for the set under the brushes, in a new Query tab. */
+  function applyFacets(brushes: Brush[]) {
+    if (!facetWithin) return;
+    const list = Object.entries(prefixes).map(([prefix, iri]) => ({ prefix, iri }));
+    app.pendingQuery = { query: setQuery(facetWithin, brushes, list), title: 'Facets' };
+    goto(resolve('/query'));
+  }
   const comment = $derived(grouped.find(([p]) => p === RDFS_COMMENT)?.[1]);
 
   // --- search -------------------------------------------------------------------
@@ -1739,6 +1921,13 @@
         setCanvasMode(canvasMode === 'map' ? 'graph' : 'map');
         return;
       }
+      // Shift+F opens and closes the facet panel
+      if (e.key === 'F' && e.shiftKey) {
+        if (tab !== 'graph' || (!nodeCount && !facetsOpen)) return;
+        e.preventDefault();
+        toggleFacets();
+        return;
+      }
       // Shift+P opens the path finder; with it open, the graph takes its keys too
       if (e.key === 'P' && e.shiftKey && ds && tab !== 'schema') {
         e.preventDefault();
@@ -1912,6 +2101,7 @@
       class:overview={nodeCount === 0 && !graphTimeOpen && !community && !pathsOpen}
       class:reporting={nodeCount === 0 && !!community && !pathsOpen}
       class:mapmode={canvasMode === 'map' && nodeCount > 0 && !pathsOpen}
+      class:faceted={facetsOpen && nodeCount > 0 && !pathsOpen}
     >
       <div class="canvas">
         {#if nodeCount > 0 || graphTimeOpen || pathsOpen}
@@ -1953,7 +2143,18 @@
                   {lenses}
                   short={(iri) => shortLabel(iri, prefixes)}
                   keys={tab === 'graph' && canvasMode === 'graph'}
-                />
+                >
+                  {#snippet extra()}
+                    {#if vOn && vProbe}
+                      <ValidationSource
+                        probe={vProbe}
+                        editor={vHasEditor}
+                        bind:kind={vSource}
+                        bind:graphIri={vGraphIri}
+                      />
+                    {/if}
+                  {/snippet}
+                </LensMenu>
                 <button
                   class="btn sm"
                   aria-pressed={listView}
@@ -1962,6 +2163,12 @@
                   ><Icon name="table" size={13} /> List</button
                 >
               {/if}
+              <button
+                class="btn sm"
+                aria-pressed={facetsOpen}
+                title="Histograms of the properties of the entities, which brush the graph (Shift+F)"
+                onclick={toggleFacets}><Icon name="filter" size={13} /> Facets</button
+              >
               <button
                 class="btn sm"
                 aria-pressed={graphTimeOpen}
@@ -1975,7 +2182,38 @@
               >
             {/if}
           </div>
-          <SelectionBar onopengraph={openSelectionAsGraph} />
+          <SelectionBar onopengraph={openSelectionAsGraph} onuse={useSelection} />
+          {#if ds && vItems.length}
+            <ValidationOverlay
+              bind:this={overlay}
+              {ds}
+              items={vItems}
+              {prefixes}
+              on={vOn}
+              bind:sourceKind={vSource}
+              bind:graphIri={vGraphIri}
+              bind:probe={vProbe}
+              bind:probeFor={vProbeFor}
+              bind:hasEditor={vHasEditor}
+              at={mapAt}
+              branch={overviewBranch ?? ''}
+              paused={vPlaying}
+              head={app.datasets.find((d) => d.name === ds)?.head ?? null}
+              {selectedId}
+              onselect={(id) => {
+                select(id);
+                graphView?.center(id);
+              }}
+              onshowtriples={showResultTriples}
+              onopenquery={(text) => {
+                app.pendingQuery = { query: text, title: 'Suggested fix' };
+                goto(resolve('/query'));
+              }}
+              bind:live={vLive}
+              bind:badges={vBadges}
+              bind:marked={vMarked}
+            />
+          {/if}
         {/if}
         {#if graphTimeOpen && ds}
           <div class="graph-time">
@@ -1997,6 +2235,7 @@
               bind:playMode={graphPlayMode}
               bind:playing={graphPlaying}
               onshowdiff={(from, to) => openDiff(to, from)}
+              onplaying={(on) => (vPlaying = on)}
               onchange={() => syncUrl(selected?.term.type === 'uri' ? selected.iri : null)}
               onclose={() => {
                 closeGraphTime();
@@ -2073,12 +2312,15 @@
                   selected={selectedId}
                   onselect={select}
                   onexpand={expand}
-                  highlight={selection.ids}
+                  highlight={selection.active ? selection.ids : null}
                   pathFocus={pathHighlight}
                   onmenu={(id, at) =>
                     (menu = nodes[id]?.term.type === 'uri' ? { id, ...at } : null)}
                   lens={lenses.encoding}
                   marked={lensMarked}
+                  validation={vLive && vOn
+                    ? { badges: vBadges, marked: vMarked, onbadge: (id) => overlay?.open(id) }
+                    : null}
                 />
                 {#if menu}
                   <div
@@ -2123,6 +2365,39 @@
         {/if}
       </div>
 
+      {#if facetsOpen && nodeCount > 0 && !pathsOpen && ds}
+        <aside class="side side-facets" aria-label="Facets">
+          <FacetPanel
+            {ds}
+            within={facetWithin}
+            setLabel={facetSet?.name ?? 'entities'}
+            at={timeActive ? exAt : ''}
+            {prefixes}
+            drawn={drawnIds}
+            onmatch={facetMatch}
+            onapply={applyFacets}
+            onclose={toggleFacets}
+          >
+            {#snippet header()}
+              {#if facetSets.length > 1}
+                <label class="row facet-set"
+                  >Count
+                  <select
+                    value={facetSet?.key ?? ''}
+                    onchange={(e) => (facetSetKey = (e.currentTarget as HTMLSelectElement).value)}
+                  >
+                    {#each facetSets as x (x.key)}
+                      <option value={x.key}>{x.label}</option>
+                    {/each}
+                  </select></label
+                >
+              {:else if facetSet}
+                <span class="faint">{facetSet.label}</span>
+              {/if}
+            {/snippet}
+          </FacetPanel>
+        </aside>
+      {/if}
       {#if pathsOpen && ds}
         <aside class="side side-paths" aria-label="Path finder">
           {#key ds}
@@ -3035,7 +3310,15 @@
     display: grid;
     grid-template-columns: minmax(0, 1fr) 380px;
   }
+  /* the facets beside the properties on a wide screen */
+  .split.faceted {
+    grid-template-columns: minmax(0, 1fr) 320px 380px;
+  }
+  .facet-set select {
+    max-width: 100%;
+  }
   .canvas {
+    position: relative;
     display: flex;
     flex-direction: column;
     min-height: 0;
@@ -3556,9 +3839,24 @@
     .bar > .tabs {
       flex-shrink: 1;
     }
-    .split {
+    .split,
+    .split.faceted {
       grid-template-columns: minmax(0, 1fr);
       grid-template-rows: minmax(320px, 1fr) auto;
+    }
+    .split.faceted {
+      grid-template-rows: minmax(320px, 1fr) auto auto;
+    }
+    /* the facets take the height they need and the page scrolls to them */
+    .side-facets {
+      max-height: none;
+    }
+    .side-facets :global(.facets) {
+      height: auto;
+    }
+    .side-facets :global(.fbody) {
+      flex: none;
+      overflow: visible;
     }
     /* the map takes the height it needs and the page scrolls to the details below it */
     .split.mapmode {

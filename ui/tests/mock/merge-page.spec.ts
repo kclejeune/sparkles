@@ -164,7 +164,7 @@ test('the History graph draws every branch with its forks and merges', async ({
   const panel = page.locator('section.panel', {
     has: page.getByRole('heading', { name: 'History', exact: true }),
   });
-  const toggle = panel.getByRole('button', { name: 'Graph' });
+  const toggle = panel.getByRole('button', { name: 'Graph', exact: true });
   await expect(toggle).toHaveAttribute('aria-pressed', 'false', { timeout: 30_000 });
   await toggle.click();
   await expect(toggle).toHaveAttribute('aria-pressed', 'true');
@@ -193,7 +193,7 @@ test('the History graph draws every branch with its forks and merges', async ({
 
   // the choice of view is kept
   await page.goto('/ui/datasets/forest');
-  await expect(panel.getByRole('button', { name: 'Graph' })).toHaveAttribute(
+  await expect(panel.getByRole('button', { name: 'Graph', exact: true })).toHaveAttribute(
     'aria-pressed',
     'true',
     { timeout: 30_000 },
