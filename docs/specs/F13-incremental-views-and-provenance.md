@@ -861,5 +861,5 @@ of F16's derived-fact layer if F16 chooses it.
 - PUT starts a `view-build` task that waits for the first evaluation on the worker,
   rather than running the evaluation in the task.
 
-**Measurements.** See [BENCHMARKS](../BENCHMARKS.md#incremental-views), which also
-compares a view's pass on an inferred dataset with the one-off query.
+**Measurements.** See [BENCHMARKS](../BENCHMARKS.md#incremental-views). The harness for
+views on inferred data is in place, and item 265 tracks its forge run.

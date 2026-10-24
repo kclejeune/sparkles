@@ -2110,11 +2110,8 @@ again with them, and item 221 tracks maintaining it incrementally. The test
 `inferred_pass_against_query` in the same file adds a small schema to the data and, for the
 materialized case, an inferred `rdf:type` per person. It then makes 100 commits that touch
 each view and 100 that do not, and compares the round after a touching commit with a
-one-off evaluation of the query. A screen on an 8-vCPU Namespace instance found that such
-a round costs about one evaluation of the query, between 0.75 and 1.02 times its median at
-200,000 and 1,000,000 people. A commit outside the footprint of the rewritten query skipped
-the view. The screen is not a published measurement, and item 265 tracks running the test
-and the commit path without views on forge.
+one-off evaluation of the query. Its numbers are not published yet, and item 265 tracks
+running it and the commit path without views on forge.
 
 ## Bindings
 
