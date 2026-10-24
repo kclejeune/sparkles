@@ -708,7 +708,9 @@ view. Queries 2, 6 and 9 read millions of facts at 100 universities and take 12 
 times as long as over the materialization. That is what `auto` of Phase 2 is for. Item
 190 holds the work on the per-query cost.
 
-**Acceptance.** A1 holds at 2,000 nodes in `backward_rules_answer_on_demand`. A2 holds in
+**Acceptance.** A1 holds at 2,000 nodes in `backward_rules_answer_on_demand`, and at
+the example's 100,000 nodes `sparkles query --reasoning demand` returns the 99,990
+ancestors of `ex:n10` in 7.4 s on the nsc instance, one iteration per node. A2 holds in
 the differential test `demand_answers_like_materialization`, over random data and
 queries for every profile and for Jena rules with builtins, `noValue` and backward rules,
 and on LUBM as above. A3 holds as above, and `owl_rl_demand_follows_the_schema` checks it
