@@ -499,7 +499,15 @@ async fn a_branch_keeps_its_projection() {
     let s = server_with(20, DbType::Persistent, None).await;
     let (st, j) = json_of(&s.app, post("/$/branches/d", r#"{"name":"dev"}"#)).await;
     assert_eq!(st, StatusCode::CREATED, "{j}");
-    let (st, j) = json_of(&s.app, post("/$/vector/d/e/projection?branch=dev", "")).await;
+    // the branch builds its own copy of the index, so wait until it answers
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
+    let (st, j) = loop {
+        let (st, j) = json_of(&s.app, post("/$/vector/d/e/projection?branch=dev", "")).await;
+        if !j.to_string().contains("still being built") || std::time::Instant::now() > deadline {
+            break (st, j);
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    };
     assert_eq!(st, StatusCode::OK, "{j}");
     let (st, j) = json_of(&s.app, get("/$/vector/d/e/projection?branch=dev")).await;
     assert_eq!(st, StatusCode::OK, "{j}");

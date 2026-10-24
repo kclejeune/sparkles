@@ -3641,6 +3641,26 @@ impl Store {
             .is_some_and(|ti| ti.checkpoint_background_for_test())
     }
 
+    /// Test hook: stop the full-text index's segment merges.
+    #[cfg(all(feature = "text", feature = "failpoints"))]
+    #[doc(hidden)]
+    pub fn stop_text_merges_for_test(&self) {
+        if let Some(ti) = self.text.load_full() {
+            ti.stop_merges_for_test();
+        }
+    }
+
+    /// Test hook: the background full-text checkpoint passes that held the live writer
+    /// lock, those of them that cleared the index's marker, and the background passes of
+    /// any kind that cleared it.
+    #[cfg(all(feature = "text", feature = "failpoints"))]
+    #[doc(hidden)]
+    pub fn text_background_checkpoints_for_test(&self) -> [u64; 3] {
+        self.text
+            .load_full()
+            .map_or([0; 3], |ti| ti.background_checkpoints_for_test())
+    }
+
     /// Test hook: pause (or resume) the full-text index's background tick, so staged
     /// documents stay uncommitted until a search, compaction or close.
     #[cfg(feature = "text")]
