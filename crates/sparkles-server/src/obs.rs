@@ -264,7 +264,7 @@ fn route_op(route: Option<&str>, req: &Request) -> Op {
         "/{ds}/sparql" | "/{ds}/query" | "/{ds}/sparql/diff" | "/{ds}/queries/{name}" => Op::Query,
         "/{ds}/update" => Op::Update,
         "/{ds}/data" | "/{ds}/get" | "/{ds}/{*graph}" => Op::Gsp,
-        "/{ds}/upload" => Op::Upload,
+        "/{ds}/upload" | "/{ds}/mappings/{name}/run" => Op::Upload,
         "/{ds}/patch" => Op::Patch,
         "/{ds}/shacl" => Op::Shacl,
         "/{ds}/shex" => Op::Shex,

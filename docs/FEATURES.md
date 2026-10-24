@@ -122,6 +122,26 @@ These read paths are tuned for queries over data that is not yet in memory
   batches. CSVW covers datatypes and formats, null values, defaults, lists, virtual
   columns and RFC 6570 URI templates. Tables stream, compressed or not, and an invalid
   cell stops the load and names its row and column.
+* CSVW's standard mode adds the table group, table and row descriptions, and primary and
+  foreign keys are checked across the tables of a load in the order their references
+  need. A CONSTRUCT template can call Tarql's `tarql:expandPrefix` and
+  `tarql:expandPrefixedName`, and with `--lookup` or `lookup=true` it reads the
+  dataset's head to link rows to resources the dataset has.
+* R2RML, RML and YARRRML mappings load CSV, TSV, JSON, JSON Lines, Parquet and SQLite
+  sources ([F19](specs/F19-mappings-and-virtual-graphs.md),
+  [USAGE.md](USAGE.md#mappings-r2rml-rml-and-yarrrml)). RML covers both the rml.io
+  vocabulary and RML-Core. `sparkles map run`, `sparkles load --mapping` and uploads run
+  them. Each source is read once as a stream, and values keep their natural types. A join
+  over one SQLite connection runs as one SQL statement, and other joins use a hash table
+  within the memory budget. Function maps call GREL, IDLab and SPARQL functions.
+  `sparkles map` also checks a mapping, converts YARRRML to RML-Core Turtle and drafts an
+  R2RML mapping from a SQLite database. The W3C R2RML test cases pass on SQLite apart
+  from three, and the RML-Core cases with CSV and JSON sources apart from six.
+* Mappings of every kind can be stored per dataset with versions and run again
+  ([API.md](API.md#stored-mappings)). A run in replace mode commits only the net change.
+  The Graph Store protocol takes CSV bodies with a stored or default mapping, and the
+  server reads SQLite databases through the named connections of its `connections`
+  settings kind.
 
 ### Transactions and durability
 
@@ -1456,11 +1476,16 @@ links each item to its design spec.
 * The loader reads TriX, RDF Thrift, RDF Protobuf and RDF/JSON by first rewriting each
   file as N-Quads in a temporary file. The library's `load_str` and `dump_graph` take only
   the W3C syntaxes, and SPARQL `LOAD` reads TriX but not the other three. Roadmap item 73.
-* CSV and TSV import supports CSVW in its minimal mode and CONSTRUCT templates. There are
-  no RML or R2RML mappings, no CSVW standard mode and no primary-key or foreign-key
-  checks, and a template cannot read the target dataset. Roadmap item 22.
-* Tables are imported, not queried in place, and the Graph Store endpoint does not read
-  CSV. Roadmap item 43.
+* Mappings read no PostgreSQL or DuckDB database and no Parquet file in an object store.
+  Roadmap items 230 and 237.
+* RML join conditions written as expression maps are not read, and function maps call 20
+  of SPARQL's functions. Roadmap items 232 and 236.
+* Stored mapping runs are not tasks, the web UI has no Mappings page, and the JVM and
+  Node.js bindings cannot run mappings. Roadmap items 231, 233 and 234.
+* The W3C CSVW test suite does not run. Roadmap item 235.
+* A template lookup that binds a blank node of the dataset writes a new node, and a JSON
+  number with a fraction or an exponent loses its source form. Roadmap items 238 and 239.
+* Tables and databases are imported, not queried in place. Roadmap item 43.
 
 * Incremental views are `table` views on `main`, maintained after the commit. There are
   no `graph` views, no maintenance inside the commit, no WebSocket or MCP access, no Node

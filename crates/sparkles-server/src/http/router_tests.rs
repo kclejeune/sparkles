@@ -36,6 +36,7 @@ mod geo_convert;
 mod group_commit;
 mod inline;
 mod loads;
+mod mappings;
 #[cfg(feature = "mcp")]
 mod mcp;
 mod open;
