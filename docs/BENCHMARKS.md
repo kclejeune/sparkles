@@ -1620,6 +1620,35 @@ queries that decode many strings, such as `export-500k`, `contains` and `lang-fi
 the default. Cold queries ran 2% to 3% faster on average, because fewer vocabulary pages
 are read, but cold `export-500k` still took 1.11 times as long.
 
+Roadmap item 108 made FSST reads faster without changing the files
+([X11](specs/X11-index-compression-and-predicate-patterns.md#item-108-faster-fsst-reads)).
+Forge compared the release binary of `e411a772` with the branch at `c2518d7b` on
+2026-10-24, with both binaries on the same stores in interleaved rounds. Warm 10.5M cells
+are medians of four runs of 15 requests, warm DBpedia cells of two runs of 10, and cold
+cells of two runs of five cold samples.
+
+| Measurement | Main, front | Main, FSST | Branch, front | Branch, FSST |
+|---|---:|---:|---:|---:|
+| Warm `export-500k` at 10.5M | 106.6 ms | 118.1 ms | 105.6 ms | 115.7 ms |
+| Warm `contains` at 10.5M | 13.08 ms | 14.11 ms | 12.77 ms | 13.31 ms |
+| Warm `lang-filter` at 10.5M | 9.24 ms | 9.99 ms | 9.30 ms | 9.69 ms |
+| Warm `star-join` at 10.5M | 29.07 ms | 29.18 ms | 28.86 ms | 30.40 ms |
+| Warm `export-1m` on DBpedia | 357.0 ms | 959.3 ms | 347.7 ms | 366.4 ms |
+| Warm geometric mean at 10.5M | 1 | 1.000 | 0.992 | 1.004 |
+| Warm geometric mean on DBpedia | 1 | 1.062 | 1.019 | 1.041 |
+| Cold `export-500k` at 10.5M | 131.7 ms | | 131.4 ms | 134.1 ms |
+| Cold geometric mean at 10.5M | 1 | | 0.999 | 0.999 |
+| Cold geometric mean on DBpedia | 1 | | 0.968 | 0.958 |
+
+The DBpedia export took 2.69 times as long with main's FSST as with front coding, and it
+takes 1.05 times as long with the branch's. The branch's front coding measured 1.019 on
+DBpedia because of queries under 1 ms in a single round, and perf on atlas counted the same
+or fewer instructions for it on each of the nine DBpedia queries that moved most. Cold `export-500k` now meets the gate, at 1.02
+times front coding. Warm `contains`, `lang-filter` and the export at 10.5M still run 4% to
+10% slower than front coding, and DBpedia's `abstract-contains` and `label-regex` 12%
+slower, so FSST stays an option. `star-join` runs 4% slower with the branch's FSST than
+with main's, which roadmap item 160 follows up.
+
 ## Loading and index builds
 
 Sparkles builds its index in one parallel pass. Parsing and vocabulary merging run on all

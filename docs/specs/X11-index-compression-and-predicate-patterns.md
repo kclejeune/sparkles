@@ -1,8 +1,10 @@
 # X11: Index compression and predicate patterns
 
 > **Status:** Phase 1 built. Phase 2a, FSST suffixes, is built as an option that is off by
-> default. Phase 2b and Phase 3 are not built. Their measured savings are below their
-> gates, and the [Outcome](#phases-not-built) gives the figures.
+> default. Roadmap item 108 made FSST reads faster, but warm queries that decode many
+> strings still miss the gate, so the option stays off. Phase 2b and Phase 3 are not built.
+> Their measured savings are below their gates, and the [Outcome](#phases-not-built) gives
+> the figures.
 >
 > **Phases:** Phase 1 is predicate patterns: a per-subject pattern table built with the
 > generation, `spk:hasPredicate`, and the planner's use of patterns for predicate listings
@@ -478,7 +480,9 @@ long old versions stay readable is X12's.
 ## Outcome
 
 Phase 1 is built. Phase 2a is built as the option `--vocab-codec fsst`, which stays off
-by default because the warm queries that decode many terms miss §4.4's gate. Phase 2b,
+by default because the warm queries that decode many terms miss §4.4's gate. Roadmap item
+108 made those reads faster without changing the files, and [its section](#item-108-faster-fsst-reads)
+records why the gate is still missed. Phase 2b,
 Phase 3 and open question 1 are not built. [Phases not built](#phases-not-built) gives
 what each would save on the measured data, and they remain under [ROADMAP](../ROADMAP.md)
 item 16.
@@ -653,9 +657,92 @@ DBpedia, where literal suffixes are long. Unrolling the decode four codes at a t
 not help. FSST therefore stays an option for deployments bound by disk or page cache,
 where the cold figures apply. Every query returned the same answers with both codecs.
 
-### Phases not built
+### Item 108, faster FSST reads
 
-Roadmap item 108 follows up on two of these results. It looks for a faster FSST decode path that meets the warm and export gates, and it measures Phase 2b on a dataset where a few prefixes cover most IRIs.
+Roadmap item 108 reworked how an FSST-coded vocabulary is read. The files and the index
+format did not change, so generations written by Phase 2a open as before.
+
+* A lookup decodes only the bytes it needs. Each key before the wanted one is decoded
+  only as far as the next key's shared prefix reaches. A key that gives the next no more
+  than its own shared prefix is skipped, and a long literal before the wanted key is
+  decoded only up to the bytes the next key takes from it. When every key of a block up
+  to the last wanted one is needed, as in an export, the block decodes in one straight
+  pass.
+* A suffix of at most eight codes without an escape code decodes without branches, in
+  four or eight unrolled steps of 8-byte stores. The key buffer keeps 64 bytes of room for
+  this, and FSST key buffers start at 192 bytes so that a single lookup does not
+  reallocate.
+* The block decoders are compiled once per codec, so the front-coded loops carry no test
+  for FSST codes.
+* A lookup of a string compares the probe with each key of its block through the
+  shared-prefix lengths, and decodes only the suffixes it has to compare instead of
+  rebuilding every key. This relies on each entry storing the longest prefix it shares
+  with the key before it, which the writer always does. `sparkles check` in full mode now
+  reports an entry whose shared prefix is shorter.
+
+The decodes that cursors use still reserve memory before each growth, and a damaged
+shared-prefix length cannot make them reserve more than the suffix can decode to. The
+larger key buffers are the only change in memory use, at 128 bytes more per buffer.
+
+Two other approaches were considered and not built. A cache of decoded terms would not
+help the queries that miss the gate, because `contains`, `lang-filter` and the export
+decode each literal once per query. A cache that served them would have to hold the whole
+literal section decoded, which gives back the space FSST saves. For single lookups, a
+hash probe into a cache costs about as much as decoding one of the 10.5M data's short
+keys, which the Phase 2a microbenchmark put at 1.5 ns. A larger
+symbol table needs codes wider than one byte, which changes the file format and makes
+every code longer, so it was not tried.
+
+Forge measured the change on 2026-10-24 with the release binary of `e411a772` as main and
+the branch at `c2518d7b`. Each codec loaded the 10.5M data four times and the DBpedia
+slice twice in A, B, B, A order, and both binaries then ran on the same front-coded and
+FSST stores in interleaved rounds. Warm 10.5M cells are medians of four runs of 15
+requests on two server cores, warm DBpedia cells medians of two runs of 10, and cold cells
+medians of two runs of five `bench-regressions.py --cold` samples. Every query returned
+the same answers in all four variants.
+
+| Warm query | Main, front | Main, FSST | Branch, front | Branch, FSST | Branch FSST over front |
+|---|---:|---:|---:|---:|---:|
+| `export-500k` at 10.5M | 106.6 ms | 118.1 ms | 105.6 ms | 115.7 ms | 1.096 |
+| `contains` at 10.5M | 13.08 ms | 14.11 ms | 12.77 ms | 13.31 ms | 1.043 |
+| `lang-filter` at 10.5M | 9.24 ms | 9.99 ms | 9.30 ms | 9.69 ms | 1.042 |
+| `star-join` at 10.5M | 29.07 ms | 29.18 ms | 28.86 ms | 30.40 ms | 1.053 |
+| `export-1m` on DBpedia | 357.0 ms | 959.3 ms | 347.7 ms | 366.4 ms | 1.054 |
+| `abstract-contains` on DBpedia | 2.43 ms | 2.94 ms | 2.54 ms | 2.85 ms | 1.122 |
+| `label-regex` on DBpedia | 0.653 ms | 0.853 ms | 0.635 ms | 0.708 ms | 1.115 |
+| `entity-summary-1` on DBpedia | 0.418 ms | 0.383 ms | 0.392 ms | 0.396 ms | 1.010 |
+
+Main's FSST took 2.69 times as long as front coding for the DBpedia export, because each
+key of a block was decoded in full to reach the next, and the branch takes 1.05 times as
+long. At 10.5M the branch's FSST is 2% to 6% faster than main's for the export,
+`contains` and `lang-filter`. Over the warm queries at 0.3 ms or more, the geometric mean
+of the branch's FSST against main's front coding is 1.004 at 10.5M and 1.041 on DBpedia,
+where main's FSST measured 1.000 and 1.062. The branch's front coding measured 0.992 and
+1.019 against main's. On DBpedia the difference comes from queries under 1 ms in a single
+round, and perf on atlas counted the same or fewer instructions for the branch's front
+coding on each of the nine DBpedia queries that moved most, so front coding did not get
+slower.
+
+Cold, the branch's FSST meets the gate. Its geometric means against main's front coding
+are 0.999 at 10.5M and 0.958 on DBpedia. Cold `export-500k` takes 134.1 ms against
+131.4 ms with front coding, a ratio of 1.02 where Phase 2a measured 1.11, and the cold
+DBpedia export is 7% faster than with front coding. Cold `entity-summary-1` on DBpedia
+took 3.52 ms against 3.00 ms, with round medians from 3.29 to 3.76 ms.
+
+FSST still misses §4.4's warm limit of 5% on the queries that decode many strings and on
+the warm export, so it stays an option and front coding stays the default. The remaining
+cost is the work of decoding each string, which the dense queries cannot skip. Load time,
+peak RSS and `vocab.dat` sizes matched the Phase 2a figures, at 17.70 to 17.81 MB at 10.5M
+and 343.7 to 346.8 MB on DBpedia.
+
+`star-join` at 10.5M runs 4% slower with the branch's FSST than with main's, 30.40 ms
+against 29.18 ms, with ranges that do not overlap. It looks up its terms one at a time,
+and perf on atlas counted 20% more cycles in that lookup than main spends decoding every
+key before the wanted one in full. Copying plain suffixes whole instead of up to the next
+key's shared prefix removed a tenth of the branch misses but added 5% of instructions and
+saved no cycles, so it was dropped. Roadmap item 160 follows up on this lookup.
+
+### Phases not built
 
 #### Phase 2b, encoded IRIs
 
