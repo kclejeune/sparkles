@@ -855,30 +855,25 @@ fn jena_graph_to(
     sent: &Cell<u64>,
 ) -> Result<()> {
     // RDF/JSON groups the triples by subject and writes them all at the end, so they
-    // count once they are written
+    // count by subject as `finish_counted` writes them
     let deferred = fmt == crate::jena_formats::JenaFormat::RdfJson;
     let mut out = crate::jena_formats::RdfWriter::new(fmt, w);
-    let mut held = 0;
     for t in &r.triples {
         out.triple(t).map_err(io)?;
-        if deferred {
-            held += 1;
-        } else {
+        if !deferred {
             sent.set(sent.get() + 1);
         }
     }
     if fmt.quads() {
         for q in &r.quads {
             out.quad(q).map_err(io)?;
-            if deferred {
-                held += 1;
-            } else {
+            if !deferred {
                 sent.set(sent.get() + 1);
             }
         }
     }
-    out.finish().map_err(io)?;
-    sent.set(sent.get() + held);
+    out.finish_counted(|n| sent.set(sent.get() + n))
+        .map_err(io)?;
     Ok(())
 }
 
@@ -1700,6 +1695,78 @@ mod buffered_tests {
         let sent = Cell::new(0);
         write_jena_graph_counted(&r, JenaFormat::RdfJson, Vec::new(), &sent).unwrap();
         assert_eq!(sent.get(), 1);
+    }
+
+    /// A writer that takes everything and fails on its flush.
+    struct FailFlush(Vec<u8>);
+
+    impl Write for FailFlush {
+        fn write(&mut self, b: &[u8]) -> std::io::Result<usize> {
+            self.0.extend_from_slice(b);
+            Ok(b.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Err(std::io::Error::other("flush failed"))
+        }
+    }
+
+    #[test]
+    fn rdf_json_counts_each_subject_the_writer_took() {
+        use crate::io::{RdfFormat as In, Source};
+        use crate::jena_formats::{JenaFormat, RdfWriter};
+        use crate::store::{Store, StoreOptions};
+        let store = Store::in_memory(StoreOptions::default());
+        store
+            .load(&[Source::from_bytes(
+                b"<http://ex.org/a> <http://ex.org/p> \"1\" .\n\
+                  <http://ex.org/a> <http://ex.org/p> \"2\"@en .\n\
+                  <http://ex.org/a> <http://ex.org/q> _:b .\n\
+                  _:b <http://ex.org/p> <http://ex.org/a> .\n"
+                    .to_vec(),
+                In::NTriples,
+                None,
+            )])
+            .unwrap();
+        let r = super::super::query(
+            store.snapshot(),
+            "CONSTRUCT WHERE { ?s ?p ?o }",
+            &Default::default(),
+        )
+        .unwrap();
+        // the document is the one `finish` writes from the whole map
+        let mut whole = Vec::new();
+        let sent = Cell::new(0);
+        write_jena_graph_counted(&r, JenaFormat::RdfJson, &mut whole, &sent).unwrap();
+        assert_eq!(sent.get(), 4);
+        let mut plain = RdfWriter::new(JenaFormat::RdfJson, Vec::new());
+        for t in &r.triples {
+            plain.triple(t).unwrap();
+        }
+        assert_eq!(plain.finish().unwrap(), whole);
+        let doc: serde_json::Value = serde_json::from_slice(&whole).unwrap();
+        assert_eq!(doc.as_object().unwrap().len(), 2);
+        // a flush that fails after the whole document leaves every triple counted
+        let mut late = FailFlush(Vec::new());
+        let sent = Cell::new(0);
+        assert!(write_jena_graph_counted(&r, JenaFormat::RdfJson, &mut late, &sent).is_err());
+        assert_eq!(late.0, whole);
+        assert_eq!(sent.get(), 4);
+        // a writer that stops partway counts the subjects whose bytes it took: the blank
+        // subject sorts first and has one triple
+        let (key, preds) = doc.as_object().unwrap().iter().next().unwrap();
+        assert!(key.starts_with("_:"));
+        let first_end = 1 + serde_json::to_string(key).unwrap().len() + 1 + preds.to_string().len();
+        for (room, counted) in [(first_end - 1, 0), (first_end, 1), (whole.len() - 1, 4)] {
+            let mut w = Short {
+                out: Vec::new(),
+                step: 5,
+                room,
+            };
+            let sent = Cell::new(0);
+            assert!(write_jena_graph_counted(&r, JenaFormat::RdfJson, &mut w, &sent).is_err());
+            assert_eq!(w.out, whole[..room]);
+            assert_eq!(sent.get(), counted, "{room}");
+        }
     }
 
     #[test]
