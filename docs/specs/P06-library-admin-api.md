@@ -196,7 +196,7 @@ after this spec, or `server-only` with the reason in §6.
 | `getClassProfiles` | `sparkles::schema::profile::profiles` | No | `ds.schema().profiles` |
 | `draftShapes` | `sparkles::schema::draft::draft_shapes` | No | `ds.schema().draft_shapes` |
 | `getGraphGroups` | `sparkles::overview::groups_at`, from [U06](U06-large-graph-rendering.md) | No | `ds.graph().groups`, bound as `Dataset.graph.groups` and `DatasetGraphSparkles.graph().groups` |
-| `getGraphFacets` | `sparkles::overview::facets_at`, from [U11](U11-linked-views.md) | No | `ds.graph().facets`. The Python, Node.js and JVM bindings are planned. |
+| `getGraphFacets` | `sparkles::overview::facets_at`, from [U11](U11-linked-views.md) | No | `ds.graph().facets`, bound as `Dataset.graph.facets` in Python. The Node.js and JVM bindings are planned. |
 
 ### 2.6 Stored queries and GraphQL
 

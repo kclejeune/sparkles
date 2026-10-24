@@ -1385,7 +1385,10 @@ endpoint, takes `timeout` and `reasoning`, and names its branch with `?branch=`.
 above 1,000,000 entities answers `507` with the `rows` budget. A facet whose queries
 exceed a budget carries an `error` with the budget's name while the other facets stay,
 and an exceeded budget while the set is counted answers `507` as a query does. Answers
-share the graph overview's cache, keyed by branch, commit, view and request.
+share the graph overview's cache, keyed by branch, commit, view and request. The Rust
+library gives the same answer through `ds.graph().facets`, and Python returns it as a dict
+from `ds.graph.facets(within, facets=…, filters=…, candidates=…, at=…)`. Node.js and the
+JVM do not bind it.
 
 ### Schema diffs
 

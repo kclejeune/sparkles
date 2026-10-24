@@ -194,3 +194,27 @@ def test_the_timeout_covers_all_of_the_queries() -> None:
         except QueryTimeoutError:
             return
     pytest.fail(f"no call timed out at {shortest / 2} s, half of the shortest whole answer")
+
+
+def test_facets_count_a_class_and_its_brushes(ds: Dataset) -> None:
+    """`Dataset.graph.facets` returns the answer of the library's `ds.graph().facets`."""
+    answer = ds.graph.facets(
+        {"class": EX + "Person"},
+        facets=[{"property": EX + "livesIn"}],
+        filters=[
+            {
+                "property": EX + "livesIn",
+                "kind": "values",
+                "values": [{"type": "uri", "value": EX + "p1"}],
+            }
+        ],
+    )
+    assert answer["size"] == 4
+    assert answer["matching"] == 2
+    counts = {v["value"]["value"]: v["count"] for v in answer["facets"][0]["values"]}
+    # a facet is not filtered by its own brush
+    assert counts == {EX + "p1": 2, EX + "p2": 2}
+    with_candidates = ds.graph.facets({"class": EX + "Person"}, candidates=True)
+    assert any(c["property"] == EX + "livesIn" for c in with_candidates["candidates"])
+    with pytest.raises(InvalidInputError):
+        ds.graph.facets({"class": EX + "Person"}, facets=[{"property": EX + "x", "bins": 1}])

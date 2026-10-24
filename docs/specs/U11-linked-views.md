@@ -639,5 +639,5 @@ clears the brushes, and on the query page the brushes end when another tab of th
 opens, while the selection they made stays. **Apply to query** on the query page cannot
 keep the counts of a query with `LIMIT`, `OFFSET`, `GROUP BY` or `HAVING`, so it refuses
 those queries rather than wrapping them in a subquery. The library call
-`ds.graph().facets` has no Python, Node.js or JVM binding, and `bindings.toml` marks the
-three as planned.
+`ds.graph().facets` is bound in Python as `Dataset.graph.facets`, and `bindings.toml`
+marks the Node.js and JVM bindings as planned.
