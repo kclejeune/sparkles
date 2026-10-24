@@ -71,6 +71,12 @@ impl Host for ServerHost {
             .unwrap_or_default()
     }
 
+    fn rdfs_on_read(&self) -> bool {
+        self.state
+            .upgrade()
+            .is_some_and(|s| s.rdfs.read().is_some())
+    }
+
     fn stored_query(&self, name: &str) -> sparkles::Result<String> {
         let s = self
             .state

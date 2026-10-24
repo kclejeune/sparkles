@@ -3491,6 +3491,10 @@ fn run() -> Result<()> {
             // the dataset's query defaults (RDFS on read, the inferred overlay and
             // DESCRIBE), as a server and the library apply them
             let (ds, _main) = open_or_load(loc, &data, opts)?.into_dataset();
+            // a query that reads views waits for them to be recovered or built
+            if q.contains(sparkles::incr::VIEW_NS) && ds.state().views.has_views() {
+                ds.views().settle(Duration::from_secs(3600));
+            }
             let store = ds.store();
             let defaults = ds.query_options();
             use sparkles::sparql::rdfs::{RdfsOnRead, RdfsSchema, SchemaSource};

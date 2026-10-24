@@ -98,6 +98,11 @@ pub trait Host: Send + Sync {
     fn epoch(&self) -> u64 {
         0
     }
+    /// Whether the dataset's queries read with RDFS on read, which views and live
+    /// queries refuse (spec F13 §4.5).
+    fn rdfs_on_read(&self) -> bool {
+        false
+    }
 }
 
 /// A host without access control: every principal reads every quad, and stored
@@ -1245,6 +1250,9 @@ impl Runtime {
         }
         def.check()?;
         let host = self.host()?;
+        if host.rdfs_on_read() {
+            return Err(super::compile::not_incremental("RDFS on read"));
+        }
         let text = Self::view_text(host.as_ref(), &def)?;
         let q = self.parse(host.as_ref(), &text)?;
         if matches!(q, Query::Ask { .. } | Query::Describe { .. }) {
@@ -1527,6 +1535,9 @@ impl Runtime {
             .read()
             .clone()
             .unwrap_or_else(|| Arc::new(OpenHost));
+        if host.rdfs_on_read() {
+            return Err(super::compile::not_incremental("RDFS on read"));
+        }
         let q = self.parse(host.as_ref(), query)?;
         if matches!(q, Query::Describe { .. }) {
             return Err(super::compile::not_incremental("DESCRIBE"));

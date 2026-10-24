@@ -55,6 +55,12 @@ impl Host for LibraryHost {
             .unwrap_or_default()
     }
 
+    fn rdfs_on_read(&self) -> bool {
+        self.state
+            .upgrade()
+            .is_some_and(|s| s.rdfs.read().is_some())
+    }
+
     fn stored_query(&self, name: &str) -> Result<String> {
         let state = self
             .state
@@ -241,5 +247,42 @@ impl Views {
     /// The plan `query` would have as a view, with each operator's mode.
     pub fn explain(&self, query: &str) -> Result<(Kind, PlanNode)> {
         self.rt().explain(query, None)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::incr::LiveOptions;
+    use crate::sparql::rdfs::{RdfsOnRead, SchemaSource};
+
+    /// Views and live queries read stored quads, so RDFS on read refuses them.
+    #[test]
+    fn rdfs_on_read_refuses_views_and_live_queries() {
+        let ds = Dataset::memory();
+        *ds.state().rdfs.write() = Some(Arc::new(RdfsOnRead::new(SchemaSource::Graph(None))));
+        let q = "SELECT ?s WHERE { ?s a <urn:C> }";
+        let e = ds.views().put("v", ViewDef::table(q)).unwrap_err();
+        assert!(e.to_string().contains("RDFS on read"), "{e}");
+        assert!(ds.live(q, &LiveOptions::default()).is_err());
+    }
+
+    /// The last handle of a dataset with running views closes it on its own thread, so
+    /// the directory opens again at once.
+    #[test]
+    fn a_dataset_with_views_reopens_at_once() {
+        let dir = tempfile::tempdir().unwrap();
+        let q = "SELECT ?s WHERE { ?s <urn:p> ?o }";
+        for i in 0..5 {
+            let ds = Dataset::open(dir.path()).unwrap();
+            ds.update(&format!("INSERT DATA {{ <urn:s{i}> <urn:p> 1 }}"))
+                .unwrap();
+            if i == 0 {
+                ds.views().put("v", ViewDef::table(q)).unwrap();
+            }
+            let v = ds.views().wait_built("v", Duration::from_secs(10)).unwrap();
+            assert!(v.commit.is_some());
+            assert_eq!(ds.views().read("v").unwrap().rows.len(), i + 1);
+        }
     }
 }
