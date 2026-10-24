@@ -1,24 +1,48 @@
 # Roadmap
 
-This is the plan for making Sparkles the best graph database for performance across the
-published benchmarks and for practical use. It also covers filling the real feature
-gaps in RDF extensions, reasoning, GeoSPARQL, search, agent memory and integration. The
-first public release is not the goal of this plan. Packaging and the release contract
-are listed at the end and wait until a release is cut.
+This roadmap says what work is planned for Sparkles and in what order. Its goal is to make
+Sparkles the fastest graph database across the published benchmarks and in practical use,
+and to close the real feature gaps in RDF extensions, reasoning, GeoSPARQL, search, agent
+memory and integration. Packaging and the release contract come last and wait until a
+first release is cut.
 
-The order weighs implementation difficulty against impact. Each item links to the spec
-that holds its design. New items have their own spec. Items that extend an existing spec
-are designed in a **Roadmap follow-ups (2026-10-12)** section at the end of that spec's
-Outcome.
+[FEATURES.md](FEATURES.md#known-gaps) describes what Sparkles does and does not do today,
+and every known gap there names the roadmap item that addresses it.
+[BENCHMARKS.md](BENCHMARKS.md#where-sparkles-loses) records the measured results and the
+workloads where Sparkles loses. This document holds only the work that remains.
 
-This document and [FEATURES.md](FEATURES.md#known-gaps) are kept separate on purpose.
-FEATURES describes what Sparkles does and does not do at the current commit. This
-document describes what will be done and in what order. Every known gap in FEATURES
-names the roadmap items that address it, and every gap is on this roadmap, in Tier 7 if
-nothing else. [BENCHMARKS.md](BENCHMARKS.md#where-sparkles-loses) remains the record of
-measured losses.
+## Contents
 
-Sizes are estimates:
+- [How the roadmap is organized](#how-the-roadmap-is-organized)
+- [Tracks and decisions](#tracks-and-decisions)
+- [Tier 1: now](#tier-1-now)
+- [Tier 2: high-impact features and the scale foundation](#tier-2-high-impact-features-and-the-scale-foundation)
+- [Tier 3: big bets](#tier-3-big-bets)
+- [Tier 4: worth doing, not urgent](#tier-4-worth-doing-not-urgent)
+- [Tier 5: backlog](#tier-5-backlog)
+- [Tier 6: release work](#tier-6-release-work)
+- [Tier 7: compatibility leftovers](#tier-7-compatibility-leftovers)
+- [Completed](#completed)
+- [Keeping this current](#keeping-this-current)
+
+## How the roadmap is organized
+
+The work is grouped into seven tiers in order of priority. Tiers 1 to 4 are the main plan,
+and Tiers 5 to 7 hold work that is wanted at a lower priority. The order weighs the effort
+of an item against its impact on the goal above, and items move between tiers as results
+come in. Within a tier, most items can run in parallel.
+
+Each item has a number that stays fixed for its lifetime. Specs, FEATURES and code
+comments refer to items by these numbers, so a number is never reused or changed. The
+numbers are not a ranking, and a new item takes the next free number whatever its tier.
+
+Each row says what remains to be done and links to the spec that holds the design. Items
+that extend an existing spec are designed in a "Roadmap follow-ups" section at the end of
+that spec's Outcome, and the Outcome also records what has already landed. An item that
+is partly finished stays in its tier, and its row describes only the remaining part.
+Finished items are listed under [Completed](#completed).
+
+The Size column estimates the remaining effort.
 
 | Size | Meaning |
 |---|---|
@@ -27,48 +51,24 @@ Sizes are estimates:
 | L | Several weeks |
 | XL | A quarter or more |
 
-A partly done item has merged implementation with work or acceptance gates remaining.
-Implementation completion does not mean that its performance gates have passed or that
-an opt-in feature is enabled by default. Work on an unmerged branch stays open here.
+The Value column in Tiers 1 to 3 rates the impact of an item on the goal. Lower tiers are
+ordered by their tier alone.
 
-Item numbers are stable identifiers, not a ranking: a new item takes the next free
-number in whatever tier it belongs to. Impact is judged against the goal above. Tiers 1–4 are the main plan. Tiers 5–7 are
-work that is wanted at a lower priority, and items move between tiers as results come in.
+## Tracks and decisions
 
-## How the work is organized
+Three tracks run through the tiers. Each track lists its open items in the order they
+should run.
 
-The tiers set the order of priority. Within a tier, most items can run in parallel.
-Three tracks run through the tiers:
-
-| Track | Items | Spec order |
+| Track | Open items | Specs |
 |---|---|---|
-| **Performance** | 3 → 2 → 1 → 7 and 86 → 4 → 16 | X09 → X08 → X06 → X08 Phase 2 and X09 Phase 4 → X07 → X11 |
+| **Performance** | 1, then 7 and 86 in parallel, then 4 | X06, X08 Phase 2, X09 Phase 4, X07 |
 | **Graph features** | 8 → 12 → 20 | F14 → C22 → F01 |
-| **Reasoning** | 9 → 87 → 19 → 18, with 17 before F18 Phase 3 | F16 → F16 follow-up → F17 → F18 Phases 1–2 → F13 → F18 Phase 3 |
+| **Reasoning** | 9 → 19 → 18 → 17, with 17 before F18 Phase 3 | F16 → F17 → F18 Phases 1 and 2 → F13 → F18 Phase 3 |
 
-The UI items (11, 21, 27–31 and the graph-interaction items 101–107) fill time when a
-track is waiting on benchmark results.
+The UI items fill time when a track is waiting on benchmark results. The rest of item 14
+waits for the sustained-write results of item 1.
 
-The next cold-read work is the corrected-source measurement gate for item 4. It
-compares warm instruction counts and read hints before repeating the cold targets
-on forge. A segmented block layout remains deferred until those measurements justify
-it, and index compression remains the later performance work under item 16, whose
-predicate patterns have shipped.
-
-The graph track can prepare the Graphalytics reference harness under item 8 alongside
-Phase 1 of the community summaries under item 12. The summaries use the existing
-Leiden implementation. The remaining algorithm UI and JVM integrations do not block
-that foundation. Reasoning first needs the materialization acceptance runs under
-item 1 before the later query-time reasoning and explanation work, since item 87 met its
-incremental-update gates on 2026-10-23.
-
-Item 2's gates run before item 1's benchmark refresh, so that the refresh measures the
-settled defaults. Item 86 and the rest of item 7 then run in parallel, since they change
-different parts of the engine. The removal at open of a leftover generation, from item 14,
-shipped on 2026-10-18 with the other durability follow-ups, and the rest of item 14 waits
-for the sustained-write results of item 1.
-
-Two decisions depend on what item 1 measures:
+Two decisions depend on what item 1 measures.
 
 * If Sparkles already leads LDBC-style workloads, openCypher (item 20) moves up.
 * If spill (item 7) turns out cheaper than expected, the incremental core (item 17)
@@ -78,155 +78,147 @@ Two decisions depend on what item 1 measures:
 
 These items are cheap or foundational.
 
-| # | Item | Spec | Size | Impact |
+| # | Item | Spec | Size | Value |
 |---|---|---|---|---|
-| 1 | **Standard refresh done at 6699f27d (2026-10-23).** Sparkles was timed again on trimmed forge in every published suite, and the other engines' results were carried over with their provenance. The BI q4 and q5 answers pass an exact float oracle, the DBpedia count disagreement is explained and the DBpedia record hashes all 38 inputs. The BI driver failures moved to item 96, the `small` profile to item 97 and F16's LUBM(1000) acceptance to item 98. Later X06 batches, BSBM at 100M and the table regeneration remain. | [X06](specs/X06-benchmark-coverage.md), [F16](specs/F16-materialization-at-scale.md), [X08](specs/X08-disk-spill-and-server-memory.md#33-the-default-and-small-profiles) §3.3 | M | Very high |
-| 2 | **Done (2026-10-18), with the Phase 1a suite runs at 10.5M and on DBpedia decided under item 97 on 2026-10-23. Server-wide cache sizing and query memory pool.** Shared caches are sized once per server, with a `small` profile. One query pool admits requests and adds retained eager estimates, including graph output, while cursor state releases promptly. Both gates were amended on 2026-10-18 and met on forge. The pool adds at most 0.5 µs to queries under 0.3 ms, and ten datasets use 0.946 and 1.027 times the anonymous memory that the A1 bound allows at 256 and 32 MiB of cache. Both profiles match the defaults from before the profiles within the run-to-run spread at 1.05M, 10.5M and on DBpedia. Item 88 covers the remaining allocator overhead. [X08](specs/X08-disk-spill-and-server-memory.md) Phase 2 follows under item 7. | [X08](specs/X08-disk-spill-and-server-memory.md) Phase 1, [C01](specs/C01-observability-and-budgets.md#roadmap-follow-ups-2026-10-12) | S, then M | High |
-| 3 | **Done (2026-10-17). Group commit as the default.** Persistent stores group concurrent commits by default, and `--no-group-commit` or `SPARKLES_GROUP_COMMIT=off` turns it off. Phases 1 and 2 add metrics, an idle fast path, modeled power-loss and failed-sync checks, and admission of most write kinds. Phase 3 meets the forge gates for serial parity, concurrency, fairness, mixed load and churn, passes the `kill -9` and 1,000-point `log-writes` runs on ext4 and XFS, adds the model-based stress test, and frames headerless logs strictly from a recorded offset. Indexed datasets kept the ordinary path until item 86. A headerless log that this release has never opened for writing keeps the mixed legacy rules for the bytes it holds. | [X09](specs/X09-group-commit-by-default.md) | S–M | High |
-| 4 | **Partly done. Cold sparse lookups.** Phases 1 and 2 pass the warm instruction, warm read-hint and concurrent policy gates on corrected source. Phase 3 writes index format 3 with 2,048-row column segments and cuts cold `star-lookup` at 10.5M from 20.4 to 12.7 ms and `employee-docs` from 16.8 to 12.2 ms against main on forge, for 3.0% more index. Cold `star-join` at 10.5M is 6–8% slower, and removing that cost is open. The Oxigraph targets were not re-measured after Phase 3, and the 1.01B dense-read gate and window sweep are not measured. | [X07](specs/X07-cold-sparse-reads.md) Phases 1 to 3, with Phase 4, the `star-join` cost, the Oxigraph targets and the 1.01B gates open | M | High |
-| 5 | **Done (2026-10-13). Correctness fixes.** `allShortest` includes equal-cost paths over zero-weight edges. Small bulk commits into large datasets record their changes within the change-log candidate limit. A `gsp-direct-r` endpoint from a Fuseki configuration refuses writes independently of grants. | [F07](specs/F07-path-search.md#roadmap-follow-ups-2026-10-12), [F06](specs/F06-snapshots-and-point-in-time.md#roadmap-follow-ups-2026-10-12), [G08](specs/G08-fuseki-configuration.md#roadmap-follow-ups-2026-10-12) | S | Medium |
-| 6 | **Ask evaluation on public benchmarks.** The initial hosted demo pilot stopped on its first request because its gate refused a chunked reply, which left $1.002560 held at its bound. The harness now has a proxy whose cost ledger reconciles such a charge with the billed amount, scores failed Asks, and converts QALD-9-plus, Text2SPARQL'25 and LC-QuAD 2.0, with gold recomputed on DBpedia 2022.12.01 and CK25. The first paid run asked the demo set and CK25 with Haiku, Sonnet and Opus 5.5. Answering the pipeline's clarification questions in the evaluation, a paid run of the DBpedia sets and independent-role evaluation remain. The DBpedia sets now run in about two seconds an Ask (item 89), but most of their questions stop at a clarification between a resource and its namesakes, and LC-QuAD 2.0 waits for a Wikidata load from the full dump. | [C18](specs/C18-natural-language-questions-and-ingest.md#roadmap-follow-ups-2026-10-12) | S–M | Medium |
-| 89 | **Done (2026-10-19). Ask and `check_query` on large datasets.** On DBpedia 2022.12.01, about a billion triples, each `sparkles ask` took about 100 s and most checks failed on the 2 GiB query memory budget. Above ten million quads the tools now read schema reports from the index statistics, corrected exactly for the delta and for graphs outside the selection, and measure a predicate's objects on demand. The planner moves a VALUES table into the branches of a UNION it joins, which `link_entities` and the terms list needed. On DBpedia a `check_query` takes 0.3 s instead of 52.7 s and 11.1 GiB, and an Ask about 2 s with under 512 MiB of anonymous memory. A selection that leaves out graphs with more than a million quads is still scanned. No report is persisted, since the correction costs no more than a scan at any commit. Item 90 covers the shapes the VALUES rewrite misses. | [C18](specs/C18-natural-language-questions-and-ingest.md#roadmap-follow-ups-2026-10-12) | M | Medium |
+| 1 | **Benchmark refresh.** Later X06 batches, BSBM at 100M, a rerun of the BSBM BI driver cells and the regeneration of the published tables remain. | [X06](specs/X06-benchmark-coverage.md), [F16](specs/F16-materialization-at-scale.md), [X08](specs/X08-disk-spill-and-server-memory.md#33-the-default-and-small-profiles) §3.3 | M | Very high |
+| 4 | **Cold sparse lookups.** Phase 4 adds an optional prewarm of the pages a server used before it stopped. Cold `star-join` at 10.5M is slower with index format 3 and that cost should be removed. The Oxigraph targets need measuring again, and the 1.01B dense-read gate and its window sweep are not measured. | [X07](specs/X07-cold-sparse-reads.md) | M | High |
+| 6 | **Ask evaluation on public benchmarks.** The evaluation should answer the pipeline's clarification questions, which stop most DBpedia questions at a choice between a resource and its namesakes. A paid run of the DBpedia sets and an evaluation with independent roles remain, and LC-QuAD 2.0 waits for a Wikidata load from the full dump. | [C18](specs/C18-natural-language-questions-and-ingest.md#roadmap-follow-ups-2026-10-12) | S–M | Medium |
 
 ## Tier 2: high-impact features and the scale foundation
 
-| # | Item | Spec | Size | Impact |
+| # | Item | Spec | Size | Value |
 |---|---|---|---|---|
-| 7 | **Partly done. Batch-oriented joins and grouping, then disk spill.** Also covers LIMIT propagation, running state for FOLD aggregates, parallel decoding, earlier first bytes and wider automatic selection. Automatic execution became the default over HTTP, in the CLI and in Node on 2026-10-16 and in the JVM library on 2026-10-17, and the UI's result table still asks for eager execution until it can show a streamed result's unknown total. The streaming parity work of 2026-10-17 closed the cursor's own gaps and widened automatic scans to a thousand rows. On 2026-10-17 the cursor's joins, counts, groupings and DISTINCT moved to column kernels, OPTIONAL counts and other groupings of 20,000 input rows or more stream automatically again, and sorts, groupings and unordered DISTINCT spill to disk, with the eager memory retry. Item 85 added hash-join and merge-join spill, a DISTINCT that runs below its ORDER BY and encrypted spill on 2026-10-18, and spill remains opt-in until all Phase 2b acceptance gates pass. On 2026-10-18 a cursor filter over an index scan began to read and filter the scan in parallel morsels, which brought CONTAINS, STRSTARTS and LANGMATCHES filters to 0.91 to 0.95 times eager execution at eight threads, and a REGEX over subject IRIs to 1.08. A cursor range top-k ranks its range in parallel morsels and holds only its best rows, at 0.89 to 1.06 times eager execution with eight threads over several runs. A filter over a scan in native JSON at one thread reached parity on the same day. These were measured on an 8-vCPU AMD Namespace instance, and the 12-thread measurement on an Intel host is still to be taken. On 2026-10-23 automatic execution began to stream groupings whose EXISTS are FILTER conjuncts that a key set answers, at 0.68 to 0.99 times eager execution at 10.5M on Namespace. An EXISTS evaluated once per outer key, in BIND or an OPTIONAL condition, stays eager because the cursor was 1.15 times slower, and DESCRIBE does not stream. Decoding ahead under many concurrent queries is unmeasured. A JVM cancellation that raced the release of its query threw from `abort()` until 2026-10-23. Per-clone regular expression caches for the eager `regex-iri` filter measured 1.08 to 1.17 times slower than `regex::Regex` on Namespace on 2026-10-23, so the filter keeps `regex::Regex` and its 5% inlining sensitivity on forge stays open. X08-P1-retained-results shipped on 2026-10-23, so a finished eager SELECT or ASK keeps only its result's estimate in the pool. X08-P1-grant-routing shipped on the same day, so MCP tool calls wait for the pool and the ask, GraphQL draft, diagnostics, Graph Store DELETE and upload queries charge their admitted grant. X08-P1-admit-after-body shipped on the same day, so the server admits a query or update after its body arrives, uploads and Graph Store writes take no initial grant, and a release wakes only the waiters that fit. X08-P1-nested-service shipped on the same day, so a SERVICE call that names this server's public URL or bound listener exactly runs in process under the caller's principal and grant. | [X08](specs/X08-disk-spill-and-server-memory.md) Phase 2, [X05](specs/X05-streaming-query-execution.md#roadmap-follow-ups-2026-10-12) | L | Very high |
-| 8 | **Partly done. Graph-algorithm library, remainder.** The review follow-ups are done. Every long loop over nodes, rows or heap entries checks cancellation within bounded work, sorts run as one step, every workspace is charged, write-back decodes one batch at a time, `GRAPH ?g` scopes each call to its graph and reads each graph once, and HTTP runs authorize before the body and wait for the memory pool. A BFS, WCC and PageRank reference adapter and native runs on the two small official example graphs are done, and the full Graphalytics harness with [X06](specs/X06-benchmark-coverage.md), the UI, a JVM handle, the C23 writer and openCypher procedures with F01 remain. | [F14](specs/F14-graph-algorithms.md#outcome) | S–M | High |
-| 9 | **Partly done. Materialization at scale.** Phase 1 is built, with rules that read the compressed indexes, a parallel merge, one memory budget per run and a kept closure without the explicit facts. Phase 1 gives the same closures as the commit before it, runs 1.5 times faster on LUBM(100) with OWL 2 RL and peaks at 0.62 to 0.65 times its RSS. A1 is met at LUBM(1000) under item 98, where RDFS takes 91 s at 15.2 GiB of RSS, at most 0.43 of the memory the commit before Phase 1 needs. Item 87 brought small incremental runs back to within 1.2 times their earlier time. The separate derived-fact layer and `owl:sameAs` representatives of Phases 2 and 3 remain unbuilt. | [F16](specs/F16-materialization-at-scale.md), [C08](specs/C08-inference-freshness.md#roadmap-follow-ups-2026-10-12) | L | High |
-| 10 | **Done (2026-10-13). Vector index maintenance.** Committed rows join the HNSW graph in the background, compactions carry the graph over before they switch, and builds are about 2.2 times faster (63.5 s at 1M × 384, 1.27 times USearch). | [F04](specs/F04-vector-search.md#roadmap-follow-ups-2026-10-12) | M | Medium–high |
-| 11 | **Done (2026-10-16). Time slider** over graphs, results, entities and the schema. It builds on the existing `at=` field, history diffs and Memory's "As of" selector. A browser compare of complete results, a bounded commit timeline and a server comparison inside the memory budget and pool shipped with it. A calendar-aware track by time, a branch-qualified selector and a server comparison across branches stay unbuilt, as the spec's Outcome records. | [U01](specs/U01-time-slider.md) | M | High |
-| 12 | **Partly done. GraphRAG community summaries.** Phase 1 builds reports from the Leiden hierarchy with citations, provenance, review status, budgets and protected reads, with routes, a CLI and a Communities tab. Its paid acceptance runs wait for approval. Phase 2 adds global answers in Ask, `community_reports` and community context in `recall` and the brief. Phase 3 refreshes reports automatically from the change feed. The Explore overview of item 29 draws the communities and their reports under the same coverage rule. The evaluation follows, and counting changes from an F13 view waits for item 17. Several configurations per dataset are item 100. | [C22](specs/C22-graph-rag-community-summaries.md) | M | High |
-| 13 | **Done (2026-10-16). Current shape standards.** SHACL 1.2 node expressions, ShEx 2.2, recursive ShEx typing that survives restarts, and richer drafted shapes. The SHACL 1.2 Core additions that are not expression syntax, ShEx `RESTRICTS` and the `EXACTLY` reference syntax stay out, and the Outcome sections of the specs list them. | [G03](specs/G03-shaclc.md#roadmap-follow-ups-2026-10-12), [G02](specs/G02-shex.md#roadmap-follow-ups-2026-10-12), [C02](specs/C02-schema-discovery.md#roadmap-follow-ups-2026-10-12) | M | Medium–high |
-| 14 | **Partly done. Compaction.** Delta changes located per block, new vocabulary without a full rebuild, adaptive thresholds and automatic compaction in embedded use remain open. The removal at open of a build that a power loss left behind shipped on 2026-10-18. | [C13](specs/C13-automatic-compaction.md#roadmap-follow-ups-2026-10-12) | M | Medium–high |
-| 15 | **Ingestion.** *Partly done (2026-10-13).* Office documents, more transcript adapters and CSV entity linking shipped. Images and audio remain, with the follow-ups recorded in C18. | [C18](specs/C18-natural-language-questions-and-ingest.md#roadmap-follow-ups-2026-10-12) | M | Medium–high |
-| 16 | **Done (2026-10-23). Index compression after predicate patterns.** QLever's predicate patterns shipped as X11 Phase 1, in a versioned file of 1.6% of the index that cut DBpedia predicate counts over every subject from 1.9 s to 1.3 ms. FSST suffix compression shipped as the option `--vocab-codec fsst` in index format 4, which shrinks `vocab.dat` by 29% to 32% but stays off by default because warm term-heavy queries run up to 13% slower. IRI encoding, zstd and frame-of-reference block codecs and `COUNT(*)` per predicate from the patterns were measured and save less than their gates ask on DBpedia, so they are not built. Item 108 made FSST reads faster and measured IRI encoding on datasets with dominant prefixes, and FSST still misses the warm gate. | [X11](specs/X11-index-compression-and-predicate-patterns.md#outcome), [X01](specs/X01-compression-codecs.md#roadmap-follow-ups-2026-10-12) | L | High at scale |
-| 86 | **Partly done. Group commit for indexed datasets.** Full-text, spatial and embedding datasets group commits, and the forge acceptance of 2026-10-23 met the amended gates for memory, for throughput and for 35 of 36 serial checks. The p90 of spatial serial inserts at 10.5M missed and the reader gates are not established, because the mixed cells failed the schedule lag requirement. Items 110 to 112 follow up, and the text and spatial mixed cells rerun after item 110. | [X09 section 17](specs/X09-group-commit-by-default.md#17-phase-4-group-commit-for-indexed-datasets) | M–L | Medium–high |
-| 87 | **Done (2026-10-23). Small incremental runs over a kept closure.** The kept closure remembers its lookups of the input graphs, deletion rounds search in parallel, the base tier reads segments of cold blocks, the insertion evaluates split bindings in batches, and the backward search reads few derived rows before a long lookup and reuses its blocks. On forge, a change of 1,000 triples at 16 threads takes 0.90 to 1.12 times its time before the F16 follow-up for RDFS and 1.00 to 1.18 times for OWL 2 RL by the medians, within the 1.2 times goal, while the kept closure stays at 41% and 47% of the memory. Changes of 100 triples at 16 threads and undos at 1 thread remain slower, under item 113. | [F16](specs/F16-materialization-at-scale.md#roadmap-follow-ups-2026-10-18) | S–M | Medium |
-| 113 | Small changes and undos over a kept closure. Item 87 met its goal of 1.2 times and left some slowdown that this item takes over. By the medians on LUBM-style data with 100 universities, a change of 1,000 triples at 16 threads takes 1.09 times its time before the F16 follow-up for RDFS and 1.18 times for OWL 2 RL, and its undo takes 1.12 and 1.13 times. Changes of 100 triples at 16 threads take 1.6 to 2.3 times their time before the follow-up, a few milliseconds, and undos at 1 thread take 1.3 to 1.8 times. Full runs on index format 3 take 1.01 times their time on main at `dc95359c` for RDFS and 1.05 times for OWL 2 RL, so a profile of the full run should find what costs the 5% and remove it or record it as noise. A lookup of the backward search that the remembered answers cannot serve reads a decoded block of the store where it probed an in-memory table before. Options are an opt-in in-memory index of the input facts that the searches touch, charged to the memory budget, and per-thread counters in the block cache. | [F16](specs/F16-materialization-at-scale.md#roadmap-follow-ups-2026-10-18) | M | Low |
+| 7 | **Batch-oriented execution and disk spill.** Spill stays opt-in until X08 Phase 2b's acceptance gates pass, and several cases still run eagerly. The [remaining work](#remaining-work-for-item-7) is listed below. | [X08](specs/X08-disk-spill-and-server-memory.md) Phase 2, [X05](specs/X05-streaming-query-execution.md#roadmap-follow-ups-2026-10-12) | L | Very high |
+| 8 | **Graph-algorithm library.** The full Graphalytics harness with X06, the UI, a JVM handle, the C23 writer and openCypher procedures with F01 remain. | [F14](specs/F14-graph-algorithms.md#outcome) | S–M | High |
+| 9 | **Materialization at scale.** The separate derived-fact layer of Phase 2 and the `owl:sameAs` representatives of Phase 3 remain. | [F16](specs/F16-materialization-at-scale.md), [C08](specs/C08-inference-freshness.md#roadmap-follow-ups-2026-10-12) | L | High |
+| 12 | **GraphRAG community summaries.** The paid acceptance runs wait for approval, and the evaluation of §9 follows them. Counting changes from an F13 view waits for item 17. | [C22](specs/C22-graph-rag-community-summaries.md) | M | High |
+| 14 | **Compaction.** Delta changes located per block, new vocabulary without a full rebuild, adaptive thresholds and automatic compaction in embedded use remain. | [C13](specs/C13-automatic-compaction.md#roadmap-follow-ups-2026-10-12) | M | Medium–high |
+| 15 | **Ingestion of images and audio.** The remaining follow-ups are recorded in C18. | [C18](specs/C18-natural-language-questions-and-ingest.md#roadmap-follow-ups-2026-10-12) | M | Medium–high |
+| 86 | **Group commit for indexed datasets.** The p90 of spatial serial inserts at 10.5M misses its gate, and the reader gates are not established. Items 110 to 112 follow up, and the text and spatial mixed cells rerun after item 110. | [X09 section 17](specs/X09-group-commit-by-default.md#17-phase-4-group-commit-for-indexed-datasets) | M–L | Medium–high |
+| 113 | **Small changes and undos over a kept closure.** Changes of 100 triples at 16 threads and undos at 1 thread remain slower than before the F16 follow-up, and a profile of the full run should find or rule out a cost of about 5%. An opt-in in-memory index of the input facts, charged to the memory budget, is one option. | [F16](specs/F16-materialization-at-scale.md#roadmap-follow-ups-2026-10-18) | M | Low |
+
+### Remaining work for item 7
+
+* Spill stays opt-in until all X08 Phase 2b acceptance gates pass, which item 93 tracks.
+* An EXISTS evaluated once per outer key, in BIND or an OPTIONAL condition, stays eager
+  because the cursor was slower, and DESCRIBE does not stream.
+* The UI's result table still asks for eager execution until it can show a streamed
+  result's unknown total.
+* The parallel cursor filters and range top-k were measured on 8 vCPUs and still need a
+  12-thread measurement on an Intel host. Decoding ahead under many concurrent queries is
+  unmeasured.
+* The eager `regex-iri` filter keeps `regex::Regex`, and its 5% inlining sensitivity on
+  forge is open.
 
 ## Tier 3: big bets
 
-| # | Item | Spec | Size | Impact |
+The reasoning track leads this tier in its own order. Full-text parity, GeoSPARQL, live
+query profiling and query by example lead the items that fill time around it, and
+openCypher comes last.
+
+| # | Item | Spec | Size | Value |
 |---|---|---|---|---|
-| 17 | **Incremental computation core.** Materialized SPARQL views, live queries that push result changes, and provenance per fact | [F13](specs/F13-incremental-views-and-provenance.md) | XL | Very high |
-| 18 | **Explanations.** Derivation trees, "why not?" answers, entailment diffs on branches, and minimal justifications; protections that track provenance, and `reviewedOnly` (which Ask already has, but which doesn't cover the inferred graph) extended to derived facts. Phases 1–2 need only F17 Phase 1; Phase 3 needs F13. | [F18](specs/F18-explanations-and-entailment-diffs.md) | M–L | High |
-| 19 | **Partly done. Query-time reasoning.** Phase 1 was built on 2026-10-24. `reasoning=demand` derives the facts a query needs with the demand (magic sets) transformation over RDFS, RDFS simple, OWL 2 RL and Jena rules with backward rules, with stratified `noValue`, equality in a stage of its own, rules specialized to the schema, tables cached per snapshot and view, budgets, EXPLAIN, the CLI and the library API. All 14 LUBM queries give the materialized answers under RDFS and OWL 2 RL at 10 universities, and query 1 at 100 universities derives no facts beyond the schema. With cached tables, the selective LUBM queries take 1.4 to 2.5 times as long as over a materialization under RDFS and 2.5 to 17 times under OWL 2 RL, which misses the 2 × target, and items 190 to 193 cover what Phase 1 left. Phases 2 and 3 are open: `auto` with its cost model, the dataset setting, hybrid rules, OWL 2 QL rewriting, reuse of tables across commits, the MCP argument, the UI, and tables kept current by F13 | [F17](specs/F17-query-time-reasoning.md#outcome) | L | High |
-| 20 | **openCypher,** with graph algorithms as procedures and LDBC SNB as acceptance | [F01](specs/F01-cypher.md#roadmap-follow-ups-2026-10-12) | L–XL | High |
-| 21 | **Partly done (2026-10-24). Editing forms generated from SHACL shapes,** writing to branches. Phase 1 shipped: the form model, check and save routes, the `forms` settings kind, forms for predicate and inverse paths with literal and IRI values in Explore and on their own page, checks in the browser, previews, saves to `main` or a session branch, and field-level conflicts. Phase 2 shipped on the same day without nested forms, with DASH editors and viewers, **New instance** with minted IRIs and value search over a field's class with full text. Nested forms for blank nodes, the list editor and `sh:or` and `sh:xone` choices of Phase 3, and validation of nodes more than two triples from the edited resource in a check without a guard remain. | [U02](specs/U02-shape-driven-forms.md#outcome) | M–L | Medium–high |
-| 22 | **RML, R2RML and YARRRML loading,** CSVW standard mode and key checks, and tests that Tarql's functions work in templates (`apf:strSplit` already exists in the engine) | [F19](specs/F19-mappings-and-virtual-graphs.md) Phase 1, [C05](specs/C05-tabular-imports.md#roadmap-follow-ups-2026-10-12) | M–L | Medium–high |
-| 23 | **Full-text parity.** Lucene analyzers, CJK segmentation, online reindexing, search after uncommitted writes, and historical search | [F03](specs/F03-full-text-search.md#roadmap-follow-ups-2026-10-12) | M each | Medium |
-| 24 | **GeoSPARQL.** k-NN with arbitrary joins, better polygon approximations than the existing cell grid, QLever's spatial syntax, and geometry limits: geographic CRSs on datums other than WGS 84, grid-based datum shifts, exact Helmert shifts, curved GML segments and solids, 3D constructions, and lines split at crossings | [G01](specs/G01-geosparql.md#roadmap-follow-ups-2026-10-12) | M | Medium |
-| 25 | **Callbacks in other languages** (Python and JavaScript functions inside queries, and native dispatch of Java functions, which today run through ARQ) | [P03](specs/P03-query-extensions.md#roadmap-follow-ups-2026-10-12) | M | Medium |
-| 26 | **Local models.** GPU, ONNX and GGUF, rerankers, and models shared between processes | [F12](specs/F12-local-embeddings.md#roadmap-follow-ups-2026-10-12) | M–L | Medium |
-| 81 | **Shared memory representation for agents and personal knowledge.** Define a common profile for documents, cited assertions, entities, notes, decisions and tasks, with distinct evidence and dependency relations, time and invalidation rules, and knowledge separated from instructions. This is deferred and has no active implementation lane. | [C17](specs/C17-agent-memory.md#shared-memory-representation), [C18](specs/C18-natural-language-questions-and-ingest.md#shared-memory-workflows) | M–L | High |
+| 19 | **Query-time reasoning.** Phase 2 adds `auto` with its cost model, the dataset setting and hybrid rules. Phase 3 adds OWL 2 QL rewriting, reuse of tables across commits, the MCP argument, the UI and tables kept current by F13. Items 190 to 193 cover what Phase 1 left. | [F17](specs/F17-query-time-reasoning.md#outcome) | L | High |
+| 18 | **Explanations.** Derivation trees, "why not?" answers, entailment diffs on branches and minimal justifications, with protections that track provenance and `reviewedOnly` extended to derived facts. Phases 1 and 2 need only F17 Phase 1, and Phase 3 needs F13. | [F18](specs/F18-explanations-and-entailment-diffs.md) | M–L | High |
+| 17 | **Incremental computation core.** Materialized SPARQL views, live queries that push result changes, and provenance per fact. | [F13](specs/F13-incremental-views-and-provenance.md) | XL | Very high |
+| 23 | **Full-text parity.** Lucene analyzers, CJK segmentation, online reindexing, search after uncommitted writes, and historical search. | [F03](specs/F03-full-text-search.md#roadmap-follow-ups-2026-10-12) | M each | Medium |
+| 24 | **GeoSPARQL.** k-NN with arbitrary joins, better polygon approximations than the cell grid and QLever's spatial syntax. The geometry limits to lift are datums other than WGS 84, grid-based and exact Helmert shifts, curved GML segments and solids, 3D constructions, and lines split at crossings. | [G01](specs/G01-geosparql.md#roadmap-follow-ups-2026-10-12) | M | Medium |
+| 27 | **Live query profiling** with verified rewrite suggestions. | [U04](specs/U04-live-query-profiling.md) | M | Not rated |
+| 28 | **Query by example** and Bloom-style search phrases. | [U03](specs/U03-query-by-example.md) | M | Not rated |
+| 21 | **Editing forms generated from SHACL shapes.** Phase 3 adds nested forms for blank nodes, the list editor and `sh:or` and `sh:xone` choices. Validation of nodes more than two triples from the edited resource, in a check without a guard, also remains. | [U02](specs/U02-shape-driven-forms.md#outcome) | M–L | Medium–high |
+| 22 | **RML, R2RML and YARRRML loading,** CSVW standard mode and key checks, and tests that Tarql's functions work in templates. | [F19](specs/F19-mappings-and-virtual-graphs.md) Phase 1, [C05](specs/C05-tabular-imports.md#roadmap-follow-ups-2026-10-12) | M–L | Medium–high |
+| 25 | **Callbacks in other languages.** Python and JavaScript functions inside queries, and native dispatch of Java functions, which today run through ARQ. | [P03](specs/P03-query-extensions.md#roadmap-follow-ups-2026-10-12) | M | Medium |
+| 26 | **Local models.** GPU, ONNX and GGUF, rerankers, and models shared between processes. | [F12](specs/F12-local-embeddings.md#roadmap-follow-ups-2026-10-12) | M–L | Medium |
+| 81 | **Shared memory representation for agents and personal knowledge.** A common profile for documents, cited assertions, entities, notes, decisions and tasks, with evidence and dependency relations, time and invalidation rules, and knowledge kept apart from instructions. This item is deferred. | [C17](specs/C17-agent-memory.md#shared-memory-representation), [C18](specs/C18-natural-language-questions-and-ingest.md#shared-memory-workflows) | M–L | High |
+| 20 | **openCypher,** with graph algorithms as procedures and LDBC SNB as acceptance. | [F01](specs/F01-cypher.md#roadmap-follow-ups-2026-10-12) | L–XL | High |
 
 ## Tier 4: worth doing, not urgent
 
+This tier has three groups. The features are user-facing work, the performance follow-ups
+investigate measured costs and planner losses, and the graph-interaction UI finishes a set
+of canvas features.
+
+### Features
+
 | # | Item | Spec | Size |
 |---|---|---|---|
-| 27 | Live query profiling with verified rewrite suggestions | [U04](specs/U04-live-query-profiling.md) | M |
-| 28 | Query by example and Bloom-style search phrases | [U03](specs/U03-query-by-example.md) | M |
-| 29 | **Partly done (2026-10-23). Rendering very large graphs with WebGL, with server-side aggregation.** The user moved Phases 1 and 2 up the queue on 2026-10-23, and they shipped that day: Explore opens on a WebGL class overview with semantic zoom through `POST /$/graph/{ds}/groups`, and the query page draws results above 2,000 nodes with WebGL. Server layouts, the binary transfer format and the GPU frame-rate tests of Phase 3 remain, at this tier's priority. The groups call reached Python, Node.js and the JVM bindings on 2026-10-23. The overview also groups the dataset by the GraphRAG communities of item 12 since 2026-10-23, with the report beside the picture. | [U06](specs/U06-large-graph-rendering.md#outcome) | M |
-| 30 | Notebooks stored in the dataset | [U05](specs/U05-notebooks.md) | M |
-| 31 | Data-quality timeline and schema diagram | [U07](specs/U07-data-quality-and-schema-diagram.md) | M |
-| 32 | Parameterized reusable plans | [X10](specs/X10-reusable-query-plans.md), [P01](specs/P01-python-bindings.md#roadmap-follow-ups-2026-10-12) | L |
-| 33 | Per-call overhead in the bindings: JNI calls (3–4× Jena's in-memory store), Node `has()` (1.9 vs 1.3 µs published) and Node export conversion (1.44×) | [P04](specs/P04-jvm-bindings.md#roadmap-follow-ups-2026-10-12), [P05](specs/P05-node-bindings.md#roadmap-follow-ups-2026-10-12) | M |
-| 34 | Vector quantization and vector-result caching | [F04](specs/F04-vector-search.md#roadmap-follow-ups-2026-10-12) | M |
-| 35 | Multi-field full-text entity documents | [F03](specs/F03-full-text-search.md#roadmap-follow-ups-2026-10-12) | M |
-| 36 | Batched (chunked) updates and commit triggers | [C23](specs/C23-batched-updates-and-triggers.md) | M |
-| 37 | GraphQL execution: child queries seeded with engine IDs and top-k per parent; later, persisted queries, mutations and subscriptions | [C03](specs/C03-graphql.md#roadmap-follow-ups-2026-10-12) | M |
-| 38 | SERVICE enhancer: slice-aware cache, cache functions, disk cache and parallel requests | [G10](specs/G10-service-enhancer.md#roadmap-follow-ups-2026-10-12) | M |
-| 39 | Stored updates, multi-value parameters and private stored queries | [C16](specs/C16-stored-queries.md#roadmap-follow-ups-2026-10-12) | S–M |
-| 40 | Memory footprint: idle server RSS, Python process RSS and full-text index size | [X08](specs/X08-disk-spill-and-server-memory.md) Phase 3 | M |
-| 41 | Text input in Similar, chunk offsets kept beside vectors, and NixOS embedding settings | [F08](specs/F08-embeddings-on-write.md#roadmap-follow-ups-2026-10-12) | S |
-| 42 | MCP progress notifications, per-tool metrics and performance measurements | [C11](specs/C11-mcp-server.md#roadmap-follow-ups-2026-10-12) | S–M |
-| 43 | Virtual graphs over SQL, Parquet and Iceberg | [F19](specs/F19-mappings-and-virtual-graphs.md) Phase 2 | XL |
-| 44 | A local-first engine in WebAssembly that syncs through RDF Patch and branches | [F20](specs/F20-local-first-engine.md) | XL |
-| 72 | JSON query languages, and a Datalog surface syntax for rules and queries | [C24](specs/C24-json-query-languages.md), [F17](specs/F17-query-time-reasoning.md) | M–L |
-| 78 | Incremental write-time validation of recursive SHACL shapes and SHACL-SPARQL constraints not anchored at the focus node | [C10](specs/C10-write-time-validation.md#roadmap-follow-ups-2026-10-12) | M–L |
-| 82 | Cheaper vector catch-up and measured half-precision recall. Catch-up scans only new rows, binary16 recall is measured on Euclidean and dot-product data with an offset, a measurement picks the worker pool, and a test cancels a carry. | [F04](specs/F04-vector-search.md#roadmap-follow-ups-2026-10-12) | S–M |
-| 83 | The ShEx guard checks the SHA-256 of its schema copy against `schema.sha256` in its `validation.json` when it loads, and refuses the guard or validates in full when they differ, so a copy edited outside Sparkles is not trusted with the stored baseline counts. | [C10](specs/C10-write-time-validation.md#known-gap-schema-copy-digest-2026-10-16) | S |
-| 84 | Large query plans. The deadline checks, the plan JSON without ids, the iterative explanation reader and the teardown of refused queries shipped. An n-ary join, designed in X05, would let the 4000-level plan limit rise, and planning time still grows with the square of the number of triple patterns. A star of a variable that many patterns share remains slow, about 3 s at the limit on a dataset of 31,815 triples. | [X05](specs/X05-streaming-query-execution.md#large-basic-graph-patterns) | M |
-| 85 | **Implementation done (2026-10-21). Hash-join spill, ordered DISTINCT spill and encrypted spill.** Review corrections bound retained files and batch admission, with tests for nested merge EOF, keyless builds and DISTINCT accounting. Spill remains opt-in, and item 93 records the full-scale acceptance matrix and remaining execution work. | [X08](specs/X08-disk-spill-and-server-memory.md) §6.3 and §6.7 | M |
-| 93 | **Acceptance matrix passed (2026-10-21).** The 20-million-row sort and the 10-million-group aggregate and DISTINCT matrix pass in plain and encrypted modes under 64 MiB. Grouping cost above ordered spilled joins, the extra writes that restore probe order, a DISTINCT over ordered input that keeps its whole set, the performance investigation and a review of enabling spill by default remain open. | [X08](specs/X08-disk-spill-and-server-memory.md#full-scale-spill-acceptance-item-93-2026-10-21) | M |
-| 94 | **Done (2026-10-24). Spilled join amplification.** Build rows that leave a spilled hash join's key unbound stay in memory only up to a quarter of a chunk and then go to a file of their own, which never counts toward partitioning again. An inner join meets them in one job over every probe file, and other joins read them as further chunks of each job. Counting a merge join passes over its equal-key runs instead of spooling them, and spilled groupings and DISTINCT seed their partition hash per depth, so rows whose FxHash values collide spread at the next depth. Item 210 follows. | [X08](specs/X08-disk-spill-and-server-memory.md#spilled-join-amplification-item-94-2026-10-24) | S–M |
-| 95 | **Done (2026-10-24). Close-only locks on the database directory.** Backup restore took `sparkles.lock` as a plain file, and the facade's catalog lock was released only when its descriptor closed, so a child forked before exec could keep either lock held. Both now use the store's lock guard, which unlocks the file explicitly when the process that took it drops it, and the offline restore's busy probe does the same. Tests hold a forked child before exec while each lock is dropped and taken again. | [P06](specs/P06-library-admin-api.md), [F05](specs/F05-snapshot-repositories.md#23-restore) | S |
-| 96 | **Done (2026-10-23). Streaming NOT EXISTS over a Cartesian product.** Automatic execution streams a plan without spill when its eager output would outgrow the memory the query may use and the cursor's own state fits, so BSBM BI's q4 with ProductType6 answers at 10M in 15.1 s with 282 MB under the default pool, where the pool refused it, and eager execution took 17.7 s and 8.3 GB. A request larger than the whole pool answers `507` without `Retry-After`. The BI driver cells are still to be rerun by item 1. | [X08](specs/X08-disk-spill-and-server-memory.md#automatic-streaming-without-spill-item-96-2026-10-23) | M |
-| 97 | **Done (2026-10-23). Retune the `small` memory profile.** A prefetch request over its budget of an eighth of the block cache warmed nothing, so the profile's 256 MiB cache made a cold `star-lookup` decode its blocks one at a time. The budget now has a floor of 64 MiB, at most a quarter of the cache, which costs the `small` profile up to 64 MiB of other queries' blocks per cold request and leaves its RSS saving of about 70 MiB at 10.5M. The cold `star-lookup` takes 18.5 ms against the default's 18.1 ms, and both profiles meet X08's Phase 1a gate against the control with the earlier defaults. | [X08](specs/X08-disk-spill-and-server-memory.md#small-profile-retune-and-the-phase-1a-control-item-97-2026-10-23) | S |
-| 98 | **Done (2026-10-23). Materialization limit and F16 acceptance at scale.** `sparkles infer --max-inferred`, `serve --reason-max-inferred`, a request's `maxInferred`, `ReasonRequest::max_inferred` and the Python, Node and JVM bindings set the limit, which stays at 50 million by default, and 0 removes it. A run past it fails with the code `inferred-limit` and says how to raise it. On a Namespace instance of 32 GiB, LUBM(1000) under RDFS took 91 s at 15.2 GiB RSS, while the commit before Phase 1 took 360 s and at least 34.1 GiB of RSS and swap, so A1 is met. Closures matched wherever both finished. OWL2Bench under OWL 2 RL from five universities on passes 28 GiB in both. | [F16](specs/F16-materialization-at-scale.md#outcome) | S–M |
-| 108 | **Done (2026-10-24). Faster FSST reads and IRI encoding where prefixes dominate.** A lookup now decodes only the bytes of each key that the next key takes, short suffixes decode without branches and a string lookup compares keys without rebuilding them. With FSST the warm DBpedia export takes 1.05 times as long as front coding instead of 2.69 times, and cold `export-500k` 1.02 times instead of 1.11. Warm `contains`, `lang-filter`, `export-500k` and DBpedia `abstract-contains` still run 4% to 12% slower than front coding, so FSST stays an option. A decoded-term cache would not serve the dense queries, and a wider symbol table would change the format. Phase 2b would shrink `vocab.dat` by 7.4% on WatDiv and 4.9% on a Wikidata slice, short of its 10% gate, so it stays unbuilt. | [X11](specs/X11-index-compression-and-predicate-patterns.md#item-108-faster-fsst-reads) | M | Medium at scale |
-| 160 | **FSST single-term lookups.** After item 108, `star-join` at 10.5M runs 4% slower with FSST than main's FSST did, 30.40 ms against 29.18 ms on forge, because looking up one term at a time costs 20% more cycles than decoding each earlier key in full. Copying plain suffixes whole did not help. Cold `entity-summary-1` on DBpedia, which looks up long literals one at a time, took 1.17 times as long with FSST as with front coding, above the cold limit of 15%. Find a lookup path that keeps the partial decode for long literals without the cost on short keys, and profile the cold lookups. | [X11](specs/X11-index-compression-and-predicate-patterns.md#item-108-faster-fsst-reads) | S |
-| 161 | **Confirm front coding on warm DBpedia after item 108.** A single warm round on forge measured the item 108 branch's front coding at a geometric mean of 1.019 against main's on the DBpedia 50M slice, from queries under 1 ms such as `place-union-1`. Perf on atlas counted the same or fewer instructions for the branch on each of the nine queries that moved most. Rerun the warm DBpedia suite on forge with front coding, main before and after the item 108 merge, in several pinned rounds, and fix any query that stays slower. | [X11](specs/X11-index-compression-and-predicate-patterns.md#item-108-faster-fsst-reads) | S |
-| 109 | **`order-by-full` with one codegen unit for sparkles-core.** Release builds compile `sparkles-core` as one unit since 2026-10-23, which made `expr-order-key` 5.3% faster on forge. `order-by-full` ran 0.7% slower, 1059.4 ms against 1052.3 ms, with ranges of round medians that barely overlap. Profile the sort and its comparator under both settings to find what lost its inlining. | [Benchmarking](BENCHMARKING.md#release-build-settings) | S |
-| 110 | **Bound the write stall of the locked full-text checkpoint.** Forge measured all four writers stopping for a median of 70 to 150 ms about every 5.4 s under steady writes, with grouping and without it, probably in the fourth checkpoint tick, which holds the live writer lock through its file synchronization. Trace the ticks to confirm it and bound the stall, for example by synchronizing only the files written since the unlocked pass. The item ends by rerunning the text and spatial mixed cells with more headroom in the offered rate, which settles the reader gates of item 86. | [X09 Outcome](specs/X09-group-commit-by-default.md#phase-4) | S–M | Medium |
-| 111 | **Spatial serial slowdowns of group commit at 10.5M.** Single inserts of geometries ran 1.025 times slower at p50 and 1.077 times at p90 than their ordinary neighbours, with an engine overhead of 0.240 against 0.213 ms, and IRI inserts ran 1.032 times slower at p90. The reader p99 of the mixed cell was 1.044 times the ordinary one. Find the cause, then fix it or state the tradeoff. | [X09 Outcome](specs/X09-group-commit-by-default.md#phase-4) | S–M | Low–medium |
-| 112 | **Fence cost of group commit on indexed datasets.** A fence synchronizes in 1.4 to 1.5 ms against about 1.0 ms for one ordinary commit and carries only 1.9 to 2.0 commits with four writers, so full-text and spatial datasets gain 1.50 to 1.68 times and the first judgement missed 1.5 in three cells. Find why a fence costs half as much again and whether it can carry more commits. Measure it on a drive in its fast state too, where the gain was 1.27. | [X09 Outcome](specs/X09-group-commit-by-default.md#phase-4) | M | Medium |
-| 114 | **Client time of large results in `optional-chain`.** The batch pushed on 2026-10-23 answers `optional-chain` on the 1M-person Namespace screen 6.1% faster on the server but 4.7% slower at the client, 171.3 ms against 163.6 ms over eight rounds, so the time is spent writing or sending its rows. Profile the result serialization and the response path of a large SELECT between c2a2ecdd and the pushed commit, with the item 91 cursor changes and the CGU=1 build as the first suspects. | [Benchmarking](BENCHMARKING.md) | S |
-| 180 | **Plan pattern references on small queries.** The references of U04 Phase 4 added 3.8 to 13.2 thousand instructions per request to small queries, and forge measured 4 to 9% more server time on `path-plus`, `types-grouped`, `values-star` and `star-lookup` and about 1.8% more client time. A follow-up on 2026-10-24 removed 28 to 48% of the instructions. Forge did not see the saving in time, and `types-grouped` read 7.5% slower against a laptop build of e411a772, so measure it again with two builds from one host. Build the references only for a plan that is described, or reuse the parsed query's terms, so that a plain query pays nothing for them. | [Benchmarks](BENCHMARKS.md#the-cost-of-plan-pattern-references), [U04](specs/U04-live-query-profiling.md#phase-4-2026-10-23) | S–M |
-| 181 | **Compiler provenance in the Namespace query screen.** `scripts/nsc-bench.sh` caches a binary by commit alone, and the baseline of the 2026-10-24 screen was built outside the Nix shell with other C compilers, which saved it 11 to 33 thousand instructions per request through mimalloc. Record each binary's compilers as `scripts/nsc-writes.sh` does and refuse to compare binaries built with different ones. | [Benchmarking](BENCHMARKING.md#benchmark-scripts) | S |
-| 182 | **subquery-agg after the 2026-10-24 merges.** The Namespace screen of d37c2eec against 26deb06e, rerun with 8 rounds of 100 requests at 10.5M triples, measured subquery-agg 6.3% slower on the server and 5.2% slower on the client. That is under the 10% push limit, so the push went ahead. Check it on forge with pinned rounds, and if it holds, bisect the merges of U02 forms, U11 Phase 3 and item 94. | [BENCHMARKING](BENCHMARKING.md) | S |
-| 88 | Allocator overhead of the server-wide caches. The heap behind the result cache is about 1.2 times the bytes it counts, and evicted entries leave free pages in the heaps of the tokio and Rayon threads, which the amended A1 bound of X08 allows for. The idle release could collect on the tokio workers too, or the caches could charge the sizes that mimalloc reports. The item also covers about 3% of extra instructions on queries of a few microseconds between 899fb251 and 4d174d02, which profiles spread over scans, the index join, reallocation and the clock. | [X08](specs/X08-disk-spill-and-server-memory.md#gates) | S–M |
-| 90 | VALUES pushdown in more shapes. The rewrite of item 89 fires only at a join the planner plans as a whole, so `GRAPH <g> { VALUES … { A } UNION { B } }` and joins reached while flattening a group keep the table outside. A branch FILTER that reads the table's variable, such as `FILTER(isLiteral(?l))`, also keeps the table outside it, so the branch still reads its whole pattern. | [C18](specs/C18-natural-language-questions-and-ingest.md#roadmap-follow-ups-2026-10-12) | S–M |
-| 91 | **SP²Bench planner losses are partly addressed.** UNION pruning reduces `q8` and `q12b` work, bounded ASK avoids oversized `q12a` candidates, and string equality pruning answers `q5a` at 10M within the default budgets. In item 1's reference run at 10M, `q5a` returns all 385,208 rows in 3.9 s and matches an independent oracle, and `q8` takes 8.3 ms. On 2026-10-23 keyed left joins let `q6` answer its 906,313 rows at 10M in 0.95 s, matching Jena's answer, and an eager `q4` that outgrows the query pool runs again as a cursor without spill. The `q4` answer is 1.96 GB of TSV, so it still needs a `--max-result-mb` above the default 1 GiB. Jena stays 12× faster on `q12a` and Oxigraph 1.7× on `q12b`. | [X06](specs/X06-benchmark-coverage.md#sp2bench-planner-follow-up-2026-10-21), [follow-up](specs/X06-benchmark-coverage.md#sp2bench-q4-and-q6-follow-up-2026-10-23) | M |
-| 99 | **Done (2026-10-24). Truncated eager responses are logged as complete.** An eager answer whose serialized body reaches `--max-result-mb` after it has started to stream now sends the bytes it had buffered and then aborts the chunked transfer, as a cursor's answer does. The access log and the metrics record it when the body ends, with the outcome `budget`, the bytes sent and the rows written whole. Router tests cover JSON, XML, CSV, TSV, the native JSON format and Thrift. | [X06](specs/X06-benchmark-coverage.md#sp2bench-q4-and-q6-follow-up-2026-10-23) | S |
-| 100 | Several GraphRAG configurations per dataset, so readers with different views each get reports built from their own view. `graphrag.json` would take a list of named configurations, routes and the CLI would name one, and the build state and ledger would be kept per configuration under a new format version. Consumers would use the first configuration whose reports graph the caller may read. | [C22](specs/C22-graph-rag-community-summaries.md#13-open-questions) | M |
+| 29 | **Rendering very large graphs.** Phase 3 adds server layouts, the binary transfer format and GPU frame-rate tests. | [U06](specs/U06-large-graph-rendering.md#outcome) | M |
+| 30 | **Notebooks** stored in the dataset. | [U05](specs/U05-notebooks.md) | M |
+| 31 | **Data-quality timeline and schema diagram.** | [U07](specs/U07-data-quality-and-schema-diagram.md) | M |
+| 32 | **Parameterized reusable plans.** | [X10](specs/X10-reusable-query-plans.md), [P01](specs/P01-python-bindings.md#roadmap-follow-ups-2026-10-12) | L |
+| 34 | **Vector quantization** and vector-result caching. | [F04](specs/F04-vector-search.md#roadmap-follow-ups-2026-10-12) | M |
+| 35 | **Multi-field full-text entity documents.** | [F03](specs/F03-full-text-search.md#roadmap-follow-ups-2026-10-12) | M |
+| 36 | **Batched updates and commit triggers.** | [C23](specs/C23-batched-updates-and-triggers.md) | M |
+| 37 | **GraphQL execution.** Child queries seeded with engine IDs and top-k per parent, and later persisted queries, mutations and subscriptions. | [C03](specs/C03-graphql.md#roadmap-follow-ups-2026-10-12) | M |
+| 38 | **SERVICE enhancer.** A slice-aware cache, cache functions, a disk cache and parallel requests. | [G10](specs/G10-service-enhancer.md#roadmap-follow-ups-2026-10-12) | M |
+| 39 | **Stored updates,** multi-value parameters and private stored queries. | [C16](specs/C16-stored-queries.md#roadmap-follow-ups-2026-10-12) | S–M |
+| 41 | **Embedding conveniences.** Text input in Similar, chunk offsets kept beside vectors, and NixOS embedding settings. | [F08](specs/F08-embeddings-on-write.md#roadmap-follow-ups-2026-10-12) | S |
+| 42 | **MCP observability.** Progress notifications, per-tool metrics and performance measurements. | [C11](specs/C11-mcp-server.md#roadmap-follow-ups-2026-10-12) | S–M |
+| 43 | **Virtual graphs** over SQL, Parquet and Iceberg. | [F19](specs/F19-mappings-and-virtual-graphs.md) Phase 2 | XL |
+| 44 | **A local-first engine** in WebAssembly that syncs through RDF Patch and branches. | [F20](specs/F20-local-first-engine.md) | XL |
+| 72 | **JSON query languages,** and a Datalog surface syntax for rules and queries. | [C24](specs/C24-json-query-languages.md), [F17](specs/F17-query-time-reasoning.md) | M–L |
+| 78 | **Incremental write-time validation** of recursive SHACL shapes and of SHACL-SPARQL constraints not anchored at the focus node. | [C10](specs/C10-write-time-validation.md#roadmap-follow-ups-2026-10-12) | M–L |
+| 82 | **Cheaper vector catch-up and measured half-precision recall.** Catch-up should scan only new rows, binary16 recall needs measuring on Euclidean and offset dot-product data, and a measurement should pick the worker pool. A test should cancel a carry. | [F04](specs/F04-vector-search.md#roadmap-follow-ups-2026-10-12) | S–M |
+| 83 | **Digest check on the ShEx guard's schema copy.** The guard should compare its schema copy with `schema.sha256` when it loads, and refuse the guard or validate in full when they differ. | [C10](specs/C10-write-time-validation.md#known-gap-schema-copy-digest-2026-10-16) | S |
+| 100 | **Several GraphRAG configurations per dataset,** so that readers with different views each get reports built from their own view. The build state and ledger would be kept per configuration under a new format version. | [C22](specs/C22-graph-rag-community-summaries.md#13-open-questions) | M |
 
-### Graph-interaction UI (2026-10-23)
+### Performance follow-ups
 
-The user approved ten graph-interaction features on 2026-10-23. They are grouped into
-four new specs and four phases added to existing ones, and each row below is one spec or
-one added phase. Rows that need backend work name it as their first phase.
+The measurements behind these items are in [BENCHMARKS.md](BENCHMARKS.md) and the linked
+spec sections.
 
-| # | Item | Spec | Size | Impact |
-|---|---|---|---|---|
-| 101 | **Partly done (2026-10-23). A two-way visual query builder.** A canvas beside the editor that draws any query's pattern and edits a subset of SPARQL as splices of the text, with locked blocks for the rest and a stable layout. Phases 1 and 2 shipped on 2026-10-23 with the `pattern` export of the formatter's browser module, the Pattern pane and result tab, the schema pickers, filters, paths, renames, deletions, the projection strip, **Count matches** and the phone layout for building. Phase 3 remains. | [U08](specs/U08-visual-query-builder.md#outcome) | L | Medium–high |
-| 102 | **Done (2026-10-23). The plan on the pattern.** Estimated and actual rows drawn on U08's pattern graph, with misestimates marked, filter rows, join badges in run order and selection shared with the plan tree. Plan nodes name the patterns, filter variables and join variables they read. Live counts wait for item 27. | [U04](specs/U04-live-query-profiling.md#11-phase-4-the-plan-drawn-on-the-querys-pattern-2026-10-23) Phase 4 | S–M | Medium |
-| 103 | **Done (2026-10-24). A path finder.** F07's path search skips predicates and hubs with `path:excludePredicate` and `path:maxDegree`. Explore's path finder draws and animates the shortest, all shortest or k shortest paths between two entities. Paths can be weighted by a numeric property of the reifiers, and the panel draws them on the query page's result graphs in the canvas and the WebGL view. | [U09](specs/U09-path-finder.md#outcome) | M | Medium–high |
-| 104 | **Done (2026-10-23). A time-lapse and commit diffs on the canvas.** A commit's changes are drawn as a graph from History, the commit graph and write receipts, a time-lapse applies one diff per step, and the overview moves through time. `GET /{ds}/diff?group=class` groups a diff by class under the caller's view, and its numbers wait for confirmation on forge. | [U01](specs/U01-time-slider.md#phase-4-time-lapse-and-commit-diffs-on-the-canvas-2026-10-23) Phase 4 | M | Medium |
-| 105 | **Lenses on the canvas.** Size, colour, badge and edge-style lenses with legends, inferred edges drawn dashed, algorithm lenses from view-only F14 runs, and the derivation tree of an inferred edge. Phase 1 shipped the lens model with the degree, property, class, graph and inferred-edge lenses. Phase 2 shipped cached view-only runs on the server and the algorithm and GraphRAG lenses, with stable community colours and compare-mode deltas. Phase 3 first adds an explanation search over a materialized closure. | [U10](specs/U10-canvas-lenses.md) Phase 3 | L | Medium–high |
-| 106 | **Done (2026-10-23). A validation overlay.** Explore badges the SHACL and ShEx results of the drawn nodes, opens a node's results with the failing shape and the triples involved, and suggests a fix that a C15 dry run previews before it can run. `/{ds}/shacl` takes repeated `target` and `shapes=guard` or a shapes graph, and `/{ds}/shex` takes `schema=guard` and `at`. Item 120 moved the overlay into U10's badge channel, and it still holds the read of U07 Phase 1's record. | [U07](specs/U07-data-quality-and-schema-diagram.md#11-phase-4-a-validation-overlay-on-the-graph-2026-10-23) Phase 4 | M | Medium |
-| 107 | **Done (2026-10-24). Linked views.** Explore's **Map** and a result's **Arcs** draw relations as great-circle arcs, facet histograms from `POST /$/graph/{ds}/facets` brush the canvas and write their filters into the query, **Use in query** writes a selection as a `VALUES` block, and the canvases, maps and facets share one selection. Phase 3 added `POST` and `GET /$/vector/{ds}/{name}/projection` and the embedding map at `/ui/embedding`, whose lasso and box select entities for a query. Items 140 to 142 hold the remainder. | [U11](specs/U11-linked-views.md#outcome) | L | Medium |
-| 140 | **Linked views remainder in the UI.** Colour the embedding map by a kept Leiden run of the lens menu (U10) and open it with `Shift+M`, count date facets by month when a set spans less than a few years, give the facets a full-screen tab at a phone's width, and let Explore's map and facets read a branch. | [U11](specs/U11-linked-views.md#outcome) | M | Low |
-| 141 | **Frame times of the linked views on a GPU.** The arcs of Phase 1 and the embedding map of Phase 3 were measured only in software rendering. Run U11's A9, 50,000 points with density shading panning at 30 frames per second and a lasso over 20,000 points within 100 ms, in a Playwright performance project on a GPU runner, as item 29 asks for the large-graph views. | [U11](specs/U11-linked-views.md#outcome) | S | Low |
-| 142 | **Projections on disk and for partial callers.** U11's open questions 1 and 2. A projection lives in server memory and is computed again after a restart, and callers whose access covers part of a dataset get `403`. Decide whether to write projections beside the index in a versioned file and whether to serve a projection filtered to the entities a caller can read. | [U11](specs/U11-linked-views.md#10-open-questions) | M | Low |
-| 120 | **Partly done (2026-10-23). The validation overlay in the lens menu and on the quality record.** The overlay is now the badge channel's **validation results** lens, with its source picker in the lens menu, a legend by worst severity and the list view's column, and the toolbar toggle is gone. Once item 31 Phase 1 records the guard's results per commit, add `focus=` to `GET /$/validation/{ds}/results` and read the record at the head instead of validating. | [U07](specs/U07-data-quality-and-schema-diagram.md#outcome) §11 | S | Medium |
-| 150 | **Bidirectional weighted path search.** A search weighted by `path:weight` runs Dijkstra's algorithm from the source alone, so a weighted pair search on the 10.5M-triple data takes 0.68 s against 1.2 ms unweighted, and the five cheapest paths visit more than 10 million nodes. Search from both ends with a bidirectional Dijkstra, run Yen's spur searches on it, and bound them by the best cost found so far. | [F07](specs/F07-path-search.md), [U09](specs/U09-path-finder.md#outcome) | M | Medium |
-| 121 | **Conclusive previews of a suggested fix.** Under an incremental guard, a dry run's summary lists only the shapes and focus nodes it validated again, so the validation overlay can say a fix resolves a result only when no other result remains. Let a dry run name focus nodes to validate in full against the candidate state, and have the overlay name the result's focus node. | [U07](specs/U07-data-quality-and-schema-diagram.md#outcome) §11, [C15](specs/C15-write-previews.md) | S | Medium |
-
-An orchestrator should start these in the following order, for the reasons given.
-
-1. **Item 101 Phase 1 and item 105 Phase 1 in parallel.** U08's pattern export and
-   read-only pane are the base of items 102 and 107's query edits, and U10's lens model is
-   the base of item 106 and the rest of item 105. Neither depends on the other.
-2. **Items 103 and 104 alongside them.** Both are self-contained, and each starts with a
-   small server phase that a separate lane can build first.
-3. **Item 101 Phase 2, then item 102.** The plan overlay needs only U08 Phase 1, but it is
-   most useful once people build queries on the canvas. Its live counts wait for item 27.
-4. **Item 106 and item 105 Phase 2.** Both need U10 Phase 1. Item 105 Phase 2 closes the
-   community-colouring part of item 8's gap.
-5. **Items 140 to 142.** Item 107 shipped, and its remainder is small UI work, a GPU
-   measurement and two open questions about projections.
-6. **Item 105 Phase 3 last.** Its explanation search is the most open engine work of the
-   set, and U10's open question 1 asks whether to build it before F17 or to wait for item
-   18.
+| # | Item | Spec | Size |
+|---|---|---|---|
+| 33 | **Per-call overhead in the bindings.** JNI calls cost 3 to 4 times Jena's in-memory store, and Node `has()` and export conversion are slower than published targets. | [P04](specs/P04-jvm-bindings.md#roadmap-follow-ups-2026-10-12), [P05](specs/P05-node-bindings.md#roadmap-follow-ups-2026-10-12) | M |
+| 40 | **Memory footprint.** Idle server RSS, Python process RSS and full-text index size. | [X08](specs/X08-disk-spill-and-server-memory.md) Phase 3 | M |
+| 84 | **Large query plans.** An n-ary join would let the 4000-level plan limit rise, and planning time still grows with the square of the number of triple patterns. A star of a variable that many patterns share remains slow at the limit. | [X05](specs/X05-streaming-query-execution.md#large-basic-graph-patterns) | M |
+| 88 | **Allocator overhead of the server-wide caches.** The result cache's heap is about 1.2 times the bytes it counts, and evicted entries leave free pages on the tokio and Rayon threads. The item also covers about 3% more instructions on queries of a few microseconds. | [X08](specs/X08-disk-spill-and-server-memory.md#gates) | S–M |
+| 90 | **VALUES pushdown in more shapes.** The rewrite misses a VALUES inside `GRAPH`, joins reached while flattening a group, and branches whose FILTER reads the table's variable. | [C18](specs/C18-natural-language-questions-and-ingest.md#roadmap-follow-ups-2026-10-12) | S–M |
+| 91 | **SP²Bench planner losses.** Jena stays 12 times faster on `q12a` and Oxigraph 1.7 times faster on `q12b`. The `q4` answer is 1.96 GB of TSV and needs a `--max-result-mb` above the default. | [X06](specs/X06-benchmark-coverage.md#sp2bench-planner-follow-up-2026-10-21), [follow-up](specs/X06-benchmark-coverage.md#sp2bench-q4-and-q6-follow-up-2026-10-23) | M |
+| 93 | **Spill execution costs and the default.** The full-scale acceptance matrix passes. Grouping cost above ordered spilled joins, the extra writes that restore probe order, a DISTINCT over ordered input that keeps its whole set, the [performance investigation](#spill-performance-investigation) and a decision on enabling spill by default remain. | [X08](specs/X08-disk-spill-and-server-memory.md#full-scale-spill-acceptance-item-93-2026-10-21) | M |
+| 109 | **`order-by-full` with one codegen unit for sparkles-core.** The sort ran slightly slower under this build setting. Profile the sort and its comparator under both settings to find what lost its inlining. | [Benchmarking](BENCHMARKING.md#release-build-settings) | S |
+| 110 | **Write stall of the locked full-text checkpoint.** All writers stop for 70 to 150 ms about every 5.4 s under steady writes, probably while a checkpoint holds the writer lock through its file sync. Confirm and bound the stall, then rerun the text and spatial mixed cells to settle item 86's reader gates. | [X09 Outcome](specs/X09-group-commit-by-default.md#phase-4) | S–M |
+| 111 | **Spatial serial slowdowns of group commit at 10.5M.** Single geometry inserts and IRI inserts run a few percent slower at p90 with grouping. Find the cause, then fix it or state the tradeoff. | [X09 Outcome](specs/X09-group-commit-by-default.md#phase-4) | S–M |
+| 112 | **Fence cost of group commit on indexed datasets.** A fence costs about half as much again as an ordinary commit and carries only about two commits with four writers. Find why and whether it can carry more, and measure it on a drive in its fast state too. | [X09 Outcome](specs/X09-group-commit-by-default.md#phase-4) | M |
+| 114 | **Client time of large results in `optional-chain`.** The query got faster on the server but slower at the client, so the time is spent writing or sending its rows. Profile the result serialization and the response path of a large SELECT. | [Benchmarking](BENCHMARKING.md) | S |
+| 160 | **FSST single-term lookups.** Looking up one term at a time with FSST costs more than decoding each earlier key in full, which slows `star-join` and cold long-literal lookups. Find a lookup path that keeps the partial decode for long literals without the cost on short keys. | [X11](specs/X11-index-compression-and-predicate-patterns.md#item-108-faster-fsst-reads) | S |
+| 161 | **Front coding on warm DBpedia after item 108.** A single warm round measured front coding about 2% slower on short queries. Rerun the warm DBpedia suite on forge in several pinned rounds and fix any query that stays slower. | [X11](specs/X11-index-compression-and-predicate-patterns.md#item-108-faster-fsst-reads) | S |
+| 180 | **Plan pattern references on small queries.** The references of U04 Phase 4 add instructions and a few percent of server time to small queries. Build them only for a plan that is described, or reuse the parsed query's terms, and measure with two builds from one host. | [Benchmarks](BENCHMARKS.md#the-cost-of-plan-pattern-references), [U04](specs/U04-live-query-profiling.md#phase-4-2026-10-23) | S–M |
+| 181 | **Compiler provenance in the Namespace query screen.** `scripts/nsc-bench.sh` caches a binary by commit alone. Record each binary's compilers as `scripts/nsc-writes.sh` does and refuse to compare binaries built with different ones. | [Benchmarking](BENCHMARKING.md#benchmark-scripts) | S |
+| 182 | **`subquery-agg` slowdown.** The Namespace screen measured `subquery-agg` about 6% slower after the U02 forms, U11 Phase 3 and item 94 merges. Check it on forge with pinned rounds, and bisect those merges if it holds. | [Benchmarking](BENCHMARKING.md) | S |
 
 ### Spill performance investigation
 
-For item 85, repeat the default-path `expr-order-key` and `distinct-join` comparisons
-on a quiet Intel host with matched builds and inputs. Capture the executed plans and
-profile shared cursor buffer accounting, join and DISTINCT work before assigning a
-cause. Bisect reproducible slowdowns below the push gate as well as threshold failures.
-The initial screen passed the gate but does not establish that performance is
-unchanged across queries.
+This work belongs to item 93 and to [X08](specs/X08-disk-spill-and-server-memory.md).
+Repeat the default-path `expr-order-key` and `distinct-join` comparisons on a quiet Intel
+host with matched builds and inputs. Capture the executed plans and profile shared cursor
+buffer accounting, join and DISTINCT work before assigning a cause, and bisect
+reproducible slowdowns that stay below the push limit as well as clear failures.
 
 Measure ordered hash joins with a GROUP BY parent at tight and larger spill budgets,
 including consolidation writes, merge passes, charged memory, result equality and
 cleanup. Compare memory budgets within one build separately from comparisons between
-builds, and retain coverage for partially ordered DISTINCT. These investigations belong
-to [X08](specs/X08-disk-spill-and-server-memory.md), with reference measurements on forge
-when the host is free.
+builds, and keep coverage for partially ordered DISTINCT.
+
+### Graph-interaction UI
+
+These items finish a set of graph-interaction features whose first phases have landed.
+Rows that need backend work name it first.
+
+| # | Item | Spec | Size |
+|---|---|---|---|
+| 101 | **Visual query builder, Phase 3.** `UNION`, `GRAPH`, inline `VALUES`, `MINUS` and `FILTER NOT EXISTS` join the editable subset, and **Build a query** opens the pane from a class of the Explore overview. | [U08](specs/U08-visual-query-builder.md#outcome) | L |
+| 120 | **The validation overlay on the quality record.** Once item 31 Phase 1 records the guard's results per commit, add `focus=` to `GET /$/validation/{ds}/results` and read the record at the head instead of validating. | [U07](specs/U07-data-quality-and-schema-diagram.md#outcome) §11 | S |
+| 121 | **Conclusive previews of a suggested fix.** Let a dry run name focus nodes to validate in full against the candidate state, so that the overlay can say a fix resolves a result while other results remain. | [U07](specs/U07-data-quality-and-schema-diagram.md#outcome) §11, [C15](specs/C15-write-previews.md) | S |
+| 140 | **Linked views remainder in the UI.** Colour the embedding map by a kept Leiden run, count date facets by month for short spans, give the facets a full-screen tab on phones, and let Explore's map and facets read a branch. | [U11](specs/U11-linked-views.md#outcome) | M |
+| 141 | **Frame times of the linked views on a GPU.** Run U11's A9 frame-rate and lasso targets in a Playwright performance project on a GPU runner, since they were measured only in software rendering. | [U11](specs/U11-linked-views.md#outcome) | S |
+| 142 | **Projections on disk and for partial callers.** Decide whether to write projections beside the index in a versioned file, and whether to serve a projection filtered to what a caller can read instead of answering `403`. | [U11](specs/U11-linked-views.md#10-open-questions) | M |
+| 150 | **Bidirectional weighted path search.** A weighted search runs Dijkstra's algorithm from the source alone and is far slower than an unweighted one. Search from both ends, run Yen's spur searches on it, and bound them by the best cost found so far. | [F07](specs/F07-path-search.md), [U09](specs/U09-path-finder.md#outcome) | M |
+| 105 | **Canvas lenses, Phase 3.** First an explanation search over a materialized closure, then the derivation tree of an inferred edge on the canvas. | [U10](specs/U10-canvas-lenses.md) Phase 3 | L |
+
+Item 105 Phase 3 comes last because its explanation search is the most open engine work
+of the set, and U10's open question 1 asks whether to build it before F17 or wait for
+item 18.
 
 ## Tier 5: backlog
 
@@ -234,69 +226,97 @@ These items are smaller or narrower. Each has a design sketch in the linked spec
 
 | # | Item | Spec | Size |
 |---|---|---|---|
-| 92 | Per-crate Nix builds. Compare the working crate2nix prototype with Crane under matched build settings, measure which crates rebuild after source changes, and validate packaging and platform coverage before deciding whether to migrate. | [X13](specs/X13-per-crate-nix-builds.md) | S–M |
-| 45 | Branches: a remote branch-relink CLI, and clones and archive transfer between servers | [F09](specs/F09-branches-and-merges.md#roadmap-follow-ups-2026-10-12) | M |
-| 46 | Notifications: an email channel, an administration UI, broader backup-failure coverage, and delivery that doesn't let a slow channel delay the others | [C21](specs/C21-outbound-notifications.md#roadmap-follow-ups-2026-10-12) | M |
-| 47 | Rust client: typed bodies for the remaining administration calls, proactive rate-limit pacing, and credential integration tests | [P02](specs/P02-rust-client.md#roadmap-follow-ups-2026-10-12) | S–M |
-| 48 | SHACLC formatting; linting of N-Triples, N-Quads, JSON-LD and embedded SHACL queries; linting in the shapes editor; an MCP lint tool | [X02](specs/X02-formatter.md#roadmap-follow-ups-2026-10-12), [X04](specs/X04-linter.md#roadmap-follow-ups-2026-10-12) | M |
-| 49 | Write previews: local dry-run flags, UI previews beyond the CSV import panel and merge page, `If-Match` on `/{ds}/update`, and the handling of read-only servers and costly bulk previews | [C15](specs/C15-write-previews.md#roadmap-follow-ups-2026-10-12) | S–M |
-| 50 | Restricted views: token scopes limited to graphs, validation and statistics for restricted views, and text scoring local to what a caller can see | [C12](specs/C12-graph-access-control.md#roadmap-follow-ups-2026-10-12) | M |
-| 51 | ARQ: parallel LATERAL, user DESCRIBE handlers, the remaining client options and builder methods, and `shortest(…)` evaluation | [G06](specs/G06-arq-query-extensions.md#roadmap-follow-ups-2026-10-12) | M |
-| 52 | History: pin rebasing, periods per quad, change feeds per graph, reconstructing expired states, and history of settings | [F06](specs/F06-snapshots-and-point-in-time.md#roadmap-follow-ups-2026-10-12) | M |
-| 53 | Inference: input-graph and RDFS settings in the UI, the remaining RDFS-on-read surfaces, and controls for the import policy | [C08](specs/C08-inference-freshness.md#roadmap-follow-ups-2026-10-12) | S–M |
-| 54 | ShEx: combined SHACL and ShEx guards, schemas from a graph plus a file, and CLI outbound controls | [G02](specs/G02-shex.md#roadmap-follow-ups-2026-10-12) | M |
-| 55 | Dynamic and Nushell completions, and an OpenAPI "try it" page with named schemas | [X03](specs/X03-openapi-and-completions.md#roadmap-follow-ups-2026-10-12) | S–M |
-| 56 | Legacy MCP resource subscriptions | [C11](specs/C11-mcp-server.md#roadmap-follow-ups-2026-10-12) | S |
-| 57 | Scratch-branch expiry as a dataset setting, and expiry under stdio (today only `--mcp-scratch-branch-ttl` on the server) | [C17](specs/C17-agent-memory.md#roadmap-follow-ups-2026-10-12) | S |
-| 71 | An OWL 2 ontology object API, as Jena's `jena-ontapi` provides | [F21](specs/F21-ontology-api.md) | L |
-| 73 | Format coverage: all formats in `load_str`, `dump_graph`, SPARQL `LOAD` and the JVM and Node bindings (which read none of Jena's formats), and loading Thrift, Protobuf, RDF/JSON and TriX without a temporary N-Quads copy | [G05](specs/G05-command-line-tools.md#roadmap-follow-ups-2026-10-12) | S–M |
-| 74 | RDF Patch: patches with several transactions applied as several commits, blank-node identity across datasets, and patch logs | [F10](specs/F10-replication.md#roadmap-follow-ups-2026-10-12) | M |
-| 75 | Access control: validation endpoints for callers whose grants cover part of a dataset, the change feed for data-dependent protections, and hiding IRIs that visible triples mention | [C12](specs/C12-graph-access-control.md#roadmap-follow-ups-2026-10-12), [C12b](specs/C12b-triple-access-control.md#roadmap-follow-ups-2026-10-12) | M–L |
-| 76 | Jena compatibility: complete assembler bodies, direct Graph Store naming per dataset, and JVM metrics | [G08](specs/G08-fuseki-configuration.md#roadmap-follow-ups-2026-10-12), [P04](specs/P04-jvm-bindings.md#roadmap-follow-ups-2026-10-12) | S–M |
-| 77 | Assistant ingestion: the Ingest panel stores uploads without extracting facts when server ingestion is off, without saying so; and server-side document ingestion has no redaction (memory import redacts with built-in and custom patterns) | [C18](specs/C18-natural-language-questions-and-ingest.md#roadmap-follow-ups-2026-10-12), [C19](specs/C19-layered-settings.md#roadmap-follow-ups-2026-10-12) | S–M |
-| 79 | Nonnegative weighted betweenness semantics. Define zero-weight path counting and validate an algorithm before extending the current finite, strictly positive domain. | [F14](specs/F14-graph-algorithms.md#nonnegative-weighted-betweenness-semantics) | M–L |
-| 80 | Positive-weight numerical robustness. Extend the refused mixed-scale domain and define distance and path-count approximation guarantees for weighted betweenness. | [F14](specs/F14-graph-algorithms.md#positive-weight-numerical-robustness) | M–L |
-| 190 | **Per-query cost of derivation on demand.** On nsc with LUBM at 10 universities, the selective LUBM queries under `reasoning=demand` take 1.4 to 2.5 times as long as over a materialization with RDFS and 2.5 to 17 times with OWL 2 RL when their tables are cached, and 3.0 to 9.8 and 6 to 53 times when they derive afresh, against F17's target of 2 ×. Most of the time is the session's setup, the demand program built for each query, and the merge of derived facts into the query's view: at 100 universities query 2 reads 2.2 million derived facts from cached tables in 2.7 s, against 0.19 s over the materialization. Cache the specialized rules and programs per view, merge derived facts as a sorted run, and measure on forge. | [F17](specs/F17-query-time-reasoning.md#outcome) | M |
-| 191 | **Schema facts that follow from derived instance facts under demand.** The schema pass reads instance facts as stored, and a query that reads schema facts runs the unspecialized rules, whose schema copies do the same. A class whose instances are all derived is therefore not typed `rdfs:Class` by `rdf:type rdfs:range rdfs:Class`, a property used only in derived facts is not typed `rdf:Property` by `rdf1`, and `owl:sameAs` between schema terms that rules derive from instance facts does not reach the schema. Derive these facts from the demand program's own facts, or decide them by an existence test per class and property. | [F17](specs/F17-query-time-reasoning.md#outcome) | M |
-| 192 | **Budget accounting of the derived-table cache.** F17 §6.1 charges cached tables to the dataset's result cache budget. The cache is one process-wide budget of 256 MiB that no server flag sets. Charge it to the result cache, or add a `serve` flag and report its use in `/$/stats`. | [F17](specs/F17-query-time-reasoning.md#outcome) | S |
-| 193 | **DESCRIBE under derivation on demand.** A DESCRIBE reads the facts of the resources it describes outside its WHERE pattern, so no demand asks for their derived facts, and `reasoning=demand` refuses it with `501`. Turn each described resource into demands for its outgoing facts, and for the incoming facts and blank node closure that the dataset's DESCRIBE mode follows, before the description runs. | [F17](specs/F17-query-time-reasoning.md#outcome) | S |
-| 210 | One pass over the unbound build rows of a spilled OPTIONAL, semi, anti or MINUS join. These joins read the file of unbound build rows once for each partition's job, because a probe row's verdict needs all its candidates at once. A bitmap of probe rows shared between the jobs would let one job read the file once, as the inner join does. | [X08](specs/X08-disk-spill-and-server-memory.md#spilled-join-amplification-item-94-2026-10-24) | S |
+| 45 | **Branches.** A remote branch-relink CLI, and clones and archive transfer between servers. | [F09](specs/F09-branches-and-merges.md#roadmap-follow-ups-2026-10-12) | M |
+| 46 | **Notifications.** An email channel, an administration UI, broader backup-failure coverage, and delivery that a slow channel cannot delay. | [C21](specs/C21-outbound-notifications.md#roadmap-follow-ups-2026-10-12) | M |
+| 47 | **Rust client.** Typed bodies for the remaining administration calls, proactive rate-limit pacing, and credential integration tests. | [P02](specs/P02-rust-client.md#roadmap-follow-ups-2026-10-12) | S–M |
+| 48 | **Formatter and linter.** SHACLC formatting, linting of N-Triples, N-Quads, JSON-LD and embedded SHACL queries, linting in the shapes editor, and an MCP lint tool. | [X02](specs/X02-formatter.md#roadmap-follow-ups-2026-10-12), [X04](specs/X04-linter.md#roadmap-follow-ups-2026-10-12) | M |
+| 49 | **Write previews.** Local dry-run flags, UI previews beyond the CSV import panel and merge page, `If-Match` on `/{ds}/update`, and handling of read-only servers and costly bulk previews. | [C15](specs/C15-write-previews.md#roadmap-follow-ups-2026-10-12) | S–M |
+| 50 | **Restricted views.** Token scopes limited to graphs, validation and statistics for restricted views, and text scoring local to what a caller can see. | [C12](specs/C12-graph-access-control.md#roadmap-follow-ups-2026-10-12) | M |
+| 51 | **ARQ.** Parallel LATERAL, user DESCRIBE handlers, the remaining client options and builder methods, and `shortest(…)` evaluation. | [G06](specs/G06-arq-query-extensions.md#roadmap-follow-ups-2026-10-12) | M |
+| 52 | **History.** Pin rebasing, periods per quad, change feeds per graph, reconstruction of expired states, and history of settings. | [F06](specs/F06-snapshots-and-point-in-time.md#roadmap-follow-ups-2026-10-12) | M |
+| 53 | **Inference settings.** Input-graph and RDFS settings in the UI, the remaining RDFS-on-read surfaces, and controls for the import policy. | [C08](specs/C08-inference-freshness.md#roadmap-follow-ups-2026-10-12) | S–M |
+| 54 | **ShEx.** Combined SHACL and ShEx guards, schemas from a graph plus a file, and CLI outbound controls. | [G02](specs/G02-shex.md#roadmap-follow-ups-2026-10-12) | M |
+| 55 | **Completions and OpenAPI.** Dynamic and Nushell completions, and an OpenAPI "try it" page with named schemas. | [X03](specs/X03-openapi-and-completions.md#roadmap-follow-ups-2026-10-12) | S–M |
+| 56 | **Legacy MCP resource subscriptions.** | [C11](specs/C11-mcp-server.md#roadmap-follow-ups-2026-10-12) | S |
+| 57 | **Scratch-branch expiry** as a dataset setting and under stdio. Today only the server's `--mcp-scratch-branch-ttl` sets it. | [C17](specs/C17-agent-memory.md#roadmap-follow-ups-2026-10-12) | S |
+| 71 | **An OWL 2 ontology object API,** as Jena's `jena-ontapi` provides. | [F21](specs/F21-ontology-api.md) | L |
+| 73 | **Format coverage.** All formats in `load_str`, `dump_graph`, SPARQL `LOAD` and the JVM and Node bindings, and loading Thrift, Protobuf, RDF/JSON and TriX without a temporary N-Quads copy. | [G05](specs/G05-command-line-tools.md#roadmap-follow-ups-2026-10-12) | S–M |
+| 74 | **RDF Patch.** Patches with several transactions applied as several commits, blank-node identity across datasets, and patch logs. | [F10](specs/F10-replication.md#roadmap-follow-ups-2026-10-12) | M |
+| 75 | **Access control.** Validation endpoints for callers whose grants cover part of a dataset, the change feed for data-dependent protections, and hiding IRIs that visible triples mention. | [C12](specs/C12-graph-access-control.md#roadmap-follow-ups-2026-10-12), [C12b](specs/C12b-triple-access-control.md#roadmap-follow-ups-2026-10-12) | M–L |
+| 76 | **Jena compatibility.** Complete assembler bodies, direct Graph Store naming per dataset, and JVM metrics. | [G08](specs/G08-fuseki-configuration.md#roadmap-follow-ups-2026-10-12), [P04](specs/P04-jvm-bindings.md#roadmap-follow-ups-2026-10-12) | S–M |
+| 77 | **Assistant ingestion.** The Ingest panel should say when it stores uploads without extracting facts because server ingestion is off, and server-side document ingestion needs redaction. | [C18](specs/C18-natural-language-questions-and-ingest.md#roadmap-follow-ups-2026-10-12), [C19](specs/C19-layered-settings.md#roadmap-follow-ups-2026-10-12) | S–M |
+| 79 | **Nonnegative weighted betweenness.** Define zero-weight path counting and validate an algorithm before extending the current finite, strictly positive domain. | [F14](specs/F14-graph-algorithms.md#nonnegative-weighted-betweenness-semantics) | M–L |
+| 80 | **Positive-weight numerical robustness.** Extend the refused mixed-scale domain and define approximation guarantees for distances and path counts in weighted betweenness. | [F14](specs/F14-graph-algorithms.md#positive-weight-numerical-robustness) | M–L |
+| 92 | **Per-crate Nix builds.** Compare the crate2nix prototype with Crane under matched settings, measure which crates rebuild after source changes, and validate packaging and platforms before deciding whether to migrate. | [X13](specs/X13-per-crate-nix-builds.md) | S–M |
+| 190 | **Per-query cost of derivation on demand.** Selective LUBM queries under `reasoning=demand` miss F17's target of twice the time over a materialization, mostly in session setup, per-query program building and the merge of derived facts. Cache the specialized rules and programs per view, merge derived facts as a sorted run, and measure on forge. | [F17](specs/F17-query-time-reasoning.md#outcome) | M |
+| 191 | **Schema facts that follow from derived instance facts under demand.** The schema pass reads only stored instance facts, so some `rdfs:Class`, `rdf:Property` and `owl:sameAs` facts are missed. Derive them from the demand program's own facts, or decide them by an existence test per class and property. | [F17](specs/F17-query-time-reasoning.md#outcome) | M |
+| 192 | **Budget accounting of the derived-table cache.** The cache is a process-wide 256 MiB budget that no flag sets. Charge it to the result cache, or add a `serve` flag and report its use in `/$/stats`. | [F17](specs/F17-query-time-reasoning.md#outcome) | S |
+| 193 | **DESCRIBE under derivation on demand.** `reasoning=demand` refuses DESCRIBE with `501`. Turn each described resource into demands for the facts the dataset's DESCRIBE mode follows before the description runs. | [F17](specs/F17-query-time-reasoning.md#outcome) | S |
+| 210 | **One pass over the unbound build rows of a spilled outer join.** OPTIONAL, semi, anti and MINUS joins read that file once per partition. A bitmap of probe rows shared between the jobs would let one job read it once, as the inner join does. | [X08](specs/X08-disk-spill-and-server-memory.md#spilled-join-amplification-item-94-2026-10-24) | S |
 
 ## Tier 6: release work
 
-This work is done when the first release is cut. The release waits until Tiers 1–5 have
-landed (decided 2026-10-13), because leading on performance and features matters more
-than releasing early.
+This work is done when the first release is cut. The release waits until Tiers 1 to 5
+have landed, because leading on performance and features matters more than releasing
+early.
 
 | # | Item | Spec | Size |
 |---|---|---|---|
-| 58 | Packages: publishing to PyPI, Maven Central and npm, Windows and Intel macOS builds, a musl JVM build, PyPy and free-threaded wheels, and Python async wrappers. The workflows exist, with their publish jobs switched off. | [X12](specs/X12-release-engineering.md), [P01](specs/P01-python-bindings.md#roadmap-follow-ups-2026-10-12), [P04](specs/P04-jvm-bindings.md#roadmap-follow-ups-2026-10-12), [P05](specs/P05-node-bindings.md#roadmap-follow-ups-2026-10-12) | M–L |
-| 59 | Server binaries and published container images | [X12](specs/X12-release-engineering.md) | M |
-| 60 | A stability policy for the HTTP, CLI and library APIs, with its checks (X12 Phase 4). The on-disk side (Phase 3) is done: every file kind has a version marker in one registry, older formats inside the window open in place, `sparkles migrate` runs upgrade steps, and fixtures prove it. | [X12](specs/X12-release-engineering.md) | S–M |
-| 61 | Whole-server backup and restore, all datasets in one request, a remote backup CLI, and repository copy | [F05](specs/F05-snapshot-repositories.md#roadmap-follow-ups-2026-10-12) | M |
-| 62 | Audit events for creating, deleting and cloning datasets and for creating and deleting branches (restores already emit them) | [C09](specs/C09-dataset-access-control.md#roadmap-follow-ups-2026-10-12) | S |
-| 63 | Mutual TLS, OCSP, opaque-token introspection, front-channel logout and Cloudflare group lookup | [C09](specs/C09-dataset-access-control.md#roadmap-follow-ups-2026-10-12) | M |
-| 64 | Binding the listener before datasets open, and degraded startup when a dataset fails to open | [C01](specs/C01-observability-and-budgets.md#roadmap-follow-ups-2026-10-12) | M |
-| 65 | Encryption: key management workflows, Vault and cloud KMS, recovery export, and encryption of live datasets and derived indexes | [F11](specs/F11-encryption-at-rest.md#roadmap-follow-ups-2026-10-12) | L–XL |
-| 66 | Replication: read replicas, preserved primary IDs, promotion, failover, synchronous replication, and a patch log or continuous archive | [F10](specs/F10-replication.md#roadmap-follow-ups-2026-10-12) | XL |
-| 67 | MCP OAuth: RFC 9728 protected-resource metadata, audiences bound to the resource, and scope challenges. OIDC tokens are already audience-checked on every route. | [C11](specs/C11-mcp-server.md#roadmap-follow-ups-2026-10-12) | S–M |
-| 68 | **Done (2026-10-13).** Runtime secrets are sealed by default with a configured key, a systemd credential or a key that the server generates in its data directory, offline `unseal` and `rekey` commands move the values, and a build without the `backup` feature keeps plaintext. | [C19](specs/C19-layered-settings.md#roadmap-follow-ups-2026-10-12) | S–M |
+| 58 | **Packages.** Publishing to PyPI, Maven Central and npm, Windows and Intel macOS builds, a musl JVM build, PyPy and free-threaded wheels, and Python async wrappers. The workflows exist with their publish jobs switched off. | [X12](specs/X12-release-engineering.md), [P01](specs/P01-python-bindings.md#roadmap-follow-ups-2026-10-12), [P04](specs/P04-jvm-bindings.md#roadmap-follow-ups-2026-10-12), [P05](specs/P05-node-bindings.md#roadmap-follow-ups-2026-10-12) | M–L |
+| 59 | **Server binaries and published container images.** | [X12](specs/X12-release-engineering.md) | M |
+| 60 | **API stability policy.** X12 Phase 4 adds a stability policy for the HTTP, CLI and library APIs, with its checks. The on-disk side is in place. | [X12](specs/X12-release-engineering.md) | S–M |
+| 61 | **Whole-server backup and restore.** All datasets in one request, a remote backup CLI, and repository copy. | [F05](specs/F05-snapshot-repositories.md#roadmap-follow-ups-2026-10-12) | M |
+| 62 | **Audit events** for creating, deleting and cloning datasets and for creating and deleting branches. | [C09](specs/C09-dataset-access-control.md#roadmap-follow-ups-2026-10-12) | S |
+| 63 | **Authentication additions.** Mutual TLS, OCSP, opaque-token introspection, front-channel logout and Cloudflare group lookup. | [C09](specs/C09-dataset-access-control.md#roadmap-follow-ups-2026-10-12) | M |
+| 64 | **Startup resilience.** Binding the listener before datasets open, and degraded startup when a dataset fails to open. | [C01](specs/C01-observability-and-budgets.md#roadmap-follow-ups-2026-10-12) | M |
+| 65 | **Encryption.** Key management workflows, Vault and cloud KMS, recovery export, and encryption of live datasets and derived indexes. | [F11](specs/F11-encryption-at-rest.md#roadmap-follow-ups-2026-10-12) | L–XL |
+| 66 | **Replication.** Read replicas, preserved primary IDs, promotion, failover, synchronous replication, and a patch log or continuous archive. | [F10](specs/F10-replication.md#roadmap-follow-ups-2026-10-12) | XL |
+| 67 | **MCP OAuth.** RFC 9728 protected-resource metadata, audiences bound to the resource, and scope challenges. | [C11](specs/C11-mcp-server.md#roadmap-follow-ups-2026-10-12) | S–M |
 
 ## Tier 7: compatibility leftovers
 
-These were excluded earlier on purpose. They stay on the list and are reconsidered when
-users ask for them.
+These were left out on purpose. They stay on the list and are reconsidered when users ask
+for them.
 
 | # | Item | Spec | Size |
 |---|---|---|---|
-| 69 | ARQ: JavaScript functions, `afn:context`, the Leviathan library, the `JSON` query form and locale collation | [G06](specs/G06-arq-query-extensions.md#roadmap-follow-ups-2026-10-12) | M each |
-| 70 | GeoSPARQL: an optional mode that reproduces Jena's answers where Sparkles diverges on purpose ([COMPARISON.md](COMPARISON.md#geosparql)) | [G01](specs/G01-geosparql.md#roadmap-follow-ups-2026-10-12) | M |
+| 69 | **ARQ extras.** JavaScript functions, `afn:context`, the Leviathan library, the `JSON` query form and locale collation. | [G06](specs/G06-arq-query-extensions.md#roadmap-follow-ups-2026-10-12) | M each |
+| 70 | **Jena-compatible GeoSPARQL mode** that reproduces Jena's answers where Sparkles diverges on purpose, as [COMPARISON.md](COMPARISON.md#geosparql) describes. | [G01](specs/G01-geosparql.md#roadmap-follow-ups-2026-10-12) | M |
+
+## Completed
+
+These items are finished. [FEATURES.md](FEATURES.md) describes what they deliver, and the
+linked spec Outcome records how they landed.
+
+- **2.** Server-wide cache sizing and query memory pool. [X08](specs/X08-disk-spill-and-server-memory.md) Phase 1
+- **3.** Group commit as the default. [X09](specs/X09-group-commit-by-default.md)
+- **5.** Correctness fixes in path search, change logs and Fuseki endpoints. [F07](specs/F07-path-search.md#roadmap-follow-ups-2026-10-12), [F06](specs/F06-snapshots-and-point-in-time.md#roadmap-follow-ups-2026-10-12), [G08](specs/G08-fuseki-configuration.md#roadmap-follow-ups-2026-10-12)
+- **10.** Vector index maintenance. [F04](specs/F04-vector-search.md#roadmap-follow-ups-2026-10-12)
+- **11.** Time slider. [U01](specs/U01-time-slider.md)
+- **13.** Current shape standards. [G03](specs/G03-shaclc.md#roadmap-follow-ups-2026-10-12), [G02](specs/G02-shex.md#roadmap-follow-ups-2026-10-12)
+- **16.** Index compression after predicate patterns. [X11](specs/X11-index-compression-and-predicate-patterns.md#outcome)
+- **68.** Sealed runtime secrets. [C19](specs/C19-layered-settings.md#roadmap-follow-ups-2026-10-12)
+- **85.** Hash-join, ordered DISTINCT and encrypted spill. [X08](specs/X08-disk-spill-and-server-memory.md) §6.3 and §6.7
+- **87.** Small incremental runs over a kept closure. [F16](specs/F16-materialization-at-scale.md#roadmap-follow-ups-2026-10-18)
+- **89.** Ask and `check_query` on large datasets. [C18](specs/C18-natural-language-questions-and-ingest.md#roadmap-follow-ups-2026-10-12)
+- **94.** Spilled join amplification. [X08](specs/X08-disk-spill-and-server-memory.md#spilled-join-amplification-item-94-2026-10-24)
+- **95.** Close-only locks on the database directory. [P06](specs/P06-library-admin-api.md), [F05](specs/F05-snapshot-repositories.md#23-restore)
+- **96.** Streaming NOT EXISTS over a Cartesian product. [X08](specs/X08-disk-spill-and-server-memory.md#automatic-streaming-without-spill-item-96-2026-10-23)
+- **97.** Retuned `small` memory profile. [X08](specs/X08-disk-spill-and-server-memory.md#small-profile-retune-and-the-phase-1a-control-item-97-2026-10-23)
+- **98.** Materialization limit and F16 acceptance at scale. [F16](specs/F16-materialization-at-scale.md#outcome)
+- **99.** Truncated eager responses logged as truncated. [X06](specs/X06-benchmark-coverage.md#sp2bench-q4-and-q6-follow-up-2026-10-23)
+- **102.** The plan drawn on the query's pattern. [U04](specs/U04-live-query-profiling.md#11-phase-4-the-plan-drawn-on-the-querys-pattern-2026-10-23) Phase 4
+- **103.** Path finder. [U09](specs/U09-path-finder.md#outcome)
+- **104.** Time-lapse and commit diffs on the canvas. [U01](specs/U01-time-slider.md#phase-4-time-lapse-and-commit-diffs-on-the-canvas-2026-10-23) Phase 4
+- **106.** Validation overlay. [U07](specs/U07-data-quality-and-schema-diagram.md#11-phase-4-a-validation-overlay-on-the-graph-2026-10-23) Phase 4
+- **107.** Linked views. [U11](specs/U11-linked-views.md#outcome)
+- **108.** Faster FSST reads. [X11](specs/X11-index-compression-and-predicate-patterns.md#item-108-faster-fsst-reads)
 
 ## Keeping this current
 
-Update this document when an item ships, changes tier or gets a new spec. A new known gap in
-FEATURES gets a roadmap item in the same commit. When an item ships:
-
-* Its spec's Outcome records what landed.
-* [FEATURES.md](FEATURES.md) and [BENCHMARKS.md](BENCHMARKS.md) change in the same commit, and the Known gaps bullet drops the item's number.
-* The row here is removed or marked done.
+Update this document when an item ships, changes tier or gets a new spec. A new known gap
+in FEATURES gets a roadmap item in the same commit. When an item ships, its spec's Outcome
+records what landed, [FEATURES.md](FEATURES.md) and [BENCHMARKS.md](BENCHMARKS.md) change
+in the same commit, and the Known gaps bullet drops the item's number. The item's row then
+moves to a one-line entry under [Completed](#completed). When part of an item ships, its
+row is cut down to the part that remains.
