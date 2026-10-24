@@ -1,48 +1,57 @@
 # Documentation
 
-Start with the guide for the task you are doing. The repository's
-[README](../README.md) introduces Sparkles and has the quick start.
+This index lists the Sparkles documentation by what a reader wants to do. The repository's
+[README](../README.md) introduces Sparkles, its performance and a quick start.
 
-## Guides
+## Using Sparkles
 
-| Task | Read |
+| Document | What it covers |
 |---|---|
-| Run the server, import data, query or administer a dataset | [Usage](USAGE.md#running-the-server), including [CLI tools](USAGE.md#command-line-tools), [Docker](USAGE.md#docker) and [NixOS](USAGE.md#deploying-on-nixos) |
-| Embed the engine or connect an application | [Rust library](USAGE.md#embedding-the-library), [Python](USAGE.md#python), [JVM (Jena)](USAGE.md#jvm-apache-jena), [Node.js](USAGE.md#javascript-and-typescript) and [Rust remote client](USAGE.md#rust-client) |
-| Connect an agent, use memory or configure models | [MCP](USAGE.md#mcp-server-llm-agents), [agent memory](USAGE.md#agent-memory) and [questions and models](USAGE.md#asking-questions-with-a-model) |
-| Understand storage, execution and library boundaries | [Architecture](ARCHITECTURE.md) |
-| Set up an editor | [Editor integration](editors.md) |
-| Build, test or contribute | [Development](DEVELOPMENT.md) and [UI development](../ui/README.md) |
+| [Usage](USAGE.md) | How to run the server, load and query data, and operate datasets, with the [CLI tools](USAGE.md#command-line-tools), [Docker](USAGE.md#docker) and [NixOS](USAGE.md#deploying-on-nixos). |
+| [Libraries and bindings](USAGE.md#embedding-the-library) | How to embed the engine from [Rust](USAGE.md#embedding-the-library), [Python](USAGE.md#python), the [JVM through Jena](USAGE.md#jvm-apache-jena) and [Node.js](USAGE.md#javascript-and-typescript), or connect with the [Rust client](USAGE.md#rust-client). |
+| [Agents and models](USAGE.md#mcp-server-llm-agents) | How to connect an agent over MCP, use [agent memory](USAGE.md#agent-memory) and [answer questions with a model](USAGE.md#asking-questions-with-a-model). |
+| [HTTP API](API.md) | The request and response contract of every endpoint, with status codes, parameters, formats and protocol semantics. |
+| [OpenAPI](openapi.json) | The machine-readable HTTP contract, checked against the server's route table. |
+| [Editor integration](editors.md) | How to format SPARQL and RDF in an editor and use the language server. |
 
-## Reference and evidence
+## Understanding Sparkles
 
-| Document | Owns |
+| Document | What it covers |
 |---|---|
-| [Features](FEATURES.md) | The capability inventory and current [known gaps](FEATURES.md#known-gaps) |
-| [HTTP API](API.md) | Request and response contracts, status codes, parameters, formats and protocol semantics |
-| [OpenAPI](openapi.json) | The machine-readable HTTP contract, checked against the route table |
-| [Comparison](COMPARISON.md) | Compatibility differences, tradeoffs and gaps against other engines |
-| [Benchmarks](BENCHMARKS.md) | Published performance results, measurement context and comparison methodology |
-| [Running benchmarks](BENCHMARKING.md) | Harness commands, modes, outputs and regression-measurement instructions |
-| [Query optimizations](internals/OPTIMIZATIONS.md) | Detailed operator fast paths, applicability rules and local cost-model measurements |
-| [Design specs](specs/README.md) | Feature rationale, delivery status and implementation Outcomes |
-| [Roadmap](ROADMAP.md) | Planned work in priority order, with size, impact and the spec that holds each design |
-| [Source audit](AUDIT.md) | The historical audit of Jena, QLever and Oxigraph, and the original design choices |
-| [Provenance](specs/PROVENANCE.md) | Design sources, adopted dependencies, licenses and rejected alternatives |
+| [Features](FEATURES.md) | Every capability, area by area, and the [known gaps](FEATURES.md#known-gaps). |
+| [Architecture](ARCHITECTURE.md) | The library boundaries, storage, execution and the main design decisions. |
+| [Comparison](COMPARISON.md) | The gaps and tradeoffs against Jena, QLever, Fluree and Oxigraph, and where Sparkles departs from Jena on purpose. |
+| [Benchmarks](BENCHMARKS.md) | The published performance results, their setup and every case where Sparkles loses. |
+| [Query optimizations](internals/OPTIMIZATIONS.md) | Operator fast paths, when they apply and the local cost-model measurements behind them. |
+
+## Design and planning
+
+| Document | What it covers |
+|---|---|
+| [Roadmap](ROADMAP.md) | Planned work in priority order, with the size, impact and design spec of each item. |
+| [Design specs](specs/README.md) | The rationale, status and outcome of each larger feature. |
+| [Provenance](specs/PROVENANCE.md) | The design sources, adopted dependencies, licenses and rejected alternatives. |
+| [Source audit](AUDIT.md) | The original audit of Jena, QLever and Oxigraph that set the first design choices. |
+
+## Contributing
+
+| Document | What it covers |
+|---|---|
+| [Development](DEVELOPMENT.md) | The project layout, builds, tests, mise tasks and Nix setup. |
+| [Running benchmarks](BENCHMARKING.md) | The benchmark harness, its modes and outputs, and how to measure a regression. |
+| [UI development](../ui/README.md) | How to build, test and change the web UI. |
 
 ## Maintaining documentation
 
-* Put workflows and examples in Usage, exact HTTP contracts in API, and system
+* Workflows and examples belong in Usage, exact HTTP contracts in API, and system
   structure in Architecture. Link between them when a reader needs the other view.
-* Keep current capability and limitation statements in Features. Comparison should
-  explain their consequence for compatibility or migration, with links to the details.
-* Keep published timings and their setup in Benchmarks. Local optimization
-  measurements belong with their rationale and must be identified as such.
-* Preserve a spec's original design. Update its status and Outcome alongside a
-  behavior change, and update the relevant user guide. A specified phase is not a
-  shipped capability.
-* Treat the source audit as historical context. Use the current guides for supported
-  behavior. Preserve existing heading anchors when moving sections, or update every
-  reference to them.
-* Check local links and cited source paths after moves. `mise run lint:doc-paths`
-  checks source-path citations. It does not check all Markdown links or anchors.
+* Features holds current capabilities and limitations. Comparison explains what they mean
+  for compatibility or migration and links to the details.
+* Benchmarks holds published timings and their setup. Local optimization measurements stay
+  with their rationale and say that they are local.
+* A spec keeps its original design. Its status and Outcome change with the behavior, and
+  the user guide changes with them. A specified phase is not a shipped capability.
+* The source audit is historical context, and the guides describe supported behavior.
+* Keep heading anchors when moving sections, or update every link to them. Check local
+  links and cited source paths after a move. `mise run lint:doc-paths` checks cited source
+  paths, but not every Markdown link or anchor.
