@@ -1437,7 +1437,7 @@ synchronized them, and the locked attempt follows an unlocked pass instead of re
 The directory records the name of each file as Tantivy finishes it and of each metadata
 file when its atomic replacement has been renamed into place. A pass takes the recorded
 names, synchronizes those files and then the index directory, and puts the names back if
-any synchronization fails. A directory opened with its marker present may hold files that
+any synchronization fails or the pass panics. A directory opened with its marker present may hold files that
 an earlier process wrote and never synchronized, so the first pass after such an open
 synchronizes every file in it, as every pass did before. After three raced ticks, the next
 tick runs its unlocked pass first, and when a write races that pass too, it repeats the
@@ -1458,7 +1458,8 @@ not shorten the unlocked pass. Synchronizations issued together share journal co
 one thread the locked pass still held the lock for a median of 24 ms, and with eight threads
 the unlocked pass fell from 77 ms to 28 or 32 ms, the repetitions caught up, and no tick of
 the same run needed the lock for its I/O. The first error any thread meets fails the pass,
-which puts all of its names back. Synchronization order among a pass's files does not
+which puts all of its names back, and a helper thread that cannot be started leaves its
+share to the others. Synchronization order among a pass's files does not
 matter for the invariant, because the marker goes only after every one of them and the
 directory have been synchronized.
 
@@ -1491,8 +1492,11 @@ The tests cover each step. `a_raced_pass_keeps_its_progress` requires the next p
 raced one to synchronize only the file written during it, and
 `replaced_metadata_is_synchronized_again` requires a metadata replacement that finishes
 during a pass, or is in flight across it, to be synchronized by the next pass. That test
-fails when the name is recorded when the replacement starts. `a_failed_pass_puts_its_files_back`
-and `a_directory_opened_with_its_marker_synchronizes_every_file` cover a failed pass and a
+fails when the name is recorded when the replacement starts. `a_failed_pass_puts_its_files_back`,
+`a_pass_failing_after_another_threads_sync_puts_both_files_back`,
+`a_panicking_pass_puts_its_files_back`, `a_pass_without_helper_threads_synchronizes_every_file`
+and `a_directory_opened_with_its_marker_synchronizes_every_file` cover a failed pass, a
+failure after another thread's synchronization, a panic, a helper that cannot start and a
 reopen after a crash. `a_locked_pass_first_catches_up_without_live` requires the
 repetition to run without the lock and to clear the marker when nothing races it.
 `steady_publication_cannot_starve_the_background_checkpoint` races every unlocked pass and

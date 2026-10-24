@@ -95,6 +95,7 @@ pub(crate) enum TestPoint {
     AtomicBeforeRename,
     CheckpointPassStart,
     CheckpointFileSync,
+    CheckpointThreadSpawn,
     CheckpointBeforeMarkerRemoval,
     CheckpointParentSync,
 }
@@ -273,12 +274,17 @@ impl LazySyncDir {
 
     /// Take what the next pass must synchronize. The caller holds the pathname lease,
     /// so no other pass takes names between this and the pass's end.
-    fn take_pending(&self) -> Pending {
+    /// Take what a pass must synchronize. The names go back when the returned guard drops
+    /// before [`TakenPending::synchronized`], whether the pass failed or panicked.
+    fn take_pending(&self) -> TakenPending<'_> {
         let mut s = self.shared.state.lock();
-        Pending {
-            files: s.unsynced.drain().collect(),
-            all: std::mem::take(&mut s.all_unsynced),
-            dir: std::mem::take(&mut s.dir_unsynced),
+        TakenPending {
+            dir: self,
+            pending: Some(Pending {
+                files: s.unsynced.drain().collect(),
+                all: std::mem::take(&mut s.all_unsynced),
+                dir: std::mem::take(&mut s.dir_unsynced),
+            }),
         }
     }
 
@@ -352,9 +358,22 @@ impl LazySyncDir {
             Ok(())
         };
         std::thread::scope(|scope| {
-            let helpers: Vec<_> = (1..paths.len().min(SYNC_THREADS))
-                .map(|_| scope.spawn(work))
-                .collect();
+            // A helper that cannot be started leaves its share to the others and to this
+            // thread, which works through the list until it is empty.
+            let mut helpers = Vec::new();
+            for _ in 1..paths.len().min(SYNC_THREADS) {
+                #[cfg(test)]
+                if self.run_hook(TestPoint::CheckpointThreadSpawn).is_err() {
+                    break;
+                }
+                match std::thread::Builder::new()
+                    .name("text-checkpoint-sync".into())
+                    .spawn_scoped(scope, work)
+                {
+                    Ok(helper) => helpers.push(helper),
+                    Err(_) => break,
+                }
+            }
             let mut result = work();
             for helper in helpers {
                 let joined = helper
@@ -383,6 +402,32 @@ impl LazySyncDir {
 /// so that a pass which synchronized the old file under that name cannot take the record
 /// of the new one. A pass that ran meanwhile saw the guard and kept the marker.
 struct AtomicWrite<'a>(&'a Shared, PathBuf);
+
+/// What a pass took to synchronize, put back unless the pass synchronized all of it.
+struct TakenPending<'a> {
+    dir: &'a LazySyncDir,
+    pending: Option<Pending>,
+}
+
+impl TakenPending<'_> {
+    fn get(&self) -> &Pending {
+        self.pending
+            .as_ref()
+            .expect("pending files are taken until synchronized")
+    }
+
+    fn synchronized(mut self) {
+        self.pending = None;
+    }
+}
+
+impl Drop for TakenPending<'_> {
+    fn drop(&mut self) {
+        if let Some(pending) = self.pending.take() {
+            self.dir.restore_pending(pending);
+        }
+    }
+}
 
 impl Drop for AtomicWrite<'_> {
     fn drop(&mut self) {
@@ -418,10 +463,8 @@ impl Checkpoint<'_> {
         self.dir.run_hook(TestPoint::CheckpointPassStart)?;
         if before.marked {
             let pending = self.dir.take_pending();
-            if let Err(e) = self.dir.sync_files(&pending) {
-                self.dir.restore_pending(pending);
-                return Err(e);
-            }
+            self.dir.sync_files(pending.get())?;
+            pending.synchronized();
         }
         let mut s = self.dir.shared.state.lock();
         if before.active == 0 && s.atomic_writes == 0 && s.writes == before.writes {
@@ -737,12 +780,75 @@ mod tests {
         });
         assert!(dir.checkpoint().is_err());
         assert!(dir.is_marked());
-        assert!(dir.take_synced().is_empty());
+        // another thread may have synchronized the second file before the failure
+        dir.take_synced();
         assert!(dir.prepare_checkpoint().run().unwrap());
         assert_eq!(
             names(&dir.take_synced()),
             ["meta.json", "old.seg"].map(String::from).into()
         );
+    }
+
+    /// One thread fails after another synchronized its file. The pass fails as a whole,
+    /// and the retry synchronizes both names again.
+    #[test]
+    fn a_pass_failing_after_another_threads_sync_puts_both_files_back() {
+        let (_root, dir) = directory();
+        let shared = dir.shared.clone();
+        dir.test_hook(TestPoint::CheckpointFileSync, move || {
+            let deadline = std::time::Instant::now() + Duration::from_secs(10);
+            while shared.synced.lock().is_empty() {
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "no second sync thread"
+                );
+                std::thread::sleep(Duration::from_millis(1));
+            }
+            Err(io::Error::other("sync probe"))
+        });
+        assert!(dir.checkpoint().is_err());
+        assert!(dir.is_marked());
+        assert_eq!(dir.take_synced().len(), 1);
+        assert!(dir.prepare_checkpoint().run().unwrap());
+        assert_eq!(
+            names(&dir.take_synced()),
+            ["meta.json", "old.seg"].map(String::from).into()
+        );
+        assert!(!dir.is_marked());
+    }
+
+    /// A pass that cannot start its helper threads synchronizes every file itself.
+    #[test]
+    fn a_pass_without_helper_threads_synchronizes_every_file() {
+        let (_root, dir) = directory();
+        dir.test_hook(TestPoint::CheckpointThreadSpawn, || {
+            Err(io::Error::other("spawn probe"))
+        });
+        assert!(dir.prepare_checkpoint().run().unwrap());
+        assert_eq!(
+            names(&dir.take_synced()),
+            ["meta.json", "old.seg"].map(String::from).into()
+        );
+        assert!(!dir.is_marked());
+    }
+
+    /// A pass that panics puts its files back, so a later pass cannot remove the marker
+    /// without synchronizing them.
+    #[test]
+    fn a_panicking_pass_puts_its_files_back() {
+        let (_root, dir) = directory();
+        assert!(dir.prepare_checkpoint().run().unwrap());
+        dir.take_synced();
+        finish(&dir, "new.seg");
+        dir.test_hook(TestPoint::CheckpointFileSync, || panic!("sync probe"));
+        let run = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            dir.prepare_checkpoint().run()
+        }));
+        assert!(run.is_err());
+        assert!(dir.is_marked());
+        assert!(dir.prepare_checkpoint().run().unwrap());
+        assert_eq!(names(&dir.take_synced()), ["new.seg".to_string()].into());
+        assert!(!dir.is_marked());
     }
 
     /// A directory opened with its marker present may hold files that an earlier process
