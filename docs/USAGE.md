@@ -2557,6 +2557,29 @@ its limit of a million visited nodes or ten seconds, the panel says so and sugge
 shorter length, a lower hub limit or fewer predicates. At phone width the panel is a sheet
 at the bottom of the screen that folds to its handle.
 
+**Weight** in the filters orders the paths by a number on the reifiers of their edges
+instead of by their length. When the list is first opened, it asks the dataset for the
+properties that reifiers carry with numeric values of zero or more, most used first, and
+offers up to 20 of them. With a weight chosen, the search adds up that property along each
+path, as `path:weight` does, and an edge without a reifier or without the property weighs
+1. Each path in the list then shows its cost after its length, and the announcement names
+the cheapest cost. The default, **none, count edges**, counts the edges as before.
+
+### Finding paths on the query page
+
+The same panel opens over a query's graph results, from the **Paths** button of the graph
+toolbar or `Shift+P` while the graph has the focus. A right click or a long press on a node
+of the canvas offers **Paths from here** and **Paths to here**, and in the WebGL view the
+selected node fills **From**. The search reads the state the result was read at, on the
+result's branch, and the header names it. The paths are drawn on the result's own nodes and
+edges where the result has them, with each edge labelled by the paths that use it, and the
+nodes and edges a path needs that the result lacks are added for as long as the paths are
+shown. The WebGL view colours and thickens the path edges, labels the path nodes and draws
+the path numbers at the edges' midpoints, without the step-by-step animation. The keys `1`
+to `9` and `A` work as in Explore. **Add to graph** is not offered, because a result
+graph is the query's answer and not a graph to build on. Closing the panel, or running a
+query again, removes the paths and the nodes they added.
+
 ## Graph algorithms
 
 PageRank, betweenness, components, communities, node similarity, triangle counts,
