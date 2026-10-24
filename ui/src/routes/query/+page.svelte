@@ -1806,7 +1806,7 @@
     const v = facetVarShown;
     if (!v) return;
     void editQuery(
-      (p, text) => brushEdits(text, p, v, brushes),
+      (p, text) => brushEdits(text, p, v, brushes, parseNow),
       `Added ${brushes.length === 1 ? 'the brush' : `${brushes.length} brushes`} to the query`,
     );
   }

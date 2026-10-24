@@ -576,7 +576,8 @@ undoable edit. A new variable takes the property's local name and a number when 
 variable token of the text has that name, including those that only a filter or a modifier
 names. A brush written inside the `WHERE` group filters before the query's own result
 boundary, so **Apply to query** refuses a query with `LIMIT`, `OFFSET`, `GROUP BY` or
-`HAVING`, and a variable that no triple of the `WHERE` group binds, and says why. A
+`HAVING`, and a variable that no triple of the `WHERE` group or of a plain group nested in
+it binds, and says why. A
 variable bound only inside an `OPTIONAL`, a subquery, `BIND` or `VALUES` may be unbound in
 some rows, where the brush's triple would bind it to other entities. The editor's text and tab are read again after the parser loads, and a change made
 in between cancels the edit. The panel reads with the result's `reasoning=false` when the

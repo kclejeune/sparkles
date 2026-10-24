@@ -289,6 +289,13 @@ ORDER BY ?person
     expect(refused(`${P}SELECT ?s WHERE { { SELECT ?s WHERE { ?s a ex:T } } }`, 's')).toThrow(
       /bound by a triple/,
     );
+    // a nested plain group's triple binds for every row, its OPTIONAL does not
+    const inner = `${P}SELECT ?s WHERE { { ?s ex:p ?o } }`;
+    expect(brushEdits(inner, ok(inner), 's', b, parse).length).toBe(2);
+    const deeper = `${P}SELECT ?s WHERE { ?x a ex:T { { ?s ex:p ?x } } }`;
+    expect(brushEdits(deeper, ok(deeper), 's', b, parse).length).toBe(2);
+    const opt = `${P}SELECT ?s ?o WHERE { { ?s a ex:T OPTIONAL { ?s ex:p ?o } } }`;
+    expect(() => brushEdits(opt, ok(opt), 'o', b, parse)).toThrow(/bound by a triple/);
     // a variable a triple of the WHERE group binds is fine
     const nested = `${P}SELECT ?s WHERE { ?s a ex:T OPTIONAL { ?s ex:p ?o } }`;
     expect(brushEdits(nested, ok(nested), 's', b).length).toBe(2);

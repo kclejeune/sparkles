@@ -271,35 +271,41 @@ export function varTokens(text: string): Set<string> {
  * `LIMIT`, `OFFSET`, `GROUP BY` or `HAVING` would admit other entities than the facets
  * counted, and the variable must be bound by the WHERE group itself.
  */
-export function brushRefusal(p: PatternOk, v: string): string | null {
+export function brushRefusal(p: PatternOk, v: string, parse?: Parse): string | null {
   if (p.form !== 'select' || !p.root) return 'Apply to query needs a SELECT query';
   if (p.limit || p.offset)
     return 'Apply to query cannot keep the counts of a query with LIMIT or OFFSET. Remove them first';
   const m = p.modifiers.find((x) => x.kind === 'GROUP BY' || x.kind === 'HAVING');
   if (m) return `Apply to query cannot keep the counts of a query with ${m.kind}`;
-  const bound = p.root.items.some((it) => {
-    if (it.type === 'triple')
-      return [it.s, it.p, it.o].some((t) => t.kind === 'var' && t.value === v);
-    return it.type === 'group' && it.kind === 'group' && patternVarsOf(it).includes(v);
-  });
-  if (!bound)
+  // a nested group's text is read again under the query's prologue
+  const prologue =
+    (p.prologue.base ? `BASE <${p.prologue.base}>\n` : '') +
+    p.prologue.prefixes.map((x) => `PREFIX ${x.prefix}: <${x.iri}>\n`).join('');
+  const reparse = parse && ((t: string) => parse(prologue + t));
+  if (!bindsAlways(p.root, v, reparse))
     return `Apply to query needs ?${v} bound by a triple of the WHERE group, outside OPTIONAL`;
   return null;
 }
 
 /**
- * The variables the triples of a nested plain group bind. A locked block such as an
- * `OPTIONAL`, a subquery, `BIND` or `VALUES` may leave its variables unbound in some rows,
- * where the brush's triple would bind them to other entities, so only triples count.
+ * Whether a triple of the group, or of a plain group nested in it, binds `v` in every row.
+ * A locked block such as an `OPTIONAL`, a subquery, `BIND` or `VALUES` may leave its
+ * variables unbound in some rows, where the brush's triple would bind them to other
+ * entities, so only triples count. A nested plain group is a locked block of kind
+ * `group`, whose text `parse` reads again to find its triples.
  */
-function patternVarsOf(g: Group): string[] {
-  const out: string[] = [];
-  for (const it of g.items) {
+function bindsAlways(g: Group, v: string, parse?: Parse, depth = 0): boolean {
+  return g.items.some((it) => {
     if (it.type === 'triple')
-      for (const t of [it.s, it.p, it.o]) if (t.kind === 'var') out.push(t.value);
-    if (it.type === 'group' && it.kind === 'group') out.push(...patternVarsOf(it));
-  }
-  return out;
+      return [it.s, it.p, it.o].some((t) => t.kind === 'var' && t.value === v);
+    if (it.type === 'group' && it.kind === 'group') return bindsAlways(it, v, parse, depth);
+    if (it.type === 'locked' && it.kind === 'group' && parse && depth < 8) {
+      if (!(it.binds ?? it.vars).includes(v)) return false;
+      const a = parse(`SELECT * WHERE ${it.text}`);
+      return a.ok && a.root != null && bindsAlways(a.root, v, parse, depth + 1);
+    }
+    return false;
+  });
 }
 
 /**
@@ -308,8 +314,14 @@ function patternVarsOf(g: Group): string[] {
  * avoid every variable the text names. It throws when the query's shape cannot keep the
  * facets' counts (see `brushRefusal`).
  */
-export function brushEdits(text: string, p: PatternOk, v: string, brushes: Brush[]): AnyEdit[] {
-  const why = brushRefusal(p, v);
+export function brushEdits(
+  text: string,
+  p: PatternOk,
+  v: string,
+  brushes: Brush[],
+  parse?: Parse,
+): AnyEdit[] {
+  const why = brushRefusal(p, v, parse);
   if (why) throw new EditError(why);
   const taken = varTokens(text);
   for (const x of patternVars(p)) taken.add(x);
