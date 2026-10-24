@@ -14,7 +14,7 @@
 >
 > **User docs:** [API: Backup repositories](../API.md#backup-repositories) ·
 > [Usage: Backup repositories](../USAGE.md#backup-repositories) ·
-> [Features](../FEATURES.md#server-fuseki-equivalent) ·
+> [Features](../FEATURES.md#operations) ·
 > [Benchmarks: Backup repositories](../BENCHMARKS.md#backup-repositories-105m-triples)
 >
 > This is the design as written before implementation. The [Outcome](#outcome) section at
@@ -1790,6 +1790,13 @@ facade. Results include selected datasets, unchanged skips and retention. Backup
 or retention errors produce a nonzero exit status. Process-level tests cover
 two selected datasets, shared run identity, unchanged skips, a held catalog lock,
 missing catalogs, read-only failure reports and released repository locks.
+
+The offline `--replace` swap holds the target's `sparkles.lock` through the store's
+lock guard since roadmap item 95 (2026-10-24). It took the lock as a plain file
+before, so a child forked before exec could keep the lock after the swap released it,
+and a rolled-back swap could leave the original database locked. The guard unlocks the
+file explicitly when the process that took it drops it, and the busy probe of
+`backup restore --to` unlocks the same way.
 
 The maintainer decided that the whole UI of §6 belongs in the first delivery, which
 pulled lifecycle policies, garbage collection and lock management forward from Phase 2.

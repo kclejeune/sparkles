@@ -4,6 +4,7 @@
 //! what an eager one prints down to the final newline, and a remote query that the server
 //! cuts off after its response has started fails instead of looking complete.
 
+#[cfg(feature = "auth")]
 use std::io::{Read, Write};
 use std::process::Command;
 
@@ -71,6 +72,9 @@ fn a_streamed_local_query_prints_what_an_eager_one_prints() {
     }
 }
 
+// a remote query needs the client that the auth feature brings in; without it the command
+// refuses at once and the stub server below would wait for a connection that never comes
+#[cfg(feature = "auth")]
 #[test]
 fn a_remote_answer_cut_off_after_it_started_fails_the_command() {
     let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();

@@ -262,12 +262,61 @@ pub struct Shape {
     pub severity: NamedNode,
     pub messages: Vec<Literal>,
     pub constraints: Vec<Constraint>,
+    /// the shape's non-validating characteristics, when it has any
+    pub info: Option<Box<ShapeInfo>>,
 }
 
 impl Shape {
     pub fn is_property_shape(&self) -> bool {
         self.path.is_some()
     }
+
+    /// The shape's non-validating characteristics (empty when it has none).
+    pub fn info(&self) -> &ShapeInfo {
+        static NONE: std::sync::LazyLock<ShapeInfo> = std::sync::LazyLock::new(Default::default);
+        self.info.as_deref().unwrap_or(&NONE)
+    }
+}
+
+/// What a shape says about how its values are shown and edited, which validation
+/// ignores: the non-validating property shape characteristics of SHACL §2.3.2 and the
+/// DASH hints `dash:editor`, `dash:viewer`, `dash:singleLine` and `dash:readOnly`.
+/// Forms read them (spec U02).
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct ShapeInfo {
+    /// `sh:name`, every language
+    pub names: Vec<Literal>,
+    /// `sh:description`, every language
+    pub descriptions: Vec<Literal>,
+    /// `sh:order`
+    pub order: Option<f64>,
+    /// `sh:group`, a `sh:PropertyGroup`
+    pub group: Option<Term>,
+    /// `sh:defaultValue` when it is a constant (an IRI or a literal)
+    pub default_value: Option<Term>,
+    /// `dash:editor`
+    pub editor: Option<NamedNode>,
+    /// `dash:viewer`
+    pub viewer: Option<NamedNode>,
+    /// `dash:singleLine`
+    pub single_line: Option<bool>,
+    /// `dash:readOnly true`
+    pub read_only: bool,
+}
+
+impl ShapeInfo {
+    fn is_empty(&self) -> bool {
+        *self == ShapeInfo::default()
+    }
+}
+
+/// A `sh:PropertyGroup` that property shapes name with `sh:group`.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct GroupInfo {
+    /// `rdfs:label`, every language
+    pub labels: Vec<Literal>,
+    /// `sh:order`
+    pub order: Option<f64>,
 }
 
 /// A parsed shapes graph.
@@ -289,6 +338,8 @@ pub struct Shapes {
     pub(crate) expr_nodes: Vec<Term>,
     /// the custom node expression functions
     pub(crate) functions: Vec<CustomFn>,
+    /// the property groups the shapes name with `sh:group`
+    pub(crate) groups: FxHashMap<Term, GroupInfo>,
 }
 
 impl Shapes {
@@ -478,6 +529,16 @@ impl Shapes {
             }
         }
         Candidates::All
+    }
+
+    /// The property group a shape names with `sh:group`.
+    pub fn group(&self, node: &Term) -> Option<&GroupInfo> {
+        self.groups.get(node)
+    }
+
+    /// The index of a shape in [`Shapes::shapes`].
+    pub fn shape_id(&self, node: &Term) -> Option<ShapeId> {
+        self.by_node.get(node).copied()
     }
 
     /// A term of the term table.
@@ -817,8 +878,13 @@ impl<'g> Parser<'g> {
             severity,
             messages,
             constraints: Vec::new(),
+            info: None,
         });
         self.out.by_node.insert(node.clone(), id);
+        let info = self.info(node);
+        if !info.is_empty() {
+            self.out.shapes[id].info = Some(Box::new(info));
+        }
 
         // node expressions of the shape, read once the shape has its place
         for t in self.g.objects(node, sh::DEACTIVATED) {
@@ -848,6 +914,69 @@ impl<'g> Parser<'g> {
             .with_context(|| format!("shape {node}"))?;
         self.out.shapes[id].constraints = constraints;
         Ok(id)
+    }
+
+    /// The non-validating characteristics of a shape, and the property group it names.
+    fn info(&mut self, node: &Term) -> ShapeInfo {
+        let g = &self.g;
+        let literals = |p| {
+            g.objects(node, p)
+                .into_iter()
+                .filter_map(|t| match t {
+                    Term::Literal(l) => Some(l),
+                    _ => None,
+                })
+                .collect::<Vec<_>>()
+        };
+        let number = |t: Option<Term>| match t {
+            Some(Term::Literal(l)) => l
+                .value()
+                .trim()
+                .parse::<f64>()
+                .ok()
+                .filter(|f| f.is_finite()),
+            _ => None,
+        };
+        let iri = |p| match g.object(node, p) {
+            Some(Term::NamedNode(n)) => Some(n),
+            _ => None,
+        };
+        let group = g
+            .object(node, sh::GROUP)
+            .filter(|t| as_subject(t).is_some());
+        let info = ShapeInfo {
+            names: literals(sh::NAME),
+            descriptions: literals(sh::DESCRIPTION),
+            order: number(g.object(node, sh::ORDER)),
+            group: group.clone(),
+            default_value: g
+                .object(node, sh::DEFAULT_VALUE)
+                .filter(|t| matches!(t, Term::NamedNode(_) | Term::Literal(_))),
+            editor: iri(crate::vocab::dash::EDITOR),
+            viewer: iri(crate::vocab::dash::VIEWER),
+            single_line: g
+                .object(node, crate::vocab::dash::SINGLE_LINE)
+                .and_then(|t| literal_bool(&t)),
+            read_only: g
+                .objects(node, crate::vocab::dash::READ_ONLY)
+                .iter()
+                .any(|t| literal_bool(t) == Some(true)),
+        };
+        if let Some(gr) = group
+            && !self.out.groups.contains_key(&gr)
+        {
+            let labels = g
+                .objects(&gr, rdfs::LABEL)
+                .into_iter()
+                .filter_map(|t| match t {
+                    Term::Literal(l) => Some(l),
+                    _ => None,
+                })
+                .collect();
+            let order = number(g.object(&gr, sh::ORDER));
+            self.out.groups.insert(gr, GroupInfo { labels, order });
+        }
+        info
     }
 
     fn targets(&mut self, node: &Term) -> Result<Vec<Target>> {

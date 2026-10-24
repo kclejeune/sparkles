@@ -1,14 +1,18 @@
 # Usage
 
-This guide covers operating the `sparkles` binary. It describes running the server, the
-command-line tools, automatic compaction, the formatter and linter, backups, outbound
-requests, path search, integrity checks, the MCP server, embedding the library, the
-Python package, the JVM library for Apache Jena, the JavaScript packages, the Rust
-client, Docker, Kubernetes, deploying on NixOS and the Home Manager module.
-[API.md](API.md) specifies the HTTP API. [DEVELOPMENT.md](DEVELOPMENT.md) covers building from source and testing.
+This guide covers running and operating Sparkles. Its sections are grouped by task. The
+first group covers the server, the command-line tools, maintenance, backups and outbound
+requests. The next ones cover branches, path search, graph algorithms and embeddings,
+then the web UI, then the MCP server, agent memory and the model-backed features. The
+last two groups cover embedding the library, the Python, JVM, JavaScript and Rust
+clients, and deployment with Docker, Kubernetes, NixOS and Home Manager.
+[API.md](API.md) specifies the HTTP API, and [DEVELOPMENT.md](DEVELOPMENT.md) covers
+building from source and testing.
 
 Sparkles is experimental. The on-disk format, HTTP API and CLI may change between commits
 without a migration path, so keep backups of anything you cannot regenerate.
+
+**Running and operating the server**
 
 * [Running the server](#running-the-server)
   * [Network exposure](#network-exposure)
@@ -31,23 +35,39 @@ without a migration path, so keep backups of anything you cannot regenerate.
   * [DESCRIBE modes](#describe-modes)
   * [GraphQL](#graphql)
   * [Loading CSV and TSV](#loading-csv-and-tsv)
-* [Branches and merges](#branches-and-merges)
-* [The Explore overview](#the-explore-overview)
-* [Arcs on the map](#arcs-on-the-map)
-* [Lenses on the graph](#lenses-on-the-graph)
-* [The validation overlay](#the-validation-overlay)
-* [The time slider](#the-time-slider)
-* [Automatic compaction](#automatic-compaction)
 * [Formatting](#formatting)
 * [Linting](#linting)
+* [Automatic compaction](#automatic-compaction)
 * [Backup repositories](#backup-repositories)
+* [Checking a database](#checking-a-database)
+* [Upgrading databases](#upgrading-databases)
 * [Outbound requests (SERVICE and LOAD)](#outbound-requests-service-and-load)
   * [Correlated, bulk and cached SERVICE](#correlated-bulk-and-cached-service)
+* [Sending notifications](#sending-notifications)
+
+**Working with the data**
+
+* [Branches and merges](#branches-and-merges)
 * [Finding paths](#finding-paths)
 * [Graph algorithms](#graph-algorithms)
 * [Embeddings computed on write](#embeddings-computed-on-write)
-* [Checking a database](#checking-a-database)
-* [Upgrading databases](#upgrading-databases)
+* [Local embedding models](#local-embedding-models)
+
+**The web UI**
+
+* [The Explore overview](#the-explore-overview)
+* [Arcs on the map](#arcs-on-the-map)
+* [Facets and Use in query](#facets-and-use-in-query)
+* [The embedding map](#the-embedding-map)
+* [The Pattern pane](#the-pattern-pane)
+* [Lenses on the graph](#lenses-on-the-graph)
+  * [Algorithm lenses](#algorithm-lenses)
+* [The validation overlay](#the-validation-overlay)
+* [Editing forms](#editing-forms)
+* [The time slider](#the-time-slider)
+
+**Agents and models**
+
 * [MCP server (LLM agents)](#mcp-server-llm-agents)
   * [Handing a query to the web UI](#handing-a-query-to-the-web-ui)
   * [Agent memory grants](#agent-memory-grants)
@@ -57,7 +77,10 @@ without a migration path, so keep backups of anything you cannot regenerate.
   * [Escalation](#escalation)
   * [The Ask bar](#the-ask-bar)
   * [Measuring models](#measuring-models)
-* [Sending notifications](#sending-notifications)
+* [Community reports (GraphRAG)](#community-reports-graphrag)
+
+**Libraries and clients**
+
 * [Embedding the library](#embedding-the-library)
 * [Python](#python)
 * [JVM (Apache Jena)](#jvm-apache-jena)
@@ -70,6 +93,9 @@ without a migration path, so keep backups of anything you cannot regenerate.
   * [Differences from TDB2](#differences-from-tdb2)
 * [JavaScript and TypeScript](#javascript-and-typescript)
 * [Rust client](#rust-client)
+
+**Deployment**
+
 * [Docker](#docker)
 * [Kubernetes (Helm)](#kubernetes-helm)
 * [Deploying on NixOS](#deploying-on-nixos)
@@ -481,7 +507,7 @@ happens to materialized inferences, and the limits.
 | `--service-bulk-size N` | `10` | Inputs per request of `SERVICE <loop:bulk:…>` (see [Correlated and cached SERVICE](#correlated-bulk-and-cached-service)). |
 | `--service-bulk-max N` | `100` | The most inputs per request of any bulk SERVICE. `bulk+n` is capped to it. |
 | `--service-cache-mb N` | `64` (`small`: `16`) | The cache of remote results that `SERVICE <cache:…>` uses, for the whole server. `0` turns it off. A global flag. |
-| `--cache-mb N` | `1024` (`small`: `256`) | The block cache, for the whole server. Each dataset used to have a cache of this size. A global flag. |
+| `--cache-mb N` | `1024` (`small`: `256`) | The block cache, for the whole server. A global flag. |
 | `--result-cache-mb N` | `256` (`small`: `64`) | The query result cache, for the whole server. `0` turns it off. A global flag. |
 | `--history-cache-mb N` | `512` (`small`: `128`) | Materialized past states for point-in-time reads, for the whole server. A global flag. |
 | `--memory-profile NAME` | `default` | `default` or `small`. A profile sets the defaults of the cache, query budget and pool flags above, and a flag given on the command line overrides it. A global flag. |
@@ -500,6 +526,7 @@ happens to materialized inferences, and the limits.
 | `--reason-cache-triples N` | `10000000` | The largest closure of a materialization that a dataset keeps in memory, so that the next re-run or automatic run updates it incrementally. The limit counts the closure's derived triples, which take about 135 bytes each, and the input graphs are read from the store's indexes. With `0`, a run reads the closure back from a persistent dataset, and an in-memory dataset runs in full. |
 | `--reason-threads N` | half the cores | The threads that materializations evaluate rules on. All runs share this pool, so a run leaves the other cores to queries and writes. A request's `threads` field can ask for fewer. Runs are admitted in arrival order while their threads fit the pool, so a run that asks for fewer threads waits until they are free, and runs that use the whole pool run together. With `0`, runs use the pool that queries also use, which has a thread per core. |
 | `--reason-max-inferred N` | `50000000` | The derived triples a materialization may produce before it fails. Every run of the server has this limit, including automatic runs, and a request's `maxInferred` can ask for a lower one. A run that passes the limit fails with the rule that produced the most candidates and commits nothing. With `0`, runs have no limit, and only `ReasonOptions::max_memory` or the memory of the host stops a runaway rule. |
+| `--reason-max-derived N` | `1000000` | The facts one query may derive with `reasoning=demand`, not counting the magic facts of the demand transformation. A request's `maxDerived` can ask for fewer. A query that passes the limit fails with `422` and the code `reasoning-budget` ([API](API.md#query-time-reasoning)). With `0`, queries have no limit, and the query's timeout and memory budget stop a runaway derivation. |
 
 `sparkles serve --help` lists the other options. They include `--read-only`,
 `--union-default-graph`, `--auto-reason`, `--auth-config`, `--unix-socket`,
@@ -554,12 +581,12 @@ queries that each stay within `--query-memory-mb` cannot add up to more than the
 A request that finds the pool full waits up to `--query-admission-wait` seconds and then
 receives `503` with `Retry-After`. The pool costs a few atomic operations per request and
 nothing per row while a query stays inside its grant. The default pool is half of the
-available memory less the caches, so a server that ran many large queries at once may now
-see `503` where it used to run them until the host ran out of memory. Every request
+available memory less the caches, so many large concurrent queries receive `503` rather
+than running until the host runs out of memory. Every request
 reserves 16 MiB when it starts, so on a small host the pool is the 256 MiB floor, and
 concurrent queries beyond the sixteenth wait and then receive `503` with `Retry-After`.
-Set `--total-query-memory-mb 0` to turn the pool off, which restores the earlier
-behaviour. A SERVICE call from a query to its own server counts as a request of its own,
+Set `--total-query-memory-mb 0` to turn the pool off.
+A SERVICE call from a query to its own server counts as a request of its own,
 so it can wait while its caller holds memory and then answer `503`. The mechanism is
 described in [API.md](API.md#query-memory-pool).
 
@@ -590,6 +617,7 @@ sparkles load    --loc db people.csv --base http://ex.org/p/ --key id   # CSV an
 sparkles query   --loc db 'SELECT ...'        # --results text|json|xml|csv|tsv, --explain, --time
 sparkles query   --data file.ttl --query q.rq # query files in memory (arq --data)
 sparkles query   --loc db --rdfs schema.ttl 'SELECT ...'   # RDFS on read (--rdfs-graph IRI|default)
+sparkles query   --loc db --reasoning demand --profile owl-rl 'SELECT ...'   # derive on demand (--rules FILE, --max-derived N)
 sparkles query   --loc db --describe scbd 'DESCRIBE <http://ex.org/a>'   # cbd|scbd|outgoing, --describe-labels
 sparkles update  --loc db 'INSERT DATA {...}' # also LOAD <http…>
 sparkles patch   --loc db changes.rdfp        # apply RDF Patch files, one commit per file
@@ -670,7 +698,14 @@ parser is chosen and its limits.
 follows the database's `rdfs.json`, the materialized inferences of `sparkles infer` are
 part of the default graph while `reasoning.json` records them, and DESCRIBE follows
 `describe.json`. `--rdfs` or `--rdfs-graph` sets RDFS on read for the one query instead.
-`sparkles queries run` follows the same settings.
+`sparkles queries run` follows the same settings. `--reasoning demand` derives the facts
+the query needs from the rules of `--profile`, the last materialization's profile by
+default, or of a Jena rule file given with `--rules`, whose backward rules answer this
+way, and leaves the inferred graph out. `--max-derived` caps the facts it derives, and
+`--explain` shows a `Derive` node for each pattern
+([Query-time reasoning](API.md#query-time-reasoning)). A DESCRIBE is refused with
+`--reasoning demand`. `--reasoning false` reads the
+asserted data alone.
 
 When a persistent dataset opens and its configured text index is missing or damaged,
 Sparkles rebuilds the index in the background. RDF queries and writes keep working,
@@ -1183,6 +1218,44 @@ every stored query as a tool named `<dataset>__<query>`, and the UI's query page
 them with a form for their parameters. [API.md](API.md#stored-queries) describes the
 definitions, the parameter types and the versions.
 
+### Incremental views
+
+A view keeps the result of a SELECT or CONSTRUCT query current after every commit. A
+commit updates the view by the rows its changes affect, so a dashboard query over a large
+dataset costs little to keep current. A live query sends a client the same changes as
+they happen.
+
+```sh
+sparkles views put --loc db team-sizes \
+    'PREFIX org: <http://www.w3.org/ns/org#> SELECT ?team (COUNT(?p) AS ?n) WHERE { ?p org:memberOf ?team } GROUP BY ?team'
+sparkles views list --loc db
+sparkles views get --loc db team-sizes
+sparkles views explain --loc db 'SELECT ?p ?q WHERE { ?p <http://xmlns.com/foaf/0.1/knows>+ ?q }'
+sparkles query --loc db 'PREFIX view: <urn:x-sparkles:view#> SELECT * WHERE { SERVICE view:read { [] view:name "team-sizes" ; view:bind ?team, ?n } }'
+```
+
+`put` defines the view and waits for its first evaluation, and `get` shows its state, its
+size and its plan, with each operator marked `incremental` or `recompute`. `explain`
+shows the plan a query would have without defining it. The same commands work on a
+server with `--server URL --dataset NAME`, where `put`, `delete` and `rebuild` need
+`admin` on the dataset.
+
+`sparkles query --live` follows a query on a server. It prints the result, then a block
+for each commit that changes it, with `+` before the rows the commit added and `-` before
+the rows it removed. `--results json` prints one JSON object per event instead.
+
+```sh
+sparkles query --live --server http://localhost:3030 --dataset books \
+    'SELECT ?book WHERE { ?book a <http://ex.org/Book> }'
+curl -N 'localhost:3030/books/live?query=SELECT%20%3Fb%20WHERE%20%7B%20%3Fb%20a%20%3Chttp%3A%2F%2Fex.org%2FBook%3E%20%7D'
+```
+
+`serve --max-live-queries` and `--max-live-queries-per-principal` limit the live queries
+of a dataset, 1,000 and 20 by default. `--view-pass-timeout` suspends a view whose pass
+runs longer, 30 seconds by default, and `--views-memory` bounds the state of a dataset's
+views together. [API.md](API.md#incremental-views) describes the definitions, the
+states, `SERVICE view:read` and the events of a live query.
+
 ### DESCRIBE modes
 
 A DESCRIBE query returns the concise bounded description of each resource by default.
@@ -1309,9 +1382,44 @@ EOF
 sparkles load --loc db people.csv --template people.rq
 ```
 
-With `--mapping` as well, the template sees the mapping's typed values. The template
-runs against an empty dataset, and `LIMIT`, `ORDER BY`, aggregates, `FROM` and `SERVICE`
-are refused, because rows are mapped in batches of 10,000.
+With `--mapping` as well, the template sees the mapping's typed values. `LIMIT`,
+`ORDER BY`, aggregates, `FROM` and `SERVICE` are refused, because rows are mapped in
+batches of 10,000. A file may hold several CONSTRUCT queries, and each runs for every
+batch. Tarql's `tarql:expandPrefix("ex")` gives the namespace of a prefix as a string and
+`tarql:expandPrefixedName("ex:a")` the IRI, from the template's prefixes and then the
+dataset's, and `apf:strSplit` splits a cell into several values.
+
+A template runs against an empty dataset unless `--lookup` lets its WHERE clause read the
+database it loads into, as it was when the conversion started. That links rows to
+resources the database already has:
+
+```sh
+cat > link.rq <<'EOF'
+PREFIX ex: <http://ex.org/>
+CONSTRUCT { ?person ex:country ?c }
+WHERE { BIND (IRI(CONCAT("http://ex.org/person/", ?id)) AS ?person) ?c ex:isoCode ?code }
+EOF
+sparkles load --loc db people.csv --template link.rq --lookup
+# people.csv: the template read commit 12
+```
+
+A lookup links to resources with IRIs. A blank node that the WHERE clause binds becomes a
+new blank node in the load ([roadmap](ROADMAP.md) item 238). On a server, a lookup reads
+only the graphs the caller may read.
+
+CSVW's standard mode, with `--csvw-mode standard`, adds a description of the table
+group, of each table and of each row, with its row number and source URL, around the
+triples of the default minimal mode. In standard mode, or with `--csvw-check keys`, the
+metadata's `primaryKey` and `foreignKeys` are checked across the tables of the load. The
+tables are converted in the order their foreign keys need, a duplicate key fails with
+both rows, and a reference that matches no row fails with its row, column and value:
+
+```sh
+sparkles load --loc db --mapping shop-metadata.json --csvw-mode standard
+# Error: …/orders.csv: row 3, column 2 (customer): the value "2" is not among the values of column id of table customer.csv
+```
+
+The key values are held in memory while the load runs.
 
 A cell that does not match its datatype, or a row with the wrong number of cells, stops
 the load with the file, row and column, and nothing is committed. `sparkles csv convert`
@@ -1322,630 +1430,93 @@ input given as the output is refused.
 triples. On a server, `POST /{ds}/upload` takes tables too
 ([API](API.md#csv-and-tsv-uploads)).
 
-## Branches and merges
+### Mappings (R2RML, RML and YARRRML)
 
-A branch lets a change take several steps, or several people, before it reaches the data
-everyone reads. Every persistent or in-memory dataset has the branch `main`. A new
-persistent branch starts from a commit of another branch and shares that branch's index
-files until it compacts. An in-memory branch shares the unchanging base data of the
-branch it starts from and copies the vocabulary of terms added since. Its writes,
-indexes and validation state stay separate. Reads and writes choose a branch with `--branch` on the command line,
-`?branch=NAME` over HTTP, or the endpoint URL `/{ds}@{branch}/sparql`.
-[API.md](API.md#branches-and-merges) describes the routes, the merge rules and the
-conflict report.
+`sparkles map` and `sparkles load --mapping` run R2RML, RML and YARRRML mappings over CSV,
+TSV, JSON, JSON Lines, Parquet and SQLite sources
+([spec F19](specs/F19-mappings-and-virtual-graphs.md)). The kind of a mapping file is read
+from its content, and `--mapping-kind` names it when the content does not tell. A
+YARRRML mapping of two CSV files with a join looks like this:
+
+```yaml
+prefixes:
+  ex: http://ex.org/
+mappings:
+  person:
+    sources:
+      - [people.csv~csv]
+    s: ex:person/$(id)
+    po:
+      - [a, ex:Person]
+      - [ex:name, $(name)]
+      - p: ex:city
+        o:
+          mapping: city
+          condition:
+            function: equal
+            parameters:
+              - [str1, $(city)]
+              - [str2, $(id)]
+  city:
+    sources:
+      - [cities.csv~csv]
+    s: ex:city/$(id)
+    po:
+      - [ex:label, $(label)]
+```
 
 ```sh
-sparkles branch create --loc db dev --note "schema migration"
-sparkles update --loc db --branch dev 'INSERT DATA { <urn:a> <urn:p> 1 }'
-sparkles query --loc db --branch dev 'SELECT * { ?s ?p ?o }'
-sparkles branch list --loc db
-sparkles merge --loc db dev                    # into main; exits 2 on conflicts
+sparkles map check people.yml            # triples maps, sources, joins, missing columns
+sparkles map run people.yml -o people.nq # the quads, without loading them
+sparkles load --loc db --mapping people.yml
+sparkles map convert people.yml          # the same mapping as RML-Core Turtle
 ```
 
-`branch list` prints one line per branch, with its head, the commit it started from,
-the commits it is ahead of and behind its upstream, and whether it still shares its
-upstream's index (`linked`):
+A file source resolves against the mapping file's directory, and `--source NAME=PATH`
+gives the path of a source by the name the mapping uses. Each source is read once, row by
+row, for all the triples maps that read it. Values keep the types of their source, so a
+SQLite `INTEGER` column gives `xsd:integer` literals, and a CSV source gives strings
+unless a CSVW description named `FILE-metadata.json` next to the file gives its columns
+datatypes. A JSON document is parsed whole, up to `--max-json-mb` (512 MiB), and JSON
+Lines a line at a time. `--base` sets the base of relative IRIs the mapping generates,
+and a triples map's own `rml:baseIRI` wins over it.
+`sparkles load --graph G` writes every quad into G, and refuses a mapping whose graph maps
+name another graph.
 
-```
-branch  head  from     ahead  behind  storage           note
-main      61  -            -       -  gen-0004
-dev       57  main@42     15      19  linked (2.1 MiB)  schema migration
-```
-
-It reads the files when a server holds the database, and then shows heads and starting
-points without the ahead and behind counts. `branch create` takes `--from BRANCH` and
-`--at REF` to start elsewhere than `main`'s head, and `--protected` to refuse every write
-but merges. `branch protect NAME [--off]`, `branch show NAME`, `branch rename NAME NEW` and `branch
-delete NAME [--force] [--reparent]` complete the set. A rename keeps the branch's
-commits and storage, and the old name stops working. `--reparent` deletes a branch that
-other branches start from: they take its upstream, and its storage stays while their
-history needs it. These commands also work against a server with
-`--server URL --dataset NAME`.
-
-A persistent branch that still shares an index can move onto main's current index
-without changing its data, UUID or commit head:
+R2RML logical tables and RML database sources read connections given with
+`--connection NAME=URL`, where the URL is `sqlite:PATH`. An R2RML mapping reads the only
+connection, or the one named `default`, and an RML source names one as
+`urn:x-sparkles:connection:NAME`. A mapping never holds a password. Two tables of one
+connection join in one SQL statement, and other joins hold the parent's rows in memory.
+`sparkles map draft` prints an R2RML mapping in the shape of the W3C Direct Mapping for
+the tables of a SQLite database, to edit:
 
 ```sh
-sparkles branch relink --loc db dev
-sparkles branch relink --loc db dev --format json
+sparkles map draft --connection shop=sqlite:shop.sqlite --base http://ex.org/shop/ > shop.ttl
+sparkles load --loc db --mapping shop.ttl --connection shop=sqlite:shop.sqlite
 ```
 
-Relinking works on a stopped database and takes its exclusive directory lock. The
-branch's own writes are kept as a sparse overlay on main's index, and older indexes stay
-on disk while readers or history need them. `main` and branches that already have their
-own index cannot be relinked. Progress goes to stderr, and Ctrl-C cancels the
-operation. Ordinary compaction still gives a branch an index of its own. On a running
-server, `POST /$/branches/{ds}/{name}/relink` does the same (see
-[API: Relinking](API.md#relinking)).
+Function maps call the GREL and IDLab functions of RML's function descriptions and
+Sparkles' own `urn:x-sparkles:fn:` functions, which `sparkles map check --functions`
+lists. A function the list lacks fails, and a CONSTRUCT template can then do the job with
+any SPARQL function.
 
-`merge` prints the result, or the conflicts that stopped it:
-
-```
-merge dev (commit 57) into main (commit 61), base main@42
-CONFLICT  <http://ex.org/a> <http://ex.org/age>  (default graph)
-  base    30
-  ours    31   (main)
-  theirs  32   (dev)
-1 conflict, nothing merged. Resolve with --on-conflict or --resolve FILE.
-```
-
-A conflict is a cell, a subject and a predicate in a graph, that both sides changed in
-different ways. `--on-conflict ours`, `theirs` or `union` resolves every conflict one way,
-and `--resolve FILE.json` reads a JSON array of resolutions for single graphs, subjects or
-cells, such as `[{"graph": null, "subject": "<http://ex.org/a>", "predicate":
-"<http://ex.org/age>", "take": "objects", "objects": ["33"]}]`. `--expect-source N` and
-`--expect-target N` refuse the merge when either head moved since the report was read.
-`--exempt IRI`, once per predicate,
-keeps both sides' changes to that predicate instead of reporting a conflict, and `branch
-exempt --loc db IRI…` sets the dataset's own list of such predicates (`--clear` empties
-it). `--conflicts subject` treats a whole subject as one value, and `--conflicts quad` never
-reports a conflict. `--replay` makes a fast-forward
-that replays the source's commits one by one, each with its kind, message and author.
-`--squash` applies the changes as one commit that records no second
-parent, so the source stays ahead of the target and keeps its own history to itself.
-`--dry-run` shows what the merge would do. The exit status is 0 after
-a merge or when the target is already up to date, 2 when conflicts stopped the merge,
-and 1 on any other error.
-
-When two branches have merged into each other, they can have several best common
-ancestors. If those ancestors' changes combine without conflicts, the merge combines
-them into a virtual merge base. Otherwise, the merge needs an explicit base. A virtual
-base is reported as `null` and is not stored as a commit. `--replay` needs a real base.
-
-`sparkles revert N` undoes commit N of the `--branch` branch, `main` by default, with
-a new commit of kind `revert`. Later changes to the same cells conflict as in a merge,
-and `revert` takes the conflict options of `merge` and exits the same way:
+A database keeps stored mappings of every kind in `mappings.json`, with versions, and a
+stored R2RML, RML or YARRRML mapping runs again by name. `--mode replace` replaces the
+graphs the mapping writes in one commit, so a run over sources that did not change
+changes nothing:
 
 ```sh
-sparkles revert --loc db 57                     # undo commit 57 on main
-sparkles revert --loc db --branch dev 61 --on-conflict theirs
+sparkles map put people people.yml --loc db --description "People and cities"
+sparkles map list --loc db
+sparkles map run people --loc db --mode replace --dry-run
+sparkles map run people --loc db --mode replace
 ```
 
-`sparkles cherry-pick SOURCE N` applies the changes of commit N of branch SOURCE to the
-`--branch` branch, `main` by default, as one commit of kind `cherry-pick`. It records no
-second parent, so a later merge of SOURCE still brings its other commits:
-
-```sh
-sparkles cherry-pick --loc db dev 57             # commit 57 of dev, applied to main
-sparkles cherry-pick --loc db --branch qa dev 57
-```
-
-`--branch NAME` works with `query`, `update`, `load`, `dump`, `log`, `diff`, `snapshot`,
-`compact`, `stats`, `clone`, `patch`, `revert` and `cherry-pick`. With `--server`, these commands send the
-dataset's name in the path form, `ds@NAME`. The web UI has a branch menu next to the
-dataset's name, and its Branches panel creates, protects, deletes and merges branches.
-
-The panel's Merge button merges a branch without conflicts after a preview. When the
-merge has conflicts, the button opens the merge page,
-`/ui/datasets/NAME/merge?source=dev&target=main`. The page shows the merge base and the
-counts, and it lists the conflicts grouped by graph and subject, with the base, ours and
-theirs objects side by side. You choose a side for each row or for all the rows of a
-subject, or set a rule for every conflict without a choice. The page then lists the
-changes those choices make as signed N-Quads lines. The merge sends the heads the page
-showed, so a branch that moved in the meantime makes the page read both branches again
-instead of merging. When the target's write-time validation refuses the result, the page
-shows the guard's report and nothing is written.
-
-The History panel's Graph button draws the commits of every branch in time order, one
-lane per branch, as `git log --graph` does. Each branch's lane starts from the commit
-it was created from, and a merge commit links to the commit it merged. Long runs of
-commits on one branch fold into a segment that opens on a click. Clicking a commit shows
-its changes and a link that opens the query page at that commit.
-
-A branch costs almost nothing while it stays linked. Its memory then holds the upstream's
-delta at the starting commit, and its first compaction builds a full index, about what a
-clone costs. `--max-branches` (64) limits the branches of a dataset, and the dataset's
-storage quota covers every branch.
-
-## The Explore overview
-
-Explore opens on a picture of the dataset when no resource is selected. Each class with
-instances is a node sized by its instance count, and each predicate between instances of
-two classes is an edge weighted by its triples. The picture comes from the class
-profiles of [API.md](API.md#class-profiles), and it is laid out with ForceAtlas2 in a web
-worker and drawn with WebGL, so it settles while the page stays responsive. The search
-box stays at the top: a resource found there, or an IRI pasted into it, opens the
-resource graph as before.
-
-A click or a tap on a class opens it in place. A class of at most 5,000 instances opens
-into its members with their links. A larger class opens into the communities that a
-graph algorithm run wrote back ([Graph algorithms](#graph-algorithms)), when its
-instances have some, and otherwise into groups by the property whose values split the
-class best: one group per value, ranges of a number or of the years of a date, or the
-most frequent values and the rest. The line under the toolbar names the property, and
-**Group by** chooses another or lists the members. A group opens the same way, and a
-member opens in the resource view. Edges between a group and the rest of the picture
-carry the number of links they stand for.
-
-The breadcrumb above the picture shows the open path, such as `Overview › Researcher ›
-30 – 39`. A crumb, or `Backspace`, closes the levels below it, and the other classes
-and groups stay where they were. Pinching or the mouse wheel zooms, and dragging pans.
-**List** (`L`) shows the drawn nodes as a table with their size, class and links, which
-is also how a screen reader reads the picture. With the picture focused, `Tab` moves
-through the largest nodes on screen, `Enter` opens one, the arrow keys pan, `+` and `−`
-zoom and `0` fits the picture.
-
-The counts are those the signed-in user may read: a user limited to some graphs or
-under protections of triples sees the classes, groups and members of their own view
-only. Opening a large group runs queries under the user's timeout and memory budget, and
-a group that needs more stays closed with the budget's message. Without WebGL the
-picture is drawn with the canvas renderer of the resource graph. **Built-in** shows or
-hides the classes of the RDF, RDFS, OWL and SHACL vocabularies, which are shown by
-default only when the dataset has no other classes.
-
-**Group by** also offers **GraphRAG communities**, which draws the dataset as the
-communities of a [GraphRAG build](#community-reports-graphrag) instead of its classes.
-Each node is a community sized by its member count and coloured by its report's status,
-and **Colour by** switches to one colour per community. **Level** picks the level to
-start from, 0 being the coarsest. Opening a community draws the communities below it,
-and a community of the finest level opens into its members. The breadcrumb reads
-`Communities › Engineering › The payments team`. Selecting or opening a community shows
-its report beside the picture, with the same summary, findings and review actions as
-the Communities tab. Choosing a finding rings the entities it is about, and when they lie
-inside a community that is drawn closed, **Draw the members** opens it. **Open report**
-goes to the report in the Communities tab, and that tab's **Show in Explore** comes back.
-
-The communities are those of main, so on another branch the overview says so and draws
-nothing. A user whose access does not cover the reports graph is told that the
-communities are not available to them and learns nothing else about them, and a dataset
-that has no build says that none were built. Both notices offer to go back to the
-classes. The same grouping is `by: {"reports": {}}` in
-[API.md](API.md#graph-overview) and in the bindings.
-
-The query page's graph view uses the same WebGL view for results of more than 2,000
-nodes. **Max nodes** then offers 10,000, 50,000 and 100,000, and **Renderer** switches
-between the canvas and WebGL views.
-
-## Arcs on the map
-
-The maps draw relations as well as places. In Explore, the **Map** button beside **Graph**
-in the graph toolbar, or `Shift+M`, shows the drawn graph on a map. Each drawn entity that
-has a geometry becomes a marker at its point, or at the centre of its line or polygon. Each
-drawn edge between two located entities becomes an arc. An arc is a great circle, bowed a
-little to the left of its direction so that the arcs of both directions between two places
-stay apart, and it ends in an arrowhead at its target. An arc that crosses the antimeridian
-is cut there and drawn on both sides.
-
-The map finds the entities by querying for their geometries, 200 at a time with four
-requests in flight. The queries run in your own view, at the state the graph slider reads,
-so an entity whose geometry you may not read is not located. Entities without a geometry
-are listed under the map as not located, and their edges are not drawn. The map draws only
-the edges the graph already shows and asks for no relations of its own.
-
-Arcs are coloured by predicate, with a checkbox and a legend entry for each, and **Width by**
-chooses between the count and one width. Markers closer than 20 px merge into one marker
-that shows how many places it holds, and the links between two places of one marker are
-counted on the marker instead of drawn. The arcs of one predicate and direction between the
-same two markers merge into one arc whose width and label give the count. Zooming in splits
-the markers and their arcs again. When you compare two states with the graph slider, added
-arcs are green and removed arcs are red and dashed, and their labels start with a plus or a
-minus sign.
-
-On the query page, a result with two columns of geometry literals, or with two columns of
-entities that have geometries, offers **Arcs** on its Map tab. Each row is an arc from the
-first column to the second, and **Label** chooses a third column to write on the arc. A
-result with two entity columns and no geometry column gets the Map tab when a lookup of its
-first 200 entities finds a geometry, and that lookup waits while the time slider is open.
-The lookups run on the result's branch and at the state the result was read at. When you
-compare two states, the entities that only removed rows use are looked up at the earlier one. Picking a row in the list beside the map highlights its arc.
-
-A click on a marker or an arc selects the entities it stands for, and the selection bar
-names the count and the source, with **Clear** and, in Explore, **Open as graph**, which
-draws the selected entities as the graph. The selection dims everything else on the map,
-and Explore's graph canvas dims the nodes outside it too. `Escape` clears it. With the map
-focused, `Tab` moves through the markers in view, the largest first, `Enter` selects one,
-and `Shift+Enter` adds it to the selection. **List of places and links in view** below the
-map lists the same markers and arcs with their counts, for a screen reader and for taps. At
-a phone's width the controls grow to 44 px and the map takes the page's width.
-
-A map draws at most 20,000 places and 20,000 links before merging, and says when a result
-had more. [U11](specs/U11-linked-views.md#outcome) records the measurements.
-
-## The Pattern pane
-
-The query page can draw the graph pattern of the query in the editor. **Pattern** in the
-editor's toolbar, or `Alt+P`, opens a pane beside the editor, and the divider between
-them can be dragged. Each variable is a round node, each IRI a rectangle with its
-prefixed name, and each literal a small rounded box. A triple pattern is an edge labelled
-with its predicate, a variable predicate is dashed, and a simple path such as
-`ex:partOf+` labels its edge with the path. `?x a ex:Person` puts the class under the
-node instead of drawing an edge. A filter over one variable and constants, such as
-`STRSTARTS(?name, "A")`, is a chip on its variable, and an `OPTIONAL` group is a dashed
-hull around the nodes only it binds. The strip under the drawing lists the projection,
-`DISTINCT`, `LIMIT`, `OFFSET` and the other solution modifiers.
-
-The pane draws any query that parses, but it edits only a part of SPARQL: triple
-patterns, filters and one level of `OPTIONAL`. Everything else, such as `BIND`, `MINUS`,
-`UNION`, `GRAPH`, subqueries, `SERVICE` and `VALUES`, is a locked block. A locked block
-shows its kind and its text, comments included, and dotted lines join it to the
-variables it shares. The editor edits locked blocks, and edits made in the pane never
-change their text.
-
-The pane builds and edits queries. **+ Node** (`N`) asks for a variable, an IRI or a
-class, and the picker lists the dataset's classes with their instance counts. The new
-node waits on the canvas, dimmed and dashed, because SPARQL has no free variables, and
-nothing is written until an edge uses it. A class becomes a variable named after it, such
-as `?person` for `ex:Person`, and the edge that first uses it writes `?person a
-ex:Person` too. With an empty editor the pane offers **+ Node** and the five classes with
-the most instances, and the first edge writes the whole query.
-
-**+ Edge** (`E`, or **Edge from here** in a node's panel) writes a triple pattern from a
-source, a predicate and a target. The predicate picker lists first the predicates that
-instances of the source's class use, then those whose values are instances of the
-target's class, each with its count, then the rest. Typing narrows the list, and a full
-IRI or a prefixed name that the list lacks is accepted as it is. The triple goes into the
-group that holds the source's patterns, after the last part of it the pane edits, and
-also after any locked block that follows and uses a variable the new triple binds. A
-prefixed name whose prefix the query does not declare, but the dataset does, adds its
-`PREFIX` line, and one that neither declares is refused. When the schema cannot be read,
-the pickers say why and take typed names only. The schema and the counts are read at the
-query page's branch and **At** state, under the reader's own view, so a predicate the
-reader cannot see is not listed.
-
-An edge's panel changes its predicate, offers the paths `p+`, `p*`, `p?` and `^p`, and
-takes a typed sequence or alternative such as `ex:a/ex:b`. **Optional** moves the triple
-into `OPTIONAL { … }` or back out of it, and **Delete** removes it from its statement. A
-variable's panel adds a filter (`F`) from a form chosen by the datatypes its values were
-seen with, with ranges for numbers and dates, `CONTAINS`, `STRSTARTS`, `STRENDS` and
-`REGEX` for strings, `LANGMATCHES` for language-tagged strings, and `BOUND`, `isIRI` and
-`isLiteral`. The filter goes after the last triple that binds the variable, and its chip
-opens the same form again to change or delete it. The panel also renames the variable
-everywhere the pane edits. When a locked block uses the variable, the pane shows the
-block and asks whether to rename it there too. **Delete** on a node removes every triple
-that touches it, with the chips left without a bound variable. A locked block is
-deleted only after a confirmation that shows its text. A locked block that uses a
-variable nothing binds any more, for example after its triple was deleted, gets a red
-border and the note "uses ?y, which nothing binds now".
-
-The strip under the drawing has a checkbox per variable, and the first change turns
-`SELECT *` into the list of variables. It also sets `DISTINCT`, `LIMIT` and `OFFSET`.
-**Count matches** runs `SELECT (COUNT(*) AS ?n)` over the pattern with a five-second
-timeout and shows the count, or "More than the count could finish" when the time runs
-out.
-
-Each edit changes only the text it must, as one change to the editor, so `Ctrl+Z` (`⌘Z`
-on a Mac) in the editor or anywhere in the pane undoes it in one step, the same as typing.
-The pane makes an edit only when the server would accept the result and the result holds
-exactly the change asked for.
-
-The pane redraws 150 ms after typing stops. Text that does not parse leaves the last
-drawing on screen, dimmed, with the line and column of the error, and the pane makes no
-edits until the text parses again. A node keeps its place while the text around it
-changes, a new node appears next to the nodes it connects to, and a variable renamed in
-the editor keeps its position. **Tidy** lays the whole pattern out again. The browser
-keeps the positions of each query, at most 200 queries, so a query opened again from the
-history or as a stored query draws the same picture.
-
-**List** shows the same elements as rows in the order of the text, which is also how a
-screen reader reads the pattern. With the canvas focused, `Tab` and `Shift+Tab` move
-through the elements in text order, the arrow keys move to the nearest element in that
-direction, `Shift` with an arrow moves the focused node by 16 pixels, `Enter` opens the
-element's panel, `Delete` removes the focused element, `O` toggles optional on an edge,
-`N`, `E` and `F` add a node, an edge from the focused node and a filter on the focused
-variable, and `Escape` closes a form or panel, then returns to the editor. A polite live
-region announces each edit.
-
-A result has a **Pattern** tab that draws the query that produced it, read-only, and
-**Edit** puts that query in the editor with the pane open. On a phone the editor and the
-pane are two tabs, **Text** and **Pattern**, over the same query, and every control
-keeps a 44-pixel touch target. The strip folds into a **Query options** sheet, and
-**+ Edge** takes two taps, on the source and on the target or **New node**, then opens
-the predicate picker on the whole screen. The pane needs the formatter's WebAssembly module (see
-[ui/README.md](../ui/README.md#formatting-in-the-browser)). Without it the pane says so
-and draws nothing.
-
-### The plan on the pattern
-
-**Plan on pattern** draws the plan of the query that ran on its pattern. The switch is in
-the toolbar of the Plan tab and in the header of the Pattern tab and the Pattern pane, and
-it is one setting for all three, kept per viewer. With it on, each edge carries the
-estimated and actual rows of the operator that reads its triple pattern, such as
-`est 214 · rows 214`, and grows wider with the logarithm of its rows. An edge whose actual
-rows are over ten times its estimate, or under a tenth of it, turns orange and shows `⚠`
-with the ratio, such as `×1,338` or `÷40`, which is the rule the plan tree uses for its red
-counts. A class under a node shows the numbers of its `?x a C` pattern, and a filter chip
-shows how many rows reached the filter and how many passed it. Each join is a numbered
-badge on the variable it joins on, numbered in the order the plan runs the joins, with its
-operator and rows. A locked block shows the numbers of the operator that evaluates it when
-it is the only block of its kind and the plan has one such operator.
-
-**Rows** and **Time** in the bar above the drawing switch between rows and each
-operator's own time, and in time the operator with the largest share is marked `●`. On
-the Pattern tab the plan tree sits beside the drawing. Clicking an edge, a badge or a chip
-selects its operator in the tree, and selecting an operator in the tree lights the edges
-and nodes it reads while the rest fade. Hovering a join badge, or focusing it, lights the
-edges below that join. The panel of a selected element names its operator with its
-numbers. Patterns of the plan that match nothing on the drawing, such as those inside a
-locked block or those the planner rewrote, are listed under **N operators not drawn**, so
-nothing in the plan is hidden. A star join that reads several triples shows its numbers on
-each of their edges and says it is shared.
-
-The numbers come from the plan the page already has, with no further request. An
-**Explain** shows estimates only. The bar names the commit and branch the plan was read
-at. A reader whose view a graph grant limits gets no estimates in plans, so the edges show
-actual rows only and no `⚠`. The Pattern pane beside the editor draws the plan only while
-its text is the text that ran, and says so when the text has changed since, while the
-result's Pattern tab always draws the text that ran. With the canvas focused, `J` moves
-through the join badges in plan order and `T` switches between rows and time, and the
-screen reader hears each element's numbers after its description. On a phone the tree is
-the Plan tab, and a tap on an edge opens a sheet whose **Show in plan** switches to the
-tree with the operator selected. Labels shorten there to `214 / 1.2M ⚠`.
-
-## Lenses on the graph
-
-A lens changes how the graph draws its nodes and edges from data about them. The resource
-graph in Explore and the query page's graph view have a **Lenses** menu in their toolbar
-(shortcut `Shift+L`) with one row per channel, and each channel has at most one lens on at
-a time.
-
-* **Size** draws a node's area in five steps of the drawn values, so that one outlier does
-  not flatten the rest. It offers the degree in the drawn graph, the degree in the dataset
-  and a numeric property of the drawn nodes. A node without a value keeps the smallest
-  size, and the legend counts it as "no value".
-* **Colour** gives twelve colours to the categories with the most nodes and "other" to the
-  rest. It offers the node's class, the named graph it is used in and a property's values.
-  The class lens reads the asserted classes, since with reasoning every node would also
-  be in each superclass. A node with several values takes the one most drawn nodes share.
-* **Badges** puts a pill with an `i` and a count in the corner of each node that has
-  inferred edges. In Explore it also offers **validation results**, the
-  [validation overlay](#the-validation-overlay).
-* **Edges** draws the edges that the reasoner added dashed, with an `i` before their
-  label. An edge counts as inferred when the graph shows it and a read without reasoning
-  does not, which covers materialized inferences and RDFS on read alike. A triple that is
-  both asserted and inferred stays solid. While the lens is on, `rdf:type` edges are no
-  longer dashed, so that a dash means one thing.
-
-The edge lens is on by default when the dataset has materialized inferences or RDFS on
-read, and the badge and edge lenses are absent when it has neither. `Shift+1` to `Shift+4`
-turn the size, colour, badge and edge lens off and on again.
-
-The legend in the canvas's corner lists each encoding in words, such as "size is degree
-in the dataset, larger is higher" and "colour 3 is ex:Employee", with the number of nodes
-of each entry. Clicking an entry, or `Enter` on it, rings its nodes and fades the rest,
-and a second click clears them. **List** shows the drawn nodes as a table with a column
-per active lens, ordered by the size lens's value when one is on, and a screen reader
-hears each lens's result in a polite announcement. On a phone the menu is a bottom sheet
-and the legend a strip along the top of the graph that opens on a tap.
-
-The lenses read the drawn nodes with one query per 200 terms and at most four queries in
-flight, at the state the graph shows, so they follow the time slider. They read under the
-signed-in user's view, and a grown graph reads only its new nodes. Nothing they compute is
-saved. Lenses apply to at most 20,000 drawn nodes. On the query page, the edges of a
-`CONSTRUCT` result are also read with reasoning, so that a constructed triple that is not
-in the data is not taken for an inferred one.
-
-## The validation overlay
-
-Explore can badge the SHACL and ShEx results of the nodes it draws. When the dataset has a
-write-time guard ([Write-time validation](API.md#write-time-validation)), the overlay is on
-by default. It is the **validation results** lens of the badge channel in the **Lenses**
-menu ([Lenses on the graph](#lenses-on-the-graph)), which turns it on or off, and the
-choice is remembered in the browser. `Shift+3` turns it on again after it was turned off.
-When the caller's grants cover only some graphs of the dataset, the menu does not offer
-the lens and says that validation needs access to every graph. The overlay validates only the drawn nodes, in requests of up
-to 500 nodes with one in flight, so its cost follows the picture and not the dataset. It
-validates the first 1,500 drawn nodes.
-
-While the lens is on, the **Shapes** picker under the menu's channels chooses where the
-shapes come from. The write-time guard is the
-default, and a ShEx guard validates with its own schema and shape map. A shapes graph of
-the dataset can be named by its IRI. The shapes the Validate panel of the dataset page
-last validated with can be used too, and without a guard they are the default. A node
-with results gets a badge with its count and its worst severity, `✕` for a violation,
-`⚠` for a warning and `ⓘ` for an info. A literal drawn as the value of a result gets the
-same mark. The overlay validates every node the canvas draws, including the nodes the
-path finder adds. The legend groups the nodes by their worst severity, and a click on an
-entry selects its nodes. The canvas's **List** view has a **validation results** column,
-such as "✕ 1 violation".
-
-A click on a badge opens the node's results, grouped by shape and constraint, with the
-path, the value and the messages. `V` opens the results of the selected node, and
-`Shift+V` selects the next node with results. **Show triples** draws the focus node, the
-edge of the result's path and the value, and marks them. At 390 px the results open as a
-sheet at the bottom of the screen.
-
-**Suggest fix** writes a SPARQL Update for the common constraints: `sh:minCount`,
-`sh:maxCount`, `sh:datatype`, `sh:class`, `sh:in`, `sh:hasValue` and `sh:closed`, and the
-ShEx cardinality, datatype, value set and closed failures. The update holds the result's
-terms, and what the result does not say is a placeholder such as `?value`, which must be
-filled in before **Preview** runs. When the guard's data graph is one named graph, the
-update writes that graph. When it is several graphs, or the default graph of a server
-started with `--union-default-graph`, the update holds `GRAPH ?graph` for the graph that
-holds the triple. A shapes graph or the Validate panel's shapes validate the default
-graph, so on such a server their updates hold `GRAPH ?graph` too. Preview is a dry run of the update
-([C15](specs/C15-write-previews.md)). It lists the changes and says whether the guard
-would still report the result, or that the guard's answer does not tell, as when it
-validated only some of the shapes and the state still has results it did not list. **Run** commits the update only after a preview of the same
-text, and the overlay then validates the drawn nodes again, so a fixed badge goes away.
-**Open in Query** takes the update to the query editor instead. Constraints that are not
-on one predicate, `sh:pattern`, `sh:sparql`, `sh:node` and qualified shapes get no
-suggestion.
-
-With the graph's **History** open, the overlay validates the state the slider shows, and it
-pauses while the history plays. It validates the drawn nodes as focus nodes, so a
-SHACL-SPARQL constraint that is not anchored at its focus node can give other results in a
-full validation, and the overlay says so when such a result appears. A caller whose
-grants cover only some graphs of the dataset cannot validate it, and the overlay shows
-"Validation needs access to every graph". A validation over the server's result budget
-shows the error and no badges.
-
-## The time slider
-
-The web UI reads a past state of a dataset with a slider. It is a bar under the toolbar of
-a view, and moving its handle reads that view again at another commit. It writes the same
-`at` selector that the query page's **At** field and `?at=` take, so the two always name
-the same state. The slider needs a dataset whose history is readable, which
-[Point-in-time reads and snapshots](API.md#point-in-time-reads-and-snapshots) describes.
-A commit that retention has dropped is hatched on the track and labelled **gone**.
-
-The slider appears over five views.
-
-* **Query results.** The **History** button on the query page (shortcut `H`) opens it.
-  The query runs again at the commit the handle names, and the result says which state it
-  read.
-* **An entity.** In Explore, the properties panel of a selected resource has a **History**
-  button (`H`). Its track holds only the commits that changed the resource's triples.
-* **The graph.** **Graph history** (`Shift+H`) reads the drawn neighbourhood at a commit.
-  The nodes you expanded are expanded again at that commit, and nodes that appear or
-  disappear fade in and out. With reduced motion set in the system, nothing animates.
-* **The schema.** **Schema history** on the schema tab reads the class tree and the
-  property list at a commit.
-* **Agent memory.** The Memory tab's **As of** control is the same slider.
-
-Press `C`, or use **Compare**, to add a second handle. The view then shows the state at the
-right handle and marks what changed since the left one. A row only the later state has
-carries a `+` and a row only the earlier state has carries a `−`, and the chips above the
-table filter by **added**, **removed** and **unchanged**. In the graph, added elements are
-solid with a `+` badge and removed ones stay as dashed ghosts. The schema tab shows the
-change of each count, such as `+120`. On the map, added features are drawn larger and
-removed ones faded. Each change is marked by a symbol and a shape as well as colour.
-
-The arrow keys move the focused handle by one commit and `PageUp` and `PageDown` by ten.
-`Home` and `End` go to the oldest readable commit and to head. `S` and `Shift+S` jump to the
-next and previous named snapshot, `Space` plays through the commits, and `Escape` closes the
-slider. **Play** waits for each read to finish before it takes the next step. **Follow**
-keeps a view at head up to date by listening to the dataset's change feed.
-
-When a branch has more than 2,000 commits, the track shows buckets of commits with the
-size of their changes, and zooming narrows the range until each commit is listed. The
-buckets come from `GET /$/commits/{ds}/timeline` ([API](API.md#the-commit-timeline)).
-
-Compare mode also takes the head of another branch as its left side. Choose it in the
-**Compare with** menu. The query page then runs the query on both branches and the Explore
-graph and schema tab compare the two heads, which shows what a branch has changed before a
-merge.
-
-A comparison in the browser lists at most 10,000 rows on each side, and it compares only
-complete results. When a result is larger, or the row limit cut it, the page compares the
-counts, marks no row and says so, because a prefix of the rows says nothing about the rows
-after it. For a query that was typed in, and not for a stored query or a comparison with
-another branch, the page then offers **Compare on the server**. It calls
-`POST /{ds}/sparql/diff`, which runs the query at both states and returns the rows only
-one of them has ([API](API.md#comparing-a-query-between-two-states)). The table then
-lists those rows.
-
-The address keeps the view. The query page adds `ds`, `at`, `from`, `against` and `branch`
-to its URL while the slider is open, and Explore uses `at`, `from` and `against` next to its
-existing `ds`, `iri` and `tab`. Opening such a link restores the same handles and the same
-table.
-
-### Commit diffs on the graph
-
-**Show on graph** draws the changes between two commits as a graph of their own in
-Explore. It is on each commit in the dataset page's History panel, in the commit graph's
-details, on a write receipt and in the slider's compare caption. Added triples are solid
-with a `+` badge, removed ones are dashed ghosts with a `−` badge, and nothing else is
-drawn unless **context** adds up to 20 unchanged edges around each changed resource. `A`
-and `R` toggle the added and removed triples, `X` toggles context, `L` lists the changes
-as rows, the arrow keys move both commits by one while keeping the distance between them,
-and `Escape` leaves the diff. The address keeps the diff in `diff`, `diffFrom`,
-`diffBranch` and `group`.
-
-A diff with more than 500 changes draws its first 500 and offers **Group by class** (`G`).
-The grouped view draws a node for each class with its change, such as `Person +600`, and
-an edge for each predicate between classes, such as `worksFor +600`. Classes are read in
-the state where each change was seen, so a reader who cannot read a resource's type sees
-it under no class.
-
-**Play** on the diff graph runs a time-lapse. Each step asks for one commit's changes and
-applies them to what is drawn, so additions fade in and removals become ghosts that go at
-the next step unless **Keep ghosts** is on. A range of more than 500 commits steps through
-timeline buckets. A step with more changes than the canvas can hold switches the rest of
-the time-lapse to grouping by class and says so. The speeds are 1, 2, 5 and 10 steps a
-second, and at 5 and 10 the new nodes are placed next to a neighbour without a layout.
-The graph's history slider and the overview's have a **Play mode** menu. **Re-read** reads
-the view again at each commit as before, and **Time-lapse** applies each commit's diff to
-the drawn resources instead.
-
-The Explore overview has its own slider, opened with **Overview history** or `Shift+H`.
-Moving it reads the class level at that commit. Compare mode labels each class and
-predicate edge with its change from the grouped diff, and the time-lapse updates the counts
-in place with the layout held still. The slider reads classes only, so the overview does
-not offer it while **Group by** draws the GraphRAG communities, and switching to the
-communities closes it.
-
-At 390 px the diff graph's options fold into a sheet, the play controls stay in a bar at
-the bottom, and the change list opens as a second tab beside the graph.
-
-## Automatic compaction
-
-A server compacts each dataset in the background when its delta of updates grows large,
-and writes go on while it does. By default a dataset is compacted when its delta reaches
-10,000 quads plus 5% of its base index, or a million quads, or 512 MiB of memory, or when
-its write-ahead log passes 1 GiB. A delta of at least 10,000 quads is also compacted
-after 5 minutes without a commit, and any change is compacted within a day. The build
-runs on a quarter of the cores at a lower priority, and at most one automatic compaction
-runs on the server at a time. [API.md](API.md#automatic-compaction) describes when a due
-compaction waits and the status at `/$/compaction/{ds}`.
-
-| Flag | Default | Meaning |
-|---|---|---|
-| `--no-auto-compact` | | Turn automatic compaction off for every dataset. |
-| `--auto-compact-min-quads N` | `10000` | The floor. The quad-count and idle triggers need a delta at least this large. |
-| `--auto-compact-ratio R` | `0.05` | Compact when the delta reaches the floor plus this share of the base index's quads. |
-| `--auto-compact-max-quads N` | `1000000` | Compact at this delta size, whatever the base; `0` means no limit. |
-| `--auto-compact-max-delta-mb N` | `512` | Compact when the delta takes about this much memory; `0` means no limit. |
-| `--auto-compact-max-wal-mb N` | `1024` | Compact when the write-ahead log passes this size; `0` means no limit. |
-| `--auto-compact-idle S` | `300` | Compact a delta of at least the floor after this many seconds without a commit; `0` turns it off. |
-| `--auto-compact-max-age S` | `86400` | Compact when the oldest change not yet compacted is this old; `0` turns it off. |
-| `--auto-compact-min-interval S` | `60` | Seconds between the end of a compaction and the start of the next automatic one. |
-| `--auto-compact-threads N` | a quarter of the cores | Threads of an automatic compaction's build. On Linux they run at nice 10. |
-| `--auto-compact-io-mb N` | `0` | The average rate, in MiB per second, at which an automatic compaction may write its new index; `0` means no limit. |
-| `--auto-compact-max-running N` | `1` | Automatic compactions that may run on the server at once. |
-| `--auto-compact-partial MODE` | `auto` | Whether a compaction, automatic or not, may rewrite only the index blocks its delta touches: `auto`, `off` or `always`. |
-
-A dataset can override every setting but the threads, the rate and the running limit.
-The settings are stored in `compaction.json` in its directory:
-
-```sh
-sparkles compaction --loc db                                  # the policy, the delta and the verdict
-sparkles compaction --loc db --set deltaRatio=0.02 --set idleSeconds=60
-sparkles compaction --loc db --set enabled=false              # off for this dataset
-sparkles compaction --loc db --default                        # back to the server's settings
-sparkles compaction --server URL --dataset db --set maxAgeSeconds=0
-curl -X PUT 'localhost:3030/$/compaction/db' -H 'Content-Type: application/json' -d '{"deltaRatio": 0.02}'
-```
-
-A database that no server holds is never compacted on its own. `sparkles compact --loc db
---if-due` compacts it only when its policy says so, which suits a cron job.
-
-A compaction whose delta uses only terms the dataset already has rewrites only the index
-blocks that the delta touches and copies the others. Numbers, dates, booleans and blank
-nodes never add terms, and neither do links between existing resources. A delta that adds
-a term, such as a new IRI or string, rebuilds the whole index. The `partial` setting
-chooses: `auto` compacts partially when the delta adds no term and that is estimated to
-be quicker than a rebuild, `off` always rebuilds, and `always` compacts partially whenever
-the delta adds no term. `sparkles compact --partial off` rebuilds once, which also drops terms that no quad
-uses any more. The compaction's task message and `last` in its status say which it was.
-
-```sh
-sparkles compaction --loc db --set partial=off     # always rebuild this dataset's index
-sparkles compact --loc db --partial always         # one partial compaction, if no term was added
-```
-
-Each compaction makes the next incremental backup upload the whole new generation, and a
-retention window keeps the old generation until its commits age out. Raise the ratio or
-the minimum interval for datasets where that costs too much.
+With `--server URL --dataset ds` instead of `--loc`, `put`, `get`, `list`, `delete` and
+`run` act on a server, and `run` sends the `--source` files. On a server, uploads take
+mappings as a part or by name, and the Graph Store protocol takes CSV bodies
+([API](API.md#stored-mappings)).
 
 ## Formatting
 
@@ -2082,6 +1653,66 @@ fixes ([editors.md](editors.md)). The same file's `[prefixes]` and `[lsp]` table
 check them ([editors.md](editors.md#prefixes)). The UI's query editor lints while you type, and its
 Format menu fixes the safe findings. `POST /$/lint` is the HTTP form
 ([API.md](API.md#linting)).
+
+## Automatic compaction
+
+A server compacts each dataset in the background when its delta of updates grows large,
+and writes go on while it does. By default a dataset is compacted when its delta reaches
+10,000 quads plus 5% of its base index, or a million quads, or 512 MiB of memory, or when
+its write-ahead log passes 1 GiB. A delta of at least 10,000 quads is also compacted
+after 5 minutes without a commit, and any change is compacted within a day. The build
+runs on a quarter of the cores at a lower priority, and at most one automatic compaction
+runs on the server at a time. [API.md](API.md#automatic-compaction) describes when a due
+compaction waits and the status at `/$/compaction/{ds}`.
+
+| Flag | Default | Meaning |
+|---|---|---|
+| `--no-auto-compact` | | Turn automatic compaction off for every dataset. |
+| `--auto-compact-min-quads N` | `10000` | The floor. The quad-count and idle triggers need a delta at least this large. |
+| `--auto-compact-ratio R` | `0.05` | Compact when the delta reaches the floor plus this share of the base index's quads. |
+| `--auto-compact-max-quads N` | `1000000` | Compact at this delta size, whatever the base; `0` means no limit. |
+| `--auto-compact-max-delta-mb N` | `512` | Compact when the delta takes about this much memory; `0` means no limit. |
+| `--auto-compact-max-wal-mb N` | `1024` | Compact when the write-ahead log passes this size; `0` means no limit. |
+| `--auto-compact-idle S` | `300` | Compact a delta of at least the floor after this many seconds without a commit; `0` turns it off. |
+| `--auto-compact-max-age S` | `86400` | Compact when the oldest change not yet compacted is this old; `0` turns it off. |
+| `--auto-compact-min-interval S` | `60` | Seconds between the end of a compaction and the start of the next automatic one. |
+| `--auto-compact-threads N` | a quarter of the cores | Threads of an automatic compaction's build. On Linux they run at nice 10. |
+| `--auto-compact-io-mb N` | `0` | The average rate, in MiB per second, at which an automatic compaction may write its new index; `0` means no limit. |
+| `--auto-compact-max-running N` | `1` | Automatic compactions that may run on the server at once. |
+| `--auto-compact-partial MODE` | `auto` | Whether a compaction, automatic or not, may rewrite only the index blocks its delta touches: `auto`, `off` or `always`. |
+
+A dataset can override every setting but the threads, the rate and the running limit.
+The settings are stored in `compaction.json` in its directory:
+
+```sh
+sparkles compaction --loc db                                  # the policy, the delta and the verdict
+sparkles compaction --loc db --set deltaRatio=0.02 --set idleSeconds=60
+sparkles compaction --loc db --set enabled=false              # off for this dataset
+sparkles compaction --loc db --default                        # back to the server's settings
+sparkles compaction --server URL --dataset db --set maxAgeSeconds=0
+curl -X PUT 'localhost:3030/$/compaction/db' -H 'Content-Type: application/json' -d '{"deltaRatio": 0.02}'
+```
+
+A database that no server holds is never compacted on its own. `sparkles compact --loc db
+--if-due` compacts it only when its policy says so, which suits a cron job.
+
+A compaction whose delta uses only terms the dataset already has rewrites only the index
+blocks that the delta touches and copies the others. Numbers, dates, booleans and blank
+nodes never add terms, and neither do links between existing resources. A delta that adds
+a term, such as a new IRI or string, rebuilds the whole index. The `partial` setting
+chooses: `auto` compacts partially when the delta adds no term and that is estimated to
+be quicker than a rebuild, `off` always rebuilds, and `always` compacts partially whenever
+the delta adds no term. `sparkles compact --partial off` rebuilds once, which also drops terms that no quad
+uses any more. The compaction's task message and `last` in its status say which it was.
+
+```sh
+sparkles compaction --loc db --set partial=off     # always rebuild this dataset's index
+sparkles compact --loc db --partial always         # one partial compaction, if no term was added
+```
+
+Each compaction makes the next incremental backup upload the whole new generation, and a
+retention window keeps the old generation until its commits age out. Raise the ratio or
+the minimum interval for datasets where that costs too much.
 
 ## Backup repositories
 
@@ -2287,7 +1918,7 @@ are kept.
 
 The Rust TOML API keeps key references in `ConfiguredRepository`, which
 `RepoToml::configured` and `ConfigFile::configured_repositories` return.
-`RepoToml::to_config` and `ConfigFile::repository_configs` now return `Result` and
+`RepoToml::to_config` and `ConfigFile::repository_configs` return `Result` and
 refuse encrypted tables, so an encrypted repository cannot be turned into a plaintext
 one by accident. `repo list` and `repo show` print key references and the public
 metadata of key slots, never resolved keys or passphrases. Sparkles has no support for
@@ -2325,6 +1956,165 @@ The Rust registry methods `load` and `replace_config` still accept only plaintex
 repositories. A server integration that needs the trusted encryption references uses
 `load_configured` and `replace_configured`. API views and the registry the API persists
 leave those references out.
+
+## Checking a database
+
+`sparkles check --loc db` verifies a database directory without modifying it. It takes
+no lock, truncates no WAL, repairs no catalog and rebuilds no full-text index, so it can
+run next to a server that holds the database. `--data DIR` checks every database in a
+server's data directory. It leaves out directories whose names start with a dot, which
+hold unfinished clones and the copies that `sparkles migrate` builds or keeps. Each
+check prints one line, `ok`, `warning` or `error`, and lists the file, offset, block,
+row, commit or id of every problem below it. `--format json` prints the same report as
+JSON. The exit status is 0 when everything is clean, 1 when any check found an error,
+and 2 when there are warnings only.
+
+| Check | What it verifies |
+|---|---|
+| `layout` | `CURRENT` names an existing generation. `dataset.json`, the generation's `commit.json` (with the same dataset id) and `prefixes.json` parse. Leftovers of interrupted work are warnings: `*.tmp`, `text.new`/`text.old`, an old or unfinished `gen-NNNN`, or a set-aside catalog. |
+| `generation` | `meta.json` and `stats.json` parse and agree on the quad count, and this release reads the index format. |
+| `vocabulary` | The front-coded vocabulary decodes, its keys strictly increase, and its size matches `meta.json`. An FSST-coded vocabulary's tables in `vocab.fsst` read with their checksum, and in full mode every coded suffix uses only codes its table holds. Every vocabulary id in the permutations is below that size. Every entry of the sparse index `vocab.idx` names the offset and first key of its block. An index that does not read as one for this vocabulary is a warning, because the server ignores it. |
+| `delta-vocabulary` | The update vocabulary is well formed and holds no duplicate. The summary names its format, `framed` or `legacy`, and the zero bytes preallocated after its last chunk. A torn tail is a warning. |
+| `perm.spo` … `perm.gspo` | Block metadata is contiguous, sorted and fits the file, and the row count matches `meta.json`. Every block decodes to its row count, and its first and last keys match the metadata. Keys strictly increase within and across blocks, and every id is valid for its position. |
+| `permutations` | The 7 permutations hold the same number of rows and, compared by an order-independent hash, the same quads. |
+| `wal` | Records are well formed, and every commit record's checksum matches. A damaged final transaction is a warning, because open truncates it. So is a final transaction that names update-vocabulary terms the file lacks, which a crash during its commit can leave, and one with zero records before its commit record. Zero bytes after the last commit are preallocated space, reported in the summary. Commit numbers continue from the generation's base commit, and ids resolve. The summary names the log's version: 1 for a log that starts with a header record, 0 for one written before the header existed. A header with a version this release does not read is an error. |
+| `catalog` | `commits.bin` has valid record checksums, continuous records and the right dataset id, and agrees with the WAL. A lagging catalog, or damage that open can rebuild from the WAL, is a warning. Lost history before the generation is an error. |
+| `text` | `text.json` parses. The index opens read-only, and every committed segment file exists and matches its checksum. The index's commit is compared with the WAL. An index that is behind is a warning, because open catches it up or rebuilds it. |
+| `geo` | `geo.json` parses and is a valid configuration. The current generation's index files (`geo/rtree.spkg`, `geo/column.spkg`) have a valid header and footer, belong to this generation and configuration, and match their index checksums. In full mode, the data checksums are checked too. A damaged file is a warning, because open rebuilds it. |
+| `patterns` | `patterns.bin` has a valid layout, and in full mode its checksum matches and every subject's pattern, the subjects of each pattern and the predicate totals match SPO. A pattern file of a version this release does not read is a warning, because queries then read the permutations. A missing file that `meta.json` records is a warning too. |
+| `reasoning` | `reasoning.json` parses and names an existing commit. |
+
+Errors are states that `Store::open` refuses, that lose acknowledged data or history, or
+that queries would read wrongly. Warnings are states that open handles by itself. A
+server that writes during the check can cause transient warnings, because an in-flight
+transaction looks like a torn tail, but never errors.
+
+`--quick` reads metadata only. It reads block metadata instead of every block, the first
+key of each vocabulary block, and whether segment files exist instead of their
+checksums. On the 10.5M-quad benchmark database, a full check takes about 0.3 s and a
+quick one 20 ms (16 cores, warm page cache). The same check is a library call:
+`sparkles::check::check(root, &CheckOptions::default())` returns a serializable
+`CheckReport`.
+
+## Upgrading databases
+
+Every file Sparkles keeps records the version of its format, and a release reads the
+versions of the release before it. The registry of file kinds and versions is
+`crates/sparkles-core/src/formats.rs`. `GET /$/server` lists it in its `formats` member,
+and `sparkles migrate --check` prints it with each database's versions. Before 1.0, release
+0.N opens the databases and backups that 0.N and 0.(N-1) wrote. From 1.0, a release opens
+those of its own major version and of the last minor release before it.
+
+Most changes need no step. A release reads the older version, and it writes the new one
+the next time it writes the file or, for a generation's index, at the next compaction.
+A full-text, spatial or vector index in a version the release does not read is rebuilt
+in the background. When a format changes in a way the new release cannot read, the
+release ships an upgrade step and refuses the old files with a message that names
+`sparkles migrate`. A database outside the window is refused with the release that wrote
+it, which `writtenBy` in `dataset.json` records. Dump it with `sparkles dump` from that
+release and load the dump with `sparkles load`.
+
+```sh
+sparkles migrate --data /srv/sparkles --check            # every database of a stopped server
+sparkles migrate --data /srv/sparkles --dataset books    # upgrade one dataset
+sparkles migrate --loc db --keep-old                     # one database, keeping the old files
+sparkles migrate --loc db --check --format json
+```
+
+`sparkles migrate` works offline. With `--data` it takes the catalog lock, so it fails
+while a server holds the data directory, and it upgrades the persistent datasets that
+`config.json` registers, or those that `--dataset` names.
+
+`--check` plans without changing anything. It lists each database's `dataset.json`
+versions, the version of every generation's index, log and update vocabulary, whether
+the release opens the database, and the steps an upgrade would run. It does not finish
+or undo an earlier run, which it reports as `interrupted`. The exit status is 1 when a
+database is outside the window or has an interrupted run, which a server refuses until
+`sparkles migrate` runs without `--check`, and 0 otherwise. The JSON report gives both
+answers, `inWindow` for the formats and `opens` for whether this release opens the
+database now. A generation whose `meta.json` has no usable version is listed as refused,
+and the report goes on with the other generations and databases.
+
+The window covers the root of a database and every branch, and a newer settings file of
+a dataset or of one of its branches puts the database outside it. The informational files
+`origin.json` and `restore.json` are the exception, because a store ignores a newer one
+with a warning. Startup checks the dataset metadata and settings of every active and
+retained branch before it rewrites the root's metadata, and it reads the same branch
+directories as migration planning. Both leave out unpublished `.create-*` directories and
+`.deleting` tombstones, which planning leaves unchanged and which startup's branch
+recovery removes once these checks pass. An incompatible branch refuses its dataset
+before any cleanup, and the other datasets stay available.
+
+The command makes the database path absolute before it changes anything. If the path
+contains `..`, the command resolves the existing parent through the filesystem and keeps
+the final database name. This keeps a valid `db/../db` path usable during the swap and
+follows the physical meaning of symlink parents. If an interrupted run made such a path
+unresolvable, recover through the database's stable parent path. Paths without `..`
+still support a missing database and new nested directories.
+
+Without `--check`, the command copies each database that has steps to run into a
+sibling directory named `.migrate-<name>` and runs the steps on the copy. It then checks
+the copy as `sparkles check` does and swaps it in with two renames. The copy needs as much
+free space as the database. It keeps the mode and the owner of every file and directory,
+and a file that a step rewrites keeps those of the file it replaces. The command must
+therefore run as the user that owns the database or as root, and it refuses to start
+otherwise. It also refuses a database directory that its owner cannot write, and a
+database named through a symlink, which the swap would replace with a directory. Run it
+on the directory the link points to. The dataset id, the commit numbers, the commit catalog, the branches and the
+snapshots stay as they were. `--keep-old` keeps the database as it was in
+`.pre-migrate-<version>-<name>`, and without it that directory is removed. The command
+refuses to start while that directory exists, so it never deletes an earlier kept copy.
+A dataset delete does not remove a kept copy either. The command also refuses a database
+that holds a symlink or another entry that is not a regular file or directory, because
+the copy would leave it out. Replace the entry with the files it points to and run again.
+
+The command takes the lock file `.migrate.lock-<name>` next to the database, which a
+second `sparkles migrate` and a `--check` of the same database respect. It also takes
+the database's own lock, which a server or any other process that has the database open
+holds, so it fails with a locked error while a server runs on the database. The lock
+file stays in place after the command finishes. A server, or any other open of the
+database, refuses a database with a pending `.migrate-<name>` until `sparkles migrate`
+has run on it again, so a stopped run never leads to an empty database. After it checks
+for a pending migration, startup verifies that its locked file still belongs to the
+current database directory. If a migration replaced that directory while startup was
+taking its lock, the open refuses with a locked error and can be retried.
+
+Until the copy has passed its check and carries a durable mark that says so, any error
+removes the copy and leaves the database as it was. That covers a step that fails, a
+check that finds errors or fails to run, and a mark that cannot be written. If the
+command stops before the swap, the next run removes the copy, and the database is
+unchanged. If it stops between the two renames, the next run renames the checked copy
+into place. A copy without the mark of a passed check is never renamed into place, and
+the command reports it and leaves both directories alone.
+
+The mark is versioned and records the exact old sibling directory and whether to keep
+it. Recovery uses that recorded directory even when another release finishes the run, so
+it preserves unrelated kept copies. An unknown or damaged mark, or one with a known field
+given twice, refuses recovery without changing the copies. A bare legacy `keep-old` or
+`remove-old` mark also refuses automatic recovery, because it does not name the original
+old directory. In those cases inspect the sibling copies, then recover through a known
+original location or restore by hand.
+
+A backup restore refuses to replace a database while a migration is pending, including
+when the database directory is missing between the two renames. An offline restore also
+checks that its lock belongs to the current database directory before it publishes, and
+refuses a stale lock with `dataset-busy`, leaving both directories intact.
+
+The only step today rewrites a legacy update vocabulary (`delta.vocab`) in the framed
+format, which the first write to it would also do. A server opens such a database
+without the step.
+
+A server that finds a dataset in a version it does not read leaves that dataset closed,
+logs why, and serves the others. That covers an index or a log in a newer version, a
+`dataset.json` that needs a later reader, and a settings file such as `describe.json`,
+`rdfs.json` or `assistant.json` with a newer `format`, which a store checks at open before
+it writes any file. The dataset stays registered, and `GET /$/server` lists it under
+`refusedDatasets`. A caller sees the refused datasets it may read, and a server
+administrator sees all of them and alone gets the full reason, which names paths. The
+other callers get a fixed sentence. A refused dataset cannot be deleted or renamed through
+the API while it is closed. Stop the server and run `sparkles migrate`, or edit
+`config.json`. After `sparkles migrate`, or after the database is replaced, the next start
+opens it.
 
 ## Outbound requests (SERVICE and LOAD)
 
@@ -2446,6 +2236,233 @@ caller's entries apart. `cache+clear:` refreshes the entries a query reads, and
 `POST /$/cache/clear/{ds}` drops them all. `SERVICE <loop:> { … }` and
 `SERVICE <urn:x-arq:self> { … }` read the dataset itself without a request. The options
 and the request shapes are in [API.md](API.md#service-options-loop-bulk-and-cache).
+
+## Sending notifications
+
+The server can tell a person when something needs them. It sends a notification to a
+webhook or an ntfy topic when agent memory has waited for review too long, when a
+backup policy run fails, and when a model provider's daily token budget is used up.
+Notifications are off until the configuration turns them on.
+
+The configuration is the server-wide settings kind `notifications`. An operator declares
+it in the settings file under `server.notifications`, and a server administrator changes
+it at runtime unless the settings file locks a field, as for the model configuration.
+A channel never holds a credential. It names a secret, which comes from
+`--model-secret NAME=file:PATH` or from a value stored with `sparkles secrets set`.
+
+```json
+{
+  "server": {
+    "notifications": {
+      "enabled": true,
+      "baseUrl": "https://sparkles.example.org",
+      "channels": {
+        "phone": { "type": "ntfy", "topic": "sparkles-ops", "token": { "secret": "ntfy-token" } },
+        "ops": { "type": "webhook", "url": "https://hooks.example.org/sparkles", "signingSecret": { "secret": "hook-signing" } }
+      },
+      "routes": { "memory.review.pending": ["phone"], "backup.*": ["phone", "ops"], "*": ["ops"] }
+    },
+    "locked": ["notifications.channels.phone"]
+  }
+}
+```
+
+```sh
+sparkles serve --loc data/org --settings settings.json \
+  --model-secret ntfy-token=file:/run/secrets/ntfy-token \
+  --model-secret hook-signing=file:/run/secrets/hook-signing
+sparkles notify test phone
+sparkles notify status
+```
+
+`sparkles notify test CHANNEL` sends a test notification to one channel at once, even
+while notifications are off, and prints the HTTP status the channel answered or the
+error. `sparkles notify status` prints each channel with its last success and its last
+failure, the routes, and the conditions that were notified. The same configuration can
+be changed from the command line:
+
+```sh
+sparkles settings set --global notifications.enabled=true \
+  'notifications.routes.*=["ops"]'
+sparkles secrets set hook-signing < hook-signing.key
+```
+
+A webhook receives the notification as a JSON body. With `signingSecret`, the request
+carries the `webhook-id`, `webhook-timestamp` and `webhook-signature` headers of
+Standard Webhooks, and the libraries of that specification verify them. A webhook URL
+that holds a token, as many chat services' incoming webhooks do, goes into a secret
+with `"urlSecret": {"secret": NAME}` in place of `url`. An ntfy channel publishes to
+`https://ntfy.sh` unless `server` names another ntfy server. A topic on the public
+server can be read by anyone who guesses its name, so use an access token with a
+reserved topic, or a server of your own.
+
+Each dataset decides how long its memory review may wait. The event fires when the
+oldest open review branch, such as a scheduled consolidation's, is older than
+`notifyAfter`, and then at most once per `repeatEvery` until no review branch is open:
+
+```sh
+sparkles settings set org memory.review.notifyAfter=2d memory.review.repeatEvery=1d
+```
+
+A backup policy that fails notifies once, then at most once per the kind's
+`repeatEvery` (one day by default) until a run of the policy succeeds. A spent model
+budget notifies once per provider and day. Requests to the channels go through the
+outbound policy, so a channel on a private address needs `--outbound-allow-private`.
+A failed delivery is retried with backoff, five attempts by default.
+[API.md](API.md#notifications) lists every member, the events and their data, and the
+metrics.
+
+On NixOS the settings file comes from `services.sparkles.settings` and the secrets from
+`services.sparkles.models.secrets`, which also serves the model providers' keys:
+
+```nix
+services.sparkles = {
+  settings.server.notifications = {
+    enabled = true;
+    baseUrl = "https://sparkles.example.org";
+    channels.phone = { type = "ntfy"; topic = "sparkles-ops"; token.secret = "ntfy-token"; };
+    routes."*" = [ "phone" ];
+  };
+  settings.server.locked = [ "notifications.channels.phone" ];
+  settings.datasets.org.memory.review.notifyAfter = "2d";
+  models.secrets.ntfy-token.file = config.sops.secrets."ntfy-token".path;
+};
+```
+
+## Branches and merges
+
+A branch lets a change take several steps, or several people, before it reaches the data
+everyone reads. Every persistent or in-memory dataset has the branch `main`. A new
+persistent branch starts from a commit of another branch and shares that branch's index
+files until it compacts. An in-memory branch shares the unchanging base data of the
+branch it starts from and copies the vocabulary of terms added since. Its writes,
+indexes and validation state stay separate. Reads and writes choose a branch with `--branch` on the command line,
+`?branch=NAME` over HTTP, or the endpoint URL `/{ds}@{branch}/sparql`.
+[API.md](API.md#branches-and-merges) describes the routes, the merge rules and the
+conflict report.
+
+```sh
+sparkles branch create --loc db dev --note "schema migration"
+sparkles update --loc db --branch dev 'INSERT DATA { <urn:a> <urn:p> 1 }'
+sparkles query --loc db --branch dev 'SELECT * { ?s ?p ?o }'
+sparkles branch list --loc db
+sparkles merge --loc db dev                    # into main; exits 2 on conflicts
+```
+
+`branch list` prints one line per branch, with its head, the commit it started from,
+the commits it is ahead of and behind its upstream, and whether it still shares its
+upstream's index (`linked`):
+
+```
+branch  head  from     ahead  behind  storage           note
+main      61  -            -       -  gen-0004
+dev       57  main@42     15      19  linked (2.1 MiB)  schema migration
+```
+
+It reads the files when a server holds the database, and then shows heads and starting
+points without the ahead and behind counts. `branch create` takes `--from BRANCH` and
+`--at REF` to start elsewhere than `main`'s head, and `--protected` to refuse every write
+but merges. `branch protect NAME [--off]`, `branch show NAME`, `branch rename NAME NEW` and `branch
+delete NAME [--force] [--reparent]` complete the set. A rename keeps the branch's
+commits and storage, and the old name stops working. `--reparent` deletes a branch that
+other branches start from: they take its upstream, and its storage stays while their
+history needs it. These commands also work against a server with
+`--server URL --dataset NAME`.
+
+A persistent branch that still shares an index can move onto main's current index
+without changing its data, UUID or commit head:
+
+```sh
+sparkles branch relink --loc db dev
+sparkles branch relink --loc db dev --format json
+```
+
+Relinking works on a stopped database and takes its exclusive directory lock. The
+branch's own writes are kept as a sparse overlay on main's index, and older indexes stay
+on disk while readers or history need them. `main` and branches that already have their
+own index cannot be relinked. Progress goes to stderr, and Ctrl-C cancels the
+operation. Ordinary compaction still gives a branch an index of its own. On a running
+server, `POST /$/branches/{ds}/{name}/relink` does the same (see
+[API: Relinking](API.md#relinking)).
+
+`merge` prints the result, or the conflicts that stopped it:
+
+```
+merge dev (commit 57) into main (commit 61), base main@42
+CONFLICT  <http://ex.org/a> <http://ex.org/age>  (default graph)
+  base    30
+  ours    31   (main)
+  theirs  32   (dev)
+1 conflict, nothing merged. Resolve with --on-conflict or --resolve FILE.
+```
+
+A conflict is a cell, a subject and a predicate in a graph, that both sides changed in
+different ways. `--on-conflict ours`, `theirs` or `union` resolves every conflict one way,
+and `--resolve FILE.json` reads a JSON array of resolutions for single graphs, subjects or
+cells, such as `[{"graph": null, "subject": "<http://ex.org/a>", "predicate":
+"<http://ex.org/age>", "take": "objects", "objects": ["33"]}]`. `--expect-source N` and
+`--expect-target N` refuse the merge when either head moved since the report was read.
+`--exempt IRI`, once per predicate,
+keeps both sides' changes to that predicate instead of reporting a conflict, and `branch
+exempt --loc db IRI…` sets the dataset's own list of such predicates (`--clear` empties
+it). `--conflicts subject` treats a whole subject as one value, and `--conflicts quad` never
+reports a conflict. `--replay` makes a fast-forward
+that replays the source's commits one by one, each with its kind, message and author.
+`--squash` applies the changes as one commit that records no second
+parent, so the source stays ahead of the target and keeps its own history to itself.
+`--dry-run` shows what the merge would do. The exit status is 0 after
+a merge or when the target is already up to date, 2 when conflicts stopped the merge,
+and 1 on any other error.
+
+When two branches have merged into each other, they can have several best common
+ancestors. If those ancestors' changes combine without conflicts, the merge combines
+them into a virtual merge base. Otherwise, the merge needs an explicit base. A virtual
+base is reported as `null` and is not stored as a commit. `--replay` needs a real base.
+
+`sparkles revert N` undoes commit N of the `--branch` branch, `main` by default, with
+a new commit of kind `revert`. Later changes to the same cells conflict as in a merge,
+and `revert` takes the conflict options of `merge` and exits the same way:
+
+```sh
+sparkles revert --loc db 57                     # undo commit 57 on main
+sparkles revert --loc db --branch dev 61 --on-conflict theirs
+```
+
+`sparkles cherry-pick SOURCE N` applies the changes of commit N of branch SOURCE to the
+`--branch` branch, `main` by default, as one commit of kind `cherry-pick`. It records no
+second parent, so a later merge of SOURCE still brings its other commits:
+
+```sh
+sparkles cherry-pick --loc db dev 57             # commit 57 of dev, applied to main
+sparkles cherry-pick --loc db --branch qa dev 57
+```
+
+`--branch NAME` works with `query`, `update`, `load`, `dump`, `log`, `diff`, `snapshot`,
+`compact`, `stats`, `clone`, `patch`, `revert` and `cherry-pick`. With `--server`, these commands send the
+dataset's name in the path form, `ds@NAME`. The web UI has a branch menu next to the
+dataset's name, and its Branches panel creates, protects, deletes and merges branches.
+
+The panel's Merge button merges a branch without conflicts after a preview. When the
+merge has conflicts, the button opens the merge page,
+`/ui/datasets/NAME/merge?source=dev&target=main`. The page shows the merge base and the
+counts, and it lists the conflicts grouped by graph and subject, with the base, ours and
+theirs objects side by side. You choose a side for each row or for all the rows of a
+subject, or set a rule for every conflict without a choice. The page then lists the
+changes those choices make as signed N-Quads lines. The merge sends the heads the page
+showed, so a branch that moved in the meantime makes the page read both branches again
+instead of merging. When the target's write-time validation refuses the result, the page
+shows the guard's report and nothing is written.
+
+The History panel's Graph button draws the commits of every branch in time order, one
+lane per branch, as `git log --graph` does. Each branch's lane starts from the commit
+it was created from, and a merge commit links to the commit it merged. Long runs of
+commits on one branch fold into a segment that opens on a click. Clicking a commit shows
+its changes and a link that opens the query page at that commit.
+
+A branch costs almost nothing while it stays linked. Its memory then holds the upstream's
+delta at the starting commit, and its first compaction builds a full index, about what a
+clone costs. `--max-branches` (64) limits the branches of a dataset, and the dataset's
+storage quota covers every branch.
 
 ## Finding paths
 
@@ -2606,8 +2623,8 @@ a vector index.
 Weighted betweenness accepts only finite, strictly positive weights in the stored
 `f32` representation. A zero, negative or nonfinite weight refuses the whole call,
 including a SERVICE value that rounds to zero or infinity during conversion. A
-refused call returns no score rows. Unweighted betweenness still uses unit edges, SSSP
-still accepts zero weights, and PageRank retains its nonnegative weight domain.
+refused call returns no score rows. Unweighted betweenness uses unit edges, SSSP
+accepts zero weights, and PageRank keeps its nonnegative weight domain.
 [Roadmap item 79](ROADMAP.md) tracks nonnegative weighted betweenness semantics.
 
 Some finite positive graphs are also refused during computation. If a competitive
@@ -2858,164 +2875,635 @@ provider's endpoint and key, so an index need not repeat them. The fields are in
 [API.md](API.md#model-providers) and the design is in
 [F12](specs/F12-local-embeddings.md).
 
-## Checking a database
+## The Explore overview
 
-`sparkles check --loc db` verifies a database directory without modifying it. It takes
-no lock, truncates no WAL, repairs no catalog and rebuilds no full-text index, so it can
-run next to a server that holds the database. `--data DIR` checks every database in a
-server's data directory. It leaves out directories whose names start with a dot, which
-hold unfinished clones and the copies that `sparkles migrate` builds or keeps. Each
-check prints one line, `ok`, `warning` or `error`, and lists the file, offset, block,
-row, commit or id of every problem below it. `--format json` prints the same report as
-JSON. The exit status is 0 when everything is clean, 1 when any check found an error,
-and 2 when there are warnings only.
+Explore opens on a picture of the dataset when no resource is selected. Each class with
+instances is a node sized by its instance count, and each predicate between instances of
+two classes is an edge weighted by its triples. The picture comes from the class
+profiles of [API.md](API.md#class-profiles), and it is laid out with ForceAtlas2 in a web
+worker and drawn with WebGL, so it settles while the page stays responsive. The search
+box stays at the top: a resource found there, or an IRI pasted into it, opens the
+resource graph as before.
 
-| Check | What it verifies |
-|---|---|
-| `layout` | `CURRENT` names an existing generation. `dataset.json`, the generation's `commit.json` (with the same dataset id) and `prefixes.json` parse. Leftovers of interrupted work are warnings: `*.tmp`, `text.new`/`text.old`, an old or unfinished `gen-NNNN`, or a set-aside catalog. |
-| `generation` | `meta.json` and `stats.json` parse and agree on the quad count, and this release reads the index format. |
-| `vocabulary` | The front-coded vocabulary decodes, its keys strictly increase, and its size matches `meta.json`. An FSST-coded vocabulary's tables in `vocab.fsst` read with their checksum, and in full mode every coded suffix uses only codes its table holds. Every vocabulary id in the permutations is below that size. Every entry of the sparse index `vocab.idx` names the offset and first key of its block. An index that does not read as one for this vocabulary is a warning, because the server ignores it. |
-| `delta-vocabulary` | The update vocabulary is well formed and holds no duplicate. The summary names its format, `framed` or `legacy`, and the zero bytes preallocated after its last chunk. A torn tail is a warning. |
-| `perm.spo` … `perm.gspo` | Block metadata is contiguous, sorted and fits the file, and the row count matches `meta.json`. Every block decodes to its row count, and its first and last keys match the metadata. Keys strictly increase within and across blocks, and every id is valid for its position. |
-| `permutations` | The 7 permutations hold the same number of rows and, compared by an order-independent hash, the same quads. |
-| `wal` | Records are well formed, and every commit record's checksum matches. A damaged final transaction is a warning, because open truncates it. So is a final transaction that names update-vocabulary terms the file lacks, which a crash during its commit can leave, and one with zero records before its commit record. Zero bytes after the last commit are preallocated space, reported in the summary. Commit numbers continue from the generation's base commit, and ids resolve. The summary names the log's version: 1 for a log that starts with a header record, 0 for one written before the header existed. A header with a version this release does not read is an error. |
-| `catalog` | `commits.bin` has valid record checksums, continuous records and the right dataset id, and agrees with the WAL. A lagging catalog, or damage that open can rebuild from the WAL, is a warning. Lost history before the generation is an error. |
-| `text` | `text.json` parses. The index opens read-only, and every committed segment file exists and matches its checksum. The index's commit is compared with the WAL. An index that is behind is a warning, because open catches it up or rebuilds it. |
-| `geo` | `geo.json` parses and is a valid configuration. The current generation's index files (`geo/rtree.spkg`, `geo/column.spkg`) have a valid header and footer, belong to this generation and configuration, and match their index checksums. In full mode, the data checksums are checked too. A damaged file is a warning, because open rebuilds it. |
-| `patterns` | `patterns.bin` has a valid layout, and in full mode its checksum matches and every subject's pattern, the subjects of each pattern and the predicate totals match SPO. A pattern file of a version this release does not read is a warning, because queries then read the permutations. A missing file that `meta.json` records is a warning too. |
-| `reasoning` | `reasoning.json` parses and names an existing commit. |
+A click or a tap on a class opens it in place. A class of at most 5,000 instances opens
+into its members with their links. A larger class opens into the communities that a
+graph algorithm run wrote back ([Graph algorithms](#graph-algorithms)), when its
+instances have some, and otherwise into groups by the property whose values split the
+class best: one group per value, ranges of a number or of the years of a date, or the
+most frequent values and the rest. The line under the toolbar names the property, and
+**Group by** chooses another or lists the members. A group opens the same way, and a
+member opens in the resource view. Edges between a group and the rest of the picture
+carry the number of links they stand for.
 
-Errors are states that `Store::open` refuses, that lose acknowledged data or history, or
-that queries would read wrongly. Warnings are states that open handles by itself. A
-server that writes during the check can cause transient warnings, because an in-flight
-transaction looks like a torn tail, but never errors.
+The breadcrumb above the picture shows the open path, such as `Overview › Researcher ›
+30 – 39`. A crumb, or `Backspace`, closes the levels below it, and the other classes
+and groups stay where they were. Pinching or the mouse wheel zooms, and dragging pans.
+**List** (`L`) shows the drawn nodes as a table with their size, class and links, which
+is also how a screen reader reads the picture. With the picture focused, `Tab` moves
+through the largest nodes on screen, `Enter` opens one, the arrow keys pan, `+` and `−`
+zoom and `0` fits the picture.
 
-`--quick` reads metadata only. It reads block metadata instead of every block, the first
-key of each vocabulary block, and whether segment files exist instead of their
-checksums. On the 10.5M-quad benchmark database, a full check takes about 0.3 s and a
-quick one 20 ms (16 cores, warm page cache). The same check is a library call:
-`sparkles::check::check(root, &CheckOptions::default())` returns a serializable
-`CheckReport`.
+The counts are those the signed-in user may read: a user limited to some graphs or
+under protections of triples sees the classes, groups and members of their own view
+only. Opening a large group runs queries under the user's timeout and memory budget, and
+a group that needs more stays closed with the budget's message. Without WebGL the
+picture is drawn with the canvas renderer of the resource graph. **Built-in** shows or
+hides the classes of the RDF, RDFS, OWL and SHACL vocabularies, which are shown by
+default only when the dataset has no other classes.
 
-## Upgrading databases
+**Group by** also offers **GraphRAG communities**, which draws the dataset as the
+communities of a [GraphRAG build](#community-reports-graphrag) instead of its classes.
+Each node is a community sized by its member count and coloured by its report's status,
+and **Colour by** switches to one colour per community. **Level** picks the level to
+start from, 0 being the coarsest. Opening a community draws the communities below it,
+and a community of the finest level opens into its members. The breadcrumb reads
+`Communities › Engineering › The payments team`. Selecting or opening a community shows
+its report beside the picture, with the same summary, findings and review actions as
+the Communities tab. Choosing a finding rings the entities it is about, and when they lie
+inside a community that is drawn closed, **Draw the members** opens it. **Open report**
+goes to the report in the Communities tab, and that tab's **Show in Explore** comes back.
 
-Every file Sparkles keeps records the version of its format, and a release reads the
-versions of the release before it. The registry of file kinds and versions is
-`crates/sparkles-core/src/formats.rs`. `GET /$/server` lists it in its `formats` member,
-and `sparkles migrate --check` prints it with each database's versions. Before 1.0, release
-0.N opens the databases and backups that 0.N and 0.(N-1) wrote. From 1.0, a release opens
-those of its own major version and of the last minor release before it.
+The communities are those of main, so on another branch the overview says so and draws
+nothing. A user whose access does not cover the reports graph is told that the
+communities are not available to them and learns nothing else about them, and a dataset
+that has no build says that none were built. Both notices offer to go back to the
+classes. The same grouping is `by: {"reports": {}}` in
+[API.md](API.md#graph-overview) and in the bindings.
 
-Most changes need no step. A release reads the older version, and it writes the new one
-the next time it writes the file or, for a generation's index, at the next compaction.
-A full-text, spatial or vector index in a version the release does not read is rebuilt
-in the background. When a format changes in a way the new release cannot read, the
-release ships an upgrade step and refuses the old files with a message that names
-`sparkles migrate`. A database outside the window is refused with the release that wrote
-it, which `writtenBy` in `dataset.json` records. Dump it with `sparkles dump` from that
-release and load the dump with `sparkles load`.
+The query page's graph view uses the same WebGL view for results of more than 2,000
+nodes. **Max nodes** then offers 10,000, 50,000 and 100,000, and **Renderer** switches
+between the canvas and WebGL views.
 
-```sh
-sparkles migrate --data /srv/sparkles --check            # every database of a stopped server
-sparkles migrate --data /srv/sparkles --dataset books    # upgrade one dataset
-sparkles migrate --loc db --keep-old                     # one database, keeping the old files
-sparkles migrate --loc db --check --format json
-```
+## Arcs on the map
 
-`sparkles migrate` works offline. With `--data` it takes the catalog lock, so it fails
-while a server holds the data directory, and it upgrades the persistent datasets that
-`config.json` registers, or those that `--dataset` names.
+The maps draw relations as well as places. In Explore, the **Map** button beside **Graph**
+in the graph toolbar, or `Shift+M`, shows the drawn graph on a map. Each drawn entity that
+has a geometry becomes a marker at its point, or at the centre of its line or polygon. Each
+drawn edge between two located entities becomes an arc. An arc is a great circle, bowed a
+little to the left of its direction so that the arcs of both directions between two places
+stay apart, and it ends in an arrowhead at its target. An arc that crosses the antimeridian
+is cut there and drawn on both sides.
 
-`--check` plans without changing anything. It lists each database's `dataset.json`
-versions, the version of every generation's index, log and update vocabulary, whether
-the release opens the database, and the steps an upgrade would run. It does not finish
-or undo an earlier run, which it reports as `interrupted`. The exit status is 1 when a
-database is outside the window or has an interrupted run, which a server refuses until
-`sparkles migrate` runs without `--check`, and 0 otherwise. The JSON report gives both
-answers, `inWindow` for the formats and `opens` for whether this release opens the
-database now. A generation whose `meta.json` has no usable version is listed as refused,
-and the report goes on with the other generations and databases.
+The map finds the entities by querying for their geometries, 200 at a time with four
+requests in flight. The queries run in your own view, at the state the graph slider reads,
+so an entity whose geometry you may not read is not located. Entities without a geometry
+are listed under the map as not located, and their edges are not drawn. The map draws only
+the edges the graph already shows and asks for no relations of its own.
 
-The window covers the root of a database and every branch, and a newer settings file of
-a dataset or of one of its branches puts the database outside it. The informational files
-`origin.json` and `restore.json` are the exception, because a store ignores a newer one
-with a warning. Startup checks the dataset metadata and settings of every active and
-retained branch before it rewrites the root's metadata, and it reads the same branch
-directories as migration planning. Both leave out unpublished `.create-*` directories and
-`.deleting` tombstones, which planning leaves unchanged and which startup's branch
-recovery removes once these checks pass. An incompatible branch refuses its dataset
-before any cleanup, and the other datasets stay available.
+Arcs are coloured by predicate, with a checkbox and a legend entry for each, and **Width by**
+chooses between the count and one width. Markers closer than 20 px merge into one marker
+that shows how many places it holds, and the links between two places of one marker are
+counted on the marker instead of drawn. The arcs of one predicate and direction between the
+same two markers merge into one arc whose width and label give the count. Zooming in splits
+the markers and their arcs again. When you compare two states with the graph slider, added
+arcs are green and removed arcs are red and dashed, and their labels start with a plus or a
+minus sign.
 
-The command makes the database path absolute before it changes anything. If the path
-contains `..`, the command resolves the existing parent through the filesystem and keeps
-the final database name. This keeps a valid `db/../db` path usable during the swap and
-follows the physical meaning of symlink parents. If an interrupted run made such a path
-unresolvable, recover through the database's stable parent path. Paths without `..`
-still support a missing database and new nested directories.
+On the query page, a result with two columns of geometry literals, or with two columns of
+entities that have geometries, offers **Arcs** on its Map tab. Each row is an arc from the
+first column to the second, and **Label** chooses a third column to write on the arc. A
+result with two entity columns and no geometry column gets the Map tab when a lookup of its
+first 200 entities finds a geometry, and that lookup waits while the time slider is open.
+The lookups run on the result's branch and at the state the result was read at. When you
+compare two states, the entities that only removed rows use are looked up at the earlier one. Picking a row in the list beside the map highlights its arc.
 
-Without `--check`, the command copies each database that has steps to run into a
-sibling directory named `.migrate-<name>` and runs the steps on the copy. It then checks
-the copy as `sparkles check` does and swaps it in with two renames. The copy needs as much
-free space as the database. It keeps the mode and the owner of every file and directory,
-and a file that a step rewrites keeps those of the file it replaces. The command must
-therefore run as the user that owns the database or as root, and it refuses to start
-otherwise. It also refuses a database directory that its owner cannot write, and a
-database named through a symlink, which the swap would replace with a directory. Run it
-on the directory the link points to. The dataset id, the commit numbers, the commit catalog, the branches and the
-snapshots stay as they were. `--keep-old` keeps the database as it was in
-`.pre-migrate-<version>-<name>`, and without it that directory is removed. The command
-refuses to start while that directory exists, so it never deletes an earlier kept copy.
-A dataset delete does not remove a kept copy either. The command also refuses a database
-that holds a symlink or another entry that is not a regular file or directory, because
-the copy would leave it out. Replace the entry with the files it points to and run again.
+A click on a marker or an arc selects the entities it stands for, and the selection bar
+names the count and the source, with **Clear**, **Use in query** and, in Explore, **Open
+as graph**, which draws the selected entities as the graph. The selection dims everything
+else on the map, and the graph canvas dims the nodes outside it too, in Explore and on the
+query page, where the selection lasts across the result's views until the next run.
+`Escape` clears it. With the map
+focused, `Tab` moves through the markers in view, the largest first, `Enter` selects one,
+and `Shift+Enter` adds it to the selection. **List of places and links in view** below the
+map lists the same markers and arcs with their counts, for a screen reader and for taps. At
+a phone's width the controls grow to 44 px and the map takes the page's width.
 
-The command takes the lock file `.migrate.lock-<name>` next to the database, which a
-second `sparkles migrate` and a `--check` of the same database respect. It also takes
-the database's own lock, which a server or any other process that has the database open
-holds, so it fails with a locked error while a server runs on the database. The lock
-file stays in place after the command finishes. A server, or any other open of the
-database, refuses a database with a pending `.migrate-<name>` until `sparkles migrate`
-has run on it again, so a stopped run never leads to an empty database. After it checks
-for a pending migration, startup verifies that its locked file still belongs to the
-current database directory. If a migration replaced that directory while startup was
-taking its lock, the open refuses with a locked error and can be retried.
+A map draws at most 20,000 places and 20,000 links before merging, and says when a result
+had more. [U11](specs/U11-linked-views.md#outcome) records the measurements.
 
-Until the copy has passed its check and carries a durable mark that says so, any error
-removes the copy and leaves the database as it was. That covers a step that fails, a
-check that finds errors or fails to run, and a mark that cannot be written. If the
-command stops before the swap, the next run removes the copy, and the database is
-unchanged. If it stops between the two renames, the next run renames the checked copy
-into place. A copy without the mark of a passed check is never renamed into place, and
-the command reports it and leaves both directories alone.
+## Facets and Use in query
 
-The mark is versioned and records the exact old sibling directory and whether to keep
-it. Recovery uses that recorded directory even when another release finishes the run, so
-it preserves unrelated kept copies. An unknown or damaged mark, or one with a known field
-given twice, refuses recovery without changing the copies. A bare legacy `keep-old` or
-`remove-old` mark also refuses automatic recovery, because it does not name the original
-old directory. In those cases inspect the sibling copies, then recover through a known
-original location or restore by hand.
+**Facets** beside the graph show how the values of the entities' properties are spread, and
+brushing a facet narrows the graph to the entities in the brush. In Explore, the **Facets**
+button in the graph toolbar, or `Shift+F`, opens the panel beside the properties panel. It
+counts the instances of the selected entity's class, or the drawn entities when that
+entity has no single class, and **Count** switches between the two when both apply. The
+counts come from the server for every entity of the set, not only the drawn ones.
 
-A backup restore refuses to replace a database while a migration is pending, including
-when the database directory is missing between the two renames. An offline restore also
-checks that its lock belongs to the current database directory before it publishes, and
-refuses a stale lock with `dataset-busy`, leaving both directories intact.
+The panel opens with the three properties that the most entities of the set have, and
+**+ facet** adds others, up to six. A property whose values are numbers or dates becomes a
+histogram of up to 40 bins of round width, with dates counted by year. Any other property
+becomes a list of its 12 most frequent values, with how many entities have other values or
+none. Dragging across a histogram brushes a range, and so does moving one of the two
+handles under it. A click on a value of a list adds it to the brush or takes it out. Every
+other facet then counts only the entities in the brush, while the brushed facet keeps its
+own counts, so you can see what a wider brush would add. Faint bars behind a histogram show
+its counts before any other facet was brushed. The line at the bottom says how many of the
+set every brush keeps, and the drawn entities outside the brushes are dimmed through the
+selection, which then reads "selected by the facets". **Apply to query** opens a new query
+for the set with a triple and a `FILTER` per brush.
 
-The only step today rewrites a legacy update vocabulary (`delta.vocab`) in the framed
-format, which the first write to it would also do. A server opens such a database
-without the step.
+On the query page, a `SELECT` result has a **Facets** tab. It counts the values of a
+variable of the query in every solution, not only the rows on screen, and **Count the
+values of** chooses the variable. **Apply to query** adds to the editor's query, for each
+brush, a triple that binds the property to a new variable and a `FILTER` over it, such as
+`?person ex:age ?age .` and `FILTER(?age >= 30 && ?age < 45)`, and leaves the rest of the
+text as it was. The filter is the one the server applied, so the query's distinct count of
+the variable equals the panel's count. `Mod+Z` undoes the edit. A query with `LIMIT`,
+`OFFSET`, `GROUP BY` or `HAVING` would count other entities once the filters sit inside its
+`WHERE` group, so **Apply to query** refuses it and says why. The result entities that the
+brushes keep become the selection, so the **Graph** and **Map** tabs dim the others.
 
-A server that finds a dataset in a version it does not read leaves that dataset closed,
-logs why, and serves the others. That covers an index or a log in a newer version, a
-`dataset.json` that needs a later reader, and a settings file such as `describe.json`,
-`rdfs.json` or `assistant.json` with a newer `format`, which a store checks at open before
-it writes any file. The dataset stays registered, and `GET /$/server` lists it under
-`refusedDatasets`. A caller sees the refused datasets it may read, and a server
-administrator sees all of them and alone gets the full reason, which names paths. The
-other callers get a fixed sentence. A refused dataset cannot be deleted or renamed through
-the API while it is closed. Stop the server and run `sparkles migrate`, or edit
-`config.json`. After `sparkles migrate`, or after the database is replaced, the next start
-opens it.
+With a histogram focused, the arrow keys move a cursor over the bins, `Shift` with an arrow
+brushes from where the cursor was, `Enter` brushes the bin under the cursor, and `Escape`
+clears the brush. The handles are sliders that the arrow keys move by a bin, and they read
+out the brush and its count. **Table** lists the bins with their counts, and `Space` toggles
+the focused value of a list. At a phone's width the facets sit below the graph, and the
+values and handles are 44 px targets.
+
+**Use in query** in the selection bar writes the selected entities into the query as a
+`VALUES` block at the start of the `WHERE` group. On the query page it edits the query in the
+editor and binds the variable chosen beside the button, which starts as the result column
+that holds the most selected entities. In Explore it opens a new query with the selected
+entities and their labels. A block holds at most 1,000 entities, the first ones selected,
+and a note says how many were left out.
+
+## The embedding map
+
+The embedding map draws the entities of a vector index as points on a plane, so that
+entities with alike vectors sit close together. **Embedding map** on an index's card on the
+dataset page, in Explore's graph toolbar and on the Similar page opens it at
+`/ui/embedding?ds=…&index=…`. The server computes the projection the first time the map is
+opened and keeps it in memory, so later visits draw at once.
+
+**Layout** chooses how the points are placed. **PCA** projects every vector onto the two
+directions along which the index's vectors vary most, and the line above the map says how
+much of the variance those two directions explain. It runs in the request for an index of up
+to a million vectors. **Neighbours** starts from the PCA positions and lays out the index's
+own neighbour graph with a force layout, which pulls alike entities together and separates
+clusters better. It runs as a task, and the map shows a progress bar with **Cancel** while
+the last projection stays dimmed beneath it. An entity with several vectors sits at the mean
+of their positions.
+
+**Colour by** colours the points by their class, which is the first `rdf:type` of each
+entity, or by the first value of a predicate you type, such as a community predicate that a
+graph algorithm wrote back. Numbers with more than eight distinct values are coloured in up
+to five ranges of equal count. The legend names the eight largest categories with their
+counts and puts the rest under "other".
+
+A plain drag pans and the wheel zooms, and **Fit**, **+** and **−** do the same from
+buttons. **Lasso** (`L`) and **Box** (`B`) make a drag draw a shape instead, and the points
+inside it become the shared selection. `Shift` adds to the selection and `Alt` takes the
+shape's points out of it. Hovering a point shows its label, its class and its five nearest
+neighbours in the index, and a click opens it in Explore. **Use in query** in the selection
+bar opens a new query with the selected entities in a `VALUES` block and their labels. A
+block holds at most 1,000 entities, the ones nearest the selection's centre, and a note says
+how many were left out. **Open as graph** draws the selection in Explore. **List** shows the
+points in view as a table, with a checkbox per row that selects the entity.
+
+An index of more than 50,000 entities is drawn as a density shading of every entity with a
+sample of 50,000 on top. Zooming into a region fetches that region's entities, again at most
+50,000, and a lasso in a sampled view selects every entity inside it, not only the drawn
+ones. When the data changes after the projection was built, the line above the map shows
+**Stale** and **Recompute** builds a new one. The map always shows the head of the dataset,
+because vector indexes answer only at the head. A caller whose access covers only part of
+the dataset gets no map, since the projection places entities whose triples that caller
+cannot read. At a phone's width the pointer modes give way to a **Lasso** toggle, so that a
+plain drag still pans.
+
+## The Pattern pane
+
+The query page can draw the graph pattern of the query in the editor. **Pattern** in the
+editor's toolbar, or `Alt+P`, opens a pane beside the editor, and the divider between
+them can be dragged. Each variable is a round node, each IRI a rectangle with its
+prefixed name, and each literal a small rounded box. A triple pattern is an edge labelled
+with its predicate, a variable predicate is dashed, and a simple path such as
+`ex:partOf+` labels its edge with the path. `?x a ex:Person` puts the class under the
+node instead of drawing an edge. A filter over one variable and constants, such as
+`STRSTARTS(?name, "A")`, is a chip on its variable, and an `OPTIONAL` group is a dashed
+hull around the nodes only it binds. The strip under the drawing lists the projection,
+`DISTINCT`, `LIMIT`, `OFFSET` and the other solution modifiers.
+
+The pane draws any query that parses, but it edits only a part of SPARQL: triple
+patterns, filters and one level of `OPTIONAL`. Everything else, such as `BIND`, `MINUS`,
+`UNION`, `GRAPH`, subqueries, `SERVICE` and `VALUES`, is a locked block. A locked block
+shows its kind and its text, comments included, and dotted lines join it to the
+variables it shares. The editor edits locked blocks, and edits made in the pane never
+change their text.
+
+The pane builds and edits queries. **+ Node** (`N`) asks for a variable, an IRI or a
+class, and the picker lists the dataset's classes with their instance counts. The new
+node waits on the canvas, dimmed and dashed, because SPARQL has no free variables, and
+nothing is written until an edge uses it. A class becomes a variable named after it, such
+as `?person` for `ex:Person`, and the edge that first uses it writes `?person a
+ex:Person` too. With an empty editor the pane offers **+ Node** and the five classes with
+the most instances, and the first edge writes the whole query.
+
+**+ Edge** (`E`, or **Edge from here** in a node's panel) writes a triple pattern from a
+source, a predicate and a target. The predicate picker lists first the predicates that
+instances of the source's class use, then those whose values are instances of the
+target's class, each with its count, then the rest. Typing narrows the list, and a full
+IRI or a prefixed name that the list lacks is accepted as it is. The triple goes into the
+group that holds the source's patterns, after the last part of it the pane edits, and
+also after any locked block that follows and uses a variable the new triple binds. A
+prefixed name whose prefix the query does not declare, but the dataset does, adds its
+`PREFIX` line, and one that neither declares is refused. When the schema cannot be read,
+the pickers say why and take typed names only. The schema and the counts are read at the
+query page's branch and **At** state, under the reader's own view, so a predicate the
+reader cannot see is not listed.
+
+An edge's panel changes its predicate, offers the paths `p+`, `p*`, `p?` and `^p`, and
+takes a typed sequence or alternative such as `ex:a/ex:b`. **Optional** moves the triple
+into `OPTIONAL { … }` or back out of it, and **Delete** removes it from its statement. A
+variable's panel adds a filter (`F`) from a form chosen by the datatypes its values were
+seen with, with ranges for numbers and dates, `CONTAINS`, `STRSTARTS`, `STRENDS` and
+`REGEX` for strings, `LANGMATCHES` for language-tagged strings, and `BOUND`, `isIRI` and
+`isLiteral`. The filter goes after the last triple that binds the variable, and its chip
+opens the same form again to change or delete it. The panel also renames the variable
+everywhere the pane edits. When a locked block uses the variable, the pane shows the
+block and asks whether to rename it there too. **Delete** on a node removes every triple
+that touches it, with the chips left without a bound variable. A locked block is
+deleted only after a confirmation that shows its text. A locked block that uses a
+variable nothing binds any more, for example after its triple was deleted, gets a red
+border and the note "uses ?y, which nothing binds now".
+
+The strip under the drawing has a checkbox per variable, and the first change turns
+`SELECT *` into the list of variables. It also sets `DISTINCT`, `LIMIT` and `OFFSET`.
+**Count matches** runs `SELECT (COUNT(*) AS ?n)` over the pattern with a five-second
+timeout and shows the count, or "More than the count could finish" when the time runs
+out.
+
+Each edit changes only the text it must, as one change to the editor, so `Ctrl+Z` (`⌘Z`
+on a Mac) in the editor or anywhere in the pane undoes it in one step, the same as typing.
+The pane makes an edit only when the server would accept the result and the result holds
+exactly the change asked for.
+
+The pane redraws 150 ms after typing stops. Text that does not parse leaves the last
+drawing on screen, dimmed, with the line and column of the error, and the pane makes no
+edits until the text parses again. A node keeps its place while the text around it
+changes, a new node appears next to the nodes it connects to, and a variable renamed in
+the editor keeps its position. **Tidy** lays the whole pattern out again. The browser
+keeps the positions of each query, at most 200 queries, so a query opened again from the
+history or as a stored query draws the same picture.
+
+**List** shows the same elements as rows in the order of the text, which is also how a
+screen reader reads the pattern. With the canvas focused, `Tab` and `Shift+Tab` move
+through the elements in text order, the arrow keys move to the nearest element in that
+direction, `Shift` with an arrow moves the focused node by 16 pixels, `Enter` opens the
+element's panel, `Delete` removes the focused element, `O` toggles optional on an edge,
+`N`, `E` and `F` add a node, an edge from the focused node and a filter on the focused
+variable, and `Escape` closes a form or panel, then returns to the editor. A polite live
+region announces each edit.
+
+A result has a **Pattern** tab that draws the query that produced it, read-only, and
+**Edit** puts that query in the editor with the pane open. On a phone the editor and the
+pane are two tabs, **Text** and **Pattern**, over the same query, and every control
+keeps a 44-pixel touch target. The strip folds into a **Query options** sheet, and
+**+ Edge** takes two taps, on the source and on the target or **New node**, then opens
+the predicate picker on the whole screen. The pane needs the formatter's WebAssembly module (see
+[ui/README.md](../ui/README.md#formatting-in-the-browser)). Without it the pane says so
+and draws nothing.
+
+### The plan on the pattern
+
+**Plan on pattern** draws the plan of the query that ran on its pattern. The switch is in
+the toolbar of the Plan tab and in the header of the Pattern tab and the Pattern pane, and
+it is one setting for all three, kept per viewer. With it on, each edge carries the
+estimated and actual rows of the operator that reads its triple pattern, such as
+`est 214 · rows 214`, and grows wider with the logarithm of its rows. An edge whose actual
+rows are over ten times its estimate, or under a tenth of it, turns orange and shows `⚠`
+with the ratio, such as `×1,338` or `÷40`, which is the rule the plan tree uses for its red
+counts. A class under a node shows the numbers of its `?x a C` pattern, and a filter chip
+shows how many rows reached the filter and how many passed it. Each join is a numbered
+badge on the variable it joins on, numbered in the order the plan runs the joins, with its
+operator and rows. A locked block shows the numbers of the operator that evaluates it when
+it is the only block of its kind and the plan has one such operator.
+
+**Rows** and **Time** in the bar above the drawing switch between rows and each
+operator's own time, and in time the operator with the largest share is marked `●`. On
+the Pattern tab the plan tree sits beside the drawing. Clicking an edge, a badge or a chip
+selects its operator in the tree, and selecting an operator in the tree lights the edges
+and nodes it reads while the rest fade. Hovering a join badge, or focusing it, lights the
+edges below that join. The panel of a selected element names its operator with its
+numbers. Patterns of the plan that match nothing on the drawing, such as those inside a
+locked block or those the planner rewrote, are listed under **N operators not drawn**, so
+nothing in the plan is hidden. A star join that reads several triples shows its numbers on
+each of their edges and says it is shared.
+
+The numbers come from the plan the page already has, with no further request. An
+**Explain** shows estimates only. The bar names the commit and branch the plan was read
+at. A reader whose view a graph grant limits gets no estimates in plans, so the edges show
+actual rows only and no `⚠`. The Pattern pane beside the editor draws the plan only while
+its text is the text that ran, and says so when the text has changed since, while the
+result's Pattern tab always draws the text that ran. With the canvas focused, `J` moves
+through the join badges in plan order and `T` switches between rows and time, and the
+screen reader hears each element's numbers after its description. On a phone the tree is
+the Plan tab, and a tap on an edge opens a sheet whose **Show in plan** switches to the
+tree with the operator selected. Labels shorten there to `214 / 1.2M ⚠`.
+
+## Lenses on the graph
+
+A lens changes how the graph draws its nodes and edges from data about them. The resource
+graph in Explore and the query page's graph view have a **Lenses** menu in their toolbar
+(shortcut `Shift+L`) with one row per channel, and each channel has at most one lens on at
+a time.
+
+* **Size** draws a node's area in five steps of the drawn values, so that one outlier does
+  not flatten the rest. It offers the degree in the drawn graph, the degree in the dataset
+  and a numeric property of the drawn nodes. A node without a value keeps the smallest
+  size, and the legend counts it as "no value".
+* **Colour** gives twelve colours to the categories with the most nodes and "other" to the
+  rest. It offers the node's class, the named graph it is used in and a property's values.
+  The class lens reads the asserted classes, since with reasoning every node would also
+  be in each superclass. A node with several values takes the one most drawn nodes share.
+* **Badges** puts a pill with an `i` and a count in the corner of each node that has
+  inferred edges. In Explore it also offers **validation results**, the
+  [validation overlay](#the-validation-overlay).
+* **Edges** draws the edges that the reasoner added dashed, with an `i` before their
+  label. An edge counts as inferred when the graph shows it and a read without reasoning
+  does not, which covers materialized inferences and RDFS on read alike. A triple that is
+  both asserted and inferred stays solid. While the lens is on, `rdf:type` edges are no
+  longer dashed, so that a dash means one thing.
+
+The edge lens is on by default when the dataset has materialized inferences or RDFS on
+read, and the badge and edge lenses are absent when it has neither. `Shift+1` to `Shift+4`
+turn the size, colour, badge and edge lens off and on again.
+
+The legend in the canvas's corner lists each encoding in words, such as "size is degree
+in the dataset, larger is higher" and "colour 3 is ex:Employee", with the number of nodes
+of each entry. Clicking an entry, or `Enter` on it, rings its nodes and fades the rest,
+and a second click clears them. **List** shows the drawn nodes as a table with a column
+per active lens, ordered by the size lens's value when one is on, and a screen reader
+hears each lens's result in a polite announcement. On a phone the menu is a bottom sheet
+and the legend a strip along the top of the graph that opens on a tap.
+
+The lenses read the drawn nodes with one query per 200 terms and at most four queries in
+flight, at the state the graph shows, so they follow the time slider. They read under the
+signed-in user's view, and a grown graph reads only its new nodes. Nothing they compute is
+saved. Lenses apply to at most 20,000 drawn nodes. On the query page, the edges of a
+`CONSTRUCT` result are also read with reasoning, so that a constructed triple that is not
+in the data is not taken for an inferred one.
+
+In compare mode on the time slider, a size lens whose values come from the dataset shows
+each node's value at the right handle and its change since the left handle in the tooltip
+and the list.
+
+### Algorithm lenses
+
+The size channel also offers PageRank, betweenness, BFS depth from a node, k-core and
+triangles, and the colour channel WCC components, label propagation, Louvain and Leiden
+communities. These lenses run the [graph algorithms](#graph-algorithms) without writing
+anything back.
+
+![Explore with nodes sized by PageRank and coloured by Leiden communities](images/explore-algo-lenses.png)
+
+Each algorithm lens has a **scope**.
+
+* **drawn graph** runs over the drawn nodes and the edges among them, as one
+  `SERVICE algo:` query. It is the default, takes at most 1,500 drawn nodes, and runs
+  again once the graph has been still for a second.
+* **projection** runs over the whole dataset, on the drawn edges' predicates, one of them,
+  or a stored projection, and the drawn nodes show their values in that larger graph. The
+  run goes on in the background with a progress bar and **Cancel**, and the server keeps
+  its result, so changing the drawing reads the kept result instead of running again.
+
+The menu also shows the parameters a person would change, such as damping and iterations
+for PageRank or resolution and seed for Leiden, and a changed value runs the lens again.
+Louvain and Leiden show their last level unless another is picked, and BFS asks for the
+node to start from. The lens's row shows the run's summary, such as the iterations and
+whether PageRank converged, or the modularity of the communities.
+
+Community colours stay with their communities. When a new run, such as Leiden with another
+seed, finds a community that holds half or more of an earlier community's members, it keeps
+that community's colour. The legend gives each community's size, such as "community 12, 41
+drawn of 3,980" for a projection run.
+
+When the dataset has [GraphRAG reports](API.md#graphrag) that you may read, the colour
+channel offers **GraphRAG community**, with a level picker, and each legend entry links to
+the community's report in the Communities tab. The lens is absent on a branch and at a past
+state, and the menu says why.
+
+A projection run waits while the time slider plays, with the note "paused while playing",
+and runs when play stops. Above 20,000 drawn nodes only a size lens with projection scope
+runs, and it shows the top 1,000 drawn nodes by value, with the rest at the smallest size.
+A server older than the view-only runs leaves projection scope disabled with the reason,
+and drawn-graph scope still works.
+
+## The validation overlay
+
+Explore can badge the SHACL and ShEx results of the nodes it draws. When the dataset has a
+write-time guard ([Write-time validation](API.md#write-time-validation)), the overlay is on
+by default. It is the **validation results** lens of the badge channel in the **Lenses**
+menu ([Lenses on the graph](#lenses-on-the-graph)), which turns it on or off, and the
+choice is remembered in the browser. `Shift+3` turns it on again after it was turned off.
+When the caller's grants cover only some graphs of the dataset, the menu does not offer
+the lens and says that validation needs access to every graph. The overlay validates only the drawn nodes, in requests of up
+to 500 nodes with one in flight, so its cost follows the picture and not the dataset. It
+validates the first 1,500 drawn nodes.
+
+While the lens is on, the **Shapes** picker under the menu's channels chooses where the
+shapes come from. The write-time guard is the
+default, and a ShEx guard validates with its own schema and shape map. A shapes graph of
+the dataset can be named by its IRI. The shapes the Validate panel of the dataset page
+last validated with can be used too, and without a guard they are the default. A node
+with results gets a badge with its count and its worst severity, `✕` for a violation,
+`⚠` for a warning and `ⓘ` for an info. A literal drawn as the value of a result gets the
+same mark. The overlay validates every node the canvas draws, including the nodes the
+path finder adds. The legend groups the nodes by their worst severity, and a click on an
+entry selects its nodes. The canvas's **List** view has a **validation results** column,
+such as "✕ 1 violation".
+
+A click on a badge opens the node's results, grouped by shape and constraint, with the
+path, the value and the messages. `V` opens the results of the selected node, and
+`Shift+V` selects the next node with results. **Show triples** draws the focus node, the
+edge of the result's path and the value, and marks them. At 390 px the results open as a
+sheet at the bottom of the screen.
+
+**Suggest fix** writes a SPARQL Update for the common constraints: `sh:minCount`,
+`sh:maxCount`, `sh:datatype`, `sh:class`, `sh:in`, `sh:hasValue` and `sh:closed`, and the
+ShEx cardinality, datatype, value set and closed failures. The update holds the result's
+terms, and what the result does not say is a placeholder such as `?value`, which must be
+filled in before **Preview** runs. When the guard's data graph is one named graph, the
+update writes that graph. When it is several graphs, or the default graph of a server
+started with `--union-default-graph`, the update holds `GRAPH ?graph` for the graph that
+holds the triple. A shapes graph or the Validate panel's shapes validate the default
+graph, so on such a server their updates hold `GRAPH ?graph` too. Preview is a dry run of the update
+([C15](specs/C15-write-previews.md)). It lists the changes and says whether the guard
+would still report the result, or that the guard's answer does not tell, as when it
+validated only some of the shapes and the state still has results it did not list. **Run** commits the update only after a preview of the same
+text, and the overlay then validates the drawn nodes again, so a fixed badge goes away.
+**Open in Query** takes the update to the query editor instead. Constraints that are not
+on one predicate, `sh:pattern`, `sh:sparql`, `sh:node` and qualified shapes get no
+suggestion.
+
+With the graph's **History** open, the overlay validates the state the slider shows, and it
+pauses while the history plays. It validates the drawn nodes as focus nodes, so a
+SHACL-SPARQL constraint that is not anchored at its focus node can give other results in a
+full validation, and the overlay says so when such a result appears. A caller whose
+grants cover only some graphs of the dataset cannot validate it, and the overlay shows
+"Validation needs access to every graph". A validation over the server's result budget
+shows the error and no badges.
+
+## Editing forms
+
+A dataset's SHACL shapes double as editing forms
+([U02](specs/U02-shape-driven-forms.md)). When a node shape targets the resource selected
+in Explore and the caller may save, the side panel shows **Edit**, which turns the
+properties into a form. `/ui/datasets/{name}/edit?iri=…&branch=…` opens the same form on
+a page of its own, for links from other tools. The shapes come from the dataset's
+write-time SHACL guard by default ([Write-time validation](API.md#write-time-validation)),
+and the dataset's `forms` setting can name shapes graphs instead or draft shapes from the
+data. Forms from drafted shapes say that the shapes are not enforced.
+
+The form merges the property shapes of every node shape that applies, groups the fields by
+`sh:group`, orders them by `sh:order` and labels them by `sh:name`, with `sh:description`
+as help. A required field says so in words. Each field's input follows its constraints:
+radio buttons or a select for `sh:in`, a checkbox or a three-way select for booleans, date
+inputs, number inputs with the type's step and the shape's bounds, a text input with a
+language for `rdf:langString`, a text area for long strings, an entity picker for
+`sh:class` and IRIs, and a term input for a field without constraints. A known
+`dash:editor` such as `dash:TextAreaEditor` replaces the choice, and a known `dash:viewer`
+such as `dash:LabelViewer` or `dash:URIViewer` chooses how a read-only value is shown. The
+entity picker searches the instances of the field's `sh:class` by label, through the
+full-text index when the dataset has one. Triples of the resource that no shape describes
+are listed under **Other properties**, read-only. A field the caller's grants hide is
+absent, and one marked `dash:readOnly`, protected from the caller's writes or with a
+complex path is read-only with the reason beside it. A value stored in a graph the caller
+cannot write is shown read-only inside an editable field. Date-time values keep their
+timezone when edited, and a new `xsd:dateTimeStamp` takes the browser's offset.
+
+A class that a node shape targets gets **New instance** in the schema tab, which opens an
+empty form at `/ui/datasets/{name}/edit?class=…`. The first save mints the resource's IRI
+from the `forms` setting's `newIri`, a `urn:uuid:` IRI by default, writes its `rdf:type`
+with the values, and opens the form of the new resource.
+
+The browser checks values as they are typed: XSD lexical forms, patterns with their flags,
+lengths, numeric and date ranges, allowed values, counts, `sh:languageIn` and
+`sh:uniqueLang`. A problem shows under its field, and the bar at the bottom counts problems
+and changes. **Preview** sends the change to the server, which runs it as a dry run and
+validates the touched resources against every constraint of the shapes, including
+`sh:class`, `sh:node` and SHACL-SPARQL. Its results appear under their fields, and the
+preview lists the triples the save would remove and add. **Save** commits the change as one
+commit with the message typed beside it. With a guard in `reject` mode, Save checks first
+and writes nothing when the guard would reject the change. Otherwise a save with problems
+asks once more with **Save with problems**. After a failed save, an error summary at the
+top of the form lists every problem, and each entry moves the focus to its field. The
+fields are disabled while a save and the reload after it run, so nothing typed meanwhile
+is lost.
+
+Saves go to `main` when the caller may write it and it is not protected. When `main` is
+protected, or the `forms` setting's `saveTo` is `branch`, the first save creates the
+editor's branch `edits.{user}.{yyyymmdd}` from `main`'s head, and the form then edits that
+branch. Its banner counts the branch's commits and links to the merge page with
+**Review and merge**. The branch menu in the form's header opens the form on another
+branch.
+
+A save sends the values the form loaded for each field it changes. When another commit
+changed one of those fields meanwhile, the form lists the value it loaded, the value now
+stored and the person's own, and **Keep mine** or **Take the stored values** settles each
+field before saving again. Changes to other fields never conflict.
+
+The `forms` settings kind sets the shapes source, the shapes graphs, where saves go, the
+branch name template, the graph that new values go to and how new instances get IRIs
+([API](API.md#the-forms-settings-kind)). The dataset page's **Settings** tab edits it.
+
+## The time slider
+
+The web UI reads a past state of a dataset with a slider. It is a bar under the toolbar of
+a view, and moving its handle reads that view again at another commit. It writes the same
+`at` selector that the query page's **At** field and `?at=` take, so the two always name
+the same state. The slider needs a dataset whose history is readable, which
+[Point-in-time reads and snapshots](API.md#point-in-time-reads-and-snapshots) describes.
+A commit that retention has dropped is hatched on the track and labelled **gone**.
+
+The slider appears over five views.
+
+* **Query results.** The **History** button on the query page (shortcut `H`) opens it.
+  The query runs again at the commit the handle names, and the result says which state it
+  read.
+* **An entity.** In Explore, the properties panel of a selected resource has a **History**
+  button (`H`). Its track holds only the commits that changed the resource's triples.
+* **The graph.** **Graph history** (`Shift+H`) reads the drawn neighbourhood at a commit.
+  The nodes you expanded are expanded again at that commit, and nodes that appear or
+  disappear fade in and out. With reduced motion set in the system, nothing animates.
+* **The schema.** **Schema history** on the schema tab reads the class tree and the
+  property list at a commit.
+* **Agent memory.** The Memory tab's **As of** control is the same slider.
+
+Press `C`, or use **Compare**, to add a second handle. The view then shows the state at the
+right handle and marks what changed since the left one. A row only the later state has
+carries a `+` and a row only the earlier state has carries a `−`, and the chips above the
+table filter by **added**, **removed** and **unchanged**. In the graph, added elements are
+solid with a `+` badge and removed ones stay as dashed ghosts. The schema tab shows the
+change of each count, such as `+120`. On the map, added features are drawn larger and
+removed ones faded. Each change is marked by a symbol and a shape as well as colour.
+
+The arrow keys move the focused handle by one commit and `PageUp` and `PageDown` by ten.
+`Home` and `End` go to the oldest readable commit and to head. `S` and `Shift+S` jump to the
+next and previous named snapshot, `Space` plays through the commits, and `Escape` closes the
+slider. **Play** waits for each read to finish before it takes the next step. **Follow**
+keeps a view at head up to date by listening to the dataset's change feed.
+
+When a branch has more than 2,000 commits, the track shows buckets of commits with the
+size of their changes, and zooming narrows the range until each commit is listed. The
+buckets come from `GET /$/commits/{ds}/timeline` ([API](API.md#the-commit-timeline)).
+
+Compare mode also takes the head of another branch as its left side. Choose it in the
+**Compare with** menu. The query page then runs the query on both branches and the Explore
+graph and schema tab compare the two heads, which shows what a branch has changed before a
+merge.
+
+A comparison in the browser lists at most 10,000 rows on each side, and it compares only
+complete results. When a result is larger, or the row limit cut it, the page compares the
+counts, marks no row and says so, because a prefix of the rows says nothing about the rows
+after it. For a query that was typed in, and not for a stored query or a comparison with
+another branch, the page then offers **Compare on the server**. It calls
+`POST /{ds}/sparql/diff`, which runs the query at both states and returns the rows only
+one of them has ([API](API.md#comparing-a-query-between-two-states)). The table then
+lists those rows.
+
+The address keeps the view. The query page adds `ds`, `at`, `from`, `against` and `branch`
+to its URL while the slider is open, and Explore uses `at`, `from` and `against` next to its
+existing `ds`, `iri` and `tab`. Opening such a link restores the same handles and the same
+table.
+
+### Commit diffs on the graph
+
+**Show on graph** draws the changes between two commits as a graph of their own in
+Explore. It is on each commit in the dataset page's History panel, in the commit graph's
+details, on a write receipt and in the slider's compare caption. Added triples are solid
+with a `+` badge, removed ones are dashed ghosts with a `−` badge, and nothing else is
+drawn unless **context** adds up to 20 unchanged edges around each changed resource. `A`
+and `R` toggle the added and removed triples, `X` toggles context, `L` lists the changes
+as rows, the arrow keys move both commits by one while keeping the distance between them,
+and `Escape` leaves the diff. The address keeps the diff in `diff`, `diffFrom`,
+`diffBranch` and `group`.
+
+A diff with more than 500 changes draws its first 500 and offers **Group by class** (`G`).
+The grouped view draws a node for each class with its change, such as `Person +600`, and
+an edge for each predicate between classes, such as `worksFor +600`. Classes are read in
+the state where each change was seen, so a reader who cannot read a resource's type sees
+it under no class.
+
+**Play** on the diff graph runs a time-lapse. Each step asks for one commit's changes and
+applies them to what is drawn, so additions fade in and removals become ghosts that go at
+the next step unless **Keep ghosts** is on. A range of more than 500 commits steps through
+timeline buckets. A step with more changes than the canvas can hold switches the rest of
+the time-lapse to grouping by class and says so. The speeds are 1, 2, 5 and 10 steps a
+second, and at 5 and 10 the new nodes are placed next to a neighbour without a layout.
+The graph's history slider and the overview's have a **Play mode** menu. **Re-read** reads
+the view again at each commit as before, and **Time-lapse** applies each commit's diff to
+the drawn resources instead.
+
+The Explore overview has its own slider, opened with **Overview history** or `Shift+H`.
+Moving it reads the class level at that commit. Compare mode labels each class and
+predicate edge with its change from the grouped diff, and the time-lapse updates the counts
+in place with the layout held still. The slider reads classes only, so the overview does
+not offer it while **Group by** draws the GraphRAG communities, and switching to the
+communities closes it.
+
+At 390 px the diff graph's options fold into a sheet, the play controls stay in a bar at
+the bottom, and the change list opens as a second tab beside the graph.
 
 ## MCP server (LLM agents)
 
@@ -4474,98 +4962,6 @@ Agents read the reports with the MCP tool `community_reports`, and `recall` with
 `"communities": true` adds the report of each seed's community after its facts. A
 project brief lists the best rated reports of the coarsest level.
 
-## Sending notifications
-
-The server can tell a person when something needs them. It sends a notification to a
-webhook or an ntfy topic when agent memory has waited for review too long, when a
-backup policy run fails, and when a model provider's daily token budget is used up.
-Notifications are off until the configuration turns them on.
-
-The configuration is the server-wide settings kind `notifications`. An operator declares
-it in the settings file under `server.notifications`, and a server administrator changes
-it at runtime unless the settings file locks a field, as for the model configuration.
-A channel never holds a credential. It names a secret, which comes from
-`--model-secret NAME=file:PATH` or from a value stored with `sparkles secrets set`.
-
-```json
-{
-  "server": {
-    "notifications": {
-      "enabled": true,
-      "baseUrl": "https://sparkles.example.org",
-      "channels": {
-        "phone": { "type": "ntfy", "topic": "sparkles-ops", "token": { "secret": "ntfy-token" } },
-        "ops": { "type": "webhook", "url": "https://hooks.example.org/sparkles", "signingSecret": { "secret": "hook-signing" } }
-      },
-      "routes": { "memory.review.pending": ["phone"], "backup.*": ["phone", "ops"], "*": ["ops"] }
-    },
-    "locked": ["notifications.channels.phone"]
-  }
-}
-```
-
-```sh
-sparkles serve --loc data/org --settings settings.json \
-  --model-secret ntfy-token=file:/run/secrets/ntfy-token \
-  --model-secret hook-signing=file:/run/secrets/hook-signing
-sparkles notify test phone
-sparkles notify status
-```
-
-`sparkles notify test CHANNEL` sends a test notification to one channel at once, even
-while notifications are off, and prints the HTTP status the channel answered or the
-error. `sparkles notify status` prints each channel with its last success and its last
-failure, the routes, and the conditions that were notified. The same configuration can
-be changed from the command line:
-
-```sh
-sparkles settings set --global notifications.enabled=true \
-  'notifications.routes.*=["ops"]'
-sparkles secrets set hook-signing < hook-signing.key
-```
-
-A webhook receives the notification as a JSON body. With `signingSecret`, the request
-carries the `webhook-id`, `webhook-timestamp` and `webhook-signature` headers of
-Standard Webhooks, and the libraries of that specification verify them. A webhook URL
-that holds a token, as many chat services' incoming webhooks do, goes into a secret
-with `"urlSecret": {"secret": NAME}` in place of `url`. An ntfy channel publishes to
-`https://ntfy.sh` unless `server` names another ntfy server. A topic on the public
-server can be read by anyone who guesses its name, so use an access token with a
-reserved topic, or a server of your own.
-
-Each dataset decides how long its memory review may wait. The event fires when the
-oldest open review branch, such as a scheduled consolidation's, is older than
-`notifyAfter`, and then at most once per `repeatEvery` until no review branch is open:
-
-```sh
-sparkles settings set org memory.review.notifyAfter=2d memory.review.repeatEvery=1d
-```
-
-A backup policy that fails notifies once, then at most once per the kind's
-`repeatEvery` (one day by default) until a run of the policy succeeds. A spent model
-budget notifies once per provider and day. Requests to the channels go through the
-outbound policy, so a channel on a private address needs `--outbound-allow-private`.
-A failed delivery is retried with backoff, five attempts by default.
-[API.md](API.md#notifications) lists every member, the events and their data, and the
-metrics.
-
-On NixOS the settings file comes from `services.sparkles.settings` and the secrets from
-`services.sparkles.models.secrets`, which also serves the model providers' keys:
-
-```nix
-services.sparkles = {
-  settings.server.notifications = {
-    enabled = true;
-    baseUrl = "https://sparkles.example.org";
-    channels.phone = { type = "ntfy"; topic = "sparkles-ops"; token.secret = "ntfy-token"; };
-    routes."*" = [ "phone" ];
-  };
-  settings.server.locked = [ "notifications.channels.phone" ];
-  settings.datasets.org.memory.review.notifyAfter = "2d";
-  models.secrets.ntfy-token.file = config.sops.secrets."ntfy-token".path;
-};
-```
-
 ## Embedding the library
 
 `sparkles::Dataset` opens one database, and `sparkles::Catalog` manages named datasets
@@ -5221,6 +5617,19 @@ names a CSVW metadata file, and `template` a SPARQL CONSTRUCT query run for each
 `-metadata.json` file next to the table is used when none of them is given. Warnings of
 the conversion are Python warnings.
 
+`Dataset.run_mapping` runs an R2RML, RML or YARRRML mapping text and loads its quads in
+one commit, and `Dataset.mappings` stores mappings and runs them by name. `sources` maps
+the names a mapping gives its files to paths, `directory` resolves the other names, and
+`connections` maps connection names to `sqlite:PATH` URLs. The wheel is built without
+SQLite and Parquet sources, so these read CSV, TSV, JSON and JSON Lines
+([Mappings](#mappings-r2rml-rml-and-yarrrml)).
+
+```python
+ds.run_mapping(open("people.yml").read(), directory="data")
+ds.mappings.put("people", open("people.yml").read(), description="People")
+ds.mappings.run("people", sources={"people.csv": "data/people.csv"}, replace=True)
+```
+
 `sparkles.parse` parses as it reads, from a path, bytes or a file object, so the first
 quads come before the input has been read to the end. A syntax error is raised by the
 iteration, after the quads that came before it. `Dataset.load` from a file object streams
@@ -5339,6 +5748,42 @@ iterates over the same pairs. Snapshots, commits and backup records are immutabl
 configuration. `validation` holds SHACL, ShEx and the write guard, and `indexes.geo`
 controls spatial indexing. These handles replace the earlier flat administration
 methods.
+
+#### Editing forms in Python
+
+`ds.forms` builds the editing forms of [Editing forms](#editing-forms) from SHACL shapes.
+`ds.forms.model(focus)` returns the form of a resource as a dict with the shape of the
+HTTP route's answer, and `ds.forms.model(class_=iri)` returns the empty form of a new
+instance. Every call takes `settings`, a dict with the members of the `forms` setting such
+as `{"shapes": "graphs", "graphs": ["urn:shapes"]}`. Without it the form reads the shapes
+of the dataset's SHACL guard.
+
+```python
+model = ds.forms.model("http://ex.org/ann", settings=settings)
+name = next(f for f in model["fields"] if f["label"] == "Name")
+loaded = [v["term"] for v in name["values"]]
+change = {
+    "focus": "http://ex.org/ann",
+    "changes": [{"field": name["id"], "remove": loaded, "add": [Literal("Ann Lee")]}],
+    "expect": {name["id"]: loaded},     # the values the form loaded
+    "message": "rename Ann",
+}
+report = ds.forms.check(change, settings=settings)   # a dry run, nothing is written
+if report["validation"]["conforms"]:
+    ds.forms.save(change, settings=settings)
+```
+
+A term in a change is a dict of the model, such as `{"type": "literal", "value": "Ann"}`,
+or a `NamedNode` or `Literal`. `check` returns the preview of the update, the update's
+text, the `conflicts` that a save would meet and the `validation` of the nodes the change
+touches. A save writes one commit on the branch the dataset is open on, so a session
+branch is edited through `ds.branch(name).forms`. When another commit changed a field
+since the form loaded it, `save` writes nothing and raises `ConflictError` with the code
+`form-conflict` and `fields`, a list of the fields and the values stored now. Both calls
+take `author`, `timeout` and `cancel`, and `check` holds the writer lock while it runs.
+`InvalidInputError` reports a change the form cannot take, such as a field that is not in
+the form or a blank node, and `WriteRejectedError` reports a change that a rejecting guard
+refuses.
 
 Long administration operations accept `cancel`, `progress` and `timeout`. A progress
 callback receives a fraction and a message. Reports come at most once per 100 ms, and

@@ -8,7 +8,14 @@
    */
   import { onMount, tick, type Snippet } from 'svelte';
   import { CHANNEL_NAMES, CHANNELS, type Channel } from '$lib/lens';
-  import { LENS_OPTIONS, type LensId, type Lenses } from '$lib/lenses.svelte';
+  import {
+    LENS_OPTIONS,
+    type LensChoice,
+    type LensId,
+    type Lenses,
+    type Scope,
+  } from '$lib/lenses.svelte';
+  import { ALGOS, isAlgo } from '$lib/algo';
   import Icon from './Icon.svelte';
 
   let {
@@ -37,7 +44,10 @@
 
   const options = (ch: Channel) =>
     LENS_OPTIONS[ch].filter(
-      (o) => (!o.reasoning || lenses.reasoning) && (!o.validation || lenses.validation),
+      (o) =>
+        (!o.reasoning || lenses.reasoning) &&
+        (!o.validation || lenses.validation) &&
+        (!o.graphrag || !!lenses.algo.graphrag),
     );
 
   const selectValue = (ch: Channel) =>
@@ -50,8 +60,32 @@
       return;
     }
     picking[ch] = false;
+    const cur = lenses.choice[ch];
+    if (isAlgo(id)) {
+      // switching between algorithms keeps the scope and the projection
+      const keep = isAlgo(cur.lens) ? { scope: cur.scope, projection: cur.projection } : {};
+      lenses.set(ch, { lens: id, ...keep });
+      return;
+    }
     lenses.set(ch, { lens: id });
   }
+
+  /** Change one setting of the channel's algorithm lens, which runs it again (§2.3). */
+  function change(ch: Channel, part: Partial<LensChoice>) {
+    lenses.set(ch, { ...lenses.choice[ch], ...part });
+  }
+
+  function param(ch: Channel, key: string, raw: string) {
+    const v = Number(raw);
+    if (raw === '' || !Number.isFinite(v)) return;
+    change(ch, { params: { ...(lenses.choice[ch].params ?? {}), [key]: v } });
+  }
+
+  const levelsOf = (ch: Channel): number[] => {
+    const c = lenses.choice[ch];
+    if (c.lens === 'graphrag') return lenses.algo.graphrag?.levels ?? [];
+    return lenses.results[ch]?.levels ?? [];
+  };
 
   function chooseProperty(ch: Channel, iri: string) {
     if (!iri) return;
@@ -77,6 +111,7 @@
   async function show() {
     place();
     open = true;
+    void lenses.loadAlgoOptions();
     await tick();
     panel?.querySelector<HTMLElement>('select')?.focus();
   }
@@ -91,6 +126,7 @@
     const r = lenses.results[ch];
     if (s.note) return s.note;
     if (s.error) return s.error;
+    if (s.busy && s.task) return s.phase ?? 'running';
     if (s.busy) return 'reading…';
     if (!r) return '';
     const n = r.values.size;
@@ -214,8 +250,118 @@
             {#if lenses.status[ch].busy}<span class="spinner"></span>{/if}
             {status(ch)}
           </span>
+          {@const c = lenses.choice[ch]}
+          {#if isAlgo(c.lens) || c.lens === 'graphrag'}
+            <div class="opts" data-testid={`lens-options-${ch}`}>
+              {#if isAlgo(c.lens)}
+                {@const spec = ALGOS[c.lens]}
+                <label class="opt">
+                  <span>scope</span>
+                  <select
+                    class="select sm"
+                    value={c.scope ?? 'drawn'}
+                    onchange={(e) =>
+                      change(ch, {
+                        scope: (e.currentTarget as HTMLSelectElement).value as Scope,
+                      })}
+                  >
+                    <option value="drawn">drawn graph</option>
+                    <option
+                      value="projection"
+                      disabled={!!lenses.algo.projectionOff}
+                      title={lenses.algo.projectionOff ?? undefined}>projection</option
+                    >
+                  </select>
+                </label>
+                {#if (c.scope ?? 'drawn') === 'projection'}
+                  <label class="opt">
+                    <span>projection</span>
+                    <select
+                      class="select sm proj"
+                      value={c.projection ?? 'drawn'}
+                      onchange={(e) =>
+                        change(ch, { projection: (e.currentTarget as HTMLSelectElement).value })}
+                    >
+                      <option value="drawn">the drawn edges' predicates</option>
+                      {#each lenses.algo.projections as n (n)}
+                        <option value={`name:${n}`}>{n}</option>
+                      {/each}
+                      {#each lenses.drawnPredicates() as p (p)}
+                        <option value={`pred:${p}`} title={p}>{short(p)}</option>
+                      {/each}
+                    </select>
+                  </label>
+                {/if}
+                {#if spec.needsSource}
+                  {@const sources = lenses.sourceNodes()}
+                  <label class="opt">
+                    <span>from</span>
+                    <select
+                      class="select sm proj"
+                      value={c.source ?? sources[0]?.id ?? ''}
+                      onchange={(e) =>
+                        change(ch, { source: (e.currentTarget as HTMLSelectElement).value })}
+                    >
+                      {#each sources as n (n.id)}
+                        <option value={n.id}>{n.label}</option>
+                      {/each}
+                    </select>
+                  </label>
+                {/if}
+                {#each spec.params as p (p.key)}
+                  <label class="opt">
+                    <span>{p.name}</span>
+                    <input
+                      class="input sm num"
+                      type="number"
+                      min={p.min}
+                      max={p.max}
+                      step={p.step}
+                      value={c.params?.[p.key] ?? p.default}
+                      onchange={(e) =>
+                        param(ch, p.key, (e.currentTarget as HTMLInputElement).value)}
+                    />
+                  </label>
+                {/each}
+              {/if}
+              {#if levelsOf(ch).length > 1}
+                {@const levels = levelsOf(ch)}
+                <label class="opt">
+                  <span>level</span>
+                  <select
+                    class="select sm"
+                    value={String(
+                      c.level ?? (c.lens === 'graphrag' ? levels[0] : levels[levels.length - 1]),
+                    )}
+                    onchange={(e) =>
+                      change(ch, { level: Number((e.currentTarget as HTMLSelectElement).value) })}
+                  >
+                    {#each levels as l (l)}
+                      <option value={String(l)}>{l}</option>
+                    {/each}
+                  </select>
+                </label>
+              {/if}
+              {#if lenses.status[ch].busy && lenses.status[ch].task}
+                <div class="run">
+                  <progress
+                    max="1"
+                    value={lenses.status[ch].progress ?? 0}
+                    aria-label={`${CHANNEL_NAMES[ch]} run progress`}
+                  ></progress>
+                  <button class="btn sm" onclick={() => lenses.cancel(ch)}>Cancel</button>
+                </div>
+              {/if}
+            </div>
+          {/if}
         {/each}
       </div>
+      {#if lenses.algo.graphragOff}
+        <p class="note faint">{lenses.algo.graphragOff}</p>
+      {/if}
+      {#if lenses.algo.projectionOff}
+        <p class="note faint">{lenses.algo.projectionOff}</p>
+      {/if}
       {#if !lenses.reasoning}
         <p class="note faint">
           The dataset has no reasoning, so there are no inferred edges to show.
@@ -292,6 +438,45 @@
   }
   .prop {
     max-width: 220px;
+  }
+  .opts {
+    grid-column: 1 / -1;
+    display: flex;
+    flex-wrap: wrap;
+    gap: 6px 10px;
+    align-items: center;
+    padding: 0 0 4px 0;
+    margin-top: -2px;
+    border-bottom: 1px dashed var(--border);
+  }
+  .opt {
+    display: inline-flex;
+    gap: 4px;
+    align-items: center;
+    font-size: var(--fs-xs);
+    color: var(--muted);
+    min-width: 0;
+  }
+  .opt select,
+  .opt input {
+    min-width: 0;
+  }
+  .proj {
+    max-width: 200px;
+  }
+  .num {
+    width: 72px;
+  }
+  .run {
+    display: inline-flex;
+    gap: 6px;
+    align-items: center;
+    flex: 1 1 160px;
+  }
+  .run progress {
+    flex: 1;
+    min-width: 80px;
+    accent-color: var(--spark);
   }
   .st {
     font-size: var(--fs-xs);

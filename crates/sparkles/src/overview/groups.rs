@@ -36,7 +36,7 @@ pub(super) const TOP_MEMBERS: usize = 3;
 
 pub(super) const RDF_TYPE: &str = "http://www.w3.org/1999/02/22-rdf-syntax-ns#type";
 pub(super) const SKOS_BROADER: &str = "http://www.w3.org/2004/02/skos/core#broader";
-const XSD: &str = "http://www.w3.org/2001/XMLSchema#";
+pub(super) const XSD: &str = "http://www.w3.org/2001/XMLSchema#";
 /// The IRIs F14's write-back gives community resources.
 const COMMUNITY_PREFIX: &str = "urn:x-sparkles:algo:";
 /// Label properties, as Explore reads them.
@@ -79,7 +79,7 @@ pub(super) fn count(t: Option<&Term>) -> u64 {
     }
 }
 
-fn number(t: Option<&Term>) -> Option<f64> {
+pub(super) fn number(t: Option<&Term>) -> Option<f64> {
     match t {
         Some(Term::Literal(l)) => l.value().parse::<f64>().ok().filter(|f| f.is_finite()),
         _ => None,
@@ -109,7 +109,7 @@ pub(super) fn label_path() -> String {
     )
 }
 
-fn is_numeric_type(dt: &str) -> bool {
+pub(super) fn is_numeric_type(dt: &str) -> bool {
     dt.strip_prefix(XSD).is_some_and(|l| {
         matches!(
             l,
@@ -133,18 +133,18 @@ fn is_numeric_type(dt: &str) -> bool {
     })
 }
 
-fn is_integer_type(dt: &str) -> bool {
+pub(super) fn is_integer_type(dt: &str) -> bool {
     is_numeric_type(dt) && !matches!(dt.strip_prefix(XSD), Some("decimal" | "double" | "float"))
 }
 
-fn is_date_type(dt: &str) -> bool {
+pub(super) fn is_date_type(dt: &str) -> bool {
     matches!(
         dt.strip_prefix(XSD),
         Some("date" | "dateTime" | "dateTimeStamp")
     )
 }
 
-fn literal_type(t: &Term) -> Option<&str> {
+pub(super) fn literal_type(t: &Term) -> Option<&str> {
     match t {
         Term::Literal(l) => Some(l.datatype().as_str()),
         _ => None,
@@ -478,7 +478,7 @@ impl Run<'_> {
     }
 
     /// Labels of IRIs, from the label properties.
-    fn labels(&self, iris: &[&str]) -> Result<HashMap<String, String>> {
+    pub(super) fn labels(&self, iris: &[&str]) -> Result<HashMap<String, String>> {
         let mut out = HashMap::default();
         for chunk in iris.chunks(1_000) {
             if chunk.is_empty() {
@@ -1140,7 +1140,7 @@ fn partition_predicate(level: &Level) -> &str {
 
 /// The smallest round width (1, 2, 2.5 or 5 times a power of ten) of at least `raw`, and
 /// a whole number of at least 1 when the values are integers.
-fn nice_width(raw: f64, integral: bool) -> f64 {
+pub(super) fn nice_width(raw: f64, integral: bool) -> f64 {
     if !raw.is_finite() || raw <= 0.0 {
         return 1.0;
     }

@@ -51,6 +51,10 @@ work, and each item links to its design spec in [docs/specs](docs/specs/README.m
   label-colon openers, chains of colons, parentheses or semicolons, "(yet)", marketing words
   and filler. Keep table cells to one to three short sentences.
   [docs/COMPARISON.md](docs/COMPARISON.md) is the reference voice.
+- Public docs describe the project as it is now. README, FEATURES, BENCHMARKS, ROADMAP
+  and the guides carry no progress dates, "Done (date)" notes, superseded measurements,
+  review history or mentions of agents and lanes. History belongs in CHANGELOG.md and in
+  the specs' Outcome sections. Finished roadmap items go to the roadmap's Completed list.
 - `docs/plans/` holds private working notes. Never link to it from tracked files.
 
 ## Multi-agent workflow

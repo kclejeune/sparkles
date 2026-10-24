@@ -352,8 +352,8 @@ between two people of the demo dataset, which the README shows.
 
 **Measurements.** A Namespace screen of the path searches that use neither new parameter
 found no change above the noise, with a geometric mean of 0.97 for the new build over the
-old one. [BENCHMARKS](../BENCHMARKS.md#skipped-predicates-and-hubs-2026-10-23) has the
-table. A forge A/B is a follow-up after the merge.
+old one. [BENCHMARKS](../BENCHMARKS.md#path-search) has the
+result. A forge A/B is a follow-up after the merge.
 
 **Phase 3.** The engine needed no change, because F07 already weighs edges by a reifier
 property with `path:weight` and binds a path's sum with `path:cost`, and its Dijkstra and
@@ -383,7 +383,7 @@ geometric mean of 0.93 for the new build over the old one and no query above the
 since the engine did not change. It also timed the weighted searches the panel now sends.
 A weighted pair search takes 0.68 s on the 10.5M-triple data against 1.2 ms unweighted,
 and the five cheapest paths stop at the default limit of 10 million visited nodes.
-[BENCHMARKS](../BENCHMARKS.md#weighted-paths-for-the-path-finder-2026-10-24) has the table,
+[BENCHMARKS](../BENCHMARKS.md#weighted-pair-searches) has the figures,
 and ROADMAP item 150 makes weighted searches bidirectional.
 
 **Phase 3 decisions.** The spec left these open, and each was decided here. The weight

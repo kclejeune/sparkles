@@ -176,6 +176,8 @@ pub const DEFAULT_REASON_CACHE_TRIPLES: usize = sparkles::reasoning::DEFAULT_CLO
 /// Default of `serve --reason-max-inferred`, the reasoner's own default of 50 million
 /// derived triples (`sparkles_reasoner::DEFAULT_MAX_INFERRED`).
 pub const DEFAULT_REASON_MAX_INFERRED: usize = 50_000_000;
+/// The facts one query may derive with query-time reasoning by default (spec F17 §8).
+pub const DEFAULT_REASON_MAX_DERIVED: usize = 1_000_000;
 
 /// A background task. Its JSON form also carries Fuseki's names for its fields
 /// (`taskId`, `task`, `started`, `finished`, `success`; see [`Task::serialize`]).
@@ -323,6 +325,8 @@ pub struct AppState {
     /// principals carry
     #[cfg_attr(not(feature = "auth"), allow(dead_code))]
     pub graphrag_guard: Arc<crate::graphrag::guard::Guard>,
+    /// the vector index projections the server keeps (spec U11 §3.3)
+    pub projections: crate::projection::Projections,
     /// GraphRAG builds waiting for confirmation, and the figures of the metrics
     #[cfg(feature = "mcp")]
     pub graphrag: Arc<crate::graphrag::runtime::Runtime>,
@@ -394,10 +398,16 @@ pub struct AppState {
     /// the largest closure a dataset keeps in memory for incremental reasoning, in
     /// derived triples (`serve --reason-cache-triples`)
     pub reason_cache_triples: usize,
+    /// the settings of incremental views and live queries (`serve --max-live-queries`,
+    /// `--view-pass-timeout`, …)
+    pub views_options: sparkles::incr::RuntimeOptions,
     /// the derived triples a materialization may produce before it fails
     /// (`serve --reason-max-inferred`, 0 on the command line for no limit, which is
     /// `usize::MAX` here); a request may ask for less with `maxInferred`
     pub reason_max_inferred: usize,
+    /// the facts a query's query-time reasoning may derive (`serve --reason-max-derived`,
+    /// 0 on the command line for no limit); a request may ask for less with `maxDerived`
+    pub reason_max_derived: usize,
     /// automatic compaction (`serve --auto-compact-*`) and what is known of each
     /// dataset's compactions
     pub compaction: crate::compaction::AutoCompact,
@@ -637,6 +647,7 @@ impl AppState {
         let state = AppState {
             data_dir: data_dir.to_path_buf(),
             graphrag_guard: Arc::new(crate::graphrag::guard::Guard::new()),
+            projections: Default::default(),
             #[cfg(feature = "mcp")]
             graphrag: Default::default(),
             catalog,
@@ -676,7 +687,9 @@ impl AppState {
             http_compression: Default::default(),
             auto_reason: None,
             reason_cache_triples: DEFAULT_REASON_CACHE_TRIPLES,
+            views_options: Default::default(),
             reason_max_inferred: DEFAULT_REASON_MAX_INFERRED,
+            reason_max_derived: DEFAULT_REASON_MAX_DERIVED,
             compaction: Default::default(),
             #[cfg(feature = "backup")]
             backup: None,
@@ -706,6 +719,7 @@ impl AppState {
         AppState {
             data_dir: PathBuf::new(),
             graphrag_guard: Arc::new(crate::graphrag::guard::Guard::new()),
+            projections: Default::default(),
             #[cfg(feature = "mcp")]
             graphrag: Default::default(),
             catalog,
@@ -736,7 +750,9 @@ impl AppState {
             phase: AtomicU8::new(crate::obs::Phase::Ready as u8),
             auto_reason: None,
             reason_cache_triples: DEFAULT_REASON_CACHE_TRIPLES,
+            views_options: Default::default(),
             reason_max_inferred: DEFAULT_REASON_MAX_INFERRED,
+            reason_max_derived: DEFAULT_REASON_MAX_DERIVED,
             compaction: Default::default(),
             #[cfg(feature = "backup")]
             backup: None,
@@ -840,6 +856,7 @@ impl AppState {
         dataset
             .store()
             .set_prefix_filter(Some(self.settings.prefix_filter(name)));
+        crate::http::start_views(self, name, &dataset);
         Arc::new(Dataset {
             name: name.to_string(),
             kind,
@@ -850,6 +867,15 @@ impl AppState {
             offline: AtomicBool::new(false),
             dataset,
         })
+    }
+
+    /// The routing objects of the datasets open now, without opening any.
+    pub fn open_datasets(&self) -> Vec<(String, Arc<Dataset>)> {
+        self.routing
+            .lock()
+            .iter()
+            .map(|(n, ds)| (n.clone(), ds.clone()))
+            .collect()
     }
 
     /// A snapshot of the server's routing objects for the catalog's datasets.

@@ -300,3 +300,128 @@ async fn the_selected_default_graph_is_part_of_the_cache_key() {
     assert_eq!(seen[0], ["http://ex/p1", "http://ex/p2"]);
     assert_eq!(seen[1], ["http://ex/p3", "http://ex/p4"]);
 }
+
+async fn facets(app: &Router, user: &str, body: J) -> R {
+    call(
+        app,
+        "POST",
+        "/$/graph/ov/facets",
+        &[
+            ("authorization", &b(user)),
+            ("content-type", "application/json"),
+        ],
+        &body.to_string(),
+    )
+    .await
+}
+
+/// The facets route (U11 A8) counts only what the caller reads: a caller limited to one
+/// graph counts its half of the people, protected salaries count as missing, and an
+/// answer cached for a wider caller is never served to a narrower one.
+#[tokio::test]
+async fn facets_count_only_what_the_caller_reads() {
+    let (_dir, app) = server();
+    let body = json!({
+        "within": { "class": "http://ex/Person" },
+        "facets": [{ "property": "http://ex/city" }, { "property": "http://ex/salary" }],
+        "candidates": true,
+    });
+    let city = |a: &J| -> Vec<(String, u64)> {
+        let mut v: Vec<_> = a["facets"][0]["values"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|v| {
+                (
+                    v["value"]["value"].as_str().unwrap().to_string(),
+                    v["count"].as_u64().unwrap(),
+                )
+            })
+            .collect();
+        v.sort();
+        v
+    };
+    let r = facets(&app, "ofull", body.clone()).await;
+    assert_eq!(r.status, StatusCode::OK, "{}", r.text());
+    let a = r.json();
+    assert_eq!(a["size"], 4, "{a}");
+    assert_eq!(city(&a), vec![("Kyoto".into(), 2), ("Oslo".into(), 2)]);
+    assert_eq!(a["facets"][1]["missing"], 2, "{a}");
+
+    let r = facets(&app, "oga", body.clone()).await;
+    assert_eq!(r.status, StatusCode::OK, "{}", r.text());
+    let a = r.json();
+    assert_eq!(a["size"], 2, "{a}");
+    assert_eq!(city(&a), vec![("Oslo".into(), 2)]);
+    assert!(!r.text().contains("Kyoto"), "{}", r.text());
+    assert_eq!(a["facets"][1]["missing"], 2, "{a}");
+
+    // a protected predicate's values count as missing, and it is no candidate
+    let r = facets(&app, "olift", body.clone()).await;
+    assert_eq!(r.status, StatusCode::OK, "{}", r.text());
+    let a = r.json();
+    assert_eq!(a["size"], 4, "{a}");
+    assert_eq!(a["facets"][1]["missing"], 4, "{a}");
+    assert!(
+        !a["candidates"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|c| c["property"] == "http://ex/salary"),
+        "{a}"
+    );
+    // a brush on the hidden predicate keeps nobody
+    let r = facets(
+        &app,
+        "olift",
+        json!({
+            "within": { "class": "http://ex/Person" },
+            "facets": [{ "property": "http://ex/city" }],
+            "filters": [{ "property": "http://ex/salary", "range": [0, 100] }],
+        }),
+    )
+    .await;
+    assert_eq!(r.json()["matching"], 0, "{}", r.text());
+
+    // a grant of the info endpoint only cannot count
+    let r = facets(&app, "oinfo", body).await;
+    assert_eq!(r.status, StatusCode::FORBIDDEN, "{}", r.text());
+}
+
+/// The projection routes (U11 A8) answer `403` to a caller whose access covers part of
+/// the dataset, before they look for the index, as the vector status route does, since a
+/// point reveals that an entity exists. Every user of this fixture reads through a view,
+/// because the dataset has protections. Without authentication the routes reach the
+/// index lookup (`projection_tests`).
+#[tokio::test]
+async fn projections_need_access_to_the_whole_dataset() {
+    let (_dir, app) = server();
+    for user in ["oga", "olift", "ofull"] {
+        let status = call(
+            &app,
+            "GET",
+            "/$/vector/ov",
+            &[("authorization", &b(user))],
+            "",
+        )
+        .await;
+        assert_eq!(status.status, StatusCode::FORBIDDEN, "{}", status.text());
+        for method in ["POST", "GET"] {
+            let r = call(
+                &app,
+                method,
+                "/$/vector/ov/v/projection",
+                &[("authorization", &b(user))],
+                "",
+            )
+            .await;
+            assert_eq!(
+                r.status,
+                StatusCode::FORBIDDEN,
+                "{method} as {user}: {}",
+                r.text()
+            );
+            assert!(r.text().contains("covers every graph"), "{}", r.text());
+        }
+    }
+}

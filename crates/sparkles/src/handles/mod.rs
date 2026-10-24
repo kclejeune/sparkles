@@ -30,11 +30,13 @@ pub mod graph;
 pub mod graphql;
 pub mod history;
 pub mod indexes;
+pub mod mappings;
 pub mod queries;
 pub mod reasoning;
 pub mod schema;
 pub mod settings;
 pub mod validation;
+pub mod views;
 
 pub use algorithms::{Algorithms, Projections};
 #[cfg(feature = "backup")]
@@ -46,6 +48,7 @@ pub use history::{CommitDetail, CommitRef, History, Snapshots};
 pub use indexes::{
     GeoIndex, Indexes, RecallOptions, TextHit, TextHits, TextIndex, TextSearch, VectorIndexes,
 };
+pub use mappings::{MappingRun, StoredMappings};
 pub use queries::StoredQueries;
 pub use reasoning::{RdfsSetting, Reasoning};
 pub use schema::{
@@ -60,6 +63,7 @@ pub use settings::{
     CompactionReadings, CompactionState, CompactionStatus, DescribeStatus, SettingSource,
 };
 pub use validation::{GuardOutcome, GuardSetting, Validation};
+pub use views::Views;
 
 use crate::Dataset;
 

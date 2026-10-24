@@ -768,3 +768,72 @@ fn a_missing_directory_is_an_error_result() {
     let dir = tempfile::tempdir().unwrap();
     assert!(check(&dir.path().join("nope"), &CheckOptions::default()).is_err());
 }
+
+fn varint(b: &[u8], pos: &mut usize) -> u64 {
+    let (mut v, mut shift) = (0u64, 0);
+    loop {
+        let x = b[*pos];
+        *pos += 1;
+        v |= u64::from(x & 0x7f) << shift;
+        if x < 0x80 {
+            return v;
+        }
+        shift += 7;
+    }
+}
+
+fn put_varint(out: &mut Vec<u8>, mut v: u64) {
+    while v >= 0x80 {
+        out.push(v as u8 | 0x80);
+        v >>= 7;
+    }
+    out.push(v as u8);
+}
+
+/// A front-coded entry that stores a shorter shared prefix than its key has with the one
+/// before still decodes, but a lookup by term relies on the longest one (item 108), so
+/// the full check reports it.
+#[test]
+fn a_shared_prefix_shorter_than_the_longest_is_found() {
+    let (_d, root) = fresh();
+    let dir = gen_dir(&root);
+    let off = std::fs::read(dir.join("vocab.off")).unwrap();
+    let blocks = off.len() / 8 - 1;
+    let last = u64::from_le_bytes(off[(blocks - 1) * 8..blocks * 8].try_into().unwrap()) as usize;
+    let path = dir.join("vocab.dat");
+    let data = std::fs::read(&path).unwrap();
+    // rewrite the last block, moving one shared byte of its first entry with a shared
+    // prefix into that entry's suffix; the block is the last, so no offset moves
+    let mut out = data[..last].to_vec();
+    let mut pos = last;
+    let mut prev: Vec<u8> = Vec::new();
+    let mut done = false;
+    while pos < data.len() {
+        let shared = varint(&data, &mut pos) as usize;
+        let len = varint(&data, &mut pos) as usize;
+        let suffix = &data[pos..pos + len];
+        pos += len;
+        let mut key = prev[..shared].to_vec();
+        key.extend_from_slice(suffix);
+        if !done && shared > 0 {
+            put_varint(&mut out, shared as u64 - 1);
+            put_varint(&mut out, len as u64 + 1);
+            out.extend_from_slice(&key[shared - 1..]);
+            done = true;
+        } else {
+            put_varint(&mut out, shared as u64);
+            put_varint(&mut out, len as u64);
+            out.extend_from_slice(suffix);
+        }
+        prev = key;
+    }
+    assert!(done, "the last block has no shared prefix");
+    std::fs::write(&path, &out).unwrap();
+    let r = run(&root, false);
+    assert_eq!(r.status, Status::Error, "{}", r.to_text());
+    assert!(
+        r.to_text().contains("shorter shared prefix"),
+        "{}",
+        r.to_text()
+    );
+}

@@ -44,18 +44,19 @@ pub const TRAIN_BYTES: usize = 256 << 10;
 /// One symbol table, for decoding.
 #[derive(Clone)]
 pub struct Table {
-    /// the symbols by code, each padded to 8 bytes
-    syms: [[u8; 8]; MAX_SYMBOLS],
+    /// the symbols by code, each padded to 8 bytes; the last entry, for the escape
+    /// code, stays empty, so that [`Table::decode_at`] can pad a short sequence with it
+    syms: [[u8; 8]; MAX_SYMBOLS + 1],
     /// the length of each symbol, 1 to 8, and 0 for a code without a symbol
-    lens: [u8; MAX_SYMBOLS],
+    lens: [u8; MAX_SYMBOLS + 1],
     n: u8,
 }
 
 impl Default for Table {
     fn default() -> Self {
         Table {
-            syms: [[0; 8]; MAX_SYMBOLS],
-            lens: [0; MAX_SYMBOLS],
+            syms: [[0; 8]; MAX_SYMBOLS + 1],
+            lens: [0; MAX_SYMBOLS + 1],
             n: 0,
         }
     }
@@ -113,24 +114,143 @@ impl Table {
         unsafe { out.set_len(len) };
     }
 
-    /// Append what `codes` stand for without reserving more than that, for the decodes
-    /// whose callers account for every byte of their buffer (see
+    /// Append what `codes` stand for without reserving more than that (see
     /// [`Table::decoded_len`]).
     #[inline]
     pub fn decode_exact(&self, codes: &[u8], out: &mut Vec<u8>) {
+        out.reserve_exact(self.decoded_len(codes));
+        self.decode_upto(codes, usize::MAX, out);
+    }
+
+    /// Append to `out` the first `max` bytes of what `codes` stand for, or all of them
+    /// when they are fewer, without growing `out`. A caller reserves the room first:
+    /// [`Table::decoded_len`] bytes for a whole suffix, or `max` for a prefix of it, and
+    /// a decode stops at the capacity, so damaged codes cut the key short instead of
+    /// writing past it.
+    ///
+    /// Each symbol is written as one unaligned 8-byte store while 8 bytes of capacity
+    /// remain, as in [`Table::decode_into`], and copied by its length near the end of the
+    /// room. Decoding a prefix lets a front-coded block skip the bytes of a key that no
+    /// later key takes, which is most of each key but the one asked for.
+    #[inline]
+    pub fn decode_upto(&self, codes: &[u8], max: usize, out: &mut Vec<u8>) {
+        let cap = out.capacity();
+        let limit = out.len().saturating_add(max).min(cap);
+        let base = out.as_mut_ptr();
+        let mut len = out.len();
         let mut i = 0;
-        while i < codes.len() {
+        while i < codes.len() && len < limit {
             let c = codes[i];
             if c == ESCAPE {
                 if let Some(&b) = codes.get(i + 1) {
-                    out.push(b);
+                    // SAFETY: `len` < `limit` <= the capacity.
+                    unsafe { base.add(len).write(b) };
+                    len += 1;
                 }
                 i += 2;
             } else {
                 let l = self.lens[c as usize] as usize;
-                out.extend_from_slice(&self.syms[c as usize][..l]);
+                if len + 8 <= cap {
+                    // SAFETY: 8 bytes from `len` are within the capacity, and the write
+                    // is unaligned.
+                    unsafe {
+                        base.add(len)
+                            .cast::<[u8; 8]>()
+                            .write_unaligned(self.syms[c as usize])
+                    };
+                } else {
+                    let n = l.min(cap - len);
+                    // SAFETY: `n` bytes from `len` are within the capacity, and the
+                    // symbol holds at least `n` bytes.
+                    unsafe {
+                        std::ptr::copy_nonoverlapping(
+                            self.syms[c as usize].as_ptr(),
+                            base.add(len),
+                            n,
+                        )
+                    };
+                }
+                len += l;
                 i += 1;
             }
+        }
+        // SAFETY: the bytes up to `limit` were written above (or were there before), and
+        // `limit` is within the capacity. A symbol that crossed `limit` is cut there.
+        unsafe { out.set_len(len.min(limit)) };
+    }
+
+    /// [`Table::decode_upto`] after reserving the room, for decodes that do not account
+    /// for their buffer.
+    #[inline]
+    pub fn decode_prefix_into(&self, codes: &[u8], max: usize, out: &mut Vec<u8>) {
+        out.reserve(max.min(codes.len() * 8).saturating_add(8));
+        self.decode_upto(codes, max, out);
+    }
+
+    /// Decode the codes `data[start..start + len]` as [`Table::decode_upto`] does with
+    /// `max`, or, with `grow`, as [`Table::decode_into`] and
+    /// [`Table::decode_prefix_into`] do after reserving the room.
+    ///
+    /// Most suffixes of a front-coded vocabulary are two to four codes, so the loop of
+    /// the other decoders ends after a varying number of steps and its branch is often
+    /// mispredicted. A sequence of at most eight codes without an escape, whose eight
+    /// bytes `data` holds, is decoded instead from one 8-byte load in four or eight
+    /// fixed steps, with the bytes past the sequence read as the escape code, whose
+    /// symbol is empty. This needs 64 bytes of room, and a decode without it takes the
+    /// loop.
+    #[inline(always)]
+    pub fn decode_at(
+        &self,
+        data: &[u8],
+        start: usize,
+        len: usize,
+        max: usize,
+        out: &mut Vec<u8>,
+        grow: bool,
+    ) {
+        if len <= 8
+            && let Some(word) = data.get(start..start + 8)
+        {
+            if grow {
+                out.reserve(64);
+            }
+            if out.capacity() - out.len() >= 64 {
+                let w = u64::from_le_bytes(word.try_into().unwrap());
+                let valid = if len == 8 {
+                    u64::MAX
+                } else {
+                    (1u64 << (8 * len)) - 1
+                };
+                // a zero byte of `x` within the sequence is an escape there
+                let x = !w | !valid;
+                if x.wrapping_sub(0x0101_0101_0101_0101) & !x & 0x8080_8080_8080_8080 == 0 {
+                    let codes = w | !valid;
+                    let begin = out.len();
+                    let base = out.as_mut_ptr();
+                    let mut at = begin;
+                    let steps = if len <= 4 { 4 } else { 8 };
+                    for k in 0..steps {
+                        let c = (codes >> (8 * k)) as u8 as usize;
+                        // SAFETY: each step writes 8 bytes and advances by at most 8,
+                        // so every write stays within the 64 bytes of room checked
+                        // above, and the write is unaligned.
+                        unsafe { base.add(at).cast::<[u8; 8]>().write_unaligned(self.syms[c]) };
+                        at += self.lens[c] as usize;
+                    }
+                    // SAFETY: the bytes up to `at` were written above, within the
+                    // capacity; a prefix keeps the first `max` of them.
+                    unsafe { out.set_len(at.min(begin.saturating_add(max))) };
+                    return;
+                }
+            }
+        }
+        let codes = &data[start..start + len];
+        if !grow {
+            self.decode_upto(codes, max, out)
+        } else if max == usize::MAX {
+            self.decode_into(codes, out)
+        } else {
+            self.decode_prefix_into(codes, max, out)
         }
     }
 
@@ -399,6 +519,23 @@ mod tests {
             let mut out = Vec::new();
             t.decode_exact(&c, &mut out);
             assert_eq!(out, s);
+            // the branch-free path reads past the codes, which must not change them;
+            // without bytes past them, and without room, the loop decodes
+            for tail in [&[][..], &[0u8; 8][..], &[255u8; 8][..]] {
+                let wide = [b"xy".as_slice(), &c, tail].concat();
+                for max in [0, 1, 3, 7, 8, 9, s.len(), usize::MAX] {
+                    let want = &s[..s.len().min(max)];
+                    let mut out = b"pre".to_vec();
+                    t.decode_at(&wide, 2, c.len(), max, &mut out, true);
+                    assert_eq!(&out[3..], want, "{s:?} max {max}");
+                    let mut out = Vec::with_capacity(want.len());
+                    t.decode_at(&wide, 2, c.len(), max, &mut out, false);
+                    assert_eq!(out, want);
+                    let mut out = Vec::with_capacity(want.len() + 64);
+                    t.decode_at(&wide, 2, c.len(), max, &mut out, false);
+                    assert_eq!(out, want);
+                }
+            }
         } else {
             assert!(c.is_empty());
         }
@@ -410,6 +547,11 @@ mod tests {
                 format!("\"label number {i} of the http://example.org/thing\"@en").into_bytes()
             })
             .collect();
+        // short pieces, which code to eight codes or fewer
+        for i in 0..200 {
+            let l = &v[i];
+            v.push(l[i % 20..i % 20 + 1 + i % 23].to_vec());
+        }
         v.push(Vec::new());
         v.push((0..=255u8).collect());
         v.push(vec![255; 300]);

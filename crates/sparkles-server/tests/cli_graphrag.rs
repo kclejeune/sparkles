@@ -2,6 +2,8 @@
 //! a build without confirmation sends nothing, a confirmed build writes the reports, and
 //! `status` and `reports` read them back (spec C22 §2.2).
 
+#![cfg(feature = "memory")]
+
 use serde_json::{Value, json};
 use std::io::{BufRead, BufReader, Read, Write};
 use std::net::{TcpListener, TcpStream};

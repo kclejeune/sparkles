@@ -313,6 +313,119 @@ SELECT ?label ?from ?to WHERE {
   await shoot(page, 'result-arcs');
 });
 
+test('explore-facets', async ({ page }) => {
+  // the facets of the people of `world` beside the graph of the chief executive, with a
+  // brush on their ages and their employer, which dims the drawn people outside it
+  await page.goto(
+    `/ui/explore?ds=world&iri=${encodeURIComponent(`${WORLD}amira-haddad`)}&facets=1`,
+  );
+  const panel = page.getByTestId('facet-panel');
+  await expect(panel.getByTestId('facet')).toHaveCount(3, { timeout: 30_000 });
+  const facet = (local: string) =>
+    panel.locator(`[data-testid="facet"][data-property="${WORLD}${local}"]`);
+  await expect(facet('age').locator('.bin').first()).toBeVisible();
+  await facet('worksFor')
+    .getByRole('button', { name: /Meridian Logistics/ })
+    .click();
+  await facet('age')
+    .getByRole('group', { name: /age histogram/ })
+    .focus();
+  await page.keyboard.press('Home');
+  for (let i = 0; i < 3; i++) await page.keyboard.press('ArrowRight');
+  for (let i = 0; i < 6; i++) await page.keyboard.press('Shift+ArrowRight');
+  await expect(panel.getByTestId('facet-count')).toContainText(/of 41 match/);
+  await expect(page.getByRole('region', { name: 'Selection' })).toContainText(
+    'selected by the facets',
+  );
+  await shoot(page, 'explore-facets');
+});
+
+test('embedding-map', async ({ page, request }) => {
+  // the 6,000 invented shipments of `world` projected by the server and coloured by cargo
+  // class, with a lasso around one lobe of the largest class in the shared selection
+  await page.goto('/ui/embedding?ds=world&index=shipments');
+  const map = page.locator('.emap[data-ready="true"]');
+  await expect(map).toHaveAttribute('data-points', '6000', { timeout: 30_000 });
+  await expect(page.getByTestId('progress')).toHaveCount(0);
+  await page.waitForTimeout(500);
+  const r = await request.get('/$/vector/world/shipments/projection');
+  const points: { x: number; y: number; class?: number }[] = (await r.json()).points;
+  const [ax, bx, ay, by] = (await map.getAttribute('data-transform'))!.split(',').map(Number);
+  const box = (await map.boundingBox())!;
+  // the densest cell of class 0 at a coarse grid, in viewport pixels
+  const cells = new Map<string, { n: number; x: number; y: number }>();
+  for (const p of points) {
+    if (p.class !== 0) continue;
+    const vx = box.x + ax * p.x + bx;
+    const vy = box.y + ay * p.y + by;
+    const key = `${Math.floor(vx / 80)},${Math.floor(vy / 80)}`;
+    const c = cells.get(key) ?? { n: 0, x: 0, y: 0 };
+    c.n++;
+    c.x += vx;
+    c.y += vy;
+    cells.set(key, c);
+  }
+  const best = [...cells.values()].sort((a, b) => b.n - a.n)[0];
+  const cx = best.x / best.n;
+  const cy = best.y / best.n;
+  await page.getByRole('radio', { name: 'Lasso' }).click();
+  await page.mouse.move(cx + 70, cy);
+  await page.mouse.down();
+  for (let k = 1; k <= 24; k++) {
+    const a = (k / 24) * Math.PI * 2;
+    await page.mouse.move(
+      cx + 70 * Math.cos(a) * (1 + 0.15 * Math.sin(3 * a)),
+      cy + 55 * Math.sin(a),
+    );
+  }
+  await page.mouse.up();
+  await expect(page.getByRole('region', { name: 'Selection' })).toContainText(
+    'selected by the embedding map',
+  );
+  await shoot(page, 'embedding-map');
+});
+
+test('query-facets', async ({ page }) => {
+  // the query page's facets of a variable, with the brushes Apply to query writes
+  await page.addInitScript(() => localStorage.setItem('sparkles.dataset', 'world'));
+  const query = `PREFIX ex: <${WORLD}>
+SELECT ?person ?city WHERE {
+  ?person a ex:Person ;
+    ex:livesIn ?city .
+}
+ORDER BY ?person`;
+  await page.addInitScript(
+    ([q]) =>
+      localStorage.setItem(
+        'sparkles.queryTabs',
+        JSON.stringify({ tabs: [{ id: 't1', title: 'People', query: q }], active: 't1' }),
+      ),
+    [query],
+  );
+  await page.goto('/ui/query?ds=world');
+  await page.getByRole('button', { name: /^Run/ }).click();
+  const results = page.getByRole('region', { name: 'Results' });
+  await expect(results.getByRole('grid')).toBeVisible({ timeout: 30_000 });
+  await results.getByRole('tab', { name: 'Facets' }).click();
+  const panel = page.getByTestId('facet-panel');
+  await expect(panel.getByTestId('facet')).toHaveCount(3, { timeout: 30_000 });
+  const facet = (local: string) =>
+    panel.locator(`[data-testid="facet"][data-property="${WORLD}${local}"]`);
+  await expect(facet('joined').locator('.bin').first()).toBeVisible();
+  await facet('joined')
+    .getByRole('group', { name: /joined histogram/ })
+    .focus();
+  await page.keyboard.press('End');
+  for (let i = 0; i < 4; i++) await page.keyboard.press('Shift+ArrowLeft');
+  await expect(panel.getByTestId('facet-count')).toContainText(/of 41 match/);
+  await panel.getByRole('button', { name: 'Apply to query' }).click();
+  await expect(page.locator('.cm-content')).toContainText('FILTER(YEAR(?joined)');
+  // the toast that confirms the edit would cover the facets
+  await page.getByRole('button', { name: 'Dismiss' }).click();
+  await page.waitForTimeout(400);
+  await shoot(page, 'query-facets');
+});
+
 test('explore-communities', async ({ page }) => {
   // the overview of `world` grouped by its GraphRAG communities (mock/world.mjs), with the
   // report of the head office, which links every region, beside it
@@ -606,6 +719,36 @@ GROUP BY ?p ORDER BY DESC(?n) ?p LIMIT 1`,
   await shoot(page, 'explore-lenses');
 });
 
+test('explore-algo-lenses', async ({ page, request }) => {
+  // algorithm lenses over the drawn graph: nodes sized by PageRank and coloured by Leiden
+  // communities, with the menu's parameters and the legend's community sizes
+  const rows = await request.post('/foaf/sparql', {
+    headers: {
+      'Content-Type': 'application/sparql-query',
+      Accept: 'application/sparql-results+json',
+    },
+    data: `PREFIX foaf: <http://xmlns.com/foaf/0.1/>
+SELECT ?p (COUNT(?o) AS ?n) WHERE { ?p foaf:knows ?o FILTER(STRSTARTS(STR(?p), "http://example.org/resource/")) }
+GROUP BY ?p ORDER BY DESC(?n) ?p LIMIT 1`,
+  });
+  const person = (await rows.json()).results.bindings[0].p.value as string;
+  await page.addInitScript(() => localStorage.setItem('sparkles.dataset', 'foaf'));
+  await page.goto(`/ui/explore?ds=foaf&iri=${encodeURIComponent(person)}`);
+  await expect(page.locator('.wrap[data-graph]')).toBeVisible({ timeout: 30_000 });
+  await page.getByRole('button', { name: /^Lenses/ }).click();
+  const menu = page.getByRole('dialog', { name: 'Lenses' });
+  await menu.getByRole('combobox', { name: 'Size' }).selectOption('pageRank');
+  await menu.getByRole('combobox', { name: 'Colour' }).selectOption('leiden');
+  await expect(page.getByTestId('lens-status-size')).toContainText('iteration', {
+    timeout: 30_000,
+  });
+  await expect(page.getByTestId('lens-status-colour')).toContainText('communit', {
+    timeout: 30_000,
+  });
+  await page.getByRole('button', { name: 'Fit to view' }).click();
+  await shoot(page, 'explore-algo-lenses');
+});
+
 test('pattern-edit', async ({ page }) => {
   // building on the canvas: + Edge from ?person, with the predicate picker ranked by the
   // profile of ex:Person, and a waiting class node beside the drawing
@@ -703,4 +846,56 @@ q:PersonShape a sh:NodeShape ; sh:targetClass q:Person ;
   await panel.getByRole('button', { name: 'Preview' }).click();
   await expect(panel).toContainText('The guard would resolve this result.');
   await shoot(page, 'validation-overlay');
+});
+
+test('forms', async ({ page }) => {
+  // the editing form of a person of `world` in the explorer's panel, generated from the
+  // shapes (mock/forms.mjs): a mistyped email that the browser checks at once, and a
+  // previewed move to a city in Works for, which the server's check reports under the field
+  await page.goto(`/ui/explore?ds=world&iri=${encodeURIComponent(`${WORLD}priya-nair`)}`);
+  const edit = page.getByRole('button', { name: 'Edit', exact: true });
+  await expect(edit).toBeVisible({ timeout: 30_000 });
+  await edit.click();
+  const form = page.getByRole('region', { name: /^Edit Priya Nair/ });
+  await form.getByLabel('Email', { exact: true }).fill('priya.nair@meridian');
+  await form.getByRole('button', { name: 'Clear Lives in' }).click();
+  await form.getByRole('combobox', { name: 'Lives in' }).fill(`<${WORLD}delhi>`);
+  await page.getByRole('option', { name: /Use/ }).click();
+  await form.getByRole('button', { name: 'Clear Works for' }).click();
+  await form.getByRole('combobox', { name: 'Works for' }).fill(`<${WORLD}mumbai>`);
+  await page.getByRole('option', { name: /Use/ }).click();
+  await form.getByRole('button', { name: 'Preview' }).click();
+  await expect(form.locator(`[data-field="<${WORLD}worksFor>"]`)).toContainText('server check');
+  await form
+    .locator(`[data-field="<${WORLD}worksFor>"]`)
+    .evaluate((e) => e.scrollIntoView({ block: 'center' }));
+  await shoot(page, 'forms');
+});
+
+test('forms-branch', async ({ page, request }) => {
+  // the form on its own page after a save while main is protected: the save went to the
+  // editor's session branch, which the banner links to the merge page
+  const p = await request.patch('/$/branches/world/main', { data: { protected: true } });
+  expect(p.ok()).toBe(true);
+  await page.addInitScript(() => localStorage.setItem('sparkles.dataset', 'world'));
+  try {
+    await page.goto(`/ui/datasets/world/edit?iri=${encodeURIComponent(`${WORLD}wei-lin-tan`)}`);
+    const form = page.getByRole('region', { name: /^Edit / });
+    await expect(form.getByRole('note').filter({ hasText: /main is protected/ })).toBeVisible({
+      timeout: 30_000,
+    });
+    await form.getByLabel('Email', { exact: true }).fill('weilin.tan@meridian.example');
+    await form.getByRole('radio', { name: 'Active' }).check();
+    await form
+      .getByLabel('Message', { exact: true })
+      .fill('Add the email and status of Wei Lin Tan');
+    await form.getByRole('button', { name: 'Save', exact: true }).click();
+    await expect(form.getByRole('status').filter({ hasText: 'Editing on branch' })).toBeVisible();
+    await form.getByLabel('Age', { exact: true }).fill('17');
+    // the save's toast goes before the picture
+    await expect(page.getByText(/^Saved commit/)).toHaveCount(0, { timeout: 15_000 });
+    await shoot(page, 'forms-branch');
+  } finally {
+    await request.patch('/$/branches/world/main', { data: { protected: false } });
+  }
 });

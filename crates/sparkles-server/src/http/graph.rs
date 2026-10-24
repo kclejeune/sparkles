@@ -16,8 +16,11 @@
 //! state. Answers are cached per branch, commit, view and request in a small bounded
 //! cache.
 //!
+//! `POST /$/graph/{ds}/facets` answers with [`sparkles::overview::facets_at`] in the same
+//! way, under the same view, budgets and cache.
+//!
 //! Authorization (the route table in `auth/routes.rs`): `read` on `{ds}` through the
-//! query endpoint.
+//! query endpoint, for both routes.
 
 use super::{ApiResult, Params, QueryBody, St, blocking, dataset, err};
 use crate::auth::{Endpoint, Principal};
@@ -32,12 +35,12 @@ use std::time::Instant;
 
 pub(super) mod cache;
 
-use sparkles::overview::GroupsRequest;
+use sparkles::overview::{FacetsRequest, GroupsRequest};
 
 /// The RDFS on read the queries use, for the cache key: a setting can change without a
 /// commit. A fixed schema is named by a hash of its content, a graph source by its graph,
 /// whose content the commit already names.
-fn rdfs_key(rdfs: Option<&sparkles::sparql::rdfs::RdfsOnRead>) -> String {
+pub(in crate::http) fn rdfs_key(rdfs: Option<&sparkles::sparql::rdfs::RdfsOnRead>) -> String {
     use sparkles::sparql::rdfs::RdfsSchema;
     use std::hash::{Hash, Hasher};
     match rdfs.map(|r| &r.source) {
@@ -127,5 +130,64 @@ pub(super) async fn groups(
     .await
 }
 
+/// `POST /$/graph/{ds}/facets` (spec U11 §3.2): the facet histograms of a class, of a
+/// list of IRIs or of the values of a query's variable, with brushes that filter each
+/// other, from [`sparkles::overview::facets_at`]. It runs as the groups route does, under
+/// the caller's view through the query endpoint, with one deadline, the request's memory
+/// grant and the cancellation of a client that goes away, and it shares that route's
+/// answer cache.
+pub(super) async fn facets(
+    st: St,
+    Path(name): Path<String>,
+    Extension(p): Extension<Principal>,
+    uri: Uri,
+    QueryBody(body): QueryBody,
+) -> ApiResult {
+    let ds = dataset(&st, &name)?;
+    let j: J = serde_json::from_slice(&body)
+        .map_err(|e| err(StatusCode::BAD_REQUEST, format!("invalid JSON: {e}")))?;
+    let req = FacetsRequest::from_json(&j)?;
+    let params = Params::from_query(&uri);
+    let mut opts = super::query_options(&st, &ds, &params);
+    crate::auth::restrict(&mut opts, &p, &ds.name, Endpoint::Query);
+    let timeout = opts.timeout.unwrap_or(st.default_timeout);
+    opts.deadline = Some(Instant::now() + timeout);
+    let (cancel, _cancel_on_drop) = super::cancel_on_drop();
+    opts.cancel = Some(cancel);
+    blocking(move || {
+        let started = Instant::now();
+        let (snap, _) = super::history::snapshot_for(&ds, req.at.as_ref(), &opts)?;
+        let key = cache::Key {
+            branch: ds.store.branch_id(),
+            commit: snap.commit,
+            view: cache::view_key(opts.graphs.as_ref()),
+            // a query set reads the prefixes and base the request's options give it
+            extra: format!(
+                "{:?}|{:?}|{:?}|{}|{:?}|{:?}",
+                opts.default_graph_uris,
+                opts.named_graph_uris,
+                opts.default_graph_extra,
+                rdfs_key(opts.rdfs.as_deref()),
+                opts.base_iri,
+                opts.prefixes
+            ),
+            request: req.key(),
+        };
+        if let Some(hit) = cache::get(&key) {
+            return Ok(Json((*hit).clone()).into_response());
+        }
+        let answer = sparkles::overview::facets_at(snap, &req, &opts)
+            .map_err(|e| super::with_timeout(e.into(), Some(timeout)))?;
+        tracing::debug!("/{}: facets answered in {:?}", ds.name, started.elapsed());
+        let answer = Arc::new(answer);
+        cache::put(key, answer.clone());
+        Ok(Json((*answer).clone()).into_response())
+    })
+    .await
+}
+
 #[cfg(test)]
 mod tests;
+
+#[cfg(test)]
+mod facets_tests;

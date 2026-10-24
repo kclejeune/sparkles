@@ -4,9 +4,10 @@
 //! had when the build started. When the build input passes that, or a charge for it or
 //! for its hash table fails, the join picks its key column as the in-memory join does
 //! and writes the build rows to [`JoinSpill::fanout`] files by a seeded hash of the key.
-//! Build rows that leave the key unbound are compatible with every probe row, so they
-//! stay in memory. The probe input is then written to files by the same hash, and probe
-//! rows that leave the key unbound go to a file of their own.
+//! Build rows that leave the key unbound are compatible with every probe row. They stay
+//! in memory while they fill at most a quarter of a chunk, and go to a file of their own
+//! once they are more. The probe input is then written to files by the same
+//! hash, and probe rows that leave the key unbound go to a file of their own.
 //!
 //! Each partition is then joined in turn by the in-memory kernels of [`Binary`]: its
 //! build file, with the unbound build rows, is read into a table with a hash index, and
@@ -17,6 +18,13 @@
 //! once per chunk, and a bitmap of the probe rows that matched decides, after the last
 //! chunk, which rows OPTIONAL, semi, anti and MINUS joins emit alone. The unbound probe
 //! rows are joined in the same way against every build file.
+//!
+//! Unbound build rows on disk are not part of any partition, so they never count toward
+//! the decision to partition again and are never copied into the files of a deeper
+//! level. An inner join meets them in one job of their own, which reads every probe file
+//! against them in chunks. The other joins decide a probe row from all its candidates at
+//! once, so each of their jobs reads the unbound build file as further chunks after its
+//! partition's build rows.
 //!
 //! Output order changes when a join spills. An operator above may rely on the order of
 //! the probe input, which the cursor fixes when it is built, so such a join numbers its
@@ -66,6 +74,19 @@ pub(super) fn mix(mut z: u64) -> u64 {
     z = (z ^ (z >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
     z = (z ^ (z >> 27)).wrapping_mul(0x94d0_49bb_1331_11eb);
     z ^ (z >> 31)
+}
+
+/// A hash of a row's key for the partitions of a spilled grouping or DISTINCT, seeded
+/// by the partitioning depth. Each column is mixed into a state that starts from the
+/// seed, so two different keys share a partition at one depth and at the next only by
+/// chance. A seeded mix of the row's FxHash kept rows whose FxHash values collide in one
+/// partition at every depth, since the seed cannot separate equal hashes.
+pub(super) fn row_hash(depth: u64, key: impl IntoIterator<Item = Id>) -> u64 {
+    let mut state = mix(depth.wrapping_add(1).wrapping_mul(0x9e37_79b9_7f4a_7c15) ^ 0x5bd1_e995);
+    for id in key {
+        state = mix(state ^ id.0);
+    }
+    state
 }
 
 /// The bytes a table of `rows` rows of `width` columns and a hash index over it may
@@ -187,7 +208,11 @@ impl Parts {
 /// candidates.
 struct Job {
     builds: Vec<Arc<SpillRun>>,
-    probe: Arc<SpillRun>,
+    /// The probe files, read one after the other. Only the job of an inner join's
+    /// unbound build rows has more than one.
+    probes: Vec<Arc<SpillRun>>,
+    /// Whether the unbound build rows on disk follow `builds` as further chunks.
+    unbound: bool,
     /// How many times the rows were partitioned, which seeds the next partitioning.
     level: u64,
     /// Whether the probe rows bind the key, so that a hash index on it finds their
@@ -200,6 +225,19 @@ impl Job {
     fn build_rows(&self) -> u64 {
         self.builds.iter().map(|run| run.rows()).sum()
     }
+
+    fn probe_rows(&self) -> u64 {
+        self.probes.iter().map(|run| run.rows()).sum()
+    }
+}
+
+/// What reading the next probe batch of a pass found.
+enum Probe {
+    Batch,
+    /// The pass moved on to its next probe file. Rows that follow may have smaller probe
+    /// row numbers than rows before.
+    NextFile,
+    End,
 }
 
 /// The build rows of a job, read in chunks.
@@ -225,6 +263,8 @@ struct Pass {
     /// The probe file's reader for the current chunk, or for the last pass that emits
     /// the rows whose verdict waited.
     reader: Option<SpillReader>,
+    /// The probe file `reader` reads.
+    probe_at: usize,
     /// The probe file's row of the current probe batch's first row.
     base: u64,
     /// The rows of the probe file read so far in this pass.
@@ -551,8 +591,17 @@ pub(super) struct JoinSpill {
     budget: u64,
     /// The rows of a partition file's frames.
     frame_rows: usize,
-    /// Build rows that leave the key unbound, which every probe row may match.
+    /// Build rows that leave the key unbound, which every probe row may match, while
+    /// they number at most [`Self::unbound_rows`].
     unbound: Buffer,
+    /// The most unbound build rows held in memory: a quarter of a chunk, so that they
+    /// leave most of every chunk to the partition's own rows.
+    unbound_rows: u64,
+    /// The unbound build rows once they outgrew memory, while the build input is read,
+    /// buffered into whole frames as the partition files are.
+    unbound_writer: Option<Parts>,
+    /// The unbound build rows on disk.
+    unbound_run: Option<Arc<SpillRun>>,
     /// The build files of the first partitioning, until the probe input is partitioned.
     builds: Vec<Option<Arc<SpillRun>>>,
     /// The next probe row's number, when the output keeps the probe input's order.
@@ -617,6 +666,9 @@ impl JoinSpill {
             budget,
             frame_rows,
             unbound: Buffer::new(ctx, &binary.build_vars, 0)?,
+            unbound_rows: ((budget / 2) / chunk_row_bytes(width) / 4).max(1),
+            unbound_writer: None,
+            unbound_run: None,
             builds: Vec::new(),
             seq: 0,
             probed: false,
@@ -643,6 +695,11 @@ impl JoinSpill {
         let (builds, bytes) = parts.finish()?;
         spill.stats.written += bytes;
         spill.builds = builds;
+        if let Some(writer) = spill.unbound_writer.take() {
+            let (mut runs, bytes) = writer.finish()?;
+            spill.stats.written += bytes;
+            spill.unbound_run = runs.pop().flatten();
+        }
         Ok(spill)
     }
 
@@ -659,13 +716,34 @@ impl JoinSpill {
                 parts.push(partition(key, 0, self.fanout), &table.cols, row, None)?;
             }
         }
-        if !unbound.is_empty() {
-            let mut rows = Table::new(table.vars.clone());
-            for (to, from) in rows.cols.iter_mut().zip(&table.cols) {
-                to.extend(unbound.iter().map(|&row| from[row]));
+        if unbound.is_empty() {
+            return Ok(());
+        }
+        let held = self.unbound.table.len as u64 + unbound.len() as u64;
+        if self.unbound_writer.is_none() && held > self.unbound_rows {
+            // The unbound build rows outgrow their share of memory: they continue on
+            // disk, and the rows held so far go first.
+            let mut writer = Parts::new(ctx, &self.query, table.width(), 1, self.frame_rows)?;
+            let held = std::mem::replace(&mut self.unbound, Buffer::new(ctx, &table.vars, 0)?);
+            for row in 0..held.table.len {
+                writer.push(0, &held.table.cols, row, None)?;
             }
-            rows.len = unbound.len();
-            merge::append(ctx, &mut self.unbound, &rows, 0..unbound.len())?;
+            self.unbound_writer = Some(writer);
+        }
+        match &mut self.unbound_writer {
+            Some(writer) => {
+                for &row in &unbound {
+                    writer.push(0, &table.cols, row, None)?;
+                }
+            }
+            None => {
+                let mut rows = Table::new(table.vars.clone());
+                for (to, from) in rows.cols.iter_mut().zip(&table.cols) {
+                    to.extend(unbound.iter().map(|&row| from[row]));
+                }
+                rows.len = unbound.len();
+                merge::append(ctx, &mut self.unbound, &rows, 0..rows.len)?;
+            }
         }
         Ok(())
     }
@@ -694,15 +772,23 @@ impl JoinSpill {
         let builds = std::mem::take(&mut self.builds);
         // A probe row without candidates still passes an OPTIONAL, anti or MINUS join.
         let alone = matches!(binary.mode, Mode::Optional | Mode::Anti | Mode::Minus);
-        let has_unbound = self.unbound.table.len > 0;
+        // An inner join meets the unbound build rows on disk in a job of their own.
+        let separate = self.unbound_run.is_some() && binary.mode == Mode::Inner;
+        let in_jobs = self.unbound_run.is_some() && !separate;
+        let has_unbound = self.unbound.table.len > 0 || in_jobs;
+        let mut every_probe = Vec::new();
         for (probe, build) in probes.into_iter().zip(&builds) {
             let Some(probe) = probe else { continue };
+            if separate {
+                every_probe.push(probe.clone());
+            }
             if build.is_none() && !has_unbound && !alone {
                 continue;
             }
             self.jobs.push(Job {
                 builds: build.iter().cloned().collect(),
-                probe,
+                probes: vec![probe],
+                unbound: in_jobs,
                 level: 0,
                 keyed: true,
             });
@@ -710,15 +796,28 @@ impl JoinSpill {
         // The unbound probe rows meet every build file, before the partitions' jobs
         // free them.
         if let Some(probe) = unbound_probe {
+            if separate {
+                every_probe.push(probe.clone());
+            }
             let all: Vec<_> = builds.into_iter().flatten().collect();
             if !all.is_empty() || has_unbound || alone {
                 self.jobs.push(Job {
                     builds: all,
-                    probe,
+                    probes: vec![probe],
+                    unbound: in_jobs,
                     level: MAX_LEVEL,
                     keyed: false,
                 });
             }
+        }
+        if separate && !every_probe.is_empty() {
+            self.jobs.push(Job {
+                builds: self.unbound_run.iter().cloned().collect(),
+                probes: every_probe,
+                unbound: false,
+                level: MAX_LEVEL,
+                keyed: false,
+            });
         }
         binary.row = 0;
         binary.offset = 0;
@@ -780,20 +879,22 @@ impl JoinSpill {
         self.stats.written += bytes;
         let probe_width = binary.probe_vars.len() + usize::from(binary.ordered);
         let mut probes = Parts::new(ctx, &self.query, probe_width, self.fanout, self.frame_rows)?;
-        let mut reader = job.probe.reader()?;
-        while let Some((columns, rows)) = reader.next_frame()? {
-            ctx.check()?;
-            for row in 0..rows {
-                let part = partition(columns[self.key.0][row], level, self.fanout);
-                probes.push(part, &columns, row, None)?;
+        for run in &job.probes {
+            let mut reader = run.reader()?;
+            while let Some((columns, rows)) = reader.next_frame()? {
+                ctx.check()?;
+                for row in 0..rows {
+                    let part = partition(columns[self.key.0][row], level, self.fanout);
+                    probes.push(part, &columns, row, None)?;
+                }
             }
         }
-        drop(reader);
+        let unbound = job.unbound;
         drop(job);
         let (probes, bytes) = probes.finish()?;
         self.stats.written += bytes;
         let alone = matches!(binary.mode, Mode::Optional | Mode::Anti | Mode::Minus);
-        let has_unbound = self.unbound.table.len > 0;
+        let has_unbound = self.unbound.table.len > 0 || unbound;
         for (probe, build) in probes.into_iter().zip(builds) {
             let Some(probe) = probe else { continue };
             if build.is_none() && !has_unbound && !alone {
@@ -802,7 +903,8 @@ impl JoinSpill {
             let rows = build.as_ref().map_or(0, |b| b.rows());
             self.jobs.push(Job {
                 builds: build.into_iter().collect(),
-                probe,
+                probes: vec![probe],
+                unbound,
                 // A partition that did not shrink holds a heavy key, which another
                 // partitioning would not divide.
                 level: if rows * 10 > parent * 9 {
@@ -897,15 +999,22 @@ impl JoinSpill {
             let width = binary.build_vars.len();
             binary.index = None;
             binary.build = None;
-            let fits =
-                job.build_rows() + self.unbound.table.len as u64 <= self.chunk_rows(ctx, width);
-            if !fits && job.keyed && job.level < MAX_LEVEL {
+            let chunk = self.chunk_rows(ctx, width);
+            // The rows of the partition and the unbound rows in memory: only these may
+            // shrink by partitioning again.
+            let partitioned = job.build_rows() + self.unbound.table.len as u64;
+            let on_disk = match &self.unbound_run {
+                Some(run) if job.unbound => run.rows(),
+                _ => 0,
+            };
+            let fits = partitioned + on_disk <= chunk;
+            if partitioned > chunk && job.keyed && job.level < MAX_LEVEL {
                 self.repartition(ctx, binary, job)?;
                 continue;
             }
             // The verdicts of an inner join need no bitmap.
             let deferred = !fits;
-            let probe_rows = job.probe.rows();
+            let probe_rows = job.probe_rows();
             let needs_bits = deferred && binary.mode != Mode::Inner;
             let words = if needs_bits {
                 probe_rows.div_ceil(64) as usize
@@ -915,7 +1024,12 @@ impl JoinSpill {
             let charge = ctx.retained_charge(words as u64 * 8 + 64)?;
             self.pass = Some(Pass {
                 chunks: Chunks {
-                    runs: job.builds.clone(),
+                    runs: job
+                        .builds
+                        .iter()
+                        .chain(self.unbound_run.iter().filter(|_| job.unbound))
+                        .cloned()
+                        .collect(),
                     at: 0,
                     reader: None,
                     started: false,
@@ -925,6 +1039,7 @@ impl JoinSpill {
                 matched: vec![0; words],
                 _matched_charge: charge,
                 reader: None,
+                probe_at: 0,
                 base: 0,
                 read: 0,
                 seq: Vec::new(),
@@ -945,7 +1060,8 @@ impl JoinSpill {
     fn restart_probe(&mut self, binary: &mut Binary) -> Result<()> {
         self.restarted = true;
         let pass = self.pass.as_mut().expect("a running pass");
-        pass.reader = Some(pass.job.probe.reader()?);
+        pass.reader = Some(pass.job.probes[0].reader()?);
+        pass.probe_at = 0;
         pass.base = 0;
         pass.read = 0;
         binary.probe = None;
@@ -955,15 +1071,21 @@ impl JoinSpill {
         Ok(())
     }
 
-    /// The next probe batch of the current pass into the kernel. False at the end of the
+    /// The next probe batch of the current pass into the kernel, or the start of its next
     /// probe file.
-    fn next_probe(&mut self, ctx: &Arc<Ctx>, binary: &mut Binary) -> Result<bool> {
+    fn next_probe(&mut self, ctx: &Arc<Ctx>, binary: &mut Binary) -> Result<Probe> {
         let pass = self.pass.as_mut().expect("a running pass");
         ctx.check()?;
         let Some((mut columns, n)) = pass.reader.as_mut().expect("a probe reader").next_frame()?
         else {
             binary.probe = None;
-            return Ok(false);
+            if pass.probe_at + 1 < pass.job.probes.len() {
+                pass.probe_at += 1;
+                pass.reader = Some(pass.job.probes[pass.probe_at].reader()?);
+                self.restarted = true;
+                return Ok(Probe::NextFile);
+            }
+            return Ok(Probe::End);
         };
         pass.seq = if binary.ordered {
             columns.pop().expect("a number column")
@@ -982,7 +1104,7 @@ impl JoinSpill {
         binary.row = 0;
         binary.offset = 0;
         binary.matched = false;
-        Ok(true)
+        Ok(Probe::Batch)
     }
 
     /// Join more of the spilled partitions: append at most `room` rows to `out`, with
@@ -1009,9 +1131,17 @@ impl JoinSpill {
             .probe
             .as_ref()
             .is_some_and(|b| binary.row < b.table.len);
-        if !probe_live && !self.next_probe(ctx, binary)? {
-            self.end_of_probe(ctx, binary)?;
-            return Ok(true);
+        if !probe_live {
+            match self.next_probe(ctx, binary)? {
+                Probe::Batch => {}
+                // The new file's rows come in the next step, after the spooler saw the
+                // boundary.
+                Probe::NextFile => return Ok(true),
+                Probe::End => {
+                    self.end_of_probe(ctx, binary)?;
+                    return Ok(true);
+                }
+            }
         }
         let pass = self.pass.as_mut().expect("a running pass");
         lp.clear();
@@ -1255,6 +1385,137 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// `n` different two-column rows whose FxHash values are all equal: FxHash adds
+    /// each word to its state and multiplies by a constant, so rows `(a, c - a K)`
+    /// collide. The values of `a` are scattered, so the rows compress no better than
+    /// other rows.
+    fn fx_colliding_rows(n: u64) -> Vec<[Id; 2]> {
+        use std::hash::{Hash, Hasher};
+        const K: u64 = 0xf135_7aea_2e62_a9c5;
+        let c = 0x1234_5678_9abc_def0u64;
+        let rows: Vec<[Id; 2]> = (1..=n)
+            .map(|i| {
+                let a = mix(i);
+                [Id(a), Id(c.wrapping_sub(a.wrapping_mul(K)))]
+            })
+            .collect();
+        let fx = |row: &[Id; 2]| {
+            let mut hasher = rustc_hash::FxHasher::default();
+            row[0].hash(&mut hasher);
+            row[1].hash(&mut hasher);
+            hasher.finish()
+        };
+        assert!(
+            rows.iter().all(|row| fx(row) == fx(&rows[0])),
+            "rows must collide"
+        );
+        assert!(
+            rows.iter()
+                .all(|row| !row[0].is_undef() && !row[1].is_undef())
+        );
+        let mut firsts: Vec<Id> = rows.iter().map(|row| row[0]).collect();
+        firsts.sort_unstable();
+        firsts.dedup();
+        assert_eq!(firsts.len() as u64, n, "rows must differ");
+        rows
+    }
+
+    /// Rows whose FxHash values collide spread over the partitions of a spilled grouping
+    /// or DISTINCT at every depth, independently of the depth before.
+    #[test]
+    fn colliding_rows_spread_over_the_partitions_at_every_depth() {
+        let rows = fx_colliding_rows(64_000);
+        for depth in 0..4u64 {
+            let first: Vec<_> = rows
+                .iter()
+                .filter(|row| row_hash(depth, row.iter().copied()) >> 60 == 0)
+                .collect();
+            let mut counts = [0usize; 16];
+            for row in &first {
+                counts[(row_hash(depth + 1, row.iter().copied()) >> 60) as usize] += 1;
+            }
+            let even = first.len() / 16;
+            assert!(
+                counts.iter().all(|&c| c > even * 3 / 4 && c < even * 5 / 4),
+                "depth {depth}: {counts:?}"
+            );
+        }
+    }
+
+    /// A spilled DISTINCT over rows whose FxHash values collide writes about what it
+    /// writes for other rows. Before the fix every pass passed all the rows it did not
+    /// keep to one partition, so the passes and the bytes grew with the square of the
+    /// input.
+    #[test]
+    fn spilled_distinct_of_colliding_rows_is_not_amplified() {
+        let tmp = tempfile::tempdir().unwrap();
+        let spill = crate::spill::Spill::open(&crate::spill::SpillOptions {
+            dir: tmp.path().to_path_buf(),
+            max_bytes: 1 << 34,
+            query_bytes: 1 << 34,
+            min_free_bytes: 0,
+            encrypted: false,
+        })
+        .unwrap();
+        const N: u64 = 120_000;
+        let colliding = fx_colliding_rows(N);
+        // The same number of rows with ordinary values.
+        let ordinary: Vec<[Id; 2]> = (1..=N).map(|i| [Id(mix(i)), Id(mix(i + N))]).collect();
+        let mut measured = Vec::new();
+        for rows in [&ordinary, &colliding] {
+            let mut table = Table::new(vec![KEY, LEFT]);
+            for row in rows.iter().chain(rows.iter().step_by(7)) {
+                table.push_row(row);
+            }
+            let mut input = Node::leaf(
+                Kind::Empty,
+                vec![KEY, LEFT],
+                table.len as f64,
+                String::new(),
+            );
+            input.certain.clear();
+            input.kind = Kind::Values(table);
+            let mut node = Node::leaf(Kind::Distinct, vec![KEY, LEFT], N as f64, String::new());
+            node.certain.clear();
+            node.children = vec![input];
+            let ctx = context(1 << 20, Some(&spill));
+            let mut op =
+                Operator::build(&ctx, node, FallbackPolicy::RejectMaterialization).unwrap();
+            let options = CursorOptions::default();
+            let mut out = 0;
+            while let Some(batch) = op.next(&ctx, &options, 4096).unwrap() {
+                out += batch.table.len as u64;
+            }
+            assert_eq!(out, N);
+            let mut plan = op.describe(&ctx);
+            op.update_plan(&mut plan);
+            let counters = plan.operator.counters.clone().unwrap_or_default();
+            let counter = |name: &str| counters.get(name).and_then(serde_json::Value::as_u64);
+            let bytes = counter("spilledBytes").unwrap_or(0);
+            let passes = counter("spillPasses").unwrap_or(0);
+            assert!(bytes > 0, "{counters:?}");
+            eprintln!("distinct: {bytes} bytes spilled in {passes} passes");
+            measured.push((bytes, passes));
+            drop(op);
+            drop(ctx);
+            assert_eq!(spill.reserved_bytes(), 0);
+        }
+        let [
+            (ordinary_bytes, ordinary_passes),
+            (colliding_bytes, colliding_passes),
+        ] = measured[..]
+        else {
+            unreachable!()
+        };
+        assert!(
+            colliding_bytes * 2 <= ordinary_bytes * 3,
+            "colliding rows wrote {colliding_bytes} bytes, ordinary rows {ordinary_bytes}"
+        );
+        // Colliding rows used to need fewer passes than ordinary rows, each rewriting all
+        // the rows it did not keep, so only the bytes show the amplification.
+        let _ = (ordinary_passes, colliding_passes);
     }
 
     fn context(limit: u64, spill: Option<&Arc<crate::spill::Spill>>) -> Arc<Ctx> {
@@ -1548,6 +1809,255 @@ mod tests {
         drop(partitions);
         drop(ctx);
         assert_eq!(spill.reserved_bytes(), 0);
+    }
+
+    /// An order-independent digest of a bag of rows and its size, so that large
+    /// results compare without holding them as row vectors.
+    fn bag_digest<'a>(rows: impl Iterator<Item = &'a [Id]>) -> (u64, u64, u64) {
+        let (mut count, mut sum, mut xor) = (0u64, 0u64, 0u64);
+        for row in rows {
+            let h = row_hash(99, row.iter().copied());
+            count += 1;
+            sum = sum.wrapping_add(h);
+            xor ^= mix(h);
+        }
+        (count, sum, xor)
+    }
+
+    fn table_digest(table: &Table) -> (u64, u64, u64) {
+        let rows: Vec<Vec<Id>> = rows(table);
+        bag_digest(rows.iter().map(Vec::as_slice))
+    }
+
+    /// Build rows that leave the key unbound and outgrow a chunk go to a file of their
+    /// own. They neither make every partition partition again to the last level nor
+    /// stay in memory, and every join mode still gives eager execution's bag. Ordered
+    /// probe input keeps its order, including through the inner join's job of the
+    /// unbound build rows, which reads several probe files. Before the fix the join
+    /// failed its memory budget, and with the unbound rows in memory but past a chunk,
+    /// every job partitioned again to the last level.
+    #[test]
+    fn unbound_build_rows_do_not_partition_every_job_again() {
+        let tmp = tempfile::tempdir().unwrap();
+        let spill = crate::spill::Spill::open(&crate::spill::SpillOptions {
+            dir: tmp.path().to_path_buf(),
+            max_bytes: 1 << 34,
+            query_bytes: 1 << 34,
+            min_free_bytes: 0,
+            encrypted: false,
+        })
+        .unwrap();
+        let int = |i: i64| Id::from_i64(i).unwrap();
+        let table = |vars: Vec<VarId>, rows: Vec<Vec<Id>>, est: f64, order: Option<VarId>| {
+            let mut table = Table::new(vars.clone());
+            for row in &rows {
+                table.push_row(row);
+            }
+            let mut node = Node::leaf(Kind::Empty, vars.clone(), est, String::new());
+            node.certain.clear();
+            if let Some(var) = order {
+                table.sorted = vec![var];
+                node.sorted = vec![var];
+                node.certain = vec![var];
+            }
+            node.kind = Kind::Values(table);
+            node
+        };
+        let kinds = [
+            Kind::Join {
+                algo: JoinAlgo::Hash,
+                keys: vec![KEY],
+            },
+            Kind::LeftJoin { expr: None },
+            Kind::HalfJoin { anti: false },
+            Kind::HalfJoin { anti: true },
+            Kind::Minus,
+        ];
+        // Under the larger budget the unbound build rows fit in memory but not in a chunk.
+        // Under the smaller one they outgrow memory. One build row in ten unbound fills a
+        // chunk without filling an eighth of the budget.
+        for (build_rows, limit, every) in [
+            (20_000, 768u64 << 10, 2),
+            (20_000, 768 << 10, 10),
+            (6000, 192 << 10, 2),
+        ] {
+            for ordered in [false, true] {
+                for kind in &kinds {
+                    // Probe rows, a few with the key unbound, in the order of their
+                    // own column when `ordered`.
+                    let left = table(
+                        vec![KEY, LEFT],
+                        (0..160)
+                            .map(|i| {
+                                let key = if i % 37 == 0 {
+                                    Id::UNDEF
+                                } else {
+                                    int(i * 5 % 900)
+                                };
+                                vec![key, int(i)]
+                            })
+                            .collect(),
+                        1e6,
+                        ordered.then_some(LEFT),
+                    );
+                    // One build row in `every` leaves the key unbound.
+                    let right = table(
+                        vec![KEY, RIGHT],
+                        (0..build_rows)
+                            .map(|i| {
+                                let key = if i % every == 0 {
+                                    Id::UNDEF
+                                } else {
+                                    int(i % 900)
+                                };
+                                vec![key, int(i % 50)]
+                            })
+                            .collect(),
+                        build_rows as f64,
+                        None,
+                    );
+                    let node = binary(kind.clone(), left, right);
+                    let expected =
+                        table_digest(&exec::execute(&context(u64::MAX, None), &node).unwrap().0);
+                    let ctx = context(limit, Some(&spill));
+                    let mut op =
+                        Operator::build(&ctx, node.clone(), FallbackPolicy::RejectMaterialization)
+                            .unwrap();
+                    let case = format!(
+                        "{} ordered {ordered} build {build_rows} unbound 1/{every}",
+                        node.operator()
+                    );
+                    let probe_order = op.order.first() == Some(&LEFT);
+                    assert_eq!(probe_order, ordered, "{case}: order kept");
+                    let options = CursorOptions {
+                        batch_rows: 512,
+                        ..Default::default()
+                    };
+                    let left_column = node.vars.iter().position(|&v| v == LEFT).unwrap();
+                    let (mut count, mut sum, mut xor) = (0u64, 0u64, 0u64);
+                    let mut last: Option<Id> = None;
+                    while let Some(batch) = op
+                        .next(&ctx, &options, 512)
+                        .unwrap_or_else(|e| panic!("{case}: {e}"))
+                    {
+                        let rows = rows(&batch.table);
+                        if ordered {
+                            for row in &rows {
+                                let value = row[left_column];
+                                assert!(last.is_none_or(|l| l <= value), "{case}: out of order");
+                                last = Some(value);
+                            }
+                        }
+                        let (c, s, x) = bag_digest(rows.iter().map(Vec::as_slice));
+                        count += c;
+                        sum = sum.wrapping_add(s);
+                        xor ^= x;
+                    }
+                    assert_eq!((count, sum, xor), expected, "{case}");
+                    let mut plan = op.describe(&ctx);
+                    op.update_plan(&mut plan);
+                    let counters = plan.operator.counters.clone().unwrap_or_default();
+                    let counter =
+                        |name: &str| counters.get(name).and_then(serde_json::Value::as_u64);
+                    eprintln!("{case}: {counters:?}");
+                    assert!(
+                        counter("spilledBytes").unwrap_or(0) > 0,
+                        "{case}: {counters:?}"
+                    );
+                    assert_eq!(counter("spillLevels"), Some(1), "{case}: {counters:?}");
+                    if ordered {
+                        assert!(
+                            counter("spillMergePasses").unwrap_or(0) > 0,
+                            "{case}: the ordered output was not spooled: {counters:?}"
+                        );
+                    }
+                    assert!(ctx.mem_peak() <= limit, "{case}");
+                    drop(op);
+                    drop(ctx);
+                    assert_eq!(spill.reserved_bytes(), 0, "{case}");
+                }
+            }
+        }
+    }
+
+    /// Unbound build rows on disk fill whole frames whatever the input's batch size, so
+    /// one-row batches write about what large batches write. Writing each batch as a
+    /// frame of its own made the file many times larger at batch size 1.
+    #[test]
+    fn unbound_build_rows_fill_whole_frames() {
+        let tmp = tempfile::tempdir().unwrap();
+        let spill = crate::spill::Spill::open(&crate::spill::SpillOptions {
+            dir: tmp.path().to_path_buf(),
+            max_bytes: 1 << 34,
+            query_bytes: 1 << 34,
+            min_free_bytes: 0,
+            encrypted: false,
+        })
+        .unwrap();
+        let int = |i: i64| Id::from_i64(i).unwrap();
+        let values = |vars: Vec<VarId>, rows: Vec<Vec<Id>>, est: f64| {
+            let mut table = Table::new(vars.clone());
+            for row in &rows {
+                table.push_row(row);
+            }
+            let mut node = Node::leaf(Kind::Empty, vars, est, String::new());
+            node.certain.clear();
+            node.kind = Kind::Values(table);
+            node
+        };
+        let node = binary(
+            Kind::Join {
+                algo: JoinAlgo::Hash,
+                keys: vec![KEY],
+            },
+            values(
+                vec![KEY, LEFT],
+                (0..64).map(|i| vec![int(i * 7 % 900), int(i)]).collect(),
+                1e6,
+            ),
+            values(
+                vec![KEY, RIGHT],
+                (0..40_000)
+                    .map(|i| {
+                        let key = if i % 2 == 0 { Id::UNDEF } else { int(i % 900) };
+                        vec![key, int(i % 50)]
+                    })
+                    .collect(),
+                40_000.0,
+            ),
+        );
+        let mut written = Vec::new();
+        for batch_rows in [1, 512] {
+            let ctx = context(192 << 10, Some(&spill));
+            let mut op =
+                Operator::build(&ctx, node.clone(), FallbackPolicy::RejectMaterialization).unwrap();
+            let options = CursorOptions {
+                batch_rows,
+                ..Default::default()
+            };
+            while op.next(&ctx, &options, 4096).unwrap().is_some() {}
+            let mut plan = op.describe(&ctx);
+            op.update_plan(&mut plan);
+            let bytes = plan
+                .operator
+                .counters
+                .as_ref()
+                .and_then(|c| c.get("spilledBytes"))
+                .and_then(serde_json::Value::as_u64)
+                .unwrap_or(0);
+            eprintln!("batch {batch_rows}: {bytes} bytes spilled");
+            written.push(bytes);
+            drop(op);
+            drop(ctx);
+            assert_eq!(spill.reserved_bytes(), 0);
+        }
+        assert!(written[1] > 0);
+        assert!(
+            written[0] * 2 <= written[1] * 3,
+            "batch size 1 wrote {} bytes, 512 wrote {}",
+            written[0],
+            written[1]
+        );
     }
 
     /// Every join mode, with one and two shared variables, unbound keys on both sides,

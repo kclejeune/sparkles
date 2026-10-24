@@ -8,7 +8,7 @@
 >
 > **User docs:** [Usage: Loading CSV and TSV](../USAGE.md#loading-csv-and-tsv) ·
 > [API: CSV and TSV uploads](../API.md#csv-and-tsv-uploads) ·
-> [Features](../FEATURES.md#storage-tdb2-equivalent)
+> [Features](../FEATURES.md#storage-and-indexes)
 >
 > This is the design as written before implementation. The [Outcome](#outcome) section at
 > the end records how it landed.
@@ -645,3 +645,7 @@ The items this spec left out are now designed in
   uploads. See F19 §2.2 and §8.
 - **CSV in the Graph Store protocol** (§7, §8). `PUT` and `POST` on `/{ds}/data` take
   `text/csv` with `mapping=NAME` or `base`. See F19 §2.3.
+
+These follow-ups shipped on 2026-10-24 with F19 Phase 1, except the PostgreSQL source,
+which is roadmap item 230. The [F19 Outcome](F19-mappings-and-virtual-graphs.md#outcome)
+records what landed and the decisions made.

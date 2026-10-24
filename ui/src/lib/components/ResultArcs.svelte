@@ -2,7 +2,6 @@
   // The Arcs mode of a result's Map tab (docs/specs/U11-linked-views.md, section 2.2): one
   // arc per row, from a first column to a second, labelled by a third when one is chosen.
   // The columns hold geometries or entities that have geometries.
-  import { onDestroy, untrack } from 'svelte';
   import * as api from '$lib/api';
   import { capPlaces, MAX_ARCS, type Link, type Place } from '$lib/arcs';
   import { fmtInt } from '$lib/format';
@@ -15,9 +14,7 @@
   } from '$lib/result-arcs';
   import type { PrefixMap } from '$lib/rdf';
   import type { Mark } from '$lib/rowdiff';
-  import { selection } from '$lib/selection.svelte';
   import ArcMap from './ArcMap.svelte';
-  import SelectionBar from './SelectionBar.svelte';
 
   let {
     vars,
@@ -43,8 +40,6 @@
     marks?: readonly Mark[];
     onopen?: (iri: string) => void;
   } = $props();
-
-  onDestroy(() => selection.clear());
 
   const candidates = $derived(arcColumns(vars, rows));
   let from = $state('');
@@ -74,7 +69,6 @@
     located = null;
     selectedRow = null;
     listShown = 100;
-    untrack(() => selection.clear());
     if (!ends.size) {
       progress = '';
       return;
@@ -163,7 +157,6 @@
         )}{/if}
     </span>
   </div>
-  <SelectionBar />
   <div class="body">
     <ArcMap
       {places}

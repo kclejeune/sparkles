@@ -373,6 +373,18 @@ fn imports_in(snap: &Snapshot, g: Id, warnings: &mut Vec<String>) -> Vec<String>
 
 /// The graphs `inputs` reads in `snap`, with the imports resolved.
 pub fn resolve(snap: &Snapshot, inputs: &Inputs) -> Resolved {
+    resolve_readable(snap, inputs, &|_| true)
+}
+
+/// [`resolve`] for a caller who reads only the graphs `readable` admits. Imports are
+/// followed only through readable graphs, a graph the caller cannot read counts as
+/// absent, and no warning names what such a graph holds.
+pub fn resolve_readable(
+    snap: &Snapshot,
+    inputs: &Inputs,
+    readable: &dyn Fn(Id) -> bool,
+) -> Resolved {
+    let id = |g: &GraphRef| g.id(snap).filter(|i| readable(*i));
     let mut r = Resolved {
         graphs: inputs.configured(),
         ..Default::default()
@@ -389,7 +401,7 @@ pub fn resolve(snap: &Snapshot, inputs: &Inputs) -> Resolved {
     let mut seen: BTreeSet<String> = BTreeSet::new();
     let mut i = 0;
     while i < r.graphs.len() {
-        let Some(g) = r.graphs[i].id(snap) else {
+        let Some(g) = id(&r.graphs[i]) else {
             i += 1;
             continue;
         };
@@ -406,7 +418,7 @@ pub fn resolve(snap: &Snapshot, inputs: &Inputs) -> Resolved {
                 break;
             }
             let location = inputs.location_mapping.map(&iri);
-            let exists = |name: &str| GraphRef::Named(name.to_string()).id(snap).is_some();
+            let exists = |name: &str| id(&GraphRef::Named(name.to_string())).is_some();
             let graph = if exists(&iri) {
                 Some(iri.clone())
             } else if location != iri && exists(&location) {

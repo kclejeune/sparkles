@@ -31,7 +31,13 @@
   import { shortLabel, triplesToGraph, type Triple } from '$lib/graph';
   import { addMissingPrefixes, applyMissingPrefixes, queryKind, RDF_TYPE, termKey } from '$lib/rdf';
   import { formatEditor } from '$lib/fmt-edit';
-  import { formatAny, lintAny } from '$lib/fmt-wasm';
+  import { formatAny, lintAny, patternLocal, patternNow } from '$lib/fmt-wasm';
+  import FacetPanel from '$components/FacetPanel.svelte';
+  import SelectionBar from '$components/SelectionBar.svelte';
+  import { selection } from '$lib/selection.svelte';
+  import { brushEdits, composeEdits, VALUES_CAP, type Brush } from '$lib/facets';
+  import type { AnyEdit } from '$lib/pattern-edits';
+  import { toSparql } from '$lib/rdf';
   import { lintCounts, lintSummary } from '$lib/lint-view';
   import { LatestRun } from '$lib/supersede';
   import { load, save } from '$lib/storage';
@@ -120,7 +126,7 @@
     | { state: 'loading' }
     | { state: 'done'; d: askApi.Diagnosis }
     | { state: 'error' };
-  type View = 'table' | 'graph' | 'map' | 'plan' | 'pattern' | 'raw' | 'explain';
+  type View = 'table' | 'graph' | 'map' | 'facets' | 'plan' | 'pattern' | 'raw' | 'explain';
   type Outcome = {
     status: 'running' | 'done' | 'error';
     ds: string;
@@ -1659,6 +1665,191 @@
     if (outcomes[activeId]) outcomes[activeId].view = v;
   }
 
+  // --- linked views: the shared selection and the facets (U11) ----------------------
+
+  // a new result starts with no selection, while switching between its views keeps it
+  let selectionFor: unknown = null;
+  $effect(() => {
+    const r = outcome?.result ?? null;
+    if (r !== selectionFor) {
+      selectionFor = r;
+      untrack(() => selection.clear());
+    }
+  });
+
+  /** The result's variables, for the facets' set and the VALUES of Use in query. */
+  const resultVars = $derived(
+    outcome?.result?.queryType === 'SELECT' ? (outcome.result.vars ?? []) : [],
+  );
+  /** The variable whose column holds the most selected entities, else the first IRI column. */
+  const selectionVar = $derived.by(() => {
+    const r = outcome?.result;
+    const vars = resultVars;
+    if (!r || !vars.length) return '';
+    const rows = r.rows ?? [];
+    let best = '';
+    let most = -1;
+    vars.forEach((v, i) => {
+      let n = 0;
+      let iris = 0;
+      for (const row of rows.slice(0, 2000)) {
+        const t = row[i];
+        if (t?.type === 'uri') {
+          iris++;
+          if (selection.has(toSparql(t))) n++;
+        }
+      }
+      const score = n * 1e6 + iris;
+      if (score > most) {
+        most = score;
+        best = v;
+      }
+    });
+    return best;
+  });
+  // Use in query binds the column that holds the selection until the person picks another
+  let useVar = $state('');
+  let useVarPicked = $state(false);
+  $effect(() => {
+    const v = selectionVar;
+    if (!selection.active) useVarPicked = false;
+    if (!untrack(() => useVarPicked) || !resultVars.includes(untrack(() => useVar))) useVar = v;
+  });
+  let facetVar = $state('');
+  /**
+   * The facets' default column: the one with the most IRIs. It reads the result alone and
+   * never the selection, since the selection the brushes make would otherwise move the
+   * facets to another column and reset the brushes.
+   */
+  const facetDefault = $derived.by(() => {
+    const r = outcome?.result;
+    const vars = resultVars;
+    if (!r || !vars.length) return '';
+    const rows = (r.rows ?? []).slice(0, 2000);
+    let best = vars[0];
+    let most = -1;
+    vars.forEach((v, i) => {
+      const n = rows.filter((row) => row[i]?.type === 'uri').length;
+      if (n > most) {
+        most = n;
+        best = v;
+      }
+    });
+    return best;
+  });
+  const facetVarShown = $derived(resultVars.includes(facetVar) ? facetVar : facetDefault);
+  const facetWithin = $derived(
+    outcome?.view === 'facets' && outcome.query && facetVarShown
+      ? { query: outcome.query, variable: facetVarShown }
+      : null,
+  );
+
+  /**
+   * What the WebGL view marks: the lens's pick and the shared selection together, so that
+   * an active selection narrows the lens's marks rather than giving way to them.
+   */
+  const largeMarked = $derived.by(() => {
+    if (!selection.active) return lensMarked ?? null;
+    if (!lensMarked) return [...selection.ids];
+    return lensMarked.filter((k) => selection.has(k));
+  });
+
+  // a node clicked in the WebGL view stops being its selection once the shared selection
+  // changes without it, as after Clear or a brush
+  let lastSelectionIds: ReadonlySet<string> | null = null;
+  $effect(() => {
+    const ids = selection.ids;
+    if (ids === lastSelectionIds) return;
+    lastSelectionIds = ids;
+    untrack(() => {
+      if (largeSelected && !ids.has(largeSelected)) largeSelected = null;
+    });
+  });
+
+  /** The IRIs of the facets' column in the rows the result holds, which the brushes select. */
+  const facetDrawn = $derived.by(() => {
+    const r = outcome?.result;
+    const i = resultVars.indexOf(facetVarShown);
+    if (!r || i < 0) return null;
+    const out = new Set<string>();
+    for (const row of r.rows ?? []) {
+      const t = row[i];
+      if (t?.type === 'uri') out.add(toSparql(t));
+    }
+    return [...out];
+  });
+
+  /** The result entities every brush keeps become the selection the other views dim by. */
+  function facetMatch(ids: Set<string> | null) {
+    if (ids) selection.set(ids, 'the facets', { keepEmpty: true });
+    else if (selection.source === 'the facets') selection.clear();
+  }
+
+  const parseNow = (t: string) =>
+    patternNow(t) ?? {
+      ok: false as const,
+      code: 'unavailable',
+      error: 'The browser module is not ready',
+      line: 0,
+      column: 0,
+    };
+  const parseStrict = (t: string) =>
+    patternNow(t, true) ?? {
+      ok: false as const,
+      code: 'unavailable',
+      error: 'The browser module is not ready',
+      line: 0,
+      column: 0,
+    };
+
+  /** Make U08 edits on the editor's text as one change, or say why not. */
+  async function editQuery(
+    make: (p: import('$lib/pattern').PatternOk, text: string) => AnyEdit[],
+    done: string,
+  ): Promise<boolean> {
+    const text = editor?.snapshot().text ?? active.query;
+    const tab = active.id;
+    try {
+      const first = await patternLocal(text);
+      // the person may have typed or switched tabs while the parser loaded
+      if (active.id !== tab || (editor?.snapshot().text ?? active.query) !== text)
+        throw new Error('The query changed while the edit was being prepared. Try again');
+      if (!first.ok) throw new Error(`The query does not parse: ${first.error}`);
+      const changes = composeEdits(text, parseNow, parseStrict, make(first, text));
+      if (!changes.length || !editor) return false;
+      editor.applyPattern(changes);
+      toasts.push('success', done);
+      if (isPhone) phoneTab = 'text';
+      return true;
+    } catch (e) {
+      toasts.push('error', 'The query was not changed', e instanceof Error ? e.message : String(e));
+      return false;
+    }
+  }
+
+  /** Apply to query: a triple and a FILTER per brush on the facets' variable. */
+  function applyFacets(brushes: Brush[]) {
+    const v = facetVarShown;
+    if (!v) return;
+    void editQuery(
+      (p, text) => brushEdits(text, p, v, brushes, parseNow),
+      `Added ${brushes.length === 1 ? 'the brush' : `${brushes.length} brushes`} to the query`,
+    );
+  }
+
+  /** Use in query: the selected IRIs as `VALUES ?v { … }`, 1,000 at most. */
+  function useSelection(ids: string[], v: string) {
+    if (!v) return;
+    const list = ids.slice(0, VALUES_CAP);
+    const left = ids.length - list.length;
+    void editQuery(
+      () => [{ kind: 'values-add', var: v, terms: list }],
+      left
+        ? `Added VALUES ?${v} with the first ${fmtInt(list.length)} entities, ${fmtInt(left)} left out`
+        : `Added VALUES ?${v} with ${fmtInt(list.length)} ${list.length === 1 ? 'entity' : 'entities'}`,
+    );
+  }
+
   function openIri(iri: string) {
     const dsName = outcome?.ds ?? ds ?? '';
     goto(`${resolve('/explore')}?ds=${encodeURIComponent(dsName)}&iri=${encodeURIComponent(iri)}`);
@@ -2139,6 +2330,8 @@
       branch: o.branch,
       // the lenses read the state the result was read at, the head's commit included
       at: resultState(o.result),
+      // only a result read with an At selector shows a past state
+      past: !!o.result.at,
       epoch: o.startedAt,
       nodes: drawnGraph.nodes.map((n) => ({ id: n.id, term: n.term })),
       edges: drawnGraph.edges
@@ -3040,6 +3233,17 @@
                   <Icon name="map" size={14} /> Map
                 </button>
               {/if}
+              {#if outcome.result?.queryType === 'SELECT' && outcome.query && resultVars.length}
+                <button
+                  class="tab"
+                  role="tab"
+                  aria-selected={outcome.view === 'facets'}
+                  title="Histograms of the properties of a variable's values"
+                  onclick={() => setView('facets')}
+                >
+                  <Icon name="filter" size={14} /> Facets
+                </button>
+              {/if}
               <button
                 class="tab"
                 role="tab"
@@ -3137,6 +3341,14 @@
         </div>
       {/if}
 
+      {#if outcome.result && ['table', 'graph', 'map', 'facets'].includes(outcome.view)}
+        <SelectionBar
+          onuse={resultVars.length ? useSelection : undefined}
+          vars={resultVars}
+          bind:usevar={useVar}
+          onvarpick={() => (useVarPicked = true)}
+        />
+      {/if}
       {#if outcome.result && outcome.result.meta.sentRows < outcome.result.meta.totalRows && outcome.view !== 'explain'}
         <div class="notice">
           <Icon name="info" size={14} />
@@ -3534,16 +3746,23 @@
                       onlayout={() => (largeSettled = true)}
                       selected={largeSelected}
                       label="Result graph"
-                      onselect={(k) => (largeSelected = k)}
+                      onselect={(k) => {
+                        largeSelected = k;
+                        if (k) selection.set([k], 'the graph');
+                        else selection.clear();
+                      }}
                       onopen={(k) => (largeSelected = k)}
                       onfail={(reason) => (webglReason = reason)}
                       lens={lenses.encoding}
-                      marked={lensMarked}
+                      marked={largeMarked}
+                      dimEmpty={selection.active}
                     />
                   {:else}
                     <GraphView
                       lens={lenses.encoding}
                       marked={lensMarked}
+                      highlight={selection.active ? selection.ids : null}
+                      onselect={(id) => (id ? selection.set([id], 'the graph') : selection.clear())}
                       nodes={pathGraph?.nodes ?? canvasGraph.nodes}
                       edges={pathGraph?.edges ?? canvasGraph.edges}
                       {pathFocus}
@@ -3575,6 +3794,7 @@
                   {/if}
                   <LensLegend
                     results={lenses.results}
+                    ds={outcome?.ds ?? ''}
                     selected={lensMarked ? lensPick : null}
                     onselect={(key) => (lensPick = key)}
                   />
@@ -3647,6 +3867,36 @@
               baseDs={mapDiff ? outcome.baseFrom?.ds : undefined}
               baseAt={mapDiff ? outcome.baseFrom?.at : undefined}
             />
+          {:else if outcome.view === 'facets'}
+            <div class="result-facets">
+              <FacetPanel
+                ds={onBranch(outcome.ds, outcome.branch)}
+                within={facetWithin}
+                setLabel={`values of ?${facetVarShown}`}
+                at={readAt(r.at)}
+                {prefixes}
+                drawn={facetDrawn}
+                reasoning={outcome.reasoning}
+                onmatch={facetMatch}
+                onapply={applyFacets}
+              >
+                {#snippet header()}
+                  <label class="row"
+                    >Count the values of
+                    <select
+                      aria-label="The variable whose values the facets count"
+                      value={facetVarShown}
+                      onchange={(e) => (facetVar = (e.currentTarget as HTMLSelectElement).value)}
+                    >
+                      {#each resultVars as v (v)}<option value={v}>?{v}</option>{/each}
+                    </select></label
+                  >
+                  <span class="faint small"
+                    >in every solution of the query, not only the rows shown</span
+                  >
+                {/snippet}
+              </FacetPanel>
+            </div>
           {:else if outcome.view === 'plan'}
             {#if r.meta.plan}
               <ExplainedPlan
@@ -4320,6 +4570,14 @@
   }
   .vsplit:hover {
     background: var(--surface-3);
+  }
+  .result-facets {
+    flex: 1;
+    min-height: 0;
+    display: flex;
+    flex-direction: column;
+    max-width: 720px;
+    width: 100%;
   }
   .result-pattern {
     position: relative;

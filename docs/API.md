@@ -1,8 +1,11 @@
 # Sparkles HTTP API
 
-The server speaks the Fuseki protocol, so existing Jena tooling (`rdfconnection`,
-`s-query`, YASGUI and others) works unchanged. The `/$/…` extensions provide dataset
-administration, history, search configuration, validation and agent services.
+This document is the reference for the Sparkles HTTP API. The server speaks the Fuseki
+protocol, so existing Jena tooling such as `rdfconnection`, `s-query` and YASGUI works
+unchanged. The `/$/…` extensions provide dataset administration, history, search
+configuration, validation and agent services. The sections below are grouped by area,
+from the server and its datasets through queries, history, search, reasoning and
+validation, to access control and the agent endpoints.
 
 [USAGE.md](USAGE.md) provides workflows and CLI and binding examples. This document owns
 the HTTP contracts. [openapi.json](openapi.json) is their machine-readable description.
@@ -17,34 +20,59 @@ every route needs credentials or a grant to `anonymous`. See
 A machine-readable description of this API is served at `/$/openapi.json`. See
 [OpenAPI description](#openapi-description).
 
+**Server and datasets**
+
 * [OpenAPI description](#openapi-description)
 * [Server](#server)
 * [Datasets (admin)](#datasets-admin)
 * [Schema discovery](#schema-discovery)
+
+**Queries and updates**
+
 * [Per-dataset SPARQL protocol (Fuseki compatible)](#per-dataset-sparql-protocol-fuseki-compatible)
 * [Stored queries](#stored-queries)
 * [GraphQL](#graphql)
+* [`application/x-sparkles+json` (UI result format)](#applicationx-sparklesjson-ui-result-format)
+* [Explain](#explain)
+* [Compression](#compression)
+
+**History, branches and backups**
+
 * [Commits](#commits)
 * [Branches and merges](#branches-and-merges)
 * [Point-in-time reads and snapshots](#point-in-time-reads-and-snapshots)
 * [Backup repositories](#backup-repositories)
+
+**Search and graph analytics**
+
 * [Full-text search](#full-text-search)
 * [Vector similarity](#vector-similarity)
 * [Path search](#path-search)
 * [Graph algorithms](#graph-algorithms)
 * [GeoSPARQL](#geosparql)
+
+**Reasoning and validation**
+
 * [Reasoning status and diagnostics](#reasoning-status-and-diagnostics)
 * [RDFS on read](#rdfs-on-read)
+* [Query-time reasoning](#query-time-reasoning)
 * [Write-time validation](#write-time-validation)
 * [SHACL validation](#shacl-validation)
+* [Editing forms](#editing-forms)
 * [ShEx validation](#shex-validation)
+
+**Formatting and linting**
+
 * [Formatting](#formatting)
 * [Linting](#linting)
-* [`application/x-sparkles+json` (UI result format)](#applicationx-sparklesjson-ui-result-format)
-* [Explain](#explain)
-* [Compression](#compression)
+
+**Errors and access control**
+
 * [Errors](#errors)
 * [Authentication and access control](#authentication-and-access-control)
+
+**Agents and models**
+
 * [MCP server](#mcp-server)
 * [Natural-language questions](#natural-language-questions)
 
@@ -72,8 +100,8 @@ results and the dataset information to diffs, the change feed, write previews, t
 metrics snapshot, Fuseki's services, reasoning diagnostics, ShEx reports and backup
 policies. Members that this page calls free-form stay open objects inside them, such as
 the results of a validation summary, a stored query's parameters and a GeoJSON geometry.
-A few answers are still plain objects described inline: the JSON form of drafted shapes,
-class profiles, schema diffs, the linter's result, MCP's JSON-RPC messages and the
+A few answers are plain objects described inline. These are the JSON form of drafted
+shapes, class profiles, schema diffs, the linter's result, MCP's JSON-RPC messages and the
 explanation of a query. A test sends requests to a server and checks their JSON bodies
 and the answers against the schemas.
 
@@ -227,6 +255,8 @@ validators (`sparkles_shacl`, `sparkles_shex`).
 | `sparkles_embedding_backlog` | gauge. Subjects (per graph) waiting to be embedded, the status's `backlog`. | `dataset`, `index` |
 | `sparkles_embedding_lag_commits` | gauge. Commits since the newest one whose text is all embedded, which is `headSeq − appliedSeq` of the status. | `dataset`, `index` |
 | `sparkles_graphql_groups` | histogram (1 … 64). The fetch groups, which are SPARQL queries, that each GraphQL request ran. | `dataset` |
+| `sparkles_algo_view_cache_entries`, `sparkles_algo_view_cache_bytes` | gauge. The results kept by [view-only algorithm runs](#view-only-runs) and their estimated bytes, which the server memory pool also holds. | |
+| `sparkles_algo_view_cache_hits_total`, `sparkles_algo_view_cache_misses_total`, `sparkles_algo_view_cache_joins_total`, `sparkles_algo_view_cache_refused_total` | counter. View-only requests answered from a kept result, requests that ran the algorithm, background requests that joined a run in progress, and results not kept because they were larger than the cache or the pool had no room. | |
 | `sparkles_graphrag_reports` | gauge. A dataset's current [community reports](#graphrag) by status, as of the last build or review since the server started. | `dataset`, `status` = `unreviewed` \| `reviewed` \| `rejected` \| `stale` \| `failed` |
 | `sparkles_graphrag_tokens_total` | counter. Tokens counted against a dataset's GraphRAG budgets since the server started. | `dataset`, `phase` = `build` \| `refresh` |
 | `sparkles_graphrag_stale_communities` | gauge. The communities the last GraphRAG run left pending for a later one. | `dataset` |
@@ -637,6 +667,7 @@ per-dataset form and no concurrency caps. `preauth=off` turns it off.
 | GET    | `/$/schema/{ds}/profiles`    | *Extension.* `ClassProfiles`: the predicates the instances of each class use, and those that point at them. See [Class profiles](#class-profiles). |
 | GET    | `/$/schema/{ds}/diff`        | *Extension.* `SchemaDiff`: the classes and predicates added, removed and changed between two states. See [Schema diffs](#schema-diffs). |
 | POST   | `/$/graph/{ds}/groups`       | *Extension.* `GroupsAnswer`: the groups or members of a class or of a group, with the edges between them, for the Explore overview. See [Graph overview](#graph-overview). |
+| POST   | `/$/graph/{ds}/facets`       | *Extension.* `FacetsAnswer`: the facet histograms of a class, a list of IRIs or a query's values, with brushes that filter each other. See [Facets](#facets). |
 | POST   | `/$/compact/{ds}`            | Merges the delta (updates) into a freshly built, sorted base index. Writes go on during the build, and the writer lock is held only for the switch. Returns a cancellable `Task`. `409` while a compaction of the dataset is queued or running. The old generation is removed once no reader or retained history needs it, which is what Fuseki's `?deleteOld=true` asks for. `deleteOld` with no value or `true` is accepted, and `deleteOld=false` is a `400`. |
 | GET    | `/$/compaction/{ds}`         | *Extension.* `CompactionStatus`: the dataset's automatic compaction, its settings and what it sees. See [Automatic compaction](#automatic-compaction). |
 | PUT    | `/$/compaction/{ds}`         | *Extension.* Replaces the dataset's own compaction settings with the JSON object's. Returns `CompactionStatus`. |
@@ -659,7 +690,7 @@ per-dataset form and no concurrency caps. `preauth=off` turns it off.
 | DELETE | `/$/describe/{ds}`           | *Extension.* Restores the DESCRIBE defaults. Needs `admin`. |
 | GET    | `/$/tasks`                   | `[Task]` |
 | GET    | `/$/tasks/{id}`              | `Task` |
-| DELETE | `/$/tasks/{id}`              | *Extension.* Cancels a task that accepts cancellation: a queued task, a clone until it is in place, an N-Quads backup, or a reasoning run. Returns `202` with the `Task`, which ends `cancelled`. Other tasks and finished ones get `409 {code: "not-cancellable"}`. Needs `admin` on the task's dataset, or `server-admin` for a server-wide task. |
+| DELETE | `/$/tasks/{id}`              | *Extension.* Cancels a task that accepts cancellation: a queued task, a clone until it is in place, an N-Quads backup, a reasoning run or a vector projection. Returns `202` with the `Task`, which ends `cancelled`. Other tasks and finished ones get `409 {code: "not-cancellable"}`. Needs `admin` on the task's dataset, `read` on the whole dataset for a `vector-projection`, or `server-admin` for a server-wide task. The caller that started a background view-only algorithm run (`algo-view`) may also cancel it. |
 | POST   | `/$/cache/clear/{ds}`        | *Extension (no Fuseki equivalent).* Drops the dataset's cached query results and its cached remote SERVICE results ([SERVICE options](#service-options-loop-bulk-and-cache)). Returns `{ "cleared": number /* entries */, "bytes": number, "serviceCleared": number, "serviceBytes": number }`. |
 | GET    | `/$/prefixes/{ds}`           | `{ "prefixes": { "rdf": "http://…#", … } }`: the dataset's effective prefixes, which are the well-known ones, the prefixes the settings file declares and the dataset's own, as the [prefixes kind](#prefixes) computes them. |
 | GET    | `/{ds}/prefixes`             | Modelled on Fuseki's prefixes service. `?prefix=p` returns `{ prefix, uri }`, or `404` if `p` is unbound. `?uri=u` returns `{ uri, prefixes: [...] }`. With neither, the response is `{ prefixes: {...} }` with the stored prefixes only. Declared and well-known prefixes are not listed here, and `?prefix=` and `?uri=` look only at the stored ones. |
@@ -735,7 +766,8 @@ type DatasetQuota = {
 type Task = {
   id: string;
   kind: "compact" | "backup" | "reason" | "load" | "clone" | "text-rebuild" | "geo-index"
-      | "backup-create" | "backup-restore" | "backup-verify" | "backup-gc" | "backup-policy";
+      | "backup-create" | "backup-restore" | "backup-verify" | "backup-gc" | "backup-policy"
+      | "algo-run" | "algo-view" | …;
   dataset: string;          // "" for a server-wide task (listed for server admins only)
   target?: string;          // the dataset a clone creates; for backup tasks see Backup repositories
   state: "queued" | "running" | "done" | "failed" | "cancelled";
@@ -1309,6 +1341,86 @@ caller with coverage gets `unavailable: "none"` when the graph holds no communit
 grouping reads main, where reports are built, so `?branch=` naming another branch is a
 `400`, and `at` reads the reports as they were at that point of main.
 
+### Facets
+
+The design is in [U11 §3.2](specs/U11-linked-views.md#32-phase-2-prerequisite-a-facets-route).
+
+`POST /$/graph/{ds}/facets` counts the entities of a set by the values of up to six of
+their properties, for the facet panels of Explore and the query page. The Rust library
+gives the same answer through `ds.graph().facets`.
+
+```ts
+type Term = { type: "uri" | "literal"; value: string; datatype?: string; "xml:lang"?: string };
+type FacetsRequest = {
+  within: { class: string }                          // the instances of a class
+        | { nodes: string[] }                        // 1 to 20,000 IRIs
+        | { query: string; variable: string };       // the distinct values of a SELECT's variable
+  facets?: { property: string;
+             bins?: number;                          // 2 to 40, 20 by default
+             top?: number;                           // 1 to 12, 12 by default
+             kind?: "numeric" | "date" | "values";   // told from a sample of the values when absent
+             edges?: number[];                       // the ranges of an earlier answer
+             bars?: Term[] }[];                      // the values of an earlier answer
+  filters?: ({ property: string; range: [number, number]; kind?: "numeric" | "date" }
+           | { property: string; values: Term[] })[]; // at most 6 brushes
+  candidates?: boolean;                              // also list the properties of the set
+  at?: string;                                       // a commit, time or named snapshot
+};
+type FacetsAnswer = {
+  commit: number;
+  size: number;                                      // entities in the set
+  matching: number;                                  // entities kept by every brush
+  facets: { property: string; kind?: "numeric" | "date" | "values";
+            bins?: { from: number; to: number; count: number }[];
+            values?: { value: Term; count: number; label?: string }[];
+            other?: number; missing?: number;
+            error?: { budget: string; message: string } }[];
+  candidates?: { property: string; share: number; kind: "numeric" | "date" | "values" }[];
+  truncated: boolean;
+};
+```
+
+A facet whose sampled values are nine in ten numbers counts the entities by ranges of
+round width of the numbers, and one whose values are nine in ten dates counts them by
+ranges of whole years. A bin runs from `from` up to but not including `to`, so the last
+bin's `to` lies above the largest value. Any other facet lists its `top` most frequent
+values, IRIs with their labels, and `other` counts the entities whose values are all
+outside that list. `missing` counts the entities without a value of the facet's kind, so
+an entity whose value the caller may not read counts as missing. An entity with several
+values counts once in each bin or value it has. The ranges and the list come from the
+whole set, so they stay the same while other facets are brushed. A request can hand back
+the `edges` or `bars` of an earlier answer, with the facet's `kind`, which keeps the bins
+and skips the queries that find them. Every handed-back bar is answered, with a count of 0
+when no entity of the brushed set has that value.
+
+A brush keeps the entities with a value in its range, or among its values. Each facet
+counts the set kept by every brush except its own, so the facets filter each other and a
+brushed facet still shows what a wider brush would add. `matching` counts the set under
+every brush. A brush on a numeric facet is applied as `FILTER(?v >= from && ?v < to)`, a
+brush on a date facet as `FILTER(YEAR(?v) >= from && YEAR(?v) < to)` and a brush of values
+as `FILTER(?v IN (…))`. The UI's **Apply to query** writes the same text, so the applied
+query's `COUNT(DISTINCT ?x)` equals `matching` for a query without `LIMIT`, `OFFSET`,
+`GROUP BY` or `HAVING`, which the UI refuses to edit.
+
+A `query` set must be a `SELECT` without `FROM` or `FROM NAMED` that projects the
+variable, and it runs inside each count as a subquery, under the request's prefixes and
+base. `candidates` lists the properties of the first 1,000 entities of the set, ranked by
+the share of them that has a value, without the label properties, the class of a class
+set, and properties whose values are nearly all different. `truncated` says that the
+list came from a sample smaller than the set or was cut to 40.
+
+Every count comes from SPARQL queries run under the caller's view, as for the
+[graph overview](#graph-overview), so a caller limited to some graphs or under protections
+counts only what its own queries would read. The route needs `read` through the `query`
+endpoint, takes `timeout` and `reasoning`, and names its branch with `?branch=`. A set
+above 1,000,000 entities answers `507` with the `rows` budget. A facet whose queries
+exceed a budget carries an `error` with the budget's name while the other facets stay,
+and an exceeded budget while the set is counted answers `507` as a query does. Answers
+share the graph overview's cache, keyed by branch, commit, view and request. The Rust
+library gives the same answer through `ds.graph().facets`, and Python returns it as a dict
+from `ds.graph.facets(within, facets=…, filters=…, candidates=…, at=…)`. Node.js and the
+JVM do not bind it.
+
 ### Schema diffs
 
 The design is in [C02 §6, Phase 3](specs/C02-schema-discovery.md#6-phasing).
@@ -1775,7 +1887,10 @@ Query parameters beyond the standard protocol:
   end. A SPARQL LIMIT ends the query normally.
 * `reasoning=true|false` includes or excludes materialized inferences. The default is
   `true` if the dataset has any. `reasoning=false` also turns [RDFS on read](#rdfs-on-read)
-  off for the request, so that it reads the asserted data alone. The UI's inferred-edge
+  off for the request, so that it reads the asserted data alone. `reasoning=demand`
+  derives the facts the query needs from the rules instead, with `reasoningProfile` and
+  `maxDerived` ([Query-time reasoning](#query-time-reasoning)). `materialized` is the
+  same as `true`. The UI's inferred-edge
   lens compares a read with and without reasoning this way.
 * `nocache=true` bypasses the query result cache, so nothing is read from it or stored in
   it. It is meant for benchmarking, and `explain` accepts it too. `sparkles serve
@@ -1802,6 +1917,24 @@ of the same request, in one commit ([spec C05](specs/C05-tabular-imports.md)).
   that has no `url`. `key` names the column that names each row in the default mapping.
   The server has no file URL to build a namespace from, so the default mapping needs
   `base`.
+* The `mapping` part may also hold an R2RML, RML or YARRRML mapping, or a CONSTRUCT
+  template, recognized by its content or named by `mappingKind`. An R2RML, RML or
+  YARRRML mapping reads the parts its logical sources name by file name, CSV, TSV,
+  JSON, JSON Lines and Parquet alike, and the server's database connections (see
+  [Stored mappings](#stored-mappings)). The parts it does not read are loaded as usual.
+  A file source without its part answers `400` with code `mapping-source-missing`
+  before anything is read. `mapping=NAME` uses a stored mapping instead of a part, and
+  `mappingVersion` picks one of its versions.
+* `csvwMode=standard` adds CSVW's standard mode, the table group, table and row
+  descriptions with their row numbers and source URLs. `csvwCheck=keys`, the default in
+  standard mode, checks the metadata's primary and foreign keys across the tables of the
+  request, in the order the foreign keys need, and answers `400` naming both rows of a
+  duplicate key or the row whose reference matches nothing. The key values are held in
+  memory within the server's query memory budget.
+* `lookup=true` lets a template's WHERE clause read the dataset's head as the
+  conversion starts, under the caller's view. The table's report gives `lookupCommit`,
+  the commit read, and `If-Match` with that commit's entity tag makes the upload fail
+  with `412` when the head has moved by the time it commits.
 
 ```sh
 curl -X POST 'localhost:3030/ds/upload?base=http://ex.org/p/&key=id' \
@@ -1816,8 +1949,30 @@ number of cells, a bad mapping or a refused template answers `400` with the file
 column, and nothing is committed. The N-Triples written for the tables count against
 `--max-decompressed-mb` (`413`) and the free-disk reserve (`507`). A template runs with
 the server's query memory and row budgets. Dry runs and timeouts work as for any upload.
-The Graph Store endpoint does not read CSV. The web UI's upload form shows these options
-once a CSV or TSV file is chosen, and sends `base` and `key` in the query string.
+The web UI's upload form shows the `base` and `key` options once a CSV or TSV file is
+chosen, and sends them in the query string.
+
+### CSV and TSV in the Graph Store protocol
+
+`PUT`, `POST` and `DELETE` on `/{ds}/data` take a `text/csv` or
+`text/tab-separated-values` body when the request names a stored mapping with
+`mapping=NAME`, or the default mapping with `base` and optionally `key`
+([spec F19 §2.3](specs/F19-mappings-and-virtual-graphs.md)). `PUT` replaces the graph
+with the mapped triples, `POST` adds them, and `DELETE` removes them from the graph.
+Without `mapping` or `base` the body is `415`, as any body that is not RDF.
+
+The triples go into the graph the request names, whatever graph maps the mapping
+declares. A mapping whose graph maps name another graph answers `400` with code
+`mapping-graph-conflict`, because a Graph Store request addresses one graph. The body is
+the file the mapping reads. Its name is `source=NAME`, or else the mapping's only file
+source, or the CSVW metadata's only table. `csvwMode`, `csvwCheck` and `lookup` work as
+on an upload. A `DELETE` cannot remove triples with blank nodes, since the mapping makes
+new ones.
+
+```sh
+curl -X PUT 'localhost:3030/ds/data?graph=http://ex.org/people&mapping=people' \
+  -H 'Content-Type: text/csv' --data-binary @people.csv
+```
 
 ### Service description
 
@@ -2757,6 +2912,200 @@ parameter. An unknown query is `404`.
 stored queries of a database directory (see [Usage](USAGE.md#stored-queries)). The Rust
 API is `sparkles::stored`.
 
+## Stored mappings
+
+The design and its rationale are in
+[F19 Mapping languages and virtual graphs](specs/F19-mappings-and-virtual-graphs.md).
+
+A dataset can keep named mappings in `mappings.json` in its directory, with versions as
+stored queries have, and backups and clones include the file. A mapping is R2RML, RML
+(the rml.io vocabulary or RML-Core), YARRRML, CSVW metadata or a CONSTRUCT template. It
+is parsed and checked before it is stored, so a stored mapping always parses.
+
+| Method | Path | Result |
+|---|---|---|
+| GET | `/$/mappings/{ds}` | The mappings without their text, each with its kind, version, check summary and last run. |
+| PUT | `/$/mappings/{ds}/{name}` | Stores the body as the next version. `Content-Type` names the kind. |
+| GET | `/$/mappings/{ds}/{name}` | The text and metadata, or the text alone when `Accept` names the kind's media type. `?version=N` reads an older version. |
+| GET | `/$/mappings/{ds}/{name}/versions` | The kept versions, newest first. |
+| DELETE | `/$/mappings/{ds}/{name}` | Deletes the mapping and its versions. |
+| POST | `/{ds}/mappings/{name}/run` | Runs it and commits once. |
+
+The media types are `text/turtle` for R2RML and RML, `application/yaml` for YARRRML,
+`application/csvm+json` for CSVW metadata and `application/sparql-query` for a template,
+and `kind=` names one instead. `description=` sets the description,
+`Sparkles-Commit-Message` the version's message, and `If-Match: "v<N>"` and
+`If-None-Match: *` the preconditions, as for stored queries. The check's summary lists
+the triples maps, the files and connections the mapping reads, the graphs its graph maps
+name, and warnings, among them a connection the server does not declare. Storing,
+changing and deleting a mapping needs `admin` on the dataset, because a mapping names
+connections and can read any table they reach. Reading one needs `read`.
+
+A run needs `write` and is subject to the caller's graph grants as any write is. It
+takes the files the mapping reads as multipart parts, each named as the mapping names
+it, and refuses a part the mapping does not read. `mode=add`, the default, adds the
+triples. `mode=replace` replaces every graph the mapping's graph maps can write, in the
+same commit, so a run over unchanged sources changes nothing and the change feed carries
+only the net change. A mapping with a template graph map cannot be replaced, which is
+`400` with code `mapping-graphs-unknown`. `graph=IRI` writes every triple into one graph,
+`base=IRI` sets the base of generated relative IRIs, and `dryRun`, `timeout`,
+`receipt`, `If-Match` and `Sparkles-Commit-Message` work as on an upload. The commit
+message defaults to `mapping NAME (version V)`. The answer gives the rows read, the quads
+made and the warnings, and the mapping records the run's time, version, mode, commit and
+counts as `lastRun`. A run takes as long as its sources and is not a task.
+
+```sh
+curl -X PUT localhost:3030/$/mappings/ds/people -H 'Content-Type: application/yaml' \
+  --data-binary @people.yml
+curl -X POST 'localhost:3030/ds/mappings/people/run?mode=replace' \
+  -F file=@people.csv -F file=@cities.csv
+```
+
+### Database connections
+
+R2RML logical tables and RML sources of kind `urn:x-sparkles:connection:NAME` read the
+server's named connections, which the server-wide settings kind `connections` holds
+(`/$/server/settings/connections`, server `admin`, and `server.connections` in the
+settings file). Its one member, `connections`, maps names to descriptions. This build
+reads SQLite files, opened read-only. PostgreSQL and DuckDB connections are refused with
+the roadmap item that adds them (230).
+
+```json
+{ "connections": { "shop": { "kind": "sqlite", "path": "/data/shop.sqlite",
+                             "jdbcDsn": "jdbc:sqlite:shop.sqlite" } } }
+```
+
+`path` must be absolute. `jdbcDsn` names the connection for existing RML mappings that
+describe their database with `d2rq:jdbcDSN`. An R2RML mapping reads the only connection,
+or the one named `default`. A mapping may be stored before its connection exists, and a
+run fails until it does.
+
+## Incremental views
+
+The design and its rationale are in
+[F13 Incremental views, live queries and fact provenance](specs/F13-incremental-views-and-provenance.md).
+
+A view is a named SELECT or CONSTRUCT query whose result the server keeps current after
+every commit. Each commit's net changes run through a circuit compiled from the query,
+so a commit that adds one quad costs work in proportion to the rows that quad affects,
+not a new evaluation. A commit whose changes miss every pattern of the query skips the
+view after one hash probe per changed quad. The definitions are kept in the database
+directory as `views/{name}/view.json`, and the state is checkpointed beside them.
+
+```json
+{
+  "query": "PREFIX org: <http://www.w3.org/ns/org#> SELECT ?team (COUNT(?p) AS ?n) WHERE { ?p org:memberOf ?team } GROUP BY ?team",
+  "principal": "reports",
+  "memoryBytes": 268435456
+}
+```
+
+| Field | Meaning |
+|---|---|
+| `query` | A SELECT or CONSTRUCT query. The dataset's declared prefixes apply. |
+| `storedQuery` | The name of a stored query, in place of `query`. The view follows its current version when the view is attached. |
+| `principal` | The user whose view of the dataset the query reads. The default is the definer. A definer whose grants cover every graph defines a view without a principal, which reads every quad. |
+| `memoryBytes` | The budget of the view's state, 256 MiB by default. A view over its budget is suspended. |
+| `mode`, `provenance`, `maintenance`, `branches`, `keepCommits` | Phase 1 takes only `table`, `none`, `async`, `["main"]` and `0`. Other values are refused with `400 unsupported-option`. |
+
+Unknown members are refused. A query outside the incremental fragment is refused with
+`400 not-incremental` and names the construct: `NOW`, `RAND`, `UUID`, `STRUUID`, `BNODE`,
+any `SERVICE`, full-text, vector and spatial search, `DESCRIBE`, and a `GRAPH` block in a
+CONSTRUCT template. A dataset with RDFS on read, or whose materialized inferences join
+the default graph, refuses every view and live query the same way, because a view reads
+the stored quads. Views and live queries never read the graphs that a disclosure guard
+protects. `ORDER BY` without `LIMIT` does not change a view's rows and is
+ignored. Operators that the circuit cannot maintain run as
+`recompute` nodes, which evaluate their subtree again at each commit that touches it and
+subtract the previous output. Property paths with `*`, `+` or `?`, `LIMIT` and
+`OFFSET`, a dataset clause, and `MINUS`, aggregates, `DISTINCT`, `VALUES` and subqueries
+under `GRAPH ?g` are recompute nodes. The plan in `GET /$/views/{ds}/{name}` marks each
+operator `incremental` or `recompute`, with the reason.
+
+| Method | Path | Needs | Description |
+|---|---|---|---|
+| GET | `/$/views/{ds}` | `read` | `{dataset, views: [...]}`, each view with its definition and state but without its plan. |
+| GET | `/$/views/{ds}/{name}` | `read` | The view with its state, its columns, its rows counted with multiplicity, `stateBytes`, the passes run and skipped, `passMs`, `recomputeMs` and its plan. A caller who may not read the view's rows gets neither `rows` nor `stateBytes`, here or in the list. |
+| PUT | `/$/views/{ds}/{name}` | `admin` | Defines or replaces the view and starts its first evaluation as a `view-build` task. `201` for a new view, `200` otherwise, with the plan and `task`. |
+| DELETE | `/$/views/{ds}/{name}` | `admin` | Removes the view and its state (`204`). |
+| POST | `/$/views/{ds}/{name}/rebuild` | `admin` | Evaluates the view again from scratch as a task and lifts a suspension (`202`). |
+
+A view's `state` is `building` while it is evaluated, `current` at the head commit,
+`behind` with `commits` while its pass runs after a commit, `suspended` with a `reason`
+such as `over-budget` or `pass-timeout`, or `failed` with an `error`. A pass that runs
+longer than `--view-pass-timeout`, 30 seconds by default, suspends its view. The views of
+a dataset share `--views-memory` when it is set.
+
+**Reading a view.** A query reads a view's rows with the local service `view:read`.
+
+```sparql
+PREFIX view: <urn:x-sparkles:view#>
+SELECT ?team ?n WHERE {
+  SERVICE view:read { [] view:name "team-sizes" ; view:bind ?team, ?n ; view:commit ?c }
+  FILTER (?n > 1)
+}
+```
+
+Each variable of `view:bind` reads the view's column of the same name, and the rows come
+with their multiplicities. `view:commit` binds the commit the rows reflect, which is the
+query's own commit. A read at a commit the view has not reached waits up to 2 seconds
+and then fails with `503 view-behind` and `Retry-After`. A view that has moved past the
+query's commit is read back to it from its recent diffs or by evaluating its query at
+that commit, and `503 view-ahead` answers when neither is possible. `view:allowStale true` reads the latest state
+instead. A suspended view answers `503 view-suspended`, and an unknown one
+`404 view-not-found`.
+
+A caller may read a view when its own grants cover every graph, or when its grants equal
+those of the view's principal. Otherwise the read fails with `403 view-access`. Phase 1
+does not compare grant sets for containment and has no grant that declassifies a view by
+name.
+
+**Persistence.** A view's state is checkpointed to `views/{name}/main/state-{commit}.bin`
+every 60 seconds while it changes and when the dataset closes. On open the newest
+checkpoint is loaded and the commits after it are applied from the change log or from
+history. When neither covers them, the view is evaluated again and is `building`
+meanwhile. A checkpoint in a format this release does not read is left in place and the
+view is built from the data. An in-memory dataset keeps view state in memory only.
+Backups and clones do not carry view definitions in Phase 1.
+
+`sparkles views --loc DB list|get|put|delete|rebuild|explain` manages the views of a
+database directory or, with `--server`, of a server (see
+[Usage](USAGE.md#incremental-views)). The Rust API is `Dataset::views()` and
+`sparkles::incr`.
+
+## Live queries
+
+`GET /{ds}/live?query=…` runs a SELECT, ASK or CONSTRUCT query that a view could be and
+streams its result and its changes as server-sent events. It needs `read` on the dataset,
+and the query reads the caller's view of the dataset.
+
+| Event | Data | When |
+|---|---|---|
+| `snapshot` | `{commit, vars, rows, more}` | The result at the start, in pages of at most 10,000 rows. The last page has `more: false`. |
+| `diff` | `{commit, from, removed, added}` | After each commit that changed the result. `from` is the commit of the previous event. |
+| `reset` | as `snapshot` | The server evaluated the query again, after changes it could not follow or a resume it could not bridge. The client replaces its copy. |
+| `error` | `{code, error}` | The stream ends. |
+
+A row is `{"values": [...]}` with one SPARQL JSON term or `null` per variable of `vars`,
+and `count` when the row was added or removed more than once. CONSTRUCT streams rows of
+`subject`, `predicate` and `object`. ASK streams `{commit, value}` at the start and a
+`diff` of `{commit, from, value}` only when the value changes. Each event's id is the
+commit it reflects.
+
+`Last-Event-ID: N` or `after=commit:N` resumes after commit N. The first event is then
+the change from N, taken from the diffs the query's circuit keeps or by evaluating the
+query before the changes since N, and a `reset` when the change log and history cannot
+bridge the gap. `coalesceMs` merges the diffs of commits that arrive within the interval
+into one event whose id is the last commit. Commits that do not change the result send
+nothing but a comment line every 15 seconds.
+
+Live queries and views that ask the same question with the same access share one
+circuit. A dataset runs at most `--max-live-queries` live queries, 1,000 by default, and
+`--max-live-queries-per-principal`, 20 by default, for each principal. More are refused
+with `429 too-many-live-queries`. The first evaluation counts against the rate limit as
+a query. A stream ends when the server drains, and with an `access-changed` error when
+the access policy changes, after which the client reconnects under the new grants.
+
 ## GraphQL
 
 The design and its rationale are in [C03 GraphQL read adapter](specs/C03-graphql.md).
@@ -2935,6 +3284,327 @@ document hash and the number of groups, and are counted in the histogram
 `sparkles graphql --loc DB run|schema get|put|delete|versions|draft` runs documents and
 manages the configuration of a database directory (see [Usage](USAGE.md#graphql)). The
 Rust API is the crate `sparkles-graphql`.
+
+## `application/x-sparkles+json` (UI result format)
+
+This result format is modelled on QLever's `qlever-json`. The UI uses it to render results
+and draw query plans:
+
+```ts
+type SparklesResult = {
+  queryType: "SELECT" | "ASK" | "CONSTRUCT" | "DESCRIBE";
+  vars?: string[];                        // SELECT
+  rows?: (Term | null)[][];               // SELECT; null = unbound
+  boolean?: boolean;                      // ASK
+  triples?: [Term, Term, Term][];         // CONSTRUCT / DESCRIBE
+  quads?: [Term, Term, Term, Term | null][]; // streaming graph results; null default graph
+  meta: {
+    totalRows: number | null; sentRows: number;
+    status?: "complete" | "stopped";        // streaming only; totalRows null when stopped
+    timing: { parseMs: number; planMs: number; execMs: number; serializeMs: number; totalMs: number };
+    plan: PlanNode | CursorPlan;           // eager or streaming operator tree
+    memory: { peakBytes: number };         // peak estimated memory of intermediate results
+    rowsProduced: number;                  // rows produced by all operators, summed
+  };
+};
+type Term =
+  | { type: "uri"; value: string }
+  | { type: "bnode"; value: string }
+  | { type: "literal"; value: string; datatype?: string; "xml:lang"?: string }
+  | { type: "triple"; value: { subject: Term; predicate: Term; object: Term } };
+type PlanNode = {
+  planFormat?: 2;            // root only: a plan deeper than 256 levels, whose nodes have no id
+  id?: string;               // the path of child indexes from the root, such as "0.1.2"
+  operator: string;          // "IndexScan", "Join", "Sort", "Filter", ...
+  description: string;       // human readable, e.g. "PSO ?s <p> ?o"
+  columns: string[];         // variables produced
+  sortedOn: string[];
+  estimatedRows: number; estimatedCost: number;
+  actualRows: number; timeMs: number;       // wall time incl. children
+  cached: boolean;
+  children: PlanNode[];
+  counters?: Record<string, number | string | boolean>;  // spatial operators: candidates, rechecked,
+                             // refined, matched, treeNodesVisited, index ("ready", "building (37%)",
+                             // "feature-links", …), fallback (see GeoSPARQL); expressions evaluated
+                             // once per distinct value: exprCacheHits (rows that reused a result),
+                             // exprCacheMisses (evaluations), exprCacheSkipped (ran row by row)
+  warnings?: { code: string; message: string }[];       // root only: notes about the plan
+};
+```
+
+A native streaming response puts `rows` before `meta`. It includes the final counts and
+capabilities only when the query has produced every row successfully. When the query or
+the serialization fails, the response carries no success metadata. `commit` and
+`datasetId` identify the snapshot the query read, as they do on eager HTTP responses. A
+graph query's response has an empty `triples` array and puts every result in `quads`,
+with a null graph for statements in the default graph. A streaming plan has this shape:
+
+```ts
+type CursorPlan = {
+  operator: PlanNode;
+  materializes: boolean; fullInputBeforeOutput: boolean; growingState: boolean;
+  complete: boolean; reason: string | null;
+  children: CursorPlan[];
+};
+```
+
+`complete` says whether an operator's counts cover its entire execution. The counts on a
+stopped cursor are partial. `materializes` marks a subtree that fell back to eager
+execution. A native ORDER BY reads its whole input into budgeted memory before its
+first row. It reports `fullInputBeforeOutput` and a `reason`, but `materializes` stays
+false, so the strict policy that refuses eager fallback still accepts the sort.
+`growingState` warns that an operator keeps state that grows as it runs, such as
+generated strings. The batch size alone does not limit that state.
+
+### The I/O profile
+
+With `profile=io`, the metadata of a native result has an `io` object. It reports what the
+query read from the index and vocabulary files, which helps explain the time of a first
+query after a restart. The counters cover the whole process, so the profile needs the
+`metrics` permission, as `/$/metrics` does. A caller without it gets a `403`, and a value
+of `profile` other than `io` gets a `400`. A streaming response keeps the profile running
+until its body ends.
+
+```ts
+type IoProfile = {
+  index: Record<string, {                  // by permutation: spo, sop, pso, pos, osp, ops, gspo
+    columnsDecoded: number; decodedBytes: number; compressedBytes: number }>;
+  readahead: Record<string, {              // by file: the permutations, vocab.dat, vocab.off, vocab.num
+    requests: number; bytes: number }>;    // WILLNEED requests to the kernel
+  vocab: { finds: number; groupsHinted: number; blocksScanned: number };
+  numericPagesRequested: number;
+  timeMs?: { vocabLookup: number; vocabRead: number; indexDecode: number; indexWait: number };
+  majorFaults?: number; minorFaults?: number;
+  pages?: Record<string, { touched: number; residentBefore: number;
+                           residentAfter: number; broughtIn: number }>;
+  pagesTruncated?: boolean;
+  events?: { atUs: number; file: string; what: string; bytes: number }[];
+};
+```
+
+The counters are process-wide, so they include the reads of any query that runs at the
+same time. The profile is meant for one query on a quiet server. `vocab.finds` and
+`vocab.blocksScanned` are counted only while a profile runs, because a scan of the
+vocabulary adds to them millions of times from many threads. `vocabLookup` is the time
+in key lookups, which resolve the constants of the query. `vocabRead` is the time reading
+terms by id. `indexDecode` is the time decompressing index columns, and `indexWait` is the
+time to read their pages into memory before decoding. In a segmented index (format 3), a
+read of a few rows decodes single segments of a column, and each counts as one entry of
+`columnsDecoded`, with its own rows in `decodedBytes`. The times are summed over threads.
+`pages` comes from `mincore(2)` on the pages the query asked for or read, and `events`
+lists the first 512 requests in order. Overlapping profiles share one epoch inventory
+of at most 65,536 distinct file, mapping and page entries. It retains the first admitted
+pages and bounds report scratch storage by that sample. `pagesTruncated` is true when
+an inventory or range cap omitted pages. It is false when no cap omission was recorded,
+which does not guarantee complete coverage. Process counter snapshots omit the flag.
+
+All `pages` fields describe the retained best-effort sample. `touched`, `residentBefore`
+and `residentAfter` are additive lower bounds on those counts for the full observed set.
+`broughtIn` is `max(residentAfter - residentBefore, 0)` for the sample. It is neither a
+lower bound on the full-set delta nor a physical-I/O count, especially when pages are
+evicted. Platforms without mapped page observations report a false truncation flag and
+no page entries. The bounded shared inventory and event log add memory while profiles
+are active, outside any one query's grant. Their allocation size depends on the allocator.
+Profiling adds observation work, whose corrected-source cost remains to be measured.
+Numeric profiles record mapped value loads in both single and bulk lookup paths. Kinds
+and rank entries are observed before access only when read from the mapping, rather
+than a resident copy. These observations work with hints disabled or already issued.
+`numericPagesRequested` keeps counting numeric advice pages and does not count actual
+loads. Observation adds no advice and does not reset the mapping's once-only hint bits.
+
+The same counters are in `/$/metrics` as `sparkles_index_columns_decoded_total`,
+`sparkles_index_readahead_bytes_total` and `sparkles_vocab_groups_read_total`.
+
+## Explain
+
+`GET|POST /{ds}/explain?query=…` returns `{ "algebra": string /* SSE */, "plan": PlanNode }`.
+The plan is not executed, so `actualRows` is -1. The root `PlanNode` lists `warnings` when
+something in the query did not run the way it reads, although the answer is the same:
+
+* `geo-not-pushed`: a spatial FILTER is evaluated row by row. The warning says why.
+* `geo-index-building`: the spatial index is being built, and plans run without it.
+* `geo-not-built`: the query uses `geof:` functions in a build without the `geo` feature.
+
+The plan of an executed query, which the `application/x-sparkles+json` result includes,
+also lists the warnings that came up while it ran:
+
+* `geo-crs-approximate`: a geometry in a CRS whose datum shift is approximate. See
+  [Accuracy of datum shifts](#accuracy-of-datum-shifts).
+* `geo-crs-unsupported`: a geometry in an EPSG CRS that the build refused, with the
+  reason.
+
+Every node of a returned plan has an `id`, the path of child indexes from the root, such
+as `0.1.2`. A `CursorPlan` node and its operator share the id. Ids are valid only for
+the plan of the same response. A plan deeper than 256 levels is written in plan format 2
+instead, whose root has `"planFormat": 2` and whose nodes have no `id`, because ids that
+are paths would make the JSON grow with the square of the depth. A client that needs the
+ids of such a plan derives them from its shape. A plan without `planFormat` is in format
+1, and a reader refuses a format it does not know. The OpenAPI description lists
+`planFormat` on `PlanNode` and `CursorPlan`, and the plan view of the UI shows plans in
+formats 1 and 2 and says that it cannot show a plan in any other. The estimated plan of
+`/{ds}/explain` and the plan of an executed query have the same shape, so an `ASK` has
+its `Slice` root and a `CONSTRUCT` or `DESCRIBE` has a `CONSTRUCT` or `DESCRIBE` root in
+both. A node can also carry these members.
+
+| Member | Meaning |
+|---|---|
+| `skipped` | Why the node did not run, such as "the left side produced no rows". Its rows are `-1` and its time is 0. |
+| `stoppedEarly` | A `LIMIT`, `ASK` or `EXISTS` stopped the node once it had enough rows. |
+| `runs` | How often the node ran when a `LIMIT` made the executor grow its input in rounds. Its time spans every round, and its children add up their rounds too. |
+| `cached` | The node's result came from the result cache. Its children are the subtree the result was computed from, each `skipped`. |
+| `pushedFilters` | The filters a range scan or an index join applies itself. |
+| `estimateGuessed` | The estimate is a constant guess, as for `SERVICE`. |
+| `complete` | `false` on the nodes whose counts a failure cut short. |
+| `patterns` | The triple patterns and paths of the query that the node reads, in query order, as `PlanPattern` objects. Scans, index joins, star joins, paths and counts from the index carry it. |
+| `filterVars` | On a filter, the query variables its expression reads. |
+| `joinVars` | On a join, the query variables it joins on. |
+
+A `PlanPattern` has `s`, `p` and `o`, each an N-Triples term or a variable of the query
+written as `?name`. A blank node and a variable that the planner made, such as the middle
+of a path, are written as `?_`. A path is written in `p` with full IRIs in angle brackets
+and no spaces, such as `<http://example.org/partOf>+` or
+`(<http://example.org/a>|^<http://example.org/b>)*`. A pattern inside `GRAPH` also has
+`graph`, the graph term, and every pattern has `occurrence`, its index among equal
+patterns of the query, counted from 0 in query order. These members carry only terms that
+the query itself contains, so a caller whose view C12 limits learns nothing new from
+them. The UI uses them to draw the plan on the query's pattern graph. The parser writes a
+sequence such as `ex:a/ex:b` as its steps joined by a blank node, so each step is a
+pattern of its own with `?_` between them. It writes an outer inverse such as `^ex:a` or
+`^ex:a+` as the path inside it with the subject and object swapped. Any other path that the planner splits into operators, such as
+an alternative, lists the whole path on each of them.
+
+A query that a budget or its timeout stopped answers with its error as before. In the
+`application/x-sparkles+json` format the error body also carries `plan`, the plan as it
+stood when the query stopped, and `commit`. The nodes that were still running have
+`complete: false`, and their counts are those reached so far. The UI's **Explain why**
+sends that plan to `/{ds}/sparql/explain`.
+
+## Compression
+
+The design and its rationale are in [X01 Compression codecs](specs/X01-compression-codecs.md).
+
+**Responses** are compressed when the client sends `Accept-Encoding` with `zstd`, `br`,
+`gzip` or `deflate`. This includes streamed bodies. Bodies under 256 bytes and images are
+sent uncompressed. The UI's larger assets are built with brotli and gzip copies. Those
+copies are served as they are, with `Vary: Accept-Encoding`, rather than compressed per
+request.
+
+| `sparkles serve` flag | Default | |
+|---|---|---|
+| `--http-compression auto\|off` | `auto` | |
+| `--http-compression-level fastest\|default\|best\|N` | `default` | zstd 3, brotli 4, gzip 6. A number applies to whichever algorithm is chosen. |
+| `--http-compression-algorithms` | `zstd,br,gzip,deflate` | The encodings offered. |
+| `--max-decompressed-mb` | `65536` | Cap on compressed request bodies after decompression and on RDF source bytes, including plain RDF. `0` means none. |
+| `--max-query-body-mb` | `16` | Largest body of a SPARQL query, `/{ds}/explain`, `/{ds}/shacl` or `/{ds}/shex` request. `0` means none. |
+| `--max-update-body-mb` | `256` | Largest body of a SPARQL update. `0` means none. |
+| `--max-admin-body-mb` | `16` | Largest body of an admin request (`/$/…`) or a `/{ds}/prefixes` change. `0` means none. |
+| `--max-upload-mb` | `4096` | Largest Graph Store write or upload body, after HTTP decompression. `0` means none. |
+| `--min-free-disk-mb` | `1024` | Free space that must remain in the temporary directory after a spooled request body, and on the data directory's file system after a commit, rebuild, clone or N-Quads backup. `0` turns the check off. |
+| `--max-mem-dataset-mb` | `4096` | Largest in-memory (`dbType=mem`) dataset. A commit that would grow one past it fails with `507`. `0` means none. |
+
+**Request bodies** of updates, queries, Graph Store PUT/POST and uploads may be sent with
+`Content-Encoding: gzip`, `br`, `zstd` or `deflate`. Another encoding gets `415` with an
+`Accept-Encoding` header naming the supported ones. RDF bodies and uploaded files are also
+recognised as compressed by their first bytes (gzip, xz, bzip2, zstd, LZ4 frames).
+Uploads are also recognised by file name (`.gz`, `.xz`, `.bz2`, `.zst`, `.br`, `.lz4`).
+A body that decompresses past `--max-decompressed-mb` fails with `413` and commits
+nothing.
+
+**Body ceilings.** A body that is read whole has the ceiling of its request class:
+
+* `--max-query-body-mb` for queries, `/{ds}/explain`, the shapes graph of `/{ds}/shacl`
+  and the schema of `/{ds}/shex`
+* `--max-update-body-mb` for updates
+* `--max-admin-body-mb` for `/$/…` requests and prefix changes
+* a fixed 64 KiB for `/$/auth/*`
+
+The ceiling counts decompressed bytes and is checked while the body is read, so the server
+never holds more than the ceiling. A declared `Content-Length` over it is refused before
+anything is read. Past the ceiling, the request fails with `413`. A form POST to `/{ds}`
+may hold either operation, so it is read up to the larger of the query and update
+ceilings.
+
+Graph Store PUT/POST, including through `/{ds}`, and `/{ds}/upload` are the bulk
+endpoints. Their bodies stream to a temporary file instead, up to `--max-upload-mb`, or
+the request fails with `413`. That limit counts bytes after HTTP decompression. Its
+default of 4096 (4 GiB) is the body limit of the bundled NixOS nginx virtual host, and `0`
+means unlimited. `--max-decompressed-mb` caps the RDF sources separately as they are
+parsed, both files compressed inside the body and plain RDF. A body in RDF Thrift, RDF
+Protobuf, RDF/JSON or TriX is translated to N-Quads, and the translation counts against
+that cap as it is written. Before each 64 MiB of a spooled body is written to the
+temporary directory, the server checks that the file system keeps `--min-free-disk-mb`
+free (default 1024, `0` for no check). Otherwise the request fails with `507`.
+
+**Storage.** A commit to a persistent dataset is refused with `507 {code: "storage-full"}`
+when it would leave less than `--min-free-disk-mb` free on the data directory's file
+system. Free space is measured with `statvfs` and cached for a second between small
+commits. A rebuild (a large load or compaction) or a clone checks the free space while it
+builds. Once the file system goes below the limit, it stops and removes what it wrote.
+Nothing is committed in either case. An in-memory dataset (`dbType=mem`) holds at most
+`--max-mem-dataset-mb` (default 4096), estimated from its index files, delta and
+vocabulary. A commit that would grow it past that fails the same way, but deletes always
+pass. A persistent dataset can also have a storage quota of its own (see
+[Storage quotas](#storage-quotas)).
+
+**Files.** `sparkles load` reads the same codecs, chosen with
+`--compression auto|none|gzip|xz|bzip2|zstd|brotli|lz4`. `auto` goes by magic bytes, then by the
+extension. Brotli has no magic bytes, so it needs `.br` or `--compression brotli`. When a
+file's name and its data disagree, the data wins and a warning is logged. An explicit
+`--compression` that disagrees is an error.
+
+Every supported RDF syntax can be parsed incrementally from a reader. With
+`--parse-mode auto`, plain N-Triples, N-Quads and Turtle are still parsed in parallel
+from a memory-mapped file, and compressed line formats in bounded parallel blocks.
+Other compressed documents are read whole into memory and parsed there when their
+actual decompressed size is below 128 MiB for Turtle and TriG, or 8 MiB for other
+syntaxes. At or above that size, they are parsed from a reader. Plain files that
+cannot be split use the same cutoffs. A reader parses from a 128 KiB buffer and keeps
+the syntax parser's token limits. `--auto-buffer-bytes BYTES` changes the cutoff for
+each source, as do `Source.auto_buffer_bytes` in Rust and `auto_buffer_bytes` in
+Python. Zero skips the size check. The cutoff applies to each load, so concurrent loads
+can each use that much memory. Lower it or choose streaming when several loads share a
+memory budget. Plain bytes that the caller already holds in memory are parsed without a
+copy. In automatic mode, small transactional loads and Python file objects are parsed
+from a reader. `--parse-mode streaming` always uses a sequential reader, and
+`--parse-mode buffered` always reads the whole document into memory first. A buffered
+compressed input needs RAM for its full decompressed size. These modes only affect
+parsing. Transactional changes, the vocabulary, the map of blank-node labels and
+index-building batches take memory of their own. `Source.max_decompressed` limits the
+input bytes of plain files as well as decompressed ones.
+
+Ordinary JSON-LD allows keys in any order, so its reader may hold a large object in
+memory while it waits for a context that comes late. For ordered streaming JSON-LD,
+use `load --jsonld-streaming`, `convert --syntax jsonld-streaming`, or the RDF content
+type `application/ld+json; profile="http://www.w3.org/ns/json-ld#streaming"`. This
+profile checks the key order and is never applied silently to ordinary JSON-LD. See the
+[W3C streaming JSON-LD note](https://www.w3.org/TR/json-ld11-streaming/). Single
+literals, contexts and the map of blank-node labels can still be large. RDF/JSON input
+yields statements as it reads them instead of building the whole subject and predicate
+tree. The format requires unique keys, but the lenient decoder accepts a repeated
+subject or predicate key and keeps the statements from every occurrence.
+
+XZ files are decoded incrementally, and the decoder uses at most 256 MiB of memory,
+separately from the input-byte ceiling. Bzip2 files are also decoded incrementally.
+Both accept several concatenated streams in one file. They are codecs for files and
+payloads, not additional HTTP `Content-Encoding` values. A large Graph Store body that
+is translated to another syntax spills to disk once its translated output is large
+enough.
+
+`sparkles load --lenient` skips the validation of IRIs and language tags. It is meant for
+data whose IRIs are not all valid RFC 3987 IRIs; DBpedia, for example, has some that
+contain U+FFFD. Syntax errors still fail the load.
+
+`sparkles dump --out FILE` and `sparkles backup` take `--compress CODEC`, `--level N` and
+`--threads N` (zstd). `sparkles backup` and `/$/backup` write zstd (level 3) by default,
+which is about five times faster than gzip for a slightly larger file. `--compress gzip`
+(`?compression=gzip`) gives `.nq.gz`, as Fuseki writes. `sparkles dump --out FILE` goes by
+the file's extension, and writes uncompressed without one. The extension before the
+compression one, as in `dump.ttl.zst`, picks the syntax unless `--format` names it.
+
+**Full-text documents** keep their terms in columns of the index, so the Tantivy doc
+store holds no fields and its codec does not change the index size. The doc store uses
+zstd (level 3) by default, and the text configuration accepts `"docstoreCompression":
+"lz4"` or `"none"`. Changing it rebuilds the index.
 
 ## Commits
 
@@ -5192,6 +5862,8 @@ exactly.
 | DELETE | `/$/vector/{ds}/{name}` | Drops the index and its files, with `204`. |
 | POST | `/$/vector/{ds}/{name}/rebuild` | Builds the index again from RDF. Returns `202` and a task. |
 | POST | `/$/vector/{ds}/{name}/recall?samples=100&k=10&ef=` | Measures recall@k against the exact search, with stored vectors as queries. Returns `{ k, samples, ef, recall, hnswMs, exactMs }`. `recall` is `null` when no vector was sampled, for example while the index has no graph to search. |
+| POST | `/$/vector/{ds}/{name}/projection?method=pca` | Computes a two-dimensional projection of the index and keeps it. See [Embedding map](#embedding-map). |
+| GET | `/$/vector/{ds}/{name}/projection?bbox=&limit=&colour=` | The kept projection with its density grid, classes and up to 50,000 points. |
 
 A `VectorIndexStatus` is
 `{ name, predicate, dimension, metric, model?, state, progress?, message?, generation, rows, overlay: { inserts, deletes, indexed, pending, overBudget }, skipped: { malformed, wrongDimension, zeroNorm }, memory: { segmentBytes, hnswBytes, residency }, hnsw, exactThreshold, files?, lastBuild?, embedding? }`.
@@ -5218,6 +5890,85 @@ sparkles vector status  --loc DB [--name NAME]
 
 Each command takes `--server URL --dataset NAME` instead of `--loc`. `create` and
 `rebuild` wait for the build.
+
+### Embedding map
+
+`POST /$/vector/{ds}/{name}/projection` computes a two-dimensional projection of an
+index's entities at the head of the branch, and `GET` on the same path reads it. The UI's
+embedding map draws it.
+
+```sh
+curl -X POST 'http://localhost:3030/$/vector/wiki/abstracts/projection?method=pca'
+curl 'http://localhost:3030/$/vector/wiki/abstracts/projection?limit=1000'
+```
+
+`method=pca`, the default, finds the two leading principal components of a sample of up
+to 100,000 vectors and projects every vector on them. Under the cosine metric the vectors
+are normalized first. An entity with several vectors under the predicate sits at the mean
+of their projections. A PCA of an index of up to 1,000,000 vectors runs in the request
+under its `timeout`, and a larger one runs as a task. `method=neighbours` starts from the
+PCA positions and lays out the index's HNSW neighbour graph, moving each entity toward its
+neighbours and away from crowded regions. It always runs as a cancellable task of kind
+`vector-projection`, and the `POST` answers `202` with the task. Anyone with `read` on the
+whole dataset may cancel it with `DELETE /$/tasks/{id}`, since anyone who can start one
+can. The projection reads the index's base rows and the vectors inserted since, and the
+layout also follows the links of nodes that were added to the graph after its build. The
+optional body is
+`{ "sample": n, "seed": n, "iterations": n }`, where `iterations` counts the layout's
+steps, 100 by default. The same seed gives the same projection.
+
+The `POST` that runs in the request answers the projection's facts,
+`{ index, method, commit, generation, stale, vectors, dimension, entities, bounds,
+explained, builtMs, bytes }`. `vectors` counts the projected vectors and `entities` the
+points, and `explained` is the share of the sample's variance on each component.
+
+`GET` answers those facts with:
+
+| Member | Meaning |
+|---|---|
+| `points` | Up to `limit` points, 50,000 by default and at most, as `{ entity, x, y, class?, colour? }`. |
+| `region` | `{ bbox, total, shown, sampled }` for the points inside `bbox`, or all of them. |
+| `density` | `{ size: 256, bbox, max, counts }`, where `counts` is base64 of little-endian `Uint32` cell counts, row by row from the minimum y. |
+| `classes` | `{ iri, count }` per class. A point's `class` indexes this list. |
+| `colour` | With `colour=IRI`, `{ predicate, values }`, where `values` holds `{ value, count }` and a point's `colour` indexes it. |
+
+Each entity has a fixed sampling priority from the seed. A region with more points than
+`limit` returns those of lowest priority, so a smaller region shows every point that a
+larger one showed inside it, and more. A point's class is its first `rdf:type`, and its
+colour value is the first object of the `colour` predicate.
+
+`Accept: application/x-sparkles-points` returns the same answer in binary. The body starts
+with the eight bytes `SPKPTS\0\x01`, where the last byte is the format's version, and a
+reader refuses any other. A little-endian `Uint32` gives the length of the header, which is
+the JSON answer without `points` and with `count`, `termsBytes` and `hasColour`. The
+entities follow as `termsBytes` bytes of UTF-8 separated by line feeds, then zero bytes to a
+multiple of four. Then come `count` pairs of `Float32` x and y, `count` `Uint32` class
+indexes, and with `colour=` `count` `Uint32` colour indexes. `0xFFFFFFFF` means no class or
+no value.
+
+The server keeps four projections, 1 GiB in all, keyed by dataset, branch, index and
+method, and drops the least recently used first. A projection takes 24 bytes per entity,
+so ten million entities take 240 MB. The query memory pool pays for the computation before
+it allocates, from a bound of its working memory taken from the snapshot it reads. In the
+request the request's own grant is charged, and a task waits in the pool's queue for a
+grant of its own. A computation that needs more than the whole pool is refused with `507`,
+and one that finds the memory in use past the admission wait gets `503`, or a failed task.
+A kept projection then holds a grant for its own bytes until it is dropped and its last
+reader is done, and a projection the pool or the limit cannot hold is refused with
+`507`. An index replaced under the same name with another predicate, dimension or
+metric forgets its projections. A
+kept projection holds the snapshot it read, so after a compaction the replaced generation's
+files stay open until the projection is replaced or dropped. Projections are not written to
+disk, and a restart forgets them. A projection read at an older commit than the head has
+`stale: true` until a new one is computed. `GET` answers `404` until a `POST` computed one.
+`/metrics` reports `sparkles_vector_projections` and `sparkles_vector_projection_bytes`.
+
+Both routes need `read`, and they answer `403` to a caller whose grants or protections
+cover part of the dataset, as the vector status routes do, because a point reveals that an
+entity exists and what it is like. The library computes a projection with
+`ds.indexes().vector().projection(name, &ProjectionConfig, &Control)`, and Python with
+`ds.indexes.vector.projection(name, method="pca", sample=…, seed=…)`, which returns every
+point.
 
 ### Embeddings on write
 
@@ -5916,6 +6667,86 @@ parent at the next level.
 A replace run commits its first batch before the others, so a reader sees a graph with
 part of the new results until the run ends. Use `atomic` for a graph that must change at
 once, at the price of one large commit.
+
+### View-only runs
+
+A request without `write` may add four members that make it a view-only run, which the
+graph canvas uses for its algorithm lenses.
+
+```json
+{
+  "algorithm": "pageRank",
+  "projection": "people",
+  "nodes": ["http://example.org/alice", "http://example.org/bob"],
+  "keep": true,
+  "async": true
+}
+```
+
+| Member | Meaning |
+|---|---|
+| `nodes` | Up to 20,000 IRIs. The whole result is computed, and the answer holds only the rows of these nodes. A node that the caller's projection does not contain gets no row and no error. |
+| `keep` | Keep the whole result in the server's cache of view-only results, so that a later request for other nodes reads it instead of running again. |
+| `async` | With `keep`, run as a task of kind `algo-view` and answer `202` with the task. |
+| `top` | Up to 20,000. Only the rows with the highest values of the first numeric output, such as `score` or `core`, highest first. With `nodes`, the highest of the listed nodes. |
+
+The answer is SPARQL JSON results whatever the `Accept` header asks for. A community or
+component row also binds `communitySize`, the size of its community or component in the
+whole projection, counted per level for `louvain` and `leiden`. Two members follow the
+results. `summary` holds the statistics of the run, as `summary=true` returns them, and
+`run` holds the commit it computed at, whether the cache answered (`cached`), the rows of
+the whole result, the rows returned, `truncated` when the server's row limit cut the
+answer, and `definition`, a hash of the request that every answer of the same definition
+shares. A client that reads one run in several requests compares `commit` and `definition`
+to know that its answers come from one run, since a named projection can change between
+them without a commit. The answer is written one row at a time, and its buffer counts
+against the memory budget, so an answer over the result-byte limit is refused as soon as
+it passes the limit.
+
+The run reads under the caller's view at the state that the request's `at` parameter and
+`branch` parameter select, with the query timeout and memory budget. The budget parameters
+`memory-mb`, `max-rows`, `max-rows-produced`, `spill-mb` and `max-result-mb` lower the
+server's budgets as they do on a query. The decoded rows of the result count against the
+memory budget and the request's grant of the memory pool as they are decoded, so a large
+result answers `507` with `budget: "memory"` before it grows past them. An answer whose
+JSON is larger than the result-byte limit answers `507` with `budget: "result-bytes"`,
+whether it was computed or read from the cache. Any run without
+`write` may read a branch, while a run with `write` answers `400` on a branch, since its
+run record and the named projections belong to main. A run on a branch does not find
+main's named projections, so it gives its projection inline. The cache key is the
+dataset's branch, the commit, the caller's read view with its triple protections, the
+`default-graph-uri` and `named-graph-uri` parameters, the dataset's inferred overlay and
+RDFS on read, and the query text that the request without `nodes`, `keep`, `async` and
+`top` stands for, with the definition of a named projection. The query text has every
+prefixed name expanded with the dataset's prefixes as they are when the request arrives,
+so a changed prefix, which makes no commit, is a different key. A caller therefore
+never reads a result computed for a wider view. The cache keeps at most 8 results and
+512 MiB of their estimated size, and never more than half of the server memory pool, so the
+other half always stays for the admission of queries. It drops the oldest first. Each kept
+result holds a grant of the server memory pool of its size, rounded up to the pool's 4 MiB
+granules, for as long as the cache keeps it or a request still reads it, so kept results
+reduce the memory left for queries. A result larger than half the pool is answered but not
+kept, and so is a result for which the pool has no room even after the older results are
+dropped. A result keeps decoded
+terms, so it takes about 100 to 150 bytes per node and output rather than the 16 bytes of a
+bare score, in exchange for answering a later request without dictionary lookups.
+
+A background run is followed with `GET /$/tasks/{id}` and its task needs only `read`. A
+request for the same key while the task runs joins it, and its answer is the same task with
+`joined: true`. The callers that started or joined a run can follow its task even when their
+view of the dataset is restricted, and the caller that started it, or a dataset admin, can
+cancel it with `DELETE /$/tasks/{id}`. Both rights hold only while the caller can still read
+the dataset through the same view it had when it started or joined the run. The task of a
+run on a branch names the dataset as `ds@branch`, so access to it is checked on that
+branch. A run checks its cancellation and deadline again while it decodes its rows, and a
+run cancelled after it computed keeps nothing. A caller whose
+grants change loses sight of the task. The task has the deadline of an update, none unless
+the request gives a `timeout` or the server runs with `--update-timeout`, and takes its
+initial grant of the memory pool when it starts. F14's algorithms do not report their
+iterations, so the task's progress moves by phase, from waiting through computing to
+keeping the result. When the task ends, its `detail` holds the algorithm, the commit, the
+rows, the summary and `kept`, and the same request then answers from the cache with `200`.
+`/metrics` counts the cache's hits, misses, joins and refusals.
 
 ### Named projections
 
@@ -6926,6 +7757,76 @@ pattern with many answers takes 8 to 35 times as long as over materialized infer
 The materialized counts are larger because `rdfs-simple` also inherits domains and
 ranges through subproperties.
 
+## Query-time reasoning
+
+The design is in [F17](specs/F17-query-time-reasoning.md), and its
+[Outcome](specs/F17-query-time-reasoning.md#outcome) records what Phase 1 built.
+
+`reasoning=demand` derives, as the query runs, the facts its patterns need from the
+rules of a profile, and the query does not read the inferred graph. A materialization is
+not needed. The rules are those of `rdfs`, `rdfs-simple` or `owl-rl`, chosen with
+`reasoningProfile`, or the profile of the dataset's last materialization when the request
+names none. Its Jena rules come from the rules of that materialization, and Jena backward
+rules (`head <- body`), which materialization skips, answer this way.
+
+```sh
+curl -G localhost:3030/ds/sparql --data-urlencode 'query=SELECT ?x { ?x a ex:Person }' \
+  --data-urlencode reasoning=demand --data-urlencode reasoningProfile=owl-rl
+sparkles query --loc db --reasoning demand --profile owl-rl 'SELECT ?x { ?x a ex:Person }'
+sparkles query --loc db --reasoning demand --rules family.rules --explain 'SELECT ...'
+```
+
+Each triple pattern that rules can give facts for becomes a demand, with the pattern's
+constants bound. A pattern whose subject or object an earlier pattern of its group binds
+is seeded with that pattern's values, up to 10,000 of them. The demand (magic sets)
+transformation rewrites the rules for each demand, so that only the facts that can reach
+its answers are derived. LUBM query 1 at 100 universities under OWL 2 RL derives no facts
+beyond the schema, where a materialization derives 10.9 million.
+
+* The response carries `Sparkles-Reasoning: demand; derived=48211; tables=3; cached=2`,
+  the facts derived for the query, the tables it used and how many came from the cache.
+* EXPLAIN shows a `Reason` node over the plan with a `Derive` node per pattern. Its
+  counters give the adornment (such as `rdf:type^fbb`, subject free and predicate and
+  object bound), the rules the pattern can depend on, how it was seeded (`constants` or
+  `join`) and, after a run, the facts derived and the seeds.
+* `maxDerived` caps the facts one query derives. The default and the ceiling are set by
+  `serve --reason-max-derived` (1,000,000, and `0` for no limit). Magic facts, the
+  bookkeeping of the transformation, do not count, and they are charged to the query's
+  memory budget like the derived facts. A query past the cap fails with `422` and the code
+  `reasoning-budget`, naming the rule that produced the most facts. The query's timeout
+  and cancellation stop a derivation too.
+* A rule set whose `noValue` reads facts that depend on its own rule is not stratified
+  and fails with `422` and the code `reasoning-rules`.
+* Derived tables are cached per snapshot, rules and view, so a repeated query reads them.
+  `nocache=true` bypasses the tables but not the dataset's schema, which is derived once
+  per snapshot.
+* A derivation reads the caller's view, so protections that hide triples apply to it.
+  Unlike materialized inferences, which callers with protections cannot read, derived
+  facts follow only from triples the caller can see.
+* With [RDFS on read](#rdfs-on-read) set, `reasoning=demand` applies instead and EXPLAIN
+  says so.
+* `reasoning=auto`, the cost-based choice between the inferred graph and derivation,
+  answers `400`. F17 Phase 2 specifies it, and it is not built.
+* A DESCRIBE with `reasoning=demand` fails with `501` and the code `unsupported`, since
+  the description reads facts that no pattern asks for. CONSTRUCT with the description's
+  patterns gives the derived facts.
+* The facts copied into a query's view are charged to its memory budget, also when they
+  come from cached tables.
+
+Under OWL 2 RL, the rules are first specialized to the dataset's schema: the schema's
+facts are derived once per snapshot, and each rule that joins a schema fact with an
+instance fact becomes one rule per schema binding. A demand then asks only for the
+properties and classes that can give its answers. A query that reads schema facts, with
+a variable predicate, a variable class or a schema predicate such as `rdfs:subClassOf`,
+uses the rules as they are. Equality (`owl:sameAs`) is derived in full in a stage of its
+own before the query's demands when rules derive and read it, and its rules are left out
+when no `owl:sameAs` fact can hold.
+
+Queries that touch many facts derive them all. `?x a ub:Student` derives the types of
+every person, and such queries take tens to hundreds of times as long as over a
+materialization. [F17's Outcome](specs/F17-query-time-reasoning.md#outcome) has the LUBM
+measurements.
+
 ## Write-time validation
 
 The design and its rationale are in [C10 Write-time SHACL validation](specs/C10-write-time-validation.md). The ShEx guard is described in [G02 ShEx](specs/G02-shex.md).
@@ -7279,6 +8180,234 @@ SHACLC cannot express, such as a named property shape, `sh:minCount 0` or a labe
 shape, is not written at all, and the error names those triples. The Rust API is
 `sparkles_shacl::compact::{parse, write}` and `sparkles_shacl::ShapesSyntax`.
 
+## Editing forms
+
+The design and its rationale are in
+[U02 Editing forms generated from SHACL shapes](specs/U02-shape-driven-forms.md).
+
+The form routes turn a dataset's SHACL shapes into an editing form for one resource. The
+server reads the shapes, chooses the node shapes that target the resource, merges their
+property shapes into fields and reads the resource's values under the caller's grants. A
+form's changes go back as terms, and the server writes them as one update of
+`DELETE DATA` and `INSERT DATA`, so a client never writes SPARQL text for a save. The routes
+need the `shacl` cargo feature, which is on by default, and return `501` without it.
+
+| Route | Permission | Use |
+|---|---|---|
+| `GET /$/forms/{ds}?focus=IRI` | `read` | The form model of a resource, or with `class=IRI` the empty form of a new instance. |
+| `POST /$/forms/{ds}/check` | `write` | A dry run of a change and its validation against the form's shapes. |
+| `POST /$/forms/{ds}/save` | `write` | The commit of a change, unless another commit changed its fields. |
+
+### The form model
+
+`GET /$/forms/{ds}` takes these parameters.
+
+* **`focus`** is the IRI of the resource, bare or in angle brackets.
+* **`class`** asks for the form of a new instance of that class instead, built from the
+  node shapes that target the class or one of its superclasses, with no values and a
+  `focus` of `null`. A request names `focus` or `class`, and a `class` form takes no `at`.
+* **`shapes`** is `guard`, `graphs` or `drafted` and overrides the `forms` setting's
+  source. `guard` reads the shapes of the dataset's write-time SHACL guard, `graphs` reads
+  the shapes graphs the setting names, and `drafted` drafts shapes from the data as the
+  schema report does. A dataset without a SHACL guard answers with no fields and
+  `shapes.missing` set, rather than an error.
+* **`branch`** opens the form on a branch, as on other routes. **`at`** opens the form at
+  a past state, as the history routes take it, and such a form is never editable.
+* **`lang`** is the language whose `sh:name` and `sh:description` the labels prefer. The
+  server falls back to English, then to untagged text, then to the predicate's
+  `rdfs:label` and similar labels in the data, and then to its prefixed name.
+
+The answer is the model. Its `ETag` and `Sparkles-Commit` headers name the commit read.
+
+```ts
+type FormModel = {
+  formFormat: 1;
+  focus: string | null;
+  types: string[];                  // the focus node's rdf:type values
+  commit: number;                   // the commit read
+  branch: string;
+  editable: boolean;                // whether the caller may save this form
+  shapes: {
+    source: "guard" | "graphs" | "drafted";
+    nodeShapes: string[];           // the node shapes that target the focus
+    missing?: string;               // why there are no shapes
+    unknownHints: string[];         // DASH editors and viewers the server does not know
+  };
+  groups: { iri: string | null; label: string; order: number | null }[];
+  fields: FormField[];
+  other: { predicate: string; values: FormValue[] }[];  // triples no field covers
+  graph: string | null;             // where new values go, null for the default graph
+  closed: boolean;                  // a shape is sh:closed, so other properties violate it
+  save: { to: "main" | "branch"; branch: string; exists: boolean; mainProtected: boolean };
+  guard: { language: "shacl" | "shex"; mode: "reject" | "warn" | "off" } | null;
+};
+type FormField = {
+  id: string;                       // the path in SPARQL syntax, such as <http://ex/name>
+  path: string;                     // the predicate IRI, or the SPARQL path of a complex path
+  inverse: boolean;
+  editable: boolean;
+  reason?: "readOnly" | "protected" | "graph" | "complex-path" | "too-many" | "state";
+  label: string;
+  description?: string;
+  group: string | null;             // the sh:PropertyGroup IRI
+  order: number | null;
+  widget: string;                   // radio, select, checkbox, boolean-select, date, datetime,
+                                    // number, text-lang, textarea, text, entity, nested, term
+  editor?: string;                  // dash:editor
+  viewer?: string;                  // dash:viewer
+  constraints: Constraints;         // the merged constraints of every shape on this path
+  sources: string[];                // the shapes that constrain this path
+  values: FormValue[];
+  truncated?: boolean;              // more than 200 values, so the field is read-only
+};
+type FormValue = { term: Term; graph: string | null; label?: string; readOnly?: boolean };
+```
+
+A field's `id` is its path written in SPARQL syntax, so two node shapes that constrain the
+same path give one field with the stricter of each constraint. `constraints` holds the
+constraints the browser can check, which are `minCount`, `maxCount`, `datatype`,
+`nodeKind`, `class`, `in`, `hasValue`, the four range bounds, `minLength`, `maxLength`,
+`pattern` with its `flags`, `languageIn`, `uniqueLang`, `singleLine` and `defaultValue`.
+`node` lists the shapes of `sh:node`, and `server` names the other components the check
+evaluates, such as `sh:qualifiedValueShape` or a SHACL-SPARQL constraint.
+
+A predicate path and an inverse path are editable. Sequence, alternative and repetition
+paths are read-only with `reason: "complex-path"` and show no values. A field is also
+read-only when its shape has `dash:readOnly true`, when a protection of the caller's grants
+keeps the predicate from writes (`protected`), when new values would go to a graph the
+caller cannot write (`graph`), when it holds more than 200 values (`too-many`), and when
+the whole form cannot be saved (`state`). Fields whose predicate a protection hides from
+reads are left out, as are the values in graphs the caller cannot read and the values of
+the inferred graph. What the caller may write follows its grants on the update endpoint of
+the branch saves go to, and what it reads follows the query endpoint. A value in a graph
+the caller cannot write has `readOnly: true`. Only protections that name predicates and
+graphs alone make a field `protected`, and a protection scoped by classes or a pattern is
+enforced by the save itself. Shapes read from shapes graphs leave out the triples that the
+caller's protections hide. A focus that no shape targets answers `200` with no fields.
+
+### Checks and saves
+
+`check` and `save` take the same JSON body.
+
+```ts
+type FormChangeBody = {
+  focus?: string;                   // the IRI of the resource
+  class?: string;                   // or the class of a new instance, instead of focus
+  branch?: string;                  // the branch the form was opened on, main by default
+  shapes?: "guard" | "graphs" | "drafted";
+  changes: { field: string; remove?: Term[]; add?: Term[] }[];
+  expect: { [field: string]: Term[] };  // the values the form loaded, for every changed field
+  message?: string;                 // the commit message
+};
+```
+
+The server checks each change before it writes anything. A field that is not in the form,
+a blank node, or a literal on an inverse path is a `400`, because the change could not
+name its triple. A change to a
+read-only field is a `403`. A change of more than 1,000 terms is a `400`. A removed value is
+deleted from every graph that holds it, and an added value goes to the model's `graph`.
+`expect` must name every changed field. It may be empty for a field that had no values.
+A change with `class` makes a new instance. The server mints its IRI from the setting's
+`newIri`, refuses an IRI that already describes a resource, and adds its `rdf:type`.
+The middleware admits a check or a save on any branch the caller can see, and the handler
+checks write on the branch the body or the query names.
+
+`check` runs the change as a write preview (see [Write previews](#write-previews)) and then
+validates the nodes the change touches against the form's shapes, whether or not the
+dataset has a guard. The nodes it validates are the resource, the IRIs added or removed,
+and up to 500 nodes one or two triples away from one of them in either direction, whose
+shapes can read the change along a path. The check plans the change on the state its dry run starts
+from. The validation holds the dataset's writer lock and stops after 10
+seconds. The answer is the preview, the validation and the fields whose stored values
+already differ from `expect`, which a save would refuse with a conflict. A check of a
+session branch that does not exist yet previews its first commit on `main`'s head, and
+`main`'s protection does not refuse that preview.
+
+```ts
+type FormCheckAnswer = {
+  branch: string;
+  preview: WritePreview;            // as POST /{ds}/update?dryRun=true answers
+  update: string;                   // the SPARQL Update the save would run
+  conflicts: { id: string; now: Term[] }[];  // fields another commit changed, as save's 409 lists them
+  validation: {
+    checked: boolean;
+    withheld: boolean;              // the caller's grants hide part of the dataset
+    timedOut: boolean;
+    conforms: boolean | null;
+    results: (ShaclResult & { field: string | null })[] | null;
+  };
+};
+```
+
+Each result carries the `field` it belongs to, which is the field whose path is the
+result's `sh:resultPath` on the focus node, or `null` for a result on another node. A
+caller whose grants limit the graphs or triples it reads gets `withheld: true` and no
+results, as the validation routes withhold reports from such callers.
+
+The Rust library gives the same answers through `ds.forms().model`, `check` and `save`.
+Python binds them as `ds.forms.model(focus, class_=…, settings=…, at=…)`,
+`ds.forms.check(change, settings=…)` and `ds.forms.save(change, settings=…)`, which
+return dicts with the members above. A conflicting save raises `ConflictError` with the
+code `form-conflict` and the fields in `fields`. The Node.js and JVM bindings do not expose forms.
+
+`save` compares `expect` with the stored values of the changed fields while it holds the
+writer lock. When one differs, it answers `409` with code `form-conflict` and the current
+values, and writes nothing. When the values are the same but another commit moved one of
+them to another graph while the save waited, the save plans its update again on the new
+head, up to three times.
+
+```json
+{
+  "error": "another commit changed these fields since the form loaded them",
+  "code": "form-conflict",
+  "branch": "edits.ana.20261024",
+  "fields": [{ "id": "<http://example.org/email>", "now": [{ "type": "literal", "value": "a@b.org" }] }]
+}
+```
+
+Otherwise the change is committed as one commit of kind `update`, with the caller as author
+and `message` as its message, and the write-time guard runs as it does for any write. The
+answer is the commit receipt of `POST /{ds}/update` plus `dataset`, `focus`, `branch` and
+`branchCreated`, where `focus` is the IRI minted for a new instance. A rejected write answers as an update does, such as `422` with the guard's
+report.
+
+### Where saves go
+
+A form opened on a branch other than `main` saves there. A form opened on `main` saves to
+`main` or to a session branch, as the `forms` setting's `saveTo` decides.
+
+* **`auto`** is the default. It saves to `main` unless `main` is protected, and to the
+  session branch then.
+* **`main`** always saves to `main`, which a protected `main` refuses with
+  `403 branch-protected`.
+* **`branch`** always saves to the session branch.
+
+The session branch is named by `branchTemplate`, `edits.{user}.{date}` by default, where
+`{user}` is the caller's name and `{date}` is the day in UTC as `yyyymmdd`. The first save
+creates it from `main`'s head, which needs the right to write branches and grants that do
+not limit the caller to some graphs or triples. Later saves on the same day reuse it. Its
+changes reach `main` through the merge routes. A check of a session branch that does not
+exist yet runs on `main`'s head, where the branch would start.
+
+### The `forms` settings kind
+
+`forms` is a settings kind (see [Settings](#settings)), read from the dataset's `main` and
+kept in `<db>/forms.json`. Its fields are these.
+
+| Field | Default | Meaning |
+|---|---|---|
+| `shapes` | `guard` | Where the shapes come from, which is `guard`, `graphs` or `drafted`. |
+| `graphs` | `[]` | The shapes graphs that `shapes: "graphs"` reads. |
+| `saveTo` | `auto` | Where saves of a form on `main` go, which is `auto`, `main` or `branch`. |
+| `branchTemplate` | `edits.{user}.{date}` | The name of the session branch. It must hold `{user}`. |
+| `targetGraph` | `type` | The graph new values go to. `type` is the graph of the focus node's `rdf:type` triple, `default` the default graph, and an IRI that graph. |
+| `newIri` | `urn:uuid` | How new instances get IRIs, either `urn:uuid` or a template that holds `{uuid}`. The first save of a form for a new instance mints its IRI this way. |
+
+```sh
+curl -X PATCH 'localhost:3030/$/settings/people/forms' \
+  -H 'content-type: application/json' -d '{"saveTo": "branch"}'
+```
+
 ## ShEx validation
 
 The design and its rationale are in [G02 ShEx 2.1 validation](specs/G02-shex.md).
@@ -7624,327 +8753,6 @@ body that is not JSON. The endpoint follows `--format-endpoint`, `--format-max-m
 same cases, and it shares the formatter's slots. With authentication, it needs no dataset permission, and rate limits
 count it in the `query` class.
 
-## `application/x-sparkles+json` (UI result format)
-
-This result format is modelled on QLever's `qlever-json`. The UI uses it to render results
-and draw query plans:
-
-```ts
-type SparklesResult = {
-  queryType: "SELECT" | "ASK" | "CONSTRUCT" | "DESCRIBE";
-  vars?: string[];                        // SELECT
-  rows?: (Term | null)[][];               // SELECT; null = unbound
-  boolean?: boolean;                      // ASK
-  triples?: [Term, Term, Term][];         // CONSTRUCT / DESCRIBE
-  quads?: [Term, Term, Term, Term | null][]; // streaming graph results; null default graph
-  meta: {
-    totalRows: number | null; sentRows: number;
-    status?: "complete" | "stopped";        // streaming only; totalRows null when stopped
-    timing: { parseMs: number; planMs: number; execMs: number; serializeMs: number; totalMs: number };
-    plan: PlanNode | CursorPlan;           // eager or streaming operator tree
-    memory: { peakBytes: number };         // peak estimated memory of intermediate results
-    rowsProduced: number;                  // rows produced by all operators, summed
-  };
-};
-type Term =
-  | { type: "uri"; value: string }
-  | { type: "bnode"; value: string }
-  | { type: "literal"; value: string; datatype?: string; "xml:lang"?: string }
-  | { type: "triple"; value: { subject: Term; predicate: Term; object: Term } };
-type PlanNode = {
-  planFormat?: 2;            // root only: a plan deeper than 256 levels, whose nodes have no id
-  id?: string;               // the path of child indexes from the root, such as "0.1.2"
-  operator: string;          // "IndexScan", "Join", "Sort", "Filter", ...
-  description: string;       // human readable, e.g. "PSO ?s <p> ?o"
-  columns: string[];         // variables produced
-  sortedOn: string[];
-  estimatedRows: number; estimatedCost: number;
-  actualRows: number; timeMs: number;       // wall time incl. children
-  cached: boolean;
-  children: PlanNode[];
-  counters?: Record<string, number | string | boolean>;  // spatial operators: candidates, rechecked,
-                             // refined, matched, treeNodesVisited, index ("ready", "building (37%)",
-                             // "feature-links", …), fallback (see GeoSPARQL); expressions evaluated
-                             // once per distinct value: exprCacheHits (rows that reused a result),
-                             // exprCacheMisses (evaluations), exprCacheSkipped (ran row by row)
-  warnings?: { code: string; message: string }[];       // root only: notes about the plan
-};
-```
-
-A native streaming response puts `rows` before `meta`. It includes the final counts and
-capabilities only when the query has produced every row successfully. When the query or
-the serialization fails, the response carries no success metadata. `commit` and
-`datasetId` identify the snapshot the query read, as they do on eager HTTP responses. A
-graph query's response has an empty `triples` array and puts every result in `quads`,
-with a null graph for statements in the default graph. A streaming plan has this shape:
-
-```ts
-type CursorPlan = {
-  operator: PlanNode;
-  materializes: boolean; fullInputBeforeOutput: boolean; growingState: boolean;
-  complete: boolean; reason: string | null;
-  children: CursorPlan[];
-};
-```
-
-`complete` says whether an operator's counts cover its entire execution. The counts on a
-stopped cursor are partial. `materializes` marks a subtree that fell back to eager
-execution. A native ORDER BY reads its whole input into budgeted memory before its
-first row. It reports `fullInputBeforeOutput` and a `reason`, but `materializes` stays
-false, so the strict policy that refuses eager fallback still accepts the sort.
-`growingState` warns that an operator keeps state that grows as it runs, such as
-generated strings. The batch size alone does not limit that state.
-
-### The I/O profile
-
-With `profile=io`, the metadata of a native result has an `io` object. It reports what the
-query read from the index and vocabulary files, which helps explain the time of a first
-query after a restart. The counters cover the whole process, so the profile needs the
-`metrics` permission, as `/$/metrics` does. A caller without it gets a `403`, and a value
-of `profile` other than `io` gets a `400`. A streaming response keeps the profile running
-until its body ends.
-
-```ts
-type IoProfile = {
-  index: Record<string, {                  // by permutation: spo, sop, pso, pos, osp, ops, gspo
-    columnsDecoded: number; decodedBytes: number; compressedBytes: number }>;
-  readahead: Record<string, {              // by file: the permutations, vocab.dat, vocab.off, vocab.num
-    requests: number; bytes: number }>;    // WILLNEED requests to the kernel
-  vocab: { finds: number; groupsHinted: number; blocksScanned: number };
-  numericPagesRequested: number;
-  timeMs?: { vocabLookup: number; vocabRead: number; indexDecode: number; indexWait: number };
-  majorFaults?: number; minorFaults?: number;
-  pages?: Record<string, { touched: number; residentBefore: number;
-                           residentAfter: number; broughtIn: number }>;
-  pagesTruncated?: boolean;
-  events?: { atUs: number; file: string; what: string; bytes: number }[];
-};
-```
-
-The counters are process-wide, so they include the reads of any query that runs at the
-same time. The profile is meant for one query on a quiet server. `vocab.finds` and
-`vocab.blocksScanned` are counted only while a profile runs, because a scan of the
-vocabulary adds to them millions of times from many threads. `vocabLookup` is the time
-in key lookups, which resolve the constants of the query. `vocabRead` is the time reading
-terms by id. `indexDecode` is the time decompressing index columns, and `indexWait` is the
-time to read their pages into memory before decoding. In a segmented index (format 3), a
-read of a few rows decodes single segments of a column, and each counts as one entry of
-`columnsDecoded`, with its own rows in `decodedBytes`. The times are summed over threads.
-`pages` comes from `mincore(2)` on the pages the query asked for or read, and `events`
-lists the first 512 requests in order. Overlapping profiles share one epoch inventory
-of at most 65,536 distinct file, mapping and page entries. It retains the first admitted
-pages and bounds report scratch storage by that sample. `pagesTruncated` is true when
-an inventory or range cap omitted pages. It is false when no cap omission was recorded,
-which does not guarantee complete coverage. Process counter snapshots omit the flag.
-
-All `pages` fields describe the retained best-effort sample. `touched`, `residentBefore`
-and `residentAfter` are additive lower bounds on those counts for the full observed set.
-`broughtIn` is `max(residentAfter - residentBefore, 0)` for the sample. It is neither a
-lower bound on the full-set delta nor a physical-I/O count, especially when pages are
-evicted. Platforms without mapped page observations report a false truncation flag and
-no page entries. The bounded shared inventory and event log add memory while profiles
-are active, outside any one query's grant. Their allocation size depends on the allocator.
-Profiling adds observation work, whose corrected-source cost remains to be measured.
-Numeric profiles record mapped value loads in both single and bulk lookup paths. Kinds
-and rank entries are observed before access only when read from the mapping, rather
-than a resident copy. These observations work with hints disabled or already issued.
-`numericPagesRequested` keeps counting numeric advice pages and does not count actual
-loads. Observation adds no advice and does not reset the mapping's once-only hint bits.
-
-The same counters are in `/$/metrics` as `sparkles_index_columns_decoded_total`,
-`sparkles_index_readahead_bytes_total` and `sparkles_vocab_groups_read_total`.
-
-## Explain
-
-`GET|POST /{ds}/explain?query=…` returns `{ "algebra": string /* SSE */, "plan": PlanNode }`.
-The plan is not executed, so `actualRows` is -1. The root `PlanNode` lists `warnings` when
-something in the query did not run the way it reads, although the answer is the same:
-
-* `geo-not-pushed`: a spatial FILTER is evaluated row by row. The warning says why.
-* `geo-index-building`: the spatial index is being built, and plans run without it.
-* `geo-not-built`: the query uses `geof:` functions in a build without the `geo` feature.
-
-The plan of an executed query, which the `application/x-sparkles+json` result includes,
-also lists the warnings that came up while it ran:
-
-* `geo-crs-approximate`: a geometry in a CRS whose datum shift is approximate. See
-  [Accuracy of datum shifts](#accuracy-of-datum-shifts).
-* `geo-crs-unsupported`: a geometry in an EPSG CRS that the build refused, with the
-  reason.
-
-Every node of a returned plan has an `id`, the path of child indexes from the root, such
-as `0.1.2`. A `CursorPlan` node and its operator share the id. Ids are valid only for
-the plan of the same response. A plan deeper than 256 levels is written in plan format 2
-instead, whose root has `"planFormat": 2` and whose nodes have no `id`, because ids that
-are paths would make the JSON grow with the square of the depth. A client that needs the
-ids of such a plan derives them from its shape. A plan without `planFormat` is in format
-1, and a reader refuses a format it does not know. The OpenAPI description lists
-`planFormat` on `PlanNode` and `CursorPlan`, and the plan view of the UI shows plans in
-formats 1 and 2 and says that it cannot show a plan in any other. The estimated plan of
-`/{ds}/explain` and the plan of an executed query have the same shape, so an `ASK` has
-its `Slice` root and a `CONSTRUCT` or `DESCRIBE` has a `CONSTRUCT` or `DESCRIBE` root in
-both. A node can also carry these members.
-
-| Member | Meaning |
-|---|---|
-| `skipped` | Why the node did not run, such as "the left side produced no rows". Its rows are `-1` and its time is 0. |
-| `stoppedEarly` | A `LIMIT`, `ASK` or `EXISTS` stopped the node once it had enough rows. |
-| `runs` | How often the node ran when a `LIMIT` made the executor grow its input in rounds. Its time spans every round, and its children add up their rounds too. |
-| `cached` | The node's result came from the result cache. Its children are the subtree the result was computed from, each `skipped`. |
-| `pushedFilters` | The filters a range scan or an index join applies itself. |
-| `estimateGuessed` | The estimate is a constant guess, as for `SERVICE`. |
-| `complete` | `false` on the nodes whose counts a failure cut short. |
-| `patterns` | The triple patterns and paths of the query that the node reads, in query order, as `PlanPattern` objects. Scans, index joins, star joins, paths and counts from the index carry it. |
-| `filterVars` | On a filter, the query variables its expression reads. |
-| `joinVars` | On a join, the query variables it joins on. |
-
-A `PlanPattern` has `s`, `p` and `o`, each an N-Triples term or a variable of the query
-written as `?name`. A blank node and a variable that the planner made, such as the middle
-of a path, are written as `?_`. A path is written in `p` with full IRIs in angle brackets
-and no spaces, such as `<http://example.org/partOf>+` or
-`(<http://example.org/a>|^<http://example.org/b>)*`. A pattern inside `GRAPH` also has
-`graph`, the graph term, and every pattern has `occurrence`, its index among equal
-patterns of the query, counted from 0 in query order. These members carry only terms that
-the query itself contains, so a caller whose view C12 limits learns nothing new from
-them. The UI uses them to draw the plan on the query's pattern graph. The parser writes a
-sequence such as `ex:a/ex:b` as its steps joined by a blank node, so each step is a
-pattern of its own with `?_` between them. It writes an outer inverse such as `^ex:a` or
-`^ex:a+` as the path inside it with the subject and object swapped. Any other path that the planner splits into operators, such as
-an alternative, lists the whole path on each of them.
-
-A query that a budget or its timeout stopped answers with its error as before. In the
-`application/x-sparkles+json` format the error body also carries `plan`, the plan as it
-stood when the query stopped, and `commit`. The nodes that were still running have
-`complete: false`, and their counts are those reached so far. The UI's **Explain why**
-sends that plan to `/{ds}/sparql/explain`.
-
-## Compression
-
-The design and its rationale are in [X01 Compression codecs](specs/X01-compression-codecs.md).
-
-**Responses** are compressed when the client sends `Accept-Encoding` with `zstd`, `br`,
-`gzip` or `deflate`. This includes streamed bodies. Bodies under 256 bytes and images are
-sent uncompressed. The UI's larger assets are built with brotli and gzip copies. Those
-copies are served as they are, with `Vary: Accept-Encoding`, rather than compressed per
-request.
-
-| `sparkles serve` flag | Default | |
-|---|---|---|
-| `--http-compression auto\|off` | `auto` | |
-| `--http-compression-level fastest\|default\|best\|N` | `default` | zstd 3, brotli 4, gzip 6. A number applies to whichever algorithm is chosen. |
-| `--http-compression-algorithms` | `zstd,br,gzip,deflate` | The encodings offered. |
-| `--max-decompressed-mb` | `65536` | Cap on compressed request bodies after decompression and on RDF source bytes, including plain RDF. `0` means none. |
-| `--max-query-body-mb` | `16` | Largest body of a SPARQL query, `/{ds}/explain`, `/{ds}/shacl` or `/{ds}/shex` request. `0` means none. |
-| `--max-update-body-mb` | `256` | Largest body of a SPARQL update. `0` means none. |
-| `--max-admin-body-mb` | `16` | Largest body of an admin request (`/$/…`) or a `/{ds}/prefixes` change. `0` means none. |
-| `--max-upload-mb` | `4096` | Largest Graph Store write or upload body, after HTTP decompression. `0` means none. |
-| `--min-free-disk-mb` | `1024` | Free space that must remain in the temporary directory after a spooled request body, and on the data directory's file system after a commit, rebuild, clone or N-Quads backup. `0` turns the check off. |
-| `--max-mem-dataset-mb` | `4096` | Largest in-memory (`dbType=mem`) dataset. A commit that would grow one past it fails with `507`. `0` means none. |
-
-**Request bodies** of updates, queries, Graph Store PUT/POST and uploads may be sent with
-`Content-Encoding: gzip`, `br`, `zstd` or `deflate`. Another encoding gets `415` with an
-`Accept-Encoding` header naming the supported ones. RDF bodies and uploaded files are also
-recognised as compressed by their first bytes (gzip, xz, bzip2, zstd, LZ4 frames).
-Uploads are also recognised by file name (`.gz`, `.xz`, `.bz2`, `.zst`, `.br`, `.lz4`).
-A body that decompresses past `--max-decompressed-mb` fails with `413` and commits
-nothing.
-
-**Body ceilings.** A body that is read whole has the ceiling of its request class:
-
-* `--max-query-body-mb` for queries, `/{ds}/explain`, the shapes graph of `/{ds}/shacl`
-  and the schema of `/{ds}/shex`
-* `--max-update-body-mb` for updates
-* `--max-admin-body-mb` for `/$/…` requests and prefix changes
-* a fixed 64 KiB for `/$/auth/*`
-
-The ceiling counts decompressed bytes and is checked while the body is read, so the server
-never holds more than the ceiling. A declared `Content-Length` over it is refused before
-anything is read. Past the ceiling, the request fails with `413`. A form POST to `/{ds}`
-may hold either operation, so it is read up to the larger of the query and update
-ceilings.
-
-Graph Store PUT/POST, including through `/{ds}`, and `/{ds}/upload` are the bulk
-endpoints. Their bodies stream to a temporary file instead, up to `--max-upload-mb`, or
-the request fails with `413`. That limit counts bytes after HTTP decompression. Its
-default of 4096 (4 GiB) is the body limit of the bundled NixOS nginx virtual host, and `0`
-means unlimited. `--max-decompressed-mb` caps the RDF sources separately as they are
-parsed, both files compressed inside the body and plain RDF. A body in RDF Thrift, RDF
-Protobuf, RDF/JSON or TriX is translated to N-Quads, and the translation counts against
-that cap as it is written. Before each 64 MiB of a spooled body is written to the
-temporary directory, the server checks that the file system keeps `--min-free-disk-mb`
-free (default 1024, `0` for no check). Otherwise the request fails with `507`.
-
-**Storage.** A commit to a persistent dataset is refused with `507 {code: "storage-full"}`
-when it would leave less than `--min-free-disk-mb` free on the data directory's file
-system. Free space is measured with `statvfs` and cached for a second between small
-commits. A rebuild (a large load or compaction) or a clone checks the free space while it
-builds. Once the file system goes below the limit, it stops and removes what it wrote.
-Nothing is committed in either case. An in-memory dataset (`dbType=mem`) holds at most
-`--max-mem-dataset-mb` (default 4096), estimated from its index files, delta and
-vocabulary. A commit that would grow it past that fails the same way, but deletes always
-pass. A persistent dataset can also have a storage quota of its own (see
-[Storage quotas](#storage-quotas)).
-
-**Files.** `sparkles load` reads the same codecs, chosen with
-`--compression auto|none|gzip|xz|bzip2|zstd|brotli|lz4`. `auto` goes by magic bytes, then by the
-extension. Brotli has no magic bytes, so it needs `.br` or `--compression brotli`. When a
-file's name and its data disagree, the data wins and a warning is logged. An explicit
-`--compression` that disagrees is an error.
-
-Every supported RDF syntax can be parsed incrementally from a reader. With
-`--parse-mode auto`, plain N-Triples, N-Quads and Turtle are still parsed in parallel
-from a memory-mapped file, and compressed line formats in bounded parallel blocks.
-Other compressed documents are read whole into memory and parsed there when their
-actual decompressed size is below 128 MiB for Turtle and TriG, or 8 MiB for other
-syntaxes. At or above that size, they are parsed from a reader. Plain files that
-cannot be split use the same cutoffs. A reader parses from a 128 KiB buffer and keeps
-the syntax parser's token limits. `--auto-buffer-bytes BYTES` changes the cutoff for
-each source, as do `Source.auto_buffer_bytes` in Rust and `auto_buffer_bytes` in
-Python. Zero skips the size check. The cutoff applies to each load, so concurrent loads
-can each use that much memory. Lower it or choose streaming when several loads share a
-memory budget. Plain bytes that the caller already holds in memory are parsed without a
-copy. In automatic mode, small transactional loads and Python file objects are parsed
-from a reader. `--parse-mode streaming` always uses a sequential reader, and
-`--parse-mode buffered` always reads the whole document into memory first. A buffered
-compressed input needs RAM for its full decompressed size. These modes only affect
-parsing. Transactional changes, the vocabulary, the map of blank-node labels and
-index-building batches take memory of their own. `Source.max_decompressed` limits the
-input bytes of plain files as well as decompressed ones.
-
-Ordinary JSON-LD allows keys in any order, so its reader may hold a large object in
-memory while it waits for a context that comes late. For ordered streaming JSON-LD,
-use `load --jsonld-streaming`, `convert --syntax jsonld-streaming`, or the RDF content
-type `application/ld+json; profile="http://www.w3.org/ns/json-ld#streaming"`. This
-profile checks the key order and is never applied silently to ordinary JSON-LD. See the
-[W3C streaming JSON-LD note](https://www.w3.org/TR/json-ld11-streaming/). Single
-literals, contexts and the map of blank-node labels can still be large. RDF/JSON input
-yields statements as it reads them instead of building the whole subject and predicate
-tree. The format requires unique keys, but the lenient decoder accepts a repeated
-subject or predicate key and keeps the statements from every occurrence.
-
-XZ files are decoded incrementally, and the decoder uses at most 256 MiB of memory,
-separately from the input-byte ceiling. Bzip2 files are also decoded incrementally.
-Both accept several concatenated streams in one file. They are codecs for files and
-payloads, not additional HTTP `Content-Encoding` values. A large Graph Store body that
-is translated to another syntax spills to disk once its translated output is large
-enough.
-
-`sparkles load --lenient` skips the validation of IRIs and language tags. It is meant for
-data whose IRIs are not all valid RFC 3987 IRIs; DBpedia, for example, has some that
-contain U+FFFD. Syntax errors still fail the load.
-
-`sparkles dump --out FILE` and `sparkles backup` take `--compress CODEC`, `--level N` and
-`--threads N` (zstd). `sparkles backup` and `/$/backup` write zstd (level 3) by default,
-which is about five times faster than gzip for a slightly larger file. `--compress gzip`
-(`?compression=gzip`) gives `.nq.gz`, as Fuseki writes. `sparkles dump --out FILE` goes by
-the file's extension, and writes uncompressed without one. The extension before the
-compression one, as in `dump.ttl.zst`, picks the syntax unless `--format` names it.
-
-**Full-text documents** keep their terms in columns of the index since index format 2, so
-the Tantivy doc store holds no fields and its codec no longer changes the index size. The
-doc store still uses zstd (level 3) by default, and `"docstoreCompression": "lz4"` or
-`"none"` in the text configuration is still accepted. Changing it rebuilds the index.
-
 ## Errors
 
 Non-2xx responses carry `{ "error": string, "detail"?: string, "line"?: number, "column"?: number, "requestId": string }`.
@@ -8041,8 +8849,8 @@ explains a plain chain of 1998 triple patterns in about 0.35 s. The other shapes
 measured take from 34 ms to 0.8 s. The slowest are an OPTIONAL after each of 799
 patterns, in about 0.5 s, and a star or a hub of 1998 patterns, in about 0.75 s over a
 dataset of four triples. The cost of a star depends on the data too. A star of 1998
-patterns on one frequent predicate took about 2.7 s to explain over a dataset of 31,815
-triples, against about 3 s before item 84. Running a query at the limit takes about 1 s on
+patterns on one frequent predicate takes about 2.7 s to explain over a dataset of 31,815
+triples. Running a query at the limit takes about 1 s on
 the small dataset. Planning and the description of the plan observe the request's
 timeout and cancellation, so every shape stops close to its timeout. The JSON plan of a
 query at the limit, as `/{ds}/explain` and the Sparkles result format write it, is up to
@@ -8197,7 +9005,7 @@ short.
 
 The design is in [X08 Disk spill and server-wide memory](specs/X08-disk-spill-and-server-memory.md).
 Spill lets a streamed query finish within its memory budget by writing to disk what does
-not fit. It is off by default until all Phase 2b acceptance gates pass.
+not fit. It is off by default.
 `sparkles serve --spill on` enables it, and `--spill encrypted` also encrypts every
 spill file. These operators spill when it is enabled.
 
@@ -8292,8 +9100,12 @@ of up to 1 MiB is sent whole, with `Content-Length`, and an error, including the
 `result-bytes` budget, gets its status code. A larger body is streamed in 64 KiB chunks
 as it is serialized, so server memory stays flat. An error after that point, such as the
 budget running out at 1.2 GiB, aborts the transfer, and the client sees a truncated
-response instead of a status code. A query result whose smallest encoding already
-exceeds the budget is refused with `507` before anything is sent. A client that
+response instead of a status code. The bytes serialized before the budget ran out are
+sent first, and the transfer then ends without its final chunk, which HTTP clients
+report as an error. The access log and the metrics record such a request when its body
+ends, with the outcome `budget`, the bytes sent and the rows that were written whole. A
+query result whose smallest encoding already exceeds the budget is refused with `507`
+before anything is sent. A client that
 disconnects stops the serialization. A query that runs as a cursor, which by default
 includes a scan of a million rows or more, is computed while it is sent, so its timeout
 and its memory and row budgets can also end the transfer after it has started. The
@@ -8478,13 +9290,14 @@ without the permission is a `403` before any connection or file is opened, even 
 | `/ui/*`, `/$/ping`, `/$/ready`, `/$/openapi.json`, `/$/openapi.yaml` | GET | Nothing. Without `metrics`, `/$/ready` lists only readable datasets. |
 | `/$/whoami`, `/$/auth/config`, `/$/auth/login`, `/$/auth/oidc/*` (including the back-channel logout), `/$/auth/device`, `/$/auth/token` | | Nothing. Invalid credentials are still `401`. |
 | `/$/server`, `/$/datasets` (GET), `/$/tasks`, `/$/tasks/{id}`, `/$/stats`, `/$/backups-list`, `/$/validate/*`, `/$/auth/logout`, `/$/format` (POST), `/$/lint` (POST), `/$/geo/convert` (POST) | | Any caller. `/$/format` and `/$/lint` admit nobody under `--format-endpoint off`, and only signed-in callers under `authenticated`. Listings show readable datasets only, and server-wide tasks only to `server-admin`. `/$/stats` covers the datasets the caller may read, and `/$/backups-list` the files of the datasets it administers. Cancelling a task (DELETE) needs `admin` on its dataset. |
-| `/$/algo/{ds}/run` | POST | Read-only runs need `read` through `query`. Runs with `write` need `write` through `update`. The body selects the policy before dataset access. |
+| `/$/algo/{ds}/run` | POST | Read-only runs need `read` through `query`, and so do view-only runs, including background ones. Runs with `write` need `write` through `update`. The body selects the policy before dataset access. |
+| `/$/graphrag/{ds}/memberships` | POST | `read` through `query`, with the reports graph proven for the caller. |
 | `/$/algo/{ds}/projections[/{name}]` | GET | `read` through `info`. |
 | `/$/graph/{ds}/groups` | POST | `read` through `query`. |
 | `/$/algo/{ds}/projections/{name}` | PUT, DELETE | Dataset `admin`. |
 | `/$/metrics` | GET | `metrics` |
 | `/$/datasets` | POST | `server-admin` |
-| `/$/datasets/{ds}`, `/$/stats/{ds}`, `/$/schema/{ds}…`, `/$/queries/{ds}…` (GET), `/$/prefixes/{ds}`, `/$/commits/{ds}…`, `/$/ready/{ds}`, `/$/reason/{ds}` (GET), `/$/reason/{ds}/diagnostics`, `/$/text/{ds}` (GET), `/$/geo/{ds}` (GET), `/$/vector/{ds}`, `/$/vector/{ds}/{name}` (GET), `/$/snapshots/{ds}…` (GET), `/$/history/{ds}` (GET), `/$/validation/{ds}` (GET), `/$/rdfs/{ds}` (GET), `/$/describe/{ds}` (GET), `/$/quota/{ds}` (GET), `/$/compaction/{ds}` (GET), `/$/graphql/{ds}…` (GET), `/{ds}/prefixes` (GET) | GET | `read`. `POST /$/vector/{ds}/{name}/recall` needs `read` too. |
+| `/$/datasets/{ds}`, `/$/stats/{ds}`, `/$/schema/{ds}…`, `/$/queries/{ds}…` (GET), `/$/prefixes/{ds}`, `/$/commits/{ds}…`, `/$/ready/{ds}`, `/$/reason/{ds}` (GET), `/$/reason/{ds}/diagnostics`, `/$/text/{ds}` (GET), `/$/geo/{ds}` (GET), `/$/vector/{ds}`, `/$/vector/{ds}/{name}` (GET), `/$/snapshots/{ds}…` (GET), `/$/history/{ds}` (GET), `/$/validation/{ds}` (GET), `/$/rdfs/{ds}` (GET), `/$/describe/{ds}` (GET), `/$/quota/{ds}` (GET), `/$/compaction/{ds}` (GET), `/$/graphql/{ds}…` (GET), `/{ds}/prefixes` (GET) | GET | `read`. `POST /$/vector/{ds}/{name}/recall` and both methods of `/$/vector/{ds}/{name}/projection` need `read` too. |
 | `/$/datasets/{ds}` (DELETE), `/$/datasets/{ds}/clone`, `/$/compact/{ds}`, `/$/backup/{ds}`, `/$/cache/clear/{ds}`, `/$/reason/{ds}` (POST, DELETE), `/$/reason/{ds}/auto`, `/$/text/{ds}` (PUT, DELETE), `/$/text/{ds}/rebuild`, `/$/geo/{ds}` (PUT, DELETE), `/$/geo/{ds}/rebuild`, `/$/vector/{ds}/{name}` (PUT, DELETE), `/$/vector/{ds}/{name}/rebuild`, `/$/vector/{ds}/{name}/reembed`, `/$/snapshots/{ds}` (POST), `/$/snapshots/{ds}/{name}` (DELETE), `/$/history/{ds}` (PUT), `/$/validation/{ds}`, `/$/rdfs/{ds}`, `/$/describe/{ds}`, `/$/compaction/{ds}` and `/$/graphql/{ds}` (PUT, DELETE), `/$/queries/{ds}/{name}` (PUT, DELETE) | | `admin` |
 | `/$/backups/{ds}`, `/$/backups/{ds}/{repo}/{backup}` | GET | `read`. A backup of another dataset is `404`. |
 | `/$/backups/{ds}` (POST), `/$/backups/{ds}/{repo}/{backup}` (DELETE), `…/restore`, `…/verify` | | `admin`. A restore also needs it on its target name. |
@@ -8614,7 +9427,7 @@ because those come from statistics of every graph.
 Routes that report on the whole dataset answer `403` with
 `"… covers every graph of /wiki, and your access is limited to some graphs or triples"`. These are
 `/$/stats/{ds}`, `/$/reason/{ds}` (GET) and its diagnostics, `/$/text/{ds}`,
-`/$/geo/{ds}` and `/$/vector/{ds}…` status and recall, `/$/backups/{ds}…` (GET),
+`/$/geo/{ds}` and `/$/vector/{ds}…` status, recall and projections, `/$/backups/{ds}…` (GET),
 `/$/history/{ds}` (GET), `/$/rdfs/{ds}` (GET), `/$/quota/{ds}` (GET),
 `/$/compaction/{ds}` (GET), `/{ds}/shacl`, `/{ds}/shex` and changes to `/{ds}/prefixes`.
 Other
@@ -10859,6 +11672,15 @@ community with its members, its children and its report with findings and citati
 Both read through the caller's view, and a community the caller may not read is a
 `404`.
 
+`POST /$/graphrag/{ds}/memberships` takes `{"nodes": ["<iri>", …], "level": 0}` with at
+most 20,000 IRIs and answers which communities hold each node, at the given level or at
+every level when `level` is left out. Each row of `memberships` names a node, its
+community and the community's level, and `communities` gives each named community's
+level, member count and report title. The graph canvas uses it to colour nodes by
+community. It needs `read` through the query endpoint and reads through the caller's
+view on main only. A request on a branch, or from a caller for whom the reports graph is
+not proven, gets `"available": false` with no memberships.
+
 `POST /$/graphrag/{ds}/review` needs `write` on the dataset without graph or triple
 restrictions, because only an unrestricted writer may write a reports graph. A caller
 for whom the reports graph is not proven gets a `404`, and a restricted writer gets a
@@ -10879,16 +11701,16 @@ figures of the runs and reviews since the server started.
 
 ### Settings
 
-A dataset's `assistant`, `memory`, `ingest`, `prefixes`, `graphrag` and `paths` settings
-are settings kinds. The effective value of a kind is computed from four layers, and a
+A dataset's `assistant`, `memory`, `ingest`, `prefixes`, `graphrag`, `paths` and `forms`
+settings are settings kinds. The effective value of a kind is computed from four layers, and a
 later layer overrides an earlier one.
 
 1. The built-in defaults of the kind.
 2. The `defaults` of the settings file of `serve --settings`.
 3. The settings file's entry for the dataset, by name.
 4. The runtime layer, which holds the fields changed through the API. It is kept in the
-   dataset's file (`assistant.json`, `memory.json`, `paths.json`, or the settings members of
-   `ingest.json`), or in the process for an in-memory dataset.
+   dataset's file (`assistant.json`, `memory.json`, `paths.json`, `forms.json`, or the
+   settings members of `ingest.json`), or in the process for an in-memory dataset.
 
 Layers merge as in RFC 7396. Objects merge member by member, and arrays and scalars
 replace the earlier value. A field is a path of members written with dots, such as

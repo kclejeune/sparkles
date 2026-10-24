@@ -487,6 +487,8 @@ pub enum Kind {
     PathSearch(Box<super::pathsearch::PathSearchSpec>),
     /// the recorded changes of the dataset (`SERVICE hist:changes`)
     HistoryChanges(Box<super::history_svc::HistorySpec>),
+    /// the rows of a `table` view (`SERVICE view:read`)
+    ViewRead(Box<super::viewsvc::ViewSpec>),
     /// a graph algorithm on a projection of the dataset (`SERVICE algo:pageRank`, …);
     /// child 0, if the call has a variable source, is the rest of the group, and the last
     /// child is the nested pattern of edges, if any
@@ -641,6 +643,7 @@ impl Node {
             Kind::SpatialRelate(_) => "SpatialRelate",
             Kind::PathSearch(_) => "PathSearch",
             Kind::HistoryChanges(_) => "HistoryChanges",
+            Kind::ViewRead(_) => "ViewRead",
             Kind::AlgoCall(_) => "AlgoCall",
             Kind::PatternCount(_) => "PatternCount",
             Kind::PatternScan(_) => "PatternScan",
@@ -700,14 +703,43 @@ pub struct Planner<'a> {
     pub source: Option<&'a spargebra::Query>,
     /// the source's SSE form, or `None` when every variable counts as used
     source_sse: std::cell::OnceCell<Option<String>>,
-    /// how many times each pattern of the query has been planned, for its occurrence
-    seen: std::cell::RefCell<FxHashMap<PatternKey, u32>>,
+    /// how many times each pattern of the query has been planned, for its occurrence,
+    /// keyed by the first pattern planned so that a lookup copies no text
+    seen: std::cell::RefCell<FxHashMap<SeenPattern, u32>>,
     /// how many times each pattern occurs in the source
-    source_counts: std::cell::OnceCell<FxHashMap<PatternKey, u32>>,
+    source_counts: std::cell::OnceCell<FxHashMap<SeenPattern, u32>>,
 }
 
-/// A pattern's subject, predicate or path, and object, as [`PlanPattern`] writes them.
-type PatternKey = (String, String, String);
+/// A pattern as a key of [`Planner::seen`] and [`Planner::source_counts`]: equal when
+/// the subject, predicate or path, and object are, as [`PlanPattern`] writes them,
+/// whatever the graph and occurrence.
+struct SeenPattern(Arc<PlanPattern>);
+
+impl SeenPattern {
+    fn new(s: String, p: String, o: String) -> SeenPattern {
+        SeenPattern(Arc::new(PlanPattern {
+            s,
+            p,
+            o,
+            graph: None,
+            occurrence: 0,
+        }))
+    }
+}
+
+impl PartialEq for SeenPattern {
+    fn eq(&self, other: &Self) -> bool {
+        (&self.0.s, &self.0.p, &self.0.o) == (&other.0.s, &other.0.p, &other.0.o)
+    }
+}
+
+impl Eq for SeenPattern {}
+
+impl std::hash::Hash for SeenPattern {
+    fn hash<H: std::hash::Hasher>(&self, h: &mut H) {
+        (&self.0.s, &self.0.p, &self.0.o).hash(h);
+    }
+}
 
 /// `<<( s p o )>>` with variables: the triple term bound to `t` is decomposed into
 /// `parts` (constants must match, variables are bound).
@@ -1309,6 +1341,10 @@ impl<'a> Planner<'a> {
                     })
                     .collect();
                 let n = group(child, keys, aggs, self.ctx);
+                Ok(self.apply_filters(n, filters))
+            }
+            GP::Service { inner, name, .. } if super::viewsvc::is_read(name) => {
+                let n = super::viewsvc::view_leaf(self, inner)?;
                 Ok(self.apply_filters(n, filters))
             }
             GP::Service { inner, name, .. } if super::history_svc::is_changes(name) => {
@@ -2374,37 +2410,55 @@ impl<'a> Planner<'a> {
     /// counts its patterns again, so the count wraps at the number of equal patterns in
     /// the source.
     fn source_pattern(&self, s: String, p: String, o: String, g: &ActiveGraph) -> Arc<PlanPattern> {
-        let key = (s, p, o);
-        let mut seen = self.seen.borrow_mut();
-        let n = seen.entry(key.clone()).or_insert(0);
-        let mut occurrence = *n;
-        *n += 1;
-        drop(seen);
-        // the source is counted only when a pattern comes again, which most queries never do
-        if occurrence > 0
-            && let Some(total) = self.source_counts().get(&key)
-            && *total > 0
-        {
-            occurrence %= *total;
-        }
         let graph = match g {
             ActiveGraph::Default => None,
             ActiveGraph::Union => Some(format!("<{}>", super::ctx::UNION_GRAPH_IRI)),
             ActiveGraph::Named(id) => self.ctx.term(*id).map(|t| t.to_string()),
             ActiveGraph::Var(v) => Some(self.pt_str(&PT::V(*v))),
         };
-        let (s, p, o) = key;
-        Arc::new(PlanPattern {
+        let mut pattern = Arc::new(PlanPattern {
             s,
             p,
             o,
             graph,
-            occurrence,
-        })
+            occurrence: 0,
+        });
+        // the pattern itself is the key, so that a first occurrence copies no text
+        let key = SeenPattern(pattern.clone());
+        let mut seen = self.seen.borrow_mut();
+        let mut occurrence = match seen.get_mut(&key) {
+            Some(n) => {
+                let o = *n;
+                *n += 1;
+                // a second holder would make `make_mut` below copy the pattern
+                drop(key);
+                o
+            }
+            None => {
+                seen.insert(key, 1);
+                0
+            }
+        };
+        drop(seen);
+        // the source is counted only when a pattern comes again, which most queries never do
+        if occurrence > 0 {
+            let key = SeenPattern(pattern.clone());
+            if let Some(total) = self.source_counts().get(&key)
+                && *total > 0
+            {
+                occurrence %= *total;
+            }
+            drop(key);
+            if occurrence > 0 {
+                // the sole holder: the map keeps the first equal pattern, not this one
+                Arc::make_mut(&mut pattern).occurrence = occurrence;
+            }
+        }
+        pattern
     }
 
     /// How many times each triple pattern and path occurs in the source query.
-    fn source_counts(&self) -> &FxHashMap<PatternKey, u32> {
+    fn source_counts(&self) -> &FxHashMap<SeenPattern, u32> {
         self.source_counts.get_or_init(|| {
             let mut out = FxHashMap::default();
             if let Some(q) = self.source {
@@ -2594,7 +2648,7 @@ impl<'a> Planner<'a> {
         // unknown constants → empty
         if t.t
             .iter()
-            .any(|x| matches!(x, PT::C(id) if id.tag() == Tag::Local))
+            .any(|x| matches!(x, PT::C(id) if self.ctx.unknown_const(*id)))
         {
             return Ok(vec![Node::empty(vars_of(t))]);
         }
@@ -3310,15 +3364,15 @@ impl<'a> Planner<'a> {
         let mut children = Vec::new();
         let mut edge_vars = None;
         let simple = match simple {
-            Some((id, _)) if id.tag() == Tag::Local && min == 1 => {
+            Some((id, _)) if self.ctx.unknown_const(id) && min == 1 => {
                 return Ok(Node::empty(left.vars.clone()));
             }
             // a predicate that is not in the store: only the zero-length path matches
-            Some((id, _)) if id.tag() == Tag::Local && count.is_some() => {
+            Some((id, _)) if self.ctx.unknown_const(id) && count.is_some() => {
                 count = Some((0, Some(0)));
                 Some((0, false))
             }
-            Some((id, rev)) if id.tag() != Tag::Local => Some((id.0, rev)),
+            Some((id, rev)) if id.tag() != Tag::Local || self.ctx.local_facts => Some((id.0, rev)),
             _ => {
                 let (a, b) = (self.ctx.fresh_var(), self.ctx.fresh_var());
                 let mut items = Vec::new();
@@ -5462,8 +5516,8 @@ pub fn lit_int(i: i64) -> Term {
 /// variable as `?name`, and a blank node or a triple term with variables as `?_`.
 fn source_term(t: &TermPattern) -> String {
     match t {
-        TermPattern::Variable(v) => format!("?{}", v.as_str()),
-        TermPattern::NamedNode(n) => n.to_string(),
+        TermPattern::Variable(v) => var_text(v.as_str()),
+        TermPattern::NamedNode(n) => iri_text(n.as_str()),
         TermPattern::Literal(l) => l.to_string(),
         TermPattern::Triple(tp) => match ground_triple(tp) {
             Some(t) => Term::Triple(Box::new(t)).to_string(),
@@ -5476,20 +5530,38 @@ fn source_term(t: &TermPattern) -> String {
 /// A predicate of the query as [`PlanPattern`] writes it.
 fn source_named(n: &NamedNodePattern) -> String {
     match n {
-        NamedNodePattern::NamedNode(n) => n.to_string(),
-        NamedNodePattern::Variable(v) => format!("?{}", v.as_str()),
+        NamedNodePattern::NamedNode(n) => iri_text(n.as_str()),
+        NamedNodePattern::Variable(v) => var_text(v.as_str()),
     }
 }
 
+/// `<iri>`, as an IRI's `Display` writes it, without the formatting machinery: the plan
+/// names every pattern of every query this way.
+fn iri_text(iri: &str) -> String {
+    let mut s = String::with_capacity(iri.len() + 2);
+    s.push('<');
+    s.push_str(iri);
+    s.push('>');
+    s
+}
+
+/// `?name` for a variable of the query.
+fn var_text(name: &str) -> String {
+    let mut s = String::with_capacity(name.len() + 1);
+    s.push('?');
+    s.push_str(name);
+    s
+}
+
 /// Count each triple pattern and path of `gp` into `out`, keyed as the planner keys them.
-fn count_patterns(gp: &GraphPattern, out: &mut FxHashMap<PatternKey, u32>) {
+fn count_patterns(gp: &GraphPattern, out: &mut FxHashMap<SeenPattern, u32>) {
     use GraphPattern as GP;
     let mut todo = vec![gp];
     while let Some(gp) = todo.pop() {
         match gp {
             GP::Bgp { patterns } => {
                 for t in patterns {
-                    let key = (
+                    let key = SeenPattern::new(
                         source_term(&t.subject),
                         source_named(&t.predicate),
                         source_term(&t.object),
@@ -5502,7 +5574,7 @@ fn count_patterns(gp: &GraphPattern, out: &mut FxHashMap<PatternKey, u32>) {
                 path,
                 object,
             } => {
-                let key = (
+                let key = SeenPattern::new(
                     source_term(subject),
                     super::exec::path_text(path),
                     source_term(object),

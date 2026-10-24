@@ -366,7 +366,7 @@ pub fn query(
 
 /// The `Sparkles-Commit-Message` value of `m`: as is when it is ASCII, else an RFC 8187
 /// extended value (`UTF-8''…`, percent-encoded), which every HTTP stack passes through.
-fn message_header(m: &str) -> String {
+pub(crate) fn message_header(m: &str) -> String {
     let ext = m
         .get(..7)
         .is_some_and(|p| p.eq_ignore_ascii_case("utf-8''"));

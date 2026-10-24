@@ -291,6 +291,85 @@ impl Store {
     /// Measure index `name`'s recall@k against the exact search: `samples` stored
     /// vectors, spread evenly over the base rows, are the queries. `ef` overrides the
     /// index's `efSearch`.
+    /// A two-dimensional projection of index `name` at the head (spec U11 §3.3). `check`
+    /// is called now and then and its error stops the work, and `progress` hears the share
+    /// done.
+    pub fn vector_projection(
+        &self,
+        name: &str,
+        cfg: &crate::vector::ProjectionConfig,
+        admit: crate::vector::projection::Admit<'_>,
+        check: &(dyn Fn() -> Result<()> + Sync),
+        progress: &(dyn Fn(f64) + Sync),
+    ) -> Result<crate::vector::Projection> {
+        let snap = self.snapshot();
+        let b = snap.generation.vectors.built(name).ok_or_else(|| {
+            if self.vector.indexes.read().contains_key(name) {
+                Error::invalid(format!("vector index {name} is still being built"))
+            } else {
+                Error::NotFound(format!("no vector index {name}"))
+            }
+        })?;
+        // an index built before its predicate had a vector names it from the snapshot
+        let Some(pred) = crate::vector::live::pred_in(&b, &snap) else {
+            return Err(Error::invalid(format!(
+                "vector index {name} has no vectors to project"
+            )));
+        };
+        let graph = b.graph.clone();
+        let neighbours_wanted = cfg.method == crate::vector::ProjectionMethod::Neighbours;
+        // the memory the computation holds, admitted before it is allocated, from the
+        // same snapshot and build the computation reads
+        let pi = crate::index::Perm::Pso.index();
+        let range = [pred, 0, 0, 0]..=[pred, u64::MAX, u64::MAX, u64::MAX];
+        let inserted = snap.delta.ins[pi].range(range.clone()).count();
+        admit(crate::vector::projection::working_bytes(
+            crate::vector::projection::Work {
+                rows: b.segment.rows() + inserted,
+                inserted,
+                dim: b.segment.dim,
+                sample: cfg.sample,
+                method: Some(cfg.method),
+                links: graph.as_ref().map_or(0, |g| 2 * g.m),
+                live_nodes: if neighbours_wanted { inserted } else { 0 },
+                threads: rayon::current_num_threads(),
+            },
+        ))?;
+        // the live layer's bottom layer, copied for the neighbour layout only, so that the
+        // layout holds no lock, and only for the pairs this snapshot inserted, which the
+        // admission counted: the layer is shared and may have grown since
+        let layer = graph.as_ref().filter(|_| neighbours_wanted).map(|_| {
+            let pairs: rustc_hash::FxHashSet<(u64, u64)> = snap.delta.ins[pi]
+                .range(range.clone())
+                .map(|k| (k[1], k[2]))
+                .collect();
+            b.live.read().layer0(&|k| pairs.contains(&k))
+        });
+        let links = match (graph.as_ref(), layer.as_ref()) {
+            (Some(g), Some(l)) => Some(move |x: u32, out: &mut Vec<u32>| l.links(g, x, out)),
+            _ => None,
+        };
+        let neighbours = match (&links, &layer) {
+            (Some(f), Some(l)) => Some(crate::vector::projection::Neighbours {
+                links: f as &(dyn Fn(u32, &mut Vec<u32>) + Sync),
+                node_rows: &b.node_rows,
+                live: &l.live,
+            }),
+            _ => None,
+        };
+        crate::vector::projection::project(
+            &snap,
+            name,
+            pred,
+            &b.segment,
+            b.config.metric,
+            cfg,
+            neighbours.as_ref(),
+            check,
+            progress,
+        )
+    }
+
     pub fn vector_recall(
         &self,
         name: &str,

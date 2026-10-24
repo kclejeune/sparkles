@@ -14,6 +14,7 @@ import {
   schemaFromSummary,
   snapshotLine,
   type ClassInfo,
+  instanceSearchQuery,
 } from './explore';
 
 /** Class map from `sub → supers` edges, with `subs` filled in as loadSchema does. */
@@ -476,5 +477,17 @@ describe('snapshotLine', () => {
     expect(snapshotLine({ version: 1, generation: 'g', computedAt: 'soon' })).toContain(
       'computed soon',
     );
+  });
+});
+
+describe('instanceSearchQuery', () => {
+  it('requires every class of a field', () => {
+    for (const fullText of [false, true]) {
+      const q = instanceSearchQuery('ac', ['http://ex/Org', 'http://ex/Employer'], fullText);
+      expect(q).toContain('?s rdf:type/rdfs:subClassOf* <http://ex/Org> .');
+      expect(q).toContain('?s rdf:type/rdfs:subClassOf* <http://ex/Employer> .');
+      expect(q).not.toContain('VALUES ?class');
+    }
+    expect(instanceSearchQuery('ac', [], false)).not.toContain('rdf:type');
   });
 });

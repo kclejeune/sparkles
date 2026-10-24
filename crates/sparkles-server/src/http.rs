@@ -34,6 +34,10 @@ mod diff;
 mod dry_run;
 #[cfg(feature = "fmt")]
 mod format;
+#[cfg(feature = "shacl")]
+mod forms;
+#[cfg(feature = "shacl")]
+use forms::{check as forms_check, model as forms_model, save as forms_save};
 pub(crate) mod fuseki;
 mod graph;
 #[cfg(feature = "graphql")]
@@ -42,10 +46,15 @@ mod hist;
 pub(crate) mod history;
 mod inline;
 pub(crate) use sparkles::jena_formats;
+mod gsp_csv;
 #[cfg(feature = "fmt")]
 mod lint;
+mod live;
+mod mappings;
 mod patch;
 mod queries;
+mod views;
+pub(crate) use views::start as start_views;
 pub(crate) mod schema;
 pub(crate) use schema::constraints::ShapesRequest;
 pub(crate) mod sd;
@@ -130,6 +139,10 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route("/$/schema/{ds}/profiles", get(schema::profiles))
         .route("/$/schema/{ds}/diff", get(schema::diff))
         .route("/$/graph/{ds}/groups", post(graph::groups))
+        .route("/$/graph/{ds}/facets", post(graph::facets))
+        .route("/$/forms/{ds}", get(forms_model))
+        .route("/$/forms/{ds}/check", post(forms_check))
+        .route("/$/forms/{ds}/save", post(forms_save))
         .route("/$/compact/{ds}", post(compact))
         .route("/$/backup/{ds}", post(backup))
         .route(
@@ -185,7 +198,33 @@ pub fn router(state: Arc<AppState>) -> Router {
                 .delete(queries::delete_query),
         )
         .route("/$/queries/{ds}/{name}/versions", get(queries::versions))
+        .route("/$/mappings/{ds}", get(mappings::list))
+        .route(
+            "/$/mappings/{ds}/{name}",
+            get(mappings::get_mapping)
+                .put(mappings::put_mapping)
+                .delete(mappings::delete_mapping),
+        )
+        .route("/$/mappings/{ds}/{name}/versions", get(mappings::versions))
+        .route(
+            "/{ds}/mappings/{name}/run",
+            post(mappings::run).layer(DefaultBodyLimit::max(
+                state
+                    .limits
+                    .max_upload_bytes
+                    .map_or(usize::MAX, |b| b as usize),
+            )),
+        )
         .route("/{ds}/queries/{name}", get(queries::run).post(queries::run))
+        .route("/$/views/{ds}", get(views::list))
+        .route(
+            "/$/views/{ds}/{name}",
+            get(views::get_view)
+                .put(views::put_view)
+                .delete(views::delete_view),
+        )
+        .route("/$/views/{ds}/{name}/rebuild", post(views::rebuild))
+        .route("/{ds}/live", get(live::live))
         .route("/$/commits/{ds}", get(list_commits))
         .route("/$/commits/{ds}/timeline", get(timeline::timeline))
         .route("/$/commits/{ds}/{reference}", get(get_commit))
@@ -452,6 +491,15 @@ impl IntoResponse for ApiError {
 }
 
 impl ApiError {
+    /// The error's message, for a task that reports it.
+    pub(crate) fn message(&self) -> String {
+        self.1
+            .get("error")
+            .and_then(J::as_str)
+            .map(str::to_string)
+            .unwrap_or_else(|| self.1.to_string())
+    }
+
     fn respond(self) -> Response {
         // engine errors with an outcome of their own have their own status codes (see
         // `From<Error>`): 408 timeout, 503 cancelled, 507 with a `budget` field
@@ -493,7 +541,10 @@ impl ApiError {
         }
         // only a refusal that a retry can pass says when to retry: a request larger than
         // the whole pool answers 507 without it
-        if budget == Some(BudgetKind::ServerMemory) && self.0 == StatusCode::SERVICE_UNAVAILABLE {
+        let behind = body.get("code").and_then(J::as_str) == Some("view-behind");
+        if (budget == Some(BudgetKind::ServerMemory) || behind)
+            && self.0 == StatusCode::SERVICE_UNAVAILABLE
+        {
             resp.headers_mut()
                 .insert(header::RETRY_AFTER, header::HeaderValue::from_static("1"));
         }
@@ -731,6 +782,14 @@ impl From<Error> for ApiError {
             Error::Branch(b) => {
                 StatusCode::from_u16(b.status()).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR)
             }
+            Error::Component(c) if c.component == "views" => views::status(&c.code),
+            // query-time reasoning past a limit, or with rules it cannot evaluate
+            Error::Component(c)
+                if c.component == "reasoner"
+                    && matches!(c.code.as_str(), "reasoning-budget" | "reasoning-rules") =>
+            {
+                StatusCode::UNPROCESSABLE_ENTITY
+            }
             // a write handler answers a dry run with its preview before errors are mapped
             _ => StatusCode::INTERNAL_SERVER_ERROR,
         };
@@ -743,6 +802,9 @@ impl From<Error> for ApiError {
             Error::PreconditionFailed(_) => json!({ "error": msg, "code": "precondition-failed" }),
             Error::Patch(p) => json!({ "error": msg, "code": p.kind.code() }),
             Error::Branch(b) => branches::error_body(&b),
+            Error::Component(c) if c.component == "views" => {
+                json!({ "error": c.message, "code": c.code })
+            }
             Error::Conflict(_) if msg.starts_with("history-limit") => {
                 json!({ "error": msg, "code": "history-limit" })
             }
@@ -752,6 +814,9 @@ impl From<Error> for ApiError {
                 "limit": b.limit,
                 "requested": b.requested,
             }),
+            Error::Component(c) if c.component == "reasoner" => {
+                json!({ "error": msg, "code": c.code })
+            }
             _ => json!({ "error": msg }),
         };
         ApiError(status, body)
@@ -843,7 +908,7 @@ pub(crate) async fn blocking<T: Send + 'static>(
 pub(crate) struct Params(Vec<(String, String)>);
 
 impl Params {
-    fn from_query(uri: &Uri) -> Params {
+    pub(crate) fn from_query(uri: &Uri) -> Params {
         Params(
             uri.query()
                 .map(|q| form_urlencoded::parse(q.as_bytes()).into_owned().collect())
@@ -1083,7 +1148,7 @@ fn timeout_secs(params: &Params) -> Option<Duration> {
 
 /// The `timeout` parameter of a query, capped at `--max-timeout`, else the server's
 /// default.
-fn timeout_param(st: &AppState, params: &Params) -> Duration {
+pub(crate) fn timeout_param(st: &AppState, params: &Params) -> Duration {
     timeout_secs(params)
         .map(|t| st.limits.cap_timeout(t, Some(st.default_timeout)))
         .unwrap_or(st.default_timeout)
@@ -1099,7 +1164,7 @@ fn update_timeout(st: &AppState, params: &Params) -> Option<Duration> {
 
 /// A cancellation flag and the guard that sets it when dropped: kept in a handler's
 /// future, it stops the engine work of a request whose client disconnected.
-fn cancel_on_drop() -> (Arc<AtomicBool>, CancelOnDrop) {
+pub(crate) fn cancel_on_drop() -> (Arc<AtomicBool>, CancelOnDrop) {
     let cancel = Arc::new(AtomicBool::new(false));
     (cancel.clone(), CancelOnDrop(cancel))
 }
@@ -1149,7 +1214,7 @@ impl WriteDeadline {
 }
 
 /// A `408` names the timeout that applied (`timeoutSeconds`).
-fn with_timeout(mut e: ApiError, timeout: Option<Duration>) -> ApiError {
+pub(crate) fn with_timeout(mut e: ApiError, timeout: Option<Duration>) -> ApiError {
     if e.0 == StatusCode::REQUEST_TIMEOUT
         && let (Some(t), Some(o)) = (timeout, e.1.as_object_mut())
     {
@@ -1186,6 +1251,79 @@ fn query_options(st: &AppState, ds: &Dataset, params: &Params) -> QueryOptions {
         ..defaults
     }
 }
+
+/// Query-time reasoning a query asks for with `reasoning=demand` (spec F17 Phase 1): the
+/// reasoner of the dataset, with the profile `reasoningProfile` names or the last
+/// materialization's, and at most `maxDerived` derived facts, never more than the
+/// server's `--reason-max-derived`. `reasoning=auto` is refused until the cost-based
+/// choice of Phase 2 exists.
+fn query_reasoning(
+    st: &AppState,
+    ds: &Dataset,
+    params: &Params,
+    opts: &mut QueryOptions,
+) -> ApiResult<()> {
+    match params.get("reasoning") {
+        Some("demand") => {}
+        Some("auto") => {
+            return Err(err_code(
+                StatusCode::BAD_REQUEST,
+                "reasoning-mode",
+                "reasoning=auto is not available yet; use demand, materialized or false",
+            ));
+        }
+        _ => return Ok(()),
+    }
+    #[cfg(feature = "reasoning")]
+    {
+        let profile = match params.get("reasoningProfile") {
+            None => None,
+            Some(p) => Some(p.parse::<sparkles_reasoner::Profile>().map_err(|e| {
+                err_code(StatusCode::BAD_REQUEST, "reasoning-profile", e.to_string())
+            })?),
+        };
+        let max = match params.get("maxDerived") {
+            None => st.reason_max_derived,
+            Some(v) => match v.parse::<usize>() {
+                Ok(n) if n > 0 => n.min(st.reason_max_derived),
+                _ => {
+                    return Err(err(
+                        StatusCode::BAD_REQUEST,
+                        "maxDerived must be a positive integer",
+                    ));
+                }
+            },
+        };
+        let reasoner = ds.dataset.query_reasoner(profile)?.with_max_derived(max);
+        opts.reasoning = Some(reasoner.provider());
+        Ok(())
+    }
+    #[cfg(not(feature = "reasoning"))]
+    {
+        let _ = (st, ds, opts);
+        Err(err(
+            StatusCode::NOT_IMPLEMENTED,
+            "built without the `reasoning` feature",
+        ))
+    }
+}
+
+/// Add `Sparkles-Reasoning` to the response of a query that derived facts on demand.
+pub(crate) fn with_reasoning(
+    mut r: Response,
+    applied: Option<&sparkles::sparql::reasoning::Applied>,
+) -> Response {
+    if let Some(a) = applied
+        && let Ok(v) = header::HeaderValue::from_str(&a.header())
+    {
+        r.headers_mut().insert(SPARKLES_REASONING, v);
+    }
+    r
+}
+
+/// The response header that says what query-time reasoning derived (spec F17 §2.3).
+pub(crate) const SPARKLES_REASONING: header::HeaderName =
+    header::HeaderName::from_static("sparkles-reasoning");
 
 // ------------------------------------------------------------------ SPARQL ------
 
@@ -1354,6 +1492,7 @@ pub(crate) async fn run_query(
         }
     };
     let mut opts = query_options(&st, &ds, &params);
+    query_reasoning(&st, &ds, &params, &mut opts)?;
     // budgets the request asked for, never above the server's
     let asked = budgets::Overrides::parse(&params)?;
     asked.apply(&mut opts);
@@ -1537,6 +1676,7 @@ pub(crate) async fn run_query(
         }
     };
     let algorithmic = r.ctx.calls_algorithm();
+    let derived = r.ctx.reasoning.clone();
     let query_ms = r.timing.total_ms;
     let cells = r.len().saturating_mul(r.vars.len().max(3));
     let is_ask = r.kind == QueryKind::Ask;
@@ -1589,10 +1729,14 @@ pub(crate) async fn run_query(
     // attempt; a bounded trial can retry without cloning its tables.
     let dataset_id = ds.store.dataset_id().to_string();
     let attempted_ms = std::cell::Cell::new(0.0);
+    // the rows the last attempt wrote whole, for the report of a body it stopped partway
+    let sent_rows = Arc::new(std::sync::atomic::AtomicU64::new(0));
+    let rows_written = sent_rows.clone();
     let write = move |w: &mut LimitedWriter<stream::SwitchWriter>| -> sparkles::Result<()> {
         let ts = std::time::Instant::now();
+        let sent = std::cell::Cell::new(0);
         let written = if thrift {
-            write_thrift_results(&r, w, send)
+            write_thrift_results(&r, w, send, &sent)
         } else {
             serialize_result(
                 &r,
@@ -1606,8 +1750,10 @@ pub(crate) async fn run_query(
                 seq,
                 &dataset_id,
                 io.as_deref(),
+                &sent,
             )
         };
+        rows_written.store(sent.get(), std::sync::atomic::Ordering::Relaxed);
         // phase spans once serialization has ended (the request span is current here)
         attempted_ms.set(attempted_ms.get() + ts.elapsed().as_secs_f64() * 1000.0);
         if !w.get_ref().deferred() {
@@ -1615,15 +1761,28 @@ pub(crate) async fn run_query(
         }
         written
     };
-    // weak: the serializer thread must not keep the server state (and its stores' locks)
-    // alive after the response
-    let (metrics_st, name) = (Arc::downgrade(&st), ds.name.clone());
+    // A streamed body is reported once it ends, as a cursor's is, so that a body that
+    // the result-size budget or an error stopped partway is logged with its outcome and
+    // the rows it holds instead of as a complete answer.
+    let deferred = crate::obs::DeferredReport::default();
+    let stream_report = deferred.clone();
+    let streamed_base = report.clone();
     let on_stream_end = move |end: stream::StreamEnd| {
-        if let Some(st) = metrics_st.upgrade() {
-            st.metrics
-                .add_response_bytes(Some(&name), Op::Query, end.bytes);
-        }
         stream_end_log("query", &end);
+        let (outcome, budget) = end.outcome();
+        let rows = if end.error.is_some() {
+            Some(sent_rows.load(std::sync::atomic::Ordering::Relaxed))
+        } else {
+            streamed_base.rows
+        };
+        stream_report.producer_done(RequestReport {
+            outcome,
+            budget,
+            rows,
+            response_bytes: Some(end.bytes),
+            serialize_ms: Some(end.serialize_ms),
+            ..streamed_base
+        });
     };
     // Try small answers in place; actual encoded bytes decide whether the answer
     // must switch to the blocking serializer, even with very few result cells.
@@ -1634,7 +1793,7 @@ pub(crate) async fn run_query(
     };
     // a run whose answer could not be written is not known to be quick any more
     let body = body.inspect_err(|_| QUICK.record(quick_key, f64::INFINITY))?;
-    let (body, report) = match body {
+    let (body, report, deferred) = match body {
         stream::Serialized::Whole { body, serialize_ms } => {
             let ms = if algorithmic {
                 f64::INFINITY
@@ -1651,11 +1810,11 @@ pub(crate) async fn run_query(
                 serialize_ms: Some(serialize_ms),
                 ..report
             };
-            (axum::body::Body::from(body), report)
+            (axum::body::Body::from(body), report, None)
         }
         stream::Serialized::Streamed(body) => {
             QUICK.record(quick_key, f64::INFINITY);
-            (body, report)
+            (body, report, Some(deferred))
         }
     };
     let mut resp = with_commit(
@@ -1670,12 +1829,19 @@ pub(crate) async fn run_query(
         );
     }
     let resp = history::history_headers(resp, resolved.as_ref(), &uri);
+    let resp = with_reasoning(resp, derived.as_deref());
     // freshness is reported for the live state only
-    let resp = match &resolved {
+    let mut resp = match &resolved {
         Some(r) if r.historical => resp,
-        _ => with_inferences(resp, &ds, with_extra, seq),
+        _ => with_inferences(resp, &ds, with_extra && derived.is_none(), seq),
     };
-    Ok(report.attach(resp))
+    match deferred {
+        Some(deferred) => {
+            resp.extensions_mut().insert(deferred);
+            Ok(resp)
+        }
+        None => Ok(report.attach(resp)),
+    }
 }
 
 /// The I/O profile a request asked for with `profile=io`, started before the query is
@@ -1719,9 +1885,10 @@ fn serialize_result(
     seq: u64,
     dataset_id: &str,
     io: Option<&sparkles::ioacct::Profile>,
+    sent: &std::cell::Cell<u64>,
 ) -> sparkles::Result<()> {
     if sparkles_doc {
-        results::write_native_json(
+        results::write_native_json_counted(
             r,
             w,
             send,
@@ -1730,22 +1897,25 @@ fn serialize_result(
                 dataset_id,
                 io,
             }),
+            sent,
         )
     } else if is_graph {
         match rfmt {
-            OutFormat::Rdf(f) => results::write_graph(r, f, prefixes, w),
-            OutFormat::Jena(j) => results::write_jena_graph(r, j, w),
+            OutFormat::Rdf(f) => results::write_graph_counted(r, f, prefixes, w, sent),
+            OutFormat::Jena(j) => results::write_jena_graph_counted(r, j, w, sent),
         }
     } else {
-        results::write_solutions(r, sfmt, w, send)
+        results::write_solutions_counted(r, sfmt, w, send, sent)
     }
 }
 
-/// SELECT results in SPARQL Results Thrift, `send` rows at most.
+/// SELECT results in SPARQL Results Thrift, `send` rows at most, counting in `sent` the
+/// rows written whole.
 fn write_thrift_results(
     r: &sparkles::sparql::QueryResult,
     w: &mut LimitedWriter<stream::SwitchWriter>,
     send: Option<usize>,
+    sent: &std::cell::Cell<u64>,
 ) -> sparkles::Result<()> {
     let mut out = jena_formats::ThriftResults::new(w, &r.vars)?;
     let n = send.map_or(r.table.len(), |s| s.min(r.table.len()));
@@ -1754,6 +1924,7 @@ fn write_thrift_results(
         row.clear();
         row.extend(r.table.cols.iter().map(|c| r.term(c[i])));
         out.row(&row)?;
+        sent.set(sent.get() + 1);
     }
     out.finish()?;
     Ok(())
@@ -2447,6 +2618,7 @@ async fn explain(
         params.get("query").unwrap_or_default().to_string()
     };
     let mut opts = query_options(&st, &ds, &params);
+    query_reasoning(&st, &ds, &params, &mut opts)?;
     crate::auth::restrict(&mut opts, &p, &ds.name, crate::auth::Endpoint::Query);
     let at = history::at_param(&params)?;
     blocking(move || {
@@ -3226,6 +3398,25 @@ async fn gsp_on(
             };
             Ok(report.attach(resp))
         }
+        // a CSV or TSV table, mapped into the graph (F19 §2.3)
+        Method::PUT | Method::POST | Method::DELETE
+            if gsp_csv::is_table(&content_type(&headers)).is_some() =>
+        {
+            let kind = gsp_csv::is_table(&content_type(&headers)).expect("checked");
+            gsp_csv::write(
+                st.clone(),
+                ds,
+                &p,
+                method,
+                params,
+                headers,
+                body,
+                target,
+                view,
+                kind,
+            )
+            .await
+        }
         Method::PUT | Method::POST => {
             if st.read_only {
                 return Err(err(StatusCode::FORBIDDEN, "server is read-only"));
@@ -3421,6 +3612,12 @@ async fn upload(
         .get::<Principal>()
         .and_then(|p| p.view(&name, crate::auth::Endpoint::Upload));
     let restricted = wopts.opts.graphs.is_some();
+    // `If-Match` names the head the upload expects, as on a Graph Store write: a
+    // template that read the dataset (`lookup=true`) then commits only on that state
+    wopts.opts.precondition =
+        conditional::write_precondition(&headers, ds.store.dataset_id(), &Target::Dataset);
+    // a template's lookups read what the caller may read
+    let lookup_grants = wopts.opts.graphs.clone();
     let dry = wopts
         .opts
         .dry_run
@@ -3538,6 +3735,8 @@ async fn upload(
     if files.is_empty() {
         return Err(err(StatusCode::BAD_REQUEST, "no files in upload"));
     }
+    mappings.resolve(&params, &ds)?;
+    let lookup_view = lookup_param(&params)?.then_some(lookup_grants.clone());
     let (wopts, timeout) = wopts.start();
     // the admitted grant, read on the request's task before the blocking thread
     let grant = crate::server_memory::current_grant();
@@ -3571,8 +3770,20 @@ async fn upload(
                 *f = out;
             }
         }
-        // CSV and TSV files are converted into N-Triples
-        let tables = tabular::convert(&mut files, &mappings, &params, &st, &wopts, grant.as_ref())?;
+        // CSV and TSV files, and the files a mapping reads, are converted
+        let lookup = match lookup_view {
+            Some(view) => Some(tabular_lookup(&ds, view)?),
+            None => None,
+        };
+        let cx = tabular::Ctx {
+            st: &st,
+            wopts: &wopts,
+            grant: grant.as_ref(),
+            lookup,
+            only_graph: g.clone(),
+            dir: tmp.path(),
+        };
+        let tables = tabular::convert(&mut files, &mappings, &params, &cx)?;
         let sources = files
             .iter()
             .map(|p| {
@@ -3614,6 +3825,45 @@ async fn upload(
     })
     .await
     .map_err(|e| with_timeout(e, timeout))
+}
+
+/// `lookup=true`: a template reads the dataset (spec F19 §7.2).
+pub(super) fn lookup_param(params: &Params) -> ApiResult<bool> {
+    match params.get("lookup") {
+        None | Some("false") => Ok(false),
+        Some("true") => Ok(true),
+        Some(v) => Err(err(
+            StatusCode::BAD_REQUEST,
+            format!("lookup {v:?}: use true or false"),
+        )),
+    }
+}
+
+/// The snapshot a template's lookups read: the head when the conversion starts, under
+/// the caller's view when its grants cover some graphs only.
+pub(super) fn tabular_lookup(
+    ds: &Dataset,
+    view: Option<Arc<sparkles::access::GraphAccess>>,
+) -> ApiResult<sparkles::tabular::template::Lookup> {
+    let snap = ds.store.snapshot();
+    let commit = snap.commit;
+    let (snapshot, graphs) = match view {
+        Some(v) => {
+            let bound = v.bound(&snap);
+            let masked = bound.masked(&snap)?;
+            // the masked snapshot hides protected triples, and the grants keep the
+            // template out of the graphs the caller may not read
+            let graphs = (!bound.reads_all()).then_some(bound);
+            (masked, graphs)
+        }
+        None => (snap, None),
+    };
+    Ok(sparkles::tabular::template::Lookup {
+        snapshot,
+        prefixes: ds.store.prefixes().into_iter().collect(),
+        commit,
+        graphs,
+    })
 }
 
 // ------------------------------------------------------------------- admin ------
@@ -4957,7 +5207,17 @@ fn with_inferences(mut r: Response, ds: &Dataset, included: bool, seq: u64) -> R
 
 /// Whether `p` may see task `t`: read on its dataset or the dataset it creates;
 /// `server-admin` for a server-scoped task (no dataset).
-fn task_visible(p: &Principal, t: &crate::state::Task) -> bool {
+/// The figures of the cache of view-only algorithm runs, for `/metrics`.
+pub(crate) fn algo_view_metrics(out: &mut String) {
+    algo::view::metrics(out);
+}
+
+fn task_visible(st: &AppState, p: &Principal, t: &crate::state::Task) -> bool {
+    // a background view-only run is followed by the callers that started or joined it,
+    // whose view may be restricted
+    if t.kind == algo::view::TASK && algo::view::follows(st, &t.id, &t.dataset, p) {
+        return true;
+    }
     if t.dataset.is_empty() {
         return p.has(crate::auth::ServerPerm::ServerAdmin);
     }
@@ -5031,7 +5291,7 @@ async fn list_tasks(State(st): St, Extension(p): Extension<Principal>) -> Json<J
         .tasks
         .lock()
         .iter()
-        .filter(|t| task_visible(&p, t))
+        .filter(|t| task_visible(&st, &p, t))
         .map(|t| task_for(&p, t))
         .collect();
     Json(serde_json::to_value(tasks).unwrap())
@@ -5045,13 +5305,14 @@ async fn get_task(
     st.tasks
         .lock()
         .iter()
-        .find(|t| t.id == id && task_visible(&p, t))
+        .find(|t| t.id == id && task_visible(&st, &p, t))
         .map(|t| Json(serde_json::to_value(task_for(&p, t)).unwrap()))
         .ok_or_else(|| err(StatusCode::NOT_FOUND, "no such task"))
 }
 
 /// `DELETE /$/tasks/{id}`: cancel a task. Needs `admin` on the task's dataset
-/// (`server-admin` for a server-scoped task). `202` with the task when it accepted,
+/// (`server-admin` for a server-scoped task), or for a background view-only algorithm
+/// run, to be the caller that started it. `202` with the task when it accepted,
 /// `409 not-cancellable` when it does not accept cancellation or has finished.
 async fn cancel_task(
     State(st): St,
@@ -5062,7 +5323,7 @@ async fn cancel_task(
         .tasks
         .lock()
         .iter()
-        .find(|t| t.id == id && task_visible(&p, t))
+        .find(|t| t.id == id && task_visible(&st, &p, t))
         .cloned()
     else {
         return Err(err(StatusCode::NOT_FOUND, "no such task"));
@@ -5070,7 +5331,14 @@ async fn cancel_task(
     let allowed = if t.dataset.is_empty() {
         p.has(crate::auth::ServerPerm::ServerAdmin)
     } else {
+        // a projection may be cancelled by anyone who could have started it: `read` on
+        // the whole dataset
         p.can(&t.dataset, Level::Admin)
+            // the caller that started a background view-only run may cancel it
+            || (t.kind == algo::view::TASK && algo::view::started(&st, &t.id, &t.dataset, &p))
+            || (t.kind == crate::projection::TASK
+                && p.can(&t.dataset, Level::Read)
+                && !p.restricted(&t.dataset))
     };
     if !allowed {
         let msg = if t.dataset.is_empty() {
@@ -5387,6 +5655,24 @@ fn shacl_target(
 }
 
 #[cfg(not(feature = "shacl"))]
+async fn forms_model() -> ApiResult {
+    Err(err(
+        StatusCode::NOT_IMPLEMENTED,
+        "built without the `shacl` feature",
+    ))
+}
+
+#[cfg(not(feature = "shacl"))]
+async fn forms_check() -> ApiResult {
+    forms_model().await
+}
+
+#[cfg(not(feature = "shacl"))]
+async fn forms_save() -> ApiResult {
+    forms_model().await
+}
+
+#[cfg(not(feature = "shacl"))]
 async fn shacl() -> ApiResult {
     Err(err(
         StatusCode::NOT_IMPLEMENTED,
@@ -5402,6 +5688,8 @@ mod compress_tests;
 mod diff_tests;
 #[cfg(test)]
 mod dry_run_tests;
+#[cfg(all(test, feature = "shacl"))]
+mod forms_tests;
 #[cfg(test)]
 mod history_tests;
 #[cfg(test)]

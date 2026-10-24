@@ -18,7 +18,7 @@ use std::sync::Arc;
 
 mod api;
 pub mod proxy;
-mod routes;
+pub(crate) mod routes;
 
 #[cfg(feature = "auth")]
 pub mod cli;

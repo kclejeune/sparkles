@@ -115,6 +115,49 @@ async fn a_build_runs_as_a_task_and_its_reports_can_be_read_and_reviewed() {
     assert_eq!(s, StatusCode::OK, "{one}");
     assert_eq!(one["memberCount"], 4, "{one}");
     assert_eq!(one["members"].as_array().unwrap().len(), 4);
+    // the memberships of the community's members, for the colour lens (U10 §2.3)
+    let members: Vec<Value> = one["members"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|m| m["iri"].clone())
+        .chain([json!("http://ex/not-a-member")])
+        .collect();
+    let (s, m) = call(
+        &f.app,
+        "POST",
+        "/$/graphrag/org/memberships",
+        Some(json!({ "nodes": members, "level": 0 })),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK, "{m}");
+    assert_eq!(m["available"], true, "{m}");
+    let ms = m["memberships"].as_array().unwrap();
+    assert_eq!(ms.len(), 4, "{m}");
+    assert!(
+        ms.iter()
+            .all(|r| r["community"] == c.as_str() && r["level"] == 0),
+        "{m}"
+    );
+    assert_eq!(m["communities"][0]["memberCount"], 4, "{m}");
+    assert_eq!(m["communities"][0]["title"], "A community", "{m}");
+    let (s, m) = call(
+        &f.app,
+        "POST",
+        "/$/graphrag/org/memberships",
+        Some(json!({ "nodes": members, "level": 7 })),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK, "{m}");
+    assert!(m["memberships"].as_array().unwrap().is_empty(), "{m}");
+    let (s, _) = call(
+        &f.app,
+        "POST",
+        "/$/graphrag/org/memberships",
+        Some(json!({ "nodes": ["not an iri"] })),
+    )
+    .await;
+    assert_eq!(s, StatusCode::BAD_REQUEST);
     let findings = one["report"]["findings"].as_array().unwrap();
     assert_eq!(findings.len(), 1, "{one}");
     assert_eq!(findings[0]["cites"].as_array().unwrap().len(), 1, "{one}");

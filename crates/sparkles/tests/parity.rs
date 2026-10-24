@@ -378,6 +378,21 @@ fn entries() -> Vec<(&'static str, Entry)> {
         op!("measureVectorRecall", "indexes.vector.recall", |ds| {
             ds.indexes().vector().recall("v", &Default::default());
         }),
+        op!(
+            "computeVectorProjection",
+            "indexes.vector.projection",
+            |ds| {
+                ds.indexes()
+                    .vector()
+                    .projection("v", &Default::default(), &Control::none());
+            }
+        ),
+        // the server keeps the last projections it computed; the library returns each one
+        op!("getVectorProjection", "indexes.vector.projection", |ds| {
+            ds.indexes()
+                .vector()
+                .projection("v", &Default::default(), &Control::none());
+        }),
         op!("getGeoIndex", "indexes.geo.status", |ds| {
             ds.indexes().geo().status();
         }),
@@ -429,6 +444,10 @@ fn entries() -> Vec<(&'static str, Entry)> {
         op!("getGraphGroups", "graph.groups", |ds| {
             ds.graph().groups(&any(), &Default::default());
         }),
+        // ------------------------------------------------ facets (U11)
+        op!("getGraphFacets", "graph.facets", |ds| {
+            ds.graph().facets(&any(), &Default::default());
+        }),
         // ------------------------------------------------ graph algorithms
         op!("runAlgorithm", "algorithms.run", |ds| {
             ds.algorithms().run(&any(), &Default::default());
@@ -476,6 +495,45 @@ fn entries() -> Vec<(&'static str, Entry)> {
         }),
         op!("listStoredQueryVersions", "queries.versions", |ds| {
             ds.queries().versions("q");
+        }),
+        // ------------------------------------------------ stored mappings
+        op!("listStoredMappings", "mappings.list", |ds| {
+            ds.mappings().list();
+        }),
+        op!("getStoredMapping", "mappings.get", |ds| {
+            ds.mappings().get("m", None);
+        }),
+        op!("putStoredMapping", "mappings.put", |ds| {
+            ds.mappings().put("m", any(), any());
+        }),
+        op!("deleteStoredMapping", "mappings.delete", |ds| {
+            ds.mappings().delete("m", None);
+        }),
+        op!("listStoredMappingVersions", "mappings.versions", |ds| {
+            ds.mappings().versions("m");
+        }),
+        op!("runStoredMapping", "mappings.run", |ds| {
+            ds.mappings()
+                .run("m", None, &any(), &any(), false, &Default::default());
+        }),
+        // ------------------------------------------------ incremental views (F13)
+        op!("listViews", "views.list", |ds| {
+            ds.views().list();
+        }),
+        op!("getView", "views.get", |ds| {
+            ds.views().get("v");
+        }),
+        op!("putView", "views.put", |ds| {
+            ds.views().put("v", any());
+        }),
+        op!("deleteView", "views.delete", |ds| {
+            ds.views().delete("v");
+        }),
+        op!("rebuildView", "views.rebuild", |ds| {
+            ds.views().rebuild("v");
+        }),
+        op!("liveQuery", "live", |ds| {
+            ds.live("q", &Default::default());
         }),
         op_if!("graphql", "getGraphqlConfig", "graphql.config.get", |ds| {
             ds.graphql().get(None);
@@ -559,6 +617,16 @@ fn entries() -> Vec<(&'static str, Entry)> {
         }),
         op_if!("shex", "shex", "validation.shex", |ds| {
             ds.validation().shex(&any(), &any(), &any());
+        }),
+        // -------------------------------------------------------- editing forms (U02)
+        op_if!("shacl", "getForm", "forms.model", |ds| {
+            ds.forms().model(&any(), &any());
+        }),
+        op_if!("shacl", "checkForm", "forms.check", |ds| {
+            ds.forms().check(&any(), &any());
+        }),
+        op_if!("shacl", "saveForm", "forms.save", |ds| {
+            ds.forms().save(&any(), &any());
         }),
         // ------------------------------------------------------------------ backups
         op!("backupNquads", "dataset.backup", |ds| {
@@ -788,6 +856,7 @@ fn entries() -> Vec<(&'static str, Entry)> {
         server_only!("confirmGraphrag", Tasks),
         server_only!("listCommunities", Process),
         server_only!("getCommunity", Process),
+        server_only!("listCommunityMemberships", Process),
         server_only!("reviewCommunityReport", Process),
         // C19: the layered settings come from the server's settings file
         server_only!("getSettingsStatus", Process),
@@ -900,6 +969,7 @@ const EXTRA_KEYS: &[&str] = &[
     "dataset.clone_to_with",
     "dataset.clone_to_memory_with",
     "dataset.branch",
+    "dataset.run_mapping",
     "history.wait_for_commit",
     "history.prune",
     "history.tick",
@@ -932,6 +1002,7 @@ fn check_library_only_calls(ds: &Dataset, cat: &sparkles::Catalog) {
     ds.insert(any());
     ds.remove(any());
     ds.branch("dev");
+    ds.run_mapping("", None, &any(), &any(), None);
     ds.clone_to_with("clone", &Default::default(), &Default::default());
     ds.clone_to_memory_with("clone", &Default::default(), &Default::default());
     ds.algorithms().query_text(&any(), false);

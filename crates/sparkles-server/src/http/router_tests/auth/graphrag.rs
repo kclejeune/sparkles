@@ -506,6 +506,20 @@ async fn graphrag_routes_follow_coverage() {
         let r = call(
             &s.app,
             "POST",
+            "/$/graphrag/rag/memberships",
+            &[
+                ("authorization", &b(u)),
+                ("content-type", "application/json"),
+            ],
+            r#"{"nodes":["http://ex/x"]}"#,
+        )
+        .await;
+        let v: serde_json::Value = serde_json::from_str(&r.text()).unwrap();
+        assert_eq!(v["available"], false, "{u}: {v}");
+        assert!(v["memberships"].as_array().unwrap().is_empty(), "{u}: {v}");
+        let r = call(
+            &s.app,
+            "POST",
             "/$/graphrag/rag/review",
             &[
                 ("authorization", &b(u)),

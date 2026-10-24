@@ -231,6 +231,49 @@ impl Input {
         })
     }
 
+    /// Pass over the run of equal keys at the current row and return its length. A count
+    /// needs only the length, so no row is held or spooled, however long the run.
+    fn skip_run(
+        &mut self,
+        ctx: &Arc<Ctx>,
+        child: &mut Operator,
+        options: &CursorOptions,
+        cap: usize,
+        columns: &[usize],
+    ) -> Result<u64> {
+        let end = self.end(ctx, columns)?;
+        let mut rows = (end - self.at) as u64;
+        if end < self.table().len || child.done {
+            self.at = end;
+            return Ok(rows);
+        }
+        let _key_charge = ctx.charge(columns.len() as u64 * 8 + 64)?;
+        let key: Vec<Id> = columns
+            .iter()
+            .map(|&c| self.table().cols[c][self.at])
+            .collect();
+        self.at = end;
+        loop {
+            if !self.ensure(ctx, child, options, cap)? {
+                break;
+            }
+            if columns
+                .iter()
+                .zip(&key)
+                .any(|(&c, &key)| self.table().cols[c][self.at] != key)
+            {
+                break;
+            }
+            let end = self.end(ctx, columns)?;
+            rows += (end - self.at) as u64;
+            self.at = end;
+            if end < self.table().len || child.done {
+                break;
+            }
+        }
+        Ok(rows)
+    }
+
     /// Add `range` of the loaded batch to a run: to `held` while it fits, and to the
     /// spill file `spool` once it does not.
     fn hold(
@@ -951,22 +994,23 @@ impl Merge {
                             )?;
                             continue;
                         }
-                        let left = self.inputs[0].run(
+                        // Only the runs' lengths count, so neither run is held.
+                        let left = self.inputs[0].skip_run(
                             ctx,
                             &mut children[0],
                             options,
                             options.batch_rows,
                             &self.keys[0],
                         )?;
-                        let right = self.inputs[1].run(
+                        let right = self.inputs[1].skip_run(
                             ctx,
                             &mut children[1],
                             options,
                             options.batch_rows,
                             &self.keys[1],
                         )?;
-                        let n = (left.rows.len() as u64)
-                            .checked_mul(right.rows.len() as u64)
+                        let n = left
+                            .checked_mul(right)
                             .ok_or_else(|| Error::invalid("join count overflow"))?;
                         count = count
                             .checked_add(n)
@@ -1354,6 +1398,55 @@ mod tests {
                 drop(op);
                 assert_eq!(spill.reserved_bytes(), 0);
             }
+        }
+    }
+
+    /// Counting a merge join needs only the lengths of its equal-key runs, so a run
+    /// longer than memory is passed over rather than spooled. Before the fix both runs
+    /// of the heavy key went to disk only to be counted.
+    #[test]
+    fn counting_long_equal_key_runs_writes_nothing() {
+        let tmp = tempfile::tempdir().unwrap();
+        let spill = crate::spill::Spill::open(&crate::spill::SpillOptions {
+            dir: tmp.path().to_path_buf(),
+            max_bytes: 1 << 30,
+            query_bytes: 1 << 30,
+            min_free_bytes: 0,
+            encrypted: false,
+        })
+        .unwrap();
+        let side = |offset: i64| -> Vec<Vec<i64>> {
+            let mut rows: Vec<Vec<i64>> = (0..4000).map(|i| vec![7, i + offset]).collect();
+            rows.extend((0..50).map(|i| vec![8 + i, offset]));
+            rows.insert(0, vec![1, offset]);
+            rows
+        };
+        let node = join(
+            values(vec![0, 1], &side(0)),
+            values(vec![0, 2], &side(100_000)),
+        );
+        let expected = exec::execute(&context(u64::MAX), &node).unwrap().0.len as u64;
+        assert_eq!(expected, 4000 * 4000 + 51);
+        for cap in [64, 1000] {
+            let ctx = context_with_spill(128 << 10, Some(&spill));
+            let mut op =
+                Operator::build(&ctx, node.clone(), FallbackPolicy::RejectMaterialization).unwrap();
+            let options = CursorOptions {
+                batch_rows: cap,
+                ..Default::default()
+            };
+            let before = spill.written_bytes();
+            let count = op.count_input(&ctx, &options).unwrap();
+            assert_eq!(count, Some(expected), "cap {cap}");
+            assert_eq!(
+                spill.written_bytes(),
+                before,
+                "cap {cap}: a counted run spilled"
+            );
+            assert!(ctx.mem_peak() <= 128 << 10);
+            drop(op);
+            drop(ctx);
+            assert_eq!(spill.reserved_bytes(), 0);
         }
     }
 

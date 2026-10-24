@@ -144,6 +144,17 @@ def test_vector_index() -> None:
     assert [r["s"] for r in ds.query(q)] == [ex("a"), ex("c")]
     with pytest.raises(ValueError):
         ds.indexes.vector.put("bad", {"predicate": ex("emb2").value, "dimension": 3, "metric": "nonsense"})
+    # a projection places a and c, which point the same way, near each other
+    proj = ds.indexes.vector.projection("emb")
+    assert proj["method"] == "pca" and proj["vectors"] == 3
+    at = {p["entity"]: (p["x"], p["y"]) for p in proj["points"]}
+    assert set(at) == {ex(k).value for k in "abc"}
+    dist = lambda u, v: ((at[u][0] - at[v][0]) ** 2 + (at[u][1] - at[v][1]) ** 2) ** 0.5
+    assert dist(ex("a").value, ex("c").value) < dist(ex("a").value, ex("b").value)
+    with pytest.raises(ValueError):
+        ds.indexes.vector.projection("emb", method="umap")
+    with pytest.raises(NotFoundError):
+        ds.indexes.vector.projection("nope")
     ds.indexes.vector.rebuild("emb")
     ds.indexes.vector.drop("emb")
     assert ds.indexes.vector.list() == []

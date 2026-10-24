@@ -90,6 +90,8 @@ pub struct DatasetOptions {
     /// [`Catalog`](crate::Catalog) sets it from its memory options. Without a pool,
     /// only each query's own budget applies.
     pub pool: Option<Arc<crate::sparql::pool::QueryPool>>,
+    /// the settings of the incremental views and live queries (spec F13)
+    pub views: crate::incr::RuntimeOptions,
 }
 
 impl Default for DatasetOptions {
@@ -100,6 +102,7 @@ impl Default for DatasetOptions {
             closure_cache_triples: crate::reasoning::DEFAULT_CLOSURE_CACHE_TRIPLES,
             origin: None,
             pool: None,
+            views: Default::default(),
         }
     }
 }
@@ -128,6 +131,8 @@ pub struct DatasetState {
     pub name: Option<String>,
     /// the stored queries (`queries.json`)
     pub queries: crate::stored::Catalog,
+    /// the stored mappings (`mappings.json`)
+    pub mappings: crate::stored_mappings::Catalog,
     /// the named projections of graph algorithms (`algo.json`)
     pub algo: Arc<crate::algo::catalog::Catalog>,
     /// the GraphQL configuration (`graphql.json`)
@@ -153,6 +158,17 @@ pub struct DatasetState {
     /// where a clone was made from (`origin.json`, or kept in memory for an in-memory
     /// clone)
     pub origin: Option<serde_json::Value>,
+    /// the incremental views and live queries (spec F13)
+    pub views: Arc<crate::incr::Runtime>,
+    /// the thread that runs the views' passes, once started
+    pub(crate) views_worker: std::sync::OnceLock<()>,
+}
+
+impl Drop for DatasetState {
+    fn drop(&mut self) {
+        // a clean close checkpoints the views' state
+        self.views.close(&self.store);
+    }
 }
 
 impl DatasetState {
@@ -281,6 +297,13 @@ impl Dataset {
                 shown()
             );
         }
+        let mappings = crate::stored_mappings::Catalog::open_or_broken(store.root());
+        if let Some(e) = mappings.broken() {
+            tracing::error!(
+                "stored mappings of {}: {e}; they cannot be changed until it is fixed",
+                shown()
+            );
+        }
         let algo = Arc::new(crate::algo::catalog::Catalog::open_or_broken(store.root()));
         if let Some(e) = algo.broken() {
             tracing::error!(
@@ -302,15 +325,24 @@ impl Dataset {
             Some(root) => read_origin(&root.join(ORIGIN_FILE)),
             None => opts.origin,
         };
+        // a branch's views are Phase 2: a branch keeps no view definitions
+        let views_root = match &store {
+            StoreHandle::Own(s) => s.root().map(Path::to_path_buf),
+            StoreHandle::Branch(_) => None,
+        };
+        let views = crate::incr::Runtime::open(views_root, store.dataset_id(), opts.views.clone());
         Dataset {
             alias: None,
             inner: Arc::new(DatasetState {
+                views,
+                views_worker: std::sync::OnceLock::new(),
                 branches: Mutex::new(BTreeMap::new()),
                 branch_handles: Mutex::new(Vec::new()),
                 closure_cache_triples: opts.closure_cache_triples,
                 pool: opts.pool,
                 name: opts.name,
                 queries,
+                mappings,
                 algo,
                 #[cfg(feature = "graphql")]
                 graphql,
@@ -367,6 +399,11 @@ impl Dataset {
         &self.inner
     }
 
+    /// The shared state, for hosts that keep a weak reference to it.
+    pub fn inner_state(&self) -> &Arc<DatasetState> {
+        &self.inner
+    }
+
     /// The name a catalog or a server gave the dataset, if any.
     pub fn name(&self) -> Option<&str> {
         self.alias.as_deref().or(self.inner.name.as_deref())
@@ -395,6 +432,38 @@ impl Dataset {
     /// The reasoning record of the last materialization, if any.
     pub fn reasoning_record(&self) -> Option<ReasoningRecord> {
         self.inner.reasoning.read().clone()
+    }
+
+    /// The query-time reasoner of this dataset (spec F17), for
+    /// [`QueryOptions::reasoning`] with `reasoner.provider()`. With `profile`, it has
+    /// that profile's rules. Without, it has the profile and the custom rules of the last
+    /// materialization, and fails when the dataset has none. Either way it reads the input
+    /// graphs of the last materialization (the default graph and its imports when there is
+    /// none), and the vocabularies of the last materialization when the profile is the
+    /// same. Backward rules of a custom rule set take part, which materialization skips.
+    #[cfg(feature = "reasoning")]
+    pub fn query_reasoner(
+        &self,
+        profile: Option<sparkles_reasoner::Profile>,
+    ) -> Result<sparkles_reasoner::query::QueryReasoner> {
+        let record = self.reasoning_record();
+        let profile = match (profile, &record) {
+            (Some(p), _) => p,
+            (None, Some(r)) => r.profile()?,
+            (None, None) => {
+                return Err(Error::invalid(
+                    "query-time reasoning needs a profile: name one, or materialize the \
+                     dataset first so that its profile applies",
+                ));
+            }
+        };
+        let (extras, inputs) = match &record {
+            Some(r) if r.profile == profile.name() => (r.extras()?, r.run_inputs()?),
+            Some(r) => (Default::default(), r.run_inputs()?),
+            None => (Default::default(), Default::default()),
+        };
+        sparkles_reasoner::query::QueryReasoner::new(profile, &extras, inputs)
+            .map_err(crate::handles::from_anyhow)
     }
 
     /// Where a clone was made from: the `origin.json` of a persistent clone, or what an
@@ -616,6 +685,9 @@ impl Dataset {
             describe: state.store.describe_settings(),
             pool: state.pool.clone(),
             algo_projections: Some(state.algo.clone()),
+            views: Some(Arc::new(crate::handles::views::Source {
+                state: Arc::downgrade(&self.inner),
+            })),
             defaults_applied: true,
             ..Default::default()
         }
@@ -659,6 +731,9 @@ impl Dataset {
         }
         if o.algo_projections.is_none() {
             o.algo_projections = defaults.algo_projections;
+        }
+        if o.views.is_none() {
+            o.views = defaults.views;
         }
         o.defaults_applied = true;
         Cow::Owned(o)

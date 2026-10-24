@@ -1,22 +1,31 @@
 # Development
 
-This page covers building Sparkles from source, the everyday tasks, the test suites, the
-Nix flake and the third-party license notices. [USAGE.md](USAGE.md) covers running and
-operating the binary. The UI has its own development notes in
+This page is the contributor guide. It covers building Sparkles from source, the
+everyday tasks, the test suites, the language bindings, continuous integration, releases,
+the Nix flake and the third-party license notices. [USAGE.md](USAGE.md) covers running
+and operating the binary. The UI has its own development notes in
 [ui/README.md](../ui/README.md). The design specs in [specs/README.md](specs/README.md)
 explain why each feature is built the way it is.
 
 Sparkles is experimental. The on-disk format, HTTP API, CLI and Rust API may change
 between commits without a migration path.
 
+[AGENTS.md](../AGENTS.md) holds the house rules for human and agent contributors. It
+covers the local checks, the engineering rules on streaming execution, on-disk formats and
+performance claims, how commits and documentation are written, and the workflow for
+splitting large work across several agents. [ROADMAP.md](ROADMAP.md) sets the order of
+work.
+
 * [Project layout](#project-layout)
 * [Building from source](#building-from-source)
 * [mise tasks](#mise-tasks)
 * [Git hooks](#git-hooks)
 * [Testing](#testing)
+* [Language bindings](#language-bindings)
 * [Benchmark scripts](#benchmark-scripts)
 * [Continuous integration](#continuous-integration)
 * [Releases](#releases)
+* [Engineering invariants](#engineering-invariants)
 * [Nix](#nix)
 * [Third-party licenses](#third-party-licenses)
 
@@ -74,6 +83,7 @@ mise run serve        # build, then serve ./data on :3030
 mise run fmt          # cargo fmt + oxfmt        (fmt:check for CI)
 mise run lint         # clippy -D warnings + svelte-check
 mise run lint:features # clippy -D warnings over feature combinations (in ci)
+mise run test:features # the server's tests with default features off and one feature set on (in ci, not ci:fast)
 mise run lint:doc-paths # every crates/sparkles… path cited in the docs exists (in ci)
 mise run fmt:wasm     # clippy for the formatter's wasm32 build (in ci)
 mise run fmt:fuzz     # fuzz the formatter with cargo-fuzz (needs nightly and cargo-fuzz; not in ci)
@@ -127,24 +137,11 @@ runs every hook over the whole tree.
 
 ## Testing
 
-The server crate has no library target, so its unit-test binary and the binary that its
-integration tests run each compile the whole crate. In a debug build each of those rustc
-processes peaks at about 10 GB, mostly while it collects monomorphized items, and a
-build that runs both at once needs about 20 GB. `mise run test` therefore first runs
-`cargo test --workspace --no-run --bin sparkles` to build the unit-test binary on its own,
-and only then runs nextest. That keeps the peak near 10 GB and costs a few minutes of build
-time, because the second server compile no longer overlaps the first.
-
-Persistent stores and offline migrations hold an exclusive file lock through their
-owned cleanup. The lock guard explicitly unlocks before closing its descriptor, so an
-unrelated child between fork and exec cannot delay reopening the database. Store fields
-that own writers must be declared before the lock guard so their destructors finish
-while exclusion still holds.
-
 ```sh
 mise run ci            # formatting, clippy, all workspace tests, UI, Python, JVM and JavaScript tests, license notices
 mise run ci:fast       # formatting, cited doc paths, workspace clippy and the Rust tests
 mise run lint:features # clippy over feature combinations (in ci)
+mise run test:features # the server's tests with one optional feature set at a time (in ci, not ci:fast)
 mise run test:w3c      # W3C SPARQL 1.0 / 1.1 query / 1.1 update / 1.2 suites, with a summary
 mise run test:shacl    # W3C SHACL Core and SHACL-SPARQL suites, SHACL 1.2 list tests, SHACLC pairs
 mise run test:shex     # shexTest: syntax, negative syntax and structure, representation, ShExR, validation
@@ -159,10 +156,11 @@ it writes each task's output to `target/ci/logs/<task>.log`. While it runs,
 their times. Every task runs to the end, and the final summary repeats the last lines of
 each failed task's log. `--fail-fast` stops after the first failure, `--jobs N` runs more
 tasks at once, and naming tasks runs only those, as in `mise run ci lint test`. Only
-one run at a time can use a checkout. `test` and `node:test` take turns whatever the
-`--jobs` value, because each links `target/debug/sparkles` with other features. The
-binary of `test` has the formatter's fault injection, which its refused-output tests
-need, and a concurrent `node:test` used to replace it with a build without it.
+one run at a time can use a checkout. `test`, `test:features` and `node:test` take turns
+whatever the `--jobs` value, because each links `target/debug/sparkles` with other
+features. The binary of `test` has the formatter's fault injection, which its
+refused-output tests need, and a concurrent `node:test` would replace it with a build
+without it.
 
 The checks declare their input files in `mise.toml`, and mise's task cache records each
 pass under a key made from the contents of those files, the task's definition, the tool
@@ -178,6 +176,16 @@ failure. `.config/nextest.toml` holds these settings. Debug builds keep line tab
 so backtraces have file and line numbers but a debugger cannot show variables. Set
 `CARGO_PROFILE_DEV_DEBUG=true` for full debug information.
 
+The server crate has no library target, so its unit-test binary and the binary that its
+integration tests run each compile the whole crate. In a debug build each of those rustc
+processes peaks at about 10 GB, mostly while it collects monomorphized items, and a
+build that runs both at once needs about 20 GB. `mise run test` therefore first runs
+`cargo test --workspace --no-run --bin sparkles` to build the unit-test binary on its own,
+and only then runs nextest. That keeps the peak near 10 GB and costs a few minutes of build
+time, because the two server compiles do not overlap.
+
+### Conformance suites
+
 `crates/sparkles-core/tests/w3c.rs` runs the W3C SPARQL suites vendored in an Apache
 Jena checkout. It looks for the checkout at `../../apache/jena`, next to this
 repository, or at `SPARKLES_W3C_DIR`. The SHACL suites come from the same checkout, or from
@@ -191,34 +199,54 @@ and 20/20 for SHACL. The eight SHACL 1.2 list tests pass, and all 32 test pairs 
 SHACLC suite read to the expected graph and write back to it.
 `crates/sparkles-core/tests/w3c-known-failures.txt` lists known failures and is empty.
 
-For the X08 spill conformance matrix, run `SPARKLES_W3C_SPILL=plain mise run --force test:w3c`
-and repeat with `SPARKLES_W3C_SPILL=encrypted`. Cursor query passes then use a 1 MiB
-memory budget and a private spill directory per query at batch sizes 1, 2, 3 and 4,096.
-Eager passes retain their ordinary options. These runs enable spill for conformance
-fixtures; the dedicated spill tests separately force physical spill.
+The shexTest suite comes from the same Jena checkout (`jena-shex`). Set
+`SPARKLES_SHEX_TESTS` to use an upstream shexTest checkout instead.
+`crates/sparkles-shex/tests/known-failures.txt` lists the tests that fail, with reasons.
+Sparkles passes all 425 syntax, 99 negative-syntax, 14 negative-structure and 418
+representation tests, and reads and writes all 418 ShExR schemas. Of the validation
+tests, 1,062 pass and one is a known failure. The 42 tests that check blank-node labels
+are skipped, because the store does not keep them.
 
-The explicit X08 A11 and A12 gates use the `spill_acceptance` example. It produces
-20 million mixed-type sort rows or 10 million groups from compact streaming fixtures,
-checks an unlimited eager reference and independent result oracles, and requires
-physical spill within the configured budget. The `all` case runs all eight aggregate
-functions together, and separate cases also check each function. These memory-intensive gates run
-separately from ordinary CI, on a reserved host with its own build target.
+### Feature builds and cited paths
 
-```sh
-set -eu
-for mode in plain encrypted; do
-  RAYON_NUM_THREADS=2 cargo run --release -p sparkles-core --example spill_acceptance --features text,geo-epsg,zstd,brotli -- sort "target/x08-acceptance-$mode/sort" 10000 2000 "$mode" 64
-  for case in all count sum avg min max sample concat count-distinct distinct; do
-    RAYON_NUM_THREADS=2 cargo run --release -p sparkles-core --example spill_acceptance --features text,geo-epsg,zstd,brotli -- "$case" "target/x08-acceptance-$mode/$case" 10000 1000 "$mode" 64
-  done
-done
-```
+`mise run lint:features` (`scripts/lint-features.sh`) runs clippy, with warnings as
+errors, over the builds that `mise run lint` does not cover:
 
-Each invocation requires a fresh output directory and saves its query, actual plans,
-counts, budget, spill writes and cleanup checks. Smaller dimensions exercise the same
-oracles but never count as full-scale acceptance. Keep source, toolchain, feature and
-process-memory receipts beside the results, and coordinate the host's memory capacity
-before starting the full matrix.
+* the server with no optional feature, with each default feature but `mimalloc` on its
+  own, with `geo-epsg`, and with `mcp,shacl`, `mcp,shex`, `mcp,fmt` and `graphql,shacl`;
+* `sparkles-core`, `sparkles` and `sparkles-fmt` with their features off;
+* `sparkles-client` without its blocking facade;
+* the `sparkles-backup` library without a backend.
+
+Code that only some features use is gated on those features, and this task catches dead
+code and missing gates. Every combination shares the workspace target directory. The
+first run builds the dependencies once per feature set. After that, a change costs a
+minute or two.
+
+`mise run test:features` (`scripts/test-features.sh`) runs the server's unit and
+integration tests with the default features off and one optional feature set on, for
+each of `none`, `auth`, `mcp`, `memory`, `graphql` and `shacl`. The ordinary test run
+builds the server with its default features only, so a test that asserts a route or
+command that exists only with some feature passes there and fails under another build.
+This task is the test counterpart of `lint:features`. The script runs every set even
+after one fails, prints a line for each with its result and time, and exits non-zero if
+any set failed. Names on the command line choose the sets, and a set with several
+features is a comma-separated list, as in `scripts/test-features.sh none mcp,shacl`.
+Each set writes its output to `target/test-features/<set>.log`. The sets share the
+workspace target directory, so the dependencies compile once, and `CARGO_BUILD_JOBS`
+limits the compile jobs as it does for any cargo run. A test of a route that exists only
+with a feature carries a `#[cfg(feature = "...")]` gate for that feature, and a test
+file that needs a feature has the gate on the whole file. `mise run ci` runs this task
+and `mise run ci:fast` leaves it out, because every set compiles the server crate again.
+A set takes one to two minutes when the dependencies are warm, and the first run of a set
+takes several minutes more.
+
+`mise run lint:doc-paths` (`scripts/check-doc-paths.py`) checks that every
+`crates/sparkles…` path cited in the README, `docs/*.md`, `docs/specs` and the comments of
+the Rust sources exists. It expands `{a,b}` groups and ignores line numbers. A file that a
+spec describes before it is written goes in the script's `PLANNED` set.
+
+### Jena client tests
 
 `mise run test:jena-clients` (`scripts/test-jena-clients.sh`) builds a debug server, starts
 it on a temporary data directory on port 5230 with `--gsp-direct-naming`, and runs
@@ -233,6 +261,22 @@ compaction, tasks, statistics, offline datasets and the validators. It prints a 
 check and exits with the number of failures. Jena and a JDK come from nixpkgs unless
 `JENA_HOME` and `JAVA` name them, `SPARKLES_BIN` picks another server binary, and `PORT`
 another port. The task is not part of `mise run ci`.
+
+### Browser integration tests
+
+`mise run ui:e2e` builds the UI and a debug server. It starts `sparkles serve` on a free
+port of 127.0.0.1 with a temporary data directory, a small dataset, and an auth
+configuration with one user and one API token. It then runs the Playwright tests in
+`ui/tests/e2e` in headless Chromium and stops the server.
+
+To test another binary, set `SPARKLES_BIN=path/to/sparkles`. Extra arguments go to
+`playwright test`, as in `mise run ui:e2e -- -g Similar`. The flake's dev shell provides
+a Chromium that matches the pinned `@playwright/test`, so run the task as
+`nix develop -c mise run ui:e2e`. Elsewhere, the task downloads Chromium with
+`playwright install chromium`. The task is not part of `mise run ci`. On Linux, the
+flake runs the same tests as its `ui-e2e` check (see [Nix](#nix)).
+
+### Crash tests
 
 `scripts/power-loss.sh` runs the crash tests of
 [X09](specs/X09-group-commit-by-default.md) sections 10.2 and 10.4 with a release build and
@@ -261,32 +305,38 @@ scripts/power-loss.sh selftest --fs /tmp/plt --sparkles target/release/sparkles 
   --harness ./crash-harness --work /tmp/plt
 ```
 
-The shexTest suite comes from the same Jena checkout (`jena-shex`). Set
-`SPARKLES_SHEX_TESTS` to use an upstream shexTest checkout instead.
-`crates/sparkles-shex/tests/known-failures.txt` lists the tests that fail, with reasons.
-Sparkles passes all 425 syntax, 99 negative-syntax, 14 negative-structure and 418
-representation tests, and reads and writes all 418 ShExR schemas. Of the validation
-tests, 1,062 pass and one is a known failure. The 42 tests that check blank-node labels
-are skipped, because the store does not keep them.
+### Spill acceptance tests
 
-`mise run lint:features` (`scripts/lint-features.sh`) runs clippy, with warnings as
-errors, over the builds that `mise run lint` does not cover:
+For the [X08](specs/X08-disk-spill-and-server-memory.md) spill conformance matrix, run `SPARKLES_W3C_SPILL=plain mise run --force test:w3c`
+and repeat with `SPARKLES_W3C_SPILL=encrypted`. Cursor query passes then use a 1 MiB
+memory budget and a private spill directory per query at batch sizes 1, 2, 3 and 4,096.
+Eager passes retain their ordinary options. These runs enable spill for the conformance
+fixtures, and the dedicated spill tests force physical spill on their own.
 
-* the server with no optional feature, with each default feature but `mimalloc` on its
-  own, with `geo-epsg`, and with `mcp,shacl`, `mcp,shex`, `mcp,fmt` and `graphql,shacl`;
-* `sparkles-core`, `sparkles` and `sparkles-fmt` with their features off;
-* `sparkles-client` without its blocking facade;
-* the `sparkles-backup` library without a backend.
+The X08 acceptance criteria A11 and A12 use the `spill_acceptance` example. It produces
+20 million mixed-type sort rows or 10 million groups from compact streaming fixtures,
+checks an unlimited eager reference and independent result oracles, and requires
+physical spill within the configured budget. The `all` case runs all eight aggregate
+functions together, and separate cases also check each function. These tests need a
+lot of memory, so they run outside ordinary CI, on a host with its own build target.
 
-Code that only some features use is gated on those features, and this task catches dead
-code and missing gates. Every combination shares the workspace target directory. The
-first run builds the dependencies once per feature set. After that, a change costs a
-minute or two.
+```sh
+set -eu
+for mode in plain encrypted; do
+  RAYON_NUM_THREADS=2 cargo run --release -p sparkles-core --example spill_acceptance --features text,geo-epsg,zstd,brotli -- sort "target/x08-acceptance-$mode/sort" 10000 2000 "$mode" 64
+  for case in all count sum avg min max sample concat count-distinct distinct; do
+    RAYON_NUM_THREADS=2 cargo run --release -p sparkles-core --example spill_acceptance --features text,geo-epsg,zstd,brotli -- "$case" "target/x08-acceptance-$mode/$case" 10000 1000 "$mode" 64
+  done
+done
+```
 
-`mise run lint:doc-paths` (`scripts/check-doc-paths.py`) checks that every
-`crates/sparkles…` path cited in the README, `docs/*.md`, `docs/specs` and the comments of
-the Rust sources exists. It expands `{a,b}` groups and ignores line numbers. A file that a
-spec describes before it is written goes in the script's `PLANNED` set.
+Each invocation requires a fresh output directory and saves its query, actual plans,
+counts, budget, spill writes and cleanup checks. Smaller dimensions exercise the same
+oracles but do not count as full-scale acceptance. Keep the source revision, toolchain,
+features and process memory beside the results, and make sure the host has the memory
+free before starting the full matrix.
+
+## Language bindings
 
 ### Python bindings
 
@@ -335,9 +385,9 @@ set it up and run it.
 
 The x86_64 manylinux and musllinux builds can be reproduced locally with Docker in the
 `quay.io/pypa/manylinux_2_28_x86_64` and `musllinux_1_2_x86_64` images, with
-`maturin build --compatibility manylinux_2_28` or `musllinux_1_2`. Both were built that
-way, the musllinux one from the sdist, and passed the suite on CPython 3.10 and 3.14 and
-in Alpine. The macOS and aarch64 wheels are built only by the workflow.
+`maturin build --compatibility manylinux_2_28` or `musllinux_1_2`, and the musllinux
+wheel can be built from the sdist. The macOS and aarch64 wheels are built only by the
+workflow.
 `actionlint` checks the workflow file.
 
 ### JVM bindings
@@ -429,124 +479,64 @@ protocol and streaming-parser tests, and its generated administrative types are
 checked against the OpenAPI document. The release workflow builds the native target
 matrix and runs runtime checks. [Releases](#releases) describes publication to npm.
 
-### Browser integration tests
-
-`mise run ui:e2e` builds the UI and a debug server. It starts `sparkles serve` on a free
-port of 127.0.0.1 with a temporary data directory, a small dataset, and an auth
-configuration with one user and one API token. It then runs the Playwright tests in
-`ui/tests/e2e` in headless Chromium and stops the server.
-
-To test another binary, set `SPARKLES_BIN=path/to/sparkles`. Extra arguments go to
-`playwright test`, as in `mise run ui:e2e -- -g Similar`. The flake's dev shell provides
-a Chromium that matches the pinned `@playwright/test`, so run the task as
-`nix develop -c mise run ui:e2e`. Elsewhere, the task downloads Chromium with
-`playwright install chromium`. The task is not part of `mise run ci`. On Linux, the
-flake runs the same tests as its `ui-e2e` check (see [Nix](#nix)).
-
 ## Benchmark scripts
 
 [BENCHMARKING.md](BENCHMARKING.md) documents the harnesses, modes, outputs and
 measurement limits, including local and cloud regression comparisons.
-[BENCHMARKS.md](BENCHMARKS.md) contains published results and their methodology.
+[BENCHMARKS.md](BENCHMARKS.md) contains published results and their methodology. This
+section covers the two scripts that measure indexed group commit, which
+[X09](specs/X09-group-commit-by-default.md) section 17.9 specifies.
 
-`scripts/bench-indexed-commit.py` runs the native indexed group-commit gates of X09
-section 17.9 on a quiet Linux host. It takes an externally built Sparkles binary and the
-standalone client built from `scripts/write-bench.rs`. Its `--help` describes the matrix
-and the pilot overrides. Both alternatives use the same binary, and the ordinary writer
-adds `--no-group-commit`. The harness holds the host's heavy lock and runs each server
-in a user systemd service with a 12 GiB memory limit and no swap. The CPU lists need to
-match the host's topology. It creates fresh store copies, checks indexed answers and
-acknowledgements, saves individual latencies and checks a cold reopen after each run.
-Generated fixtures and seeds are flushed after preparation. Every fresh store copy is
-flushed before server startup, and completed raw evidence is flushed after cleanup.
-These owned-file flushes stay outside the writer interval and prevent bulk preparation
-writeback from spilling into the next measurement. They add no delay to timed commits.
-The embedding worker calls a deterministic local provider, whose cost represents that
-provider alone. Its own ordinary commits can appear between client receipts. The harness
-checks every acknowledgment against the recovered user history and verifies the
-intervening embedding commits, their fallback counters and their derived triples
-separately. It keeps the ordinary client's strict receipt checks. A failed acceptance
-threshold remains a failed gate in the result.
-Cold embedding inspection disables the worker and compares persisted derived triples and
-commit identities before they can be regenerated.
-Text and spatial publication checks save executed plans and require the exact completed
-TextSearch or SpatialScan operator. Spatial plans must report a ready index without a
-fallback. A broad geometry count checks every write, while a selective typed-WKT window
-checks spatial-index publication to the unique write namespace. The client's coordinate
-cycle places one write in that window every 150 changes. Both counts and index plans are
-checked live and after a cold reopen.
-The full protocol uses both dataset sizes and five ABBA blocks. A smaller pilot only
-checks the harness and estimates runtime.
+### Indexed group-commit harness
 
-Embedding seeds first finish their provider work, then close cleanly for a full offline
-compaction and vector rebuild. A cold validation with embedding disabled checks the exact
-source and derived counts, a complete graph reopened from nonempty mapped files and an
-empty overlay. The same
-baseline checks run before each timed process. Provider-idle status alone does not prove
-that graph construction has finished. Offline maintenance uses owned services with the
-same memory and CPU limits as the server, finite deadlines and saved cleanup receipts.
-New timed writes still run the normal embedding and graph workers, and provider work must
-occur inside the writer interval.
+`scripts/bench-indexed-commit.py` compares the ordinary writer with group commit on
+datasets that carry full-text, spatial and embedding indexes. It runs on a quiet Linux
+host, and its `--help` describes the matrix and the pilot overrides. It takes an
+externally built Sparkles binary and the standalone client built from
+`scripts/write-bench.rs`. Both alternatives use the same binary, and the ordinary writer
+adds `--no-group-commit`.
 
-For memory measurements, the harness saves the server's startup peak, resets its owned
-process's Linux high-water mark before client startup and reads it after the client exits,
-including raw-output finalization. This gives a conservative outer-window bound. It also
-samples resident memory, preserving wall timestamps around each read. The reported peak
-is the larger of the reset kernel bound and samples read wholly within the actual writer
-interval. Both components and the sample count are saved separately. The memory gate
-certifies the peak difference using the grouped outer-window upper bound minus the
-ordinary interval's sampled lower bound. It retains the original outer-window difference
-as a diagnostic. Missing interval samples cannot pass the gate. This prevents an
-ordinary-only post-write spike from masking a grouped interval increase. An allocation and
-release in a disposable child checks that the kernel supports resetting the peak. A
-failed reset stops the measurement. The original Namespace write harness keeps its
-existing workload defaults.
+The harness holds the host's heavy lock and runs each server in a user systemd service
+with a 12 GiB memory limit and no swap. Its CPU lists need to match the host's topology.
+The full protocol uses both dataset sizes and five ABBA blocks, and a smaller pilot only
+checks the harness and estimates the runtime.
 
-Reader requests started while the writers run keep their full latency, including those
-that finish after the writes stop. A timeout fails the observation. Both alternatives
-must sustain the same offered write rate before their reader tails can be compared.
-The harness adds a load-quality requirement beyond X09's numerical thresholds. Each
-mixed process must achieve its offered rate within five percent, with maximum schedule
-lag no greater than 50 ms or two client periods, whichever is longer.
-Schedule lag is measured at each real request's start, after connection readiness.
-Exhausted writer iterations cannot contribute a lag for an unsent request. The client's
-optional `--request-timings` file records each workload attempt's client and index, its timed or
-warmup status, wall start and end, monotonic start and due offsets, latency and HTTP
-status. Transport and connection-readiness failures use status zero. The client never
-resends a request after losing its response. Rows are buffered and written when the client
-finishes, outside the writer interval. The indexed harness saves these diagnostics for
-each process while keeping the original latency samples separate.
-Latency summaries preserve the raw samples' nine decimal places in milliseconds.
-Elapsed seconds and throughput also retain nine decimal places for performance gate
-comparisons. Writer latency measures the client's HTTP request and response interval.
-It does not isolate engine execution or storage synchronization time.
-Writer thread names include their zero-based client index so scheduler observations
-can be matched to individual clients.
-A violation remains a failed gate even when the reader latency ratio passes. The harness
-retains its raw samples and completes the data and cold-recovery checks before moving
-to the next process.
-When no rate is supplied, calibration runs an unpaced ABBA block with the actual indexed
-readers and chooses eighty percent of the slowest observed writer throughput. The harness
-then validates that common offered rate on both alternatives, including a supplied rate,
-before acceptance processes begin. Either alternative missing the five-percent achieved
-rate tolerance stops the matrix and retains all calibration evidence. The rate is fixed
-throughout the acceptance matrix. Calibration has its own raw samples and cold-recovery
-checks and cannot enter acceptance summaries. Its aggregate rate validation does not
-excuse a failed schedule-lag check in an acceptance process.
+| Concern | How the harness handles it |
+|---|---|
+| Fresh state | Every run starts from a fresh store copy. Fixtures, seeds, store copies and raw results are flushed to disk outside the writer interval, so preparation writeback does not leak into a measurement. |
+| Correctness | It checks indexed answers and every acknowledgement against the recovered history, saves individual latencies and checks a cold reopen after each run. |
+| Text and spatial indexes | It saves executed plans and requires a completed `TextSearch` or `SpatialScan` operator, with a ready spatial index and no fallback. A broad geometry count checks every write, and a selective typed-WKT window, which receives one write every 150 changes, checks spatial-index publication. Both are checked live and after a cold reopen. |
+| Embeddings | The worker calls a deterministic local provider. Seeds finish their provider work and are compacted offline with a vector rebuild, and a cold validation checks the source and derived counts before each timed process. Offline maintenance runs in services with the server's memory and CPU limits, and timed writes run the normal embedding and graph workers. The harness checks the worker's own commits, fallback counters and derived triples separately from client receipts. |
+| Memory | It resets the server's Linux high-water mark before the client starts and reads it after the client exits, and it samples resident memory with wall timestamps. The reported peak is the larger of the kernel bound and the samples taken within the writer interval. The memory comparison uses the grouped writer's outer bound minus the ordinary writer's sampled lower bound, and a run without interval samples fails. A disposable child first checks that the kernel can reset the peak, and a failed reset stops the measurement. |
+| Reader latency | Readers started during the writes keep their full latency, and a timeout fails the observation. |
+| Load quality | Each mixed process must reach its offered write rate within five percent, with a maximum schedule lag of 50 ms or two client periods, whichever is longer. Lag is measured at each request's start, after connection readiness. |
+| Offered rate | Without a supplied rate, an unpaced calibration block chooses 80 percent of the slowest writer throughput. The rate is validated on both alternatives before the acceptance processes start and stays fixed for the matrix. Calibration results never enter acceptance summaries. |
+
+Writer latency is the client's HTTP request and response interval, so it does not
+isolate engine execution or storage synchronization. Latencies, elapsed times and
+throughput keep nine decimal places. The client's optional `--request-timings` file
+records each attempt's client index, timed or warmup status, wall and monotonic times,
+latency and HTTP status, with status zero for transport failures. The client never
+resends a request after losing its response, and it writes the file after the writer
+interval. Writer thread names carry their zero-based client index. A failed threshold is
+recorded as a failure in the result, and the harness still completes the data and
+cold-recovery checks before it moves to the next process.
+
+### Campaign report
 
 `scripts/bench-indexed-report.py` summarizes finished campaigns of that harness. For
 every scenario it prints the median and range of each metric with the ordinary writer and
 with grouping, the ratio of the two medians, and the ratio between neighbouring processes
-of each ABBA block. For the serial scenarios and the writer scenarios it also prints the
-mean time of a commit synchronization, which it reads from each process's server
-counters, and for the serial scenarios the engine overhead, which is the mean request
-latency less that synchronization time. A drive whose flush latency changes between
-processes moves the synchronization column, and the overhead column shows whether the
-two writers still differ once that change is taken out. The pass and fail marks come from
-the harness's own `gate-summary.json`, which keeps the verdicts of the gates as first written.
-The report also judges the serial and four-writer throughput gates as X09 section 17.9
-amended them, on the ratios between neighbouring processes, and prints those verdicts as
-amended gate lines.
+of each ABBA block. For the serial and writer scenarios it also prints the mean time of a
+commit synchronization, read from each process's server counters. For the serial
+scenarios it prints the engine overhead, which is the mean request latency less that
+synchronization time. A drive whose flush latency changes between processes moves the
+synchronization column, and the overhead column shows whether the two writers still
+differ once that change is taken out. The pass and fail marks come from the harness's
+own `gate-summary.json`, which keeps the verdicts as first written. The report also
+judges the serial and four-writer throughput thresholds on the ratios between
+neighbouring processes, as X09 section 17.9 defines them, and prints those verdicts on
+separate lines.
 
 ## Continuous integration
 
@@ -565,6 +555,7 @@ rather than to save runner minutes. `actionlint` checks the workflow files.
 | Build tests | `cargo nextest archive` builds every test binary once and uploads the archive. The doctests run here too. |
 | Test | Five jobs run the archive. Four take a quarter of the tests each (`--partition slice:N/4`), and one runs the `timing` group of `.config/nextest.toml`, which needs a machine to itself. |
 | Jena clients | Jena's own HTTP clients against the server binary from the archive (`mise run test:jena-clients`). |
+| Features | Six jobs run `scripts/test-features.sh` for one feature set each, with the default features off. They build apart from the archive and have a cache each. |
 
 The transcript import integration test reserves all test slots while it runs in its
 shard. It sends a 5 MiB transcript through the real server, whose query deadline stays
@@ -597,7 +588,7 @@ in the release profile. Every job has a timeout, so a hung job stops instead of 
 for GitHub's default six hours.
 
 Jena 6 removed the query builder's initial-binding API. Its compatibility run skips
-that API's test, while Jena 5 still runs it. The remaining small-query tests run on both
+that API's test, and the Jena 5 run keeps it. The remaining small-query tests run on both
 versions. Substitution tests remain separate because their semantics differ.
 
 `nix.yml` builds the flake's `cacheable` output with nix-fast-build on x86_64 Linux,
@@ -620,10 +611,8 @@ information (`CARGO_PROFILE_DEV_DEBUG=0`, which `setup-rust-toolchain` sets), wh
 linking short. A cold test build still peaks above the runner's 16 GB, so that job adds
 16 GB of swap.
 
-Measured on the pull request that introduced this layout, a push with warm caches waits
-about 13 minutes for `ci.yml` and a cold one about 25. The single job it replaced took
-about 27 minutes warm and 40 cold, of which the test run alone took 14 to 21. The test
-build takes 7 minutes warm and 15 cold, and each test job about 5 to 6 minutes, of which
+A push with warm caches waits about 13 minutes for `ci.yml`, and a cold one about 25.
+The test build takes 7 minutes warm and 15 cold, and each test job about 5 to 6 minutes, of which
 downloading the test archive takes one to two. Compressing with a long zstd window shrinks the
 archive from 2.2 GB to about 1.4 GB, because the test binaries share most of their code.
 
@@ -670,6 +659,8 @@ until someone presses Publish. Set the variable `MAVEN_PUBLISHING_TYPE` to `auto
 to release them as soon as they validate. Artifacts on Maven Central can never be
 changed or deleted, so check a deployment in the Portal before you release it.
 
+## Engineering invariants
+
 ### Changing an on-disk format
 
 `crates/sparkles-core/src/formats.rs` declares every kind of file Sparkles keeps, the
@@ -696,6 +687,15 @@ made by `scripts/format-fixture.sh BIN LABEL` with that release's binary. The te
 open every fixture, compare its recorded answers, write, compact and restore its
 backups. A change that breaks a fixture inside the window needs a reader for the old
 form or a migration step, not a new fixture.
+
+### File locks
+
+Persistent stores, offline migrations, the offline restore swap and the catalog hold an
+exclusive file lock through their owned cleanup. The lock guard explicitly unlocks
+before closing its descriptor, so an unrelated child between fork and exec cannot delay
+reopening the database or the data directory. Store fields
+that own writers must be declared before the lock guard so their destructors finish
+while exclusion still holds.
 
 ## Nix
 
@@ -774,10 +774,6 @@ their own `nix.conf`.
 
 ### How the Rust build is layered
 
-Per-crate Nix builds remain an investigation under [roadmap item 92](ROADMAP.md)
-and [X13](specs/X13-per-crate-nix-builds.md). A working crate2nix prototype has not
-completed a matched comparison or packaging validation, so these builds keep Crane.
-
 crane builds `sparkles`, `sparkles-cli` and `sparkles-fmt-wasm` in two derivations each.
 The first one compiles only the dependencies. It sees the manifests and `Cargo.lock`,
 and every workspace source file is replaced by an empty stub, so it is rebuilt only when
@@ -788,7 +784,7 @@ workspace crates and nothing else.
 `sparkles` and `sparkles-cli` share one binary. The Nix build embeds no UI in it, and
 `sparkles` is a small wrapper that sets `SPARKLES_UI_DIR` to the UI's store path, from
 which the server reads the UI at run time. A UI change therefore rebuilds the UI and the
-wrapper, and no Rust code. Builds outside Nix (`mise run build`, the Dockerfile) still
+wrapper, and no Rust code. Builds outside Nix, such as `mise run build` and the Dockerfile,
 embed `ui/build` in the binary. The `sparkles-tests` check reuses the same dependency
 derivation, which also compiles the dependencies of
 `cargo test -p sparkles-core -p sparkles --lib`, because the engine alone enables fewer
@@ -803,7 +799,7 @@ and with it the UI.
 
 Dependency updates need no hash in the Nix files. crane reads `Cargo.lock` and fetches
 each crate by the checksum recorded there, so `cargo update` followed by `nix build` is
-enough. Two exceptions remain. A new version of the `wasm-bindgen` crate needs the same
+enough. There are two exceptions. A new version of the `wasm-bindgen` crate needs the same
 version of `wasm-bindgen-cli` in `nix/fmt-wasm.nix`, with its two hashes, and the build
 stops with a message until they agree. The Python package is built by maturin through
 nixpkgs' own Rust hooks, from `crates/sparkles-py/Cargo.lock`, and has no separate
@@ -816,6 +812,10 @@ same path as before unless a manifest or the lockfile changed. In the same way,
 `.#packages.x86_64-linux.sparkles-cli`, which is also `sparkles.passthru.unwrapped`, keeps
 its path across a UI change, and `.#packages.x86_64-linux.sparkles-fmt-wasm` keeps its
 path across a change to any crate but the formatter's two.
+
+Per-crate Nix builds with crate2nix are under investigation in roadmap item 92 of
+[ROADMAP.md](ROADMAP.md) and in [X13](specs/X13-per-crate-nix-builds.md). Until that
+work shows a measured gain, the flake builds with crane.
 
 ## Third-party licenses
 

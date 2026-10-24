@@ -57,6 +57,7 @@ const BRANCH_ROUTES = new Set([
   'rdfs',
   'cache',
   'backups',
+  'forms',
 ]);
 
 /**
@@ -79,7 +80,11 @@ export function branchPath(path: string): string {
   const route = segs[2];
   // `/$/cache/clear/{ds}`; `/$/datasets/{ds}/clone` copies a branch
   const at = route === 'cache' ? 4 : 3;
-  const takes = BRANCH_ROUTES.has(route) || (route === 'datasets' && segs[4] === 'clone');
+  // an algorithm run reads a branch, but the projections are main's
+  const takes =
+    BRANCH_ROUTES.has(route) ||
+    (route === 'datasets' && segs[4] === 'clone') ||
+    (route === 'algo' && segs[4] === 'run');
   const seg = segs[at];
   if (!takes || !seg) return path;
   const i = seg.replace(/%40/gi, '@').indexOf('@');

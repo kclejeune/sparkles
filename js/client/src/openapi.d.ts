@@ -54,7 +54,7 @@ export interface paths {
         put?: never;
         /**
          * Run a graph algorithm
-         * @description Without `write` the run is the SPARQL query its request stands for, answered as `/{ds}/sparql` answers (`Accept`, `timeout`, `execution` and the budget overrides apply), one row per node, node pair or node and level. `summary=true` returns only the statistics of the run. With `write` the run is a task that computes at the head commit and writes the rows in batched commits, with a run record in the graph. Read-only runs need read through the query endpoint and use Query rate/concurrency limits. Write-back runs need write through the update endpoint and use Update HTTP admission through the 202 response body. Background work uses the existing task queue and algorithm-thread admission, not an HTTP permit. A task can be cancelled with `DELETE /$/tasks/{id}`.
+         * @description Without `write` the run is the SPARQL query its request stands for, answered as `/{ds}/sparql` answers (`Accept`, `timeout`, `execution` and the budget overrides apply), one row per node, node pair or node and level. `summary=true` returns only the statistics of the run. A request with `nodes`, `keep`, `async` or `top` is a view-only run, which answers in SPARQL JSON with the rows of the listed nodes, `communitySize` for community and component rows, the run's `summary` and a `run` member that names the commit and whether the cache answered. With `keep` the whole result is kept in a cache of at most 8 results and 512 MiB charged to the server memory pool, and with `async` as well the run is an `algo-view` task that needs only read, which a request for the same key joins and the caller that started it may cancel. With `write` the run is a task that computes at the head commit and writes the rows in batched commits, with a run record in the graph. Read-only runs need read through the query endpoint and use Query rate/concurrency limits. Write-back runs need write through the update endpoint and use Update HTTP admission through the 202 response body. Background work uses the existing task queue and algorithm-thread admission, not an HTTP permit. A task can be cancelled with `DELETE /$/tasks/{id}`.
          */
         post: operations["runAlgorithm"];
         delete?: never;
@@ -999,6 +999,66 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/$/forms/{ds}": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * The form of a resource
+         * @description The fields that the property shapes of the node shapes targeting `focus` describe, laid out by `sh:group` and `sh:order` and labelled by `sh:name`, with the resource's values read under the caller's view, the widget of each field, the constraints the browser checks and the triples no property shape covers. Fields the caller's protections hide from reads are absent, and fields it cannot write are read-only with a `reason`. Reads follow the caller's query endpoint grants and writeability its update endpoint grants on the branch saves go to. A focus no shape targets answers `200` with no fields. With `class` instead of `focus`, the form is that of a new instance of the class, with the fields of the node shapes whose class targets select it and no values, and `focus` is `null`. `save` says where a save goes, and `guard` gives the write guard's mode.
+         */
+        get: operations["getForm"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/$/forms/{ds}/check": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Check a form's changes
+         * @description Turns the changes into one update of `DELETE DATA` and `INSERT DATA`, runs it as a dry run and validates the nodes it touches at the state it would make against the form's shapes, whether or not the dataset has a guard. The answer is `200` with the write preview, the update, the fields another commit changed since the form loaded them (`conflicts`, which a save would refuse), and the validation results, each with the `field` it belongs to or `null`. A check of a session branch that does not exist yet previews its first commit on `main`'s head, which `main`'s protection does not refuse. A caller whose view hides part of the data gets no validation (`withheld`), as the validation routes refuse such callers. It needs write on the branch, through the update endpoint.
+         */
+        post: operations["checkForm"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/$/forms/{ds}/save": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Save a form's changes
+         * @description Commits the changes as one update with the message, when the stored values of every changed field are still those `expect` names, compared under the writer lock. Otherwise it answers `409` with code `form-conflict` and the fields with their stored values `now`. The write guard runs as for any write. A save of a form opened on `main` while the `forms` setting sends saves to a branch creates the caller's session branch from `main`'s head when it does not exist.
+         */
+        post: operations["saveForm"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/$/geo/convert": {
         parameters: {
             query?: never;
@@ -1049,6 +1109,26 @@ export interface paths {
         put?: never;
         /** Rebuild the spatial index */
         post: operations["rebuildGeoIndex"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/$/graph/{ds}/facets": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Facet histograms of a set
+         * @description Counts the entities of a set by ranges of round width of a property's numbers or of the years of its dates, or by its 12 most frequent values, with the entities that have no value. The set is a class, up to 20,000 IRIs, or the distinct values of a variable of a `SELECT` query, and a set above 1,000,000 entities is refused with `507`. Each brush in `filters` keeps the entities with a value in its range or among its values, and each facet counts the set filtered by every brush but its own, so the facets filter each other. `matching` counts the set under every brush. A facet over a budget carries an `error` while the others stay. `candidates: true` also lists the properties of a sample of the set, ranked by the share that has a value. Every count comes from queries run under the caller's view, timeout and memory budget, so it needs read through the query endpoint and fails with `507` like a query.
+         */
+        post: operations["getGraphFacets"];
         delete?: never;
         options?: never;
         head?: never;
@@ -1228,6 +1308,26 @@ export interface paths {
          * @description Confirms or refuses the estimate of a task that waits for it. Needs `admin` on the dataset.
          */
         post: operations["confirmGraphrag"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/$/graphrag/{ds}/memberships": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Read the communities of nodes
+         * @description The communities of the reports graph that hold each listed node, at the given level or at every level, with each community's member count and report title. Read on main only and through the caller's view. A caller for whom the reports graph is not proven, or a request on a branch, gets `available: false`.
+         */
+        post: operations["listCommunityMemberships"];
         delete?: never;
         options?: never;
         head?: never;
@@ -1459,6 +1559,65 @@ export interface paths {
          * @description Lints a SPARQL query or update, or a Turtle or TriG document, with the rules of `sparkles lint`. A syntax error is one of the findings, so the answer is `200` either way. `--format-endpoint` may limit or turn off the route.
          */
         post: operations["lint"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/$/mappings/{ds}": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /** List stored mappings */
+        get: operations["listStoredMappings"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/$/mappings/{ds}/{name}": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * Get a stored mapping
+         * @description The mapping with its text and metadata, or the text alone when `Accept` names the kind's media type.
+         */
+        get: operations["getStoredMapping"];
+        /**
+         * Store a mapping
+         * @description Stores the mapping text as the next version, after parsing and checking it. `Content-Type` names the kind: `text/turtle` for R2RML and RML, `application/yaml` for YARRRML, `application/csvm+json` for CSVW metadata and `application/sparql-query` for a CONSTRUCT template. A connection the server does not declare is a warning. `If-Match: "v<N>"` stores only over version N, and `If-None-Match: *` only when the mapping does not exist.
+         */
+        put: operations["putStoredMapping"];
+        post?: never;
+        /** Delete a stored mapping */
+        delete: operations["deleteStoredMapping"];
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/$/mappings/{ds}/{name}/versions": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /** List the versions of a stored mapping */
+        get: operations["listStoredMappingVersions"];
+        put?: never;
+        post?: never;
         delete?: never;
         options?: never;
         head?: never;
@@ -2966,6 +3125,30 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/$/vector/{ds}/{name}/projection": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * Read a kept projection of a vector index
+         * @description Returns the kept projection's method, commit, bounds, a density grid of 256 by 256 cells, its classes, and up to 50,000 points as `{entity, x, y, class?, colour?}`. `bbox` returns the points inside a region and its density, at most `limit`, those of lowest sampling priority when there are more, so zooming in keeps the points already shown. `colour` names a predicate whose first value per point is returned as an index into `colour.values`. `Accept: application/x-sparkles-points` returns the binary points format of the embedding map guide. A projection read at an older commit than the head has `stale: true`.
+         */
+        get: operations["getVectorProjection"];
+        put?: never;
+        /**
+         * Compute a projection of a vector index
+         * @description Computes a two-dimensional projection of the index's entities at the head and keeps it in memory for `GET`. `pca` projects every vector on the two leading principal components of a sample, and an entity with several vectors sits at the mean of their projections. It runs in the request for an index of up to 1,000,000 vectors and as a task above that. `neighbours` lays out the index's HNSW neighbour graph from the PCA positions and always runs as a task. The server keeps four projections, 1 GiB in all, charged to the query memory pool, and refuses one it cannot hold with `507`. A caller whose access covers part of the dataset gets `403`.
+         */
+        post: operations["computeVectorProjection"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/$/vector/{ds}/{name}/rebuild": {
         parameters: {
             query?: never;
@@ -3014,6 +3197,71 @@ export interface paths {
          * @description Embeds every selected text of the index again, for example after the model behind a name changed.
          */
         post: operations["reembedVectorIndex"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/$/views/{ds}": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * List views
+         * @description The dataset's incremental views with their state: `building`, `current`, `behind` with the commits it lags, `suspended` with a reason, or `failed`.
+         */
+        get: operations["listViews"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/$/views/{ds}/{name}": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /** Get a view */
+        get: operations["getView"];
+        /**
+         * Define a view
+         * @description Compiles the query, keeps the definition and starts the first evaluation as a task in `/$/tasks`. Needs `admin` on the dataset. A query outside the incremental fragment is refused with `400 not-incremental`, and Phase 2 options with `400 unsupported-option`.
+         */
+        put: operations["putView"];
+        post?: never;
+        /**
+         * Delete a view
+         * @description Removes the view and its state. Needs `admin` on the dataset.
+         */
+        delete: operations["deleteView"];
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/$/views/{ds}/{name}/rebuild": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Rebuild a view
+         * @description Evaluates the view again from scratch as a task, and lifts a suspension. Needs `admin` on the dataset.
+         */
+        post: operations["rebuildView"];
         delete?: never;
         options?: never;
         head?: never;
@@ -3149,7 +3397,10 @@ export interface paths {
         put: operations["gspPut"];
         /** Add to a graph */
         post: operations["gspPost"];
-        /** Delete a graph */
+        /**
+         * Delete a graph
+         * @description Deletes the graph. With a `text/csv` or `text/tab-separated-values` body and `mapping` or `base`, removes the mapped triples from the graph instead.
+         */
         delete: operations["gspDelete"];
         options?: never;
         /**
@@ -3326,6 +3577,46 @@ export interface paths {
         get: operations["historyChanges"];
         put?: never;
         post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/{ds}/live": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * Live query
+         * @description A SELECT, ASK or CONSTRUCT query that a view could be, as server-sent events: `snapshot` pages of the result, then a `diff` after each commit that changes it, `reset` when the server evaluated the query again, and `error` when the stream ends. Each event's id is a commit.
+         */
+        get: operations["liveQuery"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/{ds}/mappings/{name}/run": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Run a stored mapping
+         * @description Runs the mapping over the file parts its sources name and the server's connections, and commits once. `mode=replace` replaces the constant graphs the mapping writes in that commit, and is `400` with code `mapping-graphs-unknown` for a template graph map. The commit message defaults to `mapping NAME (version V)`, and the mapping records the run.
+         */
+        post: operations["runStoredMapping"];
         delete?: never;
         options?: never;
         head?: never;
@@ -3673,7 +3964,7 @@ export interface paths {
         put?: never;
         /**
          * Upload files
-         * @description A multipart upload of RDF files, and CSV or TSV tables mapped to triples, in one commit. The format comes from each file name or content type. A plain `text/csv` or `text/tab-separated-values` body is one table.
+         * @description A multipart upload of RDF files, CSV or TSV tables mapped to triples, and the files an R2RML, RML or YARRRML mapping reads, in one commit. The format comes from each file name or content type. A plain `text/csv` or `text/tab-separated-values` body is one table. A mapping file source without its part is `400` with code `mapping-source-missing`.
          */
         post: operations["upload"];
         delete?: never;
@@ -3698,7 +3989,10 @@ export interface paths {
         put: operations["directGraphPut"];
         /** Add to a graph */
         post: operations["directGraphPost"];
-        /** Delete a graph */
+        /**
+         * Delete a graph
+         * @description Deletes the graph. With a `text/csv` or `text/tab-separated-values` body and `mapping` or `base`, removes the mapped triples from the graph instead.
+         */
         delete: operations["directGraphDelete"];
         options?: never;
         /**
@@ -3749,16 +4043,24 @@ export interface components {
             /** @description Why `algo.json` could not be read. The list is then empty and refuses changes. */
             warning?: string;
         };
-        /** @description A run of one algorithm. With `write` the results are written to a graph in batched commits. */
+        /** @description A run of one algorithm. With `write` the results are written to a graph in batched commits. Without it, `nodes`, `keep`, `async` and `top` make it a view-only run. */
         AlgoRequest: {
             /** @enum {string} */
             algorithm: "pageRank" | "betweenness" | "wcc" | "scc" | "labelPropagation" | "louvain" | "leiden" | "nodeSimilarity" | "triangleCount" | "clustering" | "kCore" | "bfs" | "sssp" | "fastRP" | "node2vec";
+            /** @description View-only runs with `keep`. Run as an `algo-view` task and answer `202`, or join the task of a run with the same key. */
+            async?: boolean;
+            /** @description View-only runs. Keep the whole result in the server's cache of view-only results, keyed by branch, commit, the caller's view and the request without `nodes`, `keep`, `async` and `top`. */
+            keep?: boolean;
+            /** @description View-only runs. The IRIs of the nodes whose rows the answer holds. The whole result is computed, and each community or component row also carries `communitySize`, its size in the whole projection. */
+            nodes?: string[];
             /** @description The parameters of the algorithm, named as in `algo:` without the prefix, such as `maxIterations`, `seed` or `topK`. */
             params?: {
                 [key: string]: unknown;
             };
             /** @description The name of a stored projection, or a definition. */
             projection?: string | components["schemas"]["AlgoProjectionDefinition"];
+            /** @description View-only runs. Only the rows with the highest values of the first numeric output, such as `score`. */
+            top?: number;
             write?: {
                 atomic?: boolean;
                 batchSize?: number;
@@ -5756,6 +6058,28 @@ export interface components {
             truncated?: boolean;
             unreviewed?: number;
         };
+        /** @description The communities that hold the listed nodes, with each community's member count and report title. */
+        GraphragMemberships: {
+            available: boolean;
+            communities: {
+                iri: string;
+                level?: number;
+                memberCount?: number;
+                title?: string | null;
+            }[];
+            memberships: {
+                community: string;
+                level?: number;
+                node: string;
+            }[];
+            reason?: string;
+            reportsGraph?: string;
+        };
+        /** @description The nodes whose communities to read, at one level or at every level. */
+        GraphragMembershipsRequest: {
+            level?: number;
+            nodes: string[];
+        };
         /** @description A review of a community report. */
         GraphragReviewRequest: {
             /** @description The report's IRI. */
@@ -6176,6 +6500,22 @@ export interface components {
                 };
             };
             review?: components["schemas"]["ReviewCounts"];
+        };
+        /** @description What a stored mapping's run made and committed. */
+        MappingRun: {
+            /** @description The quads the commit added. */
+            count?: number;
+            mapping: string;
+            /** @enum {string} */
+            mode: "add" | "replace";
+            /** @description The quads the mapping made, before the load removed duplicates. */
+            quads: number;
+            reports?: {
+                [key: string]: unknown;
+            }[];
+            rows: number;
+            version: number;
+            warnings: string[];
         };
         /** @description Everything that waits for a person: unreviewed session facts with their signals, by session, and the open review branches. */
         MemoryInbox: {
@@ -7886,7 +8226,7 @@ export interface components {
             /** @description The entity tag of the runtime layer, as in the `ETag` header. */
             etag: string;
             /** @enum {string} */
-            kind: "assistant" | "memory" | "ingest" | "prefixes" | "graphrag" | "paths";
+            kind: "assistant" | "memory" | "ingest" | "prefixes" | "graphrag" | "paths" | "forms";
             /** @description The fields the settings file locks. */
             locked: string[];
             /** @description Locked fields whose runtime value is kept in the file but ignored. */
@@ -8198,6 +8538,118 @@ export interface components {
                     [key: string]: components["schemas"]["RdfTerm"];
                 }[];
             };
+        };
+        /** @description A stored mapping, with the summary of its check and its last run. */
+        StoredMapping: {
+            /** @description On a PUT: whether a new version was stored. */
+            changed?: boolean;
+            dataset?: string;
+            description?: string;
+            /** @enum {string} */
+            kind: "rml" | "yarrrml" | "csvw" | "template";
+            lastRun?: {
+                author?: string;
+                commit?: number;
+                /** @enum {string} */
+                mode: "add" | "replace";
+                quads: number;
+                rows: number;
+                time: string;
+                version: number;
+                warnings?: string[];
+            };
+            name: string;
+            summary?: {
+                /** @description The connections it reads. An empty name is an R2RML mapping's default connection. */
+                connections: string[];
+                files: string[];
+                /** @description The graphs its graph maps name, `default` for the default graph, or null when one is not constant. */
+                graphs?: string[] | null;
+                kind: string;
+                triplesMaps: number;
+                /** @description R2RML, RML (rml.io), RML-Core or YARRRML. */
+                vocabulary?: string;
+                warnings: string[];
+            };
+            /** @description The mapping text. Listings leave it out. */
+            text?: string;
+            version: {
+                author?: string;
+                created: string;
+                /** @description The dataset's head when the version was saved. */
+                datasetCommit?: number;
+                /** @description Hex SHA-256 over the parent's digest and the definition. */
+                digest: string;
+                message?: string;
+                parent?: number;
+                version: number;
+            };
+        };
+        /** @description A dataset's stored mappings, without their text. */
+        StoredMappingList: {
+            dataset: string;
+            mappings: {
+                /** @description On a PUT: whether a new version was stored. */
+                changed?: boolean;
+                dataset?: string;
+                description?: string;
+                /** @enum {string} */
+                kind: "rml" | "yarrrml" | "csvw" | "template";
+                lastRun?: {
+                    author?: string;
+                    commit?: number;
+                    /** @enum {string} */
+                    mode: "add" | "replace";
+                    quads: number;
+                    rows: number;
+                    time: string;
+                    version: number;
+                    warnings?: string[];
+                };
+                name: string;
+                summary?: {
+                    /** @description The connections it reads. An empty name is an R2RML mapping's default connection. */
+                    connections: string[];
+                    files: string[];
+                    /** @description The graphs its graph maps name, `default` for the default graph, or null when one is not constant. */
+                    graphs?: string[] | null;
+                    kind: string;
+                    triplesMaps: number;
+                    /** @description R2RML, RML (rml.io), RML-Core or YARRRML. */
+                    vocabulary?: string;
+                    warnings: string[];
+                };
+                /** @description The mapping text. Listings leave it out. */
+                text?: string;
+                version: {
+                    author?: string;
+                    created: string;
+                    /** @description The dataset's head when the version was saved. */
+                    datasetCommit?: number;
+                    /** @description Hex SHA-256 over the parent's digest and the definition. */
+                    digest: string;
+                    message?: string;
+                    parent?: number;
+                    version: number;
+                };
+            }[];
+            warning?: string;
+        };
+        /** @description The kept versions of a stored mapping, newest first. */
+        StoredMappingVersions: {
+            dataset: string;
+            name: string;
+            versions: {
+                author?: string;
+                created: string;
+                /** @description The dataset's head when the version was saved. */
+                datasetCommit?: number;
+                /** @description Hex SHA-256 over the parent's digest and the definition. */
+                digest: string;
+                message?: string;
+                parent?: number;
+                version: number;
+            }[];
         };
         /** @description A stored query definition. A PUT sends `query` and the optional members, and reads add `name`, `dataset`, `kind` and `version`. */
         StoredQuery: {
@@ -8819,6 +9271,95 @@ export interface components {
              */
             level: "exists" | "data" | "restore";
         };
+        /** @description A view with its state. */
+        View: {
+            columns?: string[];
+            /** @description The commit its rows reflect. */
+            commit?: number;
+            /** @description With `behind`: the commits it lags. */
+            commits?: number;
+            dataset?: string;
+            definition: components["schemas"]["ViewDefinition"];
+            /** @description With `failed`: why. */
+            error?: string;
+            name: string;
+            passMs?: number;
+            passes?: number;
+            /** @description The view's plan: each node has its `operator`, its `mode` (`incremental` or `recompute`), its `vars`, a `detail` that gives a recompute node's reason, and its `children`. */
+            plan?: {
+                [key: string]: unknown;
+            };
+            /** @description With `suspended`: why. */
+            reason?: string;
+            /** @description Time spent in its recompute nodes. */
+            recomputeMs?: number;
+            /** @description Its rows, multiplicities counted. */
+            rows?: number;
+            /** @description Passes its footprint skipped. */
+            skipped?: number;
+            /** @enum {string} */
+            state: "building" | "current" | "behind" | "suspended" | "failed";
+            stateBytes?: number;
+            /** @description On a PUT: the task of the first evaluation. */
+            task?: string;
+        };
+        /** @description A view's definition. Phase 1 takes `table` views maintained `async` on `main`, without provenance and with `keepCommits` 0. */
+        ViewDefinition: {
+            branches?: string[];
+            graph?: string;
+            keepCommits?: number;
+            /** @enum {string} */
+            maintenance?: "async" | "commit";
+            /** @description The budget of the view's state. */
+            memoryBytes?: number;
+            /** @enum {string} */
+            mode?: "table" | "graph";
+            /** @description The user whose view of the dataset the query reads; the definer by default. */
+            principal?: string;
+            /** @enum {string} */
+            provenance?: "none" | "count" | "why" | "lineage";
+            /** @description A SELECT or CONSTRUCT query; the dataset's prefixes apply. */
+            query?: string;
+            /** @description A stored query by name, in place of `query`. */
+            storedQuery?: string;
+        };
+        /** @description A dataset's views without their plans. */
+        ViewList: {
+            dataset: string;
+            views: {
+                columns?: string[];
+                /** @description The commit its rows reflect. */
+                commit?: number;
+                /** @description With `behind`: the commits it lags. */
+                commits?: number;
+                dataset?: string;
+                definition?: components["schemas"]["ViewDefinition"];
+                /** @description With `failed`: why. */
+                error?: string;
+                name: string;
+                passMs?: number;
+                passes?: number;
+                /** @description With `suspended`: why. */
+                reason?: string;
+                /** @description Time spent in its recompute nodes. */
+                recomputeMs?: number;
+                /** @description Its rows, multiplicities counted. */
+                rows?: number;
+                /** @description Passes its footprint skipped. */
+                skipped?: number;
+                /** @enum {string} */
+                state: "building" | "current" | "behind" | "suspended" | "failed";
+                stateBytes?: number;
+                /** @description On a PUT: the task of the first evaluation. */
+                task?: string;
+            }[];
+        };
+        /** @description A view's rebuild and the task that runs it. */
+        ViewTask: {
+            dataset: string;
+            name: string;
+            task: string;
+        };
         Whoami: {
             authEnabled: boolean;
             canMintTokens?: boolean;
@@ -9169,10 +9710,12 @@ export interface components {
         ifMatch: string;
         /** @description Entity tags, or `*`. */
         ifNoneMatch: string;
-        /** @description The settings kind: `assistant`, `memory`, `ingest` or `graphrag` of a dataset, or `models` or `notifications` of the server. */
-        kind: "assistant" | "memory" | "ingest" | "graphrag" | "models" | "notifications";
+        /** @description The settings kind: `assistant`, `memory`, `ingest`, `graphrag` or `forms` of a dataset, or `models` or `notifications` of the server. */
+        kind: "assistant" | "memory" | "ingest" | "graphrag" | "forms" | "models" | "notifications";
         /** @description The page size. */
         limit: number;
+        /** @description The most facts `reasoning=demand` may derive for the query, magic facts aside. It never exceeds the server's `--reason-max-derived`. */
+        maxDerived: number;
         /** @description A lower budget of the serialized result, in MiB. */
         maxResultMb: number;
         /** @description A lower budget of intermediate rows. */
@@ -9191,8 +9734,12 @@ export interface components {
         policy: string;
         /** @description `io` adds an `io` object to the metadata of the `application/x-sparkles+json` result, with what the query read from the index and vocabulary files and the time spent doing so. The counters are process-wide, so concurrent queries add to them. Overlapping profiles share at most 65,536 first-admitted pages; pagesTruncated reports cap omissions, not completeness. Page counts describe the retained sample, and broughtIn is its diagnostic nonnegative resident-count delta rather than physical I/O. Numeric mapped loads are observed independently of advice, including hints-off and previously hinted reads. The counters cover the whole process, so the parameter needs the `metrics` permission and answers `403` without it. Any other value answers `400`. */
         profile: "io";
+        /** @description `true` or `materialized` reads materialized inferences, the default when the dataset has any. `demand` derives the facts the query needs from the dataset's rules as it runs, without the inferred graph (spec F17). `false` reads the asserted data alone and also turns RDFS on read off. */
+        queryReasoning: "true" | "false" | "materialized" | "demand";
         /** @description Include materialized inferences. The default is true when the dataset has any. False also turns RDFS on read off. */
         reasoning: boolean;
+        /** @description The rules of `reasoning=demand`. The default is the profile of the last materialization. */
+        reasoningProfile: "rdfs" | "rdfs-simple" | "owl-rl";
         /** @description Add a commit receipt to the body. */
         receipt: boolean;
         /** @description A commit: `42`, `commit:42` or `head`. */
@@ -9213,7 +9760,7 @@ export interface components {
         validate: boolean;
     };
     requestBodies: {
-        /** @description RDF data in the syntax its `Content-Type` names. Jena's N3 media types are read as Turtle. */
+        /** @description RDF data in the syntax its `Content-Type` names. Jena's N3 media types are read as Turtle. A `text/csv` or `text/tab-separated-values` body is a table that `mapping` or `base` maps into the graph. */
         RdfData: {
             content: {
                 "application/ld+json": string;
@@ -9225,8 +9772,10 @@ export interface components {
                 "application/rdf+thrift": string;
                 "application/rdf+xml": string;
                 "application/trig": string;
+                "text/csv": string;
                 "text/n3": string;
                 "text/rdf+n3": string;
+                "text/tab-separated-values": string;
                 "text/turtle": string;
             };
         };
@@ -9423,7 +9972,7 @@ export interface operations {
                     "application/sparql-results+json": Record<string, never>;
                 };
             };
-            /** @description A run with `write`, started as a task. */
+            /** @description A run with `write`, or a view-only run with `keep` and `async`, started as a task. A view-only answer has `joined: true` when it joined a run already in progress. */
             202: {
                 headers: {
                     [name: string]: unknown;
@@ -11542,6 +12091,210 @@ export interface operations {
             default: components["responses"]["Error"];
         };
     };
+    getForm: {
+        parameters: {
+            query?: {
+                /** @description The IRI of the resource. Give either `focus` or `class`. */
+                focus?: string;
+                /** @description The class of a new instance. */
+                class?: string;
+                /** @description Where the shapes come from, when not the dataset's `forms` setting. */
+                shapes?: "guard" | "graphs" | "drafted";
+                /** @description The language labels are picked in, then English, then untagged. */
+                lang?: string;
+                /** @description The branch to work on (default `main`). The path form `/{ds}@{branch}/…` chooses one too; the two must agree. */
+                branch?: components["parameters"]["branch"];
+                /** @description The state to read: `head`, `42`, `commit:42`, `time:<RFC 3339>` or `snapshot:NAME`. */
+                at?: components["parameters"]["at"];
+                /** @description Seconds. Capped at the server's `--max-timeout`. */
+                timeout?: components["parameters"]["timeout"];
+            };
+            header?: never;
+            path: {
+                /** @description The dataset name. */
+                ds: components["parameters"]["ds"];
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description The form model. */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": {
+                        branch: string;
+                        closed: boolean;
+                        commit: number;
+                        /** @description The caller may save changes through this form. */
+                        editable: boolean;
+                        fields: Record<string, never>[];
+                        focus: string | null;
+                        /** @enum {integer} */
+                        formFormat: 1;
+                        /** @description The graph new values go into, `null` for the default graph. */
+                        graph: string | null;
+                        groups: Record<string, never>[];
+                        /** @description `{language, mode}` of the write guard. */
+                        guard?: Record<string, never> | null;
+                        other: Record<string, never>[];
+                        /** @description `{to, branch, exists, mainProtected}`: `to` is `main` or `branch`. */
+                        save: Record<string, never>;
+                        /** @description `{source, nodeShapes, missing?, unknownHints}`. */
+                        shapes: Record<string, never>;
+                        types: string[];
+                    };
+                };
+            };
+            400: components["responses"]["BadRequest"];
+            401: components["responses"]["Unauthorized"];
+            403: components["responses"]["Forbidden"];
+            404: components["responses"]["NotFound"];
+            408: components["responses"]["Timeout"];
+            501: components["responses"]["NotImplemented"];
+            default: components["responses"]["Error"];
+        };
+    };
+    checkForm: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description The dataset name. */
+                ds: components["parameters"]["ds"];
+            };
+            cookie?: never;
+        };
+        /** @description The changes. */
+        requestBody: {
+            content: {
+                "application/json": {
+                    /** @description The branch the form was opened on. A form opened on `main` saves where the dataset's `forms` setting says, which may be the caller's session branch. */
+                    branch?: string;
+                    changes: {
+                        add?: Record<string, never>[];
+                        /** @description The field's id, its path in SPARQL syntax. */
+                        field: string;
+                        remove?: Record<string, never>[];
+                    }[];
+                    /** @description The class of a new instance, whose IRI the server mints from the `forms` setting's `newIri`. The change also adds the instance's `rdf:type`. */
+                    class?: string;
+                    /** @description The values the form loaded, by field id, for every changed field. */
+                    expect?: {
+                        [key: string]: Record<string, never>[];
+                    };
+                    /** @description The IRI of the resource. Give either `focus` or `class`. */
+                    focus?: string;
+                    /** @description The commit message. */
+                    message?: string;
+                    /**
+                     * @description The shapes the form was built from, when not the setting's.
+                     * @enum {string}
+                     */
+                    shapes?: "guard" | "graphs" | "drafted";
+                };
+            };
+        };
+        responses: {
+            /** @description The preview and the validation. */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": {
+                        branch: string;
+                        /** @description `{id, now}` of each changed field whose stored values differ from `expect`. */
+                        conflicts: Record<string, never>[];
+                        /** @description The dry run, as a write preview answers it. */
+                        preview: Record<string, never>;
+                        update: string;
+                        /** @description `{checked, withheld, timedOut, conforms, results}`. */
+                        validation: Record<string, never>;
+                    };
+                };
+            };
+            400: components["responses"]["BadRequest"];
+            401: components["responses"]["Unauthorized"];
+            403: components["responses"]["Forbidden"];
+            404: components["responses"]["NotFound"];
+            408: components["responses"]["Timeout"];
+            default: components["responses"]["Error"];
+        };
+    };
+    saveForm: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description The dataset name. */
+                ds: components["parameters"]["ds"];
+            };
+            cookie?: never;
+        };
+        /** @description The changes. */
+        requestBody: {
+            content: {
+                "application/json": {
+                    /** @description The branch the form was opened on. A form opened on `main` saves where the dataset's `forms` setting says, which may be the caller's session branch. */
+                    branch?: string;
+                    changes: {
+                        add?: Record<string, never>[];
+                        /** @description The field's id, its path in SPARQL syntax. */
+                        field: string;
+                        remove?: Record<string, never>[];
+                    }[];
+                    /** @description The class of a new instance, whose IRI the server mints from the `forms` setting's `newIri`. The change also adds the instance's `rdf:type`. */
+                    class?: string;
+                    /** @description The values the form loaded, by field id, for every changed field. */
+                    expect?: {
+                        [key: string]: Record<string, never>[];
+                    };
+                    /** @description The IRI of the resource. Give either `focus` or `class`. */
+                    focus?: string;
+                    /** @description The commit message. */
+                    message?: string;
+                    /**
+                     * @description The shapes the form was built from, when not the setting's.
+                     * @enum {string}
+                     */
+                    shapes?: "guard" | "graphs" | "drafted";
+                };
+            };
+        };
+        responses: {
+            /** @description The commit receipt. */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": {
+                        branch: string;
+                        branchCreated: boolean;
+                        commit: Record<string, never>;
+                        committed: boolean;
+                        dataset?: string;
+                        datasetId?: string;
+                        /** @description The resource saved, which for a new instance is the IRI minted for it. */
+                        focus?: string;
+                        validation?: Record<string, never>;
+                    };
+                };
+            };
+            400: components["responses"]["BadRequest"];
+            401: components["responses"]["Unauthorized"];
+            403: components["responses"]["Forbidden"];
+            404: components["responses"]["NotFound"];
+            408: components["responses"]["Timeout"];
+            409: components["responses"]["Conflict"];
+            422: components["responses"]["Unprocessable"];
+            507: components["responses"]["InsufficientStorage"];
+            default: components["responses"]["Error"];
+        };
+    };
     convertGeometries: {
         parameters: {
             query?: never;
@@ -11667,6 +12420,66 @@ export interface operations {
             403: components["responses"]["Forbidden"];
             404: components["responses"]["NotFound"];
             409: components["responses"]["Conflict"];
+            default: components["responses"]["Error"];
+        };
+    };
+    getGraphFacets: {
+        parameters: {
+            query?: {
+                /** @description Seconds. Capped at the server's `--max-timeout`. */
+                timeout?: components["parameters"]["timeout"];
+                /** @description Include materialized inferences. The default is true when the dataset has any. False also turns RDFS on read off. */
+                reasoning?: components["parameters"]["reasoning"];
+            };
+            header?: never;
+            path: {
+                /** @description The dataset name. */
+                ds: components["parameters"]["ds"];
+            };
+            cookie?: never;
+        };
+        /** @description The set, its facets and the brushes. */
+        requestBody: {
+            content: {
+                "application/json": {
+                    /** @description A commit, time or named snapshot. */
+                    at?: string;
+                    /** @description Also list the properties of the set. */
+                    candidates?: boolean;
+                    facets?: Record<string, never>[];
+                    filters?: Record<string, never>[];
+                    /** @description `{"class": IRI}`, `{"nodes": [IRI, …]}` with up to 20,000 IRIs, or `{"query": SELECT, "variable": name}`. */
+                    within: Record<string, never>;
+                };
+            };
+        };
+        responses: {
+            /** @description The counts of each facet. */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": {
+                        candidates?: Record<string, never>[];
+                        commit: number;
+                        facets: Record<string, never>[];
+                        /** @description Entities of the set under every brush. */
+                        matching: number;
+                        /** @description Entities in the set. */
+                        size: number;
+                        /** @description The candidates come from a sample of the set or were cut to 40. */
+                        truncated: boolean;
+                    };
+                };
+            };
+            400: components["responses"]["BadRequest"];
+            401: components["responses"]["Unauthorized"];
+            403: components["responses"]["Forbidden"];
+            404: components["responses"]["NotFound"];
+            408: components["responses"]["Timeout"];
+            503: components["responses"]["Unavailable"];
+            507: components["responses"]["InsufficientStorage"];
             default: components["responses"]["Error"];
         };
     };
@@ -12081,6 +12894,39 @@ export interface operations {
             403: components["responses"]["Forbidden"];
             404: components["responses"]["NotFound"];
             409: components["responses"]["Conflict"];
+            default: components["responses"]["Error"];
+        };
+    };
+    listCommunityMemberships: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description The dataset name. */
+                ds: components["parameters"]["ds"];
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["GraphragMembershipsRequest"];
+            };
+        };
+        responses: {
+            /** @description The memberships. */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["GraphragMemberships"];
+                };
+            };
+            400: components["responses"]["BadRequest"];
+            401: components["responses"]["Unauthorized"];
+            403: components["responses"]["Forbidden"];
+            404: components["responses"]["NotFound"];
+            413: components["responses"]["PayloadTooLarge"];
             default: components["responses"]["Error"];
         };
     };
@@ -12581,6 +13427,193 @@ export interface operations {
             403: components["responses"]["Forbidden"];
             413: components["responses"]["PayloadTooLarge"];
             415: components["responses"]["UnsupportedMediaType"];
+            default: components["responses"]["Error"];
+        };
+    };
+    listStoredMappings: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description The dataset name. */
+                ds: components["parameters"]["ds"];
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description The mappings without their text. */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["StoredMappingList"];
+                };
+            };
+            401: components["responses"]["Unauthorized"];
+            403: components["responses"]["Forbidden"];
+            404: components["responses"]["NotFound"];
+            default: components["responses"]["Error"];
+        };
+    };
+    getStoredMapping: {
+        parameters: {
+            query?: {
+                /** @description An older version, while it is kept. */
+                version?: number;
+            };
+            header?: never;
+            path: {
+                /** @description The dataset name. */
+                ds: components["parameters"]["ds"];
+                /** @description The name of the stored query, snapshot, vector index, branch, ingest profile or model secret. */
+                name: components["parameters"]["name"];
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description The mapping. */
+            200: {
+                headers: {
+                    /** @description `"v<N>"` */
+                    ETag?: string;
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/csvm+json": string;
+                    "application/json": components["schemas"]["StoredMapping"];
+                    "application/sparql-query": string;
+                    "application/yaml": string;
+                    "text/turtle": string;
+                };
+            };
+            401: components["responses"]["Unauthorized"];
+            403: components["responses"]["Forbidden"];
+            404: components["responses"]["NotFound"];
+            default: components["responses"]["Error"];
+        };
+    };
+    putStoredMapping: {
+        parameters: {
+            query?: {
+                /** @description The kind, instead of the media type. */
+                kind?: "rml" | "yarrrml" | "csvw" | "template";
+                /** @description A description of at most 1024 bytes. */
+                description?: string;
+            };
+            header?: {
+                /** @description Entity tags. A write needs a tag that names the current head. */
+                "If-Match"?: components["parameters"]["ifMatch"];
+                /** @description Entity tags, or `*`. */
+                "If-None-Match"?: components["parameters"]["ifNoneMatch"];
+                /** @description The commit message of the write, at most 1024 bytes of UTF-8. RFC 8187 extended values are accepted. */
+                "Sparkles-Commit-Message"?: components["parameters"]["commitMessage"];
+            };
+            path: {
+                /** @description The dataset name. */
+                ds: components["parameters"]["ds"];
+                /** @description The name of the stored query, snapshot, vector index, branch, ingest profile or model secret. */
+                name: components["parameters"]["name"];
+            };
+            cookie?: never;
+        };
+        /** @description The mapping text. */
+        requestBody: {
+            content: {
+                "application/csvm+json": string;
+                "application/sparql-query": string;
+                "application/yaml": string;
+                "text/turtle": string;
+            };
+        };
+        responses: {
+            /** @description Stored as a new version, or unchanged (`changed: false`). */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["StoredMapping"];
+                };
+            };
+            /** @description Created. */
+            201: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["StoredMapping"];
+                };
+            };
+            400: components["responses"]["BadRequest"];
+            401: components["responses"]["Unauthorized"];
+            403: components["responses"]["Forbidden"];
+            404: components["responses"]["NotFound"];
+            409: components["responses"]["Conflict"];
+            412: components["responses"]["PreconditionFailed"];
+            415: components["responses"]["UnsupportedMediaType"];
+            default: components["responses"]["Error"];
+        };
+    };
+    deleteStoredMapping: {
+        parameters: {
+            query?: never;
+            header?: {
+                /** @description Entity tags. A write needs a tag that names the current head. */
+                "If-Match"?: components["parameters"]["ifMatch"];
+            };
+            path: {
+                /** @description The dataset name. */
+                ds: components["parameters"]["ds"];
+                /** @description The name of the stored query, snapshot, vector index, branch, ingest profile or model secret. */
+                name: components["parameters"]["name"];
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Deleted with its versions. */
+            204: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            401: components["responses"]["Unauthorized"];
+            403: components["responses"]["Forbidden"];
+            404: components["responses"]["NotFound"];
+            412: components["responses"]["PreconditionFailed"];
+            default: components["responses"]["Error"];
+        };
+    };
+    listStoredMappingVersions: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description The dataset name. */
+                ds: components["parameters"]["ds"];
+                /** @description The name of the stored query, snapshot, vector index, branch, ingest profile or model secret. */
+                name: components["parameters"]["name"];
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description The kept versions, newest first. */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["StoredMappingVersions"];
+                };
+            };
+            401: components["responses"]["Unauthorized"];
+            403: components["responses"]["Forbidden"];
+            404: components["responses"]["NotFound"];
             default: components["responses"]["Error"];
         };
     };
@@ -14982,7 +16015,7 @@ export interface operations {
             query?: never;
             header?: never;
             path: {
-                /** @description The settings kind: `assistant`, `memory`, `ingest` or `graphrag` of a dataset, or `models` or `notifications` of the server. */
+                /** @description The settings kind: `assistant`, `memory`, `ingest`, `graphrag` or `forms` of a dataset, or `models` or `notifications` of the server. */
                 kind: components["parameters"]["kind"];
             };
             cookie?: never;
@@ -15012,7 +16045,7 @@ export interface operations {
                 "If-Match"?: string;
             };
             path: {
-                /** @description The settings kind: `assistant`, `memory`, `ingest` or `graphrag` of a dataset, or `models` or `notifications` of the server. */
+                /** @description The settings kind: `assistant`, `memory`, `ingest`, `graphrag` or `forms` of a dataset, or `models` or `notifications` of the server. */
                 kind: components["parameters"]["kind"];
             };
             cookie?: never;
@@ -15053,7 +16086,7 @@ export interface operations {
                 "If-Match"?: string;
             };
             path: {
-                /** @description The settings kind: `assistant`, `memory`, `ingest` or `graphrag` of a dataset, or `models` or `notifications` of the server. */
+                /** @description The settings kind: `assistant`, `memory`, `ingest`, `graphrag` or `forms` of a dataset, or `models` or `notifications` of the server. */
                 kind: components["parameters"]["kind"];
             };
             cookie?: never;
@@ -15086,7 +16119,7 @@ export interface operations {
                 "If-Match"?: string;
             };
             path: {
-                /** @description The settings kind: `assistant`, `memory`, `ingest` or `graphrag` of a dataset, or `models` or `notifications` of the server. */
+                /** @description The settings kind: `assistant`, `memory`, `ingest`, `graphrag` or `forms` of a dataset, or `models` or `notifications` of the server. */
                 kind: components["parameters"]["kind"];
             };
             cookie?: never;
@@ -15173,7 +16206,7 @@ export interface operations {
             path: {
                 /** @description The dataset name. */
                 ds: components["parameters"]["ds"];
-                /** @description The settings kind: `assistant`, `memory`, `ingest` or `graphrag` of a dataset, or `models` or `notifications` of the server. */
+                /** @description The settings kind: `assistant`, `memory`, `ingest`, `graphrag` or `forms` of a dataset, or `models` or `notifications` of the server. */
                 kind: components["parameters"]["kind"];
             };
             cookie?: never;
@@ -15205,7 +16238,7 @@ export interface operations {
             path: {
                 /** @description The dataset name. */
                 ds: components["parameters"]["ds"];
-                /** @description The settings kind: `assistant`, `memory`, `ingest` or `graphrag` of a dataset, or `models` or `notifications` of the server. */
+                /** @description The settings kind: `assistant`, `memory`, `ingest`, `graphrag` or `forms` of a dataset, or `models` or `notifications` of the server. */
                 kind: components["parameters"]["kind"];
             };
             cookie?: never;
@@ -15248,7 +16281,7 @@ export interface operations {
             path: {
                 /** @description The dataset name. */
                 ds: components["parameters"]["ds"];
-                /** @description The settings kind: `assistant`, `memory`, `ingest` or `graphrag` of a dataset, or `models` or `notifications` of the server. */
+                /** @description The settings kind: `assistant`, `memory`, `ingest`, `graphrag` or `forms` of a dataset, or `models` or `notifications` of the server. */
                 kind: components["parameters"]["kind"];
             };
             cookie?: never;
@@ -15283,7 +16316,7 @@ export interface operations {
             path: {
                 /** @description The dataset name. */
                 ds: components["parameters"]["ds"];
-                /** @description The settings kind: `assistant`, `memory`, `ingest` or `graphrag` of a dataset, or `models` or `notifications` of the server. */
+                /** @description The settings kind: `assistant`, `memory`, `ingest`, `graphrag` or `forms` of a dataset, or `models` or `notifications` of the server. */
                 kind: components["parameters"]["kind"];
             };
             cookie?: never;
@@ -16250,6 +17283,136 @@ export interface operations {
             default: components["responses"]["Error"];
         };
     };
+    getVectorProjection: {
+        parameters: {
+            query?: {
+                /** @description The projection's method. The most recent of any method when absent. */
+                method?: "pca" | "neighbours";
+                /** @description `minX,minY,maxX,maxY`. */
+                bbox?: string;
+                /** @description The most points to return. */
+                limit?: number;
+                /** @description A predicate IRI whose values colour the points. */
+                colour?: string;
+            };
+            header?: never;
+            path: {
+                /** @description The dataset name. */
+                ds: components["parameters"]["ds"];
+                /** @description The name of the stored query, snapshot, vector index, branch, ingest profile or model secret. */
+                name: components["parameters"]["name"];
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description The projection and its points. */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": {
+                        /** @description `[minX, minY, maxX, maxY]`. */
+                        bounds: number[];
+                        builtMs?: number;
+                        bytes?: number;
+                        classes: Record<string, never>[];
+                        /** @description `{predicate, values}`, where `values` holds `{value, count}` with a term in the SPARQL JSON results form. */
+                        colour?: Record<string, never>;
+                        commit: number;
+                        /** @description `{size, bbox, max, counts}`, where `counts` is base64 of little-endian `Uint32` cell counts, row by row from the minimum y. */
+                        density: Record<string, never>;
+                        dimension?: number;
+                        /** @description Points in the whole projection. */
+                        entities: number;
+                        /** @description The share of the sample's variance on each component. */
+                        explained?: number[];
+                        generation?: string;
+                        index: string;
+                        method: string;
+                        points: Record<string, never>[];
+                        /** @description `{bbox, total, shown, sampled}`: the points inside the region and how many are returned. */
+                        region: Record<string, never>;
+                        /** @description The head has moved since the projection was computed. */
+                        stale: boolean;
+                        vectors?: number;
+                    };
+                    "application/x-sparkles-points": string;
+                };
+            };
+            400: components["responses"]["BadRequest"];
+            401: components["responses"]["Unauthorized"];
+            403: components["responses"]["Forbidden"];
+            404: components["responses"]["NotFound"];
+            default: components["responses"]["Error"];
+        };
+    };
+    computeVectorProjection: {
+        parameters: {
+            query?: {
+                /** @description How the vectors are placed. */
+                method?: "pca" | "neighbours";
+                /** @description Seconds. Capped at the server's `--max-timeout`. */
+                timeout?: components["parameters"]["timeout"];
+            };
+            header?: never;
+            path: {
+                /** @description The dataset name. */
+                ds: components["parameters"]["ds"];
+                /** @description The name of the stored query, snapshot, vector index, branch, ingest profile or model secret. */
+                name: components["parameters"]["name"];
+            };
+            cookie?: never;
+        };
+        /** @description The sample, seed and layout steps. */
+        requestBody?: {
+            content: {
+                "application/json": {
+                    /** @description Steps of the neighbour layout. */
+                    iterations?: number;
+                    /** @description Vectors the PCA learns from. */
+                    sample?: number;
+                    /** @description The seed of the first directions, the sampling priorities and the layout. */
+                    seed?: number;
+                };
+            };
+        };
+        responses: {
+            /** @description The projection, without its points. */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": {
+                        bounds: number[];
+                        builtMs?: number;
+                        bytes?: number;
+                        commit: number;
+                        dimension?: number;
+                        entities: number;
+                        explained?: number[];
+                        generation?: string;
+                        index: string;
+                        /** @enum {string} */
+                        method: "pca" | "neighbours";
+                        stale: boolean;
+                        vectors?: number;
+                    };
+                };
+            };
+            202: components["responses"]["TaskStarted"];
+            400: components["responses"]["BadRequest"];
+            401: components["responses"]["Unauthorized"];
+            403: components["responses"]["Forbidden"];
+            404: components["responses"]["NotFound"];
+            408: components["responses"]["Timeout"];
+            503: components["responses"]["Unavailable"];
+            507: components["responses"]["InsufficientStorage"];
+            default: components["responses"]["Error"];
+        };
+    };
     rebuildVectorIndex: {
         parameters: {
             query?: never;
@@ -16338,6 +17501,161 @@ export interface operations {
             default: components["responses"]["Error"];
         };
     };
+    listViews: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description The dataset name. */
+                ds: components["parameters"]["ds"];
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description The views without their plans. */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ViewList"];
+                };
+            };
+            401: components["responses"]["Unauthorized"];
+            403: components["responses"]["Forbidden"];
+            404: components["responses"]["NotFound"];
+            default: components["responses"]["Error"];
+        };
+    };
+    getView: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description The dataset name. */
+                ds: components["parameters"]["ds"];
+                /** @description The name of the stored query, snapshot, vector index, branch, ingest profile or model secret. */
+                name: components["parameters"]["name"];
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description The view with its state and its plan, each operator marked `incremental` or `recompute`. */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["View"];
+                };
+            };
+            401: components["responses"]["Unauthorized"];
+            403: components["responses"]["Forbidden"];
+            404: components["responses"]["NotFound"];
+            default: components["responses"]["Error"];
+        };
+    };
+    putView: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description The dataset name. */
+                ds: components["parameters"]["ds"];
+                /** @description The name of the stored query, snapshot, vector index, branch, ingest profile or model secret. */
+                name: components["parameters"]["name"];
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["ViewDefinition"];
+            };
+        };
+        responses: {
+            /** @description Replaced. */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["View"];
+                };
+            };
+            /** @description Created. */
+            201: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["View"];
+                };
+            };
+            400: components["responses"]["BadRequest"];
+            401: components["responses"]["Unauthorized"];
+            403: components["responses"]["Forbidden"];
+            404: components["responses"]["NotFound"];
+            default: components["responses"]["Error"];
+        };
+    };
+    deleteView: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description The dataset name. */
+                ds: components["parameters"]["ds"];
+                /** @description The name of the stored query, snapshot, vector index, branch, ingest profile or model secret. */
+                name: components["parameters"]["name"];
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Deleted. */
+            204: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            401: components["responses"]["Unauthorized"];
+            403: components["responses"]["Forbidden"];
+            404: components["responses"]["NotFound"];
+            default: components["responses"]["Error"];
+        };
+    };
+    rebuildView: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description The dataset name. */
+                ds: components["parameters"]["ds"];
+                /** @description The name of the stored query, snapshot, vector index, branch, ingest profile or model secret. */
+                name: components["parameters"]["name"];
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description The rebuild's task. */
+            202: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ViewTask"];
+                };
+            };
+            401: components["responses"]["Unauthorized"];
+            403: components["responses"]["Forbidden"];
+            404: components["responses"]["NotFound"];
+            default: components["responses"]["Error"];
+        };
+    };
     whoami: {
         parameters: {
             query?: never;
@@ -16372,8 +17690,12 @@ export interface operations {
                 format?: components["parameters"]["format"];
                 /** @description Seconds. Capped at the server's `--max-timeout`. */
                 timeout?: components["parameters"]["timeout"];
-                /** @description Include materialized inferences. The default is true when the dataset has any. False also turns RDFS on read off. */
-                reasoning?: components["parameters"]["reasoning"];
+                /** @description `true` or `materialized` reads materialized inferences, the default when the dataset has any. `demand` derives the facts the query needs from the dataset's rules as it runs, without the inferred graph (spec F17). `false` reads the asserted data alone and also turns RDFS on read off. */
+                reasoning?: components["parameters"]["queryReasoning"];
+                /** @description The rules of `reasoning=demand`. The default is the profile of the last materialization. */
+                reasoningProfile?: components["parameters"]["reasoningProfile"];
+                /** @description The most facts `reasoning=demand` may derive for the query, magic facts aside. It never exceeds the server's `--reason-max-derived`. */
+                maxDerived?: components["parameters"]["maxDerived"];
                 /** @description The state to read: `head`, `42`, `commit:42`, `time:<RFC 3339>` or `snapshot:NAME`. */
                 at?: components["parameters"]["at"];
                 /** @description The branch to work on (default `main`). The path form `/{ds}@{branch}/…` chooses one too; the two must agree. */
@@ -16533,8 +17855,12 @@ export interface operations {
                 "named-graph-uri"?: components["parameters"]["namedGraphUri"];
                 /** @description The response format, in place of `Accept`. Fuseki's `output` and `results` are the same parameter. */
                 format?: components["parameters"]["format"];
-                /** @description Include materialized inferences. The default is true when the dataset has any. False also turns RDFS on read off. */
-                reasoning?: components["parameters"]["reasoning"];
+                /** @description `true` or `materialized` reads materialized inferences, the default when the dataset has any. `demand` derives the facts the query needs from the dataset's rules as it runs, without the inferred graph (spec F17). `false` reads the asserted data alone and also turns RDFS on read off. */
+                reasoning?: components["parameters"]["queryReasoning"];
+                /** @description The rules of `reasoning=demand`. The default is the profile of the last materialization. */
+                reasoningProfile?: components["parameters"]["reasoningProfile"];
+                /** @description The most facts `reasoning=demand` may derive for the query, magic facts aside. It never exceeds the server's `--reason-max-derived`. */
+                maxDerived?: components["parameters"]["maxDerived"];
                 /** @description The state to read: `head`, `42`, `commit:42`, `time:<RFC 3339>` or `snapshot:NAME`. */
                 at?: components["parameters"]["at"];
                 /** @description The most rows serialized. Eager native metadata reports the full total; streaming stops production at the prefix and reports a null total unless exhausted. */
@@ -16945,6 +18271,20 @@ export interface operations {
     gspPut: {
         parameters: {
             query?: {
+                /** @description A CSV or TSV body: the stored mapping that maps it. */
+                mapping?: string;
+                /** @description A CSV or TSV body: the default mapping's namespace. */
+                base?: string;
+                /** @description A CSV or TSV body: the column that names each row in the default mapping. */
+                key?: string;
+                /** @description A CSV or TSV body: the file name the mapping reads it as, when the mapping reads several. */
+                source?: string;
+                /** @description A CSVW mapping: standard mode adds the table group, table and row descriptions. */
+                csvwMode?: "minimal" | "standard";
+                /** @description A CSVW mapping: check primary and foreign keys (the default in standard mode). */
+                csvwCheck?: "keys" | "none";
+                /** @description A CONSTRUCT template: read the dataset's head while mapping. */
+                lookup?: boolean;
                 /** @description The graph IRI. `default` and `union` name the default graph and the union of the named graphs. */
                 graph?: components["parameters"]["gspGraph"];
                 /** @description Name the default graph (`?default`, no value needed). */
@@ -17007,6 +18347,20 @@ export interface operations {
     gspPost: {
         parameters: {
             query?: {
+                /** @description A CSV or TSV body: the stored mapping that maps it. */
+                mapping?: string;
+                /** @description A CSV or TSV body: the default mapping's namespace. */
+                base?: string;
+                /** @description A CSV or TSV body: the column that names each row in the default mapping. */
+                key?: string;
+                /** @description A CSV or TSV body: the file name the mapping reads it as, when the mapping reads several. */
+                source?: string;
+                /** @description A CSVW mapping: standard mode adds the table group, table and row descriptions. */
+                csvwMode?: "minimal" | "standard";
+                /** @description A CSVW mapping: check primary and foreign keys (the default in standard mode). */
+                csvwCheck?: "keys" | "none";
+                /** @description A CONSTRUCT template: read the dataset's head while mapping. */
+                lookup?: boolean;
                 /** @description The graph IRI. `default` and `union` name the default graph and the union of the named graphs. */
                 graph?: components["parameters"]["gspGraph"];
                 /** @description Name the default graph (`?default`, no value needed). */
@@ -17069,6 +18423,20 @@ export interface operations {
     gspDelete: {
         parameters: {
             query?: {
+                /** @description A CSV or TSV body: the stored mapping that maps it. */
+                mapping?: string;
+                /** @description A CSV or TSV body: the default mapping's namespace. */
+                base?: string;
+                /** @description A CSV or TSV body: the column that names each row in the default mapping. */
+                key?: string;
+                /** @description A CSV or TSV body: the file name the mapping reads it as, when the mapping reads several. */
+                source?: string;
+                /** @description A CSVW mapping: standard mode adds the table group, table and row descriptions. */
+                csvwMode?: "minimal" | "standard";
+                /** @description A CSVW mapping: check primary and foreign keys (the default in standard mode). */
+                csvwCheck?: "keys" | "none";
+                /** @description A CONSTRUCT template: read the dataset's head while mapping. */
+                lookup?: boolean;
                 /** @description The graph IRI. `default` and `union` name the default graph and the union of the named graphs. */
                 graph?: components["parameters"]["gspGraph"];
                 /** @description Name the default graph (`?default`, no value needed). */
@@ -17104,7 +18472,13 @@ export interface operations {
             };
             cookie?: never;
         };
-        requestBody?: never;
+        /** @description A table whose mapped triples are removed. */
+        requestBody?: {
+            content: {
+                "text/csv": string;
+                "text/tab-separated-values": string;
+            };
+        };
         responses: {
             200: components["responses"]["WriteDone"];
             /** @description The graph was deleted. */
@@ -17796,6 +19170,127 @@ export interface operations {
             default: components["responses"]["Error"];
         };
     };
+    liveQuery: {
+        parameters: {
+            query?: {
+                /** @description The query. */
+                query?: string;
+                /** @description Resume after this commit (`commit:N`): the first event is the change since it, or a `reset`. */
+                after?: string;
+                /** @description Merge the diffs of commits that arrive within this many milliseconds. */
+                coalesceMs?: number;
+            };
+            header?: {
+                /** @description Resume after this commit. */
+                "Last-Event-ID"?: string;
+            };
+            path: {
+                /** @description The dataset name. */
+                ds: components["parameters"]["ds"];
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description The events. */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "text/event-stream": string;
+                };
+            };
+            400: components["responses"]["BadRequest"];
+            401: components["responses"]["Unauthorized"];
+            403: components["responses"]["Forbidden"];
+            404: components["responses"]["NotFound"];
+            429: components["responses"]["TooManyRequests"];
+            default: components["responses"]["Error"];
+        };
+    };
+    runStoredMapping: {
+        parameters: {
+            query?: {
+                /** @description Add the triples (the default), or replace the graphs the mapping writes. */
+                mode?: "add" | "replace";
+                /** @description Run an older version. */
+                version?: number;
+                /** @description Write every triple into this graph. A mapping whose graph maps name another graph is `400` with code `mapping-graph-conflict`. */
+                graph?: string;
+                /** @description The base IRI of generated relative IRIs. */
+                base?: string;
+                /** @description A CONSTRUCT template: read the dataset's head while mapping. */
+                lookup?: boolean;
+                /** @description A CSVW mapping: standard mode. */
+                csvwMode?: "minimal" | "standard";
+                /** @description A CSVW mapping: check primary and foreign keys. */
+                csvwCheck?: "keys" | "none";
+                /** @description The branch to work on (default `main`). The path form `/{ds}@{branch}/…` chooses one too; the two must agree. */
+                branch?: components["parameters"]["branch"];
+                /** @description Seconds. Capped at the server's `--max-timeout`. */
+                timeout?: components["parameters"]["timeout"];
+                /** @description Run the write as a preview and roll it back. `dryRun` with no value means true. */
+                dryRun?: components["parameters"]["dryRun"];
+                /** @description With `dryRun`: list up to this many changed quads. */
+                changes?: components["parameters"]["changes"];
+                /** @description Add a commit receipt to the body. */
+                receipt?: components["parameters"]["receipt"];
+                /** @description `false` skips write-time validation when the server allows it (`--allow-unvalidated-writes`). */
+                validate?: components["parameters"]["validate"];
+                /** @description The most validation results reported when a write is rejected. */
+                validationLimit?: number;
+            };
+            header?: {
+                /** @description Entity tags. A write needs a tag that names the current head. */
+                "If-Match"?: components["parameters"]["ifMatch"];
+                /** @description The commit message of the write, at most 1024 bytes of UTF-8. RFC 8187 extended values are accepted. */
+                "Sparkles-Commit-Message"?: components["parameters"]["commitMessage"];
+                /** @description `true` runs the write as a preview. */
+                "Sparkles-Dry-Run"?: components["parameters"]["dryRunHeader"];
+            };
+            path: {
+                /** @description The dataset name. */
+                ds: components["parameters"]["ds"];
+                /** @description The name of the stored query, snapshot, vector index, branch, ingest profile or model secret. */
+                name: components["parameters"]["name"];
+            };
+            cookie?: never;
+        };
+        /** @description The files the mapping reads, each a part whose file name is the one the mapping names. */
+        requestBody?: {
+            content: {
+                "multipart/form-data": {
+                    file?: string[];
+                } & {
+                    [key: string]: unknown;
+                };
+            };
+        };
+        responses: {
+            /** @description The run's counts, with the commit receipt when asked for. */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["MappingRun"];
+                };
+            };
+            400: components["responses"]["BadRequest"];
+            401: components["responses"]["Unauthorized"];
+            403: components["responses"]["Forbidden"];
+            404: components["responses"]["NotFound"];
+            408: components["responses"]["Timeout"];
+            412: components["responses"]["PreconditionFailed"];
+            413: components["responses"]["PayloadTooLarge"];
+            415: components["responses"]["UnsupportedMediaType"];
+            422: components["responses"]["Unprocessable"];
+            503: components["responses"]["Unavailable"];
+            507: components["responses"]["InsufficientStorage"];
+            default: components["responses"]["Error"];
+        };
+    };
     memoryBrief: {
         parameters: {
             query?: never;
@@ -18266,8 +19761,12 @@ export interface operations {
                 format?: components["parameters"]["format"];
                 /** @description Seconds. Capped at the server's `--max-timeout`. */
                 timeout?: components["parameters"]["timeout"];
-                /** @description Include materialized inferences. The default is true when the dataset has any. False also turns RDFS on read off. */
-                reasoning?: components["parameters"]["reasoning"];
+                /** @description `true` or `materialized` reads materialized inferences, the default when the dataset has any. `demand` derives the facts the query needs from the dataset's rules as it runs, without the inferred graph (spec F17). `false` reads the asserted data alone and also turns RDFS on read off. */
+                reasoning?: components["parameters"]["queryReasoning"];
+                /** @description The rules of `reasoning=demand`. The default is the profile of the last materialization. */
+                reasoningProfile?: components["parameters"]["reasoningProfile"];
+                /** @description The most facts `reasoning=demand` may derive for the query, magic facts aside. It never exceeds the server's `--reason-max-derived`. */
+                maxDerived?: components["parameters"]["maxDerived"];
                 /** @description The state to read: `head`, `42`, `commit:42`, `time:<RFC 3339>` or `snapshot:NAME`. */
                 at?: components["parameters"]["at"];
                 /** @description The branch to work on (default `main`). The path form `/{ds}@{branch}/…` chooses one too; the two must agree. */
@@ -18337,8 +19836,12 @@ export interface operations {
                 format?: components["parameters"]["format"];
                 /** @description Seconds. Capped at the server's `--max-timeout`. */
                 timeout?: components["parameters"]["timeout"];
-                /** @description Include materialized inferences. The default is true when the dataset has any. False also turns RDFS on read off. */
-                reasoning?: components["parameters"]["reasoning"];
+                /** @description `true` or `materialized` reads materialized inferences, the default when the dataset has any. `demand` derives the facts the query needs from the dataset's rules as it runs, without the inferred graph (spec F17). `false` reads the asserted data alone and also turns RDFS on read off. */
+                reasoning?: components["parameters"]["queryReasoning"];
+                /** @description The rules of `reasoning=demand`. The default is the profile of the last materialization. */
+                reasoningProfile?: components["parameters"]["reasoningProfile"];
+                /** @description The most facts `reasoning=demand` may derive for the query, magic facts aside. It never exceeds the server's `--reason-max-derived`. */
+                maxDerived?: components["parameters"]["maxDerived"];
                 /** @description The state to read: `head`, `42`, `commit:42`, `time:<RFC 3339>` or `snapshot:NAME`. */
                 at?: components["parameters"]["at"];
                 /** @description The branch to work on (default `main`). The path form `/{ds}@{branch}/…` chooses one too; the two must agree. */
@@ -18645,8 +20148,12 @@ export interface operations {
                 format?: components["parameters"]["format"];
                 /** @description Seconds. Capped at the server's `--max-timeout`. */
                 timeout?: components["parameters"]["timeout"];
-                /** @description Include materialized inferences. The default is true when the dataset has any. False also turns RDFS on read off. */
-                reasoning?: components["parameters"]["reasoning"];
+                /** @description `true` or `materialized` reads materialized inferences, the default when the dataset has any. `demand` derives the facts the query needs from the dataset's rules as it runs, without the inferred graph (spec F17). `false` reads the asserted data alone and also turns RDFS on read off. */
+                reasoning?: components["parameters"]["queryReasoning"];
+                /** @description The rules of `reasoning=demand`. The default is the profile of the last materialization. */
+                reasoningProfile?: components["parameters"]["reasoningProfile"];
+                /** @description The most facts `reasoning=demand` may derive for the query, magic facts aside. It never exceeds the server's `--reason-max-derived`. */
+                maxDerived?: components["parameters"]["maxDerived"];
                 /** @description The state to read: `head`, `42`, `commit:42`, `time:<RFC 3339>` or `snapshot:NAME`. */
                 at?: components["parameters"]["at"];
                 /** @description The branch to work on (default `main`). The path form `/{ds}@{branch}/…` chooses one too; the two must agree. */
@@ -18716,8 +20223,12 @@ export interface operations {
                 format?: components["parameters"]["format"];
                 /** @description Seconds. Capped at the server's `--max-timeout`. */
                 timeout?: components["parameters"]["timeout"];
-                /** @description Include materialized inferences. The default is true when the dataset has any. False also turns RDFS on read off. */
-                reasoning?: components["parameters"]["reasoning"];
+                /** @description `true` or `materialized` reads materialized inferences, the default when the dataset has any. `demand` derives the facts the query needs from the dataset's rules as it runs, without the inferred graph (spec F17). `false` reads the asserted data alone and also turns RDFS on read off. */
+                reasoning?: components["parameters"]["queryReasoning"];
+                /** @description The rules of `reasoning=demand`. The default is the profile of the last materialization. */
+                reasoningProfile?: components["parameters"]["reasoningProfile"];
+                /** @description The most facts `reasoning=demand` may derive for the query, magic facts aside. It never exceeds the server's `--reason-max-derived`. */
+                maxDerived?: components["parameters"]["maxDerived"];
                 /** @description The state to read: `head`, `42`, `commit:42`, `time:<RFC 3339>` or `snapshot:NAME`. */
                 at?: components["parameters"]["at"];
                 /** @description The branch to work on (default `main`). The path form `/{ds}@{branch}/…` chooses one too; the two must agree. */
@@ -19083,6 +20594,18 @@ export interface operations {
                 base?: string;
                 /** @description The column that names each row in the default mapping. */
                 key?: string;
+                /** @description A stored mapping to use instead of a `mapping` part. */
+                mapping?: string;
+                /** @description The stored mapping's version (the latest by default). */
+                mappingVersion?: number;
+                /** @description The kind of the `mapping` part when its content does not tell. */
+                mappingKind?: "rml" | "yarrrml" | "csvw" | "template";
+                /** @description A CSVW mapping: standard mode adds the table group, table and row descriptions. */
+                csvwMode?: "minimal" | "standard";
+                /** @description A CSVW mapping: check primary and foreign keys (the default in standard mode). */
+                csvwCheck?: "keys" | "none";
+                /** @description A CONSTRUCT template: read the dataset's head while mapping. The report gives `lookupCommit`, and `If-Match` makes the commit fail when the head moved. */
+                lookup?: boolean;
                 /** @description The branch to work on (default `main`). The path form `/{ds}@{branch}/…` chooses one too; the two must agree. */
                 branch?: components["parameters"]["branch"];
                 /** @description Seconds. Capped at the server's `--max-timeout`. */
@@ -19099,6 +20622,8 @@ export interface operations {
                 validationLimit?: number;
             };
             header?: {
+                /** @description Entity tags. A write needs a tag that names the current head. */
+                "If-Match"?: components["parameters"]["ifMatch"];
                 /** @description The commit message of the write, at most 1024 bytes of UTF-8. RFC 8187 extended values are accepted. */
                 "Sparkles-Commit-Message"?: components["parameters"]["commitMessage"];
                 /** @description `true` runs the write as a preview. */
@@ -19116,7 +20641,7 @@ export interface operations {
                 "multipart/form-data": {
                     file?: string[];
                     graph?: string;
-                    /** @description A CSVW metadata document. */
+                    /** @description CSVW metadata, an R2RML, RML or YARRRML mapping, or a CONSTRUCT template. The file parts its sources name are read by it. */
                     mapping?: string;
                     /** @description A SPARQL CONSTRUCT template for tables. */
                     template?: string;
@@ -19192,6 +20717,20 @@ export interface operations {
     directGraphPut: {
         parameters: {
             query?: {
+                /** @description A CSV or TSV body: the stored mapping that maps it. */
+                mapping?: string;
+                /** @description A CSV or TSV body: the default mapping's namespace. */
+                base?: string;
+                /** @description A CSV or TSV body: the column that names each row in the default mapping. */
+                key?: string;
+                /** @description A CSV or TSV body: the file name the mapping reads it as, when the mapping reads several. */
+                source?: string;
+                /** @description A CSVW mapping: standard mode adds the table group, table and row descriptions. */
+                csvwMode?: "minimal" | "standard";
+                /** @description A CSVW mapping: check primary and foreign keys (the default in standard mode). */
+                csvwCheck?: "keys" | "none";
+                /** @description A CONSTRUCT template: read the dataset's head while mapping. */
+                lookup?: boolean;
                 /** @description The branch to work on (default `main`). The path form `/{ds}@{branch}/…` chooses one too; the two must agree. */
                 branch?: components["parameters"]["branch"];
                 /** @description Seconds. Capped at the server's `--max-timeout`. */
@@ -19252,6 +20791,20 @@ export interface operations {
     directGraphPost: {
         parameters: {
             query?: {
+                /** @description A CSV or TSV body: the stored mapping that maps it. */
+                mapping?: string;
+                /** @description A CSV or TSV body: the default mapping's namespace. */
+                base?: string;
+                /** @description A CSV or TSV body: the column that names each row in the default mapping. */
+                key?: string;
+                /** @description A CSV or TSV body: the file name the mapping reads it as, when the mapping reads several. */
+                source?: string;
+                /** @description A CSVW mapping: standard mode adds the table group, table and row descriptions. */
+                csvwMode?: "minimal" | "standard";
+                /** @description A CSVW mapping: check primary and foreign keys (the default in standard mode). */
+                csvwCheck?: "keys" | "none";
+                /** @description A CONSTRUCT template: read the dataset's head while mapping. */
+                lookup?: boolean;
                 /** @description The branch to work on (default `main`). The path form `/{ds}@{branch}/…` chooses one too; the two must agree. */
                 branch?: components["parameters"]["branch"];
                 /** @description Seconds. Capped at the server's `--max-timeout`. */
@@ -19312,6 +20865,20 @@ export interface operations {
     directGraphDelete: {
         parameters: {
             query?: {
+                /** @description A CSV or TSV body: the stored mapping that maps it. */
+                mapping?: string;
+                /** @description A CSV or TSV body: the default mapping's namespace. */
+                base?: string;
+                /** @description A CSV or TSV body: the column that names each row in the default mapping. */
+                key?: string;
+                /** @description A CSV or TSV body: the file name the mapping reads it as, when the mapping reads several. */
+                source?: string;
+                /** @description A CSVW mapping: standard mode adds the table group, table and row descriptions. */
+                csvwMode?: "minimal" | "standard";
+                /** @description A CSVW mapping: check primary and foreign keys (the default in standard mode). */
+                csvwCheck?: "keys" | "none";
+                /** @description A CONSTRUCT template: read the dataset's head while mapping. */
+                lookup?: boolean;
                 /** @description The branch to work on (default `main`). The path form `/{ds}@{branch}/…` chooses one too; the two must agree. */
                 branch?: components["parameters"]["branch"];
                 /** @description Seconds. Capped at the server's `--max-timeout`. */
@@ -19345,7 +20912,13 @@ export interface operations {
             };
             cookie?: never;
         };
-        requestBody?: never;
+        /** @description A table whose mapped triples are removed. */
+        requestBody?: {
+            content: {
+                "text/csv": string;
+                "text/tab-separated-values": string;
+            };
+        };
         responses: {
             200: components["responses"]["WriteDone"];
             /** @description The graph was deleted. */

@@ -1471,7 +1471,7 @@ fn settings(put: &mut dyn FnMut(&str, J)) {
                 ],
                 json!({
                     "dataset": string(),
-                    "kind": string_enum(&["assistant", "memory", "ingest", "prefixes", "graphrag", "paths"]),
+                    "kind": string_enum(&["assistant", "memory", "ingest", "prefixes", "graphrag", "paths", "forms"]),
                     "effective": any_object("The effective object: the built-in defaults, the declared values and the runtime layer merged, with the locked fields from the settings file."),
                     "declared": any_object("The settings file's `defaults` and dataset entry for this kind, merged."),
                     "runtime": any_object("The runtime layer: the fields changed through the API. `null` removes a declared member."),
@@ -1814,6 +1814,46 @@ fn graphrag(put: &mut dyn FnMut(&str, J)) {
                 }),
             ),
             "The communities of the reports graph, by level and then by rating.",
+            "graphrag",
+        ),
+    );
+    put(
+        "GraphragMembershipsRequest",
+        doc(
+            closed(
+                &["nodes"],
+                json!({
+                    "nodes": { "type": "array", "items": string(), "maxItems": 20000 },
+                    "level": int(),
+                }),
+            ),
+            "The nodes whose communities to read, at one level or at every level.",
+            "graphrag",
+        ),
+    );
+    put(
+        "GraphragMemberships",
+        doc(
+            obj(
+                &["available", "memberships", "communities"],
+                json!({
+                    "available": boolean(),
+                    "reason": string(),
+                    "reportsGraph": string(),
+                    "memberships": array(obj(&["node", "community"], json!({
+                        "node": string(),
+                        "community": string(),
+                        "level": int(),
+                    }))),
+                    "communities": array(obj(&["iri"], json!({
+                        "iri": string(),
+                        "level": int(),
+                        "memberCount": int(),
+                        "title": or_null(string()),
+                    }))),
+                }),
+            ),
+            "The communities that hold the listed nodes, with each community's member count and report title.",
             "graphrag",
         ),
     );

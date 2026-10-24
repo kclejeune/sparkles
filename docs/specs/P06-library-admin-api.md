@@ -196,6 +196,7 @@ after this spec, or `server-only` with the reason in §6.
 | `getClassProfiles` | `sparkles::schema::profile::profiles` | No | `ds.schema().profiles` |
 | `draftShapes` | `sparkles::schema::draft::draft_shapes` | No | `ds.schema().draft_shapes` |
 | `getGraphGroups` | `sparkles::overview::groups_at`, from [U06](U06-large-graph-rendering.md) | No | `ds.graph().groups`, bound as `Dataset.graph.groups` and `DatasetGraphSparkles.graph().groups` |
+| `getGraphFacets` | `sparkles::overview::facets_at`, from [U11](U11-linked-views.md) | No | `ds.graph().facets`, bound as `Dataset.graph.facets` in Python. The Node.js and JVM bindings are planned. |
 
 ### 2.6 Stored queries and GraphQL
 
@@ -219,6 +220,7 @@ after this spec, or `server-only` with the reason in §6.
 | `getWriteValidation`, `setWriteValidation`, `deleteWriteValidation` | Partial. The guards are in `sparkles-shacl` and `sparkles-shex`. Installing them and their status are in the server, and the Python binding has its own copy. | `write_validation`, `set_write_validation` | `ds.validation().guard()` |
 | `shacl` | `sparkles_shacl::validate` | `validate_shacl` | `ds.validation().shacl` |
 | `shex` | `sparkles_shex::validate` | `validate_shex` | `ds.validation().shex` |
+| `getForm`, `checkForm`, `saveForm` | `sparkles::forms`, from [U02](U02-shape-driven-forms.md) | No | `ds.forms()` with `model`, `check` and `save`. The Python, Node.js and JVM bindings are planned. |
 
 ### 2.8 Backups
 
@@ -1714,6 +1716,14 @@ the fix of the library's query defaults that came with it.
 recovering unfinished work. `inspect` reads the registry without store locks. Store
 and catalog lock conflicts now return the structured `Error::Locked`; the Python
 binding maps it to `DatasetLockedError` without inspecting an error message.
+
+The catalog lock was released only when its descriptor closed, so a child forked
+before exec, which shares the locked open file description, kept the directory locked
+after the catalog had closed. Since roadmap item 95 (2026-10-24) the catalog lock and
+`lock_data_dir` use the store's lock guard, which unlocks the file explicitly when the
+process that took it drops it. A child that drops an inherited guard leaves the
+parent's lock held. A test drops a catalog and an offline lock while a forked child
+waits before exec, and takes the lock again.
 
 The catalog namespace contains datasets only. `Dataset::branch` keeps branch state
 in a lazy library cache, preserving the parent's store options and closure-cache size.

@@ -84,6 +84,10 @@ fn s() -> J {
     json!({ "type": "string" })
 }
 
+fn str_enum(values: &[&str]) -> J {
+    json!({ "type": "string", "enum": values })
+}
+
 fn int() -> J {
     json!({ "type": "integer" })
 }
@@ -108,7 +112,9 @@ fn query_params(o: Op) -> Op {
         "namedGraphUri",
         "format",
         "timeout",
-        "reasoning",
+        "queryReasoning",
+        "reasoningProfile",
+        "maxDerived",
         "at",
         "branch",
         "send",
@@ -258,12 +264,17 @@ pub(super) fn shared_responses() -> Map<String, J> {
 /// The shared request bodies of `components.requestBodies`.
 pub(super) fn shared_bodies() -> Map<String, J> {
     let mut m = Map::new();
+    let mut rdf_and_tables = rdf_in();
+    if let Some(m) = rdf_and_tables.as_object_mut() {
+        m.insert("text/csv".into(), text());
+        m.insert("text/tab-separated-values".into(), text());
+    }
     m.insert(
         "RdfData".into(),
         json!({
             "required": true,
-            "description": "RDF data in the syntax its `Content-Type` names. Jena's N3 media types are read as Turtle.",
-            "content": rdf_in(),
+            "description": "RDF data in the syntax its `Content-Type` names. Jena's N3 media types are read as Turtle. A `text/csv` or `text/tab-separated-values` body is a table that `mapping` or `base` maps into the graph.",
+            "content": rdf_and_tables,
         }),
     );
     m.insert(
@@ -282,6 +293,45 @@ pub(super) fn shared_bodies() -> Map<String, J> {
 
 fn write_errors(o: Op) -> Op {
     o.errors(&[400, 408, 412, 413, 415, 422, 503, 507])
+}
+
+/// The parameters of a Graph Store write whose body is a CSV or TSV table (F19 §2.3).
+fn table_params(o: Op) -> Op {
+    o.query(
+        "mapping",
+        s(),
+        "A CSV or TSV body: the stored mapping that maps it.",
+    )
+    .query(
+        "base",
+        s(),
+        "A CSV or TSV body: the default mapping's namespace.",
+    )
+    .query(
+        "key",
+        s(),
+        "A CSV or TSV body: the column that names each row in the default mapping.",
+    )
+    .query(
+        "source",
+        s(),
+        "A CSV or TSV body: the file name the mapping reads it as, when the mapping reads several.",
+    )
+    .query(
+        "csvwMode",
+        str_enum(&["minimal", "standard"]),
+        "A CSVW mapping: standard mode adds the table group, table and row descriptions.",
+    )
+    .query(
+        "csvwCheck",
+        str_enum(&["keys", "none"]),
+        "A CSVW mapping: check primary and foreign keys (the default in standard mode).",
+    )
+    .query(
+        "lookup",
+        boolean(),
+        "A CONSTRUCT template: read the dataset's head while mapping.",
+    )
 }
 
 /// The Graph Store operations of one route, with operation ids `{prefix}Get` and so on.
@@ -325,6 +375,7 @@ fn graph_store(p: &mut Paths, route: &'static str, prefix: &str, methods: &[Meth
                 .see("per-dataset-sparql-protocol-fuseki-compatible")
                 .params(&["ifMatch", "ifNoneMatch"])
                 .body_ref("RdfData");
+                let o = table_params(o);
                 let o = write_ok(selector(o), "200").resp("201", "The graph was created.", None);
                 write_errors(write_params(o))
             }
@@ -339,6 +390,7 @@ fn graph_store(p: &mut Paths, route: &'static str, prefix: &str, methods: &[Meth
                 .see("per-dataset-sparql-protocol-fuseki-compatible")
                 .params(&["ifMatch", "ifNoneMatch"])
                 .body_ref("RdfData");
+                let o = table_params(o);
                 let o = write_ok(selector(o), "200").resp("201", "The graph was created.", None);
                 write_errors(write_params(o))
             }
@@ -350,8 +402,15 @@ fn graph_store(p: &mut Paths, route: &'static str, prefix: &str, methods: &[Meth
                     "Graph Store",
                     "Delete a graph",
                 )
+                .doc("Deletes the graph. With a `text/csv` or `text/tab-separated-values` body and `mapping` or `base`, removes the mapped triples from the graph instead.")
                 .see("per-dataset-sparql-protocol-fuseki-compatible")
-                .params(&["ifMatch", "ifNoneMatch"]);
+                .params(&["ifMatch", "ifNoneMatch"])
+                .body(
+                    false,
+                    "A table whose mapped triples are removed.",
+                    json!({ "text/csv": text(), "text/tab-separated-values": text() }),
+                );
+                let o = table_params(o);
                 let o = write_ok(selector(o), "200").resp("204", "The graph was deleted.", None);
                 write_errors(write_params(o))
             }
@@ -420,8 +479,10 @@ pub(super) fn add_all(p: &mut Paths) {
     datasets(p);
     fuseki(p);
     schema(p);
+    forms(p);
     admin(p);
     queries(p);
+    mappings(p);
     algorithms(p);
     graphql(p);
     history(p);
@@ -434,6 +495,111 @@ pub(super) fn add_all(p: &mut Paths) {
     auth(p);
     protocol(p);
     openapi(p);
+}
+
+/// Editing forms generated from SHACL shapes (U02).
+fn forms(p: &mut Paths) {
+    let term = json!({ "type": "object", "description": "A term in the SPARQL JSON results form: `{\"type\": \"uri\", \"value\": …}` or `{\"type\": \"literal\", \"value\": …, \"datatype\"?: …, \"xml:lang\"?: …}`." });
+    let change = json!({ "application/json": { "schema": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["changes"],
+        "properties": {
+            "focus": { "type": "string", "description": "The IRI of the resource. Give either `focus` or `class`." },
+            "class": { "type": "string", "description": "The class of a new instance, whose IRI the server mints from the `forms` setting's `newIri`. The change also adds the instance's `rdf:type`." },
+            "branch": { "type": "string", "description": "The branch the form was opened on. A form opened on `main` saves where the dataset's `forms` setting says, which may be the caller's session branch." },
+            "shapes": { "type": "string", "enum": ["guard", "graphs", "drafted"], "description": "The shapes the form was built from, when not the setting's." },
+            "changes": { "type": "array", "items": { "type": "object", "required": ["field"], "properties": {
+                "field": { "type": "string", "description": "The field's id, its path in SPARQL syntax." },
+                "remove": { "type": "array", "items": term },
+                "add": { "type": "array", "items": term }
+            } } },
+            "expect": { "type": "object", "additionalProperties": { "type": "array", "items": term }, "description": "The values the form loaded, by field id, for every changed field." },
+            "message": { "type": "string", "description": "The commit message." }
+        }
+    } } });
+    p.add(
+        op(GET, "/$/forms/{ds}", "getForm", "Validation", "The form of a resource")
+            .doc("The fields that the property shapes of the node shapes targeting `focus` describe, laid out by `sh:group` and `sh:order` and labelled by `sh:name`, with the resource's values read under the caller's view, the widget of each field, the constraints the browser checks and the triples no property shape covers. Fields the caller's protections hide from reads are absent, and fields it cannot write are read-only with a `reason`. Reads follow the caller's query endpoint grants and writeability its update endpoint grants on the branch saves go to. A focus no shape targets answers `200` with no fields. With `class` instead of `focus`, the form is that of a new instance of the class, with the fields of the node shapes whose class targets select it and no values, and `focus` is `null`. `save` says where a save goes, and `guard` gives the write guard's mode.")
+            .see("editing-forms")
+            .query("focus", s(), "The IRI of the resource. Give either `focus` or `class`.")
+            .query("class", s(), "The class of a new instance.")
+            .query("shapes", json!({ "type": "string", "enum": ["guard", "graphs", "drafted"] }), "Where the shapes come from, when not the dataset's `forms` setting.")
+            .query("lang", s(), "The language labels are picked in, then English, then untagged.")
+            .params(&["branch", "at", "timeout"])
+            .resp(
+                "200",
+                "The form model.",
+                Some(json!({ "application/json": { "schema": {
+                    "type": "object",
+                    "required": ["formFormat", "focus", "types", "commit", "branch", "editable", "shapes", "groups", "fields", "other", "graph", "closed", "save"],
+                    "properties": {
+                        "formFormat": { "type": "integer", "enum": [1] },
+                        "focus": { "type": ["string", "null"] },
+                        "types": { "type": "array", "items": { "type": "string" } },
+                        "commit": { "type": "integer" },
+                        "branch": { "type": "string" },
+                        "editable": { "type": "boolean", "description": "The caller may save changes through this form." },
+                        "shapes": { "type": "object", "description": "`{source, nodeShapes, missing?, unknownHints}`." },
+                        "groups": { "type": "array", "items": { "type": "object", "description": "`{iri, label, order}`." } },
+                        "fields": { "type": "array", "items": { "type": "object", "description": "`{id, path, inverse, editable, reason?, label, description?, group, order, widget, editor?, viewer?, constraints, sources, values}`, where each value is `{term, graph, label?, readOnly?}`." } },
+                        "other": { "type": "array", "items": { "type": "object", "description": "`{predicate, values}`." } },
+                        "graph": { "type": ["string", "null"], "description": "The graph new values go into, `null` for the default graph." },
+                        "closed": { "type": "boolean" },
+                        "save": { "type": "object", "description": "`{to, branch, exists, mainProtected}`: `to` is `main` or `branch`." },
+                        "guard": { "type": ["object", "null"], "description": "`{language, mode}` of the write guard." }
+                    }
+                } } })),
+            )
+            .errors(&[400, 403, 404, 408, 501]),
+    );
+    p.add(
+        op(POST, "/$/forms/{ds}/check", "checkForm", "Validation", "Check a form's changes")
+            .doc("Turns the changes into one update of `DELETE DATA` and `INSERT DATA`, runs it as a dry run and validates the nodes it touches at the state it would make against the form's shapes, whether or not the dataset has a guard. The answer is `200` with the write preview, the update, the fields another commit changed since the form loaded them (`conflicts`, which a save would refuse), and the validation results, each with the `field` it belongs to or `null`. A check of a session branch that does not exist yet previews its first commit on `main`'s head, which `main`'s protection does not refuse. A caller whose view hides part of the data gets no validation (`withheld`), as the validation routes refuse such callers. It needs write on the branch, through the update endpoint.")
+            .see("editing-forms")
+            .body(true, "The changes.", change.clone())
+            .resp(
+                "200",
+                "The preview and the validation.",
+                Some(json!({ "application/json": { "schema": {
+                    "type": "object",
+                    "required": ["branch", "preview", "update", "conflicts", "validation"],
+                    "properties": {
+                        "branch": { "type": "string" },
+                        "preview": { "type": "object", "description": "The dry run, as a write preview answers it." },
+                        "update": { "type": "string" },
+                        "conflicts": { "type": "array", "items": { "type": "object" }, "description": "`{id, now}` of each changed field whose stored values differ from `expect`." },
+                        "validation": { "type": "object", "description": "`{checked, withheld, timedOut, conforms, results}`." }
+                    }
+                } } })),
+            )
+            .errors(&[400, 403, 404, 408]),
+    );
+    p.add(
+        op(POST, "/$/forms/{ds}/save", "saveForm", "Validation", "Save a form's changes")
+            .doc("Commits the changes as one update with the message, when the stored values of every changed field are still those `expect` names, compared under the writer lock. Otherwise it answers `409` with code `form-conflict` and the fields with their stored values `now`. The write guard runs as for any write. A save of a form opened on `main` while the `forms` setting sends saves to a branch creates the caller's session branch from `main`'s head when it does not exist.")
+            .see("editing-forms")
+            .body(true, "The changes.", change)
+            .resp(
+                "200",
+                "The commit receipt.",
+                Some(json!({ "application/json": { "schema": {
+                    "type": "object",
+                    "required": ["committed", "commit", "branch", "branchCreated"],
+                    "properties": {
+                        "committed": { "type": "boolean" },
+                        "commit": { "type": "object" },
+                        "branch": { "type": "string" },
+                        "branchCreated": { "type": "boolean" },
+                        "focus": { "type": "string", "description": "The resource saved, which for a new instance is the IRI minted for it." },
+                        "dataset": { "type": "string" },
+                        "datasetId": { "type": "string" },
+                        "validation": { "type": "object" }
+                    }
+                } } })),
+            )
+            .errors(&[400, 403, 404, 408, 409, 422, 507]),
+    );
 }
 
 fn server(p: &mut Paths) {
@@ -900,6 +1066,52 @@ fn schema(p: &mut Paths) {
     );
     p.add(
         op(
+            POST,
+            "/$/graph/{ds}/facets",
+            "getGraphFacets",
+            "Schema",
+            "Facet histograms of a set",
+        )
+        .doc("Counts the entities of a set by ranges of round width of a property's numbers or of the years of its dates, or by its 12 most frequent values, with the entities that have no value. The set is a class, up to 20,000 IRIs, or the distinct values of a variable of a `SELECT` query, and a set above 1,000,000 entities is refused with `507`. Each brush in `filters` keeps the entities with a value in its range or among its values, and each facet counts the set filtered by every brush but its own, so the facets filter each other. `matching` counts the set under every brush. A facet over a budget carries an `error` while the others stay. `candidates: true` also lists the properties of a sample of the set, ranked by the share that has a value. Every count comes from queries run under the caller's view, timeout and memory budget, so it needs read through the query endpoint and fails with `507` like a query.")
+        .see("facets")
+        .param("timeout")
+        .param("reasoning")
+        .body(
+            true,
+            "The set, its facets and the brushes.",
+            json!({ "application/json": { "schema": {
+                "type": "object",
+                "additionalProperties": false,
+                "required": ["within"],
+                "properties": {
+                    "within": { "type": "object", "description": "`{\"class\": IRI}`, `{\"nodes\": [IRI, …]}` with up to 20,000 IRIs, or `{\"query\": SELECT, \"variable\": name}`." },
+                    "facets": { "type": "array", "maxItems": 6, "items": { "type": "object", "description": "`{\"property\": IRI, \"bins\"?: 2–40, \"top\"?: 1–12, \"kind\"?: \"numeric\" | \"date\" | \"values\", \"edges\"?: [number, …], \"bars\"?: [term, …]}`. `edges` and `bars` hand back the ranges or values of an earlier answer." } },
+                    "filters": { "type": "array", "maxItems": 6, "items": { "type": "object", "description": "`{\"property\": IRI, \"range\": [from, to], \"kind\"?: \"numeric\" | \"date\"}`, where a date range is in whole years and `to` is excluded, or `{\"property\": IRI, \"values\": [term, …]}` with terms in the SPARQL JSON results form." } },
+                    "candidates": { "type": "boolean", "description": "Also list the properties of the set." },
+                    "at": { "type": "string", "description": "A commit, time or named snapshot." }
+                }
+            } } }),
+        )
+        .resp(
+            "200",
+            "The counts of each facet.",
+            Some(json!({ "application/json": { "schema": {
+                "type": "object",
+                "required": ["commit", "size", "matching", "facets", "truncated"],
+                "properties": {
+                    "commit": { "type": "integer" },
+                    "size": { "type": "integer", "description": "Entities in the set." },
+                    "matching": { "type": "integer", "description": "Entities of the set under every brush." },
+                    "facets": { "type": "array", "items": { "type": "object", "description": "`property`, `kind`, `missing`, and `bins` of `{from, to, count}` for a range facet or `values` of `{value, count, label?}` and `other` for a bar list, or `error` with its `budget` and `message`." } },
+                    "candidates": { "type": "array", "items": { "type": "object", "description": "`{property, share, kind}`." } },
+                    "truncated": { "type": "boolean", "description": "The candidates come from a sample of the set or were cut to 40." }
+                }
+            } } })),
+        )
+        .errors(&[400, 403, 404, 408, 503, 507]),
+    );
+    p.add(
+        op(
             GET,
             "/$/schema/{ds}/diff",
             "getSchemaDiff",
@@ -1083,7 +1295,7 @@ fn algorithms(p: &mut Paths) {
             "Graph algorithms",
             "Run a graph algorithm",
         )
-        .doc("Without `write` the run is the SPARQL query its request stands for, answered as `/{ds}/sparql` answers (`Accept`, `timeout`, `execution` and the budget overrides apply), one row per node, node pair or node and level. `summary=true` returns only the statistics of the run. With `write` the run is a task that computes at the head commit and writes the rows in batched commits, with a run record in the graph. Read-only runs need read through the query endpoint and use Query rate/concurrency limits. Write-back runs need write through the update endpoint and use Update HTTP admission through the 202 response body. Background work uses the existing task queue and algorithm-thread admission, not an HTTP permit. A task can be cancelled with `DELETE /$/tasks/{id}`.")
+        .doc("Without `write` the run is the SPARQL query its request stands for, answered as `/{ds}/sparql` answers (`Accept`, `timeout`, `execution` and the budget overrides apply), one row per node, node pair or node and level. `summary=true` returns only the statistics of the run. A request with `nodes`, `keep`, `async` or `top` is a view-only run, which answers in SPARQL JSON with the rows of the listed nodes, `communitySize` for community and component rows, the run's `summary` and a `run` member that names the commit and whether the cache answered. With `keep` the whole result is kept in a cache of at most 8 results and 512 MiB charged to the server memory pool, and with `async` as well the run is an `algo-view` task that needs only read, which a request for the same key joins and the caller that started it may cancel. With `write` the run is a task that computes at the head commit and writes the rows in batched commits, with a run record in the graph. Read-only runs need read through the query endpoint and use Query rate/concurrency limits. Write-back runs need write through the update endpoint and use Update HTTP admission through the 202 response body. Background work uses the existing task queue and algorithm-thread admission, not an HTTP permit. A task can be cancelled with `DELETE /$/tasks/{id}`.")
         .see("graph-algorithms")
         .params(&["format", "timeout", "nocache", "execution"])
         .query("summary", json!({ "type": "boolean" }), "Return only the summary of the run.")
@@ -1094,7 +1306,7 @@ fn algorithms(p: &mut Paths) {
             Some(json!({ "application/sparql-results+json": { "schema": { "type": "object" } } })),
             json!({}),
         )
-        .resp("202", "A run with `write`, started as a task.", Some(json!({ "application/json": { "schema": sref("Task") } })))
+        .resp("202", "A run with `write`, or a view-only run with `keep` and `async`, started as a task. A view-only answer has `joined: true` when it joined a run already in progress.", Some(json!({ "application/json": { "schema": sref("Task") } })))
         .errors(&[400, 409, 413, 429, 503, 507]),
     );
     p.add(
@@ -1230,6 +1442,58 @@ fn queries(p: &mut Paths) {
             "StoredQueryVersions",
         ),
     );
+    p.add(
+        op(GET, "/$/views/{ds}", "listViews", "Views", "List views")
+            .doc("The dataset's incremental views with their state: `building`, `current`, `behind` with the commits it lags, `suspended` with a reason, or `failed`.")
+            .see("incremental-views")
+            .json("200", "The views without their plans.", "ViewList"),
+    );
+    p.add(
+        op(GET, "/$/views/{ds}/{name}", "getView", "Views", "Get a view")
+            .see("incremental-views")
+            .json("200", "The view with its state and its plan, each operator marked `incremental` or `recompute`.", "View")
+            .errors(&[404]),
+    );
+    p.add(
+        op(PUT, "/$/views/{ds}/{name}", "putView", "Views", "Define a view")
+            .doc("Compiles the query, keeps the definition and starts the first evaluation as a task in `/$/tasks`. Needs `admin` on the dataset. A query outside the incremental fragment is refused with `400 not-incremental`, and Phase 2 options with `400 unsupported-option`.")
+            .see("incremental-views")
+            .json_body(true, "ViewDefinition")
+            .json("200", "Replaced.", "View")
+            .json("201", "Created.", "View")
+            .errors(&[400]),
+    );
+    p.add(
+        op(
+            DELETE,
+            "/$/views/{ds}/{name}",
+            "deleteView",
+            "Views",
+            "Delete a view",
+        )
+        .doc("Removes the view and its state. Needs `admin` on the dataset.")
+        .see("incremental-views")
+        .no_content("Deleted.")
+        .errors(&[404]),
+    );
+    p.add(
+        op(POST, "/$/views/{ds}/{name}/rebuild", "rebuildView", "Views", "Rebuild a view")
+            .doc("Evaluates the view again from scratch as a task, and lifts a suspension. Needs `admin` on the dataset.")
+            .see("incremental-views")
+            .json("202", "The rebuild's task.", "ViewTask")
+            .errors(&[404]),
+    );
+    p.add(
+        op(GET, "/{ds}/live", "liveQuery", "Views", "Live query")
+            .doc("A SELECT, ASK or CONSTRUCT query that a view could be, as server-sent events: `snapshot` pages of the result, then a `diff` after each commit that changes it, `reset` when the server evaluated the query again, and `error` when the stream ends. Each event's id is a commit.")
+            .see("live-queries")
+            .query("query", s(), "The query.")
+            .query("after", s(), "Resume after this commit (`commit:N`): the first event is the change since it, or a `reset`.")
+            .query("coalesceMs", json!({ "type": "integer", "minimum": 0, "default": 0 }), "Merge the diffs of commits that arrive within this many milliseconds.")
+            .header("Last-Event-ID", s(), "Resume after this commit.")
+            .resp("200", "The events.", Some(json!({ "text/event-stream": text() })))
+            .errors(&[400, 403, 429]),
+    );
     for (m, id, summary) in [
         (GET, "runStoredQuery", "Run a stored query"),
         (POST, "runStoredQueryPost", "Run a stored query (POST)"),
@@ -1259,6 +1523,117 @@ fn queries(p: &mut Paths) {
             .errors(&[400, 408, 507]),
         );
     }
+}
+
+fn mappings(p: &mut Paths) {
+    let text_kinds = || {
+        json!({
+            "text/turtle": text(),
+            "application/yaml": text(),
+            "application/csvm+json": text(),
+            "application/sparql-query": text(),
+        })
+    };
+    p.add(
+        op(
+            GET,
+            "/$/mappings/{ds}",
+            "listStoredMappings",
+            "Stored mappings",
+            "List stored mappings",
+        )
+        .see("stored-mappings")
+        .json(
+            "200",
+            "The mappings without their text.",
+            "StoredMappingList",
+        ),
+    );
+    p.add(
+        op(GET, "/$/mappings/{ds}/{name}", "getStoredMapping", "Stored mappings", "Get a stored mapping")
+            .doc("The mapping with its text and metadata, or the text alone when `Accept` names the kind's media type.")
+            .see("stored-mappings")
+            .query("version", int(), "An older version, while it is kept.")
+            .resp_h(
+                "200",
+                "The mapping.",
+                Some({
+                    let mut c = text_kinds();
+                    c["application/json"] = json!({ "schema": sref("StoredMapping") });
+                    c
+                }),
+                json!({ "ETag": { "description": "`\"v<N>\"`", "schema": { "type": "string" } } }),
+            )
+            .errors(&[404]),
+    );
+    p.add(
+        op(PUT, "/$/mappings/{ds}/{name}", "putStoredMapping", "Stored mappings", "Store a mapping")
+            .doc("Stores the mapping text as the next version, after parsing and checking it. `Content-Type` names the kind: `text/turtle` for R2RML and RML, `application/yaml` for YARRRML, `application/csvm+json` for CSVW metadata and `application/sparql-query` for a CONSTRUCT template. A connection the server does not declare is a warning. `If-Match: \"v<N>\"` stores only over version N, and `If-None-Match: *` only when the mapping does not exist.")
+            .see("stored-mappings")
+            .params(&["ifMatch", "ifNoneMatch", "commitMessage"])
+            .query("kind", str_enum(&["rml", "yarrrml", "csvw", "template"]), "The kind, instead of the media type.")
+            .query("description", s(), "A description of at most 1024 bytes.")
+            .body(true, "The mapping text.", text_kinds())
+            .json("200", "Stored as a new version, or unchanged (`changed: false`).", "StoredMapping")
+            .json("201", "Created.", "StoredMapping")
+            .errors(&[400, 409, 412, 415]),
+    );
+    p.add(
+        op(
+            DELETE,
+            "/$/mappings/{ds}/{name}",
+            "deleteStoredMapping",
+            "Stored mappings",
+            "Delete a stored mapping",
+        )
+        .see("stored-mappings")
+        .param("ifMatch")
+        .no_content("Deleted with its versions.")
+        .errors(&[404, 412]),
+    );
+    p.add(
+        op(
+            GET,
+            "/$/mappings/{ds}/{name}/versions",
+            "listStoredMappingVersions",
+            "Stored mappings",
+            "List the versions of a stored mapping",
+        )
+        .see("stored-mappings")
+        .json(
+            "200",
+            "The kept versions, newest first.",
+            "StoredMappingVersions",
+        )
+        .errors(&[404]),
+    );
+    let o = op(POST, "/{ds}/mappings/{name}/run", "runStoredMapping", "Stored mappings", "Run a stored mapping")
+        .doc("Runs the mapping over the file parts its sources name and the server's connections, and commits once. `mode=replace` replaces the constant graphs the mapping writes in that commit, and is `400` with code `mapping-graphs-unknown` for a template graph map. The commit message defaults to `mapping NAME (version V)`, and the mapping records the run.")
+        .see("stored-mappings")
+        .query("mode", str_enum(&["add", "replace"]), "Add the triples (the default), or replace the graphs the mapping writes.")
+        .query("version", int(), "Run an older version.")
+        .query("graph", s(), "Write every triple into this graph. A mapping whose graph maps name another graph is `400` with code `mapping-graph-conflict`.")
+        .query("base", s(), "The base IRI of generated relative IRIs.")
+        .query("lookup", boolean(), "A CONSTRUCT template: read the dataset's head while mapping.")
+        .query("csvwMode", str_enum(&["minimal", "standard"]), "A CSVW mapping: standard mode.")
+        .query("csvwCheck", str_enum(&["keys", "none"]), "A CSVW mapping: check primary and foreign keys.")
+        .params(&["ifMatch"])
+        .body(
+            false,
+            "The files the mapping reads, each a part whose file name is the one the mapping names.",
+            json!({ "multipart/form-data": { "schema": {
+                "type": "object",
+                "additionalProperties": true,
+                "properties": { "file": { "type": "array", "items": { "type": "string", "contentMediaType": "application/octet-stream" } } },
+            } } }),
+        );
+    let mut o = write_params(o).json(
+        "200",
+        "The run's counts, with the commit receipt when asked for.",
+        "MappingRun",
+    );
+    o = write_errors(o);
+    p.add(o.errors(&[404]));
 }
 
 fn graphql_response() -> J {
@@ -2194,6 +2569,81 @@ fn format_and_mcp(p: &mut Paths) {
         answer.insert(m.into(), text());
     }
     p.add(
+        op(
+            POST,
+            "/$/vector/{ds}/{name}/projection",
+            "computeVectorProjection",
+            "Search",
+            "Compute a projection of a vector index",
+        )
+        .doc("Computes a two-dimensional projection of the index's entities at the head and keeps it in memory for `GET`. `pca` projects every vector on the two leading principal components of a sample, and an entity with several vectors sits at the mean of their projections. It runs in the request for an index of up to 1,000,000 vectors and as a task above that. `neighbours` lays out the index's HNSW neighbour graph from the PCA positions and always runs as a task. The server keeps four projections, 1 GiB in all, charged to the query memory pool, and refuses one it cannot hold with `507`. A caller whose access covers part of the dataset gets `403`.")
+        .see("embedding-map")
+        .query("method", json!({ "type": "string", "enum": ["pca", "neighbours"], "default": "pca" }), "How the vectors are placed.")
+        .param("timeout")
+        .body(
+            false,
+            "The sample, seed and layout steps.",
+            json!({ "application/json": { "schema": {
+                "type": "object",
+                "additionalProperties": false,
+                "properties": {
+                    "sample": { "type": "integer", "minimum": 1, "maximum": 100000, "description": "Vectors the PCA learns from." },
+                    "seed": { "type": "integer", "minimum": 0, "description": "The seed of the first directions, the sampling priorities and the layout." },
+                    "iterations": { "type": "integer", "minimum": 1, "maximum": 1000, "description": "Steps of the neighbour layout." }
+                }
+            } } }),
+        )
+        .json_inline("200", "The projection, without its points.", projection_summary())
+        .task()
+        .errors(&[400, 403, 404, 408, 503, 507]),
+    );
+    p.add(
+        op(
+            GET,
+            "/$/vector/{ds}/{name}/projection",
+            "getVectorProjection",
+            "Search",
+            "Read a kept projection of a vector index",
+        )
+        .doc("Returns the kept projection's method, commit, bounds, a density grid of 256 by 256 cells, its classes, and up to 50,000 points as `{entity, x, y, class?, colour?}`. `bbox` returns the points inside a region and its density, at most `limit`, those of lowest sampling priority when there are more, so zooming in keeps the points already shown. `colour` names a predicate whose first value per point is returned as an index into `colour.values`. `Accept: application/x-sparkles-points` returns the binary points format of the embedding map guide. A projection read at an older commit than the head has `stale: true`.")
+        .see("embedding-map")
+        .query("method", json!({ "type": "string", "enum": ["pca", "neighbours"] }), "The projection's method. The most recent of any method when absent.")
+        .query("bbox", json!({ "type": "string" }), "`minX,minY,maxX,maxY`.")
+        .query("limit", json!({ "type": "integer", "minimum": 0, "maximum": 50000, "default": 50000 }), "The most points to return.")
+        .query("colour", json!({ "type": "string" }), "A predicate IRI whose values colour the points.")
+        .resp(
+            "200",
+            "The projection and its points.",
+            Some(json!({
+                "application/json": { "schema": {
+                    "type": "object",
+                    "required": ["index", "method", "commit", "stale", "entities", "bounds", "region", "density", "classes", "points"],
+                    "properties": {
+                        "index": { "type": "string" },
+                        "method": { "type": "string" },
+                        "commit": { "type": "integer" },
+                        "generation": { "type": "string" },
+                        "stale": { "type": "boolean", "description": "The head has moved since the projection was computed." },
+                        "vectors": { "type": "integer" },
+                        "dimension": { "type": "integer" },
+                        "entities": { "type": "integer", "description": "Points in the whole projection." },
+                        "bounds": { "type": "array", "items": { "type": "number" }, "description": "`[minX, minY, maxX, maxY]`." },
+                        "explained": { "type": "array", "items": { "type": "number" }, "description": "The share of the sample's variance on each component." },
+                        "builtMs": { "type": "number" },
+                        "bytes": { "type": "integer" },
+                        "region": { "type": "object", "description": "`{bbox, total, shown, sampled}`: the points inside the region and how many are returned." },
+                        "density": { "type": "object", "description": "`{size, bbox, max, counts}`, where `counts` is base64 of little-endian `Uint32` cell counts, row by row from the minimum y." },
+                        "classes": { "type": "array", "items": { "type": "object", "description": "`{iri, count}`." } },
+                        "colour": { "type": "object", "description": "`{predicate, values}`, where `values` holds `{value, count}` with a term in the SPARQL JSON results form." },
+                        "points": { "type": "array", "items": { "type": "object", "description": "`{entity, x, y, class?, colour?}`, where `class` and `colour` index `classes` and `colour.values`." } }
+                    }
+                } },
+                "application/x-sparkles-points": { "schema": { "type": "string", "format": "binary" } }
+            })),
+        )
+        .errors(&[400, 403, 404]),
+    );
+    p.add(
         o.query("prefixGroup", s(), "One prefix group, comma-separated (repeatable).")
             .body(true, "The text, as a JSON `FormatRequest` or a raw body.", J::Object(body))
             .resp_h(
@@ -2801,6 +3251,14 @@ fn assist(p: &mut Paths) {
             .see("graphrag")
             .json("200", "The community.", "GraphragCommunity")
             .errors(&[400, 404]),
+    );
+    p.add(
+        op(POST, "/$/graphrag/{ds}/memberships", "listCommunityMemberships", "Datasets", "Read the communities of nodes")
+            .doc("The communities of the reports graph that hold each listed node, at the given level or at every level, with each community's member count and report title. Read on main only and through the caller's view. A caller for whom the reports graph is not proven, or a request on a branch, gets `available: false`.")
+            .see("graphrag")
+            .json_body(true, "GraphragMembershipsRequest")
+            .json("200", "The memberships.", "GraphragMemberships")
+            .errors(&[400, 404, 413]),
     );
     p.add(
         op(POST, "/$/graphrag/{ds}/review", "reviewCommunityReport", "Datasets", "Review a community report")
@@ -3662,11 +4120,18 @@ fn protocol(p: &mut Paths) {
     );
     graph_store(p, "/{ds}/get", "gspRead", &[GET, HEAD], false);
     let o = op(POST, "/{ds}/upload", "upload", "Graph Store", "Upload files")
-        .doc("A multipart upload of RDF files, and CSV or TSV tables mapped to triples, in one commit. The format comes from each file name or content type. A plain `text/csv` or `text/tab-separated-values` body is one table.")
+        .doc("A multipart upload of RDF files, CSV or TSV tables mapped to triples, and the files an R2RML, RML or YARRRML mapping reads, in one commit. The format comes from each file name or content type. A plain `text/csv` or `text/tab-separated-values` body is one table. A mapping file source without its part is `400` with code `mapping-source-missing`.")
         .see("csv-and-tsv-uploads")
         .query("graph", s(), "The target graph.")
         .query("base", s(), "The default mapping's namespace for tables.")
         .query("key", s(), "The column that names each row in the default mapping.")
+        .query("mapping", s(), "A stored mapping to use instead of a `mapping` part.")
+        .query("mappingVersion", int(), "The stored mapping's version (the latest by default).")
+        .query("mappingKind", str_enum(&["rml", "yarrrml", "csvw", "template"]), "The kind of the `mapping` part when its content does not tell.")
+        .query("csvwMode", str_enum(&["minimal", "standard"]), "A CSVW mapping: standard mode adds the table group, table and row descriptions.")
+        .query("csvwCheck", str_enum(&["keys", "none"]), "A CSVW mapping: check primary and foreign keys (the default in standard mode).")
+        .query("lookup", boolean(), "A CONSTRUCT template: read the dataset's head while mapping. The report gives `lookupCommit`, and `If-Match` makes the commit fail when the head moved.")
+        .param("ifMatch")
         .body(
             true,
             "The files.",
@@ -3677,7 +4142,7 @@ fn protocol(p: &mut Paths) {
                     "properties": {
                         "file": { "type": "array", "items": { "type": "string", "contentMediaType": "application/octet-stream" } },
                         "graph": { "type": "string" },
-                        "mapping": { "type": "string", "description": "A CSVW metadata document." },
+                        "mapping": { "type": "string", "description": "CSVW metadata, an R2RML, RML or YARRRML mapping, or a CONSTRUCT template. The file parts its sources name are read by it." },
                         "template": { "type": "string", "description": "A SPARQL CONSTRUCT template for tables." },
                     },
                 } },
@@ -3867,4 +4332,26 @@ fn openapi(p: &mut Paths) {
         )
         .resp("304", "Not modified.", None),
     );
+}
+
+/// The facts of a projection, as `POST /$/vector/{ds}/{name}/projection` answers them.
+fn projection_summary() -> J {
+    json!({
+        "type": "object",
+        "required": ["index", "method", "commit", "stale", "entities", "bounds"],
+        "properties": {
+            "index": { "type": "string" },
+            "method": { "type": "string", "enum": ["pca", "neighbours"] },
+            "commit": { "type": "integer" },
+            "generation": { "type": "string" },
+            "stale": { "type": "boolean" },
+            "vectors": { "type": "integer" },
+            "dimension": { "type": "integer" },
+            "entities": { "type": "integer" },
+            "bounds": { "type": "array", "items": { "type": "number" } },
+            "explained": { "type": "array", "items": { "type": "number" } },
+            "builtMs": { "type": "number" },
+            "bytes": { "type": "integer" }
+        }
+    })
 }

@@ -386,6 +386,11 @@ python = "Dataset.replace"
 jvm = "DatasetGraphSparkles.addGraph"
 node = "Dataset.replace"
 
+["dataset.run_mapping"]
+python = "Dataset.run_mapping"
+jvm = "planned: a typed handle after the Python one (ROADMAP item 231)"
+node = "planned: a typed handle after the Python one (ROADMAP item 231)"
+
 ["dataset.select"]
 python = "Dataset.select"
 jvm = "Jena QueryExec.dataset(ds).query(...).select"
@@ -431,6 +436,21 @@ python = "skip: formatter and linter remain CLI tools"
 jvm = "SparklesHelpers.lint"
 node = "lint"
 
+["forms.check"]
+python = "Dataset.forms.check"
+jvm = "planned: DatasetGraphSparkles.forms().check, after the Python and Node.js ones"
+node = "planned: Dataset.forms.check, after the form editor settles"
+
+["forms.model"]
+python = "Dataset.forms.model"
+jvm = "planned: DatasetGraphSparkles.forms().model, after the Python and Node.js ones"
+node = "planned: Dataset.forms.model, after the form editor settles"
+
+["forms.save"]
+python = "Dataset.forms.save"
+jvm = "planned: DatasetGraphSparkles.forms().save, after the Python and Node.js ones"
+node = "planned: Dataset.forms.save, after the form editor settles"
+
 ["geo.convert"]
 python = "convert_geometries"
 jvm = "SparklesHelpers.convertGeometries"
@@ -440,6 +460,11 @@ node = "convertGeometries"
 python = "Dataset.clear_graph"
 jvm = "DatasetGraphSparkles.getGraph(graph).clear"
 node = "Dataset.clearGraph"
+
+["graph.facets"]
+python = "Dataset.graph.facets"
+jvm = "planned: DatasetGraphSparkles.graph().facets, after the Python and Node.js ones"
+node = "planned: Dataset.graph.facets, after the facet panel's request settles"
 
 ["graph.groups"]
 python = "Dataset.graph.groups"
@@ -606,6 +631,11 @@ python = "Dataset.indexes.vector.rebuild"
 jvm = "DatasetGraphSparkles.indexes().vector().rebuild"
 node = "Dataset.indexes.vector.rebuild"
 
+["indexes.vector.projection"]
+python = "Dataset.indexes.vector.projection"
+jvm = "planned: a typed handle after the Python and Node.js ones"
+node = "planned: Dataset.indexes.vector.projection, after the Python one"
+
 ["indexes.vector.recall"]
 python = "Dataset.indexes.vector.recall"
 jvm = "SparklesVectorIndexes.recall"
@@ -620,6 +650,36 @@ node = "Dataset.indexes.vector.reembed"
 python = "check_data"
 jvm = "SparklesHelpers.checkData"
 node = "checkData"
+
+["mappings.delete"]
+python = "Dataset.mappings.delete"
+jvm = "planned: a typed handle after the Python one (ROADMAP item 231)"
+node = "planned: a typed handle after the Python one (ROADMAP item 231)"
+
+["mappings.get"]
+python = "Dataset.mappings.get"
+jvm = "planned: a typed handle after the Python one (ROADMAP item 231)"
+node = "planned: a typed handle after the Python one (ROADMAP item 231)"
+
+["mappings.list"]
+python = "Dataset.mappings.list"
+jvm = "planned: a typed handle after the Python one (ROADMAP item 231)"
+node = "planned: a typed handle after the Python one (ROADMAP item 231)"
+
+["mappings.put"]
+python = "Dataset.mappings.put"
+jvm = "planned: a typed handle after the Python one (ROADMAP item 231)"
+node = "planned: a typed handle after the Python one (ROADMAP item 231)"
+
+["mappings.run"]
+python = "Dataset.mappings.run"
+jvm = "planned: a typed handle after the Python one (ROADMAP item 231)"
+node = "planned: a typed handle after the Python one (ROADMAP item 231)"
+
+["mappings.versions"]
+python = "Dataset.mappings.versions"
+jvm = "planned: a typed handle after the Python one (ROADMAP item 231)"
+node = "planned: a typed handle after the Python one (ROADMAP item 231)"
 
 ["queries.delete"]
 python = "Dataset.queries.delete"
@@ -870,3 +930,33 @@ node = "Dataset.validation.shacl"
 python = "Dataset.validation.shex"
 jvm = "DatasetGraphSparkles.validation().shex"
 node = "Dataset.validation.shex"
+
+["views.delete"]
+python = "Dataset.views.delete"
+jvm = "planned: F13 Phase 2 adds the JVM API"
+node = "planned: F13 Phase 2 adds the Node.js API"
+
+["views.get"]
+python = "Dataset.views.get"
+jvm = "planned: F13 Phase 2 adds the JVM API"
+node = "planned: F13 Phase 2 adds the Node.js API"
+
+["views.list"]
+python = "Dataset.views.list"
+jvm = "planned: F13 Phase 2 adds the JVM API"
+node = "planned: F13 Phase 2 adds the Node.js API"
+
+["views.put"]
+python = "Dataset.views.put"
+jvm = "planned: F13 Phase 2 adds the JVM API"
+node = "planned: F13 Phase 2 adds the Node.js API"
+
+["views.rebuild"]
+python = "Dataset.views.rebuild"
+jvm = "planned: F13 Phase 2 adds the JVM API"
+node = "planned: F13 Phase 2 adds the Node.js API"
+
+["live"]
+python = "Dataset.live"
+jvm = "planned: F13 Phase 2 adds a LiveQuery with a listener"
+node = "planned: F13 Phase 2 adds an async iterator with an AbortSignal"

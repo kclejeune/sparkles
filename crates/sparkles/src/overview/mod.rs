@@ -3,7 +3,9 @@
 //! ranges, or listed as members, with the counted edges between the groups, to their
 //! sibling groups and to the other classes. The entities of the whole dataset can also be
 //! grouped by the community hierarchy that a GraphRAG build stored in its reports graph
-//! (spec C22 §4), one level at a time, with each group's report title and status.
+//! (spec C22 §4), one level at a time, with each group's report title and status. The
+//! facets of a set (spec U11 §3.2) count a class, a list of nodes or a query's values by
+//! ranges or values of literal properties, with brushes that filter each other.
 //!
 //! Every count comes from SPARQL queries run with the caller's [`QueryOptions`], so the
 //! view, the budgets, the deadline and the cancellation of `opts` apply to all of them
@@ -19,10 +21,16 @@ use crate::store::Snapshot;
 use serde_json::Value as J;
 use std::sync::Arc;
 
+mod facets;
 mod groups;
 mod ids;
 mod reports;
 
+pub use facets::{
+    Brush, DEFAULT_BINS, FacetSet, FacetSpec, FacetsRequest, Kind as FacetKind, MAX_BINS,
+    MAX_FACETS, MAX_FILTERS, MAX_NODES as MAX_FACET_NODES, MAX_SET, MAX_TOP, brush_condition,
+    facets_at, number_text, rdf_term_from_json, round_edges,
+};
 pub use groups::{DEFAULT_BUCKETS, MAX_BUCKETS, MAX_EDGES, MAX_LIMIT};
 pub use ids::MAX_DEPTH;
 pub use reports::{DEFAULT_REPORTS_GRAPH, DISCLOSURE_GRAPH, GUARDED_PREFIX, MAX_REPORT_LEVEL};

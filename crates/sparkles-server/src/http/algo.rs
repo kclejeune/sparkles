@@ -30,6 +30,7 @@ use std::sync::Arc;
 
 #[cfg(test)]
 pub(super) mod probe;
+pub(super) mod view;
 
 /// The kind of the task of a run that writes its results.
 pub const TASK: &str = "algo-run";
@@ -40,6 +41,8 @@ pub const TASK: &str = "algo-run";
 pub(super) struct PreparedAlgoRun {
     dataset: String,
     request: Arc<AlgoRequest>,
+    /// the view-only members `nodes`, `keep`, `async` and `top` (spec U10 §3.2)
+    view: Option<view::ViewOpts>,
     #[cfg(test)]
     probe: probe::Probe,
 }
@@ -94,11 +97,20 @@ pub(super) async fn admit_run(State(st): St, req: Request, next: Next) -> Respon
         };
     #[cfg(test)]
     probe::event(&parts.extensions, "parse");
-    let request = match serde_json::from_slice::<J>(&body)
+    let parsed = serde_json::from_slice::<J>(&body)
         .map_err(|e| bad(format!("invalid JSON: {e}")))
-        .and_then(|j| AlgoRequest::from_json(j).map_err(Into::into))
-    {
-        Ok(request) => Arc::new(request),
+        .and_then(|mut j| {
+            let view = view::ViewOpts::split(&mut j)?;
+            let request = AlgoRequest::from_json(j)?;
+            if view.is_some() && request.write.is_some() {
+                return Err(bad(
+                    "nodes, keep, async and top apply only to a run without a write part",
+                ));
+            }
+            Ok((request, view))
+        });
+    let (request, view) = match parsed {
+        Ok((request, view)) => (Arc::new(request), view),
         Err(error) => return error.into_response(),
     };
     let (level, endpoint, class) = if request.write.is_some() {
@@ -117,6 +129,14 @@ pub(super) async fn admit_run(State(st): St, req: Request, next: Next) -> Respon
     {
         return denied;
     }
+    // a run that reads may read a branch; one that writes keeps to main, where its run
+    // record and its named projections live
+    if request.write.is_some()
+        && super::branches::current().is_some_and(|b| b != sparkles::branch::MAIN)
+    {
+        return bad("a run that writes its results runs on main; leave out the branch")
+            .into_response();
+    }
     if request.write.is_some() && st.read_only {
         return err(StatusCode::FORBIDDEN, "server is read-only").into_response();
     }
@@ -133,6 +153,7 @@ pub(super) async fn admit_run(State(st): St, req: Request, next: Next) -> Respon
     let prepared = PreparedAlgoRun {
         dataset: name.clone(),
         request,
+        view,
         #[cfg(test)]
         probe: parts
             .extensions
@@ -204,6 +225,9 @@ pub(super) async fn run(
     prepared.probe.events.lock().push("lookup");
     let ds = dataset(&st, &name)?;
     let params = Params::from_query(&uri);
+    if let Some(v) = prepared.view {
+        return view::run(State(st), ds, p, params, req, v).await;
+    }
     if req.write.is_none() {
         let summary = params
             .get("summary")

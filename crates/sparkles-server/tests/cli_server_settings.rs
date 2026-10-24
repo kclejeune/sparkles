@@ -319,12 +319,14 @@ fn server_settings_restart_reload_and_log() {
 }
 
 /// The output of a CLI run.
+#[cfg(feature = "auth")]
 struct Out {
     code: Option<i32>,
     stdout: String,
     stderr: String,
 }
 
+#[cfg(feature = "auth")]
 impl Out {
     fn ok(self) -> Out {
         assert_eq!(self.code, Some(0), "{}\n{}", self.stdout, self.stderr);
@@ -338,6 +340,7 @@ impl Out {
 }
 
 /// Run the CLI against `s` with `stdin` piped in, so that it is not a terminal.
+#[cfg(feature = "auth")]
 fn cli(s: &Server, home: &Path, args: &[&str], stdin: &str) -> Out {
     let mut c = Command::new(BIN);
     c.args(args)
@@ -365,6 +368,7 @@ fn cli(s: &Server, home: &Path, args: &[&str], stdin: &str) -> Out {
 }
 
 /// The line of `out` whose first word is `field`.
+#[cfg(feature = "auth")]
 fn line(out: &str, field: &str) -> String {
     out.lines()
         .find(|l| l.split_whitespace().next() == Some(field))
@@ -376,6 +380,7 @@ fn line(out: &str, field: &str) -> String {
 /// role list that overrides the declared one, `diff` and `reset`) and `sparkles secrets
 /// list|set|unset`, with a check that the key reaches neither the CLI's output nor the
 /// server's log.
+#[cfg(feature = "auth")]
 #[test]
 fn global_settings_and_secrets_commands() {
     const CLI_KEY: &str = "cli-runtime-key-c19-4321";
@@ -599,6 +604,7 @@ fn global_settings_and_secrets_commands() {
 /// provider from a preset with the assignments in place of the preset's fields, refuses
 /// a provider that exists and an unknown preset, and a provider with certificate checks
 /// off is reported as unverified and logged with a warning (spec C19 §11.5, §11.6).
+#[cfg(feature = "auth")]
 #[test]
 fn provider_presets_and_insecure_warning() {
     let dir = tempfile::tempdir().unwrap();

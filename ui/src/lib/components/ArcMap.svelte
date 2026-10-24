@@ -128,7 +128,7 @@
   const overlay = $derived<Overlay>({
     base: scene.base,
     hot,
-    dim: selection.size > 0 || selectedRow != null,
+    dim: selection.active || selectedRow != null,
   });
 
   /** Clusters in view, the largest first: the order of Tab on the map and of the list. */
@@ -234,7 +234,7 @@
       pickCluster(focused, { shift: e.shiftKey, alt: e.altKey });
       return;
     }
-    if (e.key === 'Escape' && selection.size) {
+    if (e.key === 'Escape' && selection.active) {
       e.preventDefault();
       selection.clear();
       detail = '';

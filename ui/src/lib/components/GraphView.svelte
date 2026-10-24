@@ -826,7 +826,8 @@
     if (!cy) return;
     cy.batch(() => {
       cy!.elements().removeClass('muted');
-      if (!keep || !keep.size) return;
+      // an empty set that is not null is an active selection that holds nothing
+      if (!keep) return;
       cy!
         .nodes()
         .filter((n) => !keep.has(n.id()))

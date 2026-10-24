@@ -42,12 +42,14 @@ mod http;
 mod ingest;
 #[cfg(feature = "fmt")]
 mod lsp;
+mod map_cmd;
 #[cfg(feature = "mcp")]
 mod mcp;
 #[cfg(feature = "memory")]
 mod memory_cmd;
 mod migrate_cmd;
 mod model_store;
+mod views_cmd;
 // the pipeline that uses most of the model clients (`ask`) needs the `mcp` feature
 #[cfg_attr(not(feature = "mcp"), allow(dead_code, unused_imports))]
 mod models;
@@ -61,6 +63,7 @@ mod outbound;
 mod patch_cmd;
 #[cfg(feature = "auth")]
 mod ping_cmd;
+mod projection;
 mod queries_cmd;
 mod quota_cmd;
 mod ratelimit;
@@ -1212,6 +1215,19 @@ enum Cmd {
         /// none; a run then reads it back from a persistent dataset)
         #[arg(long, value_name = "N", default_value_t = state::DEFAULT_REASON_CACHE_TRIPLES)]
         reason_cache_triples: usize,
+        /// The most live queries (`GET /{ds}/live`) running at once on one dataset
+        #[arg(long, value_name = "N", default_value_t = 1000)]
+        max_live_queries: usize,
+        /// The most live queries one principal runs on a dataset at once
+        #[arg(long, value_name = "N", default_value_t = 20)]
+        max_live_queries_per_principal: usize,
+        /// A view's maintenance pass that runs longer suspends the view
+        #[arg(long, value_name = "SECS", default_value_t = 30.0)]
+        view_pass_timeout: f64,
+        /// The memory all views of a dataset may keep together, in MiB (default: no
+        /// limit beyond each view's memoryBytes)
+        #[arg(long, value_name = "MB")]
+        views_memory: Option<u64>,
         /// Threads that materializations evaluate rules on, shared by all runs (default:
         /// half the cores; 0: all of them, on the pool queries also use)
         #[arg(long, value_name = "N")]
@@ -1220,6 +1236,10 @@ enum Cmd {
         /// run of the server; a request may ask for fewer with `maxInferred` (0: no limit)
         #[arg(long, value_name = "N", default_value_t = state::DEFAULT_REASON_MAX_INFERRED)]
         reason_max_inferred: usize,
+        /// The facts one query's query-time reasoning (`reasoning=demand`) may derive,
+        /// magic facts aside; a request may ask for fewer with `maxDerived` (0: no limit)
+        #[arg(long, value_name = "N", default_value_t = state::DEFAULT_REASON_MAX_DERIVED)]
+        reason_max_derived: usize,
         /// Compress responses for clients that accept it: auto or off
         #[arg(long, default_value = "auto", value_name = "MODE")]
         http_compression: String,
@@ -1559,6 +1579,10 @@ enum Cmd {
         /// Print the query plan instead of executing
         #[arg(long)]
         explain: bool,
+        /// Follow the query on --server as a live query: print the result, then the rows
+        /// each commit adds (+) and removes (-), or JSON lines with --results json
+        #[arg(long, requires = "server", conflicts_with_all = ["explain", "at"])]
+        live: bool,
         /// Print the executed plan and timing after the results
         #[arg(long)]
         time: bool,
@@ -1588,6 +1612,22 @@ enum Cmd {
         /// RDFS on read with the schema in this graph of the database: `default` or an IRI
         #[arg(long, value_name = "GRAPH")]
         rdfs_graph: Option<String>,
+        /// Reasoning: `materialized` (the default) reads the inferred graph, `demand`
+        /// derives the facts the query needs from the rules when it runs, without the
+        /// inferred graph, and `false` reads the asserted data alone
+        #[arg(long, value_name = "MODE", value_parser = ["materialized", "true", "demand", "false"])]
+        reasoning: Option<String>,
+        /// The rules of `--reasoning demand`: rdfs, rdfs-simple or owl-rl (default: the
+        /// profile of the last materialization)
+        #[arg(long, value_name = "PROFILE", conflicts_with = "rules")]
+        profile: Option<String>,
+        /// A Jena rule file for `--reasoning demand`, backward rules included
+        #[arg(long, value_name = "FILE")]
+        rules: Option<PathBuf>,
+        /// The facts `--reasoning demand` may derive for the query, magic facts aside
+        /// (default 1,000,000; 0: no limit)
+        #[arg(long, value_name = "N")]
+        max_derived: Option<usize>,
         /// How DESCRIBE describes a resource: cbd, scbd or outgoing (default: the
         /// database's setting, see `describe-settings`)
         #[arg(long, value_name = "MODE")]
@@ -1666,6 +1706,8 @@ enum Cmd {
     /// Show or change a dataset's automatic compaction settings, on a local database or
     /// on a server
     Compaction(compaction_cmd::CompactionArgs),
+    /// Manage incremental views, on a local database or on a server
+    Views(views_cmd::ViewsArgs),
     /// Ask a server whether it is ready (GET /$/ready), over HTTPS or HTTP: exit status 0
     /// when it answers 200. The container image's health check runs it.
     #[cfg(feature = "auth")]
@@ -2098,6 +2140,9 @@ enum Cmd {
     /// CSV and TSV tables: convert them to RDF without loading, or print the CSVW
     /// metadata of the default mapping
     Csv(csv_cmd::CsvCmdArgs),
+    /// R2RML, RML and YARRRML mappings: run, check and convert them, draft one from a
+    /// SQLite database, and manage the mappings stored with a dataset
+    Map(map_cmd::MapArgs),
 }
 
 fn store_opts(cli: &Cli) -> StoreOptions {
@@ -2629,8 +2674,13 @@ fn run() -> Result<()> {
             mut auto_reason,
             auto_reason_max_delay,
             reason_cache_triples,
+            max_live_queries,
+            max_live_queries_per_principal,
+            view_pass_timeout,
+            views_memory,
             reason_threads,
             reason_max_inferred,
+            reason_max_derived,
             http_compression,
             http_compression_level,
             http_compression_algorithms,
@@ -2929,7 +2979,21 @@ fn run() -> Result<()> {
                 );
             }
             st.reason_cache_triples = reason_cache_triples;
+            if !(view_pass_timeout.is_finite() && view_pass_timeout > 0.0) {
+                anyhow::bail!("--view-pass-timeout must be a positive number of seconds");
+            }
+            st.views_options = sparkles::incr::RuntimeOptions {
+                max_live: max_live_queries,
+                max_live_per_principal: max_live_queries_per_principal,
+                pass_timeout: Duration::from_secs_f64(view_pass_timeout),
+                views_memory: views_memory.map(|m| m << 20),
+                ..Default::default()
+            };
+            for (_, ds) in st.open_datasets() {
+                ds.views.set_options(st.views_options.clone());
+            }
             st.reason_max_inferred = no_limit_if_zero(reason_max_inferred);
+            st.reason_max_derived = no_limit_if_zero(reason_max_derived);
             #[cfg(feature = "reasoning")]
             sparkles::reasoning::set_reason_threads(
                 reason_threads.unwrap_or_else(sparkles::reasoning::default_reason_threads),
@@ -3265,6 +3329,7 @@ fn run() -> Result<()> {
         Cmd::Tools(cmd) => tools::run(cmd, opts),
         Cmd::Config(args) => config_cmd::run(args),
         Cmd::Csv(args) => csv_cmd::run(args),
+        Cmd::Map(args) => map_cmd::run(args, opts),
         Cmd::Load {
             loc,
             graph,
@@ -3287,8 +3352,25 @@ fn run() -> Result<()> {
                 .map(sparkles::annotations::validate_message)
                 .transpose()?
                 .flatten();
-            // tables become temporary N-Triples files, kept until the load is done
-            let prepared = csv_cmd::prepare(&files, &csv)?;
+            // a template with --lookup reads the database's head before the load
+            let early = match (&loc, csv.lookup) {
+                (Some(loc), true) => Some(open_for_write(loc, opts.clone(), no_validate)?),
+                _ => None,
+            };
+            let lookup = early.as_ref().map(|db| {
+                let snapshot = db.snapshot();
+                sparkles::tabular::template::Lookup {
+                    prefixes: db.prefixes().into_iter().collect(),
+                    commit: db.head_commit().seq,
+                    snapshot,
+                    graphs: None,
+                }
+            });
+            // tables become temporary N-Triples files, kept until the load is done, and
+            // a mapping's quads go into --graph when it is given
+            let mut csv = csv;
+            csv.graph = graph.clone();
+            let prepared = csv_cmd::prepare(&files, &csv, lookup)?;
             let files = &prepared.files;
             // the term checks read the files once before anything is written
             if check {
@@ -3326,7 +3408,10 @@ fn run() -> Result<()> {
             if files.is_empty() {
                 bail!("no files given");
             }
-            let store = open_for_write(&loc, opts, no_validate)?;
+            let store = match early {
+                Some(db) => db,
+                None => open_for_write(&loc, opts, no_validate)?,
+            };
             let g = graph.map(oxrdf::NamedNode::new).transpose()?;
             let explicit = match compression.as_str() {
                 "auto" => None,
@@ -3380,6 +3465,7 @@ fn run() -> Result<()> {
             results: fmt,
             execution,
             explain,
+            live,
             time,
             timeout,
             at,
@@ -3390,6 +3476,10 @@ fn run() -> Result<()> {
             insecure_http,
             rdfs,
             rdfs_graph,
+            reasoning,
+            profile,
+            rules,
+            max_derived,
             describe,
             describe_labels,
             describe_reifiers,
@@ -3402,8 +3492,17 @@ fn run() -> Result<()> {
                 (None, Some(t)) => t,
                 _ => bail!("no query given"),
             };
+            if live && (loc.is_some() || !data.is_empty()) {
+                bail!("--live follows a query on --server, not on --loc or --data");
+            }
             if loc.is_none() && data.is_empty() && server.is_some() {
                 let ds = remote_dataset(server.as_deref(), dataset.as_deref())?;
+                if live {
+                    #[cfg(feature = "auth")]
+                    return views_cmd::live(server.as_deref(), insecure_http, &ds, &q, &fmt);
+                    #[cfg(not(feature = "auth"))]
+                    return no_remote(&ds, insecure_http);
+                }
                 // the server's DESCRIBE request parameters, over the dataset's setting
                 let mut params: Vec<(&str, String)> = Vec::new();
                 if let Some(execution) = &execution {
@@ -3425,6 +3524,18 @@ fn run() -> Result<()> {
                 if let Some(n) = describe_max_depth {
                     params.push(("describe-max-depth", n.to_string()));
                 }
+                if let Some(r) = &reasoning {
+                    params.push(("reasoning", r.clone()));
+                }
+                if let Some(p) = &profile {
+                    params.push(("reasoningProfile", p.clone()));
+                }
+                if let Some(n) = max_derived.filter(|&n| n > 0) {
+                    params.push(("maxDerived", n.to_string()));
+                }
+                if rules.is_some() {
+                    bail!("--rules needs a local database (--loc or --data), not --server");
+                }
                 #[cfg(feature = "auth")]
                 return remote::client::query(
                     server.as_deref(),
@@ -3443,6 +3554,10 @@ fn run() -> Result<()> {
             // the dataset's query defaults (RDFS on read, the inferred overlay and
             // DESCRIBE), as a server and the library apply them
             let (ds, _main) = open_or_load(loc, &data, opts)?.into_dataset();
+            // a query that reads views waits for them to be recovered or built
+            if q.contains(sparkles::incr::VIEW_NS) && ds.state().views.has_views() {
+                ds.views().settle(Duration::from_secs(3600));
+            }
             let store = ds.store();
             let defaults = ds.query_options();
             use sparkles::sparql::rdfs::{RdfsOnRead, RdfsSchema, SchemaSource};
@@ -3474,6 +3589,14 @@ fn run() -> Result<()> {
                 },
                 ..defaults
             };
+            let qopts = query_reasoning_options(
+                &ds,
+                qopts,
+                reasoning.as_deref(),
+                profile,
+                rules,
+                max_derived,
+            )?;
             let snap = match at {
                 Some(a) => {
                     let a: sparkles::history::At = a.parse()?;
@@ -3840,6 +3963,7 @@ fn run() -> Result<()> {
         Cmd::Models(args) => models_cmd::run(args),
         Cmd::Dataset { cmd } => dataset_cmd::run(cmd, opts),
         Cmd::Compaction(args) => compaction_cmd::run(args, opts),
+        Cmd::Views(args) => views_cmd::run(args, opts),
         #[cfg(feature = "auth")]
         Cmd::Ping(args) => ping_cmd::run(args),
         Cmd::VocabIndex { loc } => {
@@ -5515,4 +5639,58 @@ fn print_patterns(s: &sparkles::store::Snapshot) -> anyhow::Result<()> {
         }
     }
     Ok(())
+}
+
+/// The options of `sparkles query` with its `--reasoning`, `--profile`, `--rules` and
+/// `--max-derived` (spec F17).
+fn query_reasoning_options(
+    ds: &sparkles::Dataset,
+    qopts: QueryOptions,
+    reasoning: Option<&str>,
+    profile: Option<String>,
+    rules: Option<PathBuf>,
+    max_derived: Option<usize>,
+) -> Result<QueryOptions> {
+    match reasoning {
+        None | Some("materialized") | Some("true") => {
+            if profile.is_some() || rules.is_some() || max_derived.is_some() {
+                bail!("--profile, --rules and --max-derived need --reasoning demand");
+            }
+            Ok(qopts)
+        }
+        Some("false") => Ok(QueryOptions {
+            default_graph_extra: Vec::new(),
+            rdfs: None,
+            ..qopts
+        }),
+        Some("demand") => {
+            #[cfg(feature = "reasoning")]
+            {
+                let profile = match (profile, rules) {
+                    (_, Some(f)) => Some(sparkles_reasoner::Profile::Rules(
+                        std::fs::read_to_string(&f)
+                            .with_context(|| format!("--rules {}", f.display()))?,
+                    )),
+                    (Some(p), None) => Some(p.parse::<sparkles_reasoner::Profile>()?),
+                    (None, None) => None,
+                };
+                let r = ds.query_reasoner(profile)?;
+                let r = match max_derived {
+                    Some(0) => r.with_max_derived(usize::MAX),
+                    Some(n) => r.with_max_derived(n),
+                    None => r,
+                };
+                Ok(QueryOptions {
+                    reasoning: Some(r.provider()),
+                    ..qopts
+                })
+            }
+            #[cfg(not(feature = "reasoning"))]
+            {
+                let _ = (ds, profile, rules, max_derived);
+                bail!("built without the `reasoning` feature")
+            }
+        }
+        Some(other) => bail!("--reasoning must be materialized, demand or false, not {other}"),
+    }
 }

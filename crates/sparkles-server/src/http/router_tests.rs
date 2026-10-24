@@ -36,6 +36,7 @@ mod geo_convert;
 mod group_commit;
 mod inline;
 mod loads;
+mod mappings;
 #[cfg(feature = "mcp")]
 mod mcp;
 mod open;
@@ -46,6 +47,7 @@ mod rename;
 mod sd;
 mod tabular;
 mod tasks;
+mod views;
 
 const DATA: &str = r#"
 @prefix ex: <http://example.org/> .

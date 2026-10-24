@@ -1403,8 +1403,71 @@ impl PyDataset {
     }
 
     #[getter]
+    fn forms(slf: Py<Self>) -> crate::forms::PyForms {
+        crate::forms::PyForms { owner: slf }
+    }
+
+    #[getter]
     fn queries(slf: Py<Self>) -> crate::queries::PyStoredQueries {
         crate::queries::PyStoredQueries { owner: slf }
+    }
+
+    #[getter]
+    fn mappings(slf: Py<Self>) -> crate::mappings::PyStoredMappings {
+        crate::mappings::PyStoredMappings { owner: slf }
+    }
+
+    /// Run an R2RML, RML or YARRRML mapping and load its quads in one commit.
+    #[pyo3(signature=(text,*,kind=None,sources=None,connections=None,directory=None,base=None,graph=None))]
+    #[allow(clippy::too_many_arguments)]
+    fn run_mapping<'py>(
+        &self,
+        py: Python<'py>,
+        text: &str,
+        kind: Option<&str>,
+        sources: Option<std::collections::BTreeMap<String, std::path::PathBuf>>,
+        connections: Option<std::collections::BTreeMap<String, String>>,
+        directory: Option<std::path::PathBuf>,
+        base: Option<String>,
+        graph: Option<String>,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        let ds = self.ds_for_write(py)?;
+        crate::mappings::run_text(
+            py,
+            ds,
+            text,
+            kind,
+            sources,
+            connections,
+            directory,
+            base,
+            graph,
+        )
+    }
+
+    #[getter]
+    fn views(slf: Py<Self>) -> crate::views::PyViews {
+        crate::views::PyViews { owner: slf }
+    }
+
+    /// Subscribe to a SELECT, ASK or CONSTRUCT query: iterate the result for the
+    /// snapshot and then a diff after each commit that changes it.
+    #[pyo3(signature=(query, *, after=None))]
+    fn live(
+        &self,
+        py: Python<'_>,
+        query: &str,
+        after: Option<u64>,
+    ) -> PyResult<crate::views::PyLiveQuery> {
+        let ds = self.ds(py)?;
+        let o = sparkles::incr::LiveOptions {
+            after,
+            ..Default::default()
+        };
+        let live = py.detach(|| ds.live(query, &o)).py(py)?;
+        Ok(crate::views::PyLiveQuery {
+            live: std::sync::Mutex::new(Some(std::sync::Arc::new(live))),
+        })
     }
 
     #[getter]

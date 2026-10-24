@@ -66,6 +66,11 @@ pub const ROUTES: &[(&str, &[&str])] = &[
     ("/$/schema/{ds}/profiles", &["GET"]),
     ("/$/schema/{ds}/diff", &["GET"]),
     ("/$/graph/{ds}/groups", &["POST"]),
+    ("/$/graph/{ds}/facets", &["POST"]),
+    // editing forms (U02): the check and the save check write on the branch they name
+    ("/$/forms/{ds}", &["GET"]),
+    ("/$/forms/{ds}/check", &["POST"]),
+    ("/$/forms/{ds}/save", &["POST"]),
     ("/$/compact/{ds}", &["POST"]),
     ("/$/backup/{ds}", &["POST"]),
     ("/$/reason/{ds}", &["GET", "POST", "DELETE"]),
@@ -117,6 +122,7 @@ pub const ROUTES: &[(&str, &[&str])] = &[
     ("/$/graphrag/{ds}/confirm", &["POST"]),
     ("/$/graphrag/{ds}/communities", &["GET"]),
     ("/$/graphrag/{ds}/community", &["GET"]),
+    ("/$/graphrag/{ds}/memberships", &["POST"]),
     ("/$/graphrag/{ds}/review", &["POST"]),
     // layered dataset settings (C19 §6)
     ("/$/settings", &["GET"]),
@@ -140,6 +146,17 @@ pub const ROUTES: &[(&str, &[&str])] = &[
     ("/$/queries/{ds}/{name}", &["GET", "PUT", "DELETE"]),
     ("/$/queries/{ds}/{name}/versions", &["GET"]),
     ("/{ds}/queries/{name}", &["GET", "POST"]),
+    // stored mappings (F19 §2.2): admin stores them, write runs them
+    ("/$/mappings/{ds}", &["GET"]),
+    ("/$/mappings/{ds}/{name}", &["GET", "PUT", "DELETE"]),
+    ("/$/mappings/{ds}/{name}/versions", &["GET"]),
+    ("/{ds}/mappings/{name}/run", &["POST"]),
+    // incremental views and live queries (F13): readers list views and subscribe,
+    // admins define them
+    ("/$/views/{ds}", &["GET"]),
+    ("/$/views/{ds}/{name}", &["GET", "PUT", "DELETE"]),
+    ("/$/views/{ds}/{name}/rebuild", &["POST"]),
+    ("/{ds}/live", &["GET"]),
     // graph algorithms (F14): a run that writes also needs write on the dataset
     ("/$/algo/{ds}/run", &["POST"]),
     ("/$/algo/{ds}/projections", &["GET"]),
@@ -160,6 +177,7 @@ pub const ROUTES: &[(&str, &[&str])] = &[
     ("/$/vector/{ds}/{name}/rebuild", &["POST"]),
     ("/$/vector/{ds}/{name}/reembed", &["POST"]),
     ("/$/vector/{ds}/{name}/recall", &["POST"]),
+    ("/$/vector/{ds}/{name}/projection", &["GET", "POST"]),
     ("/$/snapshots/{ds}", &["GET", "POST"]),
     ("/$/snapshots/{ds}/{name}", &["GET", "DELETE"]),
     ("/$/history/{ds}", &["GET", "PUT"]),
@@ -326,6 +344,9 @@ pub fn need(route: &str, method: &Method, uri: &Uri, headers: &HeaderMap) -> Opt
         "/$/algo/{ds}/run" | "/$/algo/{ds}/projections" => Dataset(Read),
         "/$/algo/{ds}/projections/{name}" if get => Dataset(Read),
         "/$/algo/{ds}/projections/{name}" => Dataset(Admin),
+        "/$/views/{ds}" | "/{ds}/live" => Dataset(Read),
+        "/$/views/{ds}/{name}" if get => Dataset(Read),
+        "/$/views/{ds}/{name}" | "/$/views/{ds}/{name}/rebuild" => Dataset(Admin),
         "/$/queries/{ds}/suggestions" if *method == Method::POST => Dataset(Read),
         "/$/queries/{ds}/suggestions" => Dataset(Admin),
         "/$/memory/{ds}" if get => Dataset(Read),
@@ -350,9 +371,10 @@ pub fn need(route: &str, method: &Method, uri: &Uri, headers: &HeaderMap) -> Opt
         | "/$/ingest/{ds}/{task}/approve" => Dataset(Read),
         "/$/assistant/{ds}" if get => Dataset(Read),
         "/$/assistant/{ds}" => Dataset(Admin),
-        "/$/graphrag/{ds}" | "/$/graphrag/{ds}/communities" | "/$/graphrag/{ds}/community" => {
-            Dataset(Read)
-        }
+        "/$/graphrag/{ds}"
+        | "/$/graphrag/{ds}/communities"
+        | "/$/graphrag/{ds}/community"
+        | "/$/graphrag/{ds}/memberships" => Dataset(Read),
         // a build sends the dataset to a provider and spends the dataset's budget
         "/$/graphrag/{ds}/build" | "/$/graphrag/{ds}/refresh" | "/$/graphrag/{ds}/confirm" => {
             Dataset(Admin)
@@ -387,7 +409,11 @@ pub fn need(route: &str, method: &Method, uri: &Uri, headers: &HeaderMap) -> Opt
         | "/$/merge/{ds}"
         | "/$/revert/{ds}"
         | "/$/cherry-pick/{ds}"
-        | "/$/commit-graph/{ds}" => Dataset(Read),
+        | "/$/commit-graph/{ds}"
+        // a form's check or save names its branch in the body: the handlers check write
+        // on the branch it resolves to
+        | "/$/forms/{ds}/check"
+        | "/$/forms/{ds}/save" => Dataset(Read),
         "/$/ready/{ds}"
         | "/$/stats/{ds}"
         | "/$/schema/{ds}"
@@ -398,6 +424,8 @@ pub fn need(route: &str, method: &Method, uri: &Uri, headers: &HeaderMap) -> Opt
         | "/$/schema/{ds}/profiles"
         | "/$/schema/{ds}/diff"
         | "/$/graph/{ds}/groups"
+        | "/$/graph/{ds}/facets"
+        | "/$/forms/{ds}"
         | "/$/reason/{ds}/diagnostics"
         | "/$/prefixes/{ds}"
         | "/$/commits/{ds}"
@@ -405,9 +433,12 @@ pub fn need(route: &str, method: &Method, uri: &Uri, headers: &HeaderMap) -> Opt
         | "/$/commits/{ds}/{reference}"
         | "/$/queries/{ds}"
         | "/$/queries/{ds}/{name}/versions"
+        | "/$/mappings/{ds}"
+        | "/$/mappings/{ds}/{name}/versions"
         | "/{ds}/queries/{name}"
         | "/$/vector/{ds}"
         | "/$/vector/{ds}/{name}/recall"
+        | "/$/vector/{ds}/{name}/projection"
         | "/{ds}/sparql"
         | "/{ds}/query"
         | "/{ds}/explain"
@@ -434,6 +465,7 @@ pub fn need(route: &str, method: &Method, uri: &Uri, headers: &HeaderMap) -> Opt
         | "/$/geo/{ds}"
         | "/$/vector/{ds}/{name}"
         | "/$/queries/{ds}/{name}"
+        | "/$/mappings/{ds}/{name}"
         | "/$/snapshots/{ds}"
         | "/$/snapshots/{ds}/{name}"
         | "/$/history/{ds}"
@@ -470,6 +502,8 @@ pub fn need(route: &str, method: &Method, uri: &Uri, headers: &HeaderMap) -> Opt
         | "/$/snapshots/{ds}/{name}"
         | "/$/history/{ds}"
         | "/$/queries/{ds}/{name}"
+        // a stored mapping names connections, and can read any table they reach
+        | "/$/mappings/{ds}/{name}"
         | "/$/validation/{ds}"
         | "/$/graphql/{ds}"
         | "/$/rdfs/{ds}"
@@ -497,7 +531,9 @@ pub fn need(route: &str, method: &Method, uri: &Uri, headers: &HeaderMap) -> Opt
         | "/$/backups/{ds}/{repo}/{backup}"
         | "/$/backups/{ds}/{repo}/{backup}/restore"
         | "/$/backups/{ds}/{repo}/{backup}/verify" => Dataset(Admin),
-        "/{ds}/update" | "/{ds}/upload" | "/{ds}/facts" => Dataset(Write),
+        "/{ds}/update" | "/{ds}/upload" | "/{ds}/facts" | "/{ds}/mappings/{name}/run" => {
+            Dataset(Write)
+        }
         "/{ds}/memory/brief" => Dataset(Read),
         "/{ds}/sources" if get => Dataset(Read),
         "/{ds}/sources" => Dataset(Write),
@@ -544,7 +580,12 @@ pub fn endpoint(route: &str, method: &Method, uri: &Uri, headers: &HeaderMap) ->
         | "/{ds}/text"
         | "/{ds}/geo"
         | "/{ds}/queries/{name}"
-        | "/$/graph/{ds}/groups" => Endpoint::Query,
+        | "/{ds}/live"
+        | "/$/graph/{ds}/groups"
+        | "/$/graph/{ds}/facets"
+        | "/$/graphrag/{ds}/memberships"
+        | "/$/forms/{ds}" => Endpoint::Query,
+        "/$/forms/{ds}/check" | "/$/forms/{ds}/save" => Endpoint::Update,
         "/{ds}/graphql" | "/{ds}/graphql/schema" => Endpoint::Graphql,
         "/{ds}/update" | "/{ds}/facts" => Endpoint::Update,
         "/{ds}/sources" if get => Endpoint::Query,
@@ -552,7 +593,7 @@ pub fn endpoint(route: &str, method: &Method, uri: &Uri, headers: &HeaderMap) ->
         "/{ds}/get" => Endpoint::GspR,
         "/{ds}/data" | "/{ds}/{*graph}" if get => Endpoint::GspR,
         "/{ds}/data" | "/{ds}/{*graph}" => Endpoint::GspRw,
-        "/{ds}/upload" => Endpoint::Upload,
+        "/{ds}/upload" | "/{ds}/mappings/{name}/run" => Endpoint::Upload,
         "/{ds}/patch" => Endpoint::Patch,
         "/{ds}/shacl" => Endpoint::Shacl,
         "/{ds}/shex" => Endpoint::Shex,
@@ -595,6 +636,7 @@ pub fn whole_dataset(route: &str, method: &Method) -> bool {
         | "/$/reason/{ds}/diagnostics"
         | "/$/vector/{ds}"
         | "/$/vector/{ds}/{name}/recall"
+        | "/$/vector/{ds}/{name}/projection"
         | "/{ds}/shacl"
         | "/{ds}/shex" => true,
         "/$/reason/{ds}"
@@ -1234,7 +1276,9 @@ async fn enforce(st: &AppState, auth: &super::Auth, mut req: Request, next: Next
                 || route.starts_with("/$/merge/")
                 || route.starts_with("/$/revert/")
                 || route.starts_with("/$/cherry-pick/")
-                || route.starts_with("/$/commit-graph/");
+                || route.starts_with("/$/commit-graph/")
+                || route == "/$/forms/{ds}/check"
+                || route == "/$/forms/{ds}/save";
             let have = if branch_routes {
                 p.level_any_branch(&ds)
             } else {

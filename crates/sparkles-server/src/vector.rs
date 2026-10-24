@@ -38,6 +38,10 @@ pub fn routes() -> Router<Arc<crate::state::AppState>> {
         .route("/$/vector/{ds}/{name}/rebuild", post(rebuild))
         .route("/$/vector/{ds}/{name}/reembed", post(reembed))
         .route("/$/vector/{ds}/{name}/recall", post(recall))
+        .route(
+            "/$/vector/{ds}/{name}/projection",
+            get(crate::projection::answer).post(crate::projection::compute),
+        )
 }
 
 /// `GET /$/vector/{ds}`: the memory budget, the configured indexes, and the predicates

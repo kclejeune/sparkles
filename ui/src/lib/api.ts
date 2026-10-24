@@ -1,6 +1,7 @@
 // Typed client for the Sparkles HTTP API (see docs/API.md — the source of truth).
 // All paths are absolute from the server root; the UI itself lives under /ui/.
 
+import { parsePoints, type Projection } from './embedding';
 import { CSRF_HEADER, needsCsrf, type Level } from './auth';
 import { fmtBytes, fmtInt } from './format';
 import { branchPath } from './branches';
@@ -346,7 +347,8 @@ export type TaskKind =
   | 'backup-verify'
   | 'backup-gc'
   | 'graphrag'
-  | 'backup-policy';
+  | 'backup-policy'
+  | 'vector-projection';
 /** `queued`: waiting for a task slot; `cancelled`: stopped by `DELETE /$/tasks/{id}`. */
 export type TaskState = 'queued' | 'running' | 'done' | 'failed' | 'cancelled';
 export type Task = {
@@ -882,6 +884,10 @@ export async function listTasks(): Promise<Task[]> {
 }
 
 export const getTask = (id: string) => json<Task>(`/$/tasks/${enc(id)}`);
+
+/** `DELETE /$/tasks/{id}`: stop a cancellable task. */
+export const cancelTask = (id: string) =>
+  json<unknown>(`/$/tasks/${enc(id)}`, { method: 'DELETE' });
 
 export async function prefixes(ds: string): Promise<Record<string, string>> {
   const body = await json<{ prefixes: Record<string, string> }>(`/$/prefixes/${enc(ds)}`);
@@ -3276,6 +3282,79 @@ export type GroupsAnswer = {
 export const graphGroups = (ds: string, req: GroupsRequest, signal?: AbortSignal) =>
   json<GroupsAnswer>(`/$/graph/${enc(ds)}/groups`, { ...jsonBody(req), signal });
 
+// ------------------------------------------------------------------- facets ------
+
+/** What a facet counts by: ranges of numbers, ranges of years, or the frequent values. */
+export type FacetKind = 'numeric' | 'date' | 'values';
+
+/** The set `POST /$/graph/{ds}/facets` counts. */
+export type FacetSetSpec =
+  | { class: string }
+  | { nodes: string[] }
+  | { query: string; variable: string };
+
+export type FacetSpec = {
+  property: string;
+  bins?: number;
+  top?: number;
+  kind?: FacetKind;
+  /** The edges of an earlier answer's ranges, kept as they are. */
+  edges?: number[];
+  /** The values of an earlier answer's bar list. */
+  bars?: Term[];
+};
+
+/** A brush: `[from, to)`, in whole years for a date facet, or values of a bar list. */
+export type FacetFilter =
+  | { property: string; range: [number, number]; kind?: 'numeric' | 'date' }
+  | { property: string; values: Term[] };
+
+export type FacetsRequest = {
+  within: FacetSetSpec;
+  facets?: FacetSpec[];
+  filters?: FacetFilter[];
+  candidates?: boolean;
+  at?: string;
+};
+
+export type FacetBin = { from: number; to: number; count: number };
+
+export type FacetAnswer = {
+  property: string;
+  kind?: FacetKind;
+  bins?: FacetBin[];
+  values?: { value: Term; count: number; label?: string }[];
+  other?: number;
+  missing?: number;
+  /** A facet over its budget, while the others stay. */
+  error?: { budget: string; message: string };
+};
+
+export type FacetsAnswer = {
+  commit: number;
+  size: number;
+  matching: number;
+  facets: FacetAnswer[];
+  candidates?: { property: string; share: number; kind: FacetKind }[];
+  truncated: boolean;
+};
+
+/** `POST /$/graph/{ds}/facets`, on the branch of a `ds@branch` target. */
+export function graphFacets(
+  target: string,
+  req: FacetsRequest,
+  signal?: AbortSignal,
+  opts: { reasoning?: boolean } = {},
+) {
+  const at = target.indexOf('@');
+  const p = new URLSearchParams();
+  if (at >= 0) p.set('branch', target.slice(at + 1));
+  if (opts.reasoning === false) p.set('reasoning', 'false');
+  const q = p.size ? `?${p}` : '';
+  const name = at < 0 ? target : target.slice(0, at);
+  return json<FacetsAnswer>(`/$/graph/${enc(name)}/facets${q}`, { ...jsonBody(req), signal });
+}
+
 /** One difference of a field between two reports: a value, or members of a list. */
 export type SchemaChange =
   | { path: string; from: unknown; to: unknown }
@@ -3439,4 +3518,52 @@ export async function runStoredQuery(
   const at = atInfo(res.headers);
   if (at) body.at = at;
   return normalizeResult(body);
+}
+
+// --- vector index projections (U11 Phase 3) ------------------------------------
+
+/** `POST /$/vector/{ds}/{name}/projection`: compute a projection, or start its task. */
+export async function computeProjection(
+  ds: string,
+  index: string,
+  method: 'pca' | 'neighbours',
+  opts: { seed?: number; iterations?: number; signal?: AbortSignal } = {},
+): Promise<{ task: Task } | { head: Record<string, unknown> }> {
+  const body: Record<string, number> = {};
+  if (opts.seed != null) body.seed = opts.seed;
+  if (opts.iterations != null) body.iterations = opts.iterations;
+  const res = await request(`/$/vector/${enc(ds)}/${enc(index)}/projection?method=${method}`, {
+    ...jsonBody(body),
+    signal: opts.signal,
+  });
+  const j = await res.json();
+  return res.status === 202 ? { task: j as Task } : { head: j };
+}
+
+/**
+ * `GET /$/vector/{ds}/{name}/projection` in the binary points format: the kept projection,
+ * in a region and coloured by a predicate when given.
+ */
+export async function vectorProjection(
+  ds: string,
+  index: string,
+  opts: {
+    method?: 'pca' | 'neighbours';
+    bbox?: [number, number, number, number];
+    limit?: number;
+    colour?: string;
+    signal?: AbortSignal;
+  } = {},
+): Promise<Projection> {
+  const p = new URLSearchParams();
+  if (opts.method) p.set('method', opts.method);
+  if (opts.bbox) p.set('bbox', opts.bbox.join(','));
+  if (opts.limit != null) p.set('limit', String(opts.limit));
+  if (opts.colour) p.set('colour', opts.colour);
+  const q = p.size ? `?${p}` : '';
+  const res = await request(`/$/vector/${enc(ds)}/${enc(index)}/projection${q}`, {
+    headers: { Accept: 'application/x-sparkles-points' },
+    signal: opts.signal,
+  });
+  return parsePoints(await res.arrayBuffer());
 }

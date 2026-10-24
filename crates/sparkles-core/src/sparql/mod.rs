@@ -39,6 +39,7 @@ pub mod pool;
 mod propertyext;
 pub(crate) mod query_memory;
 pub mod rdfs;
+pub mod reasoning;
 mod registeredagg;
 pub mod results;
 mod sample;
@@ -52,6 +53,7 @@ pub mod update;
 pub mod value;
 mod valuespush;
 mod vectortopk;
+pub mod viewsvc;
 mod zipper;
 
 use crate::error::{Error, Result};
@@ -162,9 +164,15 @@ pub struct QueryOptions {
     /// RDFS on read: patterns match the RDFS closure of each graph with respect to this
     /// schema (see [`rdfs`]).
     pub rdfs: Option<Arc<rdfs::RdfsOnRead>>,
+    /// Query-time reasoning (spec F17): the reasoner that derives, for this query, the
+    /// facts its patterns need (see [`reasoning`]). With it, the query reads neither the
+    /// inferred graph of `default_graph_extra` nor RDFS on read.
+    pub reasoning: Option<Arc<dyn reasoning::ReasoningProvider>>,
     /// The named projections of the dataset, for `algo:projection` in a graph algorithm
     /// call (see [`crate::algo::catalog`]).
     pub algo_projections: Option<Arc<crate::algo::catalog::Catalog>>,
+    /// The dataset's views, which `SERVICE view:read` reads (see [`viewsvc`]).
+    pub views: Option<Arc<dyn viewsvc::ViewSource>>,
     /// The outbound budget the request spends (`None`: a new one from
     /// [`outbound`](Self::outbound)), shared by several requests that count as one.
     pub outbound_budget: Option<Arc<crate::outbound::RequestBudget>>,
@@ -534,6 +542,7 @@ fn make_ctx(
     };
     ctx.use_cache = !opts.no_cache;
     ctx.algo_projections = opts.algo_projections.clone();
+    ctx.views = opts.views.clone();
     ctx.extensions = opts.extensions.clone();
     if let Some(s) = &opts.service_scope {
         ctx.service_scope = s.clone();
@@ -754,6 +763,21 @@ struct PreparedQuery {
     plan_depth: usize,
 }
 
+/// With query-time reasoning, the options the context is made with: without the inferred
+/// graph in the default graph and without RDFS on read (spec F17 §2.1, §4.4), and whether
+/// RDFS on read was set and does not apply.
+fn demand_options(opts: &QueryOptions) -> (Option<QueryOptions>, bool) {
+    if opts.reasoning.is_none() {
+        return (None, false);
+    }
+    let o = QueryOptions {
+        default_graph_extra: Vec::new(),
+        rdfs: None,
+        ..opts.clone()
+    };
+    (Some(o), opts.rdfs.is_some())
+}
+
 /// Semantic preparation shared by eager execution and snapshot-owning cursors.
 fn prepare_query(
     snap: Arc<Snapshot>,
@@ -764,12 +788,26 @@ fn prepare_query(
 ) -> Result<PreparedQuery> {
     let (pattern, dataset, base) = split(parsed);
     extensions::check_family(snap.dataset_id)?;
-    let mut ctx = make_ctx(snap, opts, dataset, base)?;
+    let (demand_opts, rdfs_skipped) = demand_options(opts);
+    let mut ctx = make_ctx(snap, demand_opts.as_ref().unwrap_or(opts), dataset, base)?;
     if let Some(started) = cursor_started.filter(|_| automatic.is_none()) {
         ctx.enable_cursor_accounting()?;
         ctx.deadline = opts.effective_deadline(started)?;
     }
     ctx.configure_extensions(pattern);
+    if let Some(provider) = &opts.reasoning {
+        reasoning::check_form(parsed)?;
+        reasoning::apply(
+            &mut ctx,
+            provider,
+            pattern,
+            opts,
+            dataset,
+            base,
+            rdfs_skipped,
+            true,
+        )?;
+    }
     // EXISTS is planned only when rows reach it, so the algebra decides, not the planner
     if algosvc::calls_algorithm(pattern) {
         ctx.note_algorithm_call();
@@ -886,6 +924,9 @@ fn execute_prepared(
         Err(e) => return Err(failed(e, None, None)),
     };
     ioacct::mark("executed");
+    if let Some(a) = &ctx.reasoning {
+        plan = a.wrap(plan);
+    }
     plan.warnings = ctx.warnings();
     if ctx.graphs.is_some() {
         plan.redact();
@@ -1031,8 +1072,22 @@ pub fn explain(snap: Arc<Snapshot>, q: &str, opts: &QueryOptions) -> Result<(Str
     depth::with_stack(depth, || {
         let (pattern, dataset, base) = split(&parsed);
         extensions::check_family(snap.dataset_id)?;
-        let mut ctx = make_ctx(snap, opts, dataset, base)?;
+        let (demand_opts, rdfs_skipped) = demand_options(opts);
+        let mut ctx = make_ctx(snap, demand_opts.as_ref().unwrap_or(opts), dataset, base)?;
         ctx.configure_extensions(pattern);
+        if let Some(provider) = &opts.reasoning {
+            reasoning::check_form(&parsed)?;
+            reasoning::apply(
+                &mut ctx,
+                provider,
+                pattern,
+                opts,
+                dataset,
+                base,
+                rdfs_skipped,
+                false,
+            )?;
+        }
         crate::geo::validate_query(pattern, &mut |w| ctx.warn(w))?;
         let mut planner = Planner::new(&ctx);
         planner.source = Some(&parsed);
@@ -1055,6 +1110,9 @@ pub fn explain(snap: Arc<Snapshot>, q: &str, opts: &QueryOptions) -> Result<(Str
         let node = planner.plan(&pattern, &ActiveGraph::Default, Vec::new())?;
         depth::check_plan(node.depth())?;
         let mut info = exec::try_describe(&ctx, &node)?;
+        if let Some(a) = &ctx.reasoning {
+            info = a.wrap(info);
+        }
         if matches!(kind, QueryKind::Construct | QueryKind::Describe) {
             info = graph_root(kind, info, Instant::now());
             info.time_ms = 0.0;

@@ -264,7 +264,7 @@ fn route_op(route: Option<&str>, req: &Request) -> Op {
         "/{ds}/sparql" | "/{ds}/query" | "/{ds}/sparql/diff" | "/{ds}/queries/{name}" => Op::Query,
         "/{ds}/update" => Op::Update,
         "/{ds}/data" | "/{ds}/get" | "/{ds}/{*graph}" => Op::Gsp,
-        "/{ds}/upload" => Op::Upload,
+        "/{ds}/upload" | "/{ds}/mappings/{name}/run" => Op::Upload,
         "/{ds}/patch" => Op::Patch,
         "/{ds}/shacl" => Op::Shacl,
         "/{ds}/shex" => Op::Shex,
@@ -350,6 +350,7 @@ pub async fn observe(State(st): State<Arc<AppState>>, mut req: Request, next: Ne
     let otel = crate::otel::on_request(&span, &req, route.as_deref(), &id);
     req.extensions_mut().insert(RequestSpan(span.clone()));
     let op = route_op(route.as_deref(), &req);
+    let head = req.method() == axum::http::Method::HEAD;
     let mut pending = Pending::new(
         st,
         span,
@@ -385,7 +386,7 @@ pub async fn observe(State(st): State<Arc<AppState>>, mut req: Request, next: Ne
     pending.auth = auth;
     crate::otel::response_headers(&pending.otel, resp.headers_mut());
     if let Some(deferred) = resp.extensions_mut().remove::<DeferredReport>() {
-        deferred.observe(pending, resp.status().as_u16());
+        deferred.observe(pending, resp.status().as_u16(), head);
         let body = std::mem::replace(resp.body_mut(), axum::body::Body::empty());
         *resp.body_mut() = deferred.wrap(body);
     } else {
@@ -1280,6 +1281,136 @@ fn start_time_seconds(st: &AppState) -> f64 {
         .map_or(0.0, |d| d.as_secs_f64())
 }
 
+/// The metrics of incremental views and live queries (spec F13 §8.2), read from each
+/// open dataset's runtime.
+fn views_metrics(st: &AppState, o: &mut String) {
+    let family = |o: &mut String, name: &str, kind: &str, help: &str| {
+        let _ = writeln!(o, "# HELP {name} {help}");
+        let _ = writeln!(o, "# TYPE {name} {kind}");
+    };
+    // the datasets open now: metrics never open one
+    let open = st.open_datasets();
+    let stats: Vec<(String, sparkles::incr::RuntimeStats)> = open
+        .into_iter()
+        .map(|(n, ds)| {
+            let s = ds.views.stats(&ds.store);
+            (n, s)
+        })
+        .collect();
+    // datasets past the label cap share `$other`: their series are summed (lag: the most)
+    let mut per_view: std::collections::BTreeMap<(String, String), (u64, u64)> = Default::default();
+    let mut live: std::collections::BTreeMap<String, usize> = Default::default();
+    for (n, s) in &stats {
+        let label = st.metrics.dataset_label(Some(n));
+        *live.entry(label.clone()).or_default() += s.live_queries;
+        for v in &s.views {
+            let e = per_view.entry((label.clone(), v.name.clone())).or_default();
+            e.0 = e.0.max(v.lag_commits);
+            e.1 += v.state_bytes;
+        }
+    }
+    family(
+        o,
+        "sparkles_view_lag_commits",
+        "gauge",
+        "Commits a view is behind the head.",
+    );
+    for ((ds, view), (lag, _)) in &per_view {
+        let _ = writeln!(
+            o,
+            "sparkles_view_lag_commits{{dataset=\"{}\",view=\"{}\"}} {lag}",
+            escape_label(ds),
+            escape_label(view)
+        );
+    }
+    family(
+        o,
+        "sparkles_view_state_bytes",
+        "gauge",
+        "Approximate memory of a view's state.",
+    );
+    for ((ds, view), (_, bytes)) in &per_view {
+        let _ = writeln!(
+            o,
+            "sparkles_view_state_bytes{{dataset=\"{}\",view=\"{}\"}} {bytes}",
+            escape_label(ds),
+            escape_label(view)
+        );
+    }
+    family(o, "sparkles_live_queries", "gauge", "Live queries running.");
+    for (ds, n) in &live {
+        let _ = writeln!(
+            o,
+            "sparkles_live_queries{{dataset=\"{}\"}} {n}",
+            escape_label(ds)
+        );
+    }
+    let sum = |f: &dyn Fn(&sparkles::incr::RuntimeStats) -> f64| {
+        stats.iter().map(|(_, s)| f(s)).sum::<f64>()
+    };
+    family(
+        o,
+        "sparkles_live_events_total",
+        "counter",
+        "Events sent to live queries.",
+    );
+    let _ = writeln!(
+        o,
+        "sparkles_live_events_total {}",
+        sum(&|s| s.live_events as f64)
+    );
+    family(
+        o,
+        "sparkles_view_recompute_seconds_total",
+        "counter",
+        "Time spent evaluating recompute nodes of views and live queries.",
+    );
+    let _ = writeln!(
+        o,
+        "sparkles_view_recompute_seconds_total {:.6}",
+        sum(&|s| s.recompute_seconds)
+    );
+    family(
+        o,
+        "sparkles_view_pass_seconds",
+        "histogram",
+        "Time of a maintenance pass.",
+    );
+    let mut cum = 0u64;
+    for (i, le) in sparkles::incr::runtime::PASS_BUCKETS.iter().enumerate() {
+        cum += stats
+            .iter()
+            .map(|(_, s)| s.pass_buckets.get(i).copied().unwrap_or(0))
+            .sum::<u64>();
+        let _ = writeln!(o, "sparkles_view_pass_seconds_bucket{{le=\"{le}\"}} {cum}");
+    }
+    let total: u64 = stats
+        .iter()
+        .map(|(_, s)| s.pass_buckets.iter().sum::<u64>())
+        .sum();
+    let _ = writeln!(
+        o,
+        "sparkles_view_pass_seconds_bucket{{le=\"+Inf\"}} {total}"
+    );
+    let _ = writeln!(
+        o,
+        "sparkles_view_pass_seconds_sum {:.6}",
+        sum(&|s| s.pass_seconds_sum)
+    );
+    let _ = writeln!(o, "sparkles_view_pass_seconds_count {total}");
+    family(
+        o,
+        "sparkles_view_passes_skipped_total",
+        "counter",
+        "Passes a view's footprint skipped.",
+    );
+    let _ = writeln!(
+        o,
+        "sparkles_view_passes_skipped_total {}",
+        sum(&|s| s.skipped as f64)
+    );
+}
+
 fn escape_label(v: &str) -> String {
     v.replace('\\', "\\\\")
         .replace('"', "\\\"")
@@ -1856,8 +1987,10 @@ pub fn render_prometheus(st: &AppState) -> String {
     crate::geo::metrics(st, &mut o);
     crate::compaction::metrics(st, &mut o);
     crate::vector::metrics(st, &mut o);
+    crate::projection::metrics(st, &mut o);
     crate::http::history::metrics(st, &mut o);
     crate::http::branches::metrics(st, &mut o);
+    crate::http::algo_view_metrics(&mut o);
     crate::assistant::metrics(st, &mut o);
     crate::notify::metrics(st, &mut o);
     #[cfg(feature = "mcp")]
@@ -1867,6 +2000,7 @@ pub fn render_prometheus(st: &AppState) -> String {
     #[cfg(feature = "mcp")]
     crate::graphrag::http::metrics(st, &mut o);
     io_metrics(&mut o);
+    views_metrics(st, &mut o);
     if let Some(rss) = resident_bytes() {
         family(
             &mut o,
