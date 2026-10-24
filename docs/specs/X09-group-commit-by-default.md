@@ -1450,6 +1450,25 @@ metadata of the commits that the readers sealed during the last repetition, so i
 lock for a few file synchronizations rather than for all of them. The count of raced
 ticks starts again after such a tick whatever its outcome, as before.
 
+A pass synchronizes its files from up to eight threads. On `forge` each synchronization of a
+newly written file took about 1.5 ms on its own, because each forced its own journal commit,
+and the segments that the readers' searches commit are merged away within seconds, so nearly
+every file in the directory was new at each tick and synchronizing only the new files did
+not shorten the unlocked pass. Synchronizations issued together share journal commits. With
+one thread the locked pass still held the lock for a median of 24 ms, and with eight threads
+the unlocked pass fell from 77 ms to 28 or 32 ms, the repetitions caught up, and no tick of
+the same run needed the lock for its I/O. The first error any thread meets fails the pass,
+which puts all of its names back. Synchronization order among a pass's files does not
+matter for the invariant, because the marker goes only after every one of them and the
+directory have been synchronized.
+
+[BENCHMARKS.md](../BENCHMARKS.md#bounded-full-text-checkpoint-on-forge) has the traced runs
+of each step. Over two processes of each setting at a fixed 500 transactions/s, the shipped
+build had no write stall over 25 ms where the trace of e411a772 had 73, its longest write
+took 19.5 ms against 171.4 ms, and its maximum schedule lag was 31.0 and 37.9 ms ordinary
+and 10.1 and 10.7 ms grouped, within the 50 ms rule, against 159.6 to 165.6 ms. The reader p99
+was 3.8% higher on average, within the spread of these runs, and item 170 follows it up.
+
 The crash argument is the invariant of `text/lazydir.rs`, that `meta.json` never refers to
 unsynchronized data unless the marker exists, and the change keeps it. The marker is
 removed only when no write was counted and no atomic replacement was in flight between a
