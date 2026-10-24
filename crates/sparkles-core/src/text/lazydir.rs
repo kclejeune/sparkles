@@ -29,7 +29,8 @@
 //! file, as every checkpoint did before. The parent directory is synchronized when a file
 //! was created, renamed or removed since the last synchronization of it. A checkpoint that a
 //! write raced therefore still makes progress, and the next one has only the files written
-//! during it left to synchronize.
+//! during it left to synchronize. A pass synchronizes its files from several threads at
+//! once, because a journaling file system then commits their metadata together.
 //!
 //! The pathname lease serializes checkpoints with directory replacement. It does not
 //! stop Tantivy publication. The checkpoint streams file handles rather than pinning
@@ -109,6 +110,12 @@ impl std::fmt::Debug for LazySyncDir {
         write!(f, "LazySyncDir({:?})", self.shared.root)
     }
 }
+
+/// Threads that synchronize the files of one checkpoint pass at once. File systems that
+/// journal their metadata, such as ext4 and XFS, commit the metadata of concurrent
+/// synchronizations together, so a pass over newly written files costs a few journal
+/// commits rather than one for each file.
+const SYNC_THREADS: usize = 8;
 
 fn sync_dir(p: &Path) -> io::Result<()> {
     File::open(p)?.sync_all()
@@ -306,21 +313,57 @@ impl LazySyncDir {
 
     fn sync_files(&self, pending: &Pending) -> io::Result<()> {
         if pending.all {
+            let mut names = Vec::new();
             for entry in std::fs::read_dir(&self.shared.root)? {
                 let entry = entry?;
                 if entry.file_type()?.is_file() {
-                    self.sync_file(Path::new(&entry.file_name()))?;
+                    names.push(PathBuf::from(entry.file_name()));
                 }
             }
+            self.sync_paths(&names)?;
         } else {
-            for path in &pending.files {
-                self.sync_file(path)?;
-            }
+            self.sync_paths(&pending.files)?;
         }
         if pending.all || pending.dir {
             sync_dir(&self.shared.root)?;
         }
         Ok(())
+    }
+
+    /// Synchronize `paths` from up to [`SYNC_THREADS`] threads, each holding one file
+    /// open at a time. Returns once every synchronization has returned, with the first
+    /// error, after which the threads start no further ones.
+    fn sync_paths(&self, paths: &[PathBuf]) -> io::Result<()> {
+        use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+        if paths.len() < 2 {
+            return paths.iter().try_for_each(|p| self.sync_file(p));
+        }
+        let (next, failed) = (AtomicUsize::new(0), AtomicBool::new(false));
+        let work = || -> io::Result<()> {
+            while !failed.load(Ordering::Relaxed) {
+                let Some(path) = paths.get(next.fetch_add(1, Ordering::Relaxed)) else {
+                    break;
+                };
+                if let Err(e) = self.sync_file(path) {
+                    failed.store(true, Ordering::Relaxed);
+                    return Err(e);
+                }
+            }
+            Ok(())
+        };
+        std::thread::scope(|scope| {
+            let helpers: Vec<_> = (1..paths.len().min(SYNC_THREADS))
+                .map(|_| scope.spawn(work))
+                .collect();
+            let mut result = work();
+            for helper in helpers {
+                let joined = helper
+                    .join()
+                    .unwrap_or_else(|_| Err(io::Error::other("file synchronization panicked")));
+                result = result.and(joined);
+            }
+            result
+        })
     }
 
     fn sync_marker_parent(&self) -> io::Result<()> {

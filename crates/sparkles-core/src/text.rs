@@ -3112,12 +3112,13 @@ mod imp {
                 }
                 Ok(false) if live.raced >= RACED_BEFORE_LOCKED && self.healthy() => {
                     // Writes raced this attempt and the ones before it. A pass that
-                    // holds live keeps text publication out, so only a merge can still
-                    // race it. Unlocked passes first catch up on what was written during
-                    // the one before, so that the locked pass finds only a few files,
-                    // which bounds the stall to a few file synchronizations. The count
-                    // starts again either way, so a merge that races the locked pass
-                    // does not make the next ticks hold live.
+                    // holds live keeps text publication out, so only writes that Tantivy
+                    // makes from its own threads, such as a merge's, can still race it.
+                    // Unlocked passes first catch up on what was written during the one
+                    // before, so that the locked pass finds only a few files, which
+                    // bounds the stall to a few file synchronizations. The count starts
+                    // again either way, so a merge that races the locked pass does not
+                    // make the next ticks hold live.
                     live.raced = 0;
                     let mut passes = 0;
                     while passes < CATCH_UP_PASSES
