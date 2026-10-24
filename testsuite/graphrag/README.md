@@ -11,13 +11,15 @@ key and every request is reserved against the cap before it leaves.
 
 The `acceptance` phase builds reports for two clusters of ten people joined by one edge and
 checks A1, A3, A4 and A8 on them. A1 checks that every cited fact lies inside its
-community. A3 adds one fact and checks that a refresh keeps both communities and writes
+community, which means its subject is a member and so is its object unless that is a
+literal. A3 adds one fact and checks that a refresh keeps both communities and writes
 nothing. A4 adds seven more and checks that the refresh rewrites exactly one report, which
-revises the old one. A8 sets `tokensPerBuild` just above one report's reservation and checks
+revises the old one. A manual refresh compares digests when it runs, so the result records
+whether `status` showed the report stale beforehand rather than requiring it. A8 sets `tokensPerBuild` just above one report's reservation and checks
 that the build stops with a community pending. On the demo graph it checks A6, a global
-question classified `global` whose points cite findings that cite facts, and A7, which
-answers locally without reviewed reports and from reviewed reports alone once three are
-marked reviewed.
+question classified `global` whose answer carries point markers, each resolving to a point
+whose findings cite facts or child findings, and A7, which answers in local mode without
+reviewed reports and from reviewed reports alone once three are marked reviewed.
 
 The `generate` phase describes the demo graph from its classes, properties and labels and
 asks the generator model for five users, three tasks for each and two global questions for
@@ -26,14 +28,21 @@ each task, as Edge et al. do. The questions are checked and kept in `questions.j
 The `evaluate` phase answers every question of `questions.json` four ways. Ask answers in
 local mode. A text baseline retrieves the eight best paragraphs of the documents of
 `testsuite/ingest/sample.json` with BM25 and has the answering model answer from them.
-Global answering runs on a build with one level, which is the coarsest, and on a build with
-three levels, where Ask reads the finest level with at most 100 reports. The judge model
+Global answering runs on a build with `levels` 0, which keeps only the coarsest level, and
+on a build with `levels` 3, where Ask reads the finest level with at most 100 reports. The
+report lists the levels each mode answered from. The judge model
 compares every pair of answers in both orders on comprehensiveness, diversity, empowerment
 and directness, without citation markers, and the report gives each pair's win rate with a
 95% bootstrap interval over questions and the share of judgements that agree when the order
 is swapped. The phase also measures the classification of §7.1 on the global questions and
-a fixed sample of answerable demo questions in `auto` mode, checks the citations of every
-global answer with the judge, and records latency and build tokens. The demo graph is
+a fixed sample of answerable demo questions in `auto` mode, where an Ask that fails counts
+as failed rather than as either mode. It checks the citations of every global answer. Each
+sentence takes the markers that follow it, the findings of its points are resolved through
+child findings to the facts they cite, every cited fact is looked up in the projection,
+and the judge rates each claim against that evidence. A reply that does not give exactly
+one verdict per claim is asked once more and otherwise counted as incomplete. The phase
+also records latency and build tokens, and it refuses a questions file without a global
+question before any paid request. The demo graph is
 `testsuite/ask/org.ttl` with the gold facts of the labelled sample folded in, as if the
 documents had been ingested without error.
 
@@ -55,6 +64,7 @@ the carryover, the answering, judge and generator models, the effort, the output
 context window, the Ask deadline, the questions file, the number of local questions, the
 phases, and prior costs for a local Ask, a global Ask, a direct model call and a build
 request. The judge must be a different model from the answering one. Before each block the
-harness projects its cost from the priors, or from a build's own estimate, times
-`projectionMargin`, and stops when that passes what the cap leaves. `--dry-run` answers
+harness projects its cost from the priors and the request counts of the builds' own
+estimates, times `projectionMargin`, and stops when that passes what the cap leaves. The
+evaluation admits both of its builds together with its answers and judgements. `--dry-run` answers
 every request with an instance of its JSON schema from a local fake and reads no key.

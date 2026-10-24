@@ -929,6 +929,22 @@ class Clarifications(unittest.TestCase):
             },
         )
 
+    def test_an_n_triples_term_matches_its_iri(self):
+        # `link_entities` choices carry the IRI as an N-Triples term, and the answer
+        # keeps that spelling, which `--clarification` takes.
+        c = self.choices(
+            ("Salt Lake City, Utah", "<http://dbpedia.org/resource/Salt_Lake_City,_Utah>"),
+            ("Salt Lake City", "<http://dbpedia.org/resource/Salt_Lake_City>"),
+        )
+        self.assertEqual(
+            choose_clarification(c, self.GOLD),
+            {
+                "answer": "<http://dbpedia.org/resource/Salt_Lake_City>",
+                "index": 1,
+                "basis": "gold-iri",
+            },
+        )
+
     def test_words_decide_a_free_text_choice_and_ties_go_to_the_first(self):
         c = self.choices(("the mayor", "the mayor"), ("its time zone", "its time zone"))
         self.assertEqual(choose_clarification(c, self.GOLD)["index"], 1)

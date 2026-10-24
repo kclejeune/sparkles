@@ -10,6 +10,7 @@ local fake that answers every request with an instance of its schema, and reads 
 
 import argparse
 import json
+import re
 import math
 import os
 import pathlib
@@ -205,19 +206,27 @@ class Harness:
             label,
         )
 
+    def estimate(self, db, command="build"):
+        """The run's estimate, which a run without --confirm reports and sends nothing."""
+        value, _ = self.graphrag(db, command, label=command + "-estimate")
+        detail = ((value or {}).get("detail") or {}).get("detail") or {}
+        return detail.get("estimate") or {}
+
+    def confirm(self, db, command="build"):
+        value, record = self.graphrag(db, command, "--confirm", label=command)
+        return value or {}, record
+
     def build(self, db, command="build"):
         """Read the estimate, check it fits the cap, then build with --confirm."""
-        estimate, _ = self.graphrag(db, command, label=command + "-estimate")
-        detail = ((estimate or {}).get("detail") or {}).get("detail") or {}
-        est = detail.get("estimate") or {}
+        est = self.estimate(db, command)
         if est:
             self.admit(
                 command,
                 est.get("requests", 0),
                 self.run["priorNanodollars"]["buildRequest"],
             )
-        value, record = self.graphrag(db, command, "--confirm", label=command)
-        return value or {}, record, est
+        value, record = self.confirm(db, command)
+        return value, record, est
 
     def query(self, db, text, label="query"):
         value, _ = self.must(
@@ -317,6 +326,59 @@ def is_global(out):
     return out.get("mode") == "global"
 
 
+def mode_of(out):
+    """global, local, or failed when the Ask gave no answer in either mode."""
+    mode = out.get("mode")
+    return mode if mode in ("global", "local") and out.get("returncode") == 0 else "failed"
+
+
+MARKER = re.compile(r"\[(\d+(?:\s*,\s*\d+)*)\]")
+
+
+def claims(text):
+    """The sentences of an answer with the point numbers each one cites. A marker after
+    the closing punctuation belongs to the sentence before it."""
+    out = []
+
+    def numbers(markers):
+        return [int(n) for g in MARKER.findall(markers) for n in re.split(r"\s*,\s*", g)]
+
+    for part in re.split(r"(?<=[.!?])\s+", (text or "").strip()):
+        lead = re.match(r"(?:\[\d+(?:\s*,\s*\d+)*\]\s*)+", part)
+        if lead and out:
+            out[-1]["points"] += numbers(lead.group())
+            part = part[lead.end() :]
+        if not part.strip():
+            continue
+        sentence = re.sub(r"\s+([.!?,;:])", r"\1", MARKER.sub("", part)).strip()
+        out.append({"sentence": sentence, "points": numbers(part)})
+    return out
+
+
+def cited_points(out):
+    """Whether every marker of a global answer resolves to a point, every such point
+    to findings, and every finding to citations."""
+    points = {p.get("n"): p for p in out.get("points") or []}
+    finds = {
+        f.get("iri"): f for r in out.get("reports") or [] for f in r.get("findings") or []
+    }
+    marks = [n for c in claims((out.get("summary") or {}).get("text")) for n in c["points"]]
+    unlinked = [
+        n
+        for n in marks
+        if n not in points
+        or not points[n].get("findings")
+        or not all((finds.get(f) or {}).get("cites") for f in points[n]["findings"])
+    ]
+    return {
+        "mode": out.get("mode"),
+        "markers": len(marks),
+        "unlinked": len(unlinked),
+        "points": len(points),
+        "reports": len(out.get("reports") or []),
+    }
+
+
 # Acceptance examples
 
 def acceptance(h, work):
@@ -338,14 +400,17 @@ def acceptance(h, work):
         members.setdefault(row["c"], set()).add(row["m"])
     cites = h.query(
         db,
-        "SELECT ?c ?f ?s ?o WHERE { GRAPH <%s> { ?c <%sreport> ?r . ?r <%sfinding> ?f ."
-        " ?f <%scites> <<( ?s ?p ?o )>> } }" % (REPORTS, GR, GR, GR),
+        "SELECT ?c ?f ?s ?o (isIRI(?o) AS ?resource) WHERE { GRAPH <%s> { ?c <%sreport> ?r ."
+        " ?r <%sfinding> ?f . ?f <%scites> <<( ?s ?p ?o )>> } }" % (REPORTS, GR, GR, GR),
         "cites",
     )
+    # A cited fact lies inside its community when its subject is a member and so is its
+    # object, unless the object is a literal such as a member's label.
     outside = [
         r
         for r in cites
-        if r["s"] not in members.get(r["c"], ()) or r["o"] not in members.get(r["c"], ())
+        if r["s"] not in members.get(r["c"], ())
+        or (r["resource"] == "true" and r["o"] not in members.get(r["c"], ()))
     ]
     clusters = sorted(
         "".join(sorted({m.rsplit("/", 1)[1][0] for m in ms})) for ms in members.values()
@@ -420,6 +485,9 @@ def acceptance(h, work):
         and {c for c, _ in final} == {c for c, _ in before}
         and any(r["new"] == next(iter(changed))[1] for r in revised),
         "staleBeforeRefresh": stale,
+        # A manual refresh compares digests when it runs, so `status` may show no
+        # report stale before it. The stale transition is then not observed here.
+        "staleObserved": bool(stale),
         "written": detail.get("written"),
         "kept": detail.get("kept"),
         "reportsChanged": len(changed),
@@ -453,16 +521,10 @@ def acceptance(h, work):
     # A6 and A7 on the demo graph
     demo = demo_db(h, work, "demo-a6.db", levels=3)
     out = h.ask(demo, "What are the main areas of work in this organisation?", "auto", "a6")
-    findings = [f for r in out.get("reports") or [] for f in r.get("findings") or []]
+    linked = cited_points(out)
     results["A6"] = {
-        "pass": is_global(out)
-        and bool(out.get("points"))
-        and all(p.get("findings") for p in out["points"])
-        and bool(findings)
-        and all(f.get("cites") for f in findings),
-        "mode": out.get("mode"),
-        "points": len(out.get("points") or []),
-        "reports": len(out.get("reports") or []),
+        "pass": is_global(out) and linked["markers"] > 0 and linked["unlinked"] == 0,
+        **linked,
         "notes": out.get("notes"),
         "answer": answer_text(out),
     }
@@ -473,7 +535,7 @@ def acceptance(h, work):
         "a7-none",
         reviewed_only=True,
     )
-    none_local = not is_global(out)
+    none_local = out.get("mode") == "local"
     reviewed = h.query(
         demo,
         f"SELECT ?r WHERE {{ GRAPH <{REPORTS}> {{ ?r <{GR}status> \"unreviewed\" }} }} LIMIT 3",
@@ -547,19 +609,26 @@ def demo_db(h, work, name, levels, build=True):
         ],
         "text-index",
     )
+    h.settings(db, levels=levels)
     if build:
-        h.settings(db, levels=levels)
-        task, record, est = h.build(db)
-        if task.get("state") != "done":
-            raise Invalid(f"the build of {name} did not finish: {task.get('message')}")
-        h.builds = getattr(h, "builds", {})
-        h.builds[name] = {
-            "levels": levels,
-            "detail": task.get("detail"),
-            "estimate": est,
-            "seconds": record.get("elapsedSeconds"),
-        }
+        build_demo(h, db, name, levels, h.build)
     return db
+
+
+def build_demo(h, db, name, levels, run):
+    """Build a demo database's reports with `run`, which admits or confirms the build."""
+    result = run(db)
+    task, record = result[0], result[1]
+    est = result[2] if len(result) > 2 else None
+    if task.get("state") != "done":
+        raise Invalid(f"the build of {name} did not finish: {task.get('message')}")
+    h.builds = getattr(h, "builds", {})
+    h.builds[name] = {
+        "levels": levels,
+        "detail": task.get("detail"),
+        "estimate": est,
+        "seconds": record.get("elapsedSeconds"),
+    }
 
 
 # Question generation
@@ -774,39 +843,75 @@ def judge_pair(h, question, a, b):
     return h.call(h.run["judgeModel"], JUDGE_SYSTEM, user, judge_schema(), max_tokens=1024)
 
 
-def citation_check(h, question, out):
-    """Each sentence with point markers of a global answer, against the findings and
-    facts its points cite."""
-    import re
+def evidence(h, db, finding, depth=0):
+    """The facts a finding cites, through the child findings a parent's finding cites,
+    each with whether the projection still holds it. Results are cached per database."""
+    cache = h.__dict__.setdefault("evidence", {})
+    key = (str(db), finding)
+    if key in cache:
+        return cache[key]
+    facts = [
+        {"fact": f"{r['s']} {r['p']} {r['o']}", "found": r["found"] == "true"}
+        for r in h.query(
+            db,
+            "SELECT ?s ?p ?o (EXISTS { GRAPH <%s> { ?s ?p ?o } } AS ?found) WHERE {"
+            " GRAPH <%s> { <%s> <%scites> ?t FILTER(isTRIPLE(?t))"
+            " BIND(SUBJECT(?t) AS ?s) BIND(PREDICATE(?t) AS ?p) BIND(OBJECT(?t) AS ?o) } }"
+            % (GRAPH, REPORTS, finding, GR),
+            "evidence",
+        )
+    ]
+    if depth < 6:
+        for r in h.query(
+            db,
+            "SELECT ?c WHERE { GRAPH <%s> { <%s> <%scites> ?c FILTER(isIRI(?c)) } }"
+            % (REPORTS, finding, GR),
+            "evidence-children",
+        ):
+            facts += evidence(h, db, r["c"], depth + 1)
+    cache[key] = facts
+    return facts
 
+
+def citation_check(h, db, question, out):
+    """Judge each cited claim of a global answer against the findings its points use
+    and the facts those findings cite, resolved through child findings. Returns the
+    verdicts, the cited facts with whether each exists, and whether the judge gave
+    exactly one verdict per claim."""
     points = {p.get("n"): p for p in out.get("points") or []}
-    findings = {
+    finds = {
         f.get("iri"): f for r in out.get("reports") or [] for f in r.get("findings") or []
     }
-    text = (out.get("summary") or {}).get("text") or ""
-    claims = []
-    for sentence in re.split(r"(?<=[.!?])\s+", text):
-        marks = [int(m) for m in re.findall(r"\[(\d+)\]", sentence)]
-        if not marks:
+    items, facts = [], []
+    for c in claims((out.get("summary") or {}).get("text")):
+        if not c["points"]:
             continue
         cited = []
-        for m in marks:
-            p = points.get(m)
-            if not p:
-                continue
-            for iri in p.get("findings") or []:
-                f = findings.get(iri)
-                if f:
-                    cited.append(f"{f.get('text')} (facts: {'; '.join(f.get('cites') or [])})")
-        claims.append({"sentence": sentence, "cited": cited})
-    if not claims:
-        return []
+        for n in c["points"]:
+            for iri in (points.get(n) or {}).get("findings") or []:
+                ev = evidence(h, db, iri)
+                facts += ev
+                text = (finds.get(iri) or {}).get("text", "")
+                cited.append(f"{text} (facts: {'; '.join(e['fact'] for e in ev) or 'none'})")
+        items.append({"sentence": c["sentence"], "cited": cited})
+    if not items:
+        return {"verdicts": [], "facts": facts, "complete": True}
     user = f"Question:\n<data>{question}</data>\n\nClaims:\n" + "\n".join(
         f"{i}. <data>{c['sentence']}</data>\n   Cited: <data>{' | '.join(c['cited']) or 'nothing'}</data>"
-        for i, c in enumerate(claims, 1)
+        for i, c in enumerate(items, 1)
     )
-    value = h.call(h.run["judgeModel"], CITE_SYSTEM, user, cite_schema(), max_tokens=1024)
-    return [c.get("supported") for c in value.get("claims") or []]
+    for _ in range(2):
+        value = h.call(h.run["judgeModel"], CITE_SYSTEM, user, cite_schema(), max_tokens=1024)
+        got = {}
+        for c in value.get("claims") or []:
+            got.setdefault(c.get("n"), []).append(c.get("supported"))
+        if sorted(got) == list(range(1, len(items) + 1)) and all(len(v) == 1 for v in got.values()):
+            return {
+                "verdicts": [got[i][0] for i in range(1, len(items) + 1)],
+                "facts": facts,
+                "complete": True,
+            }
+    return {"verdicts": [], "facts": facts, "complete": False, "claims": len(items)}
 
 
 def evaluate(h, work, phase):
@@ -815,7 +920,13 @@ def evaluate(h, work, phase):
     if not qfile.is_absolute():
         qfile = ROOT / qfile
     qset = strict_json(bounded_file(qfile, 4 * 1024 * 1024))
-    questions = [q for q in qset["questions"] if q.get("kind") == "global"]
+    questions = [
+        q
+        for q in qset.get("questions") or []
+        if q.get("kind") == "global" and isinstance(q.get("question"), str) and q["question"].strip()
+    ]
+    if not questions:
+        raise Invalid("the questions file holds no global question")
     demo_set = strict_json((ROOT / "testsuite/ask/demo.json").read_bytes())
     local_qs = es.stable_sample(
         [q for q in demo_set["questions"] if q["kind"] == "answerable"],
@@ -824,17 +935,24 @@ def evaluate(h, work, phase):
     )
     priors = run["priorNanodollars"]
     n = len(questions)
-    # Two builds, four answers and twelve judgements per question, the classification
-    # of global and local questions and a citation check of each global answer.
+    # `levels` is the deepest level kept, so 0 keeps only the coarsest level, and Ask on
+    # the three-level build reads the finest level with at most 100 reports.
+    fine = demo_db(h, work, "demo-fine.db", levels=3, build=False)
+    coarse = demo_db(h, work, "demo-coarse.db", levels=0, build=False)
+    requests = sum(h.estimate(db).get("requests", 0) for db in (fine, coarse))
+    # Both builds, four answers and twelve judgements per question, the classification
+    # of global and local questions and a citation check of each global answer, all
+    # admitted together so that the builds cannot spend what the answers need.
     h.admit(
         "evaluate",
         1,
-        n * (priors["localAsk"] + 2 * priors["globalAsk"] + priors["modelCall"] * 15)
+        requests * priors["buildRequest"]
+        + n * (priors["localAsk"] + 2 * priors["globalAsk"] + priors["modelCall"] * 15)
         + len(local_qs) * priors["localAsk"]
         + n * priors["globalAsk"],
     )
-    fine = demo_db(h, work, "demo-fine.db", levels=3)
-    coarse = demo_db(h, work, "demo-coarse.db", levels=1)
+    build_demo(h, fine, "demo-fine.db", 3, h.confirm)
+    build_demo(h, coarse, "demo-coarse.db", 0, h.confirm)
     sample = strict_json((ROOT / "testsuite/ingest/sample.json").read_bytes())
     chunk_list = es.chunks(sample)
     answers = {}
@@ -897,26 +1015,32 @@ def evaluate(h, work, phase):
     for q in questions:
         h.proxy.set_case("classify:" + q["id"])
         out = h.ask(fine, q["question"], "auto", "auto-" + q["id"])
-        classified.append({"id": q["id"], "label": "global", "got": "global" if is_global(out) else "local"})
+        classified.append({"id": q["id"], "label": "global", "got": mode_of(out)})
     for q in local_qs:
         h.proxy.set_case("classify:" + q["id"])
         out = h.ask(fine, q["question"], "auto", "auto-" + q["id"])
-        classified.append({"id": q["id"], "label": "local", "got": "global" if is_global(out) else "local"})
+        classified.append({"id": q["id"], "label": "local", "got": mode_of(out)})
     h.proxy.set_case(None)
     # Citation validity of the global answers
     citations = {}
-    for m in ("global-coarse", "global-fine"):
-        marks = []
+    for m, db in (("global-coarse", coarse), ("global-fine", fine)):
+        marks, facts, incomplete = [], [], 0
         for q in questions:
             h.proxy.set_case("cite:" + q["id"])
             out = answers[q["id"]][m]
             if is_global(out):
-                marks += citation_check(h, q["question"], out)
+                checked = citation_check(h, db, q["question"], out)
+                marks += checked["verdicts"]
+                facts += checked["facts"]
+                incomplete += not checked["complete"]
         citations[m] = {
             "claims": len(marks),
             "yes": marks.count("yes"),
             "partly": marks.count("partly"),
             "no": marks.count("no"),
+            "answersWithIncompleteJudgement": incomplete,
+            "citedFacts": len(facts),
+            "citedFactsFound": sum(f["found"] for f in facts),
         }
     h.proxy.set_case(None)
     latency = {}
@@ -931,6 +1055,17 @@ def evaluate(h, work, phase):
     global_share = {
         m: sum(is_global(a[m]) for a in answers.values()) for m in ("global-coarse", "global-fine")
     }
+    levels_used = {
+        m: sorted(
+            {
+                (a[m].get("global") or {}).get("level")
+                for a in answers.values()
+                if is_global(a[m])
+            },
+            key=str,
+        )
+        for m in ("global-coarse", "global-fine")
+    }
     return {
         "questions": n,
         "localQuestions": len(local_qs),
@@ -941,10 +1076,12 @@ def evaluate(h, work, phase):
             "globalQuestions": n,
             "localAsLocal": sum(c["label"] == c["got"] == "local" for c in classified),
             "localQuestions": len(local_qs),
+            "failed": sum(c["got"] == "failed" for c in classified),
             "cases": classified,
         },
         "citations": citations,
         "answeredGlobally": global_share,
+        "levelsUsed": levels_used,
         "latencySeconds": latency,
         "builds": getattr(h, "builds", {}),
     }

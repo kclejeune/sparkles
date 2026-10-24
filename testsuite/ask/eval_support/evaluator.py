@@ -577,7 +577,8 @@ def choose_clarification(clarify, gold_text):
 
     The answer is always the value of one of the choices the pipeline offered, so
     nothing from the gold query that the pipeline did not already propose reaches it.
-    A choice whose value is an IRI the gold query names wins. Otherwise the choice
+    A choice whose value is an IRI the gold query names wins, written bare or as an
+    N-Triples term in angle brackets. Otherwise the choice
     whose label and value share the most words with the gold's IRIs and literals
     wins. A tie goes to the earliest of the tied choices, and with no overlap at all
     the first choice is taken, as a person with no preference would. Returns the
@@ -609,7 +610,13 @@ def choose_clarification(clarify, gold_text):
             "basis": basis if len(indices) == 1 else basis + "-tie",
         }
 
-    exact = [i for i, c in enumerate(choices) if c["value"] in iris]
+    def iri_of(value):
+        # The pipeline offers a linked mention as an N-Triples term, <IRI>.
+        if value.startswith("<") and value.endswith(">"):
+            return value[1:-1]
+        return value
+
+    exact = [i for i, c in enumerate(choices) if iri_of(c["value"]) in iris]
     if exact:
         return pick(exact, "gold-iri")
     overlap = [

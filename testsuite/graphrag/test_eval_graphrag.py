@@ -167,6 +167,42 @@ class Statistics(unittest.TestCase):
         self.assertEqual(value, {"scope": "global", "cites": [1], "rating": 5})
 
 
+class Answers(unittest.TestCase):
+    def test_a_marker_after_the_full_stop_belongs_to_the_sentence_before(self):
+        self.assertEqual(
+            harness.claims("Storage builds. [1] Research builds [2, 3]. No marker here."),
+            [
+                {"sentence": "Storage builds.", "points": [1]},
+                {"sentence": "Research builds.", "points": [2, 3]},
+                {"sentence": "No marker here.", "points": []},
+            ],
+        )
+
+    def test_a_failed_ask_is_neither_global_nor_local(self):
+        self.assertEqual(harness.mode_of({"mode": "global", "returncode": 0}), "global")
+        self.assertEqual(harness.mode_of({"mode": "local", "returncode": 0}), "local")
+        self.assertEqual(harness.mode_of({"outcome": "error", "returncode": 2}), "failed")
+        self.assertEqual(harness.mode_of({"mode": "local", "returncode": 2}), "failed")
+
+    def test_every_marker_must_reach_cited_findings(self):
+        out = {
+            "mode": "global",
+            "summary": {"text": "Work is on storage [1] and caching [2].", "citations": [1, 2]},
+            "points": [
+                {"n": 1, "findings": ["r#f1"]},
+                {"n": 2, "findings": ["r#f2"]},
+            ],
+            "reports": [
+                {"findings": [{"iri": "r#f1", "cites": ["<<( <a> <b> <c> )>>"]}, {"iri": "r#f2", "cites": []}]}
+            ],
+        }
+        self.assertEqual(harness.cited_points(out)["unlinked"], 1)
+        out["reports"][0]["findings"][1]["cites"] = ["r#f9"]
+        self.assertEqual(harness.cited_points(out)["unlinked"], 0)
+        out["summary"]["text"] = "No markers."
+        self.assertEqual(harness.cited_points(out)["markers"], 0)
+
+
 class ByteBound(unittest.TestCase):
     def test_only_community_requests_are_measured(self):
         with tempfile.TemporaryDirectory() as d:
@@ -228,6 +264,9 @@ class DryRun(unittest.TestCase):
                 self.assertTrue(examples[name]["pass"], (name, examples[name]))
             ev = summary["phases"]["evaluate"]
             self.assertEqual(ev["questions"], 1)
+            self.assertEqual(ev["levelsUsed"]["global-coarse"], [0])
+            self.assertEqual(ev["classification"]["failed"], 0)
+            self.assertTrue(ev["citations"]["global-fine"]["citedFacts"] > 0)
             self.assertEqual(len(ev["winRates"]), 6)
             self.assertEqual(summary["ledger"]["unresolvedNanodollars"], 0)
 
