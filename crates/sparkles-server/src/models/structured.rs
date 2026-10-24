@@ -6,8 +6,10 @@
 //!
 //! The schemas use a small common subset of JSON Schema that local servers accept:
 //! `type`, `properties`, `required`, `additionalProperties: false`, `items`, `enum`,
-//! `maxLength`, `minItems` and `maxItems`, with no `$ref`, no `anyOf` or `oneOf`, no
-//! `patternProperties` and no numeric bounds.
+//! `maxLength`, `minItems`, `maxItems`, `minimum` and `maximum`, with no `$ref`, no
+//! `anyOf` or `oneOf` and no `patternProperties`. A provider that refuses some of these
+//! receives the schema without them, and the answer is still validated here against the
+//! whole schema.
 
 use super::client::{CallError, ChatResponse, Message};
 use super::config::Level;
@@ -95,6 +97,19 @@ fn check(s: &Value, v: &Value, at: &str, out: &mut Vec<String>) {
                 }
             }
         }
+        Value::Number(x) => {
+            let x = x.as_f64().unwrap_or(f64::NAN);
+            if let Some(n) = s.get("minimum").and_then(Value::as_f64)
+                && !(x >= n)
+            {
+                out.push(format!("{at} is below {n}"));
+            }
+            if let Some(n) = s.get("maximum").and_then(Value::as_f64)
+                && !(x <= n)
+            {
+                out.push(format!("{at} is above {n}"));
+            }
+        }
         Value::String(t) => {
             if let Some(n) = s.get("maxLength").and_then(Value::as_u64)
                 && t.chars().count() as u64 > n
@@ -148,7 +163,10 @@ pub fn messages(user: &str, out: &OutputSchema, level: Level) -> Vec<Message> {
     match level {
         Level::JsonObject => {
             u.push_str("\n\nAnswer with one JSON object that matches this JSON Schema, and nothing else:\n");
-            u.push_str(&out.schema.to_string());
+            // in the schema's own property order, as the request body carries it
+            u.push_str(&String::from_utf8_lossy(&super::client::body_bytes(
+                &out.schema,
+            )));
         }
         Level::Text => {
             u.push_str("\n\n");
@@ -234,6 +252,10 @@ mod tests {
         assert!(e.iter().any(|m| m.contains("unexpected member z")));
         assert!(e.iter().any(|m| m.contains("one of")));
         assert_eq!(validate(&s, &json!({})), vec!["$ lacks the member q"]);
+        let r = json!({"type": "number", "minimum": 0, "maximum": 10});
+        assert!(validate(&r, &json!(10)).is_empty());
+        assert_eq!(validate(&r, &json!(11)), vec!["$ is above 10"]);
+        assert_eq!(validate(&r, &json!(-0.5)), vec!["$ is below 0"]);
     }
 
     #[test]

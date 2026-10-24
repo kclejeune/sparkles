@@ -25,7 +25,11 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from evaluator import Invalid, strict_json
 
 LEDGER_VERSION = 2
-HARD_CAP = 25 * 10**9  # USD 25 in nanodollars, for the carryover and every run together
+# The most one ledger may hold, its cap and carryover together, in nanodollars. The
+# person who pays sets each campaign's total, and a campaign may use several ledgers,
+# each in its own directory. USD 25 bounded the first campaign of 2026-10-15 to
+# 2026-10-19. The campaign of 2026-10-24 has USD 90 over ledgers of USD 50 and 30.
+HARD_CAP = 50 * 10**9
 MODELS = ("claude-haiku-5-5", "claude-sonnet-5-5", "claude-opus-5-5")
 REQUEST_CAP, RESPONSE_CAP = 128 * 1024, 1024 * 1024
 # Integer USD nanodollars per token as input, 5 minute cache write, 1 hour cache
@@ -926,8 +930,13 @@ class Proxy:
         self.server_port = server.server_port
         return server
 
-    def config(self):
-        """The model configuration of the children: one loopback provider."""
+    def config(self, context_tokens=None):
+        """The model configuration of the children: one loopback provider.
+
+        Without `context_tokens` every model has the server's default context of 8192
+        tokens, which makes Ask treat it as a small model and trim its grounding, as
+        the first paid run did.
+        """
         provider = {
             "kind": "anthropic",
             "endpoint": f"http://127.0.0.1:{self.server_port}",
@@ -939,6 +948,8 @@ class Proxy:
             "structuredOutput": "json-schema",
             "concurrency": 1,
         }
+        if context_tokens is not None:
+            provider["contextTokens"] = context_tokens
         return {
             "models": {
                 "providers": {"evaluation": provider},

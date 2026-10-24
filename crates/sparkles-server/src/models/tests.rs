@@ -166,6 +166,50 @@ fn invalid_output_is_retried_once() {
     assert_eq!((a.record.input_tokens, a.record.output_tokens), (20, 10));
 }
 
+/// An Anthropic request leaves out the numeric bounds the API refuses, so the bounds
+/// are checked locally and an answer outside them is retried with the error.
+#[test]
+fn bounds_left_out_for_anthropic_are_checked_locally() {
+    let mock = MockModel::start(|_, n| match n {
+        0 => (200, mock::answer(Kind::Anthropic, r#"{"rating":11}"#)),
+        _ => (200, mock::answer(Kind::Anthropic, r#"{"rating":7}"#)),
+    });
+    let m = models(
+        json!({ "a": { "kind": "anthropic", "endpoint": mock.url() } }),
+        &[],
+    );
+    let out = OutputSchema {
+        name: "Report",
+        schema: json!({
+            "type": "object",
+            "properties": { "rating": { "type": "integer", "minimum": 0, "maximum": 10 } },
+            "required": ["rating"],
+            "additionalProperties": false
+        }),
+        from_text: |_| None,
+        text_instruction: "",
+    };
+    let a = m
+        .call(
+            Some(Role::Draft),
+            &Pair::new("a", "m1"),
+            "system text",
+            "user text",
+            &out,
+            Instant::now() + Duration::from_secs(10),
+        )
+        .unwrap();
+    assert_eq!(a.value, json!({"rating": 7}));
+    assert_eq!(a.record.requests, 2);
+    let first = &mock.requests()[0];
+    assert!(
+        first.body["output_config"]["format"]["schema"]["properties"]["rating"]
+            .get("maximum")
+            .is_none()
+    );
+    assert!(mock::prompt_of(&mock.requests()[1]).contains("$.rating is above 10"));
+}
+
 #[test]
 fn refusals_and_outages() {
     let mock = MockModel::start(|_, _| {

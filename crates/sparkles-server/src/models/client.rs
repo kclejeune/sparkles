@@ -220,8 +220,9 @@ pub fn build(p: &ProviderConfig, req: &ChatRequest) -> (String, Value) {
             }
             match (req.level, &req.schema) {
                 (Level::JsonSchema, Some((_, s))) => {
-                    body["output_config"] =
-                        json!({ "format": { "type": "json_schema", "schema": s } });
+                    body["output_config"] = json!({
+                        "format": { "type": "json_schema", "schema": anthropic_schema(s) }
+                    });
                 }
                 (Level::Tool, Some((name, s))) => {
                     body["tools"] = json!([{
@@ -450,7 +451,7 @@ fn provider_count(
     };
     let hs = headers(p, t.key.as_deref());
     let hrefs: Vec<(&str, &str)> = hs.iter().map(|(k, v)| (k.as_str(), v.as_str())).collect();
-    let bytes = serde_json::to_vec(&body).expect("serializable");
+    let bytes = body_bytes(&body);
     let key = t.key.as_deref();
     let posted = sparkles::outbound::post_json(t.outbound, &url, &hrefs, bytes, timeout)
         .map_err(|f| CallError::Unavailable(scrub(format!("provider {name}: {f}"), key)))?;
@@ -484,7 +485,7 @@ pub fn send_admitted(
     let (url, body) = build(p, req);
     let hs = headers(p, t.key.as_deref());
     let hrefs: Vec<(&str, &str)> = hs.iter().map(|(k, v)| (k.as_str(), v.as_str())).collect();
-    let bytes = serde_json::to_vec(&body).expect("serializable");
+    let bytes = body_bytes(&body);
     let started = Instant::now();
     let key = t.key.as_deref();
     // counting spends the request's own time
@@ -599,9 +600,200 @@ pub fn send_admitted(
     }
 }
 
+/// The keyword with which a schema object names the order of its properties.
+pub const PROPERTY_ORDER: &str = "x-sparkles-order";
+
+/// The JSON text of a request body. `serde_json` sorts the members of an object, and a
+/// provider's constrained decoding writes an answer's members in the order its schema
+/// lists them, so a schema object can name the order of its properties under
+/// [`PROPERTY_ORDER`]. The properties it names come first in that order, the others follow
+/// sorted, and the keyword itself is never sent.
+pub fn body_bytes(body: &Value) -> Vec<u8> {
+    let mut out = Vec::new();
+    write_body(body, None, &mut out);
+    out
+}
+
+/// `members` is set when `v` is the `properties` map of a schema, with the order its
+/// schema names, so that a property may itself be called like the keyword.
+fn write_body(v: &Value, members: Option<&[Value]>, out: &mut Vec<u8>) {
+    match v {
+        Value::Object(m) => {
+            let mut keys: Vec<&String> = Vec::with_capacity(m.len());
+            for k in members.unwrap_or(&[]).iter().filter_map(Value::as_str) {
+                if let Some((key, _)) = m.get_key_value(k)
+                    && !keys.contains(&key)
+                {
+                    keys.push(key);
+                }
+            }
+            for k in m.keys() {
+                if (members.is_some() || k != PROPERTY_ORDER) && !keys.contains(&k) {
+                    keys.push(k);
+                }
+            }
+            let order = m
+                .get(PROPERTY_ORDER)
+                .and_then(Value::as_array)
+                .map(Vec::as_slice);
+            out.push(b'{');
+            for (i, k) in keys.into_iter().enumerate() {
+                if i > 0 {
+                    out.push(b',');
+                }
+                out.extend(serde_json::to_vec(k).expect("a string serializes"));
+                out.push(b':');
+                let inner = (members.is_none() && k == "properties").then(|| order.unwrap_or(&[]));
+                write_body(&m[k], inner, out);
+            }
+            out.push(b'}');
+        }
+        Value::Array(a) => {
+            out.push(b'[');
+            for (i, x) in a.iter().enumerate() {
+                if i > 0 {
+                    out.push(b',');
+                }
+                write_body(x, None, out);
+            }
+            out.push(b']');
+        }
+        other => out.extend(serde_json::to_vec(other).expect("a scalar serializes")),
+    }
+}
+
+/// A schema that Anthropic's structured output accepts. It refuses length, count and
+/// numeric bounds with a 400, so they are left out of the request. Every answer is still
+/// validated against the full schema (`structured::validate`), so a bound the model
+/// passes costs a retry rather than a wrong value.
+fn anthropic_schema(s: &Value) -> Value {
+    const BOUNDS: [&str; 8] = [
+        "maxItems",
+        "maxLength",
+        "minLength",
+        "minimum",
+        "maximum",
+        "exclusiveMinimum",
+        "exclusiveMaximum",
+        "multipleOf",
+    ];
+    let Value::Object(m) = s else {
+        return s.clone();
+    };
+    let mut out = serde_json::Map::new();
+    for (k, v) in m {
+        // only a minItems of 0 or 1 is accepted
+        if BOUNDS.contains(&k.as_str())
+            || (k.as_str() == "minItems" && v.as_u64().is_some_and(|n| n > 1))
+        {
+            continue;
+        }
+        let v = match (k.as_str(), v) {
+            // the members are named schemas, so a member called `maximum` stays
+            ("properties", Value::Object(p)) => Value::Object(
+                p.iter()
+                    .map(|(name, sub)| (name.clone(), anthropic_schema(sub)))
+                    .collect(),
+            ),
+            ("items", sub) => anthropic_schema(sub),
+            _ => v.clone(),
+        };
+        out.insert(k.clone(), v);
+    }
+    Value::Object(out)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A schema object's named order reaches the provider, the keyword does not, and a
+    /// property may carry the keyword's name.
+    #[test]
+    fn request_bodies_keep_the_named_property_order() {
+        let body = json!({
+            "model": "m",
+            "schema": {
+                "type": "object",
+                "x-sparkles-order": ["text", "score", "findings"],
+                "properties": {
+                    "findings": { "type": "array", "items": { "type": "object",
+                        "x-sparkles-order": ["x-sparkles-order", "a"],
+                        "properties": { "a": {}, "x-sparkles-order": {} } } },
+                    "score": { "type": "integer" },
+                    "text": { "type": "string" },
+                    "extra": { "type": "string" }
+                },
+                "required": ["text", "score", "findings"]
+            }
+        });
+        let text = String::from_utf8(body_bytes(&body)).unwrap();
+        assert_eq!(
+            text,
+            r#"{"model":"m","schema":{"properties":{"text":{"type":"string"},"score":{"type":"integer"},"findings":{"items":{"properties":{"x-sparkles-order":{},"a":{}},"type":"object"},"type":"array"},"extra":{"type":"string"}},"required":["text","score","findings"],"type":"object"}}"#
+        );
+        // without the keyword the text is serde_json's own
+        let plain =
+            json!({ "b": [1, "two", null, 2.5, { "d": true, "c": false }], "a": "\u{1}\"" });
+        assert_eq!(body_bytes(&plain), serde_json::to_vec(&plain).unwrap());
+    }
+
+    #[test]
+    fn anthropic_schemas_leave_out_the_bounds_it_refuses() {
+        let mut r = req(Level::JsonSchema);
+        r.schema = Some((
+            "Report".into(),
+            json!({
+                "type": "object",
+                "properties": {
+                    "title": { "type": "string", "maxLength": 200 },
+                    "findings": { "type": "array", "maxItems": 12, "minItems": 2,
+                                  "items": { "type": "integer", "minimum": 0 } },
+                    "tags": { "type": "array", "minItems": 1, "items": { "type": "string" } },
+                    "rating": { "type": "integer", "minimum": 0, "maximum": 10 }
+                },
+                "required": ["title"],
+                "additionalProperties": false
+            }),
+        ));
+        let (_, b) = build(&provider(Kind::Anthropic), &r);
+        assert_eq!(
+            b["output_config"]["format"]["schema"],
+            json!({
+                "type": "object",
+                "properties": {
+                    "title": { "type": "string" },
+                    "findings": { "type": "array", "items": { "type": "integer" } },
+                    "tags": { "type": "array", "minItems": 1, "items": { "type": "string" } },
+                    "rating": { "type": "integer" }
+                },
+                "required": ["title"],
+                "additionalProperties": false
+            })
+        );
+        // a member named after a bound is a member, not a bound
+        r.schema = Some((
+            "M".into(),
+            json!({ "type": "object",
+                    "properties": { "maximum": { "type": "integer", "maximum": 3 } },
+                    "required": ["maximum"], "additionalProperties": false }),
+        ));
+        let (_, b) = build(&provider(Kind::Anthropic), &r);
+        assert_eq!(
+            b["output_config"]["format"]["schema"]["properties"],
+            json!({ "maximum": { "type": "integer" } })
+        );
+        r.schema = Some((
+            "Report".into(),
+            json!({ "type": "object", "properties": { "rating": { "type": "integer", "maximum": 10 } } }),
+        ));
+        // other kinds keep the schema as written
+        let (_, b) = build(&provider(Kind::Openai), &r);
+        assert_eq!(
+            b["response_format"]["json_schema"]["schema"]["properties"]["rating"]["maximum"],
+            10
+        );
+    }
 
     fn provider(kind: Kind) -> ProviderConfig {
         serde_json::from_value(json!({ "kind": kind.as_str(), "endpoint": "http://h/v1/" }))

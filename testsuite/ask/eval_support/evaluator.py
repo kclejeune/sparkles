@@ -106,6 +106,38 @@ class OfflinePolicy(Invalid):
     pass
 
 
+# The well-known prefixes that every dataset resolves before its own (C20 §3.1), as
+# `sparkles::io::well_known_prefixes` lists them. Ask runs a draft with them, and
+# `sparkles query --loc` does not, so the scorer declares them before the set's own.
+WELL_KNOWN_PREFIXES = {
+    "rdf": "http://www.w3.org/1999/02/22-rdf-syntax-ns#",
+    "rdfs": "http://www.w3.org/2000/01/rdf-schema#",
+    "owl": "http://www.w3.org/2002/07/owl#",
+    "xsd": "http://www.w3.org/2001/XMLSchema#",
+    "dc": "http://purl.org/dc/elements/1.1/",
+    "dcterms": "http://purl.org/dc/terms/",
+    "foaf": "http://xmlns.com/foaf/0.1/",
+    "skos": "http://www.w3.org/2004/02/skos/core#",
+    "schema": "http://schema.org/",
+    "sh": "http://www.w3.org/ns/shacl#",
+    "prov": "http://www.w3.org/ns/prov#",
+    "spk": "urn:x-sparkles:",
+    "hist": "urn:x-sparkles:history#",
+    "path": "urn:x-sparkles:path#",
+    "mem": "urn:x-sparkles:mem:",
+    "sparkles": "urn:x-sparkles:assembler#",
+    "text": "http://jena.apache.org/text#",
+}
+
+
+def prefix_header(own):
+    """The PREFIX lines a scored query starts with: the well-known prefixes, then the
+    set's own, which replace a well-known one of the same name."""
+    merged = {k: v for k, v in WELL_KNOWN_PREFIXES.items() if k not in own}
+    merged.update(own)
+    return "".join(f"PREFIX {k}: <{v}>\n" for k, v in merged.items())
+
+
 def offline_query(text):
     """Conservative lexical SERVICE refusal before the read-only CLI is spawned.
 
@@ -442,6 +474,191 @@ def leaf_environment(extra=None):
             raise Invalid("invalid leaf environment")
         env.update(extra)
     return env
+
+
+# The characters a prefixed name may escape with a backslash (SPARQL 1.1 PN_LOCAL_ESC).
+PN_LOCAL_ESC = "_~.-!$&'()*+,;=/?#@%"
+# Words too common to tell two choices apart.
+STOP_WORDS = frozenset(
+    "the and for with that this which what who whom whose from into onto about "
+    "one any all are was were has have had not its their his her does did you "
+    "mean http https www org com resource ontology property".split()
+)
+CLARIFY_CHOICES = 16
+CLARIFY_VALUE = 2000
+
+
+def words_of(text):
+    """Lowercase words of three or more characters, with camelCase, underscores and
+    percent escapes split, as a set. Each pair of neighbouring words also counts
+    joined, so "time zone" meets "timezone"."""
+    import urllib.parse
+
+    text = urllib.parse.unquote(text)
+    text = re.sub(r"([a-z0-9])([A-Z])", r"\1 \2", text)
+    parts = re.findall(r"[^\W_]+", text.lower())
+    parts += [a + b for a, b in itertools.pairwise(parts)]
+    return {w for w in parts if len(w) >= 3 and w not in STOP_WORDS}
+
+
+def gold_terms(text):
+    """The IRIs a gold query names and the words of their local names and literals.
+
+    The scan follows the lexical rules of `offline_query`: comments are skipped,
+    literals are read as data, a prefixed name is expanded with the PREFIX
+    declarations before it, its escapes undone, and a relative IRI resolves against
+    the BASE in force. A name with an undeclared prefix is left out, and so are the
+    IRIs of the declarations themselves. Returns (set of IRIs, set of words).
+    """
+    tokens, literals, i = [], [], 0
+    while i < len(text):
+        c = text[i]
+        if c == "#":
+            while i < len(text) and text[i] not in "\r\n":
+                i += 1
+            continue
+        if c in ('"', "'"):
+            marker = c * 3 if text.startswith(c * 3, i) else c
+            start = i + len(marker)
+            j = start
+            while j < len(text) and not text.startswith(marker, j):
+                j += 2 if text[j] == "\\" else 1
+            literals.append(text[start:j])
+            i = j + len(marker)
+            continue
+        if c == "<":
+            iri = re.match(r'<([^<>"{}|^`\\\x00-\x20]*)>', text[i:])
+            if iri:
+                tokens.append(("iri", iri[1]))
+                i += len(iri[0])
+                continue
+            i += 1
+            continue
+        if c in ("?", "$"):
+            i += 1
+            while i < len(text) and (text[i].isalnum() or text[i] == "_"):
+                i += 1
+            continue
+        if c.isalpha() or c in ("_", ":"):
+            chars, j = [(c, False)], i + 1
+            while j < len(text):
+                if text[j].isalnum() or text[j] in "_-.:%":
+                    chars.append((text[j], False))
+                    j += 1
+                elif (
+                    text[j] == "\\" and j + 1 < len(text) and text[j + 1] in PN_LOCAL_ESC
+                ):
+                    chars.append((text[j + 1], True))
+                    j += 2
+                else:
+                    break
+            while chars and chars[-1] == (".", False):
+                chars.pop()  # an unescaped final dot ends a triple pattern
+            tokens.append(("name", "".join(ch for ch, _ in chars)))
+            i = j
+            continue
+        i += 1
+    # PREFIX and BASE apply from where they stand, so the tokens are read in order. A
+    # relative IRI resolves against the BASE in force, and so does a namespace.
+    import urllib.parse
+
+    prefixes, iris, base, k = {}, set(), None, 0
+
+    def resolve(iri):
+        # An absolute IRI keeps its exact spelling, which urljoin would normalize.
+        if not base or re.match(r"[A-Za-z][A-Za-z0-9+.-]*:", iri):
+            return iri
+        return urllib.parse.urljoin(base, iri)
+
+    while k < len(tokens):
+        kind, value = tokens[k]
+        nxt = tokens[k + 1 : k + 3]
+        if (
+            kind == "name"
+            and value.upper() == "PREFIX"
+            and len(nxt) == 2
+            and nxt[0][0] == "name"
+            and nxt[0][1].endswith(":")
+            and nxt[0][1].count(":") == 1
+            and nxt[1][0] == "iri"
+        ):
+            prefixes[nxt[0][1][:-1]] = resolve(nxt[1][1])
+            k += 3
+            continue
+        if kind == "name" and value.upper() == "BASE" and nxt and nxt[0][0] == "iri":
+            base = resolve(nxt[0][1])
+            k += 2
+            continue
+        if kind == "iri":
+            iris.add(resolve(value))
+        elif ":" in value:
+            prefix, local = value.split(":", 1)
+            if prefix in prefixes and local:
+                iris.add(prefixes[prefix] + local)
+        k += 1
+    words = set()
+    for iri in iris:
+        words |= words_of(re.split(r"[/#]", iri)[-1])
+    for literal in literals:
+        words |= words_of(literal)
+    return iris, words
+
+
+def choose_clarification(clarify, gold_text):
+    """Answer a clarification the way a person who means the gold query would.
+
+    The answer is always the value of one of the choices the pipeline offered, so
+    nothing from the gold query that the pipeline did not already propose reaches it.
+    A choice whose value is an IRI the gold query names wins, written bare or as an
+    N-Triples term in angle brackets. Otherwise the choice
+    whose label and value share the most words with the gold's IRIs and literals
+    wins. A tie goes to the earliest of the tied choices, and with no overlap at all
+    the first choice is taken, as a person with no preference would. Returns the
+    answer, the index of the choice and the basis of the decision, or None when the
+    clarification is not a list of usable choices.
+    """
+    if not isinstance(clarify, dict):
+        return None
+    choices = clarify.get("choices")
+    if not isinstance(choices, list) or not 1 <= len(choices) <= CLARIFY_CHOICES:
+        return None
+    for c in choices:
+        if (
+            not isinstance(c, dict)
+            or not isinstance(c.get("value"), str)
+            or not c["value"].strip()
+            or len(c["value"]) > CLARIFY_VALUE
+            or any(ord(ch) < 32 for ch in c["value"])
+            or not isinstance(c.get("label", ""), str)
+        ):
+            return None
+    iris, words = gold_terms(gold_text)
+
+    def pick(indices, basis):
+        index = indices[0]
+        return {
+            "answer": choices[index]["value"],
+            "index": index,
+            "basis": basis if len(indices) == 1 else basis + "-tie",
+        }
+
+    def iri_of(value):
+        # The pipeline offers a linked mention as an N-Triples term, <IRI>.
+        if value.startswith("<") and value.endswith(">"):
+            return value[1:-1]
+        return value
+
+    exact = [i for i, c in enumerate(choices) if iri_of(c["value"]) in iris]
+    if exact:
+        return pick(exact, "gold-iri")
+    overlap = [
+        len((words_of(c.get("label", "")) | words_of(c["value"])) & words)
+        for c in choices
+    ]
+    best = max(overlap)
+    if best > 0:
+        return pick([i for i, n in enumerate(overlap) if n == best], "gold-words")
+    return {"answer": choices[0]["value"], "index": 0, "basis": "first-choice"}
 
 
 def validate_ask_record(value):

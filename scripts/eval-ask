@@ -29,7 +29,9 @@ from evaluator import (
     answer_set,
     bounded_file,
     capture_child,
+    choose_clarification,
     digest,
+    prefix_header,
     finite_positive,
     leaf_environment,
     offline_query,
@@ -46,6 +48,10 @@ from evaluator import (
 )
 
 DEFAULT_SET = ROOT / "testsuite/ask/demo.json"
+# `answer` answers a clarification of an answerable question from its gold query and
+# scores the second Ask. `score` scores the clarification itself as a failure, as the
+# first paid run did.
+CLARIFICATIONS = ("answer", "score")
 
 
 def bucket(score):
@@ -178,13 +184,14 @@ class Runner:
             if self.loc
             else (pathlib.Path(args.set).parent / qset["data"]).resolve()
         )
-        self.header = "".join(
-            f"PREFIX {k}: <{v}>\n" for k, v in qset.get("prefixes", {}).items()
-        )
+        self.header = prefix_header(qset.get("prefixes", {}))
         self.gold_cache, self.serial, self.last_record = {}, 0, None
         self.policy = getattr(args, "scoring_policy", None) or POLICY
         if self.policy not in POLICIES:
             raise Invalid("unknown scoring policy")
+        self.clarifications = getattr(args, "clarifications", None) or "answer"
+        if self.clarifications not in CLARIFICATIONS:
+            raise Invalid("unknown clarification policy")
         self.env = leaf_environment(
             {"SPARKLES_EVAL_GATE_TOKEN": proxy.token} if proxy else None
         )
@@ -320,7 +327,7 @@ class Runner:
             return out, None
         return out, "invalid_output"
 
-    def ask(self, pair, q, config=None):
+    def ask_command(self, pair, q, config=None, clarification=None):
         cmd = [
             self.args.sparkles,
             "ask",
@@ -346,14 +353,31 @@ class Runner:
             cmd += ["--model-secret", secret]
         if self.args.allow_loopback:
             cmd += ["--outbound-allow", "127.0.0.1/32"]
+        if clarification is not None:
+            # One argument, so a value that starts with a dash is never an option.
+            cmd.append("--clarification=" + clarification)
+        return cmd
+
+    def ask(self, pair, q, config=None):
         refused = self.proxy.cap_refusals if self.proxy else 0
-        record, directory = self.spawn(cmd, "ask")
+        record, directory = self.spawn(self.ask_command(pair, q, config), "ask")
         out, failure = self.classify(record, directory)
+        wall = record["elapsedSeconds"]
+        if (
+            not failure
+            and self.clarifications == "answer"
+            and q["kind"] == "answerable"
+            and out.get("outcome") == "clarify"
+            and not (self.proxy and self.proxy.cap_refusals > refused)
+        ):
+            out, record, failure, wall = self.answer_clarification(
+                pair, q, config, out, record, wall
+            )
         if self.proxy and self.proxy.cap_refusals > refused:
             failure = "budget_refused"
         if failure:
             out["evalFailure"] = failure
-        out["wallSeconds"] = record["elapsedSeconds"]
+        out["wallSeconds"] = wall
         out["execution"] = record
         # The SDK reports zero when pricing is unconfigured. Never call that a
         # known free answer. Preserve the raw SDK value in stdout as a diagnostic.
@@ -361,6 +385,44 @@ class Runner:
             p in self.cli_priced_pairs for p in ([pair] if pair else self.args.pair)
         )
         return out
+
+    def answer_clarification(self, pair, q, config, first, record, wall):
+        """Answer the pipeline's clarification from the gold query and ask again.
+
+        `choose_clarification` only ever answers with a value the pipeline offered.
+        The second Ask is the one scored, and the first one's clarification, answer,
+        execution and usage are kept beside it. Its usage is added to the second's,
+        and the case's ledger cost already covers both.
+        """
+        choice = choose_clarification(first.get("clarify"), self.header + q["gold"])
+        if choice is None:
+            first["clarification"] = {"basis": "unusable"}
+            return first, record, None, wall
+        record2, directory = self.spawn(
+            self.ask_command(pair, q, config, choice["answer"]), "ask-clarified"
+        )
+        out, failure = self.classify(record2, directory)
+        clarify = first.get("clarify") or {}
+        out["clarification"] = {
+            "id": clarify.get("id"),
+            "question": clarify.get("question"),
+            "choices": clarify.get("choices"),
+            **choice,
+            "firstExecution": record,
+            "firstUsage": first.get("usage"),
+        }
+        usage, before = dict(out.get("usage") or {}), first.get("usage") or {}
+        for field in ("inputTokens", "outputTokens"):
+            if type(before.get(field)) is int:
+                usage[field] = usage.get(field, 0) + before[field]
+        if before.get("estimatedCost") is not None:
+            later = usage.get("estimatedCost")
+            usage["estimatedCost"] = (
+                later + before["estimatedCost"] if later is not None else None
+            )
+        if usage:
+            out["usage"] = usage
+        return out, record2, failure, wall + record2["elapsedSeconds"]
 
     def first_draft(self, q, out):
         attempts = out.get("attempts")
@@ -497,7 +559,31 @@ def summarize_pair(pair, qs, answers, scores):
     ledger_cost = (
         sum(nano) / 1e9 if answers and all(type(v) is int for v in nano) else None
     )
-    clar = [i for i, a in enumerate(answers) if a.get("outcome") == "clarify"]
+    # A question counts as asked when the pipeline asked, even when the clarification
+    # was then answered and the second Ask was scored, and in a cascade when any pair
+    # it tried asked.
+    clar = [
+        i
+        for i, a in enumerate(answers)
+        if a.get("outcome") == "clarify"
+        or "clarification" in a
+        or a.get("cascadeAsked")
+    ]
+
+    def records(a):
+        if "cascadeClarifications" in a:
+            return a["cascadeClarifications"]
+        return [a["clarification"]] if "clarification" in a else []
+
+    answered = [
+        i
+        for i in answerable
+        if any(c.get("basis") != "unusable" for c in records(answers[i]))
+    ]
+    basis = {}
+    for a in answers:
+        for c in records(a):
+            basis[c.get("basis")] = basis.get(c.get("basis"), 0) + 1
     refusal = [i for i, q in enumerate(qs) if q["kind"] == "unanswerable"]
     selects = [scores[i][2] for i in answerable if scores[i][2]["kind"] == "select"]
     common = sum(s["intersection"] for s in selects)
@@ -525,6 +611,9 @@ def summarize_pair(pair, qs, answers, scores):
             "clarificationPrecision": ratio(
                 sum(qs[i]["kind"] == "clarify" for i in clar), len(clar)
             ),
+            "clarificationsAnswered": ratio(len(answered), len(answerable)),
+            "clarificationBasis": basis,
+            "correctAfterClarification": sum(bool(scores[i][0]) for i in answered),
             "refusalAccuracy": ratio(sum(scores[i][0] for i in refusal), len(refusal)),
             "macroPrecision": statistics.mean(scores[i][1][0] for i in answerable)
             if answerable
@@ -623,6 +712,14 @@ def cascade_cases(pairs, qs, answers, scores):
         merged["cliEstimatedCostKnown"] = all(
             a.get("cliEstimatedCostKnown", True) for a in spent
         )
+        # A pair that asked for a clarification and then failed still asked, so the
+        # cascade keeps the clarifications of every pair it tried.
+        merged["cascadeAsked"] = any(
+            a.get("outcome") == "clarify" or "clarification" in a for a in spent
+        )
+        merged["cascadeClarifications"] = [
+            a["clarification"] for a in spent if "clarification" in a
+        ]
         used.append(q)
         cascade_answers.append(merged)
         cascade_scores.append(scores[tried[-1]][q["id"]])
@@ -654,6 +751,7 @@ def finish_run(report, out_dir, runner, error=None):
     with (out_dir / "report.md").open("x") as f:
         f.write(
             f"# Ask pipelines\n\nStrict RDF-term accuracy uses {runner.policy}.\n\n"
+            f"The clarification policy is {runner.clarifications}.\n\n"
         )
         f.write(
             "The run is "
@@ -678,6 +776,7 @@ def run_matrix(args, proxy=None, prepared=None, admit=None):
         "schema": 3,
         "mode": "pipeline",
         "scoringPolicy": runner.policy,
+        "clarificationPolicy": runner.clarifications,
         "set": str(args.set),
         "setSha256": digest(args.set),
         "dataSha256": digest(runner.data) if runner.data else None,
@@ -887,6 +986,12 @@ def parse_args(argv=None):
         choices=POLICIES,
         default=POLICY,
         help="the projected-column policy, or the whole-row one of the first paid run",
+    )
+    ap.add_argument(
+        "--clarifications",
+        choices=CLARIFICATIONS,
+        default="answer",
+        help="answer an answerable question's clarification from its gold, or score it",
     )
     ap.add_argument("--allow-loopback", action="store_true")
     ap.add_argument("--self-test", action="store_true")

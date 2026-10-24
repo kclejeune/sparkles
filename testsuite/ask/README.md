@@ -33,10 +33,8 @@ prefixes that DBpedia's endpoint predeclares, such as `dbo:` and `xsd:`, and put
 parentheses and a variable around a bare projection such as `SELECT DISTINCT COUNT(?x)`.
 The rewrites never look inside a literal, an IRI or a comment, and the new variable is
 one the query does not use. The set keeps the source query as `sourceGold` and lists the
-rewrites. The DBpedia sets cannot run yet. On the full DBpedia database every `sparkles
-ask` takes about 100 seconds and most checks fail on the 2 GiB query memory budget. The
-likely cause is the schema report of the whole dataset that `check_query` builds in each
-process, and roadmap item 89 addresses it.
+rewrites. The DBpedia sets run with `--loc` against a database of the release their gold
+answers were recomputed on.
 
 ## What is scored
 
@@ -71,6 +69,29 @@ the saved answers of a run again under the current policy, or the first one with
 data file or a binary whose SHA256 differs from the run's, and a case file whose
 question differs from its report row. The new report records the query timeout, each
 case file's SHA256 and each row's execution accuracy before and after.
+
+Every query the evaluator runs starts with PREFIX lines for the well-known prefixes of
+C20 §3.1, such as `rdfs:`, `skos:` and `dcterms:`, followed by the set's own prefixes,
+which replace a well-known one of the same name. Ask runs its drafts with the well-known
+prefixes and `sparkles query --loc` does not, so before 2026-10-24 a correct answer that
+wrote `rdfs:label` without declaring it failed when it was scored. The DBpedia sets
+declare no prefixes of their own, and the first paid run of them was scored again with
+these lines.
+
+When an answerable question ends at a clarification, the evaluator answers it as a person
+who means the gold query would, and scores a second Ask that carries the answer. The
+answer is always the value of one of the choices the pipeline offered, so nothing from the
+gold that the pipeline did not already propose reaches it. A choice whose value is an IRI
+that the gold query names wins. Otherwise the choice whose label and value share the most
+words with the gold's IRIs and literals wins, a tie goes to the earliest tied choice, and
+with no shared word the first choice is taken. The saved answer keeps the clarification,
+the choice, its basis and the first Ask's execution and usage, and each row counts
+`clarificationsAnswered`, `clarificationBasis` and `correctAfterClarification`. A
+question still counts as asked for clarification precision, and a cascade row counts a
+question as asked when any pair it tried asked. A relative IRI in the gold resolves
+against its BASE before the choices are compared. A question of kind `clarify`
+or `unanswerable` is never answered, and `--clarifications score` scores every
+clarification as a failure, as the first paid run did.
 
 Answerable accuracy, clarification precision and refusal accuracy have separate
 denominators. Only the `unanswerable` outcome is a successful refusal. A provider error,
@@ -119,8 +140,9 @@ and the reply writes a settle line with the cost from its usage. A request is re
 when the spent total plus its bound would pass `localCapNanodollars`. The spent total
 includes the carryover, so the cap covers the carryover as well, and new requests can
 spend the cap minus the carryover. The run file is also refused when the cap plus the
-carryover passes USD 25, which counts the carryover twice and keeps the run on the safe
-side. An error reply is free, a lost reply costs the bound, a reply without usage costs
+carryover passes the hard cap of one ledger, USD 50, which counts the carryover twice and
+keeps the run on the safe side. The person who pays sets each campaign's total, which can
+span several ledgers in separate directories. An error reply is free, a lost reply costs the bound, a reply without usage costs
 the bound, and any other fault of the request costs the bound. Replaying the ledger
 counts every unsettled reserve at its bound, and the pilot's unresolved $1.002560 is the
 carryover line. Reopening a ledger resumes it. Nothing resets it. The ledger's first line
@@ -129,7 +151,7 @@ holds its format version, 2, and a reader refuses any other version.
 Replay is strict. It refuses a cost or bound that is not a nonnegative integer, a request
 ID that is not a positive integer, a settle without its reserve, a repeated reserve, a
 carryover anywhere but right after the header, and a reconcile that breaks any rule
-below or takes the ledger past USD 25. A refused ledger stops the run. A ledger from an
+below or takes the ledger past the hard cap. A refused ledger stops the run. A ledger from an
 older format, an empty file and a ledger cut off between its header and its carryover
 are refused the same way, and need a new ledger directory or an edit by hand.
 
@@ -154,8 +176,9 @@ scripts/eval-ask-anthropic --run RUN.json --reconcile carryover \
   --billed-nanodollars 1600000 --evidence "Console cost of key K on 2026-10-15"
 ```
 
-The local ledger is the authority. A Console workspace spend limit of $24 is a backstop
-against a defect, and it can lag billing, so the run does not rely on it.
+The local ledger is the authority. A Console workspace spend limit below the account's
+balance is a backstop against a defect, and it can lag billing, so the run does not rely
+on it.
 
 Before spending, the run counts tokens, which is free, and sends each model of the run
 one structured-output request of at most 256 tokens. It records the status and headers
@@ -177,8 +200,12 @@ cannot be traced to the reply that produced them.
 `run.example.json` shows the run file. Copy it and set the paths. It holds the sets and
 the models of each set, the effort, `maxOutputTokens`, the request and Ask timeouts, the
 query timeout, the cap, the carryover, the ledger, the output directory and the binary
-with its SHA256. The carryover is required, and the cap plus the carryover cannot pass
-USD 25. A real run refuses a second `.jsonl` file in the ledger directory, so the ledger
+with its SHA256. The carryover is required, zero for a fresh authorization, and the cap
+plus the carryover cannot pass USD 50. `clarifications` is `answer` unless the run file
+sets `score`. `contextTokens` gives every model its context window. Without it the server
+assumes 8192 tokens, treats each model as a small one and trims the grounding to 30
+classes, 60 predicates, two examples and three candidates per mention, which is how the
+first paid run asked. A real run refuses a second `.jsonl` file in the ledger directory, so the ledger
 file stays the account of record for the whole spend.
 
 `askTokenBudget` is the total token limit of one Ask. The default of 32768 ends most

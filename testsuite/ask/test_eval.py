@@ -18,9 +18,13 @@ from evaluator import (
     Unsupported,
     answer_set,
     capture_child,
+    choose_clarification,
     digest,
+    gold_terms,
     norm_term,
     parse_child,
+    WELL_KNOWN_PREFIXES,
+    prefix_header,
     prf,
     score_sets,
     strict_json,
@@ -45,6 +49,23 @@ def result(rows, names=("x", "y")):
 
 def iri(value):
     return {"type": "uri", "value": value}
+
+
+class Prefixes(unittest.TestCase):
+    def test_the_well_known_prefixes_match_the_engine(self):
+        src = (HERE.parents[1] / "crates/sparkles-core/src/io.rs").read_text()
+        body = src[src.index("pub fn standard_prefixes") : src.index("pub fn well_known_prefixes")]
+        import re
+
+        pairs = dict(re.findall(r'\("([a-z]+)",\s*"([^"]+)"\)', body))
+        self.assertEqual(pairs, WELL_KNOWN_PREFIXES)
+
+    def test_the_set_overrides_a_well_known_name(self):
+        header = prefix_header({"dc": "http://purl.org/dc/terms/", "ex": "http://e/"})
+        self.assertIn("PREFIX rdfs: <http://www.w3.org/2000/01/rdf-schema#>\n", header)
+        self.assertIn("PREFIX dc: <http://purl.org/dc/terms/>\n", header)
+        self.assertNotIn("http://purl.org/dc/elements/1.1/", header)
+        self.assertTrue(header.endswith("PREFIX ex: <http://e/>\n"))
 
 
 class Scoring(unittest.TestCase):
@@ -881,6 +902,269 @@ class ExtraInvariants(unittest.TestCase):
             )
 
 
+class Clarifications(unittest.TestCase):
+    """The evaluator answers a clarification as a person who means the gold would."""
+
+    GOLD = (
+        "PREFIX res: <http://dbpedia.org/resource/>\n"
+        "# res:Salt_Lake_City,_Utah is only in a comment\n"
+        'SELECT ?tz WHERE { res:Salt_Lake_City <http://dbpedia.org/ontology/timeZone> ?tz .'
+        ' ?tz <http://www.w3.org/2000/01/rdf-schema#label> "res:Diocese" .'
+        " res:Washington\\,_D.C\\. ?p ?o . und:Berlin ?p ?o }"
+    )
+
+    @staticmethod
+    def choices(*pairs):
+        return {"choices": [{"label": label, "value": value} for label, value in pairs]}
+
+    def test_gold_terms_follow_the_lexical_rules(self):
+        iris, words = gold_terms(self.GOLD)
+        self.assertIn("http://dbpedia.org/resource/Salt_Lake_City", iris)
+        self.assertIn("http://dbpedia.org/resource/Washington,_D.C.", iris)
+        self.assertIn("http://dbpedia.org/ontology/timeZone", iris)
+        # A comment, a literal, an undeclared prefix and the declaration itself are not
+        # names the query uses.
+        self.assertNotIn("http://dbpedia.org/resource/Salt_Lake_City,_Utah", iris)
+        self.assertNotIn("http://dbpedia.org/resource/Diocese", iris)
+        self.assertNotIn("http://dbpedia.org/resource/", iris)
+        self.assertFalse(any("Berlin" in i for i in iris))
+        self.assertTrue({"salt", "lake", "city", "timezone", "diocese"} <= words)
+        # An unescaped final dot ends the triple pattern.
+        iris, _ = gold_terms("PREFIX r: <http://x/> SELECT * { r:a r:b r:c. }")
+        self.assertEqual(iris, {"http://x/a", "http://x/b", "http://x/c"})
+
+    def test_an_offered_iri_the_gold_names_wins(self):
+        c = self.choices(
+            ("Salt Lake City (Category)", "http://dbpedia.org/resource/Category:Salt_Lake_City"),
+            ("Salt Lake City, Utah", "http://dbpedia.org/resource/Salt_Lake_City,_Utah"),
+            ("Salt Lake City (dbo:City)", "http://dbpedia.org/resource/Salt_Lake_City"),
+        )
+        self.assertEqual(
+            choose_clarification(c, self.GOLD),
+            {
+                "answer": "http://dbpedia.org/resource/Salt_Lake_City",
+                "index": 2,
+                "basis": "gold-iri",
+            },
+        )
+
+    def test_an_n_triples_term_matches_its_iri(self):
+        # `link_entities` choices carry the IRI as an N-Triples term, and the answer
+        # keeps that spelling, which `--clarification` takes.
+        c = self.choices(
+            ("Salt Lake City, Utah", "<http://dbpedia.org/resource/Salt_Lake_City,_Utah>"),
+            ("Salt Lake City", "<http://dbpedia.org/resource/Salt_Lake_City>"),
+        )
+        self.assertEqual(
+            choose_clarification(c, self.GOLD),
+            {
+                "answer": "<http://dbpedia.org/resource/Salt_Lake_City>",
+                "index": 1,
+                "basis": "gold-iri",
+            },
+        )
+
+    def test_words_decide_a_free_text_choice_and_ties_go_to_the_first(self):
+        c = self.choices(("the mayor", "the mayor"), ("its time zone", "its time zone"))
+        self.assertEqual(choose_clarification(c, self.GOLD)["index"], 1)
+        self.assertEqual(choose_clarification(c, self.GOLD)["basis"], "gold-words")
+        c = self.choices(("salt flats", "a"), ("salt mine", "b"))
+        self.assertEqual(
+            choose_clarification(c, self.GOLD),
+            {"answer": "a", "index": 0, "basis": "gold-words-tie"},
+        )
+        c = self.choices(("red", "red"), ("blue", "blue"))
+        self.assertEqual(
+            choose_clarification(c, self.GOLD),
+            {"answer": "red", "index": 0, "basis": "first-choice"},
+        )
+
+    def test_the_answer_is_always_an_offered_value(self):
+        # The gold names Salt_Lake_City, which is not offered, so it never reaches the
+        # pipeline.
+        c = self.choices(("Berlin", "http://dbpedia.org/resource/Berlin"))
+        out = choose_clarification(c, self.GOLD)
+        self.assertEqual(out["answer"], "http://dbpedia.org/resource/Berlin")
+
+    def test_relative_iris_resolve_against_the_base_in_force(self):
+        gold = (
+            "BASE <http://dbpedia.org/resource/>\n"
+            "PREFIX rel: <sub/>\n"
+            "SELECT ?x { <Berlin> <http://ex/p> ?x . rel:a ?p ?x }"
+        )
+        iris, _ = gold_terms(gold)
+        self.assertEqual(
+            iris,
+            {
+                "http://dbpedia.org/resource/Berlin",
+                "http://ex/p",
+                "http://dbpedia.org/resource/sub/a",
+            },
+        )
+        c = self.choices(
+            ("Berlin", "http://dbpedia.org/resource/Berlin,_New_Hampshire"),
+            ("Berlin", "http://dbpedia.org/resource/Berlin"),
+        )
+        self.assertEqual(choose_clarification(c, gold)["index"], 1)
+        self.assertEqual(choose_clarification(c, gold)["basis"], "gold-iri")
+        # An absolute IRI keeps its spelling under a BASE.
+        gold = "BASE <http://ex/> SELECT ?x { <HTTP://ex/Berlin> <p> ?x }"
+        self.assertEqual(gold_terms(gold)[0], {"HTTP://ex/Berlin", "http://ex/p"})
+        c = self.choices(("Berlin", "http://ex/Berlin"), ("Berlin", "HTTP://ex/Berlin"))
+        self.assertEqual(choose_clarification(c, gold)["index"], 1)
+
+    def test_unusable_clarifications(self):
+        for clarify in [
+            None,
+            {},
+            {"choices": []},
+            {"choices": ["plain"]},
+            {"choices": [{"label": "x"}]},
+            {"choices": [{"label": "x", "value": " "}]},
+            {"choices": [{"label": "x", "value": "a\nb"}]},
+            {"choices": [{"label": 3, "value": "a"}]},
+            {"choices": [{"label": "x", "value": "v"}] * 17},
+        ]:
+            with self.subTest(clarify=clarify):
+                self.assertIsNone(choose_clarification(clarify, self.GOLD))
+
+
+class ClarifiedRuns(unittest.TestCase):
+    setUp = Processes.setUp
+    child = Processes.child
+    fixture = Processes.fixture
+    questions_fixture = Processes.questions_fixture
+    fake_ask = Processes.fake_ask
+
+    # The fake asks which "B" is meant, offering a value that starts with a dash and
+    # the gold's IRI, and answers only when the argument names the gold's IRI.
+    BODY = (
+        "import json,sys\n"
+        'if sys.argv[1] == "query":\n'
+        '    print(json.dumps({"head":{"vars":["x"]},"results":{"bindings":'
+        '[{"x":{"type":"uri","value":"http://ex/v"}}]}}))\n'
+        "    raise SystemExit(0)\n"
+        'given = [a for a in sys.argv if a.startswith("--clarification")]\n'
+        "if not given:\n"
+        '    print(json.dumps({"outcome":"clarify","clarify":{"id":"mention",'
+        '"question":"Which B?","choices":[{"label":"B (dash)","value":"-B"},'
+        '{"label":"B","value":"http://ex/B"}]},'
+        '"usage":{"inputTokens":3,"outputTokens":1,"estimatedCost":0.5}}))\n'
+        'elif given == ["--clarification=http://ex/B"]:\n'
+        '    print(json.dumps({"outcome":"answered","result":{"query":'
+        '"SELECT ?x WHERE { <http://ex/B> <http://ex/p> ?x }"},'
+        '"usage":{"inputTokens":10,"outputTokens":2,"estimatedCost":1.0}}))\n'
+        "else:\n"
+        '    print(json.dumps({"outcome":"answered","result":{"query":"SELECT ?x {}"}}))\n'
+    )
+
+    def run_set(self, kinds, policy=None):
+        args = self.questions_fixture(kinds)
+        s = json.loads(pathlib.Path(args.set).read_text())
+        for q in s["questions"]:
+            if q["kind"] == "answerable":
+                q["gold"] = "SELECT ?x WHERE { <http://ex/B> <http://ex/p> ?x }"
+        pathlib.Path(args.set).write_text(json.dumps(s))
+        if policy:
+            args.clarifications = policy
+        self.fake_ask(args, self.BODY)
+        _, report = eval_ask.run_matrix(args)
+        self.assertTrue(report["complete"], report.get("errorDetail"))
+        return args, report
+
+    def test_an_answered_clarification_scores_the_second_ask(self):
+        args, report = self.run_set(["answerable", "clarify"])
+        self.assertEqual(report["clarificationPolicy"], "answer")
+        first, second = report["cases"]
+        self.assertTrue(first["correct"], first)
+        self.assertTrue(second["correct"], second)  # a clarify question is not answered
+        saved = json.loads(
+            (pathlib.Path(args.out) / (first["case"] + ".json")).read_text()
+        )
+        answer = saved["answer"]
+        self.assertEqual(answer["clarification"]["answer"], "http://ex/B")
+        self.assertEqual(answer["clarification"]["basis"], "gold-iri")
+        self.assertEqual(answer["clarification"]["question"], "Which B?")
+        self.assertEqual(answer["usage"]["inputTokens"], 13)
+        self.assertEqual(answer["usage"]["outputTokens"], 3)
+        self.assertEqual(answer["usage"]["estimatedCost"], 1.5)
+        self.assertGreater(
+            answer["wallSeconds"], answer["clarification"]["firstExecution"]["elapsedSeconds"]
+        )
+        labels = sorted(p.name.split("-", 1)[1] for p in pathlib.Path(args.out).iterdir() if p.is_dir())
+        self.assertEqual(labels.count("ask-clarified"), 1)
+        row = report["rows"][0]
+        self.assertEqual(row["clarificationsAnswered"]["numerator"], 1)
+        self.assertEqual(row["clarificationBasis"], {"gold-iri": 1})
+        self.assertEqual(row["correctAfterClarification"], 1)
+        # Both questions asked, and only the clarify question was meant to.
+        self.assertEqual(row["clarificationPrecision"]["numerator"], 1)
+        self.assertEqual(row["clarificationPrecision"]["denominator"], 2)
+
+    def test_a_cascade_keeps_the_clarification_of_a_pair_that_failed_after_it(self):
+        args, _ = self.run_set(["answerable"])
+        cfg = json.loads(pathlib.Path(args.model_config).read_text())
+        cfg["models"]["providers"]["p"]["models"]["m2"] = {}
+        pathlib.Path(args.model_config).write_text(json.dumps(cfg))
+        args.pair = ["p/m", "p/m2"]
+        args.out = str(pathlib.Path(args.out).with_name("cascade"))
+        # The first pair asks, and fails once the clarification is answered. The second
+        # answers without asking.
+        self.fake_ask(
+            args,
+            "import json,sys\n"
+            'if sys.argv[1] == "query":\n'
+            '    print(json.dumps({"head":{"vars":["x"]},"results":{"bindings":'
+            '[{"x":{"type":"uri","value":"http://ex/v"}}]}}))\n'
+            'elif "draft=p/m2" in sys.argv:\n'
+            '    print(json.dumps({"outcome":"answered","result":{"query":'
+            '"SELECT ?x WHERE { <http://ex/B> <http://ex/p> ?x }"}}))\n'
+            'elif not any(a.startswith("--clarification") for a in sys.argv):\n'
+            '    print(json.dumps({"outcome":"clarify","clarify":{"id":"mention",'
+            '"question":"Which B?","choices":[{"label":"B","value":"http://ex/B"}]}}))\n'
+            "else:\n"
+            '    print(json.dumps({"outcome":"error","error":{"code":"provider-unavailable"}}))\n'
+            "    raise SystemExit(2)\n",
+        )
+        _, report = eval_ask.run_matrix(args)
+        self.assertTrue(report["complete"], report.get("errorDetail"))
+        first, second, cascade = report["rows"]
+        self.assertEqual(first["failureStatuses"], {"provider_error": 1})
+        self.assertEqual(first["clarificationBasis"], {"gold-iri": 1})
+        self.assertEqual(second["clarificationPrecision"]["denominator"], 0)
+        self.assertEqual(cascade["executionAccuracy"]["numerator"], 1)
+        self.assertEqual(cascade["clarificationPrecision"]["denominator"], 1)
+        self.assertEqual(cascade["clarificationsAnswered"]["numerator"], 1)
+        self.assertEqual(cascade["clarificationBasis"], {"gold-iri": 1})
+
+    def test_the_score_policy_keeps_the_clarification_a_failure(self):
+        args, report = self.run_set(["answerable"], policy="score")
+        self.assertEqual(report["clarificationPolicy"], "score")
+        case = report["cases"][0]
+        self.assertFalse(case["correct"])
+        self.assertEqual(case["detail"]["status"], "pipeline_clarify")
+        self.assertEqual(report["rows"][0]["clarificationsAnswered"]["numerator"], 0)
+
+    def test_an_unusable_clarification_is_scored_as_asked(self):
+        args = self.questions_fixture(["answerable"])
+        s = json.loads(pathlib.Path(args.set).read_text())
+        s["questions"][0]["gold"] = "SELECT ?x WHERE { <http://ex/B> <http://ex/p> ?x }"
+        pathlib.Path(args.set).write_text(json.dumps(s))
+        self.fake_ask(
+            args,
+            "import json,sys\n"
+            'if sys.argv[1] == "query":\n'
+            '    print(json.dumps({"head":{"vars":["x"]},"results":{"bindings":[]}}))\n'
+            "else:\n"
+            '    print(json.dumps({"outcome":"clarify","clarify":{"choices":[]}}))\n',
+        )
+        _, report = eval_ask.run_matrix(args)
+        case = report["cases"][0]
+        self.assertEqual(case["detail"]["status"], "pipeline_clarify")
+        self.assertEqual(report["rows"][0]["clarificationBasis"], {"unusable": 1})
+        self.assertEqual(report["rows"][0]["clarificationsAnswered"]["numerator"], 0)
+
+
 class FirstDraft(unittest.TestCase):
     setUp = Processes.setUp
     child = Processes.child
@@ -898,7 +1182,7 @@ class FirstDraft(unittest.TestCase):
         b.write_text(
             "#!"
             + PYTHON
-            + '\nimport json,sys\nprint(json.dumps({"head":{"vars":["x"]},"results":{"bindings":[] if sys.argv[-1]=="EMPTY" else [{"x":{"type":"literal","value":"wrong"}}]}}))\n'
+            + '\nimport json,sys\nprint(json.dumps({"head":{"vars":["x"]},"results":{"bindings":[] if sys.argv[-1].endswith("EMPTY") else [{"x":{"type":"literal","value":"wrong"}}]}}))\n'
         )
 
         def answer(first, check=None):
