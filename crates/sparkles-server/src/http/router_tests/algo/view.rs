@@ -588,6 +588,8 @@ async fn answers_of_one_definition_share_its_hash() {
     assert_ne!(a["run"]["definition"], c["run"]["definition"]);
 }
 
+// the GraphRAG routes are built with the `mcp` feature
+#[cfg(feature = "mcp")]
 #[tokio::test]
 async fn memberships_on_a_branch_say_they_are_not_available() {
     let s = algo_server();
