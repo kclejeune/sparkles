@@ -1343,6 +1343,17 @@ before Phase 2 starts.
     where it would go?
 21. **Estimate.** Phase 2 was estimated at about two weeks before the features in
     question 15 existed. What is the estimate now?
+22. **Joining a peer and its credentials.** A replica joins today by static
+    configuration: an operator writes the primary's URL, a CA file and a bearer token
+    from a replication-only grant (§4.8), and the primary learns of the follower from its
+    first request. There is no enrollment step, no discovery of peers and no way to
+    rotate a token without editing both servers. With lease-based failover any replica
+    can become the primary, so every peer needs a token that the others accept and
+    credentials for the lease store. Should peers enroll with a one-time join token,
+    authenticate each other with mutual TLS (item 63), or use the identity of the
+    platform, such as a Kubernetes service account? How are tokens rotated, how are
+    users and grants kept in step across peers (open question 10), and how does a
+    joining replica get the keys of an encrypted dataset (question 17)?
 
 ## 12. Sources
 
