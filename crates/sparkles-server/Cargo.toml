@@ -134,7 +134,7 @@ sparkles-office = { workspace = true, features = ["fixtures"] }
 sparkles-client = { workspace = true, features = ["blocking"] }
 
 [features]
-default = ["reasoning", "shacl", "shex", "mimalloc", "text", "geo", "geo-epsg", "otel", "auth", "mcp", "memory", "backup", "fmt", "tls", "graphql", "pdf", "office", "mapping-sqlite", "mapping-parquet"]
+default = ["reasoning", "shacl", "shex", "mimalloc", "text", "text-cjk-dict", "geo", "geo-epsg", "otel", "auth", "mcp", "memory", "backup", "fmt", "tls", "graphql", "pdf", "office", "mapping-sqlite", "mapping-parquet"]
 # SQLite connections of R2RML and RML mappings (`sparkles map`, `--connection`, the
 # `connections` settings kind); bundles SQLite's C sources
 mapping-sqlite = ["sparkles/mapping-sqlite"]
@@ -148,6 +148,9 @@ shacl = ["dep:sparkles-shacl", "sparkles/shacl"]
 shex = ["dep:sparkles-shex", "sparkles/shex"]
 # full-text search (`text:query`, `/$/text`, `sparkles text-index`)
 text = ["sparkles/text"]
+# the ja-dict, zh-dict and ko-dict analyzers and `sparkles text-dict`, which installs their
+# dictionaries; the binary carries no dictionary
+text-cjk-dict = ["text", "sparkles/text-cjk-dict"]
 # GeoSPARQL (`geof:` functions, `spatial:` property functions, `/$/geo`, `sparkles geo-index`),
 # with projected CRSs an operator defines by proj4 strings (`--geo-crs`)
 geo = ["sparkles/geo", "sparkles/geo-proj4"]

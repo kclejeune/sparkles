@@ -923,7 +923,10 @@ fn normalize(s: &str, analyzer: Option<super::Analyzer>) -> String {
     while let Some(t) = stream.next() {
         out.push_str(&t.text);
     }
-    if analyzer == Some(super::Analyzer::German) {
+    if analyzer == Some(super::Analyzer::GermanLight) {
+        // Lucene's German analyzer normalizes a multi-term query as it does its tokens
+        out = super::light::german_normalize(&out);
+    } else if analyzer == Some(super::Analyzer::German) {
         out = out
             .replace('ä', "a")
             .replace('ö', "o")

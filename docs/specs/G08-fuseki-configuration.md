@@ -188,8 +188,12 @@ and named in the report:
   `text:defaultField` in Jena. This differs when the map has more than one field.
 - Lucene's analyzers. Sparkles splits words, lowercases and folds to ASCII. A
   `text:LocalizedAnalyzer` with `text:language` adds that language to `languages`, and
-  `text:multilingualSupport true` sets `languages` to `"all"`. Stop words, keyword
-  analyzers, `text:ConfigurableAnalyzer`, `text:DefinedAnalyzer` and
+  `text:multilingualSupport true` adds the 20 languages that jena-text analyzes and
+  Sparkles has an analyzer for. Each language gets the analyzer closest to Lucene's,
+  which is the one that follows Lucene's for English, French, Spanish, Italian,
+  Portuguese, German, Dutch, Russian, Swedish, Chinese, Japanese and Korean, and the
+  Snowball one for the others ([F03](F03-full-text-search.md#outcome)). Stop words,
+  keyword analyzers, `text:ConfigurableAnalyzer`, `text:DefinedAnalyzer` and
   `text:queryAnalyzer` have no equivalent.
 - `text:propLists`.
 

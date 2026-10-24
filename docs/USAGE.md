@@ -647,7 +647,12 @@ sparkles infer   --loc db --profile rdfs --max-inferred 200000000   # allow 200 
 sparkles infer   --loc db --vocab geosparql --geo-default-geometry   # + GeoSPARQL axioms, default geometries
 sparkles infer   --loc db --ontology-graph http://ex.org/onto --imports fetch   # input graphs and owl:imports
 sparkles text-index --loc db                  # full-text index: --predicate, --exclude-graph, --language en|all,
-                                              #   --rebuild, --status, --disable
+                                              #   --language fr=french-light (a tag with an analyzer),
+                                              #   --rebuild, --status, --disable, --text-dicts DIR
+sparkles text-dict fetch ja-dict              # dictionary of ja-dict, zh-dict or ko-dict: download, verify,
+                                              #   compile and install (--dir DIR or --data DATA)
+sparkles text-dict install zh-dict --from dict.txt --license LICENSE   # from a local source
+sparkles text-dict list                       # the installed dictionaries, checked (--json)
 sparkles geo-index  --loc db                  # spatial index: --predicate, --feature-link, --exclude-graph, --wgs84,
                                               #   --distance geodesic|haversine, --rebuild, --status (JSON), --disable
 sparkles vector create --loc db --name emb --predicate http://example.org/emb --dim 384
@@ -721,6 +726,21 @@ configuration cancels the background rebuild and waits for its cleanup. If the r
 has already started publishing the new index files, that step finishes before the
 cancellation returns. Cancelling the HTTP rebuild task behaves as it did before, and
 the native rebuild stops synchronously ([API](API.md#full-text-search)).
+
+The `ja-dict`, `zh-dict` and `ko-dict` analyzers read dictionaries that
+`sparkles text-dict` installs. `fetch` downloads a pinned source, checks its SHA-256,
+compiles it and installs it with its license. `ja-dict` uses IPADIC 2.7.0 with the entry
+for `令和` that Lucene adds, `ko-dict` uses mecab-ko-dic 2.0.3, the version that Lucene's
+Nori is built from, and `zh-dict` uses jieba's word list. `install` compiles a local
+source instead, a MeCab dictionary directory for `ja-dict` and `ko-dict` or a word list
+of `word frequency` lines for `zh-dict`. Both write `NAME.sdict`, `NAME.license.txt` and
+`NAME.json` to `--dir`, to `--data DATA` as `DATA/text-dicts`, or to
+`$SPARKLES_TEXT_DICTS`. `serve` reads them from `--text-dicts`, `DATA/text-dicts` by
+default, and `text-index` from `--text-dicts` or `$SPARKLES_TEXT_DICTS`. Other commands
+that open a dataset whose index uses a dictionary read `$SPARKLES_TEXT_DICTS`. The
+compiled dictionaries take 12 MiB for `zh-dict`, 18 MiB for `ja-dict` and 58 MiB for
+`ko-dict`, and a server keeps each one it uses in memory. A store whose installed
+dictionary has changed rebuilds its text index with the new one when it opens.
 
 `sparkles dump` writes N-Quads by default. `--format`, or the extension of `--out`, picks
 another syntax: TriG, N-Triples, Turtle, JSON-LD, RDF/XML, TriX, RDF Thrift (`rt`), RDF

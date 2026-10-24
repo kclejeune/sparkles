@@ -18471,6 +18471,14 @@
           "url": "https://github.com/kclejeune/sparkles/blob/main/docs/API.md#full-text-search"
         },
         "properties": {
+          "dictionaries": {
+            "additionalProperties": {
+              "type": "string"
+            },
+            "description": "The SHA-256 of the installed dictionary of each dictionary analyzer the index uses. The server fills it in when the index is configured.",
+            "readOnly": true,
+            "type": "object"
+          },
           "docstoreCompression": {
             "enum": [
               "zstd",
@@ -18518,7 +18526,7 @@
                 "additionalProperties": {
                   "type": "string"
                 },
-                "description": "A language tag's analyzer, such as `english` or `cjk`.",
+                "description": "A language tag's analyzer, such as `english`, `english-lucene`, `cjk` or `ja-dict`.",
                 "type": "object"
               }
             ]

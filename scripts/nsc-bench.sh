@@ -42,6 +42,14 @@
 #   --serve-args "..."  extra `sparkles serve` flags for both servers
 #   --execution MODE    send execution=MODE (eager, streaming or auto) with every query, or
 #                       A_MODE,B_MODE for a different mode per variant
+#   --prepare "..."     a `sparkles` command run once on each store after its load, timed,
+#                       with `--loc STORE` appended, e.g. "text-index --language en"
+#   --prepare-a "..."   the same for variant A only (overrides --prepare), and
+#   --prepare-b "..."   for variant B only, to compare settings of one binary
+#   --prepare-repeat "..."  a `sparkles` command run --prepare-reps times on each store
+#                       after the prepare command, each run timed, e.g. "text-index --rebuild"
+#   --prepare-reps N    runs of --prepare-repeat (default 5); results/prepare.tsv gets
+#                       every timing, and the summary its medians
 #   --cargo-args "..."  extra `cargo build` flags, e.g. "--features text"
 #   --machine-type T    Namespace machine type (default linux/amd64:8x16)
 #   --duration D        instance lifetime cap, as nsc takes it (default 2h)
@@ -65,6 +73,11 @@ CLIENT_CPU=4
 SERVE_ARGS=
 EXECUTION=
 CARGO_ARGS=
+PREPARE=
+PREPARE_A=
+PREPARE_B=
+PREPARE_REPEAT=
+PREPARE_REPS=5
 MACHINE=linux/amd64:8x16
 DURATION=2h
 OUT=
@@ -105,6 +118,11 @@ while [ $# -gt 0 ]; do
     --serve-args) SERVE_ARGS=$2 ;;
     --execution) EXECUTION=$2 ;;
     --cargo-args) CARGO_ARGS=$2 ;;
+    --prepare) PREPARE=$2 ;;
+    --prepare-a) PREPARE_A=$2 ;;
+    --prepare-b) PREPARE_B=$2 ;;
+    --prepare-repeat) PREPARE_REPEAT=$2 ;;
+    --prepare-reps) PREPARE_REPS=$2 ;;
     --machine-type) MACHINE=$2 ;;
     --duration) DURATION=$2 ;;
     --out) OUT=$2 ;;
@@ -236,7 +254,12 @@ CLIENT_CPU=$CLIENT_CPU
 SPIN=$SPIN
 SERVE_ARGS="$SERVE_ARGS"
 EXECUTION=$EXECUTION
+PREPARE_A="${PREPARE_A:-$PREPARE}"
+PREPARE_B="${PREPARE_B:-$PREPARE}"
+PREPARE_REPEAT="$PREPARE_REPEAT"
+PREPARE_REPS=$PREPARE_REPS
 EOF
+[ -z "$PREPARE$PREPARE_A$PREPARE_B" ] || note "prepare: A ${PREPARE_A:-$PREPARE}; B ${PREPARE_B:-$PREPARE}${PREPARE_REPEAT:+; then $PREPARE_REPS runs of $PREPARE_REPEAT}"
 note "settings: $NQ queries, $ROUNDS rounds of A,B,B,A, $WARMUP warm-up and $REPS timed requests per query and server, RAYON_NUM_THREADS=$RAYON_THREADS, server CPU $SERVER_CPU, client CPU $CLIENT_CPU, spinners $([ "$SPIN" = 1 ] && echo on || echo off)${SERVE_ARGS:+, serve $SERVE_ARGS}${EXECUTION:+, execution $EXECUTION}"
 
 # ---------------------------------------------------------------------------- instance
@@ -349,6 +372,18 @@ rm -f "$STAGE"/{bin-A.zst,bin-B.zst,data.nt.zst}
 [ "$status" = ok ] || die "the remote run failed ($status), see $OUT/results/progress.log"
 
 python3 "$ROOT/scripts/nsc-bench-summary.py" "$OUT" > "$OUT/summary.md"
+if [ -s "$OUT/results/prepare.tsv" ]; then
+  {
+    echo
+    echo "Prepare commands (seconds, median of the runs; results/prepare.tsv has each run):"
+    echo
+    awk -F'\t' '{k = $1 " " $2; n[k]++; v[k, n[k]] = $3; c[k] = $4}
+      END {for (k in n) {m = n[k]; for (i = 1; i <= m; i++) a[i] = v[k, i]
+        for (i = 1; i <= m; i++) for (j = i + 1; j <= m; j++) if (a[j] < a[i]) {t = a[i]; a[i] = a[j]; a[j] = t}
+        med = (m % 2) ? a[(m + 1) / 2] : (a[m / 2] + a[m / 2 + 1]) / 2
+        printf "- %s: %.3f s over %d runs (%s)\n", k, med, m, c[k]}}' "$OUT/results/prepare.tsv" | sort
+  } >> "$OUT/summary.md"
+fi
 cat "$OUT/summary.md"
 echo
 echo "results: $OUT"

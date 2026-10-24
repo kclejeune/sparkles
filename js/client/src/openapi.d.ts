@@ -9332,6 +9332,10 @@ export interface components {
         };
         /** @description The full-text index's configuration. */
         TextConfig: {
+            /** @description The SHA-256 of the installed dictionary of each dictionary analyzer the index uses. The server fills it in when the index is configured. */
+            readonly dictionaries?: {
+                [key: string]: string;
+            };
             /** @enum {string} */
             docstoreCompression?: "zstd" | "lz4" | "none";
             graphs?: {

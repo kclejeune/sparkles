@@ -3292,9 +3292,29 @@ impl Store {
         };
         #[cfg(feature = "text")]
         {
-            let Some(cfg) = crate::text::imp_read_config(root)? else {
+            let Some(mut cfg) = crate::text::imp_read_config(root)? else {
                 return Ok(());
             };
+            // An installed dictionary that differs from the one the index was built with
+            // becomes the index's dictionary: the configuration changes, so the index is
+            // rebuilt in the background below. A missing one leaves the configuration as
+            // it is, and the index cannot open until the dictionary is installed.
+            if !cfg.dictionaries.is_empty() {
+                match cfg.clone().with_dictionaries() {
+                    Ok(refreshed) if refreshed.dictionaries != cfg.dictionaries => {
+                        tracing::warn!(target: "sparkles::store", "{}: an installed text dictionary changed; rebuilding the full-text index", root.display());
+                        write_atomic(
+                            &root.join("text.json"),
+                            &crate::formats::settings_to_vec("text.json", &refreshed)?,
+                        )?;
+                        cfg = refreshed;
+                    }
+                    Ok(_) => {}
+                    Err(e) => {
+                        tracing::error!(target: "sparkles::store", "{}: full-text dictionary: {e}", root.display());
+                    }
+                }
+            }
             let snap = self.snapshot();
             let first_wal_seq = snap
                 .generation
@@ -3465,6 +3485,8 @@ impl Store {
     #[cfg(feature = "text")]
     pub fn enable_text(&self, cfg: crate::text::TextConfig) -> Result<crate::text::TextStatus> {
         crate::sparql::extensions::check_family(self.owner_dataset_id())?;
+        // the dictionaries of dictionary analyzers are found before anything changes
+        let cfg = cfg.with_dictionaries()?;
         let _lifecycle = self.text_lifecycle.lock();
         self.stop_text_recovery();
         // an online rebuild of the current index finishes first (it builds in `text.new`)

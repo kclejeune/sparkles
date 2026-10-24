@@ -5594,12 +5594,43 @@ SELECT ?s ?score ?label WHERE {
     `ar`, `da`, `nl`, `en`, `fi`, `fr`, `de`, `el`, `hu`, `it`, `no` (and `nb` and `nn`),
     `pt`, `ro`, `ru`, `es`, `sv`, `ta` and `tr`, and `zh`, `ja` and `ko` for `cjk`.
     `"all"` names the 18 stemmed languages, so CJK is listed on its own, as in
-    `["en", "zh", "ja", "ko"]`.
+    `["en", "zh", "ja", "ko"]`. Analyzer names are read in any case.
   * `porter` stems English with Porter's algorithm after the English stop words, as
     Lucene's English analyzer, and so jena-text, does, where `english` uses the
     Snowball English stemmer. The two differ on words such as `relativity`, which
     Porter stems to `rel`, as it does `relative`, and Snowball to `relat`. No tag takes
     it by default: `{"en": "porter"}` selects it.
+  * The analyzers `english-lucene`, `french-light`, `spanish-light`, `italian-light`,
+    `portuguese-light`, `german-light`, `dutch-lucene`, `russian-lucene`,
+    `swedish-lucene` and `cjk-lucene` reproduce the Lucene analyzers that jena-text uses
+    for those languages, so a stemmed search finds the literals it finds in Jena. They
+    split words as Lucene does, so `aren't` and `3,14` stay whole. French and Italian
+    remove elided articles such as `l'`, English removes a possessive `'s`, and the stop
+    words are Lucene's. French, Spanish, Italian, Portuguese and German use Savoy's light
+    stemmers, which merge fewer forms than Snowball's, English uses Porter's stemmer,
+    Dutch adds Lucene's stem dictionary, and Russian reads `ё` as `е`. `cjk-lucene` pairs
+    CJK characters as `cjk` does, keeps words that mix Hangul and Latin letters whole and
+    removes Lucene's CJK stop words, such as `the` and `www`. No tag takes them by
+    default: `{"fr": "french-light", "ja": "cjk-lucene"}` selects them. A configuration
+    imported from Fuseki selects them for its languages. Their tokenizer follows the
+    grammar of Lucene's `StandardTokenizer` over Unicode 12.1, so an emoji, a flag or a
+    run of Thai is a word, and prefixes, wildcards and fuzzy words are lowercased as
+    Java lowercases them, so `İS*` finds `İstanbul`.
+  * `ja-dict`, `zh-dict` and `ko-dict` segment Japanese, Chinese and Korean text into
+    words with a dictionary instead of pairing characters. `ja-dict` and `ko-dict`
+    produce the tokens of Lucene's Kuromoji `JapaneseAnalyzer` and Nori
+    `KoreanAnalyzer`, and `zh-dict` cuts Chinese by word frequencies as jieba does.
+    `東京都に住んでいる` is indexed as `東京`, `都` and `住む`, so `京都` does not find it.
+    Japanese words are reduced to their base form and particles, auxiliary verbs and
+    Kuromoji's stop words are dropped. Korean compounds and inflected words are split
+    into their parts, and endings and particles are dropped. Each needs its dictionary
+    installed with `sparkles text-dict` and a server built with the `text-cjk-dict`
+    cargo feature, which the default build has. The dictionaries are read from the
+    server's `--text-dicts` directory, `DATA/text-dicts` by default. Enabling an index
+    with one fails while its dictionary is missing. The index records each dictionary's
+    SHA-256 in `dictionaries`, and a store whose installed dictionary has changed
+    rebuilds the index with it when it opens. No tag takes them by default:
+    `{"ja": "ja-dict", "zh": "zh-dict", "ko": "ko-dict"}` selects them.
   * `cjk` segments Chinese, Japanese and Korean text without a dictionary, as Lucene's
     `CJKAnalyzer` does. A run of Han, Hiragana, Katakana or Hangul characters becomes its
     overlapping pairs of characters, so `東京都` is indexed as `東京` and `京都`, and a
@@ -5676,6 +5707,7 @@ type TextConfig = {
   maxHits?: number;                                     // default 1000000 hits without a limit or above one (then 507)
   docstoreCompression?: "zstd" | "lz4" | "none";         // default zstd; a change rebuilds
   languages?: "all" | string[] | { [tag: string]: string };  // stemmed languages; a change rebuilds
+  readonly dictionaries?: { [analyzer: string]: string };  // SHA-256 of each dictionary used
 };
 type TextStatus = {
   enabled: true; state: "ready" | "stale" | "rebuilding" | "failed"; docs: number;

@@ -382,3 +382,127 @@ fn text_query_ranks_its_hits() {
         .contains("malformed")
     );
 }
+
+const LUCENE_DATA: &str = r#"
+@prefix ex: <http://example.org/> .
+@prefix rdfs: <http://www.w3.org/2000/01/rdf-schema#> .
+ex:en1 rdfs:label "Darwin's theories"@en .
+ex:en2 rdfs:label "The theory of Darwin"@en .
+ex:en3 rdfs:label "it's done"@en .
+ex:fr1 rdfs:label "L'utilisatrice des chevaux"@fr .
+ex:fr2 rdfs:label "Un utilisateur"@fr .
+ex:fr3 rdfs:label "Les utilisations"@fr .
+ex:es1 rdfs:label "Las canciones"@es .
+ex:es2 rdfs:label "Una canción"@es .
+ex:it1 rdfs:label "Dell'arte moderna"@it .
+ex:pt1 rdfs:label "As nações"@pt .
+ex:pt2 rdfs:label "Uma nação"@pt .
+ex:de1 rdfs:label "Die Häuser"@de .
+ex:de2 rdfs:label "Ein Hauses"@de .
+ex:nl1 rdfs:label "Het kind"@nl .
+ex:nl2 rdfs:label "De kinderen"@nl .
+ex:ru1 rdfs:label "Зелёная ёлка"@ru .
+ex:ru2 rdfs:label "Зеленая елка"@ru .
+ex:sv1 rdfs:label "Hon vill sitta"@sv .
+ex:ja1 rdfs:label "東京 the 都"@ja .
+ex:ja2 rdfs:label "ＡＢＣ ｶﾞｷﾞｸﾞ"@ja .
+ex:en4 rdfs:label "İSTANBUL 😀 trip"@en .
+"#;
+
+fn lucene_store() -> Store {
+    let s = Store::in_memory(StoreOptions::default());
+    s.load(&[Source::from_bytes(
+        LUCENE_DATA.as_bytes().to_vec(),
+        RdfFormat::Turtle,
+        None,
+    )])
+    .unwrap();
+    let cfg: TextConfig = serde_json::from_str(
+        r#"{"languages": {"en": "english-lucene", "fr": "french-light", "es": "spanish-light",
+            "it": "italian-light", "pt": "portuguese-light", "de": "german-light",
+            "nl": "dutch-lucene", "ru": "russian-lucene", "sv": "swedish-lucene",
+            "ja": "cjk-lucene"}}"#,
+    )
+    .unwrap();
+    s.enable_text(cfg).unwrap();
+    s
+}
+
+/// The analyzers that follow Lucene's, through `text:query`.
+#[test]
+fn lucene_analyzers_search_as_jena_does() {
+    let s = lucene_store();
+    // the possessive goes, so the phrase "darwin theories" matches Darwin's theories
+    assert_eq!(hits(&s, "\"darwin\" \"lang:en\""), ["en1", "en2"]);
+    assert_eq!(hits(&s, "'\\\"darwin theory\\\"' \"lang:en\""), ["en1"]);
+    // it's loses its 's and is then the stop word it
+    assert_eq!(hits(&s, "\"done\" \"lang:en\""), ["en3"]);
+    // French: elision, and the light stemmer's derivational suffixes
+    assert_eq!(hits(&s, "\"utilisateurs\" \"lang:fr\""), ["fr1", "fr2"]);
+    assert_eq!(hits(&s, "\"cheval\" \"lang:fr\""), ["fr1"]);
+    assert_eq!(hits(&s, "\"l'utilisation\" \"lang:fr\""), ["fr3"]);
+    // elision also applies to prefixes, which are not stemmed
+    // (utilisations stems to util, so the prefix misses it, as in Lucene)
+    assert_eq!(hits(&s, "\"l'utilis*\" \"lang:fr\""), ["fr1", "fr2"]);
+    assert_eq!(hits(&s, "\"cancion\" \"lang:es\""), ["es1", "es2"]);
+    assert_eq!(hits(&s, "\"arte\" \"lang:it\""), ["it1"]);
+    assert_eq!(hits(&s, "\"nação\" \"lang:pt\""), ["pt1", "pt2"]);
+    // German: normalization and the light stemmer; a prefix is normalized too, so
+    // haeu* is hau*
+    assert_eq!(hits(&s, "\"haus\" \"lang:de\""), ["de1", "de2"]);
+    assert_eq!(hits(&s, "\"haeu*\" \"lang:de\""), ["de1", "de2"]);
+    // Dutch: the stem dictionary maps kind to kinder, as kinderen stems
+    assert_eq!(hits(&s, "\"kind\" \"lang:nl\""), ["nl1", "nl2"]);
+    // Russian: ё is е
+    assert_eq!(hits(&s, "\"елки\" \"lang:ru\""), ["ru1", "ru2"]);
+    assert_eq!(hits(&s, "\"зелёный\" \"lang:ru\""), ["ru1", "ru2"]);
+    // Swedish: sitta is one of Lucene's stop words
+    assert!(
+        err(&s, "SELECT ?s { ?s text:query (\"sitta\" \"lang:sv\") }")
+            .contains("no word to search for")
+    );
+    assert_eq!(hits(&s, "\"vill\" \"lang:sv\""), ["sv1"]);
+    // CJK: the stop word leaves a gap, and lone characters stay unigrams
+    assert_eq!(hits(&s, "\"東京\" \"lang:ja\""), ["ja1"]);
+    assert_eq!(
+        hits(&s, "'\\\"東京 都\\\"' \"lang:ja\""),
+        Vec::<String>::new()
+    );
+    // a prefix is lowercased as Java lowercases (İ is i) and its widths folded, as the
+    // indexed tokens are
+    assert_eq!(hits(&s, "\"İS*\" \"lang:en\""), ["en4"]);
+    assert_eq!(hits(&s, "\"ＡＢ*\" \"lang:ja\""), ["ja2"]);
+    assert_eq!(hits(&s, "\"ｶﾞｷﾞ*\" \"lang:ja\""), ["ja2"]);
+    // an emoji is a word, so a phrase does not skip it
+    assert_eq!(hits(&s, "\"😀\" \"lang:en\""), ["en4"]);
+    assert_eq!(
+        hits(&s, "'\\\"istanbul trip\\\"' \"lang:en\""),
+        Vec::<String>::new()
+    );
+    // folding joins each voiced mark to its kana, so every bigram of the word covers
+    // the whole word, as in Lucene
+    assert_eq!(
+        rows(
+            &s,
+            "SELECT ?lit { (?s ?sc ?lit) text:query (rdfs:label \"ガギ\" \"lang:ja\" \"highlight:s:[|e:]\") }"
+        ),
+        ["ＡＢＣ [ｶﾞｷﾞｸﾞ]"]
+    );
+    // the names are kept in text.json and read back in any case
+    let cfg: TextConfig = serde_json::from_str(r#"{"languages": {"fr": "French-Light"}}"#).unwrap();
+    assert_eq!(
+        serde_json::to_string(&cfg.languages).unwrap(),
+        r#"{"fr":"french-light"}"#
+    );
+    assert_eq!(
+        Languages::from_args(&["fr=french-light", "de"])
+            .unwrap()
+            .resolve(),
+        [
+            ("de".to_string(), Analyzer::German),
+            ("fr".to_string(), Analyzer::FrenchLight)
+        ]
+    );
+    assert!(Languages::from_args(&["all", "fr=french-light"]).is_err());
+    assert!(Languages::from_args(&["fr=french-heavy"]).is_err());
+}

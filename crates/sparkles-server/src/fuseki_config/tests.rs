@@ -661,3 +661,54 @@ fn password_fields_match(text: &str, expected: &[(&str, &str)]) -> bool {
                 .is_ok()
     })
 }
+
+/// `text:multilingualSupport` and a `text:LocalizedAnalyzer` select the analyzers that
+/// follow Lucene's where Sparkles has them, so imported indexes stem as jena-text does.
+#[test]
+fn text_languages_follow_lucene() {
+    let dir = tempfile::tempdir().unwrap();
+    let write_cfg = |name: &str, extra: &str| {
+        let path = dir.path().join(name);
+        std::fs::write(
+            &path,
+            format!(
+                r#"@prefix fuseki: <http://jena.apache.org/fuseki#> .
+@prefix ja: <http://jena.hpl.hp.com/2005/11/Assembler#> .
+@prefix rdfs: <http://www.w3.org/2000/01/rdf-schema#> .
+@prefix text: <http://jena.apache.org/text#> .
+<#service> a fuseki:Service ; fuseki:name "ds" ;
+    fuseki:endpoint [ fuseki:operation fuseki:query ] ; fuseki:dataset <#text> .
+<#text> a text:TextDataset ; text:dataset <#mem> ; text:index <#lucene> .
+<#mem> a ja:MemoryDataset .
+<#lucene> a text:TextIndexLucene ; text:directory "mem" ; {extra}
+    text:entityMap <#map> .
+<#map> a text:EntityMap ; text:entityField "uri" ; text:defaultField "label" ;
+    text:map ( [ text:field "label" ; text:predicate rdfs:label ] ) .
+"#
+            ),
+        )
+        .unwrap();
+        plan_for(&[path], &UserSource::default(), Mode::Files).unwrap()
+    };
+    let p = write_cfg("multi.ttl", "text:multilingualSupport true ;");
+    let langs = &p.datasets[0].text.as_ref().unwrap()["languages"];
+    assert_eq!(langs["fr"], "french-light");
+    assert_eq!(langs["de"], "german-light");
+    assert_eq!(langs["ja"], "cjk-lucene");
+    assert_eq!(langs["da"], "danish");
+    assert!(langs.get("ta").is_none(), "{langs}");
+    let p = write_cfg(
+        "one.ttl",
+        "text:analyzer [ a text:LocalizedAnalyzer ; text:language \"en-GB\" ] ;",
+    );
+    assert_eq!(
+        p.datasets[0].text.as_ref().unwrap()["languages"],
+        serde_json::json!({"en": "english-lucene"})
+    );
+    #[cfg(feature = "text")]
+    {
+        let c: sparkles::text::TextConfig =
+            serde_json::from_value(p.datasets[0].text.clone().unwrap()).unwrap();
+        assert!(!c.languages.is_none());
+    }
+}

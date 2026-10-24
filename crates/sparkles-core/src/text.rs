@@ -34,10 +34,16 @@ use crate::error::{Error, Result};
 
 #[cfg(feature = "text")]
 mod cjk;
+#[cfg(feature = "text-cjk-dict")]
+pub mod dict;
+#[cfg(feature = "text")]
+mod filters;
 #[cfg(feature = "text")]
 mod highlight;
 #[cfg(feature = "text")]
 mod lazydir;
+#[cfg(feature = "text")]
+mod light;
 #[cfg(feature = "text")]
 mod lucene;
 #[cfg(feature = "text")]
@@ -46,6 +52,11 @@ mod porter;
 mod search;
 #[cfg(feature = "text")]
 mod sloppy;
+#[cfg(feature = "text")]
+mod standard;
+#[cfg(feature = "text")]
+#[rustfmt::skip]
+mod standard_tables;
 use serde::{Deserialize, Serialize};
 
 /// Which predicates are indexed.
@@ -125,6 +136,40 @@ pub struct TextConfig {
     /// stemmed, and a search with that language searches the stemmed text
     #[serde(default, skip_serializing_if = "Languages::is_none")]
     pub languages: Languages,
+    /// the SHA-256 of the installed dictionary of each dictionary analyzer the index
+    /// uses (`ja-dict`, …), which [`TextConfig::with_dictionaries`] fills in
+    #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
+    pub dictionaries: std::collections::BTreeMap<String, String>,
+}
+
+impl TextConfig {
+    /// The configuration with `dictionaries` naming the installed dictionary of each
+    /// dictionary analyzer its languages use. Fails when one is missing or this build
+    /// has no `text-cjk-dict` feature.
+    pub fn with_dictionaries(mut self) -> Result<TextConfig> {
+        let names: std::collections::BTreeSet<&'static str> = self
+            .languages
+            .resolve()
+            .into_iter()
+            .filter(|(_, a)| a.needs_dictionary())
+            .map(|(_, a)| a.name())
+            .collect();
+        #[cfg(not(feature = "text-cjk-dict"))]
+        if let Some(name) = names.first() {
+            return Err(Error::Unsupported(format!(
+                "the {name} analyzer needs a build with the text-cjk-dict feature"
+            )));
+        }
+        #[cfg(feature = "text-cjk-dict")]
+        let used = names
+            .into_iter()
+            .map(|name| Ok((name.to_string(), dict::load(name)?.sha256.clone())))
+            .collect::<Result<_>>()?;
+        #[cfg(not(feature = "text-cjk-dict"))]
+        let used = Default::default();
+        self.dictionaries = used;
+        Ok(self)
+    }
 }
 
 /// A language analyzer: Tantivy's Snowball stemmer for the language, after the stop
@@ -159,6 +204,56 @@ pub enum Analyzer {
     /// jena-text), where `english` uses the Snowball English stemmer; no tag has it by
     /// default
     Porter,
+    /// Lucene's `EnglishAnalyzer` as a whole: Lucene's word boundaries, the possessive
+    /// `'s` removed, the English stop words and Porter's stemmer
+    #[serde(rename = "english-lucene")]
+    EnglishLucene,
+    /// Lucene's `FrenchAnalyzer`: elided articles removed, the French stop words and
+    /// Savoy's light French stemmer
+    #[serde(rename = "french-light")]
+    FrenchLight,
+    /// Lucene's `SpanishAnalyzer`: the Spanish stop words and Savoy's light stemmer
+    #[serde(rename = "spanish-light")]
+    SpanishLight,
+    /// Lucene's `ItalianAnalyzer`: elided articles removed, the Italian stop words and
+    /// Savoy's light stemmer
+    #[serde(rename = "italian-light")]
+    ItalianLight,
+    /// Lucene's `PortugueseAnalyzer`: the Portuguese stop words and Savoy's light
+    /// stemmer
+    #[serde(rename = "portuguese-light")]
+    PortugueseLight,
+    /// Lucene's `GermanAnalyzer`: the German stop words, German normalization and
+    /// Savoy's light German stemmer
+    #[serde(rename = "german-light")]
+    GermanLight,
+    /// Lucene's `DutchAnalyzer`: the Dutch stop words, its stem dictionary and the
+    /// Snowball Dutch stemmer
+    #[serde(rename = "dutch-lucene")]
+    DutchLucene,
+    /// Lucene's `RussianAnalyzer`: the Russian stop words and the Snowball Russian
+    /// stemmer, which reads `ё` as `е`
+    #[serde(rename = "russian-lucene")]
+    RussianLucene,
+    /// Lucene's `SwedishAnalyzer`: Lucene's Swedish stop words and the Snowball Swedish
+    /// stemmer
+    #[serde(rename = "swedish-lucene")]
+    SwedishLucene,
+    /// Lucene's `CJKAnalyzer`: the bigrams of `cjk` without its stop words
+    #[serde(rename = "cjk-lucene")]
+    CjkLucene,
+    /// Japanese words found in an installed MeCab IPADIC dictionary, after Lucene's
+    /// Kuromoji (feature `text-cjk-dict`)
+    #[serde(rename = "ja-dict")]
+    JaDict,
+    /// Chinese words found in an installed word list with frequencies, after Lucene's
+    /// SmartChineseAnalyzer (feature `text-cjk-dict`)
+    #[serde(rename = "zh-dict")]
+    ZhDict,
+    /// Korean words found in an installed mecab-ko-dic dictionary, after Lucene's Nori
+    /// (feature `text-cjk-dict`)
+    #[serde(rename = "ko-dict")]
+    KoDict,
 }
 
 impl Analyzer {
@@ -201,14 +296,58 @@ impl Analyzer {
         Self::ALL.iter().find(|(t, _)| *t == tag).map(|(_, a)| *a)
     }
 
-    /// The analyzer of a name (`english`, `cjk`, …), in any case.
+    /// The analyzers that no tag has by default: `cjk`, which the CJK tags have, and
+    /// the analyzers that follow Lucene's.
+    pub const NAMED: [Analyzer; 15] = [
+        Analyzer::Cjk,
+        Analyzer::Porter,
+        Analyzer::EnglishLucene,
+        Analyzer::FrenchLight,
+        Analyzer::SpanishLight,
+        Analyzer::ItalianLight,
+        Analyzer::PortugueseLight,
+        Analyzer::GermanLight,
+        Analyzer::DutchLucene,
+        Analyzer::RussianLucene,
+        Analyzer::SwedishLucene,
+        Analyzer::CjkLucene,
+        Analyzer::JaDict,
+        Analyzer::ZhDict,
+        Analyzer::KoDict,
+    ];
+
+    /// Whether the analyzer reads an installed dictionary.
+    pub fn needs_dictionary(self) -> bool {
+        matches!(self, Analyzer::JaDict | Analyzer::ZhDict | Analyzer::KoDict)
+    }
+
+    /// The analyzer that follows Lucene's analyzer of a primary language tag, as
+    /// jena-text picks it with `text:multilingualSupport`, where this build has one.
+    pub fn lucene_for_tag(tag: &str) -> Option<Analyzer> {
+        Some(match tag {
+            "en" => Analyzer::EnglishLucene,
+            "fr" => Analyzer::FrenchLight,
+            "es" => Analyzer::SpanishLight,
+            "it" => Analyzer::ItalianLight,
+            "pt" => Analyzer::PortugueseLight,
+            "de" => Analyzer::GermanLight,
+            "nl" => Analyzer::DutchLucene,
+            "ru" => Analyzer::RussianLucene,
+            "sv" => Analyzer::SwedishLucene,
+            "ja" | "ko" | "zh" => Analyzer::CjkLucene,
+            _ => return None,
+        })
+    }
+
+    /// Every analyzer, the stemmed languages first.
+    pub fn every() -> impl Iterator<Item = Analyzer> {
+        Self::ALL.iter().map(|(_, a)| *a).chain(Self::NAMED)
+    }
+
+    /// The analyzer of a name (`english`, `cjk`, `french-light`, …), in any case.
     pub fn named(name: &str) -> Option<Analyzer> {
         let name = name.to_ascii_lowercase();
-        Self::ALL
-            .iter()
-            .map(|(_, a)| *a)
-            .chain([Analyzer::Cjk, Analyzer::Porter])
-            .find(|a| a.name() == name)
+        Self::every().find(|a| a.name() == name)
     }
 
     pub fn name(self) -> &'static str {
@@ -233,6 +372,19 @@ impl Analyzer {
             Analyzer::Turkish => "turkish",
             Analyzer::Cjk => "cjk",
             Analyzer::Porter => "porter",
+            Analyzer::EnglishLucene => "english-lucene",
+            Analyzer::FrenchLight => "french-light",
+            Analyzer::SpanishLight => "spanish-light",
+            Analyzer::ItalianLight => "italian-light",
+            Analyzer::PortugueseLight => "portuguese-light",
+            Analyzer::GermanLight => "german-light",
+            Analyzer::DutchLucene => "dutch-lucene",
+            Analyzer::RussianLucene => "russian-lucene",
+            Analyzer::SwedishLucene => "swedish-lucene",
+            Analyzer::CjkLucene => "cjk-lucene",
+            Analyzer::JaDict => "ja-dict",
+            Analyzer::ZhDict => "zh-dict",
+            Analyzer::KoDict => "ko-dict",
         }
     }
 }
@@ -294,6 +446,44 @@ impl Languages {
     }
 }
 
+impl Languages {
+    /// Languages from command line arguments: `all`, tags each with its default
+    /// analyzer, or `tag=analyzer` (`fr=french-light`).
+    pub fn from_args<S: AsRef<str>>(args: &[S]) -> std::result::Result<Languages, String> {
+        let (named, tags): (Vec<&str>, Vec<&str>) = args
+            .iter()
+            .map(|a| a.as_ref())
+            .partition(|a| a.contains('='));
+        let mut langs = Languages::from_tags(&tags)?;
+        if named.is_empty() {
+            return Ok(langs);
+        }
+        let mut m = match langs {
+            Languages::All => {
+                return Err("languages: \"all\" cannot be combined with tag=analyzer".into());
+            }
+            Languages::None => Default::default(),
+            Languages::Only(m) => m,
+        };
+        for a in named {
+            let (t, name) = a.split_once('=').expect("partitioned on '='");
+            let tag = primary_tag(t)?;
+            let analyzer = Analyzer::named(name.trim()).ok_or_else(|| {
+                format!(
+                    "languages: unknown analyzer {name:?} (one of {})",
+                    Analyzer::every()
+                        .map(|a| a.name())
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                )
+            })?;
+            m.insert(tag, analyzer);
+        }
+        langs = Languages::Only(m);
+        Ok(langs)
+    }
+}
+
 /// A primary language subtag, lowercased: 2 to 8 ASCII letters.
 fn primary_tag(t: &str) -> std::result::Result<String, String> {
     let tag = t.trim().to_ascii_lowercase();
@@ -339,8 +529,11 @@ impl<'de> Deserialize<'de> for Languages {
                     let tag = primary_tag(&t).map_err(err)?;
                     let a = Analyzer::named(&a).ok_or_else(|| {
                         err(format!(
-                            "languages: unknown analyzer {a:?} (one of {}, cjk)",
-                            Analyzer::ALL.map(|(_, a)| a.name()).join(", ")
+                            "languages: unknown analyzer {a:?} (one of {})",
+                            Analyzer::every()
+                                .map(|a| a.name())
+                                .collect::<Vec<_>>()
+                                .join(", ")
                         ))
                     })?;
                     out.insert(tag, a);
@@ -387,6 +580,7 @@ impl Default for TextConfig {
             max_hits: default_max_hits(),
             docstore_compression: None,
             languages: Languages::None,
+            dictionaries: Default::default(),
         }
     }
 }
@@ -862,7 +1056,7 @@ mod imp {
         format!("sparkles_{}", a.name())
     }
 
-    fn register_tokenizer(index: &Index) {
+    fn register_tokenizer(index: &Index, config: &TextConfig) -> Result<()> {
         index.tokenizers().register(
             TOKENIZER,
             TextAnalyzer::builder(SimpleTokenizer::default())
@@ -871,15 +1065,45 @@ mod imp {
                 .filter(AsciiFoldingFilter)
                 .build(),
         );
-        for a in Analyzer::ALL
-            .map(|(_, a)| a)
-            .into_iter()
-            .chain([Analyzer::Cjk, Analyzer::Porter])
-        {
+        for a in Analyzer::every().filter(|a| !a.needs_dictionary()) {
             index
                 .tokenizers()
                 .register(&tokenizer_name(a), language_analyzer(a));
         }
+        for (_, a) in config.languages.resolve() {
+            if a.needs_dictionary() {
+                index
+                    .tokenizers()
+                    .register(&tokenizer_name(a), dictionary_analyzer(a, config)?);
+            }
+        }
+        Ok(())
+    }
+
+    /// A dictionary analyzer: the installed dictionary, which must be the one the
+    /// configuration recorded, then lowercasing.
+    #[cfg(feature = "text-cjk-dict")]
+    fn dictionary_analyzer(a: Analyzer, config: &TextConfig) -> Result<TextAnalyzer> {
+        let d = super::dict::load(a.name())?;
+        if config.dictionaries.get(a.name()) != Some(&d.sha256) {
+            return Err(Error::Invalid(format!(
+                "full-text index: the installed {} dictionary is not the one this index was \
+                 configured with; the index adopts it when the store next opens, or when it is \
+                 configured again",
+                a.name()
+            )));
+        }
+        Ok(TextAnalyzer::builder(super::dict::DictTokenizer(d))
+            .filter(super::filters::MapFilter(super::filters::lowercase))
+            .build())
+    }
+
+    #[cfg(not(feature = "text-cjk-dict"))]
+    fn dictionary_analyzer(a: Analyzer, _config: &TextConfig) -> Result<TextAnalyzer> {
+        Err(Error::Unsupported(format!(
+            "the {} analyzer needs a build with the text-cjk-dict feature",
+            a.name()
+        )))
     }
 
     /// A language's analyzer: the standard tokens, lowercased, without the language's
@@ -903,6 +1127,26 @@ mod imp {
                     .filter(StopWordFilter::new(L::English).expect("English stop words"))
                     .filter(super::porter::PorterStemmer)
                     .build();
+            }
+            Analyzer::CjkLucene => {
+                return TextAnalyzer::builder(super::cjk::CjkLuceneTokenizer)
+                    .filter(super::filters::MapFilter(super::filters::lowercase))
+                    .filter(StopWordFilter::remove(
+                        super::filters::CJK_STOP_WORDS.map(String::from),
+                    ))
+                    .build();
+            }
+            Analyzer::EnglishLucene
+            | Analyzer::FrenchLight
+            | Analyzer::SpanishLight
+            | Analyzer::ItalianLight
+            | Analyzer::PortugueseLight
+            | Analyzer::GermanLight
+            | Analyzer::DutchLucene
+            | Analyzer::RussianLucene
+            | Analyzer::SwedishLucene => return lucene_analyzer(a),
+            Analyzer::JaDict | Analyzer::ZhDict | Analyzer::KoDict => {
+                unreachable!("a dictionary analyzer is built by dictionary_analyzer")
             }
             Analyzer::Arabic => L::Arabic,
             Analyzer::Danish => L::Danish,
@@ -934,17 +1178,92 @@ mod imp {
         b.filter_dynamic(Stemmer::new(lang)).build()
     }
 
+    /// An analyzer that follows one of Lucene's: Lucene's word boundaries, the
+    /// language's elision or possessive filter, lowercasing, the stop words and the
+    /// stemmer, in Lucene's order. Words are not dropped for their length, as Lucene
+    /// keeps them, and the tokenizer cuts one longer than 255 characters.
+    fn lucene_analyzer(a: Analyzer) -> TextAnalyzer {
+        use super::filters::{self as f, MapFilter};
+        use tantivy::tokenizer::{Language as L, StopWordFilter};
+        type Map = fn(&str) -> Option<String>;
+        let (before, stop, stem): (Option<Map>, Option<L>, Map) = match a {
+            Analyzer::EnglishLucene => (Some(f::possessive), Some(L::English), f::porter),
+            Analyzer::FrenchLight => (Some(f::french_elision), Some(L::French), f::french_light),
+            Analyzer::SpanishLight => (None, Some(L::Spanish), f::spanish_light),
+            Analyzer::ItalianLight => {
+                (Some(f::italian_elision), Some(L::Italian), f::italian_light)
+            }
+            Analyzer::PortugueseLight => (None, Some(L::Portuguese), f::portuguese_light),
+            Analyzer::GermanLight => (None, Some(L::German), f::german_light),
+            Analyzer::DutchLucene => (None, Some(L::Dutch), f::dutch),
+            Analyzer::RussianLucene => (None, Some(L::Russian), f::russian),
+            // Lucene's Swedish list differs from Tantivy's in one word
+            Analyzer::SwedishLucene => (None, None, f::swedish),
+            _ => unreachable!("not a Lucene analyzer: {a:?}"),
+        };
+        let stop = match stop {
+            Some(l) => StopWordFilter::new(l).expect("stop words"),
+            None => StopWordFilter::remove(f::SWEDISH_STOP_WORDS.map(String::from)),
+        };
+        let b = TextAnalyzer::builder(super::standard::StandardTokenizer).dynamic();
+        let b = match before {
+            Some(g) => b.filter_dynamic(MapFilter(g)),
+            None => b,
+        };
+        b.filter_dynamic(MapFilter(f::lowercase))
+            .filter_dynamic(stop)
+            .filter_dynamic(MapFilter(stem))
+            .build()
+    }
+
     /// A text field's analysis without its tokenizer: a prefix, wildcard, fuzzy or
     /// regular expression term is normalized as the indexed tokens are, but not split or
     /// stemmed. Terms of the standard text (`None`) are lowercased and ASCII-folded, and
-    /// those of a language only lowercased, as Lucene's analyzers normalize them.
+    /// those of a language only lowercased, as Lucene's analyzers normalize them. The
+    /// analyzers that follow Lucene's lowercase as Java does, character by character,
+    /// and the CJK ones fold widths first.
     pub(super) fn normalizer(analyzer: Option<Analyzer>) -> TextAnalyzer {
-        let b = TextAnalyzer::builder(tantivy::tokenizer::RawTokenizer::default())
-            .filter(LowerCaser)
-            .dynamic();
+        use super::filters::{self as f, MapFilter};
+        fn width(s: &str) -> Option<String> {
+            Some(super::cjk::fold_word(s))
+        }
+        fn width_legacy(s: &str) -> Option<String> {
+            Some(super::cjk::fold_legacy(s))
+        }
+        let raw = || TextAnalyzer::builder(tantivy::tokenizer::RawTokenizer::default()).dynamic();
+        let java = || raw().filter_dynamic(MapFilter(f::lowercase));
         match analyzer {
-            None => b.filter_dynamic(AsciiFoldingFilter).build(),
-            Some(_) => b.build(),
+            None => raw()
+                .filter_dynamic(LowerCaser)
+                .filter_dynamic(AsciiFoldingFilter)
+                .build(),
+            Some(Analyzer::Cjk) => raw()
+                .filter_dynamic(MapFilter(width_legacy))
+                .filter_dynamic(LowerCaser)
+                .build(),
+            // Nori folds no widths
+            Some(Analyzer::KoDict) => java().build(),
+            Some(Analyzer::CjkLucene | Analyzer::JaDict | Analyzer::ZhDict) => raw()
+                .filter_dynamic(MapFilter(width))
+                .filter_dynamic(MapFilter(f::lowercase))
+                .build(),
+            // Lucene's French and Italian analyzers normalize elisions too
+            Some(Analyzer::FrenchLight) => {
+                java().filter_dynamic(MapFilter(f::french_elision)).build()
+            }
+            Some(Analyzer::ItalianLight) => {
+                java().filter_dynamic(MapFilter(f::italian_elision)).build()
+            }
+            Some(
+                Analyzer::EnglishLucene
+                | Analyzer::SpanishLight
+                | Analyzer::PortugueseLight
+                | Analyzer::GermanLight
+                | Analyzer::DutchLucene
+                | Analyzer::RussianLucene
+                | Analyzer::SwedishLucene,
+            ) => java().build(),
+            Some(_) => raw().filter_dynamic(LowerCaser).build(),
         }
     }
 
@@ -1329,7 +1648,7 @@ mod imp {
                 builder.create_in_dir(d).map_err(text_err)?
             }
         };
-        register_tokenizer(&index);
+        register_tokenizer(&index, config)?;
         Ok((index, fields))
     }
 
@@ -1342,7 +1661,7 @@ mod imp {
     fn open_index(root: &Path, config: &TextConfig) -> Result<(Index, Fields, LazySyncDir)> {
         let dir = LazySyncDir::open(&root.join("text"), marker(root))?;
         let index = Index::open(dir.clone()).map_err(text_err)?;
-        register_tokenizer(&index);
+        register_tokenizer(&index, config)?;
         let (expected, fields) = schema(config);
         if index.schema() != expected {
             return Err(text_err("unexpected index schema"));
@@ -4189,6 +4508,19 @@ mod imp {
         }
 
         fn tokens(a: Analyzer, text: &str) -> Vec<(usize, String)> {
+            #[cfg(feature = "text-cjk-dict")]
+            let mut an = if a.needs_dictionary() {
+                // the installed dictionary, whichever it is
+                let mut config = TextConfig::default();
+                config.dictionaries.insert(
+                    a.name().to_string(),
+                    super::super::dict::load(a.name()).unwrap().sha256.clone(),
+                );
+                dictionary_analyzer(a, &config).unwrap()
+            } else {
+                language_analyzer(a)
+            };
+            #[cfg(not(feature = "text-cjk-dict"))]
             let mut an = language_analyzer(a);
             let mut st = an.token_stream(text);
             let mut out = Vec::new();
@@ -4219,6 +4551,114 @@ mod imp {
             assert_eq!(words(Analyzer::Spanish, "las canciones"), ["cancion"]);
             // a language without a stop word list in Tantivy still stems
             assert_eq!(words(Analyzer::Turkish, "kitaplar"), ["kitap"]);
+        }
+
+        /// One line per input line: its tokens, separated by spaces, each preceded by
+        /// `+N:` when its position does not follow the last one's (the format of the
+        /// Lucene side of `scripts/text-lucene-compare`).
+        fn analyzed_lines(a: Analyzer, input: &str) -> String {
+            let mut out = String::new();
+            for line in input.lines() {
+                let mut last: Option<usize> = None;
+                let mut words = Vec::new();
+                for (pos, w) in tokens(a, line) {
+                    let inc = match last {
+                        Some(l) => pos - l,
+                        None => pos + 1,
+                    };
+                    last = Some(pos);
+                    words.push(if inc == 1 { w } else { format!("+{inc}:{w}") });
+                }
+                out.push_str(&words.join(" "));
+                out.push('\n');
+            }
+            out
+        }
+
+        /// The analyzers that follow Lucene's against the tokens Lucene 9.11 made of
+        /// the same lines (`tests/data/lucene-analyzers/`, made by
+        /// `scripts/text-lucene-compare/tokens.sh`).
+        #[test]
+        fn lucene_analyzers_agree_with_lucene() {
+            let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("tests/data/lucene-analyzers");
+            let mut failures = Vec::new();
+            let mut checked = 0;
+            for a in Analyzer::every() {
+                let Ok(input) = std::fs::read_to_string(dir.join(format!("{}.in", a.name())))
+                else {
+                    continue;
+                };
+                let expected = std::fs::read_to_string(dir.join(format!("{}.out", a.name())))
+                    .expect("expected tokens");
+                let got = analyzed_lines(a, &input);
+                for ((line, e), g) in input.lines().zip(expected.lines()).zip(got.lines()) {
+                    checked += 1;
+                    if e != g {
+                        failures.push(format!(
+                            "{}: {line:?}: lucene {e:?}, sparkles {g:?}",
+                            a.name()
+                        ));
+                    }
+                }
+            }
+            assert!(checked > 0, "no fixtures in {}", dir.display());
+            assert!(
+                failures.is_empty(),
+                "{} of {checked} lines differ:\n{}",
+                failures.len(),
+                failures.join("\n")
+            );
+        }
+
+        /// `ja-dict` and `ko-dict` against the tokens Kuromoji and Nori 9.11 made of the
+        /// same lines (`tests/data/lucene-dict-analyzers/`, made by
+        /// `scripts/text-lucene-compare/tokens.sh`). It needs the dictionaries that
+        /// `sparkles text-dict fetch` installs, in `$SPARKLES_TEXT_DICTS`.
+        #[cfg(feature = "text-cjk-dict")]
+        #[test]
+        #[ignore]
+        fn dictionary_analyzers_agree_with_lucene() {
+            let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("tests/data/lucene-dict-analyzers");
+            let mut failures = Vec::new();
+            let mut checked = 0;
+            for a in [Analyzer::JaDict, Analyzer::KoDict] {
+                let read =
+                    |ext| std::fs::read_to_string(dir.join(format!("{}.{ext}", a.name()))).unwrap();
+                let (input, expected) = (read("in"), read("out"));
+                let got = analyzed_lines(a, &input);
+                for ((line, e), g) in input.lines().zip(expected.lines()).zip(got.lines()) {
+                    checked += 1;
+                    if e != g {
+                        failures.push(format!(
+                            "{}: {line:?}: lucene {e:?}, sparkles {g:?}",
+                            a.name()
+                        ));
+                    }
+                }
+            }
+            assert!(
+                failures.is_empty(),
+                "{} of {checked} lines differ:\n{}",
+                failures.len(),
+                failures.join("\n")
+            );
+        }
+
+        /// Analyzes the lines of `$SPARKLES_ANALYZE_IN` with `$SPARKLES_ANALYZER` and
+        /// writes them to `$SPARKLES_ANALYZE_OUT` (for comparing analyzers by hand).
+        #[test]
+        #[ignore]
+        fn analyze_file() {
+            let a = Analyzer::named(&std::env::var("SPARKLES_ANALYZER").unwrap()).unwrap();
+            let input =
+                std::fs::read_to_string(std::env::var("SPARKLES_ANALYZE_IN").unwrap()).unwrap();
+            std::fs::write(
+                std::env::var("SPARKLES_ANALYZE_OUT").unwrap(),
+                analyzed_lines(a, &input),
+            )
+            .unwrap();
         }
     }
 }

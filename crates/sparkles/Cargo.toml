@@ -49,6 +49,7 @@ tempfile.workspace = true
 # The engine's features under the same names. The default is empty, as the engine's is.
 [features]
 text = ["sparkles-core/text"]
+text-cjk-dict = ["text", "sparkles-core/text-cjk-dict"]
 geo = ["sparkles-core/geo"]
 geo-proj4 = ["geo", "sparkles-core/geo-proj4"]
 geo-epsg = ["geo-proj4", "sparkles-core/geo-epsg"]

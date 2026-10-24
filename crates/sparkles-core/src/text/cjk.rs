@@ -22,6 +22,17 @@ pub(crate) struct CjkTokenStream {
     token: Token,
 }
 
+impl CjkTokenStream {
+    /// A stream over tokens already made.
+    #[cfg_attr(not(feature = "text-cjk-dict"), allow(dead_code))]
+    pub(super) fn of(tokens: Vec<Token>) -> Self {
+        CjkTokenStream {
+            tokens: tokens.into_iter(),
+            token: Token::default(),
+        }
+    }
+}
+
 impl Tokenizer for CjkTokenizer {
     type TokenStream<'a> = CjkTokenStream;
 
@@ -53,6 +64,151 @@ impl TokenStream for CjkTokenStream {
     }
 }
 
+/// The tokenizer of the `cjk-lucene` analyzer, which follows Lucene's `CJKAnalyzer`
+/// exactly: Lucene's word boundaries ([`super::standard`]), each word's widths folded as
+/// `CJKWidthFilter` folds them, and then the characters of adjacent Han, Hiragana,
+/// Katakana and Hangul words paired as `CJKBigramFilter` pairs them. A word that mixes
+/// Hangul or Katakana with other letters stays whole, and so do numbers such as `3.5`
+/// and words such as `don't`, which `cjk` splits.
+#[derive(Clone, Default)]
+pub(crate) struct CjkLuceneTokenizer;
+
+impl Tokenizer for CjkLuceneTokenizer {
+    type TokenStream<'a> = CjkTokenStream;
+
+    fn token_stream<'a>(&'a mut self, text: &'a str) -> CjkTokenStream {
+        CjkTokenStream {
+            tokens: lucene_tokens(text).into_iter(),
+            token: Token::default(),
+        }
+    }
+}
+
+/// A word with its widths folded and a half-width voiced mark joined to the kana before
+/// it, as Lucene's `CJKWidthFilter` folds a token.
+pub(super) fn fold_word(word: &str) -> String {
+    fold_chars(word).into_iter().map(|(c, _, _)| c).collect()
+}
+
+/// The characters of `text` with their widths folded and each half-width voiced mark
+/// joined to the kana before it where the two combine, as Lucene's `CJKWidthCharFilter`
+/// and `CJKWidthFilter` fold them, each with the byte range of `text` it comes from.
+pub(super) fn fold_chars(text: &str) -> Vec<(char, usize, usize)> {
+    let mut out: Vec<(char, usize, usize)> = Vec::with_capacity(text.len());
+    for (i, c) in text.char_indices() {
+        let end = i + c.len_utf8();
+        if matches!(c as u32, 0xFF9E | 0xFF9F)
+            && let Some(last) = out.last_mut()
+            && let Some(v) = combine(last.0, c)
+        {
+            last.0 = v;
+            last.2 = end;
+            continue;
+        }
+        out.push((fold(c), i, end));
+    }
+    out
+}
+
+/// What Lucene adds to a Katakana from U+30A6 to U+30FD to voice it, and to make it
+/// semi-voiced (its `KANA_COMBINE_VOICED` and `KANA_COMBINE_SEMI_VOICED`).
+const COMBINE_VOICED: [u8; 88] = [
+    78, 0, 0, 0, 0, 1, 0, 1, 0, 1, 0, 1, 0, 1, 0, 1, 0, 1, 0, 1, 0, 1, 0, 1, 0, 1, 0, 1, 0, 0, 1,
+    0, 1, 0, 1, 0, 0, 0, 0, 0, 0, 1, 0, 0, 1, 0, 0, 1, 0, 0, 1, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 8, 8, 8, 8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1,
+];
+const COMBINE_SEMI_VOICED: [u8; 88] = [
+    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+    0, 0, 0, 0, 0, 0, 0, 0, 0, 2, 0, 0, 2, 0, 0, 2, 0, 0, 2, 0, 0, 2, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+];
+
+/// The Katakana `prev` voiced by the half-width mark `mark` (U+FF9E, or U+FF9F for the
+/// semi-voiced mark), if the two combine.
+fn combine(prev: char, mark: char) -> Option<char> {
+    let u = prev as u32;
+    if !(0x30A6..=0x30FD).contains(&u) {
+        return None;
+    }
+    let i = (u - 0x30A6) as usize;
+    let add = if mark == '\u{FF9F}' {
+        COMBINE_SEMI_VOICED[i]
+    } else {
+        COMBINE_VOICED[i]
+    };
+    (add != 0).then(|| char::from_u32(u + add as u32)).flatten()
+}
+
+/// A word folded as the `cjk` analyzer folds its text: widths, and any voiced mark
+/// joined to the kana before it.
+pub(super) fn fold_legacy(word: &str) -> String {
+    let mut out: Vec<char> = Vec::with_capacity(word.len());
+    for c in word.chars() {
+        let f = fold(c);
+        if matches!(f as u32, 0x3099 | 0x309A)
+            && let Some(last) = out.last_mut()
+            && let Some(v) = voiced(*last, f)
+        {
+            *last = v;
+            continue;
+        }
+        out.push(f);
+    }
+    out.into_iter().collect()
+}
+
+/// The tokens of `cjk-lucene`: see [`CjkLuceneTokenizer`].
+fn lucene_tokens(text: &str) -> Vec<Token> {
+    use super::standard::{Kind, typed_tokens};
+    let mut out: Vec<Token> = Vec::new();
+    // the characters of the adjacent CJK words not yet paired, with their offsets
+    let mut run: Vec<(char, usize, usize)> = Vec::new();
+    let push = |out: &mut Vec<Token>, text: String, from: usize, to: usize| {
+        let position = out.len();
+        out.push(Token {
+            offset_from: from,
+            offset_to: to,
+            position,
+            text,
+            position_length: 1,
+        });
+    };
+    let flush = |out: &mut Vec<Token>, run: &mut Vec<(char, usize, usize)>| {
+        if run.len() == 1 {
+            push(out, run[0].0.to_string(), run[0].1, run[0].2);
+        } else {
+            for w in run.windows(2) {
+                push(out, [w[0].0, w[1].0].iter().collect(), w[0].1, w[1].2);
+            }
+        }
+        run.clear();
+    };
+    for (t, kind) in typed_tokens(text) {
+        let word = fold_word(&t.text);
+        if kind == Kind::Alphanum {
+            flush(&mut out, &mut run);
+            push(&mut out, word, t.offset_from, t.offset_to);
+            continue;
+        }
+        if run.last().is_some_and(|l| l.2 != t.offset_from) {
+            flush(&mut out, &mut run);
+        }
+        // each character covers its own source character, unless folding joined a
+        // voiced mark to its kana: then, as in Lucene's bigram filter, which compares
+        // the lengths, every character covers the whole word
+        if word.encode_utf16().count() == t.text.encode_utf16().count() {
+            for ((i, s), c) in t.text.char_indices().zip(word.chars()) {
+                let from = t.offset_from + i;
+                run.push((c, from, from + s.len_utf8()));
+            }
+        } else {
+            run.extend(word.chars().map(|c| (c, t.offset_from, t.offset_to)));
+        }
+    }
+    flush(&mut out, &mut run);
+    out
+}
+
 /// Whether `c` is written in a CJK script whose runs are cut into bigrams.
 fn is_cjk(c: char) -> bool {
     matches!(c as u32,
@@ -77,7 +233,7 @@ const KANA: [u32; 59] = [
 
 /// `c` with its width folded: full-width ASCII to ASCII, half-width Katakana to
 /// full-width.
-fn fold(c: char) -> char {
+pub(super) fn fold(c: char) -> char {
     let u = c as u32;
     let f = match u {
         0xFF01..=0xFF5E => u - 0xFEE0,
@@ -89,7 +245,7 @@ fn fold(c: char) -> char {
 
 /// The voiced (`mark` U+3099) or semi-voiced (U+309A) form of the Katakana `k`, if it
 /// has one.
-fn voiced(k: char, mark: char) -> Option<char> {
+pub(super) fn voiced(k: char, mark: char) -> Option<char> {
     let u = k as u32;
     let v = match mark as u32 {
         0x3099 => match u {

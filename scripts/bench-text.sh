@@ -27,7 +27,9 @@
 # QUERIES="name …" to limit the queries, SKIP_LOAD=1 to reuse the stores and text indexes
 # of an earlier run, ANSWERS_ONLY=1 to check answers and rebuild the summary without
 # timing queries, DATA=path/to/data.nt to reuse a generated dataset (for example
-# scripts/bench.sh's), PORT_BASE (default 3940; the servers listen on PORT_BASE+1..+3).
+# scripts/bench.sh's), PORT_BASE (default 3940; the servers listen on PORT_BASE+1..+3),
+# SPARKLES_LANGUAGE (default en) for the --language argument of Sparkles' index, such as
+# en=english-lucene for the analyzer that follows Lucene's English analyzer.
 set -euo pipefail
 # Servers run inside a transient systemd scope limited to SERVER_MEM_MAX (for example 12G)
 # when it is set, so an engine that runs out of memory is killed alone (as in bench.sh).
@@ -190,7 +192,7 @@ if [ -z "${SKIP_LOAD:-}" ]; then
   if has sparkles; then
     BUILD+=(--prepare "$SPARKLES text-index --loc sparkles.db --disable > /dev/null 2>&1 || true"
       --command-name sparkles
-      "$SPARKLES text-index --loc sparkles.db --predicate ${FOAF}name --predicate ${EX}title --predicate ${RDFS}label --language en")
+      "$SPARKLES text-index --loc sparkles.db --predicate ${FOAF}name --predicate ${EX}title --predicate ${RDFS}label --language ${SPARKLES_LANGUAGE:-en}")
   fi
   if has jena; then
     BUILD+=(--prepare 'rm -rf jena-text' --command-name jena-fuseki

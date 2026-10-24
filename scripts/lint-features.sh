@@ -17,6 +17,7 @@ server=(
   shacl
   shex
   text
+  text-cjk-dict
   geo
   geo-epsg
   otel
