@@ -1866,6 +1866,27 @@ starting a process. The child adds about 10 ms to each document, which is small 
 the model calls of an ingestion. Each running conversion may also use up to
 `--convert-memory`, 2 GiB by default, of address space beside the server.
 
+### Tables through mappings
+
+A YARRRML mapping of a CSV table runs faster than C05's default mapping of the same
+table ([spec F19](specs/F19-mappings-and-virtual-graphs.md#outcome)). The table has
+1,000,000 rows of four columns, and both mappings write the same 4,000,000 triples, one
+subject per row and one predicate per column. The figures are medians of three rounds of
+the release binary on atlas, an Intel i5-13500 with 20 threads, which other work shared.
+They are not a quiet-machine benchmark.
+
+| 1,000,000 rows | Wall time | Peak memory |
+|---|---:|---:|
+| `sparkles csv convert`, the C05 default mapping | 2.81 s | 39 MB |
+| `sparkles map run`, the YARRRML mapping | 1.61 s | 41 MB |
+| `sparkles load`, the C05 default mapping | 4.12 s | 830 MB |
+| `sparkles load --mapping`, the YARRRML mapping | 2.88 s | 834 MB |
+
+C05's default mapping passes each cell through CSVW's datatype and URL template steps,
+which the mapping engine does not have. A Parquet file of 10,000,000 rows
+and two columns, 227 MB on disk, maps to 20,000,000 triples in 11.6 s with a peak of
+46 MB, since the file is read one row group at a time.
+
 ## Writes and updates
 
 Every Sparkles write is durable when it is acknowledged: the WAL record and any new

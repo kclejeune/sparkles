@@ -1086,7 +1086,14 @@ Tests and conformance:
 
 Measurements:
 
-BENCH_OUTCOME
+* On 2026-10-24 on atlas, an Intel i5-13500 shared with other work, a YARRRML mapping
+  of a 1,000,000-row CSV table with four columns wrote the same 4,000,000 triples as
+  C05's default mapping in 1.61 s against 2.81 s, with peaks of 41 MB and 39 MB. Loaded
+  into a new database, the mapping took 2.88 s and the C05 conversion 4.12 s. Each figure
+  is the median of three rounds of the release binary. The mapping is faster, so no
+  follow-up item was needed.
+* A Parquet file of 10,000,000 rows and two columns, 227 MB, mapped to 20,000,000
+  triples in 11.6 s with a peak of 46 MB, read one row group at a time.
 
 The A10 refresh, the R2RML cases on PostgreSQL and the BSBM comparison wait for the
 PostgreSQL source and Phase 2.
