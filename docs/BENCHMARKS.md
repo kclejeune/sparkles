@@ -1157,16 +1157,42 @@ ways do not pass through literals.
 
 ### Weighted pair searches
 
-A weighted pair search runs Dijkstra's algorithm from the source alone, where an
-unweighted pair runs a breadth-first search from both ends. On the 10.5M-triple data,
-where every edge weighs 1, `ps-pair` with `path:weight` and `path:cost` takes 0.68 s of
-server time against 1.2 ms without them. Five weighted shortest paths by Yen's algorithm
-fail after about 7 s, when the search visits more than the default 10 million nodes. The
-path finder of the UI sends a limit of a million visits, so on a graph of this size a
-weighted search stops at the limit and the panel says so. [Roadmap](ROADMAP.md) item 150
-makes weighted searches bidirectional.
+A weighted search for the cheapest path of one pair runs Dijkstra's algorithm from both
+ends, and so do the spur searches of Yen's algorithm with weights
+([F07](specs/F07-path-search.md#weighted-searches-from-both-ends-2026-10-24)). The table
+compares the build before this change with the current one on the 10.5M-triple data, once
+with every edge weighing 1 and once with an `ex:km` weight from 1 to 100 on the reifier of
+every `foaf:knows` triple. The pair is person 0 and the last person, and every query binds
+`path:weight` and `path:cost`.
 
-*Measured on an 8-vCPU Namespace instance on 2026-10-24.*
+| query | weights | one end (ms) | both ends (ms) |
+|---|---|---:|---:|
+| `ps-pair` | all 1 | 820.2 | 3.5 |
+| `ps-pair` with `path:direction path:both` | all 1 | 730.6 | 1.4 |
+| `ps-pair-k5`, five cheapest paths | all 1 | fails at 10M visits | 68.9 |
+| `ps-pair` | 1 to 100 | 4,937.9 | 29.0 |
+| `ps-pair` with `path:direction path:both` | 1 to 100 | 11,904.4 | 51.6 |
+| `ps-pair-k5`, five cheapest paths | 1 to 100 | fails at 10M visits | 656.0 |
+| `ps-pair-all`, every cheapest path | all 1 | 876.2 | 896.8 |
+
+Times are medians of the server's execution time. With every edge weighing 1 the weighted
+pair search costs about 1.5 times the unweighted `ps-pair`, which took 2.3 ms in the same
+runs. Weighted `path:allShortest` still runs from the source alone and got 2.3% slower from
+the double-double sums of costs, and [Roadmap](ROADMAP.md) item 242 would run it from both
+ends. Between equally cheap paths the two builds returned different ones in one case, which
+the spec allows, and every other answer matched.
+
+A weighted shortest search with `path:maxLength 6`, as the UI's path finder sends, failed
+in both builds at its limit of a million visits, because no path of this pair has fewer
+than 17 edges and the search lists paths by cost until one is short enough. Item 240
+addresses it. The unweighted `ps-pair`, `ps-pair-all`, `ps-pair-k5` and `ps-values10`
+measured 3 to 4% slower in every round although the change does not touch their search,
+and item 241 looks for the cause.
+
+*Measured on forge, an Intel Core i5-13500, on 2026-10-24, with the server on one core and
+the client on another, in interleaved A, B, B, A rounds. With all weights 1 there were four
+rounds of 20 requests per query, or one round of three for the five cheapest paths. With
+weights from 1 to 100 there were two rounds of five, or one round of three.*
 
 <a id="graph-algorithm-polling"></a>
 

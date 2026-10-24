@@ -697,3 +697,45 @@ compare the search with brute-force paths on random graphs, one in a single grap
 the counts are used, and one over named graphs with duplicate triples where the edges are
 read. The router tests in `http/router_tests/auth/paths.rs` check that a restricted
 reader's paths and degrees stay inside its view.
+
+### Weighted searches from both ends (2026-10-24)
+
+[ROADMAP](../ROADMAP.md) item 150 made a weighted search for the cheapest path of one pair
+run Dijkstra's algorithm from both ends, and the spur searches of Yen's algorithm with
+weights do the same. The search keeps a heap and a distance table for each end and grows
+the end whose heap is smaller. Each relaxation that reaches a node the other end has
+reached records a meeting, and the search stops once the two heads of the heaps add up to
+at least the cheapest meeting. Like the unweighted search, it never meets at a hub that
+`path:maxDegree` excludes or at a literal, and Yen's banned nodes and edges apply on both
+ends. The two halves are joined at the meeting node and any loop is
+cut out, so the result is always a simple path.
+
+Weighted `path:allShortest`, cycles through the source and searches to several or unbound
+targets still run from the source alone. `path:shortest` with weights and `path:maxLength`
+lists paths by Yen's algorithm in order of cost until one is short enough, so its spur
+searches now run from both ends. A pair with no path short enough still runs until the
+visit limit, which item 240 addresses with a search bounded by the length.
+
+The search adds weights in double-double arithmetic, where a cost is the sum of two
+doubles, so that a path's cost is the same to about 2^-106 of its value from either end. A
+plain double ranked paths by the end it came from when the weights differed greatly in
+size, as a review found with one weight of 10^16 beside weights of 1. When the sum of the
+high parts would overflow, both costs are halved, added and doubled, and a cost is
+infinite only when the exact sum rounds past the largest double. Among paths of equal cost
+the search can return a different one than before, which §4.2 allows.
+
+A differential test in `crates/sparkles-core/tests/path_search.rs` compares the cheapest path and the four
+cheapest paths with brute-force paths on 60 random weighted graphs, in every direction,
+with an excluded predicate and with hub limits of 2 and 3. Three more tests cover weights
+of mixed size and weights near the largest double, and unit tests check that costs add up
+alike in either order and that two halves sharing a node give a simple path.
+
+On forge, in interleaved rounds against the build before the change on the 10.5M-triple
+data, a weighted pair search went from 820 ms to 3.5 ms with every edge weighing 1 and from
+4.9 s to 29 ms with weights from 1 to 100. The five cheapest weighted paths had failed at
+the limit of 10 million visited nodes, and they now take 69 ms and 656 ms.
+[BENCHMARKS](../BENCHMARKS.md#weighted-pair-searches) has the figures. The unweighted pair,
+k-shortest and `VALUES` searches measured 3 to 4% slower in every round although the change
+does not touch their search, and weighted `path:allShortest` measured 2.3% slower from the
+double-double sums. Item 241 looks for the
+cause, and item 242 would run weighted `path:allShortest` from both ends.

@@ -520,9 +520,10 @@ rest of a query.
   every triple, or from the solutions of a nested graph pattern. Each edge can be bound as
   a triple term. Sources and targets are constants or variables bound by the rest of the
   group.
-* Weights on RDF 1.2 reifiers switch the search to Dijkstra's algorithm. An unweighted
-  single pair runs as a bidirectional breadth-first search over the PSO and POS
-  permutations.
+* Weights on RDF 1.2 reifiers switch the search to Dijkstra's algorithm. A single pair
+  runs from both ends, as a breadth-first search over the PSO and POS permutations
+  without weights and as Dijkstra's algorithm with them. Yen's spur searches run from both
+  ends too.
 * `path:excludePredicate` skips predicates such as `rdf:type`, and `path:maxDegree` keeps
   paths from passing through hubs. Paths never use triples the caller cannot see.
 
@@ -1513,11 +1514,13 @@ links each item to its design spec.
 * A vector index has no quantization, so its packed vectors take 4 bytes per dimension,
   roadmap item 34. Each pass that inserts new rows into a vector index's graph scans all
   rows inserted since the last compaction, item 82.
-* A search weighted by `path:weight` runs Dijkstra's algorithm from the source alone. On
-  the 10.5M-triple benchmark data a weighted pair search takes 0.68 s where the
-  unweighted one takes 1.2 ms, and the five cheapest paths exceed the default limit of 10
-  million visited nodes. The UI's weighted searches stop at a million visits. Roadmap item
-  150.
+* A weighted shortest search with `path:maxLength` lists paths in order of cost until one
+  is short enough, so a pair whose short paths are all dear runs until the visit limit.
+  The UI's path finder always sends a length limit and stops at a million visits. Roadmap
+  item 240.
+* Weighted `path:allShortest`, cycles through the source and weighted searches to several
+  targets run Dijkstra's algorithm from the source alone. Every cheapest path of one pair
+  takes 0.9 s on the 10.5M-triple benchmark data. Roadmap item 242.
 * Graph algorithms match the Graphalytics reference outputs for BFS, WCC and PageRank on
   the two small official example graphs, through `scripts/graphalytics-reference.py`.
   There is no full Graphalytics driver, no run on the larger datasets, no reference check
