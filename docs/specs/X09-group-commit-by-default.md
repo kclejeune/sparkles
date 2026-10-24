@@ -1419,6 +1419,71 @@ disabled or when the count is kept after a raced locked attempt. The forge accep
 2026-10-23 below saw write stalls that match the period of the locked attempt, but it did
 not trace the ticks, and roadmap item 110 confirms the cause.
 
+**Bounded locked checkpoint.** Roadmap item 110 traced the ticks on `forge` on 2026-10-24
+and confirmed the cause. Each background checkpoint now logs at debug level, under the
+target `sparkles::text::checkpoint`, how long it held the live writer lock before its file
+synchronization, how long the synchronization took, how long it kept text publication out
+in all, and whether it cleared the marker. In a mixed full-text run at 1.05M with a build
+of e411a772 and this trace, every unlocked checkpoint was raced, because each reader's
+search seals the open batch and commits it to the index's files, and every fourth tick
+then held the live writer lock for a median of 74 ms and at most 166 ms, about every
+5.3 s. Each of these locked ticks synchronized every file of the index again, a median of
+76 ms in the unlocked ticks as well. All 16 write stalls of the ordinary process lay inside
+a locked tick, with a median of 127 ms and a maximum of 177 ms as the writers saw them, and
+none lay elsewhere.
+
+The checkpoint now synchronizes only the files finished or replaced since a pass last
+synchronized them, and the locked attempt follows an unlocked pass instead of replacing it.
+The directory records the name of each file as Tantivy finishes it and of each metadata
+file when its atomic replacement has been renamed into place. A pass takes the recorded
+names, synchronizes those files and then the index directory, and puts the names back if
+any synchronization fails. A directory opened with its marker present may hold files that
+an earlier process wrote and never synchronized, so the first pass after such an open
+synchronizes every file in it, as every pass did before. After three raced ticks, the next
+tick runs its unlocked pass first, and when a write races that pass too, it repeats the
+unlocked pass for the files written during the one before, up to four times, until none
+are left. Each repetition has only the files of a shorter interval to synchronize, so it
+takes a fraction of the time of the one before, and a repetition that no write races
+clears the marker without the tick ever holding the lock for its I/O. Otherwise the tick
+then takes the live writer lock and runs a last pass, which finds only the segments and
+metadata of the commits that the readers sealed during the last repetition, so it holds the
+lock for a few file synchronizations rather than for all of them. The count of raced
+ticks starts again after such a tick whatever its outcome, as before.
+
+The crash argument is the invariant of `text/lazydir.rs`, that `meta.json` never refers to
+unsynchronized data unless the marker exists, and the change keeps it. The marker is
+removed only when no write was counted and no atomic replacement was in flight between a
+pass's snapshot of the write count and its check, as before. Every write the snapshot
+counts recorded its name in the same critical section that counted it, so the name was
+either taken by this pass or by an earlier pass that synchronized it successfully. Tantivy
+never changes a finished file, so a file synchronized by an earlier pass is still durable.
+A metadata replacement records its name only after its rename, so a pass that synchronized
+the old file under that name, while the replacement was in flight, saw the in-flight count
+and kept the marker, and the next pass synchronizes the new file. A file deleted since it
+was recorded is skipped, because no metadata that a later checkpoint can declare clean
+refers to it. The index directory is synchronized whenever a file was created, renamed or
+removed since the last time, so the names of the synchronized files are durable before the
+marker goes. Nothing changes in the WAL ordering. A checkpoint writes no index content and
+changes no payload, the payload in `meta.json` still comes from a commit made under the
+live writer lock from fenced commits only, and the marker removal and its parent directory
+synchronization are unchanged. No format changed, so no version moved.
+
+The tests cover each step. `a_raced_pass_keeps_its_progress` requires the next pass after a
+raced one to synchronize only the file written during it, and
+`replaced_metadata_is_synchronized_again` requires a metadata replacement that finishes
+during a pass, or is in flight across it, to be synchronized by the next pass. That test
+fails when the name is recorded when the replacement starts. `a_failed_pass_puts_its_files_back`
+and `a_directory_opened_with_its_marker_synchronizes_every_file` cover a failed pass and a
+reopen after a crash. `a_locked_pass_first_catches_up_without_live` requires the
+repetition to run without the lock and to clear the marker when nothing races it.
+`steady_publication_cannot_starve_the_background_checkpoint` races every unlocked pass and
+every repetition with a publication, and requires the fourth tick to end in one pass that
+holds live and clears the marker, and the count to start again when a merge's write races
+that pass. The background crash fixture
+of `tests/power_loss.rs` runs a reader that searches throughout, so its commits race the
+unlocked passes, and it requires at least one locked second pass to clear the marker before
+it replays every crash image against the receipts and the recovered text.
+
 This change removes the background file-synchronization wait from the live writer
 lock. Tantivy publication can still occur inside a group leader's fence, and WAL
 and vocabulary synchronization can still delay writes. It does not establish the
