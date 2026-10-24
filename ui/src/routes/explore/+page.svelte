@@ -732,12 +732,12 @@
   // the validation lens of the badge channel (U07 §11.2): the overlay validates, and the
   // lens carries its badges to the legend, the list column and the descriptions
   const vOn = $derived(lenses.choice.badge.lens === 'validation');
-  lenses.onchoose = (ch, c) => {
+  lenses.onchoose = (ch, c, remember) => {
     if (ch !== 'badge') return;
     vChoice = c.lens === 'validation';
     savePref('sparkles.explore.validation', vChoice);
     // Shift+3 turns this lens on again, also after the page opens again
-    if (c.lens !== 'none') savePref('sparkles.explore.badgeLens', c.lens);
+    savePref('sparkles.explore.badgeLens', remember.lens);
     if (!vChoice) vMarked = null;
   };
   {

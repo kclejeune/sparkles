@@ -251,3 +251,25 @@ describe('the validation lens after review (item 120)', () => {
     l.destroy();
   });
 });
+
+describe('the validation lens after the second review (item 120)', () => {
+  it('turning off a default lens names it for Shift+3 after a reload', () => {
+    const { l } = lenses(() => []);
+    const remembered: string[] = [];
+    l.onchoose = (_ch, _c, remember) => remembered.push(remember.lens);
+    l.setInput(input({ reasoning: true }));
+    l.setValidation(true);
+    l.suggest('badge', { lens: 'validation' });
+    l.set('badge', { lens: 'none' });
+    expect(remembered).toEqual(['validation']);
+    l.destroy();
+    // the page opens again with what it saved
+    const { l: again } = lenses(() => []);
+    again.setLast('badge', { lens: remembered[0] as 'validation' });
+    again.setInput(input({ reasoning: true }));
+    again.setValidation(true);
+    again.toggle('badge');
+    expect(again.choice.badge.lens).toBe('validation');
+    again.destroy();
+  });
+});

@@ -160,8 +160,12 @@ export class Lenses {
    */
   validation = $state(false);
   validationNote = $state<string | null>(null);
-  /** A lens the person chose, with the channel, such as for remembering it. */
-  onchoose: ((channel: Channel, choice: LensChoice) => void) | undefined;
+  /**
+   * A lens the person chose, with the channel and the lens `toggle` would turn on next:
+   * the chosen one, or the outgoing one when the channel is turned off, which may be a
+   * default the person never chose.
+   */
+  onchoose: ((channel: Channel, choice: LensChoice, remember: LensChoice) => void) | undefined;
   encoding = $derived(encode(this.results));
   /** The list view's column per active lens: its title and each node's value as text. */
   columns = $derived(
@@ -278,7 +282,7 @@ export class Lenses {
       if (channel === 'edge') this.#edgeChosen = true;
       this.#chosen.add(channel);
       this.#suggested.delete(channel);
-      this.onchoose?.(channel, choice);
+      this.onchoose?.(channel, choice, choice.lens !== 'none' ? choice : this.#last[channel]);
     }
     if (sameChoice(this.choice[channel], choice)) return;
     this.choice[channel] = choice;
