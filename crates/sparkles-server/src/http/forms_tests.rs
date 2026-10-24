@@ -321,6 +321,32 @@ async fn a4_saves_go_to_a_session_branch_while_main_is_protected() {
         json!([lit("al@example.org")]),
         json!([old]),
     );
+    // the check before the first save previews the branch's first commit on main's head,
+    // which main's protection does not refuse, and creates no branch
+    let r = send(
+        &app,
+        "POST",
+        "/$/forms/people/check",
+        "application/json",
+        &c.to_string(),
+    )
+    .await;
+    assert_eq!(
+        r.status,
+        StatusCode::OK,
+        "{}",
+        String::from_utf8_lossy(&r.body)
+    );
+    let j: J = serde_json::from_slice(&r.body).unwrap();
+    assert_eq!(j["preview"]["outcome"], "commit", "{j}");
+    assert_eq!(j["branch"], session.as_str());
+    assert!(
+        st.get("people")
+            .unwrap()
+            .store
+            .branch_id_of(&session)
+            .is_err()
+    );
     let r = send(
         &app,
         "POST",
@@ -440,6 +466,17 @@ async fn a5_a_stale_form_gets_the_conflict_and_concurrent_saves_one_wins() {
         j["fields"],
         json!([{ "id": format!("<{EX}email>"), "now": [lit("one@example.org")] }])
     );
+    // the check of the stale change reports the same conflict before any save
+    let r = send(
+        &app,
+        "POST",
+        "/$/forms/people/check",
+        "application/json",
+        &second.to_string(),
+    )
+    .await;
+    assert_eq!(r.status, StatusCode::OK);
+    assert_eq!(r.json()["conflicts"], j["fields"]);
     // concurrent saves of the same loaded value: exactly one commits
     let now = lit("one@example.org");
     let mut tasks = Vec::new();

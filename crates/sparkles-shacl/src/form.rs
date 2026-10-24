@@ -188,6 +188,11 @@ impl FormField {
         if !c.node.is_empty() && matches!(c.node_kind, Some(NodeKind::BlankNode)) {
             return "nested";
         }
+        // string constraints on values of no stated kind: plain text, a simple literal
+        let texty = !c.patterns.is_empty() || c.min_length.is_some() || c.max_length.is_some();
+        if matches!(c.node_kind, Some(NodeKind::Literal)) || (c.node_kind.is_none() && texty) {
+            return "text";
+        }
         "term"
     }
 }

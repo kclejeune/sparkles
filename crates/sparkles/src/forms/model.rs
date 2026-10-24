@@ -204,6 +204,9 @@ pub struct FormChange {
 pub struct FormCheck {
     /// the dry run of the update
     pub preview: Preview,
+    /// the changed fields another commit changed since the form loaded them, which a
+    /// save would answer with `Conflict`
+    pub conflicts: Vec<FieldConflict>,
     /// the update the change makes
     pub update: String,
     /// the validation of the nodes the change touches against the form's shapes:
@@ -315,6 +318,12 @@ impl Forms {
         let head = store.snapshot();
         let built = self.build(&head, &change.focus, &change.settings, None, opts)?;
         let plan = built.plan(change)?;
+        let conflicts = conflicts_at(
+            &head,
+            opts.graphs.as_deref(),
+            &built.focus,
+            &expected(&plan, change)?,
+        )?;
         let mut wopts = opts.write.clone();
         wopts.message = change.message.clone().map(Arc::from);
         wopts.precondition = None;
@@ -346,6 +355,7 @@ impl Forms {
         })?;
         Ok(FormCheck {
             preview,
+            conflicts,
             update: plan.update,
             results,
             conforms,
@@ -363,31 +373,11 @@ impl Forms {
         let head = store.snapshot();
         let built = self.build(&head, &change.focus, &change.settings, None, opts)?;
         let plan = built.plan(change)?;
-        // the values the form loaded, by field
-        let mut checks: Vec<(String, FieldPath, BTreeMap<String, Term>)> = Vec::new();
-        for (id, path) in &plan.changed {
-            let want = change.expect.get(id).ok_or_else(|| {
-                Error::invalid(format!(
-                    "expect: give the values the form loaded for field {id}"
-                ))
-            })?;
-            checks.push((id.clone(), path.clone(), set(&mut want.iter().cloned())));
-        }
+        let checks = expected(&plan, change)?;
         let focus = built.focus.clone();
         let access = opts.graphs.clone();
-        let differ = Arc::new(move |snap: &Arc<Snapshot>| -> Result<Vec<FieldConflict>> {
-            let read = Reader::new(snap, access.as_deref())?;
-            let mut out = Vec::new();
-            for (id, path, want) in &checks {
-                let now = set(&mut read.values(&focus, path)?.into_iter().map(|v| v.term));
-                if now.keys().ne(want.keys()) {
-                    out.push(FieldConflict {
-                        id: id.clone(),
-                        now: now.into_values().collect(),
-                    });
-                }
-            }
-            Ok(out)
+        let differ = Arc::new(move |snap: &Arc<Snapshot>| {
+            conflicts_at(snap, access.as_deref(), &focus, &checks)
         });
         // a conflict already at the head: no need to wait for the writer
         let early = differ(&head)?;
@@ -1104,6 +1094,44 @@ impl Built {
             })
             .collect()
     }
+}
+
+/// The values the form loaded for each changed field: `change.expect` must name them all.
+type Expected = Vec<(String, FieldPath, BTreeMap<String, Term>)>;
+
+fn expected(plan: &Plan, change: &FormChange) -> Result<Expected> {
+    let mut checks = Vec::new();
+    for (id, path) in &plan.changed {
+        let want = change.expect.get(id).ok_or_else(|| {
+            Error::invalid(format!(
+                "expect: give the values the form loaded for field {id}"
+            ))
+        })?;
+        checks.push((id.clone(), path.clone(), set(&mut want.iter().cloned())));
+    }
+    Ok(checks)
+}
+
+/// The changed fields whose values at `snap`, under the caller's view, are not those the
+/// form loaded.
+fn conflicts_at(
+    snap: &Arc<Snapshot>,
+    access: Option<&GraphAccess>,
+    focus: &Term,
+    checks: &Expected,
+) -> Result<Vec<FieldConflict>> {
+    let read = Reader::new(snap, access)?;
+    let mut out = Vec::new();
+    for (id, path, want) in checks {
+        let now = set(&mut read.values(focus, path)?.into_iter().map(|v| v.term));
+        if now.keys().ne(want.keys()) {
+            out.push(FieldConflict {
+                id: id.clone(),
+                now: now.into_values().collect(),
+            });
+        }
+    }
+    Ok(out)
 }
 
 fn cmp_order(a: Option<f64>, b: Option<f64>) -> std::cmp::Ordering {

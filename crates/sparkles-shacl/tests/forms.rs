@@ -218,7 +218,7 @@ fn fields_merge_by_path_and_keep_the_stricter_constraints() {
     assert_eq!(field("<http://ex.org/role>").widget(), "radio");
     assert_eq!(field("<http://ex.org/worksFor>").widget(), "entity");
     assert_eq!(field("<http://ex.org/bio>").widget(), "textarea");
-    assert_eq!(field("<http://ex.org/email>").widget(), "term");
+    assert_eq!(field("<http://ex.org/email>").widget(), "text");
     assert!(field("<http://ex.org/id>").read_only);
     assert!(matches!(
         field("^<http://ex.org/member>").path,

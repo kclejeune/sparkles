@@ -7483,13 +7483,17 @@ deleted from every graph that holds it, and an added value goes to the model's `
 `check` runs the change as a write preview (see [Write previews](#write-previews)) and then
 validates the nodes the change touches against the form's shapes, whether or not the
 dataset has a guard. The validation holds the dataset's writer lock and stops after 10
-seconds. The answer is the preview and the validation.
+seconds. The answer is the preview, the validation and the fields whose stored values
+already differ from `expect`, which a save would refuse with a conflict. A check of a
+session branch that does not exist yet previews its first commit on `main`'s head, and
+`main`'s protection does not refuse that preview.
 
 ```ts
 type FormCheckAnswer = {
   branch: string;
   preview: WritePreview;            // as POST /{ds}/update?dryRun=true answers
   update: string;                   // the SPARQL Update the save would run
+  conflicts: { id: string; now: Term[] }[];  // fields another commit changed, as save's 409 lists them
   validation: {
     checked: boolean;
     withheld: boolean;              // the caller's grants hide part of the dataset

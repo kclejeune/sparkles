@@ -54,6 +54,7 @@ pub(super) fn write_options(
         author: None,
         precondition: None,
         no_wait: false,
+        preview_as_new_branch: false,
         graphs: None,
         dry_run: super::dry_run::parse(st, params, headers)?,
     })

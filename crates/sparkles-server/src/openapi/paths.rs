@@ -493,7 +493,7 @@ fn forms(p: &mut Paths) {
     );
     p.add(
         op(POST, "/$/forms/{ds}/check", "checkForm", "Validation", "Check a form's changes")
-            .doc("Turns the changes into one update of `DELETE DATA` and `INSERT DATA`, runs it as a dry run and validates the nodes it touches at the state it would make against the form's shapes, whether or not the dataset has a guard. The answer is `200` with the write preview, the update, and the validation results, each with the `field` it belongs to or `null`. A caller whose view hides part of the data gets no validation (`withheld`), as the validation routes refuse such callers. It needs write on the branch, through the update endpoint.")
+            .doc("Turns the changes into one update of `DELETE DATA` and `INSERT DATA`, runs it as a dry run and validates the nodes it touches at the state it would make against the form's shapes, whether or not the dataset has a guard. The answer is `200` with the write preview, the update, the fields another commit changed since the form loaded them (`conflicts`, which a save would refuse), and the validation results, each with the `field` it belongs to or `null`. A check of a session branch that does not exist yet previews its first commit on `main`'s head, which `main`'s protection does not refuse. A caller whose view hides part of the data gets no validation (`withheld`), as the validation routes refuse such callers. It needs write on the branch, through the update endpoint.")
             .see("editing-forms")
             .body(true, "The changes.", change.clone())
             .resp(
@@ -501,11 +501,12 @@ fn forms(p: &mut Paths) {
                 "The preview and the validation.",
                 Some(json!({ "application/json": { "schema": {
                     "type": "object",
-                    "required": ["branch", "preview", "update", "validation"],
+                    "required": ["branch", "preview", "update", "conflicts", "validation"],
                     "properties": {
                         "branch": { "type": "string" },
                         "preview": { "type": "object", "description": "The dry run, as a write preview answers it." },
                         "update": { "type": "string" },
+                        "conflicts": { "type": "array", "items": { "type": "object" }, "description": "`{id, now}` of each changed field whose stored values differ from `expect`." },
                         "validation": { "type": "object", "description": "`{checked, withheld, timedOut, conforms, results}`." }
                     }
                 } } })),

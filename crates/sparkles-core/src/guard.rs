@@ -142,6 +142,11 @@ pub struct WriteOptions {
     /// nothing is written (see [`crate::preview`]). Guards see it on
     /// [`Candidate::opts`] and must record nothing for such a check.
     pub dry_run: Option<crate::preview::DryRun>,
+    /// With `dry_run`, preview the write as the first commit of a branch that does not
+    /// exist yet and would start at this branch's head, so the protection of this branch
+    /// does not refuse it. A form's check of a session branch it has not created uses it
+    /// (spec U02 §2.6). Without `dry_run` it does nothing.
+    pub preview_as_new_branch: bool,
 }
 
 /// A check of the committed state that a write depends on (an HTTP `If-Match`, say).

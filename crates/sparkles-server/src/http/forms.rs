@@ -362,6 +362,9 @@ async fn prepare(
     let mut w = validation::write_options(st, &params, headers, timeout)?;
     // a check is a dry run whatever the request says, a save never is
     w.dry_run = None;
+    // a check of a session branch not created yet previews its first commit on main's
+    // head, which main's protection must not refuse
+    w.preview_as_new_branch = !exists && !create;
     w.graphs = opts.graphs.clone();
     w.author = author(p);
     let (cancel, cancel_guard) = cancel_on_drop();
@@ -421,6 +424,7 @@ pub(super) async fn check(
             "branch": pr.branch,
             "preview": preview,
             "update": c.update,
+            "conflicts": c.conflicts,
             "validation": {
                 "checked": c.results.is_some(),
                 "withheld": c.withheld,
