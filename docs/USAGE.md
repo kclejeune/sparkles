@@ -69,6 +69,7 @@ without a migration path, so keep backups of anything you cannot regenerate.
 **Agents and models**
 
 * [MCP server (LLM agents)](#mcp-server-llm-agents)
+  * [Connecting with OAuth](#connecting-with-oauth)
   * [Handing a query to the web UI](#handing-a-query-to-the-web-ui)
   * [Agent memory grants](#agent-memory-grants)
 * [Agent memory](#agent-memory)
@@ -3760,6 +3761,81 @@ server's `--timeout`. Requests from web pages pass the same Origin and Host chec
 rest of the API. Hosts that still use the older `initialize` handshake get a session,
 which belongs to the caller that opened it. [API.md](API.md#http-endpoint-mcp) lists the
 flags and the transport details.
+
+### Connecting with OAuth
+
+With an OIDC provider in the auth configuration, `/$/mcp` is an OAuth protected
+resource, and an MCP host signs the user in by itself. The host calls the endpoint,
+gets a `401` that points to the server's protected-resource metadata, finds the provider
+there, opens the provider's login page in a browser and then sends the provider's access
+token with each request. Nobody copies a token by hand.
+
+The server side needs `server.public_url`, an `[oidc]` section and `--mcp`. The resource
+identifier is `server.public_url` followed by `/$/mcp`. `--mcp-require-auth` makes every
+anonymous request to `/$/mcp` answer `401`, which a host needs to start the sign-in when
+anonymous callers may read some dataset:
+
+```toml
+[server]
+public_url = "https://sparql.example.org"
+
+[oidc]
+issuer = "https://idp.example.org/realms/main"
+client_id = "sparkles"                     # the web UI's client
+client_secret_file = "/etc/sparkles/oidc-secret"
+
+[roles.wiki-editors]
+datasets = { wiki = "write" }
+
+[external]
+allowed_groups = ["sparkles"]
+[external.group_roles]
+"kg-editors" = ["wiki-editors"]
+```
+
+```sh
+sparkles serve --data ./data --auth-config auth.toml --mcp --mcp-allow-update --mcp-require-auth
+```
+
+The provider must issue access tokens whose `aud` is the resource identifier, with the
+user's email (or the claim `api_name_claim` names) and groups, and with the Sparkles
+scopes. In Keycloak, for the realm `main`:
+
+1. Create the client scopes `sparkles:read` and `sparkles:update` as optional scopes,
+   and `sparkles:admin` if agents should administer datasets.
+2. Give each of them an Audience mapper whose included custom audience is
+   `https://sparql.example.org/$/mcp`, added to the access token, and a Group Membership
+   mapper with the token claim name `groups`, without full group paths.
+3. Let MCP hosts register. Either allow anonymous dynamic client registration under the
+   realm's client registration policies, or create a public client with standard flow
+   and PKCE for each host, with the host's loopback redirect URIs, and give the host its
+   client ID.
+
+Other providers work the same way. The provider's issuer goes into `oidc.issuer`, and
+its tokens must name the resource identifier as their audience exactly as the metadata
+spells it.
+
+The host needs only the URL. In a project's `.mcp.json` for Claude Code:
+
+```json
+{
+  "mcpServers": {
+    "sparkles": {
+      "type": "http",
+      "url": "https://sparql.example.org/$/mcp"
+    }
+  }
+}
+```
+
+The host asks for `sparkles:read` first, because the `401` names it. A call of a write
+tool then gets a `403` that names `sparkles:update`, and the host asks the user again
+for the larger scope. A scope only narrows what the user's groups allow. A user who may
+only read `wiki` cannot write it with `sparkles:update`, and `sparkles:read:wiki` keeps a
+token to `wiki` even when the user may read more. A token issued for the resource works
+only at `/$/mcp`, so a host cannot replay it against the SPARQL endpoints.
+[API.md](API.md#oauth-for-the-mcp-endpoint) has the metadata, the challenges and the
+scope rules.
 
 ### Handing a query to the web UI
 

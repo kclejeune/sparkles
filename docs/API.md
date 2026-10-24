@@ -9315,7 +9315,8 @@ pass. So does the server's own UI.
 Each request resolves to one principal. The first applicable source wins:
 
 1. **`Authorization`.** `Bearer spk_…` with an API token, `Bearer` with an access token
-   (a JWT) of the OIDC provider when `oidc.api_audience` is set, or `Basic` with a
+   (a JWT) of the OIDC provider when `oidc.api_audience` is set or the request goes to
+   `/$/mcp` as an OAuth protected resource, or `Basic` with a
    configured user and password. `Basic` also accepts a token as the password, with any
    user name, for Basic-only clients such as Jena. Invalid credentials are `401`, never
    treated as anonymous.
@@ -9863,8 +9864,13 @@ against RFC 7519:
   one of `oidc.algorithms`. `none`, HMAC algorithms, a key embedded in the token
   (`jwk`, `jku`, `x5u`, `x5c`), a `crit` header and an encrypted token are refused.
 * `iss` must be the provider's issuer, and `aud` must contain one of `api_audience`.
+  At `/$/mcp`, the endpoint's resource identifier is accepted too (see
+  [OAuth for the MCP endpoint](#oauth-for-the-mcp-endpoint)).
 * `exp` is required. `exp`, `nbf` and `iat` allow 60 seconds of clock skew.
-* Every scope of `api_scopes` must be in `scope` (space-separated) or `scp`.
+* Every scope of `api_scopes` must be in `scope` (space-separated) or `scp`, unless only
+  the MCP resource identifier accepted the token.
+* `sparkles:read`, `sparkles:update` and `sparkles:admin` in `scope` bound the token's
+  grants on every route. A token without them keeps its full grants.
 
 The account comes from `api_name_claim`, which defaults to `name_claim`. `client_id` or
 `azp` name the client of a client credentials grant. The principal is
@@ -10733,6 +10739,7 @@ notification stream after `notifications/initialized`, and ends when stdin close
 | `--mcp-no-stored-queries` | off | Does not offer the datasets' stored queries as tools. |
 | `--mcp-max-sessions N` | `256` | Sessions of legacy clients open at once. `0` serves those clients without sessions. |
 | `--mcp-task-after-ms MS` | `2000` | How long a call of a client that supports tasks runs before it becomes a task (see [Tasks](#tasks)). |
+| `--mcp-require-auth` | off | With auth, answers every anonymous request with `401`, even when anonymous callers may read a dataset, so that MCP clients sign in. |
 
 A call may ask for a `timeoutSeconds` up to the server's `--timeout`, and calls default
 to 30 seconds. The intermediate-row cap is `--max-rows`.
@@ -10764,17 +10771,20 @@ other route by HTTP Basic, an API token, a web UI session or trusted proxy heade
 - `sparql_update` and `assert_facts` need `write` on their dataset, through the `update`
   endpoint. The branch tools need the grants above. `SERVICE` needs `federate`.
 - An anonymous caller that can read no dataset gets `401` with the server's
-  `WWW-Authenticate` challenges, so a client knows to sign in. Invalid credentials are
-  `401` as on every route.
+  `WWW-Authenticate` challenges, so a client knows to sign in. With
+  `--mcp-require-auth` every anonymous caller gets it. Invalid credentials are `401` as
+  on every route.
 - A legacy session belongs to the principal that opened it. The same session id from
   another caller is `404`. Each message still runs as its own caller.
 
-Clients authenticate with a bearer token in the `Authorization` header. Create one with
-`sparkles auth token create` or `POST /$/auth/tokens`, and scope it to the datasets the
-agent should reach. The endpoint does not publish OAuth protected-resource metadata,
-because the server accepts only its own API tokens and the OIDC provider issues none of
-them. Browser sessions and proxy identities are ambient credentials, so their POSTs need
-the CSRF header as on every other route.
+Clients authenticate with a bearer token in the `Authorization` header. An API token
+works on any server with auth. Create one with `sparkles auth token create` or
+`POST /$/auth/tokens`, and scope it to the datasets the agent should reach. With an
+`[oidc]` provider the endpoint is also an OAuth protected resource, and MCP clients get
+an access token from the provider by themselves (see
+[OAuth for the MCP endpoint](#oauth-for-the-mcp-endpoint)). Browser sessions and proxy
+identities are ambient credentials, so their POSTs need the CSRF header as on every
+other route.
 
 **Limits.** A `tools/call` is charged to the `query` [rate limit](#rate-limiting) of its
 dataset, and a call of a tool that writes to the `update` limit, as the SPARQL endpoints are.
@@ -10793,6 +10803,90 @@ to gets `421`, which stops DNS rebinding. Browser clients on an allowed origin c
 
 The access log records MCP messages with `operation=mcp`. The `sparkles_requests_total`
 and `sparkles_request_duration_seconds` metrics count them under the same label.
+
+### OAuth for the MCP endpoint
+
+A server with `--mcp`, an auth configuration and an `[oidc]` provider makes `/$/mcp` an
+OAuth 2.1 protected resource under the MCP authorization specification. An MCP client
+then discovers the provider, signs the user in there and calls the endpoint with the
+provider's access token. The provider is the authorization server, and Sparkles only
+checks the tokens it issues.
+
+**Resource identifier.** The identifier is `server.public_url` followed by `/$/mcp`, for
+example `https://sparql.example.org/$/mcp`. The server builds it and the metadata URL
+from `server.public_url` alone, which `[oidc]` requires. It never reads `Host` or
+forwarded headers for them, so the identifier stays the same behind a reverse proxy.
+
+**Metadata.** `GET /.well-known/oauth-protected-resource/$/mcp` and
+`GET /.well-known/oauth-protected-resource` both answer the RFC 9728 document of the
+endpoint. Both are public.
+
+```json
+{
+  "resource": "https://sparql.example.org/$/mcp",
+  "authorization_servers": ["https://idp.example.org/realms/main"],
+  "scopes_supported": ["sparkles:read", "sparkles:update", "sparkles:admin"],
+  "bearer_methods_supported": ["header"],
+  "resource_name": "Sparkles MCP server"
+}
+```
+
+Without `--mcp`, without auth or without an `[oidc]` provider, both paths answer `404`
+with a JSON error that says so, and the endpoint's challenges name no metadata.
+
+**Challenges.** A `401` from `/$/mcp` names the metadata in its `Bearer` challenge. With
+no token it also names the scope to ask for first.
+
+```http
+HTTP/1.1 401 Unauthorized
+WWW-Authenticate: Bearer realm="sparkles", resource_metadata="https://sparql.example.org/.well-known/oauth-protected-resource/$/mcp", scope="sparkles:read"
+```
+
+An invalid or expired token gets `error="invalid_token"` with the same
+`resource_metadata`. Other routes keep their challenges without it.
+
+**Audiences.** At `/$/mcp` an access token is accepted when its `aud` is the resource
+identifier, which a client gets by sending it as RFC 8707's `resource` parameter, or one
+of the `api_audience` values. Everywhere else only the `api_audience` values are accepted,
+so a token whose only audience is the resource is `401` on every other route. The
+`api_scopes` requirement applies to tokens accepted through `api_audience`. The
+identifier is compared exactly, so the provider must put it in `aud` as the metadata
+spells it.
+
+**Scopes.** Three scopes bound what a token may do. Each may name a dataset or a `*`
+pattern after a colon, as in `sparkles:read:wiki`.
+
+| Scope | Bound |
+|---|---|
+| `sparkles:read` | Read on every dataset, and `federate`. |
+| `sparkles:update` | Write on every dataset, which includes read, and `federate`. |
+| `sparkles:admin` | Admin on every dataset and every server permission. With a dataset, admin on that dataset and `federate`. |
+
+The bound is intersected with the grants of the token's principal, which the provider's
+groups map to roles as for any OIDC login, so a scope never adds access. A token's scopes
+bound it when it carries any `sparkles:` scope, on every route, and always when only the
+resource identifier accepted it. A token for the resource without such a scope can do
+nothing. A token accepted through `api_audience` without such a scope keeps its full
+grants, as before.
+
+**Scope challenges.** The endpoint checks each message against the token's scopes before
+it runs. A write tool needs `sparkles:update` on its dataset, and every other message
+needs `sparkles:read` on its dataset, or on some dataset when it names none. When the
+principal's grants allow the message and the scopes do not, the answer is `403`.
+
+```http
+HTTP/1.1 403 Forbidden
+WWW-Authenticate: Bearer error="insufficient_scope", scope="sparkles:update", resource_metadata="https://sparql.example.org/.well-known/oauth-protected-resource/$/mcp", error_description="sparql_update on wiki needs the sparkles:update scope"
+```
+
+The body is the server's JSON error. The challenge names the scope without a dataset,
+because providers rarely define per-dataset scopes, and the broader scope includes the
+narrower ones. When the grants do not allow the message either, a new scope would not
+help, so the tool answers as it does for any caller, for example with `unknown-dataset`.
+`tools/list` lists the write tools by the principal's grants, so that a client with
+`sparkles:read` sees them and steps up when it calls one. Operations inside a tool that
+need admin, such as deleting a protected branch, are refused by the tool without a
+challenge.
 
 ### Errors
 

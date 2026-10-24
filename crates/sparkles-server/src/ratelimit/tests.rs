@@ -157,6 +157,13 @@ fn classifies_routes() {
     assert_eq!(c(Some("/$/ping"), Method::GET, "/$/ping"), None);
     assert_eq!(c(Some("/$/ready/{ds}"), Method::GET, "/$/ready/ds"), None);
     assert_eq!(c(Some("/$/metrics"), Method::GET, "/$/metrics"), None);
+    // the protected-resource metadata of `/$/mcp`
+    for p in [
+        "/.well-known/oauth-protected-resource",
+        "/.well-known/oauth-protected-resource/$/mcp",
+    ] {
+        assert_eq!(c(Some(p), Method::GET, p), None);
+    }
     assert_eq!(c(Some("/ui/{*path}"), Method::GET, "/ui/x.js"), None);
     assert_eq!(
         c(Some("/{ds}/sparql"), Method::POST, "/ds/sparql"),

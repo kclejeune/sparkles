@@ -851,6 +851,12 @@ Authentication is off by default. Once it is on, access is denied unless a grant
   back-channel logout and optional idle timeouts. API clients can send the provider's JWT
   access tokens, checked against its JWKS with key rotation, and Cloudflare Access
   assertions are verified. Groups map to roles.
+* With an OIDC provider and `serve --mcp`, `/$/mcp` is an OAuth 2.1 protected resource
+  ([API.md](API.md#oauth-for-the-mcp-endpoint)). It publishes RFC 9728 metadata that
+  names the provider, accepts access tokens whose audience is its own resource
+  identifier at `/$/mcp` only, and answers a token that lacks a scope with an
+  `insufficient_scope` challenge. The scopes `sparkles:read`, `sparkles:update` and
+  `sparkles:admin`, optionally per dataset, only narrow the user's grants.
 * `serve --tls-cert --tls-key` serves HTTPS with rustls, HTTP/2 through ALPN and
   certificate reload. Cookies follow CSRF and CORS rules. `sparkles auth login` signs the
   CLI in with a browser loopback or a device code.
@@ -902,6 +908,11 @@ build community reports.
   runs under the engine's budgets with SERVICE off.
 * Over HTTP each call runs as the request's caller, so tools, resources and prompts see
   only the datasets that caller may read, and the server's rate limits apply.
+* Standard MCP hosts connect over HTTP with OAuth and no hand-made token
+  ([USAGE.md](USAGE.md#connecting-with-oauth)). The host finds the OIDC provider through
+  the endpoint's protected-resource metadata, signs the user in there and asks for the
+  `sparkles:update` scope only when a write tool needs it. `--mcp-require-auth` makes
+  anonymous requests start the sign-in even when anonymous callers may read a dataset.
 * The `sparql_update` tool is off unless the operator enables it, and is listed only for
   callers that may write. Writes pass write-time validation and carry a commit message,
   `LOAD` is refused, `dryRun` previews, `ifHead` makes a write conditional, and `patch`
@@ -1652,6 +1663,9 @@ links each item to its design spec.
   LC-QuAD 2.0, and LC-QuAD 2.0 needs a Wikidata load from the full dump. Independent-role
   evaluation has not run. Roadmap item 6.
 * The UI's ingestion controls do not turn on assistant ingestion. Roadmap item 77.
+* An MCP tool operation that needs admin, such as deleting a protected branch, refuses an
+  OAuth token without `sparkles:admin` as a tool error instead of a scope challenge.
+  Roadmap item 270.
 * Agent memory does not import from Cursor's SQLite store or the editors' Copilot Chat
   storage, and redaction finds only the secrets its patterns describe. Roadmap item 15.
 * The server does not convert images or audio. Scanned PDF pages need a build with

@@ -809,23 +809,24 @@ The server returns these instructions in `server/discover.instructions`, and in
   - Any other request gets `403` and a JSON-RPC error body without an `id`.
 - **Binding.** `serve` binds `0.0.0.0` by default. Unless `--host` is a loopback
   address, `--mcp` logs a warning that `/$/mcp` is unauthenticated.
-- **Auth today.** Like every other endpoint, `/$/mcp` relies on a proxy in front of
-  it, as in the nginx example in `README.md`. Proxy basic auth works with MCP hosts
-  that allow custom headers.
-- **Future auth.** A separate feature makes `/$/mcp` an OAuth 2.1 protected resource
-  under the MCP authorization spec, with:
-  - RFC 9728 metadata, and `401` with `WWW-Authenticate` for a missing or invalid
-    token;
-  - audience validation;
-  - `403` with a scope challenge.
-  - Scopes map onto the existing read/write split. `sparkles:read` covers every read
-    tool, and `sparkles:write` covers `sparql_update`, which is listed only for tokens
-    with that scope. The spec allows `tools/list` to vary by authorization.
+- **Auth.** Every message runs as the request's principal from
+  [C09](C09-dataset-access-control.md), authenticated as on every route. With an
+  `[oidc]` provider the endpoint is an OAuth 2.1 protected resource under the MCP
+  authorization spec, as the Outcome's
+  [OAuth section](#oauth-for-the-mcp-endpoint-item-67-2026-10-24) records:
+  - RFC 9728 metadata, and `401` with `WWW-Authenticate` naming it for a missing or
+    invalid token;
+  - the endpoint's resource identifier as an audience accepted at `/$/mcp` only;
+  - `403` with an `insufficient_scope` challenge for a message the token's scopes do not
+    cover.
+  - Scopes map onto the levels. `sparkles:read` covers every read tool,
+    `sparkles:update` covers the write tools and `sparkles:admin` covers admin, each
+    optionally for one dataset. They bound the principal's grants and never add to them.
   - Datasets a token cannot read are omitted from `list_datasets` and rejected as
     `unknown-dataset`.
   - Pins are checked against the caller's dataset access on every use.
-  - `tools/list` and `server/discover` switch to `cacheScope: "private"` once lists
-    vary by token.
+  - `tools/list` and `server/discover` use `cacheScope: "private"`, since lists vary by
+    caller.
 - **stdio** has no auth. It runs as the invoking user, and OS file permissions are the
   boundary. The spec says stdio servers take credentials from the environment.
 
@@ -1647,6 +1648,91 @@ Phase 2). Legacy `resources/subscribe` is not served, and no tool sends progress
 notifications (deviations 1 and 3 of Phase 3). MCP has no measurements in
 [BENCHMARKS](../BENCHMARKS.md).
 
+### OAuth for the MCP endpoint (item 67, 2026-10-24)
+
+`/$/mcp` became an OAuth 2.1 protected resource under the MCP authorization spec, which
+closes deviation 3 of Phase 2. The code is in `crates/sparkles-server/src/auth/oauth.rs`,
+the audience check in `auth/oidc.rs`, the challenges in `auth/routes.rs` and the check
+of each message in `mcp/http.rs`.
+
+- **When it applies.** The endpoint is a protected resource when the server runs with
+  `--mcp`, an auth configuration and an `[oidc]` provider. Without one of them, both
+  metadata paths answer `404` with a JSON error that names what is missing, and the
+  endpoint's challenges name no metadata. A `404` was chosen over an empty document
+  because RFC 9728 has no document for a resource without an authorization server.
+- **Resource identifier.** It is `server.public_url` followed by `/$/mcp`. `[oidc]`
+  already required `server.public_url` for its redirect URI, so no new setting was
+  needed. The identifier and the metadata URL never come from `Host` or forwarded
+  headers, so they are stable behind a reverse proxy and cannot be steered by a client.
+- **Metadata.** `GET /.well-known/oauth-protected-resource/$/mcp` and
+  `GET /.well-known/oauth-protected-resource` answer the same document: `resource`,
+  `authorization_servers` with the provider's issuer, `scopes_supported` with the three
+  scopes, `bearer_methods_supported` with `header`, and `resource_name`. The root form
+  describes `/$/mcp` too, because it is the server's only protected resource and MCP
+  clients fall back to the root. Both routes exist in every build, are public in the
+  route table, are not charged to a rate-limit class (the pre-authentication limit still
+  applies), and follow the policy's CORS origins like every route.
+- **Challenges.** A `401` from `/$/mcp` adds `resource_metadata` with the path-suffixed
+  URL to its `Bearer` challenge, and with no token also `scope="sparkles:read"`, which
+  MCP clients take as the scope to ask for first. Invalid and expired tokens keep
+  `error="invalid_token"`. A new flag, `--mcp-require-auth`, answers every anonymous
+  request with `401`, because a server whose anonymous grants read a dataset otherwise
+  serves an MCP client anonymously and the client never starts a sign-in.
+- **Audiences.** At `/$/mcp` an access token is accepted when its `aud` contains the
+  resource identifier or an `api_audience` value. On every other route only
+  `api_audience` is accepted, so a token for the resource alone is `401` there. The
+  identifier is compared exactly. `api_scopes` applies only to tokens accepted through
+  `api_audience`, since a client that asks for the resource cannot know the API's
+  scopes. Without `--mcp` the resource is no audience anywhere.
+- **Scopes.** `sparkles:read`, `sparkles:update` and `sparkles:admin`, optionally
+  followed by `:<dataset>` (a name or `*` pattern), become one more entry in the
+  principal's access scopes, the same intersection that bounds minted API tokens, so a
+  scope never adds access. Read and update keep only the `federate` server permission,
+  which `SERVICE` needs, and unqualified admin keeps every server permission. A token is
+  bounded by its scopes when it carries any `sparkles:` scope, on every route, and always
+  when only the resource identifier accepted it, so a resource token without such a
+  scope can do nothing. An `api_audience` token without them keeps its full grants as
+  before. Scopes that do not parse add nothing. MCP tasks and legacy sessions belong
+  to the account and its scopes together, so a token of the same account with
+  narrower scopes cannot poll a broader token's task or use its session.
+- **Scope challenges.** `mcp/http.rs` checks each JSON-RPC request before it is
+  charged. A write tool needs `sparkles:update` on its dataset and every other message
+  `sparkles:read` on its dataset, or on some exposed dataset when it names none. When the
+  grants without the scope bound allow the message and the bounded access does not, the
+  answer is HTTP `403` with
+  `Bearer error="insufficient_scope", scope=…, resource_metadata=…, error_description=…`,
+  the form the MCP spec gives for Streamable HTTP. The dataset checked is the one the
+  message acts on. A stored query's tool is bound to its own dataset whatever its
+  arguments say, other tools and prompts name it in `dataset`, and a resource in its URI.
+  Levels are compared on any branch,
+  since a scope's bound does not depend on the branch. When the grants do not allow the
+  message either, no challenge is sent and the tool answers as for any caller, so a
+  challenge never reveals a hidden dataset. The challenge names the scope without a
+  dataset, because providers rarely define per-dataset scopes and the broader scope
+  covers the narrower ones. `tools/list` lists the write tools by the principal's
+  grants rather than by its scopes, so that a client holding `sparkles:read` sees them
+  and steps up when it calls one.
+
+**Deviations.**
+
+1. An operation inside a tool that needs admin, such as deleting a protected branch,
+   is refused by the tool as an error, without a challenge naming `sparkles:admin`.
+   Item 270 follows up.
+2. The resource identifier must match `aud` exactly. The MCP spec suggests accepting an
+   uppercase scheme or host, but the audience check is the token library's exact
+   comparison, and every client takes the identifier from the metadata.
+3. The metadata sends no `Access-Control-Allow-Origin: *`. A browser-based MCP client
+   on another origin needs that origin in `cors.origins`.
+
+**Tests.** `src/http/router_tests/auth/mcp_oauth.rs` runs against the fake identity
+provider. It covers the metadata on both paths, the `404` without `[oidc]`, without
+`--mcp` and without auth, the `401` challenges with and without a token, a forged and an
+expired token, a wrong audience, a neighbouring path as audience, a resource token on
+other routes, `api_audience` tokens unchanged, a missing scope on a write tool, a token
+without Sparkles scopes, a per-dataset scope used on another dataset, and
+`sparkles:admin` failing to reach a dataset the grants hide. Unit tests in
+`auth/oauth.rs` cover the scope parsing and the quoting of the challenges.
+
 ### Roadmap follow-ups (2026-10-12)
 
 **Progress, tool metrics, load enablement and measurements** (item 42, Tier 4,
@@ -1688,25 +1774,7 @@ limit of 64 watchers. Updates go out as `notifications/resources/updated` on the
 session's stream. A request without a session has no stream to deliver to, so it
 gets the protocol's error for an unsupported method.
 
-**OAuth for the MCP endpoint** (item 67, Tier 2, [ROADMAP](../ROADMAP.md)).
-Deviation 3 of Phase 2 records that protected-resource metadata, audience validation and
-scope challenges were not built. Part of it has since landed: OIDC access tokens are
-accepted as bearer credentials on every route, `/$/mcp` included, when their audience
-is one of the provider's `api_audience` values and they grant every `api_scopes` value
-(`crates/sparkles-server/src/auth/config.rs`). What remains:
-
-* **Protected-resource metadata (RFC 9728).** `GET /.well-known/oauth-protected-resource`
-  (and the path-suffixed form for `/$/mcp`) returns the resource identifier, the OIDC
-  issuer as `authorization_servers`, `scopes_supported` and `bearer_methods_supported`.
-  A `401` from `/$/mcp` carries `WWW-Authenticate: Bearer resource_metadata="…"`, so
-  MCP clients discover the authorization server.
-* **Resource-bound audiences.** The audience check accepts any configured
-  `api_audience`, the same for every route. The MCP endpoint's canonical URL becomes an
-  accepted audience of its own, so a client that requests a token for the resource
-  (RFC 8707's `resource` parameter, which the MCP authorization profile requires) gets
-  one that works at `/$/mcp` and nowhere else unless the provider adds the API's
-  audience too.
-* **Scope challenges.** A token that lacks a scope a tool needs gets `403` with
-  `WWW-Authenticate: Bearer error="insufficient_scope", scope="…"`. Scopes map to the
-  existing grants: `sparkles:read`, `sparkles:update` and `sparkles:admin`, optionally
-  per dataset, intersected with the principal's grants, so a scope never adds access.
+**OAuth for the MCP endpoint** (item 67). This shipped on 2026-10-24, and
+[its section of the Outcome](#oauth-for-the-mcp-endpoint-item-67-2026-10-24) records
+how. The scope challenge for operations inside a tool that need admin remains as item
+270 of the [ROADMAP](../ROADMAP.md).

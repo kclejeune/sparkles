@@ -12,7 +12,11 @@
 //! route's permission (any caller). It then:
 //!
 //! * answers `401` with the server's challenges to an anonymous caller that can read no
-//!   dataset, so that clients know to sign in;
+//!   dataset, or to every anonymous caller with `--mcp-require-auth`, so that clients
+//!   know to sign in;
+//! * answers `403` with an `insufficient_scope` challenge (RFC 6750 §3.1) to a message
+//!   of an OIDC access token whose `sparkles:` scopes do not cover what the message
+//!   needs while the principal's grants do, so that the client asks for that scope;
 //! * binds each legacy session to the principal that opened it: another caller's
 //!   requests with that session id get `404`, like an unknown session;
 //! * bounds the number of legacy sessions;
@@ -98,6 +102,11 @@ pub struct ServeArgs {
     /// a task that the client polls, in milliseconds
     #[arg(long, value_name = "MS", default_value_t = 2000)]
     pub mcp_task_after_ms: u64,
+    /// With auth, answer every anonymous request to /$/mcp with 401, even when anonymous
+    /// callers may read a dataset, so that MCP clients sign in (with an [oidc] provider,
+    /// through OAuth discovery)
+    #[arg(long)]
+    pub mcp_require_auth: bool,
 }
 
 /// The endpoint's settings (`AppState::mcp`).
@@ -107,6 +116,8 @@ pub struct HttpConf {
     pub max_sessions: usize,
     /// ends the SSE streams and sessions when the server shuts down
     pub shutdown: CancellationToken,
+    /// every anonymous request gets `401` (`--mcp-require-auth`)
+    pub require_auth: bool,
 }
 
 impl ServeArgs {
@@ -188,6 +199,7 @@ impl ServeArgs {
             },
             max_sessions: self.mcp_max_sessions,
             shutdown: CancellationToken::new(),
+            require_auth: self.mcp_require_auth,
         }))
     }
 }
@@ -210,6 +222,7 @@ struct Endpoint {
     /// the principal (`Principal::id`) that opened each legacy session
     owners: Mutex<HashMap<String, String>>,
     max_sessions: usize,
+    require_auth: bool,
 }
 
 /// The `/$/mcp` route, or `None` when the endpoint is off.
@@ -235,6 +248,7 @@ pub fn route(state: &Arc<AppState>) -> Option<MethodRouter<Arc<AppState>>> {
         sessions,
         owners: Mutex::new(HashMap::new()),
         max_sessions: conf.max_sessions,
+        require_auth: conf.require_auth,
     });
     Some(axum::routing::any(move |req: Request| {
         let ep = ep.clone();
@@ -280,7 +294,9 @@ fn charge_of(message: &Value) -> Charge {
             } else {
                 Class::Query
             };
-            // a stored query's tool names its dataset (`<dataset>__<query>`)
+            // a stored query's tool names its dataset (`<dataset>__<query>`); `handle`
+            // replaces this with the stored tool's own dataset, since the name is
+            // sanitized and a parameter may be named `dataset`
             let dataset =
                 str_at(params.and_then(|p| p.get("arguments")), "dataset").or_else(|| {
                     name.as_deref()
@@ -319,9 +335,13 @@ impl Endpoint {
                 "request without a caller",
             );
         };
-        // an anonymous caller that can read nothing is asked to sign in
-        if self.state.auth.is_some() && p.is_anonymous() && self.server.visible(&p).is_empty() {
-            return crate::auth::authentication_required(&self.state, &p, req.headers());
+        // an anonymous caller that can read nothing is asked to sign in, and with
+        // `--mcp-require-auth` every anonymous caller
+        if self.state.auth.is_some()
+            && p.is_anonymous()
+            && (self.require_auth || self.server.visible(&p).is_empty())
+        {
+            return crate::auth::mcp_authentication_required(&self.state, &p, req.headers());
         }
         let session = req
             .headers()
@@ -334,7 +354,7 @@ impl Endpoint {
                 .owners
                 .lock()
                 .get(s)
-                .is_some_and(|owner| *owner != p.id())
+                .is_some_and(|owner| *owner != p.access_id())
         {
             return error(StatusCode::NOT_FOUND, "Not Found: Session not found");
         }
@@ -367,12 +387,28 @@ impl Endpoint {
                 return r;
             }
         }
+        // a stored query's tool is charged to its own dataset, whatever its arguments
+        // say (its name is sanitized, and a parameter may be named `dataset`)
+        if let Some(name) = message.pointer("/params/name").and_then(Value::as_str)
+            && charge.class.is_some()
+            && message.get("method").and_then(Value::as_str) == Some("tools/call")
+            && let Some(ds) = self.stored_dataset(&p, name)
+        {
+            charge.dataset = Some(ds);
+        }
         // a call without `dataset` reads the caller's only dataset
         if charge.class.is_some() && charge.dataset.is_none() {
             let visible = self.server.visible(&p);
             if let [only] = visible.as_slice() {
                 charge.dataset = Some(only.name.clone());
             }
+        }
+        // a token's scopes are checked for each message, before it is charged
+        #[cfg(feature = "auth")]
+        if p.oauth_scoped()
+            && let Some(r) = self.scope_challenge(&p, &message)
+        {
+            return r;
         }
         let req = Request::from_parts(parts, Body::from(bytes));
         // a tool call or resource read runs queries, so it waits for the memory pool as
@@ -386,6 +422,120 @@ impl Endpoint {
                 .await
             }
             _ => self.admitted(req, &p, admit).await,
+        }
+    }
+
+    /// The `403` scope challenge for `message` of a principal limited by its OAuth
+    /// scopes, or `None` when its scopes cover what the message needs or when a scope
+    /// would not help because its grants do not allow it either (the tool then answers
+    /// as for any caller). A write tool needs `sparkles:update` on its dataset, and every
+    /// other message `sparkles:read` on its dataset, or on some dataset when it names
+    /// none. The bound of a scope does not depend on the branch, so the levels compared
+    /// are those of any branch.
+    #[cfg(feature = "auth")]
+    fn scope_challenge(&self, p: &Principal, message: &Value) -> Option<Response> {
+        use crate::auth::{Level, oauth};
+        let auth = self.state.auth.as_ref()?;
+        let (public, _) = crate::auth::protected_resource(&self.state, &auth.policy())?;
+        // a response or notification of the client asks for nothing
+        let method = message.get("method").and_then(Value::as_str)?;
+        message.get("id")?;
+        let tool = (method == "tools/call")
+            .then(|| message.pointer("/params/name").and_then(Value::as_str))
+            .flatten();
+        let need = if tool.is_some_and(|t| super::branches::WRITE_TOOLS.contains(&t)) {
+            Level::Write
+        } else {
+            Level::Read
+        };
+        let full = p.without_oauth_scopes();
+        let target = self.scope_target(p, method, tool, message);
+        let reaches =
+            |who: &Principal, ds: &str| who.level_any_branch(ds).is_some_and(|l| l >= need);
+        let short = match &target {
+            Some(ds) => {
+                self.state.get(ds).is_some()
+                    && self.server.exposed(ds)
+                    && reaches(&full, ds)
+                    && !reaches(p, ds)
+            }
+            None => {
+                let some = |who: &Principal| {
+                    self.state
+                        .datasets()
+                        .values()
+                        .any(|ds| self.server.exposed(&ds.name) && reaches(who, &ds.name))
+                };
+                some(&full) && !some(p)
+            }
+        };
+        if !short {
+            return None;
+        }
+        let scope = oauth::scope_for(need);
+        let what = tool.unwrap_or(method);
+        let msg = match &target {
+            Some(ds) => format!("{what} on {ds} needs the {scope} scope"),
+            None => format!("{what} needs the {scope} scope"),
+        };
+        Some(crate::auth::insufficient_scope(p, &public, scope, &msg))
+    }
+
+    /// The dataset of the stored query whose tool is `name`, or `None` for an offered
+    /// tool or a name no stored tool has. The tool that runs is the one `p` sees, so it
+    /// is looked up for `p` first. Only when `p`'s scopes hide it is it looked up for `p`
+    /// without its scope bound, which a scope check needs. Tool names are made unique
+    /// within the stored tools one principal sees, so the two lookups can differ only
+    /// in that case.
+    fn stored_dataset(&self, p: &Principal, name: &str) -> Option<String> {
+        if self.server.offers(name) || !name.contains("__") {
+            return None;
+        }
+        let t = match self.server.stored_tool(p, name) {
+            Some(t) => t,
+            None if p.oauth_scoped() => self.server.stored_tool(&p.without_oauth_scopes(), name)?,
+            None => return None,
+        };
+        Some(t.dataset.name.clone())
+    }
+
+    /// The dataset a message acts on, for its scope check. A stored query's tool is
+    /// bound to its dataset whatever its arguments say (a parameter may be named
+    /// `dataset`), so its dataset comes from [`Endpoint::stored_dataset`], and a name
+    /// with `__` that no stored tool has names no dataset. Other tools and prompts name
+    /// it in `dataset`, and a resource in its URI. `None` when the message names none.
+    #[cfg(feature = "auth")]
+    fn scope_target(
+        &self,
+        p: &Principal,
+        method: &str,
+        tool: Option<&str>,
+        message: &Value,
+    ) -> Option<String> {
+        let params = message.get("params");
+        let arg = |k: &str| {
+            params
+                .and_then(|p| p.get("arguments"))
+                .and_then(|a| a.get(k))
+                .and_then(Value::as_str)
+                .map(str::to_string)
+        };
+        match method {
+            "tools/call" => {
+                let name = tool?;
+                if !self.server.offers(name) && name.contains("__") {
+                    return self.stored_dataset(p, name);
+                }
+                arg("dataset")
+            }
+            "prompts/get" => arg("dataset"),
+            "resources/read" => params
+                .and_then(|p| p.get("uri"))
+                .and_then(Value::as_str)
+                .and_then(|u| u.strip_prefix("sparkles://"))
+                .and_then(|r| r.split_once('/'))
+                .map(|(ds, _)| ds.to_string()),
+            _ => None,
         }
     }
 
@@ -424,7 +574,7 @@ impl Endpoint {
             let open = self.sessions.sessions.read().await;
             let mut owners = self.owners.lock();
             owners.retain(|s, _| open.keys().any(|k| k.as_ref() == s.as_str()));
-            owners.insert(id.to_string(), p.id());
+            owners.insert(id.to_string(), p.access_id());
         }
         resp.map(Body::new)
     }

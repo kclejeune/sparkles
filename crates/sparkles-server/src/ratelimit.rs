@@ -115,6 +115,11 @@ pub fn classify(
     }
     let read = matches!(*method, Method::GET | Method::HEAD);
     let r = route?;
+    // the protected-resource metadata of `/$/mcp`: a small constant document, like
+    // `/$/ping` (the pre-authentication limit still applies)
+    if r.starts_with("/.well-known/") {
+        return None;
+    }
     // The bounded algorithm admission layer selects Query or Update from the body,
     // once, before the restore guard. Projection management keeps Admin policy.
     if r == "/$/algo/{ds}/run" && *method == Method::POST {

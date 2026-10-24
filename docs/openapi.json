@@ -28285,7 +28285,7 @@
         "x-sparkles-permission": "any caller"
       },
       "post": {
-        "description": "One JSON-RPC message of the Model Context Protocol's Streamable HTTP transport. `404` unless the server runs with `--mcp`.",
+        "description": "One JSON-RPC message of the Model Context Protocol's Streamable HTTP transport. `404` unless the server runs with `--mcp`. With an `[oidc]` provider the endpoint is an OAuth protected resource. A `401` then names the protected-resource metadata in `WWW-Authenticate`, and a `403` with `error=\"insufficient_scope\"` names the scope an access token lacks for this message.",
         "externalDocs": {
           "url": "https://github.com/kclejeune/sparkles/blob/main/docs/API.md#http-endpoint-mcp"
         },
@@ -36808,6 +36808,184 @@
         "summary": "The caller and its permissions",
         "tags": [
           "Authentication"
+        ],
+        "x-sparkles-permission": "public"
+      }
+    },
+    "/.well-known/oauth-protected-resource": {
+      "get": {
+        "description": "RFC 9728 metadata that tells MCP clients which authorization server issues tokens for `/$/mcp` and which scopes it takes. Both paths answer the same document. `404` unless the server runs with `--mcp`, an auth configuration and an `[oidc]` provider.",
+        "externalDocs": {
+          "url": "https://github.com/kclejeune/sparkles/blob/main/docs/API.md#oauth-for-the-mcp-endpoint"
+        },
+        "operationId": "oauthProtectedResource",
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "properties": {
+                    "authorization_servers": {
+                      "description": "The issuer of the `[oidc]` provider.",
+                      "items": {
+                        "format": "uri",
+                        "type": "string"
+                      },
+                      "type": "array"
+                    },
+                    "bearer_methods_supported": {
+                      "items": {
+                        "enum": [
+                          "header"
+                        ],
+                        "type": "string"
+                      },
+                      "type": "array"
+                    },
+                    "resource": {
+                      "description": "The resource identifier of `/$/mcp`: `server.public_url` followed by `/$/mcp`.",
+                      "format": "uri",
+                      "type": "string"
+                    },
+                    "resource_name": {
+                      "type": "string"
+                    },
+                    "scopes_supported": {
+                      "items": {
+                        "type": "string"
+                      },
+                      "type": "array"
+                    }
+                  },
+                  "required": [
+                    "resource",
+                    "authorization_servers",
+                    "scopes_supported",
+                    "bearer_methods_supported"
+                  ],
+                  "type": "object"
+                }
+              }
+            },
+            "description": "The metadata."
+          },
+          "404": {
+            "$ref": "#/components/responses/NotFound"
+          },
+          "default": {
+            "$ref": "#/components/responses/Error"
+          }
+        },
+        "security": [
+          {},
+          {
+            "basicAuth": []
+          },
+          {
+            "apiToken": []
+          },
+          {
+            "oidcAccessToken": []
+          },
+          {
+            "sessionCookie": []
+          },
+          {
+            "cloudflareAccess": []
+          }
+        ],
+        "summary": "Protected-resource metadata of the MCP endpoint",
+        "tags": [
+          "MCP"
+        ],
+        "x-sparkles-permission": "public"
+      }
+    },
+    "/.well-known/oauth-protected-resource/$/mcp": {
+      "get": {
+        "description": "RFC 9728 metadata that tells MCP clients which authorization server issues tokens for `/$/mcp` and which scopes it takes. Both paths answer the same document. `404` unless the server runs with `--mcp`, an auth configuration and an `[oidc]` provider.",
+        "externalDocs": {
+          "url": "https://github.com/kclejeune/sparkles/blob/main/docs/API.md#oauth-for-the-mcp-endpoint"
+        },
+        "operationId": "oauthProtectedResourceMcp",
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "properties": {
+                    "authorization_servers": {
+                      "description": "The issuer of the `[oidc]` provider.",
+                      "items": {
+                        "format": "uri",
+                        "type": "string"
+                      },
+                      "type": "array"
+                    },
+                    "bearer_methods_supported": {
+                      "items": {
+                        "enum": [
+                          "header"
+                        ],
+                        "type": "string"
+                      },
+                      "type": "array"
+                    },
+                    "resource": {
+                      "description": "The resource identifier of `/$/mcp`: `server.public_url` followed by `/$/mcp`.",
+                      "format": "uri",
+                      "type": "string"
+                    },
+                    "resource_name": {
+                      "type": "string"
+                    },
+                    "scopes_supported": {
+                      "items": {
+                        "type": "string"
+                      },
+                      "type": "array"
+                    }
+                  },
+                  "required": [
+                    "resource",
+                    "authorization_servers",
+                    "scopes_supported",
+                    "bearer_methods_supported"
+                  ],
+                  "type": "object"
+                }
+              }
+            },
+            "description": "The metadata."
+          },
+          "404": {
+            "$ref": "#/components/responses/NotFound"
+          },
+          "default": {
+            "$ref": "#/components/responses/Error"
+          }
+        },
+        "security": [
+          {},
+          {
+            "basicAuth": []
+          },
+          {
+            "apiToken": []
+          },
+          {
+            "oidcAccessToken": []
+          },
+          {
+            "sessionCookie": []
+          },
+          {
+            "cloudflareAccess": []
+          }
+        ],
+        "summary": "Protected-resource metadata of the MCP endpoint (path-suffixed)",
+        "tags": [
+          "MCP"
         ],
         "x-sparkles-permission": "public"
       }

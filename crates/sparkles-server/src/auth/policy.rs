@@ -875,13 +875,16 @@ impl Auth {
     ///
     /// `admission`: the request's standing under the pre-authentication limit, charged
     /// before a password is verified; `client`: the network of the client, whose
-    /// password verifications are capped.
+    /// password verifications are capped; `resource`: the identifier of `/$/mcp` when
+    /// the request goes there and the endpoint is an OAuth protected resource, which
+    /// OIDC access tokens may then name as their audience.
     pub async fn authenticate(
         &self,
         h: &HeaderMap,
         peer: Option<&Peer>,
         admission: Option<&Admission>,
         client: Option<&ClientKey>,
+        resource: Option<&str>,
     ) -> Result<Authenticated, AuthError> {
         let policy = self.policy.load_full();
         let ok = |principal| Authenticated {
@@ -890,7 +893,7 @@ impl Auth {
         };
         if let Some(v) = h.get(header::AUTHORIZATION) {
             return self
-                .authorization(&policy, v, admission, client)
+                .authorization(&policy, v, admission, client, resource)
                 .await
                 .map(ok);
         }
@@ -973,6 +976,7 @@ impl Auth {
         v: &axum::http::HeaderValue,
         admission: Option<&Admission>,
         client: Option<&ClientKey>,
+        resource: Option<&str>,
     ) -> Result<Principal, AuthError> {
         let malformed = |scheme| AuthError {
             scheme,
@@ -989,9 +993,11 @@ impl Auth {
             if !rest.starts_with("spk_")
                 && jwt::looks_like_jwt(rest)
                 && let Some(oidc) = self.oidc.client()
-                && oidc.accepts_access_tokens()
+                && (oidc.accepts_access_tokens() || resource.is_some())
             {
-                return self.access_token_principal(policy, &oidc, rest).await;
+                return self
+                    .access_token_principal(policy, &oidc, rest, resource)
+                    .await;
             }
             return self.token_principal(policy, rest, Scheme::Bearer);
         }
@@ -1151,24 +1157,30 @@ impl Auth {
     }
 
     /// An access token of the OIDC provider on the API: an `oidc:` principal with the
-    /// token's groups, admitted and mapped to roles like a UI login.
+    /// token's groups, admitted and mapped to roles like a UI login. Its `sparkles:`
+    /// scopes bound its grants when it carries any, and always when only the `/$/mcp`
+    /// resource accepted it (a token for the resource without such scopes gets nothing).
     async fn access_token_principal(
         &self,
         policy: &Policy,
         oidc: &super::oidc::Oidc,
         token: &str,
+        resource: Option<&str>,
     ) -> Result<Principal, AuthError> {
         let err = |failure| AuthError {
             scheme: "bearer",
             failure,
         };
-        let claims = match oidc.verify_access_token(token).await {
+        let verified = match oidc.verify_access_token(token, resource).await {
             Ok(c) => c,
             Err(e) => {
                 tracing::debug!("access token refused: {e}");
                 return Err(err(jwt_failure(&e)));
             }
         };
+        let oauth = super::oauth::sparkles_scopes(&verified.scopes);
+        let oauth = (!oauth.is_empty() || !verified.api).then_some(oauth);
+        let claims = verified.claims;
         let Some(cfg) = &policy.oidc else {
             return Err(err(Failure::Invalid));
         };
@@ -1199,15 +1211,18 @@ impl Auth {
             .get("exp")
             .and_then(serde_json::Value::as_f64)
             .map(|e| e as i64);
+        let mut access = Access::of(grants);
+        if let Some(names) = &oauth {
+            access.scopes.push(super::oauth::scope_of(names));
+        }
         Ok(
-            Principal::new(Kind::Oidc, &name, Scheme::Bearer, Access::of(grants)).with_info(
-                PrincipalInfo {
-                    owner: Some(who),
-                    expires,
-                    idp_token: true,
-                    ..Default::default()
-                },
-            ),
+            Principal::new(Kind::Oidc, &name, Scheme::Bearer, access).with_info(PrincipalInfo {
+                owner: Some(who),
+                expires,
+                idp_token: true,
+                oauth_scopes: oauth,
+                ..Default::default()
+            }),
         )
     }
 

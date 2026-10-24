@@ -17,6 +17,7 @@ use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 
 mod api;
+pub mod oauth;
 pub mod proxy;
 pub(crate) mod routes;
 
@@ -50,8 +51,12 @@ pub use api::{
 pub use proxy::Peer;
 #[cfg(test)]
 pub use routes::ROUTES;
+#[cfg(all(feature = "auth", feature = "mcp"))]
+pub(crate) use routes::insufficient_scope;
 #[cfg(feature = "mcp")]
-pub use routes::authentication_required;
+pub use routes::mcp_authentication_required;
+#[cfg(feature = "auth")]
+pub(crate) use routes::protected_resource;
 pub use routes::{AuthReport, Denied, dataset_denial, forbidden, middleware};
 pub use routes::{Need, need};
 
@@ -671,6 +676,10 @@ pub struct PrincipalInfo {
     pub csrf: Option<String>,
     /// digest of the session id (sessions only)
     pub session: Option<[u8; 32]>,
+    /// the `sparkles:` scopes of an OIDC access token that limit it (the last entry of
+    /// its access's scopes), for the scope challenges of `/$/mcp`; `None` when the
+    /// token is not limited by scopes
+    pub oauth_scopes: Option<Vec<String>>,
 }
 
 /// How a principal's grants limit one dataset (`whoami`).
@@ -778,6 +787,26 @@ impl Principal {
 
     pub fn is_local(&self) -> bool {
         self.kind == Kind::Local
+    }
+
+    /// Whether an OIDC access token's `sparkles:` scopes limit this principal.
+    pub fn oauth_scoped(&self) -> bool {
+        self.info.oauth_scopes.is_some()
+    }
+
+    /// This principal with its grants alone, without the bound of its OAuth scopes:
+    /// what a token with more scopes could do. Used only to decide whether a scope
+    /// challenge would help and which tools to list, never to authorize.
+    #[cfg_attr(not(feature = "mcp"), allow(dead_code))]
+    pub fn without_oauth_scopes(&self) -> Principal {
+        if !self.oauth_scoped() {
+            return self.clone();
+        }
+        let mut access = (*self.access).clone();
+        access.scopes.pop();
+        let mut p = self.clone();
+        p.access = Arc::new(access);
+        p
     }
 
     pub fn is_anonymous(&self) -> bool {
@@ -941,6 +970,25 @@ impl Principal {
     /// limiters and audit records key on.
     pub fn id(&self) -> String {
         self.log_name().unwrap_or_else(|| "local".into())
+    }
+
+    #[cfg_attr(not(feature = "mcp"), allow(dead_code))]
+    /// [`Principal::id`] together with the bound of an OIDC access token's scopes, for
+    /// what must not pass between two tokens of one account with different scopes, such
+    /// as MCP tasks and legacy sessions. With a scope bound it is the JSON array
+    /// `["oidc:alice@example.org",["sparkles:read"]]`, which no [`Principal::id`]
+    /// equals (those start with a kind's name) and whose escaping keeps any account
+    /// name and scope apart.
+    pub fn access_id(&self) -> String {
+        match &self.info.oauth_scopes {
+            Some(scopes) => {
+                let mut s = scopes.clone();
+                s.sort();
+                s.dedup();
+                serde_json::json!([self.id(), s]).to_string()
+            }
+            None => self.id(),
+        }
     }
 
     /// The key of per-client rate limits: the owner of a minted token or a session
