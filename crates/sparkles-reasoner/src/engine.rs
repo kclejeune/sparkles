@@ -1581,10 +1581,14 @@ pub(crate) fn run(
         let produced = AtomicUsize::new(0);
         let budget = limits
             .max_inferred
-            .saturating_sub((gr.len() - base_len) as usize);
-        // the candidates an evaluation may produce for the limit of inferred triples;
+            .saturating_sub(gr.inferred_since(base_len));
+        // the candidates an evaluation may produce for the limit of inferred triples, with
+        // room for the magic facts of a demand program, which the limit does not count;
         // memory is checked by the charges as the candidates arrive
-        let max_out = budget.saturating_mul(4).saturating_add(1 << 20);
+        let max_out = budget
+            .saturating_add(gr.hidden_rows(0))
+            .saturating_mul(4)
+            .saturating_add(1 << 20);
         let timed = tracing::enabled!(tracing::Level::TRACE);
         let item_time: Vec<AtomicUsize> = if timed {
             rules.iter().map(|_| AtomicUsize::new(0)).collect()
@@ -1697,13 +1701,14 @@ pub(crate) fn run(
         }
         let candidates = produced.load(Ordering::Relaxed);
         if candidates > max_out {
+            tracing::debug!(candidates, max_out, "candidates past the limit");
             return Err(crate::InferredLimitExceeded {
                 limit: limits.max_inferred,
                 context: top_rule(&results),
             }
             .into());
         }
-        let overflow = if (g.len() - base_len) as usize + candidates > limits.max_inferred {
+        let overflow = if g.inferred_since(base_len) + candidates > limits.max_inferred {
             top_rule(&results)
         } else {
             String::new()
@@ -1723,12 +1728,13 @@ pub(crate) fn run(
         tracing::debug!(
             iteration,
             new,
+            visible = g.inferred_since(base_len),
             candidates,
             eval_ms,
             merge_ms = t_merge.elapsed().as_millis() as u64,
             "reasoner iteration"
         );
-        if (g.len() - base_len) as usize > limits.max_inferred {
+        if g.inferred_since(base_len) > limits.max_inferred {
             return Err(crate::InferredLimitExceeded {
                 limit: limits.max_inferred,
                 context: overflow,

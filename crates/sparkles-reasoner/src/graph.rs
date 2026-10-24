@@ -1296,6 +1296,27 @@ impl Graph {
             .map_or(0, |l| restrict(l, lo.max(self.offset), hi).len())
     }
 
+    /// The in-memory rows from row `lo` on whose predicate is hidden (magic facts), which
+    /// the limit of inferred facts does not count.
+    pub fn hidden_rows(&self, lo: u32) -> usize {
+        let Some(h) = &self.hidden else {
+            return 0;
+        };
+        let lo = lo.max(self.offset);
+        h.iter()
+            .map(|&p| {
+                self.by_p[shard1(p)]
+                    .get(&p)
+                    .map_or(0, |l| restrict(l, lo, self.len()).len())
+            })
+            .sum()
+    }
+
+    /// The facts inferred from row `lo` on, without the hidden ones.
+    pub fn inferred_since(&self, lo: u32) -> usize {
+        (self.len() - lo) as usize - self.hidden_rows(lo)
+    }
+
     /// (distinct subjects, distinct objects) of predicate `p`
     pub fn pstats(&self, p: u64) -> (u32, u32) {
         let (bs, bo) = self.base.as_ref().map_or((0, 0), |b| b.pstats(p));

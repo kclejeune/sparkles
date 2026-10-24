@@ -510,7 +510,8 @@ pub(crate) fn apply(
             })
             .collect();
         // bound positions first, then patterns read without derivation, then the fewest
-        // stored facts
+        // stored facts. The class of an `rdf:type` pattern counts after a bound subject or
+        // object of any other, since a class has many instances.
         let mut left: Vec<usize> = (0..group.len()).collect();
         let mut bound: Vec<Variable> = Vec::new();
         while !left.is_empty() {
@@ -519,10 +520,17 @@ pub(crate) fn apply(
                 let b = |x: &TermPattern| {
                     const_term(x).is_some() || join_var(x).is_some_and(|v| bound.contains(&v))
                 };
+                let class = matches!(&t.predicate, NamedNodePattern::NamedNode(p) if p.as_ref() == oxrdf::vocab::rdf::TYPE);
+                let ends = b(&t.subject) as u8 + (b(&t.object) && !class) as u8;
                 let n = b(&t.subject) as u8
                     + matches!(&t.predicate, NamedNodePattern::NamedNode(_)) as u8
                     + b(&t.object) as u8;
-                (n, !intensional[i] as u8, std::cmp::Reverse(estimates[i]))
+                (
+                    ends,
+                    n,
+                    !intensional[i] as u8,
+                    std::cmp::Reverse(estimates[i]),
+                )
             };
             let k = (0..left.len())
                 .max_by(|&a, &b| score(left[a]).cmp(&score(left[b])).then(b.cmp(&a)))

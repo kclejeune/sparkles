@@ -11,7 +11,7 @@
 //! deadline, cancellation and memory budget and a limit of derived facts.
 
 use crate::budget::{Budget, MemoryExceeded};
-use crate::demand::{self, Key, KeyP, Program, TransformError};
+use crate::demand::{self, Key, KeyP, Pass, Program, TransformError, Vocab};
 use crate::engine::{self, Atom, CRule, Slot};
 use crate::facts::Base;
 use crate::graph::{Graph, Triple};
@@ -81,7 +81,9 @@ impl QueryReasoner {
                 rules,
                 inputs,
                 max_derived: DEFAULT_MAX_DERIVED,
-                max_iterations: 10_000,
+                // a linear chain of n nodes takes n iterations, so the limit of derived
+                // facts and the query's deadline bound the run instead
+                max_iterations: usize::MAX,
                 warnings,
             }),
         })
@@ -188,8 +190,12 @@ struct Session {
     absent: bool,
     stop: Arc<dyn Fn() -> Result<()> + Send + Sync>,
     budget: Arc<Budget>,
-    /// the cache's view key, when the view is a committed one
+    /// the cache's view key, when the view is a committed one and the query may read
+    /// cached tables
     view: Option<String>,
+    /// the view key of the schema's table, which `nocache` does not bypass: like the
+    /// compiled rules, the schema is the same for every query of the view
+    schema_view: Option<String>,
     warnings: Vec<String>,
     demands: Vec<Demand>,
     keys: Vec<Key>,
@@ -209,6 +215,16 @@ struct Session {
     made_bnodes: bool,
     /// whether the lower stages were evaluated
     lower_done: bool,
+    /// the schema pass's program, when it ran in this session
+    pre: Option<Program>,
+    /// whether the program was specialized to the schema, or found not to need it
+    specialized: bool,
+    /// the magic predicates of every program of the session
+    hidden: FxHashSet<u64>,
+    /// the schema the rules were specialized to, and its rows in the derived tier, which
+    /// go out only to the demands that can read them
+    closed: Option<demand::Closed>,
+    schema_rows: Option<(usize, usize)>,
     /// tables read from the cache
     cached: Vec<Arc<Table>>,
     reports: Vec<DemandReport>,
@@ -217,6 +233,7 @@ struct Session {
 
 impl Session {
     fn new(shared: Arc<Shared>, req: SessionRequest) -> Result<Session> {
+        let t0 = std::time::Instant::now();
         let snap = req.snap;
         let budget = Budget::new(req.max_memory.map(|m| m.min(usize::MAX as u64) as usize));
         let terms = Terms::new(snap.clone());
@@ -228,11 +245,12 @@ impl Session {
         let resolved = inputs::resolve(&snap, &shared.inputs);
         warnings.extend(resolved.warnings.iter().cloned());
         let mut graphs = resolved.ids(&snap);
+        tracing::debug!(target: "sparkles_reasoner::demand", "session: rules compiled and inputs resolved in {:?}", t0.elapsed());
         if let Some(readable) = &req.readable {
             graphs.retain(|g| readable(*g));
         }
         let absent = graphs.contains(&Id::DEFAULT_GRAPH);
-        let view = (snap.cacheable && !req.no_cache).then(|| {
+        let schema_view = snap.cacheable.then(|| {
             format!(
                 "{}|{}|{}|{:?}",
                 snap.generation.uid,
@@ -241,6 +259,7 @@ impl Session {
                 graphs
             )
         });
+        let view = schema_view.clone().filter(|_| !req.no_cache);
         Ok(Session {
             shared,
             snap,
@@ -251,6 +270,7 @@ impl Session {
             stop: req.stop,
             budget,
             view,
+            schema_view,
             warnings,
             demands: Vec::new(),
             keys: Vec::new(),
@@ -264,6 +284,11 @@ impl Session {
             local_keys: Vec::new(),
             made_bnodes: false,
             lower_done: false,
+            pre: None,
+            specialized: false,
+            hidden: FxHashSet::default(),
+            closed: None,
+            schema_rows: None,
             cached: Vec::new(),
             reports: Vec::new(),
             seeds: Vec::new(),
@@ -295,11 +320,13 @@ impl Session {
 
     /// Evaluate `rules` from row `start` on, under the limits, checking the query's
     /// deadline and cancellation meanwhile.
-    fn run(&mut self, stage: usize, start: u32, what: &str) -> Result<()> {
-        let program = self.program.as_ref().expect("prepared");
+    fn run(&mut self, pre: bool, stage: usize, start: u32, what: &str) -> Result<()> {
+        let program = if pre { &self.pre } else { &self.program };
+        let program = program.as_ref().expect("prepared");
         let rules = &program.stages[stage].rules;
         let g = self.graph.as_mut().expect("graph made");
-        let derived = (g.len() - g.offset()) as usize;
+        // magic facts are charged to the memory budget, not to the limit of facts
+        let derived = g.inferred_since(g.offset());
         let max = self.shared.max_derived;
         if derived > max {
             return Err(component(
@@ -338,7 +365,7 @@ impl Session {
             r
         });
         if tracing::enabled!(target: "sparkles_reasoner::demand", tracing::Level::DEBUG) {
-            self.trace_facts();
+            self.trace_facts(pre);
         }
         if let Some(e) = stopped.into_inner() {
             return Err(e);
@@ -392,9 +419,17 @@ impl Session {
             return Ok(());
         }
         self.lower_done = true;
-        let stages = self.program.as_ref().map_or(0, |p| p.stages.len());
+        self.run_lower(false, "the patterns noValue reads")
+    }
+
+    /// Evaluate the lower stages of the query's program or the schema pass's (`pre`), the
+    /// last first.
+    fn run_lower(&mut self, pre: bool, what: &str) -> Result<()> {
+        let program = if pre { &self.pre } else { &self.program };
+        let stages = program.as_ref().map_or(0, |p| p.stages.len());
         for si in (1..stages).rev() {
-            let stage = &self.program.as_ref().expect("prepared").stages[si];
+            let program = if pre { &self.pre } else { &self.program };
+            let stage = &program.as_ref().expect("prepared").stages[si];
             let g = self.graph.as_mut().expect("graph made");
             if let Some(p) = stage.only_if
                 && g.count_p(p, 0, g.len()) == 0
@@ -403,21 +438,228 @@ impl Session {
             }
             let seeds = stage.seeds.clone();
             let start = g.len();
-            g.try_add_batch(seeds)
-                .map_err(|e| memory_error(e, "the patterns noValue reads"))?;
-            self.run(si, start, "the patterns noValue reads")?;
+            g.try_add_batch(seeds).map_err(|e| memory_error(e, what))?;
+            self.run(pre, si, start, what)?;
         }
         Ok(())
     }
 
+    fn hide(&mut self, preds: &FxHashSet<u64>) {
+        self.hidden.extend(preds.iter().copied());
+        if let Some(g) = self.graph.as_mut() {
+            g.set_hidden(Arc::new(self.hidden.clone()));
+        }
+    }
+
+    fn transform(&self, rules: &[CRule], roots: &[Key], pass: Pass<'_>) -> Result<Program> {
+        let g = self.graph.as_ref().expect("graph made");
+        let est = |a: &Atom, bound: &[bool]| estimate(g, a, bound);
+        demand::transform(rules, &self.terms, roots, &est, pass).map_err(|e| match e {
+            TransformError::Memory(m) => memory_error(m, "the demand program"),
+            TransformError::TooLarge(_) => component(BUDGET_CODE, e.to_string()),
+            TransformError::NotStratified => component(RULES_CODE, e.to_string()),
+        })
+    }
+
+    /// Specialize the rules to the schema (see [`crate::specialize`]), the first time a
+    /// demand derives: the schema comes from the table cache or a pass of its own, and the
+    /// query's program is made again over the specialized rules.
+    fn ensure_program(&mut self) -> Result<()> {
+        if self.specialized {
+            return Ok(());
+        }
+        self.specialized = true;
+        let iri = |s: &str| Term::NamedNode(oxrdf::NamedNode::new_unchecked(s));
+        let rdf_type = self.id_of(&iri("http://www.w3.org/1999/02/22-rdf-syntax-ns#type"));
+        let vocab = Vocab::of(&self.rules, &self.terms);
+        let roots = demand::schema_roots(&vocab, rdf_type);
+        self.make_graph()?;
+        let t0 = std::time::Instant::now();
+        if roots.is_empty() {
+            let program = self.transform(&self.rules, &self.keys, Pass::Plain)?;
+            self.hide(&program.magic_preds);
+            self.program = Some(program);
+            self.lower_done = false;
+            return Ok(());
+        }
+        let key = self.schema_view.as_ref().map(|v| tables::Key {
+            view: v.clone(),
+            digest: self.shared.digest,
+            demand: "schema".into(),
+            seeds: (0, 0),
+        });
+        let schema_from = self.graph.as_ref().expect("graph made").derived().len();
+        if let Some(t) = key.as_ref().and_then(tables::get) {
+            let facts = self.remap(&t)?;
+            let g = self.graph.as_mut().expect("graph made");
+            g.try_add_batch(facts)
+                .map_err(|e| memory_error(e, "the schema"))?;
+        } else {
+            let keys: Vec<Key> = roots.iter().map(|r| r.0).collect();
+            let pre = self.transform(&self.rules, &keys, Pass::Schema)?;
+            self.hide(&pre.magic_preds);
+            let from = self.graph.as_ref().expect("graph made").derived().len();
+            let seeds: Vec<Triple> = roots
+                .iter()
+                .map(|(k, v)| {
+                    let m = pre.stages[0]
+                        .magic(k)
+                        .expect("a root key has a magic predicate");
+                    demand::magic_fact(k, m, pre.dummy, v[0], v[1], v[2])
+                })
+                .collect();
+            self.pre = Some(pre);
+            let g = self.graph.as_mut().expect("graph made");
+            let start = g.len();
+            g.try_add_batch(seeds)
+                .map_err(|e| memory_error(e, "the schema"))?;
+            self.run(true, 0, start, "the schema")?;
+            if let Some(key) = key {
+                self.cache_schema(key, from);
+            }
+        }
+        let schema_to = self.graph.as_ref().expect("graph made").derived().len();
+        if self.exported == schema_from {
+            self.exported = schema_to;
+            self.schema_rows = Some((schema_from, schema_to));
+        }
+        let closed = crate::specialize::closed(&vocab, rdf_type);
+        // RDF lists are read as stored unless a rule gives their facts
+        let lists: Vec<u64> = ["first", "rest"]
+            .into_iter()
+            .map(|l| {
+                self.id_of(&iri(&format!(
+                    "http://www.w3.org/1999/02/22-rdf-syntax-ns#{l}"
+                )))
+            })
+            .filter(|&p| {
+                !self.rules.iter().any(|r| {
+                    r.head
+                        .iter()
+                        .any(|h| demand::head_slots(h).1 == Slot::Const(p))
+                })
+            })
+            .collect();
+        let g = self.graph.as_ref().expect("graph made");
+        let t1 = std::time::Instant::now();
+        let rules = crate::specialize::specialize(
+            &self.rules,
+            &closed,
+            &lists,
+            g,
+            &self.terms,
+            &self.budget,
+        )
+        .map_err(|e| memory_error(e, "the rules specialized to the schema"))?;
+        self.closed = Some(closed);
+        if rules.reads_instances && (0..self.keys.len()).any(|d| self.reads_schema(d)) {
+            // the schema the pass derived may lack facts that follow from derived
+            // instance facts, which this query reads
+            let program = self.transform(&self.rules, &self.keys, Pass::Plain)?;
+            self.hide(&program.magic_preds);
+            self.program = Some(program);
+            self.lower_done = false;
+            return Ok(());
+        }
+        let closed = self.closed.as_ref().expect("set above");
+        let same_as = self.id_of(&iri("http://www.w3.org/2002/07/owl#sameAs"));
+        let g = self.graph.as_ref().expect("graph made");
+        let rules = crate::specialize::without_equality(rules.rules, same_as, g);
+        let t2 = std::time::Instant::now();
+        let program = self.transform(&rules, &self.keys, Pass::Closed(closed))?;
+        tracing::debug!(
+            target: "sparkles_reasoner::demand",
+            "schema {:?}, {} rules specialized in {:?}, program of {} rules in {:?}, stages {:?}",
+            t1 - t0,
+            rules.len(),
+            t2 - t1,
+            program.stages.iter().map(|s| s.rules.len()).sum::<usize>(),
+            t2.elapsed(),
+            program
+                .stages
+                .iter()
+                .map(|s| (s.keys().count(), s.rules.len()))
+                .collect::<Vec<_>>()
+        );
+        self.hide(&program.magic_preds);
+        self.program = Some(program);
+        self.lower_done = false;
+        Ok(())
+    }
+
+    /// Whether demand `d` can read facts of the schema.
+    fn reads_schema(&self, d: usize) -> bool {
+        let Some(c) = &self.closed else {
+            return true;
+        };
+        let k = &self.keys[d];
+        match k.p {
+            KeyP::Const(p) if p == c.rdf_type => k.class.is_none_or(|x| c.classes.contains(&x)),
+            KeyP::Const(p) => c.preds.contains(&p),
+            _ => true,
+        }
+    }
+
+    /// Keep the facts the schema pass derived from row `from` of the derived tier in the
+    /// table cache, unless a rule made a blank node among them.
+    fn cache_schema(&self, key: tables::Key, from: usize) {
+        let g = self.graph.as_ref().expect("graph made");
+        let mut facts: Vec<[u64; 3]> = Vec::new();
+        let mut keys: Vec<(u64, Vec<u8>)> = Vec::new();
+        let mut seen: FxHashSet<u64> = FxHashSet::default();
+        for t in &g.derived()[from..] {
+            if self.hidden.contains(&t[1]) || !self.terms.valid(t) {
+                continue;
+            }
+            for &x in t {
+                if Id(x).tag() == Tag::Local && seen.insert(x) {
+                    match self.terms.local(x) {
+                        Some(LocalTerm::Key(k)) => keys.push((x, k.clone())),
+                        _ => return,
+                    }
+                }
+            }
+            facts.push(*t);
+        }
+        tables::put(
+            key,
+            Arc::new(Table {
+                chunks: vec![Arc::new(facts)],
+                keys,
+            }),
+        );
+    }
+
+    /// The facts of a cached table in this session's ids.
+    fn remap(&self, t: &Table) -> Result<Vec<[u64; 3]>> {
+        let mut map: FxHashMap<u64, u64> = FxHashMap::default();
+        for (old, key) in &t.keys {
+            let new = self
+                .terms
+                .try_id_for_key(key)
+                .map_err(|e| memory_error(e, "a cached table"))?;
+            map.insert(*old, new);
+        }
+        Ok(t.facts()
+            .map(|f| f.map(|x| map.get(&x).copied().unwrap_or(x)))
+            .collect())
+    }
+
     /// The derived facts not returned yet, without magic facts and facts RDF cannot state.
     fn export(&mut self, out: &mut Derived) {
-        let program = self.program.as_ref().expect("prepared");
+        let end = self.graph.as_ref().expect("graph made").derived().len();
+        self.export_rows(self.exported, end, out);
+        self.exported = end;
+    }
+
+    /// The derived facts of rows `lo` to `hi` of the derived tier, as [`export`] returns
+    /// them.
+    fn export_rows(&mut self, lo: usize, hi: usize, out: &mut Derived) {
         let g = self.graph.as_ref().expect("graph made");
         let rows = g.derived();
         let mut chunk: Vec<[u64; 3]> = Vec::new();
-        for t in &rows[self.exported..] {
-            if program.magic_preds.contains(&t[1]) || !self.terms.valid(t) {
+        for t in &rows[lo..hi] {
+            if self.hidden.contains(&t[1]) || !self.terms.valid(t) {
                 continue;
             }
             for &x in t {
@@ -437,7 +679,6 @@ impl Session {
             }
             chunk.push(*t);
         }
-        self.exported = rows.len();
         out.facts.extend_from_slice(&chunk);
         if !chunk.is_empty() {
             self.chunks.push(Arc::new(chunk));
@@ -472,14 +713,15 @@ impl Session {
     }
 
     /// Debug output: the magic facts of each key and the derived facts of each predicate.
-    fn trace_facts(&self) {
-        let program = self.program.as_ref().expect("prepared");
+    fn trace_facts(&self, pre: bool) {
+        let program = if pre { &self.pre } else { &self.program };
+        let program = program.as_ref().expect("prepared");
         let g = self.graph.as_ref().expect("graph made");
         let mut by_magic: FxHashMap<u64, usize> = FxHashMap::default();
         let mut by_pred: FxHashMap<u64, usize> = FxHashMap::default();
         let mut first: FxHashMap<u64, Vec<[u64; 3]>> = FxHashMap::default();
         for t in g.derived() {
-            if program.magic_preds.contains(&t[1]) {
+            if self.hidden.contains(&t[1]) {
                 *by_magic.entry(t[1]).or_default() += 1;
                 let f = first.entry(t[1]).or_default();
                 if f.len() < 3 {
@@ -630,7 +872,14 @@ impl ReasoningSession for Session {
             let p = val(&d.p, 1);
             let o = val(&d.o, 2);
             let kp = if p { KeyP::Const(c[1]) } else { KeyP::Free };
-            self.keys.push(Key::new(s, kp, o));
+            let k = Key::new(s, kp, o);
+            let rdf_type = self.id_of(&Term::NamedNode(oxrdf::vocab::rdf::TYPE.into_owned()));
+            self.keys.push(match (&d.p, &d.o) {
+                (DemandTerm::Const(_), DemandTerm::Const(_)) if c[1] == rdf_type => {
+                    k.with_class(c[2])
+                }
+                _ => k,
+            });
             self.consts.push(c);
             self.seeded.push(match (&d.s, &d.o) {
                 (DemandTerm::Seeded, _) => Seeded::Subject,
@@ -638,35 +887,31 @@ impl ReasoningSession for Session {
                 _ => Seeded::None,
             });
         }
-        self.make_graph()?;
-        let g = self.graph.as_ref().expect("graph made");
-        let est = |a: &Atom, bound: &[bool]| estimate(g, a, bound);
-        let program =
-            demand::transform(&self.rules, &self.terms, &self.keys, &est).map_err(|e| match e {
-                TransformError::Memory(m) => memory_error(m, "the demand program"),
-                TransformError::TooLarge(_) => component(BUDGET_CODE, e.to_string()),
-                TransformError::NotStratified => component(RULES_CODE, e.to_string()),
-            })?;
-        if let Some(g) = self.graph.as_mut() {
-            g.set_hidden(Arc::new(program.magic_preds.clone()));
-        }
+        // the program is made at the first derivation, which a cached table may spare
         let infos = demands
             .iter()
             .zip(&self.keys)
-            .map(|(d, k)| {
+            .zip(&self.consts)
+            .map(|((d, k), c)| {
                 let pred = match &d.p {
                     DemandTerm::Const(t) => short(t),
                     _ => "?p".to_string(),
                 };
+                let slot = |t: &DemandTerm, i: usize| match t {
+                    DemandTerm::Const(_) => Slot::Const(c[i]),
+                    _ => Slot::Var(i),
+                };
+                let pattern = (slot(&d.s, 0), slot(&d.p, 1), slot(&d.o, 2));
                 DemandInfo {
                     adornment: format!("{pred}^{}", k.adornment()),
-                    rules: program.stages[0].cone(k).into_iter().collect(),
+                    rules: demand::cone(&self.rules, pattern).into_iter().collect(),
                 }
             })
             .collect();
         self.reports = vec![DemandReport::default(); demands.len()];
         self.seeds = vec![FxHashSet::default(); demands.len()];
-        self.program = Some(program);
+        self.program = None;
+        self.specialized = false;
         Ok(infos)
     }
 
@@ -699,7 +944,14 @@ impl ReasoningSession for Session {
                 .map(|(d, _, _)| demand_text(&self.demands[*d]))
                 .collect::<Vec<_>>()
                 .join(", ");
+            self.ensure_program()?;
             self.ensure_graph()?;
+            if let Some((lo, hi)) = self.schema_rows
+                && misses.iter().any(|(d, _, _)| self.reads_schema(*d))
+            {
+                self.schema_rows = None;
+                self.export_rows(lo, hi, &mut out);
+            }
             let program = self.program.as_ref().expect("prepared");
             let stage = &program.stages[0];
             let mut magic: Vec<Triple> = Vec::new();
@@ -724,7 +976,9 @@ impl ReasoningSession for Session {
             let g = self.graph.as_mut().expect("graph made");
             let start = g.len();
             g.try_add_batch(magic).map_err(|e| memory_error(e, &what))?;
-            self.run(0, start, &what)?;
+            let t0 = std::time::Instant::now();
+            self.run(false, 0, start, &what)?;
+            tracing::debug!(target: "sparkles_reasoner::demand", "derived {what} in {:?}", t0.elapsed());
             self.export(&mut out);
             if !self.made_bnodes {
                 let table = Arc::new(Table {

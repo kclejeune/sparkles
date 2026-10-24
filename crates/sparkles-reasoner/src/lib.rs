@@ -30,6 +30,7 @@ mod maintain;
 pub mod parser;
 mod pool;
 pub mod query;
+mod specialize;
 pub mod tables;
 mod terms;
 

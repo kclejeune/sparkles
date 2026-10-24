@@ -425,3 +425,50 @@ fn derived_terms_and_no_inferred_graph() {
         .collect();
     assert!(names.contains("<http://ex.org/shout>"), "{names:?}");
 }
+
+/// A3 in small: with OWL 2 RL, a query for the instances of an intersection class that
+/// a constant narrows asks only for the facts of the seeded students. The rules are
+/// specialized to the schema, so the demand for `ex:Person` reads the facts of the
+/// properties whose domain is a subclass of it for the seeds alone, and the intersection's
+/// `listForAll` asks for the types of its members.
+#[test]
+fn owl_rl_demand_follows_the_schema() {
+    let mut ttl = String::from(
+        "ex:takes rdfs:domain ex:Student ; rdfs:range ex:Course .
+         ex:teaches rdfs:domain ex:Teacher ; rdfs:range ex:Course .
+         ex:memberOf rdfs:domain ex:Person .
+         ex:Student rdfs:subClassOf ex:Person .
+         ex:Teacher rdfs:subClassOf ex:Person .
+         ex:GradCourse rdfs:subClassOf ex:Course .
+         ex:GradStudent owl:intersectionOf ( ex:Person
+             [ owl:onProperty ex:takes ; owl:someValuesFrom ex:GradCourse ] ) .\n",
+    );
+    for c in (0..30).step_by(2) {
+        ttl.push_str(&format!("ex:c{c} a ex:GradCourse .\n"));
+    }
+    for i in 0..300 {
+        ttl.push_str(&format!(
+            "ex:s{i} ex:takes ex:c{} ; ex:memberOf ex:d{} .\n\
+             ex:t{i} ex:teaches ex:c{} ; ex:memberOf ex:d{} .\n",
+            i % 30,
+            i % 3,
+            i % 30,
+            i % 3
+        ));
+    }
+    let s = store(&ttl);
+    let report = materialize(&s, &Profile::OwlRl, &ReasonOptions::default()).unwrap();
+    let qr = reasoner(&Profile::OwlRl);
+    let q = "SELECT ?x { ?x a ex:GradStudent . ?x ex:takes ex:c4 }";
+    let want = rows(&run(&s, q, &materialized()));
+    let r = run(&s, q, &demand(&qr));
+    assert_eq!(rows(&r), want);
+    assert_eq!(want.len(), 10);
+    let a = r.ctx.reasoning.clone().unwrap();
+    assert!(
+        a.report.derived * 4 < report.inferred,
+        "derived {} of the {} a materialization derives",
+        a.report.derived,
+        report.inferred
+    );
+}
