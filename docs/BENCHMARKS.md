@@ -2178,8 +2178,10 @@ setting, and the ratios are the paired medians of grouped to ordinary that
 | Spatial at 1.05M | 583 | 1.04, 0.98 | 1.66, 1.35 | 0.947, 0.813 | 136.1–271.7, 8.0–11.7 | Not established. |
 | Spatial at 10.5M | 444 | 1.03, 1.02 | 1.48, 1.45 | 0.999, 0.988 | 3.5–12.3, 4.0–8.8 | Met. |
 
-No text process stalled, and the longest ordinary lag of the text cell at 1.05M fell from
-150 to 584 ms on 2026-10-23 to 30.1 ms. The ordinary spatial processes at 1.05M had no slow
+No text process stalled. The ordinary lag of the text cell fell from 153 to 182 ms at 1.05M
+on 2026-10-23 to 6.3 to 30.1 ms, and from 156 to 584 ms at 10.5M to 3.7 to 6.4 ms. The
+grouped readers' paired p50 ratio of 1.001 at 1.05M and p99 ratio of 1.008 at 10.5M are
+within the gate and the spread of the runs, and [roadmap](ROADMAP.md) item 170 follows them up. The ordinary spatial processes at 1.05M had no slow
 request, but in 36 to 56 of their 86 seconds four queued commit synchronizations took about
 7 ms, so they sustained about 570 transactions/s against the offered 583. The unpaced
 calibration averaged the drive's fast and slow states, and [roadmap](ROADMAP.md) item 171

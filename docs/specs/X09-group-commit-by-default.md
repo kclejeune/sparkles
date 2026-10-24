@@ -1599,8 +1599,11 @@ reopen. The table gives the paired ratios of grouped to ordinary.
 | Spatial at 1.05M | 583 | 136.1 to 271.7 and 8.0 to 11.7 | 0.947 | 0.813 | Not established, because every ordinary process missed the 50 ms lag. |
 | Spatial at 10.5M | 444 | 3.5 to 12.3 and 4.0 to 8.8 | 0.999 | 0.988 | Met. |
 
-No text process stalled. The longest ordinary lag at 1.05M fell from 150 to 584 ms in the
-campaign of 2026-10-23 to 30.1 ms. The ordinary spatial processes at 1.05M had no slow
+No text process stalled. The ordinary lag of the text cell fell from 153 to 182 ms at 1.05M
+in the campaign of 2026-10-23 to 6.3 to 30.1 ms, and from 156 to 584 ms at 10.5M to 3.7 to
+6.4 ms. The grouped readers' paired p50 ratio of 1.001 at 1.05M and p99 ratio of 1.008 at
+10.5M are within the 10% gate and the spread of the runs, and [ROADMAP](../ROADMAP.md) item
+170 follows them up. The ordinary spatial processes at 1.05M had no slow
 request either, with a longest write of 16.6 to 26.8 ms. In 36 to 56 of their 86 seconds,
 however, their write p90 was about 7 ms, the time of four commit synchronizations queued
 behind each other, and in the other seconds it was about 2 ms. No grouped process had such a
