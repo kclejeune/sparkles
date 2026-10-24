@@ -163,7 +163,7 @@ panel below it has more workflows and detail views.
   </tr>
   <tr>
     <td><img src="docs/images/explore-facets.png" alt="The resource explorer with the Facets panel beside a person's graph, brushing an age range on a histogram and one employer on a bar list, so that the other facets count the 41 people under both brushes and the drawn people outside them are dimmed"></td>
-    <td><img src="docs/images/embedding-map.png" alt="The embedding map of 6,000 freight shipments projected from 64-dimensional vectors to two dimensions and coloured by cargo class, with the legend counting each class and a lasso around one cluster whose 1,054 shipments form the shared selection, ready for Use in query or Open as graph"></td>
+    <td><img src="docs/images/embedding-map.png" alt="The embedding map of 6,000 freight shipments projected from 64-dimensional vectors to two dimensions and coloured by cargo class, with the legend counting each class and a lasso around one cluster whose 1,171 shipments form the shared selection, ready for Use in query or Open as graph"></td>
   </tr>
   <tr>
     <td>Facet histograms whose brushes filter the graph</td>

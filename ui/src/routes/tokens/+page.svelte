@@ -91,8 +91,8 @@
 
 <svelte:head><title>API tokens | Sparkles</title></svelte:head>
 
-<div class="page page-container">
-  <header class="head">
+<div class="page-container">
+  <header class="page-head">
     <div>
       <h1>API tokens</h1>
       <p class="muted">
@@ -203,23 +203,6 @@
 </Modal>
 
 <style>
-  .page {
-    padding: 20px 24px 40px;
-    gap: 16px;
-  }
-  .head {
-    display: flex;
-    align-items: flex-start;
-    gap: 8px;
-    flex-wrap: wrap;
-  }
-  h1 {
-    margin: 0 0 4px;
-    font-size: 20px;
-  }
-  .head p {
-    margin: 0;
-  }
   .check {
     display: flex;
     align-items: center;
