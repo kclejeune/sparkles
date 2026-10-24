@@ -525,9 +525,14 @@ GraphView gained one optional `validation` prop with the badges, the marked elem
 the click handler, and TimeSlider an `onplaying` callback.
 
 Nothing in Phase 4 changes an on-disk format. The overlay sends one small probe when a
-graph opens and then one request per 500 drawn nodes, so no benchmark covers it. A14 at
-10 million triples was not measured. Per node, a validation reads the node's own triples
-through the indexes, so its cost does not grow with the dataset.
+graph opens and then one request per 500 drawn nodes, so no benchmark covers it. A14 was
+measured on atlas, an x86_64 host with 20 cores, with a release build. The dataset was
+`scripts/gen-data.py` with one million people, 10.5 million triples, and a warn guard of
+four property shapes on `ex:Employee`, one of which fails for most people. Three
+`POST /{ds}/shacl?shapes=guard` requests of 500 `target` nodes each took 37 to 48 ms in
+all over three rounds and reported 928 results. That is well inside the two seconds A14
+allows. Per node, a validation reads the node's own triples through the indexes, so its
+cost does not grow with the dataset.
 
 **Decisions taken where the spec left them open.**
 
