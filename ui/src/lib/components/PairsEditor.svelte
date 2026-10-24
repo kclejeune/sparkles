@@ -33,19 +33,29 @@
   let addError = $state<string | null>(null);
   const what = $derived(def.keyLabel ?? 'name');
 
-  /** Why a row's new name was refused, by row. */
-  let renameError = $state<Record<number, string>>({});
+  /** Why a rename was refused, by the name the row keeps. */
+  let renameError = $state<Record<string, string>>({});
+  // any change of the value, from this editor or from outside, starts without them
+  $effect(() => {
+    void value;
+    renameError = {};
+  });
 
-  function rename(i: number, to: string) {
+  /** Rename row `i`, or refuse and put its name back in `input`. */
+  function rename(i: number, to: string, input: HTMLInputElement) {
+    const from = pairs[i][0];
+    if (to === from) return;
     const clash = pairs.find(([n], j) => j !== i && n.toLowerCase() === to.toLowerCase());
     if (!to || clash) {
+      input.value = from;
       renameError = {
         ...renameError,
-        [i]: to ? `${clash![0]} is set already` : `A ${what} needs a name`,
+        [from]: to
+          ? `${clash![0]} is set already, so ${from} keeps its name`
+          : `A ${what} needs a name, so ${from} keeps its name`,
       };
       return;
     }
-    renameError = Object.fromEntries(Object.entries(renameError).filter(([j]) => Number(j) !== i));
     const next: JsonObject = {};
     pairs.forEach(([n, v], j) => (next[j === i ? to : n] = v));
     onchange(next);
@@ -76,7 +86,7 @@
   {:else}
     <ul class="rows" aria-label={def.label}>
       {#each pairs as [n, v], i (i)}
-        {@const e = renameError[i] ?? errors[pathString([n])]}
+        {@const e = renameError[n] ?? errors[pathString([n])]}
         <li>
           <div class="row">
             <input
@@ -85,7 +95,7 @@
               {disabled}
               aria-label="{def.label} {what} {i + 1}"
               aria-invalid={e ? 'true' : undefined}
-              onchange={(ev) => rename(i, ev.currentTarget.value.trim())}
+              onchange={(ev) => rename(i, ev.currentTarget.value.trim(), ev.currentTarget)}
             />
             <input
               class="input mono"

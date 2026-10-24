@@ -143,10 +143,13 @@ test('a server refusal shows beside the field it names', async ({ page }) => {
   await headers.getByRole('button', { name: 'Add', exact: true }).click();
   await headers.getByLabel('Headers header 2').fill('x-team');
   await headers.getByLabel('Headers header 2').press('Tab');
-  await expect(headers.getByText('X-Team is set already')).toBeVisible();
+  await expect(headers.getByText('X-Team is set already, so X-Other keeps its name')).toBeVisible();
+  await expect(headers.getByLabel('Headers header 2')).toHaveValue('X-Other');
   await expect(headers.getByLabel('Value of X-Team')).toHaveValue('search');
   await expect(headers.getByLabel('Value of X-Other')).toHaveValue('b');
+  // the error goes with the next change, and does not move to another row
   await headers.getByRole('button', { name: 'Remove X-Other' }).click();
+  await expect(headers.getByText('is set already')).toHaveCount(0);
 
   // a role entry the server refuses names its row
   const draft = row('roles.draft');
