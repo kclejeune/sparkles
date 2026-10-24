@@ -659,7 +659,7 @@ Phase 3 shipped the server prerequisite of §3.3, `POST /$/reason/{ds}/explain` 
 mode over a materialized closure and over RDFS on read, and the Why? panel of §2.4 with
 **Show on graph**, **Next**, **Expand** and the stale note. Open question 1 is settled in
 favour of building the search before F17. With this phase every part of
-[ROADMAP](../ROADMAP.md) item 105 has shipped, and items 135 to 138 carry what it left out.
+[ROADMAP](../ROADMAP.md) item 105 has shipped, and items 135 to 139 carry what it left out.
 
 **What was built in the engine.** `crates/sparkles-reasoner/src/explain.rs` reads the
 closure as the input graphs plus the inferred graph through one masked snapshot, and walks
@@ -732,6 +732,10 @@ rules by iterative deepening, so the mock suites run the panel.
   triple excluded, so no tree derives its triple from itself through another top rule.
 - *Sharing.* A repeated fact is shared by `id` within one tree only, so the panel shows
   each tree on its own, and ids stay unique across the answer.
+- *RDFS on read limits.* Every schema neighbour the search visits counts as one of its
+  100,000 reads, so a very wide hierarchy meets the limit and the request's controls as
+  the rows stream. A subclass or subproperty fact of the schema's closure is explained on
+  its own, which is what **Expand** asks for when a chain is cut at the depth limit.
 - *Past states.* The route explains the latest inferences only. While the time slider
   shows a past commit, the panel says so instead of loading a tree, and the premises it
   marked are cleared.
@@ -749,7 +753,10 @@ found and answers `404`, which item 136 covers. A tree leaves out the builtins a
 bindings of the rule that fired, which item 137 adds. The RDFS on read schema that a
 search needs is built, as for a query, without the request's timeout or cancellation,
 which are checked before and after it, and item 138 makes that build interruptible. A
-schema the caller cannot read is not built. The search reads only what the caller
+schema the caller cannot read is not built, though a triple a readable graph asserts is
+still its own answer. When a dataset has both materialized inferences and RDFS on read, a
+derivation that needs both, such as an RDFS subclass over a materialized type, is not
+found, and item 139 joins the two. The search reads only what the caller
 reads, so its answer and its time cannot tell a hidden derivation from none. `whyNot` answers `501` until F18 Phase 1.
 
 **What F18 can build on.** The answer types and `finish` are F18 §2.1's `Derivation` with
