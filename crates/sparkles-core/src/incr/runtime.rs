@@ -93,6 +93,11 @@ pub trait Host: Send + Sync {
     }
     /// The text of the current version of stored query `name` (C16).
     fn stored_query(&self, name: &str) -> Result<String>;
+    /// A number that changes when principals' access may have changed (a policy
+    /// reload): the views then resolve their principals again.
+    fn epoch(&self) -> u64 {
+        0
+    }
 }
 
 /// A host without access control: every principal reads every quad, and stored
@@ -333,7 +338,7 @@ pub struct RuntimeStats {
 
 /// The views and live queries of one dataset.
 pub struct Runtime {
-    opts: RuntimeOptions,
+    opts: RwLock<RuntimeOptions>,
     root: Option<PathBuf>,
     dataset: uuid::Uuid,
     host: RwLock<Option<Arc<dyn Host>>>,
@@ -348,6 +353,10 @@ pub struct Runtime {
     counters: Counters,
     last_checkpoint: Mutex<Instant>,
     closed: AtomicBool,
+    /// the host's epoch the attached views resolved their principals under
+    host_epoch: AtomicU64,
+    /// the worker holds the dataset for a round
+    busy: AtomicBool,
 }
 
 impl std::fmt::Debug for Runtime {
@@ -491,7 +500,7 @@ impl Runtime {
             }
         }
         Arc::new(Runtime {
-            opts,
+            opts: RwLock::new(opts),
             root,
             dataset,
             host: RwLock::new(None),
@@ -505,11 +514,18 @@ impl Runtime {
             counters: Counters::default(),
             last_checkpoint: Mutex::new(Instant::now()),
             closed: AtomicBool::new(false),
+            host_epoch: AtomicU64::new(0),
+            busy: AtomicBool::new(false),
         })
     }
 
-    pub fn options(&self) -> &RuntimeOptions {
-        &self.opts
+    pub fn options(&self) -> RuntimeOptions {
+        self.opts.read().clone()
+    }
+
+    /// Change the settings; circuits keep their budgets until they are built again.
+    pub fn set_options(&self, opts: RuntimeOptions) {
+        *self.opts.write() = opts;
     }
 
     /// Set how principals, prefixes and stored queries resolve. Views attach on the
@@ -707,10 +723,21 @@ impl Runtime {
     }
 
     fn attach_pending(&self, store: &Store) {
-        if !self.has_host() {
+        let Some(host) = self.host.read().clone() else {
             return;
-        }
+        };
         let mut reg = self.reg.lock();
+        let epoch = host.epoch();
+        if self.host_epoch.swap(epoch, Ordering::AcqRel) != epoch {
+            // grants may have changed: resolve every view's principal again
+            for e in reg.views.values_mut() {
+                e.error = None;
+                if let Some(c) = e.cell.take() {
+                    let mut st = c.state.lock();
+                    st.views = st.views.saturating_sub(1);
+                }
+            }
+        }
         let pending: Vec<String> = reg
             .views
             .iter()
@@ -763,7 +790,7 @@ impl Runtime {
         self.gc();
         if self.root.is_some() {
             let due = self.last_checkpoint.lock().elapsed()
-                >= Duration::from_secs(self.opts.checkpoint_seconds);
+                >= Duration::from_secs(self.opts.read().checkpoint_seconds);
             if due {
                 self.checkpoint(store);
             }
@@ -775,7 +802,7 @@ impl Runtime {
 
     fn control(&self) -> Control {
         Control {
-            deadline: Some(Instant::now() + self.opts.pass_timeout),
+            deadline: Some(Instant::now() + self.opts.read().pass_timeout),
             ..Control::none()
         }
     }
@@ -885,7 +912,7 @@ impl Runtime {
             Ok(Advance::Skipped) => {
                 self.note_pass(cell, st, took, true);
                 let to = st.circuit.applied;
-                let max = self.opts.history_commits;
+                let max = self.opts.read().history_commits;
                 st.remember(from, to, Arc::from(Vec::new()), max);
             }
             Ok(Advance::Changed(c)) => {
@@ -948,7 +975,7 @@ impl Runtime {
             return;
         }
         let to = st.circuit.applied;
-        let max = self.opts.history_commits;
+        let max = self.opts.read().history_commits;
         let event = if st.circuit.kind == Kind::Ask {
             let delta: i64 = c.iter().map(|x| x.1).sum();
             let now = st.circuit.result.total();
@@ -961,7 +988,7 @@ impl Runtime {
                 from,
                 value: now > 0,
             }
-        } else if reset && c.len() > self.opts.reset_rows {
+        } else if reset && c.len() > self.opts.read().reset_rows {
             st.history.clear();
             st.history_rows = 0;
             st.event(true)
@@ -990,7 +1017,7 @@ impl Runtime {
             .filter_map(|e| e.cell.as_ref())
             .map(|c| c.info.lock().bytes)
             .sum();
-        let pool = self.opts.views_memory;
+        let pool = self.opts.read().views_memory;
         for (cell, bytes) in cells {
             let names: Vec<String> = reg
                 .views
@@ -1141,8 +1168,14 @@ impl Runtime {
                 }
                 commits.borrow_and_update();
                 {
-                    let Some(s) = store() else { return };
+                    runtime.busy.store(true, Ordering::Release);
+                    let Some(s) = store() else {
+                        runtime.busy.store(false, Ordering::Release);
+                        return;
+                    };
                     runtime.round(&s);
+                    drop(s);
+                    runtime.busy.store(false, Ordering::Release);
                 }
                 drop(runtime);
                 let gone = exec.block_on(async {
@@ -1164,6 +1197,18 @@ impl Runtime {
                 }
             }
         })
+    }
+
+    /// Whether the worker holds the dataset for a round.
+    pub fn worker_busy(&self) -> bool {
+        self.busy.load(Ordering::Acquire)
+    }
+
+    /// Run a round on the worker and wait for it, at most `timeout`: views defined in
+    /// the dataset are then attached and recovered.
+    pub fn settle(&self, timeout: Duration) {
+        self.kick();
+        self.wait_round(Instant::now() + timeout);
     }
 
     /// Wait until a round has finished after this call, at most until `until`.
@@ -1393,7 +1438,7 @@ impl Runtime {
 
     /// The rows of view `name` (spec F13 §2.2).
     pub fn read(&self, r: &ViewRead<'_>) -> Result<ViewRows> {
-        let wait = Instant::now() + self.opts.view_wait;
+        let wait = Instant::now() + self.opts.read().view_wait;
         let until = r.deadline.map_or(wait, |d| d.min(wait));
         loop {
             let (cell, access, suspended, error) = {
@@ -1487,13 +1532,13 @@ impl Runtime {
             return Err(super::compile::not_incremental("DESCRIBE"));
         }
         // the limits
-        if self.live_total.fetch_add(1, Ordering::AcqRel) >= self.opts.max_live {
+        if self.live_total.fetch_add(1, Ordering::AcqRel) >= self.opts.read().max_live {
             self.live_total.fetch_sub(1, Ordering::AcqRel);
             return Err(super::error(
                 "too-many-live-queries",
                 format!(
                     "the server runs its limit of {} live queries",
-                    self.opts.max_live
+                    self.opts.read().max_live
                 ),
             ));
         }
@@ -1504,19 +1549,21 @@ impl Runtime {
         if let Some(p) = &o.principal {
             let mut m = self.live_by.lock();
             let n = m.entry(p.clone()).or_insert(0);
-            if *n >= self.opts.max_live_per_principal {
+            if *n >= self.opts.read().max_live_per_principal {
                 return Err(super::error(
                     "too-many-live-queries",
                     format!(
                         "{p} runs its limit of {} live queries",
-                        self.opts.max_live_per_principal
+                        self.opts.read().max_live_per_principal
                     ),
                 ));
             }
             *n += 1;
             count.principal = Some((self.live_by.clone(), p.clone()));
         }
-        let budget = o.max_memory_bytes.unwrap_or(self.opts.live_memory_bytes);
+        let budget = o
+            .max_memory_bytes
+            .unwrap_or(self.opts.read().live_memory_bytes);
         let (cell, _) = {
             let mut reg = self.reg.lock();
             if self.is_closed() {
