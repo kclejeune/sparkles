@@ -808,6 +808,12 @@ class Server:
             "MemorySwapMax=0",
             "-p",
             "TimeoutStopSec=30s",
+            # a user service does not inherit this environment; pass a log filter on
+            *(
+                ["--setenv=RUST_LOG=" + os.environ["RUST_LOG"]]
+                if os.environ.get("RUST_LOG")
+                else []
+            ),
             "taskset",
             "-c",
             args.server_cpus,
@@ -1672,6 +1678,7 @@ def calibrate_mixed(args, cell, index, triples, requested_rate):
         "unpaced": [],
         "validation": [],
         "common_rate": requested_rate or None,
+        "rate_fraction": args.rate_fraction,
         "achieved_rate_validated": False,
     }
     path = cell / "rate-calibration.json"
@@ -1692,7 +1699,7 @@ def calibrate_mixed(args, cell, index, triples, requested_rate):
             )
             receipt["unpaced"].append(row)
             save(path, receipt)
-        rate = min(row["tps"] for row in receipt["unpaced"]) * 0.8
+        rate = min(row["tps"] for row in receipt["unpaced"]) * args.rate_fraction
         receipt["common_rate"] = rate
         save(path, receipt)
     for grouped in (False, True):
@@ -1750,6 +1757,12 @@ def main():
         default=0,
         help="fixed mixed rate; discover with active readers when zero; always validate both alternatives",
     )
+    p.add_argument(
+        "--rate-fraction",
+        type=float,
+        default=0.8,
+        help="discovered mixed rate as a fraction of the slowest unpaced calibration process",
+    )
     p.add_argument("--port", type=int, default=3986)
     p.add_argument("--provider-port", type=int, default=3987)
     p.add_argument("--server-cpus", default="0-11")
@@ -1767,6 +1780,7 @@ def main():
     assert args.blocks > 0 and min(args.people) > 0
     assert args.serial_changes > 0 and args.writer_changes > 0 and args.warmup >= 0
     assert math.isfinite(args.write_rate) and args.write_rate >= 0
+    assert 0 < args.rate_fraction <= 1
     server_cpus, client_cpus, provider_cpus = map(
         cpu_set, (args.server_cpus, args.client_cpus, args.provider_cpus)
     )
