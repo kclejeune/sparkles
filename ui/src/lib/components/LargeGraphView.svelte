@@ -168,6 +168,8 @@
   }
 
   let near: Set<string> | null = null;
+  /** Whether `near` holds the marks, which dim the paths too, rather than a hover. */
+  let nearMarks = false;
   const markSet = $derived(new Set(marked ?? []));
   /** The path elements of the drawn graph, nodes and edges. */
   let pathCount = 0;
@@ -181,11 +183,20 @@
     const k = hovered ?? selected;
     // marked nodes stand out on their own while nothing is hovered
     const marks = (marked ?? []).filter((m) => graph?.hasNode(m));
-    if (!hovered && (marks.length || (dimEmpty && marked && !marked.length))) {
+    // with dimEmpty, marks of which none is drawn dim the whole graph
+    if (!hovered && (marks.length || (dimEmpty && marked))) {
       near = new Set(marks);
+      nearMarks = true;
       if (selected && graph?.hasNode(selected)) near.add(selected);
     } else {
       near = k && graph?.hasNode(k) ? neighbours(k) : null;
+      nearMarks = false;
+    }
+    // for the tests: the canvas has no elements to find
+    if (overlay) {
+      overlay.dataset.near = near ? String(near.size) : '';
+      overlay.dataset.nearMarks = String(nearMarks);
+      overlay.dataset.selected = selected ?? '';
     }
     renderer?.refresh({ skipIndexation: true });
   }
@@ -456,7 +467,10 @@
           }
           if (pathCount) {
             const on = onPath(data.paths as number[] | undefined);
-            if (on) {
+            if (on && nearMarks && near && !near.has(key)) {
+              // a path node outside the selection stays dimmed, as on the canvas
+              res.zIndex = 1;
+            } else if (on) {
               res.forceLabel = true;
               res.zIndex = 3;
               res.color = data.color as string;
@@ -476,7 +490,17 @@
             res.hidden = true;
             return res;
           }
+          const outside = (() => {
+            if (!nearMarks || !near || !graph) return false;
+            const [s, t] = graph.extremities(key);
+            return !(near.has(s) && near.has(t));
+          })();
           if (pathCount) {
+            if (onPath(data.paths as number[] | undefined) && outside) {
+              res.color = colors.edge;
+              res.zIndex = 1;
+              return res;
+            }
             if (onPath(data.paths as number[] | undefined)) {
               res.color = colors.spark;
               res.size = Math.max(2.5, (data.size as number) ?? 1);

@@ -1744,6 +1744,28 @@
       : null,
   );
 
+  /**
+   * What the WebGL view marks: the lens's pick and the shared selection together, so that
+   * an active selection narrows the lens's marks rather than giving way to them.
+   */
+  const largeMarked = $derived.by(() => {
+    if (!selection.active) return lensMarked ?? null;
+    if (!lensMarked) return [...selection.ids];
+    return lensMarked.filter((k) => selection.has(k));
+  });
+
+  // a node clicked in the WebGL view stops being its selection once the shared selection
+  // changes without it, as after Clear or a brush
+  let lastSelectionIds: ReadonlySet<string> | null = null;
+  $effect(() => {
+    const ids = selection.ids;
+    if (ids === lastSelectionIds) return;
+    lastSelectionIds = ids;
+    untrack(() => {
+      if (largeSelected && !ids.has(largeSelected)) largeSelected = null;
+    });
+  });
+
   /** The IRIs of the facets' column in the rows the result holds, which the brushes select. */
   const facetDrawn = $derived.by(() => {
     const r = outcome?.result;
@@ -3319,7 +3341,7 @@
 
       {#if outcome.result && ['table', 'graph', 'map', 'facets'].includes(outcome.view)}
         <SelectionBar
-          onuse={useSelection}
+          onuse={resultVars.length ? useSelection : undefined}
           vars={resultVars}
           bind:usevar={useVar}
           onvarpick={() => (useVarPicked = true)}
@@ -3730,8 +3752,8 @@
                       onopen={(k) => (largeSelected = k)}
                       onfail={(reason) => (webglReason = reason)}
                       lens={lenses.encoding}
-                      marked={lensMarked ?? (selection.active ? [...selection.ids] : null)}
-                      dimEmpty={lensMarked == null && selection.active}
+                      marked={largeMarked}
+                      dimEmpty={selection.active}
                     />
                   {:else}
                     <GraphView

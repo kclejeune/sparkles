@@ -273,6 +273,69 @@ test('a selection on a result map reaches its graph and becomes a VALUES block w
   await expect(bar).toHaveCount(0);
 });
 
+async function runWorld(page: Page, query: string) {
+  await page.addInitScript(() => localStorage.setItem('sparkles.dataset', 'world'));
+  await page.goto('/ui/query');
+  const editor = page.locator('.cm-content');
+  await editor.click();
+  await page.keyboard.press('ControlOrMeta+a');
+  await page.keyboard.insertText(`${PREFIXES}${query}`);
+  await page.getByRole('button', { name: /^Run\b/ }).click();
+  const results = page.getByRole('region', { name: 'Results' });
+  await expect(results.getByRole('grid').or(results.locator('.gcanvas'))).toBeVisible();
+  return results;
+}
+
+test('a selection of entities the WebGL view does not draw dims all of it', async ({ page }) => {
+  // the graph draws the cities of ?c1 and ?c2, while the facets count ?person
+  const results = await runWorld(
+    page,
+    'SELECT ?c1 ?c2 ?k ?person WHERE { ?person a ex:Person ; ex:livesIn ?c1 . BIND(?c1 AS ?c2) BIND(1 AS ?k) }',
+  );
+  await results.getByRole('tab', { name: 'Facets' }).click();
+  const panel = page.getByTestId('facet-panel');
+  await panel.getByRole('combobox', { name: /variable whose values/ }).selectOption('person');
+  await expect(panel.getByRole('heading', { name: /41 values of \?person/ })).toBeVisible();
+  await facet(panel, 'worksFor')
+    .getByRole('button', { name: /Meridian Logistics/ })
+    .click();
+  const bar = page.getByRole('region', { name: 'Selection' });
+  await expect(bar).toContainText('24 selected by the facets');
+  await results.getByRole('tab', { name: 'Graph' }).click();
+  await page.getByRole('combobox', { name: 'Renderer' }).selectOption('webgl');
+  const overlay = page.locator('.lg-overlay');
+  await expect(overlay).toHaveAttribute('data-near-marks', 'true');
+  await expect(overlay).toHaveAttribute('data-near', '0');
+});
+
+test("Clear ends the WebGL view's own selection", async ({ page }) => {
+  const results = await runWorld(
+    page,
+    'SELECT ?person ?city WHERE { ?person a ex:Person ; ex:livesIn ?city }',
+  );
+  await results.getByRole('tab', { name: 'Graph' }).click();
+  await page.getByRole('combobox', { name: 'Renderer' }).selectOption('webgl');
+  const overlay = page.locator('.lg-overlay');
+  await expect(overlay).toHaveAttribute('data-selected', '');
+  // a node picked in the list of drawn nodes is the view's selection
+  await page.getByRole('button', { name: 'List' }).click();
+  await page.getByRole('table', { name: 'Drawn nodes' }).locator('button.name').first().click();
+  await page.getByRole('button', { name: 'List' }).click();
+  await expect(overlay).not.toHaveAttribute('data-selected', '');
+  // a selection made on the map, then cleared, takes it away
+  await results.getByRole('tab', { name: 'Map' }).click();
+  const arcmap = page.locator('.arcmap');
+  await expect(arcmap).toHaveAttribute('data-loading', 'false');
+  await arcmap.locator('details.list summary').click();
+  await arcmap.getByRole('list', { name: 'Markers in view' }).getByRole('button').first().click();
+  const bar = page.getByRole('region', { name: 'Selection' });
+  await expect(bar).toContainText('selected by the map');
+  await bar.getByRole('button', { name: 'Clear' }).click();
+  await results.getByRole('tab', { name: 'Graph' }).click();
+  await expect(page.locator('.lg-overlay')).toHaveAttribute('data-selected', '');
+  await expect(page.locator('.lg-overlay')).toHaveAttribute('data-near', '');
+});
+
 test('a set without literal properties says so', async ({ page }) => {
   await page.goto(`/ui/explore?ds=world&iri=${encodeURIComponent(`${WORLD}dubai`)}`);
   await expect(page.getByText(/\d+ nodes, \d+ edges/)).toBeVisible();
