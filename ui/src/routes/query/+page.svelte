@@ -1712,7 +1712,28 @@
     if (!untrack(() => useVarPicked) || !resultVars.includes(untrack(() => useVar))) useVar = v;
   });
   let facetVar = $state('');
-  const facetVarShown = $derived(resultVars.includes(facetVar) ? facetVar : selectionVar);
+  /**
+   * The facets' default column: the one with the most IRIs. It reads the result alone and
+   * never the selection, since the selection the brushes make would otherwise move the
+   * facets to another column and reset the brushes.
+   */
+  const facetDefault = $derived.by(() => {
+    const r = outcome?.result;
+    const vars = resultVars;
+    if (!r || !vars.length) return '';
+    const rows = (r.rows ?? []).slice(0, 2000);
+    let best = vars[0];
+    let most = -1;
+    vars.forEach((v, i) => {
+      const n = rows.filter((row) => row[i]?.type === 'uri').length;
+      if (n > most) {
+        most = n;
+        best = v;
+      }
+    });
+    return best;
+  });
+  const facetVarShown = $derived(resultVars.includes(facetVar) ? facetVar : facetDefault);
   const facetWithin = $derived(
     outcome?.view === 'facets' && outcome.query && facetVarShown
       ? { query: outcome.query, variable: facetVarShown }

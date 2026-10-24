@@ -280,20 +280,23 @@ export function brushRefusal(p: PatternOk, v: string): string | null {
   const bound = p.root.items.some((it) => {
     if (it.type === 'triple')
       return [it.s, it.p, it.o].some((t) => t.kind === 'var' && t.value === v);
-    if (it.type === 'locked') return (it.binds ?? []).includes(v);
     return it.type === 'group' && it.kind === 'group' && patternVarsOf(it).includes(v);
   });
-  if (!bound) return `Apply to query needs ?${v} bound by the WHERE group, outside OPTIONAL`;
+  if (!bound)
+    return `Apply to query needs ?${v} bound by a triple of the WHERE group, outside OPTIONAL`;
   return null;
 }
 
-/** The variables the triples of a nested plain group bind. */
+/**
+ * The variables the triples of a nested plain group bind. A locked block such as an
+ * `OPTIONAL`, a subquery, `BIND` or `VALUES` may leave its variables unbound in some rows,
+ * where the brush's triple would bind them to other entities, so only triples count.
+ */
 function patternVarsOf(g: Group): string[] {
   const out: string[] = [];
   for (const it of g.items) {
     if (it.type === 'triple')
       for (const t of [it.s, it.p, it.o]) if (t.kind === 'var') out.push(t.value);
-    if (it.type === 'locked') out.push(...(it.binds ?? []));
     if (it.type === 'group' && it.kind === 'group') out.push(...patternVarsOf(it));
   }
   return out;

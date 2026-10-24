@@ -566,7 +566,9 @@ query** opens a new Query tab with a query for the set, a triple and a `FILTER` 
 and the labels. `&facets=1` in the address keeps the panel open, and `Shift+F` toggles it.
 
 **The query page.** A `SELECT` result has a **Facets** tab whose panel counts the values of a
-chosen variable of the query that ran. **Apply to query** edits the editor's text through
+chosen variable of the query that ran. The default is the column with the most IRIs,
+read from the result alone, so the selection that the brushes make never moves the facets
+to another column. **Apply to query** edits the editor's text through
 U08's edits, an `add-many` of one triple per brush followed by a `filter-add` per brush,
 made one after another with a parse between them. Each step must parse strictly and pass
 U08's R3 check, or nothing is changed, and the composed change goes to the editor as one
@@ -574,8 +576,9 @@ undoable edit. A new variable takes the property's local name and a number when 
 variable token of the text has that name, including those that only a filter or a modifier
 names. A brush written inside the `WHERE` group filters before the query's own result
 boundary, so **Apply to query** refuses a query with `LIMIT`, `OFFSET`, `GROUP BY` or
-`HAVING`, and a variable that the `WHERE` group does not bind outside `OPTIONAL`, and says
-why. The editor's text and tab are read again after the parser loads, and a change made
+`HAVING`, and a variable that no triple of the `WHERE` group binds, and says why. A
+variable bound only inside an `OPTIONAL`, a subquery, `BIND` or `VALUES` may be unbound in
+some rows, where the brush's triple would bind it to other entities. The editor's text and tab are read again after the parser loads, and a change made
 in between cancels the edit. The panel reads with the result's `reasoning=false` when the
 result was read without inferences. The result entities of the chosen variable that every
 brush keeps become the shared selection, so the graph and map tabs dim the rest. A brush

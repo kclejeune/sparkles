@@ -275,21 +275,23 @@ ORDER BY ?person
       refused(`${P}SELECT ?s (COUNT(?o) AS ?n) WHERE { ?s ex:p ?o } GROUP BY ?s`, 's'),
     ).toThrow(/GROUP BY/);
     expect(refused(`${P}SELECT ?s ?o WHERE { ?s a ex:T OPTIONAL { ?s ex:p ?o } }`, 'o')).toThrow(
-      /bound by the WHERE group/,
+      /bound by a triple/,
     );
-    expect(refused(`${P}SELECT (?s AS ?t) WHERE { ?s a ex:T }`, 't')).toThrow(
-      /bound by the WHERE group/,
-    );
+    expect(refused(`${P}SELECT (?s AS ?t) WHERE { ?s a ex:T }`, 't')).toThrow(/bound by a triple/);
     expect(refused(`${P}ASK { ?s a ex:T }`, 's')).toThrow(/SELECT/);
-    // a variable a subquery or a nested group binds is fine
+    // a locked OPTIONAL, which may leave the variable unbound, and a subquery are refused
     expect(
-      brushEdits(
-        `${P}SELECT ?s WHERE { { SELECT ?s WHERE { ?s a ex:T } } }`,
-        ok(`${P}SELECT ?s WHERE { { SELECT ?s WHERE { ?s a ex:T } } }`),
-        's',
-        b,
-      ).length,
-    ).toBe(2);
+      refused(
+        `${P}SELECT ?s ?who WHERE { ?s a ex:T OPTIONAL { ?s ex:who ?who BIND(1 AS ?x) } }`,
+        'who',
+      ),
+    ).toThrow(/bound by a triple/);
+    expect(refused(`${P}SELECT ?s WHERE { { SELECT ?s WHERE { ?s a ex:T } } }`, 's')).toThrow(
+      /bound by a triple/,
+    );
+    // a variable a triple of the WHERE group binds is fine
+    const nested = `${P}SELECT ?s WHERE { ?s a ex:T OPTIONAL { ?s ex:p ?o } }`;
+    expect(brushEdits(nested, ok(nested), 's', b).length).toBe(2);
   });
 
   it('writes the selection as a VALUES block first in the WHERE group', () => {

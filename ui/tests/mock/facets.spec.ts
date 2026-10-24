@@ -194,6 +194,35 @@ test('A5 on the query page: the facets of a variable, Apply to query, and the co
   await expect(results.getByRole('tab', { name: /Table/ })).toContainText(String(matching));
 });
 
+test('the selection the brushes make never moves the facets to another column', async ({
+  page,
+}) => {
+  // every row's ?q is Amira, so once a brush keeps her the ?q column holds the most
+  // selected entities, yet the facets stay on ?p and keep their brush
+  await page.addInitScript(() => localStorage.setItem('sparkles.dataset', 'world'));
+  await page.goto('/ui/query');
+  const editor = page.locator('.cm-content');
+  await editor.click();
+  await page.keyboard.press('ControlOrMeta+a');
+  await page.keyboard.insertText(
+    `${PREFIXES}SELECT ?p ?q WHERE { ?p a ex:Person . BIND(ex:amira-haddad AS ?q) }`,
+  );
+  await page.getByRole('button', { name: /^Run\b/ }).click();
+  const results = page.getByRole('region', { name: 'Results' });
+  await expect(results.getByRole('grid')).toBeVisible();
+  await results.getByRole('tab', { name: 'Facets' }).click();
+  const panel = page.getByTestId('facet-panel');
+  await expect(panel.getByRole('heading', { name: /41 values of \?p/ })).toBeVisible();
+  const works = facet(panel, 'worksFor');
+  await works.getByRole('button', { name: /Meridian Logistics/ }).click();
+  const bar = page.getByRole('region', { name: 'Selection' });
+  await expect(bar).toContainText('24 selected by the facets');
+  await page.waitForTimeout(600);
+  await expect(panel.getByRole('heading', { name: /41 values of \?p/ })).toBeVisible();
+  await expect(panel.getByTestId('facet-count')).toContainText('24 of 41 match');
+  await expect(bar).toContainText('24 selected by the facets');
+});
+
 test('a selection on a result map reaches its graph and becomes a VALUES block with Use in query', async ({
   page,
 }) => {
