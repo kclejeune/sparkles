@@ -96,6 +96,7 @@ These items are cheap or foundational.
 | 15 | **Ingestion of images and audio.** The remaining follow-ups are recorded in C18. | [C18](specs/C18-natural-language-questions-and-ingest.md#roadmap-follow-ups-2026-10-12) | M | Medium–high |
 | 86 | **Group commit for indexed datasets.** The p90 of spatial serial inserts at 10.5M misses its gate. The spatial reader gate at 1.05M is not established, because the ordinary writer missed the schedule lag requirement. Items 111, 112 and 171 follow up. | [X09 section 17](specs/X09-group-commit-by-default.md#17-phase-4-group-commit-for-indexed-datasets) | M–L | Medium–high |
 | 113 | **Small changes and undos over a kept closure.** Changes of 100 triples at 16 threads and undos at 1 thread remain slower than before the F16 follow-up, and a profile of the full run should find or rule out a cost of about 5%. The options are an opt-in in-memory index of the input facts, charged to the memory budget, and per-thread counters in the block cache. | [F16](specs/F16-materialization-at-scale.md#roadmap-follow-ups-2026-10-18) | M | Low |
+| 67 | **MCP OAuth.** Standard MCP clients need OAuth discovery to connect to `/$/mcp` and its agent-memory tools without a hand-supplied token. What remains is RFC 9728 protected-resource metadata, audiences bound to the resource, and scope challenges. | [C11](specs/C11-mcp-server.md#roadmap-follow-ups-2026-10-12) | S–M | High |
 
 ### Remaining work for item 7
 
@@ -282,7 +283,6 @@ early.
 | 64 | **Startup resilience.** Binding the listener before datasets open, and degraded startup when a dataset fails to open. | [C01](specs/C01-observability-and-budgets.md#roadmap-follow-ups-2026-10-12) | M |
 | 65 | **Encryption.** Key management workflows, Vault and cloud KMS, recovery export, and encryption of live datasets and derived indexes. | [F11](specs/F11-encryption-at-rest.md#roadmap-follow-ups-2026-10-12) | L–XL |
 | 66 | **Replication.** Read replicas, preserved primary IDs, promotion, failover, synchronous replication, and a patch log or continuous archive. | [F10](specs/F10-replication.md#roadmap-follow-ups-2026-10-12) | XL |
-| 67 | **MCP OAuth.** RFC 9728 protected-resource metadata, audiences bound to the resource, and scope challenges. | [C11](specs/C11-mcp-server.md#roadmap-follow-ups-2026-10-12) | S–M |
 
 ## Tier 7: compatibility leftovers
 
