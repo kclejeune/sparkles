@@ -44,6 +44,7 @@ import { handleGraphrag } from './graphrag.mjs';
 import { handleAlgo, rewriteService } from './algo.mjs';
 import { handleExplain, timedOutPlan } from './explain.mjs';
 import { handleReview, INGEST_BRANCH } from './review.mjs';
+import { handleReason } from './reason.mjs';
 import { geoQuery, handleGeo } from './geo.mjs';
 import { handleVector, seedVectors, touchPacked, vectorIndexFor } from './vector.mjs';
 import { WORLD, worldTurtle } from './world.mjs';
@@ -2381,6 +2382,17 @@ const server = http.createServer(async (req, res) => {
     // questions, checks and agent memory (mock/memory.mjs)
     if (await handleAsk(req, res, url, seg, { datasets, send, fail, readBody })) return;
     if (await handleExplain(req, res, url, seg, { datasets, send, fail, readBody })) return;
+    // why an inferred triple holds (mock/reason.mjs)
+    if (
+      await handleReason(req, res, seg, {
+        datasets,
+        send,
+        fail,
+        readBody,
+        headSeq: (d) => headCommit(d).seq,
+      })
+    )
+      return;
     // the model configuration of a server without one (mock/models.mjs)
     if (handleModels(req, res, seg, { send, fail })) return;
     // the facets of a set (mock/facets.mjs)

@@ -78,6 +78,8 @@
     lens = NO_ENCODING,
     marked = null,
     validation = null,
+    onedge,
+    whyMarked = null,
   }: {
     nodes: GNode[];
     edges: GEdge[];
@@ -115,6 +117,10 @@
     marked?: string[] | null;
     /** The validation overlay's badges and marks; none when null. */
     validation?: GValidation | null;
+    /** An edge was clicked or tapped, such as an inferred one to explain (U10 §2.4). */
+    onedge?: (id: string) => void;
+    /** The derivation Show on graph drew (U10 §2.4): its nodes and edges stand out. */
+    whyMarked?: { nodes: string[]; edges: string[] } | null;
   } = $props();
 
   let host: HTMLDivElement;
@@ -340,6 +346,26 @@
           'target-arrow-color': cssVar('--danger'),
           width: 2.6,
           'text-opacity': 1,
+        },
+      },
+      {
+        selector: 'node.wmark',
+        style: {
+          'border-color': spark,
+          'border-width': 3,
+          'underlay-color': spark,
+          'underlay-opacity': 0.25,
+          'underlay-padding': 6,
+        },
+      },
+      {
+        selector: 'edge.wmark',
+        style: {
+          'line-color': spark,
+          'target-arrow-color': spark,
+          width: 3,
+          'text-opacity': 1,
+          'font-weight': 600,
         },
       },
       { selector: '.faded', style: { opacity: 0.25 } },
@@ -760,6 +786,7 @@
       }
     });
     cy.on('tap', 'node', (e) => onselect?.(e.target.id()));
+    cy.on('tap', 'edge', (e) => onedge?.(e.target.id()));
     cy.on('tap', (e) => {
       if (e.target === cy) onselect?.(null);
     });
@@ -931,6 +958,19 @@
       for (const id of [...m.nodes, ...m.edges]) cy!.getElementById(id).addClass('vmark');
     });
     if (wrap) wrap.dataset.vmarked = String(cy.elements('.vmark').length);
+  });
+  // Show on graph: the derivation's nodes and edges
+  $effect(() => {
+    const m = whyMarked;
+    void nodes;
+    void edges;
+    if (!cy) return;
+    cy.batch(() => {
+      cy!.elements('.wmark').removeClass('wmark');
+      if (!m) return;
+      for (const id of [...m.nodes, ...m.edges]) cy!.getElementById(id).addClass('wmark');
+    });
+    if (wrap) wrap.dataset.whymarked = String(cy.elements('.wmark').length);
   });
   onDestroy(() => {
     if (frame) cancelAnimationFrame(frame);
