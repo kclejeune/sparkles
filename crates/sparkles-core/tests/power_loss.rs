@@ -529,6 +529,14 @@ enum Rec {
     },
 }
 
+/// Parse the shim's log. The writer leaves by `exit` while the store's own threads still
+/// run, so the last record can be cut short when the process exits. The shim writes
+/// each record in one critical section, so only the last one can be incomplete, and
+/// it is dropped. The shim logs a
+/// write or a `ftruncate` before its call, which then never ran. It logs the end of a
+/// call and a directory operation after the call, and since no record follows, no
+/// synchronization that returned covers what the cut record describes. Dropping it gives
+/// an image the model already allows, one in which the crash lost that operation.
 fn parse_log(buf: &[u8]) -> Vec<Rec> {
     let mut out = Vec::new();
     let mut p = 0;
@@ -542,6 +550,17 @@ fn parse_log(buf: &[u8]) -> Vec<Rec> {
         let path = String::from_utf8_lossy(&buf[p + 4..p + 4 + pl]).to_string();
         let off = u64::from_le_bytes(buf[p + 4 + pl..p + 12 + pl].try_into().unwrap());
         let len = u64::from_le_bytes(buf[p + 12 + pl..p + 20 + pl].try_into().unwrap());
+        let body = if matches!(kind, 1 | 6) {
+            let Ok(body) = usize::try_from(len) else {
+                break;
+            };
+            body
+        } else {
+            0
+        };
+        if body > buf.len() - p - hdr {
+            break;
+        }
         p += hdr;
         out.push(match kind {
             1 => {
@@ -576,6 +595,57 @@ fn parse_log(buf: &[u8]) -> Vec<Rec> {
         });
     }
     out
+}
+
+/// A log whose last record the writer's exit cut short parses to the records before it,
+/// wherever the cut falls.
+#[test]
+fn a_cut_last_record_is_dropped() {
+    fn rec(kind: u8, path: &str, off: u64, len: u64, data: &[u8]) -> Vec<u8> {
+        let mut b = vec![kind, 0];
+        b.extend((path.len() as u16).to_le_bytes());
+        b.extend(path.as_bytes());
+        b.extend(off.to_le_bytes());
+        b.extend(len.to_le_bytes());
+        b.extend(data);
+        b
+    }
+    let mut prefix = rec(4, "/r/db/wal", 0, 0, &[]);
+    prefix.extend(rec(5, "/r/db/wal", 0, 0, &[]));
+    for kind in 1..=8 {
+        let data: &[u8] = match kind {
+            1 => &[7; 9000],
+            6 => b"/r/db/text/new-segment",
+            _ => &[],
+        };
+        let mut log = prefix.clone();
+        log.extend(rec(
+            kind,
+            "/r/db/text/segment",
+            4096,
+            data.len() as u64,
+            data,
+        ));
+        for cut in prefix.len()..log.len() {
+            let recs = parse_log(&log[..cut]);
+            assert_eq!(recs.len(), 2, "record {kind}, cut at {cut}");
+            assert!(matches!(recs[1], Rec::SyncEnd { .. }));
+        }
+        let recs = parse_log(&log);
+        assert_eq!(recs.len(), 3, "complete record {kind}");
+        if kind == 1 {
+            assert!(matches!(&recs[2], Rec::Write { data: parsed, .. } if parsed == data));
+        } else if kind == 6 {
+            assert!(matches!(&recs[2], Rec::Rename { to, .. } if to.as_bytes() == data));
+        }
+    }
+    let mut log = prefix;
+    log.extend(rec(1, "/r/db/text/segment", 0, u64::MAX, &[]));
+    assert_eq!(
+        parse_log(&log).len(),
+        2,
+        "an impossible body length is incomplete"
+    );
 }
 
 #[derive(Clone, Copy, PartialEq)]
