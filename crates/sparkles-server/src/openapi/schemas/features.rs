@@ -126,6 +126,74 @@ fn reasoning(put: &mut dyn FnMut(&str, J)) {
             "reasoning-status-and-diagnostics",
         ),
     );
+    let triple = obj(
+        &["s", "p", "o"],
+        json!({ "s": sref("RdfTerm"), "p": sref("RdfTerm"), "o": sref("RdfTerm") }),
+    );
+    put(
+        "ExplainRequest",
+        doc(
+            obj(
+                &["triple"],
+                json!({
+                    "triple": triple.clone(),
+                    "mode": string_enum(&["why", "whyNot"]),
+                    "source": string_enum(&["materialized"]),
+                    "maxTrees": { "type": "integer", "minimum": 1, "maximum": 10 },
+                    "maxDepth": { "type": "integer", "minimum": 1, "maximum": 64 },
+                    "timeout": { "type": "number", "exclusiveMinimum": 0, "description": "Seconds, 10 by default, capped at `--max-timeout`." },
+                }),
+            ),
+            "The triple to explain and the limits of the search.",
+            "explanations",
+        ),
+    );
+    put(
+        "Derivation",
+        doc(
+            obj(
+                &["id", "triple", "kind", "depth"],
+                json!({
+                    "id": int(),
+                    "triple": triple,
+                    "kind": string_enum(&["asserted", "axiom", "derived", "ref"]),
+                    "depth": int(),
+                    "graph": { "type": "string", "description": "For an asserted node, `default` or the IRI of the graph that holds the triple. Absent for a triple of an RDFS-on-read schema given as a document." },
+                    "rule": obj(&["name", "profile"], json!({
+                        "name": string(),
+                        "profile": string(),
+                        "owl2rl": string(),
+                    })),
+                    "premises": array(sref("Derivation")),
+                    "shared": { "type": "boolean", "description": "The node repeats one given earlier with the same id, without its premises." },
+                }),
+            ),
+            "A node of a derivation tree.",
+            "explanations",
+        ),
+    );
+    put(
+        "Explanation",
+        doc(
+            obj(
+                &["mode", "entailed", "commit", "trees", "more", "source"],
+                json!({
+                    "mode": { "const": "why" },
+                    "entailed": { "const": true },
+                    "commit": { "type": "integer", "description": "The commit the search read." },
+                    "trees": array(sref("Derivation")),
+                    "more": boolean(),
+                    "source": string_enum(&["materialized", "rdfsOnRead"]),
+                    "readAtHead": boolean(),
+                    "stale": nullable("boolean"),
+                    "commitsSince": int(),
+                    "staleReason": string(),
+                }),
+            ),
+            "Derivation trees of a triple, from facts the caller reads.",
+            "explanations",
+        ),
+    );
 }
 
 fn search(put: &mut dyn FnMut(&str, J)) {

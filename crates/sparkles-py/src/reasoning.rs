@@ -160,6 +160,48 @@ impl PyReasoning {
             ))
         }
     }
+    /// Why the dataset entails a triple, given in Turtle with the dataset's prefixes:
+    /// the JSON answer of `POST /$/reason/{ds}/explain`, with `entailed: false` when no
+    /// derivation is found.
+    #[pyo3(signature=(triple,*,max_trees=1,max_depth=32,cancel=None,timeout=None))]
+    fn explain<'py>(
+        &self,
+        py: Python<'py>,
+        triple: String,
+        max_trees: usize,
+        max_depth: u32,
+        cancel: Option<&Bound<'py, PyAny>>,
+        timeout: Option<f64>,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        use sparkles::reasoning::explain as ex;
+        let ds = self.ds(py)?;
+        let r = interrupt::controlled(py, cancel, None, timeout, move |ctl| {
+            if !(1..=ex::MAX_TREES).contains(&max_trees) {
+                return Err(sparkles::Error::invalid(format!(
+                    "max_trees must be from 1 to {}",
+                    ex::MAX_TREES
+                )));
+            }
+            if !(1..=ex::MAX_DEPTH).contains(&max_depth) {
+                return Err(sparkles::Error::invalid(format!(
+                    "max_depth must be from 1 to {}",
+                    ex::MAX_DEPTH
+                )));
+            }
+            let prefixes: Vec<(String, String)> = ds.prefixes().into_iter().collect();
+            let mut req = ex::ExplainRequest::new(ex::triple_from_text(&triple, &prefixes)?);
+            req.max_trees = max_trees;
+            req.max_depth = max_depth;
+            req.timeout = ctl
+                .deadline
+                .map(|d| d.saturating_duration_since(std::time::Instant::now()));
+            req.cancel = Some(ctl.cancel.flag());
+            let e = ds.reasoning().explain(&req)?;
+            ctl.check()?;
+            Ok(ex::explanation_json(&e))
+        })?;
+        admin::to_py(py, &r)
+    }
 }
 #[pymethods]
 impl PyRdfsSetting {

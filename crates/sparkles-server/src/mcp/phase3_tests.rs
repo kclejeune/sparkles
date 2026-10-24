@@ -927,3 +927,46 @@ async fn memory_review_resource() {
     assert_eq!(n["method"], "notifications/resources/updated", "{n}");
     assert_eq!(n["params"]["uri"], uri);
 }
+
+#[cfg(feature = "reasoning")]
+#[tokio::test(flavor = "multi_thread")]
+async fn explain_inference() {
+    const DATA: &str = r#"@prefix ex: <http://ex.org/> .
+@prefix rdfs: <http://www.w3.org/2000/01/rdf-schema#> .
+ex:Cat rdfs:subClassOf ex:Animal . ex:tom a ex:Cat .
+"#;
+    let srv = server_with(&[("t", &[DATA])], McpConfig::default());
+    srv.state
+        .get("t")
+        .unwrap()
+        .dataset
+        .reasoning()
+        .run(&sparkles::reasoning::ReasonRequest::default())
+        .unwrap();
+    let mut c = Client::start(srv);
+    let s = c
+        .structured("explain_inference", json!({"triple": "ex:tom a ex:Animal"}))
+        .await;
+    assert_eq!(s["entailed"], true, "{s}");
+    assert_eq!(s["source"], "materialized");
+    assert_eq!(s["trees"][0]["rule"]["name"], "rdfs9");
+    assert_eq!(
+        s["summaries"][0],
+        "ex:tom a ex:Animal because ex:tom a ex:Cat (asserted) and ex:Cat rdfs:subClassOf ex:Animal (asserted), by rdfs9"
+    );
+    let s = c
+        .structured("explain_inference", json!({"triple": "ex:tom a ex:Plant"}))
+        .await;
+    assert_eq!(s["entailed"], false, "{s}");
+    let (t, _) = c
+        .error(
+            "explain_inference",
+            json!({"triple": "ex:tom a ex:Animal", "mode": "whyNot"}),
+        )
+        .await;
+    assert!(t.contains("whyNot"), "{t}");
+    let (t, _) = c
+        .error("explain_inference", json!({"triple": "ex:tom a"}))
+        .await;
+    assert!(t.contains("does not parse"), "{t}");
+}

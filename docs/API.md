@@ -34,6 +34,7 @@ A machine-readable description of this API is served at `/$/openapi.json`. See
 * [Graph algorithms](#graph-algorithms)
 * [GeoSPARQL](#geosparql)
 * [Reasoning status and diagnostics](#reasoning-status-and-diagnostics)
+* [Explanations](#explanations)
 * [RDFS on read](#rdfs-on-read)
 * [Write-time validation](#write-time-validation)
 * [SHACL validation](#shacl-validation)
@@ -653,6 +654,7 @@ per-dataset form and no concurrency caps. `preauth=off` turns it off.
 | PUT    | `/$/reason/{ds}/auto`        | *Extension.* Sets the dataset's own automatic re-runs with `{ "enabled": boolean, "debounceSeconds"?: number, "maxDelaySeconds"?: number }`. Returns the `ReasoningStatus`. `409` when nothing is recorded, `403` on a read-only server. |
 | DELETE | `/$/reason/{ds}/auto`        | *Extension.* Removes the dataset's own setting, so the server's `--auto-reason` applies again. Returns the `ReasoningStatus`. |
 | GET    | `/$/reason/{ds}/diagnostics` | `DiagnosticsReport`: OWL 2 RL inconsistency checks. |
+| POST   | `/$/reason/{ds}/explain`     | *Extension.* Derivation trees for an inferred triple, from the facts the caller reads. See [Explanations](#explanations). |
 | DELETE | `/$/reason/{ds}`             | Drops materialized inferences. |
 | GET    | `/$/rdfs/{ds}`               | The dataset's RDFS-on-read setting, `{ "enabled": false }` when there is none. See [RDFS on read](#rdfs-on-read). |
 | PUT    | `/$/rdfs/{ds}`               | Sets RDFS on read, like Fuseki's `--rdfs`. The body is `{ "graph": IRI \| "default" }` for a schema graph of the dataset, or a schema document in an RDF syntax given by `Content-Type`. Needs `admin`. `400` for a malformed body, `415` for another content type, `403` on a read-only server. |
@@ -6998,6 +7000,110 @@ Without them, it reads the graphs that the recorded status names. Its fetches us
 local `--outbound-*` policy, which allows private addresses unless
 `--outbound-block-private` is given.
 
+## Explanations
+
+`POST /$/reason/{ds}/explain` answers why the dataset entails a triple, with derivation
+trees over the materialized inferences or over what RDFS on read answers. It needs `read`
+on the dataset, takes the same rate limit class as a query, and reads on a branch with
+`?branch=`. The body names the triple with terms of the SPARQL JSON results format, and a
+blank node by the label a query result gave it.
+
+```json
+{
+  "triple": {
+    "s": { "type": "uri", "value": "http://ex.org/alice" },
+    "p": { "type": "uri", "value": "http://www.w3.org/1999/02/22-rdf-syntax-ns#type" },
+    "o": { "type": "uri", "value": "http://ex.org/Employee" }
+  },
+  "mode": "why",
+  "maxTrees": 5,
+  "maxDepth": 32,
+  "timeout": 10
+}
+```
+
+`maxTrees` asks for up to ten derivations whose top rules differ, one by default.
+`maxDepth`, from 1 to 64 and 32 by default, is the depth of the returned trees, and a
+deeper node is cut as a `ref` node that another request on its triple expands. `timeout`
+is in seconds, ten by default, and `--max-timeout` caps it. `mode: "whyNot"` answers `501`,
+and `source` takes only `"materialized"`.
+
+```json
+{
+  "mode": "why",
+  "entailed": true,
+  "commit": 318,
+  "source": "materialized",
+  "stale": false,
+  "commitsSince": 0,
+  "more": true,
+  "trees": [{
+    "id": 1,
+    "triple": { "s": …, "p": …, "o": … },
+    "kind": "derived",
+    "depth": 2,
+    "rule": { "name": "rdfs9", "profile": "rdfs" },
+    "premises": [
+      { "id": 2, "triple": …, "kind": "derived", "depth": 1,
+        "rule": { "name": "rdfs2", "profile": "rdfs" },
+        "premises": [
+          { "id": 3, "triple": …, "kind": "asserted", "depth": 0, "graph": "http://ex.org/hr" },
+          { "id": 4, "triple": …, "kind": "asserted", "depth": 0, "graph": "http://ex.org/ontology" }
+        ] },
+      { "id": 5, "triple": …, "kind": "asserted", "depth": 0, "graph": "http://ex.org/ontology" }
+    ]
+  }]
+}
+```
+
+A node's `kind` is `asserted` for a triple of an input graph, which `graph` names as
+`default` or an IRI, `axiom` for a triple of a rule with an empty body, `derived` for a
+triple a rule instance derived from its `premises`, and `ref` for a node cut at the depth
+limit. A derived node names its rule, the profile or vocabulary the rule belongs to, and
+for the rules of the `owl-rl` profile the rule's id in the OWL 2 RL tables as `owl2rl`.
+Premises are in the order of the rule's body. A triple that occurs again in the answer
+keeps the `id` it had first, carries `shared: true` and leaves out its premises. Each
+tree's root has an id of its own. `depth` is the depth of the node's derivation, 0 for an
+asserted triple and 1 for an axiom.
+
+The materialized inferences are explained at the commit their run read, which `commit`
+gives, so the trees use the input graphs the closure was computed from. When the store's
+history no longer has that commit, the search reads the head and the answer carries
+`readAtHead: true`. `stale`, `commitsSince` and `staleReason` give the inferences'
+freshness at the head, since a tree explains the closure as its run computed it. The
+search walks back from the triple a level at a time, enumerating the rule instances of the
+facts it reached whose premises are in the closure, and accepts a fact at depth `d` only
+when it is asserted, an axiom, or derived from facts accepted at a smaller depth. A cycle
+of facts that only support each other is never accepted, and the result does not depend on
+the order incremental runs left the closure in. The first tree has the smallest depth
+found, and the others are found within three further levels. A search visits at most
+100,000 rule instances and holds them until it answers, about 10 MB at that limit.
+
+With RDFS on read and no materialized derivation, the trees come from the schema, with
+`source: "rdfsOnRead"` and rules of the profile `rdfs-on-read`. A type comes from `rdfs9`
+over a stored type, or from `rdfs2` or `rdfs3` over the domain or range of the property
+that declares it, as Jena's `MatchRDFS` applies them. A triple of a superproperty comes
+from `rdfs7`. A subclass or subproperty fact that the schema graph holds only through a
+chain is derived by `rdfs11` or `rdfs5` from the chain's facts. A schema given as a
+document has its closed triples as leaves without a `graph`.
+
+The search reads the caller's view. Its leaves are the input graphs and the schema graph
+the caller reads, in a snapshot without the triples the caller's protections hide, and a
+tree is returned only when all its leaves come from what the caller reads. A triple with no
+such derivation answers `404` with code `no-visible-derivation`, the same answer as a triple
+that is not entailed. A search that passes its limits before it finds a tree answers `422`
+with code `reasoning-budget`. A derivation through a generalized fact, such as a literal
+subject, is not found, because the inferred graph does not hold such facts, and neither is
+one of `geo:hasDefaultGeometry`, which the run adds outside the rules.
+
+The library call is `Dataset::reasoning().explain`, and the Python and Node.js bindings
+expose it as `ds.reasoning.explain(triple)` with the triple in Turtle. In the CLI,
+`sparkles infer --loc DB --why '<http://ex.org/tom> a ex:Animal' [--max-trees N]
+[--max-depth N] [--timeout S] [--format text|json]` prints the trees indented, one premise
+per line with its rule or graph. It exits with 1 when no derivation is found and with 2
+when the search passes its limits. The MCP tool `explain_inference` returns the same
+answer with a one-line summary per tree.
+
 ## RDFS on read
 
 The design and its rationale are in
@@ -9520,6 +9626,7 @@ open-world when SERVICE is allowed. The common arguments are:
 | `recall` | `query` (≤ 2000 characters) or `seeds` (≤ 20 IRIs) or both, `types` (≤ 5 class IRIs), `graphs` (≤ 20 IRIs or `default`), `hops` (1, ≤ 2), `seedLimit` (10, ≤ 50), `maxTriples` (150, ≤ 1000), `maxBytes` (32768, ≤ `--mcp-max-bytes`), `includeSuperseded` (false), `statuses` (both), `unreviewedWeight` (0.7), `recency` (a half-life such as `90d`), `communities` (false), `communityLevel` (the finest), `format` (`text`\|`json`), `timeoutSeconds` (30) | One text block: the facts around the seeds with their citations, described below. No `structuredContent`. |
 | `community_reports` | `query` (≤ 2000 characters), `level` (the finest level with at most 100 reports), `reviewedOnly` (false), `limit` (10, ≤ 100), `findings` (true), `timeoutSeconds` (30) | `{dataset, available, reason?, message?, reportsGraph, level, levels: [{level, reports}], ranking, stale, reports: [{iri, community, level, title, summary, status, rating, memberCount, score?, findings: [{iri, text, cites}]}]}`, described below. |
 | `why_empty` | `query` (required, ≤ 65536 characters), `timeoutSeconds` (30) | `{dataset, commit, empty, first?, steps, unchecked?, complete, message, prefixes}`, described in [Checking and explaining queries](#checking-and-explaining-queries). |
+| `explain_inference` | `triple` (required, Turtle with the dataset's prefixes, such as `ex:tom a ex:Animal`), `mode` (`why`; `whyNot` is not available), `maxTrees` (1, at most 10), `maxDepth` (32, at most 64), `timeoutSeconds` | The answer of [Explanations](#explanations) with `dataset`, `summaries` (one line per tree, such as `ex:tom a ex:Animal because ex:tom a ex:Cat (asserted) and ex:Cat rdfs:subClassOf ex:Animal (asserted), by rdfs9`) and `prefixes`. A triple with no derivation from facts the caller reads gives `entailed: false` and a `message`. Offered in builds with the `reasoning` feature. |
 | `share_query` | `query` (required, ≤ 65536 characters), `question` (≤ 2000 characters), `explanation` (≤ 400 characters), `assumptions` (≤ 5), `branch`, `atCommit` | `{url, dataset, commit, ok, issues, prefixes}`. The link opens the query in a new tab of the UI's query page with the question header. The query is checked and never run. Listed only when the server knows the UI's address, which is the request's own host over HTTP and `--ui-url` over stdio. A payload over 32 KiB is refused with `too-large`, and an update with `not-a-query`. |
 | `validate_shacl` | `shapes` (required: a shapes graph in Turtle, ≤ 1 MiB), `shapesFormat` (`turtle` or `shaclc`), `graph` (`default`\|`union`\|IRI), `maxResults` (20, ≤ `--mcp-max-rows`), `timeoutSeconds` (30) | `{dataset, commit, reasoning, conforms, total, bySeverity: {violation, warning, info}, results: [{focus, path?, value?, shape, constraint, severity, message?}], truncated, prefixes}`: the validation of [`/{ds}/shacl`](#shacl-validation). The most severe results come first, then results are ordered by shape and focus node. `severity` is `Violation`, `Warning` or `Info`. SHACL 1.2 `Debug` and `Trace` count as info. A complex `path` is a SPARQL property path. Only in builds with the `shacl` feature. |
 | `validate_shex` | `schema` (required: ShExC, or ShExJ when it starts with `{`; ≤ 1 MiB), `shapeMap` (required: a compact shape map, ≤ 65536 characters), `graph`, `onlyNonconformant` (true), `maxResults` (20, ≤ `--mcp-max-rows`), `timeoutSeconds` (30) | `{dataset, commit, reasoning, conforms, counts: {conformant, nonconformant}, results: [{node, shape, status, reason?, failures?}], truncated, warnings, prefixes}`: the validation of [`/{ds}/shex`](#shex-validation), with results in shape-map order. `shape` is `START` for a START association. `failures` are the report's `appinfo.failures`, with `value` as a term and `predicate` as an IRI. Prefixed names in the map use the schema's prefixes, then the dataset's. `IMPORT` is refused with `bad-argument`, so put the imported shapes into the schema. EXTERNAL shapes have no definition (`invalid-schema`). `SPARQL """…"""` node selectors run on the data graph under the call's row and memory budgets, without SERVICE, and with only their own prefixes. A failing selector query is `invalid-schema`. Only in builds with the `shex` feature. |

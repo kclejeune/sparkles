@@ -21,7 +21,7 @@ use crate::store::Snapshot;
 use serde_json::Value as J;
 use std::sync::Arc;
 
-mod facets;
+pub(crate) mod facets;
 mod groups;
 mod ids;
 mod reports;

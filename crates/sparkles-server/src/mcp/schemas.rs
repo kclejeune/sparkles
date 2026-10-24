@@ -36,6 +36,9 @@ pub fn all_tools() -> Vec<&'static str> {
         "list_sources",
         "ingest_profile",
     ]);
+    if cfg!(feature = "reasoning") {
+        v.push("explain_inference");
+    }
     if cfg!(feature = "shacl") {
         v.push("validate_shacl");
     }
@@ -661,6 +664,29 @@ pub fn tools(cfg: &McpConfig) -> Vec<ToolDef> {
                 "timeoutSeconds": to(cfg),
                 "atCommit": at(), "at": at_sel()}}),
             Some(why_empty_output()),
+        ),
+        read(
+            "explain_inference",
+            "Explain why a triple is inferred",
+            "Explain why a dataset entails a triple: derivation trees over the materialized inferences, or over what RDFS on read answers, from the facts you can read. Each derived node names its rule, with its profile and its OWL 2 RL id, and its premises, and each asserted leaf names its graph. Use it when a query returns a triple that the data does not assert, such as an rdf:type from a subclass. A triple with no derivation from facts you can read answers entailed: false, as one that is not entailed does. Mode whyNot is not available.",
+            json!({"type":"object","additionalProperties":false,"required":["triple"],"properties":{
+                "dataset": ds(),
+                "triple": {"type":"string","minLength":1,"maxLength":4096,"description":"The triple in Turtle with the dataset prefixes, such as `ex:tom a ex:Animal` or `<http://ex.org/tom> <http://ex.org/knows> \"Ann\"`"},
+                "mode": {"enum":["why","whyNot"],"default":"why"},
+                "maxTrees": {"type":"integer","minimum":1,"maximum":10,"default":1,"description":"Derivations whose top rules differ"},
+                "maxDepth": {"type":"integer","minimum":1,"maximum":64,"default":32,"description":"The depth of the trees; deeper nodes are cut as ref nodes"},
+                "timeoutSeconds": to(cfg)}}),
+            Some(json!({"type":"object","required":["dataset","mode","entailed","commit","summaries","prefixes"],"properties":{
+                "dataset":{"type":"string"},"mode":{"const":"why"},"entailed":{"type":"boolean"},
+                "commit":{"type":"integer","description":"The commit the search read"},
+                "source":{"enum":["materialized","rdfsOnRead"]},
+                "trees":{"type":"array","items":{"type":"object","description":"A derivation: id, triple, kind (asserted, axiom, derived or ref), depth, graph, rule and premises"}},
+                "more":{"type":"boolean","description":"Derivations by further rules exist"},
+                "summaries":strings(),
+                "readAtHead":{"type":"boolean"},"stale":{"type":["boolean","null"]},
+                "commitsSince":{"type":"integer"},"staleReason":{"type":"string"},
+                "message":{"type":"string"},
+                "prefixes":prefixes()}})),
         ),
         read(
             "share_query",

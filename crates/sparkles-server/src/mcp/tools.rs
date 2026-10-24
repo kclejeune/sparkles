@@ -133,6 +133,8 @@ fn dispatch(t: &Tools, name: &str, args: Map<String, Value>) -> Result<Outcome, 
         "recall" => t.recall(args),
         "community_reports" => t.community_reports(args),
         "why_empty" => t.why_empty(args),
+        #[cfg(feature = "reasoning")]
+        "explain_inference" => t.explain_inference(args),
         "share_query" => t.share_query(args),
         "sparql_update" => t.sparql_update(args),
         "assert_facts" => t.assert_facts(args),

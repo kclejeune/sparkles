@@ -1936,8 +1936,8 @@ enum Cmd {
         /// text or json (with --check also turtle)
         #[arg(long, default_value = "text")]
         format: String,
-        /// Timeout of the checks in seconds
-        #[arg(long, requires = "check")]
+        /// Timeout of the checks, or of --why, in seconds
+        #[arg(long)]
         timeout: Option<f64>,
         /// A graph whose triples the rules read: `default` or a graph IRI (repeatable;
         /// default: the default graph). Without input options, a run reads the graphs
@@ -1964,6 +1964,16 @@ enum Cmd {
         /// The derived triples the run may produce before it fails (0: no limit)
         #[arg(long, value_name = "N", default_value_t = state::DEFAULT_REASON_MAX_INFERRED)]
         max_inferred: usize,
+        /// Explain why the database entails a triple, given in Turtle with the
+        /// database's prefixes, such as '<http://ex.org/tom> a ex:Animal'
+        #[arg(long, value_name = "TRIPLE", conflicts_with_all = ["clear", "check", "status", "profile", "rules", "full"])]
+        why: Option<String>,
+        /// Derivations whose top rules differ, with --why (at most 10)
+        #[arg(long, value_name = "N", default_value_t = 1, requires = "why")]
+        max_trees: usize,
+        /// The depth of the trees, with --why (at most 64); deeper nodes are cut
+        #[arg(long, value_name = "N", default_value_t = 32, requires = "why")]
+        max_depth: u32,
         // where fetched imports may come from
         #[command(flatten)]
         outbound: outbound::OutboundArgs,
@@ -4086,9 +4096,15 @@ fn run() -> Result<()> {
             refresh_imports,
             threads,
             max_inferred,
+            why,
+            max_trees,
+            max_depth,
             outbound,
         } => {
             use sparkles_reasoner::diagnostics::{self, Closure, DiagnoseOptions};
+            if let Some(text) = why {
+                return explain_cli(&loc, &text, max_trees, max_depth, timeout, &format);
+            }
             // bad check options exit with 2, before any work
             let closure = match Closure::parse(&closure) {
                 Some(c) => c,
@@ -4711,6 +4727,59 @@ fn print_schema(out: &mut impl Write, r: &sparkles::schema::SchemaReport) -> Res
             }
             writeln!(out, "    subjects: {}", parts.join(", "))?;
         }
+    }
+    Ok(())
+}
+
+/// `sparkles infer --why`: the derivation trees of a triple, as text or JSON. Exits with
+/// 1 when no derivation is found and 2 when the search passes its limits.
+#[cfg(feature = "reasoning")]
+fn explain_cli(
+    loc: &std::path::Path,
+    text: &str,
+    max_trees: usize,
+    max_depth: u32,
+    timeout: Option<f64>,
+    format: &str,
+) -> Result<()> {
+    use sparkles::reasoning::explain as ex;
+    if !(1..=ex::MAX_TREES).contains(&max_trees) {
+        eprintln!("error: --max-trees must be between 1 and {}", ex::MAX_TREES);
+        std::process::exit(2);
+    }
+    if !(1..=ex::MAX_DEPTH).contains(&max_depth) {
+        eprintln!("error: --max-depth must be between 1 and {}", ex::MAX_DEPTH);
+        std::process::exit(2);
+    }
+    if !loc.join("CURRENT").exists() {
+        bail!("{} is not a Sparkles database (no CURRENT)", loc.display());
+    }
+    let ds = sparkles::Dataset::open(loc)?;
+    let prefixes: Vec<(String, String)> = ds.prefixes().into_iter().collect();
+    let triple = ex::triple_from_text(text, &prefixes)?;
+    let mut req = ex::ExplainRequest::new(triple);
+    req.max_trees = max_trees;
+    req.max_depth = max_depth;
+    req.timeout = timeout.map(std::time::Duration::from_secs_f64);
+    let e = match ds.reasoning().explain(&req) {
+        Ok(e) => e,
+        Err(sparkles::Error::Component(c)) if c.code == ex::REASONING_BUDGET => {
+            eprintln!("error: {}", c.message);
+            std::process::exit(2);
+        }
+        Err(e) => return Err(e.into()),
+    };
+    let found = matches!(e.explained, sparkles::explain::Explained::Found { .. });
+    if format == "json" {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&ex::explanation_json(&e))?
+        );
+    } else {
+        print!("{}", ex::explanation_text(&e, &prefixes));
+    }
+    if !found {
+        std::process::exit(1);
     }
     Ok(())
 }

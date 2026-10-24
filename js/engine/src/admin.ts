@@ -569,6 +569,11 @@ export class Administration {
           inferences?: boolean;
         } = {},
       ) => call<Configuration>('reasoning.diagnostics', { ...options }, options, false),
+      /** Why the dataset entails a triple, given in Turtle with the dataset's prefixes: derivation trees, or `entailed: false`. */
+      explain: (
+        triple: string,
+        options: OperationOptions & { maxTrees?: number; maxDepth?: number } = {},
+      ) => call<Configuration>('reasoning.explain', { triple, ...options }, options, false),
       status: (o?: OperationOptions) =>
         call<Configuration | null>('reasoning.status', {}, o, false),
       /** `maxInferred` is the derived triples a run may produce before it fails: 50 million by default, 0 for no limit. */

@@ -72,6 +72,7 @@ pub const ROUTES: &[(&str, &[&str])] = &[
     ("/$/reason/{ds}", &["GET", "POST", "DELETE"]),
     ("/$/reason/{ds}/auto", &["PUT", "DELETE"]),
     ("/$/reason/{ds}/diagnostics", &["GET"]),
+    ("/$/reason/{ds}/explain", &["POST"]),
     ("/$/tasks", &["GET"]),
     // DELETE (cancel) checks admin on the task's dataset in the handler
     ("/$/tasks/{id}", &["GET", "DELETE"]),
@@ -403,6 +404,7 @@ pub fn need(route: &str, method: &Method, uri: &Uri, headers: &HeaderMap) -> Opt
         | "/$/graph/{ds}/groups"
         | "/$/graph/{ds}/facets"
         | "/$/reason/{ds}/diagnostics"
+        | "/$/reason/{ds}/explain"
         | "/$/prefixes/{ds}"
         | "/$/commits/{ds}"
         | "/$/commits/{ds}/timeline"
@@ -550,7 +552,8 @@ pub fn endpoint(route: &str, method: &Method, uri: &Uri, headers: &HeaderMap) ->
         | "/{ds}/queries/{name}"
         | "/$/graph/{ds}/groups"
         | "/$/graph/{ds}/facets"
-        | "/$/graphrag/{ds}/memberships" => Endpoint::Query,
+        | "/$/graphrag/{ds}/memberships"
+        | "/$/reason/{ds}/explain" => Endpoint::Query,
         "/{ds}/graphql" | "/{ds}/graphql/schema" => Endpoint::Graphql,
         "/{ds}/update" | "/{ds}/facts" => Endpoint::Update,
         "/{ds}/sources" if get => Endpoint::Query,

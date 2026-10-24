@@ -12,6 +12,8 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 mod algo_view;
 mod branches;
 mod cli_grants;
+#[cfg(feature = "reasoning")]
+mod explain;
 #[cfg(feature = "graphql")]
 mod graphql;
 mod graphrag;
