@@ -6,6 +6,17 @@
 
   /** One element of the drawing the keyboard can focus. */
   export type Focusable = { node: PNode } | { edge: PEdge };
+
+  /** The plan's numbers on the drawing (spec U04 §11.2), by element id. */
+  export type CanvasOverlay = {
+    edges: Record<
+      string,
+      { text: string; width: number; warn: boolean; hot: boolean; spoken: string }
+    >;
+    nodes: Record<string, { lines: string[]; warn: boolean; hot: boolean; spoken: string }>;
+    /** the nodes with join badges, in the order the plan runs the joins, for `J` */
+    joins: string[];
+  };
 </script>
 
 <script lang="ts">
@@ -29,6 +40,9 @@
     onlayout,
     onkey,
     label = 'Pattern canvas',
+    overlay = null,
+    lit = null,
+    onhover,
   }: {
     drawing: Drawing | null;
     /** the positions to keep, by key */
@@ -45,6 +59,12 @@
     /** a key the canvas does not handle itself, with the focused element */
     onkey?: (e: KeyboardEvent, el: Focusable | null) => void;
     label?: string;
+    /** the plan drawn on the pattern, when it is on and of this text */
+    overlay?: CanvasOverlay | null;
+    /** the elements of an operator chosen in the plan, to light while the rest fade */
+    lit?: string[] | null;
+    /** the element under the pointer or the focus, or null */
+    onhover?: (id: string | null) => void;
   } = $props();
 
   let host: HTMLDivElement;
@@ -206,6 +226,33 @@
           'line-color': text3,
         },
       },
+      // the plan on the pattern: a width that grows with the rows, misestimates in the
+      // warning colour, and the highlight of an operator chosen in the plan
+      {
+        selector: 'edge[ow]',
+        style: { width: 'data(ow)', 'text-wrap': 'wrap', 'line-height': 1.25 },
+      },
+      {
+        selector: 'edge[?owarn]',
+        style: {
+          'line-color': cssVar('--warn'),
+          'target-arrow-color': cssVar('--warn'),
+          color: cssVar('--warn'),
+        },
+      },
+      {
+        selector: 'node[?owarn]',
+        style: { 'border-color': cssVar('--warn'), 'border-width': 2 },
+      },
+      { selector: '.faded', style: { opacity: 0.25 } },
+      {
+        selector: '.lit',
+        style: {
+          'underlay-color': spark,
+          'underlay-opacity': 0.22,
+          'underlay-padding': 5,
+        },
+      },
       {
         selector: '.kfocus, :selected',
         style: {
@@ -227,7 +274,8 @@
     let main = n.label;
     if (phone && n.kind === 'iri')
       main = main.replace(/^[^:]*:/, '').replace(/^<.*[/#]([^/#>]+)>$/, '$1');
-    return [main, ...n.subtitle].join('\n');
+    const more = overlay?.nodes[n.id]?.lines ?? [];
+    return [main, ...n.subtitle, ...more].join('\n');
   }
 
   function size(label: string, kind: string) {
@@ -247,8 +295,22 @@
       title: n.title,
       waiting: !!n.waiting,
       warn: !!n.warn,
+      owarn: !!overlay?.nodes[n.id]?.warn,
       ...size(label, n.kind),
       ...(n.parent ? { parent: n.parent } : {}),
+    };
+  }
+
+  function edgeData(e: PEdge) {
+    const o = overlay?.edges[e.id];
+    return {
+      id: e.id,
+      source: e.source,
+      target: e.target,
+      label: o ? `${e.label}\n${o.text}${o.hot ? ' ●' : ''}` : e.label,
+      style: e.style,
+      optional: e.optional,
+      ...(o ? { ow: o.width, owarn: o.warn } : {}),
     };
   }
 
@@ -266,6 +328,22 @@
       hulls: d ? d.hulls.length : 0,
       locked: d ? d.nodes.filter((n) => n.locked).map((n) => n.locked!.text) : [],
     });
+    const o = overlay;
+    if (o && d) {
+      const labelOf = (id: string) => d.nodes.find((n) => n.id === id)?.label ?? id;
+      wrap.dataset.overlay = JSON.stringify({
+        edges: d.edges
+          .filter((e) => o.edges[e.id])
+          .map((e) => [e.label, o.edges[e.id].text, o.edges[e.id].warn, o.edges[e.id].width]),
+        nodes: Object.entries(o.nodes).map(([id, v]) => [labelOf(id), v.lines]),
+        lit: lit
+          ? lit.map((id) => {
+              const e = d.edges.find((x) => x.id === id);
+              return e ? e.label : labelOf(id);
+            })
+          : null,
+      });
+    } else delete wrap.dataset.overlay;
     const pos: Record<string, [number, number]> = {};
     cy.nodes()
       .not(':parent')
@@ -292,6 +370,11 @@
           const p = n.renderedPosition();
           out[n.id()] = [Math.round(p.x), Math.round(p.y)];
         });
+      // and the middle of each edge, by its id
+      cy.edges().forEach((e) => {
+        const p = e.renderedMidpoint();
+        out[e.id()] = [Math.round(p.x), Math.round(p.y)];
+      });
       wrap.dataset.screen = JSON.stringify(out);
     });
   }
@@ -349,14 +432,7 @@
       for (const e of d.edges)
         want.set(e.id, {
           group: 'edges',
-          data: {
-            id: e.id,
-            source: e.source,
-            target: e.target,
-            label: e.label,
-            style: e.style,
-            optional: e.optional,
-          },
+          data: edgeData(e),
         });
     }
     const fresh: cytoscape.NodeSingular[] = [];
@@ -377,6 +453,8 @@
       for (const [id, def] of want) {
         const el = cy!.getElementById(id);
         if (el.nonempty()) {
+          // an overlay that went leaves no width or mark behind
+          if (el.isEdge() && def.data.ow === undefined) el.removeData('ow owarn');
           el.data(def.data);
           continue;
         }
@@ -500,6 +578,8 @@
       if (e.target === cy) onselect?.(null);
     });
     cy.on('viewport', exposeScreen);
+    cy.on('mouseover', 'node, edge', (e) => onhover?.(e.target.id()));
+    cy.on('mouseout', 'node, edge', () => onhover?.(null));
     // a form or bar opening above the canvas moves and shrinks it: cytoscape keeps the
     // container's box, so taps would land beside their nodes until it measures again
     sizeObserver = new ResizeObserver(() => {
@@ -545,7 +625,24 @@
   $effect(() => {
     void drawing;
     void dim;
+    void overlay;
     sync();
+  });
+
+  // an operator chosen in the plan lights its elements, and the rest fade
+  $effect(() => {
+    const on = lit && overlay ? new Set(lit) : null;
+    void drawing;
+    if (!cy) return;
+    cy.batch(() => {
+      cy!.elements().removeClass('lit faded');
+      if (!on) return;
+      cy!.elements().forEach((el) => {
+        if (el.isNode() && el.isParent()) return;
+        el.addClass(on.has(el.id()) ? 'lit' : 'faded');
+      });
+    });
+    if (wrap) expose();
   });
 
   $effect(() => {
@@ -600,8 +697,10 @@
     focusAt = i;
     const el = order[i];
     if (!el || !drawing) return;
-    announce = describe(el, drawing);
     const id = 'node' in el ? el.node.id : el.edge.id;
+    const extra = 'node' in el ? overlay?.nodes[id]?.spoken : overlay?.edges[id]?.spoken;
+    announce = describe(el, drawing) + (extra ? `, ${extra}` : '');
+    onhover?.(id);
     const c = cy?.getElementById(id);
     if (c && c.nonempty() && cy) {
       const bb = c.renderedBoundingBox();
@@ -680,6 +779,25 @@
       onselect?.(el);
       return;
     }
+    // J moves through the join badges in the order the plan runs them
+    if (
+      (e.key === 'j' || e.key === 'J') &&
+      overlay?.joins.length &&
+      !e.ctrlKey &&
+      !e.metaKey &&
+      !e.altKey
+    ) {
+      e.preventDefault();
+      const ids = overlay.joins;
+      const cur = el && 'node' in el ? ids.indexOf(el.node.id) : -1;
+      const next =
+        cur < 0
+          ? ids[e.shiftKey ? ids.length - 1 : 0]
+          : ids[(cur + (e.shiftKey ? ids.length - 1 : 1)) % ids.length];
+      const i = order.findIndex((x) => 'node' in x && x.node.id === next);
+      if (i >= 0) focusEl(i);
+      return;
+    }
     onkey?.(e, el);
   }
 
@@ -689,7 +807,10 @@
   }
 
   function focusout(e: FocusEvent) {
-    if (!wrap.contains(e.relatedTarget as Node | null)) focusAt = -1;
+    if (!wrap.contains(e.relatedTarget as Node | null)) {
+      focusAt = -1;
+      onhover?.(null);
+    }
   }
 </script>
 
@@ -714,7 +835,9 @@
     Tab moves through the pattern in text order, arrow keys move to the nearest element, Shift with
     an arrow moves a node, Enter opens its panel, Delete removes it, O toggles optional, N adds a
     node, E adds an edge from the focused node, F adds a filter on the focused variable, and Escape
-    returns to the editor.
+    returns to the editor.{overlay
+      ? ' With the plan on the pattern, J moves through the joins in the order they run, and T switches between rows and time.'
+      : ''}
   </p>
   <p class="sr-only" aria-live="polite" data-testid="pattern-focus">{announce}</p>
 </div>

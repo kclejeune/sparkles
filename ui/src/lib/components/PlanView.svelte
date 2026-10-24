@@ -2,6 +2,7 @@
   import { tick, type Snippet } from 'svelte';
   import { planFormatProblem, planOf, type CursorPlan, type PlanNode } from '$lib/api';
   import type { Severity } from '$lib/explain';
+  import { misestimate as misestimateOf } from '$lib/plan-pattern';
   import { fmtCompact, fmtInt, fmtMs } from '$lib/format';
   import { shorten, type PrefixMap } from '$lib/rdf';
   import Icon from './Icon.svelte';
@@ -115,18 +116,8 @@
     collapsed = next;
   }
 
-  /**
-   * Ratio of actual to estimated rows; flags big misestimates. A hidden estimate (`-1`),
-   * a node that stopped early or did not run, and partial counts are not misestimates.
-   */
-  function misestimate(n: PlanNode): number | null {
-    if (!executed || n.actualRows < 0 || n.estimatedRows < 0) return null;
-    if (n.stoppedEarly || n.skipped || n.complete === false) return null;
-    const a = Math.max(n.actualRows, 1);
-    const e = Math.max(n.estimatedRows, 1);
-    const r = a > e ? a / e : e / a;
-    return r >= 10 ? r : null;
-  }
+  /** Ratio of actual to estimated rows, for big misestimates (the rule of `plan-pattern`). */
+  const misestimate = (n: PlanNode) => misestimateOf(n, executed);
 
   // Icicle layout: x/width in [0,1] proportional to time (or cost when not executed).
   type Box = { id: string; node: PlanNode; x: number; w: number; depth: number };

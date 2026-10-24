@@ -383,6 +383,56 @@ ORDER BY ?name`;
   await shoot(page, 'pattern');
 });
 
+test('plan-pattern', async ({ page }) => {
+  // the plan drawn on the pattern of the query that ran (U04 §11): estimated and actual
+  // rows on each edge, ex:memberOf marked as a misestimate, the joins as numbered badges
+  // and the filter's rows on its chip, with the plan tree beside it
+  const query = `PREFIX ex: <http://example.org/ontology#>
+PREFIX foaf: <http://xmlns.com/foaf/0.1/>
+PREFIX rdfs: <http://www.w3.org/2000/01/rdf-schema#>
+
+SELECT ?name ?teamName WHERE {
+  ?person a ex:Person ;
+          foaf:name ?name ;
+          ex:memberOf ?team .
+  ?team rdfs:label ?teamName .
+  FILTER(STRLEN(?name) > 3)
+}`;
+  await page.addInitScript(
+    ([q]) => {
+      localStorage.setItem(
+        'sparkles.queryTabs',
+        JSON.stringify({ tabs: [{ id: 't1', title: 'Teams', query: q }], active: 't1' }),
+      );
+      localStorage.removeItem('sparkles.patternLayouts');
+      localStorage.setItem('sparkles.patternPane', JSON.stringify({ open: false }));
+      localStorage.setItem('sparkles.planOnPattern', 'true');
+    },
+    [query],
+  );
+  await page.goto(`/ui/query?ds=${DATASET}`);
+  await expect(page.locator('.cm-content')).toContainText('SELECT', { timeout: 30_000 });
+  // a shorter editor, so the drawing and the tree have room
+  const top = (await page.locator('.cm-editor').boundingBox())!.y;
+  const split = (await page.getByRole('separator', { name: 'Resize editor' }).boundingBox())!;
+  await page.mouse.move(split.x + split.width / 2, split.y + split.height / 2);
+  await page.mouse.down();
+  await page.mouse.move(split.x + split.width / 2, top + 250, { steps: 5 });
+  await page.mouse.up();
+  await page.getByRole('button', { name: /^Run/ }).click();
+  const results = page.getByRole('region', { name: 'Results' });
+  await results.getByRole('tab', { name: /Pattern/ }).click();
+  const ran = results.getByRole('region', { name: 'Pattern of the query that ran' });
+  const canvas = ran.locator('.pcanvas');
+  await expect(canvas).toHaveAttribute('data-overlay', /memberOf/, { timeout: 30_000 });
+  await expect
+    .poll(async () => Number(await canvas.getAttribute('data-settled')))
+    .toBeGreaterThan(0);
+  await ran.getByRole('button', { name: 'Fit to view' }).click();
+  await page.mouse.move(0, 0);
+  await shoot(page, 'plan-pattern');
+});
+
 test('diff-graph', async ({ page }) => {
   // the last commit of main drawn as a graph of its own, with the triples around it
   await page.goto(`/ui/explore?ds=${DATASET}&diff=head`);

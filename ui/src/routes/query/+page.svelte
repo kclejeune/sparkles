@@ -42,6 +42,7 @@
   import { chooseRenderer, hasWebGL2, seed, type Renderer } from '$lib/overview';
   import Icon from '$components/Icon.svelte';
   import ExplainedPlan from '$components/ExplainedPlan.svelte';
+  import PlanView from '$components/PlanView.svelte';
   import ResultMap from '$components/ResultMap.svelte';
   import Modal from '$components/Modal.svelte';
   import ResultTable from '$components/ResultTable.svelte';
@@ -215,6 +216,49 @@
     return () => m.removeEventListener('change', on);
   });
   const patternShown = $derived(patternOpen && (!isPhone || phoneTab === 'pattern'));
+
+  // the plan drawn on the pattern (spec U04 §11): a switch shared by the Plan and Pattern
+  // tabs, per viewer, and the operator selected in either view
+  const PLAN_PATTERN_KEY = 'sparkles.planOnPattern';
+  let planOnPattern = $state(load<boolean>(PLAN_PATTERN_KEY, false) === true);
+  $effect(() => save(PLAN_PATTERN_KEY, planOnPattern));
+  let planSel = $state<string | null>(null);
+  let planHover = $state<string | null>(null);
+  /** The plan of the active tab's outcome and the text it is of, when there is one. */
+  const planSource = $derived.by(() => {
+    const o = outcomes[activeId];
+    if (!o) return null;
+    const branchNote = o.branch ? ` on ${o.branch}` : '';
+    if (o.result?.meta?.plan && o.query) {
+      const c = o.result.meta.commit;
+      return {
+        plan: o.result.meta.plan,
+        text: o.query,
+        executed: true,
+        header: `${typeof c === 'number' ? `commit ${c}` : 'the head'}${branchNote}`,
+      };
+    }
+    if (o.explain?.plan && o.explainQuery)
+      return {
+        plan: o.explain.plan,
+        text: o.explainQuery,
+        executed: false,
+        header: `the head${branchNote}`,
+      };
+    return null;
+  });
+  // a new plan starts with nothing selected
+  $effect(() => {
+    void planSource?.plan;
+    planSel = null;
+    planHover = null;
+  });
+  /** Show an operator in the plan tree: the Plan tab with it selected (the phone's sheet). */
+  function showInPlan(id: string) {
+    planSel = id;
+    const o = outcomes[activeId];
+    if (o) o.view = o.explain && !o.result ? 'explain' : 'plan';
+  }
 
   /** Alt+P: open the pane and focus it, or move focus back to the editor, or close it. */
   async function togglePattern(from: 'editor' | 'pane' | 'page') {
@@ -2735,6 +2779,16 @@
             onredo={() => editor?.redo()}
             onescape={() => (isPhone ? (phoneTab = 'text') : editor?.focus())}
             onclose={() => (patternOpen = false)}
+            plan={planOnPattern ? planSource?.plan : null}
+            planText={planSource?.text ?? null}
+            planExecuted={planSource?.executed ?? true}
+            planHeader={planSource?.header ?? null}
+            planSelected={planHover ?? planSel}
+            onplanselect={(id) => (planSel = id)}
+            onshowplan={showInPlan}
+            planSwitch={planSource && planSource.text === active.query
+              ? { on: planOnPattern, set: (on) => (planOnPattern = on) }
+              : null}
           />
         {/key}
       </div>
@@ -3110,6 +3164,11 @@
                   plan={outcome.explain.plan}
                   executed={false}
                   {prefixes}
+                  onPattern={planOnPattern}
+                  onpattern={(on) => (planOnPattern = on)}
+                  select={planSel}
+                  onselectop={(id) => (planSel = id)}
+                  onhoverop={(id) => (planHover = id)}
                 />
               </div>
             </div>
@@ -3364,24 +3423,52 @@
                 plan={r.meta.plan}
                 commit={r.meta.commit}
                 {prefixes}
+                onPattern={planOnPattern}
+                onpattern={outcome.query ? (on) => (planOnPattern = on) : undefined}
+                select={planSel}
+                onselectop={(id) => (planSel = id)}
+                onhoverop={(id) => (planHover = id)}
               />
             {:else}
               <div class="empty">The server did not return a plan for this query.</div>
             {/if}
           {:else if outcome.view === 'pattern' && outcome.query}
-            <div class="result-pattern">
-              <PatternPane text={outcome.query} readonly phone={isPhone} />
-              <div class="result-pattern-bar">
-                <button
-                  class="btn sm"
-                  title="Put this query in the editor and open the Pattern pane"
-                  onclick={() => {
+            {@const drawPlan = planOnPattern && !!r.meta.plan}
+            <div class="result-pattern" class:with-plan={drawPlan && !isPhone}>
+              <div class="result-pattern-main">
+                <PatternPane
+                  text={outcome.query}
+                  readonly
+                  phone={isPhone}
+                  plan={drawPlan ? r.meta.plan : null}
+                  planText={outcome.query}
+                  planExecuted
+                  planHeader={planSource?.header ?? null}
+                  planSelected={planHover ?? planSel}
+                  onplanselect={(id) => (planSel = id)}
+                  onshowplan={isPhone ? showInPlan : undefined}
+                  planSwitch={r.meta.plan
+                    ? { on: planOnPattern, set: (on) => (planOnPattern = on) }
+                    : null}
+                  onopen={() => {
                     setQuery(outcome!.query!);
                     patternOpen = true;
                     if (isPhone) phoneTab = 'pattern';
-                  }}>Edit</button
-                >
+                  }}
+                />
               </div>
+              {#if drawPlan && !isPhone && r.meta.plan}
+                <div class="result-pattern-tree">
+                  <PlanView
+                    plan={r.meta.plan}
+                    {prefixes}
+                    selected={planSel}
+                    lit={planSel ? new Set([planSel]) : null}
+                    onselect={(id) => (planSel = id)}
+                    onhover={(id) => (planHover = id)}
+                  />
+                </div>
+              {/if}
             </div>
           {:else if outcome.view === 'raw'}
             <div class="raw">
@@ -4009,10 +4096,23 @@
     display: flex;
     flex-direction: column;
   }
-  .result-pattern-bar {
-    position: absolute;
-    top: 6px;
-    right: 120px;
+  .result-pattern-main {
+    flex: 1;
+    min-height: 0;
+    min-width: 0;
+    display: flex;
+    flex-direction: column;
+  }
+  .result-pattern.with-plan {
+    flex-direction: row;
+  }
+  .result-pattern-tree {
+    width: min(42%, 520px);
+    min-height: 0;
+    overflow: auto;
+    border-left: 1px solid var(--border);
+    display: flex;
+    flex-direction: column;
   }
   .splitter {
     cursor: row-resize;
@@ -4301,11 +4401,6 @@
     }
     .page:has(.phone-pattern) {
       --editor-row: max(420px, 65vh);
-    }
-    .result-pattern-bar {
-      right: 8px;
-      top: auto;
-      bottom: 44px;
     }
     .examples,
     .saved,

@@ -404,6 +404,12 @@ export type PlanNode = {
   pushedFilters?: string[];
   /** The estimate is a constant guess (`SERVICE`). */
   estimateGuessed?: boolean;
+  /** The triple patterns and paths of the query the node reads, in query order (U04 §11.3). */
+  patterns?: { s: string; p: string; o: string; graph?: string; occurrence: number }[];
+  /** On a filter, the query variables its expression reads. */
+  filterVars?: string[];
+  /** On a join, the query variables it joins on. */
+  joinVars?: string[];
   /** From a streamed plan: whether the operator materializes its input, and why. */
   materializes?: boolean;
   reason?: string | null;

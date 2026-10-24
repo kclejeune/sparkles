@@ -1,8 +1,9 @@
 # U04: Live query profiling
 
-> **Status:** specified
+> **Status:** partly implemented
 >
-> **Phases:** None shipped. Phase 1 is a progress registry in the engine and server,
+> **Phases:** Phase 4 shipped on 2026-10-23, and Phases 1 to 3 are not built. Phase 1 is a
+> progress registry in the engine and server,
 > `GET /$/running/{id}` as JSON and server-sent events, cancellation by id, and the query
 > page's plan tree updating while a query runs. Phase 2 adds hot-spot marks, **Stop and
 > explain**, and the server page's list of running queries. Phase 3 shows C18's verified
@@ -10,10 +11,11 @@
 > 2026-10-23 in §11, draws estimated and actual rows on the query's pattern graph from
 > [U08](U08-visual-query-builder.md) and marks misestimates.
 >
-> **User docs:** none, because nothing is built.
+> **User docs:** [Usage: The plan on the pattern](../USAGE.md#the-plan-on-the-pattern) ·
+> [API: Explain](../API.md#explain) · [Features](../FEATURES.md#web-ui)
 >
 > This is the design as written before implementation. The [Outcome](#outcome) section at
-> the end will record how it lands.
+> the end records how Phase 4 landed.
 
 This design was written from the Sparkles code and specs: the executed plan with node
 ids that `/{ds}/sparql` returns in `meta.plan` and the query page draws with `PlanView`,
@@ -492,5 +494,57 @@ The dataset is §7's `big`.
 
 ## Outcome
 
-Not built. See [ROADMAP](../ROADMAP.md) item 27 for Phases 1 to 3 and item 102 for
-Phase 4.
+Phases 1 to 3 are not built, and [ROADMAP](../ROADMAP.md) item 27 tracks them. Phase 4,
+item 102, shipped on 2026-10-23.
+
+### Phase 4 (2026-10-23)
+
+**Server.** Every plan node that reads triple patterns or paths lists them in `patterns`,
+and filters and joins list `filterVars` and `joinVars`, as §11.3 describes. The planner
+records each pattern's terms when it collects the pattern, so the scans, range scans,
+ordered top-k scans, spatial scans, counts from the index, index joins, star joins and
+paths built from it carry it, and the members are written when a plan node is described.
+Generated variables and blank nodes are `?_`. The occurrence index counts equal patterns as
+the planner meets them and wraps at the number of equal patterns in the parsed query, so a
+group that the planner plans once per named graph keeps the index of its text. Two
+behaviours of the parser shape the members. A sequence of IRIs such as `ex:a/ex:b` reaches
+the planner as its steps joined by a blank node, so each step is a pattern of its own with
+`?_` in the middle, and an inverse IRI `^ex:a` reaches it as the triple the other way
+round. Other paths are written whole in a form without spaces, which `path_text` defines
+and the browser reproduces. `joinVars` of an optional join, `MINUS`, a semi-join or an
+anti-join are the variables its two sides share. The members are in `/{ds}/explain`,
+`POST /{ds}/sparql/explain`, `meta.plan`, the plan of a budget error body and the
+OpenAPI description, and `planFormat` did not change. MCP's `explain_query` returns node
+facts rather than the plan, so it does not carry them.
+
+**Client.** `ui/src/lib/plan-pattern.ts` matches the plan with the drawing by the three
+terms and the occurrence, writing literals, prefixed names and paths of the pattern in
+the server's form. An edge with several operators, such as a sequence read by two scans,
+shows the operator nearest the root and says how many read it. The Pattern pane draws the
+labels, widths and marks of §11.2, the filter rows, the join badges in run order and the
+list of operators not drawn. The Plan tab, the Pattern tab and the pane share one
+**Plan on pattern** switch, and the Pattern tab puts the plan tree beside the drawing on a
+desktop, with selection and highlight both ways. `J`, `T`, the spoken numbers and the
+phone's sheet with **Show in plan** are as specified. A locked block shows numbers when it
+is the only block of its kind and the plan has exactly one operator of the matching name,
+such as one `BIND` and one `Bind`, and none otherwise. The Pattern pane's **Edit** button
+of a result moved into the pane's header, where it no longer covers the canvas buttons.
+
+**Deviations.** Live counts and A18 wait for Phases 1 and 2, which are not built. The
+misestimate rule of PlanView, a ratio of ten or more either way, moved into
+`plan-pattern.ts`, and both views use it. A pattern inside a locked block counts toward
+the server's occurrence index but is not a triple of the drawing, so an equal pattern
+after it in the text can take the wrong operator's numbers. That case needs an earlier
+equal pattern inside a `UNION`, `GRAPH` or subquery and is left as it is. The answer to
+open question 1 stays open, because matching by terms worked for every acceptance example.
+
+**Tests.** `plan_refs_tests.rs` covers the members for each operator kind, generated
+variables, occurrences in a union and in per-graph evaluation, named graphs, paths, star
+joins, counts from the index, redaction and plan format 2. The router test
+`plan_patterns_are_on_every_route_that_returns_a_plan` checks the four routes and a
+budget error body. Vitest covers matching, a copied answer, occurrences, unmatched
+patterns, star joins, sequences and inverses, filters, locked blocks, hidden estimates,
+the hot operator and A20, whose 200 patterns match in well under 50 ms. The mock
+Playwright spec covers A14 to A16, A19, the keyboard, the list of operators not drawn and
+the 390 px sheet, and the real-server spec covers A14, A15 and A17.
+
