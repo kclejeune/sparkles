@@ -92,6 +92,7 @@ type TestHook = Box<dyn FnOnce() -> io::Result<()> + Send>;
 pub(crate) enum TestPoint {
     AtomicMarked,
     AtomicBeforeRename,
+    CheckpointPassStart,
     CheckpointFileSync,
     CheckpointBeforeMarkerRemoval,
     CheckpointParentSync,
@@ -180,6 +181,11 @@ impl LazySyncDir {
         hook: impl FnOnce() -> io::Result<()> + Send + 'static,
     ) {
         self.shared.hooks.lock().insert(point, Box::new(hook));
+    }
+
+    #[cfg(test)]
+    pub(crate) fn clear_test_hooks(&self) {
+        self.shared.hooks.lock().clear();
     }
 
     #[cfg(test)]
@@ -365,6 +371,8 @@ impl Checkpoint<'_> {
             let state = self.dir.shared.state.lock();
             return Ok(!state.marked && !state.marker_sync_pending);
         };
+        #[cfg(test)]
+        self.dir.run_hook(TestPoint::CheckpointPassStart)?;
         if before.marked {
             let pending = self.dir.take_pending();
             if let Err(e) = self.dir.sync_files(&pending) {

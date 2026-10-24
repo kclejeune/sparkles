@@ -1513,11 +1513,13 @@ mod imp {
     /// is due a locked pass first repeats its unlocked pass, each time synchronizing only
     /// what was written during the one before, until at most this many files are left.
     /// Under steady commits each repetition takes a fraction of the one before, because
-    /// it has only the files of a shorter interval to synchronize.
-    const LOCKED_FILES: usize = 16;
+    /// it has only the files of a shorter interval to synchronize, and one that no commit
+    /// races clears the marker without holding live at all.
+    const LOCKED_FILES: usize = 0;
 
     /// Unlocked passes a raced tick may repeat before its locked pass, so that commits
-    /// written faster than they can be synchronized still end in a locked pass.
+    /// written faster than they can be synchronized still end in a locked pass, which
+    /// then has the files of one short repetition left.
     const CATCH_UP_PASSES: u32 = 4;
 
     /// Record one background checkpoint at debug level under the target
@@ -3521,17 +3523,48 @@ mod imp {
             assert_eq!(index.reader().unwrap().searcher().num_docs(), 2);
         }
 
+        /// Arm a hook at the start of each later pass of a tick: one that finds live free
+        /// publishes a document, which races it, and arms the next; the one that holds
+        /// live reports it and, in the merge round, writes as a merge does.
+        fn later_passes(
+            inner: Arc<Inner>,
+            dir: LazySyncDir,
+            seq: Arc<AtomicU64>,
+            merge: bool,
+            held_tx: std::sync::mpsc::Sender<bool>,
+            depth: u32,
+        ) {
+            use super::super::lazydir::TestPoint;
+            let hook_dir = dir.clone();
+            hook_dir.test_hook(TestPoint::CheckpointPassStart, move || {
+                let held = inner.live.try_lock().is_none();
+                let _ = held_tx.send(held);
+                if held {
+                    if merge {
+                        tantivy::directory::Directory::atomic_write(
+                            &dir,
+                            Path::new("merge-probe"),
+                            b"merge",
+                        )?;
+                    }
+                } else if depth < 2 * CATCH_UP_PASSES {
+                    let next = seq.fetch_add(1, Ordering::SeqCst) + 1;
+                    publish_checkpoint_document(&inner, next).map_err(std::io::Error::other)?;
+                    later_passes(inner, dir, seq, merge, held_tx, depth + 1);
+                }
+                Ok(())
+            });
+        }
+
         /// A publication races every unlocked background checkpoint, inside its file
-        /// synchronization. The tick after `RACED_BEFORE_LOCKED` such ticks follows its
-        /// raced unlocked pass with a second pass that holds live, so the publication
-        /// cannot race it, and the marker clears. That pass synchronizes only the files
-        /// written during the unlocked pass. When a merge's write races the locked pass
-        /// instead, the count starts again, so the following ticks release live and at
-        /// most one tick in four holds it.
+        /// synchronization. The tick after `RACED_BEFORE_LOCKED` such ticks repeats its
+        /// raced unlocked pass, which a publication races again, and then runs a pass
+        /// that holds live, so the publication cannot race it, and the marker clears.
+        /// When a merge's write races the locked pass instead, the count starts again, so
+        /// the following ticks release live and at most one tick in four holds it.
         #[test]
         fn steady_publication_cannot_starve_the_background_checkpoint() {
             use super::super::lazydir::TestPoint;
-            use std::collections::BTreeSet;
             let (root, inner, dir) = checkpoint_fixture();
             // a merge could race the locked attempt too
             if let Some(writer) = inner.live.lock().writer.as_ref() {
@@ -3539,12 +3572,6 @@ mod imp {
             }
             publish_checkpoint_document(&inner, 1).unwrap();
             let seq = Arc::new(AtomicU64::new(1));
-            let files = || -> BTreeSet<PathBuf> {
-                std::fs::read_dir(root.path().join("text"))
-                    .unwrap()
-                    .map(|e| PathBuf::from(e.unwrap().file_name()))
-                    .collect()
-            };
             for round in 0..3 {
                 // the locked pass of this round meets a merge's write
                 let merge = round == 1;
@@ -3567,50 +3594,33 @@ mod imp {
                         Ok(())
                     });
                     if locked {
-                        // armed once the unlocked pass has finished its I/O, so that only
-                        // a later pass of the tick can meet it
-                        let (hook_inner, hook_dir) = (inner.clone(), dir.clone());
+                        // Armed once the unlocked pass has finished its I/O, so that only
+                        // a later pass of the tick can meet it. A publication races each
+                        // repetition of the unlocked pass, and the pass that holds live
+                        // meets a merge's write in the merge round.
+                        let (hook_inner, hook_dir, hook_seq) =
+                            (inner.clone(), dir.clone(), seq.clone());
                         *inner.after_checkpoint_io.lock() = Some(Box::new(move || {
-                            let first = hook_dir.take_synced();
-                            let dir = hook_dir.clone();
-                            hook_dir.test_hook(TestPoint::CheckpointFileSync, move || {
-                                let held = hook_inner.live.try_lock().is_none();
-                                if merge {
-                                    // a merge writes without live
-                                    tantivy::directory::Directory::atomic_write(
-                                        &dir,
-                                        Path::new("merge-probe"),
-                                        b"merge",
-                                    )?;
-                                }
-                                let _ = held_tx.send((held, first));
-                                Ok(())
-                            });
+                            later_passes(hook_inner, hook_dir, hook_seq, merge, held_tx, 0);
                         }));
                     }
-                    let before = files();
-                    dir.take_synced();
                     assert!(inner.tick(), "round {round}, attempt {attempt}");
+                    dir.clear_test_hooks();
                     let raced = raced_rx
                         .recv_timeout(Duration::from_secs(5))
                         .expect("the checkpoint synchronized no file");
                     assert!(raced, "round {round}, attempt {attempt}: live was held");
                     if locked {
-                        let (held, first) = held_rx
-                            .recv_timeout(Duration::from_secs(5))
-                            .expect("the locked pass synchronized no file");
-                        assert!(held, "round {round}: the second pass released live");
-                        let second = dir.take_synced();
-                        assert!(!first.is_empty() && !second.is_empty());
-                        // only what the publication during the unlocked pass wrote
-                        for name in &second {
-                            assert!(
-                                !before.contains(name)
-                                    || name == Path::new("meta.json")
-                                    || name == Path::new(".managed.json"),
-                                "round {round}: the locked pass synchronized {name:?} again"
-                            );
-                        }
+                        let passes: Vec<bool> = held_rx.try_iter().collect();
+                        assert!(
+                            passes.len() >= 2 && passes[..passes.len() - 1].iter().all(|h| !h),
+                            "round {round}: a repetition of the unlocked pass held live: {passes:?}"
+                        );
+                        assert_eq!(
+                            passes.last(),
+                            Some(&true),
+                            "round {round}: no pass held live: {passes:?}"
+                        );
                     }
                     assert!(inner.healthy());
                     let live = inner.live.lock();
