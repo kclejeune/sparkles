@@ -1580,7 +1580,7 @@ export interface paths {
         put?: never;
         /**
          * Send an MCP message
-         * @description One JSON-RPC message of the Model Context Protocol's Streamable HTTP transport. `404` unless the server runs with `--mcp`.
+         * @description One JSON-RPC message of the Model Context Protocol's Streamable HTTP transport. `404` unless the server runs with `--mcp`. With an `[oidc]` provider the endpoint is an OAuth protected resource. A `401` then names the protected-resource metadata in `WWW-Authenticate`, and a `403` with `error="insufficient_scope"` names the scope an access token lacks for this message.
          */
         post: operations["mcpPost"];
         /**
@@ -3221,6 +3221,46 @@ export interface paths {
          * @description Answers `401` only for invalid credentials.
          */
         get: operations["whoami"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/.well-known/oauth-protected-resource": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * Protected-resource metadata of the MCP endpoint
+         * @description RFC 9728 metadata that tells MCP clients which authorization server issues tokens for `/$/mcp` and which scopes it takes. Both paths answer the same document. `404` unless the server runs with `--mcp`, an auth configuration and an `[oidc]` provider.
+         */
+        get: operations["oauthProtectedResource"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/.well-known/oauth-protected-resource/$/mcp": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * Protected-resource metadata of the MCP endpoint (path-suffixed)
+         * @description RFC 9728 metadata that tells MCP clients which authorization server issues tokens for `/$/mcp` and which scopes it takes. Both paths answer the same document. `404` unless the server runs with `--mcp`, an auth configuration and an `[oidc]` provider.
+         */
+        get: operations["oauthProtectedResourceMcp"];
         put?: never;
         post?: never;
         delete?: never;
@@ -17272,6 +17312,72 @@ export interface operations {
                     "application/json": components["schemas"]["Whoami"];
                 };
             };
+            default: components["responses"]["Error"];
+        };
+    };
+    oauthProtectedResource: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description The metadata. */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": {
+                        /** @description The issuer of the `[oidc]` provider. */
+                        authorization_servers: string[];
+                        bearer_methods_supported: "header"[];
+                        /**
+                         * Format: uri
+                         * @description The resource identifier of `/$/mcp`: `server.public_url` followed by `/$/mcp`.
+                         */
+                        resource: string;
+                        resource_name?: string;
+                        scopes_supported: string[];
+                    };
+                };
+            };
+            404: components["responses"]["NotFound"];
+            default: components["responses"]["Error"];
+        };
+    };
+    oauthProtectedResourceMcp: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description The metadata. */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": {
+                        /** @description The issuer of the `[oidc]` provider. */
+                        authorization_servers: string[];
+                        bearer_methods_supported: "header"[];
+                        /**
+                         * Format: uri
+                         * @description The resource identifier of `/$/mcp`: `server.public_url` followed by `/$/mcp`.
+                         */
+                        resource: string;
+                        resource_name?: string;
+                        scopes_supported: string[];
+                    };
+                };
+            };
+            404: components["responses"]["NotFound"];
             default: components["responses"]["Error"];
         };
     };

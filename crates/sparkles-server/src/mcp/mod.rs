@@ -356,12 +356,15 @@ impl McpServer {
 
     /// Whether `p` may call the offered tool `name`: the write tool needs a dataset
     /// `p` may write to, and `graphql_query` one with a GraphQL schema that `p` may
-    /// query. Tool listings leave out the others.
+    /// query. Tool listings leave out the others. The write tools are listed by the
+    /// grants of an OIDC access token's principal, not by the token's scopes, so that a
+    /// client limited to `sparkles:read` learns of them and gets the scope challenge of
+    /// `http.rs` when it calls one (the call itself is checked against the scopes).
     pub fn allows(&self, p: &Principal, name: &str) -> bool {
         match name {
-            "sparql_update" => self.may_update(p),
+            "sparql_update" => self.may_update(&p.without_oauth_scopes()),
             n if branches::WRITE_TOOLS.contains(&n) => {
-                self.offers(n) && self.may_write_somewhere(p)
+                self.offers(n) && self.may_write_somewhere(&p.without_oauth_scopes())
             }
             #[cfg(feature = "graphql")]
             "graphql_query" => self.graphql_available(p),
@@ -379,7 +382,7 @@ impl McpServer {
     }
 
     /// Whether MCP may show the dataset `name` at all (`serve --mcp-dataset`).
-    fn exposed(&self, name: &str) -> bool {
+    pub(crate) fn exposed(&self, name: &str) -> bool {
         let patterns = &self.shared.cfg.datasets;
         patterns.is_empty() || patterns.iter().any(|p| crate::auth::glob(p, name))
     }

@@ -12,7 +12,11 @@
 //! route's permission (any caller). It then:
 //!
 //! * answers `401` with the server's challenges to an anonymous caller that can read no
-//!   dataset, so that clients know to sign in;
+//!   dataset, or to every anonymous caller with `--mcp-require-auth`, so that clients
+//!   know to sign in;
+//! * answers `403` with an `insufficient_scope` challenge (RFC 6750 §3.1) to a message
+//!   of an OIDC access token whose `sparkles:` scopes do not cover what the message
+//!   needs while the principal's grants do, so that the client asks for that scope;
 //! * binds each legacy session to the principal that opened it: another caller's
 //!   requests with that session id get `404`, like an unknown session;
 //! * bounds the number of legacy sessions;
@@ -98,6 +102,11 @@ pub struct ServeArgs {
     /// a task that the client polls, in milliseconds
     #[arg(long, value_name = "MS", default_value_t = 2000)]
     pub mcp_task_after_ms: u64,
+    /// With auth, answer every anonymous request to /$/mcp with 401, even when anonymous
+    /// callers may read a dataset, so that MCP clients sign in (with an [oidc] provider,
+    /// through OAuth discovery)
+    #[arg(long)]
+    pub mcp_require_auth: bool,
 }
 
 /// The endpoint's settings (`AppState::mcp`).
@@ -107,6 +116,8 @@ pub struct HttpConf {
     pub max_sessions: usize,
     /// ends the SSE streams and sessions when the server shuts down
     pub shutdown: CancellationToken,
+    /// every anonymous request gets `401` (`--mcp-require-auth`)
+    pub require_auth: bool,
 }
 
 impl ServeArgs {
@@ -188,6 +199,7 @@ impl ServeArgs {
             },
             max_sessions: self.mcp_max_sessions,
             shutdown: CancellationToken::new(),
+            require_auth: self.mcp_require_auth,
         }))
     }
 }
@@ -210,6 +222,7 @@ struct Endpoint {
     /// the principal (`Principal::id`) that opened each legacy session
     owners: Mutex<HashMap<String, String>>,
     max_sessions: usize,
+    require_auth: bool,
 }
 
 /// The `/$/mcp` route, or `None` when the endpoint is off.
@@ -235,6 +248,7 @@ pub fn route(state: &Arc<AppState>) -> Option<MethodRouter<Arc<AppState>>> {
         sessions,
         owners: Mutex::new(HashMap::new()),
         max_sessions: conf.max_sessions,
+        require_auth: conf.require_auth,
     });
     Some(axum::routing::any(move |req: Request| {
         let ep = ep.clone();
@@ -319,9 +333,13 @@ impl Endpoint {
                 "request without a caller",
             );
         };
-        // an anonymous caller that can read nothing is asked to sign in
-        if self.state.auth.is_some() && p.is_anonymous() && self.server.visible(&p).is_empty() {
-            return crate::auth::authentication_required(&self.state, &p, req.headers());
+        // an anonymous caller that can read nothing is asked to sign in, and with
+        // `--mcp-require-auth` every anonymous caller
+        if self.state.auth.is_some()
+            && p.is_anonymous()
+            && (self.require_auth || self.server.visible(&p).is_empty())
+        {
+            return crate::auth::mcp_authentication_required(&self.state, &p, req.headers());
         }
         let session = req
             .headers()
@@ -374,6 +392,13 @@ impl Endpoint {
                 charge.dataset = Some(only.name.clone());
             }
         }
+        // a token's scopes are checked for each message, before it is charged
+        #[cfg(feature = "auth")]
+        if p.oauth_scoped()
+            && let Some(r) = self.scope_challenge(&p, &message, &charge)
+        {
+            return r;
+        }
         let req = Request::from_parts(parts, Body::from(bytes));
         // a tool call or resource read runs queries, so it waits for the memory pool as
         // a query or update request does, inside the rate limiter's caps
@@ -387,6 +412,61 @@ impl Endpoint {
             }
             _ => self.admitted(req, &p, admit).await,
         }
+    }
+
+    /// The `403` scope challenge for `message` of a principal limited by its OAuth
+    /// scopes, or `None` when its scopes cover what the message needs or when a scope
+    /// would not help because its grants do not allow it either (the tool then answers
+    /// as for any caller). A write tool needs `sparkles:update` on its dataset, and every
+    /// other message `sparkles:read` on its dataset, or on some dataset when it names
+    /// none. The bound of a scope does not depend on the branch, so the levels compared
+    /// are those of any branch.
+    #[cfg(feature = "auth")]
+    fn scope_challenge(&self, p: &Principal, message: &Value, charge: &Charge) -> Option<Response> {
+        use crate::auth::{Level, oauth};
+        let auth = self.state.auth.as_ref()?;
+        let (public, _) = crate::auth::protected_resource(&self.state, &auth.policy())?;
+        // a response or notification of the client asks for nothing
+        let method = message.get("method").and_then(Value::as_str)?;
+        message.get("id")?;
+        let tool = (method == "tools/call")
+            .then(|| message.pointer("/params/name").and_then(Value::as_str))
+            .flatten();
+        let need = if tool.is_some_and(|t| super::branches::WRITE_TOOLS.contains(&t)) {
+            Level::Write
+        } else {
+            Level::Read
+        };
+        let full = p.without_oauth_scopes();
+        let reaches =
+            |who: &Principal, ds: &str| who.level_any_branch(ds).is_some_and(|l| l >= need);
+        let short = match &charge.dataset {
+            Some(ds) => {
+                self.state.get(ds).is_some()
+                    && self.server.exposed(ds)
+                    && reaches(&full, ds)
+                    && !reaches(p, ds)
+            }
+            None => {
+                let some = |who: &Principal| {
+                    self.state
+                        .datasets()
+                        .values()
+                        .any(|ds| self.server.exposed(&ds.name) && reaches(who, &ds.name))
+                };
+                some(&full) && !some(p)
+            }
+        };
+        if !short {
+            return None;
+        }
+        let scope = oauth::scope_for(need);
+        let what = tool.unwrap_or(method);
+        let msg = match &charge.dataset {
+            Some(ds) => format!("{what} on {ds} needs the {scope} scope"),
+            None => format!("{what} needs the {scope} scope"),
+        };
+        Some(crate::auth::insufficient_scope(p, &public, scope, &msg))
     }
 
     /// Take an initial grant of the query memory pool when `admit`, waiting in arrival

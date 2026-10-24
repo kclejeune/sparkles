@@ -189,13 +189,42 @@ pub fn proxy_host_warning(st: &AppState, public_hosts: bool) -> Option<String> {
 /// the other `/$/auth/*` routes do not exist).
 pub fn routes() -> axum::Router<Arc<AppState>> {
     use axum::routing::get;
-    let r = axum::Router::new().route("/$/whoami", get(whoami));
+    let r = axum::Router::new()
+        .route("/$/whoami", get(whoami))
+        // RFC 9728 metadata of `/$/mcp`, in every build (`404` unless it applies)
+        .route(
+            "/.well-known/oauth-protected-resource",
+            get(protected_resource_metadata),
+        )
+        .route(
+            "/.well-known/oauth-protected-resource/$/mcp",
+            get(protected_resource_metadata),
+        );
     #[cfg(feature = "auth")]
     return r.merge(super::handlers::routes());
     #[cfg(not(feature = "auth"))]
     r.route(
         "/$/auth/config",
         get(|| async { axum::Json(json!({ "enabled": false })) }),
+    )
+}
+
+/// `GET /.well-known/oauth-protected-resource[/$/mcp]`: the protected-resource metadata
+/// of `/$/mcp` (RFC 9728 §3), or `404` when the endpoint is not an OAuth protected
+/// resource (no `--mcp`, no auth, or no `[oidc]` provider).
+async fn protected_resource_metadata(State(st): State<Arc<AppState>>) -> axum::response::Response {
+    use axum::response::IntoResponse;
+    #[cfg(feature = "auth")]
+    if let Some(a) = &st.auth
+        && let Some((public, issuer)) = super::protected_resource(&st, &a.policy())
+    {
+        return axum::Json(super::oauth::metadata(&public, &issuer)).into_response();
+    }
+    let _ = &st;
+    super::routes::json_error(
+        axum::http::StatusCode::NOT_FOUND,
+        "no OAuth protected resource here: /$/mcp is one only on a server with --mcp, an auth \
+         configuration and an [oidc] provider",
     )
 }
 

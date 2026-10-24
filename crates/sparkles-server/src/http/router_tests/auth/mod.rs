@@ -21,6 +21,8 @@ pub(super) mod graphs;
 mod idp;
 mod io_profile;
 mod limits;
+#[cfg(feature = "mcp")]
+mod mcp_oauth;
 mod oidc;
 mod overview;
 mod paths;
@@ -61,6 +63,8 @@ pub(super) struct Fixture {
     pub extra: String,
     /// the values of `--gsp-direct-naming`
     pub gsp_direct_naming: Vec<String>,
+    /// `serve --mcp` with these more MCP flags; `None`: no MCP endpoint
+    pub mcp: Option<Vec<&'static str>>,
 }
 
 impl Default for Fixture {
@@ -73,6 +77,7 @@ impl Default for Fixture {
             public_url: "http://localhost:3030",
             extra: String::new(),
             gsp_direct_naming: Vec::new(),
+            mcp: None,
         }
     }
 }
@@ -208,6 +213,19 @@ fn open_state(
     st.outbound.allow_private = true;
     if f.enabled {
         st.auth = Some(Arc::new(Auth::open(config, dir).unwrap().0));
+    }
+    #[cfg(feature = "mcp")]
+    if let Some(flags) = &f.mcp {
+        #[derive(clap::Parser)]
+        struct Flags {
+            #[command(flatten)]
+            mcp: crate::mcp::http::ServeArgs,
+        }
+        use clap::Parser;
+        let args = ["serve", "--mcp"].into_iter().chain(flags.iter().copied());
+        st.mcp = Some(Arc::new(
+            Flags::parse_from(args).mcp.conf(&st).unwrap().unwrap(),
+        ));
     }
     let st = Arc::new(st);
     for name in ["wiki", "team-a", "secret", "public"] {

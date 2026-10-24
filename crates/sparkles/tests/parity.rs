@@ -786,6 +786,9 @@ fn entries() -> Vec<(&'static str, Entry)> {
         server_only!("mcpPost", Mcp),
         server_only!("mcpStream", Mcp),
         server_only!("mcpEndSession", Mcp),
+        // RFC 9728 metadata of `/$/mcp` as an OAuth protected resource
+        server_only!("oauthProtectedResource", Credentials),
+        server_only!("oauthProtectedResourceMcp", Credentials),
         // C18: the MCP tools over HTTP, and the server's model and assistant settings
         server_only!("checkQuery", Mcp),
         server_only!("recallFacts", Mcp),

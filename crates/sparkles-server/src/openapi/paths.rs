@@ -582,6 +582,37 @@ fn server(p: &mut Paths) {
         .see("whoami")
         .json("200", "The caller.", "Whoami"),
     );
+    let resource_metadata = json!({
+        "type": "object",
+        "required": ["resource", "authorization_servers", "scopes_supported", "bearer_methods_supported"],
+        "properties": {
+            "resource": { "type": "string", "format": "uri", "description": "The resource identifier of `/$/mcp`: `server.public_url` followed by `/$/mcp`." },
+            "authorization_servers": { "type": "array", "items": { "type": "string", "format": "uri" }, "description": "The issuer of the `[oidc]` provider." },
+            "scopes_supported": { "type": "array", "items": { "type": "string" } },
+            "bearer_methods_supported": { "type": "array", "items": { "type": "string", "enum": ["header"] } },
+            "resource_name": { "type": "string" }
+        }
+    });
+    for (path, id, summary) in [
+        (
+            "/.well-known/oauth-protected-resource",
+            "oauthProtectedResource",
+            "Protected-resource metadata of the MCP endpoint",
+        ),
+        (
+            "/.well-known/oauth-protected-resource/$/mcp",
+            "oauthProtectedResourceMcp",
+            "Protected-resource metadata of the MCP endpoint (path-suffixed)",
+        ),
+    ] {
+        p.add(
+            op(GET, path, id, "MCP", summary)
+                .doc("RFC 9728 metadata that tells MCP clients which authorization server issues tokens for `/$/mcp` and which scopes it takes. Both paths answer the same document. `404` unless the server runs with `--mcp`, an auth configuration and an `[oidc]` provider.")
+                .see("oauth-for-the-mcp-endpoint")
+                .json_inline("200", "The metadata.", resource_metadata.clone())
+                .errors(&[404]),
+        );
+    }
     for (m, id) in [(GET, "getServer"), (POST, "getServerPost")] {
         p.add(
             op(m, "/$/server", id, "Server", "Server information")
@@ -2510,7 +2541,7 @@ fn format_and_mcp(p: &mut Paths) {
             .errors(&[400, 413])
     };
     p.add(
-        mcp(POST, "mcpPost", "Send an MCP message", "One JSON-RPC message of the Model Context Protocol's Streamable HTTP transport. `404` unless the server runs with `--mcp`.")
+        mcp(POST, "mcpPost", "Send an MCP message", "One JSON-RPC message of the Model Context Protocol's Streamable HTTP transport. `404` unless the server runs with `--mcp`. With an `[oidc]` provider the endpoint is an OAuth protected resource. A `401` then names the protected-resource metadata in `WWW-Authenticate`, and a `403` with `error=\"insufficient_scope\"` names the scope an access token lacks for this message.")
             .header("Mcp-Method", s(), "The JSON-RPC method (stateless requests).")
             .header("Mcp-Name", s(), "The tool, resource or prompt name, or the task id (stateless requests).")
             .body(true, "A JSON-RPC message.", json!({ "application/json": { "schema": { "type": "object" } } }))

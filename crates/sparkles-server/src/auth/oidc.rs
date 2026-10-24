@@ -339,38 +339,57 @@ impl Oidc {
     }
 
     /// Validate an access token presented as `Authorization: Bearer` (RFC 7519 §7.2,
-    /// shaped by RFC 9068): the signature, `iss`, an `aud` of `api_audience`, `exp` and
-    /// `nbf` with leeway, and the required scopes. Returns its claims.
-    pub async fn verify_access_token(&self, token: &str) -> Result<Map<String, J>, JwtError> {
-        if !self.accepts_access_tokens() {
+    /// shaped by RFC 9068): the signature, `iss`, `exp` and `nbf` with leeway, and an
+    /// accepted audience. An `api_audience` value is accepted on every route when the
+    /// token grants every `api_scopes` value. `resource`, the identifier of `/$/mcp`
+    /// when the request goes there, is accepted there too, whatever the `api_scopes`
+    /// (RFC 8707: a token requested for the resource works at the resource).
+    pub async fn verify_access_token(
+        &self,
+        token: &str,
+        resource: Option<&str>,
+    ) -> Result<AccessToken, JwtError> {
+        if !self.accepts_access_tokens() && resource.is_none() {
             return Err(JwtError::Invalid("access tokens are not accepted".into()));
         }
         let m = self
             .metadata()
             .await
             .map_err(|e| JwtError::Unavailable(format!("{e:#}")))?;
+        let mut audiences = self.settings.api_audiences.clone();
+        audiences.extend(resource.map(str::to_string));
         let claims = jwt::verify(
             token,
             &self.keys,
             &m.jwks_uri,
             &Expect {
                 issuer: &m.issuer,
-                audiences: &self.settings.api_audiences,
+                audiences: &audiences,
                 algorithms: &self.settings.algorithms,
                 required: &["exp"],
             },
         )
         .await?;
+        let aud = jwt::strings(claims.get("aud"));
         let granted = jwt::scopes(&claims);
-        if let Some(missing) = self
+        let missing = self
             .settings
             .api_scopes
             .iter()
-            .find(|s| !granted.contains(s))
-        {
-            return Err(JwtError::Invalid(format!("scope {missing} not granted")));
+            .find(|s| !granted.contains(s));
+        let api = aud.iter().any(|a| self.settings.api_audiences.contains(a)) && missing.is_none();
+        let for_resource = resource.is_some_and(|r| aud.iter().any(|a| a == r));
+        if !api && !for_resource {
+            return Err(JwtError::Invalid(match missing {
+                Some(s) => format!("scope {s} not granted"),
+                None => "no accepted audience for this route".into(),
+            }));
         }
-        Ok(claims)
+        Ok(AccessToken {
+            claims,
+            api,
+            scopes: granted,
+        })
     }
 
     /// Validate a back-channel logout token (OpenID Connect Back-Channel Logout 1.0,
@@ -445,6 +464,16 @@ impl Oidc {
     pub fn end_session_endpoint(&self) -> Option<String> {
         self.metadata.get()?.end_session_endpoint.clone()
     }
+}
+
+/// A verified access token of the provider.
+pub struct AccessToken {
+    pub claims: Map<String, J>,
+    /// accepted through `api_audience` (with every `api_scopes` value), which is valid
+    /// on every route; otherwise only through the `/$/mcp` resource
+    pub api: bool,
+    /// the scopes it grants (`scope` or `scp`)
+    pub scopes: Vec<String>,
 }
 
 /// A login started at `/$/auth/oidc/login`, waiting for its callback.

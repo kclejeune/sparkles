@@ -36,6 +36,9 @@ pub const ROUTES: &[(&str, &[&str])] = &[
     ("/ui/{*path}", &["GET"]),
     ("/$/ping", &["GET", "POST"]),
     ("/$/whoami", &["GET"]),
+    // RFC 9728 metadata of `/$/mcp` as an OAuth protected resource
+    ("/.well-known/oauth-protected-resource", &["GET"]),
+    ("/.well-known/oauth-protected-resource/$/mcp", &["GET"]),
     // the OpenAPI description (`openapi`)
     ("/$/openapi.json", &["GET"]),
     ("/$/openapi.yaml", &["GET"]),
@@ -301,6 +304,10 @@ pub fn need(route: &str, method: &Method, uri: &Uri, headers: &HeaderMap) -> Opt
         "/" | "/ui" | "/ui/" | "/ui/{*path}" | "/$/ping" | "/$/ready" | "/$/whoami" => Public,
         // describes the binary's API, not its data or configuration
         "/$/openapi.json" | "/$/openapi.yaml" => Public,
+        // where MCP clients find the authorization server, before they hold a token
+        "/.well-known/oauth-protected-resource" | "/.well-known/oauth-protected-resource/$/mcp" => {
+            Public
+        }
         "/$/auth/config"
         | "/$/auth/login"
         | "/$/auth/oidc/login"
@@ -833,18 +840,21 @@ pub fn json_error(status: StatusCode, msg: &str) -> Response {
 
 /// `WWW-Authenticate` challenges of a 401. `Basic` is left out for script fetches (no
 /// browser login dialog over the UI) and when no user can sign in with a password.
+/// `bearer_params` are more auth-params of the `Bearer` challenge (`, k="v"`), such as
+/// the `resource_metadata` of `/$/mcp`.
 fn challenges(
     realm: &str,
     h: &HeaderMap,
     bearer_error: Option<&str>,
     basic: bool,
+    bearer_params: &str,
 ) -> Vec<HeaderValue> {
     let mut out = Vec::new();
     let bearer = match bearer_error {
-        None => format!("Bearer realm=\"{realm}\""),
-        Some(d) => {
-            format!("Bearer realm=\"{realm}\", error=\"invalid_token\", error_description=\"{d}\"")
-        }
+        None => format!("Bearer realm=\"{realm}\"{bearer_params}"),
+        Some(d) => format!(
+            "Bearer realm=\"{realm}\", error=\"invalid_token\", error_description=\"{d}\"{bearer_params}"
+        ),
     };
     out.extend(HeaderValue::from_str(&bearer).ok());
     let script = h
@@ -865,9 +875,10 @@ fn unauthorized(
     msg: &str,
     bearer_error: Option<&str>,
     basic: bool,
+    bearer_params: &str,
 ) -> Response {
     let mut r = json_error(StatusCode::UNAUTHORIZED, msg);
-    for c in challenges(realm, h, bearer_error, basic) {
+    for c in challenges(realm, h, bearer_error, basic, bearer_params) {
         r.headers_mut().append(header::WWW_AUTHENTICATE, c);
     }
     r
@@ -891,6 +902,19 @@ fn forbidden_as(p: &Principal, msg: &str, kind: Denied) -> Response {
         r.headers_mut().insert(header::WWW_AUTHENTICATE, v);
     }
     with_report(r, report_of(p, Some(kind)))
+}
+
+/// The `403` of an OIDC access token whose `sparkles:` scopes do not cover an operation
+/// its grants allow (RFC 6750 §3.1): `scope` names the scope to ask for, and the
+/// challenge names the metadata of `/$/mcp`, as the MCP authorization spec asks.
+#[cfg(all(feature = "auth", feature = "mcp"))]
+pub fn insufficient_scope(p: &Principal, public_url: &str, scope: &str, msg: &str) -> Response {
+    let mut r = json_error(StatusCode::FORBIDDEN, msg);
+    if let Ok(v) = HeaderValue::from_str(&super::oauth::insufficient_scope(public_url, scope, msg))
+    {
+        r.headers_mut().insert(header::WWW_AUTHENTICATE, v);
+    }
+    with_report(r, report_of(p, Some(Denied::Forbidden)))
 }
 
 fn report_of(p: &Principal, denied: Option<Denied>) -> AuthReport {
@@ -941,6 +965,32 @@ fn denial_message(ds: &str, lvl: Level, e: Endpoint, have: Option<Level>) -> Str
 /// The `401` with the server's challenges, for an anonymous caller that must sign in
 /// (the MCP endpoint, when anonymous callers can read no dataset).
 pub fn authentication_required(st: &AppState, p: &Principal, headers: &HeaderMap) -> Response {
+    authentication_required_with(st, p, headers, "")
+}
+
+/// [`authentication_required`] at `/$/mcp`: when the endpoint is an OAuth protected
+/// resource, the `Bearer` challenge names its metadata and the scope to ask for
+/// (RFC 9728 §5.1).
+#[cfg(feature = "mcp")]
+pub fn mcp_authentication_required(st: &AppState, p: &Principal, headers: &HeaderMap) -> Response {
+    #[cfg(feature = "auth")]
+    let params = st
+        .auth
+        .as_ref()
+        .and_then(|a| protected_resource(st, &a.policy()))
+        .map(|(public, _)| super::oauth::bearer_params(&public, true))
+        .unwrap_or_default();
+    #[cfg(not(feature = "auth"))]
+    let params = String::new();
+    authentication_required_with(st, p, headers, &params)
+}
+
+fn authentication_required_with(
+    st: &AppState,
+    p: &Principal,
+    headers: &HeaderMap,
+    bearer_params: &str,
+) -> Response {
     #[cfg(feature = "auth")]
     let (realm, basic) = match &st.auth {
         Some(a) => {
@@ -954,8 +1004,40 @@ pub fn authentication_required(st: &AppState, p: &Principal, headers: &HeaderMap
         let _ = st;
         ("sparkles".to_string(), false)
     };
-    let r = unauthorized(&realm, headers, "authentication required", None, basic);
+    let r = unauthorized(
+        &realm,
+        headers,
+        "authentication required",
+        None,
+        basic,
+        bearer_params,
+    );
     with_report(r, report_of(p, Some(Denied::Unauthenticated)))
+}
+
+/// `server.public_url` and the OIDC issuer when `/$/mcp` is an OAuth protected
+/// resource: the endpoint is mounted (`serve --mcp`) and the policy has an `[oidc]`
+/// provider, which requires `server.public_url`. The URLs built from it never come from
+/// forwarded headers.
+#[cfg(feature = "auth")]
+pub(crate) fn protected_resource(
+    st: &AppState,
+    policy: &super::policy::Policy,
+) -> Option<(String, String)> {
+    #[cfg(feature = "mcp")]
+    let mounted = st.mcp.is_some();
+    #[cfg(not(feature = "mcp"))]
+    let mounted = {
+        let _ = st;
+        false
+    };
+    if !mounted {
+        return None;
+    }
+    Some((
+        policy.public_url.clone()?,
+        policy.oidc.as_ref()?.issuer.clone(),
+    ))
 }
 
 /// The `{ds}` segment of the request path.
@@ -1024,6 +1106,17 @@ async fn enforce(st: &AppState, auth: &super::Auth, mut req: Request, next: Next
     let policy = auth.policy();
     let realm = policy.realm.as_str();
     let basic = policy.has_users();
+    // at `/$/mcp` as an OAuth protected resource, the resource identifier is an accepted
+    // audience, and a 401 names the metadata
+    let oauth_public = (route == super::oauth::MCP_PATH)
+        .then(|| protected_resource(st, &policy))
+        .flatten()
+        .map(|(public, _)| public);
+    let resource = oauth_public.as_deref().map(super::oauth::resource);
+    let bearer_params = oauth_public
+        .as_deref()
+        .map(|p| super::oauth::bearer_params(p, false))
+        .unwrap_or_default();
     let span = tracing::Span::current();
     let count = |kind: Denied| {
         auth.metrics.denied[Denied::ALL.iter().position(|d| *d == kind).unwrap_or(0)]
@@ -1069,6 +1162,7 @@ async fn enforce(st: &AppState, auth: &super::Auth, mut req: Request, next: Next
             peer.as_ref(),
             admission.as_ref(),
             client.as_ref(),
+            resource.as_deref(),
         )
         .await
     {
@@ -1131,6 +1225,7 @@ async fn enforce(st: &AppState, auth: &super::Auth, mut req: Request, next: Next
                     "token expired",
                     Some("token expired"),
                     basic,
+                    &bearer_params,
                 ),
                 _ => unauthorized(
                     realm,
@@ -1138,6 +1233,7 @@ async fn enforce(st: &AppState, auth: &super::Auth, mut req: Request, next: Next
                     "invalid credentials",
                     Some("invalid credentials"),
                     basic,
+                    &bearer_params,
                 ),
             };
             if failed && !exhausted {
@@ -1225,7 +1321,7 @@ async fn enforce(st: &AppState, auth: &super::Auth, mut req: Request, next: Next
     }
 
     // 4.–6. decide
-    let unauth = |h: &HeaderMap| unauthorized(realm, h, "authentication required", None, basic);
+    let unauth = |h: &HeaderMap| unauthorized(realm, h, "authentication required", None, basic, "");
     match need {
         Need::Public | Need::Caller => {}
         Need::Authed => {
