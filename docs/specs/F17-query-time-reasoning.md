@@ -584,23 +584,27 @@ read did not apply.
   out, since the `eq-rep-*` rules, whose predicate is a variable, would otherwise answer
   every demand.
 * **Negation.** The pattern a `noValue` reads, with its constants bound, is a demand of a
-  lower stage evaluated to its fixpoint first. A negated `rdf:type` pattern with a
-  constant class asks for that class alone, as a positive one does. The schema pass runs
-  its lower stages first too, and they derive instance facts in full, so a schema rule's
-  `noValue` reads a complete pattern. A program whose stages do not end is not
+  lower stage evaluated to its fixpoint first. The lower stage's key keeps the pattern's
+  constant subject and object, so a rule whose head has other constants there is not
+  part of it, and a negated `rdf:type` pattern with a constant class asks for that class
+  alone, as a positive one does. The schema pass runs its lower stages first too, and
+  they derive instance facts in full, so a schema rule's `noValue` reads a complete
+  pattern. The schema facts they derive are kept in the schema's table. A program whose stages do not end is not
   stratified and fails with `422` and `reasoning-rules`.
 * **Lists.** A builtin or head action that reads an RDF list is not evaluated again when
   the list's facts grow. When rules give `rdf:first` or `rdf:rest` facts with that
   constant predicate, a lower stage therefore derives every such list before the stage
-  that reads it. The facts a `listForAll` reads are asked for behind the copy's guard,
+  that reads it. When that stage would depend on itself, as when a rule reads one list
+  to build another, the program is made again with lists read as the stage holds them. The facts a `listForAll` reads are asked for behind the copy's guard,
   unless an atom of the rule already matches them as in `cls-int1`.
 * **Evaluation.** `crates/sparkles-reasoner/src/query.rs` evaluates the program with the
   semi-naive engine over the base tier of the caller's input graphs, under the query's
   deadline, cancellation and memory budget, and the schema joins of specialization stop
   with the query too. Each derivation adds its magic facts and continues from them. The
   program is made at the first derivation that misses the table cache. The facts a query
-  copies into its view are charged to its memory budget at 448 bytes each, seven index
-  keys with their node overhead, also when they come from cached tables.
+  adds to its view are charged to its memory budget at 448 bytes each, seven index keys
+  with their node overhead, also when they come from cached tables. A fact that several
+  tables hold is charged once.
 * **Tables.** `crates/sparkles-reasoner/src/tables.rs` caches what a demand derived,
   keyed by the generation, the commit, the mask of a view that hides triples, the input
   graphs, the rules' digest, the demand with its constants and a hash of its seeds. Local
@@ -643,7 +647,8 @@ read did not apply.
 8. Lists that rules derive are complete in a lower stage, which derives every list the
    rules give rather than the lists a query reaches. This costs a derivation of all such
    lists for each query that reads one and keeps the answers equal to a fixpoint. Lists
-   that only the equality rules rename are read with what they hold so far.
+   that only the equality rules rename, and lists whose stage would depend on itself, are
+   read with what they hold so far.
 9. DESCRIBE is refused rather than answered from the asserted facts, so a description is
    never silently incomplete.
 
@@ -750,7 +755,13 @@ Facts copied from cached tables bypassed the memory budget
 (`specialization_stops_at_the_deadline`). List builtins asked for no derived lists
 (`list_builtins_ask_for_derived_lists`). Negated type demands lost their class and
 reported a false cycle (`negative_type_demands_keep_the_class`). DESCRIBE answered
-without derived facts (`describe_is_refused_under_demand`).
+without derived facts (`describe_is_refused_under_demand`). A second review of the fixes
+found three regressions in them, each fixed with a test. Schema facts from the schema
+pass's lower stages were left out of the schema's table
+(`cached_schema_keeps_lower_stage_schema_facts`). Facts that several tables hold were
+charged once per table (`overlapping_tables_are_charged_once`). A rule that reads one
+list and builds another was refused as unstratified
+(`distinct_list_heads_are_not_a_cycle`).
 
 **Limitations.** Schema facts that follow only from derived instance facts can be missing
 from a query that reads them, as decision 3 describes, and `owl:sameAs` that rules derive
