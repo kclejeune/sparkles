@@ -149,6 +149,11 @@ test('merge review: a node the path finder draws is validated too', async ({ pag
   await expect
     .poll(async () => (await badgesOf(page))[`<${EX}p5>`], { timeout: 15_000 })
     .toBe('✕1');
+  // its results open, and Show triples marks it
+  await page.getByRole('button', { name: /Eve, 1 violation/ }).click();
+  const panel = page.getByRole('dialog', { name: /Validation results of/ });
+  await panel.getByRole('button', { name: 'Show triples' }).click();
+  await expect(page.locator('.wrap[data-vmarked]')).toHaveAttribute('data-vmarked', '1');
 });
 
 test('merge review: a source without shapes drops the badges', async ({ page }) => {

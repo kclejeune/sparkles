@@ -907,8 +907,10 @@
     void validation;
     void nodes;
     if (!cy) return;
-    cy.off('viewport position add remove layoutstop', schedulePlace);
-    if (validation?.badges.size) cy.on('viewport position add remove layoutstop', schedulePlace);
+    // style: a path's nodes appear by animation, and a lens changes their sizes
+    const events = 'viewport position add remove layoutstop style';
+    cy.off(events, schedulePlace);
+    if (validation?.badges.size) cy.on(events, schedulePlace);
     schedulePlace();
     // for the tests: the badges as text
     if (wrap)

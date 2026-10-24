@@ -188,6 +188,7 @@
     changes = null;
     selection.clear();
     lensPick = null;
+    vShown = new Set();
     graphEpoch++;
   }
   let graphView: GraphView | undefined = $state();
@@ -201,6 +202,8 @@
   let vBadges = $state(new Map<string, Badge>());
   let vMarked = $state<{ nodes: string[]; edges: string[] } | null>(null);
   let vPlaying = $state(false);
+  /** The elements Show triples drew, which stay drawn while the paths are drawn alone. */
+  let vShown = $state(new Set<string>());
   let overlay: ValidationOverlay | undefined = $state();
   function toggleValidation() {
     vChoice = !(vChoice ?? vLive);
@@ -210,8 +213,16 @@
   /** Show triples: draw the result's focus node, path edge and value, and mark them. */
   function showResultTriples(r: VResult) {
     const sid = termKey(r.focus);
+    // a node the path finder drew joins the graph, so that its triples can be drawn
+    const drawnNode = gNodes.find((n) => n.id === sid && n.change !== 'removed');
+    if (!nodes[sid] && drawnNode) ensureNode(r.focus, drawnNode.label);
     const out = { nodes: nodes[sid] ? [sid] : [], edges: [] as string[] };
-    if (!r.path || !r.value || !nodes[sid]) return out;
+    const shown = () => {
+      // paths alone hide the explored graph, but not the triples of a result
+      vShown = new Set([...vShown, ...out.nodes, ...out.edges]);
+      return out;
+    };
+    if (!r.path || !r.value || !nodes[sid]) return shown();
     const lit = r.value.type === 'literal';
     if (lit) showLiterals = true;
     const oid = lit ? `lit:${sid}|${r.path}|${termKey(r.value)}` : termKey(r.value);
@@ -220,7 +231,7 @@
     addEdge(s, r.path, o, lit);
     out.nodes.push(oid);
     out.edges.push(`${s}|${r.path}|${o}`);
-    return out;
+    return shown();
   }
   // the reads of a view that goes away stop with it
   onDestroy(() => {
@@ -459,7 +470,7 @@
     if (!pathOverlay) return [...real, ...ghosts];
     // the path finder's overlay: on the drawn nodes, plus the nodes it adds
     const on = new Map(pathOverlay.nodes.map((n) => [n.key, n]));
-    const drawn = pathsAlone ? [] : [...real, ...ghosts];
+    const drawn = pathsAlone ? real.filter((n) => vShown.has(n.id)) : [...real, ...ghosts];
     const have = new Set(drawn.map((n) => n.id));
     const marked = drawn.map((n) => (on.has(n.id) ? { ...n, paths: on.get(n.id)!.paths } : n));
     const extra = pathOverlay.nodes
@@ -496,7 +507,7 @@
       .map((e) => ({ ...e, change: 'removed' as const }));
     if (!pathOverlay) return [...real, ...ghosts];
     const on = new Map(pathOverlay.edges.map((e) => [e.id, e]));
-    const drawn = pathsAlone ? [] : [...real, ...ghosts];
+    const drawn = pathsAlone ? real.filter((e) => vShown.has(e.id)) : [...real, ...ghosts];
     const have = new Set(drawn.map((e) => e.id));
     const marked = drawn.map((e) => (on.has(e.id) ? { ...e, paths: on.get(e.id)!.paths } : e));
     const extra = pathOverlay.edges
