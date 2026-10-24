@@ -34,10 +34,10 @@ Build both sides of an A/B with the same compilers. The C compiler builds mimall
 binaries built with different C compilers differ on every request. A binary built outside
 the Nix development shell with GCC 16.2 and Clang 21 ran 11 to 33 thousand fewer
 instructions per request than the same source built in the shell, enough to make small
-queries look slower on the other side. Build both revisions in `nix develop`, and check
-the `.comment` section of each binary (`readelf -p .comment`) when a screen of small
-queries flags something. [Roadmap](ROADMAP.md) item 181 records the compilers with each
-cached binary.
+queries look slower on the other side. Build both revisions in `nix develop`.
+`scripts/nsc-bench.sh` reads the compilers from each binary's `.comment` section and
+refuses a pair whose compilers differ, and `readelf -p .comment` shows them for any other
+comparison.
 
 Server ports belong below the kernel's range of ephemeral client ports, which is 32768 to
 60999 by default (`/proc/sys/net/ipv4/ip_local_port_range`). A client connection that
@@ -117,8 +117,15 @@ A change that touched only SERVICE code once added 4.5% to the instructions per 
 `expr-order-key`. One unit gives `expr-order-key` 6.4% fewer instructions per request on
 atlas, and in 24 interleaved rounds on forge it ran 5.3% faster, 12.72 ms against
 13.43 ms, with no overlap between the ranges of round medians. `exists-join`, `star-join`
-and `employee-docs` moved by 2% or less, and `order-by-full` ran 0.7% slower, which
-[roadmap](ROADMAP.md) item 109 follows up.
+and `employee-docs` moved by 2% or less.
+
+`order-by-full` is the one query that one unit makes slower. It runs the same number of
+instructions under both settings, 26.67 billion per request at 10.5M, so it does no extra
+work and no call in its sort lost its inlining. In 12 interleaved rounds on forge its
+server time was 0.8% longer with one unit, 679.6 ms against 674.1 ms, slower in every
+round, and its client time was the same, 1250.4 ms against 1250.5 ms. The difference
+comes from where the sort's code lands, and it is small next to the gain on
+`expr-order-key`, so the setting stays.
 
 A Namespace screen could not decide this setting. Its geometric mean was 0.997 for server
 time, with queries under 2 ms moving 9% to 32% in both directions, so the pinned check on

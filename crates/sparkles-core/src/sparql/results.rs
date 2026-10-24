@@ -229,6 +229,110 @@ impl<W: Write> Write for LimitedWriter<W> {
     }
 }
 
+/// The bytes [`Buffered`] collects before it writes them on. Serializers write a few
+/// bytes at a time, and each write that went straight to the response writer passed its
+/// size limit, cancellation check and channel buffer.
+const OUTPUT_BUFFER: usize = 8 << 10;
+
+/// The writer that the eager result serializers write to: their output in pieces of
+/// [`OUTPUT_BUFFER`] bytes on the way to the caller's writer. Its type is the engine's,
+/// so the serializers are compiled with the engine and not once per caller's writer in
+/// the crate that calls them, where their speed moved with unrelated changes.
+///
+/// A serializer counts its rows in `staged` after writing each of them. A row counts in
+/// the caller's `sent` only once its bytes have reached the caller's writer, so `sent`
+/// still holds the rows of the output when that writer stops it partway.
+pub(crate) struct Buffered<'a> {
+    inner: &'a mut dyn Write,
+    buf: Vec<u8>,
+    staged: &'a Cell<u64>,
+    /// `staged` at the last write, which every row before it ends inside `buf`
+    rows: u64,
+    sent: &'a Cell<u64>,
+    /// the caller's writer refused a write, so nothing more goes to it
+    failed: bool,
+}
+
+impl Buffered<'_> {
+    /// Write the collected bytes on, and with them the rows they end.
+    fn drain(&mut self) -> std::io::Result<()> {
+        if !self.buf.is_empty() {
+            self.pass(self.buf.len())?;
+            self.buf.clear();
+        }
+        self.sent.set(self.rows);
+        Ok(())
+    }
+
+    /// Write the first `n` bytes of `buf` on, or remember that the caller's writer failed.
+    fn pass(&mut self, n: usize) -> std::io::Result<()> {
+        let r = self.inner.write_all(&self.buf[..n]);
+        self.failed |= r.is_err();
+        r
+    }
+}
+
+impl Write for Buffered<'_> {
+    #[inline]
+    fn write(&mut self, b: &[u8]) -> std::io::Result<usize> {
+        // the rows counted since the last write end where `buf` ends now
+        self.rows = self.staged.get();
+        if b.len() > OUTPUT_BUFFER - self.buf.len() {
+            self.drain()?;
+            if b.len() >= OUTPUT_BUFFER {
+                let r = self.inner.write_all(b);
+                self.failed |= r.is_err();
+                r?;
+                return Ok(b.len());
+            }
+        }
+        self.buf.extend_from_slice(b);
+        Ok(b.len())
+    }
+
+    #[inline]
+    fn write_all(&mut self, b: &[u8]) -> std::io::Result<()> {
+        self.write(b).map(|_| ())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        self.rows = self.staged.get();
+        self.drain()?;
+        self.inner.flush()
+    }
+}
+
+/// Run `f`, a serializer, on a [`Buffered`] writer to `w`, and write what it left in the
+/// buffer on. A serializer that fails still has the bytes before its failure written on,
+/// as they were without the buffer, so `sent` counts the rows that reached `w`.
+fn write_buffered(
+    w: &mut dyn Write,
+    sent: &Cell<u64>,
+    f: &mut dyn FnMut(&mut Buffered<'_>, &Cell<u64>) -> Result<()>,
+) -> Result<()> {
+    let staged = Cell::new(sent.get());
+    let mut out = Buffered {
+        inner: w,
+        buf: Vec::with_capacity(OUTPUT_BUFFER),
+        staged: &staged,
+        rows: staged.get(),
+        sent,
+        failed: false,
+    };
+    let result = f(&mut out, &staged);
+    out.rows = staged.get();
+    match result {
+        Ok(()) => out.drain().map_err(io),
+        Err(e) => {
+            // the error is the one to report, and the output stops here either way
+            if !out.failed {
+                let _ = out.drain();
+            }
+            Err(e)
+        }
+    }
+}
+
 /// The reservation for the cells of a streamed row that the batch's term cache does not
 /// hold, which are decoded or built for the row and dropped after it. It grows to the
 /// largest such row and is held until the output ends, so a row costs no reservation of
@@ -379,6 +483,19 @@ pub fn write_solutions_counted(
     if fmt == SolutionsFormat::Sparkles {
         return write_native_json_counted(r, w, send, None, sent);
     }
+    write_buffered(&mut w, sent, &mut |w, sent| {
+        solutions_to(r, fmt, w, send, sent)
+    })
+}
+
+/// [`write_solutions_counted`] into the buffer of [`write_buffered`].
+fn solutions_to(
+    r: &QueryResult,
+    fmt: SolutionsFormat,
+    w: &mut Buffered<'_>,
+    send: Option<usize>,
+    sent: &Cell<u64>,
+) -> Result<()> {
     let f = match fmt {
         SolutionsFormat::Json => QueryResultsFormat::Json,
         SolutionsFormat::Xml => QueryResultsFormat::Xml,
@@ -636,7 +753,20 @@ pub fn write_graph_counted(
     r: &QueryResult,
     fmt: RdfFormat,
     prefixes: &BTreeMap<String, String>,
-    w: impl Write,
+    mut w: impl Write,
+    sent: &Cell<u64>,
+) -> Result<()> {
+    write_buffered(&mut w, sent, &mut |w, sent| {
+        graph_to(r, fmt, prefixes, w, sent)
+    })
+}
+
+/// [`write_graph_counted`] into the buffer of [`write_buffered`].
+fn graph_to(
+    r: &QueryResult,
+    fmt: RdfFormat,
+    prefixes: &BTreeMap<String, String>,
+    w: &mut Buffered<'_>,
     sent: &Cell<u64>,
 ) -> Result<()> {
     let mut ser = RdfSerializer::from_format(fmt);
@@ -677,7 +807,17 @@ pub fn write_jena_graph(
 pub fn write_jena_graph_counted(
     r: &QueryResult,
     fmt: crate::jena_formats::JenaFormat,
-    w: impl Write,
+    mut w: impl Write,
+    sent: &Cell<u64>,
+) -> Result<()> {
+    write_buffered(&mut w, sent, &mut |w, sent| jena_graph_to(r, fmt, w, sent))
+}
+
+/// [`write_jena_graph_counted`] into the buffer of [`write_buffered`].
+fn jena_graph_to(
+    r: &QueryResult,
+    fmt: crate::jena_formats::JenaFormat,
+    w: &mut Buffered<'_>,
     sent: &Cell<u64>,
 ) -> Result<()> {
     let mut out = crate::jena_formats::RdfWriter::new(fmt, w);
@@ -721,7 +861,21 @@ pub fn write_native_json(
 /// [`write_native_json`], counting in `sent` the rows written whole.
 pub fn write_native_json_counted(
     r: &QueryResult,
-    w: impl Write,
+    mut w: impl Write,
+    send: Option<usize>,
+    metadata: Option<NativeJsonMetadata<'_>>,
+    sent: &Cell<u64>,
+) -> Result<()> {
+    let mut metadata = metadata;
+    write_buffered(&mut w, sent, &mut |w, sent| {
+        native_json_to(r, w, send, metadata.take(), sent)
+    })
+}
+
+/// [`write_native_json_counted`] into the buffer of [`write_buffered`].
+fn native_json_to(
+    r: &QueryResult,
+    w: &mut Buffered<'_>,
     send: Option<usize>,
     metadata: Option<NativeJsonMetadata<'_>>,
     sent: &Cell<u64>,
@@ -1359,4 +1513,89 @@ pub fn sparkles_json(r: &QueryResult, send: Option<usize>) -> J {
         }),
     );
     J::Object(out)
+}
+
+#[cfg(test)]
+mod buffered_tests {
+    use super::*;
+
+    /// A writer that takes `room` bytes and refuses the write that would pass them, as
+    /// the response writer does at the result-size budget.
+    struct Capped {
+        out: Vec<u8>,
+        room: usize,
+    }
+
+    impl Write for Capped {
+        fn write(&mut self, b: &[u8]) -> std::io::Result<usize> {
+            if self.out.len() + b.len() > self.room {
+                return Err(std::io::Error::other("over the budget"));
+            }
+            self.out.extend_from_slice(b);
+            Ok(b.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    /// Rows of `row` bytes written a few bytes at a time and counted after each, as the
+    /// serializers do.
+    fn rows(n: u64, row: usize) -> impl FnMut(&mut Buffered<'_>, &Cell<u64>) -> Result<()> {
+        move |w, staged| {
+            for i in 0..n {
+                let line = format!("{i:0>width$}\n", width = row - 1);
+                for piece in line.as_bytes().chunks(7) {
+                    w.write_all(piece).map_err(io)?;
+                }
+                staged.set(staged.get() + 1);
+            }
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn the_output_is_whole_and_every_row_counted() {
+        let mut out = Vec::new();
+        let sent = Cell::new(0);
+        write_buffered(&mut out, &sent, &mut rows(5000, 40)).unwrap();
+        assert_eq!(out.len(), 5000 * 40);
+        assert_eq!(sent.get(), 5000);
+        // a piece longer than the buffer goes through as it is
+        let mut out = Vec::new();
+        let sent = Cell::new(0);
+        write_buffered(&mut out, &sent, &mut rows(3, OUTPUT_BUFFER * 2 + 5)).unwrap();
+        assert_eq!(out.len(), 3 * (OUTPUT_BUFFER * 2 + 5));
+        assert_eq!(sent.get(), 3);
+    }
+
+    #[test]
+    fn a_writer_that_stops_partway_has_exactly_the_rows_counted() {
+        for room in [100, OUTPUT_BUFFER - 1, OUTPUT_BUFFER * 3 + 17, 150_000] {
+            let mut w = Capped {
+                out: Vec::new(),
+                room,
+            };
+            let sent = Cell::new(0);
+            assert!(write_buffered(&mut w, &sent, &mut rows(5000, 40)).is_err());
+            assert!(w.out.len() <= room);
+            let whole = w.out.iter().filter(|&&b| b == b'\n').count() as u64;
+            assert_eq!(sent.get(), whole, "{room}");
+        }
+    }
+
+    #[test]
+    fn a_serializer_that_fails_leaves_what_it_wrote() {
+        let mut out = Vec::new();
+        let sent = Cell::new(0);
+        let mut f = |w: &mut Buffered<'_>, staged: &Cell<u64>| -> Result<()> {
+            w.write_all(b"row\n").map_err(io)?;
+            staged.set(staged.get() + 1);
+            w.write_all(b"half").map_err(io)?;
+            Err(Error::invalid("stopped"))
+        };
+        assert!(write_buffered(&mut out, &sent, &mut f).is_err());
+        assert_eq!(out, b"row\nhalf");
+        assert_eq!(sent.get(), 1);
+    }
 }
