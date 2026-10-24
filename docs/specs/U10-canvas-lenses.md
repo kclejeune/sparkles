@@ -708,7 +708,9 @@ rules by iterative deepening, so the mock suites run the panel.
 - *Without materialized inferences.* When the dataset has RDFS on read and no materialized
   inferences cover the triple, the answer comes from RDFS on read with `source:
   "rdfsOnRead"`. Its data graphs are the default graph and the readable named graphs, and a
-  schema leaf names the schema graph or none when the schema is a document.
+  schema leaf names the schema graph or none when the schema is a document. A document
+  schema's leaves are the triples of its closure, so a schema triple outside that closure
+  has no derivation.
 - *Several derivations.* `maxTrees` is at most 10 and the panel asks for 5. Derivations
   with other top rules come shallowest first, and `more` says whether the search found more
   than were returned.

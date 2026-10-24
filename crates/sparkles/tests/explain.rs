@@ -285,9 +285,10 @@ fn rdfs_on_read_explains_a_schema_chain_on_its_own() {
 
 #[test]
 fn rdfs_on_read_counts_schema_neighbours_against_its_reads() {
-    // a class with more direct superclasses than the search may read
+    // a class with 60,000 direct superclasses: visiting them makes 60,001 reads, under the
+    // limit of 100,000, so only the reads of their 60,000 rows as neighbours exceed it
     let mut schema = String::new();
-    for i in 0..100_001 {
+    for i in 0..60_000 {
         schema.push_str(&format!("ex:A rdfs:subClassOf ex:S{i} . "));
     }
     schema.push_str("ex:p rdfs:domain ex:A . ex:Z rdfs:subClassOf ex:Top .");
@@ -331,4 +332,69 @@ fn an_asserted_triple_is_explained_without_the_schema() {
     req.access = only(&["default"]);
     let t = &found(ds.reasoning().explain(&req).unwrap().explained)[0];
     assert_eq!(t.kind, DerivationKind::Asserted);
+}
+
+/// A dataset with RDFS on read over a schema given as triples, and `data` in its default
+/// graph.
+fn on_read_document(data: &str, schema: &[[&str; 3]]) -> (tempfile::TempDir, Dataset) {
+    let (dir, ds) = open();
+    if !data.is_empty() {
+        ds.load_str(
+            &format!("@prefix ex: <http://ex.org/> . {data}"),
+            RdfFormat::Turtle,
+        )
+        .unwrap();
+    }
+    let iri = |s: &str| NamedNode::new(s).unwrap();
+    let triples = schema
+        .iter()
+        .map(|[s, p, o]| oxrdf::Triple::new(iri(s), iri(p), iri(o)))
+        .collect();
+    ds.reasoning()
+        .rdfs()
+        .set(sparkles::reasoning::rdfs::NewSchema::Triples(triples))
+        .unwrap();
+    (dir, ds)
+}
+
+const SC: &str = "http://www.w3.org/2000/01/rdf-schema#subClassOf";
+const SP: &str = "http://www.w3.org/2000/01/rdf-schema#subPropertyOf";
+
+#[test]
+fn a_document_schema_explains_only_the_facts_of_its_closure() {
+    let iri = |s: &str| Term::NamedNode(NamedNode::new(s).unwrap());
+    for pred in [SC, SP] {
+        for data in ["", "ex:x ex:y ex:z ."] {
+            let (_dir, ds) = on_read_document(
+                data,
+                &[
+                    ["http://ex.org/A", pred, "http://ex.org/B"],
+                    ["http://ex.org/B", pred, "http://ex.org/C"],
+                ],
+            );
+            let ask = |a: &str, b: &str| {
+                ds.reasoning()
+                    .explain(&ExplainRequest::new([ex(a), iri(pred), ex(b)]))
+                    .unwrap()
+                    .explained
+            };
+            for (a, b) in [
+                ("unrelated", "absent"),
+                ("A", "absent"),
+                ("C", "A"),
+                ("B", "A"),
+            ] {
+                assert!(
+                    matches!(ask(a, b), Explained::NotFound),
+                    "{pred} {a} {b} on {data:?}"
+                );
+            }
+            // a fact of the closure is a leaf of the document
+            for (a, b) in [("A", "B"), ("A", "C")] {
+                let t = &found(ask(a, b))[0];
+                assert_eq!(t.kind, DerivationKind::Asserted, "{pred} {a} {b}");
+                assert_eq!(t.graph, None);
+            }
+        }
+    }
 }

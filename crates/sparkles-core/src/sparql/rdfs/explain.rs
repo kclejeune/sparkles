@@ -229,7 +229,8 @@ impl Cx<'_> {
         Ok(None)
     }
 
-    /// The schema fact `a pred b` that the schema holds directly, as a leaf.
+    /// The schema fact `a pred b` as a leaf, when the schema graph holds it or the closure
+    /// of a document schema has it.
     fn schema_fact(
         &self,
         a: &NamedNode,
@@ -242,7 +243,12 @@ impl Cx<'_> {
             Term::NamedNode(b.clone()),
         ];
         Ok(match self.leaves {
-            SchemaLeaves::Document => Some(Derivation::asserted(t, None)),
+            // a document's leaves are the triples of its closure, so a fact outside it is
+            // no leaf
+            SchemaLeaves::Document => self
+                .schema
+                .closes(a, pred, b)
+                .then(|| Derivation::asserted(t, None)),
             SchemaLeaves::Graph(g) => {
                 if self.held(g, &t)? {
                     Some(Derivation::asserted(t, self.graph_name(g)))
