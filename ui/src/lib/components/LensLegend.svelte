@@ -81,7 +81,8 @@
                     >
                     <span class="txt">{e.text}</span>
                   {:else if r.channel === 'badge'}
-                    <span class="pill" aria-hidden="true">i</span>
+                    <!-- the validation lens's entries name their severity's mark in the text -->
+                    {#if r.lens !== 'validation'}<span class="pill" aria-hidden="true">i</span>{/if}
                     <span class="txt">{e.text}</span>
                   {:else}
                     <svg class="dash" width="26" height="10" aria-hidden="true"

@@ -56,16 +56,14 @@ test('A10: the people without names have one violation each', async ({ page }) =
   await open(page);
   const b = await badgesOf(page);
   for (const p of ['p1', 'p2', 'p3', 'p4']) expect(b[`<${EX}${p}>`]).toBe('✕1');
-  await expect(page.getByRole('button', { name: 'Validation', exact: true })).toHaveAttribute(
-    'aria-pressed',
-    'true',
-  );
-  // the list's Validation column
-  const overlay = page.getByRole('region', { name: 'Validation overlay' });
-  await overlay.getByText(/Nodes with results \(4\)/).click();
-  const rows = overlay.getByRole('row');
-  await expect(rows).toHaveCount(5);
-  await expect(rows.filter({ hasText: 'p2' })).toContainText('1 violation');
+  // the badge channel's validation lens, on by default with a guard, and its legend
+  await page.getByRole('button', { name: /^Lenses/ }).click();
+  const menu = page.getByRole('dialog', { name: 'Lenses' });
+  await expect(menu.getByRole('combobox', { name: 'Badges' })).toHaveValue('validation');
+  await expect(menu.getByRole('combobox', { name: 'Validation source' })).toHaveValue('guard');
+  await expect(menu.getByTestId('lens-status-badge')).toContainText('4 nodes have results');
+  await page.keyboard.press('Escape');
+  await expect(page.getByText('nodes whose worst result is a violation')).toBeVisible();
   // the badge is a button that names the node and its results
   await expect(page.getByRole('button', { name: /p3, 1 violation/ })).toBeVisible();
 });
@@ -158,15 +156,16 @@ test('merge review: a node the path finder draws is validated too', async ({ pag
 
 test('merge review: a source without shapes drops the badges', async ({ page }) => {
   await open(page);
-  const overlay = page.getByRole('region', { name: 'Validation overlay' });
-  await overlay.getByRole('combobox', { name: 'Validation source' }).selectOption('graph');
+  await page.getByRole('button', { name: /^Lenses/ }).click();
+  const menu = page.getByRole('dialog', { name: 'Lenses' });
+  await menu.getByRole('combobox', { name: 'Validation source' }).selectOption('graph');
   await expect.poll(async () => Object.keys(await badgesOf(page)).length).toBe(0);
 });
 
 test('merge review: the List view has a Validation column', async ({ page }) => {
   await open(page);
   await page.getByRole('button', { name: 'List', exact: true }).click();
-  const header = page.getByRole('columnheader', { name: 'Validation' });
+  const header = page.getByRole('columnheader', { name: 'validation results' });
   await expect(header).toBeVisible();
   const row = page.getByRole('row').filter({ hasText: 'p2' }).first();
   await expect(row).toContainText('1 violation');
@@ -187,6 +186,27 @@ test('merge review: badges follow their nodes when a size lens changes them', as
       return Math.abs(b.x - before.x) + Math.abs(b.y - before.y);
     })
     .toBeGreaterThan(2);
+});
+
+test('item 120: the badge channel turns validation off, remembers it, and Shift+3 turns it on', async ({
+  page,
+}) => {
+  await open(page);
+  await page.getByRole('button', { name: /^Lenses/ }).click();
+  const menu = page.getByRole('dialog', { name: 'Lenses' });
+  await menu.getByRole('combobox', { name: 'Badges' }).selectOption('none');
+  await page.keyboard.press('Escape');
+  await expect.poll(async () => Object.keys(await badgesOf(page)).length).toBe(0);
+  await expect(page.getByRole('region', { name: 'Validation overlay' })).toHaveCount(0);
+  // the choice holds when the page opens again
+  await page.reload();
+  await expect(page.locator('.wrap[data-graph]')).toBeVisible({ timeout: 15_000 });
+  await page.waitForTimeout(800);
+  expect(Object.keys(await badgesOf(page)).length).toBe(0);
+  // Shift+3 turns the badge channel's last lens on again
+  await page.locator('body').click({ position: { x: 1, y: 1 } });
+  await page.keyboard.press('Shift+Digit3');
+  await expect.poll(async () => Object.keys(await badgesOf(page)).length).toBe(4);
 });
 
 test('A11: a suggested fix is previewed, run, and its badge goes away', async ({ page }) => {

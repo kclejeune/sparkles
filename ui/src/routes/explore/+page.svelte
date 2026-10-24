@@ -61,9 +61,10 @@
   import LensMenu from '$components/LensMenu.svelte';
   import LensLegend from '$components/LensLegend.svelte';
   import { describe as lensDescribe, entryIds, OTHER } from '$lib/lens';
-  import { Lenses, type LensColumn } from '$lib/lenses.svelte';
+  import { Lenses } from '$lib/lenses.svelte';
   import ValidationOverlay from '$components/ValidationOverlay.svelte';
-  import { MARK, type Badge, type VResult } from '$lib/validation-overlay';
+  import ValidationSource from '$components/ValidationSource.svelte';
+  import { type Badge, type GuardProbe, type VResult } from '$lib/validation-overlay';
   import { load as loadPref, save as savePref } from '$lib/storage';
 
   type ENode = {
@@ -194,22 +195,25 @@
   let graphView: GraphView | undefined = $state();
 
   // --- the validation overlay (docs/specs/U07-data-quality-and-schema-diagram.md §11) ---
-  /** On, off, or `null` for the default: on when the dataset has a write-time guard. */
+  /**
+   * The person's last choice of the validation lens, on or off, or `null` for the default:
+   * on when the dataset has a write-time guard (U07 §11.2).
+   */
   let vChoice = $state<boolean | null>(
     loadPref<boolean | null>('sparkles.explore.validation', null),
   );
   let vLive = $state(false);
+  /** The lens's source, which the lens menu's picker sets and the overlay validates with. */
+  let vSource = $state<'guard' | 'graph' | 'editor'>('guard');
+  let vGraphIri = $state('');
+  let vProbe = $state<GuardProbe | null>(null);
+  let vHasEditor = $state(false);
   let vBadges = $state(new Map<string, Badge>());
   let vMarked = $state<{ nodes: string[]; edges: string[] } | null>(null);
   let vPlaying = $state(false);
   /** The elements Show triples drew, which stay drawn while the paths are drawn alone. */
   let vShown = $state(new Set<string>());
   let overlay: ValidationOverlay | undefined = $state();
-  function toggleValidation() {
-    vChoice = !(vChoice ?? vLive);
-    savePref('sparkles.explore.validation', vChoice);
-    if (!vChoice) vMarked = null;
-  }
   /** Show triples: draw the result's focus node, path edge and value, and mark them. */
   function showResultTriples(r: VResult) {
     const sid = termKey(r.focus);
@@ -535,16 +539,6 @@
       n.term && n.change !== 'removed' ? [{ id: n.id, term: n.term, label: n.label }] : [],
     ),
   );
-  /** The list view's Validation column (U07 §11.2). */
-  const vColumn = $derived<LensColumn | null>(
-    vLive && vChoice !== false && vBadges.size
-      ? {
-          channel: 'badge',
-          title: 'Validation',
-          cells: new Map([...vBadges].map(([id, b]) => [id, `${MARK[b.worst]} ${b.words}`])),
-        }
-      : null,
-  );
 
   // --- the path finder (docs/specs/U09-path-finder.md) ----------------------------------
 
@@ -734,6 +728,32 @@
       short: (iri) => shortLabel(iri, prefixes),
     });
   });
+  // the validation lens of the badge channel (U07 §11.2): the overlay validates, and the
+  // lens carries its badges to the legend, the list column and the descriptions
+  const vOn = $derived(lenses.choice.badge.lens === 'validation');
+  lenses.onchoose = (ch, c) => {
+    if (ch !== 'badge') return;
+    vChoice = c.lens === 'validation';
+    savePref('sparkles.explore.validation', vChoice);
+    if (!vChoice) vMarked = null;
+  };
+  $effect(() => {
+    const p = vProbe;
+    // while the overlay looks, the lens stays as it is
+    if (!p) return;
+    const ok = p.state !== 'restricted' && p.state !== 'unavailable';
+    lenses.setValidation(ok, ok ? null : `${p.message}.`);
+    const guard = p.state === 'shacl' || p.state === 'shex';
+    if (ok && (vChoice === true || (vChoice === null && guard)))
+      lenses.suggest('badge', { lens: 'validation' });
+  });
+  $effect(() => {
+    lenses.setValidationBadges(vBadges);
+  });
+  $effect(() => {
+    if (!vOn) vMarked = null;
+  });
+
   /** The list view's rows: the drawn nodes, ordered by the size lens when one is on. */
   const listRows = $derived.by((): ListRow[] => {
     const size = lenses.results.size;
@@ -2014,7 +2034,18 @@
                   {lenses}
                   short={(iri) => shortLabel(iri, prefixes)}
                   keys={tab === 'graph' && canvasMode === 'graph'}
-                />
+                >
+                  {#snippet extra()}
+                    {#if vOn && vProbe}
+                      <ValidationSource
+                        probe={vProbe}
+                        editor={vHasEditor}
+                        bind:kind={vSource}
+                        bind:graphIri={vGraphIri}
+                      />
+                    {/if}
+                  {/snippet}
+                </LensMenu>
                 <button
                   class="btn sm"
                   aria-pressed={listView}
@@ -2031,25 +2062,23 @@
                 onclick={() => (graphTimeOpen ? closeGraphTime() : openGraphTime())}
                 ><Icon name="clock" size={13} /> History</button
               >
-              <button
-                class="btn sm"
-                aria-pressed={vChoice ?? vLive}
-                title="Badge the SHACL and ShEx results of the drawn nodes (V opens a node's results, Shift+V moves to the next)"
-                onclick={toggleValidation}><Icon name="check" size={13} /> Validation</button
-              >
               <button class="btn sm ghost" onclick={clearGraph}
                 ><Icon name="trash" size={13} /> Clear</button
               >
             {/if}
           </div>
           <SelectionBar onopengraph={openSelectionAsGraph} />
-          {#if ds && vItems.length && vChoice !== false}
+          {#if ds && vItems.length}
             <ValidationOverlay
               bind:this={overlay}
               {ds}
               items={vItems}
               {prefixes}
-              auto={vChoice === null}
+              on={vOn}
+              bind:sourceKind={vSource}
+              bind:graphIri={vGraphIri}
+              bind:probe={vProbe}
+              bind:hasEditor={vHasEditor}
               at={mapAt}
               branch={overviewBranch ?? ''}
               paused={vPlaying}
@@ -2149,7 +2178,7 @@
                   rows={listRows}
                   plain
                   label="Drawn nodes"
-                  lensColumns={vColumn ? [...lenses.columns, vColumn] : lenses.columns}
+                  lensColumns={lenses.columns}
                   selected={selectedId}
                   onselect={select}
                   openLabel="Focus"
@@ -2173,7 +2202,7 @@
                     (menu = nodes[id]?.term.type === 'uri' ? { id, ...at } : null)}
                   lens={lenses.encoding}
                   marked={lensMarked}
-                  validation={vLive && vChoice !== false
+                  validation={vLive && vOn
                     ? { badges: vBadges, marked: vMarked, onbadge: (id) => overlay?.open(id) }
                     : null}
                 />

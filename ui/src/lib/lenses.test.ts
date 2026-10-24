@@ -161,3 +161,64 @@ describe('resultState', () => {
     expect(resultState({ meta: {} })).toBeUndefined();
   });
 });
+
+describe('the validation lens (U07 §11.2, item 120)', () => {
+  const badge = (count: number, worst: 'violation' | 'warning' | 'info' = 'violation') => ({
+    count,
+    worst,
+    words: `${count} ${worst}${count === 1 ? '' : 's'}`,
+  });
+  it('is offered only where the overlay may validate, and says why not', () => {
+    const { l } = lenses(() => []);
+    l.setInput(input({}));
+    expect(l.validation).toBe(false);
+    l.setValidation(false, 'Validation needs access to every graph.');
+    expect(l.validationNote).toBe('Validation needs access to every graph.');
+    l.setValidation(true);
+    expect(l.validation).toBe(true);
+    expect(l.validationNote).toBeNull();
+    l.destroy();
+  });
+
+  it('is a default that leaves a chosen badge lens alone, and ends when it is not offered', async () => {
+    const { l } = lenses(() => []);
+    const chosen: string[] = [];
+    l.onchoose = (ch, c) => chosen.push(`${ch}:${c.lens}`);
+    l.setInput(input({ nodes: [node('a'), node('b')] }));
+    l.setValidation(true);
+    l.suggest('badge', { lens: 'validation' });
+    expect(l.choice.badge.lens).toBe('validation');
+    // a default is not the person's choice
+    expect(chosen).toEqual([]);
+    l.setValidationBadges(new Map([[`<${EX}a>`, badge(2)]]));
+    await settle();
+    const r = l.results.badge!;
+    expect(r.lens).toBe('validation');
+    expect(r.text.get(`<${EX}a>`)).toBe('✕ 2 violations');
+    expect(r.legend.map((e) => e.ids)).toEqual([[`<${EX}a>`]]);
+    expect(l.columns.find((c) => c.channel === 'badge')?.title).toBe('validation results');
+    // the overlay draws these badges, so the canvas encoding has none
+    expect(l.encoding.badge).toBe(false);
+    expect(l.encoding.nodes.get(`<${EX}a>`)?.badge).toBeUndefined();
+    // the person turns it off, and a default no longer applies
+    l.set('badge', { lens: 'none' });
+    expect(chosen).toEqual(['badge:none']);
+    l.suggest('badge', { lens: 'validation' });
+    expect(l.choice.badge.lens).toBe('none');
+    l.set('badge', { lens: 'validation' });
+    l.setValidation(false, 'Validation needs access to every graph.');
+    expect(l.choice.badge.lens).toBe('none');
+    l.destroy();
+  });
+
+  it('a default of one dataset is not carried to the next', () => {
+    const { l } = lenses(() => []);
+    l.setInput(input({ ds: 'one' }));
+    l.setValidation(true);
+    l.suggest('badge', { lens: 'validation' });
+    expect(l.choice.badge.lens).toBe('validation');
+    l.setInput(input({ ds: 'two' }));
+    expect(l.choice.badge.lens).toBe('none');
+    l.destroy();
+  });
+});

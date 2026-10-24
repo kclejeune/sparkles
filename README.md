@@ -333,7 +333,7 @@ agent memory, the map view and a merge preview.
   </tr>
   <tr>
     <td><img src="docs/images/pattern-edit.png" alt="The Pattern pane adding an edge from ?person, with the predicate picker listing the predicates that instances of ex:Person use, with their counts"></td>
-    <td><img src="docs/images/validation-overlay.png" alt="The resource explorer with validation badges on three people, a bad email address and its edge marked, and a results panel previewing an update that adds a missing name"></td>
+    <td><img src="docs/images/validation-overlay.png" alt="The resource explorer with validation badges on three people, the validation lens's legend grouping the nodes by their worst severity, and a results panel previewing an update that adds a missing name"></td>
   </tr>
   <tr>
     <td>A query built on the canvas from the schema</td>

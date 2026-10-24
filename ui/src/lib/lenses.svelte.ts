@@ -12,9 +12,11 @@ import {
   encode,
   inferredResult,
   sizeResult,
+  validationResult,
   type Channel,
   type LensResult,
   type Results,
+  type ValidationBadge,
 } from './lens';
 import {
   BATCH,
@@ -51,11 +53,15 @@ export type LensId =
   | 'property'
   | 'class'
   | 'graph'
-  | 'inferred';
+  | 'inferred'
+  | 'validation';
 export type LensChoice = { lens: LensId; property?: string };
 
 /** The lenses of each channel in the menu, in order. */
-export const LENS_OPTIONS: Record<Channel, { id: LensId; name: string; reasoning?: boolean }[]> = {
+export const LENS_OPTIONS: Record<
+  Channel,
+  { id: LensId; name: string; reasoning?: boolean; validation?: boolean }[]
+> = {
   size: [
     { id: 'none', name: 'none' },
     { id: 'degree', name: 'degree in the drawn graph' },
@@ -71,6 +77,7 @@ export const LENS_OPTIONS: Record<Channel, { id: LensId; name: string; reasoning
   badge: [
     { id: 'none', name: 'none' },
     { id: 'inferred', name: 'has inferred edges', reasoning: true },
+    { id: 'validation', name: 'validation results', validation: true },
   ],
   edge: [
     { id: 'none', name: 'none' },
@@ -146,6 +153,15 @@ export class Lenses {
   announcement = $state('');
   /** Why the lenses are off, such as a graph over the node limit. */
   blocked = $state<string | null>(null);
+  /**
+   * The validation lens exists: the page has a validation overlay the caller may use
+   * (U07 §11.2). `validationNote` says why it does not, such as a caller whose access
+   * covers part of the dataset.
+   */
+  validation = $state(false);
+  validationNote = $state<string | null>(null);
+  /** A lens the person chose, with the channel, such as for remembering it. */
+  onchoose: ((channel: Channel, choice: LensChoice) => void) | undefined;
   encoding = $derived(encode(this.results));
   /** The list view's column per active lens: its title and each node's value as text. */
   columns = $derived(
@@ -181,6 +197,12 @@ export class Lenses {
   };
   /** Whether the person chose the edge lens, so the default no longer applies. */
   #edgeChosen = false;
+  /** The channels whose lens the person chose, so that `suggest` leaves them alone. */
+  #chosen = new Set<Channel>();
+  /** The channels whose lens `suggest` set, which a change of dataset undoes. */
+  #suggested = new Set<Channel>();
+  /** The validation overlay's badges, which the validation lens shows. */
+  #vBadges: ReadonlyMap<string, ValidationBadge> = new Map();
   #caches = new Map<string, ValueCache | Map<string, boolean>>();
   #seq: Record<Channel, number> = { size: 0, colour: 0, badge: 0, edge: 0 };
   #ctl: Partial<Record<Channel, AbortController>> = {};
@@ -215,6 +237,9 @@ export class Lenses {
         this.#edgeChosen = false;
         this.properties = [];
         this.#propsKey = '';
+        // a default of the last dataset is not this one's
+        for (const ch of this.#suggested) this.#clear(ch);
+        this.#suggested.clear();
       }
       if (input.reasoning !== this.reasoning) this.reasoning = input.reasoning;
       // the inferred-edge lens is on by default where the dataset has reasoning (§2.2), and
@@ -247,9 +272,14 @@ export class Lenses {
     });
   }
 
-  /** Choose the lens of a channel. */
-  set(channel: Channel, choice: LensChoice) {
-    if (channel === 'edge') this.#edgeChosen = true;
+  /** Choose the lens of a channel. `byPerson` is false for a default the page sets. */
+  set(channel: Channel, choice: LensChoice, byPerson = true) {
+    if (byPerson) {
+      if (channel === 'edge') this.#edgeChosen = true;
+      this.#chosen.add(channel);
+      this.#suggested.delete(channel);
+      this.onchoose?.(channel, choice);
+    }
     if (sameChoice(this.choice[channel], choice)) return;
     this.choice[channel] = choice;
     if (choice.lens !== 'none') this.#last[channel] = choice;
@@ -261,6 +291,41 @@ export class Lenses {
     this.#runSoon(channel, 0);
   }
 
+  /**
+   * Turn a lens on by default, such as the validation lens on a dataset with a write-time
+   * guard (U07 §11.2), unless the person chose the channel's lens or it has one.
+   */
+  suggest(channel: Channel, choice: LensChoice) {
+    if (this.#chosen.has(channel) || this.choice[channel].lens !== 'none') return;
+    this.#suggested.add(channel);
+    this.set(channel, choice, false);
+  }
+
+  /** Whether the validation lens exists, and why not. Turning it off ends the lens. */
+  setValidation(available: boolean, note: string | null = null) {
+    untrack(() => {
+      this.validation = available;
+      this.validationNote = available ? null : note;
+      if (!available && this.choice.badge.lens === 'validation') this.#clear('badge');
+    });
+  }
+
+  /** The validation overlay's badges for the drawn nodes. */
+  setValidationBadges(badges: ReadonlyMap<string, ValidationBadge>) {
+    untrack(() => {
+      this.#vBadges = badges;
+      if (this.choice.badge.lens === 'validation') void this.#run('badge');
+    });
+  }
+
+  #clear(channel: Channel) {
+    this.choice[channel] = { lens: 'none' };
+    this.#ctl[channel]?.abort();
+    this.#seq[channel]++;
+    this.results[channel] = null;
+    this.status[channel] = { busy: false };
+  }
+
   /** Turn a channel's lens off, or on again with the last lens it had (§2.5). */
   toggle(channel: Channel) {
     const cur = this.choice[channel];
@@ -268,8 +333,13 @@ export class Lenses {
       this.set(channel, { lens: 'none' });
       return;
     }
-    const last = this.#last[channel];
-    if (last.lens === 'inferred' && !this.reasoning) return;
+    let last = this.#last[channel];
+    // without reasoning the badge channel's other lens is validation, where it exists
+    if (last.lens === 'inferred' && !this.reasoning) {
+      if (channel !== 'badge' || !this.validation) return;
+      last = { lens: 'validation' };
+    }
+    if (last.lens === 'validation' && !this.validation) return;
     if (last.lens === 'property' && !last.property) return;
     this.set(channel, last);
   }
@@ -369,7 +439,8 @@ export class Lenses {
   #name(channel: Channel, choice: LensChoice): string {
     if (choice.lens === 'property' && choice.property)
       return this.#input?.short(choice.property) ?? choice.property;
-    if (channel === 'badge') return 'inferred edges';
+    if (channel === 'badge')
+      return choice.lens === 'validation' ? 'validation results' : 'inferred edges';
     return LENS_OPTIONS[channel].find((o) => o.id === choice.lens)?.name ?? choice.lens;
   }
 
@@ -386,6 +457,9 @@ export class Lenses {
     const key = (k: string) => `${k}|${at}`;
     const nodes = input.nodes;
     switch (choice.lens) {
+      case 'validation':
+        // the overlay validates, and the lens shows what it found
+        return validationResult({ lens: 'validation', name, values: this.#vBadges, computedAt });
       case 'degree':
         return sizeResult({
           lens: 'degree',

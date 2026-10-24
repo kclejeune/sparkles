@@ -1670,7 +1670,8 @@ a time.
   The class lens reads the asserted classes, since with reasoning every node would also
   be in each superclass. A node with several values takes the one most drawn nodes share.
 * **Badges** puts a pill with an `i` and a count in the corner of each node that has
-  inferred edges.
+  inferred edges. In Explore it also offers **validation results**, the
+  [validation overlay](#the-validation-overlay).
 * **Edges** draws the edges that the reasoner added dashed, with an `i` before their
   label. An edge counts as inferred when the graph shows it and a read without reasoning
   does not, which covers materialized inferences and RDFS on read alike. A triple that is
@@ -1700,20 +1701,25 @@ in the data is not taken for an inferred one.
 
 Explore can badge the SHACL and ShEx results of the nodes it draws. When the dataset has a
 write-time guard ([Write-time validation](API.md#write-time-validation)), the overlay is on
-by default. **Validation** in the canvas toolbar turns it on or off, and the choice is
-remembered in the browser. The overlay validates only the drawn nodes, in requests of up
+by default. It is the **validation results** lens of the badge channel in the **Lenses**
+menu ([Lenses on the graph](#lenses-on-the-graph)), which turns it on or off, and the
+choice is remembered in the browser. `Shift+3` turns it on again after it was turned off.
+When the caller's grants cover only some graphs of the dataset, the menu does not offer
+the lens and says that validation needs access to every graph. The overlay validates only the drawn nodes, in requests of up
 to 500 nodes with one in flight, so its cost follows the picture and not the dataset. It
 validates the first 1,500 drawn nodes.
 
-The **Shapes** picker chooses where the shapes come from. The write-time guard is the
+While the lens is on, the **Shapes** picker under the menu's channels chooses where the
+shapes come from. The write-time guard is the
 default, and a ShEx guard validates with its own schema and shape map. A shapes graph of
 the dataset can be named by its IRI. The shapes the Validate panel of the dataset page
 last validated with can be used too, and without a guard they are the default. A node
 with results gets a badge with its count and its worst severity, `✕` for a violation,
 `⚠` for a warning and `ⓘ` for an info. A literal drawn as the value of a result gets the
 same mark. The overlay validates every node the canvas draws, including the nodes the
-path finder adds. **Nodes with results** lists them with a Validation column, such as
-"1 violation", and the canvas's **List** view has the same column.
+path finder adds. The legend groups the nodes by their worst severity, and a click on an
+entry selects its nodes. The canvas's **List** view has a **validation results** column,
+such as "✕ 1 violation".
 
 A click on a badge opens the node's results, grouped by shape and constraint, with the
 path, the value and the messages. `V` opens the results of the selected node, and
