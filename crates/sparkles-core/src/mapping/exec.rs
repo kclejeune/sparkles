@@ -24,7 +24,7 @@ fn base_of(b: &Option<String>) -> Option<Rc<str>> {
 }
 
 /// What a run did.
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Debug, Default, serde::Serialize)]
 pub struct Stats {
     /// Quads written (a quad generated twice is counted twice; the loader removes the
     /// copy).

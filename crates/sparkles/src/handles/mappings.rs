@@ -55,6 +55,63 @@ impl StoredMappings {
     pub fn error(&self) -> Option<String> {
         self.ds.state().mappings.broken().map(str::to_string)
     }
+
+    /// Run stored R2RML, RML or YARRRML mapping `name` (at `version`, or its latest) and
+    /// commit once, then record the run. With `replace`, the run replaces every graph the
+    /// mapping's graph maps write in that commit, which needs constant graph maps. `o`
+    /// carries the commit message (by default `mapping NAME (version V)`), the author,
+    /// the deadline and a precondition. CSVW metadata and templates map CSV files, which
+    /// a load converts with them (see [`crate::tabular`]).
+    pub fn run(
+        &self,
+        name: &str,
+        version: Option<u64>,
+        inputs: &Inputs,
+        opts: &RunOptions,
+        replace: bool,
+        o: &crate::guard::WriteOptions,
+    ) -> Result<MappingRun> {
+        let stored = self
+            .get(name, version)
+            .ok_or_else(|| Error::NotFound(format!("no stored mapping '{name}'")))?;
+        let kind = stored.definition.kind()?;
+        if !matches!(kind, MappingKind::Rml | MappingKind::Yarrrml) {
+            return Err(Error::invalid(format!(
+                "mapping '{name}' is {} metadata and maps CSV files: load the tables with it",
+                kind.name()
+            )));
+        }
+        let m = mapping::parse(&stored.definition.text, kind, None)?;
+        let graphs = if replace {
+            Some(m.constant_graphs().ok_or_else(|| {
+                Error::invalid(
+                    "replace mode needs constant graph maps, since the graphs a template graph map would clear are not known before the run",
+                )
+            })?)
+        } else {
+            None
+        };
+        let (tmp, stats) = mapping::to_nquads_file(&m, inputs, opts, None)?;
+        let mut o = o.clone();
+        if o.message.is_none() {
+            o.message = Some(format!("mapping {name} (version {})", stored.version.version).into());
+        }
+        let receipt = self.ds.load_mapping_output(&tmp, graphs.as_deref(), &o)?;
+        self.record_run(
+            name,
+            LastRun {
+                time: crate::builder::now_rfc3339(),
+                version: stored.version.version,
+                mode: if replace { "replace" } else { "add" }.into(),
+                commit: receipt.committed.then_some(receipt.commit.seq),
+                quads: stats.quads,
+                rows: stats.rows,
+                warnings: stats.warnings.clone(),
+                author: o.author.as_ref().map(|a| a.to_string()),
+            },
+        )?;
+        Ok(MappingRun { receipt, stats })
+    }
 }
 
 /// What [`Dataset::run_mapping`] did: the commit's receipt and the run's counts.

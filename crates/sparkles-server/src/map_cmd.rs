@@ -554,53 +554,37 @@ fn run_stored(
     let mut ins = inputs_for(&m, None, inputs)?;
     ins.dir = std::env::current_dir().ok();
     let replace = mode == Some("replace");
-    let graphs = if replace {
-        Some(m.constant_graphs().context(
-            "mode replace needs constant graph maps, since the graphs a template graph map clears are not known before the run",
-        )?)
-    } else {
-        None
-    };
-    let (tmp, stats) = mapping::to_nquads_file(&m, &ins, &run_options(inputs), None)?;
+    if replace && m.constant_graphs().is_none() {
+        bail!(
+            "mode replace needs constant graph maps, since the graphs a template graph map clears are not known before the run"
+        );
+    }
     if dry_run {
+        let (_tmp, stats) = mapping::to_nquads_file(&m, &ins, &run_options(inputs), None)?;
         println!(
             "{name}: {} rows, {} quads; nothing committed (dry run)",
             stats.rows, stats.quads
         );
         return Ok(());
     }
-    let msg = message
-        .map(str::to_string)
-        .unwrap_or_else(|| format!("mapping {name} (version {})", stored.version.version));
     let wo = sparkles::guard::WriteOptions {
-        message: Some(msg.into()),
+        message: message.map(Into::into),
         ..Default::default()
     };
-    let receipt = ds.load_mapping_output(&tmp, graphs.as_deref(), &wo)?;
-    let commit = receipt.committed.then_some(receipt.commit.seq);
-    ds.mappings().record_run(
-        name,
-        sparkles::stored_mappings::LastRun {
-            time: sparkles::builder::now_rfc3339(),
-            version: stored.version.version,
-            mode: if replace { "replace" } else { "add" }.into(),
-            commit,
-            quads: stats.quads,
-            rows: stats.rows,
-            warnings: stats.warnings.clone(),
-            author: None,
-        },
-    )?;
-    for w in &stats.warnings {
+    let run = ds
+        .mappings()
+        .run(name, None, &ins, &run_options(inputs), replace, &wo)?;
+    for w in &run.stats.warnings {
         eprintln!("{name}: warning: {w}");
     }
     println!(
         "{name}: {} rows, {} quads; {}",
-        stats.rows,
-        stats.quads,
-        match commit {
-            Some(c) => format!("commit {c}"),
-            None => "nothing changed".into(),
+        run.stats.rows,
+        run.stats.quads,
+        if run.receipt.committed {
+            format!("commit {}", run.receipt.commit.seq)
+        } else {
+            "nothing changed".into()
         }
     );
     Ok(())

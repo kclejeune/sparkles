@@ -21,6 +21,7 @@ mod handles;
 mod indexes;
 mod interrupt;
 mod io;
+mod mappings;
 mod overview;
 mod queries;
 mod query_cursor;
@@ -71,6 +72,7 @@ fn _sparkles(m: &Bound<'_, PyModule>) -> PyResult<()> {
     indexes::register(m)?;
     reasoning::register(m)?;
     querybuilder::register(m)?;
+    mappings::register(m)?;
     queries::register(m)?;
     algorithms::register(m)?;
     overview::register(m)?;

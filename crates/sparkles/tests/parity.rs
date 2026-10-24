@@ -496,6 +496,26 @@ fn entries() -> Vec<(&'static str, Entry)> {
         op!("listStoredQueryVersions", "queries.versions", |ds| {
             ds.queries().versions("q");
         }),
+        // ------------------------------------------------ stored mappings
+        op!("listStoredMappings", "mappings.list", |ds| {
+            ds.mappings().list();
+        }),
+        op!("getStoredMapping", "mappings.get", |ds| {
+            ds.mappings().get("m", None);
+        }),
+        op!("putStoredMapping", "mappings.put", |ds| {
+            ds.mappings().put("m", any(), any());
+        }),
+        op!("deleteStoredMapping", "mappings.delete", |ds| {
+            ds.mappings().delete("m", None);
+        }),
+        op!("listStoredMappingVersions", "mappings.versions", |ds| {
+            ds.mappings().versions("m");
+        }),
+        op!("runStoredMapping", "mappings.run", |ds| {
+            ds.mappings()
+                .run("m", None, &any(), &any(), false, &Default::default());
+        }),
         op_if!("graphql", "getGraphqlConfig", "graphql.config.get", |ds| {
             ds.graphql().get(None);
         }),
@@ -930,6 +950,7 @@ const EXTRA_KEYS: &[&str] = &[
     "dataset.clone_to_with",
     "dataset.clone_to_memory_with",
     "dataset.branch",
+    "dataset.run_mapping",
     "history.wait_for_commit",
     "history.prune",
     "history.tick",
@@ -962,6 +983,7 @@ fn check_library_only_calls(ds: &Dataset, cat: &sparkles::Catalog) {
     ds.insert(any());
     ds.remove(any());
     ds.branch("dev");
+    ds.run_mapping("", None, &any(), &any(), None);
     ds.clone_to_with("clone", &Default::default(), &Default::default());
     ds.clone_to_memory_with("clone", &Default::default(), &Default::default());
     ds.algorithms().query_text(&any(), false);
