@@ -204,7 +204,7 @@ test('memory', async ({ page }) => {
   });
   const search = page.getByRole('region', { name: 'Search memory' });
   await search.getByRole('textbox', { name: 'Search memory' }).fill('payments team');
-  await search.getByRole('button', { name: 'Recall' }).click();
+  await search.getByRole('button', { name: 'Search' }).click();
   await expect(search.getByRole('region', { name: /Facts about/ }).first()).toBeVisible();
   await shoot(page, 'memory');
 });

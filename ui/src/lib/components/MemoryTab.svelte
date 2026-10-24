@@ -82,7 +82,7 @@
       before = null;
       error =
         e instanceof api.ApiError && e.status === 404
-          ? 'This server does not answer recall requests.'
+          ? 'Memory search is not available on this server.'
           : api.errorMessage(e);
     } finally {
       if (owns()) loading = false;
@@ -145,12 +145,12 @@
       </select>
     </label>
     <label class="row small check">
-      <input type="checkbox" bind:checked={showSuperseded} /> show superseded
+      <input type="checkbox" bind:checked={showSuperseded} /> Show superseded
     </label>
     <button
       class="btn sm"
       aria-pressed={timeOpen}
-      title="Read the memory as it was at an earlier commit"
+      title="Show memory as of an earlier commit"
       onclick={() => {
         timeOpen = !timeOpen;
         if (!timeOpen) {
@@ -198,7 +198,7 @@
   {/if}
 
   {#if loading && !result}
-    <p class="faint row"><span class="spinner"></span> Recalling…</p>
+    <p class="faint row"><span class="spinner"></span> Loading memory…</p>
   {:else if error}
     <div class="error-box">{error}</div>
   {:else if result && entity}
@@ -213,7 +213,7 @@
           Changed since commit {before?.commit ?? ''} <span class="faint">{changes.length}</span>
         </h4>
         {#if changes.length === 0}
-          <p class="faint small">No fact of this resource differs between the two commits.</p>
+          <p class="faint small">No changes between these commits.</p>
         {:else}
           <ul class="history">
             {#each changes as c (c.kind + c.p + c.o)}
@@ -241,7 +241,7 @@
     />
     <h4 class="sub">History <span class="faint">{history.length}</span></h4>
     {#if history.length === 0}
-      <p class="faint small">Nothing about this resource was superseded or retracted.</p>
+      <p class="faint small">No superseded or retracted facts.</p>
     {:else}
       <ul class="history" aria-label="History">
         {#each history as h (h.reifier)}
@@ -258,7 +258,7 @@
       </ul>
     {/if}
   {:else if result}
-    <p class="faint">The memory you can read holds nothing about this resource.</p>
+    <p class="faint">No memory about this resource yet.</p>
   {/if}
 </div>
 

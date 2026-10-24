@@ -62,7 +62,7 @@
         data = null;
         error =
           e instanceof api.ApiError && e.status === 404
-            ? 'This server has no review inbox.'
+            ? 'The review inbox is not available on this server.'
             : api.errorMessage(e);
       }
     } finally {
@@ -88,7 +88,7 @@
     selected = passingKeys(allFacts, corroborated);
     toasts.push(
       'info',
-      `${selected.size} fact${selected.size === 1 ? '' : 's'} pass${selected.size === 1 ? 'es' : ''} every check`,
+      `Selected ${selected.size} fact${selected.size === 1 ? '' : 's'} that pass every check`,
     );
   }
 
@@ -106,7 +106,7 @@
         `${base}/datasets/${encodeURIComponent(ds)}/merge?source=${encodeURIComponent(r.branch)}`,
       );
     } catch (e) {
-      toasts.error('The action failed', e);
+      toasts.error('Could not promote the facts', e);
     } finally {
       acting = null;
     }
@@ -122,7 +122,7 @@
       reason = '';
       await load();
     } catch (e) {
-      toasts.error('The action failed', e);
+      toasts.error('Could not reject the facts', e);
     } finally {
       acting = null;
     }
@@ -141,13 +141,13 @@
   {:else if data}
     {@const rag = data.communities}
     {#if data.sessions.length === 0 && data.branches.length === 0 && !rag?.unreviewed && !rag?.anomalies?.length}
-      <p class="faint">Nothing waits for review.</p>
+      <p class="faint">Nothing to review.</p>
     {/if}
 
     {#if rag?.anomalies?.length}
       <div class="error-box" role="alert">
-        <strong>GraphRAG accounting anomaly.</strong>
-        A model provider reported more usage than was reserved, and the build stopped. See the
+        <strong>Community build stopped.</strong>
+        A model provider reported more usage than was reserved. See the
         <a href="{base}/datasets/{encodeURIComponent(ds)}?tab=communities">Communities tab</a>.
       </div>
     {/if}
@@ -169,7 +169,7 @@
             </li>
           {/each}
         </ul>
-        {#if rag.truncated}<p class="faint small">More reports wait than the inbox lists.</p>{/if}
+        {#if rag.truncated}<p class="faint small">More reports are waiting than shown here.</p>{/if}
       </section>
     {/if}
 
@@ -177,7 +177,7 @@
       <section class="group" aria-label="Session {s.shown}">
         <h3>
           <span class="badge">Session</span>
-          <span>{s.by.map(principalName).join(', ') || 'unknown agent'}</span>
+          <span>{s.by.map(principalName).join(', ') || 'Unknown agent'}</span>
           {#if s.first}<span class="faint small">{when(s.first)}</span>{/if}
           <span class="mono small faint">{s.shown}</span>
         </h3>
@@ -242,7 +242,7 @@
     {/each}
 
     {#if data.truncated}
-      <p class="faint small">More facts wait than the inbox lists. Review these first.</p>
+      <p class="faint small">More facts are waiting than shown here. Review these first.</p>
     {/if}
 
     {#if allFacts.length}
@@ -250,7 +250,7 @@
         <span class="small">{chosen.length} selected</span>
         <button class="btn sm" onclick={acceptPassing}>Accept all that pass</button>
         <label class="small row"
-          ><input type="checkbox" bind:checked={corroborated} /> require corroboration</label
+          ><input type="checkbox" bind:checked={corroborated} /> Require corroboration</label
         >
         <span class="spacer"></span>
         <label class="small row target">
@@ -273,7 +273,7 @@
         <input
           class="input reason"
           bind:value={reason}
-          placeholder="reason (optional)"
+          placeholder="Reason (optional)"
           aria-label="Reason"
         />
         <button
