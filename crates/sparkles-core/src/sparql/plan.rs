@@ -2366,7 +2366,9 @@ impl<'a> Planner<'a> {
         let mut occurrence = *n;
         *n += 1;
         drop(seen);
-        if let Some(total) = self.source_counts().get(&key)
+        // the source is counted only when a pattern comes again, which most queries never do
+        if occurrence > 0
+            && let Some(total) = self.source_counts().get(&key)
             && *total > 0
         {
             occurrence %= *total;
