@@ -1457,7 +1457,7 @@ enum Cmd {
         #[arg(long)]
         exclude_graph: Vec<String>,
         /// also index the literals of this language stemmed, for lang: searches (a
-        /// primary tag such as en, or all)
+        /// primary tag such as en, all, or a tag with an analyzer, as in fr=french-light)
         #[arg(long)]
         language: Vec<String>,
         /// rebuild even if the index is current
@@ -2269,7 +2269,7 @@ fn text_index(
                 cfg.predicates = PredicateSet::Only(predicates);
             }
             cfg.graphs.exclude = exclude_graph;
-            cfg.languages = Languages::from_tags(&languages).map_err(anyhow::Error::msg)?;
+            cfg.languages = Languages::from_args(&languages).map_err(anyhow::Error::msg)?;
             store.enable_text(cfg)?
         }
     };
