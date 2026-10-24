@@ -972,6 +972,11 @@ class Clarifications(unittest.TestCase):
         )
         self.assertEqual(choose_clarification(c, gold)["index"], 1)
         self.assertEqual(choose_clarification(c, gold)["basis"], "gold-iri")
+        # An absolute IRI keeps its spelling under a BASE.
+        gold = "BASE <http://ex/> SELECT ?x { <HTTP://ex/Berlin> <p> ?x }"
+        self.assertEqual(gold_terms(gold)[0], {"HTTP://ex/Berlin", "http://ex/p"})
+        c = self.choices(("Berlin", "http://ex/Berlin"), ("Berlin", "HTTP://ex/Berlin"))
+        self.assertEqual(choose_clarification(c, gold)["index"], 1)
 
     def test_unusable_clarifications(self):
         for clarify in [

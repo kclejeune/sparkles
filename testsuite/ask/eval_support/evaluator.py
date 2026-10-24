@@ -533,7 +533,10 @@ def gold_terms(text):
     prefixes, iris, base, k = {}, set(), None, 0
 
     def resolve(iri):
-        return urllib.parse.urljoin(base, iri) if base else iri
+        # An absolute IRI keeps its exact spelling, which urljoin would normalize.
+        if not base or re.match(r"[A-Za-z][A-Za-z0-9+.-]*:", iri):
+            return iri
+        return urllib.parse.urljoin(base, iri)
 
     while k < len(tokens):
         kind, value = tokens[k]
