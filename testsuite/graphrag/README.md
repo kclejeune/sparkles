@@ -36,7 +36,8 @@ and directness, without citation markers, and the report gives each pair's win r
 95% bootstrap interval over questions and the share of judgements that agree when the order
 is swapped. The phase also measures the classification of §7.1 on the global questions and
 a fixed sample of answerable demo questions in `auto` mode, where an Ask that never chose a
-scope, because it stopped at a mention clarification or an error, counts as unclassified. It checks the citations of every global answer. Each
+scope, because it stopped at a mention clarification before the draft or at an error, counts as
+unclassified. A clarification that the draft asks keeps the scope the draft chose. It checks the citations of every global answer. Each
 sentence takes the markers that follow it, the findings of its points are resolved through
 child findings to the facts they cite, every cited fact is looked up in the projection,
 and the judge rates each claim against that evidence, with a missing fact marked as not in

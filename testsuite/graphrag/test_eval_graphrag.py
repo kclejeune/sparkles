@@ -186,7 +186,10 @@ class Answers(unittest.TestCase):
         self.assertEqual(mode(mode="local"), "local")
         # A query that failed its repairs still came from a draft that chose local.
         self.assertEqual(mode(mode="local", outcome="failed"), "local")
-        self.assertEqual(mode(mode="local", outcome="clarify"), "unclassified")
+        self.assertEqual(
+            mode(mode="local", outcome="clarify", clarify={"id": "mention"}), "unclassified"
+        )
+        self.assertEqual(mode(mode="local", outcome="clarify", clarify={"id": "draft"}), "local")
         self.assertEqual(mode(outcome="error", returncode=2), "unclassified")
         self.assertEqual(mode(mode="local", returncode=2), "unclassified")
 

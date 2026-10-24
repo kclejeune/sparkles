@@ -334,7 +334,11 @@ SCOPED = ("answered", "empty", "failed", "unanswerable", "not-run")
 def mode_of(out):
     """The scope Ask chose, global or local, or unclassified when it never chose one."""
     mode = out.get("mode")
-    if out.get("returncode") == 0 and out.get("outcome") in SCOPED and mode in ("global", "local"):
+    scoped = out.get("outcome") in SCOPED or (
+        # A draft that asks for a clarification has already chosen its scope.
+        out.get("outcome") == "clarify" and (out.get("clarify") or {}).get("id") == "draft"
+    )
+    if out.get("returncode") == 0 and scoped and mode in ("global", "local"):
         return mode
     return "unclassified"
 
