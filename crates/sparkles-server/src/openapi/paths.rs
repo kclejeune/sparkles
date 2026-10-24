@@ -3329,7 +3329,7 @@ fn assist(p: &mut Paths) {
     let server_body = |o: super::Op| {
         o.body(
             true,
-            "Fields of the kind: `providers`, `roles` and `routing` of `models`, or `enabled`, `server`, `baseUrl`, `repeatEvery`, `channels`, `routes` and `delivery` of `notifications`.",
+            "Fields of the kind: `providers`, `roles` and `routing` of `models` (`ModelsSettings`), or `enabled`, `server`, `baseUrl`, `repeatEvery`, `channels`, `routes` and `delivery` of `notifications`.",
             json!({ "application/json": { "schema": { "type": "object" } } }),
         )
         .header(
@@ -3349,7 +3349,7 @@ fn assist(p: &mut Paths) {
     );
     p.add(server_body(
         op(PATCH, "/$/server/settings/{kind}", "patchServerSettings", "Server", "Change server settings fields")
-            .doc("Merges the body into the runtime layer as RFC 7396 says. Providers merge member by member, and `null` for a declared provider removes it. A role list is one field. Headers that carry credentials and endpoints with credentials, a query or a fragment are refused. A change to a locked field is a `409` with `locked-by-config`. Requests that start after the change use it. Needs server `admin`.")
+            .doc("Merges the body into the runtime layer as RFC 7396 says. Providers merge member by member, and `null` for a declared provider removes it. A role list is one field. Headers that carry credentials and endpoints with credentials, a query or a fragment are refused. A change to a locked field is a `409` with `locked-by-config`. A change that leaves the model configuration invalid is a `400` with `bad-settings`, and its `field` names the field that fails as a dotted path, such as `providers.claude.models.m.temperature`, when the check names one. Requests that start after the change use it. Needs server `admin`.")
             .see("server-settings"),
     ));
     p.add(server_body(

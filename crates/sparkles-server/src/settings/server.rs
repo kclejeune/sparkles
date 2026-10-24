@@ -12,7 +12,7 @@
 //! A secret's runtime value ([`super::secrets`]) takes the place of its `--model-secret`
 //! source unless `server.locked` names `secrets.NAME`.
 
-use super::http::{Op, Write, bad, if_match, op_of, plan};
+use super::http::{Op, Write, if_match, op_of, plan};
 use super::merge::path_string;
 use super::{Declared, Kind, Providers, Resolved, Scope, read_file, resolve_layers};
 use crate::http::{ApiResult, blocking, err};
@@ -617,7 +617,7 @@ pub async fn write(
         let new = plan(&cur, op, if_match.as_deref(), "the server")?;
         let r = resolve_kind(&st, kind, &d, new);
         if let Err(e) = &r.status {
-            return Err(bad(format!("{}: {e}", kind.name)));
+            return Err(invalid(kind, &r.effective, e));
         }
         if r.runtime == cur.runtime {
             return Ok(r);
@@ -651,6 +651,19 @@ pub async fn write(
         Ok(r)
     })
     .await
+}
+
+/// The `400` of a write that leaves `effective` invalid. For `models` it names the field
+/// that fails as a dotted path in `field`, when the check knows it, so a form can show
+/// the message beside that field.
+fn invalid(kind: &Kind, effective: &Value, e: &str) -> crate::http::ApiError {
+    let mut body = json!({ "error": format!("{}: {e}", kind.name), "code": "bad-settings" });
+    if kind.name == MODELS.name
+        && let Some(f) = crate::models::invalid_field(effective)
+    {
+        body["field"] = path_string(&f).into();
+    }
+    crate::http::err_body(StatusCode::BAD_REQUEST, body)
 }
 
 /// A runtime layer read from its file: JSON, with its `format` member checked against

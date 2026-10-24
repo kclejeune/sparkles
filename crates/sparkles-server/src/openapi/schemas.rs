@@ -13,6 +13,7 @@ mod assist;
 mod changes;
 mod features;
 mod kit;
+mod model_settings;
 mod policies;
 mod server;
 
@@ -1363,5 +1364,6 @@ pub(super) fn schemas() -> Map<String, J> {
     features::put_all(&mut put);
     policies::put_all(&mut put);
     assist::put_all(&mut put);
+    model_settings::put_all(&mut put);
     s
 }
