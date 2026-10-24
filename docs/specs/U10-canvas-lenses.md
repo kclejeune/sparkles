@@ -554,7 +554,9 @@ query view and the query timeout and memory budget, and answers in SPARQL JSON w
 pool charge are those of §3.2, with three additions. The key also holds the request's
 `default-graph-uri` and `named-graph-uri`, the dataset's inferred overlay and its RDFS on
 read, as the overview cache's key does, and the definition of a named projection, which can
-change without a commit. `POST /$/graphrag/{ds}/memberships` answers which communities hold
+change without a commit. The request's part of the key is the query text it stands for,
+with every prefixed name expanded by the dataset's prefixes at the time of the request,
+because a prefix change makes no commit, and the run computes that same text. `POST /$/graphrag/{ds}/memberships` answers which communities hold
 the listed nodes, on main and through the coverage guard. `/metrics` gains six
 `sparkles_algo_view_cache_*` series, and API.md, the route table and the OpenAPI
 description document the members, the task kind and the route.
@@ -577,14 +579,23 @@ the memberships route in the mock, with small textbook versions of the algorithm
   stores one.
 - *Memory.* A kept result keeps decoded terms, about 100 to 150 bytes per node and output
   instead of the 16 bytes of §3.2, so a hit needs no dictionary lookup. Each result holds a
-  grant of the memory pool of its estimated size, which queries then cannot use. When the
-  pool has no room even after dropping the older results, the answer is returned and the
-  result is not kept, and the task's `detail` says `kept: false`.
+  grant of the memory pool of its estimated size, which queries then cannot use, and the
+  grant lives with the result, so a request that still reads a result the cache dropped
+  keeps it charged. The cache never holds more than half of the pool, so the other half
+  always stays for query admission. A result larger than that, or one the pool has no room
+  for even after dropping the older results, is answered and not kept, and the task's
+  `detail` says `kept: false`. The decoded rows are charged to the request's memory budget
+  and pool grant every 1,024 rows while they are decoded, and the summary literal is
+  decoded once rather than for every row.
+- *Budgets.* A view-only run takes the request budget parameters that a query takes, and its
+  answer is held to the result-byte limit, whether it was computed or read from the cache.
 - *Background runs.* A background run has an update's deadline, none unless the request or
   `--update-timeout` gives one, and takes its pool grant when its task starts, as a
   write-back run does. F14's algorithms have no iteration hooks, so the progress moves by
   phase. The callers that start or join a run can follow its task even under a restricted
-  view, and the caller that started it, or a dataset admin, can cancel it. A joining caller's
+  view, and the caller that started it, or a dataset admin, can cancel it. These rights
+  are checked again on every request against the caller's current read access and view,
+  and they are remembered for as long as the server lists the task. A joining caller's
   **Cancel** only stops following the run. A cancelled run is never joined, so a request just
   after a cancel starts a new run.
 - *Branches.* A run without `write` may read a branch, and one with `write` answers `400`
@@ -597,13 +608,18 @@ the memberships route in the mock, with small textbook versions of the algorithm
   whose modularity the summary reports, and a level picker appears when a run has several.
   The GraphRAG lens starts at the lowest level.
 - *Stable colours.* A community keeps an earlier community's colour when its members hold
-  half or more of that community's members. Communities claim colours in order of their
+  half or more of that community's members. Among the earlier communities that pass this
+  test and whose colour is still free, it takes the one it overlaps most. Communities claim colours in order of their
   drawn size, each earlier colour goes to one community at most, and the colour memory
   carries over between the community lenses of one canvas.
 - *GraphRAG.* The lens is offered on main at the head when the dataset has built reports
   that the caller may read. On a branch, at a past state, or for a caller whose access does
   not cover the build, the menu says why it is absent. A legend entry links to the
   community's report in the Communities tab.
+- *Projection reads.* After a background run, the lens reads the kept result at the run's
+  commit, and every later chunk at that same commit, so a commit that lands during the
+  reads cannot mix two states. An answer from another commit, or one the server cut at its
+  row limit, is shown as an error instead of a partial lens.
 - *Compare mode.* Deltas apply to size lenses whose values come from the dataset, the
   degree in the dataset, a numeric property and projection runs, and they read both handles.
   Drawn-graph values belong to one drawing, so they show no delta.
@@ -619,11 +635,17 @@ follow-up item was added.
 **Tests.** Rust unit tests cover the member parsing, the `nodes` filter, community sizes per
 level, `top`, and the cache's keys, bound and pool charge. Router tests cover the filter,
 kept results across commits and parameters, branches, background runs that are joined,
-cancelled and kept, a request right after a cancel, and, under restricted principals, a view
-that never reads a wider kept result and a caller that follows and cancels its own run. The
+cancelled and kept, a request right after a cancel, a queued run cancelled before it
+starts, the memory budget against decoded rows, the result-byte limit, a changed prefix,
+and caller records that outlive a full table. Under restricted principals they cover a view
+that never reads a wider kept result, a caller that follows and cancels its own run, and
+callers that lose the task when their grants change. Unit tests cover the cache's half of
+the pool and a reader that keeps a dropped result charged. The
 GraphRAG route tests cover memberships and coverage. Vitest covers the query text, rows and
-levels, projection runs with their tasks, chunks and top, stable colours, the stillness
-delay, the pause while playing, compare deltas and the top 1,000
+levels, projection runs with their tasks, chunks and top, reads pinned to the run's commit,
+truncated answers, polling that stops on abort, stable colours, the stillness delay, the
+pause while playing, compare deltas, the top 1,000, a late cancel answer and the GraphRAG
+lens at a past state
 (`algo.test.ts`, `lens.test.ts`, `lenses.test.ts`). The mock Playwright suite
 `tests/mock/algo-lenses.spec.ts` covers A3, A4, projection scope with progress and Cancel,
 the GraphRAG lens and the 390 px sheet, and `tests/e2e/algo-lenses.spec.ts` runs A3, A4 and

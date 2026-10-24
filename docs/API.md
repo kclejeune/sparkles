@@ -5951,19 +5951,30 @@ the whole result, the rows returned, and `truncated` when the server's row limit
 answer.
 
 The run reads under the caller's view at the state that the request's `at` parameter and
-`branch` parameter select, with the query timeout and memory budget. Any run without
+`branch` parameter select, with the query timeout and memory budget. The budget parameters
+`memory-mb`, `max-rows`, `max-rows-produced`, `spill-mb` and `max-result-mb` lower the
+server's budgets as they do on a query. The decoded rows of the result count against the
+memory budget and the request's grant of the memory pool as they are decoded, so a large
+result answers `507` with `budget: "memory"` before it grows past them. An answer whose
+JSON is larger than the result-byte limit answers `507` with `budget: "result-bytes"`,
+whether it was computed or read from the cache. Any run without
 `write` may read a branch, while a run with `write` answers `400` on a branch, since its
 run record and the named projections belong to main. A run on a branch does not find
 main's named projections, so it gives its projection inline. The cache key is the
 dataset's branch, the commit, the caller's read view with its triple protections, the
 `default-graph-uri` and `named-graph-uri` parameters, the dataset's inferred overlay and
-RDFS on read, and the request without `nodes`, `keep`, `async` and `top`, with the
-definition of a named projection, which can change without a commit. A caller therefore
+RDFS on read, and the query text that the request without `nodes`, `keep`, `async` and
+`top` stands for, with the definition of a named projection. The query text has every
+prefixed name expanded with the dataset's prefixes as they are when the request arrives,
+so a changed prefix, which makes no commit, is a different key. A caller therefore
 never reads a result computed for a wider view. The cache keeps at most 8 results and
-512 MiB of their estimated size and drops the oldest first. Each kept result holds a grant
-of the server memory pool of its size for as long as it is kept, so kept results reduce the
-memory left for queries. When the pool has no room even after the older results are
-dropped, the answer is still returned but the result is not kept. A result keeps decoded
+512 MiB of their estimated size, and never more than half of the server memory pool, so the
+other half always stays for the admission of queries. It drops the oldest first. Each kept
+result holds a grant of the server memory pool of its size, rounded up to the pool's 4 MiB
+granules, for as long as the cache keeps it or a request still reads it, so kept results
+reduce the memory left for queries. A result larger than half the pool is answered but not
+kept, and so is a result for which the pool has no room even after the older results are
+dropped. A result keeps decoded
 terms, so it takes about 100 to 150 bytes per node and output rather than the 16 bytes of a
 bare score, in exchange for answering a later request without dictionary lookups.
 
@@ -5971,7 +5982,9 @@ A background run is followed with `GET /$/tasks/{id}` and its task needs only `r
 request for the same key while the task runs joins it, and its answer is the same task with
 `joined: true`. The callers that started or joined a run can follow its task even when their
 view of the dataset is restricted, and the caller that started it, or a dataset admin, can
-cancel it with `DELETE /$/tasks/{id}`. The task has the deadline of an update, none unless
+cancel it with `DELETE /$/tasks/{id}`. Both rights hold only while the caller can still read
+the dataset through the same view it had when it started or joined the run. A caller whose
+grants change loses sight of the task. The task has the deadline of an update, none unless
 the request gives a `timeout` or the server runs with `--update-timeout`, and takes its
 initial grant of the memory pool when it starts. F14's algorithms do not report their
 iterations, so the task's progress moves by phase, from waiting through computing to
