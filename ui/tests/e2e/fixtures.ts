@@ -36,6 +36,10 @@ export const server = {
   get token() {
     return env('SPARKLES_E2E_TOKEN');
   },
+  /** A static token whose grant covers only the default graph of `overlay-limited`. */
+  get limitedToken() {
+    return env('SPARKLES_E2E_LIMITED_TOKEN');
+  },
   /** Where the open server's API may register `fs` backup repositories. */
   get repos() {
     return env('SPARKLES_E2E_REPOS');

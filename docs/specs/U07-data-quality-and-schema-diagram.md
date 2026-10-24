@@ -1,8 +1,8 @@
 # U07: A data-quality timeline and a schema diagram
 
-> **Status:** specified
+> **Status:** Phase 4 shipped on 2026-10-23
 >
-> **Phases:** None shipped. Phase 1 records a validation summary for every commit a
+> **Phases:** Phase 4 shipped on 2026-10-23, and Phases 1 to 3 are not built. Phase 1 records a validation summary for every commit a
 > write-time guard validates, and draws it as a timeline on the dataset page with links
 > to the commits that introduced each result. Phase 2 backfills the timeline for past
 > commits and finds the introducing commit of results older than the record. Phase 3
@@ -10,7 +10,8 @@
 > 4, added on 2026-10-23 in §11, badges SHACL and ShEx results on the nodes of the Explore
 > graph, shows the failing shape and triples, and suggests a fix query.
 >
-> **User docs:** none, because nothing is built.
+> **User docs:** [USAGE.md](../USAGE.md#the-validation-overlay) for the overlay, and
+> [API.md](../API.md#shacl-validation) for the routes' focus sets and stored shapes.
 >
 > This is the design as written before implementation. The [Outcome](#outcome) section at
 > the end will record how it lands.
@@ -499,5 +500,109 @@ The data is §7's dataset `q`.
 
 ## Outcome
 
-Not built. See [ROADMAP](../ROADMAP.md) item 31 for Phases 1 to 3 and item 106 for
-Phase 4.
+Phases 1 to 3 are not built, and [ROADMAP](../ROADMAP.md) item 31 covers them. Phase 4
+shipped on 2026-10-23 under item 106, and item 120 holds what it left for later.
+
+### Phase 4 (2026-10-23)
+
+The prerequisite of §11.3 is in the routes. `POST /{ds}/shacl` takes `target` up to 1,000
+times and validates the nodes in one engine run, and it takes `shapes=guard` or
+`shapes=<graph IRI>`. `POST /{ds}/shex` takes `schema=guard` with a shape map of up to
+1,000 nodes, and it now takes `at=` as `/{ds}/shacl` does. The library gained
+`sparkles_shacl::validate_nodes`, `sparkles_shex::shapemap::focus_map`, and accessors on
+the two guards for their data graph and, for ShEx, their schema and shape map. The routes
+keep the validation pool, the request timeout, the result budgets and the `403` for a
+caller whose grants cover some graphs, and router tests check each of these on the new
+forms.
+
+Explore has the overlay of §11.2. Badges are buttons drawn over the canvas at their
+nodes, whose names give the node and its counts. The results panel groups a node's
+results by shape and constraint, **Show triples** draws and marks the focus node, the path
+edge and the value, and **Suggest fix** builds an update in `ui/src/lib/fixes.ts` for the
+components of §11.4. A preview is a dry run of `/{ds}/update` with `changes=20`, and the
+panel reads the dry run's guard summary to say whether the result would be resolved.
+GraphView gained one optional `validation` prop with the badges, the marked elements and
+the click handler, and TimeSlider an `onplaying` callback.
+
+Nothing in Phase 4 changes an on-disk format. The overlay sends one small probe when a
+graph opens and then one request per 500 drawn nodes, so no benchmark covers it. A14 was
+measured on atlas, an x86_64 host with 20 cores, with a release build. The dataset was
+`scripts/gen-data.py` with one million people, 10.5 million triples, and a warn guard of
+four property shapes on `ex:Employee`, one of which fails for most people. Three
+`POST /{ds}/shacl?shapes=guard` requests of 500 `target` nodes each took 37 to 48 ms in
+all over three rounds and reported 928 results. That is well inside the two seconds A14
+allows. Per node, a validation reads the node's own triples through the indexes, so its
+cost does not grow with the dataset.
+
+**Decisions taken where the spec left them open.**
+
+1. **A toolbar toggle instead of the lens menu.** U10's badge channel is not built, so
+   **Validation** is a toggle beside the canvas. With no choice made, it is on when the
+   dataset has a guard the caller may use. The choice is remembered in the browser. Item
+   120 moves it into the lens menu.
+2. **No read of the Phase 1 record.** Phase 1 is not built, so the overlay always
+   validates, and `focus=` on `GET /$/validation/{ds}/results` waits for item 120.
+3. **A named source takes a form body.** §11.3 asks for an empty body with `shapes` or
+   `schema`. A form body is accepted too, and its fields are parameters, because 500 IRIs
+   in a query string can pass the URL limits of proxies. Any other body is still a `400`.
+4. **The guard's shapes as they are now.** `shapes=guard` validates the guard's data graph
+   with the guard's current shapes, also at a past state, so `graph` is a `400` with it.
+   `shapes=<graph IRI>` reads the shapes graph at the state read and leaves it out of the
+   data graph.
+5. **START under `schema=guard`.** Each association of the request's map must name a node.
+   `START` takes the shapes of the guard's associations that select the node, by naming it
+   or by a `{FOCUS p o}` or `{s p FOCUS}` pattern checked for that node alone. A guard's map
+   cannot hold SPARQL selectors, so none are left out. An association with a label keeps
+   it.
+6. **Targets name blank nodes.** `target` also takes an IRI in angle brackets and a stored
+   blank node label, so the overlay can send every drawn IRI and blank node as it is.
+7. **Finding the guard.** The page asks `shapes=guard` about a node that is not in the
+   data. A `200` means a SHACL guard, a `400` naming ShEx a ShEx guard, a `404` no guard
+   and a `403` a restricted caller. This works for callers who may not read the guard's
+   configuration.
+8. **The Validate panel's shapes.** The editor source is the SHACL shapes the dataset
+   page's Validate panel last validated with, read from the browser's storage, sent in
+   batches of 100 nodes because the targets then travel in the query string. A ShEx
+   editor source is not offered.
+9. **Parameters of a suggestion.** A SHACL result does not carry the constraint's value, so
+   the datatype, the class and the allowed values are read from the default messages. A
+   parameter is used only when it is exactly one IRI or one literal, so a shape's own
+   `sh:message` can never add SPARQL to the update, and message text in a comment is kept
+   on one line. When a message hides the parameter, a class becomes the placeholder
+   `?class`, allowed values become `?allowed`, and a cast is not suggested. A cast also
+   needs a valid date, day of the month and time zone offset. A focus node that is a blank node
+   gets no suggestion, because an update cannot name a stored blank node. `sh:hasValue`
+   inserts the required value. `sh:maxCount` lists the current values, read with a query at
+   the canvas's state. A ShEx datatype or value-set failure does not name its predicate,
+   so its update matches the value under any predicate `?p`.
+10. **The fix stays in the panel at 390 px.** §11.2 opens the query page there, but that
+    page has no C15 preview, and a suggestion must be previewed before it runs. The sheet
+    keeps the editor and the preview, and **Open in Query** takes the text to the query
+    page at any width.
+11. **When Run is enabled.** Run needs a preview of the same text whose outcome is
+    `commit`, and a canvas at the head. A placeholder variable left in the text disables
+    Preview. Comments, literals and IRIs that contain the same name do not count.
+12. **Resolved or not.** The preview's guard summary decides. The result is still reported
+    when the summary lists the same focus node, shape, component, path and value. It is
+    resolved only when the summary is conclusive: the guard validated the state, the list
+    is not truncated, and it lists every result of the state. A full validation lists them
+    all. An incremental validation lists only the shapes and focus nodes it validated
+    again, so its list is complete only when the exact total equals the number listed.
+    Otherwise the panel says it cannot tell, and the overlay validates again after the
+    update runs.
+13. **The list view.** Explore's node-link canvas has no list view, so the overlay has its
+    own **Nodes with results** table with a Validation column.
+14. **Pausing.** The overlay waits while the graph's history plays, through a callback that
+    TimeSlider gained, and it validates the drawn nodes 150 ms after they stop changing.
+15. **The graph a fix writes.** A result does not name its graph, so the overlay reads the
+    guard's `dataGraph` from `GET /$/validation/{ds}`, which needs read access. That answer
+    also says whether the server serves the union of the graphs as the default graph, and
+    then a data graph that includes the default graph gives `GRAPH ?graph { }`. Otherwise a
+    data graph that is the default graph gives plain updates, one named graph wraps every pattern in
+    `GRAPH <g> { }`, and `union`, several graphs or a failed read give `GRAPH ?graph { }`
+    with the placeholder `?graph` to fill in or remove. The shapes-graph and editor sources
+    validate the default graph.
+16. **Stored blank nodes as targets.** A `target` that is a stored blank node's label names
+    that stored node even when the shapes come from the body, whose own blank nodes are
+    local to the shapes.
+

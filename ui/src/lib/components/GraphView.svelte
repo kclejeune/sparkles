@@ -42,6 +42,20 @@
     /** The triple the edge stands for, for the inferred-edge lens. */
     triple?: EdgeTriple;
   };
+  /**
+   * The validation overlay (docs/specs/U07-data-quality-and-schema-diagram.md §11): a badge
+   * per node with results, the elements of the triples a result involves, and what a click
+   * on a badge does.
+   */
+  export type GValidation = {
+    badges: ReadonlyMap<
+      string,
+      { text: string; worst: 'violation' | 'warning' | 'info'; words: string }
+    >;
+    /** Show triples: the nodes and edges to mark. */
+    marked?: { nodes: string[]; edges: string[] } | null;
+    onbadge?: (id: string) => void;
+  };
 </script>
 
 <script lang="ts">
@@ -63,6 +77,7 @@
     layoutNew = true,
     lens = NO_ENCODING,
     marked = null,
+    validation = null,
   }: {
     nodes: GNode[];
     edges: GEdge[];
@@ -98,6 +113,8 @@
     lens?: Encoding;
     /** Nodes to ring while the rest fade, such as those of a legend entry. */
     marked?: string[] | null;
+    /** The validation overlay's badges and marks; none when null. */
+    validation?: GValidation | null;
   } = $props();
 
   let host: HTMLDivElement;
@@ -303,6 +320,25 @@
           'target-arrow-color': spark,
           width: 2,
           color: text,
+          'text-opacity': 1,
+        },
+      },
+      {
+        selector: 'node.vmark',
+        style: {
+          'border-color': cssVar('--danger'),
+          'border-width': 3,
+          'underlay-color': cssVar('--danger'),
+          'underlay-opacity': 0.2,
+          'underlay-padding': 6,
+        },
+      },
+      {
+        selector: 'edge.vmark',
+        style: {
+          'line-color': cssVar('--danger'),
+          'target-arrow-color': cssVar('--danger'),
+          width: 2.6,
           'text-opacity': 1,
         },
       },
@@ -833,6 +869,68 @@
     cy.animate({ fit: { eles: els, padding: 40 }, duration: reduced() ? 0 : 250 });
   }
 
+  // --- the validation overlay's badges: buttons over the canvas, placed at their nodes ---
+  type Placed = { id: string; x: number; y: number; text: string; worst: string; label: string };
+  let placed = $state<Placed[]>([]);
+  let frame = 0;
+  function place() {
+    frame = 0;
+    const b = validation?.badges;
+    if (!cy || !b || !b.size) {
+      if (placed.length) placed = [];
+      return;
+    }
+    const out: Placed[] = [];
+    for (const [id, badge] of b) {
+      const n = cy.getElementById(id);
+      if (n.empty() || !n.isNode() || n.hasClass('leaving') || !n.visible()) continue;
+      const p = n.renderedPosition();
+      const w = n.renderedWidth();
+      const h = n.renderedHeight();
+      out.push({
+        id,
+        x: p.x + w / 2,
+        y: p.y - h / 2,
+        text: badge.text,
+        worst: badge.worst,
+        label: `${n.data('label') || id}, ${badge.words}`,
+      });
+    }
+    placed = out;
+  }
+  const schedulePlace = () => {
+    if (!frame) frame = requestAnimationFrame(place);
+  };
+  $effect(() => {
+    void validation;
+    void nodes;
+    if (!cy) return;
+    cy.off('viewport position add remove layoutstop', schedulePlace);
+    if (validation?.badges.size) cy.on('viewport position add remove layoutstop', schedulePlace);
+    schedulePlace();
+    // for the tests: the badges as text
+    if (wrap)
+      wrap.dataset.badges = JSON.stringify(
+        [...(validation?.badges ?? new Map())].map(([id, x]) => [id, x.text]),
+      );
+  });
+  // Show triples: the marked nodes and edges
+  $effect(() => {
+    const m = validation?.marked;
+    void nodes;
+    void edges;
+    if (!cy) return;
+    cy.batch(() => {
+      cy!.elements('.vmark').removeClass('vmark');
+      if (!m) return;
+      for (const id of [...m.nodes, ...m.edges]) cy!.getElementById(id).addClass('vmark');
+    });
+    if (wrap) wrap.dataset.vmarked = String(cy.elements('.vmark').length);
+  });
+  onDestroy(() => {
+    if (frame) cancelAnimationFrame(frame);
+  });
+
   export function fit() {
     if (!cy) return;
     cy.fit(cy.elements(), 30);
@@ -854,6 +952,17 @@
 
 <div class="wrap" bind:this={wrap} data-motion={motionOn ? 'on' : 'off'} data-animations="0">
   <div class="cy" bind:this={host}></div>
+  {#each placed as b (b.id)}
+    <button
+      class="vbadge {b.worst}"
+      style:left="{b.x}px"
+      style:top="{b.y}px"
+      aria-label={b.label}
+      title={b.label}
+      data-node={b.id}
+      onclick={() => validation?.onbadge?.(b.id)}>{b.text}</button
+    >
+  {/each}
   {#if nodes.length === 0}
     <div class="empty-overlay">{emptyText}</div>
   {/if}
@@ -891,6 +1000,28 @@
     top: 10px;
     display: flex;
     gap: 4px;
+  }
+  .vbadge {
+    position: absolute;
+    transform: translate(-30%, -70%);
+    font: 600 10px/1 var(--font-ui);
+    padding: 2px 4px;
+    border-radius: 8px;
+    border: 1px solid var(--surface);
+    color: var(--surface);
+    background: var(--danger);
+    cursor: pointer;
+    white-space: nowrap;
+  }
+  .vbadge.warning {
+    background: var(--warn);
+  }
+  .vbadge.info {
+    background: var(--text-2);
+  }
+  .vbadge:focus-visible {
+    outline: 2px solid var(--focus);
+    outline-offset: 1px;
   }
   .empty-overlay {
     position: absolute;

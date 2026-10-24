@@ -934,3 +934,133 @@ async fn sparql_selectors_have_the_query_budgets() {
     .await;
     assert_eq!(r.status, StatusCode::REQUEST_TIMEOUT, "{}", r.text());
 }
+
+/// `PUT /$/validation/ds` of a ShEx guard in warn mode over `PERSON`.
+async fn shex_guard(app: &Router, map: &str) {
+    let cfg = json!({"language": "shex", "mode": "warn",
+        "schema": {"inline": PERSON, "format": "shexc"}, "shapeMap": map});
+    let req = Request::put("/$/validation/ds")
+        .header(header::CONTENT_TYPE, "application/json")
+        .body(Body::from(cfg.to_string()))
+        .unwrap();
+    let r = send(app, req).await;
+    assert_eq!(r.status, StatusCode::OK, "{}", r.text());
+}
+
+/// Spec U07 §11.3: `schema=guard` with a shape map of nodes, START taking the shapes the
+/// guard's map gives each node.
+#[tokio::test]
+async fn guard_schema_with_a_map_of_nodes() {
+    let (_dir, app) = server_with(PEOPLE, |_| {});
+    // no guard yet
+    let r = send(
+        &app,
+        post_as("/ds/shex?schema=guard&node=ex:carol", "text/plain", ""),
+    )
+    .await;
+    assert_eq!(r.status, StatusCode::NOT_FOUND, "{}", r.text());
+    shex_guard(
+        &app,
+        "{FOCUS a <http://xmlns.com/foaf/0.1/Person>}@<http://ex.org/Person>",
+    )
+    .await;
+
+    // a form body with the map: carol fails, alice conforms, dave has no class and so
+    // no shape
+    let map = "ex:alice@START,ex:carol@START,ex:dave@START";
+    let r = send(
+        &app,
+        post_as(
+            "/ds/shex?schema=guard",
+            "application/x-www-form-urlencoded",
+            &format!("map={}", enc(map)),
+        ),
+    )
+    .await;
+    assert_eq!(r.status, StatusCode::OK, "{}", r.text());
+    let v = verdicts(&r.json());
+    assert_eq!(
+        v,
+        vec![
+            ("alice".into(), "conformant".into()),
+            ("carol".into(), "nonconformant".into()),
+        ],
+        "{}",
+        r.text()
+    );
+    // a label is kept as given; the query string works too
+    let r = send(
+        &app,
+        post_as(
+            &format!("/ds/shex?schema=guard&map={}", enc("ex:dave@ex:Person")),
+            "text/plain",
+            "",
+        ),
+    )
+    .await;
+    assert_eq!(r.status, StatusCode::OK, "{}", r.text());
+    let v = verdicts(&r.json());
+    assert_eq!(v, vec![("dave".into(), "nonconformant".into())]);
+
+    // the state at a commit
+    let r = send(
+        &app,
+        post_as(
+            "/ds/shex?schema=guard&node=ex:carol&at=commit:0",
+            "text/plain",
+            "",
+        ),
+    )
+    .await;
+    assert_ne!(r.status, StatusCode::INTERNAL_SERVER_ERROR, "{}", r.text());
+
+    // errors: a body with the source, graph, selectors, too many associations
+    for (uri, ct, body, needle) in [
+        (
+            "/ds/shex?schema=guard&node=ex:a",
+            "text/shex",
+            SCHEMA,
+            "not both",
+        ),
+        (
+            "/ds/shex?schema=guard&node=ex:a&graph=default",
+            "text/plain",
+            "",
+            "leave out graph",
+        ),
+        (
+            "/ds/shex?schema=other&node=ex:a",
+            "text/plain",
+            "",
+            "invalid schema",
+        ),
+        (
+            "/ds/shex?schema=guard",
+            "application/x-www-form-urlencoded",
+            "map=%7BFOCUS%20a%20_%7D%40START",
+            "names a node",
+        ),
+    ] {
+        let r = send(&app, post_as(uri, ct, body)).await;
+        assert_eq!(r.status, StatusCode::BAD_REQUEST, "{uri}: {}", r.text());
+        assert!(error_of(&r).contains(needle), "{uri}: {}", r.text());
+    }
+    let many: Vec<String> = (0..=crate::http::MAX_FOCUS_NODES)
+        .map(|i| format!("<http://ex.org/n{i}>@START"))
+        .collect();
+    let r = send(
+        &app,
+        post_as(
+            "/ds/shex?schema=guard",
+            "application/x-www-form-urlencoded",
+            &format!("map={}", enc(&many.join(","))),
+        ),
+    )
+    .await;
+    assert_eq!(r.status, StatusCode::BAD_REQUEST, "{}", r.text());
+    assert!(
+        error_of(&r).contains("too many associations"),
+        "{}",
+        r.text()
+    );
+}

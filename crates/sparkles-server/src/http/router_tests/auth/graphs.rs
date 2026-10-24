@@ -491,6 +491,26 @@ async fn routes_that_cover_every_graph_refuse_a_limited_view() {
     )
     .await;
     assert_eq!(r.status, StatusCode::FORBIDDEN);
+    // the focus-set and stored-shape forms of spec U07 §11.3 are refused the same way
+    for u in [
+        "/graphs/shacl?shapes=guard&target=http%3A%2F%2Fex%2Fa",
+        "/graphs/shacl?target=http%3A%2F%2Fex%2Fa&target=http%3A%2F%2Fex%2Fb",
+        "/graphs/shacl?shapes=http%3A%2F%2Fex%2Fa%2Fshapes",
+        "/graphs/shex?schema=guard&node=%3Chttp%3A%2F%2Fex%2Fa%3E",
+    ] {
+        let r = call(
+            &s.app,
+            "POST",
+            u,
+            &[
+                ("authorization", &b("gra")),
+                ("content-type", "application/x-www-form-urlencoded"),
+            ],
+            "",
+        )
+        .await;
+        assert_eq!(r.status, StatusCode::FORBIDDEN, "{u}: {}", r.text());
+    }
     // the dataset's description leaves out its size
     let r = get("/$/datasets/graphs", "gra").await.json();
     assert_eq!(r["quads"], 3, "{r}");

@@ -62,6 +62,9 @@
   import LensLegend from '$components/LensLegend.svelte';
   import { describe as lensDescribe, entryIds, OTHER } from '$lib/lens';
   import { Lenses } from '$lib/lenses.svelte';
+  import ValidationOverlay from '$components/ValidationOverlay.svelte';
+  import type { VResult } from '$lib/validation-overlay';
+  import { load as loadPref, save as savePref } from '$lib/storage';
 
   type ENode = {
     id: string;
@@ -188,6 +191,40 @@
     graphEpoch++;
   }
   let graphView: GraphView | undefined = $state();
+
+  // --- the validation overlay (docs/specs/U07-data-quality-and-schema-diagram.md §11) ---
+  /** On, off, or `null` for the default: on when the dataset has a write-time guard. */
+  let vChoice = $state<boolean | null>(
+    loadPref<boolean | null>('sparkles.explore.validation', null),
+  );
+  let vLive = $state(false);
+  let vBadges = $state(new Map());
+  let vMarked = $state<{ nodes: string[]; edges: string[] } | null>(null);
+  let vPlaying = $state(false);
+  let overlay: ValidationOverlay | undefined = $state();
+  const vItems = $derived(
+    Object.values(nodes).map((n) => ({ id: n.id, term: n.term, label: n.label })),
+  );
+  function toggleValidation() {
+    vChoice = !(vChoice ?? vLive);
+    savePref('sparkles.explore.validation', vChoice);
+    if (!vChoice) vMarked = null;
+  }
+  /** Show triples: draw the result's focus node, path edge and value, and mark them. */
+  function showResultTriples(r: VResult) {
+    const sid = termKey(r.focus);
+    const out = { nodes: nodes[sid] ? [sid] : [], edges: [] as string[] };
+    if (!r.path || !r.value || !nodes[sid]) return out;
+    const lit = r.value.type === 'literal';
+    if (lit) showLiterals = true;
+    const oid = lit ? `lit:${sid}|${r.path}|${termKey(r.value)}` : termKey(r.value);
+    ensureNode(r.value, undefined, oid);
+    const [s, o] = r.inverse ? [oid, sid] : [sid, oid];
+    addEdge(s, r.path, o, lit);
+    out.nodes.push(oid);
+    out.edges.push(`${s}|${r.path}|${o}`);
+    return out;
+  }
   // the reads of a view that goes away stop with it
   onDestroy(() => {
     selection.clear();
@@ -380,6 +417,7 @@
 
   function closeGraphTime() {
     graphTimeOpen = false;
+    vPlaying = false;
     resetTime();
   }
 
@@ -1967,12 +2005,44 @@
                 onclick={() => (graphTimeOpen ? closeGraphTime() : openGraphTime())}
                 ><Icon name="clock" size={13} /> History</button
               >
+              <button
+                class="btn sm"
+                aria-pressed={vChoice ?? vLive}
+                title="Badge the SHACL and ShEx results of the drawn nodes (V opens a node's results, Shift+V moves to the next)"
+                onclick={toggleValidation}><Icon name="check" size={13} /> Validation</button
+              >
               <button class="btn sm ghost" onclick={clearGraph}
                 ><Icon name="trash" size={13} /> Clear</button
               >
             {/if}
           </div>
           <SelectionBar onopengraph={openSelectionAsGraph} />
+          {#if ds && nodeCount && vChoice !== false}
+            <ValidationOverlay
+              bind:this={overlay}
+              {ds}
+              items={vItems}
+              {prefixes}
+              auto={vChoice === null}
+              at={mapAt}
+              branch={overviewBranch ?? ''}
+              paused={vPlaying}
+              head={app.datasets.find((d) => d.name === ds)?.head ?? null}
+              {selectedId}
+              onselect={(id) => {
+                select(id);
+                graphView?.center(id);
+              }}
+              onshowtriples={showResultTriples}
+              onopenquery={(text) => {
+                app.pendingQuery = { query: text, title: 'Suggested fix' };
+                goto(resolve('/query'));
+              }}
+              bind:live={vLive}
+              bind:badges={vBadges}
+              bind:marked={vMarked}
+            />
+          {/if}
         {/if}
         {#if graphTimeOpen && ds}
           <div class="graph-time">
@@ -1994,6 +2064,7 @@
               bind:playMode={graphPlayMode}
               bind:playing={graphPlaying}
               onshowdiff={(from, to) => openDiff(to, from)}
+              onplaying={(on) => (vPlaying = on)}
               onchange={() => syncUrl(selected?.term.type === 'uri' ? selected.iri : null)}
               onclose={() => {
                 closeGraphTime();
@@ -2076,6 +2147,9 @@
                     (menu = nodes[id]?.term.type === 'uri' ? { id, ...at } : null)}
                   lens={lenses.encoding}
                   marked={lensMarked}
+                  validation={vLive && vChoice !== false
+                    ? { badges: vBadges, marked: vMarked, onbadge: (id) => overlay?.open(id) }
+                    : null}
                 />
                 {#if menu}
                   <div
@@ -3032,6 +3106,7 @@
     grid-template-columns: minmax(0, 1fr) 380px;
   }
   .canvas {
+    position: relative;
     display: flex;
     flex-direction: column;
     min-height: 0;

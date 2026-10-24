@@ -17501,6 +17501,9 @@
                   "recentRejections"
                 ],
                 "type": "object"
+              },
+              "unionDefaultGraph": {
+                "type": "boolean"
               }
             },
             "required": [
@@ -38441,7 +38444,7 @@
     },
     "/{ds}/shacl": {
       "post": {
-        "description": "Validates a data graph of the dataset against the shapes graph in the body, as Fuseki's `/{ds}/shacl` does. The report answers `200` whether or not the data conforms.",
+        "description": "Validates a data graph of the dataset against the shapes graph in the body, as Fuseki's `/{ds}/shacl` does. The report answers `200` whether or not the data conforms. With `shapes=guard` or `shapes=<graph IRI>` the shapes come from the write-time guard or from a graph of the dataset, and the body is empty or a form of further parameters. A named source with any other body is a `400`.",
         "externalDocs": {
           "url": "https://github.com/kclejeune/sparkles/blob/main/docs/API.md#shacl-validation"
         },
@@ -38454,9 +38457,21 @@
             "$ref": "#/components/parameters/graphSel"
           },
           {
-            "description": "Validate one node, an IRI or prefixed name.",
+            "description": "Validate these nodes against the shapes whose targets select them. Each is an IRI, a prefixed name or a blank node label, and the parameter may repeat up to 1,000 times.",
             "in": "query",
             "name": "target",
+            "schema": {
+              "items": {
+                "type": "string"
+              },
+              "maxItems": 1000,
+              "type": "array"
+            }
+          },
+          {
+            "description": "`guard` for the write-time guard's shapes on its data graph, or the IRI of a shapes graph of the dataset.",
+            "in": "query",
+            "name": "shapes",
             "schema": {
               "type": "string"
             }
@@ -38501,6 +38516,11 @@
                 "type": "string"
               }
             },
+            "application/x-www-form-urlencoded": {
+              "schema": {
+                "type": "string"
+              }
+            },
             "text/shaclc": {
               "schema": {
                 "type": "string"
@@ -38512,8 +38532,8 @@
               }
             }
           },
-          "description": "The shapes graph.",
-          "required": true
+          "description": "The shapes graph, or with `shapes` an empty body or a form of parameters.",
+          "required": false
         },
         "responses": {
           "200": {
@@ -38660,6 +38680,17 @@
             }
           },
           {
+            "description": "`guard` validates against the write-time guard's schema on its data graph. The body is then empty or a form of parameters, and the shape map names up to 1,000 nodes, where `START` takes the shapes the guard's shape map gives each node.",
+            "in": "query",
+            "name": "schema",
+            "schema": {
+              "enum": [
+                "guard"
+              ],
+              "type": "string"
+            }
+          },
+          {
             "$ref": "#/components/parameters/graphSel"
           },
           {
@@ -38667,6 +38698,9 @@
           },
           {
             "$ref": "#/components/parameters/timeout"
+          },
+          {
+            "$ref": "#/components/parameters/at"
           },
           {
             "$ref": "#/components/parameters/format"
@@ -38692,6 +38726,11 @@
                 "type": "object"
               }
             },
+            "application/x-www-form-urlencoded": {
+              "schema": {
+                "type": "string"
+              }
+            },
             "text/shex": {
               "schema": {
                 "type": "string"
@@ -38703,8 +38742,8 @@
               }
             }
           },
-          "description": "The schema, or a JSON envelope.",
-          "required": true
+          "description": "The schema, or a JSON envelope, or with `schema=guard` an empty body or a form of parameters.",
+          "required": false
         },
         "responses": {
           "200": {

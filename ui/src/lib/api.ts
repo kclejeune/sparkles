@@ -2968,6 +2968,8 @@ export type ValidationConfig = {
 export type WriteValidation = {
   language: 'shacl' | 'shex';
   config: ValidationConfig;
+  /** Whether the server serves the union of the graphs as the default graph */
+  unionDefaultGraph?: boolean;
   status: WriteValidationStatus;
 };
 
