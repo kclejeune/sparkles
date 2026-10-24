@@ -193,6 +193,16 @@ class Answers(unittest.TestCase):
         self.assertEqual(mode(outcome="error", returncode=2), "unclassified")
         self.assertEqual(mode(mode="local", returncode=2), "unclassified")
 
+    def test_only_a_local_answer_or_draft_clarification_answers_locally(self):
+        def local(**kw):
+            return harness.answered_locally(dict({"returncode": 0, "mode": "local"}, **kw))
+
+        self.assertTrue(local(outcome="answered"))
+        self.assertTrue(local(outcome="clarify", clarify={"id": "draft"}))
+        self.assertFalse(local(outcome="clarify", clarify={"id": "mention"}))
+        self.assertFalse(local(outcome="failed"))
+        self.assertFalse(local(outcome="answered", mode="global"))
+
     def test_every_marker_must_reach_cited_findings(self):
         out = {
             "mode": "global",

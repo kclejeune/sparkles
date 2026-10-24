@@ -343,6 +343,17 @@ def mode_of(out):
     return "unclassified"
 
 
+def answered_locally(out):
+    """Whether Ask answered in local mode, as A7 requires without reviewed reports. A
+    clarification that the draft asks has already chosen the local scope, and a failed
+    query is not an answer."""
+    outcome = out.get("outcome")
+    return mode_of(out) == "local" and (
+        outcome in ("answered", "empty", "unanswerable")
+        or (outcome == "clarify" and (out.get("clarify") or {}).get("id") == "draft")
+    )
+
+
 MARKER = re.compile(r"\[(\d+(?:\s*,\s*\d+)*)\]")
 
 
@@ -550,8 +561,7 @@ def acceptance(h, work):
         "a7-none",
         reviewed_only=True,
     )
-    # A clarification that the draft asks has already chosen the local scope.
-    none_local = mode_of(out) == "local"
+    none_local = answered_locally(out)
     none_outcome = out.get("outcome")
     reviewed = h.query(
         demo,
