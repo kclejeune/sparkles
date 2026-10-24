@@ -39,7 +39,7 @@
   import type Sigma from 'sigma';
   import type { LayoutStart, LayoutTick } from '$lib/layout.worker';
   import { NO_ENCODING, OTHER, readPalette, sizeFactor, type Encoding } from '$lib/lens';
-  import { placeBetween } from '$lib/path-overlay';
+  import { placeAdded } from '$lib/path-overlay';
 
   let {
     nodes,
@@ -713,6 +713,8 @@
   function sync() {
     if (!graph || !renderer) return;
     const before = positions();
+    // a new level is normalized by its own bounds
+    renderer.setCustomBBox(null);
     graph.clear();
     for (const n of nodes) {
       const p = before.get(n.key);
@@ -758,33 +760,29 @@
     g.forEachNode((k) => {
       if (!want.has(k)) g.dropNode(k);
     });
-    // a node new to the picture, such as one a path adds, is placed between its neighbours
-    // already drawn, in passes so that a chain of new nodes is placed too
-    let fresh: LNode[] = [];
+    // the paths change the picture in place: sigma's bounds stay as they were, so the nodes
+    // a path adds do not rescale the picture and move the nodes already drawn
+    const paths = pathCount > 0 || nodes.some((n) => n.paths?.length);
+    if (paths && !renderer.getCustomBBox()) renderer.setCustomBBox(renderer.getBBox());
+    // a node new to the picture, such as one a path adds, is placed among its neighbours on
+    // the paths, and any other at its own coordinates
+    const fresh: LNode[] = [];
     for (const n of nodes) {
       const a = { label: n.label, size: n.size, color: n.color, paths: n.paths };
       if (g.hasNode(n.key)) g.mergeNodeAttributes(n.key, a);
       else fresh.push(n);
     }
-    const at = (k: string) => {
-      if (!g.hasNode(k)) return undefined;
-      const a = g.getNodeAttributes(k);
-      return { x: a.x as number, y: a.y as number };
-    };
-    while (fresh.length) {
-      const later: LNode[] = [];
-      const placed: [LNode, { x: number; y: number }][] = [];
-      for (const n of fresh) {
-        const p = placeBetween(n.key, edges, at, { x: NaN, y: NaN });
-        if (Number.isNaN(p.x)) later.push(n);
-        else placed.push([n, p]);
-      }
-      const last = !placed.length;
-      for (const [n, p] of placed) addFixed(n, p);
-      if (last) for (const n of later) addFixed(n, { x: n.x, y: n.y });
-      fresh = last ? [] : later;
-    }
-    function addFixed(n: LNode, p: { x: number; y: number }) {
+    const place = placeAdded(
+      fresh.map((n) => ({ id: n.key, fallback: { x: n.x, y: n.y } })),
+      edges,
+      (k) => {
+        if (!g.hasNode(k)) return undefined;
+        const a = g.getNodeAttributes(k);
+        return { x: a.x as number, y: a.y as number };
+      },
+    );
+    for (const n of fresh) {
+      const p = place.get(n.key)!;
       g.addNode(n.key, {
         label: n.label,
         size: n.size,

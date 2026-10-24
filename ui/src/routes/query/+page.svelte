@@ -2009,6 +2009,15 @@
    * drawn, showing or clearing paths updates the picture in place, without a new layout.
    */
   let pathBase = $state.raw<LNode[] | null>(null);
+  /**
+   * Whether the WebGL view's layout of the drawn graph has settled: paths that arrive while
+   * it still runs are drawn by a new layout, since there is no settled picture to keep.
+   */
+  let largeSettled = $state(false);
+  $effect(() => {
+    void largeNodes;
+    largeSettled = false;
+  });
   const pickedOf = (id: string | null): Picked | null => {
     // the nodes the paths added can start a search too
     const n = id ? (pathGraph?.nodes ?? drawnGraph.nodes).find((x) => x.id === id) : undefined;
@@ -3521,7 +3530,8 @@
                       nodes={largePathNodes}
                       edges={largePathEdges}
                       {pathFocus}
-                      still={pathBase === largeNodes}
+                      still={pathBase === largeNodes && largeSettled}
+                      onlayout={() => (largeSettled = true)}
                       selected={largeSelected}
                       label="Result graph"
                       onselect={(k) => (largeSelected = k)}
@@ -3583,7 +3593,13 @@
                         bind:highlight={pathFocus}
                         onresult={showPaths}
                         onopenquery={(query, at) => {
+                          // the new tab reads the dataset, branch and state the paths came from
+                          const o = outcome;
                           addTab(query, 'Paths');
+                          if (o) {
+                            app.setDataset(o.ds);
+                            app.queryBranch = !o.branch || o.branch === MAIN ? '' : o.branch;
+                          }
                           app.queryAt = at;
                         }}
                         onclear={clearPaths}

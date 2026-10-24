@@ -138,27 +138,66 @@ export function mergePaths(
 }
 
 type Link = { source: string; target: string; paths?: number[] };
+type Point = { x: number; y: number };
 
 /**
- * Where a node the paths add is placed in a view that is already laid out: between its
- * neighbours on the paths that have places, else at `fallback`.
+ * Where the nodes a path adds go in a view that is already laid out. Each new node with a
+ * neighbour on a path, laid out or new, starts at the mean of its laid-out neighbours and
+ * then moves to the mean of all its path neighbours a few dozen times, so a chain of new
+ * nodes between two drawn ones spreads evenly along the way between them. A new node with no
+ * path neighbour keeps its fallback. Only the edges on a path are read, once, so a large
+ * graph without paths costs one pass over its edges.
  */
-export function placeBetween(
-  id: string,
+export function placeAdded(
+  added: readonly { id: string; fallback: Point }[],
   edges: readonly Link[],
-  at: (id: string) => { x: number; y: number } | undefined,
-  fallback: { x: number; y: number },
-): { x: number; y: number } {
-  const near: { x: number; y: number }[] = [];
+  at: (id: string) => Point | undefined,
+): Map<string, Point> {
+  const fresh = new Set(added.map((n) => n.id));
+  const near = new Map<string, string[]>();
+  const link = (a: string, b: string) => {
+    let l = near.get(a);
+    if (!l) near.set(a, (l = []));
+    l.push(b);
+  };
   for (const e of edges) {
-    if (!e.paths?.length) continue;
-    const other = e.source === id ? e.target : e.target === id ? e.source : null;
-    const p = other != null ? at(other) : undefined;
-    if (p) near.push(p);
+    if (!e.paths?.length || e.source === e.target) continue;
+    if (fresh.has(e.source)) link(e.source, e.target);
+    if (fresh.has(e.target)) link(e.target, e.source);
   }
-  if (!near.length) return fallback;
-  const x = near.reduce((a, p) => a + p.x, 0) / near.length;
-  const y = near.reduce((a, p) => a + p.y, 0) / near.length;
+  const out = new Map<string, Point>();
+  const moving: string[] = [];
+  for (const n of added) {
+    const l = near.get(n.id);
+    const fixed = l?.map(at).filter((p): p is Point => !!p) ?? [];
+    if (!l?.some((k) => fresh.has(k) || at(k))) {
+      out.set(n.id, n.fallback);
+      continue;
+    }
+    out.set(n.id, fixed.length ? mean(fixed) : n.fallback);
+    moving.push(n.id);
+  }
+  const where = (k: string) => (fresh.has(k) ? out.get(k) : at(k));
+  for (let round = 0; round < 60 && moving.length; round++) {
+    for (const id of moving) {
+      const ps = near
+        .get(id)!
+        .map(where)
+        .filter((p): p is Point => !!p);
+      if (ps.length) out.set(id, mean(ps));
+    }
+  }
   // a small offset, so that a node between two others does not sit on their edge
-  return { x: x + 3, y: y + 3 };
+  for (const id of moving) {
+    const p = out.get(id)!;
+    out.set(id, { x: p.x + 3, y: p.y + 3 });
+  }
+  return out;
+}
+
+function mean(ps: Point[]): Point {
+  return {
+    x: ps.reduce((a, p) => a + p.x, 0) / ps.length,
+    y: ps.reduce((a, p) => a + p.y, 0) / ps.length,
+  };
 }

@@ -1,7 +1,7 @@
 import { describe, expect, it } from 'vitest';
 import type { GEdge, GNode } from '$components/GraphView.svelte';
 import type { Term } from './api';
-import { mergePaths, placeBetween } from './path-overlay';
+import { mergePaths, placeAdded } from './path-overlay';
 import { edgeId } from './paths';
 import { termKey } from './rdf';
 
@@ -154,17 +154,28 @@ describe('mergePaths', () => {
   });
 });
 
-describe('placeBetween', () => {
-  const es: GEdge[] = [
-    { id: '1', source: 'a', target: 'n', label: '', paths: [1] },
-    { id: '2', source: 'n', target: 'b', label: '', paths: [1] },
-    { id: '3', source: 'n', target: 'z', label: '' },
-  ];
-  const at = (id: string) => ({ a: { x: 0, y: 0 }, b: { x: 10, y: 20 }, z: { x: 99, y: 99 } })[id];
-  it('places a node between its neighbours on the paths', () => {
-    expect(placeBetween('n', es, at, { x: -1, y: -1 })).toEqual({ x: 8, y: 13 });
+describe('placeAdded', () => {
+  const at = (id: string) => ({ a: { x: 0, y: 0 }, b: { x: 1000, y: 0 }, z: { x: 99, y: 99 } })[id];
+  const far = { x: -1, y: -1 };
+  it('spreads a chain of new nodes evenly between the drawn ends of a path', () => {
+    const p = placeAdded(
+      [
+        { id: 'n1', fallback: far },
+        { id: 'n2', fallback: far },
+      ],
+      [
+        { source: 'a', target: 'n1', paths: [1] },
+        { source: 'n1', target: 'n2', paths: [1] },
+        { source: 'n2', target: 'b', paths: [1] },
+        { source: 'n1', target: 'z' },
+      ],
+      at,
+    );
+    expect(Math.round(p.get('n1')!.x)).toBe(336);
+    expect(Math.round(p.get('n2')!.x)).toBe(670);
   });
-  it('falls back when no neighbour has a place', () => {
-    expect(placeBetween('q', es, at, { x: -1, y: -1 })).toEqual({ x: -1, y: -1 });
+  it('keeps the fallback of a node with no neighbour on a path, without reading other edges', () => {
+    const edges = Array.from({ length: 1000 }, (_, i) => ({ source: 'q', target: `x${i}` }));
+    expect(placeAdded([{ id: 'q', fallback: far }], edges, at).get('q')).toEqual(far);
   });
 });

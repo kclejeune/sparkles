@@ -247,7 +247,16 @@ test('a node menu on the result graph starts a search, and a new result clears t
   await page.getByRole('button', { name: 'Paths', exact: true }).click();
   await panel(page).getByRole('button', { name: 'Find paths' }).click();
   await expect(list(page).getByRole('option')).toHaveCount(1);
+  // the page has moved to another dataset since the result was read, and the query that
+  // opens goes back to the result's
+  await page.locator('.ds-button').click();
+  await page
+    .getByRole('listbox', { name: 'Datasets' })
+    .getByRole('option', { name: /^world/ })
+    .click();
+  await expect(page.locator('.ds-button')).toContainText('world');
   await panel(page).getByRole('button', { name: 'Open in editor' }).click();
+  await expect(page.locator('.ds-button')).toContainText(DS);
   await expect(page.getByRole('tab', { name: /^Paths/ })).toHaveAttribute('aria-selected', 'true');
   await expect(page.locator('.cm-content')).toContainText('path:search');
 });
