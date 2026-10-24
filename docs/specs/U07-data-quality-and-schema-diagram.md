@@ -589,7 +589,8 @@ cost does not grow with the dataset.
     all. An incremental validation lists only the shapes and focus nodes it validated
     again, so its list is complete only when the exact total equals the number listed.
     Otherwise the panel says it cannot tell, and the overlay validates again after the
-    update runs.
+    update runs. Under an incremental guard on a dataset with other results, that is the
+    usual answer, and item 121 lets the preview validate the result's focus node in full.
 13. **The list view.** When Phase 4 was built, Explore's node-link canvas had no list
     view, so the overlay has its own **Nodes with results** table with a Validation column.
     The **List** view that U10 added shows the same column beside the lens columns. The
