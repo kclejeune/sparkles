@@ -392,7 +392,11 @@ pub fn need(route: &str, method: &Method, uri: &Uri, headers: &HeaderMap) -> Opt
         | "/$/merge/{ds}"
         | "/$/revert/{ds}"
         | "/$/cherry-pick/{ds}"
-        | "/$/commit-graph/{ds}" => Dataset(Read),
+        | "/$/commit-graph/{ds}"
+        // a form's check or save names its branch in the body: the handlers check write
+        // on the branch it resolves to
+        | "/$/forms/{ds}/check"
+        | "/$/forms/{ds}/save" => Dataset(Read),
         "/$/ready/{ds}"
         | "/$/stats/{ds}"
         | "/$/schema/{ds}"
@@ -404,10 +408,7 @@ pub fn need(route: &str, method: &Method, uri: &Uri, headers: &HeaderMap) -> Opt
         | "/$/schema/{ds}/diff"
         | "/$/graph/{ds}/groups"
         | "/$/graph/{ds}/facets"
-        // a check or a save names its branch in the body: the handlers check write on it
         | "/$/forms/{ds}"
-        | "/$/forms/{ds}/check"
-        | "/$/forms/{ds}/save"
         | "/$/reason/{ds}/diagnostics"
         | "/$/prefixes/{ds}"
         | "/$/commits/{ds}"
@@ -1247,7 +1248,9 @@ async fn enforce(st: &AppState, auth: &super::Auth, mut req: Request, next: Next
                 || route.starts_with("/$/merge/")
                 || route.starts_with("/$/revert/")
                 || route.starts_with("/$/cherry-pick/")
-                || route.starts_with("/$/commit-graph/");
+                || route.starts_with("/$/commit-graph/")
+                || route == "/$/forms/{ds}/check"
+                || route == "/$/forms/{ds}/save";
             let have = if branch_routes {
                 p.level_any_branch(&ds)
             } else {

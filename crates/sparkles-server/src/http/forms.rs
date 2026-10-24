@@ -128,6 +128,9 @@ pub(super) async fn model(
     opts.cancel = Some(cancel);
     let (target, exists) = save_target(&main, &s, &p, &branch)?;
     let writable = at.is_none() && may_save(&st, &p, &name, &target, exists);
+    // what is writable follows the grants of the update endpoint on the branch saves go to
+    let mut wq = QueryOptions::default();
+    crate::auth::restrict(&mut wq, &p, &on_branch(&name, &target), Endpoint::Update);
     let lang = params.get("lang").map(str::to_string);
     if class.is_some() && at.is_some() {
         return Err(err(
@@ -143,6 +146,7 @@ pub(super) async fn model(
         req.at = at;
         req.lang = lang;
         req.writable = writable;
+        req.write_graphs = Some(wq.graphs);
         let m = ds
             .dataset
             .forms()

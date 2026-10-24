@@ -33,6 +33,12 @@ pub const MAX_OTHER: usize = 100;
 pub const MAX_CHANGED_TERMS: usize = 1000;
 /// How long the server check of a change may validate (spec U02 §2.8).
 pub const CHECK_TIMEOUT: Duration = Duration::from_secs(10);
+/// How many times a save plans its update again when other commits move the values of
+/// its fields between graphs while it waits for the writer.
+pub const SAVE_ROUNDS: usize = 3;
+/// The most nodes a check validates besides those its change touches: the nodes that
+/// reach a touched node through one or two triples.
+pub const MAX_DEPENDENTS: usize = 500;
 
 const RDF_TYPE: &str = "http://www.w3.org/1999/02/22-rdf-syntax-ns#type";
 const INFERRED: &str = "urn:x-sparkles:inferred";
@@ -61,6 +67,10 @@ pub struct FormRequest {
     /// a new instance of this class instead of `focus` (Phase 2): the form of the node
     /// shapes that would target it, with no values
     pub class: Option<String>,
+    /// the view writes go through, which decides the fields and values that are
+    /// writable: `None` takes the view of `opts.graphs` that reads go through, and
+    /// `Some(None)` is a view that writes every graph
+    pub write_graphs: Option<Option<Arc<GraphAccess>>>,
 }
 
 impl FormRequest {
@@ -72,6 +82,7 @@ impl FormRequest {
             settings,
             writable: true,
             class: None,
+            write_graphs: None,
         }
     }
 }
@@ -311,14 +322,18 @@ impl Forms {
                 store.snapshot_at(at, &o)?.0
             }
         };
-        let built = self.build(
+        let mut built = self.build(
             &snap,
             &req.focus,
             &req.settings,
-            req.lang.as_deref(),
             opts,
             req.class.as_deref(),
+            match &req.write_graphs {
+                Some(w) => w.as_ref(),
+                None => opts.graphs.as_ref(),
+            },
         )?;
+        built.lang = req.lang.clone();
         let writable = req.writable && req.at.is_none();
         Ok(built.model(writable, &store.branch_name()))
     }
@@ -331,37 +346,46 @@ impl Forms {
     pub fn check(&self, change: &FormChange, opts: &QueryOptions) -> Result<FormCheck> {
         let store = self.ds.store();
         let head = store.snapshot();
-        let built = self.build(
-            &head,
-            &change.focus,
-            &change.settings,
-            None,
-            opts,
-            change.class.as_deref(),
-        )?;
-        let plan = built.plan(change)?;
-        let conflicts = conflicts_at(
-            &head,
-            opts.graphs.as_deref(),
-            &built.focus,
-            &expected(&plan, change)?,
-        )?;
+        let mut built = self.build_for(&head, change, opts)?;
+        let dry = DryRun {
+            changes: 1000,
+            all_changes: false,
+            max_changes: 0,
+        };
         let mut wopts = opts.write.clone();
         wopts.message = change.message.clone().map(Arc::from);
         wopts.precondition = None;
+        // a dry run from the start: however the check ends, the terms it added go again
+        wopts.dry_run = Some(dry.clone());
         let mut txn = store.try_write_with(CommitKind::Update, wopts)?;
-        let stats = crate::sparql::update::update_in(&mut txn, &plan.update, opts)?;
-        let _ = stats;
+        // the change is planned on the state the transaction starts from
+        if txn.base().commit != built.commit {
+            let base = txn.base().clone();
+            built = self.build_for(&base, change, opts)?;
+        }
+        let plan = built.plan(change)?;
+        let checks = expected(&built, &plan, change)?;
+        let conflicts = conflicts_at(
+            txn.base(),
+            opts.graphs.as_deref(),
+            &built.focus,
+            &checks,
+            &Limits::of(opts),
+        )?
+        .0;
+        crate::sparql::update::update_in(&mut txn, &plan.update, opts)?;
         let withheld = opts.graphs.as_ref().is_some_and(|a| !a.reads_everything());
         let (mut results, mut conforms, mut timed_out) = (None, None, false);
         if !withheld && !built.shapes.is_empty() {
             let post = Arc::new(txn.view());
+            let nodes = dependents(&post, &plan.touched, &Limits::of(opts))?;
             let mut v = built.vopts.clone();
             v.timeout = Some(CHECK_TIMEOUT);
             v.cancel = opts.cancel.clone();
+            v.cancellation = opts.cancellation.clone();
             v.deadline = deadline(opts);
             v.parallel = false;
-            match sparkles_shacl::validate_nodes(&post, &built.shapes, &plan.touched, &v) {
+            match sparkles_shacl::validate_nodes(&post, &built.shapes, &nodes, &v) {
                 Ok(report) => {
                     conforms = Some(report.conforms);
                     results = Some(built.map_results(&report));
@@ -370,11 +394,7 @@ impl Forms {
                 Err(e) => return Err(crate::handles::from_anyhow(e)),
             }
         }
-        let preview = txn.preview(DryRun {
-            changes: 1000,
-            all_changes: false,
-            max_changes: 0,
-        })?;
+        let preview = txn.preview(dry)?;
         Ok(FormCheck {
             preview,
             conflicts,
@@ -389,59 +409,94 @@ impl Forms {
     /// Commit a change as one update with its message, when the stored values of every
     /// changed field are still those `change.expect` names; otherwise answer the fields
     /// that differ and write nothing. The comparison runs under the writer lock, so no
-    /// commit comes between it and the write. The write guard runs as for any write.
+    /// commit comes between it and the write. The update is planned on a state whose
+    /// changed fields hold their values in the same graphs as the head the write starts
+    /// from: when another commit moved one between graphs, the save plans again on the
+    /// new head, up to [`SAVE_ROUNDS`] times. The write guard runs as for any write.
     pub fn save(&self, change: &FormChange, opts: &QueryOptions) -> Result<FormSaved> {
         let store = self.ds.store();
-        let head = store.snapshot();
-        let built = self.build(
-            &head,
-            &change.focus,
-            &change.settings,
-            None,
-            opts,
-            change.class.as_deref(),
-        )?;
-        let plan = built.plan(change)?;
-        let checks = expected(&plan, change)?;
-        let focus = built.focus.clone();
-        let access = opts.graphs.clone();
-        let differ = Arc::new(move |snap: &Arc<Snapshot>| {
-            conflicts_at(snap, access.as_deref(), &focus, &checks)
-        });
-        // a conflict already at the head: no need to wait for the writer
-        let early = differ(&head)?;
-        if !early.is_empty() {
-            return Ok(FormSaved::Conflict(early));
-        }
-        let found: Arc<Mutex<Vec<FieldConflict>>> = Default::default();
-        let sink = found.clone();
-        let check = differ.clone();
-        let mut wopts = opts.write.clone();
-        wopts.message = change.message.clone().map(Arc::from);
-        wopts.dry_run = None;
-        wopts.precondition = Some(Precondition::new(move |head: &Snapshot| {
-            let c = check(&Arc::new(head.clone()))?;
-            if c.is_empty() {
-                return Ok(());
+        let limits = Limits::of(opts);
+        let mut head = store.snapshot();
+        for _ in 0..SAVE_ROUNDS {
+            let built = self.build_for(&head, change, opts)?;
+            let plan = built.plan(change)?;
+            let checks = expected(&built, &plan, change)?;
+            let focus = built.focus.clone();
+            let access = opts.graphs.clone();
+            let (settings, target) = (change.settings.clone(), built.target.clone());
+            let lim = limits.clone();
+            let differ = Arc::new(move |snap: &Arc<Snapshot>| {
+                let (c, mut stale) = conflicts_at(snap, access.as_deref(), &focus, &checks, &lim)?;
+                if c.is_empty() && !stale {
+                    // new values go to a graph that depends on the state
+                    let read = Reader::new(snap, access.as_deref())?;
+                    stale = target_graph(&read, &focus, &settings)? != target;
+                }
+                Ok::<_, Error>((c, stale))
+            });
+            // a conflict already at the head: no need to wait for the writer
+            let (early, _) = differ(&head)?;
+            if !early.is_empty() {
+                return Ok(FormSaved::Conflict(early));
             }
-            *sink.lock() = c;
-            Err(Error::PreconditionFailed(
-                "the stored values of a field changed since the form loaded them".into(),
-            ))
-        }));
-        let mut txn = match store.try_write_with(CommitKind::Update, wopts) {
-            Ok(t) => t,
-            Err(Error::PreconditionFailed(m)) => {
-                let c = std::mem::take(&mut *found.lock());
-                if c.is_empty() {
+            let found: Arc<Mutex<Vec<FieldConflict>>> = Default::default();
+            let moved: Arc<Mutex<bool>> = Default::default();
+            let (sink, moved_sink) = (found.clone(), moved.clone());
+            let check = differ.clone();
+            let mut wopts = opts.write.clone();
+            wopts.message = change.message.clone().map(Arc::from);
+            wopts.dry_run = None;
+            wopts.precondition = Some(Precondition::new(move |head: &Snapshot| {
+                let (c, stale) = check(&Arc::new(head.clone()))?;
+                if !c.is_empty() {
+                    *sink.lock() = c;
+                } else if stale {
+                    *moved_sink.lock() = true;
+                } else {
+                    return Ok(());
+                }
+                Err(Error::PreconditionFailed(
+                    "the stored values of a field changed since the form loaded them".into(),
+                ))
+            }));
+            let mut txn = match store.try_write_with(CommitKind::Update, wopts) {
+                Ok(t) => t,
+                Err(Error::PreconditionFailed(m)) => {
+                    let c = std::mem::take(&mut *found.lock());
+                    if !c.is_empty() {
+                        return Ok(FormSaved::Conflict(c));
+                    }
+                    if *moved.lock() {
+                        head = store.snapshot();
+                        continue;
+                    }
                     return Err(Error::PreconditionFailed(m));
                 }
-                return Ok(FormSaved::Conflict(c));
-            }
-            Err(e) => return Err(e),
-        };
-        crate::sparql::update::update_in(&mut txn, &plan.update, opts)?;
-        Ok(FormSaved::Saved(Box::new(txn.commit()?)))
+                Err(e) => return Err(e),
+            };
+            crate::sparql::update::update_in(&mut txn, &plan.update, opts)?;
+            return Ok(FormSaved::Saved(Box::new(txn.commit()?)));
+        }
+        Err(Error::PreconditionFailed(format!(
+            "other commits kept moving the values of the form between graphs: tried {SAVE_ROUNDS} times"
+        )))
+    }
+
+    /// The fields of a change's resource at `snap`, writable through the view of `opts`.
+    fn build_for(
+        &self,
+        snap: &Arc<Snapshot>,
+        change: &FormChange,
+        opts: &QueryOptions,
+    ) -> Result<Built> {
+        self.build(
+            snap,
+            &change.focus,
+            &change.settings,
+            opts,
+            change.class.as_deref(),
+            opts.graphs.as_ref(),
+        )
     }
 
     /// The fields of a resource at `snap`.
@@ -450,10 +505,12 @@ impl Forms {
         snap: &Arc<Snapshot>,
         focus: &str,
         settings: &FormSettings,
-        lang: Option<&str>,
         opts: &QueryOptions,
         class: Option<&str>,
+        write: Option<&Arc<GraphAccess>>,
     ) -> Result<Built> {
+        let limits = Limits::of(opts);
+        limits.check()?;
         let focus = NamedNode::new(focus)
             .map_err(|e| Error::invalid(format!("focus: invalid IRI '{focus}': {e}")))?;
         let focus = Term::NamedNode(focus);
@@ -464,7 +521,9 @@ impl Forms {
             })
             .transpose()?;
         let access = opts.graphs.as_ref().map(|a| a.bound(snap));
-        let read = Reader::new(snap, access.as_deref())?;
+        let write_access = write.map(|a| a.bound(snap));
+        let mut read = Reader::new(snap, access.as_deref())?;
+        read.limits = limits.clone();
         let types: Vec<String> = if let Some(c) = &new_class {
             vec![c.as_str().to_string()]
         } else {
@@ -481,7 +540,12 @@ impl Forms {
             .into_iter()
             .collect()
         };
-        let (shapes, mut vopts, missing) = self.shapes(snap, settings, &types, &access, opts)?;
+        // shapes graphs are read under the view, without the triples it hides
+        let (shapes, mut vopts, missing) =
+            self.shapes(read.snap(), settings, &types, &access, opts)?;
+        vopts.cancel = opts.cancel.clone();
+        vopts.cancellation = opts.cancellation.clone();
+        vopts.deadline = deadline(opts);
         // a caller limited to some graphs: decide the targets without the others
         if let Some(a) = access.as_deref()
             && !a.reads_all()
@@ -527,9 +591,11 @@ impl Forms {
             layout,
             target,
             access,
+            write_access,
+            limits,
             snap: read_snap,
             masked,
-            lang: lang.map(str::to_string),
+            lang: None,
             prefixes,
         })
     }
@@ -652,6 +718,9 @@ struct Built {
     layout: FormLayout,
     target: Option<String>,
     access: Option<Arc<GraphAccess>>,
+    /// the view writes go through, which decides what is writable
+    write_access: Option<Arc<GraphAccess>>,
+    limits: Limits,
     /// the state read, masked by the view
     snap: Arc<Snapshot>,
     masked: bool,
@@ -699,6 +768,7 @@ impl Built {
             snap: self.snap.clone(),
             access: self.access.as_deref(),
             masked: self.masked,
+            limits: self.limits.clone(),
         })
     }
 
@@ -933,17 +1003,21 @@ impl Built {
         })
     }
 
-    /// Whether the view's protections keep the caller from writing the field's
-    /// predicate in the graph new values go to.
+    /// Whether the write view's protections keep the caller from writing the field's
+    /// predicate in the graph new values go to. Only protections that name predicates
+    /// and graphs alone count here: one scoped by classes or a pattern depends on the
+    /// data, and the write itself enforces it.
     fn protected(&self, f: &FormField, target: Option<&Term>) -> bool {
         let (Some(p), Some(rules)) = (
             f.path.predicate(),
-            self.access.as_ref().and_then(|a| a.triples.as_ref()),
+            self.write_access.as_ref().and_then(|a| a.triples.as_ref()),
         ) else {
             return false;
         };
         rules.rules.iter().any(|r| {
             !r.write.is_all()
+                && r.protection.classes.is_none()
+                && r.protection.pattern.is_none()
                 && r.protection.covers_predicate(p.as_str())
                 && r.protection.covers_graph(target)
                 && !r.write.allows(target)
@@ -954,7 +1028,7 @@ impl Built {
         if g == Some(INFERRED) {
             return false;
         }
-        match &self.access {
+        match &self.write_access {
             None => true,
             Some(a) => {
                 let t = g.map(|g| Term::NamedNode(NamedNode::new_unchecked(g)));
@@ -1172,10 +1246,26 @@ impl Built {
     }
 }
 
-/// The values the form loaded for each changed field: `change.expect` must name them all.
-type Expected = Vec<(String, FieldPath, BTreeMap<String, Term>)>;
+/// A changed field's values as the form loaded them (`change.expect` must name them
+/// all), and the values with their graphs in the state its update was planned on.
+struct Check {
+    id: String,
+    path: FieldPath,
+    want: BTreeMap<String, Term>,
+    planned: BTreeSet<(String, Option<String>)>,
+}
 
-fn expected(plan: &Plan, change: &FormChange) -> Result<Expected> {
+type Expected = Vec<Check>;
+
+fn placed(values: &[FormValue]) -> BTreeSet<(String, Option<String>)> {
+    values
+        .iter()
+        .map(|v| (v.term.to_string(), v.graph.clone()))
+        .collect()
+}
+
+fn expected(built: &Built, plan: &Plan, change: &FormChange) -> Result<Expected> {
+    let read = built.read()?;
     let mut checks = Vec::new();
     for (id, path) in &plan.changed {
         let want = change.expect.get(id).ok_or_else(|| {
@@ -1183,31 +1273,113 @@ fn expected(plan: &Plan, change: &FormChange) -> Result<Expected> {
                 "expect: give the values the form loaded for field {id}"
             ))
         })?;
-        checks.push((id.clone(), path.clone(), set(&mut want.iter().cloned())));
+        checks.push(Check {
+            id: id.clone(),
+            path: path.clone(),
+            want: set(&mut want.iter().cloned()),
+            planned: placed(&read.values(&built.focus, path)?),
+        });
     }
     Ok(checks)
 }
 
 /// The changed fields whose values at `snap`, under the caller's view, are not those the
-/// form loaded.
+/// form loaded; and whether, with the same values, one of them sits in other graphs than
+/// in the state the update was planned on, so that the update no longer fits.
 fn conflicts_at(
     snap: &Arc<Snapshot>,
     access: Option<&GraphAccess>,
     focus: &Term,
     checks: &Expected,
-) -> Result<Vec<FieldConflict>> {
-    let read = Reader::new(snap, access)?;
+    limits: &Limits,
+) -> Result<(Vec<FieldConflict>, bool)> {
+    let mut read = Reader::new(snap, access)?;
+    read.limits = limits.clone();
     let mut out = Vec::new();
-    for (id, path, want) in checks {
-        let now = set(&mut read.values(focus, path)?.into_iter().map(|v| v.term));
-        if now.keys().ne(want.keys()) {
+    let mut stale = false;
+    for c in checks {
+        let values = read.values(focus, &c.path)?;
+        let now = set(&mut values.iter().map(|v| v.term.clone()));
+        if now.keys().ne(c.want.keys()) {
             out.push(FieldConflict {
-                id: id.clone(),
+                id: c.id.clone(),
                 now: now.into_values().collect(),
             });
+        } else if placed(&values) != c.planned {
+            stale = true;
         }
     }
+    Ok((out, stale))
+}
+
+/// The nodes a check validates: those the change touches, and the nodes that reach one
+/// of them through one or two triples in `post`, whose shapes can read the touched
+/// nodes along a path. At most [`MAX_DEPENDENTS`] are added.
+fn dependents(post: &Arc<Snapshot>, touched: &[Term], limits: &Limits) -> Result<Vec<Term>> {
+    let mut read = Reader::new(post, None)?;
+    read.limits = limits.clone();
+    let mut seen: BTreeSet<Id> = BTreeSet::new();
+    let mut out: Vec<Term> = touched.to_vec();
+    let mut frontier: Vec<Id> = touched.iter().filter_map(|t| post.lookup_term(t)).collect();
+    seen.extend(frontier.iter().copied());
+    let mut added = 0usize;
+    'hops: for _ in 0..2 {
+        let mut next = Vec::new();
+        for o in std::mem::take(&mut frontier) {
+            for q in read.scan(Perm::Osp, &[o.0], MAX_DEPENDENTS + 1)? {
+                if read.graph(q[3]).is_none() || !seen.insert(q[0]) {
+                    continue;
+                }
+                let Some(t) = post.term(q[0]) else { continue };
+                if matches!(t, Term::Literal(_)) {
+                    continue;
+                }
+                out.push(t);
+                next.push(q[0]);
+                added += 1;
+                if added >= MAX_DEPENDENTS {
+                    break 'hops;
+                }
+            }
+        }
+        frontier = next;
+    }
     Ok(out)
+}
+
+/// The cancellation and the deadline of a request, checked while forms read.
+#[derive(Clone, Default)]
+struct Limits {
+    cancel: Option<Arc<std::sync::atomic::AtomicBool>>,
+    cancellation: Option<sparkles_core::task::Cancellation>,
+    deadline: Option<Instant>,
+}
+
+impl Limits {
+    fn of(opts: &QueryOptions) -> Limits {
+        Limits {
+            cancel: opts.cancel.clone(),
+            cancellation: opts.cancellation.clone(),
+            deadline: deadline(opts),
+        }
+    }
+
+    fn check(&self) -> Result<()> {
+        if self
+            .cancel
+            .as_ref()
+            .is_some_and(|c| c.load(std::sync::atomic::Ordering::Relaxed))
+        {
+            return Err(Error::Cancelled);
+        }
+        if let Some(c) = &self.cancellation {
+            c.check()?;
+        }
+        if self.deadline.is_some_and(|d| Instant::now() >= d) {
+            return Err(Error::Timeout);
+        }
+        Ok(())
+    }
 }
 
 fn cmp_order(a: Option<f64>, b: Option<f64>) -> std::cmp::Ordering {
@@ -1316,6 +1488,7 @@ struct Reader<'a> {
     access: Option<&'a GraphAccess>,
     /// `snap` is masked already
     masked: bool,
+    limits: Limits,
 }
 
 impl<'a> Reader<'a> {
@@ -1325,11 +1498,13 @@ impl<'a> Reader<'a> {
                 snap: a.masked(snap)?,
                 access,
                 masked: true,
+                limits: Limits::default(),
             }),
             None => Ok(Reader {
                 snap: snap.clone(),
                 access,
                 masked: false,
+                limits: Limits::default(),
             }),
         }
     }
@@ -1364,8 +1539,10 @@ impl<'a> Reader<'a> {
 
     /// The quads whose key in `perm` starts with `prefix`.
     fn scan(&self, perm: Perm, prefix: &[u64], limit: usize) -> Result<Vec<[Id; 4]>> {
+        self.limits.check()?;
         let mut out = Vec::new();
         self.snap.scan(perm, prefix, |c| {
+            self.limits.check()?;
             match c {
                 Chunk::Block(b, s, e) => {
                     for i in s..e {

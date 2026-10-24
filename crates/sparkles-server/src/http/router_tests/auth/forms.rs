@@ -10,7 +10,9 @@ const EX: &str = "http://example.org/";
 
 /// `fadmin` sees everything. `fwriter` writes under the protection of `ex:email`,
 /// `fhalf` also reads emails, `freader` only reads, and `fgraph` reads and writes the
-/// default graph alone.
+/// default graph alone. `fdev` writes the `dev*` branches only, and `fsplit` reads
+/// through the query endpoint and writes the default graph through the update endpoint.
+/// The protections of patients and of shape descriptions cover no field of Alice's.
 fn users() -> String {
     let h = |pw: &str| hash_password_with(pw, 8, 1, 1).unwrap();
     format!(
@@ -19,6 +21,16 @@ fn users() -> String {
 name = "emails"
 dataset = "ppl"
 predicates = ["http://example.org/email"]
+
+[[protections]]
+name = "patients"
+dataset = "ppl"
+classes = ["http://example.org/Patient"]
+
+[[protections]]
+name = "notes"
+dataset = "ppl"
+predicates = ["http://www.w3.org/ns/shacl#description"]
 
 [[users]]
 name = "fadmin"
@@ -52,12 +64,35 @@ dataset = "ppl"
 level = "write"
 graphs = ["urn:x-arq:DefaultGraph"]
 lifts = ["emails"]
+
+[[users]]
+name = "fdev"
+password = "{fdev}"
+[[users.grants]]
+dataset = "ppl"
+level = "write"
+branches = ["dev*"]
+
+[[users]]
+name = "fsplit"
+password = "{fsplit}"
+[[users.grants]]
+dataset = "ppl"
+level = "read"
+endpoints = ["query"]
+[[users.grants]]
+dataset = "ppl"
+level = "write"
+graphs = ["urn:x-arq:DefaultGraph"]
+endpoints = ["update"]
 "#,
         fadmin = h("fadmin-pw"),
         fwriter = h("fwriter-pw"),
         fhalf = h("fhalf-pw"),
         freader = h("freader-pw"),
         fgraph = h("fgraph-pw"),
+        fdev = h("fdev-pw"),
+        fsplit = h("fsplit-pw"),
     )
 }
 
@@ -167,6 +202,8 @@ async fn a6_protected_fields_are_absent_or_read_only() {
     assert_eq!(labels(&m), ["Name", "Works for", "Role"]);
     assert!(!m.to_string().contains("alice@example.org"), "{m}");
     assert_eq!(m["editable"], true);
+    // the protection of patients depends on the class: Alice's name stays editable
+    assert_eq!(field(&m, "Name")["editable"], true, "{m}");
     // fwriter can still save the name
     let r = post(&s.app, "fwriter", "save", &name_change()).await;
     assert_eq!(r.status, StatusCode::OK, "{}", r.text());
@@ -221,4 +258,77 @@ async fn readers_cannot_save_and_limited_callers_get_no_validation() {
     let r = post(&s.app, "fgraph", "save", &name_change()).await;
     assert_eq!(r.status, StatusCode::OK, "{}", r.text());
     assert!(r.json()["commit"].get("quads").is_none());
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn shapes_graphs_are_read_under_the_mask() {
+    let s = server().await;
+    let admin = b("fadmin");
+    let shapes = r#"@prefix sh: <http://www.w3.org/ns/shacl#> .
+@prefix ex: <http://example.org/> .
+ex:PersonShape a sh:NodeShape ; sh:targetClass ex:Person ;
+  sh:property [ sh:path ex:name ; sh:name "Name" ; sh:description "a secret note" ] ."#;
+    let r = call(
+        &s.app,
+        "PUT",
+        &format!("/ppl/data?graph={}", enc("urn:shapes")),
+        &[("authorization", &admin), ("content-type", "text/turtle")],
+        shapes,
+    )
+    .await;
+    assert!(r.status.is_success(), "{}", r.text());
+    let r = call(
+        &s.app,
+        "PATCH",
+        "/$/settings/ppl/forms",
+        &[
+            ("authorization", &admin),
+            ("content-type", "application/json"),
+        ],
+        &json!({ "shapes": "graphs", "graphs": ["urn:shapes"] }).to_string(),
+    )
+    .await;
+    assert_eq!(r.status, StatusCode::OK, "{}", r.text());
+    let m = model(&s.app, "fadmin").await;
+    assert_eq!(field(&m, "Name")["description"], "a secret note", "{m}");
+    // the protection of sh:description hides the note from fwriter's form
+    let m = model(&s.app, "fwriter").await;
+    assert!(!m.to_string().contains("a secret note"), "{m}");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_writer_of_some_branches_saves_with_the_branch_in_the_body() {
+    let s = server().await;
+    let r = call(
+        &s.app,
+        "POST",
+        "/$/branches/ppl",
+        &[
+            ("authorization", &b("fadmin")),
+            ("content-type", "application/json"),
+        ],
+        r#"{"name":"dev1"}"#,
+    )
+    .await;
+    assert_eq!(r.status, StatusCode::CREATED, "{}", r.text());
+    let mut c = name_change();
+    let r = post(&s.app, "fdev", "save", &c).await;
+    assert_eq!(r.status, StatusCode::FORBIDDEN, "{}", r.text());
+    c["branch"] = json!("dev1");
+    let r = post(&s.app, "fdev", "check", &c).await;
+    assert_eq!(r.status, StatusCode::OK, "{}", r.text());
+    let r = post(&s.app, "fdev", "save", &c).await;
+    assert_eq!(r.status, StatusCode::OK, "{}", r.text());
+    assert_eq!(r.json()["branch"], "dev1");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn update_grants_decide_what_the_form_may_change() {
+    let s = server().await;
+    let m = model(&s.app, "fsplit").await;
+    assert_eq!(m["editable"], true, "{m}");
+    assert_eq!(field(&m, "Name")["editable"], true, "{m}");
+    assert_ne!(field(&m, "Name")["values"][0]["readOnly"], true, "{m}");
+    let r = post(&s.app, "fsplit", "save", &name_change()).await;
+    assert_eq!(r.status, StatusCode::OK, "{}", r.text());
 }

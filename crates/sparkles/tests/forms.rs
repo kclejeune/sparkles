@@ -444,3 +444,129 @@ fn a_new_instance_takes_a_minted_iri_its_type_and_its_values() {
     };
     assert!(t.mint_iri().starts_with(&ex("person/")));
 }
+
+#[cfg(feature = "failpoints")]
+#[test]
+fn a_save_plans_again_when_a_value_moves_graph_while_it_waits() {
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    let (ds, settings) = dataset();
+    // another writer moves the name into a named graph while the save waits for the lock
+    let other = ds.clone();
+    let fired = Arc::new(AtomicBool::new(false));
+    let f = fired.clone();
+    ds.store().set_failpoint(
+        "writer-acquiring",
+        Some(Arc::new(move |_| {
+            if !f.swap(true, Ordering::SeqCst) {
+                other
+                    .update(&format!(
+                        "DELETE DATA {{ <{EX}alice> <{EX}name> \"Alice Lima\" }} ;
+                         INSERT DATA {{ GRAPH <urn:g> {{ <{EX}alice> <{EX}name> \"Alice Lima\" }} }}"
+                    ))
+                    .unwrap();
+            }
+        })),
+    );
+    let mut c = change(
+        "name",
+        vec![lit("Alice Lima")],
+        vec![lit("Z")],
+        vec![lit("Alice Lima")],
+    );
+    c.settings = settings;
+    let saved = ds.forms().save(&c, &Default::default());
+    ds.store().set_failpoint("writer-acquiring", None);
+    assert!(fired.load(Ordering::SeqCst));
+    let FormSaved::Saved(_) = saved.unwrap() else {
+        panic!("the save found a conflict");
+    };
+    // the value was removed from the graph it moved to, not left beside the new one
+    assert!(
+        !ds.ask(&format!(
+            "ASK {{ GRAPH ?g {{ <{EX}alice> <{EX}name> \"Alice Lima\" }} }}"
+        ))
+        .unwrap()
+    );
+    assert!(
+        ds.ask(&format!("ASK {{ <{EX}alice> <{EX}name> \"Z\" }}"))
+            .unwrap()
+    );
+}
+
+#[test]
+fn a_check_that_fails_leaves_no_terms_behind() {
+    let (ds, settings) = dataset();
+    ds.load_str_into(
+        r#"@prefix sh: <http://www.w3.org/ns/shacl#> .
+@prefix ex: <http://example.org/> .
+ex:Failing a sh:NodeShape ; sh:targetClass ex:Person ;
+  sh:sparql [ sh:select "SELECT $this ?failure WHERE { BIND(true AS ?failure) }" ] ."#,
+        sparkles::io::RdfFormat::Turtle,
+        "urn:shapes",
+    )
+    .unwrap();
+    let before = ds.stats(&Default::default()).unwrap().terms;
+    let mut c = change(
+        "name",
+        vec![lit("Alice Lima")],
+        vec![lit("a term nothing else has")],
+        vec![lit("Alice Lima")],
+    );
+    c.settings = settings;
+    assert!(ds.forms().check(&c, &Default::default()).is_err());
+    assert_eq!(ds.stats(&Default::default()).unwrap().terms, before);
+}
+
+#[test]
+fn a_check_validates_the_nodes_whose_shapes_reach_the_focus() {
+    let (ds, settings) = dataset();
+    ds.load_str_into(
+        r#"@prefix sh: <http://www.w3.org/ns/shacl#> .
+@prefix ex: <http://example.org/> .
+ex:TeamShape a sh:NodeShape ; sh:targetClass ex:Team ;
+  sh:property [ sh:path ex:member ; sh:node ex:Named ] .
+ex:Named a sh:NodeShape ; sh:property [ sh:path ex:nickname ; sh:minCount 1 ] ."#,
+        sparkles::io::RdfFormat::Turtle,
+        "urn:shapes",
+    )
+    .unwrap();
+    ds.update(&format!("INSERT DATA {{ <{EX}core> a <{EX}Team> }}"))
+        .unwrap();
+    // removing the nickname of Alice, a member of the team, breaks the team's shape
+    let mut c = change(
+        "name",
+        vec![],
+        vec![lit("Alice L.")],
+        vec![lit("Alice Lima")],
+    );
+    c.settings = settings.clone();
+    let check = ds.forms().check(&c, &Default::default()).unwrap();
+    assert_eq!(check.conforms, Some(true), "{:?}", check.results);
+    ds.update(&format!(
+        "DELETE DATA {{ <{EX}alice> <{EX}nickname> \"Al\" }}"
+    ))
+    .unwrap();
+    let check = ds.forms().check(&c, &Default::default()).unwrap();
+    let results = check.results.unwrap();
+    assert!(
+        results
+            .iter()
+            .any(|r| r["focusNode"]["value"] == ex("core")),
+        "{results:?}"
+    );
+}
+
+#[test]
+fn a_cancelled_model_request_is_refused() {
+    use std::sync::Arc;
+    use std::sync::atomic::AtomicBool;
+    let (ds, settings) = dataset();
+    let req = FormRequest::new(ex("alice"), settings);
+    let opts = sparkles::sparql::QueryOptions {
+        cancel: Some(Arc::new(AtomicBool::new(true))),
+        ..Default::default()
+    };
+    let e = ds.forms().model(&req, &opts).unwrap_err();
+    assert!(matches!(e, sparkles::Error::Cancelled), "{e}");
+}
