@@ -561,16 +561,30 @@ def summarize_pair(pair, qs, answers, scores):
         sum(nano) / 1e9 if answers and all(type(v) is int for v in nano) else None
     )
     # A question counts as asked when the pipeline asked, even when the clarification
-    # was then answered and the second Ask was scored.
+    # was then answered and the second Ask was scored, and in a cascade when any pair
+    # it tried asked.
     clar = [
         i
         for i, a in enumerate(answers)
-        if a.get("outcome") == "clarify" or "clarification" in a
+        if a.get("outcome") == "clarify"
+        or "clarification" in a
+        or a.get("cascadeAsked")
     ]
-    answered = [a["clarification"] for a in answers if "clarification" in a]
+
+    def records(a):
+        if "cascadeClarifications" in a:
+            return a["cascadeClarifications"]
+        return [a["clarification"]] if "clarification" in a else []
+
+    answered = [
+        i
+        for i in answerable
+        if any(c.get("basis") != "unusable" for c in records(answers[i]))
+    ]
     basis = {}
-    for c in answered:
-        basis[c.get("basis")] = basis.get(c.get("basis"), 0) + 1
+    for a in answers:
+        for c in records(a):
+            basis[c.get("basis")] = basis.get(c.get("basis"), 0) + 1
     refusal = [i for i, q in enumerate(qs) if q["kind"] == "unanswerable"]
     selects = [scores[i][2] for i in answerable if scores[i][2]["kind"] == "select"]
     common = sum(s["intersection"] for s in selects)
@@ -598,13 +612,9 @@ def summarize_pair(pair, qs, answers, scores):
             "clarificationPrecision": ratio(
                 sum(qs[i]["kind"] == "clarify" for i in clar), len(clar)
             ),
-            "clarificationsAnswered": ratio(
-                sum(c.get("basis") != "unusable" for c in answered), len(answerable)
-            ),
+            "clarificationsAnswered": ratio(len(answered), len(answerable)),
             "clarificationBasis": basis,
-            "correctAfterClarification": sum(
-                bool(scores[i][0]) for i in answerable if "clarification" in answers[i]
-            ),
+            "correctAfterClarification": sum(bool(scores[i][0]) for i in answered),
             "refusalAccuracy": ratio(sum(scores[i][0] for i in refusal), len(refusal)),
             "macroPrecision": statistics.mean(scores[i][1][0] for i in answerable)
             if answerable
@@ -703,6 +713,14 @@ def cascade_cases(pairs, qs, answers, scores):
         merged["cliEstimatedCostKnown"] = all(
             a.get("cliEstimatedCostKnown", True) for a in spent
         )
+        # A pair that asked for a clarification and then failed still asked, so the
+        # cascade keeps the clarifications of every pair it tried.
+        merged["cascadeAsked"] = any(
+            a.get("outcome") == "clarify" or "clarification" in a for a in spent
+        )
+        merged["cascadeClarifications"] = [
+            a["clarification"] for a in spent if "clarification" in a
+        ]
         used.append(q)
         cascade_answers.append(merged)
         cascade_scores.append(scores[tried[-1]][q["id"]])

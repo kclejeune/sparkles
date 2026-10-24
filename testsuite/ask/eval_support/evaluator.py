@@ -473,9 +473,10 @@ def gold_terms(text):
     """The IRIs a gold query names and the words of their local names and literals.
 
     The scan follows the lexical rules of `offline_query`: comments are skipped,
-    literals are read as data, and a prefixed name is expanded with the PREFIX
-    declarations of the text, its escapes undone. A name with an undeclared prefix
-    is left out. Returns (set of IRIs, set of words).
+    literals are read as data, a prefixed name is expanded with the PREFIX
+    declarations before it, its escapes undone, and a relative IRI resolves against
+    the BASE in force. A name with an undeclared prefix is left out, and so are the
+    IRIs of the declarations themselves. Returns (set of IRIs, set of words).
     """
     tokens, literals, i = [], [], 0
     while i < len(text):
@@ -525,27 +526,41 @@ def gold_terms(text):
             i = j
             continue
         i += 1
-    prefixes, declared = {}, set()
-    for k in range(len(tokens) - 2):
-        (k0, v0), (k1, v1), (k2, v2) = tokens[k : k + 3]
+    # PREFIX and BASE apply from where they stand, so the tokens are read in order. A
+    # relative IRI resolves against the BASE in force, and so does a namespace.
+    import urllib.parse
+
+    prefixes, iris, base, k = {}, set(), None, 0
+
+    def resolve(iri):
+        return urllib.parse.urljoin(base, iri) if base else iri
+
+    while k < len(tokens):
+        kind, value = tokens[k]
+        nxt = tokens[k + 1 : k + 3]
         if (
-            k0 == "name"
-            and v0.upper() == "PREFIX"
-            and k1 == "name"
-            and v1.endswith(":")
-            and v1.count(":") == 1
-            and k2 == "iri"
+            kind == "name"
+            and value.upper() == "PREFIX"
+            and len(nxt) == 2
+            and nxt[0][0] == "name"
+            and nxt[0][1].endswith(":")
+            and nxt[0][1].count(":") == 1
+            and nxt[1][0] == "iri"
         ):
-            prefixes[v1[:-1]] = v2
-            declared.add(k + 2)
-    iris = set()
-    for k, (kind, value) in enumerate(tokens):
-        if kind == "iri" and k not in declared:
-            iris.add(value)
+            prefixes[nxt[0][1][:-1]] = resolve(nxt[1][1])
+            k += 3
+            continue
+        if kind == "name" and value.upper() == "BASE" and nxt and nxt[0][0] == "iri":
+            base = resolve(nxt[0][1])
+            k += 2
+            continue
+        if kind == "iri":
+            iris.add(resolve(value))
         elif ":" in value:
             prefix, local = value.split(":", 1)
             if prefix in prefixes and local:
                 iris.add(prefixes[prefix] + local)
+        k += 1
     words = set()
     for iri in iris:
         words |= words_of(re.split(r"[/#]", iri)[-1])

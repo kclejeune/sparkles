@@ -951,6 +951,28 @@ class Clarifications(unittest.TestCase):
         out = choose_clarification(c, self.GOLD)
         self.assertEqual(out["answer"], "http://dbpedia.org/resource/Berlin")
 
+    def test_relative_iris_resolve_against_the_base_in_force(self):
+        gold = (
+            "BASE <http://dbpedia.org/resource/>\n"
+            "PREFIX rel: <sub/>\n"
+            "SELECT ?x { <Berlin> <http://ex/p> ?x . rel:a ?p ?x }"
+        )
+        iris, _ = gold_terms(gold)
+        self.assertEqual(
+            iris,
+            {
+                "http://dbpedia.org/resource/Berlin",
+                "http://ex/p",
+                "http://dbpedia.org/resource/sub/a",
+            },
+        )
+        c = self.choices(
+            ("Berlin", "http://dbpedia.org/resource/Berlin,_New_Hampshire"),
+            ("Berlin", "http://dbpedia.org/resource/Berlin"),
+        )
+        self.assertEqual(choose_clarification(c, gold)["index"], 1)
+        self.assertEqual(choose_clarification(c, gold)["basis"], "gold-iri")
+
     def test_unusable_clarifications(self):
         for clarify in [
             None,
@@ -1038,6 +1060,42 @@ class ClarifiedRuns(unittest.TestCase):
         # Both questions asked, and only the clarify question was meant to.
         self.assertEqual(row["clarificationPrecision"]["numerator"], 1)
         self.assertEqual(row["clarificationPrecision"]["denominator"], 2)
+
+    def test_a_cascade_keeps_the_clarification_of_a_pair_that_failed_after_it(self):
+        args, _ = self.run_set(["answerable"])
+        cfg = json.loads(pathlib.Path(args.model_config).read_text())
+        cfg["models"]["providers"]["p"]["models"]["m2"] = {}
+        pathlib.Path(args.model_config).write_text(json.dumps(cfg))
+        args.pair = ["p/m", "p/m2"]
+        args.out = str(pathlib.Path(args.out).with_name("cascade"))
+        # The first pair asks, and fails once the clarification is answered. The second
+        # answers without asking.
+        self.fake_ask(
+            args,
+            "import json,sys\n"
+            'if sys.argv[1] == "query":\n'
+            '    print(json.dumps({"head":{"vars":["x"]},"results":{"bindings":'
+            '[{"x":{"type":"uri","value":"http://ex/v"}}]}}))\n'
+            'elif "draft=p/m2" in sys.argv:\n'
+            '    print(json.dumps({"outcome":"answered","result":{"query":'
+            '"SELECT ?x WHERE { <http://ex/B> <http://ex/p> ?x }"}}))\n'
+            'elif not any(a.startswith("--clarification") for a in sys.argv):\n'
+            '    print(json.dumps({"outcome":"clarify","clarify":{"id":"mention",'
+            '"question":"Which B?","choices":[{"label":"B","value":"http://ex/B"}]}}))\n'
+            "else:\n"
+            '    print(json.dumps({"outcome":"error","error":{"code":"provider-unavailable"}}))\n'
+            "    raise SystemExit(2)\n",
+        )
+        _, report = eval_ask.run_matrix(args)
+        self.assertTrue(report["complete"], report.get("errorDetail"))
+        first, second, cascade = report["rows"]
+        self.assertEqual(first["failureStatuses"], {"provider_error": 1})
+        self.assertEqual(first["clarificationBasis"], {"gold-iri": 1})
+        self.assertEqual(second["clarificationPrecision"]["denominator"], 0)
+        self.assertEqual(cascade["executionAccuracy"]["numerator"], 1)
+        self.assertEqual(cascade["clarificationPrecision"]["denominator"], 1)
+        self.assertEqual(cascade["clarificationsAnswered"]["numerator"], 1)
+        self.assertEqual(cascade["clarificationBasis"], {"gold-iri": 1})
 
     def test_the_score_policy_keeps_the_clarification_a_failure(self):
         args, report = self.run_set(["answerable"], policy="score")

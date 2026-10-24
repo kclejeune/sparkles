@@ -79,7 +79,9 @@ words with the gold's IRIs and literals wins, a tie goes to the earliest tied ch
 with no shared word the first choice is taken. The saved answer keeps the clarification,
 the choice, its basis and the first Ask's execution and usage, and each row counts
 `clarificationsAnswered`, `clarificationBasis` and `correctAfterClarification`. A
-question still counts as asked for clarification precision. A question of kind `clarify`
+question still counts as asked for clarification precision, and a cascade row counts a
+question as asked when any pair it tried asked. A relative IRI in the gold resolves
+against its BASE before the choices are compared. A question of kind `clarify`
 or `unanswerable` is never answered, and `--clarifications score` scores every
 clarification as a failure, as the first paid run did.
 
