@@ -1883,6 +1883,15 @@
     });
   });
 
+  // `?selection=1` (Open as graph on another page, such as the embedding map) draws the
+  // shared selection once the dataset is open
+  let selectionOpened = false;
+  $effect(() => {
+    if (selectionOpened || !ds || page.url.searchParams.get('selection') !== '1') return;
+    selectionOpened = true;
+    untrack(() => void openSelectionAsGraph([...selection.ids]));
+  });
+
   function setTab(t: Tab) {
     tab = t;
     syncUrl(focusId && nodes[focusId] ? nodes[focusId].iri : null);

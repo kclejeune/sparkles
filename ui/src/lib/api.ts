@@ -1,6 +1,7 @@
 // Typed client for the Sparkles HTTP API (see docs/API.md — the source of truth).
 // All paths are absolute from the server root; the UI itself lives under /ui/.
 
+import { parsePoints, type Projection } from './embedding';
 import { CSRF_HEADER, needsCsrf, type Level } from './auth';
 import { fmtBytes, fmtInt } from './format';
 import { branchPath } from './branches';
@@ -346,7 +347,8 @@ export type TaskKind =
   | 'backup-verify'
   | 'backup-gc'
   | 'graphrag'
-  | 'backup-policy';
+  | 'backup-policy'
+  | 'vector-projection';
 /** `queued`: waiting for a task slot; `cancelled`: stopped by `DELETE /$/tasks/{id}`. */
 export type TaskState = 'queued' | 'running' | 'done' | 'failed' | 'cancelled';
 export type Task = {
@@ -882,6 +884,10 @@ export async function listTasks(): Promise<Task[]> {
 }
 
 export const getTask = (id: string) => json<Task>(`/$/tasks/${enc(id)}`);
+
+/** `DELETE /$/tasks/{id}`: stop a cancellable task. */
+export const cancelTask = (id: string) =>
+  json<unknown>(`/$/tasks/${enc(id)}`, { method: 'DELETE' });
 
 export async function prefixes(ds: string): Promise<Record<string, string>> {
   const body = await json<{ prefixes: Record<string, string> }>(`/$/prefixes/${enc(ds)}`);
@@ -3512,4 +3518,52 @@ export async function runStoredQuery(
   const at = atInfo(res.headers);
   if (at) body.at = at;
   return normalizeResult(body);
+}
+
+// --- vector index projections (U11 Phase 3) ------------------------------------
+
+/** `POST /$/vector/{ds}/{name}/projection`: compute a projection, or start its task. */
+export async function computeProjection(
+  ds: string,
+  index: string,
+  method: 'pca' | 'neighbours',
+  opts: { seed?: number; iterations?: number; signal?: AbortSignal } = {},
+): Promise<{ task: Task } | { head: Record<string, unknown> }> {
+  const body: Record<string, number> = {};
+  if (opts.seed != null) body.seed = opts.seed;
+  if (opts.iterations != null) body.iterations = opts.iterations;
+  const res = await request(`/$/vector/${enc(ds)}/${enc(index)}/projection?method=${method}`, {
+    ...jsonBody(body),
+    signal: opts.signal,
+  });
+  const j = await res.json();
+  return res.status === 202 ? { task: j as Task } : { head: j };
+}
+
+/**
+ * `GET /$/vector/{ds}/{name}/projection` in the binary points format: the kept projection,
+ * in a region and coloured by a predicate when given.
+ */
+export async function vectorProjection(
+  ds: string,
+  index: string,
+  opts: {
+    method?: 'pca' | 'neighbours';
+    bbox?: [number, number, number, number];
+    limit?: number;
+    colour?: string;
+    signal?: AbortSignal;
+  } = {},
+): Promise<Projection> {
+  const p = new URLSearchParams();
+  if (opts.method) p.set('method', opts.method);
+  if (opts.bbox) p.set('bbox', opts.bbox.join(','));
+  if (opts.limit != null) p.set('limit', String(opts.limit));
+  if (opts.colour) p.set('colour', opts.colour);
+  const q = p.size ? `?${p}` : '';
+  const res = await request(`/$/vector/${enc(ds)}/${enc(index)}/projection${q}`, {
+    headers: { Accept: 'application/x-sparkles-points' },
+    signal: opts.signal,
+  });
+  return parsePoints(await res.arrayBuffer());
 }
