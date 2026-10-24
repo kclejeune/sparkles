@@ -248,6 +248,27 @@ const ROUTES = [
 
 const point = (lon, lat) => `"POINT(${lon} ${lat})"^^geo:wktLiteral`;
 
+/** The great-circle distance between two cities in kilometres, rounded. */
+function km(a, b) {
+  const r = Math.PI / 180;
+  const h =
+    Math.sin(((b.lat - a.lat) * r) / 2) ** 2 +
+    Math.cos(a.lat * r) * Math.cos(b.lat * r) * Math.sin(((b.lon - a.lon) * r) / 2) ** 2;
+  return Math.round(2 * 6371 * Math.asin(Math.sqrt(h)));
+}
+
+/**
+ * The routes as `ex:flight` edges between the cities, each annotated by a reifier with its
+ * distance in `ex:km`, as SPARQL `INSERT DATA` content. Only the path finder's screenshot
+ * adds them, so the dataset the other screenshots read stays as it is.
+ */
+export function worldFlights() {
+  return ROUTES.map(
+    ([from, to]) =>
+      `<${WORLD}${from}> <${WORLD}flight> <${WORLD}${to}> {| <${WORLD}km> ${km(CITY.get(from), CITY.get(to))} |} .`,
+  ).join('\n');
+}
+
 /** The dataset as Turtle. */
 export function worldTurtle() {
   let ttl = PREFIXES;

@@ -4,13 +4,14 @@
 // gets a branch whose changes clash with main, so that the dataset page shows branches and
 // the commit graph and the merge page shows conflicts. The Ask bar runs the scripted
 // pipeline of mock/assistant.mjs, and a handoff link stands in for an agent's
-// `share_query`. The maps of relations, the communities, the Pattern pane and the diff
-// graph use the `world` showcase dataset of mock/world.mjs. Run with
-// `mise run docs:screenshots`.
+// `share_query`. The maps of relations, the communities, the Pattern pane, the diff graph
+// and the path finder on a query's graph use the `world` showcase dataset of
+// mock/world.mjs. Run with `mise run docs:screenshots`.
 
 import { test as base, expect, type APIRequestContext, type Page } from '@playwright/test';
 import { encodeHandoff } from '../../src/lib/handoff';
 import { OUT, settle, shoot } from '../shoot';
+import { worldFlights } from '../../mock/world.mjs';
 import { join } from 'node:path';
 
 const DATASET = 'org';
@@ -329,6 +330,68 @@ test('explore-communities', async ({ page }) => {
   await ov.getByRole('button', { name: 'List' }).click();
   await expect(ov.locator('canvas').first()).toBeVisible();
   await shoot(page, 'explore-communities');
+});
+
+test('query-paths', async ({ page, request }) => {
+  // the freight routes of `world` as a result graph on the query page, with the three
+  // shortest ways from Vancouver to Auckland by distance, which the reifiers of the flights
+  // carry in ex:km, drawn over it
+  await update(request, 'world', `INSERT DATA {\n${worldFlights()}\n}`, 'Add the flight distances');
+  const query = `PREFIX ex: <${WORLD}>
+PREFIX rdfs: <http://www.w3.org/2000/01/rdf-schema#>
+
+# The flights between the cities, named by their labels
+CONSTRUCT { ?a ex:flight ?b . ?a rdfs:label ?from . ?b rdfs:label ?to }
+WHERE { ?a ex:flight ?b ; rdfs:label ?from . ?b rdfs:label ?to }`;
+  await page.addInitScript(
+    ([q]) => {
+      localStorage.setItem(
+        'sparkles.queryTabs',
+        JSON.stringify({ tabs: [{ id: 't1', title: 'Flights', query: q }], active: 't1' }),
+      );
+      localStorage.setItem('sparkles.dataset', 'world');
+    },
+    [query],
+  );
+  await page.emulateMedia({ reducedMotion: 'reduce' });
+  await page.goto('/ui/query?ds=world');
+  // a short editor, so the graph has room
+  const top = (await page.locator('.cm-editor').boundingBox())!.y;
+  const split = (await page.getByRole('separator', { name: 'Resize editor' }).boundingBox())!;
+  await page.mouse.move(split.x + split.width / 2, split.y + split.height / 2);
+  await page.mouse.down();
+  await page.mouse.move(split.x + split.width / 2, top + 150, { steps: 5 });
+  await page.mouse.up();
+  await page.getByRole('button', { name: /^Run/ }).click();
+  const results = page.getByRole('region', { name: 'Results' });
+  await results.getByRole('tab', { name: 'Graph' }).click();
+  await expect(results.locator('.wrap[data-graph]')).toBeAttached({ timeout: 30_000 });
+  await results.getByRole('button', { name: 'Paths', exact: true }).click();
+  const panel = page.getByRole('region', { name: 'Paths' });
+  for (const [end, text, name] of [
+    ['From', 'Vanc', /^Vancouver\b/],
+    ['To', 'Auck', /^Auckland\b/],
+  ] as const) {
+    await panel.getByRole('combobox', { name: end }).fill(text);
+    await panel.getByRole('option', { name }).first().click();
+  }
+  await panel.getByLabel('k shortest').check();
+  await panel.getByLabel('only', { exact: true }).check();
+  await panel.getByRole('combobox', { name: 'Add a predicate' }).fill('ex:flight');
+  await panel.getByRole('combobox', { name: 'Add a predicate' }).press('Enter');
+  const weight = panel.getByRole('combobox', { name: 'Weight' });
+  await weight.focus();
+  await expect(weight.locator(`option[value="${WORLD}km"]`)).toHaveCount(1);
+  await weight.selectOption(`${WORLD}km`);
+  await panel.getByRole('button', { name: 'Find paths' }).click();
+  await expect(panel.getByRole('listbox', { name: 'Paths found' }).getByRole('option')).toHaveCount(
+    3,
+  );
+  // the filters folded away, so the list shows the three paths with their costs
+  await panel.locator('summary', { hasText: 'Filters' }).click();
+  await page.waitForTimeout(1000);
+  await results.getByRole('button', { name: 'Fit to view' }).click();
+  await shoot(page, 'query-paths');
 });
 
 test('pattern', async ({ page }) => {
