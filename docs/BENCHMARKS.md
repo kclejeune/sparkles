@@ -468,7 +468,22 @@ medians.
 
 The changes stay within 1.2 times their earlier time while the kept closure needs 41% and
 47% of the memory. Changes of 100 triples at 16 threads and undos at 1 thread are still
-slower, by 1.3 to 2.3 times. These are development A/B numbers rather than a refreshed
+slower, by 1.3 to 2.3 times.
+
+The dataset above is in index format 2, the one format a6179e58 reads. A recheck on the
+dataset in index format 3, whose blocks have segments, compared 77789822, the work merged
+onto main, with main at dc95359c in six more rounds. Main holds the first pass of item 87.
+
+| Run, 16 threads, format 3 | dc95359c | 77789822 |
+|---|---|---|
+| RDFS, change, undo, change again | 36.5, 16.5, 13 ms | 18, 13.5, 12 ms |
+| OWL 2 RL, change, undo, change again | 111.5, 51.5, 44.5 ms | 40.5, 44.5, 25 ms |
+| RDFS, full run | 14.6 s | 14.7 s |
+| OWL 2 RL, full run | 19.9 s | 20.8 s |
+
+The change takes half its time on main for RDFS and about a third for OWL 2 RL. Full runs
+are 1% slower for RDFS and 5% slower for OWL 2 RL, which roadmap item 113 follows up.
+These are development A/B numbers rather than a refreshed
 benchmark. [F16's follow-ups](specs/F16-materialization-at-scale.md#roadmap-follow-ups-2026-10-18)
 give the ranges, the other sizes and the 1-thread runs.
 

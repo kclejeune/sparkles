@@ -1417,6 +1417,32 @@ bound them. The peak heap of a change of 1,000 triples still fell. Full runs of 
 than the first pass in the batch that ran both, close to the spread between batches, and
 they stay faster than before the follow-up.
 
+A recheck after the merge with main ran the same cells on the dataset in index format 3,
+whose blocks have segments, so the segment reads took part. It compared `77789822`, this
+work merged onto main, with main at `dc95359c`, which holds the first pass, over six
+rounds at 16 threads on forge on 2026-10-23. Each run held the bench lock and the heavy
+lock, on a fresh copy of the dataset, after a check of free disk and of the copy's size.
+
+| Run, 16 threads, 1,000 changes, format 3 | Main | Merged |
+|---|---|---|
+| RDFS, change | 36.5 ms, 34 to 38 | 18 ms, 18 to 23 |
+| RDFS, undo | 16.5 ms, 15 to 21 | 13.5 ms, 13 to 16 |
+| RDFS, change again | 13 ms, 12 to 16 | 12 ms, 12 to 13 |
+| OWL 2 RL, change | 111.5 ms, 94 to 121 | 40.5 ms, 36 to 45 |
+| OWL 2 RL, undo | 51.5 ms, 50 to 55 | 44.5 ms, 42 to 61 |
+| OWL 2 RL, change again | 44.5 ms, 43 to 50 | 25 ms, 24 to 29 |
+| RDFS, peak heap of the change | 23 to 28 MiB | 11 to 15 MiB |
+| OWL 2 RL, peak heap of the change | 36 to 48 MiB | 17 to 26 MiB |
+| RDFS, full run | 14.6 s | 14.7 s |
+| OWL 2 RL, full run | 19.9 s | 20.8 s |
+| RDFS, change read back from the dataset | 3.75 s | 3.48 s |
+| OWL 2 RL, change read back from the dataset | 2.55 s | 1.92 s |
+
+The change of 1,000 triples takes half its time on main for RDFS and about a third for
+OWL 2 RL, and its times on format 3 are close to those on format 2 in the first table. The
+kept closure is the same 927 MiB and 1,244 MiB. Full runs are 1% slower for RDFS and 5%
+slower for OWL 2 RL than on main, and [ROADMAP](../ROADMAP.md) item 113 follows them up.
+
 The runs at other sizes and at 1 thread measured `0188dc48`, the commit before the memo and
 the counter, against `a6179e58` on forge, in two rounds for the sizes and three for 1 thread.
 The memo changes only the backward search, and the counter change touches every read of a
