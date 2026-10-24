@@ -193,6 +193,9 @@ pub(crate) struct Graph {
     spilled: usize,
     /// the graph's heap, charged to the run's budget
     held: Held,
+    /// predicates of bookkeeping facts (the magic facts of a demand program) that atoms
+    /// and `noValue` builtins with a variable predicate do not see
+    hidden: Option<Arc<FxHashSet<u64>>>,
 }
 
 impl Default for Graph {
@@ -200,6 +203,7 @@ impl Default for Graph {
         Graph {
             spilled: 0,
             held: Held::new(&Budget::unlimited()),
+            hidden: None,
             offset: 0,
             base: None,
             triples: Vec::new(),
@@ -297,6 +301,18 @@ struct Piece {
 }
 
 impl Graph {
+    /// Hide the facts with these predicates from atoms and `noValue` builtins whose
+    /// predicate is a variable.
+    pub fn set_hidden(&mut self, preds: Arc<FxHashSet<u64>>) {
+        self.hidden = (!preds.is_empty()).then_some(preds);
+    }
+
+    /// Whether facts with predicate `p` are hidden from a variable predicate.
+    #[inline]
+    pub fn is_hidden(&self, p: u64) -> bool {
+        self.hidden.as_ref().is_some_and(|h| h.contains(&p))
+    }
+
     pub fn with_capacity(n: usize) -> Graph {
         let mut g = Graph::default();
         g.triples.reserve(n);
@@ -1343,7 +1359,7 @@ impl Graph {
             }
             let t = self.triple(r);
             s.is_none_or(|x| x == t[0])
-                && p.is_none_or(|x| x == t[1])
+                && p.map_or(!self.is_hidden(t[1]), |x| x == t[1])
                 && o.is_none_or(|x| x == t[2])
         })
     }

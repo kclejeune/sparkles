@@ -101,11 +101,31 @@ fn vars_of(n: &Node, out: &mut Vec<String>) {
     }
 }
 
-/// Compile parsed rules. Unsupported rules are skipped with a warning.
+/// Compile parsed rules for materialization. Unsupported rules are skipped with a
+/// warning, backward rules among them.
 pub(crate) fn compile(rules: &[Rule], terms: &Terms, warnings: &mut Vec<String>) -> Vec<CRule> {
+    compile_with(rules, terms, warnings, false)
+}
+
+/// Compile parsed rules for query-time reasoning (spec F17 §5.1): backward rules join the
+/// forward rules, since evaluating both bottom-up on demand gives the same least fixpoint.
+pub(crate) fn compile_query(
+    rules: &[Rule],
+    terms: &Terms,
+    warnings: &mut Vec<String>,
+) -> Vec<CRule> {
+    compile_with(rules, terms, warnings, true)
+}
+
+fn compile_with(
+    rules: &[Rule],
+    terms: &Terms,
+    warnings: &mut Vec<String>,
+    backward: bool,
+) -> Vec<CRule> {
     let mut flat = Vec::new();
     for r in rules {
-        if r.direction == Direction::Backward {
+        if r.direction == Direction::Backward && !backward {
             warnings.push(format!(
                 "rule '{}' (line {}): backward rules ('<-') are not supported by forward materialization; skipped",
                 r.label(),
@@ -271,6 +291,8 @@ fn compile_one(
                     }
                     head.push(CHead::Action(action, args));
                 }
+                // Jena's tabling directives: every predicate is tabled here
+                Some(Err(())) if matches!(b.name.as_str(), "table" | "tableAll") => {}
                 Some(Err(())) => {
                     warnings.push(format!(
                         "rule '{}': head builtin '{}' ignored",
@@ -1047,6 +1069,9 @@ impl<'a> Eval<'a> {
     #[inline]
     fn fact(&mut self, k: usize, atom: usize, b: &mut [u64], t: Triple) {
         let a = &self.rule.atoms[atom];
+        if !matches!(a.p, Slot::Const(_)) && self.g.is_hidden(t[1]) {
+            return;
+        }
         let mut newly = [usize::MAX; 3];
         let mut n = 0;
         let ok = unify(a.s, t[0], b, &mut newly, &mut n)
