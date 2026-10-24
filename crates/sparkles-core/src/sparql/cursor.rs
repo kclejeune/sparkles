@@ -1045,7 +1045,7 @@ fn filtered_ask_admitted(ctx: &Ctx, node: &Node) -> bool {
 /// that eager limited execution collects, while streaming the larger one. Other
 /// cursor and eager plans retain their original children and variable order.
 /// Any other shape, which a future cursor admission might pass here, is left alone.
-fn orient_filtered_ask(node: &mut Node) {
+fn orient_filtered_ask(node: &mut Node, ctx: &Ctx) {
     use super::plan::JoinAlgo;
 
     let Some(mut filtered) = node.children.first_mut() else {
@@ -1060,6 +1060,9 @@ fn orient_filtered_ask(node: &mut Node) {
     if let Kind::KeyedJoin { ripple, .. } = &mut filtered.kind {
         // the first matching pair answers the ASK
         *ripple = filtered.children.len() == 2;
+        for input in &mut filtered.children {
+            first_rows(input, ctx);
+        }
         return;
     }
     if !matches!(filtered.kind, Kind::Filter(_)) {
@@ -1078,6 +1081,41 @@ fn orient_filtered_ask(node: &mut Node) {
         && product.children[0].est < product.children[1].est
     {
         product.children.swap(0, 1);
+    }
+}
+
+/// A ripple join reads its inputs a few rows at a time, so a hash join below it that
+/// reads one input whole before its first row costs more than probing the index of a
+/// pattern for each row it needs. Each hash join with a triple pattern as one input
+/// becomes an index join from its other input into that pattern, when that input
+/// always binds the pattern's key and the index join keeps the order the hash join
+/// promised.
+fn first_rows(node: &mut Node, ctx: &Ctx) {
+    use super::plan::JoinAlgo;
+    for child in &mut node.children {
+        first_rows(child, ctx);
+    }
+    if !matches!(
+        node.kind,
+        Kind::Join {
+            algo: JoinAlgo::Hash,
+            ..
+        }
+    ) || node.children.len() != 2
+    {
+        return;
+    }
+    for drive in [0, 1] {
+        if let Some(joined) = super::indexjoin::index_join_for_first_rows(
+            &node.children[drive],
+            &node.children[1 - drive],
+            ctx,
+        ) && joined.sorted.starts_with(&node.sorted)
+            && joined.vars.len() == node.vars.len()
+        {
+            *node = joined;
+            return;
+        }
     }
 }
 
@@ -1502,7 +1540,7 @@ pub fn query_execution_with_plan(
                 && !matches!(&parsed, spargebra::Query::Select { pattern, .. } if calls_service(pattern));
             if prepared.ctx.is_cursor() {
                 if kind == QueryKind::Ask {
-                    orient_filtered_ask(&mut prepared.node);
+                    orient_filtered_ask(&mut prepared.node, &prepared.ctx);
                 }
                 let (cursor, _, _) = from_prepared(
                     prepared, &parsed, query, options, cursor, started, parse_ms, plan_ms, levels,
@@ -4339,7 +4377,7 @@ mod tests {
                 format!("{:?}/{}[{}]", node.vars, node.est, children.join(","))
             }
             let before = shape(&p.node);
-            orient_filtered_ask(&mut p.node);
+            orient_filtered_ask(&mut p.node, &p.ctx);
             assert_eq!(shape(&p.node), before, "{text}");
         }
     }
