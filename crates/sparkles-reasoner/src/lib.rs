@@ -19,6 +19,7 @@ mod budget;
 mod builtins;
 pub mod diagnostics;
 mod engine;
+pub mod explain;
 pub mod extras;
 mod facts;
 mod graph;
