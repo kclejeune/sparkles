@@ -2487,13 +2487,27 @@ impl<'a> Engine<'a> {
             }))
     }
 
+    /// A path's cost as a double-double, added from its start, so that equal paths always
+    /// get equal costs and costs that differ in the low bits rank apart. `real` maps the
+    /// virtual end of a cycle back to its node for the weight lookup.
+    fn exact_cost(&self, edges: &[Edge], real: impl Fn(u64) -> u64) -> Result<Cost> {
+        if !self.spec.weighted() {
+            return Ok(Cost::of(edges.len() as f64));
+        }
+        let mut c = Cost::ZERO;
+        for e in edges {
+            c = c.add(Cost::of(self.weight(&e.map(&real))?));
+        }
+        Ok(c)
+    }
+
     /// Simple paths in nondecreasing cost by Yen's algorithm; `accept` sees each one
     /// and returns whether to go on.
     fn yen(
         &self,
         s: u64,
         t: u64,
-        mut accept: impl FnMut(&[Edge], f64) -> Result<bool>,
+        mut accept: impl FnMut(&[Edge], Cost) -> Result<bool>,
     ) -> Result<()> {
         let tt = if s == t { VIRT } else { t };
         let real = |x: u64| if x == VIRT { s } else { x };
@@ -2501,15 +2515,19 @@ impl<'a> Engine<'a> {
         let none_n = FxHashSet::default();
         let none_e = FxHashSet::default();
         let budget = if self.spec.weighted() { None } else { max };
-        let Some(first) = self.spur(s, tt, s, &none_n, &none_e, budget)? else {
+        let Some((first, _)) = self.spur(s, tt, s, &none_n, &none_e, budget)? else {
             return Ok(());
         };
-        let mut a: Vec<(Vec<Edge>, f64)> = vec![first];
+        // candidates are ranked by their whole cost in double-double, never by the
+        // spur's rounded cost plus the root's, so that two equally cheap candidates
+        // cannot rank apart by the order their weights were added in
+        let first_cost = self.exact_cost(&first, real)?;
+        let mut a: Vec<(Vec<Edge>, Cost)> = vec![(first, first_cost)];
         let mut seen: FxHashSet<Vec<Edge>> = FxHashSet::default();
         seen.insert(a[0].0.clone());
         // candidates by (cost, length, discovery)
-        let mut heap: BinaryHeap<Reverse<(OrdF64, usize, u64)>> = BinaryHeap::new();
-        let mut cands: FxHashMap<u64, (Vec<Edge>, f64)> = FxHashMap::default();
+        let mut heap: BinaryHeap<Reverse<(Cost, usize, u64)>> = BinaryHeap::new();
+        let mut cands: FxHashMap<u64, (Vec<Edge>, Cost)> = FxHashMap::default();
         let mut seq = 0u64;
         loop {
             let (cur, cost) = a.last().cloned().unwrap();
@@ -2518,15 +2536,7 @@ impl<'a> Engine<'a> {
                 return Ok(());
             }
             let nodes: Vec<u64> = std::iter::once(s).chain(cur.iter().map(|e| e.to)).collect();
-            let mut root_cost = 0.0;
             for i in 0..cur.len() {
-                if i > 0 {
-                    root_cost += if self.spec.weighted() {
-                        self.weight(&cur[i - 1].map(real))?
-                    } else {
-                        1.0
-                    };
-                }
                 let root = &cur[..i];
                 let mut banned_edges = FxHashSet::default();
                 for (p, _) in &a {
@@ -2540,15 +2550,16 @@ impl<'a> Engine<'a> {
                     Some(m) => Some(m - i as u32),
                     None => None,
                 };
-                if let Some((sp, c)) =
+                if let Some((sp, _)) =
                     self.spur(nodes[i], tt, s, &banned_nodes, &banned_edges, budget)?
                 {
                     let mut path = root.to_vec();
                     path.extend(sp);
                     if seen.insert(path.clone()) {
                         let len = path.len();
-                        cands.insert(seq, (path, root_cost + c));
-                        heap.push(Reverse((OrdF64(root_cost + c), len, seq)));
+                        let c = self.exact_cost(&path, real)?;
+                        cands.insert(seq, (path, c));
+                        heap.push(Reverse((c, len, seq)));
                         seq += 1;
                         self.charge.add(len as u64 * 32)?;
                     }
@@ -2827,7 +2838,7 @@ pub fn run(
                         }
                         continue;
                     }
-                    let mut best: Option<f64> = None;
+                    let mut best: Option<Cost> = None;
                     let mut out = Vec::new();
                     eng.yen(s, t, |p, c| {
                         if p.len() as u32 > spec.max_len.unwrap() || (p.len() as u32) < spec.min_len

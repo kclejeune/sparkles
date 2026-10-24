@@ -451,6 +451,36 @@ fn weights_of_mixed_magnitudes_from_both_ends() {
     }
 }
 
+/// Yen's candidates of mixed magnitudes: `s b t` costs M+9, while `s c a t` and `s c b a t`
+/// cost M+8. The spurs from `c` and `b` round differently when a candidate's cost is the
+/// root's plus the spur's in plain floating point, so candidates are ranked by their whole
+/// cost in double-double (ROADMAP item 150).
+#[test]
+fn yen_candidates_of_mixed_magnitudes_rank_by_their_exact_cost() {
+    let s = store_of(
+        "ex:s ex:p ex:a {| ex:w 5 |} . ex:a ex:p ex:t {| ex:w 2 |} .
+         ex:s ex:p ex:b {| ex:w 10000000000000004 |} . ex:b ex:p ex:a {| ex:w 1 |} .
+         ex:b ex:p ex:t {| ex:w 5 |} .
+         ex:s ex:p ex:c {| ex:w 10000000000000004 |} . ex:c ex:p ex:b {| ex:w 1 |} .
+         ex:c ex:p ex:a {| ex:w 2 |} .",
+    );
+    let r = rows(
+        &s,
+        "SELECT ?path ?i ?s ?o WHERE { SERVICE path:search { [] path:source ex:s ; \
+         path:target ex:t ; path:predicate ex:p ; path:algorithm path:kShortest ; path:k 3 ; \
+         path:weight ex:w ; path:pathIndex ?path ; path:edgeIndex ?i ; path:edgeSubject ?s ; \
+         path:edgeObject ?o } }",
+    );
+    let paths: Vec<String> = node_paths(&r).values().map(|p| p.join(" ")).collect();
+    assert_eq!(paths.len(), 3, "{paths:?}");
+    assert_eq!(paths[0], "s a t", "{paths:?}");
+    assert_eq!(paths[1], "s b a t", "{paths:?}");
+    assert!(
+        paths[2] == "s c a t" || paths[2] == "s c b a t",
+        "{paths:?}"
+    );
+}
+
 /// Costs at the top of the floating-point range: a sum whose rounded part reaches past the
 /// largest double while its rounding error brings it back under is still finite, so the
 /// route through `y` beats the one through `x`, whose cost is about twice the largest double.
