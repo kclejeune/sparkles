@@ -148,6 +148,10 @@ pub struct QueryOptions {
     pub default_graph_extra: Vec<String>,
     /// Bypass the result cache (read and write).
     pub no_cache: bool,
+    /// Leave out the plan's references to the query's text, the `patterns`,
+    /// `filterVars` and `joinVars` of spec U04 §11.3. A caller that never shows the plan
+    /// sets it, so that a plain query does not name its patterns for nobody.
+    pub no_plan_patterns: bool,
     /// Pre-bound variables (Jena `QueryExec.substitution`): every occurrence of the
     /// variable is replaced by the term; projected variables report the bound value.
     /// A blank node with a stored node's label (`_:b…`) is that stored node. Any other
@@ -538,6 +542,7 @@ fn make_ctx(
         None => None,
     };
     ctx.use_cache = !opts.no_cache;
+    ctx.plan_patterns = !opts.no_plan_patterns;
     ctx.algo_projections = opts.algo_projections.clone();
     ctx.extensions = opts.extensions.clone();
     if let Some(s) = &opts.service_scope {

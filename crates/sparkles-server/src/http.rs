@@ -1473,6 +1473,10 @@ pub(crate) async fn run_query(
     let limit = asked.result_limit(st.limits.max_result_bytes);
     let sfmt = solutions_format(&params, &headers);
     let thrift = results_thrift(&params, &headers);
+    // Only the Sparkles formats carry the plan, in the answer or in the body of an error.
+    // Any other answer leaves out the plan's patterns, which a plain query would
+    // otherwise name for nobody (item 180).
+    opts.no_plan_patterns = sfmt != SolutionsFormat::Sparkles && !params_wants_sparkles(&headers);
     // Automatic execution decides once the query is planned, and a plan it keeps eager
     // continues below exactly as an eager request does. Some requests run eagerly
     // without asking. SPARQL Results Thrift has no cursor writer, and initial bindings

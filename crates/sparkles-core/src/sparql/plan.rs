@@ -1540,13 +1540,14 @@ impl<'a> Planner<'a> {
             } => {
                 let s = self.term_pattern(subject);
                 let o = self.term_pattern(object);
-                let src = self.source_pattern(
-                    source_term(subject),
-                    super::exec::path_text(path),
-                    source_term(object),
-                    g,
-                );
-                self.collect_path(s, path, o, g, items, &Some(src))?;
+                let src = self.source_pattern(g, || {
+                    (
+                        source_term(subject),
+                        super::exec::path_text(path),
+                        source_term(object),
+                    )
+                });
+                self.collect_path(s, path, o, g, items, &src)?;
                 items.extend(self.unpacks.borrow_mut().drain(..).map(Item::Unpack));
             }
             GP::Join { left, right } if !super::enhancer::is_loop(right) => {
@@ -2237,18 +2238,19 @@ impl<'a> Planner<'a> {
             Some(i) => i.cost + i.est,
             None => est + uses.corr.touched.len() as f64,
         };
-        let src = self.source_pattern(
-            source_term(&shape.triple.subject),
-            source_named(&shape.triple.predicate),
-            source_term(&shape.triple.object),
-            g,
-        );
+        let src = self.source_pattern(g, || {
+            (
+                source_term(&shape.triple.subject),
+                source_named(&shape.triple.predicate),
+                source_term(&shape.triple.object),
+            )
+        });
         let spec = PatternCountSpec {
             uses,
             subject: input.as_ref().map(|_| s),
             pred: p,
             counts,
-            src: Some(src),
+            src,
         };
         let mut n = Node::leaf(Kind::PatternCount(Box::new(spec)), vars, est, desc);
         n.cost = cost;
@@ -2292,12 +2294,13 @@ impl<'a> Planner<'a> {
             }
             return Ok(Node::empty(vars));
         }
-        let src = self.source_pattern(
-            source_term(&t.subject),
-            source_named(&t.predicate),
-            source_term(&t.object),
-            g,
-        );
+        let src = self.source_pattern(g, || {
+            (
+                source_term(&t.subject),
+                source_named(&t.predicate),
+                source_term(&t.object),
+            )
+        });
         let s = self.term_pattern(&t.subject);
         let p = self.term_pattern(&t.object);
         let mut vars = Vec::new();
@@ -2341,7 +2344,7 @@ impl<'a> Planner<'a> {
                 uses,
                 s: end(s),
                 p: end(p),
-                src: Some(src.clone()),
+                src: src.clone(),
             };
             let mut n = Node::leaf(Kind::PatternScan(Box::new(spec)), vars.clone(), est, desc);
             n.sorted = match (s, p) {
@@ -2365,7 +2368,7 @@ impl<'a> Planner<'a> {
         let sub = vec![Item::Triple(Triple {
             t: [s, p, o],
             graph: g.clone(),
-            src: Some(src),
+            src,
         })];
         let node = self.plan_group(sub, Vec::new())?;
         if let ActiveGraph::Var(gv) = g
@@ -2388,12 +2391,13 @@ impl<'a> Planner<'a> {
                 self.term_pattern(&tp.object),
             ],
             graph: g.clone(),
-            src: Some(self.source_pattern(
-                source_term(&tp.subject),
-                source_named(&tp.predicate),
-                source_term(&tp.object),
-                g,
-            )),
+            src: self.source_pattern(g, || {
+                (
+                    source_term(&tp.subject),
+                    source_named(&tp.predicate),
+                    source_term(&tp.object),
+                )
+            }),
         }
     }
 
@@ -2402,7 +2406,24 @@ impl<'a> Planner<'a> {
     /// the query that is planned again (the inner pattern of `GRAPH ?g` once per graph)
     /// counts its patterns again, so the count wraps at the number of equal patterns in
     /// the source.
-    fn source_pattern(&self, s: String, p: String, o: String, g: &ActiveGraph) -> Arc<PlanPattern> {
+    ///
+    /// `None` when the plan does not name its patterns ([`Ctx::plan_patterns`]), and then
+    /// `text`, which writes the subject, predicate or path, and object, is not called.
+    #[inline]
+    fn source_pattern(
+        &self,
+        g: &ActiveGraph,
+        text: impl FnOnce() -> (String, String, String),
+    ) -> Option<Arc<PlanPattern>> {
+        if !self.ctx.plan_patterns {
+            return None;
+        }
+        let (s, p, o) = text();
+        Some(self.record_pattern(s, p, o, g))
+    }
+
+    /// [`Self::source_pattern`] of a pattern whose text is written.
+    fn record_pattern(&self, s: String, p: String, o: String, g: &ActiveGraph) -> Arc<PlanPattern> {
         let graph = match g {
             ActiveGraph::Default => None,
             ActiveGraph::Union => Some(format!("<{}>", super::ctx::UNION_GRAPH_IRI)),
