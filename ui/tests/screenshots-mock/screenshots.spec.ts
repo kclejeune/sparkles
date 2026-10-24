@@ -878,7 +878,7 @@ INSERT DATA {
   await why.click();
   const panel = page.getByTestId('why-panel');
   await expect(panel.getByRole('tree')).toBeVisible();
-  await expect(panel.getByRole('note')).toContainText('stale');
+  await expect(panel.getByRole('note')).toContainText('out of date');
   await panel.getByRole('button', { name: 'Next' }).click();
   await expect(panel).toContainText('2 of 2 derivations');
   await page.getByRole('button', { name: 'Fit to view' }).click();
