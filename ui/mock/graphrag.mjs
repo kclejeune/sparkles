@@ -120,7 +120,7 @@ let label = DATASETS.org.label;
 
 /** Points the handlers at the communities of dataset `name`; false when it has none. */
 function use(name) {
-  const d = DATASETS[name];
+  const d = Object.hasOwn(DATASETS, name) ? DATASETS[name] : null;
   if (!d) return false;
   communities = state[name] ??= d.seed();
   ({ res: RES, links: LINKS, knows: KNOWS, label } = d);

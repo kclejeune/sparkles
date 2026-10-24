@@ -379,7 +379,8 @@ ORDER BY ?region`;
     .toBeGreaterThan(0);
   // the strip's count of the pattern's matches
   await pane.getByRole('button', { name: 'Count matches' }).click();
-  await expect(pane.getByTestId('pattern-count')).toBeVisible();
+  // the seven heads of regions, which the README's alt text names
+  await expect(pane.getByTestId('pattern-count')).toContainText('7 matches');
   await pane.getByRole('button', { name: 'Fit to view' }).click();
   await shoot(page, 'pattern');
 });

@@ -181,7 +181,8 @@ const UNION = { use_default_graph_as_union: true };
 /** The text without strings, IRIs and comments, to look for keywords. */
 const bare = (q) =>
   q
-    .replace(/#[^\n]*/g, ' ')
+    // a comment, but not the # of an IRI
+    .replace(/<[^>\s]*>|#[^\n]*/g, (m) => (m.startsWith('<') ? m : ' '))
     .replace(/"(?:[^"\\]|\\.)*"|'(?:[^'\\]|\\.)*'/g, '""')
     .replace(/<[^>\s]*>/g, '<>');
 
@@ -208,12 +209,13 @@ function declared(q) {
 function queryIris(q, prefixes) {
   const known = { ...prefixes, ...declared(q) };
   const body = q
-    .replace(/#[^\n]*/g, ' ')
+    // a comment, but not the # of an IRI
+    .replace(/<[^>\s]*>|#[^\n]*/g, (m) => (m.startsWith('<') ? m : ' '))
     .replace(/"(?:[^"\\]|\\.)*"|'(?:[^'\\]|\\.)*'/g, '""')
     .replace(/\bPREFIX\s+[\w.-]*:\s*<[^>]*>/gi, ' ')
     .replace(/\bBASE\s+<[^>]*>/gi, ' ')
     // graph names are not terms of a triple pattern, which the server's check skips too
-    .replace(/\b(GRAPH|FROM(\s+NAMED)?)\s+(<[^>]*>|[A-Za-z][\w.-]*:[\w.-]*)/gi, ' ');
+    .replace(/(?<![\w?$:.-])(GRAPH|FROM(\s+NAMED)?)\s+(<[^>]*>|[A-Za-z][\w.-]*:[\w.-]*)/gi, ' ');
   const out = [];
   const seen = new Set();
   const add = (iri) => {

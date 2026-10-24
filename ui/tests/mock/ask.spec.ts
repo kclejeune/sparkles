@@ -238,3 +238,23 @@ test.describe('a global answer on a phone', () => {
     expect(box && box.x + box.width).toBeLessThanOrEqual(391);
   });
 });
+
+test("the check skips graph names, but not a variable or a prefixed name that ends in 'graph' or 'from'", async ({
+  request,
+}) => {
+  const check = async (query: string) => {
+    const r = await request.post('/org/check', { data: { query, terms: true } });
+    expect(r.ok()).toBe(true);
+    return (await r.json()) as { issues: { code: string }[]; terms: { term: string }[] };
+  };
+  const ex = 'PREFIX ex: <http://example.org/ontology#>\n';
+  const named = await check(
+    `${ex}SELECT ?d WHERE { GRAPH <https://example.org/hr> { ?p ex:startDate ?d } }`,
+  );
+  expect(named.issues.map((i) => i.code)).not.toContain('unknown-term');
+  expect(named.terms.map((t) => t.term)).toEqual(['ex:startDate']);
+  const variable = await check(`${ex}SELECT ?graph WHERE { ?graph ex:misspelled ?o }`);
+  expect(variable.issues.map((i) => i.code)).toContain('unknown-term');
+  const prefixed = await check(`${ex}SELECT ?s WHERE { ?s ex:from ex:typo }`);
+  expect(prefixed.terms.map((t) => t.term)).toEqual(['ex:from', 'ex:typo']);
+});
