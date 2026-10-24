@@ -8566,8 +8566,12 @@ of up to 1 MiB is sent whole, with `Content-Length`, and an error, including the
 `result-bytes` budget, gets its status code. A larger body is streamed in 64 KiB chunks
 as it is serialized, so server memory stays flat. An error after that point, such as the
 budget running out at 1.2 GiB, aborts the transfer, and the client sees a truncated
-response instead of a status code. A query result whose smallest encoding already
-exceeds the budget is refused with `507` before anything is sent. A client that
+response instead of a status code. The bytes serialized before the budget ran out are
+sent first, and the transfer then ends without its final chunk, which HTTP clients
+report as an error. The access log and the metrics record such a request when its body
+ends, with the outcome `budget`, the bytes sent and the rows that were written whole. A
+query result whose smallest encoding already exceeds the budget is refused with `507`
+before anything is sent. A client that
 disconnects stops the serialization. A query that runs as a cursor, which by default
 includes a scan of a million rows or more, is computed while it is sent, so its timeout
 and its memory and row budgets can also end the transfer after it has started. The

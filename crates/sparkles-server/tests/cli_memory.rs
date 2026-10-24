@@ -350,22 +350,29 @@ fn memory_import_sync_and_brief() {
     // A59: init as admin writes the vocabulary and installs the shapes in the guard
     let init = mem_json(&f, &s, "admin", &["init", "--import-base", BASE]);
     assert_eq!(init["importBase"], BASE);
-    assert_eq!(init["shapes"]["status"], "installed", "{init:#}");
     assert!(s.ask("ASK { GRAPH <urn:x-sparkles:vocab:mem> { <urn:x-sparkles:mem:Memory> a <http://www.w3.org/2000/01/rdf-schema#Class> } }"));
-    let v: Value = reqwest::blocking::Client::new()
-        .get(format!("{}/$/validation/{DS}", s.url))
-        .bearer_auth(s.token("admin"))
-        .send()
-        .unwrap()
-        .json_value();
-    assert_eq!(
-        v["config"]["shapes"]["graphs"][0],
-        "urn:x-sparkles:shapes:mem"
-    );
-    assert_eq!(v["config"]["mode"], "warn");
+    // the shapes go into the validation guard, which exists only with the shacl feature
+    #[cfg(feature = "shacl")]
+    {
+        assert_eq!(init["shapes"]["status"], "installed", "{init:#}");
+        let v: Value = reqwest::blocking::Client::new()
+            .get(format!("{}/$/validation/{DS}", s.url))
+            .bearer_auth(s.token("admin"))
+            .send()
+            .unwrap()
+            .json_value();
+        assert_eq!(
+            v["config"]["shapes"]["graphs"][0],
+            "urn:x-sparkles:shapes:mem"
+        );
+        assert_eq!(v["config"]["mode"], "warn");
+    }
+    #[cfg(not(feature = "shacl"))]
+    assert_eq!(init["shapes"]["status"], "skipped", "{init:#}");
     // a second init changes nothing
     let again = mem_json(&f, &s, "admin", &["init"]);
     assert_eq!(again["settingsChanged"], false);
+    #[cfg(feature = "shacl")]
     assert_eq!(again["shapes"]["status"], "present");
 
     // A59: the import as ana
@@ -1854,10 +1861,13 @@ fn memory_loc() {
     assert_eq!(j["code"], "locked", "{j:#}");
 }
 
+// used only by the shacl check in memory_import_sync_and_brief
+#[cfg(feature = "shacl")]
 trait JsonValue {
     fn json_value(self) -> Value;
 }
 
+#[cfg(feature = "shacl")]
 impl JsonValue for reqwest::blocking::Response {
     fn json_value(self) -> Value {
         serde_json::from_slice(&self.bytes().unwrap()).unwrap()

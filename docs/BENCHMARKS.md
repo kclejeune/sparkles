@@ -1469,6 +1469,65 @@ The rest of the gap to 20f01c82 on values-star is the fast memory account of F14
 4 thousand instructions on every query, and the warm checks that the X07 hints need. These
 are a hash per constant, a bit test per answer term and one cache lookup per scan.
 
+### The cost of plan pattern references
+
+The batch pushed on 2026-10-23 as e411a772 made the planner record the triple patterns
+each plan node reads ([U04](specs/U04-live-query-profiling.md#phase-4-2026-10-23) Phase
+4). The Namespace screen against the previous push flagged `path-plus`, `star-lookup`,
+`subquery-agg`, `types-grouped` and `values-star`, so forge ran a pinned check. Forge is
+an Intel Core i5-13500 with the 10.5M triple dataset. Each run had 16 rounds of A, B, B,
+A, with 20 warm-up and 200 timed requests per query and server process, the server
+pinned to CPU 2 with one Rayon thread and the client pinned to CPU 4. Instructions are
+`instructions:u` per request over 2,000 warm requests on atlas, the same CPU model, in
+two passes that agreed within 0.1%.
+
+The screen's baseline binary was built outside the Nix development shell, with GCC 16.2
+and Clang 21, while the pushed binary used the shell's GCC 15.3 and Clang 22. The C
+compiler builds mimalloc, and the baseline ran 11 to 33 thousand fewer instructions per
+request than atlas's build of the same source in the shell, 306.9 thousand against 318.0
+thousand on `path-plus` and 2,406 thousand against 2,439 thousand on `star-lookup`. Both binaries of the forge rows below were built on
+atlas in the shell. On the screen's own binaries, forge measured 2 to 8% more server
+time on the five flagged queries and at most 1.8% more client time.
+
+| Query | Instructions, b1a80ebd | Instructions, e411a772 | Server time, b1a80ebd | Server time, e411a772 | Client time ratio |
+|---|--:|--:|--:|--:|--:|
+| `count-all` | 326.5 thousand | 330.3 thousand | 4.7 µs | 4.7 µs | 1.014 |
+| `path-plus` | 318.0 thousand | 322.7 thousand | 6.6 µs | 6.9 µs | 1.018 |
+| `types-grouped` | 659.8 thousand | 663.8 thousand | 5.8 µs | 6.4 µs | 1.017 |
+| `values-star` | 1,156.7 thousand | 1,165.7 thousand | 13.2 µs | 14.4 µs | 1.018 |
+| `star-lookup` | 2,439.1 thousand | 2,452.3 thousand | 45.5 µs | 47.8 µs | 1.019 |
+| `subquery-agg` | 15,379.1 thousand | 15,385.5 thousand | 1.900 ms | 1.906 ms | 1.008 |
+
+On server time, `star-lookup` was slower in all 16 rounds and the ranges of round
+medians did not overlap, 44.8 to 46.6 µs against 46.8 to 49.2 µs. `types-grouped` and
+`values-star` were slower in 15 rounds. `exists-join`, `expr-order-key`,
+`optional-count` and `star-join` moved by 1.6% or less on server time, and `star-join`
+took 4.9% less client time. A build of e411a772 that skips the references matched the
+instructions of the commit before Phase 4 within 0.1% on every query but `path-plus`,
+and the merges between b1a80ebd and Phase 4 changed them by 0.2% or less, so the
+references are the whole difference.
+
+A follow-up on 2026-10-24 keys the planner's count of equal patterns by the pattern it
+records instead of a second copy of its three terms, and writes IRIs and variables
+without the formatting machinery. The plan output is unchanged.
+
+| Query | Instructions, e411a772 | Instructions, follow-up | Added by Phase 4 that remains |
+|---|--:|--:|--:|
+| `count-all` | 330.3 thousand | 329.2 thousand | 72% |
+| `path-plus` | 322.7 thousand | 321.3 thousand | 69% |
+| `types-grouped` | 663.8 thousand | 662.3 thousand | 64% |
+| `values-star` | 1,165.7 thousand | 1,161.6 thousand | 55% |
+| `star-lookup` | 2,452.3 thousand | 2,445.9 thousand | 52% |
+
+On forge, the follow-up against e411a772 changed the server time of `path-plus`,
+`star-lookup`, `values-star` and `count-all` by −1.6 to 1.5% and their client time by
+−1.5 to 0.3%, with overlapping ranges, so the saving is not visible in time.
+`types-grouped` read 7.5% slower on server time in all 16 rounds, 6.2 µs against 6.6 µs,
+with 1.5 thousand fewer instructions, and 0.2% faster on client time. That run compared a
+laptop build of e411a772 with an atlas build of the follow-up, so code placement between
+the two builds may explain it. [Roadmap](ROADMAP.md) item 180 repeats it with two atlas
+builds.
+
 ### The cost of the query memory pool
 
 The query memory pool of [X08](specs/X08-disk-spill-and-server-memory.md#gates) is on by

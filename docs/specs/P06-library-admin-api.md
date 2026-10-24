@@ -1716,6 +1716,14 @@ recovering unfinished work. `inspect` reads the registry without store locks. St
 and catalog lock conflicts now return the structured `Error::Locked`; the Python
 binding maps it to `DatasetLockedError` without inspecting an error message.
 
+The catalog lock was released only when its descriptor closed, so a child forked
+before exec, which shares the locked open file description, kept the directory locked
+after the catalog had closed. Since roadmap item 95 (2026-10-24) the catalog lock and
+`lock_data_dir` use the store's lock guard, which unlocks the file explicitly when the
+process that took it drops it. A child that drops an inherited guard leaves the
+parent's lock held. A test drops a catalog and an offline lock while a forked child
+waits before exec, and takes the lock again.
+
 The catalog namespace contains datasets only. `Dataset::branch` keeps branch state
 in a lazy library cache, preserving the parent's store options and closure-cache size.
 The server retains HTTP routing objects, offline flags and validation observers, while

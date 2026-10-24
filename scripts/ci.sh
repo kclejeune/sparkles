@@ -16,13 +16,15 @@
 # cache (see the task caching section of mise.toml).
 #
 # Usage: scripts/ci.sh [--fast] [--fail-fast] [--force] [--jobs N] [task...]
-#   --fast       formatting, doc paths, Clippy on the workspace and the Rust tests only
+#   --fast       formatting, doc paths, Clippy on the workspace and the Rust tests only. The
+#                per-feature test runs (test:features) belong to the full gate alone.
 #   --fail-fast  stop the remaining tasks after the first failure
 #   --force      run every check even when the task cache has a pass for it
 #   --jobs N     tasks run at once (default 2). Cargo tasks share one build lock, so more
 #                jobs mostly help the UI, JVM and Node tasks. `test` and `node:test` never
 #                run at the same time, because each links target/debug/sparkles with other
-#                features (see links_server below).
+#                features (see links_server below). `test:features` takes turns with them
+#                for the same reason.
 #   task...      run only these CI tasks
 set -euo pipefail
 
@@ -34,7 +36,7 @@ main() {
   full=(
     fmt:check ui:fmt:check node:fmt:check lint:doc-paths test:bench-scripts
     lint ui:check fmt:wasm py:lint jvm:lint node:lint
-    test ui:test lint:features
+    test ui:test lint:features test:features
     py:test jvm:rust-test jvm:test node:test node:client:check licenses:check
   )
   fast=(fmt:check lint:doc-paths lint test)
@@ -84,7 +86,7 @@ main() {
   prep=()
   for t in "${tasks[@]}"; do
     case "$t" in
-      lint | lint:features | test | ui:check | ui:test | licenses:check) prep+=(ui:build) ;;
+      lint | lint:features | test | test:features | ui:check | ui:test | licenses:check) prep+=(ui:build) ;;
       ui:fmt:check) prep+=(ui:install) ;;
       node:fmt:check | node:client:check) prep+=(node:install) ;;
       node:test) prep+=(node:build) ;;
@@ -175,10 +177,11 @@ main() {
   # `node:test` builds the server alone without them. Cargo replaces the one file with
   # whichever link finishes last, so two such tasks at once would run one's tests on the
   # other's binary. Building each into its own target directory would cost a second
-  # build of the server, so they take turns instead.
+  # build of the server, so they take turns instead. `test:features` links it with one
+  # optional feature set after another, so it takes turns too.
   links_server() {
     case "$1" in
-      test | node:test) return 0 ;;
+      test | test:features | node:test) return 0 ;;
       *) return 1 ;;
     esac
   }

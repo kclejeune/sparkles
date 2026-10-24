@@ -22,7 +22,7 @@ use object_store::{GetOptions, ObjectStore};
 use serde_json::Value as J;
 use sparkles_core::check::{CheckOptions, Status};
 use sparkles_core::commit::ForkedFrom;
-use sparkles_core::store::Store;
+use sparkles_core::store::{ProcessLock, Store};
 use std::fs::{File, OpenOptions};
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
@@ -792,8 +792,10 @@ fn rename_second(from: &Path, to: &Path) -> std::io::Result<()> {
 }
 
 /// Take the process lock of the database directory `root` (`sparkles.lock`, as
-/// `Store::open` does), or fail with the "in use by another process" error.
-fn lock_database(root: &Path) -> Result<File> {
+/// `Store::open` does), or fail with the "in use by another process" error. The guard
+/// unlocks the file when the process that took it drops it, as the store's lock does,
+/// so a child forked before exec cannot keep the database locked after the swap.
+fn lock_database(root: &Path) -> Result<ProcessLock> {
     let path = root.join("sparkles.lock");
     let f = OpenOptions::new()
         .create(true)
@@ -804,7 +806,8 @@ fn lock_database(root: &Path) -> Result<File> {
     #[cfg(test)]
     tests::after_lock_open();
     match f.try_lock() {
-        Ok(()) => Ok(f),
+        // unlocked explicitly when dropped, so a child forked meanwhile cannot keep it
+        Ok(()) => Ok(ProcessLock::from_locked_file(f)),
         Err(std::fs::TryLockError::WouldBlock) => {
             let pid = std::fs::read_to_string(&path).unwrap_or_default();
             Err(BackupError::new(

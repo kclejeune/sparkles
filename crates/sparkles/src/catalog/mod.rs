@@ -5,7 +5,7 @@
 //! stores, reservations and lock with every clone.
 
 use crate::store::caches::{CacheSizes, SharedCaches};
-use crate::store::{Store, StoreOptions};
+use crate::store::{ProcessLock, Store, StoreOptions};
 use crate::{Dataset, DatasetOptions, Error, Result};
 use parking_lot::{Mutex, RwLock};
 use serde::{Deserialize, Serialize};
@@ -183,7 +183,7 @@ pub(crate) struct Inner {
     #[cfg(feature = "backup")]
     pub(crate) repositories: Mutex<Option<crate::backup::Repositories>>,
     // Drop the lock only after the stores have closed.
-    _lock: Option<File>,
+    _lock: Option<ProcessLock>,
 }
 
 #[derive(Clone)]
@@ -1061,15 +1061,18 @@ fn read_registry(dir: &Path) -> Result<Registry> {
     }
 }
 /// Take the catalog lock of a data directory without opening its datasets, for offline
-/// commands on a stopped server. The lock is held until the returned file is dropped.
+/// commands on a stopped server. The lock is held until the returned guard is dropped.
 /// A running server holds it, so this fails with [`Error::Locked`] while one runs.
-pub fn lock_data_dir(dir: &Path) -> Result<File> {
+pub fn lock_data_dir(dir: &Path) -> Result<ProcessLock> {
     lock_dir(dir)
 }
 
-pub(crate) fn lock_dir(dir: &Path) -> Result<File> {
+/// Take `catalog.lock` in `dir`. The guard unlocks the file when the process that took
+/// it drops it, as the store's `sparkles.lock` does, so a child forked before exec cannot
+/// keep the catalog locked after the owner has closed it.
+pub(crate) fn lock_dir(dir: &Path) -> Result<ProcessLock> {
     let path = dir.join("catalog.lock");
-    let mut file = OpenOptions::new()
+    let file = OpenOptions::new()
         .create(true)
         .truncate(false)
         .read(true)
@@ -1077,8 +1080,9 @@ pub(crate) fn lock_dir(dir: &Path) -> Result<File> {
         .open(&path)?;
     match file.try_lock() {
         Ok(()) => {
+            let file = ProcessLock::from_locked_file(file);
             file.set_len(0)?;
-            writeln!(file, "{}", std::process::id())?;
+            writeln!(&*file, "{}", std::process::id())?;
             file.sync_all()?;
             Ok(file)
         }
@@ -1304,5 +1308,131 @@ mod tests {
         let reopened = Catalog::open(dir.path(), Default::default()).unwrap();
         assert!(reopened.get("a").is_some());
         assert!(reopened.get("b").is_some());
+    }
+
+    /// A child forked from this process and held before exec, so that it shares every
+    /// descriptor the process had open when it forked, until [`PreExecChild::release`].
+    #[cfg(unix)]
+    struct PreExecChild {
+        resume: std::os::unix::net::UnixStream,
+        worker: std::thread::JoinHandle<std::process::ExitStatus>,
+    }
+
+    #[cfg(unix)]
+    impl PreExecChild {
+        /// Fork a child that waits before exec, and return once it is waiting. After exec it
+        /// runs this test binary with `--list` for a filter that matches no test.
+        fn hold() -> Self {
+            use std::io::Read;
+            use std::os::fd::AsRawFd;
+            use std::os::unix::{net::UnixStream, process::CommandExt};
+            use std::time::{Duration, Instant};
+
+            let (mut ready_parent, ready_child) = UnixStream::pair().unwrap();
+            let (resume_parent, resume_child) = UnixStream::pair().unwrap();
+            ready_parent
+                .set_read_timeout(Some(Duration::from_secs(10)))
+                .unwrap();
+            let close_ready = ready_parent.as_raw_fd();
+            let close_resume = resume_parent.as_raw_fd();
+            let worker = std::thread::spawn(move || {
+                let mut command = std::process::Command::new(std::env::current_exe().unwrap());
+                command
+                    .args(["--list", "--exact", "no::such::test"])
+                    .stdout(std::process::Stdio::null())
+                    .stderr(std::process::Stdio::null());
+                let ready = ready_child.as_raw_fd();
+                let resume = resume_child.as_raw_fd();
+                // SAFETY: only async-signal-safe close/write/poll/read syscalls run after
+                // fork. The parent holds both pairs until the spawn has completed, and the
+                // poll timeout bounds cleanup even if the parent fails before releasing it.
+                unsafe {
+                    command.pre_exec(move || {
+                        libc::close(close_ready);
+                        libc::close(close_resume);
+                        if libc::write(ready, b"x".as_ptr().cast(), 1) != 1 {
+                            return Err(std::io::Error::last_os_error());
+                        }
+                        let mut poll = libc::pollfd {
+                            fd: resume,
+                            events: libc::POLLIN,
+                            revents: 0,
+                        };
+                        if libc::poll(&mut poll, 1, 10_000) <= 0 {
+                            return Err(std::io::Error::from_raw_os_error(libc::ETIMEDOUT));
+                        }
+                        let mut byte = 0u8;
+                        if libc::read(resume, (&mut byte as *mut u8).cast(), 1) < 0 {
+                            return Err(std::io::Error::last_os_error());
+                        }
+                        Ok(())
+                    });
+                }
+                let spawned = command.spawn();
+                drop(ready_child);
+                drop(resume_child);
+                let mut child = spawned.unwrap();
+                let deadline = Instant::now() + Duration::from_secs(10);
+                loop {
+                    if let Some(status) = child.try_wait().unwrap() {
+                        return status;
+                    }
+                    if Instant::now() >= deadline {
+                        let _ = child.kill();
+                        let _ = child.wait();
+                        panic!("the pre-exec child failed to exit");
+                    }
+                    std::thread::sleep(Duration::from_millis(5));
+                }
+            });
+            ready_parent
+                .read_exact(&mut [0u8])
+                .expect("the child reached pre-exec");
+            PreExecChild {
+                resume: resume_parent,
+                worker,
+            }
+        }
+
+        /// Let the child exec and exit, and reap it.
+        fn release(self) {
+            drop(self.resume);
+            assert!(self.worker.join().unwrap().success());
+        }
+    }
+
+    /// The catalog lock, whether a catalog or an offline command holds it, ends when its
+    /// owner drops it, even while a child forked meanwhile still shares the locked
+    /// descriptor before exec.
+    #[cfg(unix)]
+    #[test]
+    fn catalog_lock_unlocks_during_an_unrelated_pre_exec_child() {
+        let dir = tempfile::tempdir().unwrap();
+        let cat = Catalog::open(dir.path(), Default::default()).unwrap();
+        drop(cat.create("ds", &Default::default()).unwrap());
+        let child = PreExecChild::hold();
+        drop(cat);
+        let reopened = Catalog::open(dir.path(), Default::default());
+        // reaped before asserting, so the expected failure before the fix also cleans up
+        child.release();
+        let reopened = reopened.expect("a pre-exec child kept the catalog's lock");
+        assert!(reopened.get("ds").is_some());
+        assert!(matches!(
+            lock_data_dir(dir.path()),
+            Err(Error::Locked { .. })
+        ));
+        drop(reopened);
+
+        let guard = lock_data_dir(dir.path()).unwrap();
+        let child = PreExecChild::hold();
+        drop(guard);
+        let again = lock_data_dir(dir.path());
+        child.release();
+        let again = again.expect("a pre-exec child kept the offline catalog lock");
+        assert!(matches!(
+            Catalog::open(dir.path(), Default::default()),
+            Err(Error::Locked { .. })
+        ));
+        drop(again);
     }
 }

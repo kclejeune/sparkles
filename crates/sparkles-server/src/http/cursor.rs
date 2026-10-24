@@ -171,6 +171,9 @@ pub(super) async fn serve(
     // the plan as it stood when a native JSON stream failed before its first byte
     let failed_plan: Arc<parking_lot::Mutex<Option<serde_json::Value>>> = Default::default();
     let plan_slot = failed_plan.clone();
+    // the rows an eager answer wrote whole, for the report of a body stopped partway
+    let eager_sent: Arc<parking_lot::Mutex<Option<u64>>> = Default::default();
+    let eager_slot = eager_sent.clone();
     let deferred = DeferredReport::default();
     let final_report = deferred.clone();
     let waits = control.clone();
@@ -191,21 +194,30 @@ pub(super) async fn serve(
                         && result.result().kind == QueryKind::Select
                         && format != SolutionsFormat::Sparkles =>
                 {
-                    write_thrift_results(result.result(), writer, send)
+                    let sent = std::cell::Cell::new(0);
+                    let written = write_thrift_results(result.result(), writer, send, &sent);
+                    *eager_slot.lock() = Some(sent.get());
+                    written
                 }
-                QueryExecution::Eager(result) => serialize_result(
-                    result.result(),
-                    writer,
-                    (!graph && format == SolutionsFormat::Sparkles) || native_graph,
-                    graph,
-                    format,
-                    rdf_format,
-                    send,
-                    &prefix_map,
-                    seq,
-                    &dataset_id,
-                    io.as_deref(),
-                ),
+                QueryExecution::Eager(result) => {
+                    let sent = std::cell::Cell::new(0);
+                    let written = serialize_result(
+                        result.result(),
+                        writer,
+                        (!graph && format == SolutionsFormat::Sparkles) || native_graph,
+                        graph,
+                        format,
+                        rdf_format,
+                        send,
+                        &prefix_map,
+                        seq,
+                        &dataset_id,
+                        io.as_deref(),
+                        &sent,
+                    );
+                    *eager_slot.lock() = Some(sent.get());
+                    written
+                }
                 QueryExecution::Select(cursor) if format == SolutionsFormat::Sparkles => {
                     results::write_cursor_native_json(cursor, &mut *writer, send, metadata)
                         .map(|_| ())
@@ -258,13 +270,12 @@ pub(super) async fn serve(
             let exec_ms = stats.as_ref().map_or(0.0, |s| s.timing.exec_ms);
             let serialize_ms =
                 (began.elapsed().as_secs_f64() * 1000.0 - exec_ms - wait_ms).max(0.0);
-            let (outcome, budget) = match &end.error {
-                Some(Error::Timeout) => (Some(Outcome::Timeout), None),
-                Some(Error::Cancelled) => (Some(Outcome::Cancelled), None),
-                Some(Error::BudgetExceeded(b)) => (Some(Outcome::Budget), Some(b.kind)),
-                Some(_) if end.disconnected => (Some(Outcome::Cancelled), None),
-                Some(_) => (Some(Outcome::Error), None),
-                None => (None, None),
+            let (outcome, budget) = end.outcome();
+            // An eager answer's statistics count all of its rows, so a body that stopped
+            // partway reports the rows it wrote, as a cursor's emitted rows do.
+            let rows = match *eager_sent.lock() {
+                Some(sent) if end.error.is_some() => Some(sent),
+                _ => stats.as_ref().map(|s| s.emitted_rows),
             };
             if let Some(stats) = &stats {
                 crate::otel::cursor_done(t0, kind, stats, serialize_ms);
@@ -277,7 +288,7 @@ pub(super) async fn serve(
                 operation: Some(Op::Query),
                 outcome,
                 budget,
-                rows: stats.as_ref().map(|s| s.emitted_rows),
+                rows,
                 timing,
                 serialize_ms: Some(serialize_ms),
                 response_bytes: Some(end.bytes),

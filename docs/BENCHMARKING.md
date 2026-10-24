@@ -691,6 +691,16 @@ on atlas with six jobs.
   `c4b49fab`, also measured +1.0% on Namespace, against +15% on Atlas. The other queries
   agreed with Atlas within the noise. A result that depends on how one CPU schedules a
   loop has to be measured on that CPU.
+
+  The cache keys a binary by its commit alone and builds with whatever compilers the
+  shell provides. The C compiler builds mimalloc, so two binaries built with different
+  C compilers differ on every request. The baseline of the screen of 2026-10-24 was built
+  outside the Nix development shell with GCC 16.2 and Clang 21 and ran 11 to 33 thousand
+  fewer instructions per request than the same source built in the shell, which made the
+  pushed commit look slower on small queries. Build both revisions in `nix develop`, and
+  check the `.comment` section of each binary (`readelf -p .comment`) when a screen of
+  small queries flags something. [Roadmap](ROADMAP.md) item 181 records the compilers
+  with each cached binary.
 * `scripts/nsc-writes.sh` stages write workloads before creating a capped Namespace
   instance. Its revision builds use `SPARKLES_NSC_CACHE/writes-v1`, separately from
   the query harness. Each source commit and exact `--cargo-args` string has its own

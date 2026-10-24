@@ -203,7 +203,10 @@ fn a_fuseki_base_directory_with_shiro() {
         d.path(),
         &["config", "import", "fuseki", "run", "--out", "out"],
     );
-    assert!(o.status.code() == Some(0), "{}{}", out(&o), err(&o));
+    // without the auth feature the passwords cannot be hashed, which the report lists as
+    // unsupported
+    let status = if cfg!(feature = "auth") { 0 } else { 1 };
+    assert!(o.status.code() == Some(status), "{}{}", out(&o), err(&o));
     let report = out(&o);
     assert!(report.contains("shiro.ini"), "{report}");
     assert!(

@@ -361,6 +361,8 @@ async fn async_client_against_a_server() {
             .unwrap()
             .starts_with("lib_")
     );
+    // the backup repositories' listing exists only with the backup feature
+    #[cfg(feature = "backup")]
     assert_eq!(ds.backups().await.unwrap()["dataset"], "lib");
     let tmp = client
         .create_dataset("scratch", DatasetType::Memory)
