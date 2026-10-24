@@ -111,7 +111,7 @@ test('branches', async ({ page }) => {
   await expect(panel.getByRole('row').filter({ hasText: 'reorg-2027' })).toBeVisible({
     timeout: 30_000,
   });
-  const toggle = history(page).getByRole('button', { name: 'Graph' });
+  const toggle = history(page).getByRole('button', { name: 'Graph', exact: true });
   await toggle.click();
   await expect(toggle).toHaveAttribute('aria-pressed', 'true');
   await expect(history(page)).toContainText('commits of');
