@@ -183,6 +183,44 @@ pub fn shapes_for_node(
     Ok(out)
 }
 
+/// The node shapes that would target a new instance of `class`: those with a class
+/// target (explicit or implicit) of `class` or of a class `class` is a subclass of in the
+/// data graph. Targets by node, by subject or object of a predicate, by expression and
+/// `sh:targetWhere` depend on data a new resource does not have yet, so they do not count.
+pub fn shapes_for_class(
+    snap: &Arc<Snapshot>,
+    shapes: &Shapes,
+    class: &Term,
+    opts: &ValidateOptions,
+) -> Result<Vec<ShapeId>> {
+    let (mut data, ids) = DataGraph::new(
+        snap.clone(),
+        opts.data_graph.as_deref(),
+        &opts.extra_graphs,
+        &opts.exclude_graphs,
+        shapes,
+    )?;
+    let cls = data.resolve(class, shapes.bnodes_in_store);
+    let engine = Engine::new(shapes, &data, ids, opts)?;
+    let mut out = Vec::new();
+    for (si, shape) in shapes.shapes.iter().enumerate() {
+        if shape.deactivated {
+            continue;
+        }
+        engine.check_limits()?;
+        for t in &shape.targets {
+            if let Target::Class(c) = t {
+                let c = engine.id(*c);
+                if c == cls || data.subclasses(c)?.contains(&cls) {
+                    out.push(si);
+                    break;
+                }
+            }
+        }
+    }
+    Ok(out)
+}
+
 /// The id of a focus node named by a caller: a blank node with the label of a stored one
 /// (`b…`) is that stored node, whatever the scope of the shapes' own blank nodes, and any
 /// other term resolves as the shapes' terms do.

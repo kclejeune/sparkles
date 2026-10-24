@@ -23733,7 +23733,7 @@
     },
     "/$/forms/{ds}": {
       "get": {
-        "description": "The fields that the property shapes of the node shapes targeting `focus` describe, laid out by `sh:group` and `sh:order` and labelled by `sh:name`, with the resource's values read under the caller's view, the widget of each field, the constraints the browser checks and the triples no property shape covers. Fields the caller's protections hide from reads are absent, and fields it cannot write are read-only with a `reason`. A focus no shape targets answers `200` with no fields. `save` says where a save goes, and `guard` gives the write guard's mode.",
+        "description": "The fields that the property shapes of the node shapes targeting `focus` describe, laid out by `sh:group` and `sh:order` and labelled by `sh:name`, with the resource's values read under the caller's view, the widget of each field, the constraints the browser checks and the triples no property shape covers. Fields the caller's protections hide from reads are absent, and fields it cannot write are read-only with a `reason`. A focus no shape targets answers `200` with no fields. With `class` instead of `focus`, the form is that of a new instance of the class, with the fields of the node shapes whose class targets select it and no values, and `focus` is `null`. `save` says where a save goes, and `guard` gives the write guard's mode.",
         "externalDocs": {
           "url": "https://github.com/kclejeune/sparkles/blob/main/docs/API.md#editing-forms"
         },
@@ -23743,10 +23743,17 @@
             "$ref": "#/components/parameters/ds"
           },
           {
-            "description": "The IRI of the resource.",
+            "description": "The IRI of the resource. Give either `focus` or `class`.",
             "in": "query",
             "name": "focus",
-            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "The class of a new instance.",
+            "in": "query",
+            "name": "class",
             "schema": {
               "type": "string"
             }
@@ -23964,6 +23971,10 @@
                     },
                     "type": "array"
                   },
+                  "class": {
+                    "description": "The class of a new instance, whose IRI the server mints from the `forms` setting's `newIri`. The change also adds the instance's `rdf:type`.",
+                    "type": "string"
+                  },
                   "expect": {
                     "additionalProperties": {
                       "items": {
@@ -23976,7 +23987,7 @@
                     "type": "object"
                   },
                   "focus": {
-                    "description": "The IRI of the resource.",
+                    "description": "The IRI of the resource. Give either `focus` or `class`.",
                     "type": "string"
                   },
                   "message": {
@@ -23994,7 +24005,6 @@
                   }
                 },
                 "required": [
-                  "focus",
                   "changes"
                 ],
                 "type": "object"
@@ -24140,6 +24150,10 @@
                     },
                     "type": "array"
                   },
+                  "class": {
+                    "description": "The class of a new instance, whose IRI the server mints from the `forms` setting's `newIri`. The change also adds the instance's `rdf:type`.",
+                    "type": "string"
+                  },
                   "expect": {
                     "additionalProperties": {
                       "items": {
@@ -24152,7 +24166,7 @@
                     "type": "object"
                   },
                   "focus": {
-                    "description": "The IRI of the resource.",
+                    "description": "The IRI of the resource. Give either `focus` or `class`.",
                     "type": "string"
                   },
                   "message": {
@@ -24170,7 +24184,6 @@
                   }
                 },
                 "required": [
-                  "focus",
                   "changes"
                 ],
                 "type": "object"
@@ -24202,6 +24215,10 @@
                       "type": "string"
                     },
                     "datasetId": {
+                      "type": "string"
+                    },
+                    "focus": {
+                      "description": "The resource saved, which for a new instance is the IRI minted for it.",
                       "type": "string"
                     },
                     "validation": {

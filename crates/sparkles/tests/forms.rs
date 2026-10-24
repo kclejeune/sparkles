@@ -85,10 +85,7 @@ fn a1_the_form_lists_the_fields_in_order_with_groups_and_values() {
     let m = model(&ds, &settings, "alice");
     assert_eq!(m["formFormat"], 1);
     assert_eq!(m["types"], json!([ex("Person")]));
-    assert_eq!(
-        m["shapes"]["nodeShapes"],
-        json!([format!("<{}>", ex("PersonShape"))])
-    );
+    assert_eq!(m["shapes"]["nodeShapes"], json!([ex("PersonShape")]));
     let labels: Vec<&str> = m["fields"]
         .as_array()
         .unwrap()
@@ -109,7 +106,7 @@ fn a1_the_form_lists_the_fields_in_order_with_groups_and_values() {
     );
     assert_eq!(
         m["groups"],
-        json!([{ "iri": format!("<{}>", ex("Work")), "label": "Work", "order": 2.0 }])
+        json!([{ "iri": ex("Work"), "label": "Work", "order": 2.0 }])
     );
     let name = field(&m, "Name");
     assert_eq!(name["id"], format!("<{}>", ex("name")));
@@ -383,4 +380,67 @@ fn settings_are_checked() {
     let j: FormSettings = serde_json::from_value(json!({})).unwrap();
     assert_eq!(j, FormSettings::default());
     assert!(serde_json::from_value::<FormSettings>(json!({ "x": 1 })).is_err());
+}
+
+#[test]
+fn a_new_instance_takes_a_minted_iri_its_type_and_its_values() {
+    let (ds, settings) = dataset();
+    // the form of a new Person: the class's shapes, no values and no focus
+    let mut req = FormRequest::new(settings.mint_iri(), settings.clone());
+    req.class = Some(ex("Person"));
+    let m = serde_json::to_value(ds.forms().model(&req, &Default::default()).unwrap()).unwrap();
+    assert_eq!(m["focus"], Value::Null);
+    assert_eq!(m["types"], json!([ex("Person")]));
+    assert_eq!(field(&m, "Name")["values"], json!([]));
+    assert!(m["editable"].as_bool().unwrap());
+    // a subclass of Person gets the same shape
+    ds.update(&format!(
+        "INSERT DATA {{ <{EX}Manager> <http://www.w3.org/2000/01/rdf-schema#subClassOf> <{EX}Person> }}"
+    ))
+    .unwrap();
+    req.class = Some(ex("Manager"));
+    let m = serde_json::to_value(ds.forms().model(&req, &Default::default()).unwrap()).unwrap();
+    assert_eq!(m["shapes"]["nodeShapes"], json!([ex("PersonShape")]));
+    // a class no shape targets has no fields
+    req.class = Some(ex("Org"));
+    let m = serde_json::to_value(ds.forms().model(&req, &Default::default()).unwrap()).unwrap();
+    assert_eq!(m["fields"], json!([]));
+
+    let focus = settings.mint_iri();
+    assert!(focus.starts_with("urn:uuid:"), "{focus}");
+    let mut c = change("name", vec![], vec![lit("Carol")], vec![]);
+    c.focus = focus.clone();
+    c.class = Some(ex("Person"));
+    c.settings = settings.clone();
+    c.changes.push(FieldChange {
+        field: format!("<{EX}worksFor>"),
+        remove: vec![],
+        add: vec![iri("acme")],
+    });
+    c.expect.insert(format!("<{EX}worksFor>"), vec![]);
+    let check = ds.forms().check(&c, &Default::default()).unwrap();
+    assert_eq!(check.conforms, Some(true), "{:?}", check.results);
+    assert!(
+        check
+            .update
+            .contains("<http://www.w3.org/1999/02/22-rdf-syntax-ns#type>")
+    );
+    let FormSaved::Saved(_) = ds.forms().save(&c, &Default::default()).unwrap() else {
+        panic!("the new instance was not saved");
+    };
+    assert!(
+        ds.ask(&format!(
+            "ASK {{ <{focus}> a <{EX}Person> ; <{EX}name> \"Carol\" ; <{EX}worksFor> <{EX}acme> }}"
+        ))
+        .unwrap()
+    );
+    // the same IRI again: it describes a resource now
+    let e = ds.forms().save(&c, &Default::default()).unwrap_err();
+    assert!(e.to_string().contains("already describes"), "{e}");
+    // a template mints under its namespace
+    let t = FormSettings {
+        new_iri: format!("{EX}person/{{uuid}}"),
+        ..settings
+    };
+    assert!(t.mint_iri().starts_with(&ex("person/")));
 }

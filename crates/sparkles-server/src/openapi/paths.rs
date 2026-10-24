@@ -443,9 +443,10 @@ fn forms(p: &mut Paths) {
     let change = json!({ "application/json": { "schema": {
         "type": "object",
         "additionalProperties": false,
-        "required": ["focus", "changes"],
+        "required": ["changes"],
         "properties": {
-            "focus": { "type": "string", "description": "The IRI of the resource." },
+            "focus": { "type": "string", "description": "The IRI of the resource. Give either `focus` or `class`." },
+            "class": { "type": "string", "description": "The class of a new instance, whose IRI the server mints from the `forms` setting's `newIri`. The change also adds the instance's `rdf:type`." },
             "branch": { "type": "string", "description": "The branch the form was opened on. A form opened on `main` saves where the dataset's `forms` setting says, which may be the caller's session branch." },
             "shapes": { "type": "string", "enum": ["guard", "graphs", "drafted"], "description": "The shapes the form was built from, when not the setting's." },
             "changes": { "type": "array", "items": { "type": "object", "required": ["field"], "properties": {
@@ -459,9 +460,10 @@ fn forms(p: &mut Paths) {
     } } });
     p.add(
         op(GET, "/$/forms/{ds}", "getForm", "Validation", "The form of a resource")
-            .doc("The fields that the property shapes of the node shapes targeting `focus` describe, laid out by `sh:group` and `sh:order` and labelled by `sh:name`, with the resource's values read under the caller's view, the widget of each field, the constraints the browser checks and the triples no property shape covers. Fields the caller's protections hide from reads are absent, and fields it cannot write are read-only with a `reason`. A focus no shape targets answers `200` with no fields. `save` says where a save goes, and `guard` gives the write guard's mode.")
+            .doc("The fields that the property shapes of the node shapes targeting `focus` describe, laid out by `sh:group` and `sh:order` and labelled by `sh:name`, with the resource's values read under the caller's view, the widget of each field, the constraints the browser checks and the triples no property shape covers. Fields the caller's protections hide from reads are absent, and fields it cannot write are read-only with a `reason`. A focus no shape targets answers `200` with no fields. With `class` instead of `focus`, the form is that of a new instance of the class, with the fields of the node shapes whose class targets select it and no values, and `focus` is `null`. `save` says where a save goes, and `guard` gives the write guard's mode.")
             .see("editing-forms")
-            .query_req("focus", s(), "The IRI of the resource.")
+            .query("focus", s(), "The IRI of the resource. Give either `focus` or `class`.")
+            .query("class", s(), "The class of a new instance.")
             .query("shapes", json!({ "type": "string", "enum": ["guard", "graphs", "drafted"] }), "Where the shapes come from, when not the dataset's `forms` setting.")
             .query("lang", s(), "The language labels are picked in, then English, then untagged.")
             .params(&["branch", "at", "timeout"])
@@ -529,6 +531,7 @@ fn forms(p: &mut Paths) {
                         "commit": { "type": "object" },
                         "branch": { "type": "string" },
                         "branchCreated": { "type": "boolean" },
+                        "focus": { "type": "string", "description": "The resource saved, which for a new instance is the IRI minted for it." },
                         "dataset": { "type": "string" },
                         "datasetId": { "type": "string" },
                         "validation": { "type": "object" }

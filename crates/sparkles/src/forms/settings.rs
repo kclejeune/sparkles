@@ -139,6 +139,17 @@ impl FormSettings {
         Ok(())
     }
 
+    /// A new IRI for a new instance, by `newIri`: `urn:uuid:` and a random UUID, or the
+    /// template with `{uuid}` replaced by one.
+    pub fn mint_iri(&self) -> String {
+        let id = uuid::Uuid::new_v4().to_string();
+        if self.new_iri == "urn:uuid" {
+            format!("urn:uuid:{id}")
+        } else {
+            self.new_iri.replace("{uuid}", &id)
+        }
+    }
+
     /// The session branch's name for `user` on `date` (`yyyymmdd`), with characters a
     /// branch name cannot hold replaced by `-`.
     pub fn session_branch(&self, user: &str, date: &str) -> String {

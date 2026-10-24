@@ -56,7 +56,8 @@ pub use shapes::{Constraint, GroupInfo, NodeKind, Shape, ShapeInfo, Shapes, Targ
 pub use sparkles_core::io::RdfFormat;
 pub use syntax::ShapesSyntax;
 pub use validate::{
-    TooManyResults, ValidateOptions, shapes_for_node, validate, validate_node, validate_nodes,
+    TooManyResults, ValidateOptions, shapes_for_class, shapes_for_node, validate, validate_node,
+    validate_nodes,
 };
 
 /// Lexical validity of an XSD literal (as used by `sh:datatype`; see [`sparkles_core::xsd`]).

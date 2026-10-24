@@ -58,6 +58,9 @@ pub struct FormRequest {
     pub settings: FormSettings,
     /// whether the caller may write the branch (fields are read-only otherwise)
     pub writable: bool,
+    /// a new instance of this class instead of `focus` (Phase 2): the form of the node
+    /// shapes that would target it, with no values
+    pub class: Option<String>,
 }
 
 impl FormRequest {
@@ -68,6 +71,7 @@ impl FormRequest {
             lang: None,
             settings,
             writable: true,
+            class: None,
         }
     }
 }
@@ -191,7 +195,11 @@ pub struct FieldChange {
 /// The changes a form makes to a resource.
 #[derive(Clone, Debug, Default)]
 pub struct FormChange {
+    /// the resource; with `class`, the IRI the new instance takes, which must not be the
+    /// subject of any triple yet
     pub focus: String,
+    /// a new instance of this class: the change also adds `focus rdf:type class`
+    pub class: Option<String>,
     pub changes: Vec<FieldChange>,
     /// the values the form loaded, by field id: one entry for every changed field
     pub expect: BTreeMap<String, Vec<Term>>,
@@ -303,7 +311,14 @@ impl Forms {
                 store.snapshot_at(at, &o)?.0
             }
         };
-        let built = self.build(&snap, &req.focus, &req.settings, req.lang.as_deref(), opts)?;
+        let built = self.build(
+            &snap,
+            &req.focus,
+            &req.settings,
+            req.lang.as_deref(),
+            opts,
+            req.class.as_deref(),
+        )?;
         let writable = req.writable && req.at.is_none();
         Ok(built.model(writable, &store.branch_name()))
     }
@@ -316,7 +331,14 @@ impl Forms {
     pub fn check(&self, change: &FormChange, opts: &QueryOptions) -> Result<FormCheck> {
         let store = self.ds.store();
         let head = store.snapshot();
-        let built = self.build(&head, &change.focus, &change.settings, None, opts)?;
+        let built = self.build(
+            &head,
+            &change.focus,
+            &change.settings,
+            None,
+            opts,
+            change.class.as_deref(),
+        )?;
         let plan = built.plan(change)?;
         let conflicts = conflicts_at(
             &head,
@@ -371,7 +393,14 @@ impl Forms {
     pub fn save(&self, change: &FormChange, opts: &QueryOptions) -> Result<FormSaved> {
         let store = self.ds.store();
         let head = store.snapshot();
-        let built = self.build(&head, &change.focus, &change.settings, None, opts)?;
+        let built = self.build(
+            &head,
+            &change.focus,
+            &change.settings,
+            None,
+            opts,
+            change.class.as_deref(),
+        )?;
         let plan = built.plan(change)?;
         let checks = expected(&plan, change)?;
         let focus = built.focus.clone();
@@ -423,14 +452,23 @@ impl Forms {
         settings: &FormSettings,
         lang: Option<&str>,
         opts: &QueryOptions,
+        class: Option<&str>,
     ) -> Result<Built> {
         let focus = NamedNode::new(focus)
             .map_err(|e| Error::invalid(format!("focus: invalid IRI '{focus}': {e}")))?;
         let focus = Term::NamedNode(focus);
+        let new_class = class
+            .map(|c| {
+                NamedNode::new(c.trim_start_matches('<').trim_end_matches('>'))
+                    .map_err(|e| Error::invalid(format!("class: invalid IRI '{c}': {e}")))
+            })
+            .transpose()?;
         let access = opts.graphs.as_ref().map(|a| a.bound(snap));
         let read = Reader::new(snap, access.as_deref())?;
-        let types: Vec<String> = read
-            .values(
+        let types: Vec<String> = if let Some(c) = &new_class {
+            vec![c.as_str().to_string()]
+        } else {
+            read.values(
                 &focus,
                 &FieldPath::Predicate(NamedNode::new_unchecked(RDF_TYPE)),
             )?
@@ -441,7 +479,8 @@ impl Forms {
             })
             .collect::<BTreeSet<_>>()
             .into_iter()
-            .collect();
+            .collect()
+        };
         let (shapes, mut vopts, missing) = self.shapes(snap, settings, &types, &access, opts)?;
         // a caller limited to some graphs: decide the targets without the others
         if let Some(a) = access.as_deref()
@@ -457,6 +496,14 @@ impl Forms {
         }
         let node_shapes = if shapes.is_empty() {
             Vec::new()
+        } else if let Some(c) = &new_class {
+            sparkles_shacl::shapes_for_class(
+                read.snap(),
+                &shapes,
+                &Term::NamedNode(c.clone()),
+                &vopts,
+            )
+            .map_err(crate::handles::from_anyhow)?
         } else {
             sparkles_shacl::shapes_for_node(read.snap(), &shapes, &focus, &vopts)
                 .map_err(crate::handles::from_anyhow)?
@@ -469,6 +516,7 @@ impl Forms {
         drop(read);
         Ok(Built {
             focus,
+            new_class,
             types,
             commit: snap.commit,
             source: settings.shapes,
@@ -592,6 +640,8 @@ fn target_graph(read: &Reader<'_>, focus: &Term, s: &FormSettings) -> Result<Opt
 /// The fields of a resource and what they were built from.
 struct Built {
     focus: Term,
+    /// a new instance of this class: `focus` is the IRI minted for it
+    new_class: Option<NamedNode>,
     types: Vec<String>,
     commit: u64,
     source: ShapesSource,
@@ -654,7 +704,7 @@ impl Built {
 
     fn shape_name(&self, t: &Term) -> String {
         match t {
-            Term::NamedNode(n) => n.to_string(),
+            Term::NamedNode(n) => n.as_str().to_string(),
             Term::BlankNode(b) => format!("_:{}", b.as_str()),
             t => t.to_string(),
         }
@@ -804,7 +854,7 @@ impl Built {
         FormModel {
             form_format: FORM_FORMAT,
             focus: match &self.focus {
-                Term::NamedNode(n) => Some(n.as_str().to_string()),
+                Term::NamedNode(n) if self.new_class.is_none() => Some(n.as_str().to_string()),
                 _ => None,
             },
             types: self.types.clone(),
@@ -932,6 +982,32 @@ impl Built {
         }
         let mut del: BTreeMap<Option<String>, Vec<String>> = BTreeMap::new();
         let mut ins: BTreeMap<Option<String>, Vec<String>> = BTreeMap::new();
+        if let Some(c) = &self.new_class {
+            // a new instance takes an IRI nothing describes yet
+            let used = match read.snap().lookup_term(&self.focus) {
+                None => false,
+                Some(id) => !read.scan(Perm::Spo, &[id.0], 1)?.is_empty(),
+            };
+            if used {
+                return Err(Error::invalid(format!(
+                    "focus: {} already describes a resource; a new instance needs a new IRI",
+                    self.focus
+                )));
+            }
+            if !self.writable_graph(self.target.as_deref()) {
+                return Err(Error::NotPermitted(format!(
+                    "new values go to {}, which you cannot write",
+                    self.target
+                        .as_deref()
+                        .map_or("the default graph".into(), |g| format!("<{g}>"))
+                )));
+            }
+            ins.entry(self.target.clone()).or_default().push(format!(
+                "{} <{RDF_TYPE}> <{}>",
+                self.focus,
+                c.as_str()
+            ));
+        }
         let mut changed = Vec::new();
         let mut touched: Vec<Term> = vec![self.focus.clone()];
         for c in &change.changes {

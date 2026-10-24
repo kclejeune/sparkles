@@ -666,3 +666,97 @@ async fn the_forms_settings_kind_chooses_shapes_and_saves() {
     assert_eq!(file["format"], 1);
     assert_eq!(file["shapes"], "graphs");
 }
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_new_instance_gets_a_minted_iri() {
+    let (_d, st, app) = server().await;
+    let get = |q: String| {
+        let app = app.clone();
+        async move { send(&app, "GET", &format!("/$/forms/people?{q}"), "", "").await }
+    };
+    let r = get(format!("class={}", enc(&format!("{EX}Person")))).await;
+    assert_eq!(
+        r.status,
+        StatusCode::OK,
+        "{}",
+        String::from_utf8_lossy(&r.body)
+    );
+    let m = r.json();
+    assert_eq!(m["focus"], J::Null);
+    assert_eq!(m["types"], json!([format!("{EX}Person")]));
+    assert_eq!(field(&m, "Name")["values"], json!([]));
+    // focus and class together, or neither, are refused
+    let r = get(format!("class=x&focus={}", enc(&format!("{EX}alice")))).await;
+    assert_eq!(r.status, StatusCode::BAD_REQUEST);
+    let r = get(String::new()).await;
+    assert_eq!(r.status, StatusCode::BAD_REQUEST);
+    let id = |p: &str| format!("<{EX}{p}>");
+    let body = json!({
+        "class": format!("{EX}Person"),
+        "changes": [
+            { "field": id("name"), "add": [lit("Carol")] },
+            { "field": id("worksFor"), "add": [{ "type": "uri", "value": format!("{EX}acme") }] },
+        ],
+        "expect": { id("name"): [], id("worksFor"): [] },
+        "message": "add Carol",
+    });
+    let r = send(
+        &app,
+        "POST",
+        "/$/forms/people/check",
+        "application/json",
+        &body.to_string(),
+    )
+    .await;
+    assert_eq!(
+        r.status,
+        StatusCode::OK,
+        "{}",
+        String::from_utf8_lossy(&r.body)
+    );
+    assert_eq!(r.json()["validation"]["conforms"], true);
+    let r = send(
+        &app,
+        "POST",
+        "/$/forms/people/save",
+        "application/json",
+        &body.to_string(),
+    )
+    .await;
+    assert_eq!(
+        r.status,
+        StatusCode::OK,
+        "{}",
+        String::from_utf8_lossy(&r.body)
+    );
+    let focus = r.json()["focus"].as_str().unwrap().to_string();
+    assert!(focus.starts_with("urn:uuid:"), "{focus}");
+    let ds = st.get("people").unwrap();
+    assert!(
+        ds.dataset
+            .ask(&format!(
+                "ASK {{ <{focus}> a <{EX}Person> ; <{EX}name> \"Carol\" }}"
+            ))
+            .unwrap()
+    );
+    // the guard rejects a new instance that misses a required field
+    let bad = json!({
+        "class": format!("{EX}Person"),
+        "changes": [{ "field": id("name"), "add": [lit("Dan")] }],
+        "expect": { id("name"): [] },
+    });
+    let r = send(
+        &app,
+        "POST",
+        "/$/forms/people/save",
+        "application/json",
+        &bad.to_string(),
+    )
+    .await;
+    assert_eq!(
+        r.status,
+        StatusCode::UNPROCESSABLE_ENTITY,
+        "{}",
+        String::from_utf8_lossy(&r.body)
+    );
+}

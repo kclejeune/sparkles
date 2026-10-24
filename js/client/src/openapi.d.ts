@@ -1008,7 +1008,7 @@ export interface paths {
         };
         /**
          * The form of a resource
-         * @description The fields that the property shapes of the node shapes targeting `focus` describe, laid out by `sh:group` and `sh:order` and labelled by `sh:name`, with the resource's values read under the caller's view, the widget of each field, the constraints the browser checks and the triples no property shape covers. Fields the caller's protections hide from reads are absent, and fields it cannot write are read-only with a `reason`. A focus no shape targets answers `200` with no fields. `save` says where a save goes, and `guard` gives the write guard's mode.
+         * @description The fields that the property shapes of the node shapes targeting `focus` describe, laid out by `sh:group` and `sh:order` and labelled by `sh:name`, with the resource's values read under the caller's view, the widget of each field, the constraints the browser checks and the triples no property shape covers. Fields the caller's protections hide from reads are absent, and fields it cannot write are read-only with a `reason`. A focus no shape targets answers `200` with no fields. With `class` instead of `focus`, the form is that of a new instance of the class, with the fields of the node shapes whose class targets select it and no values, and `focus` is `null`. `save` says where a save goes, and `guard` gives the write guard's mode.
          */
         get: operations["getForm"];
         put?: never;
@@ -11624,9 +11624,11 @@ export interface operations {
     };
     getForm: {
         parameters: {
-            query: {
-                /** @description The IRI of the resource. */
-                focus: string;
+            query?: {
+                /** @description The IRI of the resource. Give either `focus` or `class`. */
+                focus?: string;
+                /** @description The class of a new instance. */
+                class?: string;
                 /** @description Where the shapes come from, when not the dataset's `forms` setting. */
                 shapes?: "guard" | "graphs" | "drafted";
                 /** @description The language labels are picked in, then English, then untagged. */
@@ -11708,12 +11710,14 @@ export interface operations {
                         field: string;
                         remove?: Record<string, never>[];
                     }[];
+                    /** @description The class of a new instance, whose IRI the server mints from the `forms` setting's `newIri`. The change also adds the instance's `rdf:type`. */
+                    class?: string;
                     /** @description The values the form loaded, by field id, for every changed field. */
                     expect?: {
                         [key: string]: Record<string, never>[];
                     };
-                    /** @description The IRI of the resource. */
-                    focus: string;
+                    /** @description The IRI of the resource. Give either `focus` or `class`. */
+                    focus?: string;
                     /** @description The commit message. */
                     message?: string;
                     /**
@@ -11773,12 +11777,14 @@ export interface operations {
                         field: string;
                         remove?: Record<string, never>[];
                     }[];
+                    /** @description The class of a new instance, whose IRI the server mints from the `forms` setting's `newIri`. The change also adds the instance's `rdf:type`. */
+                    class?: string;
                     /** @description The values the form loaded, by field id, for every changed field. */
                     expect?: {
                         [key: string]: Record<string, never>[];
                     };
-                    /** @description The IRI of the resource. */
-                    focus: string;
+                    /** @description The IRI of the resource. Give either `focus` or `class`. */
+                    focus?: string;
                     /** @description The commit message. */
                     message?: string;
                     /**
@@ -11803,6 +11809,8 @@ export interface operations {
                         committed: boolean;
                         dataset?: string;
                         datasetId?: string;
+                        /** @description The resource saved, which for a new instance is the IRI minted for it. */
+                        focus?: string;
                         validation?: Record<string, never>;
                     };
                 };

@@ -101,23 +101,20 @@ pub(super) async fn model(
     let ds = dataset(&st, &name)?;
     let main = ds.main().unwrap_or_else(|| ds.clone());
     let params = Params::from_query(&uri);
+    let class = params
+        .get("class")
+        .map(str::trim)
+        .filter(|c| !c.is_empty())
+        .map(|c| c.trim_start_matches('<').trim_end_matches('>').to_string());
     let focus = params
         .get("focus")
         .map(str::trim)
         .filter(|f| !f.is_empty())
-        .ok_or_else(|| {
-            err(
-                StatusCode::BAD_REQUEST,
-                "missing 'focus': the IRI of a resource",
-            )
-        })?
-        .trim_start_matches('<')
-        .trim_end_matches('>')
-        .to_string();
-    if params.get("class").is_some() {
+        .map(|f| f.trim_start_matches('<').trim_end_matches('>').to_string());
+    if focus.is_some() == class.is_some() {
         return Err(err(
-            StatusCode::NOT_IMPLEMENTED,
-            "forms for new instances (class=) come with phase 2 of the forms",
+            StatusCode::BAD_REQUEST,
+            "name either 'focus', the IRI of a resource, or 'class', the class of a new instance",
         ));
     }
     let s = settings(&st, &main, params.get("shapes"))?;
@@ -132,8 +129,17 @@ pub(super) async fn model(
     let (target, exists) = save_target(&main, &s, &p, &branch)?;
     let writable = at.is_none() && may_save(&st, &p, &name, &target, exists);
     let lang = params.get("lang").map(str::to_string);
+    if class.is_some() && at.is_some() {
+        return Err(err(
+            StatusCode::BAD_REQUEST,
+            "a form for a new instance reads the head: leave out 'at'",
+        ));
+    }
     blocking(move || {
+        // a new instance's form reads an IRI minted for it, which holds nothing yet
+        let focus = focus.unwrap_or_else(|| s.mint_iri());
         let mut req = FormRequest::new(focus, s.clone());
+        req.class = class;
         req.at = at;
         req.lang = lang;
         req.writable = writable;
@@ -168,7 +174,8 @@ fn guard_json(ds: &Dataset) -> J {
 
 /// A check or save request (spec U02 §3.2).
 struct Body {
-    focus: String,
+    focus: Option<String>,
+    class: Option<String>,
     branch: Option<String>,
     shapes: Option<String>,
     changes: Vec<FieldChange>,
@@ -185,18 +192,13 @@ fn body(bytes: &[u8]) -> ApiResult<Body> {
     if let Some(k) = o.keys().find(|k| {
         !matches!(
             k.as_str(),
-            "focus" | "branch" | "shapes" | "changes" | "expect" | "message"
+            "focus" | "class" | "branch" | "shapes" | "changes" | "expect" | "message"
         )
     }) {
         return Err(bad(format!(
-            "unknown member '{k}': focus, branch, shapes, changes, expect and message"
+            "unknown member '{k}': focus, class, branch, shapes, changes, expect and message"
         )));
     }
-    let focus = o
-        .get("focus")
-        .and_then(J::as_str)
-        .ok_or_else(|| bad("focus: the IRI of the resource".into()))?
-        .to_string();
     let string = |k: &str| -> ApiResult<Option<String>> {
         match o.get(k) {
             None | Some(J::Null) => Ok(None),
@@ -246,8 +248,17 @@ fn body(bytes: &[u8]) -> ApiResult<Body> {
         }
         Some(_) => return Err(bad("expect: an object of field ids to terms".into())),
     }
+    let focus = string("focus")?.filter(|f| !f.is_empty());
+    let class = string("class")?.filter(|c| !c.is_empty());
+    if focus.is_some() == class.is_some() {
+        return Err(bad(
+            "name either focus, the IRI of the resource, or class, the class of a new instance"
+                .into(),
+        ));
+    }
     Ok(Body {
         focus,
+        class,
         branch: string("branch")?,
         shapes: string("shapes")?,
         changes,
@@ -377,7 +388,9 @@ async fn prepare(
         branch,
         created,
         change: FormChange {
-            focus: b.focus,
+            // a new instance takes an IRI minted from the forms setting
+            focus: b.focus.unwrap_or_else(|| s.mint_iri()),
+            class: b.class,
             changes: b.changes,
             expect: b.expect,
             message: b.message,
@@ -483,6 +496,7 @@ pub(super) async fn save(
                     }
                 }
                 j["dataset"] = json!(pr.ds.name);
+                j["focus"] = json!(pr.change.focus);
                 j["branch"] = json!(pr.branch);
                 j["branchCreated"] = json!(pr.created);
                 let validation = receipt.validation.clone().filter(|_| !pr.restricted);
