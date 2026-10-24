@@ -808,8 +808,8 @@ order and inherits the resolved `summarize` list when neither layer explicitly
 configures `community`. An explicit empty list disables the role. Configuration,
 server/dataset precedence and UI guidance have focused regression tests.
 
-Phase 1 is implemented, and its acceptance runs against paid providers wait for the
-user's approval. A build reads the projection as the settings' principal, which must be
+Phase 1 is implemented, and its acceptance runs against a paid provider passed on
+2026-10-24, as the section on them below records. A build reads the projection as the settings' principal, which must be
 allowed to query the dataset on the run's branch. It computes the Leiden hierarchy with
 stable identities, writes one report per community through the `community` role with
 the checks of §3.4, and stores communities, reports, findings, citations and their
@@ -923,6 +923,44 @@ grouping is unavailable, and learns no report identity, title or count, nor whet
 report exists. It reads main, and `at` reads the reports of that point of main. The
 Communities tab and the overview link to each other, and the overview shows a report
 through the same component as the tab.
+
+### Paid acceptance and evaluation (2026-10-24)
+
+The acceptance examples that need a real model ran on 2026-10-24 with Claude Sonnet 5.5
+in the `community` and `summarize` roles at effort `medium`, through
+`scripts/eval-graphrag` and its capped ledger. The first attempt failed on every report,
+because Anthropic's structured output refuses `maxItems` and the other length, count and
+numeric bounds of the report schema with a 400. The client now leaves those bounds out
+of an Anthropic request, and the local validator checks them all, including `minimum`
+and `maximum`, so an answer outside them costs one retry.
+
+The second attempt passed A3, A4 and A8 and failed A6 and A7, because the map step of a
+global answer gave no points. Ask read the 27 reports of the finest level, and Sonnet
+answered with one empty point scored 0. `serde_json` sorts the members of an object, so
+the schema reached the provider with a point's members in the order `findings`,
+`reports`, `score` and `text`, and constrained decoding writes members in the order the
+schema lists them. The model therefore had to list a point's findings before it stated
+the point. Resent unchanged, the recorded request gave no points in two of two tries.
+With `text` first it gave five or six scored points in four of four. A schema object can
+now name the order of its properties with `x-sparkles-order`. The client sends that order
+and never sends the keyword, and the map and reduce schemas put the text before the
+labels. The other schemas keep the sorted order they were measured with, and roadmap
+item 264 checks whether an explicit order helps them too.
+
+The third attempt, on the binary of commit 847d8d0b, passed all six examples. A1 wrote
+two reports for the two clusters, and every one of their 72 cited facts has a member as
+its subject. Two of those facts are the edge between the clusters, which §3.2 sends to
+both communities as an edge to another community. A3 kept both communities and wrote
+nothing. A4 rewrote one report as a revision of the old one, and `status` had not shown
+it stale beforehand, because a manual refresh compares digests when it runs. A8 stopped
+with one community pending after one request. A6 classified the question `global` and
+answered from 17 reports with five point markers, each resolving to findings. In A7 the
+question without reviewed reports took the local path, where the draft asked which
+reading of "areas of work" was meant, and with three reviewed reports the answer used
+exactly those three. The three attempts cost $0.023, $0.744 and $0.730, and the probes of
+the map request cost $0.461.
+
+The evaluation of §9 runs on the same binary and is not finished.
 
 ### Shared memory representation follow-up
 
