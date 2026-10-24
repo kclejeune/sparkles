@@ -420,6 +420,7 @@ pub(super) fn add_all(p: &mut Paths) {
     datasets(p);
     fuseki(p);
     schema(p);
+    forms(p);
     admin(p);
     queries(p);
     algorithms(p);
@@ -434,6 +435,107 @@ pub(super) fn add_all(p: &mut Paths) {
     auth(p);
     protocol(p);
     openapi(p);
+}
+
+/// Editing forms generated from SHACL shapes (U02).
+fn forms(p: &mut Paths) {
+    let term = json!({ "type": "object", "description": "A term in the SPARQL JSON results form: `{\"type\": \"uri\", \"value\": …}` or `{\"type\": \"literal\", \"value\": …, \"datatype\"?: …, \"xml:lang\"?: …}`." });
+    let change = json!({ "application/json": { "schema": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["focus", "changes"],
+        "properties": {
+            "focus": { "type": "string", "description": "The IRI of the resource." },
+            "branch": { "type": "string", "description": "The branch the form was opened on. A form opened on `main` saves where the dataset's `forms` setting says, which may be the caller's session branch." },
+            "shapes": { "type": "string", "enum": ["guard", "graphs", "drafted"], "description": "The shapes the form was built from, when not the setting's." },
+            "changes": { "type": "array", "items": { "type": "object", "required": ["field"], "properties": {
+                "field": { "type": "string", "description": "The field's id, its path in SPARQL syntax." },
+                "remove": { "type": "array", "items": term },
+                "add": { "type": "array", "items": term }
+            } } },
+            "expect": { "type": "object", "additionalProperties": { "type": "array", "items": term }, "description": "The values the form loaded, by field id, for every changed field." },
+            "message": { "type": "string", "description": "The commit message." }
+        }
+    } } });
+    p.add(
+        op(GET, "/$/forms/{ds}", "getForm", "Validation", "The form of a resource")
+            .doc("The fields that the property shapes of the node shapes targeting `focus` describe, laid out by `sh:group` and `sh:order` and labelled by `sh:name`, with the resource's values read under the caller's view, the widget of each field, the constraints the browser checks and the triples no property shape covers. Fields the caller's protections hide from reads are absent, and fields it cannot write are read-only with a `reason`. A focus no shape targets answers `200` with no fields. `save` says where a save goes, and `guard` gives the write guard's mode.")
+            .see("editing-forms")
+            .query_req("focus", s(), "The IRI of the resource.")
+            .query("shapes", json!({ "type": "string", "enum": ["guard", "graphs", "drafted"] }), "Where the shapes come from, when not the dataset's `forms` setting.")
+            .query("lang", s(), "The language labels are picked in, then English, then untagged.")
+            .params(&["branch", "at", "timeout"])
+            .resp(
+                "200",
+                "The form model.",
+                Some(json!({ "application/json": { "schema": {
+                    "type": "object",
+                    "required": ["formFormat", "focus", "types", "commit", "branch", "editable", "shapes", "groups", "fields", "other", "graph", "closed", "save"],
+                    "properties": {
+                        "formFormat": { "type": "integer", "enum": [1] },
+                        "focus": { "type": ["string", "null"] },
+                        "types": { "type": "array", "items": { "type": "string" } },
+                        "commit": { "type": "integer" },
+                        "branch": { "type": "string" },
+                        "editable": { "type": "boolean", "description": "The caller may save changes through this form." },
+                        "shapes": { "type": "object", "description": "`{source, nodeShapes, missing?, unknownHints}`." },
+                        "groups": { "type": "array", "items": { "type": "object", "description": "`{iri, label, order}`." } },
+                        "fields": { "type": "array", "items": { "type": "object", "description": "`{id, path, inverse, editable, reason?, label, description?, group, order, widget, editor?, viewer?, constraints, sources, values}`, where each value is `{term, graph, label?, readOnly?}`." } },
+                        "other": { "type": "array", "items": { "type": "object", "description": "`{predicate, values}`." } },
+                        "graph": { "type": ["string", "null"], "description": "The graph new values go into, `null` for the default graph." },
+                        "closed": { "type": "boolean" },
+                        "save": { "type": "object", "description": "`{to, branch, exists, mainProtected}`: `to` is `main` or `branch`." },
+                        "guard": { "type": ["object", "null"], "description": "`{language, mode}` of the write guard." }
+                    }
+                } } })),
+            )
+            .errors(&[400, 403, 404, 408, 501]),
+    );
+    p.add(
+        op(POST, "/$/forms/{ds}/check", "checkForm", "Validation", "Check a form's changes")
+            .doc("Turns the changes into one update of `DELETE DATA` and `INSERT DATA`, runs it as a dry run and validates the nodes it touches at the state it would make against the form's shapes, whether or not the dataset has a guard. The answer is `200` with the write preview, the update, and the validation results, each with the `field` it belongs to or `null`. A caller whose view hides part of the data gets no validation (`withheld`), as the validation routes refuse such callers. It needs write on the branch, through the update endpoint.")
+            .see("editing-forms")
+            .body(true, "The changes.", change.clone())
+            .resp(
+                "200",
+                "The preview and the validation.",
+                Some(json!({ "application/json": { "schema": {
+                    "type": "object",
+                    "required": ["branch", "preview", "update", "validation"],
+                    "properties": {
+                        "branch": { "type": "string" },
+                        "preview": { "type": "object", "description": "The dry run, as a write preview answers it." },
+                        "update": { "type": "string" },
+                        "validation": { "type": "object", "description": "`{checked, withheld, timedOut, conforms, results}`." }
+                    }
+                } } })),
+            )
+            .errors(&[400, 403, 404, 408]),
+    );
+    p.add(
+        op(POST, "/$/forms/{ds}/save", "saveForm", "Validation", "Save a form's changes")
+            .doc("Commits the changes as one update with the message, when the stored values of every changed field are still those `expect` names, compared under the writer lock. Otherwise it answers `409` with code `form-conflict` and the fields with their stored values `now`. The write guard runs as for any write. A save of a form opened on `main` while the `forms` setting sends saves to a branch creates the caller's session branch from `main`'s head when it does not exist.")
+            .see("editing-forms")
+            .body(true, "The changes.", change)
+            .resp(
+                "200",
+                "The commit receipt.",
+                Some(json!({ "application/json": { "schema": {
+                    "type": "object",
+                    "required": ["committed", "commit", "branch", "branchCreated"],
+                    "properties": {
+                        "committed": { "type": "boolean" },
+                        "commit": { "type": "object" },
+                        "branch": { "type": "string" },
+                        "branchCreated": { "type": "boolean" },
+                        "dataset": { "type": "string" },
+                        "datasetId": { "type": "string" },
+                        "validation": { "type": "object" }
+                    }
+                } } })),
+            )
+            .errors(&[400, 403, 404, 408, 409, 422, 507]),
+    );
 }
 
 fn server(p: &mut Paths) {

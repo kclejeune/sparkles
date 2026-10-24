@@ -34,6 +34,10 @@ mod diff;
 mod dry_run;
 #[cfg(feature = "fmt")]
 mod format;
+#[cfg(feature = "shacl")]
+mod forms;
+#[cfg(feature = "shacl")]
+use forms::{check as forms_check, model as forms_model, save as forms_save};
 pub(crate) mod fuseki;
 mod graph;
 #[cfg(feature = "graphql")]
@@ -131,6 +135,9 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route("/$/schema/{ds}/diff", get(schema::diff))
         .route("/$/graph/{ds}/groups", post(graph::groups))
         .route("/$/graph/{ds}/facets", post(graph::facets))
+        .route("/$/forms/{ds}", get(forms_model))
+        .route("/$/forms/{ds}/check", post(forms_check))
+        .route("/$/forms/{ds}/save", post(forms_save))
         .route("/$/compact/{ds}", post(compact))
         .route("/$/backup/{ds}", post(backup))
         .route(
@@ -5388,6 +5395,24 @@ fn shacl_target(
 }
 
 #[cfg(not(feature = "shacl"))]
+async fn forms_model() -> ApiResult {
+    Err(err(
+        StatusCode::NOT_IMPLEMENTED,
+        "built without the `shacl` feature",
+    ))
+}
+
+#[cfg(not(feature = "shacl"))]
+async fn forms_check() -> ApiResult {
+    forms_model().await
+}
+
+#[cfg(not(feature = "shacl"))]
+async fn forms_save() -> ApiResult {
+    forms_model().await
+}
+
+#[cfg(not(feature = "shacl"))]
 async fn shacl() -> ApiResult {
     Err(err(
         StatusCode::NOT_IMPLEMENTED,
@@ -5403,6 +5428,8 @@ mod compress_tests;
 mod diff_tests;
 #[cfg(test)]
 mod dry_run_tests;
+#[cfg(all(test, feature = "shacl"))]
+mod forms_tests;
 #[cfg(test)]
 mod history_tests;
 #[cfg(test)]

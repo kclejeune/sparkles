@@ -67,6 +67,10 @@ pub const ROUTES: &[(&str, &[&str])] = &[
     ("/$/schema/{ds}/diff", &["GET"]),
     ("/$/graph/{ds}/groups", &["POST"]),
     ("/$/graph/{ds}/facets", &["POST"]),
+    // editing forms (U02): the check and the save check write on the branch they name
+    ("/$/forms/{ds}", &["GET"]),
+    ("/$/forms/{ds}/check", &["POST"]),
+    ("/$/forms/{ds}/save", &["POST"]),
     ("/$/compact/{ds}", &["POST"]),
     ("/$/backup/{ds}", &["POST"]),
     ("/$/reason/{ds}", &["GET", "POST", "DELETE"]),
@@ -400,6 +404,10 @@ pub fn need(route: &str, method: &Method, uri: &Uri, headers: &HeaderMap) -> Opt
         | "/$/schema/{ds}/diff"
         | "/$/graph/{ds}/groups"
         | "/$/graph/{ds}/facets"
+        // a check or a save names its branch in the body: the handlers check write on it
+        | "/$/forms/{ds}"
+        | "/$/forms/{ds}/check"
+        | "/$/forms/{ds}/save"
         | "/$/reason/{ds}/diagnostics"
         | "/$/prefixes/{ds}"
         | "/$/commits/{ds}"
@@ -547,7 +555,9 @@ pub fn endpoint(route: &str, method: &Method, uri: &Uri, headers: &HeaderMap) ->
         | "/{ds}/geo"
         | "/{ds}/queries/{name}"
         | "/$/graph/{ds}/groups"
-        | "/$/graph/{ds}/facets" => Endpoint::Query,
+        | "/$/graph/{ds}/facets"
+        | "/$/forms/{ds}" => Endpoint::Query,
+        "/$/forms/{ds}/check" | "/$/forms/{ds}/save" => Endpoint::Update,
         "/{ds}/graphql" | "/{ds}/graphql/schema" => Endpoint::Graphql,
         "/{ds}/update" | "/{ds}/facts" => Endpoint::Update,
         "/{ds}/sources" if get => Endpoint::Query,

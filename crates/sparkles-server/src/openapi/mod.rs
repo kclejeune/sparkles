@@ -498,13 +498,14 @@ fn parameters() -> Map<String, J> {
     );
     let mut kind = path(
         "kind",
-        "The settings kind: `assistant`, `memory`, `ingest` or `graphrag` of a dataset, or `models` or `notifications` of the server.",
+        "The settings kind: `assistant`, `memory`, `ingest`, `graphrag` or `forms` of a dataset, or `models` or `notifications` of the server.",
     );
     kind["schema"]["enum"] = json!([
         "assistant",
         "memory",
         "ingest",
         "graphrag",
+        "forms",
         "models",
         "notifications"
     ]);
@@ -939,7 +940,7 @@ fn tags() -> J {
         ),
         t(
             "Validation",
-            "SHACL and ShEx validation, and write-time validation.",
+            "SHACL and ShEx validation, write-time validation and editing forms generated from shapes.",
             "write-time-validation"
         ),
         t("Tasks", "Background tasks.", "datasets-admin"),
