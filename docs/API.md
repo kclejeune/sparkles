@@ -2872,7 +2872,10 @@ directory as `views/{name}/view.json`, and the state is checkpointed beside them
 Unknown members are refused. A query outside the incremental fragment is refused with
 `400 not-incremental` and names the construct: `NOW`, `RAND`, `UUID`, `STRUUID`, `BNODE`,
 any `SERVICE`, full-text, vector and spatial search, `DESCRIBE`, and a `GRAPH` block in a
-CONSTRUCT template. `ORDER BY` without `LIMIT` does not change a view's rows and is
+CONSTRUCT template. A dataset with RDFS on read, or whose materialized inferences join
+the default graph, refuses every view and live query the same way, because a view reads
+the stored quads. Views and live queries never read the graphs that a disclosure guard
+protects. `ORDER BY` without `LIMIT` does not change a view's rows and is
 ignored. Operators that the circuit cannot maintain run as
 `recompute` nodes, which evaluate their subtree again at each commit that touches it and
 subtract the previous output. Property paths with `*`, `+` or `?`, `LIMIT` and
@@ -2883,7 +2886,7 @@ operator `incremental` or `recompute`, with the reason.
 | Method | Path | Needs | Description |
 |---|---|---|---|
 | GET | `/$/views/{ds}` | `read` | `{dataset, views: [...]}`, each view with its definition and state but without its plan. |
-| GET | `/$/views/{ds}/{name}` | `read` | The view with its state, its columns, its rows counted with multiplicity, `stateBytes`, the passes run and skipped, `passMs`, `recomputeMs` and its plan. |
+| GET | `/$/views/{ds}/{name}` | `read` | The view with its state, its columns, its rows counted with multiplicity, `stateBytes`, the passes run and skipped, `passMs`, `recomputeMs` and its plan. A caller who may not read the view's rows gets neither `rows` nor `stateBytes`, here or in the list. |
 | PUT | `/$/views/{ds}/{name}` | `admin` | Defines or replaces the view and starts its first evaluation as a `view-build` task. `201` for a new view, `200` otherwise, with the plan and `task`. |
 | DELETE | `/$/views/{ds}/{name}` | `admin` | Removes the view and its state (`204`). |
 | POST | `/$/views/{ds}/{name}/rebuild` | `admin` | Evaluates the view again from scratch as a task and lifts a suspension (`202`). |
@@ -2905,9 +2908,11 @@ SELECT ?team ?n WHERE {
 ```
 
 Each variable of `view:bind` reads the view's column of the same name, and the rows come
-with their multiplicities. `view:commit` binds the commit the rows reflect. A read at a
-commit the view has not reached waits up to 2 seconds and then fails with
-`503 view-behind` and `Retry-After`. `view:allowStale true` reads the latest state
+with their multiplicities. `view:commit` binds the commit the rows reflect, which is the
+query's own commit. A read at a commit the view has not reached waits up to 2 seconds
+and then fails with `503 view-behind` and `Retry-After`. A view that has moved past the
+query's commit is read back to it from its recent diffs or by evaluating its query at
+that commit, and `503 view-ahead` answers when neither is possible. `view:allowStale true` reads the latest state
 instead. A suspended view answers `503 view-suspended`, and an unknown one
 `404 view-not-found`.
 

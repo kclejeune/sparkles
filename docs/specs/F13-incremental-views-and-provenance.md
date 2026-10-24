@@ -776,19 +776,28 @@ of F16's derived-fact layer if F16 chooses it.
   the aggregates other than `COUNT`, `SUM` and `AVG`, correlated `EXISTS`, `LATERAL` and
   ARQ's other extensions, triple terms, property functions, and `MINUS`, aggregates,
   `DISTINCT`, `VALUES` and subqueries under `GRAPH ?g`. `ORDER BY` without `LIMIT` does not change a view's rows and is ignored.
-- `SUM` and `AVG` keep exact integer and decimal sums, and value counts for floats and
-  doubles, whose sums depend on order.
+- `SUM` and `AVG` keep an exact integer sum, and value counts for decimals, floats and
+  doubles. A decimal sum whose positive or negative values pass the decimal range is
+  unbound, as an overflow in a one-off evaluation is.
 - A CONSTRUCT template's blank nodes are minted as `_:v` and a hex hash of the template's
-  label and the solution's terms, so a solution that returns gives the same node.
+  label and the solution's terms, so a solution that returns gives the same node. A
+  solution that occurs twice gives two nodes, because the template keeps each solution's
+  count and hashes the number of each occurrence after the first.
 - Views and live queries with the same normalized query text and the same access
   fingerprint share one circuit. The parser's random names of aggregate variables are
   renamed in the text, so one query parsed twice gives one circuit and one checkpoint
   fingerprint.
 - Protections that depend on the data make the whole query one `recompute` node over the
-  masked snapshot, as §6.2 allows for Phase 1. Graph grants and protections by predicate
-  filter the changes quad by quad.
+  masked snapshot, as §6.2 allows for Phase 1. Any change runs it again, even one in a
+  graph the principal cannot read, because such a change can alter what the protection
+  hides. Graph grants and protections by predicate filter the changes quad by quad.
+- Circuits never read the graphs a disclosure guard protects (C22 §6.3). A request
+  decides a guard at its own snapshot, and a circuit cannot decide it again at each
+  commit, so every circuit and every access fingerprint treat a guard as exempting
+  nothing. Item 227 tracks proving guards in circuits.
 - A caller reads a view when it reads every quad of the dataset or has the same access
-  fingerprint as the view's principal. Comparing grant sets for containment and the
+  fingerprint as the view's principal. A caller who cannot read a view still sees its
+  definition and state through `GET /$/views/{ds}`, without `rows` and `stateBytes`. Comparing grant sets for containment and the
   `view:{name}` grant that declassifies a view are left to item 222.
 - A view's principal is a configured user, resolved through the server's policy when
   the view is attached and again after each policy reload. A definer whose grants cover
@@ -799,6 +808,12 @@ of F16's derived-fact layer if F16 chooses it.
   history. A6 holds. A7 holds only when neither covers the gap, for example after a
   compaction with the change log off. The view is then `building` until the pass that
   evaluates it again ends.
+- `SERVICE view:read` returns the view's rows at the query's commit. When a pass has
+  moved the view past that commit, the rows are rewound with the view's recent diffs,
+  which a circuit with views keeps for 16 commits, or else the view's query is evaluated
+  at the query's snapshot. A read that has neither fails with `503 view-ahead`.
+- A diff's `from` is the commit of the subscriber's previous event, so commits that
+  leave the result alone do not break the chain.
 - A live query resumed after commit N gets the merged diffs the circuit kept since N
   (256 commits and 1M rows at most). Otherwise the query is evaluated at the snapshot
   before the changes since N and compared with the current result, and when those
@@ -820,8 +835,10 @@ of F16's derived-fact layer if F16 chooses it.
 **Deviations.**
 
 - Views read the stored quads. RDFS on read refuses views and live queries as §4.5 says,
-  but the inferred graph that a materialization adds to the default graph is not part of
-  a view's default graph. Item 221 tracks it.
+  and so does a materialization whose inferred graph joins the default graph, since a
+  circuit's default graph leaves it out. When either is turned on later, the views are
+  detached with an error and live queries end with a `not-incremental` event. Item 221
+  tracks reading the inferred graph in circuits.
 - Backups and clones do not carry view definitions, because the backup layout has no
   path for nested settings files. Item 220 tracks it.
 - PUT starts a `view-build` task that waits for the first evaluation on the worker,

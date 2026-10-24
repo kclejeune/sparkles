@@ -277,10 +277,11 @@ that work by priority and links each item to its design spec.
 * **Incremental views remainder.** Views are `table` views on `main`, maintained after
   the commit. `graph` views, maintenance inside the commit, the WebSocket, MCP, the Node
   and JVM APIs, the UI, views per branch, ordered windows and provenance are later phases
-  of F13. Backups and clones do not carry view definitions, a view's default graph leaves
-  out materialized inferences, a caller reads a view only with the principal's exact
-  access or full access, passes run on one thread per dataset, and the live query limits
-  count per dataset. [Roadmap](ROADMAP.md) items 17 and 220 to 224.
+  of F13. Backups and clones do not carry view definitions, a dataset whose materialized
+  inferences join the default graph refuses views, a caller reads a view only with the
+  principal's exact access or full access, passes run on one thread per dataset, the
+  live query limits count per dataset, and circuits never read graphs that a disclosure
+  guard protects. [Roadmap](ROADMAP.md) items 17, 220 to 224 and 227.
 
 * **Editing forms remainder.** Forms edit predicate and inverse paths with literal and IRI
   values. Blank node values with `dash:DetailsEditor`, list editors for `sh:memberShape`
