@@ -20,11 +20,23 @@
 //! atomic-write guard also keeps a checkpoint from declaring a metadata replacement
 //! clean while that replacement is still being written or renamed.
 //!
+//! A checkpoint synchronizes only the files finished or replaced since they were last
+//! synchronized, which the directory records as they finish. Tantivy never changes a
+//! finished file, and it replaces metadata by renaming a new file over the old name, so a
+//! file that one pass synchronized stays durable, and a replacement is recorded again. A
+//! pass that fails puts its files back. A directory opened with its marker present may hold
+//! unsynchronized files from an earlier process, so its first checkpoint synchronizes every
+//! file, as every checkpoint did before. The parent directory is synchronized when a file
+//! was created, renamed or removed since the last synchronization of it. A checkpoint that a
+//! write raced therefore still makes progress, and the next one has only the files written
+//! during it left to synchronize.
+//!
 //! The pathname lease serializes checkpoints with directory replacement. It does not
 //! stop Tantivy publication. The checkpoint streams file handles rather than pinning
 //! every segment at once, so its handle count does not grow with the index.
 
 use parking_lot::{Mutex, MutexGuard};
+use std::collections::HashSet;
 use std::fs::{File, OpenOptions};
 use std::io::{self, BufWriter, Write};
 use std::path::{Path, PathBuf};
@@ -44,6 +56,20 @@ struct State {
     marked: bool,
     /// its unlink happened, but synchronizing the parent directory has not succeeded
     marker_sync_pending: bool,
+    /// files finished or replaced since a checkpoint last synchronized them, by name
+    unsynced: HashSet<PathBuf>,
+    /// any file may be unsynchronized: the marker was present when the directory opened
+    all_unsynced: bool,
+    /// a file was created, renamed or removed since the directory was last synchronized
+    dir_unsynced: bool,
+}
+
+/// What one checkpoint pass synchronizes, taken from [`State`] at its start and put back
+/// when the pass fails.
+struct Pending {
+    files: Vec<PathBuf>,
+    all: bool,
+    dir: bool,
 }
 
 struct Shared {
@@ -53,6 +79,9 @@ struct Shared {
     checkpoint: Mutex<()>,
     #[cfg(test)]
     hooks: Mutex<std::collections::BTreeMap<TestPoint, TestHook>>,
+    /// the names each checkpoint pass synchronized, in order, for tests
+    #[cfg(test)]
+    synced: Mutex<Vec<PathBuf>>,
 }
 
 #[cfg(test)]
@@ -99,10 +128,15 @@ impl LazySyncDir {
                     atomic_writes: 0,
                     marked,
                     marker_sync_pending: false,
+                    unsynced: HashSet::new(),
+                    all_unsynced: marked,
+                    dir_unsynced: marked,
                 }),
                 checkpoint: Mutex::new(()),
                 #[cfg(test)]
                 hooks: Mutex::new(Default::default()),
+                #[cfg(test)]
+                synced: Mutex::new(Vec::new()),
             }),
         })
     }
@@ -157,10 +191,28 @@ impl LazySyncDir {
         }
     }
 
-    /// Note a write that `meta.json` may come to refer to; mark the index first.
-    fn wrote(&self) -> io::Result<()> {
+    /// Note a finished file that `meta.json` may come to refer to; mark the index first.
+    /// The name is recorded in the same critical section as the write count, so a
+    /// checkpoint that misses the name also sees the count change.
+    fn finished(&self, path: &Path) -> io::Result<()> {
         let mut s = self.shared.state.lock();
-        self.mark_write(&mut s)
+        self.mark_write(&mut s)?;
+        s.unsynced.insert(path.to_path_buf());
+        s.dir_unsynced = true;
+        Ok(())
+    }
+
+    /// How many files the next checkpoint pass would synchronize, or `None` when it
+    /// would synchronize every file of the directory.
+    pub(crate) fn unsynced_files(&self) -> Option<usize> {
+        let s = self.shared.state.lock();
+        (!s.all_unsynced).then_some(s.unsynced.len())
+    }
+
+    /// The names synchronized by checkpoint passes since the last call, for tests.
+    #[cfg(test)]
+    pub(crate) fn take_synced(&self) -> Vec<PathBuf> {
+        std::mem::take(&mut self.shared.synced.lock())
     }
 
     fn mark_write(&self, s: &mut State) -> io::Result<()> {
@@ -176,11 +228,11 @@ impl LazySyncDir {
         Ok(())
     }
 
-    fn atomic_write_started(&self) -> io::Result<AtomicWrite<'_>> {
+    fn atomic_write_started(&self, path: &Path) -> io::Result<AtomicWrite<'_>> {
         let mut state = self.shared.state.lock();
         self.mark_write(&mut state)?;
         state.atomic_writes += 1;
-        Ok(AtomicWrite(&self.shared))
+        Ok(AtomicWrite(&self.shared, path.to_path_buf()))
     }
 
     /// Capture the write counter before releasing the text live mutex. The lease
@@ -206,31 +258,63 @@ impl LazySyncDir {
         self.prepare_checkpoint().run().map(|_| ())
     }
 
-    fn sync_files(&self) -> io::Result<()> {
-        for entry in std::fs::read_dir(&self.shared.root)? {
-            let entry = entry?;
-            if entry.file_type()?.is_file() {
-                match File::open(entry.path()) {
-                    Ok(f) => {
-                        #[cfg(test)]
-                        {
-                            self.run_hook(TestPoint::CheckpointFileSync)?;
-                            if let Some(root) = self.shared.marker.parent() {
-                                crate::store::text_recovery::hook(
-                                    root,
-                                    "text-checkpoint-file-sync",
-                                );
-                            }
-                        }
-                        f.sync_data()?;
+    /// Take what the next pass must synchronize. The caller holds the pathname lease,
+    /// so no other pass takes names between this and the pass's end.
+    fn take_pending(&self) -> Pending {
+        let mut s = self.shared.state.lock();
+        Pending {
+            files: s.unsynced.drain().collect(),
+            all: std::mem::take(&mut s.all_unsynced),
+            dir: std::mem::take(&mut s.dir_unsynced),
+        }
+    }
+
+    /// Put back what a failed pass took, so a retry synchronizes it.
+    fn restore_pending(&self, pending: Pending) {
+        let mut s = self.shared.state.lock();
+        s.unsynced.extend(pending.files);
+        s.all_unsynced |= pending.all;
+        s.dir_unsynced |= pending.dir;
+    }
+
+    fn sync_file(&self, path: &Path) -> io::Result<()> {
+        match File::open(self.shared.root.join(path)) {
+            Ok(f) => {
+                #[cfg(test)]
+                {
+                    self.run_hook(TestPoint::CheckpointFileSync)?;
+                    if let Some(root) = self.shared.marker.parent() {
+                        crate::store::text_recovery::hook(root, "text-checkpoint-file-sync");
                     }
-                    // deleted meanwhile (merge garbage collection)
-                    Err(e) if e.kind() == io::ErrorKind::NotFound => {}
-                    Err(e) => return Err(e),
+                }
+                f.sync_data()?;
+                #[cfg(test)]
+                self.shared.synced.lock().push(path.to_path_buf());
+                Ok(())
+            }
+            // deleted meanwhile (merge garbage collection)
+            Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(()),
+            Err(e) => Err(e),
+        }
+    }
+
+    fn sync_files(&self, pending: &Pending) -> io::Result<()> {
+        if pending.all {
+            for entry in std::fs::read_dir(&self.shared.root)? {
+                let entry = entry?;
+                if entry.file_type()?.is_file() {
+                    self.sync_file(Path::new(&entry.file_name()))?;
                 }
             }
+        } else {
+            for path in &pending.files {
+                self.sync_file(path)?;
+            }
         }
-        sync_dir(&self.shared.root)
+        if pending.all || pending.dir {
+            sync_dir(&self.shared.root)?;
+        }
+        Ok(())
     }
 
     fn sync_marker_parent(&self) -> io::Result<()> {
@@ -246,11 +330,17 @@ impl LazySyncDir {
 /// This guard covers temporary-file creation through the metadata rename. In
 /// particular, a write that began before a checkpoint's counter snapshot cannot let
 /// that checkpoint declare the replacement metadata durable before it is published.
-struct AtomicWrite<'a>(&'a Shared);
+/// Its target is recorded as unsynchronized only when the guard drops, after the rename,
+/// so that a pass which synchronized the old file under that name cannot take the record
+/// of the new one. A pass that ran meanwhile saw the guard and kept the marker.
+struct AtomicWrite<'a>(&'a Shared, PathBuf);
 
 impl Drop for AtomicWrite<'_> {
     fn drop(&mut self) {
-        self.0.state.lock().atomic_writes -= 1;
+        let mut s = self.0.state.lock();
+        s.atomic_writes -= 1;
+        s.unsynced.insert(std::mem::take(&mut self.1));
+        s.dir_unsynced = true;
     }
 }
 
@@ -276,7 +366,11 @@ impl Checkpoint<'_> {
             return Ok(!state.marked && !state.marker_sync_pending);
         };
         if before.marked {
-            self.dir.sync_files()?;
+            let pending = self.dir.take_pending();
+            if let Err(e) = self.dir.sync_files(&pending) {
+                self.dir.restore_pending(pending);
+                return Err(e);
+            }
         }
         let mut s = self.dir.shared.state.lock();
         if before.active == 0 && s.atomic_writes == 0 && s.writes == before.writes {
@@ -306,6 +400,7 @@ impl Checkpoint<'_> {
 /// A file written without fsync; finishing it marks the directory.
 struct LazyFile {
     file: File,
+    path: PathBuf,
     dir: LazySyncDir,
 }
 
@@ -322,7 +417,7 @@ impl Write for LazyFile {
 impl TerminatingWrite for LazyFile {
     fn terminate_ref(&mut self, _: AntiCallToken) -> io::Result<()> {
         self.file.flush()?;
-        self.dir.wrote()
+        self.dir.finished(&self.path)
     }
 }
 
@@ -332,7 +427,9 @@ impl Directory for LazySyncDir {
     }
 
     fn delete(&self, path: &Path) -> Result<(), DeleteError> {
-        self.inner.delete(path)
+        self.inner.delete(path)?;
+        self.shared.state.lock().dir_unsynced = true;
+        Ok(())
     }
 
     fn exists(&self, path: &Path) -> Result<bool, OpenReadError> {
@@ -353,6 +450,7 @@ impl Directory for LazySyncDir {
             })?;
         Ok(BufWriter::new(Box::new(LazyFile {
             file,
+            path: path.to_path_buf(),
             dir: self.clone(),
         })))
     }
@@ -362,7 +460,7 @@ impl Directory for LazySyncDir {
     }
 
     fn atomic_write(&self, path: &Path, data: &[u8]) -> io::Result<()> {
-        let _publication = self.atomic_write_started()?;
+        let _publication = self.atomic_write_started(path)?;
         #[cfg(test)]
         self.run_hook(TestPoint::AtomicMarked)?;
         let target = self.shared.root.join(path);
@@ -483,6 +581,143 @@ mod tests {
             dir.atomic_read(Path::new("meta.json")).unwrap(),
             br#"{"segment":"old.seg","revision":2}"#
         );
+    }
+
+    fn names(paths: &[PathBuf]) -> std::collections::BTreeSet<String> {
+        paths
+            .iter()
+            .map(|p| p.to_string_lossy().into_owned())
+            .collect()
+    }
+
+    fn finish(dir: &LazySyncDir, name: &str) {
+        let mut file = dir.open_write(Path::new(name)).unwrap();
+        file.write_all(name.as_bytes()).unwrap();
+        file.terminate().unwrap();
+    }
+
+    /// A pass that a write raced keeps the marker but not the work it did: the next pass
+    /// synchronizes only the file written during the first.
+    #[test]
+    fn a_raced_pass_keeps_its_progress() {
+        let (_root, dir) = directory();
+        let (entered, release) = pause(&dir, TestPoint::CheckpointFileSync);
+        let checkpoint_dir = dir.clone();
+        let checkpoint = std::thread::spawn(move || checkpoint_dir.prepare_checkpoint().run());
+        let reached = entered.recv_timeout(Duration::from_secs(5));
+        if reached.is_ok() {
+            finish(&dir, "new.seg");
+        }
+        let _ = release.send(());
+        let clean = checkpoint.join().unwrap().unwrap();
+        reached.unwrap();
+        assert!(!clean);
+        assert!(dir.is_marked());
+        assert_eq!(
+            names(&dir.take_synced()),
+            ["meta.json", "old.seg"].map(String::from).into()
+        );
+        assert!(dir.prepare_checkpoint().run().unwrap());
+        assert!(!dir.is_marked());
+        assert_eq!(names(&dir.take_synced()), ["new.seg".to_string()].into());
+        // a clean directory has nothing left to synchronize
+        assert!(dir.prepare_checkpoint().run().unwrap());
+        assert!(dir.take_synced().is_empty());
+    }
+
+    /// Metadata replaced while a pass runs is synchronized again by the next pass, both
+    /// when the replacement finishes during the pass and when it is still in flight. A
+    /// replacement recorded at its start rather than after its rename would let the pass
+    /// synchronize the old file and take the record of the new one.
+    #[test]
+    fn replaced_metadata_is_synchronized_again() {
+        for in_flight in [false, true] {
+            let (_root, dir) = directory();
+            assert!(dir.prepare_checkpoint().run().unwrap());
+            finish(&dir, "new.seg");
+            dir.take_synced();
+            let writer = if in_flight {
+                let (entered, release) = pause(&dir, TestPoint::AtomicBeforeRename);
+                let writer_dir = dir.clone();
+                let writer = std::thread::spawn(move || {
+                    writer_dir.atomic_write(Path::new("meta.json"), br#"{"segment":"new.seg"}"#)
+                });
+                entered.recv_timeout(Duration::from_secs(5)).unwrap();
+                assert!(!dir.prepare_checkpoint().run().unwrap());
+                let _ = release.send(());
+                writer.join().unwrap().unwrap();
+                None
+            } else {
+                let (entered, release) = pause(&dir, TestPoint::CheckpointFileSync);
+                let checkpoint_dir = dir.clone();
+                let checkpoint =
+                    std::thread::spawn(move || checkpoint_dir.prepare_checkpoint().run());
+                let reached = entered.recv_timeout(Duration::from_secs(5));
+                let write = reached
+                    .as_ref()
+                    .ok()
+                    .map(|_| dir.atomic_write(Path::new("meta.json"), br#"{"segment":"new.seg"}"#));
+                let _ = release.send(());
+                assert!(!checkpoint.join().unwrap().unwrap());
+                reached.unwrap();
+                Some(write.unwrap())
+            };
+            if let Some(write) = writer {
+                write.unwrap();
+            }
+            assert!(dir.is_marked());
+            dir.take_synced();
+            assert!(dir.prepare_checkpoint().run().unwrap());
+            assert!(
+                names(&dir.take_synced()).contains("meta.json"),
+                "in flight {in_flight}: the replacement was never synchronized"
+            );
+            assert!(!dir.is_marked());
+        }
+    }
+
+    /// A pass that fails puts back what it took, so the retry synchronizes every file the
+    /// failed pass had not finished with.
+    #[test]
+    fn a_failed_pass_puts_its_files_back() {
+        let (_root, dir) = directory();
+        dir.test_hook(TestPoint::CheckpointFileSync, || {
+            Err(io::Error::other("sync probe"))
+        });
+        assert!(dir.checkpoint().is_err());
+        assert!(dir.is_marked());
+        assert!(dir.take_synced().is_empty());
+        assert!(dir.prepare_checkpoint().run().unwrap());
+        assert_eq!(
+            names(&dir.take_synced()),
+            ["meta.json", "old.seg"].map(String::from).into()
+        );
+    }
+
+    /// A directory opened with its marker present may hold files that an earlier process
+    /// never synchronized, so its first checkpoint synchronizes every file in it.
+    #[test]
+    fn a_directory_opened_with_its_marker_synchronizes_every_file() {
+        let (root, dir) = directory();
+        finish(&dir, "earlier.seg");
+        drop(dir);
+        let dir = LazySyncDir::open(&root.path().join("text"), root.path().join("dirty")).unwrap();
+        assert!(dir.is_marked());
+        assert!(dir.prepare_checkpoint().run().unwrap());
+        assert_eq!(
+            names(&dir.take_synced()),
+            ["earlier.seg", "meta.json", "old.seg"]
+                .map(String::from)
+                .into()
+        );
+        assert!(!dir.is_marked());
+        drop(dir);
+        // a clean directory reopens with nothing to synchronize
+        let dir = LazySyncDir::open(&root.path().join("text"), root.path().join("dirty")).unwrap();
+        assert!(!dir.is_marked());
+        finish(&dir, "later.seg");
+        assert!(dir.prepare_checkpoint().run().unwrap());
+        assert_eq!(names(&dir.take_synced()), ["later.seg".to_string()].into());
     }
 
     #[test]

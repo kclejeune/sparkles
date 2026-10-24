@@ -1207,6 +1207,10 @@ mod imp {
         retirement_failed: AtomicBool,
         #[cfg(test)]
         after_checkpoint_io: Mutex<Option<Box<dyn FnOnce() + Send>>>,
+        /// background checkpoint passes that held live, those of them that cleared the
+        /// marker, and background passes of any kind that cleared it, for the crash tests
+        #[cfg(feature = "failpoints")]
+        background_passes: [AtomicU64; 3],
         #[cfg(test)]
         before_install_checkpoint: Mutex<Option<Box<dyn FnOnce() + Send>>>,
         /// the quads of the commits since an online rebuild's snapshot, while one runs
@@ -1495,14 +1499,26 @@ mod imp {
     /// of the tick that seals batches.
     const CHECKPOINT_AFTER: Duration = Duration::from_secs(1);
 
-    /// Background checkpoints in a row that a write may race before the tick holds the
-    /// live writer lock through its file synchronization. A checkpoint that a write
+    /// Background checkpoints in a row that a write may race before the next raced tick
+    /// runs a second pass that holds the live writer lock. A checkpoint that a write
     /// raced keeps the marker. Under commits more frequent than a checkpoint's
     /// synchronization every unlocked attempt would race, the marker would never clear,
-    /// and every crash would pay verification at open. The locked attempt blocks text
-    /// publication for one synchronization, as an explicit checkpoint does, so it runs
-    /// at most once per this many raced ticks.
+    /// and every crash would pay verification at open. The locked pass follows an
+    /// unlocked one and synchronizes only the files written during it, so it blocks text
+    /// publication for a few file synchronizations, and it runs at most once in this
+    /// many ticks plus one.
     const RACED_BEFORE_LOCKED: u32 = 3;
+
+    /// Files a locked checkpoint pass may find left to synchronize. A raced tick that
+    /// is due a locked pass first repeats its unlocked pass, each time synchronizing only
+    /// what was written during the one before, until at most this many files are left.
+    /// Under steady commits each repetition takes a fraction of the one before, because
+    /// it has only the files of a shorter interval to synchronize.
+    const LOCKED_FILES: usize = 16;
+
+    /// Unlocked passes a raced tick may repeat before its locked pass, so that commits
+    /// written faster than they can be synchronized still end in a locked pass.
+    const CATCH_UP_PASSES: u32 = 4;
 
     /// Record one background checkpoint at debug level under the target
     /// `sparkles::text::checkpoint`: how long the tick held the live writer lock before
@@ -2015,6 +2031,8 @@ mod imp {
             retirement_failed: AtomicBool::new(false),
             #[cfg(test)]
             after_checkpoint_io: Mutex::new(None),
+            #[cfg(feature = "failpoints")]
+            background_passes: Default::default(),
             #[cfg(test)]
             before_install_checkpoint: Mutex::new(None),
             journal: Default::default(),
@@ -2286,6 +2304,17 @@ mod imp {
                 }
             }
             self.inner.tick()
+        }
+
+        /// The background checkpoint passes that held the live writer lock, those of
+        /// them that cleared the marker, and the background passes of any kind that
+        /// cleared it.
+        #[cfg(feature = "failpoints")]
+        pub(crate) fn background_checkpoints_for_test(&self) -> [u64; 3] {
+            self.inner
+                .background_passes
+                .each_ref()
+                .map(|n| n.load(Ordering::Relaxed))
         }
 
         /// Stop maintenance before the store deletes or reuses this index's path.
@@ -3035,23 +3064,6 @@ mod imp {
             let Some(dir) = live.dir.clone() else {
                 return false;
             };
-            if live.raced >= RACED_BEFORE_LOCKED {
-                // Writes raced the last unlocked attempts. Holding live keeps text
-                // publication out of this one, so only a merge can still race it. The
-                // count starts again either way, so a merge that races this attempt
-                // does not make the next ticks hold live as well.
-                live.raced = 0;
-                let before_io = held.elapsed();
-                let io = Instant::now();
-                let result = dir.prepare_checkpoint().run();
-                note_checkpoint("locked", before_io, io.elapsed(), held.elapsed(), &result);
-                match result {
-                    Ok(true) => live.dirty_since = None,
-                    Ok(false) => {}
-                    Err(e) => self.fail_locked(&mut live, &e.into()),
-                }
-                return true;
-            }
             let generation = live.commit_generation;
             let checkpoint = dir.prepare_checkpoint();
             let before_io = held.elapsed();
@@ -3076,11 +3088,82 @@ mod imp {
                 return true;
             }
             note_checkpoint("unlocked", before_io, io, before_io, &result);
+            #[cfg(feature = "failpoints")]
+            if matches!(result, Ok(true)) {
+                self.background_passes[2].fetch_add(1, Ordering::Relaxed);
+            }
             match result {
                 Ok(true) => {
                     live.raced = 0;
                     if live.commit_generation == generation {
                         live.dirty_since = None;
+                    }
+                }
+                Ok(false) if live.raced >= RACED_BEFORE_LOCKED && self.healthy() => {
+                    // Writes raced this attempt and the ones before it. A pass that
+                    // holds live keeps text publication out, so only a merge can still
+                    // race it. Unlocked passes first catch up on what was written during
+                    // the one before, so that the locked pass finds only a few files,
+                    // which bounds the stall to a few file synchronizations. The count
+                    // starts again either way, so a merge that races the locked pass
+                    // does not make the next ticks hold live.
+                    live.raced = 0;
+                    let mut passes = 0;
+                    while passes < CATCH_UP_PASSES
+                        && dir.unsynced_files().is_none_or(|n| n > LOCKED_FILES)
+                    {
+                        passes += 1;
+                        let generation = live.commit_generation;
+                        let checkpoint = dir.prepare_checkpoint();
+                        drop(live);
+                        let io = Instant::now();
+                        let result = checkpoint.run();
+                        let io = io.elapsed();
+                        live = self.live.lock();
+                        if live.writer.is_none()
+                            || !live.dir.as_ref().is_some_and(|d| d.same_directory(&dir))
+                            || !self.healthy()
+                        {
+                            return true;
+                        }
+                        note_checkpoint("catch-up", Duration::ZERO, io, Duration::ZERO, &result);
+                        #[cfg(feature = "failpoints")]
+                        if matches!(result, Ok(true)) {
+                            self.background_passes[2].fetch_add(1, Ordering::Relaxed);
+                        }
+                        match result {
+                            Ok(true) => {
+                                if live.commit_generation == generation {
+                                    live.dirty_since = None;
+                                }
+                                return true;
+                            }
+                            Ok(false) => {}
+                            Err(e) => {
+                                self.fail_locked(&mut live, &e.into());
+                                return true;
+                            }
+                        }
+                    }
+                    let held = Instant::now();
+                    let result = dir.prepare_checkpoint().run();
+                    let io = held.elapsed();
+                    note_checkpoint("locked", Duration::ZERO, io, io, &result);
+                    #[cfg(feature = "failpoints")]
+                    if matches!(result, Ok(true)) {
+                        self.background_passes[2].fetch_add(1, Ordering::Relaxed);
+                    }
+                    #[cfg(feature = "failpoints")]
+                    {
+                        self.background_passes[0].fetch_add(1, Ordering::Relaxed);
+                        if matches!(result, Ok(true)) {
+                            self.background_passes[1].fetch_add(1, Ordering::Relaxed);
+                        }
+                    }
+                    match result {
+                        Ok(true) => live.dirty_since = None,
+                        Ok(false) => {}
+                        Err(e) => self.fail_locked(&mut live, &e.into()),
                     }
                 }
                 Ok(false) => live.raced = live.raced.saturating_add(1),
@@ -3439,13 +3522,16 @@ mod imp {
         }
 
         /// A publication races every unlocked background checkpoint, inside its file
-        /// synchronization. After `RACED_BEFORE_LOCKED` such ticks the next one holds
-        /// live, the publication cannot race it, and the marker clears. When a merge's
-        /// write races that locked attempt instead, the count starts again, so the
-        /// following ticks release live and at most one tick in four holds it.
+        /// synchronization. The tick after `RACED_BEFORE_LOCKED` such ticks follows its
+        /// raced unlocked pass with a second pass that holds live, so the publication
+        /// cannot race it, and the marker clears. That pass synchronizes only the files
+        /// written during the unlocked pass. When a merge's write races the locked pass
+        /// instead, the count starts again, so the following ticks release live and at
+        /// most one tick in four holds it.
         #[test]
         fn steady_publication_cannot_starve_the_background_checkpoint() {
             use super::super::lazydir::TestPoint;
+            use std::collections::BTreeSet;
             let (root, inner, dir) = checkpoint_fixture();
             // a merge could race the locked attempt too
             if let Some(writer) = inner.live.lock().writer.as_ref() {
@@ -3453,39 +3539,79 @@ mod imp {
             }
             publish_checkpoint_document(&inner, 1).unwrap();
             let seq = Arc::new(AtomicU64::new(1));
+            let files = || -> BTreeSet<PathBuf> {
+                std::fs::read_dir(root.path().join("text"))
+                    .unwrap()
+                    .map(|e| PathBuf::from(e.unwrap().file_name()))
+                    .collect()
+            };
             for round in 0..3 {
-                // the locked attempt of this round meets a merge's write
+                // the locked pass of this round meets a merge's write
                 let merge = round == 1;
                 for attempt in 0..=RACED_BEFORE_LOCKED {
                     let locked = attempt == RACED_BEFORE_LOCKED;
                     inner.live.lock().dirty_since = Some(Instant::now() - CHECKPOINT_AFTER);
-                    let (hook_inner, hook_seq, hook_dir) =
-                        (inner.clone(), seq.clone(), dir.clone());
+                    let (hook_inner, hook_seq) = (inner.clone(), seq.clone());
                     let (raced_tx, raced_rx) = std::sync::mpsc::channel();
+                    let (held_tx, held_rx) = std::sync::mpsc::channel();
                     dir.test_hook(TestPoint::CheckpointFileSync, move || {
-                        // The unlocked tick has released live, so the publication runs
+                        // The unlocked pass has released live, so the publication runs
                         // here, between the checkpoint's snapshot and its marker check.
                         let free = hook_inner.live.try_lock().is_some();
                         if free {
                             let next = hook_seq.fetch_add(1, Ordering::SeqCst) + 1;
                             publish_checkpoint_document(&hook_inner, next)
                                 .map_err(std::io::Error::other)?;
-                        } else if merge {
-                            // a merge writes without live
-                            tantivy::directory::Directory::atomic_write(
-                                &hook_dir,
-                                Path::new("merge-probe"),
-                                b"merge",
-                            )?;
                         }
                         let _ = raced_tx.send(free);
                         Ok(())
                     });
+                    if locked {
+                        // armed once the unlocked pass has finished its I/O, so that only
+                        // a later pass of the tick can meet it
+                        let (hook_inner, hook_dir) = (inner.clone(), dir.clone());
+                        *inner.after_checkpoint_io.lock() = Some(Box::new(move || {
+                            let first = hook_dir.take_synced();
+                            let dir = hook_dir.clone();
+                            hook_dir.test_hook(TestPoint::CheckpointFileSync, move || {
+                                let held = hook_inner.live.try_lock().is_none();
+                                if merge {
+                                    // a merge writes without live
+                                    tantivy::directory::Directory::atomic_write(
+                                        &dir,
+                                        Path::new("merge-probe"),
+                                        b"merge",
+                                    )?;
+                                }
+                                let _ = held_tx.send((held, first));
+                                Ok(())
+                            });
+                        }));
+                    }
+                    let before = files();
+                    dir.take_synced();
                     assert!(inner.tick(), "round {round}, attempt {attempt}");
                     let raced = raced_rx
                         .recv_timeout(Duration::from_secs(5))
                         .expect("the checkpoint synchronized no file");
-                    assert_eq!(raced, !locked, "round {round}, attempt {attempt}");
+                    assert!(raced, "round {round}, attempt {attempt}: live was held");
+                    if locked {
+                        let (held, first) = held_rx
+                            .recv_timeout(Duration::from_secs(5))
+                            .expect("the locked pass synchronized no file");
+                        assert!(held, "round {round}: the second pass released live");
+                        let second = dir.take_synced();
+                        assert!(!first.is_empty() && !second.is_empty());
+                        // only what the publication during the unlocked pass wrote
+                        for name in &second {
+                            assert!(
+                                !before.contains(name)
+                                    || name == Path::new("meta.json")
+                                    || name == Path::new(".managed.json"),
+                                "round {round}: the locked pass synchronized {name:?} again"
+                            );
+                        }
+                    }
                     assert!(inner.healthy());
                     let live = inner.live.lock();
                     if locked && merge {
@@ -3512,6 +3638,61 @@ mod imp {
             assert!(!dir.is_marked());
             let (index, _, _) = open_index(root.path(), &inner.config).unwrap();
             assert_eq!(index.reader().unwrap().searcher().num_docs(), published);
+        }
+
+        /// When the commits written during the unlocked pass of a tick due a locked
+        /// pass leave more than `LOCKED_FILES` files, the tick repeats the unlocked pass
+        /// for them first, without live. Nothing races that repetition here, so it clears
+        /// the marker and the tick never holds live for its I/O.
+        #[test]
+        fn a_locked_pass_first_catches_up_without_live() {
+            use super::super::lazydir::TestPoint;
+            let (_root, inner, dir) = checkpoint_fixture();
+            if let Some(writer) = inner.live.lock().writer.as_ref() {
+                writer.set_merge_policy(Box::new(tantivy::indexer::NoMergePolicy));
+            }
+            publish_checkpoint_document(&inner, 1).unwrap();
+            inner.live.lock().raced = RACED_BEFORE_LOCKED;
+            inner.live.lock().dirty_since = Some(Instant::now() - CHECKPOINT_AFTER);
+            let hook_inner = inner.clone();
+            let (tx, rx) = std::sync::mpsc::channel();
+            dir.test_hook(TestPoint::CheckpointFileSync, move || {
+                // commits during the unlocked pass leave many files behind it
+                for seq in 2..=6 {
+                    publish_checkpoint_document(&hook_inner, seq).map_err(std::io::Error::other)?;
+                }
+                Ok(())
+            });
+            // armed once the unlocked pass has finished its I/O, so that only a later
+            // pass of the tick can meet it
+            let (hook_inner, hook_dir) = (inner.clone(), dir.clone());
+            *inner.after_checkpoint_io.lock() = Some(Box::new(move || {
+                let left = hook_dir.unsynced_files();
+                let _ = tx.send(("left", left.is_some_and(|n| n > LOCKED_FILES)));
+                hook_dir.test_hook(TestPoint::CheckpointFileSync, move || {
+                    // the catch-up pass runs without live
+                    let _ = tx.send(("catch-up", hook_inner.live.try_lock().is_some()));
+                    Ok(())
+                });
+            }));
+            assert!(inner.tick());
+            assert_eq!(
+                rx.recv_timeout(Duration::from_secs(5)).unwrap(),
+                ("left", true)
+            );
+            assert_eq!(
+                rx.recv_timeout(Duration::from_secs(5)).unwrap(),
+                ("catch-up", true),
+                "the catch-up pass held live"
+            );
+            assert!(
+                !dir.is_marked(),
+                "the catch-up pass did not clear the marker"
+            );
+            assert_eq!(dir.unsynced_files(), Some(0));
+            let live = inner.live.lock();
+            assert_eq!(live.raced, 0);
+            assert!(live.dirty_since.is_none());
         }
 
         #[test]
