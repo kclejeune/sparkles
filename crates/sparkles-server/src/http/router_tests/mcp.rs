@@ -1286,6 +1286,37 @@ mod auth {
     }
 
     #[tokio::test(flavor = "multi_thread")]
+    async fn stored_tools_are_charged_to_their_dataset() {
+        // the tool of a stored query on `my.data` is named `my_data__q`, and its
+        // parameter `dataset` names another dataset: neither moves the charge
+        let s = authed(&[], &["query=100/min", "query@my.data=1/min"], "");
+        load(&s.state, "my.data", FIXTURE);
+        let def: sparkles::stored::Definition = serde_json::from_value(json!({
+            "query": "SELECT ?x WHERE { BIND(?dataset AS ?x) }",
+            "parameters": { "dataset": { "type": "string" } }
+        }))
+        .unwrap();
+        s.state.datasets()["my.data"]
+            .queries
+            .put("q", def, sparkles::stored::Change::default())
+            .unwrap();
+        let alice = b("alice");
+        let h = [("authorization", alice.as_str())];
+        let names = tool_names(&s.app, &h).await;
+        assert!(names.contains(&"my_data__q".to_string()), "{names:?}");
+        let r = tool(&s.app, "my_data__q", json!({"dataset": "wiki"}), &h).await;
+        assert_eq!(r["isError"], false, "{r}");
+        let r = modern(
+            &s.app,
+            "tools/call",
+            json!({"name": "my_data__q", "arguments": {"dataset": "wiki"}}),
+            &h,
+        )
+        .await;
+        assert_eq!(r.status, StatusCode::TOO_MANY_REQUESTS, "{}", r.body);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
     async fn rate_limits_apply_per_class() {
         let s = authed(
             &["--mcp-allow-update"],

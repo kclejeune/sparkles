@@ -294,13 +294,15 @@ fn charge_of(message: &Value) -> Charge {
             } else {
                 Class::Query
             };
-            // a stored query's tool names its dataset (`<dataset>__<query>`), whatever a
-            // parameter named `dataset` says; no built-in tool name has `__`
-            let dataset = name
-                .as_deref()
-                .and_then(|n| n.split_once("__"))
-                .map(|(ds, _)| ds.to_string())
-                .or_else(|| str_at(params.and_then(|p| p.get("arguments")), "dataset"));
+            // a stored query's tool names its dataset (`<dataset>__<query>`); `handle`
+            // replaces this with the stored tool's own dataset, since the name is
+            // sanitized and a parameter may be named `dataset`
+            let dataset =
+                str_at(params.and_then(|p| p.get("arguments")), "dataset").or_else(|| {
+                    name.as_deref()
+                        .and_then(|n| n.split_once("__"))
+                        .map(|(ds, _)| ds.to_string())
+                });
             Charge {
                 class: Some(class),
                 dataset,
@@ -384,6 +386,16 @@ impl Endpoint {
                     .insert(header::RETRY_AFTER, HeaderValue::from_static("5"));
                 return r;
             }
+        }
+        // a stored query's tool is charged to its own dataset, whatever its arguments
+        // say (its name is sanitized, and a parameter may be named `dataset`)
+        if let Some(name) = message.pointer("/params/name").and_then(Value::as_str)
+            && charge.class.is_some()
+            && message.get("method").and_then(Value::as_str) == Some("tools/call")
+            && !self.server.offers(name)
+            && let Some(t) = self.server.stored_tool(&p.without_oauth_scopes(), name)
+        {
+            charge.dataset = Some(t.dataset.name.clone());
         }
         // a call without `dataset` reads the caller's only dataset
         if charge.class.is_some() && charge.dataset.is_none() {
@@ -591,14 +603,5 @@ mod tests {
             Charge::default()
         );
         assert_eq!(c("[1,2]"), Charge::default());
-        // a stored query's parameter named `dataset` does not move the charge
-        assert_eq!(
-            c(
-                r#"{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"wiki__q","arguments":{"dataset":"other"}}}"#
-            )
-            .dataset
-            .as_deref(),
-            Some("wiki")
-        );
     }
 }

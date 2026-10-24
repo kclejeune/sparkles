@@ -53,6 +53,11 @@ api_audience = "{API_AUD}"
 /// An access token for alice (who writes `wiki` and reads `team-a`) with audience `aud`
 /// and scope `scope`.
 fn token(m: &Mock, aud: J, scope: &str) -> String {
+    token_for(m, "alice@example.org", aud, scope)
+}
+
+/// [`token`] for the account `email`.
+fn token_for(m: &Mock, email: &str, aud: J, scope: &str) -> String {
     m.sign(&json!({
         "iss": m.issuer,
         "sub": "u-1",
@@ -60,7 +65,7 @@ fn token(m: &Mock, aud: J, scope: &str) -> String {
         "iat": now(),
         "exp": now() + 300,
         "scope": scope,
-        "email": "alice@example.org",
+        "email": email,
         "groups": ["sparkles", "kg-editors"],
     }))
 }
@@ -584,5 +589,22 @@ async fn tasks_do_not_cross_scopes() {
     assert_eq!(task["status"], "completed", "{task}");
     // still hidden from the narrower token once it is done
     let r = get(narrow).await;
+    assert_eq!(r["error"]["code"], -32602, "{r}");
+    // and from another account whose name spells the first one's name and scopes
+    let other = bearer_of(&token_for(
+        &m,
+        "alice@example.org#sparkles:read",
+        json!(API_AUD),
+        "openid",
+    ));
+    let r = get(other.clone()).await;
+    assert_eq!(r["error"]["code"], -32602, "{r}");
+    let other = bearer_of(&token_for(
+        &m,
+        "alice@example.org\",[\"sparkles:read\"]]",
+        json!(API_AUD),
+        "openid",
+    ));
+    let r = get(other).await;
     assert_eq!(r["error"]["code"], -32602, "{r}");
 }

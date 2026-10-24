@@ -975,14 +975,17 @@ impl Principal {
     #[cfg_attr(not(feature = "mcp"), allow(dead_code))]
     /// [`Principal::id`] together with the bound of an OIDC access token's scopes, for
     /// what must not pass between two tokens of one account with different scopes, such
-    /// as MCP tasks and legacy sessions: `oidc:alice@example.org#sparkles:read`.
+    /// as MCP tasks and legacy sessions. With a scope bound it is the JSON array
+    /// `["oidc:alice@example.org",["sparkles:read"]]`, which no [`Principal::id`]
+    /// equals (those start with a kind's name) and whose escaping keeps any account
+    /// name and scope apart.
     pub fn access_id(&self) -> String {
         match &self.info.oauth_scopes {
             Some(scopes) => {
                 let mut s = scopes.clone();
                 s.sort();
                 s.dedup();
-                format!("{}#{}", self.id(), s.join(" "))
+                serde_json::json!([self.id(), s]).to_string()
             }
             None => self.id(),
         }
