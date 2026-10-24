@@ -1,0 +1,410 @@
+//! Explanations of what RDFS on read answers (spec U10 §3.3).
+//!
+//! RDFS on read derives a triple in one step from a stored triple of the same graph and
+//! the schema, so a tree has one data premise and the schema facts it used. The rules are
+//! those of the W3C RDF 1.1 Semantics that Jena's `MatchRDFS` applies: `rdfs9` for a type
+//! from a stored type and the closed class hierarchy, `rdfs2` and `rdfs3` for a type from
+//! the domain or range its declaring property has, and `rdfs7` for a triple from a stored
+//! triple of a subproperty. A subclass or subproperty fact the schema graph does not hold
+//! directly is derived by `rdfs11` or `rdfs5` from a chain of facts it holds.
+
+use super::RdfsSchema;
+use crate::error::Result;
+use crate::explain::{
+    Derivation, ExplainBudgetExceeded, ExplainLimits, Explained, RuleRef, finish,
+};
+use crate::id::Id;
+use crate::index::Perm;
+use crate::store::Snapshot;
+use oxrdf::vocab::{rdf, rdfs};
+use oxrdf::{NamedNode, NamedNodeRef, Term};
+use std::collections::{BTreeMap, VecDeque};
+use std::time::Instant;
+
+/// Where the schema's facts are, for the leaves of an explanation.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SchemaLeaves {
+    /// a schema given as a document: its closed triples are leaves without a graph
+    Document,
+    /// a graph of the dataset the caller reads
+    Graph(Id),
+    /// a graph the caller does not read: no derivation that needs the schema is shown
+    Hidden,
+}
+
+/// The most index reads one explanation makes.
+const MAX_READS: usize = 100_000;
+
+struct Cx<'a> {
+    schema: &'a RdfsSchema,
+    snap: &'a Snapshot,
+    leaves: SchemaLeaves,
+    deadline: Option<Instant>,
+    reads: std::cell::Cell<usize>,
+}
+
+fn nn(n: NamedNodeRef<'_>) -> Term {
+    Term::NamedNode(n.into_owned())
+}
+
+fn rule(name: &str) -> RuleRef {
+    RuleRef {
+        name: name.to_string(),
+        profile: "rdfs-on-read".to_string(),
+        owl2rl: None,
+    }
+}
+
+impl Cx<'_> {
+    fn read(&self) -> Result<()> {
+        let n = self.reads.get() + 1;
+        self.reads.set(n);
+        if n > MAX_READS {
+            return Err(budget(format!(
+                "the explanation made its limit of {MAX_READS} index reads"
+            )));
+        }
+        if n.is_multiple_of(256) && self.deadline.is_some_and(|d| Instant::now() >= d) {
+            return Err(budget("the explanation passed its timeout".to_string()));
+        }
+        Ok(())
+    }
+
+    fn id(&self, t: &Term) -> Option<Id> {
+        self.snap.lookup_term(t)
+    }
+
+    fn graph_name(&self, g: Id) -> Option<String> {
+        if g == Id::DEFAULT_GRAPH {
+            return Some("default".to_string());
+        }
+        match self.snap.term(g)? {
+            Term::NamedNode(n) => Some(n.into_string()),
+            _ => None,
+        }
+    }
+
+    /// Whether graph `g` holds `s p o`.
+    fn held(&self, g: Id, t: &[Term; 3]) -> Result<bool> {
+        let (Some(s), Some(p), Some(o)) = (self.id(&t[0]), self.id(&t[1]), self.id(&t[2])) else {
+            return Ok(false);
+        };
+        self.read()?;
+        Ok(self.snap.count(Perm::Gspo, &[g.0, s.0, p.0, o.0])? > 0)
+    }
+
+    /// An object of `s p ?` in graph `g`.
+    fn object(&self, g: Id, s: &Term, p: &NamedNode) -> Result<Option<Term>> {
+        let (Some(s), Some(p)) = (self.id(s), self.snap.lookup_iri(p.as_str())) else {
+            return Ok(None);
+        };
+        self.read()?;
+        let mut found = None;
+        self.snap.scan(Perm::Gspo, &[g.0, s.0, p.0], |c| {
+            let o = match c {
+                crate::store::Chunk::Block(b, st, _) => b.cols[3][st],
+                crate::store::Chunk::Row(k) => k[3],
+            };
+            found = Some(Id(o));
+            Ok(false)
+        })?;
+        Ok(found.and_then(|o| self.snap.term(o)))
+    }
+
+    /// A subject of `? p o` in graph `g`.
+    fn subject(&self, g: Id, p: &NamedNode, o: &Term) -> Result<Option<Term>> {
+        let (Some(p), Some(o)) = (self.snap.lookup_iri(p.as_str()), self.id(o)) else {
+            return Ok(None);
+        };
+        self.read()?;
+        let mut found = None;
+        for k in self.snap.scan_keys(Perm::Pos, &[p.0, o.0])? {
+            let q = Perm::Pos.to_quad(&k);
+            if q[3] == g {
+                found = Some(q[0]);
+                break;
+            }
+        }
+        Ok(found.and_then(|s| self.snap.term(s)))
+    }
+
+    /// The schema fact `a pred b` that the schema holds directly, as a leaf.
+    fn schema_fact(
+        &self,
+        a: &NamedNode,
+        pred: NamedNodeRef<'_>,
+        b: &NamedNode,
+    ) -> Result<Option<Derivation>> {
+        let t = [
+            Term::NamedNode(a.clone()),
+            nn(pred),
+            Term::NamedNode(b.clone()),
+        ];
+        Ok(match self.leaves {
+            SchemaLeaves::Document => Some(Derivation::asserted(t, None)),
+            SchemaLeaves::Graph(g) => {
+                if self.held(g, &t)? {
+                    Some(Derivation::asserted(t, self.graph_name(g)))
+                } else {
+                    None
+                }
+            }
+            SchemaLeaves::Hidden => None,
+        })
+    }
+
+    /// `a pred b` for `rdfs:subClassOf` or `rdfs:subPropertyOf` in the schema's closure: a
+    /// leaf, or a chain of facts the schema graph holds joined by `rdfs11` or `rdfs5`.
+    fn chain(
+        &self,
+        a: &NamedNode,
+        pred: NamedNodeRef<'_>,
+        b: &NamedNode,
+    ) -> Result<Option<Derivation>> {
+        let g = match self.leaves {
+            SchemaLeaves::Document => return self.schema_fact(a, pred, b),
+            SchemaLeaves::Graph(g) => g,
+            SchemaLeaves::Hidden => return Ok(None),
+        };
+        // the shortest path of direct facts from a to b
+        let pred_owned = pred.into_owned();
+        let mut back: BTreeMap<NamedNode, NamedNode> = BTreeMap::new();
+        let mut queue = VecDeque::from([a.clone()]);
+        let mut reached = false;
+        while let Some(x) = queue.pop_front() {
+            if &x == b {
+                reached = true;
+                break;
+            }
+            let (Some(xi), Some(pi)) = (
+                self.id(&Term::NamedNode(x.clone())),
+                self.snap.lookup_iri(pred.as_str()),
+            ) else {
+                continue;
+            };
+            self.read()?;
+            for k in self.snap.scan_keys(Perm::Gspo, &[g.0, xi.0, pi.0])? {
+                let Some(Term::NamedNode(y)) = self.snap.term(Id(k[3])) else {
+                    continue;
+                };
+                if &y != a && !back.contains_key(&y) {
+                    back.insert(y.clone(), x.clone());
+                    queue.push_back(y);
+                }
+            }
+        }
+        if !reached {
+            return Ok(None);
+        }
+        let mut path = vec![b.clone()];
+        while path.last() != Some(a) {
+            let prev = back[path.last().unwrap()].clone();
+            path.push(prev);
+        }
+        path.reverse();
+        let name = if pred == rdfs::SUB_CLASS_OF {
+            "rdfs11"
+        } else {
+            "rdfs5"
+        };
+        let leaf = |x: &NamedNode, y: &NamedNode| {
+            Derivation::asserted(
+                [
+                    Term::NamedNode(x.clone()),
+                    Term::NamedNode(pred_owned.clone()),
+                    Term::NamedNode(y.clone()),
+                ],
+                self.graph_name(g),
+            )
+        };
+        // a sc x1, x1 sc ... sc b: fold from the right
+        let n = path.len();
+        let mut d = leaf(&path[n - 2], &path[n - 1]);
+        for i in (0..n - 2).rev() {
+            d = Derivation::derived(
+                [
+                    Term::NamedNode(path[i].clone()),
+                    Term::NamedNode(pred_owned.clone()),
+                    Term::NamedNode(path[n - 1].clone()),
+                ],
+                rule(name),
+                vec![leaf(&path[i], &path[i + 1]), d],
+            );
+        }
+        Ok(Some(d))
+    }
+
+    /// `s rdf:type c` by `rdfs2` or `rdfs3` from a stored triple of `s` in graph `g` and
+    /// a domain or range `c` of its property.
+    fn by_domain_range(
+        &self,
+        g: Id,
+        s: &Term,
+        c: &NamedNode,
+        range: bool,
+    ) -> Result<Option<Derivation>> {
+        let (m, pred, name) = if range {
+            (&self.schema.range, rdfs::RANGE, "rdfs3")
+        } else {
+            (&self.schema.domain, rdfs::DOMAIN, "rdfs2")
+        };
+        for (p, classes) in m {
+            if !classes.contains(c) {
+                continue;
+            }
+            let other = if range {
+                self.subject(g, p, s)?
+            } else {
+                self.object(g, s, p)?
+            };
+            let Some(x) = other else {
+                continue;
+            };
+            let Some(fact) = self.schema_fact(p, pred, c)? else {
+                continue;
+            };
+            let data = if range {
+                [x, Term::NamedNode(p.clone()), s.clone()]
+            } else {
+                [s.clone(), Term::NamedNode(p.clone()), x]
+            };
+            return Ok(Some(Derivation::derived(
+                [s.clone(), nn(rdf::TYPE), Term::NamedNode(c.clone())],
+                rule(name),
+                vec![Derivation::asserted(data, self.graph_name(g)), fact],
+            )));
+        }
+        Ok(None)
+    }
+}
+
+fn budget(m: String) -> crate::error::Error {
+    crate::error::Error::Component(Box::new(
+        crate::error::ComponentError::new("reasoner", "reasoning-budget", m.clone())
+            .with_source(ExplainBudgetExceeded(m)),
+    ))
+}
+
+impl RdfsSchema {
+    /// Explain why RDFS on read with this schema answers `triple` in one of `graphs`, the
+    /// graphs the caller reads, from the snapshot of the caller's view: up to `max_trees`
+    /// derivations whose top rules differ, cut at the depth of `limits`. A triple a graph holds is
+    /// its own leaf.
+    pub fn explain(
+        &self,
+        snap: &Snapshot,
+        leaves: SchemaLeaves,
+        graphs: &[Id],
+        triple: &[Term; 3],
+        limits: ExplainLimits,
+    ) -> Result<Explained> {
+        let ExplainLimits {
+            max_trees,
+            max_depth,
+            deadline,
+        } = limits;
+        let cx = Cx {
+            schema: self,
+            snap,
+            leaves,
+            deadline,
+            reads: std::cell::Cell::new(0),
+        };
+        for &g in graphs {
+            if cx.held(g, triple)? {
+                let mut trees = vec![Derivation::asserted(triple.clone(), cx.graph_name(g))];
+                finish(&mut trees, max_depth);
+                return Ok(Explained::Found { trees, more: false });
+            }
+        }
+        // the best tree of each top rule
+        let mut tops: BTreeMap<String, Derivation> = BTreeMap::new();
+        let mut keep = |d: Derivation| {
+            let name = d.rule.as_ref().map(|r| r.name.clone()).unwrap_or_default();
+            match tops.get(&name) {
+                Some(have) if have.depth <= d.depth => {}
+                _ => {
+                    tops.insert(name, d);
+                }
+            }
+        };
+        let [s, p, o] = triple;
+        let Term::NamedNode(p) = p else {
+            return Ok(Explained::NotFound);
+        };
+        let pr = p.as_ref();
+        if pr == rdf::TYPE
+            && let Term::NamedNode(c) = o
+        {
+            let subs: Vec<NamedNode> = Self::get(&self.sub_class, c.as_ref())
+                .into_iter()
+                .flatten()
+                .filter(|d| *d != c)
+                .cloned()
+                .collect();
+            for &g in graphs {
+                for range in [false, true] {
+                    if let Some(d) = cx.by_domain_range(g, s, c, range)? {
+                        keep(d);
+                    }
+                }
+                for d in &subs {
+                    let typed = [s.clone(), nn(rdf::TYPE), Term::NamedNode(d.clone())];
+                    let premise = if cx.held(g, &typed)? {
+                        Some(Derivation::asserted(typed, cx.graph_name(g)))
+                    } else {
+                        match cx.by_domain_range(g, s, d, false)? {
+                            Some(x) => Some(x),
+                            None => cx.by_domain_range(g, s, d, true)?,
+                        }
+                    };
+                    let Some(premise) = premise else {
+                        continue;
+                    };
+                    let Some(sc) = cx.chain(d, rdfs::SUB_CLASS_OF, c)? else {
+                        continue;
+                    };
+                    keep(Derivation::derived(
+                        triple.clone(),
+                        rule("rdfs9"),
+                        vec![premise, sc],
+                    ));
+                }
+            }
+        }
+        if pr != rdfs::SUB_CLASS_OF && pr != rdfs::SUB_PROPERTY_OF {
+            let subs: Vec<NamedNode> = Self::get(&self.sub_prop, pr)
+                .into_iter()
+                .flatten()
+                .filter(|q| *q != p)
+                .cloned()
+                .collect();
+            'graphs: for &g in graphs {
+                for q in &subs {
+                    let stored = [s.clone(), Term::NamedNode(q.clone()), o.clone()];
+                    if !cx.held(g, &stored)? {
+                        continue;
+                    }
+                    let Some(sp) = cx.chain(q, rdfs::SUB_PROPERTY_OF, p)? else {
+                        continue;
+                    };
+                    keep(Derivation::derived(
+                        triple.clone(),
+                        rule("rdfs7"),
+                        vec![Derivation::asserted(stored, cx.graph_name(g)), sp],
+                    ));
+                    break 'graphs;
+                }
+            }
+        }
+        if tops.is_empty() {
+            return Ok(Explained::NotFound);
+        }
+        let mut all: Vec<Derivation> = tops.into_values().collect();
+        all.sort_by_key(|d| d.depth);
+        let more = all.len() > max_trees.max(1);
+        all.truncate(max_trees.max(1));
+        finish(&mut all, max_depth);
+        Ok(Explained::Found { trees: all, more })
+    }
+}

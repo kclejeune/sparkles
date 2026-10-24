@@ -89,6 +89,17 @@ impl Reasoning {
         Ok(n)
     }
 
+    /// Why the dataset entails a triple: derivation trees over the materialized
+    /// inferences, or over what RDFS on read answers, from the facts `req.access` reads
+    /// (spec U10 §3.3). A search over its limits fails with a `reasoner` component error
+    /// whose code is [`REASONING_BUDGET`](crate::reasoning::explain::REASONING_BUDGET).
+    pub fn explain(
+        &self,
+        req: &crate::reasoning::explain::ExplainRequest,
+    ) -> Result<crate::reasoning::explain::Explanation> {
+        crate::reasoning::explain::explain(&self.ds, req)
+    }
+
     /// RDFS on read.
     pub fn rdfs(&self) -> RdfsSetting {
         RdfsSetting {

@@ -27,11 +27,13 @@ use crate::engine::{self, CRule, Eval, Mode};
 use crate::facts::Base;
 use crate::graph::{Graph, Triple};
 use crate::incremental::{Plans, bind_head};
-use crate::inputs::GraphRef;
 use crate::terms::Terms;
 use crate::{Extras, Profile};
 use oxrdf::Term;
 use rustc_hash::FxHashMap;
+pub use sparkles_core::explain::{
+    Derivation, DerivationKind, ExplainBudgetExceeded, Explained, RuleRef,
+};
 use sparkles_core::id::{Id, Tag};
 use sparkles_core::index::Perm;
 use sparkles_core::store::Snapshot;
@@ -98,78 +100,6 @@ pub struct ExplainInput<'a> {
     /// the inferred graph, when the caller can read it
     pub inferred: Option<Id>,
 }
-
-/// What a node of a derivation is.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum DerivationKind {
-    /// a fact of an input graph
-    Asserted,
-    /// a fact from a rule with an empty body
-    Axiom,
-    /// a fact a rule instance derived from the node's premises
-    Derived,
-    /// a fact the tree does not expand because it passed the depth limit; another request
-    /// on its triple explains it
-    Ref,
-}
-
-impl DerivationKind {
-    pub fn as_str(self) -> &'static str {
-        match self {
-            DerivationKind::Asserted => "asserted",
-            DerivationKind::Axiom => "axiom",
-            DerivationKind::Derived => "derived",
-            DerivationKind::Ref => "ref",
-        }
-    }
-}
-
-/// The rule of a derived node.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct RuleRef {
-    /// the rule's name in its rule text, or `rule@line N` for an unnamed rule
-    pub name: String,
-    /// the profile the rule belongs to, or the vocabulary that added it
-    pub profile: String,
-    /// the rule's id in the OWL 2 RL tables, for the rules of the `owl-rl` profile that
-    /// carry one
-    pub owl2rl: Option<String>,
-}
-
-/// One node of a derivation tree.
-#[derive(Clone, Debug)]
-pub struct Derivation {
-    /// the node's number in the answer; a fact has one number in all the answer's trees
-    pub id: u32,
-    pub triple: [Term; 3],
-    pub kind: DerivationKind,
-    /// for an asserted node, the input graph that holds the fact
-    pub graph: Option<GraphRef>,
-    /// for a derived node or an axiom, its rule
-    pub rule: Option<RuleRef>,
-    /// the premises, in the order of the rule's body
-    pub premises: Vec<Derivation>,
-    /// whether the node repeats one given earlier in the answer with the same `id`, whose
-    /// premises it leaves out
-    pub shared: bool,
-    /// the depth of the fact's derivation: 0 for an asserted fact, 1 for an axiom
-    pub depth: u32,
-}
-
-/// The answer of an explanation.
-#[derive(Clone, Debug)]
-pub enum Explained {
-    /// derivations from the leaves, the first of the smallest depth, then others whose top
-    /// rule differs, and whether derivations by further rules exist
-    Found { trees: Vec<Derivation>, more: bool },
-    /// no derivation from the leaves exists, or the closure does not hold the triple
-    NotFound,
-}
-
-/// An explanation that passed its limits.
-#[derive(Clone, Debug, thiserror::Error)]
-#[error("{0}")]
-pub struct ExplainBudgetExceeded(pub String);
 
 /// The OWL 2 RL rule id of a rule of the `owl-rl` profile: its name when the name follows
 /// the profile's tables.
@@ -452,12 +382,12 @@ impl Builder<'_, '_> {
         Ok([self.term(t[0])?, self.term(t[1])?, self.term(t[2])?])
     }
 
-    fn graph(&self, g: Id) -> anyhow::Result<GraphRef> {
+    fn graph(&self, g: Id) -> anyhow::Result<String> {
         if g == Id::DEFAULT_GRAPH {
-            return Ok(GraphRef::Default);
+            return Ok("default".to_string());
         }
         match self.term(g.0)? {
-            Term::NamedNode(n) => Ok(GraphRef::Named(n.into_string())),
+            Term::NamedNode(n) => Ok(n.into_string()),
             t => anyhow::bail!("graph {t} is not an IRI"),
         }
     }

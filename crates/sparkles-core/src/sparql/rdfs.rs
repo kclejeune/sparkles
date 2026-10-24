@@ -31,6 +31,9 @@
 //! matched in, and each graph is closed on its own, as in Jena, where every graph of the
 //! dataset is wrapped with the schema.
 
+mod explain;
+pub use explain::SchemaLeaves;
+
 use super::ctx::Ctx;
 use crate::error::Result;
 use crate::id::Id;

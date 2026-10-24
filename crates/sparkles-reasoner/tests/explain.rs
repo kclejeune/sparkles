@@ -188,10 +188,7 @@ fn a_subclass_derivation_names_its_rules_and_graphs() {
         .iter()
         .map(|p| {
             assert_eq!(p.kind, DerivationKind::Asserted);
-            (
-                p.triple[1].to_string(),
-                p.graph.as_ref().unwrap().as_str().to_string(),
-            )
+            (p.triple[1].to_string(), p.graph.clone().unwrap())
         })
         .collect();
     assert_eq!(
@@ -207,7 +204,7 @@ fn a_subclass_derivation_names_its_rules_and_graphs() {
         .find(|p| p.triple[1] == n(&format!("{RDFS}subClassOf")))
         .unwrap();
     assert_eq!(sco.kind, DerivationKind::Asserted);
-    assert_eq!(sco.graph, Some(GraphRef::Named(ONTO.into())));
+    assert_eq!(sco.graph, Some(ONTO.to_string()));
     well_founded(root, &mut Vec::new(), &mut BTreeSet::new());
 }
 
@@ -244,7 +241,7 @@ fn an_asserted_triple_is_its_own_leaf() {
         .unwrap(),
     );
     assert_eq!(ts[0].kind, DerivationKind::Asserted);
-    assert_eq!(ts[0].graph, Some(GraphRef::Named(HR.into())));
+    assert_eq!(ts[0].graph, Some(HR.to_string()));
 }
 
 #[test]
