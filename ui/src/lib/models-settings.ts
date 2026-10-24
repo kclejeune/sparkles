@@ -4,7 +4,15 @@
 // nothing here ever holds one after it is sent.
 
 import { json } from './api';
+import schemas from './models-schema.json';
 import presets from './provider-presets.json';
+import {
+  deref,
+  fieldsOf,
+  type JsonSchema,
+  type SchemaContext,
+  type SchemaSet,
+} from './schema-form';
 import {
   getAt,
   parsePath,
@@ -32,8 +40,6 @@ export const ROLES = [
   'explain',
   'optimize',
 ] as const;
-
-const LEVELS = ['auto', 'json-schema', 'json-object', 'tool', 'text'] as const;
 
 /**
  * A template for a provider with a well-known endpoint. It fills the Add provider form,
@@ -249,215 +255,115 @@ export const providerGroup = (name: string) => `Provider ${name}`;
 export const groupProvider = (group: string) =>
   group.startsWith('Provider ') ? group.slice('Provider '.length) : null;
 
+/** The schemas of the model configuration, from docs/openapi.json (`pnpm models-schema`). */
+export const MODELS_SCHEMA = schemas as unknown as SchemaSet;
+
+const root = MODELS_SCHEMA.ModelsSettings ?? {};
+const PROVIDER_SCHEMA = deref(
+  MODELS_SCHEMA,
+  (root.properties?.providers?.additionalProperties as JsonSchema | undefined) ?? {},
+);
+
 /**
- * The form of the `models` kind: the common fields of each provider and its per-model
- * options, the role lists and the routing settings. Headers and other members the form
- * leaves out are edited in the runtime layer's JSON.
+ * The form of the `models` kind, built from its schema: a group for each provider with
+ * the members that apply to its kind (TLS for https endpoints only), its allowed models
+ * as a list, its per-model options as a card per model and its headers as pairs; then
+ * the role lists as rows of provider and model, and the routing. A role entry picks its
+ * provider from those that answer prompts.
  */
 export function modelFields(k: SettingsKind | null): FieldDef[] {
   const out: FieldDef[] = [];
   const kinds = providerKinds(k);
   const https = httpsProviders(k);
-  for (const name of providerNames(k)) {
-    const at = (m: string) => pathString(['providers', name, ...m.split('.')]);
-    const group = providerGroup(name);
-    const kind = kinds[name];
-    out.push(
-      {
-        path: at('kind'),
-        group,
-        label: 'Protocol',
-        type: 'enum',
-        options: PROVIDER_KINDS,
-      },
-      {
-        path: at('endpoint'),
-        group,
-        label: 'Endpoint',
-        type: 'text',
-        help: 'The base URL. A private address needs --outbound-allow-private.',
-      },
-      {
-        path: at('apiKey.secret'),
-        group,
-        label: 'Key (secret name)',
-        type: 'text',
-        optional: true,
-        placeholder: 'no key',
-        help: 'The secret that holds the key. The key itself is set under API keys.',
-      },
-      {
-        path: at('budget.tokensPerDay'),
-        group,
-        label: 'Tokens per day',
-        type: 'int',
-        min: 1,
-        optional: true,
-        placeholder: 'no cap',
-      },
-      {
-        path: at('concurrency'),
-        group,
-        label: 'Concurrent calls',
-        type: 'int',
-        min: 1,
-        optional: true,
-        fallback: 4,
-      },
-      {
-        path: at('requestsPerMinute'),
-        group,
-        label: 'Requests per minute',
-        type: 'int',
-        min: 1,
-        optional: true,
-        placeholder: 'no limit',
-      },
-      {
-        path: at('allowedModels'),
-        group,
-        label: 'Allowed models',
-        type: 'lines',
-        optional: true,
-        placeholder: 'any model, one per line',
-      },
-      {
-        path: at('contextTokens'),
-        group,
-        label: 'Context tokens',
-        type: 'int',
-        min: 1,
-        optional: true,
-        fallback: 8192,
-      },
-      {
-        path: at('maxOutputTokens'),
-        group,
-        label: 'Output tokens',
-        type: 'int',
-        min: 1,
-        optional: true,
-        fallback: 2048,
-      },
-      {
-        path: at('structuredOutput'),
-        group,
-        label: 'Structured output',
-        type: 'enum',
-        options: LEVELS,
-        optional: true,
-      },
-      {
-        path: at('requestTimeoutSecs'),
-        group,
-        label: 'Request timeout (s)',
-        type: 'number',
-        min: 0.001,
-        optional: true,
-        fallback: 60,
-      },
-    );
-    if (kind === 'ollama')
-      out.push(
-        {
-          path: at('numCtx'),
-          group,
-          label: 'Context (num_ctx)',
-          type: 'int',
-          min: 1,
-          optional: true,
-        },
-        {
-          path: at('keepAlive'),
-          group,
-          label: 'Keep alive',
-          type: 'text',
-          optional: true,
-        },
-      );
-    if (kind === 'anthropic')
-      out.push({
-        path: at('version'),
-        group,
-        label: 'API version',
-        type: 'text',
-        optional: true,
-        placeholder: '2023-06-01',
-      });
-    if (https.includes(name))
-      out.push(
-        {
-          path: at('tls.caCert.file'),
-          group,
-          label: 'CA certificate file',
-          type: 'text',
-          optional: true,
-          placeholder: 'system roots only',
-          help: 'An absolute path on the server to a PEM CA certificate or bundle, trusted for this provider in addition to the system roots. Use it for an internal CA or a self-signed certificate.',
-        },
-        {
-          path: at('tls.caCert.secret'),
-          group,
-          label: 'CA certificate (secret name)',
-          type: 'text',
-          optional: true,
-          placeholder: 'none',
-          help: 'A secret that holds the PEM CA certificate, in place of a file. Set only one of the two.',
-        },
-        {
-          path: at('tls.insecureSkipVerify'),
-          group,
-          label: 'Skip certificate verification',
-          type: 'bool',
-          fallback: false,
-          help: 'Unsafe. The API key and the prompts sent to this provider can be read and changed by anyone on the network path. Saving it on asks for an acknowledgement. Prefer a CA certificate.',
-        },
-      );
-    out.push({
-      path: at('models'),
-      group,
-      label: 'Per-model options',
-      type: 'json',
-      placeholder: '{ "qwen3:8b": { "contextTokens": 32768 } }',
-      help: 'contextTokens, maxOutputTokens, temperature, structuredOutput, pricing, requestTimeoutSecs and numCtx by model.',
-    });
+  const names = providerNames(k);
+  for (const name of names) {
+    const ctx: SchemaContext = {
+      set: MODELS_SCHEMA,
+      kind: kinds[name] || undefined,
+      https: https.includes(name),
+      group: providerGroup(name),
+    };
+    for (const d of fieldsOf(PROVIDER_SCHEMA, ['providers', name], ctx)) {
+      if (d.type === 'map') d.keyLabel = 'model';
+      if (d.type === 'pairs') d.keyLabel = 'header';
+      if (d.type === 'list') d.emptyText = 'No model is allowed.';
+      out.push(d);
+    }
   }
+  const chat = names.filter((n) => kinds[n] !== 'local');
+  const roles = root.properties?.roles;
+  if (roles)
+    for (const d of fieldsOf(roles, ['roles'], { set: MODELS_SCHEMA, group: 'Roles' })) {
+      if (d.type === 'records') {
+        d.entry = d.entry?.map((f) =>
+          f.path === 'provider' ? { ...f, type: 'enum', options: chat, openOptions: true } : f,
+        );
+        d.emptyText = 'Empty list: the role is off.';
+        d.keyLabel = 'entry';
+      }
+      out.push(d);
+    }
+  const routing = root.properties?.routing;
+  if (routing)
+    out.push(...fieldsOf(routing, ['routing'], { set: MODELS_SCHEMA, group: 'Routing' }));
+  return out;
+}
+
+/**
+ * The models to suggest for a provider: those its allowed models, its per-model options,
+ * the role lists and `GET /$/models` name, in that order, each once.
+ */
+export function modelSuggestions(
+  k: SettingsKind | null,
+  status: ModelsStatus | null,
+  provider: string,
+): string[] {
+  const p = (k?.effective.providers as Record<string, JsonObject> | undefined)?.[provider];
+  const out: string[] = [];
+  const add = (m: unknown) => {
+    if (typeof m === 'string' && m && !out.includes(m)) out.push(m);
+  };
+  if (Array.isArray(p?.allowedModels)) p.allowedModels.forEach(add);
+  if (p?.models && typeof p.models === 'object') Object.keys(p.models).forEach(add);
+  for (const list of Object.values((k?.effective.roles as JsonObject | undefined) ?? {}))
+    if (Array.isArray(list))
+      for (const e of list)
+        if (e && (e as JsonObject).provider === provider) add((e as JsonObject).model);
+  status?.providers.find((x) => x.name === provider)?.models.forEach((m) => add(m.name));
+  return out;
+}
+
+/**
+ * The checks of the role lists that need the rest of the configuration, as the server
+ * makes them: a provider that is defined and answers prompts, and a model its allowed
+ * models permit. `effective` is the configuration the pending change gives, so a change
+ * that adds a provider and a role entry naming it passes. The answer is keyed by the
+ * dotted path of the member, such as `roles.draft.1.model`.
+ */
+export function roleErrors(
+  effective: JsonObject | undefined,
+  form: Record<string, unknown>,
+): Record<string, string> {
+  const out: Record<string, string> = {};
+  const providers = (effective?.providers as Record<string, JsonObject> | undefined) ?? {};
   for (const role of ROLES) {
-    const fallback = role === 'repair' ? 'draft' : role === 'community' ? 'summarize' : null;
-    out.push({
-      path: pathString(['roles', role]),
-      group: 'Roles',
-      label: role,
-      type: 'json',
-      placeholder: fallback
-        ? `the ${fallback} list`
-        : '[{ "provider": "local", "model": "qwen3:8b" }]',
-      help: fallback
-        ? `Uses the ${fallback} list when unset. An empty list turns this role off.`
-        : role === 'draft'
-          ? 'Provider and model pairs, from the cheapest to the strongest. Roles without a fallback are off when unset.'
-          : undefined,
+    const list = form[pathString(['roles', role])];
+    if (!Array.isArray(list)) continue;
+    list.forEach((e, i) => {
+      const entry = (e ?? {}) as JsonObject;
+      const provider = typeof entry.provider === 'string' ? entry.provider : '';
+      const model = typeof entry.model === 'string' ? entry.model.trim() : '';
+      const at = (m: string) => pathString(['roles', role, String(i), m]);
+      if (!provider) return;
+      const p = providers[provider];
+      if (!p || typeof p !== 'object')
+        out[at('provider')] = `No provider named ${provider} is defined`;
+      else if (p.kind === 'local')
+        out[at('provider')] = `${provider} computes embeddings and does not answer prompts`;
+      else if (model && Array.isArray(p.allowedModels) && !p.allowedModels.includes(model))
+        out[at('model')] = `${provider} does not allow ${model} (allowed models)`;
     });
   }
-  out.push(
-    {
-      path: 'routing.complexityThreshold',
-      group: 'Routing',
-      label: 'Complexity threshold',
-      type: 'int',
-      min: 0,
-      optional: true,
-    },
-    {
-      path: 'routing.exampleScore',
-      group: 'Routing',
-      label: 'Example score',
-      type: 'number',
-      min: 0,
-      max: 1,
-      optional: true,
-    },
-  );
   return out;
 }
 

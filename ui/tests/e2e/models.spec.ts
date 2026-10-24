@@ -9,6 +9,9 @@ import { expect, open, test } from './fixtures';
 
 const RUNTIME_KEY = 'sk-e2e-runtime-key-never-shown';
 
+// the tests share the server's model configuration
+open.describe.configure({ mode: 'serial' });
+
 open('the Models section edits providers, roles and keys', async ({ page, request }) => {
   // a clean runtime layer, also when the test is retried
   expect((await request.delete('/$/server/settings/models')).ok()).toBe(true);
@@ -95,7 +98,9 @@ open('the Models section edits providers, roles and keys', async ({ page, reques
     expect(await (await request.get(path)).text()).not.toContain(RUNTIME_KEY);
 
   // a role list and the removal of a declared provider override the server config too
-  await row('roles.draft').getByRole('textbox').fill('[{"provider": "claude", "model": "c"}]');
+  const draft = row('roles.draft');
+  await draft.getByLabel('Provider').selectOption('claude');
+  await draft.getByLabel('Model').fill('c');
   await panel.getByRole('button', { name: 'Save', exact: true }).click();
   await expect(row('roles.draft').getByText('overrides server config')).toBeVisible();
   await panel.getByRole('button', { name: 'Remove provider local' }).click();
@@ -196,3 +201,87 @@ test('people without server-admin see no Models section', async ({ page }) => {
   await expect(page.getByRole('heading', { name: 'Readiness' })).toBeVisible();
   await expect(page.getByTestId('models-section')).toHaveCount(0);
 });
+
+open(
+  'a save of allowed models, per-model options and headers round-trips',
+  async ({ page, request }) => {
+    expect((await request.delete('/$/server/settings/models')).ok()).toBe(true);
+    await page.goto('/ui/server');
+    const panel = page.getByTestId('settings-model-configuration');
+    const row = (field: string) => panel.locator(`[data-field="${field}"]`);
+    const save = () => panel.getByRole('button', { name: 'Save', exact: true }).click();
+
+    // allowed models: the model the draft role names first, then a second one above it
+    const allowed = row('providers.local.allowedModels');
+    await expect(allowed).toContainText('Not set: any model');
+    await allowed.getByRole('button', { name: 'Add m' }).click();
+    const add = allowed.getByPlaceholder('Add a model');
+    await add.fill('m2');
+    await add.press('Enter');
+    await allowed.getByRole('button', { name: 'Move m2 up' }).click();
+
+    // per-model options of m2, typed, with an inline error first
+    const models = row('providers.local.models');
+    await models.getByPlaceholder('Add options for a model').fill('m2');
+    await models.getByRole('button', { name: 'Add model' }).click();
+    const card = models.locator('[data-entry="m2"]');
+    await card.getByLabel('Temperature').fill('2.5');
+    await expect(card.getByText('Temperature is at most 2')).toBeVisible();
+    await card.getByLabel('Temperature').fill('0.3');
+    await card.getByLabel('Context tokens').fill('4096');
+    await card.getByLabel('Input price').fill('0.25');
+
+    // a header that is not secret
+    const headers = row('providers.local.headers');
+    await headers.getByPlaceholder('New header').fill('X-Team');
+    await headers.getByLabel('Value of the new header').fill('e2e');
+    await headers.getByRole('button', { name: 'Add', exact: true }).click();
+
+    await save();
+    await expect(page.getByText('Saved the model configuration settings')).toBeVisible();
+    const want = {
+      allowedModels: ['m2', 'm'],
+      models: {
+        m2: {
+          structuredOutput: 'auto',
+          temperature: 0.3,
+          contextTokens: 4096,
+          pricing: { inputPerMTok: 0.25 },
+        },
+      },
+      headers: { 'X-Team': 'e2e' },
+    };
+    const k = await (await request.get('/$/server/settings/models')).json();
+    expect(k.runtime).toEqual({ providers: { local: want } });
+    expect(k.effective.providers.local).toMatchObject({ kind: 'openai', ...want });
+
+    // a reload shows the saved values in the same controls
+    await page.reload();
+    await expect(
+      row('providers.local.allowedModels').getByLabel('Allowed models entry 1'),
+    ).toHaveValue('m2');
+    await expect(
+      row('providers.local.allowedModels').getByLabel('Allowed models entry 2'),
+    ).toHaveValue('m');
+    const again = row('providers.local.models').locator('[data-entry="m2"]');
+    await again.locator('summary').click();
+    await expect(again.getByLabel('Temperature')).toHaveValue('0.3');
+    await expect(again.getByLabel('Input price')).toHaveValue('0.25');
+    await expect(row('providers.local.headers').getByLabel('Value of X-Team')).toHaveValue('e2e');
+    await expect(panel.getByText('unsaved', { exact: true })).toHaveCount(0);
+
+    // the server's refusal of a header that carries a key names the header's row
+    await row('providers.local.headers').getByPlaceholder('New header').fill('Authorization');
+    await row('providers.local.headers').getByLabel('Value of the new header').fill('Bearer x');
+    await row('providers.local.headers').getByRole('button', { name: 'Add', exact: true }).click();
+    await save();
+    await expect(
+      row('providers.local.headers').getByText('the header Authorization carries a key'),
+    ).toBeVisible();
+    expect((await (await request.get('/$/server/settings/models')).json()).runtime).toEqual({
+      providers: { local: want },
+    });
+
+    expect((await request.delete('/$/server/settings/models')).ok()).toBe(true);
+  },
+);

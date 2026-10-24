@@ -343,3 +343,62 @@ fn yaml_has_every_operation() {
     }
     assert!(yaml.contains("openapi: \"3.1.0\"\n"));
 }
+
+/// The schema of a provider names every member the model configuration takes, so the
+/// web UI's form, which is built from it, offers each of them; and the options of one
+/// model are the members a model entry accepts.
+#[test]
+fn model_settings_schema_matches_the_configuration() {
+    let doc = doc();
+    let schemas = &doc["components"]["schemas"];
+    let provider = &schemas["ModelProviderSettings"];
+    let names = |o: &J| -> BTreeSet<String> {
+        o["properties"]
+            .as_object()
+            .unwrap()
+            .keys()
+            .cloned()
+            .collect()
+    };
+    let order = |o: &J| -> BTreeSet<String> {
+        o["x-sparkles-order"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|v| v.as_str().unwrap().to_string())
+            .collect()
+    };
+    let members: BTreeSet<String> = crate::models::PROVIDER_MEMBERS
+        .iter()
+        .map(|m| m.to_string())
+        .collect();
+    assert_eq!(names(provider), members);
+    assert_eq!(order(provider), members);
+    let options = &schemas["ModelOptions"];
+    assert_eq!(order(options), names(options));
+    // each option is a member a model entry accepts
+    let models = r#"{"providers": {"p": {"kind": "local", "models": {"m": OPTS}}}}"#;
+    for (k, v) in options["properties"].as_object().unwrap() {
+        let sample = match v["type"].as_str() {
+            _ if v["enum"].is_array() => v["enum"][0].clone(),
+            Some("integer") | Some("number") => json!(4),
+            Some("object") => json!({}),
+            _ => json!("x"),
+        };
+        let text = models.replace("OPTS", &json!({ k: sample }).to_string());
+        let parsed: serde_json::Result<crate::models::ModelsConfig> = serde_json::from_str(&text);
+        assert!(parsed.is_ok(), "{k}: {parsed:?}");
+    }
+    let tls = &provider["properties"]["tls"];
+    let tls_members: BTreeSet<String> = crate::models::TLS_MEMBERS
+        .iter()
+        .map(|m| m.to_string())
+        .collect();
+    assert_eq!(names(tls), tls_members);
+    let roles = &schemas["ModelsSettings"]["properties"]["roles"];
+    let all: BTreeSet<String> = crate::models::Role::ALL
+        .iter()
+        .map(|r| r.as_str().to_string())
+        .collect();
+    assert_eq!(names(roles), all);
+}

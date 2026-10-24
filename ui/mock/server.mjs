@@ -2395,7 +2395,7 @@ const server = http.createServer(async (req, res) => {
       })
     )
       return;
-    // the model configuration of a server without one (mock/models.mjs)
+    // the model configuration, its keys and its runtime changes (mock/models.mjs)
     if (handleModels(req, res, seg, { send, fail })) return;
     // the facets of a set (mock/facets.mjs)
     if (await handleFacets(req, res, seg, { datasets, send, fail, readBody })) return;

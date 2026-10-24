@@ -247,6 +247,14 @@ panel below it has more workflows and detail views.
     <td>The schema browser</td>
     <td>The k shortest paths between two people</td>
   </tr>
+  <tr>
+    <td><img src="docs/images/models-settings.png" alt="The model configuration form on the server page, with a provider's allowed models as a list of three with buttons to move and remove each, and its per-model options as two open cards with typed fields for context tokens, output tokens, temperature, structured output, request timeout and prices, the empty fields showing the values they inherit"></td>
+    <td><img src="docs/images/models-settings-errors.png" alt="The model configuration form with a new model's card marked 2 errors, saying under its fields that context tokens must be a whole number and that the temperature is at most 2, above the role lists shown as rows of provider and model"></td>
+  </tr>
+  <tr>
+    <td>Allowed models and per-model options as form fields</td>
+    <td>Errors beside the fields of the model configuration</td>
+  </tr>
 </table>
 
 </details>

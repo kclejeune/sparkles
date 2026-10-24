@@ -444,6 +444,71 @@ pub const PROVIDER_MEMBERS: &[&str] = &[
     "documentPrefix",
 ];
 
+/// A check that fails at one field of the configuration. Its message is the check's
+/// own, and `path` names the field below the configuration's root, such as
+/// `["providers", "claude", "models", "m", "temperature"]`, so a form can show the
+/// message beside the field (spec C19 §11.3).
+#[derive(Debug)]
+pub struct FieldError {
+    pub path: Vec<String>,
+    msg: String,
+}
+
+impl std::fmt::Display for FieldError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.msg)
+    }
+}
+
+impl std::error::Error for FieldError {}
+
+fn field_err(path: &[&str], msg: String) -> anyhow::Error {
+    FieldError {
+        path: path.iter().map(|s| s.to_string()).collect(),
+        msg,
+    }
+    .into()
+}
+
+/// Return a [`FieldError`] at the field the members name, with a formatted message.
+macro_rules! fail {
+    ([$($p:expr),* $(,)?], $($arg:tt)+) => {
+        return Err(field_err(&[$(AsRef::<str>::as_ref(&$p)),*], format!($($arg)+)))
+    };
+    ($path:expr, $($arg:tt)+) => {{
+        let path: Vec<String> = $path;
+        let path: Vec<&str> = path.iter().map(String::as_str).collect();
+        return Err(field_err(&path, format!($($arg)+)))
+    }};
+}
+
+/// `e` as a [`FieldError`] below `base`: a field error's path is put after `base`, and
+/// any other error names `base` itself. Call it before adding context, which a
+/// downcast would drop.
+fn under(e: anyhow::Error, base: &[&str]) -> anyhow::Error {
+    let mut path: Vec<String> = base.iter().map(|s| s.to_string()).collect();
+    match e.downcast::<FieldError>() {
+        Ok(f) => {
+            path.extend(f.path);
+            FieldError { path, msg: f.msg }.into()
+        }
+        Err(e) => FieldError {
+            path,
+            msg: format!("{e:#}"),
+        }
+        .into(),
+    }
+}
+
+/// The field that makes `v` an invalid model configuration, when the check that refuses
+/// it names one.
+pub fn invalid_field(v: &serde_json::Value) -> Option<Vec<String>> {
+    let e = ModelsConfig::from_value(v).err()?;
+    e.chain()
+        .find_map(|c| c.downcast_ref::<FieldError>())
+        .map(|f| f.path.clone())
+}
+
 /// Refuse unknown provider members, which serde's `flatten` would ignore.
 fn known_members(cfg: &serde_json::Value) -> Result<()> {
     if let Some(ps) = cfg.get("providers").and_then(|p| p.as_object()) {
@@ -451,7 +516,8 @@ fn known_members(cfg: &serde_json::Value) -> Result<()> {
             if let Some(o) = p.as_object()
                 && let Some(k) = o.keys().find(|k| !PROVIDER_MEMBERS.contains(&k.as_str()))
             {
-                bail!(
+                fail!(
+                    ["providers", name, k],
                     "provider {name}: unknown field `{k}`, expected one of {}",
                     PROVIDER_MEMBERS.join(", ")
                 );
@@ -474,7 +540,8 @@ fn key_references(cfg: &serde_json::Value) -> Result<()> {
                     o.len() == 1 && o.get("secret").is_some_and(serde_json::Value::is_string)
                 });
             if !ok {
-                bail!(
+                fail!(
+                    ["providers", name, "apiKey"],
                     "provider {name}: apiKey must be {{\"secret\": NAME}}; a key's value is stored with PUT /$/server/secrets/{{name}} or --model-secret"
                 );
             }
@@ -501,7 +568,8 @@ fn ca_cert_references(cfg: &serde_json::Value) -> Result<()> {
                             .all(|(k, v)| matches!(k.as_str(), "file" | "secret") && v.is_string())
                 });
             if !ok {
-                bail!(
+                fail!(
+                    ["providers", name, "tls", "caCert"],
                     "provider {name}: tls.caCert must be {{\"file\": PATH}} or {{\"secret\": NAME}}; the certificate itself is never written into the configuration"
                 );
             }
@@ -592,7 +660,10 @@ impl ModelsConfig {
             .keys()
             .find(|k| !matches!(k.as_str(), "providers" | "roles" | "routing"))
         {
-            bail!("unknown field `{k}`, expected one of providers, roles, routing");
+            fail!(
+                [k],
+                "unknown field `{k}`, expected one of providers, roles, routing"
+            );
         }
         known_members(v)?;
         key_references(v)?;
@@ -610,19 +681,33 @@ impl ModelsConfig {
                     .bytes()
                     .all(|c| c.is_ascii_alphanumeric() || matches!(c, b'_' | b'-' | b'.'))
             {
-                bail!("provider name {name:?}: use letters, digits, '_', '-' and '.'");
+                fail!(
+                    ["providers", name],
+                    "provider name {name:?}: use letters, digits, '_', '-' and '.'"
+                );
             }
             if p.kind == Kind::Local {
-                check_local(p).with_context(|| format!("provider {name}"))?;
+                check_local(p)
+                    .map_err(|e| under(e, &["providers", name]))
+                    .with_context(|| format!("provider {name}"))?;
             } else {
-                check_endpoint(&p.endpoint).with_context(|| format!("provider {name}"))?;
+                check_endpoint(&p.endpoint)
+                    .map_err(|e| under(e, &["providers", name, "endpoint"]))
+                    .with_context(|| format!("provider {name}"))?;
             }
             if let Some(k) = &p.api_key {
                 if k.secret.is_empty() {
-                    bail!("provider {name}: apiKey names an empty secret");
+                    fail!(
+                        ["providers", name, "apiKey", "secret"],
+                        "provider {name}: apiKey names an empty secret"
+                    );
                 }
-                check_secret_name(&k.secret)
-                    .map_err(|e| anyhow::anyhow!("provider {name}: apiKey: {e}"))?;
+                if let Err(e) = check_secret_name(&k.secret) {
+                    fail!(
+                        ["providers", name, "apiKey", "secret"],
+                        "provider {name}: apiKey: {e}"
+                    );
+                }
             }
             for (h, v) in &p.headers {
                 let lower = h.to_ascii_lowercase();
@@ -630,81 +715,132 @@ impl ModelsConfig {
                     lower.as_str(),
                     "authorization" | "x-api-key" | "api-key" | "proxy-authorization"
                 ) {
-                    bail!(
+                    fail!(
+                        ["providers", name, "headers", h],
                         "provider {name}: the header {h} carries a key; name the key with apiKey and a secret"
                     );
                 }
                 if axum::http::HeaderName::from_bytes(h.as_bytes()).is_err()
                     || axum::http::HeaderValue::from_str(v).is_err()
                 {
-                    bail!("provider {name}: invalid header {h}");
+                    fail!(
+                        ["providers", name, "headers", h],
+                        "provider {name}: invalid header {h}"
+                    );
                 }
             }
             if let Some(t) = &p.tls {
-                check_tls(t, &p.endpoint).with_context(|| format!("provider {name}"))?;
+                check_tls(t, &p.endpoint)
+                    .map_err(|e| under(e, &["providers", name]))
+                    .with_context(|| format!("provider {name}"))?;
             }
             if p.keep_alive.is_some() && p.kind != Kind::Ollama {
-                bail!("provider {name}: keepAlive applies to the ollama kind only");
+                fail!(
+                    ["providers", name, "keepAlive"],
+                    "provider {name}: keepAlive applies to the ollama kind only"
+                );
             }
             if !p.headers.is_empty() && p.kind != Kind::Openai {
-                bail!("provider {name}: headers apply to the openai kind only");
+                fail!(
+                    ["providers", name, "headers"],
+                    "provider {name}: headers apply to the openai kind only"
+                );
             }
             if p.version.is_some() && p.kind != Kind::Anthropic {
-                bail!("provider {name}: version applies to the anthropic kind only");
+                fail!(
+                    ["providers", name, "version"],
+                    "provider {name}: version applies to the anthropic kind only"
+                );
             }
             if p.concurrency == Some(0) {
-                bail!("provider {name}: concurrency must be at least 1");
+                fail!(
+                    ["providers", name, "concurrency"],
+                    "provider {name}: concurrency must be at least 1"
+                );
             }
             for (m, o) in std::iter::once(("(defaults)", &p.defaults))
                 .chain(p.models.iter().map(|(m, o)| (m.as_str(), o)))
             {
-                check_options(o).with_context(|| format!("provider {name}, model {m}"))?;
-                if p.kind != Kind::Local && local_members_elsewhere(o) {
-                    bail!(
+                // the defaults are members of the provider itself
+                let base: Vec<&str> = if m == "(defaults)" {
+                    vec!["providers", name]
+                } else {
+                    vec!["providers", name, "models", m]
+                };
+                let at = |member: &str| {
+                    let mut v: Vec<String> = base.iter().map(|s| s.to_string()).collect();
+                    v.push(member.to_string());
+                    v
+                };
+                check_options(o)
+                    .map_err(|e| under(e, &base))
+                    .with_context(|| format!("provider {name}, model {m}"))?;
+                if p.kind != Kind::Local
+                    && let Some(member) = local_member_elsewhere(o)
+                {
+                    fail!(
+                        at(member),
                         "provider {name}, model {m}: repo, revision, path, dtype, threads, idleUnloadSecs, dimensions, maxTokens, queryPrefix and documentPrefix apply to the local kind only"
                     );
                 }
                 if o.num_ctx.is_some() && p.kind != Kind::Ollama {
-                    bail!("provider {name}, model {m}: numCtx applies to the ollama kind only");
+                    fail!(
+                        at("numCtx"),
+                        "provider {name}, model {m}: numCtx applies to the ollama kind only"
+                    );
                 }
                 if o.structured_output == Some(Level::JsonObject) && p.kind == Kind::Anthropic {
-                    bail!(
+                    fail!(
+                        at("structuredOutput"),
                         "provider {name}, model {m}: the anthropic kind offers no json-object level"
                     );
                 }
                 if o.structured_output == Some(Level::Tool) && p.kind == Kind::Ollama {
-                    bail!("provider {name}, model {m}: the ollama kind offers no tool level");
+                    fail!(
+                        at("structuredOutput"),
+                        "provider {name}, model {m}: the ollama kind offers no tool level"
+                    );
                 }
             }
-            for t in [p.connect_timeout_secs] {
-                if let Some(t) = t
-                    && !(t.is_finite() && t > 0.0)
-                {
-                    bail!("provider {name}: timeouts must be positive numbers of seconds");
-                }
+            if let Some(t) = p.connect_timeout_secs
+                && !(t.is_finite() && t > 0.0)
+            {
+                fail!(
+                    ["providers", name, "connectTimeoutSecs"],
+                    "provider {name}: timeouts must be positive numbers of seconds"
+                );
             }
         }
         for (role, list) in &self.roles {
-            for pair in list {
+            for (i, pair) in list.iter().enumerate() {
+                let i = i.to_string();
+                let r = role.as_str();
                 let Some(p) = self.providers.get(&pair.provider) else {
-                    bail!(
+                    fail!(
+                        ["roles", r, i, "provider"],
                         "role {}: no provider named {:?} is defined",
                         role.as_str(),
                         pair.provider
                     );
                 };
                 if pair.model.is_empty() {
-                    bail!("role {}: an entry names no model", role.as_str());
+                    fail!(
+                        ["roles", r, i, "model"],
+                        "role {}: an entry names no model",
+                        role.as_str()
+                    );
                 }
                 if p.kind == Kind::Local {
-                    bail!(
+                    fail!(
+                        ["roles", r, i, "provider"],
                         "role {}: provider {} is of the local kind, which computes embeddings and does not answer prompts",
                         role.as_str(),
                         pair.provider
                     );
                 }
                 if !p.allows(&pair.model) {
-                    bail!(
+                    fail!(
+                        ["roles", r, i, "model"],
                         "role {}: provider {} does not allow the model {:?} (allowedModels)",
                         role.as_str(),
                         pair.provider,
@@ -712,7 +848,11 @@ impl ModelsConfig {
                     );
                 }
                 if pair.max_output_tokens == Some(0) {
-                    bail!("role {}: maxOutputTokens must be at least 1", role.as_str());
+                    fail!(
+                        ["roles", r, i, "maxOutputTokens"],
+                        "role {}: maxOutputTokens must be at least 1",
+                        role.as_str()
+                    );
                 }
             }
         }
@@ -731,20 +871,23 @@ impl ModelsConfig {
 
 fn check_options(o: &ModelOptions) -> Result<()> {
     if o.context_tokens == Some(0) {
-        bail!("contextTokens must be at least 1");
+        fail!(["contextTokens"], "contextTokens must be at least 1");
     }
     if o.max_output_tokens == Some(0) {
-        bail!("maxOutputTokens must be at least 1");
+        fail!(["maxOutputTokens"], "maxOutputTokens must be at least 1");
     }
     if let Some(t) = o.temperature
         && !(t.is_finite() && (0.0..=2.0).contains(&t))
     {
-        bail!("temperature must be between 0 and 2");
+        fail!(["temperature"], "temperature must be between 0 and 2");
     }
     if let Some(t) = o.request_timeout_secs
         && !(t.is_finite() && t > 0.0)
     {
-        bail!("requestTimeoutSecs must be a positive number of seconds");
+        fail!(
+            ["requestTimeoutSecs"],
+            "requestTimeoutSecs must be a positive number of seconds"
+        );
     }
     if let Some(p) = o.pricing
         && !(p.input_per_m_tok.is_finite()
@@ -752,7 +895,7 @@ fn check_options(o: &ModelOptions) -> Result<()> {
             && p.output_per_m_tok.is_finite()
             && p.output_per_m_tok >= 0.0)
     {
-        bail!("pricing must hold non-negative numbers");
+        fail!(["pricing"], "pricing must hold non-negative numbers");
     }
     Ok(())
 }
@@ -764,19 +907,30 @@ fn check_tls(t: &TlsConfig, endpoint: &str) -> Result<()> {
         .get(..8)
         .is_some_and(|s| s.eq_ignore_ascii_case("https://"));
     if (t.ca_cert.is_some() || t.insecure_skip_verify) && !https {
-        bail!("tls applies to https endpoints only, and {endpoint:?} is not one");
+        fail!(
+            ["tls"],
+            "tls applies to https endpoints only, and {endpoint:?} is not one"
+        );
     }
     if let Some(c) = &t.ca_cert {
         match (&c.file, &c.secret) {
             (Some(f), None) => {
                 if !std::path::Path::new(f).is_absolute() {
-                    bail!("tls.caCert.file {f:?}: use an absolute path");
+                    fail!(
+                        ["tls", "caCert", "file"],
+                        "tls.caCert.file {f:?}: use an absolute path"
+                    );
                 }
             }
             (None, Some(s)) => {
-                check_secret_name(s).map_err(|e| anyhow::anyhow!("tls.caCert: {e}"))?;
+                if let Err(e) = check_secret_name(s) {
+                    fail!(["tls", "caCert", "secret"], "tls.caCert: {e}");
+                }
             }
-            _ => bail!("tls.caCert names either a file or a secret"),
+            _ => fail!(
+                ["tls", "caCert"],
+                "tls.caCert names either a file or a secret"
+            ),
         }
     }
     Ok(())
@@ -787,60 +941,83 @@ fn check_tls(t: &TlsConfig, endpoint: &str) -> Result<()> {
 /// members.
 fn check_local(p: &ProviderConfig) -> Result<()> {
     if !p.endpoint.is_empty() {
-        bail!("the local kind takes no endpoint");
+        fail!(["endpoint"], "the local kind takes no endpoint");
     }
     if p.api_key.is_some() {
-        bail!("the local kind takes no apiKey");
+        fail!(["apiKey"], "the local kind takes no apiKey");
     }
     for (m, o) in &p.models {
         let o = o.over(&p.defaults);
         let what = format!("model {m}");
         match (&o.repo, &o.revision, &o.path) {
             (Some(r), Some(v), None) => {
-                sparkles_modelstore::check_repo(r).map_err(|e| anyhow::anyhow!("{what}: {e}"))?;
+                if let Err(e) = sparkles_modelstore::check_repo(r) {
+                    fail!(["models", m, "repo"], "{what}: {e}");
+                }
                 if !sparkles_modelstore::is_pinned(v) {
-                    bail!("{what}: revision must be a full 40-character commit id, not {v:?}");
+                    fail!(
+                        ["models", m, "revision"],
+                        "{what}: revision must be a full 40-character commit id, not {v:?}"
+                    );
                 }
             }
             (None, None, Some(path)) => {
                 if !std::path::Path::new(path).is_absolute() {
-                    bail!("{what}: path must be absolute");
+                    fail!(["models", m, "path"], "{what}: path must be absolute");
                 }
             }
-            _ => bail!("{what}: give repo and revision, or path"),
+            _ => fail!(["models", m], "{what}: give repo and revision, or path"),
         }
         if let Some(d) = &o.dtype
             && !matches!(d.as_str(), "f32" | "bf16")
         {
-            bail!("{what}: dtype must be f32 or bf16");
+            fail!(["models", m, "dtype"], "{what}: dtype must be f32 or bf16");
         }
         if o.threads.is_some_and(|t| t == 0 || t > 256) {
-            bail!("{what}: threads must be 1 to 256");
+            fail!(["models", m, "threads"], "{what}: threads must be 1 to 256");
         }
         if o.dimensions == Some(0) || o.max_tokens.is_some_and(|t| t < 2) {
-            bail!("{what}: dimensions must be at least 1 and maxTokens at least 2");
+            let member = if o.dimensions == Some(0) {
+                "dimensions"
+            } else {
+                "maxTokens"
+            };
+            fail!(
+                ["models", m, member],
+                "{what}: dimensions must be at least 1 and maxTokens at least 2"
+            );
         }
-        for t in [&o.query_prefix, &o.document_prefix].into_iter().flatten() {
-            if t.len() > 4096 {
-                bail!("{what}: queryPrefix and documentPrefix take at most 4096 bytes");
+        for (member, t) in [
+            ("queryPrefix", &o.query_prefix),
+            ("documentPrefix", &o.document_prefix),
+        ] {
+            if t.as_ref().is_some_and(|t| t.len() > 4096) {
+                fail!(
+                    ["models", m, member],
+                    "{what}: queryPrefix and documentPrefix take at most 4096 bytes"
+                );
             }
         }
     }
     Ok(())
 }
 
-/// Whether a provider of another kind sets a member of the local kind.
-fn local_members_elsewhere(o: &ModelOptions) -> bool {
-    o.repo.is_some()
-        || o.revision.is_some()
-        || o.path.is_some()
-        || o.dtype.is_some()
-        || o.threads.is_some()
-        || o.idle_unload_secs.is_some()
-        || o.dimensions.is_some()
-        || o.max_tokens.is_some()
-        || o.query_prefix.is_some()
-        || o.document_prefix.is_some()
+/// The first member of the local kind that a provider of another kind sets.
+fn local_member_elsewhere(o: &ModelOptions) -> Option<&'static str> {
+    [
+        ("repo", o.repo.is_some()),
+        ("revision", o.revision.is_some()),
+        ("path", o.path.is_some()),
+        ("dtype", o.dtype.is_some()),
+        ("threads", o.threads.is_some()),
+        ("idleUnloadSecs", o.idle_unload_secs.is_some()),
+        ("dimensions", o.dimensions.is_some()),
+        ("maxTokens", o.max_tokens.is_some()),
+        ("queryPrefix", o.query_prefix.is_some()),
+        ("documentPrefix", o.document_prefix.is_some()),
+    ]
+    .into_iter()
+    .find_map(|(m, set)| set.then_some(m))
 }
 
 /// An endpoint is an absolute `http` or `https` URL without credentials, a query or a

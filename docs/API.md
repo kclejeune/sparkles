@@ -12151,6 +12151,26 @@ endpoints and secrets here, unlike a dataset's settings, but never a key's value
 `{"path": "providers.local", "declared": {...}, "runtime": null}`.
 `sparkles settings --global` and the **Models** section of the UI use these routes.
 
+The `ModelsSettings` schema of the OpenAPI description gives each member of `models` with
+its type, bounds and description, and the UI builds its form from it. Its extensions
+`x-sparkles-order`, `x-sparkles-kinds`, `x-sparkles-secret`, `x-sparkles-unset` and
+`x-sparkles-section` give the order of the members, the provider kinds a member applies
+to, the strings that name a secret, what an unset member means and the heading it belongs
+under. A write of `models` that leaves the configuration invalid is a `400` with
+`bad-settings`, and when the failed check concerns one field, `field` names it as a
+dotted path:
+
+```json
+{
+  "error": "models: provider claude, model claude-haiku-5-5: temperature must be between 0 and 2",
+  "code": "bad-settings",
+  "field": "providers.claude.models.claude-haiku-5-5.temperature"
+}
+```
+
+A dot inside a name is escaped with `\`, as in the paths of `sources`. A body whose
+member has the wrong type, such as text for a number, names no field.
+
 Every change is logged at INFO under the `sparkles::audit` target as the event
 `server_settings_changed`, with the `kind`, the `operation`, the changed `fields` as
 dotted paths and the `principal`.

@@ -1602,7 +1602,7 @@ fn server_settings(put: &mut dyn FnMut(&str, J)) {
                 json!({
                     "scope": string_enum(&["server"]),
                     "kind": string_enum(&["models"]),
-                    "effective": any_object("The effective model configuration: `providers`, `roles` and `routing`, from the built-in defaults, `--model-config` and the runtime layer, with the locked fields from the declared configuration."),
+                    "effective": any_object("The effective object. For `models` it is a `ModelsSettings`: `providers`, `roles` and `routing`, from the built-in defaults, `--model-config` and the runtime layer, with the locked fields from the declared configuration."),
                     "declared": any_object("The model configuration of `--model-config`."),
                     "runtime": any_object("The runtime layer kept in `<dataDir>/models.json`. `null` for a provider removes a declared provider."),
                     "sources": { "type": "object", "description": "The source of each field of `effective`, by dotted path such as `providers.claude.endpoint`.", "additionalProperties": source },

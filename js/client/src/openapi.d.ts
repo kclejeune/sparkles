@@ -2729,7 +2729,7 @@ export interface paths {
         head?: never;
         /**
          * Change server settings fields
-         * @description Merges the body into the runtime layer as RFC 7396 says. Providers merge member by member, and `null` for a declared provider removes it. A role list is one field. Headers that carry credentials and endpoints with credentials, a query or a fragment are refused. A change to a locked field is a `409` with `locked-by-config`. Requests that start after the change use it. Needs server `admin`.
+         * @description Merges the body into the runtime layer as RFC 7396 says. Providers merge member by member, and `null` for a declared provider removes it. A role list is one field. Headers that carry credentials and endpoints with credentials, a query or a fragment are refused. A change to a locked field is a `409` with `locked-by-config`. A change that leaves the model configuration invalid is a `400` with `bad-settings`, and its `field` names the field that fails as a dotted path, such as `providers.claude.models.m.temperature`, when the check names one. Requests that start after the change use it. Needs server `admin`.
          */
         patch: operations["patchServerSettings"];
         trace?: never;
@@ -6912,6 +6912,329 @@ export interface components {
             uptimeSeconds: number;
             version: string;
         };
+        /** @description The options of one model of a provider. A member left out takes the provider's value, then the built-in default. */
+        ModelOptions: {
+            /**
+             * Context tokens
+             * @description The tokens the model reads at most, prompt and answer together.
+             * @default 8192
+             */
+            contextTokens: number;
+            /**
+             * Dimensions
+             * @description Truncate the vectors to this many components.
+             */
+            dimensions?: number;
+            /**
+             * Document prefix
+             * @description Text put before stored documents, in place of the snapshot's prompt.
+             */
+            documentPrefix?: string;
+            /**
+             * Weights type
+             * @description The type the weights are computed in.
+             * @enum {string}
+             */
+            dtype?: "f32" | "bf16";
+            /**
+             * Unload after
+             * @description Seconds without work before the weights are dropped. 0 keeps them.
+             */
+            idleUnloadSecs?: number;
+            /**
+             * Output tokens
+             * @description The tokens of one answer at most.
+             * @default 2048
+             */
+            maxOutputTokens: number;
+            /**
+             * Tokens per text
+             * @description The tokens of one text at most, up to the model's own limit.
+             */
+            maxTokens?: number;
+            /**
+             * Context (num_ctx)
+             * @description Ollama's context option, sent with each call.
+             */
+            numCtx?: number;
+            /**
+             * Snapshot path
+             * @description An absolute snapshot directory on the server, in place of repo and revision.
+             */
+            path?: string;
+            /**
+             * Pricing
+             * @description Prices per million tokens, for cost estimates only.
+             */
+            pricing?: {
+                /**
+                 * Input price
+                 * @description The price of a million input tokens. A model's prices replace the provider's both at once.
+                 * @default 0
+                 */
+                inputPerMTok: number;
+                /**
+                 * Output price
+                 * @description The price of a million output tokens. A model's prices replace the provider's both at once.
+                 * @default 0
+                 */
+                outputPerMTok: number;
+            };
+            /**
+             * Query prefix
+             * @description Text put before queries, in place of the snapshot's query prompt.
+             */
+            queryPrefix?: string;
+            /**
+             * Repository
+             * @description The Hugging Face repository of the model's snapshot.
+             */
+            repo?: string;
+            /**
+             * Request timeout
+             * @description How long one call may take.
+             * @default 60
+             */
+            requestTimeoutSecs: number;
+            /**
+             * Revision
+             * @description The snapshot's full 40-character commit.
+             */
+            revision?: string;
+            /**
+             * Structured output
+             * @description How answers are held to a JSON Schema. `auto` tries json-schema, then json-object, then text, and keeps the first that works. The anthropic kind offers no json-object level and the ollama kind no tool level.
+             * @default auto
+             * @enum {string}
+             */
+            structuredOutput: "auto" | "json-schema" | "json-object" | "tool" | "text";
+            /**
+             * Temperature
+             * @description Sampling temperature from 0 to 2. Other kinds send 0 when it is unset, and the anthropic kind sends nothing.
+             */
+            temperature?: number;
+            /**
+             * Threads
+             * @description The threads of the model's inference pool, from 1 to 256.
+             */
+            threads?: number;
+        };
+        /** @description One provider of the model configuration: its protocol, endpoint, key and limits, the defaults of its models (the members in the `Model defaults` section) and the options of each model. */
+        ModelProviderSettings: {
+            /**
+             * Allowed models
+             * @description The models that role lists may name with this provider. When it is unset, any model is allowed.
+             */
+            allowedModels?: string[];
+            /**
+             * API key
+             * @description The key, named by a secret and never written here.
+             */
+            apiKey?: {
+                /**
+                 * API key
+                 * @description The secret that holds the key. The key itself is stored with Set key or under API keys and is never shown.
+                 */
+                secret: string;
+            };
+            /**
+             * Budget
+             * @description Token caps of the provider.
+             */
+            budget?: {
+                /**
+                 * Tokens per day
+                 * @description Input and output tokens per day at most. 0 stops every call.
+                 */
+                tokensPerDay?: number;
+            };
+            /**
+             * Concurrent calls
+             * @description The calls to this provider that may run at once.
+             * @default 4
+             */
+            concurrency: number;
+            /**
+             * Connect timeout
+             * @description How long opening a connection may take.
+             * @default 10
+             */
+            connectTimeoutSecs: number;
+            /**
+             * Context tokens
+             * @description The tokens the model reads at most, prompt and answer together.
+             * @default 8192
+             */
+            contextTokens: number;
+            /**
+             * Dimensions
+             * @description Truncate the vectors to this many components.
+             */
+            dimensions?: number;
+            /**
+             * Document prefix
+             * @description Text put before stored documents, in place of the snapshot's prompt.
+             */
+            documentPrefix?: string;
+            /**
+             * Weights type
+             * @description The type the weights are computed in.
+             * @enum {string}
+             */
+            dtype?: "f32" | "bf16";
+            /**
+             * Endpoint
+             * Format: uri
+             * @description The base URL, http or https, without credentials, a query or a fragment. A private address needs --outbound-allow-private.
+             */
+            endpoint?: string;
+            /**
+             * Headers
+             * @description Extra request headers that are not secret. Headers that carry a key, such as Authorization, are refused.
+             */
+            headers?: {
+                [key: string]: string;
+            };
+            /**
+             * Unload after
+             * @description Seconds without work before the weights are dropped. 0 keeps them.
+             */
+            idleUnloadSecs?: number;
+            /**
+             * Keep alive
+             * @description How long Ollama keeps the model loaded, as a duration such as 10m or 1h, or -1 to keep it.
+             */
+            keepAlive?: string;
+            /**
+             * Protocol
+             * @description The protocol the provider speaks. The local kind runs embedding models in the server and takes no endpoint or key.
+             * @enum {string}
+             */
+            kind: "ollama" | "openai" | "anthropic" | "local";
+            /**
+             * Output tokens
+             * @description The tokens of one answer at most.
+             * @default 2048
+             */
+            maxOutputTokens: number;
+            /**
+             * Tokens per text
+             * @description The tokens of one text at most, up to the model's own limit.
+             */
+            maxTokens?: number;
+            /**
+             * Per-model options
+             * @description Options by model name. A model's entry overrides the provider's defaults above for that model.
+             */
+            models?: {
+                [key: string]: components["schemas"]["ModelOptions"];
+            };
+            /**
+             * Context (num_ctx)
+             * @description Ollama's context option, sent with each call.
+             */
+            numCtx?: number;
+            /**
+             * Snapshot path
+             * @description An absolute snapshot directory on the server, in place of repo and revision.
+             */
+            path?: string;
+            /**
+             * Pricing
+             * @description Prices per million tokens, for cost estimates only.
+             */
+            pricing?: {
+                /**
+                 * Input price
+                 * @description The price of a million input tokens. A model's prices replace the provider's both at once.
+                 * @default 0
+                 */
+                inputPerMTok: number;
+                /**
+                 * Output price
+                 * @description The price of a million output tokens. A model's prices replace the provider's both at once.
+                 * @default 0
+                 */
+                outputPerMTok: number;
+            };
+            /**
+             * Query prefix
+             * @description Text put before queries, in place of the snapshot's query prompt.
+             */
+            queryPrefix?: string;
+            /**
+             * Repository
+             * @description The Hugging Face repository of the model's snapshot.
+             */
+            repo?: string;
+            /**
+             * Request timeout
+             * @description How long one call may take.
+             * @default 60
+             */
+            requestTimeoutSecs: number;
+            /**
+             * Requests per minute
+             * @description The calls per minute at most. 0 sets no limit.
+             */
+            requestsPerMinute?: number;
+            /**
+             * Revision
+             * @description The snapshot's full 40-character commit.
+             */
+            revision?: string;
+            /**
+             * Structured output
+             * @description How answers are held to a JSON Schema. `auto` tries json-schema, then json-object, then text, and keeps the first that works. The anthropic kind offers no json-object level and the ollama kind no tool level.
+             * @default auto
+             * @enum {string}
+             */
+            structuredOutput: "auto" | "json-schema" | "json-object" | "tool" | "text";
+            /**
+             * Temperature
+             * @description Sampling temperature from 0 to 2. Other kinds send 0 when it is unset, and the anthropic kind sends nothing.
+             */
+            temperature?: number;
+            /**
+             * Threads
+             * @description The threads of the model's inference pool, from 1 to 256.
+             */
+            threads?: number;
+            /**
+             * TLS
+             * @description How the provider's certificate is checked.
+             */
+            tls?: {
+                /**
+                 * CA certificate
+                 * @description A PEM CA certificate or bundle trusted for this provider in addition to the system roots, named by a file or a secret. Set only one of the two.
+                 */
+                caCert?: {
+                    /**
+                     * CA certificate file
+                     * @description An absolute path on the server to a PEM CA certificate or bundle. Use it for an internal CA or a self-signed certificate.
+                     */
+                    file?: string;
+                    /**
+                     * CA certificate secret
+                     * @description A secret that holds the PEM CA certificate, in place of a file.
+                     */
+                    secret?: string;
+                };
+                /**
+                 * Skip certificate verification
+                 * @description Unsafe. The API key and the prompts sent to this provider can be read and changed by anyone on the network path. Prefer a CA certificate.
+                 * @default false
+                 */
+                insecureSkipVerify: boolean;
+            };
+            /**
+             * API version
+             * @description The anthropic-version header.
+             * @default 2023-06-01
+             */
+            version: string;
+        };
         /** @description The model providers, their models and the role lists. */
         ModelProviders: {
             /** @description Whether the server runs with `--model-config`. */
@@ -7063,6 +7386,29 @@ export interface components {
                 [key: string]: unknown;
             };
         };
+        /** @description One entry of a role list: a provider and model, with optional caps. */
+        ModelRolePair: {
+            /**
+             * Output tokens
+             * @description Caps the answer of this entry below the model's own cap.
+             */
+            maxOutputTokens?: number;
+            /**
+             * Model
+             * @description A model of the provider that its allowed models permit.
+             */
+            model: string;
+            /**
+             * Provider
+             * @description A provider of the configuration, of a kind other than local.
+             */
+            provider: string;
+            /**
+             * Request timeout
+             * @description The timeout of this entry, in place of the model's.
+             */
+            requestTimeoutSecs?: number;
+        };
         /** @description A test call to one provider and model. */
         ModelTestRequest: {
             /** @description The model to test. By default the first one the role lists name. */
@@ -7106,6 +7452,78 @@ export interface components {
                 }[];
             }[];
             days: number;
+        };
+        /**
+         * Model configuration
+         * @description The model configuration of `--model-config` and of the `models` kind of `/$/server/settings/models`: providers, role lists and routing. The web UI builds its form from this schema.
+         */
+        ModelsSettings: {
+            /**
+             * Providers
+             * @description The providers by name. A name has letters, digits, _, - and . only.
+             */
+            providers?: {
+                [key: string]: components["schemas"]["ModelProviderSettings"];
+            };
+            /**
+             * Roles
+             * @description The provider and model pairs each step calls, in order. A role list is one field.
+             */
+            roles?: {
+                /**
+                 * community
+                 * @description The reports of GraphRAG communities. It uses the summarize list when unset, and an empty list turns it off.
+                 */
+                community?: components["schemas"]["ModelRolePair"][];
+                /**
+                 * draft
+                 * @description The first draft of a query from a question. The first entry answers, and the server moves to the next only on the signals it verifies. The role is off when unset.
+                 */
+                draft?: components["schemas"]["ModelRolePair"][];
+                /**
+                 * explain
+                 * @description The prose of a query explanation. The role is off when unset.
+                 */
+                explain?: components["schemas"]["ModelRolePair"][];
+                /**
+                 * extract
+                 * @description Extraction from document chunks and the CSV mapping draft. The role is off when unset.
+                 */
+                extract?: components["schemas"]["ModelRolePair"][];
+                /**
+                 * optimize
+                 * @description A proposed query rewrite. The role is off when unset.
+                 */
+                optimize?: components["schemas"]["ModelRolePair"][];
+                /**
+                 * repair
+                 * @description A new draft after a diagnosis. It uses the draft list when unset, and an empty list turns it off.
+                 */
+                repair?: components["schemas"]["ModelRolePair"][];
+                /**
+                 * summarize
+                 * @description The answer from the rows. The role is off when unset.
+                 */
+                summarize?: components["schemas"]["ModelRolePair"][];
+            };
+            /**
+             * Routing
+             * @description When a question starts at the second entry of a role list.
+             */
+            routing?: {
+                /**
+                 * Complexity threshold
+                 * @description A query whose complexity score reaches it starts repair, or the next draft, at the second entry of its list. A dataset's assistant settings can override it.
+                 * @default 8
+                 */
+                complexityThreshold: number;
+                /**
+                 * Example score
+                 * @description The score from 0 to 1 that the best stored example needs before its complexity counts.
+                 * @default 0.8
+                 */
+                exampleScore: number;
+            };
         };
         /** @description A named snapshot: the commit it pins and its expiry. */
         NamedSnapshot: {
@@ -8282,7 +8700,7 @@ export interface components {
             declared: {
                 [key: string]: unknown;
             };
-            /** @description The effective model configuration: `providers`, `roles` and `routing`, from the built-in defaults, `--model-config` and the runtime layer, with the locked fields from the declared configuration. */
+            /** @description The effective object. For `models` it is a `ModelsSettings`: `providers`, `roles` and `routing`, from the built-in defaults, `--model-config` and the runtime layer, with the locked fields from the declared configuration. */
             effective: {
                 [key: string]: unknown;
             };
@@ -16197,7 +16615,7 @@ export interface operations {
             };
             cookie?: never;
         };
-        /** @description Fields of the kind: `providers`, `roles` and `routing` of `models`, or `enabled`, `server`, `baseUrl`, `repeatEvery`, `channels`, `routes` and `delivery` of `notifications`. */
+        /** @description Fields of the kind: `providers`, `roles` and `routing` of `models` (`ModelsSettings`), or `enabled`, `server`, `baseUrl`, `repeatEvery`, `channels`, `routes` and `delivery` of `notifications`. */
         requestBody: {
             content: {
                 "application/json": Record<string, never>;
@@ -16271,7 +16689,7 @@ export interface operations {
             };
             cookie?: never;
         };
-        /** @description Fields of the kind: `providers`, `roles` and `routing` of `models`, or `enabled`, `server`, `baseUrl`, `repeatEvery`, `channels`, `routes` and `delivery` of `notifications`. */
+        /** @description Fields of the kind: `providers`, `roles` and `routing` of `models` (`ModelsSettings`), or `enabled`, `server`, `baseUrl`, `repeatEvery`, `channels`, `routes` and `delivery` of `notifications`. */
         requestBody: {
             content: {
                 "application/json": Record<string, never>;

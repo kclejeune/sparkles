@@ -36,7 +36,7 @@ pub use client::body_bytes;
 pub use client::{CallError, ChatRequest, Message};
 pub use config::{
     DEFAULT_CONTEXT_TOKENS, Kind, Level, ModelsConfig, PROVIDER_MEMBERS, Pair, ProviderConfig,
-    Role, Routing, TLS_MEMBERS, check_secret_name,
+    Role, Routing, TLS_MEMBERS, check_secret_name, invalid_field,
 };
 #[cfg(test)]
 pub use structured::validate;

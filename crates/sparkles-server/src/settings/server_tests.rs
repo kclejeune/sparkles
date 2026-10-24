@@ -302,6 +302,77 @@ async fn models_layers_and_routes() {
     );
 }
 
+/// A refused write names the field that fails, as a dotted path, so a form can show the
+/// message beside it. A check without a field leaves `field` out.
+#[tokio::test(flavor = "multi_thread")]
+async fn refused_writes_name_the_field() {
+    let f = fixture(declared_models("http://127.0.0.1:9/v1"), None, true);
+    for (patch, field) in [
+        (
+            json!({"providers": {"local": {"models": {"m.x": {"temperature": 3}}}}}),
+            Some("providers.local.models.m\\.x.temperature"),
+        ),
+        (
+            json!({"providers": {"claude": {"contextTokens": 0}}}),
+            Some("providers.claude.contextTokens"),
+        ),
+        (
+            json!({"providers": {"local": {"concurrency": 0}}}),
+            Some("providers.local.concurrency"),
+        ),
+        (
+            json!({"providers": {"local": {"endpoint": "ftp://h.example"}}}),
+            Some("providers.local.endpoint"),
+        ),
+        (
+            json!({"providers": {"local": {"apiKey": {"secret": ".bad"}}}}),
+            Some("providers.local.apiKey.secret"),
+        ),
+        (
+            json!({"providers": {"local": {"keepAlive": "5m"}}}),
+            Some("providers.local.keepAlive"),
+        ),
+        (
+            json!({"providers": {"local": {"headers": {"X-Api-Key": "k"}}}}),
+            Some("providers.local.headers.X-Api-Key"),
+        ),
+        (
+            json!({"providers": {"local": {"tls": {"caCert": {"file": "rel.pem"}}}}}),
+            Some("providers.local.tls"),
+        ),
+        (
+            json!({"providers": {"claude": {"tls": {"caCert": {"file": "rel.pem"}}}}}),
+            Some("providers.claude.tls.caCert.file"),
+        ),
+        (
+            json!({"providers": {"claude": {"structuredOutput": "json-object"}}}),
+            Some("providers.claude.structuredOutput"),
+        ),
+        (
+            json!({"providers": {"local": {"allowedModels": ["a"]}}}),
+            Some("roles.draft.0.model"),
+        ),
+        (
+            json!({"roles": {"extract": [{"provider": "local", "model": "m"}, {"provider": "nope", "model": "m"}]}}),
+            Some("roles.extract.1.provider"),
+        ),
+        (
+            json!({"providers": {"local": {"x": 1}}}),
+            Some("providers.local.x"),
+        ),
+        // a type error from the parser names no field
+        (
+            json!({"providers": {"local": {"concurrency": "two"}}}),
+            None,
+        ),
+    ] {
+        let (s, v, _) = send(&f.app, "PATCH", MODELS_URI, Some(patch.clone())).await;
+        assert_eq!(s, StatusCode::BAD_REQUEST, "{patch}: {v}");
+        assert_eq!(v["code"], "bad-settings", "{patch}: {v}");
+        assert_eq!(v["field"].as_str(), field, "{patch}: {v}");
+    }
+}
+
 /// The checks of the model configuration apply to the effective object.
 #[tokio::test(flavor = "multi_thread")]
 async fn credentials_and_bad_endpoints_are_refused() {
