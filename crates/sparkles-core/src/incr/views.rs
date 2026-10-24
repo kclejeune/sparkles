@@ -195,6 +195,14 @@ pub struct ViewInfo {
     /// time spent in passes and in `recompute` nodes, in milliseconds
     pub pass_ms: f64,
     pub recompute_ms: f64,
+    /// `recompute` when every relevant commit evaluates the whole query again, as on a
+    /// dataset with RDFS on read or materialized inferences, `incremental` otherwise
+    /// (absent while the view has no circuit)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub evaluation: Option<super::ops::Mode>,
+    /// why the whole query is evaluated again
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub evaluation_reason: Option<String>,
     /// the plan with each operator's mode
     #[serde(skip_serializing_if = "Option::is_none")]
     pub plan: Option<PlanNode>,

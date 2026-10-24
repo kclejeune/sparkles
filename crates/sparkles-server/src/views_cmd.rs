@@ -191,6 +191,15 @@ fn state_text(v: &J) -> String {
     }
 }
 
+/// How the view is kept: `incremental`, or `recompute (why)`.
+fn evaluation_text(v: &J) -> String {
+    match (v["evaluation"].as_str(), v["evaluationReason"].as_str()) {
+        (Some(m), Some(why)) => format!("{m} ({why})"),
+        (Some(m), None) => m.to_string(),
+        (None, _) => "-".to_string(),
+    }
+}
+
 fn plan_text(p: &J, depth: usize, out: &mut String) {
     let pad = "  ".repeat(depth);
     let mode = p["mode"].as_str().unwrap_or("");
@@ -215,9 +224,10 @@ fn print(out: &J, format: &str) -> Result<()> {
         }
         for v in views {
             println!(
-                "{}  {}  {} rows  {}",
+                "{}  {}  {}  {} rows  {}",
                 v["name"].as_str().unwrap_or("?"),
                 state_text(v),
+                evaluation_text(v),
                 v["rows"],
                 sparkles::error::human_bytes(v["stateBytes"].as_u64().unwrap_or(0))
             );
@@ -230,9 +240,10 @@ fn print(out: &J, format: &str) -> Result<()> {
     }
     if out.get("definition").is_some() {
         println!(
-            "{}: {}, {} rows at commit {}, {} passes ({} skipped)",
+            "{}: {}, {}, {} rows at commit {}, {} passes ({} skipped)",
             out["name"].as_str().unwrap_or("?"),
             state_text(out),
+            evaluation_text(out),
             out["rows"],
             out["commit"],
             out["passes"],
@@ -386,6 +397,15 @@ pub fn live(server: Option<&str>, insecure: bool, ds: &str, query: &str, fmt: &s
 mod tests {
     use super::*;
 
+    /// The listing says when a view evaluates its query again, and why.
+    #[test]
+    fn the_listing_shows_the_mode() {
+        let v =
+            serde_json::json!({ "evaluation": "recompute", "evaluationReason": "RDFS on read" });
+        assert_eq!(evaluation_text(&v), "recompute (RDFS on read)");
+        assert_eq!(evaluation_text(&serde_json::json!({})), "-");
+    }
+
     #[test]
     fn local_views_are_managed() {
         let dir = tempfile::tempdir().unwrap();
@@ -422,6 +442,7 @@ mod tests {
         print(&j, "text").unwrap();
         let j = local(&db, &args(ViewsCmd::List), StoreOptions::default()).unwrap();
         assert_eq!(j["views"][0]["name"], "sizes");
+        assert_eq!(evaluation_text(&j["views"][0]), "incremental");
         print(&j, "text").unwrap();
         let j = local(
             &db,

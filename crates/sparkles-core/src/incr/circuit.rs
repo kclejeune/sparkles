@@ -3,6 +3,7 @@
 
 use super::compile::{Compiled, Kind};
 use super::footprint::{Footprint, Resolved};
+use super::inference::{Inference, InferredFootprint};
 use super::ops::{Node, PlanNode};
 use super::pass::{Pass, PassStats, Vis};
 use super::persist::{Reader, Writer};
@@ -157,6 +158,13 @@ pub struct Circuit {
     pub max_memory_bytes: Option<u64>,
     /// the query's base IRI, for expressions and evaluations
     pub base: Option<oxiri::Iri<String>>,
+    /// what the dataset's queries read beyond the stored quads: the circuit is then one
+    /// `recompute` node evaluated with it
+    pub inference: Option<Arc<Inference>>,
+    /// the query's pattern and dataset clause
+    pub pattern: spargebra::algebra::GraphPattern,
+    pub dataset: Option<spargebra::algebra::QueryDataset>,
+    inferred: InferredFootprint,
 }
 
 impl Circuit {
@@ -179,6 +187,10 @@ impl Circuit {
             last: PassStats::default(),
             max_memory_bytes: None,
             base: c.base,
+            inference: None,
+            pattern: c.pattern,
+            dataset: c.dataset,
+            inferred: InferredFootprint::default(),
         }
     }
 
@@ -222,12 +234,15 @@ impl Circuit {
         );
         p.max_memory_bytes = self.max_memory_bytes;
         p.base = self.base.clone();
+        p.inference = self.inference.clone();
         (p, &mut self.root)
     }
 
     /// Evaluate the circuit from scratch at `snap`.
     pub fn build(&mut self, snap: Arc<Snapshot>, control: &Control) -> Result<()> {
         self.terms = Terms::default();
+        // the schema may have changed in changes no pass saw
+        self.inferred = InferredFootprint::default();
         let vis = Vis::new(self.access.as_ref(), &snap);
         let (mut p, root) = self.pass(snap.clone(), None, &[], &[], &vis, control);
         let out = root.init(&mut p)?;
@@ -267,6 +282,7 @@ impl Circuit {
         self.terms = terms;
         self.snap = Some(snap.clone());
         self.resolved = None;
+        self.inferred = InferredFootprint::default();
         Ok(())
     }
 
@@ -321,9 +337,24 @@ impl Circuit {
         let vis = Vis::new(self.access.as_ref(), &snap);
         // protections that depend on the data make the whole query one `recompute`
         // node, and a change anywhere, even in a graph the principal cannot read, can
-        // change what they hide: every change runs the pass
-        if super::runtime::whole_reason(self.access.as_ref()).is_some() {
-            if d.added.is_empty() && d.removed.is_empty() {
+        // change what they hide: every change runs the pass. Inference makes the whole
+        // query one `recompute` node too, which runs when the changes touch its
+        // footprint over the inferred data.
+        let whole = super::runtime::whole_reason(self.access.as_ref()).is_some();
+        if whole || self.inference.is_some() {
+            let skip = match &self.inference {
+                Some(inf) if !whole => !self.inferred.touches(
+                    inf,
+                    &self.pattern,
+                    self.dataset.is_some(),
+                    &snap,
+                    &d.added,
+                    &d.removed,
+                    &vis,
+                )?,
+                _ => d.added.is_empty() && d.removed.is_empty(),
+            };
+            if skip {
                 self.applied = snap.commit;
                 self.snap = Some(snap);
                 return Ok(Advance::Skipped);

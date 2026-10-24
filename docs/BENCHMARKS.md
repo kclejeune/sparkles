@@ -2153,6 +2153,14 @@ views. The run with no views came first and paid for a cold page cache. With 100
 single worker thread falls behind the writer and needs 5.4 seconds after the last commit to
 catch up. Item 223 tracks passes on several threads.
 
+On a dataset with RDFS on read or materialized inferences, a view evaluates its whole query
+again with them, and item 221 tracks maintaining it incrementally. The test
+`inferred_pass_against_query` in the same file adds a small schema to the data and, for the
+materialized case, an inferred `rdf:type` per person. It then makes 100 commits that touch
+each view and 100 that do not, and compares the round after a touching commit with a
+one-off evaluation of the query. Its numbers are not published yet, and item 265 tracks
+running it and the commit path without views on forge.
+
 ## Bindings
 
 The bindings embed the engine in a JVM, Python or Node.js process. The comparison of

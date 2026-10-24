@@ -835,14 +835,31 @@ of F16's derived-fact layer if F16 chooses it.
 
 **Deviations.**
 
-- Views read the stored quads. RDFS on read refuses views and live queries as §4.5 says,
-  and so does a materialization whose inferred graph joins the default graph, since a
-  circuit's default graph leaves it out. When either is turned on later, the views are
-  detached with an error and live queries end with a `not-incremental` event. Item 221
-  tracks reading the inferred graph in circuits.
+- §4.5 refuses RDFS on read. Instead, a view or live query on a dataset with RDFS on
+  read, or whose materialized inferences join the default graph, evaluates its whole
+  query again. Its circuit is one `recompute` node that the query engine runs with the
+  dataset's inference, so its rows are those of a one-off query with the same options.
+  The footprint is that of the query rewritten over stored triples for the current
+  schema. A change of `rdfs:subClassOf`, `rdfs:subPropertyOf`, `rdfs:domain` or
+  `rdfs:range` in the schema's graph touches every such circuit, and a change in the
+  inferred graph counts as a change of the default graph. Item 221 tracks maintaining
+  these views incrementally.
+- Turning RDFS on read or the materialized inferences on or off compiles every circuit
+  again for the new setting and evaluates it on the next round. Views stay attached, and
+  live queries receive the difference as a diff or a `reset`. A live query resumed at or
+  before the commit of the switch gets the whole result, because the switch changed the
+  rows without a commit. A read of a view after the setting changed never returns the
+  rows of the old mode.
+- A view's state reports `evaluation`, which is `recompute` with an `evaluationReason`
+  when every relevant commit evaluates the whole query again, and `incremental`
+  otherwise. Protections that depend on the data report `recompute` as well.
+- A checkpoint's fingerprint includes the inference settings, with a fixed schema named by
+  a hash of its triples. A state written in the other mode is built again rather than
+  loaded, and the checkpoint format keeps version 1.
 - Backups and clones do not carry view definitions, because the backup layout has no
   path for nested settings files. Item 220 tracks it.
 - PUT starts a `view-build` task that waits for the first evaluation on the worker,
   rather than running the evaluation in the task.
 
-**Measurements.** See [BENCHMARKS](../BENCHMARKS.md#incremental-views).
+**Measurements.** See [BENCHMARKS](../BENCHMARKS.md#incremental-views). The harness for
+views on inferred data is in place, and item 265 tracks its forge run.

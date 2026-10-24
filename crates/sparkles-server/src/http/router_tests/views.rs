@@ -193,3 +193,92 @@ async fn live_queries_stream_snapshots_and_diffs() {
     .await;
     assert_eq!(r.status, StatusCode::BAD_REQUEST, "{}", r.text());
 }
+
+/// The SPARQL JSON bindings of `q` at the query endpoint, as sorted values of `?p`.
+async fn people(s: &Server, q: &str) -> Vec<String> {
+    let r = send(
+        &s.app,
+        Request::get(format!("/ds/sparql?query={}", enc(q)))
+            .header("accept", "application/sparql-results+json")
+            .body(Body::empty())
+            .unwrap(),
+    )
+    .await;
+    assert_eq!(r.status, StatusCode::OK, "{}", r.text());
+    let mut v: Vec<String> = r.json()["results"]["bindings"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|b| b["p"]["value"].as_str().unwrap().to_string())
+        .collect();
+    v.sort();
+    v
+}
+
+/// With RDFS on read, a view and a live query evaluate their query again with it and
+/// say so, and turning it off switches them back without ending the stream.
+#[tokio::test]
+async fn views_and_live_queries_run_with_rdfs_on_read() {
+    let s = server();
+    let r = send(&s.app, req("PUT", "/$/rdfs/ds", r#"{"graph":"default"}"#)).await;
+    assert_eq!(r.status, StatusCode::OK, "{}", r.text());
+    let q = "PREFIX ex: <http://example.org/> SELECT ?p WHERE { ?p a ex:Person }";
+    let body = serde_json::json!({ "query": q }).to_string();
+    let r = send(&s.app, req("PUT", "/$/views/ds/people", &body)).await;
+    assert!(r.status.is_success(), "{}", r.text());
+    let read = "PREFIX view: <urn:x-sparkles:view#> SELECT ?p WHERE { SERVICE view:read { [] view:name \"people\" ; view:bind ?p } }";
+    assert_eq!(people(&s, read).await, people(&s, q).await);
+    assert_eq!(people(&s, q).await.len(), 2);
+    let r = send(&s.app, req("GET", "/$/views/ds/people", "")).await;
+    let j = r.json();
+    assert_eq!(j["evaluation"], "recompute", "{j}");
+    assert_eq!(j["evaluationReason"], "RDFS on read", "{j}");
+    let r = send(&s.app, req("GET", "/$/views/ds", "")).await;
+    assert_eq!(r.json()["views"][0]["evaluation"], "recompute");
+
+    let res = s
+        .app
+        .clone()
+        .oneshot(
+            Request::get(format!("/ds/live?query={}", enc(q)))
+                .header("accept", "text/event-stream")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(res.status(), StatusCode::OK);
+    let mut stream = res.into_body().into_data_stream();
+    let mut buf = String::new();
+    let (ev, data) = next(&mut stream, &mut buf).await;
+    assert_eq!(ev, "snapshot");
+    let j: J = serde_json::from_str(&data).unwrap();
+    assert_eq!(j["rows"].as_array().unwrap().len(), 2, "{j}");
+    s.state
+        .get("ds")
+        .unwrap()
+        .dataset
+        .update("PREFIX ex: <http://example.org/> INSERT DATA { ex:erin a ex:Student }")
+        .unwrap();
+    let (ev, data) = next(&mut stream, &mut buf).await;
+    assert_eq!(ev, "diff", "{data}");
+    let j: J = serde_json::from_str(&data).unwrap();
+    assert_eq!(
+        j["added"][0]["values"][0]["value"],
+        "http://example.org/erin"
+    );
+    assert_eq!(people(&s, read).await, people(&s, q).await);
+
+    // RDFS on read off: the students leave the stream and the view
+    let r = send(&s.app, req("DELETE", "/$/rdfs/ds", "")).await;
+    assert!(r.status.is_success(), "{}", r.text());
+    let (ev, data) = next(&mut stream, &mut buf).await;
+    assert_eq!(ev, "diff", "{data}");
+    let j: J = serde_json::from_str(&data).unwrap();
+    assert_eq!(j["removed"].as_array().unwrap().len(), 2, "{j}");
+    assert_eq!(people(&s, read).await, ["http://example.org/bob"]);
+    let r = send(&s.app, req("GET", "/$/views/ds/people", "")).await;
+    let j = r.json();
+    assert_eq!(j["evaluation"], "incremental", "{j}");
+    assert!(j.get("evaluationReason").is_none(), "{j}");
+}

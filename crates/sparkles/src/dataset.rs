@@ -179,6 +179,8 @@ impl DatasetState {
             crate::reasoning::write_record(root, record.as_ref())?;
         }
         *self.reasoning.write() = record;
+        // views and live queries switch to the new default graph
+        self.views.kick();
         Ok(())
     }
 }

@@ -47,3 +47,24 @@ def test_close_wakes_a_waiting_iterator() -> None:
     t.join(timeout=10)
     assert not t.is_alive()
     assert out == [None]
+
+
+def test_views_recompute_with_rdfs_on_read() -> None:
+    ds = sparkles.Dataset.memory()
+    ds.update(
+        "INSERT DATA { <urn:Student> <http://www.w3.org/2000/01/rdf-schema#subClassOf> <urn:Person> ."
+        " <urn:a> a <urn:Student> }"
+    )
+    people = "SELECT ?x WHERE { ?x a <urn:Person> }"
+    info = ds.views.put("people", people, wait=30)
+    assert info["evaluation"] == "incremental"
+    assert ds.views.read("people")["rows"] == []
+    ds.reasoning.rdfs.set(graph="default")
+    assert len(ds.views.read("people")["rows"]) == 1
+    view = ds.views.get("people")
+    assert view is not None
+    assert view["evaluation"] == "recompute"
+    assert view["evaluationReason"] == "RDFS on read"
+    ds.reasoning.rdfs.reset()
+    assert ds.views.read("people")["rows"] == []
+    assert ds.views.list()[0]["evaluation"] == "incremental"

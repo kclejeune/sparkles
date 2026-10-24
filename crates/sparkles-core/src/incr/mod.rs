@@ -13,6 +13,7 @@
 pub mod circuit;
 pub mod compile;
 pub mod footprint;
+pub mod inference;
 pub mod live;
 pub mod ops;
 pub mod pass;
@@ -29,6 +30,7 @@ mod tests;
 
 pub use circuit::{Circuit, DeltaSet};
 pub use compile::{Compiled, Kind, compile};
+pub use inference::Inference;
 pub use live::{LiveEvent, LiveOptions, LiveQuery, LiveRow};
 pub use ops::{Mode, PlanNode};
 pub use runtime::{Host, OpenHost, Runtime, RuntimeOptions, RuntimeStats};

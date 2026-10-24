@@ -19154,6 +19154,18 @@
             "description": "With `failed`: why.",
             "type": "string"
           },
+          "evaluation": {
+            "description": "`recompute` when every relevant commit evaluates the whole query again, as on a dataset with RDFS on read or materialized inferences. Absent while the view has no circuit.",
+            "enum": [
+              "incremental",
+              "recompute"
+            ],
+            "type": "string"
+          },
+          "evaluationReason": {
+            "description": "With `recompute`: why the whole query is evaluated again.",
+            "type": "string"
+          },
           "name": {
             "type": "string"
           },
@@ -19305,6 +19317,18 @@
                 },
                 "error": {
                   "description": "With `failed`: why.",
+                  "type": "string"
+                },
+                "evaluation": {
+                  "description": "`recompute` when every relevant commit evaluates the whole query again, as on a dataset with RDFS on read or materialized inferences. Absent while the view has no circuit.",
+                  "enum": [
+                    "incremental",
+                    "recompute"
+                  ],
+                  "type": "string"
+                },
+                "evaluationReason": {
+                  "description": "With `recompute`: why the whole query is evaluated again.",
                   "type": "string"
                 },
                 "name": {

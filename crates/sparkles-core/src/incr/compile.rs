@@ -52,6 +52,17 @@ pub struct Compiled {
     pub footprint: Footprint,
     /// the query's base IRI
     pub base: Option<oxiri::Iri<String>>,
+    /// the query's pattern and dataset clause, which a circuit over inferred data reads
+    /// its footprint from
+    pub pattern: GP,
+    pub dataset: Option<QueryDataset>,
+}
+
+/// The footprint of `gp` read in the default graph.
+pub(crate) fn pattern_footprint(gp: &GP) -> Footprint {
+    let mut fp = Footprint::default();
+    footprint_of(gp, &Scope::Default, &mut fp);
+    fp
 }
 
 /// The error of a query that cannot be a view or a live query (`400 not-incremental`).
@@ -1452,7 +1463,7 @@ impl C {
 }
 
 /// Compile a parsed query. `whole` names a reason to evaluate the whole query again on
-/// every relevant commit (protections that depend on the data).
+/// every relevant commit (protections that depend on the data, or inference).
 pub fn compile(q: &Query, whole: Option<&str>) -> Result<Compiled> {
     if let Some(f) = refused(q) {
         return Err(not_incremental(&f));
@@ -1562,5 +1573,7 @@ pub fn compile(q: &Query, whole: Option<&str>) -> Result<Compiled> {
         root,
         footprint,
         base,
+        pattern: pattern.clone(),
+        dataset: dataset.cloned(),
     })
 }

@@ -9282,6 +9282,13 @@ export interface components {
             definition: components["schemas"]["ViewDefinition"];
             /** @description With `failed`: why. */
             error?: string;
+            /**
+             * @description `recompute` when every relevant commit evaluates the whole query again, as on a dataset with RDFS on read or materialized inferences. Absent while the view has no circuit.
+             * @enum {string}
+             */
+            evaluation?: "incremental" | "recompute";
+            /** @description With `recompute`: why the whole query is evaluated again. */
+            evaluationReason?: string;
             name: string;
             passMs?: number;
             passes?: number;
@@ -9336,6 +9343,13 @@ export interface components {
                 definition?: components["schemas"]["ViewDefinition"];
                 /** @description With `failed`: why. */
                 error?: string;
+                /**
+                 * @description `recompute` when every relevant commit evaluates the whole query again, as on a dataset with RDFS on read or materialized inferences. Absent while the view has no circuit.
+                 * @enum {string}
+                 */
+                evaluation?: "incremental" | "recompute";
+                /** @description With `recompute`: why the whole query is evaluated again. */
+                evaluationReason?: string;
                 name: string;
                 passMs?: number;
                 passes?: number;
