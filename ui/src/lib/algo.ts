@@ -296,7 +296,7 @@ type RunAnswer = {
   head: { vars: string[] };
   results: { bindings: Row[] };
   summary?: Record<string, unknown> | null;
-  run?: { commit: number; cached: boolean; rows: number };
+  run?: { commit: number; cached: boolean; rows: number; truncated?: boolean };
 };
 
 /** The answer of `POST /$/algo/{ds}/run`: `202` with a task, or the rows. */
@@ -339,17 +339,21 @@ async function postRun(path: string, body: unknown, signal?: AbortSignal): Promi
   return res.status === 202 ? { task: j } : { answer: j };
 }
 
-const sleep = (ms: number, signal?: AbortSignal) =>
+const aborted = (signal: AbortSignal) => signal.reason ?? new DOMException('aborted', 'AbortError');
+
+/** Wait `ms`, or reject at once when `signal` aborts, before or while it waits. */
+export const sleep = (ms: number, signal?: AbortSignal) =>
   new Promise<void>((resolve, reject) => {
-    const t = setTimeout(resolve, ms);
-    signal?.addEventListener(
-      'abort',
-      () => {
-        clearTimeout(t);
-        reject(signal.reason ?? new DOMException('aborted', 'AbortError'));
-      },
-      { once: true },
-    );
+    if (signal?.aborted) return reject(aborted(signal));
+    const onAbort = () => {
+      clearTimeout(t);
+      reject(aborted(signal!));
+    };
+    const t = setTimeout(() => {
+      signal?.removeEventListener('abort', onAbort);
+      resolve();
+    }, ms);
+    signal?.addEventListener('abort', onAbort, { once: true });
   });
 
 /**
@@ -368,9 +372,11 @@ export async function runProjection(
 ): Promise<AlgoRows> {
   const post = ctx.post ?? postRun;
   const getTask = ctx.getTask ?? api.getTask;
-  const q = new URLSearchParams();
-  if (ctx.at) q.set('at', ctx.at);
-  const path = `/$/algo/${encodeURIComponent(ctx.ds)}/run${q.size ? `?${q}` : ''}`;
+  const pathAt = (at: string | undefined) => {
+    const q = new URLSearchParams();
+    if (at) q.set('at', at);
+    return `/$/algo/${encodeURIComponent(ctx.ds)}/run${q.size ? `?${q}` : ''}`;
+  };
   const base = {
     algorithm: spec.id,
     projection: 'name' in projection ? projection.name : { predicates: projection.predicates },
@@ -379,9 +385,9 @@ export async function runProjection(
   };
   const chunks = chunk(iris, MAX_RUN_NODES);
   if (!chunks.length) chunks.push([]);
-  const ask = (nodes: readonly string[], background: boolean) =>
+  const ask = (nodes: readonly string[], background: boolean, at = ctx.at) =>
     post(
-      path,
+      pathAt(at),
       {
         ...base,
         nodes,
@@ -390,13 +396,19 @@ export async function runProjection(
       },
       ctx.signal,
     );
+  const check = () => {
+    if (ctx.signal?.aborted) throw aborted(ctx.signal);
+  };
   let first = await ask(chunks[0], true);
+  // the commit every read must come from, once the run has one
+  let commit: number | undefined;
   if ('task' in first) {
     let t: api.Task = first.task;
     ctx.onTask?.(t);
     while (t.state === 'running' || t.state === 'queued') {
       await sleep(ctx.poll ?? 500, ctx.signal);
       t = await getTask(t.id);
+      check();
       ctx.onTask?.(t);
     }
     if (t.state !== 'done')
@@ -405,19 +417,38 @@ export async function runProjection(
           ? 'The run was cancelled.'
           : `The run failed: ${t.message ?? 'no message'}`,
       );
-    const kept = (t.detail as { kept?: boolean } | undefined)?.kept;
-    if (kept === false)
+    const detail = t.detail as { kept?: boolean; commit?: number } | undefined;
+    if (detail?.kept === false)
       throw new Error(
         'The run finished, but the server had no memory to keep its result. Narrow the projection, or try again later.',
       );
-    first = await ask(chunks[0], false);
+    commit = detail?.commit;
+    // read the kept result at the run's commit, not at a head that may have moved on
+    first = await ask(
+      chunks[0],
+      false,
+      ctx.at ?? (commit != null ? `commit:${commit}` : undefined),
+    );
     if ('task' in first) throw new Error('The kept result went away before it could be read.');
   }
   const answers: RunAnswer[] = [first.answer];
+  commit ??= first.answer.run?.commit;
+  const pinned = ctx.at ?? (commit != null ? `commit:${commit}` : undefined);
   for (const c of chunks.slice(1)) {
-    const a = await ask(c, false);
+    check();
+    const a = await ask(c, false, pinned);
     if ('task' in a) throw new Error('The kept result went away before it could be read.');
     answers.push(a.answer);
+  }
+  for (const a of answers) {
+    if (commit != null && a.run?.commit != null && a.run.commit !== commit)
+      throw new Error(
+        `The dataset changed while the lens read the run: commit ${a.run.commit} instead of ${commit}.`,
+      );
+    if (a.run?.truncated)
+      throw new Error(
+        `The server cut the answer at its row limit, so the lens has only part of the run (${a.results.bindings.length} rows). Ask for fewer nodes, or raise the limit.`,
+      );
   }
   const rows = answers.flatMap((a) => a.results.bindings);
   // the summary is not a row here: give it to the reader as the first row's

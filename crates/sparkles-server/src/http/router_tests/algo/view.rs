@@ -225,6 +225,11 @@ async fn background_runs_are_joined_cancelled_and_kept() {
     assert_eq!(st, StatusCode::OK, "{j}");
     assert_eq!(j["run"]["cached"], true);
     assert_eq!(j["results"]["bindings"][0]["communitySize"]["value"], "2");
+    // the UI reads a finished run at its commit, which is the head here
+    let at = format!("paused?at=commit:{}", detail["commit"]);
+    let (st, j) = run(&s, &at, &sync).await;
+    assert_eq!(st, StatusCode::OK, "{j}");
+    assert_eq!(j["run"]["cached"], true, "{j}");
 }
 
 #[tokio::test]

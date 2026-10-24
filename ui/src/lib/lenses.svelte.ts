@@ -368,6 +368,8 @@ export class Lenses {
         this.#caches.clear();
         this.#dropInferred();
       }
+      // what the algorithm lenses offer depends on the state shown: read it again once read
+      if (this.#algoKey && stateChanged) void this.loadAlgoOptions();
       this.#schedule(stateChanged);
     });
   }
@@ -473,8 +475,10 @@ export class Lenses {
   async cancel(channel: Channel) {
     const task = this.status[channel].task;
     this.#ctl[channel]?.abort();
-    this.#seq[channel]++;
+    const seq = ++this.#seq[channel];
     const ok = task ? await cancelRun(task) : true;
+    // a newer run of the channel started while the cancel was on its way: its status stays
+    if (this.#seq[channel] !== seq) return;
     this.status[channel] = {
       busy: false,
       note: ok
@@ -786,6 +790,13 @@ export class Lenses {
         });
       }
       case 'graphrag': {
+        // checked against the graph as it is now, not when the options were last read (§6)
+        if (input.branch && input.branch !== 'main')
+          throw new Error('GraphRAG communities are built on main, and this graph shows a branch.');
+        if (input.past ?? !!input.at)
+          throw new Error(
+            'GraphRAG communities describe the head, and this graph shows a past state.',
+          );
         const gr = this.algo.graphrag;
         if (!gr)
           throw new Error(this.algo.graphragOff ?? 'The dataset has no GraphRAG communities.');

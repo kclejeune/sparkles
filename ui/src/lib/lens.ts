@@ -223,13 +223,17 @@ export function stableIndex(
       const p = before.get(id);
       if (p != null && !claimed.has(p)) overlap.set(p, (overlap.get(p) ?? 0) + 1);
     }
+    // the largest overlap among the earlier communities this one may take the colour of:
+    // it holds at least half of them, and their colour is still free
     let best: [string, number] | null = null;
-    for (const [p, n] of overlap)
+    for (const [p, n] of overlap) {
+      const idx = prev.index.get(p);
+      const size = prev.members.get(p)?.size ?? 0;
+      if (idx == null || idx >= OTHER || used.has(idx) || n * 2 < size) continue;
       if (!best || n > best[1] || (n === best[1] && p < best[0])) best = [p, n];
+    }
     if (!best) continue;
-    const idx = prev.index.get(best[0]);
-    const size = prev.members.get(best[0])?.size ?? 0;
-    if (idx == null || idx >= OTHER || used.has(idx) || best[1] * 2 < size) continue;
+    const idx = prev.index.get(best[0])!;
     out.set(cat, idx);
     used.add(idx);
     claimed.add(best[0]);

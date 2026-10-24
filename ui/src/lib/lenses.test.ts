@@ -1,5 +1,5 @@
-import { describe, expect, it } from 'vitest';
-import type { QueryOptions, Term } from './api';
+import { afterEach, describe, expect, it, vi } from 'vitest';
+import type { QueryOptions, Task, Term } from './api';
 import { Lenses, resultState, type LensInput } from './lenses.svelte';
 import type { LensEdge, LensNode, SelectFn } from './lens-sources';
 
@@ -298,6 +298,59 @@ describe('algorithm lenses (Phase 2)', () => {
     expect(tops.length).toBeGreaterThanOrEqual(2);
     expect(tops.every((t) => t === 1000)).toBe(true);
     expect(l.results.size?.summary).toMatch(/^the top 1 of 20,001 drawn nodes/);
+    l.destroy();
+  });
+
+  afterEach(() => vi.unstubAllGlobals());
+
+  it('refuses the GraphRAG lens at a past state although its options were read at the head (§6)', async () => {
+    const fetches = vi.fn(async () => new Response('{}', { status: 500 }));
+    vi.stubGlobal('fetch', fetches);
+    const { l } = lenses(() => []);
+    l.setInput(input({ nodes: people, at: 'commit:2', past: true }));
+    // the options as read at the head, before the slider moved
+    l.algo = { projections: [], projectionOff: null, graphrag: { levels: [0] }, graphragOff: null };
+    l.set('colour', { lens: 'graphrag' });
+    await settleLong();
+    expect(l.status.colour.error).toMatch(/past state/);
+    expect(fetches).not.toHaveBeenCalled();
+    l.destroy();
+  });
+
+  it('keeps the status of a newer run when a cancel answers late (§2.3)', async () => {
+    vi.stubGlobal(
+      'fetch',
+      vi.fn(
+        () =>
+          new Promise<Response>((r) =>
+            setTimeout(() => r(new Response('{}', { status: 202 })), 60),
+          ),
+      ),
+    );
+    const { l } = lenses(() => []);
+    let n = 0;
+    l.projectionHooks = {
+      poll: 5,
+      post: async (_p, body) => ({
+        task: {
+          id: `${(body as { projection: string }).projection}-${++n}`,
+          state: 'running',
+        } as unknown as Task,
+      }),
+      getTask: async (id) => ({ id, state: 'running', progress: 0.5 }) as unknown as Task,
+    };
+    l.setInput(input({ nodes: people }));
+    l.set('size', { lens: 'pageRank', scope: 'projection', projection: 'name:a' });
+    await settle();
+    expect(l.status.size.task).toMatch(/^a-/);
+    const cancelled = l.cancel('size');
+    l.set('size', { lens: 'pageRank', scope: 'projection', projection: 'name:b' });
+    await settle();
+    expect(l.status.size.task).toMatch(/^b-/);
+    await cancelled;
+    expect(l.status.size.task).toMatch(/^b-/);
+    expect(l.status.size.busy).toBe(true);
+    expect(l.status.size.note).not.toBe('Cancelled.');
     l.destroy();
   });
 });

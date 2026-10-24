@@ -171,6 +171,6 @@ test('A12: at 390 px the algorithm options fit the bottom sheet without scrollin
   await expect(page.getByTestId('lens-status-colour')).toContainText(/communit/, {
     timeout: 15_000,
   });
-  await expectNoSidewaysScroll(page);
+  await expectNoSidewaysScroll(page, 'Explore with the algorithm options open');
   await ctx.close();
 });

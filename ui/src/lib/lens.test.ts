@@ -296,6 +296,31 @@ describe('stable community colours (§2.3)', () => {
     expect(i.get('q')).toBe(1);
   });
 
+  it('picks the largest overlap among the earlier communities that qualify', () => {
+    const xs = Array.from({ length: 10 }, (_, i) => `x${i}`);
+    const ys = ['y0', 'y1', 'y2'];
+    const before = {
+      members: new Map([
+        ['X', new Set(xs)],
+        ['Y', new Set(ys)],
+      ]),
+      index: new Map([
+        ['X', 0],
+        ['Y', 1],
+      ]),
+    };
+    const o: Record<string, string> = {};
+    // n holds four of X's ten, below half, and all three of Y
+    for (const id of [...xs.slice(0, 4), ...ys]) o[id] = 'n';
+    for (const id of xs.slice(4)) o[id] = 'm';
+    // a larger new community that would take a freed colour first
+    for (let i = 0; i < 8; i++) o[`new${i}`] = 'l';
+    const index = stableIndex(vals(o), before);
+    expect(index.get('n')).toBe(1);
+    expect(index.get('m')).toBe(0);
+    expect(index.get('l')).toBe(2);
+  });
+
   it('sends communities beyond the palette to "other"', () => {
     const o: Record<string, string> = {};
     for (let i = 0; i < 15; i++) o[`n${i}`] = `c${i}`;

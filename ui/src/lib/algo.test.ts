@@ -9,6 +9,7 @@ import {
   readRows,
   runParams,
   runProjection,
+  sleep,
   summaryText,
   type ProjectionContext,
 } from './algo';
@@ -195,6 +196,88 @@ describe('projection runs (§3.2)', () => {
       );
     await expect(run({ state: 'cancelled' })).rejects.toThrow('cancelled');
     await expect(run({ state: 'done', detail: { kept: false } })).rejects.toThrow('no memory');
+  });
+
+  it('reads the kept result at the run commit and refuses a chunk from another', async () => {
+    const iris = Array.from({ length: 25_000 }, (_, i) => `${EX}n${i}`);
+    const paths: string[] = [];
+    let head = 7;
+    const ctx: ProjectionContext = {
+      ds: 'ds',
+      poll: 1,
+      post: async (path, body) => {
+        paths.push(path);
+        const b = body as { nodes: string[]; async?: boolean };
+        if (b.async) return { task: { id: '1', state: 'running' } as unknown as Task };
+        const a = answer(b.nodes.slice(0, 2), true);
+        // a commit lands between the reads: an unpinned read would see it
+        const pinned = path.includes('at=commit%3A7');
+        a.answer.run.commit = pinned ? 7 : head;
+        head = 8;
+        return a;
+      },
+      getTask: async () =>
+        ({ id: '1', state: 'done', detail: { kept: true, commit: 7 } }) as unknown as Task,
+    };
+    const r = await runProjection(ctx, ALGOS.pageRank, { name: 'p' }, iris, {});
+    expect(paths.slice(1)).toEqual([
+      '/$/algo/ds/run?at=commit%3A7',
+      '/$/algo/ds/run?at=commit%3A7',
+    ]);
+    expect(r.commit).toBe(7);
+    // a server that answers from another commit anyway is refused
+    const other: ProjectionContext = {
+      ds: 'ds',
+      post: async (_p, body) => {
+        const b = body as { nodes: string[] };
+        const a = answer(b.nodes.slice(0, 1), true);
+        a.answer.run.commit = b.nodes[0] === `${EX}n0` ? 7 : 8;
+        return a;
+      },
+    };
+    await expect(runProjection(other, ALGOS.pageRank, { name: 'p' }, iris, {})).rejects.toThrow(
+      'commit 8 instead of 7',
+    );
+  });
+
+  it('stops following the task once the lens is cancelled', async () => {
+    const stop = new AbortController();
+    let polls = 0;
+    const ctx: ProjectionContext = {
+      ds: 'ds',
+      poll: 1,
+      signal: stop.signal,
+      post: async () => ({ task: { id: '1', state: 'running' } as unknown as Task }),
+      getTask: async () => {
+        polls++;
+        // the lens changes while this read is in flight
+        stop.abort();
+        return { id: '1', state: 'running' } as unknown as Task;
+      },
+    };
+    await expect(
+      runProjection(ctx, ALGOS.pageRank, { name: 'p' }, [`${EX}a`], {}),
+    ).rejects.toThrow();
+    await new Promise((r) => setTimeout(r, 20));
+    expect(polls).toBe(1);
+    // and a wait on a signal that already fired ends at once
+    const t0 = Date.now();
+    await expect(sleep(10_000, stop.signal)).rejects.toThrow();
+    expect(Date.now() - t0).toBeLessThan(1000);
+  });
+
+  it('refuses an answer the server cut at its row limit', async () => {
+    const ctx: ProjectionContext = {
+      ds: 'ds',
+      post: async (_p, body) => {
+        const a = answer((body as { nodes: string[] }).nodes.slice(0, 1), false);
+        (a.answer.run as { truncated?: boolean }).truncated = true;
+        return a;
+      },
+    };
+    await expect(
+      runProjection(ctx, ALGOS.pageRank, { name: 'p' }, [`${EX}a`, `${EX}b`], {}),
+    ).rejects.toThrow('row limit');
   });
 
   afterEach(() => vi.unstubAllGlobals());
