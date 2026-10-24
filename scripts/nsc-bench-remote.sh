@@ -29,6 +29,10 @@ source ./run.env
 # store, which compares settings of one binary without the differences between two stores.
 # scripts/nsc-bench.sh does not write these three, and scripts/x08-gates/latency.sh does.
 : "${SERVE_ARGS_A:=}" "${SERVE_ARGS_B:=}" "${SHARE_STORE:=0}"
+# PREPARE_A and PREPARE_B are sparkles commands run once on each variant's store after its
+# load, and PREPARE_REPEAT one run PREPARE_REPS times after that. Each run is timed into
+# results/prepare.tsv as variant, command, seconds and the store's size in KiB after it.
+: "${PREPARE_A:=}" "${PREPARE_B:=}" "${PREPARE_REPEAT:=}" "${PREPARE_REPS:=5}"
 R=results
 mkdir -p "$R"
 # this script, its curl client and the log writer run on the client CPU, each server on its
@@ -89,6 +93,36 @@ for v in A B; do
   printf '%s\t%s\t%s\n' "$v" "$(awk "BEGIN {print $t1 - $t0}")" "$(du -sk "stores/$v" | cut -f1)" >> "$R/load.tsv"
   log "$v loaded in $(awk "BEGIN {printf \"%.2f\", $t1 - $t0}") s"
 done
+
+: > "$R/prepare.tsv"
+prepare() { # <variant> <command…>
+  local v=$1 t0 t1
+  shift
+  t0=$EPOCHREALTIME
+  # shellcheck disable=SC2086 # BIN is a command line
+  taskset -c "$ALL" ${BIN[$v]} "$@" --loc "stores/$v" >> "$R/prepare-$v.log" 2>&1 || fail "prepare $v: $*, see prepare-$v.log"
+  t1=$EPOCHREALTIME
+  printf '%s\t%s\t%s\t%s KiB\n' "$v" "$*" "$(awk "BEGIN {print $t1 - $t0}")" "$(du -sk "stores/$v" | cut -f1)" >> "$R/prepare.tsv"
+  log "$v: $* took $(awk "BEGIN {printf \"%.2f\", $t1 - $t0}") s"
+}
+VARIANTS=(A B)
+[ "$SHARE_STORE" = 1 ] && VARIANTS=(A)
+for v in "${VARIANTS[@]}"; do
+  p=PREPARE_$v
+  # shellcheck disable=SC2086 # the commands are word lists
+  [ -z "${!p}" ] || prepare "$v" ${!p}
+done
+# the repeated runs alternate A, B and B, A
+if [ -n "$PREPARE_REPEAT" ]; then
+  for i in $(seq "$PREPARE_REPS"); do
+    order=("${VARIANTS[@]}")
+    [ $((i % 2)) = 0 ] && [ ${#VARIANTS[@]} = 2 ] && order=(B A)
+    for v in "${order[@]}"; do
+      # shellcheck disable=SC2086
+      prepare "$v" $PREPARE_REPEAT
+    done
+  done
+fi
 
 mapfile -t QUERIES < <(cd queries && for f in *.rq; do echo "${f%.rq}"; done)
 log "queries: ${QUERIES[*]}"
