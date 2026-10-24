@@ -257,4 +257,11 @@ test("the check skips graph names, but not a variable or a prefixed name that en
   expect(variable.issues.map((i) => i.code)).toContain('unknown-term');
   const prefixed = await check(`${ex}SELECT ?s WHERE { ?s ex:from ex:typo }`);
   expect(prefixed.terms.map((t) => t.term)).toEqual(['ex:from', 'ex:typo']);
+  // GRAPH right after a triple's dot, and a comparison that is not an IRI
+  const compact = await check(
+    `${ex}SELECT * WHERE { ?s ex:startDate ?o.GRAPH <https://example.org/hr> { ?p ?q ?r } }`,
+  );
+  expect(compact.terms.map((t) => t.term)).toEqual(['ex:startDate']);
+  const compared = await check('SELECT * WHERE { ?s ?p ?o FILTER(?o<STRLEN("#")&&?o>0) }');
+  expect(compared.terms).toEqual([]);
 });

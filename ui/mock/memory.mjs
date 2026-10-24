@@ -181,9 +181,11 @@ const UNION = { use_default_graph_as_union: true };
 /** The text without strings, IRIs and comments, to look for keywords. */
 const bare = (q) =>
   q
-    // a comment, but not the # of an IRI
-    .replace(/<[^>\s]*>|#[^\n]*/g, (m) => (m.startsWith('<') ? m : ' '))
-    .replace(/"(?:[^"\\]|\\.)*"|'(?:[^'\\]|\\.)*'/g, '""')
+    // strings, IRIs and comments in one pass, so that the # of an IRI or a string is not a
+    // comment and a comparison is not an IRI
+    .replace(/"(?:[^"\\\n]|\\.)*"|'(?:[^'\\\n]|\\.)*'|<[^<>"{}|^`\\\s]*>|#[^\n]*/g, (m) =>
+      m[0] === '<' ? m : m[0] === '#' ? ' ' : '""',
+    )
     .replace(/<[^>\s]*>/g, '<>');
 
 const isUpdate = (q) =>
@@ -209,13 +211,19 @@ function declared(q) {
 function queryIris(q, prefixes) {
   const known = { ...prefixes, ...declared(q) };
   const body = q
-    // a comment, but not the # of an IRI
-    .replace(/<[^>\s]*>|#[^\n]*/g, (m) => (m.startsWith('<') ? m : ' '))
-    .replace(/"(?:[^"\\]|\\.)*"|'(?:[^'\\]|\\.)*'/g, '""')
+    // strings, IRIs and comments in one pass, so that the # of an IRI or a string is not a
+    // comment and a comparison is not an IRI
+    .replace(/"(?:[^"\\\n]|\\.)*"|'(?:[^'\\\n]|\\.)*'|<[^<>"{}|^`\\\s]*>|#[^\n]*/g, (m) =>
+      m[0] === '<' ? m : m[0] === '#' ? ' ' : '""',
+    )
     .replace(/\bPREFIX\s+[\w.-]*:\s*<[^>]*>/gi, ' ')
     .replace(/\bBASE\s+<[^>]*>/gi, ' ')
     // graph names are not terms of a triple pattern, which the server's check skips too
-    .replace(/(?<![\w?$:.-])(GRAPH|FROM(\s+NAMED)?)\s+(<[^>]*>|[A-Za-z][\w.-]*:[\w.-]*)/gi, ' ');
+    // (a keyword that stands alone: not part of a variable or a prefixed name)
+    .replace(
+      /(?<![\w?$:-])(?<!:[\w.-]*\.)(GRAPH|FROM(\s+NAMED)?)\s+(<[^>]*>|[A-Za-z][\w.-]*:[\w.-]*)/gi,
+      ' ',
+    );
   const out = [];
   const seen = new Set();
   const add = (iri) => {
@@ -225,7 +233,7 @@ function queryIris(q, prefixes) {
     }
   };
   for (const m of body.matchAll(
-    /<([^>\s]*)>|(?<![\w?$:.-])([A-Za-z][\w.-]*)?:((?:[\w-]|\.(?=[\w-]))*)/g,
+    /<([^<>"{}|^`\\\s]*)>|(?<![\w?$:.-])([A-Za-z][\w.-]*)?:((?:[\w-]|\.(?=[\w-]))*)/g,
   )) {
     if (m[1] != null) add(m[1]);
     else if (known[m[2] ?? ''] != null) add(known[m[2] ?? ''] + m[3]);
