@@ -25,6 +25,8 @@ pub fn row_bytes(width: usize) -> u64 {
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct ZSet {
     map: FxHashMap<Row, i64>,
+    /// the sum of the weights, kept as rows change
+    total: i64,
 }
 
 impl ZSet {
@@ -39,6 +41,7 @@ impl ZSet {
             let cur = self.get(&row);
             return (cur, cur);
         }
+        self.total += w;
         match self.map.entry(row) {
             Entry::Occupied(mut e) => {
                 let old = *e.get();
@@ -71,7 +74,7 @@ impl ZSet {
 
     /// The sum of the weights: the number of solutions of a bag.
     pub fn total(&self) -> i64 {
-        self.map.values().sum()
+        self.total
     }
 
     pub fn iter(&self) -> impl Iterator<Item = (&Row, i64)> + '_ {
@@ -115,6 +118,7 @@ impl ZSet {
     /// one on the ids present).
     pub fn remap(&mut self, f: &mut dyn FnMut(Id) -> Id) {
         let old = std::mem::take(&mut self.map);
+        self.total = 0;
         for (r, w) in old {
             let r: Row = r.iter().map(|&i| f(i)).collect();
             self.add(r, w);
