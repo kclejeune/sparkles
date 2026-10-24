@@ -605,6 +605,15 @@ mod parquet_source {
         w.close().unwrap();
     }
 
+    /// The file of acceptance example A5, 10 million rows in 100 row groups, written to
+    /// `$SPARKLES_A5_PARQUET` for a measurement of `sparkles map run` (spec F19 §12).
+    #[test]
+    #[ignore = "writes a large file for a measurement"]
+    fn write_a5_parquet() {
+        let path = std::env::var("SPARKLES_A5_PARQUET").expect("SPARKLES_A5_PARQUET");
+        write_parquet(Path::new(&path), 100, 100_000);
+    }
+
     #[test]
     fn parquet_rows_map_with_natural_types_and_nulls() {
         let dir = tempfile::tempdir().unwrap();
