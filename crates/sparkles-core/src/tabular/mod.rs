@@ -1420,3 +1420,146 @@ pub fn default_metadata(
     }
     Ok(m)
 }
+
+// ------------------------------------------------------------ rows for mappings ----
+
+/// The records of a table after its dialect's skipped rows, header and skipped columns,
+/// for the CSV sources of RML mappings (spec F19 §4.1). It reads with the same reader,
+/// dialects, record limit and BOM rule as [`convert`].
+pub(crate) struct RowReader<R: Read> {
+    recs: Records<R>,
+    dialect: Dialect,
+    rec: csv::StringRecord,
+    /// the column titles, from the first header row
+    pub header: Vec<String>,
+    name: String,
+}
+
+impl<R: Read> RowReader<R> {
+    /// Open a table: read its skipped rows and header.
+    pub(crate) fn new(
+        input: R,
+        tsv: bool,
+        dialect: &csvw::DialectDesc,
+        name: &str,
+        limits: &Limits,
+    ) -> Result<RowReader<R>> {
+        let d = Dialect::new(tsv, dialect);
+        let mut o = Options::new(Mapping::Default { key: None }, name);
+        o.limits = limits.clone();
+        let mut recs = Records::new(input, &d, &o);
+        let mut rec = csv::StringRecord::new();
+        for _ in 0..d.skip_rows {
+            if recs.next(&mut rec)?.is_none() {
+                break;
+            }
+        }
+        let mut header: Vec<String> = Vec::new();
+        for h in 0..d.header_rows {
+            if recs.next(&mut rec)?.is_none() {
+                break;
+            }
+            if h == 0 {
+                header = rec
+                    .iter()
+                    .skip(d.skip_columns)
+                    .map(|f| d.trim(f).to_string())
+                    .collect();
+            }
+        }
+        if header.len() > limits.max_columns {
+            return Err(Error::invalid(format!(
+                "{name}: the table has {} columns, more than the limit of {}",
+                header.len(),
+                limits.max_columns
+            )));
+        }
+        Ok(RowReader {
+            recs,
+            dialect: d,
+            rec,
+            header,
+            name: name.to_string(),
+        })
+    }
+
+    /// Move to the next data row and return its source row, or `None` at the end. A
+    /// row whose width differs from the header's fails.
+    pub(crate) fn next(&mut self) -> Result<Option<u64>> {
+        loop {
+            let Some((source_row, line)) = self.recs.next(&mut self.rec)? else {
+                return Ok(None);
+            };
+            if self.dialect.skip_blank_rows
+                && self.rec.iter().all(|f| self.dialect.trim(f).is_empty())
+            {
+                continue;
+            }
+            let n = self.rec.len().saturating_sub(self.dialect.skip_columns);
+            if !self.header.is_empty() && n != self.header.len() {
+                return Err(Error::invalid(format!(
+                    "{}: row {source_row}{} has {n} cells and the table has {} columns",
+                    self.name,
+                    line_note(source_row, Some(line)),
+                    self.header.len()
+                )));
+            }
+            return Ok(Some(source_row));
+        }
+    }
+
+    /// Cell `i` of the current row, trimmed by the dialect.
+    pub(crate) fn field(&self, i: usize) -> Option<&str> {
+        self.rec
+            .get(i + self.dialect.skip_columns)
+            .map(|f| self.dialect.trim(f))
+    }
+}
+
+/// The columns of a CSVW table description, for parsing the cells of an RML CSV source
+/// by their datatypes and null values (spec F19 §3.5).
+pub(crate) struct TypedColumns {
+    columns: Vec<Column>,
+}
+
+impl TypedColumns {
+    /// The columns of `desc` for a table whose header is `header`.
+    pub(crate) fn new(
+        desc: &TableDesc,
+        header: &[String],
+    ) -> std::result::Result<TypedColumns, String> {
+        let titles: Vec<Vec<String>> = header.iter().map(|h| vec![h.clone()]).collect();
+        let mut warnings = Vec::new();
+        let columns = columns(
+            desc,
+            &titles,
+            header.len(),
+            !header.is_empty(),
+            false,
+            &mut warnings,
+        )?;
+        Ok(TypedColumns {
+            columns: columns.into_iter().filter(|c| !c.is_virtual).collect(),
+        })
+    }
+
+    /// The literals of cell `i` with raw value `raw`: none for a null, several for a
+    /// list.
+    pub(crate) fn cell(&self, i: usize, raw: &str) -> std::result::Result<Vec<Literal>, String> {
+        let Some(c) = self.columns.get(i) else {
+            return Ok(if raw.is_empty() {
+                Vec::new()
+            } else {
+                vec![Literal::new_simple_literal(raw)]
+            });
+        };
+        Ok(match c.parse(raw)? {
+            Cell::Null => Vec::new(),
+            Cell::One(lex) => vec![c.datatype.literal(lex, c.lang.as_deref())],
+            Cell::List(items, _) => items
+                .into_iter()
+                .map(|lex| c.datatype.literal(lex, c.lang.as_deref()))
+                .collect(),
+        })
+    }
+}

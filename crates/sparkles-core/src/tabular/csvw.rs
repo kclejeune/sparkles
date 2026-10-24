@@ -85,7 +85,7 @@ impl Props {
 }
 
 /// Dialect properties as given. `None` is "not set here".
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Debug, Default, PartialEq)]
 pub struct DialectDesc {
     pub delimiter: Option<u8>,
     pub quote: Option<Option<u8>>,

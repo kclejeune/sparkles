@@ -17,6 +17,7 @@ pub mod index;
 pub mod io;
 pub mod ioacct;
 pub mod jena_formats;
+pub mod mapping;
 pub mod migrate;
 pub mod nesting;
 pub mod outbound;
