@@ -37,24 +37,19 @@ const FSST_ROOM: usize = 64;
 /// Every key of a front-coded block, as a mask of [`Vocab::decode_block`].
 const ALL_KEYS: u32 = (1 << FC_BLOCK) - 1;
 
-/// How many bytes of each key up to `last` of a block a decode of the keys in `wanted`
-/// needs: all of a wanted key (`usize::MAX`), and of another key the bytes that the
-/// following keys up to the next wanted one take from it, which is the least of their
-/// shared-prefix lengths. A key whose need does not exceed its own shared prefix is not
-/// decoded at all, and another is decoded only up to its need, so a lookup of one key
-/// decodes little more than that key.
+/// How many bytes of key `i` of a front-coded FSST block a decode of the keys in
+/// `wanted` (a bit per key) needs, given the entry after it: all of a wanted key
+/// (`usize::MAX`), and of another key the bytes that the next key takes from it, its
+/// shared-prefix length. A key that gives the next no more than its own shared prefix
+/// is not decoded at all, and another only up to what the next takes, so a lookup of
+/// one key decodes little more than that key. The need of a key after the last wanted
+/// one does not arise, since decoding stops there.
 #[inline(always)]
-fn needs(es: &[Entry; FC_BLOCK], last: usize, wanted: u32) -> [usize; FC_BLOCK] {
-    let mut need = [0usize; FC_BLOCK];
-    let mut n = usize::MAX;
-    for i in (0..=last).rev() {
-        if wanted >> i & 1 == 1 {
-            n = usize::MAX;
-        }
-        need[i] = n;
-        n = n.min(es[i].shared);
+fn lookahead(wanted: u32, i: usize, next: Option<Entry>) -> usize {
+    match next {
+        Some(e) if wanted >> i & 1 == 0 => e.shared,
+        _ => usize::MAX,
     }
-    need
 }
 
 /// Front-coded blocks per entry of the sparse index (`vocab.idx`).
@@ -572,7 +567,7 @@ impl Vocab {
     /// Decode the keys of block `b` whose bits are set in `wanted` (bit `i` for the
     /// block's `i`-th key), calling `f(i, key)` for each in order until it returns false.
     /// `key` is the scratch buffer, cleared first. Of the other keys, only the bytes that
-    /// a wanted key takes from them are decoded (see [`Vocab::needs`]). Under a profile
+    /// a wanted key takes from them are decoded (see [`lookahead`]). Under a profile
     /// (`P`) the block is counted and its pages recorded.
     #[inline(always)]
     fn decode_block<const P: bool>(
@@ -614,10 +609,7 @@ impl Vocab {
             return;
         }
         let last = 31 - wanted.leading_zeros() as usize;
-        if !F || wanted == (2u32 << last) - 1 {
-            // Every key up to the last is decoded whole when each is wanted, and when
-            // the suffixes are plain, whose copies cost less than planning which bytes
-            // to skip: on `star-join` at 10.5M the plan added 3.7% to the instructions.
+        if !F {
             for i in 0..=last {
                 let e = self.entry::<F>(data, &mut pos, i == 0);
                 key.truncate(e.shared);
@@ -628,48 +620,17 @@ impl Vocab {
             }
             return;
         }
-        self.decode_planned(data, pos, start, last, wanted, key, &mut f);
-    }
-
-    /// The rest of [`Vocab::decode_block`] for an FSST-coded block whose wanted keys
-    /// leave gaps, out of line so that the straight decode stays small.
-    #[inline(never)]
-    #[allow(clippy::too_many_arguments)]
-    fn decode_planned(
-        &self,
-        data: &[u8],
-        mut pos: usize,
-        start: usize,
-        last: usize,
-        wanted: u32,
-        key: &mut Vec<u8>,
-        f: &mut dyn FnMut(usize, &[u8]) -> bool,
-    ) {
-        let mut es = [Entry::default(); FC_BLOCK];
-        for (i, e) in es.iter_mut().enumerate().take(last + 1) {
-            *e = self.entry::<true>(data, &mut pos, i == 0);
-        }
-        let need = needs(&es, last, wanted);
+        let mut cur = self.entry::<F>(data, &mut pos, true);
         for i in 0..=last {
-            self.step::<true>(data, es[i], (start + i) as u64, need[i], key, false);
+            let next = (i < last).then(|| self.entry::<F>(data, &mut pos, false));
+            let need = lookahead(wanted, i, next);
+            self.step::<F>(data, cur, (start + i) as u64, need, key, false);
             if wanted >> i & 1 == 1 && !f(i, key) {
                 return;
             }
-        }
-    }
-
-    /// [`needs`] for an FSST-coded vocabulary (`F`), and every key whole for a
-    /// front-coded one, whose plain suffixes cost less to copy than to plan around.
-    #[inline(always)]
-    fn needs_as<const F: bool>(
-        es: &[Entry; FC_BLOCK],
-        last: usize,
-        wanted: u32,
-    ) -> [usize; FC_BLOCK] {
-        if F {
-            needs(es, last, wanted)
-        } else {
-            [usize::MAX; FC_BLOCK]
+            if let Some(e) = next {
+                cur = e;
+            }
         }
     }
 
@@ -729,7 +690,7 @@ impl Vocab {
     /// Bring `key` from the bytes it holds of the key before entry `e` to the first
     /// `need` bytes of the key of `e` (of id `id`), or all of it when `need` is
     /// `usize::MAX`. `key` must hold at least `need.min(e.shared)` bytes, which
-    /// [`Vocab::needs`] ensures.
+    /// [`lookahead`] ensures.
     #[inline(always)]
     fn step<const F: bool>(
         &self,
@@ -836,15 +797,31 @@ impl Vocab {
             let mut pos = self.block_offset(b);
             ioacct::vocab_blocks_scanned(1);
             self.touch_block(b);
-            let mut es = [Entry::default(); FC_BLOCK];
-            for (at, e) in es.iter_mut().enumerate().take(last + 1) {
-                *e = self.entry::<F>(data, &mut pos, at == 0);
-            }
-            let need = Self::needs_as::<F>(&es, last, mask);
             key.clear();
+            if !F {
+                // front coding rebuilds every key up to the last wanted one, in one pass
+                for at in 0..=last {
+                    let id = (b * FC_BLOCK + at) as u64;
+                    let e = self.entry::<F>(data, &mut pos, at == 0);
+                    let total = key.len().min(e.shared).saturating_add(e.len);
+                    if total > key.capacity() {
+                        reserve(total)?;
+                        key.reserve_exact(total - key.len());
+                    }
+                    key.truncate(e.shared);
+                    self.push_suffix::<F>(data, e, id, usize::MAX, &mut key, true);
+                    if mask >> at & 1 == 1 {
+                        f(id, &key)?;
+                    }
+                }
+                i = j;
+                continue;
+            }
+            let mut e = self.entry::<F>(data, &mut pos, true);
             for at in 0..=last {
                 let id = (b * FC_BLOCK + at) as u64;
-                let (e, nd) = (es[at], need[at]);
+                let next = (at < last).then(|| self.entry::<F>(data, &mut pos, false));
+                let nd = lookahead(mask, at, next);
                 if nd > e.shared {
                     // the whole key, or the bytes of it that later keys take
                     let add = if nd == usize::MAX {
@@ -864,6 +841,9 @@ impl Vocab {
                 self.step::<F>(data, e, id, nd, &mut key, true);
                 if mask >> at & 1 == 1 {
                     f(id, &key)?;
+                }
+                if let Some(n) = next {
+                    e = n;
                 }
             }
             i = j;
@@ -1303,15 +1283,16 @@ impl Vocab {
             return Ok(());
         }
         let last = 31 - wanted.leading_zeros() as usize;
-        let mut es = [Entry::default(); FC_BLOCK];
-        for (i, e) in es.iter_mut().enumerate().take(last + 1) {
-            *e = self.entry::<F>(data, &mut pos, i == 0);
-        }
-        let need = Self::needs_as::<F>(&es, last, wanted);
         let mut key = Vec::new();
+        let mut e = self.entry::<F>(data, &mut pos, true);
         for i in 0..=last {
             let id = (b * FC_BLOCK + i) as u64;
-            let (e, nd) = (es[i], need[i]);
+            let next = (i < last).then(|| self.entry::<F>(data, &mut pos, false));
+            let nd = if F {
+                lookahead(wanted, i, next)
+            } else {
+                usize::MAX
+            };
             if nd > e.shared {
                 let add = if nd == usize::MAX {
                     self.suffix_len(data, e, id)
@@ -1342,6 +1323,9 @@ impl Vocab {
             self.step::<F>(data, e, id, nd, &mut key, true);
             if wanted >> i & 1 == 1 && !f(i, &key)? {
                 break;
+            }
+            if let Some(n) = next {
+                e = n;
             }
         }
         Ok(())
