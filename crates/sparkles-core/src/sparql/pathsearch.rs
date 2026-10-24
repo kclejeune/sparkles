@@ -1132,16 +1132,38 @@ impl Cost {
         Cost { hi: w, lo: 0.0 }
     }
 
+    const INFINITE: Cost = Cost {
+        hi: f64::INFINITY,
+        lo: 0.0,
+    };
+
     fn add(self, o: Cost) -> Cost {
-        let s = self.hi + o.hi;
-        if !s.is_finite() {
-            return Cost { hi: s, lo: 0.0 };
+        let (mut a, mut b) = (self.hi, o.hi);
+        let mut lows = self.lo + o.lo;
+        if !(a + b).is_finite() {
+            if a.is_infinite() || b.is_infinite() {
+                return Cost::INFINITE;
+            }
+            // the rounded parts reach past the largest double, but the rounding errors can
+            // bring the sum back under it: fold them into the smaller part first
+            if a < b {
+                std::mem::swap(&mut a, &mut b);
+            }
+            b += lows;
+            lows = 0.0;
+            if !(a + b).is_finite() {
+                return Cost::INFINITE;
+            }
         }
-        // TwoSum: s + e is exactly self.hi + o.hi
-        let bb = s - self.hi;
-        let e = (self.hi - (s - bb)) + (o.hi - bb) + self.lo + o.lo;
+        // TwoSum: s + e is exactly a + b
+        let s = a + b;
+        let bb = s - a;
+        let e = (a - (s - bb)) + (b - bb) + lows;
         // Fast2Sum renormalizes, since |s| ≥ |e|
         let hi = s + e;
+        if !hi.is_finite() {
+            return Cost::INFINITE;
+        }
         Cost {
             hi,
             lo: e - (hi - s),
@@ -3205,7 +3227,21 @@ mod tree_tests {
         // halves met in the middle add up to the whole
         let half = Cost::of(1.0).add(Cost::of(1.0));
         assert_eq!(half.add(Cost::of(1.0).add(Cost::of(1e16))), fwd);
-        assert_eq!(Cost::of(f64::MAX).add(Cost::of(f64::MAX)).hi, f64::INFINITY);
+        assert_eq!(Cost::of(f64::MAX).add(Cost::of(f64::MAX)), Cost::INFINITE);
+        // the rounded parts overflow, the whole does not
+        let u = 2f64.powi(969);
+        let near = Cost {
+            hi: f64::MAX,
+            lo: -u,
+        };
+        assert_eq!(
+            near.add(Cost::of(2.0 * u)),
+            Cost {
+                hi: f64::MAX,
+                lo: u
+            }
+        );
+        assert_eq!(Cost::INFINITE.add(Cost::of(1.0)), Cost::INFINITE);
     }
 
     #[test]

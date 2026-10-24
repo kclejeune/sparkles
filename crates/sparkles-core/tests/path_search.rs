@@ -451,6 +451,37 @@ fn weights_of_mixed_magnitudes_from_both_ends() {
     }
 }
 
+/// Costs at the top of the floating-point range: a sum whose rounded part reaches past the
+/// largest double while its rounding error brings it back under is still finite, so the
+/// route through `y` beats the one through `x`, whose cost is about twice the largest double.
+#[test]
+fn weights_near_the_largest_double_from_both_ends() {
+    let m = f64::MAX;
+    let u = 2f64.powi(969);
+    let w = |x: f64| format!("{x:e}");
+    let s = store_of(&format!(
+        "ex:s ex:p ex:a {{| ex:w {} |}} . ex:a ex:p ex:b {{| ex:w {} |}} .
+         ex:b ex:p ex:x {{| ex:w {} |}} . ex:x ex:p ex:t {{| ex:w {} |}} .
+         ex:b ex:p ex:y {{| ex:w {} |}} . ex:y ex:p ex:t {{| ex:w {} |}} .",
+        w(m - 4.0 * u),
+        w(2.0 * u),
+        w(m - 4.0 * u),
+        w(u),
+        w(u),
+        w(2.0 * u),
+    ));
+    let r = rows(
+        &s,
+        "SELECT ?path ?i ?s ?o WHERE { SERVICE path:search { [] path:source ex:s ; \
+         path:target ex:t ; path:predicate ex:p ; path:weight ex:w ; path:pathIndex ?path ; \
+         path:edgeIndex ?i ; path:edgeSubject ?s ; path:edgeObject ?o } }",
+    );
+    assert_eq!(
+        node_paths(&r).values().next().unwrap().join(" "),
+        "s a b y t"
+    );
+}
+
 #[test]
 fn weights_from_reifiers() {
     // A8: the weights sit on the reifiers of the edges
