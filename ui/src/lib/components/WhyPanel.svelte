@@ -10,6 +10,7 @@
     graft,
     how,
     maxId,
+    sameRead,
     MAX_TREES,
     premiseTriples,
     staleNote,
@@ -109,6 +110,8 @@
   });
   onDestroy(stopAll);
 
+  const CHANGED =
+    'The inferences changed since this tree was read. Close Why? and open it again to see the current derivation.';
   const PAST =
     "Why? explains the inferences of the latest commit. Move the time slider to the latest commit to see this edge's derivation.";
   const explanation = $derived(result?.ok ? result.explanation : null);
@@ -146,7 +149,9 @@
     try {
       const r = await explainTriple(ds, d.triple, { maxTrees: 1, signal: c.signal });
       if (gen !== generation) return;
-      if (r.ok && r.explanation.trees[0]) {
+      if (r.ok && explanation && !sameRead(explanation, r.explanation)) {
+        refError = CHANGED;
+      } else if (r.ok && r.explanation.trees[0]) {
         const sub = r.explanation.trees[0];
         // the new ids pass every tree's, since folds and expansions are keyed by id
         const floor = maxId(trees);

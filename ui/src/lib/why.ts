@@ -202,6 +202,14 @@ export function graft(
   return put(tree);
 }
 
+/**
+ * Whether two answers read the same inferences: the same commit and source, and both or
+ * neither at the head. An expansion that reads others cannot join the tree it expands.
+ */
+export function sameRead(a: Explanation, b: Explanation): boolean {
+  return a.commit === b.commit && a.source === b.source && !!a.readAtHead === !!b.readAtHead;
+}
+
 /** The panel's footer: which derivation of how many, its depth and its commit. */
 export function footer(e: Explanation, index: number): string {
   const n = e.trees.length;

@@ -190,6 +190,69 @@ test('at a past state Why? says that it explains the latest commit', async ({ pa
   expect(asked).toBe(0);
 });
 
+test('Expand refuses a subtree from inferences computed since the tree was read', async ({
+  page,
+}) => {
+  const T = (s: string, p: string, o: string) => ({
+    s: { type: 'uri', value: `${EX}${s}` },
+    p: { type: 'uri', value: p.startsWith('http') ? p : `${EX}${p}` },
+    o: { type: 'uri', value: `${EX}${o}` },
+  });
+  const TYPE = 'http://www.w3.org/1999/02/22-rdf-syntax-ns#type';
+  const answer = (commit: number, trees: unknown[]) => ({
+    mode: 'why',
+    entailed: true,
+    commit,
+    source: 'materialized',
+    trees,
+    more: false,
+    stale: false,
+    commitsSince: 0,
+  });
+  let calls = 0;
+  await page.route('**/$/reason/why1/explain', (route) => {
+    calls++;
+    const body =
+      calls === 1
+        ? // the tree is cut at its first premise
+          answer(5, [
+            {
+              id: 1,
+              triple: T('alice', TYPE, 'Manager'),
+              kind: 'derived',
+              depth: 2,
+              rule: { name: 'rdfs2', profile: 'rdfs' },
+              premises: [{ id: 2, triple: T('alice', 'manages', 'team7'), kind: 'ref', depth: 1 }],
+            },
+          ])
+        : // the premise's own tree, from a run at a later commit
+          answer(9, [
+            {
+              id: 1,
+              triple: T('alice', 'manages', 'team7'),
+              kind: 'asserted',
+              depth: 0,
+              graph: 'default',
+            },
+          ]);
+    return route.fulfill({
+      status: 200,
+      contentType: 'application/json',
+      body: JSON.stringify(body),
+    });
+  });
+  await open(page, 'why1');
+  const at = await edgeOn(page, 'alice', 'Manager');
+  await page.mouse.click(at.x, at.y);
+  const tree = panel(page).getByRole('tree', { name: 'Derivation' });
+  await expect(tree.locator('li.ref')).toHaveCount(1);
+  await panel(page).getByRole('button', { name: 'Expand' }).click();
+  await expect(panel(page).getByRole('status')).toContainText('The inferences changed');
+  // the cut node stays cut, and nothing from the later run joins the tree
+  await expect(tree.locator('li.ref')).toHaveCount(1);
+  await expect(tree.locator('li.asserted')).toHaveCount(0);
+});
+
 test('a triple with no visible derivation says only that', async ({ page }) => {
   await page.route('**/$/reason/why1/explain', (route) =>
     route.fulfill({

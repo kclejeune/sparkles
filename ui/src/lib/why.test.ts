@@ -9,6 +9,7 @@ import {
   premiseTriples,
   staleNote,
   maxId,
+  sameRead,
   tripleKey,
   walk,
   type Derivation,
@@ -159,6 +160,13 @@ describe('derivation trees (U10 §2.4)', () => {
       .slice(1)
       .map((d) => d.id);
     expect(added.every((x) => x > 7)).toBe(true);
+  });
+
+  it('tells answers that read other inferences apart', () => {
+    expect(sameRead(explanation(), explanation())).toBe(true);
+    expect(sameRead(explanation(), explanation({ commit: 319 }))).toBe(false);
+    expect(sameRead(explanation(), explanation({ source: 'rdfsOnRead' }))).toBe(false);
+    expect(sameRead(explanation(), explanation({ readAtHead: true }))).toBe(false);
   });
 
   it('counts the derivations and notes stale inferences', () => {
