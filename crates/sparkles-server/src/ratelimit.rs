@@ -133,6 +133,7 @@ pub fn classify(
             || admin.starts_with("schema/")
             || admin == "graph/{ds}/groups"
             || admin == "graph/{ds}/facets"
+            || admin == "vector/{ds}/{name}/projection"
             || admin.starts_with("stats/")
             || admin == "reason/{ds}/diagnostics"
             || admin == "graphql/{ds}/draft"

@@ -611,6 +611,11 @@ python = "Dataset.indexes.vector.rebuild"
 jvm = "DatasetGraphSparkles.indexes().vector().rebuild"
 node = "Dataset.indexes.vector.rebuild"
 
+["indexes.vector.projection"]
+python = "Dataset.indexes.vector.projection"
+jvm = "planned: a typed handle after the Python and Node.js ones"
+node = "planned: Dataset.indexes.vector.projection, after the Python one"
+
 ["indexes.vector.recall"]
 python = "Dataset.indexes.vector.recall"
 jvm = "SparklesVectorIndexes.recall"

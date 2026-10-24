@@ -2986,6 +2986,30 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/$/vector/{ds}/{name}/projection": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * Read a kept projection of a vector index
+         * @description Returns the kept projection's method, commit, bounds, a density grid of 256 by 256 cells, its classes, and up to 50,000 points as `{entity, x, y, class?, colour?}`. `bbox` returns the points inside a region and its density, at most `limit`, those of lowest sampling priority when there are more, so zooming in keeps the points already shown. `colour` names a predicate whose first value per point is returned as an index into `colour.values`. `Accept: application/x-sparkles-points` returns the binary points format of the embedding map guide. A projection read at an older commit than the head has `stale: true`.
+         */
+        get: operations["getVectorProjection"];
+        put?: never;
+        /**
+         * Compute a projection of a vector index
+         * @description Computes a two-dimensional projection of the index's entities at the head and keeps it in memory for `GET`. `pca` projects every vector on the two leading principal components of a sample, and an entity with several vectors sits at the mean of their projections. It runs in the request for an index of up to 1,000,000 vectors and as a task above that. `neighbours` lays out the index's HNSW neighbour graph from the PCA positions and always runs as a task. The server keeps four projections, 1 GiB in all, charged to the query memory pool, and refuses one it cannot hold with `507`. A caller whose access covers part of the dataset gets `403`.
+         */
+        post: operations["computeVectorProjection"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/$/vector/{ds}/{name}/rebuild": {
         parameters: {
             query?: never;
@@ -16327,6 +16351,136 @@ export interface operations {
             401: components["responses"]["Unauthorized"];
             403: components["responses"]["Forbidden"];
             404: components["responses"]["NotFound"];
+            default: components["responses"]["Error"];
+        };
+    };
+    getVectorProjection: {
+        parameters: {
+            query?: {
+                /** @description The projection's method. The most recent of any method when absent. */
+                method?: "pca" | "neighbours";
+                /** @description `minX,minY,maxX,maxY`. */
+                bbox?: string;
+                /** @description The most points to return. */
+                limit?: number;
+                /** @description A predicate IRI whose values colour the points. */
+                colour?: string;
+            };
+            header?: never;
+            path: {
+                /** @description The dataset name. */
+                ds: components["parameters"]["ds"];
+                /** @description The name of the stored query, snapshot, vector index, branch, ingest profile or model secret. */
+                name: components["parameters"]["name"];
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description The projection and its points. */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": {
+                        /** @description `[minX, minY, maxX, maxY]`. */
+                        bounds: number[];
+                        builtMs?: number;
+                        bytes?: number;
+                        classes: Record<string, never>[];
+                        /** @description `{predicate, values}`, where `values` holds `{value, count}` with a term in the SPARQL JSON results form. */
+                        colour?: Record<string, never>;
+                        commit: number;
+                        /** @description `{size, bbox, max, counts}`, where `counts` is base64 of little-endian `Uint32` cell counts, row by row from the minimum y. */
+                        density: Record<string, never>;
+                        dimension?: number;
+                        /** @description Points in the whole projection. */
+                        entities: number;
+                        /** @description The share of the sample's variance on each component. */
+                        explained?: number[];
+                        generation?: string;
+                        index: string;
+                        method: string;
+                        points: Record<string, never>[];
+                        /** @description `{bbox, total, shown, sampled}`: the points inside the region and how many are returned. */
+                        region: Record<string, never>;
+                        /** @description The head has moved since the projection was computed. */
+                        stale: boolean;
+                        vectors?: number;
+                    };
+                    "application/x-sparkles-points": string;
+                };
+            };
+            400: components["responses"]["BadRequest"];
+            401: components["responses"]["Unauthorized"];
+            403: components["responses"]["Forbidden"];
+            404: components["responses"]["NotFound"];
+            default: components["responses"]["Error"];
+        };
+    };
+    computeVectorProjection: {
+        parameters: {
+            query?: {
+                /** @description How the vectors are placed. */
+                method?: "pca" | "neighbours";
+                /** @description Seconds. Capped at the server's `--max-timeout`. */
+                timeout?: components["parameters"]["timeout"];
+            };
+            header?: never;
+            path: {
+                /** @description The dataset name. */
+                ds: components["parameters"]["ds"];
+                /** @description The name of the stored query, snapshot, vector index, branch, ingest profile or model secret. */
+                name: components["parameters"]["name"];
+            };
+            cookie?: never;
+        };
+        /** @description The sample, seed and layout steps. */
+        requestBody?: {
+            content: {
+                "application/json": {
+                    /** @description Steps of the neighbour layout. */
+                    iterations?: number;
+                    /** @description Vectors the PCA learns from. */
+                    sample?: number;
+                    /** @description The seed of the first directions, the sampling priorities and the layout. */
+                    seed?: number;
+                };
+            };
+        };
+        responses: {
+            /** @description The projection, without its points. */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": {
+                        bounds: number[];
+                        builtMs?: number;
+                        bytes?: number;
+                        commit: number;
+                        dimension?: number;
+                        entities: number;
+                        explained?: number[];
+                        generation?: string;
+                        index: string;
+                        /** @enum {string} */
+                        method: "pca" | "neighbours";
+                        stale: boolean;
+                        vectors?: number;
+                    };
+                };
+            };
+            202: components["responses"]["TaskStarted"];
+            400: components["responses"]["BadRequest"];
+            401: components["responses"]["Unauthorized"];
+            403: components["responses"]["Forbidden"];
+            404: components["responses"]["NotFound"];
+            408: components["responses"]["Timeout"];
+            503: components["responses"]["Unavailable"];
+            507: components["responses"]["InsufficientStorage"];
             default: components["responses"]["Error"];
         };
     };

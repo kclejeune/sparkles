@@ -233,6 +233,72 @@ impl PyVectorIndexes {
         })?;
         admin::to_py(py, &r)
     }
+    /// A two-dimensional projection of index `name` at the head: `"pca"` or
+    /// `"neighbours"`, from a sample of up to `sample` vectors, with `seed`. Returns its
+    /// facts, its classes and every point as `{"entity", "x", "y", "class"?}`.
+    #[pyo3(signature=(name,*,method="pca",sample=100_000,seed=0x5eed,iterations=100,cancel=None,progress=None,timeout=None))]
+    #[allow(clippy::too_many_arguments)]
+    fn projection<'py>(
+        &self,
+        py: Python<'py>,
+        name: String,
+        method: &str,
+        sample: usize,
+        seed: u64,
+        iterations: usize,
+        cancel: Option<&Bound<'py, PyAny>>,
+        progress: Option<&Bound<'py, PyAny>>,
+        timeout: Option<f64>,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        let ds = self.ds(py)?;
+        let method = sparkles::vector::ProjectionMethod::parse(method).ok_or_else(|| {
+            pyo3::exceptions::PyValueError::new_err(format!(
+                "method must be \"pca\" or \"neighbours\", not {method:?}"
+            ))
+        })?;
+        let cfg = sparkles::vector::ProjectionConfig {
+            method,
+            sample,
+            seed,
+            iterations,
+        };
+        let r = interrupt::controlled(py, cancel, progress, timeout, move |ctl| {
+            let p = ds.indexes().vector().projection(&name, &cfg, &ctl)?;
+            let text = |id: u64| match p.snapshot.term(sparkles::id::Id(id)) {
+                Some(oxrdf::Term::NamedNode(n)) => n.into_string(),
+                Some(oxrdf::Term::BlankNode(b)) => format!("_:{}", b.as_str()),
+                Some(t) => t.to_string(),
+                None => String::new(),
+            };
+            let points: Vec<serde_json::Value> = (0..p.len())
+                .map(|i| {
+                    let mut o = serde_json::json!({
+                        "entity": text(p.subjects[i]),
+                        "x": p.xy[i][0],
+                        "y": p.xy[i][1],
+                    });
+                    if p.classes[i] != sparkles::vector::projection::NO_CLASS {
+                        o["class"] = p.classes[i].into();
+                    }
+                    o
+                })
+                .collect();
+            Ok(serde_json::json!({
+                "index": p.index,
+                "method": p.method.name(),
+                "commit": p.commit(),
+                "vectors": p.vectors,
+                "dimension": p.dimension,
+                "bounds": p.bounds,
+                "explained": p.explained,
+                "classes": p.class_ids.iter().zip(&p.class_counts)
+                    .map(|(c, n)| serde_json::json!({ "iri": text(*c), "count": n }))
+                    .collect::<Vec<_>>(),
+                "points": points,
+            }))
+        })?;
+        admin::to_py(py, &r)
+    }
     #[pyo3(signature=(*,timeout=3600.0,allow_private=true,secrets=None,cancel=None,progress=None))]
     #[allow(clippy::too_many_arguments)]
     fn embed_until_idle(

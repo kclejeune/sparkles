@@ -2240,6 +2240,81 @@ fn format_and_mcp(p: &mut Paths) {
         answer.insert(m.into(), text());
     }
     p.add(
+        op(
+            POST,
+            "/$/vector/{ds}/{name}/projection",
+            "computeVectorProjection",
+            "Search",
+            "Compute a projection of a vector index",
+        )
+        .doc("Computes a two-dimensional projection of the index's entities at the head and keeps it in memory for `GET`. `pca` projects every vector on the two leading principal components of a sample, and an entity with several vectors sits at the mean of their projections. It runs in the request for an index of up to 1,000,000 vectors and as a task above that. `neighbours` lays out the index's HNSW neighbour graph from the PCA positions and always runs as a task. The server keeps four projections, 1 GiB in all, charged to the query memory pool, and refuses one it cannot hold with `507`. A caller whose access covers part of the dataset gets `403`.")
+        .see("embedding-map")
+        .query("method", json!({ "type": "string", "enum": ["pca", "neighbours"], "default": "pca" }), "How the vectors are placed.")
+        .param("timeout")
+        .body(
+            false,
+            "The sample, seed and layout steps.",
+            json!({ "application/json": { "schema": {
+                "type": "object",
+                "additionalProperties": false,
+                "properties": {
+                    "sample": { "type": "integer", "minimum": 1, "maximum": 100000, "description": "Vectors the PCA learns from." },
+                    "seed": { "type": "integer", "minimum": 0, "description": "The seed of the first directions, the sampling priorities and the layout." },
+                    "iterations": { "type": "integer", "minimum": 1, "maximum": 1000, "description": "Steps of the neighbour layout." }
+                }
+            } } }),
+        )
+        .json_inline("200", "The projection, without its points.", projection_summary())
+        .task()
+        .errors(&[400, 403, 404, 408, 503, 507]),
+    );
+    p.add(
+        op(
+            GET,
+            "/$/vector/{ds}/{name}/projection",
+            "getVectorProjection",
+            "Search",
+            "Read a kept projection of a vector index",
+        )
+        .doc("Returns the kept projection's method, commit, bounds, a density grid of 256 by 256 cells, its classes, and up to 50,000 points as `{entity, x, y, class?, colour?}`. `bbox` returns the points inside a region and its density, at most `limit`, those of lowest sampling priority when there are more, so zooming in keeps the points already shown. `colour` names a predicate whose first value per point is returned as an index into `colour.values`. `Accept: application/x-sparkles-points` returns the binary points format of the embedding map guide. A projection read at an older commit than the head has `stale: true`.")
+        .see("embedding-map")
+        .query("method", json!({ "type": "string", "enum": ["pca", "neighbours"] }), "The projection's method. The most recent of any method when absent.")
+        .query("bbox", json!({ "type": "string" }), "`minX,minY,maxX,maxY`.")
+        .query("limit", json!({ "type": "integer", "minimum": 0, "maximum": 50000, "default": 50000 }), "The most points to return.")
+        .query("colour", json!({ "type": "string" }), "A predicate IRI whose values colour the points.")
+        .resp(
+            "200",
+            "The projection and its points.",
+            Some(json!({
+                "application/json": { "schema": {
+                    "type": "object",
+                    "required": ["index", "method", "commit", "stale", "entities", "bounds", "region", "density", "classes", "points"],
+                    "properties": {
+                        "index": { "type": "string" },
+                        "method": { "type": "string" },
+                        "commit": { "type": "integer" },
+                        "generation": { "type": "string" },
+                        "stale": { "type": "boolean", "description": "The head has moved since the projection was computed." },
+                        "vectors": { "type": "integer" },
+                        "dimension": { "type": "integer" },
+                        "entities": { "type": "integer", "description": "Points in the whole projection." },
+                        "bounds": { "type": "array", "items": { "type": "number" }, "description": "`[minX, minY, maxX, maxY]`." },
+                        "explained": { "type": "array", "items": { "type": "number" }, "description": "The share of the sample's variance on each component." },
+                        "builtMs": { "type": "number" },
+                        "bytes": { "type": "integer" },
+                        "region": { "type": "object", "description": "`{bbox, total, shown, sampled}`: the points inside the region and how many are returned." },
+                        "density": { "type": "object", "description": "`{size, bbox, max, counts}`, where `counts` is base64 of little-endian `Uint32` cell counts, row by row from the minimum y." },
+                        "classes": { "type": "array", "items": { "type": "object", "description": "`{iri, count}`." } },
+                        "colour": { "type": "object", "description": "`{predicate, values}`, where `values` holds `{value, count}` with a term in the SPARQL JSON results form." },
+                        "points": { "type": "array", "items": { "type": "object", "description": "`{entity, x, y, class?, colour?}`, where `class` and `colour` index `classes` and `colour.values`." } }
+                    }
+                } },
+                "application/x-sparkles-points": { "schema": { "type": "string", "format": "binary" } }
+            })),
+        )
+        .errors(&[400, 403, 404]),
+    );
+    p.add(
         o.query("prefixGroup", s(), "One prefix group, comma-separated (repeatable).")
             .body(true, "The text, as a JSON `FormatRequest` or a raw body.", J::Object(body))
             .resp_h(
@@ -3913,4 +3988,26 @@ fn openapi(p: &mut Paths) {
         )
         .resp("304", "Not modified.", None),
     );
+}
+
+/// The facts of a projection, as `POST /$/vector/{ds}/{name}/projection` answers them.
+fn projection_summary() -> J {
+    json!({
+        "type": "object",
+        "required": ["index", "method", "commit", "stale", "entities", "bounds"],
+        "properties": {
+            "index": { "type": "string" },
+            "method": { "type": "string", "enum": ["pca", "neighbours"] },
+            "commit": { "type": "integer" },
+            "generation": { "type": "string" },
+            "stale": { "type": "boolean" },
+            "vectors": { "type": "integer" },
+            "dimension": { "type": "integer" },
+            "entities": { "type": "integer" },
+            "bounds": { "type": "array", "items": { "type": "number" } },
+            "explained": { "type": "array", "items": { "type": "number" } },
+            "builtMs": { "type": "number" },
+            "bytes": { "type": "integer" }
+        }
+    })
 }

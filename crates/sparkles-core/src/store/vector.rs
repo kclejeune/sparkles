@@ -291,6 +291,52 @@ impl Store {
     /// Measure index `name`'s recall@k against the exact search: `samples` stored
     /// vectors, spread evenly over the base rows, are the queries. `ef` overrides the
     /// index's `efSearch`.
+    /// A two-dimensional projection of index `name` at the head (spec U11 §3.3). `check`
+    /// is called now and then and its error stops the work, and `progress` hears the share
+    /// done.
+    pub fn vector_projection(
+        &self,
+        name: &str,
+        cfg: &crate::vector::ProjectionConfig,
+        check: &(dyn Fn() -> Result<()> + Sync),
+        progress: &(dyn Fn(f64) + Sync),
+    ) -> Result<crate::vector::Projection> {
+        let snap = self.snapshot();
+        let b = snap.generation.vectors.built(name).ok_or_else(|| {
+            if self.vector.indexes.read().contains_key(name) {
+                Error::invalid(format!("vector index {name} is still being built"))
+            } else {
+                Error::NotFound(format!("no vector index {name}"))
+            }
+        })?;
+        let Some(pred) = b.pred else {
+            return Err(Error::invalid(format!(
+                "vector index {name} has no vectors to project"
+            )));
+        };
+        let graph = b.graph.clone();
+        let links = graph.as_ref().map(|g| {
+            let g = g.clone();
+            move |x: u32, out: &mut Vec<u32>| g.links(0, x, out)
+        });
+        let links_ref: Option<crate::vector::projection::Links<'_>> = links
+            .as_ref()
+            .map(|f| f as &(dyn Fn(u32, &mut Vec<u32>) + Sync));
+        let node_rows: &[u32] = if graph.is_some() { &b.node_rows } else { &[] };
+        crate::vector::projection::project(
+            &snap,
+            name,
+            pred,
+            &b.segment,
+            b.config.metric,
+            cfg,
+            links_ref,
+            node_rows,
+            check,
+            progress,
+        )
+    }
+
     pub fn vector_recall(
         &self,
         name: &str,

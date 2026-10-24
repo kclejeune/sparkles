@@ -358,6 +358,23 @@ impl VectorIndexes {
             .vector_recall(name, opts.samples, opts.k, opts.ef)
     }
 
+    /// A two-dimensional projection of index `name`'s entities at the head, by PCA or by
+    /// a layout of its neighbour graph (spec U11 §3.3). `ctl` cancels it, bounds it with a
+    /// deadline and hears its progress. The projection is not kept: the server keeps the
+    /// last ones it computed.
+    pub fn projection(
+        &self,
+        name: &str,
+        cfg: &crate::vector::ProjectionConfig,
+        ctl: &crate::task::Control,
+    ) -> Result<crate::vector::Projection> {
+        let check = || ctl.check();
+        let progress = |p: f64| ctl.progress.report(p as f32, "projecting the vectors");
+        self.ds
+            .store()
+            .vector_projection(name, cfg, &check, &progress)
+    }
+
     /// Compute index `name`'s embeddings again with its embedding service.
     pub fn reembed(&self, name: &str) -> Result<()> {
         self.ds.store().reembed(name)
