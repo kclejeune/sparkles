@@ -180,10 +180,10 @@ pub(crate) struct Slot {
     subs: Vec<Sub>,
     /// the views attached to the circuit
     views: usize,
-    /// the commit at which the circuit last switched between incremental maintenance and
-    /// evaluating again (0: never). The switch changes the result without a commit, so
-    /// a live query resumed at or before it gets the whole result.
-    switched: u64,
+    /// set by a switch of the inference until the evaluation that follows it: the change
+    /// that evaluation publishes leads from one mode to the other, and diffs from before
+    /// it must not rewind a view across the switch
+    rebased: bool,
 }
 
 impl Slot {
@@ -437,6 +437,12 @@ pub struct Runtime {
     host_epoch: AtomicU64,
     /// the worker holds the dataset for a round
     busy: AtomicBool,
+    /// the highest commit a circuit's result has reflected
+    seen: AtomicU64,
+    /// `seen` at the latest switch of the inference (0: none). The switch changes results
+    /// without a commit, so a live query resumed at or before it gets the whole result,
+    /// even when its circuit was collected and created again since.
+    switched: AtomicU64,
 }
 
 impl std::fmt::Debug for Runtime {
@@ -599,6 +605,8 @@ impl Runtime {
             closed: AtomicBool::new(false),
             host_epoch: AtomicU64::new(0),
             busy: AtomicBool::new(false),
+            seen: AtomicU64::new(0),
+            switched: AtomicU64::new(0),
         })
     }
 
@@ -727,7 +735,7 @@ impl Runtime {
                 history_rows: 0,
                 subs: Vec::new(),
                 views: 0,
-                switched: 0,
+                rebased: false,
             }),
             info: Mutex::new(info),
             pending: AtomicUsize::new(0),
@@ -792,6 +800,7 @@ impl Runtime {
             match st.circuit.decode(body, &snap) {
                 Ok(()) => {
                     st.circuit.applied = h.commit;
+                    self.seen.fetch_max(h.commit, Ordering::AcqRel);
                     self.counters.loaded.fetch_add(1, Ordering::Relaxed);
                     let mut info = cell.info.lock();
                     info.status = Status::Ready;
@@ -868,6 +877,9 @@ impl Runtime {
             reg.cells.len()
         );
         reg.inference = now.clone();
+        // every event of the old mode carries a commit at most `seen`
+        self.switched
+            .store(self.seen.load(Ordering::Acquire), Ordering::Release);
         for cell in reg.cells.values() {
             let mut st = cell.state.lock();
             let fresh = st.fresh(now.clone());
@@ -889,9 +901,7 @@ impl Runtime {
             // diffs of the old mode do not lead to rows of the new one
             st.history.clear();
             st.history_rows = 0;
-            if st.circuit.snap.is_some() {
-                st.switched = st.circuit.applied;
-            }
+            st.rebased = true;
             let mut info = cell.info.lock();
             info.plan = st.circuit.plan();
             info.whole = st.whole_reason(now.as_deref());
@@ -921,23 +931,23 @@ impl Runtime {
         let mut worked = false;
         let mut over: Vec<(Arc<Cell>, u64)> = Vec::new();
         for cell in &cells {
+            // the status is read under the state lock: a switch of the inference replaces
+            // the circuit and marks it `building` under that lock
+            let mut st = cell.state.lock();
             let status = cell.info.lock().status.clone();
             match status {
                 Status::Building => {
-                    let mut st = cell.state.lock();
-                    if cell.info.lock().status == Status::Building {
-                        self.build(store, cell, &mut st);
-                        worked = true;
-                    }
+                    self.build(store, cell, &mut st);
+                    worked = true;
                 }
                 Status::Ready => {
-                    let mut st = cell.state.lock();
                     if self.advance(store, cell, &mut st, &mut deltas) {
                         worked = true;
                     }
                 }
                 Status::Failed { .. } => {}
             }
+            drop(st);
             let bytes = cell.info.lock().bytes;
             over.push((cell.clone(), bytes));
         }
@@ -963,6 +973,7 @@ impl Runtime {
     }
 
     fn note_pass(&self, cell: &Cell, st: &Slot, took: Duration, skipped: bool) {
+        self.seen.fetch_max(st.circuit.applied, Ordering::AcqRel);
         let mut info = cell.info.lock();
         info.applied = st.circuit.applied;
         info.rows = st.circuit.result.total().max(0) as u64;
@@ -1027,8 +1038,13 @@ impl Runtime {
             Ok(change) => {
                 cell.info.lock().status = Status::Ready;
                 self.note_pass(cell, st, t0.elapsed(), false);
+                self.live_budgets(st);
                 if let Some(c) = change {
                     self.publish(st, before, c, true);
+                }
+                if std::mem::take(&mut st.rebased) {
+                    st.history.clear();
+                    st.history_rows = 0;
                 }
             }
             Err(e) => self.fail(cell, st, &e),
@@ -1100,7 +1116,12 @@ impl Runtime {
                 st.circuit.applied
             );
         }
-        // live budgets
+        self.live_budgets(st);
+        true
+    }
+
+    /// End the live queries of the circuit whose budget its state passed.
+    fn live_budgets(&self, st: &mut Slot) {
         let bytes = st.circuit.bytes();
         st.subs.retain(|s| {
             if bytes <= s.budget {
@@ -1117,7 +1138,6 @@ impl Runtime {
             }
             false
         });
-        true
     }
 
     /// Send the change `c` from commit `from` to the circuit's commit to the
@@ -1250,10 +1270,12 @@ impl Runtime {
             .collect();
         let _ = store;
         for (name, cell, done) in todo {
+            // under the state lock, which a switch of the inference takes to replace the
+            // circuit
+            let st = cell.state.lock();
             if cell.info.lock().status != Status::Ready {
                 continue;
             }
-            let st = cell.state.lock();
             let applied = st.circuit.applied;
             if applied <= done {
                 continue;
@@ -1857,6 +1879,11 @@ impl Runtime {
                 }
                 cell.info.lock().status = Status::Ready;
                 self.note_pass(&cell, &st, t0.elapsed(), false);
+                if std::mem::take(&mut st.rebased) {
+                    st.history.clear();
+                    st.history_rows = 0;
+                }
+                self.live_budgets(&mut st);
                 // other subscribers see the new result as a reset
                 let applied = st.circuit.applied;
                 let reset = st.event(true);
@@ -1915,7 +1942,8 @@ impl Runtime {
     /// since, or a `reset` (spec F13 §2.3).
     fn resume(&self, store: &Store, st: &Slot, after: u64) -> Option<LiveEvent> {
         let applied = st.circuit.applied;
-        if st.switched > 0 && after <= st.switched {
+        let switched = self.switched.load(Ordering::Acquire);
+        if switched > 0 && after <= switched {
             return Some(st.event(true));
         }
         if after == applied {

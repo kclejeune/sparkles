@@ -1167,6 +1167,165 @@ fn a_resume_across_a_switch_resets() {
     drop(l);
 }
 
+fn rdfs_graph() -> Option<super::Inference> {
+    use crate::sparql::rdfs::{RdfsOnRead, SchemaSource};
+    super::Inference::new(
+        Some(Arc::new(RdfsOnRead::new(SchemaSource::Graph(None)))),
+        Vec::new(),
+    )
+}
+
+/// A live query resumed at a commit before a switch gets the whole result even when its
+/// circuit was collected and created again after the switch.
+#[test]
+fn a_resume_after_collection_resets() {
+    const PEOPLE: &str = "SELECT ?x WHERE { ?x a foaf:Person }";
+    let s = Store::in_memory(StoreOptions::default());
+    upd(
+        &s,
+        "INSERT DATA { :Student rdfs:subClassOf foaf:Person . :a a :Student . :b a foaf:Person }",
+    );
+    let rt = Runtime::open(None, s.dataset_id(), RuntimeOptions::default());
+    let host = Arc::new(Inferring(parking_lot::Mutex::new(None)));
+    rt.set_host(host.clone());
+    let l = rt
+        .live(&s, &q(PEOPLE), None, &LiveOptions::default())
+        .unwrap();
+    let Some(LiveEvent::Snapshot { commit, .. }) = l.try_next() else {
+        panic!("a snapshot first");
+    };
+    drop(l);
+    rt.round(&s);
+    *host.0.lock() = rdfs_graph();
+    rt.round(&s);
+    let again = rt
+        .live(
+            &s,
+            &q(PEOPLE),
+            None,
+            &LiveOptions {
+                after: Some(commit),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+    let e = again.try_next().unwrap();
+    assert!(
+        matches!(e, LiveEvent::Snapshot { reset: true, .. }),
+        "{e:?}"
+    );
+    assert_eq!(live_rows(&e).1, ["a", "b"]);
+}
+
+/// A view read back to the commit of a switch, after it moved on, has the rows of the
+/// new mode.
+#[test]
+fn a_read_back_after_a_switch_uses_the_new_mode() {
+    const PEOPLE: &str = "SELECT ?x WHERE { ?x a foaf:Person }";
+    let s = Store::in_memory(StoreOptions::default());
+    upd(
+        &s,
+        "INSERT DATA { :Student rdfs:subClassOf foaf:Person . :a a :Student . :b a foaf:Person }",
+    );
+    let rt = Runtime::open(None, s.dataset_id(), RuntimeOptions::default());
+    let host = Arc::new(Inferring(parking_lot::Mutex::new(None)));
+    rt.set_host(host.clone());
+    rt.put(&s, "people", ViewDef::table(q(PEOPLE))).unwrap();
+    rt.round(&s);
+    *host.0.lock() = rdfs_graph();
+    rt.round(&s);
+    let at = s.snapshot();
+    upd(&s, "INSERT DATA { :c a foaf:Person }");
+    rt.round(&s);
+    let r = rt
+        .read(&ViewRead {
+            name: "people",
+            at: at.commit,
+            snap: Some(&at),
+            allow_stale: false,
+            caller: None,
+            deadline: None,
+        })
+        .unwrap();
+    assert_eq!(rows_of(&r.rows), ["a", "b"]);
+}
+
+/// The evaluation after a switch ends the live queries whose budget the new state
+/// passes.
+#[test]
+fn a_switch_rebuild_enforces_live_budgets() {
+    const PEOPLE: &str = "SELECT ?x WHERE { ?x a foaf:Person }";
+    let s = Store::in_memory(StoreOptions::default());
+    let mut data = String::from("INSERT DATA { GRAPH <urn:x-sparkles:inferred> { ");
+    for i in 0..2000 {
+        data.push_str(&format!(":p{i} a foaf:Person . "));
+    }
+    data.push_str("} }");
+    upd(&s, &data);
+    let rt = Runtime::open(None, s.dataset_id(), RuntimeOptions::default());
+    let host = Arc::new(Inferring(parking_lot::Mutex::new(None)));
+    rt.set_host(host.clone());
+    rt.put(&s, "people", ViewDef::table(q(PEOPLE))).unwrap();
+    rt.round(&s);
+    let l = rt
+        .live(
+            &s,
+            &q(PEOPLE),
+            None,
+            &LiveOptions {
+                max_memory_bytes: Some(16 * 1024),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+    assert!(matches!(l.try_next(), Some(LiveEvent::Snapshot { .. })));
+    *host.0.lock() = super::Inference::new(None, vec!["urn:x-sparkles:inferred".into()]);
+    rt.round(&s);
+    let e = l.try_next();
+    assert!(
+        matches!(&e, Some(LiveEvent::Error { code, .. }) if code == "over-budget"),
+        "{e:?}"
+    );
+}
+
+/// Switches of the inference from other threads while rounds run never leave a view
+/// with rows of both modes.
+#[test]
+fn switches_racing_rounds_keep_views_exact() {
+    const PEOPLE: &str = "SELECT ?x WHERE { ?x a foaf:Person }";
+    let s = Arc::new(Store::in_memory(StoreOptions::default()));
+    upd(
+        &s,
+        "INSERT DATA { :Student rdfs:subClassOf foaf:Person . :a a :Student . :b a foaf:Person }",
+    );
+    let rt = Runtime::open(None, s.dataset_id(), RuntimeOptions::default());
+    let host = Arc::new(Inferring(parking_lot::Mutex::new(None)));
+    rt.set_host(host.clone());
+    rt.put(&s, "people", ViewDef::table(q(PEOPLE))).unwrap();
+    rt.round(&s);
+    let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let switcher = {
+        let (rt, s, host, stop) = (rt.clone(), s.clone(), host.clone(), stop.clone());
+        std::thread::spawn(move || {
+            let mut on = false;
+            while !stop.load(std::sync::atomic::Ordering::Relaxed) {
+                on = !on;
+                *host.0.lock() = if on { rdfs_graph() } else { None };
+                let _ = rt.get(&s, "people");
+            }
+        })
+    };
+    for i in 0..300 {
+        upd(&s, &format!("INSERT DATA {{ :n{i} a foaf:Person }}"));
+        rt.round(&s);
+        let rows = rt.get(&s, "people").unwrap().rows;
+        // at most every person once, whatever the mode
+        assert!(rows <= i as u64 + 3, "{rows} rows after {i} commits");
+    }
+    stop.store(true, std::sync::atomic::Ordering::Relaxed);
+    switcher.join().unwrap();
+}
+
 /// A circuit over inferred data skips a commit outside its footprint, and runs on a
 /// change of a schema predicate or of the inferred graph.
 #[test]
