@@ -738,7 +738,7 @@ class Cap(Base):
 
     def test_the_cap_is_global_not_per_ledger_file(self):
         carry = {"name": "pilot", "cost": 1_002_560_000}
-        self.assertEqual(px.HARD_CAP, 25 * 10**9)
+        self.assertEqual(px.HARD_CAP, 50 * 10**9)
         with self.assertRaises(Invalid):
             px.Ledger(self.root / "big.jsonl", px.HARD_CAP, carry)  # with carryover
         with self.assertRaises(Invalid):

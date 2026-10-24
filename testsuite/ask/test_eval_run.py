@@ -56,6 +56,15 @@ class LoadRun(unittest.TestCase):
     def test_a_complete_run_file_loads(self):
         self.assertEqual(self.load(RUN)["effort"], "medium")
 
+    def test_a_fresh_authorization_carries_zero(self):
+        run = dict(
+            copy.deepcopy(RUN),
+            localCapNanodollars=50_000_000_000,
+            carryover={"name": "fresh-20261024", "nanodollars": 0},
+            clarifications="score",
+        )
+        self.assertEqual(self.load(run)["clarifications"], "score")
+
     def test_the_documented_example_loads(self):
         example = json.loads((HERE / "run.example.json").read_text())
         self.assertEqual(self.load(example)["askTokenBudget"], 100000)
@@ -63,8 +72,9 @@ class LoadRun(unittest.TestCase):
     def test_a_real_run_names_the_pilot_carryover_and_stays_under_the_hard_cap(self):
         for change in (
             {"carryover": None},
-            {"localCapNanodollars": 25_000_000_000},
+            {"localCapNanodollars": 50_000_000_000},
             {"localCapNanodollars": 0},
+            {"clarifications": "guess"},
         ):
             with self.subTest(change=change), self.assertRaises(Invalid):
                 self.load(dict(copy.deepcopy(RUN), **change))

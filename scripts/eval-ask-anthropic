@@ -42,6 +42,7 @@ FIELDS = {
     "projectionMargin",
     "priorCaseCostNanodollars",
     "sets",
+    "clarifications",
 }
 
 
@@ -72,17 +73,23 @@ def load_run(path):
         or type(carry.get("nanodollars")) is not int
         or carry["nanodollars"] < 0
     ):
-        # The pilot's unresolved liability is part of the USD 25 aggregate, so a
-        # run file without it could spend the whole amount again.
+        # An earlier run's unresolved liability counts against the same authorization,
+        # so a run file must say what it carries, zero for a fresh authorization.
         raise Invalid("a carryover with a name and nanodollars is required")
     if run["localCapNanodollars"] + carry["nanodollars"] > px.HARD_CAP:
-        raise Invalid("the cap and the carryover pass the USD 25 aggregate")
+        raise Invalid("the cap and the carryover pass the hard cap of one ledger")
+    if run.get("clarifications", "answer") not in mod_clarifications():
+        raise Invalid("unknown clarification policy")
     for set_ in run["sets"]:
         if not set_["models"] or set(set_["models"]) - set(px.MODELS):
             raise Invalid("each set needs models from the allowed list")
         if any(m not in run["priorCaseCostNanodollars"] for m in set_["models"]):
             raise Invalid("a prior case cost is needed for every model")
     return run
+
+
+def mod_clarifications():
+    return evaluator_module().CLARIFICATIONS
 
 
 def percentile(values, share):
@@ -238,6 +245,7 @@ def main():
         "effort": run["effort"],
         "maxOutputTokens": run["maxOutputTokens"],
         "askTokenBudget": run["askTokenBudget"],
+        "clarifications": run.get("clarifications", "answer"),
         "sets": {},
     }
     code = 2
@@ -286,6 +294,7 @@ def main():
             ]
             if set_.get("loc"):
                 argv += ["--loc", set_["loc"]]
+            argv += ["--clarifications", run.get("clarifications", "answer")]
             for model in set_["models"]:
                 argv += ["--pair", "evaluation/" + model]
             ev = mod.parse_args(argv)

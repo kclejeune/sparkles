@@ -25,7 +25,11 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from evaluator import Invalid, strict_json
 
 LEDGER_VERSION = 2
-HARD_CAP = 25 * 10**9  # USD 25 in nanodollars, for the carryover and every run together
+# The most one ledger may hold, its cap and carryover together, in nanodollars. The
+# person who pays sets each campaign's total, and a campaign may use several ledgers,
+# each in its own directory. USD 25 bounded the first campaign of 2026-10-15 to
+# 2026-10-19. The campaign of 2026-10-24 has USD 90 over ledgers of USD 50 and 30.
+HARD_CAP = 50 * 10**9
 MODELS = ("claude-haiku-5-5", "claude-sonnet-5-5", "claude-opus-5-5")
 REQUEST_CAP, RESPONSE_CAP = 128 * 1024, 1024 * 1024
 # Integer USD nanodollars per token as input, 5 minute cache write, 1 hour cache

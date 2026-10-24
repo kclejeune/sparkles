@@ -444,6 +444,166 @@ def leaf_environment(extra=None):
     return env
 
 
+# The characters a prefixed name may escape with a backslash (SPARQL 1.1 PN_LOCAL_ESC).
+PN_LOCAL_ESC = "_~.-!$&'()*+,;=/?#@%"
+# Words too common to tell two choices apart.
+STOP_WORDS = frozenset(
+    "the and for with that this which what who whom whose from into onto about "
+    "one any all are was were has have had not its their his her does did you "
+    "mean http https www org com resource ontology property".split()
+)
+CLARIFY_CHOICES = 16
+CLARIFY_VALUE = 2000
+
+
+def words_of(text):
+    """Lowercase words of three or more characters, with camelCase, underscores and
+    percent escapes split, as a set. Each pair of neighbouring words also counts
+    joined, so "time zone" meets "timezone"."""
+    import urllib.parse
+
+    text = urllib.parse.unquote(text)
+    text = re.sub(r"([a-z0-9])([A-Z])", r"\1 \2", text)
+    parts = re.findall(r"[^\W_]+", text.lower())
+    parts += [a + b for a, b in itertools.pairwise(parts)]
+    return {w for w in parts if len(w) >= 3 and w not in STOP_WORDS}
+
+
+def gold_terms(text):
+    """The IRIs a gold query names and the words of their local names and literals.
+
+    The scan follows the lexical rules of `offline_query`: comments are skipped,
+    literals are read as data, and a prefixed name is expanded with the PREFIX
+    declarations of the text, its escapes undone. A name with an undeclared prefix
+    is left out. Returns (set of IRIs, set of words).
+    """
+    tokens, literals, i = [], [], 0
+    while i < len(text):
+        c = text[i]
+        if c == "#":
+            while i < len(text) and text[i] not in "\r\n":
+                i += 1
+            continue
+        if c in ('"', "'"):
+            marker = c * 3 if text.startswith(c * 3, i) else c
+            start = i + len(marker)
+            j = start
+            while j < len(text) and not text.startswith(marker, j):
+                j += 2 if text[j] == "\\" else 1
+            literals.append(text[start:j])
+            i = j + len(marker)
+            continue
+        if c == "<":
+            iri = re.match(r'<([^<>"{}|^`\\\x00-\x20]*)>', text[i:])
+            if iri:
+                tokens.append(("iri", iri[1]))
+                i += len(iri[0])
+                continue
+            i += 1
+            continue
+        if c in ("?", "$"):
+            i += 1
+            while i < len(text) and (text[i].isalnum() or text[i] == "_"):
+                i += 1
+            continue
+        if c.isalpha() or c in ("_", ":"):
+            chars, j = [(c, False)], i + 1
+            while j < len(text):
+                if text[j].isalnum() or text[j] in "_-.:%":
+                    chars.append((text[j], False))
+                    j += 1
+                elif (
+                    text[j] == "\\" and j + 1 < len(text) and text[j + 1] in PN_LOCAL_ESC
+                ):
+                    chars.append((text[j + 1], True))
+                    j += 2
+                else:
+                    break
+            while chars and chars[-1] == (".", False):
+                chars.pop()  # an unescaped final dot ends a triple pattern
+            tokens.append(("name", "".join(ch for ch, _ in chars)))
+            i = j
+            continue
+        i += 1
+    prefixes, declared = {}, set()
+    for k in range(len(tokens) - 2):
+        (k0, v0), (k1, v1), (k2, v2) = tokens[k : k + 3]
+        if (
+            k0 == "name"
+            and v0.upper() == "PREFIX"
+            and k1 == "name"
+            and v1.endswith(":")
+            and v1.count(":") == 1
+            and k2 == "iri"
+        ):
+            prefixes[v1[:-1]] = v2
+            declared.add(k + 2)
+    iris = set()
+    for k, (kind, value) in enumerate(tokens):
+        if kind == "iri" and k not in declared:
+            iris.add(value)
+        elif ":" in value:
+            prefix, local = value.split(":", 1)
+            if prefix in prefixes and local:
+                iris.add(prefixes[prefix] + local)
+    words = set()
+    for iri in iris:
+        words |= words_of(re.split(r"[/#]", iri)[-1])
+    for literal in literals:
+        words |= words_of(literal)
+    return iris, words
+
+
+def choose_clarification(clarify, gold_text):
+    """Answer a clarification the way a person who means the gold query would.
+
+    The answer is always the value of one of the choices the pipeline offered, so
+    nothing from the gold query that the pipeline did not already propose reaches it.
+    A choice whose value is an IRI the gold query names wins. Otherwise the choice
+    whose label and value share the most words with the gold's IRIs and literals
+    wins. A tie goes to the earliest of the tied choices, and with no overlap at all
+    the first choice is taken, as a person with no preference would. Returns the
+    answer, the index of the choice and the basis of the decision, or None when the
+    clarification is not a list of usable choices.
+    """
+    if not isinstance(clarify, dict):
+        return None
+    choices = clarify.get("choices")
+    if not isinstance(choices, list) or not 1 <= len(choices) <= CLARIFY_CHOICES:
+        return None
+    for c in choices:
+        if (
+            not isinstance(c, dict)
+            or not isinstance(c.get("value"), str)
+            or not c["value"].strip()
+            or len(c["value"]) > CLARIFY_VALUE
+            or any(ord(ch) < 32 for ch in c["value"])
+            or not isinstance(c.get("label", ""), str)
+        ):
+            return None
+    iris, words = gold_terms(gold_text)
+
+    def pick(indices, basis):
+        index = indices[0]
+        return {
+            "answer": choices[index]["value"],
+            "index": index,
+            "basis": basis if len(indices) == 1 else basis + "-tie",
+        }
+
+    exact = [i for i, c in enumerate(choices) if c["value"] in iris]
+    if exact:
+        return pick(exact, "gold-iri")
+    overlap = [
+        len((words_of(c.get("label", "")) | words_of(c["value"])) & words)
+        for c in choices
+    ]
+    best = max(overlap)
+    if best > 0:
+        return pick([i for i, n in enumerate(overlap) if n == best], "gold-words")
+    return {"answer": choices[0]["value"], "index": 0, "basis": "first-choice"}
+
+
 def validate_ask_record(value):
     if not isinstance(value, dict):
         raise Invalid("final Ask object required")
