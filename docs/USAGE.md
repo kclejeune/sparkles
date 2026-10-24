@@ -614,6 +614,7 @@ sparkles infer   --loc db --profile owl-rl    # materialize inferences, updating
 sparkles infer   --loc db --profile owl-rl --full   # materialize in full
 sparkles infer   --loc db --status            # are the inferences up to date?
 sparkles infer   --loc db --check             # OWL 2 RL inconsistency checks (exit 1 on violations)
+sparkles infer   --loc db --why 'ex:tom a ex:Animal'   # derivation trees of an inferred triple (exit 1 on none)
 sparkles infer   --loc db --profile owl-rl --threads 8   # evaluate the rules on 8 threads
 sparkles infer   --loc db --profile rdfs --max-inferred 200000000   # allow 200 million derived triples
 sparkles infer   --loc db --vocab geosparql --geo-default-geometry   # + GeoSPARQL axioms, default geometries
@@ -1829,6 +1830,36 @@ and runs when play stops. Above 20,000 drawn nodes only a size lens with project
 runs, and it shows the top 1,000 drawn nodes by value, with the rest at the smallest size.
 A server older than the view-only runs leaves projection scope disabled with the reason,
 and drawn-graph scope still works.
+
+### Why is this inferred?
+
+Clicking a dashed edge opens **Why is this inferred?** in place of the resource details,
+and so does the **Why?** button beside an inferred value in the properties, or `W` when
+that button has focus. The panel shows a derivation tree of the edge from
+[`POST /$/reason/{ds}/explain`](API.md#explanations). Each derived node names its rule,
+such as rdfs9 or cax-sco, and each leaf names the graph that asserts it. A premise that
+appears twice is shown in full once and marked "as above" after that, and a subtree cut at
+the depth limit has an **Expand** button that asks for its own tree.
+
+![Explore with the Why panel explaining an inferred type by two subclass steps, with the premises highlighted on the graph](images/explore-why.png)
+
+**Show on graph** draws every premise of the tree on the canvas and highlights them with
+the explained edge, so the chain that produced the edge can be followed on the picture.
+It shows the type edges and literals when the tree needs them. **Next** moves to another
+derivation whose top rule differs, up to five, and the footer gives the derivation's
+number, its depth and the commit the inferences were computed at.
+
+When the inferences are stale, a note above the tree says that it explains the closure as
+it was computed, and how many commits came since. A triple whose derivations all need
+facts you cannot read answers "No derivation from facts you can read was found", the same
+answer as a triple that is not entailed. A derivation deeper than the search allows says
+so. `Escape` closes the panel, and at phone width it is a full-height sheet.
+
+The same trees come from `sparkles infer --why`, which takes the triple in Turtle with the
+database's prefixes and prints the tree as text or, with `--format json`, as the route's
+answer. It exits with 1 when no derivation is found and 2 when the search runs out of its
+budget. The MCP tool `explain_inference` and the library call
+`Dataset::reasoning().explain` answer the same way.
 
 ## The validation overlay
 

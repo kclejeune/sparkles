@@ -517,7 +517,30 @@ naming `cax-sco` (OWL 2 RL) or `rdfs9` (RDFS).
 
 ## Outcome
 
-Not built. See [ROADMAP](../ROADMAP.md) item 18.
+Not built as F18. The `why` mode of `POST /$/reason/{ds}/explain` shipped first with
+[U10 Phase 3](U10-canvas-lenses.md#phase-3-2026-10-24), and the rest is
+[ROADMAP](../ROADMAP.md) item 18.
+
+### U10 Phase 3, 2026-10-24
+
+U10 Phase 3 built the first engine of §3 for the `why` mode, a backward search over the
+materialized closure that accepts a tree only when every fact in it has a well-founded
+depth, and an explainer for RDFS on read. It answers with the `Derivation` nodes of §2.1,
+shares repeated facts by `id`, cuts nodes past `maxDepth` as `ref`, and answers a hidden
+derivation with the same `404` as no derivation, as §7.3 asks. The route, the library call
+`Dataset::reasoning().explain`, `sparkles infer --why`, the MCP tool `explain_inference`,
+the Python and Node bindings and the UI's Why? panel follow §2 for that mode, and `whyNot`
+answers `501`.
+
+Phase 1 can keep the answer types and `finish` in `crates/sparkles-core/src/explain.rs`,
+the route and its access and budget answers, and every surface above. It adds `whyNot`
+behind the same route and puts its demand engine in place of the search in
+`crates/sparkles-reasoner/src/explain.rs`. The tests in
+`crates/sparkles-reasoner/tests/explain.rs` check well-foundedness and visible leaves on
+any tree, so they can compare the two engines on the same closures. The limits U10 left
+are ROADMAP items 135 to 137, a partial tree when the budget runs out, derivations through
+generalized triples and default geometries, and the builtins and bindings of a rule in the
+tree.
 
 ### Roadmap follow-ups (2026-10-23)
 
