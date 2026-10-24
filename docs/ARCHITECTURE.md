@@ -6,10 +6,9 @@ Jena's observable semantics and operational model while using QLever-style sorte
 indexes and columnar execution. Transactions, history, branches and derived indexes
 extend that foundation.
 
-This document describes the implementation in this checkout as of 2026-10-10. It
-connects the architectural decisions across the [design specs](specs/README.md);
-it does not treat every phase of a spec as implemented. The code and each spec's
-**Outcome** describe what shipped. [FEATURES](FEATURES.md) inventories behavior,
+This document describes the current implementation and connects the architectural
+decisions across the [design specs](specs/README.md). Not every phase of every spec
+is implemented, and each spec's **Outcome** section says which parts are. [FEATURES](FEATURES.md) inventories behavior,
 [API](API.md) defines the HTTP surface, and [BENCHMARKS](BENCHMARKS.md)
 records performance evidence and reproduction instructions.
 
@@ -99,8 +98,8 @@ not embed another store. The formatter has a separate browser WASM build. The
 database engine itself has no WASM build.
 
 The library-first boundary is implemented, but the server is more than a thin
-transport wrapper. Its dataset object wraps the library's `Dataset` and still
-dereferences a hidden `DatasetState` for existing handlers. Authentication, task
+transport wrapper. Its dataset object wraps the library's `Dataset` and
+dereferences a hidden `DatasetState` for the handlers that use it. Authentication, task
 queues, schedulers, layered operator settings, model providers and agent workflows
 remain process concerns. The parity map between HTTP and the library explicitly records these
 exceptions, and the bindings matrix includes intentional planned entries. A new
@@ -156,7 +155,7 @@ keep them in the vocabulary.
 
 The six triple permutations each carry the graph column. GSPO adds a graph-leading
 order. Blocks contain up to 32,768 rows, with columns encoded separately using delta
-and zig-zag varints followed by LZ4 compression. Since index format 3 each column is a
+and zig-zag varints followed by LZ4 compression. Each column is a
 run of independent frames of 2,048 rows, and a `.seg` file next to the permutation holds
 each frame's first key and length. In-memory first and last keys and offsets
 let scans skip blocks and count ranges without reading every row. Scans can decode
@@ -544,7 +543,7 @@ converts documents into facts with cited spans and puts document-derived proposa
 on review branches. Agent assertions can be immediately usable while marked
 unreviewed. Neither workflow bypasses normal access checks or write guards.
 
-Layered settings currently cover assistant, memory, ingestion and prefix
+Layered settings cover assistant, memory, ingestion and prefix
 configuration. Built-in defaults, operator-wide defaults, dataset declarations and
 runtime patches merge in order. Locks keep declared values authoritative. Responses
 explain sources, locks and overrides. Declared prefixes
@@ -593,13 +592,13 @@ matter when building on it:
 
 | Area | Current boundary |
 |---|---|
-| Distribution | RDF Patch application is implemented from F10. Pull replicas, promotion workflows and clustering are not. A change feed is not a running replication system. |
-| History | Readability depends on retained generations. Full-text search at historical commits and automatic pin rebasing remain deferred. Branch backups are independent. There is no whole-server backup. |
+| Distribution | RDF Patch application from F10 is implemented. Pull replicas, promotion workflows and clustering are not. A change feed is not a running replication system. |
+| History | Readability depends on retained generations. Full-text search at historical commits and automatic pin rebasing are not implemented. Branch backups are independent. There is no whole-server backup. |
 | Encryption | F11 partially implements optional encrypted backup repositories and operator key workflows. Live dataset files remain unencrypted by Sparkles. Content-defined chunking and KMS-backed dataset encryption are not implemented. |
 | Execution | Automatic execution streams many plans, and the rest run eagerly. Sorts, groupings, DISTINCT and joins can spill to disk when enabled with `--spill on` or `encrypted`. Eager operators still hold their whole state and can exceed a budget. |
 | Query languages | Read-only GraphQL is implemented with limitations on nested query cost. Cypher remains [specified only](specs/F01-cypher.md). There is no implemented property-graph frontend. |
 | Reasoning and shapes | Materialization plus RDFS on read is implemented, without a general backward rule engine or ontology object API. Incremental reasoning has full-run fallbacks. ShEx 2.2 and SHACL 1.2 node expressions remain absent. |
-| Agents and settings | Implemented model clients are tested against mock endpoints. The real-model evaluation matrix is still open. C18 Phase 6 is not built. |
+| Agents and settings | Model clients are tested against mock endpoints, and there is no evaluation matrix against real models. C18 Phase 6 is not built. |
 | Packaging and scale | Bindings are implemented but unpublished to package registries. The engine has no browser WASM build. Published measurements reach 1.24 billion triples on one machine. They do not establish larger or distributed behavior. |
 
 Architecture is checked through several complementary contracts. W3C query and update
