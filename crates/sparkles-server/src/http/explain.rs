@@ -30,8 +30,7 @@ pub(super) async fn explain(
             "whyNot explanations are not available: only mode \"why\" is",
         ));
     }
-    let asked = timeout.unwrap_or(DEFAULT_TIMEOUT);
-    req.timeout = Some(st.limits.cap_timeout(asked, Some(DEFAULT_TIMEOUT)));
+    req.timeout = Some(timeout_of(&st.limits, st.default_timeout, timeout));
     req.access = p.view(&ds.name, Endpoint::Query);
     // the search and the answer it builds are held to a query's memory budget
     req.max_memory = st
@@ -80,4 +79,39 @@ pub(super) async fn explain(
             .into_response())
     })
     .await
+}
+
+/// The timeout of an explanation: the one asked for or [`DEFAULT_TIMEOUT`], within the
+/// server's ceiling as a query's is, whose floor is the server's query timeout.
+fn timeout_of(
+    limits: &crate::state::Limits,
+    query_timeout: std::time::Duration,
+    asked: Option<std::time::Duration>,
+) -> std::time::Duration {
+    limits.cap_timeout(asked.unwrap_or(DEFAULT_TIMEOUT), Some(query_timeout))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::time::Duration;
+
+    #[test]
+    fn a_ceiling_below_the_default_holds() {
+        // serve --timeout 1 --max-timeout 2
+        let limits = crate::state::Limits {
+            max_timeout: Some(Duration::from_secs(2)),
+            ..Default::default()
+        };
+        let one = Duration::from_secs(1);
+        assert_eq!(timeout_of(&limits, one, None), Duration::from_secs(2));
+        assert_eq!(
+            timeout_of(&limits, one, Some(Duration::from_secs(30))),
+            Duration::from_secs(2)
+        );
+        assert_eq!(timeout_of(&limits, one, Some(one)), one);
+        // without a ceiling the default stands
+        let open = crate::state::Limits::default();
+        assert_eq!(timeout_of(&open, one, None), DEFAULT_TIMEOUT);
+    }
 }

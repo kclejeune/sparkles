@@ -720,12 +720,14 @@ rules by iterative deepening, so the mock suites run the panel.
   derive it, about 10 MB at the instance limit. The library call charges that state, the
   rule evaluations and the decoded terms of the answer to an optional memory limit. The
   route and the MCP tool set it to the query memory budget and take no pool grant, and the
-  route holds its answer to the result-byte limit of a query. Passing the memory limit
-  answers `422` as the other limits do.
+  route holds its answer to the result-byte limit of a query. An RDFS on read answer is
+  measured against the same limit once its trees are built, since it holds at most one
+  tree per rule. Passing the memory limit answers `422` as the other limits do.
 - *Deadline.* The timeout is checked between rules and inside each rule's evaluation, so a
   rule whose candidates all fail stops at it, and a stale run's history replay and the
   RDFS on read search stop at it and at a cancelled request too. A timeout too large to
-  represent answers `400`.
+  represent answers `400`. The timeout stays within the server's ceiling as a query's
+  does, even when the ceiling is below the ten-second default.
 - *Other top rules.* The trees after the first read depths worked out with the explained
   triple excluded, so no tree derives its triple from itself through another top rule.
 - *Sharing.* A repeated fact is shared by `id` within one tree only, so the panel shows

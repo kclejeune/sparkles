@@ -217,3 +217,52 @@ fn rdfs_on_read_stops_at_the_deadline() {
     req.timeout = Some(std::time::Duration::MAX);
     found(ds.reasoning().explain(&req).unwrap().explained);
 }
+
+/// A dataset with RDFS on read over `schema`, a TriG body for graph ex:ontology.
+fn on_read_with(data: &str, schema: &str) -> (tempfile::TempDir, Dataset) {
+    let (dir, ds) = open();
+    ds.load_str(
+        &format!(
+            "@prefix ex: <http://ex.org/> . @prefix rdfs: <http://www.w3.org/2000/01/rdf-schema#> .
+             @prefix rdf: <http://www.w3.org/1999/02/22-rdf-syntax-ns#> .
+             {{ {data} }} ex:ontology {{ {schema} }}"
+        ),
+        RdfFormat::TriG,
+    )
+    .unwrap();
+    ds.reasoning()
+        .rdfs()
+        .set(sparkles::reasoning::rdfs::NewSchema::Graph(ONTO.into()))
+        .unwrap();
+    (dir, ds)
+}
+
+#[test]
+fn rdfs_on_read_is_held_to_the_memory_limit() {
+    let big = "x".repeat(1_000_000);
+    let (_dir, ds) = on_read_with(&format!("ex:a ex:p \"{big}\" ."), "ex:p rdfs:domain ex:C .");
+    let mut req = ExplainRequest::new([ex("a"), ty(), ex("C")]);
+    found(ds.reasoning().explain(&req).unwrap().explained);
+    req.max_memory = Some(65_536);
+    let e = ds.reasoning().explain(&req).map(|_| ()).unwrap_err();
+    assert!(
+        matches!(&e, sparkles::Error::Component(c) if c.code == sparkles::reasoning::explain::REASONING_BUDGET),
+        "{e}"
+    );
+}
+
+#[test]
+fn rdfs_on_read_explains_a_superproperty_of_a_derived_type() {
+    let (_dir, ds) = on_read_with(
+        "ex:a ex:p ex:b .",
+        "ex:p rdfs:domain ex:C . rdf:type rdfs:subPropertyOf ex:kind .",
+    );
+    let t = &found(
+        ds.reasoning()
+            .explain(&ExplainRequest::new([ex("a"), ex("kind"), ex("C")]))
+            .unwrap()
+            .explained,
+    )[0];
+    assert_eq!(rule(t), "rdfs7");
+    assert_eq!(rule(&t.premises[0]), "rdfs2");
+}

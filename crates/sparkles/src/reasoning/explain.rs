@@ -264,6 +264,7 @@ pub fn explain(ds: &Dataset, req: &ExplainRequest) -> Result<Explanation> {
                 max_depth,
                 deadline,
                 cancel: req.cancel.clone(),
+                max_memory: req.max_memory,
             },
         )?;
         if let Explained::Found { .. } = found {

@@ -7171,7 +7171,8 @@ With RDFS on read and no materialized derivation, the trees come from the schema
 `source: "rdfsOnRead"` and rules of the profile `rdfs-on-read`. A type comes from `rdfs9`
 over a stored type, or from `rdfs2` or `rdfs3` over the domain or range of the property
 that declares it, as Jena's `MatchRDFS` applies them. A triple of a superproperty comes
-from `rdfs7`. A subclass or subproperty fact that the schema graph holds only through a
+from `rdfs7`, over a stored triple of a subproperty or, for a superproperty of `rdf:type`,
+over a type RDFS on read derives. A subclass or subproperty fact that the schema graph holds only through a
 chain is derived by `rdfs11` or `rdfs5` from the chain's facts. A schema given as a
 document has its closed triples as leaves without a `graph`.
 

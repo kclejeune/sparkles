@@ -101,6 +101,18 @@ impl Derivation {
     }
 
     /// The number of nodes in the tree, shared repeats included.
+    /// The heap the node and its premises hold, with their decoded terms.
+    pub fn heap_bytes(&self) -> usize {
+        std::mem::size_of::<Derivation>()
+            + self.triple.iter().map(term_bytes).sum::<usize>()
+            + self.graph.as_ref().map_or(0, String::len)
+            + self
+                .premises
+                .iter()
+                .map(Derivation::heap_bytes)
+                .sum::<usize>()
+    }
+
     pub fn size(&self) -> usize {
         1 + self.premises.iter().map(Derivation::size).sum::<usize>()
     }
@@ -179,4 +191,20 @@ pub struct ExplainLimits {
     pub deadline: Option<std::time::Instant>,
     /// set to `true` to stop the search
     pub cancel: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
+    /// the memory the answer may hold, unbounded when `None`
+    pub max_memory: Option<usize>,
+}
+
+/// The heap a decoded term holds.
+pub fn term_bytes(t: &Term) -> usize {
+    std::mem::size_of::<Term>()
+        + match t {
+            Term::NamedNode(n) => n.as_str().len(),
+            Term::BlankNode(b) => b.as_str().len(),
+            Term::Literal(l) => {
+                l.value().len() + l.datatype().as_str().len() + l.language().map_or(0, str::len)
+            }
+            #[allow(unreachable_patterns)]
+            _ => 64,
+        }
 }

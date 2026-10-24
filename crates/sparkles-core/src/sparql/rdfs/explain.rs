@@ -169,6 +169,47 @@ impl Cx<'_> {
         Ok(found.and_then(|s| self.snap.term(s)))
     }
 
+    /// A derivation of `s rdf:type c` in graph `g` that RDFS on read makes: from the domain
+    /// or range of a property `s` uses, or by `rdfs9` from a stored or derived type of a
+    /// subclass of `c`.
+    fn type_in(&self, g: Id, s: &Term, c: &NamedNode) -> Result<Option<Derivation>> {
+        for range in [false, true] {
+            if let Some(d) = self.by_domain_range(g, s, c, range)? {
+                return Ok(Some(d));
+            }
+        }
+        let subs: Vec<NamedNode> = RdfsSchema::get(&self.schema.sub_class, c.as_ref())
+            .into_iter()
+            .flatten()
+            .filter(|d| *d != c)
+            .cloned()
+            .collect();
+        for d in &subs {
+            let typed = [s.clone(), nn(rdf::TYPE), Term::NamedNode(d.clone())];
+            let premise = if self.held(g, &typed)? {
+                Some(Derivation::asserted(typed, self.graph_name(g)))
+            } else {
+                match self.by_domain_range(g, s, d, false)? {
+                    Some(x) => Some(x),
+                    None => self.by_domain_range(g, s, d, true)?,
+                }
+            };
+            let Some(premise) = premise else {
+                continue;
+            };
+            let Some(sc) = self.chain(d, rdfs::SUB_CLASS_OF, c)? else {
+                continue;
+            };
+            let t = [s.clone(), nn(rdf::TYPE), Term::NamedNode(c.clone())];
+            return Ok(Some(Derivation::derived(
+                t,
+                rule("rdfs9"),
+                vec![premise, sc],
+            )));
+        }
+        Ok(None)
+    }
+
     /// The schema fact `a pred b` that the schema holds directly, as a leaf.
     fn schema_fact(
         &self,
@@ -344,6 +385,7 @@ impl RdfsSchema {
             max_depth,
             deadline,
             cancel,
+            max_memory,
         } = limits;
         let cx = Cx {
             schema: self,
@@ -426,16 +468,25 @@ impl RdfsSchema {
             'graphs: for &g in graphs {
                 for q in &subs {
                     let stored = [s.clone(), Term::NamedNode(q.clone()), o.clone()];
-                    if !cx.held(g, &stored)? {
+                    let premise = if cx.held(g, &stored)? {
+                        Derivation::asserted(stored, cx.graph_name(g))
+                    } else if q.as_ref() == rdf::TYPE
+                        && let Term::NamedNode(c) = o
+                        && let Some(d) = cx.type_in(g, s, c)?
+                    {
+                        // RDFS on read answers a superproperty of rdf:type from a type
+                        // it derives, as well as from a stored one
+                        d
+                    } else {
                         continue;
-                    }
+                    };
                     let Some(sp) = cx.chain(q, rdfs::SUB_PROPERTY_OF, p)? else {
                         continue;
                     };
                     keep(Derivation::derived(
                         triple.clone(),
                         rule("rdfs7"),
-                        vec![Derivation::asserted(stored, cx.graph_name(g)), sp],
+                        vec![premise, sp],
                     ));
                     break 'graphs;
                 }
@@ -445,6 +496,16 @@ impl RdfsSchema {
             return Ok(Explained::NotFound);
         }
         let mut all: Vec<Derivation> = tops.into_values().collect();
+        // the trees hold at most one derivation per rule, so their decoded terms are
+        // measured once they are built, before the answer keeps them
+        if let Some(limit) = max_memory {
+            let bytes: usize = all.iter().map(Derivation::heap_bytes).sum();
+            if bytes > limit {
+                return Err(budget(format!(
+                    "the explanation's answer needs {bytes} bytes, over its memory limit of {limit}"
+                )));
+            }
+        }
         all.sort_by_key(|d| d.depth);
         let more = all.len() > max_trees.max(1);
         all.truncate(max_trees.max(1));
