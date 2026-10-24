@@ -1532,6 +1532,8 @@ each and asks before Phase 3 is designed in full.
   * A middle option keeps the mode off by default and enables it only where the lease
     store is known to be less available than the Sparkles nodes, such as a single etcd
     member.
+  * The maintainer prefers the middle option, and the decision is confirmed when Phase 3
+    is implemented.
 
 ## 12. Sources
 
