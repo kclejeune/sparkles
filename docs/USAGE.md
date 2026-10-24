@@ -1839,6 +1839,57 @@ grants cover only some graphs of the dataset cannot validate it, and the overlay
 "Validation needs access to every graph". A validation over the server's result budget
 shows the error and no badges.
 
+## Editing forms
+
+A dataset's SHACL shapes double as editing forms
+([U02](specs/U02-shape-driven-forms.md)). When a node shape targets the resource selected
+in Explore and the caller may save, the side panel shows **Edit**, which turns the
+properties into a form. `/ui/datasets/{name}/edit?iri=…&branch=…` opens the same form on
+a page of its own, for links from other tools. The shapes come from the dataset's
+write-time SHACL guard by default ([Write-time validation](API.md#write-time-validation)),
+and the dataset's `forms` setting can name shapes graphs instead or draft shapes from the
+data. Forms from drafted shapes say that the shapes are not enforced.
+
+The form merges the property shapes of every node shape that applies, groups the fields by
+`sh:group`, orders them by `sh:order` and labels them by `sh:name`, with `sh:description`
+as help. A required field says so in words. Each field's input follows its constraints:
+radio buttons or a select for `sh:in`, a checkbox or a three-way select for booleans, date
+inputs, number inputs with the type's step and the shape's bounds, a text input with a
+language for `rdf:langString`, a text area for long strings, an entity picker for
+`sh:class` and IRIs, and a term input for a field without constraints. A known
+`dash:editor` such as `dash:TextAreaEditor` replaces the choice. Triples of the resource
+that no shape describes are listed under **Other properties**, read-only. A field the
+caller's grants hide is absent, and one marked `dash:readOnly`, protected from the caller's
+writes or with a complex path is read-only with the reason beside it.
+
+The browser checks values as they are typed: XSD lexical forms, patterns with their flags,
+lengths, numeric and date ranges, allowed values, counts, `sh:languageIn` and
+`sh:uniqueLang`. A problem shows under its field, and the bar at the bottom counts problems
+and changes. **Preview** sends the change to the server, which runs it as a dry run and
+validates the touched resources against every constraint of the shapes, including
+`sh:class`, `sh:node` and SHACL-SPARQL. Its results appear under their fields, and the
+preview lists the triples the save would remove and add. **Save** commits the change as one
+commit with the message typed beside it. With a guard in `reject` mode, Save checks first
+and writes nothing when the guard would reject the change. Otherwise a save with problems
+asks once more with **Save with problems**. After a failed save, an error summary at the
+top of the form lists every problem, and each entry moves the focus to its field.
+
+Saves go to `main` when the caller may write it and it is not protected. When `main` is
+protected, or the `forms` setting's `saveTo` is `branch`, the first save creates the
+editor's branch `edits.{user}.{yyyymmdd}` from `main`'s head, and the form then edits that
+branch. Its banner counts the branch's commits and links to the merge page with
+**Review and merge**. The branch menu in the form's header opens the form on another
+branch.
+
+A save sends the values the form loaded for each field it changes. When another commit
+changed one of those fields meanwhile, the form lists the value it loaded, the value now
+stored and the person's own, and **Keep mine** or **Take the stored values** settles each
+field before saving again. Changes to other fields never conflict.
+
+The `forms` settings kind sets the shapes source, the shapes graphs, where saves go, the
+branch name template, the graph that new values go to and how new instances get IRIs
+([API](API.md#the-forms-settings-kind)). The dataset page's **Settings** tab edits it.
+
 ## The time slider
 
 The web UI reads a past state of a dataset with a slider. It is a bar under the toolbar of

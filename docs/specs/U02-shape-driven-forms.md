@@ -1,17 +1,18 @@
 # U02: Editing forms generated from SHACL shapes
 
-> **Status:** specified
+> **Status:** implemented (Phase 1)
 >
-> **Phases:** None shipped. Phase 1 is the form model endpoint, view and edit forms for
-> literal and IRI values, checks in the browser, previews and saves on a branch or
-> `main`, and review through the merge page. Phase 2 adds DASH editor and viewer hints,
+> **Phases:** Phase 1 shipped on 2026-10-24. It is the form model endpoint, view and edit
+> forms for literal and IRI values, checks in the browser, previews and saves on a branch
+> or `main`, and review through the merge page. Phase 2 adds DASH editor and viewer hints,
 > nested forms, new instances and value search. Phase 3 adds SHACL 1.2 lists and
 > alternatives with `sh:or` and `sh:xone`.
 >
-> **User docs:** none, because nothing is built.
+> **User docs:** [USAGE: Editing forms](../USAGE.md#editing-forms) and
+> [API: Editing forms](../API.md#editing-forms).
 >
 > This is the design as written before implementation. The [Outcome](#outcome) section at
-> the end will record how it lands.
+> the end records how it landed.
 
 This design was written from the W3C SHACL Recommendation, in particular its
 non-validating property shape characteristics (`sh:name`, `sh:description`, `sh:order`,
@@ -399,4 +400,86 @@ ex:PersonShape a sh:NodeShape ; sh:targetClass ex:Person ;
 
 ## Outcome
 
-Not built. See [ROADMAP](../ROADMAP.md) item 21.
+Phase 1 shipped on 2026-10-24 under [ROADMAP](../ROADMAP.md) item 21. Phases 2 and 3
+remain.
+
+**Where it lives.** `sparkles-shacl` reads the non-validating characteristics of property
+shapes (`sh:name`, `sh:description`, `sh:order`, `sh:group`, `sh:defaultValue`), the labels
+and orders of `sh:PropertyGroup`s and the DASH properties `dash:editor`, `dash:viewer`,
+`dash:singleLine` and `dash:readOnly`, chooses the node shapes of a focus node with
+`shapes_for_node`, and merges their property shapes into fields in its `form` module. The
+`sparkles` crate's `Dataset::forms()` handle builds the model, checks a change and saves
+it, so library callers get the same forms as HTTP. The server adds the routes of §3, the
+`forms` settings kind kept in `forms.json` at version 1, the session branch and the grants.
+The UI has `lib/forms.ts`, `lib/xsd.ts`, `ShapeForm.svelte`, `FormField.svelte`, an **Edit**
+button in Explore and the page `/datasets/{name}/edit`.
+
+**Decisions.** These settle what the spec left open or change it.
+
+* A field's `id` is its path in SPARQL syntax, such as `<http://ex/name>` or
+  `^<http://ex/memberOf>`, rather than a shape and a path. Two node shapes that constrain
+  the same path give one field with the stricter of each constraint and both shapes in
+  `sources`, as §2.8 asks, and the id stays the same across loads.
+* The server chooses the widget by §2.3 and sends it, and the UI replaces it only with the
+  widget of a DASH editor it knows. A field whose only constraints are on strings
+  (`sh:pattern`, `sh:minLength`, `sh:maxLength`) and that states no node kind gets a text
+  input for a plain literal instead of the term input.
+* A field with `sh:in` and no `sh:maxCount` is a radio group, as A1 asks, unless the
+  resource already has several values. With `sh:maxCount` above 1 or several values it is
+  a list of checkboxes.
+* `saveTo` has a third value, `auto`, which is the default. It saves to `main` unless
+  `main` is protected, which is the behaviour §2.6 describes for the default.
+* `expect` must name every changed field, and may be empty for a field that had no value.
+  A check reports the same conflicts a save would, so a stale form learns of them on
+  **Preview**.
+* With a `reject` guard, **Save** stays focusable instead of disabled. It runs the check
+  first when no check of the same changes passed, and when the guard would reject the
+  change it shows the error summary and writes nothing. Without a guard or in `warn` mode,
+  a save with problems asks once with **Save with problems**.
+* A check of a session branch that does not exist yet runs on `main`'s head and previews
+  the branch's first commit. The store's write options gained `preview_as_new_branch`,
+  which lets such a dry run past `main`'s protection and does nothing for a commit. A check
+  never creates the branch. A save creates only the caller's own session branch, which
+  needs the right to write branches and grants that do not limit the caller to some graphs
+  or triples, since such a branch would copy `main`.
+* The session branch's `{user}` is the caller's name, or `anonymous` without
+  authentication, and `{date}` is the day in UTC.
+* A caller whose grants limit the graphs or triples it reads gets checks without
+  validation results (`withheld: true`) and redacted receipts, as the validation routes and
+  previews treat such callers.
+* Values in the inferred graph `urn:x-sparkles:inferred` are neither shown nor edited.
+* Forms open only for an IRI focus. `class=` for new instances answers `501` until Phase 2.
+* The check's validation holds the writer lock while it runs and stops after 10 seconds,
+  after which the answer says `timedOut` and Save follows the guard's mode.
+* A field with more than 200 values is read-only with reason `too-many`, the other
+  properties list at most 100 predicates, and a change may remove and add at most 1,000
+  terms.
+* The `forms` settings are read from `main`, so every branch of a dataset uses the same
+  form settings.
+* A change counts each replaced, added or removed value once in the form's summary.
+
+**Open questions.** Question 4 is settled: `dash:readOnly` is enforced on the server, and a
+save that changes such a field answers `403`. For question 3, a removed value is deleted
+from every graph that holds it, an added value goes to the `targetGraph`, and moving a value
+between graphs is not offered. Questions 1 and 2 stay open: ShEx schemas do not drive
+forms, and a session branch is an ordinary branch that stays after a merge until someone
+deletes it.
+
+**Tests.** `sparkles-shacl/tests/forms.rs` covers the layout, the merge of shapes and the
+widgets. `sparkles/tests/forms.rs` covers targets by class with subclasses, inverse and
+complex paths, other properties, checks and conflicts through the library. The server's
+`http/forms_tests.rs` covers A1 to A5 and A7 over HTTP, the check against `/{ds}/shacl` on
+the same state, a check before the session branch exists, conflicts under six concurrent
+writers and the settings kind, and `router_tests/auth/forms.rs` covers A6 with a C12b
+protection, readers and a caller limited to one graph. Vitest covers the browser checks,
+the XSD lexical forms, the widgets, term parsing, change sets and the save plan. Playwright
+runs A1 to A5, A7 and A9 against a real server in `tests/e2e/forms.spec.ts` and the layout,
+the checks, branch saves, conflicts, the error summary, the empty state and the phone
+layout against the mock in `tests/mock/forms.spec.ts`.
+
+**Limits.** Nested forms, new instances, DASH viewers and full-text value search are Phase
+2, and list editors and `sh:or` or `sh:xone` alternatives are Phase 3, all under item 21.
+The entity picker searches labels as Explore's search does and does not limit its hits to
+the field's `sh:class`, which the server's check reports instead. Complex paths are shown
+without values. See the [screenshot](../images/forms.png) of a form in Explore and the
+[screenshot](../images/forms-branch.png) of a form saving to a session branch.
