@@ -127,6 +127,14 @@ round, and its client time was the same, 1250.4 ms against 1250.5 ms. The differ
 comes from where the sort's code lands, and it is small next to the gain on
 `expr-order-key`, so the setting stays.
 
+Generic code is compiled in the crate that instantiates it, so a function of the engine
+that takes a writer or another type of the server is compiled with the server, in four
+units, and its code placement moves with changes to the server. Such placement made
+`optional-chain` at 10.5M take 6% to 13% more client time on forge in builds that ran the
+same instructions within 1.7%. The eager result serializers therefore write into a buffer
+whose type is the engine's, so they are compiled with the engine and pass 8 KiB pieces to
+the server's writer. Roadmap item 240 does the same for the streamed writers.
+
 A Namespace screen could not decide this setting. Its geometric mean was 0.997 for server
 time, with queries under 2 ms moving 9% to 32% in both directions, so the pinned check on
 forge decided it. A release rebuild after a change to `sparkles-core` takes about 35

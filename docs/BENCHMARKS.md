@@ -1272,7 +1272,7 @@ patterns for every request and for the current one.
 | `star-lookup` | 2,439.0 thousand | 2,433.9 thousand |
 
 *Instructions were counted on atlas, an Intel Core i5-13500, with both binaries built in
-the Nix development shell.*
+the Nix development shell, before the result buffer of the next section.*
 
 In 16 pinned rounds of 200 SPARQL JSON requests on forge, `star-lookup` took 2.0% less
 client time without the references, 0.559 ms against 0.570 ms, and was faster in all 16
@@ -1280,6 +1280,42 @@ rounds. `values-star` took 0.6% less, and `count-all`, `path-plus` and `types-gr
 moved by 0.7% or less, which is within their noise at about 0.27 ms of client time. A
 request in the Sparkles format names its patterns and pays these instructions, since its
 answer shows them.
+
+### The cost of result serialization
+
+Eager answers are serialized into an 8 KiB buffer of the engine and written to the response
+in pieces of that size. The serializers are compiled with the engine, so their speed does
+not move with changes to the server, as [Benchmarking](BENCHMARKING.md#release-build-settings)
+explains. The table gives `instructions:u` per request of a plain SPARQL JSON request at
+10.5M, over 2,000 warm requests, for a build whose serializers wrote to the response writer
+a few bytes at a time and for the current one.
+
+| Query | Writing to the response writer | Writing to the buffer |
+|---|--:|--:|
+| `count-all` | 329.6 thousand | 316.6 thousand |
+| `path-plus` | 320.6 thousand | 308.5 thousand |
+| `types-grouped` | 660.1 thousand | 520.2 thousand |
+| `values-star` | 1,152.4 thousand | 895.3 thousand |
+| `star-lookup` | 2,437.8 thousand | 1,616.8 thousand |
+| `subquery-agg` | 15,383.0 thousand | 15,271.0 thousand |
+
+*Instructions were counted on an Intel Core Ultra X7 358H laptop, with both binaries built
+in the Nix development shell.*
+
+On forge, in 8 pinned rounds of 100 requests, the 300,191 rows of `optional-chain` reach
+the client in 150.8 ms against 220.4 ms, and every round was faster. `star-lookup` takes
+0.496 ms of client time against 0.526 ms, and `count-all`, `types-grouped` and
+`values-star` stay within 1.2%. A screen of all queries on forge, at 8
+rounds of 20 requests, found client time 19% lower for `order-by-full`, 30% lower for
+`star-join` and 5% lower for `distinct-join`. `two-hop-count` took 1.4% more server
+time in every round while it ran the same instructions, which roadmap item 242 follows
+up.
+
+The buffer remembers where each row ends, so an answer that stops partway reports the rows
+whose bytes the response writer took. That accounting costs 7% of the instructions of
+`optional-chain`, 3.7% of those of `star-lookup` and 2% of those of `values-star` against
+a buffer that counts rows only when it is written out, and on forge `optional-chain` took
+150.8 ms of client time against 132.0 ms without it. Roadmap item 243 follows this up.
 
 ### The cost of the query memory pool
 
@@ -1445,8 +1481,9 @@ at commit c2518d7b.*
 Load peak RSS stays within the spread between loads, at 2.0 to 2.1 GB at 10.5M and 3.1 to
 3.3 GB on DBpedia. Warm `contains`, `lang-filter` and the export at 10.5M run 4% to 10%
 slower with FSST, DBpedia's `abstract-contains` and `label-regex` 12% slower, and cold
-`entity-summary-1` on DBpedia takes 1.17 times as long. [Roadmap](ROADMAP.md) items 160 and
-161 follow up `star-join`, `entity-summary-1` and the warm DBpedia geometric mean.
+`entity-summary-1` on DBpedia takes 1.17 times as long. [Roadmap](ROADMAP.md) item 160
+follows up `star-join` and `entity-summary-1`, and item 241 follows up three warm DBpedia
+queries that run 1.4% to 4.2% slower with front coding since item 108.
 
 ## Loading and index builds
 
