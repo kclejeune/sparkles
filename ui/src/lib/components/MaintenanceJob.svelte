@@ -149,7 +149,7 @@
             ? 'Set “Delete session graphs after” and save before running retention'
             : job === 'consolidation'
               ? 'Start a consolidation pass with the settings above'
-              : 'Preview and then delete the session graphs older than the retention'}
+              : 'Preview, then delete session graphs older than the retention period'}
         onclick={() => (job === 'retention' ? askRetention() : run())}>Run now</button
       >
     {/if}
@@ -176,15 +176,15 @@
     onclose={closeDialog}
   >
     {#if previewError}
-      <div class="error-box"><strong>The preview failed.</strong> {previewError}</div>
+      <div class="error-box"><strong>Could not load the preview.</strong> {previewError}</div>
     {:else if !plan}
       <p class="faint">
-        <span class="spinner"></span> Looking for session graphs older than the retention…
+        <span class="spinner"></span> Finding session graphs older than the retention period…
       </p>
     {:else if plan.remove.length === 0}
       <p>
-        No session graph is old enough to delete{plan.after ? ` (older than ${plan.after})` : ''},
-        so a pass would change nothing.
+        No session graphs are old enough to delete{plan.after ? ` (older than ${plan.after})` : ''}.
+        Running retention now would change nothing.
       </p>
     {:else}
       <p>

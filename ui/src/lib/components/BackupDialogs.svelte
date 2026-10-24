@@ -97,8 +97,8 @@
   {#if del}
     <p>
       This deletes the manifest of <strong class="mono">{del.name}</strong> (commit {del.commit.seq} of
-      {del.dataset.name}) from <span class="mono">{del.repository}</span>. Other backups stay
-      complete; blobs only this one used are removed by the next garbage collection.
+      {del.dataset.name}) from <span class="mono">{del.repository}</span>. Other backups are not
+      affected. Blobs used only by this backup are removed by the next garbage collection.
     </p>
     <label class="field">
       Type the backup name to confirm

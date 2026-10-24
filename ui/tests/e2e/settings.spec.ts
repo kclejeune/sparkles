@@ -60,7 +60,7 @@ open('the Settings tab shows sources, locks and resets', async ({ page, request 
     .getByTestId('settings-assistant')
     .getByRole('button', { name: 'Save', exact: true })
     .click();
-  await expect(page.getByText('Someone else changed the assistant settings')).toBeVisible();
+  await expect(page.getByText('The assistant settings changed elsewhere')).toBeVisible();
   await expect(row(page, 'deadlineSecs').getByRole('textbox')).toHaveValue('60');
   await expect(row(page, 'rowsForSummary').getByRole('textbox')).toHaveValue('');
 
@@ -95,10 +95,10 @@ open('the Settings tab shows sources, locks and resets', async ({ page, request 
 
   // the runtime layer as JSON: a change of the locked field is refused and highlighted
   const panel = page.getByTestId('settings-assistant');
-  await panel.getByText('Advanced: the runtime layer as JSON').click();
+  await panel.getByText('Advanced: edit runtime changes as JSON').click();
   await panel.getByRole('textbox', { name: 'Assistant runtime layer' }).fill('{"send": "rows"}');
   await panel.getByRole('button', { name: 'Save JSON' }).click();
-  await expect(panel.getByText('The assistant settings were not saved.')).toBeVisible();
+  await expect(panel.getByText('Could not save the assistant settings.')).toBeVisible();
   await expect(send).toHaveClass(/conflict/);
 
   // memory maintenance: no retention is set, and a consolidation runs on request
@@ -123,7 +123,9 @@ open('declared datasets offer no delete', async ({ page }) => {
 
 test('a user without admin reads the settings', async ({ page }) => {
   await page.goto(`/ui/datasets/${DATASET}?tab=settings`);
-  await expect(page.getByText('Changing them needs admin on the dataset.')).toBeVisible();
+  await expect(
+    page.getByText('You need admin access to this dataset to change these settings.'),
+  ).toBeVisible();
   const panel = page.getByTestId('settings-assistant');
   await expect(panel.locator('[data-field="enabled"] input')).toBeDisabled();
   await expect(panel.getByRole('button', { name: 'Save', exact: true })).toHaveCount(0);

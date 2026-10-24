@@ -118,7 +118,7 @@
   function lineage(x: b.BackupSummary): { label: string; title: string } | null {
     const live = app.datasets.find((d) => d.name === x.dataset.name);
     if (!live)
-      return { label: 'not on this server', title: 'No dataset of this name is served here' };
+      return { label: 'not on this server', title: 'This server has no dataset with this name' };
     if (live.id && live.id !== x.dataset.id)
       return {
         label: 'other lineage',
@@ -176,8 +176,8 @@
           <th>Commit</th>
           <th>Completed</th>
           <th class="num" title="Sum of the file sizes">Size</th>
-          <th class="num" title="Bytes this backup stored first">Added</th>
-          <th class="num" title="Size over added bytes">Dedup</th>
+          <th class="num" title="New bytes this backup added to the repository">Added</th>
+          <th class="num" title="Total size divided by added bytes">Dedup</th>
           <th>Policy</th>
           <th>Verified</th>
           <th></th>
@@ -247,7 +247,7 @@
         {:else}
           <tr>
             <td colspan="10" class="faint">
-              {#if !loaded}Loading…{:else if backups.length}No backup matches the filters.{:else}No
+              {#if !loaded}Loading…{:else if backups.length}No backups match the filters.{:else}No
                 backups yet.{/if}
             </td>
           </tr>

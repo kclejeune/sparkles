@@ -54,6 +54,6 @@ export async function followCommits(
 /** Why Follow stopped, in a sentence. */
 export function changesFeedUnavailable(e: unknown): string {
   if (e instanceof ApiError && (e.status === 403 || e.status === 404))
-    return 'This server does not offer the change feed to you.';
+    return 'The change feed is not available.';
   return `Follow stopped. ${e instanceof Error ? e.message : String(e)}`;
 }

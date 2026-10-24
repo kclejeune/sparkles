@@ -168,7 +168,7 @@ test('A13: the time-lapse makes one request per step and groups the large one', 
   await view(page).getByRole('button', { name: 'Play the time-lapse' }).click();
   await expect(steps).toHaveText('step 2/4');
   seen.push(await labels(page));
-  await expect(view(page)).toContainText('grouped by class from here on');
+  await expect(view(page)).toContainText('groups by class from here on');
   await expect(steps).toHaveText('step 4/4');
   await expect(view(page).getByRole('button', { name: 'Play the time-lapse' })).toBeVisible();
   // bob was drawn by step 2
@@ -212,7 +212,7 @@ test('a grouped seed past the budget leaves the groups to start at the large ste
   await view(page).getByRole('button', { name: 'Play the time-lapse' }).click();
   await expect(view(page).getByText(/^step \d\/4$/)).toHaveText('step 4/4');
   expect(refused).toBe(1);
-  await expect(view(page)).toContainText('could not be grouped within the budget');
+  await expect(view(page)).toContainText('could not be grouped within the memory budget');
   await expect.poll(() => labels(page)).toMatch(/Person \+600/);
 });
 
@@ -398,7 +398,7 @@ test('A16: a reader who cannot read the graph of commit 4 sees no changes', asyn
     { name: 'mock-principal', value: 'reader', domain: '127.0.0.1', path: '/' },
   ]);
   await page.goto(diffUrl(4, 3));
-  await expect(view(page)).toContainText('No changes you can read between these commits');
+  await expect(view(page)).toContainText('No changes between these commits');
   await context.clearCookies();
 });
 
@@ -409,7 +409,7 @@ test('a grouped diff past the budget falls back to the first changes', async ({
   if (await dataset(request, 'chrono507'))
     await update(request, 'chrono507', 'INSERT DATA { ex:a ex:p ex:b }', 'One');
   await page.goto('/ui/explore?ds=chrono507&diff=commit%3A1&diffFrom=commit%3A0&group=class');
-  await expect(view(page)).toContainText('Grouping needs more than the server allows');
+  await expect(view(page)).toContainText("Grouping exceeds the server's limit");
   await expect.poll(async () => (await drawn(page)).edges.length).toBe(1);
 });
 

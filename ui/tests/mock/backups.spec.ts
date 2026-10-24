@@ -98,7 +98,7 @@ test('a backup made on the dataset page restores into a new dataset', async ({ p
   await restore.getByRole('button', { name: 'Next' }).click();
   await restore.getByRole('textbox', { name: 'Name' }).fill('foaf-e2e-copy');
   await restore.getByRole('button', { name: 'Next' }).click();
-  await expect(restore).toContainText('Here: a new id');
+  await expect(restore).toContainText('This restore: a new id');
   await restore.getByRole('button', { name: 'Restore', exact: true }).click();
   await expect(restore).toContainText('/foaf-e2e-copy is ready', { timeout: 15_000 });
   await restore.getByRole('link', { name: 'Open' }).click();

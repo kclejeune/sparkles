@@ -194,10 +194,10 @@
           const omitted = groupedElements(g, short).omitted;
           note = [
             g.truncated
-              ? `The ${fmtInt(g.groups.length)} largest of ${fmtInt(g.groupCount)} groups are drawn.`
+              ? `Showing the ${fmtInt(g.groups.length)} largest of ${fmtInt(g.groupCount)} groups.`
               : '',
             omitted
-              ? `${fmtInt(omitted)} smaller groups are left out to stay within ${fmtInt(MAX_CANVAS_NODES)} nodes.`
+              ? `${fmtInt(omitted)} smaller groups are hidden to stay within ${fmtInt(MAX_CANVAS_NODES)} nodes.`
               : '',
           ]
             .filter(Boolean)
@@ -209,7 +209,7 @@
           // a grouping past the budget falls back to the first changes
           if (e instanceof api.ApiError && e.status === 507) {
             grouped = false;
-            note = `Grouping needs more than the server allows (${e.message}), so the first ${STEP_QUADS} changes are drawn.`;
+            note = `Grouping exceeds the server's limit (${e.message}). Showing the first ${STEP_QUADS} changes.`;
           } else throw e;
         }
       }
@@ -307,7 +307,7 @@
       const cut = d != null && (d.quads?.length ?? 0) < d.added + d.removed;
       members = { cls, offset, more: full };
       note = d
-        ? `The changes of ${fmtInt(terms.length)} members of ${short(cls)}${cut ? `, the first ${fmtInt(d.quads?.length ?? 0)} of ${fmtInt(d.added + d.removed)}, which touch other resources too` : ''}.`
+        ? `Changes to ${fmtInt(terms.length)} members of ${short(cls)}${cut ? `, showing the first ${fmtInt(d.quads?.length ?? 0)} of ${fmtInt(d.added + d.removed)}, including changes to other resources` : ''}.`
         : `No changed members of ${short(cls)} to draw.`;
       announce = note;
     } catch (e) {
@@ -445,7 +445,7 @@
       if (!lapseGroups && tooLarge(s)) {
         lapseGroups = new Map();
         seed = i > 0;
-        note = `Commit ${s.to} has ${fmtInt(s.changes ?? 0)} changes, more than the ${fmtInt(STEP_QUADS)} a step draws, so the time-lapse is grouped by class from here on.`;
+        note = `Commit ${s.to} has ${fmtInt(s.changes ?? 0)} changes, more than the ${fmtInt(STEP_QUADS)} a step can draw. The time-lapse groups by class from here on.`;
       } else if (!lapseGroups) {
         const d = await api.diff(ds, {
           from: `commit:${s.from}`,
@@ -462,7 +462,7 @@
           // a step too large to draw: from here on, by class
           lapseGroups = new Map();
           seed = i > 0;
-          note = `Commit ${s.to} has ${fmtInt(d.added + d.removed)} changes, more than ${!r ? `the ${fmtInt(STEP_QUADS)} a step draws` : `${fmtInt(MAX_CANVAS_NODES)} nodes hold`}, so the time-lapse is grouped by class from here on.`;
+          note = `Commit ${s.to} has ${fmtInt(d.added + d.removed)} changes, more than ${!r ? `the ${fmtInt(STEP_QUADS)} a step can draw` : `${fmtInt(MAX_CANVAS_NODES)} nodes can hold`}. The time-lapse groups by class from here on.`;
         } else {
           const t1 = performance.now();
           canvas = r.canvas;
@@ -506,7 +506,7 @@
           // then start from this step, and the time-lapse plays on
           if (!(e instanceof api.ApiError && e.status === 507)) throw e;
           note +=
-            ' The steps drawn before could not be grouped within the budget, so the groups start here.';
+            ' Earlier steps could not be grouped within the memory budget, so grouping starts here.';
         } finally {
           inFlight--;
         }
@@ -763,14 +763,14 @@
     <select class="select sm" aria-label="Steps a second" bind:value={speed}>
       {#each SPEEDS as s (s)}<option value={s}>{s}/s</option>{/each}
     </select>
-    <label class="check small" title="Ghosts stay until the end"
+    <label class="check small" title="Keep removed elements visible as ghosts until the end"
       ><input type="checkbox" bind:checked={keepGhosts} /> Keep ghosts</label
     >
     {#if stepCount}<span class="faint small mono"
         >step {Math.max(0, stepIndex + 1)}/{stepCount}</span
       >{/if}
     {#if lapseCaption}<span class="small lapse-cap">{lapseCaption}</span>{/if}
-    {#if loading}<span class="spinner" aria-label="Reading"></span>{/if}
+    {#if loading}<span class="spinner" aria-label="Loading"></span>{/if}
   </div>
 
   <div class="tabs narrow-tabs" role="tablist" aria-label="Diff views">
@@ -798,7 +798,7 @@
       {#if emptyChanges}
         <div class="dg-empty">
           <Icon name="info" size={20} />
-          <p>No changes you can read between these commits.</p>
+          <p>No changes between these commits.</p>
         </div>
       {:else}
         <GraphView
@@ -809,7 +809,7 @@
           layoutNew={!playing || speed <= 2}
           onselect={selectNode}
           onexpand={expandNode}
-          emptyText={loading ? 'Reading the changes…' : 'Nothing to draw'}
+          emptyText={loading ? 'Loading the changes…' : 'Nothing to draw'}
         />
       {/if}
     </div>

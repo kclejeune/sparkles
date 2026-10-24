@@ -32,12 +32,12 @@
     {
       value: 'exists',
       label: 'Exists',
-      cost: 'Every referenced blob is present with its size. Listing requests only.',
+      cost: 'Checks that every referenced blob exists with the right size. Uses listing requests only.',
     },
     {
       value: 'data',
       label: 'Data',
-      cost: 'Also downloads and hashes every blob: reads every byte (egress on S3).',
+      cost: 'Also downloads and hashes every blob. Reads every byte, which costs egress on S3.',
     },
     {
       value: 'restore',
@@ -136,7 +136,7 @@
         {#if report.orphans}
           <p class="small muted">
             {fmtInt(report.orphans.blobs)} unreferenced blob{report.orphans.blobs === 1 ? '' : 's'}
-            ({fmtBytes(report.orphans.bytes)}): garbage collection removes them after the grace
+            ({fmtBytes(report.orphans.bytes)}). Garbage collection removes them after the grace
             period.
           </p>
         {/if}

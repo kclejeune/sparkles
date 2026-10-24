@@ -241,13 +241,13 @@
       goto(datasetHref(target));
     } catch (e) {
       if (e instanceof api.ApiError && e.code === 'head-moved') {
-        note = `${source} or ${target} changed since the page read them. Check the conflicts and the changes again, then merge.`;
+        note = `${source} or ${target} changed while you were reviewing. Check the conflicts and changes again, then merge.`;
         void load();
       } else if (e instanceof api.ApiError && e.status === 422) {
         refused = (e.body?.validation as api.GuardReport | undefined) ?? {};
         error = api.errorMessage(e);
       } else if (e instanceof api.ApiError && e.code === 'merge-conflict' && e.body) {
-        note = 'Some conflicts are still open. The page read them again.';
+        note = 'Some conflicts are still open. The list has been refreshed.';
         void load();
       } else error = api.errorMessage(e);
     } finally {
@@ -467,8 +467,7 @@
         </div>
         {#if cells.length < total}
           <p class="lead faint">
-            The page lists {fmtInt(cells.length)} of {fmtInt(total)} conflicts. Choose a rule for the
-            others below.
+            Showing {fmtInt(cells.length)} of {fmtInt(total)} conflicts. Choose a rule for the rest below.
           </p>
         {/if}
         <div class="rule">
@@ -504,7 +503,7 @@
         <div class="panel-body changes">
           {#if !canMerge}
             <p class="faint">
-              Merging into {target} needs write access on it, so the page cannot list the changes.
+              You need write access to {target} to see what the merge changes.
             </p>
           {:else if dryError}
             <div class="error-box">
@@ -513,7 +512,7 @@
             </div>
           {:else if dry}
             {#if open && onConflict === 'fail'}
-              <p class="faint">Conflicts without a choice keep {target}'s values in this list.</p>
+              <p class="faint">This list keeps {target}'s values for conflicts without a choice.</p>
             {/if}
             {#if dry.outcome === 'rejected' && dry.validation}
               <div class="refused" role="alert">
@@ -575,13 +574,13 @@
             </button>
           </div>
           {#if !canMerge}
-            <p class="faint">You need write access on {target} to merge into it.</p>
+            <p class="faint">You need write access to {target} to merge into it.</p>
           {:else if open}
             <p class="faint">Choose a side for every conflict to merge.</p>
           {/if}
           {#if total}
             <details class="cli">
-              <summary class="faint">The same from the command line</summary>
+              <summary class="faint">Command line equivalent</summary>
               {#each commands as cmd (cmd)}<pre class="mono">{cmd}</pre>{/each}
             </details>
           {/if}
