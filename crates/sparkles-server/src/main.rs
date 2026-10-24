@@ -4760,7 +4760,16 @@ fn explain_cli(
     let mut req = ex::ExplainRequest::new(triple);
     req.max_trees = max_trees;
     req.max_depth = max_depth;
-    req.timeout = timeout.map(std::time::Duration::from_secs_f64);
+    req.timeout = match timeout {
+        None => None,
+        Some(t) => match std::time::Duration::try_from_secs_f64(t) {
+            Ok(d) if t > 0.0 => Some(d),
+            _ => {
+                eprintln!("error: --timeout must be a positive number of seconds");
+                std::process::exit(2);
+            }
+        },
+    };
     let e = match ds.reasoning().explain(&req) {
         Ok(e) => e,
         Err(sparkles::Error::Component(c)) if c.code == ex::REASONING_BUDGET => {

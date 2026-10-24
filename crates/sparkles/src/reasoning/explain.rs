@@ -123,7 +123,8 @@ fn readable(access: Option<&Arc<GraphAccess>>, snap: &Arc<Snapshot>, g: Id) -> b
 
 /// Explain `req.triple` in `ds`.
 pub fn explain(ds: &Dataset, req: &ExplainRequest) -> Result<Explanation> {
-    let deadline = Instant::now() + req.timeout.unwrap_or(DEFAULT_TIMEOUT);
+    // a timeout too large for the clock means no deadline
+    let deadline = Instant::now().checked_add(req.timeout.unwrap_or(DEFAULT_TIMEOUT));
     let max_trees = req.max_trees.clamp(1, MAX_TREES);
     let max_depth = req.max_depth.min(MAX_DEPTH);
     let store = ds.store();
@@ -134,9 +135,20 @@ pub fn explain(ds: &Dataset, req: &ExplainRequest) -> Result<Explanation> {
         let (snap, read_at_head) = match rec.commit {
             Some(c) if c != head.commit => match store.snapshot_at(
                 &crate::history::At::Commit(c),
-                &crate::history::HistoryOptions::default(),
+                &crate::history::HistoryOptions {
+                    cancel: req.cancel.clone(),
+                    deadline,
+                },
             ) {
                 Ok((s, _)) => (s, false),
+                // the request's own controls stop the replay, which is no reason to read
+                // the head instead
+                Err(sparkles_core::error::Error::Timeout) => {
+                    return Err(budget_error(
+                        "the explanation passed its timeout".to_string(),
+                    ));
+                }
+                Err(e @ sparkles_core::error::Error::Cancelled) => return Err(e),
                 Err(_) => (head.clone(), true),
             },
             _ => (head.clone(), false),
@@ -176,7 +188,7 @@ pub fn explain(ds: &Dataset, req: &ExplainRequest) -> Result<Explanation> {
             max_trees,
             max_depth,
             max_instances: MAX_INSTANCES,
-            deadline: Some(deadline),
+            deadline,
             cancel: req.cancel.clone(),
             max_memory: req.max_memory,
         };
@@ -225,7 +237,8 @@ pub fn explain(ds: &Dataset, req: &ExplainRequest) -> Result<Explanation> {
             crate::explain::ExplainLimits {
                 max_trees,
                 max_depth,
-                deadline: Some(deadline),
+                deadline,
+                cancel: req.cancel.clone(),
             },
         )?;
         if let Explained::Found { .. } = found {
@@ -279,7 +292,7 @@ pub enum ExplainMode {
 /// A request in the JSON form of `POST /$/reason/{ds}/explain` (spec F18 §2.1): `triple`
 /// with `s`, `p` and `o`, `mode`, and the limits `maxTrees`, `maxDepth` and `timeout` in
 /// seconds. The timeout is returned apart, for the caller to cap.
-pub fn request_from_json(j: &J) -> Result<(ExplainRequest, ExplainMode, Option<f64>)> {
+pub fn request_from_json(j: &J) -> Result<(ExplainRequest, ExplainMode, Option<Duration>)> {
     let o = j
         .as_object()
         .ok_or_else(|| bad("the request must be a JSON object"))?;
@@ -356,6 +369,7 @@ pub fn request_from_json(j: &J) -> Result<(ExplainRequest, ExplainMode, Option<f
         Some(v) => Some(
             v.as_f64()
                 .filter(|t| t.is_finite() && *t > 0.0)
+                .and_then(|t| Duration::try_from_secs_f64(t).ok())
                 .ok_or_else(|| bad("timeout must be a positive number of seconds"))?,
         ),
     };

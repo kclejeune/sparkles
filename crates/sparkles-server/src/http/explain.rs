@@ -10,7 +10,6 @@ use axum::response::{IntoResponse, Json, Response};
 use sparkles::reasoning::explain::{
     self, DEFAULT_TIMEOUT, ExplainMode, NO_VISIBLE_DERIVATION, REASONING_BUDGET,
 };
-use std::time::Duration;
 
 /// `POST /$/reason/{ds}/explain`
 pub(super) async fn explain(
@@ -31,7 +30,7 @@ pub(super) async fn explain(
             "whyNot explanations are not available: only mode \"why\" is",
         ));
     }
-    let asked = timeout.map_or(DEFAULT_TIMEOUT, Duration::from_secs_f64);
+    let asked = timeout.unwrap_or(DEFAULT_TIMEOUT);
     req.timeout = Some(st.limits.cap_timeout(asked, Some(DEFAULT_TIMEOUT)));
     req.access = p.view(&ds.name, Endpoint::Query);
     let (cancel, _guard) = super::cancel_on_drop();

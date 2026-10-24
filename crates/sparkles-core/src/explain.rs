@@ -169,7 +169,7 @@ fn number(
 pub struct ExplainBudgetExceeded(pub String);
 
 /// The limits of an explanation's answer and search.
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Debug)]
 pub struct ExplainLimits {
     /// distinct top-level derivations, at least 1
     pub max_trees: usize,
@@ -177,4 +177,6 @@ pub struct ExplainLimits {
     pub max_depth: u32,
     /// when the search gives up
     pub deadline: Option<std::time::Instant>,
+    /// set to `true` to stop the search
+    pub cancel: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
 }

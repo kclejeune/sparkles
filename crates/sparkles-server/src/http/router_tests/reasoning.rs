@@ -1311,6 +1311,13 @@ async fn explain_route_answers_why() {
             "http://ex.org/Employee",
             r#","nope":1"#,
         ),
+        // a timeout too large for a duration is refused, not a panic
+        explain_body(
+            "http://ex.org/alice",
+            TYPE,
+            "http://ex.org/Employee",
+            r#","timeout":1e300"#,
+        ),
         "not json".to_string(),
     ] {
         let r = post_json(&app, "/$/reason/t/explain", &bad).await;

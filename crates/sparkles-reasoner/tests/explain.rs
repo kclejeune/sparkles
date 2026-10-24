@@ -522,3 +522,96 @@ fn every_inferred_triple_is_explained_after_incremental_deletions() {
         since = reason(&s, &p, &["default"], Some(since));
     }
 }
+
+#[test]
+fn another_top_rule_never_derives_the_root_from_itself() {
+    // q by r1 from p; s by r3 from q; and q again by r4 from s, whose only support is q
+    let s = store("@prefix ex: <http://ex.org/> . ex:a ex:p ex:b .");
+    let p = Profile::Rules(
+        "@prefix ex: <http://ex.org/> .
+[r1: (?x ex:p ?y) -> (?x ex:q ?y)]
+[r3: (?x ex:q ?y) -> (?x ex:s ?y)]
+[r4: (?x ex:s ?y) -> (?x ex:q ?y)]
+"
+        .into(),
+    );
+    reason(&s, &p, &["default"], None);
+    let (ts, _) = trees(
+        why(
+            &s,
+            &p,
+            &["default"],
+            [ex("a"), ex("q"), ex("b")],
+            &ExplainOptions {
+                max_trees: 5,
+                ..Default::default()
+            },
+        )
+        .unwrap(),
+    );
+    for t in &ts {
+        well_founded(t, &mut Vec::new(), &mut BTreeSet::new());
+    }
+    assert_eq!(ts.len(), 1, "{ts:#?}");
+    assert_eq!(rule(&ts[0]), "r1");
+}
+
+#[test]
+fn the_deadline_stops_a_rule_whose_candidates_all_fail() {
+    // r scans every ex:p fact and rejects each by its builtin, so it emits no instance
+    let mut trig = String::from("@prefix ex: <http://ex.org/> . ex:a ex:base ex:b .\n");
+    for i in 0..200_000 {
+        trig.push_str(&format!("ex:i{i} ex:p {i} .\n"));
+    }
+    let s = store(&trig);
+    let p = Profile::Rules(
+        "@prefix ex: <http://ex.org/> .
+[r: (?s ex:p ?n) greaterThan(?n, 10000000) -> (ex:a ex:t ex:y)]
+[r0: (ex:a ex:base ex:b) -> (ex:a ex:t ex:y)]
+"
+        .into(),
+    );
+    reason(&s, &p, &["default"], None);
+    let started = std::time::Instant::now();
+    let e = why(
+        &s,
+        &p,
+        &["default"],
+        [ex("a"), ex("t"), ex("y")],
+        &ExplainOptions {
+            deadline: Some(started + std::time::Duration::from_millis(20)),
+            ..Default::default()
+        },
+    );
+    let e = e.expect_err("the search ran past its deadline");
+    assert!(e.downcast_ref::<ExplainBudgetExceeded>().is_some(), "{e:#}");
+}
+
+#[test]
+fn the_memory_limit_bounds_the_search() {
+    let mut trig = String::from("@prefix ex: <http://ex.org/> .\n");
+    for i in 0..10_000 {
+        trig.push_str(&format!("ex:i{i} ex:p ex:o .\n"));
+    }
+    let s = store(&trig);
+    let p = Profile::Rules(
+        "@prefix ex: <http://ex.org/> .
+[r: (?x ex:p ?y) -> (ex:a ex:t ex:y)]
+"
+        .into(),
+    );
+    reason(&s, &p, &["default"], None);
+    let t = [ex("a"), ex("t"), ex("y")];
+    assert!(why(&s, &p, &["default"], t.clone(), &ExplainOptions::default()).is_ok());
+    let e = why(
+        &s,
+        &p,
+        &["default"],
+        t,
+        &ExplainOptions {
+            max_memory: Some(65_536),
+            ..Default::default()
+        },
+    );
+    assert!(e.is_err(), "10,000 instances fit in 64 KiB: {e:?}");
+}

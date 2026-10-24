@@ -40,6 +40,7 @@ struct Cx<'a> {
     snap: &'a Snapshot,
     leaves: SchemaLeaves,
     deadline: Option<Instant>,
+    cancel: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
     reads: std::cell::Cell<usize>,
 }
 
@@ -56,6 +57,22 @@ fn rule(name: &str) -> RuleRef {
 }
 
 impl Cx<'_> {
+    /// Fail when the request was cancelled or passed its deadline.
+    fn check(&self) -> Result<()> {
+        if self
+            .cancel
+            .as_ref()
+            .is_some_and(|c| c.load(std::sync::atomic::Ordering::Relaxed))
+        {
+            return Err(crate::error::Error::Cancelled);
+        }
+        if self.deadline.is_some_and(|d| Instant::now() >= d) {
+            return Err(budget("the explanation passed its timeout".to_string()));
+        }
+        Ok(())
+    }
+
+    /// Count one index read against the limit, and check the request's controls.
     fn read(&self) -> Result<()> {
         let n = self.reads.get() + 1;
         self.reads.set(n);
@@ -64,10 +81,7 @@ impl Cx<'_> {
                 "the explanation made its limit of {MAX_READS} index reads"
             )));
         }
-        if n.is_multiple_of(256) && self.deadline.is_some_and(|d| Instant::now() >= d) {
-            return Err(budget("the explanation passed its timeout".to_string()));
-        }
-        Ok(())
+        self.check()
     }
 
     fn id(&self, t: &Term) -> Option<Id> {
@@ -117,13 +131,40 @@ impl Cx<'_> {
             return Ok(None);
         };
         self.read()?;
+        // the rows of `? p o` stream in subject order, with the graph last, and the scan
+        // stops at the first row of `g`; every 1,024 rows count as one more read
         let mut found = None;
-        for k in self.snap.scan_keys(Perm::Pos, &[p.0, o.0])? {
-            let q = Perm::Pos.to_quad(&k);
-            if q[3] == g {
-                found = Some(q[0]);
-                break;
+        let mut rows = 0usize;
+        let mut failed = None;
+        self.snap.scan(Perm::Pos, &[p.0, o.0], |c| {
+            let (lo, hi) = match &c {
+                crate::store::Chunk::Block(_, st, end) => (*st, *end),
+                crate::store::Chunk::Row(_) => (0, 1),
+            };
+            for i in lo..hi {
+                let k = match &c {
+                    crate::store::Chunk::Block(b, _, _) => {
+                        [b.cols[0][i], b.cols[1][i], b.cols[2][i], b.cols[3][i]]
+                    }
+                    crate::store::Chunk::Row(k) => *k,
+                };
+                let q = Perm::Pos.to_quad(&k);
+                if q[3] == g {
+                    found = Some(q[0]);
+                    return Ok(false);
+                }
+                rows += 1;
+                if rows.is_multiple_of(1024)
+                    && let Err(e) = self.read()
+                {
+                    failed = Some(e);
+                    return Ok(false);
+                }
             }
+            Ok(true)
+        })?;
+        if let Some(e) = failed {
+            return Err(e);
         }
         Ok(found.and_then(|s| self.snap.term(s)))
     }
@@ -302,14 +343,17 @@ impl RdfsSchema {
             max_trees,
             max_depth,
             deadline,
+            cancel,
         } = limits;
         let cx = Cx {
             schema: self,
             snap,
             leaves,
             deadline,
+            cancel,
             reads: std::cell::Cell::new(0),
         };
+        cx.check()?;
         for &g in graphs {
             if cx.held(g, triple)? {
                 let mut trees = vec![Derivation::asserted(triple.clone(), cx.graph_name(g))];
@@ -405,6 +449,7 @@ impl RdfsSchema {
         let more = all.len() > max_trees.max(1);
         all.truncate(max_trees.max(1));
         finish(&mut all, max_depth);
+        cx.check()?;
         Ok(Explained::Found { trees: all, more })
     }
 }

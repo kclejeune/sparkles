@@ -19,8 +19,10 @@
 //!
 //! The search keeps every instance it enumerates until it answers. Its memory grows with
 //! the instance budget, about 100 bytes per instance, so a request at the default budget of
-//! 100,000 instances holds about 10 MB at most. Reading the premises' depths from those
-//! instances again after each level is what makes the trees minimal.
+//! 100,000 instances holds about 10 MB at most, and all of it is charged to the request's
+//! memory budget. Reading the premises' depths from those instances again after each level
+//! is what makes the trees minimal. The deadline is read between rules and inside each
+//! rule's evaluation, so a rule whose candidates all fail stops at it too.
 
 use crate::budget::Budget;
 use crate::engine::{self, CRule, Eval, Mode};
@@ -70,7 +72,7 @@ pub struct ExplainOptions {
     pub deadline: Option<Instant>,
     /// set to `true` to stop the search
     pub cancel: Option<Arc<AtomicBool>>,
-    /// the memory the rule evaluations may hold, unbounded when `None`
+    /// the memory the search and its rule evaluations may hold, unbounded when `None`
     pub max_memory: Option<usize>,
 }
 
@@ -119,6 +121,9 @@ struct Inst {
 
 const NONE: u32 = u32::MAX;
 
+/// Per fact, its depth and the instance that gives it, and the root's top instances.
+type RootTops = (Vec<u32>, Vec<u32>, Vec<u32>);
+
 struct Search<'a> {
     snap: &'a Snapshot,
     g: &'a Graph,
@@ -150,18 +155,35 @@ enum Stop {
     Error(anyhow::Error),
 }
 
+/// The heap one fact takes in the search: its triple, its index entry, its leaf and its
+/// list of instances.
+const FACT_BYTES: usize = 3 * 8 + 48 + 16 + 24 + 8;
+/// The heap one instance takes, without its premises.
+const INST_BYTES: usize = std::mem::size_of::<Inst>() + 4;
+
 impl<'a> Search<'a> {
-    fn fact(&mut self, t: Triple) -> (u32, bool) {
+    /// Charge `n` bytes of the search's own state to the budget.
+    fn charge(&self, n: usize) -> Result<(), Stop> {
+        self.budget.try_charge(n).map_err(|e| {
+            Stop::Error(
+                e.with_context(" while explaining a triple".to_string())
+                    .into(),
+            )
+        })
+    }
+
+    fn fact(&mut self, t: Triple) -> Result<(u32, bool), Stop> {
         if let Some(&i) = self.index.get(&t) {
-            return (i, false);
+            return Ok((i, false));
         }
+        self.charge(FACT_BYTES)?;
         let i = self.facts.len() as u32;
         let leaf = self.asserted(&t);
         self.facts.push(t);
         self.index.insert(t, i);
         self.leaf.push(leaf);
         self.by_head.push(Vec::new());
-        (i, true)
+        Ok((i, true))
     }
 
     /// The first input graph that holds `t`.
@@ -199,6 +221,7 @@ impl<'a> Search<'a> {
         let t = self.facts[f as usize];
         let heads: Vec<(usize, usize)> = self.plans.heads(t[1]).collect();
         for (ri, hi) in heads {
+            self.check_time()?;
             let Some((steps, pre)) = &self.plans.back[ri][hi] else {
                 continue;
             };
@@ -208,8 +231,11 @@ impl<'a> Search<'a> {
             };
             let mut found: Vec<Vec<Triple>> = Vec::new();
             let over = Cell::new(false);
+            let no_room = Cell::new(None);
+            let held = Cell::new(0usize);
             let room = self.opts.max_instances.saturating_sub(self.visited);
             let deadline = self.opts.deadline;
+            let budget = self.budget;
             let failed = {
                 let mut sink = |matched: &[Triple], implicit: &[Triple]| -> bool {
                     if found.len() >= room
@@ -224,6 +250,13 @@ impl<'a> Search<'a> {
                             body.push(*u);
                         }
                     }
+                    // the buffer until the instances are kept, given back below
+                    let n = 24 + body.capacity() * std::mem::size_of::<Triple>();
+                    if let Err(e) = budget.try_charge(n) {
+                        no_room.set(Some(e));
+                        return false;
+                    }
+                    held.set(held.get() + n);
                     found.push(body);
                     true
                 };
@@ -243,35 +276,30 @@ impl<'a> Search<'a> {
                     },
                     self.budget,
                 );
+                ev.set_deadline(deadline);
                 ev.run(0, &mut b, None);
                 ev.err.take()
             };
+            let held = held.get();
+            if let Some(e) = no_room.take() {
+                self.budget.release(held);
+                return Err(Stop::Error(
+                    e.with_context(" while explaining a triple".to_string())
+                        .into(),
+                ));
+            }
             if let Some(e) = failed {
+                self.budget.release(held);
                 return Err(Stop::Error(e));
             }
-            for body in found {
-                self.visited += 1;
-                // an instance among whose premises is its own head supports nothing
-                if body.contains(&t) {
-                    continue;
-                }
-                let from = self.premises.len() as u32;
-                for u in body {
-                    let (m, new) = self.fact(u);
-                    self.premises.push(m);
-                    if new && self.leaf[m as usize].is_none() {
-                        next.push(m);
-                    }
-                }
-                let i = self.insts.len() as u32;
-                self.insts.push(Inst {
-                    rule: ri as u32,
-                    head: f,
-                    from,
-                    to: self.premises.len() as u32,
-                });
-                self.by_head[f as usize].push(i);
+            // a rule whose candidates all failed stops at the deadline without an instance
+            if let Err(e) = self.check_time() {
+                self.budget.release(held);
+                return Err(e);
             }
+            let kept = self.keep(f, ri, t, found, next);
+            self.budget.release(held);
+            kept?;
             if over.get() {
                 self.check_time()?;
                 return Err(Stop::Budget(format!(
@@ -283,18 +311,66 @@ impl<'a> Search<'a> {
         Ok(())
     }
 
+    /// Keep the instances `found` of rule `ri` for fact `f`, whose triple is `t`.
+    fn keep(
+        &mut self,
+        f: u32,
+        ri: usize,
+        t: Triple,
+        found: Vec<Vec<Triple>>,
+        next: &mut Vec<u32>,
+    ) -> Result<(), Stop> {
+        for body in found {
+            self.visited += 1;
+            // an instance among whose premises is its own head supports nothing
+            if body.contains(&t) {
+                continue;
+            }
+            self.charge(INST_BYTES + 4 * body.len())?;
+            let from = self.premises.len() as u32;
+            for u in body {
+                let (m, new) = self.fact(u)?;
+                self.premises.push(m);
+                if new && self.leaf[m as usize].is_none() {
+                    next.push(m);
+                }
+            }
+            let i = self.insts.len() as u32;
+            self.insts.push(Inst {
+                rule: ri as u32,
+                head: f,
+                from,
+                to: self.premises.len() as u32,
+            });
+            self.by_head[f as usize].push(i);
+        }
+        Ok(())
+    }
+
     /// The depth of every fact reached, and the instance that gives it.
-    fn settle(&mut self) {
+    fn settle(&mut self) -> Result<(), Stop> {
+        let (depth, via) = self.settle_with(None)?;
+        self.depth = depth;
+        self.via = via;
+        Ok(())
+    }
+
+    /// The depth of every fact reached and the instance that gives it, with `exclude`
+    /// given no depth, so that no derivation of another fact goes through it.
+    fn settle_with(&self, exclude: Option<u32>) -> Result<(Vec<u32>, Vec<u32>), Stop> {
         let n = self.facts.len();
-        self.depth = vec![NONE; n];
-        self.via = vec![NONE; n];
+        // the depths, the instances, the users of each fact and the open counts
+        let work = n * (4 + 4 + 24) + self.premises.len() * 4 + self.insts.len() * 4;
+        self.charge(work)?;
+        let mut depth = vec![NONE; n];
+        let mut via = vec![NONE; n];
         let mut users: Vec<Vec<u32>> = vec![Vec::new(); n];
         let mut open: Vec<u32> = Vec::with_capacity(self.insts.len());
         let mut bucket: Vec<u32> = Vec::new();
         let mut later: Vec<u32> = Vec::new();
         for (f, l) in self.leaf.iter().enumerate() {
-            if l.is_some() {
-                self.depth[f] = 0;
+            if l.is_some() && exclude != Some(f as u32) {
+                depth[f] = 0;
                 bucket.push(f as u32);
             }
         }
@@ -304,10 +380,11 @@ impl<'a> Search<'a> {
             for &p in ps {
                 users[p as usize].push(i as u32);
             }
-            if ps.is_empty() && self.depth[inst.head as usize] == NONE {
-                self.depth[inst.head as usize] = 1;
-                self.via[inst.head as usize] = i as u32;
-                later.push(inst.head);
+            let h = inst.head;
+            if ps.is_empty() && depth[h as usize] == NONE && exclude != Some(h) {
+                depth[h as usize] = 1;
+                via[h as usize] = i as u32;
+                later.push(h);
             }
         }
         let mut d = 0u32;
@@ -316,11 +393,11 @@ impl<'a> Search<'a> {
                 for &i in &users[f as usize] {
                     open[i as usize] -= 1;
                     if open[i as usize] == 0 {
-                        let h = self.insts[i as usize].head as usize;
-                        if self.depth[h] == NONE {
-                            self.depth[h] = d + 1;
-                            self.via[h] = i;
-                            later.push(h as u32);
+                        let h = self.insts[i as usize].head;
+                        if depth[h as usize] == NONE && exclude != Some(h) {
+                            depth[h as usize] = d + 1;
+                            via[h as usize] = i;
+                            later.push(h);
                         }
                     }
                 }
@@ -328,35 +405,44 @@ impl<'a> Search<'a> {
             d += 1;
             bucket = std::mem::take(&mut later)
                 .into_iter()
-                .filter(|&f| self.depth[f as usize] == d)
+                .filter(|&f| depth[f as usize] == d)
                 .collect();
         }
+        // the users and open counts are freed here, the depths are kept by the caller
+        self.budget
+            .release(n * 24 + self.premises.len() * 4 + self.insts.len() * 4);
+        Ok((depth, via))
     }
 
-    /// The instances of fact `f` whose premises all have a depth, one per rule, the one of
-    /// `via[f]` first and the others by depth.
-    fn tops(&self, f: u32) -> Vec<u32> {
+    /// The instances of fact `f` whose premises all have a depth in `depth`, one per rule,
+    /// `first` first and the others by depth.
+    fn tops(&self, f: u32, depth: &[u32], first: u32) -> Vec<u32> {
         let mut best: FxHashMap<u32, (u32, u32)> = FxHashMap::default();
         for &i in &self.by_head[f as usize] {
             let inst = &self.insts[i as usize];
             let ps = &self.premises[inst.from as usize..inst.to as usize];
-            if ps.iter().any(|&p| self.depth[p as usize] == NONE) {
+            if ps.iter().any(|&p| depth[p as usize] == NONE) {
                 continue;
             }
-            let d = 1 + ps
-                .iter()
-                .map(|&p| self.depth[p as usize])
-                .max()
-                .unwrap_or(0);
+            let d = 1 + ps.iter().map(|&p| depth[p as usize]).max().unwrap_or(0);
             let e = best.entry(inst.rule).or_insert((d, i));
             if d < e.0 {
                 *e = (d, i);
             }
         }
-        let first = self.via[f as usize];
         let mut v: Vec<(u32, u32)> = best.into_values().collect();
         v.sort_by_key(|&(d, i)| (i != first, d, i));
         v.into_iter().map(|(_, i)| i).collect()
+    }
+
+    /// The derivations of the root `r` whose top rules differ: the depths with `r`
+    /// excluded, so that no tree derives the root from itself, and its instances by them.
+    /// The instance of the root's least depth needs no exclusion, since every premise
+    /// under it is shallower than the root, and it comes first.
+    fn root_tops(&self, r: u32) -> Result<RootTops, Stop> {
+        let (depth, via) = self.settle_with(Some(r))?;
+        let tops = self.tops(r, &depth, self.via[r as usize]);
+        Ok((depth, via, tops))
     }
 }
 
@@ -530,7 +616,13 @@ pub fn explain(
         depth: Vec::new(),
         via: Vec::new(),
     };
-    let (r, _) = s.fact(root);
+    let stop = |e: Stop| -> anyhow::Error {
+        match e {
+            Stop::Budget(m) => ExplainBudgetExceeded(m).into(),
+            Stop::Error(e) => e,
+        }
+    };
+    let (r, _) = s.fact(root).map_err(stop)?;
     let mut frontier = if s.leaf[r as usize].is_some() {
         Vec::new()
     } else {
@@ -539,13 +631,15 @@ pub fn explain(
     let mut found_at: Option<u32> = None;
     let mut level = 0u32;
     loop {
-        s.settle();
+        s.settle().map_err(stop)?;
         if s.depth[r as usize] != NONE && found_at.is_none() {
             found_at = Some(level);
         }
         let enough = match found_at {
             None => false,
-            Some(at) => s.tops(r).len() > max_trees || level >= at + EXTRA_LEVELS,
+            Some(at) => {
+                level >= at + EXTRA_LEVELS || s.root_tops(r).map_err(stop)?.2.len() > max_trees
+            }
         };
         if enough || frontier.is_empty() {
             break;
@@ -571,11 +665,10 @@ pub fn explain(
             None => {}
             // the trees found so far stand
             Some(Stop::Budget(_)) if found_at.is_some() => {
-                s.settle();
+                s.settle().map_err(stop)?;
                 break;
             }
-            Some(Stop::Budget(m)) => return Err(ExplainBudgetExceeded(m).into()),
-            Some(Stop::Error(e)) => return Err(e),
+            Some(e) => return Err(stop(e)),
         }
         frontier = next;
         level += 1;
@@ -583,6 +676,11 @@ pub fn explain(
     if found_at.is_none() {
         return Ok(Explained::NotFound);
     }
+    // every tree reads the depths with the root excluded, which equal the plain depths
+    // under the root's first instance
+    let (depth, via, tops) = s.root_tops(r).map_err(stop)?;
+    s.depth = depth;
+    s.via = via;
     let mut b = Builder {
         s: &s,
         sources: &sources,
@@ -591,11 +689,12 @@ pub fn explain(
         next: 0,
     };
     let mut trees = Vec::new();
-    let tops = s.tops(r);
     if s.leaf[r as usize].is_some() {
         trees.push(b.node(r, 0, None)?);
     }
     for &i in tops.iter().take(max_trees.saturating_sub(trees.len())) {
+        // a tree shares repeated facts within itself only, so each reads on its own
+        b.ids.clear();
         trees.push(b.node(r, 0, Some(i))?);
     }
     let more = tops.len() + usize::from(s.leaf[r as usize].is_some()) > trees.len();

@@ -202,3 +202,18 @@ fn rdfs_on_read_needs_a_readable_schema() {
     req.access = only(&["default", ONTO]);
     found(ds.reasoning().explain(&req).unwrap().explained);
 }
+
+#[test]
+fn rdfs_on_read_stops_at_the_deadline() {
+    let (_dir, ds) = on_read();
+    let mut req = ExplainRequest::new([ex("alice"), ty(), ex("Manager")]);
+    req.timeout = Some(std::time::Duration::ZERO);
+    let e = ds.reasoning().explain(&req).unwrap_err();
+    assert!(
+        matches!(&e, sparkles::Error::Component(c) if c.code == sparkles::reasoning::explain::REASONING_BUDGET),
+        "{e}"
+    );
+    // a timeout too large for the clock means none
+    req.timeout = Some(std::time::Duration::MAX);
+    found(ds.reasoning().explain(&req).unwrap().explained);
+}
