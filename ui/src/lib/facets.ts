@@ -335,7 +335,9 @@ export function brushEdits(
     triples.push({ s: `?${v}`, p: compact(b.property, prefixes), o: `?${name}` });
     filters.push({ kind: 'filter-add', var: name, expr: brushCondition(b, `?${name}`) });
   }
-  return triples.length ? [{ kind: 'add-many', triples }, ...filters] : [];
+  // in the WHERE group itself, never inside an OPTIONAL that holds a triple of `v`, so that
+  // the brushes are mandatory
+  return triples.length ? [{ kind: 'add-many', triples, root: true }, ...filters] : [];
 }
 
 /**

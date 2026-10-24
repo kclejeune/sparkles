@@ -301,6 +301,36 @@ ORDER BY ?person
     expect(brushEdits(nested, ok(nested), 's', b).length).toBe(2);
   });
 
+  it('keeps the brushes in the WHERE group when an OPTIONAL holds the first triple of the variable', () => {
+    const q = `PREFIX ex: <http://ex/>
+SELECT ?s WHERE {
+  { ?s a ex:Person }
+  OPTIONAL { ?s ex:name ?name }
+}`;
+    const out = applyChanges(
+      q,
+      composeEdits(
+        q,
+        parse,
+        parseStrict,
+        brushEdits(
+          q,
+          ok(q),
+          's',
+          [{ property: `${EX}age`, kind: 'numeric', range: [20, 30] }],
+          parse,
+        ),
+      ),
+    );
+    const p = ok(out);
+    const age = triplesOf(p).find((t) => t.triple.p.text === 'ex:age')!;
+    expect(age.path.length).toBe(1);
+    const f = filtersOf(p).find((x) => x.filter.text.includes('?age'))!;
+    expect(f.group.kind).toBe('group');
+    expect(f.group.range).toEqual(p.root!.range);
+    expect(out).toContain('OPTIONAL { ?s ex:name ?name }');
+  });
+
   it('writes the selection as a VALUES block first in the WHERE group', () => {
     const e: AnyEdit = {
       kind: 'values-add',

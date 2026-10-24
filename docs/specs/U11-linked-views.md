@@ -569,7 +569,8 @@ and the labels. `&facets=1` in the address keeps the panel open, and `Shift+F` t
 chosen variable of the query that ran. The default is the column with the most IRIs,
 read from the result alone, so the selection that the brushes make never moves the facets
 to another column. **Apply to query** edits the editor's text through
-U08's edits, an `add-many` of one triple per brush followed by a `filter-add` per brush,
+U08's edits, an `add-many` of one triple per brush in the `WHERE` group itself, never in
+an `OPTIONAL` that holds a triple of the variable, followed by a `filter-add` per brush,
 made one after another with a parse between them. Each step must parse strictly and pass
 U08's R3 check, or nothing is changed, and the composed change goes to the editor as one
 undoable edit. A new variable takes the property's local name and a number when any

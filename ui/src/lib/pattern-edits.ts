@@ -54,8 +54,11 @@ export type Words = { s: string; p: string; o: string };
 export type Phase2Edit =
   /** the predicate of a triple replaced, by an IRI, a variable or a simple path */
   | { kind: 'predicate'; edge: string; p: string; declare?: Prefixes }
-  /** several triples added together, such as `?x a C` and the edge that uses `?x` */
-  | { kind: 'add-many'; triples: Words[]; declare?: Prefixes }
+  /**
+   * several triples added together, such as `?x a C` and the edge that uses `?x`; with
+   * `root` they go to the WHERE group itself rather than the group of their subject
+   */
+  | { kind: 'add-many'; triples: Words[]; declare?: Prefixes; root?: boolean }
   /** `FILTER(expr)` after the last triple that binds `var` */
   | { kind: 'filter-add'; var: string; expr: string; declare?: Prefixes }
   | { kind: 'filter-edit'; filter: string; expr: string; declare?: Prefixes }
@@ -406,7 +409,7 @@ function checkDeclared(p: PatternOk, prefix: string, declare: Prefixes) {
 function addMany(
   text: string,
   p: PatternOk,
-  e: { triples: Words[]; declare?: Prefixes },
+  e: { triples: Words[]; declare?: Prefixes; root?: boolean },
 ): Change[] {
   if (!p.root) throw new EditError('this query has no WHERE group to edit');
   if (e.triples.length === 0) throw new EditError('nothing to add');
@@ -424,7 +427,7 @@ function addMany(
   for (const w of words) for (const x of pathPrefixes(w.p)) checkDeclared(p, x, declare);
   // the group of the first subject that has patterns, as one add would choose, so an
   // edge from a node in an OPTIONAL takes the class triple of a new target with it
-  const home = words.map((w) => homeOf(p, w.s, declare)).find((h) => !!h);
+  const home = e.root ? undefined : words.map((w) => homeOf(p, w.s, declare)).find((h) => !!h);
   const g = home ? home.path[home.path.length - 1] : p.root;
   const binds = new Set<string>();
   for (const w of words)
@@ -754,7 +757,9 @@ export function agreesWith(before: PatternOk, e: AnyEdit, after: PatternOk): boo
       // every added triple sits on the side of an OPTIONAL of the group that holds its
       // edge's source
       const declare = declarations(before, e);
-      const home = e.triples.map((w) => homeOf(before, w.s.trim(), declare)).find((h) => !!h);
+      const home = e.root
+        ? undefined
+        : e.triples.map((w) => homeOf(before, w.s.trim(), declare)).find((h) => !!h);
       const side = `|${!!home && home.path.length > 1}`;
       return (
         minus(b, a).length === 0 &&
