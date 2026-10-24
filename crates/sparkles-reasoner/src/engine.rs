@@ -844,14 +844,20 @@ impl<'a> Eval<'a> {
             return true;
         }
         self.ticks = self.ticks.wrapping_add(1);
-        if self.ticks & 0x3FF == 0
-            && (self.abort.load(Ordering::Relaxed)
+        if self.ticks & 0x3FF == 0 {
+            if self.abort.load(Ordering::Relaxed)
                 || self.cancel.is_some_and(|c| c.load(Ordering::Relaxed))
-                || self
-                    .deadline
-                    .is_some_and(|d| std::time::Instant::now() >= d))
-        {
-            return true;
+            {
+                return true;
+            }
+            // a passed deadline stops every enclosing scan at once, not one 1,024 steps on
+            if self
+                .deadline
+                .is_some_and(|d| std::time::Instant::now() >= d)
+            {
+                self.stop = true;
+                return true;
+            }
         }
         self.out.len() > self.max_out
     }

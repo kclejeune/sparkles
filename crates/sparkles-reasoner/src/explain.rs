@@ -147,6 +147,8 @@ struct Search<'a> {
     /// the instance that gives it (`NONE` for a leaf)
     depth: Vec<u32>,
     via: Vec<u32>,
+    /// the bytes of `depth` and `via` charged to the budget
+    kept: usize,
 }
 
 /// Why a search stopped before its answer.
@@ -350,6 +352,11 @@ impl<'a> Search<'a> {
     /// The depth of every fact reached, and the instance that gives it.
     fn settle(&mut self) -> Result<(), Stop> {
         let (depth, via) = self.settle_with(None)?;
+        // the new arrays are charged and the ones they replace given back
+        let bytes = 8 * depth.len();
+        self.charge(bytes)?;
+        self.budget.release(self.kept);
+        self.kept = bytes;
         self.depth = depth;
         self.via = via;
         Ok(())
@@ -408,9 +415,8 @@ impl<'a> Search<'a> {
                 .filter(|&f| depth[f as usize] == d)
                 .collect();
         }
-        // the users and open counts are freed here, the depths are kept by the caller
-        self.budget
-            .release(n * 24 + self.premises.len() * 4 + self.insts.len() * 4);
+        // the workspace is given back, and a caller that keeps the depths charges them
+        self.budget.release(work);
         Ok((depth, via))
     }
 
@@ -615,6 +621,7 @@ pub fn explain(
         visited: 0,
         depth: Vec::new(),
         via: Vec::new(),
+        kept: 0,
     };
     let stop = |e: Stop| -> anyhow::Error {
         match e {
@@ -677,7 +684,8 @@ pub fn explain(
         return Ok(Explained::NotFound);
     }
     // every tree reads the depths with the root excluded, which equal the plain depths
-    // under the root's first instance
+    // under the root's first instance. They replace arrays of the same length, so the
+    // charge for the kept arrays stands.
     let (depth, via, tops) = s.root_tops(r).map_err(stop)?;
     s.depth = depth;
     s.via = via;

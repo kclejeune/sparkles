@@ -169,13 +169,24 @@ export function how(d: Derivation, graphLabel: (g: string) => string = (g) => g)
   }
 }
 
+/** The largest id of the given trees, which ids given out later must pass. */
+export function maxId(trees: Derivation[]): number {
+  return Math.max(0, ...trees.flatMap((t) => walk(t).map((d) => d.id)));
+}
+
 /**
  * Replace the node with id `id` in `tree` by `sub` (a `ref` expanded on request). The
  * expansion's answer numbers its nodes from 1 again, so its nodes, and the shared nodes
- * that point at them, move past the tree's largest id, and its root takes `id`.
+ * that point at them, move past `floor`, and its root takes `id`. `floor` is the largest
+ * id of every tree of the answer, since the panel keys its state by id across trees.
  */
-export function graft(tree: Derivation, id: number, sub: Derivation): Derivation {
-  const offset = Math.max(...walk(tree).map((d) => d.id));
+export function graft(
+  tree: Derivation,
+  id: number,
+  sub: Derivation,
+  floor = maxId([tree]),
+): Derivation {
+  const offset = floor;
   const renumber = (d: Derivation, root: boolean): Derivation => ({
     ...d,
     id: root ? id : d.id + offset,

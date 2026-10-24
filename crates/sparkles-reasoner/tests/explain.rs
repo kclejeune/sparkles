@@ -615,3 +615,72 @@ fn the_memory_limit_bounds_the_search() {
     );
     assert!(e.is_err(), "10,000 instances fit in 64 KiB: {e:?}");
 }
+
+#[test]
+fn the_deadline_unwinds_a_nested_join() {
+    // r joins two relations of 3,000 rows and rejects every pair, so without unwinding
+    // each outer row restarts the inner scan after the deadline
+    let mut trig = String::from("@prefix ex: <http://ex.org/> . ex:a ex:base ex:b .\n");
+    for i in 0..3_000 {
+        trig.push_str(&format!(
+            "ex:i{i} ex:p {i} .\nex:j{i} ex:q {} .\n",
+            i + 100_000
+        ));
+    }
+    let s = store(&trig);
+    let p = Profile::Rules(
+        "@prefix ex: <http://ex.org/> .
+[r: (?a ex:p ?x) (?b ex:q ?y) greaterThan(?x, ?y) -> (ex:a ex:t ex:y)]
+[r0: (ex:a ex:base ex:b) -> (ex:a ex:t ex:y)]
+"
+        .into(),
+    );
+    reason(&s, &p, &["default"], None);
+    let started = std::time::Instant::now();
+    let e = why(
+        &s,
+        &p,
+        &["default"],
+        [ex("a"), ex("t"), ex("y")],
+        &ExplainOptions {
+            deadline: Some(started + std::time::Duration::from_millis(20)),
+            ..Default::default()
+        },
+    );
+    let took = started.elapsed();
+    let e = e.expect_err("the search ran past its deadline");
+    assert!(e.downcast_ref::<ExplainBudgetExceeded>().is_some(), "{e:#}");
+    assert!(
+        took < std::time::Duration::from_millis(500),
+        "the search stopped {took:?} after it started, for a deadline of 20 ms"
+    );
+}
+
+#[test]
+fn a_deep_chain_fits_a_memory_limit_its_facts_fit() {
+    // 120 rules in a chain derive 120 facts, which need far less than the limit
+    let mut rules = String::from("@prefix ex: <http://ex.org/> .\n");
+    for i in 0..120 {
+        rules.push_str(&format!(
+            "[c{i}: (?x ex:p{i} ?y) -> (?x ex:p{} ?y)]\n",
+            i + 1
+        ));
+    }
+    let s = store("@prefix ex: <http://ex.org/> . ex:a ex:p0 ex:b .");
+    let p = Profile::Rules(rules);
+    reason(&s, &p, &["default"], None);
+    let (ts, _) = trees(
+        why(
+            &s,
+            &p,
+            &["default"],
+            [ex("a"), ex("p120"), ex("b")],
+            &ExplainOptions {
+                max_memory: Some(120_000),
+                ..Default::default()
+            },
+        )
+        .unwrap_or_else(|e| panic!("{e:#}")),
+    );
+    assert_eq!(rule(&ts[0]), "c119");
+}

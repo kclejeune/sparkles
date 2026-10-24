@@ -8,6 +8,7 @@ import {
   leaves,
   premiseTriples,
   staleNote,
+  maxId,
   tripleKey,
   walk,
   type Derivation,
@@ -142,6 +143,22 @@ describe('derivation trees (U10 §2.4)', () => {
     expect(again.premises![0].premises![1].triple).toEqual(A7.premises![1].triple);
     expect(again.premises![1].triple).toEqual(A7.premises![1].triple);
     expect(again.premises![0].premises![0].triple).toEqual(A7.premises![0].premises![0].triple);
+  });
+
+  it('gives an expanded subtree ids past every tree of the answer', () => {
+    const cut: Derivation = {
+      ...A7,
+      premises: [{ ...A7.premises![0], kind: 'ref', premises: undefined }, A7.premises![1]],
+    };
+    // the next derivation holds ids 6 to 9, beyond the first tree's
+    const other: Derivation = { ...A7, id: 6, premises: [{ ...A7.premises![1], id: 7 }] };
+    const floor = maxId([cut, other]);
+    expect(floor).toBe(7);
+    const back = graft(cut, 2, { ...A7.premises![0], id: 1 }, floor);
+    const added = walk(back.premises![0])
+      .slice(1)
+      .map((d) => d.id);
+    expect(added.every((x) => x > 7)).toBe(true);
   });
 
   it('counts the derivations and notes stale inferences', () => {

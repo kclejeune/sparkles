@@ -9,6 +9,7 @@
     footer,
     graft,
     how,
+    maxId,
     MAX_TREES,
     premiseTriples,
     staleNote,
@@ -147,7 +148,9 @@
       if (gen !== generation) return;
       if (r.ok && r.explanation.trees[0]) {
         const sub = r.explanation.trees[0];
-        trees = trees.map((t, i) => (i === at ? graft(t, d.id, sub) : t));
+        // the new ids pass every tree's, since folds and expansions are keyed by id
+        const floor = maxId(trees);
+        trees = trees.map((t, i) => (i === at ? graft(t, d.id, sub, floor) : t));
       } else if (!r.ok) refError = r.message;
     } catch (e) {
       if (!(e instanceof DOMException && e.name === 'AbortError')) throw e;
