@@ -556,6 +556,65 @@ mappings:
             .to_string();
         assert!(e.contains("mapping-connection-missing"), "{e}");
     }
+
+    /// A blank node made per row is the same node in a hash join over SQLite, also when
+    /// a covering index would give a narrower read of the parent another row order.
+    #[test]
+    fn a_blank_parent_subject_over_sqlite_is_the_same_node_in_a_hash_join() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("p.db");
+        let c = rusqlite::Connection::open(&db).unwrap();
+        c.execute_batch(
+            "CREATE TABLE parent (id INTEGER PRIMARY KEY, name TEXT, extra TEXT);
+             CREATE INDEX by_name ON parent (name);
+             INSERT INTO parent VALUES (1, 'Z', 'x'), (2, 'A', 'y');",
+        )
+        .unwrap();
+        drop(c);
+        std::fs::write(dir.path().join("c.csv"), "id,k\n9,1\n").unwrap();
+        let y = r#"
+mappings:
+  parent:
+    sources:
+      - access: urn:x-sparkles:connection:db
+        query: SELECT * FROM parent
+    po:
+      - [http://ex.org/name, $(name)]
+      - [http://ex.org/extra, $(extra)]
+  child:
+    sources: [c.csv~csv]
+    s: http://ex.org/c/$(id)
+    po:
+      - p: http://ex.org/parent
+        o:
+          mapping: parent
+          condition:
+            function: equal
+            parameters:
+              - [str1, $(k)]
+              - [str2, $(id)]
+"#;
+        let inputs = Inputs {
+            dir: Some(dir.path().to_path_buf()),
+            connections: vec![NamedConnection {
+                name: "db".into(),
+                connection: Connection::Sqlite { path: db },
+                jdbc_dsn: None,
+            }],
+            ..Default::default()
+        };
+        let m = parse(y, MappingKind::Yarrrml, None).unwrap();
+        let out = nquads(&m, &inputs, &RunOptions::default()).unwrap();
+        let z = out
+            .iter()
+            .find(|l| l.contains("\"Z\""))
+            .map(|l| l.split(' ').next().unwrap().to_string())
+            .unwrap();
+        assert!(
+            out.contains(&format!("<http://ex.org/c/9> <http://ex.org/parent> {z} .")),
+            "{out:?}"
+        );
+    }
 }
 
 #[cfg(feature = "mapping-parquet")]
@@ -671,6 +730,14 @@ fn a_template_product_past_the_cap_fails() {
         .unwrap_err()
         .to_string();
     assert!(e.contains("more than 100000 values"), "{e}");
+    // a NULL reference after the product generates nothing instead of failing
+    let m3 = m.replace("{b[*]}\" ]", "{b[*]}/{c}\" ]");
+    let null_c = format!("{{\"a\":[{}],\"b\":[{}],\"c\":null}}", arr(400), arr(400));
+    assert!(
+        run_text(MappingKind::Rml, &m3, &[("a.json", &null_c)])
+            .unwrap()
+            .is_empty()
+    );
     let ok = format!("{{\"a\":[{}],\"b\":[{}]}}", arr(300), arr(300));
     assert_eq!(
         run_text(MappingKind::Rml, &m, &[("a.json", &ok)])

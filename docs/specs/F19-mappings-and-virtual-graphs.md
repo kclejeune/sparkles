@@ -1037,10 +1037,12 @@ Decisions this spec left open, made during implementation:
 * The blank node label of a value is `m` and the value escaped, so equal values give one
   node within a run. A blank node subject map without a value gives a new node per row,
   labelled by its triples map and the row's number in its source. A join that reads the
-  parent's subject again gets the same node, and such a join is never pushed into SQL,
-  whose joined rows have no row number of the parent's source. Across a hash join over
-  a SQL source, the node depends on the database returning the parent's rows in the
-  same order to both reads.
+  parent's subject again gets the same node. A hash join reads the parent's source with
+  the same statement as the parent's own scan, so both reads see the rows in the same
+  order. Such a join is never pushed into SQL, whose joined rows have no row number of
+  the parent's source, so two SQL tables whose join has a blank node per row on either
+  side join in memory, comparing values as strings rather than with the database's
+  collation.
 * A term map generates at most 100,000 values for one row, and a join probes or indexes
   at most 100,000 key combinations for one row. Multi-valued JSON references multiply,
   and past the bound the run fails with the triples map and the row. Term maps nest at

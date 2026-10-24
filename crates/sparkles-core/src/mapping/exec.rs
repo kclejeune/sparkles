@@ -10,7 +10,7 @@
 
 use super::functions;
 use super::model::{Dt, Lang, Mapping, ObjectMap, SourceKind, TermMap, TermType, Value};
-use super::source::{self, Dt as Nat, Row};
+use super::source::{self, Cell, Dt as Nat, Row};
 use super::template::{Part, iri_safe, uri_safe};
 use super::{DEFAULT_GRAPH_RML, DEFAULT_GRAPH_RR, Inputs, RunOptions};
 use crate::error::{Error, Result};
@@ -450,6 +450,20 @@ fn plan(m: &Mapping) -> Plan {
             });
         }
     }
+    // a parent table reads its source with the same references as the parent's own
+    // scan, so that both reads are the same statement and see the rows in the same
+    // order: a blank node made per row is labelled by its row number
+    for t in &tables {
+        let p = &m.maps[t.parent];
+        let scan = scans
+            .iter_mut()
+            .find(|sc| matches!(sc.kind, ScanKind::Source(s) if s == p.source))
+            .expect("the parent's own scan");
+        compile(&p.subject, &mut scan.refs, 0, t.parent);
+        for k in &t.keys {
+            scan.refs.get(0, k);
+        }
+    }
     Plan {
         scans,
         tables,
@@ -608,19 +622,31 @@ impl Gen<'_> {
             }
             CValue::Tpl(parts, uri) => {
                 let iri = t.tt == TermType::Iri;
+                // every reference first: a NULL anywhere generates nothing, before the
+                // size of the product is checked
+                let mut values: Vec<Vec<Cell<'_>>> = Vec::new();
+                let mut product = 1usize;
+                for p in parts {
+                    if let CPart::Ref(i) = p {
+                        let mut cells = Vec::new();
+                        row.get(*i, &mut cells)?;
+                        if cells.is_empty() {
+                            return Ok(());
+                        }
+                        product = product.saturating_mul(cells.len());
+                        values.push(cells);
+                    }
+                }
+                if product > MAX_ROW_VALUES {
+                    return Err(too_many(map, row, &t.desc));
+                }
+                let mut values = values.into_iter();
                 let mut acc: Vec<String> = vec![String::new()];
                 for p in parts {
                     match p {
                         CPart::Text(s) => acc.iter_mut().for_each(|a| a.push_str(s)),
-                        CPart::Ref(i) => {
-                            let mut cells = Vec::new();
-                            row.get(*i, &mut cells)?;
-                            if cells.is_empty() {
-                                return Ok(());
-                            }
-                            if acc.len().saturating_mul(cells.len()) > MAX_ROW_VALUES {
-                                return Err(too_many(map, row, &t.desc));
-                            }
+                        CPart::Ref(_) => {
+                            let cells = values.next().expect("one value set per reference");
                             let mut next = Vec::with_capacity(acc.len() * cells.len());
                             for a in &acc {
                                 for c in &cells {
@@ -1005,7 +1031,19 @@ pub fn run(
     for ti in 0..p.tables.len() {
         let parent = p.tables[ti].parent;
         let pm = &m.maps[parent];
-        let mut refs = Refs::default();
+        // the references of the parent's own scan, which hold the subject's and the keys'
+        let mut refs = Refs {
+            list: Vec::new(),
+            index: FxHashMap::default(),
+        };
+        if let Some(sc) = p
+            .scans
+            .iter()
+            .find(|sc| matches!(sc.kind, ScanKind::Source(s) if s == pm.source))
+        {
+            refs.list = sc.refs.list.clone();
+            refs.index = sc.refs.index.clone();
+        }
         let subject = compile(&pm.subject, &mut refs, 0, parent);
         g.map_base = base_of(&pm.base);
         let keys: Vec<usize> = p.tables[ti].keys.iter().map(|k| refs.get(0, k)).collect();
