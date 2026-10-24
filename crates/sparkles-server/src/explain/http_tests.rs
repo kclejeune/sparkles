@@ -590,4 +590,25 @@ async fn plan_patterns_are_on_every_route_that_returns_a_plan() {
     );
     let text = err["plan"].to_string();
     assert!(text.contains("\"filterVars\":[\"x\",\"y\"]"), "{text}");
+    // a streamed run and a graph query in the Sparkles format name them too, since only
+    // the other formats leave the patterns out (item 180)
+    let r = Request::post("/org/sparql?execution=streaming")
+        .header("content-type", "application/sparql-query")
+        .header("accept", "application/x-sparkles+json")
+        .body(Body::from(q))
+        .unwrap();
+    let (s, t) = send(&app, r).await;
+    assert_eq!(s, StatusCode::OK, "{t}");
+    let v: Value = serde_json::from_str(&t).unwrap();
+    assert_eq!(plan_patterns(&v["meta"]["plan"]), want, "{v:#}");
+    let g = "PREFIX ex: <http://example.org/> CONSTRUCT { ?p ex:n ?n } WHERE { ?p ex:team ?t ; ex:name ?n }";
+    let r = Request::post("/org/sparql")
+        .header("content-type", "application/sparql-query")
+        .header("accept", "application/x-sparkles+json")
+        .body(Body::from(g))
+        .unwrap();
+    let (s, t) = send(&app, r).await;
+    assert_eq!(s, StatusCode::OK, "{t}");
+    let v: Value = serde_json::from_str(&t).unwrap();
+    assert_eq!(plan_patterns(&v["meta"]["plan"]), want, "{v:#}");
 }
