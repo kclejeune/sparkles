@@ -389,8 +389,8 @@
 
 <svelte:head><title>Similar | Sparkles</title></svelte:head>
 
-<div class="page page-container">
-  <header class="head">
+<div class="page-container">
+  <header class="page-head">
     <div>
       <h1>Similar</h1>
       <p class="muted">
@@ -398,9 +398,10 @@
         {#if ds}in <span class="mono">{ds}</span>{/if}
       </p>
     </div>
+    <span class="spacer"></span>
     {#if ds && chosenIndex}
       <a
-        class="btn sm"
+        class="btn"
         href="{resolve('/embedding')}?ds={encodeURIComponent(ds)}&index={encodeURIComponent(
           chosenIndex.name,
         )}">Embedding map</a
@@ -732,19 +733,6 @@
 </div>
 
 <style>
-  .page {
-    padding: 24px 28px 40px;
-    gap: 18px;
-  }
-  .head {
-    display: flex;
-    align-items: flex-end;
-    gap: 8px;
-    flex-wrap: wrap;
-  }
-  .head p {
-    margin-top: 4px;
-  }
   .layout {
     display: grid;
     grid-template-columns: minmax(280px, 380px) minmax(0, 1fr);
@@ -949,9 +937,6 @@
     }
   }
   @media (max-width: 760px) {
-    .page {
-      padding: 16px;
-    }
     .hits th.vec,
     td.vec {
       display: none;

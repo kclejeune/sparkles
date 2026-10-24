@@ -1,5 +1,4 @@
 //! Materialized reasoning and RDFS on read.
-#[cfg(feature = "reasoning")]
 use crate::interrupt;
 use crate::{
     admin,

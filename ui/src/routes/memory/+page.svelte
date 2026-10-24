@@ -196,10 +196,15 @@
 
 <svelte:head><title>Memory | Sparkles</title></svelte:head>
 
-<div class="page">
-  <header class="head">
-    <h1><Icon name="brain" size={18} /> Memory <span class="faint">{ds ?? ''}</span></h1>
-    <p class="muted small">Facts, sources and activity recorded by agents.</p>
+<div class="page page-container">
+  <header class="page-head">
+    <div>
+      <h1>Memory</h1>
+      <p class="muted">
+        Facts, sources and activity that agents recorded in {#if ds}<span class="mono">{ds}</span
+          >{:else}this dataset{/if}.
+      </p>
+    </div>
   </header>
 
   {#if !ds}
@@ -407,27 +412,12 @@
 
 <style>
   .page {
-    padding: 16px;
-    display: grid;
-    gap: 14px;
-    align-content: start;
     /* The page is a scroll container with the height of the content area. Without this,
        its auto rows shrink to fit that height, and a card that scrolls sideways (its
        automatic minimum height is 0) is squeezed to a sliver. Rows that keep their
        content height make the page scroll instead. */
     grid-auto-rows: max-content;
-    min-width: 0;
     overflow: auto;
-  }
-  .head h1 {
-    display: flex;
-    align-items: center;
-    gap: 8px;
-    margin: 0;
-    font-size: var(--fs-lg);
-  }
-  .head p {
-    margin: 4px 0 0;
   }
   .grid {
     display: grid;
