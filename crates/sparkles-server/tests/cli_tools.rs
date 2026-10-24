@@ -559,6 +559,8 @@ fn qparse_and_uparse() {
         "PREFIX ex: <http://example.org/> SELECT ?s (COUNT(*) AS ?n) { ?s ex:p ?o } GROUP BY ?s";
     let o = run(dir, &["qparse", q]);
     assert!(o.status.success(), "{}", err(&o));
+    // without the formatter the parser's own rendering replaces the original text
+    #[cfg(feature = "fmt")]
     assert!(
         out(&o).contains("(COUNT(*) AS ?n)") && out(&o).contains("ex:p"),
         "{}",

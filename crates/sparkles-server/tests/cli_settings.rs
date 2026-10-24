@@ -208,12 +208,14 @@ fn settings_file_restart_reload_and_declared_datasets() {
 
 /// The output of a command run against `s` with an empty home, so that no saved login
 /// or memory configuration applies.
+#[cfg(feature = "auth")]
 struct Out {
     code: Option<i32>,
     stdout: String,
     stderr: String,
 }
 
+#[cfg(feature = "auth")]
 impl Out {
     fn json(&self) -> J {
         serde_json::from_str(&self.stdout)
@@ -226,6 +228,7 @@ impl Out {
     }
 }
 
+#[cfg(feature = "auth")]
 fn cli(s: &Server, home: &Path, args: &[&str], stdin: &str, env: &[(&str, &str)]) -> Out {
     let mut c = Command::new(BIN);
     c.args(args)
@@ -261,6 +264,7 @@ fn cli(s: &Server, home: &Path, args: &[&str], stdin: &str, env: &[(&str, &str)]
 /// `$EDIT_RACE` set, it first sets `historyDays` with another command (to the digits of
 /// the file name followed by 1), so that the
 /// edit is sent against a stale ETag.
+#[cfg(feature = "auth")]
 fn editor(dir: &Path) -> String {
     let p = dir.join("editor.sh");
     std::fs::write(
@@ -280,6 +284,7 @@ fn editor(dir: &Path) -> String {
 
 /// `sparkles settings get`, `set`, `edit`, `reset`, `diff` and `apply` against a server
 /// whose settings file declares values and locks `assistant.send`.
+#[cfg(feature = "auth")]
 #[test]
 fn settings_commands() {
     let dir = tempfile::tempdir().unwrap();
@@ -735,6 +740,7 @@ fn memory_init_and_maintenance() {
 /// Declared prefixes (spec C20) with a server process: `settings set`, `reset` and
 /// `diff` on the `prefixes` kind, a removal of a declared prefix that outlives a
 /// restart, a locked prefix, and `settings check` with its warning and errors.
+#[cfg(feature = "auth")]
 #[test]
 fn declared_prefixes() {
     const NOTES: &str = "https://kclj.io/sparkles/memory/notes/";

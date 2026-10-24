@@ -20,6 +20,8 @@ fn completions_for_each_shell() {
     assert!(out(&zsh).starts_with("#compdef sparkles"));
     // subcommands and their flags are completed
     assert!(out(&zsh).contains("--auth-config"));
+    // `memory sync --no-ingest` exists only with the memory feature
+    #[cfg(feature = "memory")]
     assert!(out(&zsh).contains("--no-ingest"));
     assert!(out(&zsh).contains("--layer"));
     for (shell, marker) in [
@@ -42,16 +44,24 @@ fn man_pages() {
     let man = dir.path().join("man");
     let o = run(&["man", "--dir", man.to_str().unwrap()]);
     assert!(o.status.success(), "{}", String::from_utf8_lossy(&o.stderr));
-    for page in [
+    let mut pages = vec![
         "sparkles.1",
         "sparkles-serve.1",
-        "sparkles-auth-login.1",
         "sparkles-completions.1",
         "sparkles-settings-edit.1",
         "sparkles-settings-apply.1",
-        "sparkles-memory-consolidate.1",
-        "sparkles-memory-maintenance.1",
-    ] {
+    ];
+    // these commands exist only with their features
+    if cfg!(feature = "auth") {
+        pages.push("sparkles-auth-login.1");
+    }
+    if cfg!(feature = "memory") {
+        pages.extend([
+            "sparkles-memory-consolidate.1",
+            "sparkles-memory-maintenance.1",
+        ]);
+    }
+    for page in pages {
         let text = std::fs::read_to_string(man.join(page)).unwrap_or_else(|_| panic!("{page}"));
         assert!(text.contains(".TH"), "{page}");
     }
