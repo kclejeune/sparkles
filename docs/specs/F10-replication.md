@@ -1355,6 +1355,17 @@ before Phase 2 starts.
     users and grants kept in step across peers (open question 10), and how does a
     joining replica get the keys of an encrypted dataset (question 17)?
 
+23. **High availability as a whole.** Questions 18 and 22 cover fencing and identity, but
+    the spec has no single account of how a cluster survives a node failure. It should
+    state recovery time and data-loss targets for the default and strict settings,
+    how many nodes a deployment needs (the lease store's quorum, such as three etcd
+    members, separate from the Sparkles nodes), whether the lease and the primary are
+    per server or per dataset, and how clients reach the new primary, through a
+    Kubernetes Service that selects the leader, a load balancer health check, or write
+    forwarding from replicas. It should also say how a dead node is replaced, by joining
+    a new one and bootstrapping it from a backup, and what happens when the lease store
+    itself is lost, where writes should stop rather than risk two primaries.
+
 ### Recommended direction for question 22
 
 The maintainer accepted this direction on 2026-10-24. Item 280 turns it into the design of
