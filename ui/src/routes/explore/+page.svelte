@@ -207,6 +207,7 @@
   let vSource = $state<'guard' | 'graph' | 'editor'>('guard');
   let vGraphIri = $state('');
   let vProbe = $state<GuardProbe | null>(null);
+  let vProbeFor = $state('');
   let vHasEditor = $state(false);
   let vBadges = $state(new Map<string, Badge>());
   let vMarked = $state<{ nodes: string[]; edges: string[] } | null>(null);
@@ -735,17 +736,33 @@
     if (ch !== 'badge') return;
     vChoice = c.lens === 'validation';
     savePref('sparkles.explore.validation', vChoice);
+    // Shift+3 turns this lens on again, also after the page opens again
+    if (c.lens !== 'none') savePref('sparkles.explore.badgeLens', c.lens);
     if (!vChoice) vMarked = null;
   };
+  {
+    const last = loadPref<string | null>('sparkles.explore.badgeLens', null);
+    if (last === 'validation' || last === 'inferred') lenses.setLast('badge', { lens: last });
+  }
   $effect(() => {
     const p = vProbe;
-    // while the overlay looks, the lens stays as it is
-    if (!p) return;
-    const ok = p.state !== 'restricted' && p.state !== 'unavailable';
-    lenses.setValidation(ok, ok ? null : `${p.message}.`);
-    const guard = p.state === 'shacl' || p.state === 'shex';
-    if (ok && (vChoice === true || (vChoice === null && guard)))
-      lenses.suggest('badge', { lens: 'validation' });
+    const name = ds;
+    const forDs = vProbeFor;
+    const choice = vChoice;
+    untrack(() => {
+      // until the overlay has probed this dataset, the lens is not offered
+      if (!p || !name || forDs !== name) {
+        lenses.setValidation(false, null);
+        return;
+      }
+      const ok = p.state !== 'restricted' && p.state !== 'unavailable';
+      lenses.setValidation(ok, ok ? null : `${p.message}.`);
+      if (!ok) return;
+      const guard = p.state === 'shacl' || p.state === 'shex';
+      // the person's own choice comes back where the lens exists again
+      if (choice === true) lenses.restore('badge', { lens: 'validation' });
+      else if (choice === null && guard) lenses.suggest('badge', { lens: 'validation' });
+    });
   });
   $effect(() => {
     lenses.setValidationBadges(vBadges);
@@ -2078,6 +2095,7 @@
               bind:sourceKind={vSource}
               bind:graphIri={vGraphIri}
               bind:probe={vProbe}
+              bind:probeFor={vProbeFor}
               bind:hasEditor={vHasEditor}
               at={mapAt}
               branch={overviewBranch ?? ''}

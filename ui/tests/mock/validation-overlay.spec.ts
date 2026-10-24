@@ -15,6 +15,18 @@ ex:PersonShape a sh:NodeShape ; sh:targetClass ex:Person ;
   sh:property [ sh:path ex:email ; sh:pattern "^[^@]+@[^@]+[.][^@]+$" ; sh:message "not an email address" ] .`;
 
 test.beforeAll(async ({ request }) => {
+  // a dataset without a guard to switch to
+  const plain = await request.post('/$/datasets', { data: { dbName: 'quality2', dbType: 'mem' } });
+  expect(plain.ok() || plain.status() === 409).toBe(true);
+  if (plain.ok()) {
+    const d = await request.post('/quality2/update', {
+      headers: { 'Content-Type': 'application/sparql-update' },
+      data: `PREFIX ex: <${EX}> INSERT DATA {
+        ex:q1 a ex:Person ; <http://www.w3.org/2000/01/rdf-schema#label> "Quinn" ; ex:knows ex:q2 .
+        ex:q2 a ex:Person . }`,
+    });
+    expect(d.ok()).toBe(true);
+  }
   const r = await request.post('/$/datasets', {
     data: { dbName: 'quality', dbType: 'persistent' },
   });
@@ -207,6 +219,26 @@ test('item 120: the badge channel turns validation off, remembers it, and Shift+
   await page.locator('body').click({ position: { x: 1, y: 1 } });
   await page.keyboard.press('Shift+Digit3');
   await expect.poll(async () => Object.keys(await badgesOf(page)).length).toBe(4);
+});
+
+test('item 120 review: a guard default does not follow the person to a dataset without one', async ({
+  page,
+}) => {
+  await open(page);
+  await page.locator('.ds-button').click();
+  await page
+    .getByRole('listbox', { name: 'Datasets' })
+    .getByRole('option', { name: /quality2/ })
+    .click();
+  const search = page.getByRole('combobox', { name: /Find a resource/ });
+  await search.fill('Quinn');
+  await page.locator('#search-results').getByRole('option', { name: /Quinn/ }).first().click();
+  await expect(page.locator('.wrap[data-graph]')).toBeVisible({ timeout: 15_000 });
+  await page.waitForTimeout(800);
+  await page.getByRole('button', { name: /^Lenses/ }).click();
+  const menu = page.getByRole('dialog', { name: 'Lenses' });
+  await expect(menu.getByRole('combobox', { name: 'Badges' })).toHaveValue('none');
+  await expect(page.getByRole('region', { name: 'Validation overlay' })).toHaveCount(0);
 });
 
 test('A11: a suggested fix is previewed, run, and its badge goes away', async ({ page }) => {

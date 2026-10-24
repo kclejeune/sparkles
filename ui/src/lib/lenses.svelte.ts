@@ -301,6 +301,21 @@ export class Lenses {
     this.set(channel, choice, false);
   }
 
+  /**
+   * Turn on a lens the person chose before, such as the validation lens remembered in the
+   * browser once the dataset offers it again, unless the channel has a lens now.
+   */
+  restore(channel: Channel, choice: LensChoice) {
+    if (this.choice[channel].lens !== 'none') return;
+    this.#suggested.delete(channel);
+    this.set(channel, choice, false);
+  }
+
+  /** The lens `toggle` turns on again, such as one remembered from an earlier visit. */
+  setLast(channel: Channel, choice: LensChoice) {
+    if (choice.lens !== 'none') this.#last[channel] = choice;
+  }
+
   /** Whether the validation lens exists, and why not. Turning it off ends the lens. */
   setValidation(available: boolean, note: string | null = null) {
     untrack(() => {

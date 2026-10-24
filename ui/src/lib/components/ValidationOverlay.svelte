@@ -62,6 +62,7 @@
     sourceKind = $bindable('guard'),
     graphIri = $bindable(''),
     probe = $bindable(null),
+    probeFor = $bindable(''),
     hasEditor = $bindable(false),
     live = $bindable(false),
     badges = $bindable(new Map()),
@@ -95,6 +96,8 @@
     graphIri?: string;
     /** What the overlay found out about the dataset's guard, for the lens menu. */
     probe?: GuardProbe | null;
+    /** The dataset `probe` describes. */
+    probeFor?: string;
     /** The Validate panel has shapes, for the source picker. */
     hasEditor?: boolean;
     /** Whether the overlay shows and validates. */
@@ -121,6 +124,7 @@
   $effect(() => {
     const name = ds;
     probe = null;
+    probeFor = '';
     probeError = null;
     guardGraph = 'choose';
     unionDefault = null;
@@ -129,6 +133,7 @@
       .then((p) => {
         if (ds !== name) return;
         probe = p;
+        probeFor = name;
         // without a guard the editor's shapes are the source (§11.2)
         if (p.state === 'none') sourceKind = editorShapes ? 'editor' : 'graph';
         else sourceKind = 'guard';

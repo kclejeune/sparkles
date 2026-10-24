@@ -222,3 +222,32 @@ describe('the validation lens (U07 §11.2, item 120)', () => {
     l.destroy();
   });
 });
+
+describe('the validation lens after review (item 120)', () => {
+  it('an explicit choice comes back when validation is offered again', () => {
+    const { l } = lenses(() => []);
+    l.setInput(input({ ds: 'a' }));
+    l.setValidation(true);
+    l.set('badge', { lens: 'validation' });
+    // a restricted dataset does not offer it
+    l.setInput(input({ ds: 'b' }));
+    l.setValidation(false, 'Validation needs access to every graph.');
+    expect(l.choice.badge.lens).toBe('none');
+    // back on the first dataset, the page restores the remembered choice
+    l.setInput(input({ ds: 'a' }));
+    l.setValidation(true);
+    l.restore('badge', { lens: 'validation' });
+    expect(l.choice.badge.lens).toBe('validation');
+    l.destroy();
+  });
+
+  it('Shift+3 turns on the remembered badge lens, also with reasoning', () => {
+    const { l } = lenses(() => []);
+    l.setLast('badge', { lens: 'validation' });
+    l.setInput(input({ reasoning: true }));
+    l.setValidation(true);
+    l.toggle('badge');
+    expect(l.choice.badge.lens).toBe('validation');
+    l.destroy();
+  });
+});
