@@ -209,7 +209,16 @@ test('the query page draws the paths on its result graph, adding what it lacks',
   // Explore's Add to graph has no place on a result
   await expect(panel(page).getByRole('button', { name: 'Add to graph' })).toHaveCount(0);
   // a node the paths added, which the result lacks, has the node menu too
-  const at = await nodeOn(page, 'Delta');
+  // once the node has stopped moving into place
+  let at = await nodeOn(page, 'Delta');
+  await expect
+    .poll(async () => {
+      const was = at;
+      await page.waitForTimeout(150);
+      at = await nodeOn(page, 'Delta');
+      return Math.hypot(at.x - was.x, at.y - was.y);
+    })
+    .toBeLessThan(0.5);
   await page.mouse.click(at.x, at.y, { button: 'right' });
   await expect(page.getByRole('menuitem', { name: 'Paths to here' })).toBeVisible();
   await page.keyboard.press('Escape');
