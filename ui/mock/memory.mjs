@@ -211,7 +211,9 @@ function queryIris(q, prefixes) {
     .replace(/#[^\n]*/g, ' ')
     .replace(/"(?:[^"\\]|\\.)*"|'(?:[^'\\]|\\.)*'/g, '""')
     .replace(/\bPREFIX\s+[\w.-]*:\s*<[^>]*>/gi, ' ')
-    .replace(/\bBASE\s+<[^>]*>/gi, ' ');
+    .replace(/\bBASE\s+<[^>]*>/gi, ' ')
+    // graph names are not terms of a triple pattern, which the server's check skips too
+    .replace(/\b(GRAPH|FROM(\s+NAMED)?)\s+(<[^>]*>|[A-Za-z][\w.-]*:[\w.-]*)/gi, ' ');
   const out = [];
   const seen = new Set();
   const add = (iri) => {

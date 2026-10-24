@@ -42,6 +42,7 @@ import { handleExplain, timedOutPlan } from './explain.mjs';
 import { handleReview, INGEST_BRANCH } from './review.mjs';
 import { geoQuery, handleGeo } from './geo.mjs';
 import { handleVector, seedVectors, touchPacked, vectorIndexFor } from './vector.mjs';
+import { WORLD, worldTurtle } from './world.mjs';
 import { PREFIXES, buildTurtle, provenanceTrig, scratchTurtle, vectorTurtle } from './data.mjs';
 
 const PORT = Number(process.env.PORT ?? 3030);
@@ -216,6 +217,16 @@ function seedHistory(ds) {
   createBranch(org, { name: 'scratch-s2', note: 'agent-7 scratchpad' });
   // an ingest branch with proposals to review (mock/review.mjs)
   createBranch(org, { name: INGEST_BRANCH, note: 'Stand-up notes of 2026-10-08' });
+  // the showcase of the maps of relations and of the GraphRAG communities (mock/world.mjs)
+  const world = makeDataset('world', 'persistent');
+  world.prefixes = {
+    ...world.prefixes,
+    ex: WORLD,
+    geo: 'http://www.opengis.net/ont/geosparql#',
+  };
+  world.store.load(worldTurtle(), { format: 'text/turtle' });
+  world.baseQuads = world.store.size;
+  addCommit(world, 'upload', world.store.size, 0, { bulk: true });
   // a branch of foaf two commits ahead of main
   const dev = createBranch(foaf, { name: 'dev', note: 'schema migration' }).branch;
   for (const u of [

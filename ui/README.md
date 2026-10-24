@@ -72,6 +72,14 @@ on. The mock answers the index status and `geo-index` tasks (`/$/geo/{ds}`),
 `GET /{ds}/geo`, `POST /$/geo/convert` and `spatial:nearbyGeom` queries, which use
 distances between centroids.
 
+`mock/world.mjs` holds the `world` dataset, which the README's screenshots of the maps of
+relations, the GraphRAG communities, the Pattern pane and the diff graph use. It has an
+invented freight company with its head office in Dubai, its offices in twelve cities, five
+partner companies, 41 invented people in 30 real cities on six continents and 37 routes
+between the cities. `mock/graphrag.mjs` gives it a tree of 25 GraphRAG communities in three
+levels, with a report for each and a mix of report statuses. The mock e2e tests do not use
+it, so it can change with the screenshots.
+
 `mock/vector.mjs` mocks the vector indexes. `foaf` has the index `embedding` over
 `ex:embedding` (8 dimensions, cosine), with an exact threshold of 10 rows so that its
 searches take the HNSW path. The mock answers `/$/vector/{ds}` and the create, replace,
