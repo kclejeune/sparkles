@@ -66,6 +66,8 @@
   import { describe as lensDescribe, entryIds, OTHER } from '$lib/lens';
   import { Lenses } from '$lib/lenses.svelte';
   import ValidationOverlay from '$components/ValidationOverlay.svelte';
+  import ShapeForm from '$components/ShapeForm.svelte';
+  import { getForm } from '$lib/forms-api';
   import ValidationSource from '$components/ValidationSource.svelte';
   import { type Badge, type GuardProbe, type VResult } from '$lib/validation-overlay';
   import { load as loadPref, save as savePref } from '$lib/storage';
@@ -448,6 +450,38 @@
     const id = selectedId;
     if (id) untrack(() => void loadDetails(id));
   });
+
+  // --- editing forms (U02) ---------------------------------------------------------
+  /** Whether a shape describes a resource and the caller may save its form, by IRI. */
+  let editable = $state<Record<string, boolean>>({});
+  /** The properties panel shows the form of the selected resource. */
+  let editing = $state(false);
+  $effect(() => {
+    // only the selection, the dataset and the slider: the graph changes as it grows
+    const id = selectedId;
+    const name = ds;
+    const past = timeActive;
+    const n = untrack(() => (id ? nodes[id] : null));
+    untrack(() => (editing = false));
+    if (!n || n.term.type !== 'uri' || !name || past) return;
+    const iri = n.iri;
+    if (untrack(() => editable[`${name}|${iri}`]) !== undefined) return;
+    const c = new AbortController();
+    getForm(name, iri, { signal: c.signal }).then(
+      (m) => (editable[`${name}|${iri}`] = m.editable && m.fields.some((f) => f.editable)),
+      () => {},
+    );
+    return () => c.abort();
+  });
+
+  /** After a save: read the resource's properties again. */
+  function formSaved(id: string) {
+    const keep = Object.fromEntries(
+      Object.entries(detailCache).filter(([k]) => !k.startsWith(`${id}|`)),
+    );
+    detailCache = keep;
+    void loadDetails(id);
+  }
 
   // --- graph model -----------------------------------------------------------
 
@@ -2466,6 +2500,17 @@
                   <button class="btn sm" onclick={() => describeInQuery(n.iri)}
                     ><Icon name="query" size={13} /> Describe</button
                   >
+                  {#if ds && editable[`${ds}|${n.iri}`] && !timeActive}
+                    <button
+                      class="btn sm"
+                      aria-pressed={editing}
+                      title="Edit this resource in a form generated from its shapes"
+                      onclick={() => {
+                        editing = !editing;
+                        sideTab = 'props';
+                      }}><Icon name="pencil" size={13} /> Edit</button
+                    >
+                  {/if}
                   <button
                     class="btn sm"
                     title="Find paths from this resource (Shift+P)"
@@ -2556,6 +2601,20 @@
             {:else if n.term.type !== 'uri'}
               <div class="side-body faint">
                 Blank nodes can only be explored through their neighbours.
+              </div>
+            {:else if editing && sideTab === 'props' && ds && !timeActive}
+              <div class="side-body scroll">
+                {#key n.iri}
+                  <ShapeForm
+                    {ds}
+                    iri={n.iri}
+                    {prefixes}
+                    title={n.label}
+                    oncancel={() => (editing = false)}
+                    onsaved={() => formSaved(n.id)}
+                    ondraft={() => (draftOpen = true)}
+                  />
+                {/key}
               </div>
             {:else if sideTab === 'memory' && ds}
               <div class="side-body scroll">

@@ -16,6 +16,10 @@
     prefixes,
     value = $bindable(null),
     literals = false,
+    hideLabel = false,
+    describedby,
+    invalid = false,
+    disabled = false,
     onpicked,
   }: {
     id: string;
@@ -25,6 +29,12 @@
     value?: Picked | null;
     /** Offer a typed `"…"` as a literal (a path may end at one). */
     literals?: boolean;
+    /** Keep the label for assistive technology only (a form shows its own). */
+    hideLabel?: boolean;
+    /** The ids of the texts that describe the input, such as its problems. */
+    describedby?: string;
+    invalid?: boolean;
+    disabled?: boolean;
     onpicked?: () => void;
   } = $props();
 
@@ -131,7 +141,7 @@
 </script>
 
 <div class="picker">
-  <label class="lbl" for={id}>{label}</label>
+  <label class="lbl" class:sr={hideLabel} for={id}>{label}</label>
   <div class="box">
     {#if value}
       <span class="chip" title={value.term.type === 'uri' ? value.term.value : value.label}>
@@ -140,6 +150,7 @@
           type="button"
           class="chip-x"
           aria-label="Clear {label}"
+          {disabled}
           onclick={() => {
             value = null;
             input?.focus();
@@ -158,6 +169,9 @@
       aria-expanded={shown && options.length > 0}
       aria-controls={listId}
       aria-autocomplete="list"
+      aria-describedby={describedby}
+      aria-invalid={invalid || undefined}
+      {disabled}
       aria-activedescendant={shown && options[active] ? `${listId}-${active}` : undefined}
       oninput={onInput}
       onkeydown={onKey}
@@ -209,6 +223,14 @@
     position: relative;
     min-width: 0;
     flex: 1 1 200px;
+  }
+  .lbl.sr {
+    position: absolute;
+    width: 1px;
+    height: 1px;
+    overflow: hidden;
+    clip-path: inset(50%);
+    white-space: nowrap;
   }
   .lbl {
     display: block;

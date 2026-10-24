@@ -57,6 +57,7 @@ const BRANCH_ROUTES = new Set([
   'rdfs',
   'cache',
   'backups',
+  'forms',
 ]);
 
 /**
