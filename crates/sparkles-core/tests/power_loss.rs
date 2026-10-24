@@ -195,6 +195,15 @@ fn child_writer() {
     // marker removal of such a pass.
     #[cfg(all(feature = "text", feature = "failpoints"))]
     if background {
+        // the index opens in the background, and a writer replaced later would merge
+        let until = std::time::Instant::now() + std::time::Duration::from_secs(30);
+        while s.text_status().is_none_or(|st| st.state != "ready") {
+            assert!(
+                std::time::Instant::now() < until,
+                "the full-text index never opened"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
         s.stop_text_merges_for_test();
     }
     fn locked_cleared(_s: &Store) -> bool {
