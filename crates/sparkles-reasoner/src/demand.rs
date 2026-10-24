@@ -31,6 +31,13 @@
 //! `(?c rdfs:subClassOf ?c)`, do not answer such a key, which keeps the reflexive schema
 //! rules of RDFS and OWL 2 RL from asking whether every class has an instance.
 //!
+//! Equality is a lower stage of its own (spec F17 §3.5). When rules derive `owl:sameAs`
+//! and read it, the stage evaluates `owl:sameAs` with the free adornment to its fixpoint
+//! first, and the stages above read its facts as stored ones: their `owl:sameAs` atoms ask
+//! for nothing and the rules that derive `owl:sameAs` are left out of them. Without it,
+//! every value a query touches would ask what it equals, and the `eq-rep-*` rules would
+//! ask for every fact of every value.
+//!
 //! `noValue` reads facts that must be complete before the rule runs. The pattern it reads,
 //! with its constants bound and its variables free, is a demand of a lower stage with
 //! magic predicates of its own, evaluated to its fixpoint first. A program whose stages
@@ -38,7 +45,7 @@
 
 use crate::budget::MemoryExceeded;
 use crate::builtins::{BuiltinKind, HeadAction};
-use crate::engine::{Atom, CBuiltin, CHead, CRule, Slot, Step, plan_with};
+use crate::engine::{Atom, CBuiltin, CHead, CRule, Slot, Step};
 use crate::graph::Triple;
 use crate::terms::Terms;
 use rustc_hash::{FxHashMap, FxHashSet};
@@ -242,11 +249,18 @@ pub(crate) struct Stage {
     copies: FxHashMap<Key, (BTreeSet<String>, BTreeSet<Key>)>,
     /// the magic facts the stage starts from (the lower stages': `noValue` patterns)
     pub seeds: Vec<Triple>,
+    /// evaluate the stage only when a fact with this predicate holds
+    pub only_if: Option<u64>,
 }
 
 impl Stage {
     pub fn magic(&self, k: &Key) -> Option<u64> {
         self.magic.get(k).copied()
+    }
+
+    /// Each key with its magic predicate.
+    pub fn keys(&self) -> impl Iterator<Item = (&Key, u64)> {
+        self.magic.iter().map(|(k, m)| (k, *m))
     }
 
     /// The original rules in the dependency cone of `k`.
@@ -338,10 +352,169 @@ fn no_value_demand(b: &CBuiltin) -> (Key, [u64; 3]) {
     (key, [s.unwrap_or(0), p.unwrap_or(0), o.unwrap_or(0)])
 }
 
+/// An estimate of the facts an atom matches with the variables `bound` bound: from the
+/// stored facts, and for a pattern of unknown predicate (what rules may derive).
+pub(crate) type Estimate<'a> = &'a dyn Fn(&Atom, &[bool]) -> (f64, f64);
+
+/// The order in which a rule copy's body is walked to pass bindings sideways: builtins as
+/// soon as their inputs are bound, then the atom with the fewest estimated matches. An
+/// atom that rules derive is estimated at least as a pattern of unknown predicate, since
+/// its stored facts say nothing of its derived ones, and comes after every other when
+/// its demand would be wide: a free predicate, or `rdf:type` with a free class. Such a
+/// demand asks for every fact or every type of each value, which asks in turn for the
+/// facts of their neighbours, so placing it after the atoms that bind its predicate or
+/// class keeps the demand from spreading over the graph. `None` when a builtin's inputs
+/// are never bound.
+fn sip(
+    rule: &CRule,
+    prebound: &[usize],
+    est: Estimate<'_>,
+    derived: &dyn Fn(&Atom) -> bool,
+    rdf_type: u64,
+) -> Option<Vec<Step>> {
+    let mut bound = vec![false; rule.nvars];
+    for &v in prebound {
+        bound[v] = true;
+    }
+    let mut steps = Vec::with_capacity(rule.atoms.len() + rule.builtins.len());
+    let mut atoms_left: Vec<usize> = (0..rule.atoms.len()).collect();
+    let mut bi_left: Vec<usize> = (0..rule.builtins.len()).collect();
+    loop {
+        let mut progress = true;
+        while progress {
+            progress = false;
+            bi_left.retain(|&j| {
+                let b = &rule.builtins[j];
+                if b.inputs.iter().all(|&v| bound[v]) {
+                    steps.push(Step::Builtin(j));
+                    for &v in &b.outputs {
+                        bound[v] = true;
+                    }
+                    progress = true;
+                    false
+                } else {
+                    true
+                }
+            });
+        }
+        if atoms_left.is_empty() {
+            break;
+        }
+        let cost = |i: usize| {
+            let a = &rule.atoms[i];
+            let (stored, unknown) = est(a, &bound);
+            if !derived(a) {
+                return stored;
+            }
+            let b = |s: Slot| match s {
+                Slot::Const(_) => true,
+                Slot::Var(v) => bound[v],
+                Slot::Any => false,
+            };
+            let wide = !b(a.p) || (a.p == Slot::Const(rdf_type) && !b(a.o));
+            let c = stored.max(unknown);
+            if wide { c * 1e9 } else { c }
+        };
+        let best = (0..atoms_left.len())
+            .min_by(|&x, &y| cost(atoms_left[x]).total_cmp(&cost(atoms_left[y])))
+            .expect("atoms left");
+        let i = atoms_left.remove(best);
+        let a = &rule.atoms[i];
+        for s in [a.s, a.p, a.o] {
+            if let Slot::Var(v) = s {
+                bound[v] = true;
+            }
+        }
+        steps.push(Step::Atom {
+            atom: i,
+            lo: 0,
+            hi: 0,
+        });
+    }
+    bi_left.is_empty().then_some(steps)
+}
+
+/// The schema vocabulary of a program: the RDFS and OWL predicates its rules name, apart
+/// from equality and annotations, and the RDF, RDFS and OWL classes of properties and
+/// classes it names as types.
+pub(crate) struct Vocab {
+    schema: FxHashSet<u64>,
+    meta: FxHashSet<u64>,
+}
+
+impl Vocab {
+    fn of(rules: &[CRule], terms: &Terms) -> Vocab {
+        const RDF: &str = "http://www.w3.org/1999/02/22-rdf-syntax-ns#";
+        const RDFS: &str = "http://www.w3.org/2000/01/rdf-schema#";
+        const OWL: &str = "http://www.w3.org/2002/07/owl#";
+        let iri = |c: u64| match terms.term(c) {
+            Some(oxrdf::Term::NamedNode(n)) => Some(n.into_string()),
+            _ => None,
+        };
+        let is_schema = |i: &str| {
+            matches!(
+                i.strip_prefix(RDFS),
+                Some("subClassOf" | "subPropertyOf" | "domain" | "range")
+            ) || i.strip_prefix(OWL).is_some_and(|l| {
+                !matches!(
+                    l,
+                    "sameAs"
+                        | "differentFrom"
+                        | "versionInfo"
+                        | "priorVersion"
+                        | "backwardCompatibleWith"
+                        | "incompatibleWith"
+                        | "deprecated"
+                )
+            })
+        };
+        let is_meta = |i: &str| {
+            [RDF, RDFS, OWL].iter().any(|ns| {
+                i.strip_prefix(ns).is_some_and(|l| {
+                    l.ends_with("Property")
+                        || matches!(l, "Class" | "Datatype" | "Restriction" | "Ontology")
+                })
+            })
+        };
+        let rdf_type = format!("{RDF}type");
+        let mut v = Vocab {
+            schema: FxHashSet::default(),
+            meta: FxHashSet::default(),
+        };
+        let mut see = |p: Slot, o: Slot| {
+            let Slot::Const(p) = p else { return };
+            let Some(pi) = iri(p) else { return };
+            if is_schema(&pi) {
+                v.schema.insert(p);
+            } else if pi == rdf_type
+                && let Slot::Const(c) = o
+                && iri(c).is_some_and(|ci| is_meta(&ci))
+            {
+                v.meta.insert(c);
+            }
+        };
+        for r in rules {
+            for a in &r.atoms {
+                see(a.p, a.o);
+            }
+            for h in &r.head {
+                let (_, p, o) = head_slots(h);
+                see(p, o);
+            }
+        }
+        v
+    }
+}
+
 /// How a body atom that rules give facts for is asked for.
 struct StageBuilder<'a> {
+    est: Estimate<'a>,
+    rdf_type: u64,
+    vocab: &'a Vocab,
     rules: &'a [CRule],
     heads: Vec<(Slot, Slot, Slot)>,
+    /// a predicate a lower stage derives in full, whose atoms ask for nothing here
+    complete: Option<u64>,
     terms: &'a Terms,
     dummy: u64,
     stage: Stage,
@@ -356,7 +529,46 @@ impl StageBuilder<'_> {
         self.terms.try_fresh_bnode().map_err(TransformError::Memory)
     }
 
+    /// Whether every head of a copy gives schema facts: a predicate of the RDFS and OWL
+    /// vocabularies, or `rdf:type` with an RDF, RDFS or OWL class of properties and classes.
+    fn schema_head(&self, heads: &[CHead]) -> bool {
+        heads.iter().all(|h| match h {
+            CHead::Triple(_, Slot::Const(p), o) => {
+                self.vocab.schema.contains(p)
+                    || (*p == self.rdf_type
+                        && matches!(o, Slot::Const(c) if self.vocab.meta.contains(c)))
+            }
+            _ => false,
+        })
+    }
+
+    /// Whether a body atom of a copy asks for derived facts. A copy that gives schema facts
+    /// reads instance facts as they are and asks only for schema facts and types, so the
+    /// schema never asks for the instances of a class or the facts of a property: which
+    /// classes have instances (`rdf:type rdfs:range rdfs:Class`) or which properties are
+    /// used (`rdf1`) is read from the facts at hand.
+    fn asks(&self, a: &Atom, schema_copy: bool) -> bool {
+        if !self.intensional(a) {
+            return false;
+        }
+        if !schema_copy {
+            return true;
+        }
+        match a.p {
+            Slot::Const(p) if self.vocab.schema.contains(&p) => true,
+            Slot::Const(p) if p == self.rdf_type => match a.o {
+                Slot::Const(c) => self.vocab.meta.contains(&c),
+                Slot::Var(_) => true,
+                Slot::Any => false,
+            },
+            _ => false,
+        }
+    }
+
     fn intensional(&self, a: &Atom) -> bool {
+        if self.complete.is_some_and(|c| a.p == Slot::Const(c)) {
+            return false;
+        }
         self.heads.iter().any(|h| unifies((a.s, a.p, a.o), *h))
     }
 
@@ -390,8 +602,14 @@ impl StageBuilder<'_> {
         if let Some(i) = skip {
             body.atoms.remove(i);
         }
-        let zero = vec![(0u32, 0u32); body.atoms.len()];
-        let Some(steps) = plan_with(&body, &zero, None, None, prebound) else {
+        let schema_copy = self.schema_head(&head);
+        let Some(steps) = sip(
+            &body,
+            prebound,
+            self.est,
+            &|a| self.asks(a, schema_copy),
+            self.rdf_type,
+        ) else {
             return Ok(());
         };
         let m = guard.p;
@@ -412,7 +630,7 @@ impl StageBuilder<'_> {
             match *st {
                 Step::Atom { atom, .. } => {
                     let a = body.atoms[atom].clone();
-                    if self.intensional(&a) {
+                    if self.asks(&a, schema_copy) {
                         let ka = key_of(&a, &bound).with_neq(irreflexive(&body, atom, &head));
                         let ma = self.magic_of(ka)?;
                         asks.push(ka);
@@ -452,6 +670,33 @@ impl StageBuilder<'_> {
                     before_builtins.push(j);
                 }
             }
+        }
+        if tracing::enabled!(target: "sparkles_reasoner::demand", tracing::Level::DEBUG) {
+            let show = |k: &Key| {
+                let p = match k.p {
+                    KeyP::Const(c) => self
+                        .terms
+                        .term(c)
+                        .map_or_else(|| format!("#{c}"), |t| t.to_string()),
+                    p => format!("{p:?}"),
+                };
+                format!("{p}^{}{}", k.adornment(), if k.neq { "!" } else { "" })
+            };
+            let order: Vec<String> = steps
+                .iter()
+                .filter_map(|st| match st {
+                    Step::Atom { atom, .. } => Some(format!("{}", atom)),
+                    Step::Builtin(_) => None,
+                })
+                .collect();
+            tracing::debug!(
+                target: "sparkles_reasoner::demand",
+                "copy {} via {} order [{}] asks [{}]",
+                show(&k),
+                r.name,
+                order.join(" "),
+                asks.iter().map(show).collect::<Vec<_>>().join(", ")
+            );
         }
         self.stage.copies.entry(k).or_default().1.extend(asks);
         for b in &body.builtins {
@@ -709,12 +954,65 @@ pub(crate) fn transform(
     rules: &[CRule],
     terms: &Terms,
     roots: &[Key],
+    est: Estimate<'_>,
 ) -> Result<Program, TransformError> {
     let dummy = terms.try_fresh_bnode().map_err(TransformError::Memory)?;
-    let heads: Vec<(Slot, Slot, Slot)> = rules
-        .iter()
-        .flat_map(|r| r.head.iter().map(head_slots))
-        .collect();
+    let rdf_type = terms
+        .try_id_for(&oxrdf::Term::NamedNode(
+            oxrdf::vocab::rdf::TYPE.into_owned(),
+        ))
+        .map_err(TransformError::Memory)?;
+    let vocab = Vocab::of(rules, terms);
+    // equality as a lower stage, when rules derive owl:sameAs and read it
+    let same_as = terms
+        .try_id_for(&oxrdf::Term::NamedNode(oxrdf::NamedNode::new_unchecked(
+            "http://www.w3.org/2002/07/owl#sameAs",
+        )))
+        .map_err(TransformError::Memory)?;
+    let derives = |r: &CRule| {
+        r.head
+            .iter()
+            .any(|h| head_slots(h).1 == Slot::Const(same_as))
+    };
+    let eq = rules.iter().any(derives)
+        && rules
+            .iter()
+            .any(|r| r.atoms.iter().any(|a| a.p == Slot::Const(same_as)));
+    // the rules of the stages above equality: without those that only derive owl:sameAs
+    let upper: Vec<CRule> = if eq {
+        rules
+            .iter()
+            .filter(|r| {
+                !r.head
+                    .iter()
+                    .all(|h| head_slots(h).1 == Slot::Const(same_as))
+            })
+            .map(CRule::clone_shallow)
+            .collect()
+    } else {
+        Vec::new()
+    };
+    let heads_of = |rs: &[CRule]| -> Vec<(Slot, Slot, Slot)> {
+        rs.iter()
+            .flat_map(|r| r.head.iter().map(head_slots))
+            .collect()
+    };
+    // the first pass of equality: without the rules that read owl:sameAs to derive other
+    // facts (the eq-rep-* rules), which can only fire once owl:sameAs holds a fact
+    let first: Vec<CRule> = if eq {
+        rules
+            .iter()
+            .filter(|r| derives(r) || !r.atoms.iter().any(|a| a.p == Slot::Const(same_as)))
+            .map(CRule::clone_shallow)
+            .collect()
+    } else {
+        Vec::new()
+    };
+    let all_heads = heads_of(rules);
+    let upper_heads = heads_of(&upper);
+    let first_heads = heads_of(&first);
+    // 0: the query's stages, 1: equality in full, 2: equality's first pass
+    let mut phase = 0;
     // the noValue builtins of the program, for the stratification check
     let no_values: usize = rules
         .iter()
@@ -729,13 +1027,35 @@ pub(crate) fn transform(
     let mut magic_preds = FxHashSet::default();
     let mut total = 0usize;
     let mut level: Vec<(Key, Option<[u64; 3]>)> = roots.iter().map(|k| (*k, None)).collect();
-    while !level.is_empty() {
-        if stages.len() > no_values {
+    loop {
+        let mut only_if = None;
+        if level.is_empty() {
+            if !eq || phase == 2 {
+                break;
+            }
+            // the equality stages, below every other: the full one runs only when the
+            // first pass, evaluated before it, found owl:sameAs facts
+            phase += 1;
+            if phase == 1 {
+                only_if = Some(same_as);
+            }
+            level = vec![(Key::new(false, KeyP::Const(same_as), false), Some([0; 3]))];
+        }
+        if stages.len() > no_values + 2 * eq as usize {
             return Err(TransformError::NotStratified);
         }
+        let (stage_rules, heads, complete): (&[CRule], &[(Slot, Slot, Slot)], _) = match phase {
+            0 if eq => (&upper, &upper_heads, Some(same_as)),
+            0 | 1 => (rules, &all_heads, None),
+            _ => (&first, &first_heads, None),
+        };
         let mut b = StageBuilder {
-            rules,
-            heads: heads.clone(),
+            est,
+            rdf_type,
+            vocab: &vocab,
+            rules: stage_rules,
+            heads: heads.to_vec(),
+            complete,
             terms,
             dummy,
             stage: Stage {
@@ -743,6 +1063,7 @@ pub(crate) fn transform(
                 magic: FxHashMap::default(),
                 copies: FxHashMap::default(),
                 seeds: Vec::new(),
+                only_if,
             },
             todo: VecDeque::new(),
             magic_preds: &mut magic_preds,

@@ -21,6 +21,7 @@ use super::plan::{ActiveGraph, Planner};
 use super::{QueryOptions, make_ctx};
 use crate::error::{Error, Result};
 use crate::id::{Id, Tag};
+use crate::index::Perm;
 use crate::store::Snapshot;
 use oxrdf::{Term, Variable};
 use rustc_hash::FxHashMap;
@@ -498,7 +499,18 @@ pub(crate) fn apply(
                 )
             })
             .collect();
-        // bound positions first, patterns read without derivation before others
+        // the stored facts each pattern's constants match: of an intensional pattern with
+        // none, its derived facts may be many, so it counts as the largest
+        let estimates: Vec<u64> = group
+            .iter()
+            .zip(&intensional)
+            .map(|(t, &int)| match stored_count(&ctx.snap, t) {
+                0 if int => u64::MAX,
+                n => n,
+            })
+            .collect();
+        // bound positions first, then patterns read without derivation, then the fewest
+        // stored facts
         let mut left: Vec<usize> = (0..group.len()).collect();
         let mut bound: Vec<Variable> = Vec::new();
         while !left.is_empty() {
@@ -510,7 +522,7 @@ pub(crate) fn apply(
                 let n = b(&t.subject) as u8
                     + matches!(&t.predicate, NamedNodePattern::NamedNode(_)) as u8
                     + b(&t.object) as u8;
-                (n, !intensional[i] as u8)
+                (n, !intensional[i] as u8, std::cmp::Reverse(estimates[i]))
             };
             let k = (0..left.len())
                 .max_by(|&a, &b| score(left[a]).cmp(&score(left[b])).then(b.cmp(&a)))
@@ -748,6 +760,32 @@ pub(crate) fn apply(
         millis: t0.elapsed().as_secs_f64() * 1000.0,
     }));
     Ok(())
+}
+
+/// The stored facts that match the constants of `t`, in all graphs, as the index counts
+/// them (`u64::MAX` when it has none).
+fn stored_count(snap: &Snapshot, t: &TriplePattern) -> u64 {
+    let id = |x: Option<Term>| x.map(|t| snap.lookup_term(&t).map(|i| i.0));
+    let (s, p, o) = (
+        id(const_term(&t.subject)),
+        id(const_pred(&t.predicate)),
+        id(const_term(&t.object)),
+    );
+    if [s, p, o].iter().any(|x| matches!(x, Some(None))) {
+        return 0;
+    }
+    let (s, p, o) = (s.flatten(), p.flatten(), o.flatten());
+    let (perm, prefix) = match (s, p, o) {
+        (Some(s), Some(p), Some(o)) => (Perm::Spo, vec![s, p, o]),
+        (Some(s), Some(p), None) => (Perm::Spo, vec![s, p]),
+        (Some(s), None, Some(o)) => (Perm::Sop, vec![s, o]),
+        (None, Some(p), Some(o)) => (Perm::Pos, vec![p, o]),
+        (Some(s), None, None) => (Perm::Spo, vec![s]),
+        (None, Some(p), None) => (Perm::Pso, vec![p]),
+        (None, None, Some(o)) => (Perm::Osp, vec![o]),
+        (None, None, None) => return u64::MAX,
+    };
+    snap.count(perm, &prefix).unwrap_or(u64::MAX)
 }
 
 /// The distinct values of `var` over the patterns `chosen`, read from the view with the

@@ -12,7 +12,7 @@
 
 use crate::budget::{Budget, MemoryExceeded};
 use crate::demand::{self, Key, KeyP, Program, TransformError};
-use crate::engine::{self, CRule, Slot};
+use crate::engine::{self, Atom, CRule, Slot};
 use crate::facts::Base;
 use crate::graph::{Graph, Triple};
 use crate::inputs::{self, Inputs};
@@ -207,6 +207,8 @@ struct Session {
     local_keys: Vec<(u64, Vec<u8>)>,
     /// whether an exported fact holds a blank node a rule made, which no table may hold
     made_bnodes: bool,
+    /// whether the lower stages were evaluated
+    lower_done: bool,
     /// tables read from the cache
     cached: Vec<Arc<Table>>,
     reports: Vec<DemandReport>,
@@ -261,6 +263,7 @@ impl Session {
             chunks: Vec::new(),
             local_keys: Vec::new(),
             made_bnodes: false,
+            lower_done: false,
             cached: Vec::new(),
             reports: Vec::new(),
             seeds: Vec::new(),
@@ -334,6 +337,9 @@ impl Session {
             watch.thread().unpark();
             r
         });
+        if tracing::enabled!(target: "sparkles_reasoner::demand", tracing::Level::DEBUG) {
+            self.trace_facts();
+        }
         if let Some(e) = stopped.into_inner() {
             return Err(e);
         }
@@ -365,8 +371,8 @@ impl Session {
         })
     }
 
-    /// Make the graph and evaluate the lower stages, the first time a demand needs it.
-    fn ensure_graph(&mut self) -> Result<()> {
+    /// Make the graph over the input graphs, once.
+    fn make_graph(&mut self) -> Result<()> {
         if self.graph.is_some() {
             return Ok(());
         }
@@ -375,16 +381,27 @@ impl Session {
         let mut g = Graph::with_base(Arc::new(base));
         g.set_budget(&self.budget)
             .map_err(|e| memory_error(e, "the input graphs"))?;
-        if let Some(p) = &self.program {
-            g.set_hidden(Arc::new(p.magic_preds.clone()));
-        }
         self.graph = Some(g);
+        Ok(())
+    }
+
+    /// Evaluate the lower stages, the first time a demand needs them.
+    fn ensure_graph(&mut self) -> Result<()> {
+        self.make_graph()?;
+        if self.lower_done {
+            return Ok(());
+        }
+        self.lower_done = true;
         let stages = self.program.as_ref().map_or(0, |p| p.stages.len());
         for si in (1..stages).rev() {
-            let seeds = self.program.as_ref().expect("prepared").stages[si]
-                .seeds
-                .clone();
+            let stage = &self.program.as_ref().expect("prepared").stages[si];
             let g = self.graph.as_mut().expect("graph made");
+            if let Some(p) = stage.only_if
+                && g.count_p(p, 0, g.len()) == 0
+            {
+                continue;
+            }
+            let seeds = stage.seeds.clone();
             let start = g.len();
             g.try_add_batch(seeds)
                 .map_err(|e| memory_error(e, "the patterns noValue reads"))?;
@@ -454,6 +471,66 @@ impl Session {
         }))
     }
 
+    /// Debug output: the magic facts of each key and the derived facts of each predicate.
+    fn trace_facts(&self) {
+        let program = self.program.as_ref().expect("prepared");
+        let g = self.graph.as_ref().expect("graph made");
+        let mut by_magic: FxHashMap<u64, usize> = FxHashMap::default();
+        let mut by_pred: FxHashMap<u64, usize> = FxHashMap::default();
+        let mut first: FxHashMap<u64, Vec<[u64; 3]>> = FxHashMap::default();
+        for t in g.derived() {
+            if program.magic_preds.contains(&t[1]) {
+                *by_magic.entry(t[1]).or_default() += 1;
+                let f = first.entry(t[1]).or_default();
+                if f.len() < 3 {
+                    f.push(*t);
+                }
+            } else {
+                *by_pred.entry(t[1]).or_default() += 1;
+            }
+        }
+        let name = |x: u64| {
+            self.terms
+                .term(x)
+                .map_or_else(|| format!("#{x}"), |t| t.to_string())
+        };
+        for (si, st) in program.stages.iter().enumerate() {
+            for (k, m) in st.keys() {
+                if let Some(n) = by_magic.get(&m) {
+                    let p = match k.p {
+                        KeyP::Const(c) => name(c),
+                        _ => format!("{:?}", k.p),
+                    };
+                    let sample: Vec<String> = first
+                        .get(&m)
+                        .into_iter()
+                        .flatten()
+                        .map(|t| {
+                            let v = |x: u64| {
+                                if x == program.dummy {
+                                    "_".to_string()
+                                } else {
+                                    name(x)
+                                }
+                            };
+                            format!("({} {})", v(t[0]), v(t[2]))
+                        })
+                        .collect();
+                    tracing::debug!(
+                        target: "sparkles_reasoner::demand",
+                        "stage {si} key {p}^{}{} magic facts {n} first {}",
+                        k.adornment(),
+                        if k.neq { " neq" } else { "" },
+                        sample.join(" ")
+                    );
+                }
+            }
+        }
+        for (p, n) in by_pred {
+            tracing::debug!(target: "sparkles_reasoner::demand", "derived {} {n}", name(p));
+        }
+    }
+
     fn matches(&self, d: usize, t: &[u64; 3]) -> bool {
         let c = &self.consts[d];
         let k = &self.keys[d];
@@ -474,6 +551,52 @@ impl Session {
         };
         pos(0, k.s) && pos(1, matches!(k.p, KeyP::Const(_))) && pos(2, k.o)
     }
+}
+
+/// The demand transformation's estimate of the facts atom `a` matches with the variables
+/// `bound` bound, before any derivation: from the input graphs' statistics, and for a
+/// pattern of unknown predicate.
+fn estimate(g: &Graph, a: &Atom, bound: &[bool]) -> (f64, f64) {
+    let b = |s: Slot| match s {
+        Slot::Const(_) => true,
+        Slot::Var(v) => bound[v],
+        Slot::Any => false,
+    };
+    let (sb, pb, ob) = (b(a.s), b(a.p), b(a.o));
+    let n = g.len().max(1) as f64;
+    let fan = (n / g.distinct_subjects() as f64).max(1.0);
+    let per_p = (n / g.distinct_predicates() as f64).max(1.0);
+    let unknown = match (sb, ob) {
+        (true, true) => 1.0,
+        (true, false) | (false, true) => {
+            if pb {
+                fan
+            } else {
+                fan * 4.0
+            }
+        }
+        (false, false) => {
+            if pb {
+                per_p
+            } else {
+                n * 2.0
+            }
+        }
+    };
+    let stored = match a.p {
+        Slot::Const(p) => {
+            let cnt = g.count_p(p, 0, g.len()) as f64;
+            let (ds, dos) = g.pstats(p);
+            match (sb, ob) {
+                (true, true) => cnt.min(1.0),
+                (true, false) => cnt / ds.max(1) as f64,
+                (false, true) => cnt / dos.max(1) as f64,
+                (false, false) => cnt,
+            }
+        }
+        _ => unknown,
+    };
+    (stored, unknown)
 }
 
 impl ReasoningSession for Session {
@@ -515,12 +638,18 @@ impl ReasoningSession for Session {
                 _ => Seeded::None,
             });
         }
+        self.make_graph()?;
+        let g = self.graph.as_ref().expect("graph made");
+        let est = |a: &Atom, bound: &[bool]| estimate(g, a, bound);
         let program =
-            demand::transform(&self.rules, &self.terms, &self.keys).map_err(|e| match e {
+            demand::transform(&self.rules, &self.terms, &self.keys, &est).map_err(|e| match e {
                 TransformError::Memory(m) => memory_error(m, "the demand program"),
                 TransformError::TooLarge(_) => component(BUDGET_CODE, e.to_string()),
                 TransformError::NotStratified => component(RULES_CODE, e.to_string()),
             })?;
+        if let Some(g) = self.graph.as_mut() {
+            g.set_hidden(Arc::new(program.magic_preds.clone()));
+        }
         let infos = demands
             .iter()
             .zip(&self.keys)
