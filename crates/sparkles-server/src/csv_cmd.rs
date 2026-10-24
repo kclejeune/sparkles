@@ -56,6 +56,10 @@ pub struct CsvArgs {
     /// JSON sources of a mapping: the largest document, in MiB (default 512)
     #[arg(long, value_name = "MB")]
     pub max_json_mb: Option<u64>,
+    /// The graph of a load (`sparkles load --graph`), which an R2RML, RML or YARRRML
+    /// mapping writes every quad into
+    #[arg(skip)]
+    pub graph: Option<String>,
 }
 
 /// `NAME=VALUE`
@@ -134,6 +138,10 @@ impl CsvArgs {
     /// The run options of the mapping engine.
     pub fn run_options(&self) -> mapping::RunOptions {
         mapping::RunOptions {
+            only_graph: self
+                .graph
+                .as_deref()
+                .and_then(|g| oxrdf::NamedNode::new(g).ok()),
             base: self.base.clone(),
             max_json_bytes: self
                 .max_json_mb

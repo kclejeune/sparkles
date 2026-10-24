@@ -172,6 +172,50 @@ fn loads_through_a_mapping() {
     );
     let s = out(&o);
     assert!(s.contains("\"Berlin\"") && s.contains("\"Paris\""), "{s}");
+    // --graph puts every quad into one graph, and a mapping's own graph maps conflict
+    expect(
+        d,
+        &[
+            "load",
+            "--loc",
+            "db2",
+            "--mapping",
+            "map.yml",
+            "--graph",
+            "urn:g",
+        ],
+        0,
+    );
+    let o = expect(
+        d,
+        &[
+            "query",
+            "--loc",
+            "db2",
+            "ASK { GRAPH <urn:g> { ?p <http://ex.org/city> ?c } }",
+        ],
+        0,
+    );
+    assert_eq!(out(&o).trim(), "yes");
+    let graphed = YARRRML.replace(
+        "    s: ex:city/$(id)\n",
+        "    s: ex:city/$(id)\n    graphs: ex:other\n",
+    );
+    std::fs::write(d.join("graphed.yml"), graphed).unwrap();
+    let o = expect(
+        d,
+        &[
+            "load",
+            "--loc",
+            "db2",
+            "--mapping",
+            "graphed.yml",
+            "--graph",
+            "urn:g",
+        ],
+        1,
+    );
+    assert!(err(&o).contains("mapping-graph-conflict"), "{}", err(&o));
 }
 
 #[test]

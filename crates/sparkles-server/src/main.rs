@@ -3328,7 +3328,10 @@ fn run() -> Result<()> {
                     snapshot,
                 }
             });
-            // tables become temporary N-Triples files, kept until the load is done
+            // tables become temporary N-Triples files, kept until the load is done, and
+            // a mapping's quads go into --graph when it is given
+            let mut csv = csv;
+            csv.graph = graph.clone();
             let prepared = csv_cmd::prepare(&files, &csv, lookup)?;
             let files = &prepared.files;
             // the term checks read the files once before anything is written
