@@ -201,7 +201,7 @@
       {:else}
         <span class="faint">No value</span>
       {/each}
-      {#if field.truncated}<span class="faint small">More values are not listed.</span>{/if}
+      {#if field.truncated}<span class="faint small">Some values are not shown.</span>{/if}
     </div>
   {:else if group === 'checks'}
     <fieldset class="ff-set" aria-describedby={describedby}>
@@ -269,7 +269,7 @@
           {#if e.readOnly && e.term}
             <div class="ro-value" id={inputId(i)} tabindex="-1" aria-describedby="{inputId(i)}-ro">
               <TermView term={e.term} {prefixes} />
-              <span class="faint small" id="{inputId(i)}-ro">in a graph you cannot write</span>
+              <span class="faint small" id="{inputId(i)}-ro">in a graph you cannot write to</span>
             </div>
           {:else if widget === 'select' && options.length}
             <select
@@ -444,7 +444,7 @@
   {/if}
   {#if noted.length && editable}
     <p class="faint small">
-      The server checks the pattern {noted.join(', ')}, which the browser cannot compile.
+      The server checks the pattern {noted.join(', ')} when you save.
     </p>
   {/if}
 </div>

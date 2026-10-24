@@ -153,7 +153,7 @@ test('stale inferences say so above the tree', async ({ page, request }) => {
   const at = await edgeOn(page, 'alice', 'Manager');
   await page.mouse.click(at.x, at.y);
   await expect(panel(page).getByRole('note')).toContainText(
-    /The inferences are stale: this tree explains the closure as it was computed at commit \d+\. 1 commit since\./,
+    /These inferences are out of date\. This tree shows them as computed at commit \d+\. 1 commit since\./,
   );
 });
 
@@ -183,7 +183,7 @@ test('at a past state Why? says that it explains the latest commit', async ({ pa
   });
   await why.click();
   await expect(panel(page).getByRole('status')).toContainText(
-    'Why? explains the inferences of the latest commit',
+    'Why? explains inferences at the latest commit only.',
   );
   await expect(panel(page).getByRole('tree')).toHaveCount(0);
   await expect(panel(page).getByRole('button', { name: 'Show on graph' })).toBeDisabled();
@@ -247,7 +247,7 @@ test('Expand refuses a subtree from inferences computed since the tree was read'
   const tree = panel(page).getByRole('tree', { name: 'Derivation' });
   await expect(tree.locator('li.ref')).toHaveCount(1);
   await panel(page).getByRole('button', { name: 'Expand' }).click();
-  await expect(panel(page).getByRole('status')).toContainText('The inferences changed');
+  await expect(panel(page).getByRole('status')).toContainText('The inferences have changed.');
   // the cut node stays cut, and nothing from the later run joins the tree
   await expect(tree.locator('li.ref')).toHaveCount(1);
   await expect(tree.locator('li.asserted')).toHaveCount(0);
@@ -267,9 +267,7 @@ test('a triple with no visible derivation says only that', async ({ page }) => {
   await open(page, 'why1');
   const at = await edgeOn(page, 'alice', 'Manager');
   await page.mouse.click(at.x, at.y);
-  await expect(panel(page).getByRole('status')).toHaveText(
-    'No derivation from facts you can read was found.',
-  );
+  await expect(panel(page).getByRole('status')).toHaveText('No derivation found.');
   await expect(panel(page).getByRole('tree')).toHaveCount(0);
 });
 

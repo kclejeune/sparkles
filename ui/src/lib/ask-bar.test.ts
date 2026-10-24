@@ -77,7 +77,7 @@ describe('the step indicator', () => {
       }),
     ).toBe('Asking large');
     expect(ev({ event: 'run', data: { attempt: 1, rows: 0 } })).toBe(
-      'Looking for what matched nothing',
+      'Checking why nothing matched',
     );
     expect(
       ev({

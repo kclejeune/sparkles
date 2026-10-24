@@ -111,9 +111,9 @@
   onDestroy(stopAll);
 
   const CHANGED =
-    'The inferences changed since this tree was read. Close Why? and open it again to see the current derivation.';
+    'The inferences have changed. Close Why? and open it again to see the current derivation.';
   const PAST =
-    "Why? explains the inferences of the latest commit. Move the time slider to the latest commit to see this edge's derivation.";
+    'Why? explains inferences at the latest commit only. Move the time slider to the latest commit to see how this edge was derived.';
   const explanation = $derived(result?.ok ? result.explanation : null);
   const tree = $derived(trees[index] ?? null);
   const stale = $derived(explanation ? staleNote(explanation) : null);
