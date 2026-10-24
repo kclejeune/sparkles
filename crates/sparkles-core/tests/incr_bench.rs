@@ -264,3 +264,51 @@ fn commit_path_without_views() {
     }
     drop(live);
 }
+
+/// Where a pass's time goes: reading the changes, building the snapshot before them,
+/// and the circuit's own work.
+#[test]
+#[ignore]
+fn pass_breakdown() {
+    use sparkles_core::incr::{Circuit, DeltaSet, compile};
+    use sparkles_core::task::Control;
+    let n = people();
+    let s = store(n, None);
+    println!("| view | read µs | old µs | advance µs |");
+    println!("|---|---|---|---|");
+    for (name, q) in VIEWS {
+        let parsed = sparql::parse_query(&format!("{PREFIX}{q}"), None, &[]).unwrap();
+        let mut c = Circuit::new(compile(&parsed, None).unwrap(), None);
+        c.build(s.snapshot(), &Control::none()).unwrap();
+        let _sub = s.subscribe_deltas();
+        let (mut read, mut old, mut adv) = (Vec::new(), Vec::new(), Vec::new());
+        for i in 0..200 {
+            let f = fresh();
+            let who = (f * 7919) % n;
+            let u = match i % 3 {
+                0 => format!(
+                    "INSERT DATA {{ :new{f} :memberOf :t{} . :new{f} :age 33 }}",
+                    who % 50
+                ),
+                1 => format!("INSERT DATA {{ :new{f} :knows :p{who} . :p{who} :knows :new{f} }}"),
+                _ => format!("DELETE WHERE {{ :p{who} :memberOf ?t }}"),
+            };
+            upd(&s, &u);
+            let t = Instant::now();
+            let d = DeltaSet::read(&s, c.applied, &Control::none());
+            read.push(t.elapsed().as_secs_f64() * 1e6);
+            let t = Instant::now();
+            d.old().unwrap();
+            old.push(t.elapsed().as_secs_f64() * 1e6);
+            let t = Instant::now();
+            c.advance(&d, &Control::none()).unwrap();
+            adv.push(t.elapsed().as_secs_f64() * 1e6);
+        }
+        println!(
+            "| {name} | {:.1} | {:.1} | {:.1} |",
+            pct(&mut read, 0.5),
+            pct(&mut old, 0.5),
+            pct(&mut adv, 0.5)
+        );
+    }
+}
