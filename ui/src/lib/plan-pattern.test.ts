@@ -5,7 +5,14 @@
 import { existsSync, readFileSync } from 'node:fs';
 import { describe, expect, it } from 'vitest';
 import type { PlanNode } from './api';
-import { drawing, type PatternAnswer, type PatternOk } from './pattern';
+import {
+  drawing,
+  filtersOf,
+  hash,
+  normalized,
+  type PatternAnswer,
+  type PatternOk,
+} from './pattern';
 import {
   badge,
   filterLabel,
@@ -126,12 +133,38 @@ describe('terms in the server form', () => {
     expect(literalNt('"a \\"b\\""', p)).toBe('"a \\"b\\""');
     expect(literalNt('"x"^^nope:t', p)).toBeNull();
   });
+  it('escapes controls as OxRDF does', () => {
+    expect(literalNt('"a\\tb"', p)).toBe('"a\\tb"');
+    expect(literalNt('"a\\bb\\fc"', p)).toBe('"a\\bb\\fc"');
+    expect(literalNt('"\\u0001\\u007f"', p)).toBe('"\\u0001\\u007F"');
+    expect(literalNt("'''a\nb'''", p)).toBe('"a\\nb"');
+    expect(literalNt('"a\\\\b"', p)).toBe('"a\\\\b"');
+  });
+  it('reads boolean keywords in any case', () => {
+    const X = 'http://www.w3.org/2001/XMLSchema#';
+    expect(literalNt('TRUE', p)).toBe(`"true"^^<${X}boolean>`);
+    expect(literalNt('False', p)).toBe(`"false"^^<${X}boolean>`);
+  });
+  it('resolves a datatype against BASE and undoes its escapes', () => {
+    const X = 'http://www.w3.org/2001/XMLSchema#';
+    const b = { prologue: { ...p.prologue, base: 'http://ex.org/a/' } } as PatternOk;
+    expect(literalNt('"x"^^<dt>', b)).toBe('"x"^^<http://ex.org/a/dt>');
+    expect(literalNt('"x"^^<../dt>', b)).toBe('"x"^^<http://ex.org/dt>');
+    expect(literalNt('"x"^^<http://e.org/\\u0041>', b)).toBe('"x"^^<http://e.org/A>');
+    expect(literalNt('"x"^^xsd:a\\.b', b)).toBe(`"x"^^<${X}a.b>`);
+  });
   it('writes paths as the engine does', () => {
     const iri = (l: string) => ({ kind: 'iri' as const, text: `ex:${l}`, iri: `${EX}${l}` });
     expect(pathNt({ kind: 'mod', op: '+', item: iri('partOf') })).toBe(`<${EX}partOf>+`);
     expect(pathNt({ kind: 'mod', op: '{1, 3}', item: iri('a') })).toBe(`<${EX}a>{1,3}`);
     expect(pathNt({ kind: 'mod', op: '{,3}', item: iri('a') })).toBe(`<${EX}a>{0,3}`);
     expect(pathNt({ kind: 'mod', op: '{2}', item: iri('a') })).toBe(`<${EX}a>{2}`);
+    expect(pathNt({ kind: 'mod', op: '{2,2}', item: iri('a') })).toBe(`<${EX}a>{2}`);
+    expect(pathNt({ kind: 'mod', op: '{01,02}', item: iri('a') })).toBe(`<${EX}a>{1,2}`);
+    expect(pathNt({ kind: 'mod', op: '{007,}', item: iri('a') })).toBe(`<${EX}a>{7,}`);
+    expect(pathNt({ kind: 'mod', op: '{18446744073709551615}', item: iri('a') })).toBe(
+      `<${EX}a>{18446744073709551615}`,
+    );
     expect(pathNt({ kind: 'alt', items: [iri('a'), iri('b')] })).toBe(`<${EX}a>|<${EX}b>`);
     expect(pathNt({ kind: 'inv', item: { kind: 'mod', op: '*', item: iri('a') } })).toBe(
       `^(<${EX}a>*)`,
@@ -218,7 +251,77 @@ describe.skipIf(!existsSync(built))('matching a plan with the pattern', async ()
       node('IndexScan', 5, 5, { patterns: [{ ...pat('?p', 'name', '?n'), graph: `<${EX}g>` }] }),
     ]);
     const o = overlay(a, d, plan, true);
-    expect(o.unmatched.map((u) => u.pattern.p)).toEqual([`<${EX}rewritten>`]);
+    // a pattern inside GRAPH draws no edge, so it is listed with its graph
+    expect(o.unmatched.map((u) => [u.pattern.p, u.pattern.graph])).toEqual([
+      [`<${EX}rewritten>`, undefined],
+      [`<${EX}name>`, `<${EX}g>`],
+    ]);
+    expect(o.edges.get(edge(d, 'ex:name'))!.est).toBe(10);
+  });
+
+  it('lists the patterns of a GRAPH block, which draws no edges', () => {
+    const a = ok(`${P}SELECT * WHERE { GRAPH ?g { ?s ex:p ?o OPTIONAL { ?s ex:q ?v } } }`);
+    const d = drawing(a);
+    const plan = node('OptionalJoin', 1, 1, { joinVars: ['s', 'g'] }, [
+      node('IndexScan', 5, 5, { patterns: [{ ...pat('?s', 'p', '?o'), graph: '?g' }] }),
+      node('IndexScan', 6, 6, { patterns: [{ ...pat('?s', 'q', '?v'), graph: '?g' }] }),
+    ]);
+    const o = overlay(a, d, plan, true);
+    expect(o.unmatched.map((u) => u.pattern.p)).toEqual([`<${EX}p>`, `<${EX}q>`]);
+  });
+
+  it('matches an inverse of a modified path with its ends swapped', () => {
+    const a = ok(`${P}SELECT * WHERE { ?u ^ex:partOf+ ?t . ?a ^ex:b* ?c }`);
+    const d = drawing(a);
+    const plan = node('Join', 1, 1, {}, [
+      node('TransitivePath', 7, 7, { patterns: [pat('?t', `<${EX}partOf>+`, '?u')] }),
+      node('TransitivePath', 8, 8, { patterns: [pat('?c', `<${EX}b>*`, '?a')] }),
+    ]);
+    const o = overlay(a, d, plan, true);
+    expect(o.unmatched).toEqual([]);
+    expect(o.edges.size).toBe(2);
+  });
+
+  it('leaves a chip unmapped rather than borrowing the numbers of another filter', () => {
+    const a = ok(
+      `${P}SELECT * WHERE { ?s ex:p ?n OPTIONAL { ?s ex:q ?m FILTER(?n > 0) } FILTER(?n < 2) }`,
+    );
+    const d = drawing(a);
+    // the optional's filter is its join's condition: only the outer one is a Filter
+    const plan = node('Filter', 3, 3, { filterVars: ['n'] }, [
+      node('OptionalJoin', 9, 9, { joinVars: ['s'] }, [
+        node('IndexScan', 9, 9, { patterns: [pat('?s', 'p', '?n')] }),
+        node('IndexScan', 4, 4, { patterns: [pat('?s', 'q', '?m')] }),
+      ]),
+    ]);
+    const o = overlay(a, d, plan, true);
+    const outer = filtersOf(a).find((f) => f.group === a.root)!.filter;
+    expect([...o.filters.keys()]).toEqual([`f:${hash(normalized(outer.text))}:0`]);
+    // two chips of the root group and one operator: the second chip shows nothing
+    const two = ok(`${P}SELECT * WHERE { ?s ex:p ?n FILTER(?n > 0) FILTER(?n < 2) }`);
+    const one = node('Filter', 3, 3, { filterVars: ['n'] }, [
+      node('IndexScan', 9, 9, { patterns: [pat('?s', 'p', '?n')] }),
+    ]);
+    expect(overlay(two, drawing(two), one, true).filters.size).toBe(1);
+  });
+
+  it('keeps every join on a variable, one badge each, in run order', () => {
+    const a = ok(
+      `${P}SELECT * WHERE { ?s ex:p ?a OPTIONAL { ?s ex:q ?b } OPTIONAL { ?s ex:r ?c } }`,
+    );
+    const d = drawing(a);
+    const plan = node('OptionalJoin', 1, 1, { joinVars: ['s'] }, [
+      node('OptionalJoin', 2, 2, { joinVars: ['s'] }, [
+        node('IndexScan', 3, 3, { patterns: [pat('?s', 'p', '?a')] }),
+        node('IndexScan', 4, 4, { patterns: [pat('?s', 'q', '?b')] }),
+      ]),
+      node('IndexScan', 5, 5, { patterns: [pat('?s', 'r', '?c')] }),
+    ]);
+    const o = overlay(a, d, plan, true);
+    expect(o.joins.map((j) => [j.n, j.op.id, j.drawnVars])).toEqual([
+      [1, '0.0', ['s']],
+      [2, '0', ['s']],
+    ]);
   });
 
   it('shares a star join between its edges and says so', () => {

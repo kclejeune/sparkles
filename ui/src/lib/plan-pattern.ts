@@ -7,8 +7,8 @@
 // plan's patterns that match nothing on the canvas, so that nothing is hidden.
 //
 // Matching is by the three terms after prefix expansion and by the occurrence index among
-// equal patterns. The parser writes a sequence of IRIs as its steps joined by a blank
-// node and an inverse IRI as the triple the other way round, so an edge with such a path
+// equal patterns. The parser writes a sequence as its steps joined by a blank node and an
+// outer inverse as the path inside it with its ends swapped, so an edge with such a path
 // is matched step by step.
 
 import { planOf, type CursorPlan, type PlanNode } from './api';
@@ -17,6 +17,7 @@ import {
   filtersOf,
   hash,
   normalized,
+  resolveIri,
   termKey,
   triplesOf,
   type Drawing,
@@ -113,17 +114,41 @@ function unescape(s: string): string {
   });
 }
 
+const ESCAPES: Record<string, string> = {
+  '\b': '\\b',
+  '\t': '\\t',
+  '\n': '\\n',
+  '\f': '\\f',
+  '\r': '\\r',
+  '"': '\\"',
+  '\\': '\\\\',
+};
+
+/** A string in quotes as OxRDF writes it in N-Triples (`print_quoted_str`). */
 function quote(s: string): string {
-  return `"${s.replace(/\\/g, '\\\\').replace(/"/g, '\\"').replace(/\n/g, '\\n').replace(/\r/g, '\\r')}"`;
+  // eslint-disable-next-line no-control-regex
+  const body = s.replace(/[\u0000-\u001f"\\\u007f\ufffe\uffff]/g, (c) => {
+    return ESCAPES[c] ?? `\\u${c.charCodeAt(0).toString(16).toUpperCase().padStart(4, '0')}`;
+  });
+  return `"${body}"`;
 }
 
-/** The IRI a prefixed name or `<iri>` stands for under the query's prefixes. */
+/** The IRI a prefixed name or `<iri>` stands for under the query's prefixes and BASE. */
 function expand(t: string, p: PatternOk): string | null {
-  if (t.startsWith('<') && t.endsWith('>')) return t.slice(1, -1);
+  if (t.startsWith('<') && t.endsWith('>')) {
+    const iri = t
+      .slice(1, -1)
+      .replace(/\\u([0-9a-fA-F]{4})|\\U([0-9a-fA-F]{8})/g, (_, a?: string, b?: string) =>
+        String.fromCodePoint(parseInt(a ?? b!, 16)),
+      );
+    return resolveIri(iri, p.prologue.base);
+  }
   const i = t.indexOf(':');
   if (i < 0) return null;
-  const pre = p.prologue.prefixes.find((x) => x.prefix === t.slice(0, i));
-  return pre ? pre.iri + t.slice(i + 1) : null;
+  // a later declaration of the same prefix wins, as in the parser
+  const pre = p.prologue.prefixes.filter((x) => x.prefix === t.slice(0, i)).pop();
+  // a local name's backslash escapes stand for the character after them
+  return pre ? pre.iri + t.slice(i + 1).replace(/\\(.)/g, '$1') : null;
 }
 
 /** A literal as written in SPARQL, as the server writes it in N-Triples, or null. */
@@ -132,7 +157,7 @@ export function literalNt(text: string, p: PatternOk): string | null {
   if (/^[+-]?\d+$/.test(t)) return `"${t}"^^<${XSD}integer>`;
   if (/^[+-]?\d*\.\d+$/.test(t)) return `"${t}"^^<${XSD}decimal>`;
   if (/^[+-]?(\d+\.?\d*|\.\d+)[eE][+-]?\d+$/.test(t)) return `"${t}"^^<${XSD}double>`;
-  if (t === 'true' || t === 'false') return `"${t}"^^<${XSD}boolean>`;
+  if (/^(true|false)$/i.test(t)) return `"${t.toLowerCase()}"^^<${XSD}boolean>`;
   const m = /^("""[\s\S]*"""|'''[\s\S]*'''|"(?:[^"\\]|\\.)*"|'(?:[^'\\]|\\.)*')(.*)$/.exec(t);
   if (!m) return null;
   const q = m[1];
@@ -164,15 +189,19 @@ export function termNt(t: Term, p: PatternOk): string | null {
 }
 
 /** A range modifier in the server's form: `{2}`, `{1,3}` or `{0,}`. */
-function rangeOp(op: string): string {
+export function rangeOp(op: string): string {
   const m = /^\{\s*(\d*)\s*(,?)\s*(\d*|\*|\+)?\s*\}$/.exec(op);
   if (!m) return op.replace(/\s+/g, '');
   const [, a, comma, b] = m;
   if (b === '*' && !a) return '{0,}';
   if (b === '+' && !a) return '{1,}';
-  const min = a || '0';
+  // the bounds as numbers, which have no leading zeros and may pass 2^53
+  const num = (x: string) => BigInt(x).toString();
+  const min = num(a || '0');
   if (!comma) return `{${min}}`;
-  return b ? `{${min},${b}}` : `{${min},}`;
+  if (!b) return `{${min},}`;
+  const max = num(b);
+  return max === min ? `{${min}}` : `{${min},${max}}`;
 }
 
 /** A path as the server writes it in `patterns` (see `path_text` in the engine). */
@@ -207,14 +236,18 @@ export function stepsOf(t: Placed, p: PatternOk): string[] | null {
   if (pr.kind === 'var') return [`${s} ?${pr.value} ${o}`];
   const path = pr.path;
   if (!path) return null;
-  if (path.kind === 'seq' && path.items.every((x) => x.kind === 'iri')) {
-    const items = path.items as { kind: 'iri'; iri: string }[];
-    return items.map(
-      (x, i) => `${i === 0 ? s : '?_'} <${x.iri}> ${i === items.length - 1 ? o : '?_'}`,
-    );
-  }
-  if (path.kind === 'inv' && path.item.kind === 'iri') return [`${o} <${path.item.iri}> ${s}`];
-  return [`${s} ${pathNt(path)} ${o}`];
+  // as the parser splits a path: an IRI is a triple, an inverse swaps the ends of the path
+  // inside it, a sequence is its steps joined by blank nodes, and the rest stay whole
+  const out: string[] = [];
+  const split = (a: string, e: PathExpr, b: string) => {
+    if (e.kind === 'iri') out.push(`${a} <${e.iri}> ${b}`);
+    else if (e.kind === 'inv') split(b, e.item, a);
+    else if (e.kind === 'seq')
+      e.items.forEach((x, i) => split(i === 0 ? a : '?_', x, i === e.items.length - 1 ? b : '?_'));
+    else out.push(`${a} ${pathNt(e)} ${b}`);
+  };
+  split(s, path, o);
+  return out;
 }
 
 // ----------------------------------------------------------------- the overlay ------
@@ -297,8 +330,10 @@ export function overlay(
   const byPattern = new Map<string, { op: Op; pattern: PlanPattern }[]>();
   for (const op of ops)
     for (const pattern of op.node.patterns ?? []) {
-      if (pattern.graph) continue;
-      const k = `${keyOf(pattern)} #${pattern.occurrence}`;
+      // a pattern inside GRAPH is in a locked block, which draws no edge for it: its key
+      // names the graph so that it never matches, and it is listed with the unmatched
+      const g = pattern.graph ? ` @${pattern.graph}` : '';
+      const k = `${keyOf(pattern)}${g} #${pattern.occurrence}`;
       const list = byPattern.get(k) ?? [];
       list.push({ op, pattern });
       byPattern.set(k, list);
@@ -350,23 +385,24 @@ export function overlay(
     have.push(stat(list));
     classes.set(id, have);
   }
-  // filters: the filter operator with the fewest variables that holds all of the chip's
+  // filters: a chip of the root group takes the unused filter operator with the fewest
+  // variables that holds all of its own. A filter in an OPTIONAL becomes its join's
+  // condition, and one in a nested group may be planned anywhere, so their chips and a
+  // chip with no unused operator left show no numbers rather than another's.
   const filterOps = ops.filter((o) => o.node.filterVars?.length && o.node.operator === 'Filter');
   const used = new Set<Op>();
   const filters = new Map<string, FilterStat>();
   const fseen = new Map<string, number>();
-  for (const { filter } of filtersOf(a)) {
+  for (const { filter, group } of filtersOf(a)) {
     const fh = hash(normalized(filter.text));
     const fn = fseen.get(fh) ?? 0;
     fseen.set(fh, fn + 1);
-    if (!filter.vars.length) continue;
+    if (!filter.vars.length || group.range.from !== a.root?.range.from) continue;
     const fits = filterOps
-      .filter((o) => filter.vars.every((v) => o.node.filterVars!.includes(v)))
+      .filter((o) => !used.has(o) && filter.vars.every((v) => o.node.filterVars!.includes(v)))
       .sort(
         (x, y) =>
-          Number(used.has(x)) - Number(used.has(y)) ||
-          x.node.filterVars!.length - y.node.filterVars!.length ||
-          ops.indexOf(x) - ops.indexOf(y),
+          x.node.filterVars!.length - y.node.filterVars!.length || ops.indexOf(x) - ops.indexOf(y),
       );
     const op = fits[0];
     if (!op) continue;

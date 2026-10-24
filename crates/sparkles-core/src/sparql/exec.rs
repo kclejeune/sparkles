@@ -609,8 +609,21 @@ fn node_refs(ctx: &Ctx, n: &Node) -> Option<Box<PlanRefs>> {
             }
             Kind::Filter(exprs) => exprs.iter().for_each(|e| e.vars(&mut filter_vars)),
             Kind::Join { keys, .. } => join_vars.extend_from_slice(keys),
-            Kind::CountJoin { var, .. } | Kind::CountJoinRuns { var } => join_vars.push(*var),
-            Kind::LeftJoin { .. }
+            Kind::PatternCount(spec) => {
+                if let Some(p) = &spec.src {
+                    patterns.push(p.clone());
+                }
+            }
+            Kind::PatternScan(spec) => {
+                if let Some(p) = &spec.src {
+                    patterns.push(p.clone());
+                }
+            }
+            // the variable a count join holds is the count's: the key is what its two
+            // inputs share
+            Kind::CountJoin { .. }
+            | Kind::CountJoinRuns { .. }
+            | Kind::LeftJoin { .. }
             | Kind::KeyedLeftJoin { .. }
             | Kind::Minus
             | Kind::HalfJoin { .. }
@@ -647,7 +660,9 @@ fn node_refs(ctx: &Ctx, n: &Node) -> Option<Box<PlanRefs>> {
         | Kind::LeftJoin { .. }
         | Kind::KeyedLeftJoin { .. }
         | Kind::Minus
-        | Kind::HalfJoin { .. } => of(ctx, n),
+        | Kind::HalfJoin { .. }
+        | Kind::PatternCount(_)
+        | Kind::PatternScan(_) => of(ctx, n),
         _ => None,
     }
 }

@@ -2208,11 +2208,18 @@ impl<'a> Planner<'a> {
             Some(i) => i.cost + i.est,
             None => est + uses.corr.touched.len() as f64,
         };
+        let src = self.source_pattern(
+            source_term(&shape.triple.subject),
+            source_named(&shape.triple.predicate),
+            source_term(&shape.triple.object),
+            g,
+        );
         let spec = PatternCountSpec {
             uses,
             subject: input.as_ref().map(|_| s),
             pred: p,
             counts,
+            src: Some(src),
         };
         let mut n = Node::leaf(Kind::PatternCount(Box::new(spec)), vars, est, desc);
         n.cost = cost;
@@ -2256,6 +2263,12 @@ impl<'a> Planner<'a> {
             }
             return Ok(Node::empty(vars));
         }
+        let src = self.source_pattern(
+            source_term(&t.subject),
+            source_named(&t.predicate),
+            source_term(&t.object),
+            g,
+        );
         let s = self.term_pattern(&t.subject);
         let p = self.term_pattern(&t.object);
         let mut vars = Vec::new();
@@ -2299,6 +2312,7 @@ impl<'a> Planner<'a> {
                 uses,
                 s: end(s),
                 p: end(p),
+                src: Some(src.clone()),
             };
             let mut n = Node::leaf(Kind::PatternScan(Box::new(spec)), vars.clone(), est, desc);
             n.sorted = match (s, p) {
@@ -2322,7 +2336,7 @@ impl<'a> Planner<'a> {
         let sub = vec![Item::Triple(Triple {
             t: [s, p, o],
             graph: g.clone(),
-            src: None,
+            src: Some(src),
         })];
         let node = self.plan_group(sub, Vec::new())?;
         if let ActiveGraph::Var(gv) = g

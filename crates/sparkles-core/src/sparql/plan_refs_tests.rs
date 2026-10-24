@@ -224,6 +224,73 @@ fn paths_are_written_whole_on_the_operators_that_read_them() {
     // the parser writes an inverse IRI as the triple the other way round
     let j = explained(&s, "SELECT * WHERE { ?u ^ex:partOf ?t }");
     assert_eq!(texts(&j), vec![format!("?t {} ?u #0", iri("partOf"))]);
+    // and any outer inverse, with the path inside it kept
+    let j = explained(&s, "SELECT * WHERE { ?u ^ex:partOf+ ?t }");
+    assert_eq!(texts(&j), vec![format!("?t {}+ ?u #0", iri("partOf"))]);
+}
+
+#[test]
+fn count_joins_name_the_variable_they_join_on() {
+    let s = people();
+    for q in [
+        "SELECT (COUNT(*) AS ?c) WHERE { ?s ex:team ?t . ?s ex:name ?n }",
+        "SELECT ?t (COUNT(*) AS ?c) WHERE { ?s ex:team ?t . ?s ex:name ?n } GROUP BY ?t",
+    ] {
+        for j in [explained(&s, q), ran(&s, q)] {
+            let joins: Vec<&Value> = nodes(&j)
+                .into_iter()
+                .filter(|n| {
+                    n["operator"]
+                        .as_str()
+                        .is_some_and(|o| o.starts_with("CountJoin"))
+                })
+                .collect();
+            for n in &joins {
+                assert_eq!(n["joinVars"], serde_json::json!(["s"]), "{q}: {j:#}");
+            }
+            if q.contains("GROUP BY") {
+                continue;
+            }
+            assert!(!joins.is_empty(), "a count join in {j:#}");
+        }
+    }
+}
+
+#[test]
+fn predicate_pattern_operators_name_their_pattern() {
+    let s = people();
+    assert!(s.snapshot().generation.patterns.file.is_some());
+    let q = "SELECT ?p (COUNT(DISTINCT ?s) AS ?n) WHERE { ?s ?p ?o } GROUP BY ?p";
+    let j = ran(&s, q);
+    let p = patterns(&j);
+    assert_eq!(
+        p,
+        vec![("PatternCount".to_string(), "?s ?p ?o #0".to_string())],
+        "{j:#}"
+    );
+    let q = "PREFIX spk: <urn:x-sparkles:> SELECT ?s ?p WHERE { ?s spk:hasPredicate ?p }";
+    let j = ran(&s, q);
+    let p = patterns(&j);
+    assert_eq!(
+        p,
+        vec![(
+            "PatternScan".to_string(),
+            "?s <urn:x-sparkles:hasPredicate> ?p #0".to_string()
+        )],
+        "{j:#}"
+    );
+    // without the patterns, the scan that answers it names the same triple
+    let off = QueryOptions {
+        optimizations: Some(Optimizations::ALL.disable("predicate_patterns").unwrap()),
+        ..opts()
+    };
+    let r = query(s.snapshot(), q, &off).unwrap();
+    let j = serde_json::to_value(&r.plan).unwrap();
+    assert_eq!(
+        texts(&j),
+        vec!["?s <urn:x-sparkles:hasPredicate> ?p #0".to_string()],
+        "{j:#}"
+    );
 }
 
 #[test]

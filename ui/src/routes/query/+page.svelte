@@ -224,26 +224,34 @@
   $effect(() => save(PLAN_PATTERN_KEY, planOnPattern));
   let planSel = $state<string | null>(null);
   let planHover = $state<string | null>(null);
-  /** The plan of the active tab's outcome and the text it is of, when there is one. */
+  /** Where a result's plan ran: its commit, or the head, and its branch. */
+  function resultHeader(o: Outcome): string {
+    const c = o.result?.meta.commit;
+    return `${typeof c === 'number' ? `commit ${c}` : 'the head'}${o.branch ? ` on ${o.branch}` : ''}`;
+  }
+  /** The plan of the active tab's outcome and the text it is of, when there is one: the
+   * explanation when the Explain view is open or there is no result's plan, since an
+   * Explain keeps the result of the run before it, and else the result's. */
   const planSource = $derived.by(() => {
     const o = outcomes[activeId];
     if (!o) return null;
-    const branchNote = o.branch ? ` on ${o.branch}` : '';
-    if (o.result?.meta?.plan && o.query) {
-      const c = o.result.meta.commit;
+    const explained = !!(o.explain?.plan && o.explainQuery);
+    const ran = !!(o.result?.meta?.plan && o.query);
+    if (explained && (o.view === 'explain' || !ran))
       return {
-        plan: o.result.meta.plan,
-        text: o.query,
-        executed: true,
-        header: `${typeof c === 'number' ? `commit ${c}` : 'the head'}${branchNote}`,
-      };
-    }
-    if (o.explain?.plan && o.explainQuery)
-      return {
-        plan: o.explain.plan,
-        text: o.explainQuery,
+        kind: 'explain' as const,
+        plan: o.explain!.plan,
+        text: o.explainQuery!,
         executed: false,
-        header: `the head${branchNote}`,
+        header: `the head${o.branch ? ` on ${o.branch}` : ''}`,
+      };
+    if (ran)
+      return {
+        kind: 'result' as const,
+        plan: o.result!.meta.plan!,
+        text: o.query!,
+        executed: true,
+        header: resultHeader(o),
       };
     return null;
   });
@@ -253,11 +261,12 @@
     planSel = null;
     planHover = null;
   });
-  /** Show an operator in the plan tree: the Plan tab with it selected (the phone's sheet). */
-  function showInPlan(id: string) {
+  /** Show an operator in the plan tree it comes from, the Explain view's or the Plan tab's,
+   * with it selected (the phone's sheet). */
+  function showInPlan(id: string, kind = planSource?.kind) {
     planSel = id;
     const o = outcomes[activeId];
-    if (o) o.view = o.explain && !o.result ? 'explain' : 'plan';
+    if (o && kind) o.view = kind === 'explain' ? 'explain' : 'plan';
   }
 
   /** Alt+P: open the pane and focus it, or move focus back to the editor, or close it. */
@@ -3443,10 +3452,10 @@
                   plan={drawPlan ? r.meta.plan : null}
                   planText={outcome.query}
                   planExecuted
-                  planHeader={planSource?.header ?? null}
+                  planHeader={resultHeader(outcome)}
                   planSelected={planHover ?? planSel}
                   onplanselect={(id) => (planSel = id)}
-                  onshowplan={isPhone ? showInPlan : undefined}
+                  onshowplan={isPhone ? (id) => showInPlan(id, 'result') : undefined}
                   planSwitch={r.meta.plan
                     ? { on: planOnPattern, set: (on) => (planOnPattern = on) }
                     : null}

@@ -7779,9 +7779,9 @@ and no spaces, such as `<http://example.org/partOf>+` or
 patterns of the query, counted from 0 in query order. These members carry only terms that
 the query itself contains, so a caller whose view C12 limits learns nothing new from
 them. The UI uses them to draw the plan on the query's pattern graph. The parser writes a
-sequence of IRIs such as `ex:a/ex:b` as its steps joined by a blank node, so each step is a
-pattern of its own with `?_` between them. It writes an inverse IRI such as `^ex:a` as the
-triple the other way round. Any other path that the planner splits into operators, such as
+sequence such as `ex:a/ex:b` as its steps joined by a blank node, so each step is a
+pattern of its own with `?_` between them. It writes an outer inverse such as `^ex:a` or
+`^ex:a+` as the path inside it with the subject and object swapped. Any other path that the planner splits into operators, such as
 an alternative, lists the whole path on each of them.
 
 A query that a budget or its timeout stopped answers with its error as before. In the

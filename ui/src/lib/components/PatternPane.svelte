@@ -246,8 +246,12 @@
 
   /** Show each operator's own time in place of its rows (`T`). */
   let planTime = $state(false);
+  /** Time shows only for a plan that ran: an estimate has no times to show. */
+  const showTime = $derived(planTime && planExecuted);
   /** the element under the pointer or the focus, for a join badge's highlight */
   let hovered = $state<string | null>(null);
+  /** the operator of the join badge `J` moved to, of the hovered node */
+  let activeJoin = $state<string | null>(null);
   let notDrawnOpen = $state(false);
 
   /** The plan matched with the drawing, when the pane draws the text the plan is of. */
@@ -290,7 +294,8 @@
   function opOf(m: Overlay, el: Focusable): string | null {
     if ('edge' in el) return m.edges.get(el.edge.id)?.op.id ?? null;
     const n = el.node;
-    const join = m.joins.find((j) => j.drawnVars.some((v) => n.id === `v:${v}`));
+    const joins = m.joins.filter((j) => j.drawnVars.some((v) => n.id === `v:${v}`));
+    const join = joins.find((j) => j.op.id === activeJoin) ?? joins[0];
     if (join) return join.op.id;
     for (const key of n.filters ?? []) {
       const f = m.filters.get(key);
@@ -302,6 +307,7 @@
   const canvasOverlay = $derived.by<CanvasOverlay | null>(() => {
     const m = planMatch;
     if (!m || !shown) return null;
+    const planTime = showTime;
     const o = { time: planTime, phone };
     const edges: CanvasOverlay['edges'] = {};
     for (const [id, st] of m.edges) {
@@ -357,20 +363,22 @@
         planTime && m.hot === st.op.id,
         `${st.op.node.operator}, ${spoken(st, planTime)}`,
       );
-    const joins: string[] = [];
+    const joins: CanvasOverlay['joins'] = [];
     for (const j of m.joins) {
       for (const v of j.drawnVars) {
         const id = `v:${v}`;
         const warn = !planTime && misestimate(j.op.node, m.executed) != null;
+        const said =
+          `join ${j.n}, ${j.op.node.operator} on ?${v}` +
+          (m.executed && j.op.node.actualRows >= 0 ? `, ${j.op.node.actualRows} rows` : '');
         add(
           id,
           badge(j, o, m.executed) + (warn ? ' ⚠' : ''),
           warn,
           planTime && m.hot === j.op.id,
-          `join ${j.n}, ${j.op.node.operator} on ?${v}` +
-            (m.executed && j.op.node.actualRows >= 0 ? `, ${j.op.node.actualRows} rows` : ''),
+          said,
         );
-        if (!joins.includes(id)) joins.push(id);
+        joins.push({ node: id, op: j.op.id, spoken: said });
       }
     }
     return { edges, nodes, joins };
@@ -381,9 +389,12 @@
   const planLit = $derived.by<string[] | null>(() => {
     const m = planMatch;
     if (!m) return null;
-    const hoverJoins = hovered
+    const onNode = hovered
       ? m.joins.filter((j) => j.drawnVars.some((v) => `v:${v}` === hovered))
       : [];
+    // the badge `J` is on, else every join on the node under the pointer
+    const active = onNode.filter((j) => j.op.id === activeJoin);
+    const hoverJoins = active.length ? active : onNode;
     if (hoverJoins.length)
       return [...new Set(hoverJoins.flatMap((j) => elementsUnder(m, j.op.id)))];
     if (planSelected) {
@@ -1099,7 +1110,14 @@
 
   /** The canvas's own keys on the focused element; the pane's keys bubble to `paneKey`. */
   function key(e: KeyboardEvent, el: Focusable | null) {
-    if (planMatch && !e.ctrlKey && !e.metaKey && !e.altKey && (e.key === 't' || e.key === 'T')) {
+    if (
+      planMatch &&
+      planExecuted &&
+      !e.ctrlKey &&
+      !e.metaKey &&
+      !e.altKey &&
+      (e.key === 't' || e.key === 'T')
+    ) {
       e.preventDefault();
       planTime = !planTime;
       live = planTime ? 'Showing each operator’s own time' : 'Showing rows';
@@ -1426,12 +1444,12 @@
           : ''}</span
       >
       <div class="seg" role="group" aria-label="Numbers on the pattern">
-        <button class="btn sm" aria-pressed={!planTime} onclick={() => (planTime = false)}
+        <button class="btn sm" aria-pressed={!showTime} onclick={() => (planTime = false)}
           >Rows</button
         >
         <button
           class="btn sm"
-          aria-pressed={planTime}
+          aria-pressed={showTime}
           disabled={!planExecuted}
           title="Each operator's own time (T)"
           onclick={() => (planTime = true)}>Time</button
@@ -1474,7 +1492,7 @@
                     self: u.op.self,
                     ratio: null,
                   },
-                  { time: planTime, phone },
+                  { time: showTime, phone },
                 )}</span
               ></button
             >
@@ -1550,6 +1568,7 @@
             overlay={canvasOverlay}
             lit={planLit}
             onhover={(id) => (hovered = id)}
+            onjoin={(op) => (activeJoin = op)}
           />
           {#if selected}
             <PatternPanel

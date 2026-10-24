@@ -14,8 +14,9 @@
       { text: string; width: number; warn: boolean; hot: boolean; spoken: string }
     >;
     nodes: Record<string, { lines: string[]; warn: boolean; hot: boolean; spoken: string }>;
-    /** the nodes with join badges, in the order the plan runs the joins, for `J` */
-    joins: string[];
+    /** the join badges in the order the plan runs them, for `J`: a variable with two
+     * badges is in the list twice, once for each join */
+    joins: { node: string; op: string; spoken: string }[];
   };
 </script>
 
@@ -43,6 +44,7 @@
     overlay = null,
     lit = null,
     onhover,
+    onjoin,
   }: {
     drawing: Drawing | null;
     /** the positions to keep, by key */
@@ -65,6 +67,8 @@
     lit?: string[] | null;
     /** the element under the pointer or the focus, or null */
     onhover?: (id: string | null) => void;
+    /** the operator of the join badge `J` moved to, or null when the focus leaves it */
+    onjoin?: (op: string | null) => void;
   } = $props();
 
   let host: HTMLDivElement;
@@ -74,6 +78,8 @@
   let settled = 0;
   /** The focused element, by its position in text order. */
   let focusAt = $state(-1);
+  /** The join badge `J` moved to, by its place in `overlay.joins`, or -1. */
+  let joinAt = -1;
   let announce = $state('');
   const order = $derived(drawing ? textOrder(drawing) : []);
 
@@ -693,12 +699,20 @@
     wrap?.focus();
   }
 
-  function focusEl(i: number) {
+  function focusEl(i: number, join = -1) {
     focusAt = i;
+    if (join !== joinAt) onjoin?.(join >= 0 ? (overlay?.joins[join]?.op ?? null) : null);
+    joinAt = join;
     const el = order[i];
     if (!el || !drawing) return;
     const id = 'node' in el ? el.node.id : el.edge.id;
-    const extra = 'node' in el ? overlay?.nodes[id]?.spoken : overlay?.edges[id]?.spoken;
+    // on a badge `J` moved to, that badge's join; elsewhere all the element's numbers
+    const extra =
+      join >= 0
+        ? overlay?.joins[join]?.spoken
+        : 'node' in el
+          ? overlay?.nodes[id]?.spoken
+          : overlay?.edges[id]?.spoken;
     announce = describe(el, drawing) + (extra ? `, ${extra}` : '');
     onhover?.(id);
     const c = cy?.getElementById(id);
@@ -788,14 +802,20 @@
       !e.altKey
     ) {
       e.preventDefault();
-      const ids = overlay.joins;
-      const cur = el && 'node' in el ? ids.indexOf(el.node.id) : -1;
-      const next =
-        cur < 0
-          ? ids[e.shiftKey ? ids.length - 1 : 0]
-          : ids[(cur + (e.shiftKey ? ids.length - 1 : 1)) % ids.length];
-      const i = order.findIndex((x) => 'node' in x && x.node.id === next);
-      if (i >= 0) focusEl(i);
+      const list = overlay.joins;
+      const id = el && 'node' in el ? el.node.id : null;
+      // on from the badge J is on; a node reached otherwise starts at its own first badge
+      const on = joinAt >= 0 && list[joinAt]?.node === id;
+      const own = list.findIndex((j) => j.node === id);
+      const k = on
+        ? (joinAt + (e.shiftKey ? list.length - 1 : 1)) % list.length
+        : own >= 0
+          ? own
+          : e.shiftKey
+            ? list.length - 1
+            : 0;
+      const i = order.findIndex((x) => 'node' in x && x.node.id === list[k].node);
+      if (i >= 0) focusEl(i, k);
       return;
     }
     onkey?.(e, el);
@@ -809,6 +829,8 @@
   function focusout(e: FocusEvent) {
     if (!wrap.contains(e.relatedTarget as Node | null)) {
       focusAt = -1;
+      if (joinAt >= 0) onjoin?.(null);
+      joinAt = -1;
       onhover?.(null);
     }
   }

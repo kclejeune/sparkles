@@ -174,6 +174,65 @@ test('A19: the editor pane hides the overlay once its text differs, and the resu
   await expect.poll(() => overlayOf(ran(page).locator('.pcanvas'))).toBeNull();
 });
 
+test('an Explain after a run draws its own estimates in the pane, and T leaves them', async ({
+  page,
+}) => {
+  await runAndOpenPattern(page);
+  await page.getByRole('button', { name: 'Pattern', exact: true }).first().click();
+  const pc = editorPane(page).locator('.pcanvas');
+  await expect.poll(() => edgeText(pc, 'foaf:knows')).toMatch(/rows 12,000/);
+  // another text, explained: the run's result stays, but the pane draws the explanation
+  await editor(page).click();
+  await page.keyboard.press('ControlOrMeta+End');
+  await page.keyboard.type(' OFFSET 1');
+  await expect(editorPane(page).getByTestId('plan-stale')).toBeVisible();
+  await page.getByRole('button', { name: 'Explain', exact: true }).click();
+  await expect(editorPane(page).getByTestId('plan-stale')).toHaveCount(0);
+  await expect.poll(() => edgeText(pc, 'foaf:knows')).toBe('est 400');
+  await expect(editorPane(page).getByTestId('plan-bar')).toContainText('Plan estimate');
+  // an estimate has no times, so T changes nothing
+  await pc.focus();
+  await page.keyboard.press('t');
+  await expect(editorPane(page).getByRole('button', { name: 'Time' })).toBeDisabled();
+  await expect(editorPane(page).getByRole('button', { name: 'Time' })).toHaveAttribute(
+    'aria-pressed',
+    'false',
+  );
+  await expect.poll(() => edgeText(pc, 'foaf:knows')).toBe('est 400');
+  // the result's own tab keeps the plan that ran
+  await results(page)
+    .getByRole('tab', { name: /Pattern/ })
+    .click();
+  await expect.poll(() => edgeText(ran(page).locator('.pcanvas'), 'foaf:knows')).toMatch(/⚠/);
+});
+
+test('J reaches each of two joins on one variable', async ({ page }) => {
+  await runAndOpenPattern(
+    page,
+    `PREFIX foaf: <http://xmlns.com/foaf/0.1/>
+SELECT * WHERE { ?a foaf:knows ?b . ?a foaf:name ?n . ?a foaf:mbox ?m }`,
+  );
+  const c = ran(page).locator('.pcanvas');
+  await expect.poll(() => edgeText(c, 'foaf:knows')).not.toBeNull();
+  const a = (await overlayOf(c))!.nodes.find((n) => n[0] === '?a');
+  expect(a?.[1].filter((l) => /HashJoin|MergeJoin/.test(l)).length).toBe(2);
+  const focus = ran(page).getByTestId('pattern-focus');
+  const lit = async () => (await overlayOf(c))?.lit?.filter((x) => x.startsWith('foaf:')).sort();
+  await c.focus();
+  await page.keyboard.press('j');
+  await expect(focus).toContainText('variable ?a');
+  await expect(focus).toContainText('join 1,');
+  await expect(focus).not.toContainText('join 2,');
+  await expect.poll(lit).toEqual(['foaf:knows', 'foaf:name']);
+  await page.keyboard.press('j');
+  await expect(focus).toContainText('variable ?a');
+  await expect(focus).toContainText('join 2,');
+  await expect.poll(lit).toEqual(['foaf:knows', 'foaf:mbox', 'foaf:name']);
+  // and round again
+  await page.keyboard.press('j');
+  await expect(focus).toContainText('join 1,');
+});
+
 test('a pattern the canvas does not draw is listed with its operator', async ({ page }) => {
   // a string literal's pattern matches no edge in the mock's plans
   await runAndOpenPattern(

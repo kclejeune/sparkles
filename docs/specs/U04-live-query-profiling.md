@@ -502,27 +502,39 @@ item 102, shipped on 2026-10-23.
 **Server.** Every plan node that reads triple patterns or paths lists them in `patterns`,
 and filters and joins list `filterVars` and `joinVars`, as §11.3 describes. The planner
 records each pattern's terms when it collects the pattern, so the scans, range scans,
-ordered top-k scans, spatial scans, counts from the index, index joins, star joins and
-paths built from it carry it, and the members are written when a plan node is described.
+ordered top-k scans, spatial scans, counts from the index, index joins, star joins,
+paths and the operators that read the predicate patterns built from it carry it, and the
+members are written when a plan node is described.
 Generated variables and blank nodes are `?_`. The occurrence index counts equal patterns as
 the planner meets them and wraps at the number of equal patterns in the parsed query, so a
 group that the planner plans once per named graph keeps the index of its text. Two
-behaviours of the parser shape the members. A sequence of IRIs such as `ex:a/ex:b` reaches
-the planner as its steps joined by a blank node, so each step is a pattern of its own with
-`?_` in the middle, and an inverse IRI `^ex:a` reaches it as the triple the other way
-round. Other paths are written whole in a form without spaces, which `path_text` defines
-and the browser reproduces. `joinVars` of an optional join, `MINUS`, a semi-join or an
-anti-join are the variables its two sides share. The members are in `/{ds}/explain`,
+behaviours of the parser shape the members. A sequence such as `ex:a/ex:b` reaches the
+planner as its steps joined by a blank node, so each step is a pattern of its own with
+`?_` in the middle. An outer inverse such as `^ex:a` or `^ex:a+` reaches it as the path
+inside it with the two ends swapped. Other paths are written whole in a form without
+spaces, which `path_text` defines and the browser reproduces. `joinVars` of an optional
+join, `MINUS`, a semi-join, an anti-join or a count join are the variables its two sides
+share. The members are in `/{ds}/explain`,
 `POST /{ds}/sparql/explain`, `meta.plan`, the plan of a budget error body and the
 OpenAPI description, and `planFormat` did not change. MCP's `explain_query` returns node
 facts rather than the plan, so it does not carry them.
 
 **Client.** `ui/src/lib/plan-pattern.ts` matches the plan with the drawing by the three
 terms and the occurrence, writing literals, prefixed names and paths of the pattern in
-the server's form. An edge with several operators, such as a sequence read by two scans,
+the server's form. A literal is escaped as OxRDF writes N-Triples, a boolean keyword in
+any case is written in lower case, a datatype IRI is resolved against `BASE` after its
+escapes are undone, and a range modifier has its bounds without leading zeros and one bound
+when both are equal. A pattern inside `GRAPH` is in a locked block and is always listed
+with the operators not drawn. An edge with several operators, such as a sequence read by two scans,
 shows the operator nearest the root and says how many read it. The Pattern pane draws the
 labels, widths and marks of §11.2, the filter rows, the join badges in run order and the
-list of operators not drawn. The Plan tab, the Pattern tab and the pane share one
+list of operators not drawn. Only a filter chip of the outer group takes a `Filter`
+operator's numbers, since a filter inside an `OPTIONAL` becomes its join's condition, and
+each operator serves one chip, so a chip shows nothing rather than another filter's rows.
+A variable with two join badges is two stops for `J`, which announces and lights the join
+it is on. The pane of the editor draws the explanation when the Explain view is open,
+because an Explain keeps the result of the run before it, and **Show in plan** goes to
+the tree the numbers came from. `T` works only on a plan that ran. The Plan tab, the Pattern tab and the pane share one
 **Plan on pattern** switch, and the Pattern tab puts the plan tree beside the drawing on a
 desktop, with selection and highlight both ways. `J`, `T`, the spoken numbers and the
 phone's sheet with **Show in plan** are as specified. A locked block shows numbers when it
@@ -547,4 +559,13 @@ patterns, star joins, sequences and inverses, filters, locked blocks, hidden est
 the hot operator and A20, whose 200 patterns match in well under 50 ms. The mock
 Playwright spec covers A14 to A16, A19, the keyboard, the list of operators not drawn and
 the 390 px sheet, and the real-server spec covers A14, A15 and A17.
+
+**Review.** The Codex review of the phase reported twelve findings, and all twelve were
+confirmed and fixed with a regression test each. Count joins named the aggregate rather
+than the join key, the predicate-pattern operators named no pattern, a filter chip in an
+`OPTIONAL` borrowed the outer filter's numbers, the pane preferred a retained result to a
+newer explanation, inverses of modified paths, literals with control characters, datatypes
+under `BASE`, boolean keywords in capitals and non-canonical ranges failed to match,
+patterns inside `GRAPH` vanished from the list, the second of two join badges on one
+variable had no keyboard stop, and `T` switched an estimate to empty times.
 
