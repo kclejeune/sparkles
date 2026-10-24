@@ -2119,6 +2119,48 @@ The embedding cell has no reader gate, and its worker called a deterministic loc
 The amended gates were written after this campaign, so the next forge run is the first to
 judge them without having seen its data.
 
+### Bounded full-text checkpoint on forge
+
+[Roadmap](ROADMAP.md) item 110 traced the background checkpoint of the full-text index on
+`forge` on 2026-10-24 with `scripts/bench-indexed-commit.py`, under the host's bench and
+heavy locks. Each run was the mixed scenario of the full-text cell at 1.05M, with one block
+of an ordinary, two grouped and an ordinary process at a fixed 500 transactions/s and two
+readers, and with the debug target `sparkles::text::checkpoint` passed to the server. Every
+release binary was built on `forge` before timing. Build A is e411a772 with only the trace
+added. Build B synchronizes only the files written since the last pass and follows a raced
+unlocked pass with a locked one at once. Build C first repeats the unlocked pass until at
+most 16 files are left. Build D, the one that shipped, repeats it until none are left and
+synchronizes a pass's files from eight threads. The table pools the two processes of each
+setting. A stall is a run of writes slower than 25 ms that starts within 1 s of the last.
+
+| Build | Setting | Locked passes | Lock held p50 (ms) | Lock held max (ms) | Unlocked pass p50 (ms) | Stalls | Longest write (ms) | Max schedule lag (ms) | Write p99 (ms) | Reader p99 (ms) |
+|---|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|
+| A | ordinary | 38 | 61.7 | 166.3 | 69.5 | 37 | 171.4 | 165.6, 162.3 | 9.87, 10.43 | 7.17, 7.33 |
+| A | grouped | 38 | 101.0 | 164.8 | 83.6 | 36 | 167.8 | 162.5, 159.6 | 6.76, 7.28 | 7.41, 6.88 |
+| B | ordinary | 37 | 24.2 | 48.4 | 77.3 | 24 | 88.3 | 81.5, 61.4 | 9.92, 9.90 | 7.40, 7.31 |
+| B | grouped | 36 | 35.4 | 54.0 | 80.4 | 32 | 71.3 | 63.4, 57.6 | 6.97, 7.06 | 7.42, 7.80 |
+| C | ordinary | 36 | 23.7 | 44.1 | 76.8 | 23 | 60.0 | 61.6, 52.0 | 9.77, 10.02 | 7.43, 7.28 |
+| C | grouped | 36 | 24.5 | 56.6 | 77.1 | 29 | 116.5 | 55.9, 110.0 | 6.69, 7.86 | 7.34, 7.32 |
+| D | ordinary | 0 | none | none | 27.7 | 0 | 19.5 | 31.0, 37.9 | 10.04, 9.41 | 7.69, 7.48 |
+| D | grouped | 0 | none | none | 31.8 | 0 | 18.6 | 10.1, 10.7 | 6.83, 6.70 | 7.51, 7.19 |
+
+The trace of build A confirms the cause. Every unlocked checkpoint was raced, every fourth
+tick held the live writer lock through a synchronization of every index file, about every
+5.3 s, and 106 of the 111 stalls of the six traced processes of build A lay inside such a
+tick. Synchronizing only the new files did not shorten the unlocked pass, because the
+segments that the readers' searches commit are merged away within seconds, so nearly every
+file in the directory is new at each tick. It did shorten the locked pass to the files of
+the unlocked pass before it. Each synchronization of a new file cost about 1.5 ms on its
+own, because each forced a journal commit, and the locked pass still held the lock for a
+median of 24 ms. Synchronizing eight files at once lets ext4 commit them together, which
+brought the unlocked pass from 77 to 28 or 32 ms. The repetitions then caught up, 76 of 111
+of them cleared the marker, and no tick of build D needed the lock for its I/O. The longest
+write fell from about 170 ms to under 20 ms in both settings, and build D met the 50 ms
+schedule lag in all four processes. Its reader p99 was 7.47 ms on average against 7.20 ms
+for build A, 3.8% higher over four processes each, which is within the spread of these
+runs but is followed up as [roadmap](ROADMAP.md) item 170, since eight synchronizing
+threads could compete with readers for the drive.
+
 ### Reader tail of group commit on forge
 
 Four writers and two readers ran against the 10.5M dataset on `forge` with its NVMe device,
