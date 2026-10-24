@@ -2308,6 +2308,15 @@ mod imp {
             self.inner.tick()
         }
 
+        /// Stop the live writer's segment merges, whose writes race a locked pass, so
+        /// that a crash test can count on such a pass clearing the marker.
+        #[cfg(feature = "failpoints")]
+        pub(crate) fn stop_merges_for_test(&self) {
+            if let Some(writer) = self.inner.live.lock().writer.as_ref() {
+                writer.set_merge_policy(Box::new(tantivy::indexer::NoMergePolicy));
+            }
+        }
+
         /// The background checkpoint passes that held the live writer lock, those of
         /// them that cleared the marker, and the background passes of any kind that
         /// cleared it.

@@ -189,12 +189,33 @@ fn child_writer() {
     if let Ok(arm) = std::env::var("SPARKLES_IO_ARM") {
         std::fs::write(arm, b"armed").unwrap();
     }
+    // In background mode merges are stopped, since a merge writes without the live
+    // writer lock and could race every locked pass, and the writers go on past their
+    // commits until a locked pass has cleared the marker, so that the images cover the
+    // marker removal of such a pass.
+    #[cfg(all(feature = "text", feature = "failpoints"))]
+    if background {
+        s.stop_text_merges_for_test();
+    }
+    fn locked_cleared(_s: &Store) -> bool {
+        #[cfg(all(feature = "text", feature = "failpoints"))]
+        {
+            _s.text_background_checkpoints_for_test()[1] > 0
+        }
+        #[cfg(not(all(feature = "text", feature = "failpoints")))]
+        {
+            true
+        }
+    }
     let out = Arc::new(Mutex::new(Vec::<String>::new()));
     let mut hs = Vec::new();
     for t in 1..=cfg.threads {
         let (s, ack, out, begin) = (s.clone(), ack.clone(), out.clone(), begin.clone());
         hs.push(std::thread::spawn(move || {
-            for k in 0..cfg.commits {
+            let more = |k: u32| {
+                k < cfg.commits || (background && k < cfg.commits * 10 && !locked_cleared(&s))
+            };
+            for k in (0..).take_while(|&k| more(k)) {
                 let designated = background && t == 1 && k == 0;
                 if designated {
                     let entered = PathBuf::from(std::env::var("SPARKLES_IO_SYNC_ENTERED").unwrap());
@@ -1199,10 +1220,10 @@ fn crash_images(name: &str, cfg: Config, text: bool, background: bool) {
         // Every pass synchronizes only the files written since a pass last synchronized
         // them, so the images after a pass cleared the marker check that nothing the
         // index refers to was left out. The reader's commits race the unlocked passes, so
-        // the locked pass that follows a run of raced ones runs too.
+        // a locked pass runs, and with merges stopped nothing can race it.
         assert!(
-            locked > 0 && cleared > 0,
-            "{name}: {locked} locked passes and {cleared} passes that cleared the marker"
+            locked_cleared > 0 && cleared >= locked_cleared,
+            "{name}: {locked} locked passes cleared the marker {locked_cleared} times"
         );
         assert!(
             overlaps > 0,

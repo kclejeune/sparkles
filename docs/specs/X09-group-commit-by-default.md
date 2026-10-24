@@ -1481,8 +1481,10 @@ every repetition with a publication, and requires the fourth tick to end in one 
 holds live and clears the marker, and the count to start again when a merge's write races
 that pass. The background crash fixture
 of `tests/power_loss.rs` runs a reader that searches throughout, so its commits race the
-unlocked passes, and it requires at least one locked second pass to clear the marker before
-it replays every crash image against the receipts and the recovered text.
+unlocked passes. It stops the index's segment merges, which write without the lock and
+could race every locked pass, and its writers go on past their commits until a locked pass
+has cleared the marker, so every recorded run contains such a removal. It then replays the
+crash images against the receipts and the recovered text.
 
 This change removes the background file-synchronization wait from the live writer
 lock. Tantivy publication can still occur inside a group leader's fence, and WAL
