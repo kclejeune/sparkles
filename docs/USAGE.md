@@ -4673,9 +4673,37 @@ The **Server** page of the web UI has a **Models** section for users with
 key can be read, and has a form to add a provider. Below it, the model configuration is
 a form with a group of fields for each provider, the role lists and the routing, with the
 same sources, locks, resets and **Use server config for all** as the dataset's Settings
-tab, and the whole runtime layer as JSON under **Advanced**. A provider has a **Remove**
-button unless the operator locked it or one of its fields, and a declared provider
-removed at runtime is listed with a **Use server config** button that brings it back.
+tab. A provider has a **Remove** button unless the operator locked it or one of its
+fields, and a declared provider removed at runtime is listed with a **Use server config**
+button that brings it back.
+
+The form is built from the `ModelsSettings` schema of the OpenAPI description, so each
+field has the label, help text, bounds and choices that the schema gives it, and a
+provider shows only the fields its protocol takes. Numbers have their units and limits,
+an enum such as the structured output level is a select that lists only the levels the
+protocol offers, and a boolean is a checkbox. The API key field names a secret and shows
+whether a key is stored under that name without showing the key, and **Set key** opens a
+password field for it. **Allowed models** is a list with buttons to add, move and remove
+a model, and it suggests the models that the provider's options, the role lists and the
+providers table name. **Per-model options** has a card per model with a typed field for
+each option, and an empty field shows the value the model inherits from the provider. A
+model that the server's configuration declares cannot be removed at runtime, so its card
+has no working **Remove** button. Extra headers of the openai protocol are rows of name
+and value. Each role list is a row per entry with a provider select, a model field with
+suggestions and the optional caps, and its entries can be moved up and down. A list that
+is not set says whether it falls back to another role's list or leaves the role off.
+
+Every field is checked as it is edited, and an error shows under the field it concerns,
+such as a temperature above 2, text in a token field or a role entry whose model the
+provider's allowed models do not include. **Save** sends nothing while a field has an
+error. When the server refuses a save, its answer names the field that fails, and the form
+shows the message under that field as well as above the **Save** button.
+
+**Advanced** shows the runtime layer as JSON, with the form's unsaved changes in it. An
+edit of the JSON shows in the form, and an edit of the form after it keeps what the JSON
+set, so either view can finish a change. Members that the form has no field for stay as
+they are when the form saves, and a member removed from the JSON goes back to the server
+config or the default.
 The **API keys** panel lists each secret and whether it is set. **Replace** opens a
 password field, and the key typed there is sent once and is not kept in the page. A
 runtime key over a declared one is marked "overrides server config" and has a **Use
@@ -4686,7 +4714,9 @@ key that the server generated beside the data, or kept unencrypted.
 `GET /$/server/settings/models` answers the effective configuration with the source of
 each field, as for a dataset's settings. A `PATCH` with `null` for a provider removes
 it, and `DELETE /$/server/settings/models?field=providers.NAME` brings a declared
-provider back. Only users with `server-admin` can use these routes. Requests to a
+provider back. A change that leaves the configuration invalid is refused with a `400`
+whose `field` names the field that fails, such as
+`providers.claude.models.claude-haiku-5-5.temperature`. Only users with `server-admin` can use these routes. Requests to a
 provider still pass through the outbound policy, so a provider on a private address,
 such as Ollama on the same host, needs `--outbound-allow-private`.
 

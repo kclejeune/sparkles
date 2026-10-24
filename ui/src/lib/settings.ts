@@ -151,6 +151,24 @@ export function setAt(obj: JsonObject, path: readonly string[], value: unknown) 
   });
 }
 
+/**
+ * A copy of the object `obj` with `value` at `path`, or without the member at `path`
+ * when `value` is undefined, in which case objects the removal leaves empty go too.
+ */
+export function withAt(obj: JsonObject, path: readonly string[], value: unknown): JsonObject {
+  const [k, ...rest] = path;
+  const out: JsonObject = { ...obj };
+  if (rest.length === 0) {
+    if (value === undefined) delete out[k];
+    else out[k] = value;
+    return out;
+  }
+  const inner = withAt(isObject(out[k]) ? (out[k] as JsonObject) : {}, rest, value);
+  if (Object.keys(inner).length === 0 && value === undefined) delete out[k];
+  else out[k] = inner;
+  return out;
+}
+
 export function deepEqual(a: unknown, b: unknown): boolean {
   if (a === b) return true;
   if (Array.isArray(a) && Array.isArray(b))
@@ -338,11 +356,28 @@ export async function resetFields(
 
 // --- form fields ---------------------------------------------------------------------
 
-export type FieldType = 'bool' | 'enum' | 'int' | 'number' | 'text' | 'lines' | 'json';
+export type FieldType =
+  | 'bool'
+  | 'enum'
+  | 'int'
+  | 'number'
+  | 'text'
+  | 'secret'
+  | 'lines'
+  | 'json'
+  | 'list'
+  | 'records'
+  | 'map'
+  | 'pairs';
+
+/** The types whose form value is JSON (an array or an object) rather than text. */
+export const STRUCTURED: readonly FieldType[] = ['list', 'records', 'map', 'pairs'];
+
+export const isStructured = (d: FieldDef) => STRUCTURED.includes(d.type);
 
 /** A field of a settings form. */
 export type FieldDef = {
-  /** The dotted path of the field. */
+  /** The dotted path of the field, or of a member of an entry for an entry's fields. */
   path: string;
   label: string;
   type: FieldType;
@@ -355,18 +390,43 @@ export type FieldDef = {
   /** `int` and `number`: the smallest and largest value. */
   min?: number;
   max?: number;
+  /** `number`: a value must be greater than this. */
+  above?: number;
+  /** `text`, `secret` and the entries of `list`: a regular expression the value matches. */
+  pattern?: string;
+  /** What a value that does not match `pattern` is told. */
+  patternText?: string;
+  /** `text`: the longest value. */
+  maxLength?: number;
+  /** A unit shown after the input, such as `seconds` or `tokens`. */
+  unit?: string;
   /** A field the server leaves unset by default: an empty input removes the value. */
   optional?: boolean;
   placeholder?: string;
   /** The heading of the group of fields the field belongs to. */
   group?: string;
+  /** A heading inside the group, shown before the first field of a run that has it. */
+  section?: string;
+  /** `records` and `map`: the fields of one entry, with paths inside the entry. */
+  entry?: FieldDef[];
+  /** `map` and `pairs`: a regular expression an entry's name matches. */
+  keyPattern?: string;
+  /** `map` and `pairs`: what an entry's name is called, such as `model` or `header`. */
+  keyLabel?: string;
+  /** `records`: the list used while the field is unset, in words. */
+  unsetText?: string;
+  /** `list` and `records`: what an empty list means, in words. */
+  emptyText?: string;
 };
 
-/** A form's values: text for inputs, booleans for checkboxes. */
-export type FormValues = Record<string, string | boolean>;
+/** A form's values: text for inputs, booleans for checkboxes, JSON for structured fields. */
+export type FormValues = Record<string, unknown>;
+
+/** A JSON value's copy. */
+export const clone = <T>(v: T): T => (v === undefined ? v : (JSON.parse(JSON.stringify(v)) as T));
 
 /** The form value of a field from a value. */
-export function toForm(def: FieldDef, v: unknown): string | boolean {
+export function toForm(def: FieldDef, v: unknown): unknown {
   const value = v === undefined ? (def.type === 'bool' ? def.fallback : undefined) : v;
   switch (def.type) {
     case 'bool':
@@ -375,6 +435,11 @@ export function toForm(def: FieldDef, v: unknown): string | boolean {
       return Array.isArray(value) ? value.map(String).join('\n') : '';
     case 'json':
       return value === undefined || value === null ? '' : JSON.stringify(value, null, 2);
+    case 'list':
+    case 'records':
+    case 'map':
+    case 'pairs':
+      return value === null ? undefined : clone(value);
     default:
       return value === undefined || value === null ? '' : String(value);
   }
@@ -387,10 +452,135 @@ export function formOf(defs: readonly FieldDef[], effective: unknown): FormValue
   );
 }
 
+/**
+ * The value an input's text stands for in a structured field's entry: nothing for an
+ * empty input, a number for a numeric field whose text reads as one, and the text itself
+ * otherwise, which the checks then refuse for a numeric field.
+ */
+export function inputValue(def: FieldDef, text: string): unknown {
+  const t = text.trim();
+  if (t === '') return undefined;
+  if (def.type === 'int' || def.type === 'number') {
+    const n = Number(t);
+    return Number.isFinite(n) ? n : t;
+  }
+  return def.type === 'text' || def.type === 'secret' ? text : t;
+}
+
+/** What is wrong with a value of a scalar field, or null. */
+export function checkValue(def: FieldDef, v: unknown): string | null {
+  if (v === undefined || v === null) {
+    if (def.optional || def.type === 'bool' || def.type === 'json' || def.type === 'enum')
+      return null;
+    return `${def.label} needs a value`;
+  }
+  switch (def.type) {
+    case 'bool':
+      return typeof v === 'boolean' ? null : `${def.label} is on or off`;
+    case 'int':
+    case 'number': {
+      const whole = def.type === 'int';
+      if (typeof v !== 'number' || !Number.isFinite(v) || (whole && !Number.isSafeInteger(v)))
+        return `${def.label} must be a ${whole ? 'whole ' : ''}number`;
+      if (def.min != null && v < def.min) return `${def.label} is at least ${def.min}`;
+      if (def.above != null && v <= def.above) return `${def.label} is more than ${def.above}`;
+      if (def.max != null && v > def.max) return `${def.label} is at most ${def.max}`;
+      return null;
+    }
+    case 'enum':
+      return typeof v === 'string' && (def.options ?? []).includes(v)
+        ? null
+        : `${def.label} is not one of the values`;
+    case 'text':
+    case 'secret': {
+      if (typeof v !== 'string') return `${def.label} is text`;
+      if (!def.optional && v.trim() === '') return `${def.label} needs a value`;
+      if (def.maxLength != null && v.length > def.maxLength)
+        return `${def.label} has at most ${def.maxLength} characters`;
+      if (def.pattern && !new RegExp(def.pattern, 'u').test(v))
+        return def.patternText ?? `${def.label} does not have the right form`;
+      return null;
+    }
+    default:
+      return null;
+  }
+}
+
+const sub = (base: string, ...members: string[]) => pathString([...parsePath(base), ...members]);
+
+/**
+ * What is wrong with a structured field's value, by the dotted path below the field: an
+ * entry of a list by its index, a member of an entry by `index.member` or `name.member`,
+ * and the field itself by `''`.
+ */
+export function checkStructured(def: FieldDef, v: unknown): Record<string, string> {
+  const out: Record<string, string> = {};
+  if (v === undefined || v === null) return out;
+  const entryFields = (at: string[], entry: unknown) => {
+    if (!isObject(entry)) {
+      out[pathString(at)] = `Each ${def.keyLabel ?? 'entry'} is an object`;
+      return;
+    }
+    for (const f of def.entry ?? []) {
+      const e = checkValue(f, getAt(entry, parsePath(f.path)));
+      if (e) out[pathString([...at, ...parsePath(f.path)])] = e;
+    }
+  };
+  switch (def.type) {
+    case 'list': {
+      if (!Array.isArray(v)) return { '': `${def.label} is a list` };
+      const seen = new Set<string>();
+      v.forEach((x, i) => {
+        const at = String(i);
+        if (typeof x !== 'string' || !x.trim()) out[at] = 'An entry needs a value';
+        else if (seen.has(x.trim())) out[at] = `${x.trim()} is listed twice`;
+        else if (def.pattern && !new RegExp(def.pattern, 'u').test(x))
+          out[at] = def.patternText ?? `${x} does not have the right form`;
+        if (typeof x === 'string') seen.add(x.trim());
+      });
+      return out;
+    }
+    case 'records':
+      if (!Array.isArray(v)) return { '': `${def.label} is a list` };
+      v.forEach((x, i) => entryFields([String(i)], x));
+      return out;
+    case 'map':
+    case 'pairs': {
+      if (!isObject(v)) return { '': `${def.label} is an object` };
+      for (const [name, x] of Object.entries(v)) {
+        if (def.keyPattern && !new RegExp(def.keyPattern, 'u').test(name))
+          out[pathString([name])] =
+            `${name} is not a ${def.keyLabel ?? 'name'} that the server accepts`;
+        else if (def.type === 'pairs') {
+          if (typeof x !== 'string') out[pathString([name])] = `The value of ${name} is text`;
+        } else entryFields([name], x);
+      }
+      return out;
+    }
+    default:
+      return out;
+  }
+}
+
+/** A structured field's value as it is sent: list entries trimmed. */
+function normalized(def: FieldDef, v: unknown): unknown {
+  if (def.type === 'list' && Array.isArray(v)) return v.map((x) => String(x).trim());
+  return clone(v);
+}
+
 /** A field's value from its form value: `undefined` for an empty optional field. */
-export function fromForm(def: FieldDef, f: string | boolean): { ok: unknown } | { error: string } {
+export function fromForm(
+  def: FieldDef,
+  f: unknown,
+): { ok: unknown } | { error: string; errors?: Record<string, string> } {
   if (def.type === 'bool') return { ok: f === true };
-  const t = String(f).trim();
+  if (isStructured(def)) {
+    const errors = checkStructured(def, f);
+    const keys = Object.keys(errors);
+    if (keys.length) return { error: errors[keys[0]], errors };
+    return { ok: f === undefined || f === null ? undefined : normalized(def, f) };
+  }
+  const t = String(f ?? '').trim();
   if (t === '') {
     // an optional list left empty is unset, as `allowedModels` is
     if (def.type === 'lines') return def.optional ? { ok: undefined } : { ok: [] };
@@ -401,11 +591,8 @@ export function fromForm(def: FieldDef, f: string | boolean): { ok: unknown } | 
     case 'int':
     case 'number': {
       const n = Number(t);
-      if (!Number.isFinite(n) || (def.type === 'int' && !Number.isSafeInteger(n)))
-        return { error: `${def.label} must be a ${def.type === 'int' ? 'whole ' : ''}number` };
-      if (def.min != null && n < def.min) return { error: `${def.label} is at least ${def.min}` };
-      if (def.max != null && n > def.max) return { error: `${def.label} is at most ${def.max}` };
-      return { ok: n };
+      const e = checkValue(def, Number.isFinite(n) ? n : t);
+      return e ? { error: e } : { ok: n };
     }
     case 'lines':
       return {
@@ -420,12 +607,10 @@ export function fromForm(def: FieldDef, f: string | boolean): { ok: unknown } | 
       } catch (e) {
         return { error: `${def.label} is not JSON: ${e instanceof Error ? e.message : e}` };
       }
-    case 'enum':
-      return def.options?.includes(t)
-        ? { ok: t }
-        : { error: `${def.label} is not one of the values` };
-    default:
-      return { ok: t };
+    default: {
+      const e = checkValue(def, t);
+      return e ? { error: e } : { ok: t };
+    }
   }
 }
 
@@ -433,43 +618,143 @@ export function fromForm(def: FieldDef, f: string | boolean): { ok: unknown } | 
  * The merge patch of a form's edits: each field whose form value changed is set, an
  * emptied optional field is `null` (the runtime value goes, and the field falls back to
  * the settings file or the default), and an object field sends only the members that
- * changed. `errors` lists fields whose text does not read.
+ * changed. `errors` lists fields whose value does not read, and `entryErrors` the
+ * members of structured fields that do not, by their whole dotted path.
  */
 export function formPatch(
   defs: readonly FieldDef[],
   initial: FormValues,
   form: FormValues,
   effective: unknown,
-): { patch: JsonObject; changed: string[]; errors: Record<string, string> } {
+): {
+  patch: JsonObject;
+  changed: string[];
+  errors: Record<string, string>;
+  entryErrors: Record<string, string>;
+} {
   const patch: JsonObject = {};
   const changed: string[] = [];
   const errors: Record<string, string> = {};
+  const entryErrors: Record<string, string> = {};
   for (const d of defs) {
-    if (form[d.path] === initial[d.path]) continue;
+    if (deepEqual(form[d.path], initial[d.path])) continue;
     const r = fromForm(d, form[d.path]);
     if ('error' in r) {
       errors[d.path] = r.error;
+      for (const [k, e] of Object.entries(r.errors ?? {}))
+        entryErrors[k === '' ? d.path : sub(d.path, ...parsePath(k))] = e;
       continue;
     }
     const p = parsePath(d.path);
     const before = getAt(effective, p);
     let value: unknown = r.ok === undefined ? null : r.ok;
-    if (d.type === 'json' && isObject(before) && isObject(r.ok)) value = diffPatch(before, r.ok);
+    if (
+      (d.type === 'json' || d.type === 'map' || d.type === 'pairs') &&
+      isObject(before) &&
+      isObject(r.ok)
+    )
+      value = diffPatch(before, r.ok);
     if (value === undefined || (value === null && before === undefined)) continue;
     setAt(patch, p, value);
     changed.push(d.path);
   }
-  return { patch, changed, errors };
+  return { patch, changed, errors, entryErrors };
 }
 
 /** The fields of a form whose value differs from the loaded one. */
 export const dirtyFields = (defs: readonly FieldDef[], initial: FormValues, form: FormValues) =>
-  defs.filter((d) => form[d.path] !== initial[d.path]).map((d) => d.path);
+  defs.filter((d) => !deepEqual(form[d.path], initial[d.path])).map((d) => d.path);
+
+/** The field of `defs` that holds the dotted `path`: the field itself or one above it. */
+export function fieldAt(defs: readonly FieldDef[], path: string): FieldDef | undefined {
+  const p = parsePath(path);
+  let best: FieldDef | undefined;
+  for (const d of defs) {
+    const dp = parsePath(d.path);
+    if (startsWith(p, dp) && (!best || dp.length > parsePath(best.path).length)) best = d;
+  }
+  return best;
+}
 
 // --- the runtime layer as JSON --------------------------------------------------------
 
 /** The runtime layer as the JSON editor shows it. */
 export const runtimeText = (k: SettingsKind) => JSON.stringify(k.runtime ?? {}, null, 2);
+
+/** A runtime layer as the JSON editor shows it. */
+export const layerText = (layer: unknown) => JSON.stringify(layer ?? {}, null, 2);
+
+/**
+ * `patch` applied to `target` as RFC 7396 says, in a copy: `null` removes a member, an
+ * object merges member by member, and anything else replaces. Members keep their order,
+ * and new ones come last.
+ */
+export function applyPatch(target: unknown, patch: unknown): unknown {
+  if (!isObject(patch)) return clone(patch);
+  const out: JsonObject = isObject(target) ? { ...target } : {};
+  for (const [k, v] of Object.entries(patch)) {
+    if (v === null) delete out[k];
+    else out[k] = applyPatch(out[k], v);
+  }
+  return out;
+}
+
+/** `v` without empty objects, which the server drops from a runtime layer as well. */
+export function pruned(v: unknown): unknown {
+  if (!isObject(v)) return v;
+  const out: JsonObject = {};
+  for (const [k, x] of Object.entries(v)) {
+    const p = pruned(x);
+    if (!(isObject(p) && Object.keys(p).length === 0)) out[k] = p;
+  }
+  return out;
+}
+
+/**
+ * The effective object once the runtime layer is `layer`, as the form shows it before a
+ * save: the members the layer changes take its values, a runtime value it removes falls
+ * back to the declared one, a `null` it holds removes the declared member, and locked
+ * fields keep their value. The server's answer to the save is the exact one.
+ */
+export function previewEffective(k: SettingsKind, layer: JsonObject): JsonObject {
+  const patch = diffPatch(k.runtime ?? {}, layer);
+  if (patch === undefined) return k.effective;
+  const walk = (eff: unknown, p: unknown, declared: unknown, l: unknown): unknown => {
+    if (!isObject(p)) return clone(p);
+    const out: JsonObject = isObject(eff) ? { ...eff } : {};
+    for (const [key, v] of Object.entries(p)) {
+      const d = isObject(declared) ? declared[key] : undefined;
+      const lv = isObject(l) ? l[key] : undefined;
+      if (v === null) {
+        if (lv === null || d === undefined || d === null) delete out[key];
+        else out[key] = clone(d);
+      } else out[key] = walk(out[key], v, d, lv);
+    }
+    return out;
+  };
+  const out = walk(k.effective, patch, k.declared, layer) as JsonObject;
+  for (const l of k.locked) {
+    const p = parsePath(l);
+    const v = getAt(k.effective, p);
+    if (v !== undefined) setAt(out, p, clone(v));
+  }
+  return out;
+}
+
+/**
+ * The editor's text as a runtime layer, or why it does not do. The layer is what the
+ * form's edits then apply to.
+ */
+export function parseLayer(text: string): { layer: JsonObject } | { error: string } {
+  let v: unknown;
+  try {
+    v = JSON.parse(text.trim() || '{}');
+  } catch (e) {
+    return { error: `Not JSON: ${e instanceof Error ? e.message : e}` };
+  }
+  if (!isObject(v)) return { error: 'The runtime layer is a JSON object.' };
+  return { layer: v };
+}
 
 /**
  * The merge patch that makes the runtime layer equal to the editor's text, or why the
@@ -479,15 +764,61 @@ export function runtimePatch(
   k: SettingsKind,
   text: string,
 ): { patch: JsonObject | null } | { error: string } {
-  let v: unknown;
-  try {
-    v = JSON.parse(text.trim() || '{}');
-  } catch (e) {
-    return { error: `Not JSON: ${e instanceof Error ? e.message : e}` };
-  }
-  if (!isObject(v)) return { error: 'The runtime layer is a JSON object.' };
-  const d = diffPatch(k.runtime ?? {}, v);
+  const r = parseLayer(text);
+  if ('error' in r) return r;
+  const d = diffPatch(k.runtime ?? {}, r.layer);
   return { patch: d === undefined ? null : (d as JsonObject) };
+}
+
+/**
+ * The state of a settings form that the JSON editor shares (C19 §10): the runtime layer
+ * the editor last set (`base`), the form of the effective object it gives (`baseForm`),
+ * and the form as edited. The layer a save sends is `base` with the form's edits, so the
+ * editor and the form show one change, and members the form does not know stay as the
+ * editor or the server left them.
+ */
+export type FormState = {
+  base: JsonObject;
+  baseForm: FormValues;
+  form: FormValues;
+};
+
+/** The state of a kind as the server answered it. */
+export function formState(defs: readonly FieldDef[], k: SettingsKind): FormState {
+  const base = clone(k.runtime ?? {});
+  const baseForm = formOf(defs, k.effective);
+  return { base, baseForm, form: clone(baseForm) };
+}
+
+/** The state once the editor's text is the runtime layer `layer`; edits of the form go. */
+export function rebase(defs: readonly FieldDef[], k: SettingsKind, layer: JsonObject): FormState {
+  const baseForm = formOf(defs, previewEffective(k, layer));
+  return { base: clone(layer), baseForm, form: clone(baseForm) };
+}
+
+/**
+ * The runtime layer a save would leave, the merge patch it sends (null when it sends
+ * nothing), and the fields and members that do not read.
+ */
+export function pendingLayer(
+  defs: readonly FieldDef[],
+  k: SettingsKind,
+  s: FormState,
+): {
+  layer: JsonObject;
+  patch: JsonObject | null;
+  errors: Record<string, string>;
+  entryErrors: Record<string, string>;
+} {
+  const r = formPatch(defs, s.baseForm, s.form, previewEffective(k, s.base));
+  const layer = pruned(applyPatch(s.base, r.patch)) as JsonObject;
+  const d = diffPatch(k.runtime ?? {}, layer);
+  return {
+    layer,
+    patch: d === undefined ? null : (d as JsonObject),
+    errors: r.errors,
+    entryErrors: r.entryErrors,
+  };
 }
 
 // --- failed writes -------------------------------------------------------------------
@@ -496,7 +827,7 @@ export function runtimePatch(
 export type WriteFailure =
   | { kind: 'stale'; message: string }
   | { kind: 'locked'; fields: string[]; message: string }
-  | { kind: 'invalid'; message: string }
+  | { kind: 'invalid'; message: string; field?: string }
   | { kind: 'forbidden'; message: string }
   | { kind: 'other'; message: string };
 
@@ -512,7 +843,12 @@ export function writeFailure(e: unknown): WriteFailure {
       message,
     };
   }
-  if (e.status === 400) return { kind: 'invalid', message };
+  if (e.status === 400) {
+    const f = e.body?.field;
+    return typeof f === 'string'
+      ? { kind: 'invalid', message, field: f }
+      : { kind: 'invalid', message };
+  }
   if (e.status === 403) return { kind: 'forbidden', message };
   return { kind: 'other', message };
 }

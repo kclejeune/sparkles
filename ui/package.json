@@ -8,6 +8,7 @@
     "build": "vite build && node scripts/precompress.mjs",
     "preview": "vite preview",
     "mock": "node mock/server.mjs",
+    "models-schema": "node scripts/models-schema.mjs",
     "check": "svelte-kit sync && svelte-check --tsconfig ./tsconfig.json",
     "check:watch": "svelte-kit sync && svelte-check --tsconfig ./tsconfig.json --watch",
     "format": "oxfmt",

@@ -1,35 +1,70 @@
+<script lang="ts" module>
+  import type { JsonObject as Obj } from '$lib/settings';
+
+  /** What a structured field's editor needs beyond its value, from the caller. */
+  export type FieldExtras = {
+    /** Values to suggest: entries of a list, names of a map. */
+    suggestions?: readonly string[];
+    /** The models to suggest for a role entry. */
+    suggest?: (entry: Obj) => readonly string[];
+    /** A map's inherited values, by member path. */
+    inherited?: Record<string, unknown>;
+    /** A map's names that the declared layer holds. */
+    declared?: readonly string[];
+  };
+</script>
+
 <script lang="ts">
-  // One layered settings kind (C19 §10): a form for its common fields, each with its
-  // source, lock and reset, and an editor of the whole runtime layer for the members the
-  // form leaves out. Writes send `If-Match`. A 412 reloads the kind, a 409 highlights the
-  // locked fields, and a 400 shows the server's message. The kind is named by its URL, so
-  // a server-wide kind uses the panel as a dataset's kind does.
-  import type { Snippet } from 'svelte';
+  // One layered settings kind (C19 §10): a form for its fields, each with its source, lock
+  // and reset, and an editor of the whole runtime layer for the members the form leaves
+  // out. The form and the editor share one change: an edit of the form shows in the
+  // editor's JSON, an edit of the JSON shows in the form, and a save sends the runtime
+  // layer they agree on, so members the form does not know are kept. Structured fields
+  // (lists, role entries, per-model options and headers) have editors of their own, and
+  // every field is checked as it is edited. Writes send `If-Match`. A 412 reloads the
+  // kind, a 409 highlights the locked fields, and a 400 shows the server's message, beside
+  // the field it names when it names one. The kind is named by its URL, so a server-wide
+  // kind uses the panel as a dataset's kind does.
+  import { tick, type Snippet } from 'svelte';
   import * as api from '$lib/api';
   import { toasts } from '$lib/app.svelte';
   import {
     conflicts,
     dirtyFields,
+    fieldAt,
     fieldInfo,
-    formOf,
-    formPatch,
+    formState,
+    isStructured,
+    layerText,
     overridesOf,
     overridesSummary,
+    parseLayer,
+    parsePath,
     patchKind,
+    pathString,
+    pendingLayer,
     readKind,
+    rebase,
     resetFields,
     resetKind,
-    runtimePatch,
     runtimeText,
+    startsWith,
     valueText,
     writeFailure,
+    formOf,
     type FieldDef,
+    type FormState,
     type FormValues,
     type JsonObject,
     type SettingsKind,
   } from '$lib/settings';
   import Icon from './Icon.svelte';
+  import ListEditor from './ListEditor.svelte';
+  import MapEditor from './MapEditor.svelte';
   import Modal from './Modal.svelte';
+  import PairsEditor from './PairsEditor.svelte';
+  import RecordsEditor from './RecordsEditor.svelte';
+  import SecretField, { type SecretView } from './SecretField.svelte';
   import SettingRow from './SettingRow.svelte';
 
   let {
@@ -43,6 +78,9 @@
     groupExtra,
     confirmWrite,
     onchange,
+    check,
+    extras,
+    secrets,
   }: {
     /** Where the declared layer comes from, in words. */
     declaredName?: string;
@@ -61,10 +99,20 @@
     /** The kind after a load or a write. */
     onchange?: (k: SettingsKind) => void;
     /**
-     * Asked before the form or the runtime JSON sends a patch: false keeps the patch
-     * unsent, as for a change that needs an acknowledgement first.
+     * Asked before a save sends a patch: false keeps the patch unsent, as for a change
+     * that needs an acknowledgement first.
      */
     confirmWrite?: (patch: JsonObject, effective: JsonObject) => Promise<boolean>;
+    /** Checks that need several fields, by the dotted path of the member they concern. */
+    check?: (form: FormValues) => Record<string, string>;
+    /** What a structured field's editor needs, by field. */
+    extras?: (def: FieldDef) => FieldExtras;
+    /** The secrets a `secret` field names, and how to store a key under one. */
+    secrets?: {
+      names: readonly string[];
+      state: (name: string) => SecretView | null;
+      store: (name: string, key: string) => Promise<boolean>;
+    };
   } = $props();
 
   const slug = $derived(title.toLowerCase().replace(/[^a-z0-9]+/g, '-'));
@@ -73,24 +121,41 @@
   let k = $state<SettingsKind | null>(null);
   let loadError = $state<string | null>(null);
   let unsupported = $state(false);
+  /** The form of the loaded kind, which marks the fields with unsaved changes. */
   let initial = $state<FormValues>({});
-  let form = $state<FormValues>({});
+  let st = $state<FormState>({ base: {}, baseForm: {}, form: {} });
   let busy = $state(false);
   /** A write was refused with 403: the tab stays read-only. */
   let forbidden = $state(false);
   let writeError = $state<string | null>(null);
   let conflictFields = $state<string[]>([]);
-  let fieldErrors = $state<Record<string, string>>({});
+  /** The messages of a refused write, by the dotted path of the field they name. */
+  let serverErrors = $state<Record<string, string>>({});
   let jsonText = $state('');
   let jsonError = $state<string | null>(null);
   let resetAllOpen = $state(false);
   let useConfigOpen = $state(false);
+  let formEl = $state<HTMLFormElement | null>(null);
 
   const editable = $derived(canEdit && !forbidden);
   /** The runtime values that replace a value of the server's configuration. */
   const overrides = $derived(overridesOf(k));
-  const dirty = $derived(dirtyFields(fields, initial, form));
-  const jsonDirty = $derived(k != null && jsonText !== runtimeText(k));
+  const dirty = $derived(dirtyFields(fields, initial, st.form));
+  /** The runtime layer a save would leave, and what does not read. */
+  const pending = $derived(k ? pendingLayer(fields, k, st) : null);
+  const crossErrors = $derived(check ? check(st.form) : {});
+  /** Every member error, by its whole dotted path. */
+  const memberErrors = $derived({
+    ...(pending?.entryErrors ?? {}),
+    ...crossErrors,
+    ...serverErrors,
+  });
+  const errorCount = $derived(
+    Object.keys(pending?.errors ?? {}).length +
+      Object.keys(crossErrors).length +
+      (jsonError ? 1 : 0),
+  );
+  const changed = $derived(pending?.patch != null || dirty.length > 0);
   const runtimeCount = $derived(k ? Object.keys(k.runtime ?? {}).length : 0);
   const groups = $derived.by(() => {
     const out: { name: string; defs: FieldDef[] }[] = [];
@@ -107,10 +172,10 @@
   function show(next: SettingsKind) {
     k = next;
     initial = formOf(fields, next.effective);
-    form = { ...initial };
+    st = formState(fields, next);
     jsonText = runtimeText(next);
     jsonError = null;
-    fieldErrors = {};
+    serverErrors = {};
     onchange?.(next);
   }
 
@@ -139,6 +204,20 @@
     conflictFields = [];
     void load();
   });
+
+  /** Bring the first control with an error into view and focus it. */
+  async function focusError() {
+    await tick();
+    const el = formEl?.querySelector<HTMLElement>(
+      '[aria-invalid="true"], .setting .note.bad, .entry-field.bad',
+    );
+    const target =
+      el?.matches('input, select, textarea, button') === true
+        ? el
+        : el?.closest('.setting')?.querySelector<HTMLElement>('input, select, textarea, button');
+    el?.scrollIntoView({ block: 'center', behavior: 'smooth' });
+    target?.focus({ preventScroll: true });
+  }
 
   /** Run a write; the answer is the kind after it. */
   async function write(what: string, fn: (etag: string | undefined) => Promise<SettingsKind>) {
@@ -172,6 +251,10 @@
           break;
         case 'invalid':
           writeError = f.message;
+          if (f.field && fieldAt(fields, f.field)) {
+            serverErrors = { [f.field]: f.message };
+            void focusError();
+          }
           break;
         default:
           toasts.error(`The ${lower} settings were not saved`, e);
@@ -182,19 +265,29 @@
     }
   }
 
-  async function save(e: SubmitEvent) {
-    e.preventDefault();
-    if (!k) return;
-    const effective = k.effective;
-    const r = formPatch(fields, initial, form, effective);
-    fieldErrors = r.errors;
-    if (Object.keys(r.errors).length) return;
-    if (r.changed.length === 0) {
-      form = { ...initial };
+  async function save(e?: SubmitEvent) {
+    e?.preventDefault();
+    if (!k || !pending) return;
+    if (errorCount) {
+      void focusError();
       return;
     }
-    if (confirmWrite && !(await confirmWrite(r.patch, effective))) return;
-    await write(`Saved the ${lower} settings`, (etag) => patchKind(url, r.patch, etag));
+    const patch = pending.patch;
+    if (!patch) {
+      discard();
+      return;
+    }
+    if (confirmWrite && !(await confirmWrite(patch, k.effective))) return;
+    await write(`Saved the ${lower} settings`, (etag) => patchKind(url, patch, etag));
+  }
+
+  function discard() {
+    if (!k) return;
+    st = formState(fields, k);
+    jsonText = runtimeText(k);
+    jsonError = null;
+    serverErrors = {};
+    writeError = null;
   }
 
   function resetField(def: FieldDef) {
@@ -220,24 +313,54 @@
     else await load();
   }
 
-  async function saveJson() {
+  /** An edit of a field: the JSON shows the layer the form now gives. */
+  function setValue(path: string, v: unknown) {
+    st = { ...st, form: { ...st.form, [path]: v } };
+    const p = parsePath(path);
+    const left = Object.fromEntries(
+      Object.entries(serverErrors).filter(([key]) => !startsWith(parsePath(key), p)),
+    );
+    if (Object.keys(left).length !== Object.keys(serverErrors).length) {
+      serverErrors = left;
+      writeError = null;
+    }
+    if (k && !jsonError) jsonText = layerText(pendingLayer(fields, k, st).layer);
+  }
+
+  /** An edit of the JSON: the form shows the effective object it gives. */
+  function setJson(text: string) {
+    jsonText = text;
     if (!k) return;
-    const r = runtimePatch(k, jsonText);
+    const r = parseLayer(text);
     if ('error' in r) {
       jsonError = r.error;
       return;
     }
     jsonError = null;
-    if (!r.patch) return;
-    const patch = r.patch;
-    if (confirmWrite && !(await confirmWrite(patch, k.effective))) return;
-    await write(`Saved the ${lower} settings`, (etag) => patchKind(url, patch, etag));
+    serverErrors = {};
+    st = rebase(fields, k, r.layer);
   }
 
-  const setValue = (path: string, v: string | boolean) => (form = { ...form, [path]: v });
   const inputId = (d: FieldDef) => `setting-${slug}-${d.path.replace(/[^A-Za-z0-9]+/g, '-')}`;
   const placeholderOf = (d: FieldDef) =>
     d.placeholder ?? (d.fallback !== undefined ? String(d.fallback) : '');
+  /** The member errors of a structured field, by the path below it. */
+  function errorsBelow(d: FieldDef): Record<string, string> {
+    const p = parsePath(d.path);
+    const out: Record<string, string> = {};
+    for (const [key, e] of Object.entries(memberErrors)) {
+      const kp = parsePath(key);
+      if (startsWith(kp, p) && kp.length > p.length) out[pathString(kp.slice(p.length))] = e;
+    }
+    return out;
+  }
+  /** The error a field's row shows under its control. */
+  const rowError = (d: FieldDef) =>
+    serverErrors[d.path] ??
+    crossErrors[d.path] ??
+    (isStructured(d) ? pending?.entryErrors[d.path] : pending?.errors[d.path]);
+  const sectionStart = (defs: FieldDef[], i: number) =>
+    defs[i].section !== undefined && (i === 0 || defs[i - 1].section !== defs[i].section);
 </script>
 
 <section class="panel kind" aria-label="{title} settings" data-testid="settings-{slug}">
@@ -301,14 +424,17 @@
           {/if}
         </div>
       {/if}
-      <form onsubmit={save} aria-label="{title} settings form">
+      <form onsubmit={save} aria-label="{title} settings form" bind:this={formEl} novalidate>
         {#each groups as g (g.name)}
           <fieldset class="group">
             {#if g.name}<legend>{g.name}</legend>{/if}
-            {#each g.defs as d (d.path)}
+            {#each g.defs as d, i (d.path)}
               {@const info = fieldInfo(k, d.path)}
               {@const id = inputId(d)}
               {@const disabled = !editable || info.locked || busy}
+              {@const value = st.form[d.path]}
+              {@const err = rowError(d)}
+              {#if sectionStart(g.defs, i)}<h3 class="section">{d.section}</h3>{/if}
               <SettingRow
                 {id}
                 label={d.label}
@@ -316,7 +442,7 @@
                 {info}
                 conflict={conflicts(d.path, conflictFields)}
                 dirty={dirty.includes(d.path)}
-                error={fieldErrors[d.path]}
+                error={err}
                 canEdit={editable}
                 {busy}
                 onreset={() => resetField(d)}
@@ -326,23 +452,80 @@
                     <input
                       {id}
                       type="checkbox"
-                      checked={form[d.path] === true}
+                      checked={value === true}
                       {disabled}
                       onchange={(e) => setValue(d.path, e.currentTarget.checked)}
                     />
-                    <span class="faint">{form[d.path] === true ? 'on' : 'off'}</span>
+                    <span class="faint">{value === true ? 'on' : 'off'}</span>
                   </label>
                 {:else if d.type === 'enum'}
                   <select
                     {id}
                     class="select"
-                    value={form[d.path]}
+                    value={String(value ?? '')}
                     {disabled}
+                    aria-invalid={err ? 'true' : undefined}
                     onchange={(e) => setValue(d.path, e.currentTarget.value)}
                   >
                     {#if d.optional}<option value="">not set</option>{/if}
+                    {#if value && !(d.options ?? []).includes(String(value))}<option
+                        value={String(value)}>{value}</option
+                      >{/if}
                     {#each d.options ?? [] as o (o)}<option value={o}>{o}</option>{/each}
                   </select>
+                {:else if d.type === 'list'}
+                  <ListEditor
+                    def={d}
+                    {value}
+                    {id}
+                    {disabled}
+                    errors={errorsBelow(d)}
+                    suggestions={extras?.(d).suggestions}
+                    onchange={(v) => setValue(d.path, v)}
+                  />
+                {:else if d.type === 'records'}
+                  <RecordsEditor
+                    def={d}
+                    {value}
+                    {id}
+                    {disabled}
+                    errors={errorsBelow(d)}
+                    suggest={extras?.(d).suggest}
+                    onchange={(v) => setValue(d.path, v)}
+                  />
+                {:else if d.type === 'map'}
+                  {@const x = extras?.(d)}
+                  <MapEditor
+                    def={d}
+                    {value}
+                    {id}
+                    {disabled}
+                    errors={errorsBelow(d)}
+                    suggestions={x?.suggestions}
+                    inherited={x?.inherited}
+                    declared={x?.declared}
+                    onchange={(v) => setValue(d.path, v)}
+                  />
+                {:else if d.type === 'pairs'}
+                  <PairsEditor
+                    def={d}
+                    {value}
+                    {id}
+                    {disabled}
+                    errors={errorsBelow(d)}
+                    onchange={(v) => setValue(d.path, v)}
+                  />
+                {:else if d.type === 'secret'}
+                  <SecretField
+                    {value}
+                    {id}
+                    {disabled}
+                    placeholder={placeholderOf(d)}
+                    names={secrets?.names}
+                    keyState={secrets?.state}
+                    onstore={secrets?.store}
+                    onchange={(v) => setValue(d.path, v)}
+                  />
                 {:else if d.type === 'lines' || d.type === 'json'}
                   <textarea
                     {id}
@@ -350,24 +533,29 @@
                     rows={d.type === 'json' ? 3 : 2}
                     spellcheck="false"
                     placeholder={placeholderOf(d)}
-                    value={String(form[d.path])}
+                    value={String(value ?? '')}
                     {disabled}
+                    aria-invalid={err ? 'true' : undefined}
                     oninput={(e) => setValue(d.path, e.currentTarget.value)}></textarea>
                 {:else}
-                  <input
-                    {id}
-                    class="input"
-                    class:mono={d.type === 'text'}
-                    inputmode={d.type === 'int'
-                      ? 'numeric'
-                      : d.type === 'number'
-                        ? 'decimal'
-                        : undefined}
-                    placeholder={placeholderOf(d)}
-                    value={String(form[d.path])}
-                    {disabled}
-                    oninput={(e) => setValue(d.path, e.currentTarget.value)}
-                  />
+                  <span class="with-unit">
+                    <input
+                      {id}
+                      class="input"
+                      class:mono={d.type === 'text'}
+                      inputmode={d.type === 'int'
+                        ? 'numeric'
+                        : d.type === 'number'
+                          ? 'decimal'
+                          : undefined}
+                      placeholder={placeholderOf(d)}
+                      value={String(value ?? '')}
+                      {disabled}
+                      aria-invalid={err ? 'true' : undefined}
+                      oninput={(e) => setValue(d.path, e.currentTarget.value)}
+                    />
+                    {#if d.unit}<span class="unit">{d.unit}</span>{/if}
+                  </span>
                 {/if}
               </SettingRow>
             {/each}
@@ -382,20 +570,16 @@
         {/if}
         {#if editable}
           <div class="row actions">
-            {#if dirty.length}<span class="faint small"
+            {#if errorCount}<span class="bad small" role="status"
+                >{errorCount} field{errorCount === 1 ? ' needs' : 's need'} a fix</span
+              >{:else if dirty.length}<span class="faint small"
                 >{dirty.length} unsaved change{dirty.length === 1 ? '' : 's'}</span
               >{/if}
             <span class="spacer"></span>
-            <button
-              type="button"
-              class="btn sm"
-              disabled={busy || dirty.length === 0}
-              onclick={() => {
-                form = { ...initial };
-                fieldErrors = {};
-              }}>Discard</button
+            <button type="button" class="btn sm" disabled={busy || !changed} onclick={discard}
+              >Discard</button
             >
-            <button class="btn primary sm" type="submit" disabled={busy || dirty.length === 0}>
+            <button class="btn primary sm" type="submit" disabled={busy || !changed}>
               {#if busy}<span class="spinner"></span>{/if} Save
             </button>
           </div>
@@ -408,16 +592,18 @@
           <label class="field">
             Runtime layer
             <span class="faint small"
-              >The fields changed at runtime. Saving makes the runtime layer equal to this object,
-              so removing a member resets it. Role lists, routing and other members the form leaves
-              out are edited here.</span
+              >The fields changed at runtime, with the form's unsaved changes. An edit here shows in
+              the form, and members the form does not show are kept. Saving makes the runtime layer
+              equal to this object, so removing a member resets it.</span
             >
             <textarea
               class="textarea"
-              rows="8"
+              rows="10"
               spellcheck="false"
               aria-label="{title} runtime layer"
-              bind:value={jsonText}
+              aria-invalid={jsonError ? 'true' : undefined}
+              value={jsonText}
+              oninput={(e) => setJson(e.currentTarget.value)}
               readonly={!editable}></textarea>
           </label>
           <div class="field">
@@ -430,19 +616,14 @@
             <pre class="declared">{JSON.stringify(k.declared ?? {}, null, 2)}</pre>
           </div>
         </div>
-        {#if jsonError}<p class="bad small">{jsonError}</p>{/if}
+        {#if jsonError}<p class="bad small" role="alert">{jsonError}</p>{/if}
         {#if editable}
           <div class="row actions">
             <span class="spacer"></span>
-            <button
-              class="btn sm"
-              disabled={busy || !jsonDirty}
-              onclick={() => {
-                if (k) jsonText = runtimeText(k);
-                jsonError = null;
-              }}>Discard</button
+            <button class="btn sm" disabled={busy || (!changed && !jsonError)} onclick={discard}
+              >Discard</button
             >
-            <button class="btn primary sm" disabled={busy || !jsonDirty} onclick={saveJson}
+            <button class="btn primary sm" disabled={busy || !changed} onclick={() => save()}
               >Save JSON</button
             >
           </div>
@@ -550,6 +731,30 @@
     text-transform: uppercase;
     letter-spacing: 0.04em;
     color: var(--text-3);
+  }
+  .section {
+    margin: 6px 10px 0;
+    font-size: var(--fs-xs);
+    font-weight: 600;
+    color: var(--text-2);
+  }
+  .with-unit {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    max-width: 420px;
+  }
+  .with-unit .input {
+    flex: 1 1 auto;
+  }
+  .unit {
+    font-size: var(--fs-xs);
+    color: var(--text-3);
+  }
+  .input[aria-invalid='true'],
+  .select[aria-invalid='true'],
+  .textarea[aria-invalid='true'] {
+    border-color: var(--danger);
   }
   .check {
     display: inline-flex;

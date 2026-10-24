@@ -20,6 +20,7 @@
     groupProvider,
     listSecrets,
     modelFields,
+    modelSuggestions,
     modelsStatus,
     newProviderPatch,
     presetForm,
@@ -27,23 +28,29 @@
     providerNames,
     putSecret,
     removedProviders,
+    roleErrors,
     secretState,
     type ModelsStatus,
     type SecretInfo,
   } from '$lib/models-settings';
   import {
     fieldInfo,
+    getAt,
+    parsePath,
     pathString,
     patchKind,
     readKind,
     resetKind,
     writeFailure,
+    type FieldDef,
+    type FormValues,
     type JsonObject,
     type SettingsKind,
   } from '$lib/settings';
   import Icon from './Icon.svelte';
   import Modal from './Modal.svelte';
-  import SettingsKindPanel from './SettingsKindPanel.svelte';
+  import SettingsKindPanel, { type FieldExtras } from './SettingsKindPanel.svelte';
+  import type { SecretView } from './SecretField.svelte';
 
   let status = $state<ModelsStatus | null>(null);
   let statusError = $state<string | null>(null);
@@ -82,6 +89,55 @@
   // form has a group of fields for each
   const fieldsKey = $derived(JSON.stringify([providerKinds(kind), httpsProviders(kind)]));
   const removed = $derived(removedProviders(kind));
+
+  /** The checks of the role lists against the providers and their allowed models. */
+  const checkRoles = (form: FormValues) => roleErrors(kind, form);
+
+  /** Suggestions, inherited values and declared names for the structured fields. */
+  function extras(d: FieldDef): FieldExtras {
+    const p = parsePath(d.path);
+    if (p[0] === 'roles')
+      return {
+        suggest: (entry) =>
+          typeof entry.provider === 'string' ? modelSuggestions(kind, status, entry.provider) : [],
+      };
+    if (p[0] !== 'providers' || p.length < 3) return {};
+    const name = p[1];
+    const suggestions = modelSuggestions(kind, status, name);
+    if (d.type !== 'map') return { suggestions };
+    const provider = getAt(kind?.effective, ['providers', name]);
+    const inherited: Record<string, unknown> = {};
+    for (const f of d.entry ?? []) {
+      const v = getAt(provider, parsePath(f.path));
+      if (v !== undefined) inherited[f.path] = v;
+    }
+    const declared = Object.keys(
+      (getAt(kind?.declared, ['providers', name, 'models']) as JsonObject | undefined) ?? {},
+    );
+    return { suggestions, inherited, declared };
+  }
+
+  /** The keys the API key fields name, masked, and a way to store one. */
+  const secretFields = $derived({
+    names: (secrets ?? []).map((s) => s.name),
+    state: (name: string): SecretView | null => {
+      const s = secrets?.find((x) => x.name === name);
+      if (!s) return null;
+      const v = secretState(s);
+      return { set: v.set, label: v.label, title: v.title, locked: s.locked };
+    },
+    store: async (name: string, key: string) => {
+      try {
+        await putSecret(name, key);
+        toasts.push('success', `Stored a new key for ${name}`);
+        await loadStatus();
+        return true;
+      } catch (e) {
+        toasts.error(`The key for ${name} was not stored`, e);
+        return false;
+      }
+    },
+  });
 
   async function loadStatus() {
     const [m, s] = await Promise.allSettled([modelsStatus(), listSecrets()]);
@@ -347,8 +403,8 @@
           <p class="faint small">
             A preset fills the fields for a provider with a well-known endpoint, and each stays
             editable. An OpenAI-compatible gateway uses Custom with the openai protocol. The model
-            is added to the provider's models. Its other fields, TLS options and the role lists that
-            use it can be set below once it is added, or in the runtime layer's JSON under Advanced.
+            is added to the provider's models. Its other fields, its per-model options, TLS options
+            and the role lists that use it can be set below once it is added.
           </p>
         </form>
       {/if}
@@ -444,7 +500,7 @@
     {#key fieldsKey}
       <SettingsKindPanel
         title="Model configuration"
-        text="Providers, their per-model options, the role lists and routing. Each field shows whether it comes from the server's model configuration or was changed here."
+        text="Providers, their per-model options, the role lists and routing. Each field shows whether it comes from the server's model configuration or was changed here, and is checked as it is edited."
         url={MODELS_URL}
         {fields}
         canEdit
@@ -452,6 +508,9 @@
         forbiddenText="Changing the model configuration needs the server-admin permission, and the server must not be read-only."
         onchange={onKind}
         {confirmWrite}
+        check={checkRoles}
+        {extras}
+        secrets={secretFields}
       >
         {#snippet groupExtra(group: string)}
           {@const name = groupProvider(group)}
@@ -659,6 +718,10 @@
   .models {
     display: grid;
     gap: 16px;
+    min-width: 0;
+  }
+  /* the providers table scrolls in its own box, so a panel may be narrower than it */
+  .models > :global(*) {
     min-width: 0;
   }
   .intro {

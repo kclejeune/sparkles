@@ -9,12 +9,14 @@ import {
   httpsProviders,
   insecurePath,
   modelFields,
+  modelSuggestions,
   newProviderPatch,
   presetForm,
   providerGroup,
   providerNames,
   putSecret,
   removedProviders,
+  roleErrors,
   secretState,
   type SecretInfo,
 } from './models-settings';
@@ -104,9 +106,83 @@ describe('the form of the models kind', () => {
 
   it('explains community role inheritance and explicit opt-out', () => {
     expect(modelFields(models()).find((d) => d.path === 'roles.community')).toMatchObject({
-      placeholder: 'the summarize list',
-      help: 'Uses the summarize list when unset. An empty list turns this role off.',
+      type: 'records',
+      unsetText: 'the summarize list',
+      help: 'The reports of GraphRAG communities. It uses the summarize list when unset, and an empty list turns it off.',
     });
+  });
+
+  it('builds typed controls from the schema', () => {
+    const f = Object.fromEntries(modelFields(models()).map((d) => [d.path, d]));
+    expect(f['providers.claude.allowedModels']).toMatchObject({
+      type: 'list',
+      section: 'Models',
+      placeholder: 'any model',
+    });
+    expect(f['providers.claude.apiKey.secret']).toMatchObject({ type: 'secret', label: 'API key' });
+    expect(f['providers.claude.temperature']).toMatchObject({
+      type: 'number',
+      min: 0,
+      max: 2,
+      section: 'Model defaults',
+    });
+    expect(f['providers.claude.requestTimeoutSecs']).toMatchObject({ above: 0, unit: 'seconds' });
+    // the anthropic kind offers no json-object level, the ollama kind no tool level
+    expect(f['providers.claude.structuredOutput'].options).not.toContain('json-object');
+    expect(f['providers.gw\\.internal.structuredOutput'].options).not.toContain('tool');
+    // headers are for the openai kind only
+    expect(f['providers.claude.headers']).toBeUndefined();
+    const perModel = f['providers.claude.models'];
+    expect(perModel.type).toBe('map');
+    expect(perModel.entry!.map((e) => e.path)).toEqual([
+      'contextTokens',
+      'maxOutputTokens',
+      'temperature',
+      'structuredOutput',
+      'requestTimeoutSecs',
+      'pricing.inputPerMTok',
+      'pricing.outputPerMTok',
+    ]);
+    // a role entry picks among the providers that answer prompts
+    expect(f['roles.draft'].entry!.find((e) => e.path === 'provider')).toMatchObject({
+      type: 'enum',
+      options: ['claude', 'gw.internal'],
+    });
+  });
+
+  it('checks role entries against the providers and their allowed models', () => {
+    const k = models();
+    const form = {
+      'providers.claude.allowedModels': ['a'],
+      'roles.draft': [
+        { provider: 'claude', model: 'c' },
+        { provider: 'nope', model: 'm' },
+        { provider: 'claude', model: 'a' },
+      ],
+    };
+    expect(roleErrors(k, form)).toEqual({
+      'roles.draft.0.model': 'claude does not allow c (allowed models)',
+      'roles.draft.1.provider': 'No provider named nope is defined',
+    });
+  });
+
+  it('suggests the models a provider names anywhere', () => {
+    const k = models();
+    const status = {
+      configured: true,
+      providers: [
+        {
+          name: 'claude',
+          kind: 'anthropic',
+          endpoint: '',
+          status: 'ok',
+          models: [{ name: 'r' }, { name: 'c' }],
+        },
+      ],
+      roles: {},
+    };
+    expect(modelSuggestions(k, status, 'claude')).toEqual(['c', 'r']);
+    expect(modelSuggestions(k, null, 'gw.internal')).toEqual([]);
   });
 
   it('shows locks and overrides of providers as a dataset kind does', () => {
@@ -135,8 +211,11 @@ describe('the form of the models kind', () => {
       providers: { claude: { budget: { tokensPerDay: 500 } } },
     });
     const allowed = defs.find((d) => d.path === 'providers.claude.allowedModels')!;
-    expect(fromForm(allowed, '')).toEqual({ ok: undefined });
-    expect(fromForm(allowed, 'a\nb')).toEqual({ ok: ['a', 'b'] });
+    expect(fromForm(allowed, undefined)).toEqual({ ok: undefined });
+    expect(fromForm(allowed, [' a', 'b'])).toEqual({ ok: ['a', 'b'] });
+    expect(fromForm(allowed, ['a', 'a'])).toHaveProperty('error', 'a is listed twice');
+    const cleared = { ...initial, 'providers.claude.allowedModels': undefined };
+    expect(formPatch(defs, initial, cleared, k.effective).patch).toEqual({});
   });
 });
 

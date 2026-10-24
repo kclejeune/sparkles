@@ -1155,7 +1155,15 @@ The SvelteKit UI is embedded in the server binary.
   and history, and its Inbox tab reviews facts with **Accept all that pass**. The
   Communities tab shows the GraphRAG hierarchy and reports.
 * The server page shows readiness, requests, caches, backups and a Models section for
-  providers, the model configuration and write-only keys.
+  providers, the model configuration and write-only keys
+  ([USAGE.md](USAGE.md#changing-models-and-keys-at-runtime),
+  screenshots of the [form](images/models-settings.png) and its
+  [errors](images/models-settings-errors.png)). The model configuration is a form built from
+  the `ModelsSettings` schema of the OpenAPI description. Its fields are typed and
+  bounded, allowed models are a list that can be reordered, per-model options have a card
+  per model, and role lists have a row per entry. Each field is checked as it is edited,
+  a refusal from the server shows under the field it names, and the JSON view under
+  **Advanced** shares the form's unsaved change.
 
 ## Libraries and bindings
 

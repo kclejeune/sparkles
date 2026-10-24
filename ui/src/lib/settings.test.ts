@@ -23,6 +23,16 @@ import {
   sourceText,
   valueText,
   writeFailure,
+  applyPatch,
+  fieldAt,
+  formState,
+  layerText,
+  parseLayer,
+  pendingLayer,
+  previewEffective,
+  pruned,
+  rebase,
+  withAt,
   type FieldDef,
   type SettingsKind,
 } from './settings';
@@ -342,5 +352,230 @@ describe('the settings routes', () => {
     stub({ error: 'locked', code: 'locked-by-config', fields: ['send'] }, 409);
     const e = await patchKind('/$/settings/d/assistant', { send: 'rows' }).catch((x) => x);
     expect(writeFailure(e)).toEqual({ kind: 'locked', fields: ['send'], message: 'locked' });
+  });
+});
+
+describe('the form and the JSON editor share one change', () => {
+  /** A models-like kind: a declared provider with a runtime change, and members no form knows. */
+  const k = (): SettingsKind => ({
+    scope: 'server',
+    kind: 'models',
+    effective: {
+      providers: {
+        p: {
+          kind: 'openai',
+          endpoint: 'http://h/v1',
+          budget: { tokensPerDay: 7 },
+          future: { a: 1 },
+          models: { m: { temperature: 0.5, later: true } },
+        },
+        q: { kind: 'ollama', endpoint: 'http://q' },
+      },
+      roles: {
+        draft: [
+          { provider: 'p', model: 'm' },
+          { provider: 'q', model: 'x' },
+        ],
+      },
+      zzz: 3,
+    },
+    declared: {
+      providers: {
+        p: { kind: 'openai', endpoint: 'http://h/v1', budget: { tokensPerDay: 1000 } },
+        r: { kind: 'openai', endpoint: 'http://r' },
+      },
+    },
+    runtime: {
+      providers: {
+        p: {
+          budget: { tokensPerDay: 7 },
+          future: { a: 1 },
+          models: { m: { temperature: 0.5, later: true } },
+        },
+        q: { kind: 'ollama', endpoint: 'http://q' },
+        r: null,
+      },
+      roles: {
+        draft: [
+          { provider: 'p', model: 'm' },
+          { provider: 'q', model: 'x' },
+        ],
+      },
+      zzz: 3,
+    },
+    sources: {},
+    locked: ['providers.p.endpoint'],
+    overridden: [],
+    status: { valid: true },
+    etag: '"e"',
+  });
+  const defs: FieldDef[] = [
+    { path: 'providers.p.endpoint', label: 'Endpoint', type: 'text' },
+    {
+      path: 'providers.p.budget.tokensPerDay',
+      label: 'Tokens per day',
+      type: 'int',
+      min: 0,
+      optional: true,
+    },
+    {
+      path: 'providers.p.models',
+      label: 'Per-model options',
+      type: 'map',
+      entry: [
+        {
+          path: 'temperature',
+          label: 'Temperature',
+          type: 'number',
+          min: 0,
+          max: 2,
+          optional: true,
+        },
+      ],
+    },
+    {
+      path: 'roles.draft',
+      label: 'draft',
+      type: 'records',
+      entry: [
+        { path: 'provider', label: 'Provider', type: 'enum', options: ['p', 'q'] },
+        { path: 'model', label: 'Model', type: 'text' },
+      ],
+    },
+  ];
+
+  it('sends nothing until something changes', () => {
+    const r = pendingLayer(defs, k(), formState(defs, k()));
+    expect(r.patch).toBeNull();
+    expect(r.layer).toEqual(k().runtime);
+  });
+
+  it('keeps members the form does not know, and their order, when the form changes', () => {
+    const s = formState(defs, k());
+    s.form['providers.p.budget.tokensPerDay'] = '500';
+    s.form['providers.p.models'] = { m: { temperature: 1.5, later: true } };
+    const r = pendingLayer(defs, k(), s);
+    expect(r.errors).toEqual({});
+    expect(r.patch).toEqual({
+      providers: { p: { budget: { tokensPerDay: 500 }, models: { m: { temperature: 1.5 } } } },
+    });
+    // the unknown members stay, in their places
+    expect(Object.keys(r.layer)).toEqual(['providers', 'roles', 'zzz']);
+    expect(Object.keys((r.layer.providers as Record<string, unknown>).p as object)).toEqual([
+      'budget',
+      'future',
+      'models',
+    ]);
+    expect(r.layer.zzz).toBe(3);
+    expect((r.layer.providers as Record<string, unknown>).r).toBeNull();
+    expect(applyPatch(k().runtime, r.patch)).toEqual(r.layer);
+  });
+
+  it('round-trips through the JSON text without losing or reordering anything', () => {
+    const s = formState(defs, k());
+    s.form['providers.p.budget.tokensPerDay'] = '500';
+    s.form['roles.draft'] = [
+      { provider: 'q', model: 'x' },
+      { provider: 'p', model: 'm' },
+    ];
+    const first = pendingLayer(defs, k(), s);
+    const text = layerText(first.layer);
+    const parsed = parseLayer(text);
+    if ('error' in parsed) throw new Error(parsed.error);
+    const again = rebase(defs, k(), parsed.layer);
+    // the form shows the edits the text holds
+    expect(again.form['providers.p.budget.tokensPerDay']).toBe('500');
+    expect(again.form['roles.draft']).toEqual([
+      { provider: 'q', model: 'x' },
+      { provider: 'p', model: 'm' },
+    ]);
+    const second = pendingLayer(defs, k(), again);
+    expect(second.layer).toEqual(first.layer);
+    expect(second.patch).toEqual(first.patch);
+    expect(layerText(second.layer)).toBe(text);
+    // and a form edit after the JSON edit keeps what the JSON set
+    again.form['providers.p.models'] = { m: { temperature: 2, later: true } };
+    const third = pendingLayer(defs, k(), again);
+    expect(third.layer.zzz).toBe(3);
+    expect(third.patch).toMatchObject({
+      providers: { p: { budget: { tokensPerDay: 500 }, models: { m: { temperature: 2 } } } },
+    });
+  });
+
+  it('applies a JSON edit of a member the form does not know', () => {
+    const layer = { ...k().runtime, zzz: 4, added: { x: [1, 2] } };
+    const s = rebase(defs, k(), layer);
+    const r = pendingLayer(defs, k(), s);
+    expect(r.patch).toEqual({ zzz: 4, added: { x: [1, 2] } });
+  });
+
+  it('reports what does not read, and leaves it out of the layer', () => {
+    const s = formState(defs, k());
+    s.form['providers.p.budget.tokensPerDay'] = 'lots';
+    s.form['providers.p.models'] = { m: { temperature: 3 } };
+    s.form['roles.draft'] = [{ provider: 'z', model: '' }];
+    const r = pendingLayer(defs, k(), s);
+    expect(r.errors).toMatchObject({
+      'providers.p.budget.tokensPerDay': 'Tokens per day must be a whole number',
+    });
+    expect(r.entryErrors).toEqual({
+      'providers.p.models.m.temperature': 'Temperature is at most 2',
+      'roles.draft.0.provider': 'Provider is not one of the values',
+      'roles.draft.0.model': 'Model needs a value',
+    });
+    expect(r.patch).toBeNull();
+  });
+
+  it('previews the effective object of a layer, with declared values and locks', () => {
+    const kk = k();
+    // a runtime value removed falls back to the declared one
+    const back = previewEffective(kk, withAt(kk.runtime, ['providers', 'p', 'budget'], undefined));
+    expect(back.providers).toMatchObject({ p: { budget: { tokensPerDay: 1000 } } });
+    // a locked field keeps its value, whatever the layer says
+    const locked = previewEffective(
+      kk,
+      withAt(kk.runtime, ['providers', 'p', 'endpoint'], 'http://x'),
+    );
+    expect((locked.providers as Record<string, Record<string, unknown>>).p.endpoint).toBe(
+      'http://h/v1',
+    );
+    // a null removes the declared member, and taking it away brings it back
+    const restored = previewEffective(kk, withAt(kk.runtime, ['providers', 'r'], undefined));
+    expect((restored.providers as Record<string, unknown>).r).toEqual({
+      kind: 'openai',
+      endpoint: 'http://r',
+    });
+    expect(previewEffective(kk, kk.runtime)).toBe(kk.effective);
+  });
+
+  it('applies merge patches and drops empty objects as the server does', () => {
+    expect(applyPatch({ a: 1, b: { c: 2, d: 3 } }, { b: { c: null, e: 4 }, f: [1] })).toEqual({
+      a: 1,
+      b: { d: 3, e: 4 },
+      f: [1],
+    });
+    expect(pruned({ a: {}, b: { c: {} }, d: [], e: 0 })).toEqual({ d: [], e: 0 });
+    expect(withAt({ a: { b: 1 } }, ['a', 'b'], undefined)).toEqual({});
+    expect(withAt({ a: { b: 1 } }, ['a', 'c'], 2)).toEqual({ a: { b: 1, c: 2 } });
+    expect(parseLayer('[1]')).toEqual({ error: 'The runtime layer is a JSON object.' });
+  });
+
+  it('finds the field a server error names, from the field or a member below it', () => {
+    expect(fieldAt(defs, 'providers.p.models.m.temperature')?.path).toBe('providers.p.models');
+    expect(fieldAt(defs, 'roles.draft.1.model')?.path).toBe('roles.draft');
+    expect(fieldAt(defs, 'providers.p.endpoint')?.path).toBe('providers.p.endpoint');
+    expect(fieldAt(defs, 'providers.p.headers.X')).toBeUndefined();
+  });
+
+  it('reads the field a refused write names', () => {
+    const e = new ApiError(400, 'models: temperature must be between 0 and 2', {
+      code: 'bad-settings',
+      body: { field: 'providers.p.models.m.temperature' },
+    });
+    expect(writeFailure(e)).toEqual({
+      kind: 'invalid',
+      message: 'models: temperature must be between 0 and 2',
+      field: 'providers.p.models.m.temperature',
+    });
   });
 });

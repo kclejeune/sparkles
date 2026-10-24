@@ -16,6 +16,8 @@
     zoomIn: 'M11 11m-7 0a7 7 0 1 0 14 0a7 7 0 1 0 -14 0M20 20l-4-4M8 11h6M11 8v6',
     zoomOut: 'M11 11m-7 0a7 7 0 1 0 14 0a7 7 0 1 0 -14 0M20 20l-4-4M8 11h6',
     plus: 'M12 5v14M5 12h14',
+    arrowUp: 'M12 19V5M6 11l6-6 6 6',
+    arrowDown: 'M12 5v14M6 13l6 6 6-6',
     x: 'M6 6l12 12M18 6L6 18',
     trash: 'M4 7h16M9 7V4h6v3M6 7l1 13h10l1-13M10 11v6M14 11v6',
     upload: 'M12 16V4M7 9l5-5 5 5M4 16v4h16v-4',

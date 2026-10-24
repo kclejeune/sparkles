@@ -6,7 +6,8 @@
 // pipeline of mock/assistant.mjs, and a handoff link stands in for an agent's
 // `share_query`. The maps of relations, the communities, the Pattern pane, the diff graph
 // and the path finder on a query's graph use the `world` showcase dataset of
-// mock/world.mjs. Run with `mise run docs:screenshots`.
+// mock/world.mjs. The model configuration form uses the declared configuration of
+// mock/models.mjs. Run with `mise run docs:screenshots`.
 
 import { test as base, expect, type APIRequestContext, type Page } from '@playwright/test';
 import { encodeHandoff } from '../../src/lib/handoff';
@@ -898,4 +899,51 @@ test('forms-branch', async ({ page, request }) => {
   } finally {
     await request.patch('/$/branches/world/main', { data: { protected: false } });
   }
+});
+
+/** The server page's model configuration form, scrolled to the row of `field`. */
+async function modelsForm(page: Page, request: APIRequestContext, field: string) {
+  await request.delete('/$/server/settings/models');
+  await page.goto('/ui/server');
+  const panel = page.getByTestId('settings-model-configuration');
+  const row = (f: string) => panel.locator(`[data-field="${f}"]`);
+  await expect(row(field)).toBeVisible();
+  return { panel, row };
+}
+
+test('models-settings', async ({ page, request }) => {
+  // claude's allowed models as a list, and its per-model options as cards, one open with
+  // its typed fields and one being added from a suggestion
+  const { row } = await modelsForm(page, request, 'providers.claude.allowedModels');
+  const allowed = row('providers.claude.allowedModels');
+  await allowed.getByPlaceholder('Add a model').fill('claude-opus-5-5');
+  await allowed.getByPlaceholder('Add a model').press('Enter');
+  const models = row('providers.claude.models');
+  await models.locator('[data-entry="claude-haiku-5-5"] summary').click();
+  await models.getByPlaceholder('Add options for a model').fill('claude-sonnet-5-5');
+  await models.getByRole('button', { name: 'Add model' }).click();
+  const sonnet = models.locator('[data-entry="claude-sonnet-5-5"]');
+  await sonnet.getByLabel('Context tokens').fill('200000');
+  await sonnet.getByLabel('Output tokens').fill('8192');
+  await allowed.evaluate((e) => e.scrollIntoView({ block: 'start' }));
+  await page.evaluate(() => document.querySelector('main')?.scrollBy(0, -40));
+  await shoot(page, 'models-settings');
+});
+
+test('models-settings-errors', async ({ page, request }) => {
+  // errors beside the fields as they are typed: a per-model option out of range, text in
+  // a token field, and a role entry whose model the provider's allowed models leave out
+  const { panel, row } = await modelsForm(page, request, 'providers.local.models');
+  const models = row('providers.local.models');
+  await models.getByPlaceholder('Add options for a model').fill('llama3.3:70b');
+  await models.getByRole('button', { name: 'Add model' }).click();
+  const card = models.locator('[data-entry="llama3.3:70b"]');
+  await card.getByLabel('Temperature').fill('2.5');
+  await card.getByLabel('Context tokens').fill('128k');
+  await card.getByLabel('Request timeout').fill('120');
+  await expect(card.getByText('Temperature is at most 2')).toBeVisible();
+  await expect(panel.getByText('1 field needs a fix')).toBeVisible();
+  await row('providers.local.allowedModels').evaluate((e) => e.scrollIntoView({ block: 'start' }));
+  await page.evaluate(() => document.querySelector('main')?.scrollBy(0, -40));
+  await shoot(page, 'models-settings-errors');
 });

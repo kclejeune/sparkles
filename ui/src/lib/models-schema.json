@@ -1,0 +1,824 @@
+{
+  "ModelOptions": {
+    "additionalProperties": false,
+    "description": "The options of one model of a provider. A member left out takes the provider's value, then the built-in default.",
+    "properties": {
+      "contextTokens": {
+        "default": 8192,
+        "description": "The tokens the model reads at most, prompt and answer together.",
+        "minimum": 1,
+        "title": "Context tokens",
+        "type": "integer",
+        "x-sparkles-unit": "tokens"
+      },
+      "dimensions": {
+        "description": "Truncate the vectors to this many components.",
+        "minimum": 1,
+        "title": "Dimensions",
+        "type": "integer",
+        "x-sparkles-kinds": [
+          "local"
+        ]
+      },
+      "documentPrefix": {
+        "description": "Text put before stored documents, in place of the snapshot's prompt.",
+        "maxLength": 4096,
+        "title": "Document prefix",
+        "type": "string",
+        "x-sparkles-kinds": [
+          "local"
+        ]
+      },
+      "dtype": {
+        "description": "The type the weights are computed in.",
+        "enum": [
+          "f32",
+          "bf16"
+        ],
+        "title": "Weights type",
+        "type": "string",
+        "x-sparkles-kinds": [
+          "local"
+        ]
+      },
+      "idleUnloadSecs": {
+        "description": "Seconds without work before the weights are dropped. 0 keeps them.",
+        "minimum": 0,
+        "title": "Unload after",
+        "type": "integer",
+        "x-sparkles-kinds": [
+          "local"
+        ],
+        "x-sparkles-unit": "seconds"
+      },
+      "maxOutputTokens": {
+        "default": 2048,
+        "description": "The tokens of one answer at most.",
+        "minimum": 1,
+        "title": "Output tokens",
+        "type": "integer",
+        "x-sparkles-unit": "tokens"
+      },
+      "maxTokens": {
+        "description": "The tokens of one text at most, up to the model's own limit.",
+        "minimum": 2,
+        "title": "Tokens per text",
+        "type": "integer",
+        "x-sparkles-kinds": [
+          "local"
+        ],
+        "x-sparkles-unit": "tokens"
+      },
+      "numCtx": {
+        "description": "Ollama's context option, sent with each call.",
+        "minimum": 1,
+        "title": "Context (num_ctx)",
+        "type": "integer",
+        "x-sparkles-kinds": [
+          "ollama"
+        ],
+        "x-sparkles-unit": "tokens"
+      },
+      "path": {
+        "description": "An absolute snapshot directory on the server, in place of repo and revision.",
+        "title": "Snapshot path",
+        "type": "string",
+        "x-sparkles-kinds": [
+          "local"
+        ]
+      },
+      "pricing": {
+        "additionalProperties": false,
+        "description": "Prices per million tokens, for cost estimates only.",
+        "properties": {
+          "inputPerMTok": {
+            "description": "The price of a million input tokens.",
+            "minimum": 0,
+            "title": "Input price",
+            "type": "number"
+          },
+          "outputPerMTok": {
+            "description": "The price of a million output tokens.",
+            "minimum": 0,
+            "title": "Output price",
+            "type": "number"
+          }
+        },
+        "title": "Pricing",
+        "type": "object",
+        "x-sparkles-order": [
+          "inputPerMTok",
+          "outputPerMTok"
+        ]
+      },
+      "queryPrefix": {
+        "description": "Text put before queries, in place of the snapshot's query prompt.",
+        "maxLength": 4096,
+        "title": "Query prefix",
+        "type": "string",
+        "x-sparkles-kinds": [
+          "local"
+        ]
+      },
+      "repo": {
+        "description": "The Hugging Face repository of the model's snapshot.",
+        "title": "Repository",
+        "type": "string",
+        "x-sparkles-kinds": [
+          "local"
+        ]
+      },
+      "requestTimeoutSecs": {
+        "default": 60,
+        "description": "How long one call may take.",
+        "exclusiveMinimum": 0,
+        "title": "Request timeout",
+        "type": "number",
+        "x-sparkles-unit": "seconds"
+      },
+      "revision": {
+        "description": "The snapshot's full 40-character commit.",
+        "pattern": "^[0-9a-f]{40}$",
+        "title": "Revision",
+        "type": "string",
+        "x-sparkles-kinds": [
+          "local"
+        ]
+      },
+      "structuredOutput": {
+        "default": "auto",
+        "description": "How answers are held to a JSON Schema. `auto` tries json-schema, then json-object, then text, and keeps the first that works. The anthropic kind offers no json-object level and the ollama kind no tool level.",
+        "enum": [
+          "auto",
+          "json-schema",
+          "json-object",
+          "tool",
+          "text"
+        ],
+        "title": "Structured output",
+        "type": "string",
+        "x-sparkles-enum-kinds": {
+          "json-object": [
+            "ollama",
+            "openai",
+            "local"
+          ],
+          "tool": [
+            "openai",
+            "anthropic",
+            "local"
+          ]
+        }
+      },
+      "temperature": {
+        "description": "Sampling temperature from 0 to 2. Other kinds send 0 when it is unset, and the anthropic kind sends nothing.",
+        "maximum": 2,
+        "minimum": 0,
+        "title": "Temperature",
+        "type": "number",
+        "x-sparkles-unset": "0, or none for anthropic"
+      },
+      "threads": {
+        "description": "The threads of the model's inference pool, from 1 to 256.",
+        "maximum": 256,
+        "minimum": 1,
+        "title": "Threads",
+        "type": "integer",
+        "x-sparkles-kinds": [
+          "local"
+        ]
+      }
+    },
+    "type": "object",
+    "x-sparkles-order": [
+      "contextTokens",
+      "maxOutputTokens",
+      "temperature",
+      "structuredOutput",
+      "requestTimeoutSecs",
+      "numCtx",
+      "pricing",
+      "repo",
+      "revision",
+      "path",
+      "dtype",
+      "threads",
+      "idleUnloadSecs",
+      "dimensions",
+      "maxTokens",
+      "queryPrefix",
+      "documentPrefix"
+    ]
+  },
+  "ModelProviderSettings": {
+    "additionalProperties": false,
+    "description": "One provider of the model configuration: its protocol, endpoint, key and limits, the defaults of its models (the members in the `Model defaults` section) and the options of each model.",
+    "properties": {
+      "allowedModels": {
+        "description": "The models that role lists may name with this provider. When it is unset, any model is allowed.",
+        "items": {
+          "minLength": 1,
+          "type": "string"
+        },
+        "title": "Allowed models",
+        "type": "array",
+        "uniqueItems": true,
+        "x-sparkles-kinds": [
+          "ollama",
+          "openai",
+          "anthropic"
+        ],
+        "x-sparkles-section": "Models",
+        "x-sparkles-unset": "any model"
+      },
+      "apiKey": {
+        "additionalProperties": false,
+        "description": "The key, named by a secret and never written here.",
+        "properties": {
+          "secret": {
+            "description": "The secret that holds the key. The key itself is stored with Set key or under API keys and is never shown.",
+            "pattern": "^[A-Za-z0-9_][A-Za-z0-9_.-]{0,127}$",
+            "title": "API key",
+            "type": "string",
+            "x-sparkles-secret": true
+          }
+        },
+        "required": [
+          "secret"
+        ],
+        "title": "API key",
+        "type": "object",
+        "x-sparkles-kinds": [
+          "ollama",
+          "openai",
+          "anthropic"
+        ],
+        "x-sparkles-unset": "no key"
+      },
+      "budget": {
+        "additionalProperties": false,
+        "description": "Token caps of the provider.",
+        "properties": {
+          "tokensPerDay": {
+            "description": "Input and output tokens per day at most. 0 stops every call.",
+            "minimum": 0,
+            "title": "Tokens per day",
+            "type": "integer",
+            "x-sparkles-unit": "tokens",
+            "x-sparkles-unset": "no cap"
+          }
+        },
+        "title": "Budget",
+        "type": "object",
+        "x-sparkles-order": [
+          "tokensPerDay"
+        ]
+      },
+      "concurrency": {
+        "default": 4,
+        "description": "The calls to this provider that may run at once.",
+        "minimum": 1,
+        "title": "Concurrent calls",
+        "type": "integer"
+      },
+      "connectTimeoutSecs": {
+        "default": 10,
+        "description": "How long opening a connection may take.",
+        "exclusiveMinimum": 0,
+        "title": "Connect timeout",
+        "type": "number",
+        "x-sparkles-kinds": [
+          "ollama",
+          "openai",
+          "anthropic"
+        ],
+        "x-sparkles-unit": "seconds"
+      },
+      "contextTokens": {
+        "default": 8192,
+        "description": "The tokens the model reads at most, prompt and answer together.",
+        "minimum": 1,
+        "title": "Context tokens",
+        "type": "integer",
+        "x-sparkles-section": "Model defaults",
+        "x-sparkles-unit": "tokens"
+      },
+      "dimensions": {
+        "description": "Truncate the vectors to this many components.",
+        "minimum": 1,
+        "title": "Dimensions",
+        "type": "integer",
+        "x-sparkles-kinds": [
+          "local"
+        ],
+        "x-sparkles-section": "Model defaults"
+      },
+      "documentPrefix": {
+        "description": "Text put before stored documents, in place of the snapshot's prompt.",
+        "maxLength": 4096,
+        "title": "Document prefix",
+        "type": "string",
+        "x-sparkles-kinds": [
+          "local"
+        ],
+        "x-sparkles-section": "Model defaults"
+      },
+      "dtype": {
+        "description": "The type the weights are computed in.",
+        "enum": [
+          "f32",
+          "bf16"
+        ],
+        "title": "Weights type",
+        "type": "string",
+        "x-sparkles-kinds": [
+          "local"
+        ],
+        "x-sparkles-section": "Model defaults"
+      },
+      "endpoint": {
+        "description": "The base URL, http or https, without credentials, a query or a fragment. A private address needs --outbound-allow-private.",
+        "format": "uri",
+        "title": "Endpoint",
+        "type": "string",
+        "x-sparkles-kinds": [
+          "ollama",
+          "openai",
+          "anthropic"
+        ]
+      },
+      "headers": {
+        "additionalProperties": {
+          "type": "string"
+        },
+        "description": "Extra request headers that are not secret. Headers that carry a key, such as Authorization, are refused.",
+        "propertyNames": {
+          "pattern": "^[!#$%&'*+.^_`|~0-9A-Za-z-]+$"
+        },
+        "title": "Headers",
+        "type": "object",
+        "x-sparkles-kinds": [
+          "openai"
+        ]
+      },
+      "idleUnloadSecs": {
+        "description": "Seconds without work before the weights are dropped. 0 keeps them.",
+        "minimum": 0,
+        "title": "Unload after",
+        "type": "integer",
+        "x-sparkles-kinds": [
+          "local"
+        ],
+        "x-sparkles-section": "Model defaults",
+        "x-sparkles-unit": "seconds"
+      },
+      "keepAlive": {
+        "description": "How long Ollama keeps the model loaded, as a duration such as 10m or 1h, or -1 to keep it.",
+        "pattern": "^(-1|-?[0-9]+|-?([0-9]+(\\.[0-9]+)?(ns|us|µs|ms|s|m|h))+)$",
+        "title": "Keep alive",
+        "type": "string",
+        "x-sparkles-kinds": [
+          "ollama"
+        ],
+        "x-sparkles-unset": "Ollama's default"
+      },
+      "kind": {
+        "description": "The protocol the provider speaks. The local kind runs embedding models in the server and takes no endpoint or key.",
+        "enum": [
+          "ollama",
+          "openai",
+          "anthropic",
+          "local"
+        ],
+        "title": "Protocol",
+        "type": "string"
+      },
+      "maxOutputTokens": {
+        "default": 2048,
+        "description": "The tokens of one answer at most.",
+        "minimum": 1,
+        "title": "Output tokens",
+        "type": "integer",
+        "x-sparkles-section": "Model defaults",
+        "x-sparkles-unit": "tokens"
+      },
+      "maxTokens": {
+        "description": "The tokens of one text at most, up to the model's own limit.",
+        "minimum": 2,
+        "title": "Tokens per text",
+        "type": "integer",
+        "x-sparkles-kinds": [
+          "local"
+        ],
+        "x-sparkles-section": "Model defaults",
+        "x-sparkles-unit": "tokens"
+      },
+      "models": {
+        "additionalProperties": {
+          "$ref": "#/components/schemas/ModelOptions"
+        },
+        "description": "Options by model name. A model's entry overrides the provider's defaults above for that model.",
+        "title": "Per-model options",
+        "type": "object",
+        "x-sparkles-section": "Models"
+      },
+      "numCtx": {
+        "description": "Ollama's context option, sent with each call.",
+        "minimum": 1,
+        "title": "Context (num_ctx)",
+        "type": "integer",
+        "x-sparkles-kinds": [
+          "ollama"
+        ],
+        "x-sparkles-section": "Model defaults",
+        "x-sparkles-unit": "tokens"
+      },
+      "path": {
+        "description": "An absolute snapshot directory on the server, in place of repo and revision.",
+        "title": "Snapshot path",
+        "type": "string",
+        "x-sparkles-kinds": [
+          "local"
+        ],
+        "x-sparkles-section": "Model defaults"
+      },
+      "pricing": {
+        "additionalProperties": false,
+        "description": "Prices per million tokens, for cost estimates only.",
+        "properties": {
+          "inputPerMTok": {
+            "description": "The price of a million input tokens.",
+            "minimum": 0,
+            "title": "Input price",
+            "type": "number"
+          },
+          "outputPerMTok": {
+            "description": "The price of a million output tokens.",
+            "minimum": 0,
+            "title": "Output price",
+            "type": "number"
+          }
+        },
+        "title": "Pricing",
+        "type": "object",
+        "x-sparkles-order": [
+          "inputPerMTok",
+          "outputPerMTok"
+        ],
+        "x-sparkles-section": "Model defaults"
+      },
+      "queryPrefix": {
+        "description": "Text put before queries, in place of the snapshot's query prompt.",
+        "maxLength": 4096,
+        "title": "Query prefix",
+        "type": "string",
+        "x-sparkles-kinds": [
+          "local"
+        ],
+        "x-sparkles-section": "Model defaults"
+      },
+      "repo": {
+        "description": "The Hugging Face repository of the model's snapshot.",
+        "title": "Repository",
+        "type": "string",
+        "x-sparkles-kinds": [
+          "local"
+        ],
+        "x-sparkles-section": "Model defaults"
+      },
+      "requestTimeoutSecs": {
+        "default": 60,
+        "description": "How long one call may take.",
+        "exclusiveMinimum": 0,
+        "title": "Request timeout",
+        "type": "number",
+        "x-sparkles-section": "Model defaults",
+        "x-sparkles-unit": "seconds"
+      },
+      "requestsPerMinute": {
+        "description": "The calls per minute at most. 0 sets no limit.",
+        "minimum": 0,
+        "title": "Requests per minute",
+        "type": "integer",
+        "x-sparkles-unset": "no limit"
+      },
+      "revision": {
+        "description": "The snapshot's full 40-character commit.",
+        "pattern": "^[0-9a-f]{40}$",
+        "title": "Revision",
+        "type": "string",
+        "x-sparkles-kinds": [
+          "local"
+        ],
+        "x-sparkles-section": "Model defaults"
+      },
+      "structuredOutput": {
+        "default": "auto",
+        "description": "How answers are held to a JSON Schema. `auto` tries json-schema, then json-object, then text, and keeps the first that works. The anthropic kind offers no json-object level and the ollama kind no tool level.",
+        "enum": [
+          "auto",
+          "json-schema",
+          "json-object",
+          "tool",
+          "text"
+        ],
+        "title": "Structured output",
+        "type": "string",
+        "x-sparkles-enum-kinds": {
+          "json-object": [
+            "ollama",
+            "openai",
+            "local"
+          ],
+          "tool": [
+            "openai",
+            "anthropic",
+            "local"
+          ]
+        },
+        "x-sparkles-section": "Model defaults"
+      },
+      "temperature": {
+        "description": "Sampling temperature from 0 to 2. Other kinds send 0 when it is unset, and the anthropic kind sends nothing.",
+        "maximum": 2,
+        "minimum": 0,
+        "title": "Temperature",
+        "type": "number",
+        "x-sparkles-section": "Model defaults",
+        "x-sparkles-unset": "0, or none for anthropic"
+      },
+      "threads": {
+        "description": "The threads of the model's inference pool, from 1 to 256.",
+        "maximum": 256,
+        "minimum": 1,
+        "title": "Threads",
+        "type": "integer",
+        "x-sparkles-kinds": [
+          "local"
+        ],
+        "x-sparkles-section": "Model defaults"
+      },
+      "tls": {
+        "additionalProperties": false,
+        "description": "How the provider's certificate is checked.",
+        "properties": {
+          "caCert": {
+            "additionalProperties": false,
+            "description": "A PEM CA certificate or bundle trusted for this provider in addition to the system roots, named by a file or a secret. Set only one of the two.",
+            "properties": {
+              "file": {
+                "description": "An absolute path on the server to a PEM CA certificate or bundle. Use it for an internal CA or a self-signed certificate.",
+                "title": "CA certificate file",
+                "type": "string"
+              },
+              "secret": {
+                "description": "A secret that holds the PEM CA certificate, in place of a file.",
+                "pattern": "^[A-Za-z0-9_][A-Za-z0-9_.-]{0,127}$",
+                "title": "CA certificate secret",
+                "type": "string",
+                "x-sparkles-secret": true
+              }
+            },
+            "title": "CA certificate",
+            "type": "object",
+            "x-sparkles-order": [
+              "file",
+              "secret"
+            ]
+          },
+          "insecureSkipVerify": {
+            "default": false,
+            "description": "Unsafe. The API key and the prompts sent to this provider can be read and changed by anyone on the network path. Prefer a CA certificate.",
+            "title": "Skip certificate verification",
+            "type": "boolean"
+          }
+        },
+        "title": "TLS",
+        "type": "object",
+        "x-sparkles-https": true,
+        "x-sparkles-kinds": [
+          "ollama",
+          "openai",
+          "anthropic"
+        ],
+        "x-sparkles-order": [
+          "caCert",
+          "insecureSkipVerify"
+        ]
+      },
+      "version": {
+        "default": "2023-06-01",
+        "description": "The anthropic-version header.",
+        "title": "API version",
+        "type": "string",
+        "x-sparkles-kinds": [
+          "anthropic"
+        ]
+      }
+    },
+    "required": [
+      "kind"
+    ],
+    "type": "object",
+    "x-sparkles-order": [
+      "kind",
+      "endpoint",
+      "apiKey",
+      "connectTimeoutSecs",
+      "concurrency",
+      "requestsPerMinute",
+      "budget",
+      "headers",
+      "keepAlive",
+      "version",
+      "tls",
+      "contextTokens",
+      "maxOutputTokens",
+      "temperature",
+      "structuredOutput",
+      "requestTimeoutSecs",
+      "numCtx",
+      "pricing",
+      "repo",
+      "revision",
+      "path",
+      "dtype",
+      "threads",
+      "idleUnloadSecs",
+      "dimensions",
+      "maxTokens",
+      "queryPrefix",
+      "documentPrefix",
+      "allowedModels",
+      "models"
+    ]
+  },
+  "ModelRolePair": {
+    "additionalProperties": false,
+    "description": "One entry of a role list: a provider and model, with optional caps.",
+    "properties": {
+      "maxOutputTokens": {
+        "description": "Caps the answer of this entry below the model's own cap.",
+        "minimum": 1,
+        "title": "Output tokens",
+        "type": "integer",
+        "x-sparkles-unit": "tokens"
+      },
+      "model": {
+        "description": "A model of the provider that its allowed models permit.",
+        "minLength": 1,
+        "title": "Model",
+        "type": "string"
+      },
+      "provider": {
+        "description": "A provider of the configuration, of a kind other than local.",
+        "title": "Provider",
+        "type": "string"
+      },
+      "requestTimeoutSecs": {
+        "description": "The timeout of this entry, in place of the model's.",
+        "exclusiveMinimum": 0,
+        "title": "Request timeout",
+        "type": "number",
+        "x-sparkles-unit": "seconds"
+      }
+    },
+    "required": [
+      "provider",
+      "model"
+    ],
+    "type": "object",
+    "x-sparkles-order": [
+      "provider",
+      "model",
+      "maxOutputTokens",
+      "requestTimeoutSecs"
+    ]
+  },
+  "ModelsSettings": {
+    "additionalProperties": false,
+    "description": "The model configuration of `--model-config` and of the `models` kind of `/$/server/settings/models`: providers, role lists and routing. The web UI builds its form from this schema.",
+    "properties": {
+      "providers": {
+        "additionalProperties": {
+          "$ref": "#/components/schemas/ModelProviderSettings"
+        },
+        "description": "The providers by name. A name has letters, digits, _, - and . only.",
+        "propertyNames": {
+          "pattern": "^[A-Za-z0-9_.-]+$"
+        },
+        "title": "Providers",
+        "type": "object"
+      },
+      "roles": {
+        "additionalProperties": false,
+        "description": "The provider and model pairs each step calls, in order. A role list is one field.",
+        "properties": {
+          "community": {
+            "description": "The reports of GraphRAG communities. It uses the summarize list when unset, and an empty list turns it off.",
+            "items": {
+              "$ref": "#/components/schemas/ModelRolePair"
+            },
+            "title": "community",
+            "type": "array",
+            "x-sparkles-fallback": "summarize"
+          },
+          "draft": {
+            "description": "The first draft of a query from a question. The first entry answers, and the server moves to the next only on the signals it verifies. The role is off when unset.",
+            "items": {
+              "$ref": "#/components/schemas/ModelRolePair"
+            },
+            "title": "draft",
+            "type": "array"
+          },
+          "explain": {
+            "description": "The prose of a query explanation. The role is off when unset.",
+            "items": {
+              "$ref": "#/components/schemas/ModelRolePair"
+            },
+            "title": "explain",
+            "type": "array"
+          },
+          "extract": {
+            "description": "Extraction from document chunks and the CSV mapping draft. The role is off when unset.",
+            "items": {
+              "$ref": "#/components/schemas/ModelRolePair"
+            },
+            "title": "extract",
+            "type": "array"
+          },
+          "optimize": {
+            "description": "A proposed query rewrite. The role is off when unset.",
+            "items": {
+              "$ref": "#/components/schemas/ModelRolePair"
+            },
+            "title": "optimize",
+            "type": "array"
+          },
+          "repair": {
+            "description": "A new draft after a diagnosis. It uses the draft list when unset, and an empty list turns it off.",
+            "items": {
+              "$ref": "#/components/schemas/ModelRolePair"
+            },
+            "title": "repair",
+            "type": "array",
+            "x-sparkles-fallback": "draft"
+          },
+          "summarize": {
+            "description": "The answer from the rows. The role is off when unset.",
+            "items": {
+              "$ref": "#/components/schemas/ModelRolePair"
+            },
+            "title": "summarize",
+            "type": "array"
+          }
+        },
+        "title": "Roles",
+        "type": "object",
+        "x-sparkles-order": [
+          "draft",
+          "repair",
+          "summarize",
+          "community",
+          "extract",
+          "explain",
+          "optimize"
+        ]
+      },
+      "routing": {
+        "additionalProperties": false,
+        "description": "When a question starts at the second entry of a role list.",
+        "properties": {
+          "complexityThreshold": {
+            "default": 8,
+            "description": "A query whose complexity score reaches it starts repair, or the next draft, at the second entry of its list. A dataset's assistant settings can override it.",
+            "minimum": 0,
+            "title": "Complexity threshold",
+            "type": "integer"
+          },
+          "exampleScore": {
+            "default": 0.8,
+            "description": "The score from 0 to 1 that the best stored example needs before its complexity counts.",
+            "maximum": 1,
+            "minimum": 0,
+            "title": "Example score",
+            "type": "number"
+          }
+        },
+        "title": "Routing",
+        "type": "object",
+        "x-sparkles-order": [
+          "complexityThreshold",
+          "exampleScore"
+        ]
+      }
+    },
+    "title": "Model configuration",
+    "type": "object",
+    "x-sparkles-order": [
+      "providers",
+      "roles",
+      "routing"
+    ]
+  }
+}
