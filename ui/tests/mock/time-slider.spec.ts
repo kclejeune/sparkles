@@ -208,11 +208,11 @@ test('A6: a commit the server can no longer read keeps the view and hatches the 
   });
   await page.goto('/ui/query?at=commit%3A5');
   // the link reads commit 5, which the mock no longer holds: a toast names what is readable
-  await expect(page.getByText('Commit 5 can no longer be read')).toBeVisible();
+  await expect(page.getByText('Commit 5 is no longer available')).toBeVisible();
   // the head of the dataset is the only commit that can be read
-  const readable = page.getByText(/Readable commits: \d+\./);
+  const readable = page.getByText(/Available commits: \d+\./);
   await expect(readable).toBeVisible();
-  const head = /Readable commits: (\d+)\./.exec((await readable.textContent()) ?? '')?.[1];
+  const head = /Available commits: (\d+)\./.exec((await readable.textContent()) ?? '')?.[1];
   await expect(right(page)).toHaveAttribute('aria-valuenow', head ?? '');
   await expect(page.locator('input[list="at-options"]')).toHaveValue('');
   // the track marks the stretch as gone
@@ -284,7 +284,7 @@ test('U2: a refused read in the middle of a scrub keeps the last result on scree
   await page.keyboard.press('ArrowLeft');
   await expect.poll(() => reads.includes('commit:2')).toBe(true);
   await page.keyboard.press('ArrowLeft');
-  await expect(page.getByText('Commit 1 can no longer be read')).toBeVisible();
+  await expect(page.getByText('Commit 1 is no longer available')).toBeVisible();
   // the head's rows were put back without reading the head again
   await expect(right(page)).toHaveAttribute('aria-valuenow', '3');
   await expect(grid(page)).toContainText('/carol');

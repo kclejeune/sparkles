@@ -14,7 +14,7 @@
         <div>{t.text}</div>
         {#if t.detail}<div class="detail">{t.detail}</div>{/if}
         {#if t.requestId}
-          <div class="rid" title="Request id: find this request in the server log">
+          <div class="rid" title="Use this ID to find the request in the server log">
             Request <span class="mono">{t.requestId}</span>
           </div>
         {/if}

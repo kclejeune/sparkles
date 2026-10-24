@@ -63,15 +63,15 @@ export function formatFailure(e: unknown, what: string): FormatFailure | null {
     return {
       title:
         e.line != null
-          ? `Can't format: syntax error at line ${e.line}`
-          : "Can't format: syntax error",
+          ? `Cannot format: syntax error at line ${e.line}`
+          : 'Cannot format: syntax error',
       detail: e.message,
       line: e.line,
       column: e.column,
     };
   }
   if (e instanceof ApiError && e.status === 422) {
-    return { title: `The formatter could not format ${what} safely; it was left unchanged` };
+    return { title: `Could not format ${what} safely, so it was left unchanged` };
   }
   return null;
 }

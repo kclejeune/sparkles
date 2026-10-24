@@ -44,7 +44,7 @@ test('the Format button formats; a syntax error highlights its line', async ({ p
 
   await setText(page, 'ex:S a sh:NodeShape ;\n  sh:property [ sh:path ex:p .');
   await format.click();
-  await expect(page.getByText("Can't format: syntax error at line 2")).toBeVisible();
+  await expect(page.getByText('Cannot format: syntax error at line 2')).toBeVisible();
   await expect(panel.locator('.cm-error-line')).toHaveCount(1);
   await expect(panel.locator('.cm-error-line')).toContainText('sh:property [');
   // the text is left as it was; an edit clears the highlight

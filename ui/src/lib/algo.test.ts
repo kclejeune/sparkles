@@ -195,7 +195,9 @@ describe('projection runs (§3.2)', () => {
         {},
       );
     await expect(run({ state: 'cancelled' })).rejects.toThrow('cancelled');
-    await expect(run({ state: 'done', detail: { kept: false } })).rejects.toThrow('no memory');
+    await expect(run({ state: 'done', detail: { kept: false } })).rejects.toThrow(
+      'did not have the memory',
+    );
   });
 
   it('reads the kept result at the run commit and refuses a chunk from another', async () => {
@@ -236,7 +238,7 @@ describe('projection runs (§3.2)', () => {
       },
     };
     await expect(runProjection(other, ALGOS.pageRank, { name: 'p' }, iris, {})).rejects.toThrow(
-      'commit 8 instead of 7',
+      'commit 8, not 7',
     );
   });
 

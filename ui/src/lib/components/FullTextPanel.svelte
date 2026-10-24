@@ -248,8 +248,8 @@
       </dl>
       {#if behind}
         <p class="warnline">
-          <Icon name="alert" size={13} /> The index reflects commit {status.seq}, the data is at
-          commit {status.storeSeq}. Text queries answer 503 until it has caught up.
+          <Icon name="alert" size={13} /> The index is at commit {status.seq} and the data is at commit
+          {status.storeSeq}. Text queries return 503 until the index catches up.
         </p>
       {/if}
       {#if status.message}<p class="faint small">{status.message}</p>{/if}
@@ -362,7 +362,7 @@
       {/if}
     {/if}
     <p class="faint small">
-      The index is built by a background task. Text queries answer 503 until it is ready.
+      The index builds in the background. Text queries return 503 until it is ready.
     </p>
     {#if configError}<div class="error-box">{configError}</div>{/if}
   </form>
@@ -378,7 +378,7 @@
 <Modal bind:open={disableOpen} title="Disable full-text search?">
   <p>
     This deletes the full-text index of <span class="mono">{name}</span>. Queries using
-    <span class="mono">text:query</span> fail until it is enabled and rebuilt again. The data is not changed.
+    <span class="mono">text:query</span> fail until you enable it again. The data is not changed.
   </p>
   {#snippet actions()}
     <button class="btn" type="button" onclick={() => (disableOpen = false)}>Cancel</button>

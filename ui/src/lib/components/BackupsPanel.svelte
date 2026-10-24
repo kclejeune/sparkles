@@ -145,7 +145,7 @@
       <p class="panel-body faint"><span class="spinner"></span> Loading…</p>
     {:else if list.length === 0}
       <p class="panel-body faint">
-        No backups of {name} yet{admin ? ': back it up into a repository.' : '.'}
+        No backups of {name} yet.{admin ? ' Use Back up now to make one.' : ''}
       </p>
     {:else}
       <div class="scroll-x">
@@ -155,7 +155,7 @@
               <th>Backup</th>
               <th>Commit</th>
               <th class="num">Size</th>
-              <th class="num" title="Size over the bytes it added">Dedup</th>
+              <th class="num" title="Total size divided by the new bytes it added">Dedup</th>
               <th></th>
             </tr>
           </thead>
@@ -172,7 +172,7 @@
                       : ''}
                     {#if x.sameLineage === false}<span
                         class="badge warn"
-                        title="Another dataset id ({x.dataset.id}): an earlier dataset of this name"
+                        title="From an earlier dataset with this name (id {x.dataset.id})"
                         >other lineage</span
                       >{/if}
                     {#if x.verified?.status === 'error'}<span

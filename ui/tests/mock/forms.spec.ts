@@ -284,7 +284,7 @@ test('an empty scalar list of more than six values is a select that sets the val
 test('a value in a graph the person cannot write is shown read-only', async ({ page }) => {
   const form = await openCompany(page, 'andes');
   const offices = form.locator(`[data-field="<${W}hasOffice>"]`);
-  await expect(offices.getByText('in a graph you cannot write')).toBeVisible();
+  await expect(offices.getByText('in a graph you cannot write to')).toBeVisible();
   await expect(offices.getByRole('button', { name: /^Remove/ })).toHaveCount(0);
   await expect(offices.getByRole('button', { name: /Add Offices/ })).toBeEnabled();
 });

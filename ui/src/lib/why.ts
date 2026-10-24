@@ -41,8 +41,8 @@ export type WhyResult =
 /** The most derivations the panel asks for, whose top rules differ (§2.4). */
 export const MAX_TREES = 5;
 
-const NONE = 'No derivation from facts you can read was found.';
-const BUDGET = 'The derivation is deeper than the search allows.';
+const NONE = 'No derivation found.';
+const BUDGET = 'The derivation is deeper than the search limit.';
 
 /** Ask why `triple` is entailed. A `404`, `422` or `501` is an answer, not an error. */
 export async function explainTriple(
@@ -223,13 +223,13 @@ export function staleNote(e: Explanation): string | null {
   if (e.source !== 'materialized') return null;
   // a read at the head describes the current data, whatever the run's freshness
   if (e.readAtHead)
-    return 'The history no longer has the commit the inferences were computed at, so the tree reads the current data.';
+    return 'The commit these inferences were computed at is no longer in the history, so this tree uses the current data.';
   if (e.stale) {
     const since =
       e.commitsSince != null
         ? ` ${e.commitsSince} commit${e.commitsSince === 1 ? '' : 's'} since.`
         : '';
-    return `The inferences are stale: this tree explains the closure as it was computed at commit ${e.commit}.${since}`;
+    return `These inferences are out of date. This tree shows them as computed at commit ${e.commit}.${since}`;
   }
   return null;
 }

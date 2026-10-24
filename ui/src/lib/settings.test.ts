@@ -101,7 +101,7 @@ describe('field sources', () => {
     expect(fieldInfo(over, 'historyDays').overrides).toBe(30);
     expect(sourceText(fieldInfo(over, 'historyDays'))).toMatchObject({
       label: 'overrides server config',
-      title: expect.stringMatching(/configuration \(30\) is not used/),
+      title: expect.stringMatching(/overriding the server's configuration \(30\)/),
     });
     // a runtime value equal to the declared one overrides nothing
     const same = kind({ declared: { historyDays: 7 } });
@@ -145,7 +145,7 @@ describe('field sources', () => {
     expect(f).toMatchObject({ source: 'locked', locked: true, overridden: true, runtime: true });
     expect(f.ignored).toBe('rows');
     expect(sourceText(f)?.label).toBe('locked');
-    expect(sourceText(f)?.title).toMatch(/operator locked/);
+    expect(sourceText(f)?.title).toMatch(/locked in the server's configuration/);
   });
 
   it('locks the fields below a locked object, and notes a lock below a field', () => {
@@ -564,7 +564,7 @@ describe('the form and the JSON editor share one change', () => {
     expect(pruned({ a: {}, b: { c: {} }, d: [], e: 0 })).toEqual({ d: [], e: 0 });
     expect(withAt({ a: { b: 1 } }, ['a', 'b'], undefined)).toEqual({});
     expect(withAt({ a: { b: 1 } }, ['a', 'c'], 2)).toEqual({ a: { b: 1, c: 2 } });
-    expect(parseLayer('[1]')).toEqual({ error: 'The runtime layer is a JSON object.' });
+    expect(parseLayer('[1]')).toEqual({ error: 'The runtime layer must be a JSON object.' });
   });
 
   it('finds the field a server error names, from the field or a member below it', () => {

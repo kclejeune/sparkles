@@ -204,7 +204,7 @@ test('memory', async ({ page }) => {
   });
   const search = page.getByRole('region', { name: 'Search memory' });
   await search.getByRole('textbox', { name: 'Search memory' }).fill('payments team');
-  await search.getByRole('button', { name: 'Recall' }).click();
+  await search.getByRole('button', { name: 'Search' }).click();
   await expect(search.getByRole('region', { name: /Facts about/ }).first()).toBeVisible();
   await shoot(page, 'memory');
 });
@@ -878,7 +878,7 @@ INSERT DATA {
   await why.click();
   const panel = page.getByTestId('why-panel');
   await expect(panel.getByRole('tree')).toBeVisible();
-  await expect(panel.getByRole('note')).toContainText('stale');
+  await expect(panel.getByRole('note')).toContainText('out of date');
   await panel.getByRole('button', { name: 'Next' }).click();
   await expect(panel).toContainText('2 of 2 derivations');
   await page.getByRole('button', { name: 'Fit to view' }).click();

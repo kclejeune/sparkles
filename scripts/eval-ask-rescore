@@ -40,11 +40,18 @@ def rescore(
     model_config=None,
     timeout=None,
     policy=POLICY,
+    loc=None,
 ):
     report_path = pathlib.Path(report_path)
     source = strict_json(bounded_file(report_path, 64 * 1024 * 1024))
     if source.get("dataLoc"):
-        raise Invalid("a run on a database directory is rescored with that database")
+        # A database directory has no digest, so it is identified by its path, and the
+        # caller vouches that it has not been written since the run.
+        if not loc or str(pathlib.Path(loc).resolve()) != source["dataLoc"]:
+            raise Invalid("a run on a database directory is rescored with that database (--loc)")
+        loc = str(pathlib.Path(loc).resolve())
+    elif loc:
+        raise Invalid("--loc applies only to a run on a database directory")
     set_path = pathlib.Path(set_path or source["set"])
     if digest(set_path) != source["setSha256"]:
         raise Invalid("the question set differs from the one the run used")
@@ -55,11 +62,12 @@ def rescore(
     )
     qset = strict_json(bounded_file(set_path, 4 * 1024 * 1024))
     # The set's hash does not cover the data file beside it, so that is checked too.
-    data = (set_path.parent / qset["data"]).resolve() if qset.get("data") else None
-    if data is None or not source.get("dataSha256"):
-        raise Invalid("the run's data file and its SHA256 are both required")
-    if digest(data) != source["dataSha256"]:
-        raise Invalid("the data file differs from the one the run used")
+    if not loc:
+        data = (set_path.parent / qset["data"]).resolve() if qset.get("data") else None
+        if data is None or not source.get("dataSha256"):
+            raise Invalid("the run's data file and its SHA256 are both required")
+        if digest(data) != source["dataSha256"]:
+            raise Invalid("the data file differs from the one the run used")
     if policy not in POLICIES:
         raise Invalid("unknown scoring policy")
     out = pathlib.Path(out)
@@ -71,7 +79,7 @@ def rescore(
         set=str(set_path),
         sparkles=str(sparkles),
         model_config=str(model_config),
-        loc=None,
+        loc=loc,
         out=str(out),
         phase_deadline=0,
         timeout=timeout,
@@ -174,6 +182,9 @@ def main():
     ap.add_argument("--model-config", help="the run's models.json")
     ap.add_argument("--timeout", type=float, help="query seconds")
     ap.add_argument("--scoring-policy", choices=POLICIES, default=POLICY)
+    ap.add_argument(
+        "--loc", help="the database directory of a run on one, at the path the run used"
+    )
     args = ap.parse_args()
     report = rescore(
         args.report,
@@ -183,6 +194,7 @@ def main():
         args.model_config,
         args.timeout,
         args.scoring_policy,
+        args.loc,
     )
 
     def fmt(x):

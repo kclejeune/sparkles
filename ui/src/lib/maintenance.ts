@@ -123,9 +123,9 @@ export function outcomeText(
         ? `Nothing to consolidate in ${plural(r.scanned, 'fact')}`
         : 'Nothing to consolidate';
     case 'no-facts':
-      return 'No fact passed its checks, so nothing was proposed';
+      return 'No facts passed the checks, so nothing was proposed';
     case 'pending-review':
-      return `An earlier consolidation${branch ? ` on ${branch}` : ''} waits for review`;
+      return `An earlier consolidation${branch ? ` on ${branch}` : ''} is waiting for review`;
     case 'deleted': {
       const errors = num(r.errors);
       return `Deleted ${count(r.deleted, 'session graph', 'old session graphs')}${errors ? `, ${plural(errors, 'failure')}` : ''}`;

@@ -66,16 +66,16 @@ test('the Memory tab and the Memory page render for a dataset without memory', a
     'analytical engine',
   );
   await expect(memory.getByRole('list', { name: 'History' })).toHaveCount(0);
-  await expect(memory).toContainText('Nothing about this resource was superseded or retracted.');
+  await expect(memory).toContainText('No superseded or retracted facts.');
 
   await page.goto(`/ui/memory?ds=${DATASET}`);
   await expect(page.getByRole('region', { name: 'Agents' })).toContainText(
-    'No agent wrote facts you can read.',
+    'No facts recorded yet.',
   );
   await expect(page.getByRole('region', { name: 'Sources' })).toContainText(
-    'No fact you can read names a source.',
+    'No facts cite a source yet.',
   );
   await expect(page.getByRole('region', { name: 'Memory settings' })).toContainText(
-    'none, so no fact counts as unreviewed',
+    'None, so no facts are treated as unreviewed',
   );
 });

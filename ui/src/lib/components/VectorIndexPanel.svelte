@@ -165,7 +165,7 @@
     const efText = (recallEf[ix.name] ?? '').trim();
     const ef = efText ? Number(efText) : undefined;
     if (ef != null && !(Number.isInteger(ef) && ef >= 1 && ef <= 4096)) {
-      recallError[ix.name] = 'ef is a whole number from 1 to 4096.';
+      recallError[ix.name] = 'ef must be a whole number from 1 to 4096.';
       return;
     }
     measuring[ix.name] = true;
@@ -299,8 +299,8 @@
       const v = o?.type === 'literal' ? parseVector(o.value, o.datatype) : null;
       if (v) {
         form.dimension = String(v.length);
-        detectNote = `A vector of this predicate has ${v.length} dimensions.`;
-      } else detectNote = 'No vector literal of this predicate was found.';
+        detectNote = `This predicate's vectors have ${v.length} dimensions.`;
+      } else detectNote = 'No vectors found for this predicate.';
     } catch {
       if (owns()) detectNote = null;
     } finally {
@@ -387,9 +387,9 @@
       </div>
       {#if !indexes.length}
         <p class="faint">
-          No vector index. Searches with <span class="mono">spk:vectorSearch</span> scan the vectors exactly.
-          An index builds an HNSW graph over one predicate's vectors, which makes searches over large
-          sets fast.
+          No vector indexes. Searches with <span class="mono">spk:vectorSearch</span> scan the vectors
+          exactly. An index builds an HNSW graph over one predicate's vectors, which makes searches over
+          large sets fast.
         </p>
       {/if}
       <div class="cards">
@@ -515,7 +515,7 @@
                       : ''}</span
                   >
                 {:else if ix.files?.opened}
-                  <span class="faint">read from its file, not built in this process</span>
+                  <span class="faint">loaded from disk, not built since the server started</span>
                 {:else}
                   <span class="faint">—</span>
                 {/if}
@@ -554,7 +554,8 @@
                       >Retrying {fmtRelative(em.retryAt, now)}</span
                     >{/if}
                   {#if em.state === 'paused'}<span class="faint small"
-                      >No worker runs here: a read-only server, or a store opened without one.</span
+                      >No embedding worker runs on this server. It is read-only or was opened
+                      without one.</span
                     >{/if}
                   {#if em.lastError}<span class="error-text small" title={fmtTime(em.lastError.at)}
                       >{em.lastError.message}{em.lastError.subject
@@ -570,10 +571,8 @@
                   <span class="faint"
                     >recall@{recall.k}{recall.ef
                       ? ` at ef ${recall.ef}`
-                      : ', searched exactly because of the exact threshold'}, {fmtInt(
-                      recall.samples,
-                    )} samples · graph {fmtMs(recall.hnswMs)}, exact {fmtMs(recall.exactMs)} per search
-                    ·
+                      : ', exact search because of the exact threshold'}, {fmtInt(recall.samples)} samples
+                    · graph {fmtMs(recall.hnswMs)}, exact {fmtMs(recall.exactMs)} per search ·
                     <span title={fmtTime(recall.at)}>{fmtRelative(recall.at, now)}</span></span
                   >
                 {:else}
@@ -667,7 +666,7 @@
         <div class="packed">
           <h3 class="sub">Packed without an index</h3>
           <p class="faint small">
-            These predicates were searched, and their vectors are packed for exact scans.
+            These predicates have been searched, so their vectors are packed for exact scans.
           </p>
           <ul>
             {#each status.predicates as p (p.predicate)}
@@ -840,7 +839,7 @@
     </label>
     <p class="faint small">
       {#if !editing}
-        The index is built by a background task. Searches scan exactly until the graph is ready.
+        The index builds in the background. Searches scan exactly until the graph is ready.
       {:else if rebuilds}
         These changes build the index again. Searches scan exactly until the new graph is ready.
       {:else}
@@ -867,7 +866,7 @@
   <p>
     This drops the index <span class="mono">{dropTarget?.name}</span> of
     <span class="mono">{name}</span> and deletes its files. Searches of
-    <span class="mono">{dropTarget ? displayIri(dropTarget.predicate, prefixes) : ''}</span> keep working,
+    <span class="mono">{dropTarget ? displayIri(dropTarget.predicate, prefixes) : ''}</span> keep working
     by scanning the vectors exactly. The data is not changed.
   </p>
   {#snippet actions()}

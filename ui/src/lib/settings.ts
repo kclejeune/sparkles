@@ -277,27 +277,25 @@ export function sourceText(f: FieldInfo): { label: string; title: string } | nul
   if (f.locked)
     return {
       label: 'locked',
-      title:
-        "The operator locked this field in the server's configuration, so it cannot be changed here.",
+      title: "This field is locked in the server's configuration and cannot be changed here.",
     };
   switch (f.source) {
     case 'declared':
       return {
         label: 'server config',
-        title:
-          "The value comes from the server's configuration. A change here overrides it until it is reset.",
+        title: "Set in the server's configuration. A change here overrides it until you reset it.",
       };
     case 'runtime':
       return f.overrides === undefined
         ? {
             label: 'changed',
             title: f.hasDeclared
-              ? "The value was changed here or through the API. It equals the server's configuration."
-              : 'The value was changed here or through the API. Reset it to go back to the default.',
+              ? "Changed here or through the API. It matches the server's configuration."
+              : 'Changed here or through the API. Reset it to go back to the default.',
           }
         : {
             label: 'overrides server config',
-            title: `The value was changed here or through the API, so the server's configuration (${valueText(f.overrides)}) is not used. Use the server config to go back to it.`,
+            title: `Changed here or through the API, overriding the server's configuration (${valueText(f.overrides)}). Choose Use server config to go back to it.`,
           };
     default:
       return null;
@@ -309,16 +307,16 @@ export function resetText(f: FieldInfo): { text: string; title: string } {
   if (f.overridden)
     return {
       text: 'Remove change',
-      title: 'Remove the runtime value that the lock ignores',
+      title: 'Remove the runtime value, which the lock ignores',
     };
   if (f.hasDeclared)
     return {
       text: 'Use server config',
-      title: "Remove the change, so the field takes the value of the server's configuration",
+      title: "Remove the change and use the value from the server's configuration",
     };
   return {
     text: 'Reset to default',
-    title: 'Remove the change, so the field takes its built-in default',
+    title: 'Remove the change and use the built-in default',
   };
 }
 
@@ -556,7 +554,7 @@ export function checkStructured(def: FieldDef, v: unknown): Record<string, strin
           out[pathString([name])] =
             `${name} is not a ${def.keyLabel ?? 'name'} that the server accepts`;
         else if (def.type === 'pairs') {
-          if (typeof x !== 'string') out[pathString([name])] = `The value of ${name} is text`;
+          if (typeof x !== 'string') out[pathString([name])] = `${name} must be text`;
         } else entryFields([name], x);
       }
       return out;
@@ -778,7 +776,7 @@ export function parseLayer(text: string): { layer: JsonObject } | { error: strin
   } catch (e) {
     return { error: `Not JSON: ${e instanceof Error ? e.message : e}` };
   }
-  if (!isObject(v)) return { error: 'The runtime layer is a JSON object.' };
+  if (!isObject(v)) return { error: 'The runtime layer must be a JSON object.' };
   return { layer: v };
 }
 

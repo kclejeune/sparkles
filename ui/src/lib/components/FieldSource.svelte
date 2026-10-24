@@ -62,7 +62,7 @@
   {#if info.overridden}
     <span
       class="src overridden"
-      title="A value changed at runtime{ignored} is stored, but it is ignored because the operator locked the field. Reset it to remove it."
+      title="A runtime change{ignored} is saved but ignored because the operator locked this field. Reset to remove it."
       ><Icon name="alert" size={11} /> change ignored</span
     >
   {/if}

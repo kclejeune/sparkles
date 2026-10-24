@@ -132,7 +132,7 @@
     if (e instanceof api.ApiError && e.status === 403)
       return {
         title: 'Embedding maps need access to every graph',
-        hint: 'A projection places every entity of the index, so it is offered only to callers who can read the whole dataset.',
+        hint: 'The map places every entity in the index, so it needs read access to the whole dataset.',
         forbidden: true,
       };
     return { title: api.errorMessage(e) };
@@ -597,8 +597,7 @@
 
   {#if app.queryAt}
     <p class="note faint">
-      The embedding map shows the head. The Query page reads an earlier state, which the map does
-      not project.
+      The map shows the latest data, not the earlier state selected on the Query page.
     </p>
   {/if}
 

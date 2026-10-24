@@ -444,9 +444,9 @@
   );
   const schemaNote = $derived.by(() => {
     void schemaRev;
-    if (!schema) return 'No schema is available here, so type an IRI or a prefixed name.';
+    if (!schema) return 'No schema is available. Type an IRI or a prefixed name.';
     return schema.error
-      ? `The schema did not load (${schema.error}), so type an IRI or a prefixed name.`
+      ? `Could not load the schema (${schema.error}). Type an IRI or a prefixed name.`
       : null;
   });
 
@@ -641,17 +641,17 @@
       const was = keyed(answer, e);
       show(now, a, 0);
       if (was !== undefined && (was === null || was !== keyed(a, e))) {
-        refuse('The pattern changed, select it again');
+        refuse('The pattern changed. Select it again');
         return false;
       }
       // the element was picked in the drawing before the typing
       const n = named(e);
       if (n.edge && (!prev || !drawn || !stillNames(prev, drawn, n.edge))) {
-        refuse('The pattern changed, select the edge again');
+        refuse('The pattern changed. Select the edge again');
         return false;
       }
       if (n.node && !drawn?.nodes.some((x) => x.id === n.node)) {
-        refuse('The pattern changed, select the node again');
+        refuse('The pattern changed. Select the node again');
         return false;
       }
     }
@@ -679,7 +679,7 @@
       return false;
     }
     if (!agreesWith(before, e, check)) {
-      refuse('That edit would change more of the pattern than it names, so it was not made');
+      refuse('That edit would also change other parts of the pattern, so it was not made');
       return false;
     }
     // an empty editor gets the whole query at once
@@ -845,8 +845,7 @@
       } else {
         checkTerm(t, 's');
         const iri = iriOf(t);
-        if (!iri)
-          return fail(`${t} is not an IRI or a prefixed name the query or dataset declares`);
+        if (!iri) return fail(`${t} is not an IRI or a prefixed name with a declared prefix`);
         const isClass = nodeClass || (schema?.classes.some((c) => c.iri === iri) ?? false);
         if (isClass) {
           const name = varName(iri, [
@@ -947,7 +946,7 @@
     if (!reach.locked.length) return void apply({ kind: 'rename', from, to: name, locked: false });
     confirm = {
       title: `Rename ?${from} to ?${name}`,
-      lead: `?${from} is used in ${reach.locked.length === 1 ? 'a locked block' : `${reach.locked.length} locked blocks`}, which the canvas changes only when you say so.`,
+      lead: `?${from} is used in ${reach.locked.length === 1 ? 'a locked block' : `${reach.locked.length} locked blocks`}, which the canvas changes only if you choose to.`,
       blocks: reach.locked.map((b) => b.text),
       actions: [
         {
@@ -966,7 +965,7 @@
   function deleteLocked(key: string, blockText: string, filter: boolean) {
     confirm = {
       title: filter ? 'Delete this filter' : 'Delete this locked block',
-      lead: 'The canvas deletes exactly this text from the query.',
+      lead: 'Only this text is removed from the query.',
       blocks: [blockText],
       actions: [
         {
@@ -1042,7 +1041,8 @@
     const now = source(text);
     if (now !== drawnText) {
       const a = patternNow(now);
-      if (!a?.ok) return void (countText = 'The text does not parse, so there is nothing to count');
+      if (!a?.ok)
+        return void (countText = 'The query does not parse, so there is nothing to count');
       show(now, a, 0);
       await tick();
     }
@@ -1064,7 +1064,7 @@
       if (ctl.signal.aborted) return;
       countText =
         n === 'timeout'
-          ? 'More than the count could finish'
+          ? 'The count timed out after 5 seconds'
           : `${n.toLocaleString()} ${n === 1 ? 'match' : 'matches'}`;
     } catch (err) {
       if (ctl.signal.aborted) return;
@@ -1459,7 +1459,7 @@
         >
       </div>
       {#if planMatch.hiddenEstimates}
-        <span class="faint small">Estimates are hidden from your view.</span>
+        <span class="faint small">Row estimates are hidden because your access is restricted.</span>
       {:else if !phone}
         <span class="faint small legend" title={LEGEND}>⚠ over ten times off</span>
       {/if}
@@ -1505,7 +1505,7 @@
     {/if}
   {:else if planStale && !readonly}
     <p class="notice" role="status" data-testid="plan-stale">
-      The plan is of the query that ran, and the text has changed since, so it is not drawn here.
+      The query has changed since this plan ran, so the plan is not drawn.
     </p>
   {/if}
 
@@ -1513,14 +1513,12 @@
     {#if unavailable}
       <div class="state">
         <Icon name="alert" size={18} />
-        <p>
-          The visual query builder needs the browser module of the formatter, which did not load.
-        </p>
+        <p>The Pattern pane needs the formatter's browser module, which did not load.</p>
       </div>
     {:else if tooLarge}
-      <div class="state"><p>This query is longer than 256 KiB, more than the pane parses.</p></div>
+      <div class="state"><p>This query is over 256 KiB, too long for the Pattern pane.</p></div>
     {:else if error?.code === 'update' && !answer}
-      <div class="state"><p>Updates are not drawn. The builder edits queries.</p></div>
+      <div class="state"><p>The Pattern pane draws queries, not updates.</p></div>
     {:else if error && !answer}
       <div class="state" role="status">
         <p>The query does not parse ({lineCol(error)}).</p>
@@ -1530,12 +1528,12 @@
       {#if error}
         <p class="notice warn" role="status">
           {error.code === 'update'
-            ? 'Updates are not drawn. The builder edits queries.'
-            : `The text does not parse at ${lineCol(error)}, so this is the last pattern and edits wait until it parses.`}
+            ? 'The Pattern pane draws queries, not updates.'
+            : `The query does not parse at ${lineCol(error)}. This is the last pattern that parsed, and edits wait until the query parses again.`}
         </p>
       {:else if over}
         <p class="notice" role="status">
-          This pattern has {drawn.triples} triple patterns, more than the canvas draws.
+          This pattern has {drawn.triples} triple patterns, more than the canvas can draw.
         </p>
       {:else if shown.nodes.length === 0}
         <div class="notice empty" role="status">

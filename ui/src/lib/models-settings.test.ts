@@ -116,7 +116,7 @@ describe('the form of the models kind', () => {
     expect(modelFields(models()).find((d) => d.path === 'roles.community')).toMatchObject({
       type: 'records',
       unsetText: 'the summarize list',
-      help: 'The reports of GraphRAG communities. It uses the summarize list when unset, and an empty list turns it off.',
+      help: 'Writes GraphRAG community reports. Uses the summarize list when unset. An empty list turns it off.',
     });
   });
 
@@ -180,7 +180,7 @@ describe('the form of the models kind', () => {
     };
     expect(roleErrors(pending, form)).toEqual({
       'roles.draft.0.model': 'claude does not allow c (allowed models)',
-      'roles.draft.1.provider': 'No provider named nope is defined',
+      'roles.draft.1.provider': 'No provider named nope',
     });
     // the provider select lists the loaded providers, but a new one is not refused there
     const draft = modelFields(k).find((d) => d.path === 'roles.draft')!;

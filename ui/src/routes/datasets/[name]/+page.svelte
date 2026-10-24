@@ -620,8 +620,8 @@ ex:PersonShape a sh:NodeShape ;
             title={info.reasoning.stale === false
               ? 'Inferences are up to date'
               : info.reasoning.stale
-                ? 'Inferences are stale: re-run reasoning'
-                : 'Freshness of the inferences is unknown'}
+                ? 'Inferences are out of date. Run reasoning again.'
+                : 'Inference status unknown'}
             >{info.reasoning.profile} reasoning{info.reasoning.stale === false
               ? ''
               : info.reasoning.stale
@@ -888,7 +888,7 @@ ex:PersonShape a sh:NodeShape ;
               </div>
               <p class="faint note">
                 {delta.dirty
-                  ? 'Updates live in a delta alongside the sorted base permutations. Compacting rebuilds the base and clears the delta.'
+                  ? 'Recent updates are kept apart from the sorted base index. Compacting merges them into the base.'
                   : 'Everything is in the sorted base index. Nothing to compact.'}
               </p>
             {/if}
@@ -1353,7 +1353,7 @@ ex:PersonShape a sh:NodeShape ;
                 </label>
                 <label class="field">
                   Key column <span class="faint"
-                    >(optional; names each row, else rows are numbered)</span
+                    >(optional; names each row, otherwise rows are numbered)</span
                   >
                   <input
                     class="input mono"

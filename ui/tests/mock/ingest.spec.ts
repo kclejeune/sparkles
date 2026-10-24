@@ -31,7 +31,7 @@ test('a large estimate waits for a confirmation', async ({ page }) => {
   const task = await ingest(page, 'big-notes.md', 'text/markdown');
   await expect(task).toContainText('Waiting for your confirmation');
   await expect(task).toContainText('about 270,000 tokens');
-  await task.getByRole('button', { name: 'Go on' }).click();
+  await task.getByRole('button', { name: 'Continue' }).click();
   await expect(task).toContainText('2 facts proposed');
 });
 

@@ -3158,7 +3158,7 @@ border and the note "uses ?y, which nothing binds now".
 The strip under the drawing has a checkbox per variable, and the first change turns
 `SELECT *` into the list of variables. It also sets `DISTINCT`, `LIMIT` and `OFFSET`.
 **Count matches** runs `SELECT (COUNT(*) AS ?n)` over the pattern with a five-second
-timeout and shows the count, or "More than the count could finish" when the time runs
+timeout and shows the count, or "The count timed out after 5 seconds" when the time runs
 out.
 
 Each edit changes only the text it must, as one change to the editor, so `Ctrl+Z` (`⌘Z`
@@ -3335,12 +3335,12 @@ It shows the type edges and literals when the tree needs them. **Next** moves to
 derivation whose top rule differs, up to five, and the footer gives the derivation's
 number, its depth and the commit the inferences were computed at.
 
-When the inferences are stale, a note above the tree says that it explains the closure as
-it was computed, and how many commits came since. A triple whose derivations all need
-facts you cannot read answers "No derivation from facts you can read was found", the same
-answer as a triple that is not entailed. A derivation deeper than the search allows says
-so. While the time slider shows a past commit, the panel says that it explains the
-inferences of the latest commit instead of showing a tree that may not hold at that state.
+When the inferences are stale, a note above the tree says that it shows them as they were
+computed, and how many commits came since. A triple whose derivations all need facts you
+cannot read answers "No derivation found", the same answer as a triple that is not
+entailed. A derivation deeper than the search limit says so. While the time slider shows a
+past commit, the panel says that it explains inferences at the latest commit only, instead
+of showing a tree that may not hold at that state.
 `Escape` closes the panel, and at phone width it is a full-height sheet.
 
 The same trees come from `sparkles infer --why`, which takes the triple in Turtle with the
@@ -3398,7 +3398,7 @@ suggestion.
 
 With the graph's **History** open, the overlay validates the state the slider shows, and it
 pauses while the history plays. It validates the drawn nodes as focus nodes, so a
-SHACL-SPARQL constraint that is not anchored at its focus node can give other results in a
+SHACL-SPARQL constraint that looks beyond its focus node can give different results in a
 full validation, and the overlay says so when such a result appears. A caller whose
 grants cover only some graphs of the dataset cannot validate it, and the overlay shows
 "Validation needs access to every graph". A validation over the server's result budget

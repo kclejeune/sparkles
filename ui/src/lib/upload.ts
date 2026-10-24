@@ -70,7 +70,7 @@ export function tableProblem(files: { name: string }[], o: TableOptions): string
   if (base && !/^[a-z][a-z0-9+.-]*:\S*$/i.test(base))
     return 'The base must be an absolute IRI, such as http://example.org/people/.';
   if (o.key?.trim() && o.mapping)
-    return 'A key column applies to the default mapping only, not with a mapping or template.';
-  if (!o.mapping && !base) return 'The default mapping of CSV and TSV files needs a base IRI.';
+    return 'A key column works only with the default mapping, not with a custom mapping or template.';
+  if (!o.mapping && !base) return 'The default mapping for CSV and TSV files needs a base IRI.';
   return null;
 }

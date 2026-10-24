@@ -185,7 +185,7 @@ panel below it has more workflows and detail views.
 <table>
   <tr>
     <td><img src="docs/images/explore-why.png" alt="The resource explorer with the Why panel beside the graph, explaining that Alice is a Person by rdfs9 from her inferred Employee type, itself derived by rdfs9 from her asserted Manager type and the subclass of Manager, and the subclass of Employee, with every premise highlighted on the canvas after Show on graph"></td>
-    <td><img src="docs/images/explore-why-stale.png" alt="The Why panel on a dataset whose inferences are two commits stale, with the note that the tree explains the closure as computed at commit 2, and the second of two derivations, Alice as an Employee by rdfs3 from the range of reportsTo"></td>
+    <td><img src="docs/images/explore-why-stale.png" alt="The Why panel on a dataset whose inferences are two commits stale, with the note that the tree shows the inferences as computed at commit 2, and the second of two derivations, Alice as an Employee by rdfs3 from the range of reportsTo"></td>
   </tr>
   <tr>
     <td>The derivation tree of an inferred edge, with its premises drawn</td>

@@ -113,7 +113,7 @@
       .catch((e) => {
         if (weightCtl !== c || (e instanceof DOMException && e.name === 'AbortError')) return;
         weights = [];
-        weightsErr = 'The weight properties could not be read';
+        weightsErr = 'Could not load the edge weights';
       });
   }
   onDestroy(() => weightCtl?.abort());
@@ -465,7 +465,7 @@
           </select></label
         >
         <label
-          title="Add up a property of each edge's reifier instead of counting edges. An edge without one weighs 1."
+          title="Add up a numeric annotation on each edge instead of counting edges. An edge without one weighs 1."
           >Weight <select
             bind:value={weight}
             aria-describedby="path-weight-note"
@@ -484,19 +484,19 @@
       </div>
       <p class="faint small" id="path-weight-note">
         {#if weights == null && weightsFor}
-          Reading the weight properties…
+          Loading edge weights…
         {:else if weights == null}
-          Choose a property of the reifiers to add up instead of counting edges.
+          Choose an edge annotation to add up instead of counting edges.
         {:else if weightsErr}
           {weightsErr}.
         {:else if !weights.length}
-          No reifier has a numeric property to weigh edges by.
+          No edge has a numeric annotation to weigh by.
         {:else if weight}
-          Paths are ordered by the sum of {displayIri(weight, prefixes)} on their edges' reifiers, and
-          an edge without one weighs 1.
+          Paths are ordered by the sum of {displayIri(weight, prefixes)} on their edges. An edge without
+          one weighs 1.
         {:else}
           {weights.length}
-          {weights.length === 1 ? 'property' : 'properties'} on reifiers can weigh the edges.
+          {weights.length === 1 ? 'annotation' : 'annotations'} can weigh the edges.
         {/if}
       </p>
       <fieldset class="follow">
@@ -509,8 +509,8 @@
       </fieldset>
       {#if !phase1}
         <p class="faint small" id="path-phase1">
-          This server cannot skip predicates or hubs, so the search follows the predicates listed,
-          or every predicate when the list is empty.
+          This server cannot skip predicates or hubs. The search follows the listed predicates, or
+          every predicate if the list is empty.
         </p>
       {/if}
       <ul
@@ -566,7 +566,7 @@
     </div>
     {#if stale}
       <button type="button" class="btn sm" onclick={run}
-        >Search again at {at ? `commit ${at}` : 'the head'}</button
+        >Search again at {at ? `commit ${at}` : 'the latest commit'}</button
       >
     {/if}
   </form>

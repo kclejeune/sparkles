@@ -601,7 +601,7 @@ export class Lenses {
       busy: false,
       note: ok
         ? 'Cancelled.'
-        : 'Stopped following the run. Another caller started it, so it goes on for them.',
+        : 'Stopped following the run. Someone else started it, so it keeps running.',
     };
   }
 

@@ -68,7 +68,7 @@
       form = describeForm(s);
       toasts.push('info', 'DESCRIBE setting saved', describeSummary(s));
     } catch (err) {
-      toasts.error('Saving the DESCRIBE setting failed', err);
+      toasts.error('Could not save the DESCRIBE setting', err);
     } finally {
       saving = false;
     }
@@ -80,9 +80,9 @@
       const s = await api.clearDescribeSetting(target);
       setting = s;
       form = describeForm(s);
-      toasts.push('info', 'DESCRIBE uses the defaults', describeSummary(s));
+      toasts.push('info', 'DESCRIBE reset to the defaults', describeSummary(s));
     } catch (err) {
-      toasts.error('Resetting the DESCRIBE setting failed', err);
+      toasts.error('Could not reset the DESCRIBE setting', err);
     } finally {
       saving = false;
     }
@@ -103,7 +103,7 @@
     {#if error}
       <p class="faint">Could not load the DESCRIBE setting: {error}</p>
     {:else if unsupported}
-      <p class="faint">This server has no DESCRIBE setting per dataset.</p>
+      <p class="faint">This server does not support per-dataset DESCRIBE settings.</p>
     {:else if !setting || !form}
       <p class="faint"><span class="spinner"></span> Loading…</p>
     {:else}
@@ -127,7 +127,10 @@
           </label>
           <label class="check">
             <input type="checkbox" bind:checked={form.reifiers} disabled={!canEdit} />
-            <span>Reifiers <span class="faint">(the reifiers of described triples)</span></span>
+            <span
+              >Reifiers <span class="faint">(reifiers that annotate the described triples)</span
+              ></span
+            >
           </label>
         </div>
         <div class="limits">

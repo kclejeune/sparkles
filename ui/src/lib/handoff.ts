@@ -68,9 +68,9 @@ export function decodeHandoff(payload: string): Handoff {
     throw new Error('The link is damaged and could not be read.');
   const o = raw as Record<string, unknown>;
   const dataset = str(o.dataset, 'dataset', 256);
-  if (!dataset) throw new Error('The link names no dataset.');
+  if (!dataset) throw new Error('The link has no dataset.');
   const query = str(o.query, 'query', MAX_QUERY);
-  if (!query?.trim()) throw new Error('The link holds no query.');
+  if (!query?.trim()) throw new Error('The link has no query.');
   const out: Handoff = { dataset, query };
   const question = str(o.question, 'question', MAX_QUESTION);
   if (question?.trim()) out.question = question.trim();

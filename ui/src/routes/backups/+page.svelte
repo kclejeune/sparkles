@@ -118,7 +118,7 @@
         {#if !loaded}Loading…{:else if unsupported}Not available on this server{:else}{repositories.length}
           repositor{repositories.length === 1 ? 'y' : 'ies'}{repositories.length !== reachableCount
             ? `, ${repositories.length - reachableCount} unreachable`
-            : ''}{admin ? '' : ' · the backups of the datasets you administer'}{/if}
+            : ''}{admin ? '' : ' · showing datasets you administer'}{/if}
       </p>
     </div>
     <span class="spacer"></span>
@@ -130,9 +130,9 @@
       <Icon name="archive" size={24} />
       <p>This server has no backup repositories.</p>
       <p class="faint small">
-        It predates them, or was built without the backup feature. <a href={resolve('/datasets')}
+        It is an older version or was built without backup support. <a href={resolve('/datasets')}
           >Datasets</a
-        > still offer the N-Quads dump.
+        > can still write an N-Quads dump.
       </p>
     </div>
   {:else}

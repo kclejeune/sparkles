@@ -201,8 +201,8 @@
     <div>
       <h1>Memory</h1>
       <p class="muted">
-        What agents wrote into {#if ds}<span class="mono">{ds}</span>{:else}this dataset{/if}, as
-        far as your grants let you read it.
+        Facts, sources and activity that agents recorded in {#if ds}<span class="mono">{ds}</span
+          >{:else}this dataset{/if}.
       </p>
     </div>
   </header>
@@ -258,14 +258,14 @@
           />
           <button class="btn primary" type="submit" disabled={!text.trim() || searching}>
             {#if searching}<span class="spinner"></span>{:else}<Icon name="search" size={13} />{/if}
-            Recall
+            Search
           </button>
         </form>
         {#if searchError}
           <div class="error-box">{searchError}</div>
         {:else if found}
           {#if found.entities.length === 0}
-            <p class="faint">Nothing you can read matches.</p>
+            <p class="faint">No matches.</p>
           {:else}
             <RecallView result={found} {prefixes} onopen={openIri} />
           {/if}
@@ -280,7 +280,7 @@
           {:else if agents.error}
             <div class="error-box">{agents.error}</div>
           {:else if agents.rows.length === 0}
-            <p class="faint">No agent wrote facts you can read.</p>
+            <p class="faint">No facts recorded yet.</p>
           {:else}
             <table class="data">
               <thead>
@@ -311,7 +311,7 @@
           {:else if sources.error}
             <div class="error-box">{sources.error}</div>
           {:else if sources.rows.length === 0}
-            <p class="faint">No fact you can read names a source.</p>
+            <p class="faint">No facts cite a source yet.</p>
           {:else}
             <table class="data">
               <thead><tr><th>Source</th><th class="num">Facts</th></tr></thead>
@@ -336,7 +336,7 @@
           {:else if activity.error}
             <div class="error-box">{activity.error}</div>
           {:else if activities.length === 0}
-            <p class="faint">No activity you can read.</p>
+            <p class="faint">No activity yet.</p>
           {:else}
             <ul class="plain">
               {#each activities as r (v(r.act))}
@@ -358,7 +358,7 @@
           {:else if review.error}
             <div class="error-box">{review.error}</div>
           {:else if review.rows.length === 0}
-            <p class="faint">No open proposal, ingest, review or scratch branch.</p>
+            <p class="faint">No open review branches.</p>
           {:else}
             <ul class="plain">
               {#each review.rows as b (b.name)}
@@ -388,7 +388,7 @@
               <dt>Agent graphs</dt>
               <dd>
                 {#each settings.agentGraphs as g (g)}<div class="mono small">{g}</div>{:else}<span
-                    class="faint">none, so no fact counts as unreviewed</span
+                    class="faint">None, so no facts are treated as unreviewed</span
                   >{/each}
               </dd>
               <dt>Consolidated graph</dt>

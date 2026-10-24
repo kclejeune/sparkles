@@ -172,7 +172,7 @@ test('a server refusal shows beside the field it names', async ({ page }) => {
 test('the JSON view shares the form change and keeps unknown members', async ({ page }) => {
   const { panel, row, save } = await openPanel(page);
   await row('providers.claude.budget.tokensPerDay').getByRole('textbox').fill('500');
-  await panel.getByText('Advanced: the runtime layer as JSON').click();
+  await panel.getByText('Advanced: edit runtime changes as JSON').click();
   const json = panel.getByRole('textbox', { name: 'Model configuration runtime layer' });
   await expect(json).toHaveValue(/"tokensPerDay": 500/);
   // an edit of the JSON shows in the form, and the form's edit is still in it

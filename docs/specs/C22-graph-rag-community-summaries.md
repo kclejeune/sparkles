@@ -960,7 +960,57 @@ reading of "areas of work" was meant, and with three reviewed reports the answer
 exactly those three. The three attempts cost $0.023, $0.744 and $0.730, and the probes of
 the map request cost $0.461.
 
-The evaluation of §9 runs on the same binary and is not finished.
+The evaluation of §9 ran the same day on the same binary, with Sonnet 5.5 answering and
+summarizing and Opus 5.5 writing the questions and judging, and cost $11.25. It differs
+from §9 in four ways. It used the demo graph alone. Its 30 global questions came from
+five generated personas with three tasks each and two questions per task, and the agent
+that ran the evaluation checked them rather than a person. The text baseline ranks the
+paragraphs of the 20 documents of `testsuite/ingest/sample.json` with BM25 rather than
+with vector search. No person judged a sample of the judgements. The fine build has three
+levels, and Ask read its finest level, which holds 27 reports. The coarse build keeps
+only level 0, which holds 7.
+
+Opus compared every pair of answers in both orders, without citation markers. Each cell
+gives the first answer's win rate over the 30 questions, counting a tie as half, with its
+95% bootstrap interval. 686 of the 720 judgements agree with the judgement of the same
+pair in the other order.
+
+| Pair | Comprehensiveness | Diversity | Empowerment | Directness |
+|---|---|---|---|---|
+| local vs text | 0.33 (0.17–0.50) | 0.35 (0.18–0.52) | 0.33 (0.17–0.50) | 0.33 (0.17–0.50) |
+| local vs coarse | 0.25 (0.10–0.40) | 0.15 (0.03–0.28) | 0.23 (0.10–0.40) | 0.33 (0.17–0.50) |
+| local vs fine | 0.12 (0.03–0.23) | 0.03 (0.00–0.10) | 0.08 (0.00–0.18) | 0.32 (0.17–0.48) |
+| text vs coarse | 0.03 (0.00–0.10) | 0.03 (0.00–0.10) | 0.03 (0.00–0.10) | 0.13 (0.03–0.25) |
+| text vs fine | 0.00 (0.00–0.00) | 0.00 (0.00–0.00) | 0.02 (0.00–0.05) | 0.00 (0.00–0.00) |
+| coarse vs fine | 0.38 (0.23–0.55) | 0.43 (0.30–0.57) | 0.45 (0.30–0.60) | 0.21 (0.09–0.34) |
+
+Global answering from the finest level wins against every other mode on every
+criterion. Its lead over the coarsest level is clear on directness, while on the other
+three criteria the interval still includes an even split. The default selection of §7.2,
+the finest level with at most 100 reports, therefore stays. Local Ask loses most
+comparisons because these questions ask about the whole graph. In local mode it answered
+10 of the 30, asked a clarification question for 15 and found 5 unanswerable. The text baseline loses
+almost every comparison, which says more about its small corpus of 20 documents than
+about text retrieval in general.
+
+`auto` mode classified 20 of the 20 sampled answerable demo questions as local and 16 of
+the 30 global questions as global. None was left unclassified. Of the 14 global questions
+answered locally, eight came back as answers, four as clarifications and two as
+unanswerable. Every one of the 3,656 facts cited behind the coarse answers and the 5,133
+behind the fine answers exists in the projection. Opus judged 88 of the 166 claims of the
+coarse answers and 76 of the 174 claims of the fine answers fully supported by the
+findings and facts behind them, most of the rest partly supported, and 11 and 14 not
+supported. Median latency was 4.7 s for local Ask, 9.8 s for coarse global answers and
+10.4 s for fine ones, with 95th percentiles of 12.2 s, 17.3 s and 14.9 s. The fine build
+wrote 46 reports for 181,436 tokens in 284 s, and the coarse build wrote 7 for 81,420
+tokens in 53 s. Over the 53 community requests, the input tokens the provider reported
+were at most 0.45 of the byte bound of §3.5 and 0.38 of it on average, so the bound's
+default allowances hold with room to spare on these inputs.
+
+The effect of §7.3 on C18's execution accuracy and the refresh tokens per thousand
+changed facts were not measured. [ROADMAP](../ROADMAP.md) items 260 to 262 hold the
+person-checked samples, the other sets and the vector baseline, and the global questions
+that `auto` answers locally.
 
 ### Shared memory representation follow-up
 
