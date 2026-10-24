@@ -8,7 +8,7 @@
 >
 > **User docs:** [Usage: Loading CSV and TSV](../USAGE.md#loading-csv-and-tsv) ·
 > [API: CSV and TSV uploads](../API.md#csv-and-tsv-uploads) ·
-> [Features](../FEATURES.md#storage-tdb2-equivalent)
+> [Features](../FEATURES.md#storage-and-indexes)
 >
 > This is the design as written before implementation. The [Outcome](#outcome) section at
 > the end records how it landed.
