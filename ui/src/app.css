@@ -447,15 +447,37 @@ label.field {
   gap: 8px;
 }
 
-/* A page's content: one column that fills the content area at every width. Pages set
-   their own padding and gap; only inner elements with long prose or a single-column
-   form cap their width. */
+/* A page's content: one column that fills the content area at every width, with the
+   padding and the gap that the top-level pages share. A page with a layout of its own,
+   such as a dataset's subpages, sets its own padding and gap in its scoped styles. Only
+   inner elements with long prose or a single-column form cap their width. */
 .page-container {
   display: grid;
   grid-template-columns: minmax(0, 1fr);
   align-content: start;
   width: 100%;
   min-width: 0;
+  padding: 24px 28px 40px;
+  gap: 18px;
+}
+@media (max-width: 760px) {
+  .page-container {
+    padding: 16px;
+  }
+}
+
+/* The header of a top-level page: a title block of an h1 and a muted line under it, then
+   a spacer and the page's actions at the end of the row. The row wraps, so the actions
+   drop below the title on a phone instead of crowding it. Components that have a `.head`
+   of their own keep it, because this class has a distinct name. */
+.page-head {
+  display: flex;
+  align-items: flex-end;
+  gap: 8px;
+  flex-wrap: wrap;
+}
+.page-head p {
+  margin-top: 4px;
 }
 
 /* The buttons and links at the end of a table row, right-aligned on one line. A link

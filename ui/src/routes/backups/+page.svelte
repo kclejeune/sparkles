@@ -110,8 +110,8 @@
 
 <svelte:head><title>Backups | Sparkles</title></svelte:head>
 
-<div class="page page-container">
-  <header class="head">
+<div class="page-container">
+  <header class="page-head">
     <div>
       <h1>Backups</h1>
       <p class="muted">
@@ -189,19 +189,6 @@
 </div>
 
 <style>
-  .page {
-    padding: 24px 28px 40px;
-    gap: 16px;
-  }
-  .head {
-    display: flex;
-    align-items: flex-end;
-    gap: 8px;
-    flex-wrap: wrap;
-  }
-  .head p {
-    margin-top: 4px;
-  }
   .tabs {
     border-bottom: 1px solid var(--border);
   }
@@ -213,10 +200,5 @@
   }
   .small {
     font-size: var(--fs-sm);
-  }
-  @media (max-width: 760px) {
-    .page {
-      padding: 16px;
-    }
   }
 </style>

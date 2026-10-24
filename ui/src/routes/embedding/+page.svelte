@@ -584,8 +584,8 @@
 <svelte:head><title>Embedding map | Sparkles</title></svelte:head>
 <svelte:window onkeydown={onkey} />
 
-<div class="page page-container">
-  <header class="head">
+<div class="page-container">
+  <header class="page-head">
     <div>
       <h1>Embedding map</h1>
       <p class="muted">
@@ -808,13 +808,6 @@
 </div>
 
 <style>
-  .page {
-    padding: 24px 28px 40px;
-    gap: 10px;
-  }
-  .head h1 {
-    margin: 0;
-  }
   .note {
     margin: 4px 0;
   }
@@ -974,9 +967,6 @@
     background: color-mix(in srgb, var(--spark) 10%, transparent);
   }
   @media (max-width: 720px) {
-    .page {
-      padding: 16px 16px 32px;
-    }
     .body {
       grid-template-columns: 1fr;
     }
