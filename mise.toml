@@ -298,6 +298,14 @@ description = "Clippy (warnings are errors) over feature combinations: the serve
 depends = ["ui:build"]
 run = "scripts/lint-features.sh"
 
+[tasks."test:features"]
+sources = ["@group:rust", "@group:ui", "@group:docs", "scripts/test-features.sh"]
+outputs = []
+description = "The server's unit and integration tests with the default features off and one optional feature set on: none, auth, mcp, memory, graphql and shacl. Not part of ci:fast"
+# ui:build first, as for lint: the server embeds ui/build
+depends = ["ui:build"]
+run = "scripts/test-features.sh"
+
 [tasks."lint:doc-paths"]
 sources = ["@group:rust", "@group:docs", "scripts/check-doc-paths.py"]
 outputs = []

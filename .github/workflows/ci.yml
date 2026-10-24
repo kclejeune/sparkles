@@ -13,6 +13,8 @@
 #   test         the archive's tests in four shards, with the W3C SPARQL and RDF, SHACL,
 #                ShEx and JSON-LD suites fetched at pinned commits
 #   jena-clients Apache Jena's own HTTP clients against the server binary from the archive
+#   features     the server's tests with the default features off and one optional
+#                feature set on, one job for each of six sets, built apart from the archive
 #
 # A manual run can also test Linux arm64 and macOS on Apple silicon, for example before
 # a release. The server embeds ui/build, and its build script writes a placeholder page
@@ -290,6 +292,38 @@ jobs:
           path: target/nextest/ci/junit.xml
           retention-days: 7
           if-no-files-found: ignore
+
+  # The server's unit and integration tests with the default features off and one feature
+  # set on (scripts/test-features.sh, mise run test:features). The archive above builds
+  # the default features only, so a test that assumes a feature's routes, or their absence,
+  # would pass there and fail here. Each set compiles the whole server crate again, so the
+  # sets are separate jobs with a cache each, and their time adds nothing to the longest
+  # chain. A new set goes in the script's default list and in this matrix.
+  features:
+    name: Features (${{ matrix.set }})
+    needs: changes
+    if: needs.changes.outputs.rust == 'true'
+    timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      matrix:
+        set: [none, auth, mcp, memory, graphql, shacl]
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v5
+      - uses: ./.github/actions/setup-rust
+        with:
+          cache-key: features-${{ matrix.set }}
+          swap: "true"
+      # the script runs the tests under nextest when it is installed, which stops a test
+      # that hangs
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-nextest@${{ env.NEXTEST_VERSION }}
+      - name: Server tests with the feature set
+        env:
+          NEXTEST_PROFILE: ci
+        run: scripts/test-features.sh "${{ matrix.set }}"
 
   # Apache Jena's own HTTP clients (RDFConnectionRemote, RDFConnectionFuseki, GSP, DSP,
   # QueryExecHTTP, UpdateExecHTTP) and Fuseki admin calls against the server binary that
