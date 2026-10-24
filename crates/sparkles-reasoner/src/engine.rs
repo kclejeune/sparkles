@@ -1328,11 +1328,12 @@ fn split_at<'g>(
             return Ok::<(), MemoryExceeded>(());
         }
         held.try_grow(size_of::<Item<'_>>())?;
+        let b = seal_batch(std::mem::take(batch), held);
         items.push(Item {
             ri,
             steps,
             k: d,
-            b: std::mem::take(batch),
+            b,
             first: None,
         });
         Ok(())
@@ -1361,6 +1362,18 @@ fn split_at<'g>(
     // the vector of all bindings has gone
     held.shrink(total * slot);
     Ok(Some((items, held)))
+}
+
+/// A batch of [`split_at`] as it becomes a work item. One cut short by a binding of many
+/// candidates gives back the slots it reserved and did not fill, so that bindings of few
+/// and many candidates in turn do not hold `per_item` slots for each binding.
+fn seal_batch(mut b: Vec<Vec<u64>>, held: &mut Held) -> Vec<Vec<u64>> {
+    let cap = b.capacity();
+    if cap > b.len() {
+        b.shrink_to_fit();
+        held.shrink((cap - b.capacity()) * size_of::<Vec<u64>>());
+    }
+    b
 }
 
 /// Whether the candidates of plan step `k` (an atom) with the bindings `b` may be many:
@@ -1794,4 +1807,29 @@ pub(crate) fn reads_lists(r: &CRule) -> bool {
                 | B::ListForAll
         )
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Batches cut short in turn by bindings of many candidates hold only their own
+    /// slots and charge: a thousand singleton batches of a reservation of 250 slots
+    /// keep the charge of a thousand slots.
+    #[test]
+    fn short_batches_give_back_their_spare_slots() {
+        let budget = Budget::unlimited();
+        let mut held = Held::new(&budget);
+        let slot = size_of::<Vec<u64>>();
+        let mut kept = Vec::new();
+        for i in 0..1_000u64 {
+            held.try_grow(250 * slot).unwrap();
+            let mut b: Vec<Vec<u64>> = Vec::with_capacity(250);
+            b.push(vec![i]);
+            let b = seal_batch(b, &mut held);
+            assert_eq!(b.capacity(), 1);
+            kept.push(b);
+        }
+        assert_eq!(held.bytes(), 1_000 * slot);
+    }
 }
