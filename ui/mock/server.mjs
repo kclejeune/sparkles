@@ -45,6 +45,7 @@ import { handleAlgo, rewriteService } from './algo.mjs';
 import { handleExplain, timedOutPlan } from './explain.mjs';
 import { handleReview, INGEST_BRANCH } from './review.mjs';
 import { geoQuery, handleGeo } from './geo.mjs';
+import { handleProjection } from './projection.mjs';
 import { handleVector, seedVectors, touchPacked, vectorIndexFor } from './vector.mjs';
 import { WORLD, worldTurtle } from './world.mjs';
 import { handleForms } from './forms.mjs';
@@ -211,7 +212,6 @@ function seedHistory(ds) {
   scratch.store.load(scratchTurtle, { format: 'text/turtle' });
   scratch.baseQuads = scratch.store.size;
   addCommit(scratch, 'upload', scratch.store.size, 0, { bulk: true });
-  seedVectors(datasets);
   // an organisation with agent memory (mock/memory.mjs), and a scratchpad branch to review
   const org = makeDataset('org', 'persistent');
   org.prefixes = { ...ORG_PREFIXES };
@@ -232,6 +232,7 @@ function seedHistory(ds) {
   world.store.load(worldTurtle(), { format: 'text/turtle' });
   world.baseQuads = world.store.size;
   addCommit(world, 'upload', world.store.size, 0, { bulk: true });
+  seedVectors(datasets);
   // a branch of foaf two commits ahead of main
   const dev = createBranch(foaf, { name: 'dev', note: 'schema migration' }).branch;
   for (const u of [
@@ -2468,6 +2469,17 @@ const server = http.createServer(async (req, res) => {
       return;
     // the DESCRIBE setting of a dataset (mock/describe.mjs)
     if (await handleDescribe(req, res, url, seg, { datasets, send, readBody })) return;
+    // projections of vector indexes and their tasks (mock/projection.mjs)
+    if (
+      await handleProjection(req, res, url, seg, {
+        datasets,
+        tasks,
+        nextTaskId: () => String(taskSeq++),
+        send,
+        readBody,
+      })
+    )
+      return;
     // vector indexes (mock/vector.mjs)
     if (
       await handleVector(req, res, url, seg, {

@@ -662,7 +662,7 @@ per-dataset form and no concurrency caps. `preauth=off` turns it off.
 | DELETE | `/$/describe/{ds}`           | *Extension.* Restores the DESCRIBE defaults. Needs `admin`. |
 | GET    | `/$/tasks`                   | `[Task]` |
 | GET    | `/$/tasks/{id}`              | `Task` |
-| DELETE | `/$/tasks/{id}`              | *Extension.* Cancels a task that accepts cancellation: a queued task, a clone until it is in place, an N-Quads backup, or a reasoning run. Returns `202` with the `Task`, which ends `cancelled`. Other tasks and finished ones get `409 {code: "not-cancellable"}`. Needs `admin` on the task's dataset, or `server-admin` for a server-wide task. The caller that started a background view-only algorithm run (`algo-view`) may also cancel it. |
+| DELETE | `/$/tasks/{id}`              | *Extension.* Cancels a task that accepts cancellation: a queued task, a clone until it is in place, an N-Quads backup, a reasoning run or a vector projection. Returns `202` with the `Task`, which ends `cancelled`. Other tasks and finished ones get `409 {code: "not-cancellable"}`. Needs `admin` on the task's dataset, `read` on the whole dataset for a `vector-projection`, or `server-admin` for a server-wide task. The caller that started a background view-only algorithm run (`algo-view`) may also cancel it. |
 | POST   | `/$/cache/clear/{ds}`        | *Extension (no Fuseki equivalent).* Drops the dataset's cached query results and its cached remote SERVICE results ([SERVICE options](#service-options-loop-bulk-and-cache)). Returns `{ "cleared": number /* entries */, "bytes": number, "serviceCleared": number, "serviceBytes": number }`. |
 | GET    | `/$/prefixes/{ds}`           | `{ "prefixes": { "rdf": "http://…#", … } }`: the dataset's effective prefixes, which are the well-known ones, the prefixes the settings file declares and the dataset's own, as the [prefixes kind](#prefixes) computes them. |
 | GET    | `/{ds}/prefixes`             | Modelled on Fuseki's prefixes service. `?prefix=p` returns `{ prefix, uri }`, or `404` if `p` is unbound. `?uri=u` returns `{ uri, prefixes: [...] }`. With neither, the response is `{ prefixes: {...} }` with the stored prefixes only. Declared and well-known prefixes are not listed here, and `?prefix=` and `?uri=` look only at the stored ones. |
@@ -5276,6 +5276,8 @@ exactly.
 | DELETE | `/$/vector/{ds}/{name}` | Drops the index and its files, with `204`. |
 | POST | `/$/vector/{ds}/{name}/rebuild` | Builds the index again from RDF. Returns `202` and a task. |
 | POST | `/$/vector/{ds}/{name}/recall?samples=100&k=10&ef=` | Measures recall@k against the exact search, with stored vectors as queries. Returns `{ k, samples, ef, recall, hnswMs, exactMs }`. `recall` is `null` when no vector was sampled, for example while the index has no graph to search. |
+| POST | `/$/vector/{ds}/{name}/projection?method=pca` | Computes a two-dimensional projection of the index and keeps it. See [Embedding map](#embedding-map). |
+| GET | `/$/vector/{ds}/{name}/projection?bbox=&limit=&colour=` | The kept projection with its density grid, classes and up to 50,000 points. |
 
 A `VectorIndexStatus` is
 `{ name, predicate, dimension, metric, model?, state, progress?, message?, generation, rows, overlay: { inserts, deletes, indexed, pending, overBudget }, skipped: { malformed, wrongDimension, zeroNorm }, memory: { segmentBytes, hnswBytes, residency }, hnsw, exactThreshold, files?, lastBuild?, embedding? }`.
@@ -5302,6 +5304,85 @@ sparkles vector status  --loc DB [--name NAME]
 
 Each command takes `--server URL --dataset NAME` instead of `--loc`. `create` and
 `rebuild` wait for the build.
+
+### Embedding map
+
+`POST /$/vector/{ds}/{name}/projection` computes a two-dimensional projection of an
+index's entities at the head of the branch, and `GET` on the same path reads it. The UI's
+embedding map draws it.
+
+```sh
+curl -X POST 'http://localhost:3030/$/vector/wiki/abstracts/projection?method=pca'
+curl 'http://localhost:3030/$/vector/wiki/abstracts/projection?limit=1000'
+```
+
+`method=pca`, the default, finds the two leading principal components of a sample of up
+to 100,000 vectors and projects every vector on them. Under the cosine metric the vectors
+are normalized first. An entity with several vectors under the predicate sits at the mean
+of their projections. A PCA of an index of up to 1,000,000 vectors runs in the request
+under its `timeout`, and a larger one runs as a task. `method=neighbours` starts from the
+PCA positions and lays out the index's HNSW neighbour graph, moving each entity toward its
+neighbours and away from crowded regions. It always runs as a cancellable task of kind
+`vector-projection`, and the `POST` answers `202` with the task. Anyone with `read` on the
+whole dataset may cancel it with `DELETE /$/tasks/{id}`, since anyone who can start one
+can. The projection reads the index's base rows and the vectors inserted since, and the
+layout also follows the links of nodes that were added to the graph after its build. The
+optional body is
+`{ "sample": n, "seed": n, "iterations": n }`, where `iterations` counts the layout's
+steps, 100 by default. The same seed gives the same projection.
+
+The `POST` that runs in the request answers the projection's facts,
+`{ index, method, commit, generation, stale, vectors, dimension, entities, bounds,
+explained, builtMs, bytes }`. `vectors` counts the projected vectors and `entities` the
+points, and `explained` is the share of the sample's variance on each component.
+
+`GET` answers those facts with:
+
+| Member | Meaning |
+|---|---|
+| `points` | Up to `limit` points, 50,000 by default and at most, as `{ entity, x, y, class?, colour? }`. |
+| `region` | `{ bbox, total, shown, sampled }` for the points inside `bbox`, or all of them. |
+| `density` | `{ size: 256, bbox, max, counts }`, where `counts` is base64 of little-endian `Uint32` cell counts, row by row from the minimum y. |
+| `classes` | `{ iri, count }` per class. A point's `class` indexes this list. |
+| `colour` | With `colour=IRI`, `{ predicate, values }`, where `values` holds `{ value, count }` and a point's `colour` indexes it. |
+
+Each entity has a fixed sampling priority from the seed. A region with more points than
+`limit` returns those of lowest priority, so a smaller region shows every point that a
+larger one showed inside it, and more. A point's class is its first `rdf:type`, and its
+colour value is the first object of the `colour` predicate.
+
+`Accept: application/x-sparkles-points` returns the same answer in binary. The body starts
+with the eight bytes `SPKPTS\0\x01`, where the last byte is the format's version, and a
+reader refuses any other. A little-endian `Uint32` gives the length of the header, which is
+the JSON answer without `points` and with `count`, `termsBytes` and `hasColour`. The
+entities follow as `termsBytes` bytes of UTF-8 separated by line feeds, then zero bytes to a
+multiple of four. Then come `count` pairs of `Float32` x and y, `count` `Uint32` class
+indexes, and with `colour=` `count` `Uint32` colour indexes. `0xFFFFFFFF` means no class or
+no value.
+
+The server keeps four projections, 1 GiB in all, keyed by dataset, branch, index and
+method, and drops the least recently used first. A projection takes 24 bytes per entity,
+so ten million entities take 240 MB. The query memory pool pays for the computation before
+it allocates, from a bound of its working memory taken from the snapshot it reads. In the
+request the request's own grant is charged, and a task waits in the pool's queue for a
+grant of its own. A computation that needs more than the whole pool is refused with `507`,
+and one that finds the memory in use past the admission wait gets `503`, or a failed task.
+A kept projection then holds a grant for its own bytes until it is dropped and its last
+reader is done, and a projection the pool or the limit cannot hold is refused with
+`507`. An index replaced under the same name with another predicate, dimension or
+metric forgets its projections. A
+kept projection holds the snapshot it read, so after a compaction the replaced generation's
+files stay open until the projection is replaced or dropped. Projections are not written to
+disk, and a restart forgets them. A projection read at an older commit than the head has
+`stale: true` until a new one is computed. `GET` answers `404` until a `POST` computed one.
+`/metrics` reports `sparkles_vector_projections` and `sparkles_vector_projection_bytes`.
+
+Both routes need `read`, and they answer `403` to a caller whose grants or protections
+cover part of the dataset, as the vector status routes do, because a point reveals that an
+entity exists and what it is like. The library computes a projection with
+`ds.indexes().vector().projection(name, &ProjectionConfig, &Control)`, and Python with
+`ds.indexes.vector.projection(name, method="pca", sample=…, seed=…)`, which returns every
+point.
 
 ### Embeddings on write
 
@@ -8875,7 +8956,7 @@ without the permission is a `403` before any connection or file is opened, even 
 | `/$/algo/{ds}/projections/{name}` | PUT, DELETE | Dataset `admin`. |
 | `/$/metrics` | GET | `metrics` |
 | `/$/datasets` | POST | `server-admin` |
-| `/$/datasets/{ds}`, `/$/stats/{ds}`, `/$/schema/{ds}…`, `/$/queries/{ds}…` (GET), `/$/prefixes/{ds}`, `/$/commits/{ds}…`, `/$/ready/{ds}`, `/$/reason/{ds}` (GET), `/$/reason/{ds}/diagnostics`, `/$/text/{ds}` (GET), `/$/geo/{ds}` (GET), `/$/vector/{ds}`, `/$/vector/{ds}/{name}` (GET), `/$/snapshots/{ds}…` (GET), `/$/history/{ds}` (GET), `/$/validation/{ds}` (GET), `/$/rdfs/{ds}` (GET), `/$/describe/{ds}` (GET), `/$/quota/{ds}` (GET), `/$/compaction/{ds}` (GET), `/$/graphql/{ds}…` (GET), `/{ds}/prefixes` (GET) | GET | `read`. `POST /$/vector/{ds}/{name}/recall` needs `read` too. |
+| `/$/datasets/{ds}`, `/$/stats/{ds}`, `/$/schema/{ds}…`, `/$/queries/{ds}…` (GET), `/$/prefixes/{ds}`, `/$/commits/{ds}…`, `/$/ready/{ds}`, `/$/reason/{ds}` (GET), `/$/reason/{ds}/diagnostics`, `/$/text/{ds}` (GET), `/$/geo/{ds}` (GET), `/$/vector/{ds}`, `/$/vector/{ds}/{name}` (GET), `/$/snapshots/{ds}…` (GET), `/$/history/{ds}` (GET), `/$/validation/{ds}` (GET), `/$/rdfs/{ds}` (GET), `/$/describe/{ds}` (GET), `/$/quota/{ds}` (GET), `/$/compaction/{ds}` (GET), `/$/graphql/{ds}…` (GET), `/{ds}/prefixes` (GET) | GET | `read`. `POST /$/vector/{ds}/{name}/recall` and both methods of `/$/vector/{ds}/{name}/projection` need `read` too. |
 | `/$/datasets/{ds}` (DELETE), `/$/datasets/{ds}/clone`, `/$/compact/{ds}`, `/$/backup/{ds}`, `/$/cache/clear/{ds}`, `/$/reason/{ds}` (POST, DELETE), `/$/reason/{ds}/auto`, `/$/text/{ds}` (PUT, DELETE), `/$/text/{ds}/rebuild`, `/$/geo/{ds}` (PUT, DELETE), `/$/geo/{ds}/rebuild`, `/$/vector/{ds}/{name}` (PUT, DELETE), `/$/vector/{ds}/{name}/rebuild`, `/$/vector/{ds}/{name}/reembed`, `/$/snapshots/{ds}` (POST), `/$/snapshots/{ds}/{name}` (DELETE), `/$/history/{ds}` (PUT), `/$/validation/{ds}`, `/$/rdfs/{ds}`, `/$/describe/{ds}`, `/$/compaction/{ds}` and `/$/graphql/{ds}` (PUT, DELETE), `/$/queries/{ds}/{name}` (PUT, DELETE) | | `admin` |
 | `/$/backups/{ds}`, `/$/backups/{ds}/{repo}/{backup}` | GET | `read`. A backup of another dataset is `404`. |
 | `/$/backups/{ds}` (POST), `/$/backups/{ds}/{repo}/{backup}` (DELETE), `…/restore`, `…/verify` | | `admin`. A restore also needs it on its target name. |
@@ -9005,7 +9086,7 @@ because those come from statistics of every graph.
 Routes that report on the whole dataset answer `403` with
 `"… covers every graph of /wiki, and your access is limited to some graphs or triples"`. These are
 `/$/stats/{ds}`, `/$/reason/{ds}` (GET) and its diagnostics, `/$/text/{ds}`,
-`/$/geo/{ds}` and `/$/vector/{ds}…` status and recall, `/$/backups/{ds}…` (GET),
+`/$/geo/{ds}` and `/$/vector/{ds}…` status, recall and projections, `/$/backups/{ds}…` (GET),
 `/$/history/{ds}` (GET), `/$/rdfs/{ds}` (GET), `/$/quota/{ds}` (GET),
 `/$/compaction/{ds}` (GET), `/{ds}/shacl`, `/{ds}/shex` and changes to `/{ds}/prefixes`.
 Other

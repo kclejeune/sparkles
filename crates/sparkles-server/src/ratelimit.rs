@@ -135,6 +135,7 @@ pub fn classify(
             || admin == "graph/{ds}/facets"
             || admin == "forms/{ds}"
             || admin == "forms/{ds}/check"
+            || admin == "vector/{ds}/{name}/projection"
             || admin.starts_with("stats/")
             || admin == "reason/{ds}/diagnostics"
             || admin == "graphql/{ds}/draft"

@@ -1857,6 +1857,7 @@ pub fn render_prometheus(st: &AppState) -> String {
     crate::geo::metrics(st, &mut o);
     crate::compaction::metrics(st, &mut o);
     crate::vector::metrics(st, &mut o);
+    crate::projection::metrics(st, &mut o);
     crate::http::history::metrics(st, &mut o);
     crate::http::branches::metrics(st, &mut o);
     crate::http::algo_view_metrics(&mut o);

@@ -358,6 +358,36 @@ impl VectorIndexes {
             .vector_recall(name, opts.samples, opts.k, opts.ef)
     }
 
+    /// A two-dimensional projection of index `name`'s entities at the head, by PCA or by
+    /// a layout of its neighbour graph (spec U11 §3.3). `ctl` cancels it, bounds it with a
+    /// deadline and hears its progress. The projection is not kept: the server keeps the
+    /// last ones it computed.
+    pub fn projection(
+        &self,
+        name: &str,
+        cfg: &crate::vector::ProjectionConfig,
+        ctl: &crate::task::Control,
+    ) -> Result<crate::vector::Projection> {
+        self.projection_admitted(name, cfg, &|_| Ok(()), ctl)
+    }
+
+    /// [`projection`](Self::projection), calling `admit` with the bytes the computation
+    /// will hold, from the snapshot it reads, before it allocates them. An error from
+    /// `admit` refuses the computation, as a server whose memory pool cannot hold it does.
+    pub fn projection_admitted(
+        &self,
+        name: &str,
+        cfg: &crate::vector::ProjectionConfig,
+        admit: crate::vector::projection::Admit<'_>,
+        ctl: &crate::task::Control,
+    ) -> Result<crate::vector::Projection> {
+        let check = || ctl.check();
+        let progress = |p: f64| ctl.progress.report(p as f32, "projecting the vectors");
+        self.ds
+            .store()
+            .vector_projection(name, cfg, admit, &check, &progress)
+    }
+
     /// Compute index `name`'s embeddings again with its embedding service.
     pub fn reembed(&self, name: &str) -> Result<()> {
         self.ds.store().reembed(name)

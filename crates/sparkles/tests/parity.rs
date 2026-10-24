@@ -378,6 +378,21 @@ fn entries() -> Vec<(&'static str, Entry)> {
         op!("measureVectorRecall", "indexes.vector.recall", |ds| {
             ds.indexes().vector().recall("v", &Default::default());
         }),
+        op!(
+            "computeVectorProjection",
+            "indexes.vector.projection",
+            |ds| {
+                ds.indexes()
+                    .vector()
+                    .projection("v", &Default::default(), &Control::none());
+            }
+        ),
+        // the server keeps the last projections it computed; the library returns each one
+        op!("getVectorProjection", "indexes.vector.projection", |ds| {
+            ds.indexes()
+                .vector()
+                .projection("v", &Default::default(), &Control::none());
+        }),
         op!("getGeoIndex", "indexes.geo.status", |ds| {
             ds.indexes().geo().status();
         }),

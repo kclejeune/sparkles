@@ -340,6 +340,51 @@ test('explore-facets', async ({ page }) => {
   await shoot(page, 'explore-facets');
 });
 
+test('embedding-map', async ({ page, request }) => {
+  // the 6,000 invented shipments of `world` projected by the server and coloured by cargo
+  // class, with a lasso around one lobe of the largest class in the shared selection
+  await page.goto('/ui/embedding?ds=world&index=shipments');
+  const map = page.locator('.emap[data-ready="true"]');
+  await expect(map).toHaveAttribute('data-points', '6000', { timeout: 30_000 });
+  await expect(page.getByTestId('progress')).toHaveCount(0);
+  await page.waitForTimeout(500);
+  const r = await request.get('/$/vector/world/shipments/projection');
+  const points: { x: number; y: number; class?: number }[] = (await r.json()).points;
+  const [ax, bx, ay, by] = (await map.getAttribute('data-transform'))!.split(',').map(Number);
+  const box = (await map.boundingBox())!;
+  // the densest cell of class 0 at a coarse grid, in viewport pixels
+  const cells = new Map<string, { n: number; x: number; y: number }>();
+  for (const p of points) {
+    if (p.class !== 0) continue;
+    const vx = box.x + ax * p.x + bx;
+    const vy = box.y + ay * p.y + by;
+    const key = `${Math.floor(vx / 80)},${Math.floor(vy / 80)}`;
+    const c = cells.get(key) ?? { n: 0, x: 0, y: 0 };
+    c.n++;
+    c.x += vx;
+    c.y += vy;
+    cells.set(key, c);
+  }
+  const best = [...cells.values()].sort((a, b) => b.n - a.n)[0];
+  const cx = best.x / best.n;
+  const cy = best.y / best.n;
+  await page.getByRole('radio', { name: 'Lasso' }).click();
+  await page.mouse.move(cx + 70, cy);
+  await page.mouse.down();
+  for (let k = 1; k <= 24; k++) {
+    const a = (k / 24) * Math.PI * 2;
+    await page.mouse.move(
+      cx + 70 * Math.cos(a) * (1 + 0.15 * Math.sin(3 * a)),
+      cy + 55 * Math.sin(a),
+    );
+  }
+  await page.mouse.up();
+  await expect(page.getByRole('region', { name: 'Selection' })).toContainText(
+    'selected by the embedding map',
+  );
+  await shoot(page, 'embedding-map');
+});
+
 test('query-facets', async ({ page }) => {
   // the query page's facets of a variable, with the brushes Apply to query writes
   await page.addInitScript(() => localStorage.setItem('sparkles.dataset', 'world'));

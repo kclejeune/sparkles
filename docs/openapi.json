@@ -34511,6 +34511,366 @@
         "x-sparkles-permission": "admin"
       }
     },
+    "/$/vector/{ds}/{name}/projection": {
+      "get": {
+        "description": "Returns the kept projection's method, commit, bounds, a density grid of 256 by 256 cells, its classes, and up to 50,000 points as `{entity, x, y, class?, colour?}`. `bbox` returns the points inside a region and its density, at most `limit`, those of lowest sampling priority when there are more, so zooming in keeps the points already shown. `colour` names a predicate whose first value per point is returned as an index into `colour.values`. `Accept: application/x-sparkles-points` returns the binary points format of the embedding map guide. A projection read at an older commit than the head has `stale: true`.",
+        "externalDocs": {
+          "url": "https://github.com/kclejeune/sparkles/blob/main/docs/API.md#embedding-map"
+        },
+        "operationId": "getVectorProjection",
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/ds"
+          },
+          {
+            "$ref": "#/components/parameters/name"
+          },
+          {
+            "description": "The projection's method. The most recent of any method when absent.",
+            "in": "query",
+            "name": "method",
+            "schema": {
+              "enum": [
+                "pca",
+                "neighbours"
+              ],
+              "type": "string"
+            }
+          },
+          {
+            "description": "`minX,minY,maxX,maxY`.",
+            "in": "query",
+            "name": "bbox",
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "The most points to return.",
+            "in": "query",
+            "name": "limit",
+            "schema": {
+              "default": 50000,
+              "maximum": 50000,
+              "minimum": 0,
+              "type": "integer"
+            }
+          },
+          {
+            "description": "A predicate IRI whose values colour the points.",
+            "in": "query",
+            "name": "colour",
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "properties": {
+                    "bounds": {
+                      "description": "`[minX, minY, maxX, maxY]`.",
+                      "items": {
+                        "type": "number"
+                      },
+                      "type": "array"
+                    },
+                    "builtMs": {
+                      "type": "number"
+                    },
+                    "bytes": {
+                      "type": "integer"
+                    },
+                    "classes": {
+                      "items": {
+                        "description": "`{iri, count}`.",
+                        "type": "object"
+                      },
+                      "type": "array"
+                    },
+                    "colour": {
+                      "description": "`{predicate, values}`, where `values` holds `{value, count}` with a term in the SPARQL JSON results form.",
+                      "type": "object"
+                    },
+                    "commit": {
+                      "type": "integer"
+                    },
+                    "density": {
+                      "description": "`{size, bbox, max, counts}`, where `counts` is base64 of little-endian `Uint32` cell counts, row by row from the minimum y.",
+                      "type": "object"
+                    },
+                    "dimension": {
+                      "type": "integer"
+                    },
+                    "entities": {
+                      "description": "Points in the whole projection.",
+                      "type": "integer"
+                    },
+                    "explained": {
+                      "description": "The share of the sample's variance on each component.",
+                      "items": {
+                        "type": "number"
+                      },
+                      "type": "array"
+                    },
+                    "generation": {
+                      "type": "string"
+                    },
+                    "index": {
+                      "type": "string"
+                    },
+                    "method": {
+                      "type": "string"
+                    },
+                    "points": {
+                      "items": {
+                        "description": "`{entity, x, y, class?, colour?}`, where `class` and `colour` index `classes` and `colour.values`.",
+                        "type": "object"
+                      },
+                      "type": "array"
+                    },
+                    "region": {
+                      "description": "`{bbox, total, shown, sampled}`: the points inside the region and how many are returned.",
+                      "type": "object"
+                    },
+                    "stale": {
+                      "description": "The head has moved since the projection was computed.",
+                      "type": "boolean"
+                    },
+                    "vectors": {
+                      "type": "integer"
+                    }
+                  },
+                  "required": [
+                    "index",
+                    "method",
+                    "commit",
+                    "stale",
+                    "entities",
+                    "bounds",
+                    "region",
+                    "density",
+                    "classes",
+                    "points"
+                  ],
+                  "type": "object"
+                }
+              },
+              "application/x-sparkles-points": {
+                "schema": {
+                  "format": "binary",
+                  "type": "string"
+                }
+              }
+            },
+            "description": "The projection and its points."
+          },
+          "400": {
+            "$ref": "#/components/responses/BadRequest"
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "403": {
+            "$ref": "#/components/responses/Forbidden"
+          },
+          "404": {
+            "$ref": "#/components/responses/NotFound"
+          },
+          "default": {
+            "$ref": "#/components/responses/Error"
+          }
+        },
+        "summary": "Read a kept projection of a vector index",
+        "tags": [
+          "Search"
+        ],
+        "x-sparkles-permission": "read"
+      },
+      "post": {
+        "description": "Computes a two-dimensional projection of the index's entities at the head and keeps it in memory for `GET`. `pca` projects every vector on the two leading principal components of a sample, and an entity with several vectors sits at the mean of their projections. It runs in the request for an index of up to 1,000,000 vectors and as a task above that. `neighbours` lays out the index's HNSW neighbour graph from the PCA positions and always runs as a task. The server keeps four projections, 1 GiB in all, charged to the query memory pool, and refuses one it cannot hold with `507`. A caller whose access covers part of the dataset gets `403`.",
+        "externalDocs": {
+          "url": "https://github.com/kclejeune/sparkles/blob/main/docs/API.md#embedding-map"
+        },
+        "operationId": "computeVectorProjection",
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/ds"
+          },
+          {
+            "$ref": "#/components/parameters/name"
+          },
+          {
+            "description": "How the vectors are placed.",
+            "in": "query",
+            "name": "method",
+            "schema": {
+              "default": "pca",
+              "enum": [
+                "pca",
+                "neighbours"
+              ],
+              "type": "string"
+            }
+          },
+          {
+            "$ref": "#/components/parameters/timeout"
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "additionalProperties": false,
+                "properties": {
+                  "iterations": {
+                    "description": "Steps of the neighbour layout.",
+                    "maximum": 1000,
+                    "minimum": 1,
+                    "type": "integer"
+                  },
+                  "sample": {
+                    "description": "Vectors the PCA learns from.",
+                    "maximum": 100000,
+                    "minimum": 1,
+                    "type": "integer"
+                  },
+                  "seed": {
+                    "description": "The seed of the first directions, the sampling priorities and the layout.",
+                    "minimum": 0,
+                    "type": "integer"
+                  }
+                },
+                "type": "object"
+              }
+            }
+          },
+          "description": "The sample, seed and layout steps.",
+          "required": false
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "properties": {
+                    "bounds": {
+                      "items": {
+                        "type": "number"
+                      },
+                      "type": "array"
+                    },
+                    "builtMs": {
+                      "type": "number"
+                    },
+                    "bytes": {
+                      "type": "integer"
+                    },
+                    "commit": {
+                      "type": "integer"
+                    },
+                    "dimension": {
+                      "type": "integer"
+                    },
+                    "entities": {
+                      "type": "integer"
+                    },
+                    "explained": {
+                      "items": {
+                        "type": "number"
+                      },
+                      "type": "array"
+                    },
+                    "generation": {
+                      "type": "string"
+                    },
+                    "index": {
+                      "type": "string"
+                    },
+                    "method": {
+                      "enum": [
+                        "pca",
+                        "neighbours"
+                      ],
+                      "type": "string"
+                    },
+                    "stale": {
+                      "type": "boolean"
+                    },
+                    "vectors": {
+                      "type": "integer"
+                    }
+                  },
+                  "required": [
+                    "index",
+                    "method",
+                    "commit",
+                    "stale",
+                    "entities",
+                    "bounds"
+                  ],
+                  "type": "object"
+                }
+              }
+            },
+            "description": "The projection, without its points."
+          },
+          "202": {
+            "$ref": "#/components/responses/TaskStarted"
+          },
+          "400": {
+            "$ref": "#/components/responses/BadRequest"
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "403": {
+            "$ref": "#/components/responses/Forbidden"
+          },
+          "404": {
+            "$ref": "#/components/responses/NotFound"
+          },
+          "408": {
+            "$ref": "#/components/responses/Timeout"
+          },
+          "503": {
+            "$ref": "#/components/responses/Unavailable"
+          },
+          "507": {
+            "$ref": "#/components/responses/InsufficientStorage"
+          },
+          "default": {
+            "$ref": "#/components/responses/Error"
+          }
+        },
+        "security": [
+          {
+            "basicAuth": []
+          },
+          {
+            "apiToken": []
+          },
+          {
+            "oidcAccessToken": []
+          },
+          {
+            "csrfToken": [],
+            "sessionCookie": []
+          },
+          {
+            "cloudflareAccess": []
+          }
+        ],
+        "summary": "Compute a projection of a vector index",
+        "tags": [
+          "Search"
+        ],
+        "x-sparkles-permission": "read"
+      }
+    },
     "/$/vector/{ds}/{name}/rebuild": {
       "post": {
         "externalDocs": {

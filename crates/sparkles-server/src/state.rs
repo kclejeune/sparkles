@@ -323,6 +323,8 @@ pub struct AppState {
     /// principals carry
     #[cfg_attr(not(feature = "auth"), allow(dead_code))]
     pub graphrag_guard: Arc<crate::graphrag::guard::Guard>,
+    /// the vector index projections the server keeps (spec U11 §3.3)
+    pub projections: crate::projection::Projections,
     /// GraphRAG builds waiting for confirmation, and the figures of the metrics
     #[cfg(feature = "mcp")]
     pub graphrag: Arc<crate::graphrag::runtime::Runtime>,
@@ -637,6 +639,7 @@ impl AppState {
         let state = AppState {
             data_dir: data_dir.to_path_buf(),
             graphrag_guard: Arc::new(crate::graphrag::guard::Guard::new()),
+            projections: Default::default(),
             #[cfg(feature = "mcp")]
             graphrag: Default::default(),
             catalog,
@@ -706,6 +709,7 @@ impl AppState {
         AppState {
             data_dir: PathBuf::new(),
             graphrag_guard: Arc::new(crate::graphrag::guard::Guard::new()),
+            projections: Default::default(),
             #[cfg(feature = "mcp")]
             graphrag: Default::default(),
             catalog,

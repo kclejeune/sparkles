@@ -166,6 +166,7 @@ pub const ROUTES: &[(&str, &[&str])] = &[
     ("/$/vector/{ds}/{name}/rebuild", &["POST"]),
     ("/$/vector/{ds}/{name}/reembed", &["POST"]),
     ("/$/vector/{ds}/{name}/recall", &["POST"]),
+    ("/$/vector/{ds}/{name}/projection", &["GET", "POST"]),
     ("/$/snapshots/{ds}", &["GET", "POST"]),
     ("/$/snapshots/{ds}/{name}", &["GET", "DELETE"]),
     ("/$/history/{ds}", &["GET", "PUT"]),
@@ -421,6 +422,7 @@ pub fn need(route: &str, method: &Method, uri: &Uri, headers: &HeaderMap) -> Opt
         | "/{ds}/queries/{name}"
         | "/$/vector/{ds}"
         | "/$/vector/{ds}/{name}/recall"
+        | "/$/vector/{ds}/{name}/projection"
         | "/{ds}/sparql"
         | "/{ds}/query"
         | "/{ds}/explain"
@@ -612,6 +614,7 @@ pub fn whole_dataset(route: &str, method: &Method) -> bool {
         | "/$/reason/{ds}/diagnostics"
         | "/$/vector/{ds}"
         | "/$/vector/{ds}/{name}/recall"
+        | "/$/vector/{ds}/{name}/projection"
         | "/{ds}/shacl"
         | "/{ds}/shex" => true,
         "/$/reason/{ds}"

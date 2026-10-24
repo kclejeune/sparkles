@@ -398,6 +398,14 @@
         {#if ds}in <span class="mono">{ds}</span>{/if}
       </p>
     </div>
+    {#if ds && chosenIndex}
+      <a
+        class="btn sm"
+        href="{resolve('/embedding')}?ds={encodeURIComponent(ds)}&index={encodeURIComponent(
+          chosenIndex.name,
+        )}">Embedding map</a
+      >
+    {/if}
   </header>
 
   <div class="layout">
