@@ -351,6 +351,14 @@ fn edge_cases_follow_the_oracle() {
                 "INSERT DATA { :c :v 9223372036854775807 . :d :v 9223372036854775807 }",
             ],
         ),
+        // decimal values that cancel out sum exactly
+        (
+            "SELECT (SUM(?v) AS ?s) (AVG(?v) AS ?m) WHERE { ?x :v ?v }",
+            &[
+                "INSERT DATA { :a :v 100000000000000000000.0 . :b :v -100000000000000000000.0 }",
+                "INSERT DATA { :c :v 100000000000000000001.0 . :d :v -100000000000000000001.0 }",
+            ],
+        ),
         // the base IRI reaches expressions
         (
             "BASE <http://example.org/> SELECT (IRI(\"relative\") AS ?i) WHERE {}",
@@ -445,4 +453,21 @@ fn a_rebuild_clears_the_operators_state() {
         step(&s, &mut c);
         check(&s, &c, q, "after a delete");
     }
+}
+
+/// A template that mints many occurrences of one solution still meets the deadline.
+#[test]
+fn a_template_expansion_meets_the_deadline() {
+    let s = Store::in_memory(StoreOptions::default());
+    let values: String = (0..15)
+        .map(|i| format!("VALUES ?v{i} {{ 1 1 }} "))
+        .collect();
+    let q = format!("CONSTRUCT {{ [] :p ?v0 }} WHERE {{ {values} }}");
+    let parsed = sparql::parse_query(&format!("{PREFIX}{q}"), None, &[]).expect("parse");
+    let mut c = Circuit::new(compile(&parsed, None).expect("compile"), None);
+    let control = Control {
+        deadline: Some(std::time::Instant::now()),
+        ..Control::none()
+    };
+    assert!(c.build(s.snapshot(), &control).is_err());
 }

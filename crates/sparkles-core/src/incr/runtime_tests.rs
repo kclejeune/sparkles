@@ -1026,3 +1026,107 @@ fn inferences_in_the_default_graph_refuse_views() {
             .is_err()
     );
 }
+
+/// A view read back to an earlier commit keeps the view's own default graph, whatever
+/// the reading query asks for.
+#[test]
+fn a_view_read_back_keeps_its_default_graph() {
+    let s = Store::in_memory(StoreOptions::default());
+    upd(&s, "INSERT DATA { :a :v 1 . GRAPH :g { :b :v 2 } }");
+    let rt = runtime(&s, None);
+    rt.put(&s, "v", ViewDef::table(q("SELECT ?s WHERE { ?s :v ?o }")))
+        .unwrap();
+    rt.round(&s);
+    let first = s.snapshot();
+    let mut union = (*first).clone();
+    union.union_default_graph = !first.union_default_graph;
+    let union = Arc::new(union);
+    // more changes than the view's history keeps
+    for i in 0..20 {
+        upd(&s, &format!("INSERT DATA {{ :n{i} :v 1 }}"));
+        rt.round(&s);
+    }
+    rt.round(&s);
+    let r = rt
+        .read(&ViewRead {
+            name: "v",
+            at: first.commit,
+            snap: Some(&union),
+            allow_stale: false,
+            caller: None,
+            deadline: None,
+        })
+        .map(|r| rows_of(&r.rows));
+    assert_eq!(r.ok(), Some(vec!["a".to_string()]));
+}
+
+/// An error that ends a stream survives the recovery of an overflowed queue.
+#[test]
+fn an_overflow_keeps_the_ending_error() {
+    let s = Store::in_memory(StoreOptions::default());
+    load(&s);
+    let rt = runtime(&s, None);
+    let l = rt
+        .live(
+            &s,
+            &q("SELECT ?s ?o WHERE { ?s :n ?o }"),
+            None,
+            &LiveOptions {
+                max_memory_bytes: Some(100_000),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+    l.try_next().unwrap();
+    let mut data = String::from("INSERT DATA { ");
+    for i in 0..5000 {
+        data.push_str(&format!(":s{i} :n {i} . "));
+    }
+    data.push('}');
+    upd(&s, &data);
+    rt.round(&s);
+    let mut last = None;
+    while let Some(e) = l.try_next() {
+        last = Some(e);
+    }
+    assert!(
+        matches!(&last, Some(LiveEvent::Error { code, .. }) if code == "over-budget"),
+        "{last:?}"
+    );
+}
+
+/// Closing wakes every asynchronous reader.
+#[test]
+fn closing_wakes_every_async_reader() {
+    let s = Store::in_memory(StoreOptions::default());
+    load(&s);
+    let rt = runtime(&s, None);
+    let l = Arc::new(
+        rt.live(&s, &q(TEAM_SIZES), None, &LiveOptions::default())
+            .unwrap(),
+    );
+    l.try_next().unwrap();
+    let (tx, rx) = std::sync::mpsc::channel();
+    let l2 = l.clone();
+    let t = std::thread::spawn(move || {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .build()
+            .unwrap();
+        let both = rt.block_on(async {
+            let a = tokio::spawn({
+                let l = l2.clone();
+                async move { l.recv().await.is_none() }
+            });
+            let b = tokio::spawn({
+                let l = l2.clone();
+                async move { l.recv().await.is_none() }
+            });
+            (a.await.unwrap(), b.await.unwrap())
+        });
+        tx.send(both).unwrap();
+    });
+    std::thread::sleep(Duration::from_millis(100));
+    l.close();
+    assert_eq!(rx.recv_timeout(Duration::from_secs(10)), Ok((true, true)));
+    t.join().unwrap();
+}

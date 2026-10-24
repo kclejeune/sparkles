@@ -777,8 +777,9 @@ of F16's derived-fact layer if F16 chooses it.
   ARQ's other extensions, triple terms, property functions, and `MINUS`, aggregates,
   `DISTINCT`, `VALUES` and subqueries under `GRAPH ?g`. `ORDER BY` without `LIMIT` does not change a view's rows and is ignored.
 - `SUM` and `AVG` keep an exact integer sum, and value counts for decimals, floats and
-  doubles. A decimal sum whose positive or negative values pass the decimal range is
-  unbound, as an overflow in a one-off evaluation is.
+  doubles. Decimals are summed exactly in 256 bits, and a sum outside the decimal range
+  is unbound. A one-off evaluation adds the rows in order and can overflow on the way to
+  a sum in the range, where a view returns the sum.
 - A CONSTRUCT template's blank nodes are minted as `_:v` and a hex hash of the template's
   label and the solution's terms, so a solution that returns gives the same node. A
   solution that occurs twice gives two nodes, because the template keeps each solution's

@@ -250,7 +250,13 @@ impl Shared {
 
     pub(crate) fn close(&self) {
         self.queue.lock().closed = true;
+        self.wake_all();
+    }
+
+    /// Wake every waiting reader, blocking or asynchronous, and the next one to wait.
+    fn wake_all(&self) {
         self.cv.notify_all();
+        self.notify.notify_waiters();
         self.notify.notify_one();
     }
 }
@@ -321,7 +327,8 @@ impl LiveQuery {
                 }
                 q.overflow = false;
                 q.rows = 0;
-                q.events.clear();
+                // the reset covers the data events, but not an error that ends the stream
+                q.events.retain(|e| matches!(e, LiveEvent::Error { .. }));
                 Some(slot.resync(&self.shared))
             });
             if e.is_some() {
@@ -374,7 +381,9 @@ impl LiveQuery {
     /// The next event, awaiting it. `None` once the subscription has ended.
     pub async fn recv(&self) -> Option<LiveEvent> {
         loop {
-            let notified = self.shared.notify.notified();
+            // registered before the queue is read, so that a wake in between is kept
+            let mut notified = std::pin::pin!(self.shared.notify.notified());
+            notified.as_mut().enable();
             {
                 let mut q = self.shared.queue.lock();
                 if let Some(e) = self.take(&mut q) {
@@ -397,8 +406,7 @@ impl LiveQuery {
         q.rows = 0;
         q.overflow = false;
         drop(q);
-        self.shared.cv.notify_all();
-        self.shared.notify.notify_one();
+        self.shared.wake_all();
     }
 
     /// Whether the subscription has ended and its queue is empty.

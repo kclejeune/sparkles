@@ -77,6 +77,7 @@ impl Template {
                 (before + w..before, -1)
             };
             for k in range {
+                p.tick()?;
                 let k = (k > 0).then_some(k);
                 self.emit(p, &row, &keys, k, sign, &mut out);
             }

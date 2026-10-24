@@ -4,9 +4,10 @@
 //! Integer and decimal sums are kept exactly, so removing a value is exact. Float and
 //! double values are kept as value counts, and a changed group sums them again: such a
 //! sum can differ in its last bits from a one-off evaluation, which adds the values in
-//! the order the rows arrive. A sum whose integer part leaves the 64-bit range, or
-//! whose positive or negative decimal values sum past the decimal range, is
-//! unbound, as an overflow in a one-off evaluation is. `DISTINCT` aggregates keep the
+//! the order the rows arrive. A sum whose integer part leaves the 64-bit range, or a
+//! decimal sum outside the decimal range, is unbound, as an overflow in a one-off
+//! evaluation is. A one-off evaluation can also overflow on the way to a sum in the
+//! range, depending on the order of the rows, where the circuit's exact sum does not. `DISTINCT` aggregates keep the
 //! counts of the group's distinct values.
 
 use super::super::pass::Pass;
@@ -19,6 +20,46 @@ use crate::sparql::value::{NumOp, Value, arith};
 use oxsdatatypes::{Decimal, Double, Float};
 use rustc_hash::FxHashMap;
 use spargebra::algebra::Expression;
+
+/// A 256-bit two's complement integer, for exact sums of 128-bit products.
+#[derive(Default)]
+struct Wide {
+    hi: u128,
+    lo: u128,
+}
+
+impl Wide {
+    fn add(&mut self, hi: u128, lo: u128) {
+        let (lo, carry) = self.lo.overflowing_add(lo);
+        self.lo = lo;
+        self.hi = self.hi.wrapping_add(hi).wrapping_add(u128::from(carry));
+    }
+
+    /// Add `a × b`.
+    fn add_product(&mut self, a: i128, b: i64) {
+        let negative = (a < 0) != (b < 0);
+        let (m, n) = (a.unsigned_abs(), u128::from(b.unsigned_abs()));
+        // |a| × |b| as two 128-bit limbs, from the 64-bit halves of |a|
+        let low = (m & u128::from(u64::MAX)) * n;
+        let high = (m >> 64) * n;
+        let (lo, carry) = low.overflowing_add(high << 64);
+        let hi = (high >> 64) + u128::from(carry);
+        if negative {
+            // two's complement: invert and add one
+            let (lo, carry) = (!lo).overflowing_add(1);
+            self.add((!hi).wrapping_add(u128::from(carry)), lo);
+        } else {
+            self.add(hi, lo);
+        }
+    }
+
+    /// The value when it fits in 128 bits.
+    fn to_i128(&self) -> Option<i128> {
+        let v = self.lo as i128;
+        let sign = if v < 0 { u128::MAX } else { 0 };
+        (self.hi == sign).then_some(v)
+    }
+}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum AggKind {
@@ -83,21 +124,15 @@ impl SumState {
             return None;
         }
         let mut acc = if !self.decs.is_empty() {
-            // the positive and negative parts, each summed with checks: a part that
-            // leaves the decimal range makes the sum unbound
-            let (mut pos, mut neg) = (0i128, 0i128);
+            // summed exactly in 256 bits, so that values which cancel out do not
+            // overflow on the way; the integers join the decimals, as a one-off
+            // evaluation promotes them
+            let mut acc = Wide::default();
             for (k, n) in &self.decs {
-                let v = k.checked_mul(i128::from(*n))?;
-                if v >= 0 {
-                    pos = pos.checked_add(v)?;
-                } else {
-                    neg = neg.checked_add(v)?;
-                }
+                acc.add_product(*k, *n);
             }
-            // the integers join the decimals, as a one-off evaluation promotes them
-            let int = self.int.checked_mul(1_000_000_000_000_000_000)?;
-            let raw = pos.checked_add(neg)?.checked_add(int)?;
-            Value::Decimal(Decimal::from_be_bytes(raw.to_be_bytes()))
+            acc.add_product(self.int, 1_000_000_000_000_000_000);
+            Value::Decimal(Decimal::from_be_bytes(acc.to_i128()?.to_be_bytes()))
         } else {
             Value::Integer(i64::try_from(self.int).ok()?.into())
         };

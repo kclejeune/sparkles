@@ -37,7 +37,7 @@ use std::time::{Duration, Instant};
 
 /// The version of the compiler, part of a checkpoint's fingerprint: a state written
 /// by another compiler is not loaded.
-const COMPILER: &str = "f13-phase1-1";
+const COMPILER: &str = "f13-phase1-2";
 /// The branch whose state Phase 1 keeps.
 const BRANCH: &str = "main";
 /// The most rows a circuit's diff history keeps for resumed live queries.
@@ -1636,6 +1636,19 @@ impl Runtime {
         let Some(snap) = r.snap.filter(|s| s.commit == r.at) else {
             return Err(ahead());
         };
+        // the view's own default graph, whatever the reading query asked for
+        let union = st
+            .circuit
+            .snap
+            .as_ref()
+            .map_or(snap.union_default_graph, |s| s.union_default_graph);
+        let snap = if union == snap.union_default_graph {
+            snap.clone()
+        } else {
+            let mut s = (**snap).clone();
+            s.union_default_graph = union;
+            Arc::new(s)
+        };
         let compiled = compile(&st.query, st.whole.as_deref())?;
         let mut c = Circuit::new(compiled, st.circuit.access.clone());
         drop(st);
@@ -1643,7 +1656,7 @@ impl Runtime {
             deadline: r.deadline.or(self.control().deadline),
             ..Control::none()
         };
-        c.build(snap.clone(), &control)?;
+        c.build(snap, &control)?;
         Ok(ViewRows {
             columns,
             rows: c.rows(),
