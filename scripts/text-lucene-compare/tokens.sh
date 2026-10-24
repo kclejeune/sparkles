@@ -2,7 +2,9 @@
 # Regenerates the expected tokens of the analyzers that follow Lucene's, which
 # crates/sparkles-core's test lucene_analyzers_agree_with_lucene checks:
 # crates/sparkles-core/tests/data/lucene-analyzers/NAME.out holds the tokens that Lucene
-# makes of each line of NAME.in.
+# makes of each line of NAME.in, and standard-tokenizer.out holds the tokens, offsets and
+# types that Lucene's StandardTokenizer makes of each line of standard-tokenizer.in
+# (which standard-inputs.py writes).
 #
 #   scripts/text-lucene-compare/tokens.sh
 #
@@ -24,8 +26,12 @@ FHOME=$(dirname "$(readlink -f "$FUSEKI")")
 [ -f "$FHOME/fuseki-server.jar" ] || FHOME=$(dirname "$FHOME")
 JAR=$FHOME/fuseki-server.jar
 JDK=$(grep -o "/nix/store/[^'\":]*openjdk[^/'\":]*" "$FUSEKI" | head -1)
-"$JDK/bin/javac" -proc:none -cp "$JAR" -d "$WORK" "$ROOT/scripts/text-lucene-compare/LuceneTokens.java"
+"$JDK/bin/javac" -proc:none -cp "$JAR" -d "$WORK" "$ROOT/scripts/text-lucene-compare/LuceneTokens.java" \
+  "$ROOT/scripts/text-lucene-compare/StandardTokens.java"
 DATA=$ROOT/crates/sparkles-core/tests/data/lucene-analyzers
+"$JDK/bin/java" -cp "$JAR:$WORK" StandardTokens \
+  < "$DATA/standard-tokenizer.in" > "$DATA/standard-tokenizer.out"
+echo "standard-tokenizer: $(wc -l < "$DATA/standard-tokenizer.out") lines"
 while read -r name class; do
   "$JDK/bin/java" -cp "$JAR:$WORK" LuceneTokens "org.apache.lucene.analysis.$class" \
     < "$DATA/$name.in" > "$DATA/$name.out"

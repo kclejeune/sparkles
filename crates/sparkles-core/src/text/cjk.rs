@@ -137,19 +137,16 @@ fn lucene_tokens(text: &str) -> Vec<Token> {
         if run.last().is_some_and(|l| l.2 != t.offset_from) {
             flush(&mut out, &mut run);
         }
-        // each character covers its share of the word's bytes; folding can join a
-        // voiced mark to its kana, so the last character ends where the word does
-        let mut from = t.offset_from;
-        let source: Vec<(usize, char)> = t.text.char_indices().collect();
-        let n = word.chars().count();
-        for (k, c) in word.chars().enumerate() {
-            let to = if k + 1 == n {
-                t.offset_to
-            } else {
-                t.offset_from + source.get(k + 1).map_or(t.text.len(), |x| x.0)
-            };
-            run.push((c, from, to));
-            from = to;
+        // each character covers its own source character, unless folding joined a
+        // voiced mark to its kana: then, as in Lucene's bigram filter, which compares
+        // the lengths, every character covers the whole word
+        if word.encode_utf16().count() == t.text.encode_utf16().count() {
+            for ((i, s), c) in t.text.char_indices().zip(word.chars()) {
+                let from = t.offset_from + i;
+                run.push((c, from, from + s.len_utf8()));
+            }
+        } else {
+            run.extend(word.chars().map(|c| (c, t.offset_from, t.offset_to)));
         }
     }
     flush(&mut out, &mut run);

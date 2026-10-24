@@ -54,6 +54,9 @@ mod search;
 mod sloppy;
 #[cfg(feature = "text")]
 mod standard;
+#[cfg(feature = "text")]
+#[rustfmt::skip]
+mod standard_tables;
 use serde::{Deserialize, Serialize};
 
 /// Which predicates are indexed.
@@ -1216,21 +1219,48 @@ mod imp {
     /// A text field's analysis without its tokenizer: a prefix, wildcard, fuzzy or
     /// regular expression term is normalized as the indexed tokens are, but not split or
     /// stemmed. Terms of the standard text (`None`) are lowercased and ASCII-folded, and
-    /// those of a language only lowercased, as Lucene's analyzers normalize them.
+    /// those of a language only lowercased, as Lucene's analyzers normalize them. The
+    /// analyzers that follow Lucene's lowercase as Java does, character by character,
+    /// and the CJK ones fold widths first.
     pub(super) fn normalizer(analyzer: Option<Analyzer>) -> TextAnalyzer {
-        let b = TextAnalyzer::builder(tantivy::tokenizer::RawTokenizer::default())
-            .filter(LowerCaser)
-            .dynamic();
+        use super::filters::{self as f, MapFilter};
+        fn width(s: &str) -> Option<String> {
+            Some(super::cjk::fold_word(s))
+        }
+        let raw = || TextAnalyzer::builder(tantivy::tokenizer::RawTokenizer::default()).dynamic();
+        let java = || raw().filter_dynamic(MapFilter(f::lowercase));
         match analyzer {
-            None => b.filter_dynamic(AsciiFoldingFilter).build(),
+            None => raw()
+                .filter_dynamic(LowerCaser)
+                .filter_dynamic(AsciiFoldingFilter)
+                .build(),
+            Some(Analyzer::Cjk) => raw()
+                .filter_dynamic(MapFilter(width))
+                .filter_dynamic(LowerCaser)
+                .build(),
+            Some(Analyzer::CjkLucene | Analyzer::JaDict | Analyzer::ZhDict | Analyzer::KoDict) => {
+                raw()
+                    .filter_dynamic(MapFilter(width))
+                    .filter_dynamic(MapFilter(f::lowercase))
+                    .build()
+            }
             // Lucene's French and Italian analyzers normalize elisions too
-            Some(Analyzer::FrenchLight) => b
-                .filter_dynamic(super::filters::MapFilter(super::filters::french_elision))
-                .build(),
-            Some(Analyzer::ItalianLight) => b
-                .filter_dynamic(super::filters::MapFilter(super::filters::italian_elision))
-                .build(),
-            Some(_) => b.build(),
+            Some(Analyzer::FrenchLight) => {
+                java().filter_dynamic(MapFilter(f::french_elision)).build()
+            }
+            Some(Analyzer::ItalianLight) => {
+                java().filter_dynamic(MapFilter(f::italian_elision)).build()
+            }
+            Some(
+                Analyzer::EnglishLucene
+                | Analyzer::SpanishLight
+                | Analyzer::PortugueseLight
+                | Analyzer::GermanLight
+                | Analyzer::DutchLucene
+                | Analyzer::RussianLucene
+                | Analyzer::SwedishLucene,
+            ) => java().build(),
+            Some(_) => raw().filter_dynamic(LowerCaser).build(),
         }
     }
 

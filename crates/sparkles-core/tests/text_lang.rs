@@ -405,6 +405,8 @@ ex:ru1 rdfs:label "Зелёная ёлка"@ru .
 ex:ru2 rdfs:label "Зеленая елка"@ru .
 ex:sv1 rdfs:label "Hon vill sitta"@sv .
 ex:ja1 rdfs:label "東京 the 都"@ja .
+ex:ja2 rdfs:label "ＡＢＣ ｶﾞｷﾞｸﾞ"@ja .
+ex:en4 rdfs:label "İSTANBUL 😀 trip"@en .
 "#;
 
 fn lucene_store() -> Store {
@@ -465,6 +467,26 @@ fn lucene_analyzers_search_as_jena_does() {
     assert_eq!(
         hits(&s, "'\\\"東京 都\\\"' \"lang:ja\""),
         Vec::<String>::new()
+    );
+    // a prefix is lowercased as Java lowercases (İ is i) and its widths folded, as the
+    // indexed tokens are
+    assert_eq!(hits(&s, "\"İS*\" \"lang:en\""), ["en4"]);
+    assert_eq!(hits(&s, "\"ＡＢ*\" \"lang:ja\""), ["ja2"]);
+    assert_eq!(hits(&s, "\"ｶﾞｷﾞ*\" \"lang:ja\""), ["ja2"]);
+    // an emoji is a word, so a phrase does not skip it
+    assert_eq!(hits(&s, "\"😀\" \"lang:en\""), ["en4"]);
+    assert_eq!(
+        hits(&s, "'\\\"istanbul trip\\\"' \"lang:en\""),
+        Vec::<String>::new()
+    );
+    // folding joins each voiced mark to its kana, so every bigram of the word covers
+    // the whole word, as in Lucene
+    assert_eq!(
+        rows(
+            &s,
+            "SELECT ?lit { (?s ?sc ?lit) text:query (rdfs:label \"ガギ\" \"lang:ja\" \"highlight:s:[|e:]\") }"
+        ),
+        ["ＡＢＣ [ｶﾞｷﾞｸﾞ]"]
     );
     // the names are kept in text.json and read back in any case
     let cfg: TextConfig = serde_json::from_str(r#"{"languages": {"fr": "French-Light"}}"#).unwrap();
