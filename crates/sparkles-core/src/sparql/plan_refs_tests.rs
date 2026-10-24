@@ -515,3 +515,54 @@ fn a_caller_that_shows_no_plan_gets_no_members_and_the_same_answer() {
         assert!(n.get("patterns").is_none(), "{n}");
     }
 }
+
+/// One store that answers SERVICE calls to `http://local/sparql` in process.
+struct Local(Arc<crate::store::Snapshot>);
+
+impl std::fmt::Debug for Local {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("Local")
+    }
+}
+
+impl LocalEndpoints for Local {
+    fn resolve(&self, iri: &str) -> Option<Result<LocalTarget>> {
+        (iri == "http://local/sparql").then(|| {
+            Ok(LocalTarget {
+                snap: self.0.clone(),
+                options: QueryOptions::default(),
+                hold: None,
+            })
+        })
+    }
+}
+
+#[test]
+fn an_in_process_service_call_names_no_patterns() {
+    let s = people();
+    let q = "SELECT * WHERE { SERVICE <http://local/sparql> { ?p <http://ex.org/team> ?t } }";
+    let local = QueryOptions {
+        no_plan_patterns: true,
+        local_endpoints: Some(Arc::new(Local(s.snapshot()))),
+        allow_service: true,
+        ..opts()
+    };
+    plan::PATTERNS_NAMED.with(|n| n.set(0));
+    let r = query(s.snapshot(), q, &local).unwrap();
+    assert_eq!(r.len(), 60);
+    // the call's plan is dropped, so neither query names a pattern
+    assert_eq!(plan::PATTERNS_NAMED.with(|n| n.get()), 0);
+    // without the outer opt-out the call still names nothing, since its plan is dropped
+    let shown = QueryOptions {
+        no_plan_patterns: false,
+        ..local
+    };
+    let r = query(s.snapshot(), q, &shown).unwrap();
+    assert_eq!(r.len(), 60);
+    let outer = serde_json::to_value(&r.plan).unwrap();
+    assert_eq!(
+        plan::PATTERNS_NAMED.with(|n| n.get()),
+        texts(&outer).len(),
+        "{outer:#}"
+    );
+}

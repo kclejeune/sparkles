@@ -8441,6 +8441,8 @@ fn fetch_local(
     opts.work = Some(ctx.rows_produced.clone());
     opts.outbound_budget = Some(ctx.outbound_budget.clone());
     opts.service_depth = ctx.service_depth + 1;
+    // the call's plan is dropped below, so it names no patterns (item 180)
+    opts.no_plan_patterns = true;
     ctx.check()?;
     let r = super::query(snap, query, &opts)?;
     let vars: std::sync::Arc<[oxrdf::Variable]> = r

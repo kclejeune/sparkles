@@ -707,6 +707,13 @@ pub struct Planner<'a> {
     source_counts: std::cell::OnceCell<FxHashMap<SeenPattern, u32>>,
 }
 
+#[cfg(test)]
+thread_local! {
+    /// How many patterns the planners of this thread have named, for tests of when a plan
+    /// names none.
+    pub(super) static PATTERNS_NAMED: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
 /// A pattern as a key of [`Planner::seen`] and [`Planner::source_counts`]: equal when
 /// the subject, predicate or path, and object are, as [`PlanPattern`] writes them,
 /// whatever the graph and occurrence.
@@ -2424,6 +2431,8 @@ impl<'a> Planner<'a> {
 
     /// [`Self::source_pattern`] of a pattern whose text is written.
     fn record_pattern(&self, s: String, p: String, o: String, g: &ActiveGraph) -> Arc<PlanPattern> {
+        #[cfg(test)]
+        PATTERNS_NAMED.with(|n| n.set(n.get() + 1));
         let graph = match g {
             ActiveGraph::Default => None,
             ActiveGraph::Union => Some(format!("<{}>", super::ctx::UNION_GRAPH_IRI)),
