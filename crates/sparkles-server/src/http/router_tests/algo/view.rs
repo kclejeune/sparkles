@@ -429,3 +429,83 @@ async fn caller_records_stay_while_their_tasks_are_listed() {
     stop.store(true, std::sync::atomic::Ordering::Relaxed);
     super::super::tasks::wait_done(&s.state, &first).await;
 }
+
+#[tokio::test]
+async fn pruning_caller_records_never_waits_for_the_task_list_while_holding_them() {
+    let s = algo_server();
+    let p = crate::auth::Principal::local();
+    for i in 0..view::MAX_CALLERS {
+        view::add_caller(&s.state, &format!("fill-{i}"), "g", &p);
+    }
+    // a task read holds the task list while it asks whether its caller follows the task
+    let tasks = s.state.tasks.lock();
+    let st = s.state.clone();
+    let pruner = std::thread::spawn(move || {
+        let p = crate::auth::Principal::local();
+        view::add_caller(&st, "another", "g", &p);
+    });
+    std::thread::sleep(Duration::from_millis(100));
+    let (tx, rx) = std::sync::mpsc::channel();
+    let st = s.state.clone();
+    std::thread::spawn(move || {
+        let p = crate::auth::Principal::local();
+        let _ = tx.send(view::follows(&st, "fill-0", "g", &p));
+    });
+    let answered = rx.recv_timeout(Duration::from_secs(5));
+    drop(tasks);
+    pruner.join().unwrap();
+    assert!(
+        answered.is_ok(),
+        "a follower check waited on a pruning caller table"
+    );
+}
+
+#[tokio::test]
+async fn a_background_run_hands_its_bytes_to_the_cache() {
+    let dir = tempfile::tempdir().unwrap();
+    let state = AppState::with_memory(
+        dir.path(),
+        StoreOptions::default(),
+        Duration::from_secs(30),
+        Some(32 << 20),
+    )
+    .unwrap();
+    let state = Arc::new(state);
+    state.create("big", DbType::Mem).unwrap();
+    state
+        .get("big")
+        .unwrap()
+        .store
+        .load(&[Source::from_bytes(
+            long_chain(50_000, 30).into_bytes(),
+            oxrdfio::RdfFormat::NTriples,
+            None,
+        )])
+        .unwrap();
+    let s = Server {
+        _dir: dir,
+        app: router(state.clone()),
+        state,
+    };
+    let body = json!({
+        "algorithm": "wcc",
+        "projection": {"predicates": ["http://ex/p"]},
+        "nodes": ["http://ex/1"],
+        "keep": true,
+        "async": true,
+    });
+    let (st, t) = run(&s, "big", &body).await;
+    assert_eq!(st, StatusCode::ACCEPTED, "{t}");
+    let id = t["id"].as_str().unwrap().to_string();
+    let done = super::super::tasks::wait_done(&s.state, &id).await;
+    assert_eq!(done.state, task_state::DONE, "{:?}", done.message);
+    let detail = done.detail.unwrap();
+    let pool = s.state.catalog.pool().unwrap();
+    assert_eq!(
+        detail["kept"],
+        true,
+        "{detail}, pool {} of {}",
+        pool.granted(),
+        pool.capacity()
+    );
+}

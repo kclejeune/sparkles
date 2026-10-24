@@ -605,7 +605,7 @@ type Caller = (String, String);
 static CALLERS: Mutex<VecDeque<(String, Vec<Caller>)>> = parking_lot::const_mutex(VecDeque::new());
 /// Tasks whose callers are remembered at most. Records of tasks the server still lists
 /// are kept below this, and only past it does the oldest go.
-const MAX_CALLERS: usize = 4096;
+pub(crate) const MAX_CALLERS: usize = 4096;
 
 fn who(p: &Principal) -> String {
     format!("{:?}\u{1f}{}", p.kind, p.name)
@@ -624,6 +624,16 @@ fn task_key(st: &AppState, id: &str) -> String {
 pub(crate) fn add_caller(st: &AppState, id: &str, ds: &str, p: &Principal) {
     let id = &task_key(st, id);
     let me = (who(p), read_view(p, ds));
+    // The task list is read before the records are locked, never while: a task read holds
+    // the list's lock while it asks whether its caller follows the task.
+    let full = CALLERS.lock().len() >= MAX_CALLERS;
+    let listed: Option<HashSet<String>> = full.then(|| {
+        st.tasks
+            .lock()
+            .iter()
+            .map(|t| task_key(st, &t.id))
+            .collect()
+    });
     let mut c = CALLERS.lock();
     if let Some((_, v)) = c.iter_mut().find(|(t, _)| t == id) {
         if !v.contains(&me) {
@@ -632,15 +642,12 @@ pub(crate) fn add_caller(st: &AppState, id: &str, ds: &str, p: &Principal) {
         return;
     }
     if c.len() >= MAX_CALLERS {
-        // the records of this server's tasks that it no longer lists go first
+        // the records of this server's tasks that it no longer lists go first (the task
+        // being added is listed only once it starts, and is not in the table yet)
         let mine = format!("{:p}/", st);
-        let listed: HashSet<String> = st
-            .tasks
-            .lock()
-            .iter()
-            .map(|t| task_key(st, &t.id))
-            .collect();
-        c.retain(|(t, _)| !t.starts_with(&mine) || listed.contains(t));
+        if let Some(listed) = &listed {
+            c.retain(|(t, _)| !t.starts_with(&mine) || listed.contains(t));
+        }
         while c.len() >= MAX_CALLERS {
             c.pop_front();
         }
@@ -814,8 +821,13 @@ pub(crate) async fn run(
             req.algorithm,
             started.elapsed()
         );
+        // a kept result moves its bytes from the request's grant to its own, instead of
+        // holding both while the cache asks the pool
         if view.keep {
-            put(st.catalog.pool(), key, kept.clone());
+            held.settle(0)?;
+            if !put(st.catalog.pool(), key, kept.clone()) {
+                held.settle(kept.bytes)?;
+            }
         }
         let out = respond(kept.answer(&view, false, max_rows), limit);
         drop(held);
@@ -932,9 +944,10 @@ async fn background(
             let rows = kept.rows.len();
             let commit = kept.commit;
             let summary = kept.summary.clone();
-            let stored = put(state.catalog.pool(), key, kept);
+            // the run's own grant goes back before the cache asks the pool for the result's
             drop(held);
             opts.grant = None;
+            let stored = put(state.catalog.pool(), key, kept);
             h.set_detail(json!({
                 "algorithm": req.algorithm,
                 "commit": commit,

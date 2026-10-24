@@ -586,7 +586,8 @@ the memberships route in the mock, with small textbook versions of the algorithm
   for even after dropping the older results, is answered and not kept, and the task's
   `detail` says `kept: false`. The decoded rows are charged to the request's memory budget
   and pool grant every 1,024 rows while they are decoded, and the summary literal is
-  decoded once rather than for every row.
+  decoded once rather than for every row. A result that is kept gives its bytes back to the
+  run's grant before the cache asks the pool for its own, so the two never hold it at once.
 - *Budgets.* A view-only run takes the request budget parameters that a query takes, and its
   answer is held to the result-byte limit, whether it was computed or read from the cache.
 - *Background runs.* A background run has an update's deadline, none unless the request or
