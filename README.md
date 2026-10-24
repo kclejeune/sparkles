@@ -339,6 +339,14 @@ agent memory, the map view and a merge preview.
     <td>A query built on the canvas from the schema</td>
     <td>A query's plan drawn on its pattern, with misestimates marked</td>
   </tr>
+  <tr>
+    <td><img src="docs/images/explore-algo-lenses.png" alt="The resource explorer with algorithm lenses, sizing nodes by PageRank over the drawn graph and colouring them by Leiden communities, with the legend giving the score ranges and each community's size"></td>
+    <td></td>
+  </tr>
+  <tr>
+    <td>Lenses that size nodes by PageRank and colour them by community</td>
+    <td></td>
+  </tr>
 </table>
 
 </details>

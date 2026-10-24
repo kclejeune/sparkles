@@ -1,8 +1,8 @@
 # U10: Lenses on the graph canvas
 
-> **Status:** Phase 1 shipped
+> **Status:** Phases 1 and 2 shipped
 >
-> **Phases:** Phase 1 shipped on 2026-10-23. Phase 1 adds lenses to the Explore graph and the WebGL view, a
+> **Phases:** Phases 1 and 2 shipped on 2026-10-23. Phase 1 adds lenses to the Explore graph and the WebGL view, a
 > shared way to size, colour, badge and style drawn elements from data computed for them,
 > with a legend and a list column, and the first lenses: degree, a property's values, class,
 > graph and inferred edges drawn dashed. Phase 2 adds algorithm lenses, which size nodes by
@@ -14,7 +14,7 @@
 > **User docs:** [USAGE.md](../USAGE.md#lenses-on-the-graph).
 >
 > This is the design as written before implementation. The [Outcome](#outcome) section at
-> the end records how Phase 1 landed.
+> the end records how Phases 1 and 2 landed.
 
 This design was written from the Sparkles code and specs: graph algorithms
 ([F14](F14-graph-algorithms.md)), community summaries ([C22](C22-graph-rag-community-summaries.md)),
@@ -537,3 +537,95 @@ covers A1, the size, colour and graph lenses with their legend and list columns,
 numeric property's "no value", the absent edge lens without reasoning, the query page on both
 renderers and the 390 px layout of A12. `tests/e2e/lenses.spec.ts` runs A1 and A2 against a
 real server. A3 to A11 need Phases 2 and 3.
+
+### Phase 2, 2026-10-23
+
+Phase 2 shipped the cached view-only algorithm runs of §3.2, the algorithm lenses of §2.3
+with drawn-graph and projection scope, stable community colours, the GraphRAG community
+lens, the pause while playing and the compare-mode deltas of §4.3, and the top 1,000 of §5
+above 20,000 drawn nodes. Phase 3 remains [ROADMAP](../ROADMAP.md) item 105.
+
+**What was built on the server.** `crates/sparkles-server/src/http/algo/view.rs` takes the
+`nodes`, `keep`, `async` and `top` members out of a run request before the rest parses as
+F14's request, so F14's request type and its other callers are unchanged. A view-only run
+computes the whole result at the snapshot that `at` and `branch` select, under the caller's
+query view and the query timeout and memory budget, and answers in SPARQL JSON with
+`communitySize`, the run's `summary` and a `run` member. The cache key, the bounds and the
+pool charge are those of §3.2, with three additions. The key also holds the request's
+`default-graph-uri` and `named-graph-uri`, the dataset's inferred overlay and its RDFS on
+read, as the overview cache's key does, and the definition of a named projection, which can
+change without a commit. `POST /$/graphrag/{ds}/memberships` answers which communities hold
+the listed nodes, on main and through the coverage guard. `/metrics` gains six
+`sparkles_algo_view_cache_*` series, and API.md, the route table and the OpenAPI
+description document the members, the task kind and the route.
+
+**What was built in the UI.** `ui/src/lib/algo.ts` holds the algorithm list, the drawn-graph
+query, the projection run with its task and the membership reads. The size channel offers
+PageRank, betweenness, BFS depth from a node, k-core and triangles, and the colour channel
+WCC, label propagation, Louvain, Leiden and GraphRAG community. The menu shows each
+algorithm lens's scope, projection, parameters, level and start node, and a background run's
+progress bar and **Cancel**. `ui/mock/algo.mjs` answers `SERVICE algo:`, the run route and
+the memberships route in the mock, with small textbook versions of the algorithms.
+
+**Decisions the spec left open.**
+
+- *Request members.* `async` needs `keep`, and all four members are refused with `400` on a
+  run with `write`. `nodes` takes IRIs only, since a blank node cannot be named across
+  requests. `top` orders by the first numeric output, highest first, and a request without
+  `nodes` answers every row up to the server's row limit, with `truncated` set when it cut.
+- *Reading the cache.* A request without `keep` still reads a kept result, and only `keep`
+  stores one.
+- *Memory.* A kept result keeps decoded terms, about 100 to 150 bytes per node and output
+  instead of the 16 bytes of §3.2, so a hit needs no dictionary lookup. Each result holds a
+  grant of the memory pool of its estimated size, which queries then cannot use. When the
+  pool has no room even after dropping the older results, the answer is returned and the
+  result is not kept, and the task's `detail` says `kept: false`.
+- *Background runs.* A background run has an update's deadline, none unless the request or
+  `--update-timeout` gives one, and takes its pool grant when its task starts, as a
+  write-back run does. F14's algorithms have no iteration hooks, so the progress moves by
+  phase. The callers that start or join a run can follow its task even under a restricted
+  view, and the caller that started it, or a dataset admin, can cancel it. A joining caller's
+  **Cancel** only stops following the run. A cancelled run is never joined, so a request just
+  after a cancel starts a new run.
+- *Branches.* A run without `write` may read a branch, and one with `write` answers `400`
+  there. Named projections belong to main, so on a branch the menu offers only predicate
+  projections.
+- *Drawn-graph runs.* A drawn-graph lens runs after the canvas has been still for a second
+  and takes at most 1,500 drawn IRIs. Projection scope offers the drawn edges' predicates,
+  each of them alone, and the stored projections.
+- *Levels.* A hierarchical lens shows the last level, which is the coarsest and the one
+  whose modularity the summary reports, and a level picker appears when a run has several.
+  The GraphRAG lens starts at the lowest level.
+- *Stable colours.* A community keeps an earlier community's colour when its members hold
+  half or more of that community's members. Communities claim colours in order of their
+  drawn size, each earlier colour goes to one community at most, and the colour memory
+  carries over between the community lenses of one canvas.
+- *GraphRAG.* The lens is offered on main at the head when the dataset has built reports
+  that the caller may read. On a branch, at a past state, or for a caller whose access does
+  not cover the build, the menu says why it is absent. A legend entry links to the
+  community's report in the Communities tab.
+- *Compare mode.* Deltas apply to size lenses whose values come from the dataset, the
+  degree in the dataset, a numeric property and projection runs, and they read both handles.
+  Drawn-graph values belong to one drawing, so they show no delta.
+- *Above 20,000 drawn nodes.* Only a size lens with projection scope runs. It asks each
+  chunk of 20,000 nodes for its top 1,000 and keeps the top 1,000 of all, and the rest are
+  drawn at the smallest size.
+
+**Deferred and limits.** The BFS start node is chosen from the first 500 drawn IRIs. A
+background run's progress has phases, not iterations, until F14 reports its iterations.
+Lens choices are still not part of the URL. No measured slowdown was accepted, so no
+follow-up item was added.
+
+**Tests.** Rust unit tests cover the member parsing, the `nodes` filter, community sizes per
+level, `top`, and the cache's keys, bound and pool charge. Router tests cover the filter,
+kept results across commits and parameters, branches, background runs that are joined,
+cancelled and kept, a request right after a cancel, and, under restricted principals, a view
+that never reads a wider kept result and a caller that follows and cancels its own run. The
+GraphRAG route tests cover memberships and coverage. Vitest covers the query text, rows and
+levels, projection runs with their tasks, chunks and top, stable colours, the stillness
+delay, the pause while playing, compare deltas and the top 1,000
+(`algo.test.ts`, `lens.test.ts`, `lenses.test.ts`). The mock Playwright suite
+`tests/mock/algo-lenses.spec.ts` covers A3, A4, projection scope with progress and Cancel,
+the GraphRAG lens and the 390 px sheet, and `tests/e2e/algo-lenses.spec.ts` runs A3, A4 and
+A5 against a real server. A6 is covered by the router tests, and A11 still needs its frame
+time measurement in U06's performance project.
