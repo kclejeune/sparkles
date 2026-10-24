@@ -189,12 +189,42 @@ fn child_writer() {
     if let Ok(arm) = std::env::var("SPARKLES_IO_ARM") {
         std::fs::write(arm, b"armed").unwrap();
     }
+    // In background mode merges are stopped, since a merge writes without the live
+    // writer lock and could race every locked pass, and the writers go on past their
+    // commits until a locked pass has cleared the marker, so that the images cover the
+    // marker removal of such a pass.
+    #[cfg(all(feature = "text", feature = "failpoints"))]
+    if background {
+        // the index opens in the background, and a writer replaced later would merge
+        let until = std::time::Instant::now() + std::time::Duration::from_secs(30);
+        while s.text_status().is_none_or(|st| st.state != "ready") {
+            assert!(
+                std::time::Instant::now() < until,
+                "the full-text index never opened"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        s.stop_text_merges_for_test();
+    }
+    fn locked_cleared(_s: &Store) -> bool {
+        #[cfg(all(feature = "text", feature = "failpoints"))]
+        {
+            _s.text_background_checkpoints_for_test()[1] > 0
+        }
+        #[cfg(not(all(feature = "text", feature = "failpoints")))]
+        {
+            true
+        }
+    }
     let out = Arc::new(Mutex::new(Vec::<String>::new()));
     let mut hs = Vec::new();
     for t in 1..=cfg.threads {
         let (s, ack, out, begin) = (s.clone(), ack.clone(), out.clone(), begin.clone());
         hs.push(std::thread::spawn(move || {
-            for k in 0..cfg.commits {
+            let more = |k: u32| {
+                k < cfg.commits || (background && k < cfg.commits * 10 && !locked_cleared(&s))
+            };
+            for k in (0..).take_while(|&k| more(k)) {
                 let designated = background && t == 1 && k == 0;
                 if designated {
                     let entered = PathBuf::from(std::env::var("SPARKLES_IO_SYNC_ENTERED").unwrap());
@@ -293,6 +323,25 @@ fn child_writer() {
             }
         })
     });
+    // In background mode a reader searches the index throughout, as the server's readers
+    // do. Each search seals the open batch and commits it to the index's files, so
+    // commits race the unlocked checkpoint passes, and the tick follows a run of raced
+    // passes with a second pass that holds the live writer lock and synchronizes only
+    // what the first pass left.
+    #[cfg(feature = "text")]
+    let reader = background.then(|| {
+        let (s, done) = (s.clone(), done.clone());
+        std::thread::spawn(move || {
+            let q = "PREFIX text:<http://jena.apache.org/text#> \
+                     SELECT (COUNT(*) AS ?n) { ?s text:query \"value\" }";
+            while !done.load(std::sync::atomic::Ordering::Relaxed) {
+                if sparkles_core::sparql::query(s.snapshot(), q, &Default::default()).is_err() {
+                    return;
+                }
+                std::thread::sleep(std::time::Duration::from_micros(200));
+            }
+        })
+    });
     for h in hs {
         h.join().unwrap();
     }
@@ -302,11 +351,20 @@ fn child_writer() {
         c.join().unwrap();
     }
     #[cfg(feature = "text")]
+    if let Some(r) = reader {
+        r.join().unwrap();
+    }
+    #[cfg(feature = "text")]
     if background {
         println!(
             "LINE background-checkpoints {}",
             checkpoints.load(std::sync::atomic::Ordering::Relaxed)
         );
+        #[cfg(feature = "failpoints")]
+        {
+            let [locked, locked_cleared, cleared] = s.text_background_checkpoints_for_test();
+            println!("LINE background-locked {locked} {locked_cleared} {cleared}");
+        }
     }
     for l in out.lock().unwrap().iter() {
         println!("LINE {l}");
@@ -1156,8 +1214,25 @@ fn crash_images(name: &str, cfg: Config, text: bool, background: bool) {
             "{name}: designated transaction did not release the text-file sync"
         );
         let overlaps = background_publications(&log);
+        let [locked, locked_cleared, cleared]: [usize; 3] = run
+            .lines
+            .iter()
+            .find_map(|line| line.strip_prefix("background-locked "))
+            .map(|l| {
+                let n: Vec<usize> = l.split(' ').map(|n| n.parse().unwrap()).collect();
+                n.try_into().unwrap()
+            })
+            .expect("the writer must report its locked checkpoint passes");
         println!(
-            "{name}: {count} actual background checkpoints, {overlaps} fresh acknowledged transactions during successful text-file sync"
+            "{name}: {count} actual background checkpoints, {locked} locked passes ({locked_cleared} cleared), {cleared} passes that cleared the marker, {overlaps} fresh acknowledged transactions during successful text-file sync"
+        );
+        // Every pass synchronizes only the files written since a pass last synchronized
+        // them, so the images after a pass cleared the marker check that nothing the
+        // index refers to was left out. The reader's commits race the unlocked passes, so
+        // a locked pass runs, and with merges stopped nothing can race it.
+        assert!(
+            locked_cleared > 0 && cleared >= locked_cleared,
+            "{name}: {locked} locked passes cleared the marker {locked_cleared} times"
         );
         assert!(
             overlaps > 0,
@@ -1382,7 +1457,7 @@ fn crash_images_during_background_full_text_checkpoints() {
                 direct: false,
                 idle_direct: false,
                 threads: 4,
-                commits: 25,
+                commits: 50,
             },
             true,
             true,

@@ -955,8 +955,9 @@ class Oracles(unittest.TestCase):
 
         with tempfile.TemporaryDirectory(prefix="sparkles-active-rate-") as temp:
             root = pathlib.Path(temp)
+            args = SimpleNamespace(rate_fraction=0.8)
             with mock.patch.object(BENCH, "measure", side_effect=process):
-                rate = BENCH.calibrate_mixed(None, root, "geo", 10, 0)
+                rate = BENCH.calibrate_mixed(args, root, "geo", 10, 0)
             self.assertAlmostEqual(rate, 668.4 * 0.8)
             self.assertEqual(
                 [grouped for grouped, _, _ in calls],
@@ -977,6 +978,34 @@ class Oracles(unittest.TestCase):
             )
             with self.assertRaisesRegex(AssertionError, "calibration"):
                 BENCH.summarize(receipt["validation"])
+
+    def test_calibration_leaves_the_requested_headroom(self):
+        discovery = iter((900.0, 1200.0, 1100.0, 700.0))
+
+        def process(
+            args, cell, index, scenario, grouped, triples, run_id, rate, *, calibration
+        ):
+            row = {
+                "calibration": True,
+                "scenario": scenario,
+                "grouped": grouped,
+                "write_rate": rate,
+                "tps": next(discovery) if not rate else rate,
+                "max_schedule_lag_ms": 10 if rate else 0,
+                "reopen": "passed",
+            }
+            row["mixed_load_checks"] = BENCH.mixed_load_checks(row) if rate else None
+            return row
+
+        with tempfile.TemporaryDirectory(prefix="sparkles-headroom-") as temp:
+            root = pathlib.Path(temp)
+            args = SimpleNamespace(rate_fraction=0.6)
+            with mock.patch.object(BENCH, "measure", side_effect=process):
+                rate = BENCH.calibrate_mixed(args, root, "text", 10, 0)
+            self.assertAlmostEqual(rate, 700.0 * 0.6)
+            receipt = json.loads((root / "rate-calibration.json").read_text())
+            self.assertEqual(receipt["rate_fraction"], 0.6)
+            self.assertAlmostEqual(receipt["common_rate"], 420.0)
 
     def test_failed_common_rate_preserves_both_alternatives_without_retry(self):
         rates = []
@@ -1004,7 +1033,9 @@ class Oracles(unittest.TestCase):
                 mock.patch.object(BENCH, "measure", side_effect=process),
                 self.assertRaisesRegex(AssertionError, "rate validation failed"),
             ):
-                BENCH.calibrate_mixed(None, root, "text", 10, 500)
+                BENCH.calibrate_mixed(
+                    SimpleNamespace(rate_fraction=0.8), root, "text", 10, 500
+                )
             self.assertEqual(rates, [500, 500])
             receipt = json.loads((root / "rate-calibration.json").read_text())
             self.assertFalse(receipt["achieved_rate_validated"])
