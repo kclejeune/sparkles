@@ -595,7 +595,8 @@ read did not apply.
   the list's facts grow. When rules give `rdf:first` or `rdf:rest` facts with that
   constant predicate, a lower stage therefore derives every such list before the stage
   that reads it. When that stage would depend on itself, as when a rule reads one list
-  to build another, the program is made again with lists read as the stage holds them. The facts a `listForAll` reads are asked for behind the copy's guard,
+  to build another, the program is made again with lists read as the stage holds them,
+  unless a `noValue` lies on a cycle of the rules' predicates, which stays refused. The facts a `listForAll` reads are asked for behind the copy's guard,
   unless an atom of the rule already matches them as in `cls-int1`.
 * **Evaluation.** `crates/sparkles-reasoner/src/query.rs` evaluates the program with the
   semi-naive engine over the base tier of the caller's input graphs, under the query's
@@ -603,8 +604,9 @@ read did not apply.
   with the query too. Each derivation adds its magic facts and continues from them. The
   program is made at the first derivation that misses the table cache. The facts a query
   adds to its view are charged to its memory budget at 448 bytes each, seven index keys
-  with their node overhead, also when they come from cached tables. A fact that several
-  tables hold is charged once.
+  with their node overhead, also when they come from cached tables. The facts the view
+  does not hold yet are reserved before it grows, and the reservation then shrinks to
+  what it grew by, so a fact that several tables hold is charged once.
 * **Tables.** `crates/sparkles-reasoner/src/tables.rs` caches what a demand derived,
   keyed by the generation, the commit, the mask of a view that hides triples, the input
   graphs, the rules' digest, the demand with its constants and a hash of its seeds. Local
@@ -761,7 +763,10 @@ pass's lower stages were left out of the schema's table
 (`cached_schema_keeps_lower_stage_schema_facts`). Facts that several tables hold were
 charged once per table (`overlapping_tables_are_charged_once`). A rule that reads one
 list and builds another was refused as unstratified
-(`distinct_list_heads_are_not_a_cycle`).
+(`distinct_list_heads_are_not_a_cycle`). A third review found that the overlay grew
+before its charge was admitted, which now reserves first, and that the retry without
+list stages accepted a `noValue` on a cycle through a list
+(`negation_through_lists_is_refused`).
 
 **Limitations.** Schema facts that follow only from derived instance facts can be missing
 from a query that reads them, as decision 3 describes, and `owl:sameAs` that rules derive
