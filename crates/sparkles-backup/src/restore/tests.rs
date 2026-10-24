@@ -912,3 +912,118 @@ fn swap_dir_rejects_a_lock_from_the_previous_root() {
         b"restored copy"
     );
 }
+
+/// A child forked from this process and held before exec, so that it shares every
+/// descriptor the process had open when it forked, until [`PreExecChild::release`].
+#[cfg(unix)]
+struct PreExecChild {
+    resume: std::os::unix::net::UnixStream,
+    worker: std::thread::JoinHandle<std::process::ExitStatus>,
+}
+
+#[cfg(unix)]
+impl PreExecChild {
+    /// Fork a child that waits before exec, and return once it is waiting. After exec it
+    /// runs this test binary with `--list` for a filter that matches no test.
+    fn hold() -> Self {
+        use std::io::Read;
+        use std::os::fd::AsRawFd;
+        use std::os::unix::{net::UnixStream, process::CommandExt};
+        use std::time::{Duration, Instant};
+
+        let (mut ready_parent, ready_child) = UnixStream::pair().unwrap();
+        let (resume_parent, resume_child) = UnixStream::pair().unwrap();
+        ready_parent
+            .set_read_timeout(Some(Duration::from_secs(10)))
+            .unwrap();
+        let close_ready = ready_parent.as_raw_fd();
+        let close_resume = resume_parent.as_raw_fd();
+        let worker = std::thread::spawn(move || {
+            let mut command = std::process::Command::new(std::env::current_exe().unwrap());
+            command
+                .args(["--list", "--exact", "no::such::test"])
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null());
+            let ready = ready_child.as_raw_fd();
+            let resume = resume_child.as_raw_fd();
+            // SAFETY: only async-signal-safe close/write/poll/read syscalls run after
+            // fork. The parent holds both pairs until the spawn has completed, and the
+            // poll timeout bounds cleanup even if the parent fails before releasing it.
+            unsafe {
+                command.pre_exec(move || {
+                    libc::close(close_ready);
+                    libc::close(close_resume);
+                    if libc::write(ready, b"x".as_ptr().cast(), 1) != 1 {
+                        return Err(std::io::Error::last_os_error());
+                    }
+                    let mut poll = libc::pollfd {
+                        fd: resume,
+                        events: libc::POLLIN,
+                        revents: 0,
+                    };
+                    if libc::poll(&mut poll, 1, 10_000) <= 0 {
+                        return Err(std::io::Error::from_raw_os_error(libc::ETIMEDOUT));
+                    }
+                    let mut byte = 0u8;
+                    if libc::read(resume, (&mut byte as *mut u8).cast(), 1) < 0 {
+                        return Err(std::io::Error::last_os_error());
+                    }
+                    Ok(())
+                });
+            }
+            let spawned = command.spawn();
+            drop(ready_child);
+            drop(resume_child);
+            let mut child = spawned.unwrap();
+            let deadline = Instant::now() + Duration::from_secs(10);
+            loop {
+                if let Some(status) = child.try_wait().unwrap() {
+                    return status;
+                }
+                if Instant::now() >= deadline {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    panic!("the pre-exec child failed to exit");
+                }
+                std::thread::sleep(Duration::from_millis(5));
+            }
+        });
+        ready_parent
+            .read_exact(&mut [0u8])
+            .expect("the child reached pre-exec");
+        PreExecChild {
+            resume: resume_parent,
+            worker,
+        }
+    }
+
+    /// Let the child exec and exit, and reap it.
+    fn release(self) {
+        drop(self.resume);
+        assert!(self.worker.join().unwrap().success());
+    }
+}
+
+/// The restore's hold on `sparkles.lock` ends when its guard drops, even while a child
+/// forked meanwhile still shares the locked descriptor before exec.
+#[cfg(unix)]
+#[test]
+fn restore_lock_unlocks_during_an_unrelated_pre_exec_child() {
+    let dir = tempfile::tempdir().unwrap();
+    let target = dir.path().join("db");
+    std::fs::create_dir(&target).unwrap();
+    let lock = lock_database(&target).unwrap();
+    let child = PreExecChild::hold();
+    drop(lock);
+    let again = lock_database(&target);
+    // reaped before asserting, so the expected failure before the fix also cleans up
+    child.release();
+    let again = again.expect("a pre-exec child kept the restore's lock");
+    // the new owner holds the lock
+    assert_eq!(
+        lock_database(&target).unwrap_err().code(),
+        crate::error::Code::DatasetBusy
+    );
+    drop(again);
+    drop(lock_database(&target).unwrap());
+}

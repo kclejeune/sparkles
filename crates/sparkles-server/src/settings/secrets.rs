@@ -659,14 +659,14 @@ pub struct Offline {
 /// The stored values of a stopped server's data directory, opened, with its catalog
 /// lock held until this is dropped.
 struct OfflineValues {
-    _lock: std::fs::File,
+    _lock: sparkles::store::ProcessLock,
     current: Sealing,
     dir: PathBuf,
     values: Vec<Opened>,
 }
 
 /// Take the catalog lock of the stopped server's data directory `data`.
-fn lock_data(data: &FsPath) -> anyhow::Result<std::fs::File> {
+fn lock_data(data: &FsPath) -> anyhow::Result<sparkles::store::ProcessLock> {
     if !data.is_dir() {
         anyhow::bail!("{} is not a data directory", data.display());
     }
@@ -678,7 +678,7 @@ fn lock_data(data: &FsPath) -> anyhow::Result<std::fs::File> {
 /// for `--secrets-key`), holding `lock`. A value that opens only with `next` is
 /// `Held::Next`.
 fn offline_values(
-    lock: std::fs::File,
+    lock: sparkles::store::ProcessLock,
     data: &FsPath,
     source: Option<&str>,
     next: Option<&Sealing>,

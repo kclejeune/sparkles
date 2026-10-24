@@ -1919,13 +1919,18 @@ fn refuse_if_open(dir: &Path) -> Result<()> {
     let Ok(f) = std::fs::File::open(&path) else {
         return Ok(());
     };
-    if let Err(std::fs::TryLockError::WouldBlock) = f.try_lock() {
-        let pid = std::fs::read_to_string(&path).unwrap_or_default();
-        bail!(
-            "database {} is in use by another process (pid {}); stop it or talk to it over HTTP",
-            dir.display(),
-            pid.trim()
-        );
+    match f.try_lock() {
+        // the probe unlocks explicitly, so a child forked meanwhile cannot keep the lock
+        Ok(()) => drop(sparkles::store::ProcessLock::from_locked_file(f)),
+        Err(std::fs::TryLockError::WouldBlock) => {
+            let pid = std::fs::read_to_string(&path).unwrap_or_default();
+            bail!(
+                "database {} is in use by another process (pid {}); stop it or talk to it over HTTP",
+                dir.display(),
+                pid.trim()
+            );
+        }
+        Err(std::fs::TryLockError::Error(_)) => (),
     }
     Ok(())
 }
