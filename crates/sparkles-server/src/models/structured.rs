@@ -163,7 +163,10 @@ pub fn messages(user: &str, out: &OutputSchema, level: Level) -> Vec<Message> {
     match level {
         Level::JsonObject => {
             u.push_str("\n\nAnswer with one JSON object that matches this JSON Schema, and nothing else:\n");
-            u.push_str(&out.schema.to_string());
+            // in the schema's own property order, as the request body carries it
+            u.push_str(&String::from_utf8_lossy(&super::client::body_bytes(
+                &out.schema,
+            )));
         }
         Level::Text => {
             u.push_str("\n\n");

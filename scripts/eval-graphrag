@@ -415,13 +415,16 @@ def acceptance(h, work):
         " ?r <%sfinding> ?f . ?f <%scites> <<( ?s ?p ?o )>> } }" % (REPORTS, GR, GR, GR),
         "cites",
     )
-    # A cited fact lies inside its community when its subject is a member and so is its
-    # object, unless the object is a literal such as a member's label.
-    outside = [
+    # A community's facts are its members' facts (§3.2), so a cited fact lies inside its
+    # community when its subject is a member. An edge from a member to another community
+    # is one of those facts, and it is counted apart.
+    outside = [r for r in cites if r["s"] not in members.get(r["c"], ())]
+    bridging = [
         r
         for r in cites
-        if r["s"] not in members.get(r["c"], ())
-        or (r["resource"] == "true" and r["o"] not in members.get(r["c"], ()))
+        if r["s"] in members.get(r["c"], ())
+        and r["resource"] == "true"
+        and r["o"] not in members.get(r["c"], ())
     ]
     clusters = sorted(
         "".join(sorted({m.rsplit("/", 1)[1][0] for m in ms})) for ms in members.values()
@@ -436,6 +439,7 @@ def acceptance(h, work):
         "clusters": clusters,
         "citedFacts": len(cites),
         "citationsOutsideTheCluster": len(outside),
+        "citationsOfEdgesToTheOtherCluster": len(bridging),
         "estimate": est,
         "tokens": detail.get("tokens"),
         "seconds": record.get("elapsedSeconds"),
@@ -546,11 +550,9 @@ def acceptance(h, work):
         "a7-none",
         reviewed_only=True,
     )
-    none_local = out.get("mode") == "local" and out.get("outcome") in (
-        "answered",
-        "empty",
-        "unanswerable",
-    )
+    # A clarification that the draft asks has already chosen the local scope.
+    none_local = mode_of(out) == "local"
+    none_outcome = out.get("outcome")
     reviewed = h.query(
         demo,
         f"SELECT ?r WHERE {{ GRAPH <{REPORTS}> {{ ?r <{GR}status> \"unreviewed\" }} }} LIMIT 3",
@@ -584,6 +586,7 @@ def acceptance(h, work):
         and bool(used)
         and set(used) <= set(marked),
         "withoutReviewedReportsLocal": none_local,
+        "withoutReviewedReportsOutcome": none_outcome,
         "markedReviewed": len(marked),
         "reportsUsed": len(used),
         "onlyReviewedUsed": set(used) <= set(marked),

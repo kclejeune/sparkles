@@ -61,6 +61,9 @@ pub fn map_schema() -> OutputSchema {
                             "findings": { "type": "array", "items": { "type": "string" } }
                         },
                         "required": ["text", "score", "reports", "findings"],
+                        // the point before the labels it uses: in the sorted order a
+                        // model wrote the labels first and often gave up (C22 §9)
+                        "x-sparkles-order": ["text", "score", "reports", "findings"],
                         "additionalProperties": false
                     }
                 }
@@ -89,6 +92,7 @@ pub fn reduce_schema() -> OutputSchema {
                 "citations": { "type": "array", "items": { "type": "integer" } }
             },
             "required": ["text", "citations"],
+            "x-sparkles-order": ["text", "citations"],
             "additionalProperties": false
         }),
         from_text: |t| {
@@ -714,6 +718,16 @@ impl Asking<'_, '_> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A point's text and an answer's text reach the provider before their labels.
+    #[test]
+    fn texts_come_before_their_labels() {
+        let map = String::from_utf8(crate::models::body_bytes(&map_schema().schema)).unwrap();
+        assert!(map.find(r#""text""#).unwrap() < map.find(r#""findings""#).unwrap());
+        assert!(!map.contains("x-sparkles-order"));
+        let reduce = String::from_utf8(crate::models::body_bytes(&reduce_schema().schema)).unwrap();
+        assert!(reduce.find(r#""text""#).unwrap() < reduce.find(r#""citations""#).unwrap());
+    }
 
     #[test]
     fn batches_fill_the_budget() {

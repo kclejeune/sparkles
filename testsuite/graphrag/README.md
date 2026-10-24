@@ -11,15 +11,16 @@ key and every request is reserved against the cap before it leaves.
 
 The `acceptance` phase builds reports for two clusters of ten people joined by one edge and
 checks A1, A3, A4 and A8 on them. A1 checks that every cited fact lies inside its
-community, which means its subject is a member and so is its object unless that is a
-literal. A3 adds one fact and checks that a refresh keeps both communities and writes
+community. A community's facts are its members' facts, so a fact lies inside when its
+subject is a member, and the result counts apart the cited edges that lead to the other
+cluster. A3 adds one fact and checks that a refresh keeps both communities and writes
 nothing. A4 adds seven more and checks that the refresh rewrites exactly one report, which
 revises the old one. A manual refresh compares digests when it runs, so the result records
 whether `status` showed the report stale beforehand rather than requiring it. A8 sets `tokensPerBuild` just above one report's reservation and checks
 that the build stops with a community pending. On the demo graph it checks A6, a global
 question classified `global` whose answer carries point markers, each resolving to a point
 whose findings cite facts or child findings, and A7, which answers in local mode without
-reviewed reports and from reviewed reports alone once three are marked reviewed.
+reviewed reports, a clarification asked by the draft counting as local, and from reviewed reports alone once three are marked reviewed.
 
 The `generate` phase describes the demo graph from its classes, properties and labels and
 asks the generator model for five users, three tasks for each and two global questions for

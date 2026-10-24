@@ -31,6 +31,8 @@ pub(crate) mod mock;
 pub mod presets;
 mod structured;
 
+#[cfg(test)]
+pub use client::body_bytes;
 pub use client::{CallError, ChatRequest, Message};
 pub use config::{
     DEFAULT_CONTEXT_TOKENS, Kind, Level, ModelsConfig, PROVIDER_MEMBERS, Pair, ProviderConfig,
