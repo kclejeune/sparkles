@@ -140,7 +140,7 @@ describe('textErrorHint', () => {
     const failed = textErrorHint(new ApiError(503, 'full-text recovery failed'));
     expect(failed.title).toContain('failed');
     expect(failed.hint).toContain('Full-text search panel');
-    expect(failed.hint).toContain('retry a failed rebuild');
+    expect(failed.hint).toContain('retry the rebuild if it failed');
     expect(textErrorHint(new ApiError(501, 'built without')).title).toContain('without');
   });
 });

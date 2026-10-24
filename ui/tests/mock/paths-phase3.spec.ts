@@ -118,10 +118,10 @@ test('weights: the cheapest path by a reifier property comes first, with its cos
   );
   // the picker offers the numeric properties of the reifiers once it is used
   const weight = panel(page).getByRole('combobox', { name: 'Weight' });
-  await expect(panel(page)).toContainText('Choose a property of the reifiers');
+  await expect(panel(page)).toContainText('Choose an edge annotation to add up');
   await weight.focus();
   await expect(weight.locator(`option[value="${EX}km"]`)).toHaveCount(1);
-  await expect(panel(page)).toContainText('2 properties on reifiers can weigh the edges');
+  await expect(panel(page)).toContainText('2 annotations can weigh the edges');
   await weight.selectOption(`${EX}km`);
   const req = page.waitForRequest(
     (r) => r.method() === 'POST' && (r.postData() ?? '').includes('path:weight'),
@@ -164,16 +164,16 @@ test('the weight list follows the state, and a weight the state lacks is dropped
   held.release();
   await page.unroute(`**/${DS}/sparql**`);
   await page.waitForTimeout(300);
-  await expect(note).toContainText('Choose a property of the reifiers');
+  await expect(note).toContainText('Choose an edge annotation to add up');
   // at commit 2 there are two weight properties: choose the one commit 1 lacks
   await next.click();
   await weight.focus();
-  await expect(note).toContainText('2 properties on reifiers can weigh the edges');
+  await expect(note).toContainText('2 annotations can weigh the edges');
   await weight.selectOption(`${EX}mins`);
   await expect(note).toContainText('mins on their edges');
   // back at commit 1 the weight is checked at once and dropped
   await previous.click();
-  await expect(note).toContainText('1 property on reifiers can weigh the edges');
+  await expect(note).toContainText('1 annotation can weigh the edges');
   await expect(weight.locator(`option[value="${EX}mins"]`)).toHaveCount(0);
 });
 
