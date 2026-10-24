@@ -921,10 +921,17 @@ impl Overlay {
             .filter(|q| !q[..3].contains(&Id::UNDEF))
             .collect();
         // The facts come from the session's tables, which a cache hit shares without a
-        // charge, so the copy the overlay keeps is charged here (Codex review F17-P1 #4).
-        let bytes = (quads.len() as u64).saturating_mul(OVERLAY_QUAD_BYTES);
-        self.leases.push(ctx.output_lease(bytes)?);
-        self.snap = Arc::new(self.snap.with_overlay(&quads, d.absent_from_default)?);
+        // charge, so the overlay's growth is charged here (Codex review F17-P1 #4). Tables
+        // of several demands can hold the same facts, which the overlay keeps once, so
+        // the charge is the growth of its inserted keys rather than the facts received.
+        let before = self.snap.delta.ins[Perm::Spo.index()].len();
+        let snap = self.snap.with_overlay(&quads, d.absent_from_default)?;
+        let grown = snap.delta.ins[Perm::Spo.index()]
+            .len()
+            .saturating_sub(before);
+        self.leases
+            .push(ctx.output_lease((grown as u64).saturating_mul(OVERLAY_QUAD_BYTES))?);
+        self.snap = Arc::new(snap);
         Ok(())
     }
 

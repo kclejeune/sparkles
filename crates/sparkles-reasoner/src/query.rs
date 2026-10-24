@@ -512,7 +512,10 @@ impl Session {
                 .map_err(|e| memory_error(e, "the schema"))?;
             self.run(true, 0, start, "the schema")?;
             if let Some(key) = key {
-                self.cache_schema(key, lower_end);
+                // the schema facts the lower stages gave belong to the schema, and their
+                // instance facts are derived again by the sessions that read the table
+                let closed = crate::specialize::closed(&vocab, rdf_type);
+                self.cache_schema(key, schema_from, lower_end, &closed);
             }
         }
         let schema_to = self.graph.as_ref().expect("graph made").derived().len();
@@ -609,14 +612,32 @@ impl Session {
     }
 
     /// Keep the facts the schema pass derived from row `from` of the derived tier in the
-    /// table cache, unless a rule made a blank node among them.
-    fn cache_schema(&self, key: tables::Key, from: usize) {
+    /// table cache, unless a rule made a blank node among them. Of the rows before
+    /// `lower_end`, which its lower stages derived, only the schema facts `closed` names
+    /// are kept (Codex re-review F17-P1 #1).
+    fn cache_schema(
+        &self,
+        key: tables::Key,
+        from: usize,
+        lower_end: usize,
+        closed: &demand::Closed,
+    ) {
         let g = self.graph.as_ref().expect("graph made");
         let mut facts: Vec<[u64; 3]> = Vec::new();
         let mut keys: Vec<(u64, Vec<u8>)> = Vec::new();
         let mut seen: FxHashSet<u64> = FxHashSet::default();
-        for t in &g.derived()[from..] {
+        for (i, t) in g.derived()[from..].iter().enumerate() {
             if self.hidden.contains(&t[1]) || !self.terms.valid(t) {
+                continue;
+            }
+            let schema = || {
+                closed.closes(&Atom {
+                    s: Slot::Const(t[0]),
+                    p: Slot::Const(t[1]),
+                    o: Slot::Const(t[2]),
+                })
+            };
+            if from + i < lower_end && !schema() {
                 continue;
             }
             for &x in t {

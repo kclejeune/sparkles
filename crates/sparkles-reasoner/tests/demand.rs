@@ -679,3 +679,76 @@ fn describe_is_refused_under_demand() {
         Ok(_) => panic!("DESCRIBE should be refused"),
     }
 }
+
+/// Codex re-review F17-P1 #1: schema facts that the lower stages of the schema pass
+/// derive are kept in the schema's table, so a session that reads the table has them.
+#[test]
+fn cached_schema_keeps_lower_stage_schema_facts() {
+    let s = store("ex:s ex:p ex:o . ex:a a ex:C .");
+    let rules = Profile::Rules(
+        "@prefix ex: <http://ex.org/>.
+         @prefix rdfs: <http://www.w3.org/2000/01/rdf-schema#>.
+         [d: (?x ex:p ?y) -> (ex:C rdfs:subClassOf ex:D)]
+         [n: (?x ex:p ?y), noValue(ex:C, rdfs:subClassOf, ex:D) -> (ex:C rdfs:subClassOf ex:E)]
+         [sc: (?c rdfs:subClassOf ?d), (?x rdf:type ?c) -> (?x rdf:type ?d)]"
+            .into(),
+    );
+    let qr = reasoner(&rules);
+    let q = "SELECT ?x { ?x a ex:D }";
+    assert_eq!(rows(&run(&s, q, &demand(&qr))), vec!["<http://ex.org/a>"]);
+    // derived again from the cached schema
+    let mut o = demand(&qr);
+    o.no_cache = true;
+    assert_eq!(rows(&run(&s, q, &o)), vec!["<http://ex.org/a>"]);
+    assert_eq!(
+        rows(&run(&s, "SELECT ?x { ?x a ex:E }", &demand(&qr))),
+        Vec::<String>::new()
+    );
+}
+
+/// Codex re-review F17-P1 #2: facts that several cached tables hold are charged once.
+#[test]
+fn overlapping_tables_are_charged_once() {
+    let mut ttl = String::new();
+    for i in 0..2000 {
+        ttl.push_str(&format!("ex:a{i} ex:p ex:b{i} .\n"));
+    }
+    let s = store(&ttl);
+    let rules = Profile::Rules(
+        "@prefix ex: <http://ex.org/>.
+         [q: (?x ex:q ?y) <- (?x ex:p ?y)]
+         [r: (?x ex:r ?y) <- (?x ex:p ?y)]"
+            .into(),
+    );
+    let qr = reasoner(&rules);
+    let q = "SELECT (COUNT(*) AS ?n) { ?x ex:q ?y . ?x ex:r ?y }";
+    let budget = |nocache: bool| {
+        let mut o = demand(&qr);
+        o.no_cache = nocache;
+        o.max_memory_bytes = Some(2_500_000);
+        o
+    };
+    let want = vec!["\"2000\"^^<http://www.w3.org/2001/XMLSchema#integer>"];
+    assert_eq!(rows(&run(&s, q, &budget(true))), want);
+    run(&s, q, &demand(&qr));
+    assert_eq!(rows(&run(&s, q, &budget(false))), want);
+}
+
+/// Codex re-review F17-P1 #3: a rule that reads one stored list and builds another
+/// makes the lower stage of derived lists depend on itself, and the program then reads
+/// lists as its stage holds them rather than failing as unstratified.
+#[test]
+fn distinct_list_heads_are_not_a_cycle() {
+    let s = store("ex:L0 rdf:first ex:b ; rdf:rest rdf:nil . ex:a ex:p ex:c .");
+    let rules = Profile::Rules(
+        "@prefix ex: <http://ex.org/>.
+         [copy: (?x ex:p ?y), listMember(ex:L0, ?m) -> (ex:L1 rdf:first ?m), (ex:L1 rdf:rest rdf:nil)]
+         [use: (?x ex:p ?y), listMember(ex:L0, ?m) -> (?x ex:q ?m)]"
+            .into(),
+    );
+    let qr = reasoner(&rules);
+    assert_eq!(
+        rows(&run(&s, "SELECT ?m { ex:a ex:q ?m }", &demand(&qr))),
+        vec!["<http://ex.org/b>"]
+    );
+}

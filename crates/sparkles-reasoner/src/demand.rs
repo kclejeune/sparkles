@@ -75,6 +75,9 @@ pub(crate) struct Key {
     pub neq: bool,
     /// the class of an `rdf:type` key whose object is a constant (spec F17 §3.2)
     pub class: Option<u64>,
+    /// the constant subject and object of a `noValue` pattern a lower stage completes:
+    /// a head with another constant there cannot give its facts
+    pub fixed: [Option<u64>; 2],
 }
 
 impl Key {
@@ -87,6 +90,7 @@ impl Key {
             o,
             neq: false,
             class: None,
+            fixed: [None; 2],
         }
     }
 
@@ -370,6 +374,7 @@ fn no_value_demand(b: &CBuiltin, rdf_type: u64) -> (Key, [u64; 3]) {
     {
         key = key.with_class(c);
     }
+    key.fixed = [s, o];
     (key, [s.unwrap_or(0), p.unwrap_or(0), o.unwrap_or(0)])
 }
 
@@ -908,6 +913,11 @@ impl StageBuilder<'_> {
                 {
                     continue;
                 }
+                let other =
+                    |f: Option<u64>, h: Slot| matches!((f, h), (Some(c), Slot::Const(d)) if c != d);
+                if other(k.fixed[0], hs.0) || other(k.fixed[1], hs.2) {
+                    continue;
+                }
                 if !made.insert((ri, hi)) {
                     continue;
                 }
@@ -1243,6 +1253,23 @@ pub(crate) fn transform(
     est: Estimate<'_>,
     pass: Pass<'_>,
 ) -> Result<Program, TransformError> {
+    // A lower stage of every derived list can depend on itself when a rule reads one
+    // list to build another, which the keys cannot tell apart. The program is then made
+    // again with lists read as the stage holds them (Codex re-review F17-P1 #3).
+    match transform_in(rules, terms, roots, est, pass, true) {
+        Err(TransformError::NotStratified) => transform_in(rules, terms, roots, est, pass, false),
+        r => r,
+    }
+}
+
+fn transform_in(
+    rules: &[CRule],
+    terms: &Terms,
+    roots: &[Key],
+    est: Estimate<'_>,
+    pass: Pass<'_>,
+    list_stages: bool,
+) -> Result<Program, TransformError> {
     let closed = match pass {
         Pass::Closed(c) => Some(c),
         _ => None,
@@ -1326,7 +1353,7 @@ pub(crate) fn transform(
                 .count()
         })
         .sum::<usize>()
-        + if list_heads(rules, terms) {
+        + if list_stages && list_heads(rules, terms) {
             rules.iter().filter(|r| reads_lists(r)).count()
         } else {
             0
@@ -1393,7 +1420,7 @@ pub(crate) fn transform(
             magic_preds: &mut magic_preds,
             below: Vec::new(),
             below_seen: FxHashSet::default(),
-            derived_lists: phase == 0 && list_heads(stage_rules, terms),
+            derived_lists: list_stages && phase == 0 && list_heads(stage_rules, terms),
         };
         let mut seeds: Vec<(Key, [u64; 3])> = Vec::new();
         for (k, vals) in &level {
