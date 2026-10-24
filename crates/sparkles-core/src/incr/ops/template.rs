@@ -171,3 +171,56 @@ impl Template {
         self.apply(p, c)
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::incr::ops::Op;
+    use crate::incr::ops::linear::Values;
+    use crate::incr::pass::Vis;
+    use crate::incr::terms::Terms;
+    use crate::store::{Store, StoreOptions};
+    use crate::task::Control;
+    use oxrdf::NamedNode;
+
+    /// Minting the occurrences of one solution with a large count checks the deadline.
+    #[test]
+    fn minting_occurrences_meets_the_deadline() {
+        let s = Store::in_memory(StoreOptions::default());
+        let snap = s.snapshot();
+        let mut t = Template {
+            inner: Node {
+                op: Op::Values(Box::new(Values { rows: Vec::new() })),
+                schema: vec![0],
+                certain: vec![0],
+            },
+            triples: vec![[
+                TSlot::Blank("b".into()),
+                TSlot::Const(Term::NamedNode(NamedNode::new_unchecked("urn:p"))),
+                TSlot::Var(Some(0)),
+            ]],
+            seed: String::new(),
+            counts: ZSet::new(),
+        };
+        let mut terms = Terms::default();
+        let vis = Vis::new(None, &snap);
+        let control = Control {
+            deadline: Some(std::time::Instant::now()),
+            ..Control::none()
+        };
+        let vars = vec!["o".to_string()];
+        let mut p = Pass::new(
+            snap,
+            None,
+            &[],
+            &[],
+            &mut terms,
+            &vis,
+            None,
+            &control,
+            &vars,
+        );
+        let row: Row = vec![Id::from_i64(1).expect("inline")].into();
+        assert!(t.apply(&mut p, vec![(row, 100_000)]).is_err());
+    }
+}

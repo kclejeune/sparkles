@@ -454,20 +454,3 @@ fn a_rebuild_clears_the_operators_state() {
         check(&s, &c, q, "after a delete");
     }
 }
-
-/// A template that mints many occurrences of one solution still meets the deadline.
-#[test]
-fn a_template_expansion_meets_the_deadline() {
-    let s = Store::in_memory(StoreOptions::default());
-    let values: String = (0..15)
-        .map(|i| format!("VALUES ?v{i} {{ 1 1 }} "))
-        .collect();
-    let q = format!("CONSTRUCT {{ [] :p ?v0 }} WHERE {{ {values} }}");
-    let parsed = sparql::parse_query(&format!("{PREFIX}{q}"), None, &[]).expect("parse");
-    let mut c = Circuit::new(compile(&parsed, None).expect("compile"), None);
-    let control = Control {
-        deadline: Some(std::time::Instant::now()),
-        ..Control::none()
-    };
-    assert!(c.build(s.snapshot(), &control).is_err());
-}
