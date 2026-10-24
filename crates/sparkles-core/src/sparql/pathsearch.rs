@@ -1138,28 +1138,37 @@ impl Cost {
     };
 
     fn add(self, o: Cost) -> Cost {
-        let (mut a, mut b) = (self.hi, o.hi);
-        let mut lows = self.lo + o.lo;
-        if !(a + b).is_finite() {
-            if a.is_infinite() || b.is_infinite() {
-                return Cost::INFINITE;
-            }
-            // the rounded parts reach past the largest double, but the rounding errors can
-            // bring the sum back under it: fold them into the smaller part first
-            if a < b {
-                std::mem::swap(&mut a, &mut b);
-            }
-            b += lows;
-            lows = 0.0;
-            if !(a + b).is_finite() {
-                return Cost::INFINITE;
-            }
+        if self.hi.is_infinite() || o.hi.is_infinite() {
+            return Cost::INFINITE;
         }
-        // TwoSum: s + e is exactly a + b
+        if (self.hi + o.hi).is_finite() {
+            return self.sum(o);
+        }
+        // the rounded parts reach past the largest double, but the rounding errors can
+        // bring the sum back under it. Halving is exact, so the halves are added without
+        // overflow and the sum doubled, which overflows only when the sum itself rounds
+        // past the largest double.
+        let half = |c: Cost| Cost {
+            hi: c.hi * 0.5,
+            lo: c.lo * 0.5,
+        };
+        let h = half(self).sum(half(o));
+        let hi = h.hi * 2.0;
+        if !hi.is_finite() {
+            return Cost::INFINITE;
+        }
+        Cost { hi, lo: h.lo * 2.0 }
+    }
+
+    /// TwoSum of the rounded parts, the rounding errors added to the error, and Fast2Sum
+    /// to renormalize.
+    fn sum(self, o: Cost) -> Cost {
+        let (a, b) = (self.hi, o.hi);
+        // s + e is exactly a + b
         let s = a + b;
         let bb = s - a;
-        let e = (a - (s - bb)) + (b - bb) + lows;
-        // Fast2Sum renormalizes, since |s| ≥ |e|
+        let e = (a - (s - bb)) + (b - bb) + self.lo + o.lo;
+        // |s| ≥ |e|
         let hi = s + e;
         if !hi.is_finite() {
             return Cost::INFINITE;

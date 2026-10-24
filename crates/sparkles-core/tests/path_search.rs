@@ -482,6 +482,37 @@ fn weights_near_the_largest_double_from_both_ends() {
     );
 }
 
+/// Two large halves met in the middle: the route through the `a` nodes costs about
+/// `MAX + u/2` and the one through `b` about `MAX + u/4`. Both round to the largest
+/// double, and only the rounding errors tell them apart.
+#[test]
+fn large_halves_near_the_largest_double_from_both_ends() {
+    let m = f64::MAX;
+    let u = 2f64.powi(969);
+    let a = 2f64.powi(1023);
+    let w = |x: f64| format!("{x:e}");
+    let s = store_of(&format!(
+        "ex:s ex:p ex:a1 {{| ex:w {} |}} . ex:a1 ex:p ex:a2 {{| ex:w {} |}} .
+         ex:a2 ex:p ex:a3 {{| ex:w {} |}} . ex:a3 ex:p ex:t {{| ex:w {} |}} .
+         ex:a1 ex:p ex:z {{| ex:w {} |}} .
+         ex:s ex:p ex:b1 {{| ex:w {} |}} . ex:b1 ex:p ex:t {{| ex:w {} |}} .",
+        w(a - 2.0 * u),
+        w(u),
+        w(1.5 * u),
+        w(a - 4.0 * u),
+        w(m),
+        w(m - 4.0 * u),
+        w(4.25 * u),
+    ));
+    let r = rows(
+        &s,
+        "SELECT ?path ?i ?s ?o WHERE { SERVICE path:search { [] path:source ex:s ; \
+         path:target ex:t ; path:predicate ex:p ; path:weight ex:w ; path:pathIndex ?path ; \
+         path:edgeIndex ?i ; path:edgeSubject ?s ; path:edgeObject ?o } }",
+    );
+    assert_eq!(node_paths(&r).values().next().unwrap().join(" "), "s b1 t");
+}
+
 #[test]
 fn weights_from_reifiers() {
     // A8: the weights sit on the reifiers of the edges
