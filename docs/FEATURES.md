@@ -451,6 +451,15 @@ rest of a query.
   German, Dutch, Russian, Swedish and CJK text can be selected per language instead. With
   them, 1,576 of 1,590 stemmed searches in nine languages find the same literals as
   Fuseki, and the other 14 consist of stop words alone.
+* The tokenizer of those analyzers follows the grammar of Lucene's `StandardTokenizer`
+  over Unicode 12.1, emoji and South East Asian scripts included, and agrees with Lucene
+  on every code point.
+* Japanese, Chinese and Korean text can be segmented into words with a dictionary
+  through the `ja-dict`, `zh-dict` and `ko-dict` analyzers. `ja-dict` and `ko-dict`
+  produce the tokens of Lucene's Kuromoji and Nori analyzers on every line of their
+  fixtures, and `zh-dict` segments by jieba's word frequencies. `sparkles text-dict`
+  downloads the pinned IPADIC, mecab-ko-dic and jieba sources with verified hashes and
+  compiles them.
 * An index can be enabled when a dataset is created. A missing or damaged index recovers
   in the background at open while the RDF data stays usable, and text searches answer
   `503` until recovery succeeds. Reconfiguring an index waits for old writers and
@@ -1484,8 +1493,10 @@ links each item to its design spec.
 
 * Full-text search uses Tantivy's Snowball stemmers by default, and the analyzers that
   reproduce Lucene's are selected per language. Lucene's analyzers for other languages,
-  such as Greek and Arabic, have no counterpart. CJK text is cut into bigrams with no
-  dictionary-based segmentation. Roadmap item 23.
+  such as Greek and Arabic, have no counterpart. Roadmap item 251.
+* `zh-dict` segments Chinese by jieba's word frequencies, so its tokens differ from those
+  of Lucene's SmartChineseAnalyzer. Kuromoji's normal and extended modes and the user
+  dictionaries of Kuromoji and Nori have no counterpart. Roadmap item 250.
 * Full-text documents have one field. Roadmap item 35.
 * Enabling or reconfiguring a full-text index builds it while writes wait. A write
   transaction cannot search the full-text index after it changes data, because the index

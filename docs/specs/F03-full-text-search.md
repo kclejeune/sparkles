@@ -980,11 +980,14 @@ in `languages` as `porter` is, for example `{"fr": "french-light"}`, or with
 `sparkles text-index --language fr=french-light`. No tag takes them by default, so
 existing indexes keep their configuration hash and their tokens.
 
-- *Analysis.* The words come from `text/standard.rs`, which applies the word boundary
-  rules of UAX #29 as Lucene's `StandardTokenizer` does. Letters around an apostrophe,
-  period or colon stay one word (`aren't`, `l'homme`, `u.s.a`), and so do digits around
-  a comma or period (`3,14`). A word longer than 255 characters is cut into pieces, as
-  Lucene cuts it, where the other analyzers drop tokens over 40 bytes. Lowercasing goes
+- *Analysis.* The words come from `text/standard.rs`, which follows the JFlex grammar of
+  Lucene's `StandardTokenizer` rule for rule over the character properties of Unicode
+  12.1, the version that grammar is generated from. Letters around an apostrophe, period
+  or colon stay one word (`aren't`, `l'homme`, `u.s.a`), and so do digits around a comma
+  or period (`3,14`). An emoji sequence, a flag and a run of Thai, Lao, Khmer or Myanmar
+  letters are words, and each Han ideograph and Hiragana character is a word of its own.
+  A word longer than 255 UTF-16 code units is cut where the longest match inside those
+  units ends, as Lucene cuts it, where the other analyzers drop tokens over 40 bytes. Lowercasing goes
   character by character, as Java's does, so `İ` becomes `i`. French and Italian remove
   elided articles (`l'`, `dell'`), and English removes a possessive `'s`. The stop words
   are Lucene's lists, which are the Snowball ones apart from Swedish `sitta`. The
@@ -1006,7 +1009,11 @@ existing indexes keep their configuration hash and their tokens.
   `scripts/text-lucene-compare/tokens.sh` from words of the Snowball test vocabularies,
   of the OpenTaal Dutch word list and of Swedish inflections written for the tests, and
   from generated lines with punctuation, numbers and CJK text. Every analyzer produces
-  the same tokens and positions as Lucene on every line. Over the full vocabularies and
+  the same tokens and positions as Lucene on every line. The tokenizer has a fixture of
+  its own, 19,599 lines with Lucene's tokens, UTF-16 offsets and types, which covers
+  every boundary of its character table in seven contexts. Over every code point in
+  nine contexts, 10,008,558 lines, and 420,000 random lines of up to 600 characters, its
+  tokens, offsets and types are those of Lucene. Over the full vocabularies and
   a Swedish dictionary, about 320,000 words, no stem differs.
 - *Agreement.* With these analyzers selected, 1,576 of the 1,590 queries of the
   comparison above match the same literals as Fuseki. Each language agrees except on
@@ -1028,6 +1035,61 @@ existing indexes keep their configuration hash and their tokens.
   an analyzer under an existing index would leave its indexed tokens out of step with
   its queries without a change of its configuration hash.
 
+**Dictionary analyzers.** `ja-dict`, `zh-dict` and `ko-dict` segment Japanese, Chinese
+and Korean text into words with a dictionary. They are behind the cargo feature
+`text-cjk-dict`, which the server's default build enables, and no tag takes them by
+default, so `cjk` stays the analyzer of CJK text unless an index selects them with
+`{"ja": "ja-dict"}` and the like.
+
+- *Dictionaries.* None ships with Sparkles. `sparkles text-dict fetch` downloads a
+  pinned source, checks its SHA-256, compiles it and installs it with its license in the
+  dictionary directory, `DATA/text-dicts` for a server. `ja-dict` uses IPADIC
+  2.7.0-20070801 with the `令和` entry that Lucene's build adds, `ko-dict` uses
+  mecab-ko-dic 2.0.3-20170922, the version Nori is built from, and `zh-dict` uses jieba's
+  word list. `sparkles text-dict install` compiles a local source and `list` checks the
+  installed ones. A compiled dictionary is one file that starts with a magic number and a
+  format version, which a reader refuses when it does not know it, and ends with the
+  SHA-256 of what precedes it. They take 18 MiB for `ja-dict`, 58 MiB for `ko-dict` and
+  12 MiB for `zh-dict`, and a process keeps each one it uses in memory once.
+- *Configuration.* Enabling an index with a dictionary analyzer fails while its
+  dictionary is missing. The configuration records each dictionary's SHA-256 in
+  `dictionaries`, so the configuration hash covers the dictionary. When a store opens and
+  an installed dictionary differs from the recorded one, the configuration takes the new
+  hash and the index is rebuilt in the background, as for a damaged index. A missing
+  dictionary at open leaves the index unavailable until it is installed.
+- *Segmentation.* `text/dict/morph.rs` ports Lucene 9.11.1's `JapaneseTokenizer` in
+  search mode and `KoreanTokenizer`, with the filters of `JapaneseAnalyzer` and
+  `KoreanAnalyzer`. Both run the Viterbi search over the whole text and commit to the
+  best path wherever one path is left. Unknown words are grouped by `char.def` and by
+  Java's character properties of Unicode 15.0, which a generated table holds. Kuromoji
+  scores the lattice under a long word again with its penalty, and its analyzer folds
+  widths, replaces inflected words by their base form, drops the parts of speech of
+  `stoptags.txt` and the words of `stopwords.txt`, removes the final `ー` of long Katakana
+  words and lowercases. Nori charges for a word after a space that cannot start one,
+  splits compounds and inflected words into their parts, drops its default stop tags and
+  replaces Hanja by its Hangul reading. Removed words leave position gaps, as in Lucene.
+  `zh-dict` cuts each run of CJK characters into the words whose summed costs, the
+  negative logarithms of their frequencies, are lowest.
+- *Checks.* Kuromoji and Nori produce the same tokens and positions as `ja-dict` and
+  `ko-dict` on all 60,035 lines of the comparison corpora, which are sentences written
+  for the tests, lines of words drawn at random from each dictionary, and generated lines
+  that join such words with Latin, Kana, Hangul, Han, symbols and spaces. 10,038 of
+  those lines are fixtures in `crates/sparkles-core/tests/data/lucene-dict-analyzers`,
+  which `scripts/text-lucene-compare/tokens.sh` regenerates and the ignored test
+  `dictionary_analyzers_agree_with_lucene` checks against installed dictionaries. The
+  unit tests use small dictionaries written for them.
+- *Decisions.* `zh-dict` segments by jieba's frequencies rather than reproducing
+  SmartChineseAnalyzer. Fuseki bundles none of SmartChinese, Kuromoji and Nori, so no
+  Fuseki configuration depends on their tokens, and SmartChinese's dictionaries are
+  serialized Java objects inside its jar, segmented sentence by sentence with the JDK's
+  `BreakIterator`. Item 250 records that work. `ko-dict` pins mecab-ko-dic 2.0.3 instead
+  of the newer 2.1.1, because Nori's tokens come from 2.0.3. Java and the WHATWG EUC-JP
+  decoder differ on seven JIS X 0208 characters, such as `〜` and `—`, and the compiler
+  maps those back to Java's characters so that IPADIC's entries match Kuromoji's. A
+  changed dictionary is adopted at open by rebuilding the index rather than by refusing
+  to open it, since the change is the operator's and the RDF data stays usable during
+  the rebuild.
+
 ### Roadmap follow-ups (2026-10-12)
 
 **Full-text parity** (item 23, Tier 3, [ROADMAP](../ROADMAP.md)). Each part below is
@@ -1035,15 +1097,11 @@ sized at about one to two weeks.
 
 * **Lucene analyzer parity** is built, as *Analyzers that follow Lucene's* above
   describes.
-* **CJK dictionary segmentation.** The `cjk` analyzer makes overlapping bigrams, which
-  index more terms and match across word boundaries. A dictionary analyzer per language
-  (`ja-dict` after Lucene's Kuromoji, `zh-dict` after SmartChineseAnalyzer, `ko-dict`
-  after Nori) segments by a lattice over a dictionary with costs. The dictionaries are
-  large (tens of MB) and carry their own licenses, so they are a cargo feature
-  (`text-cjk-dict`) and the analyzer reads a dictionary file that the operator
-  provides or that `sparkles models`-style verified downloads fetch; the bigram
-  analyzer stays the default. The provenance and license of each dictionary go into
-  PROVENANCE before adoption.
+* **CJK dictionary segmentation** is built, as *Dictionary analyzers* above describes.
+  Chinese segmentation after SmartChineseAnalyzer, Kuromoji's normal and extended modes
+  and user dictionaries for Kuromoji and Nori remain, as item 250.
+* **Analyzers for the other languages of jena-text,** such as Greek, Arabic, Persian and
+  Hindi, which use Snowball stemmers or none today. Item 251 records them.
 * **Online enable and reconfigure.** `Store::enable_text` in
   `crates/sparkles-core/src/store.rs` takes the writer lock (`guarded_writer`) for the
   whole build, and *Online rebuilds* above records that reconfiguring still builds

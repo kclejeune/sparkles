@@ -5495,7 +5495,25 @@ SELECT ?s ?score ?label WHERE {
     CJK characters as `cjk` does, keeps words that mix Hangul and Latin letters whole and
     removes Lucene's CJK stop words, such as `the` and `www`. No tag takes them by
     default: `{"fr": "french-light", "ja": "cjk-lucene"}` selects them. A configuration
-    imported from Fuseki selects them for its languages.
+    imported from Fuseki selects them for its languages. Their tokenizer follows the
+    grammar of Lucene's `StandardTokenizer` over Unicode 12.1, so an emoji, a flag or a
+    run of Thai is a word, and prefixes, wildcards and fuzzy words are lowercased as
+    Java lowercases them, so `İS*` finds `İstanbul`.
+  * `ja-dict`, `zh-dict` and `ko-dict` segment Japanese, Chinese and Korean text into
+    words with a dictionary instead of pairing characters. `ja-dict` and `ko-dict`
+    produce the tokens of Lucene's Kuromoji `JapaneseAnalyzer` and Nori
+    `KoreanAnalyzer`, and `zh-dict` cuts Chinese by word frequencies as jieba does.
+    `東京都に住んでいる` is indexed as `東京`, `都` and `住む`, so `京都` does not find it.
+    Japanese words are reduced to their base form and particles, auxiliary verbs and
+    Kuromoji's stop words are dropped. Korean compounds and inflected words are split
+    into their parts, and endings and particles are dropped. Each needs its dictionary
+    installed with `sparkles text-dict` and a server built with the `text-cjk-dict`
+    cargo feature, which the default build has. The dictionaries are read from the
+    server's `--text-dicts` directory, `DATA/text-dicts` by default. Enabling an index
+    with one fails while its dictionary is missing. The index records each dictionary's
+    SHA-256 in `dictionaries`, and a store whose installed dictionary has changed
+    rebuilds the index with it when it opens. No tag takes them by default:
+    `{"ja": "ja-dict", "zh": "zh-dict", "ko": "ko-dict"}` selects them.
   * `cjk` segments Chinese, Japanese and Korean text without a dictionary, as Lucene's
     `CJKAnalyzer` does. A run of Han, Hiragana, Katakana or Hangul characters becomes its
     overlapping pairs of characters, so `東京都` is indexed as `東京` and `京都`, and a
@@ -5572,6 +5590,7 @@ type TextConfig = {
   maxHits?: number;                                     // default 1000000 hits without a limit or above one (then 507)
   docstoreCompression?: "zstd" | "lz4" | "none";         // default zstd; a change rebuilds
   languages?: "all" | string[] | { [tag: string]: string };  // stemmed languages; a change rebuilds
+  readonly dictionaries?: { [analyzer: string]: string };  // SHA-256 of each dictionary used
 };
 type TextStatus = {
   enabled: true; state: "ready" | "stale" | "rebuilding" | "failed"; docs: number;
