@@ -6,6 +6,8 @@
 //! [`to_nquads_file`] writes them to the temporary N-Quads file that the loader reads as
 //! an ordinary [`Source`](crate::io::Source), as C05 does with a table.
 
+#[cfg(feature = "mapping-sqlite")]
+pub mod draft;
 pub mod exec;
 pub mod functions;
 pub mod jsonpath;

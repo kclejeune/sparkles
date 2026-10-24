@@ -7,6 +7,9 @@
 pub struct Template {
     text: String,
     pub parts: Vec<Part>,
+    /// RML-Core's `rml:URI` term type: values are percent-encoded to URI-safe form,
+    /// non-ASCII characters included, instead of R2RML's IRI-safe form.
+    uri_safe: bool,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -59,7 +62,18 @@ impl Template {
         Ok(Template {
             text: text.to_string(),
             parts,
+            uri_safe: false,
         })
+    }
+
+    /// The template with URI-safe encoding of its values (`rml:URI`).
+    pub fn with_uri_safe(mut self) -> Template {
+        self.uri_safe = true;
+        self
+    }
+
+    pub fn uri_safe(&self) -> bool {
+        self.uri_safe
     }
 
     pub fn as_str(&self) -> &str {
@@ -99,6 +113,20 @@ pub fn iri_safe(s: &str, out: &mut String) {
                 out.push(char::from(HEX[(x >> 4) as usize]));
                 out.push(char::from(HEX[(x & 15) as usize]));
             }
+        }
+    }
+}
+
+/// The URI-safe form of a string: every character other than the unreserved ASCII
+/// characters is percent-encoded as UTF-8 (RML-Core's `rml:URI` term type).
+pub fn uri_safe(s: &str, out: &mut String) {
+    for b in s.bytes() {
+        if b.is_ascii_alphanumeric() || matches!(b, b'-' | b'.' | b'_' | b'~') {
+            out.push(char::from(b));
+        } else {
+            out.push('%');
+            out.push(char::from(HEX[(b >> 4) as usize]));
+            out.push(char::from(HEX[(b & 15) as usize]));
         }
     }
 }

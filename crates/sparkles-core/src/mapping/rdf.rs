@@ -206,14 +206,7 @@ pub fn parse(text: &str, base: Option<&str>) -> Result<Mapping> {
     for t in &tms {
         maps.push(r.triples_map(t)?);
     }
-    let base = tms
-        .iter()
-        .find_map(|t| match r.g.one(t, "baseIRI").ok().flatten() {
-            Some(Term::NamedNode(n)) => Some(n.as_str().to_string()),
-            Some(Term::Literal(l)) => Some(l.value().to_string()),
-            _ => None,
-        })
-        .or(doc_base);
+    let base = doc_base;
     let mut warnings = std::mem::take(&mut r.g.warnings);
     for t in &tms {
         if !r.g.all(t, "logicalTarget").is_empty() {
@@ -294,6 +287,12 @@ impl Reader {
             };
             pos.push(self.predicate_object(&po)?);
         }
+        let base = match self.g.one(t, "baseIRI")? {
+            None => None,
+            Some(Term::NamedNode(n)) => Some(n.as_str().to_string()),
+            Some(Term::Literal(l)) => Some(l.value().to_string()),
+            Some(other) => return self.bad(t, format!("a base IRI must be an IRI, not {other}")),
+        };
         Ok(TriplesMap {
             id,
             source,
@@ -301,6 +300,7 @@ impl Reader {
             classes,
             graphs,
             predicate_objects: pos,
+            base,
         })
     }
 
@@ -412,6 +412,7 @@ impl Reader {
         if count > 1 {
             return self.bad(n, "a term map has more than one of constant, column or reference, template and function");
         }
+        let mut uri = false;
         let term_type = match self.g.one(n, "termType")? {
             None => None,
             Some(Term::NamedNode(t)) => {
@@ -420,7 +421,11 @@ impl Reader {
                     .strip_prefix(RR)
                     .or_else(|| t.as_str().strip_prefix(RML));
                 Some(match local {
-                    Some("IRI") | Some("UnsafeIRI") | Some("URI") => TermType::Iri,
+                    Some("IRI") | Some("UnsafeIRI") => TermType::Iri,
+                    Some("URI") => {
+                        uri = true;
+                        TermType::Iri
+                    }
                     Some("BlankNode") => TermType::BlankNode,
                     Some("Literal") => TermType::Literal,
                     _ => return self.bad(n, format!("unknown term type <{}>", t.as_str())),
@@ -477,7 +482,9 @@ impl Reader {
             Value::Reference(r)
         } else if let Some(t) = template {
             Value::Template(
-                Template::parse(&t).map_err(|e| Error::invalid(format!("{}: {e}", show(n))))?,
+                Template::parse(&t)
+                    .map(|t| if uri { t.with_uri_safe() } else { t })
+                    .map_err(|e| Error::invalid(format!("{}: {e}", show(n))))?,
             )
         } else if let Some(f) = function {
             Value::Function(Box::new(f))
@@ -493,6 +500,7 @@ impl Reader {
             Some(t) => t,
             None => match (&value, role) {
                 (Value::Constant(Term::Literal(_)), _) => TermType::Literal,
+                (Value::Constant(Term::NamedNode(_)), _) => TermType::Iri,
                 (Value::Constant(Term::BlankNode(_)), _) => TermType::BlankNode,
                 (_, Role::Object | Role::Value)
                     if matches!(value, Value::Reference(_) | Value::Function(_))

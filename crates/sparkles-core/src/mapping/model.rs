@@ -136,6 +136,9 @@ pub struct TriplesMap {
     /// The subject map's graph maps; empty is the default graph.
     pub graphs: Vec<TermMap>,
     pub predicate_objects: Vec<PredicateObject>,
+    /// The map's own base IRI (RML-Core `rml:baseIRI`), over the run's and the
+    /// mapping's.
+    pub base: Option<String>,
 }
 
 #[derive(Clone, Debug)]

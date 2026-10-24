@@ -560,6 +560,7 @@ pub const SETTINGS: &[SettingsFile] = &[
     ds("branches.json", 2),
     ds("branch.json", 1),
     ds("queries.json", 1),
+    ds("mappings.json", 1),
     ds("algo.json", 2),
     ds("validation.json", 2),
     ds("validation-status.json", 1),

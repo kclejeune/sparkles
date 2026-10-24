@@ -19,6 +19,7 @@ pub(super) struct JsonSource {
     lines: bool,
     iterator: JPath,
     refs: Vec<JPath>,
+    names: Vec<String>,
     opts: RunOptions,
 }
 
@@ -34,6 +35,7 @@ impl JsonSource {
         check_file(&path, name)?;
         let bad = |e: String| Error::invalid(format!("{name}: {e}"));
         let iterator = JPath::parse(iterator.unwrap_or("$")).map_err(bad)?;
+        let names = refs;
         let refs = refs
             .iter()
             .map(|r| JPath::parse(r).map_err(bad))
@@ -44,6 +46,7 @@ impl JsonSource {
             lines,
             iterator,
             refs,
+            names: names.to_vec(),
             opts: opts.clone(),
         })
     }
@@ -52,11 +55,13 @@ impl JsonSource {
 struct JsonRow<'r> {
     node: &'r J,
     refs: &'r [JPath],
+    names: &'r [String],
     pos: &'r dyn Fn() -> String,
 }
 
-/// The values of a JSON node: an array gives its items.
-fn push<'a>(v: &'a J, out: &mut Vec<Cell<'a>>, depth: u8) {
+/// The value of a JSON node: none for `null`. An array or an object is not a value
+/// (RML-Core): a reference selects the items of an array with `[*]`.
+fn push<'a>(v: &'a J, out: &mut Vec<Cell<'a>>) -> std::result::Result<(), ()> {
     match v {
         J::Null => {}
         J::Bool(b) => out.push(Cell {
@@ -78,18 +83,22 @@ fn push<'a>(v: &'a J, out: &mut Vec<Cell<'a>>, depth: u8) {
             });
         }
         J::String(s) => out.push(Cell::str(s)),
-        J::Array(a) if depth == 0 => a.iter().for_each(|x| push(x, out, 1)),
-        J::Array(_) | J::Object(_) => out.push(Cell {
-            lex: Cow::Owned(v.to_string()),
-            dt: Dt::Str,
-        }),
+        J::Array(_) | J::Object(_) => return Err(()),
     }
+    Ok(())
 }
 
 impl Row for JsonRow<'_> {
     fn get<'a>(&'a self, r: usize, out: &mut Vec<Cell<'a>>) -> Result<()> {
         for v in self.refs[r].select(self.node) {
-            push(v, out, 0);
+            if push(v, out).is_err() {
+                return Err(Error::invalid(format!(
+                    "{}: the reference {:?} selects a JSON {}, not a value; select the items of an array with [*]",
+                    (self.pos)(),
+                    self.names[r],
+                    if v.is_array() { "array" } else { "object" }
+                )));
+            }
         }
         Ok(())
     }
@@ -132,6 +141,7 @@ impl RowSource for JsonSource {
                     f(&JsonRow {
                         node,
                         refs: &self.refs,
+                        names: &self.names,
                         pos: &pos,
                     })?;
                 }
@@ -164,6 +174,7 @@ impl RowSource for JsonSource {
             f(&JsonRow {
                 node,
                 refs: &self.refs,
+                names: &self.names,
                 pos: &pos,
             })?;
         }

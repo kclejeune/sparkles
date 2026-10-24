@@ -11,12 +11,17 @@
 use super::functions;
 use super::model::{Dt, Lang, Mapping, ObjectMap, SourceKind, TermMap, TermType, Value};
 use super::source::{self, Cell, Dt as Nat, Row};
-use super::template::{Part, iri_safe};
+use super::template::{Part, iri_safe, uri_safe};
 use super::{DEFAULT_GRAPH_RML, DEFAULT_GRAPH_RR, Inputs, RunOptions};
 use crate::error::{Error, Result};
 use oxrdf::vocab::rdf;
 use oxrdf::{BlankNode, GraphName, Literal, NamedNode, NamedOrBlankNode, Quad, Term};
 use rustc_hash::FxHashMap;
+use std::rc::Rc;
+
+fn base_of(b: &Option<String>) -> Option<Rc<str>> {
+    b.as_deref().map(Rc::from)
+}
 
 /// What a run did.
 #[derive(Clone, Debug, Default)]
@@ -149,7 +154,8 @@ impl Refs {
 enum CValue {
     Const(Term),
     Ref(usize),
-    Tpl(Vec<CPart>),
+    /// the parts, and whether values are URI-safe rather than IRI-safe encoded
+    Tpl(Vec<CPart>, bool),
     Fn(String, Vec<(usize, CTerm)>),
     Fresh,
 }
@@ -195,6 +201,7 @@ fn compile(t: &TermMap, refs: &mut Refs, side: u8) -> CTerm {
                     Part::Ref(r) => CPart::Ref(refs.get(side, r)),
                 })
                 .collect(),
+            tpl.uri_safe(),
         ),
         Value::Function(f) => {
             let def = functions::lookup(f.function.as_str());
@@ -235,14 +242,14 @@ fn compile(t: &TermMap, refs: &mut Refs, side: u8) -> CTerm {
 enum CObj {
     Term(CTerm),
     /// the parent's subject from the same row
-    SameRow(CTerm),
+    SameRow(CTerm, Option<Rc<str>>),
     /// a probe of hash table `table` with the child's join values
     Probe {
         table: usize,
         keys: Vec<usize>,
     },
     /// the parent's subject, from the parent's columns of a pushed-down join scan
-    Joined(CTerm),
+    Joined(CTerm, Option<Rc<str>>),
     /// made by another scan (a pushed-down join)
     Skip,
 }
@@ -257,6 +264,7 @@ struct CPo {
 #[derive(Clone, Debug)]
 struct CMap {
     id: String,
+    base: Option<Rc<str>>,
     subject: CTerm,
     classes: Vec<NamedNode>,
     graphs: Vec<CTerm>,
@@ -333,7 +341,7 @@ fn plan(m: &Mapping) -> Plan {
                                     "{} → {}: the parent's subject from the same row",
                                     tm.id, p.id
                                 ));
-                                CObj::SameRow(compile(&p.subject, &mut refs, 0))
+                                CObj::SameRow(compile(&p.subject, &mut refs, 0), base_of(&p.base))
                             } else if let (Some(a), Some(b)) = (is_sql(m, s), is_sql(m, p.source))
                                 && a == b
                             {
@@ -387,6 +395,7 @@ fn plan(m: &Mapping) -> Plan {
             }
             maps.push(CMap {
                 id: tm.id.clone(),
+                base: base_of(&tm.base),
                 subject,
                 classes: tm.classes.clone(),
                 graphs,
@@ -442,12 +451,13 @@ fn join_scan(
         refs,
         maps: vec![CMap {
             id: tm.id.clone(),
+            base: base_of(&tm.base),
             subject,
             classes: Vec::new(),
             graphs,
             pos: vec![CPo {
                 preds,
-                objs: vec![CObj::Joined(obj)],
+                objs: vec![CObj::Joined(obj, base_of(&p.base))],
                 graphs: pgraphs,
             }],
         }],
@@ -492,6 +502,8 @@ pub fn describe_joins(m: &Mapping) -> Vec<String> {
 
 struct Gen<'a> {
     base: Option<&'a str>,
+    /// the base of the triples map being generated, over `base`
+    map_base: Option<Rc<str>>,
     fresh: u64,
     only_graph: Option<&'a NamedNode>,
 }
@@ -544,7 +556,7 @@ impl Gen<'_> {
                     out.push((c.lex.into_owned(), c.dt));
                 }
             }
-            CValue::Tpl(parts) => {
+            CValue::Tpl(parts, uri) => {
                 let iri = t.tt == TermType::Iri;
                 let mut acc: Vec<String> = vec![String::new()];
                 for p in parts {
@@ -560,7 +572,9 @@ impl Gen<'_> {
                             for a in &acc {
                                 for c in &cells {
                                     let mut s = a.clone();
-                                    if iri {
+                                    if iri && *uri {
+                                        uri_safe(&c.lex, &mut s);
+                                    } else if iri {
                                         iri_safe(&c.lex, &mut s);
                                     } else {
                                         s.push_str(&c.lex);
@@ -621,7 +635,7 @@ impl Gen<'_> {
         if oxiri::Iri::parse(s.as_str()).is_ok() {
             return NamedNode::new(s).map_err(|e| data_error(map, row, t, e));
         }
-        let Some(base) = self.base else {
+        let Some(base) = self.map_base.as_deref().or(self.base) else {
             return Err(data_error(
                 map,
                 row,
@@ -744,6 +758,7 @@ impl Gen<'_> {
         sink: &mut dyn FnMut(Quad) -> Result<()>,
         stats: &mut Stats,
     ) -> Result<()> {
+        self.map_base = cm.base.clone();
         let mut subjects = Vec::new();
         self.terms(&cm.subject, row, &cm.id, &mut subjects)?;
         if subjects.is_empty() {
@@ -814,8 +829,13 @@ impl Gen<'_> {
             objs.clear();
             for o in &po.objs {
                 match o {
-                    CObj::Term(t) | CObj::SameRow(t) | CObj::Joined(t) => {
-                        self.terms(t, row, &cm.id, &mut objs)?
+                    CObj::Term(t) => self.terms(t, row, &cm.id, &mut objs)?,
+                    CObj::SameRow(t, base) | CObj::Joined(t, base) => {
+                        // the parent's subject, under the parent's base
+                        let own = std::mem::replace(&mut self.map_base, base.clone());
+                        let r = self.terms(t, row, &cm.id, &mut objs);
+                        self.map_base = own;
+                        r?
                     }
                     CObj::Probe { table, keys } => {
                         keyvals.clear();
@@ -905,6 +925,7 @@ pub fn run(
     let base = opts.base.as_deref().or(m.base.as_deref());
     let mut g = Gen {
         base,
+        map_base: None,
         fresh: 0,
         only_graph: opts.only_graph.as_ref(),
     };
@@ -915,6 +936,7 @@ pub fn run(
         let pm = &m.maps[parent];
         let mut refs = Refs::default();
         let subject = compile(&pm.subject, &mut refs, 0);
+        g.map_base = base_of(&pm.base);
         let keys: Vec<usize> = p.tables[ti].keys.iter().map(|k| refs.get(0, k)).collect();
         let mut src = source::open(&m.sources[pm.source], &refs.list, inputs, opts)?;
         let mut rows: FxHashMap<Vec<String>, Vec<Term>> = FxHashMap::default();

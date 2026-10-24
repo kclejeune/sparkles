@@ -29,6 +29,7 @@ pub mod sparql;
 pub mod spill;
 pub mod store;
 pub mod stored;
+pub mod stored_mappings;
 pub mod tabular;
 pub mod task;
 pub mod text;

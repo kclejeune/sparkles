@@ -53,11 +53,12 @@ fn quote(id: &str) -> String {
     format!("\"{}\"", id.replace('"', "\"\""))
 }
 
-/// The columns of a derived table, by preparing it.
+/// The columns of a derived table, by preparing it. The query itself is prepared, not
+/// a `SELECT *` over it, because SQLite renames the duplicate columns of a subquery
+/// (`ID:1`), and a duplicate name makes a reference ambiguous.
 fn columns(c: &rusqlite::Connection, inner: &str) -> Result<Vec<String>> {
-    let sql = format!("SELECT * FROM ({inner}) AS m0");
     let st = c
-        .prepare(&sql)
+        .prepare(inner)
         .map_err(|e| Error::invalid(format!("SQL {inner:?}: {e}")))?;
     Ok(st.column_names().into_iter().map(str::to_string).collect())
 }
@@ -71,11 +72,27 @@ fn resolve(cols: &[String], r: &str, what: &str) -> Result<String> {
     } else {
         r.to_string()
     };
-    if let Some(c) = cols.iter().find(|c| **c == want) {
-        return Ok(c.clone());
+    let ambiguous = || {
+        Err(Error::invalid(format!(
+            "{what} has more than one column named {r:?}, so the reference is ambiguous"
+        )))
+    };
+    let exact: Vec<&String> = cols.iter().filter(|c| **c == want).collect();
+    match exact.as_slice() {
+        [c] => return Ok((*c).clone()),
+        [] => {}
+        _ => return ambiguous(),
     }
-    if !delimited && let Some(c) = cols.iter().find(|c| c.eq_ignore_ascii_case(&want)) {
-        return Ok(c.clone());
+    if !delimited {
+        let folded: Vec<&String> = cols
+            .iter()
+            .filter(|c| c.eq_ignore_ascii_case(&want))
+            .collect();
+        match folded.as_slice() {
+            [c] => return Ok((*c).clone()),
+            [] => {}
+            _ => return ambiguous(),
+        }
     }
     Err(Error::invalid(format!(
         "{what} has no column {r:?}; its columns are {}",

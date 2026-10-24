@@ -617,6 +617,7 @@ fn mapping(cx: &Cx, name: &str, y: &Yaml, sources: &mut Vec<SourceDecl>) -> Resu
                 classes: Vec::new(),
                 graphs: graphs.clone(),
                 predicate_objects: pos.clone(),
+                base: None,
             });
             for (po, target, conds) in &joins {
                 out_joins.push((i, *po, target.clone(), conds.clone()));
