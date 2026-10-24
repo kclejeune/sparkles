@@ -1414,6 +1414,179 @@ async fn late_cursor_byte_budget_aborts_and_reports_once() {
     );
 }
 
+/// An eager SELECT whose serialized answer reaches `--max-result-mb` after its body has
+/// started to stream aborts the transfer in every result format, and the access log and
+/// the metrics record the outcome `budget` with the rows and bytes the client received.
+#[test]
+fn late_eager_byte_budget_aborts_and_reports_the_rows_sent() {
+    const ROWS: usize = 5000;
+    for format in ["tsv", "csv", "json", "xml", "sparkles", "thrift"] {
+        let mut received = Vec::new();
+        let mut metrics_text = String::new();
+        let lines = access_lines_of(|| async {
+            let s = server_with(|st| {
+                st.access_log = true;
+                st.limits.max_result_bytes =
+                    Some((super::stream::STREAM_AFTER + super::stream::CHUNK * 2) as u64);
+            });
+            let data = (0..ROWS)
+                .map(|i| format!("<urn:big:{i}> <urn:big> \"{}\" .\n", "x".repeat(512)))
+                .collect::<String>();
+            s.state
+                .get("ds")
+                .unwrap()
+                .store
+                .load(&[Source::from_bytes(
+                    data.into_bytes(),
+                    oxrdfio::RdfFormat::NTriples,
+                    None,
+                )])
+                .unwrap();
+            let uri = format!(
+                "/ds/sparql?execution=eager&format={format}&query=SELECT%20%3Fs%20%3Fo%20%7B%3Fs%20%3Curn:big%3E%20%3Fo%7D"
+            );
+            let res = s
+                .app
+                .clone()
+                .oneshot(Request::get(uri).body(Body::empty()).unwrap())
+                .await
+                .unwrap();
+            assert_eq!(
+                res.status(),
+                StatusCode::OK,
+                "{format}: headers must precede the later budget failure"
+            );
+            assert!(res.headers().get(header::CONTENT_LENGTH).is_none(), "{format}");
+            let mut body = res.into_body().into_data_stream();
+            let mut failed = false;
+            while let Some(chunk) = futures_util::StreamExt::next(&mut body).await {
+                match chunk {
+                    Ok(bytes) => received.extend_from_slice(&bytes),
+                    Err(_) => {
+                        failed = true;
+                        break;
+                    }
+                }
+            }
+            assert!(failed, "{format}: a partial answer must not end successfully");
+            metrics_text = metrics(&s.app).await;
+        })
+        .into_iter()
+        .filter(|l| l.contains(r#""route":"/{ds}/sparql""#))
+        .collect::<Vec<_>>();
+        assert_eq!(lines.len(), 1, "{format}: {lines:#?}");
+        let j: J = serde_json::from_str(&lines[0]).unwrap();
+        let f = &j["fields"];
+        assert_eq!(f["outcome"], "budget", "{format}: {f}");
+        assert_eq!(f["status"], 200, "{format}: {f}");
+        assert_eq!(
+            f["response_bytes"].as_u64(),
+            Some(received.len() as u64),
+            "{format}: the bytes logged are the bytes received"
+        );
+        let rows = f["rows"].as_u64().unwrap();
+        assert!(rows > 0 && rows < ROWS as u64, "{format}: {f}");
+        if matches!(format, "tsv" | "csv") {
+            // every whole line after the header is a row the client received
+            let lines = received.iter().filter(|&&b| b == b'\n').count() as u64;
+            assert_eq!(
+                rows,
+                lines - 1,
+                "{format}: the rows logged are the rows received"
+            );
+        }
+        assert_eq!(
+            sample(
+                &metrics_text,
+                r#"sparkles_requests_total{dataset="ds",operation="query",outcome="budget"}"#
+            ),
+            Some(1.0),
+            "{format}: {metrics_text}"
+        );
+        assert_eq!(
+            sample(
+                &metrics_text,
+                r#"sparkles_requests_total{dataset="ds",operation="query",outcome="ok"}"#
+            ),
+            Some(0.0),
+            "{format}"
+        );
+        assert_eq!(
+            sample(
+                &metrics_text,
+                r#"sparkles_budget_exceeded_total{dataset="ds",budget="result-bytes"}"#
+            ),
+            Some(1.0),
+            "{format}"
+        );
+        assert_eq!(
+            sample(
+                &metrics_text,
+                r#"sparkles_response_bytes_total{dataset="ds",operation="query"}"#
+            ),
+            Some(received.len() as f64),
+            "{format}"
+        );
+    }
+}
+
+/// A HEAD request for a large eager answer gets its headers, and the server drops the
+/// streamed body on purpose. That is recorded as a complete request, not a cancelled one.
+#[tokio::test]
+async fn head_of_a_streamed_eager_answer_is_recorded_as_ok() {
+    let s = server_with(|st| st.limits.max_result_bytes = None);
+    let data = (0..5000)
+        .map(|i| format!("<urn:big:{i}> <urn:big> \"{}\" .\n", "x".repeat(512)))
+        .collect::<String>();
+    s.state
+        .get("ds")
+        .unwrap()
+        .store
+        .load(&[Source::from_bytes(
+            data.into_bytes(),
+            oxrdfio::RdfFormat::NTriples,
+            None,
+        )])
+        .unwrap();
+    for execution in ["eager", "streaming"] {
+        let uri = format!(
+            "/ds/sparql?execution={execution}&format=tsv&query=SELECT%20%3Fs%20%3Fo%20%7B%3Fs%20%3Curn:big%3E%20%3Fo%7D"
+        );
+        let r = send(&s.app, Request::head(uri).body(Body::empty()).unwrap()).await;
+        assert_eq!(r.status, StatusCode::OK, "{execution}");
+        assert!(r.body.is_empty(), "{execution}");
+    }
+    // the producer reports once it notices the dropped body
+    let mut m = String::new();
+    for _ in 0..200 {
+        m = metrics(&s.app).await;
+        if sample(
+            &m,
+            r#"sparkles_request_duration_seconds_count{dataset="ds",operation="query"}"#,
+        ) == Some(2.0)
+        {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    assert_eq!(
+        sample(
+            &m,
+            r#"sparkles_requests_total{dataset="ds",operation="query",outcome="ok"}"#
+        ),
+        Some(2.0),
+        "{m}"
+    );
+    assert_eq!(
+        sample(
+            &m,
+            r#"sparkles_requests_total{dataset="ds",operation="query",outcome="cancelled"}"#
+        ),
+        Some(0.0),
+        "{m}"
+    );
+}
+
 #[tokio::test]
 async fn cursor_graph_and_ask_formats_use_the_negotiated_query_form() {
     let s = server();

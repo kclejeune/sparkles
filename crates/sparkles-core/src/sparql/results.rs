@@ -10,6 +10,7 @@ use serde::{Serialize, Serializer};
 use serde_json::{Value as J, json};
 use sparesults::{QueryResultsFormat, QueryResultsSerializer};
 use std::borrow::Cow;
+use std::cell::Cell;
 use std::collections::BTreeMap;
 use std::io::Write;
 use std::sync::Arc;
@@ -359,11 +360,24 @@ pub fn write_cursor_solutions(
 pub fn write_solutions(
     r: &QueryResult,
     fmt: SolutionsFormat,
-    mut w: impl Write,
+    w: impl Write,
     send: Option<usize>,
 ) -> Result<()> {
+    write_solutions_counted(r, fmt, w, send, &Cell::new(0))
+}
+
+/// [`write_solutions`], counting in `sent` the rows written whole. A caller whose writer
+/// stops the output partway, such as at the result-size budget, learns from it how many
+/// rows the output holds.
+pub fn write_solutions_counted(
+    r: &QueryResult,
+    fmt: SolutionsFormat,
+    mut w: impl Write,
+    send: Option<usize>,
+    sent: &Cell<u64>,
+) -> Result<()> {
     if fmt == SolutionsFormat::Sparkles {
-        return write_native_json(r, w, send, None);
+        return write_native_json_counted(r, w, send, None, sent);
     }
     let f = match fmt {
         SolutionsFormat::Json => QueryResultsFormat::Json,
@@ -413,6 +427,7 @@ pub fn write_solutions(
                 .collect();
             s.serialize(terms.iter().map(|(c, t)| (vars[*c].as_ref(), t.as_ref())))
                 .map_err(io)?;
+            sent.set(sent.get() + 1);
         }
         s.finish().map_err(io)?;
         return Ok(());
@@ -440,6 +455,7 @@ pub fn write_solutions(
                         .map(|(c, t)| (vars[*c].as_ref(), t.as_ref().as_ref())),
                 )
                 .map_err(io)?;
+                sent.set(sent.get() + 1);
             }
             if let Some(h) = next {
                 ids = h
@@ -612,6 +628,17 @@ pub fn write_graph(
     prefixes: &BTreeMap<String, String>,
     w: impl Write,
 ) -> Result<()> {
+    write_graph_counted(r, fmt, prefixes, w, &Cell::new(0))
+}
+
+/// [`write_graph`], counting in `sent` the triples and quads written whole.
+pub fn write_graph_counted(
+    r: &QueryResult,
+    fmt: RdfFormat,
+    prefixes: &BTreeMap<String, String>,
+    w: impl Write,
+    sent: &Cell<u64>,
+) -> Result<()> {
     let mut ser = RdfSerializer::from_format(fmt);
     if matches!(fmt, RdfFormat::Turtle | RdfFormat::TriG | RdfFormat::RdfXml) {
         for (p, ns) in prefixes {
@@ -623,10 +650,12 @@ pub fn write_graph(
     let mut s = ser.for_writer(w);
     for t in &r.triples {
         s.serialize_triple(t).map_err(io)?;
+        sent.set(sent.get() + 1);
     }
     if fmt.supports_datasets() {
         for q in &r.quads {
             s.serialize_quad(q).map_err(io)?;
+            sent.set(sent.get() + 1);
         }
     }
     s.finish().map_err(io)?;
@@ -641,13 +670,25 @@ pub fn write_jena_graph(
     fmt: crate::jena_formats::JenaFormat,
     w: impl Write,
 ) -> Result<()> {
+    write_jena_graph_counted(r, fmt, w, &Cell::new(0))
+}
+
+/// [`write_jena_graph`], counting in `sent` the triples and quads written whole.
+pub fn write_jena_graph_counted(
+    r: &QueryResult,
+    fmt: crate::jena_formats::JenaFormat,
+    w: impl Write,
+    sent: &Cell<u64>,
+) -> Result<()> {
     let mut out = crate::jena_formats::RdfWriter::new(fmt, w);
     for t in &r.triples {
         out.triple(t).map_err(io)?;
+        sent.set(sent.get() + 1);
     }
     if fmt.quads() {
         for q in &r.quads {
             out.quad(q).map_err(io)?;
+            sent.set(sent.get() + 1);
         }
     }
     out.finish().map_err(io)?;
@@ -674,6 +715,17 @@ pub fn write_native_json(
     send: Option<usize>,
     metadata: Option<NativeJsonMetadata<'_>>,
 ) -> Result<()> {
+    write_native_json_counted(r, w, send, metadata, &Cell::new(0))
+}
+
+/// [`write_native_json`], counting in `sent` the rows written whole.
+pub fn write_native_json_counted(
+    r: &QueryResult,
+    w: impl Write,
+    send: Option<usize>,
+    metadata: Option<NativeJsonMetadata<'_>>,
+    sent: &Cell<u64>,
+) -> Result<()> {
     let n = send.map_or(r.len(), |s| s.min(r.len()));
     serde_json::to_writer(
         w,
@@ -682,6 +734,7 @@ pub fn write_native_json(
             n,
             metadata,
             started: Instant::now(),
+            sent,
         },
     )
     .map_err(|e| Error::Io(e.into()))
@@ -930,6 +983,7 @@ struct NativeJson<'a> {
     n: usize,
     metadata: Option<NativeJsonMetadata<'a>>,
     started: Instant,
+    sent: &'a Cell<u64>,
 }
 
 impl Serialize for NativeJson<'_> {
@@ -940,17 +994,31 @@ impl Serialize for NativeJson<'_> {
         match r.kind {
             QueryKind::Select => {
                 map.serialize_entry("vars", &r.vars)?;
-                map.serialize_entry("rows", &NativeRows { r, n: self.n })?;
+                map.serialize_entry(
+                    "rows",
+                    &NativeRows {
+                        r,
+                        n: self.n,
+                        sent: self.sent,
+                    },
+                )?;
             }
             QueryKind::Ask => map.serialize_entry("boolean", &r.boolean)?,
             _ => {
                 map.serialize_entry(
                     "triples",
-                    &NativeGraphRows::Triples(&r.triples[..self.n.min(r.triples.len())]),
+                    &NativeGraphRows {
+                        rows: GraphRows::Triples(&r.triples[..self.n.min(r.triples.len())]),
+                        sent: self.sent,
+                    },
                 )?;
                 if !r.quads.is_empty() {
                     let n = self.n.saturating_sub(r.triples.len()).min(r.quads.len());
-                    map.serialize_entry("quads", &NativeGraphRows::Quads(&r.quads[..n]))?;
+                    let rows = NativeGraphRows {
+                        rows: GraphRows::Quads(&r.quads[..n]),
+                        sent: self.sent,
+                    };
+                    map.serialize_entry("quads", &rows)?;
                 }
             }
         }
@@ -1013,6 +1081,7 @@ struct NativeMemory {
 struct NativeRows<'a> {
     r: &'a QueryResult,
     n: usize,
+    sent: &'a Cell<u64>,
 }
 
 impl Serialize for NativeRows<'_> {
@@ -1026,6 +1095,7 @@ impl Serialize for NativeRows<'_> {
         }
         for i in 0..self.n {
             seq.serialize_element(&NativeRow { r: self.r, i })?;
+            self.sent.set(self.sent.get() + 1);
         }
         seq.end()
     }
@@ -1066,30 +1136,36 @@ impl Serialize for NativeQuad<'_> {
     }
 }
 
-enum NativeGraphRows<'a> {
+enum GraphRows<'a> {
     Triples(&'a [oxrdf::Triple]),
     Quads(&'a [oxrdf::Quad]),
 }
 
+struct NativeGraphRows<'a> {
+    rows: GraphRows<'a>,
+    sent: &'a Cell<u64>,
+}
+
 impl Serialize for NativeGraphRows<'_> {
     fn serialize<S: Serializer>(&self, s: S) -> std::result::Result<S::Ok, S::Error> {
-        let mut seq = s.serialize_seq(Some(match self {
-            Self::Triples(rows) => rows.len(),
-            Self::Quads(rows) => rows.len(),
+        let mut seq = s.serialize_seq(Some(match self.rows {
+            GraphRows::Triples(rows) => rows.len(),
+            GraphRows::Quads(rows) => rows.len(),
         }))?;
-        match self {
-            Self::Triples(rows) => {
-                for row in *rows {
+        match self.rows {
+            GraphRows::Triples(rows) => {
+                for row in rows {
                     let t = row.as_ref();
                     seq.serialize_element(&[
                         NativeTerm(t.subject.into()),
                         NativeTerm(t.predicate.into()),
                         NativeTerm(t.object),
                     ])?;
+                    self.sent.set(self.sent.get() + 1);
                 }
             }
-            Self::Quads(rows) => {
-                for row in *rows {
+            GraphRows::Quads(rows) => {
+                for row in rows {
                     let q = row.as_ref();
                     let graph = match q.graph_name {
                         oxrdf::GraphNameRef::NamedNode(n) => Some(NativeTerm(n.into())),
@@ -1102,6 +1178,7 @@ impl Serialize for NativeGraphRows<'_> {
                         Some(NativeTerm(q.object)),
                         graph,
                     ])?;
+                    self.sent.set(self.sent.get() + 1);
                 }
             }
         }

@@ -350,6 +350,7 @@ pub async fn observe(State(st): State<Arc<AppState>>, mut req: Request, next: Ne
     let otel = crate::otel::on_request(&span, &req, route.as_deref(), &id);
     req.extensions_mut().insert(RequestSpan(span.clone()));
     let op = route_op(route.as_deref(), &req);
+    let head = req.method() == axum::http::Method::HEAD;
     let mut pending = Pending::new(
         st,
         span,
@@ -385,7 +386,7 @@ pub async fn observe(State(st): State<Arc<AppState>>, mut req: Request, next: Ne
     pending.auth = auth;
     crate::otel::response_headers(&pending.otel, resp.headers_mut());
     if let Some(deferred) = resp.extensions_mut().remove::<DeferredReport>() {
-        deferred.observe(pending, resp.status().as_u16());
+        deferred.observe(pending, resp.status().as_u16(), head);
         let body = std::mem::replace(resp.body_mut(), axum::body::Body::empty());
         *resp.body_mut() = deferred.wrap(body);
     } else {

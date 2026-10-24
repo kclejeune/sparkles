@@ -16,6 +16,8 @@ struct State {
     pending: Option<Pending>,
     report: Option<RequestReport>,
     status: u16,
+    /// a HEAD request, whose body the server drops on purpose
+    head: bool,
     body: Option<BodyEnd>,
 }
 
@@ -32,10 +34,11 @@ impl DeferredReport {
         self.complete();
     }
 
-    pub(super) fn observe(&self, pending: Pending, status: u16) {
+    pub(super) fn observe(&self, pending: Pending, status: u16, head: bool) {
         let mut state = self.0.lock();
         state.pending = Some(pending);
         state.status = status;
+        state.head = head;
         drop(state);
         self.complete();
     }
@@ -54,6 +57,15 @@ impl DeferredReport {
             let pending = state.pending.take().expect("pending report");
             let mut report = state.report.take().expect("producer report");
             let mut status = state.status;
+            if state.head {
+                // The server drops the body of a HEAD response, so the producer sees a
+                // disconnect and the body never ends. Neither is the client's doing, and
+                // other outcomes such as a timeout stand.
+                if report.outcome == Some(Outcome::Cancelled) {
+                    report.outcome = None;
+                }
+                state.body = Some(BodyEnd::Complete);
+            }
             match state.body.expect("body end") {
                 BodyEnd::Complete => (),
                 BodyEnd::Failed => {

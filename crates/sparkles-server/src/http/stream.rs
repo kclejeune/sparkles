@@ -6,7 +6,10 @@
 //! was buffered and continues in [`CHUNK`]-sized pieces through a bounded channel, so
 //! serialized-body buffering stays bounded. The query result itself may already be
 //! materialized. An error after the switch aborts the transfer (the client sees a
-//! truncated response), and a client that goes away stops the serialization.
+//! truncated response), and a client that goes away stops the serialization. An eager
+//! body that reaches the result-size budget after the switch first sends the bytes it had
+//! buffered, so the client receives everything the serializer wrote before the budget
+//! stopped it.
 
 use super::{ApiError, ApiResult, err};
 use axum::body::Bytes;
@@ -42,6 +45,22 @@ pub struct StreamEnd {
     pub error: Option<Error>,
     /// the client went away before the end
     pub disconnected: bool,
+}
+
+impl StreamEnd {
+    /// The outcome and budget that the access log and the metrics record for a body that
+    /// ended this way. A complete body has no outcome of its own.
+    pub(crate) fn outcome(&self) -> (Option<crate::obs::Outcome>, Option<sparkles::BudgetKind>) {
+        use crate::obs::Outcome as O;
+        match &self.error {
+            Some(Error::Timeout) => (Some(O::Timeout), None),
+            Some(Error::Cancelled) => (Some(O::Cancelled), None),
+            Some(Error::BudgetExceeded(b)) => (Some(O::Budget), Some(b.kind)),
+            Some(_) if self.disconnected => (Some(O::Cancelled), None),
+            Some(_) => (Some(O::Error), None),
+            None => (None, None),
+        }
+    }
 }
 
 enum Outcome {
@@ -376,9 +395,28 @@ where
             write(&mut w)
         };
         let result = result.map_err(|e| w.classify(e));
-        let bytes = w.written();
+        let mut bytes = w.written();
         let mut sw = w.into_inner();
-        let result = result.and_then(|()| sw.send_chunk().map_err(Error::from));
+        let result = match result {
+            Ok(()) => sw.send_chunk().map_err(Error::from),
+            Err(e) => {
+                // An eager body stopped by the result-size budget sends what it buffered
+                // before it aborts, so that the client receives every row the report
+                // counts. Its writes already wait for the reader, so this wait is one
+                // more chunk of the same kind. A cursor's body ends at once instead,
+                // since its waits are bounded by the stall limit. The bytes reported
+                // leave out what was not sent.
+                let pending = sw.buf.len() as u64;
+                let flushed = control.is_none()
+                    && matches!(e, Error::BudgetExceeded(_))
+                    && sw.tx.is_some()
+                    && sw.send_chunk().is_ok();
+                if sw.tx.is_some() && !flushed {
+                    bytes = bytes.saturating_sub(pending);
+                }
+                Err(e)
+            }
+        };
         let result = result.map_err(|e| match &control {
             Some(c) => c.classify(e),
             None => e,
