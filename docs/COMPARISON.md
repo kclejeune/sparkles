@@ -208,8 +208,8 @@ endpoint, query budgets, result cache or web UI.
 
 ### Out of scope for v1
 
-The original v1 exclusions are recorded in [AUDIT.md](AUDIT.md#5-explicit-non-goals-for-v1).
-Several have since shipped. The current [known gaps](FEATURES.md#known-gaps) include
+The original v1 exclusions are recorded in [AUDIT.md](AUDIT.md#5-explicit-non-goals-for-v1),
+and Sparkles implements several of them. The remaining [known gaps](FEATURES.md#known-gaps) include
 JavaScript functions, ontology object mapping, Lucene index-file compatibility,
 backward-chaining rules and Shiro as an authentication framework.
 `sparkles config import fuseki` translates supported Shiro users and URL rules into
