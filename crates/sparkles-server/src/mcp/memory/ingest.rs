@@ -2705,8 +2705,10 @@ mod tests {
                 assert_eq!(index.find(&text, q, first), find_quote(&text, q, first));
             }
         }
+        // The unbounded version took 52 s in a debug build. A shared CI runner took 6.2 s
+        // for the bounded one, so the bound leaves room for slow machines.
         assert!(
-            began.elapsed() < std::time::Duration::from_secs(5),
+            began.elapsed() < std::time::Duration::from_secs(20),
             "{:?}",
             began.elapsed()
         );
@@ -2741,8 +2743,10 @@ mod tests {
                 "{q}"
             );
         }
+        // `complete` is the check that fails on a single global fallback. The time bound
+        // only catches a large slowdown, with room for a slow shared runner.
         assert!(
-            began.elapsed() < std::time::Duration::from_secs(5),
+            began.elapsed() < std::time::Duration::from_secs(20),
             "{:?}",
             began.elapsed()
         );
