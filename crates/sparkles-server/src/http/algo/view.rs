@@ -544,11 +544,13 @@ pub(crate) fn started(st: &AppState, id: &str, p: &Principal) -> bool {
 pub(crate) static PAUSED: Mutex<Vec<String>> = parking_lot::const_mutex(Vec::new());
 
 /// Removes a run from [`RUNNING`] when its task ends, however it ends.
-struct Running(Key);
+struct Running(Key, String);
 
 impl Drop for Running {
     fn drop(&mut self) {
-        RUNNING.lock().retain(|(k, _)| *k != self.0);
+        RUNNING
+            .lock()
+            .retain(|(k, id)| !(*k == self.0 && *id == self.1));
     }
 }
 
@@ -659,9 +661,22 @@ async fn background(
             return Ok(Json(kept.answer(&view, true, max_rows)).into_response());
         }
         let mut running = RUNNING.lock();
-        if let Some((_, id)) = running.iter().find(|(k, _)| *k == key)
-            && let Some(task) = st.tasks.lock().iter().find(|t| t.id == *id).cloned()
-        {
+        // a run that was cancelled is not joined: it is ending, and a new one starts
+        let live = running.iter().find_map(|(k, id)| {
+            (*k == key)
+                .then(|| {
+                    st.tasks
+                        .lock()
+                        .iter()
+                        .find(|t| {
+                            t.id == *id && t.active() && !t.cancel.load(Ordering::Relaxed)
+                        })
+                        .cloned()
+                })
+                .flatten()
+        });
+        if let Some(task) = live {
+            let id = &task.id;
             JOINS.fetch_add(1, Ordering::Relaxed);
             add_caller(&st, id, &p);
             return Ok(task_answer(&task, true));
@@ -685,8 +700,9 @@ async fn background(
         add_caller(&st, &id, &p);
         let state = st.clone();
         let d = ds.clone();
+        let task_id = id.clone();
         let task = st.start_task_opts(id, TASK, &ds.name, None, true, move |h| {
-            let _running = Running(key.clone());
+            let _running = Running(key.clone(), task_id);
             let mut opts = opts;
             opts.cancel = Some(h.cancel_flag());
             if let Some((pool, want, wait)) = admission {

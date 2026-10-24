@@ -195,15 +195,19 @@ async fn background_runs_are_joined_cancelled_and_kept() {
     )
     .await;
     assert_eq!(r.status, StatusCode::ACCEPTED, "{}", r.text());
-    let done = super::super::tasks::wait_done(&s.state, &id).await;
-    assert_eq!(done.state, task_state::CANCELLED, "{:?}", done.message);
-    // a new run starts, finishes and is kept
-    view::PAUSED.lock().retain(|d| d != "paused");
+    // a request right after the cancel does not join the ending run: it starts another
     let (st, t) = run(&s, "paused", &body).await;
     assert_eq!(st, StatusCode::ACCEPTED, "{t}");
-    assert_eq!(t["joined"], false);
+    assert_eq!(t["joined"], false, "{t}");
     let id2 = t["id"].as_str().unwrap().to_string();
     assert_ne!(id2, id);
+    let done = super::super::tasks::wait_done(&s.state, &id).await;
+    assert_eq!(done.state, task_state::CANCELLED, "{:?}", done.message);
+    // the new run is still the one a request joins after the old one ended
+    let (_, j) = run(&s, "paused", &body).await;
+    assert_eq!(j["id"], id2.as_str(), "{j}");
+    // it finishes and is kept
+    view::PAUSED.lock().retain(|d| d != "paused");
     let done = super::super::tasks::wait_done(&s.state, &id2).await;
     assert_eq!(done.state, task_state::DONE, "{:?}", done.message);
     let detail = done.detail.unwrap();

@@ -398,7 +398,9 @@ export async function handleAlgo(req, res, url, seg, ctx) {
   if (view.async) {
     const id = running.get(key);
     const t = id && tasks.find((x) => x.id === id);
-    if (t && t.state === 'running') return (send(res, 202, { ...t, joined: true }), true);
+    // a cancelled run is ending: a new one starts instead of joining it
+    if (t && t.state === 'running' && !t.cancelled)
+      return (send(res, 202, { ...t, joined: true }), true);
     const task = {
       id: nextTaskId(),
       kind: 'algo-view',
@@ -420,7 +422,7 @@ export async function handleAlgo(req, res, url, seg, ctx) {
         i++;
         if (task.cancelled) {
           clearInterval(timer);
-          running.delete(key);
+          if (running.get(key) === task.id) running.delete(key);
           Object.assign(task, { state: 'cancelled', finishedAt: new Date().toISOString() });
           delete task.progress;
           return;
@@ -428,7 +430,7 @@ export async function handleAlgo(req, res, url, seg, ctx) {
         task.progress = i / steps;
         if (i < steps) return;
         clearInterval(timer);
-        running.delete(key);
+        if (running.get(key) === task.id) running.delete(key);
         try {
           const r = run();
           kept.set(key, r);
