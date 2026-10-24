@@ -152,6 +152,37 @@ pub fn validate_node(
     engine.run_nodes(&[focus])
 }
 
+/// The shapes whose targets select `node` in the data graph of `opts`, in shape order:
+/// the shapes [`validate_node`] would validate the node against. Deactivated shapes are
+/// left out.
+pub fn shapes_for_node(
+    snap: &Arc<Snapshot>,
+    shapes: &Shapes,
+    node: &Term,
+    opts: &ValidateOptions,
+) -> Result<Vec<ShapeId>> {
+    let (mut data, ids) = DataGraph::new(
+        snap.clone(),
+        opts.data_graph.as_deref(),
+        &opts.extra_graphs,
+        &opts.exclude_graphs,
+        shapes,
+    )?;
+    let focus = resolve_focus(&mut data, node, shapes);
+    let engine = Engine::new(shapes, &data, ids, opts)?;
+    let mut out = Vec::new();
+    for (si, shape) in shapes.shapes.iter().enumerate() {
+        if shape.targets.is_empty() || shape.deactivated {
+            continue;
+        }
+        engine.check_limits()?;
+        if engine.is_target(si, focus)? {
+            out.push(si);
+        }
+    }
+    Ok(out)
+}
+
 /// The id of a focus node named by a caller: a blank node with the label of a stored one
 /// (`b…`) is that stored node, whatever the scope of the shapes' own blank nodes, and any
 /// other term resolves as the shapes' terms do.

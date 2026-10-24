@@ -77,6 +77,12 @@ pub mod sh {
         NODE_BY_EXPRESSION = "nodeByExpression",
         VALUES = "values",
         DEFAULT_VALUE = "defaultValue",
+        // non-validating property shape characteristics (SHACL §2.3.2)
+        NAME = "name",
+        DESCRIPTION = "description",
+        ORDER = "order",
+        GROUP = "group",
+        PROPERTY_GROUP = "PropertyGroup",
         SPARQL_EXPR = "sparqlExpr",
         BODY_EXPRESSION = "bodyExpression",
         KEY_PARAMETER = "keyParameter",
@@ -215,6 +221,21 @@ pub mod rdfs {
     terms! { "http://www.w3.org/2000/01/rdf-schema#";
         CLASS = "Class",
         SUB_CLASS_OF = "subClassOf",
+        LABEL = "label",
+        COMMENT = "comment",
+    }
+}
+
+/// The DASH Data Shapes namespace (TopQuadrant), whose editor and viewer hints forms read.
+pub const DASH_NS: &str = "http://datashapes.org/dash#";
+
+pub mod dash {
+    use super::NamedNodeRef;
+    terms! { "http://datashapes.org/dash#";
+        EDITOR = "editor",
+        VIEWER = "viewer",
+        SINGLE_LINE = "singleLine",
+        READ_ONLY = "readOnly",
     }
 }
 

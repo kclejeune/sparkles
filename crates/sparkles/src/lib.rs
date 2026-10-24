@@ -19,6 +19,8 @@ pub mod dataset;
 pub mod embed;
 #[cfg(feature = "fmt")]
 pub mod fmt;
+#[cfg(feature = "shacl")]
+pub mod forms;
 pub mod handles;
 pub mod overview;
 pub mod querybuilder;
