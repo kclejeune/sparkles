@@ -34,6 +34,7 @@ the settings of each engine and the commands that reproduce each table.
 * [Loading and index builds](#loading-and-index-builds)
 * [Writes and updates](#writes-and-updates)
 * [Bindings](#bindings)
+* [Natural-language questions](#natural-language-questions)
 * [Memory and disk](#memory-and-disk)
 * [Methodology and reproduction](#methodology-and-reproduction)
 
@@ -2247,6 +2248,62 @@ store took 13 to 15 ms against TDB2's 2.3 to 3.2 ms.
 
 *Measured on 8-vCPU AMD EPYC instances of a cloud CI provider, not a quiet machine. Runs on
 different instances differed by up to 30%.*
+
+## Natural-language questions
+
+These numbers measure `sparkles ask` and global answering from community reports with
+Anthropic models. They depend on the models and prompts more than on the engine.
+`testsuite/ask/README.md` and `testsuite/graphrag/README.md` explain the harnesses, which
+call the provider through a local proxy that holds every request against a cost cap.
+
+| Measurement context | |
+|---|---|
+| Date and host | 2026-10-24, on a development laptop with the DBpedia database on local disk |
+| Models | Claude Haiku 5.5, Sonnet 5.5 and Opus 5.5 at effort `medium`, with a 200,000-token context |
+| Builds | Ask from commit 03aa64bb, global answering from commit 847d8d0b |
+| Cost | $28.80 for the Ask runs and $11.25 for the evaluation of global answering |
+
+### Ask on DBpedia
+
+The questions run on the DBpedia 2022.12.01 database of 1.01 billion quads, against
+answers recomputed on that release. When the pipeline asks which resource a name means,
+the harness answers from the gold query by choosing one of the offered choices. An answer
+is correct when its rows match the gold's on the projected columns, and the equal-width
+row gives no credit for extra columns such as a label beside an IRI.
+
+| Set | Haiku 5.5 | Sonnet 5.5 | Opus 5.5 |
+|---|---|---|---|
+| QALD-9-plus, 107 questions | 16 (15%) | 35 (33%) | 40 (37%) |
+| QALD-9-plus, equal width | 13 | 15 | 15 |
+| DBpedia-only, 74 questions | 11 (15%) | 28 (38%) | 32 (43%) |
+| DBpedia-only, equal width | 9 | 14 | 13 |
+| Cost per correct answer, QALD-9-plus | $0.020 | $0.160 | $0.279 |
+| Median time per question, QALD-9-plus | 11.8 s | 12.7 s | 18.6 s |
+
+Haiku found most questions unanswerable, because the grounding seldom lists the
+predicate a question needs. Sonnet and Opus guess the predicate and are often wrong.
+[C18](specs/C18-natural-language-questions-and-ingest.md#roadmap-follow-ups-2026-10-12)
+gives the failures and the earlier runs on the demo set and CK25, and
+[ROADMAP](ROADMAP.md) item 263 holds the follow-up.
+
+### Global answering
+
+Sonnet 5.5 answered 30 generated questions about the whole demo organisation graph four
+ways, and Opus 5.5 judged each pair of answers in both orders on the criteria of Edge et
+al. The table gives the win rate of global answering from the finest level, which holds
+27 reports, against each other mode, with a tie counted as half.
+
+| Against | Comprehensiveness | Diversity | Empowerment | Directness |
+|---|---|---|---|---|
+| Local Ask | 0.88 | 0.97 | 0.92 | 0.68 |
+| BM25 over 20 documents | 1.00 | 1.00 | 0.98 | 1.00 |
+| Global from the coarsest level | 0.62 | 0.57 | 0.55 | 0.79 |
+
+A global answer took a median of 10.4 s against 4.7 s for local Ask. Every cited fact
+exists, and the judge found 44% of the claims of fine answers fully supported and 48%
+partly supported.
+[C22](specs/C22-graph-rag-community-summaries.md#paid-acceptance-and-evaluation-2026-10-24)
+gives the intervals and the other measures.
 
 ## Memory and disk
 
