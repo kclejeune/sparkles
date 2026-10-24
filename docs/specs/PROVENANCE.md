@@ -54,6 +54,18 @@ implementation landed.
   Tantivy's source. The English list is Lucene's, and the others are the Snowball
   project's (BSD-3-Clause, the license `rust-stemmers` already carries). Tantivy is behind the optional
   `text` feature of `sparkles`, which the server enables by default.
+- **Analyzers that follow Lucene's:** written for Sparkles from J. Savoy, "Report on
+  CLEF-2001 experiments" (CLEF 2001, LNCS 2406) for the light French, Spanish and
+  Italian stemmers, J. Savoy, "Light stemming approaches for the French, Portuguese,
+  German and Hungarian languages" (ACM SAC 2006) for the French, Portuguese and German
+  ones, Unicode's UAX #29 for word boundaries, and Lucene's behaviour as observed from the
+  outside. That behaviour is the tokens and stop sets that the Lucene 9.11.1 bundled in
+  Fuseki 5.1.0's `fuseki-server.jar` produces, which `scripts/text-lucene-compare` records
+  as test fixtures. `rust-stemmers` became a direct dependency of `sparkles-core` for the
+  Dutch, Russian and Swedish stems, at the version Tantivy already links, so no crate was
+  added. The fixtures and the comparison corpus use words from the Snowball project's test
+  vocabularies (BSD-3-Clause) and the OpenTaal Dutch word list (BSD-3-Clause or CC BY 3.0),
+  and Swedish words written for the tests.
 - **Rejected** (spec §8):
   - a home-grown inverted index;
   - one document per subject;

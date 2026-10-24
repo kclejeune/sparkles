@@ -449,8 +449,8 @@ rest of a query.
   and stop words, and `lang:` searches use them, as with jena-text's multilingual support.
   Analyzers that reproduce Lucene's for English, French, Spanish, Italian, Portuguese,
   German, Dutch, Russian, Swedish and CJK text can be selected per language instead. With
-  them, 1,573 of 1,590 stemmed searches in nine languages find the same literals as
-  Fuseki, and the other 17 consist of stop words alone.
+  them, 1,576 of 1,590 stemmed searches in nine languages find the same literals as
+  Fuseki, and the other 14 consist of stop words alone.
 * An index can be enabled when a dataset is created. A missing or damaged index recovers
   in the background at open while the RDF data stays usable, and text searches answer
   `503` until recovery succeeds. Reconfiguring an index waits for old writers and

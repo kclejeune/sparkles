@@ -5,7 +5,11 @@
 
 WORDS.json holds, per language, families of inflected forms, filler words and stop words.
 A family is a set of words that Lucene's analyzer or Snowball's stemmer reduces to one
-stem, so the queries probe exactly where the two stem differently. The output is
+stem, so the queries probe exactly where the two stem differently. The words come from
+the Snowball project's test vocabularies (BSD-3-Clause) for English, French, Spanish,
+Italian, Portuguese, German and Russian, from the OpenTaal Dutch word list (BSD-3-Clause
+or CC BY 3.0), and for Swedish from inflections written for this comparison. The stop
+words are Lucene's lists. The output is
 OUT_DIR/corpus.nt, 300 rdfs:label literals per language, and OUT_DIR/queries.tsv, one
 query per line as LANG<TAB>KIND<TAB>QUERY. Both depend only on WORDS.json and the seed.
 
@@ -93,6 +97,9 @@ def queries(rng, lang, words, lits):
     for k in kinds:
         text, content = rng.choice(lits)
         w = rng.choice(content)
+        if len(w) < 4 and k in ("prefix", "fuzzy", "wildcard"):
+            # too short to cut or change
+            k = "word"
         if k == "word":
             q = w
         elif k == "and":

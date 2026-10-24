@@ -10,8 +10,8 @@
 # and javac and java from the JDK its wrapper uses. FUSEKI overrides the fuseki-server
 # executable. The inputs are words of the Snowball project's test vocabularies (English,
 # French, Spanish, Italian, Portuguese, German and Russian), words of the OpenTaal Dutch
-# and the DSSO Swedish dictionaries, and generated lines that mix those words with
-# punctuation, numbers and CJK text.
+# dictionary, Swedish words written for these tests, and generated lines that mix those
+# words with punctuation, numbers and CJK text.
 set -euo pipefail
 ROOT=$(cd "$(dirname "$0")/../.." && pwd)
 WORK=$(mktemp -d)

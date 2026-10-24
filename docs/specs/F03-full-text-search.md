@@ -854,11 +854,11 @@ literal is indexed a second time with its language's analyzer and a search with
   multilingual support. The literals mix inflected forms with stop words, and each word
   family is a set of forms that Lucene's analyzer or Snowball's stemmer reduces to one
   stem. Of 1,590 stemmed queries (words, conjunctions, stop words, prefixes, fuzzy
-  words, wildcards and phrases), 1,300 match the same literals with the default
-  Snowball analyzers. German, Dutch, Russian and Swedish agree on 634 of 671, English on
+  words, wildcards and phrases), 1,302 match the same literals with the default
+  Snowball analyzers. German, Dutch, Russian and Swedish agree on 636 of 671, English on
   172 of 191, and French, Spanish, Italian and Portuguese on 494 of 728, because Lucene
   uses Porter's stemmer for English and light stemmers for French, Spanish, Italian,
-  Portuguese and German. With the analyzers that follow Lucene's, described below, 1,573
+  Portuguese and German. With the analyzers that follow Lucene's, described below, 1,576
   queries agree.
 - *Benchmark.* `scripts/bench-text.sh` indexes the English titles stemmed in both engines
   and has a seventh query, `"+theories +42"` with `lang:en`. On 210,509 triples Sparkles
@@ -1001,18 +1001,18 @@ existing indexes keep their configuration hash and their tokens.
   expressions are normalized as Lucene's analyzers normalize them, with elision for
   French and Italian and German normalization for German. No new crate is needed, as
   the Snowball stemmers are those of Tantivy's `rust-stemmers`.
-- *Checks.* Lucene's own tokens of 16,800 lines, words of the Snowball test
-  vocabularies and of the OpenTaal and DSSO dictionaries plus generated lines with
-  punctuation, numbers and CJK text, are fixtures in
+- *Checks.* Lucene's own tokens of 15,917 lines are fixtures in
   `crates/sparkles-core/tests/data/lucene-analyzers`, made by
-  `scripts/text-lucene-compare/tokens.sh`. Every analyzer produces the same tokens and
-  positions as Lucene on every line. Over the full vocabularies, about 320,000 words, no
-  stem differs.
-- *Agreement.* With these analyzers selected, 1,573 of the 1,590 queries of the
+  `scripts/text-lucene-compare/tokens.sh` from words of the Snowball test vocabularies,
+  of the OpenTaal Dutch word list and of Swedish inflections written for the tests, and
+  from generated lines with punctuation, numbers and CJK text. Every analyzer produces
+  the same tokens and positions as Lucene on every line. Over the full vocabularies and
+  a Swedish dictionary, about 320,000 words, no stem differs.
+- *Agreement.* With these analyzers selected, 1,576 of the 1,590 queries of the
   comparison above match the same literals as Fuseki. Each language agrees except on
   queries whose words are all stop words: `it`, `"as they"`, `seriez`, `"serai ces"`,
   `"quel aurait"`, `hayas`, `faremmo`, `"avessero contro"`, `delas`, `hin`,
-  `"muss ihrem"`, `ben`, `говорил`, `åt`, `"nu åt"`, `"när ni"` and `"här kan"`.
+  `"muss ihrem"`, `ben`, `говорил` and `hon`.
   jena-text then searches the language field alone and returns every literal of the
   language, where Sparkles answers `400` because no word is left to search for. This
   difference is kept on purpose.
