@@ -590,8 +590,11 @@ cost does not grow with the dataset.
     again, so its list is complete only when the exact total equals the number listed.
     Otherwise the panel says it cannot tell, and the overlay validates again after the
     update runs.
-13. **The list view.** Explore's node-link canvas has no list view, so the overlay has its
-    own **Nodes with results** table with a Validation column.
+13. **The list view.** When Phase 4 was built, Explore's node-link canvas had no list
+    view, so the overlay has its own **Nodes with results** table with a Validation column.
+    The **List** view that U10 added shows the same column beside the lens columns. The
+    overlay validates the nodes the canvas draws, which include the path finder's nodes
+    and leave out a comparison's ghosts.
 14. **Pausing.** The overlay waits while the graph's history plays, through a callback that
     TimeSlider gained, and it validates the drawn nodes 150 ms after they stop changing.
 15. **The graph a fix writes.** A result does not name its graph, so the overlay reads the
@@ -601,7 +604,10 @@ cost does not grow with the dataset.
     data graph that is the default graph gives plain updates, one named graph wraps every pattern in
     `GRAPH <g> { }`, and `union`, several graphs or a failed read give `GRAPH ?graph { }`
     with the placeholder `?graph` to fill in or remove. The shapes-graph and editor sources
-    validate the default graph.
+    validate the default graph. Their fixes are plain updates, unless the server serves
+    the union as the default graph or the flag could not be read, and then they hold
+    `GRAPH ?graph { }`. `GET /$/validation/{ds}` carries the flag without a configuration
+    too.
 16. **Stored blank nodes as targets.** A `target` that is a stored blank node's label names
     that stored node even when the shapes come from the body, whose own blank nodes are
     local to the shapes.

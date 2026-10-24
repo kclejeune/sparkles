@@ -8498,6 +8498,7 @@ export interface components {
         /** @description `{language, config, status}`, or `{config: null}` without validation. */
         ValidationStatus: {
             config: null;
+            unionDefaultGraph?: boolean;
         } | {
             config: components["schemas"]["ValidationConfig"];
             /** @enum {string} */

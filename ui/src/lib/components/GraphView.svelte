@@ -711,6 +711,8 @@
       });
     });
     writeTestData();
+    // a size lens changes the nodes' sizes, which moves the corners the badges sit on
+    if (validation?.badges.size) schedulePlace();
   }
 
   /** Ring the marked nodes and fade the rest. */

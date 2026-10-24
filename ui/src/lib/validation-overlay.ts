@@ -502,6 +502,20 @@ export function fixGraph(
   return 'choose';
 }
 
+/**
+ * The graph a fix writes for a source of the overlay: the guard's graph for the guard. The
+ * shapes-graph and editor sources validate the default graph, which is the union of the
+ * graphs on a union-default server, and `unionDefault` is null until it is known.
+ */
+export function sourceFixGraph(
+  kind: 'guard' | 'graph' | 'editor',
+  guardGraph: string | null | 'choose',
+  unionDefault: boolean | null,
+): string | null | 'choose' {
+  if (kind === 'guard') return guardGraph;
+  return unionDefault === false ? null : 'choose';
+}
+
 /** The datatype IRI of a ShEx constraint such as `xsd:integer` or `<http://…>`, or null. */
 export function expandIri(text: string, prefixes: PrefixMap): string | null {
   const t = text.trim();

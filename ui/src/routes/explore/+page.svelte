@@ -61,9 +61,9 @@
   import LensMenu from '$components/LensMenu.svelte';
   import LensLegend from '$components/LensLegend.svelte';
   import { describe as lensDescribe, entryIds, OTHER } from '$lib/lens';
-  import { Lenses } from '$lib/lenses.svelte';
+  import { Lenses, type LensColumn } from '$lib/lenses.svelte';
   import ValidationOverlay from '$components/ValidationOverlay.svelte';
-  import type { VResult } from '$lib/validation-overlay';
+  import { MARK, type Badge, type VResult } from '$lib/validation-overlay';
   import { load as loadPref, save as savePref } from '$lib/storage';
 
   type ENode = {
@@ -198,13 +198,10 @@
     loadPref<boolean | null>('sparkles.explore.validation', null),
   );
   let vLive = $state(false);
-  let vBadges = $state(new Map());
+  let vBadges = $state(new Map<string, Badge>());
   let vMarked = $state<{ nodes: string[]; edges: string[] } | null>(null);
   let vPlaying = $state(false);
   let overlay: ValidationOverlay | undefined = $state();
-  const vItems = $derived(
-    Object.values(nodes).map((n) => ({ id: n.id, term: n.term, label: n.label })),
-  );
   function toggleValidation() {
     vChoice = !(vChoice ?? vLive);
     savePref('sparkles.explore.validation', vChoice);
@@ -519,6 +516,24 @@
     return [...marked, ...extra];
   });
   const nodeCount = $derived(Object.keys(nodes).length);
+
+  // --- the validation overlay's drawn nodes and list column ---
+  // the nodes the canvas draws, path finder nodes included and ghosts left out
+  const vItems = $derived(
+    gNodes.flatMap((n) =>
+      n.term && n.change !== 'removed' ? [{ id: n.id, term: n.term, label: n.label }] : [],
+    ),
+  );
+  /** The list view's Validation column (U07 §11.2). */
+  const vColumn = $derived<LensColumn | null>(
+    vLive && vChoice !== false && vBadges.size
+      ? {
+          channel: 'badge',
+          title: 'Validation',
+          cells: new Map([...vBadges].map(([id, b]) => [id, `${MARK[b.worst]} ${b.words}`])),
+        }
+      : null,
+  );
 
   // --- the path finder (docs/specs/U09-path-finder.md) ----------------------------------
 
@@ -2017,7 +2032,7 @@
             {/if}
           </div>
           <SelectionBar onopengraph={openSelectionAsGraph} />
-          {#if ds && nodeCount && vChoice !== false}
+          {#if ds && vItems.length && vChoice !== false}
             <ValidationOverlay
               bind:this={overlay}
               {ds}
@@ -2123,7 +2138,7 @@
                   rows={listRows}
                   plain
                   label="Drawn nodes"
-                  lensColumns={lenses.columns}
+                  lensColumns={vColumn ? [...lenses.columns, vColumn] : lenses.columns}
                   selected={selectedId}
                   onselect={select}
                   openLabel="Focus"

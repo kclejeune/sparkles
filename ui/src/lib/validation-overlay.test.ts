@@ -5,6 +5,7 @@ import {
   componentKind,
   countsText,
   fixGraph,
+  sourceFixGraph,
   focusable,
   fromShacl,
   fromShex,
@@ -288,5 +289,15 @@ describe('review round 2: coverage of the selected shape and the union default g
     expect(fixGraph(['urn:x-arq:DefaultGraph'], true)).toBe('choose');
     expect(fixGraph(['http://g/1'], true)).toBe('http://g/1');
     expect(fixGraph('default', false)).toBeNull();
+  });
+});
+
+describe('merge review: the graph of a fix for each source', () => {
+  it('the shapes-graph and editor sources name a graph on a union-default server', () => {
+    expect(sourceFixGraph('guard', 'http://g/1', true)).toBe('http://g/1');
+    expect(sourceFixGraph('graph', 'http://g/1', false)).toBeNull();
+    expect(sourceFixGraph('graph', null, true)).toBe('choose');
+    expect(sourceFixGraph('editor', null, true)).toBe('choose');
+    expect(sourceFixGraph('editor', null, null)).toBe('choose');
   });
 });

@@ -24,6 +24,7 @@
     badges as toBadges,
     countsText,
     fixGraph,
+    sourceFixGraph,
     focusable,
     groupResults,
     MARK,
@@ -101,14 +102,16 @@
 
   /** Where the guard's results live, for suggested fixes (`choose` until known). */
   let guardGraph = $state<FixGraph>('choose');
-  // the shapes-graph and editor sources validate the default graph
-  const graphOfFix = $derived<FixGraph>(sourceKind === 'guard' ? guardGraph : null);
+  /** Whether the server serves the union as the default graph, null until known. */
+  let unionDefault = $state<boolean | null>(null);
+  const graphOfFix = $derived<FixGraph>(sourceFixGraph(sourceKind, guardGraph, unionDefault));
 
   $effect(() => {
     const name = ds;
     probe = null;
     probeError = null;
     guardGraph = 'choose';
+    unionDefault = null;
     const ctl = new AbortController();
     probeGuard(name, ctl.signal)
       .then((p) => {
@@ -117,12 +120,15 @@
         // without a guard the editor's shapes are the source (§11.2)
         if (p.state === 'none') sourceKind = editorShapes ? 'editor' : 'graph';
         else sourceKind = 'guard';
-        // the guard's data graph, which a suggested fix writes (unknown: the person chooses)
-        if (p.state === 'shacl' || p.state === 'shex')
+        // the guard's data graph and the union default, which decide the graph a fix writes
+        // (unknown: the person chooses)
+        if (p.state !== 'restricted' && p.state !== 'unavailable')
           api
-            .writeValidation(name, ctl.signal)
-            .then((w) => {
-              if (ds === name) guardGraph = fixGraph(w?.config.dataGraph, w?.unionDefaultGraph);
+            .writeValidationState(name, ctl.signal)
+            .then(({ validation: w, unionDefaultGraph }) => {
+              if (ds !== name) return;
+              unionDefault = unionDefaultGraph;
+              guardGraph = w ? fixGraph(w.config.dataGraph, unionDefaultGraph) : 'choose';
             })
             .catch(() => {
               if (ds === name) guardGraph = 'choose';
@@ -203,7 +209,27 @@
     void head;
     const src = source;
     const state = at;
-    if (paused || !src || !available || !isLive) return;
+    // a run for the earlier drawing, source or state never finishes into this one
+    untrack(() => {
+      ctl?.abort();
+      ctl = null;
+      validating = false;
+      progress = null;
+    });
+    if (!src || !available || !isLive) {
+      untrack(() => {
+        results = [];
+        validatedAt = null;
+      });
+      return;
+    }
+    // results read at another state than the one shown are dropped (a playing history)
+    if (untrack(() => validatedAt?.at) !== state)
+      untrack(() => {
+        results = [];
+        validatedAt = null;
+      });
+    if (paused) return;
     const nodes = untrack(() => targets);
     if (!nodes.length) {
       results = [];

@@ -2997,6 +2997,24 @@ export async function writeValidation(
 }
 
 /**
+ * `GET /$/validation/{ds}` with the server's union-default flag, which the answer carries
+ * with a configuration and without one.
+ */
+export async function writeValidationState(
+  ds: string,
+  signal?: AbortSignal,
+): Promise<{ validation: WriteValidation | null; unionDefaultGraph: boolean }> {
+  const body = await json<(WriteValidation | { config: null }) & { unionDefaultGraph?: boolean }>(
+    `/$/validation/${enc(ds)}`,
+    { signal, cache: 'no-store' },
+  );
+  return {
+    validation: body && body.config ? (body as WriteValidation) : null,
+    unionDefaultGraph: !!body?.unionDefaultGraph,
+  };
+}
+
+/**
  * `PUT /$/validation/{ds}` in warn mode with inline shapes (SHACL Turtle) or an inline ShEx
  * schema and its shape map. It replaces any configuration the dataset has; needs admin.
  */

@@ -322,6 +322,12 @@ async fn status_reports_the_union_default_graph() {
         let st = Arc::new(AppState::new(dir.path(), opts, Duration::from_secs(30)).unwrap());
         st.create("v", DbType::Persistent).unwrap();
         let app = router(st.clone());
+        // the overlay's shapes-graph and editor sources need it without a guard too
+        let none = send(&app, req("GET", "/$/validation/v", "", ""))
+            .await
+            .json();
+        assert_eq!(none["config"], J::Null, "{none}");
+        assert_eq!(none["unionDefaultGraph"], json!(union), "{none}");
         assert_eq!(enable(&app, "warn").await.status, StatusCode::OK);
         let got = send(&app, req("GET", "/$/validation/v", "", ""))
             .await

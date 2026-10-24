@@ -1711,8 +1711,9 @@ the dataset can be named by its IRI. The shapes the Validate panel of the datase
 last validated with can be used too, and without a guard they are the default. A node
 with results gets a badge with its count and its worst severity, `✕` for a violation,
 `⚠` for a warning and `ⓘ` for an info. A literal drawn as the value of a result gets the
-same mark. **Nodes with results** lists them with a Validation column, such as
-"1 violation".
+same mark. The overlay validates every node the canvas draws, including the nodes the
+path finder adds. **Nodes with results** lists them with a Validation column, such as
+"1 violation", and the canvas's **List** view has the same column.
 
 A click on a badge opens the node's results, grouped by shape and constraint, with the
 path, the value and the messages. `V` opens the results of the selected node, and
@@ -1727,7 +1728,8 @@ terms, and what the result does not say is a placeholder such as `?value`, which
 filled in before **Preview** runs. When the guard's data graph is one named graph, the
 update writes that graph. When it is several graphs, or the default graph of a server
 started with `--union-default-graph`, the update holds `GRAPH ?graph` for the graph that
-holds the triple. Preview is a dry run of the update
+holds the triple. A shapes graph or the Validate panel's shapes validate the default
+graph, so on such a server their updates hold `GRAPH ?graph` too. Preview is a dry run of the update
 ([C15](specs/C15-write-previews.md)). It lists the changes and says whether the guard
 would still report the result, or that the guard's answer does not tell, as when it
 validated only some of the shapes and the state still has results it did not list. **Run** commits the update only after a preview of the same

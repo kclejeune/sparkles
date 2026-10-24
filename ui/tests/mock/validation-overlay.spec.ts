@@ -25,7 +25,9 @@ test.beforeAll(async ({ request }) => {
     data: `PREFIX ex: <${EX}> INSERT DATA {
       ex:p1 a ex:Person ; ex:knows ex:p2, ex:p3, ex:p4 .
       ex:p2 a ex:Person . ex:p3 a ex:Person .
-      ex:p4 a ex:Person ; ex:name "Dee" ; ex:email "a@x" . }`,
+      ex:p4 a ex:Person ; ex:name "Dee" ; ex:email "a@x" .
+      ex:p3 ex:knows ex:p5 .
+      ex:p5 a ex:Person ; <http://www.w3.org/2000/01/rdf-schema#label> "Eve" . }`,
   });
   expect(u.ok()).toBe(true);
   const g = await request.put('/$/validation/quality', {
@@ -134,6 +136,52 @@ test('review: closing a playing history does not leave the overlay paused', asyn
   await page.getByRole('button', { name: 'Graph history' }).click();
   await expect(overlay).not.toContainText('Paused while the history plays.');
   await expect.poll(async () => Object.keys(await badgesOf(page)).length).toBe(4);
+});
+
+test('merge review: a node the path finder draws is validated too', async ({ page }) => {
+  await open(page);
+  expect((await badgesOf(page))[`<${EX}p5>`]).toBeUndefined();
+  await page.getByRole('button', { name: 'Paths', exact: true }).click();
+  const paths = page.getByRole('region', { name: 'Paths' });
+  await paths.getByRole('combobox', { name: 'To' }).fill('Eve');
+  await paths.getByRole('option', { name: /Eve/ }).first().click();
+  await paths.getByRole('button', { name: 'Find paths' }).click();
+  await expect
+    .poll(async () => (await badgesOf(page))[`<${EX}p5>`], { timeout: 15_000 })
+    .toBe('✕1');
+});
+
+test('merge review: a source without shapes drops the badges', async ({ page }) => {
+  await open(page);
+  const overlay = page.getByRole('region', { name: 'Validation overlay' });
+  await overlay.getByRole('combobox', { name: 'Validation source' }).selectOption('graph');
+  await expect.poll(async () => Object.keys(await badgesOf(page)).length).toBe(0);
+});
+
+test('merge review: the List view has a Validation column', async ({ page }) => {
+  await open(page);
+  await page.getByRole('button', { name: 'List', exact: true }).click();
+  const header = page.getByRole('columnheader', { name: 'Validation' });
+  await expect(header).toBeVisible();
+  const row = page.getByRole('row').filter({ hasText: 'p2' }).first();
+  await expect(row).toContainText('1 violation');
+});
+
+test('merge review: badges follow their nodes when a size lens changes them', async ({ page }) => {
+  await open(page);
+  const badge = page.getByRole('button', { name: /p1, 1 violation/ });
+  await page.waitForTimeout(500);
+  const before = (await badge.boundingBox())!;
+  await page.getByRole('button', { name: /^Lenses/ }).click();
+  const menu = page.getByRole('dialog', { name: 'Lenses' });
+  await menu.getByRole('combobox', { name: 'Size' }).selectOption('degree');
+  await page.keyboard.press('Escape');
+  await expect
+    .poll(async () => {
+      const b = (await badge.boundingBox())!;
+      return Math.abs(b.x - before.x) + Math.abs(b.y - before.y);
+    })
+    .toBeGreaterThan(2);
 });
 
 test('A11: a suggested fix is previewed, run, and its badge goes away', async ({ page }) => {
