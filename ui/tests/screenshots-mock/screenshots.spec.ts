@@ -704,6 +704,82 @@ GROUP BY ?p ORDER BY DESC(?n) ?p LIMIT 1`,
   await shoot(page, 'explore-algo-lenses');
 });
 
+test('explore-why', async ({ page, request }) => {
+  // why is this inferred? the dashed edge's derivation tree beside the graph, with its
+  // premises drawn and highlighted by Show on graph
+  const ds = 'staff';
+  const r = await request.post('/$/datasets', { data: { dbName: ds, dbType: 'persistent' } });
+  expect(r.ok() || r.status() === 409).toBe(true);
+  if (r.ok()) {
+    const u = await request.post(`/${ds}/update`, {
+      headers: { 'Content-Type': 'application/sparql-update' },
+      data: `PREFIX ex: <http://example.org/ontology#>
+PREFIX res: <http://example.org/resource/>
+PREFIX rdfs: <http://www.w3.org/2000/01/rdf-schema#>
+INSERT DATA {
+  ex:Manager rdfs:subClassOf ex:Employee . ex:Employee rdfs:subClassOf ex:Person .
+  ex:manages rdfs:domain ex:Manager . ex:manages rdfs:range ex:Team .
+  res:alice a ex:Manager ; ex:manages res:team7 ; ex:knows res:bob , res:carol ; rdfs:label "Alice Ng" .
+  res:bob ex:memberOf res:team7 ; rdfs:label "Bob Diaz" . res:carol rdfs:label "Carol Ito" .
+  res:team7 rdfs:label "Team 7" .
+}`,
+    });
+    expect(u.ok()).toBe(true);
+    const t = await request.post(`/$/reason/${ds}`, { form: { profile: 'rdfs' } });
+    expect(t.ok()).toBe(true);
+    await expect
+      .poll(async () => (await (await request.get(`/$/reason/${ds}`)).json()).profile, {
+        timeout: 20_000,
+      })
+      .toBe('rdfs');
+  }
+  await page.addInitScript((d) => localStorage.setItem('sparkles.dataset', d), ds);
+  await page.goto(
+    `/ui/explore?ds=${ds}&iri=${encodeURIComponent('http://example.org/resource/alice')}`,
+  );
+  const graph = page.locator('.wrap[data-graph]');
+  await expect(graph).toBeVisible({ timeout: 30_000 });
+  await expect
+    .poll(async () => {
+      const g = JSON.parse((await graph.getAttribute('data-graph')) ?? '{"edges":[]}');
+      return (g.edges as [string, string, string][]).some(([, , i]) => i === 'inferred');
+    })
+    .toBe(true);
+  await expect
+    .poll(async () => {
+      const g = JSON.parse((await graph.getAttribute('data-graph')) ?? '{"nodes":[]}');
+      return (g.nodes as [string][]).map(([l]) => l);
+    })
+    .toEqual(expect.arrayContaining(['Alice Ng', 'Person']));
+  // the dashed edge from alice to Person, two subclass steps above her asserted type
+  const at = await page
+    .locator('.wrap canvas')
+    .first()
+    .evaluate((canvas) => {
+      type Node = { data(k: string): unknown };
+      type Edge = { source(): Node; target(): Node; renderedMidpoint(): { x: number; y: number } };
+      let el: HTMLElement | null = canvas.parentElement;
+      while (el && !('_cyreg' in el)) el = el.parentElement;
+      const cy = (el as unknown as { _cyreg: { cy: { edges(): Edge[] } } })._cyreg.cy;
+      const e = [...cy.edges()].find(
+        (x) => x.source().data('label') === 'Alice Ng' && x.target().data('label') === 'Person',
+      )!;
+      const p = e.renderedMidpoint();
+      const box = el!.getBoundingClientRect();
+      return { x: box.left + p.x, y: box.top + p.y };
+    });
+  await page.mouse.click(at.x, at.y);
+  const panel = page.getByTestId('why-panel');
+  await expect(panel.getByRole('tree')).toBeVisible();
+  await panel.getByRole('button', { name: 'Show on graph' }).click();
+  await expect
+    .poll(async () => Number(await page.locator('.wrap').first().getAttribute('data-whymarked')))
+    .toBeGreaterThan(8);
+  await page.getByRole('button', { name: 'Fit to view' }).click();
+  await settle(page, graph);
+  await shoot(page, 'explore-why');
+});
+
 test('pattern-edit', async ({ page }) => {
   // building on the canvas: + Edge from ?person, with the predicate picker ranked by the
   // profile of ex:Person, and a waiting class node beside the drawing

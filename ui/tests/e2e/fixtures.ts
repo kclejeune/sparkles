@@ -36,7 +36,10 @@ export const server = {
   get token() {
     return env('SPARKLES_E2E_TOKEN');
   },
-  /** A static token whose grant covers only the default graph of `overlay-limited`. */
+  /**
+   * A static token whose grant covers only the default graph of `overlay-limited`, and the
+   * hr and inferred graphs of `why-limited`.
+   */
   get limitedToken() {
     return env('SPARKLES_E2E_LIMITED_TOKEN');
   },

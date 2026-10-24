@@ -150,7 +150,8 @@ export default async function globalSetup(_config: FullConfig) {
   // A static token (spk_ + 43 base64url characters), stored in the config as its sha256.
   const token = `spk_${randomBytes(32).toString('base64url')}`;
   // a static token whose grant covers only the default graph of overlay-limited, for
-  // the validation overlay's restricted caller (U07 §11.8, A13)
+  // the validation overlay's restricted caller (U07 §11.8, A13), and the hr graph and
+  // the inferred graph of why-limited, for the hidden premise of U10 A9
   const limited = `spk_${randomBytes(32).toString('base64url')}`;
   const hashed = spawnSync(bin, ['auth', 'hash'], { input: `${PASSWORD}\n`, encoding: 'utf8' });
   if (hashed.status !== 0) throw new Error(`sparkles auth hash failed: ${hashed.stderr}`);
@@ -212,6 +213,11 @@ hash = "sha256:${createHash('sha256').update(limited).digest('hex')}"
 dataset = "overlay-limited"
 level = "read"
 graphs = ["urn:x-arq:DefaultGraph"]
+
+[[tokens.grants]]
+dataset = "why-limited"
+level = "read"
+graphs = ["http://example.org/hr", "urn:x-sparkles:inferred"]
 `,
     { mode: 0o600 },
   );
