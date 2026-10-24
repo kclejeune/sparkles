@@ -905,6 +905,11 @@ class Requests(Base):
             KEY, json.dumps(leaf_environment({"SPARKLES_EVAL_GATE_TOKEN": proxy.token}))
         )
         self.assertIn(f"127.0.0.1:{server.server_port}", config)
+        # The context is the server's default unless the run sets it.
+        provider = proxy.config()["models"]["providers"]["evaluation"]
+        self.assertNotIn("contextTokens", provider)
+        provider = proxy.config(200000)["models"]["providers"]["evaluation"]
+        self.assertEqual(provider["contextTokens"], 200000)
 
     def test_requests_and_replies_are_recorded_without_the_key(self):
         echo = dict(REPLY, content=[{"type": "text", "text": "key " + KEY}])

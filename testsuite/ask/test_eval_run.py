@@ -62,6 +62,7 @@ class LoadRun(unittest.TestCase):
             localCapNanodollars=50_000_000_000,
             carryover={"name": "fresh-20261024", "nanodollars": 0},
             clarifications="score",
+            contextTokens=200000,
         )
         self.assertEqual(self.load(run)["clarifications"], "score")
 
@@ -75,6 +76,8 @@ class LoadRun(unittest.TestCase):
             {"localCapNanodollars": 50_000_000_000},
             {"localCapNanodollars": 0},
             {"clarifications": "guess"},
+            {"contextTokens": 0},
+            {"contextTokens": "200000"},
         ):
             with self.subTest(change=change), self.assertRaises(Invalid):
                 self.load(dict(copy.deepcopy(RUN), **change))

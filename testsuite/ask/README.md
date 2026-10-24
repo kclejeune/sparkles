@@ -194,7 +194,10 @@ the models of each set, the effort, `maxOutputTokens`, the request and Ask timeo
 query timeout, the cap, the carryover, the ledger, the output directory and the binary
 with its SHA256. The carryover is required, zero for a fresh authorization, and the cap
 plus the carryover cannot pass USD 50. `clarifications` is `answer` unless the run file
-sets `score`. A real run refuses a second `.jsonl` file in the ledger directory, so the ledger
+sets `score`. `contextTokens` gives every model its context window. Without it the server
+assumes 8192 tokens, treats each model as a small one and trims the grounding to 30
+classes, 60 predicates, two examples and three candidates per mention, which is how the
+first paid run asked. A real run refuses a second `.jsonl` file in the ledger directory, so the ledger
 file stays the account of record for the whole spend.
 
 `askTokenBudget` is the total token limit of one Ask. The default of 32768 ends most

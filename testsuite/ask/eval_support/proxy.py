@@ -930,8 +930,13 @@ class Proxy:
         self.server_port = server.server_port
         return server
 
-    def config(self):
-        """The model configuration of the children: one loopback provider."""
+    def config(self, context_tokens=None):
+        """The model configuration of the children: one loopback provider.
+
+        Without `context_tokens` every model has the server's default context of 8192
+        tokens, which makes Ask treat it as a small model and trim its grounding, as
+        the first paid run did.
+        """
         provider = {
             "kind": "anthropic",
             "endpoint": f"http://127.0.0.1:{self.server_port}",
@@ -943,6 +948,8 @@ class Proxy:
             "structuredOutput": "json-schema",
             "concurrency": 1,
         }
+        if context_tokens is not None:
+            provider["contextTokens"] = context_tokens
         return {
             "models": {
                 "providers": {"evaluation": provider},

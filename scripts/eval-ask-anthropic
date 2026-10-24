@@ -43,6 +43,7 @@ FIELDS = {
     "priorCaseCostNanodollars",
     "sets",
     "clarifications",
+    "contextTokens",
 }
 
 
@@ -78,6 +79,9 @@ def load_run(path):
         raise Invalid("a carryover with a name and nanodollars is required")
     if run["localCapNanodollars"] + carry["nanodollars"] > px.HARD_CAP:
         raise Invalid("the cap and the carryover pass the hard cap of one ledger")
+    context = run.get("contextTokens")
+    if context is not None and (type(context) is not int or not 0 < context <= 10**7):
+        raise Invalid("contextTokens is a positive integer")
     if run.get("clarifications", "answer") not in mod_clarifications():
         raise Invalid("unknown clarification policy")
     for set_ in run["sets"]:
@@ -246,6 +250,7 @@ def main():
         "maxOutputTokens": run["maxOutputTokens"],
         "askTokenBudget": run["askTokenBudget"],
         "clarifications": run.get("clarifications", "answer"),
+        "contextTokens": run.get("contextTokens"),
         "sets": {},
     }
     code = 2
@@ -267,7 +272,7 @@ def main():
                 )
                 + "\n"
             )
-        config = proxy.config()
+        config = proxy.config(run.get("contextTokens"))
         (out / "models.json").write_text(json.dumps(config, indent=2) + "\n")
         done = []
         for set_ in run["sets"] if not args.preflight_only else []:
