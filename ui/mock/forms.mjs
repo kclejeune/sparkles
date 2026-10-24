@@ -8,6 +8,7 @@
 // cannot check. A save checks the expected values, commits the change and, on a protected
 // `main`, goes to the session branch `edits.anonymous.{date}`.
 
+import { randomUUID } from 'node:crypto';
 import ox from 'oxigraph';
 import { WORLD } from './world.mjs';
 import { branchOf, MAIN } from './branches.mjs';
@@ -121,6 +122,15 @@ const LAYOUTS = new Map([
           },
         },
         {
+          path: `${WORLD}notes`,
+          label: 'Notes',
+          group: NETWORK.iri,
+          order: 2,
+          widget: 'text',
+          editor: 'http://datashapes.org/dash#TextAreaEditor',
+          constraints: { datatype: `${XSD}string`, maxCount: 1 },
+        },
+        {
           path: `${WORLD}knows`,
           label: 'Knows',
           description: 'People they work with directly.',
@@ -217,7 +227,9 @@ const valuesOf = (store, focus, path) => store.match(focus, named(path), null, n
 function model(ds, focusIri, opts) {
   const focus = named(focusIri);
   const store = ds.store;
-  const { types, layouts } = layoutsOf(store, focus);
+  const { types, layouts } = opts.class
+    ? { types: [opts.class], layouts: [LAYOUTS.get(opts.class)].filter(Boolean) }
+    : layoutsOf(store, focus);
   const fields = [];
   const groups = [];
   const covered = new Set([RDF_TYPE]);
@@ -237,6 +249,7 @@ function model(ds, focusIri, opts) {
         group: f.group,
         order: f.order,
         widget: f.widget,
+        ...(f.editor ? { editor: f.editor } : {}),
         constraints: f.constraints,
         sources: [l.shape],
         values: valuesOf(store, focus, f.path).map((q) => ({
@@ -259,7 +272,7 @@ function model(ds, focusIri, opts) {
   }
   return {
     formFormat: 1,
-    focus: focusIri,
+    focus: opts.class ? null : focusIri,
     types,
     commit: opts.head,
     branch: ds.branchName ?? MAIN,
@@ -277,6 +290,8 @@ function model(ds, focusIri, opts) {
   };
 }
 
+const mint = () => `urn:uuid:${randomUUID()}`;
+
 const today = () => new Date().toISOString().slice(0, 10).replaceAll('-', '');
 
 /** Where a save of a form opened on `branch` goes. */
@@ -290,7 +305,9 @@ function saveTarget(main, branch) {
 /** The update of a change: the quads to delete and to insert, or an error. */
 function plan(ds, body) {
   const focus = named(body.focus);
-  const { layouts } = layoutsOf(ds.store, focus);
+  const { layouts } = body.class
+    ? { layouts: [LAYOUTS.get(body.class)].filter(Boolean) }
+    : layoutsOf(ds.store, focus);
   const fields = new Map();
   for (const l of layouts) for (const f of l.fields) fields.set(idOf(f.path), f);
   const del = [];
@@ -309,6 +326,7 @@ function plan(ds, body) {
     }
     changed.push(f);
   }
+  if (body.class) ins.push(ox.quad(focus, named(RDF_TYPE), named(body.class), ox.defaultGraph()));
   if (!del.length && !ins.length) return { error: [400, { error: 'the change changes nothing' }] };
   return { focus, del, ins, changed, layouts };
 }
@@ -395,17 +413,14 @@ export async function handleForms(req, res, url, seg, ctx) {
   if (!ds) return (fail(res, 404, `no such dataset: /${name}`), true);
   const head = (b) => ctx.headCommit(b).seq;
   if (req.method === 'GET' && seg.length === 3) {
-    const focus = url.searchParams.get('focus')?.trim().replace(/^<|>$/g, '');
+    const cls = url.searchParams.get('class')?.trim() || null;
+    const focus = cls ? mint() : url.searchParams.get('focus')?.trim().replace(/^<|>$/g, '');
     if (!focus) return (fail(res, 400, "missing 'focus': the IRI of a resource"), true);
-    if (url.searchParams.get('class'))
-      return (
-        fail(res, 501, 'forms for new instances (class=) come with phase 2 of the forms'), true
-      );
     const main = ctx.mainOf(name);
     const opened = ds.branchName ?? MAIN;
     const save = saveTarget(main, opened);
     const at = url.searchParams.get('at');
-    const m = model(ds, focus, { head: head(ds), editable: !at });
+    const m = model(ds, focus, { head: head(ds), editable: !at, class: cls });
     send(res, 200, {
       ...m,
       save: { ...save, mainProtected: !!main.protected },
@@ -421,6 +436,7 @@ export async function handleForms(req, res, url, seg, ctx) {
   } catch (e) {
     return (fail(res, 400, `invalid JSON: ${e.message}`), true);
   }
+  if (typeof body.class === 'string' && body.class) body.focus = mint();
   if (typeof body.focus !== 'string' || !Array.isArray(body.changes))
     return (fail(res, 400, 'focus and changes are required'), true);
   const main = ctx.mainOf(name);
@@ -482,6 +498,7 @@ export async function handleForms(req, res, url, seg, ctx) {
   });
   send(res, 200, {
     ...receipt,
+    focus: body.focus,
     branch: save.branch,
     branchCreated: !save.exists,
   });

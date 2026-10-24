@@ -3,6 +3,7 @@ import * as api from './api';
 import type { Term } from './api';
 import { CANDIDATES_PER_QUERY, candidateQuery, edgeIdOf, type EdgeTriple } from './explore-time';
 import { sparqlIri, sparqlString } from './rdf';
+import { escapeTextQuery, TEXT_NS } from './textsearch';
 
 const P = `PREFIX rdf: <http://www.w3.org/1999/02/22-rdf-syntax-ns#>
 PREFIX rdfs: <http://www.w3.org/2000/01/rdf-schema#>
@@ -64,6 +65,70 @@ LIMIT 25`,
     { ...opts, signal },
   );
   return rows.map((r) => ({ iri: v(r.s)!, label: v(r.label) })).filter((h) => h.iri);
+}
+
+/**
+ * The query of an instance search for a form's entity picker (U02 Phase 2): resources
+ * whose label holds `text`, limited to instances of `classes` (or their subclasses) when
+ * there are some. With `fullText`, the dataset's full-text index finds the labels and
+ * ranks the hits.
+ */
+export function instanceSearchQuery(text: string, classes: string[], fullText: boolean): string {
+  const typed = classes.length
+    ? `  ?s rdf:type/rdfs:subClassOf* ?class .\n  VALUES ?class { ${classes.map(sparqlIri).join(' ')} }\n`
+    : '';
+  if (fullText) {
+    const q = sparqlString(escapeTextQuery(text.trim()));
+    return `${P}PREFIX text: <${TEXT_NS}>
+SELECT ?s (SAMPLE(?l) AS ?label) (MAX(?score) AS ?best) WHERE {
+  (?s ?score ?literal ?graph ?predicate) text:query (${q} 200) .
+  FILTER(isIRI(?s))
+${typed}  OPTIONAL { ?s ${LABEL_PATH} ?l }
+}
+GROUP BY ?s
+ORDER BY DESC(?best)
+LIMIT 25`;
+  }
+  const q = sparqlString(text.toLowerCase());
+  return `${P}
+SELECT ?s (SAMPLE(?l) AS ?label) WHERE {
+  {
+    ?s ${LABEL_PATH} ?l .
+    FILTER(CONTAINS(LCASE(STR(?l)), ${q}))
+  } UNION {
+    ?s ?p ?o .
+    FILTER(isIRI(?s) && CONTAINS(LCASE(STR(?s)), ${q}))
+    OPTIONAL { ?s rdfs:label ?l }
+  }
+  FILTER(isIRI(?s))
+${typed}}
+GROUP BY ?s
+LIMIT 25`;
+}
+
+/**
+ * Search instances for a form's entity picker. A full-text search that fails, as on a
+ * dataset whose index is still building, falls back to matching labels.
+ */
+export async function searchInstances(
+  ds: string,
+  text: string,
+  o: { classes?: string[]; fullText?: boolean; signal?: AbortSignal } = {},
+): Promise<SearchHit[]> {
+  const run = async (fullText: boolean) => {
+    const rows = await api.select(ds, instanceSearchQuery(text, o.classes ?? [], fullText), {
+      ...opts,
+      signal: o.signal,
+    });
+    return rows.map((r) => ({ iri: v(r.s)!, label: v(r.label) })).filter((h) => h.iri);
+  };
+  if (!o.fullText) return run(false);
+  try {
+    return await run(true);
+  } catch (e) {
+    if (e instanceof DOMException && e.name === 'AbortError') throw e;
+    return run(false);
+  }
 }
 
 export type Neighbour = { predicate: string; term: Term; label?: string; incoming: boolean };

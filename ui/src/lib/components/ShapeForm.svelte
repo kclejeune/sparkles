@@ -54,11 +54,14 @@
     oncancel,
     onsaved,
     ondraft,
+    cls,
   }: {
     /** The dataset (its main). */
     ds: string;
-    /** The resource the form edits. */
+    /** The resource the form edits (empty for a new instance). */
     iri: string;
+    /** A new instance of this class instead of `iri` (U02 Phase 2). */
+    cls?: string;
     /** The branch the form is open on; a save to a new session branch moves it there. */
     branch?: string | null;
     prefixes: PrefixMap;
@@ -116,7 +119,12 @@
     loading = true;
     loadError = null;
     try {
-      const m = await getForm(ds, iri, { branch, lang, signal: c.signal });
+      const m = await getForm(ds, iri, {
+        branch,
+        lang,
+        signal: c.signal,
+        ...(cls ? { class: cls } : {}),
+      });
       if (c !== ctl) return;
       model = m;
       entries = Object.fromEntries(m.fields.map((f) => [f.id, entriesOf(f, m)]));
@@ -136,8 +144,21 @@
   $effect(() => {
     void ds;
     void iri;
+    void cls;
     untrack(() => load());
     return () => ctl?.abort();
+  });
+
+  /** The dataset's full-text index is ready: the entity pickers search with it. */
+  let fullText = $state(false);
+  $effect(() => {
+    const name = ds;
+    api.textStatus(name).then(
+      (t) => {
+        if (name === ds) fullText = t?.state === 'ready';
+      },
+      () => (fullText = false),
+    );
   });
 
   $effect(() => {
@@ -204,12 +225,13 @@
     const v = f?.values.find((x) => x.term.type === 'literal');
     return v && v.term.type === 'literal' ? v.term.value : displayIri(iri, prefixes);
   });
+  const heading = $derived(cls ? `New ${displayIri(cls, prefixes)}` : `Edit ${name}`);
   const openBranch = $derived(model?.branch ?? branch ?? MAIN);
   const branchInfo = $derived(branchList.find((b) => b.name === openBranch));
 
   function body() {
     return {
-      focus: iri,
+      ...(cls ? { class: cls } : { focus: iri }),
       ...(openBranch !== MAIN ? { branch: openBranch } : {}),
       changes: changes.changes,
       expect: changes.expect,
@@ -288,6 +310,8 @@
       message = '';
       if (a.branch !== openBranch) branch = a.branch === MAIN ? null : a.branch;
       onsaved?.(a);
+      // a new instance's page moves to the resource it made
+      if (cls) return;
       await load();
       api.branches(ds).then(
         (l) => (branchList = l.branches),
@@ -343,12 +367,12 @@
   );
 </script>
 
-<section class="sf" aria-label="Edit {name}">
+<section class="sf" aria-label={heading}>
   <header class="sf-head">
     <div class="sf-title">
       <h2>
         <Icon name="pencil" size={14} />
-        Edit {name}
+        {heading}
       </h2>
       {#if model?.types.length}
         <span class="faint small">{model.types.map((t) => displayIri(t, prefixes)).join(', ')}</span
@@ -545,6 +569,7 @@
               {ds}
               {prefixes}
               {lang}
+              {fullText}
             />
           {/each}
         </fieldset>

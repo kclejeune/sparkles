@@ -9,9 +9,12 @@
   import { displayIri } from '$lib/rdf';
   import Icon from '$components/Icon.svelte';
   import ShapeForm from '$components/ShapeForm.svelte';
+  import type { FormSaveAnswer } from '$lib/forms-api';
 
   const name = $derived(page.params.name ?? '');
   const iri = $derived(page.url.searchParams.get('iri')?.trim() ?? '');
+  /** `?class=`: the form of a new instance of the class. */
+  const cls = $derived(page.url.searchParams.get('class')?.trim() ?? '');
   const prefixes = $derived(app.prefixes(name));
   let branch = $state<string | null>(branchParam(page.url.searchParams.get('branch')));
 
@@ -19,9 +22,19 @@
     if (name) void app.loadPrefixes(name);
   });
 
+  /** After a new instance's first save, edit the resource it made. */
+  function saved(a: FormSaveAnswer) {
+    if (!cls || !a.focus) return;
+    const q = new URLSearchParams({ iri: a.focus });
+    if (a.branch && a.branch !== 'main') q.set('branch', a.branch);
+    goto(`${resolve('/datasets/[name]/edit', { name })}?${q}`, { replaceState: true });
+  }
+
   /** Keep the branch the form moved to in the URL, so a reload opens the same one. */
   $effect(() => {
     const b = branch;
+    // a new instance's save moves to the resource with its branch (see `saved`)
+    if (cls) return;
     const q = new URLSearchParams(page.url.searchParams);
     if ((q.get('branch') ?? null) === b) return;
     if (b) q.set('branch', b);
@@ -35,7 +48,12 @@
 </script>
 
 <svelte:head
-  ><title>Edit {iri ? displayIri(iri, prefixes) : 'a resource'} | Sparkles</title></svelte:head
+  ><title
+    >{cls
+      ? `New ${displayIri(cls, prefixes)}`
+      : `Edit ${iri ? displayIri(iri, prefixes) : 'a resource'}`}
+    | Sparkles</title
+  ></svelte:head
 >
 
 <div class="page page-container">
@@ -44,12 +62,22 @@
       href={resolve('/datasets/[name]', { name })}>{name}</a
     ><Icon name="chevron" size={12} /><span>Edit</span>
   </nav>
-  {#if !iri}
-    <p class="empty">Name the resource to edit with <span class="mono">?iri=</span>.</p>
+  {#if !iri && !cls}
+    <p class="empty">
+      Name the resource to edit with <span class="mono">?iri=</span>, or the class of a new instance
+      with <span class="mono">?class=</span>.
+    </p>
   {:else}
     <div class="form-wrap">
-      {#key `${name}|${iri}`}
-        <ShapeForm ds={name} {iri} bind:branch {prefixes} />
+      {#key `${name}|${iri}|${cls}`}
+        <ShapeForm
+          ds={name}
+          iri={cls ? '' : iri}
+          cls={cls || undefined}
+          bind:branch
+          {prefixes}
+          onsaved={saved}
+        />
       {/key}
     </div>
   {/if}

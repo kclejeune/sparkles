@@ -20,6 +20,7 @@
     describedby,
     invalid = false,
     disabled = false,
+    search,
     onpicked,
   }: {
     id: string;
@@ -35,6 +36,8 @@
     describedby?: string;
     invalid?: boolean;
     disabled?: boolean;
+    /** How to search, in place of Explore's label search. */
+    search?: (text: string, signal: AbortSignal) => Promise<ex.SearchHit[]>;
     onpicked?: () => void;
   } = $props();
 
@@ -94,7 +97,7 @@
       const c = (ctl = new AbortController());
       err = null;
       try {
-        hits = await ex.search(ds, q, c.signal);
+        hits = await (search ? search(q, c.signal) : ex.search(ds, q, c.signal));
       } catch (e) {
         if (!(e instanceof DOMException && e.name === 'AbortError')) err = api.errorMessage(e);
       } finally {

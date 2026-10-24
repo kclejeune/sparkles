@@ -225,3 +225,48 @@ open(
     expect(unnamed).toBe(0);
   },
 );
+
+open('A8: a dash:editor makes Name a text area', async ({ page, request }) => {
+  const ds = 'forms-a8';
+  const made = await request.post('/$/datasets', { data: { dbName: ds, dbType: 'mem' } });
+  expect(made.ok(), await made.text()).toBe(true);
+  const r = await request.post(`/${ds}/update`, {
+    headers: { 'Content-Type': 'application/sparql-update' },
+    data: DATA,
+  });
+  expect(r.ok()).toBe(true);
+  const shapes = SHAPES.replace(
+    'sh:name "Name" ;',
+    'sh:name "Name" ; <http://datashapes.org/dash#editor> <http://datashapes.org/dash#TextAreaEditor> ;',
+  );
+  const g = await request.put(`/$/validation/${ds}`, {
+    data: { mode: 'warn', shapes: { inline: shapes } },
+  });
+  expect(g.ok(), await g.text()).toBe(true);
+  const form = await openForm(page, ds);
+  const name = form.getByRole('textbox', { name: 'Name', exact: true });
+  expect(await name.evaluate((e) => e.tagName)).toBe('TEXTAREA');
+  await expect(name).toHaveValue('Alice Lima');
+});
+
+open('a new instance of a class gets a minted IRI', async ({ page, request }) => {
+  const ds = 'forms-new';
+  await people(request, ds);
+  await page.goto(`/ui/datasets/${ds}/edit?class=${encodeURIComponent(`${EX}Person`)}`);
+  const form = page.getByRole('region', { name: /^New / });
+  await expect(form.getByText('Name', { exact: true })).toBeVisible({ timeout: 30_000 });
+  await form.getByRole('textbox', { name: 'Name', exact: true }).fill('Carol King');
+  await form.getByRole('combobox', { name: 'Works for' }).fill(`<${EX}acme>`);
+  await page.getByRole('option', { name: /Use/ }).click();
+  await form.getByRole('button', { name: 'Save', exact: true }).click();
+  await expect(page).toHaveURL(/iri=urn%3Auuid%3A/, { timeout: 15_000 });
+  const iri = new URL(page.url()).searchParams.get('iri')!;
+  expect(
+    await ask(request, ds, `ASK { <${iri}> a <${EX}Person> ; <${EX}name> "Carol King" }`),
+  ).toBe(true);
+  await expect(
+    page
+      .getByRole('region', { name: /^Edit / })
+      .getByRole('textbox', { name: 'Name', exact: true }),
+  ).toHaveValue('Carol King');
+});

@@ -474,6 +474,21 @@
     return () => c.abort();
   });
 
+  /** Whether a shape would describe a new instance of a class the caller may save, by class. */
+  let creatable = $state<Record<string, boolean>>({});
+  $effect(() => {
+    const c = selectedClass;
+    const name = ds;
+    if (!c || !name) return;
+    if (untrack(() => creatable[`${name}|${c}`]) !== undefined) return;
+    const ctl = new AbortController();
+    getForm(name, '', { class: c, signal: ctl.signal }).then(
+      (m) => (creatable[`${name}|${c}`] = m.editable && m.fields.some((f) => f.editable)),
+      () => {},
+    );
+    return () => ctl.abort();
+  });
+
   /** After a save: read the resource's properties again. */
   function formSaved(id: string) {
     const keep = Object.fromEntries(
@@ -3099,6 +3114,16 @@
               <button class="btn sm" onclick={() => focusOn(cls.iri, cls.label)}
                 ><Icon name="graph" size={13} /> Class as graph</button
               >
+              {#if ds && creatable[`${ds}|${cls.iri}`]}
+                <a
+                  class="btn sm"
+                  href="{resolve('/datasets/[name]/edit', { name: ds })}?class={encodeURIComponent(
+                    cls.iri,
+                  )}"
+                  title="Make a resource of this class in a form generated from its shapes"
+                  ><Icon name="plus" size={13} /> New instance</a
+                >
+              {/if}
             </div>
           </div>
           <div class="side-body scroll">

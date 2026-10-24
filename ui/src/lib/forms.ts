@@ -163,6 +163,23 @@ export function widgetOf(f: Pick<FormField, 'widget' | 'editor' | 'constraints'>
   return KNOWN.has(f.widget) ? f.widget : 'term';
 }
 
+/** How a read-only value shows (§2.3): the DASH viewer, or a label for an IRI by default. */
+export type Viewer = 'label' | 'uri' | 'literal' | 'term';
+
+/** The viewer of a field: its known `dash:viewer`, else `label`, as DASH's default for IRIs. */
+export function viewerOf(f: Pick<FormField, 'viewer'>): Viewer {
+  switch (f.viewer?.startsWith(DASH) ? f.viewer.slice(DASH.length) : '') {
+    case 'URIViewer':
+      return 'uri';
+    case 'LiteralViewer':
+      return 'literal';
+    case 'LabelViewer':
+      return 'label';
+    default:
+      return 'label';
+  }
+}
+
 /** Whether a field takes several values (no `sh:maxCount`, or one above 1). */
 export const multiValued = (f: FormField) => (f.constraints.maxCount ?? Infinity) > 1;
 

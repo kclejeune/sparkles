@@ -18,12 +18,17 @@ export type FormOptions = {
   lang?: string;
   /** Where the shapes come from, overriding the dataset's setting. */
   shapes?: 'guard' | 'graphs' | 'drafted';
+  /** The form of a new instance of this class instead of a resource's. */
+  class?: string;
   signal?: AbortSignal;
 };
 
-/** `GET /$/forms/{ds}?focus=`: the form model of a resource. */
+/**
+ * `GET /$/forms/{ds}?focus=`: the form model of a resource, or with `class` and an empty
+ * `focus` the form of a new instance.
+ */
 export function getForm(ds: string, focus: string, opts: FormOptions = {}): Promise<FormModel> {
-  const p = new URLSearchParams({ focus });
+  const p = new URLSearchParams(opts.class ? { class: opts.class } : { focus });
   if (opts.at) p.set('at', opts.at);
   if (opts.lang) p.set('lang', opts.lang);
   if (opts.shapes) p.set('shapes', opts.shapes);
@@ -35,7 +40,9 @@ export function getForm(ds: string, focus: string, opts: FormOptions = {}): Prom
 
 /** The body of a check or a save. */
 export type FormChangeBody = {
-  focus: string;
+  /** The resource; a new instance names its `class` instead. */
+  focus?: string;
+  class?: string;
   branch?: string;
   shapes?: 'guard' | 'graphs' | 'drafted';
   changes: FieldChange[];
@@ -59,6 +66,8 @@ export type FormCheckAnswer = {
 };
 
 export type FormSaveAnswer = Receipt & {
+  /** The resource saved: for a new instance, the IRI the server minted. */
+  focus?: string;
   branch: string;
   branchCreated: boolean;
 };

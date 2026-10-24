@@ -14,6 +14,7 @@
     sameTerm,
     serverPatterns,
     termText,
+    viewerOf,
     type Entry,
     type FieldResult,
     type FormField,
@@ -22,6 +23,7 @@
   } from '$lib/forms';
   import { displayTerm, type PrefixMap } from '$lib/rdf';
   import { numberStep, typeBounds, XSD } from '$lib/xsd';
+  import { searchInstances } from '$lib/explore';
   import EntityPicker from './EntityPicker.svelte';
   import TermView from './TermView.svelte';
 
@@ -35,6 +37,7 @@
     ds,
     prefixes,
     lang = 'en',
+    fullText = false,
   }: {
     field: FormField;
     widget: Widget;
@@ -49,10 +52,17 @@
     prefixes: PrefixMap;
     /** The language new text with a language takes. */
     lang?: string;
+    /** The dataset's full-text index is ready, so the entity picker searches with it. */
+    fullText?: boolean;
   } = $props();
+
+  /** The entity picker's search: instances of the field's classes, by label. */
+  const searchHits = (text: string, signal: AbortSignal) =>
+    searchInstances(ds, text, { classes: c.class ?? [], fullText, signal });
 
   const base = $derived(fieldDomId(field.id));
   const c = $derived(field.constraints);
+  const viewer = $derived(viewerOf(field));
   const many = $derived(multiValued(field));
   const req = $derived(required(field));
   const options = $derived(c.in ?? []);
@@ -163,7 +173,17 @@
     {#if field.description}<p class="help" id={helpId}>{field.description}</p>{/if}
     <div class="ro-values" id={base} tabindex="-1" aria-labelledby="{base}-label">
       {#each field.values as v, i (i)}
-        <div class="ro-value"><TermView term={v.term} {prefixes} /></div>
+        <div class="ro-value">
+          {#if v.term.type === 'uri' && viewer === 'uri'}
+            <span class="mono t-iri">{v.term.value}</span>
+          {:else if v.term.type === 'uri' && viewer === 'label' && v.label}
+            <span title={v.term.value}>{v.label}</span>
+          {:else if v.term.type === 'literal' && viewer === 'literal'}
+            <span>{v.term.value}</span>
+          {:else}
+            <TermView term={v.term} {prefixes} />
+          {/if}
+        </div>
       {:else}
         <span class="faint">No value</span>
       {/each}
@@ -288,6 +308,7 @@
               {prefixes}
               {describedby}
               invalid={hasProblems}
+              search={searchHits}
               bind:value={
                 () =>
                   e.term ? { term: e.term, label: e.label ?? displayTerm(e.term, prefixes) } : null,

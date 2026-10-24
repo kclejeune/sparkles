@@ -213,3 +213,45 @@ test('the edit page fits a phone', async ({ page }) => {
   await openEdit(page, 'amira');
   await expectNoSidewaysScroll(page, 'the edit page');
 });
+
+test('A8: a DASH editor makes Notes a text area', async ({ page }) => {
+  const form = await openEdit(page, 'amira');
+  const notes = form.getByLabel('Notes', { exact: true });
+  await expect(notes).toBeVisible();
+  expect(await notes.evaluate((e) => e.tagName)).toBe('TEXTAREA');
+});
+
+test('the entity picker offers instances of the field class only', async ({ page }) => {
+  const form = await openEdit(page, 'omar');
+  await form.getByRole('button', { name: 'Clear Works for' }).click();
+  await form.getByRole('combobox', { name: 'Works for' }).fill('an');
+  // Andes Cargo is a company; nothing else whose label holds "an" (Dubai, Omar Rahman…) is
+  const list = page.getByRole('listbox', { name: 'Works for choices' });
+  await expect(list.getByRole('option', { name: /Andes Cargo/ })).toBeVisible();
+  await expect(list.getByRole('option', { name: /Rahman/ })).toHaveCount(0);
+  await list.getByRole('option', { name: /Andes Cargo/ }).click();
+  await expect(form.getByText(/^0 problems · 1 change/)).toBeVisible();
+});
+
+test('New instance in the schema tab makes a resource with a minted IRI', async ({ page }) => {
+  await page.goto(`/ui/explore?ds=${DS}&tab=schema`);
+  await page
+    .getByRole('treeitem', { name: /Person/ })
+    .first()
+    .click();
+  const add = page.getByRole('link', { name: 'New instance' });
+  await expect(add).toBeVisible({ timeout: 30_000 });
+  await add.click();
+  const form = page.getByRole('region', { name: /^New ex:Person|^New http/ });
+  await expect(form.getByRole('group', { name: 'Identity' })).toBeVisible({ timeout: 30_000 });
+  await form.getByRole('textbox', { name: 'Name', exact: true }).fill('Lucía Moreno');
+  await form.getByRole('combobox', { name: 'Works for' }).fill(`<${W}andes>`);
+  await page.getByRole('option', { name: /Use/ }).click();
+  await form.getByRole('button', { name: 'Save', exact: true }).click();
+  await expect(page).toHaveURL(/iri=urn%3Auuid%3A/);
+  const edit = page.getByRole('region', { name: /^Edit / });
+  await expect(edit.getByRole('textbox', { name: 'Name', exact: true })).toHaveValue(
+    'Lucía Moreno',
+  );
+  await expect(edit).toContainText('Person');
+});
