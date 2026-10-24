@@ -133,9 +133,11 @@ function render(proofs, profile, maxDepth) {
       return n;
     }
     const id = ++next;
-    if (!root) ids.set(k, id);
+    // a node cut at the depth limit is no target for sharing, as on the server
+    const cut = p.kind !== 'asserted' && level >= maxDepth;
+    if (!root && !cut) ids.set(k, id);
     if (p.kind === 'asserted') return { id, triple, kind: 'asserted', depth: 0, graph: p.graph };
-    if (level >= maxDepth) return { id, triple, kind: 'ref', depth: depthOf(p) };
+    if (cut) return { id, triple, kind: 'ref', depth: depthOf(p) };
     const rule = { name: p.rule, profile };
     if (profile === 'owl-rl' && /^(prp|cax|scm|eq|cls)-/.test(p.rule)) rule.owl2rl = p.rule;
     return {

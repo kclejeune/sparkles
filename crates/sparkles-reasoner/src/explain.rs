@@ -532,7 +532,16 @@ impl Builder<'_, '_> {
             // premise, since a premise of a well-founded tree is not its root
             (Some(_), _) => (self.next, false),
             (None, None) => {
-                self.ids.insert(f, self.next);
+                // a node cut at the depth limit is no target for sharing, so a shallower
+                // repeat of its fact shows its premises
+                let i = s.via[f as usize];
+                let cut = s.leaf[f as usize].is_none()
+                    && level >= self.max_depth
+                    && i != NONE
+                    && s.insts[i as usize].from != s.insts[i as usize].to;
+                if !cut {
+                    self.ids.insert(f, self.next);
+                }
                 (self.next, false)
             }
         };
@@ -676,6 +685,8 @@ fn search(
     let mut found_at: Option<u32> = None;
     let mut level = 0u32;
     loop {
+        // the controls hold at every level, also when the root needs no expansion
+        s.check_time().map_err(stop)?;
         s.settle().map_err(stop)?;
         if s.depth[r as usize] != NONE && found_at.is_none() {
             found_at = Some(level);

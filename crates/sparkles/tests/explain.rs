@@ -266,3 +266,69 @@ fn rdfs_on_read_explains_a_superproperty_of_a_derived_type() {
     assert_eq!(rule(t), "rdfs7");
     assert_eq!(rule(&t.premises[0]), "rdfs2");
 }
+
+#[test]
+fn rdfs_on_read_explains_a_schema_chain_on_its_own() {
+    // what Expand asks for when a subclass chain is cut at the depth limit
+    let (_dir, ds) = on_read();
+    let sc =
+        Term::NamedNode(NamedNode::new("http://www.w3.org/2000/01/rdf-schema#subClassOf").unwrap());
+    let t = &found(
+        ds.reasoning()
+            .explain(&ExplainRequest::new([ex("Manager"), sc, ex("Employee")]))
+            .unwrap()
+            .explained,
+    )[0];
+    assert_eq!(rule(t), "rdfs11");
+    assert_eq!(t.premises.len(), 2);
+}
+
+#[test]
+fn rdfs_on_read_counts_schema_neighbours_against_its_reads() {
+    // a class with more direct superclasses than the search may read
+    let mut schema = String::new();
+    for i in 0..100_001 {
+        schema.push_str(&format!("ex:A rdfs:subClassOf ex:S{i} . "));
+    }
+    schema.push_str("ex:p rdfs:domain ex:A . ex:Z rdfs:subClassOf ex:Top .");
+    let (_dir, ds) = on_read_with("ex:a ex:p ex:b .", &schema);
+    let sc =
+        Term::NamedNode(NamedNode::new("http://www.w3.org/2000/01/rdf-schema#subClassOf").unwrap());
+    // A reaches no Top, and the search reads every superclass of A on the way
+    let e = ds
+        .reasoning()
+        .explain(&ExplainRequest::new([ex("A"), sc, ex("Top")]))
+        .map(|_| ())
+        .unwrap_err();
+    assert!(
+        matches!(&e, sparkles::Error::Component(c) if c.code == sparkles::reasoning::explain::REASONING_BUDGET),
+        "{e}"
+    );
+}
+
+#[test]
+fn rdfs_on_read_holds_an_asserted_answer_to_the_memory_limit() {
+    let big = "x".repeat(1_000_000);
+    let (_dir, ds) = on_read_with(&format!("ex:a ex:p \"{big}\" ."), "ex:p rdfs:domain ex:C .");
+    let mut req = ExplainRequest::new([
+        ex("a"),
+        ex("p"),
+        Term::Literal(oxrdf::Literal::new_simple_literal(big)),
+    ]);
+    found(ds.reasoning().explain(&req).unwrap().explained);
+    req.max_memory = Some(65_536);
+    let e = ds.reasoning().explain(&req).map(|_| ()).unwrap_err();
+    assert!(
+        matches!(&e, sparkles::Error::Component(c) if c.code == sparkles::reasoning::explain::REASONING_BUDGET),
+        "{e}"
+    );
+}
+
+#[test]
+fn an_asserted_triple_is_explained_without_the_schema() {
+    let (_dir, ds) = on_read();
+    let mut req = ExplainRequest::new([ex("alice"), ex("manages"), ex("team7")]);
+    req.access = only(&["default"]);
+    let t = &found(ds.reasoning().explain(&req).unwrap().explained)[0];
+    assert_eq!(t.kind, DerivationKind::Asserted);
+}

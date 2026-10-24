@@ -239,21 +239,23 @@ pub fn explain(ds: &Dataset, req: &ExplainRequest) -> Result<Explanation> {
                 }
             }
         };
-        // every RDFS derivation needs a schema fact, so a schema the caller cannot read
-        // explains nothing and is not built
-        if leaves == SchemaLeaves::Hidden {
-            return Ok(not_found(head.commit));
-        }
         let view = view_of(access, &head)?;
-        // the schema is shared with queries and built without the request's controls, so
-        // they are checked on both sides of it
-        check_controls(req, deadline)?;
-        let schema = on.schema(&view)?;
-        check_controls(req, deadline)?;
         let inferred = head.lookup_iri(super::INFERRED_GRAPH);
         let mut graphs = vec![Id::DEFAULT_GRAPH];
         graphs.extend(head.graph_ids()?);
         graphs.retain(|&g| Some(g) != inferred && readable(access, &head, g));
+        // every RDFS derivation needs a schema fact, so a schema the caller cannot read is
+        // not built, and an empty one still finds a triple a readable graph asserts
+        let schema = if leaves == SchemaLeaves::Hidden {
+            std::sync::Arc::new(sparkles_core::sparql::rdfs::RdfsSchema::default())
+        } else {
+            // the schema is shared with queries and built without the request's
+            // controls, so they are checked on both sides of it
+            check_controls(req, deadline)?;
+            let schema = on.schema(&view)?;
+            check_controls(req, deadline)?;
+            schema
+        };
         let found = schema.explain(
             &view,
             leaves,

@@ -717,3 +717,86 @@ fn the_memory_limit_counts_the_terms_of_the_answer() {
     .expect_err("a million bytes of terms fit in 500,000");
     assert!(e.downcast_ref::<ExplainBudgetExceeded>().is_some(), "{e:#}");
 }
+
+#[test]
+fn a_fact_cut_at_the_depth_limit_is_not_shared_as_derived() {
+    // root from a and b, a from b, b from p: with depth 2, b under a is cut, and b as
+    // root's own premise must still show its support
+    let s = store("@prefix ex: <http://ex.org/> . ex:x ex:p ex:y .");
+    let p = Profile::Rules(
+        "@prefix ex: <http://ex.org/> .
+[rb: (?x ex:p ?y) -> (?x ex:b ?y)]
+[ra: (?x ex:b ?y) -> (?x ex:a ?y)]
+[rr: (?x ex:a ?y) (?x ex:b ?y) -> (?x ex:root ?y)]
+"
+        .into(),
+    );
+    reason(&s, &p, &["default"], None);
+    let (ts, _) = trees(
+        why(
+            &s,
+            &p,
+            &["default"],
+            [ex("x"), ex("root"), ex("y")],
+            &ExplainOptions {
+                max_depth: 2,
+                ..Default::default()
+            },
+        )
+        .unwrap(),
+    );
+    fn shared_to_ref(d: &Derivation, refs: &mut BTreeSet<u32>, bad: &mut bool) {
+        if d.kind == DerivationKind::Ref {
+            refs.insert(d.id);
+        }
+        if d.shared && refs.contains(&d.id) {
+            *bad = true;
+        }
+        for p in &d.premises {
+            shared_to_ref(p, refs, bad);
+        }
+    }
+    let mut bad = false;
+    shared_to_ref(&ts[0], &mut BTreeSet::new(), &mut bad);
+    assert!(!bad, "a shared node points at a cut one: {:#?}", ts[0]);
+    let b = ts[0]
+        .premises
+        .iter()
+        .find(|d| d.triple[1] == ex("b"))
+        .unwrap();
+    assert!(b.shared || !b.premises.is_empty(), "{b:#?}");
+}
+
+#[test]
+fn an_asserted_triple_still_answers_to_the_controls() {
+    let s = store(TRIG);
+    reason(&s, &Profile::Rdfs, &[HR, ONTO], None);
+    let t = [ex("alice"), ex("manages"), ex("team7")];
+    let e = why(
+        &s,
+        &Profile::Rdfs,
+        &[HR, ONTO],
+        t.clone(),
+        &ExplainOptions {
+            deadline: Some(std::time::Instant::now()),
+            ..Default::default()
+        },
+    )
+    .map(|_| ())
+    .unwrap_err();
+    assert!(e.downcast_ref::<ExplainBudgetExceeded>().is_some(), "{e:#}");
+    let cancel = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true));
+    assert!(
+        why(
+            &s,
+            &Profile::Rdfs,
+            &[HR, ONTO],
+            t,
+            &ExplainOptions {
+                cancel: Some(cancel),
+                ..Default::default()
+            },
+        )
+        .is_err()
+    );
+}

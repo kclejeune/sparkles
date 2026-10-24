@@ -84,6 +84,44 @@ impl Cx<'_> {
         self.check()
     }
 
+    /// Visit the rows of `prefix` in `perm` as they stream from the index, until `f`
+    /// answers `false` or fails.
+    fn scan_rows(
+        &self,
+        perm: Perm,
+        prefix: &[u64],
+        mut f: impl FnMut(&crate::index::Key) -> Result<bool>,
+    ) -> Result<()> {
+        let mut failed = None;
+        self.snap.scan(perm, prefix, |c| {
+            let (lo, hi) = match &c {
+                crate::store::Chunk::Block(_, st, end) => (*st, *end),
+                crate::store::Chunk::Row(_) => (0, 1),
+            };
+            for i in lo..hi {
+                let k = match &c {
+                    crate::store::Chunk::Block(b, _, _) => {
+                        [b.cols[0][i], b.cols[1][i], b.cols[2][i], b.cols[3][i]]
+                    }
+                    crate::store::Chunk::Row(k) => *k,
+                };
+                match f(&k) {
+                    Ok(true) => {}
+                    Ok(false) => return Ok(false),
+                    Err(e) => {
+                        failed = Some(e);
+                        return Ok(false);
+                    }
+                }
+            }
+            Ok(true)
+        })?;
+        match failed {
+            Some(e) => Err(e),
+            None => Ok(()),
+        }
+    }
+
     fn id(&self, t: &Term) -> Option<Id> {
         self.snap.lookup_term(t)
     }
@@ -135,37 +173,18 @@ impl Cx<'_> {
         // stops at the first row of `g`; every 1,024 rows count as one more read
         let mut found = None;
         let mut rows = 0usize;
-        let mut failed = None;
-        self.snap.scan(Perm::Pos, &[p.0, o.0], |c| {
-            let (lo, hi) = match &c {
-                crate::store::Chunk::Block(_, st, end) => (*st, *end),
-                crate::store::Chunk::Row(_) => (0, 1),
-            };
-            for i in lo..hi {
-                let k = match &c {
-                    crate::store::Chunk::Block(b, _, _) => {
-                        [b.cols[0][i], b.cols[1][i], b.cols[2][i], b.cols[3][i]]
-                    }
-                    crate::store::Chunk::Row(k) => *k,
-                };
-                let q = Perm::Pos.to_quad(&k);
-                if q[3] == g {
-                    found = Some(q[0]);
-                    return Ok(false);
-                }
-                rows += 1;
-                if rows.is_multiple_of(1024)
-                    && let Err(e) = self.read()
-                {
-                    failed = Some(e);
-                    return Ok(false);
-                }
+        self.scan_rows(Perm::Pos, &[p.0, o.0], |k| {
+            let q = Perm::Pos.to_quad(k);
+            if q[3] == g {
+                found = Some(q[0]);
+                return Ok(false);
+            }
+            rows += 1;
+            if rows.is_multiple_of(1024) {
+                self.read()?;
             }
             Ok(true)
         })?;
-        if let Some(e) = failed {
-            return Err(e);
-        }
         Ok(found.and_then(|s| self.snap.term(s)))
     }
 
@@ -265,15 +284,19 @@ impl Cx<'_> {
                 continue;
             };
             self.read()?;
-            for k in self.snap.scan_keys(Perm::Gspo, &[g.0, xi.0, pi.0])? {
-                let Some(Term::NamedNode(y)) = self.snap.term(Id(k[3])) else {
-                    continue;
-                };
-                if &y != a && !back.contains_key(&y) {
+            // every neighbour counts as a read, so a wide schema meets the limit and the
+            // request's controls as the rows stream
+            self.scan_rows(Perm::Gspo, &[g.0, xi.0, pi.0], |k| {
+                self.read()?;
+                if let Some(Term::NamedNode(y)) = self.snap.term(Id(k[3]))
+                    && &y != a
+                    && !back.contains_key(&y)
+                {
                     back.insert(y.clone(), x.clone());
                     queue.push_back(y);
                 }
-            }
+                Ok(true)
+            })?;
         }
         if !reached {
             return Ok(None);
@@ -396,9 +419,23 @@ impl RdfsSchema {
             reads: std::cell::Cell::new(0),
         };
         cx.check()?;
+        // the trees hold at most one derivation per rule, so their decoded terms are
+        // measured once they are built, before the answer keeps them
+        let fits = |trees: &[Derivation]| -> Result<()> {
+            if let Some(limit) = max_memory {
+                let bytes: usize = trees.iter().map(Derivation::heap_bytes).sum();
+                if bytes > limit {
+                    return Err(budget(format!(
+                        "the explanation's answer needs {bytes} bytes, over its memory limit of {limit}"
+                    )));
+                }
+            }
+            Ok(())
+        };
         for &g in graphs {
             if cx.held(g, triple)? {
                 let mut trees = vec![Derivation::asserted(triple.clone(), cx.graph_name(g))];
+                fits(&trees)?;
                 finish(&mut trees, max_depth);
                 return Ok(Explained::Found { trees, more: false });
             }
@@ -419,6 +456,14 @@ impl RdfsSchema {
             return Ok(Explained::NotFound);
         };
         let pr = p.as_ref();
+        // a fact of the schema's closure, which a tree cut at the depth limit asks for
+        if (pr == rdfs::SUB_CLASS_OF || pr == rdfs::SUB_PROPERTY_OF)
+            && let (Term::NamedNode(a), Term::NamedNode(b)) = (s, o)
+            && a != b
+            && let Some(d) = cx.chain(a, pr, b)?
+        {
+            keep(d);
+        }
         if pr == rdf::TYPE
             && let Term::NamedNode(c) = o
         {
@@ -496,16 +541,7 @@ impl RdfsSchema {
             return Ok(Explained::NotFound);
         }
         let mut all: Vec<Derivation> = tops.into_values().collect();
-        // the trees hold at most one derivation per rule, so their decoded terms are
-        // measured once they are built, before the answer keeps them
-        if let Some(limit) = max_memory {
-            let bytes: usize = all.iter().map(Derivation::heap_bytes).sum();
-            if bytes > limit {
-                return Err(budget(format!(
-                    "the explanation's answer needs {bytes} bytes, over its memory limit of {limit}"
-                )));
-            }
-        }
+        fits(&all)?;
         all.sort_by_key(|d| d.depth);
         let more = all.len() > max_trees.max(1);
         all.truncate(max_trees.max(1));
