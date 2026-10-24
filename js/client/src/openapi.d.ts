@@ -1565,6 +1565,65 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/$/mappings/{ds}": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /** List stored mappings */
+        get: operations["listStoredMappings"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/$/mappings/{ds}/{name}": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * Get a stored mapping
+         * @description The mapping with its text and metadata, or the text alone when `Accept` names the kind's media type.
+         */
+        get: operations["getStoredMapping"];
+        /**
+         * Store a mapping
+         * @description Stores the mapping text as the next version, after parsing and checking it. `Content-Type` names the kind: `text/turtle` for R2RML and RML, `application/yaml` for YARRRML, `application/csvm+json` for CSVW metadata and `application/sparql-query` for a CONSTRUCT template. A connection the server does not declare is a warning. `If-Match: "v<N>"` stores only over version N, and `If-None-Match: *` only when the mapping does not exist.
+         */
+        put: operations["putStoredMapping"];
+        post?: never;
+        /** Delete a stored mapping */
+        delete: operations["deleteStoredMapping"];
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/$/mappings/{ds}/{name}/versions": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /** List the versions of a stored mapping */
+        get: operations["listStoredMappingVersions"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/$/mcp": {
         parameters: {
             query?: never;
@@ -3378,7 +3437,10 @@ export interface paths {
         put: operations["gspPut"];
         /** Add to a graph */
         post: operations["gspPost"];
-        /** Delete a graph */
+        /**
+         * Delete a graph
+         * @description Deletes the graph. With a `text/csv` or `text/tab-separated-values` body and `mapping` or `base`, removes the mapped triples from the graph instead.
+         */
         delete: operations["gspDelete"];
         options?: never;
         /**
@@ -3575,6 +3637,26 @@ export interface paths {
         get: operations["liveQuery"];
         put?: never;
         post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/{ds}/mappings/{name}/run": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Run a stored mapping
+         * @description Runs the mapping over the file parts its sources name and the server's connections, and commits once. `mode=replace` replaces the constant graphs the mapping writes in that commit, and is `400` with code `mapping-graphs-unknown` for a template graph map. The commit message defaults to `mapping NAME (version V)`, and the mapping records the run.
+         */
+        post: operations["runStoredMapping"];
         delete?: never;
         options?: never;
         head?: never;
@@ -3922,7 +4004,7 @@ export interface paths {
         put?: never;
         /**
          * Upload files
-         * @description A multipart upload of RDF files, and CSV or TSV tables mapped to triples, in one commit. The format comes from each file name or content type. A plain `text/csv` or `text/tab-separated-values` body is one table.
+         * @description A multipart upload of RDF files, CSV or TSV tables mapped to triples, and the files an R2RML, RML or YARRRML mapping reads, in one commit. The format comes from each file name or content type. A plain `text/csv` or `text/tab-separated-values` body is one table. A mapping file source without its part is `400` with code `mapping-source-missing`.
          */
         post: operations["upload"];
         delete?: never;
@@ -3947,7 +4029,10 @@ export interface paths {
         put: operations["directGraphPut"];
         /** Add to a graph */
         post: operations["directGraphPost"];
-        /** Delete a graph */
+        /**
+         * Delete a graph
+         * @description Deletes the graph. With a `text/csv` or `text/tab-separated-values` body and `mapping` or `base`, removes the mapped triples from the graph instead.
+         */
         delete: operations["directGraphDelete"];
         options?: never;
         /**
@@ -6456,6 +6541,22 @@ export interface components {
             };
             review?: components["schemas"]["ReviewCounts"];
         };
+        /** @description What a stored mapping's run made and committed. */
+        MappingRun: {
+            /** @description The quads the commit added. */
+            count?: number;
+            mapping: string;
+            /** @enum {string} */
+            mode: "add" | "replace";
+            /** @description The quads the mapping made, before the load removed duplicates. */
+            quads: number;
+            reports?: {
+                [key: string]: unknown;
+            }[];
+            rows: number;
+            version: number;
+            warnings: string[];
+        };
         /** @description Everything that waits for a person: unreviewed session facts with their signals, by session, and the open review branches. */
         MemoryInbox: {
             agentGraphs?: string[];
@@ -8478,6 +8579,118 @@ export interface components {
                 }[];
             };
         };
+        /** @description A stored mapping, with the summary of its check and its last run. */
+        StoredMapping: {
+            /** @description On a PUT: whether a new version was stored. */
+            changed?: boolean;
+            dataset?: string;
+            description?: string;
+            /** @enum {string} */
+            kind: "rml" | "yarrrml" | "csvw" | "template";
+            lastRun?: {
+                author?: string;
+                commit?: number;
+                /** @enum {string} */
+                mode: "add" | "replace";
+                quads: number;
+                rows: number;
+                time: string;
+                version: number;
+                warnings?: string[];
+            };
+            name: string;
+            summary?: {
+                /** @description The connections it reads. An empty name is an R2RML mapping's default connection. */
+                connections: string[];
+                files: string[];
+                /** @description The graphs its graph maps name, `default` for the default graph, or null when one is not constant. */
+                graphs?: string[] | null;
+                kind: string;
+                triplesMaps: number;
+                /** @description R2RML, RML (rml.io), RML-Core or YARRRML. */
+                vocabulary?: string;
+                warnings: string[];
+            };
+            /** @description The mapping text. Listings leave it out. */
+            text?: string;
+            version: {
+                author?: string;
+                created: string;
+                /** @description The dataset's head when the version was saved. */
+                datasetCommit?: number;
+                /** @description Hex SHA-256 over the parent's digest and the definition. */
+                digest: string;
+                message?: string;
+                parent?: number;
+                version: number;
+            };
+        };
+        /** @description A dataset's stored mappings, without their text. */
+        StoredMappingList: {
+            dataset: string;
+            mappings: {
+                /** @description On a PUT: whether a new version was stored. */
+                changed?: boolean;
+                dataset?: string;
+                description?: string;
+                /** @enum {string} */
+                kind: "rml" | "yarrrml" | "csvw" | "template";
+                lastRun?: {
+                    author?: string;
+                    commit?: number;
+                    /** @enum {string} */
+                    mode: "add" | "replace";
+                    quads: number;
+                    rows: number;
+                    time: string;
+                    version: number;
+                    warnings?: string[];
+                };
+                name: string;
+                summary?: {
+                    /** @description The connections it reads. An empty name is an R2RML mapping's default connection. */
+                    connections: string[];
+                    files: string[];
+                    /** @description The graphs its graph maps name, `default` for the default graph, or null when one is not constant. */
+                    graphs?: string[] | null;
+                    kind: string;
+                    triplesMaps: number;
+                    /** @description R2RML, RML (rml.io), RML-Core or YARRRML. */
+                    vocabulary?: string;
+                    warnings: string[];
+                };
+                /** @description The mapping text. Listings leave it out. */
+                text?: string;
+                version: {
+                    author?: string;
+                    created: string;
+                    /** @description The dataset's head when the version was saved. */
+                    datasetCommit?: number;
+                    /** @description Hex SHA-256 over the parent's digest and the definition. */
+                    digest: string;
+                    message?: string;
+                    parent?: number;
+                    version: number;
+                };
+            }[];
+            warning?: string;
+        };
+        /** @description The kept versions of a stored mapping, newest first. */
+        StoredMappingVersions: {
+            dataset: string;
+            name: string;
+            versions: {
+                author?: string;
+                created: string;
+                /** @description The dataset's head when the version was saved. */
+                datasetCommit?: number;
+                /** @description Hex SHA-256 over the parent's digest and the definition. */
+                digest: string;
+                message?: string;
+                parent?: number;
+                version: number;
+            }[];
+        };
         /** @description A stored query definition. A PUT sends `query` and the optional members, and reads add `name`, `dataset`, `kind` and `version`. */
         StoredQuery: {
             /** @description On a PUT: whether a new version was stored. */
@@ -9587,7 +9800,7 @@ export interface components {
         validate: boolean;
     };
     requestBodies: {
-        /** @description RDF data in the syntax its `Content-Type` names. Jena's N3 media types are read as Turtle. */
+        /** @description RDF data in the syntax its `Content-Type` names. Jena's N3 media types are read as Turtle. A `text/csv` or `text/tab-separated-values` body is a table that `mapping` or `base` maps into the graph. */
         RdfData: {
             content: {
                 "application/ld+json": string;
@@ -9599,8 +9812,10 @@ export interface components {
                 "application/rdf+thrift": string;
                 "application/rdf+xml": string;
                 "application/trig": string;
+                "text/csv": string;
                 "text/n3": string;
                 "text/rdf+n3": string;
+                "text/tab-separated-values": string;
                 "text/turtle": string;
             };
         };
@@ -13252,6 +13467,193 @@ export interface operations {
             403: components["responses"]["Forbidden"];
             413: components["responses"]["PayloadTooLarge"];
             415: components["responses"]["UnsupportedMediaType"];
+            default: components["responses"]["Error"];
+        };
+    };
+    listStoredMappings: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description The dataset name. */
+                ds: components["parameters"]["ds"];
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description The mappings without their text. */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["StoredMappingList"];
+                };
+            };
+            401: components["responses"]["Unauthorized"];
+            403: components["responses"]["Forbidden"];
+            404: components["responses"]["NotFound"];
+            default: components["responses"]["Error"];
+        };
+    };
+    getStoredMapping: {
+        parameters: {
+            query?: {
+                /** @description An older version, while it is kept. */
+                version?: number;
+            };
+            header?: never;
+            path: {
+                /** @description The dataset name. */
+                ds: components["parameters"]["ds"];
+                /** @description The name of the stored query, snapshot, vector index, branch, ingest profile or model secret. */
+                name: components["parameters"]["name"];
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description The mapping. */
+            200: {
+                headers: {
+                    /** @description `"v<N>"` */
+                    ETag?: string;
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/csvm+json": string;
+                    "application/json": components["schemas"]["StoredMapping"];
+                    "application/sparql-query": string;
+                    "application/yaml": string;
+                    "text/turtle": string;
+                };
+            };
+            401: components["responses"]["Unauthorized"];
+            403: components["responses"]["Forbidden"];
+            404: components["responses"]["NotFound"];
+            default: components["responses"]["Error"];
+        };
+    };
+    putStoredMapping: {
+        parameters: {
+            query?: {
+                /** @description The kind, instead of the media type. */
+                kind?: "rml" | "yarrrml" | "csvw" | "template";
+                /** @description A description of at most 1024 bytes. */
+                description?: string;
+            };
+            header?: {
+                /** @description Entity tags. A write needs a tag that names the current head. */
+                "If-Match"?: components["parameters"]["ifMatch"];
+                /** @description Entity tags, or `*`. */
+                "If-None-Match"?: components["parameters"]["ifNoneMatch"];
+                /** @description The commit message of the write, at most 1024 bytes of UTF-8. RFC 8187 extended values are accepted. */
+                "Sparkles-Commit-Message"?: components["parameters"]["commitMessage"];
+            };
+            path: {
+                /** @description The dataset name. */
+                ds: components["parameters"]["ds"];
+                /** @description The name of the stored query, snapshot, vector index, branch, ingest profile or model secret. */
+                name: components["parameters"]["name"];
+            };
+            cookie?: never;
+        };
+        /** @description The mapping text. */
+        requestBody: {
+            content: {
+                "application/csvm+json": string;
+                "application/sparql-query": string;
+                "application/yaml": string;
+                "text/turtle": string;
+            };
+        };
+        responses: {
+            /** @description Stored as a new version, or unchanged (`changed: false`). */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["StoredMapping"];
+                };
+            };
+            /** @description Created. */
+            201: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["StoredMapping"];
+                };
+            };
+            400: components["responses"]["BadRequest"];
+            401: components["responses"]["Unauthorized"];
+            403: components["responses"]["Forbidden"];
+            404: components["responses"]["NotFound"];
+            409: components["responses"]["Conflict"];
+            412: components["responses"]["PreconditionFailed"];
+            415: components["responses"]["UnsupportedMediaType"];
+            default: components["responses"]["Error"];
+        };
+    };
+    deleteStoredMapping: {
+        parameters: {
+            query?: never;
+            header?: {
+                /** @description Entity tags. A write needs a tag that names the current head. */
+                "If-Match"?: components["parameters"]["ifMatch"];
+            };
+            path: {
+                /** @description The dataset name. */
+                ds: components["parameters"]["ds"];
+                /** @description The name of the stored query, snapshot, vector index, branch, ingest profile or model secret. */
+                name: components["parameters"]["name"];
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Deleted with its versions. */
+            204: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            401: components["responses"]["Unauthorized"];
+            403: components["responses"]["Forbidden"];
+            404: components["responses"]["NotFound"];
+            412: components["responses"]["PreconditionFailed"];
+            default: components["responses"]["Error"];
+        };
+    };
+    listStoredMappingVersions: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description The dataset name. */
+                ds: components["parameters"]["ds"];
+                /** @description The name of the stored query, snapshot, vector index, branch, ingest profile or model secret. */
+                name: components["parameters"]["name"];
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description The kept versions, newest first. */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["StoredMappingVersions"];
+                };
+            };
+            401: components["responses"]["Unauthorized"];
+            403: components["responses"]["Forbidden"];
+            404: components["responses"]["NotFound"];
             default: components["responses"]["Error"];
         };
     };
@@ -17975,6 +18377,20 @@ export interface operations {
     gspPut: {
         parameters: {
             query?: {
+                /** @description A CSV or TSV body: the stored mapping that maps it. */
+                mapping?: string;
+                /** @description A CSV or TSV body: the default mapping's namespace. */
+                base?: string;
+                /** @description A CSV or TSV body: the column that names each row in the default mapping. */
+                key?: string;
+                /** @description A CSV or TSV body: the file name the mapping reads it as, when the mapping reads several. */
+                source?: string;
+                /** @description A CSVW mapping: standard mode adds the table group, table and row descriptions. */
+                csvwMode?: "minimal" | "standard";
+                /** @description A CSVW mapping: check primary and foreign keys (the default in standard mode). */
+                csvwCheck?: "keys" | "none";
+                /** @description A CONSTRUCT template: read the dataset's head while mapping. */
+                lookup?: boolean;
                 /** @description The graph IRI. `default` and `union` name the default graph and the union of the named graphs. */
                 graph?: components["parameters"]["gspGraph"];
                 /** @description Name the default graph (`?default`, no value needed). */
@@ -18037,6 +18453,20 @@ export interface operations {
     gspPost: {
         parameters: {
             query?: {
+                /** @description A CSV or TSV body: the stored mapping that maps it. */
+                mapping?: string;
+                /** @description A CSV or TSV body: the default mapping's namespace. */
+                base?: string;
+                /** @description A CSV or TSV body: the column that names each row in the default mapping. */
+                key?: string;
+                /** @description A CSV or TSV body: the file name the mapping reads it as, when the mapping reads several. */
+                source?: string;
+                /** @description A CSVW mapping: standard mode adds the table group, table and row descriptions. */
+                csvwMode?: "minimal" | "standard";
+                /** @description A CSVW mapping: check primary and foreign keys (the default in standard mode). */
+                csvwCheck?: "keys" | "none";
+                /** @description A CONSTRUCT template: read the dataset's head while mapping. */
+                lookup?: boolean;
                 /** @description The graph IRI. `default` and `union` name the default graph and the union of the named graphs. */
                 graph?: components["parameters"]["gspGraph"];
                 /** @description Name the default graph (`?default`, no value needed). */
@@ -18099,6 +18529,20 @@ export interface operations {
     gspDelete: {
         parameters: {
             query?: {
+                /** @description A CSV or TSV body: the stored mapping that maps it. */
+                mapping?: string;
+                /** @description A CSV or TSV body: the default mapping's namespace. */
+                base?: string;
+                /** @description A CSV or TSV body: the column that names each row in the default mapping. */
+                key?: string;
+                /** @description A CSV or TSV body: the file name the mapping reads it as, when the mapping reads several. */
+                source?: string;
+                /** @description A CSVW mapping: standard mode adds the table group, table and row descriptions. */
+                csvwMode?: "minimal" | "standard";
+                /** @description A CSVW mapping: check primary and foreign keys (the default in standard mode). */
+                csvwCheck?: "keys" | "none";
+                /** @description A CONSTRUCT template: read the dataset's head while mapping. */
+                lookup?: boolean;
                 /** @description The graph IRI. `default` and `union` name the default graph and the union of the named graphs. */
                 graph?: components["parameters"]["gspGraph"];
                 /** @description Name the default graph (`?default`, no value needed). */
@@ -18134,7 +18578,13 @@ export interface operations {
             };
             cookie?: never;
         };
-        requestBody?: never;
+        /** @description A table whose mapped triples are removed. */
+        requestBody?: {
+            content: {
+                "text/csv": string;
+                "text/tab-separated-values": string;
+            };
+        };
         responses: {
             200: components["responses"]["WriteDone"];
             /** @description The graph was deleted. */
@@ -18862,6 +19312,88 @@ export interface operations {
             403: components["responses"]["Forbidden"];
             404: components["responses"]["NotFound"];
             429: components["responses"]["TooManyRequests"];
+            default: components["responses"]["Error"];
+        };
+    };
+    runStoredMapping: {
+        parameters: {
+            query?: {
+                /** @description Add the triples (the default), or replace the graphs the mapping writes. */
+                mode?: "add" | "replace";
+                /** @description Run an older version. */
+                version?: number;
+                /** @description Write every triple into this graph. A mapping whose graph maps name another graph is `400` with code `mapping-graph-conflict`. */
+                graph?: string;
+                /** @description The base IRI of generated relative IRIs. */
+                base?: string;
+                /** @description A CONSTRUCT template: read the dataset's head while mapping. */
+                lookup?: boolean;
+                /** @description A CSVW mapping: standard mode. */
+                csvwMode?: "minimal" | "standard";
+                /** @description A CSVW mapping: check primary and foreign keys. */
+                csvwCheck?: "keys" | "none";
+                /** @description The branch to work on (default `main`). The path form `/{ds}@{branch}/…` chooses one too; the two must agree. */
+                branch?: components["parameters"]["branch"];
+                /** @description Seconds. Capped at the server's `--max-timeout`. */
+                timeout?: components["parameters"]["timeout"];
+                /** @description Run the write as a preview and roll it back. `dryRun` with no value means true. */
+                dryRun?: components["parameters"]["dryRun"];
+                /** @description With `dryRun`: list up to this many changed quads. */
+                changes?: components["parameters"]["changes"];
+                /** @description Add a commit receipt to the body. */
+                receipt?: components["parameters"]["receipt"];
+                /** @description `false` skips write-time validation when the server allows it (`--allow-unvalidated-writes`). */
+                validate?: components["parameters"]["validate"];
+                /** @description The most validation results reported when a write is rejected. */
+                validationLimit?: number;
+            };
+            header?: {
+                /** @description Entity tags. A write needs a tag that names the current head. */
+                "If-Match"?: components["parameters"]["ifMatch"];
+                /** @description The commit message of the write, at most 1024 bytes of UTF-8. RFC 8187 extended values are accepted. */
+                "Sparkles-Commit-Message"?: components["parameters"]["commitMessage"];
+                /** @description `true` runs the write as a preview. */
+                "Sparkles-Dry-Run"?: components["parameters"]["dryRunHeader"];
+            };
+            path: {
+                /** @description The dataset name. */
+                ds: components["parameters"]["ds"];
+                /** @description The name of the stored query, snapshot, vector index, branch, ingest profile or model secret. */
+                name: components["parameters"]["name"];
+            };
+            cookie?: never;
+        };
+        /** @description The files the mapping reads, each a part whose file name is the one the mapping names. */
+        requestBody?: {
+            content: {
+                "multipart/form-data": {
+                    file?: string[];
+                } & {
+                    [key: string]: unknown;
+                };
+            };
+        };
+        responses: {
+            /** @description The run's counts, with the commit receipt when asked for. */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["MappingRun"];
+                };
+            };
+            400: components["responses"]["BadRequest"];
+            401: components["responses"]["Unauthorized"];
+            403: components["responses"]["Forbidden"];
+            404: components["responses"]["NotFound"];
+            408: components["responses"]["Timeout"];
+            412: components["responses"]["PreconditionFailed"];
+            413: components["responses"]["PayloadTooLarge"];
+            415: components["responses"]["UnsupportedMediaType"];
+            422: components["responses"]["Unprocessable"];
+            503: components["responses"]["Unavailable"];
+            507: components["responses"]["InsufficientStorage"];
             default: components["responses"]["Error"];
         };
     };
@@ -20168,6 +20700,18 @@ export interface operations {
                 base?: string;
                 /** @description The column that names each row in the default mapping. */
                 key?: string;
+                /** @description A stored mapping to use instead of a `mapping` part. */
+                mapping?: string;
+                /** @description The stored mapping's version (the latest by default). */
+                mappingVersion?: number;
+                /** @description The kind of the `mapping` part when its content does not tell. */
+                mappingKind?: "rml" | "yarrrml" | "csvw" | "template";
+                /** @description A CSVW mapping: standard mode adds the table group, table and row descriptions. */
+                csvwMode?: "minimal" | "standard";
+                /** @description A CSVW mapping: check primary and foreign keys (the default in standard mode). */
+                csvwCheck?: "keys" | "none";
+                /** @description A CONSTRUCT template: read the dataset's head while mapping. The report gives `lookupCommit`, and `If-Match` makes the commit fail when the head moved. */
+                lookup?: boolean;
                 /** @description The branch to work on (default `main`). The path form `/{ds}@{branch}/…` chooses one too; the two must agree. */
                 branch?: components["parameters"]["branch"];
                 /** @description Seconds. Capped at the server's `--max-timeout`. */
@@ -20184,6 +20728,8 @@ export interface operations {
                 validationLimit?: number;
             };
             header?: {
+                /** @description Entity tags. A write needs a tag that names the current head. */
+                "If-Match"?: components["parameters"]["ifMatch"];
                 /** @description The commit message of the write, at most 1024 bytes of UTF-8. RFC 8187 extended values are accepted. */
                 "Sparkles-Commit-Message"?: components["parameters"]["commitMessage"];
                 /** @description `true` runs the write as a preview. */
@@ -20201,7 +20747,7 @@ export interface operations {
                 "multipart/form-data": {
                     file?: string[];
                     graph?: string;
-                    /** @description A CSVW metadata document. */
+                    /** @description CSVW metadata, an R2RML, RML or YARRRML mapping, or a CONSTRUCT template. The file parts its sources name are read by it. */
                     mapping?: string;
                     /** @description A SPARQL CONSTRUCT template for tables. */
                     template?: string;
@@ -20277,6 +20823,20 @@ export interface operations {
     directGraphPut: {
         parameters: {
             query?: {
+                /** @description A CSV or TSV body: the stored mapping that maps it. */
+                mapping?: string;
+                /** @description A CSV or TSV body: the default mapping's namespace. */
+                base?: string;
+                /** @description A CSV or TSV body: the column that names each row in the default mapping. */
+                key?: string;
+                /** @description A CSV or TSV body: the file name the mapping reads it as, when the mapping reads several. */
+                source?: string;
+                /** @description A CSVW mapping: standard mode adds the table group, table and row descriptions. */
+                csvwMode?: "minimal" | "standard";
+                /** @description A CSVW mapping: check primary and foreign keys (the default in standard mode). */
+                csvwCheck?: "keys" | "none";
+                /** @description A CONSTRUCT template: read the dataset's head while mapping. */
+                lookup?: boolean;
                 /** @description The branch to work on (default `main`). The path form `/{ds}@{branch}/…` chooses one too; the two must agree. */
                 branch?: components["parameters"]["branch"];
                 /** @description Seconds. Capped at the server's `--max-timeout`. */
@@ -20337,6 +20897,20 @@ export interface operations {
     directGraphPost: {
         parameters: {
             query?: {
+                /** @description A CSV or TSV body: the stored mapping that maps it. */
+                mapping?: string;
+                /** @description A CSV or TSV body: the default mapping's namespace. */
+                base?: string;
+                /** @description A CSV or TSV body: the column that names each row in the default mapping. */
+                key?: string;
+                /** @description A CSV or TSV body: the file name the mapping reads it as, when the mapping reads several. */
+                source?: string;
+                /** @description A CSVW mapping: standard mode adds the table group, table and row descriptions. */
+                csvwMode?: "minimal" | "standard";
+                /** @description A CSVW mapping: check primary and foreign keys (the default in standard mode). */
+                csvwCheck?: "keys" | "none";
+                /** @description A CONSTRUCT template: read the dataset's head while mapping. */
+                lookup?: boolean;
                 /** @description The branch to work on (default `main`). The path form `/{ds}@{branch}/…` chooses one too; the two must agree. */
                 branch?: components["parameters"]["branch"];
                 /** @description Seconds. Capped at the server's `--max-timeout`. */
@@ -20397,6 +20971,20 @@ export interface operations {
     directGraphDelete: {
         parameters: {
             query?: {
+                /** @description A CSV or TSV body: the stored mapping that maps it. */
+                mapping?: string;
+                /** @description A CSV or TSV body: the default mapping's namespace. */
+                base?: string;
+                /** @description A CSV or TSV body: the column that names each row in the default mapping. */
+                key?: string;
+                /** @description A CSV or TSV body: the file name the mapping reads it as, when the mapping reads several. */
+                source?: string;
+                /** @description A CSVW mapping: standard mode adds the table group, table and row descriptions. */
+                csvwMode?: "minimal" | "standard";
+                /** @description A CSVW mapping: check primary and foreign keys (the default in standard mode). */
+                csvwCheck?: "keys" | "none";
+                /** @description A CONSTRUCT template: read the dataset's head while mapping. */
+                lookup?: boolean;
                 /** @description The branch to work on (default `main`). The path form `/{ds}@{branch}/…` chooses one too; the two must agree. */
                 branch?: components["parameters"]["branch"];
                 /** @description Seconds. Capped at the server's `--max-timeout`. */
@@ -20430,7 +21018,13 @@ export interface operations {
             };
             cookie?: never;
         };
-        requestBody?: never;
+        /** @description A table whose mapped triples are removed. */
+        requestBody?: {
+            content: {
+                "text/csv": string;
+                "text/tab-separated-values": string;
+            };
+        };
         responses: {
             200: components["responses"]["WriteDone"];
             /** @description The graph was deleted. */

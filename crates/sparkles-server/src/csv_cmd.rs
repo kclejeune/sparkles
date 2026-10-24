@@ -1,9 +1,12 @@
 //! CSV and TSV files on the command line (spec C05): the mapping options of
 //! `sparkles load`, which turn each table into a temporary N-Triples file before the
-//! load, and `sparkles csv`, which converts tables without loading them.
+//! load, and `sparkles csv`, which converts tables without loading them. A `--mapping`
+//! that holds R2RML, RML or YARRRML runs through the mapping engine instead (spec F19),
+//! with the files on the command line as its sources.
 
 use anyhow::{Context, Result, bail};
 use clap::{Args, Subcommand};
+use sparkles::mapping::{self, MappingKind};
 use sparkles::tabular::{self, Mapping, Options, Stats};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -27,11 +30,124 @@ pub struct CsvArgs {
     /// mapping (without it, a row is named by its row number in the file)
     #[arg(long, value_name = "COLUMN", conflicts_with_all = ["mapping", "template"])]
     pub key: Option<String>,
+    /// The kind of the --mapping file when its content does not tell: rml (R2RML and
+    /// RML), yarrrml, csvw or template
+    #[arg(long, value_name = "KIND")]
+    pub mapping_kind: Option<String>,
+    /// R2RML, RML and YARRRML: a file that a logical source names, NAME=PATH
+    /// (repeatable); files on the command line count by their file names
+    #[arg(long, value_name = "NAME=PATH")]
+    pub source: Vec<String>,
+    /// R2RML, RML and YARRRML: a database connection, NAME=URL with sqlite:PATH
+    /// (repeatable); an R2RML mapping reads the only one, or the one named default
+    #[arg(long, value_name = "NAME=URL")]
+    pub connection: Vec<String>,
+    /// CSVW metadata: minimal (the default) or standard, which adds the table group,
+    /// table and row descriptions
+    #[arg(long, value_name = "MODE", value_parser = ["minimal", "standard"])]
+    pub csvw_mode: Option<String>,
+    /// CSVW metadata: check primary and foreign keys (keys, the default in standard
+    /// mode) or not (none)
+    #[arg(long, value_name = "CHECK", value_parser = ["keys", "none"])]
+    pub csvw_check: Option<String>,
+    /// CONSTRUCT templates: read the target database (--loc) while mapping
+    #[arg(long)]
+    pub lookup: bool,
+    /// JSON sources of a mapping: the largest document, in MiB (default 512)
+    #[arg(long, value_name = "MB")]
+    pub max_json_mb: Option<u64>,
+    /// The graph of a load (`sparkles load --graph`), which an R2RML, RML or YARRRML
+    /// mapping writes every quad into
+    #[arg(skip)]
+    pub graph: Option<String>,
+}
+
+/// `NAME=VALUE`
+fn pair(s: &str, what: &str) -> Result<(String, String)> {
+    let (n, v) = s
+        .split_once('=')
+        .with_context(|| format!("{what} {s}: expected NAME=VALUE"))?;
+    Ok((n.to_string(), v.to_string()))
+}
+
+/// The connections of `--connection NAME=URL`.
+pub fn connections(args: &[String]) -> Result<Vec<mapping::NamedConnection>> {
+    args.iter()
+        .map(|c| {
+            let (name, url) = pair(c, "--connection")?;
+            Ok(mapping::NamedConnection {
+                name,
+                connection: mapping::Connection::from_url(&url)?,
+                jdbc_dsn: None,
+            })
+        })
+        .collect()
+}
+
+/// The kind of a mapping file: `--mapping-kind`, or its content.
+pub fn file_kind(path: &Path, explicit: Option<&str>) -> Result<MappingKind> {
+    if let Some(k) = explicit {
+        return MappingKind::parse(k)
+            .with_context(|| format!("--mapping-kind {k}: use rml, yarrrml, csvw or template"));
+    }
+    let text =
+        std::fs::read_to_string(path).with_context(|| format!("reading {}", path.display()))?;
+    mapping::detect(&text).with_context(|| {
+        format!(
+            "{}: not CSVW metadata, R2RML, RML, YARRRML or a CONSTRUCT template (give --mapping-kind)",
+            path.display()
+        )
+    })
 }
 
 impl CsvArgs {
     fn explicit(&self) -> bool {
         self.mapping.is_some() || self.template.is_some() || self.key.is_some()
+    }
+
+    /// The mapping engine's kind of `--mapping`, when it holds R2RML, RML or YARRRML.
+    pub fn engine_kind(&self) -> Result<Option<MappingKind>> {
+        let Some(m) = &self.mapping else {
+            return Ok(None);
+        };
+        Ok(match file_kind(m, self.mapping_kind.as_deref())? {
+            k @ (MappingKind::Rml | MappingKind::Yarrrml) => Some(k),
+            _ => None,
+        })
+    }
+
+    /// Whether `--mapping` holds a CONSTRUCT template.
+    fn mapping_is_template(&self) -> Result<bool> {
+        match &self.mapping {
+            Some(m) => Ok(file_kind(m, self.mapping_kind.as_deref())? == MappingKind::Template),
+            None => Ok(false),
+        }
+    }
+
+    fn standard(&self) -> bool {
+        self.csvw_mode.as_deref() == Some("standard")
+    }
+
+    fn keys(&self) -> bool {
+        match self.csvw_check.as_deref() {
+            Some(c) => c == "keys",
+            None => self.standard(),
+        }
+    }
+
+    /// The run options of the mapping engine.
+    pub fn run_options(&self) -> mapping::RunOptions {
+        mapping::RunOptions {
+            only_graph: self
+                .graph
+                .as_deref()
+                .and_then(|g| oxrdf::NamedNode::new(g).ok()),
+            base: self.base.clone(),
+            max_json_bytes: self
+                .max_json_mb
+                .map_or(mapping::DEFAULT_MAX_JSON_BYTES, |m| m << 20),
+            ..Default::default()
+        }
     }
 
     /// The mapping for `file`: the explicit one, a `file-metadata.json` next to it, or
@@ -41,6 +157,16 @@ impl CsvArgs {
         file: Option<&Path>,
         cache: &mut Cache,
     ) -> Result<(Mapping, Option<String>)> {
+        // a CONSTRUCT template given as --mapping is a template
+        if self.mapping_is_template()? {
+            return Ok((
+                Mapping::Template {
+                    template: cache.template(self.mapping.as_ref().expect("checked"))?,
+                    metadata: None,
+                },
+                None,
+            ));
+        }
         let metadata = match &self.mapping {
             Some(m) => Some(cache.metadata(m)?),
             None => None,
@@ -229,7 +355,103 @@ fn options(job: &Job, args: &CsvArgs, part: usize) -> Options {
     o.base = args.base.clone();
     o.table = job.table;
     o.part = part;
+    o.standard = args.standard();
     o
+}
+
+/// With key checks, the jobs of a CSVW mapping in the order of their foreign keys, each
+/// with the table it is, and the registry that shares the referenced values.
+fn order_for_keys(
+    jobs: Vec<Job>,
+    args: &CsvArgs,
+) -> Result<(Vec<Job>, Option<Arc<tabular::KeyRegistry>>)> {
+    if !args.keys() {
+        return Ok((jobs, None));
+    }
+    let Some(Mapping::Csvw(meta)) = jobs.first().map(|j| j.mapping.clone()) else {
+        if args.csvw_check.is_some() {
+            bail!("--csvw-check keys needs CSVW metadata (--mapping)");
+        }
+        return Ok((jobs, None));
+    };
+    let mut indexed = Vec::new();
+    for (i, mut j) in jobs.into_iter().enumerate() {
+        let t = match j.table {
+            Some(t) => t,
+            None => tabular::table_index(&meta, &options(&j, args, i))?,
+        };
+        j.table = Some(t);
+        indexed.push((t, j));
+    }
+    let tables: Vec<usize> = indexed.iter().map(|(t, _)| *t).collect();
+    let order = tabular::key_order(&meta, &tables)?;
+    let mut out = Vec::new();
+    for t in order {
+        if let Some(pos) = indexed.iter().position(|(x, _)| *x == t) {
+            out.push(indexed.remove(pos).1);
+        }
+    }
+    Ok((out, Some(Arc::new(tabular::KeyRegistry::new(None)))))
+}
+
+/// The inputs of the mapping engine: `--source`, `--connection`, the files on the
+/// command line that a logical source names, and the mapping file's directory. Returns
+/// the inputs and the files that are not sources (RDF files of the same load).
+fn engine_inputs(
+    m: &mapping::Mapping,
+    mapping_file: &Path,
+    files: &[PathBuf],
+    args: &CsvArgs,
+) -> Result<(mapping::Inputs, Vec<PathBuf>)> {
+    let mut inputs = mapping::Inputs {
+        files: Vec::new(),
+        dir: mapping_file.parent().map(|d| {
+            if d.as_os_str().is_empty() {
+                PathBuf::from(".")
+            } else {
+                d.to_path_buf()
+            }
+        }),
+        connections: connections(&args.connection)?,
+    };
+    for s in &args.source {
+        let (n, p) = pair(s, "--source")?;
+        inputs.files.push((n, PathBuf::from(p)));
+    }
+    let last = |s: &str| s.rsplit(['/', '\\']).next().unwrap_or(s).to_string();
+    let names: Vec<String> = m
+        .sources
+        .iter()
+        .filter_map(|s| s.kind.file().map(last))
+        .collect();
+    let mut rest = Vec::new();
+    for f in files {
+        let name = f
+            .file_name()
+            .map(|n| n.to_string_lossy().into_owned())
+            .unwrap_or_default();
+        if names.contains(&name) {
+            inputs.files.push((name, f.clone()));
+        } else {
+            rest.push(f.clone());
+        }
+    }
+    Ok((inputs, rest))
+}
+
+/// Read and parse a mapping file of the engine's kinds.
+pub fn read_mapping(path: &Path, kind: MappingKind) -> Result<mapping::Mapping> {
+    let text =
+        std::fs::read_to_string(path).with_context(|| format!("reading {}", path.display()))?;
+    mapping::parse(&text, kind, Some(&tabular::file_url(path)))
+        .map_err(|e| anyhow::anyhow!("{}: {e}", path.display()))
+}
+
+fn report_mapping(name: &str, s: &mapping::Stats) {
+    for w in &s.warnings {
+        eprintln!("{name}: warning: {w}");
+    }
+    eprintln!("{name}: {} rows, {} quads", s.rows, s.quads);
 }
 
 fn report(name: &str, s: &Stats, note: Option<&str>) {
@@ -256,31 +478,94 @@ pub struct Prepared {
 }
 
 /// Convert the tables and the files in Jena's syntaxes among `files` for a load. Other
-/// RDF files pass through.
-pub fn prepare(files: &[PathBuf], args: &CsvArgs) -> Result<Prepared> {
-    let jobs = jobs(files, args)?;
+/// RDF files pass through. A template with `--lookup` reads `lookup`.
+pub fn prepare(
+    files: &[PathBuf],
+    args: &CsvArgs,
+    lookup: Option<tabular::template::Lookup>,
+) -> Result<Prepared> {
     let mut out = Prepared {
         files: Vec::new(),
         names: Vec::new(),
         converted: Vec::new(),
         _temps: Vec::new(),
     };
+    if let Some(kind) = args.engine_kind()? {
+        let mfile = args.mapping.as_ref().expect("an engine mapping");
+        if args.template.is_some() || args.key.is_some() {
+            bail!("--template and --key do not apply to an R2RML, RML or YARRRML mapping");
+        }
+        let m = read_mapping(mfile, kind)?;
+        let (inputs, rest) = engine_inputs(&m, mfile, files, args)?;
+        let (path, stats) = mapping::to_nquads_file(&m, &inputs, &args.run_options(), None)?;
+        let name = mfile.display().to_string();
+        report_mapping(&name, &stats);
+        out.files.push(path.to_path_buf());
+        out.names.push(name);
+        out.converted.push(true);
+        out._temps.push(path);
+        for f in rest {
+            let p = prepare(std::slice::from_ref(&f), &CsvArgs::default(), None)?;
+            out.files.extend(p.files);
+            out.names.extend(p.names);
+            out.converted.extend(p.converted);
+            out._temps.extend(p._temps);
+        }
+        return Ok(out);
+    }
+    if args.lookup && lookup.is_none() {
+        bail!("--lookup reads the target database, so it needs --loc");
+    }
+    let (jobs, keys) = order_for_keys(jobs(files, args)?, args)?;
     let mut converted = std::collections::HashMap::new();
+    // in standard mode the tables share one file, so that the table group's blank node
+    // is one node when the file is loaded
+    let mut shared: Option<PathBuf> = None;
     for (i, job) in jobs.iter().enumerate() {
         let name = job.path.display().to_string();
         let input = tabular::open(&job.path, None)?;
-        let (path, stats) = tabular::to_ntriples_file(input, &options(job, args, i), None)?;
+        let mut o = options(job, args, i);
+        o.keys = keys.clone();
+        o.lookup = lookup.clone();
+        let (path, stats) = match &shared {
+            Some(p) if args.standard() => {
+                let f = std::fs::OpenOptions::new().append(true).open(p)?;
+                let stats = tabular::write(
+                    input,
+                    &o,
+                    std::io::BufWriter::with_capacity(1 << 20, f),
+                    oxrdfio::RdfFormat::NTriples,
+                    None,
+                )?;
+                (p.clone(), stats)
+            }
+            _ => {
+                let (temp, stats) = tabular::to_ntriples_file(input, &o, None)?;
+                let p = temp.to_path_buf();
+                out._temps.push(temp);
+                if args.standard() {
+                    shared = Some(p.clone());
+                }
+                (p, stats)
+            }
+        };
         report(&name, &stats, job.note.as_deref());
-        converted.insert(job.path.clone(), path.to_path_buf());
-        if !files.contains(&job.path) {
-            out.files.push(path.to_path_buf());
+        if let Some(c) = stats.lookup_commit {
+            eprintln!("{name}: the template read commit {c}");
+        }
+        converted.insert(job.path.clone(), path.clone());
+        if !files.contains(&job.path) && !out.files.contains(&path) {
+            out.files.push(path);
             out.names.push(name);
             out.converted.push(true);
         }
-        out._temps.push(path);
     }
     for f in files {
         if let Some(p) = converted.get(f) {
+            // the shared file of standard mode is loaded once
+            if out.files.contains(p) {
+                continue;
+            }
             out.files.push(p.clone());
             out.converted.push(true);
         } else if let Some(j) = crate::http::jena_formats::JenaFormat::from_path(f) {
@@ -327,6 +612,8 @@ pub struct CsvCmdArgs {
     pub cmd: CsvCmd,
 }
 
+// one command runs per process, so the size of a variant does not matter
+#[allow(clippy::large_enum_variant)]
 #[derive(Subcommand, Debug)]
 pub enum CsvCmd {
     /// Convert CSV and TSV files to RDF without loading them
@@ -384,7 +671,13 @@ pub fn run(args: CsvCmdArgs) -> Result<()> {
             if graph.is_some() && format != oxrdfio::RdfFormat::NQuads {
                 bail!("--graph needs --format nq");
             }
-            let jobs = jobs(&files, &csv)?;
+            if csv.engine_kind()?.is_some() {
+                bail!("an R2RML, RML or YARRRML mapping runs with `sparkles map run`");
+            }
+            if csv.lookup {
+                bail!("--lookup reads a database; use it with sparkles load --loc");
+            }
+            let (jobs, keys) = order_for_keys(jobs(&files, &csv)?, &csv)?;
             // written through a temporary file that replaces the output at the end
             let staged = match &output {
                 Some(p) => Some(crate::tools::out_file::OutFile::create(
@@ -402,13 +695,9 @@ pub fn run(args: CsvCmdArgs) -> Result<()> {
             };
             for (i, job) in jobs.iter().enumerate() {
                 let input = tabular::open(&job.path, None)?;
-                let stats = tabular::write(
-                    input,
-                    &options(job, &csv, i),
-                    &mut out,
-                    format,
-                    graph.as_ref(),
-                )?;
+                let mut o = options(job, &csv, i);
+                o.keys = keys.clone();
+                let stats = tabular::write(input, &o, &mut out, format, graph.as_ref())?;
                 report(&job.path.display().to_string(), &stats, job.note.as_deref());
             }
             out.flush()?;
@@ -460,7 +749,7 @@ mod tests {
             key: Some("id".into()),
             ..Default::default()
         };
-        let p = prepare(&[csv.clone(), ttl.clone()], &args).unwrap();
+        let p = prepare(&[csv.clone(), ttl.clone()], &args, None).unwrap();
         assert_eq!(p.files.len(), 2);
         assert_eq!(p.files[1], ttl);
         let nt = std::fs::read_to_string(&p.files[0]).unwrap();
@@ -478,7 +767,7 @@ mod tests {
                             {"name": "name", "propertyUrl": "http://e/name"}]}}"#,
         )
         .unwrap();
-        let p = prepare(std::slice::from_ref(&csv), &CsvArgs::default()).unwrap();
+        let p = prepare(std::slice::from_ref(&csv), &CsvArgs::default(), None).unwrap();
         let nt = std::fs::read_to_string(&p.files[0]).unwrap();
         assert!(
             nt.contains(
@@ -493,6 +782,7 @@ mod tests {
                 mapping: Some(dir.path().join("people.csv-metadata.json")),
                 ..Default::default()
             },
+            None,
         );
         assert!(p.is_err(), "the table has no url");
         std::fs::write(
@@ -507,11 +797,12 @@ mod tests {
                 mapping: Some(dir.path().join("m.json")),
                 ..Default::default()
             },
+            None,
         )
         .unwrap();
         let nt = std::fs::read_to_string(&p.files[0]).unwrap();
         assert!(nt.contains("<http://e/q/7>"), "{nt}");
         // options without a table
-        assert!(prepare(&[ttl], &args).is_err());
+        assert!(prepare(&[ttl], &args, None).is_err());
     }
 }

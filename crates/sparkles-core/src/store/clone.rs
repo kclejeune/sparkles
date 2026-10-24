@@ -253,6 +253,7 @@ impl Store {
         if let Some(root) = &self.root {
             for f in crate::guard::config::FILES.iter().chain([
                 &crate::stored::FILE,
+                &crate::stored_mappings::FILE,
                 &crate::algo::catalog::FILE,
                 &"graphql.json",
             ]) {

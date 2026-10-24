@@ -149,6 +149,11 @@ pub const ROUTES: &[(&str, &[&str])] = &[
     ("/$/queries/{ds}/{name}", &["GET", "PUT", "DELETE"]),
     ("/$/queries/{ds}/{name}/versions", &["GET"]),
     ("/{ds}/queries/{name}", &["GET", "POST"]),
+    // stored mappings (F19 §2.2): admin stores them, write runs them
+    ("/$/mappings/{ds}", &["GET"]),
+    ("/$/mappings/{ds}/{name}", &["GET", "PUT", "DELETE"]),
+    ("/$/mappings/{ds}/{name}/versions", &["GET"]),
+    ("/{ds}/mappings/{name}/run", &["POST"]),
     // incremental views and live queries (F13): readers list views and subscribe,
     // admins define them
     ("/$/views/{ds}", &["GET"]),
@@ -435,6 +440,8 @@ pub fn need(route: &str, method: &Method, uri: &Uri, headers: &HeaderMap) -> Opt
         | "/$/commits/{ds}/{reference}"
         | "/$/queries/{ds}"
         | "/$/queries/{ds}/{name}/versions"
+        | "/$/mappings/{ds}"
+        | "/$/mappings/{ds}/{name}/versions"
         | "/{ds}/queries/{name}"
         | "/$/vector/{ds}"
         | "/$/vector/{ds}/{name}/recall"
@@ -465,6 +472,7 @@ pub fn need(route: &str, method: &Method, uri: &Uri, headers: &HeaderMap) -> Opt
         | "/$/geo/{ds}"
         | "/$/vector/{ds}/{name}"
         | "/$/queries/{ds}/{name}"
+        | "/$/mappings/{ds}/{name}"
         | "/$/snapshots/{ds}"
         | "/$/snapshots/{ds}/{name}"
         | "/$/history/{ds}"
@@ -501,6 +509,8 @@ pub fn need(route: &str, method: &Method, uri: &Uri, headers: &HeaderMap) -> Opt
         | "/$/snapshots/{ds}/{name}"
         | "/$/history/{ds}"
         | "/$/queries/{ds}/{name}"
+        // a stored mapping names connections, and can read any table they reach
+        | "/$/mappings/{ds}/{name}"
         | "/$/validation/{ds}"
         | "/$/graphql/{ds}"
         | "/$/rdfs/{ds}"
@@ -528,7 +538,9 @@ pub fn need(route: &str, method: &Method, uri: &Uri, headers: &HeaderMap) -> Opt
         | "/$/backups/{ds}/{repo}/{backup}"
         | "/$/backups/{ds}/{repo}/{backup}/restore"
         | "/$/backups/{ds}/{repo}/{backup}/verify" => Dataset(Admin),
-        "/{ds}/update" | "/{ds}/upload" | "/{ds}/facts" => Dataset(Write),
+        "/{ds}/update" | "/{ds}/upload" | "/{ds}/facts" | "/{ds}/mappings/{name}/run" => {
+            Dataset(Write)
+        }
         "/{ds}/memory/brief" => Dataset(Read),
         "/{ds}/sources" if get => Dataset(Read),
         "/{ds}/sources" => Dataset(Write),
@@ -588,7 +600,7 @@ pub fn endpoint(route: &str, method: &Method, uri: &Uri, headers: &HeaderMap) ->
         "/{ds}/get" => Endpoint::GspR,
         "/{ds}/data" | "/{ds}/{*graph}" if get => Endpoint::GspR,
         "/{ds}/data" | "/{ds}/{*graph}" => Endpoint::GspRw,
-        "/{ds}/upload" => Endpoint::Upload,
+        "/{ds}/upload" | "/{ds}/mappings/{name}/run" => Endpoint::Upload,
         "/{ds}/patch" => Endpoint::Patch,
         "/{ds}/shacl" => Endpoint::Shacl,
         "/{ds}/shex" => Endpoint::Shex,

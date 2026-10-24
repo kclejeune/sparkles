@@ -516,6 +516,11 @@
               "type": "string"
             }
           },
+          "text/csv": {
+            "schema": {
+              "type": "string"
+            }
+          },
           "text/n3": {
             "schema": {
               "type": "string"
@@ -526,13 +531,18 @@
               "type": "string"
             }
           },
+          "text/tab-separated-values": {
+            "schema": {
+              "type": "string"
+            }
+          },
           "text/turtle": {
             "schema": {
               "type": "string"
             }
           }
         },
-        "description": "RDF data in the syntax its `Content-Type` names. Jena's N3 media types are read as Turtle.",
+        "description": "RDF data in the syntax its `Content-Type` names. Jena's N3 media types are read as Turtle. A `text/csv` or `text/tab-separated-values` body is a table that `mapping` or `base` maps into the graph.",
         "required": true
       },
       "SparqlQuery": {
@@ -9666,6 +9676,60 @@
         ],
         "type": "object"
       },
+      "MappingRun": {
+        "description": "What a stored mapping's run made and committed.",
+        "externalDocs": {
+          "url": "https://github.com/kclejeune/sparkles/blob/main/docs/API.md#stored-mappings"
+        },
+        "properties": {
+          "count": {
+            "description": "The quads the commit added.",
+            "type": "integer"
+          },
+          "mapping": {
+            "type": "string"
+          },
+          "mode": {
+            "enum": [
+              "add",
+              "replace"
+            ],
+            "type": "string"
+          },
+          "quads": {
+            "description": "The quads the mapping made, before the load removed duplicates.",
+            "type": "integer"
+          },
+          "reports": {
+            "items": {
+              "additionalProperties": true,
+              "type": "object"
+            },
+            "type": "array"
+          },
+          "rows": {
+            "type": "integer"
+          },
+          "version": {
+            "type": "integer"
+          },
+          "warnings": {
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          }
+        },
+        "required": [
+          "mapping",
+          "version",
+          "mode",
+          "rows",
+          "quads",
+          "warnings"
+        ],
+        "type": "object"
+      },
       "MemoryInbox": {
         "description": "Everything that waits for a person: unreviewed session facts with their signals, by session, and the open review branches.",
         "externalDocs": {
@@ -16521,6 +16585,414 @@
         },
         "required": [
           "head"
+        ],
+        "type": "object"
+      },
+      "StoredMapping": {
+        "description": "A stored mapping, with the summary of its check and its last run.",
+        "externalDocs": {
+          "url": "https://github.com/kclejeune/sparkles/blob/main/docs/API.md#stored-mappings"
+        },
+        "properties": {
+          "changed": {
+            "description": "On a PUT: whether a new version was stored.",
+            "type": "boolean"
+          },
+          "dataset": {
+            "type": "string"
+          },
+          "description": {
+            "type": "string"
+          },
+          "kind": {
+            "enum": [
+              "rml",
+              "yarrrml",
+              "csvw",
+              "template"
+            ],
+            "type": "string"
+          },
+          "lastRun": {
+            "properties": {
+              "author": {
+                "type": "string"
+              },
+              "commit": {
+                "type": "integer"
+              },
+              "mode": {
+                "enum": [
+                  "add",
+                  "replace"
+                ],
+                "type": "string"
+              },
+              "quads": {
+                "type": "integer"
+              },
+              "rows": {
+                "type": "integer"
+              },
+              "time": {
+                "type": "string"
+              },
+              "version": {
+                "type": "integer"
+              },
+              "warnings": {
+                "items": {
+                  "type": "string"
+                },
+                "type": "array"
+              }
+            },
+            "required": [
+              "time",
+              "version",
+              "mode",
+              "quads",
+              "rows"
+            ],
+            "type": "object"
+          },
+          "name": {
+            "type": "string"
+          },
+          "summary": {
+            "properties": {
+              "connections": {
+                "description": "The connections it reads. An empty name is an R2RML mapping's default connection.",
+                "items": {
+                  "type": "string"
+                },
+                "type": "array"
+              },
+              "files": {
+                "items": {
+                  "type": "string"
+                },
+                "type": "array"
+              },
+              "graphs": {
+                "description": "The graphs its graph maps name, `default` for the default graph, or null when one is not constant.",
+                "items": {
+                  "type": "string"
+                },
+                "type": [
+                  "array",
+                  "null"
+                ]
+              },
+              "kind": {
+                "type": "string"
+              },
+              "triplesMaps": {
+                "type": "integer"
+              },
+              "vocabulary": {
+                "description": "R2RML, RML (rml.io), RML-Core or YARRRML.",
+                "type": "string"
+              },
+              "warnings": {
+                "items": {
+                  "type": "string"
+                },
+                "type": "array"
+              }
+            },
+            "required": [
+              "kind",
+              "triplesMaps",
+              "files",
+              "connections",
+              "warnings"
+            ],
+            "type": "object"
+          },
+          "text": {
+            "description": "The mapping text. Listings leave it out.",
+            "type": "string"
+          },
+          "version": {
+            "properties": {
+              "author": {
+                "type": "string"
+              },
+              "created": {
+                "type": "string"
+              },
+              "datasetCommit": {
+                "description": "The dataset's head when the version was saved.",
+                "type": "integer"
+              },
+              "digest": {
+                "description": "Hex SHA-256 over the parent's digest and the definition.",
+                "type": "string"
+              },
+              "message": {
+                "type": "string"
+              },
+              "parent": {
+                "type": "integer"
+              },
+              "version": {
+                "type": "integer"
+              }
+            },
+            "required": [
+              "version",
+              "created",
+              "digest"
+            ],
+            "type": "object"
+          }
+        },
+        "required": [
+          "name",
+          "kind",
+          "version"
+        ],
+        "type": "object"
+      },
+      "StoredMappingList": {
+        "description": "A dataset's stored mappings, without their text.",
+        "externalDocs": {
+          "url": "https://github.com/kclejeune/sparkles/blob/main/docs/API.md#stored-mappings"
+        },
+        "properties": {
+          "dataset": {
+            "type": "string"
+          },
+          "mappings": {
+            "items": {
+              "properties": {
+                "changed": {
+                  "description": "On a PUT: whether a new version was stored.",
+                  "type": "boolean"
+                },
+                "dataset": {
+                  "type": "string"
+                },
+                "description": {
+                  "type": "string"
+                },
+                "kind": {
+                  "enum": [
+                    "rml",
+                    "yarrrml",
+                    "csvw",
+                    "template"
+                  ],
+                  "type": "string"
+                },
+                "lastRun": {
+                  "properties": {
+                    "author": {
+                      "type": "string"
+                    },
+                    "commit": {
+                      "type": "integer"
+                    },
+                    "mode": {
+                      "enum": [
+                        "add",
+                        "replace"
+                      ],
+                      "type": "string"
+                    },
+                    "quads": {
+                      "type": "integer"
+                    },
+                    "rows": {
+                      "type": "integer"
+                    },
+                    "time": {
+                      "type": "string"
+                    },
+                    "version": {
+                      "type": "integer"
+                    },
+                    "warnings": {
+                      "items": {
+                        "type": "string"
+                      },
+                      "type": "array"
+                    }
+                  },
+                  "required": [
+                    "time",
+                    "version",
+                    "mode",
+                    "quads",
+                    "rows"
+                  ],
+                  "type": "object"
+                },
+                "name": {
+                  "type": "string"
+                },
+                "summary": {
+                  "properties": {
+                    "connections": {
+                      "description": "The connections it reads. An empty name is an R2RML mapping's default connection.",
+                      "items": {
+                        "type": "string"
+                      },
+                      "type": "array"
+                    },
+                    "files": {
+                      "items": {
+                        "type": "string"
+                      },
+                      "type": "array"
+                    },
+                    "graphs": {
+                      "description": "The graphs its graph maps name, `default` for the default graph, or null when one is not constant.",
+                      "items": {
+                        "type": "string"
+                      },
+                      "type": [
+                        "array",
+                        "null"
+                      ]
+                    },
+                    "kind": {
+                      "type": "string"
+                    },
+                    "triplesMaps": {
+                      "type": "integer"
+                    },
+                    "vocabulary": {
+                      "description": "R2RML, RML (rml.io), RML-Core or YARRRML.",
+                      "type": "string"
+                    },
+                    "warnings": {
+                      "items": {
+                        "type": "string"
+                      },
+                      "type": "array"
+                    }
+                  },
+                  "required": [
+                    "kind",
+                    "triplesMaps",
+                    "files",
+                    "connections",
+                    "warnings"
+                  ],
+                  "type": "object"
+                },
+                "text": {
+                  "description": "The mapping text. Listings leave it out.",
+                  "type": "string"
+                },
+                "version": {
+                  "properties": {
+                    "author": {
+                      "type": "string"
+                    },
+                    "created": {
+                      "type": "string"
+                    },
+                    "datasetCommit": {
+                      "description": "The dataset's head when the version was saved.",
+                      "type": "integer"
+                    },
+                    "digest": {
+                      "description": "Hex SHA-256 over the parent's digest and the definition.",
+                      "type": "string"
+                    },
+                    "message": {
+                      "type": "string"
+                    },
+                    "parent": {
+                      "type": "integer"
+                    },
+                    "version": {
+                      "type": "integer"
+                    }
+                  },
+                  "required": [
+                    "version",
+                    "created",
+                    "digest"
+                  ],
+                  "type": "object"
+                }
+              },
+              "required": [
+                "name",
+                "kind",
+                "version"
+              ],
+              "type": "object"
+            },
+            "type": "array"
+          },
+          "warning": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "dataset",
+          "mappings"
+        ],
+        "type": "object"
+      },
+      "StoredMappingVersions": {
+        "description": "The kept versions of a stored mapping, newest first.",
+        "externalDocs": {
+          "url": "https://github.com/kclejeune/sparkles/blob/main/docs/API.md#stored-mappings"
+        },
+        "properties": {
+          "dataset": {
+            "type": "string"
+          },
+          "name": {
+            "type": "string"
+          },
+          "versions": {
+            "items": {
+              "properties": {
+                "author": {
+                  "type": "string"
+                },
+                "created": {
+                  "type": "string"
+                },
+                "datasetCommit": {
+                  "description": "The dataset's head when the version was saved.",
+                  "type": "integer"
+                },
+                "digest": {
+                  "description": "Hex SHA-256 over the parent's digest and the definition.",
+                  "type": "string"
+                },
+                "message": {
+                  "type": "string"
+                },
+                "parent": {
+                  "type": "integer"
+                },
+                "version": {
+                  "type": "integer"
+                }
+              },
+              "required": [
+                "version",
+                "created",
+                "digest"
+              ],
+              "type": "object"
+            },
+            "type": "array"
+          }
+        },
+        "required": [
+          "dataset",
+          "name",
+          "versions"
         ],
         "type": "object"
       },
@@ -27134,6 +27606,376 @@
         "x-sparkles-permission": "any caller"
       }
     },
+    "/$/mappings/{ds}": {
+      "get": {
+        "externalDocs": {
+          "url": "https://github.com/kclejeune/sparkles/blob/main/docs/API.md#stored-mappings"
+        },
+        "operationId": "listStoredMappings",
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/ds"
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/StoredMappingList"
+                }
+              }
+            },
+            "description": "The mappings without their text."
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "403": {
+            "$ref": "#/components/responses/Forbidden"
+          },
+          "404": {
+            "$ref": "#/components/responses/NotFound"
+          },
+          "default": {
+            "$ref": "#/components/responses/Error"
+          }
+        },
+        "summary": "List stored mappings",
+        "tags": [
+          "Stored mappings"
+        ],
+        "x-sparkles-permission": "read"
+      }
+    },
+    "/$/mappings/{ds}/{name}": {
+      "delete": {
+        "externalDocs": {
+          "url": "https://github.com/kclejeune/sparkles/blob/main/docs/API.md#stored-mappings"
+        },
+        "operationId": "deleteStoredMapping",
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/ds"
+          },
+          {
+            "$ref": "#/components/parameters/name"
+          },
+          {
+            "$ref": "#/components/parameters/ifMatch"
+          }
+        ],
+        "responses": {
+          "204": {
+            "description": "Deleted with its versions."
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "403": {
+            "$ref": "#/components/responses/Forbidden"
+          },
+          "404": {
+            "$ref": "#/components/responses/NotFound"
+          },
+          "412": {
+            "$ref": "#/components/responses/PreconditionFailed"
+          },
+          "default": {
+            "$ref": "#/components/responses/Error"
+          }
+        },
+        "security": [
+          {
+            "basicAuth": []
+          },
+          {
+            "apiToken": []
+          },
+          {
+            "oidcAccessToken": []
+          },
+          {
+            "csrfToken": [],
+            "sessionCookie": []
+          },
+          {
+            "cloudflareAccess": []
+          }
+        ],
+        "summary": "Delete a stored mapping",
+        "tags": [
+          "Stored mappings"
+        ],
+        "x-sparkles-permission": "admin"
+      },
+      "get": {
+        "description": "The mapping with its text and metadata, or the text alone when `Accept` names the kind's media type.",
+        "externalDocs": {
+          "url": "https://github.com/kclejeune/sparkles/blob/main/docs/API.md#stored-mappings"
+        },
+        "operationId": "getStoredMapping",
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/ds"
+          },
+          {
+            "$ref": "#/components/parameters/name"
+          },
+          {
+            "description": "An older version, while it is kept.",
+            "in": "query",
+            "name": "version",
+            "schema": {
+              "type": "integer"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/csvm+json": {
+                "schema": {
+                  "type": "string"
+                }
+              },
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/StoredMapping"
+                }
+              },
+              "application/sparql-query": {
+                "schema": {
+                  "type": "string"
+                }
+              },
+              "application/yaml": {
+                "schema": {
+                  "type": "string"
+                }
+              },
+              "text/turtle": {
+                "schema": {
+                  "type": "string"
+                }
+              }
+            },
+            "description": "The mapping.",
+            "headers": {
+              "ETag": {
+                "description": "`\"v<N>\"`",
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "403": {
+            "$ref": "#/components/responses/Forbidden"
+          },
+          "404": {
+            "$ref": "#/components/responses/NotFound"
+          },
+          "default": {
+            "$ref": "#/components/responses/Error"
+          }
+        },
+        "summary": "Get a stored mapping",
+        "tags": [
+          "Stored mappings"
+        ],
+        "x-sparkles-permission": "read"
+      },
+      "put": {
+        "description": "Stores the mapping text as the next version, after parsing and checking it. `Content-Type` names the kind: `text/turtle` for R2RML and RML, `application/yaml` for YARRRML, `application/csvm+json` for CSVW metadata and `application/sparql-query` for a CONSTRUCT template. A connection the server does not declare is a warning. `If-Match: \"v<N>\"` stores only over version N, and `If-None-Match: *` only when the mapping does not exist.",
+        "externalDocs": {
+          "url": "https://github.com/kclejeune/sparkles/blob/main/docs/API.md#stored-mappings"
+        },
+        "operationId": "putStoredMapping",
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/ds"
+          },
+          {
+            "$ref": "#/components/parameters/name"
+          },
+          {
+            "$ref": "#/components/parameters/ifMatch"
+          },
+          {
+            "$ref": "#/components/parameters/ifNoneMatch"
+          },
+          {
+            "$ref": "#/components/parameters/commitMessage"
+          },
+          {
+            "description": "The kind, instead of the media type.",
+            "in": "query",
+            "name": "kind",
+            "schema": {
+              "enum": [
+                "rml",
+                "yarrrml",
+                "csvw",
+                "template"
+              ],
+              "type": "string"
+            }
+          },
+          {
+            "description": "A description of at most 1024 bytes.",
+            "in": "query",
+            "name": "description",
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/csvm+json": {
+              "schema": {
+                "type": "string"
+              }
+            },
+            "application/sparql-query": {
+              "schema": {
+                "type": "string"
+              }
+            },
+            "application/yaml": {
+              "schema": {
+                "type": "string"
+              }
+            },
+            "text/turtle": {
+              "schema": {
+                "type": "string"
+              }
+            }
+          },
+          "description": "The mapping text.",
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/StoredMapping"
+                }
+              }
+            },
+            "description": "Stored as a new version, or unchanged (`changed: false`)."
+          },
+          "201": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/StoredMapping"
+                }
+              }
+            },
+            "description": "Created."
+          },
+          "400": {
+            "$ref": "#/components/responses/BadRequest"
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "403": {
+            "$ref": "#/components/responses/Forbidden"
+          },
+          "404": {
+            "$ref": "#/components/responses/NotFound"
+          },
+          "409": {
+            "$ref": "#/components/responses/Conflict"
+          },
+          "412": {
+            "$ref": "#/components/responses/PreconditionFailed"
+          },
+          "415": {
+            "$ref": "#/components/responses/UnsupportedMediaType"
+          },
+          "default": {
+            "$ref": "#/components/responses/Error"
+          }
+        },
+        "security": [
+          {
+            "basicAuth": []
+          },
+          {
+            "apiToken": []
+          },
+          {
+            "oidcAccessToken": []
+          },
+          {
+            "csrfToken": [],
+            "sessionCookie": []
+          },
+          {
+            "cloudflareAccess": []
+          }
+        ],
+        "summary": "Store a mapping",
+        "tags": [
+          "Stored mappings"
+        ],
+        "x-sparkles-permission": "admin"
+      }
+    },
+    "/$/mappings/{ds}/{name}/versions": {
+      "get": {
+        "externalDocs": {
+          "url": "https://github.com/kclejeune/sparkles/blob/main/docs/API.md#stored-mappings"
+        },
+        "operationId": "listStoredMappingVersions",
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/ds"
+          },
+          {
+            "$ref": "#/components/parameters/name"
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/StoredMappingVersions"
+                }
+              }
+            },
+            "description": "The kept versions, newest first."
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "403": {
+            "$ref": "#/components/responses/Forbidden"
+          },
+          "404": {
+            "$ref": "#/components/responses/NotFound"
+          },
+          "default": {
+            "$ref": "#/components/responses/Error"
+          }
+        },
+        "summary": "List the versions of a stored mapping",
+        "tags": [
+          "Stored mappings"
+        ],
+        "x-sparkles-permission": "read"
+      }
+    },
     "/$/mcp": {
       "delete": {
         "description": "Ends a legacy session.",
@@ -37107,6 +37949,7 @@
     },
     "/{ds}/data": {
       "delete": {
+        "description": "Deletes the graph. With a `text/csv` or `text/tab-separated-values` body and `mapping` or `base`, removes the mapped triples from the graph instead.",
         "externalDocs": {
           "url": "https://github.com/kclejeune/sparkles/blob/main/docs/API.md#per-dataset-sparql-protocol-fuseki-compatible"
         },
@@ -37120,6 +37963,70 @@
           },
           {
             "$ref": "#/components/parameters/ifNoneMatch"
+          },
+          {
+            "description": "A CSV or TSV body: the stored mapping that maps it.",
+            "in": "query",
+            "name": "mapping",
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "A CSV or TSV body: the default mapping's namespace.",
+            "in": "query",
+            "name": "base",
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "A CSV or TSV body: the column that names each row in the default mapping.",
+            "in": "query",
+            "name": "key",
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "A CSV or TSV body: the file name the mapping reads it as, when the mapping reads several.",
+            "in": "query",
+            "name": "source",
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "A CSVW mapping: standard mode adds the table group, table and row descriptions.",
+            "in": "query",
+            "name": "csvwMode",
+            "schema": {
+              "enum": [
+                "minimal",
+                "standard"
+              ],
+              "type": "string"
+            }
+          },
+          {
+            "description": "A CSVW mapping: check primary and foreign keys (the default in standard mode).",
+            "in": "query",
+            "name": "csvwCheck",
+            "schema": {
+              "enum": [
+                "keys",
+                "none"
+              ],
+              "type": "string"
+            }
+          },
+          {
+            "description": "A CONSTRUCT template: read the dataset's head while mapping.",
+            "in": "query",
+            "name": "lookup",
+            "schema": {
+              "type": "boolean"
+            }
           },
           {
             "$ref": "#/components/parameters/gspGraph"
@@ -37160,6 +38067,22 @@
             }
           }
         ],
+        "requestBody": {
+          "content": {
+            "text/csv": {
+              "schema": {
+                "type": "string"
+              }
+            },
+            "text/tab-separated-values": {
+              "schema": {
+                "type": "string"
+              }
+            }
+          },
+          "description": "A table whose mapped triples are removed.",
+          "required": false
+        },
         "responses": {
           "200": {
             "$ref": "#/components/responses/WriteDone"
@@ -37390,6 +38313,70 @@
             "$ref": "#/components/parameters/ifNoneMatch"
           },
           {
+            "description": "A CSV or TSV body: the stored mapping that maps it.",
+            "in": "query",
+            "name": "mapping",
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "A CSV or TSV body: the default mapping's namespace.",
+            "in": "query",
+            "name": "base",
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "A CSV or TSV body: the column that names each row in the default mapping.",
+            "in": "query",
+            "name": "key",
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "A CSV or TSV body: the file name the mapping reads it as, when the mapping reads several.",
+            "in": "query",
+            "name": "source",
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "A CSVW mapping: standard mode adds the table group, table and row descriptions.",
+            "in": "query",
+            "name": "csvwMode",
+            "schema": {
+              "enum": [
+                "minimal",
+                "standard"
+              ],
+              "type": "string"
+            }
+          },
+          {
+            "description": "A CSVW mapping: check primary and foreign keys (the default in standard mode).",
+            "in": "query",
+            "name": "csvwCheck",
+            "schema": {
+              "enum": [
+                "keys",
+                "none"
+              ],
+              "type": "string"
+            }
+          },
+          {
+            "description": "A CONSTRUCT template: read the dataset's head while mapping.",
+            "in": "query",
+            "name": "lookup",
+            "schema": {
+              "type": "boolean"
+            }
+          },
+          {
             "$ref": "#/components/parameters/gspGraph"
           },
           {
@@ -37513,6 +38500,70 @@
           },
           {
             "$ref": "#/components/parameters/ifNoneMatch"
+          },
+          {
+            "description": "A CSV or TSV body: the stored mapping that maps it.",
+            "in": "query",
+            "name": "mapping",
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "A CSV or TSV body: the default mapping's namespace.",
+            "in": "query",
+            "name": "base",
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "A CSV or TSV body: the column that names each row in the default mapping.",
+            "in": "query",
+            "name": "key",
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "A CSV or TSV body: the file name the mapping reads it as, when the mapping reads several.",
+            "in": "query",
+            "name": "source",
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "A CSVW mapping: standard mode adds the table group, table and row descriptions.",
+            "in": "query",
+            "name": "csvwMode",
+            "schema": {
+              "enum": [
+                "minimal",
+                "standard"
+              ],
+              "type": "string"
+            }
+          },
+          {
+            "description": "A CSVW mapping: check primary and foreign keys (the default in standard mode).",
+            "in": "query",
+            "name": "csvwCheck",
+            "schema": {
+              "enum": [
+                "keys",
+                "none"
+              ],
+              "type": "string"
+            }
+          },
+          {
+            "description": "A CONSTRUCT template: read the dataset's head while mapping.",
+            "in": "query",
+            "name": "lookup",
+            "schema": {
+              "type": "boolean"
+            }
           },
           {
             "$ref": "#/components/parameters/gspGraph"
@@ -39162,6 +40213,218 @@
           "Views"
         ],
         "x-sparkles-permission": "read"
+      }
+    },
+    "/{ds}/mappings/{name}/run": {
+      "post": {
+        "description": "Runs the mapping over the file parts its sources name and the server's connections, and commits once. `mode=replace` replaces the constant graphs the mapping writes in that commit, and is `400` with code `mapping-graphs-unknown` for a template graph map. The commit message defaults to `mapping NAME (version V)`, and the mapping records the run.",
+        "externalDocs": {
+          "url": "https://github.com/kclejeune/sparkles/blob/main/docs/API.md#stored-mappings"
+        },
+        "operationId": "runStoredMapping",
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/ds"
+          },
+          {
+            "$ref": "#/components/parameters/name"
+          },
+          {
+            "description": "Add the triples (the default), or replace the graphs the mapping writes.",
+            "in": "query",
+            "name": "mode",
+            "schema": {
+              "enum": [
+                "add",
+                "replace"
+              ],
+              "type": "string"
+            }
+          },
+          {
+            "description": "Run an older version.",
+            "in": "query",
+            "name": "version",
+            "schema": {
+              "type": "integer"
+            }
+          },
+          {
+            "description": "Write every triple into this graph. A mapping whose graph maps name another graph is `400` with code `mapping-graph-conflict`.",
+            "in": "query",
+            "name": "graph",
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "The base IRI of generated relative IRIs.",
+            "in": "query",
+            "name": "base",
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "A CONSTRUCT template: read the dataset's head while mapping.",
+            "in": "query",
+            "name": "lookup",
+            "schema": {
+              "type": "boolean"
+            }
+          },
+          {
+            "description": "A CSVW mapping: standard mode.",
+            "in": "query",
+            "name": "csvwMode",
+            "schema": {
+              "enum": [
+                "minimal",
+                "standard"
+              ],
+              "type": "string"
+            }
+          },
+          {
+            "description": "A CSVW mapping: check primary and foreign keys.",
+            "in": "query",
+            "name": "csvwCheck",
+            "schema": {
+              "enum": [
+                "keys",
+                "none"
+              ],
+              "type": "string"
+            }
+          },
+          {
+            "$ref": "#/components/parameters/ifMatch"
+          },
+          {
+            "$ref": "#/components/parameters/branch"
+          },
+          {
+            "$ref": "#/components/parameters/timeout"
+          },
+          {
+            "$ref": "#/components/parameters/dryRun"
+          },
+          {
+            "$ref": "#/components/parameters/changes"
+          },
+          {
+            "$ref": "#/components/parameters/receipt"
+          },
+          {
+            "$ref": "#/components/parameters/validate"
+          },
+          {
+            "$ref": "#/components/parameters/commitMessage"
+          },
+          {
+            "$ref": "#/components/parameters/dryRunHeader"
+          },
+          {
+            "description": "The most validation results reported when a write is rejected.",
+            "in": "query",
+            "name": "validationLimit",
+            "schema": {
+              "type": "integer"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "multipart/form-data": {
+              "schema": {
+                "additionalProperties": true,
+                "properties": {
+                  "file": {
+                    "items": {
+                      "contentMediaType": "application/octet-stream",
+                      "type": "string"
+                    },
+                    "type": "array"
+                  }
+                },
+                "type": "object"
+              }
+            }
+          },
+          "description": "The files the mapping reads, each a part whose file name is the one the mapping names.",
+          "required": false
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/MappingRun"
+                }
+              }
+            },
+            "description": "The run's counts, with the commit receipt when asked for."
+          },
+          "400": {
+            "$ref": "#/components/responses/BadRequest"
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "403": {
+            "$ref": "#/components/responses/Forbidden"
+          },
+          "404": {
+            "$ref": "#/components/responses/NotFound"
+          },
+          "408": {
+            "$ref": "#/components/responses/Timeout"
+          },
+          "412": {
+            "$ref": "#/components/responses/PreconditionFailed"
+          },
+          "413": {
+            "$ref": "#/components/responses/PayloadTooLarge"
+          },
+          "415": {
+            "$ref": "#/components/responses/UnsupportedMediaType"
+          },
+          "422": {
+            "$ref": "#/components/responses/Unprocessable"
+          },
+          "503": {
+            "$ref": "#/components/responses/Unavailable"
+          },
+          "507": {
+            "$ref": "#/components/responses/InsufficientStorage"
+          },
+          "default": {
+            "$ref": "#/components/responses/Error"
+          }
+        },
+        "security": [
+          {
+            "basicAuth": []
+          },
+          {
+            "apiToken": []
+          },
+          {
+            "oidcAccessToken": []
+          },
+          {
+            "csrfToken": [],
+            "sessionCookie": []
+          },
+          {
+            "cloudflareAccess": []
+          }
+        ],
+        "summary": "Run a stored mapping",
+        "tags": [
+          "Stored mappings"
+        ],
+        "x-sparkles-permission": "write"
       }
     },
     "/{ds}/memory/brief": {
@@ -42271,7 +43534,7 @@
     },
     "/{ds}/upload": {
       "post": {
-        "description": "A multipart upload of RDF files, and CSV or TSV tables mapped to triples, in one commit. The format comes from each file name or content type. A plain `text/csv` or `text/tab-separated-values` body is one table.",
+        "description": "A multipart upload of RDF files, CSV or TSV tables mapped to triples, and the files an R2RML, RML or YARRRML mapping reads, in one commit. The format comes from each file name or content type. A plain `text/csv` or `text/tab-separated-values` body is one table. A mapping file source without its part is `400` with code `mapping-source-missing`.",
         "externalDocs": {
           "url": "https://github.com/kclejeune/sparkles/blob/main/docs/API.md#csv-and-tsv-uploads"
         },
@@ -42303,6 +43566,71 @@
             "schema": {
               "type": "string"
             }
+          },
+          {
+            "description": "A stored mapping to use instead of a `mapping` part.",
+            "in": "query",
+            "name": "mapping",
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "The stored mapping's version (the latest by default).",
+            "in": "query",
+            "name": "mappingVersion",
+            "schema": {
+              "type": "integer"
+            }
+          },
+          {
+            "description": "The kind of the `mapping` part when its content does not tell.",
+            "in": "query",
+            "name": "mappingKind",
+            "schema": {
+              "enum": [
+                "rml",
+                "yarrrml",
+                "csvw",
+                "template"
+              ],
+              "type": "string"
+            }
+          },
+          {
+            "description": "A CSVW mapping: standard mode adds the table group, table and row descriptions.",
+            "in": "query",
+            "name": "csvwMode",
+            "schema": {
+              "enum": [
+                "minimal",
+                "standard"
+              ],
+              "type": "string"
+            }
+          },
+          {
+            "description": "A CSVW mapping: check primary and foreign keys (the default in standard mode).",
+            "in": "query",
+            "name": "csvwCheck",
+            "schema": {
+              "enum": [
+                "keys",
+                "none"
+              ],
+              "type": "string"
+            }
+          },
+          {
+            "description": "A CONSTRUCT template: read the dataset's head while mapping. The report gives `lookupCommit`, and `If-Match` makes the commit fail when the head moved.",
+            "in": "query",
+            "name": "lookup",
+            "schema": {
+              "type": "boolean"
+            }
+          },
+          {
+            "$ref": "#/components/parameters/ifMatch"
           },
           {
             "$ref": "#/components/parameters/branch"
@@ -42354,7 +43682,7 @@
                     "type": "string"
                   },
                   "mapping": {
-                    "description": "A CSVW metadata document.",
+                    "description": "CSVW metadata, an R2RML, RML or YARRRML mapping, or a CONSTRUCT template. The file parts its sources name are read by it.",
                     "type": "string"
                   },
                   "template": {
@@ -42447,6 +43775,7 @@
     },
     "/{ds}/{graph}": {
       "delete": {
+        "description": "Deletes the graph. With a `text/csv` or `text/tab-separated-values` body and `mapping` or `base`, removes the mapped triples from the graph instead.",
         "externalDocs": {
           "url": "https://github.com/kclejeune/sparkles/blob/main/docs/API.md#per-dataset-sparql-protocol-fuseki-compatible"
         },
@@ -42463,6 +43792,70 @@
           },
           {
             "$ref": "#/components/parameters/ifNoneMatch"
+          },
+          {
+            "description": "A CSV or TSV body: the stored mapping that maps it.",
+            "in": "query",
+            "name": "mapping",
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "A CSV or TSV body: the default mapping's namespace.",
+            "in": "query",
+            "name": "base",
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "A CSV or TSV body: the column that names each row in the default mapping.",
+            "in": "query",
+            "name": "key",
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "A CSV or TSV body: the file name the mapping reads it as, when the mapping reads several.",
+            "in": "query",
+            "name": "source",
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "A CSVW mapping: standard mode adds the table group, table and row descriptions.",
+            "in": "query",
+            "name": "csvwMode",
+            "schema": {
+              "enum": [
+                "minimal",
+                "standard"
+              ],
+              "type": "string"
+            }
+          },
+          {
+            "description": "A CSVW mapping: check primary and foreign keys (the default in standard mode).",
+            "in": "query",
+            "name": "csvwCheck",
+            "schema": {
+              "enum": [
+                "keys",
+                "none"
+              ],
+              "type": "string"
+            }
+          },
+          {
+            "description": "A CONSTRUCT template: read the dataset's head while mapping.",
+            "in": "query",
+            "name": "lookup",
+            "schema": {
+              "type": "boolean"
+            }
           },
           {
             "$ref": "#/components/parameters/branch"
@@ -42497,6 +43890,22 @@
             }
           }
         ],
+        "requestBody": {
+          "content": {
+            "text/csv": {
+              "schema": {
+                "type": "string"
+              }
+            },
+            "text/tab-separated-values": {
+              "schema": {
+                "type": "string"
+              }
+            }
+          },
+          "description": "A table whose mapped triples are removed.",
+          "required": false
+        },
         "responses": {
           "200": {
             "$ref": "#/components/responses/WriteDone"
@@ -42724,6 +44133,70 @@
             "$ref": "#/components/parameters/ifNoneMatch"
           },
           {
+            "description": "A CSV or TSV body: the stored mapping that maps it.",
+            "in": "query",
+            "name": "mapping",
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "A CSV or TSV body: the default mapping's namespace.",
+            "in": "query",
+            "name": "base",
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "A CSV or TSV body: the column that names each row in the default mapping.",
+            "in": "query",
+            "name": "key",
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "A CSV or TSV body: the file name the mapping reads it as, when the mapping reads several.",
+            "in": "query",
+            "name": "source",
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "A CSVW mapping: standard mode adds the table group, table and row descriptions.",
+            "in": "query",
+            "name": "csvwMode",
+            "schema": {
+              "enum": [
+                "minimal",
+                "standard"
+              ],
+              "type": "string"
+            }
+          },
+          {
+            "description": "A CSVW mapping: check primary and foreign keys (the default in standard mode).",
+            "in": "query",
+            "name": "csvwCheck",
+            "schema": {
+              "enum": [
+                "keys",
+                "none"
+              ],
+              "type": "string"
+            }
+          },
+          {
+            "description": "A CONSTRUCT template: read the dataset's head while mapping.",
+            "in": "query",
+            "name": "lookup",
+            "schema": {
+              "type": "boolean"
+            }
+          },
+          {
             "$ref": "#/components/parameters/branch"
           },
           {
@@ -42844,6 +44317,70 @@
           },
           {
             "$ref": "#/components/parameters/ifNoneMatch"
+          },
+          {
+            "description": "A CSV or TSV body: the stored mapping that maps it.",
+            "in": "query",
+            "name": "mapping",
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "A CSV or TSV body: the default mapping's namespace.",
+            "in": "query",
+            "name": "base",
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "A CSV or TSV body: the column that names each row in the default mapping.",
+            "in": "query",
+            "name": "key",
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "A CSV or TSV body: the file name the mapping reads it as, when the mapping reads several.",
+            "in": "query",
+            "name": "source",
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "A CSVW mapping: standard mode adds the table group, table and row descriptions.",
+            "in": "query",
+            "name": "csvwMode",
+            "schema": {
+              "enum": [
+                "minimal",
+                "standard"
+              ],
+              "type": "string"
+            }
+          },
+          {
+            "description": "A CSVW mapping: check primary and foreign keys (the default in standard mode).",
+            "in": "query",
+            "name": "csvwCheck",
+            "schema": {
+              "enum": [
+                "keys",
+                "none"
+              ],
+              "type": "string"
+            }
+          },
+          {
+            "description": "A CONSTRUCT template: read the dataset's head while mapping.",
+            "in": "query",
+            "name": "lookup",
+            "schema": {
+              "type": "boolean"
+            }
           },
           {
             "$ref": "#/components/parameters/branch"
@@ -43016,6 +44553,13 @@
         "url": "https://github.com/kclejeune/sparkles/blob/main/docs/API.md#stored-queries"
       },
       "name": "Stored queries"
+    },
+    {
+      "description": "R2RML, RML, YARRRML, CSVW and template mappings kept with a dataset, and their runs.",
+      "externalDocs": {
+        "url": "https://github.com/kclejeune/sparkles/blob/main/docs/API.md#stored-mappings"
+      },
+      "name": "Stored mappings"
     },
     {
       "description": "Incremental views kept current after every commit, and live queries.",

@@ -1917,6 +1917,24 @@ of the same request, in one commit ([spec C05](specs/C05-tabular-imports.md)).
   that has no `url`. `key` names the column that names each row in the default mapping.
   The server has no file URL to build a namespace from, so the default mapping needs
   `base`.
+* The `mapping` part may also hold an R2RML, RML or YARRRML mapping, or a CONSTRUCT
+  template, recognized by its content or named by `mappingKind`. An R2RML, RML or
+  YARRRML mapping reads the parts its logical sources name by file name, CSV, TSV,
+  JSON, JSON Lines and Parquet alike, and the server's database connections (see
+  [Stored mappings](#stored-mappings)). The parts it does not read are loaded as usual.
+  A file source without its part answers `400` with code `mapping-source-missing`
+  before anything is read. `mapping=NAME` uses a stored mapping instead of a part, and
+  `mappingVersion` picks one of its versions.
+* `csvwMode=standard` adds CSVW's standard mode, the table group, table and row
+  descriptions with their row numbers and source URLs. `csvwCheck=keys`, the default in
+  standard mode, checks the metadata's primary and foreign keys across the tables of the
+  request, in the order the foreign keys need, and answers `400` naming both rows of a
+  duplicate key or the row whose reference matches nothing. The key values are held in
+  memory within the server's query memory budget.
+* `lookup=true` lets a template's WHERE clause read the dataset's head as the
+  conversion starts, under the caller's view. The table's report gives `lookupCommit`,
+  the commit read, and `If-Match` with that commit's entity tag makes the upload fail
+  with `412` when the head has moved by the time it commits.
 
 ```sh
 curl -X POST 'localhost:3030/ds/upload?base=http://ex.org/p/&key=id' \
@@ -1931,8 +1949,30 @@ number of cells, a bad mapping or a refused template answers `400` with the file
 column, and nothing is committed. The N-Triples written for the tables count against
 `--max-decompressed-mb` (`413`) and the free-disk reserve (`507`). A template runs with
 the server's query memory and row budgets. Dry runs and timeouts work as for any upload.
-The Graph Store endpoint does not read CSV. The web UI's upload form shows these options
-once a CSV or TSV file is chosen, and sends `base` and `key` in the query string.
+The web UI's upload form shows the `base` and `key` options once a CSV or TSV file is
+chosen, and sends them in the query string.
+
+### CSV and TSV in the Graph Store protocol
+
+`PUT`, `POST` and `DELETE` on `/{ds}/data` take a `text/csv` or
+`text/tab-separated-values` body when the request names a stored mapping with
+`mapping=NAME`, or the default mapping with `base` and optionally `key`
+([spec F19 §2.3](specs/F19-mappings-and-virtual-graphs.md)). `PUT` replaces the graph
+with the mapped triples, `POST` adds them, and `DELETE` removes them from the graph.
+Without `mapping` or `base` the body is `415`, as any body that is not RDF.
+
+The triples go into the graph the request names, whatever graph maps the mapping
+declares. A mapping whose graph maps name another graph answers `400` with code
+`mapping-graph-conflict`, because a Graph Store request addresses one graph. The body is
+the file the mapping reads. Its name is `source=NAME`, or else the mapping's only file
+source, or the CSVW metadata's only table. `csvwMode`, `csvwCheck` and `lookup` work as
+on an upload. A `DELETE` cannot remove triples with blank nodes, since the mapping makes
+new ones.
+
+```sh
+curl -X PUT 'localhost:3030/ds/data?graph=http://ex.org/people&mapping=people' \
+  -H 'Content-Type: text/csv' --data-binary @people.csv
+```
 
 ### Service description
 
@@ -2871,6 +2911,74 @@ parameter. An unknown query is `404`.
 `sparkles queries --loc DB list|get|versions|put|delete|run` manages and runs the
 stored queries of a database directory (see [Usage](USAGE.md#stored-queries)). The Rust
 API is `sparkles::stored`.
+
+## Stored mappings
+
+The design and its rationale are in
+[F19 Mapping languages and virtual graphs](specs/F19-mappings-and-virtual-graphs.md).
+
+A dataset can keep named mappings in `mappings.json` in its directory, with versions as
+stored queries have, and backups and clones include the file. A mapping is R2RML, RML
+(the rml.io vocabulary or RML-Core), YARRRML, CSVW metadata or a CONSTRUCT template. It
+is parsed and checked before it is stored, so a stored mapping always parses.
+
+| Method | Path | Result |
+|---|---|---|
+| GET | `/$/mappings/{ds}` | The mappings without their text, each with its kind, version, check summary and last run. |
+| PUT | `/$/mappings/{ds}/{name}` | Stores the body as the next version. `Content-Type` names the kind. |
+| GET | `/$/mappings/{ds}/{name}` | The text and metadata, or the text alone when `Accept` names the kind's media type. `?version=N` reads an older version. |
+| GET | `/$/mappings/{ds}/{name}/versions` | The kept versions, newest first. |
+| DELETE | `/$/mappings/{ds}/{name}` | Deletes the mapping and its versions. |
+| POST | `/{ds}/mappings/{name}/run` | Runs it and commits once. |
+
+The media types are `text/turtle` for R2RML and RML, `application/yaml` for YARRRML,
+`application/csvm+json` for CSVW metadata and `application/sparql-query` for a template,
+and `kind=` names one instead. `description=` sets the description,
+`Sparkles-Commit-Message` the version's message, and `If-Match: "v<N>"` and
+`If-None-Match: *` the preconditions, as for stored queries. The check's summary lists
+the triples maps, the files and connections the mapping reads, the graphs its graph maps
+name, and warnings, among them a connection the server does not declare. Storing,
+changing and deleting a mapping needs `admin` on the dataset, because a mapping names
+connections and can read any table they reach. Reading one needs `read`.
+
+A run needs `write` and is subject to the caller's graph grants as any write is. It
+takes the files the mapping reads as multipart parts, each named as the mapping names
+it, and refuses a part the mapping does not read. `mode=add`, the default, adds the
+triples. `mode=replace` replaces every graph the mapping's graph maps can write, in the
+same commit, so a run over unchanged sources changes nothing and the change feed carries
+only the net change. A mapping with a template graph map cannot be replaced, which is
+`400` with code `mapping-graphs-unknown`. `graph=IRI` writes every triple into one graph,
+`base=IRI` sets the base of generated relative IRIs, and `dryRun`, `timeout`,
+`receipt`, `If-Match` and `Sparkles-Commit-Message` work as on an upload. The commit
+message defaults to `mapping NAME (version V)`. The answer gives the rows read, the quads
+made and the warnings, and the mapping records the run's time, version, mode, commit and
+counts as `lastRun`. A run takes as long as its sources and is not a task.
+
+```sh
+curl -X PUT localhost:3030/$/mappings/ds/people -H 'Content-Type: application/yaml' \
+  --data-binary @people.yml
+curl -X POST 'localhost:3030/ds/mappings/people/run?mode=replace' \
+  -F file=@people.csv -F file=@cities.csv
+```
+
+### Database connections
+
+R2RML logical tables and RML sources of kind `urn:x-sparkles:connection:NAME` read the
+server's named connections, which the server-wide settings kind `connections` holds
+(`/$/server/settings/connections`, server `admin`, and `server.connections` in the
+settings file). Its one member, `connections`, maps names to descriptions. This build
+reads SQLite files, opened read-only. PostgreSQL and DuckDB connections are refused with
+the roadmap item that adds them (230).
+
+```json
+{ "connections": { "shop": { "kind": "sqlite", "path": "/data/shop.sqlite",
+                             "jdbcDsn": "jdbc:sqlite:shop.sqlite" } } }
+```
+
+`path` must be absolute. `jdbcDsn` names the connection for existing RML mappings that
+describe their database with `d2rq:jdbcDSN`. An R2RML mapping reads the only connection,
+or the one named `default`. A mapping may be stored before its connection exists, and a
+run fails until it does.
 
 ## Incremental views
 
@@ -6170,7 +6278,8 @@ described under "Edges from a pattern" below.
   `ex:a ex:road ex:b {| ex:km 12 |}` writes. The smallest value counts when there are
   several. A weight that is not a non-negative number fails the query. The shortest
   modes then use Dijkstra's algorithm and `path:kShortest` uses Yen's algorithm with
-  Dijkstra's. Lengths still count edges.
+  Dijkstra's. The cheapest path of one pair and Yen's spur searches run from both ends.
+  Lengths still count edges.
 * **Graphs and access.** The search reads the active graph, as a triple pattern would.
   Under `GRAPH ?g` each named graph is searched on its own and `?g` is bound to it. A
   path never uses a triple that the caller's grants or protections hide, and a hidden

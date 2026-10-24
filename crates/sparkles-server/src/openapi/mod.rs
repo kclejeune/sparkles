@@ -933,6 +933,11 @@ fn tags() -> J {
             "stored-queries"
         ),
         t(
+            "Stored mappings",
+            "R2RML, RML, YARRRML, CSVW and template mappings kept with a dataset, and their runs.",
+            "stored-mappings"
+        ),
+        t(
             "Views",
             "Incremental views kept current after every commit, and live queries.",
             "incremental-views"

@@ -182,6 +182,22 @@ fn classifies_routes() {
         Some(Class::Update)
     );
     assert_eq!(
+        c(
+            Some("/{ds}/mappings/{name}/run"),
+            Method::POST,
+            "/ds/mappings/m/run"
+        ),
+        Some(Class::Update)
+    );
+    assert_eq!(
+        c(
+            Some("/$/mappings/{ds}/{name}"),
+            Method::PUT,
+            "/$/mappings/ds/m"
+        ),
+        Some(Class::Admin)
+    );
+    assert_eq!(
         c(Some("/{ds}"), Method::GET, "/ds?query=x"),
         Some(Class::Query)
     );

@@ -122,6 +122,26 @@ These read paths are tuned for queries over data that is not yet in memory
   batches. CSVW covers datatypes and formats, null values, defaults, lists, virtual
   columns and RFC 6570 URI templates. Tables stream, compressed or not, and an invalid
   cell stops the load and names its row and column.
+* CSVW's standard mode adds the table group, table and row descriptions, and primary and
+  foreign keys are checked across the tables of a load in the order their references
+  need. A CONSTRUCT template can call Tarql's `tarql:expandPrefix` and
+  `tarql:expandPrefixedName`, and with `--lookup` or `lookup=true` it reads the
+  dataset's head to link rows to resources the dataset has.
+* R2RML, RML and YARRRML mappings load CSV, TSV, JSON, JSON Lines, Parquet and SQLite
+  sources ([F19](specs/F19-mappings-and-virtual-graphs.md),
+  [USAGE.md](USAGE.md#mappings-r2rml-rml-and-yarrrml)). RML covers both the rml.io
+  vocabulary and RML-Core. `sparkles map run`, `sparkles load --mapping` and uploads run
+  them. Each source is read once as a stream, and values keep their natural types. A join
+  over one SQLite connection runs as one SQL statement, and other joins use a hash table
+  within the memory budget. Function maps call GREL, IDLab and SPARQL functions.
+  `sparkles map` also checks a mapping, converts YARRRML to RML-Core Turtle and drafts an
+  R2RML mapping from a SQLite database. The W3C R2RML test cases pass on SQLite apart
+  from three, and the RML-Core cases with CSV and JSON sources apart from six.
+* Mappings of every kind can be stored per dataset with versions and run again
+  ([API.md](API.md#stored-mappings)). A run in replace mode commits only the net change.
+  The Graph Store protocol takes CSV bodies with a stored or default mapping, and the
+  server reads SQLite databases through the named connections of its `connections`
+  settings kind.
 
 ### Transactions and durability
 
@@ -500,9 +520,10 @@ rest of a query.
   every triple, or from the solutions of a nested graph pattern. Each edge can be bound as
   a triple term. Sources and targets are constants or variables bound by the rest of the
   group.
-* Weights on RDF 1.2 reifiers switch the search to Dijkstra's algorithm. An unweighted
-  single pair runs as a bidirectional breadth-first search over the PSO and POS
-  permutations.
+* Weights on RDF 1.2 reifiers switch the search to Dijkstra's algorithm. A single pair
+  runs from both ends, as a breadth-first search over the PSO and POS permutations
+  without weights and as Dijkstra's algorithm with them. Yen's spur searches run from both
+  ends too.
 * `path:excludePredicate` skips predicates such as `rdf:type`, and `path:maxDegree` keeps
   paths from passing through hubs. Paths never use triples the caller cannot see.
 
@@ -1467,11 +1488,16 @@ links each item to its design spec.
 * The loader reads TriX, RDF Thrift, RDF Protobuf and RDF/JSON by first rewriting each
   file as N-Quads in a temporary file. The library's `load_str` and `dump_graph` take only
   the W3C syntaxes, and SPARQL `LOAD` reads TriX but not the other three. Roadmap item 73.
-* CSV and TSV import supports CSVW in its minimal mode and CONSTRUCT templates. There are
-  no RML or R2RML mappings, no CSVW standard mode and no primary-key or foreign-key
-  checks, and a template cannot read the target dataset. Roadmap item 22.
-* Tables are imported, not queried in place, and the Graph Store endpoint does not read
-  CSV. Roadmap item 43.
+* Mappings read no PostgreSQL or DuckDB database and no Parquet file in an object store.
+  Roadmap items 230 and 237.
+* RML join conditions written as expression maps are not read, and function maps call 20
+  of SPARQL's functions. Roadmap items 232 and 236.
+* Stored mapping runs are not tasks, the web UI has no Mappings page, and the JVM and
+  Node.js bindings cannot run mappings. Roadmap items 231, 233 and 234.
+* The W3C CSVW test suite does not run. Roadmap item 235.
+* A template lookup that binds a blank node of the dataset writes a new node, and a JSON
+  number with a fraction or an exponent loses its source form. Roadmap items 238 and 239.
+* Tables and databases are imported, not queried in place. Roadmap item 43.
 
 * Incremental views are `table` views on `main`, maintained after the commit. There are
   no `graph` views, no maintenance inside the commit, no WebSocket or MCP access, no Node
@@ -1499,11 +1525,13 @@ links each item to its design spec.
 * A vector index has no quantization, so its packed vectors take 4 bytes per dimension,
   roadmap item 34. Each pass that inserts new rows into a vector index's graph scans all
   rows inserted since the last compaction, item 82.
-* A search weighted by `path:weight` runs Dijkstra's algorithm from the source alone. On
-  the 10.5M-triple benchmark data a weighted pair search takes 0.68 s where the
-  unweighted one takes 1.2 ms, and the five cheapest paths exceed the default limit of 10
-  million visited nodes. The UI's weighted searches stop at a million visits. Roadmap item
-  150.
+* A weighted shortest search with `path:maxLength` lists paths in order of cost until one
+  is short enough, so a pair whose short paths are all dear runs until the visit limit.
+  The UI's path finder always sends a length limit and stops at a million visits. Roadmap
+  item 275.
+* Weighted `path:allShortest` without `path:maxLength`, cycles through the source and
+  weighted searches to several targets run Dijkstra's algorithm from the source alone. Every cheapest path of one pair
+  takes 0.9 s on the 10.5M-triple benchmark data. Roadmap item 277.
 * Graph algorithms match the Graphalytics reference outputs for BFS, WCC and PageRank on
   the two small official example graphs, through `scripts/graphalytics-reference.py`.
   There is no full Graphalytics driver, no run on the larger datasets, no reference check

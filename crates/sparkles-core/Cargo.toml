@@ -70,6 +70,14 @@ geographiclib-rs = { workspace = true, optional = true }
 # Apache-2.0); `geo-epsg` adds crs-definitions' EPSG-derived table (CC0)
 proj4rs = { version = "0.2", default-features = false, optional = true }
 crs-definitions = { version = "0.5", optional = true }
+# YARRRML mappings (spec F19 §3.4; pure Rust, MIT OR Apache-2.0)
+yaml-rust2 = { version = "0.11", default-features = false }
+# SQLite sources of R2RML and RML mappings (feature `mapping-sqlite`; bundles SQLite's C
+# sources, so the library's default build leaves it out)
+rusqlite = { version = "0.40", features = ["bundled", "column_decltype", "hooks"], optional = true }
+# Parquet sources of RML mappings (feature `mapping-parquet`): the row reader only, without
+# Arrow
+parquet = { version = "59.3", default-features = false, features = ["snap", "flate2-rust_backend", "lz4", "zstd", "brotli"], optional = true }
 
 # statvfs: the free disk space a store keeps
 [target.'cfg(unix)'.dependencies]
@@ -102,5 +110,9 @@ geo-epsg = ["geo-proj4", "dep:crs-definitions"]
 zstd = ["dep:zstd", "tantivy?/zstd-compression"]
 # brotli inputs, dumps and backups (pure Rust)
 brotli = ["dep:brotli"]
+# SQLite sources of R2RML and RML mappings (spec F19 §4.4)
+mapping-sqlite = ["dep:rusqlite"]
+# Parquet files as sources of RML mappings (spec F19 §4.3)
+mapping-parquet = ["dep:parquet"]
 # test hooks at named points of the store (`Store::set_failpoint`), for other crates' tests
 failpoints = []

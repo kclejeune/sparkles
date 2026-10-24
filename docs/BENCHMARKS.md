@@ -1157,16 +1157,42 @@ ways do not pass through literals.
 
 ### Weighted pair searches
 
-A weighted pair search runs Dijkstra's algorithm from the source alone, where an
-unweighted pair runs a breadth-first search from both ends. On the 10.5M-triple data,
-where every edge weighs 1, `ps-pair` with `path:weight` and `path:cost` takes 0.68 s of
-server time against 1.2 ms without them. Five weighted shortest paths by Yen's algorithm
-fail after about 7 s, when the search visits more than the default 10 million nodes. The
-path finder of the UI sends a limit of a million visits, so on a graph of this size a
-weighted search stops at the limit and the panel says so. [Roadmap](ROADMAP.md) item 150
-makes weighted searches bidirectional.
+A weighted search for the cheapest path of one pair runs Dijkstra's algorithm from both
+ends, and so do the spur searches of Yen's algorithm with weights
+([F07](specs/F07-path-search.md#weighted-searches-from-both-ends-2026-10-24)). The table
+compares the build before this change with the current one on the 10.5M-triple data, once
+with every edge weighing 1 and once with an `ex:km` weight from 1 to 100 on the reifier of
+every `foaf:knows` triple. The pair is person 0 and the last person, and every query binds
+`path:weight` and `path:cost`.
 
-*Measured on an 8-vCPU Namespace instance on 2026-10-24.*
+| query | weights | one end (ms) | both ends (ms) |
+|---|---|---:|---:|
+| `ps-pair` | all 1 | 820.2 | 3.5 |
+| `ps-pair` with `path:direction path:both` | all 1 | 730.6 | 1.4 |
+| `ps-pair-k5`, five cheapest paths | all 1 | fails at 10M visits | 68.9 |
+| `ps-pair` | 1 to 100 | 4,937.9 | 29.0 |
+| `ps-pair` with `path:direction path:both` | 1 to 100 | 11,904.4 | 51.6 |
+| `ps-pair-k5`, five cheapest paths | 1 to 100 | fails at 10M visits | 656.0 |
+| `ps-pair-all`, every cheapest path | all 1 | 876.2 | 896.8 |
+
+Times are medians of the server's execution time. With every edge weighing 1 the weighted
+pair search costs about 1.5 times the unweighted `ps-pair`, which took 2.3 ms in the same
+runs. Weighted `path:allShortest` without `path:maxLength` still runs from the source
+alone and measured 2.3% slower, although its search did not change, which item 276 covers.
+[Roadmap](ROADMAP.md) item 277 would run it from both ends. Between equally cheap paths the two builds returned different ones in one case, which
+the spec allows, and every other answer matched.
+
+A weighted shortest search with `path:maxLength 6`, as the UI's path finder sends, failed
+in both builds at its limit of a million visits, because no path of this pair has fewer
+than 17 edges and the search lists paths by cost until one is short enough. Item 275
+addresses it. The unweighted `ps-pair`, `ps-pair-all`, `ps-pair-k5` and `ps-values10`
+measured 3 to 4% slower in every round although the change does not touch their search,
+and item 276 looks for the cause.
+
+*Measured on forge, an Intel Core i5-13500, on 2026-10-24, with the server on one core and
+the client on another, in interleaved A, B, B, A rounds. With all weights 1 there were four
+rounds of 20 requests per query, or one round of three for the five cheapest paths. With
+weights from 1 to 100 there were two rounds of five, or one round of three.*
 
 <a id="graph-algorithm-polling"></a>
 
@@ -1572,6 +1598,28 @@ Starting `/bin/true` took 2 to 4 ms on the same machine, so most of the child's 
 starting a process. The child adds about 10 ms to each document, which is small next to
 the model calls of an ingestion. Each running conversion may also use up to
 `--convert-memory`, 2 GiB by default, of address space beside the server.
+
+### Tables through mappings
+
+A YARRRML mapping of a CSV table runs faster than C05's default mapping of the same
+table ([spec F19](specs/F19-mappings-and-virtual-graphs.md#outcome)). The table has
+1,000,000 rows of four columns, and both mappings write the same 4,000,000 triples, one
+subject per row and one predicate per column. The figures are medians of three rounds of
+the release binary at commit 9bd9feb6, run on atlas on 2026-10-24. Atlas is an Intel
+i5-13500 with 20 threads, and other work shared it, so these are not quiet-machine
+figures.
+
+| 1,000,000 rows | Wall time | Peak memory |
+|---|---:|---:|
+| `sparkles csv convert`, the C05 default mapping | 2.81 s | 39 MB |
+| `sparkles map run`, the YARRRML mapping | 1.61 s | 41 MB |
+| `sparkles load`, the C05 default mapping | 4.12 s | 830 MB |
+| `sparkles load --mapping`, the YARRRML mapping | 2.88 s | 834 MB |
+
+C05's default mapping passes each cell through CSVW's datatype and URL template steps,
+which the mapping engine does not have. A Parquet file of 10,000,000 rows
+and two columns, 227 MB on disk, maps to 20,000,000 triples in 11.6 s with a peak of
+46 MB, since the file is read one row group at a time.
 
 ## Writes and updates
 

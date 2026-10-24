@@ -128,7 +128,6 @@ openCypher comes last.
 | 27 | **Live query profiling** with verified rewrite suggestions. | [U04](specs/U04-live-query-profiling.md) | M | Not rated |
 | 28 | **Query by example** and Bloom-style search phrases. | [U03](specs/U03-query-by-example.md) | M | Not rated |
 | 21 | **Editing forms generated from SHACL shapes.** Phase 3 adds nested forms for blank nodes, the list editor and `sh:or` and `sh:xone` choices. Validation of nodes more than two triples from the edited resource, in a check without a guard, also remains. | [U02](specs/U02-shape-driven-forms.md#outcome) | M–L | Medium–high |
-| 22 | **RML, R2RML and YARRRML loading,** CSVW standard mode and key checks, and tests that Tarql's functions work in templates. | [F19](specs/F19-mappings-and-virtual-graphs.md) Phase 1, [C05](specs/C05-tabular-imports.md#roadmap-follow-ups-2026-10-12) | M–L | Medium–high |
 | 25 | **Callbacks in other languages.** Python and JavaScript functions inside queries, and native dispatch of Java functions, which today run through ARQ. | [P03](specs/P03-query-extensions.md#roadmap-follow-ups-2026-10-12) | M | Medium |
 | 26 | **Local models.** GPU, ONNX and GGUF, rerankers, and models shared between processes. | [F12](specs/F12-local-embeddings.md#roadmap-follow-ups-2026-10-12) | M–L | Medium |
 | 81 | **Shared memory representation for agents and personal knowledge.** A common profile for documents, cited assertions, entities, notes, decisions and tasks, with evidence and dependency relations, time and invalidation rules, and knowledge kept apart from instructions. This item is deferred. | [C17](specs/C17-agent-memory.md#shared-memory-representation), [C18](specs/C18-natural-language-questions-and-ingest.md#shared-memory-workflows) | M–L | High |
@@ -190,6 +189,7 @@ spec sections.
 | 180 | **Plan pattern references on small queries.** The references of U04 Phase 4 add instructions and a few percent of server time to small queries. Build them only for a plan that is described, or reuse the parsed query's terms, and measure with two builds from one host. | [Benchmarks](BENCHMARKS.md#the-cost-of-plan-pattern-references), [U04](specs/U04-live-query-profiling.md#phase-4-2026-10-23) | S–M |
 | 181 | **Compiler provenance in the Namespace query screen.** `scripts/nsc-bench.sh` caches a binary by commit alone. Record each binary's compilers as `scripts/nsc-writes.sh` does and refuse to compare binaries built with different ones. | [Benchmarking](BENCHMARKING.md#benchmark-scripts) | S |
 | 182 | **`subquery-agg` slowdown.** The Namespace screen measured `subquery-agg` about 6% slower after the U02 forms, U11 Phase 3 and item 94 merges. Check it on forge with pinned rounds, and bisect those merges if it holds. | [Benchmarking](BENCHMARKING.md) | S |
+| 276 | **Unweighted path searches after item 150.** Forge measured the unweighted `ps-pair`, `ps-pair-all`, `ps-pair-k5` and `ps-values10` 3 to 4% slower in every round and weighted `path:allShortest` 2.3% slower, although item 150 does not touch their searches. Compare their code generation in both builds and profile them to find what changed. | [Benchmarks](BENCHMARKS.md#weighted-pair-searches) | S |
 | 223 | **Parallel view passes.** Each dataset runs its view passes on one worker thread, which falls behind a fast writer with 100 views. `--view-threads`, a shared worker pool and joins whose large deltas split across threads are not built. | [F13](specs/F13-incremental-views-and-provenance.md#outcome) | M |
 | 225 | **The F13 benchmarks and tests.** The SNB update streams with live short reads and views, BSBM's mix with views, the fan-out test of 1,000 subscribers, a grammar-driven query generator for the differential tests and injected crashes for recovery are not built. A grouped COUNT's pass is only 15 to 35 times cheaper than the query on synthetic data, short of the 100 times target. | [F13](specs/F13-incremental-views-and-provenance.md#outcome) | M |
 | 226 | **The cost of the change ring on commits.** While a view or live query is subscribed, each commit copies its changes into a ring, which adds about 4% to a single-quad commit on atlas. It needs a pinned forge measurement and a cheaper copy. | [F13](specs/F13-incremental-views-and-provenance.md#outcome) | S |
@@ -220,7 +220,8 @@ Rows that need backend work name it first.
 | 140 | **Linked views remainder in the UI.** Colour the embedding map by a kept Leiden run and open it with `Shift+M`, count date facets by month for short spans, give the facets a full-screen tab on phones, and let Explore's map and facets read a branch. | [U11](specs/U11-linked-views.md#outcome) | M |
 | 141 | **Frame times of the linked views on a GPU.** Run U11's A9 frame-rate and lasso targets in a Playwright performance project on a GPU runner, since they were measured only in software rendering. | [U11](specs/U11-linked-views.md#outcome) | S |
 | 142 | **Projections on disk and for partial callers.** Decide whether to write projections beside the index in a versioned file, and whether to serve a projection filtered to what a caller can read instead of answering `403`. | [U11](specs/U11-linked-views.md#10-open-questions) | M |
-| 150 | **Bidirectional weighted path search.** A weighted search runs Dijkstra's algorithm from the source alone and is far slower than an unweighted one. Search from both ends, run Yen's spur searches on it, and bound them by the best cost found so far. | [F07](specs/F07-path-search.md), [U09](specs/U09-path-finder.md#outcome) | M |
+| 275 | **Weighted shortest paths under a length limit.** A weighted shortest search with `path:maxLength` lists paths by cost until one is short enough, so a pair whose short paths are all dear runs to the visit limit, and the path finder always sends a limit. Search over pairs of node and length, keeping a label only when no other label at the node is both cheaper and shorter, and use the same search for Yen's spurs. | [F07](specs/F07-path-search.md#weighted-searches-from-both-ends-2026-10-24), [U09](specs/U09-path-finder.md#outcome) | M |
+| 277 | **Weighted `path:allShortest` from both ends.** Every cheapest path of one pair without `path:maxLength`, cycles through the source and searches to several targets still run Dijkstra's algorithm from the source alone. Keep every tied parent on both ends and join the halves at every cheapest meeting. | [F07](specs/F07-path-search.md#weighted-searches-from-both-ends-2026-10-24) | S–M |
 | 105 | **Canvas lenses, Phase 3.** First an explanation search over a materialized closure, then the derivation tree of an inferred edge on the canvas. | [U10](specs/U10-canvas-lenses.md) Phase 3 | L |
 
 Item 105 Phase 3 comes last because its explanation search is the most open engine work
@@ -264,6 +265,16 @@ These items are smaller or narrower. Each has a design sketch in the linked spec
 | 221 | **Views over the inferred graph.** A dataset whose queries add the graph of materialized inferences to the default graph refuses views and live queries, because a circuit's default graph is the stored one. The circuit's scans and footprints need the same overlay. | [F13](specs/F13-incremental-views-and-provenance.md#outcome) | S–M |
 | 224 | **A server-wide limit of live queries.** `--max-live-queries` and `--max-live-queries-per-principal` count per dataset, where the design counts over the server. | [F13](specs/F13-incremental-views-and-provenance.md#outcome) | S |
 | 227 | **Disclosure guards in circuits.** Circuits treat the graphs a C22 guard protects as unreadable, because a request decides a guard at its own snapshot. A view principal or live reader whose footprints prove a reports graph does not see it. Circuits need a guard decision that a pass can update as the footprints change. | [F13](specs/F13-incremental-views-and-provenance.md#outcome) | M |
+| 230 | **PostgreSQL and DuckDB sources for mappings.** The `postgres` and `duckdb` connection kinds of F19 §4.4 with secret references, the outbound policy for PostgreSQL hosts, the R2RML test cases on PostgreSQL in CI, and acceptance examples A1 and A10. | [F19](specs/F19-mappings-and-virtual-graphs.md#outcome) | M |
+| 231 | **Mappings in the JVM and Node.js bindings.** The stored mappings handle and `run_mapping`, which the Rust library and Python have. | [F19](specs/F19-mappings-and-virtual-graphs.md#outcome) | S |
+| 232 | **RML join conditions written as expression maps,** and the IRI checks of RMLTC0027b. Six RML-Core test cases are excluded until then. | [F19](specs/F19-mappings-and-virtual-graphs.md#outcome) | S–M |
+| 233 | **A Mappings page in the web UI** that lists stored mappings, edits them, runs them with a dry run first and shows the last run. | [F19](specs/F19-mappings-and-virtual-graphs.md#8-stored-mappings) | M |
+| 234 | **Stored mapping runs as tasks.** Runs longer than 10 seconds become tasks of `/$/tasks` with progress and cancellation, as F19 §2.2 describes. A run is one request. | [F19](specs/F19-mappings-and-virtual-graphs.md#outcome) | S–M |
+| 235 | **The W3C CSVW test suite,** vendored as test data for the RDF tests in minimal and standard mode. | [F19](specs/F19-mappings-and-virtual-graphs.md#131-conformance-and-equivalence) | S–M |
+| 236 | **The remaining SPARQL functions in function maps,** such as the date, numeric and term functions, as `urn:x-sparkles:fn:` functions. | [F19](specs/F19-mappings-and-virtual-graphs.md#outcome) | S |
+| 237 | **Parquet sources in object stores** (`s3`, `gcs`, `azure`) through `object_store`, as F19 §4.4 lists. Parquet files are read from the local disk. | [F19](specs/F19-mappings-and-virtual-graphs.md#outcome) | M |
+| 238 | **Template lookups that keep the dataset's blank nodes.** A lookup that binds an existing blank node writes a new one, because the loader scopes blank node labels per file. | [F19](specs/F19-mappings-and-virtual-graphs.md#outcome) | S–M |
+| 239 | **JSON numbers with their source lexical form,** as F19 §4.2 asks. serde_json prints a non-integral number in its own form. | [F19](specs/F19-mappings-and-virtual-graphs.md#outcome) | S |
 | 270 | **Scope challenges inside MCP tools.** `/$/mcp` challenges a missing `sparkles:read` or `sparkles:update` before a message runs, but an operation inside a tool that needs admin, such as deleting a protected branch, is refused as a tool error without naming `sparkles:admin`. The tools need a way to return the challenge, or the message check needs to know which arguments need admin. | [C11](specs/C11-mcp-server.md#oauth-for-the-mcp-endpoint-item-67-2026-10-24) | S |
 
 ## Tier 6: release work
@@ -282,6 +293,7 @@ early.
 | 63 | **Authentication additions.** Mutual TLS, OCSP, opaque-token introspection, front-channel logout and Cloudflare group lookup. | [C09](specs/C09-dataset-access-control.md#roadmap-follow-ups-2026-10-12) | M |
 | 64 | **Startup resilience.** Binding the listener before datasets open, and degraded startup when a dataset fails to open. | [C01](specs/C01-observability-and-budgets.md#roadmap-follow-ups-2026-10-12) | M |
 | 65 | **Encryption.** Key management workflows, Vault and cloud KMS, recovery export, and encryption of live datasets and derived indexes. | [F11](specs/F11-encryption-at-rest.md#roadmap-follow-ups-2026-10-12) | L–XL |
+| 280 | **Replication spec refresh.** Answer F10's open questions 15 to 23 before Phase 2 starts. They cover derived state on replicas, branches, encryption, the fencing and data-loss guarantees of lease-based failover, Kubernetes, scope, the estimate, how a peer joins and exchanges credentials, and one account of high availability with recovery targets and client routing. | [F10](specs/F10-replication.md#11-open-questions) | S |
 | 66 | **Replication.** Read replicas, preserved primary IDs, promotion, failover, synchronous replication, and a patch log or continuous archive. | [F10](specs/F10-replication.md#roadmap-follow-ups-2026-10-12) | XL |
 
 ## Tier 7: compatibility leftovers
@@ -306,6 +318,7 @@ linked spec Outcome records how they landed.
 - **11.** Time slider. [U01](specs/U01-time-slider.md)
 - **13.** Current shape standards. [G03](specs/G03-shaclc.md#roadmap-follow-ups-2026-10-12), [G02](specs/G02-shex.md#roadmap-follow-ups-2026-10-12)
 - **16.** Index compression after predicate patterns. [X11](specs/X11-index-compression-and-predicate-patterns.md#outcome)
+- **22.** RML, R2RML and YARRRML loading. [F19](specs/F19-mappings-and-virtual-graphs.md#outcome) Phase 1
 - **67.** MCP OAuth. [C11](specs/C11-mcp-server.md#oauth-for-the-mcp-endpoint-item-67-2026-10-24)
 - **68.** Sealed runtime secrets. [C19](specs/C19-layered-settings.md#roadmap-follow-ups-2026-10-12)
 - **85.** Hash-join, ordered DISTINCT and encrypted spill. [X08](specs/X08-disk-spill-and-server-memory.md) §6.3 and §6.7
@@ -324,6 +337,7 @@ linked spec Outcome records how they landed.
 - **107.** Linked views. [U11](specs/U11-linked-views.md#outcome)
 - **108.** Faster FSST reads. [X11](specs/X11-index-compression-and-predicate-patterns.md#item-108-faster-fsst-reads)
 - **110.** Bounded write stall of the locked full-text checkpoint. [X09](specs/X09-group-commit-by-default.md#phase-4)
+- **150.** Weighted path searches from both ends. [F07](specs/F07-path-search.md#weighted-searches-from-both-ends-2026-10-24)
 
 ## Keeping this current
 

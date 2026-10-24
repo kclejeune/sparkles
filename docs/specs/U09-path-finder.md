@@ -383,8 +383,16 @@ geometric mean of 0.93 for the new build over the old one and no query above the
 since the engine did not change. It also timed the weighted searches the panel now sends.
 A weighted pair search takes 0.68 s on the 10.5M-triple data against 1.2 ms unweighted,
 and the five cheapest paths stop at the default limit of 10 million visited nodes.
-[BENCHMARKS](../BENCHMARKS.md#weighted-pair-searches) has the figures,
-and ROADMAP item 150 makes weighted searches bidirectional.
+[BENCHMARKS](../BENCHMARKS.md#weighted-pair-searches) has the figures.
+
+**Weighted searches from both ends.** ROADMAP item 150 made the weighted search of one
+pair and Yen's weighted spur searches run from both ends, as
+[F07](F07-path-search.md#weighted-searches-from-both-ends-2026-10-24) describes. On forge
+the weighted pair search now takes 3.5 ms on the 10.5M-triple data and the five cheapest
+paths 69 ms. The panel always sends `path:maxLength`, so its weighted shortest search lists
+paths by cost until one is short enough. It answers quickly when the cheapest path is
+within the limit, and a pair whose short paths are all dear still runs to the panel's
+limit of a million visits, which ROADMAP item 275 addresses.
 
 **Phase 3 decisions.** The spec left these open, and each was decided here. The weight
 picker offers reifier properties only, with no free IRI field, since a weight that no

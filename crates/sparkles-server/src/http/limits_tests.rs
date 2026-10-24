@@ -438,3 +438,45 @@ async fn spooling_keeps_free_disk_space() {
     assert!(budget.disk(&std::env::temp_dir(), 1).is_ok());
     assert!(free_disk_bytes(&std::env::temp_dir()).unwrap() > 0);
 }
+
+/// A mapping's output keeps the free-disk reserve, also when the mapping reads only a
+/// database and nothing was uploaded to spool (spec F19, review round 1).
+#[cfg(feature = "mapping-sqlite")]
+#[tokio::test]
+async fn mapping_output_keeps_free_disk_space() {
+    let (d, st, app) = server(|st| st.limits.min_free_disk_bytes = Some(u64::MAX / 2));
+    let db = d.path().join("shop.sqlite");
+    let c = sparkles::mapping::rusqlite::Connection::open(&db).unwrap();
+    c.execute_batch("CREATE TABLE t (id INTEGER PRIMARY KEY); INSERT INTO t VALUES (1);")
+        .unwrap();
+    drop(c);
+    let conns = serde_json::json!({"connections": {"shop": {"kind": "sqlite", "path": db.to_str().unwrap()}}});
+    let r = send(
+        &app,
+        Request::patch("/$/server/settings/connections")
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(Body::from(conns.to_string()))
+            .unwrap(),
+    )
+    .await;
+    assert!(r.status.is_success(), "{}", r.text());
+    let r2rml = "@prefix rr: <http://www.w3.org/ns/r2rml#> .\n<#t> rr:logicalTable [ rr:tableName \"t\" ] ; rr:subjectMap [ rr:template \"http://ex.org/t/{id}\" ; rr:class <http://ex.org/T> ] .\n";
+    let r = send(
+        &app,
+        Request::put("/$/mappings/c/t")
+            .header(header::CONTENT_TYPE, "text/turtle")
+            .body(Body::from(r2rml))
+            .unwrap(),
+    )
+    .await;
+    assert_eq!(r.status, StatusCode::CREATED, "{}", r.text());
+    let r = send(
+        &app,
+        Request::post("/c/mappings/t/run")
+            .body(Body::empty())
+            .unwrap(),
+    )
+    .await;
+    assert_eq!(r.status, StatusCode::INSUFFICIENT_STORAGE, "{}", r.text());
+    assert_eq!(count(&st), 0);
+}
