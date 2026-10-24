@@ -972,6 +972,22 @@ impl Principal {
         self.log_name().unwrap_or_else(|| "local".into())
     }
 
+    #[cfg_attr(not(feature = "mcp"), allow(dead_code))]
+    /// [`Principal::id`] together with the bound of an OIDC access token's scopes, for
+    /// what must not pass between two tokens of one account with different scopes, such
+    /// as MCP tasks and legacy sessions: `oidc:alice@example.org#sparkles:read`.
+    pub fn access_id(&self) -> String {
+        match &self.info.oauth_scopes {
+            Some(scopes) => {
+                let mut s = scopes.clone();
+                s.sort();
+                s.dedup();
+                format!("{}#{}", self.id(), s.join(" "))
+            }
+            None => self.id(),
+        }
+    }
+
     /// The key of per-client rate limits: the owner of a minted token or a session
     /// (`user:bob`), so that all the credentials of one owner share one budget; else
     /// [`Principal::id`] (a static token of the configuration is a client of its own).

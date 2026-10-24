@@ -71,13 +71,16 @@ fn rpc(method: &str, params: J) -> String {
 
 /// A modern MCP request (protocol `2026-07-28`) as `auth`.
 async fn mcp(s: &AuthServer, auth: Option<&str>, method: &str, mut params: J) -> R {
-    params["_meta"] = json!({
-        "io.modelcontextprotocol/protocolVersion": "2026-07-28",
-        "io.modelcontextprotocol/clientCapabilities": {}
-    });
+    if params.get("_meta").is_none() {
+        params["_meta"] = json!({
+            "io.modelcontextprotocol/protocolVersion": "2026-07-28",
+            "io.modelcontextprotocol/clientCapabilities": {}
+        });
+    }
     let name = params
         .get("name")
         .or_else(|| params.get("uri"))
+        .or_else(|| params.get("taskId"))
         .and_then(J::as_str)
         .map(str::to_string);
     let mut h = vec![
@@ -488,4 +491,98 @@ async fn a_scope_never_adds_access() {
     .await;
     assert_eq!(r.status, StatusCode::OK, "{}", r.text());
     assert_eq!(r.json()["result"]["isError"], true);
+}
+
+/// A scope target comes from what the message acts on: a stored query's tool is bound to
+/// its dataset even when a parameter is named `dataset`, and a prompt names its dataset.
+#[tokio::test]
+async fn scope_targets_follow_the_operation() {
+    let (s, m) = server(Some(vec![]), true).await;
+    let def: sparkles::stored::Definition = serde_json::from_value(json!({
+        "query": "SELECT ?x WHERE { BIND(?dataset AS ?x) }",
+        "parameters": { "dataset": { "type": "string" } }
+    }))
+    .unwrap();
+    s.state.datasets()["wiki"]
+        .queries
+        .put("param", def, sparkles::stored::Change::default())
+        .unwrap();
+    let wiki = bearer_of(&token(&m, json!(RESOURCE), "sparkles:read:wiki"));
+    let r = tool(&s, &wiki, "wiki__param", json!({"dataset": "team-a"})).await;
+    assert!(r.get("isError").is_none_or(|e| e == false), "{r}");
+    let r = mcp(
+        &s,
+        Some(&wiki),
+        "prompts/get",
+        json!({"name": "explore_dataset", "arguments": {"dataset": "team-a"}}),
+    )
+    .await;
+    assert_eq!(challenged_scope(&r), "sparkles:read");
+}
+
+/// A task belongs to its caller's account and scopes together: a token of the same
+/// account with narrower scopes cannot read the result of a broader one's task.
+#[tokio::test(flavor = "multi_thread")]
+async fn tasks_do_not_cross_scopes() {
+    let (s, m) = server(Some(vec!["--mcp-task-after-ms", "0"]), true).await;
+    let mut data = String::from("@prefix ex: <http://ex.org/> .\n");
+    for i in 0..3000 {
+        data.push_str(&format!("ex:s{i} ex:v {i} .\n"));
+    }
+    s.state.datasets()["team-a"]
+        .store
+        .load(&[Source::from_bytes(
+            data.into_bytes(),
+            oxrdfio::RdfFormat::Turtle,
+            None,
+        )])
+        .unwrap();
+    let meta = json!({
+        "io.modelcontextprotocol/protocolVersion": "2026-07-28",
+        "io.modelcontextprotocol/clientCapabilities": {
+            "extensions": {"io.modelcontextprotocol/tasks": {}}
+        }
+    });
+    let broad = bearer_of(&token(&m, json!(RESOURCE), "sparkles:read"));
+    let narrow = bearer_of(&token(&m, json!(RESOURCE), "sparkles:read:wiki"));
+    let r = mcp(
+        &s,
+        Some(&broad),
+        "tools/call",
+        json!({"_meta": meta, "name": "sparql_query", "arguments": {"dataset": "team-a",
+               "query": "PREFIX ex: <http://ex.org/> SELECT (COUNT(*) AS ?n) WHERE { ?a ex:v ?x . ?b ex:v ?y }"}}),
+    )
+    .await;
+    assert_eq!(r.status, StatusCode::OK, "{}", r.text());
+    let res = r.json()["result"].clone();
+    assert_eq!(res["resultType"], "task", "{res}");
+    let id = res["taskId"].as_str().unwrap().to_string();
+    let get = |auth: String| {
+        let (meta, id) = (meta.clone(), id.clone());
+        let s = &s;
+        async move {
+            mcp(
+                s,
+                Some(&auth),
+                "tasks/get",
+                json!({"_meta": meta, "taskId": id}),
+            )
+            .await
+            .json()
+        }
+    };
+    let r = get(narrow.clone()).await;
+    assert_eq!(r["error"]["code"], -32602, "{r}");
+    let mut task = J::Null;
+    for _ in 0..600 {
+        task = get(broad.clone()).await["result"].clone();
+        if task["status"] != "working" {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    assert_eq!(task["status"], "completed", "{task}");
+    // still hidden from the narrower token once it is done
+    let r = get(narrow).await;
+    assert_eq!(r["error"]["code"], -32602, "{r}");
 }

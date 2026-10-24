@@ -1692,14 +1692,19 @@ of each message in `mcp/http.rs`.
   bounded by its scopes when it carries any `sparkles:` scope, on every route, and always
   when only the resource identifier accepted it, so a resource token without such a
   scope can do nothing. An `api_audience` token without them keeps its full grants as
-  before. Scopes that do not parse add nothing.
+  before. Scopes that do not parse add nothing. MCP tasks and legacy sessions belong
+  to the account and its scopes together, so a token of the same account with
+  narrower scopes cannot poll a broader token's task or use its session.
 - **Scope challenges.** `mcp/http.rs` checks each JSON-RPC request before it is
   charged. A write tool needs `sparkles:update` on its dataset and every other message
   `sparkles:read` on its dataset, or on some exposed dataset when it names none. When the
   grants without the scope bound allow the message and the bounded access does not, the
   answer is HTTP `403` with
   `Bearer error="insufficient_scope", scope=…, resource_metadata=…, error_description=…`,
-  the form the MCP spec gives for Streamable HTTP. Levels are compared on any branch,
+  the form the MCP spec gives for Streamable HTTP. The dataset checked is the one the
+  message acts on. A stored query's tool is bound to its own dataset whatever its
+  arguments say, other tools and prompts name it in `dataset`, and a resource in its URI.
+  Levels are compared on any branch,
   since a scope's bound does not depend on the branch. When the grants do not allow the
   message either, no challenge is sent and the tool answers as for any caller, so a
   challenge never reveals a hidden dataset. The challenge names the scope without a

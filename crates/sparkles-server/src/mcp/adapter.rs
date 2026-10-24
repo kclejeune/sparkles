@@ -379,7 +379,11 @@ impl ServerHandler for Adapter {
         ctx: RequestContext<RoleServer>,
     ) -> Result<GetTaskResult, McpError> {
         let p = self.principal(&ctx)?;
-        let task = self.server.shared.tasks.get(&p.id(), &request.task_id)?;
+        let task = self
+            .server
+            .shared
+            .tasks
+            .get(&p.access_id(), &request.task_id)?;
         Ok(GetTaskResult::new(task))
     }
 
@@ -389,7 +393,10 @@ impl ServerHandler for Adapter {
         ctx: RequestContext<RoleServer>,
     ) -> Result<(), McpError> {
         let p = self.principal(&ctx)?;
-        self.server.shared.tasks.cancel(&p.id(), &request.task_id)
+        self.server
+            .shared
+            .tasks
+            .cancel(&p.access_id(), &request.task_id)
     }
 
     async fn update_task(
@@ -398,7 +405,10 @@ impl ServerHandler for Adapter {
         ctx: RequestContext<RoleServer>,
     ) -> Result<(), McpError> {
         let p = self.principal(&ctx)?;
-        self.server.shared.tasks.update(&p.id(), &request.task_id)
+        self.server
+            .shared
+            .tasks
+            .update(&p.access_id(), &request.task_id)
     }
 
     fn supported_protocol_versions(&self) -> Cow<'static, [ProtocolVersion]> {
@@ -625,7 +635,9 @@ impl ServerHandler for Adapter {
                 None,
             ));
         }
-        let owner = call.principal.id();
+        // a task belongs to its caller's identity and scope bound together, so a token
+        // with narrower scopes cannot read the result of a broader one
+        let owner = call.principal.access_id();
         let args = request.arguments.unwrap_or_default();
         let modern = modern(&ctx);
         let server = self.server.clone();
