@@ -446,6 +446,47 @@ memory the baseline needed, which meets A1. These are development numbers from a
 Namespace instance, not forge. [F16's Outcome](specs/F16-materialization-at-scale.md#outcome)
 has the method and the decision.
 
+### Small incremental runs on LUBM-style data
+
+Roadmap item 87 measured small incremental runs over a kept closure on forge on
+2026-10-23. The data is LUBM-style data with 100 universities from the generator of
+`examples/lubm.rs`, 13.1 million triples, not the UBA data of the LUBM section, and each run
+materializes the closure, then changes 1,000 triples, undoes the change and makes it again,
+each time from the closure kept in memory. Commit 534a7ad3 ran against a6179e58, the commit
+before the kept closure dropped the explicit facts, in six interleaved rounds at 16 threads,
+each run alone under the bench lock on a fresh copy of the dataset. The table gives the
+medians.
+
+| Run, 16 threads | a6179e58 | 534a7ad3 |
+|---|---|---|
+| RDFS, change, undo, change again | 17.5, 13, 15 ms | 19, 14.5, 13.5 ms |
+| OWL 2 RL, change, undo, change again | 37, 43, 26 ms | 43.5, 48.5, 26 ms |
+| RDFS, kept closure | 2,267 MiB | 927 MiB |
+| OWL 2 RL, kept closure | 2,654 MiB | 1,244 MiB |
+| RDFS, full run | 16.0 s | 14.8 s |
+| OWL 2 RL, full run | 21.9 s | 20.9 s |
+
+The changes stay within 1.2 times their earlier time while the kept closure needs 41% and
+47% of the memory. Changes of 100 triples at 16 threads and undos at 1 thread are still
+slower, by 1.3 to 2.3 times.
+
+The dataset above is in index format 2, the one format a6179e58 reads. A recheck on the
+dataset in index format 3, whose blocks have segments, compared 77789822, the work merged
+onto main, with main at dc95359c in six more rounds. Main holds the first pass of item 87.
+
+| Run, 16 threads, format 3 | dc95359c | 77789822 |
+|---|---|---|
+| RDFS, change, undo, change again | 36.5, 16.5, 13 ms | 18, 13.5, 12 ms |
+| OWL 2 RL, change, undo, change again | 111.5, 51.5, 44.5 ms | 40.5, 44.5, 25 ms |
+| RDFS, full run | 14.6 s | 14.7 s |
+| OWL 2 RL, full run | 19.9 s | 20.8 s |
+
+The change takes half its time on main for RDFS and about a third for OWL 2 RL. Full runs
+are 1% slower for RDFS and 5% slower for OWL 2 RL, which roadmap item 113 follows up.
+These are development A/B numbers rather than a refreshed
+benchmark. [F16's follow-ups](specs/F16-materialization-at-scale.md#roadmap-follow-ups-2026-10-18)
+give the ranges, the other sizes and the 1-thread runs.
+
 ### DBpedia at the 50M slice
 
 The subject-hash slice of DBpedia 2022.12.01 contains 50,143,058 input statements.
