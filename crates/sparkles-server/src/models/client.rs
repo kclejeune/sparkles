@@ -220,8 +220,9 @@ pub fn build(p: &ProviderConfig, req: &ChatRequest) -> (String, Value) {
             }
             match (req.level, &req.schema) {
                 (Level::JsonSchema, Some((_, s))) => {
-                    body["output_config"] =
-                        json!({ "format": { "type": "json_schema", "schema": s } });
+                    body["output_config"] = json!({
+                        "format": { "type": "json_schema", "schema": anthropic_schema(s) }
+                    });
                 }
                 (Level::Tool, Some((name, s))) => {
                     body["tools"] = json!([{
@@ -599,9 +600,81 @@ pub fn send_admitted(
     }
 }
 
+/// A schema that Anthropic's structured output accepts. It refuses length, count and
+/// numeric bounds with a 400, so they are left out of the request. Every answer is still
+/// validated against the full schema (`structured::validate`), so a bound the model
+/// passes costs a retry rather than a wrong value.
+fn anthropic_schema(s: &Value) -> Value {
+    const BOUNDS: [&str; 8] = [
+        "maxItems",
+        "maxLength",
+        "minLength",
+        "minimum",
+        "maximum",
+        "exclusiveMinimum",
+        "exclusiveMaximum",
+        "multipleOf",
+    ];
+    match s {
+        Value::Object(m) => Value::Object(
+            m.iter()
+                .filter(|(k, v)| {
+                    !BOUNDS.contains(&k.as_str())
+                        // only a minItems of 0 or 1 is accepted
+                        && !(k.as_str() == "minItems" && v.as_u64().is_some_and(|n| n > 1))
+                })
+                .map(|(k, v)| (k.clone(), anthropic_schema(v)))
+                .collect(),
+        ),
+        Value::Array(a) => Value::Array(a.iter().map(anthropic_schema).collect()),
+        v => v.clone(),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn anthropic_schemas_leave_out_the_bounds_it_refuses() {
+        let mut r = req(Level::JsonSchema);
+        r.schema = Some((
+            "Report".into(),
+            json!({
+                "type": "object",
+                "properties": {
+                    "title": { "type": "string", "maxLength": 200 },
+                    "findings": { "type": "array", "maxItems": 12, "minItems": 2,
+                                  "items": { "type": "integer", "minimum": 0 } },
+                    "tags": { "type": "array", "minItems": 1, "items": { "type": "string" } },
+                    "rating": { "type": "integer", "minimum": 0, "maximum": 10 }
+                },
+                "required": ["title"],
+                "additionalProperties": false
+            }),
+        ));
+        let (_, b) = build(&provider(Kind::Anthropic), &r);
+        assert_eq!(
+            b["output_config"]["format"]["schema"],
+            json!({
+                "type": "object",
+                "properties": {
+                    "title": { "type": "string" },
+                    "findings": { "type": "array", "items": { "type": "integer" } },
+                    "tags": { "type": "array", "minItems": 1, "items": { "type": "string" } },
+                    "rating": { "type": "integer" }
+                },
+                "required": ["title"],
+                "additionalProperties": false
+            })
+        );
+        // other kinds keep the schema as written
+        let (_, b) = build(&provider(Kind::Openai), &r);
+        assert_eq!(
+            b["response_format"]["json_schema"]["schema"]["properties"]["rating"]["maximum"],
+            10
+        );
+    }
 
     fn provider(kind: Kind) -> ProviderConfig {
         serde_json::from_value(json!({ "kind": kind.as_str(), "endpoint": "http://h/v1/" }))
