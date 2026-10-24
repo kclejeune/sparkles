@@ -1002,6 +1002,149 @@ fn random_weighted_graphs_against_brute_force() {
     }
 }
 
+/// The cheapest path and the k cheapest paths with weights, which search from both ends
+/// (ROADMAP item 150), on random graphs in every direction, with skipped predicates and
+/// hubs, against every simple path enumerated by brute force. Each path found must be one
+/// of them, and the costs must be the cheapest in order.
+#[test]
+fn random_weighted_graphs_from_both_ends_against_brute_force() {
+    let mut r = Rng(0x0b1d_1ec7_ed00);
+    for case in 0..60 {
+        let n = 6 + r.below(5);
+        let m = n + r.below(2 * n);
+        let mut triples: BTreeMap<E, Option<usize>> = BTreeMap::new();
+        for _ in 0..m {
+            let w = match r.below(6) {
+                0 => None,
+                1 => Some(0),
+                w => Some(w - 1),
+            };
+            triples.insert((r.below(n), r.below(3), r.below(n)), w);
+        }
+        let ttl: String = triples
+            .iter()
+            .map(|((a, p, b), w)| match w {
+                Some(w) => format!("ex:n{a} ex:p{p} ex:n{b} {{| ex:w {w} |}} .\n"),
+                None => format!("ex:n{a} ex:p{p} ex:n{b} .\n"),
+            })
+            .collect();
+        let s = store_of(&ttl);
+        let weight = |t: &E| triples[t].unwrap_or(1);
+        let skip_p2 = r.below(2) == 0;
+        let max_degree = [None, Some(2), Some(3)][r.below(3)];
+        let (dir, back, both) = [
+            ("path:forward", false, false),
+            ("path:backward", true, false),
+            ("path:both", false, true),
+        ][r.below(3)];
+        let mut adj: BTreeMap<usize, Vec<(usize, usize, E)>> = BTreeMap::new();
+        for &(a, p, b) in triples.keys() {
+            if skip_p2 && p == 2 {
+                continue;
+            }
+            let t = (a, p, b);
+            if back || both {
+                adj.entry(b).or_default().push((p, a, t));
+            }
+            if !back && !(both && a == b) {
+                adj.entry(a).or_default().push((p, b, t));
+            }
+        }
+        let degree = |x: usize| adj.get(&x).map_or(0, Vec::len);
+        let src = r.below(n);
+        // the nodes of a path in path order, from the stored triples
+        let nodes_of = |path: &[E]| -> Vec<usize> {
+            let mut out = vec![src];
+            for &(a, _, b) in path {
+                let x = *out.last().unwrap();
+                let fwd = !back && a == x;
+                out.push(if fwd || (both && a == x) { b } else { a });
+            }
+            out
+        };
+        let all: Vec<(usize, Vec<E>)> = brute(&adj, src, n)
+            .into_iter()
+            .filter(|(_, p)| {
+                let ns = nodes_of(p);
+                // a hub may be an end of a path but no node in between
+                ns[1..ns.len() - 1]
+                    .iter()
+                    .all(|&x| max_degree.is_none_or(|l| degree(x) <= l))
+            })
+            .collect();
+        let mut extra = format!("path:direction {dir}");
+        if skip_p2 {
+            extra.push_str(" ; path:excludePredicate ex:p2");
+        }
+        if let Some(l) = max_degree {
+            extra.push_str(&format!(" ; path:maxDegree {l}"));
+        }
+        for t in 0..n {
+            let ctx = format!("case {case} {extra} n{src}→n{t}");
+            let want: BTreeSet<&Vec<E>> = all
+                .iter()
+                .filter(|(e, _)| *e == t)
+                .map(|(_, p)| p)
+                .collect();
+            let mut costs: Vec<usize> = want.iter().map(|p| p.iter().map(weight).sum()).collect();
+            costs.sort();
+            let found = |alg: &str| -> Vec<(Vec<E>, usize)> {
+                let mut by: BTreeMap<usize, (BTreeMap<usize, E>, f64)> = BTreeMap::new();
+                for row in rows(
+                    &s,
+                    &format!(
+                        "SELECT * WHERE {{ SERVICE path:search {{ [] path:source ex:n{src} ; \
+                         path:target ex:n{t} ; path:weight ex:w ; {extra} ; {alg} path:cost ?c ; \
+                         path:pathIndex ?path ; path:edgeIndex ?i ; path:edgeSubject ?s ; \
+                         path:edgePredicate ?p ; path:edgeObject ?o }} }}"
+                    ),
+                ) {
+                    let num = |k: &str| {
+                        row[k]
+                            .trim_start_matches(|c: char| !c.is_ascii_digit())
+                            .parse::<usize>()
+                            .unwrap()
+                    };
+                    let e = by
+                        .entry(row["path"].parse().unwrap())
+                        .or_insert_with(|| (BTreeMap::new(), row["c"].parse().unwrap()));
+                    e.0.insert(row["i"].parse().unwrap(), (num("s"), num("p"), num("o")));
+                }
+                by.into_values()
+                    .map(|(es, c)| {
+                        let p: Vec<E> = es.into_values().collect();
+                        let sum: usize = p.iter().map(weight).sum();
+                        assert_eq!(c, sum as f64, "{ctx}: the cost of {p:?}");
+                        (p, sum)
+                    })
+                    .collect()
+            };
+            let one = found("");
+            assert_eq!(
+                one.len(),
+                usize::from(!costs.is_empty()),
+                "{ctx}: one cheapest"
+            );
+            if let Some((p, c)) = one.first() {
+                assert!(want.contains(p), "{ctx}: {p:?} is a path");
+                assert_eq!(Some(c), costs.first(), "{ctx}: cheapest");
+            }
+            let k = 4;
+            let ks = found(&format!("path:algorithm path:kShortest ; path:k {k} ;"));
+            let mut got: Vec<usize> = ks.iter().map(|(_, c)| *c).collect();
+            got.sort();
+            let mut best = costs.clone();
+            best.truncate(k);
+            assert_eq!(got, best, "{ctx}: {k} cheapest");
+            let distinct: BTreeSet<&Vec<E>> = ks.iter().map(|(p, _)| p).collect();
+            assert_eq!(distinct.len(), ks.len(), "{ctx}: distinct paths");
+            for (p, _) in &ks {
+                assert!(want.contains(p), "{ctx}: {p:?} is a path");
+            }
+        }
+    }
+}
+
 /// The nodes of a path given as stored triples, walked from `src`: `ex:p0` triples
 /// forward and `ex:p1` triples backward.
 fn walk(src: usize, path: &[E]) -> Vec<usize> {

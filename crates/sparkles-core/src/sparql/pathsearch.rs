@@ -27,7 +27,8 @@
 //!
 //! The searches: bidirectional breadth-first search for one unweighted pair, one
 //! breadth-first search per source (or per target) for several or unbound ends,
-//! Dijkstra's algorithm with weights, Yen's algorithm for the k shortest paths, and a
+//! Dijkstra's algorithm with weights, from both ends for the cheapest path of one pair and
+//! for the spur searches of Yen's algorithm for the k shortest paths, and a
 //! depth-first enumeration pruned by the distance to the targets for all paths.
 
 use super::ctx::{Charge, Ctx};
@@ -1112,6 +1113,28 @@ impl Tree {
 /// An `f64` ordered by `total_cmp`, for the heaps.
 #[derive(Clone, Copy, Debug, PartialEq)]
 struct OrdF64(f64);
+
+/// A path from `s` with every cycle cut out, so each node appears once. Two halves of a
+/// bidirectional search can share a node only through edges of weight zero, so the cut
+/// path costs the same.
+fn without_loops(s: u64, edges: Vec<Edge>) -> Vec<Edge> {
+    let mut out: Vec<Edge> = Vec::with_capacity(edges.len());
+    // the position in `out` after which each node is reached
+    let mut at: FxHashMap<u64, usize> = FxHashMap::default();
+    at.insert(s, 0);
+    for e in edges {
+        if let Some(&i) = at.get(&e.to) {
+            for d in out.drain(i..) {
+                at.remove(&d.to);
+            }
+            at.insert(e.to, i);
+            continue;
+        }
+        out.push(e);
+        at.insert(e.to, out.len());
+    }
+    out
+}
 impl Eq for OrdF64 {}
 impl PartialOrd for OrdF64 {
     fn partial_cmp(&self, o: &Self) -> Option<Ordering> {
@@ -2200,6 +2223,139 @@ impl<'a> Engine<'a> {
         Ok((tree, dist))
     }
 
+    /// The cheapest path from `s` to `t`, two different real nodes, by Dijkstra's
+    /// algorithm from both ends (ROADMAP item 150). The forward search settles nodes by
+    /// their cost from `s` and the backward search by their cost to `t`, and the side with
+    /// the smaller queue goes next. Every edge either side relaxes onto a node the other
+    /// side has reached gives a path, and the cheapest one so far is kept. The search
+    /// stops once the two queues' least costs add up to at least that path's cost, since
+    /// no path through an unsettled node can be cheaper, so on a graph where most paths
+    /// are short each side settles only the nodes near its end. A meeting node must be
+    /// one a path may pass through: not a hub and not a literal, unless it is an end.
+    /// `banned` nodes and edges are skipped on both sides, for Yen's spur searches.
+    fn dijkstra_pair(
+        &self,
+        s: u64,
+        t: u64,
+        banned_nodes: Option<&FxHashSet<u64>>,
+        banned_edges: Option<&FxHashSet<Edge>>,
+    ) -> Result<Option<(Vec<Edge>, f64)>> {
+        debug_assert!(s != t && s != VIRT && t != VIRT);
+        self.set_roots(&[s, t]);
+        let mut trees = [Tree::new(s, true), Tree::new(t, false)];
+        let mut dist: [FxHashMap<u64, f64>; 2] = Default::default();
+        let mut settled: [FxHashSet<u64>; 2] = Default::default();
+        let mut heaps: [BinaryHeap<Reverse<(OrdF64, u64)>>; 2] = Default::default();
+        for (i, r) in [s, t].into_iter().enumerate() {
+            dist[i].insert(r, 0.0);
+            heaps[i].push(Reverse((OrdF64(0.0), r)));
+        }
+        // the cheapest path found so far, by its cost and the node where the sides meet
+        let mut best: Option<(f64, u64)> = None;
+        let mut n = 0u64;
+        loop {
+            for i in 0..2 {
+                while let Some(&Reverse((_, u))) = heaps[i].peek() {
+                    if !settled[i].contains(&u) {
+                        break;
+                    }
+                    heaps[i].pop();
+                }
+            }
+            let (Some(&Reverse((OrdF64(df), _))), Some(&Reverse((OrdF64(db), _)))) =
+                (heaps[0].peek(), heaps[1].peek())
+            else {
+                // one side has settled everything it can reach
+                break;
+            };
+            if best.is_some_and(|(mu, _)| df + db >= mu) {
+                break;
+            }
+            let side = usize::from(heaps[0].len() > heaps[1].len());
+            let forward = side == 0;
+            let Reverse((OrdF64(d), u)) = heaps[side].pop().unwrap();
+            settled[side].insert(u);
+            if u != trees[side].root {
+                trees[side].order.push((u, 0));
+            }
+            self.visit(1)?;
+            n += 1;
+            if n.is_multiple_of(4096) {
+                self.ctx.check()?;
+            }
+            // a plain search expands each node once; Yen's spur searches revisit them
+            let steps: Rc<[Step]> = if banned_nodes.is_some() {
+                self.neighbours(u, forward)?
+            } else {
+                let mut out = Vec::new();
+                self.expand(&[u], forward, &mut out)?;
+                out.into_iter().map(|(_, s)| s).collect()
+            };
+            for st in steps.iter() {
+                let y = st.node;
+                if settled[side].contains(&y) || banned_nodes.is_some_and(|b| b.contains(&y)) {
+                    continue;
+                }
+                let e = if forward {
+                    Edge {
+                        from: u,
+                        to: y,
+                        p: st.p,
+                        rev: st.rev,
+                    }
+                } else {
+                    Edge {
+                        from: y,
+                        to: u,
+                        p: st.p,
+                        rev: st.rev,
+                    }
+                };
+                if banned_edges.is_some_and(|b| b.contains(&e)) {
+                    continue;
+                }
+                let nd = d + self.weight(&e)?;
+                if dist[side].get(&y).is_some_and(|&c| nd >= c) {
+                    continue;
+                }
+                dist[side].insert(y, nd);
+                trees[side].first.insert(
+                    y,
+                    (
+                        Parent {
+                            node: u,
+                            p: st.p,
+                            rev: st.rev,
+                        },
+                        0,
+                    ),
+                );
+                heaps[side].push(Reverse((OrdF64(nd), y)));
+                if let Some(&o) = dist[1 - side].get(&y)
+                    && best.is_none_or(|(mu, _)| nd + o < mu)
+                    && (y == s || y == t || !(self.sink(y, true) || self.blocked(y)?))
+                {
+                    best = Some((nd + o, y));
+                }
+            }
+        }
+        let Some((_, m)) = best else {
+            return Ok(None);
+        };
+        // the parents of a node only ever get cheaper, so the two halves through the
+        // meeting node cost at most the path found, which no path beats
+        let check = || self.ctx.check();
+        let (Some(a), Some(z)) = (
+            trees[0].paths(m, false, 1, None, &check)?.pop(),
+            trees[1].paths(m, false, 1, None, &check)?.pop(),
+        ) else {
+            return Ok(None);
+        };
+        let path = without_loops(s, a.into_iter().chain(z).collect());
+        let cost = self.path_cost(&path)?;
+        Ok(Some((path, cost)))
+    }
+
     /// The shortest path from `from` to `to` (forward) that avoids the banned nodes and
     /// edges, of at most `budget` edges without weights: Yen's spur search.
     fn spur(
@@ -2211,7 +2367,11 @@ impl<'a> Engine<'a> {
         banned_edges: &FxHashSet<Edge>,
         budget: Option<u32>,
     ) -> Result<Option<(Vec<Edge>, f64)>> {
+        if self.spec.weighted() && to != VIRT && from != to {
+            return self.dijkstra_pair(from, to, Some(banned_nodes), Some(banned_edges));
+        }
         if self.spec.weighted() {
+            // a spur that closes a cycle searches from one end
             let close = to == VIRT;
             let targets: FxHashSet<u64> = [if close { virt } else { to }].into_iter().collect();
             let (tree, dist) = self.dijkstra(
@@ -2624,6 +2784,19 @@ pub fn run(
                     }
                     continue;
                 }
+                // one cheapest path between two different nodes: from both ends
+                if single && weighted && !all {
+                    let t = *targets.set.first().unwrap();
+                    if t != s {
+                        eng.begin();
+                        if let Some((p, _)) = eng.dijkstra_pair(s, t, None, None)?
+                            && !add(&mut found, s, t, p, None, true)?
+                        {
+                            break 'sources;
+                        }
+                        continue;
+                    }
+                }
                 eng.begin();
                 let close = targets.any || tset.contains(&s);
                 let (tree, cost) = if weighted {
@@ -2969,6 +3142,24 @@ mod tree_tests {
         }
         t.order = (1..=len).map(|i| (i, 0)).collect();
         t
+    }
+
+    #[test]
+    fn halves_that_share_a_node_are_cut_to_a_simple_path() {
+        let e = |from, to| Edge {
+            from,
+            to,
+            p: 9,
+            rev: false,
+        };
+        // 1 → 2 → 3 → 2 → 4, where the halves met at 3 over zero-weight edges
+        let cut = without_loops(1, vec![e(1, 2), e(2, 3), e(3, 2), e(2, 4)]);
+        assert_eq!(cut, vec![e(1, 2), e(2, 4)]);
+        // a loop back through the source
+        let cut = without_loops(1, vec![e(1, 2), e(2, 1), e(1, 5)]);
+        assert_eq!(cut, vec![e(1, 5)]);
+        let plain = vec![e(1, 2), e(2, 3)];
+        assert_eq!(without_loops(1, plain.clone()), plain);
     }
 
     #[test]
