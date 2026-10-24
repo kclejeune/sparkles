@@ -7688,6 +7688,12 @@ result's `sh:resultPath` on the focus node, or `null` for a result on another no
 caller whose grants limit the graphs or triples it reads gets `withheld: true` and no
 results, as the validation routes withhold reports from such callers.
 
+The Rust library gives the same answers through `ds.forms().model`, `check` and `save`.
+Python binds them as `ds.forms.model(focus, class_=…, settings=…, at=…)`,
+`ds.forms.check(change, settings=…)` and `ds.forms.save(change, settings=…)`, which
+return dicts with the members above. A conflicting save raises `ConflictError` with the
+code `form-conflict` and the fields in `fields`. The Node.js and JVM bindings are planned.
+
 `save` compares `expect` with the stored values of the changed fields while it holds the
 writer lock. When one differs, it answers `409` with code `form-conflict` and the current
 values, and writes nothing. When the values are the same but another commit moved one of

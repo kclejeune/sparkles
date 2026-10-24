@@ -5543,6 +5543,42 @@ configuration. `validation` holds SHACL, ShEx and the write guard, and `indexes.
 controls spatial indexing. These handles replace the earlier flat administration
 methods.
 
+#### Editing forms in Python
+
+`ds.forms` builds the editing forms of [Editing forms](#editing-forms) from SHACL shapes.
+`ds.forms.model(focus)` returns the form of a resource as a dict with the shape of the
+HTTP route's answer, and `ds.forms.model(class_=iri)` returns the empty form of a new
+instance. Every call takes `settings`, a dict with the members of the `forms` setting such
+as `{"shapes": "graphs", "graphs": ["urn:shapes"]}`. Without it the form reads the shapes
+of the dataset's SHACL guard.
+
+```python
+model = ds.forms.model("http://ex.org/ann", settings=settings)
+name = next(f for f in model["fields"] if f["label"] == "Name")
+loaded = [v["term"] for v in name["values"]]
+change = {
+    "focus": "http://ex.org/ann",
+    "changes": [{"field": name["id"], "remove": loaded, "add": [Literal("Ann Lee")]}],
+    "expect": {name["id"]: loaded},     # the values the form loaded
+    "message": "rename Ann",
+}
+report = ds.forms.check(change, settings=settings)   # a dry run, nothing is written
+if report["validation"]["conforms"]:
+    ds.forms.save(change, settings=settings)
+```
+
+A term in a change is a dict of the model, such as `{"type": "literal", "value": "Ann"}`,
+or a `NamedNode` or `Literal`. `check` returns the preview of the update, the update's
+text, the `conflicts` that a save would meet and the `validation` of the nodes the change
+touches. A save writes one commit on the branch the dataset is open on, so a session
+branch is edited through `ds.branch(name).forms`. When another commit changed a field
+since the form loaded it, `save` writes nothing and raises `ConflictError` with the code
+`form-conflict` and `fields`, a list of the fields and the values stored now. Both calls
+take `author`, `timeout` and `cancel`, and `check` holds the writer lock while it runs.
+`InvalidInputError` reports a change the form cannot take, such as a field that is not in
+the form or a blank node, and `WriteRejectedError` reports a change that a rejecting guard
+refuses.
+
 Long administration operations accept `cancel`, `progress` and `timeout`. A progress
 callback receives a fraction and a message. Reports come at most once per 100 ms, and
 the final report is always delivered. An exception in a callback cancels the work and
