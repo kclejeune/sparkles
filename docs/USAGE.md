@@ -1853,7 +1853,9 @@ When the inferences are stale, a note above the tree says that it explains the c
 it was computed, and how many commits came since. A triple whose derivations all need
 facts you cannot read answers "No derivation from facts you can read was found", the same
 answer as a triple that is not entailed. A derivation deeper than the search allows says
-so. `Escape` closes the panel, and at phone width it is a full-height sheet.
+so. While the time slider shows a past commit, the panel says that it explains the
+inferences of the latest commit instead of showing a tree that may not hold at that state.
+`Escape` closes the panel, and at phone width it is a full-height sheet.
 
 The same trees come from `sparkles infer --why`, which takes the triple in Turtle with the
 database's prefixes and prints the tree as text or, with `--format json`, as the route's

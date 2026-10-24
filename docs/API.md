@@ -7061,9 +7061,10 @@ A node's `kind` is `asserted` for a triple of an input graph, which `graph` name
 triple a rule instance derived from its `premises`, and `ref` for a node cut at the depth
 limit. A derived node names its rule, the profile or vocabulary the rule belongs to, and
 for the rules of the `owl-rl` profile the rule's id in the OWL 2 RL tables as `owl2rl`.
-Premises are in the order of the rule's body. A triple that occurs again in the answer
-keeps the `id` it had first, carries `shared: true` and leaves out its premises. Each
-tree's root has an id of its own. `depth` is the depth of the node's derivation, 0 for an
+Premises are in the order of the rule's body. A triple that occurs again in the same tree
+keeps the `id` it had first, carries `shared: true` and leaves out its premises, so each
+tree reads on its own. Ids are unique across the answer, and each tree's root has an id
+of its own. `depth` is the depth of the node's derivation, 0 for an
 asserted triple and 1 for an axiom.
 
 The materialized inferences are explained at the commit their run read, which `commit`
@@ -7076,8 +7077,11 @@ facts it reached whose premises are in the closure, and accepts a fact at depth 
 when it is asserted, an axiom, or derived from facts accepted at a smaller depth. A cycle
 of facts that only support each other is never accepted, and the result does not depend on
 the order incremental runs left the closure in. The first tree has the smallest depth
-found, and the others are found within three further levels. A search visits at most
-100,000 rule instances and holds them until it answers, about 10 MB at that limit.
+found, and the others are found within three further levels. No tree derives its own
+triple from itself, even when another top rule's premises could only be derived through
+it. A search visits at most 100,000 rule instances and holds them until it answers, about
+10 MB at that limit. Its timeout is checked inside each rule's evaluation, so a rule whose
+candidates all fail stops at it too. A `timeout` too large to represent answers `400`.
 
 With RDFS on read and no materialized derivation, the trees come from the schema, with
 `source: "rdfsOnRead"` and rules of the profile `rdfs-on-read`. A type comes from `rdfs9`

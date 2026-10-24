@@ -717,11 +717,23 @@ rules by iterative deepening, so the mock suites run the panel.
   limit answers `422` with `code: "reasoning-budget"`. The CLI exits with 2 there and with 1
   when no derivation is found. `maxDepth` is 32 by default and at most 64.
 - *Memory.* The search holds each fact it reached with its depth and the instances that
-  derive it, about 10 MB at the instance limit. The library call takes an optional memory
-  limit for that state, and the server leaves it unset and takes no pool grant, because
-  the instance limit already bounds it.
-- *Expand.* A `ref` node asks the route for its own first tree and grafts it in place, so
-  a deep chain costs one request per level the person opens.
+  derive it, about 10 MB at the instance limit. The library call charges that state and
+  the rule evaluations to an optional memory limit, and the server leaves it unset and
+  takes no pool grant, because the instance limit already bounds it.
+- *Deadline.* The timeout is checked between rules and inside each rule's evaluation, so a
+  rule whose candidates all fail stops at it, and a stale run's history replay and the
+  RDFS on read search stop at it and at a cancelled request too. A timeout too large to
+  represent answers `400`.
+- *Other top rules.* The trees after the first read depths worked out with the explained
+  triple excluded, so no tree derives its triple from itself through another top rule.
+- *Sharing.* A repeated fact is shared by `id` within one tree only, so the panel shows
+  each tree on its own, and ids stay unique across the answer.
+- *Past states.* The route explains the latest inferences only. While the time slider
+  shows a past commit, the panel says so instead of loading a tree, and the premises it
+  marked are cleared.
+- *Expand.* A `ref` node asks the route for its own first tree and grafts it in place,
+  with the subtree's ids moved past the tree's, so a deep chain costs one request per
+  level the person opens. An expansion whose explanation was replaced is dropped.
 - *Show on graph.* The panel turns off **Hide rdf:type** and turns on **Literals** when the
   premises need them, so the drawn chain is complete.
 
@@ -729,9 +741,8 @@ rules by iterative deepening, so the mock suites run the panel.
 derivation through a generalized triple, such as one with a literal subject that the
 closure uses but the store does not hold, or through a GeoSPARQL default geometry, is not
 found and answers `404`, which item 136 covers. A tree leaves out the builtins and the
-bindings of the rule that fired, which item 137 adds. The search time can differ between a
-hidden derivation and no derivation when the inferred graph holds facts derived from
-hidden graphs, though the answers are the same. `whyNot` answers `501` until F18 Phase 1.
+bindings of the rule that fired, which item 137 adds. The search reads only what the caller
+reads, so its answer and its time cannot tell a hidden derivation from none. `whyNot` answers `501` until F18 Phase 1.
 
 **What F18 can build on.** The answer types and `finish` are F18 §2.1's `Derivation` with
 its sharing and depth cuts, and F18's engines can fill them as they are. The route, its
@@ -745,11 +756,13 @@ explainer gives F18's UI work a backend without a reasoner build.
 
 **Tests.** The reasoner tests cover A7, A8 with `owl:sameAs`, A9, an asserted triple, an
 axiom, the depth cut, the instance budget, a shared premise, derivations with other top
-rules, and every inferred triple after incremental deletions. The library tests cover
-input graphs, a hidden ontology, a stale run, and RDFS on read with and without a readable
-schema. Router tests cover the route and A9 as the same answer as a triple that is not
+rules, another top rule that could only derive the root from itself, the deadline in a
+rule whose candidates all fail, the memory limit, and every inferred triple after
+incremental deletions. The library tests cover
+input graphs, a hidden ontology, a stale run, RDFS on read with and without a readable
+schema, and its deadline. Router tests cover the route and A9 as the same answer as a triple that is not
 entailed, and the MCP, CLI and parity suites cover their surfaces. Vitest covers the tree
 helpers and the route's answers (`why.test.ts`). The mock Playwright suite
-`tests/mock/why.spec.ts` covers A10, the stale note, no derivation, and A12 with the
-keyboard and at 390 px, and `tests/e2e/why.spec.ts` runs A7, A9 and A10 against a real
+`tests/mock/why.spec.ts` covers A10, the stale note, a past state, no derivation, and A12
+with the keyboard and at 390 px, and `tests/e2e/why.spec.ts` runs A7, A9 and A10 against a real
 server.
