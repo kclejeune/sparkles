@@ -28,7 +28,7 @@ use crate::graph::Graph;
 use crate::terms::Terms;
 use rustc_hash::FxHashSet;
 use std::sync::Arc;
-use std::sync::atomic::AtomicBool;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 /// The most schema bindings a rule is specialized to.
 pub(crate) const MAX_BINDINGS: usize = 4096;
@@ -201,7 +201,8 @@ pub(crate) struct Specialized {
 
 /// The rules of a demand program over the schema that `g` holds in full: each rule
 /// specialized to the bindings of its schema join, without the rules whose heads give
-/// only facts `closed` says are complete.
+/// only facts `closed` says are complete. The joins stop when `cancel` is set, and the
+/// rules made so far are then returned, which the caller drops.
 pub(crate) fn specialize(
     rules: &[CRule],
     closed: &Closed,
@@ -209,6 +210,7 @@ pub(crate) fn specialize(
     g: &Graph,
     terms: &Terms,
     budget: &Arc<Budget>,
+    cancel: &AtomicBool,
 ) -> Result<Specialized, MemoryExceeded> {
     let abort = AtomicBool::new(false);
     let mut out: Vec<CRule> = Vec::new();
@@ -221,6 +223,9 @@ pub(crate) fn specialize(
     };
     let reads = |r: &CRule| r.atoms.iter().any(|a| !closed.closes(a));
     for r in rules {
+        if cancel.load(Ordering::Relaxed) {
+            break;
+        }
         if left_out(r) {
             reads_instances |= reads(r);
             continue;
@@ -251,7 +256,7 @@ pub(crate) fn specialize(
             &steps,
             g.len(),
             &abort,
-            None,
+            Some(cancel),
             usize::MAX,
             Mode::New,
             budget,

@@ -355,15 +355,66 @@ fn magic_atom(k: &Key, m: u64, dummy: u64, (s, p, o): (Slot, Slot, Slot)) -> Ato
 }
 
 /// A `noValue` builtin's pattern as a demand of the stage below: its constants bound, its
-/// variables free, with the constants' values.
-fn no_value_demand(b: &CBuiltin) -> (Key, [u64; 3]) {
+/// variables free, with the constants' values. An `rdf:type` pattern with a constant
+/// class is split by the class, as [`key_of`] splits a positive one (Codex review F17-P1
+/// #7), so the stage below asks for that class alone.
+fn no_value_demand(b: &CBuiltin, rdf_type: u64) -> (Key, [u64; 3]) {
     let c = |s: Option<&Slot>| match s {
         Some(Slot::Const(c)) => Some(*c),
         _ => None,
     };
     let (s, p, o) = (c(b.args.first()), c(b.args.get(1)), c(b.args.get(2)));
-    let key = Key::new(s.is_some(), p.map_or(KeyP::Free, KeyP::Const), o.is_some());
+    let mut key = Key::new(s.is_some(), p.map_or(KeyP::Free, KeyP::Const), o.is_some());
+    if let (Some(t), Some(c)) = (p, o)
+        && t == rdf_type
+    {
+        key = key.with_class(c);
+    }
     (key, [s.unwrap_or(0), p.unwrap_or(0), o.unwrap_or(0)])
+}
+
+/// What a builtin or head action reads outside the atoms of its rule.
+enum Read {
+    /// a list, whose head the builtin's first argument holds
+    List,
+    /// the facts with this subject and predicate (`listForAll`)
+    Facts(Slot, Slot),
+}
+
+/// The reads of builtin `kind`, or of head action `action` when it is given, over `args`.
+fn list_reads(kind: BuiltinKind, args: &[Slot], action: Option<HeadAction>) -> Vec<Read> {
+    use BuiltinKind::*;
+    match action {
+        Some(HeadAction::ListMapAsSubject) => return vec![Read::List],
+        Some(HeadAction::ListMapAsObject) => return vec![Read::List],
+        None => {}
+    }
+    match kind {
+        ListMember | ListContains | ListNotContains | ListLength | ListEntry => {
+            vec![Read::List]
+        }
+        ListForAll => vec![Read::List, Read::Facts(args[1], args[2])],
+        _ => Vec::new(),
+    }
+}
+
+/// Whether a rule of `rules` gives `rdf:first` or `rdf:rest` facts by a head with that
+/// constant predicate. Heads with a variable predicate, such as those of the equality
+/// rules, are left out: lists are read with the facts those give so far.
+fn list_heads(rules: &[CRule], terms: &Terms) -> bool {
+    rules.iter().any(|r| {
+        r.head.iter().any(|h| {
+            matches!(head_slots(h).1, Slot::Const(p) if p == terms.rdf_first || p == terms.rdf_rest)
+        })
+    })
+}
+
+/// Whether a rule reads lists through a builtin or a head action.
+fn reads_lists(r: &CRule) -> bool {
+    r.builtins
+        .iter()
+        .any(|b| !list_reads(b.kind, &b.args, None).is_empty())
+        || r.head.iter().any(|h| matches!(h, CHead::Action(..)))
 }
 
 /// An estimate of the facts an atom matches with the variables `bound` bound: from the
@@ -544,6 +595,9 @@ struct StageBuilder<'a> {
     magic_preds: &'a mut FxHashSet<u64>,
     below: Vec<(Key, Option<[u64; 3]>)>,
     below_seen: FxHashSet<(Key, [u64; 3])>,
+    /// rules of the stage give `rdf:first` or `rdf:rest` facts, which builtins that
+    /// read lists need complete
+    derived_lists: bool,
 }
 
 impl StageBuilder<'_> {
@@ -683,11 +737,38 @@ impl StageBuilder<'_> {
                     before_atoms.push(atom);
                 }
                 Step::Builtin(j) => {
+                    let b = &body.builtins[j];
+                    let mut reads = list_reads(b.kind, &b.args, None);
+                    // an atom of the rule matches the facts a covered listForAll reads
+                    if crate::engine::list_for_all_covered(&body, b) {
+                        reads.retain(|r| matches!(r, Read::List));
+                    }
+                    self.ask_reads(
+                        &reads,
+                        &body,
+                        &guard,
+                        &before_atoms,
+                        &before_builtins,
+                        &bound,
+                    )?;
                     for &v in &body.builtins[j].outputs {
                         bound[v] = true;
                     }
                     before_builtins.push(j);
                 }
+            }
+        }
+        for h in &head {
+            if let CHead::Action(a, args) = h {
+                let reads = list_reads(BuiltinKind::NoValue, args, Some(*a));
+                self.ask_reads(
+                    &reads,
+                    &body,
+                    &guard,
+                    &before_atoms,
+                    &before_builtins,
+                    &bound,
+                )?;
             }
         }
         if tracing::enabled!(target: "sparkles_reasoner::demand", tracing::Level::DEBUG) {
@@ -719,7 +800,7 @@ impl StageBuilder<'_> {
         }
         for b in &body.builtins {
             if b.kind == BuiltinKind::NoValue {
-                let (nk, vals) = no_value_demand(b);
+                let (nk, vals) = no_value_demand(b, self.rdf_type);
                 if self.below_seen.insert((nk, vals)) {
                     self.below.push((nk, Some(vals)));
                 }
@@ -734,6 +815,59 @@ impl StageBuilder<'_> {
             builtins: body.builtins,
             head,
         });
+        Ok(())
+    }
+
+    /// The demands of facts a copy reads through a builtin or head action rather than
+    /// an atom (Codex review F17-P1 #6), behind the guard and the steps before it.
+    fn ask_reads(
+        &mut self,
+        reads: &[Read],
+        body: &CRule,
+        guard: &Atom,
+        before_atoms: &[usize],
+        before_builtins: &[usize],
+        bound: &[bool],
+    ) -> Result<(), TransformError> {
+        for read in reads {
+            let (k, at) = match *read {
+                Read::List => {
+                    // a list read through a builtin is not read again when its facts
+                    // grow, so the lists the rules give are complete in a stage below
+                    // first, like the patterns of noValue
+                    if self.derived_lists {
+                        for p in [self.terms.rdf_first, self.terms.rdf_rest] {
+                            let k = Key::new(false, KeyP::Const(p), false);
+                            if self.below_seen.insert((k, [0; 3])) {
+                                self.below.push((k, Some([0; 3])));
+                            }
+                        }
+                    }
+                    continue;
+                }
+                Read::Facts(s, p) => {
+                    let at = Atom { s, p, o: Slot::Any };
+                    if !self.intensional(&at) {
+                        continue;
+                    }
+                    (key_of(&at, bound, self.rdf_type), at)
+                }
+            };
+            let m = self.magic_of(k)?;
+            let mh = magic_atom(&k, m, self.dummy, (at.s, at.p, at.o));
+            let mut atoms = vec![guard.clone()];
+            atoms.extend(before_atoms.iter().map(|&i| body.atoms[i].clone()));
+            self.stage.rules.push(CRule {
+                name: format!("{} (demand of lists)", body.name),
+                nvars: body.nvars,
+                atoms,
+                builtins: before_builtins
+                    .iter()
+                    .map(|&j| clone_builtin(&body.builtins[j]))
+                    .collect(),
+                head: vec![CHead::Triple(mh.s, mh.p, mh.o)],
+            });
+        }
         Ok(())
     }
 
@@ -941,6 +1075,44 @@ impl StageBuilder<'_> {
                 Slot::Const(reach),
                 Slot::Var(0),
             )],
+        });
+        // the facts of `p` the graph holds at a reached node, stored or derived, hold at
+        // the value asked for too (Codex review F17-P1 #2): `(c reach n), (n p o) ->
+        // (c p o)`, or `(s p n) -> (s p c)` for the object. The atom reads the facts as
+        // they are, without a demand of its own, since the rules below give its derived
+        // facts at the value asked for.
+        let (at, out) = if subject {
+            (
+                Atom {
+                    s: Slot::Var(1),
+                    p: Slot::Const(p),
+                    o: Slot::Var(2),
+                },
+                CHead::Triple(Slot::Var(0), Slot::Const(p), Slot::Var(2)),
+            )
+        } else {
+            (
+                Atom {
+                    s: Slot::Var(2),
+                    p: Slot::Const(p),
+                    o: Slot::Var(1),
+                },
+                CHead::Triple(Slot::Var(2), Slot::Const(p), Slot::Var(0)),
+            )
+        };
+        self.stage.rules.push(CRule {
+            name: "linear recursion, stored facts (demand)".into(),
+            nvars: 3,
+            atoms: vec![
+                Atom {
+                    s: Slot::Var(0),
+                    p: Slot::Const(reach),
+                    o: Slot::Var(1),
+                },
+                at,
+            ],
+            builtins: Vec::new(),
+            head: vec![out],
         });
         for pl in plans {
             let r = &pl.rule;
@@ -1153,7 +1325,12 @@ pub(crate) fn transform(
                 .filter(|b| b.kind == BuiltinKind::NoValue)
                 .count()
         })
-        .sum();
+        .sum::<usize>()
+        + if list_heads(rules, terms) {
+            rules.iter().filter(|r| reads_lists(r)).count()
+        } else {
+            0
+        };
     let mut stages: Vec<Stage> = Vec::new();
     let mut magic_preds = FxHashSet::default();
     let mut total = 0usize;
@@ -1200,7 +1377,10 @@ pub(crate) fn transform(
             var_heads,
             complete,
             closed,
-            schema_only: phase == 0 && matches!(pass, Pass::Schema),
+            // the lower stages of the schema pass complete the patterns its noValue
+            // builtins read, instance facts included, so only its first stage reads
+            // instance facts as they are
+            schema_only: phase == 0 && stages.is_empty() && matches!(pass, Pass::Schema),
             terms,
             dummy,
             stage: Stage {
@@ -1213,6 +1393,7 @@ pub(crate) fn transform(
             magic_preds: &mut magic_preds,
             below: Vec::new(),
             below_seen: FxHashSet::default(),
+            derived_lists: phase == 0 && list_heads(stage_rules, terms),
         };
         let mut seeds: Vec<(Key, [u64; 3])> = Vec::new();
         for (k, vals) in &level {

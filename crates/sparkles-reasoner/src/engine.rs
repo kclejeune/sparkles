@@ -1810,7 +1810,10 @@ pub(crate) fn incremental_blocker(r: &CRule, terms: &Terms) -> Option<String> {
 /// `listForAll(?l, ?y, P)` is covered when the rule also has `listMember(?l, ?m)` and
 /// the atom `(?y P ?m)`: every fact it reads is then matched by that atom in some
 /// instance.
-fn list_for_all_covered(r: &CRule, b: &CBuiltin) -> bool {
+pub(crate) fn list_for_all_covered(r: &CRule, b: &CBuiltin) -> bool {
+    if b.kind != crate::builtins::BuiltinKind::ListForAll {
+        return false;
+    }
     let &[l @ Slot::Var(_), y, p] = &b.args[..] else {
         return false;
     };

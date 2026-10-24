@@ -452,6 +452,9 @@ pub struct Ctx {
     /// The snapshot holds facts with query-local terms, which query-time reasoning
     /// derived (spec F17). A pattern constant the store does not have may then match.
     pub local_facts: bool,
+    /// The memory the derived facts of query-time reasoning hold in the snapshot's
+    /// overlay, charged to the query until the context drops.
+    pub(super) reasoning_memory: Vec<QueryMemoryLease>,
     pub snap: Arc<Snapshot>,
     local: RwLock<AppendVocab>,
     values: Vec<RwLock<FxHashMap<Id, Value>>>,
@@ -826,6 +829,7 @@ impl Ctx {
         Ctx {
             reasoning: None,
             local_facts: false,
+            reasoning_memory: Vec::new(),
             extension_families: Vec::new(),
             extension_writers: Vec::new(),
             extension_ancestors: Vec::new(),

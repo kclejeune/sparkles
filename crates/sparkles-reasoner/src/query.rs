@@ -226,6 +226,9 @@ struct Session {
     /// go out only to the demands that can read them
     closed: Option<demand::Closed>,
     schema_rows: Option<(usize, usize)>,
+    /// the rows the lower stages of the schema pass derived, the facts its `noValue`
+    /// builtins read, which go out with the next derivation like any other
+    lower_rows: Option<(usize, usize)>,
     /// tables read from the cache
     cached: Vec<Arc<Table>>,
     reports: Vec<DemandReport>,
@@ -243,7 +246,11 @@ impl Session {
             .map_err(|e| memory_error(e, "the rules"))?;
         let mut warnings = shared.warnings.clone();
         let rules = engine::compile_query(&shared.rules, &terms, &mut warnings);
-        let resolved = inputs::resolve(&snap, &shared.inputs);
+        // imports are followed only through the graphs the caller reads (spec F17 §4.5)
+        let resolved = match &req.readable {
+            Some(readable) => inputs::resolve_readable(&snap, &shared.inputs, &|g| readable(g)),
+            None => inputs::resolve(&snap, &shared.inputs),
+        };
         warnings.extend(resolved.warnings.iter().cloned());
         let mut graphs = resolved.ids(&snap);
         tracing::debug!(target: "sparkles_reasoner::demand", "session: rules compiled and inputs resolved in {:?}", t0.elapsed());
@@ -290,6 +297,7 @@ impl Session {
             hidden: FxHashSet::default(),
             closed: None,
             schema_rows: None,
+            lower_rows: None,
             cached: Vec::new(),
             reports: Vec::new(),
             seeds: Vec::new(),
@@ -345,30 +353,14 @@ impl Session {
             progress: None,
             budget: self.budget.clone(),
         };
-        let stopped: Mutex<Option<Error>> = Mutex::new(None);
-        let stop = self.stop.clone();
-        let done = AtomicBool::new(false);
         let terms = &self.terms;
-        let r = std::thread::scope(|sc| {
-            let watch = sc.spawn(|| {
-                while !done.load(Ordering::Relaxed) {
-                    if let Err(e) = stop() {
-                        *stopped.lock() = Some(e);
-                        flag.store(true, Ordering::Relaxed);
-                        return;
-                    }
-                    std::thread::park_timeout(STOP_POLL);
-                }
-            });
-            let r = engine::run(g, rules, terms, &limits, Some(start));
-            done.store(true, Ordering::Relaxed);
-            watch.thread().unpark();
-            r
+        let (r, stopped) = watched(&self.stop, &flag, || {
+            engine::run(g, rules, terms, &limits, Some(start))
         });
         if tracing::enabled!(target: "sparkles_reasoner::demand", tracing::Level::DEBUG) {
             self.trace_facts(pre);
         }
-        if let Some(e) = stopped.into_inner() {
+        if let Some(e) = stopped {
             return Err(e);
         }
         r.map(|_| ()).map_err(|e| {
@@ -490,6 +482,7 @@ impl Session {
             seeds: (0, 0),
         });
         let schema_from = self.graph.as_ref().expect("graph made").derived().len();
+        let mut lower_end = schema_from;
         if let Some(t) = key.as_ref().and_then(tables::get) {
             let facts = self.remap(&t)?;
             let g = self.graph.as_mut().expect("graph made");
@@ -499,7 +492,6 @@ impl Session {
             let keys: Vec<Key> = roots.iter().map(|r| r.0).collect();
             let pre = self.transform(&self.rules, &keys, Pass::Schema)?;
             self.hide(&pre.magic_preds);
-            let from = self.graph.as_ref().expect("graph made").derived().len();
             let seeds: Vec<Triple> = roots
                 .iter()
                 .map(|(k, v)| {
@@ -510,19 +502,26 @@ impl Session {
                 })
                 .collect();
             self.pre = Some(pre);
+            // the patterns the schema rules' noValue reads are complete before stage zero
+            // reads them (Codex review F17-P1 #3)
+            self.run_lower(true, "the schema")?;
             let g = self.graph.as_mut().expect("graph made");
+            lower_end = g.derived().len();
             let start = g.len();
             g.try_add_batch(seeds)
                 .map_err(|e| memory_error(e, "the schema"))?;
             self.run(true, 0, start, "the schema")?;
             if let Some(key) = key {
-                self.cache_schema(key, from);
+                self.cache_schema(key, lower_end);
             }
         }
         let schema_to = self.graph.as_ref().expect("graph made").derived().len();
         if self.exported == schema_from {
             self.exported = schema_to;
-            self.schema_rows = Some((schema_from, schema_to));
+            self.schema_rows = Some((lower_end, schema_to));
+            if lower_end > schema_from {
+                self.lower_rows = Some((schema_from, lower_end));
+            }
         }
         let closed = crate::specialize::closed(&vocab, rdf_type);
         // RDF lists are read as stored unless a rule gives their facts
@@ -543,15 +542,23 @@ impl Session {
             .collect();
         let g = self.graph.as_ref().expect("graph made");
         let t1 = std::time::Instant::now();
-        let rules = crate::specialize::specialize(
-            &self.rules,
-            &closed,
-            &lists,
-            g,
-            &self.terms,
-            &self.budget,
-        )
-        .map_err(|e| memory_error(e, "the rules specialized to the schema"))?;
+        // the schema joins can be long, so they stop with the query (Codex review F17-P1 #5)
+        let flag = AtomicBool::new(false);
+        let (rules, stopped) = watched(&self.stop, &flag, || {
+            crate::specialize::specialize(
+                &self.rules,
+                &closed,
+                &lists,
+                g,
+                &self.terms,
+                &self.budget,
+                &flag,
+            )
+        });
+        if let Some(e) = stopped {
+            return Err(e);
+        }
+        let rules = rules.map_err(|e| memory_error(e, "the rules specialized to the schema"))?;
         self.closed = Some(closed);
         if rules.reads_instances && (0..self.keys.len()).any(|d| self.reads_schema(d)) {
             // the schema the pass derived may lack facts that follow from derived
@@ -947,6 +954,9 @@ impl ReasoningSession for Session {
                 .join(", ");
             self.ensure_program()?;
             self.ensure_graph()?;
+            if let Some((lo, hi)) = self.lower_rows.take() {
+                self.export_rows(lo, hi, &mut out);
+            }
             if let Some((lo, hi)) = self.schema_rows
                 && misses.iter().any(|(d, _, _)| self.reads_schema(*d))
             {
@@ -1030,4 +1040,32 @@ impl ReasoningSession for Session {
             warnings: self.warnings.clone(),
         }
     }
+}
+
+/// `f` run while a thread polls `stop`, the query's deadline and cancellation, and sets
+/// `flag` when it fails, with the error it gave.
+fn watched<R>(
+    stop: &Arc<dyn Fn() -> Result<()> + Send + Sync>,
+    flag: &AtomicBool,
+    f: impl FnOnce() -> R,
+) -> (R, Option<Error>) {
+    let stopped: Mutex<Option<Error>> = Mutex::new(None);
+    let done = AtomicBool::new(false);
+    let r = std::thread::scope(|sc| {
+        let watch = sc.spawn(|| {
+            while !done.load(Ordering::Relaxed) {
+                if let Err(e) = stop() {
+                    *stopped.lock() = Some(e);
+                    flag.store(true, Ordering::Relaxed);
+                    return;
+                }
+                std::thread::park_timeout(STOP_POLL);
+            }
+        });
+        let r = f();
+        done.store(true, Ordering::Relaxed);
+        watch.thread().unpark();
+        r
+    });
+    (r, stopped.into_inner())
 }

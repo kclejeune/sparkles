@@ -150,6 +150,21 @@ impl std::fmt::Debug for dyn ReasoningProvider {
     }
 }
 
+/// Refuse the query forms that query-time reasoning cannot answer in full. A DESCRIBE
+/// reads the facts of the resources it describes outside its WHERE pattern, so no demand
+/// asks for their derived facts, and its answer would leave them out without saying so
+/// (Codex review F17-P1 #8).
+pub fn check_form(q: &spargebra::Query) -> Result<()> {
+    if matches!(q, spargebra::Query::Describe { .. }) {
+        return Err(Error::Unsupported(
+            "DESCRIBE is not supported with reasoning=demand; use CONSTRUCT with the \
+             patterns of the description, or a materialized dataset"
+                .into(),
+        ));
+    }
+    Ok(())
+}
+
 /// What query-time reasoning did for a query, kept on its context.
 #[derive(Clone, Debug, Default)]
 pub struct Applied {
@@ -759,6 +774,7 @@ pub(crate) fn apply(
         });
     }
     ctx.local_facts = view.has_locals();
+    ctx.reasoning_memory.append(&mut view.leases);
     ctx.snap = view.finish();
     ctx.reasoning = Some(Arc::new(Applied {
         label,
@@ -861,7 +877,13 @@ struct Overlay {
     /// the query's id of each local term of the session, and the reverse
     to_query: FxHashMap<u64, Id>,
     to_session: FxHashMap<Id, u64>,
+    /// the memory charged for the overlay's facts, held while the query runs
+    leases: Vec<super::query_memory::QueryMemoryLease>,
 }
+
+/// The bytes one derived quad holds in the overlay: a 32-byte key in each of the seven
+/// permutations of the delta, with the node overhead of the persistent sets.
+const OVERLAY_QUAD_BYTES: u64 = 7 * 64;
 
 impl Overlay {
     fn new(snap: Arc<Snapshot>) -> Overlay {
@@ -869,6 +891,7 @@ impl Overlay {
             snap,
             to_query: FxHashMap::default(),
             to_session: FxHashMap::default(),
+            leases: Vec::new(),
         }
     }
 
@@ -897,6 +920,10 @@ impl Overlay {
             .map(|t| [map(t[0]), map(t[1]), map(t[2]), Id::DEFAULT_GRAPH])
             .filter(|q| !q[..3].contains(&Id::UNDEF))
             .collect();
+        // The facts come from the session's tables, which a cache hit shares without a
+        // charge, so the copy the overlay keeps is charged here (Codex review F17-P1 #4).
+        let bytes = (quads.len() as u64).saturating_mul(OVERLAY_QUAD_BYTES);
+        self.leases.push(ctx.output_lease(bytes)?);
         self.snap = Arc::new(self.snap.with_overlay(&quads, d.absent_from_default)?);
         Ok(())
     }

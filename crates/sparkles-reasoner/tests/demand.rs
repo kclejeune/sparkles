@@ -472,3 +472,210 @@ fn owl_rl_demand_follows_the_schema() {
         report.inferred
     );
 }
+
+/// Codex review F17-P1 #1: imports are followed only through graphs the caller reads, so
+/// a denied graph neither adds its schema nor names the graphs it imports.
+#[test]
+fn imports_follow_the_graph_view() {
+    use sparkles_core::access::{GraphAccess, GraphRule, Graphs};
+    use std::sync::Arc;
+    let s = Store::in_memory(StoreOptions::default());
+    s.load(&[Source::from_bytes(
+        format!(
+            "{PREFIXES}
+             <urn:o> owl:imports <http://ex.org/hidden> . ex:tom a ex:Cat .
+             GRAPH <http://ex.org/hidden> {{
+                 <urn:h> owl:imports <http://secret/graph> .
+                 ex:Cat rdfs:subClassOf ex:Animal .
+             }}"
+        )
+        .into_bytes(),
+        RdfFormat::TriG,
+        None,
+    )])
+    .unwrap();
+    let qr = reasoner(&Profile::Rdfs);
+    let q = "SELECT ?x { ?x a ex:Animal }";
+    // with every graph readable the import applies
+    assert_eq!(rows(&run(&s, q, &demand(&qr))), vec!["<http://ex.org/tom>"]);
+    let mut o = demand(&qr);
+    o.graphs = Some(Arc::new(GraphAccess::graphs(
+        Graphs::Only(GraphRule::new(["default"], &[])),
+        Graphs::none(),
+    )));
+    let r = run(&s, q, &o);
+    assert!(rows(&r).is_empty(), "{:?}", rows(&r));
+    let warnings: Vec<String> = r.ctx.warnings().into_iter().map(|w| w.message).collect();
+    assert!(
+        !warnings.iter().any(|w| w.contains("secret")),
+        "{warnings:?}"
+    );
+}
+
+/// Codex review F17-P1 #2: the linear rewriting keeps the stored facts of the recursive
+/// predicate at the nodes it reaches, from either end.
+#[test]
+fn linear_recursion_reads_stored_facts() {
+    let s = store("ex:a ex:parent ex:b . ex:b ex:ancestor ex:c .");
+    let both = Profile::Rules(
+        "@prefix ex: <http://ex.org/>.
+         [anc1: (?x ex:ancestor ?y) <- (?x ex:parent ?y)]
+         [anc2: (?x ex:ancestor ?z) <- (?x ex:parent ?y), (?y ex:ancestor ?z)]"
+            .into(),
+    );
+    let rec = Profile::Rules(
+        "@prefix ex: <http://ex.org/>.
+         [anc2: (?x ex:ancestor ?z) <- (?x ex:parent ?y), (?y ex:ancestor ?z)]"
+            .into(),
+    );
+    let qb = reasoner(&both);
+    let qr = reasoner(&rec);
+    let down = "SELECT ?z { ex:a ex:ancestor ?z }";
+    let up = "SELECT ?x { ?x ex:ancestor ex:c }";
+    assert_eq!(
+        rows(&run(&s, down, &demand(&qb))),
+        vec!["<http://ex.org/b>", "<http://ex.org/c>"]
+    );
+    assert_eq!(
+        rows(&run(&s, down, &demand(&qr))),
+        vec!["<http://ex.org/c>"]
+    );
+    assert_eq!(
+        rows(&run(&s, up, &demand(&qb))),
+        vec!["<http://ex.org/a>", "<http://ex.org/b>"]
+    );
+    assert_eq!(
+        rows(&run(&s, up, &demand(&qr))),
+        vec!["<http://ex.org/a>", "<http://ex.org/b>"]
+    );
+}
+
+/// Codex review F17-P1 #3: a schema rule's noValue reads facts that the lower stages
+/// of the schema pass complete first.
+#[test]
+fn schema_negation_reads_complete_lower_stages() {
+    let s = store("ex:s ex:p ex:o . ex:x a ex:C .");
+    let rules = Profile::Rules(
+        "@prefix ex: <http://ex.org/>.
+         @prefix rdfs: <http://www.w3.org/2000/01/rdf-schema#>.
+         [q: (?a ex:p ?b) -> (?a ex:q ?b)]
+         [n: (?a ex:p ?b), noValue(?a, ex:q) -> (ex:C rdfs:subClassOf ex:D)]
+         [sc: (?c rdfs:subClassOf ?d), (?x rdf:type ?c) -> (?x rdf:type ?d)]"
+            .into(),
+    );
+    // forward materialization fires `n` before `q` has given its fact, as Jena's
+    // forward engine does, so the stratified answer is checked on its own
+    let qr = reasoner(&rules);
+    let q = "SELECT ?x { ?x a ex:D }";
+    assert_eq!(rows(&run(&s, q, &demand(&qr))), Vec::<String>::new());
+    assert_eq!(
+        rows(&run(
+            &s,
+            "SELECT ?d { ex:C rdfs:subClassOf ?d }",
+            &demand(&qr)
+        )),
+        Vec::<String>::new()
+    );
+}
+
+/// Codex review F17-P1 #4: the derived facts a query copies into its view are charged
+/// to its memory budget, also when they come from cached tables.
+#[test]
+fn cached_tables_are_charged_to_the_memory_budget() {
+    let mut ttl = String::from("ex:C rdfs:subClassOf ex:B .\n");
+    for i in 0..20_000 {
+        ttl.push_str(&format!("ex:i{i} a ex:C .\n"));
+    }
+    let s = store(&ttl);
+    let qr = reasoner(&Profile::Rdfs);
+    let q = "SELECT (COUNT(*) AS ?n) { ?x a ex:B }";
+    let warm = run(&s, q, &demand(&qr));
+    assert_eq!(
+        rows(&warm),
+        vec!["\"20000\"^^<http://www.w3.org/2001/XMLSchema#integer>"]
+    );
+    let mut o = demand(&qr);
+    o.max_memory_bytes = Some(1 << 20);
+    let r = query(s.snapshot(), q, &o);
+    assert!(r.is_err(), "a 1 MiB budget holds 20,000 derived facts");
+}
+
+/// Codex review F17-P1 #5: the schema joins of specialization stop at the query's
+/// deadline.
+#[test]
+fn specialization_stops_at_the_deadline() {
+    let mut ttl = String::from("ex:a ex:p0 ex:b .\n");
+    for i in 0..6000 {
+        ttl.push_str(&format!(
+            "ex:p{i} rdfs:domain ex:c{i} . ex:q{i} rdfs:range ex:d{i} .\n"
+        ));
+    }
+    let s = store(&ttl);
+    let rules = Profile::Rules(
+        "@prefix ex: <http://ex.org/>.
+         @prefix rdfs: <http://www.w3.org/2000/01/rdf-schema#>.
+         [j: (?p rdfs:domain ?c), (?q rdfs:range ?d), equal(?c, ?d), (?x ?p ?y)
+             -> (?x ex:via ?q)]"
+            .into(),
+    );
+    let qr = reasoner(&rules);
+    let mut o = demand(&qr);
+    o.timeout = Some(std::time::Duration::from_millis(50));
+    let t0 = std::time::Instant::now();
+    let r = query(s.snapshot(), "SELECT ?q { ex:a ex:via ?q }", &o);
+    let took = t0.elapsed();
+    assert!(r.is_err(), "the query should time out");
+    assert!(
+        took < std::time::Duration::from_secs(2),
+        "stopped after {took:?}"
+    );
+}
+
+/// Codex review F17-P1 #6: list builtins ask for the list facts that rules derive.
+#[test]
+fn list_builtins_ask_for_derived_lists() {
+    let s = store("ex:a ex:p ex:b .");
+    let rules = Profile::Rules(
+        "@prefix ex: <http://ex.org/>.
+         [l: (?x ex:p ?y) -> (ex:L rdf:first ?y), (ex:L rdf:rest rdf:nil)]
+         [m: (?x ex:p ?y), listMember(ex:L, ?m) -> (?x ex:q ?m)]"
+            .into(),
+    );
+    let qr = reasoner(&rules);
+    assert_eq!(
+        rows(&run(&s, "SELECT ?m { ex:a ex:q ?m }", &demand(&qr))),
+        vec!["<http://ex.org/b>"]
+    );
+}
+
+/// Codex review F17-P1 #7: a noValue over a constant class asks the stage below for
+/// that class alone, so rules stratified by class are not refused.
+#[test]
+fn negative_type_demands_keep_the_class() {
+    let s = store("ex:a ex:p ex:b . ex:c ex:s ex:d .");
+    let rules = Profile::Rules(
+        "@prefix ex: <http://ex.org/>.
+         [l: (?x ex:p ?y) -> (?x rdf:type ex:Lower)]
+         [u: (?x ex:p ?y), noValue(?x, rdf:type, ex:Lower) -> (?x rdf:type ex:Upper)]
+         [v: (?x ex:s ?y), noValue(?x, rdf:type, ex:Lower) -> (?x rdf:type ex:Upper)]"
+            .into(),
+    );
+    let qr = reasoner(&rules);
+    assert_eq!(
+        rows(&run(&s, "SELECT ?x { ?x a ex:Upper }", &demand(&qr))),
+        vec!["<http://ex.org/c>"]
+    );
+}
+
+/// Codex review F17-P1 #8: DESCRIBE reads facts outside its pattern, which no demand
+/// asks for, so it is refused under demand reasoning.
+#[test]
+fn describe_is_refused_under_demand() {
+    let s = store("ex:a ex:p ex:b .");
+    let qr = reasoner(&Profile::Rdfs);
+    match query(s.snapshot(), "DESCRIBE ex:a", &demand(&qr)) {
+        Err(sparkles_core::Error::Unsupported(m)) => assert!(m.contains("DESCRIBE"), "{m}"),
+        Err(e) => panic!("{e}"),
+        Ok(_) => panic!("DESCRIBE should be refused"),
+    }
+}

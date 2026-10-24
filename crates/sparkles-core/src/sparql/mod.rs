@@ -792,6 +792,7 @@ fn prepare_query(
     }
     ctx.configure_extensions(pattern);
     if let Some(provider) = &opts.reasoning {
+        reasoning::check_form(parsed)?;
         reasoning::apply(
             &mut ctx,
             provider,
@@ -1071,6 +1072,7 @@ pub fn explain(snap: Arc<Snapshot>, q: &str, opts: &QueryOptions) -> Result<(Str
         let mut ctx = make_ctx(snap, demand_opts.as_ref().unwrap_or(opts), dataset, base)?;
         ctx.configure_extensions(pattern);
         if let Some(provider) = &opts.reasoning {
+            reasoning::check_form(&parsed)?;
             reasoning::apply(
                 &mut ctx,
                 provider,
