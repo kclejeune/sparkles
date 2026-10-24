@@ -1624,6 +1624,14 @@ impl QueryExecution {
             },
         }
     }
+    /// What query-time reasoning derived for the query (spec F17).
+    pub fn reasoning(&self) -> Option<Arc<super::reasoning::Applied>> {
+        match self {
+            Self::Select(c) => c.reasoning(),
+            Self::Graph(c) => c.reasoning(),
+            Self::Eager(r) | Self::Ask(r) => r.result().ctx.reasoning.clone(),
+        }
+    }
     pub fn cancellation_token(&self) -> Arc<std::sync::atomic::AtomicBool> {
         match self {
             Self::Select(c) => c.cancellation_token(),
@@ -1713,6 +1721,10 @@ impl QueryCursor {
     /// Cancellation/deadline controls remain valid through response serialization.
     pub fn cancellation_token(&self) -> Arc<std::sync::atomic::AtomicBool> {
         self.ctx.cancel.clone()
+    }
+    /// What query-time reasoning derived for the query (spec F17).
+    pub fn reasoning(&self) -> Option<Arc<super::reasoning::Applied>> {
+        self.ctx.reasoning.clone()
     }
     pub fn deadline(&self) -> Option<Instant> {
         self.ctx.deadline

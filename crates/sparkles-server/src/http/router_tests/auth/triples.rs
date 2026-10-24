@@ -603,3 +603,66 @@ async fn grouped_diffs_keep_the_protections() {
     assert_eq!(r.status, StatusCode::OK, "{}", r.text());
     assert!(r.text().contains("http://ex/Patient"), "{}", r.text());
 }
+
+/// A7 (spec F17): query-time reasoning reads the caller's view, so a backward rule over
+/// protected triples derives nothing for a caller the protection hides them from, and
+/// neither caller reads the inferred graph.
+#[cfg(feature = "reasoning")]
+#[tokio::test]
+async fn demand_reasoning_reads_the_protected_view() {
+    let s = server();
+    let rules = "@prefix ex: <http://ex/>.
+        [high: (?x rdf:type ex:HighEarner) <- (?x ex:salary ?s), greaterThan(?s, 50)]";
+    let body = serde_json::json!({"profile": "rules", "rules": rules}).to_string();
+    let r = call(
+        &s.app,
+        "POST",
+        "/$/reason/hr",
+        &[
+            ("authorization", &b("tadmin")),
+            ("content-type", "application/json"),
+        ],
+        &body,
+    )
+    .await;
+    assert_eq!(r.status, StatusCode::ACCEPTED, "{}", r.text());
+    let t0 = std::time::Instant::now();
+    while s.state.tasks.lock().iter().any(|t| t.state == "running") {
+        assert!(
+            t0.elapsed() < Duration::from_secs(30),
+            "the run did not end"
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    let q = "SELECT ?x { ?x a <http://ex/HighEarner> }";
+    let ask = |user: &'static str| {
+        let app = s.app.clone();
+        async move {
+            call(
+                &app,
+                "GET",
+                &format!("/hr/sparql?reasoning=demand&query={}", enc(q)),
+                &[("authorization", &b(user)), ("accept", "text/csv")],
+                "",
+            )
+            .await
+        }
+    };
+    let hr = ask("thr").await;
+    assert_eq!(hr.status, StatusCode::OK, "{}", hr.text());
+    assert_eq!(
+        hr.text().lines().skip(1).collect::<Vec<_>>(),
+        ["http://ex/alice"]
+    );
+    let h = hr.headers["sparkles-reasoning"]
+        .to_str()
+        .unwrap()
+        .to_string();
+    assert!(h.starts_with("demand; derived=1"), "{h}");
+    assert!(!hr.headers.contains_key("sparkles-inferences"));
+    let staff = ask("tstaff").await;
+    assert_eq!(staff.status, StatusCode::OK, "{}", staff.text());
+    assert_eq!(staff.text().lines().skip(1).count(), 0, "{}", staff.text());
+    // the materialized run skipped the backward rule: the inferred graph is empty
+    assert!(rows(&s.app, "thr", q).await.is_empty());
+}

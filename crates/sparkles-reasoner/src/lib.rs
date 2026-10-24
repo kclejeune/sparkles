@@ -17,6 +17,7 @@
 
 mod budget;
 mod builtins;
+mod demand;
 pub mod diagnostics;
 mod engine;
 pub mod extras;
@@ -28,6 +29,9 @@ mod lookups;
 mod maintain;
 pub mod parser;
 mod pool;
+pub mod query;
+mod specialize;
+pub mod tables;
 mod terms;
 
 pub use extras::{Extras, UnknownVocabulary, Vocabulary};
