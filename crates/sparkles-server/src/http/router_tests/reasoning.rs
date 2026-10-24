@@ -1204,6 +1204,187 @@ async fn a9_merges_leave_inferences_out_and_mark_them_stale() {
     assert_eq!(rows, ["http://ex.org/x"]);
 }
 
+fn explain_body(s: &str, p: &str, o: &str, extra: &str) -> String {
+    format!(
+        r#"{{"triple":{{"s":{{"type":"uri","value":"{s}"}},"p":{{"type":"uri","value":"{p}"}},"o":{{"type":"uri","value":"{o}"}}}}{extra}}}"#
+    )
+}
+
+const TYPE: &str = "http://www.w3.org/1999/02/22-rdf-syntax-ns#type";
+
+#[tokio::test]
+async fn explain_route_answers_why() {
+    let dir = tempfile::tempdir().unwrap();
+    let st = open(dir.path(), None, false);
+    st.create("t", DbType::Persistent).unwrap();
+    load(
+        &st,
+        "t",
+        "ex:Manager rdfs:subClassOf ex:Employee . ex:manages rdfs:domain ex:Manager .
+         ex:alice ex:manages ex:team7 .",
+    );
+    let app = router(st.clone());
+    let why = explain_body("http://ex.org/alice", TYPE, "http://ex.org/Employee", "");
+    // nothing materialized: not entailed
+    let r = post_json(&app, "/$/reason/t/explain", &why).await;
+    assert_eq!(r.status, StatusCode::NOT_FOUND, "{}", r.text());
+    assert_eq!(r.json()["code"], "no-visible-derivation");
+
+    let r = post_json(&app, "/$/reason/t", r#"{"profile":"rdfs"}"#).await;
+    assert_eq!(r.status, StatusCode::ACCEPTED);
+    wait_tasks(&st).await;
+    let s = get_json(&app, "/$/reason/t").await;
+    let r = post_json(&app, "/$/reason/t/explain", &why).await;
+    assert_eq!(r.status, StatusCode::OK, "{}", r.text());
+    let j = r.json();
+    assert_eq!(j["mode"], "why");
+    assert_eq!(j["entailed"], true);
+    assert_eq!(j["source"], "materialized");
+    assert_eq!(j["commit"], s["commit"]);
+    assert_eq!(j["stale"], false);
+    let t = &j["trees"][0];
+    assert_eq!(t["id"], 1);
+    assert_eq!(t["kind"], "derived");
+    assert_eq!(t["rule"]["name"], "rdfs9");
+    assert_eq!(t["rule"]["profile"], "rdfs");
+    assert_eq!(t["depth"], 2);
+    let premises = t["premises"].as_array().unwrap();
+    assert_eq!(premises.len(), 2);
+    let m = premises
+        .iter()
+        .find(|p| p["triple"]["o"]["value"] == "http://ex.org/Manager")
+        .unwrap();
+    assert_eq!(m["rule"]["name"], "rdfs2");
+    for leaf in m["premises"].as_array().unwrap() {
+        assert_eq!(leaf["kind"], "asserted");
+        assert_eq!(leaf["graph"], "default");
+    }
+
+    // a cut at depth 1 leaves a ref
+    let r = post_json(
+        &app,
+        "/$/reason/t/explain",
+        &explain_body(
+            "http://ex.org/alice",
+            TYPE,
+            "http://ex.org/Employee",
+            r#","maxDepth":1"#,
+        ),
+    )
+    .await;
+    let j = r.json();
+    let m = j["trees"][0]["premises"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|p| p["triple"]["o"]["value"] == "http://ex.org/Manager")
+        .unwrap()
+        .clone();
+    assert_eq!(m["kind"], "ref");
+    assert!(m.get("premises").is_none());
+
+    // whyNot is not available
+    let r = post_json(
+        &app,
+        "/$/reason/t/explain",
+        &explain_body(
+            "http://ex.org/alice",
+            TYPE,
+            "http://ex.org/Employee",
+            r#","mode":"whyNot""#,
+        ),
+    )
+    .await;
+    assert_eq!(r.status, StatusCode::NOT_IMPLEMENTED, "{}", r.text());
+    // malformed requests
+    for bad in [
+        r#"{"triple":{"s":{"type":"uri","value":"http://ex.org/a"}}}"#.to_string(),
+        explain_body(
+            "http://ex.org/alice",
+            TYPE,
+            "http://ex.org/Employee",
+            r#","maxTrees":11"#,
+        ),
+        explain_body(
+            "http://ex.org/alice",
+            TYPE,
+            "http://ex.org/Employee",
+            r#","nope":1"#,
+        ),
+        // a timeout too large for a duration is refused, not a panic
+        explain_body(
+            "http://ex.org/alice",
+            TYPE,
+            "http://ex.org/Employee",
+            r#","timeout":1e300"#,
+        ),
+        "not json".to_string(),
+    ] {
+        let r = post_json(&app, "/$/reason/t/explain", &bad).await;
+        assert_eq!(r.status, StatusCode::BAD_REQUEST, "{bad}: {}", r.text());
+    }
+    // a search past its deadline
+    let r = post_json(
+        &app,
+        "/$/reason/t/explain",
+        &explain_body(
+            "http://ex.org/alice",
+            TYPE,
+            "http://ex.org/Employee",
+            r#","timeout":0.000000001"#,
+        ),
+    )
+    .await;
+    assert_eq!(r.status, StatusCode::UNPROCESSABLE_ENTITY, "{}", r.text());
+    assert_eq!(r.json()["code"], "reasoning-budget");
+
+    // stale inferences are still explained at their run, and say so
+    update(&app, "t", "DELETE DATA { ex:alice ex:manages ex:team7 }").await;
+    let r = post_json(&app, "/$/reason/t/explain", &why).await;
+    assert_eq!(r.status, StatusCode::OK, "{}", r.text());
+    let j = r.json();
+    assert_eq!(j["stale"], true);
+    assert_eq!(j["commit"], s["commit"]);
+}
+
+/// An explanation's answer is held to the result-byte limit, and its search to the query
+/// memory budget.
+#[tokio::test]
+async fn explain_route_keeps_the_query_limits() {
+    for (bytes, memory, status) in [
+        (Some(200u64), None, StatusCode::OK),
+        (None, Some(256u64), StatusCode::UNPROCESSABLE_ENTITY),
+    ] {
+        let dir = tempfile::tempdir().unwrap();
+        let mut st =
+            AppState::new(dir.path(), StoreOptions::default(), Duration::from_secs(30)).unwrap();
+        st.limits.max_result_bytes = bytes;
+        st.limits.query_memory_bytes = memory;
+        let st = Arc::new(st);
+        st.create("t", DbType::Persistent).unwrap();
+        load(
+            &st,
+            "t",
+            "ex:Manager rdfs:subClassOf ex:Employee . ex:manages rdfs:domain ex:Manager .
+             ex:alice ex:manages ex:team7 .",
+        );
+        let app = router(st.clone());
+        let r = post_json(&app, "/$/reason/t", r#"{"profile":"rdfs"}"#).await;
+        assert_eq!(r.status, StatusCode::ACCEPTED);
+        wait_tasks(&st).await;
+        let why = explain_body("http://ex.org/alice", TYPE, "http://ex.org/Employee", "");
+        let r = post_json(&app, "/$/reason/t/explain", &why).await;
+        if bytes.is_some() {
+            // the tree is larger than 200 bytes
+            assert_ne!(r.status, status, "{}", r.text());
+            assert!(r.text().contains("result-bytes"), "{}", r.text());
+        } else {
+            assert_eq!(r.status, status, "{}", r.text());
+            assert_eq!(r.json()["code"], "reasoning-budget", "{}", r.text());
+        }
+    }
+}
+
 /// Query-time reasoning over HTTP (spec F17 §2): `reasoning=demand` answers with the
 /// derived facts and the `Sparkles-Reasoning` header, a derivation past `maxDerived`
 /// fails with 422 `reasoning-budget`, and `auto` is refused until Phase 2.

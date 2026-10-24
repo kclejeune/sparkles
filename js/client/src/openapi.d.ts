@@ -2288,6 +2288,26 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/$/reason/{ds}/explain": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Explain why a triple is inferred
+         * @description Derivation trees for a triple of the materialized inferences or of what RDFS on read answers, searched from the facts the caller reads. Mode `whyNot` answers `501`. A triple with no derivation from readable facts answers `404` with code `no-visible-derivation`, as one that is not entailed does, and a search over its limits answers `422` with code `reasoning-budget`.
+         */
+        post: operations["explainInference"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/$/repositories": {
         parameters: {
             query?: never;
@@ -5396,6 +5416,28 @@ export interface components {
         } & {
             [key: string]: unknown;
         };
+        /** @description A node of a derivation tree. */
+        Derivation: {
+            depth: number;
+            /** @description For an asserted node, `default` or the IRI of the graph that holds the triple. Absent for a triple of an RDFS-on-read schema given as a document. */
+            graph?: string;
+            id: number;
+            /** @enum {string} */
+            kind: "asserted" | "axiom" | "derived" | "ref";
+            premises?: components["schemas"]["Derivation"][];
+            rule?: {
+                name: string;
+                owl2rl?: string;
+                profile: string;
+            };
+            /** @description The node repeats one given earlier with the same id, without its premises. */
+            shared?: boolean;
+            triple: {
+                o: components["schemas"]["RdfTerm"];
+                p: components["schemas"]["RdfTerm"];
+                s: components["schemas"]["RdfTerm"];
+            };
+        };
         DescribeSetting: {
             labels?: boolean;
             maxDepth?: number | null;
@@ -5790,6 +5832,23 @@ export interface components {
                 code: string;
                 message: string;
             }[];
+        };
+        /** @description Derivation trees of a triple, from facts the caller reads. */
+        Explanation: {
+            /** @description The commit the search read. */
+            commit: number;
+            commitsSince?: number;
+            /** @constant */
+            entailed: true;
+            /** @constant */
+            mode: "why";
+            more: boolean;
+            readAtHead?: boolean;
+            /** @enum {string} */
+            source: "materialized" | "rdfsOnRead";
+            stale?: boolean | null;
+            staleReason?: string;
+            trees: components["schemas"]["Derivation"][];
         };
         /** @enum {string} */
         FormatLanguage: "sparql" | "turtle" | "trig" | "ntriples" | "nquads" | "jsonld";
@@ -15154,6 +15213,40 @@ export interface operations {
             401: components["responses"]["Unauthorized"];
             403: components["responses"]["Forbidden"];
             404: components["responses"]["NotFound"];
+            default: components["responses"]["Error"];
+        };
+    };
+    explainInference: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description The dataset name. */
+                ds: components["parameters"]["ds"];
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["ExplainRequest"];
+            };
+        };
+        responses: {
+            /** @description The trees. */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Explanation"];
+                };
+            };
+            400: components["responses"]["BadRequest"];
+            401: components["responses"]["Unauthorized"];
+            403: components["responses"]["Forbidden"];
+            404: components["responses"]["NotFound"];
+            422: components["responses"]["Unprocessable"];
+            501: components["responses"]["NotImplemented"];
             default: components["responses"]["Error"];
         };
     };

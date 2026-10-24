@@ -32,6 +32,7 @@ mod cursor;
 mod describe;
 mod diff;
 mod dry_run;
+mod explain;
 #[cfg(feature = "fmt")]
 mod format;
 #[cfg(feature = "shacl")]
@@ -154,6 +155,7 @@ pub fn router(state: Arc<AppState>) -> Router {
             axum::routing::put(reason_auto_set).delete(reason_auto_clear),
         )
         .route("/$/reason/{ds}/diagnostics", get(reason_diagnostics))
+        .route("/$/reason/{ds}/explain", post(explain::explain))
         .route("/$/tasks", get(list_tasks))
         .route("/$/tasks/{id}", get(get_task).delete(cancel_task))
         .route("/$/prefixes/{ds}", get(prefixes))

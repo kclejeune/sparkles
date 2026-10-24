@@ -721,6 +721,11 @@ python = "Dataset.reasoning.diagnostics"
 jvm = "SparklesReasoning.diagnostics"
 node = "Dataset.reasoning.diagnostics"
 
+["reasoning.explain"]
+python = "Dataset.reasoning.explain"
+jvm = "planned: a typed handle after the Python and Node.js ones"
+node = "Dataset.reasoning.explain"
+
 ["reasoning.rdfs.get"]
 python = "Dataset.reasoning.rdfs.get"
 jvm = "DatasetGraphSparkles.reasoning().rdfs().enabled"

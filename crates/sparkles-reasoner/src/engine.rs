@@ -626,6 +626,8 @@ pub(crate) struct Eval<'a> {
     /// stop at this plan step and keep the bindings instead, up to this many
     pub collect_at: Option<(usize, usize)>,
     pub collected: Vec<Vec<u64>>,
+    /// stop, as an abort does, once this passes (explanations only)
+    deadline: Option<std::time::Instant>,
     /// the heap of the buffers and caches above, charged to the run's budget
     held: Option<Held>,
     /// the run's budget, which `held` charges once the evaluation charges anything
@@ -702,7 +704,14 @@ impl<'a> Eval<'a> {
             lists: FxHashMap::default(),
             collect_at: None,
             collected: Vec::new(),
+            deadline: None,
         }
+    }
+
+    /// Stop the evaluation, as an abort does, once `deadline` passes. The clock is read
+    /// with the abort flag, every 1,024 steps.
+    pub(crate) fn set_deadline(&mut self, deadline: Option<std::time::Instant>) {
+        self.deadline = deadline;
     }
 
     /// Read the base tier's remembered lookups through `memo`, the blocks a caller's
@@ -857,11 +866,20 @@ impl<'a> Eval<'a> {
             return true;
         }
         self.ticks = self.ticks.wrapping_add(1);
-        if self.ticks & 0x3FF == 0
-            && (self.abort.load(Ordering::Relaxed)
-                || self.cancel.is_some_and(|c| c.load(Ordering::Relaxed)))
-        {
-            return true;
+        if self.ticks & 0x3FF == 0 {
+            if self.abort.load(Ordering::Relaxed)
+                || self.cancel.is_some_and(|c| c.load(Ordering::Relaxed))
+            {
+                return true;
+            }
+            // a passed deadline stops every enclosing scan at once, not one 1,024 steps on
+            if self
+                .deadline
+                .is_some_and(|d| std::time::Instant::now() >= d)
+            {
+                self.stop = true;
+                return true;
+            }
         }
         self.out.len() > self.max_out
     }

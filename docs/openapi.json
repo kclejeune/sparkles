@@ -5797,6 +5797,87 @@
         ],
         "type": "object"
       },
+      "Derivation": {
+        "description": "A node of a derivation tree.",
+        "externalDocs": {
+          "url": "https://github.com/kclejeune/sparkles/blob/main/docs/API.md#explanations"
+        },
+        "properties": {
+          "depth": {
+            "type": "integer"
+          },
+          "graph": {
+            "description": "For an asserted node, `default` or the IRI of the graph that holds the triple. Absent for a triple of an RDFS-on-read schema given as a document.",
+            "type": "string"
+          },
+          "id": {
+            "type": "integer"
+          },
+          "kind": {
+            "enum": [
+              "asserted",
+              "axiom",
+              "derived",
+              "ref"
+            ],
+            "type": "string"
+          },
+          "premises": {
+            "items": {
+              "$ref": "#/components/schemas/Derivation"
+            },
+            "type": "array"
+          },
+          "rule": {
+            "properties": {
+              "name": {
+                "type": "string"
+              },
+              "owl2rl": {
+                "type": "string"
+              },
+              "profile": {
+                "type": "string"
+              }
+            },
+            "required": [
+              "name",
+              "profile"
+            ],
+            "type": "object"
+          },
+          "shared": {
+            "description": "The node repeats one given earlier with the same id, without its premises.",
+            "type": "boolean"
+          },
+          "triple": {
+            "properties": {
+              "o": {
+                "$ref": "#/components/schemas/RdfTerm"
+              },
+              "p": {
+                "$ref": "#/components/schemas/RdfTerm"
+              },
+              "s": {
+                "$ref": "#/components/schemas/RdfTerm"
+              }
+            },
+            "required": [
+              "s",
+              "p",
+              "o"
+            ],
+            "type": "object"
+          }
+        },
+        "required": [
+          "id",
+          "triple",
+          "kind",
+          "depth"
+        ],
+        "type": "object"
+      },
       "DescribeSetting": {
         "properties": {
           "labels": {
@@ -7191,6 +7272,64 @@
           "nodes",
           "notes",
           "explanation"
+        ],
+        "type": "object"
+      },
+      "Explanation": {
+        "description": "Derivation trees of a triple, from facts the caller reads.",
+        "externalDocs": {
+          "url": "https://github.com/kclejeune/sparkles/blob/main/docs/API.md#explanations"
+        },
+        "properties": {
+          "commit": {
+            "description": "The commit the search read.",
+            "type": "integer"
+          },
+          "commitsSince": {
+            "type": "integer"
+          },
+          "entailed": {
+            "const": true
+          },
+          "mode": {
+            "const": "why"
+          },
+          "more": {
+            "type": "boolean"
+          },
+          "readAtHead": {
+            "type": "boolean"
+          },
+          "source": {
+            "enum": [
+              "materialized",
+              "rdfsOnRead"
+            ],
+            "type": "string"
+          },
+          "stale": {
+            "type": [
+              "boolean",
+              "null"
+            ]
+          },
+          "staleReason": {
+            "type": "string"
+          },
+          "trees": {
+            "items": {
+              "$ref": "#/components/schemas/Derivation"
+            },
+            "type": "array"
+          }
+        },
+        "required": [
+          "mode",
+          "entailed",
+          "commit",
+          "trees",
+          "more",
+          "source"
         ],
         "type": "object"
       },
@@ -31110,6 +31249,87 @@
           }
         },
         "summary": "Inconsistency diagnostics",
+        "tags": [
+          "Reasoning"
+        ],
+        "x-sparkles-permission": "read"
+      }
+    },
+    "/$/reason/{ds}/explain": {
+      "post": {
+        "description": "Derivation trees for a triple of the materialized inferences or of what RDFS on read answers, searched from the facts the caller reads. Mode `whyNot` answers `501`. A triple with no derivation from readable facts answers `404` with code `no-visible-derivation`, as one that is not entailed does, and a search over its limits answers `422` with code `reasoning-budget`.",
+        "externalDocs": {
+          "url": "https://github.com/kclejeune/sparkles/blob/main/docs/API.md#explanations"
+        },
+        "operationId": "explainInference",
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/ds"
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/ExplainRequest"
+              }
+            }
+          },
+          "description": "",
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Explanation"
+                }
+              }
+            },
+            "description": "The trees."
+          },
+          "400": {
+            "$ref": "#/components/responses/BadRequest"
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "403": {
+            "$ref": "#/components/responses/Forbidden"
+          },
+          "404": {
+            "$ref": "#/components/responses/NotFound"
+          },
+          "422": {
+            "$ref": "#/components/responses/Unprocessable"
+          },
+          "501": {
+            "$ref": "#/components/responses/NotImplemented"
+          },
+          "default": {
+            "$ref": "#/components/responses/Error"
+          }
+        },
+        "security": [
+          {
+            "basicAuth": []
+          },
+          {
+            "apiToken": []
+          },
+          {
+            "oidcAccessToken": []
+          },
+          {
+            "csrfToken": [],
+            "sessionCookie": []
+          },
+          {
+            "cloudflareAccess": []
+          }
+        ],
+        "summary": "Explain why a triple is inferred",
         "tags": [
           "Reasoning"
         ],

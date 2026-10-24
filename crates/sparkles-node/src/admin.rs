@@ -218,6 +218,7 @@ fn writes(op: &str) -> bool {
             | "indexes.geo.features"
             | "indexes.vector.recall"
             | "reasoning.diagnostics"
+            | "reasoning.explain"
             | "history.query"
             | "schema.profiles"
             | "schema.draftShapes"
@@ -910,6 +911,35 @@ fn run_admin(
                 "commit": d.commit,
                 "inferences": d.inferences,
             })
+        }
+        "reasoning.explain" => {
+            use sparkles::reasoning::explain as ex;
+            let text = a["triple"].as_str().unwrap_or_default();
+            let prefixes: Vec<(String, String)> = ds.prefixes().into_iter().collect();
+            let mut req = ex::ExplainRequest::new(ex::triple_from_text(text, &prefixes)?);
+            if let Some(n) = a["maxTrees"].as_u64() {
+                if !(1..=ex::MAX_TREES as u64).contains(&n) {
+                    return Err(sparkles::Error::invalid(format!(
+                        "maxTrees must be from 1 to {}",
+                        ex::MAX_TREES
+                    )));
+                }
+                req.max_trees = n as usize;
+            }
+            if let Some(n) = a["maxDepth"].as_u64() {
+                if !(1..=ex::MAX_DEPTH as u64).contains(&n) {
+                    return Err(sparkles::Error::invalid(format!(
+                        "maxDepth must be from 1 to {}",
+                        ex::MAX_DEPTH
+                    )));
+                }
+                req.max_depth = n as u32;
+            }
+            req.timeout = ctl
+                .deadline
+                .map(|d| d.saturating_duration_since(Instant::now()));
+            req.cancel = Some(ctl.cancel.flag());
+            ex::explanation_json(&ds.reasoning().explain(&req)?)
         }
         "schema.constraints" => value(ds.schema().constraints(&Default::default())?)?,
         #[cfg(feature = "graphql")]

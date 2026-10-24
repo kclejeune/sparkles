@@ -6,6 +6,7 @@
 //! and its serde form is that of `reasoning.json`, which older versions also embedded in
 //! the server's registry (`config.json`).
 
+pub mod explain;
 pub mod freshness;
 pub mod rdfs;
 #[cfg(feature = "reasoning")]

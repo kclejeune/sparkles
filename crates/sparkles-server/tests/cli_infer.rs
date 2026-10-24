@@ -140,3 +140,49 @@ fn infer_stops_at_the_limit_of_inferred_triples() {
     );
     assert!(stderr(&o).contains("inferred triples"), "{}", stderr(&o));
 }
+
+#[test]
+fn infer_why_prints_the_derivation() {
+    let dir = tempfile::tempdir().unwrap();
+    let data = dir.path().join("data.ttl");
+    std::fs::write(
+        &data,
+        "@prefix ex: <http://ex.org/> .
+         @prefix rdfs: <http://www.w3.org/2000/01/rdf-schema#> .
+         ex:Cat rdfs:subClassOf ex:Animal . ex:tom a ex:Cat .",
+    )
+    .unwrap();
+    let db = dir.path().join("db").to_str().unwrap().to_string();
+    expect(&["load", "--loc", &db, data.to_str().unwrap()], 0);
+    expect(&["infer", "--loc", &db, "--profile", "rdfs"], 0);
+    let why = "<http://ex.org/tom> a <http://ex.org/Animal>";
+    let o = expect(&["infer", "--loc", &db, "--why", why], 0);
+    let text = String::from_utf8_lossy(&o.stdout).into_owned();
+    assert!(text.contains("derived by rdfs9 (rdfs)"), "{text}");
+    assert!(text.contains("asserted in graph default"), "{text}");
+    let o = expect(
+        &["infer", "--loc", &db, "--why", why, "--format", "json"],
+        0,
+    );
+    let j: serde_json::Value = serde_json::from_slice(&o.stdout).unwrap();
+    assert_eq!(j["trees"][0]["rule"]["name"], "rdfs9", "{j}");
+    // not entailed: exit 1; a malformed triple: an error
+    expect(
+        &[
+            "infer",
+            "--loc",
+            &db,
+            "--why",
+            "<http://ex.org/tom> a <http://ex.org/Plant>",
+        ],
+        1,
+    );
+    expect(
+        &["infer", "--loc", &db, "--why", "<http://ex.org/tom> a"],
+        1,
+    );
+    expect(
+        &["infer", "--loc", &db, "--why", why, "--max-trees", "11"],
+        2,
+    );
+}

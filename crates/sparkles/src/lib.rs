@@ -4,10 +4,10 @@
 //! and the [`querybuilder`] are defined here.
 
 pub use sparkles_core::{
-    access, algo, annotations, branch, builder, check, codec, commit, disk, error, formats, geo,
-    guard, history, id, incr, index, io, ioacct, jena_formats, mapping, migrate, nesting, outbound,
-    patch, patterns, preview, schema, sparql, spill, store, stored, stored_mappings, tabular, task,
-    text, trix, validation, vector, vocab, xsd,
+    access, algo, annotations, branch, builder, check, codec, commit, disk, error, explain,
+    formats, geo, guard, history, id, incr, index, io, ioacct, jena_formats, mapping, migrate,
+    nesting, outbound, patch, patterns, preview, schema, sparql, spill, store, stored,
+    stored_mappings, tabular, task, text, trix, validation, vector, vocab, xsd,
 };
 
 #[cfg(feature = "backup")]

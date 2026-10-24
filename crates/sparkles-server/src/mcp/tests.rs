@@ -530,6 +530,17 @@ fn expected_input_schemas() -> Vec<(&'static str, Value)> {
                 "timeoutSeconds": to,
                 "atCommit": at, "at": sel}}),
         ),
+        #[cfg(feature = "reasoning")]
+        (
+            "explain_inference",
+            json!({"type":"object","additionalProperties":false,"required":["triple"],"properties":{
+                "dataset": ds,
+                "triple": {"type":"string","minLength":1,"maxLength":4096,"description":"The triple in Turtle with the dataset prefixes, such as `ex:tom a ex:Animal` or `<http://ex.org/tom> <http://ex.org/knows> \"Ann\"`"},
+                "mode": {"enum":["why","whyNot"],"default":"why"},
+                "maxTrees": {"type":"integer","minimum":1,"maximum":10,"default":1,"description":"Derivations whose top rules differ"},
+                "maxDepth": {"type":"integer","minimum":1,"maximum":64,"default":32,"description":"The depth of the trees; deeper nodes are cut as ref nodes"},
+                "timeoutSeconds": to}}),
+        ),
         #[cfg(feature = "shacl")]
         (
             "validate_shacl",
@@ -630,6 +641,8 @@ async fn a03_tool_list() {
             "recall",
             "community_reports",
             "why_empty",
+            #[cfg(feature = "reasoning")]
+            "explain_inference",
             #[cfg(feature = "shacl")]
             "validate_shacl",
             #[cfg(feature = "shex")]

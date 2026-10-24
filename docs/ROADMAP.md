@@ -122,7 +122,7 @@ openCypher comes last.
 | # | Item | Spec | Size | Value |
 |---|---|---|---|---|
 | 19 | **Query-time reasoning.** Phase 2 adds `auto` with its cost model, the dataset setting, hybrid Jena rules, OWL 2 QL rewriting, reuse of tables across commits, the MCP argument, the UI and the G08 mapping. Phase 3 keeps tables current through F13 and adds `why` provenance on tables for F18. Items 190 to 193 cover what Phase 1 left. | [F17](specs/F17-query-time-reasoning.md#outcome) | L | High |
-| 18 | **Explanations.** Derivation trees, "why not?" answers, entailment diffs on branches and minimal justifications, with protections that track provenance and `reviewedOnly` extended to derived facts. Phases 1 and 2 need only F17 Phase 1, and Phase 3 needs F13. | [F18](specs/F18-explanations-and-entailment-diffs.md) | M–L | High |
+| 18 | **Explanations.** Derivation trees from F17's demand engine behind `POST /$/reason/{ds}/explain`, whose `why` mode already explains materialized inferences and RDFS on read, plus "why not?" answers, entailment diffs on branches and minimal justifications, with protections that track provenance and `reviewedOnly` extended to derived facts. Phases 1 and 2 need only F17 Phase 1, and Phase 3 needs F13. | [F18](specs/F18-explanations-and-entailment-diffs.md) | M–L | High |
 | 17 | **Incremental computation core.** Phase 2 adds `graph` views, maintenance inside the commit, the WebSocket, MCP, the Node and JVM APIs, the UI, views per branch, `keepCommits`, ordered windows and data-dependent protections compiled to views. Phase 3 adds provenance per fact, recursion and GraphQL subscriptions. | [F13](specs/F13-incremental-views-and-provenance.md#outcome) | XL | Very high |
 | 23 | **Full-text parity.** Lucene analyzers, CJK segmentation, online reindexing, search after uncommitted writes, and historical search. | [F03](specs/F03-full-text-search.md#roadmap-follow-ups-2026-10-12) | M each | Medium |
 | 24 | **GeoSPARQL.** k-NN with arbitrary joins, better polygon approximations than the cell grid and QLever's spatial syntax. The geometry limits to lift are datums other than WGS 84, grid-based and exact Helmert shifts, curved GML segments and solids, 3D constructions, and lines split at crossings. | [G01](specs/G01-geosparql.md#roadmap-follow-ups-2026-10-12) | M | Medium |
@@ -224,11 +224,11 @@ Rows that need backend work name it first.
 | 142 | **Projections on disk and for partial callers.** Decide whether to write projections beside the index in a versioned file, and whether to serve a projection filtered to what a caller can read instead of answering `403`. | [U11](specs/U11-linked-views.md#10-open-questions) | M |
 | 275 | **Weighted shortest paths under a length limit.** A weighted shortest search with `path:maxLength` lists paths by cost until one is short enough, so a pair whose short paths are all dear runs to the visit limit, and the path finder always sends a limit. Search over pairs of node and length, keeping a label only when no other label at the node is both cheaper and shorter, and use the same search for Yen's spurs. | [F07](specs/F07-path-search.md#weighted-searches-from-both-ends-2026-10-24), [U09](specs/U09-path-finder.md#outcome) | M |
 | 277 | **Weighted `path:allShortest` from both ends.** Every cheapest path of one pair without `path:maxLength`, cycles through the source and searches to several targets still run Dijkstra's algorithm from the source alone. Keep every tied parent on both ends and join the halves at every cheapest meeting. | [F07](specs/F07-path-search.md#weighted-searches-from-both-ends-2026-10-24) | S–M |
-| 105 | **Canvas lenses, Phase 3.** First an explanation search over a materialized closure, then the derivation tree of an inferred edge on the canvas. | [U10](specs/U10-canvas-lenses.md) Phase 3 | L |
-
-Item 105 Phase 3 comes last because its explanation search is the most open engine work
-of the set, and U10's open question 1 asks whether to build it before F17 or wait for
-item 18.
+| 135 | **A partial tree when an explanation runs out of budget.** `POST /$/reason/{ds}/explain` answers `422` without a tree when the search passes 100,000 rule instances or its timeout. Return the deepest well-founded part found so far, with the unexplained premises marked. | [U10](specs/U10-canvas-lenses.md#phase-3-2026-10-24) | S |
+| 136 | **Explanations through generalized triples and default geometries.** A derivation whose chain passes through a generalized triple that the closure uses but the store does not hold, or through a GeoSPARQL default geometry, is not found and answers `404`. Let the search reach those facts. | [U10](specs/U10-canvas-lenses.md#phase-3-2026-10-24) | S–M |
+| 137 | **Builtins and bindings in derivation trees.** A tree names the rule that fired and its premises but leaves out the builtins it called and the values it bound, which matter for Jena rules. Add them to the `Derivation` node and the Why? panel. | [U10](specs/U10-canvas-lenses.md#phase-3-2026-10-24) | S |
+| 138 | **Interruptible RDFS on read schema builds.** A query or an explanation over RDFS on read builds the schema's closure once per state without the request's timeout or cancellation, so a large class hierarchy delays both past their deadline. Pass the request's controls into the schema build. | [U10](specs/U10-canvas-lenses.md#phase-3-2026-10-24) | S |
+| 139 | **Explanations across materialized inferences and RDFS on read.** When a dataset has both, a query answers a triple that RDFS on read derives from a materialized one, but the explanation route searches each engine separately and finds no derivation. Let an RDFS on read tree take materialized premises and explain them through the materialized search. | [U10](specs/U10-canvas-lenses.md#phase-3-2026-10-24) | S–M |
 
 ## Tier 5: backlog
 
@@ -333,6 +333,7 @@ linked spec Outcome records how they landed.
 - **102.** The plan drawn on the query's pattern. [U04](specs/U04-live-query-profiling.md#11-phase-4-the-plan-drawn-on-the-querys-pattern-2026-10-23) Phase 4
 - **103.** Path finder. [U09](specs/U09-path-finder.md#outcome)
 - **104.** Time-lapse and commit diffs on the canvas. [U01](specs/U01-time-slider.md#phase-4-time-lapse-and-commit-diffs-on-the-canvas-2026-10-23) Phase 4
+- **105.** Canvas lenses and the derivation tree of an inferred edge. [U10](specs/U10-canvas-lenses.md#outcome)
 - **106.** Validation overlay. [U07](specs/U07-data-quality-and-schema-diagram.md#11-phase-4-a-validation-overlay-on-the-graph-2026-10-23) Phase 4
 - **107.** Linked views. [U11](specs/U11-linked-views.md#outcome)
 - **108.** Faster FSST reads. [X11](specs/X11-index-compression-and-predicate-patterns.md#item-108-faster-fsst-reads)

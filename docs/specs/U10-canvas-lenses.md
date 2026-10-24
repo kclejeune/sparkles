@@ -543,7 +543,7 @@ real server. A3 to A11 need Phases 2 and 3.
 Phase 2 shipped the cached view-only algorithm runs of §3.2, the algorithm lenses of §2.3
 with drawn-graph and projection scope, stable community colours, the GraphRAG community
 lens, the pause while playing and the compare-mode deltas of §4.3, and the top 1,000 of §5
-above 20,000 drawn nodes. Phase 3 remains [ROADMAP](../ROADMAP.md) item 105.
+above 20,000 drawn nodes. Phase 3 follows below.
 
 **What was built on the server.** `crates/sparkles-server/src/http/algo/view.rs` takes the
 `nodes`, `keep`, `async` and `top` members out of a run request before the rest parses as
@@ -652,3 +652,134 @@ lens at a past state
 the GraphRAG lens and the 390 px sheet, and `tests/e2e/algo-lenses.spec.ts` runs A3, A4 and
 A5 against a real server. A6 is covered by the router tests, and A11 still needs its frame
 time measurement in U06's performance project.
+
+### Phase 3, 2026-10-24
+
+Phase 3 shipped the server prerequisite of §3.3, `POST /$/reason/{ds}/explain` in the `why`
+mode over a materialized closure and over RDFS on read, and the Why? panel of §2.4 with
+**Show on graph**, **Next**, **Expand** and the stale note. Open question 1 is settled in
+favour of building the search before F17. With this phase every part of
+[ROADMAP](../ROADMAP.md) item 105 has shipped, and items 135 to 139 carry what it left out.
+
+**What was built in the engine.** `crates/sparkles-reasoner/src/explain.rs` reads the
+closure as the input graphs plus the inferred graph through one masked snapshot, and walks
+backward from the triple one level at a time. Each level enumerates the rule instances
+whose head is a fact of the frontier, with the incremental search's compiled plans in an
+instances mode, and keeps those whose premises all hold in the closure. After each level a
+bucket-queue fixpoint gives every fact its least well-founded depth, 0 for a fact of a
+readable input graph, 1 for an axiom, and one more than the deepest premise for a derived
+fact. The walk stops at the first level where the triple has a depth, then walks three
+more levels to find derivations with other top rules, and gives up after 128 levels. A
+cycle of facts that only support each other never gets a depth, so it is never shown, and
+the search reads no row order of a kept closure, so it is correct after any sequence of
+incremental runs. Rules are compiled per source, so a node names the profile or
+vocabulary its rule came from, and an OWL 2 RL rule also carries its name in the OWL 2 RL
+tables. `crates/sparkles-core/src/sparql/rdfs/explain.rs` explains what RDFS on read
+answers with the rules of Jena's `MatchRDFS`, rdfs2, rdfs3, rdfs5, rdfs7, rdfs9 and rdfs11,
+over the schema graph's direct edges.
+
+**What was built around it.** The answer types `Derivation`, `RuleRef`, `Explained` and
+`ExplainLimits` live in `crates/sparkles-core/src/explain.rs` with `finish`, which numbers
+the nodes, shares a repeated fact by `id` and cuts nodes deeper than `maxDepth` as `ref`.
+`crates/sparkles/src/reasoning/explain.rs` holds the library call
+`Dataset::reasoning().explain`, the JSON request and answer, the Turtle form of a triple
+and the text form of a tree. The server route is `crates/sparkles-server/src/http/explain.rs`,
+with `read` on the dataset, the query rate limit class and the query view. `sparkles infer
+--why`, the MCP tool `explain_inference`, `Dataset.reasoning.explain` in Python and
+`reasoning.explain` in Node call the library. API.md documents the route, and the OpenAPI
+description names it `explainInference`.
+
+**What was built in the UI.** `ui/src/lib/why.ts` asks the route and turns its answer into
+what the panel shows, and `WhyPanel.svelte` draws the tree as an ARIA tree with folds.
+Explore opens it from a click on an inferred edge, from the **Why?** button beside an
+inferred value, or with `W`. **Show on graph** draws the premises and marks them on the
+canvas through GraphView's `whyMarked`. `ui/mock/reason.mjs` explains the mock reasoner's
+rules by iterative deepening, so the mock suites run the panel.
+
+**Decisions the spec left open.**
+
+- *Which closure.* A materialized tree reads the store at the commit of the last run, so a
+  stale tree explains the closure as it was computed. When the history no longer has that
+  commit, the tree reads the head and the answer says `readAtHead`. Freshness comes from
+  C08's record.
+- *Leaves.* A leaf is a fact of a graph the last run read that the caller may read. The
+  inferred graph is read only when the caller may read it. A triple that is itself
+  asserted answers with one asserted node.
+- *Without materialized inferences.* When the dataset has RDFS on read and no materialized
+  inferences cover the triple, the answer comes from RDFS on read with `source:
+  "rdfsOnRead"`. Its data graphs are the default graph and the readable named graphs, and a
+  schema leaf names the schema graph or none when the schema is a document. A document
+  schema's leaves are the triples of its closure, so a schema triple outside that closure
+  has no derivation.
+- *Several derivations.* `maxTrees` is at most 10 and the panel asks for 5. Derivations
+  with other top rules come shallowest first, and `more` says whether the search found more
+  than were returned.
+- *Budgets.* The search visits at most 100,000 rule instances and stops at the request's
+  timeout, ten seconds by default and never more than the server's query timeout. Either
+  limit answers `422` with `code: "reasoning-budget"`. The CLI exits with 2 there and with 1
+  when no derivation is found. `maxDepth` is 32 by default and at most 64.
+- *Memory.* The search holds each fact it reached with its depth and the instances that
+  derive it, about 10 MB at the instance limit. The library call charges that state, the
+  rule evaluations and the decoded terms of the answer to an optional memory limit. The
+  route and the MCP tool set it to the query memory budget and take no pool grant, and the
+  route holds its answer to the result-byte limit of a query. An RDFS on read answer is
+  measured against the same limit once its trees are built, since it holds at most one
+  tree per rule. Passing the memory limit answers `422` as the other limits do.
+- *Deadline.* The timeout is checked between rules and inside each rule's evaluation, so a
+  rule whose candidates all fail stops at it, and a stale run's history replay and the
+  RDFS on read search stop at it and at a cancelled request too. A timeout too large to
+  represent answers `400`. The timeout stays within the server's ceiling as a query's
+  does, even when the ceiling is below the ten-second default.
+- *Other top rules.* The trees after the first read depths worked out with the explained
+  triple excluded, so no tree derives its triple from itself through another top rule.
+- *Sharing.* A repeated fact is shared by `id` within one tree only, so the panel shows
+  each tree on its own, and ids stay unique across the answer.
+- *RDFS on read limits.* Every schema neighbour the search visits counts as one of its
+  100,000 reads, so a very wide hierarchy meets the limit and the request's controls as
+  the rows stream. A subclass or subproperty fact of the schema's closure is explained on
+  its own, which is what **Expand** asks for when a chain is cut at the depth limit.
+- *Past states.* The route explains the latest inferences only. While the time slider
+  shows a past commit, the panel says so instead of loading a tree, and the premises it
+  marked are cleared.
+- *Expand.* A `ref` node asks the route for its own first tree and grafts it in place,
+  with the subtree's ids moved past every tree's, so a deep chain costs one request per
+  level the person opens. An expansion whose explanation was replaced is dropped, and one
+  that reads inferences of another commit is refused with a note to open Why? again.
+- *Show on graph.* The panel turns off **Hide rdf:type** and turns on **Literals** when the
+  premises need them, so the drawn chain is complete.
+
+**Deferred and limits.** A `422` answer has no partial tree, which item 135 adds. A
+derivation through a generalized triple, such as one with a literal subject that the
+closure uses but the store does not hold, or through a GeoSPARQL default geometry, is not
+found and answers `404`, which item 136 covers. A tree leaves out the builtins and the
+bindings of the rule that fired, which item 137 adds. The RDFS on read schema that a
+search needs is built, as for a query, without the request's timeout or cancellation,
+which are checked before and after it, and item 138 makes that build interruptible. A
+schema the caller cannot read is not built, though a triple a readable graph asserts is
+still its own answer. When a dataset has both materialized inferences and RDFS on read, a
+derivation that needs both, such as an RDFS subclass over a materialized type, is not
+found, and item 139 joins the two. The search reads only what the caller
+reads, so its answer and its time cannot tell a hidden derivation from none. `whyNot` answers `501` until F18 Phase 1.
+
+**What F18 can build on.** The answer types and `finish` are F18 §2.1's `Derivation` with
+its sharing and depth cuts, and F18's engines can fill them as they are. The route, its
+access and budget answers, the library call, the CLI, the MCP tool, the bindings and the
+Why? panel are F18 §2's surfaces for the `why` mode, so F18 Phase 1 adds `whyNot` behind
+them and replaces the search with its demand engine. The tests in
+`crates/sparkles-reasoner/tests/explain.rs` check well-foundedness and the visible leaves on
+any tree, so they can compare the two engines on the same closures as §3.3 asks. The RDFS
+on read explainer stays as it is, because F17 does not cover that path. The mock's
+explainer gives F18's UI work a backend without a reasoner build.
+
+**Tests.** The reasoner tests cover A7, A8 with `owl:sameAs`, A9, an asserted triple, an
+axiom, the depth cut, the instance budget, a shared premise, derivations with other top
+rules, another top rule that could only derive the root from itself, the deadline in a
+rule whose candidates all fail, the memory limit, and every inferred triple after
+incremental deletions. The library tests cover
+input graphs, a hidden ontology, a stale run, RDFS on read with and without a readable
+schema, and its deadline. Router tests cover the route and A9 as the same answer as a triple that is not
+entailed, and the MCP, CLI and parity suites cover their surfaces. Vitest covers the tree
+helpers and the route's answers (`why.test.ts`). The mock Playwright suite
+`tests/mock/why.spec.ts` covers A10, the stale note, a past state, no derivation, and A12
+with the keyboard and at 390 px, and `tests/e2e/why.spec.ts` runs A7, A9 and A10 against a real
+server.

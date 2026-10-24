@@ -676,25 +676,25 @@ pub(crate) fn dred_overdeletion(
 // ------------------------------------------------------------------ plans ----
 
 /// A plan that starts with the variables of a rule head bound, and those variables.
-type BackPlan = (Vec<Step>, Vec<usize>);
+pub(crate) type BackPlan = (Vec<Step>, Vec<usize>);
 
 /// The plans an update evaluates with, made once per update.
-struct Plans {
+pub(crate) struct Plans {
     /// per rule and head: the plan with the head's variables bound (those that some atom
     /// binds), and those variables
-    back: Vec<Vec<Option<BackPlan>>>,
+    pub(crate) back: Vec<Vec<Option<BackPlan>>>,
     /// heads by constant predicate: (rule, head)
-    by_pred: FxHashMap<u64, Vec<(usize, usize)>>,
+    pub(crate) by_pred: FxHashMap<u64, Vec<(usize, usize)>>,
     /// heads with a variable predicate
-    any_pred: Vec<(usize, usize)>,
+    pub(crate) any_pred: Vec<(usize, usize)>,
     /// per rule and atom: the plan that starts with that atom
-    forward: Vec<Vec<Option<Vec<Step>>>>,
+    pub(crate) forward: Vec<Vec<Option<Vec<Step>>>>,
     /// an estimate of the plans' heap
-    bytes: usize,
+    pub(crate) bytes: usize,
 }
 
 impl Plans {
-    fn new(g: &mut Graph, rules: &[CRule]) -> Result<Plans, MemoryExceeded> {
+    pub(crate) fn new(g: &mut Graph, rules: &[CRule]) -> Result<Plans, MemoryExceeded> {
         let mut p = Plans {
             back: Vec::with_capacity(rules.len()),
             by_pred: FxHashMap::default(),
@@ -783,7 +783,7 @@ impl Plans {
         Ok(p)
     }
 
-    fn heads(&self, p: u64) -> impl Iterator<Item = (usize, usize)> + '_ {
+    pub(crate) fn heads(&self, p: u64) -> impl Iterator<Item = (usize, usize)> + '_ {
         self.by_pred
             .get(&p)
             .into_iter()
@@ -1407,7 +1407,7 @@ impl Search {
 
 /// Bindings of rule `ri`'s head `hi` unified with `t` (only the variables in `pre`), or
 /// `None` when a constant differs.
-fn bind_head(
+pub(crate) fn bind_head(
     rule: &CRule,
     hi: usize,
     pre: &[usize],

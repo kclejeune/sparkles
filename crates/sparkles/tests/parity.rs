@@ -583,6 +583,9 @@ fn entries() -> Vec<(&'static str, Entry)> {
                 ds.reasoning().diagnostics(&any());
             }
         ),
+        op!("explainInference", "reasoning.explain", |ds| {
+            ds.reasoning().explain(&any());
+        }),
         op!("getRdfs", "reasoning.rdfs.get", |ds| {
             ds.reasoning().rdfs().get();
         }),

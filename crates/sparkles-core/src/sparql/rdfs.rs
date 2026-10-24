@@ -31,6 +31,9 @@
 //! matched in, and each graph is closed on its own, as in Jena, where every graph of the
 //! dataset is wrapped with the schema.
 
+mod explain;
+pub use explain::SchemaLeaves;
+
 use super::ctx::Ctx;
 use crate::error::Result;
 use crate::id::Id;
@@ -149,6 +152,23 @@ impl RdfsSchema {
     /// Jena's `hasOnlyPropertyDeclarations`: no class hierarchy, domain or range.
     fn only_properties(&self) -> bool {
         self.sub_class.is_empty() && self.domain.is_empty() && self.range.is_empty()
+    }
+
+    /// Whether `a pred b` is a triple of the closed schema that [`RdfsSchema::triples`]
+    /// lists, for `pred` one of the four schema predicates.
+    pub(crate) fn closes(&self, a: &NamedNode, pred: NamedNodeRef<'_>, b: &NamedNode) -> bool {
+        let m = if pred == rdfs::SUB_CLASS_OF {
+            &self.sup_class
+        } else if pred == rdfs::SUB_PROPERTY_OF {
+            &self.sup_prop
+        } else if pred == rdfs::DOMAIN {
+            &self.domain
+        } else if pred == rdfs::RANGE {
+            &self.range
+        } else {
+            return false;
+        };
+        m.get(a).is_some_and(|s| s.contains(b))
     }
 
     fn get<'m>(m: &'m Map, k: NamedNodeRef<'_>) -> Option<&'m Set> {

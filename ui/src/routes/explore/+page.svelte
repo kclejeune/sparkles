@@ -66,6 +66,8 @@
   import { describe as lensDescribe, entryIds, OTHER } from '$lib/lens';
   import { Lenses } from '$lib/lenses.svelte';
   import ValidationOverlay from '$components/ValidationOverlay.svelte';
+  import WhyPanel from '$components/WhyPanel.svelte';
+  import type { WhyTriple } from '$lib/why';
   import ShapeForm from '$components/ShapeForm.svelte';
   import { getForm } from '$lib/forms-api';
   import ValidationSource from '$components/ValidationSource.svelte';
@@ -247,6 +249,50 @@
     out.edges.push(`${s}|${r.path}|${o}`);
     return shown();
   }
+  // --- Why is this inferred? (docs/specs/U10-canvas-lenses.md §2.4) -----------------
+  /** The inferred triple the Why? panel explains, or null when it is closed. */
+  let whyFor = $state<WhyTriple | null>(null);
+  /** The premises Show on graph drew, highlighted on the canvas. */
+  let whyMarked = $state<{ nodes: string[]; edges: string[] } | null>(null);
+  /** Open Why? for a drawn edge that the inferred-edge lens marks; false for another edge. */
+  function openWhyEdge(id: string): boolean {
+    const e = gEdges.find((x) => x.id === id);
+    if (!e?.triple || !lenses.encoding.inferred.has(id)) return false;
+    const [s, p, o] = e.triple;
+    whyMarked = null;
+    whyFor = { s, p, o };
+    return true;
+  }
+  function closeWhy() {
+    whyFor = null;
+    whyMarked = null;
+  }
+  /** Show on graph: draw the premises and highlight them with the explained edge. */
+  function showWhy(triples: WhyTriple[]) {
+    const out = { nodes: new Set<string>(), edges: new Set<string>() };
+    const root = whyFor;
+    for (const t of root ? [root, ...triples] : triples) {
+      if (t.s.type === 'literal' || t.p.type !== 'uri') continue;
+      const sid = termKey(t.s);
+      ensureNode(t.s);
+      const lit = t.o.type === 'literal';
+      if (lit) showLiterals = true;
+      if (t.p.value === RDF_TYPE) hideTypes = false;
+      const oid = lit ? `lit:${sid}|${t.p.value}|${termKey(t.o)}` : termKey(t.o);
+      ensureNode(t.o, undefined, oid);
+      addEdge(sid, t.p.value, oid, lit);
+      out.nodes.add(sid);
+      out.nodes.add(oid);
+      out.edges.add(`${sid}|${t.p.value}|${oid}`);
+    }
+    whyMarked = { nodes: [...out.nodes], edges: [...out.edges] };
+  }
+  /** The edge id of a value of the selected resource, as the canvas draws it. */
+  function valueEdge(sid: string, p: string, o: Term, incoming = false): string {
+    if (incoming) return `${termKey(o)}|${p}|${sid}`;
+    const oid = o.type === 'literal' ? `lit:${sid}|${p}|${termKey(o)}` : termKey(o);
+    return `${sid}|${p}|${oid}`;
+  }
   // the reads of a view that goes away stop with it
   onDestroy(() => {
     selection.clear();
@@ -344,6 +390,14 @@
   let graphSlider: TimeSlider | undefined = $state();
   /** Either slider is open, so the properties are read at the state they name. */
   const timeActive = $derived(stripOpen || graphTimeOpen);
+  /**
+   * The canvas shows a past state, where the route's tree of the latest inferences may not
+   * hold, so the panel says so and the premises it drew are no longer marked.
+   */
+  const whyAtPast = $derived(timeActive && exAt !== '');
+  $effect(() => {
+    if (whyAtPast) untrack(() => (whyMarked = null));
+  });
   type EntityHistory = {
     iri: string;
     changes: EntityChange[];
@@ -2031,6 +2085,12 @@
           return;
         }
       }
+      // W opens Why? for the focused inferred edge of the resource's properties (§2.5)
+      if ((e.key === 'w' || e.key === 'W') && !e.shiftKey && tab === 'graph') {
+        const el = target?.closest?.('[data-why-edge]') as HTMLElement | null;
+        if (el?.dataset.whyEdge && openWhyEdge(el.dataset.whyEdge)) e.preventDefault();
+        return;
+      }
       if (e.key !== 'h' && e.key !== 'H') return;
       if (tab !== 'graph') return;
       if (e.shiftKey) {
@@ -2404,6 +2464,8 @@
                     (menu = nodes[id]?.term.type === 'uri' ? { id, ...at } : null)}
                   lens={lenses.encoding}
                   marked={lensMarked}
+                  onedge={(id) => void openWhyEdge(id)}
+                  whyMarked={whyFor ? whyMarked : null}
                   validation={vLive && vOn
                     ? { badges: vBadges, marked: vMarked, onbadge: (id) => overlay?.open(id) }
                     : null}
@@ -2505,7 +2567,17 @@
         </aside>
       {:else if nodeCount > 0 || graphTimeOpen}
         <aside class="side" aria-label="Resource details">
-          {#if selected}
+          {#if whyFor && ds}
+            <WhyPanel
+              {ds}
+              triple={whyFor}
+              {prefixes}
+              past={whyAtPast}
+              onshow={showWhy}
+              onopen={(iri) => focusOn(iri)}
+              onclose={closeWhy}
+            />
+          {:else if selected}
             {@const n = selected}
             <div class="side-head">
               <div class="side-title">
@@ -2732,13 +2804,23 @@
                         <th title={p}><span class="t-iri">{displayIri(p, prefixes)}</span></th>
                         <td>
                           {#each values.slice(0, 20) as o (termKey(o))}
-                            <div class="val">
+                            {@const eid = valueEdge(n.id, p, o)}
+                            {@const inferred = lenses.encoding.inferred.has(eid)}
+                            <div class="val" data-why-edge={inferred ? eid : undefined}>
                               <TermView
                                 term={o}
                                 {prefixes}
                                 expandable
                                 onopen={(iri) => addLinked(n.id, p, { type: 'uri', value: iri })}
                               />
+                              {#if inferred}
+                                <button
+                                  class="why-btn"
+                                  title="Why is this inferred? (W)"
+                                  aria-label="Why is {displayIri(p, prefixes)} inferred?"
+                                  onclick={() => openWhyEdge(eid)}>ⓘ Why?</button
+                                >
+                              {/if}
                             </div>
                           {/each}
                           {#if values.length > 20}<div class="faint">
@@ -3737,6 +3819,21 @@
   .props td {
     font-family: var(--font-mono);
     word-break: break-word;
+  }
+  .why-btn {
+    margin-left: 6px;
+    border: 1px dashed var(--border-strong);
+    border-radius: 999px;
+    background: transparent;
+    color: var(--text-2);
+    font-size: var(--fs-xs);
+    padding: 0 6px;
+    cursor: pointer;
+  }
+  .why-btn:hover,
+  .why-btn:focus-visible {
+    color: var(--text);
+    border-color: var(--accent, var(--text-2));
   }
   .props .val + .val {
     margin-top: 2px;
