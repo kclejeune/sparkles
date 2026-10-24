@@ -608,3 +608,56 @@ async fn tasks_do_not_cross_scopes() {
     let r = get(other).await;
     assert_eq!(r["error"]["code"], -32602, "{r}");
 }
+
+/// When two stored tools would share a name among the stored tools of the principal
+/// without its scope bound, the tool that runs is the one its scopes show, and it is
+/// charged to that tool's dataset, not to a dataset its arguments name.
+#[tokio::test]
+async fn a_stored_tool_is_charged_to_the_dataset_that_runs_it() {
+    let m = start_mock().await;
+    let s = build(Fixture {
+        public_url: PUBLIC,
+        extra: format!(
+            r#"
+[roles.both]
+datasets = {{ "my_data" = "read", "my.data" = "read" }}
+
+[external.user_roles]
+"alice@example.org" = ["both"]
+
+[oidc]
+issuer = "{}"
+client_id = "sparkles"
+algorithms = ["RS256"]
+"#,
+            m.issuer
+        ),
+        mcp: Some(vec![]),
+        rate_limits: vec!["query=100/min", "query@my_data=1/min"],
+        ..Default::default()
+    });
+    let def = || -> sparkles::stored::Definition {
+        serde_json::from_value(json!({
+            "query": "SELECT ?x WHERE { BIND(?dataset AS ?x) }",
+            "parameters": { "dataset": { "type": "string" } }
+        }))
+        .unwrap()
+    };
+    for name in ["my_data", "my.data"] {
+        let ds = s.state.attach(name, DbType::Mem, None).unwrap();
+        ds.queries
+            .put("q", def(), sparkles::stored::Change::default())
+            .unwrap();
+    }
+    let t = bearer_of(&token(&m, json!(RESOURCE), "sparkles:read:my_data"));
+    let r = tool(&s, &t, "my_data__q", json!({"dataset": "unused"})).await;
+    assert!(r.get("isError").is_none_or(|e| e == false), "{r}");
+    let r = mcp(
+        &s,
+        Some(&t),
+        "tools/call",
+        json!({"name": "my_data__q", "arguments": {"dataset": "unused"}}),
+    )
+    .await;
+    assert_eq!(r.status, StatusCode::TOO_MANY_REQUESTS, "{}", r.text());
+}

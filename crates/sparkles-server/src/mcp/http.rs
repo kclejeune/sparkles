@@ -392,10 +392,9 @@ impl Endpoint {
         if let Some(name) = message.pointer("/params/name").and_then(Value::as_str)
             && charge.class.is_some()
             && message.get("method").and_then(Value::as_str) == Some("tools/call")
-            && !self.server.offers(name)
-            && let Some(t) = self.server.stored_tool(&p.without_oauth_scopes(), name)
+            && let Some(ds) = self.stored_dataset(&p, name)
         {
-            charge.dataset = Some(t.dataset.name.clone());
+            charge.dataset = Some(ds);
         }
         // a call without `dataset` reads the caller's only dataset
         if charge.class.is_some() && charge.dataset.is_none() {
@@ -450,7 +449,7 @@ impl Endpoint {
             Level::Read
         };
         let full = p.without_oauth_scopes();
-        let target = self.scope_target(&full, method, tool, message);
+        let target = self.scope_target(p, method, tool, message);
         let reaches =
             |who: &Principal, ds: &str| who.level_any_branch(ds).is_some_and(|l| l >= need);
         let short = match &target {
@@ -482,15 +481,33 @@ impl Endpoint {
         Some(crate::auth::insufficient_scope(p, &public, scope, &msg))
     }
 
+    /// The dataset of the stored query whose tool is `name`, or `None` for an offered
+    /// tool or a name no stored tool has. The tool that runs is the one `p` sees, so it
+    /// is looked up for `p` first. Only when `p`'s scopes hide it is it looked up for `p`
+    /// without its scope bound, which a scope check needs. Tool names are made unique
+    /// within the stored tools one principal sees, so the two lookups can differ only
+    /// in that case.
+    fn stored_dataset(&self, p: &Principal, name: &str) -> Option<String> {
+        if self.server.offers(name) || !name.contains("__") {
+            return None;
+        }
+        let t = match self.server.stored_tool(p, name) {
+            Some(t) => t,
+            None if p.oauth_scoped() => self.server.stored_tool(&p.without_oauth_scopes(), name)?,
+            None => return None,
+        };
+        Some(t.dataset.name.clone())
+    }
+
     /// The dataset a message acts on, for its scope check. A stored query's tool is
     /// bound to its dataset whatever its arguments say (a parameter may be named
-    /// `dataset`), so it is looked up among the stored tools that `full`, the principal
-    /// without its scope bound, may see. Other tools and prompts name it in `dataset`, and
-    /// a resource in its URI. `None` when the message names none.
+    /// `dataset`), so its dataset comes from [`Endpoint::stored_dataset`], and a name
+    /// with `__` that no stored tool has names no dataset. Other tools and prompts name
+    /// it in `dataset`, and a resource in its URI. `None` when the message names none.
     #[cfg(feature = "auth")]
     fn scope_target(
         &self,
-        full: &Principal,
+        p: &Principal,
         method: &str,
         tool: Option<&str>,
         message: &Value,
@@ -506,10 +523,8 @@ impl Endpoint {
         match method {
             "tools/call" => {
                 let name = tool?;
-                if !self.server.offers(name)
-                    && let Some(t) = self.server.stored_tool(full, name)
-                {
-                    return Some(t.dataset.name.clone());
+                if !self.server.offers(name) && name.contains("__") {
+                    return self.stored_dataset(p, name);
                 }
                 arg("dataset")
             }

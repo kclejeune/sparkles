@@ -65,6 +65,8 @@ pub(super) struct Fixture {
     pub gsp_direct_naming: Vec<String>,
     /// `serve --mcp` with these more MCP flags; `None`: no MCP endpoint
     pub mcp: Option<Vec<&'static str>>,
+    /// `--rate-limit` values (`query@ds=1/min`); empty: no rate limiter
+    pub rate_limits: Vec<&'static str>,
 }
 
 impl Default for Fixture {
@@ -78,6 +80,7 @@ impl Default for Fixture {
             extra: String::new(),
             gsp_direct_naming: Vec::new(),
             mcp: None,
+            rate_limits: Vec::new(),
         }
     }
 }
@@ -213,6 +216,20 @@ fn open_state(
     st.outbound.allow_private = true;
     if f.enabled {
         st.auth = Some(Arc::new(Auth::open(config, dir).unwrap().0));
+    }
+    if !f.rate_limits.is_empty() {
+        let sources = crate::ratelimit::Sources {
+            flags: f.rate_limits.iter().map(|s| s.to_string()).collect(),
+            auth: f.enabled,
+            ..Default::default()
+        };
+        st.rate_limit = sources.load().unwrap().map(|cfg| {
+            Arc::new(
+                crate::ratelimit::RateLimiter::new(&cfg)
+                    .unwrap()
+                    .with_keyer(Arc::new(crate::auth::PrincipalKeyer)),
+            )
+        });
     }
     #[cfg(feature = "mcp")]
     if let Some(flags) = &f.mcp {
