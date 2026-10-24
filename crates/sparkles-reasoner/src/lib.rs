@@ -1225,17 +1225,14 @@ fn update_closure(
     }
     progress(opts, 0.0, "reading the previous closure");
     let budget = Budget::new(opts.max_memory);
-    let prev = maintain::previous(
-        store,
-        snap,
-        since,
-        digest,
-        &graphs,
-        &resolved.ids(snap),
-        inc.cache,
-        raw,
-        &budget,
-    )?;
+    // on the run's threads: this thread may stand in for a parked worker of the pool
+    // that called, so its parallel work must not go to that pool
+    let run_ids = resolved.ids(snap);
+    let prev = exec.install(|| {
+        maintain::previous(
+            store, snap, since, digest, &graphs, &run_ids, inc.cache, raw, &budget,
+        )
+    })?;
     let mut closure = prev.closure;
     let mut ch = prev.changes;
     let _prev_held = prev.held;
@@ -1246,7 +1243,7 @@ fn update_closure(
     // the default geometries count as explicit facts, so that the update keeps the facts
     // derived from them; those of the changed features change with the explicit ones
     let touched = if extras.geo_default_geometry {
-        default_geometry_changes(&base, &mut closure, &mut ch, &budget)?
+        exec.install(|| default_geometry_changes(&base, &mut closure, &mut ch, &budget))?
     } else {
         Vec::new()
     };
