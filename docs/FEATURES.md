@@ -1614,10 +1614,12 @@ links each item to its design spec.
   imported memory to personal notes, decisions and tasks with evidence, dependency and
   validity semantics. Roadmap item 81.
 * A dataset has one GraphRAG configuration, so readers with different views cannot each
-  have reports built from their own view, roadmap item 100. Global answering has not been
-  evaluated against local answers and text retrieval, an automatic refresh counts changes
-  from the change feed rather than from an incremental view, and the byte bound's default
-  allowances are unmeasured, item 12.
+  have reports built from their own view, roadmap item 100. The evaluation of global
+  answering covers one generated question set on the demo graph, compares it with BM25
+  rather than vector retrieval and has no samples checked by a person, items 260 and 261.
+  `auto` mode answers about half of the questions about the whole graph locally, item
+  262. An automatic refresh counts changes from the change feed rather than from an
+  incremental view, item 12.
 
 ### Web UI
 
