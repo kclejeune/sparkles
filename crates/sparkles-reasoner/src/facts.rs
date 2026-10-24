@@ -979,6 +979,39 @@ mod tests {
             Ok(true)
         })
         .unwrap();
+        // a store opened afresh has an empty block cache and no block read whole yet:
+        // point and sorted probes of a few facts there decode segments and no whole
+        // column, and answer as the scan does
+        drop(snap);
+        drop(store);
+        let store = Store::open(&dir.path().join("db"), StoreOptions::default()).unwrap();
+        let snap = store.snapshot();
+        let gspo = snap.perm(Perm::Gspo);
+        {
+            let base = Base::new(snap.clone(), &[g]).unwrap();
+            let have: rustc_hash::FxHashSet<Triple> = all.iter().copied().collect();
+            let mut probes: Vec<Triple> = Vec::new();
+            for _ in 0..3 {
+                let t = all[next(all.len() as u64) as usize];
+                let other = [t[0], t[1], all[next(all.len() as u64) as usize][2]];
+                assert!(base.contains(&t).unwrap());
+                assert_eq!(base.contains(&other).unwrap(), have.contains(&other));
+                probes.extend([t, other]);
+            }
+            probes.sort_unstable();
+            probes.dedup();
+            let want: Vec<bool> = probes.iter().map(|t| have.contains(t)).collect();
+            assert_eq!(base.contains_sorted(&probes).unwrap(), want);
+            assert!(snap.cache.misses() > 0, "the probes decoded nothing");
+            for b in 0..gspo.blocks.len() {
+                for c in 0..4 {
+                    assert!(
+                        !snap.cache.has_cols(gspo, b, 1 << c),
+                        "the probes decoded column {c} of block {b} whole"
+                    );
+                }
+            }
+        }
         let budget = Budget::unlimited();
         for round in 0..2 {
             for i in 0..100 {
