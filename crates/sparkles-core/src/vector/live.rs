@@ -284,17 +284,24 @@ impl LiveState {
     }
 
     /// The bottom layer as the projection's neighbour layout reads it: the frozen node
-    /// count, the pair of each live node, the links of each live node, and the
-    /// replacement links of frozen nodes. A copy, so the layout does not hold the lock.
-    pub fn layer0(&self) -> Layer0 {
+    /// count, the live nodes whose pair `visible` accepts with their links, and the
+    /// replacement links of frozen nodes. A copy, so the layout does not hold the lock,
+    /// and bounded by the pairs the projection's snapshot holds, however far the layer
+    /// has grown since.
+    pub fn layer0(&self, visible: &dyn Fn((u64, u64)) -> bool) -> Layer0 {
+        let mut live = Vec::new();
+        let mut links = FxHashMap::default();
+        for (i, key) in self.keys.iter().enumerate() {
+            if visible(*key) {
+                let x = self.base + i as u32;
+                live.push((x, *key));
+                links.insert(x, self.links[i].first().cloned().unwrap_or_default());
+            }
+        }
         Layer0 {
             base: self.base,
-            keys: self.keys.clone(),
-            links: self
-                .links
-                .iter()
-                .map(|l| l.first().cloned().unwrap_or_default())
-                .collect(),
+            live,
+            links,
             side: self
                 .side
                 .iter()
@@ -317,19 +324,20 @@ impl LiveState {
 pub struct Layer0 {
     /// the frozen graph's node count
     pub base: u32,
-    /// the (subject, object) pair of each live node
-    pub keys: Vec<(u64, u64)>,
-    /// the bottom-layer links of each live node
-    pub links: Vec<Vec<u32>>,
+    /// the live nodes copied, with their (subject, object) pairs
+    pub live: Vec<(u32, (u64, u64))>,
+    /// the bottom-layer links of each live node copied
+    pub links: FxHashMap<u32, Vec<u32>>,
     /// replacement bottom-layer links of frozen nodes
     pub side: FxHashMap<u32, Vec<u32>>,
 }
 
 impl Layer0 {
-    /// The bottom-layer links of node `x` with the frozen graph `g` below.
+    /// The bottom-layer links of node `x` with the frozen graph `g` below. A live node
+    /// that was not copied has none.
     pub fn links(&self, g: &Graph, x: u32, out: &mut Vec<u32>) {
         if x >= self.base {
-            if let Some(v) = self.links.get((x - self.base) as usize) {
+            if let Some(v) = self.links.get(&x) {
                 out.extend_from_slice(v);
             }
         } else if let Some(v) = self.side.get(&x) {

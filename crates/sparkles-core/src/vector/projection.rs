@@ -36,7 +36,7 @@ pub const MAX_POINTS: usize = 50_000;
 pub const GRID: usize = 256;
 /// The directions of the subspace iteration: the two components and six more, which make
 /// the two leading ones converge in a few rounds.
-const BLOCK: usize = 8;
+pub const BLOCK: usize = 8;
 /// Rounds of subspace iteration.
 const ROUNDS: usize = 8;
 /// No class, in [`Projection::classes`].
@@ -57,7 +57,7 @@ pub struct Work {
     pub method: Option<ProjectionMethod>,
     /// the bottom-layer links of a graph node, `2M`
     pub links: usize,
-    /// the nodes of the graph's live layer, whose bottom layer the layout copies
+    /// the live nodes the layout copies: at most the snapshot's inserted pairs
     pub live_nodes: usize,
     /// the threads the parallel steps run on
     pub threads: usize,
@@ -78,16 +78,18 @@ pub fn working_bytes(w: Work) -> u64 {
     let mut bytes = rows * (per_row + per_point)
         + w.inserted as u64 * dim * 4
         + (w.sample as u64).min(rows) * dim * 8
-        // the PCA's blocks of directions and the accumulators of its parallel folds, and a
-        // row's buffer per thread when every row is projected
-        + (2 * threads + 4) * k * dim * 8
+        // the PCA's blocks of directions and its accumulators, one per thread, and a row's
+        // buffer per thread when every row is projected
+        + (threads + 4) * k * dim * 8
         + threads * dim * 8
         + 64 * 64 * 8;
     if w.method == Some(ProjectionMethod::Neighbours) {
         let links = w.links as u64;
-        // the live layer's copy, an edge kept, both directions of the adjacency, and the
+        // the inserted pairs, the copy of their live nodes and of the frozen nodes'
+        // replacement links, an edge kept, both directions of the adjacency, and the
         // layout's positions and grid
-        bytes += w.live_nodes as u64 * (16 + links * 4 + 24)
+        bytes += w.live_nodes as u64 * (32 + 16 + links * 4 + 32)
+            + rows * links * 4
             + rows * (links * (8 + 8) + 32)
             + 512 * 512 * 12;
     }
@@ -109,8 +111,8 @@ pub struct Neighbours<'a> {
     pub links: Links<'a>,
     /// the first base row of each frozen node; nodes past its end are live
     pub node_rows: &'a [u32],
-    /// the (subject, object) pair of each live node, in node order after the frozen ones
-    pub live_keys: &'a [(u64, u64)],
+    /// the live nodes the snapshot holds a row of, with their (subject, object) pairs
+    pub live: &'a [(u32, (u64, u64))],
 }
 
 const RDF_TYPE: &str = "http://www.w3.org/1999/02/22-rdf-syntax-ns#type";
@@ -480,22 +482,21 @@ fn layout_edges(
     point_of_row: &[u32],
 ) -> Vec<(u32, u32)> {
     let frozen = g.node_rows.len();
+    let live: rustc_hash::FxHashMap<u32, (u64, u64)> = g.live.iter().copied().collect();
     let row_of = |x: u32| -> Option<usize> {
-        let x = x as usize;
-        if x < frozen {
+        if (x as usize) < frozen {
             based
-                .get(g.node_rows[x] as usize)
+                .get(g.node_rows[x as usize] as usize)
                 .copied()
                 .filter(|&k| k != usize::MAX)
         } else {
-            g.live_keys
-                .get(x - frozen)
-                .and_then(|key| inserted.get(key).copied())
+            live.get(&x).and_then(|key| inserted.get(key).copied())
         }
     };
     let mut edges: Vec<(u32, u32)> = Vec::new();
     let mut out = Vec::new();
-    for x in 0..(frozen + g.live_keys.len()) as u32 {
+    let nodes = (0..frozen as u32).chain(g.live.iter().map(|(x, _)| *x));
+    for x in nodes {
         let Some(a) = row_of(x) else {
             continue;
         };
@@ -561,33 +562,36 @@ pub fn principal(
         })
         .collect();
     orthonormalize(&mut q);
-    // Z = Xᵀ X Q, a pass over the sample per round
+    // Z = Xᵀ X Q, a pass over the sample per round, in one part per thread so that at
+    // most that many accumulators are alive at once
+    let parts = rayon::current_num_threads().clamp(1, m.max(1));
+    let per = m.div_ceil(parts).max(1);
     let times = |q: &[Vec<f64>]| -> Vec<Vec<f64>> {
-        sample
-            .par_chunks(dim)
-            .fold(
-                || vec![vec![0f64; dim]; q.len()],
-                |mut acc, row| {
+        let sums: Vec<Vec<Vec<f64>>> = sample
+            .par_chunks(per * dim.max(1))
+            .map(|part| {
+                let mut acc = vec![vec![0f64; dim]; q.len()];
+                for row in part.chunks(dim.max(1)) {
                     for (a, c) in acc.iter_mut().zip(q) {
                         let y: f64 = row.iter().zip(c).map(|(x, w)| x * w).sum();
                         for (t, x) in a.iter_mut().zip(row) {
                             *t += y * x;
                         }
                     }
-                    acc
-                },
-            )
-            .reduce(
-                || vec![vec![0f64; dim]; q.len()],
-                |mut a, b| {
-                    for (x, y) in a.iter_mut().zip(b) {
-                        for (s, t) in x.iter_mut().zip(y) {
-                            *s += t;
-                        }
-                    }
-                    a
-                },
-            )
+                }
+                acc
+            })
+            .collect();
+        let mut it = sums.into_iter();
+        let mut total = it.next().unwrap_or_else(|| vec![vec![0f64; dim]; q.len()]);
+        for b in it {
+            for (x, y) in total.iter_mut().zip(b) {
+                for (s, t) in x.iter_mut().zip(y) {
+                    *s += t;
+                }
+            }
+        }
+        total
     };
     for _ in 0..ROUNDS {
         check()?;
@@ -879,7 +883,7 @@ mod tests {
         let g = Neighbours {
             links: &f,
             node_rows: &[0, 1],
-            live_keys: &[(7, 70), (8, 80)],
+            live: &[(2, (7, 70)), (3, (8, 80))],
         };
         let based = vec![0, usize::MAX];
         let mut inserted = rustc_hash::FxHashMap::default();

@@ -688,8 +688,11 @@ the first `rdf:type` of an entity in the store's order.
 least recently used dropped first. The query memory pool pays for the computation before
 it allocates. The store computes an upper bound of the working memory from the same
 snapshot and build that the computation then reads, counting the rows, the sample, the
-PCA's blocks and fold accumulators per thread, the points and, for the neighbour layout,
-the copy of the live layer and the edges, and passes it to an admission callback. In the
+PCA's blocks and its accumulators, which it keeps to one per thread by splitting the
+sample into one part per thread, the points and, for the neighbour layout, the copy of the
+live layer and the edges, and passes it to an admission callback. The layout copies only
+the live nodes of pairs the snapshot inserted, so a live layer that grew after the
+admission cannot make the copy larger than what was admitted. In the
 request the callback charges the request's admission grant, and the charge lives in the
 blocking worker, so it stays paid for while a computation whose client went away runs to
 its next cancellation check. A task waits in the pool's queue for a grant of its own,

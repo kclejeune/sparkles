@@ -321,9 +321,8 @@ impl Store {
         // the memory the computation holds, admitted before it is allocated, from the
         // same snapshot and build the computation reads
         let pi = crate::index::Perm::Pso.index();
-        let inserted = snap.delta.ins[pi]
-            .range([pred, 0, 0, 0]..=[pred, u64::MAX, u64::MAX, u64::MAX])
-            .count();
+        let range = [pred, 0, 0, 0]..=[pred, u64::MAX, u64::MAX, u64::MAX];
+        let inserted = snap.delta.ins[pi].range(range.clone()).count();
         admit(crate::vector::projection::working_bytes(
             crate::vector::projection::Work {
                 rows: b.segment.rows() + inserted,
@@ -332,20 +331,20 @@ impl Store {
                 sample: cfg.sample,
                 method: Some(cfg.method),
                 links: graph.as_ref().map_or(0, |g| 2 * g.m),
-                live_nodes: if neighbours_wanted {
-                    b.live.read().nodes()
-                } else {
-                    0
-                },
+                live_nodes: if neighbours_wanted { inserted } else { 0 },
                 threads: rayon::current_num_threads(),
             },
         ))?;
         // the live layer's bottom layer, copied for the neighbour layout only, so that the
-        // layout holds no lock
-        let layer = graph
-            .as_ref()
-            .filter(|_| neighbours_wanted)
-            .map(|_| b.live.read().layer0());
+        // layout holds no lock, and only for the pairs this snapshot inserted, which the
+        // admission counted: the layer is shared and may have grown since
+        let layer = graph.as_ref().filter(|_| neighbours_wanted).map(|_| {
+            let pairs: rustc_hash::FxHashSet<(u64, u64)> = snap.delta.ins[pi]
+                .range(range.clone())
+                .map(|k| (k[1], k[2]))
+                .collect();
+            b.live.read().layer0(&|k| pairs.contains(&k))
+        });
         let links = match (graph.as_ref(), layer.as_ref()) {
             (Some(g), Some(l)) => Some(move |x: u32, out: &mut Vec<u32>| l.links(g, x, out)),
             _ => None,
@@ -354,7 +353,7 @@ impl Store {
             (Some(f), Some(l)) => Some(crate::vector::projection::Neighbours {
                 links: f as &(dyn Fn(u32, &mut Vec<u32>) + Sync),
                 node_rows: &b.node_rows,
-                live_keys: &l.keys,
+                live: &l.live,
             }),
             _ => None,
         };
