@@ -1504,6 +1504,29 @@ mod imp {
     /// at most once per this many raced ticks.
     const RACED_BEFORE_LOCKED: u32 = 3;
 
+    /// Record one background checkpoint at debug level under the target
+    /// `sparkles::text::checkpoint`: how long the tick held the live writer lock before
+    /// its file synchronization, how long the synchronization took, and how long text
+    /// publication was kept out in all.
+    fn note_checkpoint(
+        mode: &'static str,
+        before_io: Duration,
+        io: Duration,
+        live_held: Duration,
+        outcome: &std::io::Result<bool>,
+    ) {
+        tracing::debug!(
+            target: "sparkles::text::checkpoint",
+            mode,
+            before_io_us = before_io.as_micros() as u64,
+            io_us = io.as_micros() as u64,
+            live_held_us = live_held.as_micros() as u64,
+            cleared = matches!(outcome, Ok(true)),
+            failed = outcome.is_err(),
+            "full-text background checkpoint"
+        );
+    }
+
     /// Staged operations at which a write seals its batch itself. Commit time grows with
     /// the batch (roughly 20 ms for 10k operations, 55 ms for 40k, measured on 1k-triple
     /// updates), and the first search after a burst would pay it.
@@ -2989,6 +3012,7 @@ mod imp {
                 return false;
             }
             let mut live = self.live.lock();
+            let held = Instant::now();
             if live.writer.is_none() || !self.healthy() {
                 return false;
             }
@@ -3017,7 +3041,11 @@ mod imp {
                 // count starts again either way, so a merge that races this attempt
                 // does not make the next ticks hold live as well.
                 live.raced = 0;
-                match dir.prepare_checkpoint().run() {
+                let before_io = held.elapsed();
+                let io = Instant::now();
+                let result = dir.prepare_checkpoint().run();
+                note_checkpoint("locked", before_io, io.elapsed(), held.elapsed(), &result);
+                match result {
                     Ok(true) => live.dirty_since = None,
                     Ok(false) => {}
                     Err(e) => self.fail_locked(&mut live, &e.into()),
@@ -3026,10 +3054,13 @@ mod imp {
             }
             let generation = live.commit_generation;
             let checkpoint = dir.prepare_checkpoint();
+            let before_io = held.elapsed();
             drop(live);
             // File syncing can wait for many journal commits. Publication needs live,
             // so keep only the pathname lease during this background I/O.
+            let io = Instant::now();
             let result = checkpoint.run();
+            let io = io.elapsed();
             #[cfg(test)]
             {
                 let hook = self.after_checkpoint_io.lock().take();
@@ -3044,6 +3075,7 @@ mod imp {
             if live.writer.is_none() || !live.dir.as_ref().is_some_and(|d| d.same_directory(&dir)) {
                 return true;
             }
+            note_checkpoint("unlocked", before_io, io, before_io, &result);
             match result {
                 Ok(true) => {
                     live.raced = 0;
