@@ -86,7 +86,13 @@ impl Vis {
         if !g_ok {
             return false;
         }
-        let Some(t) = a.triples.as_ref().filter(|t| t.hides()) else {
+        // protections that depend on the data make the whole query one `recompute`
+        // node, which reads the masked snapshot: the delta is not filtered by them
+        let Some(t) = a
+            .triples
+            .as_ref()
+            .filter(|t| t.hides() && t.state_independent())
+        else {
             return true;
         };
         *self

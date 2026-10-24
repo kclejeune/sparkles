@@ -328,7 +328,7 @@ pub fn list(dir: &Path) -> Vec<(u64, PathBuf)> {
             Some((n.parse().ok()?, e.path()))
         })
         .collect();
-    out.sort_by(|a, b| b.0.cmp(&a.0));
+    out.sort_by_key(|e| std::cmp::Reverse(e.0));
     out
 }
 

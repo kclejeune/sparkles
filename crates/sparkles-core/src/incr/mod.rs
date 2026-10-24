@@ -13,24 +13,26 @@
 pub mod circuit;
 pub mod compile;
 pub mod footprint;
-// pub mod live;
+pub mod live;
 pub mod ops;
 pub mod pass;
 pub mod persist;
-// pub mod runtime;
+pub mod runtime;
 pub mod terms;
-// pub mod views;
+pub mod views;
 pub mod zset;
 
+#[cfg(test)]
+mod runtime_tests;
 #[cfg(test)]
 mod tests;
 
 pub use circuit::{Circuit, DeltaSet};
 pub use compile::{Compiled, Kind, compile};
-// pub use live::{LiveEvent, LiveOptions, LiveQuery, LiveRow};
+pub use live::{LiveEvent, LiveOptions, LiveQuery, LiveRow};
 pub use ops::{Mode, PlanNode};
-// pub use runtime::{Runtime, RuntimeOptions, RuntimeStats};
-// pub use views::{ViewDef, ViewInfo, ViewState};
+pub use runtime::{Host, OpenHost, Runtime, RuntimeOptions, RuntimeStats};
+pub use views::{ViewDef, ViewInfo, ViewState};
 
 /// The IRI of the local SERVICE that reads a `table` view (`view:read`).
 pub const VIEW_READ: &str = "urn:x-sparkles:view#read";

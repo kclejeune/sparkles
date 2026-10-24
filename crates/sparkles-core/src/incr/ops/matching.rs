@@ -245,6 +245,7 @@ impl MatchOp {
                 touched.insert(a.clone(), v);
             }
         }
+        #[allow(clippy::type_complexity)]
         let mut new: Vec<(Row, (i64, i64), (i64, i64))> = Vec::with_capacity(touched.len());
         for (a, (ow, om)) in touched {
             let nw = ow + dw.get(&a).copied().unwrap_or(0);

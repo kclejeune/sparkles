@@ -342,6 +342,17 @@ pub const VALIDATION_TYPING: FileKind = FileKind {
     reads: &[1],
 };
 
+/// The checkpoints of incremental views (spec F13 §8.4). A version this build does not
+/// read is left in place and the view is built again from the data.
+pub const VIEW_STATE: FileKind = FileKind {
+    id: "view-state",
+    files: "views/NAME/BRANCH/state-COMMIT.bin",
+    marker: "the u32 after the `SPKVIEW` magic; another version is ignored and the view rebuilt",
+    class: Class::Derived,
+    writes: 1,
+    reads: &[1],
+};
+
 /// The spill files of cursor operators that outgrow their memory budget. Only the
 /// process that wrote a file reads it, and a start removes what dead processes left.
 pub const SPILL: FileKind = FileKind {
@@ -480,6 +491,7 @@ pub const KINDS: &[&FileKind] = &[
     &VECTOR,
     &GEO,
     &VALIDATION_TYPING,
+    &VIEW_STATE,
     &SPILL,
     &BACKUP_LAYOUT,
     &BACKUP_BLOB,
@@ -579,6 +591,8 @@ pub const SETTINGS: &[SettingsFile] = &[
     ds("graphrag.json", 1),
     ds("paths.json", 1),
     ds("forms.json", 1),
+    // a view's definition, `views/NAME/view.json`
+    ds("view.json", 1),
     named(ds("graphrag/state.json", 2), "version"),
     named(ds("graphrag/ledger.json", 1), "version"),
     // the data directory
@@ -873,6 +887,11 @@ mod tests {
         assert_eq!(VECTOR.writes, crate::vector::config::FORMAT_VERSION);
         assert_eq!(GEO.writes, crate::geo::config::FORMAT_VERSION);
         assert_eq!(SPILL.writes, u32::from(crate::spill::FORMAT_VERSION));
+        assert_eq!(VIEW_STATE.writes, crate::incr::persist::FORMAT);
+        assert_eq!(
+            crate::incr::views::FORMAT,
+            settings_file(crate::incr::views::FILE).unwrap().writes
+        );
         assert_eq!(
             crate::stored::FORMAT,
             settings_file(crate::stored::FILE).unwrap().writes
