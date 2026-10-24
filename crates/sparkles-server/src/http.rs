@@ -750,6 +750,13 @@ impl From<Error> for ApiError {
             Error::Branch(b) => {
                 StatusCode::from_u16(b.status()).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR)
             }
+            // query-time reasoning past a limit, or with rules it cannot evaluate
+            Error::Component(c)
+                if c.component == "reasoner"
+                    && matches!(c.code.as_str(), "reasoning-budget" | "reasoning-rules") =>
+            {
+                StatusCode::UNPROCESSABLE_ENTITY
+            }
             // a write handler answers a dry run with its preview before errors are mapped
             _ => StatusCode::INTERNAL_SERVER_ERROR,
         };
@@ -771,6 +778,9 @@ impl From<Error> for ApiError {
                 "limit": b.limit,
                 "requested": b.requested,
             }),
+            Error::Component(c) if c.component == "reasoner" => {
+                json!({ "error": msg, "code": c.code })
+            }
             _ => json!({ "error": msg }),
         };
         ApiError(status, body)
@@ -1206,6 +1216,79 @@ fn query_options(st: &AppState, ds: &Dataset, params: &Params) -> QueryOptions {
     }
 }
 
+/// Query-time reasoning a query asks for with `reasoning=demand` (spec F17 Phase 1): the
+/// reasoner of the dataset, with the profile `reasoningProfile` names or the last
+/// materialization's, and at most `maxDerived` derived facts, never more than the
+/// server's `--reason-max-derived`. `reasoning=auto` is refused until the cost-based
+/// choice of Phase 2 exists.
+fn query_reasoning(
+    st: &AppState,
+    ds: &Dataset,
+    params: &Params,
+    opts: &mut QueryOptions,
+) -> ApiResult<()> {
+    match params.get("reasoning") {
+        Some("demand") => {}
+        Some("auto") => {
+            return Err(err_code(
+                StatusCode::BAD_REQUEST,
+                "reasoning-mode",
+                "reasoning=auto is not available yet; use demand, materialized or false",
+            ));
+        }
+        _ => return Ok(()),
+    }
+    #[cfg(feature = "reasoning")]
+    {
+        let profile = match params.get("reasoningProfile") {
+            None => None,
+            Some(p) => Some(p.parse::<sparkles_reasoner::Profile>().map_err(|e| {
+                err_code(StatusCode::BAD_REQUEST, "reasoning-profile", e.to_string())
+            })?),
+        };
+        let max = match params.get("maxDerived") {
+            None => st.reason_max_derived,
+            Some(v) => match v.parse::<usize>() {
+                Ok(n) if n > 0 => n.min(st.reason_max_derived),
+                _ => {
+                    return Err(err(
+                        StatusCode::BAD_REQUEST,
+                        "maxDerived must be a positive integer",
+                    ));
+                }
+            },
+        };
+        let reasoner = ds.dataset.query_reasoner(profile)?.with_max_derived(max);
+        opts.reasoning = Some(reasoner.provider());
+        Ok(())
+    }
+    #[cfg(not(feature = "reasoning"))]
+    {
+        let _ = (st, ds, opts);
+        Err(err(
+            StatusCode::NOT_IMPLEMENTED,
+            "built without the `reasoning` feature",
+        ))
+    }
+}
+
+/// Add `Sparkles-Reasoning` to the response of a query that derived facts on demand.
+pub(crate) fn with_reasoning(
+    mut r: Response,
+    applied: Option<&sparkles::sparql::reasoning::Applied>,
+) -> Response {
+    if let Some(a) = applied
+        && let Ok(v) = header::HeaderValue::from_str(&a.header())
+    {
+        r.headers_mut().insert(SPARKLES_REASONING, v);
+    }
+    r
+}
+
+/// The response header that says what query-time reasoning derived (spec F17 §2.3).
+pub(crate) const SPARKLES_REASONING: header::HeaderName =
+    header::HeaderName::from_static("sparkles-reasoning");
+
 // ------------------------------------------------------------------ SPARQL ------
 
 async fn dataset_root(
@@ -1373,6 +1456,7 @@ pub(crate) async fn run_query(
         }
     };
     let mut opts = query_options(&st, &ds, &params);
+    query_reasoning(&st, &ds, &params, &mut opts)?;
     // budgets the request asked for, never above the server's
     let asked = budgets::Overrides::parse(&params)?;
     asked.apply(&mut opts);
@@ -1556,6 +1640,7 @@ pub(crate) async fn run_query(
         }
     };
     let algorithmic = r.ctx.calls_algorithm();
+    let derived = r.ctx.reasoning.clone();
     let query_ms = r.timing.total_ms;
     let cells = r.len().saturating_mul(r.vars.len().max(3));
     let is_ask = r.kind == QueryKind::Ask;
@@ -1708,10 +1793,11 @@ pub(crate) async fn run_query(
         );
     }
     let resp = history::history_headers(resp, resolved.as_ref(), &uri);
+    let resp = with_reasoning(resp, derived.as_deref());
     // freshness is reported for the live state only
     let mut resp = match &resolved {
         Some(r) if r.historical => resp,
-        _ => with_inferences(resp, &ds, with_extra, seq),
+        _ => with_inferences(resp, &ds, with_extra && derived.is_none(), seq),
     };
     match deferred {
         Some(deferred) => {
@@ -2496,6 +2582,7 @@ async fn explain(
         params.get("query").unwrap_or_default().to_string()
     };
     let mut opts = query_options(&st, &ds, &params);
+    query_reasoning(&st, &ds, &params, &mut opts)?;
     crate::auth::restrict(&mut opts, &p, &ds.name, crate::auth::Endpoint::Query);
     let at = history::at_param(&params)?;
     blocking(move || {

@@ -493,6 +493,11 @@ button in Explore and the page `/datasets/{name}/edit`.
 * The `forms` settings are read from `main`, so every branch of a dataset uses the same
   form settings.
 * A change counts each replaced, added or removed value once in the form's summary.
+* The Python binding is `Dataset.forms.model`, `check` and `save`, which take and return
+  the HTTP route's JSON as dicts and take the `forms` setting as a `settings` dict. A save
+  that meets a conflict raises `ConflictError` with the code `form-conflict` and the
+  fields. A session branch is edited through `Dataset.branch(name).forms`. The Node.js and
+  JVM bindings remain planned in `bindings.toml`.
 
 **Open questions.** Question 4 is settled: `dash:readOnly` is enforced on the server, and a
 save that changes such a field answers `403`. For question 3, a removed value is deleted

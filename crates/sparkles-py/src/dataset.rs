@@ -1403,6 +1403,11 @@ impl PyDataset {
     }
 
     #[getter]
+    fn forms(slf: Py<Self>) -> crate::forms::PyForms {
+        crate::forms::PyForms { owner: slf }
+    }
+
+    #[getter]
     fn queries(slf: Py<Self>) -> crate::queries::PyStoredQueries {
         crate::queries::PyStoredQueries { owner: slf }
     }

@@ -1861,7 +1861,10 @@ Query parameters beyond the standard protocol:
   end. A SPARQL LIMIT ends the query normally.
 * `reasoning=true|false` includes or excludes materialized inferences. The default is
   `true` if the dataset has any. `reasoning=false` also turns [RDFS on read](#rdfs-on-read)
-  off for the request, so that it reads the asserted data alone. The UI's inferred-edge
+  off for the request, so that it reads the asserted data alone. `reasoning=demand`
+  derives the facts the query needs from the rules instead, with `reasoningProfile` and
+  `maxDerived` ([Query-time reasoning](#query-time-reasoning)). `materialized` is the
+  same as `true`. The UI's inferred-edge
   lens compares a read with and without reasoning this way.
 * `nocache=true` bypasses the query result cache, so nothing is read from it or stored in
   it. It is meant for benchmarking, and `explain` accepts it too. `sparkles serve
@@ -7285,6 +7288,76 @@ pattern with many answers takes 8 to 35 times as long as over materialized infer
 The materialized counts are larger because `rdfs-simple` also inherits domains and
 ranges through subproperties.
 
+## Query-time reasoning
+
+The design is in [F17](specs/F17-query-time-reasoning.md), and its
+[Outcome](specs/F17-query-time-reasoning.md#outcome) records what Phase 1 built.
+
+`reasoning=demand` derives, as the query runs, the facts its patterns need from the
+rules of a profile, and the query does not read the inferred graph. A materialization is
+not needed. The rules are those of `rdfs`, `rdfs-simple` or `owl-rl`, chosen with
+`reasoningProfile`, or the profile of the dataset's last materialization when the request
+names none. Its Jena rules come from the rules of that materialization, and Jena backward
+rules (`head <- body`), which materialization skips, answer this way.
+
+```sh
+curl -G localhost:3030/ds/sparql --data-urlencode 'query=SELECT ?x { ?x a ex:Person }' \
+  --data-urlencode reasoning=demand --data-urlencode reasoningProfile=owl-rl
+sparkles query --loc db --reasoning demand --profile owl-rl 'SELECT ?x { ?x a ex:Person }'
+sparkles query --loc db --reasoning demand --rules family.rules --explain 'SELECT ...'
+```
+
+Each triple pattern that rules can give facts for becomes a demand, with the pattern's
+constants bound. A pattern whose subject or object an earlier pattern of its group binds
+is seeded with that pattern's values, up to 10,000 of them. The demand (magic sets)
+transformation rewrites the rules for each demand, so that only the facts that can reach
+its answers are derived. LUBM query 1 at 100 universities under OWL 2 RL derives no facts
+beyond the schema, where a materialization derives 10.9 million.
+
+* The response carries `Sparkles-Reasoning: demand; derived=48211; tables=3; cached=2`,
+  the facts derived for the query, the tables it used and how many came from the cache.
+* EXPLAIN shows a `Reason` node over the plan with a `Derive` node per pattern. Its
+  counters give the adornment (such as `rdf:type^fbb`, subject free and predicate and
+  object bound), the rules the pattern can depend on, how it was seeded (`constants` or
+  `join`) and, after a run, the facts derived and the seeds.
+* `maxDerived` caps the facts one query derives. The default and the ceiling are set by
+  `serve --reason-max-derived` (1,000,000, and `0` for no limit). Magic facts, the
+  bookkeeping of the transformation, do not count, and they are charged to the query's
+  memory budget like the derived facts. A query past the cap fails with `422` and the code
+  `reasoning-budget`, naming the rule that produced the most facts. The query's timeout
+  and cancellation stop a derivation too.
+* A rule set whose `noValue` reads facts that depend on its own rule is not stratified
+  and fails with `422` and the code `reasoning-rules`.
+* Derived tables are cached per snapshot, rules and view, so a repeated query reads them.
+  `nocache=true` bypasses the tables but not the dataset's schema, which is derived once
+  per snapshot.
+* A derivation reads the caller's view, so protections that hide triples apply to it.
+  Unlike materialized inferences, which callers with protections cannot read, derived
+  facts follow only from triples the caller can see.
+* With [RDFS on read](#rdfs-on-read) set, `reasoning=demand` applies instead and EXPLAIN
+  says so.
+* `reasoning=auto`, the cost-based choice between the inferred graph and derivation,
+  answers `400` until F17 Phase 2.
+* A DESCRIBE with `reasoning=demand` fails with `501` and the code `unsupported`, since
+  the description reads facts that no pattern asks for. CONSTRUCT with the description's
+  patterns gives the derived facts.
+* The facts copied into a query's view are charged to its memory budget, also when they
+  come from cached tables.
+
+Under OWL 2 RL, the rules are first specialized to the dataset's schema: the schema's
+facts are derived once per snapshot, and each rule that joins a schema fact with an
+instance fact becomes one rule per schema binding. A demand then asks only for the
+properties and classes that can give its answers. A query that reads schema facts, with
+a variable predicate, a variable class or a schema predicate such as `rdfs:subClassOf`,
+uses the rules as they are. Equality (`owl:sameAs`) is derived in full in a stage of its
+own before the query's demands when rules derive and read it, and its rules are left out
+when no `owl:sameAs` fact can hold.
+
+Queries that touch many facts derive them all. `?x a ub:Student` derives the types of
+every person, and such queries take tens to hundreds of times as long as over a
+materialization. [F17's Outcome](specs/F17-query-time-reasoning.md#outcome) has the LUBM
+measurements.
+
 ## Write-time validation
 
 The design and its rationale are in [C10 Write-time SHACL validation](specs/C10-write-time-validation.md). The ShEx guard is described in [G02 ShEx](specs/G02-shex.md).
@@ -7801,6 +7874,12 @@ Each result carries the `field` it belongs to, which is the field whose path is 
 result's `sh:resultPath` on the focus node, or `null` for a result on another node. A
 caller whose grants limit the graphs or triples it reads gets `withheld: true` and no
 results, as the validation routes withhold reports from such callers.
+
+The Rust library gives the same answers through `ds.forms().model`, `check` and `save`.
+Python binds them as `ds.forms.model(focus, class_=…, settings=…, at=…)`,
+`ds.forms.check(change, settings=…)` and `ds.forms.save(change, settings=…)`, which
+return dicts with the members above. A conflicting save raises `ConflictError` with the
+code `form-conflict` and the fields in `fields`. The Node.js and JVM bindings are planned.
 
 `save` compares `expect` with the stored values of the changed fields while it holds the
 writer lock. When one differs, it answers `409` with code `form-conflict` and the current

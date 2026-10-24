@@ -15,6 +15,7 @@ mod branches;
 mod catalog;
 mod dataset;
 mod errors;
+mod forms;
 mod graphql;
 mod handles;
 mod indexes;
@@ -73,6 +74,7 @@ fn _sparkles(m: &Bound<'_, PyModule>) -> PyResult<()> {
     queries::register(m)?;
     algorithms::register(m)?;
     overview::register(m)?;
+    forms::register(m)?;
     rdflib_nodes::register(m)?;
     m.add_class::<dataset::PyDataset>()?;
     m.add_class::<txn::PyTransaction>()?;

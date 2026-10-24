@@ -397,6 +397,38 @@ impl Dataset {
         self.inner.reasoning.read().clone()
     }
 
+    /// The query-time reasoner of this dataset (spec F17), for
+    /// [`QueryOptions::reasoning`] with `reasoner.provider()`. With `profile`, it has
+    /// that profile's rules. Without, it has the profile and the custom rules of the last
+    /// materialization, and fails when the dataset has none. Either way it reads the input
+    /// graphs of the last materialization (the default graph and its imports when there is
+    /// none), and the vocabularies of the last materialization when the profile is the
+    /// same. Backward rules of a custom rule set take part, which materialization skips.
+    #[cfg(feature = "reasoning")]
+    pub fn query_reasoner(
+        &self,
+        profile: Option<sparkles_reasoner::Profile>,
+    ) -> Result<sparkles_reasoner::query::QueryReasoner> {
+        let record = self.reasoning_record();
+        let profile = match (profile, &record) {
+            (Some(p), _) => p,
+            (None, Some(r)) => r.profile()?,
+            (None, None) => {
+                return Err(Error::invalid(
+                    "query-time reasoning needs a profile: name one, or materialize the \
+                     dataset first so that its profile applies",
+                ));
+            }
+        };
+        let (extras, inputs) = match &record {
+            Some(r) if r.profile == profile.name() => (r.extras()?, r.run_inputs()?),
+            Some(r) => (Default::default(), r.run_inputs()?),
+            None => (Default::default(), Default::default()),
+        };
+        sparkles_reasoner::query::QueryReasoner::new(profile, &extras, inputs)
+            .map_err(crate::handles::from_anyhow)
+    }
+
     /// Where a clone was made from: the `origin.json` of a persistent clone, or what an
     /// in-memory clone keeps.
     pub fn origin(&self) -> Option<&serde_json::Value> {

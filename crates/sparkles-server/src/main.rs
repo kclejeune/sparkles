@@ -1221,6 +1221,10 @@ enum Cmd {
         /// run of the server; a request may ask for fewer with `maxInferred` (0: no limit)
         #[arg(long, value_name = "N", default_value_t = state::DEFAULT_REASON_MAX_INFERRED)]
         reason_max_inferred: usize,
+        /// The facts one query's query-time reasoning (`reasoning=demand`) may derive,
+        /// magic facts aside; a request may ask for fewer with `maxDerived` (0: no limit)
+        #[arg(long, value_name = "N", default_value_t = state::DEFAULT_REASON_MAX_DERIVED)]
+        reason_max_derived: usize,
         /// Compress responses for clients that accept it: auto or off
         #[arg(long, default_value = "auto", value_name = "MODE")]
         http_compression: String,
@@ -1589,6 +1593,22 @@ enum Cmd {
         /// RDFS on read with the schema in this graph of the database: `default` or an IRI
         #[arg(long, value_name = "GRAPH")]
         rdfs_graph: Option<String>,
+        /// Reasoning: `materialized` (the default) reads the inferred graph, `demand`
+        /// derives the facts the query needs from the rules when it runs, without the
+        /// inferred graph, and `false` reads the asserted data alone
+        #[arg(long, value_name = "MODE", value_parser = ["materialized", "true", "demand", "false"])]
+        reasoning: Option<String>,
+        /// The rules of `--reasoning demand`: rdfs, rdfs-simple or owl-rl (default: the
+        /// profile of the last materialization)
+        #[arg(long, value_name = "PROFILE", conflicts_with = "rules")]
+        profile: Option<String>,
+        /// A Jena rule file for `--reasoning demand`, backward rules included
+        #[arg(long, value_name = "FILE")]
+        rules: Option<PathBuf>,
+        /// The facts `--reasoning demand` may derive for the query, magic facts aside
+        /// (default 1,000,000; 0: no limit)
+        #[arg(long, value_name = "N")]
+        max_derived: Option<usize>,
         /// How DESCRIBE describes a resource: cbd, scbd or outgoing (default: the
         /// database's setting, see `describe-settings`)
         #[arg(long, value_name = "MODE")]
@@ -2642,6 +2662,7 @@ fn run() -> Result<()> {
             reason_cache_triples,
             reason_threads,
             reason_max_inferred,
+            reason_max_derived,
             http_compression,
             http_compression_level,
             http_compression_algorithms,
@@ -2941,6 +2962,7 @@ fn run() -> Result<()> {
             }
             st.reason_cache_triples = reason_cache_triples;
             st.reason_max_inferred = no_limit_if_zero(reason_max_inferred);
+            st.reason_max_derived = no_limit_if_zero(reason_max_derived);
             #[cfg(feature = "reasoning")]
             sparkles::reasoning::set_reason_threads(
                 reason_threads.unwrap_or_else(sparkles::reasoning::default_reason_threads),
@@ -3401,6 +3423,10 @@ fn run() -> Result<()> {
             insecure_http,
             rdfs,
             rdfs_graph,
+            reasoning,
+            profile,
+            rules,
+            max_derived,
             describe,
             describe_labels,
             describe_reifiers,
@@ -3435,6 +3461,18 @@ fn run() -> Result<()> {
                 }
                 if let Some(n) = describe_max_depth {
                     params.push(("describe-max-depth", n.to_string()));
+                }
+                if let Some(r) = &reasoning {
+                    params.push(("reasoning", r.clone()));
+                }
+                if let Some(p) = &profile {
+                    params.push(("reasoningProfile", p.clone()));
+                }
+                if let Some(n) = max_derived.filter(|&n| n > 0) {
+                    params.push(("maxDerived", n.to_string()));
+                }
+                if rules.is_some() {
+                    bail!("--rules needs a local database (--loc or --data), not --server");
                 }
                 #[cfg(feature = "auth")]
                 return remote::client::query(
@@ -3485,6 +3523,14 @@ fn run() -> Result<()> {
                 },
                 ..defaults
             };
+            let qopts = query_reasoning_options(
+                &ds,
+                qopts,
+                reasoning.as_deref(),
+                profile,
+                rules,
+                max_derived,
+            )?;
             let snap = match at {
                 Some(a) => {
                     let a: sparkles::history::At = a.parse()?;
@@ -5594,4 +5640,58 @@ fn print_patterns(s: &sparkles::store::Snapshot) -> anyhow::Result<()> {
         }
     }
     Ok(())
+}
+
+/// The options of `sparkles query` with its `--reasoning`, `--profile`, `--rules` and
+/// `--max-derived` (spec F17).
+fn query_reasoning_options(
+    ds: &sparkles::Dataset,
+    qopts: QueryOptions,
+    reasoning: Option<&str>,
+    profile: Option<String>,
+    rules: Option<PathBuf>,
+    max_derived: Option<usize>,
+) -> Result<QueryOptions> {
+    match reasoning {
+        None | Some("materialized") | Some("true") => {
+            if profile.is_some() || rules.is_some() || max_derived.is_some() {
+                bail!("--profile, --rules and --max-derived need --reasoning demand");
+            }
+            Ok(qopts)
+        }
+        Some("false") => Ok(QueryOptions {
+            default_graph_extra: Vec::new(),
+            rdfs: None,
+            ..qopts
+        }),
+        Some("demand") => {
+            #[cfg(feature = "reasoning")]
+            {
+                let profile = match (profile, rules) {
+                    (_, Some(f)) => Some(sparkles_reasoner::Profile::Rules(
+                        std::fs::read_to_string(&f)
+                            .with_context(|| format!("--rules {}", f.display()))?,
+                    )),
+                    (Some(p), None) => Some(p.parse::<sparkles_reasoner::Profile>()?),
+                    (None, None) => None,
+                };
+                let r = ds.query_reasoner(profile)?;
+                let r = match max_derived {
+                    Some(0) => r.with_max_derived(usize::MAX),
+                    Some(n) => r.with_max_derived(n),
+                    None => r,
+                };
+                Ok(QueryOptions {
+                    reasoning: Some(r.provider()),
+                    ..qopts
+                })
+            }
+            #[cfg(not(feature = "reasoning"))]
+            {
+                let _ = (ds, profile, rules, max_derived);
+                bail!("built without the `reasoning` feature")
+            }
+        }
+        Some(other) => bail!("--reasoning must be materialized, demand or false, not {other}"),
+    }
 }

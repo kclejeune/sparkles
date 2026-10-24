@@ -260,6 +260,15 @@
           "type": "integer"
         }
       },
+      "maxDerived": {
+        "description": "The most facts `reasoning=demand` may derive for the query, magic facts aside. It never exceeds the server's `--reason-max-derived`.",
+        "in": "query",
+        "name": "maxDerived",
+        "schema": {
+          "minimum": 1,
+          "type": "integer"
+        }
+      },
       "maxResultMb": {
         "description": "A lower budget of the serialized result, in MiB.",
         "in": "query",
@@ -344,12 +353,39 @@
           "type": "string"
         }
       },
+      "queryReasoning": {
+        "description": "`true` or `materialized` reads materialized inferences, the default when the dataset has any. `demand` derives the facts the query needs from the dataset's rules as it runs, without the inferred graph (spec F17). `false` reads the asserted data alone and also turns RDFS on read off.",
+        "in": "query",
+        "name": "reasoning",
+        "schema": {
+          "enum": [
+            "true",
+            "false",
+            "materialized",
+            "demand"
+          ],
+          "type": "string"
+        }
+      },
       "reasoning": {
         "description": "Include materialized inferences. The default is true when the dataset has any. False also turns RDFS on read off.",
         "in": "query",
         "name": "reasoning",
         "schema": {
           "type": "boolean"
+        }
+      },
+      "reasoningProfile": {
+        "description": "The rules of `reasoning=demand`. The default is the profile of the last materialization.",
+        "in": "query",
+        "name": "reasoningProfile",
+        "schema": {
+          "enum": [
+            "rdfs",
+            "rdfs-simple",
+            "owl-rl"
+          ],
+          "type": "string"
         }
       },
       "receipt": {
@@ -35511,7 +35547,13 @@
             "$ref": "#/components/parameters/timeout"
           },
           {
-            "$ref": "#/components/parameters/reasoning"
+            "$ref": "#/components/parameters/queryReasoning"
+          },
+          {
+            "$ref": "#/components/parameters/reasoningProfile"
+          },
+          {
+            "$ref": "#/components/parameters/maxDerived"
           },
           {
             "$ref": "#/components/parameters/at"
@@ -35729,7 +35771,13 @@
             "$ref": "#/components/parameters/format"
           },
           {
-            "$ref": "#/components/parameters/reasoning"
+            "$ref": "#/components/parameters/queryReasoning"
+          },
+          {
+            "$ref": "#/components/parameters/reasoningProfile"
+          },
+          {
+            "$ref": "#/components/parameters/maxDerived"
           },
           {
             "$ref": "#/components/parameters/at"
@@ -39670,7 +39718,13 @@
             "$ref": "#/components/parameters/timeout"
           },
           {
-            "$ref": "#/components/parameters/reasoning"
+            "$ref": "#/components/parameters/queryReasoning"
+          },
+          {
+            "$ref": "#/components/parameters/reasoningProfile"
+          },
+          {
+            "$ref": "#/components/parameters/maxDerived"
           },
           {
             "$ref": "#/components/parameters/at"
@@ -39796,7 +39850,13 @@
             "$ref": "#/components/parameters/timeout"
           },
           {
-            "$ref": "#/components/parameters/reasoning"
+            "$ref": "#/components/parameters/queryReasoning"
+          },
+          {
+            "$ref": "#/components/parameters/reasoningProfile"
+          },
+          {
+            "$ref": "#/components/parameters/maxDerived"
           },
           {
             "$ref": "#/components/parameters/at"
@@ -40581,7 +40641,13 @@
             "$ref": "#/components/parameters/timeout"
           },
           {
-            "$ref": "#/components/parameters/reasoning"
+            "$ref": "#/components/parameters/queryReasoning"
+          },
+          {
+            "$ref": "#/components/parameters/reasoningProfile"
+          },
+          {
+            "$ref": "#/components/parameters/maxDerived"
           },
           {
             "$ref": "#/components/parameters/at"
@@ -40707,7 +40773,13 @@
             "$ref": "#/components/parameters/timeout"
           },
           {
-            "$ref": "#/components/parameters/reasoning"
+            "$ref": "#/components/parameters/queryReasoning"
+          },
+          {
+            "$ref": "#/components/parameters/reasoningProfile"
+          },
+          {
+            "$ref": "#/components/parameters/maxDerived"
           },
           {
             "$ref": "#/components/parameters/at"

@@ -1071,6 +1071,25 @@ bear on the view and the budgets, which are `default_graph`, `named_graphs`,
 without the GIL and share one deadline made from `timeout`, and a malformed request
 raises `InvalidInputError`.
 
+### Editing forms
+
+`Dataset.forms.model`, `check` and `save` bind the library's `ds.forms()` from
+[U02](U02-shape-driven-forms.md#outcome). `model(focus, *, class_=None, settings=None,
+at=None, lang=None, writable=True)` takes the resource, or the class of a new instance
+as `class_`, and returns the form as the dict that the HTTP route answers. `check(change)`
+and `save(change)` take the change as a dict with the members of the route's body, which
+are `focus` or `class`, `changes`, `expect` and `message`. A term is a dict of the model
+or a `NamedNode` or `Literal`. All three take `settings`, a dict with the members of the
+`forms` setting, and the default is the shapes of the dataset's guard. Session branch
+logic belongs to the server, so a session branch is edited through
+`Dataset.branch(name).forms`. `check` returns the preview, the update, the `conflicts`
+and the `validation`. `save` returns the receipt with the `focus` and the `branch`. When
+another commit changed a field it writes nothing and raises `ConflictError` with
+`code == "form-conflict"` and `fields`, where the library returns `FormSaved::Conflict`.
+The calls take `timeout` and `cancel`, and the writes take `author`. A change the form
+cannot take raises `InvalidInputError`. The calls run without the GIL, and a build
+without the `shacl` feature raises `UnsupportedError`.
+
 ### Roadmap follow-ups (2026-10-12)
 
 * **Plan cache** ([ROADMAP](../ROADMAP.md) item 32). The plan cache sketched in the

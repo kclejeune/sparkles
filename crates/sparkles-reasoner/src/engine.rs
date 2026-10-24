@@ -101,11 +101,31 @@ fn vars_of(n: &Node, out: &mut Vec<String>) {
     }
 }
 
-/// Compile parsed rules. Unsupported rules are skipped with a warning.
+/// Compile parsed rules for materialization. Unsupported rules are skipped with a
+/// warning, backward rules among them.
 pub(crate) fn compile(rules: &[Rule], terms: &Terms, warnings: &mut Vec<String>) -> Vec<CRule> {
+    compile_with(rules, terms, warnings, false)
+}
+
+/// Compile parsed rules for query-time reasoning (spec F17 §5.1): backward rules join the
+/// forward rules, since evaluating both bottom-up on demand gives the same least fixpoint.
+pub(crate) fn compile_query(
+    rules: &[Rule],
+    terms: &Terms,
+    warnings: &mut Vec<String>,
+) -> Vec<CRule> {
+    compile_with(rules, terms, warnings, true)
+}
+
+fn compile_with(
+    rules: &[Rule],
+    terms: &Terms,
+    warnings: &mut Vec<String>,
+    backward: bool,
+) -> Vec<CRule> {
     let mut flat = Vec::new();
     for r in rules {
-        if r.direction == Direction::Backward {
+        if r.direction == Direction::Backward && !backward {
             warnings.push(format!(
                 "rule '{}' (line {}): backward rules ('<-') are not supported by forward materialization; skipped",
                 r.label(),
@@ -271,6 +291,8 @@ fn compile_one(
                     }
                     head.push(CHead::Action(action, args));
                 }
+                // Jena's tabling directives: every predicate is tabled here
+                Some(Err(())) if matches!(b.name.as_str(), "table" | "tableAll") => {}
                 Some(Err(())) => {
                     warnings.push(format!(
                         "rule '{}': head builtin '{}' ignored",
@@ -1065,6 +1087,9 @@ impl<'a> Eval<'a> {
     #[inline]
     fn fact(&mut self, k: usize, atom: usize, b: &mut [u64], t: Triple) {
         let a = &self.rule.atoms[atom];
+        if !matches!(a.p, Slot::Const(_)) && self.g.is_hidden(t[1]) {
+            return;
+        }
         let mut newly = [usize::MAX; 3];
         let mut n = 0;
         let ok = unify(a.s, t[0], b, &mut newly, &mut n)
@@ -1574,10 +1599,14 @@ pub(crate) fn run(
         let produced = AtomicUsize::new(0);
         let budget = limits
             .max_inferred
-            .saturating_sub((gr.len() - base_len) as usize);
-        // the candidates an evaluation may produce for the limit of inferred triples;
+            .saturating_sub(gr.inferred_since(base_len));
+        // the candidates an evaluation may produce for the limit of inferred triples, with
+        // room for the magic facts of a demand program, which the limit does not count;
         // memory is checked by the charges as the candidates arrive
-        let max_out = budget.saturating_mul(4).saturating_add(1 << 20);
+        let max_out = budget
+            .saturating_add(gr.hidden_rows(0))
+            .saturating_mul(4)
+            .saturating_add(1 << 20);
         let timed = tracing::enabled!(tracing::Level::TRACE);
         let item_time: Vec<AtomicUsize> = if timed {
             rules.iter().map(|_| AtomicUsize::new(0)).collect()
@@ -1690,13 +1719,14 @@ pub(crate) fn run(
         }
         let candidates = produced.load(Ordering::Relaxed);
         if candidates > max_out {
+            tracing::debug!(candidates, max_out, "candidates past the limit");
             return Err(crate::InferredLimitExceeded {
                 limit: limits.max_inferred,
                 context: top_rule(&results),
             }
             .into());
         }
-        let overflow = if (g.len() - base_len) as usize + candidates > limits.max_inferred {
+        let overflow = if g.inferred_since(base_len) + candidates > limits.max_inferred {
             top_rule(&results)
         } else {
             String::new()
@@ -1716,12 +1746,13 @@ pub(crate) fn run(
         tracing::debug!(
             iteration,
             new,
+            visible = g.inferred_since(base_len),
             candidates,
             eval_ms,
             merge_ms = t_merge.elapsed().as_millis() as u64,
             "reasoner iteration"
         );
-        if (g.len() - base_len) as usize > limits.max_inferred {
+        if g.inferred_since(base_len) > limits.max_inferred {
             return Err(crate::InferredLimitExceeded {
                 limit: limits.max_inferred,
                 context: overflow,
@@ -1797,7 +1828,10 @@ pub(crate) fn incremental_blocker(r: &CRule, terms: &Terms) -> Option<String> {
 /// `listForAll(?l, ?y, P)` is covered when the rule also has `listMember(?l, ?m)` and
 /// the atom `(?y P ?m)`: every fact it reads is then matched by that atom in some
 /// instance.
-fn list_for_all_covered(r: &CRule, b: &CBuiltin) -> bool {
+pub(crate) fn list_for_all_covered(r: &CRule, b: &CBuiltin) -> bool {
+    if b.kind != crate::builtins::BuiltinKind::ListForAll {
+        return false;
+    }
     let &[l @ Slot::Var(_), y, p] = &b.args[..] else {
         return false;
     };

@@ -1384,3 +1384,68 @@ async fn explain_route_keeps_the_query_limits() {
         }
     }
 }
+
+/// Query-time reasoning over HTTP (spec F17 §2): `reasoning=demand` answers with the
+/// derived facts and the `Sparkles-Reasoning` header, a derivation past `maxDerived`
+/// fails with 422 `reasoning-budget`, and `auto` is refused until Phase 2.
+#[tokio::test]
+async fn demand_reasoning_over_http() {
+    let dir = tempfile::tempdir().unwrap();
+    let st = open(dir.path(), None, false);
+    st.create("t", DbType::Persistent).unwrap();
+    load(
+        &st,
+        "t",
+        "ex:C rdfs:subClassOf ex:B . ex:x a ex:C . ex:y a ex:C . ex:z a ex:B .",
+    );
+    let app = router(st.clone());
+    let q = "SELECT ?s { ?s a <http://ex.org/B> } ORDER BY ?s";
+    let get = |params: &str| {
+        let app = app.clone();
+        let uri = format!(
+            "/t/sparql?{params}&query={}",
+            form_urlencoded::byte_serialize(q.as_bytes()).collect::<String>()
+        );
+        async move {
+            send_h(
+                &app,
+                Request::get(uri)
+                    .header(header::ACCEPT, "application/sparql-results+json")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+        }
+    };
+    // no profile and nothing materialized: the request names none
+    let (r, _) = get("reasoning=demand").await;
+    assert_eq!(r.status, StatusCode::BAD_REQUEST, "{}", r.text());
+    let (r, h) = get("reasoning=demand&reasoningProfile=rdfs-simple").await;
+    assert_eq!(r.status, StatusCode::OK, "{}", r.text());
+    let rows: Vec<String> = r.json()["results"]["bindings"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|b| b["s"]["value"].as_str().unwrap().to_string())
+        .collect();
+    assert_eq!(
+        rows,
+        ["http://ex.org/x", "http://ex.org/y", "http://ex.org/z"]
+    );
+    let hdr = h["sparkles-reasoning"].to_str().unwrap();
+    assert!(hdr.starts_with("demand; derived=2; tables=1"), "{hdr}");
+    assert!(!h.contains_key("sparkles-inferences"));
+    // the same query reads its table from the cache, so the budget applies to a fresh one
+    let (r, h) = get("reasoning=demand&reasoningProfile=rdfs-simple").await;
+    assert_eq!(r.status, StatusCode::OK, "{}", r.text());
+    let hdr = h["sparkles-reasoning"].to_str().unwrap();
+    assert!(hdr.ends_with("tables=1; cached=1"), "{hdr}");
+    let (r, _) =
+        get("reasoning=demand&reasoningProfile=rdfs-simple&maxDerived=1&nocache=true").await;
+    assert_eq!(r.status, StatusCode::UNPROCESSABLE_ENTITY, "{}", r.text());
+    assert!(r.text().contains("reasoning-budget"), "{}", r.text());
+    let (r, _) = get("reasoning=auto").await;
+    assert_eq!(r.status, StatusCode::BAD_REQUEST, "{}", r.text());
+    let (r, _) = get("reasoning=demand&reasoningProfile=nope").await;
+    assert_eq!(r.status, StatusCode::BAD_REQUEST, "{}", r.text());
+}

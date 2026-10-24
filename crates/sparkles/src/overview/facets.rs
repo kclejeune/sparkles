@@ -179,12 +179,30 @@ pub fn rdf_term_from_json(v: &J, what: &str) -> Result<Term> {
             Ok(Term::NamedNode(n))
         }
         Some("literal") | Some("typed-literal") => {
+            let dir = match o.get("its:dir").and_then(J::as_str) {
+                None => None,
+                Some("ltr") => Some(oxrdf::BaseDirection::Ltr),
+                Some("rtl") => Some(oxrdf::BaseDirection::Rtl),
+                Some(d) => {
+                    return Err(bad(format!(
+                        "{what}.its:dir must be \"ltr\" or \"rtl\", not \"{d}\""
+                    )));
+                }
+            };
             let lit = match (
                 o.get("xml:lang").and_then(J::as_str),
                 o.get("datatype").and_then(J::as_str),
             ) {
-                (Some(lang), _) => oxrdf::Literal::new_language_tagged_literal(value, lang)
-                    .map_err(|e| bad(format!("{what}: invalid language tag: {e}")))?,
+                (Some(lang), _) => match dir {
+                    Some(dir) => {
+                        oxrdf::Literal::new_directional_language_tagged_literal(value, lang, dir)
+                    }
+                    None => oxrdf::Literal::new_language_tagged_literal(value, lang),
+                }
+                .map_err(|e| bad(format!("{what}: invalid language tag: {e}")))?,
+                (None, _) if dir.is_some() => {
+                    return Err(bad(format!("{what}: its:dir needs an xml:lang")));
+                }
                 (None, Some(dt)) => {
                     let dt = oxrdf::NamedNode::new(dt)
                         .map_err(|e| bad(format!("{what}: invalid datatype: {e}")))?;
@@ -1014,6 +1032,27 @@ fn candidates(ctx: &Ctx, within: &FacetSet, size: u64) -> Result<(Vec<J>, bool)>
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_directional_literal_keeps_its_direction() {
+        let j =
+            json!({ "type": "literal", "value": "marhaba", "xml:lang": "ar", "its:dir": "rtl" });
+        let Term::Literal(l) = rdf_term_from_json(&j, "t").unwrap() else {
+            panic!("not a literal");
+        };
+        assert_eq!(l.language(), Some("ar"));
+        assert_eq!(l.direction(), Some(oxrdf::BaseDirection::Rtl));
+        // the form a literal is written in reads back as the same term
+        let again = rdf_term_from_json(
+            &sparkles_core::sparql::results::term_json(&l.clone().into()),
+            "t",
+        );
+        assert_eq!(again.unwrap(), Term::Literal(l));
+        let bad = json!({ "type": "literal", "value": "x", "xml:lang": "ar", "its:dir": "up" });
+        assert!(rdf_term_from_json(&bad, "t").is_err());
+        let bad = json!({ "type": "literal", "value": "x", "its:dir": "ltr" });
+        assert!(rdf_term_from_json(&bad, "t").is_err());
+    }
 
     #[test]
     fn round_edges_hold_every_value() {

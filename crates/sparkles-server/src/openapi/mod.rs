@@ -578,6 +578,30 @@ fn parameters() -> Map<String, J> {
         ),
     );
     put(
+        "queryReasoning",
+        q(
+            "reasoning",
+            json!({ "type": "string", "enum": ["true", "false", "materialized", "demand"] }),
+            "`true` or `materialized` reads materialized inferences, the default when the dataset has any. `demand` derives the facts the query needs from the dataset's rules as it runs, without the inferred graph (spec F17). `false` reads the asserted data alone and also turns RDFS on read off.",
+        ),
+    );
+    put(
+        "reasoningProfile",
+        q(
+            "reasoningProfile",
+            json!({ "type": "string", "enum": ["rdfs", "rdfs-simple", "owl-rl"] }),
+            "The rules of `reasoning=demand`. The default is the profile of the last materialization.",
+        ),
+    );
+    put(
+        "maxDerived",
+        q(
+            "maxDerived",
+            json!({ "type": "integer", "minimum": 1 }),
+            "The most facts `reasoning=demand` may derive for the query, magic facts aside. It never exceeds the server's `--reason-max-derived`.",
+        ),
+    );
+    put(
         "graphSel",
         q(
             "graph",
