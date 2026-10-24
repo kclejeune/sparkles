@@ -3,7 +3,9 @@
 This guide describes how to measure Sparkles: which host to use, how the comparison
 engines are pinned, how release builds are configured, and what each benchmark harness
 does and writes. [BENCHMARKS.md](BENCHMARKS.md) holds the published results and their
-methodology, and [DEVELOPMENT.md](DEVELOPMENT.md) covers building and testing.
+methodology, [PERFORMANCE-EXPERIMENTS.md](PERFORMANCE-EXPERIMENTS.md) lists optimizations
+that were measured and not kept, and [DEVELOPMENT.md](DEVELOPMENT.md) covers building and
+testing.
 
 * [Choosing a host](#choosing-a-host)
 * [Pinned comparison engines](#pinned-comparison-engines)

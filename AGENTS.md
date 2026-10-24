@@ -38,6 +38,11 @@ work, and each item links to its design spec in [docs/specs](docs/specs/README.m
 - A measured slowdown that a gate accepts still gets a follow-up item in
   [docs/ROADMAP.md](docs/ROADMAP.md), added in the same change that accepts it. This holds
   for a loosened gate, a result judged to be noise and a tradeoff taken on purpose.
+- An optimization that is built and measured but not kept, because it measured no faster
+  or slower, gets an entry in
+  [docs/PERFORMANCE-EXPERIMENTS.md](docs/PERFORMANCE-EXPERIMENTS.md) in the same change.
+  The entry records the measurement and when the idea could still pay off, such as at a
+  larger scale, and the code stays reachable as a reverted commit or an `experiment/` tag.
 
 ## Commits and documentation
 
