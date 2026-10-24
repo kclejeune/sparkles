@@ -31,6 +31,27 @@ use std::sync::atomic::{AtomicU64, Ordering as AtomicOrdering};
 
 pub const FC_BLOCK: usize = 16;
 
+/// The room past a key that a checked decode reserves for an FSST suffix.
+const FSST_ROOM: usize = 64;
+
+/// Every key of a front-coded block, as a mask of [`Vocab::decode_block`].
+const ALL_KEYS: u32 = (1 << FC_BLOCK) - 1;
+
+/// How many bytes of key `i` of a front-coded FSST block a decode of the keys in
+/// `wanted` (a bit per key) needs, given the entry after it: all of a wanted key
+/// (`usize::MAX`), and of another key the bytes that the next key takes from it, its
+/// shared-prefix length. A key that gives the next no more than its own shared prefix
+/// is not decoded at all, and another only up to what the next takes, so a lookup of
+/// one key decodes little more than that key. The need of a key after the last wanted
+/// one does not arise, since decoding stops there.
+#[inline(always)]
+fn lookahead(wanted: u32, i: usize, next: Option<Entry>) -> usize {
+    match next {
+        Some(e) if wanted >> i & 1 == 0 => e.shared,
+        _ => usize::MAX,
+    }
+}
+
 /// Front-coded blocks per entry of the sparse index (`vocab.idx`).
 const IDX_BLOCKS: usize = 128;
 const IDX_MAGIC: &[u8; 8] = b"SPKVIDX1";
@@ -315,13 +336,27 @@ pub struct Vocab {
 
 /// One entry of a front-coded block: the length of the prefix it shares with the key
 /// before it, and where its stored bytes are.
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Default)]
 struct Entry {
     shared: usize,
     start: usize,
     len: usize,
     /// the bytes are FSST codes
     coded: bool,
+}
+
+impl Entry {
+    /// The most bytes this entry's suffix can stand for: its length, or eight bytes per
+    /// code. A partial decode reserves no more than this, so a damaged shared-prefix
+    /// length in the next entry cannot ask for more room than the suffix could fill.
+    #[inline(always)]
+    fn most(&self) -> usize {
+        if self.coded {
+            self.len.saturating_mul(8)
+        } else {
+            self.len
+        }
+    }
 }
 
 impl Vocab {
@@ -533,18 +568,56 @@ impl Vocab {
         }
     }
 
+    /// The first capacity of a key buffer. An FSST suffix decodes without branches only
+    /// with 64 bytes of room past the key (`fsst::Table::decode_at`), so a buffer of 64
+    /// bytes would be reallocated on its second key, once per lookup of a single key.
+    #[inline(always)]
+    fn scratch_capacity(&self) -> usize {
+        if self.fsst.is_some() { 192 } else { 64 }
+    }
+
     /// Decode a whole block, invoking `f(index_in_block, key)`; stops when `f` returns false.
     fn scan_block(&self, b: usize, f: impl FnMut(usize, &[u8]) -> bool) {
+        let mut key = Vec::with_capacity(self.scratch_capacity());
         if ioacct::profiling() {
-            self.scan_block_at::<true>(b, f)
+            self.decode_block::<true>(b, ALL_KEYS, &mut key, f)
         } else {
-            self.scan_block_at::<false>(b, f)
+            self.decode_block::<false>(b, ALL_KEYS, &mut key, f)
         }
     }
 
-    /// [`Vocab::scan_block`], counting and recording the block under a profile when `P`.
+    /// Decode the keys of block `b` whose bits are set in `wanted` (bit `i` for the
+    /// block's `i`-th key), calling `f(i, key)` for each in order until it returns false.
+    /// `key` is the scratch buffer, cleared first. Of the other keys, only the bytes that
+    /// a wanted key takes from them are decoded (see [`lookahead`]). Under a profile
+    /// (`P`) the block is counted and its pages recorded.
     #[inline(always)]
-    fn scan_block_at<const P: bool>(&self, b: usize, mut f: impl FnMut(usize, &[u8]) -> bool) {
+    fn decode_block<const P: bool>(
+        &self,
+        b: usize,
+        wanted: u32,
+        key: &mut Vec<u8>,
+        f: impl FnMut(usize, &[u8]) -> bool,
+    ) {
+        if self.fsst.is_some() {
+            self.decode_block_as::<P, true>(b, wanted, key, f)
+        } else {
+            self.decode_block_as::<P, false>(b, wanted, key, f)
+        }
+    }
+
+    /// [`Vocab::decode_block`] for an FSST-coded vocabulary when `F` and a front-coded
+    /// one otherwise. Each hot loop is compiled once per codec, so the front-coded loops
+    /// carry no test for FSST codes.
+    #[inline(always)]
+    fn decode_block_as<const P: bool, const F: bool>(
+        &self,
+        b: usize,
+        wanted: u32,
+        key: &mut Vec<u8>,
+        mut f: impl FnMut(usize, &[u8]) -> bool,
+    ) {
+        key.clear();
         let data = self.data.as_slice();
         let mut pos = self.block_offset_at::<P>(b);
         let start = b * FC_BLOCK;
@@ -553,22 +626,44 @@ impl Vocab {
             ioacct::vocab_blocks_scanned(1);
             self.touch_block(b);
         }
-        // Single-key callers own this fresh buffer throughout their scan.
-        let mut key = Vec::with_capacity(64);
-        for i in 0..n {
-            self.reconstruct_key(data, &mut pos, (start + i) as u64, i == 0, &mut key);
-            if !f(i, &key) {
+        let wanted = wanted & ((1u32 << n) - 1);
+        if wanted == 0 {
+            return;
+        }
+        let last = 31 - wanted.leading_zeros() as usize;
+        if !F || wanted == (2u32 << last) - 1 {
+            // every key decoded whole: front coding, and FSST when each key is wanted
+            for i in 0..=last {
+                let e = self.entry::<F>(data, &mut pos, i == 0);
+                key.truncate(e.shared);
+                self.push_suffix::<F>(data, e, (start + i) as u64, usize::MAX, key, false);
+                if wanted >> i & 1 == 1 && !f(i, key) {
+                    return;
+                }
+            }
+            return;
+        }
+        let mut cur = self.entry::<F>(data, &mut pos, true);
+        for i in 0..=last {
+            let next = (i < last).then(|| self.entry::<F>(data, &mut pos, false));
+            let need = lookahead(wanted, i, next);
+            self.step::<F>(data, cur, (start + i) as u64, need, key, false);
+            if wanted >> i & 1 == 1 && !f(i, key) {
                 return;
+            }
+            if let Some(e) = next {
+                cur = e;
             }
         }
     }
 
     /// The entry at `pos` (advanced past it), the first of its block when `first`.
+    /// `F` says whether the vocabulary is FSST-coded.
     #[inline(always)]
-    fn entry(&self, data: &[u8], pos: &mut usize, first: bool) -> Entry {
+    fn entry<const F: bool>(&self, data: &[u8], pos: &mut usize, first: bool) -> Entry {
         let shared = read_varint(data, pos) as usize;
         let word = read_varint(data, pos) as usize;
-        let (len, coded) = if self.fsst.is_some() && !first {
+        let (len, coded) = if F && !first {
             (word >> 1, word & 1 == 1)
         } else {
             (word, false)
@@ -592,60 +687,48 @@ impl Vocab {
         }
     }
 
-    /// Append the suffix of entry `e` (of key `id`) to `key`. With `exact`, the buffer
-    /// grows by no more than the suffix (see [`fsst::Table::decode_exact`]).
+    /// Append the first `max` bytes of the suffix of entry `e` (of key `id`) to `key`, or
+    /// all of it when it is shorter. With `exact`, the caller has reserved the room and
+    /// the buffer does not grow (see [`fsst::Table::decode_upto`]).
     #[inline(always)]
-    fn push_suffix(&self, data: &[u8], e: Entry, id: u64, key: &mut Vec<u8>, exact: bool) {
-        let bytes = &data[e.start..e.start + e.len];
-        match &self.fsst {
-            Some(t) if e.coded => {
-                if exact {
-                    t.table(id).decode_exact(bytes, key)
-                } else {
-                    t.table(id).decode_into(bytes, key)
-                }
-            }
-            _ => key.extend_from_slice(bytes),
+    fn push_suffix<const F: bool>(
+        &self,
+        data: &[u8],
+        e: Entry,
+        id: u64,
+        max: usize,
+        key: &mut Vec<u8>,
+        exact: bool,
+    ) {
+        if F && e.coded
+            && let Some(t) = &self.fsst
+        {
+            t.table(id)
+                .decode_at(data, e.start, e.len, max, key, !exact)
+        } else {
+            key.extend_from_slice(&data[e.start..e.start + e.len.min(max)])
         }
     }
 
-    /// One front-coded key, `id`, the first of its block when `first`; shared by the
-    /// fresh-buffer and reusable-buffer loops.
+    /// Bring `key` from the bytes it holds of the key before entry `e` to the first
+    /// `need` bytes of the key of `e` (of id `id`), or all of it when `need` is
+    /// `usize::MAX`. `key` must hold at least `need.min(e.shared)` bytes, which
+    /// [`lookahead`] ensures.
     #[inline(always)]
-    fn reconstruct_key(
+    fn step<const F: bool>(
         &self,
         data: &[u8],
-        pos: &mut usize,
+        e: Entry,
         id: u64,
-        first: bool,
+        need: usize,
         key: &mut Vec<u8>,
+        exact: bool,
     ) {
-        let e = self.entry(data, pos, first);
-        key.truncate(e.shared);
-        self.push_suffix(data, e, id, key, false);
-    }
-
-    /// Each block starts with an empty reconstruction, while capacity can be reused
-    /// by a sorted decode across blocks. Single-key callers retain a local buffer.
-    #[inline(always)]
-    fn scan_block_with_scratch(
-        &self,
-        b: usize,
-        key: &mut Vec<u8>,
-        mut f: impl FnMut(usize, &[u8]) -> bool,
-    ) {
-        key.clear();
-        let data = self.data.as_slice();
-        let mut pos = self.block_offset(b);
-        ioacct::vocab_blocks_scanned(1);
-        self.touch_block(b);
-        let start = b * FC_BLOCK;
-        let n = FC_BLOCK.min((self.len as usize) - start);
-        for i in 0..n {
-            self.reconstruct_key(data, &mut pos, (start + i) as u64, i == 0, key);
-            if !f(i, key) {
-                return;
-            }
+        if need <= e.shared {
+            key.truncate(need);
+        } else {
+            key.truncate(e.shared);
+            self.push_suffix::<F>(data, e, id, need - e.shared, key, exact);
         }
     }
 
@@ -674,13 +757,11 @@ impl Vocab {
         let b = (id as usize) / FC_BLOCK;
         let want = (id as usize) % FC_BLOCK;
         let mut out = None;
-        self.scan_block_at::<P>(b, |i, k| {
-            if i == want {
-                out = Some(f(k));
-                false
-            } else {
-                true
-            }
+        // Single-key callers own this fresh buffer throughout their scan.
+        let mut key = Vec::with_capacity(self.scratch_capacity());
+        self.decode_block::<P>(b, 1 << want, &mut key, |_, k| {
+            out = Some(f(k));
+            false
         });
         out
     }
@@ -694,6 +775,21 @@ impl Vocab {
     /// Fallible cursor decoding: reserve reconstruction storage before growing it,
     /// including intermediate keys needed to reach a selected front-coded key.
     pub(crate) fn get_sorted_checked<E>(
+        &self,
+        ids: &[u64],
+        reserve: impl FnMut(usize) -> std::result::Result<(), E>,
+        f: impl FnMut(u64, &[u8]) -> std::result::Result<(), E>,
+    ) -> std::result::Result<(), E> {
+        if self.fsst.is_some() {
+            self.get_sorted_checked_as::<true, E>(ids, reserve, f)
+        } else {
+            self.get_sorted_checked_as::<false, E>(ids, reserve, f)
+        }
+    }
+
+    /// [`Vocab::get_sorted_checked`] for an FSST-coded vocabulary when `F`.
+    #[inline(always)]
+    fn get_sorted_checked_as<const F: bool, E>(
         &self,
         ids: &[u64],
         mut reserve: impl FnMut(usize) -> std::result::Result<(), E>,
@@ -714,30 +810,63 @@ impl Vocab {
             ahead.at(self, b);
             let end = ((b + 1) * FC_BLOCK) as u64;
             let j = i + ids[i..].partition_point(|&x| x < end);
-            let wanted = &ids[i..j];
-            let last = (wanted[wanted.len() - 1] as usize % FC_BLOCK)
-                .min(FC_BLOCK.min(self.len as usize - b * FC_BLOCK) - 1);
-            let mut w = 0;
+            let n = FC_BLOCK.min(self.len as usize - b * FC_BLOCK);
+            let mut mask = 0u32;
+            for &x in &ids[i..j] {
+                mask |= 1 << (x as usize % FC_BLOCK);
+            }
+            mask &= (1u32 << n) - 1;
+            let last = 31 - mask.leading_zeros() as usize;
             let mut pos = self.block_offset(b);
             ioacct::vocab_blocks_scanned(1);
             self.touch_block(b);
             key.clear();
+            if !F {
+                // front coding rebuilds every key up to the last wanted one, in one pass
+                for at in 0..=last {
+                    let id = (b * FC_BLOCK + at) as u64;
+                    let e = self.entry::<F>(data, &mut pos, at == 0);
+                    let total = key.len().min(e.shared).saturating_add(e.len);
+                    if total > key.capacity() {
+                        reserve(total)?;
+                        key.reserve_exact(total - key.len());
+                    }
+                    key.truncate(e.shared);
+                    self.push_suffix::<F>(data, e, id, usize::MAX, &mut key, true);
+                    if mask >> at & 1 == 1 {
+                        f(id, &key)?;
+                    }
+                }
+                i = j;
+                continue;
+            }
+            let mut e = self.entry::<F>(data, &mut pos, true);
             for at in 0..=last {
                 let id = (b * FC_BLOCK + at) as u64;
-                let e = self.entry(data, &mut pos, at == 0);
-                let need = key
-                    .len()
-                    .min(e.shared)
-                    .saturating_add(self.suffix_len(data, e, id));
-                if need > key.capacity() {
-                    reserve(need)?;
-                    key.reserve_exact(need - key.len());
+                let next = (at < last).then(|| self.entry::<F>(data, &mut pos, false));
+                let nd = lookahead(mask, at, next);
+                if nd > e.shared {
+                    // the whole key, or the bytes of it that later keys take
+                    let add = if nd == usize::MAX {
+                        self.suffix_len(data, e, id)
+                    } else {
+                        (nd - e.shared).min(e.most())
+                    };
+                    let total = key.len().min(e.shared).saturating_add(add);
+                    if total > key.capacity() {
+                        // an FSST suffix decodes fastest with room for eight symbols
+                        // past the key (`fsst::Table::decode_at`)
+                        let total = total.saturating_add(FSST_ROOM * usize::from(e.coded));
+                        reserve(total)?;
+                        key.reserve_exact(total - key.len());
+                    }
                 }
-                key.truncate(e.shared);
-                self.push_suffix(data, e, id, &mut key, true);
-                if w < wanted.len() && wanted[w] as usize % FC_BLOCK == at {
-                    f(wanted[w], &key)?;
-                    w += 1;
+                self.step::<F>(data, e, id, nd, &mut key, true);
+                if mask >> at & 1 == 1 {
+                    f(id, &key)?;
+                }
+                if let Some(n) = next {
+                    e = n;
                 }
             }
             i = j;
@@ -780,7 +909,7 @@ impl Vocab {
         }
         // Empty and entirely out-of-range passes need no reconstruction storage.
         let mut key = if ids.first().is_some_and(|&id| id < self.len) {
-            Vec::with_capacity(64)
+            Vec::with_capacity(self.scratch_capacity())
         } else {
             Vec::new()
         };
@@ -794,18 +923,27 @@ impl Vocab {
             ahead.at(self, b);
             let end = ((b + 1) * FC_BLOCK) as u64;
             let j = i + ids[i..].partition_point(|&x| x < end);
-            let wanted = &ids[i..j];
-            let last = (wanted[wanted.len() - 1] as usize) % FC_BLOCK;
-            let mut w = 0;
-            self.scan_block_with_scratch(b, &mut key, |pos, k| {
-                if w < wanted.len() && (wanted[w] as usize) % FC_BLOCK == pos {
-                    f(wanted[w], k);
-                    w += 1;
-                }
-                pos < last
+            let mut mask = 0u32;
+            for &x in &ids[i..j] {
+                mask |= 1 << (x as usize % FC_BLOCK);
+            }
+            self.decode_block::<true>(b, mask, &mut key, |at, k| {
+                f((b * FC_BLOCK + at) as u64, k);
+                true
             });
             i = j;
         }
+    }
+
+    /// Decode every key of block `b` into the reusable buffer `key`.
+    #[cfg(test)]
+    fn scan_block_with_scratch(
+        &self,
+        b: usize,
+        key: &mut Vec<u8>,
+        f: impl FnMut(usize, &[u8]) -> bool,
+    ) {
+        self.decode_block::<true>(b, ALL_KEYS, key, f)
     }
 
     /// Ask the kernel to read ahead, asynchronously, the pages of the front-coded blocks
@@ -1067,20 +1205,72 @@ impl Vocab {
         if lo == 0 {
             return Err(0);
         }
-        let b = lo - 1;
-        let mut result = Err(((b + 1) * FC_BLOCK).min(self.len as usize) as u64);
-        self.scan_block_at::<P>(b, |i, k| match k.cmp(key) {
-            std::cmp::Ordering::Less => true,
-            std::cmp::Ordering::Equal => {
-                result = Ok((b * FC_BLOCK + i) as u64);
-                false
+        if self.fsst.is_some() {
+            self.find_in_block::<P, true>(lo - 1, key)
+        } else {
+            self.find_in_block::<P, false>(lo - 1, key)
+        }
+    }
+
+    /// Find `probe` in block `b`, whose first key is not above it: `Ok(id)` when it is
+    /// there and otherwise `Err` of the id of the first key above it, or of the next
+    /// block's first id.
+    ///
+    /// The keys are compared without being rebuilt. With `c` the length of the prefix
+    /// that the probe shares with the key before, a key that shares fewer than `c` bytes
+    /// with that key is above the probe, since its byte at the shared length is above the
+    /// key's and so above the probe's, and a key that shares more is below it with the
+    /// same `c`. Only a key that shares exactly `c` bytes has its suffix read and
+    /// compared, and only that suffix is decoded. This relies on the writer storing the
+    /// longest shared prefix, which [`VocabWriter`] does and `sparkles check` verifies.
+    #[inline(always)]
+    fn find_in_block<const P: bool, const F: bool>(
+        &self,
+        b: usize,
+        probe: &[u8],
+    ) -> std::result::Result<u64, u64> {
+        let data = self.data.as_slice();
+        let mut pos = self.block_offset_at::<P>(b);
+        let start = b * FC_BLOCK;
+        let n = FC_BLOCK.min((self.len as usize) - start);
+        if P {
+            ioacct::vocab_blocks_scanned(1);
+            self.touch_block(b);
+        }
+        let lcp = |a: &[u8], b: &[u8]| a.iter().zip(b).take_while(|(x, y)| x == y).count();
+        let e = self.entry::<F>(data, &mut pos, true);
+        let first = &data[e.start..e.start + e.len];
+        match first.cmp(probe) {
+            std::cmp::Ordering::Less => {}
+            std::cmp::Ordering::Equal => return Ok(start as u64),
+            std::cmp::Ordering::Greater => return Err(start as u64),
+        }
+        let mut c = lcp(first, probe);
+        let mut scratch = Vec::new();
+        for i in 1..n {
+            let id = (start + i) as u64;
+            let e = self.entry::<F>(data, &mut pos, false);
+            if e.shared < c {
+                return Err(id);
             }
-            std::cmp::Ordering::Greater => {
-                result = Err((b * FC_BLOCK + i) as u64);
-                false
+            if e.shared > c {
+                continue;
             }
-        });
-        result
+            let suffix: &[u8] = if F && e.coded {
+                scratch.clear();
+                self.push_suffix::<F>(data, e, id, usize::MAX, &mut scratch, false);
+                &scratch
+            } else {
+                &data[e.start..e.start + e.len]
+            };
+            let rest = &probe[c..];
+            match suffix.cmp(rest) {
+                std::cmp::Ordering::Less => c += lcp(suffix, rest),
+                std::cmp::Ordering::Equal => return Ok(id),
+                std::cmp::Ordering::Greater => return Err(id),
+            }
+        }
+        Err(((b + 1) * FC_BLOCK).min(self.len as usize) as u64)
     }
 
     /// Fallible checked reconstruction for call-owned projection scratch. Public
@@ -1088,41 +1278,77 @@ impl Vocab {
     fn scan_block_checked(
         &self,
         b: usize,
+        wanted: u32,
+        reserve: &mut impl FnMut(usize) -> crate::error::Result<()>,
+        f: impl FnMut(usize, &[u8]) -> crate::error::Result<bool>,
+    ) -> crate::error::Result<()> {
+        if self.fsst.is_some() {
+            self.scan_block_checked_as::<true>(b, wanted, reserve, f)
+        } else {
+            self.scan_block_checked_as::<false>(b, wanted, reserve, f)
+        }
+    }
+
+    /// [`Vocab::scan_block_checked`] for an FSST-coded vocabulary when `F`.
+    #[inline(always)]
+    fn scan_block_checked_as<const F: bool>(
+        &self,
+        b: usize,
+        wanted: u32,
         reserve: &mut impl FnMut(usize) -> crate::error::Result<()>,
         mut f: impl FnMut(usize, &[u8]) -> crate::error::Result<bool>,
     ) -> crate::error::Result<()> {
         let data = self.data.as_slice();
         let mut pos = self.block_offset(b);
         let n = FC_BLOCK.min(self.len as usize - b * FC_BLOCK);
+        let wanted = wanted & ((1u32 << n) - 1);
+        if wanted == 0 {
+            return Ok(());
+        }
+        let last = 31 - wanted.leading_zeros() as usize;
         let mut key = Vec::new();
-        for i in 0..n {
+        let mut e = self.entry::<F>(data, &mut pos, true);
+        for i in 0..=last {
             let id = (b * FC_BLOCK + i) as u64;
-            let e = self.entry(data, &mut pos, i == 0);
-            let need = key
-                .len()
-                .min(e.shared)
-                .checked_add(self.suffix_len(data, e, id))
-                .ok_or_else(|| crate::error::Error::invalid("vocabulary scratch overflows"))?;
-            if need > key.capacity() {
-                reserve(need)?;
-                key.try_reserve_exact(need - key.len()).map_err(|e| {
-                    crate::error::Error::invalid(format!("vocabulary allocation failed: {e}"))
-                })?;
-                if key.capacity() != need {
-                    return Err(crate::error::Error::invalid(
-                        "unsupported vocabulary scratch capacity",
+            let next = (i < last).then(|| self.entry::<F>(data, &mut pos, false));
+            let nd = if F {
+                lookahead(wanted, i, next)
+            } else {
+                usize::MAX
+            };
+            if nd > e.shared {
+                let add = if nd == usize::MAX {
+                    self.suffix_len(data, e, id)
+                } else {
+                    (nd - e.shared).min(e.most())
+                };
+                let total =
+                    key.len().min(e.shared).checked_add(add).ok_or_else(|| {
+                        crate::error::Error::invalid("vocabulary scratch overflows")
+                    })?;
+                if total > key.capacity() {
+                    reserve(total)?;
+                    key.try_reserve_exact(total - key.len()).map_err(|e| {
+                        crate::error::Error::invalid(format!("vocabulary allocation failed: {e}"))
+                    })?;
+                    if key.capacity() != total {
+                        return Err(crate::error::Error::invalid(
+                            "unsupported vocabulary scratch capacity",
+                        ));
+                    }
+                    #[cfg(any(test, feature = "failpoints"))]
+                    crate::algo::observe_projection(crate::algo::ProjectionEvent::Materialized(
+                        "vocab-scratch-allocated",
+                        key.capacity(),
                     ));
                 }
-                #[cfg(any(test, feature = "failpoints"))]
-                crate::algo::observe_projection(crate::algo::ProjectionEvent::Materialized(
-                    "vocab-scratch-allocated",
-                    key.capacity(),
-                ));
             }
-            key.truncate(e.shared);
-            self.push_suffix(data, e, id, &mut key, true);
-            if !f(i, &key)? {
+            self.step::<F>(data, e, id, nd, &mut key, true);
+            if wanted >> i & 1 == 1 && !f(i, &key)? {
                 break;
+            }
+            if let Some(n) = next {
+                e = n;
             }
         }
         Ok(())
@@ -1139,15 +1365,10 @@ impl Vocab {
         }
         let b = id as usize / FC_BLOCK;
         self.ahead_for(&[id]).at(self, b);
-        let wanted = id as usize % FC_BLOCK;
         let mut result = None;
-        self.scan_block_checked(b, &mut reserve, |i, key| {
-            if i == wanted {
-                result = Some(f(key));
-                Ok(false)
-            } else {
-                Ok(true)
-            }
+        self.scan_block_checked(b, 1 << (id as usize % FC_BLOCK), &mut reserve, |_, key| {
+            result = Some(f(key));
+            Ok(false)
         })?;
         Ok(result)
     }
@@ -1200,7 +1421,7 @@ impl Vocab {
         }
         let b = lo - 1;
         let mut result = Err(((b + 1) * FC_BLOCK).min(self.len as usize) as u64);
-        self.scan_block_checked(b, &mut reserve, |i, k| {
+        self.scan_block_checked(b, ALL_KEYS, &mut reserve, |i, k| {
             Ok(match k.cmp(key) {
                 std::cmp::Ordering::Less => true,
                 std::cmp::Ordering::Equal => {
@@ -2128,40 +2349,56 @@ mod tests {
             format!("\"a{}", "x".repeat(32 << 10)).into_bytes(),
             b"\"b".to_vec(),
         ];
-        let dir = tempfile::tempdir().unwrap();
-        let mut w = VocabWriter::create(dir.path()).unwrap();
-        for key in &keys {
-            w.push(key).unwrap();
+        for fsst in [false, true] {
+            let dir = tempfile::tempdir().unwrap();
+            write_codec(dir.path(), &keys, fsst);
+            let v = Vocab::open(dir.path()).unwrap();
+            let mut called = false;
+            let blocked = v.get_with_checked(
+                0,
+                |need| if need > 1024 { Err(need) } else { Ok(()) },
+                |_| called = true,
+            );
+            assert!(blocked.unwrap_err() > 32 << 10);
+            assert!(!called);
+            // A front-coded block rebuilds the long key before the short one and
+            // reserves it first. An FSST-coded one decodes only the byte of it that the
+            // short key takes (item 108), so the long key costs nothing.
+            let mut most = 0;
+            let got = v.get_with_checked(
+                1,
+                |need| {
+                    most = most.max(need);
+                    if need > 1024 && fsst {
+                        Err(need)
+                    } else {
+                        Ok(())
+                    }
+                },
+                |k| k.to_vec(),
+            );
+            assert_eq!(got, Ok(Some(keys[1].clone())));
+            if fsst {
+                assert_eq!(most, 2);
+            } else {
+                assert!(most > 32 << 10);
+            }
+            let mut got = Vec::new();
+            v.get_sorted_checked(
+                &[0, 1, 2, 15, u64::MAX],
+                |_| Ok::<_, ()>(()),
+                |id, k| {
+                    got.push((id, k.to_vec()));
+                    Ok(())
+                },
+            )
+            .unwrap();
+            assert_eq!(got, vec![(0, keys[0].clone()), (1, keys[1].clone())]);
+            assert_eq!(
+                v.get_with_checked(u64::MAX, |_| Err::<(), _>(()), |_| panic!("invalid key")),
+                Ok(None)
+            );
         }
-        w.finish().unwrap();
-        let v = Vocab::open(dir.path()).unwrap();
-        let mut called = false;
-        let blocked = v.get_with_checked(
-            1,
-            |need| if need > 1024 { Err(need) } else { Ok(()) },
-            |_| called = true,
-        );
-        assert!(blocked.unwrap_err() > 32 << 10);
-        assert!(!called);
-        assert_eq!(
-            v.get_with_checked(1, |_| Ok::<_, ()>(()), |k| k.to_vec()),
-            Ok(Some(keys[1].clone()))
-        );
-        let mut got = Vec::new();
-        v.get_sorted_checked(
-            &[0, 1, 2, 15, u64::MAX],
-            |_| Ok::<_, ()>(()),
-            |id, k| {
-                got.push((id, k.to_vec()));
-                Ok(())
-            },
-        )
-        .unwrap();
-        assert_eq!(got, vec![(0, keys[0].clone()), (1, keys[1].clone())]);
-        assert_eq!(
-            v.get_with_checked(u64::MAX, |_| Err::<(), _>(()), |_| panic!("invalid key")),
-            Ok(None)
-        );
     }
 
     #[test]
@@ -2501,6 +2738,120 @@ mod tests {
             w.push(k).unwrap();
         }
         w.finish().unwrap();
+    }
+
+    /// Random subsets of a block decode to the keys asked for, whichever keys before
+    /// them are skipped or decoded in part (item 108), with both codecs and every
+    /// decoder, including the checked ones, whose buffer never outgrows what they
+    /// reserved.
+    #[test]
+    fn subsets_of_blocks_decode_like_the_keys() {
+        let mut keys = mixed_keys(400);
+        // keys whose shared prefixes rise and fall within a block, and long ones
+        for i in 0..300 {
+            keys.push(format!("\"{}{}", "ab".repeat(i % 7), "z".repeat(i % 40)).into_bytes());
+            keys.push(format!("<p/{}/{i}", "q".repeat(i % 300)).into_bytes());
+        }
+        keys.sort();
+        keys.dedup();
+        let mut x = 0x9E37_79B9_7F4A_7C15u64;
+        let mut rand = move || {
+            x ^= x << 13;
+            x ^= x >> 7;
+            x ^= x << 17;
+            x
+        };
+        for fsst in [false, true] {
+            let d = tempfile::tempdir().unwrap();
+            write_codec(d.path(), &keys, fsst);
+            let v = Vocab::open(d.path()).unwrap();
+            assert_eq!(v.is_fsst(), fsst);
+            for _ in 0..400 {
+                let b = rand() as usize % keys.len().div_ceil(FC_BLOCK);
+                let mask = rand() as u32;
+                let ids: Vec<u64> = (0..FC_BLOCK)
+                    .filter(|i| mask >> i & 1 == 1)
+                    .map(|i| (b * FC_BLOCK + i) as u64)
+                    .filter(|&id| id < keys.len() as u64)
+                    .collect();
+                let want: Vec<(u64, Vec<u8>)> =
+                    ids.iter().map(|&i| (i, keys[i as usize].clone())).collect();
+                let mut got = Vec::new();
+                v.get_sorted(&ids, |i, k| got.push((i, k.to_vec())));
+                assert_eq!(got, want, "fsst {fsst} block {b} mask {mask:x}");
+                let mut got = Vec::new();
+                let cap = std::cell::Cell::new(0usize);
+                v.get_sorted_checked::<()>(
+                    &ids,
+                    |n| {
+                        cap.set(cap.get().max(n));
+                        Ok(())
+                    },
+                    |i, k| {
+                        assert!(k.len() <= cap.get());
+                        got.push((i, k.to_vec()));
+                        Ok(())
+                    },
+                )
+                .unwrap();
+                assert_eq!(got, want, "checked, fsst {fsst} block {b} mask {mask:x}");
+                for &(i, ref k) in &want {
+                    assert_eq!(v.get(i).as_ref(), Some(k));
+                    assert_eq!(
+                        v.get_with_fallible(i, |_| Ok(()), |k| k.to_vec())
+                            .unwrap()
+                            .as_ref(),
+                        Some(k)
+                    );
+                }
+            }
+        }
+    }
+
+    /// A damaged shared-prefix length in the entry after a key does not make a checked
+    /// decode of the later key reserve room for it (Codex review of item 108): the
+    /// partial decode of the key before reserves at most what its suffix can fill.
+    #[test]
+    fn a_damaged_shared_prefix_reserves_no_more_than_the_suffix() {
+        let keys = [b"\"a".to_vec(), b"\"ab".to_vec()];
+        for fsst in [false, true] {
+            let d = tempfile::tempdir().unwrap();
+            write_codec(d.path(), &keys, fsst);
+            let path = d.path().join("vocab.dat");
+            let data = std::fs::read(&path).unwrap();
+            // the second entry's shared length becomes 2^62
+            let mut pos = 0;
+            read_varint(&data, &mut pos);
+            let len = read_varint(&data, &mut pos) as usize;
+            let second = pos + len;
+            let mut at = second;
+            read_varint(&data, &mut at);
+            let mut out = data[..second].to_vec();
+            write_varint(&mut out, 1 << 62);
+            out.extend_from_slice(&data[at..]);
+            std::fs::write(&path, &out).unwrap();
+            let v = Vocab::open(d.path()).unwrap();
+            let most = std::cell::Cell::new(0usize);
+            let got = v.get_with_checked(
+                1,
+                |need| {
+                    most.set(most.get().max(need));
+                    if need > 1 << 20 { Err(need) } else { Ok(()) }
+                },
+                |k| k.len(),
+            );
+            assert!(
+                most.get() <= 1 << 20,
+                "fsst {fsst}: asked for {}",
+                most.get()
+            );
+            assert!(got.is_ok(), "fsst {fsst}: {got:?}");
+            let got = v.get_with_fallible(1, |_| Ok(()), |k| k.len());
+            assert!(got.is_ok(), "fsst {fsst}");
+            // the unchecked decoders do not panic either
+            v.get(1);
+            v.get_sorted(&[0, 1], |_, _| {});
+        }
     }
 
     /// Long keys are coded in batches bounded by their bytes, which end at a block.
