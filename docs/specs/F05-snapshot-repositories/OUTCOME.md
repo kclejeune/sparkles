@@ -21,7 +21,7 @@ The recorded dates and measurements below describe their original delivery stage
 > **User docs:** [API: Backup repositories](../../API.md#backup-repositories) ·
 > [Usage: Backup repositories](../../USAGE.md#backup-repositories) ·
 > [Features](../../operations/README.md#operations) ·
-> [Benchmarks: Backup repositories](../../BENCHMARKS.md#backup-repositories-105m-triples)
+> [Benchmarks: Backup repositories](../../benchmarks/writes/RESULTS.md#backup-repositories-105m-triples)
 >
 > This is the design as written before implementation. The [Outcome](SPEC.md#outcome) section at
 > the end records how it landed.
@@ -88,7 +88,7 @@ an hourly scheduler tick.
 UI has Playwright tests against the mock and the real server. The W3C and SHACL suites
 were unchanged. A follow-up added NixOS module options with a VM round-trip test.
 
-**Performance.** [Benchmarks: Backup repositories](../../BENCHMARKS.md#backup-repositories-105m-triples)
+**Performance.** [Benchmarks: Backup repositories](../../benchmarks/writes/RESULTS.md#backup-repositories-105m-triples)
 measured 10.5M quads with an `fs` repository on the same disk. A full backup took 0.56 s
 (534 MB/s, against a target of < 5 s). An incremental backup after 1,000 single-quad
 commits took 0.34 s and added 55.3 KB (targets < 1 s and < 200 KB). A restore with a

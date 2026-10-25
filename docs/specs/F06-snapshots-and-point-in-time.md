@@ -16,7 +16,7 @@
 > [API: History queries](../API.md#history-queries) ·
 > [Usage: History, snapshots and clones](../USAGE.md#history-snapshots-and-clones) ·
 > [Features](../storage/README.md#versioning-and-history) ·
-> [Benchmarks: Point-in-time reads](../BENCHMARKS.md#point-in-time-reads-105m-triples)
+> [Benchmarks: Point-in-time reads](../benchmarks/writes/RESULTS.md#point-in-time-reads-105m-triples)
 >
 > This is the design as written before implementation. The [Outcome](#outcome) section
 > at the end records how it landed.
@@ -1428,7 +1428,7 @@ without history.
 
 **Performance.** Acceptance example A23 was measured at 10.5M triples, with 200,000
 single-quad commits in one generation
-([Benchmarks: Point-in-time reads](../BENCHMARKS.md#point-in-time-reads-105m-triples)).
+([Benchmarks: Point-in-time reads](../benchmarks/writes/RESULTS.md#point-in-time-reads-105m-triples)).
 The first read of a cold commit takes 0.6–0.65 s, against a target of < 1 s. Repeat
 reads reuse the cached state and take 0.7–3.6 ms. Reading the base of a sealed
 generation takes 43 ms (target < 50 ms), or 89–93 ms right after a restart, when that
@@ -1640,7 +1640,7 @@ so they vary by tens of percent. `history_performance` in
 | One-commit diff at the head | 2.9 ms | 0.52 ms |
 | Reopen (replays 50,000 commits) | 421 ms | 104 ms |
 
-The benchmark of [Point-in-time reads](../BENCHMARKS.md#point-in-time-reads-105m-triples)
+The benchmark of [Point-in-time reads](../benchmarks/writes/RESULTS.md#point-in-time-reads-105m-triples)
 at the same smaller scale (1,000,000 triples, 50,000 single-quad commits over 4 HTTP
 connections, timed by single `curl` requests) gave:
 

@@ -17,7 +17,7 @@
 > [API: Request ids and the access log](../API.md#request-ids-and-the-access-log) ·
 > [API: Metrics](../API.md#metrics) · [API: Budgets](../API.md#budgets) ·
 > [Features](../operations/README.md#operations) ·
-> [Benchmarks: Full-text index and observability](../BENCHMARKS.md#full-text-index-and-observability-105m-triples)
+> [Benchmarks: Full-text index and observability](../benchmarks/full-text/RESULTS.md#full-text-index-and-observability-105m-triples)
 >
 > This is the design as written before implementation. The [Outcome](#outcome) section at
 > the end records how it landed.
@@ -982,7 +982,7 @@ followed the same day.
 **Performance.** With access logging and metrics on, the 20 harness queries at 10.5M
 triples differ by 0.6% from a run with `--no-access-log --no-metrics`. That is noise.
 `ASK {}` and star-join throughput under `oha` do not change. The numbers are in
-[Benchmarks](../BENCHMARKS.md#full-text-index-and-observability-105m-triples).
+[Benchmarks](../benchmarks/full-text/RESULTS.md#full-text-index-and-observability-105m-triples).
 
 **Phase 2 metrics** (2026-10-03). The four metrics of §4.5 landed, with
 `rows_produced` in the access log.

@@ -637,7 +637,7 @@ the median execution time of distinct-obj from 3.75 to 3.19 µs, compared with t
 before the lazy ledger. Against origin/main at 20f01c82, the release before F14, the
 execution time of the three smallest queries stays 0.5 to 0.7 µs higher, and the wall
 time of the four small queries that the screen flagged is 0.7 to 3.3% higher. The numbers are
-in [BENCHMARKS](../BENCHMARKS.md#the-fixed-cost-of-a-plain-query). The fast account adds
+in [BENCHMARKS](../benchmarks/engine/RESULTS.md#the-fixed-cost-of-a-plain-query). The fast account adds
 a mutex, four atomic counters and a lazily set grant to each query context, and saves the
 ledger that a plain query no longer allocates. A plain query's contribution to its grant
 is unchanged.
@@ -907,7 +907,7 @@ against 8.0 MB before, when its frontiers were not charged. Weakly connected com
 and k-core stay between -2% and -0.2%. The graph is uniform random, so the checks
 inside a long row are covered by the cancellation tests rather than by this timing. Label propagation and FastRP measured +0.4% to +1.4% in one
 run and +0.4% to +0.9% in a repeat, within the noise of the measurement. The table is in
-[BENCHMARKS](../BENCHMARKS.md#graph-algorithm-polling).
+[BENCHMARKS](../benchmarks/graph/RESULTS.md#graph-algorithm-polling).
 
 **Deviations.**
 * A1 says `{h}` appears as a third component "with `algo:nodeClass ex:N`". `nodeClass`

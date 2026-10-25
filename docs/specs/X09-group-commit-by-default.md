@@ -25,7 +25,7 @@
 This design was written from the Sparkles code (`crates/sparkles-core/src/store/group.rs`,
 `store.rs`, `store/wal.rs`, `commit.rs`, `annotations.rs`, `crates/sparkles-server/src/main.rs`
 and its router test `http/router_tests/group_commit.rs`), the write measurements in
-[BENCHMARKS.md](../BENCHMARKS.md#writes-and-updates), the commit identity spec
+[BENCHMARKS.md](../benchmarks/writes/RESULTS.md#writes-and-updates), the commit identity spec
 [CI](CI-commit-identity.md) and its Outcome on the commit record's unfenced count, the
 published work on group commit and on crash consistency listed in §16, the PostgreSQL
 and MySQL documentation of their commit-delay settings, and the Linux documentation of
@@ -138,7 +138,7 @@ a failed `fdatasync`.
 
 ### 2.3 Measurements and open findings
 
-From [BENCHMARKS.md](../BENCHMARKS.md#concurrent-durable-commits):
+From [BENCHMARKS.md](../benchmarks/writes/RESULTS.md#concurrent-durable-commits):
 
 | | Default writer | Group commit |
 |---|---|---|
@@ -1078,7 +1078,7 @@ left them.
 
 **Section 9 gates.** These runs used `forge` on 2026-10-17 with one binary at revision
 758a6a25, comparing the default writer with `--experimental-group-commit`, and nothing
-else running on the host. [BENCHMARKS.md](../BENCHMARKS.md#concurrent-durable-commits)
+else running on the host. [BENCHMARKS.md](../benchmarks/writes/RESULTS.md#concurrent-durable-commits)
 has the tables.
 
 | Gate | 1.05M | 10.5M | Target |
@@ -1334,7 +1334,7 @@ rebuilt. A rerun with cf833158 or later is queued on `forge` with the gates.
 | ext4, embedding | 36,649 | 364 | 46,025 | 1,000 | 0 |
 | XFS, embedding | 26,315 | 357 | 22,619 | 1,000 | 0 |
 
-**Measurements.** [BENCHMARKS.md](../BENCHMARKS.md#group-commit-on-indexed-datasets) has
+**Measurements.** [BENCHMARKS.md](../benchmarks/writes/RESULTS.md#group-commit-on-indexed-datasets) has
 Namespace screens of every index against origin/main and against `--no-group-commit`.
 With 4 ms added to every synchronization on the 10.5M-triple dataset, four writers ran
 2.0 to 2.2 times and sixteen writers 7.7 to 8.5 times the transactions per second of
@@ -1494,7 +1494,7 @@ share to the others. Synchronization order among a pass's files does not
 matter for the invariant, because the marker goes only after every one of them and the
 directory have been synchronized.
 
-[BENCHMARKS.md](../BENCHMARKS.md#bounded-full-text-checkpoint-on-forge) has the traced runs
+[BENCHMARKS.md](../benchmarks/writes/RESULTS.md#bounded-full-text-checkpoint-on-forge) has the traced runs
 of each step. Over two processes of each setting at a fixed 500 transactions/s, the shipped
 build had no write stall over 25 ms where the trace of e411a772 had 73, its longest write
 took 19.5 ms against 171.4 ms, and its maximum schedule lag was 31.0 and 37.9 ms ordinary
@@ -1555,7 +1555,7 @@ section 17.9.
 timing. Each of six cells, one index on a dataset of 1.05M or 10.5M triples, ran five blocks
 of an ordinary, a grouped, a grouped and an ordinary process on native storage, with the
 server pinned to the performance cores. Every process checked its acknowledgements and index
-answers live and after a cold reopen. [BENCHMARKS.md](../BENCHMARKS.md#group-commit-on-indexed-datasets-on-forge)
+answers live and after a cold reopen. [BENCHMARKS.md](../benchmarks/writes/RESULTS.md#group-commit-on-indexed-datasets-on-forge)
 has the tables. The harness judged the gates as first written and found 28 of 36 serial
 checks and 3 of 6 throughput gates met. The user then amended those two gates, as section
 17.9 describes, and `scripts/bench-indexed-report.py` judged the campaign again under the

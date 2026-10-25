@@ -2572,7 +2572,7 @@ list cannot describe rather than large graphs that predicates can.
 Paths are computed per query and nothing is indexed ahead of time. On the 10.5M-triple
 benchmark data, the shortest path between two people 17 edges apart takes about 3 ms,
 where `ASK { … foaf:knows+ … }` for the same pair takes about 125 ms, because the search
-runs from both ends at once ([BENCHMARKS.md](BENCHMARKS.md#path-search)).
+runs from both ends at once ([BENCHMARKS.md](benchmarks/graph/RESULTS.md#path-search)).
 
 ### Finding paths in Explore
 

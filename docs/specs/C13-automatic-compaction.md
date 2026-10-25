@@ -10,8 +10,8 @@
 > **User docs:** [API: Automatic compaction](../API.md#automatic-compaction) ·
 > [Usage: Automatic compaction](../USAGE.md#automatic-compaction) ·
 > [Features](../storage/README.md#storage-and-indexes) ·
-> [Benchmarks: Automatic compaction](../BENCHMARKS.md#automatic-compaction-105m-triples) ·
-> [Benchmarks: Partial compaction](../BENCHMARKS.md#partial-compaction-and-the-spatial-index)
+> [Benchmarks: Automatic compaction](../benchmarks/writes/RESULTS.md#automatic-compaction-105m-triples) ·
+> [Benchmarks: Partial compaction](../benchmarks/loading/RESULTS.md#partial-compaction-and-the-spatial-index)
 >
 > This is the design as written before implementation. The [Outcome](#outcome) section
 > at the end records how it landed.
@@ -684,7 +684,7 @@ rewritten block.
 
 The measurements ran on 2026-10-03 on a shared 16-core machine whose load average was
 between 12 and 50 while other builds ran, so single timings vary by a factor of two or
-more. [Benchmarks](../BENCHMARKS.md#partial-compaction-and-the-spatial-index) has the
+more. [Benchmarks](../benchmarks/loading/RESULTS.md#partial-compaction-and-the-spatial-index) has the
 tables and how to run them.
 
 * **Spatial index.** With 100,000 point geometries in 300,000 quads and 100 commits
@@ -804,7 +804,7 @@ settings over HTTP and across a restart, a read-only server, cancellation for a 
 the flags, the stats and the metrics. `compaction_cmd.rs` and `ui/src/lib/compaction.test.ts`
 cover the CLI and the UI's wording. The W3C SPARQL suites pass unchanged.
 
-**Performance.** [Benchmarks: Automatic compaction](../BENCHMARKS.md#automatic-compaction-105m-triples)
+**Performance.** [Benchmarks: Automatic compaction](../benchmarks/writes/RESULTS.md#automatic-compaction-105m-triples)
 has the measurements at 1.05M triples with 50,000 single-triple commits, taken on a busy
 shared machine. After an automatic compaction, `types-grouped` went from 5.8 ms to 1.9 ms
 and `distinct-obj` from 7.8 ms to 2.2 ms, and `predicate-counts` stayed at 1.9–2.0 ms.

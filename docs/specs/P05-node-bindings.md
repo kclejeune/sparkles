@@ -1549,7 +1549,7 @@ Small SELECT timings remain unstable across processes and change direction in a 
 repeat. Full export consumption varies from 0.8% faster to 1.5% slower, while count-only
 exports are 0.4% to 1.0% slower. Item 329 retains these accepted small export costs and the
 query-control uncertainty. No export rewrite follows from this comparison. Term IDs and
-lazy term decoding already exist. The [benchmark record](../BENCHMARKS.md#native-term-validation)
+lazy term decoding already exist. The [benchmark record](../benchmarks/bindings/RESULTS.md#native-term-validation)
 holds the method, limits and raw samples. Item 33 still covers the remaining binding gaps.
 
 ### Graph overview

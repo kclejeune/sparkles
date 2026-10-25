@@ -25,8 +25,8 @@ The recorded dates and measurements below describe their original delivery stage
 > [API: maps in the web UI](../../API.md#maps-in-the-web-ui) ·
 > [API: CRSs from proj4 definitions](../../API.md#crss-from-proj4-definitions) ·
 > [Features](../../search/README.md#geosparql) ·
-> [Benchmarks: spatial index commit cost](../../BENCHMARKS.md#spatial-index-commit-cost) ·
-> [Benchmarks: GeoSPARQL Compliance Benchmark](../../BENCHMARKS.md#geosparql-compliance-benchmark)
+> [Benchmarks: spatial index commit cost](../../benchmarks/writes/RESULTS.md#spatial-index-commit-cost) ·
+> [Benchmarks: GeoSPARQL Compliance Benchmark](../../benchmarks/spatial/RESULTS.md#geosparql-compliance-benchmark)
 >
 > This is the design as written before implementation. The [Outcome](SPEC.md#outcome) section at
 > the end records how it landed.
@@ -149,7 +149,7 @@ plan run as tests, and so do the GML and KML examples printed in GeoSPARQL 1.1. 
 and SHACL results did not change. Sparkles passes 37 of the 44 cases in Oxigraph's
 GeoSPARQL suite. The other 7 are listed with reasons in
 `testsuite/geosparql/oxigraph/expected-failures.txt`. On the Phase 1 build, the
-[Compliance Benchmark](../../BENCHMARKS.md#geosparql-compliance-benchmark) scored 74 of 206.
+[Compliance Benchmark](../../benchmarks/spatial/RESULTS.md#geosparql-compliance-benchmark) scored 74 of 206.
 After Phase 3 it scores 187 of 206, against the 177 GeoSPARQL Fuseki 3.17 published.
 The extension requirements R25 to R30 ran against a database with RDFS entailment and
 query rewrite, and the others against the plain data. Without the extensions the score is
@@ -157,9 +157,9 @@ query rewrite, and the others against the plain data. Without the extensions the
 buffer computed another way, and rewrite answers that DE-9IM does not give.
 
 **Performance.** The index adds no measurable commit latency ([commit
-cost](../../BENCHMARKS.md#spatial-index-commit-cost)). The §9 query targets are set at
+cost](../../benchmarks/writes/RESULTS.md#spatial-index-commit-cost)). The §9 query targets are set at
 N = 1M and have not been measured at that size.
-[BENCHMARKS.md](../../BENCHMARKS.md#spatial-queries) publishes Q1 to Q9 at 100,000 points
+[BENCHMARKS.md](../../benchmarks/spatial/RESULTS.md#spatial-queries) publishes Q1 to Q9 at 100,000 points
 from `forge` on 2026-10-08, with the index 1.3 to 68 times faster than without it and
 the same answers both ways. The cell grid made 200,000 `sfContains` tests against a 1,024-vertex polygon
 4.3 times faster (60 ms instead of 256 ms) and 5.4 times faster against a 16,384-vertex

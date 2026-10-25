@@ -598,7 +598,7 @@ library callers keep the default and name their patterns as before. A plain SPAR
 request then runs 0.7 to 5.8 thousand fewer instructions than with the references, which
 puts it at or below the commit before Phase 4 on `star-lookup`, `values-star` and
 `types-grouped`. A request in the Sparkles format still pays for them, since it shows
-them. [Benchmarks](../BENCHMARKS.md#the-cost-of-plan-pattern-references) has the numbers.
+them. [Benchmarks](../benchmarks/engine/RESULTS.md#the-cost-of-plan-pattern-references) has the numbers.
 
 **Review.** The Codex review of the phase reported twelve findings, and all twelve were
 confirmed and fixed with a regression test each. Count joins named the aggregate rather

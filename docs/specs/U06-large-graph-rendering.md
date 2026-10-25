@@ -469,7 +469,7 @@ first overview request took a median of 1.12 s with the parallel profiles and 2.
 without, which meets goal 3 only with the parallel build. Repeated requests at the same
 commit return from the cache in under 1 ms. Opening the largest class, `Researcher` with
 300,002 instances, took 1.35 to 2.26 s, and deeper levels took 0.1 to 0.8 s.
-[BENCHMARKS](../BENCHMARKS.md#the-explore-overview) has the table.
+[BENCHMARKS](../benchmarks/engine/RESULTS.md#the-explore-overview) has the table.
 
 **Limits.** A2 and A3, the frame rate and the main-thread checks on a GPU runner, are not
 automated, because the CI browsers run without a GPU. The headless browser used for the

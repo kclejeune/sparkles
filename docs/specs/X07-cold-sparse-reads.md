@@ -16,7 +16,7 @@
 This design was written from the Sparkles code (`crates/sparkles-core/src/index.rs`,
 `vocab.rs`, `sparql/indexjoin.rs`, `sparql/results.rs`, `sparql/ctx.rs`,
 `store/partial.rs`), the cold-start section and the loss table of
-[BENCHMARKS.md](../BENCHMARKS.md#cold-starts), the Linux `madvise(2)`, `mincore(2)`,
+[BENCHMARKS.md](../benchmarks/synthetic/RESULTS.md#cold-starts), the Linux `madvise(2)`, `mincore(2)`,
 `getrusage(2)` and `proc(5)` manual pages, the PAX paper by Ailamaki et al. on the
 layout of columns inside a page, the RocksDB and PostgreSQL documentation on block
 sizes and on prewarming, and the specs [X01](X01-compression-codecs.md),
@@ -26,7 +26,7 @@ sizes and on prewarming, and the specs [X01](X01-compression-codecs.md),
 ## 1. Summary, goals, non-goals
 
 After a restart with an empty page cache, Sparkles answers small lookups slower than
-Oxigraph. At 10.5M triples, cold medians from [BENCHMARKS.md](../BENCHMARKS.md#cold-starts)
+Oxigraph. At 10.5M triples, cold medians from [BENCHMARKS.md](../benchmarks/synthetic/RESULTS.md#cold-starts)
 are:
 
 | Query, cold, 10.5M | Sparkles (ms) | Oxigraph (ms) | Ratio |

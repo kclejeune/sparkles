@@ -1333,7 +1333,7 @@ is listed below.
   CC BY-SA 4.0. The strict scorer compares rows as sets, so the two CK25 questions marked
   `RESULT_ORDER_MATTERS` are scored without their order, and their scores carry
   `orderNotScored`.
-- [BENCHMARKS](../../BENCHMARKS.md#natural-language-questions) gives the Anthropic numbers
+- [BENCHMARKS](../../benchmarks/natural-language/RESULTS.md#natural-language-questions) gives the Anthropic numbers
   per model. Numbers per role, and §3.7's example role lists replaced in the
   documentation with measured ones as §11.4 intends, remain.
 - Add LC-QuAD 2.0 and QALD-10, which §11.1 deferred until a Wikidata subset can be

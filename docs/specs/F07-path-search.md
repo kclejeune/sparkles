@@ -559,7 +559,7 @@ with brute-force costs. `mise run ci` passes, and the W3C suites pass 482/328/15
 
 **Performance at landing.** Measured on the benchmark data's `foaf:knows` graph with a
 warm server, 31 interleaved runs per query, while other builds kept the load average
-between 33 and 80 on 16 cores ([BENCHMARKS.md](../BENCHMARKS.md#path-search)). The
+between 33 and 80 on 16 cores ([BENCHMARKS.md](../benchmarks/graph/RESULTS.md#path-search)). The
 fastest runs at 10.5M were 3.0 ms for the shortest path between two people 17 edges
 apart, against 123 ms for `ASK` with `foaf:knows+` on the same pair, and 2.7 ms for all
 three shortest paths. One shortest path from a person to each of the 892,556 nodes it
@@ -722,7 +722,7 @@ and both ways. This changes answers of earlier releases for searches with `path:
 or `path:both` over predicates with literal objects, which were wrong. The checks run only
 when a lane can leave a literal, which is a lane read by the object on the successor side
 or by the subject on the predecessor side, so a forward search never makes them. The
-[Namespace screen](../BENCHMARKS.md#path-search) found no
+[Namespace screen](../benchmarks/graph/RESULTS.md#path-search) found no
 change above the noise in the searches that use neither new parameter.
 
 `crates/sparkles-core/tests/path_search_filters.rs` tests both parameters in every mode,
@@ -774,7 +774,7 @@ On forge, in interleaved rounds against the build before the change on the 10.5M
 data, a weighted pair search went from 820 ms to 3.5 ms with every edge weighing 1 and from
 4.9 s to 29 ms with weights from 1 to 100. The five cheapest weighted paths had failed at
 the limit of 10 million visited nodes, and they now take 69 ms and 656 ms.
-[BENCHMARKS](../BENCHMARKS.md#weighted-pair-searches) has the figures. The unweighted pair,
+[BENCHMARKS](../benchmarks/graph/RESULTS.md#weighted-pair-searches) has the figures. The unweighted pair,
 k-shortest and `VALUES` searches measured 3 to 4% slower in every round, and weighted
 `path:allShortest` 2.3% slower, although the change does not touch their searches. Item 276
 looks for the cause, and item 277 would run weighted `path:allShortest` from both ends.

@@ -23,7 +23,7 @@ query context and its charges, the cursor operators, the server's limits and fla
 specs [C01](C01-observability-and-budgets.md), [X05](X05-streaming-query-execution.md),
 [F11](F11-encryption-at-rest.md), [C13](C13-automatic-compaction.md),
 [P01](P01-python-bindings.md) and [F03](F03-full-text-search/README.md), the measurements in
-[BENCHMARKS](../BENCHMARKS.md#memory-and-the-speed-it-buys), and published work on
+[BENCHMARKS](../benchmarks/memory/RESULTS.md#memory-and-the-speed-it-buys), and published work on
 external hashing and sorting: M. Kitsuregawa, H. Tanaka and T. Moto-oka, "Application of
 Hash to Data Base Machine and Its Architecture", New Generation Computing 1(1), 1983 (the
 Grace hash join); D. DeWitt et al., "Implementation Techniques for Main Memory Database
@@ -1432,7 +1432,7 @@ process, the ratios of streaming to eager at 1.05M with one thread, 10.5M with o
 `minus`, 0.70, 0.66 and 0.78 for `expr-bind-group`, and 1.09, 0.95 and 0.99 for
 `distinct-join`. `optional-chain` read 1.00, 1.33 and 0.92, and an earlier run on another
 instance read 0.72 at 10.5M with one thread, so it is within the gate in two runs of three
-and noisy in the third. [BENCHMARKS.md](../BENCHMARKS.md#batch-kernels-and-disk-spill)
+and noisy in the third. [BENCHMARKS.md](../benchmarks/memory/RESULTS.md#batch-kernels-and-disk-spill)
 has the full table. The second half of §5.3, no other query slower by more than the tie
 threshold, is checked by the screen in the gate below.
 

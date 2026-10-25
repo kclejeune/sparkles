@@ -5,7 +5,7 @@ what each engine has that Sparkles lacks, the places where Sparkles departs from
 QLever on purpose. [ARCHITECTURE.md](ARCHITECTURE.md) explains the engine's design, and
 the [query optimization reference](internals/OPTIMIZATIONS.md) records its detailed
 fast paths. Benchmark results, including the
-queries Sparkles loses, are in [BENCHMARKS.md](BENCHMARKS.md#where-sparkles-loses). The
+queries Sparkles loses, are in [BENCHMARKS.md](benchmarks/overview/RESULTS.md#where-sparkles-loses). The
 full feature list is in [FEATURES.md](FEATURES.md).
 
 * [Feature gaps by engine](#feature-gaps-by-engine)
@@ -61,8 +61,8 @@ full feature list is in [FEATURES.md](FEATURES.md).
 
 | Area | QLever | Sparkles |
 |---|---|---|
-| Scale | Tested to tens of billions of triples (Wikidata, UniProt) | Measured up to 1.24 billion input triples (English DBpedia). [BENCHMARKS.md](BENCHMARKS.md#dbpedia-at-124-billion-triples) records load time, index size, query timings and the measurement limits. |
-| Streaming execution | Lazy, block-wise scans, joins, filters and GROUP BY. Results streamed to the client | Automatic execution, the default, streams plain scans of a thousand rows or more, large groupings and, with spill enabled, plans expected to outgrow memory, and runs the rest eagerly. Cursor sorts, groupings, DISTINCT and joins can spill to disk when enabled, with optional encryption. Streaming serialization is separate from incremental execution. See [ARCHITECTURE.md](ARCHITECTURE.md#eager-execution-and-cursors-have-different-memory-costs) and the [memory measurements](BENCHMARKS.md#memory-and-the-speed-it-buys). |
+| Scale | Tested to tens of billions of triples (Wikidata, UniProt) | Measured up to 1.24 billion input triples (English DBpedia). [BENCHMARKS.md](benchmarks/dbpedia/RESULTS.md#dbpedia-at-124-billion-triples) records load time, index size, query timings and the measurement limits. |
+| Streaming execution | Lazy, block-wise scans, joins, filters and GROUP BY. Results streamed to the client | Automatic execution, the default, streams plain scans of a thousand rows or more, large groupings and, with spill enabled, plans expected to outgrow memory, and runs the rest eagerly. Cursor sorts, groupings, DISTINCT and joins can spill to disk when enabled, with optional encryption. Streaming serialization is separate from incremental execution. See [ARCHITECTURE.md](ARCHITECTURE.md#eager-execution-and-cursors-have-different-memory-costs) and the [memory measurements](benchmarks/memory/RESULTS.md#memory-and-the-speed-it-buys). |
 | Block prefiltering | FILTER ranges and STRSTARTS checked against block min/max to skip blocks | Numeric range scans on eligible inline segments, vocabulary prefix and id ranges for STRSTARTS and anchored REGEX, selective column decoding and a numeric value column for vocabulary literals. Other cases use generic evaluation. See the [optimization reference](internals/OPTIMIZATIONS.md). |
 | Pattern trick | `ql:has-predicate`, per-subject predicate patterns | Per-subject predicate patterns for the default graph and the union of the named graphs, corrected per subject for pending writes. `spk:hasPredicate` and `ql:has-predicate`, subject counts per predicate and `SELECT DISTINCT ?p` read them ([X11](specs/X11-index-compression-and-predicate-patterns.md#outcome)). |
 | Text and spatial | `ql:contains-word`, BM25 scoring, spatial joins, a geo index | BM25 search through `text:query` (no text/entity co-occurrence index). GeoSPARQL functions, a spatial index, spatial joins and nearest-neighbour ORDER BY. |
@@ -137,9 +137,9 @@ Sparkles' own.
 | Spatial | GeoSPARQL functions (`spargeo`, on by default in the CLI); no spatial index | GeoSPARQL 1.1 functions (geodesic measures, EPSG:4326 axis order, metric buffers) and a per-dataset spatial index |
 | Write durability | One RocksDB transaction per request, written to RocksDB's WAL without an fsync (RocksDB's default) | The WAL is fsynced before a write is acknowledged. A commit waits for one `fdatasync`. When it adds terms the dataset has not seen before, they go to a separate file, which is synced at the same time as the WAL. A commit message or change digest adds one more. |
 
-The [query measurements](BENCHMARKS.md#synthetic-suite-at-105m-triples),
-[write measurements](BENCHMARKS.md#writes-and-updates) and
-[binding comparisons](BENCHMARKS.md#bindings) record the workload-specific differences.
+The [query measurements](benchmarks/synthetic/RESULTS.md#synthetic-suite-at-105m-triples),
+[write measurements](benchmarks/writes/RESULTS.md#writes-and-updates) and
+[binding comparisons](benchmarks/bindings/RESULTS.md#bindings) record the workload-specific differences.
 
 Oxigraph has no reasoning, SHACL, full-text or vector search, path search, CSV imports,
 point-in-time reads, authentication or per-dataset permissions, Fuseki admin API, GraphQL

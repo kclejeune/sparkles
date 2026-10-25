@@ -10,7 +10,7 @@
 > option. Phase 3's blobs shipped with [F05](F05-snapshot-repositories/README.md), compressed
 > with LZ4 rather than zstd.
 >
-> **User docs:** [API: Compression](../API.md#compression) · [Features](../storage/README.md#storage-and-indexes) · [Benchmarks: Compression](../BENCHMARKS.md#compression-105m-triples)
+> **User docs:** [API: Compression](../API.md#compression) · [Features](../storage/README.md#storage-and-indexes) · [Benchmarks: Compression](../benchmarks/memory/RESULTS.md#compression-105m-triples)
 >
 > This is the design as written before implementation; the [Outcome](#outcome) section at
 > the end records how it landed.
@@ -436,7 +436,7 @@ and [bzip2 multi-stream API](https://docs.rs/bzip2/latest/bzip2/read/struct.Mult
   LZ4. The zstd codec byte is reserved and never written.
 
 **Measurements.** These cover items 1–4 of §6 at 10.5M triples. The full results are in
-the [benchmarks](../BENCHMARKS.md#compression-105m-triples).
+the [benchmarks](../benchmarks/memory/RESULTS.md#compression-105m-triples).
 - zstd-3 streams the 1.1 GB N-Quads export as fast as identity (3.74 s against 3.78 s)
   and makes it 13.5× smaller. gzip-6 doubles the wall time and triples the server CPU.
 - `/$/backup` takes 8.2 s with zstd-3 (81.5 MB) and 41 s with gzip-6 (74.9 MB).

@@ -1766,7 +1766,7 @@ the dependencies above.
 ## 8. Performance
 
 The targets are measured on a release build on a quiet machine, as in
-[BENCHMARKS](../../BENCHMARKS.md#setup), and include the §6 checks.
+[BENCHMARKS](../../benchmarks/reference/README.md#setup), and include the §6 checks.
 
 | Input | Target |
 |---|---|

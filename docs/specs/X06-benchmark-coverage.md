@@ -290,7 +290,7 @@ Rules:
 
 ## 5. Fairness rules
 
-These extend [BENCHMARKS.md § Setup](../BENCHMARKS.md#setup).
+These extend [BENCHMARKS.md § Setup](../benchmarks/reference/README.md#setup).
 
 ### 5.1 Durability parity
 
@@ -1234,7 +1234,7 @@ losses remain documented and deferred. This work is separate from refreshing the
 comparison records in item 1.
 
 The first step rebuilds the loss inventory from the full benchmark tables as well as
-[Where Sparkles loses](../BENCHMARKS.md#where-sparkles-loses). A case already brought
+[Where Sparkles loses](../benchmarks/overview/RESULTS.md#where-sparkles-loses). A case already brought
 within the comparison's ten-percent tie band needs a matching measurement and an updated
 record. Prioritize material persistent costs among the losses that remain, using both
 the relative gap and its absolute cost. Roughly 10–25% gaps and 1–2 ms differences

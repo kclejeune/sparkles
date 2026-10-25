@@ -1544,7 +1544,7 @@ each with inserts, deletes, blank nodes, named graphs, compactions, bulk commits
 creation and merges in both directions, and checks every merge against the three-way
 rule applied to dumps.
 
-**Performance.** At 10.5M triples ([BENCHMARKS](../BENCHMARKS.md#branches-and-merges-105m-triples)),
+**Performance.** At 10.5M triples ([BENCHMARKS](../benchmarks/writes/RESULTS.md#branches-and-merges-105m-triples)),
 creating a branch took 19.5 to 32.7 ms over HTTP and wrote about 1.4 KB of files; the
 store's first open adds a 68 KiB change-log segment. A query on a new linked branch took
 as long as on `main` (38.7 against 38.3 ms). A merge of 10,000 inserted quads into a

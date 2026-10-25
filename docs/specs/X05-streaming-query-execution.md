@@ -758,7 +758,7 @@ under the strict policy.
 Correctness and resource gates passed across core, HTTP and the bindings. The benchmark
 refresh, which measures Sparkles only, covers 1.05M, 10.5M and full DBpedia, plus
 specialized suites and matched JVM controls.
-[BENCHMARKS](../BENCHMARKS.md#streaming-execution) reports the current cost of each
+[BENCHMARKS](../benchmarks/memory/RESULTS.md#streaming-execution) reports the current cost of each
 mode on representative queries.
 
 Eager controls matched with the production allocator are close to the previous
@@ -945,7 +945,7 @@ scan does this per batch with no extra state, and the eager scan per parallel ch
 Sorts, top-k and the cursor's decoded value columns read numbers from the column too.
 On full DBpedia the cold `geo-box` query fell from 255 to 108 ms, and the answers are
 identical with the column switched off (`SPARKLES_NUMERIC_COLUMN=off`).
-[BENCHMARKS.md](../BENCHMARKS.md#numeric-literals-in-the-vocabulary) has the
+[BENCHMARKS.md](../benchmarks/dbpedia/RESULTS.md#numeric-literals-in-the-vocabulary) has the
 measurements.
 
 ### Roadmap follow-ups (2026-10-12)
@@ -1070,7 +1070,7 @@ The memory effect is the one the explicit-streaming measurements predicted. At 1
 the full scan with `send=10` peaks at a 1.1 MiB allocation estimate and 66 MiB of server
 RSS by default, against 241.0 MiB and 804 MiB eagerly, and answers in 2 to 5 ms instead
 of 240 to 320 ms. Read whole as TSV, the scan peaks at 581 MiB of RSS instead of 885 MiB
-in about the same time. [BENCHMARKS](../BENCHMARKS.md#streaming-execution) has the table.
+in about the same time. [BENCHMARKS](../benchmarks/memory/RESULTS.md#streaming-execution) has the table.
 
 The first A/B screen on forge flagged the whole name scan at 10.5M in native JSON, which
 the default streams. Its wall time rose by 10.5%, from 553 ms to 611 ms. A profile put
@@ -1159,7 +1159,7 @@ That case has not been measured and is left to item 7.
 Automatic execution now streams a plain scan, its projection or a `LIMIT` over it from an
 estimated thousand rows, where it needed a million before. On forge a cursor wrote such a
 scan faster than eager execution from about a hundred rows on, at one thread and at 12,
-in TSV and native JSON. [BENCHMARKS](../BENCHMARKS.md#streaming-execution) gives the
+in TSV and native JSON. [BENCHMARKS](../benchmarks/memory/RESULTS.md#streaming-execution) gives the
 library times of one probe run, 0.259 ms streamed against 0.332 ms at 1,000 triples and
 1.126 ms against 1.604 ms at 5,000 with 12 threads. An earlier probe run measured 0.22
 against 0.24 ms and 0.85 against 1.10 ms. Filters, top-k and orderings stay eager by
@@ -1171,7 +1171,7 @@ answers were remembered at first, so a scan of a few thousand rows that streamed
 first run went through the blocking pool and the streamed writer on every run. A streamed
 answer that completes in one body, which the server buffers up to 1 MiB, is now
 remembered with its time as well. A stream that `send` stops early has not run the whole
-query and is not remembered. [BENCHMARKS](../BENCHMARKS.md#streaming-execution) measures the threshold
+query and is not remembered. [BENCHMARKS](../benchmarks/memory/RESULTS.md#streaming-execution) measures the threshold
 over HTTP against af4a79d6, which ran these scans eagerly. With one Rayon thread on forge,
 scans of 20,000 and 50,000 rows answered 7% to 15% faster on their first run, and scans of
 1,000 and 5,000 rows matched. On a Namespace AMD EPYC instance every size was within 5%,
@@ -1603,7 +1603,7 @@ calls a SERVICE, and so does `decorrelate_exists` turned off. Planning the patte
 interns their variables and runs none of them.
 
 The rule follows the measurements in
-[BENCHMARKS](../BENCHMARKS.md#automatic-exists). On Namespace with one Rayon thread at
+[BENCHMARKS](../benchmarks/memory/RESULTS.md#automatic-exists). On Namespace with one Rayon thread at
 10.5M, groupings over key-set filters took 0.68 to 0.99 times as long in the cursor as
 eagerly, and a grouping by `BIND(EXISTS …)` took 1.15 times as long. That EXISTS is
 evaluated once per distinct outer key, and the cursor charges each memo entry where eager

@@ -19,8 +19,8 @@ Spatial functions, indexed filters and joins, maps and indexed constant-geometry
 [API: maps in the web UI](../../API.md#maps-in-the-web-ui) ·
 [API: CRSs from proj4 definitions](../../API.md#crss-from-proj4-definitions) ·
 [Features](../../search/README.md#geosparql) ·
-[Benchmarks: spatial index commit cost](../../BENCHMARKS.md#spatial-index-commit-cost) ·
-[Benchmarks: GeoSPARQL Compliance Benchmark](../../BENCHMARKS.md#geosparql-compliance-benchmark)
+[Benchmarks: spatial index commit cost](../../benchmarks/writes/RESULTS.md#spatial-index-commit-cost) ·
+[Benchmarks: GeoSPARQL Compliance Benchmark](../../benchmarks/spatial/RESULTS.md#geosparql-compliance-benchmark)
 
 The [roadmap](../../ROADMAP.md#completion-paths-for-partially-complete-specs)
 tracks remaining work. The delivery record preserves the detailed phase history.

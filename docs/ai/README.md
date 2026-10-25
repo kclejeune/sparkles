@@ -180,7 +180,7 @@ dependencies are recorded in the [central roadmap](../ROADMAP.md).
 * Ask has been evaluated with Anthropic models only, on the demo set, CK25, QALD-9-plus
   and 74 DBpedia-only questions
   ([C18](../specs/C18-natural-language-questions-and-ingest/OUTCOME.md#roadmap-follow-ups-2026-10-12),
-  [BENCHMARKS.md](../BENCHMARKS.md#natural-language-questions)). On the retained 107-question
+  [BENCHMARKS.md](../benchmarks/natural-language/RESULTS.md#natural-language-questions)). On the retained 107-question
   DBpedia repeat, Sonnet answers 31 under projected-column scoring and 9 with equal-width
   scoring. Haiku answers 26 and 23 respectively. These
   repeated regression questions do not measure unseen generalization. Model-dependent

@@ -1172,7 +1172,7 @@ still establishes its grandfather baseline from the current report.
 **Cost at Phase 1.** Every validated write ran a full validation of the data graph. For
 SHACL that took about 160 ms at 1M triples. Skipped writes were free. The standalone
 validator's numbers are in
-[BENCHMARKS: Other measurements](../BENCHMARKS.md#other-measurements).
+[BENCHMARKS: Other measurements](../benchmarks/writes/RESULTS.md#other-measurements).
 
 **Phase 2 shipped on 2026-10-02.**
 

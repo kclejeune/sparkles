@@ -748,7 +748,7 @@ client types list the new parameters.
 - **Grouped diff size against time.** Over a base of 200,000 typed resources, grouping a
   commit of 1,000, 10,000 and 100,000 changes took 1.30, 11.21 and 119.54 ms on top of
   diffs of 0.68, 5.35 and 78.63 ms, about 1.2 µs per change. These are local numbers from
-  a busy laptop, recorded in [BENCHMARKS](../BENCHMARKS.md#diffs-grouped-by-class), and
+  a busy laptop, recorded in [BENCHMARKS](../benchmarks/writes/RESULTS.md#diffs-grouped-by-class), and
   wait for confirmation on forge.
 
 #### Where the build differs from the design

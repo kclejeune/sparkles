@@ -893,7 +893,7 @@ capabilities and remaining work are described by the spec status and Outcome.
 - PUT starts a `view-build` task that waits for the first evaluation on the worker,
   rather than running the evaluation in the task.
 
-**Measurements.** See [BENCHMARKS](../BENCHMARKS.md#incremental-views). Three pinned forge
+**Measurements.** See [BENCHMARKS](../benchmarks/writes/RESULTS.md#incremental-views). Three pinned forge
 runs at 200,000 and 1,000,000 people put touching rounds near one query evaluation, with
 median per-run ratios from 0.93 to 1.07. Unrelated commits skipped the view in at most
 0.053 ms in the published medians. The materialized class-count view skipped 166 of its

@@ -22,7 +22,7 @@ The recorded dates and measurements below describe their original delivery stage
 > now recover in the background at persistent open. Facets, search at historical
 > snapshots and an opt-in stale mode are not built.
 >
-> **User docs:** [API: Full-text search](../../API.md#full-text-search) · [Features](../../search/README.md#search) · [Benchmarks: Full-text index and observability](../../BENCHMARKS.md#full-text-index-and-observability-105m-triples)
+> **User docs:** [API: Full-text search](../../API.md#full-text-search) · [Features](../../search/README.md#search) · [Benchmarks: Full-text index and observability](../../benchmarks/full-text/RESULTS.md#full-text-index-and-observability-105m-triples)
 >
 > This is the design as written before implementation. The [Outcome](SPEC.md#outcome) section at
 > the end records how it landed.
@@ -137,7 +137,7 @@ checks, not simulated power-loss measurements.
 acceptance examples, with a test hook that fails an index commit. Server tests cover the
 routes, and the Playwright smoke tests include text search.
 
-**Performance** ([benchmarks](../../BENCHMARKS.md#full-text-index-and-observability-105m-triples),
+**Performance** ([benchmarks](../../benchmarks/full-text/RESULTS.md#full-text-index-and-observability-105m-triples),
 10.5M triples). Building the index over every string literal takes 8.0 s and 102 MB on
 disk. With the lazy commit, a 1,000-triple insert takes 28.4 ms with text search on, against
 24–26 ms with it off and 46.2 ms with a commit per write. A top-10 `text:query` takes about

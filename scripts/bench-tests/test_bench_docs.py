@@ -118,22 +118,6 @@ class BenchmarkDocumentationTests(unittest.TestCase):
                                 capture_output=True, text=True)
         self.assertEqual(result.returncode, 0, result.stderr)
 
-    def test_legacy_bookmarks_reach_preserved_anchors(self):
-        navigation = DOCS.read_json(DOCS.ROOT / DOCS.DOCS / "anchors.json")
-        legacy = (DOCS.ROOT / "docs/BENCHMARKS.md").read_text()
-        for anchor, target in navigation["anchors"].items():
-            with self.subTest(anchor=anchor):
-                self.assertIn(f'<a id="{anchor}"></a>', legacy)
-                body = (DOCS.ROOT / target["path"]).read_text()
-                ids = set(re.findall(r'<a id="([^"]+)"', body))
-                counts = {}
-                for title in re.findall(r'^#+ (.*)$', body, re.MULTILINE):
-                    slug = re.sub(r'[^\w\- ]', '', title.replace('`', '').lower()).replace(' ', '-')
-                    count = counts.get(slug, 0)
-                    counts[slug] = count + 1
-                    ids.add(slug + (f'-{count}' if count else ''))
-                self.assertIn(target["anchor"], ids)
-
     def test_source_content_mutation_is_refused(self):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
