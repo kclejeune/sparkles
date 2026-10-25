@@ -298,7 +298,7 @@ def main():
                 raw_digest = hashlib.sha256(body).hexdigest()
                 answer = json.loads(body)
                 fingerprint = fingerprints.select_record(text, answer, False)
-            except (OSError, ValueError, TypeError, KeyError, AttributeError):
+            except Exception:  # Match bench-answers, including numeric fingerprint failures.
                 # Use the same parse boundary as bench-answers. Such a capture has
                 # no fingerprint there, so it cannot acquire an acceptance verdict.
                 engines[engine] = {"status": "capture-error", "problems": ["unreadable or invalid SPARQL JSON"],

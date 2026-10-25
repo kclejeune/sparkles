@@ -147,7 +147,8 @@ class CaptureTests(unittest.TestCase):
 
     def test_bad_capture_is_isolated_from_valid_peers(self):
         valid = json.dumps(products_answer(()))
-        for body in ['{invalid', '{}', '{"head":{"vars":["product"]},"results":{"bindings":[null]}}']:
+        for body in ['{invalid', '{}', '{"head":{"vars":["product"]},"results":{"bindings":[null]}}',
+                     '{"head":{"vars":{"product":true}},"results":{"bindings":[{"product":{"type":"literal","datatype":"http://www.w3.org/2001/XMLSchema#double","value":"1e1000000"}}]}}']:
             receipt = self.run_cli({"valid": valid, "broken": body})
             self.assertEqual(receipt["queries"]["bi-q7-1"]["valid"]["status"], "ok")
             broken = receipt["queries"]["bi-q7-1"]["broken"]
