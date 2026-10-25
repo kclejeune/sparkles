@@ -61,6 +61,11 @@ work, and each item links to its design spec in [docs/specs](docs/specs/README.m
   linked from [FEATURES.md](docs/FEATURES.md). Keep configuration, usage and roadmap
   sections discoverable there. FEATURES owns the capability matrix, and ROADMAP owns
   item priorities and dependencies. Preserve existing links when moving content.
+- Benchmark methodology and results belong in `docs/benchmarks/<workload>/README.md`
+  and `RESULTS.md`, linked from the benchmark index. Keep raw run records immutable
+  and identify their host, build, configuration and correctness evidence. Distinguish
+  manual reports from generated reports, and check generated output against its
+  explicit source selection with `python3 scripts/bench-docs.py --check`.
 - When a roadmap item or spec phase ships, update its spec's Outcome section,
   [docs/FEATURES.md](docs/FEATURES.md), [docs/BENCHMARKS.md](docs/BENCHMARKS.md) when there
   are numbers, and the item's row in [docs/ROADMAP.md](docs/ROADMAP.md), all in the same

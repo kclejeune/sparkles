@@ -126,7 +126,7 @@ establish a current peer ranking. The
 new-literal commits near 1.2 ms for Sparkles and 0.6 ms for unsynced Oxigraph at 10.5M
 triples. Sparkles also uses more memory than QLever at its peak in exchange for speed,
 1,339 MiB against 939 MiB under 16 readers at 10.5M triples, mostly for a 1 GiB decoded-block cache that can be made
-smaller. [docs/BENCHMARKS.md](docs/BENCHMARKS.md) has every measurement, the cost of each
+smaller. The [benchmark reports](docs/benchmarks/README.md) give the measurements, the cost of each
 memory tradeoff and [every case where Sparkles loses](docs/BENCHMARKS.md#where-sparkles-loses).
 
 ## Web UI
@@ -332,7 +332,7 @@ published to a registry, so build them with `mise run jvm:build`, `mise run py:b
 | Document | Contents |
 |---|---|
 | [Features](docs/FEATURES.md) | Every capability, area by area, and the known gaps. |
-| [Benchmarks](docs/BENCHMARKS.md) | Results against Jena, QLever, Fluree and Oxigraph, with the setup and every loss. |
+| [Benchmarks](docs/benchmarks/README.md) | Results against Jena, QLever, Fluree and Oxigraph, with setup, raw-run catalogs, charts and measured losses. |
 | [Architecture](docs/ARCHITECTURE.md) | Library boundaries, storage, execution and the main design decisions. |
 | [Comparison](docs/COMPARISON.md) | Feature gaps per engine and where Sparkles departs from Jena and QLever. |
 | [Usage](docs/USAGE.md) | The server, the CLI, the bindings, MCP, backups and deployment. |

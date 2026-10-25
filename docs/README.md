@@ -21,7 +21,7 @@ This index lists the Sparkles documentation by what a reader wants to do. The re
 | [Features](FEATURES.md) | The capability matrix and category guides with current scope, configuration, usage, limitations and roadmap links. |
 | [Architecture](ARCHITECTURE.md) | The library boundaries, storage, execution and the main design decisions. |
 | [Comparison](COMPARISON.md) | The gaps and tradeoffs against Jena, QLever, Fluree and Oxigraph, and where Sparkles departs from Jena on purpose. |
-| [Benchmarks](BENCHMARKS.md) | The published performance results, their setup and every case where Sparkles loses. |
+| [Benchmarks](benchmarks/README.md) | Workload guides, published results, raw-run catalogs and generated charts, including the measured losses and comparison limits. |
 | [Query optimizations](internals/OPTIMIZATIONS.md) | Operator fast paths, when they apply and the local cost-model measurements behind them. |
 
 ## Design and planning
@@ -48,8 +48,10 @@ This index lists the Sparkles documentation by what a reader wants to do. The re
 * FEATURES holds the capability matrix. Its category guides own current capability
   details and limitations, with configuration, usage and roadmap links. Comparison
   explains what those limits mean for compatibility or migration.
-* Benchmarks holds published timings and their setup. Local optimization measurements stay
-  with their rationale and say that they are local.
+* Benchmark categories hold methodology, results and immutable run catalogs. Keep
+  manually maintained reports distinct from generated reports and their explicit source
+  selections. Local optimization measurements stay with their rationale and say that
+  they are local.
 * A spec keeps its original design. Its status and Outcome change with the behavior, and
   the user guide changes with them. A specified phase is not a shipped capability.
 * The source audit is historical context, and the guides describe supported behavior.
