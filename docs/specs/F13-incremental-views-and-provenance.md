@@ -898,3 +898,22 @@ nonmonotone analyses retain that fallback.
 Recovery tests must cross input publication, durable job creation, partial circuit
 maintenance and guarded result publication, checking that a result cannot remain
 labelled current while an unexamined relevant input change is pending.
+
+### Dataset shutdown and directory ownership
+
+The final dataset handle synchronizes shutdown with worker acquisition and any round
+already in progress. A separate shared lifetime guard counts dataset handles without
+counting temporary worker or host references. Closing waits for the worker to release
+its store reference before the dataset releases its directory lock. If a worker
+callback releases the final handle, cleanup runs after that round releases its locks,
+including when the round unwinds a panic.
+
+Two causal regressions fail against the earlier implementation. One pauses a host while
+it holds a temporary third state reference. The other pauses worker acquisition before
+it obtains a store reference. The seven regression tests cover these cases, cloned
+handles, concurrent final drops, worker panic, closing from a worker store destructor
+and closing from a host callback, including panic after a deferred close request.
+
+All 51 targeted incremental view tests pass. The GraphQL feature configuration passes
+all 776 tests, and 50 repetitions of all six HTTP group commit tests pass. These include
+the persistent reopen assertion that exposed the directory lock race.
