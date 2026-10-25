@@ -7904,11 +7904,14 @@ actual merged target candidate against the pinned target state, preserving the t
 independent changes. Unresolved merge conflicts leave the candidate unavailable.
 Heads that move between inspection and simulation refuse the stale preview.
 
-The library exposes `Dataset::reasoning().diff` and `.diff_preview`. Python and Node use
+The library exposes `Dataset::reasoning().diff` and `.diff_preview`. Python uses
+`ds.reasoning.diff(from_state, to_state, options=options)`. Node uses
 `ds.reasoning.diff(from, to, options)`, and the JVM uses `ds.reasoning().diff(from, to,
 options)`. The CLI accepts `sparkles infer --loc DB --diff main..feature` with JSON,
 text, TriG or RDF Patch output. The read-only MCP tool `entailment_diff` accepts
-`dataset`, `from`, `to` and the bounded program options.
+`dataset`, `from`, `to`, `profile`, `rules`, `inputs`, `sampleLimit` and
+`timeoutSeconds`. Its sample limit is at most 100 per direction. Memory and inference
+ceilings come from server policy.
 
 ## Minimal justifications
 
@@ -7939,10 +7942,10 @@ subset checks, which can exhaust the allowance sooner than monotone contraction.
 finding, or `null` when no support was certified within the allowance, together with
 `justificationComplete`. `justificationsComplete` and `justificationChecks` cover the
 whole report. Diagnostics and supports share one retained snapshot and deadline.
-The CLI adds `--justify` to `infer --check`. Python and Node expose
+The CLI adds `--justify` to `infer --check`. Python exposes
+`ds.reasoning.justify(target, options=options)`, Node exposes
 `ds.reasoning.justify(target, options)`, and the JVM exposes
 `ds.reasoning().justify(request)`.
-
 
 ## RDFS on read
 
@@ -10454,7 +10457,7 @@ open-world when SERVICE is allowed. The common arguments are:
 | `community_reports` | `query` (≤ 2000 characters), `level` (the finest level with at most 100 reports), `reviewedOnly` (false), `limit` (10, ≤ 100), `findings` (true), `timeoutSeconds` (30) | `{dataset, available, reason?, message?, reportsGraph, level, levels: [{level, reports}], ranking, stale, reports: [{iri, community, level, title, summary, status, rating, memberCount, score?, findings: [{iri, text, cites}]}]}`, described below. |
 | `why_empty` | `query` (required, ≤ 65536 characters), `timeoutSeconds` (30) | `{dataset, commit, empty, first?, steps, unchecked?, complete, message, prefixes}`, described in [Checking and explaining queries](#checking-and-explaining-queries). |
 | `explain_inference` | `triple` (required, Turtle with the dataset's prefixes, such as `ex:tom a ex:Animal`), `mode` (`why`; `whyNot` is not available), `maxTrees` (1, at most 10), `maxDepth` (32, at most 64), `timeoutSeconds` | The answer of [Explanations](#explanations) with `dataset`, `summaries` (one line per tree, such as `ex:tom a ex:Animal because ex:tom a ex:Cat (asserted) and ex:Cat rdfs:subClassOf ex:Animal (asserted), by rdfs9`) and `prefixes`. A triple with no derivation from facts the caller reads gives `entailed: false` and a `message`. Offered in builds with the `reasoning` feature. |
-| `entailment_diff` | `dataset`, `from`, `to`, program options and analysis limits | Complete entailment counts, bounded samples and new findings between two retained states. The tool is read-only and requires the reasoning feature. |
+| `entailment_diff` | `dataset`, `from` (required), `to` (`head`), `profile`, `rules`, `inputs`, `sampleLimit` (100, 1–100 per direction), `timeoutSeconds` (30, capped by server policy) | Complete entailment counts, bounded samples and new findings between two retained states. The tool is read-only and requires the reasoning feature. |
 | `share_query` | `query` (required, ≤ 65536 characters), `question` (≤ 2000 characters), `explanation` (≤ 400 characters), `assumptions` (≤ 5), `branch`, `atCommit` | `{url, dataset, commit, ok, issues, prefixes}`. The link opens the query in a new tab of the UI's query page with the question header. The query is checked and never run. Listed only when the server knows the UI's address, which is the request's own host over HTTP and `--ui-url` over stdio. A payload over 32 KiB is refused with `too-large`, and an update with `not-a-query`. |
 | `validate_shacl` | `shapes` (required: a shapes graph in Turtle, ≤ 1 MiB), `shapesFormat` (`turtle` or `shaclc`), `graph` (`default`\|`union`\|IRI), `maxResults` (20, ≤ `--mcp-max-rows`), `timeoutSeconds` (30) | `{dataset, commit, reasoning, conforms, total, bySeverity: {violation, warning, info}, results: [{focus, path?, value?, shape, constraint, severity, message?}], truncated, prefixes}`: the validation of [`/{ds}/shacl`](#shacl-validation). The most severe results come first, then results are ordered by shape and focus node. `severity` is `Violation`, `Warning` or `Info`. SHACL 1.2 `Debug` and `Trace` count as info. A complex `path` is a SPARQL property path. Only in builds with the `shacl` feature. |
 | `validate_shex` | `schema` (required: ShExC, or ShExJ when it starts with `{`; ≤ 1 MiB), `shapeMap` (required: a compact shape map, ≤ 65536 characters), `graph`, `onlyNonconformant` (true), `maxResults` (20, ≤ `--mcp-max-rows`), `timeoutSeconds` (30) | `{dataset, commit, reasoning, conforms, counts: {conformant, nonconformant}, results: [{node, shape, status, reason?, failures?}], truncated, warnings, prefixes}`: the validation of [`/{ds}/shex`](#shex-validation), with results in shape-map order. `shape` is `START` for a START association. `failures` are the report's `appinfo.failures`, with `value` as a term and `predicate` as an IRI. Prefixed names in the map use the schema's prefixes, then the dataset's. `IMPORT` is refused with `bad-argument`, so put the imported shapes into the schema. EXTERNAL shapes have no definition (`invalid-schema`). `SPARQL """…"""` node selectors run on the data graph under the call's row and memory budgets, without SERVICE, and with only their own prefixes. A failing selector query is `invalid-schema`. Only in builds with the `shex` feature. |

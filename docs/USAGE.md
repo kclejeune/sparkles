@@ -3378,9 +3378,10 @@ explains the recorded materialization at its original commit, including stale fa
 
 The Diagnostics panel can show minimal supports for a finding and probe a class for
 unsatisfiability. Expand a support to see ontology axioms and assertions separately.
-**Preview removal** creates a new branch from the finding's commit and previews deleting
-that exact asserted fact, including its reasoning changes. Review the candidate before
-choosing **Apply to draft branch**. The source branch is unchanged.
+Choose **Remove on a branch** beside a support fact, then **Create branch and preview**
+to create a draft from the finding's commit and preview deleting that exact asserted
+fact, including its reasoning changes. Review the candidate before choosing
+**Apply removal on branch**. The source branch is unchanged.
 
 ![Preview a support fact removal and its reasoning changes](images/reasoning-support-preview.png)
 
