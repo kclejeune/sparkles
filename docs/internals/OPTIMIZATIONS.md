@@ -352,6 +352,12 @@ Each of these can be switched off per query (`QueryOptions::optimizations`) or p
   switched off, a key costs 140 rows plus 6 per doubling, and probing wins up to about 1
   or 2%. Probing is not offered when it would cost more than twice the scan of the
   pattern. EXPLAIN counts the keys, seeks, blocks and rows read (`batched_join`).
+  A single two-column probe whose other variable is already present in the input can
+  narrow each primary-key span by a bound secondary value. It verifies secondary
+  ordering within equal primary keys before binary search, with cancellation and
+  deadline checks during that pass. This uses the existing probe table without another
+  index allocation. Equal secondary rows keep their multiplicity, and an unbound value
+  or unordered secondary column retains the complete compatibility scan.
 * **Fused stars.** Index joins on one subject over constant predicates (`?p ex:worksFor
   ex:org7 ; foaf:name ?n ; foaf:age ?a`) run as one operator (`StarJoin`). It walks each
   subject's SPO run once and picks out the star's predicates, or probes each pattern's own

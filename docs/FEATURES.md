@@ -405,6 +405,9 @@ check them against the W3C suites and Jena's own answers.
   snapshot read proves that the pattern has exactly one row. This makes other patterns
   and numeric FILTER bounds constant while preserving the result variables. Volatile
   filters, application callbacks and algebra boundaries retain the ordinary plan.
+* An index join can use a bound second variable to skip incompatible rows within an
+  already-read key range. It preserves input order, duplicate solutions and unbound
+  matches, and retains all compatibility checks when the secondary ordering cannot be used.
 * Queries can run eagerly or as streaming cursors
   ([X05](specs/X05-streaming-query-execution.md)). Automatic execution, the default over
   HTTP, in the CLI, in Node and in the JVM library, streams scans expected to return at
