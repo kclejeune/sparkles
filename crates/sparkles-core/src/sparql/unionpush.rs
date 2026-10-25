@@ -121,7 +121,7 @@ pub(super) fn limited_input(ctx: &super::ctx::Ctx, node: &Node) -> bool {
             .load(std::sync::atomic::Ordering::Relaxed)
         // Widening can itself exceed a tight output or memory budget. Reuse the
         // conservative whole-subtree bounds before keeping the larger prefix.
-        && !retried.is_some_and(|c| restarts_build(c, &mut 128) && ordering_fits(ctx, c))
+        && !retried.is_some_and(|c| restarts_build(c, &mut 128) && ordering_fits(ctx, node))
 }
 
 /// A prefix's live rows cannot exceed its covering base blocks and inserted keys.

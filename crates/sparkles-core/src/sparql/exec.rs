@@ -9017,4 +9017,142 @@ mod limited_startup_tests {
             3
         );
     }
+
+    fn expanding_consumer(index_probe: bool) -> Result<()> {
+        use super::super::indexjoin::{IndexJoinSpec, Probe};
+
+        let store = Store::in_memory(StoreOptions::default());
+        let data: String = (0..64)
+            .map(|i| {
+                format!(
+                    "<urn:record:{i:04}> <urn:driver> <urn:key> . \
+                 <urn:key> <urn:probe> <urn:value:{i:04}> .\n"
+                )
+            })
+            .collect();
+        store
+            .load(&[Source::from_bytes(
+                data.into_bytes(),
+                RdfFormat::Turtle,
+                None,
+            )])
+            .unwrap();
+        let mut ctx = Ctx::new(store.snapshot());
+        ctx.use_cache = false;
+        ctx.max_rows = 1000;
+        let subject = ctx.var("subject");
+        let key = ctx.var("key");
+        let value = ctx.var("value");
+        let term = |text: &str| ctx.intern_term(&oxrdf::NamedNode::new(text).unwrap().into());
+        let key_id = term("urn:key");
+        let driver = Node::leaf(
+            Kind::Scan(ScanSpec {
+                perm: Perm::Pso,
+                prefix: vec![term("urn:driver").0],
+                cols: vec![(1, subject)],
+                eqs: Vec::new(),
+                graph: GraphFilter::Default,
+                graph_col: 3,
+                dedup: false,
+                src: None,
+            }),
+            vec![subject],
+            64.0,
+            "bounded driving scan".into(),
+        );
+        let mut one = Table::new(vec![key]);
+        one.push_row(&[key_id]);
+        let build = Node::leaf(Kind::Values(one), vec![key], 1.0, "nested build".into());
+        let mut nested = Node::leaf(
+            Kind::Join {
+                algo: JoinAlgo::Cross,
+                keys: Vec::new(),
+            },
+            vec![subject, key],
+            128.0,
+            "bounded nested join".into(),
+        );
+        nested.children = vec![driver, build];
+        let mut consumer = if index_probe {
+            let mut node = Node::leaf(
+                Kind::IndexJoin(Box::new(IndexJoinSpec {
+                    key,
+                    probes: vec![Probe {
+                        scan: ScanSpec {
+                            perm: Perm::Pso,
+                            prefix: vec![term("urn:probe").0],
+                            cols: vec![(1, key), (2, value)],
+                            eqs: Vec::new(),
+                            graph: GraphFilter::Default,
+                            graph_col: 3,
+                            dedup: false,
+                            src: None,
+                        },
+                        filter: Vec::new(),
+                        star: None,
+                    }],
+                })),
+                vec![subject, key, value],
+                4096.0,
+                "expanding probe".into(),
+            );
+            node.children.push(nested);
+            node
+        } else {
+            let mut values = Table::new(vec![value]);
+            for i in 0..64 {
+                values.push_row(&[term(&format!("urn:value:{i:04}"))]);
+            }
+            let build = Node::leaf(
+                Kind::Values(values),
+                vec![value],
+                64.0,
+                "consumer build".into(),
+            );
+            let mut node = Node::leaf(
+                Kind::Join {
+                    algo: JoinAlgo::Cross,
+                    keys: Vec::new(),
+                },
+                vec![subject, key, value],
+                4096.0,
+                "expanding join".into(),
+            );
+            node.children = vec![nested, build];
+            node
+        };
+        consumer.cost = 4096.0;
+        let mut union = Node::leaf(
+            Kind::Union,
+            consumer.vars.clone(),
+            4096.0,
+            "pure union".into(),
+        );
+        union.cost = consumer.cost;
+        union.children = vec![consumer, Node::empty(vec![subject, key, value])];
+        let mut root = unary(
+            Kind::Slice {
+                offset: 0,
+                limit: Some(1),
+            },
+            union,
+            "ASK demand",
+        );
+        super::super::unionpush::order_ask(&ctx, &mut root);
+        assert!(ctx.eager_union_demand.load(AtomicOrdering::Relaxed));
+        let (out, _) = execute(&ctx, &root)?;
+        assert_eq!(out.len(), 1);
+        assert_eq!(out.cols[1][0], key_id);
+        Ok(())
+    }
+
+    #[test]
+    fn nested_join_prefix_keeps_the_expanding_consumer_within_its_budget() {
+        expanding_consumer(false).unwrap();
+    }
+
+    #[test]
+    fn probe_prefix_keeps_the_expanding_consumer_within_its_budget() {
+        expanding_consumer(true).unwrap();
+    }
 }

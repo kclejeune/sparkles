@@ -1353,11 +1353,14 @@ to reorder index-probe branches or certify their estimated fanout.
 A broader execution check found that a filtered join with its first match at row nine
 rebuilt its thousand-row input three times under prefixes one, eight and sixty-four.
 The ordinary prefix built it once. Retrying operators now keep the ordinary prefix
-when their input would restart a full join build and conservative subtree bounds prove
-that widening fits the row and memory limits. Tight budgets retain exact demand even
-when this can repeat build work. Projections and constant bindings
+when their input would restart a full join build and conservative whole-consumer bounds
+prove that widening fits the row and memory limits. Tight budgets retain exact demand even
+when this can repeat build work, which remains under roadmap item 292. Projections and constant bindings
 preserve exact demand so they do not drain additional UNION operands. The physical
 regression checks the same answer and one build in both cases, with result caching off.
+Nested-join and native probe controls keep exact demand when a bounded child would
+expand beyond the consuming operator's row limit. Unknown probe bounds retain exact
+demand.
 
 Additional data-oracle controls vary vocabulary, sizes, uniform and skewed keys,
 Unicode literals, duplicate solutions and updates while retaining old snapshots.
