@@ -1,0 +1,66 @@
+PREFIX ev: <urn:x-sparkles:evidence:>
+PREFIX rdf: <http://www.w3.org/1999/02/22-rdf-syntax-ns#>
+PREFIX rdfs: <http://www.w3.org/2000/01/rdf-schema#>
+PREFIX owl: <http://www.w3.org/2002/07/owl#>
+PREFIX xsd: <http://www.w3.org/2001/XMLSchema#>
+PREFIX prov: <http://www.w3.org/ns/prov#>
+PREFIX oa: <http://www.w3.org/ns/oa#>
+PREFIX ex: <https://example.org/>
+
+ex:bulletin a ev:Source .
+ex:other a ev:Source .
+ex:mirror a ev:Source .
+ex:revision1 a ev:SourceRevision ; prov:specializationOf ex:bulletin ;
+  ev:sourceKey "bulletin/1" ; ev:contentDigest "sha256:aa7c37f696e8a9826de4f8a9f3582d4b781f4e1657c4ec5d0bfba31361979307" ;
+  ev:publishedAt "2026-01-01T12:00:00+02:00"^^xsd:dateTime ;
+  ev:firstAvailableAt "2026-01-01T10:03:00Z"^^xsd:dateTime ;
+  ev:availabilityReceipt ex:demonstrationReceipt ; ev:sourceFamily ex:publisherFamily .
+ex:revision2 a ev:SourceRevision ; prov:specializationOf ex:other ; ev:sourceKey "other/1" ;
+  ev:contentDigest "sha256:5af3a6121484f24a48559010837b796bab7fbc5f99e0fbfc9dec83d32ee867f0" .
+ex:mirrorRevision a ev:SourceRevision ; prov:specializationOf ex:mirror ; ev:sourceKey "mirror/1" ;
+  ev:contentDigest "sha256:aa7c37f696e8a9826de4f8a9f3582d4b781f4e1657c4ec5d0bfba31361979307" ; ev:upstreamSource ex:revision1 ; ev:sourceFamily ex:publisherFamily .
+ex:text a ev:Rendition ; prov:wasDerivedFrom ex:revision1 ; prov:wasGeneratedBy ex:conversion ;
+  ev:contentDigest "sha256:845aa90eb948d20991c9a280a452622821a26b3f19570d7b4074e041393a9d45" ; ev:mediaType "text/plain" ; ev:language "en" ;
+  ev:normalizedText "Advisory: Café release 1.0 is affected.\n" .
+ex:selector a oa:TextPositionSelector ; oa:start 10 ; oa:end 14 .
+ex:passage a ev:Passage, oa:SpecificResource ; oa:hasSource ex:text ;
+  ev:sourceRevision ex:revision1 ; oa:hasSelector ex:selector ; oa:exact "Café" ; ev:textDigest "sha256:73473dcc12b763085904a5279d048c4d5b3b008c46f1f32443b99de04aa83a14" .
+ex:fieldRef a ev:EvidenceRef ; ev:sourceRevision ex:revision1 ;
+  ev:jsonPointer "/a~1b/m~0n" ; ev:valueDigest "sha256:e5e78ae5b702f7fbf134a768c5324df629488749e33950e746131273be7e0e9e" ;
+  ev:method ex:json-value-utf8 ; ev:methodVersion "1" .
+ex:passageRef a ev:EvidenceRef ; ev:sourceRevision ex:revision1 ; ev:rendition ex:text ; ev:passage ex:passage .
+ex:factRef a ev:EvidenceRef ; ev:datasetId "12345678-1234-4234-8234-123456789abc" ;
+  ev:branchId "abcdef01-2345-4678-8123-abcdef012345" ; ev:commit 7 ; ev:graphKind ev:DefaultGraph ;
+  ev:expectedTriple <<( ex:inventory ex:hasRelease ex:release )>> .
+ex:namedFactRef a ev:EvidenceRef ; ev:datasetId "12345678-1234-4234-8234-123456789abc" ;
+  ev:branchId "abcdef01-2345-4678-8123-abcdef012345" ; ev:commit 7 ;
+  ev:graphKind ev:NamedGraph ; ev:graph ev:DefaultGraph ;
+  ev:expectedTriple <<( ex:inventory ex:hasRelease ex:release )>> .
+ex:claim1 ex:configuration ex:linux ; a ev:Claim ; rdf:reifies <<( ex:release ex:affectedBy ex:vulnerability )>> ;
+  ev:claimKind ev:Reported ; ev:polarity ev:Positive ; prov:wasDerivedFrom ex:revision1 ;
+  prov:wasGeneratedBy ex:import ; prov:wasAttributedTo ex:publisher .
+ex:claim2 ex:configuration ex:linux ; a ev:Claim ; rdf:reifies <<( ex:release ex:affectedBy ex:vulnerability )>> ;
+  ev:claimKind ev:Observation ; ev:polarity ev:Negative ; prov:wasDerivedFrom ex:revision2 ;
+  prov:wasGeneratedBy ex:import ; prov:wasAttributedTo ex:otherAuthor .
+ex:claim3 ex:configuration ex:windows ; a ev:Claim ; rdf:reifies <<( ex:release ex:affectedBy ex:vulnerability )>> ;
+  ev:claimKind ev:Reported ; ev:polarity ev:Positive ; prov:wasDerivedFrom ex:mirrorRevision ;
+  prov:wasGeneratedBy ex:import ; prov:wasAttributedTo ex:mirrorAuthor .
+ex:link1 a ev:EvidenceLink ; ev:target ex:claim1 ; ev:evidence ex:fieldRef ; ev:relation ev:Supports ;
+  prov:wasGeneratedBy ex:import ; prov:wasAttributedTo ex:importer .
+ex:link2 a ev:EvidenceLink ; ev:target ex:claim1 ; ev:evidence ex:passageRef ; ev:relation ev:Mentions ;
+  prov:wasGeneratedBy ex:import ; prov:wasAttributedTo ex:importer .
+ex:link3 a ev:EvidenceLink ; ev:target ex:claim1 ; ev:evidence ex:factRef ; ev:relation ev:Contradicts ;
+  prov:wasGeneratedBy ex:import ; prov:wasAttributedTo ex:reviewer .
+ex:assessment a ev:Assessment ; ev:target ex:claim1 ; ev:conclusion "needs review" ;
+  ev:method ex:triage ; ev:methodVersion "1" ; ev:configurationDigest "sha256:44136fa355b3678a1146ad16f7e8649e94fb4fc21fe77e8310c060f61caaff8a" ;
+  ev:evaluatedAt "2026-01-01T10:05:00Z"^^xsd:dateTime ;
+  prov:wasGeneratedBy ex:analysis ; prov:wasAttributedTo ex:analyst ; ev:analystConfidence ex:confidence .
+ex:confidence a ev:Confidence ; ev:value 0.75000000000000000001 ; ev:scale ev:ZeroToOne ;
+  prov:wasAttributedTo ex:analyst .
+ex:note a ev:Note ; prov:wasGeneratedBy ex:authorship ; prov:wasAttributedTo ex:analyst ;
+  rdfs:label "تنبيه"@ar--rtl ; ev:rationaleFor ex:decision .
+ex:decision a ev:Decision ; prov:wasGeneratedBy ex:authorship ; prov:wasAttributedTo ex:analyst .
+ex:task a ev:Task ; prov:wasGeneratedBy ex:authorship ; prov:wasAttributedTo ex:analyst ; ev:dependsOnTask ex:otherTask .
+ex:claim1 ev:sourceConfidence ex:publisherConfidence ; ev:extractionConfidence ex:extractorConfidence .
+ex:publisherConfidence a ev:Confidence ; ev:value "high" ; ev:scale ex:publisherOrdinal ; prov:wasAttributedTo ex:publisher .
+ex:extractorConfidence a ev:Confidence ; ev:value 0.9 ; ev:scale ev:ZeroToOne ; ev:method ex:extractor-v1 ; prov:wasAttributedTo ex:importer .

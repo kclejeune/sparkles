@@ -17,6 +17,7 @@ pub mod catalog;
 pub mod cloning;
 pub mod dataset;
 pub mod embed;
+pub mod evidence;
 #[cfg(feature = "fmt")]
 pub mod fmt;
 pub mod forms;

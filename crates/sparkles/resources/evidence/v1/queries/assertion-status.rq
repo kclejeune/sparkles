@@ -1,0 +1,11 @@
+PREFIX ev: <urn:x-sparkles:evidence:>
+PREFIX rdf: <http://www.w3.org/1999/02/22-rdf-syntax-ns#>
+PREFIX prov: <http://www.w3.org/ns/prov#>
+PREFIX oa: <http://www.w3.org/ns/oa#>
+
+SELECT ?claim (EXISTS { ?s ?p ?o } AS ?asserted) WHERE {
+  ?claim a ev:Claim ; rdf:reifies ?proposition .
+  BIND(SUBJECT(?proposition) AS ?s)
+  BIND(PREDICATE(?proposition) AS ?p)
+  BIND(OBJECT(?proposition) AS ?o)
+} ORDER BY ?claim

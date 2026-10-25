@@ -1,0 +1,177 @@
+[
+  {
+    "lexical": "0",
+    "datatype": "decimal",
+    "conforms": true
+  },
+  {
+    "lexical": "0.0",
+    "datatype": "decimal",
+    "conforms": true
+  },
+  {
+    "lexical": "1",
+    "datatype": "decimal",
+    "conforms": true
+  },
+  {
+    "lexical": "1.00",
+    "datatype": "decimal",
+    "conforms": true
+  },
+  {
+    "lexical": "+1.000",
+    "datatype": "decimal",
+    "conforms": true
+  },
+  {
+    "lexical": "0001.0000",
+    "datatype": "decimal",
+    "conforms": true
+  },
+  {
+    "lexical": "+000.5000",
+    "datatype": "decimal",
+    "conforms": true
+  },
+  {
+    "lexical": ".0",
+    "datatype": "decimal",
+    "conforms": true
+  },
+  {
+    "lexical": "+.5",
+    "datatype": "decimal",
+    "conforms": true
+  },
+  {
+    "lexical": "-0",
+    "datatype": "decimal",
+    "conforms": true
+  },
+  {
+    "lexical": "-0.000",
+    "datatype": "decimal",
+    "conforms": true
+  },
+  {
+    "lexical": "-.0",
+    "datatype": "decimal",
+    "conforms": true
+  },
+  {
+    "lexical": "-000.",
+    "datatype": "decimal",
+    "conforms": true
+  },
+  {
+    "lexical": "0.75000000000000000001",
+    "datatype": "decimal",
+    "conforms": true
+  },
+  {
+    "lexical": "0.999999999999999999999999999999",
+    "datatype": "decimal",
+    "conforms": true
+  },
+  {
+    "lexical": "1.000000000000000000000000000001",
+    "datatype": "decimal",
+    "conforms": false
+  },
+  {
+    "lexical": "-0.000000000000000000000000000001",
+    "datatype": "decimal",
+    "conforms": false
+  },
+  {
+    "lexical": "1.01",
+    "datatype": "decimal",
+    "conforms": false
+  },
+  {
+    "lexical": "-0.1",
+    "datatype": "decimal",
+    "conforms": false
+  },
+  {
+    "lexical": "2",
+    "datatype": "decimal",
+    "conforms": false
+  },
+  {
+    "lexical": "1e0",
+    "datatype": "decimal",
+    "conforms": false
+  },
+  {
+    "lexical": "NaN",
+    "datatype": "decimal",
+    "conforms": false
+  },
+  {
+    "lexical": "INF",
+    "datatype": "decimal",
+    "conforms": false
+  },
+  {
+    "lexical": "",
+    "datatype": "decimal",
+    "conforms": false
+  },
+  {
+    "lexical": ".",
+    "datatype": "decimal",
+    "conforms": false
+  },
+  {
+    "lexical": "+",
+    "datatype": "decimal",
+    "conforms": false
+  },
+  {
+    "lexical": "0_1",
+    "datatype": "decimal",
+    "conforms": false
+  },
+  {
+    "lexical": "0.5",
+    "datatype": "double",
+    "conforms": false
+  },
+  {
+    "lexical": "NaN",
+    "datatype": "double",
+    "conforms": false
+  },
+  {
+    "lexical": "0.5",
+    "datatype": "string",
+    "conforms": false
+  },
+  {
+    "lexical": " \t+.5\r\n",
+    "datatype": "decimal",
+    "conforms": true
+  },
+  {
+    "lexical": "\n-0.0 ",
+    "datatype": "decimal",
+    "conforms": true
+  },
+  {
+    "lexical": " 1.00000000000000000000 ",
+    "datatype": "decimal",
+    "conforms": true
+  },
+  {
+    "lexical": "0 .5",
+    "datatype": "decimal",
+    "conforms": false
+  },
+  {
+    "lexical": " 0.5 ",
+    "datatype": "decimal",
+    "conforms": false
+  }
+]

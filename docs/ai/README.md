@@ -150,6 +150,27 @@ build community reports.
 * `scripts/eval-ingest` scores an ingestion of `testsuite/ingest/sample.json`, and
   `scripts/eval-text2kg` runs Text2KGBench.
 
+### Evidence profile
+
+The version 1 [evidence resources](../../crates/sparkles/resources/evidence/v1/README.md)
+provide an RDF vocabulary, SHACL shapes, competency queries and read-only views of
+existing memory records. Rust applications select them with
+`sparkles::evidence::profile(1)`. Unknown versions return `None`. The CLI can validate
+profile RDF with `sparkles shacl` and run the supplied queries with `sparkles query`.
+
+Source revisions, renditions and passages retain exact identities and digests. Claim
+occurrences describe a proposition with an RDF 1.2 triple term without asserting it.
+Evidence links distinguish support, contradiction and mention. Declared lineage stays
+separate from an assessment of independence. Qualified confidence retains its evaluator
+and scale. Domain scope remains application RDF.
+
+These resources are ordinary caller-visible data under the existing access policy.
+Their shapes check structure, while the fixtures independently check source bytes and
+selectors. Loading a review decision or receipt does not authenticate it, admit facts
+or enable execution. Existing `assert_facts` and source registration keep their current
+behavior. [C25](../specs/C25-evidence-and-assessments.md#outcome) records the exact phase
+boundary and remaining managed operations.
+
 ### Community reports (GraphRAG)
 
 * A GraphRAG build groups a projection's resources into the Leiden hierarchy and has the
@@ -202,9 +223,12 @@ dependencies are recorded in the [central roadmap](../ROADMAP.md).
   exactly or after folding case and spacing. A value with several matches keeps a minted
   IRI until a person chooses, and the lookup reports only the first variant of an
   ambiguous group. Roadmap item 15.
-* A shared profile for source revisions, unasserted claims, evidence, review and identity
-  decisions is planned in [C25](../specs/C25-evidence-and-assessments.md), roadmap item 81.
-  Current memory provenance and supersession do not provide that complete profile.
+* The evidence resource profile does not supply authenticated typed writes, protected
+  availability metadata, retained-reference resolution, review state machines, accepted
+  projections or reversible identity operations. These remain in
+  [C25](../specs/C25-evidence-and-assessments.md), roadmap item 81, followed by recall,
+  ingestion, reporting and maintained-analysis integration. Ordinary RDF shape validation
+  does not establish these runtime guarantees.
 * Durable jobs, worker leases, collection checkpoints and a transactional delivery outbox
   are planned in [C26](../specs/C26-durable-jobs-and-delivery.md), roadmap item 339. Current
   server tasks and operator notifications do not provide the proposed recovery contract.
@@ -231,6 +255,7 @@ or library workflows. Exact HTTP contracts remain in the API reference.
 * Read [Connecting with OAuth](../USAGE.md#connecting-with-oauth).
 * Read [Asking questions with a model](../USAGE.md#asking-questions-with-a-model).
 * Read [Agent memory](../USAGE.md#agent-memory).
+* Read [Evidence profile resource usage](../../crates/sparkles/resources/evidence/v1/README.md).
 * Read [Maintaining agent memory](../USAGE.md#maintaining-agent-memory).
 * Read [Ingesting documents and reviewing memory](../USAGE.md#ingesting-documents-and-reviewing-memory).
 * Read [Ingesting documents in the server](../USAGE.md#ingesting-documents-in-the-server).

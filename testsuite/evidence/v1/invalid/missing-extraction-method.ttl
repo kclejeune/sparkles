@@ -1,0 +1,5 @@
+PREFIX ev: <urn:x-sparkles:evidence:>
+PREFIX prov: <http://www.w3.org/ns/prov#>
+PREFIX ex: <https://example.org/>
+ex:claim1 ev:extractionConfidence ex:missingMethod .
+ex:missingMethod a ev:Confidence ; ev:value 0.5 ; ev:scale ev:ZeroToOne ; prov:wasAttributedTo ex:importer .

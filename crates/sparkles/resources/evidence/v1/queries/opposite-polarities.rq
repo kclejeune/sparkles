@@ -1,0 +1,10 @@
+# Candidate pairs only. Compare application-specific scope before calling them contradictory.
+PREFIX ev: <urn:x-sparkles:evidence:>
+PREFIX rdf: <http://www.w3.org/1999/02/22-rdf-syntax-ns#>
+PREFIX prov: <http://www.w3.org/ns/prov#>
+PREFIX oa: <http://www.w3.org/ns/oa#>
+
+SELECT ?positive ?negative ?proposition WHERE {
+  ?positive a ev:Claim ; rdf:reifies ?proposition ; ev:polarity ev:Positive .
+  ?negative a ev:Claim ; rdf:reifies ?proposition ; ev:polarity ev:Negative .
+} ORDER BY ?positive ?negative

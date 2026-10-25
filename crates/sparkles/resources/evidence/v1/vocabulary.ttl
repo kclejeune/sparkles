@@ -1,0 +1,93 @@
+PREFIX ev: <urn:x-sparkles:evidence:>
+PREFIX rdf: <http://www.w3.org/1999/02/22-rdf-syntax-ns#>
+PREFIX rdfs: <http://www.w3.org/2000/01/rdf-schema#>
+PREFIX owl: <http://www.w3.org/2002/07/owl#>
+PREFIX xsd: <http://www.w3.org/2001/XMLSchema#>
+PREFIX prov: <http://www.w3.org/ns/prov#>
+PREFIX oa: <http://www.w3.org/ns/oa#>
+<urn:x-sparkles:evidence:profile:1> a owl:Ontology ; ev:profileVersion 1 ; owl:versionInfo "1" .
+ev:Source a rdfs:Class ; rdfs:subClassOf prov:Entity ; rdfs:comment "The continuing identity of a source, distinct from any observed revision." .
+ev:SourceRevision a rdfs:Class ; rdfs:subClassOf prov:Entity ; rdfs:comment "An immutable observed source version, identified by source identity and a content digest." .
+ev:Rendition a rdfs:Class ; rdfs:subClassOf prov:Entity ; rdfs:comment "One representation of an exact source revision, with its conversion and content digest." .
+ev:Passage a rdfs:Class ; rdfs:subClassOf prov:Entity ; rdfs:comment "A selection of an exact rendition, with a selected-text digest." .
+ev:Claim a rdfs:Class ; rdfs:subClassOf prov:Entity ; rdfs:comment "An attributed occurrence of a proposition that does not assert the proposition." .
+ev:EvidenceRef a rdfs:Class ; rdfs:subClassOf prov:Entity ; rdfs:comment "An exact reference to a source selection or a stored fact at a recorded view." .
+ev:EvidenceLink a rdfs:Class ; rdfs:subClassOf prov:Entity ; rdfs:comment "An attributed supports, contradicts or mentions relation to a claim or assessment." .
+ev:Assessment a rdfs:Class ; rdfs:subClassOf prov:Entity ; rdfs:comment "A qualified evaluation whose conclusion, method and evidence are retained." .
+ev:ReviewDecision a rdfs:Class ; rdfs:subClassOf prov:Entity ; rdfs:comment "A decision about an exact target revision under a named review policy." .
+ev:IdentityProposal a rdfs:Class ; rdfs:subClassOf prov:Entity ; rdfs:comment "A proposed correspondence or separation that does not assert owl:sameAs." .
+ev:Note a rdfs:Class ; rdfs:subClassOf prov:Entity ; rdfs:comment "An authored note whose content is data." .
+ev:Decision a rdfs:Class ; rdfs:subClassOf prov:Entity ; rdfs:comment "An authored rationale or recommendation, distinct from evidence support." .
+ev:Task a rdfs:Class ; rdfs:subClassOf prov:Entity ; rdfs:comment "An authored description of work that grants no execution authority." .
+ev:Confidence a rdfs:Class ; rdfs:subClassOf prov:Entity ; rdfs:comment "A qualified value on a declared scale, attributed to its evaluator." .
+ev:LegacyAssertion a rdfs:Class ; rdfs:subClassOf prov:Entity ; rdfs:comment "A compatibility view of an existing asserted C17 fact and its original reifier." .
+ev:LegacyRendition a rdfs:Class ; rdfs:subClassOf prov:Entity ; rdfs:comment "A compatibility view of a C18 rendition without invented source-revision metadata." .
+ev:profileVersion a rdf:Property ; rdfs:comment "The explicit evidence resource profile version." .
+ev:contentDigest a rdf:Property ; rdfs:comment "The SHA-256 digest of the exact retained content bytes." .
+ev:sourceKey a rdf:Property ; rdfs:comment "An importer-declared stable source revision key." .
+ev:upstreamVersion a rdf:Property ; rdfs:comment "An upstream version identifier when one was supplied." .
+ev:claimKind a rdf:Property ; rdfs:comment "The kind of a claim occurrence, independent of polarity." .
+ev:polarity a rdf:Property ; rdfs:comment "Whether the source affirms, denies or is uncertain about a proposition." .
+ev:publishedAt a rdf:Property ; rdfs:comment "A source publication timestamp, with an explicit timezone." .
+ev:firstAvailableAt a rdf:Property ; rdfs:comment "The locally recorded availability time; RDF syntax alone does not authenticate it." .
+ev:reportedAvailableAt a rdf:Property ; rdfs:comment "An attributed allegation of earlier availability." .
+ev:availabilityReceipt a rdf:Property ; rdfs:comment "The ingest receipt whose verified publication origin authenticates local availability." .
+ev:upstreamSource a rdf:Property ; rdfs:comment "A known underlying source from which this source derives." .
+ev:sourceFamily a rdf:Property ; rdfs:comment "A declared common origin, not proof of independent corroboration." .
+ev:sourceConfidence a rdf:Property ; rdfs:comment "A source-reported confidence with its original scale." .
+ev:extractionConfidence a rdf:Property ; rdfs:comment "An extraction evaluation with its declared method and scale." .
+ev:analystConfidence a rdf:Property ; rdfs:comment "An assessment confidence with its evaluator and scale." .
+ev:value a rdf:Property ; rdfs:comment "A confidence value without implicit conversion to another scale." .
+ev:scale a rdf:Property ; rdfs:comment "The declared scale of a confidence value." .
+ev:mediaType a rdf:Property ; rdfs:comment "The media type of a retained rendition." .
+ev:language a rdf:Property ; rdfs:comment "The language of a rendition." .
+ev:normalizedText a rdf:Property ; rdfs:comment "The retained normalized rendition text used by code-point selectors." .
+ev:textDigest a rdf:Property ; rdfs:comment "The SHA-256 digest of the selected normalized UTF-8 text." .
+ev:sourceRevision a rdf:Property ; rdfs:comment "The exact source revision addressed by a reference." .
+ev:rendition a rdf:Property ; rdfs:comment "The exact rendition addressed by a passage reference." .
+ev:jsonPointer a rdf:Property ; rdfs:comment "An RFC 6901 pointer evaluated against the retained parsed revision." .
+ev:valueDigest a rdf:Property ; rdfs:comment "The digest of the selected structured value under the stated importer normalization." .
+ev:datasetId a rdf:Property ; rdfs:comment "The UUID identity of the dataset, independent of its mutable name." .
+ev:branchId a rdf:Property ; rdfs:comment "The UUID identity of the branch, independent of its mutable name." .
+ev:commit a rdf:Property ; rdfs:comment "The exact recorded commit sequence of a stored-fact reference." .
+ev:graphKind a rdf:Property ; rdfs:comment "An explicit distinction between the default graph and a named graph." .
+ev:graph a rdf:Property ; rdfs:comment "The IRI of a named graph; absent for a default-graph reference." .
+ev:expectedTriple a rdf:Property ; rdfs:comment "The exact triple term expected at a stored view." .
+ev:reifier a rdf:Property ; rdfs:comment "A stable reifier present at the referenced view, when one is required." .
+ev:skolemMap a rdf:Property ; rdfs:comment "An explicit source-import blank-node mapping, verified by the runtime resolver." .
+ev:passage a rdf:Property ; rdfs:comment "An exact selected passage associated with a reference." .
+ev:evidence a rdf:Property ; rdfs:comment "The evidence reference of a qualified link." .
+ev:relation a rdf:Property ; rdfs:comment "The declared relation of an evidence link or identity proposal." .
+ev:target a rdf:Property ; rdfs:comment "The exact claim, assessment or decision target." .
+ev:conclusion a rdf:Property ; rdfs:comment "The qualified conclusion of an assessment, not an asserted premise." .
+ev:method a rdf:Property ; rdfs:comment "The declared evaluation or normalization method." .
+ev:methodVersion a rdf:Property ; rdfs:comment "The version of the declared method." .
+ev:configurationDigest a rdf:Property ; rdfs:comment "The digest of the configuration used by a method." .
+ev:evaluatedAt a rdf:Property ; rdfs:comment "The evaluation timestamp with an explicit timezone." .
+ev:rationaleFor a rdf:Property ; rdfs:comment "An authored rationale connected to a decision, distinct from evidence support." .
+ev:dependsOnTask a rdf:Property ; rdfs:comment "A work dependency between authored tasks." .
+ev:entity a rdf:Property ; rdfs:comment "One identifier participating in an identity proposal." .
+ev:disposition a rdf:Property ; rdfs:comment "The outcome of a review under its declared policy." .
+ev:targetDigest a rdf:Property ; rdfs:comment "The exact immutable target content digest reviewed." .
+ev:reviewPolicy a rdf:Property ; rdfs:comment "The named review policy governing a decision." .
+ev:policyVersion a rdf:Property ; rdfs:comment "The exact review policy revision." .
+ev:legacyAssertion a rdf:Property ; rdfs:comment "Marks a compatibility projection of an already asserted fact." .
+ev:legacySource a rdf:Property ; rdfs:comment "The original source locator retained without inventing an immutable revision." .
+ev:Reported a rdfs:Resource ; rdfs:comment "The proposition was reported by its attributed source." .
+ev:Observation a rdfs:Resource ; rdfs:comment "The attributed author describes an observation." .
+ev:Hypothesis a rdfs:Resource ; rdfs:comment "The proposition is proposed for investigation." .
+ev:Preference a rdfs:Resource ; rdfs:comment "The occurrence describes a preference, not objective evidence." .
+ev:Positive a rdfs:Resource ; rdfs:comment "The source affirms the proposition." .
+ev:Negative a rdfs:Resource ; rdfs:comment "The source denies the proposition without adding RDF negation." .
+ev:Uncertain a rdfs:Resource ; rdfs:comment "The source does not commit to either position." .
+ev:Supports a rdfs:Resource ; rdfs:comment "An attributed judgment that the reference supports its target." .
+ev:Contradicts a rdfs:Resource ; rdfs:comment "An attributed judgment that the reference contradicts its target." .
+ev:Mentions a rdfs:Resource ; rdfs:comment "The reference mentions the target without asserting support." .
+ev:DefaultGraph a rdfs:Resource ; rdfs:comment "The RDF default graph, identified by its kind rather than an IRI." .
+ev:NamedGraph a rdfs:Resource ; rdfs:comment "A named graph whose IRI is recorded separately." .
+ev:PossibleMatch a rdfs:Resource ; rdfs:comment "A proposed correspondence without logical identity." .
+ev:DistinctEntities a rdfs:Resource ; rdfs:comment "A proposed separation of two identifiers." .
+ev:Accepted a rdfs:Resource ; rdfs:comment "A review accepts the exact target under its policy." .
+ev:Rejected a rdfs:Resource ; rdfs:comment "A review rejects the exact target under its policy." .
+ev:NeedsEvidence a rdfs:Resource ; rdfs:comment "A review asks for more evidence about the exact target." .
+ev:ZeroToOne a rdfs:Resource ; rdfs:comment "The declared finite decimal confidence scale from zero through one." .

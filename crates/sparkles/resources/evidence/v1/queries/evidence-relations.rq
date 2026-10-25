@@ -1,0 +1,9 @@
+PREFIX ev: <urn:x-sparkles:evidence:>
+PREFIX rdf: <http://www.w3.org/1999/02/22-rdf-syntax-ns#>
+PREFIX prov: <http://www.w3.org/ns/prov#>
+PREFIX oa: <http://www.w3.org/ns/oa#>
+
+SELECT ?target ?relation ?reference ?author WHERE {
+  ?link a ev:EvidenceLink ; ev:target ?target ; ev:relation ?relation ;
+    ev:evidence ?reference ; prov:wasAttributedTo ?author .
+} ORDER BY ?relation ?reference

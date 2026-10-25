@@ -1,0 +1,11 @@
+PREFIX ev: <urn:x-sparkles:evidence:>
+PREFIX rdf: <http://www.w3.org/1999/02/22-rdf-syntax-ns#>
+PREFIX prov: <http://www.w3.org/ns/prov#>
+PREFIX oa: <http://www.w3.org/ns/oa#>
+
+SELECT ?reference ?dataset ?branch ?commit ?kind ?graph ?triple ?anchor WHERE {
+  ?reference a ev:EvidenceRef ; ev:datasetId ?dataset ; ev:branchId ?branch ;
+    ev:commit ?commit ; ev:graphKind ?kind ; ev:expectedTriple ?triple .
+  OPTIONAL { ?reference ev:graph ?graph }
+  OPTIONAL { ?reference ev:reifier ?anchor }
+} ORDER BY ?reference

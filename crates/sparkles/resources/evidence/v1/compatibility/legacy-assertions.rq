@@ -1,0 +1,36 @@
+PREFIX ev: <urn:x-sparkles:evidence:>
+PREFIX rdf: <http://www.w3.org/1999/02/22-rdf-syntax-ns#>
+PREFIX prov: <http://www.w3.org/ns/prov#>
+PREFIX oa: <http://www.w3.org/ns/oa#>
+PREFIX spk: <urn:x-sparkles:>
+PREFIX rdfs: <http://www.w3.org/2000/01/rdf-schema#>
+PREFIX xsd: <http://www.w3.org/2001/XMLSchema#>
+
+# Read-only projection. Legacy assertions stay asserted and are not new proposals.
+CONSTRUCT {
+  ?reifier a ev:LegacyAssertion ; rdf:reifies ?triple ; ev:legacyAssertion true ;
+    prov:wasGeneratedBy ?activity ; ev:legacySource ?source ;
+    spk:confidence ?confidence ; spk:quote ?quote .
+  ?activity prov:wasAssociatedWith ?principal .
+} WHERE {
+  { ?reifier rdf:reifies ?triple ; prov:wasGeneratedBy ?activity .
+    ?activity prov:wasAssociatedWith ?principal .
+    BIND(SUBJECT(?triple) AS ?s)
+    BIND(PREDICATE(?triple) AS ?p)
+    BIND(OBJECT(?triple) AS ?o)
+    ?s ?p ?o .
+    OPTIONAL { ?reifier prov:wasDerivedFrom ?source }
+    OPTIONAL { ?reifier spk:confidence ?confidence }
+    OPTIONAL { ?reifier spk:quote ?quote }
+ }
+  UNION { GRAPH ?graph { ?reifier rdf:reifies ?triple ; prov:wasGeneratedBy ?activity .
+    ?activity prov:wasAssociatedWith ?principal .
+    BIND(SUBJECT(?triple) AS ?s)
+    BIND(PREDICATE(?triple) AS ?p)
+    BIND(OBJECT(?triple) AS ?o)
+    ?s ?p ?o .
+    OPTIONAL { ?reifier prov:wasDerivedFrom ?source }
+    OPTIONAL { ?reifier spk:confidence ?confidence }
+    OPTIONAL { ?reifier spk:quote ?quote }
+ } }
+}

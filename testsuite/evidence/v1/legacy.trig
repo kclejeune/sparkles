@@ -1,0 +1,20 @@
+PREFIX ev: <urn:x-sparkles:evidence:>
+PREFIX rdf: <http://www.w3.org/1999/02/22-rdf-syntax-ns#>
+PREFIX prov: <http://www.w3.org/ns/prov#>
+PREFIX oa: <http://www.w3.org/ns/oa#>
+PREFIX spk: <urn:x-sparkles:>
+PREFIX rdfs: <http://www.w3.org/2000/01/rdf-schema#>
+PREFIX xsd: <http://www.w3.org/2001/XMLSchema#>
+PREFIX ex: <https://example.org/>
+
+ex:legacyGraph {
+  ex:release ex:affectedBy ex:vulnerability .
+  ex:legacyReifier rdf:reifies <<( ex:release ex:affectedBy ex:vulnerability )>> ;
+    prov:wasGeneratedBy ex:legacyActivity ;
+    prov:wasDerivedFrom ex:legacySource, <https://example.org/legacyRendition#char=10,14> ;
+    spk:confidence 0.8 ; spk:quote "Café" .
+  ex:legacyActivity a prov:Activity ; prov:wasAssociatedWith ex:legacyPrincipal .
+  ex:legacySource spk:rendition ex:legacyRendition ; spk:contentDigest "legacy-digest" .
+  ex:legacyRendition a spk:TextRendition ; prov:wasDerivedFrom ex:legacySource ; spk:length 38 .
+  ex:uncitedRendition a spk:TextRendition ; prov:wasDerivedFrom ex:uncitedSource ; spk:length 42 .
+}
