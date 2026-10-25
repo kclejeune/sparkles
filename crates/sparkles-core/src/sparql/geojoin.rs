@@ -14,8 +14,7 @@
 //!   spatial index instead of being read; any other is planned as usual and its distinct
 //!   geometries are packed into a tree for the query.
 //! * `ORDER BY ASC(geof:distance(?w, C, u)) LIMIT k` (or a variable bound to it) over a
-//!   group whose geometries come from one indexed scan, and whose other patterns connect
-//!   to that scan (a star on its subject, or a path from it), becomes a
+//!   group whose geometries come from one indexed scan becomes a
 //!   [`SpatialKnnSpec`] below the top-k: the group runs over the scan's rows in
 //!   increasing distance, in batches, until `k` rows are proven.
 //!
@@ -134,7 +133,7 @@ mod on {
         ScanShape, constant_geom, distance_text, fold_const, geof_call, number, scope_covers,
         unit_iri, warn,
     };
-    use super::super::plan::{self, JoinAlgo, Kind, merge_dist, short};
+    use super::super::plan::{self, Kind, merge_dist, short};
     use super::super::table::Table;
     use super::super::value::Value;
     use super::*;
@@ -583,9 +582,7 @@ mod on {
     /// The leaves and filters of a tree of joins; `false` when something else is in it.
     fn flatten(n: &Node, ctx: &Ctx, leaves: &mut Vec<Node>, filters: &mut Vec<Expr>) -> bool {
         match &n.kind {
-            Kind::Join { algo, .. } if !matches!(algo, JoinAlgo::Cross) => {
-                n.children.iter().all(|c| flatten(c, ctx, leaves, filters))
-            }
+            Kind::Join { .. } => n.children.iter().all(|c| flatten(c, ctx, leaves, filters)),
             Kind::Sort(_) => flatten(&n.children[0], ctx, leaves, filters),
             Kind::Filter(es) if !es.iter().any(Expr::has_exists) => {
                 filters.extend(es.iter().cloned());
@@ -782,8 +779,9 @@ mod on {
         if !scope_covers(&view.config, &shape.graph_filter(&spec), ctx) {
             return Err("the query reads graphs out of the spatial index's scope".into());
         }
-        // the other patterns are read per batch, each joined on a variable bound before
-        // it (from the batch's subjects on), so that they are probed for its keys
+        // Read the scan's connected patterns per batch, probing the batch's keys.
+        // Independent components are joined on their own keys before crossing them
+        // with the batch, so their joins do not enumerate a cross product first.
         let mut bound = scan_node.vars.clone();
         let mut joined = Vec::new();
         while !leaves.is_empty() {
@@ -791,10 +789,7 @@ mod on {
                 .iter()
                 .position(|l| l.vars.iter().any(|v| bound.contains(v)))
             else {
-                return Err(format!(
-                    "the group's other patterns are not connected to the scan of {}",
-                    name(ctx, w)
-                ));
+                break;
             };
             let l = leaves.remove(i);
             bound.extend(l.vars.iter().copied());
@@ -817,6 +812,16 @@ mod on {
         let mut t = ph;
         for leaf in joined {
             t = plan::join(t, leaf, ctx);
+        }
+        while !leaves.is_empty() {
+            let mut component = leaves.remove(0);
+            while let Some(i) = leaves
+                .iter()
+                .position(|l| l.vars.iter().any(|v| component.vars.contains(v)))
+            {
+                component = plan::join(component, leaves.remove(i), ctx);
+            }
+            t = plan::join(t, component, ctx);
         }
         if !filters.is_empty() {
             t = plan::filter(t, filters.clone(), ctx);

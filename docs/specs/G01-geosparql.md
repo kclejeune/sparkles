@@ -1726,7 +1726,7 @@ these items.
 * `--geo-crs` registers projected CRSs from proj4 definitions, which transform through
   `proj4rs`.
 
-The rest of Phase 3 is not built. That is k-NN with arbitrary joins, simplified polygon
+The rest of Phase 3 is not built. That is k-NN with a query geometry bound per row, simplified polygon
 approximations, `geo:hasMetricArea` and similar properties by rewrite, QLever's
 `SERVICE spatialSearch:` syntax, and the Compliance Benchmark in CI.
 
@@ -1844,6 +1844,14 @@ the same answers both ways. The cell grid made 200,000 `sfContains` tests agains
 one, for about 16 bytes per region vertex, up to 64 KiB per region.
 
 ### Roadmap follow-ups (2026-10-12)
+
+Nearest-neighbour ordering around a constant also handles independent join components.
+The planner joins each component on its own keys before crossing it with a batch of
+nearest candidates. Joins and filters can discard a whole batch, and the search continues
+until enough rows are proven or the index is exhausted. Duplicate solutions retain their
+multiplicity, and the existing query budgets apply to each template run and its output.
+Independent components run again for each batch, without an additional materialized cache.
+The per-row nearest-neighbour join described below remains open under item 24.
 
 **The rest of Phase 3 and geometry limits** (item 24, Tier 3,
 [ROADMAP](../ROADMAP.md)). The Outcome lists the first items below as not built, and

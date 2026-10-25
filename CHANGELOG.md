@@ -4,6 +4,10 @@
 
 ### Changed
 
+Indexed nearest-neighbour ordering can join candidate batches with independent query
+components. It continues searching when joins or filters discard an entire batch and
+preserves duplicate solutions.
+
 The full-text integrity check retries segment replacements made by merges even when the
 commit stamp stays the same. If the index keeps changing throughout its three attempts,
 it requests another check instead of reporting missing files from superseded metadata.

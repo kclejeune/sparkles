@@ -7257,9 +7257,10 @@ pairs count against the query's row limit, and past it the query fails with `507
 under the top-k). The query needs a `LIMIT` and an `ORDER BY` on
 `ASC(geof:metricDistance(?w, C))`, on `geof:distance(?w, C, unit)` with a length unit, or
 on a variable bound to one of them. `?w` must be the object of one pattern of an indexed
-predicate, and the group's other patterns must connect to that pattern. The group then
-runs over batches of the nearest rows until the `k`-th distance found is below the bound
-of every row not read yet.
+predicate. Other patterns can connect to that pattern or form independent join
+components. The group runs over batches of the nearest rows until the `k`-th distance
+found is below the bound of every row not read yet. A batch that produces no rows after
+the joins and filters does not end the search.
 
 Rows whose distance is an error come first in SPARQL's order. Their value is not a
 geometry, is malformed or empty, or is in a CRS without a transform. Without a
@@ -7277,12 +7278,13 @@ SELECT ?g ?d WHERE {
 The answer is the same as the generic sort's, up to the choice among rows tied at the
 `k`-th distance. These cases keep the generic sort and add a `geo-not-knn` warning: a
 descending order, an angle unit, a constant that is empty or not in longitude and
-latitude, an index that is not ready, and a group whose other patterns do not connect to
-`?w`'s pattern.
+latitude, an index that is not ready, and a group whose operators cannot be used as a
+nearest-candidate template. A query geometry bound per row keeps the generic plan.
 
 Both operators report the counters of the other spatial operators. A join adds `pairs`,
 the geometry pairs that passed, and `indexProbes`. Nearest neighbours adds `batches`, the
-runs of the group, and `errorRows`. The two operators are the `spatial_join` and
+runs of the group, `emptyBatches`, the runs that produced no rows, and `errorRows`.
+The two operators are the `spatial_join` and
 `spatial_knn` optimizations, which are on by default (see `QueryOptions::optimizations`
 and `SPARKLES_DISABLE_OPTIMIZATIONS`).
 

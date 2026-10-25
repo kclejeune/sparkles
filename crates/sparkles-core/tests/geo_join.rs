@@ -311,6 +311,53 @@ fn nearest_neighbours_come_first() {
 }
 
 #[test]
+fn nearest_neighbours_join_disconnected_patterns_after_empty_batches() {
+    let s = Store::in_memory(StoreOptions::default());
+    let mut data = String::new();
+    for i in 0..160 {
+        data.push_str(&format!(
+            "<http://example.org/g{i}> <http://www.opengis.net/ont/geosparql#asWKT> \
+             \"POINT({} 0)\"^^<http://www.opengis.net/ont/geosparql#wktLiteral> ; \
+             <http://example.org/rank> {i} .\n",
+            f64::from(i) / 1000.0
+        ));
+    }
+    data.push_str("<http://example.org/setting> <http://example.org/minRank> 140 ; <http://example.org/enabled> true .\n");
+    load(&s, &data);
+    s.enable_geo(GeoConfig::default()).unwrap();
+    let snap = s.snapshot();
+    for (independent, expected) in [
+        ("VALUES ?threshold { 140 145 }", 6),
+        ("VALUES ?threshold { 140 140 }", 6),
+        ("?setting ex:minRank ?threshold ; ex:enabled true .", 6),
+        ("VALUES ?threshold { 999 }", 0),
+    ] {
+        let q = format!(
+            "SELECT ?g ?threshold ?d {{ ?g geo:asWKT ?w ; ex:rank ?rank . \
+             {independent} \
+             BIND(geof:metricDistance(?w, \"POINT(0 0)\"^^geo:wktLiteral) AS ?d) \
+             FILTER(BOUND(?d) && ?rank >= ?threshold) }} \
+             ORDER BY ?d ?g ?threshold LIMIT 6"
+        );
+        let r = same(&snap, &q);
+        assert_eq!(r.table.len(), expected, "{q}");
+        let knn = find(&r.plan, "SpatialKnn").expect("disconnected nearest-neighbour join");
+        assert!(
+            knn.counters.as_ref().unwrap()["batches"].as_u64().unwrap() >= 2,
+            "the search must continue after an empty batch: {:#?}",
+            r.plan
+        );
+        assert!(
+            knn.counters.as_ref().unwrap()["emptyBatches"]
+                .as_u64()
+                .unwrap()
+                >= 1,
+            "{q}"
+        );
+    }
+}
+
+#[test]
 fn nearest_neighbour_shapes_that_stay_generic_warn() {
     let s = Store::in_memory(StoreOptions::default());
     load(&s, FIXTURE);
@@ -334,13 +381,6 @@ fn nearest_neighbour_shapes_that_stay_generic_warn() {
                 "SELECT ?g {{ ?g geo:asWKT ?w }} ORDER BY geof:distance(?w, {GA}, uom:degree) LIMIT 2"
             ),
             "angle",
-        ),
-        (
-            format!(
-                "SELECT ?g {{ ?g geo:asWKT ?w . ?x geo:hasGeometry ?y }} \
-                 ORDER BY geof:metricDistance(?w, {GA}) LIMIT 2"
-            ),
-            "join",
         ),
     ] {
         let r = same(&snap, &q);
