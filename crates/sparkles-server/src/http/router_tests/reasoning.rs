@@ -1283,7 +1283,7 @@ async fn explain_route_answers_why() {
     assert_eq!(m["kind"], "ref");
     assert!(m.get("premises").is_none());
 
-    // whyNot is not available
+    // Why-not checks entailment over the same visible inputs.
     let r = post_json(
         &app,
         "/$/reason/t/explain",
@@ -1295,7 +1295,9 @@ async fn explain_route_answers_why() {
         ),
     )
     .await;
-    assert_eq!(r.status, StatusCode::NOT_IMPLEMENTED, "{}", r.text());
+    assert_eq!(r.status, StatusCode::OK, "{}", r.text());
+    assert_eq!(r.json()["mode"], "whyNot");
+    assert_eq!(r.json()["entailed"], true);
     // malformed requests
     for bad in [
         r#"{"triple":{"s":{"type":"uri","value":"http://ex.org/a"}}}"#.to_string(),
@@ -1340,7 +1342,13 @@ async fn explain_route_answers_why() {
 
     // stale inferences are still explained at their run, and say so
     update(&app, "t", "DELETE DATA { ex:alice ex:manages ex:team7 }").await;
-    let r = post_json(&app, "/$/reason/t/explain", &why).await;
+    let historical = explain_body(
+        "http://ex.org/alice",
+        TYPE,
+        "http://ex.org/Employee",
+        r#","source":"materialized""#,
+    );
+    let r = post_json(&app, "/$/reason/t/explain", &historical).await;
     assert_eq!(r.status, StatusCode::OK, "{}", r.text());
     let j = r.json();
     assert_eq!(j["stale"], true);

@@ -186,3 +186,38 @@ fn infer_why_prints_the_derivation() {
         2,
     );
 }
+
+#[test]
+fn infer_why_not_returns_verified_missing_facts_without_materializing() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = dir.path().join("db").to_str().unwrap().to_string();
+    let data = dir.path().join("data.ttl");
+    std::fs::write(&data, "@prefix ex: <http://ex.org/> . ex:tom a ex:Cat .").unwrap();
+    expect(&["load", "--loc", &db, data.to_str().unwrap()], 0);
+    let output = expect(
+        &[
+            "infer",
+            "--loc",
+            &db,
+            "--why-not",
+            "<http://ex.org/tom> a <http://ex.org/Animal>",
+            "--profile",
+            "rdfs",
+            "--max-depth",
+            "2",
+            "--max-hypotheses",
+            "3",
+            "--format",
+            "json",
+        ],
+        0,
+    );
+    let j: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(j["mode"], "whyNot");
+    assert_eq!(j["entailed"], false);
+    assert!(!j["hypotheses"].as_array().unwrap().is_empty(), "{j}");
+    let output = expect(&["infer", "--loc", &db, "--status", "--format", "json"], 0);
+    assert!(
+        serde_json::from_slice::<serde_json::Value>(&output.stdout).unwrap()["reasoning"].is_null()
+    );
+}

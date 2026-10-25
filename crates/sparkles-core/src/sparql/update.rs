@@ -447,7 +447,7 @@ fn run_op(
             // the WHERE clause reads the request's graph view only
             super::restrict_ctx(&mut ctx, req.opts.graphs.as_ref())?;
             if let Some(r) = &req.opts.rdfs {
-                ctx.rdfs = Some(r.schema(&ctx.snap)?);
+                ctx.rdfs = Some(r.schema_controlled(&ctx.snap, &mut || ctx.check())?);
             }
             let pattern = super::rdfs::apply(&ctx, pattern);
             let node = Planner::new(&ctx).plan(&pattern, &ActiveGraph::Default, Vec::new())?;

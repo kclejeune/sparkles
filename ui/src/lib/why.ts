@@ -8,14 +8,26 @@ import { termKey } from './rdf';
 
 export type WhyTriple = { s: Term; p: Term; o: Term };
 
+export type ReadContext = {
+  commit: number;
+  source: 'materialized' | 'rdfsOnRead' | 'demand';
+  readAtHead?: boolean;
+};
+
 export type Derivation = {
   id: number;
   triple: WhyTriple;
-  kind: 'asserted' | 'axiom' | 'derived' | 'ref';
+  kind: 'asserted' | 'axiom' | 'derived' | 'ref' | 'unexplained';
   depth: number;
   graph?: string;
   rule?: { name: string; profile: string; owl2rl?: string };
   premises?: Derivation[];
+  bindings?: Record<string, Term>;
+  builtins?: { call: string; holds: true }[];
+  generalized?: boolean;
+  missing?: boolean;
+  /** The original read of a materialized subtree inside a mixed tree. */
+  read?: ReadContext;
   /** A repeat of the node with this id given earlier, without its premises. */
   shared?: boolean;
 };
@@ -24,7 +36,9 @@ export type Explanation = {
   mode: 'why';
   entailed: true;
   commit: number;
-  source: 'materialized' | 'rdfsOnRead';
+  source: 'materialized' | 'rdfsOnRead' | 'demand';
+  partial?: boolean;
+  reason?: string;
   trees: Derivation[];
   more: boolean;
   readAtHead?: boolean;
@@ -48,7 +62,12 @@ const BUDGET = 'The derivation is deeper than the search limit.';
 export async function explainTriple(
   ds: string,
   triple: WhyTriple,
-  opts: { maxTrees?: number; maxDepth?: number; signal?: AbortSignal } = {},
+  opts: {
+    maxTrees?: number;
+    maxDepth?: number;
+    source?: 'materialized' | 'demand';
+    signal?: AbortSignal;
+  } = {},
 ): Promise<WhyResult> {
   try {
     const explanation = await api.json<Explanation>(`/$/reason/${encodeURIComponent(ds)}/explain`, {
@@ -59,6 +78,7 @@ export async function explainTriple(
         mode: 'why',
         maxTrees: opts.maxTrees ?? MAX_TREES,
         ...(opts.maxDepth ? { maxDepth: opts.maxDepth } : {}),
+        ...(opts.source ? { source: opts.source } : {}),
       }),
       signal: opts.signal,
     });
@@ -160,6 +180,8 @@ export function how(d: Derivation, graphLabel: (g: string) => string = (g) => g)
       return d.graph ? `asserted · graph ${graphLabel(d.graph)}` : 'asserted · RDFS schema';
     case 'axiom':
       return `axiom${d.rule ? ` · ${d.rule.name}` : ''}`;
+    case 'unexplained':
+      return 'not explained within the search budget';
     case 'ref':
       return 'derived deeper than shown';
     default: {
@@ -202,11 +224,13 @@ export function graft(
   return put(tree);
 }
 
-/**
- * Whether two answers read the same inferences: the same commit and source, and both or
- * neither at the head. An expansion that reads others cannot join the tree it expands.
- */
-export function sameRead(a: Explanation, b: Explanation): boolean {
+/** The original read of a mixed subtree, or the containing answer for older servers. */
+export function readFor(node: Derivation, parent: ReadContext): ReadContext {
+  return node.read ?? parent;
+}
+
+/** An expansion must retain its commit, source and history-fallback marker. */
+export function sameRead(a: ReadContext, b: ReadContext): boolean {
   return a.commit === b.commit && a.source === b.source && !!a.readAtHead === !!b.readAtHead;
 }
 
@@ -232,4 +256,30 @@ export function staleNote(e: Explanation): string | null {
     return `These inferences are out of date. This tree shows them as computed at commit ${e.commit}.${since}`;
   }
   return null;
+}
+
+export type WhyNotExplanation = {
+  mode: 'whyNot';
+  entailed: boolean;
+  commit: number;
+  rules?: {
+    name: string;
+    unifier: Record<string, Term>;
+    blockedBy?: { call: string; fact?: WhyTriple }[];
+  }[];
+  hypotheses?: { missing: WhyTriple[]; placeholders: string[]; tree: Derivation }[];
+  complete?: boolean;
+};
+
+export function explainMissing(
+  ds: string,
+  triple: WhyTriple,
+  signal?: AbortSignal,
+): Promise<WhyNotExplanation> {
+  return api.json<WhyNotExplanation>(`/$/reason/${encodeURIComponent(ds)}/explain`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ triple, mode: 'whyNot', maxMissing: 2, maxHypotheses: 10 }),
+    signal,
+  });
 }

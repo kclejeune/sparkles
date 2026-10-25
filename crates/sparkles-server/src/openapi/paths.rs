@@ -1282,11 +1282,11 @@ fn admin(p: &mut Paths) {
             "Reasoning",
             "Explain why a triple is inferred",
         )
-        .doc("Derivation trees for a triple of the materialized inferences or of what RDFS on read answers, searched from the facts the caller reads. Mode `whyNot` answers `501`. A triple with no derivation from readable facts answers `404` with code `no-visible-derivation`, as one that is not entailed does, and a search over its limits answers `422` with code `reasoning-budget`.")
+        .doc("Derivation trees for a triple of the materialized inferences or of what RDFS on read answers, searched from the facts the caller reads. Mode `whyNot` returns verified sets of missing facts. Source `demand` derives from the current visible inputs, with an explicit profile when the dataset has no recorded program. A bounded partial tree marks unexplained premises. A triple with no derivation from readable facts answers `404` with code `no-visible-derivation`, as one that is not entailed does, and a search over its limits answers `422` with code `reasoning-budget`.")
         .see("explanations")
         .json_body(true, "ExplainRequest")
         .json("200", "The trees.", "Explanation")
-        .errors(&[400, 404, 422, 501]),
+        .errors(&[400, 404, 422]),
     );
     p.add(
         op(GET, "/$/tasks", "listTasks", "Tasks", "List tasks")

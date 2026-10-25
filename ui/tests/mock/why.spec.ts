@@ -321,3 +321,89 @@ test('A12: at 390 px Why? is a full-height sheet opened by a tap, without scroll
   await expect(panel(page)).toHaveCount(0);
   await ctx.close();
 });
+
+test('why not lists verified missing facts for the selected resource', async ({
+  page,
+  request,
+}) => {
+  const ds = 'why-not-missing';
+  await create(request, ds);
+  await page.addInitScript((d) => localStorage.setItem('sparkles.dataset', d), ds);
+  await page.goto(`/ui/explore?ds=${ds}&iri=${encodeURIComponent(`${EX}alice`)}`);
+  const panel = page.getByRole('region', { name: 'Why not?', exact: true });
+  await expect(panel).toBeVisible();
+  await panel.getByText('Why not…?', { exact: true }).click();
+  await panel.getByLabel('Why not value').fill(`<${EX}Director>`);
+  await panel.getByRole('button', { name: 'Find missing facts' }).click();
+  await expect(panel.getByText('Possibility 1: add 1 fact', { exact: true })).toBeVisible();
+  await panel.getByText('Possibility 1: add 1 fact', { exact: true }).click();
+  await expect(panel.getByText('Verified derivation', { exact: true }).first()).toBeVisible();
+  await panel.getByText('Verified derivation', { exact: true }).first().click();
+  await expect(panel.locator('li').filter({ hasText: 'missing' }).first()).toBeVisible();
+});
+
+test('a mixed historical generalized ref expands using its original read', async ({ page }) => {
+  const sources: unknown[] = [];
+  await page.route('**/$/reason/why1/explain', async (route) => {
+    const q = route.request().postDataJSON();
+    sources.push(q.source);
+    const value = { type: 'literal', value: '7' };
+    const ref = {
+      id: 2,
+      kind: 'ref',
+      depth: 1,
+      generalized: true,
+      triple: { s: value, p: { type: 'uri', value: `${EX}of` }, o: q.triple.s },
+      read: { source: 'materialized', commit: 300, readAtHead: false },
+    };
+    const tree =
+      q.source === 'materialized'
+        ? {
+            id: 1,
+            kind: 'derived',
+            depth: 1,
+            generalized: true,
+            triple: q.triple,
+            rule: { name: 'reverse', profile: 'rules' },
+            premises: [
+              {
+                id: 2,
+                kind: 'asserted',
+                depth: 0,
+                graph: 'default',
+                triple: { s: q.triple.o, p: { type: 'uri', value: `${EX}value` }, o: value },
+              },
+            ],
+          }
+        : {
+            id: 1,
+            kind: 'derived',
+            depth: 2,
+            triple: q.triple,
+            rule: { name: 'rdfs9', profile: 'rdfs-on-read' },
+            premises: [ref],
+          };
+    await route.fulfill({
+      status: 200,
+      contentType: 'application/json',
+      body: JSON.stringify({
+        mode: 'why',
+        entailed: true,
+        source: q.source === 'materialized' ? 'materialized' : 'rdfsOnRead',
+        commit: q.source === 'materialized' ? 300 : 301,
+        trees: [tree],
+        more: false,
+      }),
+    });
+  });
+  await open(page, 'why1');
+  const at = await edgeOn(page, 'alice', 'Manager');
+  await page.mouse.click(at.x, at.y);
+  const tree = panel(page).getByRole('tree', { name: 'Derivation' });
+  await expect(tree.locator('li.ref')).toHaveCount(1);
+  await panel(page).getByRole('button', { name: 'Expand' }).click();
+  await expect(tree.locator('li.ref')).toHaveCount(0);
+  await expect(tree.locator('li.asserted')).toHaveCount(1);
+  expect(sources).toEqual([undefined, 'materialized']);
+  await expect(panel(page)).not.toContainText('The inferences have changed.');
+});

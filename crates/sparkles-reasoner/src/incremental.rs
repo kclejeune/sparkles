@@ -1296,7 +1296,7 @@ impl Search {
             // a nested expansion takes a memo of its own meanwhile
             let memo = std::mem::take(&mut self.memo);
             let (failed, memo) = {
-                let mut sink = |body: &[Triple], implicit: &[Triple]| -> bool {
+                let mut sink = |body: &[Triple], implicit: &[Triple], _: &[u64]| -> bool {
                     self.instance(cx, n, root, depth, body, implicit)
                 };
                 let mut ev = Eval::new(

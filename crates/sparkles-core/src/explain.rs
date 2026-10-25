@@ -19,6 +19,8 @@ pub enum DerivationKind {
     /// a fact the tree does not expand because it passed the depth limit; another request
     /// on its triple explains it
     Ref,
+    /// a premise of a partial tree that the search ran out of budget before explaining
+    Unexplained,
 }
 
 impl DerivationKind {
@@ -28,6 +30,7 @@ impl DerivationKind {
             DerivationKind::Axiom => "axiom",
             DerivationKind::Derived => "derived",
             DerivationKind::Ref => "ref",
+            DerivationKind::Unexplained => "unexplained",
         }
     }
 }
@@ -42,6 +45,15 @@ pub struct RuleRef {
     /// the rule's id in the OWL 2 RL tables, for the rules of the `owl-rl` profile that
     /// carry one
     pub owl2rl: Option<String>,
+}
+
+/// The read that an expansion must retain, including a materialized subtree of a
+/// mixed RDFS-on-read tree.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct DerivationRead {
+    pub commit: u64,
+    pub source: &'static str,
+    pub read_at_head: bool,
 }
 
 /// One node of a derivation tree.
@@ -64,6 +76,20 @@ pub struct Derivation {
     pub shared: bool,
     /// the depth of the fact's derivation: 0 for an asserted fact, 1 for an axiom
     pub depth: u32,
+    /// for a derived node, the values the rule instance bound, by variable name without
+    /// the `?`, in the order of the rule's variables
+    pub bindings: Vec<(String, Term)>,
+    /// for a derived node, the builtins the instance passed, as calls with their bound
+    /// arguments, such as `notEqual(<http://ex.org/a>, <http://ex.org/b>)`
+    pub builtins: Vec<String>,
+    /// the triple is not RDF (a literal subject or a predicate that is not an IRI): the
+    /// rules use it, and it is never written to the inferred graph
+    pub generalized: bool,
+    /// for an asserted node of a why-not answer, the fact is one of the hypothesis's
+    /// missing facts and not in the data
+    pub missing: bool,
+    /// The selected read of this subtree, retained when it is cut as a ref.
+    pub read: Option<DerivationRead>,
 }
 
 impl Derivation {
@@ -78,6 +104,11 @@ impl Derivation {
             premises: Vec::new(),
             shared: false,
             depth: 0,
+            bindings: Vec::new(),
+            builtins: Vec::new(),
+            generalized: false,
+            missing: false,
+            read: None,
         }
     }
 
@@ -97,15 +128,25 @@ impl Derivation {
             premises,
             shared: false,
             depth,
+            bindings: Vec::new(),
+            builtins: Vec::new(),
+            generalized: false,
+            missing: false,
+            read: None,
         }
     }
 
-    /// The number of nodes in the tree, shared repeats included.
     /// The heap the node and its premises hold, with their decoded terms.
     pub fn heap_bytes(&self) -> usize {
         std::mem::size_of::<Derivation>()
             + self.triple.iter().map(term_bytes).sum::<usize>()
             + self.graph.as_ref().map_or(0, String::len)
+            + self
+                .bindings
+                .iter()
+                .map(|(n, t)| n.len() + term_bytes(t))
+                .sum::<usize>()
+            + self.builtins.iter().map(String::len).sum::<usize>()
             + self
                 .premises
                 .iter()
@@ -113,6 +154,7 @@ impl Derivation {
                 .sum::<usize>()
     }
 
+    /// The number of nodes in the tree, shared repeats included.
     pub fn size(&self) -> usize {
         1 + self.premises.iter().map(Derivation::size).sum::<usize>()
     }
@@ -124,6 +166,13 @@ pub enum Explained {
     /// derivations from the leaves, the first of the smallest depth found, then others
     /// whose top rule differs, and whether derivations by further rules exist
     Found { trees: Vec<Derivation>, more: bool },
+    /// the search passed a limit after it reached rule instances of the triple: the
+    /// deepest well-founded part it found, with the premises it did not explain as
+    /// `unexplained` nodes, and the limit it passed
+    Partial {
+        tree: Box<Derivation>,
+        reason: String,
+    },
     /// no derivation from facts the caller reads exists, or the triple is not entailed
     NotFound,
 }

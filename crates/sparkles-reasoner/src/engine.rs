@@ -59,13 +59,33 @@ pub(crate) struct CRule {
 
 struct FlatRule {
     name: String,
+    line: usize,
+    /// the index of the parsed rule it came from
+    parsed: usize,
     body: Vec<Clause>,
     head: Vec<Clause>,
 }
 
+/// What an explanation names of a compiled rule: its variables by number, the names of
+/// its builtins in body order, and the line of the rule text it came from.
+#[derive(Clone, Debug, Default)]
+pub(crate) struct RuleInfo {
+    pub vars: Vec<String>,
+    pub builtins: Vec<String>,
+    pub line: usize,
+    /// the index, among the rules compiled, of the parsed rule this one came from
+    pub parsed: usize,
+}
+
 /// Flatten nested rules in heads: `B1 -> [H <- B2]` materializes exactly like
 /// `B1, B2 -> H` (and the same for nested forward rules).
-fn flatten(r: &Rule, prefix: &[Clause], name: String, out: &mut Vec<FlatRule>) {
+fn flatten(
+    r: &Rule,
+    prefix: &[Clause],
+    name: String,
+    (line, parsed): (usize, usize),
+    out: &mut Vec<FlatRule>,
+) {
     let mut body = prefix.to_vec();
     body.extend(
         r.body
@@ -83,13 +103,19 @@ fn flatten(r: &Rule, prefix: &[Clause], name: String, out: &mut Vec<FlatRule>) {
                     .name
                     .clone()
                     .unwrap_or_else(|| format!("{name}/{nested}"));
-                flatten(inner, &body, n, out);
+                flatten(inner, &body, n, (inner.line, parsed), out);
             }
             c => head.push(c.clone()),
         }
     }
     if !head.is_empty() || nested == 0 {
-        out.push(FlatRule { name, body, head });
+        out.push(FlatRule {
+            name,
+            line,
+            parsed,
+            body,
+            head,
+        });
     }
 }
 
@@ -104,17 +130,19 @@ fn vars_of(n: &Node, out: &mut Vec<String>) {
 /// Compile parsed rules for materialization. Unsupported rules are skipped with a
 /// warning, backward rules among them.
 pub(crate) fn compile(rules: &[Rule], terms: &Terms, warnings: &mut Vec<String>) -> Vec<CRule> {
-    compile_with(rules, terms, warnings, false)
+    compile_with(rules, terms, warnings, false).0
 }
 
-/// Compile parsed rules for query-time reasoning (spec F17 §5.1): backward rules join the
-/// forward rules, since evaluating both bottom-up on demand gives the same least fixpoint.
-pub(crate) fn compile_query(
+/// [`compile`], with backward rules too when `backward` is set (for query-time
+/// reasoning, spec F17 §5.1), and with what an explanation names of
+/// each rule, in the same order.
+pub(crate) fn compile_info(
     rules: &[Rule],
     terms: &Terms,
     warnings: &mut Vec<String>,
-) -> Vec<CRule> {
-    compile_with(rules, terms, warnings, true)
+    backward: bool,
+) -> (Vec<CRule>, Vec<RuleInfo>) {
+    compile_with(rules, terms, warnings, backward)
 }
 
 fn compile_with(
@@ -122,9 +150,9 @@ fn compile_with(
     terms: &Terms,
     warnings: &mut Vec<String>,
     backward: bool,
-) -> Vec<CRule> {
+) -> (Vec<CRule>, Vec<RuleInfo>) {
     let mut flat = Vec::new();
-    for r in rules {
+    for (parsed, r) in rules.iter().enumerate() {
         if r.direction == Direction::Backward && !backward {
             warnings.push(format!(
                 "rule '{}' (line {}): backward rules ('<-') are not supported by forward materialization; skipped",
@@ -140,25 +168,30 @@ fn compile_with(
             ));
             continue;
         }
-        flatten(r, &[], r.label(), &mut flat);
+        flatten(r, &[], r.label(), (r.line, parsed), &mut flat);
     }
     let mut out = Vec::new();
+    let mut infos = Vec::new();
     for f in flat {
         match compile_one(&f, terms, warnings) {
-            Ok(Some(c)) => out.push(c),
+            Ok(Some((c, info))) => {
+                out.push(c);
+                infos.push(info);
+            }
             Ok(None) => {}
             Err(msg) => warnings.push(format!("rule '{}': {msg}; skipped", f.name)),
         }
     }
-    out
+    (out, infos)
 }
 
 fn compile_one(
     f: &FlatRule,
     terms: &Terms,
     warnings: &mut Vec<String>,
-) -> Result<Option<CRule>, String> {
+) -> Result<Option<(CRule, RuleInfo)>, String> {
     let mut vars: FxHashMap<String, usize> = FxHashMap::default();
+    let mut builtin_names: Vec<String> = Vec::new();
     let mut var = |v: &str| -> usize {
         let n = vars.len();
         *vars.entry(v.to_string()).or_insert(n)
@@ -166,7 +199,7 @@ fn compile_one(
     let slot = |n: &Node, var: &mut dyn FnMut(&str) -> usize| -> Result<Slot, String> {
         Ok(match n {
             Node::Var(v) => Slot::Var(var(v)),
-            Node::Const(t) => Slot::Const(terms.id_for(t)),
+            Node::Const(t) => Slot::Const(terms.id_for_rule(t)),
             Node::Any => Slot::Any,
             Node::Functor(name, _) => {
                 return Err(format!(
@@ -263,6 +296,7 @@ fn compile_one(
                     outputs,
                     regex,
                 });
+                builtin_names.push(b.name.clone());
             }
             Clause::Rule(_) => unreachable!("flattened"),
         }
@@ -357,7 +391,17 @@ fn compile_one(
     if plan(&rule, &ranges, None).is_none() {
         return Err("a builtin's input variables are never bound by the body".into());
     }
-    Ok(Some(rule))
+    let mut names = vec![String::new(); nvars];
+    for (n, &i) in &vars {
+        names[i] = n.clone();
+    }
+    let info = RuleInfo {
+        vars: names,
+        builtins: builtin_names,
+        line: f.line,
+        parsed: f.parsed,
+    };
+    Ok(Some((rule, info)))
 }
 
 /// `bound(?x…)` / `unbound(?x…)` are resolved statically from the textual position.
@@ -564,7 +608,9 @@ pub(crate) fn index_needs_with(rule: &CRule, steps: &[Step], prebound: &[usize])
 
 /// Receives the body of a rule instance: the facts its atoms matched and the facts its
 /// builtins read (`listForAll`). Returns false to stop the evaluation.
-pub(crate) type Sink<'s> = dyn FnMut(&[Triple], &[Triple]) -> bool + 's;
+/// Receives a rule instance: the facts its atoms matched, the facts its builtins read and
+/// its bindings, one value per variable of the rule (0 for a variable left unbound).
+pub(crate) type Sink<'s> = dyn FnMut(&[Triple], &[Triple], &[u64]) -> bool + 's;
 
 /// Where the first step of a plan reads its candidates when the work is split.
 #[derive(Clone, Copy)]
@@ -1149,7 +1195,7 @@ impl<'a> Eval<'a> {
                         ..
                     } = self;
                     if let Mode::Instances { sink, .. } = mode
-                        && !sink(trail, implicit)
+                        && !sink(trail, implicit, b)
                     {
                         *stop = true;
                     }

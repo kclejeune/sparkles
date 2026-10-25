@@ -603,6 +603,8 @@ struct StageBuilder<'a> {
     /// rules of the stage give `rdf:first` or `rdf:rest` facts, which builtins that
     /// read lists need complete
     derived_lists: bool,
+    /// whether linear recursion is rewritten (see [`transform`])
+    rewrite_linear: bool,
 }
 
 impl StageBuilder<'_> {
@@ -879,7 +881,7 @@ impl StageBuilder<'_> {
     /// The adorned copies of every rule that can give facts of key `k`.
     fn adorn(&mut self, k: Key) -> Result<(), TransformError> {
         let m = self.stage.magic[&k];
-        if self.linear(k, m)? {
+        if self.rewrite_linear && self.linear(k, m)? {
             return Ok(());
         }
         let rules = self.rules;
@@ -1246,21 +1248,26 @@ pub(crate) fn schema_roots(vocab: &Vocab, rdf_type: u64) -> Vec<(Key, [u64; 3])>
 
 /// Make the demand program of `rules` for the query's keys `roots`. Magic predicates and
 /// the dummy value are fresh blank nodes of `terms`.
+///
+/// With `linear` unset, linear recursion is not rewritten. Then every fact the program derives for a key has, among the facts derived, the
+/// premises of an instance of the original rule (spec F18 §3.1), since the rewriting
+/// derives the answers for the value asked for and not for the nodes it passes.
 pub(crate) fn transform(
     rules: &[CRule],
     terms: &Terms,
     roots: &[Key],
     est: Estimate<'_>,
     pass: Pass<'_>,
+    linear: bool,
 ) -> Result<Program, TransformError> {
     // A lower stage of every derived list can depend on itself when a rule reads one
     // list to build another, which the keys cannot tell apart. The program is then made
     // again with lists read as the stage holds them (Codex re-review F17-P1 #3).
     // A program whose noValue lies on a cycle stays refused (second Codex re-review of
     // F17-P1, #2).
-    match transform_in(rules, terms, roots, est, pass, true) {
+    match transform_in(rules, terms, roots, est, pass, true, linear) {
         Err(TransformError::NotStratified) if !negation_on_a_cycle(rules, terms) => {
-            transform_in(rules, terms, roots, est, pass, false)
+            transform_in(rules, terms, roots, est, pass, false, linear)
         }
         r => r,
     }
@@ -1394,6 +1401,7 @@ fn transform_in(
     est: Estimate<'_>,
     pass: Pass<'_>,
     list_stages: bool,
+    linear: bool,
 ) -> Result<Program, TransformError> {
     let closed = match pass {
         Pass::Closed(c) => Some(c),
@@ -1546,6 +1554,7 @@ fn transform_in(
             below: Vec::new(),
             below_seen: FxHashSet::default(),
             derived_lists: list_stages && phase == 0 && list_heads(stage_rules, terms),
+            rewrite_linear: linear,
         };
         let mut seeds: Vec<(Key, [u64; 3])> = Vec::new();
         for (k, vals) in &level {

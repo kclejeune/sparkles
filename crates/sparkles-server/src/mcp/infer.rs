@@ -18,27 +18,16 @@ struct InferArgs {
     mode: Option<String>,
     max_trees: Option<u64>,
     max_depth: Option<u64>,
+    max_missing: Option<u64>,
+    max_hypotheses: Option<u64>,
+    source: Option<String>,
+    profile: Option<String>,
     timeout_seconds: Option<f64>,
 }
 
 impl Tools<'_> {
     pub(super) fn explain_inference(&self, args: Map<String, Value>) -> Result<Outcome, ToolError> {
         let a: InferArgs = parse(args)?;
-        match a.mode.as_deref() {
-            None | Some("why") => {}
-            Some("whyNot") => {
-                return Err(ToolError::new(
-                    "not-implemented",
-                    501,
-                    "whyNot explanations are not available: only mode \"why\" is",
-                ));
-            }
-            Some(m) => {
-                return Err(ToolError::bad_argument(format!(
-                    "mode must be \"why\" or \"whyNot\", not '{m}'"
-                )));
-            }
-        }
         let timeout = self.timeout(a.timeout_seconds)?;
         let ds = self.dataset(a.dataset.as_deref())?;
         let prefix_map = dataset_prefixes(&ds);
@@ -48,25 +37,12 @@ impl Tools<'_> {
             .collect();
         let triple = ex::triple_from_text(&a.triple, &prefixes)
             .map_err(|e| ToolError::bad_argument(e.to_string()))?;
-        let mut req = ex::ExplainRequest::new(triple);
-        if let Some(n) = a.max_trees {
-            if !(1..=ex::MAX_TREES as u64).contains(&n) {
-                return Err(ToolError::bad_argument(format!(
-                    "maxTrees must be from 1 to {}",
-                    ex::MAX_TREES
-                )));
-            }
-            req.max_trees = n as usize;
-        }
-        if let Some(n) = a.max_depth {
-            if !(1..=ex::MAX_DEPTH as u64).contains(&n) {
-                return Err(ToolError::bad_argument(format!(
-                    "maxDepth must be from 1 to {}",
-                    ex::MAX_DEPTH
-                )));
-            }
-            req.max_depth = n as u32;
-        }
+        let term = ex::term_json;
+        let request = json!({"triple":{"s":term(&triple[0]),"p":term(&triple[1]),"o":term(&triple[2])},
+            "mode":a.mode.as_deref().unwrap_or("why"), "source":a.source,"profile":a.profile,
+            "maxTrees":a.max_trees,"maxDepth":a.max_depth,"maxMissing":a.max_missing,"maxHypotheses":a.max_hypotheses});
+        let (mut req, _, _) =
+            ex::request_from_json(&request).map_err(|e| ToolError::bad_argument(e.to_string()))?;
         req.timeout = Some(timeout);
         // the search and its answer are held to a query's memory budget
         req.max_memory = self
@@ -107,9 +83,17 @@ impl Tools<'_> {
                 .iter()
                 .map(|t| Value::String(ex::summary(t, &prefixes)))
                 .collect(),
+            Explained::Partial { tree, .. } => json!([ex::summary(tree, &prefixes)]),
             Explained::NotFound => json!([]),
         };
-        if let Explained::NotFound = e.explained {
+        if let Some(sparkles_reasoner::whynot::WhyNot::NotEntailed { hypotheses, .. }) = &e.why_not
+        {
+            out["summaries"] = hypotheses
+                .iter()
+                .map(|h| Value::String(ex::summary(&h.tree, &prefixes)))
+                .collect();
+        }
+        if req.mode == ex::ExplainMode::Why && matches!(e.explained, Explained::NotFound) {
             out["message"] = "no derivation from facts you can read was found".into();
         }
         out["prefixes"] = json!(prefix_map);
