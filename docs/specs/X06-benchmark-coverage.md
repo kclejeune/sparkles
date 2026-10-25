@@ -1185,3 +1185,50 @@ is released when the cursor ends. On atlas at 1M with four threads, an approxima
 measurement on a shared host, streamed `q4` execution fell from about 2.7 s to 1.4 s,
 eager execution stayed at about 0.4 s, and the answers stayed the same. A test counts the
 ledger operations of 2,000 cursor comparisons against a filter that compares nothing.
+
+### Remaining competitive benchmark losses
+
+Roadmap item 307 follows the competitive query and durable-write improvements. It
+rechecks the published losses with the resulting build before choosing further
+optimizations. Its work is separate from refreshing the comparison records in item 1.
+The remaining LUBM q2 gap belongs to the preceding competitive query work.
+
+The first step rebuilds the loss inventory from the full benchmark tables as well as
+[Where Sparkles loses](../BENCHMARKS.md#where-sparkles-loses). A case already brought
+within the comparison's ten-percent tie band needs a matching measurement and an updated
+record. A loss that remains needs a profile and a fix, followed by the comparison again.
+An internal A/B improvement alone does not establish that Sparkles leads the other engine.
+
+| Work | Published evidence and required coverage |
+|---|---|
+| DBpedia | Recheck the 50M slice's `births-by-decade`, where QLever leads by 4.9 times warm and 1.7 times cold, and cold `outlink-classes-2` at 1.24 billion triples. Keep both dataset sizes so a win at full scale does not hide a smaller-scale regression. |
+| Remaining BSBM queries | Complete the investigation of BI q3 and Explore q7 and q8. Profiles of these cases do not count as closed competitor gaps. |
+| Cold reads | Recheck cold point lookups against Oxigraph and small cold scans against Fluree at 1.05M and 10.5M. Coordinate changes with item 4 and X07, including their warm-query and dense-read guards. |
+| Bindings | Recheck JVM and Python small queries, rdflib calls, Node adds and probes, and Node `export-500k`. Item 33 coordinates this work, including fresh quiet-host measurements of JVM resource descriptions and DELETE/INSERT WHERE, whose shared-host timings show further possible losses. |
+| Mixed reads and writes | Recheck the write-rate gap under concurrent readers as well as serial commits, while preserving durable acknowledgements. Compare the read rates and latency tails alongside the write rate, and keep the engines' synchronization policies explicit. |
+| Smaller query losses | Recheck WatDiv L1-1 and changed-store `two-hop-count`, whose published gaps are near ten percent. Use enough rounds to distinguish a persistent loss from measurement variation. |
+
+The binding comparisons include Python's small VALUES query and rdflib's `contains`
+and `Graph.value` calls. The JVM microbenchmarks include the fixed cost of entering the
+native binding and constructing Jena results. A repair must preserve transaction,
+term-conversion and iterator behavior rather than remove work that the public API needs.
+
+Each comparison uses the same input digest, query, result format and qualified answers,
+with matched compiler and cache settings where appropriate. Published numbers come from
+quiet forge runs. Warm and cold cases remain distinct, and every cold comparison records
+its eviction method. The write comparisons retain Sparkles' acknowledgement durability
+and report a competitor's unsynchronized commits as a different policy.
+
+The loss inventory also retains the documented memory and index-size differences under
+item 40. Mapped file pages, reclaimable caches and private heap must be distinguished,
+and text indexes must be compared with their predicate scope and features stated. These
+are separate footprint tradeoffs. This follow-up does not silently reduce caches or
+remove features to improve a ranking, and the standing priority remains speed unless a
+memory cost is egregious.
+
+Implement and review changes in independent groups, with correctness tests and broad
+regression screens. Update README, BENCHMARKS and the corresponding spec outcomes only
+when measurements support the new comparison. Record any accepted slowdown as roadmap
+work and any measured rejected optimization in PERFORMANCE-EXPERIMENTS, retaining its
+commit and revert. Item 307 remains open while confirmed speed losses remain, unless the
+user explicitly accepts a tradeoff or removes a case from scope.
