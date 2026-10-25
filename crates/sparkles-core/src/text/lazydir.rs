@@ -263,6 +263,8 @@ impl LazySyncDir {
             dir: self,
             _lease: lease,
             before,
+            #[cfg(feature = "failpoints")]
+            before_sync: None,
         }
     }
 
@@ -442,6 +444,8 @@ pub(crate) struct Checkpoint<'a> {
     dir: &'a LazySyncDir,
     _lease: MutexGuard<'a, ()>,
     before: Option<CheckpointStart>,
+    #[cfg(feature = "failpoints")]
+    before_sync: Option<Arc<dyn Fn() + Send + Sync>>,
 }
 
 #[derive(Clone, Copy)]
@@ -452,6 +456,14 @@ struct CheckpointStart {
 }
 
 impl Checkpoint<'_> {
+    /// Inject publication after taking this pass's pending files, so the next
+    /// pass must catch up on the new files. Used only by a single test driver.
+    #[cfg(feature = "failpoints")]
+    pub(crate) fn on_sync(mut self, hook: Option<Arc<dyn Fn() + Send + Sync>>) -> Self {
+        self.before_sync = hook;
+        self
+    }
+
     /// Return whether the marker was safely cleared. A racing write keeps it, and a
     /// later tick retries. All paths release the pathname lease before returning.
     pub(crate) fn run(self) -> io::Result<bool> {
@@ -463,6 +475,10 @@ impl Checkpoint<'_> {
         self.dir.run_hook(TestPoint::CheckpointPassStart)?;
         if before.marked {
             let pending = self.dir.take_pending();
+            #[cfg(feature = "failpoints")]
+            if let Some(hook) = &self.before_sync {
+                hook();
+            }
             self.dir.sync_files(pending.get())?;
             pending.synchronized();
         }
