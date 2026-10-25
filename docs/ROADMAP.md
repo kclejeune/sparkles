@@ -473,8 +473,8 @@ linked spec Outcome records how they landed.
 
 Update this document when an item ships, changes tier or gets a new spec. A new known gap
 in a feature guide gets a roadmap item in the same commit. When an item ships, its spec's
-Outcome records what landed, [FEATURES.md](FEATURES.md), the affected guide and
-[BENCHMARKS.md](BENCHMARKS.md) change
+Outcome records what landed, [FEATURES.md](FEATURES.md), the affected guide and the
+relevant [benchmark report](benchmarks/README.md) change
 in the same commit, and the Known gaps bullet drops the item's number. The item's row then
 moves to a one-line entry under [Completed](#completed). When part of an item ships, its
 row is cut down to the part that remains.

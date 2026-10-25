@@ -67,8 +67,9 @@ work, and each item links to its design spec in [docs/specs](docs/specs/README.m
   manual reports from generated reports, and check generated output against its
   explicit source selection with `python3 scripts/bench-docs.py --check`.
 - When a roadmap item or spec phase ships, update its spec's Outcome section,
-  [docs/FEATURES.md](docs/FEATURES.md), [docs/BENCHMARKS.md](docs/BENCHMARKS.md) when there
-  are numbers, and the item's row in [docs/ROADMAP.md](docs/ROADMAP.md), all in the same
+  [docs/FEATURES.md](docs/FEATURES.md), the relevant
+  [benchmark report](docs/benchmarks/README.md) when there are numbers, and the item's
+  row in [docs/ROADMAP.md](docs/ROADMAP.md), all in the same
   change. Update the affected feature guide too. A new known gap in feature documentation
   gets a roadmap item in the same commit.
 - Write documentation as plain technical prose in full sentences. Avoid fragment openers,
