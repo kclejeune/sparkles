@@ -46,7 +46,7 @@ implementation status.
 | [Durable commits and dataset identity](#storage-and-indexes) | Complete within the documented commit contract. | Transactions, receipts and synchronized acknowledgements are available. Indexed group-commit performance follow-ups remain separate measurements. |
 | [Storage, loading and compaction](#storage-and-indexes) | Partially complete. | Compressed indexes, bulk imports, online compaction and optional FSST are available. Finer compaction controls and larger-scale measurements remain. |
 | [History, snapshots and branches](#versioning-and-history) | Partially complete. | Retained commits, diffs, branches and merge review are available. Historical full-text search and further branch administration remain. |
-| [Streaming execution and disk spill](#sparql-queries-and-updates) | Partially complete. | Eligible plans stream automatically, with explicit cursors and opt-in spill. Eager fallbacks and spill acceptance work remain. |
+| [Streaming execution and disk spill](#sparql-queries-and-updates) | Partially complete. | Eligible plans stream automatically, with explicit cursors and opt-in spill. Eager fallbacks, spill costs and default decisions remain. |
 | [Incremental views and live queries](#sparql-queries-and-updates) | Partially complete. | Table views, checkpoints and SSE result changes are available. Graph views, commit-time maintenance, branch views and per-fact provenance remain planned. |
 | [Full-text and vector search](#search) | Partially complete. | BM25, HNSW, hybrid ranking and embeddings on write are available. Historical search, multi-field documents and quantization remain planned. |
 | [Paths and graph algorithms](#search) | Partially complete. | Shortest paths, communities, centrality and graph embeddings are available. Some path kernels, algorithm surfaces and larger reference comparisons remain. |
@@ -1573,6 +1573,9 @@ links each item to its design spec.
 * FSST vocabulary compression is off by default. With it, a DBpedia export takes 1.05
   times as long as with front coding, and warm queries that decode many strings run 4% to
   12% slower. Single-term lookups are the follow-up in roadmap item 160.
+* Vocabulary codec and predicate-pattern choices have no dataset-local layered settings.
+  Roadmap item 343 adds settings for subsequent builds and compactions while retaining
+  each existing generation's recorded format.
 * Cold `values-star` and `path-plus` were slower than Oxigraph at 1.05M and 10.5M, as was
   cold `star-lookup` at 10.5M, and that comparison has not been repeated on index format
   3. Index format 3 makes cold `star-join` at 10.5M 6% to 8% slower. Dense reads on the
@@ -1758,6 +1761,8 @@ links each item to its design spec.
 
 ### Server, access control and operations
 
+* The JSON metrics snapshot and OTLP export omit some produced-row, memory-peak and
+  rebuild series available in Prometheus. Cross-format parity is roadmap item 342.
 * There are no JVM metrics. Assembler bodies are read only for the part that maps to a
   dataset. Direct Graph Store naming is chosen per dataset at start with
   `--gsp-direct-naming` and not through the settings API. Roadmap item 76.
@@ -1774,8 +1779,9 @@ links each item to its design spec.
 * Sparkles runs as a single node on local disk. There is no clustering and there are no
   replicas, roadmap item 66. Live RDF data on local disk is not encrypted at rest, item 65.
 * Backups cover individual datasets, with no whole-server backup, roadmap item 61.
+  Retained-history backups and storage-retention controls also remain under item 61.
   Encryption keys for backup repositories cannot be managed through the API, Vault or a
-  cloud KMS, item 65.
+  cloud KMS, and write-only age-recipient repositories are not built, item 65.
 * Without `--secrets-key`, runtime keys are sealed with a key that the server generated in
   the data directory, which does not protect them from someone who can read that
   directory. An operator who wants no keys on disk locks the secrets in the settings file.
