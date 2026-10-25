@@ -8886,8 +8886,14 @@ mod limited_startup_tests {
         node
     }
 
-    #[test]
-    fn admitted_ask_filters_do_not_restart_full_join_builds() {
+    fn run(
+        reduced: bool,
+        row_limit: usize,
+        build_rows: usize,
+        duplicate_keys: bool,
+        match_row: usize,
+        memory: Option<u64>,
+    ) -> Result<u32> {
         let store = Store::in_memory(StoreOptions::default());
         let data: String = (0..2000)
             .map(|i| format!("<urn:record:{i:04}> <urn:key> <urn:bucket:0> .\n"))
@@ -8899,95 +8905,116 @@ mod limited_startup_tests {
                 None,
             )])
             .unwrap();
-        let run = |reduced: bool| {
-            let mut ctx = Ctx::new(store.snapshot());
-            ctx.use_cache = false;
-            let subject = ctx.var("subject");
-            let key = ctx.var("key");
-            let target = ctx.var("target");
-            let term = |text: &str| ctx.intern_term(&oxrdf::NamedNode::new(text).unwrap().into());
-            let predicate = term("urn:key");
-            let witness = term("urn:record:0008");
-            let scan = Node::leaf(
-                Kind::Scan(ScanSpec {
-                    perm: Perm::Pso,
-                    prefix: vec![predicate.0],
-                    cols: vec![(1, subject), (2, key)],
-                    eqs: Vec::new(),
-                    graph: GraphFilter::Default,
-                    graph_col: 3,
-                    dedup: false,
-                    src: None,
-                }),
-                vec![subject, key],
-                2000.0,
-                "driving scan".into(),
-            );
-            let mut values = Table::new(vec![key, target]);
-            for i in 0..1000 {
-                values.push_row(&[term(&format!("urn:bucket:{i}")), witness]);
+        let mut ctx = Ctx::new(store.snapshot());
+        ctx.use_cache = false;
+        ctx.max_rows = row_limit;
+        ctx.mem_limit = memory.unwrap_or(u64::MAX);
+        let subject = ctx.var("subject");
+        let key = ctx.var("key");
+        let target = ctx.var("target");
+        let term = |text: &str| ctx.intern_term(&oxrdf::NamedNode::new(text).unwrap().into());
+        let predicate = term("urn:key");
+        let witness = term(&format!("urn:record:{match_row:04}"));
+        let scan = Node::leaf(
+            Kind::Scan(ScanSpec {
+                perm: Perm::Pso,
+                prefix: vec![predicate.0],
+                cols: vec![(1, subject), (2, key)],
+                eqs: Vec::new(),
+                graph: GraphFilter::Default,
+                graph_col: 3,
+                dedup: false,
+                src: None,
+            }),
+            vec![subject, key],
+            2000.0,
+            "driving scan".into(),
+        );
+        let mut values = Table::new(vec![key, target]);
+        for i in 0..build_rows {
+            let bucket = if duplicate_keys { 0 } else { i };
+            values.push_row(&[term(&format!("urn:bucket:{bucket}")), witness]);
+        }
+        let build = Node::leaf(
+            Kind::Values(values),
+            vec![key, target],
+            build_rows as f64,
+            "full build".into(),
+        );
+        let mut joined = Node::leaf(
+            Kind::Join {
+                algo: JoinAlgo::Hash,
+                keys: vec![key],
+            },
+            vec![subject, key, target],
+            2000.0,
+            "hash join".into(),
+        );
+        joined.children = vec![scan, build];
+        joined.cost = 6000.0;
+        let mut filtered = unary(
+            Kind::Filter(vec![Expr::SameTerm(
+                Box::new(Expr::Var(subject)),
+                Box::new(Expr::Var(target)),
+            )]),
+            joined,
+            "matching both inputs",
+        );
+        filtered.est = 1.0;
+        let mut union = Node::leaf(Kind::Union, filtered.vars.clone(), 1.0, "pure union".into());
+        union.cost = filtered.cost;
+        union.children = vec![filtered, Node::empty(vec![subject, key, target])];
+        let mut root = unary(
+            Kind::Slice {
+                offset: 0,
+                limit: Some(1),
+            },
+            union,
+            "ASK demand",
+        );
+        super::super::unionpush::order_ask(&ctx, &mut root);
+        assert!(ctx.eager_union_demand.load(AtomicOrdering::Relaxed));
+        if !reduced {
+            ctx.eager_union_demand.store(false, AtomicOrdering::Relaxed);
+        }
+        let (output, plan) = execute(&ctx, &root)?;
+        assert_eq!(output.len(), 1);
+        assert_eq!(output.cols[0][0], witness);
+        fn find_build(p: &PlanInfo) -> Option<&PlanInfo> {
+            if p.operator == "Values" && p.description == "full build" {
+                return Some(p);
             }
-            let build = Node::leaf(
-                Kind::Values(values),
-                vec![key, target],
-                1000.0,
-                "full build".into(),
-            );
-            let mut joined = Node::leaf(
-                Kind::Join {
-                    algo: JoinAlgo::Hash,
-                    keys: vec![key],
-                },
-                vec![subject, key, target],
-                2000.0,
-                "hash join".into(),
-            );
-            joined.children = vec![scan, build];
-            joined.cost = 6000.0;
-            let mut filtered = unary(
-                Kind::Filter(vec![Expr::SameTerm(
-                    Box::new(Expr::Var(subject)),
-                    Box::new(Expr::Var(target)),
-                )]),
-                joined,
-                "matching both inputs",
-            );
-            filtered.est = 1.0;
-            let mut union =
-                Node::leaf(Kind::Union, filtered.vars.clone(), 1.0, "pure union".into());
-            union.cost = filtered.cost;
-            union.children = vec![filtered, Node::empty(vec![subject, key, target])];
-            let mut root = unary(
-                Kind::Slice {
-                    offset: 0,
-                    limit: Some(1),
-                },
-                union,
-                "ASK demand",
-            );
-            super::super::unionpush::order_ask(&ctx, &mut root);
-            assert!(ctx.eager_union_demand.load(AtomicOrdering::Relaxed));
-            if !reduced {
-                ctx.eager_union_demand.store(false, AtomicOrdering::Relaxed);
-            }
-            let (output, plan) = execute(&ctx, &root).unwrap();
-            assert_eq!(output.len(), 1);
-            assert_eq!(output.cols[0][0], witness);
-            fn find_build(p: &PlanInfo) -> Option<&PlanInfo> {
-                if p.operator == "Values" && p.description == "full build" {
-                    return Some(p);
-                }
-                p.children.iter().find_map(find_build)
-            }
-            let build = find_build(&plan).unwrap();
-            assert_eq!(build.actual_rows, 1000);
-            build.fidelity().reruns + 1
-        };
-        assert_eq!(run(false), 1, "ordinary prefixes build the input once");
+            p.children.iter().find_map(find_build)
+        }
+        let build = find_build(&plan).unwrap();
+        assert_eq!(build.actual_rows, build_rows as i64);
+        Ok(build.fidelity().reruns + 1)
+    }
+
+    #[test]
+    fn admitted_ask_filters_do_not_restart_full_join_builds() {
         assert_eq!(
-            run(true),
+            run(false, 2_000_000, 1000, false, 8, None).unwrap(),
+            1,
+            "ordinary prefixes build the input once"
+        );
+        assert_eq!(
+            run(true, 2_000_000, 1000, false, 8, None).unwrap(),
             1,
             "reduced filter demand must not rebuild full inputs"
+        );
+    }
+
+    #[test]
+    fn early_filtered_join_keeps_its_budget_safe_exact_prefix() {
+        assert_eq!(run(true, 64, 64, true, 0, None).unwrap(), 1);
+    }
+
+    #[test]
+    fn tight_memory_keeps_exact_demand_when_wider_work_cannot_be_proven() {
+        assert_eq!(
+            run(true, 2_000_000, 1000, false, 8, Some(2 << 20)).unwrap(),
+            3
         );
     }
 }

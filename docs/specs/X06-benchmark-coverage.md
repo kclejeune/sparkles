@@ -1344,7 +1344,9 @@ to reorder index-probe branches or certify their estimated fanout.
 A broader execution check found that a filtered join with its first match at row nine
 rebuilt its thousand-row input three times under prefixes one, eight and sixty-four.
 The ordinary prefix built it once. Retrying operators now keep the ordinary prefix
-when their input would restart a full join build. Projections and constant bindings
+when their input would restart a full join build and conservative subtree bounds prove
+that widening fits the row and memory limits. Tight budgets retain exact demand even
+when this can repeat build work. Projections and constant bindings
 preserve exact demand so they do not drain additional UNION operands. The physical
 regression checks the same answer and one build in both cases, with result caching off.
 

@@ -317,7 +317,9 @@ Each of these can be switched off per query (`QueryOptions::optimizations`) or p
   does not bound duplicate-key fanout. Pure demand admission is independent, so reducing
   excess demand can still avoid unnecessary work. Retrying filters, probes and nested
   joins keep the ordinary initial prefix when a new input prefix would rebuild a full
-  join input. Row-preserving projections and constant bindings still pass exact demand.
+  join input and conservative bounds prove that widening fits the row and memory
+  limits. Otherwise they retain exact demand. Row-preserving projections and constant
+  bindings still pass exact demand.
 * A pattern with one free variable and at most four estimated rows is eligible for
   `point_patterns`. The planner reads at most two rows and substitutes a constant only
   when exactly one row exists in the query snapshot. It restores the variable in the
