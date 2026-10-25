@@ -434,3 +434,120 @@ test('a branch canvas reads its history and family path defaults in the correct 
   await page.getByRole('button', { name: 'Paths', exact: true }).click();
   await expect.poll(() => settings).toEqual([`/$/settings/${name}/paths`]);
 });
+
+test('same-component Explore navigation reconciles family before branch reads', async ({
+  page,
+  request,
+}) => {
+  const a = 'f18-navigation-a';
+  const b = 'f18-navigation-b';
+  for (const name of [a, b]) {
+    await create(request, name);
+    await request.post(`/$/branches/${name}`, { data: { name: 'dev' } });
+  }
+  await page.goto(`/ui/explore?ds=${a}&iri=urn%3ACat`);
+  await expect(page.getByRole('complementary', { name: 'Resource details' })).toBeVisible();
+  const reads: string[] = [];
+  page.on('request', (request) => {
+    const path = decodeURIComponent(new URL(request.url()).pathname);
+    if (path.endsWith('/sparql') && (request.postData() ?? '').includes('<urn:Cat>'))
+      reads.push(path);
+  });
+  await page.evaluate((href) => {
+    const link = document.createElement('a');
+    link.href = href;
+    link.textContent = 'Change explanation target';
+    document.body.append(link);
+  }, `/ui/explore?ds=${b}&branch=dev&iri=urn%3ACat`);
+  await page.getByRole('link', { name: 'Change explanation target' }).click();
+  await expect.poll(() => reads.some((path) => path === `/${b}@dev/sparql`)).toBe(true);
+  expect(reads.filter((path) => path === `/${a}@dev/sparql`)).toEqual([]);
+});
+
+test('Similar keeps branch handoffs in query and embedding pages', async ({ page, request }) => {
+  await request.post('/$/branches/foaf', { data: { name: 'dev' } });
+  await page.goto('/ui/similar?ds=foaf&branch=dev&index=embedding');
+  const query = page.getByRole('region', { name: 'Query', exact: true });
+  await query.getByRole('radio', { name: 'Vector', exact: true }).click();
+  await query.getByLabel(/^Vector/).fill('[0.9, 0.1, -0.7, -1.1, -0.6, 0.4, 1.1, 0.9]');
+  await query.getByRole('button', { name: 'Search', exact: true }).click();
+  const results = page.getByRole('region', { name: 'Similar results' });
+  await expect(results.locator('tbody tr')).toHaveCount(10);
+  const map = page.getByRole('link', { name: 'Embedding map', exact: true });
+  const href = new URL((await map.getAttribute('href'))!, page.url());
+  expect(href.searchParams.get('ds')).toBe('foaf');
+  expect(href.searchParams.get('branch')).toBe('dev');
+  await results.getByRole('button', { name: 'Open in query editor' }).click();
+  await expect(page.getByRole('combobox', { name: 'Branch', exact: true })).toHaveValue('dev');
+  await page.goto(href.toString());
+  await expect(page.locator('.emap[data-ready="true"]')).toBeVisible();
+  await expect(page).toHaveURL(
+    (url) => url.searchParams.get('ds') === 'foaf' && url.searchParams.get('branch') === 'dev',
+  );
+});
+
+test('Similar invalidates a pending branch response when sidebar navigation selects main', async ({
+  page,
+  request,
+}) => {
+  await request.post('/$/branches/foaf', { data: { name: 'dev' } });
+  let started: () => void = () => {};
+  const start = new Promise<void>((resolve) => {
+    started = resolve;
+  });
+  let release: () => void = () => {};
+  const pending = new Promise<void>((resolve) => {
+    release = resolve;
+  });
+  let handled: () => void = () => {};
+  const done = new Promise<void>((resolve) => {
+    handled = resolve;
+  });
+  await page.route('**/foaf@dev/sparql**', async (route) => {
+    const body = route.request().postData() ?? '';
+    if (!body.includes('vectorSearch')) return route.continue();
+    const response = await route.fetch();
+    started();
+    await pending;
+    await route.fulfill({ response }).catch(() => {});
+    handled();
+  });
+  await page.goto('/ui/similar?ds=foaf&branch=dev&index=embedding');
+  const query = page.getByRole('region', { name: 'Query', exact: true });
+  await query.getByRole('radio', { name: 'Vector', exact: true }).click();
+  await query.getByLabel(/^Vector/).fill('[0.9, 0.1, -0.7, -1.1, -0.6, 0.4, 1.1, 0.9]');
+  await query.getByRole('button', { name: 'Search', exact: true }).click();
+  await start;
+  await page.getByRole('navigation').getByRole('link', { name: 'Similar', exact: true }).click();
+  await expect(page).toHaveURL(
+    (url) => url.pathname === '/ui/similar' && !url.searchParams.has('branch'),
+  );
+  release();
+  await expect(query.getByRole('button', { name: 'Search', exact: true })).toBeEnabled();
+  await done;
+  await page.evaluate(
+    () =>
+      new Promise<void>((resolve) =>
+        requestAnimationFrame(() => requestAnimationFrame(() => resolve())),
+      ),
+  );
+  const results = page.getByRole('region', { name: 'Similar results' });
+  await expect(results.locator('tbody tr')).toHaveCount(0);
+  await expect(results.getByRole('button', { name: 'Open in query editor' })).toHaveCount(0);
+});
+
+test('Similar opens the query editor on the branch that produced its result', async ({
+  page,
+  request,
+}) => {
+  await request.post('/$/branches/foaf', { data: { name: 'dev' } });
+  await page.goto('/ui/similar?ds=foaf&branch=dev&index=embedding');
+  const query = page.getByRole('region', { name: 'Query', exact: true });
+  await query.getByRole('radio', { name: 'Vector', exact: true }).click();
+  await query.getByLabel(/^Vector/).fill('[0.9, 0.1, -0.7, -1.1, -0.6, 0.4, 1.1, 0.9]');
+  await query.getByRole('button', { name: 'Search', exact: true }).click();
+  const results = page.getByRole('region', { name: 'Similar results' });
+  await expect(results.locator('tbody tr')).toHaveCount(10);
+  await results.getByRole('button', { name: 'Open in query editor' }).click();
+  await expect(page.getByRole('combobox', { name: 'Branch', exact: true })).toHaveValue('dev');
+});

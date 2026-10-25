@@ -90,8 +90,18 @@
     if (!name) return;
     untrack(() => {
       if (lastDs != null && lastDs !== name) {
+        ctl?.abort();
+        runs.claim('search');
+        suggestRuns.claim('suggest');
+        entityRuns.claim('entity');
+        clearTimeout(suggestTimer);
+        suggestions = [];
+        entityVectors = null;
         target = '';
         result = null;
+        ran = null;
+        labels = new Map();
+        searching = false;
         error = null;
       }
       lastDs = name;
@@ -315,7 +325,8 @@
     const s = search;
     const name = ds;
     if (!s || !name) return;
-    const owns = runs.claim('search');
+    const requestOwns = runs.claim('search');
+    const owns = () => requestOwns() && name === ds;
     ctl?.abort();
     const c = (ctl = new AbortController());
     searching = true;
@@ -364,6 +375,8 @@
   function openInQuery() {
     const s = ran ?? search;
     if (!s) return;
+    app.queryBranch = selectedBranch ?? '';
+    app.queryAt = '';
     app.pendingQuery = { query: buildVectorSearch(s.q), title: 'Similar' };
     goto(resolve('/query'));
   }
@@ -405,9 +418,10 @@
     {#if ds && chosenIndex}
       <a
         class="btn"
-        href="{resolve('/embedding')}?ds={encodeURIComponent(ds)}&index={encodeURIComponent(
-          chosenIndex.name,
-        )}">Embedding map</a
+        href="{resolve('/embedding')}?{new URLSearchParams({
+          ds: family!,
+          ...(selectedBranch ? { branch: selectedBranch } : {}),
+        })}&index={encodeURIComponent(chosenIndex.name)}">Embedding map</a
       >
     {/if}
   </header>

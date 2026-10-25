@@ -143,15 +143,31 @@
   /** The reports belong to main: a page on another branch draws no communities. */
   const overviewBranch = $derived(branchParam(page.url.searchParams.get('branch')));
   const resourceTarget = $derived(ds ? onBranch(ds, overviewBranch) : null);
-  let previousResourceBranch: string | null | undefined = undefined;
+  let lastDs: string | null = null;
+  // Set the URL family before any branch-target effect can launch a read.
   $effect(() => {
-    const branch = overviewBranch;
-    if (previousResourceBranch === undefined) {
-      previousResourceBranch = branch;
+    const urlDs = page.url.searchParams.get('ds');
+    untrack(() => {
+      if (urlDs && urlDs !== app.current && app.datasets.some((d) => d.name === urlDs)) {
+        lastDs = urlDs;
+        app.setDataset(urlDs);
+        void loadStarters(urlDs);
+      } else if (urlDs && urlDs !== app.current && !app.datasetsLoaded) {
+        app.setDataset(urlDs);
+        lastDs = urlDs;
+      }
+    });
+  });
+
+  let previousResourceTarget: string | null | undefined = undefined;
+  $effect(() => {
+    const target = resourceTarget;
+    if (previousResourceTarget === undefined) {
+      previousResourceTarget = target;
       return;
     }
-    if (previousResourceBranch === branch) return;
-    previousResourceBranch = branch;
+    if (previousResourceTarget === target) return;
+    previousResourceTarget = target;
     untrack(() => {
       graphRuns.claim('graph');
       histRuns.claim('history');
@@ -1039,7 +1055,8 @@
     const n = nodes[id];
     if (!n || n.term.type !== 'uri' || !ds || expanding[id]) return;
     const gen = graphGen.current;
-    const stale = () => !graphGen.isCurrent(gen) || nodes[id] !== n;
+    const target = resourceTarget;
+    const stale = () => target !== resourceTarget || !graphGen.isCurrent(gen) || nodes[id] !== n;
     if (nodeCount > MAX_NODES) {
       toasts.push(
         'error',
@@ -1052,7 +1069,7 @@
     const signal = expandCtl.signal;
     try {
       const r = await ex.neighbours(
-        resourceTarget!,
+        target!,
         n.iri,
         timeActive && graphTimeOpen ? exAt || undefined : undefined,
         signal,
@@ -1999,7 +2016,6 @@
 
   // --- lifecycle / url sync -----------------------------------------------------
 
-  let lastDs: string | null = null;
   $effect(() => {
     const name = ds;
     if (name === lastDs) return;
@@ -2036,19 +2052,11 @@
       untrack(() => loadSchema(ds!));
   });
 
-  // React to resource and branch changes from links into a retained support.
+  // Focus only after initial time controls have reconciled, preserving a past-state URL.
   $effect(() => {
     const iri = page.url.searchParams.get('iri');
-    const urlDs = page.url.searchParams.get('ds');
+    void page.url.searchParams.get('ds');
     untrack(() => {
-      if (urlDs && urlDs !== app.current && app.datasets.some((d) => d.name === urlDs)) {
-        lastDs = urlDs;
-        app.setDataset(urlDs);
-        void loadStarters(urlDs);
-      } else if (urlDs && urlDs !== app.current && !app.datasetsLoaded) {
-        app.setDataset(urlDs);
-        lastDs = urlDs;
-      }
       if (iri && (!focusId || nodes[focusId]?.iri !== iri)) void focusOn(iri, undefined, true);
     });
   });
