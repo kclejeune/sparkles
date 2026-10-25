@@ -1352,6 +1352,16 @@ against 5.3 µs and `distinct-obj` 14.5% higher at 4.2 µs against 3.6 µs. Ever
 queries. Client time stayed within 1.2%, at about 0.30 ms. Item 306 tracks isolating and
 removing the server-time cost.
 
+A diagnostic A,B,B,A comparison of the same builds counted about 11% fewer user-space
+instructions for each complete HTTP request in the later build. It used 20,000 requests
+per query and server process over persistent connections, with the server on CPU 2, the
+client on CPU 4 and one Rayon thread on forge. The answers and operators agreed. These
+counters include parsing, planning and serialization, so their reduction does not
+establish that execution itself does less work. The index-count routine has the same
+instruction sequence in both binaries after addresses are normalized. Checks of the
+intermediate builds did not isolate a single responsible change. Item 306 remains open
+for a measurement confined to execution and its plan bookkeeping.
+
 ### The cost of the query memory pool
 
 The query memory pool of [X08](specs/X08-disk-spill-and-server-memory.md#gates) is on by
@@ -2240,6 +2250,14 @@ on the reference build and from 0.274 to 1.604 ms on the build with inferred vie
 ratio of group medians changed from 3.40 to 0.30 and 0.18 across the three groups, so the
 run does not isolate a cost of the inference change. Item 265 tracks profiling this
 latency variation and obtaining a stable comparison.
+
+Syscall tracing of four more processes in A,B,B,A order, after SSD trimming on forge,
+located the large variation inside writes to the WAL and delta vocabulary. Blocks of
+3,000 aligned writes had median syscall times between about 0.24 and 1.55 ms. Both
+builds switched between faster and slower writes within a process. Tracing changes the
+timings, so these figures diagnose where the variation occurs rather than measure the
+inference change's cost. Item 265 requires a comparison with matched durable-write
+latency before attributing a difference to the engine.
 
 ## Bindings
 

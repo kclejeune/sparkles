@@ -867,5 +867,9 @@ median per-run ratios from 0.93 to 1.07. Unrelated commits skipped the view in a
 0.053 ms in the published medians. The materialized class-count view skipped 166 of its
 200 measured commits. A matched persistent commit-path comparison remained inconclusive
 after SSD trimming, with unsubscribed round medians varying from about 0.27 to 1.61 ms
-within a build and the comparison reversing across interleaved groups. Item 265 now
-tracks profiling that variation and obtaining a stable comparison.
+within a build and the comparison reversing across interleaved groups. Four later
+processes under syscall tracing located large variation inside aligned WAL and delta
+vocabulary writes in both builds. Their blocks of 3,000 writes had median syscall times
+from about 0.24 to 1.55 ms. Tracing affects absolute latency, so this locates the variation
+without measuring a cost of the inference change. Item 265 tracks obtaining a comparison
+with matched durable-write latency.
