@@ -15164,5 +15164,25 @@
    ],
    "servers_stopped": true
   }
+ },
+ "query": {
+  "path": "scripts/bench-billion/queries/births-by-decade.rq",
+  "sha256": "5bb3573d778339e7412587bbf7196877edaa53a7ac34f0643dbce85946e42f9e",
+  "text": "PREFIX dbo: <http://dbpedia.org/ontology/>\nPREFIX dbr: <http://dbpedia.org/resource/>\nPREFIX dct: <http://purl.org/dc/terms/>\nPREFIX foaf: <http://xmlns.com/foaf/0.1/>\nPREFIX geo: <http://www.w3.org/2003/01/geo/wgs84_pos#>\nPREFIX owl: <http://www.w3.org/2002/07/owl#>\nPREFIX rdf: <http://www.w3.org/1999/02/22-rdf-syntax-ns#>\nPREFIX rdfs: <http://www.w3.org/2000/01/rdf-schema#>\nPREFIX skos: <http://www.w3.org/2004/02/skos/core#>\nPREFIX xsd: <http://www.w3.org/2001/XMLSchema#>\nSELECT ?decade (COUNT(?p) AS ?n) WHERE { ?p a dbo:Person ; dbo:birthDate ?d BIND(FLOOR(YEAR(?d) / 10) * 10 AS ?decade) } GROUP BY ?decade ORDER BY ?decade\n"
+ },
+ "datasets": {
+  "slice": {
+   "distinct_quads": 41127700,
+   "terms": 16058349,
+   "source_statements": 50143058,
+   "verified_subject_slice_files": 38,
+   "format_version": 3
+  },
+  "full": {
+   "distinct_quads": 1014683275,
+   "terms": 205941262,
+   "format_version": 2,
+   "source": "Read-only clone of retained full generation0002; immutable files shared, mutable state copied independently. No full-source oracle is asserted."
+  }
  }
 }
