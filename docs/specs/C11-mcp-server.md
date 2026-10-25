@@ -14,7 +14,7 @@
 >
 > **User docs:** [API: MCP server](../API.md#mcp-server) ·
 > [Usage: MCP server](../USAGE.md#mcp-server-llm-agents) ·
-> [Features](../FEATURES.md#ai-and-agents)
+> [Features](../ai/README.md#ai-and-agents)
 >
 > This is the design as written before implementation. The [Outcome](#outcome) section at
 > the end records how it landed.

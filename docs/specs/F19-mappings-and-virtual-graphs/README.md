@@ -14,7 +14,7 @@ Materialized mappings over the implemented CSV, TSV, JSON, local Parquet and SQL
 
 [Mappings](../../API.md#stored-mappings),
 [usage](../../USAGE.md#mappings-r2rml-rml-and-yarrrml) and
-[features](../../FEATURES.md#storage-and-indexes).
+[features](../../storage/README.md#storage-and-indexes).
 
 The [roadmap](../../ROADMAP.md#completion-paths-for-partially-complete-specs)
 tracks remaining work. The delivery record preserves the detailed phase history.

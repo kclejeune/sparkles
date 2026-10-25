@@ -9,7 +9,7 @@
 > planned in Phase 3.
 >
 > **User docs:** [Query-time reasoning](../API.md#query-time-reasoning) and
-> [features](../FEATURES.md#reasoning-validation-and-schema).
+> [features](../reasoning/README.md#reasoning-validation-and-schema).
 >
 > This is the design as written before implementation. The [Outcome](#outcome) records
 > what shipped and the remaining work.

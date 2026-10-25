@@ -13,7 +13,7 @@
 > pattern from a class in the Explore overview. It is not built.
 >
 > **User docs:** [Usage: The Pattern pane](../USAGE.md#the-pattern-pane) ·
-> [Features](../FEATURES.md#web-ui)
+> [Features](../visualization/README.md#web-ui)
 >
 > This is the design as written before implementation, with the answers to open
 > questions 1 and 2 of §10. The [Outcome](#outcome) section at the end records how

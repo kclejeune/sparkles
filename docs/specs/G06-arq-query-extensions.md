@@ -12,7 +12,7 @@
 > [API: extension functions](../API.md#extension-functions-and-aggregates) ·
 > [API: property functions](../API.md#arqs-property-functions) ·
 > [API: DESCRIBE](../API.md#describe) ·
-> [Features](../FEATURES.md#sparql-queries-and-updates) ·
+> [Features](../querying/README.md#sparql-queries-and-updates) ·
 > [Comparison with Jena](../COMPARISON.md#vs-apache-jena--fuseki)
 >
 > This is the design as written before implementation. The [Outcome](#outcome) section at

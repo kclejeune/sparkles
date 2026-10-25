@@ -11,7 +11,7 @@
 >
 > **User docs:** [API: Graph overview](../API.md#graph-overview) ·
 > [Usage: The Explore overview](../USAGE.md#the-explore-overview) ·
-> [Features](../FEATURES.md#web-ui)
+> [Features](../visualization/README.md#web-ui)
 >
 > This is the design as written before implementation, with the amendment of §2.3 and the
 > answers of §11. The [Outcome](#outcome) section at the end records how it landed.

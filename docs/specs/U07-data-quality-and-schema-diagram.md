@@ -7,7 +7,7 @@
 > backfill, introducing-commit search and schema diagram remain planned.
 >
 > **User docs:** [Validation overlay](../USAGE.md#the-validation-overlay) and
-> [features](../FEATURES.md#web-ui).
+> [features](../visualization/README.md#web-ui).
 >
 > This is the design as written before implementation. The [Outcome](#outcome) records
 > what shipped and the remaining work.

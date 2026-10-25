@@ -7,7 +7,7 @@
 > diagnostics and quick fixes in `sparkles lsp`, `POST /$/lint`, the browser module's
 > `lint`, and linting in the query editor.
 >
-> **User docs:** [API: Linting](../API.md#linting) · [Usage](../USAGE.md#linting) · [Editor integration](../editors.md) · [Features](../FEATURES.md#formatter-and-editor-support)
+> **User docs:** [API: Linting](../API.md#linting) · [Usage](../USAGE.md#linting) · [Editor integration](../editors.md) · [Features](../querying/README.md#formatter-and-editor-support)
 >
 > This is the design; the [Outcome](#outcome) section at the end records how it landed.
 

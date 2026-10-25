@@ -10,7 +10,7 @@
 > [Outcome](#outcome) lists what it added.
 >
 > **User docs:** [Usage: Python](../USAGE.md#python) ·
-> [Features](../FEATURES.md#libraries-and-bindings) ·
+> [Features](../integrations/README.md#libraries-and-bindings) ·
 > [Known gaps](../FEATURES.md#known-gaps) · [Comparison](../COMPARISON.md#vs-oxigraph) ·
 > [Development](../DEVELOPMENT.md#python-bindings)
 >

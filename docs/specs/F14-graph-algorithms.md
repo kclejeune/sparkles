@@ -9,7 +9,7 @@
 > wait for [F01](F01-cypher.md).
 >
 > **User docs:** [Graph algorithms API](../API.md#graph-algorithms),
-> [usage](../USAGE.md#graph-algorithms) and [features](../FEATURES.md#search).
+> [usage](../USAGE.md#graph-algorithms) and [features](../search/README.md#search).
 >
 > This is the design as written before implementation. The [Outcome](#outcome) records
 > what shipped and the remaining work.

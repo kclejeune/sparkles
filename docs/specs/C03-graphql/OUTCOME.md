@@ -15,7 +15,7 @@ The recorded dates and measurements below describe their original delivery stage
 > for them.
 >
 > **User docs:** [API: GraphQL](../../API.md#graphql) · [Usage: GraphQL](../../USAGE.md#graphql) ·
-> [Features](../../FEATURES.md#server-and-protocols)
+> [Features](../../server/README.md#server-and-protocols)
 >
 > This is the design as written before implementation. The [Outcome](SPEC.md#outcome) section at
 > the end records how it landed.

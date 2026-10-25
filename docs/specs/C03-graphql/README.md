@@ -13,7 +13,7 @@ The read-only GraphQL adapter, schema configuration and schema drafts are availa
 ## User guides
 
 [API: GraphQL](../../API.md#graphql) · [Usage: GraphQL](../../USAGE.md#graphql) ·
-[Features](../../FEATURES.md#server-and-protocols)
+[Features](../../server/README.md#server-and-protocols)
 
 The [roadmap](../../ROADMAP.md#completion-paths-for-partially-complete-specs)
 tracks remaining work. The delivery record preserves the detailed phase history.

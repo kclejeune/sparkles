@@ -14,7 +14,7 @@ ShExC, ShExJ and ShExR validation, persisted typing and incremental write guards
 
 [API: ShEx validation](../../API.md#shex-validation) ·
 [API: Write-time validation](../../API.md#write-time-validation) ·
-[API: MCP server](../../API.md#mcp-server) · [Features](../../FEATURES.md#reasoning-validation-and-schema)
+[API: MCP server](../../API.md#mcp-server) · [Features](../../reasoning/README.md#reasoning-validation-and-schema)
 
 The [roadmap](../../ROADMAP.md#completion-paths-for-partially-complete-specs)
 tracks remaining work. The delivery record preserves the detailed phase history.

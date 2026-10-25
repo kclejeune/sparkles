@@ -13,7 +13,7 @@
 > kept across compactions and faster builds shipped as roadmap item 10. Quantization is
 > not built.
 >
-> **User docs:** [API: Vector similarity](../API.md#vector-similarity) · [API: Vector indexes](../API.md#vector-indexes) · [Features](../FEATURES.md#search)
+> **User docs:** [API: Vector similarity](../API.md#vector-similarity) · [API: Vector indexes](../API.md#vector-indexes) · [Features](../search/README.md#search)
 >
 > This is the design as written before implementation. The [Outcome](#outcome) section at
 > the end records how it landed.

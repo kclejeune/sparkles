@@ -12,7 +12,7 @@ Full-text queries, committed index maintenance, ranked search and the implemente
 
 ## User guides
 
-[API: Full-text search](../../API.md#full-text-search) · [Features](../../FEATURES.md#search) · [Benchmarks: Full-text index and observability](../../BENCHMARKS.md#full-text-index-and-observability-105m-triples)
+[API: Full-text search](../../API.md#full-text-search) · [Features](../../search/README.md#search) · [Benchmarks: Full-text index and observability](../../BENCHMARKS.md#full-text-index-and-observability-105m-triples)
 
 The [roadmap](../../ROADMAP.md#completion-paths-for-partially-complete-specs)
 tracks remaining work. The delivery record preserves the detailed phase history.

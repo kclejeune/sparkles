@@ -57,10 +57,15 @@ work, and each item links to its design spec in [docs/specs](docs/specs/README.m
   `PROVENANCE.md` for substantial records, and keep the
   [provenance index](docs/specs/PROVENANCE.md) current. Preserve historical source and
   license records without treating old delivery statements as current feature status.
+- Current capability details and limitations belong in the feature-category guides
+  linked from [FEATURES.md](docs/FEATURES.md). Keep configuration, usage and roadmap
+  sections discoverable there. FEATURES owns the capability matrix, and ROADMAP owns
+  item priorities and dependencies. Preserve existing links when moving content.
 - When a roadmap item or spec phase ships, update its spec's Outcome section,
   [docs/FEATURES.md](docs/FEATURES.md), [docs/BENCHMARKS.md](docs/BENCHMARKS.md) when there
   are numbers, and the item's row in [docs/ROADMAP.md](docs/ROADMAP.md), all in the same
-  change. A new known gap in FEATURES gets a roadmap item in the same commit.
+  change. Update the affected feature guide too. A new known gap in feature documentation
+  gets a roadmap item in the same commit.
 - Write documentation as plain technical prose in full sentences. Avoid fragment openers,
   label-colon openers, chains of colons, parentheses or semicolons, "(yet)", marketing words
   and filler. Keep table cells to one to three short sentences.

@@ -20,7 +20,7 @@ The recorded dates and measurements below describe their original delivery stage
 >
 > **User docs:** [API: Backup repositories](../../API.md#backup-repositories) ·
 > [Usage: Backup repositories](../../USAGE.md#backup-repositories) ·
-> [Features](../../FEATURES.md#operations) ·
+> [Features](../../operations/README.md#operations) ·
 > [Benchmarks: Backup repositories](../../BENCHMARKS.md#backup-repositories-105m-triples)
 >
 > This is the design as written before implementation. The [Outcome](SPEC.md#outcome) section at

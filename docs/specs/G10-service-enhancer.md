@@ -8,7 +8,7 @@
 >
 > **User docs:** [API: SERVICE options](../API.md#service-options-loop-bulk-and-cache) ·
 > [Usage: correlated, bulk and cached SERVICE](../USAGE.md#correlated-bulk-and-cached-service) ·
-> [Features](../FEATURES.md#sparql-queries-and-updates) ·
+> [Features](../querying/README.md#sparql-queries-and-updates) ·
 > [Comparison with Jena](../COMPARISON.md#vs-apache-jena--fuseki)
 >
 > This is the design as written before implementation. The [Outcome](#outcome) section at

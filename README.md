@@ -38,7 +38,7 @@ on top of the second:
    diffed and branched.
 3. **Library first.** The engine is a library with no HTTP server. The server, the CLI
    and the Python, JVM and Node.js bindings use its public API and query semantics.
-   The [feature list](docs/FEATURES.md#libraries-and-bindings) identifies the administration
+   The [feature list](docs/integrations/README.md#libraries-and-bindings) identifies the administration
    and integration surfaces each binding exposes. The term model, parsers and SPARQL
    algebra come from the Oxigraph project's crates.
 
@@ -46,37 +46,37 @@ on top of the second:
 
 * **Query performance.** Sparkles is the fastest engine on most of the published
   comparisons. See [Performance](#performance) and
-  [SPARQL](docs/FEATURES.md#sparql-queries-and-updates).
+  [SPARQL](docs/querying/README.md#sparql-queries-and-updates).
 * **Standards conformance.** Sparkles passes the W3C suites for SPARQL 1.0, 1.1 Query,
   1.1 Update and 1.2, SHACL Core and SHACL-SPARQL, and supports RDF 1.2, Jena's ARQ
-  extensions and GeoSPARQL 1.1. See [Standards conformance](docs/FEATURES.md#standards-conformance) and
-  [GeoSPARQL](docs/FEATURES.md#geosparql).
+  extensions and GeoSPARQL 1.1. See [Standards conformance](docs/querying/README.md#standards-conformance) and
+  [GeoSPARQL](docs/search/README.md#geosparql).
 * **Fuseki compatibility.** The server speaks the SPARQL 1.1 Protocol, the Graph Store
   Protocol and Fuseki's `/$/` admin API, and converts Fuseki configurations. See
-  [Server and protocols](docs/FEATURES.md#server-and-protocols).
+  [Server and protocols](docs/server/README.md#server-and-protocols).
 * **Branches and time travel.** Queries can read any commit that compaction has retained,
   two retained commits can be diffed, and a branch can start from one and merge back with
   conflict review. Full-text search reads only the head. See
-  [Versioning and history](docs/FEATURES.md#versioning-and-history).
+  [Versioning and history](docs/storage/README.md#versioning-and-history).
 * **Vector and full-text search.** BM25 full-text search compatible with jena-text, HNSW
   vector indexes with embeddings computed on write, hybrid ranking, path search and graph
-  algorithms all run inside SPARQL. See [Search](docs/FEATURES.md#search).
+  algorithms all run inside SPARQL. See [Search](docs/search/README.md#search).
 * **Reasoning and validation.** RDFS, OWL 2 RL and Jena rules can be materialized
   incrementally or derived at query time, and SHACL and ShEx can validate every commit.
-  See [Reasoning, validation and schema](docs/FEATURES.md#reasoning-validation-and-schema).
+  See [Reasoning, validation and schema](docs/reasoning/README.md#reasoning-validation-and-schema).
 * **GraphRAG and agent memory.** An MCP server gives agents grant-checked tools, questions
   are answered with checked queries and cited summaries, and agent memory records each
   fact with its source for review on a branch. GraphRAG builds write reports for Leiden
-  communities. See [AI and agents](docs/FEATURES.md#ai-and-agents).
+  communities. See [AI and agents](docs/ai/README.md#ai-and-agents).
 * **Web UI.** The embedded UI has a query editor with table, graph and map views, a
   resource explorer, a visual query builder, forms generated from SHACL shapes, and views
   of history, branches and agent memory. See [Web UI](#web-ui) and
-  [the feature list](docs/FEATURES.md#web-ui).
+  [the feature list](docs/visualization/README.md#web-ui).
 * **Bindings.** The Rust, Python, JVM and Node.js libraries embed the engine in process,
   and the JVM binding implements Jena's `DatasetGraph`. See
-  [Libraries and bindings](docs/FEATURES.md#libraries-and-bindings).
+  [Libraries and bindings](docs/integrations/README.md#libraries-and-bindings).
 * **Access control.** Grants apply per dataset, named graph and endpoint, with rate
-  limits and query budgets. See [Access control](docs/FEATURES.md#access-control-and-security).
+  limits and query budgets. See [Access control](docs/server/README.md#access-control-and-security).
 
 [docs/FEATURES.md](docs/FEATURES.md) lists every feature and the
 [known gaps](docs/FEATURES.md#known-gaps), including compatibility differences from Jena.

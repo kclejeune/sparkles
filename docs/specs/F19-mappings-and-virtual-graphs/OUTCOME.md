@@ -15,7 +15,7 @@ The recorded dates and measurements below describe their original delivery stage
 >
 > **User docs:** [Mappings](../../API.md#stored-mappings),
 > [usage](../../USAGE.md#mappings-r2rml-rml-and-yarrrml) and
-> [features](../../FEATURES.md#storage-and-indexes).
+> [features](../../storage/README.md#storage-and-indexes).
 >
 > This is the design as written before implementation. The [Outcome](SPEC.md#outcome) records
 > what shipped and the remaining work.

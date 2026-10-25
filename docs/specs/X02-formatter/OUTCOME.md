@@ -15,7 +15,7 @@ The recorded dates and measurements below describe their original delivery stage
 > WebAssembly build that the UI uses, streaming Turtle/TriG and the cargo-fuzz targets
 > (`mise run fmt:fuzz`).
 >
-> **User docs:** [API: Formatting](../../API.md#formatting) · [Editor integration](../../editors.md) · [Features](../../FEATURES.md#formatter-and-editor-support)
+> **User docs:** [API: Formatting](../../API.md#formatting) · [Editor integration](../../editors.md) · [Features](../../querying/README.md#formatter-and-editor-support)
 >
 > This is the design as written before implementation; the [Outcome](SPEC.md#outcome) section at the end
 > records how it landed.

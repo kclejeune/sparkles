@@ -12,7 +12,7 @@
 > [U08](U08-visual-query-builder.md) and marks misestimates.
 >
 > **User docs:** [Usage: The plan on the pattern](../USAGE.md#the-plan-on-the-pattern) ·
-> [API: Explain](../API.md#explain) · [Features](../FEATURES.md#web-ui)
+> [API: Explain](../API.md#explain) · [Features](../visualization/README.md#web-ui)
 >
 > This is the design as written before implementation. The [Outcome](#outcome) section at
 > the end records how Phase 4 landed.

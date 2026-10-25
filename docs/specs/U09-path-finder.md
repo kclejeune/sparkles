@@ -10,7 +10,7 @@
 > the query page's graph results, in the canvas and in the WebGL view.
 >
 > **User docs:** [API: Path search](../API.md#path-search) ·
-> [Usage: Finding paths](../USAGE.md#finding-paths) · [Features](../FEATURES.md#web-ui)
+> [Usage: Finding paths](../USAGE.md#finding-paths) · [Features](../visualization/README.md#web-ui)
 >
 > This is the design as written before implementation. The [Outcome](#outcome) section at
 > the end records how it landed.

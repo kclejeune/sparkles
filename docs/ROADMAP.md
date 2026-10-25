@@ -7,8 +7,8 @@ competitive results can be accepted with their measurements and tradeoffs record
 Packaging and the release contract follow the selected feature and reliability gates
 and must be ready before the first release is cut.
 
-[FEATURES.md](FEATURES.md#known-gaps) describes what Sparkles does and does not do today,
-and every known gap there names the roadmap item that addresses it.
+The [feature index](FEATURES.md) and its category guides describe what Sparkles does
+and does not do today. Every known gap names the roadmap item that addresses it.
 [BENCHMARKS.md](BENCHMARKS.md#where-sparkles-loses) records the measured results and the
 workloads where Sparkles loses. This document holds only the work that remains.
 
@@ -472,8 +472,9 @@ linked spec Outcome records how they landed.
 ## Keeping this current
 
 Update this document when an item ships, changes tier or gets a new spec. A new known gap
-in FEATURES gets a roadmap item in the same commit. When an item ships, its spec's Outcome
-records what landed, [FEATURES.md](FEATURES.md) and [BENCHMARKS.md](BENCHMARKS.md) change
+in a feature guide gets a roadmap item in the same commit. When an item ships, its spec's
+Outcome records what landed, [FEATURES.md](FEATURES.md), the affected guide and
+[BENCHMARKS.md](BENCHMARKS.md) change
 in the same commit, and the Known gaps bullet drops the item's number. The item's row then
 moves to a one-line entry under [Completed](#completed). When part of an item ships, its
 row is cut down to the part that remains.

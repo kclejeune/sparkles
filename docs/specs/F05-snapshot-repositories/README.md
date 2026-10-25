@@ -14,7 +14,7 @@ Per-dataset repository backups, restore, verification and policies are available
 
 [API: Backup repositories](../../API.md#backup-repositories) ·
 [Usage: Backup repositories](../../USAGE.md#backup-repositories) ·
-[Features](../../FEATURES.md#operations) ·
+[Features](../../operations/README.md#operations) ·
 [Benchmarks: Backup repositories](../../BENCHMARKS.md#backup-repositories-105m-triples)
 
 The [roadmap](../../ROADMAP.md#completion-paths-for-partially-complete-specs)

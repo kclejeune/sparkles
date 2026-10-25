@@ -18,7 +18,7 @@ This index lists the Sparkles documentation by what a reader wants to do. The re
 
 | Document | What it covers |
 |---|---|
-| [Features](FEATURES.md) | Every capability, area by area, and the [known gaps](FEATURES.md#known-gaps). |
+| [Features](FEATURES.md) | The capability matrix and category guides with current scope, configuration, usage, limitations and roadmap links. |
 | [Architecture](ARCHITECTURE.md) | The library boundaries, storage, execution and the main design decisions. |
 | [Comparison](COMPARISON.md) | The gaps and tradeoffs against Jena, QLever, Fluree and Oxigraph, and where Sparkles departs from Jena on purpose. |
 | [Benchmarks](BENCHMARKS.md) | The published performance results, their setup and every case where Sparkles loses. |
@@ -45,8 +45,9 @@ This index lists the Sparkles documentation by what a reader wants to do. The re
 
 * Workflows and examples belong in Usage, exact HTTP contracts in API, and system
   structure in Architecture. Link between them when a reader needs the other view.
-* Features holds current capabilities and limitations. Comparison explains what they mean
-  for compatibility or migration and links to the details.
+* FEATURES holds the capability matrix. Its category guides own current capability
+  details and limitations, with configuration, usage and roadmap links. Comparison
+  explains what those limits mean for compatibility or migration.
 * Benchmarks holds published timings and their setup. Local optimization measurements stay
   with their rationale and say that they are local.
 * A spec keeps its original design. Its status and Outcome change with the behavior, and

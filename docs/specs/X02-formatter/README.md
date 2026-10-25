@@ -12,7 +12,7 @@ The formatter, language server and browser WebAssembly build are available for t
 
 ## User guides
 
-[API: Formatting](../../API.md#formatting) · [Editor integration](../../editors.md) · [Features](../../FEATURES.md#formatter-and-editor-support)
+[API: Formatting](../../API.md#formatting) · [Editor integration](../../editors.md) · [Features](../../querying/README.md#formatter-and-editor-support)
 
 The [roadmap](../../ROADMAP.md#completion-paths-for-partially-complete-specs)
 tracks remaining work. The delivery record preserves the detailed phase history.
