@@ -14,6 +14,9 @@ SCRIPT = pathlib.Path(__file__).resolve().parents[1] / "bench-sp2b/qualify.py"
 SPEC = importlib.util.spec_from_file_location("sp2b_qualify", SCRIPT)
 qualifier = importlib.util.module_from_spec(SPEC)
 SPEC.loader.exec_module(qualifier)
+RECORD_SPEC = importlib.util.spec_from_file_location("sp2b_recorder", SCRIPT.parent.parent / "bench-record.py")
+recorder = importlib.util.module_from_spec(RECORD_SPEC)
+RECORD_SPEC.loader.exec_module(recorder)
 
 
 class QualificationTests(unittest.TestCase):
@@ -74,6 +77,20 @@ class QualificationTests(unittest.TestCase):
                 self.write(directory, bindings, role, documents[role])
                 with self.assertRaisesRegex(ValueError, "timing summary"):
                     qualifier.qualify(directory, bindings)
+
+    def test_recorder_rounding_boundary_is_accepted(self):
+        with tempfile.TemporaryDirectory() as directory:
+            bindings, documents = self.fixture(directory)
+            times = [.1, .200001]
+            documents["q4_timing"]["results"][0]["times"] = times
+            answer = documents["raw_record"]["results"][0]["answer"]
+            row = recorder.result("sparkles", "q4", "warm", times, [0, 0], answer)
+            self.assertEqual(row["median_ms"], 150.0)
+            documents["raw_record"]["results"] = [row]
+            for role in ("raw_record", "q4_timing"):
+                self.write(directory, bindings, role, documents[role])
+            derived, _ = qualifier.qualify(directory, bindings)
+            self.assertEqual(derived["results"][0]["median_ms"], row["median_ms"])
 
     def test_unknown_and_missing_record_versions_are_rejected(self):
         for version in (None, 99):

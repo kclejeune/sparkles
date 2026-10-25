@@ -37,7 +37,6 @@ def timing_summaries(row, timing):
     times = timing["times"]
     require(times and all(isinstance(value, (int, float)) and not isinstance(value, bool)
                          and math.isfinite(value) and value > 0 for value in times), "invalid raw timing samples")
-    ordered = sorted(times)
     stats = {"mean": statistics.mean(times), "median": statistics.median(times),
              "stddev": statistics.stdev(times) if len(times) > 1 else 0.0,
              "min": min(times), "max": max(times)}
@@ -47,8 +46,13 @@ def timing_summaries(row, timing):
         actual = timing[key]
         require(isinstance(actual, (int, float)) and not isinstance(actual, bool) and math.isfinite(actual)
                 and math.isclose(actual, expected, rel_tol=1e-9, abs_tol=1e-9), f"stale raw timing summary: {key}")
-    expected_ms = {"median_ms": round(stats["median"] * 1000, 3),
-                   "p95_ms": round(ordered[max(0, math.ceil(.95 * len(times)) - 1)] * 1000, 3)}
+    milliseconds = [seconds * 1000 for seconds in times]
+    ordered_ms = sorted(milliseconds)
+    stats_ms = {"mean": statistics.mean(milliseconds), "median": statistics.median(milliseconds),
+                "stddev": statistics.stdev(milliseconds) if len(milliseconds) > 1 else 0.0,
+                "min": min(milliseconds), "max": max(milliseconds)}
+    expected_ms = {"median_ms": round(stats_ms["median"], 3),
+                   "p95_ms": round(ordered_ms[max(0, math.ceil(.95 * len(times)) - 1)], 3)}
     for key, expected in expected_ms.items():
         actual = row.get(key)
         require(isinstance(actual, (int, float)) and not isinstance(actual, bool) and math.isfinite(actual)
@@ -58,7 +62,7 @@ def timing_summaries(row, timing):
         if field in row:
             actual = row[field]
             require(isinstance(actual, (int, float)) and not isinstance(actual, bool) and math.isfinite(actual)
-                    and math.isclose(actual, stats[key] * 1000, rel_tol=1e-9, abs_tol=.00051),
+                    and math.isclose(actual, stats_ms[key], rel_tol=1e-9, abs_tol=.00051),
                     f"stale timing summary: {field}")
 
 
