@@ -300,6 +300,11 @@ Each of these can be switched off per query (`QueryOptions::optimizations`) or p
   collecting a whole input before their first output. The alternating join can hold
   prefixes of both inputs, which uses more memory than one hash-build input. It charges
   that storage before allocation and drops obsolete history once an input ends.
+* An eager ASK over a bounded pure UNION visits the branch with the lowest estimated
+  cost first. Projections over the same pure UNION pass the limited row demand
+  directly instead of requesting at least 64 rows. SELECT keeps its operand order.
+  Expression calls, EXISTS, SERVICE and operators outside the whitelist retain their
+  ordinary order and demand policy. Explicit streaming uses its existing operators.
 * A pattern with one free variable and at most four estimated rows is eligible for
   `point_patterns`. The planner reads at most two rows and substitutes a constant only
   when exactly one row exists in the query snapshot. It restores the variable in the

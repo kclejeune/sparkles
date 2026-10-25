@@ -393,6 +393,10 @@ check them against the W3C suites and Jena's own answers.
   that each branch uses its bindings to choose a join order. It keeps duplicates and
   FILTER scope, and it keeps the ordinary plan when that plan is estimated to be cheaper.
   This avoids enumerating unrelated coauthor walks in SP²Bench `q8` and `q12b`.
+* Eager ASK execution visits a cheaper pure UNION branch first. Projections above
+  those branches request only the rows the limit needs, so one answer can stop the
+  query. Branches with expression calls, EXISTS or external effects keep their order
+  and demand policy. Explicit streaming keeps its existing execution policy.
 * An OPTIONAL whose sides share no variable, but whose condition contains `?a = ?b` with
   one variable from each side, pairs its rows through that equality instead of forming
   their product ([internals](internals/OPTIMIZATIONS.md)). SP²Bench `q6` at 10M tests 7.4

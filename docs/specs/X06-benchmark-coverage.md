@@ -1285,6 +1285,23 @@ their pooled fingerprint is the published Sparkles answer fingerprint.
 roadmap item 91. LUBM `q2` probe fanout and serial durable commit overhead remain open
 under item 290. The write work retains synchronization before acknowledgement.
 
+### Limited pure UNION demand
+
+Eager ASK execution can visit a cheaper pure UNION operand first. A bounded physical
+plan and expression whitelist excludes callbacks, expression calls, EXISTS, SERVICE
+and unknown operators. Projections above the same pure UNION preserve the limit's
+actual demand. Otherwise their minimum request of 64 rows could make a one-row cheap
+branch continue into an unnecessary wide operand. SELECT retains its operand order,
+and explicit streaming retains its execution and budget paths.
+
+The asymmetric regression reads 64 wide rows before the change and skips that scan
+after the cheap branch answers. A cheap false branch followed by a plain scan reads
+only the one requested row. A retained filtered branch still refuses its physical
+64-row input when the row budget is one. Further tests cover false and empty unions,
+duplicate and unbound VALUES, graph scopes, constant bindings, cancellation, deadlines,
+memory and produced-row budgets. A volatile callback branch keeps its original 64
+calls, and explicit streaming still visits the original first operand.
+
 ### Short-query checks after keyed inner groups
 
 The Namespace guard against `a5847311` used matching compiler signatures and returned

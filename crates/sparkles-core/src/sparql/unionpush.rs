@@ -10,6 +10,113 @@ use spargebra::term::{TermPattern, TriplePattern, Variable};
 const MAX_TRIPLES: usize = 8;
 const MAX_BRANCHES: usize = 8;
 const MAX_SCREEN_NODES: usize = MAX_TRIPLES * MAX_BRANCHES * 4;
+
+/// A bounded UNION whose branch order and excess demand have no external effects.
+fn pure_union(ctx: &super::ctx::Ctx, node: &Node) -> bool {
+    use super::expr::Expr;
+
+    fn expression(expr: &Expr, remaining: &mut usize) -> bool {
+        if *remaining == 0 {
+            return false;
+        }
+        *remaining -= 1;
+        match expr {
+            Expr::Const(_) | Expr::Lit(..) | Expr::Var(_) | Expr::Bound(_) => true,
+            Expr::Eq(a, b) | Expr::SameTerm(a, b) | Expr::And(a, b) | Expr::Or(a, b) => {
+                expression(a, remaining) && expression(b, remaining)
+            }
+            Expr::Not(a) => expression(a, remaining),
+            _ => false,
+        }
+    }
+
+    fn plain(node: &Node, remaining: &mut usize, expressions: &mut usize) -> bool {
+        if *remaining == 0 {
+            return false;
+        }
+        *remaining -= 1;
+        let shape = match &node.kind {
+            Kind::Scan(_) | Kind::Values(_) | Kind::Empty => node.children.is_empty(),
+            Kind::Join { .. } => node.children.len() == 2,
+            Kind::Union => (2..=MAX_BRANCHES).contains(&node.children.len()),
+            Kind::Project(_) | Kind::Sort(_) => node.children.len() == 1,
+            Kind::Extend(_, expr) => node.children.len() == 1 && expr.const_id().is_some(),
+            Kind::Filter(exprs) => {
+                node.children.len() == 1 && exprs.iter().all(|e| expression(e, expressions))
+            }
+            Kind::IndexJoin(spec) => {
+                node.children.len() == 1
+                    && spec
+                        .probes
+                        .iter()
+                        .all(|p| p.filter.iter().all(|e| expression(e, expressions)))
+            }
+            _ => false,
+        };
+        shape
+            && node
+                .children
+                .iter()
+                .all(|c| plain(c, remaining, expressions))
+    }
+
+    !ctx.calls_extensions
+        && matches!(node.kind, Kind::Union)
+        && (2..=MAX_BRANCHES).contains(&node.children.len())
+        && node
+            .children
+            .iter()
+            .all(|c| c.cost.is_finite() && c.cost >= 0.0)
+        && plain(node, &mut 128, &mut 256)
+}
+
+/// A pure projected UNION can honor the limit directly. Asking it for at least
+/// 64 rows could visit another branch even after one branch answered the ASK.
+pub(super) fn limited_projection(ctx: &super::ctx::Ctx, node: &Node) -> bool {
+    if ctx.is_cursor() || !matches!(node.kind, Kind::Project(_)) {
+        return false;
+    }
+    let mut union = node;
+    for _ in 0..8 {
+        if !matches!(union.kind, Kind::Project(_)) || union.children.len() != 1 {
+            break;
+        }
+        union = &union.children[0];
+    }
+    pure_union(ctx, union)
+}
+
+/// An eager ASK needs one solution, so visit a cheaper pure UNION operand first.
+/// Cursor execution and SELECT retain their existing order.
+pub(super) fn order_ask(ctx: &super::ctx::Ctx, node: &mut Node) {
+    if !matches!(
+        node.kind,
+        Kind::Slice {
+            offset: 0,
+            limit: Some(1)
+        }
+    ) || node.children.len() != 1
+    {
+        return;
+    }
+    let mut union = &mut node.children[0];
+    for _ in 0..8 {
+        if !matches!(union.kind, Kind::Project(_)) || union.children.len() != 1 {
+            break;
+        }
+        union = &mut union.children[0];
+    }
+    if !pure_union(ctx, union) {
+        return;
+    }
+    let mut cheapest = 0;
+    for i in 1..union.children.len() {
+        if union.children[i].cost < union.children[cheapest].cost {
+            cheapest = i;
+        }
+    }
+    union.children.swap(0, cheapest);
+}
 /// Do not duplicate broad anchor reads merely because they have a constant object.
 pub(super) const MAX_ANCHOR_ROWS: f64 = 32.0;
 
@@ -280,6 +387,328 @@ fn safe_expression(expr: &Expression, moved: &[Variable], bound: &[Variable]) ->
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn ask_visits_a_cheap_pure_union_branch_before_reading_the_wide_one() {
+        use crate::io::Source;
+        use crate::sparql::{PlanInfo, QueryOptions, query};
+        use crate::store::{Store, StoreOptions};
+
+        let store = Store::in_memory(StoreOptions::default());
+        let mut data = String::from("<urn:yes> <urn:cheap> 1 .\n");
+        for i in 0..128 {
+            data.push_str(&format!("<urn:s{i}> <urn:wide> {i} .\n"));
+        }
+        store
+            .load(&[Source::from_bytes(
+                data.into_bytes(),
+                oxrdfio::RdfFormat::Turtle,
+                None,
+            )])
+            .unwrap();
+        let r = query(
+            store.snapshot(),
+            "ASK { { ?s <urn:wide> ?v } UNION { <urn:yes> <urn:cheap> ?v } }",
+            &QueryOptions::default(),
+        )
+        .unwrap();
+        assert!(r.boolean);
+        fn wide(p: &PlanInfo) -> Option<&PlanInfo> {
+            if p.description.contains("urn:wide") {
+                return Some(p);
+            }
+            p.children.iter().find_map(wide)
+        }
+        let wide = wide(&r.plan).expect("wide scan is retained in the physical plan");
+        assert_eq!(
+            wide.actual_rows, -1,
+            "the cheaper branch must answer ASK before any wide scan"
+        );
+        assert!(wide.fidelity().skipped.is_some());
+        let selected = query(
+            store.snapshot(),
+            "SELECT * WHERE { { ?s <urn:wide> ?v } UNION { <urn:yes> <urn:cheap> ?v } } LIMIT 1",
+            &QueryOptions::default(),
+        )
+        .unwrap();
+        assert!(
+            selected.rows()[0]
+                .iter()
+                .any(|v| v.as_ref().is_some_and(|v| v.to_string().contains("urn:s")))
+        );
+        let explicit = crate::sparql::ask_streaming(
+            store.snapshot(),
+            "ASK { { ?s <urn:wide> ?v } UNION { <urn:yes> <urn:cheap> ?v } }",
+            &QueryOptions::default(),
+            &crate::sparql::CursorOptions {
+                batch_rows: 1,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        let mut plans = vec![&explicit.plan];
+        let mut read_wide = false;
+        while let Some(p) = plans.pop() {
+            if p.description.contains("urn:wide") && p.actual_rows > 0 {
+                read_wide = true;
+            }
+            plans.extend(p.children.iter());
+        }
+        assert!(
+            read_wide,
+            "forced streaming retains its original operand order"
+        );
+    }
+
+    #[test]
+    fn ask_union_answers_and_explicit_streaming_keep_their_execution_contract() {
+        use crate::io::Source;
+        use crate::sparql::{
+            CursorOptions, ExecutionMode, QueryExecution, QueryOptions, query_execution,
+        };
+        use crate::store::{Store, StoreOptions};
+        let store = Store::in_memory(StoreOptions::default());
+        store
+            .load(&[Source::from_bytes(
+                b"<urn:s> <urn:p> 1, 2 . <urn:t> <urn:q> 3 . <urn:g> { <urn:s> <urn:p> 4 }"
+                    .to_vec(),
+                oxrdfio::RdfFormat::TriG,
+                None,
+            )])
+            .unwrap();
+        let cases = [
+            ("{ ?s <urn:p> ?v } UNION { <urn:t> <urn:q> ?v }", true),
+            (
+                "{ ?s <urn:p> ?v FILTER(?v = 99) } UNION { <urn:t> <urn:q> ?v }",
+                true,
+            ),
+            (
+                "{ ?s <urn:p> ?v FILTER(?v = 99) } UNION { <urn:t> <urn:q> ?v FILTER(?v = 99) }",
+                false,
+            ),
+            (
+                "{ VALUES ?v { UNDEF 1 1 } ?s <urn:p> ?v } UNION { <urn:t> <urn:q> ?v }",
+                true,
+            ),
+            (
+                "{ GRAPH ?g { ?s <urn:p> ?v } } UNION { GRAPH <urn:g> { ?s <urn:p> ?v } }",
+                true,
+            ),
+            (
+                "{ BIND(<urn:t> AS ?s) ?s <urn:q> ?v } UNION { ?s <urn:missing> ?v }",
+                true,
+            ),
+            (
+                "{ ?s <urn:missing> ?v } UNION { ?s <urn:absent> ?v }",
+                false,
+            ),
+        ];
+        for (body, expected) in cases {
+            let text = format!("ASK {{ {body} }}");
+            for mode in [
+                ExecutionMode::Eager,
+                ExecutionMode::Auto,
+                ExecutionMode::Streaming,
+            ] {
+                let result = query_execution(
+                    store.snapshot(),
+                    &text,
+                    &QueryOptions::default(),
+                    &CursorOptions {
+                        batch_rows: 1,
+                        ..Default::default()
+                    },
+                    mode,
+                )
+                .unwrap();
+                let result = match result {
+                    QueryExecution::Eager(result) => {
+                        assert_ne!(mode, ExecutionMode::Streaming);
+                        result
+                    }
+                    QueryExecution::Ask(result) => {
+                        assert_eq!(mode, ExecutionMode::Streaming);
+                        result
+                    }
+                    _ => panic!("ASK must produce a completed boolean"),
+                };
+                assert_eq!(result.result().boolean, expected, "{text}, {mode:?}");
+            }
+        }
+        let parsed = crate::sparql::parse_query(
+            "ASK { { ?s <urn:p> ?v } UNION { <urn:t> <urn:q> ?v } }",
+            None,
+            &[],
+        )
+        .unwrap();
+        let mut prepared =
+            super::super::prepare_query(store.snapshot(), &parsed, &Default::default(), None, None)
+                .unwrap();
+        assert!(limited_projection(
+            &prepared.ctx,
+            &prepared.node.children[0]
+        ));
+        std::sync::Arc::get_mut(&mut prepared.ctx)
+            .unwrap()
+            .enable_cursor_accounting()
+            .unwrap();
+        assert!(
+            !limited_projection(&prepared.ctx, &prepared.node.children[0]),
+            "a cursor fallback must retain its original eager prefix policy too"
+        );
+    }
+
+    #[test]
+    fn effectful_ask_branches_still_run_in_the_original_order() {
+        use crate::io::Source;
+        use crate::sparql::extensions::{
+            ExtensionRegistry, ScalarContext, ScalarDescriptor, ScalarResult, Volatility,
+        };
+        use crate::sparql::{QueryOptions, query};
+        use crate::store::{Store, StoreOptions};
+        use std::sync::{
+            Arc,
+            atomic::{AtomicUsize, Ordering},
+        };
+        let store = Store::in_memory(StoreOptions::default());
+        let mut data = String::from("<urn:t> <urn:cheap> 1 .\n");
+        for i in 0..128 {
+            data.push_str(&format!("<urn:s{i}> <urn:wide> {i} .\n"));
+        }
+        store
+            .load(&[Source::from_bytes(
+                data.into_bytes(),
+                oxrdfio::RdfFormat::Turtle,
+                None,
+            )])
+            .unwrap();
+        let count = Arc::new(AtomicUsize::new(0));
+        let seen = count.clone();
+        let mut descriptor = ScalarDescriptor::new(
+            "urn:tick",
+            0..=0,
+            move |_: &ScalarContext<'_>, _: &[oxrdf::Term]| -> ScalarResult {
+                seen.fetch_add(1, Ordering::Relaxed);
+                Ok(oxrdf::Literal::from(true).into())
+            },
+        )
+        .unwrap();
+        descriptor.volatility = Volatility::Volatile;
+        let mut registry = ExtensionRegistry::builder();
+        registry.register_scalar(descriptor).unwrap();
+        let opts = QueryOptions {
+            extensions: Some(registry.build()),
+            ..Default::default()
+        };
+        let result = query(
+            store.snapshot(),
+            "ASK { { ?s <urn:wide> ?v FILTER(<urn:tick>()) } UNION { <urn:t> <urn:cheap> ?v } }",
+            &opts,
+        )
+        .unwrap();
+        assert!(result.boolean);
+        assert_eq!(
+            count.load(Ordering::Relaxed),
+            64,
+            "the effectful path retains its original demand and callback count"
+        );
+    }
+
+    #[test]
+    fn reordered_and_retained_ask_work_is_still_bounded() {
+        use crate::io::Source;
+        use crate::sparql::{QueryOptions, query};
+        use crate::store::{Store, StoreOptions};
+        use std::sync::{Arc, atomic::AtomicBool};
+        use std::time::{Duration, Instant};
+        let store = Store::in_memory(StoreOptions::default());
+        let mut data = String::from("<urn:t> <urn:cheap> 1 .\n");
+        for i in 0..128 {
+            data.push_str(&format!("<urn:s{i}> <urn:wide> {i} .\n"));
+        }
+        store
+            .load(&[Source::from_bytes(
+                data.into_bytes(),
+                oxrdfio::RdfFormat::Turtle,
+                None,
+            )])
+            .unwrap();
+        let q = "ASK { { ?s <urn:wide> ?v } UNION { <urn:t> <urn:cheap> ?v } }";
+        assert!(
+            query(
+                store.snapshot(),
+                q,
+                &QueryOptions {
+                    max_rows: Some(1),
+                    ..Default::default()
+                }
+            )
+            .unwrap()
+            .boolean
+        );
+        for options in [
+            QueryOptions {
+                max_rows: Some(0),
+                ..Default::default()
+            },
+            QueryOptions {
+                max_rows_produced: Some(0),
+                ..Default::default()
+            },
+            QueryOptions {
+                max_memory_bytes: Some(0),
+                ..Default::default()
+            },
+            QueryOptions {
+                cancel: Some(Arc::new(AtomicBool::new(true))),
+                ..Default::default()
+            },
+            QueryOptions {
+                deadline: Some(Instant::now() - Duration::from_secs(1)),
+                ..Default::default()
+            },
+        ] {
+            assert!(query(store.snapshot(), q, &options).is_err());
+        }
+        let false_then_wide =
+            "ASK { { ?s <urn:wide> ?v } UNION { <urn:t> <urn:cheap> ?v FILTER(?v = 99) } }";
+        let one_row = query(
+            store.snapshot(),
+            false_then_wide,
+            &QueryOptions {
+                max_rows: Some(1),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        assert!(one_row.boolean);
+        let mut plans = vec![&one_row.plan];
+        let mut wide_rows = None;
+        while let Some(p) = plans.pop() {
+            if p.operator == "IndexScan" && p.description.contains("urn:wide") {
+                wide_rows = Some(p.actual_rows);
+            }
+            plans.extend(p.children.iter());
+        }
+        assert_eq!(
+            wide_rows,
+            Some(1),
+            "the remaining plain branch reads only its actual demand"
+        );
+        let filtered_wide = "ASK { { ?s <urn:wide> ?v FILTER(?v != ?s) } UNION { <urn:t> <urn:cheap> ?v FILTER(?v = 99) } }";
+        assert!(
+            query(
+                store.snapshot(),
+                filtered_wide,
+                &QueryOptions {
+                    max_rows: Some(1),
+                    ..Default::default()
+                }
+            )
+            .is_err(),
+            "the retained filtered path still refuses its physical64-row input work"
+        );
+    }
 
     #[test]
     fn small_or_unshared_anchors_do_not_plan_an_alternative() {
