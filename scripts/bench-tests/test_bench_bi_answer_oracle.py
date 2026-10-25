@@ -153,3 +153,17 @@ class CaptureTests(unittest.TestCase):
             broken = receipt["queries"]["bi-q7-1"]["broken"]
             self.assertEqual(broken["status"], "capture-error")
             self.assertNotIn("fingerprint", broken)
+
+    def test_fingerprintable_invalid_select_shape_reaches_recording(self):
+        module = importlib.util.spec_from_file_location("record", SCRIPT.parents[1] / "bench-record.py")
+        record = importlib.util.module_from_spec(module)
+        module.loader.exec_module(record)
+        receipt = self.run_cli({"broken": '{"head":{},"results":{"bindings":[]}}',
+                                "valid": json.dumps(products_answer(()))})
+        verdicts = receipt["queries"]["bi-q7-1"]
+        self.assertEqual(verdicts["broken"]["status"], "disagrees")
+        answers = {"bi-q7-1": {engine: {**v["fingerprint"], "query_sha256": v["query_sha256"]}
+                                  for engine, v in verdicts.items()}}
+        checked = record.fingerprints(answers, receipt, [receipt["source_sha256"]])
+        self.assertEqual(record.status_of([0], [.01], checked["bi-q7-1", "broken"]), "wrong-answer")
+        self.assertEqual(record.status_of([0], [.01], checked["bi-q7-1", "valid"]), "ok")

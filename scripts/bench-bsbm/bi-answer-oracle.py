@@ -297,7 +297,15 @@ def main():
                 body = raw.read_bytes()
                 raw_digest = hashlib.sha256(body).hexdigest()
                 answer = json.loads(body)
-                if (not isinstance(answer, dict) or not isinstance(answer.get("head"), dict)
+                fingerprint = fingerprints.select_record(text, answer, False)
+            except (OSError, ValueError, TypeError, KeyError, AttributeError):
+                # Use the same parse boundary as bench-answers. Such a capture has
+                # no fingerprint there, so it cannot acquire an acceptance verdict.
+                engines[engine] = {"status": "capture-error", "problems": ["unreadable or invalid SPARQL JSON"],
+                    "query_sha256": hashlib.sha256(path.read_bytes()).hexdigest(), "raw_sha256": raw_digest}
+                continue
+            try:
+                if (not isinstance(answer.get("head"), dict)
                         or not isinstance(answer["head"].get("vars"), list)
                         or not all(isinstance(v, str) for v in answer["head"]["vars"])
                         or not isinstance(answer.get("results"), dict)
@@ -306,19 +314,16 @@ def main():
                                for row in answer["results"]["bindings"])):
                     raise ValueError("invalid SPARQL JSON result structure")
                 problems = check_q6(expected, answer) if kind == "q6" else check_q7(expected, answer)
-                fingerprint = fingerprints.select_record(text, answer, False)
-            except (OSError, ValueError, TypeError, KeyError, AttributeError):
-                # bench-answers already marks an unparseable request as an error.
-                # Never turn an unreadable body into an acceptance verdict or stop peers.
-                engines[engine] = {"status": "capture-error", "problems": ["unreadable or invalid SPARQL JSON"],
-                    "query_sha256": hashlib.sha256(path.read_bytes()).hexdigest(), "raw_sha256": raw_digest}
-                continue
+            except (ValueError, TypeError, KeyError, AttributeError):
+                # A fingerprintable response still must have the expected SELECT
+                # shape. Bind its failed verdict so recording and valid peers proceed.
+                problems = ["invalid SPARQL JSON result structure"]
             engines[engine] = {"status": "ok" if not problems else "disagrees", "problems": problems,
                 "policy": "binary32-summation-equivalence" if kind == "q6" else "legal-inner-limit-ties",
                 "query_sha256": hashlib.sha256(path.read_bytes()).hexdigest(),
                 "raw_sha256": raw_digest,
                 "fingerprint": fingerprint}
-            if kind == "q6":
+            if kind == "q6" and not problems:
                 engines[engine]["datatypes"] = sorted({b.get("reviewerAvgScore", {}).get("datatype", "")
                     for b in answer["results"]["bindings"]})
         report["queries"][name] = engines
