@@ -111,6 +111,13 @@ import. A client cannot backdate that field. An externally alleged earlier avail
 uses the separately attributed `ev:reportedAvailableAt`. Local acquisition time does
 not claim when the publisher first made the content public.
 
+These timestamp fields use valid `xsd:dateTime` values with an explicit offset and
+normalize to UTC while retaining the source lexical value. A date with unknown time
+or timezone uses C27's bounded or unknown temporal representation instead of an
+invented timestamp. `ev:availabilityReceipt` names the authenticated ingest record and
+its dataset UUID, branch UUID and commit. A trusted restore preserves that origin or
+reports that it cannot reproduce the original knowledge history.
+
 `ev:upstreamSource` links a revision to a known underlying source. `ev:sourceFamily`
 records a declared common origin. A claim that two sources are independent is itself
 an assessment with evidence and a method. Absent lineage means unknown independence.
@@ -266,7 +273,8 @@ source meanings. An account does not become a person because its display name ma
 The common predicate `vt:validDuring`, in `urn:x-sparkles:valid-time:`, attaches C27
 validity records. Recorded time, first availability, source publication and valid time
 remain distinct. Missing validity means unknown validity, not an interval of all time.
-Expiry is a policy condition for current use. It is not proof that the old claim is false.
+`vt:expiresAt` is a review or freshness deadline for current use. It does not end the
+underlying claim's valid-time interval or prove that the old claim is false.
 
 A source correction creates a new revision and new claim occurrences, with
 `prov:wasRevisionOf` where correspondence is known. A withdrawal records its activity
