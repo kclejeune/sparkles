@@ -917,12 +917,16 @@ while it holds a temporary third state reference. Another pauses worker acquisit
 before it obtains a store reference. The third releases the final handle from a
 synchronous inference callback while listing views under the registry lock.
 
-Twelve regression tests cover those cases, cloned handles, concurrent final drops,
+Thirteen regression tests cover those cases, cloned handles, concurrent final drops,
 worker and synchronous panic, worker store destruction and host replacement. A callback
 matrix exercises 15 synchronous operation and callback combinations. Nested operations
-cover both the same runtime and different runtimes.
+cover both the same runtime and different runtimes. Operation tracking has no
+thread-local destructor. A subprocess regression keeps earlier store-access bookkeeping
+alive while a later thread-local owner's destructor lists views and releases the final
+handle, then checks that the store reopens.
 
-All 56 targeted incremental view tests pass. The GraphQL feature configuration passes
+All 57 targeted incremental view tests pass. The GraphQL feature configuration passes
 all 776 tests. Twenty repetitions of all six HTTP group commit tests pass, including
 the persistent reopen assertion that exposed the directory lock race. The worker
-callback case that reopens through a retained state also passes 100 repetitions.
+callback case that reopens through a retained state and the thread-local destruction
+case each pass 100 repetitions.
