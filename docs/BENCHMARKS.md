@@ -468,9 +468,9 @@ error with the default settings. With `--max-result-mb 4096` on one thread and w
 server cap, a streamed answer takes 30.4 s and an eager one 16.3 s. These figures come from
 forge on 2026-10-23.
 
-Sparkles answers `q12a` faster than Jena in both paired passes. `q12b` remains 1.33× slower than
-Oxigraph ([roadmap](ROADMAP.md) item 91). On `q11` the unchecked times of QLever and Fluree, 42.8
-and 51.7 ms, are lower than Sparkles' 103.1 ms.
+Sparkles answers `q12a` faster than Jena in both paired passes. On `q12b`, its mean of
+4.0 ms is 7.8% above Oxigraph's 3.7 ms, within the ten percent tie band. On `q11` the
+unchecked times of QLever and Fluree, 42.8 and 51.7 ms, are lower than Sparkles' 103.1 ms.
 
 Sparkles loads the data in 3.93 s, against 8.90 s for Fluree, 9.70 s for QLever, 20.49 s
 for Oxigraph and 44.88 s for TDB2. Its index takes 307 MiB on disk, against QLever's
