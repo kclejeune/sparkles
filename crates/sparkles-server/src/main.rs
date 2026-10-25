@@ -2023,13 +2023,25 @@ enum Cmd {
         max_inferred: usize,
         /// Explain why the database entails a triple, given in Turtle with the
         /// database's prefixes, such as '<http://ex.org/tom> a ex:Animal'
-        #[arg(long, value_name = "TRIPLE", conflicts_with_all = ["clear", "check", "status", "profile", "rules", "full"])]
+        #[arg(long, value_name = "TRIPLE", conflicts_with_all = ["clear", "check", "status", "rules", "full", "why_not"])]
         why: Option<String>,
+        /// Explain which missing facts would entail a triple
+        #[arg(long, value_name = "TRIPLE", conflicts_with_all = ["clear", "check", "status", "rules", "full", "why"])]
+        why_not: Option<String>,
+        /// Missing facts per hypothesis, at most four
+        #[arg(long, default_value_t = 2)]
+        max_missing: usize,
+        /// Hypotheses returned by a why-not search
+        #[arg(long, default_value_t = 10)]
+        max_hypotheses: usize,
+        /// Read materialized inferences or derive on demand
+        #[arg(long, value_parser = ["materialized", "demand"])]
+        source: Option<String>,
         /// Derivations whose top rules differ, with --why (at most 10)
-        #[arg(long, value_name = "N", default_value_t = 1, requires = "why")]
+        #[arg(long, value_name = "N", default_value_t = 1)]
         max_trees: usize,
         /// The depth of the trees, with --why (at most 64); deeper nodes are cut
-        #[arg(long, value_name = "N", default_value_t = 32, requires = "why")]
+        #[arg(long, value_name = "N", default_value_t = 32)]
         max_depth: u32,
         // where fetched imports may come from
         #[command(flatten)]
@@ -4253,13 +4265,31 @@ fn run() -> Result<()> {
             threads,
             max_inferred,
             why,
+            why_not,
+            max_missing,
+            max_hypotheses,
+            source,
             max_trees,
             max_depth,
             outbound,
         } => {
             use sparkles_reasoner::diagnostics::{self, Closure, DiagnoseOptions};
-            if let Some(text) = why {
-                return explain_cli(&loc, &text, max_trees, max_depth, timeout, &format);
+            if why.is_some() || why_not.is_some() {
+                let mode = if why_not.is_some() { "whyNot" } else { "why" };
+                let text = why.or(why_not).expect("explanation text");
+                return explain_cli(
+                    &loc,
+                    &text,
+                    mode,
+                    source.as_deref(),
+                    profile.as_deref(),
+                    max_trees,
+                    max_depth,
+                    max_missing,
+                    max_hypotheses,
+                    timeout,
+                    &format,
+                );
             }
             // bad check options exit with 2, before any work
             let closure = match Closure::parse(&closure) {
@@ -4890,11 +4920,17 @@ fn print_schema(out: &mut impl Write, r: &sparkles::schema::SchemaReport) -> Res
 /// `sparkles infer --why`: the derivation trees of a triple, as text or JSON. Exits with
 /// 1 when no derivation is found and 2 when the search passes its limits.
 #[cfg(feature = "reasoning")]
+#[allow(clippy::too_many_arguments)]
 fn explain_cli(
     loc: &std::path::Path,
     text: &str,
+    mode: &str,
+    source: Option<&str>,
+    profile: Option<&str>,
     max_trees: usize,
     max_depth: u32,
+    max_missing: usize,
+    max_hypotheses: usize,
     timeout: Option<f64>,
     format: &str,
 ) -> Result<()> {
@@ -4913,9 +4949,11 @@ fn explain_cli(
     let ds = sparkles::Dataset::open(loc)?;
     let prefixes: Vec<(String, String)> = ds.prefixes().into_iter().collect();
     let triple = ex::triple_from_text(text, &prefixes)?;
-    let mut req = ex::ExplainRequest::new(triple);
-    req.max_trees = max_trees;
-    req.max_depth = max_depth;
+    let term = ex::term_json;
+    let request = serde_json::json!({"triple":{"s":term(&triple[0]),"p":term(&triple[1]),"o":term(&triple[2])},
+        "mode":mode,"source":source,"profile":profile,"maxTrees":max_trees,"maxDepth":max_depth,
+        "maxMissing":max_missing,"maxHypotheses":max_hypotheses});
+    let (mut req, _, _) = ex::request_from_json(&request)?;
     req.timeout = match timeout {
         None => None,
         Some(t) => match std::time::Duration::try_from_secs_f64(t) {
@@ -4934,7 +4972,7 @@ fn explain_cli(
         }
         Err(e) => return Err(e.into()),
     };
-    let found = matches!(e.explained, sparkles::explain::Explained::Found { .. });
+    let found = ex::explanation_json(&e)["entailed"] == true || mode == "whyNot";
     if format == "json" {
         println!(
             "{}",

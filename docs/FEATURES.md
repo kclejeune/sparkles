@@ -397,11 +397,20 @@ check them against the W3C suites and Jena's own answers.
   one variable from each side, pairs its rows through that equality instead of forming
   their product ([internals](internals/OPTIMIZATIONS.md)). SP²Bench `q6` at 10M tests 7.4
   million candidate pairs where the product had 1.6 × 10¹² rows.
+* Groups linked only by a FILTER equality also join through candidate keys and test the
+  full condition on those pairs. Large ASK queries read the inputs alternately and stop
+  at the first qualifying pair. They retain prefixes of both inputs while both can
+  produce rows, then discard obsolete history when either input ends.
+* A triple pattern with one free variable can bind it during planning when a bounded
+  snapshot read proves that the pattern has exactly one row. This makes other patterns
+  and numeric FILTER bounds constant while preserving the result variables. Volatile
+  filters, application callbacks and algebra boundaries retain the ordinary plan.
 * Queries can run eagerly or as streaming cursors
   ([X05](specs/X05-streaming-query-execution.md)). Automatic execution, the default over
   HTTP, in the CLI, in Node and in the JVM library, streams scans expected to return at
   least a thousand rows, groupings of an estimated 20,000 input rows or more, and bounded
-  ASK products whose eager candidates would exceed a budget. Other plans run eagerly, and
+  ASK products whose eager candidates would exceed a budget, and large equality-keyed
+  ASK joins. Other plans run eagerly, and
   `execution=eager` or `execution=streaming` overrides the choice.
 * Rust, Python and Node have snapshot-owning SELECT and graph cursors, and the JVM
   library pulls SELECT results. Result writers use bounded buffers with backpressure and
@@ -666,18 +675,19 @@ request or on every write, and the schema report counts what the data holds.
   under OWL 2 RL derives no facts beyond the schema. Derived tables are cached per
   snapshot and view, and `maxDerived`, the deadline and the memory budget bound them.
   EXPLAIN shows a `Derive` node per pattern.
-* `POST /$/reason/{ds}/explain` answers why a dataset entails a triple with derivation
-  trees, over the materialized inferences at the commit they were computed at or over RDFS
-  on read ([API.md](API.md#explanations), [U10](specs/U10-canvas-lenses.md#phase-3-2026-10-24)).
-  The search walks back from the triple through the reasoner's rule instances and keeps a
-  tree only when every fact in it has a well-founded depth, so it stays correct after
-  incremental runs. Each derived node names its rule and profile, with the OWL 2 RL name
-  where there is one, and each leaf names its graph. A derivation is returned only when
-  the caller can read every leaf, and a hidden one answers the same `404` as a triple that
-  is not entailed. The search visits at most 100,000 rule instances within the query
-  timeout. `sparkles infer --why`, the MCP tool `explain_inference`, the library and the
-  Python and Node bindings return the same trees
-  ([USAGE.md](USAGE.md#why-is-this-inferred)).
+* `POST /$/reason/{ds}/explain` returns derivation trees from materialized inferences,
+  RDFS on read or the demand engine ([API.md](API.md#explanations),
+  [F18](specs/F18-explanations-and-entailment-diffs.md#outcome)). A tree has well-founded
+  premises, the rule's variable bindings and passed builtins. Generalized intermediate
+  facts and default geometries are explained, and a bounded partial tree marks premises
+  that could not be expanded. RDFS-on-read trees can include materialized derivations.
+  Schema builds honor cancellation and the deadline.
+* The same explanation route accepts `mode: "whyNot"`. It lists candidate rules,
+  conditions that block them and small sets of missing facts, with a verified derivation
+  under each hypothesis. Fresh blank-node placeholders stand for missing resources.
+  `complete` reports whether the bounded search exhausted its candidates. The CLI,
+  library, MCP, Python and Node bindings expose both modes, and Explore has a Why-not
+  form beside a resource's properties.
 * Sparkles records the commit at which inferences were made, and only a later change to a
   graph the run read makes them stale. `GET /$/reason/{ds}`, dataset info, `/$/stats` and
   the `Sparkles-Inferences` header report freshness. Automatic re-runs are opt-in with
@@ -1619,12 +1629,10 @@ links each item to its design spec.
   that follow only from derived instance facts may be missing from its answers, item 191.
   The derived-table cache's budget accounting is item 192. DESCRIBE is refused under
   derivation on demand, item 193.
-* An explanation that passes its budget answers `422` without a partial tree, roadmap
-  item 135. Derivations through generalized triples or GeoSPARQL default geometries are
-  not found, item 136, and trees leave out a rule's builtins and bindings, item 137. The
-  RDFS on read schema is built without the request's timeout, item 138, and a derivation
-  that needs both materialized inferences and RDFS on read is not found, item 139.
-  Explanations from derivation on demand and "why not?" answers are roadmap item 18.
+* Entailment diffs, minimal inconsistency justifications and provenance-based inferred
+  visibility remain roadmap item 18. Query result cells do not offer a Why? action,
+  item 285. `why_empty` adds hypotheses for a grounded failing intensional pattern.
+  Abduction for patterns with unbound target variables remains item 286.
 * Derived facts use the ordinary inferred graph. A separate derived-fact layer and
   canonical `owl:sameAs` representatives are not built. Roadmap item 9.
 * Incremental maintenance does not cover rules with `noValue`, `now` or new blank nodes,

@@ -96,11 +96,13 @@ Each of these can be switched off per query (`QueryOptions::optimizations`) or p
   predicate, the count comes from the index statistics instead, corrected like the counts
   from statistics below (`CountDistinctFromMetadata`, part of `metadata_counts`).
 * **Filters on vocabulary keys.** `CONTAINS`, `STRSTARTS`, `STRENDS` and `REGEX` over `?v`
-  or `STR(?v)`, and `LANGMATCHES(LANG(?v), …)`, are tested on the stored key bytes
+  or `STR(?v)`, `STRLEN` comparisons with integer constants, and
+  `LANGMATCHES(LANG(?v), …)`, are tested on the stored key bytes
   (`"lexical 0xFF @lang`, `<iri`). Each front-coded block is read once, in parallel,
   without allocating a string per term. A `CONTAINS` needle is searched with a substring
-  finder built once, and a key is checked to be UTF-8 only when it matches, since a byte
-  match of UTF-8 text is a match of the strings. Each parallel task tests with its own
+  finder built once. A passing key must be valid UTF-8, and string lengths count Unicode
+  scalar values while preserving the literal argument rules. Each parallel task tests
+  with its own
   copy of a regular expression, because threads that share one wait for its match caches.
   Terms added by updates are tested on their delta keys. Inline values (numbers, dates)
   go through the general evaluator.
@@ -290,14 +292,28 @@ Each of these can be switched off per query (`QueryOptions::optimizations`) or p
   is kept alone. At 10.5M triples, `optional-count` runs in 6 ms instead of 15 ms on a
   warm store. EXPLAIN notes `[merge on ?p]`. Other OPTIONALs keep the hash join, which
   puts the unmatched left rows last.
+* Groups linked only by a FILTER equality use a keyed inner join when `keyed_join` is
+  enabled. The keys propose candidate pairs and the full FILTER still decides which
+  pairs pass. An eager LIMIT bounds the larger input in growing prefixes. A large ASK
+  instead reads both inputs alternately, starting with 64 rows, and stops at its first
+  matching pair. Hash joins below that ASK can probe a triple-pattern index to avoid
+  collecting a whole input before their first output. The alternating join can hold
+  prefixes of both inputs, which uses more memory than one hash-build input. It charges
+  that storage before allocation and drops obsolete history once an input ends.
+* A pattern with one free variable and at most four estimated rows is eligible for
+  `point_patterns`. The planner reads at most two rows and substitutes a constant only
+  when exactly one row exists in the query snapshot. It restores the variable in the
+  result and preserves RDF term identity, graph scope and multiplicity. The substitution
+  also makes arithmetic FILTER bounds constant. Filters with volatile functions,
+  application callbacks and occurrences in other algebra nodes keep their bindings.
 * **Keyed left joins** (`keyed_left_join`). Without this path, an OPTIONAL whose two
   sides share no variable joins every left row with every right row before its FILTER
   runs. When
   the FILTER has a conjunct `?a = ?b` with one variable from each side, the join pairs
-  the rows through that equality instead. An IRI or a blank node equals only itself, so
-  a left row whose value is one meets only the right rows with the same id. A left row
-  with another kind of value meets the right rows whose value is neither unbound nor an
-  IRI or a blank node, and an unbound value meets none. The whole FILTER is then tested
+  the rows through that equality instead. IRIs, blank nodes, simple strings and literals
+  of uninterpreted datatypes use their term ids. Language strings use keys that normalize
+  the case of their tags. Interpreted datatypes and triple terms meet other values in
+  that category, and unbound values meet none. The whole FILTER is then tested
   on these candidate pairs, 64K pairs at a time, so the result and its bag multiplicity
   are the product's. SP²Bench `q6` links its OPTIONAL to the outer pattern only by
   `?author = ?author2`. At 10M triples the product has 1.58 × 10¹² rows, while the

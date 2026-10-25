@@ -360,6 +360,18 @@ pub enum Kind {
         left: VarId,
         right: VarId,
     },
+    /// The inner join of two parts of a group that share no variable, linked by a FILTER
+    /// conjunct `?left = ?right` over a variable of each. The candidate pairs are those of
+    /// [`Kind::KeyedLeftJoin`], and `expr`, the conjunction of the FILTERs that need both
+    /// sides, is tested on them, so the result is the filtered product's. With `ripple`,
+    /// set for an ASK that a cursor answers, both inputs are read alternately so that the
+    /// first matching pair ends the query early (see `cursor::ripple`).
+    KeyedJoin {
+        expr: Expr,
+        left: VarId,
+        right: VarId,
+        ripple: bool,
+    },
     Minus,
     /// ARQ's SEMIJOIN (`anti`: ANTIJOIN): the rows of child 0 compatible with a row of
     /// child 1 (with none)
@@ -598,6 +610,7 @@ impl Node {
                 ..
             } => "CartesianProduct",
             Kind::LeftJoin { .. } | Kind::KeyedLeftJoin { .. } => "OptionalJoin",
+            Kind::KeyedJoin { .. } => "KeyedJoin",
             Kind::Minus => "Minus",
             Kind::HalfJoin { anti: false } => "SemiJoin",
             Kind::HalfJoin { anti: true } => "AntiJoin",
@@ -685,6 +698,9 @@ struct PathItem {
 }
 
 pub(super) const FILTER_SELECTIVITY: f64 = 0.3;
+/// A pattern with one variable estimated at this many rows or fewer is read at planning
+/// time, and bound to its value when it has one row (see `Planner::point_value`).
+const POINT_ROWS: f64 = 4.0;
 const DP_LIMIT: usize = 12;
 
 pub struct Planner<'a> {
@@ -2938,6 +2954,34 @@ impl<'a> Planner<'a> {
             i += 1;
         }
 
+        // Point patterns: a triple pattern with a single variable of which the store holds
+        // exactly one row binds that variable to a constant for the rest of the group, as
+        // the filter-equality substitution above does. Its FILTERs then test the constant,
+        // so they can narrow scans of the group's other patterns.
+        if self.ctx.opt.point_patterns && !self.ctx.calls_extensions {
+            let mut i = 0;
+            while i < triples.len() {
+                let point =
+                    self.point_value(&triples[i], i, &triples, &filters, &nodes, &paths, &unpacks)?;
+                let Some((v, c)) = point else {
+                    i += 1;
+                    continue;
+                };
+                triples.remove(i);
+                for t in &mut triples {
+                    for x in &mut t.t {
+                        if *x == PT::V(v) {
+                            *x = PT::C(c);
+                        }
+                    }
+                }
+                for f in &mut filters {
+                    substitute(f, v, c);
+                }
+                binds.push((v, c));
+            }
+        }
+
         let mut leaves: Vec<Vec<Node>> = Vec::new();
         for t in &triples {
             leaves.push(self.scan_options(t)?);
@@ -3057,6 +3101,68 @@ impl<'a> Planner<'a> {
         Ok(result)
     }
 
+    /// The constant that the point pattern `triples[i]` binds its variable to, read from
+    /// the snapshot, when the pattern has one variable in one position, the store holds
+    /// exactly one row of it, and the variable appears in another pattern or a FILTER of
+    /// the group and nowhere a constant cannot take its place.
+    #[allow(clippy::too_many_arguments)]
+    fn point_value(
+        &self,
+        t: &Triple,
+        i: usize,
+        triples: &[Triple],
+        filters: &[Expr],
+        nodes: &[Node],
+        paths: &[PathItem],
+        unpacks: &[UnpackItem],
+    ) -> Result<Option<(VarId, Id)>> {
+        if matches!(t.graph, ActiveGraph::Var(_)) {
+            return Ok(None);
+        }
+        let mut vars = t.t.iter().filter_map(|x| match x {
+            PT::V(v) => Some(*v),
+            PT::C(_) => None,
+        });
+        let (Some(v), None) = (vars.next(), vars.next()) else {
+            return Ok(None);
+        };
+        let used = triples
+            .iter()
+            .enumerate()
+            .any(|(j, o)| j != i && o.t.contains(&PT::V(v)))
+            || filters.iter().any(|f| f.var_set().contains(&v));
+        if !used
+            || filters
+                .iter()
+                .any(|f| super::exprcache::impurity(f).is_some())
+            || nodes.iter().any(|n| n.vars.contains(&v))
+            || paths.iter().any(|p| p.s == PT::V(v) || p.o == PT::V(v))
+            || unpacks
+                .iter()
+                .any(|u| u.t == v || u.parts.contains(&PT::V(v)))
+            || triples
+                .iter()
+                .any(|o| matches!(o.graph, ActiveGraph::Var(g) if g == v))
+        {
+            return Ok(None);
+        }
+        let Some(scan) = self.scan_options(t)?.into_iter().next() else {
+            return Ok(None);
+        };
+        let Kind::Scan(spec) = &scan.kind else {
+            return Ok(None);
+        };
+        // an estimate of a few rows comes before the read, which costs a seek
+        if !scan.est.is_finite() || scan.est > POINT_ROWS || !spec.eqs.is_empty() {
+            return Ok(None);
+        }
+        let (rows, _) = super::exec::scan_limited(self.ctx, spec, &scan.vars, Some(2))?;
+        Ok(match (rows.len(), rows.col_of(v)) {
+            (1, Some(c)) => Some((v, rows.cols[c][0])).filter(|(_, id)| !id.is_undef()),
+            _ => None,
+        })
+    }
+
     /// DP / greedy join ordering over connected components (QLever QueryPlanner).
     fn join_order(&self, leaves: Vec<Vec<Node>>, filters: &mut Vec<Expr>) -> Result<Node> {
         let n = leaves.len();
@@ -3144,9 +3250,52 @@ impl<'a> Planner<'a> {
         let mut it = parts.into_iter();
         let mut acc = it.next().unwrap();
         for p in it {
-            acc = self.place_filters(join(acc, p, self.ctx), filters);
+            acc = self.join_components(acc, p, filters);
         }
         Ok(super::indexjoin::fuse_stars(acc, self.ctx))
+    }
+
+    /// The join of `a` and `b`, which share no variable, keyed on a conjunct `?x = ?y` of
+    /// a remaining FILTER with one variable on each side (see [`Kind::KeyedJoin`]). Every
+    /// FILTER that both sides together bind is tested on the candidates and removed from
+    /// `filters`. Without a suitable equality it retains the ordinary product.
+    fn join_components(&self, a: Node, b: Node, filters: &mut Vec<Expr>) -> Node {
+        // An application callback in the condition may count or depend on its calls,
+        // which the candidates change, so it keeps the product.
+        if !self.ctx.opt.keyed_join
+            || self.ctx.calls_extensions
+            || a.is_empty()
+            || b.is_empty()
+            || a.vars.iter().any(|v| b.vars.contains(v))
+        {
+            return self.place_filters(join(a, b, self.ctx), filters);
+        }
+        let bound = |f: &Expr| {
+            !f.has_exists() && {
+                let vs = f.var_set();
+                !vs.is_empty() && vs.iter().all(|v| a.vars.contains(v) || b.vars.contains(v))
+            }
+        };
+        let Some((x, y)) = filters
+            .iter()
+            .filter(|f| bound(f))
+            .find_map(|f| equality_key(f, &a, &b))
+        else {
+            return self.place_filters(join(a, b, self.ctx), filters);
+        };
+        let (now, later): (Vec<Expr>, Vec<Expr>) =
+            std::mem::take(filters).into_iter().partition(|f| bound(f));
+        *filters = later;
+        let expr = now
+            .into_iter()
+            .reduce(|l, r| Expr::And(Box::new(l), Box::new(r)))
+            .expect("the linking FILTER");
+        // The larger input is streamed and the smaller one indexed.
+        if a.est >= b.est {
+            keyed_inner_join(a, b, expr, (x, y), self.ctx)
+        } else {
+            keyed_inner_join(b, a, expr, (y, x), self.ctx)
+        }
     }
 
     /// Apply (and remove) filters whose variables are all bound by `n`.
@@ -4006,6 +4155,43 @@ fn keyed_left_join(l: Node, r: Node, expr: Expr, (a, b): (VarId, VarId), ctx: &C
     }
 }
 
+/// The inner join of `l` and `r` keyed on the equality of `a` (left) and `b` (right),
+/// with the condition `expr` tested on the candidates (see [`Kind::KeyedJoin`]). It is
+/// estimated as a join on one variable whose result the rest of the condition filters.
+fn keyed_inner_join(l: Node, r: Node, expr: Expr, (a, b): (VarId, VarId), ctx: &Ctx) -> Node {
+    let joined = join_est_from(l.est, r.est, l.d(a).max(r.d(b)));
+    let conjuncts = expr.clone().conjuncts().len().max(1);
+    let est = (joined * FILTER_SELECTIVITY.powi(conjuncts as i32 - 1)).max(1.0);
+    let mut vars = l.vars.clone();
+    vars.extend(r.vars.iter().filter(|v| !l.vars.contains(v)));
+    let mut certain = l.certain.clone();
+    certain.extend(r.certain.iter().filter(|v| !l.certain.contains(v)));
+    let desc = format!(
+        "on ?{} = ?{} filter {}",
+        ctx.var_name(a),
+        ctx.var_name(b),
+        expr.display(ctx)
+    );
+    let dist = merge_dist(&l, &r, est, None);
+    let base = hash_base(Costing::of(ctx).hash_build, r.est, l.est);
+    Node {
+        kind: Kind::KeyedJoin {
+            expr,
+            left: a,
+            right: b,
+            ripple: false,
+        },
+        vars,
+        certain,
+        sorted: Vec::new(),
+        est,
+        cost: l.cost + r.cost + base + joined + est,
+        dist,
+        desc,
+        children: vec![l, r],
+    }
+}
+
 fn union(children: Vec<Node>) -> Node {
     match children.len() {
         0 => return Node::empty(Vec::new()),
@@ -4152,6 +4338,20 @@ pub(super) fn range_atom(e: &Expr, v: VarId, ctx: &Ctx) -> Option<(RangeOp, supe
             Expr::Const(id) => ctx.value(*id),
             Expr::Neg(x) => arith(NumOp::Sub, &Value::Integer(0.into()), &constant(x, ctx)?).ok(),
             Expr::Pos(x) => constant(x, ctx).filter(|c| c.is_numeric()),
+            Expr::Arith(x, y, op) => {
+                use super::expr::ArithOp;
+                let op = match op {
+                    ArithOp::Add => NumOp::Add,
+                    ArithOp::Sub => NumOp::Sub,
+                    ArithOp::Mul => NumOp::Mul,
+                    ArithOp::Div => NumOp::Div,
+                };
+                let (x, y) = (constant(x, ctx)?, constant(y, ctx)?);
+                if !(x.is_numeric() && y.is_numeric()) {
+                    return None;
+                }
+                arith(op, &x, &y).ok()
+            }
             _ => None,
         }
     }

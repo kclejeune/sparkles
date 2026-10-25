@@ -168,10 +168,6 @@ export async function handleReason(req, res, seg, ctx) {
   } catch {
     return (fail(res, 400, 'invalid JSON'), true);
   }
-  if (body.mode === 'whyNot')
-    return (
-      fail(res, 501, 'whyNot explanations are not available', { code: 'not-implemented' }), true
-    );
   const t = body.triple ?? {};
   const triple = [toTerm(t.s), toTerm(t.p), toTerm(t.o)];
   if (triple.some((x) => !x)) return (fail(res, 400, 'triple must have s, p and o'), true);
@@ -182,6 +178,83 @@ export async function handleReason(req, res, seg, ctx) {
       code: 'no-visible-derivation',
     });
   const x = explainer(ds.store);
+  if (body.mode === 'whyNot') {
+    const commit = headSeq(ds);
+    if (x.prove(triple, MAX_SEARCH))
+      return (send(res, 200, { mode: 'whyNot', entailed: true, commit }), true);
+    const rules = [];
+    const hypotheses = [];
+    const add = (name, facts, present = []) => {
+      if (facts.length > Number(body.maxMissing ?? 2)) return;
+      const premises = [
+        ...present.map((t) => ({ kind: 'asserted', t, graph: x.asserted(t) })),
+        ...facts.map((t) => ({ kind: 'asserted', t, missing: true })),
+      ];
+      const tree = render(
+        [{ kind: 'derived', t: triple, rule: name, premises }],
+        ds.reasoning?.profile ?? 'rdfs',
+        maxDepth,
+      )[0];
+      const mark = (d) => {
+        if (
+          facts.some(
+            (t) => key(t) === key([toTerm(d.triple.s), toTerm(d.triple.p), toTerm(d.triple.o)]),
+          )
+        )
+          d.missing = true;
+        for (const p of d.premises ?? []) mark(p);
+      };
+      mark(tree);
+      rules.push({ name, unifier: {} });
+      hypotheses.push({
+        missing: facts.map((t) => ({ s: termJson(t[0]), p: termJson(t[1]), o: termJson(t[2]) })),
+        placeholders: [],
+        tree,
+      });
+    };
+    if (triple[1].value === RDF_TYPE) {
+      for (const q of ds.store.match(null, null, triple[0], null)) {
+        if (q.graph.value !== INFERRED)
+          add(
+            'rdfs3',
+            [[q.predicate, ox.namedNode(`${RDFS}range`), triple[2]]],
+            [[q.subject, q.predicate, q.object]],
+          );
+      }
+      for (const q of ds.store.match(triple[0], null, null, null)) {
+        if (q.graph.value === INFERRED) continue;
+        if (q.predicate.value === RDF_TYPE)
+          add(
+            'rdfs9',
+            [[q.object, ox.namedNode(`${RDFS}subClassOf`), triple[2]]],
+            [[q.subject, q.predicate, q.object]],
+          );
+        else
+          add(
+            'rdfs2',
+            [[q.predicate, ox.namedNode(`${RDFS}domain`), triple[2]]],
+            [[q.subject, q.predicate, q.object]],
+          );
+      }
+    }
+    hypotheses.sort(
+      (a, b) =>
+        Number(b.missing[0]?.p.value === `${RDFS}subClassOf`) -
+        Number(a.missing[0]?.p.value === `${RDFS}subClassOf`),
+    );
+    return (
+      send(res, 200, {
+        mode: 'whyNot',
+        entailed: false,
+        commit,
+        source: 'demand',
+        rules,
+        hypotheses: hypotheses.slice(0, Number(body.maxHypotheses ?? 10)),
+        complete: false,
+      }),
+      true
+    );
+  }
   const withGraph = (p) =>
     p.kind === 'asserted'
       ? { ...p, graph: x.asserted(p.t) }

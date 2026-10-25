@@ -25,7 +25,7 @@ count as equal. Only runs in which the driver succeeded without a timeout take p
 compared only with runs that have the same mix count. Each engine casts one vote per query, and
 only when its own runs agree, so an engine with more client counts does not outvote the others. When
 only one engine has runs, its runs vote against each other. A run that differs from the majority on
-any query gets status `wrong-answer` and the numbers of those queries in `disagreeing_queries`. A run
+any query gets status `answer-disagreement` and the numbers of those queries in `disagreeing_queries`. A run
 that failed keeps its `error` or `timeout`, and every check starts again from `driver_status`, so
 a label from an earlier check does not stay.
 """
@@ -145,7 +145,7 @@ def check(path, skip=()):
             diff = sorted((nr for nr, x in v["avgresults"].items() if nr in majority and not agree(x, majority[nr])),
                           key=int)
             if diff:
-                v["status"] = "wrong-answer"
+                v["status"] = "answer-disagreement"
                 v["disagreeing_queries"] = diff
                 bad += 1
                 print(f"{e} x{c}: average result counts differ from the majority on queries {', '.join(diff)}")

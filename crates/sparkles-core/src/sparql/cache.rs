@@ -641,7 +641,7 @@ fn write_node(n: &Node, ctx: &Ctx, s: &mut String) -> bool {
         Kind::Filter(es) => es.iter().all(deterministic),
         Kind::Extend(_, e) | Kind::Assign(_, e) | Kind::Unfold { expr: e, .. } => deterministic(e),
         Kind::LeftJoin { expr } => expr.as_ref().is_none_or(deterministic),
-        Kind::KeyedLeftJoin { expr, .. } => deterministic(expr),
+        Kind::KeyedLeftJoin { expr, .. } | Kind::KeyedJoin { expr, .. } => deterministic(expr),
         Kind::OrderBy { keys, limit } => {
             let _ = write!(s, "limit={limit:?}");
             keys.iter().all(|(e, _)| deterministic(e))

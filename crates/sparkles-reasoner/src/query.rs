@@ -50,6 +50,10 @@ const STOP_POLL: Duration = Duration::from_millis(5);
 struct Shared {
     profile: Profile,
     rules: Vec<Rule>,
+    /// the profile or vocabulary of each rule of `rules`
+    sources: Vec<String>,
+    /// whether the materialization adds GeoSPARQL default geometries
+    geo_default: bool,
     inputs: Inputs,
     digest: u64,
     max_derived: usize,
@@ -68,6 +72,7 @@ impl QueryReasoner {
     /// `inputs`, with [`DEFAULT_MAX_DERIVED`] as the limit of derived facts.
     pub fn new(profile: Profile, extras: &Extras, inputs: Inputs) -> anyhow::Result<QueryReasoner> {
         let rules = crate::profile_rules(&profile, extras)?;
+        let sources = crate::rule_sources(&profile, extras)?;
         let mut warnings = Vec::new();
         if extras.geo_default_geometry {
             warnings.push(
@@ -80,6 +85,8 @@ impl QueryReasoner {
                 digest: crate::rules_digest(&profile, extras),
                 profile,
                 rules,
+                sources,
+                geo_default: extras.geo_default_geometry,
                 inputs,
                 max_derived: DEFAULT_MAX_DERIVED,
                 // a linear chain of n nodes takes n iterations, so the limit of derived
@@ -98,6 +105,8 @@ impl QueryReasoner {
             shared: Arc::new(Shared {
                 profile: s.profile.clone(),
                 rules: s.rules.clone(),
+                sources: s.sources.clone(),
+                geo_default: s.geo_default,
                 inputs: s.inputs.clone(),
                 digest: s.digest,
                 max_derived: n,
@@ -132,6 +141,26 @@ impl ReasoningProvider for QueryReasoner {
 
     fn start(&self, req: SessionRequest) -> Result<Box<dyn ReasoningSession>> {
         Ok(Box::new(Session::new(self.shared.clone(), req)?))
+    }
+}
+
+impl QueryReasoner {
+    /// A session for an explanation (spec F18 §3.1). Linear recursion is not rewritten,
+    /// so every fact it derives has an instance of an original rule among the facts
+    /// derived. Its demands neither read nor fill the table cache, since a table's facts
+    /// go to a query and not into the session's graph, which the search reads. With
+    /// `cached` set it reads and fills the schema's table, whose facts join the graph, and
+    /// without it not even that, since facts added to the session (a why-not hypothesis)
+    /// change the schema.
+    pub(crate) fn explain_session(&self, mut req: SessionRequest, cached: bool) -> Result<Session> {
+        req.no_cache = true;
+        let mut s = Session::new(self.shared.clone(), req)?;
+        s.rewrite_linear = false;
+        s.view = None;
+        if !cached {
+            s.schema_view = None;
+        }
+        Ok(s)
     }
 }
 
@@ -182,11 +211,28 @@ enum Seeded {
     Object,
 }
 
-struct Session {
+/// The parts of a session an explanation's search reads (see [`Session::parts`]).
+pub(crate) struct Parts<'a> {
+    pub graph: &'a mut Graph,
+    pub terms: &'a Terms,
+    pub rules: &'a [CRule],
+    pub infos: &'a [engine::RuleInfo],
+    pub sources: &'a [String],
+    pub geo_default: bool,
+    pub inputs: &'a [Id],
+    pub snap: &'a Arc<Snapshot>,
+    pub budget: &'a Arc<Budget>,
+}
+
+pub(crate) struct Session {
     shared: Arc<Shared>,
     snap: Arc<Snapshot>,
     terms: Terms,
     rules: Vec<CRule>,
+    /// what an explanation names of each rule
+    infos: Vec<engine::RuleInfo>,
+    /// whether the demand program rewrites linear recursion (see [`demand::transform`])
+    rewrite_linear: bool,
     graphs: Vec<Id>,
     absent: bool,
     stop: Arc<dyn Fn() -> Result<()> + Send + Sync>,
@@ -245,7 +291,7 @@ impl Session {
             .set_budget(&budget)
             .map_err(|e| memory_error(e, "the rules"))?;
         let mut warnings = shared.warnings.clone();
-        let rules = engine::compile_query(&shared.rules, &terms, &mut warnings);
+        let (rules, infos) = engine::compile_info(&shared.rules, &terms, &mut warnings, true);
         // imports are followed only through the graphs the caller reads (spec F17 §4.5)
         let resolved = match &req.readable {
             Some(readable) => inputs::resolve_readable(&snap, &shared.inputs, &|g| readable(g)),
@@ -273,6 +319,8 @@ impl Session {
             snap,
             terms,
             rules,
+            infos,
+            rewrite_linear: true,
             graphs,
             absent,
             stop: req.stop,
@@ -447,10 +495,12 @@ impl Session {
     fn transform(&self, rules: &[CRule], roots: &[Key], pass: Pass<'_>) -> Result<Program> {
         let g = self.graph.as_ref().expect("graph made");
         let est = |a: &Atom, bound: &[bool]| estimate(g, a, bound);
-        demand::transform(rules, &self.terms, roots, &est, pass).map_err(|e| match e {
-            TransformError::Memory(m) => memory_error(m, "the demand program"),
-            TransformError::TooLarge(_) => component(BUDGET_CODE, e.to_string()),
-            TransformError::NotStratified => component(RULES_CODE, e.to_string()),
+        demand::transform(rules, &self.terms, roots, &est, pass, self.rewrite_linear).map_err(|e| {
+            match e {
+                TransformError::Memory(m) => memory_error(m, "the demand program"),
+                TransformError::TooLarge(_) => component(BUDGET_CODE, e.to_string()),
+                TransformError::NotStratified => component(RULES_CODE, e.to_string()),
+            }
         })
     }
 
@@ -596,6 +646,76 @@ impl Session {
         self.program = Some(program);
         self.lower_done = false;
         Ok(())
+    }
+
+    /// The parts a search over the session's facts reads, borrowed at once.
+    pub(crate) fn parts(&mut self) -> Result<Parts<'_>> {
+        self.make_graph()?;
+        Ok(Parts {
+            graph: self.graph.as_mut().expect("graph made"),
+            terms: &self.terms,
+            rules: &self.rules,
+            infos: &self.infos,
+            sources: &self.shared.sources,
+            geo_default: self.shared.geo_default,
+            inputs: &self.graphs,
+            snap: &self.snap,
+            budget: &self.budget,
+        })
+    }
+
+    /// Add `facts` to the session's graph before it derives, as facts of the derived
+    /// tier: a why-not hypothesis (spec F18 §4.2) or the GeoSPARQL default geometries a
+    /// materialization adds.
+    pub(crate) fn add_facts(&mut self, facts: Vec<Triple>) -> Result<()> {
+        self.make_graph()?;
+        let g = self.graph.as_mut().expect("graph made");
+        g.try_add_batch(facts)
+            .map_err(|e| memory_error(e, "the facts of an explanation"))?;
+        Ok(())
+    }
+
+    /// Derive every fact of `demands`, each with its constants alone.
+    pub(crate) fn derive_all(&mut self, demands: &[Demand]) -> Result<()> {
+        self.prepare(demands)?;
+        let seeds = (0..demands.len()).map(|d| (d, Vec::new())).collect();
+        self.derive(seeds)?;
+        Ok(())
+    }
+
+    /// The session's graph, made when no demand derived yet.
+    pub(crate) fn graph_mut(&mut self) -> Result<&mut Graph> {
+        self.make_graph()?;
+        Ok(self.graph.as_mut().expect("graph made"))
+    }
+
+    pub(crate) fn graph(&self) -> Option<&Graph> {
+        self.graph.as_ref()
+    }
+
+    pub(crate) fn terms(&self) -> &Terms {
+        &self.terms
+    }
+
+    pub(crate) fn rules(&self) -> &[CRule] {
+        &self.rules
+    }
+
+    pub(crate) fn infos(&self) -> &[engine::RuleInfo] {
+        &self.infos
+    }
+
+    /// The profile or vocabulary of each parsed rule.
+    pub(crate) fn sources(&self) -> &[String] {
+        &self.shared.sources
+    }
+
+    pub(crate) fn geo_default(&self) -> bool {
+        self.shared.geo_default
+    }
+
+    pub(crate) fn budget(&self) -> &Arc<Budget> {
+        &self.budget
     }
 
     /// Whether demand `d` can read facts of the schema.

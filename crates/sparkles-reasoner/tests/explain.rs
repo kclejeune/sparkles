@@ -117,6 +117,7 @@ fn trees(e: Explained) -> (Vec<Derivation>, bool) {
     match e {
         Explained::Found { trees, more } => (trees, more),
         Explained::NotFound => panic!("no derivation"),
+        Explained::Partial { reason, .. } => panic!("a partial tree: {reason}"),
     }
 }
 
@@ -298,6 +299,7 @@ fn a_tree_past_the_depth_limit_is_cut_as_a_ref() {
 fn the_instance_budget_stops_the_search() {
     let s = store(TRIG);
     reason(&s, &Profile::Rdfs, &[HR, ONTO], None);
+    // past the budget, the instances found give a partial tree (ROADMAP item 135)
     let e = why(
         &s,
         &Profile::Rdfs,
@@ -308,8 +310,22 @@ fn the_instance_budget_stops_the_search() {
             ..Default::default()
         },
     )
-    .unwrap_err();
-    assert!(e.downcast_ref::<ExplainBudgetExceeded>().is_some(), "{e:#}");
+    .unwrap();
+    let Explained::Partial { tree, reason } = e else {
+        panic!("expected a partial tree, got {e:?}");
+    };
+    assert!(reason.contains("rule instances"), "{reason}");
+    assert_eq!(tree.kind, DerivationKind::Derived);
+    assert_eq!(tree.rule.as_ref().unwrap().name, "rdfs9");
+    fn kinds(d: &Derivation, out: &mut Vec<DerivationKind>) {
+        out.push(d.kind);
+        d.premises.iter().for_each(|p| kinds(p, out));
+    }
+    let mut ks = Vec::new();
+    kinds(&tree, &mut ks);
+    assert!(ks.contains(&DerivationKind::Unexplained), "{tree:?}");
+    assert!(ks.contains(&DerivationKind::Asserted), "{tree:?}");
+    // with nothing reached, the budget still answers as an error
     let e = why(
         &s,
         &Profile::Rdfs,
@@ -499,6 +515,7 @@ fn every_inferred_triple_is_explained_after_incremental_deletions() {
             let (ts, _) = match e {
                 Explained::Found { trees, more } => (trees, more),
                 Explained::NotFound => panic!("step {step}: {terms:?} has no derivation"),
+                Explained::Partial { reason, .. } => panic!("step {step}: partial, {reason}"),
             };
             let mut seen = BTreeSet::new();
             for d in &ts {

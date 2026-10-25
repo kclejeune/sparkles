@@ -140,10 +140,21 @@ fn every_pattern_of_three_is_named_once_by_the_operator_that_reads_it() {
 #[test]
 fn constants_are_n_triples_terms_and_blank_nodes_hidden() {
     let s = people();
-    let j = explained(
-        &s,
+    // Retain every runtime scan while checking references for all four patterns.
+    let options = QueryOptions {
+        optimizations: Some(Optimizations {
+            point_patterns: false,
+            ..Optimizations::ALL
+        }),
+        ..opts()
+    };
+    let (_, plan) = explain(
+        s.snapshot(),
         "SELECT * WHERE { ?p ex:name \"n3\" ; ex:age 3 ; ex:boss [ ex:name ?bn ] }",
-    );
+        &options,
+    )
+    .unwrap();
+    let j = serde_json::to_value(&plan).unwrap();
     let t = texts(&j);
     assert!(
         t.contains(&format!("?p {} \"n3\" #0", iri("name"))),
@@ -158,6 +169,21 @@ fn constants_are_n_triples_terms_and_blank_nodes_hidden() {
     );
     assert!(t.contains(&format!("?p {} ?_ #0", iri("boss"))), "{t:?}");
     assert!(t.contains(&format!("?_ {} ?bn #0", iri("name"))), "{t:?}");
+}
+
+#[test]
+fn point_substitutions_keep_original_source_terms() {
+    let s = people();
+    let j = explained(&s, "SELECT * WHERE { ?p ex:name \"n3\" ; ex:age 3 }");
+    // The name lookup binds ?p during planning. Its remaining scan still names
+    // the query variable, rather than exposing the stored subject as source text.
+    assert_eq!(
+        texts(&j),
+        vec![format!(
+            "?p {} \"3\"^^<http://www.w3.org/2001/XMLSchema#integer> #0",
+            iri("age")
+        )]
+    );
 }
 
 #[test]

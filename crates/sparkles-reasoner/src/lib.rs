@@ -34,6 +34,7 @@ pub mod query;
 mod specialize;
 pub mod tables;
 mod terms;
+pub mod whynot;
 
 pub use extras::{Extras, UnknownVocabulary, Vocabulary};
 pub use inputs::{
@@ -429,13 +430,28 @@ fn default_geometries(
     terms: &Terms,
     budget: &Arc<Budget>,
 ) -> anyhow::Result<(Vec<[u64; 3]>, Held)> {
+    default_geometries_controlled(base, terms, budget, || Ok(()))
+}
+
+fn default_geometries_controlled(
+    base: &facts::Base,
+    terms: &Terms,
+    budget: &Arc<Budget>,
+    mut check: impl FnMut() -> anyhow::Result<()>,
+) -> anyhow::Result<(Vec<[u64; 3]>, Held)> {
+    check()?;
     let (has, default) = geo_ids(terms);
     let mut held = Held::new(budget);
     let mut refused = None;
+    let mut stopped = None;
     // feature → its only geometry (`None` once it has a second)
     let mut one: FxHashMap<u64, Option<u64>> = FxHashMap::default();
     let entry = size_of::<(u64, Option<u64>)>();
     base.for_each(None, Some(has), None, |t| {
+        if let Err(e) = check() {
+            stopped = Some(e);
+            return false;
+        }
         if !one.contains_key(&t[0])
             && let Err(e) = room_for_key(&mut held, one.capacity(), one.len(), entry)
         {
@@ -451,9 +467,16 @@ fn default_geometries(
             .or_insert(Some(t[2]));
         true
     })?;
+    if let Some(e) = stopped.take() {
+        return Err(e);
+    }
     let mut with_default: FxHashSet<u64> = FxHashSet::default();
     if refused.is_none() {
         base.for_each(None, Some(default), None, |t| {
+            if let Err(e) = check() {
+                stopped = Some(e);
+                return false;
+            }
             if one.contains_key(&t[0])
                 && !with_default.contains(&t[0])
                 && let Err(e) = room_for_key(
@@ -472,24 +495,33 @@ fn default_geometries(
             true
         })?;
     }
+    if let Some(e) = stopped {
+        return Err(e);
+    }
     if let Some(e) = refused {
         return Err(e
             .with_context(" (finding the GeoSPARQL default geometries)".into())
             .into());
     }
-    let n = one
-        .iter()
-        .filter(|(f, g)| g.is_some() && !with_default.contains(f))
-        .count();
+    let mut n = 0;
+    for (feature, geometry) in &one {
+        check()?;
+        if geometry.is_some() && !with_default.contains(feature) {
+            n += 1;
+        }
+    }
     let tables = budget::table_bytes(one.capacity(), entry)
         + budget::table_bytes(with_default.capacity(), size_of::<u64>());
     held.try_grow(n * size_of::<[u64; 3]>())?;
     let mut out: Vec<[u64; 3]> = Vec::with_capacity(n);
-    out.extend(
-        one.into_iter()
-            .filter(|(f, _)| !with_default.contains(f))
-            .filter_map(|(f, geom)| Some([f, default, geom?])),
-    );
+    for (feature, geometry) in one {
+        check()?;
+        if !with_default.contains(&feature)
+            && let Some(geometry) = geometry
+        {
+            out.push([feature, default, geometry]);
+        }
+    }
     drop(with_default);
     held.shrink(tables);
     out.sort_unstable();
@@ -681,7 +713,16 @@ impl Derivation {
 }
 
 /// The rules of a profile with the axioms of the vocabularies of `extras`.
-fn profile_rules(profile: &Profile, extras: &Extras) -> anyhow::Result<Vec<Rule>> {
+/// The profile or vocabulary each rule of [`profile_rules`] comes from, by its name.
+pub(crate) fn rule_sources(profile: &Profile, extras: &Extras) -> anyhow::Result<Vec<String>> {
+    let mut out = vec![profile.name().to_string(); profile.rules()?.len()];
+    for v in &extras.vocabularies {
+        out.extend(std::iter::repeat_n(v.name().to_string(), v.rules()?.len()));
+    }
+    Ok(out)
+}
+
+pub(crate) fn profile_rules(profile: &Profile, extras: &Extras) -> anyhow::Result<Vec<Rule>> {
     let mut rules = profile
         .rules()
         .with_context(|| format!("parsing rules for profile '{}'", profile.name()))?;
@@ -1083,7 +1124,7 @@ fn store_ids(
                 None => {
                     let id = match terms.local(x) {
                         Some(LocalTerm::Key(k)) => txn.intern_key(&k)?,
-                        Some(LocalTerm::BNode) => txn.new_bnode(),
+                        Some(LocalTerm::BNode | LocalTerm::RuleBNode(_)) => txn.new_bnode(),
                         None => anyhow::bail!("dangling local term id {x:#x}"),
                     };
                     stored.insert(x, id);

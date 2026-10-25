@@ -11,6 +11,7 @@
     how,
     maxId,
     sameRead,
+    readFor,
     MAX_TREES,
     premiseTriples,
     staleNote,
@@ -147,9 +148,14 @@
     expanding = new Set([...expanding, d.id]);
     refError = '';
     try {
-      const r = await explainTriple(ds, d.triple, { maxTrees: 1, signal: c.signal });
+      const expected = explanation ? readFor(d, explanation) : null;
+      const r = await explainTriple(ds, d.triple, {
+        maxTrees: 1,
+        source: expected?.source === 'rdfsOnRead' ? undefined : expected?.source,
+        signal: c.signal,
+      });
       if (gen !== generation) return;
-      if (r.ok && explanation && !sameRead(explanation, r.explanation)) {
+      if (r.ok && expected && !sameRead(expected, r.explanation)) {
         refError = CHANGED;
       } else if (r.ok && r.explanation.trees[0]) {
         const sub = r.explanation.trees[0];
@@ -209,6 +215,21 @@
         </button>
       {/if}
     </div>
+    {#if open && d.bindings && Object.keys(d.bindings).length}
+      <div class="pad small" aria-label="Rule bindings">
+        {#each Object.entries(d.bindings) as [name, term] (name)}
+          <span class="mono">?{name} = </span><TermView {term} {prefixes} {onopen} />{' '}
+        {/each}
+      </div>
+    {/if}
+    {#if open && d.builtins?.length}
+      <ul aria-label="Passed conditions">
+        {#each d.builtins as b}<li class="mono small">{b.call} ✓</li>{/each}
+      </ul>
+    {/if}
+    {#if d.generalized}<p class="pad small faint">
+        Intermediate rule fact. It is not stored as RDF.
+      </p>{/if}
     {#if kids.length && open}
       <ul role="group">
         {#each kids as k, i (k.id + ':' + i)}
@@ -243,6 +264,9 @@
     <p class="msg pad" class:error-box={result.kind === 'error'} role="status">{result.message}</p>
   {:else if tree}
     {#if stale}<p class="stale pad" role="note"><Icon name="alert" size={13} /> {stale}</p>{/if}
+    {#if explanation?.partial}<p class="pad faint" role="note">
+        Partial derivation. {explanation.reason}
+      </p>{/if}
     <ul class="tree" role="tree" aria-label="Derivation">
       {@render node(tree, true)}
     </ul>

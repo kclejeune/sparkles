@@ -15,6 +15,7 @@ mod cursor_regex;
 pub mod depth;
 pub mod describe;
 pub mod enhancer;
+mod eqkey;
 pub mod exec;
 mod exists;
 pub mod expr;
@@ -541,7 +542,7 @@ fn make_ctx(
         .clone()
         .unwrap_or_else(|| crate::outbound::RequestBudget::new(&opts.outbound));
     ctx.rdfs = match &opts.rdfs {
-        Some(r) => Some(r.schema(&ctx.snap)?),
+        Some(r) => Some(r.schema_controlled(&ctx.snap, &mut || ctx.check())?),
         None => None,
     };
     ctx.use_cache = !opts.no_cache;

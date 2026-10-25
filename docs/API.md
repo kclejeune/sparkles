@@ -7738,8 +7738,11 @@ blank node by the label a query result gave it.
 `maxTrees` asks for up to ten derivations whose top rules differ, one by default.
 `maxDepth`, from 1 to 64 and 32 by default, is the depth of the returned trees, and a
 deeper node is cut as a `ref` node that another request on its triple expands. `timeout`
-is in seconds, ten by default, and `--max-timeout` caps it. `mode: "whyNot"` answers `501`,
-and `source` takes only `"materialized"`.
+is in seconds, ten by default, and `--max-timeout` caps it. `source` takes
+`"materialized"` or `"demand"`. Without a source, a fresh readable materialization is
+used and stale or hidden materialized facts are derived from the current visible inputs.
+`profile` selects `rdfs`, `rdfs-simple` or `owl-rl` for a demand explanation, and is
+required when no materialization has recorded a program.
 
 ```json
 {
@@ -7814,8 +7817,32 @@ tree is returned only when all its leaves come from what the caller reads. A tri
 such derivation answers `404` with code `no-visible-derivation`, the same answer as a triple
 that is not entailed. A search that passes its limits before it finds a tree answers `422`
 with code `reasoning-budget`. A derivation through a generalized fact, such as a literal
-subject, is not found, because the inferred graph does not hold such facts, and neither is
-one of `geo:hasDefaultGeometry`, which the run adds outside the rules.
+subject, is recovered from the demand engine, and generalized premises carry
+`generalized: true`. Such a reference can be expanded with a why request containing its
+literal subject or blank-node predicate. Rule-level blank nodes have opaque labels that
+round-trip through subsequent requests. A ref's optional `read` object gives its `commit`,
+`source` and `readAtHead` when it belongs to a materialized subtree. Expansion preserves
+that read, including within a mixed RDFS tree at a later head. Why-not hypotheses remain
+valid RDF.
+The `geo-default-geometry` rule explains a default geometry from the
+feature's single geometry. A derived node includes its variable `bindings` and the
+`builtins` its instance passed. When the search has reached a rule instance before a
+limit stops it, the response carries `partial: true`, the `reason`, and a tree with
+`unexplained` premises.
+
+With `mode: "whyNot"`, an entailed triple returns `entailed: true`. Otherwise the
+answer lists candidate `rules` with head-variable `unifier` values and `hypotheses` of
+missing RDF facts, each with a verified derivation tree. A failed builtin appears in the
+candidate's `blockedBy`, including the blocking fact for `noValue`. Blocker text and
+decoded response terms count against the explanation memory limit. `maxMissing` limits a
+hypothesis to one through four facts, two by default. `maxHypotheses` limits the response
+to one through 100 hypotheses, ten by default. A missing resource is shown as a blank-node
+placeholder, shared across its facts and listed in `placeholders`. These placeholders
+stand for fresh resources when adding the facts. `complete: false` reports a search that
+stopped at its unfolding, candidate, matching or response limits. Hypotheses are verified
+against an uncached overlay of the caller's snapshot and never write to the dataset.
+Rules that create blank nodes and hypotheses that would need a compiler-local blank
+identity make the search incomplete. Such identities cannot be recreated by inserting RDF.
 
 The library call is `Dataset::reasoning().explain`, and the Python and Node.js bindings
 expose it as `ds.reasoning.explain(triple)` with the triple in Turtle. In the CLI,

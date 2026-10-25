@@ -67,6 +67,7 @@
   import { Lenses } from '$lib/lenses.svelte';
   import ValidationOverlay from '$components/ValidationOverlay.svelte';
   import WhyPanel from '$components/WhyPanel.svelte';
+  import WhyNotPanel from '$components/WhyNotPanel.svelte';
   import type { WhyTriple } from '$lib/why';
   import ShapeForm from '$components/ShapeForm.svelte';
   import { getForm } from '$lib/forms-api';
@@ -2858,6 +2859,12 @@
                 {#key n.iri}
                   <GeoMapCard {ds} iri={n.iri} props={detail.props} {prefixes} />
                   <SimilarPanel {ds} iri={n.iri} props={detail.props} {prefixes} />
+                  {#if ds && !timeActive}<WhyNotPanel
+                      {ds}
+                      subject={n.term}
+                      {prefixes}
+                      onopen={(iri) => focusOn(iri)}
+                    />{/if}
                 {/key}
 
                 <h3 class="sub">

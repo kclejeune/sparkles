@@ -86,7 +86,7 @@ class RecordTests(unittest.TestCase):
 
     def test_shape_and_validation(self):
         rec, out = self.record()
-        self.assertEqual(rec["record"], 2)
+        self.assertEqual(rec["record"], 3)
         self.assertEqual({r["engine"] for r in rec["results"]}, {"sparkles", "jena", "oxigraph"})
         r = self.find(rec, "sparkles", "q1")
         self.assertEqual(len(r["samples_ms"]), 5)
@@ -146,7 +146,7 @@ class RecordTests(unittest.TestCase):
         self.assertTrue(all(x["mode"] == "answer" for x in r.values()))
         self.assertEqual(r["sparkles"]["answer"]["hash"], r["oxigraph"]["answer"]["hash"])
         self.assertEqual(r["sparkles"]["status"], "ok")
-        self.assertEqual(r["qlever"]["status"], "wrong-answer")
+        self.assertEqual(r["qlever"]["status"], "answer-disagreement")
         self.assertEqual(r["jena"]["status"], "error")
         self.assertEqual(subprocess.run([sys.executable, RECORD, "validate", out], capture_output=True).returncode, 0)
 
@@ -234,9 +234,9 @@ class RecordTests(unittest.TestCase):
         # one cold run timed out and the other failed otherwise: not all timeouts
         self.assertEqual(self.find(rec, "jena", "slow", "cold")["status"], "error")
 
-    def test_wrong_answer_is_marked(self):
+    def test_majority_disagreement_does_not_claim_an_independent_wrong_answer(self):
         rec, _ = self.record(wrong=True)
-        self.assertEqual(self.find(rec, "oxigraph", "q1")["status"], "wrong-answer")
+        self.assertEqual(self.find(rec, "oxigraph", "q1")["status"], "answer-disagreement")
         self.assertEqual(self.find(rec, "oxigraph", "q1")["answer"]["agrees"], False)
         self.assertEqual(self.find(rec, "sparkles", "q1")["status"], "ok")
 
@@ -439,15 +439,15 @@ class CompareTests(unittest.TestCase):
     def test_unknown_record_versions_are_refused(self):
         a = self.qmph_record("v1", 100.0)
         rec = jload(a)
-        rec["record"] = 3
-        b = os.path.join(self.tmp.name, "v3.json")
+        rec["record"] = 4
+        b = os.path.join(self.tmp.name, "v4.json")
         write_path(b, rec)
         p = self.compare(a, b)
         self.assertEqual(p.returncode, 2, p.stdout + p.stderr)
-        self.assertIn("record version 3", p.stderr)
+        self.assertIn("record version 4", p.stderr)
         v = subprocess.run([sys.executable, RECORD, "validate", b], capture_output=True, text=True)
         self.assertEqual(v.returncode, 1)
-        self.assertIn("record version 3", v.stderr)
+        self.assertIn("record version 4", v.stderr)
         # version 1 is still read
         self.assertEqual(self.compare(a, a).returncode, 0)
 
@@ -735,6 +735,69 @@ class PortTests(unittest.TestCase):
             p = subprocess.run(["bash", "-c", f'source "{lib}"; evict sparkles && echo done'], cwd=d, env=env,
                                capture_output=True, text=True)
         self.assertEqual((p.stdout.strip(), p.stderr), ("done", ""))
+
+
+class OracleRecordTests(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.res = self.tmp.name
+        self.query = "bi-q7-1"
+        self.answers = {self.query: {
+            "sparkles": {"rows": 3, "exact": "three", "value": "three", "query_sha256": "query"},
+            "jena-fuseki": {"rows": 3, "exact": "three", "value": "three", "query_sha256": "query"},
+            "fluree": {"rows": 2, "exact": "two", "value": "two", "query_sha256": "query"}}}
+        self.verdicts = {"version": 1, "source_sha256": "dataset", "queries": {self.query: {
+            engine: {"status": "ok", "policy": "legal-inner-limit-ties", "query_sha256": "query",
+                     "fingerprint": {k: v for k, v in fp.items() if k != "query_sha256"}}
+            for engine, fp in self.answers[self.query].items()}}}
+        self.manifest = os.path.join(self.res, "manifest.json")
+        write(self.res, "manifest.json", {"data": {"input": {"sha256": "dataset"}}})
+
+    def record(self, pool=False):
+        write(self.res, "answers.json", self.answers)
+        write(self.res, "answer-validation.json", self.verdicts)
+        out = os.path.join(self.res, "output.json")
+        options = {"manifest": self.manifest, "queries": self.query}
+        if pool:
+            options["pool-instances"] = True
+        process = build(self.res, out, **options)
+        return process, jload(out) if process.returncode == 0 else None
+
+    def test_verified_valid_ties_override_majority_without_rewriting_fingerprints(self):
+        process, record = self.record(pool=True)
+        self.assertEqual(process.returncode, 0, process.stderr)
+        rows = {r["engine"]: r for r in record["results"]}
+        self.assertTrue(all(r["status"] == "ok" and r["answer"]["agrees"] for r in rows.values()))
+        self.assertEqual(rows["fluree"]["answer"]["rows"], 2)
+        self.assertEqual(rows["sparkles"]["answer"]["rows"], 3)
+        self.assertNotEqual(rows["fluree"]["answer"]["hash"], rows["sparkles"]["answer"]["hash"])
+        self.assertEqual(rows["fluree"]["answer"]["verification"]["method"], "data-oracle")
+
+    def test_an_independent_oracle_failure_is_a_wrong_answer(self):
+        self.verdicts["queries"][self.query]["fluree"]["status"] = "disagrees"
+        process, record = self.record()
+        self.assertEqual(process.returncode, 0, process.stderr)
+        fluree = next(r for r in record["results"] if r["engine"] == "fluree")
+        self.assertEqual(fluree["status"], "wrong-answer")
+
+    def test_verdicts_are_bound_to_input_query_and_every_answer_digest(self):
+        original = copy.deepcopy(self.verdicts)
+        for key, value in [("source_sha256", "another-input"), ("version", 2)]:
+            self.verdicts = copy.deepcopy(original)
+            self.verdicts[key] = value
+            process, _ = self.record()
+            self.assertNotEqual(process.returncode, 0, key)
+        for key in ["query_sha256", "policy"]:
+            self.verdicts = copy.deepcopy(original)
+            self.verdicts["queries"][self.query]["fluree"][key] = "stale"
+            process, _ = self.record()
+            self.assertNotEqual(process.returncode, 0, key)
+        for key in ["rows", "exact", "value", "order"]:
+            self.verdicts = copy.deepcopy(original)
+            self.verdicts["queries"][self.query]["fluree"]["fingerprint"][key] = "stale"
+            process, _ = self.record()
+            self.assertNotEqual(process.returncode, 0, key)
 
 
 if __name__ == "__main__":

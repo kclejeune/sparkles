@@ -162,35 +162,33 @@ impl PyReasoning {
     /// Why the dataset entails a triple, given in Turtle with the dataset's prefixes:
     /// the JSON answer of `POST /$/reason/{ds}/explain`, with `entailed: false` when no
     /// derivation is found.
-    #[pyo3(signature=(triple,*,max_trees=1,max_depth=32,cancel=None,timeout=None))]
+    #[allow(clippy::too_many_arguments)]
+    #[pyo3(signature=(triple,*,mode="why",source=None,profile=None,max_trees=1,max_depth=32,max_missing=2,max_hypotheses=10,cancel=None,timeout=None))]
     fn explain<'py>(
         &self,
         py: Python<'py>,
         triple: String,
+        mode: &str,
+        source: Option<String>,
+        profile: Option<String>,
         max_trees: usize,
         max_depth: u32,
+        max_missing: usize,
+        max_hypotheses: usize,
         cancel: Option<&Bound<'py, PyAny>>,
         timeout: Option<f64>,
     ) -> PyResult<Bound<'py, PyAny>> {
         use sparkles::reasoning::explain as ex;
         let ds = self.ds(py)?;
+        let mode = mode.to_string();
         let r = interrupt::controlled(py, cancel, None, timeout, move |ctl| {
-            if !(1..=ex::MAX_TREES).contains(&max_trees) {
-                return Err(sparkles::Error::invalid(format!(
-                    "max_trees must be from 1 to {}",
-                    ex::MAX_TREES
-                )));
-            }
-            if !(1..=ex::MAX_DEPTH).contains(&max_depth) {
-                return Err(sparkles::Error::invalid(format!(
-                    "max_depth must be from 1 to {}",
-                    ex::MAX_DEPTH
-                )));
-            }
             let prefixes: Vec<(String, String)> = ds.prefixes().into_iter().collect();
-            let mut req = ex::ExplainRequest::new(ex::triple_from_text(&triple, &prefixes)?);
-            req.max_trees = max_trees;
-            req.max_depth = max_depth;
+            let triple = ex::triple_from_text(&triple, &prefixes)?;
+            let term = ex::term_json;
+            let request = serde_json::json!({"triple":{"s":term(&triple[0]),"p":term(&triple[1]),"o":term(&triple[2])},
+                "mode":mode,"source":source,"profile":profile,"maxTrees":max_trees,"maxDepth":max_depth,
+                "maxMissing":max_missing,"maxHypotheses":max_hypotheses});
+            let (mut req, _, _) = ex::request_from_json(&request)?;
             req.timeout = ctl
                 .deadline
                 .map(|d| d.saturating_duration_since(std::time::Instant::now()));

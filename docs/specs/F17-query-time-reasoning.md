@@ -778,3 +778,12 @@ between schema terms does not reach the schema (item 191). Equality is not kept 
 canonical representatives, so an entity with many aliases still costs a fact per alias and
 property in the equality stage. `MAX_SEEDS` and the specialization caps are not tuned by
 measurement. DESCRIBE is refused under `reasoning=demand` (item 193).
+
+
+### Explanation sessions, 2026-10-24
+
+[F18 Phase 1](F18-explanations-and-entailment-diffs.md#outcome) runs demand sessions for a
+single triple and exposes their facts to the well-founded derivation search. These
+sessions keep the original linear-recursive rules and bypass result tables so the
+search can see every intermediate premise. Why-not overlays also bypass the schema table,
+because application rules can derive schema facts from a hypothesis.
