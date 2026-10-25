@@ -301,9 +301,10 @@ Each of these can be switched off per query (`QueryOptions::optimizations`) or p
   prefixes of both inputs, which uses more memory than one hash-build input. It charges
   that storage before allocation and drops obsolete history once an input ends.
 * An eager ASK over a bounded pure UNION compares work before the first answer. An
-  unfiltered scan uses its requested prefix. Filters, sorts and probes retain their
-  full costs, and joins include the input eager execution builds in full. The whole
-  ASK must pass the whitelist before projections pass the limited demand directly
+  unfiltered scan uses its requested prefix. VALUES, filters, sorts and probes retain
+  their full costs, and joins include the input eager execution builds in full.
+  Nested UNION estimates include later operands until they meet the remaining demand.
+  The whole ASK must pass the whitelist before projections pass the limited demand directly
   instead of requesting at least 64 rows. SELECT and effectful consumers retain their
   order and demand policy. Explicit streaming uses its existing operators.
 * A pattern with one free variable and at most four estimated rows is eligible for

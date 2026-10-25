@@ -1288,8 +1288,9 @@ under item 290. The write work retains synchronization before acknowledgement.
 ### Limited pure UNION demand
 
 Eager ASK execution compares work before the first UNION answer. An unfiltered scan
-uses its requested prefix. Filters, sorts and probes keep their full estimates, and
-joins include their eagerly built input. A bounded whitelist of the whole ASK excludes
+uses its requested prefix. VALUES, filters, sorts and probes keep their full estimates,
+and joins include their eagerly built input. Nested UNIONs account for remaining
+demand across their operands. A bounded whitelist of the whole ASK excludes
 callbacks, expression calls, EXISTS, SERVICE and unknown operators. Only that admitted
 consumer enables exact projection demand. Its ordinary minimum request of 64 rows
 could otherwise make a one-row cheap branch continue into an unnecessary wide operand.
@@ -1305,6 +1306,8 @@ duplicate and unbound VALUES, graph scopes, constant bindings, cancellation, dea
 memory and produced-row budgets. A volatile callback branch keeps its original 64
 calls. A nested pure UNION retains its effectful consumer's 127 correlated SERVICE
 evaluations, and explicit streaming still visits the original first operand.
+Competing-operand tests keep a 10,000-row eager VALUES table and a nested false arm
+skipped when the first operand can already answer within a 64-row budget.
 
 ### Short-query checks after keyed inner groups
 

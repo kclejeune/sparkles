@@ -118,7 +118,7 @@ fn first_work(
                 node.cost
             }
         }
-        Kind::Values(_) => node.cost * prefix(node.est),
+        Kind::Values(_) => node.cost,
         Kind::Empty => 0.0,
         Kind::Project(_) => first_work(ctx, &node.children[0], want, remaining)?,
         Kind::Extend(..) => {
@@ -151,9 +151,11 @@ fn first_work(
         }
         Kind::Union => {
             let mut cost = 0.0;
+            let mut need = want as f64;
             for child in &node.children {
-                cost += first_work(ctx, child, want, remaining)?;
-                if child.est > 0.0 {
+                cost += first_work(ctx, child, need.ceil() as usize, remaining)?;
+                need = (need - child.est).max(0.0);
+                if need == 0.0 {
                     break;
                 }
             }
@@ -475,6 +477,93 @@ fn safe_expression(expr: &Expression, moved: &[Variable], bound: &[Variable]) ->
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn an_eager_values_operand_is_not_priced_as_a_single_row() {
+        use crate::io::Source;
+        use crate::sparql::{QueryOptions, query};
+        use crate::store::{Store, StoreOptions};
+        let store = Store::in_memory(StoreOptions::default());
+        let data = (0..64)
+            .map(|i| format!("<urn:s{i}> <urn:first> {i} .\n"))
+            .collect::<String>();
+        store
+            .load(&[Source::from_bytes(
+                data.into_bytes(),
+                oxrdfio::RdfFormat::Turtle,
+                None,
+            )])
+            .unwrap();
+        let values = (0..10_000)
+            .map(|i| i.to_string())
+            .collect::<Vec<_>>()
+            .join(" ");
+        let text = format!(
+            "ASK {{ {{ ?s <urn:first> ?v FILTER(?v != ?s) }} UNION {{ VALUES ?x {{ {values} }} }} }}"
+        );
+        let result = query(
+            store.snapshot(),
+            &text,
+            &QueryOptions {
+                no_cache: true,
+                max_rows: Some(64),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        assert!(result.boolean);
+        let mut todo = vec![&result.plan];
+        while let Some(p) = todo.pop() {
+            if p.operator == "Values" {
+                assert_eq!(
+                    p.actual_rows, -1,
+                    "the eager10,000-row VALUES must stay skipped"
+                );
+            }
+            todo.extend(p.children.iter());
+        }
+    }
+
+    #[test]
+    fn a_nested_union_prices_the_remaining_constant_bind_demand() {
+        use crate::io::Source;
+        use crate::sparql::{QueryOptions, query};
+        use crate::store::{Store, StoreOptions};
+        let store = Store::in_memory(StoreOptions::default());
+        let mut data = String::new();
+        for i in 0..64 {
+            data.push_str(&format!("<urn:s{i}> <urn:first> {i} .\n"));
+        }
+        for i in 0..10_000 {
+            data.push_str(&format!("<urn:f{i}> <urn:false> {i} .\n"));
+        }
+        store
+            .load(&[Source::from_bytes(
+                data.into_bytes(),
+                oxrdfio::RdfFormat::Turtle,
+                None,
+            )])
+            .unwrap();
+        let text = "ASK { { ?s <urn:first> ?v FILTER(?v != ?s) } UNION { { SELECT ?s WHERE { { VALUES ?s { <urn:one> } } UNION { ?s <urn:false> ?v FILTER(?v = ?s) } } } BIND(1 AS ?tag) } }";
+        let result = query(
+            store.snapshot(),
+            text,
+            &QueryOptions {
+                no_cache: true,
+                max_rows: Some(64),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        assert!(result.boolean);
+        let mut todo = vec![&result.plan];
+        while let Some(p) = todo.pop() {
+            if p.operator == "IndexScan" && p.description.contains("urn:false") {
+                assert_eq!(p.actual_rows, -1, "the nested false arm must stay skipped");
+            }
+            todo.extend(p.children.iter());
+        }
+    }
 
     #[test]
     fn a_false_filtered_operand_does_not_precede_an_immediate_wide_answer() {
