@@ -1217,3 +1217,11 @@ errors, unbound values, cancellation, deadlines and resource limits. Singleton t
 cover graph scope, duplicate solutions, RDF term identity, blank nodes, numeric bounds,
 OPTIONAL, subqueries, paths, EXISTS and snapshots with a delta. Published comparison
 refreshes remain under roadmap item 91.
+
+### Short-query checks after keyed inner groups
+
+The Namespace guard against `a5847311` used matching compiler signatures and returned
+the same answers for every query. It passed the regression threshold while accepting
+small increases for `class-predicates`, `exists-join` and `two-hop-count`. These effects
+remain unconfirmed on Intel. Roadmap item 299 tracks matched Intel checks and a fix for
+any confirmed cost. The screen does not establish current parity with other engines.
