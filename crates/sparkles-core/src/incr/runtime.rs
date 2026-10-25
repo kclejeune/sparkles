@@ -1381,11 +1381,17 @@ impl Runtime {
         }
     }
 
-    /// Run an owned dataset close after this thread leaves its runtime operations,
-    /// or immediately when none is active. The action keeps the store owner alive
-    /// while a host callback releases the final handle under metadata locks.
+    /// Coordinate an owned dataset close with this thread's runtime operations.
+    /// Synchronous callbacks retain the owner until their outer operation ends.
+    /// A worker round already defers close and retains its store until cleanup.
     #[doc(hidden)]
     pub fn defer_close(&self, close: impl FnOnce() + 'static) {
+        if self.worker.is_owned_by_current_thread() && self.worker_round.load(Ordering::Acquire) {
+            // Runtime::close defers cleanup until WorkerRound drops. Do not retain
+            // another owner in TLS beyond the worker gate's release.
+            close();
+            return;
+        }
         let mut close: Option<Box<dyn FnOnce()>> = Some(Box::new(close));
         let _ = OPERATIONS.try_with(|s| {
             let mut s = s.borrow_mut();
