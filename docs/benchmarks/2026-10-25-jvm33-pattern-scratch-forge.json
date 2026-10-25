@@ -1,0 +1,3317 @@
+{
+  "provenance": {
+    "base_source": "9fa4dbd257cf7b6e8054066370521d60eb8b2ed7",
+    "candidate_source": "536e462df0d508a6814fc415bf0347412161ce25",
+    "pair_archive_sha256": "2e13f8d73567280ece655a7a9cbbfdbbd4b785a91093e59abfa5a8c510a2dd97",
+    "native_sha256": "032366689fa7c253f5e453537f6597271e87b8c4e8ab8a926ed1b4c175c0f77c",
+    "classpaths": "Both Jena5.6.0/Kotlin2.4.20; baseline706/candidate709 verified manifest entries; benchmark driver and dependencies identical.",
+    "purpose": "Bounded isolated wrapper A/B, no engine or peer claim; exact runtime version must be captured on Forge.",
+    "canonical_harness_sha256": "ee6273f2314efcc7349eba809c9ba7660bd7d4c874f8c073e15da8f327fee073",
+    "routed_harness_sha256": "c84bfe72976f2cdfbd73fccac8feab2e06ba1389785810d53c6c2872d8b81eac",
+    "arm_labels": "base and pool have equal length; canonical per-process tags and timing behavior unchanged",
+    "runtime": "openjdk version \"21.0.12\" 2026-07-21 LTS\nOpenJDK Runtime Environment Temurin-21.0.12+8 (build 21.0.12+8-LTS)\nOpenJDK 64-Bit Server VM Temurin-21.0.12+8 (build 21.0.12+8-LTS, mixed mode, sharing)",
+    "host": "forge",
+    "cpu": "Intel Core i5-13500",
+    "method": "Six fresh timing JVMs per arm in ABBA repeated three times, CPUs0,2,4,6,8,10, six active processors, threads1/4, one-second warmup and two-second measurement per case,4GiB heap,105302 source triples.",
+    "harness_adaptation": "Only Runner.command chooses per-arm classpath and native path. The driver, cases, ordering and answer checks are identical.",
+    "metadata_caveat": "The raw commit string uses BENCH_COMMIT and appends dirty because the copied harness root is not a Git checkout. Source commits and artifact hashes above are authoritative.",
+    "revert": "21e26302",
+    "started_utc": "2026-10-25T14:14:37Z",
+    "finished_utc": "2026-10-25T14:22:11Z",
+    "harness_diff": "--- canonical/jena.py\n+++ pair-routing/jena.py\n@@ -118,12 +118,14 @@\n     def command(self, arm):\n         a = self.args\n         pin = [\"taskset\", \"-c\", a.cpus] if a.cpus else []\n+        pair = ROOT / \"pair\" / {\"base\": \"baseline\", \"pool\": \"candidate\"}[arm[\"label\"]]\n+        classpath = \":\".join(str(pair / p) for p in json.loads((pair / \"classpath.json\").read_text()))\n         jopts = [f\"-Xmx{a.jvm_heap}\", \"-Xss64m\", \"-Dorg.slf4j.simpleLogger.defaultLogLevel=warn\",\n-                 f\"-Dsparkles.native.path={ROOT / 'target' / 'release' / 'libsparkles_ffi.so'}\"]\n+                 f\"-Dsparkles.native.path={pair / 'libsparkles_ffi.so'}\"]\n         if a.cores:\n             jopts.append(f\"-XX:ActiveProcessorCount={a.cores}\")\n         jopts += a.jvm_opts.split() + arm[\"opts\"]\n-        return pin + [self.java, *jopts, \"-cp\", self.classpath, \"io.github.kclejeune.sparkles.jena.bench.JenaUseCases\"]\n+        return pin + [self.java, *jopts, \"-cp\", classpath, \"io.github.kclejeune.sparkles.jena.bench.JenaUseCases\"]\n \n     def launch(self, arm, mode, cfg, label, timeout):\n         cdir, ldir = self.args.workdir / \"configs\", self.args.workdir / \"logs\"\n"
+  },
+  "validation": {
+    "processes": 14,
+    "timing_processes": 12,
+    "read_check_processes": 2,
+    "matching_read_cases": 5,
+    "successful_timing_results": 144,
+    "writes_fingerprinted": false,
+    "raw_sha256": "1175f0f0aa9486492c8d9688aefd1cea267c75d9088fc7769ca639424e0ab902"
+  },
+  "decision": "Reject the generic per-thread pool. The concurrent contains gain does not justify the repeatable single-thread update tail cost and retained scratch for otherwise small median changes.",
+  "comparison": [
+    {
+      "case": "graph-contains",
+      "threads": 1,
+      "base_p50_us": 1.718,
+      "pool_p50_us": 1.7045,
+      "latency_ratio": 0.9921420256111757,
+      "throughput_ratio": 1.0067730794180505,
+      "p99_ratio": 1.033407025300909,
+      "latency_block_ratios": [
+        0.9988415870257745,
+        0.9858135495078172,
+        0.9988276670574444
+      ]
+    },
+    {
+      "case": "graph-contains",
+      "threads": 4,
+      "base_p50_us": 2.2755,
+      "pool_p50_us": 2.011,
+      "latency_ratio": 0.883761810591079,
+      "throughput_ratio": 1.1280250829271596,
+      "p99_ratio": 0.923033389926429,
+      "latency_block_ratios": [
+        0.8903095558546432,
+        0.8769901853871319,
+        0.8826742407690628
+      ]
+    },
+    {
+      "case": "model-getProperty",
+      "threads": 1,
+      "base_p50_us": 2.2984999999999998,
+      "pool_p50_us": 2.3095,
+      "latency_ratio": 1.004785729823798,
+      "throughput_ratio": 0.993917538756961,
+      "p99_ratio": 1.016120268067379,
+      "latency_block_ratios": [
+        1.0006490696668109,
+        1.012921594393342,
+        1.0
+      ]
+    },
+    {
+      "case": "model-getProperty",
+      "threads": 4,
+      "base_p50_us": 3.1900000000000004,
+      "pool_p50_us": 3.2275,
+      "latency_ratio": 1.0117554858934168,
+      "throughput_ratio": 0.9864678876222578,
+      "p99_ratio": 1.008066184074457,
+      "latency_block_ratios": [
+        1.0119647355163728,
+        1.016794851671637,
+        1.0103173362513678
+      ]
+    },
+    {
+      "case": "model-listProperties",
+      "threads": 1,
+      "base_p50_us": 4.957,
+      "pool_p50_us": 4.907,
+      "latency_ratio": 0.9899132539842647,
+      "throughput_ratio": 1.0110528201351212,
+      "p99_ratio": 0.9931034482758622,
+      "latency_block_ratios": [
+        0.985975179093936,
+        0.9986883261023104,
+        1.0027217741935484
+      ]
+    },
+    {
+      "case": "model-listProperties",
+      "threads": 4,
+      "base_p50_us": 5.634,
+      "pool_p50_us": 5.638,
+      "latency_ratio": 1.0007099751508697,
+      "throughput_ratio": 0.9998830803972412,
+      "p99_ratio": 0.9921264802217182,
+      "latency_block_ratios": [
+        0.9920007110479069,
+        1.011305423070129,
+        1.0056657223796035
+      ]
+    },
+    {
+      "case": "sparql-select-o",
+      "threads": 1,
+      "base_p50_us": 28.5515,
+      "pool_p50_us": 28.5805,
+      "latency_ratio": 1.0010157084566484,
+      "throughput_ratio": 0.9992378653619349,
+      "p99_ratio": 0.9930506011362136,
+      "latency_block_ratios": [
+        1.0006136582800036,
+        1.0077507200837916,
+        1.0014353983230346
+      ]
+    },
+    {
+      "case": "sparql-select-o",
+      "threads": 4,
+      "base_p50_us": 67.8055,
+      "pool_p50_us": 67.8255,
+      "latency_ratio": 1.0002949613231966,
+      "throughput_ratio": 0.9939849025216334,
+      "p99_ratio": 1.0067930144981059,
+      "latency_block_ratios": [
+        0.9837219309057229,
+        1.0279434686169895,
+        1.021051698539677
+      ]
+    },
+    {
+      "case": "model-iterate-all",
+      "threads": 1,
+      "base_p50_us": 15952.488000000001,
+      "pool_p50_us": 15854.104500000001,
+      "latency_ratio": 0.99383271750463,
+      "throughput_ratio": 1.0080815993766483,
+      "p99_ratio": 0.9709359606447792,
+      "latency_block_ratios": [
+        0.9927303304533794,
+        1.0026438732701006,
+        0.9942422107632953
+      ]
+    },
+    {
+      "case": "model-iterate-all",
+      "threads": 4,
+      "base_p50_us": 17761.033499999998,
+      "pool_p50_us": 17653.908499999998,
+      "latency_ratio": 0.9939685379232014,
+      "throughput_ratio": 1.005731590112752,
+      "p99_ratio": 0.9786236638894269,
+      "latency_block_ratios": [
+        0.9943459452605007,
+        1.0003033931838154,
+        0.9914290652448924
+      ]
+    },
+    {
+      "case": "update-modify",
+      "threads": 1,
+      "base_p50_us": 212.245,
+      "pool_p50_us": 211.51749999999998,
+      "latency_ratio": 0.9965723574171358,
+      "throughput_ratio": 0.984726603042791,
+      "p99_ratio": 1.280943626621469,
+      "latency_block_ratios": [
+        0.9922988881621975,
+        0.9791311372408222,
+        1.0142851320020043
+      ]
+    },
+    {
+      "case": "update-modify",
+      "threads": 4,
+      "base_p50_us": 2838.6440000000002,
+      "pool_p50_us": 2820.2645,
+      "latency_ratio": 0.9935252536070039,
+      "throughput_ratio": 1.0197854704298435,
+      "p99_ratio": 0.9804741431578611,
+      "latency_block_ratios": [
+        0.9592039594603222,
+        0.9899545453664245,
+        0.9944654345960673
+      ]
+    }
+  ],
+  "raw": {
+    "meta": {
+      "date": "2026-10-25T10:22:11",
+      "commit": "jvm33-matched-9fa-vs536-dirty",
+      "host": "forge",
+      "cpu": "13th Gen Intel(R) Core(TM) i5-13500 (20 logical CPUs)",
+      "loadavg": [
+        "2.56",
+        "2.02",
+        "1.03"
+      ],
+      "triples": 105302,
+      "small_triples": 10459,
+      "args": {
+        "people": 10000,
+        "small_people": 1000,
+        "workdir": "/home/kclejeune/lanes/jvm33-scratch-536e462d/target/benchmark",
+        "arm": [
+          "base=sparkles-mem",
+          "pool=sparkles-mem"
+        ],
+        "cases": "graph-contains,model-getProperty,model-listProperties,sparql-select-o,model-iterate-all,update-modify",
+        "skip": "",
+        "threads": "1,4",
+        "seconds": 2.0,
+        "warmup_seconds": 1.0,
+        "rounds": 6,
+        "check_ops": 64,
+        "no_check": false,
+        "cpus": "0,2,4,6,8,10",
+        "cores": 6,
+        "no_build": true,
+        "jvm_heap": "4g",
+        "jvm_opts": "",
+        "case_list": [
+          "graph-contains",
+          "model-getProperty",
+          "model-listProperties",
+          "sparql-select-o",
+          "model-iterate-all",
+          "update-modify"
+        ]
+      }
+    },
+    "arms": [
+      {
+        "label": "base",
+        "engine": "sparkles-mem",
+        "opts": []
+      },
+      {
+        "label": "pool",
+        "engine": "sparkles-mem",
+        "opts": []
+      }
+    ],
+    "checks": {
+      "graph-contains": {
+        "fingerprints": {
+          "base": "2d683d6cc92c76a0",
+          "pool": "2d683d6cc92c76a0"
+        },
+        "differs": []
+      },
+      "model-getProperty": {
+        "fingerprints": {
+          "base": "b3560fb63262c6c4",
+          "pool": "b3560fb63262c6c4"
+        },
+        "differs": []
+      },
+      "model-listProperties": {
+        "fingerprints": {
+          "base": "414ec97254f5a85d",
+          "pool": "414ec97254f5a85d"
+        },
+        "differs": []
+      },
+      "sparql-select-o": {
+        "fingerprints": {
+          "base": "b3560fb63262c6c4",
+          "pool": "b3560fb63262c6c4"
+        },
+        "differs": []
+      },
+      "model-iterate-all": {
+        "fingerprints": {
+          "base": "c8dd7d2f97ceca40",
+          "pool": "c8dd7d2f97ceca40"
+        },
+        "differs": []
+      }
+    },
+    "results": [
+      {
+        "arm": "base",
+        "case": "graph-contains",
+        "threads": 1,
+        "p50": 1.718,
+        "ops": 582782.0859614252,
+        "p99": 2.0355
+      },
+      {
+        "arm": "base",
+        "case": "graph-contains",
+        "threads": 4,
+        "p50": 2.2755,
+        "ops": 1680109.590614482,
+        "p99": 3.534
+      },
+      {
+        "arm": "base",
+        "case": "model-getProperty",
+        "threads": 1,
+        "p50": 2.2984999999999998,
+        "ops": 424816.1862421477,
+        "p99": 2.7605
+      },
+      {
+        "arm": "base",
+        "case": "model-getProperty",
+        "threads": 4,
+        "p50": 3.1900000000000004,
+        "ops": 1185769.0926784766,
+        "p99": 4.835
+      },
+      {
+        "arm": "base",
+        "case": "model-iterate-all",
+        "threads": 1,
+        "p50": 15952.488000000001,
+        "ops": 61.994190330248294,
+        "p99": 18365.237999999998
+      },
+      {
+        "arm": "base",
+        "case": "model-iterate-all",
+        "threads": 4,
+        "p50": 17761.033499999998,
+        "ops": 218.94627510264115,
+        "p99": 23027.66
+      },
+      {
+        "arm": "base",
+        "case": "model-listProperties",
+        "threads": 1,
+        "p50": 4.957,
+        "ops": 198851.50501786693,
+        "p99": 6.234999999999999
+      },
+      {
+        "arm": "base",
+        "case": "model-listProperties",
+        "threads": 4,
+        "p50": 5.634,
+        "ops": 687066.1481368681,
+        "p99": 7.938000000000001
+      },
+      {
+        "arm": "base",
+        "case": "sparql-select-o",
+        "threads": 1,
+        "p50": 28.5515,
+        "ops": 33569.7187567177,
+        "p99": 37.845
+      },
+      {
+        "arm": "base",
+        "case": "sparql-select-o",
+        "threads": 4,
+        "p50": 67.8055,
+        "ops": 59004.26907001977,
+        "p99": 89.3565
+      },
+      {
+        "arm": "base",
+        "case": "update-modify",
+        "threads": 1,
+        "p50": 212.245,
+        "ops": 4501.547704648387,
+        "p99": 369.341
+      },
+      {
+        "arm": "base",
+        "case": "update-modify",
+        "threads": 4,
+        "p50": 2838.6440000000002,
+        "ops": 1452.9377618253607,
+        "p99": 3442.9475
+      },
+      {
+        "arm": "pool",
+        "case": "graph-contains",
+        "threads": 1,
+        "p50": 1.7045,
+        "ops": 586729.3153130591,
+        "p99": 2.1035000000000004
+      },
+      {
+        "arm": "pool",
+        "case": "graph-contains",
+        "threads": 4,
+        "p50": 2.011,
+        "ops": 1895205.7602796173,
+        "p99": 3.262
+      },
+      {
+        "arm": "pool",
+        "case": "model-getProperty",
+        "threads": 1,
+        "p50": 2.3095,
+        "ops": 422232.2582539142,
+        "p99": 2.8049999999999997
+      },
+      {
+        "arm": "pool",
+        "case": "model-getProperty",
+        "threads": 4,
+        "p50": 3.2275,
+        "ops": 1169723.132062298,
+        "p99": 4.874
+      },
+      {
+        "arm": "pool",
+        "case": "model-iterate-all",
+        "threads": 1,
+        "p50": 15854.104500000001,
+        "ops": 62.49520254017705,
+        "p99": 17831.47
+      },
+      {
+        "arm": "pool",
+        "case": "model-iterate-all",
+        "threads": 4,
+        "p50": 17653.908499999998,
+        "ops": 220.20118540824333,
+        "p99": 22535.413
+      },
+      {
+        "arm": "pool",
+        "case": "model-listProperties",
+        "threads": 1,
+        "p50": 4.907,
+        "ops": 201049.37493642757,
+        "p99": 6.192
+      },
+      {
+        "arm": "pool",
+        "case": "model-listProperties",
+        "threads": 4,
+        "p50": 5.638,
+        "ops": 686985.816635759,
+        "p99": 7.8755
+      },
+      {
+        "arm": "pool",
+        "case": "sparql-select-o",
+        "threads": 1,
+        "p50": 28.5805,
+        "ops": 33544.134111263105,
+        "p99": 37.582
+      },
+      {
+        "arm": "pool",
+        "case": "sparql-select-o",
+        "threads": 4,
+        "p50": 67.8255,
+        "ops": 58649.35263992383,
+        "p99": 89.9635
+      },
+      {
+        "arm": "pool",
+        "case": "update-modify",
+        "threads": 1,
+        "p50": 211.51749999999998,
+        "ops": 4432.793779633479,
+        "p99": 473.105
+      },
+      {
+        "arm": "pool",
+        "case": "update-modify",
+        "threads": 4,
+        "p50": 2820.2645,
+        "ops": 1481.6848189483592,
+        "p99": 3375.721
+      }
+    ],
+    "processes": [
+      {
+        "arm": "base",
+        "engine": "sparkles-mem",
+        "opts": [],
+        "mode": "check",
+        "label": "base-check",
+        "exit": 0,
+        "killed": false,
+        "wall_s": 2.6453014349972364,
+        "events": [
+          {
+            "event": "versions",
+            "versions": {
+              "java": "21.0.12+8-LTS",
+              "jena": "5.6.0",
+              "processors": 6,
+              "max_heap_mib": 4096
+            }
+          },
+          {
+            "event": "ready",
+            "ms": 458.651479,
+            "triples": 105300
+          },
+          {
+            "event": "start",
+            "case": "graph-contains"
+          },
+          {
+            "event": "check",
+            "case": "graph-contains",
+            "fingerprint": "2d683d6cc92c76a0",
+            "status": "ok"
+          },
+          {
+            "event": "start",
+            "case": "model-getProperty"
+          },
+          {
+            "event": "check",
+            "case": "model-getProperty",
+            "fingerprint": "b3560fb63262c6c4",
+            "status": "ok"
+          },
+          {
+            "event": "start",
+            "case": "model-listProperties"
+          },
+          {
+            "event": "check",
+            "case": "model-listProperties",
+            "fingerprint": "414ec97254f5a85d",
+            "status": "ok"
+          },
+          {
+            "event": "start",
+            "case": "sparql-select-o"
+          },
+          {
+            "event": "check",
+            "case": "sparql-select-o",
+            "fingerprint": "b3560fb63262c6c4",
+            "status": "ok"
+          },
+          {
+            "event": "start",
+            "case": "model-iterate-all"
+          },
+          {
+            "event": "check",
+            "case": "model-iterate-all",
+            "fingerprint": "c8dd7d2f97ceca40",
+            "status": "ok"
+          },
+          {
+            "event": "done",
+            "sink": 0
+          }
+        ]
+      },
+      {
+        "arm": "pool",
+        "engine": "sparkles-mem",
+        "opts": [],
+        "mode": "check",
+        "label": "pool-check",
+        "exit": 0,
+        "killed": false,
+        "wall_s": 2.571686477000185,
+        "events": [
+          {
+            "event": "versions",
+            "versions": {
+              "java": "21.0.12+8-LTS",
+              "jena": "5.6.0",
+              "processors": 6,
+              "max_heap_mib": 4096
+            }
+          },
+          {
+            "event": "ready",
+            "ms": 427.892766,
+            "triples": 105300
+          },
+          {
+            "event": "start",
+            "case": "graph-contains"
+          },
+          {
+            "event": "check",
+            "case": "graph-contains",
+            "fingerprint": "2d683d6cc92c76a0",
+            "status": "ok"
+          },
+          {
+            "event": "start",
+            "case": "model-getProperty"
+          },
+          {
+            "event": "check",
+            "case": "model-getProperty",
+            "fingerprint": "b3560fb63262c6c4",
+            "status": "ok"
+          },
+          {
+            "event": "start",
+            "case": "model-listProperties"
+          },
+          {
+            "event": "check",
+            "case": "model-listProperties",
+            "fingerprint": "414ec97254f5a85d",
+            "status": "ok"
+          },
+          {
+            "event": "start",
+            "case": "sparql-select-o"
+          },
+          {
+            "event": "check",
+            "case": "sparql-select-o",
+            "fingerprint": "b3560fb63262c6c4",
+            "status": "ok"
+          },
+          {
+            "event": "start",
+            "case": "model-iterate-all"
+          },
+          {
+            "event": "check",
+            "case": "model-iterate-all",
+            "fingerprint": "c8dd7d2f97ceca40",
+            "status": "ok"
+          },
+          {
+            "event": "done",
+            "sink": 0
+          }
+        ]
+      },
+      {
+        "arm": "base",
+        "engine": "sparkles-mem",
+        "opts": [],
+        "mode": "time",
+        "label": "base-r0",
+        "exit": 0,
+        "killed": false,
+        "wall_s": 37.26068546600436,
+        "events": [
+          {
+            "event": "versions",
+            "versions": {
+              "java": "21.0.12+8-LTS",
+              "jena": "5.6.0",
+              "processors": 6,
+              "max_heap_mib": 4096
+            }
+          },
+          {
+            "event": "ready",
+            "ms": 440.739761,
+            "triples": 105300
+          },
+          {
+            "event": "start",
+            "case": "graph-contains@1"
+          },
+          {
+            "event": "case",
+            "case": "graph-contains",
+            "threads": 1,
+            "ops": 1171133,
+            "seconds": 2.000151376,
+            "ops_per_s": 585522.1829970133,
+            "p50_us": 1.716,
+            "p99_us": 2.035,
+            "mean_us": 1.6773958679330188,
+            "status": "ok"
+          },
+          {
+            "event": "start",
+            "case": "graph-contains@4"
+          },
+          {
+            "event": "case",
+            "case": "graph-contains",
+            "threads": 4,
+            "ops": 3450775,
+            "seconds": 2.00014848,
+            "ops_per_s": 1725259.416740901,
+            "p50_us": 2.209,
+            "p99_us": 3.399,
+            "mean_us": 2.265261223638168,
+            "status": "ok"
+          },
+          {
+            "event": "start",
+            "case": "model-getProperty@1"
+          },
+          {
+            "event": "case",
+            "case": "model-getProperty",
+            "threads": 1,
+            "ops": 850616,
+            "seconds": 2.000142953,
+            "ops_per_s": 425277.6026454345,
+            "p50_us": 2.295,
+            "p99_us": 2.775,
+            "mean_us": 2.323580520469871,
+            "status": "ok"
+          },
+          {
+            "event": "start",
+            "case": "model-getProperty@4"
+          },
+          {
+            "event": "case",
+            "case": "model-getProperty",
+            "threads": 4,
+            "ops": 2399055,
+            "seconds": 2.000158073,
+            "ops_per_s": 1199432.7010373243,
+            "p50_us": 3.145,
+            "p99_us": 4.745,
+            "mean_us": 3.2856335223660986,
+            "status": "ok"
+          },
+          {
+            "event": "start",
+            "case": "model-listProperties@1"
+          },
+          {
+            "event": "case",
+            "case": "model-listProperties",
+            "threads": 1,
+            "ops": 399989,
+            "seconds": 2.000148264,
+            "ops_per_s": 199979.675106725,
+            "p50_us": 4.934,
+            "p99_us": 6.157,
+            "mean_us": 4.970722359864896,
+            "status": "ok"
+          },
+          {
+            "event": "start",
+            "case": "model-listProperties@4"
+          },
+          {
+            "event": "case",
+            "case": "model-listProperties",
+            "threads": 4,
+            "ops": 1376264,
+            "seconds": 2.000150623,
+            "ops_per_s": 688080.1796495502,
+            "p50_us": 5.62,
+            "p99_us": 7.908,
+            "mean_us": 5.755122259246773,
+            "status": "ok"
+          },
+          {
+            "event": "start",
+            "case": "sparql-select-o@1"
+          },
+          {
+            "event": "case",
+            "case": "sparql-select-o",
+            "threads": 1,
+            "ops": 67021,
+            "seconds": 2.000148618,
+            "ops_per_s": 33508.01005328095,
+            "p50_us": 28.567,
+            "p99_us": 36.907,
+            "mean_us": 29.806699213679295,
+            "status": "ok"
+          },
+          {
+            "event": "start",
+            "case": "sparql-select-o@4"
+          },
+          {
+            "event": "case",
+            "case": "sparql-select-o",
+            "threads": 4,
+            "ops": 116901,
+            "seconds": 2.000151411,
+            "ops_per_s": 58446.07531064557,
+            "p50_us": 68.416,
+            "p99_us": 90.309,
+            "mean_us": 68.37870299655263,
+            "status": "ok"
+          },
+          {
+            "event": "start",
+            "case": "model-iterate-all@1"
+          },
+          {
+            "event": "case",
+            "case": "model-iterate-all",
+            "threads": 1,
+            "ops": 124,
+            "seconds": 2.000225787,
+            "ops_per_s": 61.993001393097224,
+            "p50_us": 15981.388,
+            "p99_us": 18269.323,
+            "mean_us": 16152.493983870967,
+            "status": "ok"
+          },
+          {
+            "event": "start",
+            "case": "model-iterate-all@4"
+          },
+          {
+            "event": "case",
+            "case": "model-iterate-all",
+            "threads": 4,
+            "ops": 434,
+            "seconds": 2.000171958,
+            "ops_per_s": 216.98134416101036,
+            "p50_us": 17803.765,
+            "p99_us": 23442.614,
+            "mean_us": 18434.095695852535,
+            "status": "ok"
+          },
+          {
+            "event": "start",
+            "case": "update-modify@1"
+          },
+          {
+            "event": "case",
+            "case": "update-modify",
+            "threads": 1,
+            "ops": 8821,
+            "seconds": 2.000082725,
+            "ops_per_s": 4410.31757823917,
+            "p50_us": 215.069,
+            "p99_us": 371.383,
+            "mean_us": 226.67409556739597,
+            "status": "ok"
+          },
+          {
+            "event": "start",
+            "case": "update-modify@4"
+          },
+          {
+            "event": "case",
+            "case": "update-modify",
+            "threads": 4,
+            "ops": 2580,
+            "seconds": 2.000088073,
+            "ops_per_s": 1289.943195416475,
+            "p50_us": 3188.082,
+            "p99_us": 3779.887,
+            "mean_us": 3100.8580779069766,
+            "status": "ok"
+          },
+          {
+            "event": "done",
+            "sink": 8424252625
+          }
+        ]
+      },
+      {
+        "arm": "pool",
+        "engine": "sparkles-mem",
+        "opts": [],
+        "mode": "time",
+        "label": "pool-r0",
+        "exit": 0,
+        "killed": false,
+        "wall_s": 37.292846219999774,
+        "events": [
+          {
+            "event": "versions",
+            "versions": {
+              "java": "21.0.12+8-LTS",
+              "jena": "5.6.0",
+              "processors": 6,
+              "max_heap_mib": 4096
+            }
+          },
+          {
+            "event": "ready",
+            "ms": 447.722637,
+            "triples": 105300
+          },
+          {
+            "event": "start",
+            "case": "graph-contains@1"
+          },
+          {
+            "event": "case",
+            "case": "graph-contains",
+            "threads": 1,
+            "ops": 1159359,
+            "seconds": 2.000156461,
+            "ops_per_s": 579634.1549302427,
+            "p50_us": 1.741,
+            "p99_us": 2.213,
+            "mean_us": 1.6940447221266235,
+            "status": "ok"
+          },
+          {
+            "event": "start",
+            "case": "graph-contains@4"
+          },
+          {
+            "event": "case",
+            "case": "graph-contains",
+            "threads": 4,
+            "ops": 3807503,
+            "seconds": 2.000146907,
+            "ops_per_s": 1903611.673059973,
+            "p50_us": 2.005,
+            "p99_us": 3.239,
+            "mean_us": 2.0498009601042995,
+            "status": "ok"
+          },
+          {
+            "event": "start",
+            "case": "model-getProperty@1"
+          },
+          {
+            "event": "case",
+            "case": "model-getProperty",
+            "threads": 1,
+            "ops": 841376,
+            "seconds": 2.000151496,
+            "ops_per_s": 420656.1361389998,
+            "p50_us": 2.318,
+            "p99_us": 2.813,
+            "mean_us": 2.3488653194291254,
+            "status": "ok"
+          },
+          {
+            "event": "start",
+            "case": "model-getProperty@4"
+          },
+          {
+            "event": "case",
+            "case": "model-getProperty",
+            "threads": 4,
+            "ops": 2340989,
+            "seconds": 2.000148285,
+            "ops_per_s": 1170407.7230453943,
+            "p50_us": 3.226,
+            "p99_us": 4.882,
+            "mean_us": 3.3601912648884724,
+            "status": "ok"
+          },
+          {
+            "event": "start",
+            "case": "model-listProperties@1"
+          },
+          {
+            "event": "case",
+            "case": "model-listProperties",
+            "threads": 1,
+            "ops": 403109,
+            "seconds": 2.000158518,
+            "ops_per_s": 201538.52625794732,
+            "p50_us": 4.894,
+            "p99_us": 6.133,
+            "mean_us": 4.931946406555051,
+            "status": "ok"
+          },
+          {
+            "event": "start",
+            "case": "model-listProperties@4"
+          },
+          {
+            "event": "case",
+            "case": "model-listProperties",
+            "threads": 4,
+            "ops": 1384772,
+            "seconds": 2.000084218,
+            "ops_per_s": 692356.8455455909,
+            "p50_us": 5.599,
+            "p99_us": 7.903,
+            "mean_us": 5.728861504276516,
+            "status": "ok"
+          },
+          {
+            "event": "start",
+            "case": "sparql-select-o@1"
+          },
+          {
+            "event": "case",
+            "case": "sparql-select-o",
+            "threads": 1,
+            "ops": 67414,
+            "seconds": 2.000147976,
+            "ops_per_s": 33704.50627099002,
+            "p50_us": 28.528,
+            "p99_us": 36.34,
+            "mean_us": 29.635051858664372,
+            "status": "ok"
+          },
+          {
+            "event": "start",
+            "case": "sparql-select-o@4"
+          },
+          {
+            "event": "case",
+            "case": "sparql-select-o",
+            "threads": 4,
+            "ops": 119761,
+            "seconds": 2.000142535,
+            "ops_per_s": 59876.23277058102,
+            "p50_us": 66.807,
+            "p99_us": 87.742,
+            "mean_us": 66.72830641861708,
+            "status": "ok"
+          },
+          {
+            "event": "start",
+            "case": "model-iterate-all@1"
+          },
+          {
+            "event": "case",
+            "case": "model-iterate-all",
+            "threads": 1,
+            "ops": 126,
+            "seconds": 2.000158679,
+            "ops_per_s": 62.99500200803818,
+            "p50_us": 15765.578,
+            "p99_us": 17678.404,
+            "mean_us": 15892.690825396825,
+            "status": "ok"
+          },
+          {
+            "event": "start",
+            "case": "model-iterate-all@4"
+          },
+          {
+            "event": "case",
+            "case": "model-iterate-all",
+            "threads": 4,
+            "ops": 428,
+            "seconds": 2.000179292,
+            "ops_per_s": 213.9808174756366,
+            "p50_us": 17677.732,
+            "p99_us": 28645.508,
+            "mean_us": 18686.552011682244,
+            "status": "ok"
+          },
+          {
+            "event": "start",
+            "case": "update-modify@1"
+          },
+          {
+            "event": "case",
+            "case": "update-modify",
+            "threads": 1,
+            "ops": 8793,
+            "seconds": 2.000068173,
+            "ops_per_s": 4396.350143810823,
+            "p50_us": 213.223,
+            "p99_us": 455.464,
+            "mean_us": 227.43329307403616,
+            "status": "ok"
+          },
+          {
+            "event": "start",
+            "case": "update-modify@4"
+          },
+          {
+            "event": "case",
+            "case": "update-modify",
+            "threads": 4,
+            "ops": 3263,
+            "seconds": 2.000065889,
+            "ops_per_s": 1631.446252818924,
+            "p50_us": 2921.811,
+            "p99_us": 3663.492,
+            "mean_us": 2451.6437922157525,
+            "status": "ok"
+          },
+          {
+            "event": "done",
+            "sink": 8419943351
+          }
+        ]
+      },
+      {
+        "arm": "pool",
+        "engine": "sparkles-mem",
+        "opts": [],
+        "mode": "time",
+        "label": "pool-r1",
+        "exit": 0,
+        "killed": false,
+        "wall_s": 37.28831604900188,
+        "events": [
+          {
+            "event": "versions",
+            "versions": {
+              "java": "21.0.12+8-LTS",
+              "jena": "5.6.0",
+              "processors": 6,
+              "max_heap_mib": 4096
+            }
+          },
+          {
+            "event": "ready",
+            "ms": 447.353952,
+            "triples": 105300
+          },
+          {
+            "event": "start",
+            "case": "graph-contains@1"
+          },
+          {
+            "event": "case",
+            "case": "graph-contains",
+            "threads": 1,
+            "ops": 1171937,
+            "seconds": 2.000153853,
+            "ops_per_s": 585923.4269614959,
+            "p50_us": 1.708,
+            "p99_us": 2.108,
+            "mean_us": 1.6739013829241676,
+            "status": "ok"
+          },
+          {
+            "event": "start",
+            "case": "graph-contains@4"
+          },
+          {
+            "event": "case",
+            "case": "graph-contains",
+            "threads": 4,
+            "ops": 3879175,
+            "seconds": 2.000164121,
+            "ops_per_s": 1939428.3495399226,
+            "p50_us": 1.964,
+            "p99_us": 3.178,
+            "mean_us": 2.004725528495105,
+            "status": "ok"
+          },
+          {
+            "event": "start",
+            "case": "model-getProperty@1"
+          },
+          {
+            "event": "case",
+            "case": "model-getProperty",
+            "threads": 1,
+            "ops": 844825,
+            "seconds": 2.000165709,
+            "ops_per_s": 422377.50412308465,
+            "p50_us": 2.307,
+            "p99_us": 2.8,
+            "mean_us": 2.3381303121948336,
+            "status": "ok"
+          },
+          {
+            "event": "start",
+            "case": "model-getProperty@4"
+          },
+          {
+            "event": "case",
+            "case": "model-getProperty",
+            "threads": 4,
+            "ops": 2360742,
+            "seconds": 2.000149076,
+            "ops_per_s": 1180283.0240639523,
+            "p50_us": 3.202,
+            "p99_us": 4.804,
+            "mean_us": 3.3338264617649878,
+            "status": "ok"
+          },
+          {
+            "event": "start",
+            "case": "model-listProperties@1"
+          },
+          {
+            "event": "case",
+            "case": "model-listProperties",
+            "threads": 1,
+            "ops": 403832,
+            "seconds": 2.000158114,
+            "ops_per_s": 201900.0383886651,
+            "p50_us": 4.878,
+            "p99_us": 6.169,
+            "mean_us": 4.923030361635531,
+            "status": "ok"
+          },
+          {
+            "event": "start",
+            "case": "model-listProperties@4"
+          },
+          {
+            "event": "case",
+            "case": "model-listProperties",
+            "threads": 4,
+            "ops": 1396957,
+            "seconds": 2.000085342,
+            "ops_per_s": 698448.6964956718,
+            "p50_us": 5.562,
+            "p99_us": 7.834,
+            "mean_us": 5.692300359996764,
+            "status": "ok"
+          },
+          {
+            "event": "start",
+            "case": "sparql-select-o@1"
+          },
+          {
+            "event": "case",
+            "case": "sparql-select-o",
+            "threads": 1,
+            "ops": 66944,
+            "seconds": 2.000155725,
+            "ops_per_s": 33469.393989310505,
+            "p50_us": 28.542,
+            "p99_us": 42.824,
+            "mean_us": 29.838742904517208,
+            "status": "ok"
+          },
+          {
+            "event": "start",
+            "case": "sparql-select-o@4"
+          },
+          {
+            "event": "case",
+            "case": "sparql-select-o",
+            "threads": 4,
+            "ops": 116539,
+            "seconds": 2.000150606,
+            "ops_per_s": 58265.112462236255,
+            "p50_us": 68.078,
+            "p99_us": 90.333,
+            "mean_us": 68.60194846360446,
+            "status": "ok"
+          },
+          {
+            "event": "start",
+            "case": "model-iterate-all@1"
+          },
+          {
+            "event": "case",
+            "case": "model-iterate-all",
+            "threads": 1,
+            "ops": 125,
+            "seconds": 2.000152295,
+            "ops_per_s": 62.495241143625016,
+            "p50_us": 15827.077,
+            "p99_us": 18068.638,
+            "mean_us": 15984.195624,
+            "status": "ok"
+          },
+          {
+            "event": "start",
+            "case": "model-iterate-all@4"
+          },
+          {
+            "event": "case",
+            "case": "model-iterate-all",
+            "threads": 4,
+            "ops": 440,
+            "seconds": 2.000164909,
+            "ops_per_s": 219.98186150560048,
+            "p50_us": 17624.197,
+            "p99_us": 23336.534,
+            "mean_us": 18177.13057727273,
+            "status": "ok"
+          },
+          {
+            "event": "start",
+            "case": "update-modify@1"
+          },
+          {
+            "event": "case",
+            "case": "update-modify",
+            "threads": 1,
+            "ops": 9038,
+            "seconds": 2.000093966,
+            "ops_per_s": 4518.787693797782,
+            "p50_us": 211.6,
+            "p99_us": 377.545,
+            "mean_us": 221.23204304049568,
+            "status": "ok"
+          },
+          {
+            "event": "start",
+            "case": "update-modify@4"
+          },
+          {
+            "event": "case",
+            "case": "update-modify",
+            "threads": 4,
+            "ops": 2840,
+            "seconds": 2.000087755,
+            "ops_per_s": 1419.9376966837137,
+            "p50_us": 2997.381,
+            "p99_us": 3595.768,
+            "mean_us": 2816.9891345070423,
+            "status": "ok"
+          },
+          {
+            "event": "done",
+            "sink": 8526414959
+          }
+        ]
+      },
+      {
+        "arm": "base",
+        "engine": "sparkles-mem",
+        "opts": [],
+        "mode": "time",
+        "label": "base-r1",
+        "exit": 0,
+        "killed": false,
+        "wall_s": 37.22961788599787,
+        "events": [
+          {
+            "event": "versions",
+            "versions": {
+              "java": "21.0.12+8-LTS",
+              "jena": "5.6.0",
+              "processors": 6,
+              "max_heap_mib": 4096
+            }
+          },
+          {
+            "event": "ready",
+            "ms": 430.9074,
+            "triples": 105300
+          },
+          {
+            "event": "start",
+            "case": "graph-contains@1"
+          },
+          {
+            "event": "case",
+            "case": "graph-contains",
+            "threads": 1,
+            "ops": 1163091,
+            "seconds": 2.000158332,
+            "ops_per_s": 581499.4650133528,
+            "p50_us": 1.737,
+            "p99_us": 2.045,
+            "mean_us": 1.6878794066844298,
+            "status": "ok"
+          },
+          {
+            "event": "start",
+            "case": "graph-contains@4"
+          },
+          {
+            "event": "case",
+            "case": "graph-contains",
+            "threads": 4,
+            "ops": 3426264,
+            "seconds": 2.000090703,
+            "ops_per_s": 1713054.310417441,
+            "p50_us": 2.249,
+            "p99_us": 3.409,
+            "mean_us": 2.279390817228328,
+            "status": "ok"
+          },
+          {
+            "event": "start",
+            "case": "model-getProperty@1"
+          },
+          {
+            "event": "case",
+            "case": "model-getProperty",
+            "threads": 1,
+            "ops": 839486,
+            "seconds": 2.000152944,
+            "ops_per_s": 419710.90386775945,
+            "p50_us": 2.327,
+            "p99_us": 2.793,
+            "mean_us": 2.354711779588939,
+            "status": "ok"
+          },
+          {
+            "event": "start",
+            "case": "model-getProperty@4"
+          },
+          {
+            "event": "case",
+            "case": "model-getProperty",
+            "threads": 4,
+            "ops": 2366835,
+            "seconds": 2.00014868,
+            "ops_per_s": 1183329.5312826445,
+            "p50_us": 3.207,
+            "p99_us": 4.824,
+            "mean_us": 3.327036018564877,
+            "status": "ok"
+          },
+          {
+            "event": "start",
+            "case": "model-listProperties@1"
+          },
+          {
+            "event": "case",
+            "case": "model-listProperties",
+            "threads": 1,
+            "ops": 396557,
+            "seconds": 2.000097924,
+            "ops_per_s": 198268.79236338832,
+            "p50_us": 4.977,
+            "p99_us": 6.239,
+            "mean_us": 5.013400287978777,
+            "status": "ok"
+          },
+          {
+            "event": "start",
+            "case": "model-listProperties@4"
+          },
+          {
+            "event": "case",
+            "case": "model-listProperties",
+            "threads": 4,
+            "ops": 1377317,
+            "seconds": 2.000150738,
+            "ops_per_s": 688606.6004091338,
+            "p50_us": 5.631,
+            "p99_us": 7.715,
+            "mean_us": 5.75194781956514,
+            "status": "ok"
+          },
+          {
+            "event": "start",
+            "case": "sparql-select-o@1"
+          },
+          {
+            "event": "case",
+            "case": "sparql-select-o",
+            "threads": 1,
+            "ops": 67509,
+            "seconds": 2.000159693,
+            "ops_per_s": 33751.80503649915,
+            "p50_us": 28.468,
+            "p99_us": 42.347,
+            "mean_us": 29.59144668118325,
+            "status": "ok"
+          },
+          {
+            "event": "start",
+            "case": "sparql-select-o@4"
+          },
+          {
+            "event": "case",
+            "case": "sparql-select-o",
+            "threads": 4,
+            "ops": 116039,
+            "seconds": 2.000093943,
+            "ops_per_s": 58016.77486505943,
+            "p50_us": 68.701,
+            "p99_us": 91.355,
+            "mean_us": 68.89520466394919,
+            "status": "ok"
+          },
+          {
+            "event": "start",
+            "case": "model-iterate-all@1"
+          },
+          {
+            "event": "case",
+            "case": "model-iterate-all",
+            "threads": 1,
+            "ops": 125,
+            "seconds": 2.000067429,
+            "ops_per_s": 62.497892914789325,
+            "p50_us": 15842.617,
+            "p99_us": 18119.892,
+            "mean_us": 15992.056655999999,
+            "status": "ok"
+          },
+          {
+            "event": "start",
+            "case": "model-iterate-all@4"
+          },
+          {
+            "event": "case",
+            "case": "model-iterate-all",
+            "threads": 4,
+            "ops": 444,
+            "seconds": 2.000109503,
+            "ops_per_s": 221.9878458324589,
+            "p50_us": 17698.898,
+            "p99_us": 22612.706,
+            "mean_us": 18092.522391891893,
+            "status": "ok"
+          },
+          {
+            "event": "start",
+            "case": "update-modify@1"
+          },
+          {
+            "event": "case",
+            "case": "update-modify",
+            "threads": 1,
+            "ops": 9062,
+            "seconds": 2.000092393,
+            "ops_per_s": 4530.790693327735,
+            "p50_us": 213.051,
+            "p99_us": 319.074,
+            "mean_us": 220.63416243654822,
+            "status": "ok"
+          },
+          {
+            "event": "start",
+            "case": "update-modify@4"
+          },
+          {
+            "event": "case",
+            "case": "update-modify",
+            "threads": 4,
+            "ops": 2663,
+            "seconds": 2.000073936,
+            "ops_per_s": 1331.4507789276045,
+            "p50_us": 2982.86,
+            "p99_us": 3646.316,
+            "mean_us": 2999.802042808862,
+            "status": "ok"
+          },
+          {
+            "event": "done",
+            "sink": 8569120336
+          }
+        ]
+      },
+      {
+        "arm": "base",
+        "engine": "sparkles-mem",
+        "opts": [],
+        "mode": "time",
+        "label": "base-r2",
+        "exit": 0,
+        "killed": false,
+        "wall_s": 37.21772908500134,
+        "events": [
+          {
+            "event": "versions",
+            "versions": {
+              "java": "21.0.12+8-LTS",
+              "jena": "5.6.0",
+              "processors": 6,
+              "max_heap_mib": 4096
+            }
+          },
+          {
+            "event": "ready",
+            "ms": 442.188883,
+            "triples": 105300
+          },
+          {
+            "event": "start",
+            "case": "graph-contains@1"
+          },
+          {
+            "event": "case",
+            "case": "graph-contains",
+            "threads": 1,
+            "ops": 1159707,
+            "seconds": 2.000155356,
+            "ops_per_s": 579808.4616383169,
+            "p50_us": 1.72,
+            "p99_us": 2.049,
+            "mean_us": 1.6910534979956144,
+            "status": "ok"
+          },
+          {
+            "event": "start",
+            "case": "graph-contains@4"
+          },
+          {
+            "event": "case",
+            "case": "graph-contains",
+            "threads": 4,
+            "ops": 3301193,
+            "seconds": 2.00009206,
+            "ops_per_s": 1650520.5265401632,
+            "p50_us": 2.314,
+            "p99_us": 3.582,
+            "mean_us": 2.370526964645811,
+            "status": "ok"
+          },
+          {
+            "event": "start",
+            "case": "model-getProperty@1"
+          },
+          {
+            "event": "case",
+            "case": "model-getProperty",
+            "threads": 1,
+            "ops": 854975,
+            "seconds": 2.000152807,
+            "ops_per_s": 427454.84095405915,
+            "p50_us": 2.282,
+            "p99_us": 2.746,
+            "mean_us": 2.310838236205737,
+            "status": "ok"
+          },
+          {
+            "event": "start",
+            "case": "model-getProperty@4"
+          },
+          {
+            "event": "case",
+            "case": "model-getProperty",
+            "threads": 4,
+            "ops": 2356462,
+            "seconds": 2.000157201,
+            "ops_per_s": 1178138.397732869,
+            "p50_us": 3.204,
+            "p99_us": 4.864,
+            "mean_us": 3.3375793380075724,
+            "status": "ok"
+          },
+          {
+            "event": "start",
+            "case": "model-listProperties@1"
+          },
+          {
+            "event": "case",
+            "case": "model-listProperties",
+            "threads": 1,
+            "ops": 396454,
+            "seconds": 2.000151022,
+            "ops_per_s": 198212.0328111904,
+            "p50_us": 4.971,
+            "p99_us": 6.304,
+            "mean_us": 5.015642198086033,
+            "status": "ok"
+          },
+          {
+            "event": "start",
+            "case": "model-listProperties@4"
+          },
+          {
+            "event": "case",
+            "case": "model-listProperties",
+            "threads": 4,
+            "ops": 1359159,
+            "seconds": 2.00010604,
+            "ops_per_s": 679543.4706051885,
+            "p50_us": 5.685,
+            "p99_us": 8.072,
+            "mean_us": 5.824407123817007,
+            "status": "ok"
+          },
+          {
+            "event": "start",
+            "case": "sparql-select-o@1"
+          },
+          {
+            "event": "case",
+            "case": "sparql-select-o",
+            "threads": 1,
+            "ops": 65772,
+            "seconds": 2.000167766,
+            "ops_per_s": 32883.24165504025,
+            "p50_us": 28.819,
+            "p99_us": 38.783,
+            "mean_us": 30.375930015812198,
+            "status": "ok"
+          },
+          {
+            "event": "start",
+            "case": "sparql-select-o@4"
+          },
+          {
+            "event": "case",
+            "case": "sparql-select-o",
+            "threads": 4,
+            "ops": 120171,
+            "seconds": 2.000095171,
+            "ops_per_s": 60082.640937489676,
+            "p50_us": 66.253,
+            "p99_us": 87.069,
+            "mean_us": 66.51835575970908,
+            "status": "ok"
+          },
+          {
+            "event": "start",
+            "case": "model-iterate-all@1"
+          },
+          {
+            "event": "case",
+            "case": "model-iterate-all",
+            "threads": 1,
+            "ops": 123,
+            "seconds": 2.00015425,
+            "ops_per_s": 61.495257178290125,
+            "p50_us": 16033.565,
+            "p99_us": 18461.153,
+            "mean_us": 16181.487845528454,
+            "status": "ok"
+          },
+          {
+            "event": "start",
+            "case": "model-iterate-all@4"
+          },
+          {
+            "event": "case",
+            "case": "model-iterate-all",
+            "threads": 4,
+            "ops": 433,
+            "seconds": 2.000176454,
+            "ops_per_s": 216.4809005395881,
+            "p50_us": 17816.863,
+            "p99_us": 24624.526,
+            "mean_us": 18458.06672286374,
+            "status": "ok"
+          },
+          {
+            "event": "start",
+            "case": "update-modify@1"
+          },
+          {
+            "event": "case",
+            "case": "update-modify",
+            "threads": 1,
+            "ops": 8975,
+            "seconds": 2.000082349,
+            "ops_per_s": 4487.3152370387725,
+            "p50_us": 213.619,
+            "p99_us": 367.299,
+            "mean_us": 222.79153426183845,
+            "status": "ok"
+          },
+          {
+            "event": "start",
+            "case": "update-modify@4"
+          },
+          {
+            "event": "case",
+            "case": "update-modify",
+            "threads": 4,
+            "ops": 2956,
+            "seconds": 2.000089253,
+            "ops_per_s": 1477.9340449763417,
+            "p50_us": 2879.914,
+            "p99_us": 3516.45,
+            "mean_us": 2705.874842354533,
+            "status": "ok"
+          },
+          {
+            "event": "done",
+            "sink": 8380019549
+          }
+        ]
+      },
+      {
+        "arm": "pool",
+        "engine": "sparkles-mem",
+        "opts": [],
+        "mode": "time",
+        "label": "pool-r2",
+        "exit": 0,
+        "killed": false,
+        "wall_s": 37.25241102700238,
+        "events": [
+          {
+            "event": "versions",
+            "versions": {
+              "java": "21.0.12+8-LTS",
+              "jena": "5.6.0",
+              "processors": 6,
+              "max_heap_mib": 4096
+            }
+          },
+          {
+            "event": "ready",
+            "ms": 433.6068,
+            "triples": 105300
+          },
+          {
+            "event": "start",
+            "case": "graph-contains@1"
+          },
+          {
+            "event": "case",
+            "case": "graph-contains",
+            "threads": 1,
+            "ops": 1175564,
+            "seconds": 2.000154907,
+            "ops_per_s": 587736.4777527204,
+            "p50_us": 1.701,
+            "p99_us": 2.078,
+            "mean_us": 1.6696119939025011,
+            "status": "ok"
+          },
+          {
+            "event": "start",
+            "case": "graph-contains@4"
+          },
+          {
+            "event": "case",
+            "case": "graph-contains",
+            "threads": 4,
+            "ops": 3747635,
+            "seconds": 2.000150679,
+            "ops_per_s": 1873676.3381615211,
+            "p50_us": 2.017,
+            "p99_us": 3.338,
+            "mean_us": 2.0845597159275115,
+            "status": "ok"
+          },
+          {
+            "event": "start",
+            "case": "model-getProperty@1"
+          },
+          {
+            "event": "case",
+            "case": "model-getProperty",
+            "threads": 1,
+            "ops": 846200,
+            "seconds": 2.000087207,
+            "ops_per_s": 423081.55216354027,
+            "p50_us": 2.305,
+            "p99_us": 2.81,
+            "mean_us": 2.33592307610494,
+            "status": "ok"
+          },
+          {
+            "event": "start",
+            "case": "model-getProperty@4"
+          },
+          {
+            "event": "case",
+            "case": "model-getProperty",
+            "threads": 4,
+            "ops": 2316398,
+            "seconds": 2.000165967,
+            "ops_per_s": 1158102.8965682825,
+            "p50_us": 3.252,
+            "p99_us": 4.96,
+            "mean_us": 3.3958580585029,
+            "status": "ok"
+          },
+          {
+            "event": "start",
+            "case": "model-listProperties@1"
+          },
+          {
+            "event": "case",
+            "case": "model-listProperties",
+            "threads": 1,
+            "ops": 402198,
+            "seconds": 2.000150825,
+            "ops_per_s": 201083.83576523536,
+            "p50_us": 4.907,
+            "p99_us": 6.158,
+            "mean_us": 4.943618702728506,
+            "status": "ok"
+          },
+          {
+            "event": "start",
+            "case": "model-listProperties@4"
+          },
+          {
+            "event": "case",
+            "case": "model-listProperties",
+            "threads": 4,
+            "ops": 1368142,
+            "seconds": 2.000088231,
+            "ops_per_s": 684040.8231970643,
+            "p50_us": 5.662,
+            "p99_us": 7.848,
+            "mean_us": 5.802226358082714,
+            "status": "ok"
+          },
+          {
+            "event": "start",
+            "case": "sparql-select-o@1"
+          },
+          {
+            "event": "case",
+            "case": "sparql-select-o",
+            "threads": 1,
+            "ops": 65936,
+            "seconds": 2.00015551,
+            "ops_per_s": 32965.436772463756,
+            "p50_us": 29.11,
+            "p99_us": 37.328,
+            "mean_us": 30.299128002911914,
+            "status": "ok"
+          },
+          {
+            "event": "start",
+            "case": "sparql-select-o@4"
+          },
+          {
+            "event": "case",
+            "case": "sparql-select-o",
+            "threads": 4,
+            "ops": 118076,
+            "seconds": 2.000149311,
+            "ops_per_s": 59033.59281761141,
+            "p50_us": 67.573,
+            "p99_us": 89.594,
+            "mean_us": 67.7119523611911,
+            "status": "ok"
+          },
+          {
+            "event": "start",
+            "case": "model-iterate-all@1"
+          },
+          {
+            "event": "case",
+            "case": "model-iterate-all",
+            "threads": 1,
+            "ops": 125,
+            "seconds": 2.000154766,
+            "ops_per_s": 62.49516393672908,
+            "p50_us": 15827.502,
+            "p99_us": 17698.333,
+            "mean_us": 15953.290216,
+            "status": "ok"
+          },
+          {
+            "event": "start",
+            "case": "model-iterate-all@4"
+          },
+          {
+            "event": "case",
+            "case": "model-iterate-all",
+            "threads": 4,
+            "ops": 450,
+            "seconds": 2.000167757,
+            "ops_per_s": 224.98112892037787,
+            "p50_us": 17495.688,
+            "p99_us": 21155.118,
+            "mean_us": 17831.563475555555,
+            "status": "ok"
+          },
+          {
+            "event": "start",
+            "case": "update-modify@1"
+          },
+          {
+            "event": "case",
+            "case": "update-modify",
+            "threads": 1,
+            "ops": 8886,
+            "seconds": 2.000092852,
+            "ops_per_s": 4442.79373885788,
+            "p50_us": 205.299,
+            "p99_us": 552.935,
+            "mean_us": 225.0140842898942,
+            "status": "ok"
+          },
+          {
+            "event": "start",
+            "case": "update-modify@4"
+          },
+          {
+            "event": "case",
+            "case": "update-modify",
+            "threads": 4,
+            "ops": 2811,
+            "seconds": 2.000091344,
+            "ops_per_s": 1405.435810935643,
+            "p50_us": 2833.464,
+            "p99_us": 3404.245,
+            "mean_us": 2845.847290643899,
+            "status": "ok"
+          },
+          {
+            "event": "done",
+            "sink": 8651833361
+          }
+        ]
+      },
+      {
+        "arm": "pool",
+        "engine": "sparkles-mem",
+        "opts": [],
+        "mode": "time",
+        "label": "pool-r3",
+        "exit": 0,
+        "killed": false,
+        "wall_s": 37.20915589800279,
+        "events": [
+          {
+            "event": "versions",
+            "versions": {
+              "java": "21.0.12+8-LTS",
+              "jena": "5.6.0",
+              "processors": 6,
+              "max_heap_mib": 4096
+            }
+          },
+          {
+            "event": "ready",
+            "ms": 429.619554,
+            "triples": 105300
+          },
+          {
+            "event": "start",
+            "case": "graph-contains@1"
+          },
+          {
+            "event": "case",
+            "case": "graph-contains",
+            "threads": 1,
+            "ops": 1181007,
+            "seconds": 2.000155231,
+            "ops_per_s": 590457.6713326107,
+            "p50_us": 1.704,
+            "p99_us": 2.099,
+            "mean_us": 1.6622120038238555,
+            "status": "ok"
+          },
+          {
+            "event": "start",
+            "case": "graph-contains@4"
+          },
+          {
+            "event": "case",
+            "case": "graph-contains",
+            "threads": 4,
+            "ops": 3807987,
+            "seconds": 2.000156924,
+            "ops_per_s": 1903844.1205826108,
+            "p50_us": 2.004,
+            "p99_us": 3.266,
+            "mean_us": 2.0510768521531193,
+            "status": "ok"
+          },
+          {
+            "event": "start",
+            "case": "model-getProperty@1"
+          },
+          {
+            "event": "case",
+            "case": "model-getProperty",
+            "threads": 1,
+            "ops": 840583,
+            "seconds": 2.000148986,
+            "ops_per_s": 420260.1935574013,
+            "p50_us": 2.32,
+            "p99_us": 2.865,
+            "mean_us": 2.352061500173094,
+            "status": "ok"
+          },
+          {
+            "event": "start",
+            "case": "model-getProperty@4"
+          },
+          {
+            "event": "case",
+            "case": "model-getProperty",
+            "threads": 4,
+            "ops": 2347060,
+            "seconds": 2.000613308,
+            "ops_per_s": 1173170.2426524095,
+            "p50_us": 3.226,
+            "p99_us": 4.884,
+            "mean_us": 3.3634629919985004,
+            "status": "ok"
+          },
+          {
+            "event": "start",
+            "case": "model-listProperties@1"
+          },
+          {
+            "event": "case",
+            "case": "model-listProperties",
+            "threads": 1,
+            "ops": 394569,
+            "seconds": 2.000149371,
+            "ops_per_s": 197269.766808831,
+            "p50_us": 4.991,
+            "p99_us": 6.364,
+            "mean_us": 5.039079268771749,
+            "status": "ok"
+          },
+          {
+            "event": "start",
+            "case": "model-listProperties@4"
+          },
+          {
+            "event": "case",
+            "case": "model-listProperties",
+            "threads": 4,
+            "ops": 1339535,
+            "seconds": 2.000167021,
+            "ops_per_s": 669711.5720517621,
+            "p50_us": 5.788,
+            "p99_us": 8.063,
+            "mean_us": 5.923680875079785,
+            "status": "ok"
+          },
+          {
+            "event": "start",
+            "case": "sparql-select-o@1"
+          },
+          {
+            "event": "case",
+            "case": "sparql-select-o",
+            "threads": 1,
+            "ops": 67039,
+            "seconds": 2.000157831,
+            "ops_per_s": 33516.8550006292,
+            "p50_us": 28.619,
+            "p99_us": 42.277,
+            "mean_us": 29.80188743865511,
+            "status": "ok"
+          },
+          {
+            "event": "start",
+            "case": "sparql-select-o@4"
+          },
+          {
+            "event": "case",
+            "case": "sparql-select-o",
+            "threads": 4,
+            "ops": 114553,
+            "seconds": 2.000046092,
+            "ops_per_s": 57275.18003620089,
+            "p50_us": 69.604,
+            "p99_us": 93.743,
+            "mean_us": 69.77284411582411,
+            "status": "ok"
+          },
+          {
+            "event": "start",
+            "case": "model-iterate-all@1"
+          },
+          {
+            "event": "case",
+            "case": "model-iterate-all",
+            "threads": 1,
+            "ops": 123,
+            "seconds": 2.000154826,
+            "ops_per_s": 61.49523946902698,
+            "p50_us": 16094.432,
+            "p99_us": 17735.916,
+            "mean_us": 16194.154178861789,
+            "status": "ok"
+          },
+          {
+            "event": "start",
+            "case": "model-iterate-all@4"
+          },
+          {
+            "event": "case",
+            "case": "model-iterate-all",
+            "threads": 4,
+            "ops": 436,
+            "seconds": 2.000094896,
+            "ops_per_s": 217.9896568267629,
+            "p50_us": 17931.146,
+            "p99_us": 20477.737,
+            "mean_us": 18237.992302752293,
+            "status": "ok"
+          },
+          {
+            "event": "start",
+            "case": "update-modify@1"
+          },
+          {
+            "event": "case",
+            "case": "update-modify",
+            "threads": 1,
+            "ops": 8935,
+            "seconds": 2.000066332,
+            "ops_per_s": 4467.351835809014,
+            "p50_us": 209.224,
+            "p99_us": 430.81,
+            "mean_us": 223.7822783435926,
+            "status": "ok"
+          },
+          {
+            "event": "start",
+            "case": "update-modify@4"
+          },
+          {
+            "event": "case",
+            "case": "update-modify",
+            "threads": 4,
+            "ops": 3016,
+            "seconds": 2.0000918,
+            "ops_per_s": 1507.9307859769237,
+            "p50_us": 2783.547,
+            "p99_us": 3347.197,
+            "mean_us": 2652.096668766578,
+            "status": "ok"
+          },
+          {
+            "event": "done",
+            "sink": 8432730619
+          }
+        ]
+      },
+      {
+        "arm": "base",
+        "engine": "sparkles-mem",
+        "opts": [],
+        "mode": "time",
+        "label": "base-r3",
+        "exit": 0,
+        "killed": false,
+        "wall_s": 37.25855703299749,
+        "events": [
+          {
+            "event": "versions",
+            "versions": {
+              "java": "21.0.12+8-LTS",
+              "jena": "5.6.0",
+              "processors": 6,
+              "max_heap_mib": 4096
+            }
+          },
+          {
+            "event": "ready",
+            "ms": 435.855308,
+            "triples": 105300
+          },
+          {
+            "event": "start",
+            "case": "graph-contains@1"
+          },
+          {
+            "event": "case",
+            "case": "graph-contains",
+            "threads": 1,
+            "ops": 1158702,
+            "seconds": 2.000152852,
+            "ops_per_s": 579306.7259041661,
+            "p50_us": 1.734,
+            "p99_us": 2.036,
+            "mean_us": 1.6945141097538452,
+            "status": "ok"
+          },
+          {
+            "event": "start",
+            "case": "graph-contains@4"
+          },
+          {
+            "event": "case",
+            "case": "graph-contains",
+            "threads": 4,
+            "ops": 3369576,
+            "seconds": 2.000142692,
+            "ops_per_s": 1684667.8056907353,
+            "p50_us": 2.271,
+            "p99_us": 3.549,
+            "mean_us": 2.3198444831041054,
+            "status": "ok"
+          },
+          {
+            "event": "start",
+            "case": "model-getProperty@1"
+          },
+          {
+            "event": "case",
+            "case": "model-getProperty",
+            "threads": 1,
+            "ops": 854376,
+            "seconds": 2.000151049,
+            "ops_per_s": 427155.73927636904,
+            "p50_us": 2.284,
+            "p99_us": 2.742,
+            "mean_us": 2.311909715394627,
+            "status": "ok"
+          },
+          {
+            "event": "start",
+            "case": "model-getProperty@4"
+          },
+          {
+            "event": "case",
+            "case": "model-getProperty",
+            "threads": 4,
+            "ops": 2379081,
+            "seconds": 2.000147456,
+            "ops_per_s": 1189452.804023665,
+            "p50_us": 3.167,
+            "p99_us": 4.846,
+            "mean_us": 3.3021538879928847,
+            "status": "ok"
+          },
+          {
+            "event": "start",
+            "case": "model-listProperties@1"
+          },
+          {
+            "event": "case",
+            "case": "model-listProperties",
+            "threads": 1,
+            "ops": 399024,
+            "seconds": 2.000153205,
+            "ops_per_s": 199496.71805265534,
+            "p50_us": 4.94,
+            "p99_us": 6.255,
+            "mean_us": 4.981565106359517,
+            "status": "ok"
+          },
+          {
+            "event": "start",
+            "case": "model-listProperties@4"
+          },
+          {
+            "event": "case",
+            "case": "model-listProperties",
+            "threads": 4,
+            "ops": 1372182,
+            "seconds": 2.000113354,
+            "ops_per_s": 686052.1166241862,
+            "p50_us": 5.637,
+            "p99_us": 7.968,
+            "mean_us": 5.779521727438489,
+            "status": "ok"
+          },
+          {
+            "event": "start",
+            "case": "sparql-select-o@1"
+          },
+          {
+            "event": "case",
+            "case": "sparql-select-o",
+            "threads": 1,
+            "ops": 67806,
+            "seconds": 2.000069232,
+            "ops_per_s": 33901.826454375456,
+            "p50_us": 28.466,
+            "p99_us": 35.503,
+            "mean_us": 29.46146643364894,
+            "status": "ok"
+          },
+          {
+            "event": "start",
+            "case": "sparql-select-o@4"
+          },
+          {
+            "event": "case",
+            "case": "sparql-select-o",
+            "threads": 4,
+            "ops": 119134,
+            "seconds": 2.00015235,
+            "ops_per_s": 59562.46282939397,
+            "p50_us": 67.195,
+            "p99_us": 88.404,
+            "mean_us": 67.09326111773298,
+            "status": "ok"
+          },
+          {
+            "event": "start",
+            "case": "model-iterate-all@1"
+          },
+          {
+            "event": "case",
+            "case": "model-iterate-all",
+            "threads": 1,
+            "ops": 125,
+            "seconds": 2.000147457,
+            "ops_per_s": 62.495392308468176,
+            "p50_us": 15804.194,
+            "p99_us": 18748.595,
+            "mean_us": 15947.425776,
+            "status": "ok"
+          },
+          {
+            "event": "start",
+            "case": "model-iterate-all@4"
+          },
+          {
+            "event": "case",
+            "case": "model-iterate-all",
+            "threads": 4,
+            "ops": 439,
+            "seconds": 2.000168479,
+            "ops_per_s": 219.48151098725518,
+            "p50_us": 17599.226,
+            "p99_us": 23719.703,
+            "mean_us": 18167.14323690205,
+            "status": "ok"
+          },
+          {
+            "event": "start",
+            "case": "update-modify@1"
+          },
+          {
+            "event": "case",
+            "case": "update-modify",
+            "threads": 1,
+            "ops": 9017,
+            "seconds": 2.000093634,
+            "ops_per_s": 4508.288935436909,
+            "p50_us": 209.739,
+            "p99_us": 382.514,
+            "mean_us": 221.7318721304203,
+            "status": "ok"
+          },
+          {
+            "event": "start",
+            "case": "update-modify@4"
+          },
+          {
+            "event": "case",
+            "case": "update-modify",
+            "threads": 4,
+            "ops": 2956,
+            "seconds": 2.000074283,
+            "ops_per_s": 1477.945106901812,
+            "p50_us": 2794.095,
+            "p99_us": 3369.445,
+            "mean_us": 2707.5097730040598,
+            "status": "ok"
+          },
+          {
+            "event": "done",
+            "sink": 8514285559
+          }
+        ]
+      },
+      {
+        "arm": "base",
+        "engine": "sparkles-mem",
+        "opts": [],
+        "mode": "time",
+        "label": "base-r4",
+        "exit": 0,
+        "killed": false,
+        "wall_s": 37.26473445400188,
+        "events": [
+          {
+            "event": "versions",
+            "versions": {
+              "java": "21.0.12+8-LTS",
+              "jena": "5.6.0",
+              "processors": 6,
+              "max_heap_mib": 4096
+            }
+          },
+          {
+            "event": "ready",
+            "ms": 436.407189,
+            "triples": 105300
+          },
+          {
+            "event": "start",
+            "case": "graph-contains@1"
+          },
+          {
+            "event": "case",
+            "case": "graph-contains",
+            "threads": 1,
+            "ops": 1168219,
+            "seconds": 2.000153384,
+            "ops_per_s": 584064.7069094977,
+            "p50_us": 1.712,
+            "p99_us": 2.019,
+            "mean_us": 1.6806215427073177,
+            "status": "ok"
+          },
+          {
+            "event": "start",
+            "case": "graph-contains@4"
+          },
+          {
+            "event": "case",
+            "case": "graph-contains",
+            "threads": 4,
+            "ops": 3312435,
+            "seconds": 2.000077047,
+            "ops_per_s": 1656153.6991629703,
+            "p50_us": 2.297,
+            "p99_us": 3.581,
+            "mean_us": 2.3604948226908604,
+            "status": "ok"
+          },
+          {
+            "event": "start",
+            "case": "model-getProperty@1"
+          },
+          {
+            "event": "case",
+            "case": "model-getProperty",
+            "threads": 1,
+            "ops": 848776,
+            "seconds": 2.000156615,
+            "ops_per_s": 424354.7698388609,
+            "p50_us": 2.302,
+            "p99_us": 2.755,
+            "mean_us": 2.328762381358568,
+            "status": "ok"
+          },
+          {
+            "event": "start",
+            "case": "model-getProperty@4"
+          },
+          {
+            "event": "case",
+            "case": "model-getProperty",
+            "threads": 4,
+            "ops": 2347521,
+            "seconds": 2.000155333,
+            "ops_per_s": 1173669.3452098004,
+            "p50_us": 3.221,
+            "p99_us": 4.943,
+            "mean_us": 3.3604639988311074,
+            "status": "ok"
+          },
+          {
+            "event": "start",
+            "case": "model-listProperties@1"
+          },
+          {
+            "event": "case",
+            "case": "model-listProperties",
+            "threads": 1,
+            "ops": 398696,
+            "seconds": 2.000154698,
+            "ops_per_s": 199332.58182412852,
+            "p50_us": 4.943,
+            "p99_us": 6.206,
+            "mean_us": 4.987804051206934,
+            "status": "ok"
+          },
+          {
+            "event": "start",
+            "case": "model-listProperties@4"
+          },
+          {
+            "event": "case",
+            "case": "model-listProperties",
+            "threads": 4,
+            "ops": 1363142,
+            "seconds": 2.000163293,
+            "ops_per_s": 681515.3566564327,
+            "p50_us": 5.665,
+            "p99_us": 8.042,
+            "mean_us": 5.822872720523614,
+            "status": "ok"
+          },
+          {
+            "event": "start",
+            "case": "sparql-select-o@1"
+          },
+          {
+            "event": "case",
+            "case": "sparql-select-o",
+            "threads": 1,
+            "ops": 67123,
+            "seconds": 2.000085808,
+            "ops_per_s": 33560.06013917979,
+            "p50_us": 28.591,
+            "p99_us": 35.741,
+            "mean_us": 29.76238636532932,
+            "status": "ok"
+          },
+          {
+            "event": "start",
+            "case": "sparql-select-o@4"
+          },
+          {
+            "event": "case",
+            "case": "sparql-select-o",
+            "threads": 4,
+            "ops": 115869,
+            "seconds": 2.000162429,
+            "ops_per_s": 57929.79526064281,
+            "p50_us": 69.089,
+            "p99_us": 90.811,
+            "mean_us": 68.98461219998447,
+            "status": "ok"
+          },
+          {
+            "event": "start",
+            "case": "model-iterate-all@1"
+          },
+          {
+            "event": "case",
+            "case": "model-iterate-all",
+            "threads": 1,
+            "ops": 122,
+            "seconds": 2.000155613,
+            "ops_per_s": 60.995254172756205,
+            "p50_us": 16108.498,
+            "p99_us": 28097.822,
+            "mean_us": 16411.34263934426,
+            "status": "ok"
+          },
+          {
+            "event": "start",
+            "case": "model-iterate-all@4"
+          },
+          {
+            "event": "case",
+            "case": "model-iterate-all",
+            "threads": 4,
+            "ops": 437,
+            "seconds": 2.000814618,
+            "ops_per_s": 218.41103921802713,
+            "p50_us": 17934.052,
+            "p99_us": 21212.472,
+            "mean_us": 18289.83209382151,
+            "status": "ok"
+          },
+          {
+            "event": "start",
+            "case": "update-modify@1"
+          },
+          {
+            "event": "case",
+            "case": "update-modify",
+            "threads": 1,
+            "ops": 8990,
+            "seconds": 2.000086111,
+            "ops_per_s": 4494.806473859865,
+            "p50_us": 211.439,
+            "p99_us": 385.096,
+            "mean_us": 222.40842847608454,
+            "status": "ok"
+          },
+          {
+            "event": "start",
+            "case": "update-modify@4"
+          },
+          {
+            "event": "case",
+            "case": "update-modify",
+            "threads": 4,
+            "ops": 2856,
+            "seconds": 2.000081966,
+            "ops_per_s": 1427.9414786743794,
+            "p50_us": 2797.374,
+            "p99_us": 3227.836,
+            "mean_us": 2801.888581232493,
+            "status": "ok"
+          },
+          {
+            "event": "done",
+            "sink": 8405715779
+          }
+        ]
+      },
+      {
+        "arm": "pool",
+        "engine": "sparkles-mem",
+        "opts": [],
+        "mode": "time",
+        "label": "pool-r4",
+        "exit": 0,
+        "killed": false,
+        "wall_s": 37.302391744997294,
+        "events": [
+          {
+            "event": "versions",
+            "versions": {
+              "java": "21.0.12+8-LTS",
+              "jena": "5.6.0",
+              "processors": 6,
+              "max_heap_mib": 4096
+            }
+          },
+          {
+            "event": "ready",
+            "ms": 443.398831,
+            "triples": 105300
+          },
+          {
+            "event": "start",
+            "case": "graph-contains@1"
+          },
+          {
+            "event": "case",
+            "case": "graph-contains",
+            "threads": 1,
+            "ops": 1170397,
+            "seconds": 2.000160454,
+            "ops_per_s": 585151.5550461933,
+            "p50_us": 1.703,
+            "p99_us": 2.064,
+            "mean_us": 1.6771322696486748,
+            "status": "ok"
+          },
+          {
+            "event": "start",
+            "case": "graph-contains@4"
+          },
+          {
+            "event": "case",
+            "case": "graph-contains",
+            "threads": 4,
+            "ops": 3742871,
+            "seconds": 2.000153182,
+            "ops_per_s": 1871292.1758609586,
+            "p50_us": 2.021,
+            "p99_us": 3.274,
+            "mean_us": 2.082770145431141,
+            "status": "ok"
+          },
+          {
+            "event": "start",
+            "case": "model-getProperty@1"
+          },
+          {
+            "event": "case",
+            "case": "model-getProperty",
+            "threads": 1,
+            "ops": 848064,
+            "seconds": 2.000149298,
+            "ops_per_s": 424000.34879796254,
+            "p50_us": 2.3,
+            "p99_us": 2.777,
+            "mean_us": 2.330094521168214,
+            "status": "ok"
+          },
+          {
+            "event": "start",
+            "case": "model-getProperty@4"
+          },
+          {
+            "event": "case",
+            "case": "model-getProperty",
+            "threads": 4,
+            "ops": 2321012,
+            "seconds": 2.000104652,
+            "ops_per_s": 1160445.2785403552,
+            "p50_us": 3.229,
+            "p99_us": 4.866,
+            "mean_us": 3.386160445098948,
+            "status": "ok"
+          },
+          {
+            "event": "start",
+            "case": "model-listProperties@1"
+          },
+          {
+            "event": "case",
+            "case": "model-listProperties",
+            "threads": 1,
+            "ops": 402061,
+            "seconds": 2.000155072,
+            "ops_per_s": 201014.91410761976,
+            "p50_us": 4.907,
+            "p99_us": 6.215,
+            "mean_us": 4.944557452724835,
+            "status": "ok"
+          },
+          {
+            "event": "start",
+            "case": "model-listProperties@4"
+          },
+          {
+            "event": "case",
+            "case": "model-listProperties",
+            "threads": 4,
+            "ops": 1379970,
+            "seconds": 2.000157088,
+            "ops_per_s": 689930.8100744536,
+            "p50_us": 5.614,
+            "p99_us": 8.147,
+            "mean_us": 5.766094890468634,
+            "status": "ok"
+          },
+          {
+            "event": "start",
+            "case": "sparql-select-o@1"
+          },
+          {
+            "event": "case",
+            "case": "sparql-select-o",
+            "threads": 1,
+            "ops": 67148,
+            "seconds": 2.000154106,
+            "ops_per_s": 33571.41322189701,
+            "p50_us": 28.524,
+            "p99_us": 37.836,
+            "mean_us": 29.752273738607254,
+            "status": "ok"
+          },
+          {
+            "event": "start",
+            "case": "sparql-select-o@4"
+          },
+          {
+            "event": "case",
+            "case": "sparql-select-o",
+            "threads": 4,
+            "ops": 119109,
+            "seconds": 2.00015031,
+            "ops_per_s": 59550.02451790735,
+            "p50_us": 67.204,
+            "p99_us": 88.273,
+            "mean_us": 67.110434761437,
+            "status": "ok"
+          },
+          {
+            "event": "start",
+            "case": "model-iterate-all@1"
+          },
+          {
+            "event": "case",
+            "case": "model-iterate-all",
+            "threads": 1,
+            "ops": 125,
+            "seconds": 2.000149768,
+            "ops_per_s": 62.4953201004496,
+            "p50_us": 15880.707,
+            "p99_us": 18053.635,
+            "mean_us": 16053.105952,
+            "status": "ok"
+          },
+          {
+            "event": "start",
+            "case": "model-iterate-all@4"
+          },
+          {
+            "event": "case",
+            "case": "model-iterate-all",
+            "threads": 4,
+            "ops": 441,
+            "seconds": 2.000721264,
+            "ops_per_s": 220.4205093108862,
+            "p50_us": 17716.695,
+            "p99_us": 26300.467,
+            "mean_us": 18282.23852154195,
+            "status": "ok"
+          },
+          {
+            "event": "start",
+            "case": "update-modify@1"
+          },
+          {
+            "event": "case",
+            "case": "update-modify",
+            "threads": 1,
+            "ops": 8339,
+            "seconds": 2.000073643,
+            "ops_per_s": 4169.346478408645,
+            "p50_us": 211.589,
+            "p99_us": 579.3,
+            "mean_us": 239.77630219450774,
+            "status": "ok"
+          },
+          {
+            "event": "start",
+            "case": "update-modify@4"
+          },
+          {
+            "event": "case",
+            "case": "update-modify",
+            "threads": 4,
+            "ops": 2911,
+            "seconds": 2.000084027,
+            "ops_per_s": 1455.4388519197946,
+            "p50_us": 2807.065,
+            "p99_us": 3259.42,
+            "mean_us": 2748.1190742013055,
+            "status": "ok"
+          },
+          {
+            "event": "done",
+            "sink": 8471614458
+          }
+        ]
+      },
+      {
+        "arm": "pool",
+        "engine": "sparkles-mem",
+        "opts": [],
+        "mode": "time",
+        "label": "pool-r5",
+        "exit": 0,
+        "killed": false,
+        "wall_s": 37.25908826299565,
+        "events": [
+          {
+            "event": "versions",
+            "versions": {
+              "java": "21.0.12+8-LTS",
+              "jena": "5.6.0",
+              "processors": 6,
+              "max_heap_mib": 4096
+            }
+          },
+          {
+            "event": "ready",
+            "ms": 442.126184,
+            "triples": 105300
+          },
+          {
+            "event": "start",
+            "case": "graph-contains@1"
+          },
+          {
+            "event": "case",
+            "case": "graph-contains",
+            "threads": 1,
+            "ops": 1175159,
+            "seconds": 2.000150787,
+            "ops_per_s": 587535.2036646225,
+            "p50_us": 1.705,
+            "p99_us": 2.178,
+            "mean_us": 1.67100168913313,
+            "status": "ok"
+          },
+          {
+            "event": "start",
+            "case": "graph-contains@4"
+          },
+          {
+            "event": "case",
+            "case": "graph-contains",
+            "threads": 4,
+            "ops": 3773913,
+            "seconds": 2.000166051,
+            "ops_per_s": 1886799.8474992616,
+            "p50_us": 2.019,
+            "p99_us": 3.258,
+            "mean_us": 2.073321920775598,
+            "status": "ok"
+          },
+          {
+            "event": "start",
+            "case": "model-getProperty@1"
+          },
+          {
+            "event": "case",
+            "case": "model-getProperty",
+            "threads": 1,
+            "ops": 844239,
+            "seconds": 2.000153938,
+            "ops_per_s": 422087.0123847438,
+            "p50_us": 2.312,
+            "p99_us": 2.776,
+            "mean_us": 2.341304513295406,
+            "status": "ok"
+          },
+          {
+            "event": "start",
+            "case": "model-getProperty@4"
+          },
+          {
+            "event": "case",
+            "case": "model-getProperty",
+            "threads": 4,
+            "ops": 2338256,
+            "seconds": 2.000153047,
+            "ops_per_s": 1169038.5410792017,
+            "p50_us": 3.234,
+            "p99_us": 4.861,
+            "mean_us": 3.36427085913604,
+            "status": "ok"
+          },
+          {
+            "event": "start",
+            "case": "model-listProperties@1"
+          },
+          {
+            "event": "case",
+            "case": "model-listProperties",
+            "threads": 1,
+            "ops": 392058,
+            "seconds": 2.000151297,
+            "ops_per_s": 196014.17182192294,
+            "p50_us": 5.04,
+            "p99_us": 6.297,
+            "mean_us": 5.071795428227456,
+            "status": "ok"
+          },
+          {
+            "event": "start",
+            "case": "model-listProperties@4"
+          },
+          {
+            "event": "case",
+            "case": "model-listProperties",
+            "threads": 4,
+            "ops": 1358223,
+            "seconds": 2.000099776,
+            "ops_per_s": 679077.6221755849,
+            "p50_us": 5.746,
+            "p99_us": 7.807,
+            "mean_us": 5.853805880183151,
+            "status": "ok"
+          },
+          {
+            "event": "start",
+            "case": "sparql-select-o@1"
+          },
+          {
+            "event": "case",
+            "case": "sparql-select-o",
+            "threads": 1,
+            "ops": 67321,
+            "seconds": 2.00014914,
+            "ops_per_s": 33657.99012367648,
+            "p50_us": 28.685,
+            "p99_us": 35.567,
+            "mean_us": 29.674779741833902,
+            "status": "ok"
+          },
+          {
+            "event": "start",
+            "case": "sparql-select-o@4"
+          },
+          {
+            "event": "case",
+            "case": "sparql-select-o",
+            "threads": 4,
+            "ops": 112660,
+            "seconds": 2.000083828,
+            "ops_per_s": 56327.63908333545,
+            "p50_us": 71.027,
+            "p99_us": 96.487,
+            "mean_us": 70.95229208237174,
+            "status": "ok"
+          },
+          {
+            "event": "start",
+            "case": "model-iterate-all@1"
+          },
+          {
+            "event": "case",
+            "case": "model-iterate-all",
+            "threads": 1,
+            "ops": 124,
+            "seconds": 2.000154956,
+            "ops_per_s": 61.995196736147285,
+            "p50_us": 15966.945,
+            "p99_us": 17927.024,
+            "mean_us": 16097.016185483872,
+            "status": "ok"
+          },
+          {
+            "event": "start",
+            "case": "model-iterate-all@4"
+          },
+          {
+            "event": "case",
+            "case": "model-iterate-all",
+            "threads": 4,
+            "ops": 442,
+            "seconds": 2.000160273,
+            "ops_per_s": 220.98229125261702,
+            "p50_us": 17630.085,
+            "p99_us": 21734.292,
+            "mean_us": 18130.682751131222,
+            "status": "ok"
+          },
+          {
+            "event": "start",
+            "case": "update-modify@1"
+          },
+          {
+            "event": "case",
+            "case": "update-modify",
+            "threads": 1,
+            "ops": 8846,
+            "seconds": 2.000093235,
+            "ops_per_s": 4422.793820409077,
+            "p50_us": 211.446,
+            "p99_us": 490.746,
+            "mean_us": 226.04708727108297,
+            "status": "ok"
+          },
+          {
+            "event": "start",
+            "case": "update-modify@4"
+          },
+          {
+            "event": "case",
+            "case": "update-modify",
+            "threads": 4,
+            "ops": 3279,
+            "seconds": 2.000094814,
+            "ops_per_s": 1639.4222799079764,
+            "p50_us": 2566.884,
+            "p99_us": 3058.59,
+            "mean_us": 2439.803573345532,
+            "status": "ok"
+          },
+          {
+            "event": "done",
+            "sink": 8486147286
+          }
+        ]
+      },
+      {
+        "arm": "base",
+        "engine": "sparkles-mem",
+        "opts": [],
+        "mode": "time",
+        "label": "base-r5",
+        "exit": 0,
+        "killed": false,
+        "wall_s": 37.259489789001236,
+        "events": [
+          {
+            "event": "versions",
+            "versions": {
+              "java": "21.0.12+8-LTS",
+              "jena": "5.6.0",
+              "processors": 6,
+              "max_heap_mib": 4096
+            }
+          },
+          {
+            "event": "ready",
+            "ms": 444.042034,
+            "triples": 105300
+          },
+          {
+            "event": "start",
+            "case": "graph-contains@1"
+          },
+          {
+            "event": "case",
+            "case": "graph-contains",
+            "threads": 1,
+            "ops": 1174105,
+            "seconds": 2.000151352,
+            "ops_per_s": 587008.0775767213,
+            "p50_us": 1.7,
+            "p99_us": 2.013,
+            "mean_us": 1.6719388504435293,
+            "status": "ok"
+          },
+          {
+            "event": "start",
+            "case": "graph-contains@4"
+          },
+          {
+            "event": "case",
+            "case": "graph-contains",
+            "threads": 4,
+            "ops": 3351365,
+            "seconds": 2.000156515,
+            "ops_per_s": 1675551.3755382288,
+            "p50_us": 2.28,
+            "p99_us": 3.519,
+            "mean_us": 2.340626206933593,
+            "status": "ok"
+          },
+          {
+            "event": "start",
+            "case": "model-getProperty@1"
+          },
+          {
+            "event": "case",
+            "case": "model-getProperty",
+            "threads": 1,
+            "ops": 845502,
+            "seconds": 2.00015883,
+            "ops_per_s": 422717.42989530484,
+            "p50_us": 2.31,
+            "p99_us": 2.766,
+            "mean_us": 2.337654447890129,
+            "status": "ok"
+          },
+          {
+            "event": "start",
+            "case": "model-getProperty@4"
+          },
+          {
+            "event": "case",
+            "case": "model-getProperty",
+            "threads": 4,
+            "ops": 2376595,
+            "seconds": 2.000149546,
+            "ops_per_s": 1188208.654074309,
+            "p50_us": 3.176,
+            "p99_us": 4.794,
+            "mean_us": 3.311066251927653,
+            "status": "ok"
+          },
+          {
+            "event": "start",
+            "case": "model-listProperties@1"
+          },
+          {
+            "event": "case",
+            "case": "model-listProperties",
+            "threads": 1,
+            "ops": 396771,
+            "seconds": 2.000151956,
+            "ops_per_s": 198370.42821160535,
+            "p50_us": 4.977,
+            "p99_us": 6.231,
+            "mean_us": 5.010898301539175,
+            "status": "ok"
+          },
+          {
+            "event": "start",
+            "case": "model-listProperties@4"
+          },
+          {
+            "event": "case",
+            "case": "model-listProperties",
+            "threads": 4,
+            "ops": 1376978,
+            "seconds": 2.000155749,
+            "ops_per_s": 688435.388438343,
+            "p50_us": 5.631,
+            "p99_us": 7.726,
+            "mean_us": 5.758855410180845,
+            "status": "ok"
+          },
+          {
+            "event": "start",
+            "case": "sparql-select-o@1"
+          },
+          {
+            "event": "case",
+            "case": "sparql-select-o",
+            "threads": 1,
+            "ops": 67161,
+            "seconds": 2.000066864,
+            "ops_per_s": 33579.37737425562,
+            "p50_us": 28.536,
+            "p99_us": 42.294,
+            "mean_us": 29.744402167924836,
+            "status": "ok"
+          },
+          {
+            "event": "start",
+            "case": "sparql-select-o@4"
+          },
+          {
+            "event": "case",
+            "case": "sparql-select-o",
+            "threads": 4,
+            "ops": 120210,
+            "seconds": 2.000082123,
+            "ops_per_s": 60102.53209987818,
+            "p50_us": 66.292,
+            "p99_us": 86.615,
+            "mean_us": 66.4952783212711,
+            "status": "ok"
+          },
+          {
+            "event": "start",
+            "case": "model-iterate-all@1"
+          },
+          {
+            "event": "case",
+            "case": "model-iterate-all",
+            "threads": 1,
+            "ops": 124,
+            "seconds": 2.000149067,
+            "ops_per_s": 61.995379267399365,
+            "p50_us": 15923.588,
+            "p99_us": 18226.087,
+            "mean_us": 16070.669112903226,
+            "status": "ok"
+          },
+          {
+            "event": "start",
+            "case": "model-iterate-all@4"
+          },
+          {
+            "event": "case",
+            "case": "model-iterate-all",
+            "threads": 4,
+            "ops": 444,
+            "seconds": 2.000154301,
+            "ops_per_s": 221.9828739102864,
+            "p50_us": 17718.302,
+            "p99_us": 21727.803,
+            "mean_us": 18102.62242117117,
+            "status": "ok"
+          },
+          {
+            "event": "start",
+            "case": "update-modify@1"
+          },
+          {
+            "event": "case",
+            "case": "update-modify",
+            "threads": 1,
+            "ops": 9343,
+            "seconds": 2.000065395,
+            "ops_per_s": 4671.347258623011,
+            "p50_us": 205.638,
+            "p99_us": 328.31,
+            "mean_us": 214.00634132505618,
+            "status": "ok"
+          },
+          {
+            "event": "start",
+            "case": "update-modify@4"
+          },
+          {
+            "event": "case",
+            "case": "update-modify",
+            "threads": 4,
+            "ops": 3206,
+            "seconds": 2.000090834,
+            "ops_per_s": 1602.9271998553643,
+            "p50_us": 2606.483,
+            "p99_us": 3081.101,
+            "mean_us": 2494.824290393013,
+            "status": "ok"
+          },
+          {
+            "event": "done",
+            "sink": 8508413735
+          }
+        ]
+      }
+    ]
+  }
+}
