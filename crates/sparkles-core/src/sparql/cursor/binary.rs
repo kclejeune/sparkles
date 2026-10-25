@@ -278,36 +278,6 @@ impl EqualityIndex {
     }
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::store::{Store, StoreOptions};
-
-    #[test]
-    fn equality_index_covers_loose_rows_across_vector_growth_boundaries() {
-        let store = Store::in_memory(StoreOptions::default());
-        let mut ctx = Ctx::new(store.snapshot());
-        ctx.mem_limit = 16 << 20;
-        ctx.enable_cursor_accounting().unwrap();
-        let ctx = Arc::new(ctx);
-        ctx.attach_cursor_owner();
-        for len in [65_536, 65_537] {
-            let mut build = Table::new(vec![0]);
-            for row in 0..len {
-                build.push_row(&[Id::from_i64(row as i64).unwrap()]);
-            }
-            // Building the index also checks that every temporary allocation
-            // fits its charge before the temporary keys have been dropped.
-            let index = EqualityIndex::new(&ctx, &build, 0, 0).unwrap();
-            assert_eq!(index.loose.len(), len);
-            assert_eq!(
-                index._charge.as_ref().unwrap().bytes(),
-                len as u64 * 4 + 1024
-            );
-        }
-    }
-}
-
 /// The build rows a probe row may match: every build row, or the rows of its key and
 /// then the rows that leave the key unbound.
 #[derive(Clone, Copy)]
@@ -1018,4 +988,34 @@ pub(super) fn gather(
         }
     }
     out.len += lp.len();
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::store::{Store, StoreOptions};
+
+    #[test]
+    fn equality_index_covers_loose_rows_across_vector_growth_boundaries() {
+        let store = Store::in_memory(StoreOptions::default());
+        let mut ctx = Ctx::new(store.snapshot());
+        ctx.mem_limit = 16 << 20;
+        ctx.enable_cursor_accounting().unwrap();
+        let ctx = Arc::new(ctx);
+        ctx.attach_cursor_owner();
+        for len in [65_536, 65_537] {
+            let mut build = Table::new(vec![0]);
+            for row in 0..len {
+                build.push_row(&[Id::from_i64(row as i64).unwrap()]);
+            }
+            // Building the index also checks that every temporary allocation
+            // fits its charge before the temporary keys have been dropped.
+            let index = EqualityIndex::new(&ctx, &build, 0, 0).unwrap();
+            assert_eq!(index.loose.len(), len);
+            assert_eq!(
+                index._charge.as_ref().unwrap().bytes(),
+                len as u64 * 4 + 1024
+            );
+        }
+    }
 }

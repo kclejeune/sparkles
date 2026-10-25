@@ -364,6 +364,48 @@ fn keyed_ask_admits_small_inputs_when_the_matching_prefix_exceeds_its_budget() {
     }
 }
 
+#[test]
+fn keyed_ask_discards_history_after_eof_and_keeps_late_matches() {
+    for expected in [false, true] {
+        let store = Store::in_memory(StoreOptions::default());
+        let mut data = String::new();
+        for (side, rows) in [("left", 1000), ("right", 20_000)] {
+            for i in 0..rows {
+                if i == rows - 1 {
+                    let key = if expected { "shared" } else { side };
+                    data += &format!("<urn:{side}zz-last> <urn:{side}> <urn:zz-{key}> .\n");
+                } else {
+                    data += &format!("<urn:{side}{i}> <urn:{side}> <urn:{side}-key{i}> .\n");
+                }
+            }
+        }
+        load(&store, data);
+        for equality in ["?x = ?y", "?y = ?x"] {
+            let text = format!("ASK {{ ?l <urn:left> ?x . ?r <urn:right> ?y FILTER({equality}) }}");
+            let opts = QueryOptions {
+                max_memory_bytes: Some(512 << 10),
+                ..options(100_000, true)
+            };
+            let execution = query_execution(
+                store.snapshot(),
+                &text,
+                &opts,
+                &CursorOptions {
+                    batch_rows: 64,
+                    ..Default::default()
+                },
+                ExecutionMode::Auto,
+            )
+            .unwrap();
+            let QueryExecution::Ask(answer) = execution else {
+                panic!("native keyed ASK")
+            };
+            assert_eq!(answer.result().boolean, expected, "{equality}");
+            assert!(answer.result().mem_peak_bytes <= 512 << 10);
+        }
+    }
+}
+
 /// An application callback in the FILTER sees every pair the product tests, so its
 /// calls and their order decide the answer as before.
 #[test]
@@ -516,6 +558,14 @@ fn native_keyed_ask_preserves_empty_inputs_value_errors_and_budgets() {
             "{kind:?}"
         );
     }
+    let retained_limit = QueryOptions {
+        max_memory_bytes: Some(64 << 10),
+        ..options(100_000, true)
+    };
+    assert!(matches!(
+        run("?l = ?r", &retained_limit, ExecutionMode::Streaming),
+        Err(Error::BudgetExceeded(b)) if b.kind == BudgetKind::Memory
+    ));
     let cancelled = QueryOptions {
         cancel: Some(Arc::new(AtomicBool::new(true))),
         ..options(100_000, true)
@@ -532,4 +582,36 @@ fn native_keyed_ask_preserves_empty_inputs_value_errors_and_budgets() {
         run("true", &expired, ExecutionMode::Auto),
         Err(Error::Timeout)
     ));
+}
+
+#[test]
+fn graph_discounted_scan_estimates_do_not_make_a_keyed_ask_eager() {
+    let store = Store::in_memory(StoreOptions::default());
+    let mut data = String::new();
+    for (side, rows) in [("left", 160), ("right", 800)] {
+        for i in 0..rows {
+            data += &format!("<urn:{side}{i}> <urn:{side}> <urn:shared> .\n");
+        }
+    }
+    data += "<urn:noisegraph> {\n";
+    for i in 0..8640 {
+        data += &format!("<urn:noise{i}> <urn:noise> <urn:noise{i}> .\n");
+    }
+    data += "}\n";
+    store
+        .load(&[Source::from_bytes(data.into_bytes(), RdfFormat::TriG, None)])
+        .unwrap();
+    let text = "ASK { ?l <urn:left> ?x . ?r <urn:right> ?y FILTER(?x = ?y) }";
+    let execution = query_execution(
+        store.snapshot(),
+        text,
+        &options(1024, true),
+        &Default::default(),
+        ExecutionMode::Auto,
+    )
+    .unwrap();
+    let QueryExecution::Ask(answer) = execution else {
+        panic!("discounted counts cannot prove that the eager prefix fits")
+    };
+    assert!(answer.result().boolean);
 }

@@ -963,7 +963,10 @@ fn filtered_ask_admitted(ctx: &Ctx, node: &Node) -> bool {
         let held =
             small.est * (small.vars.len() * 8) as f64 + prefix * (large.vars.len() * 8) as f64;
         let bytes = candidates * ((filtered.vars.len() + 1) * 8) as f64 + held;
-        let bounded = candidates <= ctx.max_rows as f64 && bytes <= ctx.memory_remaining() as f64;
+        let bounded = candidates <= ctx.max_rows as f64
+            && bytes <= ctx.memory_remaining() as f64
+            && exact_scan(ctx, a)
+            && exact_scan(ctx, b);
         return (small.est >= AUTO_SCAN_ROWS || !bounded) && native(filtered);
     }
     let Kind::Filter(expressions) = &filtered.kind else {

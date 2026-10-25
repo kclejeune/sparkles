@@ -11,9 +11,10 @@
 //! This is the symmetric hash join of Wilschut and Apers. Once an input is exhausted, the
 //! rows of the other one are only probed and no longer indexed.
 //!
-//! It holds the rows of both inputs read so far, where a hash join holds one input. When
-//! no pair matches, it reads and holds both inputs whole, so it runs only under ASK.
-use super::binary::gather;
+//! It holds prefixes of both inputs while both can produce rows, where a hash join
+//! holds one complete input. At EOF it drops the other input's history and retains
+//! only that input's active probe batch. The extra prefix storage runs only under ASK.
+use super::binary::{gather, map_bytes};
 use super::{Buffer, CursorOptions, Operator, merge};
 use crate::error::Result;
 use crate::id::Id;
@@ -39,13 +40,24 @@ struct Side {
     /// The rows of the next read.
     want: usize,
     charge: Option<RetainedCharge>,
-    /// Bytes of `keyed` and `loose`, as charged.
-    index_bytes: u64,
+    /// Capacity bytes of row-position vectors, excluding the map's buckets.
+    position_bytes: u64,
 }
 
 impl Side {
     fn rows(&self) -> usize {
         self.held.as_ref().map_or(0, |b| b.table.len)
+    }
+
+    fn discard_history(&mut self) -> Result<()> {
+        self.held = None;
+        self.keyed = FxHashMap::default();
+        self.loose = Vec::new();
+        self.position_bytes = 0;
+        if let Some(charge) = &mut self.charge {
+            charge.resize(1024)?;
+        }
+        Ok(())
     }
 }
 
@@ -73,6 +85,18 @@ pub(super) fn eligible(node: &Node) -> bool {
 }
 
 impl Ripple {
+    fn finish_side(&mut self, side: usize) -> Result<()> {
+        self.sides[side].done = true;
+        if self.sides[side].rows() == 0 {
+            self.sides[1 - side].done = true;
+        } else {
+            // Every retained row of the other side has already met this side's
+            // complete input. Only its future probe batches can find new pairs.
+            self.sides[1 - side].discard_history()?;
+        }
+        Ok(())
+    }
+
     pub(super) fn new(ctx: &Ctx, node: &Node) -> Result<Self> {
         let Kind::KeyedJoin {
             expr, left, right, ..
@@ -99,7 +123,7 @@ impl Ripple {
                 done: false,
                 want: FIRST_BATCH,
                 charge: ctx.retained_charge(1024)?,
-                index_bytes: 0,
+                position_bytes: 0,
             })
         };
         Ok(Self {
@@ -122,6 +146,13 @@ impl Ripple {
         options: &CursorOptions,
     ) -> Result<bool> {
         loop {
+            // A child may report EOF together with its final nonempty batch.
+            // Its last batch has finished probing before another read begins.
+            for side in 0..2 {
+                if children[side].done && !self.sides[side].done {
+                    self.finish_side(side)?;
+                }
+            }
             if self.sides.iter().all(|s| s.done) {
                 return Ok(false);
             }
@@ -134,16 +165,16 @@ impl Ripple {
             let want = self.sides[s].want;
             self.sides[s].want = want.saturating_mul(4).min(options.batch_rows.max(1));
             let Some(batch) = children[s].next(ctx, options, want)? else {
-                self.sides[s].done = true;
-                // an empty input meets no row of the other one
-                if self.sides[s].rows() == 0 {
-                    self.sides[1 - s].done = true;
-                }
+                self.finish_side(s)?;
                 continue;
             };
             let n = batch.table.len;
             if n == 0 {
                 continue;
+            }
+            if self.sides[1 - s].done {
+                // The previous probe batch has no remaining consumer.
+                self.sides[s].held = None;
             }
             let side = &mut self.sides[s];
             let start = side.rows();
@@ -155,6 +186,21 @@ impl Ripple {
             if !self.sides[1 - s].done {
                 let side = &mut self.sides[s];
                 let held = &side.held.as_ref().expect("held rows").table;
+                // Reserve before either the map or its row vectors can allocate.
+                // Each u32 vector's geometric capacity is at most four times its
+                // populated rows. The old index remains charged while an allocation
+                // moves, and reserving the map for every incoming key prevents any
+                // unplanned bucket growth during the fill.
+                if let Some(charge) = &mut side.charge {
+                    charge.resize(
+                        map_bytes(side.keyed.capacity(), 32)
+                            .saturating_add(side.position_bytes)
+                            .saturating_add(map_bytes(side.keyed.len().saturating_add(n), 32))
+                            .saturating_add((start.saturating_add(n) as u64).saturating_mul(16))
+                            .saturating_add(1024),
+                    )?;
+                }
+                side.keyed.reserve(n);
                 for row in start..start + n {
                     if row.is_multiple_of(1024) {
                         ctx.check()?;
@@ -162,19 +208,24 @@ impl Ripple {
                     match eq_key(ctx, held.cols[self.key[s]][row])? {
                         EqKey::Unbound => {}
                         EqKey::Key(k) => {
-                            // a key's entry and its first row, then 4 bytes a row
                             let rows = side.keyed.entry(k).or_default();
-                            side.index_bytes += if rows.is_empty() { 52 } else { 4 };
+                            let before = rows.capacity();
                             rows.push(row as u32);
+                            side.position_bytes += (rows.capacity() - before) as u64 * 4;
                         }
                         EqKey::Loose => {
-                            side.index_bytes += 4;
+                            let before = side.loose.capacity();
                             side.loose.push(row as u32);
+                            side.position_bytes += (side.loose.capacity() - before) as u64 * 4;
                         }
                     }
                 }
                 if let Some(charge) = &mut side.charge {
-                    charge.resize(side.index_bytes.saturating_mul(2) + 1024)?;
+                    charge.resize(
+                        map_bytes(side.keyed.capacity(), 32)
+                            .saturating_add(side.position_bytes)
+                            .saturating_add(1024),
+                    )?;
                 }
             }
             self.probe = Some(Probe {
@@ -279,11 +330,73 @@ impl Ripple {
             side.held = None;
             side.keyed = FxHashMap::default();
             side.loose = Vec::new();
-            side.index_bytes = 0;
+            side.position_bytes = 0;
             if let Some(charge) = &mut side.charge {
                 let _ = charge.resize(0);
             }
         }
         self.probe = None;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::store::{Store, StoreOptions};
+    use crate::{BudgetKind, Error};
+
+    #[test]
+    fn refused_index_growth_leaves_its_allocations_unchanged() {
+        let store = Store::in_memory(StoreOptions::default());
+        let mut ctx = Ctx::new(store.snapshot());
+        ctx.mem_limit = 7 << 10;
+        let (x, y) = (ctx.var("x"), ctx.var("y"));
+        ctx.enable_cursor_accounting().unwrap();
+        let ctx = Arc::new(ctx);
+        ctx.attach_cursor_owner();
+        let values = |v| {
+            let mut t = Table::new(vec![v]);
+            for row in 0..64 {
+                t.push_row(&[Id::bnode(row)]);
+            }
+            Node::leaf(Kind::Values(t), vec![v], 64.0, "values".into())
+        };
+        let (left, right) = (values(x), values(y));
+        let mut join = Node::leaf(
+            Kind::KeyedJoin {
+                expr: Expr::Eq(Box::new(Expr::Var(x)), Box::new(Expr::Var(y))),
+                left: x,
+                right: y,
+                ripple: true,
+            },
+            vec![x, y],
+            64.0,
+            "keyed".into(),
+        );
+        join.children = vec![left.clone(), right.clone()];
+        let mut children = vec![
+            Operator::build(
+                &ctx,
+                left,
+                super::super::FallbackPolicy::RejectMaterialization,
+            )
+            .unwrap(),
+            Operator::build(
+                &ctx,
+                right,
+                super::super::FallbackPolicy::RejectMaterialization,
+            )
+            .unwrap(),
+        ];
+        let mut ripple = Ripple::new(&ctx, &join).unwrap();
+        assert!(matches!(
+            ripple.read(&ctx, &mut children, &CursorOptions::default()),
+            Err(Error::BudgetExceeded(b)) if b.kind == BudgetKind::Memory
+        ));
+        let side = &ripple.sides[1];
+        assert_eq!(side.keyed.capacity(), 0);
+        assert_eq!(side.loose.capacity(), 0);
+        assert_eq!(side.position_bytes, 0);
+        assert_eq!(side.charge.as_ref().unwrap().bytes(), 1024);
     }
 }
