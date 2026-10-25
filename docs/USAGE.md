@@ -2017,6 +2017,10 @@ that queries would read wrongly. Warnings are states that open handles by itself
 server that writes during the check can cause transient warnings, because an in-flight
 transaction looks like a torn tail, but never errors.
 
+If full-text commits or merges keep replacing files during inspection, the text check
+warns that the index changed and asks for another run. It inspects up to three metadata
+snapshots before issuing that warning.
+
 `--quick` reads metadata only. It reads block metadata instead of every block, the first
 key of each vocabulary block, and whether segment files exist instead of their
 checksums. On the 10.5M-quad benchmark database, a full check takes about 0.3 s and a
