@@ -97,9 +97,10 @@ with result caches off, and every engine's answers were checked before timing.
 
 Paired forge runs put Sparkles ahead of Jena on SP²Bench `q12a` and QLever on BSBM BI `q2`.
 Sparkles has a lower pooled time than Fluree on BSBM Explore `q5`, with the closest
-instance tied within 4%. Oxigraph answers SP²Bench `q12b` 1.3× faster and commits
-single writes faster because it does not synchronize them to disk, with a
-median of 0.926 ms against 1.284 ms for a new literal at 10.5M triples. Sparkles also uses
+instance tied within 4%. Sparkles answers SP²Bench `q12b` within 8% of Oxigraph, inside
+the ten-percent tie band. Oxigraph commits single writes faster without synchronizing
+them to disk, with a median of 0.926 ms against 1.284 ms for a new literal at 10.5M
+triples. Sparkles also uses
 more memory than QLever at its peak in exchange for speed, 1,339 MiB against 939 MiB under
 16 readers at 10.5M triples, mostly for a 1 GiB decoded-block cache that can be made
 smaller. [docs/BENCHMARKS.md](docs/BENCHMARKS.md) has every measurement, the cost of each

@@ -75,7 +75,8 @@ On larger and standard workloads:
   materializes in 17.8 s, Sparkles is fastest on 13 of 14 queries. QLever is 3.7× faster
   on `q2`.
 * **SP²Bench at 10M triples.** Paired forge runs put `q12a` at 3.8 ms against Jena's
-  9.0 ms, while `q12b` remains at 5.0 ms against Oxigraph's 3.8 ms. Sparkles is the only
+  9.0 ms. `q12b` takes 4.0 ms against Oxigraph's 3.7 ms, inside the ten-percent tie band.
+  Sparkles is the only
   engine that answers `q5a`, whose rows match an independent oracle. It answers `q6` in
   0.95 s, 115× faster than Jena. Its `q4` answer of 1.96 GB is larger than the default
   response budget.
@@ -105,11 +106,10 @@ gives the cost and the speed of each such default.
 
 This table lists every comparison on this page where another engine is ahead by more
 than 10%. Fluree's warm advantages on `distinct-obj` at 1.05M and on two small DBpedia
-50M queries are within 10%.
+50M queries are within 10%. SP²Bench `q12b` is also within 8% of Oxigraph.
 
 | Case | Reference advantage | Qualification |
 |---|---|---|
-| SP²Bench `q12b`, 10M | Oxigraph 1.33× | The paired mean is 5.0 ms for Sparkles against 3.8 ms for Oxigraph ([roadmap](ROADMAP.md) item 91). |
 | WatDiv `L1-1`, 10.97M | Fluree 1.11× | Sparkles has the lowest mean on 19 of 20 templates, ties Fluree on S7 and leads on 81 of 88 instances. |
 | BSBM Explore `q7` and `q8`, 10M | Oxigraph 1.2× on `q7` and 1.4× on `q8` | Pooled medians cover three instances per template. Wrong answers are excluded from the ranking. |
 | BSBM BI `q3`, 10M | QLever 1.24× | The three fixed-instance answer checks agree. The driver cells have not been rerun since [roadmap](ROADMAP.md) item 96 removed the budget refusal that failed them. |
@@ -417,8 +417,9 @@ Testing of RDF Data Management Systems,” ISWC 2014.
 
 SP²Bench v1.01 generates bibliographic data in the style of DBLP. At 10M triples its
 N-Triples file is 1.49 GB. The 17 queries ran with a request limit of 600 s. Times are
-mean ± σ in ms. The paired `q12a` and `q12b` cells use 30 runs after 10 warm-ups, and
-the other cells use 10 runs after 2 warm-ups. In the original answer check, which kept all five
+mean ± σ in ms. The paired `q12a` cells and Jena's `q12b` cell use 30 runs after
+10 warm-ups. The Sparkles and Oxigraph `q12b` cells pool two reversed-order runs of
+60 requests after 15 warm-ups per engine. Other cells use 10 runs after 2 warm-ups. In the original answer check, which kept all five
 servers up, the servers of QLever and Fluree were killed during `q4`, so their answers
 from `q5a` on were not checked (§). `mise run bench:sp2b 10m` reproduces the run.
 
@@ -439,13 +440,16 @@ from `q5a` on were not checked (§). `mise run bench:sp2b 10m` reproduces the ru
 | q10 | **3.8 ± 0.2** | 7.3 ± 0.5 | 6.8 ± 0.6 § | 4.2 ± 0.2 § | 7.6 ± 0.9 |
 | q11 | **103.1 ± 9.0** | 375.8 ± 21.4 | 42.8 ± 2.8 § | 51.7 ± 0.8 § | 31619.1 ± 97.9 |
 | q12a | **3.8 ± 0.1** | 9.0 ± 1.1 | 245.1 ± 7.3 § | 1670.3 ± 5.7 § | 6794.7 ± 61.5 |
-| q12b | 5.0 ± 0.2 | 9.7 ± 1.3 | error | 180.5 ± 2.9 § | **3.8 ± 0.1** |
+| q12b | 4.0 ± 0.1 | 9.7 ± 1.3 | error | 180.5 ± 2.9 § | **3.7 ± 0.1** |
 | q12c | **3.6 ± 0.1** | 6.7 ± 0.2 | 4.2 ± 0.1 § | 3.4 ± 0.1 § | 3.7 ± 0.1 |
 
-*The `q12a` and `q12b` cells for Sparkles, Jena and Oxigraph come from the
+*The Sparkles and Oxigraph `q12b` cells come from the
+[pure ASK prefix record](benchmarks/2026-10-25-pure-ask-prefix-q12b-forge.json), with
+Sparkles at `b26ce6a9`. Oxigraph has the lower mean, and the 7.8% difference is inside
+the ten-percent tie band. The `q12a` cells and Jena's `q12b` cell come from the
 [paired forge record](benchmarks/2026-10-25-competitive-query-pairs-forge.json), with
-Sparkles at `2ec8a266`. The other Sparkles cells were measured at `6699f27d`, and the
-[SP²Bench record](benchmarks/2026-10-23-sp2b-10m-forge.json) keeps their samples and the
+Sparkles at `2ec8a266`. Other Sparkles cells were measured at `6699f27d`, and the
+[SP²Bench record](benchmarks/2026-10-23-sp2b-10m-forge.json) keeps those samples and the
 other engine cells.*
 
 Sparkles is the only engine that answers `q5a`, whose 385,208 rows match an independent
