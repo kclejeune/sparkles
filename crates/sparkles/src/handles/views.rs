@@ -752,6 +752,72 @@ mod tests {
         reader.join().unwrap();
     }
 
+    /// An owner initialized before operation tracking can use views from its TLS
+    /// destructor. Run in a subprocess because a TLS destructor panic aborts.
+    #[test]
+    fn tls_owner_can_close_views_during_teardown() {
+        const CHILD: &str = "SPARKLES_TEST_VIEWS_TLS_TEARDOWN";
+        const TEST: &str = "handles::views::tests::tls_owner_can_close_views_during_teardown";
+        if std::env::var(CHILD).as_deref() == Ok(TEST) {
+            struct Owner(Arc<DatasetState>);
+            impl Drop for Owner {
+                fn drop(&mut self) {
+                    assert!(!self.0.views.is_closed());
+                    assert!(self.0.views.list(&self.0.store).is_empty());
+                    assert!(self.0.views.is_closed());
+                }
+            }
+            thread_local! {
+                static OWNER: std::cell::RefCell<Option<Owner>> = const { std::cell::RefCell::new(None) };
+            }
+            let dir = tempfile::tempdir().unwrap();
+            let root = dir.path().to_path_buf();
+            std::thread::spawn(move || {
+                let ds = Dataset::open(&root).unwrap();
+                // Keep existing store-access TLS alive past OWNER, while operation
+                // tracking is first initialized afterward by set_host.
+                drop(ds.store().snapshot());
+                let state = ds.inner.clone();
+                OWNER.with(|owner| *owner.borrow_mut() = Some(Owner(state.clone())));
+                state.views.set_host(Arc::new(ClosingHost {
+                    ds: parking_lot::Mutex::new(Some(ds)),
+                    method: "inference",
+                    call: 1,
+                    calls: std::sync::atomic::AtomicUsize::new(0),
+                    panic: false,
+                }));
+            })
+            .join()
+            .unwrap();
+            let _reopened = Dataset::open(dir.path()).unwrap();
+            return;
+        }
+        let mut child = std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", TEST, "--nocapture"])
+            .env(CHILD, TEST)
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .spawn()
+            .unwrap();
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        while child.try_wait().unwrap().is_none() {
+            if std::time::Instant::now() >= deadline {
+                let _ = child.kill();
+                let _ = child.wait();
+                panic!("TLS teardown child deadlocked");
+            }
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        let output = child.wait_with_output().unwrap();
+        assert!(
+            output.status.success(),
+            "TLS teardown child failed: {}\n{}\n{}",
+            output.status,
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
     /// The last handle of a dataset with running views closes it on its own thread, so
     /// the directory opens again at once.
     #[test]

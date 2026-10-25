@@ -32,6 +32,7 @@ use sha2::{Digest, Sha256};
 use spargebra::Query;
 use std::cell::RefCell;
 use std::collections::{BTreeMap, VecDeque};
+use std::mem::ManuallyDrop;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Weak};
@@ -451,16 +452,24 @@ pub struct Runtime {
     switched: AtomicU64,
 }
 
-#[derive(Default)]
 struct Operations {
     depth: usize,
     close: Vec<Box<dyn FnOnce()>>,
 }
 
+type OperationStorage = ManuallyDrop<RefCell<Operations>>;
+
+// A TLS owner can call views after other TLS destructors have run. This key must
+// never register a destructor or become inaccessible during thread teardown.
+const _: () = assert!(!std::mem::needs_drop::<OperationStorage>());
+
 thread_local! {
     // Nesting can cross runtimes. No cleanup runs while any caller's metadata
-    // locks or worker gate remain held on this thread.
-    static OPERATIONS: RefCell<Operations> = RefCell::default();
+    // locks or worker gate remain held on this thread. Every outer drain takes
+    // and frees the pending Vec, leaving this destruction-free storage empty.
+    static OPERATIONS: OperationStorage = const {
+        ManuallyDrop::new(RefCell::new(Operations { depth: 0, close: Vec::new() }))
+    };
 }
 
 /// Declare before operation-local guards, so cleanup runs after their locks drop.
