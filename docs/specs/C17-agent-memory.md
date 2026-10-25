@@ -1337,11 +1337,11 @@ Phases 1b and 1c). See the [roadmap](../ROADMAP.md).
 
 ### Shared memory representation
 
-[Roadmap](../ROADMAP.md) item 81 extends the existing memory model to a shared profile
-for agent memory and personal knowledge, sometimes called a second brain. It is deferred
-and has no active implementation lane. The current data model, vocabulary and shipped
-behaviour remain as recorded above. The workflow requirements are in
-[C18](C18-natural-language-questions-and-ingest.md#shared-memory-workflows).
+[Roadmap](../ROADMAP.md) item 81 extends the existing memory model with the shared
+profile specified by [C25](C25-evidence-and-assessments.md). It connects evidence,
+claims, authored records and review decisions. The profile is unimplemented, and the
+current vocabulary and shipped behaviour remain as recorded above. The workflow
+requirements are in [C18](C18-natural-language-questions-and-ingest.md#shared-memory-workflows).
 
 The profile will connect sources and document renditions, cited assertions, shared
 entities, notes, decisions and tasks. Human notes and agent episodes can describe the
@@ -1352,8 +1352,10 @@ two sources supporting one triple must retain their separate evidence records.
 The design will reuse RDF, PROV-O, Dublin Core terms, schema.org and the existing
 `mem:` and `spk:` terms where their meanings fit. It will declare additional classes
 and predicates only for missing meanings, with definitions, examples, SHACL shapes and
-ingest profiles. Exact new term names and their cardinalities remain design decisions.
-The work does not require a separate memory store or the F21 ontology object API.
+ingest profiles. C25 defines the additional terms and cardinalities, with temporal
+selection in [C27](C27-valid-time-profiles.md) and dependency maintenance in
+[F22](F22-analysis-lifecycle.md). The work does not require a separate memory store or
+the F21 ontology object API.
 
 The profile must distinguish a reference to a document, evidence supporting an
 assertion, a conflicting assertion, derivation of a conclusion, and a dependency between
