@@ -74,7 +74,6 @@ internal class ByteBuf(initial: Int = 256) {
     private var buf = ByteArray(initial)
     var size: Int = 0
         private set
-    val capacity: Int get() = buf.size
 
     private fun ensure(n: Int) {
         if (size + n > buf.size) {
@@ -239,27 +238,14 @@ internal class TermWriter(val buf: ByteBuf = ByteBuf(), repeats: Boolean = true)
     }
 }
 
-// Patterns return an owned byte array. Borrow the scratch writer exclusively so a
-// custom Node getter can encode another pattern on the same thread without sharing it.
-private val patternWriter = ThreadLocal<TermWriter?>()
-private const val MAX_PATTERN_SCRATCH_BYTES = 4096
-
 /** The encoding of one quad pattern (graph, subject, predicate, object). */
 internal fun encodePattern(g: Node?, s: Node?, p: Node?, o: Node?): ByteArray {
-    val w = patternWriter.get() ?: TermWriter(ByteBuf(128), repeats = false)
-    patternWriter.set(null)
-    try {
-        w.graph(g)
-        w.slot(s)
-        w.slot(p)
-        w.slot(o)
-        return w.buf.toByteArray()
-    } finally {
-        if (w.buf.capacity <= MAX_PATTERN_SCRATCH_BYTES) {
-            w.reset()
-            patternWriter.set(w)
-        }
-    }
+    val w = TermWriter(ByteBuf(128), repeats = false)
+    w.graph(g)
+    w.slot(s)
+    w.slot(p)
+    w.slot(o)
+    return w.buf.toByteArray()
 }
 
 /** A batch of terms in the given order, `null` as tag 0. */
