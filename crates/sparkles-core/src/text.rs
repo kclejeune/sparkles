@@ -873,6 +873,8 @@ pub(crate) struct TextProbe {
     pub dirty: bool,
     /// the index could not be opened (or has another schema)
     pub open_error: Option<String>,
+    /// The committed files changed throughout the bounded inspection attempts.
+    pub changed: bool,
     pub payload: Option<ProbePayload>,
     pub payload_error: Option<String>,
     pub segments: usize,
@@ -1740,6 +1742,14 @@ mod imp {
     /// `checksums`, matches its checksum). A server may commit and merge meanwhile, so
     /// damage is re-checked against a fresh `meta.json` before it is reported.
     pub(crate) fn probe(root: &Path, checksums: bool) -> super::TextProbe {
+        probe_with_snapshot(root, checksums, |_| {})
+    }
+
+    fn probe_with_snapshot(
+        root: &Path,
+        checksums: bool,
+        mut after_snapshot: impl FnMut(&tantivy::IndexMeta),
+    ) -> super::TextProbe {
         let mut p = super::TextProbe::default();
         let config = match read_config(root) {
             Ok(Some(c)) => c,
@@ -1794,6 +1804,7 @@ mod imp {
             p.docs = meta.segments.iter().map(|s| s.num_docs() as u64).sum();
             p.files = 0;
             p.damaged.clear();
+            after_snapshot(&meta);
             let d = index.directory();
             for m in &meta.segments {
                 for f in m.list_files() {
@@ -1807,16 +1818,39 @@ mod imp {
                     }
                 }
             }
-            if p.damaged.is_empty() || attempt == 2 {
+            if p.damaged.is_empty() {
                 break;
             }
             // damage is reported only against the latest committed state
             match index.load_metas() {
-                Ok(m) if m.opstamp != meta.opstamp => continue,
+                Ok(m) if metas_differ(&m, &meta) => {
+                    if attempt == 2 {
+                        p.changed = true;
+                        p.damaged.clear();
+                    } else {
+                        continue;
+                    }
+                }
+                Err(e) => {
+                    p.open_error = Some(e.to_string());
+                    break;
+                }
                 _ => break,
             }
         }
         p
+    }
+
+    /// Whether `meta.json` names another set of files than before. A merge replaces
+    /// segments and deletes their files, but keeps the opstamp, so the opstamp alone
+    /// does not show that a live index moved on.
+    fn metas_differ(a: &tantivy::IndexMeta, b: &tantivy::IndexMeta) -> bool {
+        a.opstamp != b.opstamp
+            || !a
+                .segments
+                .iter()
+                .map(|s| (s.id(), s.delete_opstamp()))
+                .eq(b.segments.iter().map(|s| (s.id(), s.delete_opstamp())))
     }
 
     /// How long the index may hold unsynced commits before a checkpoint, and the period
@@ -3755,6 +3789,89 @@ mod imp {
     #[cfg(test)]
     mod tests {
         use super::*;
+
+        fn probe_merge_fixture(segments: usize) -> (tempfile::TempDir, IndexWriter) {
+            let root = tempfile::tempdir().unwrap();
+            let config = TextConfig::default();
+            std::fs::write(
+                root.path().join("text.json"),
+                serde_json::to_vec(&config).unwrap(),
+            )
+            .unwrap();
+            let (index, fields) = new_index(Some(&root.path().join("text")), &config).unwrap();
+            let mut writer: IndexWriter = index.writer_with_num_threads(1, 15_000_000).unwrap();
+            writer.set_merge_policy(Box::new(tantivy::indexer::NoMergePolicy));
+            for seq in 1..=segments {
+                writer
+                    .add_document(tantivy::doc!(fields.text => "probe"))
+                    .unwrap();
+                let mut commit = writer.prepare_commit().unwrap();
+                commit.set_payload(&payload(&config, seq as u64, 0));
+                commit.commit().unwrap();
+            }
+            assert_eq!(index.load_metas().unwrap().segments.len(), segments);
+            (root, writer)
+        }
+
+        /// Replace the first two segments without changing the opstamp. The probe's
+        /// metadata belongs to a separately opened index, so it cannot pin these files.
+        fn merge_probed_segments(root: &Path, writer: &mut IndexWriter, meta: &tantivy::IndexMeta) {
+            let old = meta.segments[0]
+                .list_files()
+                .into_iter()
+                .find(|p| p.extension().is_some_and(|e| e == "idx"))
+                .unwrap();
+            let ids: Vec<_> = meta.segments[..2].iter().map(|s| s.id()).collect();
+            writer.merge(&ids).wait().unwrap();
+            writer.garbage_collect_files().wait().unwrap();
+            let after = Index::open_in_dir(root.join("text"))
+                .unwrap()
+                .load_metas()
+                .unwrap();
+            assert_eq!(after.opstamp, meta.opstamp, "a merge keeps the opstamp");
+            assert!(
+                !root.join("text").join(old).exists(),
+                "the old file must be gone"
+            );
+        }
+
+        #[test]
+        fn a_probe_retries_a_merge_that_keeps_the_opstamp() {
+            let (root, mut writer) = probe_merge_fixture(2);
+            let mut snapshots = 0;
+            let p = probe_with_snapshot(root.path(), true, |meta| {
+                snapshots += 1;
+                if snapshots == 1 {
+                    merge_probed_segments(root.path(), &mut writer, meta);
+                }
+            });
+            assert_eq!(snapshots, 2, "the probe must inspect the merged metadata");
+            assert!(!p.changed);
+            assert!(p.open_error.is_none(), "{p:?}");
+            assert!(p.damaged.is_empty(), "{p:?}");
+            assert_eq!(p.segments, 1);
+            assert_eq!(p.docs, 2);
+        }
+
+        #[test]
+        fn a_probe_never_reports_damage_from_superseded_metadata() {
+            let (root, mut writer) = probe_merge_fixture(4);
+            let mut snapshots = 0;
+            let p = probe_with_snapshot(root.path(), true, |meta| {
+                snapshots += 1;
+                merge_probed_segments(root.path(), &mut writer, meta);
+            });
+            assert_eq!(snapshots, 3, "inspection must stay bounded");
+            assert!(p.changed, "{p:?}");
+            assert!(p.damaged.is_empty(), "{p:?}");
+            // Once writes stop, the same probe checks the surviving segment normally.
+            let p = probe(root.path(), true);
+            assert!(!p.changed);
+            assert!(p.open_error.is_none(), "{p:?}");
+            assert!(p.damaged.is_empty(), "{p:?}");
+            assert_eq!(p.segments, 1);
+            assert_eq!(p.docs, 4);
+        }
 
         #[test]
         fn a_background_checkpoint_allows_text_publication() {
