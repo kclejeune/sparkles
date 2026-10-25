@@ -1945,3 +1945,38 @@ repository copy and content-defined chunking** (item 61, Tier 6,
   FastCDC for `vocab.dat` behind the 30% gate of §5.4. It applies to plaintext
   repositories too, and the manifest records the chunker per file so old backups stay
   readable.
+
+
+### Recovery of managed definitions
+
+Roadmap item 220 extends the backup and clone manifest to carry nested view definitions,
+including `views/{name}/view.json`, with their schema version and digest. The same
+manifest contract covers the definitions of [F22](F22-analysis-lifecycle.md) and the
+settings and states of [C22b](C22b-report-configurations.md).
+
+The capture establishes one consistent boundary for data and dataset-managed definition
+revisions. Mutable definition files cannot be copied at arbitrary later times and
+called the configuration of the captured commit. Implementation must define and test
+a consistent lock order for the definition registry and data snapshot capture, and
+perform no network transfer under those locks. Captured immutable definition bytes
+and their revision identities can be uploaded after the snapshot has been pinned.
+
+The manifest names an allowlisted relative path, format version and content digest
+for every definition. Restore refuses traversal paths, symlink escapes, duplicate
+paths, unsupported required formats and missing or corrupt definition blobs before
+publishing the destination. It stages files beneath the unpublished restored root.
+Any new manifest layout is versioned in the format registry, and readers refuse
+required entries whose semantics they do not know.
+
+Derived view checkpoints can be omitted and rebuilt. Their definitions cannot be
+silently omitted. Restored views start building or paused until their principal and
+input scope have been checked. C26 jobs and outbox entries restore paused with new
+lease fences, so reopening a backup cannot deliver an old external notification.
+Credentials are secret references, not copied cleartext values. A clone has a new
+dataset identity and requires explicit remapping of references that should follow it.
+
+Acceptance tests back up several named views while definitions change, restore on an
+empty server and compare every definition revision and query result after rebuild.
+They also test missing blobs, unknown versions, permission changes, clone identity,
+interrupted restore and the absence of external deliveries before explicit resumption.
+The nested definition path and these recovery behaviors are planned and unimplemented.

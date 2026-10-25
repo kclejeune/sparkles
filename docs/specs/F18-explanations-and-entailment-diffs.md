@@ -648,3 +648,39 @@ row order, and the search does not depend on that order. `whyNot` answers `501` 
 that engine. When Phase 1 lands, its demand engine replaces the search behind the same
 route, and the tests compare the two on the same closures. U10 Phase 3 builds the search
 before F17, as U10's open question 1 proposed.
+
+
+### Supported visibility and evidence review
+
+Roadmap item 18's remaining Phase 3 includes the shared evidence profile of
+[C25](C25-evidence-and-assessments.md) and maintained assessments of
+[F22](F22-analysis-lifecycle.md). These are planned contracts, not behavior shipped
+with the explanation and entailment comparison phases.
+
+A derived triple is visible only when a kept complete derivation has asserted leaves
+visible to the caller. Under reviewed-only input selection, that same derivation must
+use only facts admitted by the selected review policy. Review decisions address exact
+claim and source revisions. A reviewed source label cannot admit a later unreviewed
+revision, and a reviewed hypothesis does not become an asserted premise without C25's
+separate admission step.
+
+Visibility uses the current principal and policy over the selected retained snapshot.
+Historical access rights do not grant present access. A cache key includes the dataset
+and branch identity, input commit, rule program, access fingerprint and review-policy
+revision. Revoking a grant or a review admission invalidates the applicable witnesses
+and caches before another result is served. A complete visible alternative may keep a
+fact readable after another support disappears. Truncated witness sets remain marked,
+and their failure to contain a visible derivation hides the result conservatively.
+
+The implementation must test negative answers, aggregates, path results, diagnostics,
+explanations, GraphRAG input and exports as well as individual triples. A hidden
+derivation must not leak through counts, missing-premise suggestions or status details.
+F22's application support lists do not replace a verified logical derivation. Until the
+provenance operator of F13 Phase 3 exists, explicit authorized projections and isolated
+datasets remain the way to publish results across different trust boundaries.
+
+Acceptance includes a fact with two independent derivations, one whose support is
+revoked and one that remains visible, and a fact whose only review-admitted support
+is withdrawn. Differential tests compare filtered answers with a fresh derivation over
+only the caller's admitted inputs. Unavailable witnesses must never make the supported
+mode silently fall back to showing the entire inferred graph.

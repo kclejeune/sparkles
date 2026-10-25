@@ -2410,6 +2410,34 @@ implementation landed.
   - a new Datalog syntax with typed columns and `.input`/`.output`;
   - writing derived relations to a graph.
 
+## Evidence, durable work and maintained analysis
+
+The new specifications are [C25](C25-evidence-and-assessments.md),
+[C26](C26-durable-jobs-and-delivery.md), [C27](C27-valid-time-profiles.md),
+[F22](F22-analysis-lifecycle.md) and [C22b](C22b-report-configurations.md). They are
+specified and unimplemented. No code or runtime dependency was adopted.
+
+The designs use the W3C RDF 1.2 Concepts, PROV-O and OWL-Time documents, HTTP semantics
+in RFC 9110, CloudEvents 1.0.2 and the Standard Webhooks specification. They were
+checked against Sparkles' existing evidence writes, commit identity, format registry,
+tasks, notifications, incremental views, inference protections and GraphRAG ledger.
+The individual specifications link their primary sources. No domain-specific threat
+intelligence feed or application ontology is required by the shared profiles.
+
+C25 adopts separate source occurrences and unasserted claims, qualified evidence links
+and immutable decisions. It rejects implicit truth from review and automatic identity
+merges based on similarity. C26 adopts the existing dataset write transaction as the
+authority for durable publication, checkpoints and delivery intent. It rejects a second
+independent queue transaction and a promise of exactly-once external delivery.
+
+C27 adopts explicit valid time and recorded availability, with uncertainty preserved.
+It rejects invented timestamp precision and retrospective availability in backtests.
+F22 adopts conservative read footprints and bounded recomputation before incremental
+maintenance. It rejects citation-only invalidation and the treatment of all withdrawn
+support as a false conclusion. C22b adopts stable configuration identities and shared
+accounting. It rejects first-readable report selection and per-configuration budgets
+that can multiply a dataset allowance.
+
 ## Development tools (not linked into Sparkles)
 
 - **Adopted** (2026-09-30, with the pre-commit hooks in `.pre-commit-config.yaml`):

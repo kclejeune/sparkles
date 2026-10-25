@@ -873,3 +873,29 @@ vocabulary writes in both builds. Their blocks of 3,000 writes had median syscal
 from about 0.24 to 1.55 ms. Tracing affects absolute latency, so this locates the variation
 without measuring a cost of the inference change. Item 265 tracks obtaining a comparison
 with matched durable-write latency.
+
+
+### Maintained assessments and conservative dependencies
+
+[F22](F22-analysis-lifecycle.md) defines the lifecycle of maintained analysis results.
+Roadmap item 17 supplies incremental graph views and per-fact provenance where an
+executor can preserve their semantics. Existing Phase 1 table views remain unchanged.
+F22 can initially recompute through [C26](C26-durable-jobs-and-delivery.md) without
+waiting for the later incremental phases.
+
+A read footprint must include insertions that can change a negative result, aggregates
+and schema-dependent rewrites. The citations on a returned row are insufficient to
+identify those dependencies. Circuits publish their checked frontier and report a gap
+or an unsupported operator as unknown freshness or full recomputation. They cannot
+advance a frontier merely because every cited fact still exists.
+
+Later-phase provenance must identify exact dataset and branch commits and persisted
+assertion occurrences, survive compaction without reusing vocabulary IDs as evidence
+identities, and retain alternative supports within explicit bounds. Derived visibility
+continues through F18. A proof that an incremental result equals full recomputation is
+a prerequisite for replacing F22's fallback. External model runs and unsupported
+nonmonotone analyses retain that fallback.
+
+Recovery tests must cross input publication, durable job creation, partial circuit
+maintenance and guarded result publication, checking that a result cannot remain
+labelled current while an unexamined relevant input change is pending.

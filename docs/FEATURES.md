@@ -1752,9 +1752,18 @@ links each item to its design spec.
   exactly or after folding case and spacing. A value with several matches keeps a minted
   IRI until a person chooses, and the lookup reports only the first variant of an
   ambiguous group. Roadmap item 15.
-* There is no shared profile that connects sources, cited assertions, sessions and
-  imported memory to personal notes, decisions and tasks with evidence, dependency and
-  validity semantics. Roadmap item 81.
+* A shared profile for source revisions, unasserted claims, evidence, review and identity
+  decisions is planned in [C25](specs/C25-evidence-and-assessments.md), roadmap item 81.
+  Current memory provenance and supersession do not provide that complete profile.
+* Durable jobs, worker leases, collection checkpoints and a transactional delivery outbox
+  are planned in [C26](specs/C26-durable-jobs-and-delivery.md), roadmap item 339. Current
+  server tasks and operator notifications do not provide the proposed recovery contract.
+* Maintained analysis records with reproducible inputs, read dependencies and guarded
+  result publication are planned in [F22](specs/F22-analysis-lifecycle.md), roadmap item
+  340. Existing reasoner and view maintenance does not provide that application lifecycle.
+* Valid-time profiles, uncertain interval matching, availability cutoffs and an event-time
+  control are planned in [C27](specs/C27-valid-time-profiles.md), roadmap item 341.
+  Current time travel selects retained commits, with domain validity queried as data.
 * A dataset has one GraphRAG configuration, so readers with different views cannot each
   have reports built from their own view, roadmap item 100. The evaluation of global
   answering covers one generated question set on the demo graph, compares it with BM25

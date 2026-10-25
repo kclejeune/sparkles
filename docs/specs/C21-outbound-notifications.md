@@ -555,3 +555,12 @@ These points differ from the design or settle what it left open.
   kind gains one (32), which bounds the threads. Acceptance: with one webhook that never
   answers and one that answers at once, a test send to the second arrives within a
   second while the first is timing out.
+
+
+### Durable application delivery
+
+[C26](C26-durable-jobs-and-delivery.md) specifies a separate durable outbox for
+dataset applications. It reuses applicable C21 signing, outbound policy and retry
+transport but commits delivery intent with the dataset update. C21's current operator
+notifications retain their in-process queue and existing event scope. The planned
+outbox does not retroactively provide restart durability to that queue.

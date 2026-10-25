@@ -345,3 +345,14 @@ longest hold.
 ## Outcome
 
 Not built. See [ROADMAP](../ROADMAP.md) item 36.
+
+
+### Shared durable execution
+
+[C26](C26-durable-jobs-and-delivery.md) is the planned durable execution substrate for
+roadmap item 36. C23 continues to define batch semantics, trigger matching and bounded
+recursion. Its resumable batches and deferred trigger actions use C26's job identities,
+checkpoints, publication fences and outbox rather than a second independent scheduler.
+Inside-commit triggers remain a separate C23 phase and may enqueue a durable job, but
+never perform an external request while holding the writer. This integration is not
+implemented and does not make current server tasks restart-durable.

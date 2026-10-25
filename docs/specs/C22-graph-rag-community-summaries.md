@@ -750,15 +750,11 @@ configurations per dataset moved to roadmap item 100.
    time would serve datasets that never build. The default chosen is a local answer.
 3. **Multilingual reports.** One `language` per configuration. Reports in several
    languages would multiply cost.
-4. **Several configurations per dataset.** Deferred to roadmap item 100, since no
-   deployment needs it yet and it changes the state format. The proposed design keeps
-   today's single object valid and also accepts `{configurations: [{name, ...}]}`, each
-   entry with its own principal, projection and reports graph. The routes take
-   `?config=` and the CLI takes `--config`, defaulting to the first configuration. The
-   build state and the ledger are kept per configuration under a new format version, and
-   a reader refuses versions it does not know. Ask, `community_reports`, `recall` and the
-   brief use the first configuration whose reports graph the caller may read, and the
-   Communities tab offers a picker.
+4. **Several configurations per dataset.** Roadmap item 100 is designed in
+   [C22b](C22b-report-configurations.md). It uses stable configuration identities, an
+   explicit default, separate guarded report states and shared dataset accounting.
+   Configuration selection and format migration remain planned. The extension replaces
+   the earlier first-readable selection and independent-ledger proposal.
 
 ## 14. Revisions
 
