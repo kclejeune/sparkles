@@ -2663,7 +2663,11 @@ fn run_limited(
         | Kind::Unpack { .. }
         | Kind::Distinct
         | Kind::IndexJoin(_) => {
-            let mut budget = want.max(64);
+            let mut budget = if super::unionpush::limited_input(ctx, n) {
+                want
+            } else {
+                want.max(64)
+            };
             // the child's runs so far, added up
             let mut runs: Option<PlanInfo> = None;
             loop {
@@ -2749,7 +2753,11 @@ fn run_limited(
                 };
                 return finish(Materialized::plain(e), infos, true);
             }
-            let mut budget = want.max(64);
+            let mut budget = if super::unionpush::limited_input(ctx, n) {
+                want
+            } else {
+                want.max(64)
+            };
             let mut runs: Option<PlanInfo> = None;
             loop {
                 let (mut part, pinfo, complete) =

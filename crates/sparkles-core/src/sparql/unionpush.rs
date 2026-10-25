@@ -10,6 +10,309 @@ use spargebra::term::{TermPattern, TriplePattern, Variable};
 const MAX_TRIPLES: usize = 8;
 const MAX_BRANCHES: usize = 8;
 const MAX_SCREEN_NODES: usize = MAX_TRIPLES * MAX_BRANCHES * 4;
+
+/// A bounded UNION whose branch order and excess demand have no external effects.
+fn pure_union(ctx: &super::ctx::Ctx, node: &Node) -> bool {
+    use super::expr::Expr;
+
+    fn expression(expr: &Expr, remaining: &mut usize) -> bool {
+        if *remaining == 0 {
+            return false;
+        }
+        *remaining -= 1;
+        match expr {
+            Expr::Const(_) | Expr::Lit(..) | Expr::Var(_) | Expr::Bound(_) => true,
+            Expr::Eq(a, b) | Expr::SameTerm(a, b) | Expr::And(a, b) | Expr::Or(a, b) => {
+                expression(a, remaining) && expression(b, remaining)
+            }
+            Expr::Not(a) => expression(a, remaining),
+            _ => false,
+        }
+    }
+
+    fn plain(node: &Node, remaining: &mut usize, expressions: &mut usize) -> bool {
+        if *remaining == 0 {
+            return false;
+        }
+        *remaining -= 1;
+        let shape = match &node.kind {
+            Kind::Scan(_) | Kind::Values(_) | Kind::Empty => node.children.is_empty(),
+            Kind::Join { .. } => node.children.len() == 2,
+            Kind::Union => (2..=MAX_BRANCHES).contains(&node.children.len()),
+            Kind::Project(_) | Kind::Sort(_) => node.children.len() == 1,
+            Kind::Extend(_, expr) => node.children.len() == 1 && expr.const_id().is_some(),
+            Kind::Filter(exprs) => {
+                node.children.len() == 1 && exprs.iter().all(|e| expression(e, expressions))
+            }
+            Kind::IndexJoin(spec) => {
+                node.children.len() == 1
+                    && spec
+                        .probes
+                        .iter()
+                        .all(|p| p.filter.iter().all(|e| expression(e, expressions)))
+            }
+            _ => false,
+        };
+        shape
+            && node
+                .children
+                .iter()
+                .all(|c| plain(c, remaining, expressions))
+    }
+
+    !ctx.calls_extensions
+        && matches!(node.kind, Kind::Union)
+        && (2..=MAX_BRANCHES).contains(&node.children.len())
+        && node
+            .children
+            .iter()
+            .all(|c| c.cost.is_finite() && c.cost >= 0.0)
+        && plain(node, &mut 128, &mut 256)
+}
+
+/// Only a wholly admitted pure ASK may reduce input demand. Subtree purity
+/// alone cannot rule out an effectful consumer outside that subtree.
+pub(super) fn limited_input(ctx: &super::ctx::Ctx, node: &Node) -> bool {
+    !ctx.is_cursor()
+        && matches!(
+            node.kind,
+            Kind::Project(_)
+                | Kind::Filter(_)
+                | Kind::Extend(..)
+                | Kind::IndexJoin(_)
+                | Kind::Join { .. }
+        )
+        && ctx
+            .eager_union_demand
+            .load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// A prefix's live rows cannot exceed its covering base blocks and inserted keys.
+/// Unlike the planner's graph discount and midpoint estimate, this is an upper bound.
+fn scan_upper(ctx: &super::ctx::Ctx, scan: &ScanSpec) -> u64 {
+    if let Some(count) = ctx.snap.predicate_count(scan.perm, &scan.prefix) {
+        return count;
+    }
+    let index = ctx.snap.perm(scan.perm);
+    let (lo, hi) = index.block_range(&scan.prefix);
+    let base = if lo < hi {
+        index.blocks[hi - 1].row_start + u64::from(index.blocks[hi - 1].rows)
+            - index.blocks[lo].row_start
+    } else {
+        0
+    };
+    base.saturating_add(crate::store::Delta::count_prefix(
+        &ctx.snap.delta.ins[scan.perm.index()],
+        &scan.prefix,
+    ))
+}
+
+fn full_work(ctx: &super::ctx::Ctx, node: &Node, left: &mut usize) -> Option<f64> {
+    if *left == 0 || !node.cost.is_finite() || node.cost < 0.0 {
+        return None;
+    }
+    *left -= 1;
+    let own = match &node.kind {
+        Kind::Scan(scan) => node.cost.max(scan_upper(ctx, scan) as f64),
+        Kind::Values(table) => node.cost.max(table.len() as f64),
+        _ => node.cost,
+    };
+    let mut children = 0.0;
+    for child in &node.children {
+        children += full_work(ctx, child, left)?;
+    }
+    let work = own.max(children);
+    work.is_finite().then_some(work)
+}
+
+/// Work before the first limited result. A filtered or blocking input may have
+/// to run to completion, so keep its full cost rather than amortizing it over
+/// output rows. Eager joins also build their estimated smaller input in full.
+fn first_work(
+    ctx: &super::ctx::Ctx,
+    node: &Node,
+    want: usize,
+    remaining: &mut usize,
+) -> Option<f64> {
+    use super::plan::GraphFilter;
+    if *remaining == 0
+        || !node.cost.is_finite()
+        || node.cost < 0.0
+        || !node.est.is_finite()
+        || node.est < 0.0
+    {
+        return None;
+    }
+    *remaining -= 1;
+    let prefix = |n: f64| (want as f64 / n.max(1.0)).min(1.0);
+    let work = match &node.kind {
+        Kind::Scan(spec) => {
+            let all = spec.eqs.is_empty()
+                && !spec.dedup
+                && (matches!(spec.graph, GraphFilter::All)
+                    || spec
+                        .prefix
+                        .get(spec.graph_col)
+                        .is_some_and(|g| spec.graph.accepts(*g))
+                    || (ctx.snap.delta.is_empty()
+                        && ctx.snap.generation.stats.graphs.len() == 1
+                        && spec.graph.accepts(ctx.snap.generation.stats.graphs[0].0)));
+            if all {
+                node.cost * prefix(node.est)
+            } else {
+                node.cost.max(scan_upper(ctx, spec) as f64)
+            }
+        }
+        Kind::Values(table) => node.cost.max(table.len() as f64),
+        Kind::Empty => 0.0,
+        Kind::Project(_) => first_work(ctx, &node.children[0], want, remaining)?,
+        Kind::Extend(..) => {
+            first_work(ctx, &node.children[0], want, remaining)?
+                + (node.cost - node.children[0].cost).max(0.0)
+                    * (want as f64 / node.est.max(1.0)).min(1.0)
+        }
+        Kind::Join { .. } => {
+            if node
+                .children
+                .iter()
+                .any(|c| !c.est.is_finite() || c.est < 0.0)
+            {
+                return None;
+            }
+            let lim = usize::from(node.children[0].est < node.children[1].est);
+            let part = &node.children[lim];
+            let other = &node.children[1 - lim];
+            if !other.cost.is_finite()
+                || other.cost < 0.0
+                || !part.est.is_finite()
+                || part.est < 0.0
+            {
+                return None;
+            }
+            full_work(ctx, other, remaining)?
+                + first_work(ctx, part, want, remaining)?
+                + (node.cost - part.cost - other.cost).max(0.0)
+                    * (want as f64 / part.est.max(1.0)).min(1.0)
+        }
+        Kind::Union => {
+            let mut cost = 0.0;
+            let mut need = want as f64;
+            for child in &node.children {
+                cost += first_work(ctx, child, need.ceil() as usize, remaining)?;
+                need = (need - child.est).max(0.0);
+                if need == 0.0 {
+                    break;
+                }
+            }
+            cost
+        }
+        Kind::Filter(_) | Kind::IndexJoin(_) | Kind::Sort(_) => {
+            // This node was counted above; the full walk counts it once itself.
+            *remaining += 1;
+            full_work(ctx, node, remaining)?
+        }
+        _ => return None,
+    };
+    (work.is_finite() && work >= 0.0).then_some(work)
+}
+
+/// A new order must fit conservative output bounds, including compatible-key
+/// products. Cardinality estimates do not bound a join whose inputs contain UNDEF.
+fn ordering_fits(ctx: &super::ctx::Ctx, root: &Node) -> bool {
+    // Geometric prefix retries can produce more than one full scan. Keep the
+    // original order under a finite total-work cap instead of certifying a sum.
+    if ctx.max_rows_produced != u64::MAX || !ctx.snap.delta.is_empty() {
+        return false;
+    }
+    fn visit(ctx: &super::ctx::Ctx, node: &Node, left: &mut usize, bytes: &mut u64) -> Option<u64> {
+        if *left == 0 || node.children.len() > MAX_BRANCHES {
+            return None;
+        }
+        *left -= 1;
+        let mut children = [0u64; MAX_BRANCHES];
+        for (i, child) in node.children.iter().enumerate() {
+            children[i] = visit(ctx, child, left, bytes)?;
+        }
+        let count = match &node.kind {
+            Kind::Values(table) => table.len() as u64,
+            Kind::Scan(scan) => scan_upper(ctx, scan),
+            Kind::Empty => 0,
+            Kind::Join { .. } => children[0].checked_mul(children[1])?,
+            Kind::Union => children[..node.children.len()]
+                .iter()
+                .try_fold(0u64, |sum, n| sum.checked_add(*n))?,
+            Kind::Project(_) | Kind::Filter(_) | Kind::Extend(..) | Kind::Sort(_) => children[0],
+            Kind::Slice { offset, limit } => children[0]
+                .saturating_sub(*offset as u64)
+                .min(limit.map_or(u64::MAX, |n| n as u64)),
+            // Probe fanout and duplicate input keys have no cheap output upper
+            // bound. Keep their original order rather than certify an estimate.
+            Kind::IndexJoin(_) => return None,
+            _ => return None,
+        };
+        if count > ctx.max_rows as u64 {
+            return None;
+        }
+        // Include room for pair indexes and capacity growth as well as columns.
+        let width = (node.vars.len() as u64).checked_mul(16)?.checked_add(64)?;
+        *bytes = bytes.checked_add(count.checked_mul(width)?.checked_add(128)?)?;
+        (*bytes <= ctx.memory_room()).then_some(count)
+    }
+    let mut bytes = 0;
+    let mut left = MAX_SCREEN_NODES;
+    visit(ctx, root, &mut left, &mut bytes).is_some()
+}
+
+/// An eager ASK needs one solution, so visit a cheaper pure UNION operand first.
+/// Cursor execution and SELECT retain their existing order.
+pub(super) fn order_ask(ctx: &super::ctx::Ctx, node: &mut Node) {
+    if !matches!(
+        node.kind,
+        Kind::Slice {
+            offset: 0,
+            limit: Some(1)
+        }
+    ) || node.children.len() != 1
+    {
+        return;
+    }
+    let mut union = &mut node.children[0];
+    for _ in 0..8 {
+        if !matches!(union.kind, Kind::Project(_)) || union.children.len() != 1 {
+            break;
+        }
+        union = &mut union.children[0];
+    }
+    if ctx.max_rows_produced != u64::MAX || !ctx.snap.delta.is_empty() || !pure_union(ctx, union) {
+        return;
+    }
+    ctx.eager_union_demand
+        .store(true, std::sync::atomic::Ordering::Relaxed);
+    if !ordering_fits(ctx, node) {
+        return;
+    }
+    let mut union = &mut node.children[0];
+    for _ in 0..8 {
+        if !matches!(union.kind, Kind::Project(_)) || union.children.len() != 1 {
+            break;
+        }
+        union = &mut union.children[0];
+    }
+    let Some(mut work) = first_work(ctx, &union.children[0], 1, &mut 128) else {
+        return;
+    };
+    let mut cheapest = 0;
+    for i in 1..union.children.len() {
+        let Some(candidate) = first_work(ctx, &union.children[i], 1, &mut 128) else {
+            return;
+        };
+        if candidate < work {
+            cheapest = i;
+            work = candidate;
+        }
+    }
+    union.children.swap(0, cheapest);
+}
 /// Do not duplicate broad anchor reads merely because they have a constant object.
 pub(super) const MAX_ANCHOR_ROWS: f64 = 32.0;
 
@@ -280,6 +583,813 @@ fn safe_expression(expr: &Expression, moved: &[Variable], bound: &[Variable]) ->
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn pure_limited_unary_inputs_read_only_their_requested_prefix() {
+        use crate::io::Source;
+        use crate::sparql::{PlanInfo, QueryOptions, query};
+        use crate::store::{Store, StoreOptions};
+        let store = Store::in_memory(StoreOptions::default());
+        let mut data = String::new();
+        for i in 0..128 {
+            data.push_str(&format!("<urn:s{i}> <urn:p> {i} .\n"));
+        }
+        for i in 0..20_000 {
+            data.push_str(&format!("<urn:s{i}> <urn:q> {} .\n", i + 1));
+        }
+        store
+            .load(&[Source::from_bytes(
+                data.into_bytes(),
+                oxrdfio::RdfFormat::Turtle,
+                None,
+            )])
+            .unwrap();
+        fn find<'a>(p: &'a PlanInfo, operator: &str, description: &str) -> Option<&'a PlanInfo> {
+            if p.operator == operator && p.description.contains(description) {
+                return Some(p);
+            }
+            p.children
+                .iter()
+                .find_map(|c| find(c, operator, description))
+        }
+        let mut observed = Vec::new();
+        for (pattern, indexed) in [
+            ("?s <urn:p> ?v BIND(1 AS ?tag)", false),
+            ("?s <urn:p> ?v FILTER(?v != ?s)", false),
+            ("?s <urn:p> ?v; <urn:q> ?n", true),
+        ] {
+            let text =
+                format!("ASK {{ {{ {pattern} }} UNION {{ ?s <urn:q> ?n FILTER(?n = ?s) }} }}");
+            let result = query(
+                store.snapshot(),
+                &text,
+                &QueryOptions {
+                    no_cache: true,
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+            assert!(result.boolean);
+            if indexed {
+                assert!(find(&result.plan, "IndexJoin", "").is_some(), "{pattern}");
+            }
+            let scan = find(&result.plan, "IndexScan", "urn:p").unwrap();
+            observed.push((pattern, scan.actual_rows));
+            assert!(scan.fidelity().stopped_early);
+            let capped = query(
+                store.snapshot(),
+                &text,
+                &QueryOptions {
+                    no_cache: true,
+                    max_rows_produced: Some(1_000_000),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+            assert!(capped.boolean);
+            assert_eq!(
+                find(&capped.plan, "IndexScan", "urn:p")
+                    .unwrap()
+                    .actual_rows,
+                64,
+                "a finite produced-row cap keeps the original prefix: {pattern}"
+            );
+        }
+        assert!(
+            observed.iter().all(|(_, rows)| *rows == 1),
+            "pure inputs: {observed:?}"
+        );
+        crate::sparql::update::update(
+            &store,
+            "INSERT DATA { <urn:new> <urn:q> 1 }",
+            &Default::default(),
+        )
+        .unwrap();
+        assert!(!store.snapshot().delta.is_empty());
+        let changed = query(
+            store.snapshot(),
+            "ASK { { ?s <urn:p> ?v BIND(1 AS ?tag) } UNION { ?s <urn:q> ?n FILTER(?n = ?s) } }",
+            &QueryOptions {
+                no_cache: true,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        assert!(changed.boolean);
+        assert_eq!(
+            find(&changed.plan, "IndexScan", "urn:p")
+                .unwrap()
+                .actual_rows,
+            64,
+            "an unmerged snapshot keeps the original prefix"
+        );
+    }
+
+    #[test]
+    fn compatible_undef_join_fanout_does_not_displace_a_bounded_answer() {
+        use crate::io::Source;
+        use crate::sparql::{QueryOptions, query};
+        use crate::store::{Store, StoreOptions};
+        let store = Store::in_memory(StoreOptions::default());
+        let mut data = String::new();
+        for i in 0..1000 {
+            data.push_str(&format!("<urn:s{i}> <urn:p> {i} .\n"));
+        }
+        data.push_str("<urn:g> {\n");
+        for i in 0..99_000 {
+            data.push_str(&format!("<urn:n{i}> <urn:q> {i} .\n"));
+        }
+        data.push_str("}\n");
+        store
+            .load(&[Source::from_bytes(
+                data.into_bytes(),
+                oxrdfio::RdfFormat::TriG,
+                None,
+            )])
+            .unwrap();
+        let values = vec!["UNDEF"; 32].join(" ");
+        let text = format!(
+            "ASK {{ {{ ?s <urn:p> ?v FILTER(?v != ?s) }} UNION {{ {{ VALUES ?x {{ {values} }} }} {{ VALUES ?x {{ {values} }} }} }} }}"
+        );
+        let result = query(
+            store.snapshot(),
+            &text,
+            &QueryOptions {
+                no_cache: true,
+                max_rows: Some(1000),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        assert!(result.boolean);
+    }
+
+    #[test]
+    fn graph_discounted_scan_estimates_do_not_admit_an_oversized_prefix() {
+        use crate::io::Source;
+        use crate::sparql::{QueryOptions, query};
+        use crate::store::{Store, StoreOptions};
+        let store = Store::in_memory(StoreOptions::default());
+        let mut data = String::new();
+        for i in 0..100 {
+            data.push_str(&format!("<urn:s{i}> <urn:p> {i} .\n"));
+        }
+        data.push_str("<urn:g> {\n");
+        for i in 0..900 {
+            data.push_str(&format!("<urn:n{i}> <urn:q> {i} .\n"));
+        }
+        data.push_str("}\n");
+        store
+            .load(&[Source::from_bytes(
+                data.into_bytes(),
+                oxrdfio::RdfFormat::TriG,
+                None,
+            )])
+            .unwrap();
+        let values = (0..24)
+            .map(|i| format!("<urn:v{i}>"))
+            .collect::<Vec<_>>()
+            .join(" ");
+        let text = format!(
+            "ASK {{ {{ VALUES ?s {{ {values} }} }} UNION {{ ?s <urn:p> ?v FILTER(?v != ?s) }} }}"
+        );
+        let result = query(
+            store.snapshot(),
+            &text,
+            &QueryOptions {
+                no_cache: true,
+                max_rows: Some(40),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        assert!(result.boolean);
+    }
+
+    #[test]
+    fn finite_produced_row_caps_keep_prefix_retries_out_of_the_first_operand() {
+        use crate::io::Source;
+        use crate::sparql::{QueryOptions, query};
+        use crate::store::{Store, StoreOptions};
+        let store = Store::in_memory(StoreOptions::default());
+        let data = (0..400)
+            .map(|i| format!("<urn:s{i}> <urn:p> {i} .\n"))
+            .collect::<String>();
+        store
+            .load(&[Source::from_bytes(
+                data.into_bytes(),
+                oxrdfio::RdfFormat::Turtle,
+                None,
+            )])
+            .unwrap();
+        let values = (0..1000)
+            .map(|i| format!("<urn:v{i}>"))
+            .collect::<Vec<_>>()
+            .join(" ");
+        let text = format!(
+            "ASK {{ {{ VALUES ?s {{ {values} }} }} UNION {{ ?s <urn:p> ?v FILTER(?v = ?s) }} }}"
+        );
+        let result = query(
+            store.snapshot(),
+            &text,
+            &QueryOptions {
+                no_cache: true,
+                max_rows_produced: Some(3420),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        assert!(result.boolean);
+        assert_eq!(result.rows_produced, 3001);
+    }
+
+    #[test]
+    fn an_eager_values_operand_is_not_priced_as_a_single_row() {
+        use crate::io::Source;
+        use crate::sparql::{QueryOptions, query};
+        use crate::store::{Store, StoreOptions};
+        let store = Store::in_memory(StoreOptions::default());
+        let data = (0..64)
+            .map(|i| format!("<urn:s{i}> <urn:first> {i} .\n"))
+            .collect::<String>();
+        store
+            .load(&[Source::from_bytes(
+                data.into_bytes(),
+                oxrdfio::RdfFormat::Turtle,
+                None,
+            )])
+            .unwrap();
+        let mut failures = Vec::new();
+        for (size, rows, produced) in [
+            (65, Some(64), None),
+            (100, Some(64), None),
+            (10_000, Some(64), None),
+            (100, None, Some(300)),
+            (10_000, None, None),
+        ] {
+            let values = (0..size)
+                .map(|i| i.to_string())
+                .collect::<Vec<_>>()
+                .join(" ");
+            let text = format!(
+                "ASK {{ {{ ?s <urn:first> ?v FILTER(?v != ?s) }} UNION {{ VALUES ?x {{ {values} }} }} }}"
+            );
+            let result = query(
+                store.snapshot(),
+                &text,
+                &QueryOptions {
+                    no_cache: true,
+                    max_rows: rows,
+                    max_rows_produced: produced,
+                    ..Default::default()
+                },
+            );
+            let result = match result {
+                Ok(result) => result,
+                Err(error) => {
+                    failures.push((size, rows, produced, error));
+                    continue;
+                }
+            };
+            assert!(result.boolean);
+            let mut todo = vec![&result.plan];
+            while let Some(p) = todo.pop() {
+                if p.operator == "Values" {
+                    assert_eq!(
+                        p.actual_rows, -1,
+                        "the eager VALUES that cannot fit the budget must stay skipped"
+                    );
+                }
+                todo.extend(p.children.iter());
+            }
+        }
+        assert!(
+            failures.is_empty(),
+            "previously answering budget cases failed: {failures:?}"
+        );
+    }
+
+    #[test]
+    fn a_nested_union_prices_the_remaining_constant_bind_demand() {
+        use crate::io::Source;
+        use crate::sparql::{QueryOptions, query};
+        use crate::store::{Store, StoreOptions};
+        let store = Store::in_memory(StoreOptions::default());
+        let mut data = String::new();
+        for i in 0..64 {
+            data.push_str(&format!("<urn:s{i}> <urn:first> {i} .\n"));
+        }
+        for i in 0..10_000 {
+            data.push_str(&format!("<urn:f{i}> <urn:false> {i} .\n"));
+        }
+        store
+            .load(&[Source::from_bytes(
+                data.into_bytes(),
+                oxrdfio::RdfFormat::Turtle,
+                None,
+            )])
+            .unwrap();
+        let text = "ASK { { ?s <urn:first> ?v FILTER(?v != ?s) } UNION { { SELECT ?s WHERE { { VALUES ?s { <urn:one> } } UNION { ?s <urn:false> ?v FILTER(?v = ?s) } } } BIND(1 AS ?tag) } }";
+        for rows in [None, Some(64)] {
+            let result = query(
+                store.snapshot(),
+                text,
+                &QueryOptions {
+                    no_cache: true,
+                    max_rows: rows,
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+            assert!(result.boolean);
+            let mut todo = vec![&result.plan];
+            while let Some(p) = todo.pop() {
+                if p.operator == "IndexScan" && p.description.contains("urn:false") {
+                    assert_eq!(p.actual_rows, -1, "the nested false arm must stay skipped");
+                }
+                todo.extend(p.children.iter());
+            }
+        }
+    }
+
+    #[test]
+    fn a_false_filtered_operand_does_not_precede_an_immediate_wide_answer() {
+        use crate::io::Source;
+        use crate::sparql::{QueryOptions, query};
+        use crate::store::{Store, StoreOptions};
+        let store = Store::in_memory(StoreOptions::default());
+        let mut data = String::new();
+        for i in 0..100_000 {
+            data.push_str(&format!("<urn:w{i}> <urn:wide> {i} .\n"));
+        }
+        for i in 0..10_000 {
+            data.push_str(&format!("<urn:f{i}> <urn:small> {i} .\n"));
+        }
+        store
+            .load(&[Source::from_bytes(
+                data.into_bytes(),
+                oxrdfio::RdfFormat::Turtle,
+                None,
+            )])
+            .unwrap();
+        for rows in [None, Some(64)] {
+            let result = query(
+                store.snapshot(),
+                "ASK { { ?s <urn:wide> ?v } UNION { ?s <urn:small> ?v FILTER(?v = ?s) } }",
+                &QueryOptions {
+                    no_cache: true,
+                    max_rows: rows,
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+            assert!(result.boolean);
+            let mut todo = vec![&result.plan];
+            while let Some(p) = todo.pop() {
+                if p.operator == "IndexScan" && p.description.contains("urn:small") {
+                    assert_eq!(p.actual_rows, -1, "the false operand must remain skipped");
+                }
+                todo.extend(p.children.iter());
+            }
+        }
+    }
+
+    #[test]
+    fn a_nested_pure_union_keeps_an_effectful_consumers_original_demand() {
+        use crate::io::Source;
+        use crate::sparql::{LocalEndpoints, LocalTarget, QueryOptions, query};
+        use crate::store::{Snapshot, Store, StoreOptions};
+        use std::sync::{
+            Arc,
+            atomic::{AtomicUsize, Ordering},
+        };
+        struct Local {
+            snap: Arc<Snapshot>,
+            calls: Arc<AtomicUsize>,
+        }
+        impl std::fmt::Debug for Local {
+            fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                f.write_str("Local")
+            }
+        }
+        impl LocalEndpoints for Local {
+            fn resolve(&self, iri: &str) -> Option<crate::Result<LocalTarget>> {
+                (iri == "http://local/sparql").then(|| {
+                    self.calls.fetch_add(1, Ordering::Relaxed);
+                    Ok(LocalTarget {
+                        snap: self.snap.clone(),
+                        options: QueryOptions {
+                            no_cache: true,
+                            ..Default::default()
+                        },
+                        hold: None,
+                    })
+                })
+            }
+        }
+        let store = Store::in_memory(StoreOptions::default());
+        let mut data = String::from("<urn:other> <urn:other> 1 .\n");
+        for i in 0..128 {
+            data.push_str(&format!("<urn:w{i}> <urn:wide> {i} .\n"));
+        }
+        store
+            .load(&[Source::from_bytes(
+                data.into_bytes(),
+                oxrdfio::RdfFormat::Turtle,
+                None,
+            )])
+            .unwrap();
+        let remote = Store::in_memory(StoreOptions::default());
+        let calls = Arc::new(AtomicUsize::new(0));
+        let values = (0..63)
+            .map(|i| format!("<urn:v{i}>"))
+            .collect::<Vec<_>>()
+            .join(" ");
+        let text = format!(
+            "ASK {{ {{ VALUES ?s {{ {values} }} }} UNION {{ SELECT ?s WHERE {{ {{ ?s <urn:wide> ?v }} UNION {{ ?s <urn:other> ?v }} }} }} BIND(EXISTS {{ SERVICE <http://local/sparql> {{ ?s <urn:r> ?x }} }} AS ?e) }}"
+        );
+        let result = query(
+            store.snapshot(),
+            &text,
+            &QueryOptions {
+                no_cache: true,
+                allow_service: true,
+                local_endpoints: Some(Arc::new(Local {
+                    snap: remote.snapshot(),
+                    calls: calls.clone(),
+                })),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        assert!(result.boolean);
+        assert!(
+            calls.load(Ordering::Relaxed) > 0,
+            "the in-process SERVICE must actually execute"
+        );
+        let mut todo = vec![&result.plan];
+        let mut rows = None;
+        while let Some(p) = todo.pop() {
+            if p.operator == "Bind" && p.columns.iter().any(|v| v == "e") {
+                rows = Some(p.actual_rows);
+            }
+            todo.extend(p.children.iter());
+        }
+        assert_eq!(
+            rows,
+            Some(127),
+            "the pure subtree must not reduce its effectful consumer's127correlated evaluations"
+        );
+    }
+
+    #[test]
+    fn ask_visits_a_cheap_pure_union_branch_before_reading_the_wide_one() {
+        use crate::io::Source;
+        use crate::sparql::{PlanInfo, QueryOptions, query};
+        use crate::store::{Store, StoreOptions};
+
+        let store = Store::in_memory(StoreOptions::default());
+        let mut data = String::from("<urn:yes> <urn:cheap> 1 .\n");
+        for i in 0..128 {
+            data.push_str(&format!(
+                "<urn:s{i}> <urn:wide> {i}; <urn:extra> {} .\n",
+                i + 1
+            ));
+        }
+        store
+            .load(&[Source::from_bytes(
+                data.into_bytes(),
+                oxrdfio::RdfFormat::Turtle,
+                None,
+            )])
+            .unwrap();
+        let r = query(
+            store.snapshot(),
+            "ASK { { ?s <urn:wide> ?v; <urn:extra> ?n } UNION { <urn:yes> <urn:cheap> ?v } }",
+            &QueryOptions::default(),
+        )
+        .unwrap();
+        assert!(r.boolean);
+        fn wide(p: &PlanInfo) -> Option<&PlanInfo> {
+            if p.description.contains("urn:wide") {
+                return Some(p);
+            }
+            p.children.iter().find_map(wide)
+        }
+        let wide = wide(&r.plan).expect("wide scan is retained in the physical plan");
+        assert_eq!(
+            wide.actual_rows, -1,
+            "the cheaper branch must answer ASK before any wide scan"
+        );
+        assert!(wide.fidelity().skipped.is_some());
+        let selected = query(
+            store.snapshot(),
+            "SELECT * WHERE { { ?s <urn:wide> ?v; <urn:extra> ?n } UNION { <urn:yes> <urn:cheap> ?v } } LIMIT 1",
+            &QueryOptions::default(),
+        )
+        .unwrap();
+        assert!(
+            selected.rows()[0]
+                .iter()
+                .any(|v| v.as_ref().is_some_and(|v| v.to_string().contains("urn:s")))
+        );
+        let explicit = crate::sparql::ask_streaming(
+            store.snapshot(),
+            "ASK { { ?s <urn:wide> ?v; <urn:extra> ?n } UNION { <urn:yes> <urn:cheap> ?v } }",
+            &QueryOptions::default(),
+            &crate::sparql::CursorOptions {
+                batch_rows: 1,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        let mut plans = vec![&explicit.plan];
+        let mut read_wide = false;
+        while let Some(p) = plans.pop() {
+            if p.description.contains("urn:wide") && p.actual_rows > 0 {
+                read_wide = true;
+            }
+            plans.extend(p.children.iter());
+        }
+        assert!(
+            read_wide,
+            "forced streaming retains its original operand order"
+        );
+    }
+
+    #[test]
+    fn ask_union_answers_and_explicit_streaming_keep_their_execution_contract() {
+        use crate::io::Source;
+        use crate::sparql::{
+            CursorOptions, ExecutionMode, QueryExecution, QueryOptions, query_execution,
+        };
+        use crate::store::{Store, StoreOptions};
+        let store = Store::in_memory(StoreOptions::default());
+        store
+            .load(&[Source::from_bytes(
+                b"<urn:s> <urn:p> 1, 2 . <urn:t> <urn:q> 3 . <urn:g> { <urn:s> <urn:p> 4 }"
+                    .to_vec(),
+                oxrdfio::RdfFormat::TriG,
+                None,
+            )])
+            .unwrap();
+        let cases = [
+            ("{ ?s <urn:p> ?v } UNION { <urn:t> <urn:q> ?v }", true),
+            (
+                "{ ?s <urn:p> ?v FILTER(?v = 99) } UNION { <urn:t> <urn:q> ?v }",
+                true,
+            ),
+            (
+                "{ ?s <urn:p> ?v FILTER(?v = 99) } UNION { <urn:t> <urn:q> ?v FILTER(?v = 99) }",
+                false,
+            ),
+            (
+                "{ VALUES ?v { UNDEF 1 1 } ?s <urn:p> ?v } UNION { <urn:t> <urn:q> ?v }",
+                true,
+            ),
+            (
+                "{ GRAPH ?g { ?s <urn:p> ?v } } UNION { GRAPH <urn:g> { ?s <urn:p> ?v } }",
+                true,
+            ),
+            (
+                "{ BIND(<urn:t> AS ?s) ?s <urn:q> ?v } UNION { ?s <urn:missing> ?v }",
+                true,
+            ),
+            (
+                "{ ?s <urn:missing> ?v } UNION { ?s <urn:absent> ?v }",
+                false,
+            ),
+        ];
+        for (body, expected) in cases {
+            let text = format!("ASK {{ {body} }}");
+            for mode in [
+                ExecutionMode::Eager,
+                ExecutionMode::Auto,
+                ExecutionMode::Streaming,
+            ] {
+                let result = query_execution(
+                    store.snapshot(),
+                    &text,
+                    &QueryOptions::default(),
+                    &CursorOptions {
+                        batch_rows: 1,
+                        ..Default::default()
+                    },
+                    mode,
+                )
+                .unwrap();
+                let result = match result {
+                    QueryExecution::Eager(result) => {
+                        assert_ne!(mode, ExecutionMode::Streaming);
+                        result
+                    }
+                    QueryExecution::Ask(result) => {
+                        assert_eq!(mode, ExecutionMode::Streaming);
+                        result
+                    }
+                    _ => panic!("ASK must produce a completed boolean"),
+                };
+                assert_eq!(result.result().boolean, expected, "{text}, {mode:?}");
+            }
+        }
+        let parsed = crate::sparql::parse_query(
+            "ASK { { ?s <urn:p> ?v } UNION { <urn:t> <urn:q> ?v } }",
+            None,
+            &[],
+        )
+        .unwrap();
+        let mut prepared =
+            super::super::prepare_query(store.snapshot(), &parsed, &Default::default(), None, None)
+                .unwrap();
+        assert!(!limited_input(&prepared.ctx, &prepared.node.children[0]));
+        order_ask(&prepared.ctx, &mut prepared.node);
+        assert!(limited_input(&prepared.ctx, &prepared.node.children[0]));
+        std::sync::Arc::get_mut(&mut prepared.ctx)
+            .unwrap()
+            .enable_cursor_accounting()
+            .unwrap();
+        assert!(
+            !limited_input(&prepared.ctx, &prepared.node.children[0]),
+            "a cursor fallback must retain its original eager prefix policy too"
+        );
+    }
+
+    #[test]
+    fn effectful_ask_branches_still_run_in_the_original_order() {
+        use crate::io::Source;
+        use crate::sparql::extensions::{
+            ExtensionRegistry, ScalarContext, ScalarDescriptor, ScalarResult, Volatility,
+        };
+        use crate::sparql::{QueryOptions, query};
+        use crate::store::{Store, StoreOptions};
+        use std::sync::{
+            Arc,
+            atomic::{AtomicUsize, Ordering},
+        };
+        let store = Store::in_memory(StoreOptions::default());
+        let mut data = String::from("<urn:t> <urn:cheap> 1 .\n");
+        for i in 0..128 {
+            data.push_str(&format!("<urn:s{i}> <urn:wide> {i} .\n"));
+        }
+        store
+            .load(&[Source::from_bytes(
+                data.into_bytes(),
+                oxrdfio::RdfFormat::Turtle,
+                None,
+            )])
+            .unwrap();
+        let count = Arc::new(AtomicUsize::new(0));
+        let seen = count.clone();
+        let mut descriptor = ScalarDescriptor::new(
+            "urn:tick",
+            0..=0,
+            move |_: &ScalarContext<'_>, _: &[oxrdf::Term]| -> ScalarResult {
+                seen.fetch_add(1, Ordering::Relaxed);
+                Ok(oxrdf::Literal::from(true).into())
+            },
+        )
+        .unwrap();
+        descriptor.volatility = Volatility::Volatile;
+        let mut registry = ExtensionRegistry::builder();
+        registry.register_scalar(descriptor).unwrap();
+        let opts = QueryOptions {
+            extensions: Some(registry.build()),
+            ..Default::default()
+        };
+        let result = query(
+            store.snapshot(),
+            "ASK { { ?s <urn:wide> ?v FILTER(<urn:tick>()) } UNION { <urn:t> <urn:cheap> ?v } }",
+            &opts,
+        )
+        .unwrap();
+        assert!(result.boolean);
+        assert_eq!(
+            count.load(Ordering::Relaxed),
+            64,
+            "the effectful path retains its original demand and callback count"
+        );
+    }
+
+    #[test]
+    fn reordered_and_retained_ask_work_is_still_bounded() {
+        use crate::io::Source;
+        use crate::sparql::{QueryOptions, query};
+        use crate::store::{Store, StoreOptions};
+        use std::sync::{Arc, atomic::AtomicBool};
+        use std::time::{Duration, Instant};
+        let store = Store::in_memory(StoreOptions::default());
+        let mut data = String::from("<urn:t> <urn:cheap> 1 .\n");
+        for i in 0..128 {
+            data.push_str(&format!("<urn:s{i}> <urn:wide> {i} .\n"));
+        }
+        store
+            .load(&[Source::from_bytes(
+                data.into_bytes(),
+                oxrdfio::RdfFormat::Turtle,
+                None,
+            )])
+            .unwrap();
+        let q = "ASK { { ?s <urn:wide> ?v } UNION { <urn:t> <urn:cheap> ?v } }";
+        assert!(
+            query(
+                store.snapshot(),
+                q,
+                &QueryOptions {
+                    max_rows: Some(1),
+                    ..Default::default()
+                }
+            )
+            .unwrap()
+            .boolean
+        );
+        for options in [
+            QueryOptions {
+                max_rows: Some(0),
+                ..Default::default()
+            },
+            QueryOptions {
+                max_rows_produced: Some(0),
+                ..Default::default()
+            },
+            QueryOptions {
+                max_memory_bytes: Some(0),
+                ..Default::default()
+            },
+            QueryOptions {
+                cancel: Some(Arc::new(AtomicBool::new(true))),
+                ..Default::default()
+            },
+            QueryOptions {
+                deadline: Some(Instant::now() - Duration::from_secs(1)),
+                ..Default::default()
+            },
+        ] {
+            assert!(query(store.snapshot(), q, &options).is_err());
+        }
+        let false_then_wide =
+            "ASK { { ?s <urn:wide> ?v } UNION { <urn:t> <urn:cheap> ?v FILTER(?v = 99) } }";
+        let one_row = query(
+            store.snapshot(),
+            false_then_wide,
+            &QueryOptions {
+                max_rows: Some(1),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        assert!(one_row.boolean);
+        let mut plans = vec![&one_row.plan];
+        let mut wide_rows = None;
+        while let Some(p) = plans.pop() {
+            if p.operator == "IndexScan" && p.description.contains("urn:wide") {
+                wide_rows = Some(p.actual_rows);
+            }
+            plans.extend(p.children.iter());
+        }
+        assert_eq!(
+            wide_rows,
+            Some(1),
+            "the remaining plain branch reads only its actual demand"
+        );
+        let filtered_wide = "ASK { { ?s <urn:wide> ?v FILTER(?v != ?s) } UNION { <urn:t> <urn:cheap> ?v FILTER(?v = 99) } }";
+        assert!(
+            query(
+                store.snapshot(),
+                filtered_wide,
+                &QueryOptions {
+                    max_rows: Some(1),
+                    max_rows_produced: Some(1_000_000),
+                    ..Default::default()
+                }
+            )
+            .is_err(),
+            "the total-work-capped filtered path still refuses its physical64-row input work"
+        );
+        let optimized = query(
+            store.snapshot(),
+            filtered_wide,
+            &QueryOptions {
+                no_cache: true,
+                max_rows: Some(1),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        assert!(optimized.boolean);
+        let mut todo = vec![&optimized.plan];
+        let mut input_rows = None;
+        while let Some(p) = todo.pop() {
+            if p.operator == "IndexScan" && p.description.contains("urn:wide") {
+                input_rows = Some(p.actual_rows);
+            }
+            todo.extend(p.children.iter());
+        }
+        assert_eq!(
+            input_rows,
+            Some(1),
+            "the admitted pure filter reads one physical row"
+        );
+    }
 
     #[test]
     fn small_or_unshared_anchors_do_not_plan_an_alternative() {

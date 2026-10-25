@@ -556,6 +556,9 @@ pub struct Ctx {
     /// the planner met a `SERVICE` of the graph-algorithm namespace (see
     /// [`Ctx::calls_algorithm`])
     algorithmic: AtomicBool,
+    /// The whole eager ASK was admitted as a bounded pure UNION. Only that
+    /// consumer may reduce pure input demand below the ordinary prefix policy.
+    pub(super) eager_union_demand: AtomicBool,
     /// The plan of the operator that failed, as far as it ran, keyed by the address of
     /// its node, until its parent takes it (see [`Ctx::take_failed`]). Execution state:
     /// a plan shared between executions must not keep it.
@@ -902,6 +905,7 @@ impl Ctx {
             geo: Default::default(),
             warnings: Default::default(),
             algorithmic: AtomicBool::new(false),
+            eager_union_demand: AtomicBool::new(false),
             failed: Default::default(),
             sampled: Default::default(),
             stars: Default::default(),

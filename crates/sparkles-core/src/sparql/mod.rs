@@ -904,7 +904,7 @@ fn execute_prepared(
 ) -> std::result::Result<QueryResult, Box<Failed>> {
     let PreparedQuery {
         ctx,
-        node,
+        mut node,
         pattern,
         bound,
         kind,
@@ -912,6 +912,9 @@ fn execute_prepared(
     } = prepared;
     let (_, dataset, _) = split(parsed);
     let t2 = Instant::now();
+    if kind == QueryKind::Ask {
+        unionpush::order_ask(&ctx, &mut node);
+    }
     // the plan of a failed query as far as it ran, under the root of a graph query
     let failed = |error: Error, plan: Option<PlanInfo>, stage: Option<Instant>| {
         let mut plan = plan.or_else(|| ctx.failed_plan());

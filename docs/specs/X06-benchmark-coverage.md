@@ -1285,6 +1285,62 @@ their pooled fingerprint is the published Sparkles answer fingerprint.
 roadmap item 91. LUBM `q2` probe fanout and serial durable commit overhead remain open
 under item 290. The write work retains synchronization before acknowledgement.
 
+### Limited pure UNION demand
+
+Eager ASK execution compares work before the first UNION answer. An unfiltered scan
+uses its requested prefix. VALUES, filters, sorts and probes keep their full estimates,
+and joins include their eagerly built input. Nested UNIONs account for remaining
+demand across their operands. A bounded whitelist of the whole ASK excludes
+callbacks, expression calls, EXISTS, SERVICE and unknown operators. Only that admitted
+consumer enables exact pure input demand on an unchanged snapshot without a finite
+produced-row cap. The ordinary minimum request of 64 rows
+could otherwise make a one-row cheap branch continue into an unnecessary wide operand.
+SELECT and effectful consumers retain their order and demand policy. Explicit
+streaming retains its execution and budget paths.
+Reordering requires an unchanged snapshot without a total produced-row cap. Scan
+rows use covering block upper bounds before graph filtering. Join outputs use the
+product of their input bounds, UNION sums them, and pure unary operators preserve
+them. Bounds must fit row and memory budgets. Index-probe joins retain their order
+because available fanout metadata is an estimate. Full filtered work includes raw scan
+work even when graph selectivity discounts the planner estimate. Pure demand
+admission remains independent.
+
+The asymmetric join regression keeps the wide scan skipped after a cheap branch
+answers. An immediately answering scan reads only one row and skips a substantial
+false operand whose 10,000 rows the full-result cost ranking had visited. A total-work-capped
+filtered branch still refuses its physical 64-row input when the row budget is one.
+The separately admitted uncapped pure path answers after one physical input row.
+Further tests cover false and empty unions,
+duplicate and unbound VALUES, graph scopes, constant bindings, cancellation, deadlines,
+memory and produced-row budgets. A volatile callback branch keeps its original 64
+calls. A nested pure UNION retains its effectful consumer's 127 correlated SERVICE
+evaluations, and explicit streaming still visits the original first operand.
+Competing-operand tests keep a 10,000-row eager VALUES table and a nested false arm
+skipped when the first operand can already answer within a 64-row budget.
+The capped VALUES cases also cover 65 and 100 rows and a total produced-row limit of
+300. The physical-work controls run without row caps too, so a resource gate cannot
+hide an incorrect first-answer or nested-demand estimate. A mixed default/named graph
+case keeps its 24-row VALUES answer within a 40-row cap despite a discounted competing
+scan estimate. A 400-row false filter behind 1,000 VALUES rows retains the original
+order under a 3,420 produced-row cap and produces exactly 3,001 rows. Reordering had
+added geometric scan retries and refused at 3,464 rows. A further test keeps a bounded
+filtered answer ahead of two 32-row VALUES inputs with UNDEF keys. Their 1,024-row
+compatible join exceeds its 1,000-row cap despite a 22.4-row planner estimate.
+
+### Pure prefix propagation
+
+The projection-only policy still expanded one requested answer into 64 input rows
+through constant bindings, filters and index joins. A direct regression demonstrated
+all three inputs reading 64 rows. The admitted pure eager consumer now passes its
+actual demand through those operators and the limited side of ordinary joins. Full
+VALUES and join build inputs retain their materialization rules. Insufficient prefixes
+still grow by eight under the ordinary physical resource checks. Finite produced-row
+caps and changed snapshots keep the original minimum prefixes, as do SELECT,
+effectful consumers and explicit streaming. The regression requires native index-join
+execution and one input row for each admitted case, with separate 64-row controls for
+finite produced budgets and an unmerged snapshot. This demand policy does not need
+to reorder index-probe branches or certify their estimated fanout.
+
 ### Short-query checks after keyed inner groups
 
 The Namespace guard against `a5847311` used matching compiler signatures and returned
