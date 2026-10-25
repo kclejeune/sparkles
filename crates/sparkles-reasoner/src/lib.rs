@@ -15,6 +15,7 @@
 //! [`materialize_incremental`] updates a previous materialization from the changes to
 //! the input graphs since its commit, with the same result as a full run.
 
+pub mod analysis;
 mod budget;
 mod builtins;
 mod demand;
@@ -157,6 +158,8 @@ pub struct InferredLimitExceeded {
 #[derive(Clone)]
 pub struct ReasonOptions {
     /// Maximum number of semi-naive iterations before giving up.
+    /// Request-local controls for isolated entailment analyses. Ordinary runs leave this absent.
+    pub analysis: Option<Arc<analysis::AnalysisContext>>,
     pub max_iterations: usize,
     /// Maximum number of derived triples before giving up, [`DEFAULT_MAX_INFERRED`] by
     /// default. A run that passes it fails with [`InferredLimitExceeded`]. `usize::MAX`
@@ -186,6 +189,7 @@ pub struct ReasonOptions {
 impl Default for ReasonOptions {
     fn default() -> Self {
         ReasonOptions {
+            analysis: None,
             max_iterations: 10_000,
             max_inferred: DEFAULT_MAX_INFERRED,
             cancel: None,
@@ -360,7 +364,11 @@ fn derive_here(
     let base = Arc::new(facts::Base::new(snap.clone(), graphs)?);
     let mut g = graph::Graph::with_base(base.clone());
     g.set_budget(&budget)?;
-    let terms = Terms::new(snap);
+    let mut terms = Terms::new(snap);
+    terms.set_analysis(
+        opts.analysis.clone(),
+        format!("{}\n{:?}\n{:?}", profile.text(), extras, opts.inputs),
+    )?;
     terms.set_budget(&budget)?;
     let mut defaults = None;
     if extras.geo_default_geometry {
@@ -370,6 +378,9 @@ fn derive_here(
     }
     let mut warnings = Vec::new();
     let compiled = engine::compile(&rules, &terms, &mut warnings);
+    if let Some(context) = &opts.analysis {
+        context.check()?;
+    }
     let limits = engine::Limits {
         max_iterations: opts.max_iterations,
         max_inferred: opts.max_inferred,
@@ -1033,6 +1044,16 @@ fn finish(
     // a run that went over its limit fails before its commit, also when its charges are
     // back under it now
     done.budget.check_peak()?;
+    if let Some(context) = &opts.analysis {
+        if store.is_persistent() {
+            anyhow::bail!("analysis witnesses cannot be persisted");
+        }
+        if let Some(closure) = &done.closure {
+            context.capture_typings(closure.terms(), &done.generalized)?;
+        } else {
+            anyhow::bail!("analysis closure was unavailable before diagnostics capture");
+        }
+    }
     let receipt = txn.commit()?;
     progress(opts, 1.0, "done");
     let mut warnings = resolved.warnings.clone();

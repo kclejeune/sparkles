@@ -215,11 +215,9 @@ pub fn recorded(
         // the run's own commit, or the head it read when it changed nothing
         commit: receipt.map(|r| r.commit.seq),
         position_source: receipt.map(|_| "commit".to_string()),
-        dataset_id: Some(
-            receipt
-                .map_or(store.dataset_id(), |r| r.dataset_id)
-                .to_string(),
-        ),
+        // Receipts identify the dataset family. The recorded position belongs to
+        // this branch's independent commit sequence, which freshness validates.
+        dataset_id: Some(store.dataset_id().to_string()),
         rules: match profile {
             Profile::Rules(t) => Some(t.clone()),
             _ => None,

@@ -110,6 +110,9 @@ impl LocalTable {
 /// Term context shared by all evaluation threads.
 pub(crate) struct Terms {
     pub snap: Arc<Snapshot>,
+    analysis: Option<Arc<crate::analysis::AnalysisContext>>,
+    analysis_program: String,
+    analysis_round: AtomicUsize,
     /// base vocabulary id range `[lo, hi)` holding literals
     lit_range: (u64, u64),
     locals: RwLock<Locals>,
@@ -135,6 +138,9 @@ impl Terms {
         let lit_range = snap.generation.vocab.prefix_range(b"\"");
         let mut t = Terms {
             snap,
+            analysis: None,
+            analysis_program: String::new(),
+            analysis_round: AtomicUsize::new(0),
             lit_range,
             locals: RwLock::new(Locals::default()),
             table: LocalTable::new(),
@@ -161,6 +167,56 @@ impl Terms {
             oxrdf::vocab::xsd::DATE_TIME,
         )));
         t
+    }
+
+    pub fn set_analysis(
+        &mut self,
+        context: Option<Arc<crate::analysis::AnalysisContext>>,
+        program: String,
+    ) -> Result<(), MemoryExceeded> {
+        if let Some(context) = &context {
+            self.now = self.try_id_for(&context.now)?;
+        }
+        self.analysis = context;
+        self.analysis_program = program;
+        Ok(())
+    }
+
+    pub fn analysis_round(&self, round: usize) {
+        if self.analysis.is_some() {
+            self.analysis_round.store(round, Ordering::Relaxed);
+        }
+    }
+
+    pub fn analysis_witness(
+        &self,
+        rule: &crate::engine::CRule,
+        builtin: usize,
+        output: usize,
+        bindings: &[u64],
+        skolem: Option<&[u64]>,
+    ) -> Option<Result<u64, MemoryExceeded>> {
+        let context = self.analysis.as_ref()?;
+        let mut key = vec![self.analysis_program.clone()];
+        if let Some(inputs) = skolem {
+            // makeSkolem is shared by argument tuple throughout an ordinary program.
+            key.push("skolem".into());
+            key.extend(inputs.iter().map(|id| {
+                self.term(*id)
+                    .map_or_else(|| "unbound".into(), |term| term.to_string())
+            }));
+        } else {
+            key.push(format!(
+                "temp:{}:{output}:round:{}",
+                rule.builtins[builtin].origin,
+                self.analysis_round.load(Ordering::Relaxed)
+            ));
+            key.extend(bindings.iter().map(|id| {
+                self.term(*id)
+                    .map_or_else(|| "unbound".into(), |term| term.to_string())
+            }));
+        }
+        Some(context.witness(key))
     }
 
     /// Charge the local terms to `budget` from now on, or fail when they do not fit.
@@ -269,9 +325,18 @@ impl Terms {
     /// Compile a source constant without interpreting a response's encoded label.
     pub fn id_for_rule(&self, term: &Term) -> u64 {
         match term {
-            Term::BlankNode(node) => self
-                .rule_bnode(node, false)
-                .expect("non-strict charges do not fail"),
+            Term::BlankNode(node) => match self.rule_bnode(node, false) {
+                Ok(id) => id,
+                Err(error) => {
+                    // The compiler is infallible. Stop before evaluating its output,
+                    // without growing the witness map after a failed strict charge.
+                    self.analysis
+                        .as_ref()
+                        .expect("only analysis compilation can fail")
+                        .fail(error);
+                    Id::UNDEF.0
+                }
+            },
             _ => self.id_for(term),
         }
     }
@@ -279,6 +344,13 @@ impl Terms {
     fn rule_bnode(&self, node: &BlankNode, strict: bool) -> Result<u64, MemoryExceeded> {
         if let Some(id) = self.snap.lookup_term(&Term::BlankNode(node.clone())) {
             return Ok(id.0);
+        }
+        if let Some(context) = &self.analysis {
+            return context.witness(vec![
+                self.analysis_program.clone(),
+                "rule-blank".into(),
+                node.as_str().into(),
+            ]);
         }
         let mut key = b"\0bn".to_vec();
         key.extend_from_slice(node.as_str().as_bytes());

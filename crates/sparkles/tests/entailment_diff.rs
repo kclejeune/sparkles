@@ -329,3 +329,66 @@ fn randomized_deltas_match_independent_full_rematerializations() {
         assert_eq!(actual(&diff.removed_triples), expected(&a, &b, &asserted_a));
     }
 }
+
+#[test]
+fn fresh_materialized_branches_compare_exact_stored_witness_terms() {
+    let dataset = Dataset::memory();
+    dataset
+        .update("INSERT DATA {<urn:s> <urn:p> <urn:t>}")
+        .unwrap();
+    dataset
+        .create_branch("feature", &Default::default())
+        .unwrap();
+    let feature = dataset.branch("feature").unwrap();
+    let request = sparkles::reasoning::ReasonRequest {
+        profile: Profile::Rules("[r: (?s <urn:p> <urn:t>) makeTemp(?w) -> (?s <urn:q> ?w)]".into()),
+        ..Default::default()
+    };
+    dataset.reasoning().run(&request).unwrap();
+    feature.reasoning().run(&request).unwrap();
+    assert_eq!(
+        dataset.reasoning().status().unwrap().freshness.stale,
+        Some(false)
+    );
+    assert_eq!(
+        feature.reasoning().status().unwrap().freshness.stale,
+        Some(false)
+    );
+    let original = dataset.store().snapshot();
+    let proposed = feature.store().snapshot();
+    let original_witness = dataset
+        .select("SELECT ?w FROM <urn:x-sparkles:inferred> WHERE {<urn:s> <urn:q> ?w}")
+        .unwrap()
+        .iter()
+        .next()
+        .unwrap()
+        .get("w")
+        .unwrap()
+        .clone();
+    let proposed_witness = feature
+        .select("SELECT ?w FROM <urn:x-sparkles:inferred> WHERE {<urn:s> <urn:q> ?w}")
+        .unwrap()
+        .iter()
+        .next()
+        .unwrap()
+        .get("w")
+        .unwrap()
+        .clone();
+    assert_ne!(original_witness, proposed_witness);
+    let mut diff_request = DiffRequest::new("head", "feature");
+    diff_request.all_changes = true;
+    let diff = dataset.reasoning().diff(&diff_request).unwrap();
+    assert_eq!(
+        (diff.added, diff.removed),
+        (1, 1),
+        "statuses {:?} / {:?}, cacheable {} / {}",
+        dataset.reasoning().status(),
+        feature.reasoning().status(),
+        original.cacheable,
+        proposed.cacheable
+    );
+    assert_eq!(diff.added_triples[0][2], proposed_witness);
+    assert_eq!(diff.removed_triples[0][2], original_witness);
+    assert_eq!(dataset.store().snapshot().commit, original.commit);
+    assert_eq!(feature.store().snapshot().commit, proposed.commit);
+}

@@ -472,15 +472,23 @@ pub(crate) fn eval(ev: &mut Eval<'_>, j: usize, k: usize, b: &mut [u64]) {
         }
         MakeTemp => {
             let mut vals: Vec<u64> = Vec::with_capacity(bi.args.len());
-            for _ in 0..bi.args.len() {
-                vals.push(charged!(ev, t.try_fresh_bnode()));
+            for output in 0..bi.args.len() {
+                vals.push(charged!(
+                    ev,
+                    t.analysis_witness(rule, j, output, b, None)
+                        .unwrap_or_else(|| t.try_fresh_bnode())
+                ));
             }
             bind_all(ev, &bi.args, &vals, k, b);
             return;
         }
         MakeSkolem => {
             let inputs: Vec<u64> = (1..bi.args.len()).map(a).collect();
-            let v = charged!(ev, t.try_skolem(&inputs));
+            let v = charged!(
+                ev,
+                t.analysis_witness(rule, j, 0, b, Some(&inputs))
+                    .unwrap_or_else(|| t.try_skolem(&inputs))
+            );
             ev.bind_and_continue(bi.args[0], v, k, b);
             return;
         }

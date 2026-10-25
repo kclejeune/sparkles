@@ -99,6 +99,7 @@ struct Search<'a> {
     quads: Vec<[Id; 4]>,
     fixed: HashSet<[Id; 4]>,
     target: Finding,
+    probe: Option<Term>,
     variables: HashSet<String>,
     checks: &'a mut usize,
     max_checks: usize,
@@ -130,7 +131,11 @@ impl Search<'_> {
             self.control,
             self.bytes,
             Some(&subset),
-            &[self.target.check.to_string()],
+            &if self.probe.is_some() {
+                Vec::new()
+            } else {
+                vec![self.target.check.to_string()]
+            },
         ) {
             Ok(state) => state,
             Err(Error::Cancelled) => return Err(Error::Cancelled),
@@ -144,18 +149,21 @@ impl Search<'_> {
         };
         let mut matched = false;
         for finding in &state.diagnostics.findings {
-            let matches =
-                match matches_finding(&self.target, finding, &self.variables, self.control) {
-                    Ok(matches) => matches,
-                    Err(Error::Cancelled) => return Err(Error::Cancelled),
-                    Err(error) => {
-                        if self.control.check().is_err() {
-                            self.stopped = true;
-                            return Ok(Truth::Unknown);
-                        }
-                        return Err(error);
+            let matches = match if let Some(probe) = &self.probe {
+                Ok(probe_conflict(finding, probe))
+            } else {
+                matches_finding(&self.target, finding, &self.variables, self.control)
+            } {
+                Ok(matches) => matches,
+                Err(Error::Cancelled) => return Err(Error::Cancelled),
+                Err(error) => {
+                    if self.control.check().is_err() {
+                        self.stopped = true;
+                        return Ok(Truth::Unknown);
                     }
-                };
+                    return Err(error);
+                }
+            };
             if matches {
                 matched = true;
                 break;
@@ -163,7 +171,15 @@ impl Search<'_> {
         }
         if matched {
             Ok(Truth::Yes)
-        } else if check_complete(&state.diagnostics, self.target.check) {
+        } else if if self.probe.is_some() {
+            state
+                .diagnostics
+                .checks
+                .iter()
+                .all(|check| check_complete(&state.diagnostics, check.id))
+        } else {
+            check_complete(&state.diagnostics, self.target.check)
+        } {
             Ok(Truth::No)
         } else {
             self.stopped = true;
@@ -364,6 +380,7 @@ fn finding_support(
     fixed: HashSet<[Id; 4]>,
     checks: &mut usize,
     request: &JustifyRequest,
+    probe: Option<Term>,
 ) -> Result<JustifiedTarget> {
     let view = analysis::view(&snapshot, options)?;
     let graphs = analysis::input_graphs(&view, &program, options);
@@ -435,6 +452,7 @@ fn finding_support(
         quads,
         fixed,
         target: target.clone(),
+        probe,
         variables: generated_blanks,
         checks,
         max_checks: request.max_checks,
@@ -449,6 +467,16 @@ fn finding_support(
         justifications,
         complete,
     })
+}
+
+#[allow(clippy::too_many_arguments)]
+fn probe_conflict(finding: &Finding, probe: &Term) -> bool {
+    finding.severity == Severity::Inconsistency
+        && (finding.focus == *probe
+            || finding.evidence.iter().any(|(_, value)| match value {
+                Evidence::One(term) => term == probe,
+                Evidence::Many(terms) => terms.contains(probe),
+            }))
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -521,14 +549,7 @@ fn class_support(
         .diagnostics
         .findings
         .iter()
-        .find(|finding| {
-            finding.severity == Severity::Inconsistency
-                && (finding.focus == probe
-                    || finding.evidence.iter().any(|(_, value)| match value {
-                        Evidence::One(term) => term == &probe,
-                        Evidence::Many(terms) => terms.contains(&probe),
-                    }))
-        })
+        .find(|finding| probe_conflict(finding, &probe))
         .cloned();
     let complete = state
         .diagnostics
@@ -555,6 +576,7 @@ fn class_support(
         HashSet::from([probe_quad]),
         checks,
         request,
+        Some(probe),
     )?;
     result.class = Some(class);
     Ok(result)
@@ -590,7 +612,18 @@ impl InputsForProbe {
 pub fn justify(dataset: &Dataset, request: &JustifyRequest) -> Result<JustificationReport> {
     let control = AnalysisControl::new(&request.analysis)?;
     let snapshot = super::diff::resolve(dataset, &request.at, &control)?;
-    let program = analysis::program(dataset, &request.analysis)?;
+    let program = if matches!(request.target, JustifyTarget::Finding(_))
+        && request.analysis.program.is_none()
+        && dataset.reasoning().record().is_none()
+    {
+        AnalysisProgram {
+            profile: sparkles_reasoner::Profile::Rules(String::new()),
+            extras: Default::default(),
+            inputs: Default::default(),
+        }
+    } else {
+        analysis::program(dataset, &request.analysis)?
+    };
     let mut checks = 0;
     let mut results = Vec::new();
     let mut exhausted = true;
@@ -605,6 +638,7 @@ pub fn justify(dataset: &Dataset, request: &JustifyRequest) -> Result<Justificat
             HashSet::new(),
             &mut checks,
             request,
+            None,
         )?),
         JustifyTarget::Class(class) => results.push(class_support(
             dataset,
@@ -638,21 +672,43 @@ pub fn justify(dataset: &Dataset, request: &JustifyRequest) -> Result<Justificat
                     state.bytes,
                 )?;
                 drop(state);
+                let mut retained = classes.iter().map(|class| 96 + class.as_str().len()).sum();
                 for class in classes {
                     if checks >= request.max_checks {
                         exhausted = false;
                         break;
                     }
-                    results.push(class_support(
+                    let mut available = request.analysis.clone();
+                    available.max_memory = request
+                        .analysis
+                        .max_memory
+                        .map(|limit| {
+                            limit
+                                .checked_sub(retained)
+                                .filter(|left| *left > 0)
+                                .ok_or_else(|| {
+                                    analysis::budget(
+                                        "retained class supports exhaust their memory limit",
+                                    )
+                                })
+                        })
+                        .transpose()?;
+                    let result = class_support(
                         dataset,
                         &snapshot,
                         &program,
-                        &request.analysis,
+                        &available,
                         &control,
                         class,
                         &mut checks,
                         request,
-                    )?);
+                    )?;
+                    hold(
+                        request.analysis.max_memory,
+                        &mut retained,
+                        result_bytes(&result),
+                    )?;
+                    results.push(result);
                 }
             }
         }
@@ -799,10 +855,7 @@ fn matches_finding(
     control: &AnalysisControl,
 ) -> Result<bool> {
     use std::collections::HashMap;
-    if variables.is_empty() {
-        return Ok(finding_key(target) == finding_key(candidate));
-    }
-    if target.check != candidate.check || target.evidence.len() != candidate.evidence.len() {
+    if target.check != candidate.check {
         return Ok(false);
     }
     fn term(
@@ -898,6 +951,10 @@ fn matches_finding(
     }
     let mut groups = Vec::new();
     for (name, evidence) in &target.evidence {
+        // The path is a proof presentation, not the identity of an unsatisfiable class.
+        if target.check == "unsatisfiable-class" && *name == "path" {
+            continue;
+        }
         let Some((_, other)) = candidate.evidence.iter().find(|(key, _)| key == name) else {
             return Ok(false);
         };
@@ -909,7 +966,7 @@ fn matches_finding(
             Evidence::One(term) => vec![term],
             Evidence::Many(terms) => terms.iter().collect(),
         };
-        if target.len() != candidate.len() {
+        if target.len() > candidate.len() {
             return Ok(false);
         }
         groups.push((target, candidate));
@@ -950,6 +1007,19 @@ impl JustifiedDiagnostics {
     }
 }
 
+fn result_bytes(result: &JustifiedTarget) -> usize {
+    512 + result.class.as_ref().map_or(0, |node| node.as_str().len())
+        + result.finding.as_ref().map_or(0, |finding| {
+            256 + finding.message.len() + finding_key(finding).len() * 2
+        })
+        + result
+            .justifications
+            .iter()
+            .flat_map(|support| &support.facts)
+            .map(|fact| 256 + fact.quad.to_string().len() * 2)
+            .sum::<usize>()
+}
+
 /// Diagnostics and their first justifications use one retained state, program,
 /// deadline, cancellation flag and oracle-check allowance.
 pub fn diagnose(
@@ -974,6 +1044,10 @@ pub fn diagnose(
         options,
         snapshot.clone(),
         &sparkles_reasoner::diagnostics::DiagnosticControls {
+            access: analysis
+                .access
+                .as_ref()
+                .map(|access| access.bound(&snapshot)),
             deadline: control.deadline,
             cancel: Some(control.cancel.clone()),
             max_memory: analysis.max_memory.map(|limit| (limit / 16) as u64),
@@ -1012,13 +1086,15 @@ pub fn diagnose(
             if matches!(control.check(), Err(Error::Cancelled)) {
                 return Err(Error::Cancelled);
             }
-            results.push(JustifiedTarget {
+            let result = JustifiedTarget {
                 class: None,
                 finding: Some(finding.clone()),
                 holds: true,
                 justifications: Vec::new(),
                 complete: false,
-            });
+            };
+            hold(analysis.max_memory, &mut retained, result_bytes(&result))?;
+            results.push(result);
             continue;
         }
         let mut available = analysis.clone();
@@ -1046,17 +1122,12 @@ pub fn diagnose(
             HashSet::new(),
             &mut checks,
             &request,
+            None,
         )?;
         // The endpoint asks for one certified support, not exhaustion of all
         // alternatives. Every returned support has already passed minimality checks.
         result.complete |= !result.justifications.is_empty();
-        let size = result
-            .justifications
-            .iter()
-            .flat_map(|support| &support.facts)
-            .map(|fact| 256 + fact.quad.to_string().len() * 2)
-            .sum();
-        hold(analysis.max_memory, &mut retained, size)?;
+        hold(analysis.max_memory, &mut retained, result_bytes(&result))?;
         results.push(result);
     }
     let complete = results.iter().all(|result| result.complete);
@@ -1117,11 +1188,12 @@ fn relevant_classes(
     limit: Option<usize>,
     mut bytes: usize,
 ) -> Result<Vec<NamedNode>> {
-    use std::collections::{BTreeMap, HashMap};
+    use std::collections::HashMap;
     const RDF: &str = "http://www.w3.org/1999/02/22-rdf-syntax-ns#";
     const OWL: &str = "http://www.w3.org/2002/07/owl#";
-    let mut reverse: BTreeMap<&str, BTreeSet<&str>> = BTreeMap::new();
-    let mut seeds = BTreeSet::from(["http://www.w3.org/2002/07/owl#Nothing"]);
+    let nothing: Term = NamedNode::new_unchecked("http://www.w3.org/2002/07/owl#Nothing").into();
+    let mut reverse: HashMap<&Term, HashSet<&Term>> = HashMap::new();
+    let mut seeds = HashSet::from([&nothing]);
     let mut first: HashMap<&Term, Vec<&Term>> = HashMap::new();
     let mut rest: HashMap<&Term, Vec<&Term>> = HashMap::new();
     let mut members: HashMap<&Term, Vec<&Term>> = HashMap::new();
@@ -1133,19 +1205,15 @@ fn relevant_classes(
             match predicate {
                 "http://www.w3.org/2000/01/rdf-schema#subClassOf"
                 | "http://www.w3.org/2002/07/owl#equivalentClass" => {
-                    if let (Term::NamedNode(sub), Term::NamedNode(sup)) = (&triple[0], &triple[2]) {
-                        if reverse
-                            .entry(sup.as_str())
-                            .or_default()
-                            .insert(sub.as_str())
-                        {
+                    if matches!(&triple[0], Term::NamedNode(_) | Term::BlankNode(_))
+                        && matches!(&triple[2], Term::NamedNode(_) | Term::BlankNode(_))
+                    {
+                        let (sub, sup) = (&triple[0], &triple[2]);
+                        if reverse.entry(sup).or_default().insert(sub) {
                             hold(limit, &mut bytes, 96)?;
                         }
                         if predicate.ends_with("equivalentClass")
-                            && reverse
-                                .entry(sub.as_str())
-                                .or_default()
-                                .insert(sup.as_str())
+                            && reverse.entry(sub).or_default().insert(sup)
                         {
                             hold(limit, &mut bytes, 96)?;
                         }
@@ -1154,8 +1222,8 @@ fn relevant_classes(
                 "http://www.w3.org/2002/07/owl#disjointWith"
                 | "http://www.w3.org/2002/07/owl#complementOf" => {
                     for term in [&triple[0], &triple[2]] {
-                        if let Term::NamedNode(class) = term
-                            && seeds.insert(class.as_str())
+                        if matches!(term, Term::NamedNode(_) | Term::BlankNode(_))
+                            && seeds.insert(term)
                         {
                             hold(limit, &mut bytes, 64)?;
                         }
@@ -1198,8 +1266,7 @@ fn relevant_classes(
         hold(limit, &mut bytes, 64)?;
         if let Some(values) = first.get(list) {
             for value in values {
-                if let Term::NamedNode(class) = value
-                    && seeds.insert(class.as_str())
+                if matches!(value, Term::NamedNode(_) | Term::BlankNode(_)) && seeds.insert(*value)
                 {
                     hold(limit, &mut bytes, 64)?;
                 }
@@ -1222,9 +1289,12 @@ fn relevant_classes(
         }
     }
     let mut classes = Vec::new();
-    for name in seeds {
-        hold(limit, &mut bytes, 64 + name.len())?;
-        classes.push(NamedNode::new_unchecked(name));
+    for term in seeds {
+        if let Term::NamedNode(name) = term {
+            hold(limit, &mut bytes, 64 + name.as_str().len())?;
+            classes.push(name.clone());
+        }
     }
+    classes.sort_by(|a, b| a.as_str().cmp(b.as_str()));
     Ok(classes)
 }

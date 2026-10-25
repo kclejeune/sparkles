@@ -63,6 +63,30 @@ fn reserve_term(term: &Term, next: &mut u64, ordinals: &mut u64) -> Result<()> {
 }
 
 impl Store {
+    /// Reserve an otherwise unused stored-blank range in an isolated memory family.
+    /// Analysis callers share this range across their copies, without changing the
+    /// source family's allocator or branch metadata.
+    pub fn reserve_simulation_blank_range(&self, ordinal: Option<u16>) -> Result<u16> {
+        if self.is_persistent() {
+            return Err(Error::invalid(
+                "simulation witnesses require an isolated memory store",
+            ));
+        }
+        let set = self.owned_set()?;
+        let ordinal = match ordinal {
+            Some(ordinal) => ordinal,
+            None => u16::try_from(set.next_ordinal()).map_err(|_| {
+                Error::invalid("no blank-node range remains for simulation witnesses")
+            })?,
+        };
+        let next = ordinal as u64 + 1;
+        set.reserve_memory_ordinals(next)?;
+        self.branching
+            .next_ordinal
+            .fetch_max(next, Ordering::Relaxed);
+        Ok(ordinal)
+    }
+
     /// Stream selected quads of `view` into an independent memory store, preserving
     /// stored blank-node identities, including inside RDF triple terms and CDT values.
     /// The view may be historical, masked or an unpublished write preview. Its dataset

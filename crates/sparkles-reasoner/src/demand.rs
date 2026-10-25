@@ -225,6 +225,7 @@ pub(crate) fn cone(rules: &[CRule], a: (Slot, Slot, Slot)) -> BTreeSet<String> {
 
 pub(crate) fn clone_builtin(b: &CBuiltin) -> CBuiltin {
     CBuiltin {
+        origin: b.origin,
         kind: b.kind,
         args: b.args.clone(),
         inputs: b.inputs.clone(),
@@ -260,6 +261,7 @@ fn specialize(r: &CRule, v: usize, c: u64) -> CRule {
             .builtins
             .iter()
             .map(|b| CBuiltin {
+                origin: b.origin,
                 kind: b.kind,
                 args: b.args.iter().map(|&s| sub(s)).collect(),
                 inputs: b.inputs.iter().copied().filter(|&x| x != v).collect(),

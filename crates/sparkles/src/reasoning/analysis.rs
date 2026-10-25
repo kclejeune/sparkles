@@ -48,6 +48,8 @@ pub(crate) struct AnalysisControl {
     caller: Option<Arc<AtomicBool>>,
     stop: Option<mpsc::Sender<()>>,
     monitor: Option<std::thread::JoinHandle<()>>,
+    witnesses: std::sync::OnceLock<Arc<sparkles_reasoner::analysis::WitnessMap>>,
+    witness_memory: Option<usize>,
 }
 
 impl Drop for AnalysisControl {
@@ -73,6 +75,8 @@ impl AnalysisControl {
             caller,
             stop: None,
             monitor: None,
+            witnesses: Default::default(),
+            witness_memory: options.max_memory.map(|bytes| bytes / 8),
         };
         control.check()?;
         let (send, receive) = mpsc::channel();
@@ -229,6 +233,7 @@ pub(crate) struct State {
     pub asserted: Facts,
     pub closure: Facts,
     pub diagnostics: sparkles_reasoner::diagnostics::DiagnosticsReport,
+    pub typings: sparkles_reasoner::diagnostics::LiteralTypings,
     pub bytes: usize,
     pub warnings: Vec<String>,
 }
@@ -244,6 +249,142 @@ pub(crate) fn hold(limit: Option<usize>, bytes: &mut usize, additional: usize) -
     Ok(())
 }
 
+/// Read exact stored terms when the caller has proved both materializations fresh.
+/// Optional closure caching only controls whether generalized diagnostics need a
+/// private recomputation; it never changes the stored graph being compared.
+pub(crate) fn stored(
+    dataset: &Dataset,
+    snapshot: &Arc<Snapshot>,
+    program: &AnalysisProgram,
+    options: &AnalysisOptions,
+    control: &AnalysisControl,
+    retained: usize,
+) -> Result<State> {
+    use sparkles_reasoner::diagnostics::{DiagnoseOptions, DiagnosticControls, MAX_LIMIT};
+    let cache = &dataset.state().closure;
+    // Cached summaries have no independent read bound. Under an explicit grant,
+    // capture the summary through the private reasoner's bounded path instead.
+    let cached = if options.max_memory.is_none() {
+        sparkles_reasoner::literal_typings(dataset.store(), snapshot.commit, Some(cache))
+            .map_err(crate::handles::from_anyhow)?
+    } else {
+        None
+    };
+    let typings = match cached {
+        Some(typings) => typings,
+        None => {
+            analyze(
+                dataset,
+                snapshot,
+                program,
+                options,
+                control,
+                retained,
+                None,
+                &[],
+            )?
+            .typings
+        }
+    };
+    let share = options.max_memory.map(|limit| {
+        limit
+            .saturating_sub(retained)
+            .saturating_sub(control.witness_memory.unwrap_or(0))
+            / 8
+    });
+    let graphs = input_graphs(snapshot, program, options);
+    let inferred = snapshot.lookup_iri(super::INFERRED_GRAPH);
+    let mut asserted = Facts::new();
+    let mut closure = Facts::new();
+    let mut bytes = typings
+        .facts
+        .iter()
+        .map(|(literal, datatype)| {
+            128 + literal.to_string().len() * 2 + datatype.as_str().len() * 2
+        })
+        .sum();
+    hold(share, &mut bytes, 0)?;
+    snapshot.for_each_quad(|quad| {
+        control.check()?;
+        let input = graphs.contains(&quad[3]);
+        if !input && Some(quad[3]) != inferred {
+            return Ok(());
+        }
+        let triple = [
+            snapshot.term(quad[0]).unwrap(),
+            snapshot.term(quad[1]).unwrap(),
+            snapshot.term(quad[2]).unwrap(),
+        ];
+        let key = fact_key(&triple);
+        if input && !asserted.contains_key(&key) {
+            hold(share, &mut bytes, fact_bytes(&key, &triple))?;
+            asserted.insert(key.clone(), triple.clone());
+        }
+        if let std::collections::btree_map::Entry::Vacant(entry) = closure.entry(key) {
+            hold(share, &mut bytes, fact_bytes(entry.key(), &triple))?;
+            entry.insert(triple);
+        }
+        Ok(())
+    })?;
+    let mut names: Vec<_> = graphs
+        .iter()
+        .filter_map(|graph| {
+            if *graph == crate::id::Id::DEFAULT_GRAPH {
+                Some("default".to_string())
+            } else {
+                match snapshot.term(*graph) {
+                    Some(oxrdf::Term::NamedNode(node)) => Some(node.into_string()),
+                    _ => None,
+                }
+            }
+        })
+        .collect();
+    if names.is_empty() {
+        // A protocol dataset containing a graph absent from this immutable view is
+        // empty; an empty list would instead restore the actual default graph.
+        loop {
+            let name = format!("urn:x-sparkles:empty-analysis:{}", uuid::Uuid::new_v4());
+            if snapshot.lookup_iri(&name).is_none() {
+                names.push(name);
+                break;
+            }
+        }
+    }
+    let diagnostics = sparkles_reasoner::diagnostics::diagnose_controlled(
+        snapshot.clone(),
+        &DiagnoseOptions {
+            graphs: names,
+            inferences: true,
+            limit: MAX_LIMIT,
+            timeout: control.remaining(),
+            ..Default::default()
+        },
+        Some(&typings),
+        &DiagnosticControls {
+            deadline: control.deadline,
+            cancel: Some(control.cancel.clone()),
+            max_memory: share.map(|bytes| bytes as u64 / 2),
+            access: options.access.clone(),
+        },
+    )
+    .map_err(|error| control.error(crate::handles::from_anyhow(error)))?;
+    for finding in &diagnostics.findings {
+        hold(
+            share,
+            &mut bytes,
+            256 + super::diff::finding_key(finding).len() * 2 + finding.message.len(),
+        )?;
+    }
+    Ok(State {
+        asserted,
+        closure,
+        diagnostics,
+        typings,
+        bytes,
+        warnings: Vec::new(),
+    })
+}
+
 /// Full-closure fallback on a private writable copy. Data and blank identities come
 /// from the immutable caller view; only the resolved visible inputs reach the copy.
 #[allow(clippy::too_many_arguments)]
@@ -257,6 +398,23 @@ pub(crate) fn analyze(
     subset: Option<&std::collections::HashSet<[crate::id::Id; 4]>>,
     checks: &[String],
 ) -> Result<State> {
+    analyze_with_cache_limit(
+        dataset, snapshot, program, options, control, retained, subset, checks, None,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn analyze_with_cache_limit(
+    dataset: &Dataset,
+    snapshot: &Arc<Snapshot>,
+    program: &AnalysisProgram,
+    options: &AnalysisOptions,
+    control: &AnalysisControl,
+    retained: usize,
+    subset: Option<&std::collections::HashSet<[crate::id::Id; 4]>>,
+    checks: &[String],
+    cache_limit: Option<usize>,
+) -> Result<State> {
     use crate::id::Id;
     use sparkles_reasoner::{GraphRef, ImportMode};
     control.check()?;
@@ -267,6 +425,7 @@ pub(crate) fn analyze(
         .map(|limit| {
             limit
                 .checked_sub(retained)
+                .and_then(|left| left.checked_sub(control.witness_memory.unwrap_or(0)))
                 .filter(|left| *left > 0)
                 .ok_or_else(|| budget("the retained analysis result exhausts its memory limit"))
         })
@@ -291,7 +450,27 @@ pub(crate) fn analyze(
             },
         )
         .map_err(|error| control.error(error))?;
-    let copied = Dataset::from_store(copied);
+    let ordinal =
+        copied.reserve_simulation_blank_range(control.witnesses.get().map(|map| map.ordinal()))?;
+    let witnesses = control
+        .witnesses
+        .get_or_init(|| {
+            sparkles_reasoner::analysis::WitnessMap::new(
+                ordinal,
+                control.witness_memory,
+                control.cancel.clone(),
+                control.deadline,
+            )
+        })
+        .clone();
+    let context = sparkles_reasoner::analysis::AnalysisContext::new(witnesses, share);
+    let copied = Dataset::from_store_with(
+        copied,
+        crate::DatasetOptions {
+            closure_cache_triples: cache_limit.unwrap_or(super::DEFAULT_CLOSURE_CACHE_TRIPLES),
+            ..Default::default()
+        },
+    );
     let before = copied.store().snapshot();
     let mut asserted = Facts::new();
     let mut bytes = 0;
@@ -331,6 +510,7 @@ pub(crate) fn analyze(
         .map(|graph| graph.as_str().to_string())
         .collect();
     let request = sparkles_reasoner::ReasonOptions {
+        analysis: Some(context.clone()),
         inputs: Inputs {
             data_graphs: selected,
             ontology_graphs: Vec::new(),
@@ -383,12 +563,20 @@ pub(crate) fn analyze(
         }
         Ok(())
     })?;
-    let typings = sparkles_reasoner::literal_typings(
-        copied.store(),
-        snapshot.commit,
-        Some(&copied.state().closure),
-    )
-    .map_err(crate::handles::from_anyhow)?;
+    let typings = context
+        .take_literal_typings(snapshot.commit)
+        .ok_or_else(|| budget("the analysis did not retain its generalized diagnostics"))?;
+    hold(
+        share,
+        &mut bytes,
+        typings
+            .facts
+            .iter()
+            .map(|(literal, datatype)| {
+                128 + literal.to_string().len() * 2 + datatype.as_str().len() * 2
+            })
+            .sum(),
+    )?;
     let diagnostics = sparkles_reasoner::diagnostics::diagnose_controlled(
         snapshot,
         &sparkles_reasoner::diagnostics::DiagnoseOptions {
@@ -400,11 +588,12 @@ pub(crate) fn analyze(
             prefixes: dataset.store().prefixes().into_iter().collect(),
             ..Default::default()
         },
-        typings.as_ref(),
+        Some(&typings),
         &sparkles_reasoner::diagnostics::DiagnosticControls {
             deadline: control.deadline,
             cancel: Some(control.cancel.clone()),
             max_memory: available.map(|bytes| (bytes / 16) as u64),
+            access: None,
         },
     )
     .map_err(|error| control.error(crate::handles::from_anyhow(error)))?;
@@ -428,6 +617,7 @@ pub(crate) fn analyze(
         asserted,
         closure,
         diagnostics,
+        typings,
         bytes,
         warnings: outcome.warnings,
     })
@@ -564,4 +754,39 @@ pub(crate) fn positive(
                 })
         })
         .unwrap_or(Ok(default))
+}
+
+#[cfg(test)]
+mod review_regressions {
+    use super::*;
+    #[test]
+    fn declined_optional_cache_does_not_erase_generalized_diagnostics() {
+        let dataset = Dataset::memory();
+        dataset
+            .update("INSERT DATA {<urn:s> <urn:p> <urn:o> . <urn:literal> <urn:value> \"abc\"}")
+            .unwrap();
+        let program=AnalysisProgram {profile:Profile::Rules("[typing: (<urn:s> <urn:p> <urn:o>) -> (\"abc\" <http://www.w3.org/1999/02/22-rdf-syntax-ns#type> <http://www.w3.org/2001/XMLSchema#integer>)]".into()),extras:Default::default(),inputs:Default::default()};
+        let options = AnalysisOptions::default();
+        let control = AnalysisControl::new(&options).unwrap();
+        let state = analyze_with_cache_limit(
+            &dataset,
+            &dataset.store().snapshot(),
+            &program,
+            &options,
+            &control,
+            0,
+            None,
+            &["literal-not-in-datatype".into()],
+            Some(0),
+        )
+        .unwrap();
+        assert!(
+            state
+                .diagnostics
+                .findings
+                .iter()
+                .any(|finding| finding.check == "literal-not-in-datatype"),
+            "optional caching lost an entailed literal typing conflict"
+        );
+    }
 }

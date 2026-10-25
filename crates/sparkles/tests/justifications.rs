@@ -271,3 +271,179 @@ fn classes_all_follows_the_relevant_superclass_cone() {
             .all(|result| result.holds)
     );
 }
+
+#[test]
+fn justified_diagnostics_cannot_disclose_an_unreadable_graph() {
+    use sparkles::access::{GraphAccess, GraphRule, Graphs};
+    use sparkles::reasoning::analysis::AnalysisOptions;
+    let (_dir, dataset) = open(
+        "ex:hidden {ex:Cat owl:disjointWith ex:Dog . ex:secret a ex:Cat, ex:Dog} ex:visible {ex:s ex:p 1}",
+    );
+    let access = std::sync::Arc::new(GraphAccess::graphs(
+        Graphs::Only(GraphRule::new(["http://ex.org/visible"], &[])),
+        Graphs::none(),
+    ));
+    let report = dataset
+        .reasoning()
+        .diagnostics_justified(
+            &DiagnoseOptions {
+                checks: vec!["disjoint-classes".into()],
+                graphs: vec!["http://ex.org/hidden".into()],
+                ..Default::default()
+            },
+            &AnalysisOptions {
+                access: Some(access),
+                ..Default::default()
+            },
+            500,
+        )
+        .unwrap();
+    assert!(
+        report.diagnostics.report.findings.is_empty(),
+        "an unreadable graph disclosed its findings"
+    );
+}
+
+#[test]
+fn nothing_member_support_accepts_requested_type_with_additional_inferred_types() {
+    let (_dir, dataset) = open("ex:C rdfs:subClassOf owl:Nothing . ex:x a ex:C .");
+    let target = dataset
+        .reasoning()
+        .diagnostics(&DiagnoseOptions {
+            checks: vec!["nothing-member".into()],
+            ..Default::default()
+        })
+        .unwrap()
+        .report
+        .findings
+        .remove(0);
+    let mut request = options(JustifyTarget::Finding(target));
+    request.analysis.program.as_mut().unwrap().profile = Profile::RdfsSimple;
+    let report = dataset.reasoning().justify(&request).unwrap();
+    assert!(
+        report.results[0].holds,
+        "requested evidence was hidden by a larger oracle evidence group"
+    );
+    assert!(report.complete);
+    assert_eq!(report.results[0].justifications[0].facts.len(), 2);
+}
+
+#[test]
+fn class_supports_include_independent_probe_conflicts() {
+    let (_dir, dataset) = open(
+        "ex:C rdfs:subClassOf ex:A, ex:B, ex:D, ex:E . ex:A owl:disjointWith ex:B . ex:D owl:disjointWith ex:E .",
+    );
+    let mut request = options(JustifyTarget::Class(
+        NamedNode::new("http://ex.org/C").unwrap(),
+    ));
+    request.max_checks = 3000;
+    let report = dataset.reasoning().justify(&request).unwrap();
+    assert!(report.complete);
+    assert_eq!(
+        report.results[0].justifications.len(),
+        2,
+        "one independent inconsistency was excluded from the class oracle"
+    );
+    assert!(
+        report.results[0]
+            .justifications
+            .iter()
+            .all(|support| support.facts.len() == 3)
+    );
+}
+
+#[test]
+fn relevant_class_cones_traverse_anonymous_disjoint_classes() {
+    let (_dir, dataset) = open("ex:C rdfs:subClassOf _:a, _:b . _:a owl:disjointWith _:b .");
+    let direct = dataset
+        .reasoning()
+        .justify(&options(JustifyTarget::Class(
+            NamedNode::new("http://ex.org/C").unwrap(),
+        )))
+        .unwrap();
+    assert!(direct.results[0].holds);
+    let mut request = options(JustifyTarget::AllClasses);
+    request.max_checks = 3000;
+    let report = dataset.reasoning().justify(&request).unwrap();
+    assert!(report.complete);
+    assert!(
+        report
+            .results
+            .iter()
+            .any(
+                |result| result.class.as_ref().unwrap().as_str() == "http://ex.org/C"
+                    && result.holds
+            ),
+        "the named subclass disappeared behind anonymous superclass nodes"
+    );
+}
+
+#[test]
+fn asserted_findings_have_supports_without_a_recorded_or_explicit_program() {
+    let (_dir, dataset) = open("ex:Cat owl:disjointWith ex:Dog . ex:tom a ex:Cat, ex:Dog .");
+    let request = JustifyRequest::new(JustifyTarget::Finding(finding(&dataset)));
+    let report = dataset.reasoning().justify(&request).unwrap();
+    assert!(report.results[0].holds);
+    assert_eq!(report.results[0].justifications[0].facts.len(), 3);
+}
+
+#[test]
+fn classes_all_charges_the_shared_large_facts_in_retained_results() {
+    let mut text = String::from("ex:Root owl:disjointWith ex:Other . ex:source ex:payload \"");
+    text.push_str(&"x".repeat(320 * 1024));
+    text.push_str("\" . ");
+    for index in 0..64 {
+        text.push_str(&format!("ex:C{index} rdfs:subClassOf ex:Root . "));
+    }
+    let (_dir, dataset) = open(&text);
+    let mut request = options(JustifyTarget::AllClasses);
+    request.analysis.program.as_mut().unwrap().profile=Profile::Rules("[support: (?x <http://www.w3.org/1999/02/22-rdf-syntax-ns#type> ?c), (?c <http://www.w3.org/2000/01/rdf-schema#subClassOf> <http://ex.org/Root>), (<http://ex.org/source> <http://ex.org/payload> ?literal) -> (?x <http://www.w3.org/1999/02/22-rdf-syntax-ns#type> <http://ex.org/Other>)]".into());
+    request.analysis.max_memory = Some(16 * 1024 * 1024);
+    request.analysis.timeout = Some(std::time::Duration::from_secs(120));
+    request.max_checks = 20_000;
+    let result = dataset.reasoning().justify(&request);
+    assert!(
+        matches!(result,Err(sparkles::Error::Component(ref error)) if error.code=="reasoning-budget" && error.message.contains("memory")),
+        "retained class results did not exhaust the shared memory grant: {}",
+        match result {
+            Ok(ref report) => format!(
+                "{} results, complete={}",
+                report.results.len(),
+                report.complete
+            ),
+            Err(ref error) => error.to_string(),
+        }
+    );
+}
+
+#[test]
+fn justified_diagnostics_cannot_disclose_a_denied_inferred_graph() {
+    use sparkles::access::{GraphAccess, GraphRule, Graphs};
+    use sparkles::reasoning::analysis::AnalysisOptions;
+    let (_dir, dataset) =
+        open("ex:Cat owl:disjointWith ex:Dog . ex:tom a ex:Cat . ex:tom ex:seed 1 .");
+    dataset.reasoning().run(&sparkles::reasoning::ReasonRequest {profile:Profile::Rules("[derived: (<http://ex.org/tom> <http://ex.org/seed> 1) -> (<http://ex.org/tom> <http://www.w3.org/1999/02/22-rdf-syntax-ns#type> <http://ex.org/Dog>)]".into()),..Default::default()}).unwrap();
+    let access = std::sync::Arc::new(GraphAccess::graphs(
+        Graphs::Only(GraphRule::new(["default"], &[])),
+        Graphs::none(),
+    ));
+    let report = dataset
+        .reasoning()
+        .diagnostics_justified(
+            &DiagnoseOptions {
+                checks: vec!["disjoint-classes".into()],
+                inferences: true,
+                ..Default::default()
+            },
+            &AnalysisOptions {
+                access: Some(access),
+                ..Default::default()
+            },
+            500,
+        )
+        .unwrap();
+    assert!(
+        report.diagnostics.report.findings.is_empty(),
+        "a denied inferred graph disclosed a finding"
+    );
+}

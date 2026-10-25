@@ -32,6 +32,8 @@ pub(crate) struct Atom {
 
 #[derive(Debug)]
 pub(crate) struct CBuiltin {
+    /// Stable textual occurrence across copies of the same compiled program.
+    pub origin: usize,
     pub kind: BuiltinKind,
     pub args: Vec<Slot>,
     /// variables that must be bound before the call
@@ -172,9 +174,14 @@ fn compile_with(
     }
     let mut out = Vec::new();
     let mut infos = Vec::new();
+    let mut occurrence = 0;
     for f in flat {
         match compile_one(&f, terms, warnings) {
-            Ok(Some((c, info))) => {
+            Ok(Some((mut c, info))) => {
+                for call in &mut c.builtins {
+                    call.origin = occurrence;
+                    occurrence += 1;
+                }
                 out.push(c);
                 infos.push(info);
             }
@@ -290,6 +297,7 @@ fn compile_one(
                     _ => None,
                 };
                 builtins.push(CBuiltin {
+                    origin: 0,
                     kind,
                     args,
                     inputs,
@@ -1527,6 +1535,7 @@ pub(crate) fn run(
         anyhow::Error::new(e.with_context(format!(" (in iteration {})", iteration + 1)))
     };
     loop {
+        terms.analysis_round(iteration);
         if cancelled() {
             anyhow::bail!("reasoning cancelled");
         }

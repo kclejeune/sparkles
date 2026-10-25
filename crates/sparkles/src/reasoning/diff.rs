@@ -169,16 +169,29 @@ impl EntailmentDiff {
     /// Every change as an RDF Patch over the inferred graph.
     pub fn to_patch(&self) -> Result<String> {
         self.complete_changes()?;
-        let mut text = String::new();
-        for (operation, rows) in [("D", &self.removed_triples), ("A", &self.added_triples)] {
+        let mut bytes = Vec::new();
+        let mut writer = crate::patch::PatchWriter::new(&mut bytes, false);
+        for (operation, rows) in [
+            (crate::store::DiffOp::Remove, &self.removed_triples),
+            (crate::store::DiffOp::Add, &self.added_triples),
+        ] {
             for [s, p, o] in rows {
-                text.push_str(&format!(
-                    "{operation} {s} {p} {o} <{}> .\n",
-                    super::INFERRED_GRAPH
-                ));
+                let subject = oxrdf::NamedOrBlankNode::try_from(s.clone())
+                    .map_err(|_| crate::Error::invalid("a patch subject must be an RDF subject"))?;
+                let predicate = oxrdf::NamedNode::try_from(p.clone())
+                    .map_err(|_| crate::Error::invalid("a patch predicate must be an IRI"))?;
+                writer.change(
+                    operation,
+                    &oxrdf::Quad::new(
+                        subject,
+                        predicate,
+                        o.clone(),
+                        oxrdf::NamedNode::new_unchecked(super::INFERRED_GRAPH),
+                    ),
+                )?;
             }
         }
-        Ok(text)
+        Ok(String::from_utf8(bytes).expect("RDF Patch is UTF-8"))
     }
 }
 
@@ -218,6 +231,46 @@ pub fn diff(dataset: &Dataset, request: &DiffRequest) -> Result<EntailmentDiff> 
     compare(dataset, &from, &to, request, &control)
 }
 
+/// A record proves freshness only for its own branch and at or after its position.
+/// Masked/unpublished snapshots and restricted views use the visible-input fallback.
+fn selected_materialization(
+    dataset: &Dataset,
+    selector: &str,
+    snapshot: &Snapshot,
+    program: &analysis::AnalysisProgram,
+    options: &AnalysisOptions,
+) -> Result<Option<Dataset>> {
+    if !snapshot.cacheable
+        || options
+            .access
+            .as_ref()
+            .is_some_and(|access| !access.reads_everything())
+    {
+        return Ok(None);
+    }
+    let selected = if let Some((branch, _)) = selector.rsplit_once('@') {
+        dataset.branch(branch)
+    } else if selector.parse::<crate::history::At>().is_ok() {
+        Ok(dataset.clone())
+    } else {
+        dataset.branch(selector)
+    };
+    let Ok(selected) = selected else {
+        return Ok(None);
+    };
+    let Some(record) = selected.reasoning().record() else {
+        return Ok(None);
+    };
+    if record.profile()? != program.profile
+        || record.extras()? != program.extras
+        || record.run_inputs()? != program.inputs
+        || super::freshness(&record, selected.store(), snapshot.commit).stale != Some(false)
+    {
+        return Ok(None);
+    }
+    Ok(Some(selected))
+}
+
 /// Compare actual retained candidates; no reconstruction from a truncated preview patch.
 pub(crate) fn compare(
     dataset: &Dataset,
@@ -231,26 +284,37 @@ pub(crate) fn compare(
     from_options.access = request.from_access.clone().or(from_options.access);
     let mut to_options = request.analysis.clone();
     to_options.access = request.to_access.clone().or(to_options.access);
-    let a = analysis::analyze(
-        dataset,
-        from,
-        &program,
-        &from_options,
-        control,
-        0,
-        None,
-        &[],
-    )?;
-    let b = analysis::analyze(
-        dataset,
-        to,
-        &program,
-        &to_options,
-        control,
-        a.bytes,
-        None,
-        &[],
-    )?;
+    let materialized =
+        selected_materialization(dataset, &request.from, from, &program, &from_options)?.zip(
+            selected_materialization(dataset, &request.to, to, &program, &to_options)?,
+        );
+    let (a, b) = if let Some((from_dataset, to_dataset)) = materialized {
+        let a = analysis::stored(&from_dataset, from, &program, &from_options, control, 0)?;
+        let b = analysis::stored(&to_dataset, to, &program, &to_options, control, a.bytes)?;
+        (a, b)
+    } else {
+        let a = analysis::analyze(
+            dataset,
+            from,
+            &program,
+            &from_options,
+            control,
+            0,
+            None,
+            &[],
+        )?;
+        let b = analysis::analyze(
+            dataset,
+            to,
+            &program,
+            &to_options,
+            control,
+            a.bytes,
+            None,
+            &[],
+        )?;
+        (a, b)
+    };
     delta(
         a,
         b,
@@ -407,4 +471,207 @@ pub fn preview(
         .ok_or_else(|| crate::Error::invalid("the preview did not retain its complete states"))?;
     let control = AnalysisControl::new(&request.analysis)?;
     compare(dataset, &states.before, &states.after, request, &control)
+}
+
+#[cfg(test)]
+mod review_regressions {
+    use super::*;
+    fn same_snapshot_after_interposed_write(profile: sparkles_reasoner::Profile) -> EntailmentDiff {
+        let dataset = Dataset::memory();
+        dataset
+            .update("INSERT DATA {<urn:trigger> <urn:p> 1}")
+            .unwrap();
+        let snapshot = dataset.store().snapshot();
+        let mut request = DiffRequest::new("head", "head");
+        request.analysis.program = Some(analysis::AnalysisProgram {
+            profile,
+            extras: Default::default(),
+            inputs: Default::default(),
+        });
+        let control = AnalysisControl::new(&request.analysis).unwrap();
+        let program = analysis::program(&dataset, &request.analysis).unwrap();
+        let a = analysis::analyze(
+            &dataset,
+            &snapshot,
+            &program,
+            &request.analysis,
+            &control,
+            0,
+            None,
+            &[],
+        )
+        .unwrap();
+        dataset
+            .update(&format!(
+                "INSERT DATA {{ _:unrelated <urn:p> \"{}\" }}",
+                "a".repeat(32768)
+            ))
+            .unwrap();
+        let b = analysis::analyze(
+            &dataset,
+            &snapshot,
+            &program,
+            &request.analysis,
+            &control,
+            a.bytes,
+            None,
+            &[],
+        )
+        .unwrap();
+        delta(
+            a,
+            b,
+            DiffState {
+                selector: "fixed".into(),
+                commit: snapshot.commit,
+            },
+            DiffState {
+                selector: "fixed".into(),
+                commit: snapshot.commit,
+            },
+            &request,
+            &control,
+        )
+        .unwrap()
+    }
+    #[test]
+    fn unrelated_blank_allocation_cannot_change_a_fixed_generated_closure() {
+        for call in ["makeTemp(?w)", "makeSkolem(?w, ?value)"] {
+            let profile = sparkles_reasoner::Profile::Rules(format!(
+                "[generated: (<urn:trigger> <urn:p> ?value), {call} -> (?w <urn:q> ?value)]"
+            ));
+            let diff = same_snapshot_after_interposed_write(profile);
+            assert_eq!((diff.added, diff.removed), (0, 0), "{call}");
+            assert!(diff.new_findings.is_empty());
+        }
+    }
+    #[test]
+    fn program_blank_constants_preserve_identity_after_interposed_allocation() {
+        let diff = same_snapshot_after_interposed_write(sparkles_reasoner::Profile::Rules(
+            "[constant: (<urn:trigger> <urn:p> ?value) -> (_:w <urn:q> ?value)]".into(),
+        ));
+        assert_eq!((diff.added, diff.removed), (0, 0));
+    }
+    #[test]
+    fn one_request_uses_one_analysis_clock_for_both_states() {
+        let diff=same_snapshot_after_interposed_write(sparkles_reasoner::Profile::Rules("[clock: (<urn:trigger> <urn:p> ?value), now(?time) -> (<urn:trigger> <urn:time> ?time)]".into()));
+        assert_eq!((diff.added, diff.removed), (0, 0));
+    }
+    #[test]
+    fn rdf_patch_keeps_jena_blank_labels() {
+        let triple = [
+            Term::BlankNode(oxrdf::BlankNode::new("b123").unwrap()),
+            oxrdf::NamedNode::new("urn:p").unwrap().into(),
+            Term::BlankNode(oxrdf::BlankNode::new("b456").unwrap()),
+        ];
+        let diff = EntailmentDiff {
+            from: DiffState {
+                selector: "a".into(),
+                commit: 1,
+            },
+            to: DiffState {
+                selector: "b".into(),
+                commit: 2,
+            },
+            added: 1,
+            removed: 0,
+            added_triples: vec![triple],
+            removed_triples: vec![],
+            by_predicate: Default::default(),
+            by_class: Default::default(),
+            new_findings: vec![],
+            findings_complete: true,
+            sample_truncated: false,
+            warnings: vec![],
+        };
+        assert_eq!(
+            diff.to_patch().unwrap(),
+            "A <_:b123> <urn:p> <_:b456> <urn:x-sparkles:inferred> .\n"
+        );
+    }
+    #[test]
+    fn inserted_earlier_bindings_preserve_existing_generated_witnesses() {
+        for generator in ["makeTemp(?w)", "makeSkolem(?w, ?s)"] {
+            let dataset = Dataset::memory();
+            dataset
+                .update("INSERT DATA {<urn:z> <urn:p> <urn:t>}")
+                .unwrap();
+            let before = dataset.store().snapshot();
+            dataset
+                .update("INSERT DATA {<urn:a> <urn:p> <urn:t>}")
+                .unwrap();
+            let after = dataset.store().snapshot();
+            let mut request = DiffRequest::new("before", "after");
+            request.analysis.program = Some(analysis::AnalysisProgram {
+                profile: sparkles_reasoner::Profile::Rules(format!(
+                    "[r: (?s <urn:p> <urn:t>) {generator} -> (?s <urn:q> ?w)]"
+                )),
+                extras: Default::default(),
+                inputs: Default::default(),
+            });
+            let control = AnalysisControl::new(&request.analysis).unwrap();
+            let diff = compare(&dataset, &before, &after, &request, &control).unwrap();
+            assert_eq!((diff.added, diff.removed), (1, 0), "{generator}");
+            assert_eq!(
+                diff.added_triples[0][0],
+                oxrdf::NamedNode::new("urn:a").unwrap().into()
+            );
+        }
+    }
+
+    #[test]
+    fn duplicate_rule_labels_keep_distinct_temporary_witnesses() {
+        let dataset = Dataset::memory();
+        let before = dataset.store().snapshot();
+        dataset
+            .update("INSERT DATA {<urn:s> <urn:p> <urn:t>}")
+            .unwrap();
+        let after = dataset.store().snapshot();
+        let mut request = DiffRequest::new("before", "after");
+        request.analysis.program = Some(analysis::AnalysisProgram { profile: sparkles_reasoner::Profile::Rules("[same: (?s <urn:p> <urn:t>) makeTemp(?w) -> (?s <urn:q> ?w)]\n[same: (?s <urn:p> <urn:t>) makeTemp(?w) -> (?s <urn:q> ?w)]".into()), extras: Default::default(), inputs: Default::default() });
+        let control = AnalysisControl::new(&request.analysis).unwrap();
+        let diff = compare(&dataset, &before, &after, &request, &control).unwrap();
+        assert_eq!((diff.added, diff.removed), (2, 0));
+        assert_ne!(diff.added_triples[0][2], diff.added_triples[1][2]);
+    }
+
+    #[test]
+    fn recursive_generated_inputs_obey_the_inferred_fact_bound() {
+        let dataset = Dataset::memory();
+        dataset
+            .update("INSERT DATA {<urn:s> <urn:p> <urn:t>}")
+            .unwrap();
+        let snapshot = dataset.store().snapshot();
+        let mut request = DiffRequest::new("before", "after");
+        request.analysis.max_inferred = Some(32);
+        request.analysis.program = Some(analysis::AnalysisProgram {
+            profile: sparkles_reasoner::Profile::Rules(
+                "[r: (?s <urn:p> <urn:t>) makeTemp(?w) -> (?w <urn:p> <urn:t>)]".into(),
+            ),
+            extras: Default::default(),
+            inputs: Default::default(),
+        });
+        let control = AnalysisControl::new(&request.analysis).unwrap();
+        let program = request.analysis.program.as_ref().unwrap();
+        let error = match analysis::analyze(
+            &dataset,
+            &snapshot,
+            program,
+            &request.analysis,
+            &control,
+            0,
+            None,
+            &[],
+        ) {
+            Err(error) => error,
+            Ok(state) => panic!(
+                "recursive closure unexpectedly stopped: {:?}",
+                state.closure
+            ),
+        };
+        assert!(
+            error.to_string().contains("inferred") || error.to_string().contains("memory"),
+            "{error}"
+        );
+    }
 }

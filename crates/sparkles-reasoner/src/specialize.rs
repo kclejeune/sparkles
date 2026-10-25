@@ -159,6 +159,7 @@ fn rest(r: &CRule, atoms: &[usize], builtins: &[usize], vals: &[Option<u64>]) ->
             .enumerate()
             .filter(|(j, _)| !builtins.contains(j))
             .map(|(_, b)| CBuiltin {
+                origin: b.origin,
                 kind: b.kind,
                 args: b.args.iter().map(|&s| sub(s)).collect(),
                 inputs: b

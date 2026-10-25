@@ -653,6 +653,8 @@ pub fn diagnose_with(
 /// Additional controls shared by entailment diffs and justification oracle calls.
 #[derive(Clone, Debug, Default)]
 pub struct DiagnosticControls {
+    /// Visibility of every diagnostic query, including literal-typing evidence.
+    pub access: Option<Arc<sparkles_core::access::GraphAccess>>,
     pub deadline: Option<Instant>,
     pub cancel: Option<Arc<std::sync::atomic::AtomicBool>>,
     /// Each query and the decoded rows it retains are held to this estimate.
@@ -680,6 +682,18 @@ pub fn diagnose_controlled(
     controls: &DiagnosticControls,
 ) -> anyhow::Result<DiagnosticsReport> {
     check_control(controls.deadline, controls.cancel.as_deref())?;
+    let mut visible_options;
+    let opts = if controls.access.as_ref().is_some_and(|access| {
+        !access.readable(Some(&Term::NamedNode(NamedNode::new_unchecked(
+            INFERRED_GRAPH,
+        ))))
+    }) {
+        visible_options = opts.clone();
+        visible_options.inferences = false;
+        &visible_options
+    } else {
+        opts
+    };
     let checks = select_checks(&opts.checks)
         .map_err(|bad| anyhow::anyhow!("unknown diagnostics check '{bad}'"))?;
     let limit = opts.limit.clamp(1, MAX_LIMIT);
@@ -728,6 +742,7 @@ pub fn diagnose_controlled(
             names: &names,
             typings: typings.filter(|_| opts.inferences),
             grant: opts.grant.as_ref(),
+            access: controls.access.as_ref(),
             cancel: controls.cancel.as_ref(),
             max_memory: controls.max_memory,
         };
@@ -802,6 +817,7 @@ struct Run<'a> {
     /// the literal typings of the inferences, when the check reads them
     typings: Option<&'a LiteralTypings>,
     grant: Option<&'a Arc<sparkles_core::sparql::pool::PoolGrant>>,
+    access: Option<&'a Arc<sparkles_core::access::GraphAccess>>,
     cancel: Option<&'a Arc<std::sync::atomic::AtomicBool>>,
     max_memory: Option<u64>,
 }
@@ -1085,6 +1101,7 @@ impl Run<'_> {
             default_graph_extra: extra,
             initial_bindings: bindings,
             grant: self.grant.cloned(),
+            graphs: self.access.cloned(),
             deadline: self.deadline,
             cancel: self.cancel.cloned(),
             max_memory_bytes: self.max_memory,
