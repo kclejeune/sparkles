@@ -141,6 +141,7 @@ mod on {
     use crate::geo::ops::relate;
     use crate::geo::units::{self, UnitKind};
     use crate::geo::{Fnv, GeoConfig, Geom, IndexState};
+    use rustc_hash::{FxHashMap, FxHashSet};
 
     const NOT_JOINED: &str = "geo-not-joined";
     const NOT_KNN: &str = "geo-not-knn";
@@ -580,7 +581,7 @@ mod on {
     }
 
     /// Variables connected to the indexed scan by the group's join inputs.
-    fn connected_vars(n: &Node, geometry: VarId) -> Vec<VarId> {
+    fn connected_vars(n: &Node, geometry: VarId) -> FxHashSet<VarId> {
         fn inputs(n: &Node, out: &mut Vec<Vec<VarId>>) {
             match &n.kind {
                 Kind::Join { .. } => {
@@ -602,29 +603,36 @@ mod on {
         }
         let mut parts = Vec::new();
         inputs(n, &mut parts);
-        let mut vars = vec![geometry];
-        loop {
-            let previous = vars.len();
-            for part in &parts {
-                if part.iter().any(|v| vars.contains(v)) {
-                    for v in part {
-                        if !vars.contains(v) {
-                            vars.push(*v);
-                        }
+        let mut by_var: FxHashMap<VarId, Vec<usize>> = FxHashMap::default();
+        for (i, part) in parts.iter().enumerate() {
+            for v in part {
+                by_var.entry(*v).or_default().push(i);
+            }
+        }
+        let mut taken = vec![false; parts.len()];
+        let mut vars = FxHashSet::default();
+        let mut pending = vec![geometry];
+        while let Some(v) = pending.pop() {
+            if !vars.insert(v) {
+                continue;
+            }
+            if let Some(adjacent) = by_var.get(&v) {
+                for &i in adjacent {
+                    if !taken[i] {
+                        taken[i] = true;
+                        pending.extend(parts[i].iter().copied());
                     }
                 }
             }
-            if vars.len() == previous {
-                return vars;
-            }
         }
+        vars
     }
 
     /// Decompose the indexed component while preserving independent subtrees.
     fn flatten(
         n: &Node,
         ctx: &Ctx,
-        connected: &[VarId],
+        connected: &FxHashSet<VarId>,
         leaves: &mut Vec<Node>,
         filters: &mut Vec<Expr>,
     ) -> bool {
