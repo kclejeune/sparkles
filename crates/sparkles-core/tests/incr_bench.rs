@@ -94,7 +94,7 @@ const VIEWS: &[(&str, &str)] = &[
     ("teams", "SELECT DISTINCT ?t WHERE { ?p :memberOf ?t }"),
 ];
 
-/// §11: a single-quad commit's pass against evaluating the query again.
+/// §11: a one- or two-quad commit's pass against evaluating the query again.
 #[test]
 #[ignore]
 fn pass_against_recompute() {
