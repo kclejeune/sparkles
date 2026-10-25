@@ -161,10 +161,18 @@ pub fn explain(ds: &Dataset, req: &ExplainRequest) -> Result<Explanation> {
     let store = ds.store();
     let head = store.snapshot();
     let access = req.access.as_ref();
+    let generalized =
+        matches!(req.triple[0], Term::Literal(_)) || !matches!(req.triple[1], Term::NamedNode(_));
+    if req.mode == ExplainMode::WhyNot && generalized {
+        return Err(bad(
+            "whyNot requires an RDF triple with an IRI predicate and no literal subject",
+        ));
+    }
     #[cfg(feature = "reasoning")]
     {
         let rec = ds.reasoning_record();
-        let use_demand = req.mode == ExplainMode::WhyNot
+        let use_demand = generalized
+            || req.mode == ExplainMode::WhyNot
             || req.source == Some(ExplainSource::Demand)
             || req.profile.is_some()
             || (req.source.is_none()
@@ -179,7 +187,8 @@ pub fn explain(ds: &Dataset, req: &ExplainRequest) -> Result<Explanation> {
         }
     }
     #[cfg(not(feature = "reasoning"))]
-    if req.mode == ExplainMode::WhyNot
+    if generalized
+        || req.mode == ExplainMode::WhyNot
         || req.source == Some(ExplainSource::Demand)
         || req.profile.is_some()
     {
@@ -225,7 +234,50 @@ pub fn explain(ds: &Dataset, req: &ExplainRequest) -> Result<Explanation> {
         } else {
             on.schema_controlled(&view, &mut || check_controls(req, deadline))?
         };
-        let mut found = schema.explain(
+        let read_at_head = std::cell::Cell::new(false);
+        #[cfg(feature = "reasoning")]
+        let resolver =
+            |graph: Id, triple: &[Term; 3]| -> Result<Option<crate::explain::Derivation>> {
+                if Some(graph) == inferred {
+                    let mut premise = req.clone();
+                    premise.triple = triple.clone();
+                    premise.max_trees = 1;
+                    premise.source = Some(ExplainSource::Materialized);
+                    let Some(answer) = materialized(ds, &premise, &head, deadline)? else {
+                        return Ok(None);
+                    };
+                    read_at_head.set(read_at_head.get() || answer.read_at_head);
+                    match answer.explained {
+                        Explained::Found { mut trees, .. } => Ok(trees.pop()),
+                        Explained::Partial { reason, .. } => Err(budget_error(reason)),
+                        Explained::NotFound => Ok(None),
+                    }
+                } else {
+                    let graph = if graph == Id::DEFAULT_GRAPH {
+                        Some("default".to_string())
+                    } else {
+                        match view.term(graph) {
+                            Some(Term::NamedNode(name)) => Some(name.into_string()),
+                            _ => None,
+                        }
+                    };
+                    Ok(Some(crate::explain::Derivation::asserted(
+                        triple.clone(),
+                        graph,
+                    )))
+                }
+            };
+        let resolve = {
+            #[cfg(feature = "reasoning")]
+            {
+                include_inferred.then_some(&resolver as &crate::sparql::rdfs::AssertedResolver<'_>)
+            }
+            #[cfg(not(feature = "reasoning"))]
+            {
+                None
+            }
+        };
+        let found = schema.explain_resolving(
             &view,
             leaves,
             &graphs,
@@ -237,76 +289,14 @@ pub fn explain(ds: &Dataset, req: &ExplainRequest) -> Result<Explanation> {
                 cancel: req.cancel.clone(),
                 max_memory: req.max_memory,
             },
+            resolve,
         )?;
-        #[cfg(feature = "reasoning")]
-        if include_inferred {
-            fn graft(
-                ds: &Dataset,
-                req: &ExplainRequest,
-                snap: &Arc<Snapshot>,
-                d: &mut crate::explain::Derivation,
-                deadline: Option<Instant>,
-            ) -> Result<bool> {
-                check_controls(req, deadline)?;
-                if d.graph.as_deref() == Some(super::INFERRED_GRAPH) {
-                    let mut premise = req.clone();
-                    premise.triple = d.triple.clone();
-                    premise.source = Some(ExplainSource::Materialized);
-                    premise.max_trees = 1;
-                    let Some(answer) = materialized(ds, &premise, snap, deadline)? else {
-                        return Ok(false);
-                    };
-                    match answer.explained {
-                        Explained::Found { mut trees, .. } if !trees.is_empty() => {
-                            *d = trees.remove(0)
-                        }
-                        Explained::Partial { tree, .. } => *d = *tree,
-                        _ => return Ok(false),
-                    }
-                } else {
-                    for p in &mut d.premises {
-                        if !graft(ds, req, snap, p, deadline)? {
-                            return Ok(false);
-                        }
-                    }
-                }
-                if d.kind == crate::explain::DerivationKind::Derived {
-                    d.depth = 1 + d.premises.iter().map(|p| p.depth).max().unwrap_or(0);
-                }
-                Ok(true)
-            }
-            if let Explained::Found { trees, .. } = &mut found {
-                let mut valid = Vec::new();
-                for mut tree in std::mem::take(trees) {
-                    if graft(ds, req, &head, &mut tree, deadline)? {
-                        valid.push(tree);
-                    }
-                }
-                if req.max_memory.is_some_and(|m| {
-                    valid
-                        .iter()
-                        .map(crate::explain::Derivation::heap_bytes)
-                        .sum::<usize>()
-                        > m
-                }) {
-                    return Err(budget_error(
-                        "the mixed derivation passed its memory limit".into(),
-                    ));
-                }
-                crate::explain::finish(&mut valid, max_depth);
-                if valid.is_empty() {
-                    found = Explained::NotFound;
-                } else {
-                    *trees = valid;
-                }
-            }
-        }
         if !matches!(found, Explained::NotFound) {
             return Ok(Explanation {
                 explained: found,
                 commit: head.commit,
                 source: Some(ExplainSource::RdfsOnRead),
-                read_at_head: false,
+                read_at_head: read_at_head.get(),
                 freshness: {
                     #[cfg(feature = "reasoning")]
                     {
@@ -598,11 +588,17 @@ pub fn request_from_json(j: &J) -> Result<(ExplainRequest, ExplainMode, Option<D
         )
     };
     let triple = [term("s")?, term("p")?, term("o")?];
-    if !matches!(triple[1], Term::NamedNode(_)) {
-        return Err(bad("triple.p must be an IRI"));
+    if !matches!(triple[1], Term::NamedNode(_))
+        && !(mode == ExplainMode::Why && matches!(triple[1], Term::BlankNode(_)))
+    {
+        return Err(bad(
+            "triple.p must be an IRI, or a blank node for a generalized why target",
+        ));
     }
-    if matches!(triple[0], Term::Literal(_)) {
-        return Err(bad("triple.s must be an IRI or a blank node"));
+    if mode == ExplainMode::WhyNot && matches!(triple[0], Term::Literal(_)) {
+        return Err(bad(
+            "triple.s must be an IRI or a blank node in whyNot mode",
+        ));
     }
     let int = |k: &str, lo: u64, hi: u64| -> Result<Option<u64>> {
         match o.get(k) {
@@ -792,6 +788,32 @@ fn with_known(own: &[(String, String)]) -> Vec<(String, String)> {
 /// prefixes `prefixes` and rdf, rdfs, owl and xsd known. A blank node is named by its
 /// label.
 pub fn triple_from_text(text: &str, prefixes: &[(String, String)]) -> Result<[Term; 3]> {
+    let rdf = triple_from_turtle(text, prefixes);
+    #[cfg(feature = "reasoning")]
+    if rdf.is_err() {
+        use sparkles_reasoner::parser::{Clause, Node, parse_rules};
+        let mut rule = String::new();
+        for (prefix, namespace) in with_known(prefixes) {
+            rule.push_str(&format!("@prefix {prefix}: <{namespace}> .\n"));
+        }
+        rule.push_str(&format!(
+            "[target: -> ({})]",
+            text.trim().trim_end_matches('.')
+        ));
+        if let Ok(rules) = parse_rules(&rule)
+            && let [rule] = rules.as_slice()
+            && let [Clause::Triple(triple)] = rule.head.as_slice()
+            && let (Node::Const(s), Node::Const(p), Node::Const(o)) =
+                (&triple.subject, &triple.predicate, &triple.object)
+            && !matches!(p, Term::Literal(_))
+        {
+            return Ok([s.clone(), p.clone(), o.clone()]);
+        }
+    }
+    rdf
+}
+
+fn triple_from_turtle(text: &str, prefixes: &[(String, String)]) -> Result<[Term; 3]> {
     let mut doc = String::new();
     for (p, ns) in with_known(prefixes) {
         doc.push_str(&format!("@prefix {p}: <{ns}> .\n"));

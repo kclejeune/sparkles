@@ -6928,6 +6928,104 @@
         ],
         "type": "object"
       },
+      "ExplainBlocker": {
+        "properties": {
+          "call": {
+            "type": "string"
+          },
+          "fact": {
+            "properties": {
+              "o": {
+                "$ref": "#/components/schemas/RdfTerm"
+              },
+              "p": {
+                "$ref": "#/components/schemas/RdfTerm"
+              },
+              "s": {
+                "$ref": "#/components/schemas/RdfTerm"
+              }
+            },
+            "required": [
+              "s",
+              "p",
+              "o"
+            ],
+            "type": "object"
+          }
+        },
+        "required": [
+          "call"
+        ],
+        "type": "object"
+      },
+      "ExplainCandidate": {
+        "properties": {
+          "blockedBy": {
+            "items": {
+              "$ref": "#/components/schemas/ExplainBlocker"
+            },
+            "type": "array"
+          },
+          "line": {
+            "type": "integer"
+          },
+          "name": {
+            "type": "string"
+          },
+          "unifier": {
+            "additionalProperties": {
+              "$ref": "#/components/schemas/RdfTerm"
+            },
+            "type": "object"
+          }
+        },
+        "required": [
+          "name",
+          "unifier"
+        ],
+        "type": "object"
+      },
+      "ExplainHypothesis": {
+        "properties": {
+          "missing": {
+            "items": {
+              "properties": {
+                "o": {
+                  "$ref": "#/components/schemas/RdfTerm"
+                },
+                "p": {
+                  "$ref": "#/components/schemas/RdfTerm"
+                },
+                "s": {
+                  "$ref": "#/components/schemas/RdfTerm"
+                }
+              },
+              "required": [
+                "s",
+                "p",
+                "o"
+              ],
+              "type": "object"
+            },
+            "type": "array"
+          },
+          "placeholders": {
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          },
+          "tree": {
+            "$ref": "#/components/schemas/Derivation"
+          }
+        },
+        "required": [
+          "missing",
+          "placeholders",
+          "tree"
+        ],
+        "type": "object"
+      },
       "ExplainRequest": {
         "additionalProperties": false,
         "description": "A query to explain.",
@@ -7327,7 +7425,7 @@
           },
           "hypotheses": {
             "items": {
-              "type": "object"
+              "$ref": "#/components/schemas/ExplainHypothesis"
             },
             "type": "array"
           },
@@ -7352,7 +7450,7 @@
           },
           "rules": {
             "items": {
-              "type": "object"
+              "$ref": "#/components/schemas/ExplainCandidate"
             },
             "type": "array"
           },

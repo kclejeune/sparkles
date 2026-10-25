@@ -5773,6 +5773,31 @@ export interface components {
             algebra: string;
             plan: components["schemas"]["PlanNode"];
         };
+        ExplainBlocker: {
+            call: string;
+            fact?: {
+                o: components["schemas"]["RdfTerm"];
+                p: components["schemas"]["RdfTerm"];
+                s: components["schemas"]["RdfTerm"];
+            };
+        };
+        ExplainCandidate: {
+            blockedBy?: components["schemas"]["ExplainBlocker"][];
+            line?: number;
+            name: string;
+            unifier: {
+                [key: string]: components["schemas"]["RdfTerm"];
+            };
+        };
+        ExplainHypothesis: {
+            missing: {
+                o: components["schemas"]["RdfTerm"];
+                p: components["schemas"]["RdfTerm"];
+                s: components["schemas"]["RdfTerm"];
+            }[];
+            placeholders: string[];
+            tree: components["schemas"]["Derivation"];
+        };
         /** @description A query to explain. */
         ExplainRequest: {
             /** @description A commit or time to read, as for `/{ds}/sparql`. */
@@ -5890,14 +5915,14 @@ export interface components {
             commitsSince?: number;
             complete?: boolean;
             entailed: boolean;
-            hypotheses?: Record<string, never>[];
+            hypotheses?: components["schemas"]["ExplainHypothesis"][];
             /** @enum {string} */
             mode: "why" | "whyNot";
             more?: boolean;
             partial?: boolean;
             readAtHead?: boolean;
             reason?: string;
-            rules?: Record<string, never>[];
+            rules?: components["schemas"]["ExplainCandidate"][];
             /** @enum {string} */
             source?: "materialized" | "rdfsOnRead" | "demand";
             stale?: boolean | null;

@@ -54,6 +54,7 @@ const MAX_ROUNDS: usize = 3;
 const MAX_VERIFIED: usize = 64;
 /// Hypotheses retained by one unfolding or Cartesian-product step.
 const MAX_PARTIAL_HYPOTHESES: usize = 4096;
+const GEO_CANDIDATE: usize = usize::MAX;
 
 /// Limits of a why-not answer.
 #[derive(Clone, Debug)]
@@ -150,6 +151,7 @@ struct Unfold<'a> {
     work: crate::budget::Held,
     opts: &'a WhyNotOptions,
     rdf_type: u64,
+    geo: Option<(u64, u64)>,
     demanded: FxHashSet<[Option<u64>; 3]>,
     /// the patterns this pass read that no derivation asked for yet
     needed: Vec<[Option<u64>; 3]>,
@@ -161,6 +163,57 @@ struct Unfold<'a> {
     complete: bool,
     /// a derivation the unfolding asked for passed its limits
     lossy: bool,
+}
+
+struct CallBytes(usize);
+impl std::fmt::Write for CallBytes {
+    fn write_str(&mut self, s: &str) -> std::fmt::Result {
+        self.0 = self.0.checked_add(s.len()).ok_or(std::fmt::Error)?;
+        Ok(())
+    }
+}
+
+fn write_call(
+    out: &mut impl std::fmt::Write,
+    name: &str,
+    args: &[Option<Term>],
+) -> std::fmt::Result {
+    write!(out, "{name}(")?;
+    for (i, arg) in args.iter().enumerate() {
+        if i != 0 {
+            out.write_str(", ")?;
+        }
+        match arg {
+            Some(term) => write!(out, "{term}")?,
+            None => out.write_str("_")?,
+        }
+    }
+    out.write_str(")")
+}
+
+/// Measure before rendering, and retain one charged string without joined copies.
+fn blocker_call(
+    terms: &Terms,
+    name: &str,
+    args: &[Option<u64>],
+    retained: &mut crate::budget::Held,
+) -> anyhow::Result<String> {
+    let mut temporary = crate::budget::Held::new(retained.budget());
+    temporary.try_grow(args.len() * std::mem::size_of::<Option<Term>>())?;
+    let mut decoded = Vec::with_capacity(args.len());
+    for arg in args {
+        let term = arg.and_then(|id| terms.term(id));
+        if let Some(t) = &term {
+            temporary.try_grow(sparkles_core::explain::term_bytes(t))?;
+        }
+        decoded.push(term);
+    }
+    let mut bytes = CallBytes(0);
+    write_call(&mut bytes, name, &decoded)?;
+    retained.try_grow(bytes.0 + 2 * std::mem::size_of::<(String, Option<Triple>)>())?;
+    let mut call = String::with_capacity(bytes.0);
+    write_call(&mut call, name, &decoded)?;
+    Ok(call)
 }
 
 /// A canonical hypothesis: its facts sorted, placeholders numbered by first use.
@@ -291,7 +344,48 @@ impl Unfold<'_> {
     /// Whether rules can give facts of the pattern.
     fn derivable(&self, p: [Option<u64>; 3]) -> bool {
         let slot = |x: Option<u64>, v: usize| x.map_or(Slot::Var(v), Slot::Const);
-        intensional(self.rules(), (slot(p[0], 0), slot(p[1], 1), slot(p[2], 2)))
+        self.geo
+            .is_some_and(|(_, default)| p[1].is_none_or(|p| p == default))
+            || intensional(self.rules(), (slot(p[0], 0), slot(p[1], 1), slot(p[2], 2)))
+    }
+
+    /// Additions that make the implicit single-geometry rule hold.
+    fn geometry_alternative(&mut self, t: Pat) -> anyhow::Result<Option<Hyp>> {
+        let Some((has, default)) = self.geo else {
+            return Ok(None);
+        };
+        if t[1] != default {
+            return Ok(None);
+        }
+        self.check_controls()?;
+        let base = self
+            .session
+            .graph()
+            .and_then(Graph::base_arc)
+            .expect("derived base");
+        if base.any(&mut Memo::default(), Some(t[0]), Some(default), None)? {
+            return Ok(None);
+        }
+        let mut exists = false;
+        let mut conflict = false;
+        let mut stopped = None;
+        base.for_each(Some(t[0]), Some(has), None, |g| {
+            if let Err(error) = self.check_controls() {
+                stopped = Some(error);
+                return false;
+            }
+            exists = true;
+            conflict |= g[2] != t[2];
+            !conflict
+        })?;
+        if let Some(error) = stopped {
+            return Err(error);
+        }
+        self.check_controls()?;
+        if exists || conflict {
+            return Ok(None);
+        }
+        Ok(Some((vec![[t[0], has, t[2]]], 1)))
     }
 
     /// Note a pattern the pass reads whose facts no derivation asked for yet.
@@ -480,7 +574,16 @@ impl Unfold<'_> {
         }
         // a ground atom that holds is never missing
         let ground = pat.iter().all(Option::is_some);
-        if !(ground && !found.is_empty()) {
+        let promote_default = ground
+            && !found.is_empty()
+            && self.geo.is_some_and(|(_, default)| pat[1] == Some(default))
+            && !self
+                .session
+                .graph()
+                .and_then(Graph::base_arc)
+                .expect("derived base")
+                .any(&mut Memo::default(), pat[0], pat[1], pat[2])?;
+        if !(ground && !found.is_empty()) || promote_default {
             missing.push(k);
             self.walk(ri, k + 1, b, missing, out, blocked)?;
             missing.pop();
@@ -510,20 +613,10 @@ impl Unfold<'_> {
         let infos = self.session.infos();
         for (j, bi) in r.builtins.iter().enumerate() {
             let args: Vec<Option<u64>> = bi.args.iter().map(|&s| val(s, &b)).collect();
-            let call = || {
-                let name = infos
-                    .get(ri)
-                    .and_then(|i| i.builtins.get(j))
-                    .map_or("builtin", String::as_str);
-                let a: Vec<String> = args
-                    .iter()
-                    .map(|x| {
-                        x.and_then(|x| terms.term(x))
-                            .map_or_else(|| "_".to_string(), |t| t.to_string())
-                    })
-                    .collect();
-                format!("{name}({})", a.join(", "))
-            };
+            let name = infos
+                .get(ri)
+                .and_then(|i| i.builtins.get(j))
+                .map_or("builtin", String::as_str);
             let fail = match bi.kind {
                 BuiltinKind::NoValue => {
                     // a variable no atom bound is a placeholder, which the test cannot read
@@ -590,7 +683,8 @@ impl Unfold<'_> {
                 }
             };
             if let Some(fact) = fail {
-                blocked.push((call(), fact));
+                let call = blocker_call(terms, name, &args, &mut self.work)?;
+                blocked.push((call, fact));
                 return Ok(());
             }
         }
@@ -626,12 +720,12 @@ impl Unfold<'_> {
         }
         pats.sort_unstable();
         pats.dedup();
-        if pats.len() <= self.opts.max_missing {
-            self.work.try_grow(
-                2 * (std::mem::size_of::<Completion>() + pats.len() * std::mem::size_of::<Pat>()),
-            )?;
-            out.push(Completion { missing: pats });
-        }
+        // Intermediate atoms can share support after unfolding, so their count does
+        // not bound the size of the final deduplicated hypothesis.
+        self.work.try_grow(
+            2 * (std::mem::size_of::<Completion>() + pats.len() * std::mem::size_of::<Pat>()),
+        )?;
+        out.push(Completion { missing: pats });
         Ok(())
     }
 
@@ -667,6 +761,14 @@ impl Unfold<'_> {
         mut candidates: Option<&mut Vec<CandidateInstance>>,
     ) -> anyhow::Result<Vec<Hyp>> {
         let mut out: Vec<Hyp> = Vec::new();
+        if self.geo.is_some_and(|(_, default)| t[1] == default) {
+            if let Some(candidates) = candidates.as_deref_mut() {
+                candidates.push((GEO_CANDIDATE, vec![t[0], t[2]], Vec::new()));
+            }
+            if let Some(hypothesis) = self.geometry_alternative(t)? {
+                out.push(hypothesis);
+            }
+        }
         let n = self.rules().len();
         for ri in 0..n {
             let heads = self.rules()[ri].head.len();
@@ -834,7 +936,11 @@ fn why_not_inner(
     let same_as = terms.id_for(&Term::NamedNode(oxrdf::NamedNode::new_unchecked(
         "http://www.w3.org/2002/07/owl#sameAs",
     )));
+    let geo = session
+        .geo_default()
+        .then(|| crate::geo_ids(session.terms()));
     let mut u = Unfold {
+        geo,
         work: crate::budget::Held::new(session.budget()),
         session,
         opts,
@@ -869,6 +975,32 @@ fn why_not_inner(
     let terms = u.session.terms();
     let mut rules = Vec::new();
     for (ri, b, blocked) in &cands {
+        u.check_controls()?;
+        if *ri == GEO_CANDIDATE {
+            let unifier: Vec<_> = ["feature", "geometry"]
+                .into_iter()
+                .zip(b)
+                .filter_map(|(name, id)| terms.term(*id).map(|term| (name.to_string(), term)))
+                .collect();
+            u.work.try_grow(
+                std::mem::size_of::<Candidate>()
+                    + unifier
+                        .iter()
+                        .map(|(name, term)| name.len() + sparkles_core::explain::term_bytes(term))
+                        .sum::<usize>(),
+            )?;
+            rules.push(Candidate {
+                rule: RuleRef {
+                    name: "geo-default-geometry".into(),
+                    profile: "geosparql".into(),
+                    owl2rl: None,
+                },
+                line: 0,
+                unifier,
+                blocked_by: Vec::new(),
+            });
+            continue;
+        }
         let r = &u.session.rules()[*ri];
         let info = u.session.infos().get(*ri);
         let mut unifier = Vec::new();
@@ -880,6 +1012,11 @@ fn why_not_inner(
                     .and_then(|i| i.vars.get(v))
                     .cloned()
                     .unwrap_or_else(|| format!("v{v}"));
+                u.work.try_grow(
+                    2 * std::mem::size_of::<(String, Term)>()
+                        + name.len()
+                        + sparkles_core::explain::term_bytes(&t),
+                )?;
                 unifier.push((name, t));
             }
         }
@@ -889,8 +1026,16 @@ fn why_not_inner(
             .unwrap_or_default();
         let mut blocked_by: Vec<Blocked> = Vec::new();
         for (call, fact) in blocked {
+            u.check_controls()?;
             let fact =
                 fact.and_then(|f| Some([terms.term(f[0])?, terms.term(f[1])?, terms.term(f[2])?]));
+            let bytes = fact.as_ref().map_or(0, |t| {
+                t.iter()
+                    .map(sparkles_core::explain::term_bytes)
+                    .sum::<usize>()
+            });
+            u.work
+                .try_grow(call.len() + bytes + 2 * std::mem::size_of::<Blocked>())?;
             let b = Blocked {
                 call: call.clone(),
                 fact,
@@ -899,6 +1044,8 @@ fn why_not_inner(
                 blocked_by.push(b);
             }
         }
+        u.work
+            .try_grow(2 * std::mem::size_of::<Candidate>() + 2 * r.name.len() + profile.len())?;
         rules.push(Candidate {
             rule: RuleRef {
                 owl2rl: crate::explain::owl2rl_id(&profile, &r.name),
@@ -928,34 +1075,35 @@ fn why_not_inner(
         })
         .collect();
     order.sort_unstable();
-    let mut kept: Vec<Vec<Pat>> = Vec::new();
-    for (_, _, _, _, i) in order {
-        let h = &hyps[i].0;
-        let ground: Vec<&Pat> = h
-            .iter()
-            .filter(|f| !f.iter().any(|&x| is_hole(x)))
-            .collect();
-        // a smaller hypothesis whose facts are all here makes this one redundant
-        let redundant = kept.iter().any(|k| {
+    let ordered: Vec<Vec<Pat>> = order
+        .into_iter()
+        .map(|(_, _, _, _, i)| hyps[i].0.clone())
+        .collect();
+    // Only verified supports can make a larger candidate redundant. A smaller
+    // candidate can invalidate its own noValue condition once its facts are added.
+    let mut verified: Vec<Vec<Pat>> = Vec::new();
+    let mut hypotheses = Vec::new();
+    let mut tried = 0usize;
+    for h in ordered {
+        if verified.iter().any(|k| {
             k.len() < h.len()
                 && k.iter()
-                    .all(|f| !f.iter().any(|&x| is_hole(x)) && ground.contains(&f))
-        });
-        if !redundant {
-            kept.push(h.clone());
+                    .all(|f| !f.iter().any(|&x| is_hole(x)) && h.contains(f))
+        }) {
+            continue;
         }
-    }
-    // verify, best first
-    let mut hypotheses = Vec::new();
-    for (tried, h) in kept.into_iter().enumerate() {
         if hypotheses.len() >= opts.max_hypotheses.max(1) || tried >= MAX_VERIFIED {
             u.complete = false;
             break;
         }
+        tried += 1;
         let tv = std::time::Instant::now();
-        let v = verify(input, triple, &u, &h, opts)?;
+        let mut verified_completely = true;
+        let v = verify(input, triple, &u, &h, opts, &mut verified_completely)?;
+        u.complete &= verified_completely;
         tracing::debug!(target: "sparkles_reasoner::whynot", "verified {} in {:?}", v.is_some(), tv.elapsed());
         if let Some(v) = v {
+            verified.push(h);
             u.work.try_grow(
                 v.tree.heap_bytes()
                     + v.missing
@@ -974,6 +1122,66 @@ fn why_not_inner(
     })
 }
 
+/// Keep synthetic defaults consistent with additions to either geometry predicate.
+fn add_hypothesis(
+    session: &mut Session,
+    facts: &[Triple],
+    opts: &ExplainOptions,
+) -> anyhow::Result<()> {
+    if !session.geo_default() {
+        return session.add_facts(facts.to_vec()).map_err(session_error);
+    }
+    let (has, default) = crate::geo_ids(session.terms());
+    let base = session
+        .graph()
+        .and_then(Graph::base_arc)
+        .ok_or_else(|| anyhow::anyhow!("the session has no input base"))?;
+    let mut features: Vec<u64> = facts
+        .iter()
+        .filter(|t| t[1] == has || t[1] == default)
+        .map(|t| t[0])
+        .collect();
+    features.sort_unstable();
+    features.dedup();
+    let stop = crate::explain::session_stop(opts);
+    let mut remove = Vec::new();
+    let mut generated = Vec::new();
+    for feature in features {
+        stop().map_err(session_error)?;
+        let mut old = FxHashSet::default();
+        let mut stopped = None;
+        base.for_each(Some(feature), Some(has), None, |t| {
+            if let Err(e) = stop() {
+                stopped = Some(e);
+                return false;
+            }
+            old.insert(t[2]);
+            old.len() < 2
+        })?;
+        if let Some(e) = stopped {
+            return Err(session_error(e));
+        }
+        let explicit = base.any(&mut Memo::default(), Some(feature), Some(default), None)?;
+        if !explicit && old.len() == 1 {
+            remove.push([feature, default, *old.iter().next().expect("one geometry")]);
+        }
+        let mut all = old;
+        for t in facts.iter().filter(|t| t[0] == feature && t[1] == has) {
+            all.insert(t[2]);
+        }
+        let explicit = explicit || facts.iter().any(|t| t[0] == feature && t[1] == default);
+        if !explicit && all.len() == 1 {
+            generated.push([feature, default, *all.iter().next().expect("one geometry")]);
+        }
+    }
+    let graph = session.graph_mut().map_err(session_error)?;
+    for t in remove {
+        graph.kill(&t);
+    }
+    session.add_facts(facts.to_vec()).map_err(session_error)?;
+    session.add_facts(generated).map_err(session_error)
+}
+
 /// Verify hypothesis `h` (in the ids of `u`'s session): its tree, when the demand program
 /// over the view with its facts derives the triple.
 fn verify(
@@ -982,6 +1190,7 @@ fn verify(
     u: &Unfold<'_>,
     h: &[Pat],
     opts: &WhyNotOptions,
+    complete: &mut bool,
 ) -> anyhow::Result<Option<Hypothesis>> {
     let from = u.session.terms();
     // Hypotheses are additions to an RDF snapshot. Generalized intermediate facts
@@ -1031,7 +1240,7 @@ fn verify(
         let [a, b, c] = <[Term; 3]>::try_from(shown).expect("three terms");
         missing.push([a, b, c]);
     }
-    s.add_facts(facts.clone()).map_err(session_error)?;
+    add_hypothesis(&mut s, &facts, &verification_opts)?;
     match s.derive_all(&[demand_of(triple)]) {
         Ok(()) => {}
         // a hypothesis whose program passes its size, such as one that adds equality
@@ -1039,6 +1248,7 @@ fn verify(
         Err(sparkles_core::Error::Component(c))
             if c.code == crate::query::BUDGET_CODE && c.message.contains("rules") =>
         {
+            *complete = false;
             return Ok(None);
         }
         Err(e) => return Err(session_error(e)),
@@ -1094,5 +1304,99 @@ fn rename(d: &mut Derivation, names: &[(Term, Term)]) {
     }
     for p in &mut d.premises {
         rename(p, names);
+    }
+}
+
+#[cfg(test)]
+mod geometry_overlay_tests {
+    use super::*;
+    use crate::{Extras, Inputs, Profile};
+    use sparkles_core::io::{RdfFormat, Source};
+    use sparkles_core::store::Store;
+
+    #[test]
+    fn overlays_preserve_asserted_defaults_and_recompute_generated_defaults() {
+        const PREFIX: &str = "@prefix geo: <http://www.opengis.net/ont/geosparql#> . ";
+        let iri = |s: &str| Term::NamedNode(oxrdf::NamedNode::new_unchecked(s));
+        let feature = iri("urn:feature");
+        let first = iri("urn:first");
+        let second = iri("urn:second");
+        let has = iri("http://www.opengis.net/ont/geosparql#hasGeometry");
+        let default = iri("http://www.opengis.net/ont/geosparql#hasDefaultGeometry");
+        let one = "<urn:feature> geo:hasGeometry <urn:first> .";
+        let explicit =
+            "<urn:feature> geo:hasGeometry <urn:first> ; geo:hasDefaultGeometry <urn:first> .";
+        let cases = [
+            (
+                "",
+                vec![[feature.clone(), has.clone(), first.clone()]],
+                true,
+                false,
+            ),
+            (
+                one,
+                vec![[feature.clone(), has.clone(), first.clone()]],
+                true,
+                false,
+            ),
+            (
+                one,
+                vec![[feature.clone(), has.clone(), second.clone()]],
+                false,
+                false,
+            ),
+            (
+                one,
+                vec![[feature.clone(), default.clone(), second.clone()]],
+                false,
+                true,
+            ),
+            (
+                explicit,
+                vec![[feature.clone(), has.clone(), second.clone()]],
+                true,
+                false,
+            ),
+        ];
+        let extras = Extras {
+            geo_default_geometry: true,
+            ..Default::default()
+        };
+        let reasoner = crate::query::QueryReasoner::new(
+            Profile::Rules(String::new()),
+            &extras,
+            Inputs::default(),
+        )
+        .unwrap();
+        for (ttl, additions, expected_first, expected_second) in cases {
+            let store = Store::in_memory(Default::default());
+            store
+                .load(&[Source::from_bytes(
+                    format!("{PREFIX}{ttl}").into_bytes(),
+                    RdfFormat::Turtle,
+                    None,
+                )])
+                .unwrap();
+            let input = DemandInput {
+                reasoner: &reasoner,
+                snap: store.snapshot(),
+                readable: None,
+            };
+            let options = ExplainOptions::default();
+            let mut session = demand_session(&input, &options, false).unwrap();
+            let facts: Vec<_> = additions
+                .iter()
+                .map(|t| t.each_ref().map(|t| session.terms().id_for(t)))
+                .collect();
+            add_hypothesis(&mut session, &facts, &options).unwrap();
+            for (geometry, expected) in [(&first, expected_first), (&second, expected_second)] {
+                let triple = [&feature, &default, geometry].map(|t| session.terms().id_for(t));
+                assert_eq!(
+                    session.graph().unwrap().contains(&triple),
+                    expected,
+                    "{ttl}, {additions:?}, {geometry}"
+                );
+            }
+        }
     }
 }

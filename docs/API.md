@@ -7812,7 +7812,9 @@ such derivation answers `404` with code `no-visible-derivation`, the same answer
 that is not entailed. A search that passes its limits before it finds a tree answers `422`
 with code `reasoning-budget`. A derivation through a generalized fact, such as a literal
 subject, is recovered from the demand engine, and generalized premises carry
-`generalized: true`. The `geo-default-geometry` rule explains a default geometry from the
+`generalized: true`. Such a reference can be expanded with a why request containing its
+literal subject or blank-node predicate. Why-not hypotheses remain valid RDF.
+The `geo-default-geometry` rule explains a default geometry from the
 feature's single geometry. A derived node includes its variable `bindings` and the
 `builtins` its instance passed. When the search has reached a rule instance before a
 limit stops it, the response carries `partial: true`, the `reason`, and a tree with
@@ -7821,7 +7823,8 @@ limit stops it, the response carries `partial: true`, the `reason`, and a tree w
 With `mode: "whyNot"`, an entailed triple returns `entailed: true`. Otherwise the
 answer lists candidate `rules` with head-variable `unifier` values and `hypotheses` of
 missing RDF facts, each with a verified derivation tree. A failed builtin appears in the
-candidate's `blockedBy`, including the blocking fact for `noValue`. `maxMissing` limits a
+candidate's `blockedBy`, including the blocking fact for `noValue`. Blocker text and
+decoded response terms count against the explanation memory limit. `maxMissing` limits a
 hypothesis to one through four facts, two by default. `maxHypotheses` limits the response
 to one through 100 hypotheses, ten by default. A missing resource is shown as a blank-node
 placeholder, shared across its facts and listed in `placeholders`. These placeholders

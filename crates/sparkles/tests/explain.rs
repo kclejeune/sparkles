@@ -495,3 +495,102 @@ fn explicit_materialized_with_rdfs_can_explain_a_stale_inferred_premise() {
     assert_eq!(e.freshness.unwrap().stale, Some(true));
     found(e.explained);
 }
+
+#[cfg(feature = "reasoning")]
+#[test]
+fn rdfs_on_read_skips_an_unsupported_inferred_root_and_uses_a_supported_mixed_proof() {
+    use sparkles::reasoning::{
+        ReasonRequest,
+        rdfs::NewSchema,
+        reasoner::{GraphRef, Inputs, Profile},
+    };
+    let ds = Dataset::memory();
+    ds.load_str("@prefix ex: <http://ex.org/> . ex:secret { ex:alice ex:secret ex:value . } ex:public { ex:alice ex:works ex:company . }",RdfFormat::TriG).unwrap();
+    ds.reasoning().run(&ReasonRequest {
+        profile: Profile::Rules("@prefix ex: <http://ex.org/> . [hidden: (?x ex:secret ?y) -> (?x rdf:type ex:Employee)] [public: (?x ex:works ?y) -> (?x rdf:type ex:Member)]".into()),
+        inputs: Inputs { data_graphs: vec![GraphRef::Named("http://ex.org/secret".into()),GraphRef::Named("http://ex.org/public".into())], ..Default::default() },
+        ..Default::default()
+    }).unwrap();
+    ds.reasoning()
+        .rdfs()
+        .set(NewSchema::Triples(vec![oxrdf::Triple::new(
+            NamedNode::new("http://ex.org/Member").unwrap(),
+            oxrdf::vocab::rdfs::SUB_CLASS_OF.into_owned(),
+            NamedNode::new("http://ex.org/Employee").unwrap(),
+        )]))
+        .unwrap();
+    let mut req = ExplainRequest::new([ex("alice"), ty(), ex("Employee")]);
+    req.source = Some(ExplainSource::Materialized);
+    req.access = only(&["http://ex.org/public", "urn:x-sparkles:inferred"]);
+    let e = ds.reasoning().explain(&req).unwrap();
+    assert_eq!(e.source, Some(ExplainSource::RdfsOnRead));
+    let trees = found(e.explained);
+    fn visible(d: &Derivation) {
+        assert_ne!(d.graph.as_deref(), Some("http://ex.org/secret"));
+        assert_ne!(d.graph.as_deref(), Some("urn:x-sparkles:inferred"));
+        for p in &d.premises {
+            visible(p);
+        }
+    }
+    assert_eq!(rule(&trees[0]), "rdfs9");
+    for t in &trees {
+        visible(t);
+    }
+}
+
+#[cfg(feature = "reasoning")]
+#[test]
+fn generalized_references_can_be_expanded_through_the_request_contract() {
+    use sparkles::reasoning::explain::{request_from_json, term_json};
+    use sparkles::reasoning::{ReasonRequest, reasoner::Profile};
+    let ds = Dataset::memory();
+    ds.load_str(
+        "@prefix ex: <http://ex.org/> . ex:a ex:value \"1\" . ex:b ex:value \"1\" .",
+        RdfFormat::Turtle,
+    )
+    .unwrap();
+    ds.reasoning().run(&ReasonRequest { profile: Profile::Rules("@prefix ex: <http://ex.org/> . [reverse: (?x ex:value ?v) -> (?v ex:of ?x)] [pair: (?v ex:of ?x), (?v ex:of ?y), notEqual(?x,?y) -> (?x ex:pair ?y)] [blank: (?x ex:value ?v) -> (?x _:predicate ?v)]".into()), ..Default::default() }).unwrap();
+    let mut req = ExplainRequest::new([ex("a"), ex("pair"), ex("b")]);
+    req.max_depth = 1;
+    let trees = found(ds.reasoning().explain(&req).unwrap().explained);
+    let refs: Vec<_> = trees[0]
+        .premises
+        .iter()
+        .filter(|d| d.kind == DerivationKind::Ref && d.generalized)
+        .collect();
+    assert_eq!(refs.len(), 2);
+    for reference in refs {
+        let triple = &reference.triple;
+        let json = serde_json::json!({"mode":"why","triple":{"s":term_json(&triple[0]),"p":term_json(&triple[1]),"o":term_json(&triple[2])}});
+        let (request, _, _) =
+            request_from_json(&json).expect("a generalized ref is a valid why target");
+        let explanation = ds.reasoning().explain(&request).unwrap();
+        assert_eq!(explanation.source, Some(ExplainSource::Demand));
+        assert!(found(explanation.explained)[0].generalized);
+        let mut why_not = json.clone();
+        why_not["mode"] = "whyNot".into();
+        assert!(request_from_json(&why_not).is_err());
+    }
+    let blank = oxrdf::Term::BlankNode(oxrdf::BlankNode::new("predicate").unwrap());
+    let json = serde_json::json!({"mode":"why",
+        "triple":{"s":term_json(&ex("a")),"p":term_json(&blank),"o":term_json(&oxrdf::Literal::from("1").into())}});
+    let (request, _, _) = request_from_json(&json).unwrap();
+    let explanation = ds.reasoning().explain(&request).unwrap();
+    assert_eq!(explanation.source, Some(ExplainSource::Demand));
+    assert!(found(explanation.explained)[0].generalized);
+    let mut why_not = json;
+    why_not["mode"] = "whyNot".into();
+    assert!(request_from_json(&why_not).is_err());
+}
+
+#[cfg(feature = "reasoning")]
+#[test]
+fn generalized_targets_round_trip_through_text_surfaces() {
+    use sparkles::reasoning::explain::triple_from_text;
+    let literal = triple_from_text("\"value\" <urn:p> <urn:o>", &[]).unwrap();
+    assert!(matches!(literal[0], oxrdf::Term::Literal(_)));
+    let blank_predicate = triple_from_text("<urn:s> _:predicate <urn:o>", &[]).unwrap();
+    assert!(matches!(blank_predicate[1], oxrdf::Term::BlankNode(_)));
+    assert!(triple_from_text("<urn:s> \"predicate\" <urn:o>", &[]).is_err());
+    assert!(triple_from_text("?s <urn:p> <urn:o>", &[]).is_err());
+}

@@ -534,6 +534,12 @@ premises. Default geometries have a `geo-default-geometry` proof.
 Why-not unfolds candidate rules, shares placeholders across missing atoms, and verifies
 only RDF hypotheses on uncached overlays. Repeated atoms count as one missing fact.
 Ground builtin checks use the rule evaluator, and `noValue` blockers name their facts.
+Blocker text, decoded terms and response copies share the request memory budget.
+Intermediate missing atoms are unfolded before the final distinct-fact limit is applied.
+Only verified smaller supports prune supersets, and an unverified program-budget case
+makes the search incomplete. Geometry overlays recompute synthetic defaults from their
+combined asserted facts before verification. The implicit single-geometry rule can
+also supply a missing geometry premise.
 The search reports truncation through `complete`. It uses additional bounds on matching,
 partial instances and verified hypotheses, and it declines hypotheses for term-generating
 rules. Candidate rules are still listed. It ranks by size, vocabulary and equality
@@ -549,8 +555,17 @@ with unbound target variables remains item 286 and needs a target-pattern API be
 
 RDFS schema scans and closure builds check the query or explanation controls. Mixed
 RDFS-on-read derivations graft the materialized premise's proof at its recorded commit,
-including an explicitly selected stale materialization. The response's freshness note
+including an explicitly selected stale materialization. Unsupported physical inferred
+leaves are rejected before the RDFS search selects a proof, so a supported mixed
+alternative remains available. The response's freshness note
 applies to that inferred component. These changes complete roadmap items 135 to 139.
+
+Partial-tree depth and predecessor tables stay aligned with facts even when a deadline
+interrupts expansion. Geometry construction uses the compiled session term dictionary
+and checks cancellation in both scans and output construction. Generalized references
+accept literal subjects and blank-node predicates through JSON and text why requests.
+The generated client types include candidates, blockers and missing-fact hypotheses,
+with a compile check that consumes those fields.
 
 Phase 2 and Phase 3 remain below item 18. No on-disk format changes are needed.
 

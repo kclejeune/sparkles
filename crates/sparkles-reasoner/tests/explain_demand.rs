@@ -728,3 +728,249 @@ fn why_not_does_not_claim_exhaustive_literal_hypotheses() {
         "literal-valued substitutions were not enumerated"
     );
 }
+
+#[test]
+fn why_not_verifies_smaller_sets_before_pruning_their_supersets() {
+    let s = store("");
+    let p = Profile::Rules(
+        "@prefix ex: <http://ex.org/> .
+      [block: (ex:a ex:grant ex:b) -> (ex:a ex:blocked ex:b)]
+      [conditional: (ex:a ex:grant ex:b), noValue(ex:a, ex:blocked, ex:b) -> (ex:a ex:allowed ex:b)]
+      [override: (ex:a ex:grant ex:b), (ex:a ex:waiver ex:b) -> (ex:a ex:allowed ex:b)]"
+            .into(),
+    );
+    let target = [ex("a"), ex("allowed"), ex("b")];
+    let WhyNot::NotEntailed { hypotheses, .. } =
+        whynot(&s, &p, target.clone(), &WhyNotOptions::default())
+    else {
+        panic!("entailed");
+    };
+    let wanted = vec![
+        [ex("a"), ex("grant"), ex("b")],
+        [ex("a"), ex("waiver"), ex("b")],
+    ];
+    let hypothesis = hypotheses
+        .iter()
+        .find(|h| wanted.iter().all(|t| h.missing.contains(t)))
+        .expect("the one-fact candidate blocks itself; the two-fact override is valid");
+    rematerialize("", &p, &hypothesis.missing, &target);
+}
+
+#[test]
+fn review_missing_intermediates_can_share_one_added_fact() {
+    for count in [2, 3] {
+        let s = store("");
+        let arms: Vec<_> = (0..count).map(|i| format!("(?x ex:arm{i} ?y)")).collect();
+        let rules: String = (0..count)
+            .map(|i| format!("[arm{i}: (?x ex:base ?y) -> {}]\n", arms[i]))
+            .collect();
+        let p = Profile::Rules(format!(
+            "@prefix ex: <http://ex.org/> .\n{rules}[join: {} -> (?x ex:target ?y)]",
+            arms.join(", ")
+        ));
+        let target = [ex("a"), ex("target"), ex("b")];
+        let WhyNot::NotEntailed { hypotheses, .. } = whynot(
+            &s,
+            &p,
+            target.clone(),
+            &WhyNotOptions {
+                max_missing: 1,
+                ..Default::default()
+            },
+        ) else {
+            panic!("entailed");
+        };
+        let wanted = vec![[ex("a"), ex("base"), ex("b")]];
+        let h = hypotheses
+            .iter()
+            .find(|h| h.missing == wanted)
+            .expect("all intermediate facts follow from the same added fact");
+        rematerialize("", &p, &h.missing, &target);
+    }
+}
+
+#[test]
+fn review_blocker_strings_are_charged_to_the_request_memory_limit() {
+    let value = "z".repeat(100_000);
+    let ttl = (0..10)
+        .map(|i| format!("ex:a ex:value \"{value}{i}\" .\n"))
+        .collect::<String>();
+    let s = store(&ttl);
+    let p = Profile::Rules("@prefix ex: <http://ex.org/> . [nonliteral: (?x ex:value ?value), notLiteral(?value) -> (?x ex:target ex:yes)]".into());
+    let qr = reasoner(&p);
+    let answer = why_not(
+        &DemandInput {
+            reasoner: &qr,
+            snap: s.snapshot(),
+            readable: None,
+        },
+        &[ex("a"), ex("target"), ex("yes")],
+        &WhyNotOptions {
+            explain: ExplainOptions {
+                max_memory: Some(200_000),
+                ..Default::default()
+            },
+            ..Default::default()
+        },
+    );
+    assert!(
+        answer.is_err(),
+        "retained blocker text must not exceed the request's memory budget"
+    );
+    assert!(
+        answer
+            .unwrap_err()
+            .downcast_ref::<sparkles_core::explain::ExplainBudgetExceeded>()
+            .is_some()
+    );
+    let answer = why_not(
+        &DemandInput {
+            reasoner: &qr,
+            snap: s.snapshot(),
+            readable: None,
+        },
+        &[ex("a"), ex("target"), ex("yes")],
+        &WhyNotOptions {
+            explain: ExplainOptions {
+                max_memory: Some(20_000_000),
+                ..Default::default()
+            },
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    let WhyNot::NotEntailed { rules, .. } = answer else {
+        panic!("blocked")
+    };
+    assert_eq!(rules[0].blocked_by.len(), 10);
+    assert!(
+        rules[0]
+            .blocked_by
+            .iter()
+            .all(|blocker| blocker.call.len() > 100_000)
+    );
+}
+
+#[test]
+fn review_geometry_hypotheses_are_sound_after_full_rematerialization() {
+    let ttl = "ex:feature geo:hasGeometry ex:first .";
+    let s = store(ttl);
+    let p = Profile::Rules("@prefix ex: <http://ex.org/> . @prefix geo: <http://www.opengis.net/ont/geosparql#> .
+      [both: (?f geo:hasDefaultGeometry ex:first), (?f geo:hasGeometry ex:second) -> (?f ex:target ex:yes)]".into());
+    let extras = Extras {
+        geo_default_geometry: true,
+        ..Default::default()
+    };
+    let qr = QueryReasoner::new(p.clone(), &extras, Inputs::default()).unwrap();
+    let target = [ex("feature"), ex("target"), ex("yes")];
+    let WhyNot::NotEntailed { hypotheses, .. } = why_not(
+        &DemandInput {
+            reasoner: &qr,
+            snap: s.snapshot(),
+            readable: None,
+        },
+        &target,
+        &WhyNotOptions::default(),
+    )
+    .unwrap() else {
+        panic!("entailed");
+    };
+    assert!(!hypotheses.is_empty());
+    for h in hypotheses {
+        let extra = h
+            .missing
+            .iter()
+            .map(|t| format!("{} {} {} .\n", t[0], t[1], t[2]))
+            .collect::<String>();
+        let fresh = store(&format!("{ttl}\n{extra}"));
+        sparkles_reasoner::materialize_with(&fresh, &p, &extras, &ReasonOptions::default())
+            .unwrap();
+        assert!(
+            holds(&fresh, Some(INFERRED_GRAPH), &target),
+            "unverified geometry hypothesis: {:?}",
+            h.missing
+        );
+    }
+}
+
+#[test]
+fn review_default_geometry_facts_use_the_session_term_dictionary() {
+    let s = store("ex:feature geo:hasGeometry ex:shape .");
+    let p = Profile::Rules(
+        "@prefix ex: <http://ex.org/> . @prefix geo: <http://www.opengis.net/ont/geosparql#> .
+      [unrelated: (?f ex:unrelated ?g) -> (?f ex:target ?g)]
+      [geometry: (?f geo:hasDefaultGeometry ?g) -> (?f ex:geometry ?g)]"
+            .into(),
+    );
+    let extras = Extras {
+        geo_default_geometry: true,
+        ..Default::default()
+    };
+    let qr = QueryReasoner::new(p, &extras, Inputs::default()).unwrap();
+    let input = DemandInput {
+        reasoner: &qr,
+        snap: s.snapshot(),
+        readable: None,
+    };
+    assert!(
+        matches!(
+            why_not(
+                &input,
+                &[ex("feature"), ex("target"), ex("shape")],
+                &WhyNotOptions::default()
+            )
+            .unwrap(),
+            WhyNot::NotEntailed { .. }
+        ),
+        "a synthetic default must not alias an unrelated rule predicate"
+    );
+    assert!(matches!(
+        explain_demand(
+            &input,
+            &[ex("feature"), ex("geometry"), ex("shape")],
+            &ExplainOptions::default()
+        )
+        .unwrap(),
+        Explained::Found { .. }
+    ));
+}
+
+#[test]
+fn geometry_why_not_unfolds_the_implicit_default_rule() {
+    let s = store("");
+    let extras = Extras {
+        geo_default_geometry: true,
+        ..Default::default()
+    };
+    let p = Profile::Rules("@prefix ex: <http://ex.org/> . @prefix geo: <http://www.opengis.net/ont/geosparql#> . [use: (?f geo:hasDefaultGeometry ?g) -> (?f ex:target ?g)]".into());
+    let qr = QueryReasoner::new(p, &extras, Inputs::default()).unwrap();
+    let input = DemandInput {
+        reasoner: &qr,
+        snap: s.snapshot(),
+        readable: None,
+    };
+    let missing = vec![[ex("feature"), n(&format!("{GEO}hasGeometry")), ex("shape")]];
+    for predicate in [n(&format!("{GEO}hasDefaultGeometry")), ex("target")] {
+        let WhyNot::NotEntailed {
+            rules, hypotheses, ..
+        } = why_not(
+            &input,
+            &[ex("feature"), predicate.clone(), ex("shape")],
+            &WhyNotOptions {
+                max_missing: 1,
+                ..Default::default()
+            },
+        )
+        .unwrap()
+        else {
+            panic!("entailed");
+        };
+        if predicate == n(&format!("{GEO}hasDefaultGeometry")) {
+            assert!(rules.iter().any(|r| r.rule.name == "geo-default-geometry"));
+        }
+        assert!(
+            hypotheses.iter().any(|h| h.missing == missing),
+            "{hypotheses:?}"
+        );
+    }
+}

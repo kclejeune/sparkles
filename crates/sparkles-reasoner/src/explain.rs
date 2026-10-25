@@ -225,13 +225,18 @@ impl<'a> Search<'a> {
         if let Some(&i) = self.index.get(&t) {
             return Ok((i, false));
         }
-        self.charge(FACT_BYTES)?;
+        self.charge(FACT_BYTES + 8)?;
         let i = self.facts.len() as u32;
         let leaf = self.asserted(&t);
         self.facts.push(t);
         self.index.insert(t, i);
         self.leaf.push(leaf);
         self.by_head.push(Vec::new());
+        // Expansion can be the last work completed before the deadline. Keep these
+        // arrays aligned even before settle gives derived premises their proof depths.
+        self.depth.push(if leaf.is_some() { 0 } else { NONE });
+        self.via.push(NONE);
+        self.kept += 8;
         Ok((i, true))
     }
 
@@ -261,7 +266,7 @@ impl<'a> Search<'a> {
             .as_ref()
             .is_some_and(|c| c.load(Ordering::Relaxed))
         {
-            return Err(Stop::Error(anyhow::anyhow!("cancelled")));
+            return Err(Stop::Error(sparkles_core::Error::Cancelled.into()));
         }
         if self.opts.deadline.is_some_and(|d| Instant::now() >= d) {
             return Err(Stop::Budget(
@@ -1096,6 +1101,8 @@ pub(crate) fn demand_session(
     opts: &ExplainOptions,
     cached: bool,
 ) -> anyhow::Result<crate::query::Session> {
+    let stop = session_stop(opts);
+    stop().map_err(session_error)?;
     let mut session = input
         .reasoner
         .explain_session(
@@ -1111,14 +1118,16 @@ pub(crate) fn demand_session(
         .map_err(session_error)?;
     if session.geo_default() {
         let budget = session.budget().clone();
-        let g = session.graph_mut().map_err(session_error)?;
-        let base = g
+        let base = session
+            .graph_mut()
+            .map_err(session_error)?
             .base_arc()
             .ok_or_else(|| anyhow::anyhow!("the session's graph has no base tier"))?;
-        let terms = Terms::new(input.snap.clone());
-        terms.set_budget(&budget)?;
-        let (facts, _held) = crate::default_geometries(&base, &terms, &budget)?;
-        // the geometries' terms are store terms, so the session's ids are the same
+        let (facts, _held) =
+            crate::default_geometries_controlled(&base, session.terms(), &budget, || {
+                stop().map_err(session_error)
+            })?;
+        // Every local ID belongs to the same dictionary as the compiled rules.
         session.add_facts(facts).map_err(session_error)?;
     }
     Ok(session)
@@ -1169,4 +1178,168 @@ pub fn explain_demand(
         }
         search_session(&mut session, &FxHashSet::default(), root, opts)
     })())
+}
+
+#[cfg(test)]
+mod partial_tests {
+    use super::*;
+
+    #[test]
+    fn geometry_session_honors_a_preexisting_cancellation() {
+        let store = sparkles_core::store::Store::in_memory(Default::default());
+        let extras = Extras {
+            geo_default_geometry: true,
+            ..Default::default()
+        };
+        let reasoner =
+            QueryReasoner::new(Profile::Rdfs, &extras, crate::Inputs::default()).unwrap();
+        let input = DemandInput {
+            reasoner: &reasoner,
+            snap: store.snapshot(),
+            readable: None,
+        };
+        let opts = ExplainOptions {
+            cancel: Some(Arc::new(AtomicBool::new(true))),
+            ..Default::default()
+        };
+        let error = demand_session(&input, &opts, true)
+            .err()
+            .expect("cancel before constructing all defaults");
+        assert!(
+            error.chain().any(|e| matches!(
+                e.downcast_ref::<sparkles_core::Error>(),
+                Some(sparkles_core::Error::Cancelled)
+            )),
+            "{error:#}"
+        );
+    }
+
+    #[test]
+    fn default_geometry_controls_interrupt_both_scans_and_output() {
+        use sparkles_core::io::{RdfFormat, Source};
+        let store = sparkles_core::store::Store::in_memory(Default::default());
+        store
+            .load(&[Source::from_bytes(
+                br#"@prefix geo: <http://www.opengis.net/ont/geosparql#> .
+            <urn:a> geo:hasGeometry <urn:g> . <urn:b> geo:hasGeometry <urn:g> .
+            <urn:a> geo:hasDefaultGeometry <urn:g> ."#
+                    .to_vec(),
+                RdfFormat::Turtle,
+                None,
+            )])
+            .unwrap();
+        let reasoner =
+            QueryReasoner::new(Profile::Rdfs, &Extras::default(), crate::Inputs::default())
+                .unwrap();
+        let input = DemandInput {
+            reasoner: &reasoner,
+            snap: store.snapshot(),
+            readable: None,
+        };
+        let mut session = demand_session(&input, &ExplainOptions::default(), true).unwrap();
+        let base = session.graph_mut().unwrap().base_arc().unwrap();
+        // Entry, two hasGeometry rows, one explicit-default row, two count rows,
+        // and two output rows are deterministic regardless of hash iteration order.
+        for stop_at in [2, 4, 7] {
+            let mut calls = 0;
+            let error = crate::default_geometries_controlled(
+                &base,
+                session.terms(),
+                &Budget::unlimited(),
+                || {
+                    calls += 1;
+                    if calls == stop_at {
+                        Err(sparkles_core::Error::Cancelled.into())
+                    } else {
+                        Ok(())
+                    }
+                },
+            )
+            .err()
+            .expect("control interrupts geometry construction");
+            assert_eq!(calls, stop_at);
+            assert!(
+                error
+                    .downcast_ref::<sparkles_core::Error>()
+                    .is_some_and(|e| matches!(e, sparkles_core::Error::Cancelled))
+            );
+        }
+    }
+
+    #[test]
+    fn partial_tree_after_expansion_has_depth_entries_for_new_premises() {
+        let store = sparkles_core::store::Store::in_memory(Default::default());
+        let snap = store.snapshot();
+        let budget = Budget::unlimited();
+        let terms = Terms::new(snap.clone());
+        terms.set_budget(&budget).unwrap();
+        let named = |local: &str| {
+            Term::NamedNode(oxrdf::NamedNode::new(format!("http://ex.org/{local}")).unwrap())
+        };
+        let root = [
+            terms.id_for(&named("a")),
+            terms.id_for(&named("q")),
+            terms.id_for(&named("b")),
+        ];
+        let premise = [root[0], terms.id_for(&named("p")), root[2]];
+        let profile = Profile::Rules("[step: (<http://ex.org/a> <http://ex.org/p> <http://ex.org/b>) -> (<http://ex.org/a> <http://ex.org/q> <http://ex.org/b>)]".into());
+        let (rules, infos) =
+            engine::compile_info(&profile.rules().unwrap(), &terms, &mut Vec::new(), false);
+        let sources = vec!["rules".into()];
+        let rs = RuleSet {
+            rules: &rules,
+            infos: &infos,
+            sources: &sources,
+            geo: None,
+        };
+        let mut g = Graph::with_capacity(0);
+        let plans = Plans::new(&mut g, &rules).unwrap();
+        let extra = FxHashSet::from_iter([premise]);
+        let opts = ExplainOptions::default();
+        let mut search = Search {
+            snap: &snap,
+            g: &g,
+            terms: &terms,
+            rs: &rs,
+            plans: &plans,
+            inputs: &[],
+            extra: &extra,
+            budget: &budget,
+            opts: &opts,
+            abort: AtomicBool::new(false),
+            facts: Vec::new(),
+            index: FxHashMap::default(),
+            leaf: Vec::new(),
+            by_head: Vec::new(),
+            insts: Vec::new(),
+            premises: Vec::new(),
+            binds: Vec::new(),
+            visited: 0,
+            depth: Vec::new(),
+            via: Vec::new(),
+            kept: 0,
+        };
+        let (root, _) = search.fact(root).ok().expect("unlimited fact allocation");
+        search
+            .settle()
+            .ok()
+            .expect("unlimited proof-depth allocation");
+        // The deadline can expire after this expansion and before the next settle.
+        search
+            .keep_one(root, 0, vec![premise], Vec::new(), &mut Vec::new())
+            .ok()
+            .expect("unlimited rule instance");
+        let mut builder = Builder {
+            s: &search,
+            budget: &budget,
+            max_depth: 32,
+            ids: FxHashMap::default(),
+            next: 0,
+        };
+        let tree = builder.partial(root, 0, &mut Vec::new()).unwrap();
+        assert_eq!(tree.kind, DerivationKind::Derived);
+        assert_eq!(tree.premises.len(), 1);
+        assert_eq!(tree.premises[0].kind, DerivationKind::Asserted);
+        assert!(tree.premises[0].missing);
+    }
 }

@@ -180,6 +180,29 @@ fn reasoning(put: &mut dyn FnMut(&str, J)) {
         ),
     );
     put(
+        "ExplainBlocker",
+        obj(&["call"], json!({"call":string(),"fact":triple.clone()})),
+    );
+    put(
+        "ExplainCandidate",
+        obj(
+            &["name", "unifier"],
+            json!({
+                "name":string(),"line":int(),"unifier":{"type":"object","additionalProperties":sref("RdfTerm")},
+                "blockedBy":array(sref("ExplainBlocker")),
+            }),
+        ),
+    );
+    put(
+        "ExplainHypothesis",
+        obj(
+            &["missing", "placeholders", "tree"],
+            json!({
+                "missing":array(triple.clone()),"placeholders":array(string()),"tree":sref("Derivation"),
+            }),
+        ),
+    );
+    put(
         "Explanation",
         doc(
             obj(
@@ -192,8 +215,8 @@ fn reasoning(put: &mut dyn FnMut(&str, J)) {
                     "more": boolean(),
                     "source": string_enum(&["materialized", "rdfsOnRead", "demand"]),
                     "partial": boolean(), "reason": string(), "complete": boolean(),
-                    "rules": {"type":"array","items":{"type":"object"}},
-                    "hypotheses": {"type":"array","items":{"type":"object"}},
+                    "rules": array(sref("ExplainCandidate")),
+                    "hypotheses": array(sref("ExplainHypothesis")),
                     "readAtHead": boolean(),
                     "stale": nullable("boolean"),
                     "commitsSince": int(),

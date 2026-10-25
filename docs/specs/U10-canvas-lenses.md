@@ -792,3 +792,7 @@ panel with demand derivations, bounded why-not, bindings and passed builtins. Ge
 premises and default geometries have proofs. Budget limits can return a partial tree,
 RDFS schema builds honor request controls, and RDFS-on-read trees can graft materialized
 premises. These extensions complete follow-ups 135 to 139.
+
+Mixed RDFS explanations resolve each inferred physical leaf before selecting their proof.
+An unsupported inferred leaf therefore does not hide a supported alternative that uses
+a different inferred intermediate and readable schema facts.

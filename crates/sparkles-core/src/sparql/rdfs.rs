@@ -32,7 +32,7 @@
 //! dataset is wrapped with the schema.
 
 mod explain;
-pub use explain::SchemaLeaves;
+pub use explain::{AssertedResolver, SchemaLeaves};
 
 use super::ctx::Ctx;
 use crate::error::Result;
