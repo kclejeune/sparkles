@@ -1560,3 +1560,90 @@ fn operation_controls_survive_guard_adapter_and_runtime() {
         );
     }
 }
+
+#[test]
+fn replay_preview_uses_each_simulated_graph_schema_without_publishing_it() {
+    let dir = tempfile::tempdir().unwrap();
+    let main = open(&dir.path().join("replay-schema"));
+    put_shexr(&main, SCHEMA, SCHEMA_GRAPH);
+    main.create_branch("dev", &Default::default()).unwrap();
+    let dev = main.branch("dev").unwrap();
+    // Replace in one source commit, without an invalid empty-schema intermediate step.
+    let tighter = crate::parse_schema(
+        &SCHEMA.replace("150", "50"),
+        None,
+        Some(SchemaFormat::ShExC),
+    )
+    .unwrap();
+    let mut txn = dev.write();
+    let view = txn.view();
+    let graph_id = view.lookup_iri(SCHEMA_GRAPH).unwrap();
+    let mut removed = Vec::new();
+    view.for_each_quad(|quad| {
+        if quad[3] == graph_id {
+            removed.push(*quad);
+        }
+        Ok(())
+    })
+    .unwrap();
+    for quad in removed {
+        txn.delete(quad).unwrap();
+    }
+    let mut labels = std::collections::HashMap::new();
+    for triple in tighter.to_shexr().iter() {
+        let quad = oxrdf::Quad::new(
+            triple.subject.into_owned(),
+            triple.predicate.into_owned(),
+            triple.object.into_owned(),
+            NamedNode::new_unchecked(SCHEMA_GRAPH),
+        );
+        let ids = txn.encode_quad(&quad, &mut labels).unwrap();
+        txn.insert(ids).unwrap();
+    }
+    txn.commit().unwrap();
+    upd(
+        &dev,
+        "INSERT DATA {ex:late a ex:Person; foaf:name \"Late\"; foaf:age 100}",
+    )
+    .unwrap();
+    let (guard, _) = installed(
+        set_config(
+            &main,
+            Some(graph_cfg("reject", &[SCHEMA_GRAPH])),
+            &NoImports,
+        )
+        .unwrap(),
+    );
+    let head = main.snapshot().commit;
+    let status_before = serde_json::to_value(guard.status()).unwrap();
+    let options = sparkles_core::branch::MergeOptions {
+        replay: true,
+        write: sparkles_core::guard::WriteOptions {
+            dry_run: Some(sparkles_core::preview::DryRun {
+                retain_states: true,
+                ..Default::default()
+            }),
+            ..Default::default()
+        },
+        ..Default::default()
+    };
+    let preview = match main.merge("dev", "main", &options) {
+        Err(Error::DryRun(preview)) => preview,
+        other => panic!("expected preview: {other:?}"),
+    };
+    assert_eq!(preview.outcome(), sparkles_core::preview::Outcome::Rejected);
+    assert_eq!(main.snapshot().commit, head);
+    assert_eq!(serde_json::to_value(guard.status()).unwrap(), status_before);
+    assert!(matches!(
+        main.merge(
+            "dev",
+            "main",
+            &sparkles_core::branch::MergeOptions {
+                replay: true,
+                ..Default::default()
+            }
+        ),
+        Err(Error::Rejected(_))
+    ));
+    assert_eq!(main.snapshot().commit, head + 1);
+}

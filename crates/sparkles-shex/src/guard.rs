@@ -1101,7 +1101,29 @@ impl CommitGuard for ShexGuard {
         // a dry run validates like a write and records nothing: no counters, no history,
         // no state for the next commit
         let live = c.opts.dry_run.is_none();
-        let model = self.model();
+        // Replay predecessors are private transaction views. Their graph schema can
+        // differ from the live cached model without any publication callback.
+        let model = if !live && !c.base.cacheable && self.cfg.schema.graphs.is_some() {
+            c.opts.check()?;
+            let loaded = load_graph_model(&self.cfg, c.base);
+            c.opts.check()?;
+            match loaded {
+                Ok(model) => Arc::new(model),
+                Err(error) => {
+                    let mut summary = ValidationSummary::empty(
+                        GuardStatus::Rejected,
+                        self.cfg.mode,
+                        Severity::Violation,
+                    );
+                    summary.language = GuardLanguage::Shex;
+                    summary.limit = self.cfg.report_limit;
+                    summary.shapes_error = Some(format!("{error:#}"));
+                    return Ok(summary);
+                }
+            }
+        } else {
+            self.model()
+        };
         let (relevant, schema_changed) = self.relevant(&model, &c.view, &c.changes);
         if schema_changed {
             return self.schema_write(c, &model, seq, live);

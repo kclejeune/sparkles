@@ -720,6 +720,22 @@ read-only servers, and a bulk dry run builds its generation. Only dry runs rolle
 vocabulary back at first. A failed load now removes its terms too. The local `update`,
 `load` and `infer` commands have no `--dry-run`, and the UI does not offer previews.
 
+### Complete replay candidates, 2026-10-25
+
+A replay preview simulates every source commit through one rollback transaction. Each
+step checks its actual predecessor, graph permissions, preconditions, guard and storage
+limits. The guard receives matching virtual predecessor identities in its before and
+after views. Graph-backed ShEx schemas are loaded from that private predecessor, so a
+schema change affects later source commits without changing the live guard cache.
+
+The preview stops at the first refusal. Otherwise its retained candidate contains the
+complete replay, including zero-net steps that still create commits. Change counts
+summarize the net candidate while storage projections include each source commit's WAL
+marker. Insertion admission is evaluated for each step, so deletion followed by
+reinsertion cannot bypass an exceeded quota. Disk-size estimates remain approximate.
+The source and target heads, published snapshot, files and guard publication state stay
+unchanged. An actual replay still publishes each successful source step separately.
+
 ### Roadmap follow-ups (2026-10-12)
 
 **Local dry-run flags, previews in the UI, read-only servers and costly bulk previews**

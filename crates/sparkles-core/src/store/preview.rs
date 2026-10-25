@@ -49,6 +49,7 @@ fn graph_len(snap: &Snapshot, g: &GraphName) -> Result<u64> {
 pub(super) struct LogChecks {
     pub validation: Option<Arc<ValidationSummary>>,
     pub precondition: Option<std::result::Result<(), String>>,
+    pub storage: StorageCheck,
 }
 
 /// The net changes of a WAL path change log: each quad whose presence differs at the
@@ -238,6 +239,31 @@ impl Store {
 }
 
 impl WriteTxn<'_> {
+    /// Project storage for the effective commit or a complete simulated replay prefix.
+    pub(super) fn preview_storage(&self, inserts: bool, wal_bytes: u64) -> StorageCheck {
+        let store = self.store;
+        let mut storage = match (&store.root, store.opts.max_memory_bytes) {
+            (Some(_), _) => match store.quota.project_commit(wal_bytes) {
+                Some((limit, used, projected)) => StorageCheck {
+                    refused: None,
+                    limit: Some(limit),
+                    used: Some(used),
+                    projected: Some(projected),
+                },
+                None => StorageCheck::default(),
+            },
+            (None, Some(max)) => StorageCheck {
+                refused: None,
+                limit: Some(max),
+                used: None,
+                projected: Some(self.memory_size()),
+            },
+            (None, None) => StorageCheck::default(),
+        };
+        storage.refused = self.check_storage_for(inserts, wal_bytes).err();
+        storage
+    }
+
     /// The preview of a commit through the WAL, made where `publish_log` would write it.
     pub(super) fn preview_log(&mut self, dr: &DryRun) -> Result<Preview> {
         self.preview_log_inner(dr, None)
@@ -246,21 +272,21 @@ impl WriteTxn<'_> {
     pub(super) fn preview_log_checked(
         &mut self,
         dr: &DryRun,
-        checks: &LogChecks,
+        checks: LogChecks,
     ) -> Result<Preview> {
         self.preview_log_inner(dr, Some(checks))
     }
 
-    fn preview_log_inner(&mut self, dr: &DryRun, checks: Option<&LogChecks>) -> Result<Preview> {
+    fn preview_log_inner(&mut self, dr: &DryRun, checks: Option<LogChecks>) -> Result<Preview> {
         let store = self.store;
         let head = self.guard.head;
-        let pre = match checks {
+        let pre = match &checks {
             Some(checks) => checks.precondition.clone(),
             None => precondition(store, &self.opts),
         };
         let changed = self.net_ins != 0 || self.net_del != 0 || (checks.is_some() && self.force);
         let (commit, validation, storage, message) = if changed {
-            let validation = if let Some(checks) = checks {
+            let validation = if let Some(checks) = &checks {
                 checks.validation.clone()
             } else {
                 match store.run_guard(
@@ -280,25 +306,10 @@ impl WriteTxn<'_> {
                 Some(m) => crate::annotations::validate_message(m)?,
                 None => None,
             };
-            let mut storage = match (&store.root, store.opts.max_memory_bytes) {
-                (Some(_), _) => match store.quota.project_commit(self.wal_bytes()) {
-                    Some((limit, used, projected)) => StorageCheck {
-                        refused: None,
-                        limit: Some(limit),
-                        used: Some(used),
-                        projected: Some(projected),
-                    },
-                    None => StorageCheck::default(),
-                },
-                (None, Some(max)) => StorageCheck {
-                    refused: None,
-                    limit: Some(max),
-                    used: None,
-                    projected: Some(self.memory_size()),
-                },
-                (None, None) => StorageCheck::default(),
+            let storage = match checks {
+                Some(checks) => checks.storage,
+                None => self.preview_storage(self.net_ins > 0, self.wal_bytes()),
             };
-            storage.refused = self.check_storage().err();
             let commit = self.next_commit(validation.as_deref());
             (Some(commit), validation, storage, message)
         } else {

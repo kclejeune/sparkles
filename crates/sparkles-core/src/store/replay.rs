@@ -261,7 +261,11 @@ impl Store {
             let precondition = super::preview::precondition_on(&before, &txn.opts);
             let validation = match target.run_guard(
                 &before,
-                || Arc::new(txn.view()),
+                || {
+                    let mut view = txn.view();
+                    view.commit = before.commit;
+                    Arc::new(view)
+                },
                 txn.kind,
                 crate::guard::Changes::Log(&txn.log[start..]),
                 &txn.opts,
@@ -271,19 +275,28 @@ impl Store {
                 Err(Error::Rejected(rejected)) => Some(Arc::new(rejected.summary)),
                 Err(error) => return Err(error),
             };
+            let inserts = txn.log[start..]
+                .iter()
+                .any(|(operation, _)| *operation == WAL_INSERT);
+            // A real replay appends one marker per source commit, including zero-net steps.
+            let wal_bytes = txn
+                .wal_bytes()
+                .saturating_add((index as u64).saturating_mul(WAL_REC as u64));
+            let storage = txn.preview_storage(inserts, wal_bytes);
             let refused = precondition
                 .as_ref()
                 .is_some_and(|outcome| outcome.is_err())
                 || validation
                     .as_ref()
                     .is_some_and(|summary| summary.status == crate::guard::GuardStatus::Rejected)
-                || txn.check_storage().is_err();
+                || storage.refused.is_some();
             if refused || index + 1 == commits.len() {
                 let checks = super::preview::LogChecks {
                     precondition,
                     validation,
+                    storage,
                 };
-                let mut preview = txn.preview_log_checked(dry, &checks)?;
+                let mut preview = txn.preview_log_checked(dry, checks)?;
                 if let Some(commit) = &mut preview.commit {
                     commit.seq = before.commit + 1;
                 }

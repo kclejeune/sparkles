@@ -6435,15 +6435,15 @@ impl WriteTxn<'_> {
     /// The storage checks of a commit through the WAL: the free disk space the store
     /// keeps, and for a commit that adds quads the quota or the in-memory size limit.
     fn check_storage(&self) -> Result<()> {
-        let wal_bytes = self.wal_bytes();
+        self.check_storage_for(self.net_ins > 0, self.wal_bytes())
+    }
+
+    fn check_storage_for(&self, inserts: bool, wal_bytes: u64) -> Result<()> {
         self.store.check_disk(wal_bytes)?;
-        if self.net_ins > 0 {
+        if inserts {
             self.store.quota.check_commit(wal_bytes)?;
         }
-        if self.net_ins > 0
-            && self.store.root.is_none()
-            && self.store.opts.max_memory_bytes.is_some()
-        {
+        if inserts && self.store.root.is_none() && self.store.opts.max_memory_bytes.is_some() {
             self.store.check_memory(self.memory_size())?;
         }
         Ok(())

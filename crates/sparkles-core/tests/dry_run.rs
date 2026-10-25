@@ -820,6 +820,10 @@ struct ReplayPreviewGuard {
 impl CommitGuard for ReplayPreviewGuard {
     fn check(&self, c: &Candidate<'_>) -> sparkles_core::Result<ValidationSummary> {
         assert!(c.opts.dry_run.is_some(), "the guard must see a preview");
+        assert_eq!(
+            c.base.commit, c.view.commit,
+            "guard views share the actual predecessor identity"
+        );
         self.states
             .lock()
             .unwrap()
@@ -1055,4 +1059,91 @@ fn complete_replay_preview_leaves_files_and_the_published_snapshot_unchanged() {
         })
         .unwrap();
     assert_eq!(got, expected);
+}
+
+#[test]
+fn replay_preview_checks_each_steps_insertions_when_already_over_quota() {
+    let dir = tempfile::tempdir().unwrap();
+    let main = Store::open(&dir.path().join("replay-quota"), StoreOptions::default()).unwrap();
+    upd(
+        &main,
+        "INSERT DATA {<urn:base> <urn:p> 0}",
+        Default::default(),
+    )
+    .unwrap();
+    main.create_branch("dev", &Default::default()).unwrap();
+    let dev = main.branch("dev").unwrap();
+    upd(
+        &dev,
+        "DELETE DATA {<urn:base> <urn:p> 0}",
+        Default::default(),
+    )
+    .unwrap();
+    upd(
+        &dev,
+        "INSERT DATA {<urn:base> <urn:p> 0}",
+        Default::default(),
+    )
+    .unwrap();
+    main.set_quota(Some(1)).unwrap();
+    let head = main.snapshot().commit;
+    let preview = replay_preview(&main, Default::default());
+    assert_eq!(preview.outcome(), Outcome::StorageRefused);
+    assert!(preview.storage.projected.unwrap() > preview.storage.limit.unwrap());
+    assert_eq!(main.snapshot().commit, head);
+    let actual = main
+        .merge(
+            "dev",
+            "main",
+            &sparkles_core::branch::MergeOptions {
+                replay: true,
+                ..Default::default()
+            },
+        )
+        .unwrap_err();
+    for error in [preview.storage.refused.as_ref().unwrap(), &actual] {
+        assert!(matches!(error, Error::BudgetExceeded(budget)
+            if budget.kind == sparkles_core::BudgetKind::DatasetBytes && budget.limit == 1));
+    }
+    assert_eq!(main.snapshot().commit, head + 1, "only the deletion fits");
+}
+
+#[test]
+fn replay_preview_projects_a_wal_commit_marker_for_every_source_step() {
+    let dir = tempfile::tempdir().unwrap();
+    let main = Store::open(&dir.path().join("replay-wal"), StoreOptions::default()).unwrap();
+    upd(
+        &main,
+        "INSERT DATA {<urn:base> <urn:p> 0}",
+        Default::default(),
+    )
+    .unwrap();
+    main.create_branch("dev", &Default::default()).unwrap();
+    let dev = main.branch("dev").unwrap();
+    upd(
+        &dev,
+        "INSERT DATA {<urn:first> <urn:p> 1}",
+        Default::default(),
+    )
+    .unwrap();
+    upd(
+        &dev,
+        "INSERT DATA {<urn:second> <urn:p> 2}",
+        Default::default(),
+    )
+    .unwrap();
+    main.set_quota(Some(u64::MAX)).unwrap();
+    let preview = replay_preview(&main, Default::default());
+    let projected_append = preview.storage.projected.unwrap() - preview.storage.used.unwrap();
+    let before = main.wal_bytes();
+    main.merge(
+        "dev",
+        "main",
+        &sparkles_core::branch::MergeOptions {
+            replay: true,
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    assert_eq!(projected_append, main.wal_bytes() - before);
 }
