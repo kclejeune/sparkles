@@ -446,6 +446,312 @@ mod tests {
         let _reopened = Dataset::open(dir.path()).unwrap();
     }
 
+    /// Synchronous host calls hold the registry too, even without a worker.
+    #[test]
+    fn a_synchronous_host_can_release_the_last_dataset_handle() {
+        struct ReleasingHost(parking_lot::Mutex<Option<Dataset>>);
+        impl Host for ReleasingHost {
+            fn access(&self, _: Option<&str>) -> Result<Option<Arc<GraphAccess>>> {
+                Ok(None)
+            }
+            fn stored_query(&self, _: &str) -> Result<String> {
+                unreachable!()
+            }
+            fn inference(&self) -> Option<Inference> {
+                drop(self.0.lock().take());
+                None
+            }
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let ds = Dataset::open(dir.path()).unwrap();
+        let state = ds.inner.clone();
+        state
+            .views
+            .set_host(Arc::new(ReleasingHost(parking_lot::Mutex::new(Some(ds)))));
+        let (done_tx, done) = std::sync::mpsc::channel();
+        let reader = std::thread::spawn(move || {
+            assert!(state.views.list(&state.store).is_empty());
+            assert!(state.views.is_closed());
+            done_tx.send(()).unwrap();
+        });
+        done.recv_timeout(Duration::from_secs(2))
+            .expect("synchronous host shutdown deadlocked");
+        reader.join().unwrap();
+        let _reopened = Dataset::open(dir.path()).unwrap();
+    }
+
+    const CLOSE_QUERY: &str = "SELECT ?s WHERE { ?s <urn:p> ?o }";
+
+    struct ClosingHost {
+        ds: parking_lot::Mutex<Option<Dataset>>,
+        method: &'static str,
+        call: usize,
+        calls: std::sync::atomic::AtomicUsize,
+        panic: bool,
+    }
+
+    impl ClosingHost {
+        fn release(&self, method: &str) {
+            if method == self.method
+                && self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1 == self.call
+            {
+                drop(self.ds.lock().take());
+                assert!(!self.panic, "host fault after releasing the final handle");
+            }
+        }
+    }
+
+    impl Host for ClosingHost {
+        fn access(&self, _: Option<&str>) -> Result<Option<Arc<GraphAccess>>> {
+            self.release("access");
+            Ok(None)
+        }
+        fn prefixes(&self) -> Vec<(String, String)> {
+            self.release("prefixes");
+            Vec::new()
+        }
+        fn stored_query(&self, _: &str) -> Result<String> {
+            self.release("stored-query");
+            Ok(CLOSE_QUERY.into())
+        }
+        fn inference(&self) -> Option<Inference> {
+            self.release("inference");
+            None
+        }
+        fn epoch(&self) -> u64 {
+            self.release("epoch");
+            0
+        }
+    }
+
+    /// Every synchronous operation that invokes a Host must defer its final close,
+    /// including callbacks repeated while an attachment holds the registry lock.
+    #[test]
+    fn synchronous_operations_defer_all_host_callback_kinds() {
+        let mut cases = vec![
+            ("list", "inference", 1),
+            ("get", "inference", 1),
+            ("wait", "inference", 1),
+            ("read", "inference", 1),
+            ("live", "inference", 1),
+            ("explain", "inference", 1),
+            ("put", "inference", 1),
+            ("round", "inference", 1),
+            ("round", "epoch", 1),
+        ];
+        for method in ["access", "prefixes", "stored-query"] {
+            cases.push(("put", method, 1));
+            cases.push(("put", method, 2));
+        }
+        for (operation, method, call) in cases {
+            let ds = Dataset::memory();
+            let state = ds.inner.clone();
+            let host = Arc::new(ClosingHost {
+                ds: parking_lot::Mutex::new(Some(ds)),
+                method,
+                call,
+                calls: std::sync::atomic::AtomicUsize::new(0),
+                panic: false,
+            });
+            state.views.set_host(host.clone());
+            let (done_tx, done) = std::sync::mpsc::channel();
+            let reader = std::thread::spawn(move || {
+                match operation {
+                    "list" => {
+                        state.views.list(&state.store);
+                    }
+                    "get" => {
+                        let _ = state.views.get(&state.store, "v");
+                    }
+                    "wait" => {
+                        let _ = state.views.wait_built("v", Duration::ZERO);
+                    }
+                    "read" => {
+                        let _ = state.views.read(&ViewRead {
+                            name: "v",
+                            at: 0,
+                            snap: None,
+                            allow_stale: false,
+                            caller: None,
+                            deadline: None,
+                        });
+                    }
+                    "live" => {
+                        let _ = state.views.live(
+                            &state.store,
+                            CLOSE_QUERY,
+                            None,
+                            &LiveOptions::default(),
+                        );
+                    }
+                    "explain" => {
+                        let _ = state.views.explain(CLOSE_QUERY, None);
+                    }
+                    "put" => {
+                        let _ = state.views.put(
+                            &state.store,
+                            "v",
+                            ViewDef {
+                                stored_query: Some("q".into()),
+                                ..Default::default()
+                            },
+                        );
+                    }
+                    "round" => {
+                        state.views.round(&state.store);
+                    }
+                    _ => unreachable!(),
+                }
+                assert!(
+                    host.ds.lock().is_none(),
+                    "{operation}/{method}/{call} did not release the handle"
+                );
+                assert!(
+                    state.views.is_closed(),
+                    "{operation}/{method}/{call} did not close"
+                );
+                done_tx.send(()).unwrap();
+            });
+            done.recv_timeout(Duration::from_secs(2))
+                .unwrap_or_else(|e| panic!("{operation}/{method}/{call}: {e}"));
+            reader.join().unwrap();
+        }
+    }
+
+    /// Nested operations on the same or another runtime must finish before owned
+    /// cleanup runs, since an outer operation can still hold a metadata lock.
+    #[test]
+    fn nested_runtime_operations_defer_close_until_the_outer_call_finishes() {
+        struct NestedHost {
+            target: parking_lot::Mutex<Option<Dataset>>,
+            nested: Weak<crate::incr::Runtime>,
+            own: Weak<DatasetState>,
+            reentered: std::sync::atomic::AtomicBool,
+        }
+        impl Host for NestedHost {
+            fn access(&self, _: Option<&str>) -> Result<Option<Arc<GraphAccess>>> {
+                Ok(None)
+            }
+            fn stored_query(&self, _: &str) -> Result<String> {
+                unreachable!()
+            }
+            fn inference(&self) -> Option<Inference> {
+                if !self
+                    .reentered
+                    .swap(true, std::sync::atomic::Ordering::SeqCst)
+                {
+                    let nested = self.nested.upgrade().unwrap();
+                    nested.explain(CLOSE_QUERY, None).unwrap();
+                    assert!(!self.own.upgrade().unwrap().views.is_closed());
+                    assert!(!nested.is_closed());
+                } else {
+                    drop(self.target.lock().take());
+                }
+                None
+            }
+        }
+        for same in [true, false] {
+            let ds = Dataset::memory();
+            let state = ds.inner.clone();
+            let other = (!same).then(Dataset::memory);
+            let other_state = other.as_ref().map(|d| d.inner.clone());
+            let nested = other_state
+                .as_ref()
+                .map_or_else(|| state.views.clone(), |s| s.views.clone());
+            if let Some(other) = other {
+                nested.set_host(Arc::new(ClosingHost {
+                    ds: parking_lot::Mutex::new(Some(other)),
+                    method: "inference",
+                    call: 1,
+                    calls: std::sync::atomic::AtomicUsize::new(0),
+                    panic: false,
+                }));
+            }
+            let host = Arc::new(NestedHost {
+                target: parking_lot::Mutex::new(Some(ds)),
+                nested: Arc::downgrade(&nested),
+                own: Arc::downgrade(&state),
+                reentered: std::sync::atomic::AtomicBool::new(false),
+            });
+            state.views.set_host(host.clone());
+            let (done_tx, done) = std::sync::mpsc::channel();
+            let reader = std::thread::spawn(move || {
+                state.views.list(&state.store);
+                if !same {
+                    drop(host.target.lock().take());
+                }
+                assert!(state.views.is_closed());
+                if let Some(other) = other_state {
+                    assert!(other.views.is_closed());
+                }
+                done_tx.send(()).unwrap();
+            });
+            done.recv_timeout(Duration::from_secs(2))
+                .expect("nested close deadlocked");
+            reader.join().unwrap();
+        }
+    }
+
+    /// Replacing a host can destroy the last handle while the host write lock is held.
+    #[test]
+    fn replacing_a_host_defers_cleanup_from_its_destructor() {
+        struct OwningHost {
+            ds: Option<Dataset>,
+            state: Weak<DatasetState>,
+        }
+        impl Host for OwningHost {
+            fn access(&self, _: Option<&str>) -> Result<Option<Arc<GraphAccess>>> {
+                Ok(None)
+            }
+            fn stored_query(&self, _: &str) -> Result<String> {
+                unreachable!()
+            }
+        }
+        impl Drop for OwningHost {
+            fn drop(&mut self) {
+                drop(self.ds.take());
+                assert!(
+                    !self.state.upgrade().unwrap().views.is_closed(),
+                    "close ran inside the old host destructor"
+                );
+            }
+        }
+        let ds = Dataset::memory();
+        let state = ds.inner.clone();
+        state.views.set_host(Arc::new(OwningHost {
+            ds: Some(ds),
+            state: Arc::downgrade(&state),
+        }));
+        state.views.set_host(Arc::new(crate::incr::OpenHost));
+        assert!(state.views.is_closed());
+    }
+
+    /// Panic unwinding drops registry guards before draining the owned close action.
+    #[test]
+    fn synchronous_host_panic_finishes_its_deferred_close() {
+        let ds = Dataset::memory();
+        let state = ds.inner.clone();
+        state.views.set_host(Arc::new(ClosingHost {
+            ds: parking_lot::Mutex::new(Some(ds)),
+            method: "inference",
+            call: 1,
+            calls: std::sync::atomic::AtomicUsize::new(0),
+            panic: true,
+        }));
+        let (done_tx, done) = std::sync::mpsc::channel();
+        let reader = std::thread::spawn(move || {
+            let panic = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                state.views.list(&state.store)
+            }));
+            assert!(panic.is_err());
+            assert!(state.views.is_closed());
+            done_tx.send(()).unwrap();
+        });
+        done.recv_timeout(Duration::from_secs(2))
+            .expect("panic cleanup deadlocked");
+        reader.join().unwrap();
+    }
+
     /// The last handle of a dataset with running views closes it on its own thread, so
     /// the directory opens again at once.
     #[test]

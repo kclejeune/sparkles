@@ -81,7 +81,8 @@ pub(crate) struct DatasetLifetime(std::sync::Weak<DatasetState>);
 impl Drop for DatasetLifetime {
     fn drop(&mut self) {
         if let Some(state) = self.0.upgrade() {
-            state.views.close(&state.store);
+            let views = state.views.clone();
+            views.defer_close(move || state.views.close(&state.store));
         }
     }
 }

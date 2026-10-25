@@ -30,6 +30,7 @@ use parking_lot::{Condvar, Mutex, ReentrantMutex, RwLock};
 use rustc_hash::FxHashMap;
 use sha2::{Digest, Sha256};
 use spargebra::Query;
+use std::cell::RefCell;
 use std::collections::{BTreeMap, VecDeque};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
@@ -450,6 +451,46 @@ pub struct Runtime {
     switched: AtomicU64,
 }
 
+#[derive(Default)]
+struct Operations {
+    depth: usize,
+    close: Vec<Box<dyn FnOnce()>>,
+}
+
+thread_local! {
+    // Nesting can cross runtimes. No cleanup runs while any caller's metadata
+    // locks or worker gate remain held on this thread.
+    static OPERATIONS: RefCell<Operations> = RefCell::default();
+}
+
+/// Declare before operation-local guards, so cleanup runs after their locks drop.
+struct Operation;
+
+impl Operation {
+    fn enter() -> Self {
+        OPERATIONS.with(|s| s.borrow_mut().depth += 1);
+        Operation
+    }
+}
+
+impl Drop for Operation {
+    fn drop(&mut self) {
+        let close = OPERATIONS.with(|s| {
+            let mut s = s.borrow_mut();
+            s.depth -= 1;
+            if s.depth == 0 {
+                std::mem::take(&mut s.close)
+            } else {
+                Vec::new()
+            }
+        });
+        // Never retain a TLS borrow while cleanup can call another runtime.
+        for close in close {
+            close();
+        }
+    }
+}
+
 /// Finish deferred shutdown after the round releases its locks, including while
 /// unwinding a panic. The worker's store wrapper remains alive until this drops.
 struct WorkerRound<'a> {
@@ -645,6 +686,7 @@ impl Runtime {
     /// Set how principals, prefixes and stored queries resolve. Views attach on the
     /// next round.
     pub fn set_host(&self, host: Arc<dyn Host>) {
+        let _operation = Operation::enter();
         *self.host.write() = Some(host);
         self.kick();
     }
@@ -691,6 +733,7 @@ impl Runtime {
         query: &str,
         access: Option<Arc<GraphAccess>>,
     ) -> Result<(Kind, PlanNode)> {
+        let _operation = Operation::enter();
         let host = self
             .host
             .read()
@@ -948,6 +991,7 @@ impl Runtime {
     /// Run one round: attach pending views, build what needs building and advance
     /// every circuit to the store's head. Returns whether anything was done.
     pub fn round(&self, store: &Store) -> bool {
+        let _operation = Operation::enter();
         if self.closed.load(Ordering::Acquire) {
             return false;
         }
@@ -1337,6 +1381,23 @@ impl Runtime {
         }
     }
 
+    /// Run an owned dataset close after this thread leaves its runtime operations,
+    /// or immediately when none is active. The action keeps the store owner alive
+    /// while a host callback releases the final handle under metadata locks.
+    #[doc(hidden)]
+    pub fn defer_close(&self, close: impl FnOnce() + 'static) {
+        let mut close: Option<Box<dyn FnOnce()>> = Some(Box::new(close));
+        let _ = OPERATIONS.try_with(|s| {
+            let mut s = s.borrow_mut();
+            if s.depth != 0 {
+                s.close.push(close.take().unwrap());
+            }
+        });
+        if let Some(close) = close {
+            close();
+        }
+    }
+
     /// Stop the rounds and checkpoint every view (a clean close).
     pub fn close(&self, store: &Store) {
         if self.worker.is_owned_by_current_thread() && self.worker_round.load(Ordering::Acquire) {
@@ -1388,6 +1449,7 @@ impl Runtime {
             loop {
                 let Some(runtime) = rt.upgrade() else { return };
                 {
+                    let _operation = Operation::enter();
                     let _worker = runtime.worker.lock();
                     if runtime.is_closed() {
                         return;
@@ -1463,6 +1525,7 @@ impl Runtime {
     /// Define or replace view `name` (spec F13 §2.1) and attach it; the first
     /// evaluation runs on the next round. Returns the view with its plan.
     pub fn put(&self, store: &Store, name: &str, def: ViewDef) -> Result<ViewInfo> {
+        let _operation = Operation::enter();
         if !views::valid_name(name) {
             return Err(super::error(
                 "invalid-view",
@@ -1616,6 +1679,7 @@ impl Runtime {
     }
 
     pub fn get(&self, store: &Store, name: &str) -> Result<ViewInfo> {
+        let _operation = Operation::enter();
         let head = store.snapshot().commit;
         let mut reg = self.reg.lock();
         self.sync_for_read(&mut reg);
@@ -1628,6 +1692,7 @@ impl Runtime {
 
     /// Every view with its state, by name.
     pub fn list(&self, store: &Store) -> Vec<ViewInfo> {
+        let _operation = Operation::enter();
         let head = store.snapshot().commit;
         let mut reg = self.reg.lock();
         self.sync_for_read(&mut reg);
@@ -1649,6 +1714,7 @@ impl Runtime {
 
     /// Wait until view `name` has left `building`, at most `timeout`.
     pub fn wait_built(&self, name: &str, timeout: Duration) -> Result<ViewInfo> {
+        let _operation = Operation::enter();
         let until = Instant::now() + timeout;
         loop {
             let (cell, err) = {
@@ -1685,6 +1751,7 @@ impl Runtime {
 
     /// The rows of view `name` (spec F13 §2.2).
     pub fn read(&self, r: &ViewRead<'_>) -> Result<ViewRows> {
+        let _operation = Operation::enter();
         let wait = Instant::now() + self.opts.read().view_wait;
         let until = r.deadline.map_or(wait, |d| d.min(wait));
         loop {
@@ -1836,6 +1903,7 @@ impl Runtime {
         access: Option<Arc<GraphAccess>>,
         o: &LiveOptions,
     ) -> Result<LiveQuery> {
+        let _operation = Operation::enter();
         let host = self
             .host
             .read()
