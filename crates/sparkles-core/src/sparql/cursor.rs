@@ -1057,7 +1057,7 @@ fn filtered_ask_admitted(ctx: &Ctx, node: &Node) -> bool {
 /// that eager limited execution collects, while streaming the larger one. Other
 /// cursor and eager plans retain their original children and variable order.
 /// Any other shape, which a future cursor admission might pass here, is left alone.
-fn orient_filtered_ask(node: &mut Node, ctx: &Ctx) {
+fn orient_filtered_ask(node: &mut Node, ctx: &Ctx, options: &CursorOptions) {
     use super::plan::JoinAlgo;
 
     let Some(mut filtered) = node.children.first_mut() else {
@@ -1073,7 +1073,7 @@ fn orient_filtered_ask(node: &mut Node, ctx: &Ctx) {
         // the first matching pair answers the ASK
         *ripple = filtered.children.len() == 2;
         for input in &mut filtered.children {
-            first_rows(input, ctx);
+            first_rows(input, ctx, options.batch_rows);
         }
         return;
     }
@@ -1102,10 +1102,10 @@ fn orient_filtered_ask(node: &mut Node, ctx: &Ctx) {
 /// becomes an index join from its other input into that pattern, when that input
 /// always binds the pattern's key and the index join keeps the order the hash join
 /// promised.
-fn first_rows(node: &mut Node, ctx: &Ctx) {
+fn first_rows(node: &mut Node, ctx: &Ctx, batch_rows: usize) {
     use super::plan::JoinAlgo;
     for child in &mut node.children {
-        first_rows(child, ctx);
+        first_rows(child, ctx, batch_rows);
     }
     if !matches!(
         node.kind,
@@ -1122,6 +1122,7 @@ fn first_rows(node: &mut Node, ctx: &Ctx) {
             &node.children[drive],
             &node.children[1 - drive],
             ctx,
+            batch_rows,
         ) && joined.sorted.starts_with(&node.sorted)
             && joined.vars.len() == node.vars.len()
         {
@@ -1552,7 +1553,7 @@ pub fn query_execution_with_plan(
                 && !matches!(&parsed, spargebra::Query::Select { pattern, .. } if calls_service(pattern));
             if prepared.ctx.is_cursor() {
                 if kind == QueryKind::Ask {
-                    orient_filtered_ask(&mut prepared.node, &prepared.ctx);
+                    orient_filtered_ask(&mut prepared.node, &prepared.ctx, cursor);
                 }
                 let (cursor, _, _) = from_prepared(
                     prepared, &parsed, query, options, cursor, started, parse_ms, plan_ms, levels,
@@ -4389,7 +4390,7 @@ mod tests {
                 format!("{:?}/{}[{}]", node.vars, node.est, children.join(","))
             }
             let before = shape(&p.node);
-            orient_filtered_ask(&mut p.node, &p.ctx);
+            orient_filtered_ask(&mut p.node, &p.ctx, &Default::default());
             assert_eq!(shape(&p.node), before, "{text}");
         }
     }
