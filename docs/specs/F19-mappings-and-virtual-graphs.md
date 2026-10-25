@@ -1,19 +1,18 @@
 # F19: Mapping languages and virtual graphs
 
-> **Status:** specified
+> **Status:** implemented in part, most of Phase 1.
 >
-> **Phases:** None shipped. Phase 1 is materialized loading through R2RML, RML and
-> YARRRML mappings over CSV and TSV, JSON, SQL databases and Parquet, CSVW's standard
-> mode with primary-key and foreign-key checks, Tarql's functions, CONSTRUCT templates
-> that read the target dataset, mappings stored on the server and CSV bodies in the Graph
-> Store protocol. Phase 2 is virtual graphs: SPARQL over SQL databases, Parquet files and
-> Iceberg tables through the same mappings, without loading, by unfolding queries into
-> SQL.
+> **Phases:** Materialized R2RML, RML and YARRRML loading over CSV, TSV, JSON, local
+> Parquet and SQLite, CSVW key checks, Tarql templates and stored mappings are available.
+> PostgreSQL and DuckDB sources, some mapping expressions and administration surfaces
+> remain. Phase 2's virtual SQL, Parquet and Iceberg graphs remain planned.
 >
-> **User docs:** none, because nothing is built.
+> **User docs:** [Mappings](../API.md#stored-mappings),
+> [usage](../USAGE.md#mappings-r2rml-rml-and-yarrrml) and
+> [features](../FEATURES.md#storage-and-indexes).
 >
-> This is the design as written before implementation. The [Outcome](#outcome) section at
-> the end will record how it lands.
+> This is the design as written before implementation. The [Outcome](#outcome) records
+> what shipped and the remaining work.
 
 This design was written from the W3C Recommendation "R2RML: RDB to RDF Mapping Language"
 (2012) and the W3C "R2RML and Direct Mapping Test Cases" note, the RML specification

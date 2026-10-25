@@ -10,6 +10,7 @@ current behaviour. [USAGE.md](USAGE.md) documents the command line and the bindi
 Sparkles with Jena and Fuseki, QLever, Fluree and Oxigraph, and
 [BENCHMARKS.md](BENCHMARKS.md) has the performance figures.
 
+* [Capability status](#capability-status)
 * [Standards conformance](#standards-conformance)
 * [Storage and indexes](#storage-and-indexes)
 * [Versioning and history](#versioning-and-history)
@@ -25,7 +26,53 @@ Sparkles with Jena and Fuseki, QLever, Fluree and Oxigraph, and
 * [Command line](#command-line)
 * [Formatter and editor support](#formatter-and-editor-support)
 * [Operations](#operations)
+* [Compatibility boundaries](#compatibility-boundaries)
 * [Known gaps](#known-gaps)
+
+## Capability status
+
+Status describes the scope named in each row. **Complete** means that documented scope
+is available. **Partially complete** means usable functionality is available while the
+listed phases or extensions remain. **In progress** identifies active implementation
+that has not shipped. **Planned** means the design exists without an implementation.
+Writing a spec or running validation does not make a planned capability available.
+The [spec index](specs/README.md) records the phase boundaries, and the
+[roadmap](ROADMAP.md) describes the remaining work. Benchmark coverage is separate from
+implementation status.
+
+| Capability | Status | Current scope and remaining work |
+|---|---|---|
+| [SPARQL Query, Update and Graph Store protocols](#standards-conformance) | Complete within the documented conformance scope. | The listed SPARQL suites pass. This does not promise every Jena extension or plugin interface. |
+| [Durable commits and dataset identity](#storage-and-indexes) | Complete within the documented commit contract. | Transactions, receipts and synchronized acknowledgements are available. Indexed group-commit performance follow-ups remain separate measurements. |
+| [Storage, loading and compaction](#storage-and-indexes) | Partially complete. | Compressed indexes, bulk imports, online compaction and optional FSST are available. Finer compaction controls and larger-scale measurements remain. |
+| [History, snapshots and branches](#versioning-and-history) | Partially complete. | Retained commits, diffs, branches and merge review are available. Historical full-text search and further branch administration remain. |
+| [Streaming execution and disk spill](#sparql-queries-and-updates) | Partially complete. | Eligible plans stream automatically, with explicit cursors and opt-in spill. Eager fallbacks and spill acceptance work remain. |
+| [Incremental views and live queries](#sparql-queries-and-updates) | Partially complete. | Table views, checkpoints and SSE result changes are available. Graph views, commit-time maintenance, branch views and per-fact provenance remain planned. |
+| [Full-text and vector search](#search) | Partially complete. | BM25, HNSW, hybrid ranking and embeddings on write are available. Historical search, multi-field documents and quantization remain planned. |
+| [Paths and graph algorithms](#search) | Partially complete. | Shortest paths, communities, centrality and graph embeddings are available. Some path kernels, algorithm surfaces and larger reference comparisons remain. |
+| [GeoSPARQL](#geosparql) | Partially complete. | Indexed spatial filters, joins and constant-geometry nearest-neighbour ordering are available. Per-row nearest-neighbour geometry and the listed geometry and CRS extensions remain. |
+| [Reasoning](#reasoning-validation-and-schema) | Partially complete. | RDFS, OWL 2 RL, Jena rules, incremental materialization and demand derivation are available. Automatic cost selection, the separate derived layer and canonical equality remain planned. |
+| [Explanations](#reasoning-validation-and-schema) | Partially complete. | Why, bounded why-not, entailment diffs and minimal supports are available. Provenance-aware inferred visibility and review protections remain planned. |
+| [Validation and forms](#reasoning-validation-and-schema) | Partially complete. | SHACL, ShEx, write guards and generated forms are available. The compatibility boundaries and remaining editors are listed below. |
+| [Schema discovery](#reasoning-validation-and-schema) | Complete within the documented discovery scope. | Class and predicate profiles, schema diffs and constrained shape drafts are available. Drafts retain the limits in the compatibility boundaries. |
+| [Server and Fuseki integration](#server-and-protocols) | Partially complete. | Supported Fuseki protocols, configuration conversion and administration are available. Remaining ARQ, enhancer and integration surfaces are listed below. |
+| [Access control and authentication](#access-control-and-security) | Partially complete. | Dataset, graph and triple protections, OIDC and API tokens are available. Supported derived visibility, further audit events and authentication extensions remain planned. |
+| [Settings and declared prefixes](#server-and-protocols) | Complete within the documented settings scope. | Layered settings, operator locks, runtime administration and prefix completion are available. |
+| [Ask, ingestion and agent memory](#ai-and-agents) | Partially complete. | Checked queries, cited memory, ingestion review and source supersession are available. Accuracy, contextual linking and additional ingest formats remain open. |
+| [GraphRAG reports](#ai-and-agents) | Partially complete. | Community reports, global Ask, memory retrieval and change-feed refresh are available. View-based refresh and reports for distinct audiences remain planned. |
+| [Web graph, map and editing tools](#web-ui) | Partially complete. | Explore, paths, lenses, derivation trees, maps, linked selections and the visual query builder are available. Live profiling, additional builder blocks and larger rendering work remain. |
+| [Rust, Python, JVM and Node.js APIs](#libraries-and-bindings) | Partially complete. | All four embed the engine, and the JVM integrates with Jena. Administration, callback and platform coverage differs by binding. |
+| [Formatting, linting and command-line tools](#formatter-and-editor-support) | Partially complete. | SPARQL and RDF formatting, linting, completion and the documented CLI tools are available. Additional syntaxes and editor surfaces remain planned. |
+| [Backups and operations](#operations) | Partially complete. | Dataset backups, policies, integrity checks and format migration are available. Whole-server recovery, nested view definitions and release packaging remain open. |
+| [Shared evidence and review records](specs/C25-evidence-and-assessments.md) | Planned. | Item 81 specifies source revisions, unasserted claims and managed accepted projections. Existing memory writes retain their current scope. |
+| [Durable jobs and delivery](specs/C26-durable-jobs-and-delivery.md) | Planned. | Item 339 specifies checkpointed jobs, fenced workers and a transactional outbox. Current tasks and notifications do not provide that recovery contract. |
+| [Maintained analysis results](specs/F22-analysis-lifecycle.md) | Planned. | Item 340 specifies reproducible runs, dependency checks, freshness and guarded publication. |
+| [Valid-time queries and event history](specs/C27-valid-time-profiles.md) | Planned. | Item 341 specifies uncertain validity intervals and availability cutoffs. Existing history selects recorded commits. |
+| [Reports for distinct audiences](specs/C22b-report-configurations.md) | Planned. | Item 100 specifies multiple guarded GraphRAG configurations and shared budget enforcement. |
+| [Batched updates and triggers](specs/C23-batched-updates-and-triggers.md) | Planned. | Item 36 specifies batched work and commit-trigger authoring. |
+| [Additional query languages](specs/C24-json-query-languages.md) | Planned. | JSON node-pattern and Datalog query surfaces remain item 72. openCypher remains item 20. |
+| [Query by example and notebooks](#known-gaps) | Planned. | Items 28 and 30 describe these interfaces. The existing visual query builder is available. |
+| [Local-first engine and ontology object API](#known-gaps) | Planned. | Items 44 and 71 describe these extensions. Ordinary RDF ontology graphs already work. |
 
 ## Standards conformance
 
@@ -1484,6 +1531,32 @@ the UI and editors.
   flight `--shutdown-grace` seconds to finish. It then cancels the rest, and a cancelled
   write commits nothing.
 
+## Compatibility boundaries
+
+These are documented scope and compatibility choices. They do not mark a completed
+roadmap item as unfinished or promise another implementation.
+
+* Predicate patterns answer counts of distinct subjects, rather than `COUNT(*)` per
+  predicate. Queries that count triples use the ordinary permutations. Encoded IRIs and
+  alternative block codecs are not available because their measured savings did not
+  meet the adoption gates in [X11](specs/X11-index-compression-and-predicate-patterns.md#phases-not-built).
+* A headerless WAL that has never been opened for writing by the current format keeps
+  its legacy interpretation. A torn record left by an older build can therefore be
+  read as a legacy commit or refused, as [X09](specs/X09-group-commit-by-default.md#phase-3)
+  describes.
+* ShEx 2.2 does not support `RESTRICTS` or `EXACTLY` reference syntax. SHACL 1.2 reifier
+  constraints, `sh:uniqueValuesFor`, `sh:subsetOf`, `sh:someValue`, `sh:rootClass`,
+  `sh:singleLine` and SHACL 1.2 custom functions are outside the supported scope. The
+  [G02](specs/G02-shex.md#roadmap-follow-ups-2026-10-12) and
+  [G03](specs/G03-shaclc.md#roadmap-follow-ups-2026-10-12) Outcomes give the details.
+* Drafted shapes link another class shape only at support 1, derive patterns only from
+  all-string properties and ranges only from inline numbers and dates, and follow
+  sequence paths one level deep. ShEx drafts leave sequence paths and date ranges as
+  comments. [C02](specs/C02-schema-discovery.md#roadmap-follow-ups-2026-10-12) defines
+  this drafting scope.
+* SP²Bench `q4` at 10M produces 1.96 GB of TSV, exceeding the default 1 GiB response
+  budget. It requires a larger `--max-result-mb`. This is a configurable result limit.
+
 ## Known gaps
 
 These are implementation limits, missing controls, and features that other RDF stores
@@ -1499,9 +1572,6 @@ links each item to its design spec.
 * FSST vocabulary compression is off by default. With it, a DBpedia export takes 1.05
   times as long as with front coding, and warm queries that decode many strings run 4% to
   12% slower. Single-term lookups are the follow-up in roadmap item 160.
-* IRI encoding and zstd or frame-of-reference block codecs were measured and are not
-  built, because they saved less than their targets on DBpedia. Predicate patterns do not
-  answer `COUNT(*)` per predicate, which counts triples. Roadmap item 16.
 * Cold `values-star` and `path-plus` were slower than Oxigraph at 1.05M and 10.5M, as was
   cold `star-lookup` at 10.5M, and that comparison has not been repeated on index format
   3. Index format 3 makes cold `star-join` at 10.5M 6% to 8% slower. Dense reads on the
@@ -1512,23 +1582,20 @@ links each item to its design spec.
   item 111. A fence synchronizes in 1.4 to 1.5 ms against about 1.0 ms for one ordinary
   commit, which is item 112. Reader latency on a spatial dataset at 1.05M under mixed load
   is not established, item 171.
-* A headerless WAL that the current release has never opened for writing keeps the mixed
-  legacy rules for the bytes it holds, so a torn record that an older build left there can
-  be read as a legacy commit or refused
-  ([X09](specs/X09-group-commit-by-default.md#phase-3)). Roadmap item 3.
-* Most plans run eagerly unless the caller asks for `execution=streaming`. Sorts without
-  LIMIT and DESCRIBE collect their whole input, and an EXISTS evaluated once per outer key
-  stays eager because the cursor is slower there. The UI's result table, the MCP tools and
-  the Python and JVM query calls run eagerly, because they report exact totals or return
-  collected results. Roadmap item 7.
+* Automatic execution streams eligible large scans, groupings and ASK joins. Other
+  plans remain eager, including an EXISTS evaluated once per outer key when its cursor
+  is slower. Without spill, sorts without LIMIT collect their input, and DESCRIBE stays
+  collected. The UI, MCP and Python's collected query API collect results, while explicit
+  cursors and the JVM's automatic execution can pull SELECT batches. Roadmap item 7.
 * Disk spill is off by default. With spill on, a DISTINCT over an ordered input other than
   an ORDER BY keeps its whole set, a grouping's single group can outgrow the budget, and
   eager operators still fail at their budget. A spilled join that must keep its order
   writes its output once more to merge it, which made one join under 4 MiB 8.9 times
   slower than the same cursor without a memory limit. Grouping above an ordered spilled
   join is slow. Roadmap item 93.
-* There are no pinned results, materialized views or live query monitoring. Roadmap items
-  17 and 27.
+* Incremental table views and SSE live queries are available. Graph views, per-fact
+  provenance and commit-time maintenance remain planned under item 17. Live operator
+  profiling and running-query monitoring remain item 27.
 * A query whose plan would nest deeper than 4000 levels is refused, so a basic graph
   pattern holds at most 1998 triple patterns ([nesting limits](API.md#nesting-limits)).
   Planning time grows with the square of the number of triple patterns, and a star of
@@ -1545,9 +1612,6 @@ links each item to its design spec.
   evicted entries leave free pages in thread heaps. Ten datasets at `--cache-mb 32` use
   1.157 times the anonymous memory that one dataset and the cache bytes predict. Roadmap
   item 88.
-* SP²Bench `q4` at 10M answers 1.96 GB of TSV, more than the default response budget of
-  1 GiB, so it answers only with a larger `--max-result-mb`. Jena is faster on `q12a`
-  and Oxigraph on `q12b`. Roadmap item 91.
 
 ### Versioning and history
 
@@ -1674,23 +1738,14 @@ links each item to its design spec.
   canonical `owl:sameAs` representatives are not built. Roadmap item 9.
 * Incremental maintenance does not cover rules with `noValue`, `now` or new blank nodes,
   or RDF lists that change under OWL 2 RL. Those runs, and the first run after a
-  compaction without retained history, recompute everything. Inconsistency checks cover a
-  fixed subset of OWL 2 RL. Roadmap items 9 and 53.
+  compaction without retained history, recompute everything. Diagnostic checks do not
+  prove consistency, and datatype membership that cannot be decided remains unknown.
+  Roadmap items 9 and 53.
 * Because the kept closure holds only derived facts, changes of 100 triples at 16 threads
   over it take 1.6 to 2.3 times as long as with a closure that also holds the explicit
   facts, and undos at 1 thread take 1.3 to 1.8 times, on LUBM-style data. Roadmap item
   113.
-* ShEx 2.2 has no `RESTRICTS` and no `EXACTLY` reference syntax. SHACL 1.2's reifier
-  constraints, `sh:uniqueValuesFor`, `sh:subsetOf`, `sh:someValue`, `sh:rootClass`,
-  `sh:singleLine` and custom functions called from SPARQL are not supported. Roadmap item
-  13 keeps them out of scope, and the Outcome sections of
-  [G02](specs/G02-shex.md#roadmap-follow-ups-2026-10-12) and
-  [G03](specs/G03-shaclc.md#roadmap-follow-ups-2026-10-12) list them.
 * `sparkles fmt` and the UI's Format button do not format SHACLC. Roadmap item 48.
-* Drafted shapes reference other class shapes only at support 1, have patterns only for
-  all-string properties and ranges only for inline numbers and dates, go one level deep in
-  sequence paths, and write sequence paths and date ranges into ShEx drafts as comments.
-  Roadmap item 13 and [C02](specs/C02-schema-discovery.md#roadmap-follow-ups-2026-10-12).
 * Write-time validation validates recursive SHACL shapes, and SHACL-SPARQL constraints not
   anchored at the focus node, in full on every write. Roadmap item 78.
 * ShEx keeps no typing when the process is killed or exits without closing the store, so

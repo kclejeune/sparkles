@@ -1,20 +1,17 @@
 # U10: Lenses on the graph canvas
 
-> **Status:** Phases 1 and 2 shipped
+> **Status:** implemented, Phases 1, 2 and 3.
 >
-> **Phases:** Phases 1 and 2 shipped on 2026-10-23. Phase 1 adds lenses to the Explore graph and the WebGL view, a
-> shared way to size, colour, badge and style drawn elements from data computed for them,
-> with a legend and a list column, and the first lenses: degree, a property's values, class,
-> graph and inferred edges drawn dashed. Phase 2 adds algorithm lenses, which size nodes by
-> PageRank or another centrality and colour them by a Leiden run that is never written back,
-> after a server prerequisite that caches view-only algorithm runs. Phase 3 answers "Why is
-> this inferred?" with the reasoner's derivation tree for a dashed edge, after a server
-> prerequisite that explains inferences over a materialized closure.
+> **Phases:** Data lenses, algorithm lenses and the derivation-tree panel for inferred
+> edges are available. Later explanation and result-cell extensions belong to
+> [F18](F18-explanations-and-entailment-diffs.md).
 >
-> **User docs:** [USAGE.md](../USAGE.md#lenses-on-the-graph).
+> **User docs:** [Lenses on the graph](../USAGE.md#lenses-on-the-graph),
+> [algorithm lenses](../USAGE.md#algorithm-lenses) and
+> [why an edge is inferred](../USAGE.md#why-is-this-inferred).
 >
-> This is the design as written before implementation. The [Outcome](#outcome) section at
-> the end records how Phases 1 and 2 landed.
+> This is the design as written before implementation. The [Outcome](#outcome) records
+> how all three phases landed.
 
 This design was written from the Sparkles code and specs: graph algorithms
 ([F14](F14-graph-algorithms.md)), community summaries ([C22](C22-graph-rag-community-summaries.md)),

@@ -1,19 +1,18 @@
 # F13: Incremental views, live queries and fact provenance
 
-> **Status:** Phase 1 shipped
+> **Status:** implemented in part, Phase 1.
 >
-> **Phases:** Phase 1 shipped on 2026-10-24. Phase 1 is the incremental core over the commit stream,
-> materialized views read as tables, live SELECT queries over server-sent events, the
-> library API, the CLI and the fallback to re-evaluation. Phase 2 adds views written to
-> named graphs, WebSocket, MCP, the bindings and the UI, views per branch, top-k views,
-> and protections that depend on the data. Phase 3 adds per-fact provenance, recursion
-> for property paths and rules, and GraphQL subscriptions on the core.
+> **Phases:** Phase 1 provides the incremental core over commits, table views, SSE live
+> queries, checkpoints, the library API, the CLI and recomputation fallbacks. Phase 2's
+> graph views, commit-time maintenance, additional transports and branch views remain
+> planned. Phase 3's per-fact provenance, recursive incremental execution and GraphQL
+> subscriptions remain planned.
 >
-> **User docs:** [API.md](../API.md#incremental-views), [API.md](../API.md#live-queries)
-> and [USAGE.md](../USAGE.md#incremental-views).
+> **User docs:** [Incremental views](../API.md#incremental-views),
+> [live queries](../API.md#live-queries) and [usage](../USAGE.md#incremental-views).
 >
-> This is the design as written before implementation. The [Outcome](#outcome) section at
-> the end records how Phase 1 landed.
+> This is the design as written before implementation. The [Outcome](#outcome) records
+> what shipped and the remaining work.
 
 This design was written from the published work on incremental view maintenance and
 dataflow: Gupta, Mumick and Subrahmanian, "Maintaining views incrementally" (SIGMOD

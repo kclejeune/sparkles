@@ -1,20 +1,17 @@
 # X07: Cold sparse reads
 
-> **Status:** implemented in part (Phases 1, 2 and 3). Phase 4 is not built. Phase 3 landed
-> on 2026-10-23 as index format 3, with the design of §6.5.
+> **Status:** implemented in part, Phases 1, 2 and 3.
 >
-> **Phases:** Phase 1 is per-query I/O accounting and a profile of the cold losses.
-> Phase 2 adds batched resolution of a query's constants, first-scan prefetch, a read
-> window per scan pass instead of per process, and execution-time term prefetch. Phase 3
-> adds a segmented block layout that lets a point lookup read and decode part of a
-> block. Phase 4 is an optional prewarm of the pages a server used before it stopped.
+> **Phases:** I/O accounting, batched constant resolution, prefetch, scan-specific read
+> windows and segmented index-format-3 blocks are available. Phase 4's optional prewarm
+> of previously used pages and the listed performance follow-ups remain planned.
 >
-> **User docs:** [The I/O profile](../API.md#the-io-profile),
-> [Cold reads](../internals/OPTIMIZATIONS.md#cold-reads) and the environment variables in
-> [USAGE.md](../USAGE.md).
+> **User docs:** [I/O profile](../API.md#the-io-profile),
+> [cold reads](../internals/OPTIMIZATIONS.md#cold-reads) and
+> [usage](../USAGE.md).
 >
-> This design was written before implementation. The [Outcome](#outcome) section at the
-> end records how it landed.
+> This is the design as written before implementation. The [Outcome](#outcome) records
+> what shipped and the remaining work.
 
 This design was written from the Sparkles code (`crates/sparkles-core/src/index.rs`,
 `vocab.rs`, `sparql/indexjoin.rs`, `sparql/results.rs`, `sparql/ctx.rs`,

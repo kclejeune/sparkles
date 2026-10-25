@@ -1,24 +1,17 @@
 # X11: Index compression and predicate patterns
 
-> **Status:** Phase 1 built. Phase 2a, FSST suffixes, is built as an option that is off by
-> default. Roadmap item 108 made FSST reads faster, but warm queries that decode many
-> strings still miss the gate, so the option stays off. Phase 2b and Phase 3 are not built.
-> Their measured savings are below their gates, and the [Outcome](#phases-not-built) gives
-> the figures.
+> **Status:** implemented in part, Phase 1 and optional Phase 2a.
 >
-> **Phases:** Phase 1 is predicate patterns: a per-subject pattern table built with the
-> generation, `spk:hasPredicate`, and the planner's use of patterns for predicate listings
-> and counts. Phase 2 adds the vocabulary codecs: FSST-compressed suffixes and encoded
-> IRIs. Phase 3 adds index column codecs and optional zstd blocks with dictionaries. Each
-> phase that changes the files raises the index format version under the rules of §7.
+> **Phases:** Predicate patterns and optional FSST vocabulary suffixes are available.
+> FSST stays off by default because string-heavy queries miss its performance gate.
+> Encoded IRIs and alternative block codecs were not adopted after their measured
+> savings fell below their gates. The Outcome records these decisions.
 >
-> **User docs:** [Predicate patterns and `spk:hasPredicate`](../API.md#predicate-patterns-and-spkhaspredicate),
-> the `--no-patterns`, `--pattern-memory-mb` and `--vocab-codec` flags and
-> `sparkles stats --patterns` in [USAGE.md](../USAGE.md), and the `predicate_patterns` flag in
-> [OPTIMIZATIONS.md](../internals/OPTIMIZATIONS.md).
+> **User docs:** [Predicate patterns](../API.md#predicate-patterns-and-spkhaspredicate),
+> [usage](../USAGE.md) and [optimizations](../internals/OPTIMIZATIONS.md).
 >
-> This is the design as written before implementation. The [Outcome](#outcome) section at
-> the end records how Phases 1 and 2a landed and where they depart from the design.
+> This is the design as written before implementation. The [Outcome](#outcome) records
+> what shipped and the measured alternatives.
 
 This design was written from H. Bast and B. Buchhold, "QLever: A Query Engine for
 Efficient SPARQL+Text Search", CIKM 2017, and the public QLever documentation of

@@ -1,20 +1,17 @@
 # C22: Community summaries for global questions (GraphRAG)
 
-> **Status:** Phase 1 implemented, Phases 2 and 3 partly implemented; the paid acceptance runs wait for approval
+> **Status:** implemented in part, Phase 1 and parts of Phases 2 and 3.
 >
-> **Phases:** Phase 1 is implemented. Phase 1 is the community build from F14's Leiden, the
-> summaries written by the server's model providers with citations to facts, their
-> storage as triples with provenance and review status, the build task and the settings.
-> Phase 2 adds global questions in Ask, community context in `recall` and the brief, and
-> the MCP tool, and is partly implemented. Phase 3 refreshes communities and summaries
-> incrementally after commits, and its refresh from the change feed is implemented.
+> **Phases:** Community builds, cited reports, review, global Ask and memory retrieval
+> are available. Automatic refresh uses the change feed and report digests. Maintenance
+> from an F13 view and reports for distinct audiences remain planned. Evaluation limits
+> are recorded separately from implementation status.
 >
-> **User docs:** [Model settings](../USAGE.md#changing-models-and-keys-at-runtime)
-> cover configuring the role, and [Community reports](../USAGE.md#community-reports-graphrag)
-> cover building and reviewing them.
+> **User docs:** [Model settings](../USAGE.md#changing-models-and-keys-at-runtime) and
+> [community reports](../USAGE.md#community-reports-graphrag).
 >
-> This is the design as written before implementation. The [Outcome](#outcome) section at
-> the end will record how it lands.
+> This is the design as written before implementation. The [Outcome](#outcome) records
+> what shipped and the remaining work.
 
 This design was written from Edge et al., "From Local to Global: A Graph RAG Approach to
 Query-Focused Summarization" (arXiv:2404.16130, 2024), Microsoft's public GraphRAG
