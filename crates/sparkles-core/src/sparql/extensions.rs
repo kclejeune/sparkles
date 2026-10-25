@@ -10,7 +10,9 @@ use rustc_hash::FxHashMap;
 use spargebra::algebra::{
     AggregateExpression, AggregateFunction, Expression, Function, GraphPattern, OrderExpression,
 };
+use std::cell::{Cell, RefCell};
 use std::fmt;
+use std::mem::ManuallyDrop;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -24,9 +26,62 @@ struct CallbackFrame {
     ancestors: Vec<Failure>,
 }
 
+type CallbackStack = RefCell<Vec<CallbackFrame>>;
+type WriterStack = RefCell<Vec<(u64, uuid::Uuid, Failure)>>;
+
+// These data keys stay accessible after the cleanup sentinel has been destroyed.
+const _: () = assert!(!std::mem::needs_drop::<ManuallyDrop<CallbackStack>>());
+const _: () = assert!(!std::mem::needs_drop::<ManuallyDrop<WriterStack>>());
+
 thread_local! {
-    static CALLBACKS: std::cell::RefCell<Vec<CallbackFrame>> = const { std::cell::RefCell::new(Vec::new()) };
-    static WRITERS: std::cell::RefCell<Vec<(u64, uuid::Uuid, Failure)>> = const { std::cell::RefCell::new(Vec::new()) };
+    static CALLBACKS: ManuallyDrop<CallbackStack> = const { ManuallyDrop::new(RefCell::new(Vec::new())) };
+    static WRITERS: ManuallyDrop<WriterStack> = const { ManuallyDrop::new(RefCell::new(Vec::new())) };
+    static TEARING_DOWN: Cell<bool> = const { Cell::new(false) };
+    static CLEANUP: TrackingCleanup = const { TrackingCleanup };
+}
+
+struct TrackingCleanup;
+
+impl Drop for TrackingCleanup {
+    fn drop(&mut self) {
+        TEARING_DOWN.with(|state| state.set(true));
+        // An earlier thread-local owner may still hold a writer or invoke a
+        // callback. Keep active entries until their guards release them.
+        CALLBACKS.with(|stack| release_idle(stack));
+        WRITERS.with(|stack| release_idle(stack));
+    }
+}
+
+fn release_idle<T>(stack: &RefCell<Vec<T>>) {
+    let allocation = {
+        let mut entries = stack.borrow_mut();
+        entries.is_empty().then(|| std::mem::take(&mut *entries))
+    };
+    drop(allocation);
+}
+
+fn release_during_teardown<T>(stack: &RefCell<Vec<T>>) {
+    if TEARING_DOWN.with(Cell::get) {
+        release_idle(stack);
+    }
+}
+
+fn register_cleanup() {
+    if CLEANUP.try_with(|_| ()).is_err() {
+        // Only sentinel registration may fail. The data keys and every family
+        // check remain available; teardown has already marked their cleanup mode.
+        debug_assert!(TEARING_DOWN.with(Cell::get));
+    }
+}
+
+fn with_callbacks<R>(f: impl FnOnce(&CallbackStack) -> R) -> R {
+    register_cleanup();
+    CALLBACKS.with(|stack| f(stack))
+}
+
+fn with_writers<R>(f: impl FnOnce(&WriterStack) -> R) -> R {
+    register_cleanup();
+    WRITERS.with(|stack| f(stack))
 }
 
 pub(crate) struct WriterOwner {
@@ -47,7 +102,7 @@ impl WriterOwner {
         static NEXT: AtomicU64 = AtomicU64::new(1);
         let token = NEXT.fetch_add(1, Ordering::Relaxed);
         let failure: Failure = Default::default();
-        WRITERS.with(|w| w.borrow_mut().push((token, family, failure.clone())));
+        with_writers(|w| w.borrow_mut().push((token, family, failure.clone())));
         Self {
             token,
             failure,
@@ -58,18 +113,21 @@ impl WriterOwner {
 
 impl Drop for WriterOwner {
     fn drop(&mut self) {
-        WRITERS.with(|w| w.borrow_mut().retain(|(token, _, _)| *token != self.token));
+        with_writers(|w| {
+            w.borrow_mut().retain(|(token, _, _)| *token != self.token);
+            release_during_teardown(w);
+        });
     }
 }
 
 pub(crate) fn captured_writers() -> Vec<(uuid::Uuid, Failure)> {
-    let mut writers: Vec<_> = WRITERS.with(|w| {
+    let mut writers: Vec<_> = with_writers(|w| {
         w.borrow()
             .iter()
             .map(|(_, id, failure)| (*id, failure.clone()))
             .collect()
     });
-    CALLBACKS.with(|c| {
+    with_callbacks(|c| {
         for frame in c.borrow().iter() {
             for (id, failure) in &frame.writers {
                 if !writers.iter().any(|(_, known)| Arc::ptr_eq(known, failure)) {
@@ -83,8 +141,8 @@ pub(crate) fn captured_writers() -> Vec<(uuid::Uuid, Failure)> {
 
 pub(crate) fn captured_families(family: uuid::Uuid) -> Vec<uuid::Uuid> {
     let mut families = vec![family];
-    WRITERS.with(|w| families.extend(w.borrow().iter().map(|(_, id, _)| *id)));
-    CALLBACKS.with(|c| {
+    with_writers(|w| families.extend(w.borrow().iter().map(|(_, id, _)| *id)));
+    with_callbacks(|c| {
         for frame in c.borrow().iter() {
             families.extend(&frame.families);
         }
@@ -96,7 +154,7 @@ pub(crate) fn captured_families(family: uuid::Uuid) -> Vec<uuid::Uuid> {
 
 pub(crate) fn captured_ancestors() -> Vec<Failure> {
     let mut failures = Vec::new();
-    CALLBACKS.with(|c| {
+    with_callbacks(|c| {
         for frame in c.borrow().iter() {
             for failure in std::iter::once(&frame.failure).chain(&frame.ancestors) {
                 if !failures.iter().any(|known| Arc::ptr_eq(known, failure)) {
@@ -114,7 +172,7 @@ pub(crate) struct CallbackGuard;
 
 impl CallbackGuard {
     pub(crate) fn enter(ctx: &Ctx) -> Self {
-        CALLBACKS.with(|s| {
+        with_callbacks(|s| {
             s.borrow_mut().push(CallbackFrame {
                 families: ctx.extension_families.clone(),
                 failure: ctx
@@ -132,14 +190,16 @@ impl CallbackGuard {
 
 impl Drop for CallbackGuard {
     fn drop(&mut self) {
-        CALLBACKS.with(|s| {
-            s.borrow_mut().pop();
+        with_callbacks(|s| {
+            let frame = s.borrow_mut().pop();
+            release_during_teardown(s);
+            drop(frame);
         });
     }
 }
 
 pub(crate) fn check_family(dataset: uuid::Uuid) -> Result<()> {
-    CALLBACKS.with(|s| {
+    with_callbacks(|s| {
         let owners = s.borrow();
         let mut forbidden = false;
         for frame in owners

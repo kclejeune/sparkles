@@ -42,6 +42,339 @@ fn bounded(f: impl FnOnce() + Send + 'static) {
     }
 }
 
+fn destruction_subprocess(name: &str, run: impl FnOnce()) {
+    const CHILD: &str = "SPARKLES_QUERY_EXTENSIONS_THREAD_DESTRUCTION";
+    if std::env::var(CHILD).as_deref() == Ok(name) {
+        run();
+        return;
+    }
+    let mut child = std::process::Command::new(std::env::current_exe().unwrap())
+        .args(["--exact", name, "--nocapture"])
+        .env(CHILD, name)
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .unwrap();
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+    while child.try_wait().unwrap().is_none() {
+        if std::time::Instant::now() >= deadline {
+            let _ = child.kill();
+            let _ = child.wait();
+            panic!("thread-destruction child did not terminate");
+        }
+        std::thread::sleep(std::time::Duration::from_millis(5));
+    }
+    let output = child.wait_with_output().unwrap();
+    assert!(
+        output.status.success(),
+        "thread-destruction child failed: {}\n{}\n{}",
+        output.status,
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+#[test]
+fn a_thread_local_owner_can_snapshot_after_callback_tracking_cleanup() {
+    destruction_subprocess(
+        "a_thread_local_owner_can_snapshot_after_callback_tracking_cleanup",
+        || {
+            struct Owner {
+                store: Arc<Store>,
+                finished: Arc<AtomicBool>,
+            }
+            impl Drop for Owner {
+                fn drop(&mut self) {
+                    assert_eq!(self.store.snapshot().len(), 0);
+                    self.finished.store(true, Ordering::SeqCst);
+                }
+            }
+            thread_local! {
+                static OWNER: std::cell::RefCell<Option<Owner>> = const { std::cell::RefCell::new(None) };
+            }
+            let finished = Arc::new(AtomicBool::new(false));
+            let observed = finished.clone();
+            std::thread::spawn(move || {
+                // Register this owner before the first store snapshot initializes
+                // callback-family bookkeeping, so it is destroyed after that key.
+                OWNER.with(|owner| assert!(owner.borrow().is_none()));
+                let store = Arc::new(Store::in_memory(StoreOptions::default()));
+                assert_eq!(store.snapshot().len(), 0);
+                OWNER.with(|owner| *owner.borrow_mut() = Some(Owner { store, finished }));
+            })
+            .join()
+            .unwrap();
+            assert!(observed.load(Ordering::SeqCst));
+        },
+    );
+}
+
+fn during_thread_destruction(make: impl FnOnce() -> Box<dyn FnOnce()> + Send + 'static) {
+    struct Owner {
+        action: Option<Box<dyn FnOnce()>>,
+        finished: Arc<AtomicBool>,
+    }
+    impl Drop for Owner {
+        fn drop(&mut self) {
+            self.action.take().unwrap()();
+            self.finished.store(true, Ordering::SeqCst);
+        }
+    }
+    thread_local! {
+        static OWNER: std::cell::RefCell<Option<Owner>> = const { std::cell::RefCell::new(None) };
+    }
+    let finished = Arc::new(AtomicBool::new(false));
+    let observed = finished.clone();
+    std::thread::spawn(move || {
+        OWNER.with(|owner| assert!(owner.borrow().is_none()));
+        let action = make();
+        OWNER.with(|owner| {
+            *owner.borrow_mut() = Some(Owner {
+                action: Some(action),
+                finished,
+            })
+        });
+    })
+    .join()
+    .unwrap();
+    assert!(observed.load(Ordering::SeqCst));
+}
+
+#[test]
+fn late_callbacks_keep_snapshot_and_nested_family_restrictions() {
+    destruction_subprocess(
+        "late_callbacks_keep_snapshot_and_nested_family_restrictions",
+        || {
+            during_thread_destruction(|| {
+                let a = Arc::new(Store::in_memory(StoreOptions::default()));
+                let b = Arc::new(Store::in_memory(StoreOptions::default()));
+                let snapshot = a.snapshot();
+                // Initialize every tracking path before the owner outlives its cleanup.
+                let warm = options(|_: &ScalarContext<'_>, _: &[Term]| text("warm"));
+                query(
+                    snapshot.clone(),
+                    &format!("SELECT (<{IRI}>() AS ?x) {{}}"),
+                    &warm,
+                )
+                .unwrap();
+                Box::new(move || {
+                    let source = format!("SELECT (<{IRI}>() AS ?x) {{}}");
+                    let safe_store = b.clone();
+                    let safe = options(move |_: &ScalarContext<'_>, _: &[Term]| {
+                        assert!(
+                            query(safe_store.snapshot(), "ASK {}", &Default::default())
+                                .unwrap()
+                                .boolean
+                        );
+                        text("safe")
+                    });
+                    assert_eq!(
+                        query(a.snapshot(), &source, &safe).unwrap().rows()[0][0],
+                        Some(Literal::from("safe").into())
+                    );
+
+                    let captured_store = a.clone();
+                    let captured_snapshot = snapshot.clone();
+                    let active = options(move |_: &ScalarContext<'_>, _: &[Term]| {
+                        // Neither catching the infallible refusal nor suppressing the
+                        // captured snapshot error can clear the active fatal flag.
+                        assert!(
+                            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                                captured_store.snapshot()
+                            }))
+                            .is_err()
+                        );
+                        assert!(
+                            query(captured_snapshot.clone(), "ASK {}", &Default::default())
+                                .is_err()
+                        );
+                        text("suppressed")
+                    });
+                    assert!(query(a.snapshot(), &source, &active).is_err());
+
+                    let captured_snapshot = snapshot.clone();
+                    let nested_store = b.clone();
+                    let nested_source = source.clone();
+                    let outer = options(move |_: &ScalarContext<'_>, _: &[Term]| {
+                        let forbidden = captured_snapshot.clone();
+                        let inner = options(move |_: &ScalarContext<'_>, _: &[Term]| {
+                            assert!(
+                                query(forbidden.clone(), "ASK {}", &Default::default()).is_err()
+                            );
+                            text("inner suppressed")
+                        });
+                        assert!(query(nested_store.snapshot(), &nested_source, &inner).is_err());
+                        text("outer suppressed")
+                    });
+                    assert!(query(a.snapshot(), &source, &outer).is_err());
+                    // Normal access recovers after all nested guards have popped.
+                    assert!(
+                        query(a.snapshot(), "ASK {}", &Default::default())
+                            .unwrap()
+                            .boolean
+                    );
+                    assert!(query(a.snapshot(), &source, &safe).is_ok());
+                })
+            });
+        },
+    );
+}
+
+#[test]
+fn a_writer_retained_by_a_tls_owner_keeps_its_family_and_sticky_failure() {
+    destruction_subprocess(
+        "a_writer_retained_by_a_tls_owner_keeps_its_family_and_sticky_failure",
+        || {
+            during_thread_destruction(|| {
+                static WRITER_STORE: std::sync::OnceLock<Store> = std::sync::OnceLock::new();
+                let writer_store =
+                    WRITER_STORE.get_or_init(|| Store::in_memory(StoreOptions::default()));
+                let other = Arc::new(Store::in_memory(StoreOptions::default()));
+                let mut transaction = writer_store.write();
+                let subject = transaction
+                    .intern(&oxrdf::NamedNode::new_unchecked("urn:pending").into())
+                    .unwrap();
+                let predicate = transaction
+                    .intern(&oxrdf::NamedNode::new_unchecked("urn:p").into())
+                    .unwrap();
+                let object = transaction.intern(&Literal::from(1).into()).unwrap();
+                transaction
+                    .insert([
+                        subject,
+                        predicate,
+                        object,
+                        sparkles_core::id::Id::DEFAULT_GRAPH,
+                    ])
+                    .unwrap();
+                Box::new(move || {
+                    let opts = options(move |_: &ScalarContext<'_>, _: &[Term]| {
+                        assert!(
+                            writer_store
+                                .try_write_with(
+                                    sparkles_core::commit::CommitKind::Transaction,
+                                    Default::default()
+                                )
+                                .is_err()
+                        );
+                        text("suppressed")
+                    });
+                    assert!(
+                        query(
+                            other.snapshot(),
+                            &format!("SELECT (<{IRI}>() AS ?x) {{}}"),
+                            &opts
+                        )
+                        .is_err()
+                    );
+                    assert!(
+                        transaction.commit().is_err(),
+                        "suppressed callback failure reached the retained writer"
+                    );
+                    assert_eq!(
+                        writer_store.snapshot().len(),
+                        0,
+                        "the staged insert was rolled back"
+                    );
+                    let recovered = writer_store.write();
+                    recovered.commit().unwrap();
+                })
+            });
+        },
+    );
+}
+
+#[test]
+fn a_late_captured_property_view_preserves_visibility_and_family_rejection() {
+    use sparkles_core::sparql::extensions::{
+        ArgumentShape, PropertyContext, PropertyDescriptor, PropertyFunction, PropertyInput,
+        PropertyPosition, PropertyRow, PropertyStream,
+    };
+    destruction_subprocess(
+        "a_late_captured_property_view_preserves_visibility_and_family_rejection",
+        || {
+            during_thread_destruction(|| {
+                struct ReadView {
+                    snapshot: Arc<sparkles_core::store::Snapshot>,
+                    seen: Arc<AtomicUsize>,
+                }
+                struct Empty;
+                impl PropertyStream for Empty {
+                    fn next(
+                        &mut self,
+                        _: &PropertyContext<'_>,
+                    ) -> Result<Option<PropertyRow>, ScalarError> {
+                        Ok(None)
+                    }
+                }
+                impl PropertyFunction for ReadView {
+                    fn open<'q>(
+                        &self,
+                        context: PropertyContext<'q>,
+                        _: PropertyInput,
+                    ) -> Result<Box<dyn PropertyStream + 'q>, ScalarError> {
+                        let mut scan = context.view().scan(None, None, None)?;
+                        let mut count = 0;
+                        while let Some(batch) = scan.next_batch()? {
+                            count += batch.triples().len();
+                        }
+                        self.seen.store(count, Ordering::SeqCst);
+                        assert_eq!(
+                            count, 1,
+                            "the captured view keeps the query's graph selection"
+                        );
+                        // The nested view guards have returned, but the outer callback
+                        // must still reject direct use of a captured snapshot.
+                        assert!(
+                            query(self.snapshot.clone(), "ASK {}", &Default::default()).is_err()
+                        );
+                        Ok(Box::new(Empty))
+                    }
+                }
+                let store = Arc::new(Store::in_memory(StoreOptions::default()));
+                sparkles_core::sparql::update::update(&store,
+                "INSERT DATA { GRAPH <urn:visible> { <urn:v> <urn:p> 1 } GRAPH <urn:hidden> { <urn:h> <urn:p> 2 } }",
+                &Default::default()).unwrap();
+                let snapshot = store.snapshot();
+                let seen = Arc::new(AtomicUsize::new(0));
+                let mut registry = ExtensionRegistry::builder();
+                registry
+                    .register_property(
+                        PropertyDescriptor::new(
+                            "urn:late:view",
+                            ArgumentShape::Term,
+                            ArgumentShape::Term,
+                            vec![],
+                            vec![PropertyPosition::Object(0)],
+                            ReadView {
+                                snapshot,
+                                seen: seen.clone(),
+                            },
+                        )
+                        .unwrap(),
+                    )
+                    .unwrap();
+                let opts = QueryOptions {
+                    extensions: Some(registry.build()),
+                    default_graph_uris: vec!["urn:visible".into()],
+                    ..Default::default()
+                };
+                Box::new(move || {
+                    assert!(
+                        query(
+                            store.snapshot(),
+                            "ASK { <urn:input> <urn:late:view> ?out }",
+                            &opts
+                        )
+                        .is_err()
+                    );
+                    assert_eq!(seen.load(Ordering::SeqCst), 1);
+                    assert_eq!(store.snapshot().len(), 2);
+                })
+            });
+        },
+    );
+}
+
 #[test]
 fn registry_identity_validation_and_builtin_collisions() {
     let callback = |_: &ScalarContext<'_>, _: &[Term]| text("ok");

@@ -396,15 +396,23 @@ cached.
 
 ### Callback context during thread destruction
 
-A remaining lifecycle gap affects thread-local owners registered before their first
-store access. The callback-family key can be destroyed before a snapshot is taken
-from an owner's destructor, causing a process abort. This predates the incremental
-view operation-tracking repair. Roadmap item 25 covers keeping the bookkeeping
-available through thread destruction while preserving captured-view and snapshot-family
-checks.
+Callback and writer bookkeeping remains available through thread destruction. The
+data keys have no destructor. A separate cleanup sentinel releases idle allocations
+and leaves active entries intact until their guards return. Normal callback and
+writer scopes keep reusing their vector capacity. Late callbacks still propagate
+captured families and sticky failure state, so a caller cannot suppress a rejection
+and commit a transaction's earlier changes.
 
-Acceptance includes a subprocess that registers its thread-local owner before the
-first `Store::snapshot`, takes a snapshot from that owner's destructor and exits
-normally. Active and nested callbacks must retain their captured-view restrictions
-and reject a snapshot from the wrong family. Failure to access the tracking key must
-not silently bypass those checks.
+Four subprocess regressions cover an owner registered before its first
+`Store::snapshot`, active and nested callback restrictions, a writer retained across
+bookkeeping cleanup, and a captured property view that keeps its graph selection.
+The first case aborts against the earlier implementation and exits normally after the
+repair. The 83 scalar, aggregate and property tests pass, as do 100 repetitions of each
+of the four destruction cases and strict Clippy on the core crate and all its targets.
+This completes only the lifecycle acceptance under item 25. Its dispatch, foreign
+callbacks, batching, aggregate arities and measurements remain open.
+
+Acceptance requires late snapshots to work while active and nested callbacks retain
+their captured-view restrictions and reject a snapshot from the wrong family.
+Destroying the cleanup sentinel must not clear an active writer or silently bypass
+the family checks.
