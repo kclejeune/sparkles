@@ -3153,7 +3153,7 @@ impl<'a> Planner<'a> {
             return Ok(None);
         };
         // an estimate of a few rows comes before the read, which costs a seek
-        if !(scan.est <= POINT_ROWS) || !spec.eqs.is_empty() {
+        if !scan.est.is_finite() || scan.est > POINT_ROWS || !spec.eqs.is_empty() {
             return Ok(None);
         }
         let (rows, _) = super::exec::scan_limited(self.ctx, spec, &scan.vars, Some(2))?;
@@ -3250,10 +3250,7 @@ impl<'a> Planner<'a> {
         let mut it = parts.into_iter();
         let mut acc = it.next().unwrap();
         for p in it {
-            acc = match self.keyed_join(acc, p, filters) {
-                Ok(keyed) => keyed,
-                Err((acc, p)) => self.place_filters(join(acc, p, self.ctx), filters),
-            };
+            acc = self.join_components(acc, p, filters);
         }
         Ok(super::indexjoin::fuse_stars(acc, self.ctx))
     }
@@ -3261,13 +3258,8 @@ impl<'a> Planner<'a> {
     /// The join of `a` and `b`, which share no variable, keyed on a conjunct `?x = ?y` of
     /// a remaining FILTER with one variable on each side (see [`Kind::KeyedJoin`]). Every
     /// FILTER that both sides together bind is tested on the candidates and removed from
-    /// `filters`. `Err` gives the inputs back when no FILTER links them so.
-    fn keyed_join(
-        &self,
-        a: Node,
-        b: Node,
-        filters: &mut Vec<Expr>,
-    ) -> std::result::Result<Node, (Node, Node)> {
+    /// `filters`. Without a suitable equality it retains the ordinary product.
+    fn join_components(&self, a: Node, b: Node, filters: &mut Vec<Expr>) -> Node {
         // An application callback in the condition may count or depend on its calls,
         // which the candidates change, so it keeps the product.
         if !self.ctx.opt.keyed_join
@@ -3276,7 +3268,7 @@ impl<'a> Planner<'a> {
             || b.is_empty()
             || a.vars.iter().any(|v| b.vars.contains(v))
         {
-            return Err((a, b));
+            return self.place_filters(join(a, b, self.ctx), filters);
         }
         let bound = |f: &Expr| {
             !f.has_exists() && {
@@ -3289,7 +3281,7 @@ impl<'a> Planner<'a> {
             .filter(|f| bound(f))
             .find_map(|f| equality_key(f, &a, &b))
         else {
-            return Err((a, b));
+            return self.place_filters(join(a, b, self.ctx), filters);
         };
         let (now, later): (Vec<Expr>, Vec<Expr>) =
             std::mem::take(filters).into_iter().partition(|f| bound(f));
@@ -3299,11 +3291,11 @@ impl<'a> Planner<'a> {
             .reduce(|l, r| Expr::And(Box::new(l), Box::new(r)))
             .expect("the linking FILTER");
         // The larger input is streamed and the smaller one indexed.
-        Ok(if a.est >= b.est {
+        if a.est >= b.est {
             keyed_inner_join(a, b, expr, (x, y), self.ctx)
         } else {
             keyed_inner_join(b, a, expr, (y, x), self.ctx)
-        })
+        }
     }
 
     /// Apply (and remove) filters whose variables are all bound by `n`.

@@ -208,7 +208,7 @@ impl KeyFilter {
     pub(super) fn cursor_scratch_bytes(exprs: &[Expr], v: VarId, rows: usize) -> Option<u64> {
         fn bytes(e: &Expr, v: VarId) -> Option<u64> {
             if length_test(e, v).is_some() {
-                return Some(128);
+                return Some(1024);
             }
             if let Expr::And(a, b) = e {
                 return Some(bytes(a, v)?.saturating_add(bytes(b, v)?));
@@ -536,6 +536,17 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[test]
+    fn length_filter_reservation_covers_minimum_test_vector_capacity() {
+        let length = call(Function::StrLen, vec![Expr::Var(0)]);
+        let bound = Expr::Lit(crate::id::Id::UNDEF, Value::Integer(2.into()));
+        let expr = Expr::Cmp(Box::new(length), Box::new(bound), CmpOp::Gt);
+        let reserved = KeyFilter::cursor_scratch_bytes(&[expr], 0, 4096).unwrap();
+        assert!(
+            reserved >= (4 * std::mem::size_of::<Test>() + std::mem::size_of::<KeyFilter>()) as u64
+        );
     }
 
     #[test]

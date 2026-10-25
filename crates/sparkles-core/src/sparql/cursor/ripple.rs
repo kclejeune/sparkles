@@ -148,8 +148,8 @@ impl Ripple {
         loop {
             // A child may report EOF together with its final nonempty batch.
             // Its last batch has finished probing before another read begins.
-            for side in 0..2 {
-                if children[side].done && !self.sides[side].done {
+            for (side, child) in children.iter().enumerate() {
+                if child.done && !self.sides[side].done {
                     self.finish_side(side)?;
                 }
             }
@@ -286,7 +286,14 @@ impl Ripple {
         cap: usize,
     ) -> Result<Option<Buffer>> {
         let mut output = Buffer::new(ctx, vars, 0)?;
-        let _pairs = ctx.charge(cap as u64 * (8 + vars.len() as u64 * 8) + 256)?;
+        // Candidate pairs, both original and filtered row-position arrays, the
+        // merged table, its mask and output capacity coexist before reconciliation.
+        // Include vector growth and the columns' metadata before allocating them.
+        let _pairs = ctx.charge(
+            (cap as u64)
+                .saturating_mul(64 + vars.len() as u64 * 32)
+                .saturating_add(vars.len() as u64 * 96 + 512),
+        )?;
         let mut pairs: Vec<(u32, u32)> = Vec::with_capacity(cap.min(1 << 16));
         while output.table.len == 0 {
             ctx.check()?;

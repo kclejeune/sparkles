@@ -32,7 +32,7 @@ fn load(store: &Store, data: String) {
 /// The features of product `p`: a few of a shared pool, so products overlap.
 fn features(p: usize) -> Vec<usize> {
     (0..FEATURES)
-        .filter(|f| (p * 7 + f * 3) % 5 == 0 || (p + f) % 11 == 0)
+        .filter(|f| (p * 7 + f * 3).is_multiple_of(5) || (p + f).is_multiple_of(11))
         .collect()
 }
 
