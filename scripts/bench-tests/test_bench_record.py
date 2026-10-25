@@ -594,6 +594,24 @@ esac
             "start sparkles", "warm u a", "warm u b", "time sparkles", "stop sparkles",
             "start jena", "warm u a", "warm u b", "time jena", "stop jena", "check-stop sparkles jena"])
 
+    def test_answer_only_check_never_has_two_servers_running(self):
+        stubs = """
+        resolve_tools() { :; }; suite_manifest() { :; }; load_all() { :; }
+        python3() { :; }; log() { :; }; sleep() { :; }; setj() { :; }; rss_of() { echo 1; }
+        start() { [ ! -f active ] || return 1; echo "$1" > active; echo "start $1"; }
+        stop() { if [ -f active ]; then echo "stop $1"; rm active; fi; }
+        answer_check() { [ "$(cat active)" = "$ENGINES" ] || exit 3; echo "check $ENGINES"; }
+        """
+        with tempfile.TemporaryDirectory() as d:
+            env = dict(os.environ, ROOT=os.path.dirname(SCRIPTS), WORK=d, ENGINES="sparkles jena")
+            lib, suite = os.path.join(SCRIPTS, "bench-lib.sh"), os.path.join(SCRIPTS, "bench-suite-lib.sh")
+            script = (f'source "{lib}"; source "{suite}"; {stubs}\n'
+                      "NAMES=(a); SUITE=s SCALE=1 SKIP_LOAD=1 ANSWERS_ONLY=1; suite_run")
+            p = subprocess.run(["bash", "-c", script], cwd=d, env=env, capture_output=True, text=True)
+        self.assertEqual(p.returncode, 0, p.stderr)
+        self.assertEqual(p.stdout.splitlines(), ["start sparkles", "check sparkles", "stop sparkles",
+                                               "start jena", "check jena", "stop jena"])
+
     def test_an_engine_that_does_not_start_is_left_out_and_the_run_fails(self):
         stubs = """
         resolve_tools() { :; }; suite_manifest() { :; }; load_all() { :; }; start_all() { :; }

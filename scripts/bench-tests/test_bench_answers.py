@@ -99,6 +99,10 @@ class StreamedTSVTests(unittest.TestCase):
                 self.record(text)
         with self.assertRaises(ValueError):
             ba.streamed_tsv_record(io.BytesIO(b'?a\n'), 'SELECT ?a {} ORDER BY ?a', False)
+        truncated = io.BytesIO(b'?a\t?b\n<urn:a>\t"x"\n')
+        truncated.length = 20  # The server declared more bytes, even though the last row is whole.
+        with self.assertRaisesRegex(ValueError, "incomplete HTTP"):
+            ba.streamed_tsv_record(truncated, 'SELECT ?a ?b {}', False)
 
     def test_raw_capture_is_complete_and_failed_capture_is_removed(self):
         with tempfile.TemporaryDirectory() as d:
@@ -415,6 +419,15 @@ class Handler(http.server.BaseHTTPRequestHandler):
         n = int(self.headers.get("Content-Length") or 0)
         sent = self.rfile.read(n).decode()
         Handler.bodies.append((self.path, sent))
+        if self.path in ("/tsv", "/tsv-short"):
+            body = b'?x\n"1"\n"2"\n'
+            self.send_response(200)
+            self.send_header("Content-Type", "text/tab-separated-values")
+            self.send_header("Content-Length", str(len(body) + (20 if self.path == "/tsv-short" else 0)))
+            self.end_headers()
+            self.wfile.write(body)
+            self.close_connection = True
+            return
         if self.path == "/slow":
             # a body that keeps arriving, so no single wait is long
             self.send_response(200)
@@ -454,17 +467,25 @@ class RequestTests(unittest.TestCase):
         self.tmp = tempfile.TemporaryDirectory()
         self.addCleanup(self.tmp.cleanup)
 
-    def answer(self, path, query, max_time="5", **env):
+    def answer(self, path, query, max_time="5", flags=(), **env):
         qf = os.path.join(self.tmp.name, "q.rq")
         with open(qf, "w") as f:
             f.write(query)
         out = os.path.join(self.tmp.name, "answers.json")
         port = self.server.server_address[1]
         t0 = time.monotonic()
-        subprocess.run([sys.executable, PATH, f"127.0.0.1:{port}{path}", qf, out, "q", "e"],
+        subprocess.run([sys.executable, PATH, f"127.0.0.1:{port}{path}", qf, out, "q", "e", *flags],
                        env=dict(os.environ, MAX_TIME=max_time, **env), capture_output=True, text=True)
         with open(out) as f:
             return json.load(f)["q"]["e"], time.monotonic() - t0
+
+    def test_streamed_tsv_path_is_wired_and_detects_an_incomplete_http_body(self):
+        rec, _ = self.answer("/tsv", "SELECT ?x {}", flags=("--stream-tsv",))
+        self.assertEqual(rec["rows"], 2)
+        self.assertTrue(rec["value"].startswith("row-sha256-v1:"))
+        bad, _ = self.answer("/tsv-short", "SELECT ?x {}", flags=("--stream-tsv",))
+        self.assertEqual(bad["rows"], "error")
+        self.assertIn("incomplete HTTP", bad["error"])
 
     def test_the_whole_request_has_a_deadline(self):
         rec, took = self.answer("/slow", "SELECT ?x { ?s ?p ?x }", max_time="1")

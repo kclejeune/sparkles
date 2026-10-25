@@ -79,6 +79,7 @@ case for one query is twice MAX_TIME.
 """
 
 import hashlib
+import functools
 import json
 import os
 import re
@@ -677,6 +678,13 @@ def sorted_row_digest(path, directory):
     return "row-sha256-v1:" + h.hexdigest()
 
 
+@functools.lru_cache(maxsize=8192)
+def canonical_tsv_field(text):
+    """Cache a bounded number of repeated RDF terms, never solution rows."""
+    parsed = tsv_term(text)
+    return repr(term(parsed, False)), repr(term(parsed, True))
+
+
 def streamed_tsv_record(response, query, count_only, raw_path=None):
     """Consume a complete unordered SELECT response with one row in memory.
 
@@ -711,12 +719,13 @@ def streamed_tsv_record(response, query, count_only, raw_path=None):
                         fields = text.split("\t")
                         if len(fields) != len(names):
                             raise ValueError("SPARQL TSV row has the wrong number of fields")
-                        terms = [tsv_term(fields[i]) for i in order]
+                        terms = [canonical_tsv_field(fields[i]) for i in order]
                         rows += 1
                         if count_only:
                             continue
-                        ex = repr(tuple(term(t, False) for t in terms)).encode()
-                        va = repr(tuple(term(t, True) for t in terms)).encode()
+                        end = ",)" if len(terms) == 1 else ")"
+                        ex = ("(" + ", ".join(t[0] for t in terms) + end).encode()
+                        va = ("(" + ", ".join(t[1] for t in terms) + end).encode()
                         eh = hashlib.sha256(ex).hexdigest().encode() + b"\n"
                         if value is None and ex != va:
                             exact.flush()
@@ -727,6 +736,8 @@ def streamed_tsv_record(response, query, count_only, raw_path=None):
                         exact.write(eh)
                         if value is not None:
                             value.write(eh if ex == va else hashlib.sha256(va).hexdigest().encode() + b"\n")
+                    if getattr(response, "length", 0):
+                        raise ValueError("incomplete HTTP response body")
             finally:
                 if value is not None:
                     value.close()
