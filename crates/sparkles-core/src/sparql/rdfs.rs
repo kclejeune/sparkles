@@ -78,9 +78,19 @@ impl RdfsSchema {
     /// The schema of these triples: their `rdfs:subClassOf`, `rdfs:subPropertyOf`,
     /// `rdfs:domain` and `rdfs:range` statements between IRIs.
     pub fn from_triples<'a>(triples: impl IntoIterator<Item = &'a Triple>) -> RdfsSchema {
+        Self::from_triples_controlled(triples, &mut || Ok(())).expect("unlimited schema build")
+    }
+
+    /// Build a schema while checking the caller's cancellation and deadline controls.
+    pub fn from_triples_controlled<'a>(
+        triples: impl IntoIterator<Item = &'a Triple>,
+        check: &mut dyn FnMut() -> Result<()>,
+    ) -> Result<RdfsSchema> {
+        check()?;
         let mut s = RdfsSchema::default();
         let (mut sc, mut sp) = (Map::new(), Map::new());
         for t in triples {
+            check()?;
             let p = t.predicate.as_ref();
             let edges = if p == rdfs::SUB_CLASS_OF {
                 &mut sc
@@ -103,9 +113,9 @@ impl RdfsSchema {
                 s.triples += 1;
             }
         }
-        (s.sup_class, s.sub_class) = closure(&sc);
-        (s.sup_prop, s.sub_prop) = closure(&sp);
-        s
+        (s.sup_class, s.sub_class) = closure_controlled(&sc, check)?;
+        (s.sup_prop, s.sub_prop) = closure_controlled(&sp, check)?;
+        Ok(s)
     }
 
     /// Whether the schema changes no answer.
@@ -209,13 +219,15 @@ fn pairs(m: &Map) -> Vec<[NamedNode; 2]> {
 
 /// The transitive closure of direct edges `a → b` as (strict successors, strict
 /// predecessors): the nodes reachable in one or more steps (Jena's `Transitive`).
-fn closure(edges: &Map) -> (Map, Map) {
+fn closure_controlled(edges: &Map, check: &mut dyn FnMut() -> Result<()>) -> Result<(Map, Map)> {
     let mut up = Map::new();
     let mut down = Map::new();
     for start in edges.keys() {
+        check()?;
         let mut seen = Set::new();
         let mut stack: Vec<&NamedNode> = edges[start].iter().collect();
         while let Some(n) = stack.pop() {
+            check()?;
             if seen.insert(n.clone())
                 && let Some(next) = edges.get(n)
             {
@@ -227,7 +239,7 @@ fn closure(edges: &Map) -> (Map, Map) {
         }
         up.insert(start.clone(), seen);
     }
-    (up, down)
+    Ok((up, down))
 }
 
 /// Where RDFS on read takes its schema from.
@@ -269,6 +281,16 @@ impl RdfsOnRead {
     /// The schema a query of `snap` uses. A graph source is read again when the snapshot
     /// is another state than the one read last.
     pub fn schema(&self, snap: &Snapshot) -> Result<Arc<RdfsSchema>> {
+        self.schema_controlled(snap, &mut || Ok(()))
+    }
+
+    /// Read or build this snapshot's schema within the request's controls.
+    pub fn schema_controlled(
+        &self,
+        snap: &Snapshot,
+        check: &mut dyn FnMut() -> Result<()>,
+    ) -> Result<Arc<RdfsSchema>> {
+        check()?;
         let graph = match &self.source {
             SchemaSource::Fixed(s) => return Ok(s.clone()),
             SchemaSource::Graph(g) => g,
@@ -284,7 +306,7 @@ impl RdfsOnRead {
         {
             return Ok(s.clone());
         }
-        let s = Arc::new(schema_of_graph(snap, graph.as_deref())?);
+        let s = Arc::new(schema_of_graph_controlled(snap, graph.as_deref(), check)?);
         *self.last.lock() = Some((key, s.clone()));
         Ok(s)
     }
@@ -292,6 +314,15 @@ impl RdfsOnRead {
 
 /// The schema in graph `graph` (`None`: the default graph) of a snapshot.
 pub fn schema_of_graph(snap: &Snapshot, graph: Option<&str>) -> Result<RdfsSchema> {
+    schema_of_graph_controlled(snap, graph, &mut || Ok(()))
+}
+
+fn schema_of_graph_controlled(
+    snap: &Snapshot,
+    graph: Option<&str>,
+    check: &mut dyn FnMut() -> Result<()>,
+) -> Result<RdfsSchema> {
+    check()?;
     let g = match graph {
         None => Id::DEFAULT_GRAPH,
         Some(iri) => match snap.lookup_iri(iri) {
@@ -309,23 +340,36 @@ pub fn schema_of_graph(snap: &Snapshot, graph: Option<&str>) -> Result<RdfsSchem
         let Some(pid) = snap.lookup_iri(p.as_str()) else {
             continue;
         };
-        for k in snap.scan_keys(Perm::Pos, &[pid.0])? {
+        let mut visit = |k: crate::index::Key| -> Result<()> {
+            check()?;
             let q = Perm::Pos.to_quad(&k);
             if q[3] != g {
-                continue;
+                return Ok(());
             }
             let (Some(s), Some(o)) = (snap.term(q[0]), snap.term(q[2])) else {
-                continue;
+                return Ok(());
             };
             let s = match s {
                 Term::NamedNode(n) => oxrdf::NamedOrBlankNode::NamedNode(n),
                 Term::BlankNode(b) => oxrdf::NamedOrBlankNode::BlankNode(b),
-                _ => continue,
+                _ => return Ok(()),
             };
             triples.push(Triple::new(s, p.into_owned(), o));
-        }
+            Ok(())
+        };
+        snap.scan(Perm::Pos, &[pid.0], |chunk| {
+            match chunk {
+                crate::store::Chunk::Block(block, start, end) => {
+                    for i in start..end {
+                        visit(block.key(i))?;
+                    }
+                }
+                crate::store::Chunk::Row(key) => visit(key)?,
+            }
+            Ok(true)
+        })?;
     }
-    Ok(RdfsSchema::from_triples(&triples))
+    RdfsSchema::from_triples_controlled(&triples, check)
 }
 
 /// The query pattern with RDFS on read applied, when the context has a schema.
@@ -1223,5 +1267,37 @@ fn blank_to_var(gp: &mut GraphPattern) {
         | G::OrderBy { inner, .. }
         | G::Group { inner, .. } => blank_to_var(inner),
         G::Service { .. } | G::Values { .. } => {}
+    }
+}
+
+#[cfg(test)]
+mod control_tests {
+    use super::*;
+
+    #[test]
+    fn closure_build_checks_controls_inside_hierarchy_traversal() {
+        let triples: Vec<_> = (0..30)
+            .map(|i| {
+                Triple::new(
+                    NamedNode::new(format!("http://ex.org/C{i}")).unwrap(),
+                    rdfs::SUB_CLASS_OF.into_owned(),
+                    NamedNode::new(format!("http://ex.org/C{}", i + 1)).unwrap(),
+                )
+            })
+            .collect();
+        let mut calls = 0;
+        let e = RdfsSchema::from_triples_controlled(&triples, &mut || {
+            calls += 1;
+            if calls == 40 {
+                Err(crate::Error::Cancelled)
+            } else {
+                Ok(())
+            }
+        })
+        .unwrap_err();
+        assert!(matches!(e, crate::Error::Cancelled));
+        assert_eq!(calls, 40);
+        // A cancelled partial build never becomes a cached or complete schema.
+        assert_eq!(RdfsSchema::from_triples(&triples).counts()[0], 30);
     }
 }

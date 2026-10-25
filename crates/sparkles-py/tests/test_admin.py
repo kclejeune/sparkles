@@ -271,3 +271,15 @@ def test_shex_write_validation() -> None:
     assert ds.validation.guard.get()["language"] == "shex"  # type: ignore[index]
     with pytest.raises(WriteRejectedError):
         ds.add(Triple(ex("bob"), RDF_TYPE, ex("Person")))
+
+
+@pytest.mark.skipif("reasoning" not in sparkles.FEATURES, reason="built without reasoning")
+def test_demand_and_why_not_explanations() -> None:
+    ds = Dataset()
+    ds.update("INSERT DATA { <http://ex.org/tom> a <http://ex.org/Cat> . <http://ex.org/Cat> <http://www.w3.org/2000/01/rdf-schema#subClassOf> <http://ex.org/Animal> . }")
+    why = ds.reasoning.explain("<http://ex.org/tom> a <http://ex.org/Animal>", source="demand", profile="rdfs")
+    assert why["entailed"] is True and why["source"] == "demand"
+    missing = ds.reasoning.explain("<http://ex.org/tom> a <http://ex.org/Plant>", mode="whyNot", profile="rdfs", max_depth=2, max_missing=1, max_hypotheses=3)
+    assert missing["mode"] == "whyNot" and missing["entailed"] is False
+    assert missing["hypotheses"]
+    assert all(len(h["missing"]) == 1 for h in missing["hypotheses"])

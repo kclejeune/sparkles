@@ -2299,7 +2299,7 @@ export interface paths {
         put?: never;
         /**
          * Explain why a triple is inferred
-         * @description Derivation trees for a triple of the materialized inferences or of what RDFS on read answers, searched from the facts the caller reads. Mode `whyNot` answers `501`. A triple with no derivation from readable facts answers `404` with code `no-visible-derivation`, as one that is not entailed does, and a search over its limits answers `422` with code `reasoning-budget`.
+         * @description Derivation trees for a triple of the materialized inferences or of what RDFS on read answers, searched from the facts the caller reads. Mode `whyNot` returns verified sets of missing facts. Source `demand` derives from the current visible inputs, with an explicit profile when the dataset has no recorded program. A bounded partial tree marks unexplained premises. A triple with no derivation from readable facts answers `404` with code `no-visible-derivation`, as one that is not entailed does, and a search over its limits answers `422` with code `reasoning-budget`.
          */
         post: operations["explainInference"];
         delete?: never;
@@ -5458,12 +5458,22 @@ export interface components {
         };
         /** @description A node of a derivation tree. */
         Derivation: {
+            bindings?: {
+                [key: string]: components["schemas"]["RdfTerm"];
+            };
+            builtins?: {
+                call: string;
+                /** @constant */
+                holds: true;
+            }[];
             depth: number;
+            generalized?: boolean;
             /** @description For an asserted node, `default` or the IRI of the graph that holds the triple. Absent for a triple of an RDFS-on-read schema given as a document. */
             graph?: string;
             id: number;
             /** @enum {string} */
-            kind: "asserted" | "axiom" | "derived" | "ref";
+            kind: "asserted" | "axiom" | "derived" | "ref" | "unexplained";
+            missing?: boolean;
             premises?: components["schemas"]["Derivation"][];
             rule?: {
                 name: string;
@@ -5878,17 +5888,21 @@ export interface components {
             /** @description The commit the search read. */
             commit: number;
             commitsSince?: number;
-            /** @constant */
-            entailed: true;
-            /** @constant */
-            mode: "why";
-            more: boolean;
-            readAtHead?: boolean;
+            complete?: boolean;
+            entailed: boolean;
+            hypotheses?: Record<string, never>[];
             /** @enum {string} */
-            source: "materialized" | "rdfsOnRead";
+            mode: "why" | "whyNot";
+            more?: boolean;
+            partial?: boolean;
+            readAtHead?: boolean;
+            reason?: string;
+            rules?: Record<string, never>[];
+            /** @enum {string} */
+            source?: "materialized" | "rdfsOnRead" | "demand";
             stale?: boolean | null;
             staleReason?: string;
-            trees: components["schemas"]["Derivation"][];
+            trees?: components["schemas"]["Derivation"][];
         };
         /** @enum {string} */
         FormatLanguage: "sparql" | "turtle" | "trig" | "ntriples" | "nquads" | "jsonld";
@@ -15708,7 +15722,6 @@ export interface operations {
             403: components["responses"]["Forbidden"];
             404: components["responses"]["NotFound"];
             422: components["responses"]["Unprocessable"];
-            501: components["responses"]["NotImplemented"];
             default: components["responses"]["Error"];
         };
     };

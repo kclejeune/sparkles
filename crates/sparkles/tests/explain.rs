@@ -37,7 +37,7 @@ fn only(graphs: &[&str]) -> Option<Arc<GraphAccess>> {
 fn found(e: Explained) -> Vec<Derivation> {
     match e {
         Explained::Found { trees, .. } => trees,
-        Explained::NotFound => panic!("no derivation"),
+        Explained::NotFound | Explained::Partial { .. } => panic!("no complete derivation"),
     }
 }
 
@@ -123,10 +123,9 @@ fn stale_inferences_are_explained_at_their_run() {
     let rec = ds.reasoning().record().unwrap();
     ds.update("DELETE DATA { GRAPH <http://ex.org/hr> { <http://ex.org/alice> <http://ex.org/manages> <http://ex.org/team7> } }")
         .unwrap();
-    let e = ds
-        .reasoning()
-        .explain(&ExplainRequest::new([ex("alice"), ty(), ex("Employee")]))
-        .unwrap();
+    let mut req = ExplainRequest::new([ex("alice"), ty(), ex("Employee")]);
+    req.source = Some(ExplainSource::Materialized);
+    let e = ds.reasoning().explain(&req).unwrap();
     assert_eq!(Some(e.commit), rec.commit);
     assert!(!e.read_at_head);
     let t = &found(e.explained)[0];
@@ -397,4 +396,102 @@ fn a_document_schema_explains_only_the_facts_of_its_closure() {
             }
         }
     }
+}
+
+#[cfg(feature = "reasoning")]
+#[test]
+fn auto_explanations_derive_current_facts_when_materialization_is_stale() {
+    let (_dir, ds) = materialized();
+    ds.update("DELETE DATA { GRAPH <http://ex.org/hr> { <http://ex.org/alice> <http://ex.org/manages> <http://ex.org/team7> } }").unwrap();
+    let e = ds
+        .reasoning()
+        .explain(&ExplainRequest::new([ex("alice"), ty(), ex("Employee")]))
+        .unwrap();
+    assert_eq!(e.source, Some(ExplainSource::Demand));
+    assert_eq!(e.commit, ds.snapshot().commit);
+    assert!(matches!(e.explained, Explained::NotFound));
+}
+
+#[cfg(feature = "reasoning")]
+#[test]
+fn demand_and_why_not_work_without_materialization_and_enforce_visibility() {
+    use sparkles::reasoning::explain::{ExplainMode, explanation_json};
+    let ds = Dataset::memory();
+    ds.load_str("@prefix ex: <http://ex.org/> . @prefix rdfs: <http://www.w3.org/2000/01/rdf-schema#> . ex:hr { ex:alice a ex:Manager . } ex:ontology { ex:Manager rdfs:subClassOf ex:Employee . }",RdfFormat::TriG).unwrap();
+    let mut req = ExplainRequest::new([ex("alice"), ty(), ex("Employee")]);
+    req.profile = Some("rdfs".into());
+    // The default input is the default graph, so use a fresh materialized dataset's
+    // recorded graph selection for the visible-view case below.
+    let e = ds.reasoning().explain(&req).unwrap();
+    assert!(matches!(e.explained, Explained::NotFound));
+    let ds = Dataset::memory();
+    ds.load_str("@prefix ex: <http://ex.org/> . @prefix rdfs: <http://www.w3.org/2000/01/rdf-schema#> . ex:alice a ex:Manager . ex:Manager rdfs:subClassOf ex:Employee .",RdfFormat::Turtle).unwrap();
+    let e = ds.reasoning().explain(&req).unwrap();
+    assert_eq!(explanation_json(&e)["entailed"], true);
+    req.access = only(&[ONTO]);
+    let e = ds.reasoning().explain(&req).unwrap();
+    assert_eq!(explanation_json(&e)["entailed"], false);
+    req.access = None;
+    req.mode = ExplainMode::WhyNot;
+    req.triple[2] = ex("Director");
+    req.max_depth = 2;
+    req.max_hypotheses = 3;
+    let e = ds.reasoning().explain(&req).unwrap();
+    let j = explanation_json(&e);
+    assert_eq!(j["mode"], "whyNot");
+    assert_eq!(j["entailed"], false);
+    assert!(!j["hypotheses"].as_array().unwrap().is_empty());
+}
+
+#[cfg(feature = "reasoning")]
+#[test]
+fn rdfs_on_read_grafts_a_materialized_premise_to_visible_assertions() {
+    use sparkles::reasoning::rdfs::NewSchema;
+    let (_dir, ds) = materialized();
+    ds.reasoning()
+        .rdfs()
+        .set(NewSchema::Triples(vec![oxrdf::Triple::new(
+            NamedNode::new("http://ex.org/Employee").unwrap(),
+            oxrdf::vocab::rdfs::SUB_CLASS_OF.into_owned(),
+            NamedNode::new("http://ex.org/Person").unwrap(),
+        )]))
+        .unwrap();
+    let e = ds
+        .reasoning()
+        .explain(&ExplainRequest::new([ex("alice"), ty(), ex("Person")]))
+        .unwrap();
+    assert_eq!(e.source, Some(ExplainSource::RdfsOnRead));
+    let trees = found(e.explained);
+    fn leaves(d: &Derivation) {
+        assert_ne!(d.graph.as_deref(), Some("urn:x-sparkles:inferred"));
+        for p in &d.premises {
+            leaves(p);
+        }
+    }
+    for t in trees {
+        leaves(&t);
+        assert!(t.depth >= 3);
+    }
+}
+
+#[cfg(feature = "reasoning")]
+#[test]
+fn explicit_materialized_with_rdfs_can_explain_a_stale_inferred_premise() {
+    use sparkles::reasoning::rdfs::NewSchema;
+    let (_dir, ds) = materialized();
+    ds.reasoning()
+        .rdfs()
+        .set(NewSchema::Triples(vec![oxrdf::Triple::new(
+            NamedNode::new("http://ex.org/Employee").unwrap(),
+            oxrdf::vocab::rdfs::SUB_CLASS_OF.into_owned(),
+            NamedNode::new("http://ex.org/Person").unwrap(),
+        )]))
+        .unwrap();
+    ds.update("DELETE DATA { GRAPH <http://ex.org/hr> { <http://ex.org/alice> <http://ex.org/manages> <http://ex.org/team7> } }").unwrap();
+    let mut req = ExplainRequest::new([ex("alice"), ty(), ex("Person")]);
+    req.source = Some(ExplainSource::Materialized);
+    let e = ds.reasoning().explain(&req).unwrap();
+    assert_eq!(e.source, Some(ExplainSource::RdfsOnRead));
+    assert_eq!(e.freshness.unwrap().stale, Some(true));
+    found(e.explained);
 }

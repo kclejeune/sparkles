@@ -5803,8 +5803,35 @@
           "url": "https://github.com/kclejeune/sparkles/blob/main/docs/API.md#explanations"
         },
         "properties": {
+          "bindings": {
+            "additionalProperties": {
+              "$ref": "#/components/schemas/RdfTerm"
+            },
+            "type": "object"
+          },
+          "builtins": {
+            "items": {
+              "properties": {
+                "call": {
+                  "type": "string"
+                },
+                "holds": {
+                  "const": true
+                }
+              },
+              "required": [
+                "call",
+                "holds"
+              ],
+              "type": "object"
+            },
+            "type": "array"
+          },
           "depth": {
             "type": "integer"
+          },
+          "generalized": {
+            "type": "boolean"
           },
           "graph": {
             "description": "For an asserted node, `default` or the IRI of the graph that holds the triple. Absent for a triple of an RDFS-on-read schema given as a document.",
@@ -5818,9 +5845,13 @@
               "asserted",
               "axiom",
               "derived",
-              "ref"
+              "ref",
+              "unexplained"
             ],
             "type": "string"
+          },
+          "missing": {
+            "type": "boolean"
           },
           "premises": {
             "items": {
@@ -7288,22 +7319,48 @@
           "commitsSince": {
             "type": "integer"
           },
+          "complete": {
+            "type": "boolean"
+          },
           "entailed": {
-            "const": true
+            "type": "boolean"
+          },
+          "hypotheses": {
+            "items": {
+              "type": "object"
+            },
+            "type": "array"
           },
           "mode": {
-            "const": "why"
+            "enum": [
+              "why",
+              "whyNot"
+            ],
+            "type": "string"
           },
           "more": {
+            "type": "boolean"
+          },
+          "partial": {
             "type": "boolean"
           },
           "readAtHead": {
             "type": "boolean"
           },
+          "reason": {
+            "type": "string"
+          },
+          "rules": {
+            "items": {
+              "type": "object"
+            },
+            "type": "array"
+          },
           "source": {
             "enum": [
               "materialized",
-              "rdfsOnRead"
+              "rdfsOnRead",
+              "demand"
             ],
             "type": "string"
           },
@@ -7326,10 +7383,7 @@
         "required": [
           "mode",
           "entailed",
-          "commit",
-          "trees",
-          "more",
-          "source"
+          "commit"
         ],
         "type": "object"
       },
@@ -32103,7 +32157,7 @@
     },
     "/$/reason/{ds}/explain": {
       "post": {
-        "description": "Derivation trees for a triple of the materialized inferences or of what RDFS on read answers, searched from the facts the caller reads. Mode `whyNot` answers `501`. A triple with no derivation from readable facts answers `404` with code `no-visible-derivation`, as one that is not entailed does, and a search over its limits answers `422` with code `reasoning-budget`.",
+        "description": "Derivation trees for a triple of the materialized inferences or of what RDFS on read answers, searched from the facts the caller reads. Mode `whyNot` returns verified sets of missing facts. Source `demand` derives from the current visible inputs, with an explicit profile when the dataset has no recorded program. A bounded partial tree marks unexplained premises. A triple with no derivation from readable facts answers `404` with code `no-visible-derivation`, as one that is not entailed does, and a search over its limits answers `422` with code `reasoning-budget`.",
         "externalDocs": {
           "url": "https://github.com/kclejeune/sparkles/blob/main/docs/API.md#explanations"
         },
@@ -32149,9 +32203,6 @@
           },
           "422": {
             "$ref": "#/components/responses/Unprocessable"
-          },
-          "501": {
-            "$ref": "#/components/responses/NotImplemented"
           },
           "default": {
             "$ref": "#/components/responses/Error"

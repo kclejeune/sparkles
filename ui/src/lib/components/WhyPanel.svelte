@@ -209,6 +209,21 @@
         </button>
       {/if}
     </div>
+    {#if open && d.bindings && Object.keys(d.bindings).length}
+      <div class="pad small" aria-label="Rule bindings">
+        {#each Object.entries(d.bindings) as [name, term] (name)}
+          <span class="mono">?{name} = </span><TermView {term} {prefixes} {onopen} />{' '}
+        {/each}
+      </div>
+    {/if}
+    {#if open && d.builtins?.length}
+      <ul aria-label="Passed conditions">
+        {#each d.builtins as b}<li class="mono small">{b.call} ✓</li>{/each}
+      </ul>
+    {/if}
+    {#if d.generalized}<p class="pad small faint">
+        Intermediate rule fact. It is not stored as RDF.
+      </p>{/if}
     {#if kids.length && open}
       <ul role="group">
         {#each kids as k, i (k.id + ':' + i)}
@@ -243,6 +258,9 @@
     <p class="msg pad" class:error-box={result.kind === 'error'} role="status">{result.message}</p>
   {:else if tree}
     {#if stale}<p class="stale pad" role="note"><Icon name="alert" size={13} /> {stale}</p>{/if}
+    {#if explanation?.partial}<p class="pad faint" role="note">
+        Partial derivation. {explanation.reason}
+      </p>{/if}
     <ul class="tree" role="tree" aria-label="Derivation">
       {@render node(tree, true)}
     </ul>

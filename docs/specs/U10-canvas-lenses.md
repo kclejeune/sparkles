@@ -783,3 +783,12 @@ helpers and the route's answers (`why.test.ts`). The mock Playwright suite
 `tests/mock/why.spec.ts` covers A10, the stale note, a past state, no derivation, and A12
 with the keyboard and at 390 px, and `tests/e2e/why.spec.ts` runs A7, A9 and A10 against a real
 server.
+
+
+### F18 explanation extensions, 2026-10-24
+
+[F18 Phase 1](F18-explanations-and-entailment-diffs.md#outcome) extends the same route and
+panel with demand derivations, bounded why-not, bindings and passed builtins. Generalized
+premises and default geometries have proofs. Budget limits can return a partial tree,
+RDFS schema builds honor request controls, and RDFS-on-read trees can graft materialized
+premises. These extensions complete follow-ups 135 to 139.

@@ -3349,6 +3349,23 @@ answer. It exits with 1 when no derivation is found and 2 when the search runs o
 budget. The MCP tool `explain_inference` and the library call
 `Dataset::reasoning().explain` answer the same way.
 
+A derived node also shows the values its rule bound and the conditions the instance
+passed. Generalized intermediate facts are labeled, and a partial response marks the
+premises that need a separate explanation.
+
+![Explore showing a verified hypothesis for a missing type](images/explore-why-not.png)
+
+Expand **Why not…?** in a resource's properties, enter a property and value, and choose
+**Find missing facts**. The panel lists small sets of facts that would derive that
+triple, with a verified tree for each set. Blank-node placeholders stand for a fresh
+resource shared by those facts. A failed condition is shown with its blocking fact when
+available. The search changes no data and says when other possibilities may exist.
+
+Use `sparkles infer --loc DB --why-not '<http://ex.org/rex> a ex:Pet' --max-missing 2`
+for the same answer in the CLI. `--source demand` derives from current inputs, and
+`--profile owl-rl` selects a program when none is recorded. `--source materialized`
+explains the recorded materialization at its original commit, including stale facts.
+
 ## The validation overlay
 
 Explore can badge the SHACL and ShEx results of the nodes it draws. When the dataset has a

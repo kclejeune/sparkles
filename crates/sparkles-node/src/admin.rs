@@ -916,25 +916,24 @@ fn run_admin(
             use sparkles::reasoning::explain as ex;
             let text = a["triple"].as_str().unwrap_or_default();
             let prefixes: Vec<(String, String)> = ds.prefixes().into_iter().collect();
-            let mut req = ex::ExplainRequest::new(ex::triple_from_text(text, &prefixes)?);
-            if let Some(n) = a["maxTrees"].as_u64() {
-                if !(1..=ex::MAX_TREES as u64).contains(&n) {
-                    return Err(sparkles::Error::invalid(format!(
-                        "maxTrees must be from 1 to {}",
-                        ex::MAX_TREES
-                    )));
+            let triple = ex::triple_from_text(text, &prefixes)?;
+            let term = ex::term_json;
+            let mut request =
+                json!({"triple":{"s":term(&triple[0]),"p":term(&triple[1]),"o":term(&triple[2])}});
+            for key in [
+                "mode",
+                "source",
+                "profile",
+                "maxTrees",
+                "maxDepth",
+                "maxMissing",
+                "maxHypotheses",
+            ] {
+                if let Some(value) = a.get(key) {
+                    request[key] = value.clone();
                 }
-                req.max_trees = n as usize;
             }
-            if let Some(n) = a["maxDepth"].as_u64() {
-                if !(1..=ex::MAX_DEPTH as u64).contains(&n) {
-                    return Err(sparkles::Error::invalid(format!(
-                        "maxDepth must be from 1 to {}",
-                        ex::MAX_DEPTH
-                    )));
-                }
-                req.max_depth = n as u32;
-            }
+            let (mut req, _, _) = ex::request_from_json(&request)?;
             req.timeout = ctl
                 .deadline
                 .map(|d| d.saturating_duration_since(Instant::now()));

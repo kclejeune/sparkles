@@ -958,13 +958,29 @@ ex:Cat rdfs:subClassOf ex:Animal . ex:tom a ex:Cat .
         .structured("explain_inference", json!({"triple": "ex:tom a ex:Plant"}))
         .await;
     assert_eq!(s["entailed"], false, "{s}");
-    let (t, _) = c
-        .error(
+    let why_not = c
+        .structured(
             "explain_inference",
-            json!({"triple": "ex:tom a ex:Animal", "mode": "whyNot"}),
+            json!({"triple":"ex:tom a ex:Animal","mode":"whyNot"}),
         )
         .await;
-    assert!(t.contains("whyNot"), "{t}");
+    assert_eq!(why_not["mode"], "whyNot");
+    assert_eq!(why_not["entailed"], true);
+    let missing = c
+        .structured(
+            "explain_inference",
+            json!({"triple":"ex:tom a ex:Plant","mode":"whyNot","maxDepth":2,"maxHypotheses":3}),
+        )
+        .await;
+    assert_eq!(missing["entailed"], false);
+    assert!(
+        !missing["hypotheses"].as_array().unwrap().is_empty(),
+        "{missing}"
+    );
+    let empty = c
+        .structured("why_empty", json!({"query":"ASK { ex:tom a ex:Plant }"}))
+        .await;
+    assert_eq!(empty["first"]["whyNot"]["mode"], "whyNot", "{empty}");
     let (t, _) = c
         .error("explain_inference", json!({"triple": "ex:tom a"}))
         .await;

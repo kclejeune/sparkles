@@ -23,13 +23,6 @@ pub(super) async fn explain(
         .map_err(|e| err(StatusCode::BAD_REQUEST, format!("invalid JSON: {e}")))?;
     let (mut req, mode, timeout) =
         explain::request_from_json(&j).map_err(|e| err(StatusCode::BAD_REQUEST, e.to_string()))?;
-    if mode == ExplainMode::WhyNot {
-        return Err(err_code(
-            StatusCode::NOT_IMPLEMENTED,
-            "not-implemented",
-            "whyNot explanations are not available: only mode \"why\" is",
-        ));
-    }
     req.timeout = Some(timeout_of(&st.limits, st.default_timeout, timeout));
     req.access = p.view(&ds.name, Endpoint::Query);
     // the search and the answer it builds are held to a query's memory budget
@@ -52,7 +45,8 @@ pub(super) async fn explain(
             }
             Err(e) => return Err(e.into()),
         };
-        if matches!(e.explained, sparkles::explain::Explained::NotFound) {
+        if mode == ExplainMode::Why && matches!(e.explained, sparkles::explain::Explained::NotFound)
+        {
             return Err(err_code(
                 StatusCode::NOT_FOUND,
                 NO_VISIBLE_DERIVATION,

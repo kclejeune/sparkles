@@ -34,6 +34,7 @@ pub mod query;
 mod specialize;
 pub mod tables;
 mod terms;
+pub mod whynot;
 
 pub use extras::{Extras, UnknownVocabulary, Vocabulary};
 pub use inputs::{
@@ -681,7 +682,16 @@ impl Derivation {
 }
 
 /// The rules of a profile with the axioms of the vocabularies of `extras`.
-fn profile_rules(profile: &Profile, extras: &Extras) -> anyhow::Result<Vec<Rule>> {
+/// The profile or vocabulary each rule of [`profile_rules`] comes from, by its name.
+pub(crate) fn rule_sources(profile: &Profile, extras: &Extras) -> anyhow::Result<Vec<String>> {
+    let mut out = vec![profile.name().to_string(); profile.rules()?.len()];
+    for v in &extras.vocabularies {
+        out.extend(std::iter::repeat_n(v.name().to_string(), v.rules()?.len()));
+    }
+    Ok(out)
+}
+
+pub(crate) fn profile_rules(profile: &Profile, extras: &Extras) -> anyhow::Result<Vec<Rule>> {
     let mut rules = profile
         .rules()
         .with_context(|| format!("parsing rules for profile '{}'", profile.name()))?;

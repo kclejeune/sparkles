@@ -11,11 +11,15 @@ export type WhyTriple = { s: Term; p: Term; o: Term };
 export type Derivation = {
   id: number;
   triple: WhyTriple;
-  kind: 'asserted' | 'axiom' | 'derived' | 'ref';
+  kind: 'asserted' | 'axiom' | 'derived' | 'ref' | 'unexplained';
   depth: number;
   graph?: string;
   rule?: { name: string; profile: string; owl2rl?: string };
   premises?: Derivation[];
+  bindings?: Record<string, Term>;
+  builtins?: { call: string; holds: true }[];
+  generalized?: boolean;
+  missing?: boolean;
   /** A repeat of the node with this id given earlier, without its premises. */
   shared?: boolean;
 };
@@ -24,7 +28,9 @@ export type Explanation = {
   mode: 'why';
   entailed: true;
   commit: number;
-  source: 'materialized' | 'rdfsOnRead';
+  source: 'materialized' | 'rdfsOnRead' | 'demand';
+  partial?: boolean;
+  reason?: string;
   trees: Derivation[];
   more: boolean;
   readAtHead?: boolean;
@@ -160,6 +166,8 @@ export function how(d: Derivation, graphLabel: (g: string) => string = (g) => g)
       return d.graph ? `asserted · graph ${graphLabel(d.graph)}` : 'asserted · RDFS schema';
     case 'axiom':
       return `axiom${d.rule ? ` · ${d.rule.name}` : ''}`;
+    case 'unexplained':
+      return 'not explained within the search budget';
     case 'ref':
       return 'derived deeper than shown';
     default: {
@@ -232,4 +240,30 @@ export function staleNote(e: Explanation): string | null {
     return `These inferences are out of date. This tree shows them as computed at commit ${e.commit}.${since}`;
   }
   return null;
+}
+
+export type WhyNotExplanation = {
+  mode: 'whyNot';
+  entailed: boolean;
+  commit: number;
+  rules?: {
+    name: string;
+    unifier: Record<string, Term>;
+    blockedBy?: { call: string; fact?: WhyTriple }[];
+  }[];
+  hypotheses?: { missing: WhyTriple[]; placeholders: string[]; tree: Derivation }[];
+  complete?: boolean;
+};
+
+export function explainMissing(
+  ds: string,
+  triple: WhyTriple,
+  signal?: AbortSignal,
+): Promise<WhyNotExplanation> {
+  return api.json<WhyNotExplanation>(`/$/reason/${encodeURIComponent(ds)}/explain`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ triple, mode: 'whyNot', maxMissing: 2, maxHypotheses: 10 }),
+    signal,
+  });
 }

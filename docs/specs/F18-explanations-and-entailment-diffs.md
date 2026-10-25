@@ -517,9 +517,42 @@ naming `cax-sco` (OWL 2 RL) or `rdfs9` (RDFS).
 
 ## Outcome
 
-Not built as F18. The `why` mode of `POST /$/reason/{ds}/explain` shipped first with
+Phase 1 extends the `why` mode of `POST /$/reason/{ds}/explain` shipped first with
 [U10 Phase 3](U10-canvas-lenses.md#phase-3-2026-10-24), and the rest is
 [ROADMAP](../ROADMAP.md) item 18.
+
+### Phase 1, 2026-10-24
+
+The existing explanation route and response gain demand derivations, bounded why-not,
+rule bindings, passed builtins, generalized premises and partial trees. The demand
+session keeps facts before linear-recursion rewriting so every intermediate fact still
+has an instance of an original rule. A backward search over those facts computes
+well-founded proof depths rather than relying on row order. Materialized explanations
+fall back to that same demand search when a stored conclusion needs generalized
+premises. Default geometries have a `geo-default-geometry` proof.
+
+Why-not unfolds candidate rules, shares placeholders across missing atoms, and verifies
+only RDF hypotheses on uncached overlays. Repeated atoms count as one missing fact.
+Ground builtin checks use the rule evaluator, and `noValue` blockers name their facts.
+The search reports truncation through `complete`. It uses additional bounds on matching,
+partial instances and verified hypotheses, and it declines hypotheses for term-generating
+rules. Candidate rules are still listed. It ranks by size, vocabulary and equality
+changes, proof length and placeholders, preserving acceptance example A3's useful range
+and subclass hypotheses.
+
+The HTTP route, library, CLI, MCP tool and Python and Node bindings expose both modes.
+Explore shows rule details and a Why-not form. `why_empty` attaches verified hypotheses
+to a grounded failing intensional pattern at the diagnosis's own visible snapshot.
+Query-cell actions remain roadmap item 285, as the phase plan allowed. Pattern abduction
+with unbound target variables remains item 286 and needs a target-pattern API beyond
+§2.1's ground triple.
+
+RDFS schema scans and closure builds check the query or explanation controls. Mixed
+RDFS-on-read derivations graft the materialized premise's proof at its recorded commit,
+including an explicitly selected stale materialization. The response's freshness note
+applies to that inferred component. These changes complete roadmap items 135 to 139.
+
+Phase 2 and Phase 3 remain below item 18. No on-disk format changes are needed.
 
 ### U10 Phase 3, 2026-10-24
 

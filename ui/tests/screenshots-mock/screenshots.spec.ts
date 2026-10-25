@@ -1083,3 +1083,32 @@ test('models-settings-errors', async ({ page, request }) => {
   await page.evaluate(() => document.querySelector('main')?.scrollBy(0, -40));
   await shoot(page, 'models-settings-errors');
 });
+
+test('explore-why-not', async ({ page, request }) => {
+  const ds = 'staff-why-not';
+  const created = await request.post('/$/datasets', { data: { dbName: ds, dbType: 'persistent' } });
+  expect(created.ok()).toBe(true);
+  const updated = await request.post(`/${ds}/update`, {
+    headers: { 'Content-Type': 'application/sparql-update' },
+    data: `${PREFIXES} INSERT DATA {
+      ex:Manager rdfs:subClassOf ex:Employee .
+      ex:manages rdfs:domain ex:Manager .
+      res:alice a ex:Manager ; ex:manages res:team7 ; rdfs:label "Alice Ng" .
+      res:team7 rdfs:label "Team 7" .
+    }`,
+  });
+  expect(updated.ok()).toBe(true);
+  await request.post(`/$/reason/${ds}`, { form: { profile: 'rdfs' } });
+  await page.goto(
+    `/ui/explore?ds=${ds}&iri=${encodeURIComponent('http://example.org/resource/alice')}`,
+  );
+  const panel = page.getByRole('region', { name: 'Why not?', exact: true });
+  await expect(panel).toBeVisible();
+  await panel.getByText('Why not…?', { exact: true }).click();
+  await panel.getByLabel('Why not value').fill('ex:Director');
+  await panel.getByRole('button', { name: 'Find missing facts' }).click();
+  await panel.getByText('Possibility 1: add 1 fact', { exact: true }).click();
+  await panel.getByText('Verified derivation', { exact: true }).first().click();
+  await panel.scrollIntoViewIfNeeded();
+  await shoot(page, 'explore-why-not');
+});

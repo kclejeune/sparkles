@@ -13,6 +13,7 @@ use crate::access::GraphAccess;
 use crate::error::Result;
 use crate::explain::Explained;
 use crate::id::Id;
+pub use crate::overview::facets::term_json;
 use crate::sparql::rdfs::{SchemaLeaves, SchemaSource};
 use crate::store::Snapshot;
 use oxrdf::Term;
@@ -51,6 +52,11 @@ pub struct ExplainRequest {
     pub cancel: Option<Arc<AtomicBool>>,
     /// the memory the rule evaluations may hold
     pub max_memory: Option<usize>,
+    pub mode: ExplainMode,
+    pub source: Option<ExplainSource>,
+    pub profile: Option<String>,
+    pub max_missing: usize,
+    pub max_hypotheses: usize,
 }
 
 impl ExplainRequest {
@@ -63,6 +69,11 @@ impl ExplainRequest {
             access: None,
             cancel: None,
             max_memory: None,
+            mode: ExplainMode::Why,
+            source: None,
+            profile: None,
+            max_missing: 2,
+            max_hypotheses: 10,
         }
     }
 }
@@ -74,6 +85,7 @@ pub enum ExplainSource {
     Materialized,
     /// RDFS on read
     RdfsOnRead,
+    Demand,
 }
 
 impl ExplainSource {
@@ -81,6 +93,7 @@ impl ExplainSource {
         match self {
             ExplainSource::Materialized => "materialized",
             ExplainSource::RdfsOnRead => "rdfsOnRead",
+            ExplainSource::Demand => "demand",
         }
     }
 }
@@ -99,6 +112,8 @@ pub struct Explanation {
     /// for the materialized inferences, their freshness at the head: a tree explains the
     /// closure as its run computed it
     pub freshness: Option<super::Freshness>,
+    #[cfg(feature = "reasoning")]
+    pub why_not: Option<sparkles_reasoner::whynot::WhyNot>,
 }
 
 fn budget_error(m: String) -> crate::Error {
@@ -147,6 +162,181 @@ pub fn explain(ds: &Dataset, req: &ExplainRequest) -> Result<Explanation> {
     let head = store.snapshot();
     let access = req.access.as_ref();
     #[cfg(feature = "reasoning")]
+    {
+        let rec = ds.reasoning_record();
+        let use_demand = req.mode == ExplainMode::WhyNot
+            || req.source == Some(ExplainSource::Demand)
+            || req.profile.is_some()
+            || (req.source.is_none()
+                && rec.as_ref().is_some_and(|r| {
+                    super::freshness(r, store, head.commit).stale != Some(false)
+                        || head
+                            .lookup_iri(super::INFERRED_GRAPH)
+                            .is_none_or(|g| !readable(access, &head, g))
+                }));
+        if use_demand {
+            return demand(ds, req, head, deadline);
+        }
+    }
+    #[cfg(not(feature = "reasoning"))]
+    if req.mode == ExplainMode::WhyNot
+        || req.source == Some(ExplainSource::Demand)
+        || req.profile.is_some()
+    {
+        return Err(bad("demand explanations need the reasoning feature"));
+    }
+    #[cfg(feature = "reasoning")]
+    if let Some(answer) = materialized(ds, req, &head, deadline)? {
+        return Ok(answer);
+    }
+    if let Some(on) = ds.reasoning().rdfs().get() {
+        let leaves = match &on.source {
+            SchemaSource::Fixed(_) => SchemaLeaves::Document,
+            SchemaSource::Graph(g) => {
+                let id = match g {
+                    None => Some(Id::DEFAULT_GRAPH),
+                    Some(iri) => head.lookup_iri(iri),
+                };
+                match id {
+                    Some(id) if readable(access, &head, id) => SchemaLeaves::Graph(id),
+                    _ => SchemaLeaves::Hidden,
+                }
+            }
+        };
+        let view = view_of(access, &head)?;
+        let inferred = head.lookup_iri(super::INFERRED_GRAPH);
+        let mut graphs = vec![Id::DEFAULT_GRAPH];
+        graphs.extend(head.graph_ids()?);
+        let include_inferred = {
+            #[cfg(feature = "reasoning")]
+            {
+                ds.reasoning_record().is_some()
+            }
+            #[cfg(not(feature = "reasoning"))]
+            {
+                false
+            }
+        };
+        graphs.retain(|&g| (include_inferred || Some(g) != inferred) && readable(access, &head, g));
+        // every RDFS derivation needs a schema fact, so a schema the caller cannot read is
+        // not built, and an empty one still finds a triple a readable graph asserts
+        let schema = if leaves == SchemaLeaves::Hidden {
+            std::sync::Arc::new(sparkles_core::sparql::rdfs::RdfsSchema::default())
+        } else {
+            on.schema_controlled(&view, &mut || check_controls(req, deadline))?
+        };
+        let mut found = schema.explain(
+            &view,
+            leaves,
+            &graphs,
+            &req.triple,
+            crate::explain::ExplainLimits {
+                max_trees,
+                max_depth,
+                deadline,
+                cancel: req.cancel.clone(),
+                max_memory: req.max_memory,
+            },
+        )?;
+        #[cfg(feature = "reasoning")]
+        if include_inferred {
+            fn graft(
+                ds: &Dataset,
+                req: &ExplainRequest,
+                snap: &Arc<Snapshot>,
+                d: &mut crate::explain::Derivation,
+                deadline: Option<Instant>,
+            ) -> Result<bool> {
+                check_controls(req, deadline)?;
+                if d.graph.as_deref() == Some(super::INFERRED_GRAPH) {
+                    let mut premise = req.clone();
+                    premise.triple = d.triple.clone();
+                    premise.source = Some(ExplainSource::Materialized);
+                    premise.max_trees = 1;
+                    let Some(answer) = materialized(ds, &premise, snap, deadline)? else {
+                        return Ok(false);
+                    };
+                    match answer.explained {
+                        Explained::Found { mut trees, .. } if !trees.is_empty() => {
+                            *d = trees.remove(0)
+                        }
+                        Explained::Partial { tree, .. } => *d = *tree,
+                        _ => return Ok(false),
+                    }
+                } else {
+                    for p in &mut d.premises {
+                        if !graft(ds, req, snap, p, deadline)? {
+                            return Ok(false);
+                        }
+                    }
+                }
+                if d.kind == crate::explain::DerivationKind::Derived {
+                    d.depth = 1 + d.premises.iter().map(|p| p.depth).max().unwrap_or(0);
+                }
+                Ok(true)
+            }
+            if let Explained::Found { trees, .. } = &mut found {
+                let mut valid = Vec::new();
+                for mut tree in std::mem::take(trees) {
+                    if graft(ds, req, &head, &mut tree, deadline)? {
+                        valid.push(tree);
+                    }
+                }
+                if req.max_memory.is_some_and(|m| {
+                    valid
+                        .iter()
+                        .map(crate::explain::Derivation::heap_bytes)
+                        .sum::<usize>()
+                        > m
+                }) {
+                    return Err(budget_error(
+                        "the mixed derivation passed its memory limit".into(),
+                    ));
+                }
+                crate::explain::finish(&mut valid, max_depth);
+                if valid.is_empty() {
+                    found = Explained::NotFound;
+                } else {
+                    *trees = valid;
+                }
+            }
+        }
+        if !matches!(found, Explained::NotFound) {
+            return Ok(Explanation {
+                explained: found,
+                commit: head.commit,
+                source: Some(ExplainSource::RdfsOnRead),
+                read_at_head: false,
+                freshness: {
+                    #[cfg(feature = "reasoning")]
+                    {
+                        ds.reasoning_record()
+                            .map(|r| super::freshness(&r, store, head.commit))
+                    }
+                    #[cfg(not(feature = "reasoning"))]
+                    {
+                        None
+                    }
+                },
+                #[cfg(feature = "reasoning")]
+                why_not: None,
+            });
+        }
+    }
+    Ok(not_found(head.commit))
+}
+
+#[cfg(feature = "reasoning")]
+fn materialized(
+    ds: &Dataset,
+    req: &ExplainRequest,
+    head: &Arc<Snapshot>,
+    deadline: Option<Instant>,
+) -> Result<Option<Explanation>> {
+    let store = ds.store();
+    let access = req.access.as_ref();
+    let max_trees = req.max_trees.clamp(1, MAX_TREES);
+    let max_depth = req.max_depth.min(MAX_DEPTH);
     if let Some(rec) = ds.reasoning_record() {
         let (snap, read_at_head) = match rec.commit {
             Some(c) if c != head.commit => match store.snapshot_at(
@@ -208,78 +398,110 @@ pub fn explain(ds: &Dataset, req: &ExplainRequest) -> Result<Explanation> {
             cancel: req.cancel.clone(),
             max_memory: req.max_memory,
         };
-        let found =
+        let mut found =
             sparkles_reasoner::explain::explain(&input, &req.triple, &opts).map_err(|e| {
                 match e.downcast::<crate::explain::ExplainBudgetExceeded>() {
                     Ok(b) => budget_error(b.0),
                     Err(e) => crate::handles::from_anyhow(e),
                 }
             })?;
-        if let Explained::Found { .. } = found {
-            return Ok(Explanation {
+        // Generalized premises and backward-only rules are kept by the demand engine.
+        // Fall back over the same historical snapshot so a materialized request still
+        // explains the run it selected.
+        let stored_inference = if let Some(graph) = inferred {
+            let ids: Option<Vec<Id>> = req.triple.iter().map(|t| snap.lookup_term(t)).collect();
+            match ids {
+                Some(t) => snap.contains(&[t[0], t[1], t[2], graph])?,
+                None => false,
+            }
+        } else {
+            false
+        };
+        if matches!(found, Explained::NotFound) && stored_inference {
+            let mut fallback = req.clone();
+            fallback.source = Some(ExplainSource::Demand);
+            let d = demand(ds, &fallback, snap.clone(), deadline)?;
+            found = d.explained;
+        }
+        if !matches!(found, Explained::NotFound) {
+            return Ok(Some(Explanation {
                 explained: found,
                 commit: snap.commit,
                 source: Some(ExplainSource::Materialized),
                 read_at_head,
                 freshness: Some(super::freshness(&rec, store, head.commit)),
-            });
+                why_not: None,
+            }));
         }
     }
-    if let Some(on) = ds.reasoning().rdfs().get() {
-        let leaves = match &on.source {
-            SchemaSource::Fixed(_) => SchemaLeaves::Document,
-            SchemaSource::Graph(g) => {
-                let id = match g {
-                    None => Some(Id::DEFAULT_GRAPH),
-                    Some(iri) => head.lookup_iri(iri),
-                };
-                match id {
-                    Some(id) if readable(access, &head, id) => SchemaLeaves::Graph(id),
-                    _ => SchemaLeaves::Hidden,
-                }
-            }
+    Ok(None)
+}
+
+#[cfg(feature = "reasoning")]
+fn demand(
+    ds: &Dataset,
+    req: &ExplainRequest,
+    snap: Arc<Snapshot>,
+    deadline: Option<Instant>,
+) -> Result<Explanation> {
+    use sparkles_reasoner::explain::{DemandInput, ExplainOptions};
+    check_controls(req, deadline)?;
+    let profile = req
+        .profile
+        .as_deref()
+        .map(str::parse)
+        .transpose()
+        .map_err(|e: sparkles_reasoner::UnknownProfile| bad(e.to_string()))?;
+    let reasoner = ds.query_reasoner(profile)?;
+    let view = view_of(req.access.as_ref(), &snap)?;
+    let readable = req.access.as_ref().map(|a| {
+        let a = a.clone();
+        let snap = snap.clone();
+        Arc::new(move |g| a.bound(&snap).readable_id(&snap, g))
+            as Arc<dyn Fn(Id) -> bool + Send + Sync>
+    });
+    let input = DemandInput {
+        reasoner: &reasoner,
+        snap: view,
+        readable,
+    };
+    let opts = ExplainOptions {
+        max_trees: req.max_trees.clamp(1, MAX_TREES),
+        max_depth: req.max_depth.min(MAX_DEPTH),
+        max_instances: MAX_INSTANCES,
+        deadline,
+        cancel: req.cancel.clone(),
+        max_memory: req.max_memory,
+    };
+    let convert = |e: anyhow::Error| match e.downcast::<crate::explain::ExplainBudgetExceeded>() {
+        Ok(b) => budget_error(b.0),
+        Err(e) => crate::handles::from_anyhow(e),
+    };
+    let (explained, why_not) = if req.mode == ExplainMode::WhyNot {
+        let opts = sparkles_reasoner::whynot::WhyNotOptions {
+            explain: opts,
+            max_missing: req.max_missing.clamp(1, 4),
+            max_hypotheses: req.max_hypotheses.clamp(1, 100),
+            max_unfold: req.max_depth.min(MAX_DEPTH),
         };
-        let view = view_of(access, &head)?;
-        let inferred = head.lookup_iri(super::INFERRED_GRAPH);
-        let mut graphs = vec![Id::DEFAULT_GRAPH];
-        graphs.extend(head.graph_ids()?);
-        graphs.retain(|&g| Some(g) != inferred && readable(access, &head, g));
-        // every RDFS derivation needs a schema fact, so a schema the caller cannot read is
-        // not built, and an empty one still finds a triple a readable graph asserts
-        let schema = if leaves == SchemaLeaves::Hidden {
-            std::sync::Arc::new(sparkles_core::sparql::rdfs::RdfsSchema::default())
-        } else {
-            // the schema is shared with queries and built without the request's
-            // controls, so they are checked on both sides of it
-            check_controls(req, deadline)?;
-            let schema = on.schema(&view)?;
-            check_controls(req, deadline)?;
-            schema
-        };
-        let found = schema.explain(
-            &view,
-            leaves,
-            &graphs,
-            &req.triple,
-            crate::explain::ExplainLimits {
-                max_trees,
-                max_depth,
-                deadline,
-                cancel: req.cancel.clone(),
-                max_memory: req.max_memory,
-            },
-        )?;
-        if let Explained::Found { .. } = found {
-            return Ok(Explanation {
-                explained: found,
-                commit: head.commit,
-                source: Some(ExplainSource::RdfsOnRead),
-                read_at_head: false,
-                freshness: None,
-            });
-        }
-    }
-    Ok(not_found(head.commit))
+        let answer =
+            sparkles_reasoner::whynot::why_not(&input, &req.triple, &opts).map_err(convert)?;
+        (Explained::NotFound, Some(answer))
+    } else {
+        (
+            sparkles_reasoner::explain::explain_demand(&input, &req.triple, &opts)
+                .map_err(convert)?,
+            None,
+        )
+    };
+    Ok(Explanation {
+        explained,
+        why_not,
+        commit: snap.commit,
+        source: Some(ExplainSource::Demand),
+        read_at_head: false,
+        freshness: None,
+    })
 }
 
 /// The answer when no derivation was found, read at `commit`.
@@ -290,6 +512,8 @@ fn not_found(commit: u64) -> Explanation {
         source: None,
         read_at_head: false,
         freshness: None,
+        #[cfg(feature = "reasoning")]
+        why_not: None,
     }
 }
 
@@ -338,6 +562,7 @@ pub fn request_from_json(j: &J) -> Result<(ExplainRequest, ExplainMode, Option<D
         "maxMissing",
         "maxHypotheses",
         "timeout",
+        "profile",
     ];
     if let Some(k) = o.keys().find(|k| !KNOWN.contains(&k.as_str())) {
         return Err(bad(format!(
@@ -345,23 +570,22 @@ pub fn request_from_json(j: &J) -> Result<(ExplainRequest, ExplainMode, Option<D
             KNOWN.join(", ")
         )));
     }
-    let mode = match o.get("mode").and_then(J::as_str) {
-        Some("why") | None => ExplainMode::Why,
-        Some("whyNot") => ExplainMode::WhyNot,
+    let mode = match o.get("mode") {
+        Some(J::String(m)) if m == "why" => ExplainMode::Why,
+        None | Some(J::Null) => ExplainMode::Why,
+        Some(J::String(m)) if m == "whyNot" => ExplainMode::WhyNot,
         Some(m) => {
             return Err(bad(format!(
                 "mode must be \"why\" or \"whyNot\", not '{m}'"
             )));
         }
     };
-    match o.get("source").and_then(J::as_str) {
-        None | Some("materialized") => {}
-        Some(s) => {
-            return Err(bad(format!(
-                "source '{s}' is not available: only \"materialized\" is"
-            )));
-        }
-    }
+    let source = match o.get("source") {
+        None | Some(J::Null) => None,
+        Some(J::String(s)) if s == "materialized" => Some(ExplainSource::Materialized),
+        Some(J::String(s)) if s == "demand" => Some(ExplainSource::Demand),
+        _ => return Err(bad("source must be materialized or demand")),
+    };
     let t = o
         .get("triple")
         .and_then(J::as_object)
@@ -391,6 +615,20 @@ pub fn request_from_json(j: &J) -> Result<(ExplainRequest, ExplainMode, Option<D
         }
     };
     let mut req = ExplainRequest::new(triple);
+    req.mode = mode;
+    req.source = source;
+    req.profile = match o.get("profile") {
+        None | Some(J::Null) => None,
+        Some(J::String(s)) => Some(s.clone()),
+        _ => return Err(bad("profile must be a string")),
+    };
+    if let Some(n) = int("maxMissing", 1, 4)? {
+        req.max_missing = n as usize;
+    }
+    if let Some(n) = int("maxHypotheses", 1, 100)? {
+        req.max_hypotheses = n as usize;
+    }
+
     if let Some(n) = int("maxTrees", 1, MAX_TREES as u64)? {
         req.max_trees = n as usize;
     }
@@ -409,7 +647,7 @@ pub fn request_from_json(j: &J) -> Result<(ExplainRequest, ExplainMode, Option<D
     Ok((req, mode, timeout))
 }
 
-fn derivation_json(d: &crate::explain::Derivation) -> J {
+pub fn derivation_json(d: &crate::explain::Derivation) -> J {
     use crate::overview::facets::term_json;
     let mut o = json!({
         "id": d.id,
@@ -431,6 +669,27 @@ fn derivation_json(d: &crate::explain::Derivation) -> J {
         }
         o["rule"] = rj;
     }
+    if !d.bindings.is_empty() {
+        o["bindings"] = d
+            .bindings
+            .iter()
+            .map(|(k, t)| (k.clone(), term_json(t)))
+            .collect::<serde_json::Map<_, _>>()
+            .into();
+    }
+    if !d.builtins.is_empty() {
+        o["builtins"] = d
+            .builtins
+            .iter()
+            .map(|call| json!({"call":call,"holds":true}))
+            .collect();
+    }
+    if d.generalized {
+        o["generalized"] = true.into();
+    }
+    if d.missing {
+        o["missing"] = true.into();
+    }
     if d.shared {
         o["shared"] = true.into();
     }
@@ -444,7 +703,46 @@ fn derivation_json(d: &crate::explain::Derivation) -> J {
 /// with where the trees come from and the inferences' freshness.
 pub fn explanation_json(e: &Explanation) -> J {
     let mut o = json!({ "mode": "why", "commit": e.commit });
+    #[cfg(feature = "reasoning")]
+    if let Some(w) = &e.why_not {
+        use crate::overview::facets::term_json;
+        use sparkles_reasoner::whynot::WhyNot;
+        let triple =
+            |t: &[Term; 3]| json!({"s":term_json(&t[0]),"p":term_json(&t[1]),"o":term_json(&t[2])});
+        o["mode"] = "whyNot".into();
+        match w {
+            WhyNot::Entailed => {
+                o["entailed"] = true.into();
+            }
+            WhyNot::NotEntailed {
+                rules,
+                hypotheses,
+                complete,
+            } => {
+                o["entailed"] = false.into();
+                o["complete"] = (*complete).into();
+                o["rules"] = rules.iter().map(|r| {
+                    let unifier: serde_json::Map<_,_> = r.unifier.iter().map(|(k,t)| (k.clone(),term_json(t))).collect();
+                    let blocked: Vec<_> = r.blocked_by.iter().map(|b| {
+                        let mut j = json!({"call":b.call});
+                        if let Some(t) = &b.fact { j["fact"] = triple(t); } j
+                    }).collect();
+                    json!({"name":r.rule.name,"line":r.line,"unifier":unifier,"blockedBy":blocked})
+                }).collect();
+                o["hypotheses"] = hypotheses.iter().map(|h| json!({"missing":h.missing.iter().map(triple).collect::<Vec<_>>(),"placeholders":h.placeholders,"tree":derivation_json(&h.tree)})).collect();
+            }
+        }
+        o["source"] = "demand".into();
+        return o;
+    }
     match &e.explained {
+        Explained::Partial { tree, reason } => {
+            o["entailed"] = true.into();
+            o["trees"] = vec![derivation_json(tree)].into();
+            o["partial"] = true.into();
+            o["reason"] = reason.clone().into();
+            o["more"] = true.into();
+        }
         Explained::Found { trees, more } => {
             o["entailed"] = true.into();
             o["trees"] = trees.iter().map(derivation_json).collect();
@@ -576,6 +874,7 @@ fn how(d: &crate::explain::Derivation) -> String {
             s
         }
         K::Ref => "derived deeper than the depth limit".to_string(),
+        K::Unexplained => "not explained within the search budget".to_string(),
     }
 }
 
@@ -599,6 +898,51 @@ fn tree_lines(
 /// The trees of an explanation indented, one premise per line.
 pub fn explanation_text(e: &Explanation, prefixes: &[(String, String)]) -> String {
     let mut out = String::new();
+    #[cfg(feature = "reasoning")]
+    if let Some(answer) = &e.why_not {
+        use sparkles_reasoner::whynot::WhyNot;
+        match answer {
+            WhyNot::Entailed => return "the triple is already entailed\n".to_string(),
+            WhyNot::NotEntailed {
+                rules,
+                hypotheses,
+                complete,
+            } => {
+                let mut out = String::new();
+                for rule in rules {
+                    for block in &rule.blocked_by {
+                        out.push_str(&format!(
+                            "{} is blocked by {}\n",
+                            rule.rule.name, block.call
+                        ));
+                    }
+                }
+                for (i, h) in hypotheses.iter().enumerate() {
+                    out.push_str(&format!(
+                        "hypothesis {} adds {} fact(s):\n",
+                        i + 1,
+                        h.missing.len()
+                    ));
+                    for t in &h.missing {
+                        out.push_str(&format!("  {}\n", short_triple(t, prefixes)));
+                    }
+                    tree_lines(&h.tree, 1, prefixes, &mut out);
+                }
+                if hypotheses.is_empty() {
+                    out.push_str("no verified hypotheses within the limits\n");
+                }
+                if !complete {
+                    out.push_str("the search is incomplete; other hypotheses may exist\n");
+                }
+                return out;
+            }
+        }
+    }
+    if let Explained::Partial { tree, reason } = &e.explained {
+        let mut out = format!("partial derivation: {reason}\n");
+        tree_lines(tree, 1, prefixes, &mut out);
+        return out;
+    }
     let Explained::Found { trees, more } = &e.explained else {
         return "no derivation from facts you can read was found\n".to_string();
     };
@@ -628,15 +972,18 @@ pub fn summary(d: &crate::explain::Derivation, prefixes: &[(String, String)]) ->
     use crate::explain::DerivationKind as K;
     let head = short_triple(&d.triple, prefixes);
     match d.kind {
+        K::Asserted if d.missing => format!("{head} is a hypothesis"),
         K::Asserted => format!("{head} is asserted"),
         K::Axiom => format!("{head} is an axiom"),
         K::Ref => format!("{head} is derived deeper than the depth limit"),
+        K::Unexplained => format!("{head} was not explained within the search budget"),
         K::Derived => {
             let parts: Vec<String> = d
                 .premises
                 .iter()
                 .map(|p| {
                     let k = match p.kind {
+                        K::Asserted if p.missing => "hypothesis",
                         K::Asserted => "asserted",
                         K::Axiom => "axiom",
                         _ => "derived",

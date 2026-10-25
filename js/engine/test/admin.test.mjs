@@ -571,3 +571,27 @@ test(
     );
   },
 );
+
+test('demand and why-not explanations preserve the selected mode and limits', async (t) => {
+  const ds = t.resource(await Dataset.memory());
+  await ds.update(
+    'INSERT DATA { <http://ex.org/tom> a <http://ex.org/Cat> . <http://ex.org/Cat> <http://www.w3.org/2000/01/rdf-schema#subClassOf> <http://ex.org/Animal> . }',
+  );
+  const why = await ds.reasoning.explain('<http://ex.org/tom> a <http://ex.org/Animal>', {
+    source: 'demand',
+    profile: 'rdfs',
+  });
+  assert.equal(why.entailed, true);
+  assert.equal(why.source, 'demand');
+  const missing = await ds.reasoning.explain('<http://ex.org/tom> a <http://ex.org/Plant>', {
+    mode: 'whyNot',
+    profile: 'rdfs',
+    maxDepth: 2,
+    maxMissing: 1,
+    maxHypotheses: 3,
+  });
+  assert.equal(missing.mode, 'whyNot');
+  assert.equal(missing.entailed, false);
+  assert.ok(missing.hypotheses.length > 0);
+  assert.ok(missing.hypotheses.every((h) => h.missing.length === 1));
+});

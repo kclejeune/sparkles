@@ -572,7 +572,15 @@ export class Administration {
       /** Why the dataset entails a triple, given in Turtle with the dataset's prefixes: derivation trees, or `entailed: false`. */
       explain: (
         triple: string,
-        options: OperationOptions & { maxTrees?: number; maxDepth?: number } = {},
+        options: OperationOptions & {
+          mode?: 'why' | 'whyNot';
+          source?: 'materialized' | 'demand';
+          profile?: string;
+          maxTrees?: number;
+          maxDepth?: number;
+          maxMissing?: number;
+          maxHypotheses?: number;
+        } = {},
       ) => call<Configuration>('reasoning.explain', { triple, ...options }, options, false),
       status: (o?: OperationOptions) =>
         call<Configuration | null>('reasoning.status', {}, o, false),

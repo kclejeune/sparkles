@@ -321,3 +321,23 @@ test('A12: at 390 px Why? is a full-height sheet opened by a tap, without scroll
   await expect(panel(page)).toHaveCount(0);
   await ctx.close();
 });
+
+test('why not lists verified missing facts for the selected resource', async ({
+  page,
+  request,
+}) => {
+  const ds = 'why-not-missing';
+  await create(request, ds);
+  await page.addInitScript((d) => localStorage.setItem('sparkles.dataset', d), ds);
+  await page.goto(`/ui/explore?ds=${ds}&iri=${encodeURIComponent(`${EX}alice`)}`);
+  const panel = page.getByRole('region', { name: 'Why not?', exact: true });
+  await expect(panel).toBeVisible();
+  await panel.getByText('Why not…?', { exact: true }).click();
+  await panel.getByLabel('Why not value').fill(`<${EX}Director>`);
+  await panel.getByRole('button', { name: 'Find missing facts' }).click();
+  await expect(panel.getByText('Possibility 1: add 1 fact', { exact: true })).toBeVisible();
+  await panel.getByText('Possibility 1: add 1 fact', { exact: true }).click();
+  await expect(panel.getByText('Verified derivation', { exact: true }).first()).toBeVisible();
+  await panel.getByText('Verified derivation', { exact: true }).first().click();
+  await expect(panel.locator('li').filter({ hasText: 'missing' }).first()).toBeVisible();
+});

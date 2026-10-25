@@ -138,7 +138,10 @@ fn reasoning(put: &mut dyn FnMut(&str, J)) {
                 json!({
                     "triple": triple.clone(),
                     "mode": string_enum(&["why", "whyNot"]),
-                    "source": string_enum(&["materialized"]),
+                    "source": string_enum(&["materialized", "demand"]),
+                    "profile": string(),
+                    "maxMissing": {"type":"integer","minimum":1,"maximum":4},
+                    "maxHypotheses": {"type":"integer","minimum":1,"maximum":100},
                     "maxTrees": { "type": "integer", "minimum": 1, "maximum": 10 },
                     "maxDepth": { "type": "integer", "minimum": 1, "maximum": 64 },
                     "timeout": { "type": "number", "exclusiveMinimum": 0, "description": "Seconds, 10 by default, capped at `--max-timeout`." },
@@ -156,7 +159,11 @@ fn reasoning(put: &mut dyn FnMut(&str, J)) {
                 json!({
                     "id": int(),
                     "triple": triple,
-                    "kind": string_enum(&["asserted", "axiom", "derived", "ref"]),
+                    "kind": string_enum(&["asserted", "axiom", "derived", "ref", "unexplained"]),
+                    "bindings": {"type":"object","additionalProperties":sref("RdfTerm")},
+                    "builtins": array(obj(&["call","holds"],json!({"call":string(),"holds":{"const":true}}))),
+                    "generalized": boolean(),
+                    "missing": boolean(),
                     "depth": int(),
                     "graph": { "type": "string", "description": "For an asserted node, `default` or the IRI of the graph that holds the triple. Absent for a triple of an RDFS-on-read schema given as a document." },
                     "rule": obj(&["name", "profile"], json!({
@@ -176,14 +183,17 @@ fn reasoning(put: &mut dyn FnMut(&str, J)) {
         "Explanation",
         doc(
             obj(
-                &["mode", "entailed", "commit", "trees", "more", "source"],
+                &["mode", "entailed", "commit"],
                 json!({
-                    "mode": { "const": "why" },
-                    "entailed": { "const": true },
+                    "mode": string_enum(&["why", "whyNot"]),
+                    "entailed": boolean(),
                     "commit": { "type": "integer", "description": "The commit the search read." },
                     "trees": array(sref("Derivation")),
                     "more": boolean(),
-                    "source": string_enum(&["materialized", "rdfsOnRead"]),
+                    "source": string_enum(&["materialized", "rdfsOnRead", "demand"]),
+                    "partial": boolean(), "reason": string(), "complete": boolean(),
+                    "rules": {"type":"array","items":{"type":"object"}},
+                    "hypotheses": {"type":"array","items":{"type":"object"}},
                     "readAtHead": boolean(),
                     "stale": nullable("boolean"),
                     "commitsSince": int(),

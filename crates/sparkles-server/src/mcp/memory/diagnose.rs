@@ -538,6 +538,75 @@ impl Tools<'_> {
                     s.text
                 ),
             };
+            #[cfg(feature = "reasoning")]
+            if kind == "pattern"
+                && let Some(GraphPattern::Bgp { patterns }) = &s.alone
+                && patterns.len() == 1
+                && s.constants.len() == 3
+                && let Ok(reasoner) = ds.dataset.query_reasoner(None)
+            {
+                // Ground intensional patterns have the same target as the explain
+                // route. Read this diagnosis's exact snapshot and graph view, including
+                // historical reads, instead of asking the current dataset head.
+                let snap = match &reader.opts.graphs {
+                    Some(a) => a
+                        .bound(&reader.snap)
+                        .masked(&reader.snap)
+                        .map_err(|e| ctx.engine(e))?,
+                    None => reader.snap.clone(),
+                };
+                let readable = reader.opts.graphs.as_ref().map(|a| {
+                    let a = a.clone();
+                    let snap = reader.snap.clone();
+                    Arc::new(move |g| a.bound(&snap).readable_id(&snap, g))
+                        as Arc<dyn Fn(sparkles::id::Id) -> bool + Send + Sync>
+                });
+                let triple: [Term; 3] = s.constants.clone().try_into().expect("three constants");
+                let input = sparkles_reasoner::explain::DemandInput {
+                    reasoner: &reasoner,
+                    snap,
+                    readable,
+                };
+                let options = sparkles_reasoner::whynot::WhyNotOptions {
+                    explain: sparkles_reasoner::explain::ExplainOptions {
+                        deadline: Some(deadline),
+                        cancel: Some(self.call.cancel.clone()),
+                        max_memory: self
+                            .server
+                            .state
+                            .limits
+                            .query_memory_bytes
+                            .map(|m| m as usize),
+                        ..Default::default()
+                    },
+                    ..Default::default()
+                };
+                match sparkles_reasoner::whynot::why_not(&input, &triple, &options) {
+                    Ok(answer @ sparkles_reasoner::whynot::WhyNot::NotEntailed { .. }) => {
+                        let intensional = matches!(&answer,sparkles_reasoner::whynot::WhyNot::NotEntailed { rules,.. } if !rules.is_empty());
+                        if intensional {
+                            let e = sparkles::reasoning::explain::Explanation {
+                                explained: sparkles::explain::Explained::NotFound,
+                                why_not: Some(answer),
+                                commit: reader.snap.commit,
+                                source: Some(sparkles::reasoning::explain::ExplainSource::Demand),
+                                read_at_head: false,
+                                freshness: None,
+                            };
+                            f["whyNot"] = sparkles::reasoning::explain::explanation_json(&e);
+                        }
+                    }
+                    Ok(_) => {}
+                    Err(e) => {
+                        if e.chain()
+                            .any(|c| matches!(c.downcast_ref::<Error>(), Some(Error::Cancelled)))
+                        {
+                            return Err(ctx.engine(Error::Cancelled));
+                        }
+                        f["whyNotError"] = e.to_string().into();
+                    }
+                }
+            }
             out["verdict"] = verdict(&f).into();
             out["first"] = f;
         } else if complete {
