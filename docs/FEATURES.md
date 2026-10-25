@@ -1,47 +1,158 @@
 # Features
 
-This page lists what Sparkles can do, grouped by area, so that you can check whether it
-supports a feature and find where that feature is documented. Each entry describes the
-current behaviour. [USAGE.md](USAGE.md) documents the command line and the bindings,
-[API.md](API.md) documents the HTTP interface, and the design specs in
-[specs/](specs/README.md) explain why each larger feature is built the way it is.
-[Known gaps](#known-gaps) lists what Sparkles does not do, and each gap names the
-[roadmap](ROADMAP.md) item that addresses it. [COMPARISON.md](COMPARISON.md) compares
-Sparkles with Jena and Fuseki, QLever, Fluree and Oxigraph, and
-[BENCHMARKS.md](BENCHMARKS.md) has the performance figures.
+Sparkles provides an RDF store, query engine, server and embedded libraries. The
+category guides below describe current capabilities, configuration, usage and limits.
+The [capability matrix](#capability-status) distinguishes complete, partially complete
+and planned work. The [roadmap](ROADMAP.md) gives the path to completing the remaining
+phases, and the [design specs](specs/README.md) explain their contracts and decisions.
 
+* [Querying](#querying)
+* [Storage and history](#storage-and-history)
+* [Search and graph analysis](#search-and-graph-analysis)
+* [Reasoning and validation](#reasoning-validation-and-schema)
+* [Server and security](#server-and-security)
+* [AI and agents](#ai-and-agents)
+* [Visualization and editing](#visualization-and-editing)
+* [Libraries and integrations](#libraries-and-integrations)
+* [Deployment and operations](#deployment-and-operations)
 * [Capability status](#capability-status)
-* [Standards conformance](querying/README.md#standards-conformance)
-* [Storage and indexes](storage/README.md#storage-and-indexes)
-* [Versioning and history](storage/README.md#versioning-and-history)
-* [SPARQL queries and updates](querying/README.md#sparql-queries-and-updates)
-* [Search](search/README.md#search)
-* [GeoSPARQL](search/README.md#geosparql)
-* [Reasoning, validation and schema](reasoning/README.md#reasoning-validation-and-schema)
-* [Server and protocols](server/README.md#server-and-protocols)
-* [Access control and security](server/README.md#access-control-and-security)
-* [AI and agents](ai/README.md#ai-and-agents)
-* [Web UI](visualization/README.md#web-ui)
-* [Libraries and bindings](integrations/README.md#libraries-and-bindings)
-* [Command line](querying/README.md#command-line)
-* [Formatter and editor support](querying/README.md#formatter-and-editor-support)
-* [Operations](operations/README.md#operations)
 * [Compatibility boundaries](#compatibility-boundaries)
 * [Known gaps](#known-gaps)
 
 ## Feature categories
 
-| Category | Documentation |
-|---|---|
-| Querying | [Capabilities, configuration, usage and roadmap](querying/README.md) |
-| Storage and history | [Capabilities, configuration, usage and roadmap](storage/README.md) |
-| Search and graph analysis | [Capabilities, configuration, usage and roadmap](search/README.md) |
-| Reasoning and validation | [Capabilities, configuration, usage and roadmap](reasoning/README.md) |
-| Server and security | [Capabilities, configuration, usage and roadmap](server/README.md) |
-| AI and agents | [Capabilities, configuration, usage and roadmap](ai/README.md) |
-| Visualization and editing | [Capabilities, configuration, usage and roadmap](visualization/README.md) |
-| Libraries and integrations | [Capabilities, configuration, usage and roadmap](integrations/README.md) |
-| Deployment and operations | [Capabilities, configuration, usage and roadmap](operations/README.md) |
+<a id="standards-conformance"></a>
+<a id="sparql-queries-and-updates"></a>
+<a id="query-and-update-language"></a>
+<a id="jena-arq-extensions"></a>
+<a id="federated-queries"></a>
+<a id="planning-and-execution"></a>
+<a id="explaining-queries"></a>
+<a id="incremental-views-and-live-queries"></a>
+<a id="command-line"></a>
+<a id="formatter-and-editor-support"></a>
+
+### Querying
+
+Use [SPARQL Query and Update](querying/README.md#sparql-queries-and-updates),
+including supported ARQ extensions, federation, query plans and incremental views.
+The guide also covers [standards conformance](querying/README.md#standards-conformance),
+the [command line](querying/README.md#command-line) and
+[formatting and editor support](querying/README.md#formatter-and-editor-support).
+
+<a id="storage-and-indexes"></a>
+<a id="indexes-and-vocabulary"></a>
+<a id="cold-reads"></a>
+<a id="loading-data"></a>
+<a id="transactions-and-durability"></a>
+<a id="compaction-clones-and-integrity"></a>
+<a id="versioning-and-history"></a>
+<a id="commits"></a>
+<a id="time-travel"></a>
+<a id="diffs-change-feed-and-history-queries"></a>
+<a id="branches-and-merges"></a>
+<a id="rdf-patch"></a>
+
+### Storage and history
+
+Load RDF into [compressed indexes](storage/README.md#storage-and-indexes) with
+durable transactions, compaction, clones and integrity checks.
+[History and branches](storage/README.md#versioning-and-history) provide retained
+commits, time travel, diffs, change feeds, RDF Patch and merge review.
+
+<a id="search"></a>
+<a id="full-text-search"></a>
+<a id="vector-search-and-embeddings"></a>
+<a id="path-search"></a>
+<a id="graph-algorithms"></a>
+<a id="geosparql"></a>
+<a id="geometry-literals-and-functions"></a>
+<a id="spatial-index-and-queries"></a>
+
+### Search and graph analysis
+
+Combine [full-text, vector and hybrid search](search/README.md#search) with SPARQL
+patterns, path search and graph algorithms. [GeoSPARQL](search/README.md#geosparql)
+adds geometry functions, spatial indexes, joins and nearest-neighbour ordering within
+the documented geometry and query limits.
+
+<a id="reasoning"></a>
+<a id="shacl"></a>
+<a id="shex"></a>
+<a id="write-time-validation"></a>
+<a id="schema-discovery-and-drafted-shapes"></a>
+
+### Reasoning, validation and schema
+
+Derive facts with [RDFS, OWL 2 RL and Jena rules](reasoning/README.md#reasoning),
+and inspect explanations. Validate data with [SHACL](reasoning/README.md#shacl),
+[ShEx](reasoning/README.md#shex) and write guards, or
+[discover schema and draft shapes](reasoning/README.md#schema-discovery-and-drafted-shapes)
+from existing data.
+
+<a id="server-and-protocols"></a>
+<a id="sparql-protocol-and-fuseki-compatibility"></a>
+<a id="graphql"></a>
+<a id="stored-queries"></a>
+<a id="access-control-and-security"></a>
+
+### Server and security
+
+Serve [SPARQL and Graph Store protocols](server/README.md#server-and-protocols),
+GraphQL and stored queries, with supported Fuseki administration and configuration.
+[Access controls](server/README.md#access-control-and-security) cover datasets,
+graphs and triples, with OIDC and API-token authentication.
+
+<a id="mcp-server"></a>
+<a id="questions-in-plain-language"></a>
+<a id="agent-memory"></a>
+<a id="document-ingestion"></a>
+<a id="community-reports-graphrag"></a>
+
+### AI and agents
+
+Connect agents through [MCP](ai/README.md#mcp-server), turn
+[questions into checked queries](ai/README.md#questions-in-plain-language), and keep
+[cited memory](ai/README.md#agent-memory). Review
+[document ingestion](ai/README.md#document-ingestion) and build
+[GraphRAG community reports](ai/README.md#community-reports-graphrag).
+
+<a id="web-ui"></a>
+<a id="query-page"></a>
+<a id="explore"></a>
+<a id="maps"></a>
+<a id="history-and-time-travel"></a>
+<a id="datasets-validation-and-editing"></a>
+
+### Visualization and editing
+
+Use the [web UI](visualization/README.md#web-ui) to edit queries and inspect result
+tables, graphs and plans. [Explore](visualization/README.md#explore),
+[maps](visualization/README.md#maps), history views and validation tools support
+connected graph inspection and editing.
+
+<a id="libraries-and-bindings"></a>
+
+### Libraries and integrations
+
+Embed the same engine through [Rust, Python, JVM and Node.js APIs](integrations/README.md#libraries-and-bindings),
+or connect through the Rust HTTP client. The guide describes Jena integration and the
+administration, callback and platform coverage that differs between bindings.
+
+<a id="operations"></a>
+<a id="deployment"></a>
+<a id="settings-and-notifications"></a>
+<a id="memory-and-resource-limits"></a>
+<a id="observability"></a>
+<a id="backups"></a>
+<a id="upgrades-and-on-disk-formats"></a>
+
+### Deployment and operations
+
+Deploy through [NixOS, Docker or the server binary](operations/README.md#deployment).
+Manage settings, resource limits, notifications and observability, and use
+[backups](operations/README.md#backups), integrity checks and format migration to
+operate datasets.
 
 ## Capability status
 
@@ -89,250 +200,6 @@ implementation status.
 | [Query by example and notebooks](#known-gaps) | Planned. | Items 28 and 30 describe these interfaces. The existing visual query builder is available. |
 | [Local-first engine and ontology object API](#known-gaps) | Planned. | Items 44 and 71 describe these extensions. Ordinary RDF ontology graphs already work. |
 
-## Standards conformance
-
-Read the [feature documentation](querying/README.md#standards-conformance).
-
-## Storage and indexes
-
-Read the [feature documentation](storage/README.md#storage-and-indexes).
-
-### Indexes and vocabulary
-
-Read the [feature documentation](storage/README.md#indexes-and-vocabulary).
-
-### Cold reads
-
-Read the [feature documentation](storage/README.md#cold-reads).
-
-### Loading data
-
-Read the [feature documentation](storage/README.md#loading-data).
-
-### Transactions and durability
-
-Read the [feature documentation](storage/README.md#transactions-and-durability).
-
-### Compaction, clones and integrity
-
-Read the [feature documentation](storage/README.md#compaction-clones-and-integrity).
-
-## Versioning and history
-
-Read the [feature documentation](storage/README.md#versioning-and-history).
-
-### Commits
-
-Read the [feature documentation](storage/README.md#commits).
-
-### Time travel
-
-Read the [feature documentation](storage/README.md#time-travel).
-
-### Diffs, change feed and history queries
-
-Read the [feature documentation](storage/README.md#diffs-change-feed-and-history-queries).
-
-### Branches and merges
-
-Read the [feature documentation](storage/README.md#branches-and-merges).
-
-### RDF Patch
-
-Read the [feature documentation](storage/README.md#rdf-patch).
-
-## SPARQL queries and updates
-
-Read the [feature documentation](querying/README.md#sparql-queries-and-updates).
-
-### Query and update language
-
-Read the [feature documentation](querying/README.md#query-and-update-language).
-
-### Jena ARQ extensions
-
-Read the [feature documentation](querying/README.md#jena-arq-extensions).
-
-### Federated queries
-
-Read the [feature documentation](querying/README.md#federated-queries).
-
-### Planning and execution
-
-Read the [feature documentation](querying/README.md#planning-and-execution).
-
-### Explaining queries
-
-Read the [feature documentation](querying/README.md#explaining-queries).
-
-### Incremental views and live queries
-
-Read the [feature documentation](querying/README.md#incremental-views-and-live-queries).
-
-## Search
-
-Read the [feature documentation](search/README.md#search).
-
-### Full-text search
-
-Read the [feature documentation](search/README.md#full-text-search).
-
-### Vector search and embeddings
-
-Read the [feature documentation](search/README.md#vector-search-and-embeddings).
-
-### Path search
-
-Read the [feature documentation](search/README.md#path-search).
-
-### Graph algorithms
-
-Read the [feature documentation](search/README.md#graph-algorithms).
-
-## GeoSPARQL
-
-Read the [feature documentation](search/README.md#geosparql).
-
-### Geometry literals and functions
-
-Read the [feature documentation](search/README.md#geometry-literals-and-functions).
-
-### Spatial index and queries
-
-Read the [feature documentation](search/README.md#spatial-index-and-queries).
-
-## Reasoning, validation and schema
-
-Read the [feature documentation](reasoning/README.md#reasoning-validation-and-schema).
-
-### Reasoning
-
-Read the [feature documentation](reasoning/README.md#reasoning).
-
-### SHACL
-
-Read the [feature documentation](reasoning/README.md#shacl).
-
-### ShEx
-
-Read the [feature documentation](reasoning/README.md#shex).
-
-### Write-time validation
-
-Read the [feature documentation](reasoning/README.md#write-time-validation).
-
-### Schema discovery and drafted shapes
-
-Read the [feature documentation](reasoning/README.md#schema-discovery-and-drafted-shapes).
-
-## Server and protocols
-
-Read the [feature documentation](server/README.md#server-and-protocols).
-
-### SPARQL protocol and Fuseki compatibility
-
-Read the [feature documentation](server/README.md#sparql-protocol-and-fuseki-compatibility).
-
-### GraphQL
-
-Read the [feature documentation](server/README.md#graphql).
-
-### Stored queries
-
-Read the [feature documentation](server/README.md#stored-queries).
-
-## Access control and security
-
-Read the [feature documentation](server/README.md#access-control-and-security).
-
-## AI and agents
-
-Read the [feature documentation](ai/README.md#ai-and-agents).
-
-### MCP server
-
-Read the [feature documentation](ai/README.md#mcp-server).
-
-### Questions in plain language
-
-Read the [feature documentation](ai/README.md#questions-in-plain-language).
-
-### Agent memory
-
-Read the [feature documentation](ai/README.md#agent-memory).
-
-### Document ingestion
-
-Read the [feature documentation](ai/README.md#document-ingestion).
-
-### Community reports (GraphRAG)
-
-Read the [feature documentation](ai/README.md#community-reports-graphrag).
-
-## Web UI
-
-Read the [feature documentation](visualization/README.md#web-ui).
-
-### Query page
-
-Read the [feature documentation](visualization/README.md#query-page).
-
-### Explore
-
-Read the [feature documentation](visualization/README.md#explore).
-
-### Maps
-
-Read the [feature documentation](visualization/README.md#maps).
-
-### History and time travel
-
-Read the [feature documentation](visualization/README.md#history-and-time-travel).
-
-### Datasets, validation and editing
-
-Read the [feature documentation](visualization/README.md#datasets-validation-and-editing).
-
-## Libraries and bindings
-
-Read the [feature documentation](integrations/README.md#libraries-and-bindings).
-
-## Command line
-
-Read the [feature documentation](querying/README.md#command-line).
-
-## Formatter and editor support
-
-Read the [feature documentation](querying/README.md#formatter-and-editor-support).
-
-## Operations
-
-Read the [feature documentation](operations/README.md#operations).
-
-### Deployment
-
-Read the [feature documentation](operations/README.md#deployment).
-
-### Settings and notifications
-
-Read the [feature documentation](operations/README.md#settings-and-notifications).
-
-### Memory and resource limits
-
-Read the [feature documentation](operations/README.md#memory-and-resource-limits).
-
-### Observability
-
-Read the [feature documentation](operations/README.md#observability).
-
-### Backups
-
-Read the [feature documentation](operations/README.md#backups).
-
-### Upgrades and on-disk formats
-
-Read the [feature documentation](operations/README.md#upgrades-and-on-disk-formats).
-
 ## Compatibility boundaries
 
 These are documented scope and compatibility choices. They do not mark a completed
@@ -363,46 +230,19 @@ roadmap item as unfinished or promise another implementation.
 
 These are implementation limits, missing controls, and features that other RDF stores
 have and Sparkles does not. [COMPARISON.md](COMPARISON.md) covers each engine, and
-[BENCHMARKS.md](BENCHMARKS.md#where-sparkles-loses) covers performance. Each gap names
-the [roadmap](ROADMAP.md) items that address it, and the roadmap orders that work and
-links each item to its design spec.
+[BENCHMARKS.md](BENCHMARKS.md#where-sparkles-loses) covers performance. The summaries below link to the full limits in each category guide. Those guides name
+the [roadmap](ROADMAP.md) items that address each gap, and the roadmap orders the work
+and links each item to its design spec.
 
-### Storage and execution
-
-Read the [current feature limits](storage/README.md#storage-and-execution).
-
-### Versioning and history
-
-Read the [current feature limits](storage/README.md#versioning-and-history-1).
-
-### SPARQL and formats
-
-Read the [current feature limits](querying/README.md#sparql-and-formats).
-
-### Search and graph algorithms
-
-Read the [current feature limits](search/README.md#search-and-graph-algorithms).
-
-### GeoSPARQL
-
-Read the [current feature limits](search/README.md#geosparql-1).
-
-### Reasoning and validation
-
-Read the [current feature limits](reasoning/README.md#reasoning-and-validation).
-
-### Server, access control and operations
-
-Read the [current feature limits](server/README.md#server-access-control-and-operations).
-
-### AI and agents
-
-Read the [current feature limits](ai/README.md#ai-and-agents-1).
-
-### Web UI
-
-Read the [current feature limits](visualization/README.md#web-ui-1).
-
-### Bindings and packaging
-
-Read the [current feature limits](integrations/README.md#bindings-and-packaging).
+| Area | Remaining scope |
+|---|---|
+| <a id="storage-and-execution"></a>[Storage and execution](storage/README.md#storage-and-execution) | Compaction controls, larger-scale measurements and storage configuration remain. |
+| <a id="versioning-and-history-1"></a>[Versioning and history](storage/README.md#versioning-and-history-1) | Historical search and further branch administration remain. |
+| <a id="sparql-and-formats"></a>[SPARQL and formats](querying/README.md#sparql-and-formats) | Additional query surfaces, execution coverage, formats and editor support remain. |
+| <a id="search-and-graph-algorithms"></a>[Search and graph algorithms](search/README.md#search-and-graph-algorithms) | Multi-field search, quantization and further algorithm surfaces remain. |
+| <a id="geosparql-1"></a>[GeoSPARQL](search/README.md#geosparql-1) | Per-row nearest-neighbour geometry and further geometry and CRS support remain. |
+| <a id="reasoning-and-validation"></a>[Reasoning and validation](reasoning/README.md#reasoning-and-validation) | Automatic reasoning selection, a separate derived layer and remaining validation and form work remain. |
+| <a id="server-access-control-and-operations"></a>[Server, access control and operations](server/README.md#server-access-control-and-operations) | Further Fuseki integration, derived visibility, audit coverage and operational controls remain. |
+| <a id="ai-and-agents-1"></a>[AI and agents](ai/README.md#ai-and-agents-1) | Ask accuracy, contextual linking, ingestion formats and configurable reports remain. |
+| <a id="web-ui-1"></a>[Web UI](visualization/README.md#web-ui-1) | Live profiling, additional query-builder blocks and larger graph rendering remain. |
+| <a id="bindings-and-packaging"></a>[Bindings and packaging](integrations/README.md#bindings-and-packaging) | Callback completion, administration parity and additional release platforms remain. |
