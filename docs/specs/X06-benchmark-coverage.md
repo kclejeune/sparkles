@@ -1342,3 +1342,28 @@ The Intel check uses the same source revisions, compilers, data and query settin
 both engines run alone on the host. It checks the small queries that Namespace cannot
 resolve and profiles any repeated instruction or latency increase before choosing a fix.
 No row is removed merely because its increase is below the push gate.
+
+
+### BIND reuse across cursor batches
+
+Automatic streaming of large groupings exposed a difference from eager expression reuse.
+A computed BIND could evaluate the same stored temporal term again in every morsel,
+although eager execution evaluated the expression once per distinct input. The cursor
+now retains an optional map for pure expressions that read one variable. A bounded pilot
+requires observed repeated IDs, without inspecting query names, function names or data
+identifiers. Stored, delta, inline and query-local inputs use exact RDF term identity,
+including lexical form and datatype. Cached errors remain unbound BIND results.
+
+The map belongs to the query and its snapshot. It retains at most 65,536 entries and
+charges about 6 MiB conservatively, beside the current batch. Dense inline integer
+admission retains its smaller cap. Refused optional growth keeps a bounded partial map
+and evaluates uncached keys normally. Identity copies, volatile expressions and
+application callbacks retain their ordinary execution. Cancellation checks continue on
+batches answered entirely from the map.
+
+A physical control evaluates 32 stored date terms once across 12,288 input rows. An
+independent calendar oracle covers leap days, negative years, year zero, invalid lexical
+forms, timezones and the dateTime end-of-day boundary. Eager and native cursor answers
+retain their values and RDF datatypes with caching enabled and disabled. Other controls
+cover distinct lexical forms, local and unbound values, changed stores and retained
+snapshots, optional memory refusal, finite physical work and cancellation.
