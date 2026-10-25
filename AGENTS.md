@@ -49,6 +49,10 @@ work, and each item links to its design spec in [docs/specs](docs/specs/README.m
 
 - Commit in logical chunks that each compile and pass their tests. Do not add attribution
   lines to commit messages.
+- New specs use `docs/specs/<ID-and-name>/README.md` and `SPEC.md`, including small specs.
+  Keep a concise Outcome overview in `SPEC.md` and link to an optional `OUTCOME.md` for
+  a substantial delivery record. Follow the [spec layout](docs/specs/README.md#spec-layout)
+  when creating or migrating a spec.
 - When a roadmap item or spec phase ships, update its spec's Outcome section,
   [docs/FEATURES.md](docs/FEATURES.md), [docs/BENCHMARKS.md](docs/BENCHMARKS.md) when there
   are numbers, and the item's row in [docs/ROADMAP.md](docs/ROADMAP.md), all in the same

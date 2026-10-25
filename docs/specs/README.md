@@ -6,17 +6,53 @@ sources were public standards, published papers, the Sparkles code, and the docu
 and permissively licensed code of other projects. [PROVENANCE.md](PROVENANCE.md) records
 the sources of each spec and the dependencies it brought in.
 
-Each spec opens with a status block that gives its status, the phases shipped and links
-to the user docs. It closes with an **Outcome** section, which records what was delivered,
-where the implementation departed from the design and why, and the decisions the
-maintainer made. The Outcome also gives the test and conformance results at landing, the
-measured performance, and what was deferred or rejected. The text in between is the
-design as it was written. Where the design and the code disagree, the code,
+Each spec has a landing page that gives its status, the phases shipped and links to the
+user docs. Its design closes with an **Outcome** overview of what was delivered,
+important departures and the work that remains. A substantial delivery record has its
+own linked document with implementation decisions, test and conformance results,
+measurements, and deferred or rejected work. The design remains as it was written.
+Where the design and the code disagree, the code,
 [the API reference](../API.md) and [the feature list](../FEATURES.md) describe the current
 behaviour, and the Outcome explains the difference.
 
 [ARCHITECTURE.md](../ARCHITECTURE.md) connects the implemented decisions across these
 specs with an overview of the library, storage, execution and server boundaries.
+
+## Spec layout
+
+Every new spec uses a directory named for its stable ID and descriptive name, with
+`README.md` and `SPEC.md` as the default files. This applies to small specs too.
+
+```text
+docs/specs/<ID-and-name>/
+  README.md
+  SPEC.md
+```
+
+`README.md` is the engineering landing page. It owns the spec's current status and
+phase summary and links to the design, relevant user guides and remaining roadmap
+items. Keep it brief and useful rather than repeating the design.
+
+`SPEC.md` holds the design, rationale, contracts and acceptance criteria. Its final
+Outcome section gives a concise delivery overview, the important departures from the
+design and links to remaining work. A small spec can keep its complete outcome there.
+
+Add `OUTCOME.md` when the implementation record benefits from its own sections, such as
+several delivered phases, substantial design decisions or detailed validation and
+measurements. Organize that record by phase or topic. Keep the Outcome overview in
+`SPEC.md` and link it to the detailed record. The detailed record links back to the
+overview. Diagrams, fixtures and further supporting files can live beside these files
+when needed.
+
+Existing single-file specs retain their current paths until migrated. Their opening
+status block serves as their landing page, and their Outcome section keeps the delivery
+record. A migration preserves the spec ID and original design, separates the current
+summary from the detailed record, and updates repository links and heading anchors in
+the same change. A Markdown stub does not automatically redirect an old heading anchor.
+
+When adding user-facing feature folders, put capabilities, configuration, usage and
+feature roadmap pages there and link to the relevant specs here. A spec may support
+several feature pages.
 
 ## How to use them
 
@@ -25,9 +61,10 @@ specs with an overview of the library, storage, execution and server boundaries.
   choices (usually with Jena or Fuseki), the failure modes, and the acceptance examples
   the tests were written from. Read the spec before you change the feature.
 * **Kept with the code.** When a change alters a feature's behaviour, update its spec in
-  the same change. Amend or extend the Outcome and leave the original design as it was,
-  so the record of how the feature came about stays intact. A new feature of similar size
-  gets a new spec here, with a new ID and a PROVENANCE entry.
+  the same change. Update its current status, Outcome overview and detailed delivery
+  record when present. Leave the original design as it was, so the record of how the
+  feature came about stays intact. A new feature of similar size gets a new spec bundle
+  here, with a new ID and a PROVENANCE entry.
 * **Cross-references.** Specs refer to each other by ID and section, such as
   [C10 §6.2](C10-write-time-validation.md). A `§` number refers to a section of the spec
   it names. Inside a spec, the labels `A1`, `A2` and so on number its acceptance examples.
