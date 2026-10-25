@@ -420,13 +420,16 @@ class Handler(http.server.BaseHTTPRequestHandler):
         n = int(self.headers.get("Content-Length") or 0)
         sent = self.rfile.read(n).decode()
         Handler.bodies.append((self.path, sent))
-        if self.path in ("/tsv", "/tsv-short"):
+        if self.path in ("/tsv", "/tsv-short", "/tsv-chunked-short"):
             body = b'?x\n"1"\n"2"\n'
             self.send_response(200)
             self.send_header("Content-Type", "text/tab-separated-values")
-            self.send_header("Content-Length", str(len(body) + (20 if self.path == "/tsv-short" else 0)))
+            if self.path == "/tsv-chunked-short":
+                self.send_header("Transfer-Encoding", "chunked")
+            else:
+                self.send_header("Content-Length", str(len(body) + (20 if self.path == "/tsv-short" else 0)))
             self.end_headers()
-            self.wfile.write(body)
+            self.wfile.write(f"{len(body):x}\r\n".encode() + body + b"\r\n" if self.path == "/tsv-chunked-short" else body)
             self.close_connection = True
             return
         if self.path == "/slow":
@@ -487,6 +490,10 @@ class RequestTests(unittest.TestCase):
         bad, _ = self.answer("/tsv-short", "SELECT ?x {}", flags=("--stream-tsv",))
         self.assertEqual(bad["rows"], "error")
         self.assertIn("incomplete HTTP", bad["error"])
+
+    def test_streamed_tsv_rejects_chunked_response_without_terminal_chunk(self):
+        bad, _ = self.answer("/tsv-chunked-short", "SELECT ?x {}", flags=("--stream-tsv",))
+        self.assertEqual(bad["rows"], "error")
 
     def test_post_response_sorting_is_outside_the_request_deadline(self):
         original = ba.sorted_row_digest

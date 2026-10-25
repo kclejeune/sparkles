@@ -687,6 +687,19 @@ def canonical_tsv_field(text):
     return repr(term(parsed, False)), repr(term(parsed, True))
 
 
+def response_lines(response):
+    """Split a strict HTTP body reader into lines without hiding chunk framing failures."""
+    read = getattr(response, "read1", response.read)
+    pending = b""
+    while chunk := read(1 << 16):
+        pieces = (pending + chunk).split(b"\n")
+        pending = pieces.pop()
+        for piece in pieces:
+            yield piece + b"\n"
+    if pending:
+        yield pending
+
+
 def streamed_tsv_record(response, query, count_only, raw_path=None, finish_response=None):
     """Consume a complete unordered SELECT response with one row in memory.
 
@@ -697,8 +710,10 @@ def streamed_tsv_record(response, query, count_only, raw_path=None, finish_respo
         raise ValueError("streamed TSV fingerprints require an unordered SELECT")
     raw = open(raw_path + ".tmp", "wb") if raw_path else None
     try:
+        lines = iter(response_lines(response))
+
         def line():
-            data = response.readline()
+            data = next(lines, b"")
             if raw:
                 raw.write(data)
             if data and not data.endswith(b"\n"):

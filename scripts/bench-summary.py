@@ -64,11 +64,12 @@ lr = load(f"{d}/load.json")
 if lr:
     row("**load** (s)", {c: lr[LOADNAME.get(c, c)] for c in cmds if LOADNAME.get(c, c) in lr}, f=lambda r: f"{r['mean']:.2f}")
 answers = json.load(open(f"{d}/answers.json")) if os.path.exists(f"{d}/answers.json") else {}
+spec = importlib.util.spec_from_file_location("record", Path(__file__).with_name("bench-record.py"))
+record = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(record)
+record.compatible_fingerprints(answers)
 verified = {}
 if os.path.exists(f"{d}/answer-validation.json"):
-    spec = importlib.util.spec_from_file_location("record", Path(__file__).with_name("bench-record.py"))
-    record = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(record)
     manifest = json.load(open(f"{d}/manifest.json"))
     validation = json.load(open(f"{d}/answer-validation.json"))
     hashes = [v.get("sha256") for v in manifest.get("data", {}).values()]

@@ -17,6 +17,14 @@
 
 DEAD_ENGINES=${DEAD_ENGINES:-}
 
+engine_started() {
+  local engine=$1 other kept=""
+  for other in $DEAD_ENGINES; do
+    [ "$other" = "$engine" ] || kept="$kept $other"
+  done
+  DEAD_ENGINES=${kept# }
+}
+
 # Resolve preparation after the probes, since a restart can change QLever's URL.
 # A server left out of the remaining queries has no cache to clear.
 cache_prepare() {
@@ -35,7 +43,10 @@ answering() {
 
 # revive <engine> <after> <results dir>: restart an engine that no longer answers
 revive() {
-  answering "$1" && return 0
+  if answering "$1"; then
+    engine_started "$1"
+    return 0
+  fi
   if declare -F start > /dev/null && declare -F stop > /dev/null; then
     log "$1: no answer after $2, restarting it"
     stop "$1"
@@ -46,6 +57,7 @@ revive() {
       FAILED_ENGINES="${FAILED_ENGINES:-} $1"
       return 0
     fi
+    engine_started "$1"
     python3 - "$3/restarts.json" "${NAME[$1]}" "$2" << 'EOF'
 import json, os, sys, time
 f, engine, after = sys.argv[1:]

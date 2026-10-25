@@ -216,6 +216,7 @@ start() {
     if curl -sf -o /dev/null --max-time 5 "$ready" 2> /dev/null; then
       t1=$(date +%s.%N)
       READY_S[$e]=$(awk "BEGIN {printf \"%.3f\", $t1 - $t0}")
+      engine_started "$e"
       return 0
     fi
     kill -0 "${PID[$e]}" 2> /dev/null || {

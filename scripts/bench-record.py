@@ -255,11 +255,43 @@ def load_json(d, name):
     return json.load(open(p)) if os.path.exists(p) else None
 
 
+def answer_algorithm(answer):
+    """The fingerprint contract, including legacy records that have no explicit marker."""
+    value = answer.get("value") or answer.get("exact") or answer.get("hash")
+    if value and value.startswith("row-sha256-v1:"):
+        inferred = "row-sha256-v1"
+    elif value and ":" in value:
+        raise ValueError("unknown answer fingerprint algorithm: " + value.split(":", 1)[0])
+    elif not value or (value.isdecimal() and len(value) != 16):
+        inferred = "row-count-v1"
+    else:
+        inferred = "canonical-sha256-v1"
+    explicit = answer.get("algorithm")
+    if explicit is not None:
+        if explicit not in {"row-sha256-v1", "canonical-sha256-v1", "row-count-v1"}:
+            raise ValueError("unknown answer fingerprint algorithm: " + str(explicit))
+        if explicit != inferred and not answer.get("instances"):
+            raise ValueError("incompatible fingerprint algorithms in answer metadata")
+    return explicit or inferred
+
+
+def compatible_fingerprints(answers):
+    """Refuse retained captures with different algorithms before any majority vote."""
+    for query, per in (answers or {}).items():
+        algorithms = {answer_algorithm(value) for value in per.values()
+                      if value.get("rows") != "error" and value.get("exact") != "unchecked"
+                      and value.get("value") != "unchecked"}
+        if len(algorithms) > 1:
+            raise ValueError(f"{query}: incompatible fingerprint algorithms {sorted(algorithms)}; "
+                             "rerun answer checks for every engine")
+
+
 def fingerprints(answers, validation=None, source_hashes=()):
     """Per query and engine: (rows, hash, agrees). Agreement is with the majority of the engines
     that answered, on the digest by value; None when there is no majority. A bound data oracle overrides this screen."""
     if validation is not None and validation.get("version") != 1:
         raise ValueError("unknown answer-validation version")
+    compatible_fingerprints(answers)
     out = {}
     for q, per in (answers or {}).items():
         # The DESCRIBE sentinel records an intentionally skipped comparison. It
@@ -283,7 +315,7 @@ def fingerprints(answers, validation=None, source_hashes=()):
                 out[q, en] = None
             else:
                 agrees = None if ref is None or len(vals) == 1 else digest[e] == ref
-                out[q, en] = {"rows": v["rows"], "hash": digest[e], "agrees": agrees}
+                out[q, en] = {"rows": v["rows"], "hash": digest[e], "agrees": agrees, "algorithm": answer_algorithm(v)}
                 verdict = ((validation or {}).get("queries", {}).get(q) or {}).get(e)
                 if verdict is not None:
                     matched = verdict.get("fingerprint", {})
@@ -369,7 +401,11 @@ def pool(results):
                            key=lambda t: (t[0], t[1]))
             text = "\n".join(f"{name}\t{a['hash']}" for _, name, a in pairs)
             h = hashlib.sha256(text.encode()).hexdigest()[:16]
-            answer = {"rows": sum(x["rows"] for x in answers), "hash": h, "agrees": agrees, "instances": len(rs)}
+            algorithms = {answer_algorithm(x) for x in answers}
+            if len(algorithms) > 1:
+                raise ValueError(f"{template}: incompatible fingerprint algorithms across instances")
+            answer = {"rows": sum(x["rows"] for x in answers), "hash": h, "agrees": agrees, "instances": len(rs),
+                      "algorithm": next(iter(algorithms))}
             if all(x.get("verification", {}).get("method") == "data-oracle" for x in answers):
                 answer["verification"] = {"method": "data-oracle",
                     "instances": {name: a["verification"] for _, name, a in pairs}}

@@ -24,6 +24,7 @@ reported.
 
 import argparse
 import hashlib
+import importlib.util
 import json
 import os
 from pathlib import Path
@@ -46,6 +47,9 @@ def compare_main(argv):
     ap.add_argument('--no-fail', action='store_true', help='exit with status 0 even when something is reported')
     ap.add_argument('--all', action='store_true', help='also print the pairs that did not change')
     a = ap.parse_args(argv)
+    spec = importlib.util.spec_from_file_location("record", Path(__file__).with_name("bench-record.py"))
+    record_api = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(record_api)
     if len(a.records) < 2:
         ap.error('compare needs at least two records')
     recs = []
@@ -78,6 +82,15 @@ def compare_main(argv):
             o, n = io[k], inew[k]
             label = f'{k[2]} {k[3]} {k[4]}' + (f' x{k[5]}' if k[5] != 1 else '')
             oa, na = o.get('answer'), n.get('answer')
+            if oa and na:
+                try:
+                    same_algorithm = record_api.answer_algorithm(oa) == record_api.answer_algorithm(na)
+                except ValueError as error:
+                    print(str(error), file=sys.stderr)
+                    return 2
+                if not same_algorithm:
+                    print(f'{label}: incompatible fingerprint algorithms; rerun compared answer checks', file=sys.stderr)
+                    return 2
             if oa and na and oa.get('hash') != na.get('hash'):
                 findings.append(f'ANSWER CHANGED {label}: {oa.get("rows")} rows -> {na.get("rows")} rows')
             if o.get('status') == 'ok' and n.get('status') != 'ok':

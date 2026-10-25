@@ -285,6 +285,7 @@ suite_run() {
         FAILED_ENGINES="$FAILED_ENGINES $e"
         continue
       fi
+      engine_started "$e"
       up="$up $e"
       warm_pass "$e"
       suite_time
