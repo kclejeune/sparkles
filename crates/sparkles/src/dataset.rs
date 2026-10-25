@@ -68,8 +68,22 @@ pub const ORIGIN_FILE: &str = "origin.json";
 /// the reasoning record of `reasoning.json` and the clone origin of `origin.json`.
 #[derive(Clone)]
 pub struct Dataset {
+    // Declared before `inner` so the last handle stops its worker while the
+    // dataset is still alive, independently of temporary worker/host references.
+    pub(crate) _lifetime: Arc<DatasetLifetime>,
     pub(crate) inner: Arc<DatasetState>,
     pub(crate) alias: Option<Arc<str>>,
+}
+
+/// Shared only by Dataset handles, never by the views worker or its host.
+pub(crate) struct DatasetLifetime(std::sync::Weak<DatasetState>);
+
+impl Drop for DatasetLifetime {
+    fn drop(&mut self) {
+        if let Some(state) = self.0.upgrade() {
+            state.views.close(&state.store);
+        }
+    }
 }
 
 /// How [`Dataset::open_with`] and [`Dataset::from_store_with`] open a dataset: the
@@ -333,32 +347,34 @@ impl Dataset {
             StoreHandle::Branch(_) => None,
         };
         let views = crate::incr::Runtime::open(views_root, store.dataset_id(), opts.views.clone());
+        let inner = Arc::new(DatasetState {
+            views,
+            views_worker: std::sync::OnceLock::new(),
+            branches: Mutex::new(BTreeMap::new()),
+            branch_handles: Mutex::new(Vec::new()),
+            closure_cache_triples: opts.closure_cache_triples,
+            pool: opts.pool,
+            name: opts.name,
+            queries,
+            mappings,
+            algo,
+            #[cfg(feature = "graphql")]
+            graphql,
+            reasoning: RwLock::new(reasoning),
+            #[cfg(feature = "reasoning")]
+            closure: sparkles_reasoner::Cache::new(opts.closure_cache_triples),
+            rdfs: RwLock::new(rdfs),
+            validation: RwLock::new(validation),
+            guard_error: RwLock::new(guard_error),
+            schema_cache: Mutex::new(Vec::new()),
+            objects_cache: Mutex::new(ObjectsCache::default()),
+            origin,
+            store,
+        });
         Dataset {
+            _lifetime: Arc::new(DatasetLifetime(Arc::downgrade(&inner))),
+            inner,
             alias: None,
-            inner: Arc::new(DatasetState {
-                views,
-                views_worker: std::sync::OnceLock::new(),
-                branches: Mutex::new(BTreeMap::new()),
-                branch_handles: Mutex::new(Vec::new()),
-                closure_cache_triples: opts.closure_cache_triples,
-                pool: opts.pool,
-                name: opts.name,
-                queries,
-                mappings,
-                algo,
-                #[cfg(feature = "graphql")]
-                graphql,
-                reasoning: RwLock::new(reasoning),
-                #[cfg(feature = "reasoning")]
-                closure: sparkles_reasoner::Cache::new(opts.closure_cache_triples),
-                rdfs: RwLock::new(rdfs),
-                validation: RwLock::new(validation),
-                guard_error: RwLock::new(guard_error),
-                schema_cache: Mutex::new(Vec::new()),
-                objects_cache: Mutex::new(ObjectsCache::default()),
-                origin,
-                store,
-            }),
         }
     }
 

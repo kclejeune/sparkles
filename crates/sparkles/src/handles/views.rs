@@ -122,31 +122,16 @@ pub(crate) fn start(state: &Arc<DatasetState>, host: Option<Arc<dyn Host>>) {
         let weak = Arc::downgrade(state);
         let name = format!("sparkles-views-{}", state.name.as_deref().unwrap_or("ds"));
         let name: String = name.chars().take(15).collect();
-        // a dataset only the worker holds is gone: it is closed rather than maintained
+        // The last Dataset handle closes the runtime before releasing its state.
         if let Err(e) = state
             .views
             .spawn_worker(name, state.store.subscribe_commits(), move || {
-                weak.upgrade()
-                    .filter(|s| Arc::strong_count(s) > 1)
-                    .map(StoreRef)
+                weak.upgrade().map(StoreRef)
             })
         {
             tracing::error!("the views' worker did not start: {e}");
         }
     });
-}
-
-impl Drop for Dataset {
-    fn drop(&mut self) {
-        // The last handle waits for a round in progress, so that the dataset closes
-        // here and not on the views' thread a moment later.
-        if self.inner.views_worker.get().is_some() && Arc::strong_count(&self.inner) == 2 {
-            let t = std::time::Instant::now();
-            while self.inner.views.worker_busy() && t.elapsed() < Duration::from_secs(60) {
-                std::thread::sleep(Duration::from_millis(1));
-            }
-        }
-    }
 }
 
 /// A store reached through its dataset, which keeps it open for a round.
@@ -299,6 +284,166 @@ mod tests {
             matches!(&first, Some(crate::incr::LiveEvent::Snapshot { rows, .. }) if rows.len() == 1),
             "{first:?}"
         );
+    }
+
+    /// A host's temporary dataset reference must not let the final handle skip
+    /// waiting for the worker and leave the directory locked after drop returns.
+    #[test]
+    fn last_handle_waits_for_a_host_holding_the_dataset() {
+        struct PausedHost {
+            state: Weak<DatasetState>,
+            entered: std::sync::mpsc::Sender<()>,
+            release: parking_lot::Mutex<std::sync::mpsc::Receiver<()>>,
+        }
+        impl Host for PausedHost {
+            fn access(&self, _: Option<&str>) -> Result<Option<Arc<GraphAccess>>> {
+                Ok(None)
+            }
+            fn stored_query(&self, _: &str) -> Result<String> {
+                unreachable!()
+            }
+            fn inference(&self) -> Option<Inference> {
+                let state = self.state.upgrade().unwrap();
+                self.entered.send(()).unwrap();
+                self.release
+                    .lock()
+                    .recv_timeout(Duration::from_secs(10))
+                    .unwrap();
+                inference(&state)
+            }
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let ds = Dataset::open(dir.path()).unwrap();
+        let (entered_tx, entered) = std::sync::mpsc::channel();
+        let (release, release_rx) = std::sync::mpsc::channel();
+        ds.start_views(Arc::new(PausedHost {
+            state: Arc::downgrade(&ds.inner),
+            entered: entered_tx,
+            release: parking_lot::Mutex::new(release_rx),
+        }));
+        entered.recv_timeout(Duration::from_secs(10)).unwrap();
+        let (done_tx, done) = std::sync::mpsc::channel();
+        let closer = std::thread::spawn(move || {
+            drop(ds);
+            done_tx.send(()).unwrap();
+        });
+        let early = done.recv_timeout(Duration::from_millis(100));
+        release.send(()).unwrap();
+        closer.join().unwrap();
+        assert!(
+            matches!(early, Err(std::sync::mpsc::RecvTimeoutError::Timeout)),
+            "the last handle returned while the worker held the dataset"
+        );
+        let reopened = Dataset::open(dir.path()).unwrap();
+        assert_eq!(reopened.store().snapshot().commit, 0);
+    }
+
+    /// Other handles keep the worker usable, and simultaneous final drops still
+    /// stop it before the directory is reopened.
+    #[test]
+    fn cloned_handles_close_the_worker_only_after_the_last_drop() {
+        let dir = tempfile::tempdir().unwrap();
+        let ds = Dataset::open(dir.path()).unwrap();
+        let clone = ds.clone();
+        ds.views()
+            .put("v", ViewDef::table("SELECT ?s WHERE { ?s <urn:p> ?o }"))
+            .unwrap();
+        drop(ds);
+        clone.update("INSERT DATA { <urn:s> <urn:p> 1 }").unwrap();
+        clone
+            .views()
+            .wait_built("v", Duration::from_secs(10))
+            .unwrap();
+        assert_eq!(clone.views().read("v").unwrap().rows.len(), 1);
+        let barrier = Arc::new(std::sync::Barrier::new(8));
+        let mut handles = Vec::new();
+        for _ in 0..8 {
+            let ds = clone.clone();
+            let barrier = barrier.clone();
+            handles.push(std::thread::spawn(move || {
+                barrier.wait();
+                drop(ds);
+            }));
+        }
+        drop(clone);
+        for handle in handles {
+            handle.join().unwrap();
+        }
+        let reopened = Dataset::open(dir.path()).unwrap();
+        assert_eq!(reopened.store().snapshot().commit, 1);
+    }
+
+    /// A panicking round releases the shutdown gate during unwinding.
+    #[test]
+    fn a_panicking_views_worker_does_not_hold_the_dataset_open() {
+        struct PanickingHost(std::sync::mpsc::Sender<()>);
+        impl Host for PanickingHost {
+            fn access(&self, _: Option<&str>) -> Result<Option<Arc<GraphAccess>>> {
+                Ok(None)
+            }
+            fn stored_query(&self, _: &str) -> Result<String> {
+                unreachable!()
+            }
+            fn inference(&self) -> Option<Inference> {
+                self.0.send(()).unwrap();
+                panic!("worker fault");
+            }
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let ds = Dataset::open(dir.path()).unwrap();
+        let (entered_tx, entered) = std::sync::mpsc::channel();
+        ds.start_views(Arc::new(PanickingHost(entered_tx)));
+        entered.recv_timeout(Duration::from_secs(10)).unwrap();
+        drop(ds);
+        let _reopened = Dataset::open(dir.path()).unwrap();
+    }
+
+    /// A host can release the last handle from a callback while the worker holds
+    /// the registry lock. Checkpointing must wait until that round ends.
+    #[test]
+    fn a_host_can_release_the_last_dataset_handle_during_a_round() {
+        struct ReleasingHost {
+            ds: parking_lot::Mutex<Option<Dataset>>,
+            release: parking_lot::Mutex<std::sync::mpsc::Receiver<()>>,
+            done: std::sync::mpsc::Sender<()>,
+        }
+        impl Host for ReleasingHost {
+            fn access(&self, _: Option<&str>) -> Result<Option<Arc<GraphAccess>>> {
+                Ok(None)
+            }
+            fn stored_query(&self, _: &str) -> Result<String> {
+                unreachable!()
+            }
+            fn inference(&self) -> Option<Inference> {
+                self.release
+                    .lock()
+                    .recv_timeout(Duration::from_secs(10))
+                    .unwrap();
+                drop(self.ds.lock().take());
+                self.done.send(()).unwrap();
+                None
+            }
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let ds = Dataset::open(dir.path()).unwrap();
+        let state = ds.inner.clone();
+        let rt = state.views.clone();
+        let (release, release_rx) = std::sync::mpsc::channel();
+        let (done_tx, done) = std::sync::mpsc::channel();
+        let host = Arc::new(ReleasingHost {
+            ds: parking_lot::Mutex::new(None),
+            release: parking_lot::Mutex::new(release_rx),
+            done: done_tx,
+        });
+        ds.start_views(host.clone());
+        *host.ds.lock() = Some(ds);
+        release.send(()).unwrap();
+        done.recv_timeout(Duration::from_secs(10)).unwrap();
+        // Join the deferred shutdown after the callback has released its locks.
+        rt.close(&state.store);
+        assert!(rt.is_closed());
+        drop(state);
+        let _reopened = Dataset::open(dir.path()).unwrap();
     }
 
     /// The last handle of a dataset with running views closes it on its own thread, so

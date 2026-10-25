@@ -26,7 +26,7 @@ use crate::sparql::viewsvc::{ViewRead, ViewRows, ViewSource};
 use crate::store::{DeltaSubscription, Store};
 use crate::task::Control;
 use oxrdf::Term;
-use parking_lot::{Condvar, Mutex, RwLock};
+use parking_lot::{Condvar, Mutex, ReentrantMutex, RwLock};
 use rustc_hash::FxHashMap;
 use sha2::{Digest, Sha256};
 use spargebra::Query;
@@ -435,14 +435,35 @@ pub struct Runtime {
     closed: AtomicBool,
     /// the host's epoch the attached views resolved their principals under
     host_epoch: AtomicU64,
-    /// the worker holds the dataset for a round
-    busy: AtomicBool,
+    /// Serializes worker store acquisition and rounds with shutdown. Reentrancy
+    /// allows a worker store wrapper to close the runtime from its destructor.
+    worker: ReentrantMutex<()>,
+    /// A host may drop its last Dataset handle from inside a round. Cleanup then
+    /// waits until that round has released its registry and circuit locks.
+    worker_round: AtomicBool,
+    deferred_close: AtomicBool,
     /// the highest commit a circuit's result has reflected
     seen: AtomicU64,
     /// `seen` at the latest switch of the inference (0: none). The switch changes results
     /// without a commit, so a live query resumed at or before it gets the whole result,
     /// even when its circuit was collected and created again since.
     switched: AtomicU64,
+}
+
+/// Finish deferred shutdown after the round releases its locks, including while
+/// unwinding a panic. The worker's store wrapper remains alive until this drops.
+struct WorkerRound<'a> {
+    runtime: &'a Runtime,
+    store: &'a Store,
+}
+
+impl Drop for WorkerRound<'_> {
+    fn drop(&mut self) {
+        self.runtime.worker_round.store(false, Ordering::Release);
+        if self.runtime.deferred_close.swap(false, Ordering::AcqRel) {
+            self.runtime.close(self.store);
+        }
+    }
 }
 
 impl std::fmt::Debug for Runtime {
@@ -604,7 +625,9 @@ impl Runtime {
             last_checkpoint: Mutex::new(Instant::now()),
             closed: AtomicBool::new(false),
             host_epoch: AtomicU64::new(0),
-            busy: AtomicBool::new(false),
+            worker: ReentrantMutex::new(()),
+            worker_round: AtomicBool::new(false),
+            deferred_close: AtomicBool::new(false),
             seen: AtomicU64::new(0),
             switched: AtomicU64::new(0),
         })
@@ -1316,6 +1339,11 @@ impl Runtime {
 
     /// Stop the rounds and checkpoint every view (a clean close).
     pub fn close(&self, store: &Store) {
+        if self.worker.is_owned_by_current_thread() && self.worker_round.load(Ordering::Acquire) {
+            self.deferred_close.store(true, Ordering::Release);
+            return;
+        }
+        let _worker = self.worker.lock();
         if self.closed.swap(true, Ordering::AcqRel) {
             return;
         }
@@ -1359,19 +1387,21 @@ impl Runtime {
             };
             loop {
                 let Some(runtime) = rt.upgrade() else { return };
-                if runtime.is_closed() {
-                    return;
-                }
-                commits.borrow_and_update();
                 {
-                    runtime.busy.store(true, Ordering::Release);
-                    let Some(s) = store() else {
-                        runtime.busy.store(false, Ordering::Release);
+                    let _worker = runtime.worker.lock();
+                    if runtime.is_closed() {
                         return;
+                    }
+                    commits.borrow_and_update();
+                    let Some(s) = store() else { return };
+                    runtime.worker_round.store(true, Ordering::Release);
+                    let active = WorkerRound {
+                        runtime: &runtime,
+                        store: &s,
                     };
                     runtime.round(&s);
+                    drop(active);
                     drop(s);
-                    runtime.busy.store(false, Ordering::Release);
                 }
                 drop(runtime);
                 let gone = exec.block_on(async {
@@ -1395,9 +1425,9 @@ impl Runtime {
         })
     }
 
-    /// Whether the worker holds the dataset for a round.
+    /// Whether a worker round or its synchronized shutdown is in progress.
     pub fn worker_busy(&self) -> bool {
-        self.busy.load(Ordering::Acquire)
+        self.worker.is_locked()
     }
 
     /// Run a round on the worker and wait for it, at most `timeout`: views defined in
