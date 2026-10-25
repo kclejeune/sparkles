@@ -2565,6 +2565,14 @@ impl Operator {
         }
         info.actual_rows = 0;
         let vars = node.vars.clone();
+        // BIND's optional domain hint needs the intact input plan, not the
+        // empty shape shells left after child operator construction.
+        let bind_reuse = match &node.kind {
+            Kind::Extend(_, expr) => {
+                bind::Reuse::new(ctx, expr, node.children.first()).map(Box::new)
+            }
+            _ => None,
+        };
         // Read before the children below become shells that keep only their order.
         let value_ordered_input =
             matches!(node.kind, Kind::Distinct) && node.children.first().is_some_and(value_ordered);
@@ -2739,12 +2747,6 @@ impl Operator {
                 format!("{} has no resumable cursor implementation", node.operator())
             }
         });
-        let bind_reuse = match &node.kind {
-            Kind::Extend(_, expr) => {
-                bind::Reuse::new(ctx, expr, node.children.first()).map(Box::new)
-            }
-            _ => None,
-        };
         let state = if let Some(merge) = merge {
             State::Merge(Box::new(merge))
         } else if let Some(binary) = binary {

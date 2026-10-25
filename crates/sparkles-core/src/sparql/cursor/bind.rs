@@ -448,7 +448,12 @@ mod tests {
         use crate::sparql::plan::{GraphFilter, ScanSpec};
         let store = Store::in_memory(StoreOptions::default());
         let data = (0..4096)
-            .map(|i| format!("<urn:s{i}> <urn:p> \"value{}\" .\n", i % 3000))
+            .map(|i| {
+                format!(
+                    "<urn:s{i:05}> <urn:p> \"value{}\" .\n",
+                    if i == 1 { 0 } else { i % 3000 }
+                )
+            })
             .collect::<String>();
         store
             .load(&[Source::from_bytes(
@@ -483,6 +488,38 @@ mod tests {
         let expr = Expr::Call(Func::Builtin(Function::Str), vec![Expr::Var(input)]);
         let mut reuse = Reuse::new(&ctx, &expr, Some(&source)).unwrap();
         assert!(reuse.expected_reuse);
+        let mut bind = Node::leaf(
+            Kind::Extend(target, expr.clone()),
+            vec![input, target],
+            4096.0,
+            String::new(),
+        );
+        bind.children.push(source.clone());
+        let mut operator = super::super::Operator::build(
+            &ctx,
+            bind,
+            super::super::FallbackPolicy::RejectMaterialization,
+        )
+        .unwrap();
+        assert!(
+            operator.bind_reuse.as_ref().unwrap().expected_reuse,
+            "operator construction must inspect the input before replacing child plans with shells"
+        );
+        let options = super::super::CursorOptions {
+            batch_rows: 1024,
+            ..Default::default()
+        };
+        let mut rows = 0;
+        while let Some(batch) = operator.next(&ctx, &options, 1024).unwrap() {
+            rows += batch.table.len;
+            assert_eq!(batch.table.cols[0], batch.table.cols[1]);
+        }
+        assert_eq!(rows, 4096);
+        assert_eq!(
+            operator.bind_reuse.as_ref().unwrap().evaluations,
+            3000,
+            "a sparse first pilot must still reuse the bounded global domain across morsels"
+        );
         let table = || {
             let mut table = Table::new(vec![input]);
             table.cols[0] = (0..1024)
