@@ -1297,8 +1297,10 @@ could otherwise make a one-row cheap branch continue into an unnecessary wide op
 SELECT and effectful consumers retain their order and demand policy. Explicit
 streaming retains its execution and budget paths.
 Reordering requires an unchanged snapshot without a total produced-row cap. Scan
-rows use covering block upper bounds before graph filtering, and the remaining plan
-estimates must fit the row and memory budgets. Full filtered work includes raw scan
+rows use covering block upper bounds before graph filtering. Join outputs use the
+product of their input bounds, UNION sums them, and pure unary operators preserve
+them. Bounds must fit row and memory budgets. Index-probe joins retain their order
+because available fanout metadata is an estimate. Full filtered work includes raw scan
 work even when graph selectivity discounts the planner estimate. Pure projection
 admission remains independent.
 
@@ -1319,7 +1321,9 @@ hide an incorrect first-answer or nested-demand estimate. A mixed default/named 
 case keeps its 24-row VALUES answer within a 40-row cap despite a discounted competing
 scan estimate. A 400-row false filter behind 1,000 VALUES rows retains the original
 order under a 3,420 produced-row cap and produces exactly 3,001 rows. Reordering had
-added geometric scan retries and refused at 3,464 rows.
+added geometric scan retries and refused at 3,464 rows. A further test keeps a bounded
+filtered answer ahead of two 32-row VALUES inputs with UNDEF keys. Their 1,024-row
+compatible join exceeds its 1,000-row cap despite a 22.4-row planner estimate.
 
 ### Short-query checks after keyed inner groups
 

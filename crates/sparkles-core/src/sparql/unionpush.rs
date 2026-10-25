@@ -209,44 +209,51 @@ fn first_work(
     (work.is_finite() && work >= 0.0).then_some(work)
 }
 
-/// Decline a new operand order when full-plan estimates already exceed its
-/// resources. A cheaper materialized operand must not introduce a known refusal.
+/// A new order must fit conservative output bounds, including compatible-key
+/// products. Cardinality estimates do not bound a join whose inputs contain UNDEF.
 fn ordering_fits(ctx: &super::ctx::Ctx, root: &Node) -> bool {
     // Geometric prefix retries can produce more than one full scan. Keep the
     // original order under a finite total-work cap instead of certifying a sum.
     if ctx.max_rows_produced != u64::MAX || !ctx.snap.delta.is_empty() {
         return false;
     }
-    fn visit(
-        ctx: &super::ctx::Ctx,
-        node: &Node,
-        left: &mut usize,
-        bytes: &mut f64,
-        max_rows: f64,
-    ) -> bool {
-        if *left == 0 || !node.est.is_finite() || node.est < 0.0 {
-            return false;
+    fn visit(ctx: &super::ctx::Ctx, node: &Node, left: &mut usize, bytes: &mut u64) -> Option<u64> {
+        if *left == 0 || node.children.len() > MAX_BRANCHES {
+            return None;
         }
         *left -= 1;
-        let count = match &node.kind {
-            Kind::Values(table) => table.len() as f64,
-            Kind::Scan(scan) => scan_upper(ctx, scan) as f64,
-            _ => node.est,
-        };
-        if count > max_rows {
-            return false;
+        let mut children = [0u64; MAX_BRANCHES];
+        for (i, child) in node.children.iter().enumerate() {
+            children[i] = visit(ctx, child, left, bytes)?;
         }
-        *bytes += count * node.vars.len() as f64 * 8.0 + 128.0;
-        bytes.is_finite()
-            && node
-                .children
+        let count = match &node.kind {
+            Kind::Values(table) => table.len() as u64,
+            Kind::Scan(scan) => scan_upper(ctx, scan),
+            Kind::Empty => 0,
+            Kind::Join { .. } => children[0].checked_mul(children[1])?,
+            Kind::Union => children[..node.children.len()]
                 .iter()
-                .all(|c| visit(ctx, c, left, bytes, max_rows))
+                .try_fold(0u64, |sum, n| sum.checked_add(*n))?,
+            Kind::Project(_) | Kind::Filter(_) | Kind::Extend(..) | Kind::Sort(_) => children[0],
+            Kind::Slice { offset, limit } => children[0]
+                .saturating_sub(*offset as u64)
+                .min(limit.map_or(u64::MAX, |n| n as u64)),
+            // Probe fanout and duplicate input keys have no cheap output upper
+            // bound. Keep their original order rather than certify an estimate.
+            Kind::IndexJoin(_) => return None,
+            _ => return None,
+        };
+        if count > ctx.max_rows as u64 {
+            return None;
+        }
+        // Include room for pair indexes and capacity growth as well as columns.
+        let width = (node.vars.len() as u64).checked_mul(16)?.checked_add(64)?;
+        *bytes = bytes.checked_add(count.checked_mul(width)?.checked_add(128)?)?;
+        (*bytes <= ctx.memory_room()).then_some(count)
     }
-    let mut bytes = 0.0;
+    let mut bytes = 0;
     let mut left = MAX_SCREEN_NODES;
-    visit(ctx, root, &mut left, &mut bytes, ctx.max_rows as f64)
-        && bytes <= ctx.memory_room() as f64
+    visit(ctx, root, &mut left, &mut bytes).is_some()
 }
 
 /// An eager ASK needs one solution, so visit a cheaper pure UNION operand first.
@@ -569,6 +576,45 @@ fn safe_expression(expr: &Expression, moved: &[Variable], bound: &[Variable]) ->
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn compatible_undef_join_fanout_does_not_displace_a_bounded_answer() {
+        use crate::io::Source;
+        use crate::sparql::{QueryOptions, query};
+        use crate::store::{Store, StoreOptions};
+        let store = Store::in_memory(StoreOptions::default());
+        let mut data = String::new();
+        for i in 0..1000 {
+            data.push_str(&format!("<urn:s{i}> <urn:p> {i} .\n"));
+        }
+        data.push_str("<urn:g> {\n");
+        for i in 0..99_000 {
+            data.push_str(&format!("<urn:n{i}> <urn:q> {i} .\n"));
+        }
+        data.push_str("}\n");
+        store
+            .load(&[Source::from_bytes(
+                data.into_bytes(),
+                oxrdfio::RdfFormat::TriG,
+                None,
+            )])
+            .unwrap();
+        let values = vec!["UNDEF"; 32].join(" ");
+        let text = format!(
+            "ASK {{ {{ ?s <urn:p> ?v FILTER(?v != ?s) }} UNION {{ {{ VALUES ?x {{ {values} }} }} {{ VALUES ?x {{ {values} }} }} }} }}"
+        );
+        let result = query(
+            store.snapshot(),
+            &text,
+            &QueryOptions {
+                no_cache: true,
+                max_rows: Some(1000),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        assert!(result.boolean);
+    }
 
     #[test]
     fn graph_discounted_scan_estimates_do_not_admit_an_oversized_prefix() {

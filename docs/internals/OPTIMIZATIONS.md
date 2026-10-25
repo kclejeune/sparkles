@@ -308,8 +308,10 @@ Each of these can be switched off per query (`QueryOptions::optimizations`) or p
   instead of requesting at least 64 rows. SELECT and effectful consumers retain their
   order and demand policy. Explicit streaming uses its existing operators.
   Branch order changes only on an unchanged snapshot without a total produced-row cap.
-  Covering block counts bound scan rows before graph filtering, and other plan estimates
-  must fit the per-table row and memory budgets. Geometric prefix retries can exceed a
+  Covering block counts bound scan rows before graph filtering. Join bounds use the
+  product of their inputs, including compatible UNDEF keys, and UNION bounds sum their
+  operands. Bounds must fit the per-table row and memory budgets. Index probes retain
+  their original order because cheap metadata does not bound duplicate-key fanout. Geometric prefix retries can exceed a
   sum of full-plan rows, so finite produced-row caps retain the original operand order.
   Pure projection admission is independent, so reducing excess demand can still avoid
   unnecessary work.
