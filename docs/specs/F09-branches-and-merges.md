@@ -1842,8 +1842,11 @@ Tier 5, [ROADMAP](../ROADMAP.md)).
   (`Content-Type: application/vnd.sparkles.export`) or `sparkles clone --from-archive
   ds.spkx --to DIR`, in place of `--loc`, builds a database directory from it. The trailer's hash is checked before the new
   dataset is published. Since the stream does not depend on the index format, an
-  archive also moves a dataset between Sparkles versions whose formats differ, which
-  the deferred on-disk format policy (item 60) can name as the migration path.
+  archive also moves a dataset between Sparkles versions whose formats differ, using
+  the implemented on-disk format registry and compatibility policy of
+  [X12](X12-release-engineering.md#outcome). Item 60's remaining API stability policy
+  is not a prerequisite for archive transfer. Unknown required configuration or
+  archive versions still need a clean refusal before publication.
 
 Acceptance: a clone of `dev` at `commit:57` from server A to server B through `remote`,
 and through an archive file, gives a dataset whose quads, blank-node labels, prefixes

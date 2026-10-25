@@ -1320,3 +1320,16 @@ through GraphQL rather than SPARQL or the Graph Store.
 read predicates. [F13](F13-incremental-views-and-provenance.md)'s live queries give the
 incremental form: a subscription compiles its groups to F13 views and sends the
 changed nodes. It is built on F13 rather than as a re-run loop.
+
+### Completion contract
+
+Roadmap item 37 covers the remaining Phase 2 UI and schema editor as well as seeded
+execution, per-parent windows, nested connections and persisted queries with their
+MCP controls. Verify schema edits and invalidation, stored-only refusal, caller
+visibility and the existing differential query tests. The top-k acceptance counter
+must bound rows produced per parent, rather than only slicing the assembled JSON.
+
+Subscriptions remain conditional on a workload adopting Phase 3 and use F13 under
+item 17. Mutations remain a separately approved design, as §12 and the follow-up
+above state. Neither conditional extension can be treated as delivered merely because
+Phase 2 completes, and declining one must be recorded explicitly.

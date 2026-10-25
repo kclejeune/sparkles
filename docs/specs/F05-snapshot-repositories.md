@@ -1902,7 +1902,7 @@ and running scripts already use them, and because Fuseki has no other route unde
 ### Roadmap follow-ups (2026-10-12)
 
 **Whole-server backup and restore, every dataset in one request, a remote backup CLI,
-repository copy and content-defined chunking** (item 61, Tier 6,
+repository copy, content-defined chunking and retained-history storage controls** (item 61, Tier 6,
 [ROADMAP](../ROADMAP.md)).
 
 * **What is missing today.** The status block's list still holds. The repository routes
@@ -1946,6 +1946,33 @@ repository copy and content-defined chunking** (item 61, Tier 6,
   repositories too, and the manifest records the chunker per file so old backups stay
   readable.
 
+
+### Remaining history and retention contract
+
+Item 61 also completes the optional inclusion of F06 retained generations, pins and
+retention metadata from the original Phase 3. Capture those references consistently
+with the backup's head and protect their referenced files until transfer completes.
+Restore must answer every included retained commit and preserve its pins, without
+claiming to recover states that were already expired. The default remains a
+current-state backup. Version any new manifest contract and test both modes against
+older readers and unknown required fields.
+
+Complete storage-class selection and S3 Object Lock/WORM controls from Phase 3.
+Distinguish the repository's logical expiry from the object's enforced retention,
+so GC does not promise deletion before it is permitted. Acceptance covers locked
+blobs shared by backups, denied or partial deletion, expiry, retries and an archived
+object's restore-before-read behavior.
+
+Resolve X01's reserved zstd repository encoding explicitly when selecting codecs for
+the versioned manifest and copy path. Measure an adopted implementation against
+raw/LZ4 for transfer size, CPU and restore time, or record why it remains unadopted.
+Older raw/LZ4 backups must remain readable, and unknown required codec tags must be
+refused. The measured rejected X11 column codecs are separate decisions and are not
+reopened by this checkpoint.
+
+These are planned acceptance requirements. Item 61 does not complete while the
+optional history mode or storage-retention controls promised by Phase 3 are silently
+omitted. Changing that accepted scope needs an explicit maintainer decision recorded here.
 
 ### Recovery of managed definitions
 

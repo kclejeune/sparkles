@@ -603,3 +603,15 @@ namespace. The code is `nodeexpr.rs`, the expression tree and its parser, and
   is a separate change to the constraint model, and none of them blocks node
   expressions.
 
+
+### Completion path
+
+Roadmap item 48 owns the remaining comment-preserving SHACLC formatter. It requires
+a lossless parser and the CLI, HTTP and editor surfaces named above. Acceptance must
+retain comments and formatting stability while preserving the reader/writer's
+semantic round trips and existing SHACLC and constraint conformance tests.
+
+Completed item 13 covers the adopted list and node-expression contracts. The draft
+SHACL 1.2 Core constraints listed above were not part of that node-expression phase,
+and its completion does not claim the entire draft suite passes. Adopting additional
+draft constraints requires a named design and conformance scope of its own.

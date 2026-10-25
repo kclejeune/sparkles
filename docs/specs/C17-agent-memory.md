@@ -8,8 +8,9 @@
 > the `assert_facts` write tool with its data model of graphs, reifiers and supersession,
 > and the `agent_memory` prompt. Phase 1c adds a `branch` argument to the MCP tools,
 > tools that list, create, merge and delete branches, scratch branches for graph-limited
-> grants and their optional expiry. Phase 2, model calls inside the server, is described
-> in §10 and deferred.
+> grants and their optional expiry. The server model calls sketched as Phase 2 in §10
+> were superseded by [C18](C18-natural-language-questions-and-ingest.md). Dataset-layered
+> scratch expiry and the shared evidence profile remain under roadmap items 57 and 81.
 >
 > **User docs:** [API: MCP tools](../API.md#tools) ·
 > [API: Memory writes](../API.md#memory-writes) ·
@@ -1380,3 +1381,11 @@ which independent sources support it, what was believed at a chosen time, and wh
 notes, decisions or tasks need review after evidence is revised. Compatibility examples
 must preserve current imports, citations, supersession and access boundaries, including
 conflicting sources and a copied source that is not independent corroboration.
+
+### Successor contract
+
+The original Phase 2 sketch was replaced by the implemented server Ask and ingestion
+contracts of [C18](C18-natural-language-questions-and-ingest.md#outcome). Historical
+statements above that Phase 2 was not built describe the original landing, rather
+than an additional untracked model backend. Roadmap item 57 completes scratch expiry,
+and item 81 owns the shared representation specified at the end of this Outcome.

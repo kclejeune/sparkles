@@ -526,9 +526,10 @@ pure-Rust zstd decoder and zstd repository blobs were not built.
 
 ### Roadmap follow-ups (2026-10-12)
 
-[ROADMAP](../ROADMAP.md) item 16 takes up the storage codecs of Phase 2 in
+[ROADMAP](../ROADMAP.md) item 16 evaluated the storage codecs of Phase 2 in
 [X11](X11-index-compression-and-predicate-patterns.md), together with QLever's predicate
-patterns.
+patterns. The descriptions below record that evaluation's original plan. The later
+measurement section records the adopted vocabulary codec and the rejected block codecs.
 
 * **U7, index blocks.** X11 §5 keeps this spec's zstd blocks with optional dictionaries
   per permutation and adds a patched frame-of-reference codec (`pfor`) whose second column
@@ -561,3 +562,23 @@ short of the gate's 25%, so zstd blocks were not built. A frame-of-reference cod
 that frame widths cannot. Restarting the deltas of a column at each run of the columns
 before it made the LZ4 frames 18% to 23% larger, since a restart stores a full id where the
 delta was small.
+
+### Remaining codec decisions
+
+The CLI and HTTP compression levels and thread controls of Phase 1 are delivered.
+The later X11 Outcome owns the adopted FSST option and the measured rejection of
+encoded IRIs and alternative block codecs. Those rejected choices are not an open
+requirement under completed item 16.
+
+Roadmap item 343 includes an explicit checkpoint for the optional pure-Rust zstd
+decoder. Compare its platform/dependency benefit, accepted input support and cost
+with the native decoder before adopting it, or record the decision to retain the
+current clean feature-disabled refusal. A decision to drop a retained requirement
+needs maintainer approval and an Outcome entry, rather than an implicit completion
+claim. Item 61 owns the equivalent decision for reserved repository-zstd encoding,
+with raw/LZ4 compatibility and restore/transfer measurements in F05.
+
+Completion of the accepted compression contract requires those decisions, the
+adopted options' round-trip and feature-matrix tests, and the named X11 settings
+work. It does not require turning every optional or measured rejected codec into a
+production feature.

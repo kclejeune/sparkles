@@ -1546,12 +1546,34 @@ it while its queries run.
   * *npm publishing.* `node-packages.yml` builds and checks the packages, and publishing
     needs an explicitly enabled npm environment. Switching it on needs the npm scope,
     provenance statements and X12's checklist.
-  * *Progress hooks.* The engine's `Control` (`crates/sparkles-core/src/task.rs`) carries
-    a `Progress` that backups already report through. Loads, compaction and index builds
-    report through it too (the bulk builder's `report` messages and a count of quads
-    applied in the delta path), and the addon passes it to an `onProgress` option through
-    a ThreadsafeFunction that keeps only the latest value while JavaScript is busy, as
-    §5.2 specifies.
 * **Browser build.** §12 describes what a WebAssembly build would take. The local-first
   engine in WebAssembly that syncs through RDF Patch and branches is now ROADMAP item 44,
   [F20](F20-local-first-engine.md).
+
+### Operation progress
+
+Roadmap item 14 owns the shared controlled load/compaction progress and Node
+`onProgress` hooks previously grouped with release work. Loads, compaction and index
+builds report through the engine progress control, and the addon forwards updates
+through a ThreadsafeFunction that retains only the latest value while JavaScript is
+busy, as §5.2 specifies. This is planned work, not an existing callback guarantee.
+
+Acceptance covers monotonic phase counters, completion, failure, cancellation and
+closing the dataset while callbacks are pending. A slow or throwing JavaScript
+consumer must not retain an unbounded queue, block engine cancellation or publish
+a false success. Engine, HTTP and embedded consumers share operation progress rather
+than creating a separate unbudgeted load path in the binding.
+
+### Remaining integration contract
+
+Roadmap item 45 owns typed branch relink with the Rust operation's semantics. Item 58
+owns publication and the claimed runtime/platform installation matrix. Item 32 owns
+reusable plans, while 33 and 329 retain comparative per-call and full-consumption
+query/export measurements. Benchmark completion permits recorded close cases and
+does not require matching an in-memory competitor on every durable write.
+
+The browser/Wasm engine remains an optional extension under item 44, with F20's own
+acceptance. UI transport migration is also an optional scope decision, rather than a
+missing prerequisite for the delivered native and remote clients. Any decision to
+remove an accepted requirement must be approved by the maintainer and recorded in
+this Outcome before declaring that scope complete.

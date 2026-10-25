@@ -1651,7 +1651,7 @@ claim is made.
 ### Roadmap follow-ups (2026-10-12)
 
 **Key workflows in the API, UI and NixOS module, Vault and cloud KMS, recovery export,
-encrypted live datasets and derived indexes** (item 65, Tier 6,
+write-only repositories, encrypted live datasets and derived indexes** (item 65, Tier 6,
 [ROADMAP](../ROADMAP.md)). §8, §11 and §7 hold the design; this section records what
 is missing at `537e048` and the order of the remaining work.
 
@@ -1688,7 +1688,14 @@ is missing at `537e048` and the order of the remaining work.
      default credential chains, all through the outbound policy. A provider outage is
      `502 key-provider-unavailable` and keeps open handles working, as the
      generation-guarded cache already does for local providers.
-  4. **Encrypted live datasets** (Phase 3, §7) and then **derived indexes** (Phase 4),
+  4. **Write-only repositories** (Phase 2, §6). Add age recipients for backup producers
+     and the age-identity key source for readers, preserving the key hierarchy and
+     capability separation of §6. Complete A11 to A13, including a producer that can
+     create backups but cannot decrypt an existing one, authorized restore, recipient
+     changes and interruption. Item 61 owns the shared FastCDC adoption gate for
+     plaintext and encrypted repositories. A failed chunking adoption measurement
+     does not remove the write-only repository contract.
+  5. **Encrypted live datasets** (Phase 3, §7) and then **derived indexes** (Phase 4),
      as designed. Phase 3 depends on [X12](X12-release-engineering.md)'s format window,
      because sealed generations are a new index format that a release must read beside
      the plaintext one; enabling encryption is a compaction into the sealed format, the

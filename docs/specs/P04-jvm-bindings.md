@@ -1930,3 +1930,19 @@ no permit.
   * *JPMS descriptor.* The main artifact supplies an automatic module name. An explicit
     `module-info.class` would require JNA's and Jena's module names and export the
     public packages only, and it needs a test that runs the library on the module path.
+
+### Remaining integration contract
+
+Roadmap item 45 owns the typed branch-relink surface, with the same identity,
+lineage and refusal behavior as the Rust operation. Item 76 owns batched ARQ fallback
+graph patterns, JVM metrics and expansion of the standalone HTTP harness to its
+accepted 77-case scope. Acceptance compares supported native and fallback queries
+with reference Jena datasets, including blank nodes, transactions, access and
+cancellation, and checks that batching preserves duplicate solutions and filters.
+
+Reusable plans, native foreign callbacks and per-call performance remain items 32,
+25 and 33. Publication and platform verification remain item 58. The optional explicit
+JPMS descriptor, allocator changes and worker-free transaction design need recorded
+scope decisions under 76 before being treated as part of a completion claim. A
+proposal to remove an accepted requirement needs maintainer approval. This avoids
+mistaking every optional JVM engineering alternative for required Jena parity.

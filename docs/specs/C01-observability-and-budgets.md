@@ -1008,7 +1008,6 @@ triples differ by 0.6% from a run with `--no-access-log --no-metrics`. That is n
 
 - bind-before-open startup with the `opening`, `failed` and `degraded` states, which
   changes how the server's state attaches datasets;
-- a server-wide query memory pool;
 - the new Phase 2 metrics in the JSON snapshot and as OTLP metrics.
 
 ### Roadmap follow-ups (2026-10-12)
@@ -1040,5 +1039,24 @@ triples differ by 0.6% from a run with `--no-access-log --no-metrics`. That is n
   `Catalog::open` before it binds (`state.rs`), so one dataset that fails to open stops
   the server. `--require-all-datasets` keeps that behaviour. WAL replay reports its progress in the dataset's state. The
   release work around it is in [X12](X12-release-engineering.md).
-* The Phase 2 metrics that are missing from `/$/metrics?format=json`, and therefore from
-  the OTLP export that reads it, are a small separate fix.
+* The Phase 2 JSON and OTLP metrics are tracked by item 342 below.
+
+### Metrics parity
+
+Roadmap item 342 completes the Phase 2 series in the JSON snapshot and OTLP export.
+Prometheus already emits produced rows, query memory peaks and rebuild counts and
+durations. `obs::metrics_json` does not include those fields, and the OTLP observer in
+`otel/sdk.rs` consumes that snapshot. An enabled exporter therefore does not imply
+that every Prometheus series is exported.
+
+Add cumulative produced-row counts, query-memory-peak histograms and rebuild counters
+and duration histograms by reason. The three representations must agree on units,
+bucket boundaries, labels, dataset aggregation and each series' reset semantics,
+including rebuild counts resetting when a dataset opens. Preserve
+the existing metrics endpoint's access policy and dataset-label bounds. Any changed
+JSON snapshot contract needs an explicit compatibility/version decision.
+
+Acceptance extends the existing work, memory and rebuild test to compare all three
+representations after queries, updates, successful compact/bulk publications and
+failed or abandoned builds. Test histogram sums/counts, unseen datasets, reopen/reset
+behavior and the exporter-disabled build. No new counters belong on inner executor loops.

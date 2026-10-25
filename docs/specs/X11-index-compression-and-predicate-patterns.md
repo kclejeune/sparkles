@@ -475,10 +475,11 @@ long old versions stay readable is X12's.
 Phase 1 is built. Phase 2a is built as the option `--vocab-codec fsst`, which stays off
 by default because the warm queries that decode many terms miss §4.4's gate. Roadmap item
 108 made those reads faster without changing the files, and [its section](#item-108-faster-fsst-reads)
-records why the gate is still missed. Phase 2b,
-Phase 3 and open question 1 are not built. [Phases not built](#phases-not-built) gives
-what each would save on the measured data, and they remain under [ROADMAP](../ROADMAP.md)
-item 16.
+records why the gate is still missed. Phase 2b, Phase 3 and open question 1 were not
+adopted. [Phases not built](#phases-not-built) records the measurements and gate
+decisions that completed roadmap items 16 and 108. Their rejection does not require
+shipping them later to complete the accepted codec contract. Dataset-local settings
+remain under item 343, while items 160 and 241 track retained lookup costs.
 
 ### What was built
 
@@ -798,3 +799,29 @@ subjects overall have some predicate with more than one triple. At 10.5M, 603,57
 only 15 of the 24 patterns, with 311,843 subjects, could carry the flag. The all-subject
 `predicate-counts` query already takes 5 ms on DBpedia, so the flag would mainly help
 counts over a class whose instances are single-valued.
+
+### Dataset-local settings
+
+Roadmap item 343 completes §2.2's settings for the adopted vocabulary codecs and
+predicate patterns. Integrate the settings with C19's built-in, declared and runtime
+layers and locks, expose the effective choices through the settings surfaces, and
+apply a captured configuration to subsequent builds and compactions. The active
+generation continues to report and use the codecs actually recorded in its metadata
+until a replacement is published. A settings edit must not relabel existing files.
+
+Keep front coding and the current pattern default unless their adoption gates are
+changed by an explicit measured decision. FSST remains an opt-in codec. Do not offer
+encoded IRIs, column codecs or the count shortcut as supported settings when their
+implementations were not adopted. Measure the named lookup costs under items 160 and
+241 separately from this configuration work.
+
+Acceptance covers two datasets with different effective choices, declared locks,
+reopen, full and partial compaction, cancellation before publication and old/new
+snapshot readers across the switch. Queries, checks and dumps must agree across the
+supported combinations. Metadata and settings versions must reject unknown required
+choices cleanly rather than guessing a codec. CLI, HTTP and embedded callers must
+observe the same accepted precedence and compatibility contract.
+
+Item 343 also records the optional portable-decoder decision described by
+[X01](X01-compression-codecs.md#remaining-codec-decisions). No rejected storage
+experiment is reopened merely to remove a partial status label.

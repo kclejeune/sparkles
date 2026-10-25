@@ -664,3 +664,12 @@ and for a persistent clone the index mode (`auto` by default). A partial clone t
 inferences names the inferred graph for the user. When the task is done, the task list,
 the toast and the "Cloned into" banner say how the index was made, from the task's
 detail. The clone's own page shows the selection and the method from `origin.json`.
+
+### Completion path
+
+Roadmap item 45 owns the remaining cross-server and archive cloning through
+[F09's transfer contract](F09-branches-and-merges.md#roadmap-follow-ups-2026-10-12).
+Its acceptance compares a chosen source branch and commit with the remote and archive
+copies, including quads, stored blank identities, prefixes, configuration and
+`forkedFrom` lineage. Cancellation, truncation and digest mismatches must publish no
+destination. Item 220 separately extends recovery to nested managed definitions.

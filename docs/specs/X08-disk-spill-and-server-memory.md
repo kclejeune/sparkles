@@ -1,12 +1,13 @@
 # X08: Disk spill and server-wide memory
 
-> **Status:** Phase 1 shipped, Phase 2 implemented with acceptance open, Phase 3 specified
+> **Status:** implemented in part. Phases 1 and 2 shipped, with spill opt-in. Phase 3 is specified.
 >
 > **Phases:** Phase 1 is shipped. It is server-wide cache sizing, a smaller memory
 > profile and the server-wide query memory pool with admission control. Phase 2 implements
 > batch-oriented hash join and grouping kernels in the cursor engine, then disk spill for
-> hash joins, sorts, grouping and DISTINCT. Spill remains opt-in until every Phase 2b
-> acceptance gate passes under roadmap item 93. Phase 3 is not built. It reduces the
+> hash joins, sorts, grouping and DISTINCT. The full-scale plain and encrypted spill
+> matrix passes. Eager fallbacks, execution costs and the spill-default decision remain
+> under roadmap items 7 and 93, so spill stays opt-in. Phase 3 is not built. It reduces the
 > idle server footprint, the Python process footprint and the size of the full-text index.
 >
 > **User docs:** [USAGE](../USAGE.md#memory-and-caches) and
