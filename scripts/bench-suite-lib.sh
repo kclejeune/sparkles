@@ -251,6 +251,8 @@ suite_run() {
     fi
     return 0
   fi
+  setj "$RES/extra.json" settings "maxTimeSeconds=$MAX_TIME" "serverTimeoutSeconds=$SERVER_TIMEOUT" \
+    "sparklesArgs=${SPARKLES_ARGS:-}" "answerStreamTSVQueries=${ANSWERS_TSV_QUERIES:-}" "correctnessEngineIsolation=true"
   resolve_tools
   trap stop_all EXIT
   suite_manifest
