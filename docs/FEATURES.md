@@ -333,7 +333,9 @@ check them against the W3C suites and Jena's own answers.
   boolean values and the total order of ORDER BY.
 * Pure BIND expressions that read one variable can reuse their results across cursor
   batches. The query owns and budgets the cache, preserving RDF term identity and
-  expression errors. Volatile expressions and application callbacks run per row.
+  expression errors. Admission uses observed repetition and bounded snapshot statistics.
+  Sparse reuse can remain rowwise, tracked in [item 293](ROADMAP.md). Volatile expressions
+  and application callbacks run per row.
 * The function library has the SPARQL 1.1 built-ins, the XSD casts, including the
   derived integer types with their ranges, `anyURI` and the Gregorian types, and ARQ's
   `fn:`, `afn:` and `math:` functions ([API.md](API.md#extension-functions-and-aggregates)).

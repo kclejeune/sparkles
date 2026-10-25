@@ -1,0 +1,537 @@
+{
+ "suite": "bounded-durable-write-assessment",
+ "baseline_runtime_commit": "4f2e1633",
+ "process_count": 16,
+ "oracle_checked_triple_states": 80000,
+ "mixed_initial_answer_bags_agree": true,
+ "processes": [
+  {
+   "scale": "10m",
+   "phase": "churn",
+   "round": 0,
+   "engine": "oxigraph",
+   "write_ms": {
+    "lit": {
+     "median": 0.6251215017982759,
+     "mean": 0.7510311667771873,
+     "n": 888
+    },
+    "iri": {
+     "median": 0.6430450011976063,
+     "mean": 0.7505272828998254,
+     "n": 2612
+    },
+    "del": {
+     "median": 0.5621910022455268,
+     "mean": 0.6662062146060634,
+     "n": 1500
+    }
+   },
+   "mean_all_ms": 0.7253204521883163
+  },
+  {
+   "scale": "10m",
+   "phase": "churn",
+   "round": 0,
+   "engine": "sparkles",
+   "write_ms": {
+    "lit": {
+     "median": 1.25370600289898,
+     "mean": 1.3088943592224456,
+     "n": 888
+    },
+    "iri": {
+     "median": 1.2273555003048386,
+     "mean": 1.2379613395879359,
+     "n": 2612
+    },
+    "del": {
+     "median": 1.2295195010665338,
+     "mean": 1.2337612907479827,
+     "n": 1500
+    }
+   },
+   "mean_all_ms": 1.2492990292230388,
+   "sync_counts": {
+    "direct": 4996.0,
+    "buffered": 4.0
+   },
+   "sync_mean_ms": {
+    "direct": 0.26517173738991195,
+    "buffered": 1.13675
+   },
+   "sync_sum_seconds": 1.329345
+  },
+  {
+   "scale": "10m",
+   "phase": "churn",
+   "round": 1,
+   "engine": "oxigraph",
+   "write_ms": {
+    "lit": {
+     "median": 0.5936234992987011,
+     "mean": 0.6308751304983686,
+     "n": 888
+    },
+    "iri": {
+     "median": 0.5867065010534134,
+     "mean": 0.6259794433012751,
+     "n": 2612
+    },
+    "del": {
+     "median": 0.5468640010803938,
+     "mean": 0.5913186639760776,
+     "n": 1500
+    }
+   },
+   "mean_all_ms": 0.6164506835499196
+  },
+  {
+   "scale": "10m",
+   "phase": "churn",
+   "round": 1,
+   "engine": "sparkles",
+   "write_ms": {
+    "lit": {
+     "median": 1.1671669963106979,
+     "mean": 1.0881884300361309,
+     "n": 888
+    },
+    "iri": {
+     "median": 1.1429790029069409,
+     "mean": 1.0479604356869305,
+     "n": 2612
+    },
+    "del": {
+     "median": 1.130396001826739,
+     "mean": 1.0357294421022136,
+     "n": 1500
+    }
+   },
+   "mean_all_ms": 1.0514356294079334,
+   "sync_counts": {
+    "direct": 4996.0,
+    "buffered": 4.0
+   },
+   "sync_mean_ms": {
+    "direct": 0.24814191353082463,
+    "buffered": 3.09525
+   },
+   "sync_sum_seconds": 1.252098
+  },
+  {
+   "scale": "10m",
+   "phase": "mixed",
+   "round": 0,
+   "engine": "oxigraph",
+   "writer": {
+    "commits": 24822,
+    "errors": 0,
+    "seconds": 30.002,
+    "per_s": 827.3,
+    "p50_ms": 1.01,
+    "p99_ms": 2.795,
+    "mean_ms": 1.204,
+    "max_ms": 8.555
+   },
+   "reader": {
+    "completed_per_s": 0.0,
+    "oha_attempts_per_s": 0.5332930605701725,
+    "p50_ms": null,
+    "p99_ms": null,
+    "success_rate": null,
+    "errors": {
+     "aborted due to deadline": 16
+    },
+    "status_codes": {}
+   },
+   "reader_rows": 29717,
+   "reader_bag_sha256": "33d21a102d43a8333eef04a4b9c06e92c9834714bc153c60f550a0fab8814507"
+  },
+  {
+   "scale": "10m",
+   "phase": "mixed",
+   "round": 0,
+   "engine": "sparkles",
+   "writer": {
+    "commits": 8245,
+    "errors": 0,
+    "seconds": 30.001,
+    "per_s": 274.8,
+    "p50_ms": 3.342,
+    "p99_ms": 7.455,
+    "mean_ms": 3.626,
+    "max_ms": 12.964
+   },
+   "reader": {
+    "completed_per_s": 244.60908448465383,
+    "oha_attempts_per_s": 245.14236495225902,
+    "p50_ms": 64.6722,
+    "p99_ms": 79.440026,
+    "success_rate": 1.0,
+    "errors": {
+     "aborted due to deadline": 16
+    },
+    "status_codes": {
+     "200": 7339
+    }
+   },
+   "reader_rows": 29717,
+   "reader_bag_sha256": "33d21a102d43a8333eef04a4b9c06e92c9834714bc153c60f550a0fab8814507",
+   "sync_counts": {
+    "direct": 8241.0,
+    "buffered": 4.0
+   },
+   "sync_mean_ms": {
+    "direct": 0.637313918213809,
+    "buffered": 2.3922499999999998
+   },
+   "sync_sum_seconds": 5.261673
+  },
+  {
+   "scale": "10m",
+   "phase": "mixed",
+   "round": 1,
+   "engine": "oxigraph",
+   "writer": {
+    "commits": 17547,
+    "errors": 0,
+    "seconds": 30.001,
+    "per_s": 584.9,
+    "p50_ms": 1.435,
+    "p99_ms": 4.08,
+    "mean_ms": 1.705,
+    "max_ms": 9.601
+   },
+   "reader": {
+    "completed_per_s": 0.0,
+    "oha_attempts_per_s": 0.533286493376299,
+    "p50_ms": null,
+    "p99_ms": null,
+    "success_rate": null,
+    "errors": {
+     "aborted due to deadline": 16
+    },
+    "status_codes": {}
+   },
+   "reader_rows": 29717,
+   "reader_bag_sha256": "33d21a102d43a8333eef04a4b9c06e92c9834714bc153c60f550a0fab8814507"
+  },
+  {
+   "scale": "10m",
+   "phase": "mixed",
+   "round": 1,
+   "engine": "sparkles",
+   "writer": {
+    "commits": 8374,
+    "errors": 0,
+    "seconds": 30.001,
+    "per_s": 279.1,
+    "p50_ms": 3.299,
+    "p99_ms": 7.367,
+    "mean_ms": 3.57,
+    "max_ms": 14.867
+   },
+   "reader": {
+    "completed_per_s": 232.40720929884273,
+    "oha_attempts_per_s": 232.94048268888739,
+    "p50_ms": 68.50249699999999,
+    "p99_ms": 85.829725,
+    "success_rate": 1.0,
+    "errors": {
+     "aborted due to deadline": 16
+    },
+    "status_codes": {
+     "200": 6973
+    }
+   },
+   "reader_rows": 29717,
+   "reader_bag_sha256": "33d21a102d43a8333eef04a4b9c06e92c9834714bc153c60f550a0fab8814507",
+   "sync_counts": {
+    "direct": 8370.0,
+    "buffered": 4.0
+   },
+   "sync_mean_ms": {
+    "direct": 0.6204931899641576,
+    "buffered": 5.0065
+   },
+   "sync_sum_seconds": 5.213553999999999
+  },
+  {
+   "scale": "1m",
+   "phase": "churn",
+   "round": 0,
+   "engine": "oxigraph",
+   "write_ms": {
+    "lit": {
+     "median": 0.5699005014321301,
+     "mean": 0.7282247626282189,
+     "n": 888
+    },
+    "iri": {
+     "median": 0.5976910033496097,
+     "mean": 0.735905524860146,
+     "n": 2612
+    },
+    "del": {
+     "median": 0.5179034997127019,
+     "mean": 0.6575856533891056,
+     "n": 1500
+    }
+   },
+   "mean_all_ms": 0.7110454600464436
+  },
+  {
+   "scale": "1m",
+   "phase": "churn",
+   "round": 0,
+   "engine": "sparkles",
+   "write_ms": {
+    "lit": {
+     "median": 2.53431849705521,
+     "mean": 2.5076584280779226,
+     "n": 888
+    },
+    "iri": {
+     "median": 2.5130750000244007,
+     "mean": 2.44771313625723,
+     "n": 2612
+    },
+    "del": {
+     "median": 2.507797002181178,
+     "mean": 2.4425014233905435,
+     "n": 1500
+    }
+   },
+   "mean_all_ms": 2.456795906224579,
+   "sync_counts": {
+    "direct": 4996.0,
+    "buffered": 4.0
+   },
+   "sync_mean_ms": {
+    "direct": 1.4761347077662128,
+    "buffered": 3.49825
+   },
+   "sync_sum_seconds": 7.388762
+  },
+  {
+   "scale": "1m",
+   "phase": "churn",
+   "round": 1,
+   "engine": "oxigraph",
+   "write_ms": {
+    "lit": {
+     "median": 0.649102501483867,
+     "mean": 0.8303359189921065,
+     "n": 888
+    },
+    "iri": {
+     "median": 0.7056269969325513,
+     "mean": 0.8722501478103919,
+     "n": 2612
+    },
+    "del": {
+     "median": 0.5479004976223223,
+     "mean": 0.7062500299459012,
+     "n": 1500
+    }
+   },
+   "mean_all_ms": 0.8150061454129173
+  },
+  {
+   "scale": "1m",
+   "phase": "churn",
+   "round": 1,
+   "engine": "sparkles",
+   "write_ms": {
+    "lit": {
+     "median": 1.073836498107994,
+     "mean": 1.0175927681802521,
+     "n": 888
+    },
+    "iri": {
+     "median": 1.0436304946779273,
+     "mean": 1.005410912338062,
+     "n": 2612
+    },
+    "del": {
+     "median": 1.0034750011982396,
+     "mean": 0.9906676060442502,
+     "n": 1500
+    }
+   },
+   "mean_all_ms": 1.0031514180474914,
+   "sync_counts": {
+    "direct": 4996.0,
+    "buffered": 4.0
+   },
+   "sync_mean_ms": {
+    "direct": 0.2504241393114492,
+    "buffered": 3.00175
+   },
+   "sync_sum_seconds": 1.2631260000000002
+  },
+  {
+   "scale": "1m",
+   "phase": "mixed",
+   "round": 0,
+   "engine": "oxigraph",
+   "writer": {
+    "commits": 45713,
+    "errors": 0,
+    "seconds": 30.0,
+    "per_s": 1523.8,
+    "p50_ms": 0.645,
+    "p99_ms": 0.828,
+    "mean_ms": 0.652,
+    "max_ms": 7.771
+   },
+   "reader": {
+    "completed_per_s": 17.19915710829488,
+    "oha_attempts_per_s": 17.73246430545131,
+    "p50_ms": 907.63882,
+    "p99_ms": 1570.186968,
+    "success_rate": 1.0,
+    "errors": {
+     "aborted due to deadline": 16
+    },
+    "status_codes": {
+     "200": 516
+    }
+   },
+   "reader_rows": 2916,
+   "reader_bag_sha256": "964fcd1d3c8ce203ed39ccf177791cbd7020a15eb16bfab46deab497faacfdf8"
+  },
+  {
+   "scale": "1m",
+   "phase": "mixed",
+   "round": 0,
+   "engine": "sparkles",
+   "writer": {
+    "commits": 11639,
+    "errors": 0,
+    "seconds": 30.001,
+    "per_s": 388.0,
+    "p50_ms": 2.311,
+    "p99_ms": 5.783,
+    "mean_ms": 2.569,
+    "max_ms": 14.06
+   },
+   "reader": {
+    "completed_per_s": 2643.932979586819,
+    "oha_attempts_per_s": 2644.4662456173933,
+    "p50_ms": 5.815556,
+    "p99_ms": 9.98649,
+    "success_rate": 1.0,
+    "errors": {
+     "aborted due to deadline": 16
+    },
+    "status_codes": {
+     "200": 79328
+    }
+   },
+   "reader_rows": 2916,
+   "reader_bag_sha256": "964fcd1d3c8ce203ed39ccf177791cbd7020a15eb16bfab46deab497faacfdf8",
+   "sync_counts": {
+    "direct": 11634.0,
+    "buffered": 5.0
+   },
+   "sync_mean_ms": {
+    "direct": 0.5647649991404504,
+    "buffered": 1.7881999999999998
+   },
+   "sync_sum_seconds": 6.579417
+  },
+  {
+   "scale": "1m",
+   "phase": "mixed",
+   "round": 1,
+   "engine": "oxigraph",
+   "writer": {
+    "commits": 42475,
+    "errors": 0,
+    "seconds": 30.0,
+    "per_s": 1415.8,
+    "p50_ms": 0.701,
+    "p99_ms": 0.931,
+    "mean_ms": 0.702,
+    "max_ms": 10.367
+   },
+   "reader": {
+    "completed_per_s": 13.598866531301548,
+    "oha_attempts_per_s": 14.132155414882,
+    "p50_ms": 1117.5653590000002,
+    "p99_ms": 1971.756052,
+    "success_rate": 1.0,
+    "errors": {
+     "aborted due to deadline": 16
+    },
+    "status_codes": {
+     "200": 408
+    }
+   },
+   "reader_rows": 2916,
+   "reader_bag_sha256": "964fcd1d3c8ce203ed39ccf177791cbd7020a15eb16bfab46deab497faacfdf8"
+  },
+  {
+   "scale": "1m",
+   "phase": "mixed",
+   "round": 1,
+   "engine": "sparkles",
+   "writer": {
+    "commits": 11189,
+    "errors": 0,
+    "seconds": 30.0,
+    "per_s": 373.0,
+    "p50_ms": 2.363,
+    "p99_ms": 5.824,
+    "mean_ms": 2.672,
+    "max_ms": 14.075
+   },
+   "reader": {
+    "completed_per_s": 2463.3136443049243,
+    "oha_attempts_per_s": 2463.846915646442,
+    "p50_ms": 6.330116,
+    "p99_ms": 10.511303,
+    "success_rate": 1.0,
+    "errors": {
+     "aborted due to deadline": 16
+    },
+    "status_codes": {
+     "200": 73908
+    }
+   },
+   "reader_rows": 2916,
+   "reader_bag_sha256": "964fcd1d3c8ce203ed39ccf177791cbd7020a15eb16bfab46deab497faacfdf8",
+   "sync_counts": {
+    "direct": 11184.0,
+    "buffered": 5.0
+   },
+   "sync_mean_ms": {
+    "direct": 0.5823618562231759,
+    "buffered": 3.1348000000000003
+   },
+   "sync_sum_seconds": 6.528809
+  }
+ ],
+ "measurement_contract": {
+  "host": "forge",
+  "runtime": "4f2e1633",
+  "build_source": "c4380c1a, fixture-only differences",
+  "sparkles_sha256": "3fcc24ed7a99676d7da68c8a095aa73383056a5e6c988e993050b3fed52e5bab",
+  "oxigraph_version": "0.5.11",
+  "oxigraph_sha256": "c99f9c4866b9d25f135729ac8b0e468cc0badd2c2cfe1c4b704f0db375ed8de3",
+  "durability": {
+   "sparkles": "synchronization before successful acknowledgement",
+   "oxigraph": "unsynced commits, a distinct durability class"
+  },
+  "isolation": "One engine alone,7GiB/no swap, bench then heavy host locks",
+  "rounds": "Two rounds with reversed engine order, fresh complete store copies with sync and settle",
+  "serial": "5000 effective distinct changes per process,888 literal inserts2612 IRI inserts1500 deletes, fresh HTTP connection per request",
+  "mixed": "One new-literal writer and16 unpaced star-join readers for30seconds; count completedHTTP200/elapsed, record16 cancellation attempts separately",
+  "correctness": "All80000 before/after churn state checks and all Sparkles offline checks pass; initial mixed reader bags agree. Mixed run has no separate post-restart state oracle. No crash/power-loss evidence is inferred.",
+  "scope": "Bounded assessment only. No production write optimization was kept or measured as a candidate. Measurements are not an equal completed-read-work comparison."
+ },
+ "assessment_version": 1,
+ "format_note": "Supplemental assessment with raw samples and diagnostics, not a scripts/bench-record.py suite record."
+}

@@ -858,6 +858,28 @@ are requested ahead, and front-coded blocks are decoded once, in id order and in
 Requests for the next chunk overlap the writing of the current one. This holds up to about
 70 MiB of additional memory while an export is written.
 
+### Cursor expression reuse controls
+
+A dedicated complete-HTTP JSON comparison over the verified 50M slice gives Sparkles
+50.2 ms and QLever 16.6 ms warm, and 68.1 and 27.6 ms cold. QLever remains faster on
+this slice. The [assessment record](benchmarks/2026-10-25-cursor-bind-assessment-forge.json)
+retains the paired samples and settings. Its Python timer and current kernel differ from
+the retained comparative tables' hyperfine and curl contract.
+
+Matching pre-cache and cache builds take 1,210.9 and 164.6 ms on the full-data warm
+guard, and 1,267.1 and 214.4 ms after file-cache eviction. Automatic and forced streaming
+execution keep all 171 groups. Native query-accounted peak memory rises from about
+2.8 to 8.3 MiB. Forced eager execution takes 42.9 ms with about 52.4 MiB of query-accounted
+peak memory. These counters describe query allocations rather than process RSS.
+
+The 50M automatic guard stays near 50 ms. Conservative cache admission forgoes the
+36.7 ms shortcut that slowed cheap near-unique inputs. An independent source stream and
+calendar oracle verifies all 80 slice groups and counts. The full guard checks unchanged
+answers without independently classifying the historical minority result. Generated
+strings, IRIs and dates cover 63 scale and reuse distributions with matching checksums.
+Longer pinned checks clear the coarse flags, while small remaining costs and original
+all-thread flags stay recorded under [item 293](ROADMAP.md).
+
 ## BSBM
 
 ### BSBM Explore at 10M triples
@@ -1760,6 +1782,27 @@ DELETE requests, one at a time, to every engine's store. No engine failed a comm
 The WAL preallocates space in steps from 64 KiB up to 4 MiB (`--wal-prealloc-kb`, `0`
 disables it). Replay, readers, backups and quotas use the logical end of the last commit,
 and recovery recognizes a torn tail.
+
+### Serial writes with reader work
+
+A bounded [write assessment](benchmarks/2026-10-25-durable-write-assessment-forge.json)
+keeps the durability distinction explicit. At 10.5M triples, two process medians for
+literal inserts are 1.254 and 1.167 ms for Sparkles, against 0.625 and 0.594 ms for
+unsynced Oxigraph. Direct synchronization averages about 0.25 ms in these Sparkles
+processes. The remaining serial difference does not justify changing acknowledgement
+ordering.
+
+With one writer and sixteen unpaced star-join readers, Sparkles completes 275–279
+writes/s and 232–245 reads/s at 10.5M, with write p99 of 7.37–7.46 ms. Oxigraph completes
+585–827 writes/s with p99 of 2.80–4.08 ms, while no read finishes in the thirty-second
+window. At 1.05M, Sparkles completes 373–388 writes/s and 2,463–2,644 reads/s, against
+1,416–1,524 writes/s and 13.6–17.2 reads/s. These rates compare different completed reader
+workloads. Deadline cancellations are separate from completed responses.
+
+All 80,000 before-and-after churn state checks and Sparkles offline checks pass. Initial
+mixed reader answer bags agree. This run supplies no separate mixed-write restart or
+power-loss proof. The bounded profile supports retaining the durable path, with remaining
+costs deferred under [item 290](ROADMAP.md).
 
 ### Concurrent durable commits
 
