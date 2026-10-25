@@ -1,9 +1,10 @@
 # Benchmarks
 
 Sparkles benchmarks cover query latency, loading, durable writes, memory and language
-bindings. Each workload has a methodology page and a result report. The
-[overview](overview/RESULTS.md) preserves the measured summary, coverage and recorded
-losses. The [reference setup](reference/README.md) explains shared timing and answer rules.
+bindings. Start with the [benchmark summary](../BENCHMARKS.md) for representative
+results and tradeoffs. Each workload below has a methodology page and a result report.
+The [detailed overview](overview/RESULTS.md) collects suite summaries, coverage and the
+full loss table. The [reference setup](reference/README.md) explains timing and answer rules.
 
 | Workload | Methodology | Results |
 |---|---|---|
