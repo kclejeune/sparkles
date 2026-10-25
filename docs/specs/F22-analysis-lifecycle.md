@@ -57,7 +57,9 @@ Records reuse the evidence namespace `ev: <urn:x-sparkles:evidence:>` from C25.
 | `an:Invalidation` | An event saying an input or policy change requires a freshness decision. It does not declare the conclusion false. |
 | `an:Publication` | An atomic installation of an assessment revision as the current result for a result key, with the checked input frontier. |
 
-Each reference to evidence is an `ev:EvidenceRef` with dataset UUID, branch UUID,
+An `an:Assessment` uses `ev:target` to name its stable result key and
+`ev:conclusion` to name its qualified conclusion or domain result resource. Its
+`prov:wasGeneratedBy` identifies the run. Each reference to evidence is an `ev:EvidenceRef` with dataset UUID, branch UUID,
 commit, graph and claim or reifier identity. Process-local vocabulary IDs and exported
 blank-node labels are not persistent references. C25 defines a resolvable immutable
 reference and its handling of blank nodes. A reference that cannot be resolved does

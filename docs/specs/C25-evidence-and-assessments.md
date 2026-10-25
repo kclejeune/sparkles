@@ -292,6 +292,15 @@ required profile features refuse managed operations without rewriting data. Ordi
 SPARQL can still read the RDF under its grants. No index or vocabulary migration is
 required. Profile vocabulary and shape revisions are named resources with content digests.
 
+Enabling managed projections also reserves a dataset-reader capability through the
+central format registry and raises `minimumReader` before the first managed write,
+using the existing admission mechanism described in C26. This prevents supported older
+writers from bypassing protection of the new managed graphs. A profile triple alone
+cannot make an older binary enforce the new contract. Releases predating that admission
+gate are outside the downgrade boundary. Unmanaged evidence RDF remains readable under
+ordinary grants, while future unknown profile versions are not writable through these
+operations.
+
 A proposal needs update rights for every graph it changes. A review needs the policy's
 review permission, read access to its complete evidence and update access to the
 decision and projection graphs. A caller cannot approve a decision using evidence it

@@ -122,9 +122,13 @@ does not invalidate review, while a changed report or supporting input must foll
 F22's explicit carry-forward policy. Deleting a configuration does not delete historical
 source evidence or authorize publication of its previous reports.
 
-Budget admission reserves against all applicable caps in one atomic accounting
-operation: build, configuration, dataset and provider. Configuration caps subdivide the
-dataset allowance; adding or renaming configurations cannot multiply or reset it.
+Budget admission reserves against the build, configuration and dataset caps in one
+atomic dataset-ledger operation. Provider-wide admission still uses the provider's
+existing accounting protocol. No request is sent until both reservations are held.
+A refusal releases the other reservation through an idempotent accounting transition,
+and an uncertain reservation remains charged until reconciled. No cross-dataset
+transaction is implied. Configuration caps subdivide the dataset allowance; adding
+or renaming configurations cannot multiply or reset it.
 Retries and outstanding reservations remain charged under their original configuration
 UUID. An unresolved charge blocks new work under C22's existing conservative policy.
 

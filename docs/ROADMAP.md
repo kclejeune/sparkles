@@ -36,6 +36,13 @@ Each item has a number that stays fixed for its lifetime. Specs, FEATURES and co
 comments refer to items by these numbers, so a number is never reused or changed. The
 numbers are not a ranking, and a new item takes the next free number whatever its tier.
 
+Implementation status is recorded in the [capability matrix](FEATURES.md#capability-status).
+Complete means the stated scope is available. Partially complete means a usable subset
+is available with remaining work named. In progress means implementation has started
+but is not available on the main branch. Planned means implementation has not started.
+A written spec alone is planned. Completed scope belongs in the list below even when
+an extension to the same capability remains in a tier.
+
 Each row says what remains to be done and links to the spec that holds the design. Items
 that extend an existing spec are designed in a "Roadmap follow-ups" section at the end of
 that spec's Outcome, and the Outcome also records what has already landed. An item that
@@ -86,16 +93,15 @@ These items are cheap or foundational.
 | 6 | **Ask evaluation on public benchmarks.** Runs of local and OpenAI-compatible models and an evaluation with independent roles remain, and LC-QuAD 2.0 waits for a Wikidata load from the full dump. | [C18](specs/C18-natural-language-questions-and-ingest.md#roadmap-follow-ups-2026-10-12) | S–M | Medium |
 | 263 | **Ask on DBpedia.** Question-aware grounding has mixed measured accuracy across models. A complete visibility-safe candidate evidence contract and context-sensitive namesake resolution remain, with genuine ambiguity kept as a clarification. Further changes need offline checks and end-to-end accuracy evaluation. | [C18](specs/C18-natural-language-questions-and-ingest.md#ask-grounding-accuracy-item-263) | M | High |
 | 318 | **Ask median latency.** The retained 107-question repeat has higher median wall time for Haiku and Sonnet, while p95 is nearly unchanged. Profile grounding and model time separately and reduce avoidable work while preserving caller visibility and required clarification. Provider variability and different GCC versions leave the cause unconfirmed. | [C18](specs/C18-natural-language-questions-and-ingest.md#ask-grounding-accuracy-item-263), [Benchmarks](BENCHMARKS.md#ask-on-dbpedia) | M | High |
-| 307 | **Targeted benchmark costs.** Remeasure and improve bindings in every language, serial and mixed-reader write performance, and DBpedia 50M `births-by-decade` with warm, cold and full-scale guards. Keep the other published losses documented and deferred, accepting close residual differences rather than requiring every cell to lead. Differences within the ten-percent tie band are accepted, and roughly 10–25% gaps or 1–2 ms differences are low priority unless a simple fix helps broadly. | [X06](specs/X06-benchmark-coverage.md#remaining-competitive-benchmark-losses), [Benchmarks](BENCHMARKS.md#where-sparkles-loses) | L | High |
 
 ## Tier 2: high-impact features and the scale foundation
 
 | # | Item | Spec | Size | Value |
 |---|---|---|---|---|
 | 7 | **Batch-oriented execution and disk spill.** Spill stays opt-in until X08 Phase 2b's acceptance gates pass, and several cases still run eagerly. The [remaining work](#remaining-work-for-item-7) is listed below. | [X08](specs/X08-disk-spill-and-server-memory.md) Phase 2, [X05](specs/X05-streaming-query-execution.md#roadmap-follow-ups-2026-10-12) | L | Very high |
-| 8 | **Graph-algorithm library.** The full Graphalytics harness with X06, the UI, a JVM handle, the C23 writer and openCypher procedures with F01 remain. | [F14](specs/F14-graph-algorithms.md#outcome) | S–M | High |
-| 9 | **Materialization at scale.** The separate derived-fact layer of Phase 2 and the `owl:sameAs` representatives of Phase 3 remain. | [F16](specs/F16-materialization-at-scale.md), [C08](specs/C08-inference-freshness.md#roadmap-follow-ups-2026-10-12) | L | High |
-| 12 | **GraphRAG community summaries.** Counting changes from an F13 view waits for item 17. | [C22](specs/C22-graph-rag-community-summaries.md) | M | High |
+| 8 | **Graph-algorithm library.** Algorithms and graph lenses are available. The full Graphalytics harness, algorithm-name completion, richer background progress, a JVM handle, the C23 writer and openCypher procedures remain. | [F14](specs/F14-graph-algorithms.md#outcome) | S–M | High |
+| 9 | **Materialization at scale.** Phase 1 materialization is available. The separate derived-fact layer of Phase 2, `owl:sameAs` representatives of Phase 3 and eligible execution without iteration barriers and equality maintenance in Phase 4 remain. | [F16](specs/F16-materialization-at-scale.md), [C08](specs/C08-inference-freshness.md#roadmap-follow-ups-2026-10-12) | L | High |
+| 12 | **GraphRAG community summaries.** Community reports, global answering and change-feed refresh are available. Counting changes from an F13 view remains planned and waits for item 17. | [C22](specs/C22-graph-rag-community-summaries.md) | M | High |
 | 14 | **Compaction.** Delta changes located per block, new vocabulary without a full rebuild, adaptive thresholds and automatic compaction in embedded use remain. | [C13](specs/C13-automatic-compaction.md#roadmap-follow-ups-2026-10-12) | M | Medium–high |
 | 15 | **Ingestion of images and audio.** The remaining follow-ups are recorded in C18. | [C18](specs/C18-natural-language-questions-and-ingest.md#roadmap-follow-ups-2026-10-12) | M | Medium–high |
 | 86 | **Group commit for indexed datasets.** The p90 of spatial serial inserts at 10.5M misses its gate. The spatial reader gate at 1.05M is not established, because the ordinary writer missed the schedule lag requirement. Items 111, 112 and 171 follow up. | [X09 section 17](specs/X09-group-commit-by-default.md#17-phase-4-group-commit-for-indexed-datasets) | M–L | Medium–high |
@@ -130,7 +136,7 @@ openCypher comes last.
 | 17 | **Incremental computation core.** Phase 2 adds `graph` views, maintenance inside the commit, the WebSocket, MCP, the Node and JVM APIs, the UI, views per branch, `keepCommits`, ordered windows and data-dependent protections compiled to views. Phase 3 adds provenance per fact, recursion and GraphQL subscriptions. | [F13](specs/F13-incremental-views-and-provenance.md#outcome) | XL | Very high |
 | 23 | **Full-text parity.** Online enabling and reconfiguring, search after uncommitted writes, and historical search remain. The analyzers that follow Lucene's and the dictionary analyzers are built. | [F03](specs/F03-full-text-search.md#roadmap-follow-ups-2026-10-12) | M each | Medium |
 | 24 | **GeoSPARQL.** k-NN with a query geometry bound per row, better polygon approximations than the cell grid and QLever's spatial syntax. The geometry limits to lift are datums other than WGS 84, grid-based and exact Helmert shifts, curved GML segments and solids, 3D constructions, and lines split at crossings. | [G01](specs/G01-geosparql.md#roadmap-follow-ups-2026-10-12) | M | Medium |
-| 27 | **Live query profiling** with verified rewrite suggestions. | [U04](specs/U04-live-query-profiling.md) | M | Not rated |
+| 27 | **Live query profiling.** The static plan overlay is available. The running-query registry, live operator progress, hotspot views and verified rewrite suggestions remain planned. | [U04](specs/U04-live-query-profiling.md) | M | Not rated |
 | 28 | **Query by example** and Bloom-style search phrases. | [U03](specs/U03-query-by-example.md) | M | Not rated |
 | 21 | **Editing forms generated from SHACL shapes.** Phase 3 adds nested forms for blank nodes, the list editor and `sh:or` and `sh:xone` choices. Validation of nodes more than two triples from the edited resource, in a check without a guard, also remains. | [U02](specs/U02-shape-driven-forms.md#outcome) | M–L | Medium–high |
 | 25 | **Callbacks in other languages.** Python and JavaScript functions inside queries, and native dispatch of Java functions, which today run through ARQ. | [P03](specs/P03-query-extensions.md#roadmap-follow-ups-2026-10-12) | M | Medium |
@@ -152,7 +158,7 @@ of canvas features.
 |---|---|---|---|
 | 29 | **Rendering very large graphs.** Phase 3 adds server layouts, the binary transfer format and GPU frame-rate tests. | [U06](specs/U06-large-graph-rendering.md#outcome) | M |
 | 30 | **Notebooks** stored in the dataset. | [U05](specs/U05-notebooks.md) | M |
-| 31 | **Data-quality timeline and schema diagram.** | [U07](specs/U07-data-quality-and-schema-diagram.md) | M |
+| 31 | **Data-quality timeline and schema diagram.** Validation overlays are available. Per-commit quality history, backfill and the schema diagram remain planned. | [U07](specs/U07-data-quality-and-schema-diagram.md) | M |
 | 32 | **Parameterized reusable plans.** | [X10](specs/X10-reusable-query-plans.md), [P01](specs/P01-python-bindings.md#roadmap-follow-ups-2026-10-12) | L |
 | 34 | **Vector quantization** and vector-result caching. | [F04](specs/F04-vector-search.md#roadmap-follow-ups-2026-10-12) | M |
 | 35 | **Multi-field full-text entity documents.** | [F03](specs/F03-full-text-search.md#roadmap-follow-ups-2026-10-12) | M |
@@ -368,6 +374,8 @@ linked spec Outcome records how they landed.
 - **181.** Compiler provenance in the Namespace query screen. [Benchmarking](BENCHMARKING.md#namespace-query-screens)
 - **182.** `subquery-agg` after the U02 forms, U11 Phase 3 and item 94 merges, which forge measured unchanged. [Benchmarking](BENCHMARKING.md#namespace-query-screens)
 - **242.** `two-hop-count` after the result buffer, which forge measured at 0.998 of the build before the buffer in 24 pinned rounds. [Benchmarks](BENCHMARKS.md#the-cost-of-result-serialization)
+
+- **307.** Bounded competitive assessment of bindings, durable writes and grouping queries. Residual costs remain under items 33, 290 and 293. [X06](specs/X06-benchmark-coverage.md#outcome)
 
 ## Keeping this current
 
