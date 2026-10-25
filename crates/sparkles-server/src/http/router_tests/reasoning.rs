@@ -1820,3 +1820,111 @@ async fn replay_preview_entailments_cover_every_source_commit() {
     assert_eq!(report["entailments"]["removed"], 0);
     assert_eq!(ds.store.snapshot().commit, head);
 }
+
+#[tokio::test]
+async fn review_adapters_diagnostics_honor_the_shared_support_check_budget() {
+    let dir = tempfile::tempdir().unwrap();
+    let st = open(dir.path(), None, false);
+    st.create("t", DbType::Persistent).unwrap();
+    load(
+        &st,
+        "t",
+        "ex:Cat owl:disjointWith ex:Dog . ex:tom a ex:Cat, ex:Dog .",
+    );
+    let app = router(st);
+    let report = get_json(
+        &app,
+        "/$/reason/t/diagnostics?justify=true&checks=disjoint-classes&maxChecks=1",
+    )
+    .await;
+    assert_eq!(report["justificationsComplete"], false, "{report}");
+    assert!(
+        report["justificationChecks"].as_u64().unwrap() <= 1,
+        "{report}"
+    );
+}
+
+#[tokio::test]
+async fn review_adapters_diagnostics_reject_invalid_support_check_budgets() {
+    let dir = tempfile::tempdir().unwrap();
+    let st = open(dir.path(), None, false);
+    st.create("t", DbType::Persistent).unwrap();
+    let app = router(st);
+    for limit in ["0", "100001", "bad", "-1"] {
+        let response = send(
+            &app,
+            Request::get(format!(
+                "/$/reason/t/diagnostics?justify=true&maxChecks={limit}"
+            ))
+            .body(Body::empty())
+            .unwrap(),
+        )
+        .await;
+        assert_eq!(
+            response.status,
+            StatusCode::BAD_REQUEST,
+            "{limit}: {}",
+            response.text()
+        );
+    }
+}
+
+#[tokio::test]
+async fn review_adapters_justified_diagnostics_enforce_json_and_turtle_byte_limits() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut st = open(dir.path(), None, false);
+    Arc::get_mut(&mut st).unwrap().limits.max_result_bytes = Some(1);
+    st.create("t", DbType::Persistent).unwrap();
+    load(
+        &st,
+        "t",
+        "ex:Cat owl:disjointWith ex:Dog . ex:tom a ex:Cat, ex:Dog .",
+    );
+    let app = router(st);
+    for format in ["json", "turtle"] {
+        let response = send(
+            &app,
+            Request::get(format!(
+                "/$/reason/t/diagnostics?justify=true&checks=disjoint-classes&format={format}"
+            ))
+            .body(Body::empty())
+            .unwrap(),
+        )
+        .await;
+        assert_eq!(
+            response.status,
+            StatusCode::INSUFFICIENT_STORAGE,
+            "{format}: {}",
+            response.text()
+        );
+        assert_eq!(response.json()["budget"], "result-bytes");
+    }
+}
+
+#[tokio::test]
+async fn review_adapters_streamed_patch_starts_the_analysis_clock_after_its_body() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut st = open(dir.path(), None, false);
+    Arc::get_mut(&mut st).unwrap().limits.max_timeout = Some(Duration::from_millis(500));
+    Arc::get_mut(&mut st).unwrap().default_timeout = Duration::from_millis(500);
+    st.create("t", DbType::Persistent).unwrap();
+    let app = router(st.clone());
+    let body = Body::from_stream(futures_util::stream::once(async {
+        tokio::time::sleep(Duration::from_millis(700)).await;
+        Ok::<_, std::io::Error>(axum::body::Bytes::from_static(
+            b"TX .\nA <urn:s> <urn:p> <urn:o> .\nTC .\n",
+        ))
+    }));
+    let response = send(
+        &app,
+        Request::post("/t/patch?dryRun=true&entailments=true&profile=rules&rules=")
+            .header(header::CONTENT_TYPE, "application/rdf-patch")
+            .body(body)
+            .unwrap(),
+    )
+    .await;
+    assert_eq!(response.status, StatusCode::OK, "{}", response.text());
+    assert_eq!(response.json()["wouldCommit"], true);
+    assert_eq!(response.json()["entailments"]["added"], 0);
+    assert_eq!(st.get("t").unwrap().store.snapshot().commit, 0);
+}

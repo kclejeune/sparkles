@@ -1025,3 +1025,28 @@ async fn entailment_diff_reads_branch_states_without_writing() {
     assert_eq!(dataset.store.snapshot().commit, head);
     assert_eq!(branch.store().snapshot().commit, branch_head);
 }
+
+#[cfg(feature = "reasoning")]
+#[tokio::test(flavor = "multi_thread")]
+async fn review_adapters_entailment_diff_honors_the_effective_mcp_memory_ceiling() {
+    let cfg = McpConfig {
+        query_memory_bytes: Some(1),
+        ..Default::default()
+    };
+    let mut state = AppState::standalone(StoreOptions::default(), cfg.max_timeout);
+    state.read_only = true;
+    state.limits.query_memory_bytes = Some(1 << 30);
+    let state = Arc::new(state);
+    let dataset = state.attach("t", DbType::Mem, None).unwrap();
+    load(&dataset, "<urn:s> <urn:p> <urn:o> .");
+    let head = dataset.store.snapshot().commit;
+    let mut client = Client::start(McpServer::new(state, cfg));
+    let result = client
+        .call(
+            "entailment_diff",
+            json!({"from":"head","to":"head","profile":"rules","rules":""}),
+        )
+        .await;
+    assert_eq!(result["isError"], true, "{result}");
+    assert_eq!(dataset.store.snapshot().commit, head);
+}

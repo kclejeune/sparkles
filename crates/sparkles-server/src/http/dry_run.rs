@@ -269,6 +269,30 @@ impl Request {
         }
     }
 
+    /// Start the analysis clock with execution after a streamed body has arrived.
+    pub(super) fn started(self, write: &sparkles::guard::WriteOptions) -> Self {
+        #[cfg(feature = "reasoning")]
+        {
+            let mut request = self;
+            if let Some(analysis) = &mut request.entailments {
+                analysis.cancel = write.cancel.clone();
+                let deadline = analysis
+                    .timeout
+                    .and_then(|timeout| std::time::Instant::now().checked_add(timeout));
+                request.analysis_deadline = match (deadline, write.deadline) {
+                    (Some(a), Some(b)) => Some(a.min(b)),
+                    (a, b) => a.or(b),
+                };
+            }
+            request
+        }
+        #[cfg(not(feature = "reasoning"))]
+        {
+            let _ = write;
+            self
+        }
+    }
+
     pub(super) fn unchanged_entailments(&self, ds: &Dataset, commit: u64) -> ApiResult<J> {
         #[cfg(feature = "reasoning")]
         if let Some(analysis) = &self.entailments {
@@ -557,5 +581,40 @@ impl Request {
             doc["error"] = json!(e);
         }
         doc
+    }
+}
+
+#[cfg(all(test, feature = "reasoning"))]
+mod control_tests {
+    use super::*;
+
+    #[test]
+    fn started_analysis_uses_the_actual_write_deadline_and_cancellation() {
+        let deadline = std::time::Instant::now() + Duration::from_millis(100);
+        let cancel = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let write = sparkles::guard::WriteOptions {
+            deadline: Some(deadline),
+            cancel: Some(cancel.clone()),
+            ..Default::default()
+        };
+        let request = Request {
+            format: Format::Json,
+            changes: 0,
+            restricted: false,
+            max_bytes: None,
+            entailments: Some(sparkles::reasoning::analysis::AnalysisOptions {
+                timeout: Some(Duration::from_secs(30)),
+                ..Default::default()
+            }),
+            analysis_deadline: None,
+            max_result_bytes: None,
+            sample_limit: 1,
+        }
+        .started(&write);
+        assert_eq!(request.analysis_deadline, Some(deadline));
+        assert!(Arc::ptr_eq(
+            request.entailments.unwrap().cancel.as_ref().unwrap(),
+            &cancel
+        ));
     }
 }

@@ -135,6 +135,7 @@ pub(super) async fn apply(
         .transpose()?;
     let body = spool(body, &mut BodyBudget::new(&st.limits)).await?;
     let (wopts, timeout) = wopts.start();
+    let dry = dry.map(|request| request.started(&wopts));
     super::blocking(move || {
         let t0 = std::time::Instant::now();
         let opts = PatchOptions {

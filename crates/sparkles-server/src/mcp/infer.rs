@@ -129,9 +129,7 @@ impl Tools<'_> {
             .map_err(|error| ToolError::bad_argument(error.to_string()))?;
         request.analysis.timeout = Some(self.timeout(args.timeout_seconds)?);
         request.analysis.max_memory = self
-            .server
-            .state
-            .limits
+            .cfg()
             .query_memory_bytes
             .map(|limit| usize::try_from(limit).unwrap_or(usize::MAX));
         request.analysis.max_inferred = Some(self.server.state.reason_max_inferred);

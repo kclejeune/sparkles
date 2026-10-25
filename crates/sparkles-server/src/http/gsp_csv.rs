@@ -197,6 +197,7 @@ pub(super) async fn write(
         p2
     };
     let (wopts, timeout) = wopts.start();
+    let dry = dry.map(|request| request.started(&wopts));
     let grant = crate::server_memory::current_grant();
     blocking(move || {
         let lookup = match lookup {

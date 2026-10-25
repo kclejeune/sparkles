@@ -64,7 +64,7 @@ fn selector_access(
 }
 
 #[cfg(feature = "reasoning")]
-fn output(body: Vec<u8>, media: &str, limit: Option<u64>) -> ApiResult {
+pub(super) fn output(body: Vec<u8>, media: &str, limit: Option<u64>) -> ApiResult {
     if let Some(limit) = limit
         && body.len() as u64 > limit
     {

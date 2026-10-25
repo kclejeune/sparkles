@@ -464,6 +464,7 @@ pub(super) async fn run(
     };
     let lookup = super::lookup_param(&params)?;
     let (mut wopts, timeout) = wopts.start();
+    let dry = dry.map(|request| request.started(&wopts));
     if wopts.message.is_none() {
         wopts.message = Some(format!("mapping {stored_name} (version {version})").into());
     }

@@ -3491,6 +3491,7 @@ async fn gsp_on(
                 .transpose()?;
             let body = spool(body, &mut BodyBudget::new(&st.limits)).await?;
             let (wopts, timeout) = wopts.start();
+            let dry = dry.map(|request| request.started(&wopts));
             blocking(move || {
                 let graph = match &target {
                     Target::Named(iri) => Some(
@@ -3574,6 +3575,7 @@ async fn gsp_on(
                 })
                 .transpose()?;
             let (wopts, timeout) = wopts.start();
+            let dry = dry.map(|request| request.started(&wopts));
             // the admitted grant, read on the request's task before the blocking thread
             let grant = crate::server_memory::current_grant();
             blocking(move || {
@@ -3795,6 +3797,7 @@ async fn upload(
     mappings.resolve(&params, &ds)?;
     let lookup_view = lookup_param(&params)?.then_some(lookup_grants.clone());
     let (wopts, timeout) = wopts.start();
+    let dry = dry.map(|request| request.started(&wopts));
     // the admitted grant, read on the request's task before the blocking thread
     let grant = crate::server_memory::current_grant();
     blocking(move || {
@@ -5213,6 +5216,20 @@ async fn reason_diagnostics(
             ));
         }
     };
+    let max_checks = match params.get("maxChecks") {
+        None => 500,
+        Some(value) => value
+            .parse::<usize>()
+            .ok()
+            .filter(|checks| (1..=100_000).contains(checks))
+            .ok_or_else(|| {
+                err(
+                    StatusCode::BAD_REQUEST,
+                    "maxChecks must be between 1 and 100000",
+                )
+            })?,
+    };
+    let max_result_bytes = st.limits.max_result_bytes;
     let mut analysis = sparkles::reasoning::analysis::AnalysisOptions::default();
     entailments::options(&st, &principal, &ds.name, &mut analysis);
     let (cancel, _guard) = cancel_on_drop();
@@ -5239,7 +5256,7 @@ async fn reason_diagnostics(
     };
     blocking(move || {
         let supports = if justify {
-            Some(reasoning.diagnostics_justified(&opts, &analysis, 500)?)
+            Some(reasoning.diagnostics_justified(&opts, &analysis, max_checks)?)
         } else {
             None
         };
@@ -5264,9 +5281,17 @@ async fn reason_diagnostics(
             if let Some(supports) = &supports {
                 ttl.push_str(&supports.supports.to_turtle());
             }
-            ([(header::CONTENT_TYPE, "text/turtle; charset=utf-8")], ttl).into_response()
+            entailments::output(
+                ttl.into_bytes(),
+                "text/turtle; charset=utf-8",
+                max_result_bytes,
+            )?
         } else {
-            Json(j).into_response()
+            entailments::output(
+                serde_json::to_vec(&j).unwrap(),
+                "application/json",
+                max_result_bytes,
+            )?
         };
         Ok(with_commit(r, &ds, seq))
     })
