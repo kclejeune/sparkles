@@ -59,7 +59,7 @@ use std::fmt;
 use std::mem::size_of;
 use std::str::FromStr;
 use std::sync::Arc;
-use std::sync::atomic::AtomicBool;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Instant;
 use terms::{LocalTerm, Terms};
 
@@ -371,7 +371,7 @@ fn derive_here(
     terms.set_budget(&budget)?;
     let mut defaults = None;
     if extras.geo_default_geometry {
-        let d = default_geometries(&base, &terms, &budget)?;
+        let d = default_geometries_for_run(&base, &terms, &budget, opts)?;
         g.try_add_batch(d.0.iter().copied())?;
         defaults = Some(d);
     }
@@ -436,6 +436,35 @@ fn room_for_key(
 /// `geo:hasGeometry` (`G`) and no `geo:hasDefaultGeometry` (Jena's
 /// `applyDefaultGeometry`), sorted, with their charge to `budget`. Two scans of the
 /// input graphs, one per property.
+fn default_geometries_for_run(
+    base: &facts::Base,
+    terms: &Terms,
+    budget: &Arc<Budget>,
+    opts: &ReasonOptions,
+) -> anyhow::Result<(Vec<[u64; 3]>, Held)> {
+    let mut entered = false;
+    let mut reported = false;
+    default_geometries_controlled(base, terms, budget, || {
+        if !entered {
+            entered = true;
+        } else if !reported {
+            reported = true;
+            progress(opts, 0.0, "finding default geometries");
+        }
+        if let Some(context) = &opts.analysis {
+            context.check()?;
+        }
+        if opts
+            .cancel
+            .as_ref()
+            .is_some_and(|cancel| cancel.load(Ordering::Relaxed))
+        {
+            anyhow::bail!("reasoning cancelled");
+        }
+        Ok(())
+    })
+}
+
 fn default_geometries(
     base: &facts::Base,
     terms: &Terms,

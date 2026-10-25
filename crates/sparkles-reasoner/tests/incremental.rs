@@ -787,3 +787,95 @@ fn diagnostic_summary_admits_cached_literal_decode_before_allocation() {
         "{error:#}"
     );
 }
+
+#[test]
+fn diagnostic_summary_accounts_for_cumulative_retained_language_tags() {
+    use sparkles_reasoner::diagnostics::DiagnosticControls;
+    let s = Store::in_memory(StoreOptions::default());
+    let mut text = String::new();
+    for i in 0..30 {
+        let tag = format!("x-{}{:08x}", "abcdefgh-".repeat(100), i);
+        text.push_str(&format!("<urn:item{i}> <urn:value> \"bad\"@{tag} .\n"));
+    }
+    s.load(&[Source::from_bytes(
+        text.into_bytes(),
+        RdfFormat::Turtle,
+        None,
+    )])
+    .unwrap();
+    let cache = Cache::default();
+    let profile=Profile::Rules("[type: (?x <urn:value> ?value) -> (?value <http://www.w3.org/1999/02/22-rdf-syntax-ns#type> <http://www.w3.org/2001/XMLSchema#integer>)]".into());
+    run(&s, &profile, None, Some(&cache));
+    let result = sparkles_reasoner::literal_typings_controlled(
+        &s,
+        s.snapshot().commit,
+        Some(&cache),
+        &DiagnosticControls {
+            max_memory: Some(32768),
+            ..Default::default()
+        },
+    );
+    let error = match result {
+        Err(error) => error,
+        Ok(_) => panic!("cumulative retained language tags must exhaust the summary allowance"),
+    };
+    assert!(
+        error
+            .downcast_ref::<sparkles_reasoner::MemoryLimitExceeded>()
+            .is_some(),
+        "{error:#}"
+    );
+}
+
+#[test]
+fn analysis_cancellation_interrupts_geometry_during_its_input_scan() {
+    use sparkles_reasoner::analysis::{AnalysisContext, WitnessMap};
+    use std::sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+    };
+    let s = Store::in_memory(StoreOptions::default());
+    s.load(&[Source::from_bytes(b"<urn:a> <http://www.opengis.net/ont/geosparql#hasGeometry> <urn:g> . <urn:b> <http://www.opengis.net/ont/geosparql#hasGeometry> <urn:h> .".to_vec(),RdfFormat::Turtle,None)]).unwrap();
+    let cancel = Arc::new(AtomicBool::new(false));
+    let context = AnalysisContext::new(
+        WitnessMap::new(1, None, cancel.clone(), None),
+        None,
+        "geometry control regression".into(),
+    )
+    .unwrap();
+    let seen = cancel.clone();
+    let options = ReasonOptions {
+        analysis: Some(context),
+        progress: Some(Arc::new(move |_, message| {
+            if message == "finding default geometries" {
+                seen.store(true, Ordering::Relaxed);
+            }
+        })),
+        ..Default::default()
+    };
+    let result = materialize_incremental(
+        &s,
+        &Profile::Rules(String::new()),
+        &Extras {
+            geo_default_geometry: true,
+            ..Default::default()
+        },
+        Incremental::default(),
+        &options,
+    );
+    assert!(
+        cancel.load(Ordering::Relaxed),
+        "cancellation must happen inside the geometry scan"
+    );
+    let error = match result {
+        Err(error) => error,
+        Ok(_) => panic!("geometry construction must stop at the next control check"),
+    };
+    assert!(
+        error
+            .to_string()
+            .contains("stopping an entailment analysis"),
+        "{error:#}"
+    );
+    assert_eq!(s.snapshot().commit, 1);
+}

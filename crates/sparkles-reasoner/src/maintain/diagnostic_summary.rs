@@ -12,6 +12,7 @@ fn check(controls: &DiagnosticControls) -> anyhow::Result<()> {
 fn fact_bytes(literal: &Literal, datatype: &NamedNode) -> usize {
     256 + literal.value().len() * 2
         + literal.datatype().as_str().len() * 2
+        + literal.language().map_or(0, str::len) * 2
         + datatype.as_str().len() * 2
 }
 
