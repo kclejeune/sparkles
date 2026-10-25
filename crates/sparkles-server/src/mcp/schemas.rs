@@ -38,6 +38,7 @@ pub fn all_tools() -> Vec<&'static str> {
     ]);
     if cfg!(feature = "reasoning") {
         v.push("explain_inference");
+        v.push("entailment_diff");
     }
     if cfg!(feature = "shacl") {
         v.push("validate_shacl");
@@ -693,6 +694,19 @@ pub fn tools(cfg: &McpConfig) -> Vec<ToolDef> {
                 "commitsSince":{"type":"integer"},"staleReason":{"type":"string"},
                 "message":{"type":"string"},
                 "prefixes":prefixes()}})),
+        ),
+        read(
+            "entailment_diff",
+            "Compare the entailments of two states",
+            "Compare commits or branches under one rule program without writing. Counts cover all added and removed inferred triples, with bounded samples and newly introduced diagnostic findings. States are a commit number, a branch name or branch@commit. By default the dataset's recorded program applies.",
+            json!({"type":"object","additionalProperties":false,"required":["from"],"properties":{
+                "dataset":ds(),"from":{"type":"string","minLength":1},"to":{"type":"string","default":"head"},
+                "profile":{"type":"string"},"rules":{"type":"string"},"inputs":{"type":"object"},
+                "sampleLimit":{"type":"integer","minimum":1,"maximum":100,"default":100},"timeoutSeconds":to(cfg)}}),
+            Some(json!({"type":"object","required":["dataset","added","removed","sample","sampleTruncated","newFindings","findingsComplete"],"properties":{
+                "dataset":{"type":"string"},"added":{"type":"integer"},"removed":{"type":"integer"},
+                "sample":{"type":"object","properties":{"added":{"type":"array","items":{"type":"array","items":{"type":"object"}}},"removed":{"type":"array","items":{"type":"array","items":{"type":"object"}}}}},
+                "sampleTruncated":{"type":"boolean"},"newFindings":{"type":"array","items":{"type":"object"}},"findingsComplete":{"type":"boolean"}}})),
         ),
         read(
             "share_query",

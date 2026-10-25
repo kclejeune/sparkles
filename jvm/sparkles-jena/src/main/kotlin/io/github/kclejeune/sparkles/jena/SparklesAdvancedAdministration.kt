@@ -67,8 +67,20 @@ public class SparklesReasoning internal constructor(private val owner: DatasetGr
     public fun status(): org.apache.jena.atlas.json.JsonObject? { owner.checkOpen(); return ffi { owner.handle.ffi.reasonStatus() }?.let { document(it).asObject } }
     @JvmOverloads public fun diagnostics(options: DiagnosticsOptions = DiagnosticsOptions()): org.apache.jena.atlas.json.JsonObject = SparklesOperation().use { diagnostics(options, it) }
     public fun diagnostics(options: DiagnosticsOptions, operation: SparklesOperation): org.apache.jena.atlas.json.JsonObject {
-        owner.checkCapture("reasoning.diagnostics"); require(options.limit in 0..10000)
-        return document(ffi { owner.handle.ffi.reasonDiagnostics(io.github.kclejeune.sparkles.jena.internal.ffi.DiagnosticsRequest(options.checks, options.limit.toUInt(), options.includeInferences, options.graphs, options.closure), operation.native) }).asObject
+        owner.checkCapture("reasoning.diagnostics"); require(options.limit in 0..10000); require(options.maxChecks in 0..100000); require(options.maxMemory == null || options.maxMemory > 0)
+        return document(ffi { owner.handle.ffi.reasonDiagnostics(io.github.kclejeune.sparkles.jena.internal.ffi.DiagnosticsRequest(options.checks, options.limit.toUInt(), options.includeInferences, options.graphs, options.closure, options.justify, options.maxChecks.toUInt(), options.maxMemory?.toULong()), operation.native) }).asObject
+    }
+    @JvmOverloads public fun diff(from: String, to: String = "head", options: org.apache.jena.atlas.json.JsonObject = org.apache.jena.atlas.json.JsonObject()): org.apache.jena.atlas.json.JsonObject = SparklesOperation().use { diff(from, to, options, it) }
+    public fun diff(from: String, to: String, options: org.apache.jena.atlas.json.JsonObject, operation: SparklesOperation): org.apache.jena.atlas.json.JsonObject {
+        owner.checkCapture("reasoning.diff")
+        val request = document(options.bytes()).asObject
+        request.put("from", from); request.put("to", to)
+        return document(ffi { owner.handle.ffi.reasonDiff(request.bytes(), operation.native) }).asObject
+    }
+    public fun justify(request: org.apache.jena.atlas.json.JsonObject): org.apache.jena.atlas.json.JsonObject = SparklesOperation().use { justify(request, it) }
+    public fun justify(request: org.apache.jena.atlas.json.JsonObject, operation: SparklesOperation): org.apache.jena.atlas.json.JsonObject {
+        owner.checkCapture("reasoning.justify")
+        return document(ffi { owner.handle.ffi.reasonJustify(request.bytes(), operation.native) }).asObject
     }
     public fun rdfs(): SparklesRdfs = SparklesRdfs(owner)
     @JvmOverloads public fun run(options: ReasonOptions = ReasonOptions()): ReasonReport = SparklesOperation().use { run(options, it) }

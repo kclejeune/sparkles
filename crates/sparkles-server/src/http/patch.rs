@@ -120,7 +120,19 @@ pub(super) async fn apply(
         .opts
         .dry_run
         .as_ref()
-        .map(|d| super::dry_run::Request::new(&st, &headers, d, restricted));
+        .map(|d| {
+            super::dry_run::Request::for_write(
+                &st,
+                &headers,
+                &params,
+                d,
+                restricted,
+                Some(&p),
+                &ds,
+                &wopts.opts,
+            )
+        })
+        .transpose()?;
     let body = spool(body, &mut BodyBudget::new(&st.limits)).await?;
     let (wopts, timeout) = wopts.start();
     super::blocking(move || {

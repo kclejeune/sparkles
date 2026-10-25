@@ -1457,3 +1457,366 @@ async fn demand_reasoning_over_http() {
     let (r, _) = get("reasoning=demand&reasoningProfile=nope").await;
     assert_eq!(r.status, StatusCode::BAD_REQUEST, "{}", r.text());
 }
+
+#[tokio::test]
+async fn entailment_diff_route_is_read_only_and_serializes_complete_formats() {
+    let dir = tempfile::tempdir().unwrap();
+    let st = open(dir.path(), None, false);
+    st.create("t", DbType::Persistent).unwrap();
+    load(&st, "t", "ex:Manager rdfs:subClassOf ex:Employee .");
+    let from = st.get("t").unwrap().store.snapshot().commit;
+    load(&st, "t", "ex:alice a ex:Manager .");
+    let head = st.get("t").unwrap().store.snapshot().commit;
+    let app = router(st.clone());
+    let path = format!("/$/reason/t/diff?from={from}&to=head&profile=rdfs-simple");
+    let value = get_json(&app, &path).await;
+    assert_eq!(value["added"], 1);
+    assert_eq!(value["removed"], 0);
+    for media in ["application/trig", "application/rdf-patch"] {
+        let response = send(
+            &app,
+            Request::get(&path)
+                .header(header::ACCEPT, media)
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await;
+        assert_eq!(response.status, StatusCode::OK, "{}", response.text());
+        assert!(response.text().contains("http://ex.org/Employee"));
+    }
+    assert_eq!(st.get("t").unwrap().store.snapshot().commit, head);
+}
+
+#[tokio::test]
+async fn justification_route_returns_minimal_class_support_and_capped_search() {
+    let dir = tempfile::tempdir().unwrap();
+    let st = open(dir.path(), None, false);
+    st.create("t", DbType::Persistent).unwrap();
+    load(
+        &st,
+        "t",
+        "ex:CatDog rdfs:subClassOf ex:Cat, ex:Dog . ex:Cat owl:disjointWith ex:Dog .",
+    );
+    let head = st.get("t").unwrap().store.snapshot().commit;
+    let app = router(st.clone());
+    let response = post_json(
+        &app,
+        "/$/reason/t/justify",
+        r#"{"class":"http://ex.org/CatDog","profile":"owl-rl"}"#,
+    )
+    .await;
+    assert_eq!(response.status, StatusCode::OK, "{}", response.text());
+    let value = response.json();
+    assert_eq!(value["results"][0]["holds"], true);
+    assert_eq!(
+        value["results"][0]["justifications"][0]["facts"]
+            .as_array()
+            .unwrap()
+            .len(),
+        3
+    );
+    let response = post_json(
+        &app,
+        "/$/reason/t/justify",
+        r#"{"class":"http://ex.org/CatDog","profile":"owl-rl","maxChecks":1}"#,
+    )
+    .await;
+    assert_eq!(response.status, StatusCode::OK, "{}", response.text());
+    assert_eq!(response.json()["complete"], false);
+    assert_eq!(st.get("t").unwrap().store.snapshot().commit, head);
+}
+
+#[tokio::test]
+async fn diagnostics_justify_adds_one_minimal_support_per_finding() {
+    let dir = tempfile::tempdir().unwrap();
+    let st = open(dir.path(), None, false);
+    st.create("t", DbType::Persistent).unwrap();
+    load(
+        &st,
+        "t",
+        "ex:Cat owl:disjointWith ex:Dog . ex:tom a ex:Cat, ex:Dog .",
+    );
+    let app = router(st.clone());
+    let report = get_json(
+        &app,
+        "/$/reason/t/diagnostics?justify=true&checks=disjoint-classes",
+    )
+    .await;
+    assert_eq!(
+        report["findings"][0]["justification"]["facts"]
+            .as_array()
+            .unwrap()
+            .len(),
+        3
+    );
+    assert_eq!(report["justificationsComplete"], true);
+    let response = send(
+        &app,
+        Request::get("/$/reason/t/diagnostics?justify=true&checks=disjoint-classes&format=turtle")
+            .body(Body::empty())
+            .unwrap(),
+    )
+    .await;
+    assert_eq!(response.status, StatusCode::OK, "{}", response.text());
+    assert!(
+        response
+            .text()
+            .contains("urn:x-sparkles:JustificationReport")
+    );
+}
+
+#[tokio::test]
+async fn write_preview_entailments_use_the_complete_candidate_when_changes_are_unlisted() {
+    let dir = tempfile::tempdir().unwrap();
+    let st = open(dir.path(), None, false);
+    st.create("t", DbType::Persistent).unwrap();
+    load(&st, "t", "ex:Manager rdfs:subClassOf ex:Employee .");
+    let head = st.get("t").unwrap().store.snapshot().commit;
+    let app = router(st.clone());
+    let response = send(
+        &app,
+        Request::post("/t/update?dryRun=true&entailments=true&changes=0&profile=rdfs-simple")
+            .header(header::CONTENT_TYPE, "application/sparql-update")
+            .body(Body::from(
+                "INSERT DATA {<http://ex.org/alice> a <http://ex.org/Manager>}",
+            ))
+            .unwrap(),
+    )
+    .await;
+    assert_eq!(response.status, StatusCode::OK, "{}", response.text());
+    let value = response.json();
+    assert_eq!(value["committed"], false);
+    assert!(value.get("changes").is_none());
+    assert_eq!(value["entailments"]["added"], 1, "{value}");
+    assert_eq!(value["entailments"]["removed"], 0);
+    assert_eq!(st.get("t").unwrap().store.snapshot().commit, head);
+    let response = send(
+        &app,
+        Request::post("/t/update?entailments=true&profile=rdfs-simple")
+            .header(header::CONTENT_TYPE, "application/sparql-update")
+            .body(Body::from("INSERT DATA {<urn:wrong> <urn:p> <urn:o>}"))
+            .unwrap(),
+    )
+    .await;
+    assert_eq!(response.status, StatusCode::BAD_REQUEST);
+    assert_eq!(st.get("t").unwrap().store.snapshot().commit, head);
+}
+
+#[tokio::test]
+async fn support_patch_preview_keeps_inherited_blank_identity_and_only_applies_to_new_branch() {
+    let dir = tempfile::tempdir().unwrap();
+    let st = open(dir.path(), None, false);
+    st.create("t", DbType::Persistent).unwrap();
+    load(
+        &st,
+        "t",
+        "ex:Manager rdfs:subClassOf ex:Employee . _:person a ex:Manager .",
+    );
+    let ds = st.get("t").unwrap();
+    let snapshot = ds.store.snapshot();
+    let source_head = snapshot.commit;
+    let mut fact = None;
+    snapshot
+        .for_each_quad(|ids| {
+            let quad = snapshot.quad_to_terms(ids).unwrap();
+            if matches!(&quad.subject, oxrdf::NamedOrBlankNode::BlankNode(_)) {
+                fact = Some(quad);
+            }
+            Ok(())
+        })
+        .unwrap();
+    let app = router(st.clone());
+    let created = post_json(
+        &app,
+        "/$/branches/t",
+        &serde_json::json!({"name":"support-removal","from":"main","at":format!("commit:{source_head}")})
+            .to_string(),
+    )
+    .await;
+    assert_eq!(created.status, StatusCode::CREATED, "{}", created.text());
+    let branch = created.json();
+    let mut writer = sparkles::patch::PatchWriter::new(Vec::new(), false);
+    let id = branch["id"].as_str().unwrap().parse().unwrap();
+    writer
+        .header(
+            "prev",
+            &sparkles::patch::commit_iri(id, branch["head"].as_u64().unwrap()),
+        )
+        .unwrap();
+    writer.begin().unwrap();
+    writer
+        .change(sparkles::store::DiffOp::Remove, &fact.unwrap())
+        .unwrap();
+    writer.commit().unwrap();
+    let patch = writer.into_inner();
+    let response = send(
+        &app,
+        Request::post(
+            "/t@support-removal/patch?dryRun=true&entailments=true&changes=1&profile=rdfs-simple",
+        )
+        .header(header::CONTENT_TYPE, sparkles::patch::MEDIA_TYPE)
+        .body(Body::from(patch.clone()))
+        .unwrap(),
+    )
+    .await;
+    assert_eq!(response.status, StatusCode::OK, "{}", response.text());
+    let preview = response.json();
+    assert_eq!(preview["changes"]["total"], 1, "{preview}");
+    assert_eq!(preview["entailments"]["removed"], 1, "{preview}");
+    assert_eq!(ds.store.snapshot().commit, source_head);
+    let response = send(
+        &app,
+        Request::post("/t@support-removal/patch?receipt=true")
+            .header(header::CONTENT_TYPE, sparkles::patch::MEDIA_TYPE)
+            .body(Body::from(patch))
+            .unwrap(),
+    )
+    .await;
+    assert_eq!(response.status, StatusCode::OK, "{}", response.text());
+    assert_eq!(ds.store.snapshot().commit, source_head);
+    assert_eq!(ds.store.snapshot().len(), 2);
+    let branch = st.branch_dataset(&ds, "support-removal").unwrap();
+    assert_eq!(branch.store.snapshot().len(), 1);
+}
+
+#[tokio::test]
+async fn merge_entailments_compare_the_merged_candidate_and_preserve_divergent_target_facts() {
+    let dir = tempfile::tempdir().unwrap();
+    let st = open(dir.path(), None, false);
+    st.create("t", DbType::Persistent).unwrap();
+    load(&st, "t", "ex:Manager rdfs:subClassOf ex:Employee .");
+    let ds = st.get("t").unwrap();
+    ds.dataset
+        .create_branch("feature", &Default::default())
+        .unwrap();
+    ds.dataset
+        .branch("feature")
+        .unwrap()
+        .update("INSERT DATA {<http://ex.org/alice> a <http://ex.org/Manager>}")
+        .unwrap();
+    load(&st, "t", "ex:bob a ex:Manager .");
+    let main_head = ds.store.snapshot().commit;
+    let branch = ds.dataset.branch("feature").unwrap();
+    let feature_head = branch.store().snapshot().commit;
+    let app = router(st.clone());
+    let report = get_json(
+        &app,
+        "/$/merge/t?source=feature&target=main&entailments=true&profile=rdfs-simple",
+    )
+    .await;
+    assert_eq!(report["entailments"]["added"], 1, "{report}");
+    assert_eq!(report["entailments"]["removed"], 0, "{report}");
+    let response = post_json(&app,"/$/merge/t",r#"{"source":"feature","target":"main","dryRun":true,"entailments":true,"profile":"rdfs-simple","changes":0}"#).await;
+    assert_eq!(response.status, StatusCode::OK, "{}", response.text());
+    assert_eq!(
+        response.json()["entailments"]["added"],
+        1,
+        "{}",
+        response.text()
+    );
+    assert_eq!(response.json()["entailments"]["removed"], 0);
+    assert_eq!(ds.store.snapshot().commit, main_head);
+    assert_eq!(branch.store().snapshot().commit, feature_head);
+}
+
+#[tokio::test]
+async fn unchanged_merge_has_zero_entailments_without_a_write() {
+    let dir = tempfile::tempdir().unwrap();
+    let st = open(dir.path(), None, false);
+    st.create("t", DbType::Persistent).unwrap();
+    load(
+        &st,
+        "t",
+        "ex:Manager rdfs:subClassOf ex:Employee . ex:alice a ex:Manager .",
+    );
+    let ds = st.get("t").unwrap();
+    ds.dataset
+        .create_branch("feature", &Default::default())
+        .unwrap();
+    let head = ds.store.snapshot().commit;
+    let app = router(st.clone());
+    let report = get_json(
+        &app,
+        "/$/merge/t?source=feature&entailments=true&profile=rdfs-simple",
+    )
+    .await;
+    assert_eq!(report["upToDate"], true, "{report}");
+    assert_eq!(report["entailments"]["added"], 0, "{report}");
+    assert_eq!(report["entailments"]["removed"], 0);
+    assert_eq!(ds.store.snapshot().commit, head);
+}
+
+#[tokio::test]
+async fn merge_conflicts_leave_entailments_unknown_until_a_complete_candidate_is_selected() {
+    let dir = tempfile::tempdir().unwrap();
+    let st = open(dir.path(), None, false);
+    st.create("t", DbType::Persistent).unwrap();
+    load(&st, "t", "ex:p rdfs:range ex:C . ex:item ex:p ex:a .");
+    let ds = st.get("t").unwrap();
+    ds.dataset
+        .create_branch("feature", &Default::default())
+        .unwrap();
+    let app = router(st.clone());
+    update(
+        &app,
+        "t@feature",
+        "DELETE {ex:item ex:p ?old} INSERT {ex:item ex:p ex:b} WHERE {ex:item ex:p ?old}",
+    )
+    .await;
+    update(
+        &app,
+        "t",
+        "DELETE {ex:item ex:p ?old} INSERT {ex:item ex:p ex:c} WHERE {ex:item ex:p ?old}",
+    )
+    .await;
+    let head = ds.store.snapshot().commit;
+    let unresolved = get_json(
+        &app,
+        "/$/merge/t?source=feature&entailments=true&profile=rdfs-simple",
+    )
+    .await;
+    assert!(unresolved["entailments"].is_null(), "{unresolved}");
+    assert!(
+        unresolved["entailmentsUnavailable"]
+            .as_str()
+            .unwrap()
+            .contains("conflict")
+    );
+    let ours = get_json(
+        &app,
+        "/$/merge/t?source=feature&entailments=true&profile=rdfs-simple&onConflict=ours",
+    )
+    .await;
+    assert_eq!(ours["entailments"]["added"], 0, "{ours}");
+    assert_eq!(ours["entailments"]["removed"], 0);
+    let theirs = get_json(
+        &app,
+        "/$/merge/t?source=feature&entailments=true&profile=rdfs-simple&onConflict=theirs",
+    )
+    .await;
+    assert_eq!(theirs["entailments"]["added"], 1, "{theirs}");
+    assert_eq!(theirs["entailments"]["removed"], 1);
+    assert_eq!(ds.store.snapshot().commit, head);
+}
+
+#[tokio::test]
+async fn replay_preview_entailments_cover_every_source_commit() {
+    let dir = tempfile::tempdir().unwrap();
+    let st = open(dir.path(), None, false);
+    st.create("t", DbType::Persistent).unwrap();
+    load(&st, "t", "ex:Manager rdfs:subClassOf ex:Employee .");
+    let ds = st.get("t").unwrap();
+    ds.dataset
+        .create_branch("feature", &Default::default())
+        .unwrap();
+    let app = router(st.clone());
+    update(&app, "t@feature", "INSERT DATA {ex:alice a ex:Manager}").await;
+    update(&app, "t@feature", "INSERT DATA {ex:bob a ex:Manager}").await;
+    let head = ds.store.snapshot().commit;
+    let response=post_json(&app,"/$/merge/t",r#"{"source":"feature","ff":"replay","dryRun":true,"entailments":true,"profile":"rdfs-simple"}"#).await;
+    assert_eq!(response.status, StatusCode::OK, "{}", response.text());
+    let report = response.json();
+    assert_eq!(report["entailments"]["added"], 2, "{report}");
+    assert_eq!(report["entailments"]["removed"], 0);
+    assert_eq!(ds.store.snapshot().commit, head);
+}

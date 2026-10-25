@@ -11,3 +11,17 @@ export function explanationDetails(answer: components['schemas']['Explanation'])
   const reads = answer.trees?.map((tree) => tree.read?.source);
   return { missing, blockers, reads };
 }
+
+// These values remain typed through generated tuples, supports and preview reports.
+export function entailmentDetails(
+  diff: components['schemas']['EntailmentDiff'],
+  supports: components['schemas']['JustificationReport'],
+  preview: components['schemas']['DryRunReport'],
+  request: components['schemas']['InferenceExplainRequest'],
+) {
+  const subjects = diff.sample.added.map(([subject]) => subject.type);
+  const roles = supports.results.flatMap((result) =>
+    result.justifications.flatMap((support) => support.facts.map((fact) => fact.role)),
+  );
+  return { subjects, roles, changes: preview.entailments?.added, triple: request.triple };
+}

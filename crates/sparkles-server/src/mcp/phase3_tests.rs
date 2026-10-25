@@ -986,3 +986,42 @@ ex:Cat rdfs:subClassOf ex:Animal . ex:tom a ex:Cat .
         .await;
     assert!(t.contains("does not parse"), "{t}");
 }
+
+#[cfg(feature = "reasoning")]
+#[tokio::test(flavor = "multi_thread")]
+async fn entailment_diff_reads_branch_states_without_writing() {
+    let server = server_with(
+        &[(
+            "t",
+            &[
+                "@prefix ex:<http://ex.org/>. @prefix rdfs:<http://www.w3.org/2000/01/rdf-schema#>. ex:Manager rdfs:subClassOf ex:Employee.",
+            ],
+        )],
+        McpConfig::default(),
+    );
+    let dataset = server.state.get("t").unwrap();
+    dataset
+        .dataset
+        .create_branch("feature", &Default::default())
+        .unwrap();
+    let branch = dataset.dataset.branch("feature").unwrap();
+    branch
+        .load_str(
+            "<http://ex.org/alice> a <http://ex.org/Manager>.",
+            sparkles::io::RdfFormat::Turtle,
+        )
+        .unwrap();
+    let head = dataset.store.snapshot().commit;
+    let branch_head = branch.store().snapshot().commit;
+    let mut client = Client::start(server);
+    let result = client
+        .structured(
+            "entailment_diff",
+            json!({"from":"main","to":"feature","profile":"rdfs-simple"}),
+        )
+        .await;
+    assert_eq!(result["added"], 1, "{result}");
+    assert_eq!(result["removed"], 0);
+    assert_eq!(dataset.store.snapshot().commit, head);
+    assert_eq!(branch.store().snapshot().commit, branch_head);
+}

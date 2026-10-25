@@ -582,9 +582,25 @@ impl Tools<'_> {
                     ..Default::default()
                 };
                 match sparkles_reasoner::whynot::why_not(&input, &triple, &options) {
-                    Ok(answer @ sparkles_reasoner::whynot::WhyNot::NotEntailed { .. }) => {
+                    Ok(mut answer @ sparkles_reasoner::whynot::WhyNot::NotEntailed { .. }) => {
                         let intensional = matches!(&answer,sparkles_reasoner::whynot::WhyNot::NotEntailed { rules,.. } if !rules.is_empty());
                         if intensional {
+                            sparkles::reasoning::hypotheses::check_consistency(
+                                &ds.dataset,
+                                &reader.snap,
+                                &reasoner,
+                                &sparkles::reasoning::analysis::AnalysisOptions {
+                                    timeout: Some(
+                                        deadline.saturating_duration_since(Instant::now()),
+                                    ),
+                                    cancel: Some(self.call.cancel.clone()),
+                                    access: reader.opts.graphs.clone(),
+                                    max_memory: options.explain.max_memory,
+                                    ..Default::default()
+                                },
+                                &mut answer,
+                            )
+                            .map_err(|error| ctx.engine(error))?;
                             let e = sparkles::reasoning::explain::Explanation {
                                 explained: sparkles::explain::Explained::NotFound,
                                 why_not: Some(answer),

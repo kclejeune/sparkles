@@ -283,3 +283,22 @@ def test_demand_and_why_not_explanations() -> None:
     assert missing["mode"] == "whyNot" and missing["entailed"] is False
     assert missing["hypotheses"]
     assert all(len(h["missing"]) == 1 for h in missing["hypotheses"])
+
+
+def test_entailment_diff_and_minimal_justifications(tmp_path: Path) -> None:
+    ds = Dataset(tmp_path / "analysis")
+    ds.update("INSERT DATA { <urn:Manager> <http://www.w3.org/2000/01/rdf-schema#subClassOf> <urn:Employee> }")
+    before = ds.head_commit.seq
+    ds.update("INSERT DATA { <urn:alice> a <urn:Manager> }")
+    head = ds.head_commit.seq
+    delta = ds.reasoning.diff(str(before), "head", options={"profile": "rdfs-simple"})
+    assert (delta["added"], delta["removed"]) == (1, 0)
+    assert delta["sample"]["added"][0][2]["value"] == "urn:Employee"
+    assert ds.head_commit.seq == head
+    ds.update("INSERT DATA { <urn:CatDog> <http://www.w3.org/2000/01/rdf-schema#subClassOf> <urn:Cat>, <urn:Dog> . <urn:Cat> <http://www.w3.org/2002/07/owl#disjointWith> <urn:Dog> . <urn:tom> a <urn:Cat>, <urn:Dog> }")
+    support = ds.reasoning.justify({"class": "urn:CatDog"}, options={"profile": "owl-rl"})
+    assert support["results"][0]["holds"] is True
+    assert len(support["results"][0]["justifications"][0]["facts"]) == 3
+    findings = ds.reasoning.diagnostics(checks=["disjoint-classes"], justify=True)
+    assert len(findings["findings"][0]["justification"]["facts"]) == 3
+    ds.close()

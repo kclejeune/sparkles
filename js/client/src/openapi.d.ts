@@ -2277,9 +2277,29 @@ export interface paths {
         };
         /**
          * Inconsistency diagnostics
-         * @description OWL 2 RL inconsistency checks.
+         * @description OWL 2 RL inconsistency checks. With justify=true, attach the first subset-minimal support to each finding under one deadline and check budget.
          */
         get: operations["reasoningDiagnostics"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/$/reason/{ds}/diff": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * Compare entailments between retained states
+         * @description Reads both states under their branch-specific query graph grants. Uses the same program on both states and does not write or change materialization records. JSON counts cover the complete delta with bounded samples. TriG and RDF Patch require retaining every changed triple and refuse a truncated delta.
+         */
+        get: operations["entailmentDiff"];
         put?: never;
         post?: never;
         delete?: never;
@@ -2302,6 +2322,26 @@ export interface paths {
          * @description Derivation trees for a triple of the materialized inferences or of what RDFS on read answers, searched from the facts the caller reads. Mode `whyNot` returns verified sets of missing facts. Source `demand` derives from the current visible inputs, with an explicit profile when the dataset has no recorded program. A bounded partial tree marks unexplained premises. A triple with no derivation from readable facts answers `404` with code `no-visible-derivation`, as one that is not entailed does, and a search over its limits answers `422` with code `reasoning-budget`.
          */
         post: operations["explainInference"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/$/reason/{ds}/justify": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Find minimal inconsistency supports
+         * @description Targets one finding, one class IRI or classes=all. Supports contain asserted quads and their schema or assertion role. Alternative supports share one bounded search. Incomplete results never certify a negative result or return an uncertified support. Reads only query-visible graphs and writes no dataset state.
+         */
+        post: operations["justifyFinding"];
         delete?: never;
         options?: never;
         head?: never;
@@ -4133,6 +4173,24 @@ export interface components {
                 };
             };
         };
+        AnalysisInputs: {
+            /**
+             * @default [
+             *       "default"
+             *     ]
+             */
+            dataGraphs: string[];
+            /** @enum {string} */
+            imports?: "none" | "dataset" | "fetch";
+            locationMapping?: ({
+                altName: string;
+                name: string;
+            } | {
+                altPrefix: string;
+                prefix: string;
+            })[];
+            ontologyGraphs?: string[];
+        };
         /** @description Feedback on an answer. */
         AskFeedback: {
             /** @description At most 1000 characters. */
@@ -5590,6 +5648,21 @@ export interface components {
              */
             verdict?: "query" | "data" | "unknown";
         };
+        DiagnosticFinding: {
+            /** @enum {string} */
+            basis: "asserted" | "uses-inferences";
+            check: string;
+            evidence: {
+                [key: string]: components["schemas"]["RdfTerm"] | components["schemas"]["RdfTerm"][];
+            };
+            focus: components["schemas"]["RdfTerm"];
+            justification?: components["schemas"]["Justification"] | null;
+            justificationComplete?: boolean;
+            message: string;
+            rule: string;
+            /** @enum {string} */
+            severity: "inconsistency" | "warning";
+        };
         /** @description OWL 2 RL inconsistency checks and their findings. */
         DiagnosticsReport: {
             checks: {
@@ -5609,19 +5682,9 @@ export interface components {
             dataset: string;
             /** @constant */
             diagnosticsFormat: 1;
-            findings: {
-                /** @enum {string} */
-                basis: "asserted" | "uses-inferences";
-                check: string;
-                evidence: {
-                    [key: string]: components["schemas"]["RdfTerm"] | components["schemas"]["RdfTerm"][];
-                };
-                focus: components["schemas"]["RdfTerm"];
-                message: string;
-                rule: string;
-                /** @enum {string} */
-                severity: "inconsistency" | "warning";
-            }[];
+            findings: components["schemas"]["DiagnosticFinding"][];
+            justificationChecks?: number;
+            justificationsComplete?: boolean;
             /** @description The report never claims consistency. */
             note: string;
             scope: {
@@ -5712,6 +5775,8 @@ export interface components {
             datasetId: string;
             /** @constant */
             dryRun: true;
+            entailments?: components["schemas"]["EntailmentDiff"] | null;
+            entailmentsUnavailable?: string;
             /** @description The error the write would get. */
             error?: string;
             graphs: {
@@ -5758,6 +5823,41 @@ export interface components {
             o: string;
             timeoutSeconds?: number;
         };
+        /** @description Complete entailment counts over two retained states under the same program, with bounded samples and new inconsistency findings. */
+        EntailmentDiff: {
+            added: number;
+            byClass: {
+                [key: string]: {
+                    added: number;
+                    removed: number;
+                };
+            };
+            byPredicate: {
+                [key: string]: {
+                    added: number;
+                    removed: number;
+                };
+            };
+            /** @constant */
+            entailmentDiffFormat: 1;
+            findingsComplete: boolean;
+            from: {
+                commit: number;
+                selector: string;
+            };
+            newFindings: components["schemas"]["DiagnosticFinding"][];
+            removed: number;
+            sample: {
+                added: components["schemas"]["RdfTripleTerms"][];
+                removed: components["schemas"]["RdfTripleTerms"][];
+            };
+            sampleTruncated: boolean;
+            to: {
+                commit: number;
+                selector: string;
+            };
+            warnings: string[];
+        };
         /** @description The body of every non-2xx response. Some errors add members of their own. */
         Error: {
             /** @description A machine-readable reason, such as `precondition-failed`, `history-gone`, `dataset-restoring` or a backup error code. */
@@ -5797,6 +5897,8 @@ export interface components {
             };
         };
         ExplainHypothesis: {
+            consistencyComplete?: boolean;
+            inconsistent?: boolean | null;
             missing: {
                 o: components["schemas"]["RdfTerm"];
                 p: components["schemas"]["RdfTerm"];
@@ -6401,6 +6503,25 @@ export interface components {
             }[];
             snapshots: number;
         };
+        /** @description The triple to explain and the limits of the search. */
+        InferenceExplainRequest: {
+            maxDepth?: number;
+            maxHypotheses?: number;
+            maxMissing?: number;
+            maxTrees?: number;
+            /** @enum {string} */
+            mode?: "why" | "whyNot";
+            profile?: string;
+            /** @enum {string} */
+            source?: "materialized" | "demand";
+            /** @description Seconds, 10 by default, capped at `--max-timeout`. */
+            timeout?: number;
+            triple: {
+                o: components["schemas"]["RdfTerm"];
+                p: components["schemas"]["RdfTerm"];
+                s: components["schemas"]["RdfTerm"];
+            };
+        };
         /** @description An ingestion of an uploaded file, with the options of `IngestRequest` as fields. */
         IngestForm: {
             /** @description Register what can be read of a PDF that needs OCR, and record the other pages. */
@@ -6562,6 +6683,57 @@ export interface components {
             dataset: string;
             tasks: components["schemas"]["IngestTask"][];
         };
+        Justification: {
+            facts: components["schemas"]["SupportFact"][];
+        };
+        /** @description Subset-minimal asserted supports. A negative result is conclusive only when complete is true. */
+        JustificationReport: {
+            checks: number;
+            commit: number;
+            complete: boolean;
+            /** @constant */
+            justificationFormat: 1;
+            results: components["schemas"]["JustifiedTarget"][];
+        };
+        JustifiedTarget: {
+            class: string | null;
+            complete: boolean;
+            finding: components["schemas"]["DiagnosticFinding"] | null;
+            holds: boolean;
+            justifications: components["schemas"]["Justification"][];
+        };
+        /** @description Exactly one finding, class IRI or classes=all target, with one bounded analysis program. */
+        JustifyRequest: {
+            at?: string;
+            class?: string;
+            /** @constant */
+            classes?: "all";
+            finding?: {
+                check: string;
+                evidence: {
+                    [key: string]: components["schemas"]["RdfTerm"] | components["schemas"]["RdfTerm"][];
+                };
+                focus: components["schemas"]["RdfTerm"];
+                rule?: string;
+            };
+            geoDefaultGeometry?: boolean;
+            inputs?: components["schemas"]["AnalysisInputs"];
+            /** @default 500 */
+            maxChecks: number;
+            maxInferred?: number;
+            /** @default 5 */
+            maxJustifications: number;
+            /** @description Bytes for retained states and the analysis, capped at the server budget. */
+            maxMemory?: number;
+            /** @description The same profile for both states. Omit the program to use the dataset's recorded program. Without a record, an explicit program is required; empty rules select asserted-only analysis. */
+            profile?: string;
+            rules?: string;
+            /** @description Library callers may choose parallelism. HTTP uses the server reasoning pool. */
+            threads?: number;
+            /** @description Seconds. Capped at the server timeout. */
+            timeout?: number;
+            vocabularies?: string[];
+        } & (unknown | unknown | unknown);
         /** @enum {string} */
         Level: "read" | "write" | "admin";
         /** @description The server's per-request budgets. 0 means unlimited. */
@@ -6808,6 +6980,8 @@ export interface components {
             /** @enum {string} */
             conflicts?: "cell" | "subject" | "quad";
             dryRun?: boolean;
+            /** @description Include complete candidate entailment changes. Requires dryRun=true. */
+            entailments?: boolean;
             /** @description Predicate IRIs whose cells never conflict in this merge, besides the dataset's. */
             exempt?: string[];
             /** @description The heads the caller saw: `409 head-moved` when either moved. */
@@ -6817,12 +6991,17 @@ export interface components {
             };
             /** @enum {string} */
             ff?: "auto" | "only" | "replay";
+            geoDefaultGeometry?: boolean;
             /** @enum {string} */
             inferences?: "exclude" | "include";
+            inputs?: components["schemas"]["AnalysisInputs"];
             limit?: number;
+            maxInferred?: number;
+            maxMemory?: number;
             message?: string;
             /** @enum {string} */
             onConflict?: "fail" | "ours" | "theirs" | "union";
+            profile?: string;
             resolutions?: {
                 /** @description N-Triples; `null` is the default graph. */
                 graph?: string | null;
@@ -6832,11 +7011,15 @@ export interface components {
                 /** @enum {string} */
                 take: "ours" | "theirs" | "base" | "union" | "objects";
             }[];
+            rules?: string;
             source: string;
             /** @description Apply the changes as one commit that records no second parent. */
             squash?: boolean;
             /** @description Default `main`. */
             target?: string;
+            threads?: number;
+            timeout?: number;
+            vocabularies?: string[];
         };
         MergeResult: {
             base?: Record<string, never> | null;
@@ -6852,9 +7035,12 @@ export interface components {
                 found?: number;
                 resolved?: number;
             };
+            entailments?: components["schemas"]["EntailmentDiff"] | null;
+            entailmentsUnavailable?: string;
             fastForward: boolean;
             inferences?: Record<string, never> | null;
             merged: boolean;
+            previewOutcome?: string;
             /** @description With `ff: "replay"`, the source commits replayed, in order, each with the commit it became (`null` in a preview). */
             replayed?: {
                 commit?: number | null;
@@ -7686,18 +7872,29 @@ export interface components {
             /** @enum {string} */
             conflicts?: "cell" | "subject" | "quad";
             dryRun?: boolean;
+            /** @description Include complete candidate entailment changes. Requires dryRun=true. */
+            entailments?: boolean;
             exempt?: string[];
             /** @description The head of the branch written to that the caller saw: `409 head-moved` when it moved. */
             expect?: {
                 target?: number;
             };
+            geoDefaultGeometry?: boolean;
             /** @enum {string} */
             inferences?: "exclude" | "include";
+            inputs?: components["schemas"]["AnalysisInputs"];
             limit?: number;
+            maxInferred?: number;
+            maxMemory?: number;
             message?: string;
             /** @enum {string} */
             onConflict?: "fail" | "ours" | "theirs" | "union";
+            profile?: string;
             resolutions?: Record<string, never>[];
+            rules?: string;
+            threads?: number;
+            timeout?: number;
+            vocabularies?: string[];
         };
         PlanNode: {
             /** @description `-1` when the node did not run. */
@@ -7985,6 +8182,11 @@ export interface components {
             value: string | components["schemas"]["TripleTerm"];
             "xml:lang"?: string;
         };
+        RdfTripleTerms: [
+            components["schemas"]["RdfTerm"],
+            components["schemas"]["RdfTerm"],
+            components["schemas"]["RdfTerm"]
+        ];
         /** @description The graph that holds the schema. A schema document in an RDF syntax is sent with its own media type instead. */
         RdfsRequest: {
             /** @description A graph IRI, or `default`. */
@@ -9325,6 +9527,12 @@ export interface components {
                 query: string;
                 question: string;
             }[];
+        };
+        SupportFact: {
+            graph: "default" | components["schemas"]["RdfTerm"];
+            /** @enum {string} */
+            role: "schema" | "assertion";
+            triple: components["schemas"]["RdfTripleTerms"];
         };
         Task: {
             cancellable: boolean;
@@ -14664,6 +14872,26 @@ export interface operations {
     previewMerge: {
         parameters: {
             query: {
+                /** @description The shared reasoning profile. Omit it to use the recorded program. */
+                profile?: string;
+                /** @description Jena rule text for the rules profile. */
+                rules?: string;
+                /** @description JSON AnalysisInputs with dataGraphs, ontologyGraphs, imports and locationMapping. */
+                inputs?: string;
+                /** @description A JSON array of built-in vocabulary names. */
+                vocabularies?: string;
+                /** @description Include GeoSPARQL default geometry inference. */
+                geoDefaultGeometry?: boolean;
+                /** @description The analysis memory allowance in bytes, capped at the server budget. */
+                maxMemory?: number;
+                /** @description The most inferred triples, capped at the server reasoning limit. */
+                maxInferred?: number;
+                /** @description HTTP uses the server reasoning pool. */
+                threads?: number;
+                /** @description Include reasoning changes for the complete merged candidate. Unresolved conflicts mark entailments unavailable. */
+                entailments?: boolean;
+                /** @description Analysis timeout in seconds, capped at the server timeout. */
+                timeout?: number;
                 /** @description The branch to merge. */
                 source: string;
                 /** @description The branch to merge into (default `main`). */
@@ -15699,7 +15927,12 @@ export interface operations {
     };
     reasoningDiagnostics: {
         parameters: {
-            query?: never;
+            query?: {
+                /** @description Attach first minimal supports. */
+                justify?: boolean;
+                /** @description The most oracle checks shared by all requested supports. */
+                maxChecks?: number;
+            };
             header?: never;
             path: {
                 /** @description The dataset name. */
@@ -15724,6 +15957,67 @@ export interface operations {
             default: components["responses"]["Error"];
         };
     };
+    entailmentDiff: {
+        parameters: {
+            query: {
+                /** @description The shared reasoning profile. Omit it to use the recorded program. */
+                profile?: string;
+                /** @description Jena rule text for the rules profile. */
+                rules?: string;
+                /** @description JSON AnalysisInputs with dataGraphs, ontologyGraphs, imports and locationMapping. */
+                inputs?: string;
+                /** @description A JSON array of built-in vocabulary names. */
+                vocabularies?: string;
+                /** @description Include GeoSPARQL default geometry inference. */
+                geoDefaultGeometry?: boolean;
+                /** @description The analysis memory allowance in bytes, capped at the server budget. */
+                maxMemory?: number;
+                /** @description The most inferred triples, capped at the server reasoning limit. */
+                maxInferred?: number;
+                /** @description HTTP uses the server reasoning pool. */
+                threads?: number;
+                /** @description A branch, branch@commit or current-branch commit selector. */
+                from: string;
+                /** @description The second state selector, head by default. */
+                to?: string;
+                /** @description Seconds, capped at the server timeout. */
+                timeout?: number;
+                /** @description The most retained triples in each direction. */
+                sampleLimit?: number;
+            };
+            header?: never;
+            path: {
+                /** @description The dataset name. */
+                ds: components["parameters"]["ds"];
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description The complete counts and samples, or all changed triples. */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["EntailmentDiff"];
+                    "application/rdf-patch": string;
+                    "application/trig": string;
+                    "text/rdf-patch": string;
+                };
+            };
+            400: components["responses"]["BadRequest"];
+            401: components["responses"]["Unauthorized"];
+            403: components["responses"]["Forbidden"];
+            404: components["responses"]["NotFound"];
+            408: components["responses"]["Timeout"];
+            410: components["responses"]["Gone"];
+            422: components["responses"]["Unprocessable"];
+            501: components["responses"]["NotImplemented"];
+            507: components["responses"]["InsufficientStorage"];
+            default: components["responses"]["Error"];
+        };
+    };
     explainInference: {
         parameters: {
             query?: never;
@@ -15736,7 +16030,7 @@ export interface operations {
         };
         requestBody: {
             content: {
-                "application/json": components["schemas"]["ExplainRequest"];
+                "application/json": components["schemas"]["InferenceExplainRequest"];
             };
         };
         responses: {
@@ -15754,6 +16048,43 @@ export interface operations {
             403: components["responses"]["Forbidden"];
             404: components["responses"]["NotFound"];
             422: components["responses"]["Unprocessable"];
+            default: components["responses"]["Error"];
+        };
+    };
+    justifyFinding: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description The dataset name. */
+                ds: components["parameters"]["ds"];
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["JustifyRequest"];
+            };
+        };
+        responses: {
+            /** @description Minimal supports and search completeness. */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["JustificationReport"];
+                };
+            };
+            400: components["responses"]["BadRequest"];
+            401: components["responses"]["Unauthorized"];
+            403: components["responses"]["Forbidden"];
+            404: components["responses"]["NotFound"];
+            408: components["responses"]["Timeout"];
+            410: components["responses"]["Gone"];
+            422: components["responses"]["Unprocessable"];
+            501: components["responses"]["NotImplemented"];
+            507: components["responses"]["InsufficientStorage"];
             default: components["responses"]["Error"];
         };
     };
@@ -18460,6 +18791,24 @@ export interface operations {
                 validate?: components["parameters"]["validate"];
                 /** @description The most validation results reported when a write is rejected. */
                 validationLimit?: number;
+                /** @description Include complete candidate entailment changes in a JSON dry run. Requires dryRun=true. */
+                entailments?: boolean;
+                /** @description The shared reasoning profile. Omit it to use the recorded program. */
+                profile?: string;
+                /** @description Jena rule text for the rules profile. */
+                rules?: string;
+                /** @description JSON AnalysisInputs with dataGraphs, ontologyGraphs, imports and locationMapping. */
+                inputs?: string;
+                /** @description A JSON array of built-in vocabulary names. */
+                vocabularies?: string;
+                /** @description Include GeoSPARQL default geometry inference. */
+                geoDefaultGeometry?: boolean;
+                /** @description The analysis memory allowance in bytes, capped at the server budget. */
+                maxMemory?: number;
+                /** @description The most inferred triples, capped at the server reasoning limit. */
+                maxInferred?: number;
+                /** @description HTTP uses the server reasoning pool. */
+                threads?: number;
             };
             header?: {
                 /** @description Entity tags. A write needs a tag that names the current head. */
@@ -18529,6 +18878,24 @@ export interface operations {
                 validate?: components["parameters"]["validate"];
                 /** @description The most validation results reported when a write is rejected. */
                 validationLimit?: number;
+                /** @description Include complete candidate entailment changes in a JSON dry run. Requires dryRun=true. */
+                entailments?: boolean;
+                /** @description The shared reasoning profile. Omit it to use the recorded program. */
+                profile?: string;
+                /** @description Jena rule text for the rules profile. */
+                rules?: string;
+                /** @description JSON AnalysisInputs with dataGraphs, ontologyGraphs, imports and locationMapping. */
+                inputs?: string;
+                /** @description A JSON array of built-in vocabulary names. */
+                vocabularies?: string;
+                /** @description Include GeoSPARQL default geometry inference. */
+                geoDefaultGeometry?: boolean;
+                /** @description The analysis memory allowance in bytes, capped at the server budget. */
+                maxMemory?: number;
+                /** @description The most inferred triples, capped at the server reasoning limit. */
+                maxInferred?: number;
+                /** @description HTTP uses the server reasoning pool. */
+                threads?: number;
                 /** @description The graphs of the default graph (SPARQL Protocol). */
                 "default-graph-uri"?: components["parameters"]["defaultGraphUri"];
                 /** @description The named graphs (SPARQL Protocol). */
@@ -18547,8 +18914,6 @@ export interface operations {
                 send?: components["parameters"]["send"];
                 /** @description Query execution mode. Streaming consumes bounded SELECT or graph batches with visible, budgeted materialization barriers; ASK stops after a qualifying solution. Auto, the default unless the server runs with `--default-execution eager`, streams immutable SELECT scans expected to return at least a thousand rows and runs every other plan eagerly. Auto runs eagerly for SPARQL Results Thrift and initial bindings, and explicit streaming SELECT does not support Thrift. A streamed answer's deadline counts the query's own time, and a client that reads nothing for longer than the timeout ends it. A failure after the response has started aborts the body, so only a transfer that completes is a complete answer. `eager` opts out. */
                 execution?: components["parameters"]["execution"];
-                /** @description `io` adds an `io` object to the metadata of the `application/x-sparkles+json` result, with what the query read from the index and vocabulary files and the time spent doing so. The counters are process-wide, so concurrent queries add to them. Overlapping profiles share at most 65,536 first-admitted pages; pagesTruncated reports cap omissions, not completeness. Page counts describe the retained sample, and broughtIn is its diagnostic nonnegative resident-count delta rather than physical I/O. Numeric mapped loads are observed independently of advice, including hints-off and previously hinted reads. The counters cover the whole process, so the parameter needs the `metrics` permission and answers `403` without it. Any other value answers `400`. */
-                profile?: components["parameters"]["profile"];
                 /** @description Bypass the query result cache. */
                 nocache?: components["parameters"]["nocache"];
                 /** @description A lower memory budget, in MiB. */
@@ -18695,6 +19060,24 @@ export interface operations {
                 validate?: components["parameters"]["validate"];
                 /** @description The most validation results reported when a write is rejected. */
                 validationLimit?: number;
+                /** @description Include complete candidate entailment changes in a JSON dry run. Requires dryRun=true. */
+                entailments?: boolean;
+                /** @description The shared reasoning profile. Omit it to use the recorded program. */
+                profile?: string;
+                /** @description Jena rule text for the rules profile. */
+                rules?: string;
+                /** @description JSON AnalysisInputs with dataGraphs, ontologyGraphs, imports and locationMapping. */
+                inputs?: string;
+                /** @description A JSON array of built-in vocabulary names. */
+                vocabularies?: string;
+                /** @description Include GeoSPARQL default geometry inference. */
+                geoDefaultGeometry?: boolean;
+                /** @description The analysis memory allowance in bytes, capped at the server budget. */
+                maxMemory?: number;
+                /** @description The most inferred triples, capped at the server reasoning limit. */
+                maxInferred?: number;
+                /** @description HTTP uses the server reasoning pool. */
+                threads?: number;
             };
             header?: {
                 /** @description Entity tags. A write needs a tag that names the current head. */
@@ -18983,6 +19366,24 @@ export interface operations {
                 validate?: components["parameters"]["validate"];
                 /** @description The most validation results reported when a write is rejected. */
                 validationLimit?: number;
+                /** @description Include complete candidate entailment changes in a JSON dry run. Requires dryRun=true. */
+                entailments?: boolean;
+                /** @description The shared reasoning profile. Omit it to use the recorded program. */
+                profile?: string;
+                /** @description Jena rule text for the rules profile. */
+                rules?: string;
+                /** @description JSON AnalysisInputs with dataGraphs, ontologyGraphs, imports and locationMapping. */
+                inputs?: string;
+                /** @description A JSON array of built-in vocabulary names. */
+                vocabularies?: string;
+                /** @description Include GeoSPARQL default geometry inference. */
+                geoDefaultGeometry?: boolean;
+                /** @description The analysis memory allowance in bytes, capped at the server budget. */
+                maxMemory?: number;
+                /** @description The most inferred triples, capped at the server reasoning limit. */
+                maxInferred?: number;
+                /** @description HTTP uses the server reasoning pool. */
+                threads?: number;
             };
             header?: {
                 /** @description Entity tags. A write needs a tag that names the current head. */
@@ -19059,6 +19460,24 @@ export interface operations {
                 validate?: components["parameters"]["validate"];
                 /** @description The most validation results reported when a write is rejected. */
                 validationLimit?: number;
+                /** @description Include complete candidate entailment changes in a JSON dry run. Requires dryRun=true. */
+                entailments?: boolean;
+                /** @description The shared reasoning profile. Omit it to use the recorded program. */
+                profile?: string;
+                /** @description Jena rule text for the rules profile. */
+                rules?: string;
+                /** @description JSON AnalysisInputs with dataGraphs, ontologyGraphs, imports and locationMapping. */
+                inputs?: string;
+                /** @description A JSON array of built-in vocabulary names. */
+                vocabularies?: string;
+                /** @description Include GeoSPARQL default geometry inference. */
+                geoDefaultGeometry?: boolean;
+                /** @description The analysis memory allowance in bytes, capped at the server budget. */
+                maxMemory?: number;
+                /** @description The most inferred triples, capped at the server reasoning limit. */
+                maxInferred?: number;
+                /** @description HTTP uses the server reasoning pool. */
+                threads?: number;
             };
             header?: {
                 /** @description Entity tags. A write needs a tag that names the current head. */
@@ -19135,6 +19554,24 @@ export interface operations {
                 validate?: components["parameters"]["validate"];
                 /** @description The most validation results reported when a write is rejected. */
                 validationLimit?: number;
+                /** @description Include complete candidate entailment changes in a JSON dry run. Requires dryRun=true. */
+                entailments?: boolean;
+                /** @description The shared reasoning profile. Omit it to use the recorded program. */
+                profile?: string;
+                /** @description Jena rule text for the rules profile. */
+                rules?: string;
+                /** @description JSON AnalysisInputs with dataGraphs, ontologyGraphs, imports and locationMapping. */
+                inputs?: string;
+                /** @description A JSON array of built-in vocabulary names. */
+                vocabularies?: string;
+                /** @description Include GeoSPARQL default geometry inference. */
+                geoDefaultGeometry?: boolean;
+                /** @description The analysis memory allowance in bytes, capped at the server budget. */
+                maxMemory?: number;
+                /** @description The most inferred triples, capped at the server reasoning limit. */
+                maxInferred?: number;
+                /** @description HTTP uses the server reasoning pool. */
+                threads?: number;
             };
             header?: {
                 /** @description Entity tags. A write needs a tag that names the current head. */
@@ -19920,6 +20357,24 @@ export interface operations {
                 validate?: components["parameters"]["validate"];
                 /** @description The most validation results reported when a write is rejected. */
                 validationLimit?: number;
+                /** @description Include complete candidate entailment changes in a JSON dry run. Requires dryRun=true. */
+                entailments?: boolean;
+                /** @description The shared reasoning profile. Omit it to use the recorded program. */
+                profile?: string;
+                /** @description Jena rule text for the rules profile. */
+                rules?: string;
+                /** @description JSON AnalysisInputs with dataGraphs, ontologyGraphs, imports and locationMapping. */
+                inputs?: string;
+                /** @description A JSON array of built-in vocabulary names. */
+                vocabularies?: string;
+                /** @description Include GeoSPARQL default geometry inference. */
+                geoDefaultGeometry?: boolean;
+                /** @description The analysis memory allowance in bytes, capped at the server budget. */
+                maxMemory?: number;
+                /** @description The most inferred triples, capped at the server reasoning limit. */
+                maxInferred?: number;
+                /** @description HTTP uses the server reasoning pool. */
+                threads?: number;
             };
             header?: {
                 /** @description Entity tags. A write needs a tag that names the current head. */
@@ -20022,6 +20477,24 @@ export interface operations {
                 validate?: components["parameters"]["validate"];
                 /** @description The most validation results reported when a write is rejected. */
                 validationLimit?: number;
+                /** @description Include complete candidate entailment changes in a JSON dry run. Requires dryRun=true. */
+                entailments?: boolean;
+                /** @description The shared reasoning profile. Omit it to use the recorded program. */
+                profile?: string;
+                /** @description Jena rule text for the rules profile. */
+                rules?: string;
+                /** @description JSON AnalysisInputs with dataGraphs, ontologyGraphs, imports and locationMapping. */
+                inputs?: string;
+                /** @description A JSON array of built-in vocabulary names. */
+                vocabularies?: string;
+                /** @description Include GeoSPARQL default geometry inference. */
+                geoDefaultGeometry?: boolean;
+                /** @description The analysis memory allowance in bytes, capped at the server budget. */
+                maxMemory?: number;
+                /** @description The most inferred triples, capped at the server reasoning limit. */
+                maxInferred?: number;
+                /** @description HTTP uses the server reasoning pool. */
+                threads?: number;
             };
             header?: {
                 /** @description The commit message of the write, at most 1024 bytes of UTF-8. RFC 8187 extended values are accepted. */
@@ -20093,6 +20566,24 @@ export interface operations {
                 validate?: components["parameters"]["validate"];
                 /** @description The most validation results reported when a write is rejected. */
                 validationLimit?: number;
+                /** @description Include complete candidate entailment changes in a JSON dry run. Requires dryRun=true. */
+                entailments?: boolean;
+                /** @description The shared reasoning profile. Omit it to use the recorded program. */
+                profile?: string;
+                /** @description Jena rule text for the rules profile. */
+                rules?: string;
+                /** @description JSON AnalysisInputs with dataGraphs, ontologyGraphs, imports and locationMapping. */
+                inputs?: string;
+                /** @description A JSON array of built-in vocabulary names. */
+                vocabularies?: string;
+                /** @description Include GeoSPARQL default geometry inference. */
+                geoDefaultGeometry?: boolean;
+                /** @description The analysis memory allowance in bytes, capped at the server budget. */
+                maxMemory?: number;
+                /** @description The most inferred triples, capped at the server reasoning limit. */
+                maxInferred?: number;
+                /** @description HTTP uses the server reasoning pool. */
+                threads?: number;
             };
             header?: {
                 /** @description The commit message of the write, at most 1024 bytes of UTF-8. RFC 8187 extended values are accepted. */
@@ -21204,6 +21695,24 @@ export interface operations {
                 validate?: components["parameters"]["validate"];
                 /** @description The most validation results reported when a write is rejected. */
                 validationLimit?: number;
+                /** @description Include complete candidate entailment changes in a JSON dry run. Requires dryRun=true. */
+                entailments?: boolean;
+                /** @description The shared reasoning profile. Omit it to use the recorded program. */
+                profile?: string;
+                /** @description Jena rule text for the rules profile. */
+                rules?: string;
+                /** @description JSON AnalysisInputs with dataGraphs, ontologyGraphs, imports and locationMapping. */
+                inputs?: string;
+                /** @description A JSON array of built-in vocabulary names. */
+                vocabularies?: string;
+                /** @description Include GeoSPARQL default geometry inference. */
+                geoDefaultGeometry?: boolean;
+                /** @description The analysis memory allowance in bytes, capped at the server budget. */
+                maxMemory?: number;
+                /** @description The most inferred triples, capped at the server reasoning limit. */
+                maxInferred?: number;
+                /** @description HTTP uses the server reasoning pool. */
+                threads?: number;
             };
             header?: {
                 /** @description The commit message of the write, at most 1024 bytes of UTF-8. RFC 8187 extended values are accepted. */
@@ -21300,6 +21809,24 @@ export interface operations {
                 validate?: components["parameters"]["validate"];
                 /** @description The most validation results reported when a write is rejected. */
                 validationLimit?: number;
+                /** @description Include complete candidate entailment changes in a JSON dry run. Requires dryRun=true. */
+                entailments?: boolean;
+                /** @description The shared reasoning profile. Omit it to use the recorded program. */
+                profile?: string;
+                /** @description Jena rule text for the rules profile. */
+                rules?: string;
+                /** @description JSON AnalysisInputs with dataGraphs, ontologyGraphs, imports and locationMapping. */
+                inputs?: string;
+                /** @description A JSON array of built-in vocabulary names. */
+                vocabularies?: string;
+                /** @description Include GeoSPARQL default geometry inference. */
+                geoDefaultGeometry?: boolean;
+                /** @description The analysis memory allowance in bytes, capped at the server budget. */
+                maxMemory?: number;
+                /** @description The most inferred triples, capped at the server reasoning limit. */
+                maxInferred?: number;
+                /** @description HTTP uses the server reasoning pool. */
+                threads?: number;
             };
             header?: {
                 /** @description Entity tags. A write needs a tag that names the current head. */
@@ -21425,6 +21952,24 @@ export interface operations {
                 validate?: components["parameters"]["validate"];
                 /** @description The most validation results reported when a write is rejected. */
                 validationLimit?: number;
+                /** @description Include complete candidate entailment changes in a JSON dry run. Requires dryRun=true. */
+                entailments?: boolean;
+                /** @description The shared reasoning profile. Omit it to use the recorded program. */
+                profile?: string;
+                /** @description Jena rule text for the rules profile. */
+                rules?: string;
+                /** @description JSON AnalysisInputs with dataGraphs, ontologyGraphs, imports and locationMapping. */
+                inputs?: string;
+                /** @description A JSON array of built-in vocabulary names. */
+                vocabularies?: string;
+                /** @description Include GeoSPARQL default geometry inference. */
+                geoDefaultGeometry?: boolean;
+                /** @description The analysis memory allowance in bytes, capped at the server budget. */
+                maxMemory?: number;
+                /** @description The most inferred triples, capped at the server reasoning limit. */
+                maxInferred?: number;
+                /** @description HTTP uses the server reasoning pool. */
+                threads?: number;
             };
             header?: {
                 /** @description Entity tags. A write needs a tag that names the current head. */
@@ -21499,6 +22044,24 @@ export interface operations {
                 validate?: components["parameters"]["validate"];
                 /** @description The most validation results reported when a write is rejected. */
                 validationLimit?: number;
+                /** @description Include complete candidate entailment changes in a JSON dry run. Requires dryRun=true. */
+                entailments?: boolean;
+                /** @description The shared reasoning profile. Omit it to use the recorded program. */
+                profile?: string;
+                /** @description Jena rule text for the rules profile. */
+                rules?: string;
+                /** @description JSON AnalysisInputs with dataGraphs, ontologyGraphs, imports and locationMapping. */
+                inputs?: string;
+                /** @description A JSON array of built-in vocabulary names. */
+                vocabularies?: string;
+                /** @description Include GeoSPARQL default geometry inference. */
+                geoDefaultGeometry?: boolean;
+                /** @description The analysis memory allowance in bytes, capped at the server budget. */
+                maxMemory?: number;
+                /** @description The most inferred triples, capped at the server reasoning limit. */
+                maxInferred?: number;
+                /** @description HTTP uses the server reasoning pool. */
+                threads?: number;
             };
             header?: {
                 /** @description Entity tags. A write needs a tag that names the current head. */
@@ -21573,6 +22136,24 @@ export interface operations {
                 validate?: components["parameters"]["validate"];
                 /** @description The most validation results reported when a write is rejected. */
                 validationLimit?: number;
+                /** @description Include complete candidate entailment changes in a JSON dry run. Requires dryRun=true. */
+                entailments?: boolean;
+                /** @description The shared reasoning profile. Omit it to use the recorded program. */
+                profile?: string;
+                /** @description Jena rule text for the rules profile. */
+                rules?: string;
+                /** @description JSON AnalysisInputs with dataGraphs, ontologyGraphs, imports and locationMapping. */
+                inputs?: string;
+                /** @description A JSON array of built-in vocabulary names. */
+                vocabularies?: string;
+                /** @description Include GeoSPARQL default geometry inference. */
+                geoDefaultGeometry?: boolean;
+                /** @description The analysis memory allowance in bytes, capped at the server budget. */
+                maxMemory?: number;
+                /** @description The most inferred triples, capped at the server reasoning limit. */
+                maxInferred?: number;
+                /** @description HTTP uses the server reasoning pool. */
+                threads?: number;
             };
             header?: {
                 /** @description Entity tags. A write needs a tag that names the current head. */

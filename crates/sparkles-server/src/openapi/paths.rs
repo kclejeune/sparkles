@@ -193,7 +193,7 @@ fn query_post(route: &'static str, id: &str) -> Op {
 
 /// The parameters of every write.
 fn write_params(o: Op) -> Op {
-    o.params(&[
+    analysis_params(o.params(&[
         "branch",
         "timeout",
         "dryRun",
@@ -208,6 +208,43 @@ fn write_params(o: Op) -> Op {
         int(),
         "The most validation results reported when a write is rejected.",
     )
+    .query("entailments", boolean(), "Include complete candidate entailment changes in a JSON dry run. Requires dryRun=true."))
+}
+
+/// Program and memory controls shared by read-only entailment analyses.
+fn analysis_params(o: Op) -> Op {
+    o.query(
+        "profile",
+        s(),
+        "The shared reasoning profile. Omit it to use the recorded program.",
+    )
+    .query("rules", s(), "Jena rule text for the rules profile.")
+    .query(
+        "inputs",
+        s(),
+        "JSON AnalysisInputs with dataGraphs, ontologyGraphs, imports and locationMapping.",
+    )
+    .query(
+        "vocabularies",
+        s(),
+        "A JSON array of built-in vocabulary names.",
+    )
+    .query(
+        "geoDefaultGeometry",
+        boolean(),
+        "Include GeoSPARQL default geometry inference.",
+    )
+    .query(
+        "maxMemory",
+        int(),
+        "The analysis memory allowance in bytes, capped at the server budget.",
+    )
+    .query(
+        "maxInferred",
+        int(),
+        "The most inferred triples, capped at the server reasoning limit.",
+    )
+    .query("threads", int(), "HTTP uses the server reasoning pool.")
 }
 
 /// The answer of a Graph Store write or an upload.
@@ -1270,9 +1307,32 @@ fn admin(p: &mut Paths) {
             "Reasoning",
             "Inconsistency diagnostics",
         )
-        .doc("OWL 2 RL inconsistency checks.")
+        .doc("OWL 2 RL inconsistency checks. With justify=true, attach the first subset-minimal support to each finding under one deadline and check budget.")
+        .query("justify", boolean(), "Attach first minimal supports.")
+        .query("maxChecks", int(), "The most oracle checks shared by all requested supports.")
         .see("reasoning-status-and-diagnostics")
         .json("200", "The report.", "DiagnosticsReport"),
+    );
+    p.add(
+        analysis_params(op(GET, "/$/reason/{ds}/diff", "entailmentDiff", "Reasoning", "Compare entailments between retained states"))
+            .doc("Reads both states under their branch-specific query graph grants. Uses the same program on both states and does not write or change materialization records. JSON counts cover the complete delta with bounded samples. TriG and RDF Patch require retaining every changed triple and refuse a truncated delta.")
+            .see("explanations")
+            .query_req("from", s(), "A branch, branch@commit or current-branch commit selector.")
+            .query("to", s(), "The second state selector, head by default.")
+            .query("timeout", json!({"type":"number","exclusiveMinimum":0}), "Seconds, capped at the server timeout.")
+            .query("sampleLimit", json!({"type":"integer","minimum":1,"maximum":10000,"default":100}), "The most retained triples in each direction.")
+            .resp("200", "The complete counts and samples, or all changed triples.", Some(json!({
+                "application/json":{"schema":sref("EntailmentDiff")},
+                "application/trig":{"schema":s()},"application/rdf-patch":{"schema":s()},"text/rdf-patch":{"schema":s()}
+            })))
+            .errors(&[400,403,404,408,410,422,501,507]),
+    );
+    p.add(
+        op(POST, "/$/reason/{ds}/justify", "justifyFinding", "Reasoning", "Find minimal inconsistency supports")
+            .doc("Targets one finding, one class IRI or classes=all. Supports contain asserted quads and their schema or assertion role. Alternative supports share one bounded search. Incomplete results never certify a negative result or return an uncertified support. Reads only query-visible graphs and writes no dataset state.")
+            .see("explanations").json_body(true,"JustifyRequest")
+            .json("200","Minimal supports and search completeness.","JustificationReport")
+            .errors(&[400,403,404,408,410,422,501,507]),
     );
     p.add(
         op(
@@ -1284,7 +1344,7 @@ fn admin(p: &mut Paths) {
         )
         .doc("Derivation trees for a triple of the materialized inferences or of what RDFS on read answers, searched from the facts the caller reads. Mode `whyNot` returns verified sets of missing facts. Source `demand` derives from the current visible inputs, with an explicit profile when the dataset has no recorded program. A bounded partial tree marks unexplained premises. A triple with no derivation from readable facts answers `404` with code `no-visible-derivation`, as one that is not entailed does, and a search over its limits answers `422` with code `reasoning-budget`.")
         .see("explanations")
-        .json_body(true, "ExplainRequest")
+        .json_body(true, "InferenceExplainRequest")
         .json("200", "The trees.", "Explanation")
         .errors(&[400, 404, 422]),
     );
@@ -1916,7 +1976,9 @@ fn branches(p: &mut Paths) {
             .errors(&[400, 403, 404, 409, 503]),
     );
     p.add(
-        op(GET, "/$/merge/{ds}", "previewMerge", "Branches", "Preview a merge")
+        analysis_params(op(GET, "/$/merge/{ds}", "previewMerge", "Branches", "Preview a merge"))
+            .query("entailments", boolean(), "Include reasoning changes for the complete merged candidate. Unresolved conflicts mark entailments unavailable.")
+            .query("timeout", json!({"type":"number","exclusiveMinimum":0}), "Analysis timeout in seconds, capped at the server timeout.")
             .doc("What merging `source` into `target` would do: the merge base, the changes and the conflicts. Nothing is written, and conflicts do not fail the request.")
             .see("merges")
             .query_req("source", s(), "The branch to merge.")
@@ -4087,7 +4149,11 @@ fn protocol(p: &mut Paths) {
         .see("per-dataset-sparql-protocol-fuseki-compatible")
         .params(&["gspGraph", "gspDefault"])
         .body(true, "A query, an update or RDF data.", J::Object(post_body));
-    let o = query_params(write_params(o));
+    let mut o = query_params(write_params(o));
+    // This endpoint accepts queries and writes. Its single profile parameter names
+    // either query I/O profiling or the preview's reasoning program.
+    o.params
+        .retain(|parameter| parameter != &super::param_ref("profile"));
     p.add(
         o.resp_h(
             "200",

@@ -1177,6 +1177,7 @@ pub(crate) async fn preview(
     Path(name): Path<String>,
     Extension(p): Extension<Principal>,
     uri: Uri,
+    headers: HeaderMap,
 ) -> ApiResult {
     let ds = main_dataset(&st, &name)?;
     let params = Params::from_query(&uri);
@@ -1186,6 +1187,14 @@ pub(crate) async fn preview(
         source: ask.source,
         target: ask.target,
     };
+    if params
+        .get("entailments")
+        .map(|value| dry_run::flag(value, "entailments"))
+        .transpose()?
+        .unwrap_or(false)
+    {
+        return preview_entailments(&st, &p, &name, ds, op, ask.o, &params, &headers).await;
+    }
     run_preview(&p, &name, ds, op, ask.o).await
 }
 
@@ -1230,6 +1239,118 @@ async fn run_preview(
     let op2 = op.clone();
     let r = blocking(move || Ok(op2.preview(&ds.store, &o)?)).await?;
     Ok(Json(op.json(&r, None)).into_response())
+}
+
+/// Compute the target before/after the complete merge candidate under pinned heads.
+#[allow(clippy::too_many_arguments)]
+async fn preview_entailments(
+    st: &Arc<AppState>,
+    p: &Principal,
+    name: &str,
+    ds: Arc<Dataset>,
+    op: Op,
+    mut options: MergeOptions,
+    params: &Params,
+    headers: &HeaderMap,
+) -> ApiResult {
+    op.access(p, name)?;
+    let target = st.branch_dataset(&ds, op.target())?;
+    let mut parameters = Params(params.0.clone());
+    parameters.0.push(("dryRun".into(), "true".into()));
+    let dry = dry_run::parse(st, &parameters, headers)?.expect("explicit dry run");
+    let (cancel, _guard) = cancel_on_drop();
+    options.cancel = Some(cancel.clone());
+    options.write.cancel = Some(cancel);
+    options.write.deadline = options.deadline;
+    let request = dry_run::Request::for_write(
+        st,
+        headers,
+        &parameters,
+        &dry,
+        false,
+        Some(p),
+        &target,
+        &options.write,
+    )?;
+    options.write.dry_run = Some(dry);
+    let op2 = op.clone();
+    blocking(move || {
+        let report = op2.preview(&ds.store, &options)?;
+        let mut doc = op2.json(&report, None);
+        if report.conflicts.is_some() && report.conflicts_found > report.conflicts_resolved {
+            doc["entailments"] = J::Null;
+            doc["entailmentsUnavailable"] =
+                json!("resolve the merge conflicts to compute a candidate");
+            return Ok(Json(doc).into_response());
+        }
+        options.expect_source = Some(report.source.seq);
+        options.expect_target = Some(report.target.seq);
+        match op2.run(&ds.store, &options) {
+            Err(Error::DryRun(preview)) => {
+                let checked = request.json_checked(&target, &preview)?;
+                doc["entailments"] = checked.get("entailments").cloned().unwrap_or(J::Null);
+                if let Some(reason) = checked.get("entailmentsUnavailable") {
+                    doc["entailmentsUnavailable"] = reason.clone();
+                }
+                doc["previewOutcome"] = json!(preview.outcome().name());
+            }
+            Ok(MergeOutcome::UpToDate(_)) => {
+                doc["entailments"] = request.unchanged_entailments(&target, report.target.seq)?;
+            }
+            Ok(MergeOutcome::Conflicts(_)) => {
+                return Err(invalid(
+                    "head-moved",
+                    "merge conflicts changed while computing the preview",
+                ));
+            }
+            Ok(MergeOutcome::Merged(_)) => {
+                return Err(err(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "a merge dry run unexpectedly committed",
+                ));
+            }
+            Err(error) => return Err(error.into()),
+        }
+        Ok(Json(doc).into_response())
+    })
+    .await
+}
+
+fn analysis_parameters(value: &J) -> ApiResult<Params> {
+    let mut params = Params(Vec::new());
+    match value.get("entailments") {
+        None | Some(J::Null) | Some(J::Bool(false)) => {}
+        Some(J::Bool(true)) => params.0.push(("entailments".into(), "true".into())),
+        Some(_) => {
+            return Err(invalid(
+                "invalid-merge",
+                "entailments must be true or false",
+            ));
+        }
+    }
+    for key in [
+        "profile",
+        "rules",
+        "inputs",
+        "vocabularies",
+        "geoDefaultGeometry",
+        "timeout",
+        "maxMemory",
+        "maxInferred",
+        "threads",
+    ] {
+        if let Some(value) = value.get(key) {
+            params.0.push((
+                key.into(),
+                if let Some(text) = value.as_str() {
+                    text.to_string()
+                } else {
+                    value.to_string()
+                },
+            ));
+        }
+    }
+    Ok(params)
 }
 
 /// `POST /$/merge/{ds}`: merge, or (`dryRun`) preview the merge commit with the
@@ -1360,6 +1481,24 @@ async fn execute(
     if let Some(a) = p.log_name() {
         o.write.author = Some(a.into());
     }
+    let params = analysis_parameters(v)?;
+    let requested = params.get("entailments").is_some();
+    if requested && !dry_run {
+        return Err(invalid("invalid-merge", "entailments requires a dry run"));
+    }
+    let retained = if requested {
+        let mut parameters = Params(params.0.clone());
+        parameters.0.push(("dryRun".into(), "true".into()));
+        dry_run::parse(st, &parameters, headers)?
+    } else {
+        None
+    };
+    let (cancel, _analysis_guard) = cancel_on_drop();
+    if requested {
+        o.cancel = Some(cancel.clone());
+        o.write.cancel = Some(cancel);
+        o.write.deadline = o.deadline;
+    }
     let dr = dry_run.then(|| sparkles::preview::DryRun {
         changes: v
             .get("changes")
@@ -1368,14 +1507,20 @@ async fn execute(
             .min(sparkles::preview::MAX_LISTED_CHANGES as u64) as usize,
         all_changes: false,
         max_changes: st.limits.max_rows as u64,
-        retain_states: false,
-        state_max_memory: None,
+        retain_states: retained.is_some(),
+        state_max_memory: retained.as_ref().and_then(|dry| dry.state_max_memory),
     });
     o.write.dry_run = dr.clone();
     let tds = st.branch_dataset(&ds, op.target())?;
     if dr.is_none() && respond_async(headers) {
         return start_task(st, name, ds, op, o);
     }
+    let response = dr
+        .as_ref()
+        .map(|dry| {
+            dry_run::Request::for_write(st, headers, &params, dry, false, Some(p), &tds, &o.write)
+        })
+        .transpose()?;
     let reasoned = tds.reasoning.read().is_some();
     let d = ds.clone();
     let (op2, o2) = (op.clone(), o.clone());
@@ -1402,9 +1547,9 @@ async fn execute(
     match out {
         Err(preview) => {
             // a dry run: the C15 preview of the merge commit, with the merge fields
-            let dr = dr.expect("only a dry run previews");
-            let req = dry_run::Request::new(st, headers, &dr, false);
-            let mut doc = req.json(&tds, &preview);
+            let req = response.expect("only a dry run previews");
+            let target = tds.clone();
+            let mut doc = blocking(move || req.json_checked(&target, &preview)).await?;
             let d = ds.clone();
             let mut po = o;
             po.write.dry_run = None;
@@ -1419,7 +1564,17 @@ async fn execute(
             StatusCode::CONFLICT,
             serde_json::to_value(c.as_ref()).unwrap_or_default(),
         )),
-        Ok(MergeOutcome::UpToDate(r)) => Ok(Json(op.json(&r, None)).into_response()),
+        Ok(MergeOutcome::UpToDate(r)) => {
+            let mut doc = op.json(&r, None);
+            if requested {
+                let target = tds.clone();
+                let req = response.expect("analysis requires dry run");
+                let commit = r.target.seq;
+                doc["entailments"] =
+                    blocking(move || req.unchanged_entailments(&target, commit)).await?;
+            }
+            Ok(Json(doc).into_response())
+        }
         Ok(MergeOutcome::Merged(r)) => {
             // a merged review branch leaves the memory review inbox
             #[cfg(feature = "mcp")]

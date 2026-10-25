@@ -156,7 +156,19 @@ pub(super) async fn write(
         .opts
         .dry_run
         .as_ref()
-        .map(|d| dry_run::Request::new(&st, &headers, d, restricted));
+        .map(|d| {
+            dry_run::Request::for_write(
+                &st,
+                &headers,
+                &params,
+                d,
+                restricted,
+                Some(p),
+                &ds,
+                &wopts.opts,
+            )
+        })
+        .transpose()?;
     let lookup = super::lookup_param(&params)?;
     let tmp = tempfile::Builder::new()
         .prefix("sparkles-gsp-")

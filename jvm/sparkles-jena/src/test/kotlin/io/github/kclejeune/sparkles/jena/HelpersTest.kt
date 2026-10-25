@@ -106,4 +106,22 @@ class HelpersTest {
             assertNotNull(ds.reasoning().diagnostics(DiagnosticsOptions(checks = listOf("disjoint-classes"))).get("report"))
         }
     }
+    @Test fun entailment_diff_and_class_justification(@TempDir dir: Path) {
+        SparklesDatasets.open(dir.resolve("analysis")).use { ds ->
+            ds.load(ByteArrayInputStream("<urn:Manager> <http://www.w3.org/2000/01/rdf-schema#subClassOf> <urn:Employee> .".toByteArray()), Lang.TURTLE)
+            val before = ds.headCommit().seq
+            ds.load(ByteArrayInputStream("<urn:alice> a <urn:Manager> .".toByteArray()), Lang.TURTLE)
+            val head = ds.headCommit().seq
+            val delta = ds.reasoning().diff(before.toString(), "head", JSON.parse("{\"profile\":\"rdfs-simple\"}"))
+            assertEquals(1, delta.getNumber("added").toInt())
+            assertEquals(head, ds.headCommit().seq)
+            ds.load(ByteArrayInputStream("<urn:CatDog> <http://www.w3.org/2000/01/rdf-schema#subClassOf> <urn:Cat>, <urn:Dog> . <urn:Cat> <http://www.w3.org/2002/07/owl#disjointWith> <urn:Dog> . <urn:tom> a <urn:Cat>, <urn:Dog> .".toByteArray()), Lang.TURTLE)
+            val result = ds.reasoning().justify(JSON.parse("{\"class\":\"urn:CatDog\",\"profile\":\"owl-rl\"}"))
+            assertTrue(result.get("results").asArray[0].asObject.getBoolean("holds"))
+            assertEquals(3, result.get("results").asArray[0].asObject.get("justifications").asArray[0].asObject.get("facts").asArray.size)
+            val findings = ds.reasoning().diagnostics(DiagnosticsOptions(checks = listOf("disjoint-classes"), justify = true))
+            assertNotNull(findings.get("report").asObject.get("findings").asArray[0].asObject.get("justification"))
+        }
+    }
+
 }

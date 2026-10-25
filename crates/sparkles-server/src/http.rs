@@ -32,6 +32,7 @@ mod cursor;
 mod describe;
 mod diff;
 mod dry_run;
+mod entailments;
 mod explain;
 #[cfg(feature = "fmt")]
 mod format;
@@ -156,6 +157,8 @@ pub fn router(state: Arc<AppState>) -> Router {
         )
         .route("/$/reason/{ds}/diagnostics", get(reason_diagnostics))
         .route("/$/reason/{ds}/explain", post(explain::explain))
+        .route("/$/reason/{ds}/diff", get(entailments::diff))
+        .route("/$/reason/{ds}/justify", post(entailments::justify))
         .route("/$/tasks", get(list_tasks))
         .route("/$/tasks/{id}", get(get_task).delete(cancel_task))
         .route("/$/prefixes/{ds}", get(prefixes))
@@ -2535,7 +2538,19 @@ async fn update_endpoint(
         .write
         .dry_run
         .as_ref()
-        .map(|d| dry_run::Request::new(&st, &headers, d, restricted));
+        .map(|d| {
+            dry_run::Request::for_write(
+                &st,
+                &headers,
+                &params,
+                d,
+                restricted,
+                Some(&p),
+                &ds,
+                &opts.write,
+            )
+        })
+        .transpose()?;
     // the response to the update's result: a dry run's preview, its statistics, or the
     // write's error
     let finish =
@@ -3461,7 +3476,19 @@ async fn gsp_on(
                 .opts
                 .dry_run
                 .as_ref()
-                .map(|d| dry_run::Request::new(&st, &headers, d, restricted));
+                .map(|d| {
+                    dry_run::Request::for_write(
+                        &st,
+                        &headers,
+                        &params,
+                        d,
+                        restricted,
+                        Some(&p),
+                        &ds,
+                        &wopts.opts,
+                    )
+                })
+                .transpose()?;
             let body = spool(body, &mut BodyBudget::new(&st.limits)).await?;
             let (wopts, timeout) = wopts.start();
             blocking(move || {
@@ -3533,7 +3560,19 @@ async fn gsp_on(
                 .opts
                 .dry_run
                 .as_ref()
-                .map(|d| dry_run::Request::new(&st, &headers, d, restricted));
+                .map(|d| {
+                    dry_run::Request::for_write(
+                        &st,
+                        &headers,
+                        &params,
+                        d,
+                        restricted,
+                        Some(&p),
+                        &ds,
+                        &wopts.opts,
+                    )
+                })
+                .transpose()?;
             let (wopts, timeout) = wopts.start();
             // the admitted grant, read on the request's task before the blocking thread
             let grant = crate::server_memory::current_grant();
@@ -3628,7 +3667,19 @@ async fn upload(
         .opts
         .dry_run
         .as_ref()
-        .map(|d| dry_run::Request::new(&st, &headers, d, restricted));
+        .map(|d| {
+            dry_run::Request::for_write(
+                &st,
+                &headers,
+                &params,
+                d,
+                restricted,
+                request.extensions().get::<Principal>(),
+                &ds,
+                &wopts.opts,
+            )
+        })
+        .transpose()?;
     let ct = content_type(&headers);
     let tmp = tempfile::Builder::new()
         .prefix("sparkles-upload-")
@@ -5084,6 +5135,7 @@ async fn reason_status(State(st): St, Path(name): Path<String>) -> ApiResult<Jso
 async fn reason_diagnostics(
     State(st): St,
     Path(name): Path<String>,
+    Extension(principal): Extension<Principal>,
     uri: Uri,
     headers: HeaderMap,
 ) -> ApiResult {
@@ -5151,6 +5203,20 @@ async fn reason_diagnostics(
             format!("graph must be default or an absolute IRI, not '{bad}'"),
         )
     })?;
+    let justify = match params.get("justify") {
+        None | Some("false" | "0") => false,
+        Some("true" | "1" | "") => true,
+        _ => {
+            return Err(err(
+                StatusCode::BAD_REQUEST,
+                "justify must be true or false",
+            ));
+        }
+    };
+    let mut analysis = sparkles::reasoning::analysis::AnalysisOptions::default();
+    entailments::options(&st, &principal, &ds.name, &mut analysis);
+    let (cancel, _guard) = cancel_on_drop();
+    analysis.cancel = Some(cancel);
     let reasoning = ds.dataset.reasoning();
     // the inferences follow from the default graph: included by default when it is checked
     let inferences = reasoning.record().is_some()
@@ -5172,18 +5238,32 @@ async fn reason_diagnostics(
         grant: crate::server_memory::current_grant(),
     };
     blocking(move || {
-        let (report, j) =
-            crate::reasoning::diagnostics_render(&ds.name, reasoning.diagnostics(&opts)?);
+        let supports = if justify {
+            Some(reasoning.diagnostics_justified(&opts, &analysis, 500)?)
+        } else {
+            None
+        };
+        let diagnostics = match &supports {
+            Some(supports) => supports.diagnostics.clone(),
+            None => reasoning.diagnostics(&opts)?,
+        };
+        let (report, mut j) = crate::reasoning::diagnostics_render(&ds.name, diagnostics);
+        if let Some(supports) = &supports {
+            supports.attach(&mut j);
+        }
         let seq = j["commit"].as_u64().unwrap_or(0);
         let r = if turtle {
             let inf = &j["scope"]["inferences"];
-            let ttl = report.to_turtle(&ReportContext {
+            let mut ttl = report.to_turtle(&ReportContext {
                 dataset: Some(&ds.name),
                 profile: inf["profile"].as_str(),
                 stale: inf["stale"].as_bool(),
                 commits_since: inf["commitsSince"].as_u64(),
                 prefixes: &opts.prefixes,
             });
+            if let Some(supports) = &supports {
+                ttl.push_str(&supports.supports.to_turtle());
+            }
             ([(header::CONTENT_TYPE, "text/turtle; charset=utf-8")], ttl).into_response()
         } else {
             Json(j).into_response()

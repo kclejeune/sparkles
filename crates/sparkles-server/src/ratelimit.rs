@@ -144,6 +144,8 @@ pub fn classify(
             || admin.starts_with("stats/")
             || admin == "reason/{ds}/diagnostics"
             || admin == "reason/{ds}/explain"
+            || admin == "reason/{ds}/diff"
+            || admin == "reason/{ds}/justify"
             || admin == "graphql/{ds}/draft"
             || admin == "commits/{ds}/timeline"
         {

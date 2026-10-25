@@ -595,3 +595,35 @@ test('demand and why-not explanations preserve the selected mode and limits', as
   assert.ok(missing.hypotheses.length > 0);
   assert.ok(missing.hypotheses.every((h) => h.missing.length === 1));
 });
+
+test('entailment diffs and minimal justifications stay read-only', async (t) => {
+  const path = await temp();
+  try {
+    const ds = t.resource(await Dataset.open(path));
+    await ds.update(
+      'INSERT DATA { <urn:Manager> <http://www.w3.org/2000/01/rdf-schema#subClassOf> <urn:Employee> }',
+    );
+    const before = (await ds.history.commit()).seq;
+    await ds.update('INSERT DATA { <urn:alice> a <urn:Manager> }');
+    const head = (await ds.history.commit()).seq;
+    const delta = await ds.reasoning.diff(String(before), 'head', { profile: 'rdfs-simple' });
+    assert.equal(delta.added, 1n);
+    assert.equal(delta.removed, 0n);
+    assert.equal(delta.sample.added[0][2].value, 'urn:Employee');
+    assert.equal((await ds.history.commit()).seq, head);
+    await ds.update(
+      'INSERT DATA { <urn:CatDog> <http://www.w3.org/2000/01/rdf-schema#subClassOf> <urn:Cat>, <urn:Dog> . <urn:Cat> <http://www.w3.org/2002/07/owl#disjointWith> <urn:Dog> . <urn:tom> a <urn:Cat>, <urn:Dog> }',
+    );
+    const support = await ds.reasoning.justify({ class: 'urn:CatDog' }, { profile: 'owl-rl' });
+    assert.equal(support.results[0].holds, true);
+    assert.equal(support.results[0].justifications[0].facts.length, 3);
+    const findings = await ds.reasoning.diagnostics({
+      checks: ['disjoint-classes'],
+      justify: true,
+    });
+    assert.equal(findings.report.findings[0].justification.facts.length, 3);
+  } finally {
+    await t.cleanup();
+    await rm(path, { recursive: true, force: true });
+  }
+});

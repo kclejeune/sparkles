@@ -106,7 +106,7 @@ impl PyReasoning {
             ))
         }
     }
-    #[pyo3(signature=(*,checks=None,limit=100,include_inferred=false,graphs=None,cancel=None,progress=None,timeout=None))]
+    #[pyo3(signature=(*,checks=None,limit=100,include_inferred=false,graphs=None,justify=false,max_checks=500,max_memory=None,cancel=None,progress=None,timeout=None))]
     #[allow(clippy::too_many_arguments)]
     fn diagnostics<'py>(
         &self,
@@ -115,6 +115,9 @@ impl PyReasoning {
         limit: usize,
         include_inferred: bool,
         graphs: Option<Vec<String>>,
+        justify: bool,
+        max_checks: usize,
+        max_memory: Option<usize>,
         cancel: Option<&Bound<'py, PyAny>>,
         progress: Option<&Bound<'py, PyAny>>,
         timeout: Option<f64>,
@@ -133,12 +136,28 @@ impl PyReasoning {
                         .map(|d| d.saturating_duration_since(std::time::Instant::now())),
                     ..Default::default()
                 };
-                let r = ds.reasoning().diagnostics(&opts)?;
+                let report = if justify {
+                    let supports = ds.reasoning().diagnostics_justified(
+                        &opts,
+                        &sparkles::reasoning::analysis::AnalysisOptions {
+                            timeout: opts.timeout,
+                            cancel: Some(ctl.cancel.flag()),
+                            max_memory,
+                            ..Default::default()
+                        },
+                        max_checks,
+                    )?;
+                    let mut report = supports.diagnostics.report.to_json();
+                    supports.attach(&mut report);
+                    report
+                } else {
+                    ds.reasoning().diagnostics(&opts)?.report.to_json()
+                };
                 ctl.check()?;
                 ctl.progress.report(1.0, "diagnosed dataset");
-                Ok(r)
+                Ok(report)
             })?;
-            admin::to_py(py, &r.report.to_json())
+            admin::to_py(py, &r)
         }
         #[cfg(not(feature = "reasoning"))]
         {
@@ -148,6 +167,9 @@ impl PyReasoning {
                 limit,
                 include_inferred,
                 graphs,
+                justify,
+                max_checks,
+                max_memory,
                 cancel,
                 progress,
                 timeout,
@@ -159,6 +181,118 @@ impl PyReasoning {
             ))
         }
     }
+    /// Compare inferred additions and removals without writing. `options` accepts the
+    /// public diff program, sample and memory controls.
+    #[pyo3(signature=(from_state,to_state="head",*,options=None,cancel=None,timeout=None))]
+    fn diff<'py>(
+        &self,
+        py: Python<'py>,
+        from_state: String,
+        to_state: &str,
+        options: Option<&Bound<'py, PyAny>>,
+        cancel: Option<&Bound<'py, PyAny>>,
+        timeout: Option<f64>,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        let ds = self.ds(py)?;
+        let mut request: serde_json::Value = options
+            .map(|options| admin::from_py(options, "diff options"))
+            .transpose()?
+            .unwrap_or_else(|| serde_json::json!({}));
+        if !request.is_object() {
+            return Err(invalid(py, "diff options must be an object"));
+        }
+        request["from"] = from_state.into();
+        request["to"] = to_state.into();
+        #[cfg(feature = "reasoning")]
+        {
+            let value = interrupt::controlled(py, cancel, None, timeout, move |control| {
+                let mut request = sparkles::reasoning::diff::DiffRequest::from_json(&request)?;
+                request.analysis.timeout = match (
+                    request.analysis.timeout,
+                    control.deadline.map(|deadline| {
+                        deadline.saturating_duration_since(std::time::Instant::now())
+                    }),
+                ) {
+                    (Some(asked), Some(limit)) => Some(asked.min(limit)),
+                    (asked, limit) => asked.or(limit),
+                };
+                request.analysis.cancel = Some(control.cancel.flag());
+                let result = ds.reasoning().diff(&request)?;
+                control.check()?;
+                Ok(result.to_json())
+            })?;
+            admin::to_py(py, &value)
+        }
+        #[cfg(not(feature = "reasoning"))]
+        {
+            let _ = (ds, request, cancel, timeout);
+            Err(crate::errors::new_err(
+                py,
+                "UnsupportedError",
+                "reasoning feature is disabled",
+            ))
+        }
+    }
+
+    /// Find minimal asserted supports. `target` contains finding, class, or classes.
+    #[pyo3(signature=(target,*,options=None,cancel=None,timeout=None))]
+    fn justify<'py>(
+        &self,
+        py: Python<'py>,
+        target: &Bound<'py, PyAny>,
+        options: Option<&Bound<'py, PyAny>>,
+        cancel: Option<&Bound<'py, PyAny>>,
+        timeout: Option<f64>,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        let ds = self.ds(py)?;
+        let target: serde_json::Value = admin::from_py(target, "justification target")?;
+        let mut request: serde_json::Value = options
+            .map(|options| admin::from_py(options, "justification options"))
+            .transpose()?
+            .unwrap_or_else(|| serde_json::json!({}));
+        let object = request
+            .as_object_mut()
+            .ok_or_else(|| invalid(py, "justification options must be an object"))?;
+        let target = target
+            .as_object()
+            .ok_or_else(|| invalid(py, "justification target must be an object"))?;
+        object.extend(
+            target
+                .iter()
+                .map(|(name, value)| (name.clone(), value.clone())),
+        );
+        #[cfg(feature = "reasoning")]
+        {
+            let value = interrupt::controlled(py, cancel, None, timeout, move |control| {
+                let mut request =
+                    sparkles::reasoning::justify::JustifyRequest::from_json(&request)?;
+                request.analysis.timeout = match (
+                    request.analysis.timeout,
+                    control.deadline.map(|deadline| {
+                        deadline.saturating_duration_since(std::time::Instant::now())
+                    }),
+                ) {
+                    (Some(asked), Some(limit)) => Some(asked.min(limit)),
+                    (asked, limit) => asked.or(limit),
+                };
+                request.analysis.cancel = Some(control.cancel.flag());
+                let result = ds.reasoning().justify(&request)?;
+                control.check()?;
+                Ok(result.to_json())
+            })?;
+            admin::to_py(py, &value)
+        }
+        #[cfg(not(feature = "reasoning"))]
+        {
+            let _ = (ds, request, cancel, timeout);
+            Err(crate::errors::new_err(
+                py,
+                "UnsupportedError",
+                "reasoning feature is disabled",
+            ))
+        }
+    }
+
     /// Why the dataset entails a triple, given in Turtle with the dataset's prefixes:
     /// the JSON answer of `POST /$/reason/{ds}/explain`, with `entailed: false` when no
     /// derivation is found.

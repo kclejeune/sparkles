@@ -5,6 +5,7 @@
 //! `docs/API.md` calls free-form, such as SHACL results and GeoJSON geometries, stay
 //! open objects inside the typed ones.
 
+use self::kit::{boolean, int, string, strings};
 use super::{api_doc, sref};
 use serde_json::{Map, Value as J, json};
 
@@ -58,7 +59,10 @@ fn counts() -> J {
 pub(super) fn schemas() -> Map<String, J> {
     let mut s = Map::new();
     let mut put = |name: &str, v: J| {
-        s.insert(name.to_string(), v);
+        assert!(
+            s.insert(name.to_string(), v).is_none(),
+            "duplicate OpenAPI schema {name}"
+        );
     };
 
     // ------------------------------------------------------------------ errors --
@@ -854,6 +858,9 @@ pub(super) fn schemas() -> Map<String, J> {
                 "limit": { "type": "integer" },
                 "message": { "type": "string" },
                 "dryRun": { "type": "boolean" },
+                "entailments": {"type":"boolean","description":"Include complete candidate entailment changes. Requires dryRun=true."},
+                "profile":string(),"rules":string(),"inputs":sref("AnalysisInputs"),"vocabularies":strings(),"geoDefaultGeometry":boolean(),
+                "timeout":{"type":"number","exclusiveMinimum":0},"maxMemory":int(),"maxInferred":int(),"threads":int(),
             }),
         ),
     );
@@ -875,6 +882,9 @@ pub(super) fn schemas() -> Map<String, J> {
                 "limit": { "type": "integer" },
                 "message": { "type": "string" },
                 "dryRun": { "type": "boolean" },
+                "entailments": {"type":"boolean","description":"Include complete candidate entailment changes. Requires dryRun=true."},
+                "profile":string(),"rules":string(),"inputs":sref("AnalysisInputs"),"vocabularies":strings(),"geoDefaultGeometry":boolean(),
+                "timeout":{"type":"number","exclusiveMinimum":0},"maxMemory":int(),"maxInferred":int(),"threads":int(),
             }),
         ),
     );
@@ -902,6 +912,8 @@ pub(super) fn schemas() -> Map<String, J> {
                     "items": { "type": "object", "properties": { "from": commit_ref(), "commit": { "type": ["integer", "null"] } } },
                 },
                 "inferences": { "type": ["object", "null"] },
+                "entailments":{"anyOf":[sref("EntailmentDiff"),{"type":"null"}]},
+                "entailmentsUnavailable":string(), "previewOutcome":string(),
             },
         }),
     );
