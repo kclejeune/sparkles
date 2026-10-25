@@ -2438,6 +2438,21 @@ support as a false conclusion. C22b adopts stable configuration identities and s
 accounting. It rejects first-readable report selection and per-configuration budgets
 that can multiply a dataset allowance.
 
+## Personal ChatGPT-plan model access
+
+[C28](C28-chatgpt-model-access.md) is specified and unimplemented. Its protocol sources
+are the official Sign in with ChatGPT documentation linked from the spec, including
+registration, account sessions, self-hosted credential transfer, Responses inference
+and preview limitations. The design was checked against Sparkles' model configuration,
+per-attempt admission, disclosure guards and protected secret storage.
+
+TREK's ChatGPT authentication service and Responses adapter were inspected as a
+reference at the maintainer's request. TREK is AGPL-3.0. No TREK code or dependency was
+copied or adopted. The proposed protocol follows the official provider documentation.
+The design adds Sparkles-specific principal isolation, conservative budget admission
+and recovery boundaries. It rejects borrowed credentials from unrelated tools, implicit
+API billing fallback, instance-wide personal-plan sharing and unverified partial results.
+
 ## Development tools (not linked into Sparkles)
 
 - **Adopted** (2026-09-30, with the pre-commit hooks in `.pre-commit-config.yaml`):
