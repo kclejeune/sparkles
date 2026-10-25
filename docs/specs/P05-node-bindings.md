@@ -1485,6 +1485,30 @@ What remains behind N3.js has these causes.
   and back, which a profile of cycles does not show. Queries are already far ahead of
   both other engines, so the round left them alone.
 
+### Borrowed native term validation
+
+The addon checks cached quad terms by borrowing their variants instead of cloning an
+owned subject, predicate or graph and immediately dropping it. Accepted term kinds and
+error messages stay the same. Characterization tests cover incompatible cached terms in
+every quad position through probes and transactional writes, including quoted terms and
+the default graph. The engine and common suites pass with 97 tests and four existing
+opt-in skips, and default and no-default-feature Clippy pass.
+
+A matched comparison on forge uses Node 22.23.3, Rust 1.98.1 and GCC 12.2.0 over 105,300
+unique quads. Six fresh processes per build in three A/B/B/A blocks put public `has()` at
+0.832 µs before and 0.796 µs after, and mixed adds at 4.464 µs before and 4.280 µs after.
+Both improve in every block. A larger lifecycle control measures 60,000 empty dataset
+creations and closes per build and is 2.9% faster, reversing an exploratory Namespace
+slowdown seen with only 400 operations per build. This control measures dataset lifecycle,
+not the DBpedia births query.
+
+Small SELECT timings remain unstable across processes and change direction in a warmed
+repeat. Full export consumption varies from 0.8% faster to 1.5% slower, while count-only
+exports are 0.4% to 1.0% slower. Item 329 retains these accepted small export costs and the
+query-control uncertainty. No export rewrite follows from this comparison. Term IDs and
+lazy term decoding already exist. The [benchmark record](../BENCHMARKS.md#native-term-validation)
+holds the method, limits and raw samples. Item 33 still covers the remaining binding gaps.
+
 ### Graph overview
 
 `ds.graph.groups(request, options?)` binds the library's `ds.graph().groups` from

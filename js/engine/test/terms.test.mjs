@@ -160,3 +160,40 @@ test('a match larger than its first batch keeps reading', async () => {
   assert.equal(seen, 3);
   assert.equal((await ds.match(n('nobody')).toArray()).length, 0);
 });
+
+test('quad positions reject incompatible terms after those terms were cached', async (t) => {
+  const ds = Dataset.memory();
+  t.after(() => ds.close());
+  const valid = q(n('validation-subject'), n('validation-predicate'), f.literal('kept'));
+  await ds.add(valid);
+  const triple = f.quad(n('quoted-subject'), n('quoted-predicate'), f.literal('quoted object'));
+  const invalid = [
+    ['subject', f.literal('literal subject'), /subject and graph/],
+    ['subject', f.defaultGraph(), /subject and graph/],
+    ['subject', triple, /subject and graph/],
+    ['predicate', f.literal('literal predicate'), /predicate must be an IRI/],
+    ['predicate', f.blankNode('predicate'), /predicate must be an IRI/],
+    ['predicate', f.defaultGraph(), /predicate must be an IRI/],
+    ['predicate', triple, /predicate must be an IRI/],
+    ['object', f.defaultGraph(), /default graph is not a term/],
+    ['graph', f.literal('literal graph'), /subject and graph/],
+    ['graph', triple, /subject and graph/],
+  ];
+  for (const [position, term, error] of invalid) {
+    const bad = { ...valid, [position]: term };
+    for (const write of [false, true]) {
+      // Literals and quoted terms are valid objects. Send them first in that role;
+      // default-graph terms are already cached by every ordinary probe.
+      if (term.termType !== 'DefaultGraph')
+        assert.equal(await ds.has(q(n('missing'), n('p'), term)), false);
+      if (write)
+        await assert.rejects(
+          ds.transaction((tx) => tx.add(bad)),
+          error,
+        );
+      else await assert.rejects(ds.has(bad), error);
+      assert.equal(await ds.count(), 1n);
+      assert.equal(await ds.has(valid), true);
+    }
+  }
+});

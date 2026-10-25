@@ -146,11 +146,35 @@ impl Handle {
 
     /// Whether the term can stand in position `pos` (0 to 3) of a quad.
     fn check(&self, pos: usize) -> Result<()> {
-        match pos {
-            0 => self.subject().map(drop),
-            1 => self.predicate().map(drop),
-            2 => self.term().map(drop),
-            _ => self.graph().map(drop),
+        // Validating a cached request must not clone its term text just to discard it.
+        let (valid, message) = match pos {
+            0 => (
+                matches!(
+                    &self.cell,
+                    Cell::Term(Term::NamedNode(_) | Term::BlankNode(_))
+                ),
+                "subject and graph must be an IRI or blank node",
+            ),
+            1 => (
+                matches!(&self.cell, Cell::Term(Term::NamedNode(_))),
+                "predicate must be an IRI",
+            ),
+            2 => (
+                matches!(&self.cell, Cell::Term(_)),
+                "the default graph is not a term here",
+            ),
+            _ => (
+                matches!(
+                    &self.cell,
+                    Cell::DefaultGraph | Cell::Term(Term::NamedNode(_) | Term::BlankNode(_))
+                ),
+                "subject and graph must be an IRI or blank node",
+            ),
+        };
+        if valid {
+            Ok(())
+        } else {
+            Err(Error::invalid(message))
         }
     }
 }

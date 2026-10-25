@@ -1272,6 +1272,8 @@ engine in process.
   source ([USAGE.md](USAGE.md#javascript-and-typescript)). `@sparkles-rdf/client` gives
   streaming SPARQL, Graph Store operations and typed administration over Fetch. Both
   share terms, result types and errors through `@sparkles-rdf/common`.
+  Repeated quad operations reuse term handles, whose native kind checks borrow the
+  cached terms. Result rows decode their RDF/JS terms lazily.
 * `crates/sparkles-client` is a Rust client of remote servers, async on tokio with a
   blocking form ([USAGE.md](USAGE.md#rust-client), [P02](specs/P02-rust-client.md)). It
   speaks the SPARQL 1.1 Protocol and the Graph Store Protocol to Sparkles, Fuseki,
