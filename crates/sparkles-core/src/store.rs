@@ -7698,6 +7698,57 @@ ex:a ex:p 1, 2, 3 . ex:b ex:p 2 . ex:c ex:q "hello"@en .
     }
 
     #[test]
+    fn deferred_bulk_change_log_creates_only_its_directory() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("db");
+        let opts = StoreOptions {
+            bulk_threshold: 0,
+            ..Default::default()
+        };
+        let store = Store::open(&root, opts.clone()).unwrap();
+        let log = store.change_log().unwrap();
+        log.set_background(false);
+        store.load(&[src()]).unwrap();
+        let entries = || {
+            std::fs::read_dir(&root)
+                .unwrap()
+                .map(|entry| entry.unwrap().file_name())
+                .collect::<std::collections::BTreeSet<_>>()
+        };
+        let generations = |entries: &std::collections::BTreeSet<std::ffi::OsString>| {
+            entries
+                .iter()
+                .filter(|name| name.to_string_lossy().starts_with("gen-"))
+                .cloned()
+                .collect::<std::collections::BTreeSet<_>>()
+        };
+        let before = entries();
+        assert!(!before.contains(std::ffi::OsStr::new("changes")));
+        assert_eq!(log.last(), None, "the successful record is still queued");
+        let current = std::fs::read(root.join("CURRENT")).unwrap();
+        let head = store.head_commit().seq;
+        let data = store.snapshot().scan_keys(Perm::Spo, &[]).unwrap();
+        store.flush_change_log().unwrap();
+        let after = entries();
+        let mut expected = before.clone();
+        expected.insert("changes".into());
+        assert_eq!(
+            after, expected,
+            "only the completed load's deferred log creates an entry"
+        );
+        assert_eq!(generations(&after), generations(&before));
+        assert_eq!(std::fs::read(root.join("CURRENT")).unwrap(), current);
+        assert_eq!(store.head_commit().seq, head);
+        assert_eq!(store.snapshot().scan_keys(Perm::Spo, &[]).unwrap(), data);
+        assert_eq!(log.last(), Some(head));
+        drop(store);
+        let reopened = Store::open(&root, opts).unwrap();
+        assert_eq!(reopened.head_commit().seq, head);
+        assert_eq!(std::fs::read(root.join("CURRENT")).unwrap(), current);
+        assert_eq!(reopened.snapshot().scan_keys(Perm::Spo, &[]).unwrap(), data);
+    }
+
+    #[test]
     fn cancelled_and_timed_out_writes_publish_nothing() {
         use crate::guard::WriteOptions;
         let dir = tempfile::tempdir().unwrap();
@@ -7709,6 +7760,11 @@ ex:a ex:p 1, 2, 3 . ex:b ex:p 2 . ex:c ex:q "hello"@en .
         };
         let store = Store::open(&root, bulk).unwrap();
         store.load(&[src()]).unwrap();
+        // The completed setup load queues its change log. Drain that legitimate
+        // root-directory write before attributing any new entry to cancellation.
+        store.flush_change_log().unwrap();
+        let current = std::fs::read(root.join("CURRENT")).unwrap();
+        let data = store.snapshot().scan_keys(Perm::Spo, &[]).unwrap();
         let head = store.head_commit().seq;
         let gens = || std::fs::read_dir(&root).unwrap().count();
         let before = gens();
@@ -7736,6 +7792,8 @@ ex:a ex:p 1, 2, 3 . ex:b ex:p 2 . ex:c ex:q "hello"@en .
             assert!(matches!(e, Error::Cancelled | Error::Timeout), "{e}");
         }
         assert_eq!(store.head_commit().seq, head);
+        assert_eq!(std::fs::read(root.join("CURRENT")).unwrap(), current);
+        assert_eq!(store.snapshot().scan_keys(Perm::Spo, &[]).unwrap(), data);
         assert_eq!(
             gens(),
             before,
