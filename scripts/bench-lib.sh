@@ -188,7 +188,7 @@ start() {
       ready="localhost:$p/\$/ping"
       ;;
     qlever)
-      (cd "$(store_of qlever)" && exec "${CAP[@]}" "$QSERVER" -i bench -p "$p" -m 8G -c 2G -e 0B -s "${SERVER_TIMEOUT}s" -a bench -j 16 >> server.log 2>&1) &
+      (cd "$(store_of qlever)" && exec "${CAP[@]}" "$QSERVER" -i bench -p "$p" -m "${QLEVER_MEMORY:-8G}" -c 2G -e 0B -s "${SERVER_TIMEOUT}s" -a bench -j 16 >> server.log 2>&1) &
       URL[$e]=localhost:$p/
       UPDURL[$e]=localhost:$p/
       UPDFIELD[$e]=access-token=bench
