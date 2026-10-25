@@ -2474,7 +2474,7 @@
               {:else}
                 <GraphView
                   bind:this={graphView}
-                  showControls={false}
+                  showControls={!nodeCount}
                   animate={graphTimeOpen}
                   nodes={gNodes}
                   edges={gEdges}
