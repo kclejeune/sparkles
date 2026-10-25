@@ -375,6 +375,12 @@ test('authenticated branch writers can remove supports and open premises on thei
   await expect(
     support.getByRole('button', { name: 'Remove on a branch', exact: true }),
   ).toHaveCount(3);
+  const premiseReads: string[] = [];
+  page.on('request', (request) => {
+    const url = new URL(request.url());
+    if (url.pathname.endsWith('/sparql') && (request.postData() ?? '').includes('<urn:Cat>'))
+      premiseReads.push(decodeURIComponent(url.pathname));
+  });
   await support.getByRole('button', { name: 'urn:Cat', exact: true }).first().click();
   await expect(page).toHaveURL(
     (url) =>
@@ -383,4 +389,6 @@ test('authenticated branch writers can remove supports and open premises on thei
       url.searchParams.get('branch') === 'dev' &&
       url.searchParams.get('iri') === 'urn:Cat',
   );
+  await expect.poll(() => premiseReads.length).toBeGreaterThanOrEqual(3);
+  expect(premiseReads.every((path) => path === `/${name}@dev/sparql`)).toBe(true);
 });
