@@ -580,16 +580,42 @@ mod on {
     }
 
     /// The leaves and filters of a tree of joins; `false` when something else is in it.
-    fn flatten(n: &Node, ctx: &Ctx, leaves: &mut Vec<Node>, filters: &mut Vec<Expr>) -> bool {
+    fn flatten(
+        n: &Node,
+        ctx: &Ctx,
+        geometry: VarId,
+        leaves: &mut Vec<Node>,
+        filters: &mut Vec<Expr>,
+    ) -> bool {
+        if !n.vars.contains(&geometry) {
+            // Preserve the independent subtree's binding scope and local filters.
+            // Per-batch repetition needs the cache's conservative eligibility rules
+            // to exclude volatile expressions, callbacks and external services.
+            if super::super::cache::key(n, ctx).is_none() {
+                return false;
+            }
+            leaves.push(n.clone());
+            return true;
+        }
         match &n.kind {
-            Kind::Join { .. } => n.children.iter().all(|c| flatten(c, ctx, leaves, filters)),
-            Kind::Sort(_) => flatten(&n.children[0], ctx, leaves, filters),
-            Kind::Filter(es) if !es.iter().any(Expr::has_exists) => {
+            Kind::Join { .. } => n
+                .children
+                .iter()
+                .all(|c| flatten(c, ctx, geometry, leaves, filters)),
+            Kind::Sort(_) => flatten(&n.children[0], ctx, geometry, leaves, filters),
+            Kind::Filter(es)
+                if es.iter().all(|e| {
+                    super::super::cache::deterministic(e)
+                        && e.var_set()
+                            .iter()
+                            .all(|v| n.children[0].certain.contains(v))
+                }) =>
+            {
                 filters.extend(es.iter().cloned());
-                flatten(&n.children[0], ctx, leaves, filters)
+                flatten(&n.children[0], ctx, geometry, leaves, filters)
             }
             Kind::IndexJoin(j) => {
-                if !flatten(&n.children[0], ctx, leaves, filters) {
+                if !flatten(&n.children[0], ctx, geometry, leaves, filters) {
                     return false;
                 }
                 // each probe as the scan it reads
@@ -723,6 +749,9 @@ mod on {
         ctx: &Ctx,
     ) -> std::result::Result<Node, String> {
         let w = dist.w;
+        if ctx.calls_extensions {
+            return Err("the query calls application extensions".into());
+        }
         let unit = dist.unit?;
         let metres_per_unit = match unit.kind {
             UnitKind::Length => unit.factor,
@@ -750,7 +779,7 @@ mod on {
         let (chain, core) = split_chain(child);
         let mut leaves = Vec::new();
         let mut filters = Vec::new();
-        if !flatten(core, ctx, &mut leaves, &mut filters) {
+        if !flatten(core, ctx, w, &mut leaves, &mut filters) {
             return Err("the group is not a join of patterns under its filters and binds".into());
         }
         let at: Vec<usize> = (0..leaves.len())

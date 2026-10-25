@@ -1851,6 +1851,9 @@ nearest candidates. Joins and filters can discard a whole batch, and the search 
 until enough rows are proven or the index is exhausted. Duplicate solutions retain their
 multiplicity, and the existing query budgets apply to each template run and its output.
 Independent components run again for each batch, without an additional materialized cache.
+Their local filters remain inside the component, preserving unbound variables and avoiding
+an unfiltered cross product. Application callbacks and components whose repeatability
+cannot be established keep the generic plan, including components with volatile functions.
 The per-row nearest-neighbour join described below remains open under item 24.
 
 **The rest of Phase 3 and geometry limits** (item 24, Tier 3,

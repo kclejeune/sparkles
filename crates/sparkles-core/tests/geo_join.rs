@@ -310,11 +310,10 @@ fn nearest_neighbours_come_first() {
     );
 }
 
-#[test]
-fn nearest_neighbours_join_disconnected_patterns_after_empty_batches() {
+fn indexed_points(n: u32) -> Store {
     let s = Store::in_memory(StoreOptions::default());
     let mut data = String::new();
-    for i in 0..160 {
+    for i in 0..n {
         data.push_str(&format!(
             "<http://example.org/g{i}> <http://www.opengis.net/ont/geosparql#asWKT> \
              \"POINT({} 0)\"^^<http://www.opengis.net/ont/geosparql#wktLiteral> ; \
@@ -325,6 +324,12 @@ fn nearest_neighbours_join_disconnected_patterns_after_empty_batches() {
     data.push_str("<http://example.org/setting> <http://example.org/minRank> 140 ; <http://example.org/enabled> true .\n");
     load(&s, &data);
     s.enable_geo(GeoConfig::default()).unwrap();
+    s
+}
+
+#[test]
+fn nearest_neighbours_join_disconnected_patterns_after_empty_batches() {
+    let s = indexed_points(160);
     let snap = s.snapshot();
     for (independent, expected) in [
         ("VALUES ?threshold { 140 145 }", 6),
@@ -355,6 +360,83 @@ fn nearest_neighbours_join_disconnected_patterns_after_empty_batches() {
             "{q}"
         );
     }
+}
+
+#[test]
+fn nearest_neighbours_preserve_independent_filter_scope_and_budget() {
+    let s = indexed_points(3);
+    let values = (0..100)
+        .map(|n| n.to_string())
+        .collect::<Vec<_>>()
+        .join(" ");
+    for independent in [
+        "{ VALUES ?x { 1 } FILTER(!BOUND(?g)) }".to_string(),
+        format!("{{ VALUES ?x {{ {values} }} FILTER(?x = 0) }}"),
+    ] {
+        let q = format!(
+            "SELECT ?g ?x {{ ?g geo:asWKT ?w . {independent} }} \
+             ORDER BY geof:metricDistance(?w, \"POINT(0 0)\"^^geo:wktLiteral) LIMIT 5"
+        );
+        let mut fast = opts(true);
+        fast.max_rows = Some(150);
+        let mut slow = opts(false);
+        slow.max_rows = Some(150);
+        let fast = run(&s.snapshot(), &q, &fast);
+        let slow = run(&s.snapshot(), &q, &slow);
+        assert_eq!(fast.table.len(), 3, "{q}");
+        assert_eq!(rows(&fast), rows(&slow), "{q}");
+        assert!(find(&fast.plan, "SpatialKnn").is_some(), "{q}");
+    }
+}
+
+#[test]
+fn nearest_neighbours_keep_callback_cardinality_and_volatile_group_identity() {
+    use sparkles_core::sparql::extensions::{ExtensionRegistry, ScalarContext, ScalarDescriptor};
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    let s = indexed_points(160);
+    let calls = Arc::new(AtomicUsize::new(0));
+    let count = calls.clone();
+    let mut registry = ExtensionRegistry::builder();
+    registry
+        .register_scalar(
+            ScalarDescriptor::new(
+                "urn:test:once",
+                0..=0,
+                move |_: &ScalarContext<'_>, _: &[Term]| {
+                    Ok(oxrdf::Literal::from(count.fetch_add(1, Ordering::SeqCst) == 0).into())
+                },
+            )
+            .unwrap(),
+        )
+        .unwrap();
+    let registry = registry.build();
+    let q = "SELECT ?g ?x { ?g geo:asWKT ?w ; ex:rank ?rank . \
+             { VALUES ?x { 1 } FILTER(<urn:test:once>()) } \
+             BIND(geof:metricDistance(?w, \"POINT(0 0)\"^^geo:wktLiteral) AS ?d) \
+             FILTER(BOUND(?d) && ?rank >= 140) } ORDER BY ?d LIMIT 6";
+    let mut fast = opts(true);
+    fast.extensions = Some(registry.clone());
+    let mut slow = opts(false);
+    slow.extensions = Some(registry);
+    let fast = run(&s.snapshot(), q, &fast);
+    assert_eq!(calls.swap(0, Ordering::SeqCst), 1);
+    let slow = run(&s.snapshot(), q, &slow);
+    assert_eq!(calls.load(Ordering::SeqCst), 1);
+    assert_eq!(fast.table.len(), 6);
+    assert_eq!(rows(&fast), rows(&slow));
+    assert!(find(&fast.plan, "SpatialKnn").is_none());
+
+    let q = "SELECT ?g ?id { ?g geo:asWKT ?w . { BIND(UUID() AS ?id) } } \
+             ORDER BY geof:metricDistance(?w, \"POINT(0 0)\"^^geo:wktLiteral) LIMIT 5";
+    let r = run(&s.snapshot(), q, &opts(true));
+    assert_eq!(r.table.len(), 5);
+    assert!(find(&r.plan, "SpatialKnn").is_none());
+    let got = r.rows();
+    assert!(
+        got.iter()
+            .all(|row| row[1].is_some() && row[1] == got[0][1])
+    );
 }
 
 #[test]

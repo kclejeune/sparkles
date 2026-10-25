@@ -7262,6 +7262,10 @@ components. The group runs over batches of the nearest rows until the `k`-th dis
 found is below the bound of every row not read yet. A batch that produces no rows after
 the joins and filters does not end the search.
 
+Independent groups keep their own filter scope and apply local filters before joining
+candidate batches. Application callbacks and independent groups with volatile expressions
+keep the generic plan so their evaluations are not repeated per batch.
+
 Rows whose distance is an error come first in SPARQL's order. Their value is not a
 geometry, is malformed or empty, or is in a CRS without a transform. Without a
 `FILTER(BOUND(?d))` or a bound on the distance in the group, the pattern's rows are
