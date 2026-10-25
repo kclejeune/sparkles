@@ -75,6 +75,8 @@ added and removed. **Play** steps through the commits and animates the changes.
 - Editing at a past commit. Writes with `at` stay refused (`at-on-write`).
 - Bitemporal or valid-time data. The slider moves through transaction time only, the
   commit sequence. Data that records its own validity periods is queried as data.
+  [C27](C27-valid-time-profiles.md) specifies a separate valid-time profile and control
+  that can be combined with this slider without changing its recorded-state meaning.
 - Reconstructing states that retention dropped. The change log's entries outlive states,
   and the slider shows them as marks, but it never claims to show a state it cannot read.
 - A new history store. Everything reads F06's states, diffs and change log.
