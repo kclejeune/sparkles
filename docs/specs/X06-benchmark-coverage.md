@@ -1296,6 +1296,8 @@ consumer enables exact projection demand. Its ordinary minimum request of 64 row
 could otherwise make a one-row cheap branch continue into an unnecessary wide operand.
 SELECT and effectful consumers retain their order and demand policy. Explicit
 streaming retains its execution and budget paths.
+Reordering also requires estimates for the entire plan to fit the configured rows and
+remaining produced rows and memory. Pure projection admission remains independent.
 
 The asymmetric join regression keeps the wide scan skipped after a cheap branch
 answers. An immediately answering scan reads only one row and skips a substantial
@@ -1308,6 +1310,9 @@ calls. A nested pure UNION retains its effectful consumer's 127 correlated SERVI
 evaluations, and explicit streaming still visits the original first operand.
 Competing-operand tests keep a 10,000-row eager VALUES table and a nested false arm
 skipped when the first operand can already answer within a 64-row budget.
+The capped VALUES cases also cover 65 and 100 rows and a total produced-row limit of
+300. The physical-work controls run without row caps too, so a resource gate cannot
+hide an incorrect first-answer or nested-demand estimate.
 
 ### Short-query checks after keyed inner groups
 

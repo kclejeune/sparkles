@@ -307,6 +307,9 @@ Each of these can be switched off per query (`QueryOptions::optimizations`) or p
   The whole ASK must pass the whitelist before projections pass the limited demand directly
   instead of requesting at least 64 rows. SELECT and effectful consumers retain their
   order and demand policy. Explicit streaming uses its existing operators.
+  Branch order changes only when estimates for the entire plan fit the remaining
+  per-table row, total produced row and memory budgets. Pure projection admission is
+  independent, so reducing excess demand can still avoid unnecessary work.
 * A pattern with one free variable and at most four estimated rows is eligible for
   `point_patterns`. The planner reads at most two rows and substitutes a constant only
   when exactly one row exists in the query snapshot. It restores the variable in the

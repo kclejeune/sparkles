@@ -167,6 +167,47 @@ fn first_work(
     (work.is_finite() && work >= 0.0).then_some(work)
 }
 
+/// Decline a new operand order when full-plan estimates already exceed its
+/// resources. A cheaper materialized operand must not introduce a known refusal.
+fn ordering_fits(ctx: &super::ctx::Ctx, root: &Node) -> bool {
+    fn visit(
+        node: &Node,
+        left: &mut usize,
+        rows: &mut f64,
+        bytes: &mut f64,
+        max_rows: f64,
+    ) -> bool {
+        if *left == 0 || !node.est.is_finite() || node.est < 0.0 {
+            return false;
+        }
+        *left -= 1;
+        let count = match &node.kind {
+            Kind::Values(table) => table.len() as f64,
+            _ => node.est,
+        };
+        if count > max_rows {
+            return false;
+        }
+        *rows += count;
+        *bytes += count * node.vars.len() as f64 * 8.0 + 128.0;
+        rows.is_finite()
+            && bytes.is_finite()
+            && node
+                .children
+                .iter()
+                .all(|c| visit(c, left, rows, bytes, max_rows))
+    }
+    let (mut rows, mut bytes) = (0.0, 0.0);
+    let mut left = MAX_SCREEN_NODES;
+    visit(root, &mut left, &mut rows, &mut bytes, ctx.max_rows as f64)
+        && rows
+            <= ctx
+                .max_rows_produced
+                .saturating_sub(ctx.rows_produced.load(std::sync::atomic::Ordering::Relaxed))
+                as f64
+        && bytes <= ctx.memory_room() as f64
+}
+
 /// An eager ASK needs one solution, so visit a cheaper pure UNION operand first.
 /// Cursor execution and SELECT retain their existing order.
 pub(super) fn order_ask(ctx: &super::ctx::Ctx, node: &mut Node) {
@@ -192,6 +233,16 @@ pub(super) fn order_ask(ctx: &super::ctx::Ctx, node: &mut Node) {
     }
     ctx.eager_union_demand
         .store(true, std::sync::atomic::Ordering::Relaxed);
+    if !ordering_fits(ctx, node) {
+        return;
+    }
+    let mut union = &mut node.children[0];
+    for _ in 0..8 {
+        if !matches!(union.kind, Kind::Project(_)) || union.children.len() != 1 {
+            break;
+        }
+        union = &mut union.children[0];
+    }
     let Some(mut work) = first_work(ctx, &union.children[0], 1, &mut 128) else {
         return;
     };
@@ -494,34 +545,54 @@ mod tests {
                 None,
             )])
             .unwrap();
-        let values = (0..10_000)
-            .map(|i| i.to_string())
-            .collect::<Vec<_>>()
-            .join(" ");
-        let text = format!(
-            "ASK {{ {{ ?s <urn:first> ?v FILTER(?v != ?s) }} UNION {{ VALUES ?x {{ {values} }} }} }}"
-        );
-        let result = query(
-            store.snapshot(),
-            &text,
-            &QueryOptions {
-                no_cache: true,
-                max_rows: Some(64),
-                ..Default::default()
-            },
-        )
-        .unwrap();
-        assert!(result.boolean);
-        let mut todo = vec![&result.plan];
-        while let Some(p) = todo.pop() {
-            if p.operator == "Values" {
-                assert_eq!(
-                    p.actual_rows, -1,
-                    "the eager10,000-row VALUES must stay skipped"
-                );
+        let mut failures = Vec::new();
+        for (size, rows, produced) in [
+            (65, Some(64), None),
+            (100, Some(64), None),
+            (10_000, Some(64), None),
+            (100, None, Some(300)),
+            (10_000, None, None),
+        ] {
+            let values = (0..size)
+                .map(|i| i.to_string())
+                .collect::<Vec<_>>()
+                .join(" ");
+            let text = format!(
+                "ASK {{ {{ ?s <urn:first> ?v FILTER(?v != ?s) }} UNION {{ VALUES ?x {{ {values} }} }} }}"
+            );
+            let result = query(
+                store.snapshot(),
+                &text,
+                &QueryOptions {
+                    no_cache: true,
+                    max_rows: rows,
+                    max_rows_produced: produced,
+                    ..Default::default()
+                },
+            );
+            let result = match result {
+                Ok(result) => result,
+                Err(error) => {
+                    failures.push((size, rows, produced, error));
+                    continue;
+                }
+            };
+            assert!(result.boolean);
+            let mut todo = vec![&result.plan];
+            while let Some(p) = todo.pop() {
+                if p.operator == "Values" {
+                    assert_eq!(
+                        p.actual_rows, -1,
+                        "the eager VALUES that cannot fit the budget must stay skipped"
+                    );
+                }
+                todo.extend(p.children.iter());
             }
-            todo.extend(p.children.iter());
         }
+        assert!(
+            failures.is_empty(),
+            "previously answering budget cases failed: {failures:?}"
+        );
     }
 
     #[test]
@@ -545,23 +616,25 @@ mod tests {
             )])
             .unwrap();
         let text = "ASK { { ?s <urn:first> ?v FILTER(?v != ?s) } UNION { { SELECT ?s WHERE { { VALUES ?s { <urn:one> } } UNION { ?s <urn:false> ?v FILTER(?v = ?s) } } } BIND(1 AS ?tag) } }";
-        let result = query(
-            store.snapshot(),
-            text,
-            &QueryOptions {
-                no_cache: true,
-                max_rows: Some(64),
-                ..Default::default()
-            },
-        )
-        .unwrap();
-        assert!(result.boolean);
-        let mut todo = vec![&result.plan];
-        while let Some(p) = todo.pop() {
-            if p.operator == "IndexScan" && p.description.contains("urn:false") {
-                assert_eq!(p.actual_rows, -1, "the nested false arm must stay skipped");
+        for rows in [None, Some(64)] {
+            let result = query(
+                store.snapshot(),
+                text,
+                &QueryOptions {
+                    no_cache: true,
+                    max_rows: rows,
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+            assert!(result.boolean);
+            let mut todo = vec![&result.plan];
+            while let Some(p) = todo.pop() {
+                if p.operator == "IndexScan" && p.description.contains("urn:false") {
+                    assert_eq!(p.actual_rows, -1, "the nested false arm must stay skipped");
+                }
+                todo.extend(p.children.iter());
             }
-            todo.extend(p.children.iter());
         }
     }
 
@@ -585,23 +658,25 @@ mod tests {
                 None,
             )])
             .unwrap();
-        let result = query(
-            store.snapshot(),
-            "ASK { { ?s <urn:wide> ?v } UNION { ?s <urn:small> ?v FILTER(?v = ?s) } }",
-            &QueryOptions {
-                no_cache: true,
-                max_rows: Some(64),
-                ..Default::default()
-            },
-        )
-        .unwrap();
-        assert!(result.boolean);
-        let mut todo = vec![&result.plan];
-        while let Some(p) = todo.pop() {
-            if p.operator == "IndexScan" && p.description.contains("urn:small") {
-                assert_eq!(p.actual_rows, -1, "the false operand must remain skipped");
+        for rows in [None, Some(64)] {
+            let result = query(
+                store.snapshot(),
+                "ASK { { ?s <urn:wide> ?v } UNION { ?s <urn:small> ?v FILTER(?v = ?s) } }",
+                &QueryOptions {
+                    no_cache: true,
+                    max_rows: rows,
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+            assert!(result.boolean);
+            let mut todo = vec![&result.plan];
+            while let Some(p) = todo.pop() {
+                if p.operator == "IndexScan" && p.description.contains("urn:small") {
+                    assert_eq!(p.actual_rows, -1, "the false operand must remain skipped");
+                }
+                todo.extend(p.children.iter());
             }
-            todo.extend(p.children.iter());
         }
     }
 
