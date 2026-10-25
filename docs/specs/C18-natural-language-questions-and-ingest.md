@@ -5380,11 +5380,12 @@ in `recall` and the brief.
 
 ### Shared memory workflows
 
-[Roadmap](../ROADMAP.md) item 81 is deferred and has no active implementation lane.
-[C17](C17-agent-memory.md#shared-memory-representation) owns the shared representation
-for agent memory and personal knowledge. This follow-up defines how ingestion, recall,
-review and maintenance will use that profile. It does not change the shipped phases or
-adopt new predicates now.
+[Roadmap](../ROADMAP.md) item 81 has a shared representation specified by
+[C25](C25-evidence-and-assessments.md), building on [C17](C17-agent-memory.md#shared-memory-representation).
+The profile is unimplemented. This follow-up defines how ingestion, recall, review and
+maintenance use it without changing the shipped phases. Current asserting writes stay
+asserting writes, while C25's additive proposal operation records claims without
+asserting their propositions.
 
 Ingestion must map human notes, documents and agent episodes to the same entity
 identities and declared vocabulary, while preserving each source, rendition, supporting
