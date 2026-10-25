@@ -1114,3 +1114,102 @@ test('explore-why-not', async ({ page, request }) => {
   await panel.scrollIntoViewIfNeeded();
   await shoot(page, 'explore-why-not');
 });
+
+// The support-removal workflow uses the same bounded API fixtures as its browser
+// regression. The capture keeps the repository's dark theme, scale and settle helper.
+test('reasoning-support-preview', async ({ page }) => {
+  const uri = (value: string) => ({ type: 'uri' as const, value });
+  const rdfType = uri('http://www.w3.org/1999/02/22-rdf-syntax-ns#type');
+  const cat = uri('urn:Cat');
+  const dog = uri('urn:Dog');
+  const focus = { type: 'bnode' as const, value: 'b0' };
+  const finding = {
+    check: 'disjoint-classes',
+    rule: 'cax-dw',
+    severity: 'inconsistency',
+    focus,
+    evidence: { classes: [cat, dog] },
+    basis: 'asserted',
+    message: 'The individual belongs to two disjoint classes.',
+    justification: {
+      facts: [
+        {
+          triple: [cat, uri('http://www.w3.org/2002/07/owl#disjointWith'), dog],
+          graph: 'default',
+          role: 'schema',
+        },
+        { triple: [focus, rdfType, cat], graph: 'default', role: 'assertion' },
+        { triple: [focus, rdfType, dog], graph: 'default', role: 'assertion' },
+      ],
+    },
+    justificationComplete: true,
+  };
+  await page.route(`**/$/reason/${DATASET}/diagnostics**`, (route) =>
+    route.fulfill({
+      json: {
+        diagnosticsFormat: 1,
+        dataset: DATASET,
+        commit: 7,
+        computedAt: '2026-10-25T00:00:00Z',
+        scope: { graph: 'default', inferences: { included: false }, closure: 'subclass' },
+        status: 'violations-found',
+        note: 'Checks selected consistency rules.',
+        checks: [
+          {
+            id: finding.check,
+            rules: ['cax-dw'],
+            severity: 'inconsistency',
+            status: 'violations',
+            findings: 1,
+            millis: 1,
+          },
+        ],
+        findings: [finding],
+      },
+    }),
+  );
+  const id = '9d0c41e2-0000-4000-8000-000000000000';
+  await page.route(`**/$/branches/${DATASET}`, (route) => {
+    if (route.request().method() !== 'POST') return route.fallback();
+    return route.fulfill({
+      status: 201,
+      json: { name: route.request().postDataJSON().name, id, head: 42 },
+    });
+  });
+  await page.route(/\/org(?:%40|@)support-[^/]+\/patch\?/, (route) =>
+    route.fulfill({
+      json: {
+        dryRun: true,
+        wouldCommit: true,
+        outcome: 'commit',
+        head: 42,
+        changes: { total: 1, limit: 1, truncated: false, quads: [] },
+        entailments: {
+          entailmentDiffFormat: 1,
+          from: { selector: 'before', commit: 42 },
+          to: { selector: 'after', commit: 43 },
+          added: 0,
+          removed: 1,
+          sample: { added: [], removed: [[uri('urn:alice'), rdfType, uri('urn:Employee')]] },
+          byPredicate: { [rdfType.value]: { added: 0, removed: 1 } },
+          byClass: { 'urn:Employee': { added: 0, removed: 1 } },
+          newFindings: [],
+          sampleTruncated: false,
+          findingsComplete: true,
+          warnings: [],
+        },
+      },
+    }),
+  );
+  await page.goto(`/ui/datasets/${DATASET}`);
+  await page.getByRole('checkbox', { name: 'Find minimal supports' }).check();
+  await page.getByRole('button', { name: 'Run checks', exact: true }).click();
+  await page.getByText('Minimal asserted supports', { exact: true }).first().click();
+  await page.getByRole('button', { name: 'Remove on a branch', exact: true }).nth(1).click();
+  const modal = page.getByRole('dialog', { name: 'Remove a support fact on a branch' });
+  await modal.getByRole('combobox', { name: 'Program', exact: true }).selectOption('owl-rl');
+  await modal.getByRole('button', { name: 'Create branch and preview' }).click();
+  await expect(modal).toContainText('1 changed quad');
+  await expect(modal).toContainText('1 removed');
+  await shoot(page, 'reasoning-support-preview');
+});
