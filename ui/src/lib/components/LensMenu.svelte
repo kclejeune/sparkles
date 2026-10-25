@@ -23,6 +23,7 @@
     short,
     keys = true,
     extra,
+    anchor,
   }: {
     lenses: Lenses;
     /** A short form of an IRI, for the property picker. */
@@ -31,6 +32,8 @@
     keys?: boolean;
     /** More controls for the panel, such as the validation lens's source. */
     extra?: Snippet;
+    /** Keep a wrapped graph toolbar above the menu, including its canvas controls. */
+    anchor?: HTMLElement;
   } = $props();
 
   let open = $state(false);
@@ -95,18 +98,28 @@
   const propsOf = (ch: Channel) =>
     ch === 'size' ? lenses.properties.filter((p) => p.numeric) : lenses.properties;
 
-  /** Where the panel opens: under the button, kept on screen. It is fixed, so no clipping box of the toolbar cuts it. */
-  let pos = $state({ top: 0, left: 0 });
+  /** Open below the whole toolbar when supplied, including when it wraps. */
+  let pos = $state({ top: 0, left: 0, room: 0 });
   const WIDTH = 560;
   function place() {
     const r = button?.getBoundingClientRect();
     if (!r) return;
     const w = Math.min(WIDTH, window.innerWidth - 32);
+    const top = Math.max(8, (anchor?.getBoundingClientRect().bottom ?? r.bottom) + 6);
     pos = {
-      top: Math.round(r.bottom + 6),
+      top: Math.round(top),
       left: Math.round(Math.max(16, Math.min(r.right - w, window.innerWidth - w - 16))),
+      room: Math.max(0, window.innerHeight - top),
     };
   }
+
+  $effect(() => {
+    const host = anchor;
+    if (!open || !host) return;
+    const observer = new ResizeObserver(place);
+    observer.observe(host);
+    return () => observer.disconnect();
+  });
 
   async function show() {
     place();
@@ -161,10 +174,12 @@
     document.addEventListener('keydown', onKey);
     document.addEventListener('mousedown', onDown);
     window.addEventListener('resize', onResize);
+    window.addEventListener('scroll', onResize, true);
     return () => {
       document.removeEventListener('keydown', onKey);
       document.removeEventListener('mousedown', onDown);
       window.removeEventListener('resize', onResize);
+      window.removeEventListener('scroll', onResize, true);
     };
   });
 </script>
@@ -193,6 +208,7 @@
       tabindex="-1"
       style:--top={`${pos.top}px`}
       style:--left={`${pos.left}px`}
+      style:--room={`${pos.room}px`}
       onkeydown={(e) => {
         if (e.key === 'Escape') {
           e.stopPropagation();
@@ -402,6 +418,8 @@
     top: var(--top);
     z-index: 30;
     width: min(560px, calc(100vw - 32px));
+    max-height: max(0px, calc(var(--room) - 16px));
+    overflow-y: auto;
     background: var(--surface);
     border: 1px solid var(--border);
     border-radius: var(--r-lg);
@@ -512,7 +530,7 @@
       bottom: 0;
       top: auto;
       width: auto;
-      max-height: 75vh;
+      max-height: min(75vh, var(--room));
       overflow-y: auto;
       border-radius: var(--r-lg) var(--r-lg) 0 0;
       padding: 12px 16px calc(12px + env(safe-area-inset-bottom));

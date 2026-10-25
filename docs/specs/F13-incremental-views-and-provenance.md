@@ -861,5 +861,11 @@ of F16's derived-fact layer if F16 chooses it.
 - PUT starts a `view-build` task that waits for the first evaluation on the worker,
   rather than running the evaluation in the task.
 
-**Measurements.** See [BENCHMARKS](../BENCHMARKS.md#incremental-views). The harness for
-views on inferred data is in place, and item 265 tracks its forge run.
+**Measurements.** See [BENCHMARKS](../BENCHMARKS.md#incremental-views). Three pinned forge
+runs at 200,000 and 1,000,000 people put touching rounds near one query evaluation, with
+median per-run ratios from 0.93 to 1.07. Unrelated commits skipped the view in at most
+0.053 ms in the published medians. The materialized class-count view skipped 166 of its
+200 measured commits. A matched persistent commit-path comparison remained inconclusive
+after SSD trimming, with unsubscribed round medians varying from about 0.27 to 1.61 ms
+within a build and the comparison reversing across interleaved groups. Item 265 now
+tracks profiling that variation and obtaining a stable comparison.

@@ -455,6 +455,45 @@ struct Checker<'a> {
     wal: Option<WalInfo>,
 }
 
+#[cfg(test)]
+mod text_probe_tests {
+    use super::*;
+
+    #[test]
+    fn a_changing_text_index_requests_reinspection() {
+        let mut checker = Checker {
+            root: Path::new("/unused"),
+            full: true,
+            checks: Vec::new(),
+            current: None,
+            dataset_id: None,
+            base: None,
+            origin: None,
+            meta: None,
+            vocab_len: None,
+            dvocab_len: None,
+            wal: None,
+        };
+        checker.text(crate::text::TextProbe {
+            configured: true,
+            index_dir: true,
+            changed: true,
+            damaged: vec![("old.idx".into(), "missing".into())],
+            ..Default::default()
+        });
+        assert_eq!(checker.checks.len(), 1);
+        let check = &checker.checks[0];
+        assert_eq!(check.status, Status::Warning);
+        assert_eq!(check.errors, 0);
+        assert!(
+            check
+                .issues
+                .iter()
+                .any(|i| i.message.contains("run check again"))
+        );
+    }
+}
+
 /// What the WAL holds, as replay would see it.
 struct WalInfo {
     /// the last commit replay would keep
@@ -2027,6 +2066,14 @@ impl Checker<'_> {
         if !p.index_dir {
             run.add(Issue::warning("the index is missing: rebuilt on open").file("text"));
             self.checks.push(run.done("no index"));
+            return;
+        }
+        if p.changed {
+            run.add(
+                Issue::warning("the index changed during inspection: run check again")
+                    .file("text/meta.json"),
+            );
+            self.checks.push(run.done("index changed during check"));
             return;
         }
         if let Some(e) = p.open_error {

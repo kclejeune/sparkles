@@ -2017,6 +2017,10 @@ that queries would read wrongly. Warnings are states that open handles by itself
 server that writes during the check can cause transient warnings, because an in-flight
 transaction looks like a torn tail, but never errors.
 
+If full-text commits or merges keep replacing files during inspection, the text check
+warns that the index changed and asks for another run. It inspects up to three metadata
+snapshots before issuing that warning.
+
 `--quick` reads metadata only. It reads block metadata instead of every block, the first
 key of each vocabulary block, and whether segment files exist instead of their
 checksums. On the 10.5M-quad benchmark database, a full check takes about 0.3 s and a
@@ -2913,6 +2917,9 @@ worker and drawn with WebGL, so it settles while the page stays responsive. The 
 box stays at the top: a resource found there, or an IRI pasted into it, opens the
 resource graph as before.
 
+Resource captions prefer RDF labels. Without a label, the graph and details use the
+dataset's prefixes to shorten the IRI and update when those prefixes finish loading.
+
 A click or a tap on a class opens it in place. A class of at most 5,000 instances opens
 into its members with their links. A larger class opens into the communities that a
 graph algorithm run wrote back ([Graph algorithms](#graph-algorithms)), when its
@@ -3235,6 +3242,9 @@ A lens changes how the graph draws its nodes and edges from data about them. The
 graph in Explore and the query page's graph view have a **Lenses** menu in their toolbar
 (shortcut `Shift+L`) with one row per channel, and each channel has at most one lens on at
 a time.
+
+Explore keeps **Fit to view** and **Re-run layout** in the graph toolbar. The lens menu
+opens below the toolbar, and its phone sheet scrolls within the space below those controls.
 
 * **Size** draws a node's area in five steps of the drawn values, so that one outlier does
   not flatten the rest. It offers the degree in the drawn graph, the degree in the dataset

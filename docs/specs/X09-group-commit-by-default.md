@@ -1502,12 +1502,16 @@ repetition to run without the lock and to clear the marker when nothing races it
 `steady_publication_cannot_starve_the_background_checkpoint` races every unlocked pass and
 every repetition with a publication, and requires the fourth tick to end in one pass that
 holds live and clears the marker, and the count to start again when a merge's write races
-that pass. The background crash fixture
-of `tests/power_loss.rs` runs a reader that searches throughout, so its commits race the
-unlocked passes. It stops the index's segment merges, which write without the lock and
-could race every locked pass, and its writers go on past their commits until a locked pass
-has cleared the marker, so every recorded run contains such a removal. It then replays the
-crash images against the receipts and the recovered text.
+that pass. The background crash fixture in `tests/power_loss.rs` makes 200 concurrent
+commits while a reader searches. Its synchronization handshake requires a fresh transaction
+to publish during a successful text-file synchronization. It then stops the reader and
+drives four raced ticks, with a new acknowledged transaction committed and searched during
+each unlocked and catch-up pass. Those searches drain Tantivy's queued indexing work,
+which can otherwise race a locked pass even when segment merges are disabled. The fourth
+tick must finish with a locked pass that clears the marker. This phase adds nine commits
+instead of extending the concurrent workload until a locked pass happens to clear. The
+fixture replays the crash images against the receipts and recovered text, including an
+image taken immediately after the forced locked pass.
 
 This change removes the background file-synchronization wait from the live writer
 lock. Tantivy publication can still occur inside a group leader's fence, and WAL

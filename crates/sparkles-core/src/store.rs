@@ -3659,14 +3659,24 @@ impl Store {
         }
     }
 
-    /// Test hook: drive a due full-text background checkpoint through its actual
-    /// unlocked I/O path, returning whether it attempted directory synchronization.
+    /// Test hook: drive a due full-text background checkpoint even with its timer
+    /// paused, returning whether it attempted directory synchronization.
     #[cfg(all(feature = "text", feature = "failpoints"))]
     #[doc(hidden)]
     pub fn checkpoint_text_background_for_test(&self) -> bool {
         self.text
             .load_full()
             .is_some_and(|ti| ti.checkpoint_background_for_test())
+    }
+
+    /// Test hook: run after the snapshot of each unlocked background checkpoint,
+    /// before its I/O. Pause the timer and use one explicit checkpoint driver first.
+    #[cfg(all(feature = "text", feature = "failpoints"))]
+    #[doc(hidden)]
+    pub fn set_text_checkpoint_hook_for_test(&self, hook: Option<Arc<dyn Fn() + Send + Sync>>) {
+        if let Some(ti) = self.text.load_full() {
+            ti.set_checkpoint_hook_for_test(hook);
+        }
     }
 
     /// Test hook: stop the full-text index's segment merges.

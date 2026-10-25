@@ -361,6 +361,26 @@ test('Clear during the label lookup leaves nothing drawn', async ({ page }) => {
   expect((await drawn(page)).nodes.map(([l]) => l)).not.toContain('Lyon');
 });
 
+for (const width of [1280, 390]) {
+  test(`at ${width} px a path drawn from the overview keeps the canvas controls`, async ({
+    page,
+  }) => {
+    await page.setViewportSize({ width, height: 844 });
+    await page.goto('/ui/explore?ds=paths9');
+    await expect(page.getByPlaceholder('Find a resource in paths9 by label or IRI')).toBeEnabled();
+    await page.keyboard.press('Shift+P');
+    await expect(panel(page)).toBeVisible();
+    await choose(page, 'From', 'Alice', /Alice/);
+    await choose(page, 'To', 'Lyon', /Lyon/);
+    await panel(page).getByRole('button', { name: 'Find paths' }).click();
+    await expect.poll(() => edgeLabels(page)).toContain('worksFor · 1');
+    await page.getByRole('button', { name: 'Fit to view', exact: true }).click({ timeout: 5000 });
+    await page.getByRole('button', { name: 'Re-run layout', exact: true }).click();
+    await expect.poll(() => edgeLabels(page)).toContain('worksFor · 1');
+    await expectNoSidewaysScroll(page, 'Paths drawn from the Explore overview');
+  });
+}
+
 test('switching datasets clears the paths', async ({ page }) => {
   await openAlice(page);
   await page.keyboard.press('Shift+P');
