@@ -7,7 +7,7 @@
 //! straight off the key are compiled; ids that are not stored terms (inline numbers and
 //! dates, blank nodes, unbound) are left to the general evaluator.
 
-use super::expr::{Expr, Func, compile_regex, lang_matches_bytes};
+use super::expr::{CmpOp, Expr, Func, compile_regex, lang_matches_bytes};
 use super::table::VarId;
 use super::value::Value;
 use crate::id::KEY_SEP;
@@ -25,6 +25,8 @@ enum Arg {
 
 #[derive(Clone)]
 enum Test {
+    /// A string length compared with an integer constant.
+    Length { arg: Arg, op: CmpOp, bound: i64 },
     /// `CONTAINS` / `STRSTARTS` / `STRENDS` with a constant second argument
     Str {
         f: Function,
@@ -47,6 +49,33 @@ enum Test {
     },
     /// `LANGMATCHES(LANG(?v), "range")`
     LangMatches(Arc<str>),
+}
+
+fn length_test(e: &Expr, v: VarId) -> Option<Test> {
+    let Expr::Cmp(a, b, op) = e else { return None };
+    let (length, constant, op) = match (&**a, &**b) {
+        (Expr::Call(Func::Builtin(Function::StrLen), args), Expr::Lit(_, Value::Integer(n))) => {
+            (args, *n, *op)
+        }
+        (Expr::Lit(_, Value::Integer(n)), Expr::Call(Func::Builtin(Function::StrLen), args)) => {
+            let reverse = match op {
+                CmpOp::Lt => CmpOp::Gt,
+                CmpOp::Le => CmpOp::Ge,
+                CmpOp::Gt => CmpOp::Lt,
+                CmpOp::Ge => CmpOp::Le,
+            };
+            (args, *n, reverse)
+        }
+        _ => return None,
+    };
+    let [arg] = length.as_slice() else {
+        return None;
+    };
+    Some(Test::Length {
+        arg: Arg::of(arg, v)?,
+        op,
+        bound: i64::from(constant),
+    })
 }
 
 /// A conjunction of key tests over one variable.
@@ -178,6 +207,9 @@ impl KeyFilter {
     /// Include the finder/prefix copies of every possible 4,096-ID work item.
     pub(super) fn cursor_scratch_bytes(exprs: &[Expr], v: VarId, rows: usize) -> Option<u64> {
         fn bytes(e: &Expr, v: VarId) -> Option<u64> {
+            if length_test(e, v).is_some() {
+                return Some(128);
+            }
             if let Expr::And(a, b) = e {
                 return Some(bytes(a, v)?.saturating_add(bytes(b, v)?));
             }
@@ -229,6 +261,10 @@ impl KeyFilter {
             v: VarId,
             out: &mut Vec<Test>,
         ) -> Option<()> {
+            if let Some(test) = length_test(e, v) {
+                out.push(test);
+                return Some(());
+            }
             let Expr::Call(Func::Builtin(f), args) = e else {
                 // an error in either side of `&&` makes the filter false, as does `false`
                 if let Expr::And(a, b) = e {
@@ -331,6 +367,22 @@ impl KeyFilter {
         // UTF-8 is self-synchronizing: a byte match of a UTF-8 needle in a UTF-8 string
         // is a match of the strings
         self.0.iter().all(|t| match t {
+            Test::Length { arg, op, bound } => arg
+                .read(&key)
+                .and_then(|(s, _)| std::str::from_utf8(s).ok())
+                .is_some_and(|s| {
+                    let n = s.chars().count() as u64;
+                    if *bound < 0 {
+                        return matches!(op, CmpOp::Gt | CmpOp::Ge);
+                    }
+                    let bound = *bound as u64;
+                    match op {
+                        CmpOp::Lt => n < bound,
+                        CmpOp::Le => n <= bound,
+                        CmpOp::Gt => n > bound,
+                        CmpOp::Ge => n >= bound,
+                    }
+                }),
             Test::Str {
                 f,
                 arg,
@@ -413,6 +465,77 @@ mod tests {
     }
     fn key(t: Term) -> Vec<u8> {
         term_key(&t)
+    }
+
+    #[test]
+    fn length_comparisons_count_characters_and_preserve_argument_types() {
+        let terms: Vec<Term> = vec![
+            Literal::new_simple_literal("").into(),
+            Literal::new_simple_literal("ascii").into(),
+            Literal::new_simple_literal("é🙂").into(),
+            Literal::new_simple_literal("e\u{301}").into(),
+            Literal::new_language_tagged_literal_unchecked("é🙂", "fr").into(),
+            Literal::new_typed_literal("123", NamedNode::new_unchecked("http://example/dt")).into(),
+            Literal::new_typed_literal(
+                "123",
+                NamedNode::new_unchecked("http://www.w3.org/2001/XMLSchema#integer"),
+            )
+            .into(),
+            NamedNode::new_unchecked("urn:é🙂").into(),
+            oxrdf::BlankNode::new_unchecked("blank").into(),
+        ];
+        for stringified in [false, true] {
+            for bound in [-1, 0, 1, 2, 5, 10] {
+                for op in [CmpOp::Lt, CmpOp::Le, CmpOp::Gt, CmpOp::Ge] {
+                    for reversed in [false, true] {
+                        let arg = if stringified {
+                            call(Function::Str, vec![Expr::Var(0)])
+                        } else {
+                            Expr::Var(0)
+                        };
+                        let length = call(Function::StrLen, vec![arg]);
+                        let n = Expr::Lit(crate::id::Id::UNDEF, Value::Integer(bound.into()));
+                        let expr = if reversed {
+                            Expr::Cmp(Box::new(n), Box::new(length), op)
+                        } else {
+                            Expr::Cmp(Box::new(length), Box::new(n), op)
+                        };
+                        let filter = KeyFilter::new(std::slice::from_ref(&expr), 0).unwrap();
+                        assert!(KeyFilter::cursor_scratch_bytes(&[expr], 0, 4096).is_some());
+                        for term in &terms {
+                            let chars = match term {
+                                Term::Literal(l)
+                                    if stringified
+                                        || l.language().is_some()
+                                        || l.datatype().as_str()
+                                            == "http://www.w3.org/2001/XMLSchema#string" =>
+                                {
+                                    Some(l.value().chars().count() as i64)
+                                }
+                                Term::NamedNode(n) if stringified => {
+                                    Some(n.as_str().chars().count() as i64)
+                                }
+                                _ => None,
+                            };
+                            let expected = chars.is_some_and(|len| {
+                                let (a, b) = if reversed { (bound, len) } else { (len, bound) };
+                                match op {
+                                    CmpOp::Lt => a < b,
+                                    CmpOp::Le => a <= b,
+                                    CmpOp::Gt => a > b,
+                                    CmpOp::Ge => a >= b,
+                                }
+                            });
+                            assert_eq!(
+                                filter.test(&key(term.clone())),
+                                expected,
+                                "{term}, {op:?}, {bound}, reversed={reversed}, STR={stringified}"
+                            );
+                        }
+                    }
+                }
+            }
+        }
     }
 
     #[test]
