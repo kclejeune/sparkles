@@ -716,6 +716,110 @@ fn the_worker_follows_commits() {
     h.join().unwrap();
 }
 
+/// Closing must fence store acquisition as well as a round already evaluating.
+#[test]
+fn close_waits_for_worker_store_acquisition() {
+    let s = Arc::new(Store::in_memory(StoreOptions::default()));
+    let rt = runtime(&s, None);
+    let worker_store = s.clone();
+    let (entered_tx, entered) = std::sync::mpsc::channel();
+    let (release, release_rx) = std::sync::mpsc::channel();
+    let release_rx = parking_lot::Mutex::new(release_rx);
+    let worker = rt
+        .spawn_worker("acquire".into(), s.subscribe_commits(), move || {
+            entered_tx.send(()).unwrap();
+            release_rx
+                .lock()
+                .recv_timeout(Duration::from_secs(10))
+                .unwrap();
+            Some(worker_store.clone())
+        })
+        .unwrap();
+    entered.recv_timeout(Duration::from_secs(10)).unwrap();
+    let closer_rt = rt.clone();
+    let (closed_tx, closed) = std::sync::mpsc::channel();
+    let closer = std::thread::spawn(move || {
+        closer_rt.close(&s);
+        closed_tx.send(()).unwrap();
+    });
+    let early = closed.recv_timeout(Duration::from_millis(100));
+    release.send(()).unwrap();
+    closer.join().unwrap();
+    worker.join().unwrap();
+    assert!(
+        matches!(early, Err(std::sync::mpsc::RecvTimeoutError::Timeout)),
+        "close returned while the worker could still acquire the store"
+    );
+    assert!(rt.is_closed());
+}
+
+/// The store wrapper may close its runtime when the worker releases it.
+#[test]
+fn a_worker_store_destructor_can_close_its_runtime() {
+    struct ClosingStore {
+        store: Arc<Store>,
+        rt: Arc<Runtime>,
+    }
+    impl std::ops::Deref for ClosingStore {
+        type Target = Store;
+        fn deref(&self) -> &Store {
+            &self.store
+        }
+    }
+    impl Drop for ClosingStore {
+        fn drop(&mut self) {
+            self.rt.close(&self.store);
+        }
+    }
+    let s = Arc::new(Store::in_memory(StoreOptions::default()));
+    let rt = runtime(&s, None);
+    let worker_rt = rt.clone();
+    let worker = rt
+        .spawn_worker("close-self".into(), s.subscribe_commits(), move || {
+            Some(ClosingStore {
+                store: s.clone(),
+                rt: worker_rt.clone(),
+            })
+        })
+        .unwrap();
+    worker.join().unwrap();
+    assert!(rt.is_closed());
+}
+
+/// A host's deferred close must finish even when its callback then panics.
+#[test]
+fn a_panicking_round_finishes_its_deferred_close() {
+    struct ClosingHost {
+        rt: std::sync::Weak<Runtime>,
+        store: Arc<Store>,
+    }
+    impl Host for ClosingHost {
+        fn access(&self, _: Option<&str>) -> crate::Result<Option<Arc<GraphAccess>>> {
+            Ok(None)
+        }
+        fn stored_query(&self, _: &str) -> crate::Result<String> {
+            unreachable!()
+        }
+        fn inference(&self) -> Option<super::inference::Inference> {
+            self.rt.upgrade().unwrap().close(&self.store);
+            panic!("worker fault after requesting close");
+        }
+    }
+    let s = Arc::new(Store::in_memory(StoreOptions::default()));
+    let rt = runtime(&s, None);
+    rt.set_host(Arc::new(ClosingHost {
+        rt: Arc::downgrade(&rt),
+        store: s.clone(),
+    }));
+    let worker = rt
+        .spawn_worker("close-panic".into(), s.subscribe_commits(), move || {
+            Some(s.clone())
+        })
+        .unwrap();
+    assert!(worker.join().is_err());
+    assert!(rt.is_closed());
+}
+
 /// `SERVICE view:read` reads a view's rows inside a query, with its commit, and a
 /// query without views or naming an unknown column fails.
 #[test]

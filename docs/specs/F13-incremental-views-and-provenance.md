@@ -931,3 +931,35 @@ nonmonotone analyses retain that fallback.
 Recovery tests must cross input publication, durable job creation, partial circuit
 maintenance and guarded result publication, checking that a result cannot remain
 labelled current while an unexamined relevant input change is pending.
+
+### Dataset shutdown and directory ownership
+
+The final dataset handle synchronizes shutdown with worker acquisition and any round
+already in progress. A separate shared lifetime guard counts dataset handles without
+counting temporary worker or host references. Worker cleanup finishes before its store
+reference and worker gate are released.
+
+Synchronous host callbacks retain an owned close action until their enclosing runtime
+operations release their metadata locks. Operation guards nest across runtimes and drain
+those actions outside the thread-local borrow, including during panic unwind. Readers
+acquire no shared lifecycle lock. Host replacement also defers cleanup from the old
+host's destructor.
+
+Three causal regressions fail against the earlier implementations. One pauses a host
+while it holds a temporary third state reference. Another pauses worker acquisition
+before it obtains a store reference. The third releases the final handle from a
+synchronous inference callback while listing views under the registry lock.
+
+Thirteen regression tests cover those cases, cloned handles, concurrent final drops,
+worker and synchronous panic, worker store destruction and host replacement. A callback
+matrix exercises 15 synchronous operation and callback combinations. Nested operations
+cover both the same runtime and different runtimes. Operation tracking has no
+thread-local destructor. A subprocess regression keeps earlier store-access bookkeeping
+alive while a later thread-local owner's destructor lists views and releases the final
+handle, then checks that the store reopens.
+
+All 57 targeted incremental view tests pass. The GraphQL feature configuration passes
+all 776 tests. Twenty repetitions of all six HTTP group commit tests pass, including
+the persistent reopen assertion that exposed the directory lock race. The worker
+callback case that reopens through a retained state and the thread-local destruction
+case each pass 100 repetitions.
