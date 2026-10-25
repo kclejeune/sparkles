@@ -1309,3 +1309,36 @@ A separate direct check confirmed Sparkles' three fixed instances each of Explor
 q11 and q12 against the generated triples. BI q2 also passed a direct feature-intersection
 oracle. BI q3 and q8 and the full DBpedia births-by-decade disagreement still lack direct
 data-oracle checks. No minority engine's semantic error follows from a majority alone.
+
+### Small query costs in the integration screen
+
+The matching-compiler Namespace comparison of `a5847311` and `4f2e1633` returned the
+same answers for all 30 queries. Four A,B,B,A rounds at 100,000 generated people gave
+server and client geometric means of 0.970 and 0.956 for the later build over the earlier
+one. The first screen flagged `count-all`, `distinct-obj`, `employee-docs` and
+`exists-join`. Eight rounds with 20 warm-ups and 100 timed requests per process cleared
+them, with server ratios from 0.979 to 1.004 and client ratios from 0.991 to 1.003.
+These timings do not establish significance or a cost on Intel.
+
+The gate accepts the remaining small increases while roadmap item 328 tracks their
+Intel confirmation. This includes noise candidates and client-only variation. The
+ratios below use the longer rerun for its four queries and the initial screen otherwise.
+The existing items 299 and 306 remain open for their recorded comparisons.
+
+| Query | Server B/A | Client B/A |
+|---|---:|---:|
+| `class-predicate-list` | 1.003 | 0.942 |
+| `class-predicates` | 1.027 | 0.995 |
+| `contains` | 1.012 | 1.048 |
+| `distinct-join` | 1.042 | 1.057 |
+| `employee-docs` | 0.998 | 1.003 |
+| `exists-join` | 1.004 | 0.993 |
+| `expr-agg-arg` | 1.031 | 1.062 |
+| `expr-bind-group` | 1.030 | 1.022 |
+| `expr-order-key` | 1.007 | 0.975 |
+| `regex-iri` | 1.013 | 0.981 |
+
+The Intel check uses the same source revisions, compilers, data and query settings, with
+both engines run alone on the host. It checks the small queries that Namespace cannot
+resolve and profiles any repeated instruction or latency increase before choosing a fix.
+No row is removed merely because its increase is below the push gate.
