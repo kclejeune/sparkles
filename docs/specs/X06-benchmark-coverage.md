@@ -1497,8 +1497,10 @@ Automatic streaming of large groupings exposed a difference from eager expressio
 A computed BIND could evaluate the same stored temporal term again in every morsel,
 although eager execution evaluated the expression once per distinct input. The cursor
 now retains an optional map for pure expressions that read one variable. A bounded pilot
-requires observed repeated IDs, without inspecting query names, function names or data
-identifiers. Stored, delta, inline and query-local inputs use exact RDF term identity,
+requires substantial observed repetition, or a repeated ID together with unchanged
+snapshot predicate statistics indicating cross-batch reuse. It does not inspect query
+names, function names or data identifiers. A bounded 64-node walk supplies only an
+optional profitability hint. Estimates do not admit physical work or memory. Stored, delta, inline and query-local inputs use exact RDF term identity,
 including lexical form and datatype. Cached errors remain unbound BIND results.
 
 The map belongs to the query and its snapshot. It retains at most 65,536 entries and
@@ -1522,3 +1524,30 @@ These calls and effectful extension functions retain per-row evaluation in eager
 cursor execution. A regression checks 5,000 distinct UUID outputs for direct aliases
 and both dynamic call forms, with expression reuse enabled and disabled. Ordinary pure
 extension functions remain eligible for reuse.
+
+
+The first generic admission policy accepted any repeated pilot key. A matched forge
+pilot found that one duplicate among 65,536 cheap inputs slowed strings from 40.60 to
+47.26 ms and IRIs from 46.68 to 52.76 ms. The entirely distinct string control stayed
+at 40.47 and 40.55 ms. The corrected policy requires at least one quarter repeated
+pilot rows, or one observed repeat and a snapshot predicate-domain bound no larger
+than four fifths of the estimated input. Changed snapshots decline the metadata hint.
+Near-unique physical controls, bounded traversal and retained-snapshot controls cover
+this correction. The rejected admission policy is recorded in PERFORMANCE-EXPERIMENTS.
+
+
+The corrected source was measured against the matched pre-BIND source in a quiet forge
+A/B/B/A pilot with three warmups and ten complete HTTP JSON requests per process.
+The near-unique string control took 40.71 and 40.38 ms, and the IRI control took 46.88
+and 45.99 ms. Low-repeat strings at 262,144 rows took 165.00 and 164.72 ms. A quarter
+repeated input reduced strings from 40.70 to 39.01 ms and IRIs from 44.72 to 40.95 ms.
+All answers and checksums agreed. These are internal source comparisons rather than
+replacement cross-engine table cells.
+
+The full-data births guard fell from 1,210.60 to 164.73 ms and retained all 171 groups.
+The 50M slice stayed at 50.48 and 50.26 ms with all 80 groups. The corrected optional
+admission forgoes the earlier 36.75 ms slice result because the pilot is sparse and the
+global domain bound does not establish the required profit estimate. An independent
+streamed RDF/calendar oracle verifies every slice group and count. The full guard checks
+unchanged answers against the retained runtime and does not independently classify the
+historical minority answer. Item 293 records conservative admission and later-skew costs.

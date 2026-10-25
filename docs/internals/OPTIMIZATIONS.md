@@ -213,7 +213,10 @@ Each of these can be switched off per query (`QueryOptions::optimizations`) or p
   per thread and reuses its match cache. The planner counts the cost of sorting an
   unsorted input column, so a single pattern under such a FILTER is read from the
   permutation sorted on the filtered variable. A cursor BIND can retain results across
-  batches after a bounded pilot finds repeated exact input IDs. The query owns the map,
+  batches when at least a quarter of a bounded pilot repeats exact input IDs. It also
+  admits a repeated pilot when unchanged-snapshot predicate statistics put the input
+  domain below four fifths of estimated rows. This optional profit hint walks at most
+  64 plan nodes and declines on changed snapshots or unknown operators. The query owns the map,
   including cached expression errors. It keeps at most 65,536 entries under the memory
   budget, charged conservatively at about 6 MiB, while dense inline integers retain their
   smaller 16,384-entry cap. A refused optional allocation or a full cache leaves uncached
