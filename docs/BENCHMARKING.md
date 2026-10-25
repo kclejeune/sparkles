@@ -403,6 +403,13 @@ from the process scope's `SERVER_MEM_MAX`.
 sample. The suites default to the ports from 28300, and the long write harness to the
 ports from 28400, below the ephemeral range.
 
+Fluree's SELECT response to a TSV request uses plain fields without RDF string quotes.
+Typed answer checks use JSON separately. Native endpoint times therefore include this
+serialization difference and must not be described as format-matched Fluree ratios.
+SPARQL TSV requires quoted string literals, as the
+[W3C format specification](https://www.w3.org/TR/sparql11-results-csv-tsv/#tsv-terms)
+defines. ASK requests use SPARQL JSON on every engine.
+
 #### Timeouts
 
 `MAX_TIME` is the longest a request may take, and each suite sets its own
