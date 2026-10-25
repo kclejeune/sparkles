@@ -296,8 +296,10 @@ Each of these can be switched off per query (`QueryOptions::optimizations`) or p
   enabled. The keys propose candidate pairs and the full FILTER still decides which
   pairs pass. An eager LIMIT bounds the larger input in growing prefixes. A large ASK
   instead reads both inputs alternately, starting with 64 rows, and stops at its first
-  matching pair. Hash joins below that ASK can probe a triple-pattern index to avoid
-  collecting a whole input before their first output. The alternating join can hold
+  matching pair. Hash joins below that ASK can probe a triple-pattern index when
+  conservative scan and key-multiplicity bounds fit the output and memory budgets.
+  This avoids collecting a whole input before their first output. Unproved expansion
+  and finite produced-row caps retain the original streaming hash join. The alternating join can hold
   prefixes of both inputs, which uses more memory than one hash-build input. It charges
   that storage before allocation and drops obsolete history once an input ends.
 * An eager ASK over a bounded pure UNION compares work before the first answer. An
