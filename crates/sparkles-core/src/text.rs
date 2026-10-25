@@ -1532,6 +1532,9 @@ mod imp {
         background_passes: [AtomicU64; 3],
         #[cfg(feature = "failpoints")]
         before_unlocked_checkpoint: Mutex<Option<Arc<dyn Fn() + Send + Sync>>>,
+        /// Drain timer work admitted before a crash test paused it.
+        #[cfg(feature = "failpoints")]
+        timer_tick: Mutex<()>,
         #[cfg(test)]
         before_install_checkpoint: Mutex<Option<Box<dyn FnOnce() + Send>>>,
         /// the quads of the commits since an online rebuild's snapshot, while one runs
@@ -2358,6 +2361,8 @@ mod imp {
             background_passes: Default::default(),
             #[cfg(feature = "failpoints")]
             before_unlocked_checkpoint: Mutex::new(None),
+            #[cfg(feature = "failpoints")]
+            timer_tick: Mutex::new(()),
             #[cfg(test)]
             before_install_checkpoint: Mutex::new(None),
             journal: Default::default(),
@@ -2639,6 +2644,13 @@ mod imp {
             &self,
             hook: Option<Arc<dyn Fn() + Send + Sync>>,
         ) {
+            // A tick that read the enabled flag before the pause must finish before
+            // publication can acquire live while holding a checkpoint's path lease.
+            let _timer_tick = self.inner.timer_tick.lock();
+            assert!(
+                !self.inner.ticks.load(Ordering::SeqCst),
+                "pause the timer first"
+            );
             *self.inner.before_unlocked_checkpoint.lock() = hook;
         }
 
@@ -3382,6 +3394,8 @@ mod imp {
         /// The tick: seal and settle what the last second staged, and checkpoint an
         /// index that has held unsynced commits for a second.
         fn tick(&self) -> bool {
+            #[cfg(feature = "failpoints")]
+            let _timer_tick = self.timer_tick.lock();
             self.ticks.load(Ordering::SeqCst) && self.tick_due()
         }
 
@@ -3816,6 +3830,51 @@ mod imp {
             let live = live_of(index, fields, &config, Some(dir.clone()), 0).unwrap();
             let inner = inner_of(Some(root.path()), config, live, 0);
             (root, inner, dir)
+        }
+
+        #[cfg(feature = "failpoints")]
+        #[test]
+        fn arming_checkpoint_publication_drains_an_admitted_timer_tick() {
+            use std::sync::mpsc;
+            let (_root, inner, dir) = checkpoint_fixture();
+            publish_checkpoint_document(&inner, 1).unwrap();
+            inner.live.lock().dirty_since = Some(Instant::now() - CHECKPOINT_AFTER);
+            let (entered_tx, entered_rx) = mpsc::channel();
+            let (release_tx, release_rx) = mpsc::channel();
+            dir.before_checkpoint_file_sync(move || {
+                entered_tx.send(()).unwrap();
+                release_rx.recv_timeout(Duration::from_secs(10)).unwrap();
+            });
+            let timer_inner = inner.clone();
+            let timer = std::thread::spawn(move || timer_inner.tick());
+            entered_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+            inner.ticks.store(false, Ordering::SeqCst);
+            let (started_tx, started_rx) = mpsc::channel();
+            let (armed_tx, armed_rx) = mpsc::channel();
+            let hook_inner = inner.clone();
+            let armer = std::thread::spawn(move || {
+                let index = TextIndex {
+                    inner: hook_inner,
+                    ticker: None,
+                };
+                started_tx.send(()).unwrap();
+                index.set_checkpoint_hook_for_test(Some(Arc::new(|| {})));
+                armed_tx.send(()).unwrap();
+                // Avoid close racing the assertions on the admitted checkpoint.
+                index.set_checkpoint_hook_for_test(None);
+            });
+            started_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+            let early = armed_rx.recv_timeout(Duration::from_millis(100));
+            // Always release and join owned threads before asserting the regression.
+            release_tx.send(()).unwrap();
+            assert!(timer.join().unwrap());
+            armer.join().unwrap();
+            assert!(
+                early.is_err(),
+                "publication was armed before the admitted timer drained"
+            );
+            armed_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+            assert!(!inner.tick(), "a later natural tick must remain paused");
         }
 
         fn publish_checkpoint_document(inner: &Arc<Inner>, seq: u64) -> Result<(u64, u64)> {

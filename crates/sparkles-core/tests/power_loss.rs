@@ -1355,6 +1355,11 @@ fn crash_images(name: &str, cfg: Config, text: bool, background: bool) {
             run.lines.iter().any(|line| line == "background-forced 8 1"),
             "{name}: the bounded phase did not race every unlocked pass and clear a locked pass"
         );
+        assert_eq!(
+            log.iter().filter(|rec| matches!(rec, Rec::Write { path, .. } if path.ends_with("/locked-cleared"))).count(),
+            1,
+            "{name}: the crash point immediately after locked marker removal must be recorded"
+        );
         assert!(
             run.lines
                 .iter()
@@ -1466,6 +1471,13 @@ fn crash_images(name: &str, cfg: Config, text: bool, background: bool) {
     );
     assert!(images > 0);
     assert!(!acked.is_empty(), "the writer acknowledged no commit");
+    if background {
+        assert_eq!(
+            acked.len(),
+            (cfg.threads * cfg.commits + 9) as usize,
+            "{name}: the bounded fixture workload changed"
+        );
+    }
     // The full-text index makes segment files and replaces its metadata by a rename,
     // and the images held checkpoints of the run's own commits, so the bound on the
     // checkpoint was checked against commits that a crash could lose.
