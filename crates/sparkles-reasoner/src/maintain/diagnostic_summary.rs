@@ -10,7 +10,9 @@ fn check(controls: &DiagnosticControls) -> anyhow::Result<()> {
 }
 
 fn fact_bytes(literal: &Literal, datatype: &NamedNode) -> usize {
-    192 + literal.to_string().len() * 2 + datatype.as_str().len() * 2
+    256 + literal.value().len() * 2
+        + literal.datatype().as_str().len() * 2
+        + datatype.as_str().len() * 2
 }
 
 /// Read actual materialized terms under a separate diagnostic memory share. Missing
@@ -34,21 +36,20 @@ pub fn literal_typings_controlled(
             .filter(|kept| kept.dataset_id == store.dataset_id() && kept.commit == commit)
     {
         let mut found = Vec::new();
+        let terms = &kept.closure.terms;
+        let predicate = Term::NamedNode(rdf::TYPE.into_owned());
         for triple in &kept.generalized {
             check(controls)?;
-            let terms = &kept.closure.terms;
-            if terms.kind(triple[0]) != crate::terms::Kind::Literal {
+            let (actual_predicate, _predicate_memory) =
+                terms.term_controlled(triple[1], &budget)?;
+            if actual_predicate.as_ref() != Some(&predicate) {
                 continue;
             }
-            let (Some(subject), Some(predicate), Some(object)) = (
-                terms.term(triple[0]),
-                terms.term(triple[1]),
-                terms.term(triple[2]),
-            ) else {
-                continue;
-            };
-            if let Some((literal, datatype)) =
-                LiteralTypings::violation(&subject, &predicate, &object)
+            let (subject, _subject_memory) = terms.term_controlled(triple[0], &budget)?;
+            let (object, _object_memory) = terms.term_controlled(triple[2], &budget)?;
+            if let (Some(subject), Some(object)) = (subject, object)
+                && let Some((literal, datatype)) =
+                    LiteralTypings::violation(&subject, &predicate, &object)
             {
                 budget.try_charge(fact_bytes(&literal, &datatype))?;
                 found.push((literal, datatype));
@@ -88,6 +89,14 @@ pub fn literal_typings_controlled(
                 budget.release(bytes);
             }
         } else if keys[1] == ty_key && keys[0].first() == Some(&b'"') {
+            let _scratch = Held::try_new(
+                &budget,
+                keys[0]
+                    .len()
+                    .saturating_add(keys[2].len())
+                    .saturating_mul(8)
+                    .saturating_add(512),
+            )?;
             let subject = sparkles_core::id::key_to_term(&keys[0]);
             let object = sparkles_core::id::key_to_term(&keys[2]);
             if let Some((literal, datatype)) =

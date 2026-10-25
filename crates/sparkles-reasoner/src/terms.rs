@@ -7,7 +7,7 @@
 //! and each segment of the table when it is first used, before they are allocated; and
 //! the regular expressions it compiled, at an estimate each.
 
-use crate::budget::{Budget, MemoryExceeded, table_bytes, table_grown};
+use crate::budget::{Budget, Held, MemoryExceeded, table_bytes, table_grown};
 use oxrdf::{BlankNode, Literal, NamedNode, Term};
 use rustc_hash::FxHashMap;
 use sparkles_core::id::{self, Id, Tag};
@@ -483,6 +483,56 @@ impl Terms {
             });
         }
         self.snap.term(i)
+    }
+
+    /// Decode a summary term only after reserving reconstruction and RDF heap space.
+    /// The returned holder covers the decoded term until the caller drops it.
+    pub fn term_controlled(
+        &self,
+        raw: u64,
+        budget: &Arc<Budget>,
+    ) -> Result<(Option<Term>, Held), MemoryExceeded> {
+        let id = Id(raw);
+        let mut decoded = Held::new(budget);
+        let mut decode = |key: &[u8]| -> Result<Term, MemoryExceeded> {
+            decoded.try_grow(key.len().saturating_mul(8).saturating_add(256))?;
+            Ok(id::key_to_term(key))
+        };
+        let term = match id.tag() {
+            Tag::Local => match self.table.get(id.payload()) {
+                Some(LocalTerm::Key(key)) => Some(decode(key)?),
+                Some(LocalTerm::RuleBNode(key)) => {
+                    decoded.try_grow(key.len().saturating_mul(8).saturating_add(256))?;
+                    self.term(raw)
+                }
+                _ => {
+                    decoded.try_grow(256)?;
+                    self.term(raw)
+                }
+            },
+            Tag::Vocab => {
+                let mut reconstruction = Held::new(budget);
+                self.snap
+                    .generation
+                    .vocab
+                    .get_with_checked(
+                        id.payload(),
+                        |capacity| reconstruction.try_set(capacity.saturating_mul(2)),
+                        decode,
+                    )?
+                    .transpose()?
+            }
+            Tag::Delta => self
+                .snap
+                .generation
+                .dvocab
+                .with(|vocab| vocab.get(id.payload()).map(&mut decode).transpose())?,
+            _ => {
+                decoded.try_grow(256)?;
+                self.term(raw)
+            }
+        };
+        Ok((term, decoded))
     }
 
     /// The vocabulary key of a term (`None` for a local blank node).

@@ -896,3 +896,52 @@ fn hypothesis_consistency_budget_is_unknown_and_cancellation_propagates() {
     .unwrap_err();
     assert!(matches!(error, sparkles::Error::Cancelled));
 }
+
+#[cfg(feature = "reasoning")]
+#[test]
+fn hypothesis_consistency_uses_the_verified_geometry_program() {
+    use sparkles::reasoning::analysis::AnalysisOptions;
+    use sparkles::reasoning::reasoner::explain::DemandInput;
+    use sparkles::reasoning::reasoner::whynot::{WhyNot, WhyNotOptions, why_not};
+    use sparkles::reasoning::reasoner::{Extras, Inputs, Profile, query::QueryReasoner};
+    let ds = Dataset::memory();
+    ds.load_str("@prefix ex: <http://ex.org/> . @prefix owl: <http://www.w3.org/2002/07/owl#> . ex:alice a ex:Cat . ex:Cat owl:disjointWith ex:Result .", RdfFormat::Turtle).unwrap();
+    let reasoner = QueryReasoner::new(Profile::Rules("@prefix ex: <http://ex.org/> . @prefix rdf: <http://www.w3.org/1999/02/22-rdf-syntax-ns#> . @prefix geo: <http://www.opengis.net/ont/geosparql#> . [use: (?f geo:hasDefaultGeometry ?g) -> (?f ex:target ?g), (?f rdf:type ex:Result)]".into()), &Extras { geo_default_geometry:true, ..Default::default() }, Inputs::default()).unwrap();
+    let snapshot = ds.store().snapshot();
+    let missing = [
+        ex("alice"),
+        Term::NamedNode(NamedNode::new_unchecked(
+            "http://www.opengis.net/ont/geosparql#hasGeometry",
+        )),
+        ex("shape"),
+    ];
+    let mut answer = why_not(
+        &DemandInput {
+            reasoner: &reasoner,
+            snap: snapshot.clone(),
+            readable: None,
+        },
+        &[ex("alice"), ex("target"), ex("shape")],
+        &WhyNotOptions {
+            max_missing: 1,
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    sparkles::reasoning::hypotheses::check_consistency(
+        &ds,
+        &snapshot,
+        &reasoner,
+        &AnalysisOptions::default(),
+        &mut answer,
+    )
+    .unwrap();
+    let WhyNot::NotEntailed { hypotheses, .. } = answer else {
+        panic!("expected a hypothesis")
+    };
+    let hypothesis = hypotheses
+        .iter()
+        .find(|hypothesis| hypothesis.missing == [missing.clone()])
+        .expect("the implicit default rule supplies a hasGeometry hypothesis");
+    assert_eq!(hypothesis.inconsistent, Some(true), "{hypotheses:?}");
+}

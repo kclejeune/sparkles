@@ -36,6 +36,18 @@ fn bounded(error: &Error) -> bool {
     )
 }
 
+fn copy_visible(
+    store: &crate::store::Store,
+    snapshot: &Arc<Snapshot>,
+    options: crate::store::StoreOptions,
+    control: &AnalysisControl,
+    include: impl FnMut(&[crate::id::Id; 4]) -> Result<bool>,
+) -> Result<crate::store::Store> {
+    store
+        .copy_view_to_memory(snapshot, options, &control.write_options(), include)
+        .map_err(|error| control.error(error))
+}
+
 /// Annotate new inconsistencies without publishing a hypothesis or altering its terms.
 /// Budget exhaustion leaves unchecked hypotheses unknown. Cancellation propagates.
 pub fn check_consistency(
@@ -101,9 +113,7 @@ pub fn check_consistency(
         .map(|limit| limit.saturating_sub(retained));
     let mut run = || -> Result<()> {
         let control = AnalysisControl::new(&options)?;
-        let mut extras = reasoner.extras().clone();
-        // Query-time reasoning explicitly leaves default geometry materialization out.
-        extras.geo_default_geometry = false;
+        let extras = reasoner.extras().clone();
         options.program = Some(AnalysisProgram {
             profile: reasoner.profile().clone(),
             extras,
@@ -118,12 +128,14 @@ pub fn check_consistency(
             service_cache_bytes: 0,
             ..Default::default()
         };
-        let base = Dataset::from_store(dataset.store().copy_view_to_memory(
+        let base = Dataset::from_store(copy_visible(
+            dataset.store(),
             &view,
             copy_options.clone(),
-            &control.write_options(),
+            &control,
             |quad| Ok(graphs.contains(&quad[3])),
         )?);
+
         let graph = loop {
             let graph = NamedNode::new_unchecked(format!(
                 "urn:x-sparkles:hypothesis:{}",
@@ -188,37 +200,42 @@ pub fn check_consistency(
             .all(|check| check_complete(&before.diagnostics, check));
         for hypothesis in hypotheses.iter_mut() {
             control.check()?;
-            let candidate = Dataset::from_store(base.store().copy_view_to_memory(
+            let candidate = Dataset::from_store(copy_visible(
+                base.store(),
                 &base_snapshot,
                 copy_options.clone(),
-                &control.write_options(),
+                &control,
                 |_| Ok(true),
             )?);
-            let mut transaction = candidate
-                .store()
-                .write_with(crate::commit::CommitKind::Update, control.write_options());
-            let placeholders: HashMap<_, _> = hypothesis
-                .placeholders
-                .iter()
-                .map(|label| {
-                    (
-                        label.clone(),
-                        Term::BlankNode(crate::store::bnode_for(transaction.new_bnode())),
-                    )
-                })
-                .collect();
-            let graph = transaction.intern(&graph.clone().into())?;
-            for triple in &hypothesis.missing {
-                let triple = triple.each_ref().map(|term| replace(term, &placeholders));
-                let ids = [
-                    transaction.intern(&triple[0])?,
-                    transaction.intern(&triple[1])?,
-                    transaction.intern(&triple[2])?,
-                    graph,
-                ];
-                transaction.insert(ids)?;
-            }
-            transaction.commit()?;
+            (|| -> Result<()> {
+                let mut transaction = candidate
+                    .store()
+                    .write_with(crate::commit::CommitKind::Update, control.write_options());
+                let placeholders: HashMap<_, _> = hypothesis
+                    .placeholders
+                    .iter()
+                    .map(|label| {
+                        (
+                            label.clone(),
+                            Term::BlankNode(crate::store::bnode_for(transaction.new_bnode())),
+                        )
+                    })
+                    .collect();
+                let graph = transaction.intern(&graph.clone().into())?;
+                for triple in &hypothesis.missing {
+                    let triple = triple.each_ref().map(|term| replace(term, &placeholders));
+                    let ids = [
+                        transaction.intern(&triple[0])?,
+                        transaction.intern(&triple[1])?,
+                        transaction.intern(&triple[2])?,
+                        graph,
+                    ];
+                    transaction.insert(ids)?;
+                }
+                transaction.commit()?;
+                Ok(())
+            })()
+            .map_err(|error| control.error(error))?;
             let after = analysis::analyze(
                 &candidate,
                 &candidate.store().snapshot(),
@@ -250,5 +267,51 @@ pub fn check_consistency(
     match run() {
         Err(error) if bounded(&error) => Ok(()),
         outcome => outcome,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    #[test]
+    fn private_copy_timeout_is_bounded_but_caller_cancel_propagates() {
+        let dataset = Dataset::memory();
+        dataset.update("INSERT DATA {<urn:s> <urn:p> 1}").unwrap();
+        let snapshot = dataset.store().snapshot();
+        let mut control = AnalysisControl::new(&AnalysisOptions::default()).unwrap();
+        control.deadline = Some(std::time::Instant::now());
+        control.cancel.store(true, Ordering::Relaxed);
+        let result = copy_visible(
+            dataset.store(),
+            &snapshot,
+            Default::default(),
+            &control,
+            |_| Ok(true),
+        );
+        let error = match result {
+            Err(error) => error,
+            Ok(_) => panic!("copy must stop"),
+        };
+        assert!(bounded(&error), "{error}");
+        let options = AnalysisOptions {
+            cancel: Some(Arc::new(AtomicBool::new(false))),
+            ..Default::default()
+        };
+        let control = AnalysisControl::new(&options).unwrap();
+        options.cancel.unwrap().store(true, Ordering::Relaxed);
+        control.cancel.store(true, Ordering::Relaxed);
+        let result = copy_visible(
+            dataset.store(),
+            &snapshot,
+            Default::default(),
+            &control,
+            |_| Ok(true),
+        );
+        let error = match result {
+            Err(error) => error,
+            Ok(_) => panic!("copy must stop"),
+        };
+        assert!(matches!(error, Error::Cancelled), "{error}");
     }
 }

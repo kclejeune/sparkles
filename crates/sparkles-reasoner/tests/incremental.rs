@@ -753,3 +753,37 @@ fn backward_search_reaches_an_explicit_proof_past_many_derived_rows() {
         rep.base_scans
     );
 }
+
+#[test]
+fn diagnostic_summary_admits_cached_literal_decode_before_allocation() {
+    use sparkles_reasoner::diagnostics::DiagnosticControls;
+    let s = Store::in_memory(StoreOptions::default());
+    s.load(&[Source::from_bytes(
+        format!("<urn:item> <urn:value> \"{}\" .", "z".repeat(1_000_000)).into_bytes(),
+        RdfFormat::Turtle,
+        None,
+    )])
+    .unwrap();
+    let cache = Cache::default();
+    let profile=Profile::Rules("[type: (?x <urn:value> ?value) -> (?value <http://www.w3.org/1999/02/22-rdf-syntax-ns#type> <http://www.w3.org/2001/XMLSchema#string>)]".into());
+    run(&s, &profile, None, Some(&cache));
+    let result = sparkles_reasoner::literal_typings_controlled(
+        &s,
+        s.snapshot().commit,
+        Some(&cache),
+        &DiagnosticControls {
+            max_memory: Some(1024),
+            ..Default::default()
+        },
+    );
+    let error = match result {
+        Err(error) => error,
+        Ok(_) => panic!("the cached decode must be admitted before allocating a megabyte literal"),
+    };
+    assert!(
+        error
+            .downcast_ref::<sparkles_reasoner::MemoryLimitExceeded>()
+            .is_some(),
+        "{error:#}"
+    );
+}
