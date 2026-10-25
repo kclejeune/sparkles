@@ -1404,3 +1404,19 @@ global domain bound does not establish the required profit estimate. An independ
 streamed RDF/calendar oracle verifies every slice group and count. The full guard checks
 unchanged answers against the retained runtime and does not independently classify the
 historical minority answer. Item 293 records conservative admission and later-skew costs.
+
+
+The complete corrected-source matrix covers 63 combinations of term kind, scale and
+reuse distribution, with matching generated checksums and exact build-pair answers.
+The two all-thread flags are retained in the assessment record. Eight-process pinned
+reruns with one Rayon thread clear their ten-percent flags. The small eager/date control
+retains about four percent or 0.11 ms of cost in the longer pinned run, tracked under293.
+Cold full-scale and Auto, Streaming and Eager answer checks pass. The paired50M QLever
+run retains the slice loss rather than declaring it closed. Exact COUNT literal datatypes
+differ between Sparkles' xsd:integer and QLever's xsd:int, while numeric values agree.
+
+The bounded write assessment finds no justified production write optimization. Sixteen
+processes retain durable acknowledgements, pass80000 churn state checks and offline
+checks, and expose the different completed reader work in mixed throughput comparisons.
+Direct synchronization and small absolute serial differences support deferring further
+work under290. No change to durability or crash-recovery behavior is inferred.
