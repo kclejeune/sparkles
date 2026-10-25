@@ -295,13 +295,17 @@ impl Tools<'_> {
             }
             out_mentions.push(mention);
         }
-        Ok(Outcome::Structured(json!({
+        let value = json!({
             "dataset": ds.name,
             "commit": r.snap.commit,
             "mentions": out_mentions,
             "search": { "text": text_used, "vector": vector_used },
             "prefixes": terms.used(),
-        })))
+        });
+        if a.evidence == Some(true) {
+            evidence_bytes(&value, self.cfg().max_bytes, &ctx)?;
+        }
+        Ok(Outcome::Structured(value))
     }
 
     /// The label predicates' language tags (from the schema report of the view when
@@ -317,12 +321,13 @@ impl Tools<'_> {
         ctx: &ErrorContext,
     ) -> Result<LinkSetup, ToolError> {
         let mut tags: BTreeSet<String> = BTreeSet::new();
-        let same_scope = self
-            .call
-            .principal
-            .view(&ds.name, crate::auth::Endpoint::Info)
-            .as_deref()
-            == r.opts.graphs.as_deref();
+        let same_scope = r.opts.rdfs.is_none()
+            && self
+                .call
+                .principal
+                .view(&ds.name, crate::auth::Endpoint::Info)
+                .as_deref()
+                == r.opts.graphs.as_deref();
         let mut languages_complete = same_scope;
         let mut label_forms_complete = same_scope;
         match self.view_report(ds, r, ctx)? {
@@ -728,6 +733,33 @@ impl Tools<'_> {
             })
             .collect())
     }
+}
+
+/// Bound structured evidence without allocating a second serialized response. MCP's
+/// mirrored text and protocol envelope are outside this structured-content budget.
+fn evidence_bytes(value: &Value, limit: usize, ctx: &ErrorContext) -> Result<(), ToolError> {
+    struct Limited {
+        remaining: usize,
+    }
+    impl std::io::Write for Limited {
+        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+            if bytes.len() > self.remaining {
+                return Err(std::io::Error::other("evidence result byte limit"));
+            }
+            self.remaining -= bytes.len();
+            Ok(bytes.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+    serde_json::to_writer(Limited { remaining: limit }, value).map_err(|_| {
+        ctx.engine(Error::BudgetExceeded(sparkles::error::Budget {
+            kind: sparkles::error::BudgetKind::ResultBytes,
+            limit: limit as u64,
+            requested: (limit as u64).saturating_add(1),
+        }))
+    })
 }
 
 /// The default label predicates: those of C11 §4.4, then `skos:altLabel`.

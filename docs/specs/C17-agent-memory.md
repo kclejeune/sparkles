@@ -1448,7 +1448,7 @@ bounded search lists before display truncation. It distinguishes the 50-candidat
 limit from the requested display limit. `exactStringLabelsComplete` is true only when
 the simple and language-tagged string lookup did not reach its cap and its language and
 literal-form inventory is exact for the same query view. Sampling, unsupported literal
-forms or a different Info view leaves that proof incomplete. `typeHintLookupComplete`
+forms, RDFS-on-read expansion or a different Info view leaves that proof incomplete. `typeHintLookupComplete`
 reports whether the existing per-graph subclass lookup reached its query limit. Neither
 flag establishes a complete normalized search, general entailment closure or user intent.
 `normalizedLabelsComplete` and `candidateUniverseComplete` remain false.
@@ -1463,7 +1463,9 @@ list. A global limit marks even a starved empty list incomplete. An empty comple
 means that no value in that defined query scope was found. Returned candidate values and
 counts use the same snapshot, reasoning selection, graphs and caller Query view. Info
 metadata can certify label scope only when that view agrees. No raw index-wide or
-hidden-candidate count is returned. The usual result-byte budget applies.
+hidden-candidate count is returned. Evidence-enabled calls refuse structured content over
+`--mcp-max-bytes` with `budget-result-bytes`. This bounds its compact JSON before the
+MCP adapter mirrors it as text and adds the protocol envelope.
 
 The richer evidence is information for contextual ranking and for deciding when another
 lookup is needed. It does not change `exact` or `ambiguous` advice, suppress clarification

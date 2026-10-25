@@ -1153,3 +1153,88 @@ fn link_evidence_counts_and_details_remain_in_the_query_view() {
     );
     assert_eq!(read(Principal::local()), full);
 }
+
+#[tokio::test(flavor = "multi_thread")]
+async fn link_evidence_review_bounds_unabridged_result_bytes() {
+    let alternative = "x".repeat(4096);
+    let ttl = format!(
+        r#"<urn:item> <http://www.w3.org/2000/01/rdf-schema#label> "Berlin"@en ; <http://www.w3.org/2004/02/skos/core#altLabel> "{alternative}" ."#
+    );
+    let cfg = McpConfig {
+        max_bytes: 1024,
+        ..Default::default()
+    };
+    let mut c = Client::start(server_with(&[("t", &[&ttl])], cfg));
+    let plain = c
+        .call("link_entities", json!({"mentions":[{"text":"Berlin"}]}))
+        .await;
+    assert_eq!(plain["isError"], false, "default behavior stays compatible");
+    let result = c
+        .call(
+            "link_entities",
+            json!({"mentions":[{"text":"Berlin"}],"evidence":true}),
+        )
+        .await;
+    assert_eq!(result["isError"], true, "{result}");
+    assert!(result.get("structuredContent").is_none());
+    assert_eq!(
+        result["_meta"]["io.github.kclejeune.sparkles/error"]["code"],
+        "budget-result-bytes"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn link_evidence_review_does_not_certify_rdfs_expanded_inventory() {
+    let server = server_with(
+        &[("t", &[r#"<urn:item> <urn:name> "Berlin"@de ."#])],
+        McpConfig::default(),
+    );
+    let ds = server.state.get("t").unwrap();
+    crate::rdfs::set(
+        &ds,
+        Some(crate::rdfs::NewSchema::Triples(vec![oxrdf::Triple::new(
+            oxrdf::NamedNode::new("urn:name").unwrap(),
+            oxrdf::NamedNode::new("http://www.w3.org/2000/01/rdf-schema#subPropertyOf").unwrap(),
+            oxrdf::NamedNode::new("http://www.w3.org/2000/01/rdf-schema#label").unwrap(),
+        )])),
+    )
+    .unwrap();
+    // MCP enables its query reasoning defaults when materialization is configured.
+    *ds.reasoning.write() = Some(sparkles::reasoning::ReasoningRecord {
+        profile: "rdfs".into(),
+        ..Default::default()
+    });
+    let mut c = Client::start(server);
+    let answer = c.text("sparql_query", json!({"query":r#"ASK { <urn:item> <http://www.w3.org/2000/01/rdf-schema#label> "Berlin"@de }"#})).await;
+    assert!(
+        answer.ends_with("true"),
+        "the query scope sees the inferred label: {answer}"
+    );
+    let result = c
+        .structured(
+            "link_entities",
+            json!({"mentions":[{"text":"Berlin"}],"evidence":true}),
+        )
+        .await;
+    assert_eq!(
+        result["mentions"][0]["candidates"]
+            .as_array()
+            .unwrap()
+            .len(),
+        0
+    );
+    assert_eq!(
+        result["mentions"][0]["evidence"]["exactStringLabelsComplete"], false,
+        "stored inventory is not the expanded query inventory: {result}"
+    );
+    let asserted = c
+        .structured(
+            "link_entities",
+            json!({"mentions":[{"text":"Berlin"}],"reasoning":false,"evidence":true}),
+        )
+        .await;
+    assert_eq!(
+        asserted["mentions"][0]["evidence"]["exactStringLabelsComplete"],
+        true
+    );
+}

@@ -1675,7 +1675,8 @@ validation of its latency and semantic effects. No paid provider was called.
 The optional version 1 evidence of C17 records the visible candidate pool and display
 bounds and exposes retained types and labels beyond the three display entries. It makes
 per-entity and global query truncation explicit. An exact-string lookup cannot claim
-complete scope from sampled language inventory or a different Info view. Normalized and
+complete scope from sampled language inventory, RDFS-on-read expansion or a different
+Info view. Normalized and
 vector search remain bounded, and the contract makes no complete-universe or unique
 intent claim. Ask continues to preserve every ambiguous clarification. Context-sensitive
 resolution and a fresh end-to-end model evaluation remain under item 263.
