@@ -2175,8 +2175,9 @@ because the queries take only a few milliseconds there. `colleagues-known` store
 state, so each change probes the indexes, and its pass is the slowest. The `labelled`
 view keeps its output rows, which is 115 MiB for 1M rows.
 
-The commit path was measured on a persistent store of 50,000 people with single-quad
-commits and the group commit off. Each figure is the median of 3,000 commits, in 3 rounds.
+The commit path was measured on a persistent store of 50,000 people with two-quad
+commits from one writer, using the default store options. Each figure is the median of
+3,000 commits, in 3 rounds.
 
 | Case | Commit median ms | Commit p99 ms |
 |---|---:|---:|
@@ -2207,8 +2208,38 @@ again with them, and item 221 tracks maintaining it incrementally. The test
 `inferred_pass_against_query` in the same file adds a small schema to the data and, for the
 materialized case, an inferred `rdf:type` per person. It then makes 100 commits that touch
 each view and 100 that do not, and compares the round after a touching commit with a
-one-off evaluation of the query. Its numbers are not published yet, and item 265 tracks
-running it and the commit path without views on forge.
+one-off evaluation of the query. The query column below is the median of 5 one-off
+evaluations with the same inference options and the cache off. Each figure is the median
+of three runs. The ratio column takes the median of each run's ratio separately, so it
+need not equal the quotient of the rounded time columns.
+
+| View | People | Query ms | Round median ms | Round p95 ms | Median round / query | Round after an unrelated commit ms |
+|---|---:|---:|---:|---:|---:|---:|
+| RDFS, COUNT by team over a superproperty | 200,000 | 18.4 | 17.2 | 17.5 | 0.93 | 0.031 |
+| RDFS, COUNT of a class reached by a domain | 200,000 | 6.0 | 6.1 | 6.2 | 1.01 | 0.041 |
+| Materialized, COUNT by team | 200,000 | 2.0 | 2.1 | 2.2 | 1.07 | 0.011 |
+| RDFS, COUNT by team over a superproperty | 1,000,000 | 215.4 | 195.6 | 209.3 | 0.93 | 0.044 |
+| RDFS, COUNT of a class reached by a domain | 1,000,000 | 40.5 | 40.8 | 41.0 | 1.00 | 0.053 |
+| Materialized, COUNT by team | 1,000,000 | 9.8 | 10.3 | 10.4 | 1.05 | 0.011 |
+
+These runs used a release build in the Nix development shell on forge, an Intel Core
+i5-13500, pinned to CPUs 0–11 with no other work on the host.
+
+A round after a touching commit costs about one evaluation of the query. A round after a
+commit outside the rewritten query's footprint skips the view and takes at most 0.053 ms
+in these medians. A view of the materialized class count ran on the 34 commits that changed
+the inferred graph and skipped the other 166. Its 95th percentile round took 3.8 ms at
+200,000 people and 12.6 ms at 1,000,000 people, against one-off queries of 3.8 ms and
+12.5 ms.
+
+The persistent commit-path comparison remains inconclusive. It used the same forge host,
+after SSD trimming, with matched release compilers and three A,B,B,A groups. Each process
+made three rounds of 3,000 two-quad commits without a subscription, then three with a live
+query subscribed. The medians of the unsubscribed rounds ranged from 0.272 to 1.611 ms
+on the reference build and from 0.274 to 1.604 ms on the build with inferred views. The
+ratio of group medians changed from 3.40 to 0.30 and 0.18 across the three groups, so the
+run does not isolate a cost of the inference change. Item 265 tracks profiling this
+latency variation and obtaining a stable comparison.
 
 ## Bindings
 

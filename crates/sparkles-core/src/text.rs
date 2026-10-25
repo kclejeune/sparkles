@@ -873,6 +873,8 @@ pub(crate) struct TextProbe {
     pub dirty: bool,
     /// the index could not be opened (or has another schema)
     pub open_error: Option<String>,
+    /// The committed files changed throughout the bounded inspection attempts.
+    pub changed: bool,
     pub payload: Option<ProbePayload>,
     pub payload_error: Option<String>,
     pub segments: usize,
@@ -1530,6 +1532,11 @@ mod imp {
         /// marker, and background passes of any kind that cleared it, for the crash tests
         #[cfg(feature = "failpoints")]
         background_passes: [AtomicU64; 3],
+        #[cfg(feature = "failpoints")]
+        before_unlocked_checkpoint: Mutex<Option<Arc<dyn Fn() + Send + Sync>>>,
+        /// Drain timer work admitted before a crash test paused it.
+        #[cfg(feature = "failpoints")]
+        timer_tick: Mutex<()>,
         #[cfg(test)]
         before_install_checkpoint: Mutex<Option<Box<dyn FnOnce() + Send>>>,
         /// the quads of the commits since an online rebuild's snapshot, while one runs
@@ -1735,6 +1742,14 @@ mod imp {
     /// `checksums`, matches its checksum). A server may commit and merge meanwhile, so
     /// damage is re-checked against a fresh `meta.json` before it is reported.
     pub(crate) fn probe(root: &Path, checksums: bool) -> super::TextProbe {
+        probe_with_snapshot(root, checksums, |_| {})
+    }
+
+    fn probe_with_snapshot(
+        root: &Path,
+        checksums: bool,
+        mut after_snapshot: impl FnMut(&tantivy::IndexMeta),
+    ) -> super::TextProbe {
         let mut p = super::TextProbe::default();
         let config = match read_config(root) {
             Ok(Some(c)) => c,
@@ -1789,6 +1804,7 @@ mod imp {
             p.docs = meta.segments.iter().map(|s| s.num_docs() as u64).sum();
             p.files = 0;
             p.damaged.clear();
+            after_snapshot(&meta);
             let d = index.directory();
             for m in &meta.segments {
                 for f in m.list_files() {
@@ -1802,16 +1818,39 @@ mod imp {
                     }
                 }
             }
-            if p.damaged.is_empty() || attempt == 2 {
+            if p.damaged.is_empty() {
                 break;
             }
             // damage is reported only against the latest committed state
             match index.load_metas() {
-                Ok(m) if m.opstamp != meta.opstamp => continue,
+                Ok(m) if metas_differ(&m, &meta) => {
+                    if attempt == 2 {
+                        p.changed = true;
+                        p.damaged.clear();
+                    } else {
+                        continue;
+                    }
+                }
+                Err(e) => {
+                    p.open_error = Some(e.to_string());
+                    break;
+                }
                 _ => break,
             }
         }
         p
+    }
+
+    /// Whether `meta.json` names another set of files than before. A merge replaces
+    /// segments and deletes their files, but keeps the opstamp, so the opstamp alone
+    /// does not show that a live index moved on.
+    fn metas_differ(a: &tantivy::IndexMeta, b: &tantivy::IndexMeta) -> bool {
+        a.opstamp != b.opstamp
+            || !a
+                .segments
+                .iter()
+                .map(|s| (s.id(), s.delete_opstamp()))
+                .eq(b.segments.iter().map(|s| (s.id(), s.delete_opstamp())))
     }
 
     /// How long the index may hold unsynced commits before a checkpoint, and the period
@@ -2354,6 +2393,10 @@ mod imp {
             after_checkpoint_io: Mutex::new(None),
             #[cfg(feature = "failpoints")]
             background_passes: Default::default(),
+            #[cfg(feature = "failpoints")]
+            before_unlocked_checkpoint: Mutex::new(None),
+            #[cfg(feature = "failpoints")]
+            timer_tick: Mutex::new(()),
             #[cfg(test)]
             before_install_checkpoint: Mutex::new(None),
             journal: Default::default(),
@@ -2614,7 +2657,7 @@ mod imp {
             self.inner.checkpoint()
         }
 
-        /// Drive the real background checkpoint without waiting for its timer. This
+        /// Drive the real background checkpoint even with its timer paused. This
         /// only ages existing dirty work; it does not stage or publish documents.
         #[cfg(feature = "failpoints")]
         pub(crate) fn checkpoint_background_for_test(&self) -> bool {
@@ -2624,11 +2667,29 @@ mod imp {
                     live.dirty_since = Some(Instant::now() - CHECKPOINT_AFTER);
                 }
             }
-            self.inner.tick()
+            self.inner.tick_due()
         }
 
-        /// Stop the live writer's segment merges, whose writes race a locked pass, so
-        /// that a crash test can count on such a pass clearing the marker.
+        /// Race the next unlocked checkpoint passes after their snapshots, without
+        /// holding live. The test must pause the timer and run only one checkpoint
+        /// driver, because its callback can acquire live while holding the path lease.
+        #[cfg(feature = "failpoints")]
+        pub(crate) fn set_checkpoint_hook_for_test(
+            &self,
+            hook: Option<Arc<dyn Fn() + Send + Sync>>,
+        ) {
+            // A tick that read the enabled flag before the pause must finish before
+            // publication can acquire live while holding a checkpoint's path lease.
+            let _timer_tick = self.inner.timer_tick.lock();
+            assert!(
+                !self.inner.ticks.load(Ordering::SeqCst),
+                "pause the timer first"
+            );
+            *self.inner.before_unlocked_checkpoint.lock() = hook;
+        }
+
+        /// Stop the live writer's segment merges. Queued indexing work can still race
+        /// a locked pass until the test commits it.
         #[cfg(feature = "failpoints")]
         pub(crate) fn stop_merges_for_test(&self) {
             if let Some(writer) = self.inner.live.lock().writer.as_ref() {
@@ -3367,7 +3428,15 @@ mod imp {
         /// The tick: seal and settle what the last second staged, and checkpoint an
         /// index that has held unsynced commits for a second.
         fn tick(&self) -> bool {
-            if !self.ticks.load(Ordering::SeqCst) || !self.healthy() {
+            #[cfg(feature = "failpoints")]
+            let _timer_tick = self.timer_tick.lock();
+            self.ticks.load(Ordering::SeqCst) && self.tick_due()
+        }
+
+        /// The due checkpoint body, also driven explicitly with the timer paused by
+        /// the crash fixture. Both drivers use the same pass and publication logic.
+        fn tick_due(&self) -> bool {
+            if !self.healthy() {
                 return false;
             }
             let mut live = self.live.lock();
@@ -3400,6 +3469,8 @@ mod imp {
             drop(live);
             // File syncing can wait for many journal commits. Publication needs live,
             // so keep only the pathname lease during this background I/O.
+            #[cfg(feature = "failpoints")]
+            let checkpoint = checkpoint.on_sync(self.before_unlocked_checkpoint.lock().clone());
             let io = Instant::now();
             let result = checkpoint.run();
             let io = io.elapsed();
@@ -3447,6 +3518,9 @@ mod imp {
                         let generation = live.commit_generation;
                         let checkpoint = dir.prepare_checkpoint();
                         drop(live);
+                        #[cfg(feature = "failpoints")]
+                        let checkpoint =
+                            checkpoint.on_sync(self.before_unlocked_checkpoint.lock().clone());
                         let io = Instant::now();
                         let result = checkpoint.run();
                         let io = io.elapsed();
@@ -3716,6 +3790,89 @@ mod imp {
     mod tests {
         use super::*;
 
+        fn probe_merge_fixture(segments: usize) -> (tempfile::TempDir, IndexWriter) {
+            let root = tempfile::tempdir().unwrap();
+            let config = TextConfig::default();
+            std::fs::write(
+                root.path().join("text.json"),
+                serde_json::to_vec(&config).unwrap(),
+            )
+            .unwrap();
+            let (index, fields) = new_index(Some(&root.path().join("text")), &config).unwrap();
+            let mut writer: IndexWriter = index.writer_with_num_threads(1, 15_000_000).unwrap();
+            writer.set_merge_policy(Box::new(tantivy::indexer::NoMergePolicy));
+            for seq in 1..=segments {
+                writer
+                    .add_document(tantivy::doc!(fields.text => "probe"))
+                    .unwrap();
+                let mut commit = writer.prepare_commit().unwrap();
+                commit.set_payload(&payload(&config, seq as u64, 0));
+                commit.commit().unwrap();
+            }
+            assert_eq!(index.load_metas().unwrap().segments.len(), segments);
+            (root, writer)
+        }
+
+        /// Replace the first two segments without changing the opstamp. The probe's
+        /// metadata belongs to a separately opened index, so it cannot pin these files.
+        fn merge_probed_segments(root: &Path, writer: &mut IndexWriter, meta: &tantivy::IndexMeta) {
+            let old = meta.segments[0]
+                .list_files()
+                .into_iter()
+                .find(|p| p.extension().is_some_and(|e| e == "idx"))
+                .unwrap();
+            let ids: Vec<_> = meta.segments[..2].iter().map(|s| s.id()).collect();
+            writer.merge(&ids).wait().unwrap();
+            writer.garbage_collect_files().wait().unwrap();
+            let after = Index::open_in_dir(root.join("text"))
+                .unwrap()
+                .load_metas()
+                .unwrap();
+            assert_eq!(after.opstamp, meta.opstamp, "a merge keeps the opstamp");
+            assert!(
+                !root.join("text").join(old).exists(),
+                "the old file must be gone"
+            );
+        }
+
+        #[test]
+        fn a_probe_retries_a_merge_that_keeps_the_opstamp() {
+            let (root, mut writer) = probe_merge_fixture(2);
+            let mut snapshots = 0;
+            let p = probe_with_snapshot(root.path(), true, |meta| {
+                snapshots += 1;
+                if snapshots == 1 {
+                    merge_probed_segments(root.path(), &mut writer, meta);
+                }
+            });
+            assert_eq!(snapshots, 2, "the probe must inspect the merged metadata");
+            assert!(!p.changed);
+            assert!(p.open_error.is_none(), "{p:?}");
+            assert!(p.damaged.is_empty(), "{p:?}");
+            assert_eq!(p.segments, 1);
+            assert_eq!(p.docs, 2);
+        }
+
+        #[test]
+        fn a_probe_never_reports_damage_from_superseded_metadata() {
+            let (root, mut writer) = probe_merge_fixture(4);
+            let mut snapshots = 0;
+            let p = probe_with_snapshot(root.path(), true, |meta| {
+                snapshots += 1;
+                merge_probed_segments(root.path(), &mut writer, meta);
+            });
+            assert_eq!(snapshots, 3, "inspection must stay bounded");
+            assert!(p.changed, "{p:?}");
+            assert!(p.damaged.is_empty(), "{p:?}");
+            // Once writes stop, the same probe checks the surviving segment normally.
+            let p = probe(root.path(), true);
+            assert!(!p.changed);
+            assert!(p.open_error.is_none(), "{p:?}");
+            assert!(p.damaged.is_empty(), "{p:?}");
+            assert_eq!(p.segments, 1);
+            assert_eq!(p.docs, 4);
+        }
+
         #[test]
         fn a_background_checkpoint_allows_text_publication() {
             use std::sync::mpsc;
@@ -3792,6 +3949,51 @@ mod imp {
             (root, inner, dir)
         }
 
+        #[cfg(feature = "failpoints")]
+        #[test]
+        fn arming_checkpoint_publication_drains_an_admitted_timer_tick() {
+            use std::sync::mpsc;
+            let (_root, inner, dir) = checkpoint_fixture();
+            publish_checkpoint_document(&inner, 1).unwrap();
+            inner.live.lock().dirty_since = Some(Instant::now() - CHECKPOINT_AFTER);
+            let (entered_tx, entered_rx) = mpsc::channel();
+            let (release_tx, release_rx) = mpsc::channel();
+            dir.before_checkpoint_file_sync(move || {
+                entered_tx.send(()).unwrap();
+                release_rx.recv_timeout(Duration::from_secs(10)).unwrap();
+            });
+            let timer_inner = inner.clone();
+            let timer = std::thread::spawn(move || timer_inner.tick());
+            entered_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+            inner.ticks.store(false, Ordering::SeqCst);
+            let (started_tx, started_rx) = mpsc::channel();
+            let (armed_tx, armed_rx) = mpsc::channel();
+            let hook_inner = inner.clone();
+            let armer = std::thread::spawn(move || {
+                let index = TextIndex {
+                    inner: hook_inner,
+                    ticker: None,
+                };
+                started_tx.send(()).unwrap();
+                index.set_checkpoint_hook_for_test(Some(Arc::new(|| {})));
+                armed_tx.send(()).unwrap();
+                // Avoid close racing the assertions on the admitted checkpoint.
+                index.set_checkpoint_hook_for_test(None);
+            });
+            started_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+            let early = armed_rx.recv_timeout(Duration::from_millis(100));
+            // Always release and join owned threads before asserting the regression.
+            release_tx.send(()).unwrap();
+            assert!(timer.join().unwrap());
+            armer.join().unwrap();
+            assert!(
+                early.is_err(),
+                "publication was armed before the admitted timer drained"
+            );
+            armed_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+            assert!(!inner.tick(), "a later natural tick must remain paused");
+        }
+
         fn publish_checkpoint_document(inner: &Arc<Inner>, seq: u64) -> Result<(u64, u64)> {
             let fields = inner.live.lock().shared.fields.clone();
             let mut document = TantivyDocument::default();
@@ -3825,6 +4027,47 @@ mod imp {
                     .expect("checkpoint completion latch expired");
             }));
             (entered_rx, release_tx)
+        }
+
+        #[cfg(feature = "failpoints")]
+        #[test]
+        fn a_late_timer_completion_is_drained_before_the_forced_baseline() {
+            use std::sync::mpsc;
+            let (_root, inner, dir) = checkpoint_fixture();
+            publish_checkpoint_document(&inner, 1).unwrap();
+            inner.live.lock().dirty_since = Some(Instant::now() - CHECKPOINT_AFTER);
+            let publishing = inner.clone();
+            dir.before_checkpoint_file_sync(move || {
+                publish_checkpoint_document(&publishing, 2).unwrap();
+            });
+            let (entered, release) = pause_checkpoint_completion(&inner);
+            let timer_inner = inner.clone();
+            let timer = std::thread::spawn(move || timer_inner.tick());
+            entered.recv_timeout(Duration::from_secs(5)).unwrap();
+            inner.ticks.store(false, Ordering::SeqCst);
+            let (started_tx, started_rx) = mpsc::channel();
+            let (baseline_tx, baseline_rx) = mpsc::channel();
+            let phase_inner = inner.clone();
+            let phase = std::thread::spawn(move || {
+                let index = TextIndex {
+                    inner: phase_inner,
+                    ticker: None,
+                };
+                started_tx.send(()).unwrap();
+                index.set_checkpoint_hook_for_test(None);
+                assert!(index.checkpoint_background_for_test());
+                baseline_tx.send(index.inner.live.lock().raced).unwrap();
+            });
+            started_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+            let early = baseline_rx.recv_timeout(Duration::from_millis(100));
+            release.send(()).unwrap();
+            assert!(timer.join().unwrap());
+            phase.join().unwrap();
+            assert!(
+                early.is_err(),
+                "the forced baseline overtook an old timer completion"
+            );
+            assert_eq!(baseline_rx.recv_timeout(Duration::from_secs(5)).unwrap(), 0);
         }
 
         #[test]

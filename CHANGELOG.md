@@ -4,6 +4,10 @@
 
 ### Changed
 
+The full-text integrity check retries segment replacements made by merges even when the
+commit stamp stays the same. If the index keeps changing throughout its three attempts,
+it requests another check instead of reporting missing files from superseded metadata.
+
 Eager results are now serialized into an 8 KiB buffer of the engine's own and written to
 the response in pieces of that size, where the serializers used to write a few bytes at a
 time through the response writer's checks. On forge the 300,191 rows of `optional-chain`

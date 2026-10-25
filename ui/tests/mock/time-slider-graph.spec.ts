@@ -151,19 +151,76 @@ test('A7: reduced motion starts no animation', async ({ page }) => {
   await expect(wrap).toHaveAttribute('data-animations', '0');
 });
 
-test('A7: a commit that cannot be read leaves the graph where it was', async ({ page }) => {
-  // the seeded history of the demo datasets has no readable states
-  await page.addInitScript(() => localStorage.setItem('sparkles.dataset', 'foaf'));
-  await page.goto('/ui/explore?ds=foaf&iri=http%3A%2F%2Fexample.org%2Fontology%23Contractor');
-  await expect.poll(async () => (await drawn(page)).nodes.length).toBeGreaterThan(0);
-  const before = await labels(page);
+test('A7: a commit that cannot be read leaves the graph where it was', async ({
+  page,
+  request,
+}) => {
+  // Backup tests replace foaf's history. This private fixture can only read its head.
+  const ds = 'pruned-graph';
+  const made = await request.post('/$/datasets', {
+    data: { dbName: ds, dbType: 'persistent', seedHistory: true },
+  });
+  expect(made.ok() || made.status() === 409).toBe(true);
+  const history = await request.get(`/$/commits/${ds}?limit=1`);
+  expect(history.ok()).toBe(true);
+  const head = (await history.json()).head as number;
+  const rows = await request.post(`/${ds}/sparql`, {
+    headers: { 'Content-Type': 'application/sparql-query' },
+    data: 'SELECT ?s WHERE { ?s <http://xmlns.com/foaf/0.1/knows> ?o } ORDER BY ?s LIMIT 1',
+  });
+  expect(rows.ok()).toBe(true);
+  const iri = (await rows.json()).results.bindings[0].s.value as string;
+  // The catalog was read just before pruning. Known-gone stops are skipped by the
+  // keyboard; a newly lost state must instead be refused by the real read endpoint.
+  await page.route(`**/$/commits/${ds}?*`, async (route) => {
+    const response = await route.fetch();
+    const catalog = await response.json();
+    await route.fulfill({
+      response,
+      json: {
+        ...catalog,
+        oldestReconstructable: head - 1,
+        reconstructable: [{ from: head - 1, to: head }],
+        commits: catalog.commits.map((commit: { seq: number }) => ({
+          ...commit,
+          reconstructable: commit.seq >= head - 1,
+        })),
+      },
+    });
+  });
+  await page.addInitScript((name) => localStorage.setItem('sparkles.dataset', name), ds);
+  await page.goto(`/ui/explore?ds=${ds}&iri=${encodeURIComponent(iri)}`);
+  await expect.poll(async () => (await drawn(page)).nodes.length).toBeGreaterThan(1);
+  // Caption fallbacks can change when prefixes arrive. Compare the nodes and edges.
+  const elements = () =>
+    page.locator('.wrap[data-graph]').evaluate((el) => {
+      type Graph = { elements(): { map(fn: (e: { id(): string }) => string): string[] } };
+      return (el as unknown as { __cy: Graph }).__cy
+        .elements()
+        .map((e) => e.id())
+        .sort();
+    });
+  const before = await elements();
   await page.getByRole('button', { name: 'Graph history' }).click();
   const handle = right(page, 'Graph history');
+  await expect(handle).toHaveAttribute('aria-valuenow', String(head));
+  const refused = page.waitForResponse((response) => {
+    const url = new URL(response.url());
+    return (
+      url.pathname === `/${ds}/sparql` &&
+      url.searchParams.get('at') === `commit:${head - 1}` &&
+      response.status() === 410
+    );
+  });
   await handle.focus();
   await page.keyboard.press('ArrowLeft');
+  await refused;
+  await expect(
+    page.getByText(`Commit ${head - 1} is no longer available`, { exact: true }).first(),
+  ).toBeVisible();
   // the handle came back, and the graph is the one it was
-  await expect(handle).toHaveAttribute('aria-valuenow', /^\d+$/);
-  expect(await labels(page)).toBe(before);
+  await expect(handle).toHaveAttribute('aria-valuenow', String(head));
+  expect(await elements()).toEqual(before);
 });
 
 async function schemaCell(page: Page, name: string, column: number) {

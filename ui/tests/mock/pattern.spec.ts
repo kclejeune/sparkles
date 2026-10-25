@@ -384,10 +384,14 @@ test('each editor tab keeps its own positions', async ({ page }) => {
   // move ?person in the first tab
   await c.focus();
   await expect(pane(page).getByTestId('pattern-focus')).toContainText('?person');
+  const firstStart = (await positions(c))['v:person'][0];
   for (let i = 0; i < 5; i++) await page.keyboard.press('Shift+ArrowRight');
-  await expect.poll(async () => (await positions(c))['v:person']?.[0]).toBeDefined();
+  await expect
+    .poll(async () => (await positions(c))['v:person']?.[0])
+    .toBeCloseTo(firstStart + 80, 0);
   const first = (await positions(c))['v:person'];
-  // the same query in a second tab, ?person moved the other way
+  // The two full layouts start from random positions. Move the second away from the
+  // first tab's saved position, so distinct pictures do not depend on those origins.
   await page.getByRole('button', { name: 'New query tab' }).click();
   // an empty tab draws an empty canvas first, so wait for the query's own layout to end
   await expect.poll(() => settled(canvas(page))).toBeGreaterThan(0);
@@ -399,7 +403,13 @@ test('each editor tab keeps its own positions', async ({ page }) => {
   await canvas(page).focus();
   // the keys move the focused node, so wait until the focus is on ?person
   await expect(pane(page).getByTestId('pattern-focus')).toContainText('?person');
-  for (let i = 0; i < 10; i++) await page.keyboard.press('Shift+ArrowLeft');
+  const secondStart = (await positions(canvas(page)))['v:person'][0];
+  const step = secondStart <= first[0] ? -16 : 16;
+  for (let i = 0; i < 10; i++)
+    await page.keyboard.press(step < 0 ? 'Shift+ArrowLeft' : 'Shift+ArrowRight');
+  await expect
+    .poll(async () => (await positions(canvas(page)))['v:person'][0])
+    .toBeCloseTo(secondStart + 10 * step, 0);
   await expect
     .poll(async () => Math.abs((await positions(canvas(page)))['v:person'][0] - first[0]))
     .toBeGreaterThan(100);
