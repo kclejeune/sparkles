@@ -7,7 +7,7 @@
 > UI assets and a zstd full-text doc store. The maintainer decided not to build Phase 2
 > (zstd index blocks, vocabulary and spill files). The bulk loader's spill files (U9)
 > were compressed later with LZ4 and the existing column encoding, without a codec
-> option. Phase 3's blobs shipped with [F05](F05-snapshot-repositories.md), compressed
+> option. Phase 3's blobs shipped with [F05](F05-snapshot-repositories/README.md), compressed
 > with LZ4 rather than zstd.
 >
 > **User docs:** [API: Compression](../API.md#compression) · [Features](../FEATURES.md#storage-and-indexes) · [Benchmarks: Compression](../BENCHMARKS.md#compression-105m-triples)
@@ -28,7 +28,7 @@ negotiates response compression through tower-http. This spec adds **zstd** and
 - outputs: dumps, backups, HTTP responses and UI assets;
 - the full-text doc store;
 - later, after measurement, storage formats: index blocks, the vocabulary and spill
-  files, and the blobs of snapshot repositories ([F05](F05-snapshot-repositories.md)).
+  files, and the blobs of snapshot repositories ([F05](F05-snapshot-repositories/README.md)).
 
 LZ4 stays where decode speed matters most, and gzip stays where compatibility matters.
 
@@ -269,7 +269,7 @@ Only measured numbers go into `docs/BENCHMARKS.md`.
   "Compression" section and the README's flags) and measurements 1–4.
 - **Phase 2, about 3 days, gated on measurement.** U7, U8 and U9 with measurements 5–6.
   The gate in §4 U7 decides the defaults.
-- **Phase 3.** U10, built together with [F05](F05-snapshot-repositories.md).
+- **Phase 3.** U10, built together with [F05](F05-snapshot-repositories/README.md).
 
 ## 8. Acceptance examples
 
@@ -338,6 +338,50 @@ Only measured numbers go into `docs/BENCHMARKS.md`.
   `io.rs` (`Source`, gzip), `store.rs` (`backup`, `dump_nquads`, `estimated_quads`),
   `http.rs` (the compression layer and spooling) and `text.rs`.
 
+## Provenance
+
+This record preserves design sources, licensing and adoption decisions at the
+stages recorded below. Delivery statements in the record are historical. Current
+capabilities and remaining work are described by the spec status and Outcome.
+
+- **Spec:** [`X01-compression-codecs.md`](X01-compression-codecs.md), written on
+  2026-09-30 independently as internal engineering. Its sources are:
+  - the codec formats' own specifications: RFC 8878 (zstd), RFC 7932 (Brotli), RFC 1952
+    (gzip) and the LZ4 frame format;
+  - RFC 9110 content codings;
+  - the docs of `zstd`, `ruzstd`, `brotli`, `flate2`, `lz4_flex`, tower-http 0.7,
+    rust-embed 8 and Tantivy 0.26;
+  - the Sparkles code.
+
+  It does not derive from any other database product.
+- **Implementation:** Phase 1, from the spec plus Sparkles code only (2026-09-30).
+  - **Dependencies:**
+    - `zstd` 0.14.0 (BSD-3-Clause), with `zstd-safe` 8.0.0, `zstd-sys`
+      2.1.0+zstd.1.5.7 (BSD-3-Clause) and the `zstdmt` feature. `zstd-sys` is a C build
+      of libzstd 1.5.7. The crate is behind the `zstd` feature of `sparkles`, which is
+      off in the library and on in the server. The spec's table says MIT/Apache-2.0, but
+      the crate's `Cargo.toml` says BSD-3-Clause. Version 0.13 was MIT.
+    - `brotli` 8.0.4 (BSD-3-Clause AND MIT), pure Rust, with `brotli-decompressor` 5.0.3
+      (BSD-3-Clause/MIT), `alloc-no-stdlib` 2.0.4 and `alloc-stdlib` 0.2.4
+      (BSD-3-Clause). It is behind the `brotli` feature, which is also off in the
+      library and on in the server.
+    - tower-http 0.7.1 (MIT) `decompression-full`, which adds `async-compression` 0.4.49
+      and `compression-codecs` 0.4.44 (MIT OR Apache-2.0) over the same codec crates.
+    - Tantivy's `zstd-compression` feature, which uses `zstd` 0.13.3 (MIT, `zstd-safe`
+      7.3.0) over the same `zstd-sys`.
+    - `http-body-util` 0.1.5 (MIT), new in the server. `flate2` 1.1.10 and `lz4_flex`
+      0.14.0 were already dependencies.
+    - The UI's precompression step (`ui/scripts/precompress.mjs`) uses Node's built-in
+      zlib only.
+  - **Not adopted:** `ruzstd` (MIT) and the `zstd-decode-pure` feature (spec §3).
+- **Skipped:** the maintainer skipped Phase 2, the storage codecs for index blocks,
+  vocabulary and spill files. The loader's spill files later got LZ4 encodings of their
+  own. Repository blobs shipped with F05 and use LZ4, and the zstd codec byte is reserved.
+- **Rejected** (spec §1 non-goals, since the spec has no rejected-alternatives section):
+  - compressing the WAL, `delta.vocab` or `commits.bin`;
+  - in-memory compressed caches;
+  - compressed network protocols other than HTTP `Content-Encoding`.
+
 ## Outcome
 
 **Delivered.** Phase 1 landed on 2026-09-30 (`2aef5f4`) and covers U1–U6 as specified:
@@ -387,7 +431,7 @@ and [bzip2 multi-stream API](https://docs.rs/bzip2/latest/bzip2/read/struct.Mult
 - The maintainer skipped Phase 2 (U7–U9), because its gate needs a prototype of zstd
   index blocks. LZ4 stays the block codec. The docs list zstd blocks and FSST as
   possible upgrades for disk-bound deployments.
-- U10 shipped with the backup repositories of [F05](F05-snapshot-repositories.md). Blob
+- U10 shipped with the backup repositories of [F05](F05-snapshot-repositories/README.md). Blob
   hashes cover the plaintext, as specified, but blobs are stored raw or compressed with
   LZ4. The zstd codec byte is reserved and never written.
 

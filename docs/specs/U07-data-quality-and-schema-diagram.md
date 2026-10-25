@@ -17,7 +17,7 @@ results), the ShEx 2.1 specification and the ShapeMap specification (result shap
 the UML 2.5 specification's notation for multiplicities, the Mermaid documentation of
 class diagrams (for the text export), and the Sparkles code and specs: write-time
 validation and its grandfather baseline ([C10](C10-write-time-validation.md)), ShEx
-([G02](G02-shex.md)), schema discovery, class profiles, the constraints layer and schema
+([G02](G02-shex/README.md)), schema discovery, class profiles, the constraints layer and schema
 diffs ([C02](C02-schema-discovery.md)), point-in-time reads and history
 ([F06](F06-snapshots-and-point-in-time.md)), branches ([F09](F09-branches-and-merges.md))
 and the time slider ([U01](U01-time-slider.md)).
@@ -493,6 +493,28 @@ The data is §7's dataset `q`.
    validation over a view lands, and with which shapes.
 2. Whether suggested fixes should be recorded as stored updates under roadmap item 39, so a
    team can reuse a fix across results.
+
+## Provenance
+
+This record preserves design sources, licensing and adoption decisions at the
+stages recorded below. Delivery statements in the record are historical. Current
+capabilities and remaining work are described by the spec status and Outcome.
+
+- **Spec:** [`U07-data-quality-and-schema-diagram.md`](U07-data-quality-and-schema-diagram.md), written on 2026-10-12 independently from:
+  - the W3C SHACL Recommendation (validation reports), ShEx 2.1 and the ShapeMap
+    specification;
+  - the UML 2.5 specification's multiplicity notation and the Mermaid documentation of
+    class diagrams;
+  - the Sparkles code (`WriteValidationPanel`, the write-time guard, class profiles) and
+    specs C02, C10, F06, F09, G02 and U01.
+- **Implementation:** not built. No new dependency is planned. The diagram uses
+  Cytoscape.js (MIT) and cytoscape-fcose (MIT), which the UI already ships, and the
+  timeline is drawn as SVG.
+- **Rejected** (spec §9):
+  - full reports stored per commit;
+  - validating every commit after the fact instead of recording;
+  - a separate diagram library with a layered layout;
+  - one figure mixing observed and declared multiplicities.
 
 ## Outcome
 

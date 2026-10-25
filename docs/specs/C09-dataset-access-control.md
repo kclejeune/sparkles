@@ -1500,7 +1500,7 @@ the whole dataset is visible:
 - **Search indexes.**
   - Full text: each dataset has one Tantivy index. Filtering after top-k returns too few
     rows, and BM25 IDF leaks term statistics of hidden graphs.
-    [F03](F03-full-text-search.md) rejected post-filtering, so the filter goes inside the
+    [F03](F03-full-text-search/README.md) rejected post-filtering, so the filter goes inside the
     collector, and scores still carry corpus-wide IDF.
   - Vector segments span graphs, so the filter must run before top-k.
 - **Inferences.** `urn:x-sparkles:inferred` is materialized from all graphs, so derived
@@ -2085,6 +2085,57 @@ These tests run against a real listener on 127.0.0.1, with `HOME` and
   Access): cited from working knowledge of each product's public documentation, to be
   verified when implementing.
 - No project planning notes other than the specs listed above were read.
+
+## Provenance
+
+This record preserves design sources, licensing and adoption decisions at the
+stages recorded below. Delivery statements in the record are historical. Current
+capabilities and remaining work are described by the spec status and Outcome.
+
+- **Spec:** [`C09-dataset-access-control.md`](C09-dataset-access-control.md), written on
+  2026-09-30 independently from:
+  - the Sparkles code;
+  - the maintainer's own nimbus project (CLI browser, loopback and device login flows),
+    read with the maintainer's permission;
+  - Apache Jena Fuseki's "Data Access Control" documentation (Apache-2.0);
+  - RFCs 9110, 7617, 6750, 6749, 7636 (PKCE), 8628 (device grant), 8252, 8414, 7519,
+    7517, 6265 and 3339; OpenID Connect Core, Discovery and RP-Initiated Logout 1.0;
+    W3C Solid WAC and the SPARQL 1.1 Protocol;
+  - the OWASP Password Storage, CSRF, Session Management and HTML5 Security cheat sheets;
+  - docs.rs pages for `argon2`, `openidconnect`, `axum-extra`, `axum` and `tower-http`,
+    and the public docs of oauth2-proxy, Authelia, Tailscale serve and Cloudflare Access
+    (header names only).
+- **Implementation:** from the spec plus Sparkles code only (2026-09-30), behind the
+  default-on `auth` feature of `sparkles-server`.
+  - **Dependencies:**
+    - `argon2` 0.6.0 (MIT OR Apache-2.0), with `password-hash` 0.6.1 and `blake2` 0.11.0
+      (MIT OR Apache-2.0), for password hashes;
+    - `jsonwebtoken` 11.1.0 (MIT), default features off, with the `aws_lc_rs` backend,
+      for OIDC ID-token signatures only. `aws-lc-rs` 1.18.1 (ISC AND (Apache-2.0 OR
+      ISC)) and `aws-lc-sys` 0.45.0 (ISC, Apache-2.0, MIT and BSD-3-Clause parts) were
+      already in the tree through rustls;
+    - `subtle` 2.6.1 (BSD-3-Clause), `zeroize` 1.9.0 (Apache-2.0 OR MIT), `getrandom`
+      0.3.4 (MIT OR Apache-2.0), `toml` 1.1.6 (MIT OR Apache-2.0), `rpassword` 7.5.4
+      (Apache-2.0), and `ipnet` 2.12.2 (MIT OR Apache-2.0, not optional);
+    - `sha2` and `reqwest` (already dependencies), and clap's `env` feature;
+    - tests only: `aws-lc-rs` 1 as a dev-dependency, to sign the mock OIDC provider's
+      tokens.
+  - **Not adopted:** `openidconnect` 4.0.1 (MIT) and `cookie`, which the spec named.
+    Our own code over `jsonwebtoken`, `reqwest` and `sha2` implements the OIDC relying
+    party (discovery, code flow with PKCE, claim checks), HMAC-SHA-256 and cookie
+    handling.
+- **Rejected** (spec §14):
+  - authentication only in the reverse proxy;
+  - a JS auth server (better-auth) or SvelteKit SSR for OIDC;
+  - tokens or passwords in browser storage;
+  - stateless signed session cookies, and a memory-only session store;
+  - argon2id for API tokens;
+  - self-contained JWT Sparkles tokens;
+  - the token in the loopback redirect URL;
+  - scope checks at mint time only;
+  - Shiro-style URL rules, or Solid WAC ACL documents;
+  - deny rules, and `403` for hidden datasets;
+  - trusting proxy headers from any peer, or behind a global flag.
 
 ## Outcome
 

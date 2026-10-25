@@ -517,6 +517,44 @@ parameter, are a non-goal for this phase.
   Jena's binary formats, `upload`, `BodyBudget`, `sparql::execute_query` and `xsd`, and
   the specs C01 and C15.
 
+## Provenance
+
+This record preserves design sources, licensing and adoption decisions at the
+stages recorded below. Delivery statements in the record are historical. Current
+capabilities and remaining work are described by the spec status and Outcome.
+
+- **Spec:** [`C05-tabular-imports.md`](C05-tabular-imports.md), written on 2026-10-02
+  independently from:
+  - the W3C Recommendations "Model for Tabular Data and Metadata on the Web", "Metadata
+    Vocabulary for Tabular Data" and "Generating RDF from Tabular Data on the Web", cited
+    from working knowledge;
+  - RFC 4180, RFC 6570, RFC 7111 and the IANA registration of
+    `text/tab-separated-values`;
+  - Tarql's public documentation (Apache-2.0), for CONSTRUCT templates over rows;
+  - the W3C R2RML Recommendation and the RML and YARRRML specifications, at the level of
+    their overviews, for the rejected alternative;
+  - the Sparkles code and specs C01 and C15.
+- **Implementation:** from the spec plus Sparkles code only (2026-10-02). No CSVW
+  processor's or Tarql's code was read or copied. The W3C CSVW test suite was not
+  available offline, so the tests were written from the spec's examples.
+  - `sparkles::tabular` holds the converter: the dialect and the record reader on the
+    `csv` crate, the CSVW metadata subset, the datatypes and their formats, an RFC 6570
+    URI template expander, the minimal-mode triples and the CONSTRUCT templates, which
+    run on the engine's `sparql::execute_query` with a `VALUES` block placed at the start
+    of the WHERE clause.
+  - `sparkles-server` has the `load` options and `sparkles csv` in `csv_cmd`, and the
+    upload's conversion in `http::tabular`.
+  - **Dependencies:** `csv` 1.4.0 and `csv-core` 0.1.13 (Unlicense OR MIT), linked into
+    the `sparkles` binary and the Python wheel.
+- **Rejected** (spec §8):
+  - RML, R2RML and YARRRML mappings, deferred until users bring existing mappings;
+  - CSVW's standard mode;
+  - type inference for the default mapping;
+  - a loader `Source` that holds the converter instead of a temporary N-Triples file;
+  - a SPARQL evaluation per row for templates;
+  - templates that read the target dataset;
+  - CSV bodies in the Graph Store protocol.
+
 ## Outcome
 
 **Delivered on 2026-10-02**, as designed in one phase.
@@ -620,7 +658,7 @@ tables with the default mapping.
 ### Roadmap follow-ups (2026-10-12)
 
 The items this spec left out are now designed in
-[F19 Phase 1](F19-mappings-and-virtual-graphs.md), roadmap item 22 in
+[F19 Phase 1](F19-mappings-and-virtual-graphs/README.md), roadmap item 22 in
 [ROADMAP](../ROADMAP.md). The converter of this spec stays in place, and F19 extends it.
 
 - **RML, R2RML and YARRRML mappings** (§8's first rejected alternative). One mapping
@@ -647,5 +685,5 @@ The items this spec left out are now designed in
   `text/csv` with `mapping=NAME` or `base`. See F19 §2.3.
 
 These follow-ups shipped on 2026-10-24 with F19 Phase 1, except the PostgreSQL source,
-which is roadmap item 230. The [F19 Outcome](F19-mappings-and-virtual-graphs.md#outcome)
+which is roadmap item 230. The [F19 Outcome](F19-mappings-and-virtual-graphs/SPEC.md#outcome)
 records what landed and the decisions made.

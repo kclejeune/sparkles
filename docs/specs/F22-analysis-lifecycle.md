@@ -388,6 +388,13 @@ The primary sources are [PROV-O](https://www.w3.org/TR/prov-o/),
 above. Provenance annotations describe origin, not a statistical confidence calculus.
 No new runtime dependency is selected by this specification.
 
+## Provenance
+
+This design shares the [evidence and analysis provenance record](shared/PROVENANCE.md#evidence-durable-work-and-maintained-analysis)
+with C25, C26, C27, F22 and C22b. The record preserves their common standards
+and each profile's adopted and rejected decisions. It does not imply shared
+implementation status. This spec's status and Outcome describe its delivery.
+
 ## Outcome
 
 This capability is specified and unimplemented. Existing query, reasoner, algorithm and

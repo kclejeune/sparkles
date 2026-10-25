@@ -29,8 +29,8 @@ compares, and the Sparkles benchmark harnesses and documents:
 [BENCHMARKING.md](../BENCHMARKING.md), [BENCHMARKS.md](../BENCHMARKS.md),
 `scripts/bench*.sh`, `scripts/bench-watdiv/watdiv.nix`, `scripts/bench-regressions.py`
 and `docs/benchmarks/2026-10-04-regressions.json`. It builds on full-text search
-([F03](F03-full-text-search.md)), vector search ([F04](F04-vector-search.md)), path
-search ([F07](F07-path-search.md)), GeoSPARQL ([G01](G01-geosparql.md)), automatic
+([F03](F03-full-text-search/README.md)), vector search ([F04](F04-vector-search.md)), path
+search ([F07](F07-path-search.md)), GeoSPARQL ([G01](G01-geosparql/README.md)), automatic
 compaction ([C13](C13-automatic-compaction.md)), inference ([C08](C08-inference-freshness.md))
 and the streaming executor ([X05](X05-streaming-query-execution.md)). The sources are
 listed in §17.
@@ -600,6 +600,44 @@ one ranking.
   licenses.
 - The Sparkles benchmark scripts and documents named above, and the specs C05, C08,
   C13, F01, F03, F04, F07, F14, G01 and X05.
+
+## Provenance
+
+This record preserves design sources, licensing and adoption decisions at the
+stages recorded below. Delivery statements in the record are historical. Current
+capabilities and remaining work are described by the spec status and Outcome.
+
+- **Spec:** [`X06-benchmark-coverage.md`](X06-benchmark-coverage.md), written on
+  2026-10-12 independently from:
+  - Bizer and Schultz, "The Berlin SPARQL Benchmark" (IJSWIS, 2009); Schmidt et al.,
+    "SP²Bench" (ICDE 2009); Guo, Pan and Heflin, "LUBM" (Journal of Web Semantics, 2005);
+    Singh, Bhatia and Mutharaju, "OWL2Bench" (ISWC 2020);
+  - Erling et al., "The LDBC Social Network Benchmark: Interactive Workload" (SIGMOD
+    2015), Szárnyas et al., "… Business Intelligence Workload" (PVLDB 2022), Iosup et
+    al., "LDBC Graphalytics" (PVLDB 2016), the LDBC SNB specification and fair-use
+    policies;
+  - Malyshev et al., "Getting the Most out of Wikidata" (ISWC 2018), for the query logs;
+    Jovanovik, Homburg and Spasić, "A GeoSPARQL Compliance Benchmark" (IJGI 2021);
+    Aumüller, Bernhardsson and Faithfull, "ANN-Benchmarks" (Information Systems, 2020);
+    Aluç et al., "Diversified Stress Testing of RDF Data Management Systems" (ISWC 2014);
+  - the public documentation and licenses of QLever, Oxigraph, Apache Jena, Fluree,
+    Neo4j, Memgraph, Kùzu, USearch, Qdrant and pgvector. No source code of these
+    projects was read;
+  - the Sparkles benchmark scripts, BENCHMARKING.md, BENCHMARKS.md and the specs C05,
+    C08, C13, F01, F03, F04, F07, F14, G01 and X05.
+- **Implementation:** not built. The spec plans no new runtime dependency. Generators,
+  data, benchmark query sets and other engines are fetched at run time and pinned by
+  checksum, never vendored or linked. GPL-licensed ones (the GeoSPARQL Compliance
+  Benchmark, GPL-2.0; Neo4j Community Edition, GPL-3.0) run only with
+  `SPARKLES_ALLOW_GPL_BENCHMARK=1`. Fluree stays BUSL-1.1 as today. The licenses of the
+  BSBM, SP²Bench and OWL2Bench generators are recorded when they are pinned (spec §16).
+- **Rejected** (spec §15):
+  - reusing harness code from GPL projects;
+  - publishing only favourable suites;
+  - disabling Sparkles' WAL synchronization for write comparisons;
+  - normalizing every engine to one cache size;
+  - one aggregate score;
+  - a hosted benchmarking service.
 
 ## Outcome
 

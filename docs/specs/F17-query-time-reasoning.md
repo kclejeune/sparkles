@@ -532,6 +532,26 @@ read did not apply.
 4. Should tables be shared across views when the view does not hide any predicate in the
    table's cone? It would raise hit rates for many callers with narrow protections.
 
+## Provenance
+
+This record preserves design sources, licensing and adoption decisions at the
+stages recorded below. Delivery statements in the record are historical. Current
+capabilities and remaining work are described by the spec status and Outcome.
+
+- **Spec:** [`F17-query-time-reasoning.md`](F17-query-time-reasoning.md), written on 2026-10-12 independently from:
+  - Bancilhon, Maier, Sagiv and Ullman, "Magic sets and other strange ways to implement logic programs" (PODS 1986), and Beeri and Ramakrishnan, "On the power of magic" (Journal of Logic Programming, 1991);
+  - Calvanese, De Giacomo, Lembo, Lenzerini and Rosati, "Tractable reasoning and efficient query answering in description logics: the DL-Lite family" (Journal of Automated Reasoning, 2007), for OWL 2 QL rewriting (PerfectRef);
+  - W3C OWL 2 Web Ontology Language Profiles (OWL 2 QL and OWL 2 RL), RDF 1.1 Semantics and SPARQL 1.1 Entailment Regimes, cited from working knowledge and not re-fetched;
+  - Apache Jena's public documentation of its rule engines (forward, backward and hybrid modes of `GenericRuleReasoner`, tabling) and of the assembler's `ja:InfModel`, cited from working knowledge; no Jena code was read for this spec;
+  - the Sparkles code (`crates/sparkles-reasoner/src/{engine.rs,incremental.rs,parser.rs,builtins.rs,lib.rs}`, `crates/sparkles-core/src/sparql/{rdfs.rs,extensions.rs}`, `crates/sparkles/src/reasoning/freshness.rs`) and specs C01, C08, C11, C12b, F13, F16, G08 and X06.
+- **Implementation:** not built. The spec plans no new runtime dependency.
+- **Rejected** (spec §14):
+  - top-down SLG resolution;
+  - extending RDFS on read to OWL 2 RL by rewriting;
+  - answering stale patterns from the materialization plus the delta;
+  - a new Datalog syntax;
+  - caching tables across generations.
+
 ## Outcome
 
 **Phase 1 built** on 2026-10-24 for roadmap item 19. Phases 2 and 3 are not built, and

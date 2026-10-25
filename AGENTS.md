@@ -53,6 +53,10 @@ work, and each item links to its design spec in [docs/specs](docs/specs/README.m
   Keep a concise Outcome overview in `SPEC.md` and link to an optional `OUTCOME.md` for
   a substantial delivery record. Follow the [spec layout](docs/specs/README.md#spec-layout)
   when creating or migrating a spec.
+- Keep short provenance in the spec's Provenance section. Link to a bundle-local
+  `PROVENANCE.md` for substantial records, and keep the
+  [provenance index](docs/specs/PROVENANCE.md) current. Preserve historical source and
+  license records without treating old delivery statements as current feature status.
 - When a roadmap item or spec phase ships, update its spec's Outcome section,
   [docs/FEATURES.md](docs/FEATURES.md), [docs/BENCHMARKS.md](docs/BENCHMARKS.md) when there
   are numbers, and the item's row in [docs/ROADMAP.md](docs/ROADMAP.md), all in the same

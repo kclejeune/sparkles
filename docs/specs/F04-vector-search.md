@@ -21,7 +21,7 @@
 The design depends on the durable commit `seq` from the commit-identity work
 ([CI](CI-commit-identity.md)) and on the budgets of
 [C01](C01-observability-and-budgets.md). Hybrid text and vector queries would also use
-[F03](F03-full-text-search.md), but nothing else requires it.
+[F03](F03-full-text-search/README.md), but nothing else requires it.
 
 ## 1. Summary, goals, non-goals
 
@@ -847,6 +847,45 @@ GRAPH ex:g2 { ex:a ex:emb "[1, 0, 0]"^^spk:vector . }
   - IEEE 754-2019 binary32;
   - Malkov & Yashunin, arXiv:1603.09320.
 
+## Provenance
+
+This record preserves design sources, licensing and adoption decisions at the
+stages recorded below. Delivery statements in the record are historical. Current
+capabilities and remaining work are described by the spec status and Outcome.
+
+- **Spec:** [`F04-vector-search.md`](F04-vector-search.md), written independently from
+  RDF 1.2 Concepts, SPARQL 1.1 §17.6, RFC 8259, IEEE 754, RFC 8141, the HNSW paper,
+  docs.rs / crates.io pages for the ANN candidates, and the Sparkles code.
+- **Implementation:** Phase 1 (exact search), from the spec and Sparkles code only.
+  There are no new dependencies. The kernel is our own 8-lane loop, and rayon was
+  already in use.
+- **Configured indexes and HNSW (Phase 1b and 2):** from the spec, the Sparkles code
+  (the spatial index's background builds and mapped files were the model), and the
+  HNSW paper (Malkov and Yashunin, arXiv:1603.09320: Algorithms 1, 2, 4 and 5, the level
+  distribution of §4, and the parameter names M, efConstruction and ef). The graph is our
+  own code. No new dependency: it uses parking_lot, rayon, memmap2 and flate2's CRC-32,
+  which Sparkles already links.
+- **Library choice.** USearch 2.26.2 (Apache-2.0), hnsw_rs 0.3.4 (MIT OR Apache-2.0) and
+  instant-distance 0.6.1 (MIT OR Apache-2.0) were measured in a throwaway harness through
+  their public APIs only, on 100k clustered vectors of dimension 384 and 768 (cosine,
+  M = 16, efConstruction = 128, 1000 queries), next to the graph written for Sparkles.
+  None of their source was copied. At 384 dimensions and ef = 64, recall@10 and median
+  latency were 0.997 and 0.35 ms for USearch (f32 or f16), 0.981 and 0.78 ms for
+  hnsw_rs, 0.999 and 0.37 ms for the Sparkles graph, and instant-distance needed 137 s to
+  build. USearch and hnsw_rs keep their own copy of every vector (USearch f16 added
+  145 MB, hnsw_rs 375 MB), while the Sparkles graph reads the packed vectors and added
+  13 MB. USearch's Rust binding sets `ef` per index rather than per query, needs a C++
+  toolchain and reserved thread slots, and is not unwind-safe. hnsw_rs adds about a
+  dozen crates (env_logger, bincode 1, mmap-rs, rand 0.9 among them). instant-distance
+  fixes `ef` at build time and has no filtered search. At 1M × 384, the Sparkles graph
+  reached recall@10 of 0.929 at ef = 64 (0.29 ms) and USearch f16 0.908 (0.36 ms).
+  USearch built 2.5 times faster and held 1.3 GB against 130 MB. No ANN crate was added.
+- **Rejected** (spec §8):
+  - canonicalizing vector literals on load;
+  - a new id tag for vectors;
+  - `rdf:JSON`;
+  - maintaining the graph on the commit path.
+
 ## Outcome
 
 **Delivered.** Phase 1 landed on 2026-09-30 (`9b06c89`). It added the `spk:vector`
@@ -916,7 +955,7 @@ Phases 1b and 2 landed on 2026-10-02.
 * The vector code is always compiled, and so is the HNSW graph. There is no `vector` or
   `vector-hnsw` cargo feature, because neither adds a dependency. USearch was measured
   against hnsw_rs, instant-distance and a graph written for Sparkles
-  ([PROVENANCE](PROVENANCE.md#vector-similarity-and-vector-indexes)). The Sparkles graph
+  ([PROVENANCE](#provenance)). The Sparkles graph
   matched USearch's recall and latency, reads the packed vectors instead of copying
   them, takes `ef` per query, and needs no C++ toolchain, so no ANN crate was added.
   There is no quantization (§2.4 `quantization`).
@@ -1000,7 +1039,7 @@ text. The server maps the index file and used 3.2 GB at 1M × 768 after the meas
   and the phone overflow tests drive both pages against the mock.
 
 **Hybrid ranking (2026-10-02).** Phase 3's hybrid ranking with
-[F03](F03-full-text-search.md) is a property function, `spk:hybridSearch`
+[F03](F03-full-text-search/README.md) is a property function, `spk:hybridSearch`
 (`urn:x-sparkles:hybridSearch`). It runs a `text:query` search and a `spk:vectorSearch`
 search and fuses their rankings by reciprocal rank fusion (Cormack, Clarke and Büttcher,
 SIGIR 2009).

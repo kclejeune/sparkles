@@ -12,7 +12,7 @@
 > The [Outcome](#outcome) section records implementation when it ships.
 
 This specification defines roadmap item 81. It builds on the cited writes and source
-records of [C17](C17-agent-memory.md) and [C18](C18-natural-language-questions-and-ingest.md),
+records of [C17](C17-agent-memory.md) and [C18](C18-natural-language-questions-and-ingest/README.md),
 RDF 1.2 triple terms, PROV-O, Web Annotation and SHACL. It reuses ordinary RDF graphs and
 the existing transaction, preview, history and access-control machinery.
 
@@ -425,6 +425,13 @@ This design uses ordinary RDF with explicit profile operations instead.
 - The design also uses the existing contracts of C17, C18, C19, CI, F05, F06, F09,
   C12 and C12b. No external implementation is adopted and no runtime dependency is added
   by this specification.
+
+## Provenance
+
+This design shares the [evidence and analysis provenance record](shared/PROVENANCE.md#evidence-durable-work-and-maintained-analysis)
+with C25, C26, C27, F22 and C22b. The record preserves their common standards
+and each profile's adopted and rejected decisions. It does not imply shared
+implementation status. This spec's status and Outcome describe its delivery.
 
 ## Outcome
 

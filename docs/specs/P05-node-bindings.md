@@ -1154,7 +1154,7 @@ in-memory datasets use today.
   tests, command-line tools, desktop applications and functions that ship their data.
   Every result would also pay for serialization and parsing. The client is still built,
   as the path for browsers and remote servers.
-* **UniFFI's JavaScript support.** UniFFI, which the JVM bindings of [P04](P04-jvm-bindings.md) use, has
+* **UniFFI's JavaScript support.** UniFFI, which the JVM bindings of [P04](P04-jvm-bindings/README.md) use, has
   no official JavaScript backend. The third-party uniffi-bindgen-react-native project has
   a Node-API runtime in pre-release versions. Using it would share interface definitions
   with the JVM bindings, but it passes arguments through serialized buffers, has no
@@ -1249,6 +1249,49 @@ OpenAPI description of [X03](X03-openapi-and-completions.md). Receipts are those
   `history.rs`, `stored.rs`, `error.rs`, `crates/sparkles/Cargo.toml`, the Python crate's
   `txn.rs`, `crates/sparkles-fmt-wasm`, `ui/src/lib/api.ts`, `docs/openapi.json`,
   `scripts/bench.sh` and `.github/workflows/python-wheels.yml`.
+
+## Provenance
+
+This record preserves design sources, licensing and adoption decisions at the
+stages recorded below. Delivery statements in the record are historical. Current
+capabilities and remaining work are described by the spec status and Outcome.
+
+- **Spec:** [`P05-node-bindings.md`](P05-node-bindings.md), written on 2026-10-03 from:
+  - the Sparkles code, the [P01](P01-python-bindings.md), [P02](P02-rust-client.md) and
+    [X03](X03-openapi-and-completions.md) specs, `docs/openapi.json` and the UI's
+    `ui/src/lib/api.ts`;
+  - the napi-rs 3 documentation (MIT): async tasks and `AbortSignal`, iterators and
+    `AsyncGenerator`, Web streams, ThreadsafeFunction, the release model with platform
+    packages, the WebAssembly target, and the support and compatibility page;
+  - the RDF/JS data model, dataset, stream and query specifications, and the
+    `@rdfjs/types` 2.0 declarations (MIT);
+  - RDF 1.2 Concepts;
+  - the documentation of N3.js (MIT), rdf-ext (MIT) and Comunica (MIT), read for their
+    store, dataset and source interfaces;
+  - the README and published type declarations of Oxigraph's JavaScript package 0.5.11
+    (MIT OR Apache-2.0), read for its API, build targets and module sizes;
+  - Bun's and Deno's documentation on Node-API addons, the Node.js release schedule and
+    API documentation, and the uniffi-bindgen-react-native release notes;
+  - the documentation of openapi-typescript and openapi-fetch (MIT), npm's documentation
+    on trusted publishing, and MDN's documentation of the Origin Private File System,
+    `SharedArrayBuffer` and cross-origin isolation.
+- **Planned dependencies:**
+  - `crates/sparkles-node` would use `napi` and `napi-derive` 3.x (MIT) with the `napi9`,
+    `async`, `tokio_rt` and `web_stream` features, and `napi-build` (MIT) at build time.
+  - The client's one runtime dependency would be `openapi-fetch` (MIT). The common
+    package would use `@rdfjs/types` (MIT) for type declarations only.
+  - The napi-rs CLI (MIT), TypeScript (Apache-2.0) and openapi-typescript (MIT) would be
+    build tools that are not shipped. N3.js, Comunica and Oxigraph's package would be
+    used by the tests and the benchmark only.
+- **Rejected** (spec §14):
+  - a WebAssembly package as the main server-side engine;
+  - Neon instead of napi-rs;
+  - an HTTP client as the only package;
+  - UniFFI through uniffi-bindgen-react-native's Node-API runtime;
+  - engine work on libuv's thread pool;
+  - a `Dataset` that implements the synchronous RDF/JS `DatasetCore`;
+  - C ABI calls through Node.js FFI libraries;
+  - results pushed through ThreadsafeFunctions.
 
 ## Outcome
 

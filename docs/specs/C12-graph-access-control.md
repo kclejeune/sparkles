@@ -137,7 +137,7 @@ of a restricted principal is the union of the named graphs it can read (§4).
 | `upload` | `/{ds}/upload` |
 | `shacl`, `shex` | `/{ds}/shacl`, `/{ds}/shex`, and the MCP validation tools |
 | `diff` | `/{ds}/diff` |
-| `graphql` | `/{ds}/graphql` and `/{ds}/graphql/schema` ([C03](C03-graphql.md)). A grant that lists `query` covers it too. |
+| `graphql` | `/{ds}/graphql` and `/{ds}/graphql/schema` ([C03](C03-graphql/README.md)). A grant that lists `query` covers it too. |
 | `info` | Every other route that needs `read` or `write` on the dataset: its description, statistics, schema, prefixes, commits, reasoning and index status, snapshots and history settings, validation settings, backups listing and readiness. The MCP tools and resources that describe a dataset count as `info`. |
 
 The first six names are Fuseki's operation names. As in Fuseki, `gsp-rw` includes the
@@ -305,7 +305,7 @@ query's dataset. So these forms see only the view:
   statistics either read the visible graphs' counts (a single graph) or take the
   statistics' correction for graphs not read (§7.2);
 - `text:query`, `spk:vectorSearch`, spatial searches and spatial joins apply the graph
-  filter inside the search, before the top-k, as [F03](F03-full-text-search.md) and
+  filter inside the search, before the top-k, as [F03](F03-full-text-search/README.md) and
   [F04](F04-vector-search.md) already require for `GRAPH` scopes;
 - `DESCRIBE` reads the default graph of the view;
 - `EXISTS`, `MINUS`, subqueries and `OPTIONAL` share the query's dataset.
@@ -629,6 +629,33 @@ predicates, plus a full-text index and vectors. The users are:
   `USING`, `CLEAR`, `DROP`, `LOAD`, `ADD`, `MOVE`, `COPY`), Protocol and Graph Store
   Protocol: cited from working knowledge.
 
+## Provenance
+
+This record preserves design sources, licensing and adoption decisions at the
+stages recorded below. Delivery statements in the record are historical. Current
+capabilities and remaining work are described by the spec status and Outcome.
+
+- **Spec:** [`C12-graph-access-control.md`](C12-graph-access-control.md), written on
+  2026-10-02 independently from:
+  - the Sparkles code and the specs C09, C10, C11, F03, F04 and F06;
+  - Apache Jena Fuseki's "Data Access Control for Fuseki" documentation (Apache-2.0),
+    for `access:AccessControlledDataset`, `access:entry`, `urn:x-arq:DefaultGraph` in
+    entries, and `allowedUsers` at the server, dataset and endpoint levels;
+  - W3C Solid Web Access Control and Access Control Policy, the NIST RBAC model and
+    SPARQL 1.1 Query, Update, Protocol and Graph Store Protocol, cited from working
+    knowledge.
+- **Implementation:** from the spec plus Sparkles code only (2026-10-02). The engine part
+  is in `sparkles::access` and the query, update, store, schema and diff modules. The
+  server part is in the `auth` module of `sparkles-server` and its handlers.
+  - **Dependencies:** none added.
+- **Rejected** (spec §11):
+  - filtering in the HTTP handlers instead of the engine;
+  - turning off the fast paths or the result cache for restricted principals;
+  - checking writes against the changes that took effect;
+  - making `CLEAR ALL` fail for every restricted principal;
+  - deny rules, Solid WAC ACL documents, and a parser for Fuseki's `access:` assembler
+    vocabulary.
+
 ## Outcome
 
 **Delivered on 2026-10-02**, as one phase.
@@ -723,7 +750,7 @@ server-sent events), RDF Patch diffs, warm snapshot pins and `spk:hybridSearch` 
 - `spk:hybridSearch` plans its text and vector searches with the active graph's filter,
   so the fusion ranks visible hits only. The differential test includes it.
 
-The GraphQL endpoint of [C03](C03-graphql.md) came later still. It added the `graphql`
+The GraphQL endpoint of [C03](C03-graphql/README.md) came later still. It added the `graphql`
 endpoint name, which a grant that lists `query` also covers, and its queries run with the
 caller's view like SPARQL queries.
 

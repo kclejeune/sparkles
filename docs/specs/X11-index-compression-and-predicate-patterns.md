@@ -27,7 +27,7 @@ files in `index.rs`, the vocabulary in `vocab.rs`, ids in `id.rs`, partial compa
 `store/partial.rs`) with the specs [X01](X01-compression-codecs.md),
 [C13](C13-automatic-compaction.md), [C02](C02-schema-discovery.md),
 [C12](C12-graph-access-control.md), [C12b](C12b-triple-access-control.md) and
-[F05](F05-snapshot-repositories.md). QLever's design is taken from the paper and its
+[F05](F05-snapshot-repositories/README.md). QLever's design is taken from the paper and its
 documentation, not from its code.
 
 ## 1. Summary, goals, non-goals
@@ -469,6 +469,36 @@ long old versions stay readable is X12's.
    touched subjects in the base?
 3. Should IRI encoding cover other numeric forms, such as zero-padded numbers with a fixed
    width?
+
+## Provenance
+
+This record preserves design sources, licensing and adoption decisions at the
+stages recorded below. Delivery statements in the record are historical. Current
+capabilities and remaining work are described by the spec status and Outcome.
+
+- **Spec:** [`X11-index-compression-and-predicate-patterns.md`](X11-index-compression-and-predicate-patterns.md),
+  written on 2026-10-12 independently from:
+  - Bast and Buchhold, "QLever: A Query Engine for Efficient SPARQL+Text Search" (CIKM
+    2017), and the public QLever documentation of `ql:has-predicate`, for predicate
+    patterns; QLever's code was not read;
+  - Boncz, Neumann and Leis, "FSST: Fast Random Access String Compression" (PVLDB 13(11),
+    2020);
+  - Neumann and Moerkotte, "Characteristic Sets" (ICDE 2011), and Lemire and Boytsov,
+    "Decoding billions of integers per second through vectorization" (Software: Practice
+    and Experience, 2015);
+  - the zstd documentation of dictionary training;
+  - the Sparkles code at `fc123d04` (the builder and its statistics, the permutation
+    files, the vocabulary, ids and partial compaction) and the specs X01, C02, C12, C12b,
+    C13 and F05.
+- **Implementation:** not built. FSST needs an implementation, either written from the
+  paper or a permissively licensed crate, recorded here when chosen. zstd is already an
+  optional dependency of `sparkles-core`.
+- **Rejected** (spec §11):
+  - patterns as triples in the main permutations;
+  - characteristic sets as the pattern table;
+  - zstd for whole vocabulary blocks;
+  - order-preserving dictionary compression;
+  - IRI encoding by hashing.
 
 ## Outcome
 

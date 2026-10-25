@@ -57,6 +57,12 @@ retaining Crane, migrating to per-crate builds, or making a smaller change. Any
 migration must preserve package interfaces and pass the existing build and test
 gates. No packaging migration is included in the CI streamline merge.
 
+## Provenance
+
+The [existing prototype](#existing-prototype) and [investigation](#investigation)
+record the evidence for this proposal. No separate adoption or external-source
+record is asserted here. The Outcome describes its current investigation scope.
+
 ## Outcome
 
 The CI streamline work landed separately. The per-crate comparison remains future

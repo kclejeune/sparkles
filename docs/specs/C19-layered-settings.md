@@ -26,7 +26,7 @@ PostgreSQL's `ALTER SYSTEM` and `postgresql.auto.conf`, systemd's drop-in direct
 Firefox enterprise policies with locked preferences, and the NixOS module conventions
 for settings and secrets, together with the Sparkles code. It builds on access control
 ([C09](C09-dataset-access-control.md)), agent memory ([C17](C17-agent-memory.md)) and
-questions and ingestion ([C18](C18-natural-language-questions-and-ingest.md)).
+questions and ingestion ([C18](C18-natural-language-questions-and-ingest/README.md)).
 
 ## 1. Summary
 
@@ -535,6 +535,39 @@ is refused, so the options never apply beyond the server they were given for.
 - Firefox's enterprise policy documentation, for locked preferences.
 - The NixOS manual's guidance on settings options and secrets.
 - The Sparkles code and specs C09, C17, C18 and F11.
+
+## Provenance
+
+This record preserves design sources, licensing and adoption decisions at the
+stages recorded below. Delivery statements in the record are historical. Current
+capabilities and remaining work are described by the spec status and Outcome.
+
+- **Spec:** [`C19-layered-settings.md`](C19-layered-settings.md), written on 2026-10-10
+  from:
+  - RFC 7396 (JSON Merge Patch) and RFC 9110 on `ETag` and `If-Match`;
+  - the public documentation of Grafana's provisioning, PostgreSQL's `ALTER SYSTEM`,
+    systemd's drop-in directories and Firefox's enterprise policies;
+  - the NixOS manual's guidance on settings options and secrets;
+  - the Sparkles code and specs C09, C17, C18 and F11.
+- **Implementation:** Phases 1 and 2 from the spec plus Sparkles code and the NixOS
+  manual's documentation of `specialisation` and `reloadTriggers` only (2026-10-10).
+  Phase 3, the UI's Settings tab with the controls of memory maintenance, from the spec,
+  docs/API.md and the Sparkles UI code only (2026-10-10), with no new UI dependency.
+  The server side of Phase 4, the `models` kind, the runtime secrets and the `/$/server`
+  routes, followed on the same day from the spec and the Sparkles code. They add no
+  runtime dependency. The CLI, UI and NixOS parts of Phase 4, with the `overrides`
+  member of each settings answer, followed on the same day from the spec, docs/API.md
+  and the Sparkles code only. They add no dependency, and the CLI's hidden prompt uses
+  the `rpassword` crate that `sparkles auth` already uses.
+- **Rejected** (spec §12):
+  - model configuration only in the operator's file;
+  - returning stored keys to administrators;
+  - turning the assistant on whenever models are configured;
+  - writing declared settings into the dataset files before each start;
+  - declared values that always win, and runtime values that always win;
+  - locks per settings kind;
+  - creating datasets from the settings file;
+  - recreating a deleted declared dataset at the next start.
 
 ## Outcome
 
@@ -1119,7 +1152,7 @@ USAGE describes the Docker bind-mount case under its upgrade notes (D2).
 **UI controls that turn on assistant ingestion** (item 77, Tier 5,
 [ROADMAP](../ROADMAP.md)). The other half of item 77, redaction beyond the fixed
 patterns, is in
-[C18's follow-ups](C18-natural-language-questions-and-ingest.md#roadmap-follow-ups-2026-10-12).
+[C18's follow-ups](C18-natural-language-questions-and-ingest/OUTCOME.md#roadmap-follow-ups-2026-10-12).
 
 * **What exists today.** §8.1's rule lives in the CLI only: `enable_ingest` in
   `crates/sparkles-server/src/memory_cmd/ops.rs` reads `/$/settings/{ds}/assistant`,

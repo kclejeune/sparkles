@@ -455,6 +455,29 @@ The data is a dataset with 300 people in three groups densely linked inside each
 3. Whether lens choices should be part of Explore's URL, so a link reproduces the colouring as
    it reproduces the slider's state.
 
+## Provenance
+
+This record preserves design sources, licensing and adoption decisions at the
+stages recorded below. Delivery statements in the record are historical. Current
+capabilities and remaining work are described by the spec status and Outcome.
+
+- **Spec:** [`U10-canvas-lenses.md`](U10-canvas-lenses.md), written on 2026-10-23 independently from:
+  - the public documentation of Gephi's ranking and partition panels and of Cytoscape.js
+    styles and mappers;
+  - the ColorBrewer qualitative palettes;
+  - S. Brin and L. Page, "The Anatomy of a Large-Scale Hypertextual Web Search Engine", 1998,
+    and V. A. Traag, L. Waltman and N. J. van Eck, "From Louvain to Leiden", Scientific
+    Reports, 2019;
+  - the WAI-ARIA Authoring Practices;
+  - the Sparkles code (`algorun.rs`, `GraphView`, `LargeGraphView`, the reasoner's instance
+    search) and specs C08, C12, C12b, C22, F14, F16, F18, U01 and U06.
+- **Implementation:** not built. No new dependency is planned.
+- **Rejected** (spec §11):
+  - algorithms computed in the browser;
+  - lens runs written back to a scratch graph;
+  - inferred edges found by their graph alone;
+  - waiting for F17 before any explanation.
+
 ## Outcome
 
 ### Phase 1, 2026-10-23

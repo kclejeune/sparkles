@@ -731,6 +731,57 @@ it as the distinct pairs of `p`. `PathEngineN` counts walks, so `multi(p)` is `p
 * **`rdfs:member` as ARQ's container function.** It is ARQ's default, but it changes the
   answers and plans of queries that use `rdfs:member` as a property.
 
+## Provenance
+
+This record preserves design sources, licensing and adoption decisions at the
+stages recorded below. Delivery statements in the record are historical. Current
+capabilities and remaining work are described by the spec status and Outcome.
+
+- **Spec:** [`G06-arq-query-extensions.md`](G06-arq-query-extensions.md), written on
+  2026-10-02 independently from:
+  - the Sparkles code and the vendored spargebra, whose `sep-0006` feature already
+    parsed `LATERAL`;
+  - Apache Jena's `jena-arq` sources (Apache-2.0): the ARQ grammar `Grammar/main.jj`,
+    `SyntaxVarScope`, `OpLateral` and its executor, the `path` package (`P_Mod`,
+    `P_FixedLength`, `PathFactory`, `PathCompiler`, `PathLib`, `PathEngineSPARQL`,
+    `PathEngineN`), `Template` and `TemplateLib`, and Fuseki's `SPARQLQueryProcessor`
+    and `Responses`, read for syntax and behaviour. No code was copied;
+  - ARQ's test suites `testing/ARQ/Syntax-Lateral`, `testing/ARQ/Lateral` and the
+    `syntax-quad-construct-*` tests of `testing/ARQ/Syntax-ARQ`, and the unit tests
+    `TestPath` and `TestPathQuery`, whose cases are ported with citations to
+    `crates/sparkles-core/tests/arq_syntax.rs`;
+  - the output of Jena 6.2.0's `arq` command on small graphs;
+  - SPARQL 1.1 and 1.2 Query and the SPARQL 1.2 community proposal SEP-0006.
+- **Implementation** (2026-10-02): from the spec and the Sparkles code. The `LATERAL`
+  decorrelation reuses the analysis of the EXISTS decorrelation, and its per-row
+  evaluation the planner's substitution of constants. **Dependencies:** none new.
+- **Rejected** (spec §9):
+  - expanding ranges in the parser;
+  - evaluating every `LATERAL` per row, or decorrelating every one into a join;
+  - renaming hidden sub-select variables in the algebra;
+  - copying Jena's evaluation of `{0,}` as `{+}`;
+  - ARQ's syntax off by default;
+  - returning quads from `Dataset::construct`.
+- **Phase 2 spec** (§11, configurable DESCRIBE), written on 2026-10-02 independently
+  from:
+  - the Sparkles code, whose DESCRIBE followed the blank-node closure in the default
+    graph;
+  - Apache Jena's `jena-arq` sources (Apache-2.0): the `core.describe` package
+    (`DescribeHandler`, `DescribeHandlerRegistry`, `DescribeBNodeClosure`), `util.Closure`
+    and `QueryExecDataset.describe`, and TDB2's `QueryEngineTDB`, read for behaviour. No
+    code was copied;
+  - the output of Jena 6.2.0's `arq` command on a small TriG dataset;
+  - the W3C member submission *CBD - Concise Bounded Description* (2005), for the
+    concise bounded description and its symmetric form, and RDF 1.2 Concepts for
+    reifiers.
+- **Phase 2 implementation** (2026-10-02): from the spec and the Sparkles code.
+  **Dependencies:** none new.
+- **Rejected in Phase 2** (spec §11.8):
+  - a registry of handlers;
+  - reifiers off by default;
+  - failing a query at `maxTriples`;
+  - the union graph as the default source in a union store.
+
 ## Outcome
 
 **Delivered.** Phase 1 landed on 2026-10-02 as designed in §2 to §6:

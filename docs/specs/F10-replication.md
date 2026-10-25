@@ -26,7 +26,7 @@ specs. §12 lists the sources.
 It builds on durable commit identity ([CI](CI-commit-identity.md)), retained history and
 the change feed ([F06](F06-snapshots-and-point-in-time.md)), background compaction
 ([C13](C13-automatic-compaction.md)), backup repositories and their capture
-([F05](F05-snapshot-repositories.md)), and access control
+([F05](F05-snapshot-repositories/README.md)), and access control
 ([C09](C09-dataset-access-control.md), [C12](C12-graph-access-control.md)).
 
 ## 1. Summary, goals, non-goals
@@ -344,7 +344,7 @@ change feed. Both tell the replica what to do next (§4.3, §2.7).
 #### 2.3.2 Captures
 
 A capture is the consistent copy of one generation that a backup uploads
-([F05 §5.3](F05-snapshot-repositories.md)), served over HTTP instead. `POST` takes the
+([F05 §5.3](F05-snapshot-repositories/README.md)), served over HTTP instead. `POST` takes the
 writer lock for about a millisecond, leases the current generation, records the WAL,
 delta-vocabulary and catalog lengths at the head, and answers `201` with a manifest:
 
@@ -811,7 +811,7 @@ an F05 restore does. Downloads resume by piece after a network error, while the 
 lives. The capture is released at the end.
 
 A bootstrap with `bootstrap = { repository, backup }` restores a backup instead, with
-identity `keep` ([F05 §2.3](F05-snapshot-repositories.md)), and then streams the commits
+identity `keep` ([F05 §2.3](F05-snapshot-repositories/README.md)), and then streams the commits
 after the backup's commit from the primary. `backup = "latest"` picks the newest backup
 of the primary's dataset id in that repository. That moves the bulk of the bytes from
 object storage instead of from the primary. If the primary cannot read the commit after
@@ -1321,7 +1321,7 @@ before Phase 2 starts.
     ([F14](F14-graph-algorithms.md)), materialized inference
     ([F16](F16-materialization-at-scale.md)), query-time reasoning settings
     ([F17](F17-query-time-reasoning.md)), mappings and virtual graphs
-    ([F19](F19-mappings-and-virtual-graphs.md)), and full-text analyzer dictionaries.
+    ([F19](F19-mappings-and-virtual-graphs/README.md)), and full-text analyzer dictionaries.
     §4.5 and §4.6 answer this only for the full-text, vector and spatial indexes.
 16. **Branches.** Open question 1 waited for the branches spec, which is now
     [F09](F09-branches-and-merges.md). Does a replica follow every branch, a chosen set,
@@ -1552,7 +1552,7 @@ each and asks before Phase 3 is designed in full.
     tokens, readiness and write previews;
   * `nix/module.nix`, the options of the backup configuration;
   * the specs [CI](CI-commit-identity.md), [F06](F06-snapshots-and-point-in-time.md) and
-    [C13](C13-automatic-compaction.md) in full, [F05](F05-snapshot-repositories.md) §§1,
+    [C13](C13-automatic-compaction.md) in full, [F05](F05-snapshot-repositories/README.md) §§1,
     2.1–2.3, 4, 5.1–5.5, 11, 12 and the Outcome, and the index and format of
     [PROVENANCE.md](PROVENANCE.md).
   * The project's private planning notes, for this item's place in the order of work
@@ -1588,6 +1588,49 @@ each and asks before Phase 3 is designed in full.
   of an Understandable Consensus Algorithm" (USENIX ATC 2014) and the etcd documentation
   on cluster sizes; PostgreSQL's `pg_promote`, timelines and `pg_rewind`; RFC 9110,
   RFC 9530, RFC 9651 and RFC 6648.
+
+## Provenance
+
+This record preserves design sources, licensing and adoption decisions at the
+stages recorded below. Delivery statements in the record are historical. Current
+capabilities and remaining work are described by the spec status and Outcome.
+
+- **Spec:** [`F10-replication.md`](F10-replication.md), written on 2026-10-02
+  independently from:
+  - the Sparkles code and the [CI](CI-commit-identity.md),
+    [F06](F06-snapshots-and-point-in-time.md), [C13](C13-automatic-compaction.md),
+    [F05](F05-snapshot-repositories/README.md), [C09](C09-dataset-access-control.md) and
+    [C12](C12-graph-access-control.md) specs;
+  - Apache Jena's `jena-rdfpatch`, `jena-cmds` (`rdfpatch`) and Fuseki (`PatchApply`,
+    `FusekiConfig`, `OperationRegistry`) sources and `GraphView` (Apache-2.0), read for
+    behaviour. No code was copied;
+  - the RDF Patch documentation of Apache Jena and the RDF Delta documentation (patch
+    logs, `id` and `prev`), fetched;
+  - the PostgreSQL documentation of log-shipping standby servers and hot standby, the
+    LiteFS documentation and Oxigraph 0.3's `Store` documentation, fetched for
+    behaviour;
+  - Litestream's design, the Raft paper and the etcd documentation, PostgreSQL timelines
+    and RFCs 9110, 9530, 9651 and 6648, cited from general knowledge.
+- **Implementation:** Phase 1 from the spec plus Sparkles code only (2026-10-02), with no
+  new dependency. The patch reader was written from the row grammar and the RDF Thrift
+  schema (`BinaryRDF.thrift`), not from Jena's reader. The tests port the patches of
+  `jena-rdfpatch`'s `TestPatchIO_Text`, `AbstractTestPatchIO` and
+  `testing/files/syntax-1.rdfp` (Apache-2.0), and the fixtures in
+  `crates/sparkles-core/tests/patch` were written by Jena 6.2.0's patch writers. Phases 2 and 3
+  are deferred.
+- **Rejected** (spec §10):
+  - physical replication of WAL bytes and generation files;
+  - the public change feed as the replication protocol;
+  - shipping SPARQL Update text;
+  - push from the primary;
+  - followers that read the primary's files;
+  - consensus (Raft) in Phases 1 and 2;
+  - keeping the dataset id on promotion;
+  - replicating every compaction as a generation copy;
+  - applying bulk commits from their changes by default;
+  - redirecting writes from a replica to the primary;
+  - Jena's blank-node labels as identities;
+  - one commit per `TX … TC` block as the default.
 
 ## Outcome
 

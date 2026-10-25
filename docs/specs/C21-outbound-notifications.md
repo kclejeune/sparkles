@@ -20,8 +20,8 @@ Standard Webhooks specification, the CloudEvents specification's JSON format,
 Prometheus Alertmanager's webhook receiver and its `repeat_interval`, RFC 2104 (HMAC),
 RFC 9110 on `Retry-After`, and, for Phase 2, RFC 5321, RFC 5322, RFC 3207, RFC 4954,
 RFC 6409 and RFC 8314. It builds on layered settings ([C19](C19-layered-settings.md)),
-agent memory maintenance ([C18](C18-natural-language-questions-and-ingest.md) §8),
-backup policies ([F05](F05-snapshot-repositories.md)) and the server's outbound policy.
+agent memory maintenance ([C18](C18-natural-language-questions-and-ingest/README.md) §8),
+backup policies ([F05](F05-snapshot-repositories/README.md)) and the server's outbound policy.
 
 ## 1. Summary
 
@@ -462,6 +462,34 @@ section is changing in parallel work.
 - For Phase 2, RFC 5321 (SMTP), RFC 5322 (message format), RFC 3207 (STARTTLS), RFC
   4954 (SMTP AUTH), RFC 6409 (message submission) and RFC 8314 (implicit TLS).
 - The Sparkles code and specs C18, C19 and F05.
+
+## Provenance
+
+This record preserves design sources, licensing and adoption decisions at the
+stages recorded below. Delivery statements in the record are historical. Current
+capabilities and remaining work are described by the spec status and Outcome.
+
+- **Spec:** [`C21-outbound-notifications.md`](C21-outbound-notifications.md), written on
+  2026-10-10 from:
+  - the public documentation of ntfy's publish API, the Standard Webhooks
+    specification, the CloudEvents specification and Prometheus Alertmanager's webhook
+    receiver and `repeat_interval`;
+  - RFC 2104 and RFC 4231 (HMAC), and RFC 9110 on `Retry-After`;
+  - for the email channel of Phase 2, RFC 5321, RFC 5322, RFC 3207, RFC 4954, RFC 6409
+    and RFC 8314;
+  - the Sparkles code and specs C18, C19 and F05.
+- **Implementation:** Phase 1, from the spec, docs/API.md and the Sparkles code only
+  (2026-10-10). It adds no dependency. HMAC-SHA256 is written on the `sha2` crate the
+  server already uses, and checked against the vectors of RFC 4231 and the example of
+  the Standard Webhooks reference libraries.
+- **Rejected** (spec §13):
+  - notifications through Alertmanager only;
+  - a configuration file of its own;
+  - inline tokens and signing keys;
+  - routes as a list of rules;
+  - retrying forever, and a queue kept on disk;
+  - payloads in the formats of chat services;
+  - channels chosen by dataset admins.
 
 ## Outcome
 

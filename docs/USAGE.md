@@ -1462,7 +1462,7 @@ triples. On a server, `POST /{ds}/upload` takes tables too
 
 `sparkles map` and `sparkles load --mapping` run R2RML, RML and YARRRML mappings over CSV,
 TSV, JSON, JSON Lines, Parquet and SQLite sources
-([spec F19](specs/F19-mappings-and-virtual-graphs.md)). The kind of a mapping file is read
+([spec F19](specs/F19-mappings-and-virtual-graphs/README.md)). The kind of a mapping file is read
 from its content, and `--mapping-kind` names it when the content does not tell. A
 YARRRML mapping of two CSV files with a join looks like this:
 
@@ -3954,7 +3954,7 @@ files and rules, Codex's `AGENTS.md` files and generated memories, `GEMINI.md`, 
 rules and GitHub Copilot's instructions. Each file becomes one named graph of facts,
 each with a reifier that quotes the line it came from. Imported facts are unreviewed
 until a person promotes them. The design is in
-[C18 §8.10](specs/C18-natural-language-questions-and-ingest.md#810-importing-memory-from-coding-agent-harnesses).
+[C18 §8.10](specs/C18-natural-language-questions-and-ingest/SPEC.md#810-importing-memory-from-coding-agent-harnesses).
 
 The commands talk to a server with the token of `sparkles auth login` or
 `SPARKLES_TOKEN`. An administrator prepares the dataset once:
@@ -4031,7 +4031,7 @@ extraction. Against a server it reports the task ids, which
 `GET /$/ingest/{ds}/{task}` follows.
 
 `sparkles memory setup claude-code` prints the hooks, the extraction skill and, for
-Codex, the MCP entry of [C18 §10.4](specs/C18-natural-language-questions-and-ingest.md#104-harness-integration),
+Codex, the MCP entry of [C18 §10.4](specs/C18-natural-language-questions-and-ingest/SPEC.md#104-harness-integration),
 and `--write` merges them into `~/.claude/settings.json` (or `.claude/settings.json`
 with `--scope project`) or `~/.codex/hooks.json`. The hooks sync a memory file when
 Claude writes it, sync the project when a session ends, and print the brief when a
@@ -4171,7 +4171,7 @@ writes to `main` land on its branch `proposals.{agent}.inbox` and wait in the in
 `scripts/eval-ingest` scores an ingestion of the labelled sample in
 `testsuite/ingest/sample.json` against its gold facts, with fact precision and recall,
 linking accuracy, the duplicate rate and the span failures of
-[C18 §11.2](specs/C18-natural-language-questions-and-ingest.md#112-ingestion).
+[C18 §11.2](specs/C18-natural-language-questions-and-ingest/SPEC.md#112-ingestion).
 `scripts/eval-ingest --self-test` runs it against a local server with a scripted agent
 and needs no model.
 
@@ -6171,7 +6171,7 @@ On Java 24 and later, the JVM warns when JNA loads native code unless the progra
 with `--enable-native-access=ALL-UNNAMED`.
 
 The library depends on `jena-arq`, JNA, the Kotlin standard library and JSpecify. The
-TDB2 import also needs `jena-tdb2` on the classpath. [Spec P04](specs/P04-jvm-bindings.md)
+TDB2 import also needs `jena-tdb2` on the classpath. [Spec P04](specs/P04-jvm-bindings/README.md)
 is the design, and `jvm/sample-java` is a Java program written against the public API.
 
 ### Opening a Jena dataset

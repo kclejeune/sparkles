@@ -472,6 +472,38 @@ class) and `docs` (class `ex:Doc` with `?s ex:owner ?user`). Users `tadmin` (adm
 - **SPARQL 1.1** Query (`VALUES`, group graph patterns), Update and Protocol, and RDF
   Schema (`rdf:type`, `rdfs:subClassOf`), cited from working knowledge.
 
+## Provenance
+
+This record preserves design sources, licensing and adoption decisions at the
+stages recorded below. Delivery statements in the record are historical. Current
+capabilities and remaining work are described by the spec status and Outcome.
+
+- **Spec:** [`C12b-triple-access-control.md`](C12b-triple-access-control.md), written on
+  2026-10-02 independently from:
+  - the Sparkles code and the specs C09, C12, C15, C16 and F06;
+  - the source and readme of Apache Jena's `jena-permissions` module (Apache-2.0) at
+    the `jena-5.6.0` release, the last before it was retired: `SecurityEvaluator`,
+    `SecuredGraph` and the query rewriter `OpRewriter`;
+  - AllegroGraph's security filters documentation (fetched 2026-10-02) and MarkLogic's
+    element-level security documentation (protected paths and protected path sets,
+    found 2026-10-02);
+  - W3C Solid Web Access Control and Access Control Policy, the W3C ODRL Information
+    Model 2.2, OASIS XACML 3.0, SPARQL 1.1 and RDF Schema, cited from working knowledge.
+- **Implementation:** from the spec plus Sparkles code only (2026-10-02). The engine part
+  is in `sparkles::access::triples`, the snapshot's mask, the write transaction's checks
+  and the query, update, schema, diff and change-feed modules. The server part is in the
+  `auth` module of `sparkles-server` and the Graph Store and listing handlers.
+  - **Dependencies:** none added.
+- **Rejected** (spec §12):
+  - checking each triple during evaluation, as `jena-permissions` does;
+  - rewriting queries with filters;
+  - turning off the fast paths for protected callers;
+  - allow and disallow filters attached to each grant;
+  - lists of readers in the protection;
+  - inference per caller;
+  - exact per-commit masks for the change feed;
+  - hiding IRIs as well as triples.
+
 ## Outcome
 
 **Delivered on 2026-10-02**, with all three tiers in one phase.
@@ -573,7 +605,7 @@ quads, which costs up to twice the time where the hidden quads are spread over t
 subjects a query reads (the managers' class counts, paths, filters and joins). Queries
 over hidden predicates get faster, since there is less to read.
 
-The GraphQL endpoint of [C03](C03-graphql.md), which came later, runs its queries with
+The GraphQL endpoint of [C03](C03-graphql/README.md), which came later, runs its queries with
 the caller's view, so protections hide triples from it as they do from SPARQL.
 
 ### Roadmap follow-ups (2026-10-12)

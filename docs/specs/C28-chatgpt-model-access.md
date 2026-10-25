@@ -12,7 +12,7 @@
 
 This design covers roadmap item 344. It extends the model configuration in
 [C19](C19-layered-settings.md), the model roles and disclosure controls in
-[C18](C18-natural-language-questions-and-ingest.md), and the per-attempt admission
+[C18](C18-natural-language-questions-and-ingest/README.md), and the per-attempt admission
 contract in [C22](C22-graph-rag-community-summaries.md). It uses
 [C26](C26-durable-jobs-and-delivery.md) for durable background work.
 
@@ -273,6 +273,25 @@ accounts or paid calls. A live owner-authorized smoke test must verify sign-in, 
 completed inference, refresh and sign-out on each supported deployment type before
 the feature is documented as available. Its account eligibility and limits are recorded
 as a compatibility observation, not a guarantee for every subscriber.
+
+## Provenance
+
+This record preserves design sources, licensing and adoption decisions at the
+stages recorded below. Delivery statements in the record are historical. Current
+capabilities and remaining work are described by the spec status and Outcome.
+
+[C28](C28-chatgpt-model-access.md) is specified and unimplemented. Its protocol sources
+are the official Sign in with ChatGPT documentation linked from the spec, including
+registration, account sessions, self-hosted credential transfer, Responses inference
+and preview limitations. The design was checked against Sparkles' model configuration,
+per-attempt admission, disclosure guards and protected secret storage.
+
+TREK's ChatGPT authentication service and Responses adapter were inspected as a
+reference at the maintainer's request. TREK is AGPL-3.0. No TREK code or dependency was
+copied or adopted. The proposed protocol follows the official provider documentation.
+The design adds Sparkles-specific principal isolation, conservative budget admission
+and recovery boundaries. It rejects borrowed credentials from unrelated tools, implicit
+API billing fallback, instance-wide personal-plan sharing and unverified partial results.
 
 ## Outcome
 

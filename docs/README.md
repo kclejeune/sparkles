@@ -30,7 +30,7 @@ This index lists the Sparkles documentation by what a reader wants to do. The re
 |---|---|
 | [Roadmap](ROADMAP.md) | Planned work in priority order, with the size, impact and design spec of each item. |
 | [Design specs](specs/README.md) | The rationale, status and outcome of each larger feature. |
-| [Provenance](specs/PROVENANCE.md) | The design sources, adopted dependencies, licenses and rejected alternatives. |
+| [Provenance](specs/PROVENANCE.md) | An index to per-spec and shared records of design sources, adopted dependencies, licenses and rejected alternatives. |
 | [Source audit](AUDIT.md) | The original audit of Jena, QLever and Oxigraph that set the first design choices. |
 
 ## Contributing

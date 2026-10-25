@@ -27,7 +27,7 @@ ontologies" (Journal of Web Semantics, 2012), for Datalog±; Fagin, Kolaitis, Mi
 Popa, "Data exchange: semantics and query answering" (Theoretical Computer Science, 2005),
 for weak acyclicity; and the Sparkles code. Fluree is licensed under BUSL-1.1; only its
 public documentation was read, and no code. It builds on the GraphQL adapter's algebra
-builder ([C03](C03-graphql.md)), the Cypher frontend's compiler design
+builder ([C03](C03-graphql/README.md)), the Cypher frontend's compiler design
 ([F01](F01-cypher.md)), query-time reasoning and its rule syntax decision
 ([F17](F17-query-time-reasoning.md) §9), stored queries ([C16](C16-stored-queries.md)),
 the MCP server ([C11](C11-mcp-server.md)), budgets ([C01](C01-observability-and-budgets.md))
@@ -494,6 +494,36 @@ from a JSON query, a frame that embeds `ex:salary`, or a Datalog query that read
 4. Is a converter from Fluree's query JSON wanted, for the queries whose features map?
 5. Should Datalog programs be storable as reasoning rule sets (F17's dataset setting)
    with their `.decl` relations, or only sent per query?
+
+## Provenance
+
+This record preserves design sources, licensing and adoption decisions at the
+stages recorded below. Delivery statements in the record are historical. Current
+capabilities and remaining work are described by the spec status and Outcome.
+
+- **Spec:** [`C24-json-query-languages.md`](C24-json-query-languages.md), written on 2026-10-12 independently from:
+  - the W3C JSON-LD 1.1, JSON-LD 1.1 Processing Algorithms and API, JSON-LD 1.1 Framing,
+    SPARQL 1.1 Query Language and SPARQL 1.1 Query Results JSON Format recommendations,
+    and RFC 6901 (JSON Pointer), cited from working knowledge and not re-fetched;
+  - the public documentation of Fluree's JSON-LD query language (Fluree is BUSL-1.1; no
+    code was read), of TerminusDB's WOQL, of Apache Jena ARQ's `JSON` query form and rule
+    syntax, and of Soufflé, cited from working knowledge;
+  - Abiteboul, Hull and Vianu, *Foundations of Databases* (1995); Calì, Gottlob and
+    Lukasiewicz, "A general Datalog-based framework for tractable query answering over
+    ontologies" (Journal of Web Semantics, 2012); Fagin, Kolaitis, Miller and Popa,
+    "Data exchange: semantics and query answering" (Theoretical Computer Science, 2005);
+  - the Sparkles code (`crates/sparkles-graphql/src/{algebra.rs,exec.rs}`,
+    `crates/sparkles-core/src/sparql/mod.rs`, `crates/sparkles-reasoner/src/{parser.rs,builtins.rs}`,
+    `crates/sparkles-server/src/http.rs`, `crates/sparkles-server/src/main.rs`) and specs
+    C01, C03, C11, C12, C12b, C16, C20, F01 and F17, FEATURES and COMPARISON.
+- **Implementation:** not built. No new dependency is planned; JSON-LD context processing,
+  pattern expansion and framing are to be written in `sparkles-core`.
+- **Rejected** (spec §12):
+  - adopting Fluree's query syntax as is;
+  - a JSON serialization of the SPARQL algebra;
+  - framing only, without a query language;
+  - a new Datalog syntax with typed columns and `.input`/`.output`;
+  - writing derived relations to a graph.
 
 ## Outcome
 

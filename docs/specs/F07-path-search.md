@@ -462,6 +462,41 @@ The graph for A1 to A6 has the triples `a→b`, `b→c`, `c→d`, `a→e`, `e→
 - J. Y. Yen, "Finding the K Shortest Loopless Paths in a Network", Management Science 17
   (1971).
 
+## Provenance
+
+This record preserves design sources, licensing and adoption decisions at the
+stages recorded below. Delivery statements in the record are historical. Current
+capabilities and remaining work are described by the spec status and Outcome.
+
+- **Spec:** [`F07-path-search.md`](F07-path-search.md), written on 2026-10-02
+  independently from:
+  - the Sparkles code and the [C01](C01-observability-and-budgets.md),
+    [C12](C12-graph-access-control.md), [C12b](C12b-triple-access-control.md),
+    [F01](F01-cypher.md) and [F04](F04-vector-search.md) specs;
+  - SPARQL 1.1 Query §9 and the SPARQL working group's feature pages on path lengths and
+    path binding, and the RDF 1.2 Concepts and Turtle 1.2 drafts for reifiers;
+  - QLever's `PathSearch` and `PathQuery` sources (Apache-2.0), read for the parameters
+    and the result shape;
+  - the public documentation of Ontotext GraphDB (graph path search), Stardog (path
+    queries), Neo4j (shortest paths) and OpenLink Virtuoso (transitivity in SPARQL and
+    SQL), and public summaries of the GQL path selectors and path modes, read for
+    behaviour only;
+  - Pohl (1971) on bidirectional search, Dijkstra (1959) and Yen (1971).
+
+  The review of other databases that named the roadmap item was not used.
+- **Implementation** (2026-10-02): from the spec and the Sparkles code. The searches,
+  the adjacency scans and the planner's handling of the service are our own code, and
+  the index sweep follows the transitive path operator Sparkles already had.
+  **Dependencies:** none new.
+- **Rejected** (spec §8):
+  - a `PATHS` query form or `TRANSITIVE` options, which need new grammar;
+  - a property function with list arguments;
+  - one value per path, such as a list literal or JSON;
+  - walk and trail semantics;
+  - weights on nodes or predicates instead of on reifiers;
+  - truncating a search that visits too many nodes;
+  - reusing the transitive path operator.
+
 ## Outcome
 
 **Delivered** on 2026-10-02, as Phase 1.

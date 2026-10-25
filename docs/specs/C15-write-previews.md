@@ -14,7 +14,7 @@
 > the end records how it landed.
 
 This spec builds on durable commit identity ([CI](CI-commit-identity.md)),
-write-time validation ([C10](C10-write-time-validation.md), [G02](G02-shex.md)), storage
+write-time validation ([C10](C10-write-time-validation.md), [G02](G02-shex/README.md)), storage
 quotas, entity tags and graph-level access control ([C12](C12-graph-access-control.md)).
 The sources were the SPARQL 1.1 Update, Protocol and Graph Store Protocol standards,
 RFC 9110, the public documentation of Kubernetes' server-side dry run and of RDF4J's
@@ -619,6 +619,30 @@ writes one WAL insert record, and its receipt says `inserted: 1, deleted: 0`.
 * Cited from general knowledge, not fetched: SPARQL 1.1 Update and Protocol, RFC 9110,
   RFC 4918, RFC 6648, RFC 7240, Apache Jena's RDF Patch documentation, RDF4J's SHACL
   validation at `prepare()`.
+
+## Provenance
+
+This record preserves design sources, licensing and adoption decisions at the
+stages recorded below. Delivery statements in the record are historical. Current
+capabilities and remaining work are described by the spec status and Outcome.
+
+- **Spec:** [`C15-write-previews.md`](C15-write-previews.md), written on 2026-10-02
+  independently from:
+  - the Sparkles code and the specs CI, C10, C12 and G02;
+  - the W3C SPARQL 1.1 Graph Store HTTP Protocol (PUT, POST and PATCH semantics);
+  - the Kubernetes documentation of server-side dry run (the `dryRun` parameter, the
+    same pipeline and authorization, admission without side effects);
+  - the RDF4J `RepositoryConnection` Javadoc (`prepare` and `rollback`);
+  - SPARQL 1.1 Update and Protocol, RFC 9110, RFC 4918, RFC 6648, RFC 7240 and Apache
+    Jena's RDF Patch, cited from working knowledge.
+- **Implementation:** from the spec plus Sparkles code only.
+  - **Dependencies:** none added.
+- **Rejected** (spec §8):
+  - a separate preview endpoint and `Prefer: dry-run`;
+  - holding a previewed transaction for a later commit;
+  - a `200` for every outcome, and stopping at the first refusal;
+  - turning bulk writes into transactional ones for a preview;
+  - upsert and graph-sync verbs, which SPARQL Update and Graph Store `PUT` already cover.
 
 ## Outcome
 

@@ -342,6 +342,32 @@ longest hold.
    after the trigger. Whether a new branch's existing commits fire is undecided; the
    default chosen is that only commits after the branch's creation fire.
 
+## Provenance
+
+This record preserves design sources, licensing and adoption decisions at the
+stages recorded below. Delivery statements in the record are historical. Current
+capabilities and remaining work are described by the spec status and Outcome.
+
+The former registry's implementation paragraph refers to cache and query-memory
+work rather than this feature. That paragraph is retained as a historical
+registry error and is not evidence of this feature's implementation.
+
+- **Spec:** [`C23-batched-updates-and-triggers.md`](C23-batched-updates-and-triggers.md),
+  written on 2026-10-12 independently from:
+  - the public APOC documentation of `apoc.periodic.iterate`, `apoc.periodic.commit` and
+    the `apoc.trigger` procedures, and the Neo4j Cypher manual's `CALL { … } IN
+    TRANSACTIONS`;
+  - the PostgreSQL documentation of `CREATE TRIGGER` and trigger recursion;
+  - W3C SPARQL 1.1 Update;
+  - the Sparkles code and specs C09, C10, C12, C15, C21, F06, F13 and P06.
+- **Implementation:** Phase 1 (shared caches and the query memory pool) is built, with no new dependency and from the spec alone. Phases 2 and 3 are not built. The spec plans no new dependency.
+- **Rejected** (spec §8):
+  - a SPARQL grammar extension for batches;
+  - batches by `LIMIT` and `OFFSET`;
+  - triggers left to change-feed clients;
+  - unbounded recursion with a cycle detector;
+  - triggers that veto writes.
+
 ## Outcome
 
 Not built. See [ROADMAP](../ROADMAP.md) item 36.

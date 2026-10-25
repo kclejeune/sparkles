@@ -24,7 +24,7 @@ This design builds on schema discovery
 [C01](C01-observability-and-budgets.md) (implemented as `QueryOptions::max_memory_bytes`
 and `Error::BudgetExceeded`) and commit identity ([CI](CI-commit-identity.md), implemented
 as `Snapshot::commit` and `/$/commits`). Full-text search
-([F03](F03-full-text-search.md)) and vector search ([F04](F04-vector-search.md)) are
+([F03](F03-full-text-search/README.md)) and vector search ([F04](F04-vector-search.md)) are
 optional. The target protocol is **MCP revision `2026-07-28`**, the current revision on
 modelcontextprotocol.io as of 2026-09-30. The server keeps the legacy `2025-11-25` /
 `2025-06-18` handshake for clients that have not moved.
@@ -1446,6 +1446,52 @@ If day 2 slips, `explain_query` warnings beyond `unknown-term` move to Phase 2.
     [C06](C06-clone-to-sandbox.md) (style) and [PROVENANCE](PROVENANCE.md).
 - No planning document other than the specs listed above was read.
 
+## Provenance
+
+This record preserves design sources, licensing and adoption decisions at the
+stages recorded below. Delivery statements in the record are historical. Current
+capabilities and remaining work are described by the spec status and Outcome.
+
+- **Spec:** [`C11-mcp-server.md`](C11-mcp-server.md), written on 2026-09-30
+  independently from:
+  - the MCP specification, revision `2026-07-28`, fetched from modelcontextprotocol.io.
+    The parts read were versioning, the changelog, the base protocol, the stdio and
+    streamable HTTP transports, tools, resources, prompts, pagination, caching,
+    cancellation, authorization and the schema;
+  - the rmcp 3.5.0 crates.io record, its docs.rs pages, READMEs and `LICENSE`;
+  - JSON-RPC 2.0 and SPARQL 1.1, cited from working knowledge;
+  - the Sparkles code and specs C01, C02 and C06.
+- **Implementation:** from the spec plus Sparkles code only (2026-09-30), behind the
+  default-on `mcp` feature of `sparkles-server`.
+  - **Dependencies:** `rmcp` 3.5.0 (Apache-2.0), the official Rust SDK
+    (github.com/modelcontextprotocol/rust-sdk). It is pinned to `~3.5` with default
+    features off and only `server` and `transport-io` on, so there are no tool macros.
+    Its dependencies are MIT, Apache-2.0 or both, including `schemars` 1.2.2 (MIT). The
+    published crate carries no `LICENSE` file. The license text is in the upstream
+    repository.
+  - **HTTP transport** (2026-10-02): rmcp's `transport-streamable-http-server` feature
+    is on as well, for `/$/mcp`. It adds one crate, `sse-stream` 0.2.6 (MIT OR
+    Apache-2.0), which turns HTTP bodies into SSE streams. `tokio-util` 0.7 (MIT) became
+    a direct dependency of the `mcp` feature, for the token that ends the endpoint's
+    streams at shutdown. It was already in the tree through rmcp. The transport, its
+    session rules and the auth integration follow the C11 spec and the C09 permission
+    model.
+  - **Phase 3** (2026-10-03): completions, `subscriptions/listen` and the tasks extension
+    use rmcp 3.5's own handlers and its `task_manager`, with no new dependency. The
+    stdio-to-HTTP bridge uses the CLI's `reqwest` client and the credentials code of
+    `sparkles-client`. The header rules of the bridge follow the Streamable HTTP
+    transport of the MCP specification as rmcp checks them.
+- **Rejected** (spec §9):
+  - a hand-rolled JSON-RPC layer (the fallback, isolated behind `adapter.rs`);
+  - rmcp `#[tool]` macros with `schemars`-derived schemas;
+  - one generic `sparql` tool only;
+  - SPARQL JSON results as tool output;
+  - `structuredContent` plus the same rows as JSON text;
+  - protocol sessions or opaque snapshot handles;
+  - silently injecting `LIMIT`;
+  - listing the search tools only when the data supports them;
+  - SSE responses and progress notifications.
+
 ## Outcome
 
 **Phase 1 shipped on 2026-09-30**, with two Phase 2 tools brought forward.
@@ -1471,11 +1517,11 @@ as a stray notification or a stateless request without `_meta`. The loop starts 
 session on the same streams. It also answers malformed tool calls with `-32602`.
 
 `validate_shacl` and `validate_shex` were added on 2026-10-01, as a Phase 3 item of
-[G02](G02-shex.md). Three choices were made during implementation, and the maintainer may
+[G02](G02-shex/README.md). Three choices were made during implementation, and the maintainer may
 revisit them. Both tools are on by default; they are read-only and follow the same access
 rules as the query tool. `maxResults` defaults to 20. ShEx imports are refused.
 
-A `format` tool was added on 2026-10-02. It is the MCP tool that [X02](X02-formatter.md)
+A `format` tool was added on 2026-10-02. It is the MCP tool that [X02](X02-formatter/README.md)
 deferred. It formats SPARQL, Turtle, TriG, N-Triples, N-Quads and JSON-LD with the engine
 of `sparkles fmt`, and it takes the camelCase style options of `POST /$/format`. Like the
 other tools, it is read-only and closed-world, and it answers with `structuredContent`.
@@ -1606,7 +1652,7 @@ since the design added five tools or arguments.
 - **New tools.** `find_paths` writes a `SERVICE path:search` block
   ([F07](F07-path-search.md)) from its arguments, with validated IRIs, and returns each
   path's ends, length, cost and edges, at most 100 paths and 2000 edges.
-  `graphql_query` runs a GraphQL document ([C03](C03-graphql.md)) as a `GET` would, so
+  `graphql_query` runs a GraphQL document ([C03](C03-graphql/README.md)) as a `GET` would, so
   mutations are refused, on the call's snapshot. Without `query` it returns the API
   schema. It is listed only while a dataset that the caller may query through GraphQL
   has a schema, and `list_datasets` marks such datasets with `graphql: true`.

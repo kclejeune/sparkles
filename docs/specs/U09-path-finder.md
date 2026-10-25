@@ -304,6 +304,23 @@ how.
    forward only, which would make the limit easier to explain but would skip nodes that a
    forward search would pass cheaply.
 
+## Provenance
+
+This record preserves design sources, licensing and adoption decisions at the
+stages recorded below. Delivery statements in the record are historical. Current
+capabilities and remaining work are described by the spec status and Outcome.
+
+- **Spec:** [`U09-path-finder.md`](U09-path-finder.md), written on 2026-10-23 independently from:
+  - J. Y. Yen, "Finding the k Shortest Loopless Paths in a Network", Management Science, 1971;
+  - the WAI-ARIA combobox and listbox patterns;
+  - the Sparkles code (`pathsearch.rs`, `GraphView`, Explore) and specs C02, C12, C12b, F07,
+    U01 and U06.
+- **Implementation:** not built. No new dependency is planned.
+- **Rejected** (spec §10):
+  - nested patterns as the exclusion mechanism;
+  - paths computed in the browser;
+  - literals excluded by default.
+
 ## Outcome
 
 Phases 1 and 2 shipped on 2026-10-23 and Phase 3 on 2026-10-24, which completes

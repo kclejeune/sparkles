@@ -886,6 +886,12 @@ Expect `outcome="cancelled"` = 1 and `sparkles_requests_active{operation="query"
   - `tracing-subscriber` 0.3.23 `Cargo.toml`: `json` pulls in `tracing-serde`, `serde`
     and `serde_json`.
 
+## Provenance
+
+The [design source list](#10-sources) records this spec's existing sources.
+Its Outcome records implementation decisions and departures. No separate
+adoption entry existed in the former central provenance registry.
+
 ## Outcome
 
 **Executor extension.** [X05](X05-streaming-query-execution.md) specifies cursor-owned

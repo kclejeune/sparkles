@@ -23,7 +23,7 @@ checks of the store (`crates/sparkles-core/src/builder.rs`, `store.rs`, `commit.
 `vocab/delta.rs`, `check.rs`) and of backups (`crates/sparkles-backup`). It also draws on
 [DEVELOPMENT.md](../DEVELOPMENT.md#releases), the stability notes in
 [USAGE.md](../USAGE.md) and the README, and the specs [P01](P01-python-bindings.md),
-[P04](P04-jvm-bindings.md), [P05](P05-node-bindings.md), [F05](F05-snapshot-repositories.md)
+[P04](P04-jvm-bindings/README.md), [P05](P05-node-bindings.md), [F05](F05-snapshot-repositories/README.md)
 and [F11](F11-encryption-at-rest.md). The external sources are Semantic Versioning 2.0.0,
 the Cargo book's chapter on SemVer compatibility, PEP 425 and PEP 600 (wheel tags and
 manylinux), PEP 656 (musllinux), PEP 703 (free-threaded CPython), PEP 740 (index
@@ -609,6 +609,28 @@ Phase 3 should land before the first release so that 0.1's databases can be read
    as the JVM loader already does for its DLL copies.
 5. **The 0.x window.** One minor release may be too short if releases are frequent.
    Default: one, revisited after three releases. Decided (2026-10-13): keep this default.
+
+## Provenance
+
+This record preserves design sources, licensing and adoption decisions at the
+stages recorded below. Delivery statements in the record are historical. Current
+capabilities and remaining work are described by the spec status and Outcome.
+
+- **Spec:** [`X12-release-engineering.md`](X12-release-engineering.md), written on 2026-10-12 independently from:
+  - Semantic Versioning 2.0.0 and the Cargo book's chapter on SemVer compatibility;
+  - PEP 425, PEP 600, PEP 656, PEP 703 and PEP 740 (wheel tags, manylinux, musllinux,
+    free-threaded CPython and index attestations);
+  - the SLSA 1.0 build provenance specification, the in-toto attestation format, the
+    Sigstore documentation of keyless signing, GitHub's documentation of artifact
+    attestations and npm's documentation of `--provenance`;
+  - the OCI image index specification;
+  - RFC 8594 (`Sunset`) and RFC 9745 (`Deprecation`);
+  - the Sparkles code (the workflows, `Dockerfile`, `nix/image.nix`, `nix/package.nix`,
+    the Helm chart, the manifests, and the version checks of the store and of backups),
+    DEVELOPMENT.md, USAGE.md, and specs P01, P04, P05, F05 and F11.
+- **Implementation:** not built. The spec plans no new runtime dependency. The release
+  workflow would add GitHub's `actions/attest-build-provenance` and `cargo semver-checks`
+  as CI tools, which are never linked into a binary.
 
 ## Outcome
 

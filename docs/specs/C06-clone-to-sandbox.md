@@ -74,7 +74,7 @@ reasoning status. Both also need the operator to pick a moment when nobody write
 | Query result cache, block cache | no | They live in memory only. |
 | Registry entry, tasks | new entry for the destination only | |
 | Commit history and dataset id ([CI](CI-commit-identity.md)) | no | The destination gets a **new** dataset id and a root commit `seq 0` (CI kind `create`). The source's id and `seq` survive only as `forkedFrom` in `origin.json`. |
-| Future: text / vector indexes ([F03](F03-full-text-search.md), [F04](F04-vector-search.md)) | no | The clone should copy their *configuration* and rebuild the indexes in the destination. Those specs decide. |
+| Future: text / vector indexes ([F03](F03-full-text-search/README.md), [F04](F04-vector-search.md)) | no | The clone should copy their *configuration* and rebuild the indexes in the destination. Those specs decide. |
 
 The clone writes `origin.json` (format version 1) into the destination directory:
 
@@ -398,7 +398,7 @@ reflinks and falls back to plain copies. It uses hard links only with an explici
 **Phase 3:**
 
 - cloning at a past commit (`?at=` from [F06](F06-snapshots-and-point-in-time.md));
-- cloning across servers through archives ([F05](F05-snapshot-repositories.md));
+- cloning across servers through archives ([F05](F05-snapshot-repositories/README.md));
 - branch and merge semantics.
 
 ## 7. Acceptance examples
@@ -534,6 +534,12 @@ most the final source count. The source ends with all 100 inserts.
   and were not re-fetched.
 - The Linux `ioctl_ficlone(2)` and `copy_file_range(2)` man pages, for the Phase 2
   reflink fallback. Cited from working knowledge.
+
+## Provenance
+
+The [design source list](#10-sources) records this spec's existing sources.
+Its Outcome records implementation decisions and departures. No separate
+adoption entry existed in the former central provenance registry.
 
 ## Outcome
 

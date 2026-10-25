@@ -210,6 +210,13 @@ The sources are the current Sparkles settings, GraphRAG implementation, format r
 and C22's published design sources. This spec adopts no external code, ontology or
 runtime dependency.
 
+## Provenance
+
+This design shares the [evidence and analysis provenance record](shared/PROVENANCE.md#evidence-durable-work-and-maintained-analysis)
+with C25, C26, C27, F22 and C22b. The record preserves their common standards
+and each profile's adopted and rejected decisions. It does not imply shared
+implementation status. This spec's status and Outcome describe its delivery.
+
 ## Outcome
 
 Multiple report configurations remain planned under roadmap item 100. The currently

@@ -22,7 +22,7 @@ compaction in LevelDB and RocksDB, QLever's background index rebuild, PostgreSQL
 autovacuum thresholds and TDB2's compaction. The spec builds on
 durable commit identity ([CI](CI-commit-identity.md)), retained generations and named
 snapshots ([F06](F06-snapshots-and-point-in-time.md)), backup leases
-([F05](F05-snapshot-repositories.md)), and the storage quotas and budgets of
+([F05](F05-snapshot-repositories/README.md)), and the storage quotas and budgets of
 [C01](C01-observability-and-budgets.md).
 
 ## 1. Summary, goals, non-goals
@@ -371,7 +371,7 @@ pin reserves its generation when it is made.
 ### 4.6 Backups and restores
 
 A backup capture leases the current generation and reads its files while the upload
-runs ([F05 §2.2](F05-snapshot-repositories.md)). A compaction during the upload is safe,
+runs ([F05 §2.2](F05-snapshot-repositories/README.md)). A compaction during the upload is safe,
 but it leaves two full indexes on disk until the upload ends, and the next incremental
 backup uploads the whole new generation. An automatic compaction waits with `backup`
 while a lease is held on the current generation.
@@ -710,6 +710,32 @@ tables and how to run them.
 * Apache Jena's TDB2 documentation of `tdb2.tdbcompact` and Fuseki's `/$/compact`.
 * The Sparkles code, the F05, F06 and C01 specs, and the storage quota rules in
   [API.md](../API.md#storage-quotas).
+
+## Provenance
+
+This record preserves design sources, licensing and adoption decisions at the
+stages recorded below. Delivery statements in the record are historical. Current
+capabilities and remaining work are described by the spec status and Outcome.
+
+- **Spec:** [`C13-automatic-compaction.md`](C13-automatic-compaction.md), written on
+  2026-10-02 independently from:
+  - the Sparkles code and the [F05](F05-snapshot-repositories/README.md),
+    [F06](F06-snapshots-and-point-in-time.md) and
+    [C01](C01-observability-and-budgets.md) specs;
+  - QLever's `--rebuild-index-strategy` option and the comments of its `DeltaTriples.h`,
+    `IndexRebuilder.h` and `IndexSwap.h` headers (Apache-2.0), read for behaviour;
+  - LSM compaction in LevelDB and RocksDB, PostgreSQL's autovacuum thresholds and Jena
+    TDB2's compaction, cited from their public documentation and general knowledge.
+- **Implementation** (2026-10-02): from the spec and the Sparkles code. No code was copied
+  from QLever. **Dependencies:** none new. `libc`'s `setpriority`, already a dependency of
+  the engine on Unix, lowers the build threads' priority.
+- **Rejected** (spec §8):
+  - holding the writer lock for the whole automatic build;
+  - a thread per dataset;
+  - carrying the net delta instead of each commit;
+  - refusing writes during a build;
+  - a size-only or ratio-only trigger;
+  - compacting every idle period whatever the delta's size.
 
 ## Outcome
 

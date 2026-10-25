@@ -22,7 +22,7 @@ This design was written from the Sparkles code at `fc123d04` (the store's caches
 query context and its charges, the cursor operators, the server's limits and flags), the
 specs [C01](C01-observability-and-budgets.md), [X05](X05-streaming-query-execution.md),
 [F11](F11-encryption-at-rest.md), [C13](C13-automatic-compaction.md),
-[P01](P01-python-bindings.md) and [F03](F03-full-text-search.md), the measurements in
+[P01](P01-python-bindings.md) and [F03](F03-full-text-search/README.md), the measurements in
 [BENCHMARKS](../BENCHMARKS.md#memory-and-the-speed-it-buys), and published work on
 external hashing and sorting: M. Kitsuregawa, H. Tanaka and T. Moto-oka, "Application of
 Hash to Data Base Machine and Its Architecture", New Generation Computing 1(1), 1983 (the
@@ -707,6 +707,36 @@ index.
    they run?
 4. Is 16 MiB the right initial grant for admission? Small queries need far less, and a
    smaller grant admits more of them at once.
+
+## Provenance
+
+This record preserves design sources, licensing and adoption decisions at the
+stages recorded below. Delivery statements in the record are historical. Current
+capabilities and remaining work are described by the spec status and Outcome.
+
+- **Spec:** [`X08-disk-spill-and-server-memory.md`](X08-disk-spill-and-server-memory.md),
+  written on 2026-10-12 as internal engineering from:
+  - the Sparkles code at `fc123d04`: the store's caches and `StoreOptions`, the query
+    context's charges, the cursor operators, the catalog, and the server's limits, flags,
+    rate limiter and metrics;
+  - the specs C01, X05, F11, C13, P01 and F03, and the memory measurements in BENCHMARKS;
+  - Kitsuregawa, Tanaka and Moto-oka, "Application of Hash to Data Base Machine and Its
+    Architecture" (New Generation Computing, 1983), DeWitt et al., "Implementation
+    Techniques for Main Memory Database Systems" (SIGMOD 1984), Graefe, "Query Evaluation
+    Techniques for Large Databases" (ACM Computing Surveys, 1993), Knuth, *The Art of
+    Computer Programming*, Vol. 3, and Kuiper, Boncz and Mühleisen, "Robust External Hash
+    Aggregation in the Solid State Age" (ICDE 2024);
+  - the Linux `open(2)` manual page (`O_TMPFILE`) and the cgroup v2 documentation.
+- **Implementation:** Phase 1 (shared caches and the query memory pool) is built, with no new dependency and from the spec alone. Phases 2 and 3 are not built. The spec plans no new dependency. Spill encryption uses
+  `aws-lc-rs`, which `sparkles-backup` already uses for encrypted repositories, and the
+  caches stay on `quick_cache`. No code from other database systems is adopted.
+- **Rejected** (spec §12):
+  - dividing the cache size by the number of datasets;
+  - a memory-mapped scratch area;
+  - spill in the eager executor;
+  - sort-merge join as the only spilled join;
+  - waiting for memory during execution;
+  - spill files under the dataset directory.
 
 ## Outcome
 

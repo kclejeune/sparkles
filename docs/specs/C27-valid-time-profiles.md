@@ -347,6 +347,13 @@ Destructively expiring source facts was rejected because expiry is an assessment
 - [C25](C25-evidence-and-assessments.md), [C26](C26-durable-jobs-and-delivery.md) and
   [F22](F22-analysis-lifecycle.md) define evidence, scheduling and assessment lifecycle.
 
+## Provenance
+
+This design shares the [evidence and analysis provenance record](shared/PROVENANCE.md#evidence-durable-work-and-maintained-analysis)
+with C25, C26, C27, F22 and C22b. The record preserves their common standards
+and each profile's adopted and rejected decisions. It does not imply shared
+implementation status. This spec's status and Outcome describe its delivery.
+
 ## Outcome
 
 No phase is implemented. The profile, helper, configuration and event-time control are

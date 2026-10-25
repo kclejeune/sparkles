@@ -238,6 +238,22 @@ Phase 3 adds JVM callbacks first, then the Python and Node adapters once their d
 contracts are proved. Each phase updates the API docs, extension descriptions and
 binding-map coverage.
 
+## Provenance
+
+This record preserves design sources, licensing and adoption decisions at the
+stages recorded below. Delivery statements in the record are historical. Current
+capabilities and remaining work are described by the spec status and Outcome.
+
+- **Spec:** [P03-query-extensions.md](P03-query-extensions.md), written on
+  2026-10-05 independently from Sparkles' query options, expression dispatcher,
+  extension catalog and binding lifecycle code; the W3C SPARQL 1.1 Query standard;
+  Apache Jena's published scalar/property-function documentation; and DataFusion's
+  published volatility documentation. The spec links those primary sources.
+- **Implementation:** implemented in part. The Rust scalar, aggregate and property
+  function registries are built on Sparkles' own expression dispatcher, aggregate
+  evaluation and planner. Dynamic registered dispatch and foreign-language callbacks
+  are not built. The implementation adds no dependency.
+
 ## Outcome
 
 The Rust scalar slice provides immutable registry builders and identities, arity and
@@ -326,7 +342,7 @@ open.
 
 * **What already works for Java.** A query that calls a function registered in Jena's
   `FunctionRegistry`, a property function in its `PropertyFunctionRegistry` or a
-  custom aggregate runs today: the fallback detector of [P04](P04-jvm-bindings.md)
+  custom aggregate runs today: the fallback detector of [P04](P04-jvm-bindings/README.md)
   (§3.5, cases 1 to 3)
   sends the whole query to ARQ over the Sparkles `DatasetGraph`. The new Java work is
   native dispatch, so such a query stays in the Sparkles engine and only the function

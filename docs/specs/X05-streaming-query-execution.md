@@ -582,6 +582,35 @@ resource contracts come from the existing specs [C01](C01-observability-and-budg
 [P06](P06-library-admin-api.md). Phases 1 and 2 add no dependency.
 [PROVENANCE](PROVENANCE.md) records these sources.
 
+## Provenance
+
+This record preserves design sources, licensing and adoption decisions at the
+stages recorded below. Delivery statements in the record are historical. Current
+capabilities and remaining work are described by the spec status and Outcome.
+
+- **Spec:** [X05-streaming-query-execution.md](X05-streaming-query-execution.md),
+  written on 2026-10-07 as internal engineering from Sparkles at `a6b6b449`:
+  the native SPARQL executor/planner, snapshot block/delta scans, query context and
+  vocabulary, result writers, bounded HTTP serialization and embedding APIs.
+  The existing C01, C12, C12b, F06, F11, G06, P03 and P06 specs supply its semantic,
+  access, budget, history, encryption and lifecycle requirements.
+- **Implementation:** implemented in part. Snapshot-owning SELECT and graph cursors,
+  standard and native writers, and the HTTP, CLI and foreign binding integrations
+  share the existing planner and executor. Joins and charged blocking operators fail
+  explicitly when they exceed the query budget, because disk spill is not built.
+  Batch-local expression reuse and vocabulary key tests adapt Sparkles' own
+  exprcache and keyfilter code. Budgeted regex expressions use `regex-automata`
+  0.4.18 (MIT OR Apache-2.0), which was already a transitive dependency of `regex`
+  and is now declared directly. Its published API documentation for `meta::Regex`
+  and `Cache` sizing and configuration, PikeVM capture slots, empty-match handling
+  in `Searcher` and capture interpolation informed the query-owned cache and its
+  conservative reservations. A later spill design must record any adopted
+  implementation or dependency before it lands.
+- **Rejected:** pagination of a completed table as an execution solution,
+  repeated prefix execution, immediate replacement of the eager executor,
+  unbounded background queues, hidden materialization/state growth, and guessed
+  automatic row-count thresholds. See X05 §11.
+
 ## Outcome
 
 The implementation exposes explicit SELECT, graph and ASK execution that owns its

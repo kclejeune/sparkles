@@ -192,7 +192,7 @@ and named in the report:
   Sparkles has an analyzer for. Each language gets the analyzer closest to Lucene's,
   which is the one that follows Lucene's for English, French, Spanish, Italian,
   Portuguese, German, Dutch, Russian, Swedish, Chinese, Japanese and Korean, and the
-  Snowball one for the others ([F03](F03-full-text-search.md#outcome)). Stop words,
+  Snowball one for the others ([F03](F03-full-text-search/SPEC.md#outcome)). Stop words,
   keyword analyzers, `text:ConfigurableAnalyzer`, `text:DefinedAnalyzer` and
   `text:queryAnalyzer` have no equivalent.
 - `text:propLists`.
@@ -347,6 +347,34 @@ command (`mod.rs`). The endpoint table of §5.1 moves out of
 the tests are copied unchanged into `testsuite/fuseki/jena` with Jena's license
 and notice.
 
+## Provenance
+
+This record preserves design sources, licensing and adoption decisions at the
+stages recorded below. Delivery statements in the record are historical. Current
+capabilities and remaining work are described by the spec status and Outcome.
+
+- **Spec:** [`G08-fuseki-configuration.md`](G08-fuseki-configuration.md), written on
+  2026-10-03 independently from:
+  - the Sparkles code, including the assembler bodies of `POST /$/datasets`, the auth
+    configuration and the settings files of each dataset;
+  - Apache Jena's sources (Apache-2.0): Fuseki's `FusekiConfig`, `FusekiServer.Builder`,
+    `FusekiVocab`, `Auth`, `Users`, `BuildLib` and `FMod_Shiro`, the assemblers' vocabularies
+    `TextVocab`, `VocabGeoSPARQL` with `GeoAssembler`, and `VocabSecurity`, read for
+    behaviour and defaults. No code was copied;
+  - Jena's example configurations in `jena-fuseki2/examples` and the test
+    configurations in `jena-fuseki2/jena-fuseki-main/testing` and
+    `jena-integration-tests/src/test/files/GeoAssembler`, copied unchanged into
+    `testsuite/fuseki/jena` with Jena's license and notice;
+  - Apache Shiro's documentation of `shiro.ini` and Eclipse Jetty's documentation of its
+    realm properties file.
+- **Implementation** (2026-10-03): from the spec and the Sparkles code. **Dependencies:**
+  none new.
+- **Rejected** (spec §9):
+  - reading assembler files as Sparkles' own configuration;
+  - approximating `localhostFilter` with anonymous grants;
+  - per-dataset timeouts;
+  - dataset aliases.
+
 ## Outcome
 
 **Delivered.** All of §2 to §7 landed on 2026-10-03 in
@@ -441,7 +469,7 @@ route in C19's settings, and assembler bodies, remain with item 76 below.
 
 **Item 76 (Tier 5, [ROADMAP](../ROADMAP.md)): complete assembler bodies, and Graph Store
 direct naming per dataset.** The item's third part, JVM metrics, belongs to
-[P04](P04-jvm-bindings.md).
+[P04](P04-jvm-bindings/README.md).
 
 * **What is missing today: assembler bodies.** `POST /$/datasets` with a Fuseki service
   description is read by `crates/sparkles-server/src/http/fuseki/assembler.rs`, not by the

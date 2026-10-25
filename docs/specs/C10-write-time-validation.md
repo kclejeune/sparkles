@@ -9,7 +9,7 @@
 > a status panel on the dataset page. Phase 3 shipped: localizable SHACL-SPARQL,
 > `sh:targetWhere`, the refinement of F3, the `unvalidated` catalog flag,
 > `serve --validate` and mixed shapes sources. ShEx later became a second guard language
-> ([G02](G02-shex.md)), and its guard is incremental too. The focus-node histogram of
+> ([G02](G02-shex/README.md)), and its guard is incremental too. The focus-node histogram of
 > §2.6, the panel's configuration form and the query page's results table for a `422`
 > are also implemented, for both SHACL and ShEx.
 >
@@ -1086,6 +1086,38 @@ with strategy `incremental`, in < 5 ms.
   * J. Corman, J. L. Reutter, O. Savković, "Semantics and validation of recursive SHACL",
     ISWC 2018.
 
+## Provenance
+
+This record preserves design sources, licensing and adoption decisions at the
+stages recorded below. Delivery statements in the record are historical. Current
+capabilities and remaining work are described by the spec status and Outcome.
+
+- **Spec:** [`C10-write-time-validation.md`](C10-write-time-validation.md), written on
+  2026-09-30 independently from:
+  - the Sparkles code and specs (CI, C08, C06, C01);
+  - W3C SHACL, SHACL 1.2 Core (Working Draft), SPARQL 1.1 Update and Protocol, and
+    Apache Jena's SHACL documentation (Apache-2.0), all fetched;
+  - RFC 9110 and RFC 9651, cited from general knowledge;
+  - four papers on integrity checking and view maintenance, cited from general
+    knowledge: Nicolas 1982; Blakeley, Larson and Tompa 1986; Gupta and Mumick 1995;
+    Corman, Reutter and Savković 2018.
+- **Implementation:** from the spec plus Sparkles code only (2026-09-30). There are no
+  new third-party dependencies. `sparkles-shacl` now uses `serde`, `serde_json`,
+  `parking_lot`, `sha2` and `tempfile`, which were all already in the workspace.
+- **Rejected** (spec §9):
+  - validating after commit and reverting with a compensating commit;
+  - validating only the request's data;
+  - validating each operation of a multi-operation update;
+  - a guard in the HTTP layer only;
+  - validating outside the writer lock;
+  - validating the bulk batch through `view()`;
+  - `409 Conflict` or `400 Bad Request` for rejected writes (`422` instead);
+  - referencing the shapes file by path;
+  - rejecting on any result (`sh:conforms false`);
+  - a default reserved shapes graph name;
+  - honoring `sh:shapesGraph` triples in the data;
+  - diff semantics (new results only) as the Phase 1 default.
+
 ## Outcome
 
 **Phase 1 shipped on 2026-09-30** in three steps:
@@ -1124,7 +1156,7 @@ still establishes its grandfather baseline from the current report.
   memory, because Phase 1 does not persist it.
 - The library gained a public `GuardObserver` trait, which the server uses for its metrics
   and logs.
-- When ShEx became a second guard language ([G02](G02-shex.md) Phase 2), the configuration
+- When ShEx became a second guard language ([G02](G02-shex/README.md) Phase 2), the configuration
   gained `language`.
   - The maintainer decided that `validation.json` is always written as format 2 with
     `language`, SHACL included. Format 1 files are still read. The file is internal, so
@@ -1261,7 +1293,7 @@ configuration form and the `422` results table were completed later, as recorded
 - **Mixed shapes sources.** `shapes` may name graphs and a file together, and the CLI
   takes `--shapes` with `--shapes-graph`. The file's triples, with fresh blank nodes,
   are merged with the graphs. A write to a shapes graph merges the file's shapes again.
-- **Grandfather mode for ShEx** shipped with this phase ([G02](G02-shex.md#outcome)).
+- **Grandfather mode for ShEx** shipped with this phase ([G02](G02-shex/SPEC.md#outcome)).
 - **Tests.** A15 gained random `sh:targetWhere` targets with and without narrowing, nine
   query forms of SHACL-SPARQL constraints, seven anchored and two not, and an ASK
   component on random paths. It also counts the writes that change `rdfs:subClassOf` and

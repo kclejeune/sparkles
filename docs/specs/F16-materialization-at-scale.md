@@ -687,6 +687,29 @@ without reasoning, and the status is fresh within 10 s after the writes stop.
 5. Does the reasoning pool need its own memory limit under C01's planned server-wide
    pool (X08)? The spec gives runs `max_memory` and leaves the pool to X08.
 
+## Provenance
+
+This record preserves design sources, licensing and adoption decisions at the
+stages recorded below. Delivery statements in the record are historical. Current
+capabilities and remaining work are described by the spec status and Outcome.
+
+- **Spec:** [`F16-materialization-at-scale.md`](F16-materialization-at-scale.md), written on 2026-10-12 independently from:
+  - W3C OWL 2 Web Ontology Language Profiles (the OWL 2 RL/RDF rules, including the `eq-*` and `dt-*` rules), RDF 1.1 Semantics and XML Schema Definition Language 1.1 Part 2: Datatypes, cited from working knowledge and not re-fetched;
+  - Motik, Nenov, Piro, Horrocks and Olteanu, "Parallel materialisation of Datalog programs in centralised, main-memory RDF systems" (AAAI 2014);
+  - Motik, Nenov, Piro and Horrocks, "Handling owl:sameAs via Rewriting" (AAAI 2015), "Incremental Update of Datalog Materialisation: the Backward/Forward Algorithm" (AAAI 2015) and "Combining Rewriting and Incremental Materialisation Maintenance for Datalog Programs with Equality" (IJCAI 2015);
+  - Guo, Pan and Heflin, "LUBM: A benchmark for OWL knowledge base systems" (Journal of Web Semantics, 2005), and the public description of OWL2Bench (Singh, Bhatia and Mutharaju, ISWC 2020);
+  - the Sparkles code (`crates/sparkles-reasoner`, `crates/sparkles-core/src/{index.rs,store.rs,store/compaction.rs,sparql/}`) and specs C08, C12b, C13, CI, F06, F09, F13, F17, F18 and X06.
+- **Implementation:** not built. The spec plans no new runtime dependency. The union-find and the derived layer reuse the existing index builder and block format.
+- **Rejected** (spec §13):
+  - spilling the in-memory graph to disk;
+  - derived facts in the base indexes with a flag column;
+  - full `owl:sameAs` materialization with compression;
+  - rewriting base facts to representatives in the store;
+  - choosing representatives by IRI order or usage;
+  - DRed for equality;
+  - a thread per rule;
+  - moving the reasoner onto F13's fixed-point operator now.
+
 ## Outcome
 
 **Phase 1 built** on 2026-10-13. A review on 2026-10-16 led to the fixes recorded below.

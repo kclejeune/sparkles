@@ -21,10 +21,10 @@ draft, the public documentation of AWS KMS, Google Cloud KMS, HashiCorp Vault Tr
 CockroachDB, MongoDB, SQLCipher, OpenZFS and Linux fscrypt, the PostgreSQL wiki page on
 transparent data encryption, RocksDB's public `env_encryption.h` header, the design
 documents of restic and borg, the age format and the FastCDC paper. §15 lists them. It
-builds on backup repositories ([F05](F05-snapshot-repositories.md)), automatic compaction
+builds on backup repositories ([F05](F05-snapshot-repositories/README.md)), automatic compaction
 ([C13](C13-automatic-compaction.md)), the full-text, vector and spatial indexes
-([F03](F03-full-text-search.md), [F04](F04-vector-search.md),
-[G01](G01-geosparql.md)), the codecs of [X01](X01-compression-codecs.md), durable commit
+([F03](F03-full-text-search/README.md), [F04](F04-vector-search.md),
+[G01](G01-geosparql/README.md)), the codecs of [X01](X01-compression-codecs.md), durable commit
 identity ([CI](CI-commit-identity.md)) and retained history
 ([F06](F06-snapshots-and-point-in-time.md)).
 
@@ -1469,9 +1469,9 @@ they hold.
     `text-index`, `geo-index`) and listed with `find`, for the file inventory of §7.1;
   * `Cargo.lock`: `aws-lc-rs` 1.18.1, `argon2` 0.6.0, `zeroize` 1.9.0, `sha2` 0.11.0,
     `memmap2` 0.9.11, `quick_cache` 0.7.0, `tantivy` 0.26.2, `object_store` 0.14.2;
-  * the specs [F05](F05-snapshot-repositories.md), [C13](C13-automatic-compaction.md),
+  * the specs [F05](F05-snapshot-repositories/README.md), [C13](C13-automatic-compaction.md),
     [X01](X01-compression-codecs.md), §4.3 and §5.5 of [CI](CI-commit-identity.md), the
-    outlines of [F03](F03-full-text-search.md) and
+    outlines of [F03](F03-full-text-search/README.md) and
     [F04](F04-vector-search.md), [PROVENANCE.md](PROVENANCE.md), and `docs/API.md` on the
     access log and spooled bodies.
 * **Fetched, standards and papers:**
@@ -1534,6 +1534,43 @@ they hold.
   development laptop, for §10.
 * No source code of restic, borg, CockroachDB, MongoDB, SQLCipher or PostgreSQL was
   read. The RocksDB header was read for its interface and comments only.
+
+## Provenance
+
+This record preserves design sources, licensing and adoption decisions at the
+stages recorded below. Delivery statements in the record are historical. Current
+capabilities and remaining work are described by the spec status and Outcome.
+
+- **Spec:** [`F11-encryption-at-rest.md`](F11-encryption-at-rest.md), written on
+  2026-10-02 independently from:
+  - the Sparkles code, the file layout of a database built with the release binary, and
+    the [F05](F05-snapshot-repositories/README.md), [C13](C13-automatic-compaction.md) and
+    [X01](X01-compression-codecs.md) specs;
+  - NIST SP 800-38D, draft-irtf-cfrg-xchacha-03 and the FastCDC paper (USENIX ATC 2016);
+  - the public documentation of restic and borg (BSD-licensed), CockroachDB, MongoDB,
+    SQLCipher, AWS KMS, Google Cloud KMS, HashiCorp Vault Transit, OpenZFS and Linux
+    fscrypt, the PostgreSQL wiki page on transparent data encryption, and RocksDB's
+    public `env_encryption.h` header, all read for design ideas only. No source code of
+    these projects was read;
+  - RFCs 2104, 5869, 8439, 8452 and 9106, NIST SP 800-108, the age format and the PADMÉ
+    padding paper, cited from general knowledge.
+- **Planned dependencies:** none new for Phases 1 and 3 beyond moving existing crates.
+  `aws-lc-rs` 1.18 (ISC AND Apache-2.0-or-ISC) is already in the tree through `rustls`.
+  It becomes a direct dependency of `sparkles-backup`, and of `sparkles` behind a `crypt`
+  feature, for AES-256-GCM, HKDF and HMAC. `argon2` 0.6 (MIT/Apache-2.0) and `zeroize` 1.x
+  (MIT/Apache-2.0) are already dependencies. Phase 2 adds the `age` crate
+  (MIT/Apache-2.0). The AWS and Google Cloud KMS clients would come behind cargo features
+  (spec open question 11). FastCDC is to be written from the paper, because it needs a
+  keyed gear table.
+- **Rejected** (spec §13):
+  - unauthenticated CTR or XTS modes at the file layer;
+  - decrypting whole indexes into memory at open;
+  - SQLCipher-style fixed pages for the permutation files;
+  - random 96-bit GCM nonces, XChaCha20-Poly1305 as the only cipher, and AES-GCM-SIV;
+  - convergent encryption for backups;
+  - backing up sealed files instead of their logical plaintext;
+  - encrypting only the vocabulary;
+  - a 7-day default rotation of data keys.
 
 ## Outcome
 

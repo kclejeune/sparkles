@@ -618,6 +618,40 @@ Deno and edge variants, and the measurements of §14.2.
   `sparql/depth.rs`, `codec.rs`, the server's `http/changes.rs`, and `ui/src/lib/api.ts`.
   The specs P05 §12, F06, F09, F10, C09, C12, C12b and X01.
 
+## Provenance
+
+This record preserves design sources, licensing and adoption decisions at the
+stages recorded below. Delivery statements in the record are historical. Current
+capabilities and remaining work are described by the spec status and Outcome.
+
+- **Spec:** [`F20-local-first-engine.md`](F20-local-first-engine.md), written on
+  2026-10-12 independently from:
+  - the WebAssembly Core Specification and the wasm-bindgen guide;
+  - the WHATWG File System Standard and MDN's documentation of the Origin Private File
+    System and `FileSystemSyncAccessHandle`, the WHATWG Storage Standard, the Indexed
+    Database API, the Web Locks API and `BroadcastChannel`, cited from working knowledge;
+  - Kleppmann, Wiggins, van Hardenberg and McGranaghan, "Local-first software: You own
+    your data, in spite of the cloud" (Onward! 2019);
+  - the RDF Patch documentation, as used by F10;
+  - the Sparkles code (`sparkles-fmt-wasm`, `sparkles-core`'s dependencies, `index.rs`,
+    `vocab.rs`, `store.rs`, `store/wal.rs`, `store/patch_apply.rs`,
+    `store/branching.rs`, `store/changes.rs`, `http/changes.rs`, `ui/src/lib/api.ts`)
+    and specs P05 §12, F06, F09, F10, C09, C12, C12b and X01.
+- **Implementation:** not built. Planned dependencies:
+  - `wasm-bindgen`, `js-sys` and `web-sys` (MIT OR Apache-2.0), already in the lock for
+    `sparkles-fmt-wasm`, with `web-sys`'s file system access features;
+  - `getrandom` with `wasm_js` (MIT OR Apache-2.0), as in `sparkles-fmt-wasm`;
+  - `ruzstd` (MIT), the pure-Rust zstd decoder that X01 designed as `zstd-decode-pure`;
+  - development tools, not linked: the wasm-bindgen CLI (MIT OR Apache-2.0) and Binaryen's
+    `wasm-opt` (Apache-2.0).
+- **Rejected** (spec §15):
+  - CRDTs for merging RDF;
+  - napi-rs's WASI target as the browser build;
+  - sync through SPARQL Update;
+  - F10 Phase 2's read-replica protocol for writable replicas;
+  - IndexedDB as the store;
+  - the sync logic in TypeScript.
+
 ## Outcome
 
 Not built. See [ROADMAP](../ROADMAP.md) item 44.

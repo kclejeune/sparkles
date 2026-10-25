@@ -29,7 +29,7 @@ Sparkles code. It builds on materialization and diagnostics
 ([F13](F13-incremental-views-and-provenance.md)), branches and merges
 ([F09](F09-branches-and-merges.md)), write previews ([C15](C15-write-previews.md)),
 triple protections ([C12b](C12b-triple-access-control.md)), agent memory and its review
-([C17](C17-agent-memory.md), [C18](C18-natural-language-questions-and-ingest.md)) and the
+([C17](C17-agent-memory.md), [C18](C18-natural-language-questions-and-ingest/README.md)) and the
 MCP server ([C11](C11-mcp-server.md)).
 
 ## 1. Summary, goals, non-goals
@@ -515,6 +515,27 @@ naming `cax-sco` (OWL 2 RL) or `rdfs9` (RDFS).
    block? The spec reports the blocking fact and does not propose its removal.
 4. Should entailment diffs be computed for every merge by default when the target has a
    materialization? The cost is one incremental update per merge preview.
+
+## Provenance
+
+This record preserves design sources, licensing and adoption decisions at the
+stages recorded below. Delivery statements in the record are historical. Current
+capabilities and remaining work are described by the spec status and Outcome.
+
+- **Spec:** [`F18-explanations-and-entailment-diffs.md`](F18-explanations-and-entailment-diffs.md), written on 2026-10-12 independently from:
+  - Kalyanpur, Parsia, Horridge and Sirin, "Finding all justifications of OWL DL entailments" (ISWC 2007), and Reiter, "A theory of diagnosis from first principles" (Artificial Intelligence, 1987), for black-box contraction and the hitting set tree;
+  - Green, Karvounarakis and Tannen, "Provenance semirings" (PODS 2007), through F13's provenance model;
+  - Motik, Nenov, Piro and Horrocks, "Incremental Update of Datalog Materialisation: the Backward/Forward Algorithm" (AAAI 2015);
+  - W3C OWL 2 Web Ontology Language Profiles (the OWL 2 RL/RDF rules), cited from working knowledge and not re-fetched;
+  - Apache Jena's public documentation of derivation logging in its rule engines (`InfGraph.getDerivation`), cited from working knowledge; no Jena code was read for this spec;
+  - the Sparkles code (`crates/sparkles-reasoner/src/{engine.rs,incremental.rs,diagnostics.rs}`, `crates/sparkles-core/src/access/triples.rs`, `crates/sparkles-server/src/ask/http.rs`, `crates/sparkles-server/src/mcp/tools.rs`, `ui/src/routes/explore/+page.svelte`) and specs C08, C11, C12b, C15, C17, C18, F09, F13, F16 and F17.
+- **Implementation:** not built. The spec plans no new runtime dependency.
+- **Rejected** (spec §12):
+  - storing a derivation per inferred triple in the dataset;
+  - building trees from the kept closure;
+  - Jena-style derivation logging during materialization;
+  - structural visibility rules;
+  - glass-box justifications with a tableau tracer.
 
 ## Outcome
 

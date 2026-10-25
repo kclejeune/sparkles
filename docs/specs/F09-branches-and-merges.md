@@ -33,7 +33,7 @@ where branches change it (§2.11). The design builds on durable commit identity
 ([CI](CI-commit-identity.md)), retained generations, diffs and the change feed
 ([F06](F06-snapshots-and-point-in-time.md)), automatic compaction
 ([C13](C13-automatic-compaction.md)), backup repositories
-([F05](F05-snapshot-repositories.md)), write-time validation
+([F05](F05-snapshot-repositories/README.md)), write-time validation
 ([C10](C10-write-time-validation.md)), write previews ([C15](C15-write-previews.md)),
 inference freshness ([C08](C08-inference-freshness.md)) and access control
 ([C09](C09-dataset-access-control.md), [C12](C12-graph-access-control.md)).
@@ -470,7 +470,7 @@ attribute holds the cells as term objects, and `report` holds the JSON document 
 - **Across servers, Phase 1.** A backup repository that both servers can reach already
   moves a dataset between servers. `sparkles backup create` on the source and a restore
   into a new name with `identity: "new"` on the destination give the same result as a
-  clone, with `forkedFrom` set ([F05 §2.3](F05-snapshot-repositories.md)). The API docs
+  clone, with `forkedFrom` set ([F05 §2.3](F05-snapshot-repositories/README.md)). The API docs
   will describe this as the way to clone across servers.
 - **Across servers, Phase 3.** `POST /$/datasets/{ds}/clone` gains a remote source,
   `{ "name": "NEW", "remote": { "url": "https://a.example/prod", "branch": "dev",
@@ -1013,7 +1013,7 @@ branch routes other than listing and `merge` for merges and merge previews.
 
 ### 6.2 Backups
 
-In Phase 1 a backup ([F05](F05-snapshot-repositories.md)) copies `main` only, as it does
+In Phase 1 a backup ([F05](F05-snapshot-repositories/README.md)) copies `main` only, as it does
 today. Its manifest records the number of branches it left out, and the dataset's Backups
 panel says that branches are not backed up. Branch holds keep generations on disk, and a
 backup's own lease works as before.
@@ -1421,7 +1421,7 @@ dataset page's Backups panel says that the other branch is not backed up.
 - **Sparkles repository, read for this spec:**
   - the specs [C06](C06-clone-to-sandbox.md), [F06](F06-snapshots-and-point-in-time.md),
     [CI](CI-commit-identity.md), [C13](C13-automatic-compaction.md),
-    [F05](F05-snapshot-repositories.md) (summary, restore and Outcome),
+    [F05](F05-snapshot-repositories/README.md) (summary, restore and Outcome),
     [C12](C12-graph-access-control.md) (summary and model), and the openings of
     [C08](C08-inference-freshness.md), [C10](C10-write-time-validation.md),
     [C15](C15-write-previews.md) and [P01](P01-python-bindings.md);
@@ -1461,6 +1461,44 @@ dataset page's Backups panel says that the other branch is not backed up.
     2014, for versioned RDF stores that merge quad sets;
   - W3C RDF 1.2 Concepts (blank-node scope), RDF Dataset Canonicalization (RDFC-1.0),
     the SPARQL 1.1 Protocol, and Apache Jena's RDF Patch documentation.
+
+## Provenance
+
+This record preserves design sources, licensing and adoption decisions at the
+stages recorded below. Delivery statements in the record are historical. Current
+capabilities and remaining work are described by the spec status and Outcome.
+
+- **Spec:** [`F09-branches-and-merges.md`](F09-branches-and-merges.md), written on
+  2026-10-02 independently from:
+  - the Sparkles code and the [C06](C06-clone-to-sandbox.md),
+    [F06](F06-snapshots-and-point-in-time.md), [CI](CI-commit-identity.md),
+    [C13](C13-automatic-compaction.md), [F05](F05-snapshot-repositories/README.md) and
+    [C12](C12-graph-access-control.md) specs;
+  - Git's model of branches, merge bases, three-way merges and two-parent merge commits,
+    from its documentation, cited from general knowledge;
+  - the public documentation of Dolt (merges and conflict tables) and Project Nessie
+    (expected hashes), both fetched, and of lakeFS (merge strategies) and TerminusDB
+    (delta layers and rebase merges), read through searches;
+  - Datomic's documentation of `with`, cited from general knowledge;
+  - the literature on three-way merges (diff3), replicated sets and version vectors, and
+    the Quit Store and R43ples papers on versioned RDF, cited from general knowledge;
+  - RDF 1.2 Concepts, RDFC-1.0 as a test oracle, the SPARQL 1.1 Protocol and Jena's RDF
+    Patch documentation.
+
+  Jena and Oxigraph have no branches, so neither was a source.
+- **Implementation:** not started. **Dependencies:** none planned.
+- **Rejected** (spec §8):
+  - a branch as a full clone;
+  - branches inside one store with one tagged log;
+  - a content-addressed index;
+  - rebase as the merge model;
+  - quad-level conflicts as the default, and conflicts from the ontology alone;
+  - conflicts kept on the server until resolved;
+  - relabelling blank nodes at merge time, and merging isomorphic blank-node structures;
+  - hard links or reflinks to share generation files;
+  - branches as separate datasets in the registry;
+  - moving refs on fast-forward;
+  - a branch syntax inside `at`.
 
 ## Outcome
 

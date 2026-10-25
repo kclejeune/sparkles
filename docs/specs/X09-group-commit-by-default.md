@@ -33,9 +33,9 @@ the device-mapper `log-writes` target. It builds on write-time validation
 ([C10](C10-write-time-validation.md)), automatic compaction
 ([C13](C13-automatic-compaction.md)), write previews ([C15](C15-write-previews.md)),
 graph access control ([C12](C12-graph-access-control.md)), full-text search
-([F03](F03-full-text-search.md)), embeddings on write ([F08](F08-embeddings-on-write.md)),
+([F03](F03-full-text-search/README.md)), embeddings on write ([F08](F08-embeddings-on-write.md)),
 replication through RDF Patch ([F10](F10-replication.md)) and GeoSPARQL
-([G01](G01-geosparql.md)).
+([G01](G01-geosparql/README.md)).
 
 ## 1. Summary, goals, non-goals
 
@@ -779,6 +779,37 @@ amended gates before it has any data, and it confirms them.
    state mutex in step 3, as section 17.4 describes. Either `fail` takes the mutex itself
    and marks the queue failed before any later fence can lead, or the leader holds a failure
    flag that `enqueue` reads before it admits a commit.
+
+## Provenance
+
+This record preserves design sources, licensing and adoption decisions at the
+stages recorded below. Delivery statements in the record are historical. Current
+capabilities and remaining work are described by the spec status and Outcome.
+
+- **Spec:** [`X09-group-commit-by-default.md`](X09-group-commit-by-default.md), written
+  on 2026-10-12 independently from:
+  - the Sparkles code (`store/group.rs`, `store.rs`, `store/wal.rs`, `commit.rs`,
+    `annotations.rs`, the server's CLI and its group-commit router test), the write
+    sections of BENCHMARKS.md and the CI spec's Outcome;
+  - DeWitt et al., "Implementation Techniques for Main Memory Database Systems" (SIGMOD
+    1984); Helland et al., "Group Commit Timers and High Volume Transaction Systems"
+    (HPTS 1987); Pillai et al., "All File Systems Are Not Created Equal" (OSDI 2014);
+    Rebello et al., "Can Applications Recover from fsync Failures?" (USENIX ATC 2020);
+  - the PostgreSQL documentation of `commit_delay` and `commit_siblings`, the MySQL
+    documentation of `binlog_group_commit_sync_delay`, and the Linux kernel
+    documentation of the device-mapper `log-writes`, `flakey` and `error` targets. No
+    source code of these projects was read;
+  - the specs CI, C10, C12, C13, C15, C19, F03, F08, F10, G01 and X06.
+- **Implementation:** not built. No new runtime dependency is planned. The power-loss
+  harness uses kernel device-mapper targets and a test-only `LD_PRELOAD` shim written
+  for the repository.
+- **Rejected** (spec §14):
+  - an asynchronous commit mode that acknowledges before synchronization;
+  - a dedicated log-writer thread;
+  - retrying a failed `fdatasync`;
+  - a nonzero default batch delay;
+  - grouping bulk commits;
+  - keeping the flag opt-in.
 
 ## Outcome
 

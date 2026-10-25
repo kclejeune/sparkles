@@ -1961,7 +1961,7 @@ chosen, and sends them in the query string.
 `PUT`, `POST` and `DELETE` on `/{ds}/data` take a `text/csv` or
 `text/tab-separated-values` body when the request names a stored mapping with
 `mapping=NAME`, or the default mapping with `base` and optionally `key`
-([spec F19 §2.3](specs/F19-mappings-and-virtual-graphs.md)). `PUT` replaces the graph
+([spec F19 §2.3](specs/F19-mappings-and-virtual-graphs/README.md)). `PUT` replaces the graph
 with the mapped triples, `POST` adds them, and `DELETE` removes them from the graph.
 Without `mapping` or `base` the body is `415`, as any body that is not RDF.
 
@@ -2919,7 +2919,7 @@ API is `sparkles::stored`.
 ## Stored mappings
 
 The design and its rationale are in
-[F19 Mapping languages and virtual graphs](specs/F19-mappings-and-virtual-graphs.md).
+[F19 Mapping languages and virtual graphs](specs/F19-mappings-and-virtual-graphs/README.md).
 
 A dataset can keep named mappings in `mappings.json` in its directory, with versions as
 stored queries have, and backups and clones include the file. A mapping is R2RML, RML
@@ -3119,7 +3119,7 @@ the access policy changes, after which the client reconnects under the new grant
 
 ## GraphQL
 
-The design and its rationale are in [C03 GraphQL read adapter](specs/C03-graphql.md).
+The design and its rationale are in [C03 GraphQL read adapter](specs/C03-graphql/README.md).
 
 A dataset can answer GraphQL queries at `/{ds}/graphql` once an administrator installs a
 mapping schema. The mapping schema is GraphQL SDL whose types and fields name RDF classes
@@ -4820,7 +4820,7 @@ can see. The Rust API has `Store::snapshot_at`, `diff`, `create_snapshot_with`,
 
 ## Backup repositories
 
-The design and its rationale are in [F05 Backup repositories](specs/F05-snapshot-repositories.md).
+The design and its rationale are in [F05 Backup repositories](specs/F05-snapshot-repositories/README.md).
 
 *Extension.* Backup repositories come from the `backup` cargo feature of
 `sparkles-server`, which is on by default. A **repository** holds deduplicated,
@@ -5473,7 +5473,7 @@ the encrypted format and what it supports.
 
 ## Full-text search
 
-The design and its rationale are in [F03 Full-text search](specs/F03-full-text-search.md).
+The design and its rationale are in [F03 Full-text search](specs/F03-full-text-search/README.md).
 
 Datasets can index their string and language-tagged literals for ranked (BM25) search.
 Queries use Jena's `text:query` property function (`PREFIX text: <http://jena.apache.org/text#>`):
@@ -6824,7 +6824,7 @@ file is never overwritten.
 
 ## GeoSPARQL
 
-The design and its rationale are in [G01 GeoSPARQL](specs/G01-geosparql.md).
+The design and its rationale are in [G01 GeoSPARQL](specs/G01-geosparql/README.md).
 
 With the `geo` cargo feature, which the server enables, Sparkles implements the GeoSPARQL
 1.1 functions over geometry literals, Jena's `spatial:` property functions, and a spatial
@@ -8120,7 +8120,7 @@ measurements.
 
 ## Write-time validation
 
-The design and its rationale are in [C10 Write-time SHACL validation](specs/C10-write-time-validation.md). The ShEx guard is described in [G02 ShEx](specs/G02-shex.md).
+The design and its rationale are in [C10 Write-time SHACL validation](specs/C10-write-time-validation.md). The ShEx guard is described in [G02 ShEx](specs/G02-shex/README.md).
 
 A dataset can validate every write against SHACL shapes or a ShEx schema before it
 commits. It uses one language at a time. The configuration lives in the database
@@ -8701,7 +8701,7 @@ curl -X PATCH 'localhost:3030/$/settings/people/forms' \
 
 ## ShEx validation
 
-The design and its rationale are in [G02 ShEx 2.1 validation](specs/G02-shex.md).
+The design and its rationale are in [G02 ShEx 2.1 validation](specs/G02-shex/README.md).
 
 `POST /{ds}/shex` validates nodes of a data graph against a ShEx 2.1 schema (Shape
 Expressions). Fuseki has no ShEx operation, so the parameters follow `/{ds}/shacl` where
@@ -8885,7 +8885,7 @@ does not say. SPARQL selectors on the command line have no row or memory budgets
 
 ## Formatting
 
-The design and its rationale are in [X02 Formatter](specs/X02-formatter.md).
+The design and its rationale are in [X02 Formatter](specs/X02-formatter/README.md).
 
 `POST /$/format` formats a SPARQL query or update, or a Turtle, TriG, N-Triples, N-Quads
 or JSON-LD document. It returns the formatted text in the style of `sparkles fmt` (see
@@ -11214,7 +11214,7 @@ no status.
 
 `sparkles memory import` reads the memory and instruction files of coding agents and
 writes each file into its own named graph. The design is in
-[C18 §8.10](specs/C18-natural-language-questions-and-ingest.md#810-importing-memory-from-coding-agent-harnesses),
+[C18 §8.10](specs/C18-natural-language-questions-and-ingest/SPEC.md#810-importing-memory-from-coding-agent-harnesses),
 and the commands are in [USAGE.md](USAGE.md#agent-memory). The memory settings name the
 prefix of every import graph in `imports`:
 
@@ -11307,7 +11307,7 @@ An agent turns a document into facts in three steps. `register_source` stores th
 document's text as a source, `ingest_profile` gives the vocabulary to extract in, and
 `assert_facts` writes each fact with a `span` that points at the passage it rests on. The
 design is in
-[C18 §7](specs/C18-natural-language-questions-and-ingest.md#7-ingestion).
+[C18 §7](specs/C18-natural-language-questions-and-ingest/SPEC.md#7-ingestion).
 
 `register_source` normalizes the text to NFC with `\n` line ends and splits it into
 chunks of about 1,000 tokens at headings, paragraphs and sentences. The source
@@ -11469,7 +11469,7 @@ agent graphs repeat once in the consolidated graph, and retention, which deletes
 session graphs. Both run in the ingestion task registry, so `GET /$/ingest/{ds}/{task}`
 reports them, with `input.kind` set to `consolidation` or `retention`. They work on the
 dataset's `main` branch only. The design is in
-[C18 §8.3 and §8.4](specs/C18-natural-language-questions-and-ingest.md#83-consolidation).
+[C18 §8.3 and §8.4](specs/C18-natural-language-questions-and-ingest/SPEC.md#83-consolidation).
 `sparkles memory consolidate`, `retention` and `maintenance` call these routes
 ([USAGE.md](USAGE.md#maintaining-agent-memory)).
 

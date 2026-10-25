@@ -20,7 +20,7 @@ Waltman and van Eck, "From Louvain to Leiden: guaranteeing well-connected commun
 (Scientific Reports, 2019), the W3C PROV-O and SKOS recommendations, and the Sparkles
 code. It builds on the graph algorithms of [F14](F14-graph-algorithms.md), the model
 providers, roles, budgets, review inbox and Ask pipeline of
-[C18](C18-natural-language-questions-and-ingest.md), the memory tools of
+[C18](C18-natural-language-questions-and-ingest/README.md), the memory tools of
 [C17](C17-agent-memory.md), embeddings on write ([F08](F08-embeddings-on-write.md)),
 access control ([C12](C12-graph-access-control.md),
 [C12b](C12b-triple-access-control.md)), and, for incremental refresh, the change feed of
@@ -793,6 +793,34 @@ which exposes old reports when the principal later loses access to an input, and
 cannot tell apart callers whose triple protections bind different `?user`, `?role` or
 `?group` values.
 
+## Provenance
+
+This record preserves design sources, licensing and adoption decisions at the
+stages recorded below. Delivery statements in the record are historical. Current
+capabilities and remaining work are described by the spec status and Outcome.
+
+The former registry's implementation paragraph refers to cache and query-memory
+work rather than this feature. That paragraph is retained as a historical
+registry error and is not evidence of this feature's implementation.
+
+- **Spec:** [`C22-graph-rag-community-summaries.md`](C22-graph-rag-community-summaries.md),
+  written on 2026-10-12 independently from:
+  - Edge et al., "From Local to Global: A Graph RAG Approach to Query-Focused
+    Summarization" (arXiv:2404.16130, 2024), and Microsoft's public GraphRAG
+    documentation of community reports and global search;
+  - Traag, Waltman and van Eck, "From Louvain to Leiden" (Scientific Reports, 2019);
+  - W3C PROV-O and SKOS;
+  - the Sparkles code and specs C11, C12, C12b, C17, C18, C19, F06, F08, F13 and F14.
+- **Implementation:** Phase 1 (shared caches and the query memory pool) is built, with no new dependency and from the spec alone. Phases 2 and 3 are not built. The spec plans no new dependency. Microsoft's GraphRAG
+  package is not used.
+- **Rejected** (spec §12):
+  - summaries in a side store;
+  - Microsoft's GraphRAG pipeline as a dependency;
+  - summaries computed only at question time;
+  - communities by label propagation or connected components;
+  - a report per entity;
+  - rewriting every report on any change.
+
 ## Outcome
 
 The `community` model role is implemented in the server configuration, dataset role
@@ -1009,7 +1037,7 @@ that `auto` answers locally.
 
 [Roadmap](../ROADMAP.md) item 81 plans a shared profile for agent memory and personal
 knowledge in [C17](C17-agent-memory.md#shared-memory-representation) and
-[C18](C18-natural-language-questions-and-ingest.md#shared-memory-workflows). It is
+[C18](C18-natural-language-questions-and-ingest/OUTCOME.md#shared-memory-workflows). It is
 deferred and does not block the existing community-summary phases. When adopted, the
 profile must let a report cite the same assertion and source identities used by recall
 and personal notes. A generated report retains its provenance and review status, and

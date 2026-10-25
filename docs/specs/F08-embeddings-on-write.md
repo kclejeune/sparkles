@@ -502,6 +502,46 @@ text's bytes, with an index `docs` on `ex:emb`, dimension 8, embedding `rdfs:lab
   download and `hf-hub`) and `candle-core`.
 - RFC 9110, RFC 6585, RFC 6750, RFC 4647, SPARQL 1.1 Query.
 
+## Provenance
+
+This record preserves design sources, licensing and adoption decisions at the
+stages recorded below. Delivery statements in the record are historical. Current
+capabilities and remaining work are described by the spec status and Outcome.
+
+- **Spec:** [`F08-embeddings-on-write.md`](F08-embeddings-on-write.md), written on
+  2026-10-02 independently from:
+  - the Sparkles code and the [F04](F04-vector-search.md), [CI](CI-commit-identity.md),
+    [C10](C10-write-time-validation.md) and [C13](C13-automatic-compaction.md) specs;
+  - OpenAI's API reference for `POST /v1/embeddings`, and the OpenAI-compatible
+    embeddings endpoints documented by Ollama, vLLM, LM Studio and Hugging Face Text
+    Embeddings Inference;
+  - the public documentation of Timescale pgai (the vectorizer and its worker), Weaviate
+    (the `text2vec-openai` and `text2vec-ollama` modules, `nearText`), Elasticsearch (the
+    inference API, `semantic_text`), Neo4j (the GenAI procedures) and Qdrant (FastEmbed),
+    read for behaviour only;
+  - RFC 9110, RFC 6585, RFC 6750 and RFC 4647, and the crates.io pages of `fastembed`
+    and `candle-core`.
+
+  The roadmap item that named the feature came from a review of other databases'
+  public descriptions. The spec itself was written from the sources above.
+- **Implementation** (2026-10-02): from the spec and the Sparkles code. The client, the
+  worker, the input record and the mock endpoint are our own code. **Dependencies:**
+  none new. Requests use the `reqwest` client and the outbound policy the engine already
+  has, and the cache uses `quick_cache`, already a dependency.
+- **Local models.** No model runtime was added. `fastembed` 7.1.0 (Apache-2.0) runs
+  models through ONNX Runtime, a native library its default features download at build
+  time, and fetches models from Hugging Face. Candle (MIT OR Apache-2.0) is pure Rust
+  but would bring model files, a tokenizer and CPU-heavy inference into the server.
+  Local models run behind Ollama or another OpenAI-compatible server instead. The binary
+  size of either option was not measured.
+- **Rejected** (spec §8):
+  - embedding on the commit path;
+  - vectors outside the RDF data;
+  - replaying the change feed to find changed text;
+  - API keys in `vector.json` or in API bodies;
+  - a model runtime in the binary;
+  - always one vector per subject.
+
 ## Outcome
 
 **Delivered** on 2026-10-02, as Phase 1.

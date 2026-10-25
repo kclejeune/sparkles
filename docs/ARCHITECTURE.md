@@ -111,7 +111,7 @@ Sources: [facade](../crates/sparkles/src/lib.rs),
 [HTTP and library parity](../crates/sparkles/tests/parity.rs),
 [bindings matrix](../crates/sparkles/bindings.toml), and
 [P01](specs/P01-python-bindings.md), [P02](specs/P02-rust-client.md),
-[P03](specs/P03-query-extensions.md), [P04](specs/P04-jvm-bindings.md),
+[P03](specs/P03-query-extensions.md), [P04](specs/P04-jvm-bindings/README.md),
 [P05](specs/P05-node-bindings.md), [P06](specs/P06-library-admin-api.md).
 
 ## Storage: immutable indexes with transactional overlays
@@ -440,7 +440,7 @@ Sources: [compaction](../crates/sparkles-core/src/store/compaction.rs),
 [backup capture](../crates/sparkles-core/src/store/backup.rs),
 [repository engine](../crates/sparkles-backup/src/lib.rs),
 [C06](specs/C06-clone-to-sandbox.md), [C13](specs/C13-automatic-compaction.md),
-[F05](specs/F05-snapshot-repositories.md),
+[F05](specs/F05-snapshot-repositories/README.md),
 [F06](specs/F06-snapshots-and-point-in-time.md),
 [F09](specs/F09-branches-and-merges.md), and
 [F11](specs/F11-encryption-at-rest.md).
@@ -486,12 +486,12 @@ Sources: [text lifecycle](../crates/sparkles-core/src/text.rs),
 [vector lifecycle](../crates/sparkles-core/src/store/vector.rs),
 [spatial lifecycle](../crates/sparkles-core/src/store/geo.rs),
 [reasoning facade](../crates/sparkles/src/reasoning/mod.rs),
-[C02](specs/C02-schema-discovery.md), [C03](specs/C03-graphql.md),
+[C02](specs/C02-schema-discovery.md), [C03](specs/C03-graphql/README.md),
 [C05](specs/C05-tabular-imports.md), [C08](specs/C08-inference-freshness.md),
-[F03](specs/F03-full-text-search.md), [F04](specs/F04-vector-search.md),
+[F03](specs/F03-full-text-search/README.md), [F04](specs/F04-vector-search.md),
 [F07](specs/F07-path-search.md), [F08](specs/F08-embeddings-on-write.md),
-[F12](specs/F12-local-embeddings.md), [G01](specs/G01-geosparql.md),
-[G02](specs/G02-shex.md), and [G03](specs/G03-shaclc.md).
+[F12](specs/F12-local-embeddings.md), [G01](specs/G01-geosparql/README.md),
+[G02](specs/G02-shex/README.md), and [G03](specs/G03-shaclc.md).
 
 ## Server policy, agents and tooling reuse the engine
 
@@ -580,9 +580,9 @@ Sources: [graph access](../crates/sparkles-core/src/access.rs),
 [C12](specs/C12-graph-access-control.md),
 [C12b](specs/C12b-triple-access-control.md), [C16](specs/C16-stored-queries.md),
 [C17](specs/C17-agent-memory.md),
-[C18](specs/C18-natural-language-questions-and-ingest.md),
+[C18](specs/C18-natural-language-questions-and-ingest/README.md),
 [C19](specs/C19-layered-settings.md), [G05](specs/G05-command-line-tools.md),
-[X01](specs/X01-compression-codecs.md), [X02](specs/X02-formatter.md),
+[X01](specs/X01-compression-codecs.md), [X02](specs/X02-formatter/README.md),
 [X03](specs/X03-openapi-and-completions.md), and [X04](specs/X04-linter.md).
 
 ## Implemented boundaries and evidence

@@ -32,7 +32,7 @@ uses. It builds on the change feed and change log of
 the filtered and masked views of [C12](C12-graph-access-control.md) and
 [C12b](C12b-triple-access-control.md), branches ([F09](F09-branches-and-merges.md)), the
 MCP server ([C11](C11-mcp-server.md)) and stored queries ([C16](C16-stored-queries.md)).
-It is the engine planned for GraphQL subscriptions ([C03 §13](C03-graphql.md#13-subscriptions)),
+It is the engine planned for GraphQL subscriptions ([C03 §13](C03-graphql/SPEC.md#13-subscriptions)),
 for the derived-fact layer of [F16](F16-materialization-at-scale.md), for the tabled caches of [F17](F17-query-time-reasoning.md) and for the explanations
 of [F18](F18-explanations-and-entailment-diffs.md).
 
@@ -722,6 +722,39 @@ of F16's derived-fact layer if F16 chooses it.
   `access.rs` and `access/triples.rs`, `task.rs`, `crates/sparkles-reasoner/src/incremental.rs`
   and `maintain.rs`, and the specs C01, C03, C08, C10, C11, C12, C12b, C13, C16, F05, F06,
   F09 and F10.
+
+## Provenance
+
+This record preserves design sources, licensing and adoption decisions at the
+stages recorded below. Delivery statements in the record are historical. Current
+capabilities and remaining work are described by the spec status and Outcome.
+
+- **Spec:** [`F13-incremental-views-and-provenance.md`](F13-incremental-views-and-provenance.md),
+  written on 2026-10-12 independently from:
+  - Gupta, Mumick and Subrahmanian, "Maintaining views incrementally" (SIGMOD 1993),
+    McSherry et al., "Differential dataflow" (CIDR 2013), Budiu et al., "DBSP: Automatic
+    Incremental View Maintenance for Rich Query Languages" (VLDB 2023), and Gjengset et
+    al., "Noria" (OSDI 2018);
+  - Green, Karvounarakis and Tannen, "Provenance semirings" (PODS 2007), Buneman, Khanna
+    and Tan, "Why and where" (ICDT 2001), and Geerts et al., "Algebraic structures for
+    capturing the provenance of SPARQL queries" (ICDT 2013);
+  - Motik, Nenov, Piro and Horrocks, the backward/forward algorithm (AAAI 2015), as
+    already used by `sparkles-reasoner`;
+  - the WHATWG HTML standard's server-sent events and RFC 6455;
+  - the Sparkles code and specs C01, C03, C08, C10, C11, C12, C12b, C13, C16, F05, F06,
+    F09 and F10.
+- **Implementation:** not built. The spec plans no new runtime dependency. The core is
+  written in `sparkles-core`; no code of the `differential-dataflow` or `dbsp` crates is
+  copied.
+- **Rejected** (spec §13):
+  - the `differential-dataflow` and `dbsp` crates as the runtime;
+  - re-running the query after each matching commit as the only strategy;
+  - views as triggers that rewrite results with SPARQL Update;
+  - a circuit per subscriber;
+  - provenance as RDF 1.2 reifiers on derived triples;
+  - the full provenance polynomial;
+  - maintaining every view inside the commit;
+  - WebSocket before server-sent events.
 
 ## Outcome
 

@@ -19,7 +19,7 @@ This design was written from the Sparkles code at `fc123d04` (the planner in
 foreign function layer in `crates/sparkles-ffi/src/query.rs`, the Python and Node
 bindings and stored queries in `crates/sparkles-core/src/stored.rs`), from the plan cache
 sketched in the Outcome of [P01](P01-python-bindings.md) and the measurements in the
-Outcomes of P01, [P04](P04-jvm-bindings.md) and [P05](P05-node-bindings.md), and from the
+Outcomes of P01, [P04](P04-jvm-bindings/README.md) and [P05](P05-node-bindings.md), and from the
 specs [C16](C16-stored-queries.md), [C12](C12-graph-access-control.md),
 [C12b](C12b-triple-access-control.md), [C13](C13-automatic-compaction.md),
 [P03](P03-query-extensions.md) and [X05](X05-streaming-query-execution.md). The
@@ -420,6 +420,30 @@ uses the text level keyed on the stored query's name and version, and its parame
    for tuning? It must redact constants under C12 and C12b.
 3. Should HTTP clients be able to name a prepared query for a session, as the PostgreSQL
    protocol does? Stored queries cover the shared case.
+
+## Provenance
+
+This record preserves design sources, licensing and adoption decisions at the
+stages recorded below. Delivery statements in the record are historical. Current
+capabilities and remaining work are described by the spec status and Outcome.
+
+- **Spec:** [`X10-reusable-query-plans.md`](X10-reusable-query-plans.md), written on
+  2026-10-12 as internal engineering from:
+  - the Sparkles code at `fc123d04`: the planner, the query context, query preparation
+    and initial bindings in `sparql/mod.rs`, the result cache's keys, the foreign function
+    layer's prepared queries, the Python and Node bindings and stored queries;
+  - the plan cache sketched in the P01 Outcome and the measurements in the P01, P04 and
+    P05 Outcomes, and the specs C12, C12b, C13, C16, P03 and X05;
+  - the public PostgreSQL documentation of `PREPARE` and `plan_cache_mode`, and Apache
+    Jena's documentation of `ParameterizedSparqlString` and `QueryExec.substitution`,
+    for the API, without code from either.
+- **Implementation:** Phase 1 (shared caches and the query memory pool) is built, with no new dependency and from the spec alone. Phases 2 and 3 are not built. The spec plans no new dependency.
+- **Rejected** (spec §12):
+  - a generic plan for every set of constants;
+  - re-planning on every commit;
+  - a parameter table read by operators instead of cloning;
+  - caching by text only;
+  - translating Jena's algebra into the engine's algebra.
 
 ## Outcome
 

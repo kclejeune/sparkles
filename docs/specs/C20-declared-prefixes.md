@@ -21,7 +21,7 @@ This design was written from the SPARQL 1.1 Query grammar (`PN_PREFIX` and `PNAM
 RDF 1.1 Turtle, RFC 7396 (JSON Merge Patch), the Language Server Protocol 3.17 and the
 public documentation of Fuseki's prefixes service, together with the Sparkles code. It
 builds on layered settings ([C19](C19-layered-settings.md)), the linter
-([X04](X04-linter.md)) and the formatter ([X02](X02-formatter.md)).
+([X04](X04-linter.md)) and the formatter ([X02](X02-formatter/README.md)).
 
 ## 1. Summary
 
@@ -318,6 +318,29 @@ checks that a runtime write to the locked one is refused with `409`.
   code actions.
 - Fuseki's public documentation of its prefixes service.
 - The Sparkles code and specs C19, X02 and X04.
+
+## Provenance
+
+This record preserves design sources, licensing and adoption decisions at the
+stages recorded below. Delivery statements in the record are historical. Current
+capabilities and remaining work are described by the spec status and Outcome.
+
+- **Spec:** [`C20-declared-prefixes.md`](C20-declared-prefixes.md), written on 2026-10-10
+  from:
+  - the SPARQL 1.1 Query grammar, RDF 1.1 Turtle and RFC 7396;
+  - the Language Server Protocol 3.17;
+  - the public documentation of Fuseki's prefixes service;
+  - the Sparkles code and specs C19, X02 and X04.
+- **Implementation:** from the spec, docs/API.md, the public documentation of Fuseki's
+  prefixes service and the Sparkles code only (2026-10-10). The language server's
+  completion follows the Language Server Protocol 3.17. It adds no dependency.
+- **Rejected** (spec §10):
+  - a separate NixOS option for prefixes;
+  - removals stored as `null` in `prefixes.json`;
+  - effective prefixes at `GET /{ds}/prefixes`;
+  - refusing a declared prefix that shadows a well-known one;
+  - adding the dataset's prefixes to queries;
+  - a language server that always asks a server.
 
 ## Outcome
 

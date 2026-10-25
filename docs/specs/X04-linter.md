@@ -11,7 +11,7 @@
 >
 > This is the design; the [Outcome](#outcome) section at the end records how it landed.
 
-This is internal engineering, not derived from any other database product. [X02](X02-formatter.md)
+This is internal engineering, not derived from any other database product. [X02](X02-formatter/README.md)
 left linting out of the formatter and said that a `sparkles lint` needs its own spec. This
 is that spec. The sources are the W3C SPARQL 1.1 and 1.2 Query specifications (variable
 scope, grouping and the algebra of FILTER, OPTIONAL and MINUS), RDF 1.1 and 1.2 Concepts,
@@ -225,6 +225,32 @@ refuses the result if they differ.
 - **Fixes for every rule.** Renaming a variable or moving a FILTER changes the query's
   meaning, so those stay findings.
 
+## Provenance
+
+This record preserves design sources, licensing and adoption decisions at the
+stages recorded below. Delivery statements in the record are historical. Current
+capabilities and remaining work are described by the spec status and Outcome.
+
+- **Spec:** [`X04-linter.md`](X04-linter.md), written on 2026-10-02 as internal
+  engineering, the `sparkles lint` that [X02](X02-formatter/README.md) deferred. Its sources are:
+  - the W3C SPARQL 1.1 and 1.2 Query specifications (variable scope, grouping, and the
+    algebra of FILTER, OPTIONAL and MINUS), RDF 1.1 and 1.2 Concepts, XML Schema 1.1
+    Part 2, BCP 47 (RFC 5646) and the IANA language subtag registry, the OWL 2 mapping to
+    RDF, and the Language Server Protocol 3.17;
+  - Apache Jena's `ARQConstants` and `MappedLoader` (Apache-2.0), read for the old
+    `jena.hpl.hp.com` namespaces and Jena's warning about them. No code was copied;
+  - the public documentation of ESLint and Ruff (MIT) for the command's conventions:
+    severities per rule, `--fix` for safe fixes only, and the exit statuses;
+  - the Sparkles code: the formatter's lexer, syntax tree, prefix scopes, reference
+    parses and equivalence checks.
+
+  No code was read or copied from another linter.
+- **Implementation** (2026-10-02): from the spec and the Sparkles code. **Dependencies:**
+  `oxsdatatypes` 0.2 (MIT OR Apache-2.0), already a dependency of `sparkles`, became a
+  dependency of `sparkles-fmt` for the XML Schema date, time and duration forms.
+- **Rejected** (spec §6): rules over the SPARQL algebra, a config file of its own, and
+  fixes that change a document's meaning.
+
 ## Outcome
 
 **Delivered on 2026-10-02**, in one phase, with this spec.
@@ -265,7 +291,7 @@ literals, an MCP tool, and linting in the shapes editor.
 
 **More formats, embedded SHACL queries, the shapes editor and an MCP tool** (item 48,
 Tier 5, [ROADMAP](../ROADMAP.md)). SHACLC formatting, the other half of item 48, is in
-[X02](X02-formatter.md#roadmap-follow-ups-2026-10-12).
+[X02](X02-formatter/OUTCOME.md#roadmap-follow-ups-2026-10-12).
 
 * **What is missing today.** The Outcome's "Not built" list still holds:
   `sparkles_fmt::lint` accepts SPARQL, Turtle and TriG only (`lint/mod.rs`, the

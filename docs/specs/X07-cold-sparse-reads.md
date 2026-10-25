@@ -501,6 +501,33 @@ Phase 1 breakdown attributes the remainder to block reads or decoding.
 - [BENCHMARKS.md](../BENCHMARKS.md), sections "Cold starts" and "Where Sparkles loses".
 - The Sparkles code named in §2 and §8, and the specs X01, X05, X06 and C13.
 
+## Provenance
+
+This record preserves design sources, licensing and adoption decisions at the
+stages recorded below. Delivery statements in the record are historical. Current
+capabilities and remaining work are described by the spec status and Outcome.
+
+- **Spec:** [`X07-cold-sparse-reads.md`](X07-cold-sparse-reads.md), written on
+  2026-10-12 independently from:
+  - the Sparkles code (`index.rs`, `vocab.rs`, `sparql/indexjoin.rs`,
+    `sparql/results.rs`, `sparql/ctx.rs`, `store/partial.rs`) and the cold-start section
+    of BENCHMARKS.md;
+  - the Linux manual pages `madvise(2)`, `mincore(2)`, `getrusage(2)` and `proc(5)`;
+  - Ailamaki et al., "Weaving Relations for Cache Performance" (VLDB 2001);
+  - the RocksDB documentation on block-based tables and the PostgreSQL documentation of
+    `pg_prewarm`, read for design ideas only. No source code of these projects was read;
+  - the specs X01, X05, X06 and C13.
+- **Implementation:** not built. No new dependency is planned. `memmap2`, `lz4_flex` and
+  `quick_cache` are already in the tree.
+- **Rejected** (spec §12):
+  - smaller index blocks;
+  - a buffer pool with `pread` instead of memory mapping;
+  - `MADV_SEQUENTIAL` on ranges for dense scans;
+  - `MADV_NORMAL` by default with hints only for sparse reads;
+  - turning the process-wide hints off for queries estimated dense;
+  - loading the whole vocabulary offset file into memory;
+  - prewarm on by default.
+
 ## Outcome
 
 Phases 1, 2 and 3 are built. Phase 4 is not. The [Phase 3 decision](#phase-3-decision)

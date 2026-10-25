@@ -16,7 +16,7 @@
 > what shipped and the remaining work.
 
 This design was written from the Sparkles code and specs: GeoSPARQL and the UI's maps
-([G01](G01-geosparql.md)), vector search and indexes ([F04](F04-vector-search.md)), local
+([G01](G01-geosparql/README.md)), vector search and indexes ([F04](F04-vector-search.md)), local
 embeddings ([F12](F12-local-embeddings.md)), graph algorithms
 ([F14](F14-graph-algorithms.md)), large-graph rendering and its groups route
 ([U06](U06-large-graph-rendering.md)), the visual query builder
@@ -391,6 +391,26 @@ it says "The embedding map shows the head".
    versioned file and a refusal of unknown versions, so a restart does not recompute them.
 3. Whether facets should also offer counts of IRI-valued properties by the class of the value,
    such as "works for an Org in France", which needs a join per facet.
+
+## Provenance
+
+This record preserves design sources, licensing and adoption decisions at the
+stages recorded below. Delivery statements in the record are historical. Current
+capabilities and remaining work are described by the spec status and Outcome.
+
+- **Spec:** [`U11-linked-views.md`](U11-linked-views.md), written on 2026-10-23 independently from:
+  - B. Shneiderman, "Dynamic Queries for Visual Information Seeking", IEEE Software, 1994,
+    and R. A. Becker and W. S. Cleveland, "Brushing Scatterplots", Technometrics, 1987;
+  - K. Pearson, "On Lines and Planes of Closest Fit to Systems of Points in Space", 1901,
+    and the public description of UMAP by L. McInnes, J. Healy and J. Melville, 2018;
+  - the MapLibre GL JS documentation of line layers and the WAI-ARIA slider and listbox
+    patterns;
+  - the Sparkles code (`MapView`, `ResultMap`, `lib/geo.ts`, the groups route, the vector
+    index) and specs C12, C12b, F04, F12, F14, G01, U01, U06, U08 and U10.
+- **Implementation:** not built. No new dependency is planned. The map uses MapLibre GL JS
+  and the embedding map uses sigma.js, which the UI already ships.
+- **Rejected:** none recorded. The spec's open questions keep the alternatives for access
+  and storage open.
 
 ## Outcome
 

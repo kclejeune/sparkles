@@ -24,7 +24,7 @@ working drafts, the public documentation of Sparnatural and of Neo4j Bloom as ex
 visual query tools, the WAI-ARIA Authoring Practices for the listbox, combobox and grid
 patterns, the CodeMirror 6 documentation of transactions and history, and the Sparkles
 code and specs: query by example ([U03](U03-query-by-example.md)), the formatter and its
-lossless SPARQL parser ([X02](X02-formatter.md)), schema discovery and class profiles
+lossless SPARQL parser ([X02](X02-formatter/README.md)), schema discovery and class profiles
 ([C02](C02-schema-discovery.md)), declared prefixes ([C20](C20-declared-prefixes.md)),
 stored queries ([C16](C16-stored-queries.md)), the Explore overview
 ([U06](U06-large-graph-rendering.md)) and graph access control
@@ -501,6 +501,28 @@ The data is U03 §7's.
    report's predicate counts, or leave counts to U04 Phase 4.
 4. Whether to add `POST /$/pattern`, the same answer from the server, for builds where
    the browser module is switched off with `VITE_FMT_WASM=off`.
+
+## Provenance
+
+This record preserves design sources, licensing and adoption decisions at the
+stages recorded below. Delivery statements in the record are historical. Current
+capabilities and remaining work are described by the spec status and Outcome.
+
+- **Spec:** [`U08-visual-query-builder.md`](U08-visual-query-builder.md), written on 2026-10-23 independently from:
+  - the W3C SPARQL 1.1 Query Recommendation and the SPARQL 1.2 working drafts;
+  - the public documentation of Sparnatural (LGPL-3.0) and Neo4j Bloom, whose code was not
+    read or used;
+  - the WAI-ARIA Authoring Practices and the CodeMirror 6 documentation of transactions
+    and history;
+  - the Sparkles code (`sparkles-fmt`'s lossless SPARQL parser, `sparkles-fmt-wasm`,
+    `SparqlEditor`, `GraphView`) and specs C02, C12, C16, C20, U03, U06 and X02.
+- **Implementation:** not built. No new dependency is planned. The canvas uses Cytoscape.js
+  and cytoscape-fcose, which the UI already ships, and the parser is the formatter's.
+- **Rejected** (spec §9):
+  - regenerating the query from a model on every edit;
+  - a JavaScript SPARQL parser such as sparqljs;
+  - layout positions in a comment inside the query;
+  - forms for locked constructs.
 
 ## Outcome
 

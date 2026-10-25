@@ -26,7 +26,7 @@ library was copied. It builds on materialized reasoning and its inconsistency di
 ([C08](C08-inference-freshness.md)), materialization at scale
 ([F16](F16-materialization-at-scale.md)), query-time reasoning
 ([F17](F17-query-time-reasoning.md)), the bindings ([P01](P01-python-bindings.md),
-[P04](P04-jvm-bindings.md), [P05](P05-node-bindings.md)) and the library administration
+[P04](P04-jvm-bindings/README.md), [P05](P05-node-bindings.md)) and the library administration
 API ([P06](P06-library-admin-api.md)), schema discovery ([C02](C02-schema-discovery.md)),
 and access control ([C12](C12-graph-access-control.md),
 [C12b](C12b-triple-access-control.md)).
@@ -526,6 +526,33 @@ building the model over a 10,000-axiom ontology takes one native read.
    whose patterns touch axioms outside RL?
 5. Should the ontology routes accept an `at=` commit, as queries do (F06)? The handle
    already reads a snapshot, so the cost is small.
+
+## Provenance
+
+This record preserves design sources, licensing and adoption decisions at the
+stages recorded below. Delivery statements in the record are historical. Current
+capabilities and remaining work are described by the spec status and Outcome.
+
+- **Spec:** [`F21-ontology-api.md`](F21-ontology-api.md), written on 2026-10-12 independently from:
+  - the W3C OWL 2 Structural Specification and Functional-Style Syntax, OWL 2 Mapping to
+    RDF Graphs and OWL 2 Profiles recommendations (second edition, 2012), and RDF 1.1
+    Concepts, cited from working knowledge and not re-fetched;
+  - the public documentation and Javadoc of Apache Jena's `jena-ontapi` module
+    (`OntModel`, `OntModelFactory`, `OntSpecification`, the `Ont*` interfaces) and of the
+    legacy `org.apache.jena.ontology` API, cited from working knowledge; no Jena code was
+    read for this spec;
+  - the Sparkles code (`crates/sparkles-reasoner/src/{lib.rs,diagnostics.rs,inputs.rs}`,
+    `crates/sparkles/src/handles/`, `crates/sparkles/src/dataset.rs`,
+    `jvm/gradle/libs.versions.toml`) and specs C02, C08, C12, C12b, C17, F16, F17, F18, P01,
+    P04, P05, P06 and AUDIT §5.
+- **Implementation:** not built. `jena-ontapi` (Apache-2.0) is planned as an optional
+  dependency of `sparkles-jena`. No new Rust dependency is planned; `horned-owl`
+  (LGPL-3.0) is named only as a rejected alternative and was not read.
+- **Rejected** (spec §13):
+  - a native implementation of `jena-ontapi`'s interfaces in the JVM binding;
+  - an ontology store separate from the triples;
+  - using an existing Rust OWL library;
+  - profile checks as SPARQL queries.
 
 ## Outcome
 

@@ -854,6 +854,34 @@ for the map of typed subjects. The deadline, cancel flag and entry cap of §4.6 
 - **Writing drafts into a shapes graph of the dataset.** That would be a write to the
   data. Drafts go through review, and installing one uses the validation configuration.
 
+## Provenance
+
+This record preserves design sources, licensing and adoption decisions at the
+stages recorded below. Delivery statements in the record are historical. Current
+capabilities and remaining work are described by the spec status and Outcome.
+
+- **Spec:** Phase 4 of [`C02-schema-discovery.md`](#11-phase-4-shapes-drafted-from-the-data),
+  written on 2026-10-02 independently from:
+  - W3C SHACL (targets of `sh:targetClass` as SHACL instances, the value-type,
+    cardinality, value-range, string-based and closed-shape components) and ShEx 2.1
+    (triple constraints, node constraints, value sets, `EXTRA`, `CLOSED`, query shape
+    maps), cited from working knowledge;
+  - published shape-extraction work, cited from working knowledge: QSE (Rabbani,
+    Lissandrini and Hose, PVLDB 2023) for the entity-to-types map and support pruning,
+    sheXer (Fernández-Álvarez, Labra Gayo and Gayo-Avello, Knowledge-Based Systems 2022)
+    for a trust threshold per constraint, and ABSTAT (Spahiu et al., 2016) for type
+    patterns with cardinality statistics. No code of these projects was read or used;
+  - the Sparkles code and specs C02, C10, C11 and C12.
+- **Implementation:** from the spec plus Sparkles code only (2026-10-02), in
+  `sparkles::schema::draft` and the server's schema, MCP and CLI code.
+  - **Dependencies:** none added.
+- **Rejected** (C02 §11.7):
+  - SPARQL `GROUP BY` queries per class instead of index passes;
+  - sampling;
+  - support counted over every instance for value constraints;
+  - `sh:or` of datatypes and `sh:node` references between class shapes;
+  - writing drafts into a shapes graph of the dataset.
+
 ## Outcome
 
 **Delivered.** Phase 1 landed on 2026-09-30 in three commits: the
@@ -1245,7 +1273,7 @@ where this section says otherwise. `DRAFT_FORMAT` is now 2, because property sha
 ### Reports from the index statistics (2026-10-19)
 
 The MCP tools, `check_query` and `sparkles ask` read a cheaper report on large stores, as
-[C18](C18-natural-language-questions-and-ingest.md#roadmap-follow-ups-2026-10-12)
+[C18](C18-natural-language-questions-and-ingest/OUTCOME.md#roadmap-follow-ups-2026-10-12)
 describes for DBpedia. `SchemaOptions::statistics_above` builds the observed layer from
 the statistics of the index build when the store holds more quads than it names, the
 caller reads every graph and the graphs the selection leaves out hold at most a million

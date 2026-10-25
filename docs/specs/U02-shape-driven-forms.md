@@ -396,6 +396,30 @@ ex:PersonShape a sh:NodeShape ; sh:targetClass ex:Person ;
 4. Whether `dash:readOnly` should also be enforced on the server for form saves, or stay
    a UI hint.
 
+## Provenance
+
+This record preserves design sources, licensing and adoption decisions at the
+stages recorded below. Delivery statements in the record are historical. Current
+capabilities and remaining work are described by the spec status and Outcome.
+
+- **Spec:** [`U02-shape-driven-forms.md`](U02-shape-driven-forms.md), written on 2026-10-12 independently from:
+  - the W3C SHACL Recommendation (non-validating property shape characteristics,
+    `sh:PropertyGroup`) and the SHACL 1.2 Core drafts for list constraints;
+  - the DASH Data Shapes vocabulary published by TopQuadrant (editors, viewers,
+    `dash:singleLine`, `dash:readOnly`) and the public documentation of TopBraid EDG's
+    forms, without any TopBraid code;
+  - Schímatos, a SHACL-based web-form generator (ISWC 2020), as a published approach;
+  - the WAI-ARIA Authoring Practices' combobox pattern;
+  - the Sparkles code and specs C02, C09, C10, C12, C12b, C15, C18, C19, F09 and G03.
+- **Implementation:** not built. No new runtime dependency is planned. Shapes are
+  resolved by the existing `sparkles-shacl` crate, and widgets are written in Svelte.
+- **Rejected** (spec §9):
+  - SPARQL Update text generated in the browser;
+  - parsing shapes in the browser;
+  - conditional saves on the dataset's entity tag;
+  - a separate review page for form edits;
+  - a third-party library that interprets shapes.
+
 ## Outcome
 
 Phase 1 shipped on 2026-10-24 under [ROADMAP](../ROADMAP.md) item 21. Phase 2 shipped

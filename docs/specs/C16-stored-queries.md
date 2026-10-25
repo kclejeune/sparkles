@@ -307,6 +307,34 @@ variables.
   `mcp`, `guard::config` and the backup file lists; and the specs CI, C01, C09, C11 and
   C12.
 
+## Provenance
+
+This record preserves design sources, licensing and adoption decisions at the
+stages recorded below. Delivery statements in the record are historical. Current
+capabilities and remaining work are described by the spec status and Outcome.
+
+- **Spec:** [`C16-stored-queries.md`](C16-stored-queries.md), written on 2026-10-02
+  independently from:
+  - W3C SPARQL 1.1 Query and Protocol, cited from working knowledge;
+  - Apache Jena's documentation (Apache-2.0) of `ParameterizedSparqlString` and of query
+    execution with substitutions, cited from working knowledge;
+  - the public documentation of Stardog's stored queries and of Ontotext GraphDB's saved
+    queries, cited from working knowledge;
+  - the OpenAPI Specification's typed operation parameters and the MCP specification's
+    tool input schemas, cited from working knowledge;
+  - the Sparkles code and specs CI, C01, C09, C11 and C12.
+- **Implementation:** from the spec plus Sparkles code only (2026-10-02). The catalog,
+  the parameter types and the binding are in `sparkles::stored`. The admin API, runs, MCP
+  tools and the `sparkles queries` command are in `sparkles-server`.
+  - **Dependencies:** none added.
+- **Rejected** (spec §8):
+  - text substitution with escaping;
+  - a trailing `VALUES` clause;
+  - `$name` parameters only;
+  - a reserved graph for the definitions;
+  - one generic MCP tool for every stored query;
+  - per-user saved queries.
+
 ## Outcome
 
 **Delivered on 2026-10-02**, as designed in one phase.

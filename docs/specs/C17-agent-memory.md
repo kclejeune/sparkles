@@ -9,7 +9,7 @@
 > and the `agent_memory` prompt. Phase 1c adds a `branch` argument to the MCP tools,
 > tools that list, create, merge and delete branches, scratch branches for graph-limited
 > grants and their optional expiry. The server model calls sketched as Phase 2 in §10
-> were superseded by [C18](C18-natural-language-questions-and-ingest.md). Dataset-layered
+> were superseded by [C18](C18-natural-language-questions-and-ingest/README.md). Dataset-layered
 > scratch expiry and the shared evidence profile remain under roadmap items 57 and 81.
 >
 > **User docs:** [API: MCP tools](../API.md#tools) ·
@@ -29,7 +29,7 @@ the Sparkles code. The sources are listed in §15. It builds on the MCP server
 ([C11](C11-mcp-server.md)), schema discovery ([C02](C02-schema-discovery.md)), stored
 queries ([C16](C16-stored-queries.md)), write previews ([C15](C15-write-previews.md)),
 write-time validation ([C10](C10-write-time-validation.md)), full-text search
-([F03](F03-full-text-search.md)), vector search ([F04](F04-vector-search.md)), embeddings
+([F03](F03-full-text-search/README.md)), vector search ([F04](F04-vector-search.md)), embeddings
 on write ([F08](F08-embeddings-on-write.md)), history ([F06](F06-snapshots-and-point-in-time.md)),
 branches ([F09](F09-branches-and-merges.md)) and access control
 ([C09](C09-dataset-access-control.md), [C12](C12-graph-access-control.md),
@@ -823,7 +823,7 @@ how well they perform, and Phase 1c needs a change to F09.
 
 The stored-query field `questions` (§5.3) is a small extension of C16.
 
-[C18](C18-natural-language-questions-and-ingest.md) builds on these tools. It turns
+[C18](C18-natural-language-questions-and-ingest/README.md) builds on these tools. It turns
 questions into checked queries with a view in the UI, turns documents into reviewed
 facts, and designs the memory view of Phase 3 and the model calls of §10. Its grant
 template for agents (C18 §8.6) leaves out the `merge` endpoint, so an agent under that
@@ -868,7 +868,7 @@ client's model for a completion, would avoid server-side keys. Few hosts support
 it reverses the direction of control that Phase 1 relies on, so it is a Phase 2 option
 only.
 
-[C18](C18-natural-language-questions-and-ingest.md) designs this phase. The maintainer
+[C18](C18-natural-language-questions-and-ingest/README.md) designs this phase. The maintainer
 decided that people using the UI do want to ask questions, and C18 §3.4 specifies
 model providers in the server for Ollama and other local models, any
 OpenAI-compatible endpoint and Anthropic's API, with keys held as named secrets. The
@@ -884,8 +884,8 @@ deprecated it and directs servers to provider APIs instead (C18 §3.3).
 | 1a | `check_query`, `similar_queries` with the `questions` field of stored queries, `link_entities`, `recall`. Read-only, available on every dataset. |
 | 1b | `assert_facts` with the data model of §3, the memory shapes of §3.5 as a documented example, and the `agent_memory` prompt. |
 | 1c | The `branch` argument on the MCP tools, the four branch tools, scratch branches for graph-limited grants and their optional expiry. |
-| 2 | Deferred here (§10). [C18](C18-natural-language-questions-and-ingest.md) designs it, with the model providers of C18 §3.4 and the asking pipeline of its Phase 2. |
-| 3 | A memory view in the UI. It shows sources and their graphs, facts with their citations, and the supersession record of an entity. [C18 §8.7](C18-natural-language-questions-and-ingest.md#87-browsing-memory-in-the-ui) designs it. |
+| 2 | Deferred here (§10). [C18](C18-natural-language-questions-and-ingest/README.md) designs it, with the model providers of C18 §3.4 and the asking pipeline of its Phase 2. |
+| 3 | A memory view in the UI. It shows sources and their graphs, facts with their citations, and the supersession record of an entity. [C18 §8.7](C18-natural-language-questions-and-ingest/SPEC.md#87-browsing-memory-in-the-ui) designs it. |
 
 **Evaluation.** Besides the acceptance examples, three measurements show whether the
 tools help. A duplicate rate is measured on a scripted corpus of notes that mention the
@@ -1096,6 +1096,52 @@ commit 41.
   of spelling errors" (CACM, 1964).
 - The Sparkles code, in particular the MCP server in `crates/sparkles-server/src/mcp/`,
   and the specs C02, C10, C11, C12, C12b, C13, C15, C16, F03, F04, F06, F08 and F09.
+
+## Provenance
+
+This record preserves design sources, licensing and adoption decisions at the
+stages recorded below. Delivery statements in the record are historical. Current
+capabilities and remaining work are described by the spec status and Outcome.
+
+- **Spec:** [`C17-agent-memory.md`](C17-agent-memory.md), written on 2026-10-08 from:
+  - the Model Context Protocol specification, revisions 2025-06-18 and 2026-07-28 (tools,
+    annotations, structured content, prompts and sampling), cited from working knowledge;
+  - W3C RDF 1.2 Concepts, Turtle 1.2 and SPARQL 1.2 Query and Update drafts for triple
+    terms and reifiers, and RDF 1.1 Concepts §3.5 for skolemization;
+  - W3C SHACL, PROV-O, SKOS and the Web Annotation Data Model, and RFC 9562 for UUIDs;
+  - Lewis et al., "Retrieval-Augmented Generation for Knowledge-Intensive NLP Tasks"
+    (NeurIPS 2020), Edge et al., "From Local to Global: A Graph RAG Approach to
+    Query-Focused Summarization" (arXiv:2404.16130), Peng et al., "Graph
+    Retrieval-Augmented Generation: A Survey" (arXiv:2408.08921), and Pan et al.,
+    "Unifying Large Language Models and Knowledge Graphs: A Roadmap" (IEEE TKDE, 2024);
+  - Shen, Wang and Han, "Entity Linking with a Knowledge Base" (IEEE TKDE, 2015), and Wu
+    et al., "Scalable Zero-shot Entity Linking with Dense Entity Retrieval" (EMNLP 2020);
+  - Liu et al., "What Makes Good In-Context Examples for GPT-3?" (DeeLIO 2022);
+  - the QALD challenge series and Dubey et al., "LC-QuAD 2.0" (ISWC 2019), for evaluation;
+  - Packer et al., "MemGPT" (arXiv:2310.08560), Park et al., "Generative Agents" (UIST
+    2023), and Rasmussen et al., "Zep: A Temporal Knowledge Graph Architecture for Agent
+    Memory" (arXiv:2501.13956);
+  - Robertson and Zaragoza on BM25 (2009), Cormack, Clarke and Büttcher on reciprocal rank
+    fusion (SIGIR 2009), Malkov and Yashunin on HNSW (IEEE TPAMI, 2020), and Damerau on
+    edit distance (CACM, 1964);
+  - the Sparkles code and specs C02, C10, C11, C12, C12b, C13, C15, C16, F03, F04, F06,
+    F08 and F09.
+- **Implementation:** not built. The spec plans no new runtime dependency. The tools
+  compose the MCP server, schema reports, stored queries, full-text and vector search,
+  the embeddings client, write previews, the write guard and the branch API.
+- **Rejected** (spec §12):
+  - question answering or ingestion with a model inside the server in Phase 1;
+  - a separate memory store next to the graph;
+  - provenance in commit metadata only;
+  - a named graph per fact;
+  - RDF 1.1 reification, singleton properties and n-ary relations for provenance;
+  - deleting old values, and keeping superseded values asserted with a flag;
+  - automatic merging of duplicate entities;
+  - extending `explain_query` in place of `check_query`;
+  - one `memory` tool with an action argument;
+  - Web Annotation selectors for source spans;
+  - stored queries saved by agents;
+  - MCP sampling in Phase 1.
 
 ## Outcome
 
@@ -1342,7 +1388,7 @@ Phases 1b and 1c). See the [roadmap](../ROADMAP.md).
 profile specified by [C25](C25-evidence-and-assessments.md). It connects evidence,
 claims, authored records and review decisions. The profile is unimplemented, and the
 current vocabulary and shipped behaviour remain as recorded above. The workflow
-requirements are in [C18](C18-natural-language-questions-and-ingest.md#shared-memory-workflows).
+requirements are in [C18](C18-natural-language-questions-and-ingest/OUTCOME.md#shared-memory-workflows).
 
 The profile will connect sources and document renditions, cited assertions, shared
 entities, notes, decisions and tasks. Human notes and agent episodes can describe the
@@ -1385,7 +1431,7 @@ conflicting sources and a copied source that is not independent corroboration.
 ### Successor contract
 
 The original Phase 2 sketch was replaced by the implemented server Ask and ingestion
-contracts of [C18](C18-natural-language-questions-and-ingest.md#outcome). Historical
+contracts of [C18](C18-natural-language-questions-and-ingest/SPEC.md#outcome). Historical
 statements above that Phase 2 was not built describe the original landing, rather
 than an additional untracked model backend. Roadmap item 57 completes scratch expiry,
 and item 81 owns the shared representation specified at the end of this Outcome.

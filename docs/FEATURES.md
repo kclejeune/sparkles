@@ -176,7 +176,7 @@ These read paths are tuned for queries over data that is not yet in memory
   `tarql:expandPrefixedName`, and with `--lookup` or `lookup=true` it reads the
   dataset's head to link rows to resources the dataset has.
 * R2RML, RML and YARRRML mappings load CSV, TSV, JSON, JSON Lines, Parquet and SQLite
-  sources ([F19](specs/F19-mappings-and-virtual-graphs.md),
+  sources ([F19](specs/F19-mappings-and-virtual-graphs/README.md),
   [USAGE.md](USAGE.md#mappings-r2rml-rml-and-yarrrml)). RML covers both the rml.io
   vocabulary and RML-Core. `sparkles map run`, `sparkles load --mapping` and uploads run
   them. Each source is read once as a stream, and values keep their natural types. A join
@@ -1031,7 +1031,7 @@ build community reports.
 ### Questions in plain language
 
 * `sparkles ask`, `POST /{ds}/ask` and the query page's Ask bar turn a question into a
-  checked SPARQL query ([C18](specs/C18-natural-language-questions-and-ingest.md),
+  checked SPARQL query ([C18](specs/C18-natural-language-questions-and-ingest/README.md),
   [USAGE.md](USAGE.md#asking-questions-with-a-model),
   [API.md](API.md#natural-language-questions)). On DBpedia's billion quads, an Ask takes
   about two seconds with under 512 MiB of anonymous memory.
@@ -1501,7 +1501,7 @@ the UI and editors.
 * `sparkles-backup`, with the `backup` cargo feature, on by default, keeps online backups
   in a file system or S3, including AWS, MinIO, R2 and Ceph RGW
   ([API.md](API.md#backup-repositories), [USAGE.md](USAGE.md#backup-repositories),
-  [F05](specs/F05-snapshot-repositories.md)). A backup holds the writer lock for only a few
+  [F05](specs/F05-snapshot-repositories/README.md)). A backup holds the writer lock for only a few
   system calls, and an in-memory dataset is backed up through a temporary generation.
 * Backups are incremental and deduplicated in content-addressed 32 MiB pieces, and only
   the appended bytes of the WAL and catalog are copied. Repositories can be encrypted with
@@ -1548,7 +1548,7 @@ roadmap item as unfinished or promise another implementation.
 * ShEx 2.2 does not support `RESTRICTS` or `EXACTLY` reference syntax. SHACL 1.2 reifier
   constraints, `sh:uniqueValuesFor`, `sh:subsetOf`, `sh:someValue`, `sh:rootClass`,
   `sh:singleLine` and SHACL 1.2 custom functions are outside the supported scope. The
-  [G02](specs/G02-shex.md#roadmap-follow-ups-2026-10-12) and
+  [G02](specs/G02-shex/OUTCOME.md#roadmap-follow-ups-2026-10-12) and
   [G03](specs/G03-shaclc.md#roadmap-follow-ups-2026-10-12) Outcomes give the details.
 * Drafted shapes link another class shape only at support 1, derive patterns only from
   all-string properties and ranges only from inline numbers and dates, and follow
@@ -1794,7 +1794,7 @@ links each item to its design spec.
   configured API credentials. It does not accept a ChatGPT subscription as model access.
 * Ask has been evaluated with Anthropic models only, on the demo set, CK25, QALD-9-plus
   and 74 DBpedia-only questions
-  ([C18](specs/C18-natural-language-questions-and-ingest.md#roadmap-follow-ups-2026-10-12),
+  ([C18](specs/C18-natural-language-questions-and-ingest/OUTCOME.md#roadmap-follow-ups-2026-10-12),
   [BENCHMARKS.md](BENCHMARKS.md#natural-language-questions)). On the retained 107-question
   DBpedia repeat, Sonnet answers 31 under projected-column scoring and 9 with equal-width
   scoring. Haiku answers 26 and 23 respectively. These

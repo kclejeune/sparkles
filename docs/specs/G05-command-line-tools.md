@@ -334,6 +334,33 @@ New dependencies: none. `sparesults` (MIT OR Apache-2.0) is already a dependency
 * The Sparkles code: `sparkles::io`, `sparkles::codec`, the formatter's canonicalization,
   `query --explain`, the remote client and `/$/validate/*`.
 
+## Provenance
+
+This record preserves design sources, licensing and adoption decisions at the
+stages recorded below. Delivery statements in the record are historical. Current
+capabilities and remaining work are described by the spec status and Outcome.
+
+- **Spec:** [`G05-command-line-tools.md`](G05-command-line-tools.md), written on
+  2026-10-02 independently from:
+  - the Sparkles code;
+  - Apache Jena's `jena-cmds` (`riot`, `CmdLangParse`, `ModLangParse`, `ModLangOutput`,
+    `qparse`, `uparse`, `rdfdiff`, `rdfcompare`, `iri`, `rsparql`, `rupdate`, `rset`),
+    `jena-langtag` (`CmdLangTag`) and `jena-iri3986` (`Issue`) sources (Apache-2.0),
+    read for behaviour, flags, output and the list of IRI issues. No code was copied;
+  - RFC 3986, RFC 3987, RFC 9110 §4.2, RFC 8141, RFC 9562, RFC 3061, RFC 8089, W3C DID
+    Core 1.0 §3.1, the IANA URI scheme registry, BCP 47 (RFC 5646), RDF 1.1 and 1.2
+    Concepts, RDFC-1.0, the SPARQL 1.1 Protocol and the SPARQL result formats.
+- **Implementation** (2026-10-02): from the spec and the Sparkles code. The IRI and
+  language-tag rules, dot-segment removal and the per-group isomorphism check are written
+  from the RFCs. **Dependencies:** none new. `sparesults` 0.3 (MIT OR Apache-2.0), already
+  a dependency of `sparkles`, became a direct dependency of `sparkles-server`.
+- **Rejected** (spec §8):
+  - a plain endpoint URL in `query --server`, which would send saved tokens to other
+    servers;
+  - canonicalizing whole datasets for the diff of `compare`;
+  - checking terms inside the loader;
+  - a subtag registry for `langtag`.
+
 ## Outcome
 
 **Delivered.** All of §3 and §4 landed on 2026-10-02 in `crates/sparkles-server/src/tools/`,

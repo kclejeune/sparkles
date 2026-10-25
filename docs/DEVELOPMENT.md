@@ -403,7 +403,7 @@ workflow.
 ### JVM bindings
 
 `crates/sparkles-ffi` is the native library of the JVM bindings
-([USAGE](USAGE.md#jvm-apache-jena), [spec P04](specs/P04-jvm-bindings.md)). It exports
+([USAGE](USAGE.md#jvm-apache-jena), [spec P04](specs/P04-jvm-bindings/README.md)). It exports
 the engine through UniFFI 0.32 and is its own cargo workspace with its own `Cargo.lock`,
 for the same reasons as `crates/sparkles-py`. UniFFI's bindings generator, with its
 template engine and object-file reader, is a binary of the crate behind the `bindgen`

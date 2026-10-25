@@ -19,9 +19,9 @@ Concepts (for `rdf:JSON` as defined in JSON-LD 1.1), and the Sparkles code and s
 point-in-time reads ([F06](F06-snapshots-and-point-in-time.md)), branches and merges
 ([F09](F09-branches-and-merges.md)), graph access control
 ([C12](C12-graph-access-control.md)), stored queries ([C16](C16-stored-queries.md)),
-questions in natural language ([C18](C18-natural-language-questions-and-ingest.md)), the
-MCP server ([C11](C11-mcp-server.md)), GeoSPARQL maps ([G01](G01-geosparql.md)) and
-backups and clones ([F05](F05-snapshot-repositories.md),
+questions in natural language ([C18](C18-natural-language-questions-and-ingest/README.md)), the
+MCP server ([C11](C11-mcp-server.md)), GeoSPARQL maps ([G01](G01-geosparql/README.md)) and
+backups and clones ([F05](F05-snapshot-repositories/README.md),
 [C06](C06-clone-to-sandbox.md)). The time slider of [U01](U01-time-slider.md) is reused
 for a notebook's state.
 
@@ -350,6 +350,27 @@ chart kind, and Vega-Lite (BSD-3-Clause), whose runtime is larger.
 2. Whether a notebook may span datasets, with a dataset per cell.
 3. Whether **Run all** should run on the server through `/run`, so a notebook can run
    from the CLI and a cron-like schedule with the same results as the browser.
+
+## Provenance
+
+This record preserves design sources, licensing and adoption decisions at the
+stages recorded below. Delivery statements in the record are historical. Current
+capabilities and remaining work are described by the spec status and Outcome.
+
+- **Spec:** [`U05-notebooks.md`](U05-notebooks.md), written on 2026-10-12 independently from:
+  - the Jupyter notebook format documentation (nbformat 4) and its JSON schema;
+  - the public documentation of Observable notebooks and Observable Plot;
+  - W3C RDF 1.1 Concepts and JSON-LD 1.1 for `rdf:JSON`, and CommonMark;
+  - the Sparkles code and specs C06, C11, C12, C16, C18, F05, F06, F09, G01 and U01.
+- **Implementation:** not built. Planned npm dependencies, loaded only on the notebook
+  page: `@observablehq/plot` (ISC) with its d3 modules (ISC) for chart cells, and
+  `micromark` (MIT) with `micromark-extension-gfm` (MIT) for Markdown cells. The nbformat
+  JSON schema (BSD-3-Clause) would be test data only.
+- **Rejected** (spec §10):
+  - notebooks as files beside `queries.json`;
+  - one JSON literal per notebook;
+  - storing results by default;
+  - a code kernel.
 
 ## Outcome
 

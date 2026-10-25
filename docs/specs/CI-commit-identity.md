@@ -18,9 +18,9 @@
 > the end records how it landed.
 
 Several later features build on this spec: full-text and vector search
-watermarks ([F03](F03-full-text-search.md), [F04](F04-vector-search.md)), point-in-time
+watermarks ([F03](F03-full-text-search/README.md), [F04](F04-vector-search.md)), point-in-time
 queries (`?at=commit:<n>`, [F06](F06-snapshots-and-point-in-time.md)), change events and
-remote storage ([F05](F05-snapshot-repositories.md)).
+remote storage ([F05](F05-snapshot-repositories/README.md)).
 
 ## 1. Summary, goals, non-goals
 
@@ -587,7 +587,7 @@ commit annotations. Clients send a message in a `Sparkles-Commit-Message` reques
 
 **Later work** has its own specs. Retained generations and `?at=commit:N|time:…` belong to
 [F06](F06-snapshots-and-point-in-time.md). Search indexes that record their `seq`
-watermark belong to [F03](F03-full-text-search.md) and [F04](F04-vector-search.md). A
+watermark belong to [F03](F03-full-text-search/README.md) and [F04](F04-vector-search.md). A
 long-poll change feed on `GET /$/commits/{ds}?after=` and catalog pruning are also later
 work.
 
@@ -772,6 +772,28 @@ while `sparkles serve` holds the lock → succeeds and lists seqs 1, 0.
   semantics, ETag), RFC 6648 (`X-` prefix), RFC 9651 (Structured Field Values), RFC 7089
   (Memento), W3C RDF Dataset Canonicalization (RDFC-1.0).
 
+## Provenance
+
+This record preserves design sources, licensing and adoption decisions at the
+stages recorded below. Delivery statements in the record are historical. Current
+capabilities and remaining work are described by the spec status and Outcome.
+
+- **Spec:** [`CI-commit-identity.md`](CI-commit-identity.md), written independently from
+  the Sparkles code, the Apache Jena Fuseki sources (Apache-2.0), the W3C SPARQL 1.1
+  Protocol and Graph Store Protocol, and RFCs 3339, 9562, 9110, 6648 and 9651.
+- **Implementation:** from the spec plus Sparkles code only.
+  - **Dependencies:** `uuid` 1.x (Apache-2.0/MIT), with its `serde` feature now
+    enabled, and the CRC-32 from `flate2` (MIT/Apache-2.0). Both were already
+    dependencies.
+- **Rejected** (spec §8):
+  - `Snapshot::version` as the id;
+  - content hashes as the primary id;
+  - a new WAL opcode, which older binaries would truncate;
+  - fsyncing the catalog per commit;
+  - a JSON-lines catalog;
+  - empty commits for no-op writes;
+  - a commit per compaction.
+
 ## Outcome
 
 **Delivered.** Phase 1 landed on 2026-09-30 in two commits. `0374949` changed the engine.
@@ -786,10 +808,10 @@ receipts, and `cb598c8` added commit headers on SHACL validation. Dataset entrie
 `sparkles log --at` works, and in-memory datasets keep a ring of 65,536 commits
 (`StoreOptions::memory_commit_ring`).
 
-Later features build on the receipts. Search watermarks ([F03](F03-full-text-search.md)),
+Later features build on the receipts. Search watermarks ([F03](F03-full-text-search/README.md)),
 `?at=` reads and named snapshots ([F06](F06-snapshots-and-point-in-time.md)), clones that
 record `forkedFrom` ([C06](C06-clone-to-sandbox.md)), backups and restores
-([F05](F05-snapshot-repositories.md)) and write-time validation summaries
+([F05](F05-snapshot-repositories/README.md)) and write-time validation summaries
 ([C10](C10-write-time-validation.md)) all use them.
 
 An aborted RDF Patch reports one published commit identity, including its matching

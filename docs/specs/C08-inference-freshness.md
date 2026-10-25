@@ -820,6 +820,12 @@ ex:owns rdfs:range ex:Pet .` and the data `ex:tom a ex:Cat . ex:ann ex:owns ex:r
 `SELECT ?x { ?x a ex:Animal }` returns `ex:tom`, and `SELECT ?t { ex:rex a ?t }` returns
 `ex:Pet`, as Jena does. Nothing is written to the dataset.
 
+## Provenance
+
+The [design source list](#10-sources) records this spec's existing sources.
+Its Outcome records implementation decisions and departures. No separate
+adoption entry existed in the former central provenance registry.
+
 ## Outcome
 
 **Delivered.** Phase 1 landed on 2026-09-30, after durable commit identity. Freshness
@@ -849,7 +855,7 @@ server-wide setting.
 
 **Later additions.** Clones rebase the status ([C06](C06-clone-to-sandbox.md)).
 GeoSPARQL added the optional `vocabularies` and `geoDefaultGeometry` fields to the status
-([G01](G01-geosparql.md)). Write-time validation can refuse a reasoning run's commit and
+([G01](G01-geosparql/README.md)). Write-time validation can refuse a reasoning run's commit and
 puts the reason in the task's error ([C10](C10-write-time-validation.md)).
 
 **Phase 2.** Phase 2 landed on 2026-10-02 with these parts:

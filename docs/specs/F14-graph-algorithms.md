@@ -585,6 +585,34 @@ stays current. It is left out of this spec.
   `sparql/plan.rs`, `access.rs`, `task.rs`, `vector/config.rs`, and the specs C01, C11,
   C12, C12b, F04, F07 and P06.
 
+## Provenance
+
+This record preserves design sources, licensing and adoption decisions at the
+stages recorded below. Delivery statements in the record are historical. Current
+capabilities and remaining work are described by the spec status and Outcome.
+
+- **Spec:** [`F14-graph-algorithms.md`](F14-graph-algorithms.md), written on 2026-10-12
+  independently from:
+  - the public documentation of the Neo4j Graph Data Science library (projections,
+    execution modes and algorithm pages) and of Amazon Neptune Analytics' algorithms.
+    No GDS source was read;
+  - the LDBC Graphalytics specification and Iosup et al. (VLDB 2016);
+  - the papers defining each algorithm: Page et al. (1999), Haveliwala (WWW 2002),
+    Brandes (2001), Brandes and Pich (2007), Tarjan (1972), Raghavan, Albert and Kumara
+    (2007), Blondel et al. (2008), Traag, Waltman and van Eck (2019), Batagelj and
+    Zaversnik (2003), Watts and Strogatz (1998), Chen et al. FastRP (CIKM 2019), Grover
+    and Leskovec node2vec (KDD 2016), and Zachary (1977) for a test graph;
+  - the Sparkles code and specs C01, C11, C12, C12b, F04, F07 and P06.
+- **Implementation:** not built. The spec plans no new dependency; `rand` and `rayon`
+  are already used.
+- **Rejected** (spec §10):
+  - a graph catalog with mutable projections;
+  - one `SERVICE algo:run` with an algorithm parameter;
+  - property functions with positional arguments;
+  - igraph (GPL) or NetworKit through FFI;
+  - writing results only through SPARQL Update;
+  - the algorithms as recursive SPARQL updates.
+
 ## Outcome
 
 Algorithm SERVICE allocations now enter the same query ledger as ordinary query work.

@@ -1346,6 +1346,51 @@ past commit keeps answering `501`.
   papers (Arndt, Naumann and Marx, 2017–2019), all cited from general knowledge for their
   documented behavior. No code of these systems was read.
 
+## Provenance
+
+This record preserves design sources, licensing and adoption decisions at the
+stages recorded below. Delivery statements in the record are historical. Current
+capabilities and remaining work are described by the spec status and Outcome.
+
+- **Spec:** [`F06-snapshots-and-point-in-time.md`](F06-snapshots-and-point-in-time.md),
+  written on 2026-09-30 independently from:
+  - the Sparkles code and [CI](CI-commit-identity.md);
+  - RFC 7089 (Memento), RFC 9110, and the W3C SPARQL 1.1 Protocol and Graph Store
+    Protocol, all fetched;
+  - RFCs 3339, 8246, 6648 and 9651, cited from general knowledge;
+  - Jena's RDF Patch format (Apache-2.0), cited from general knowledge for an open
+    question only.
+- **Implementation:** from the spec plus Sparkles code only (2026-09-30).
+  - **Dependencies:** `httpdate` 1.0.3 (MIT OR Apache-2.0), new in the server.
+- **Rejected** (spec §8):
+  - alternatives B (a new write path and formats) and C (named points only, a rebuild per
+    pin) as the MVP;
+  - in-memory `Arc<Snapshot>` retention for persistent datasets;
+  - generation names in pins;
+  - deleting a pin's data when its generation is missing;
+  - `404` for garbage-collected commits (`410` instead);
+  - RFC 7089 clamping for `?at=time:` before the root;
+  - a strong ETag per commit;
+  - refusing compaction when retention would exceed a limit;
+  - a `sealed.json` per generation;
+  - `Snapshot::version` in the cache key of historical snapshots;
+  - `X-Sparkles-*` or product-specific selector syntaxes.
+- **Phase 3** (history queries and the change log, spec §11), written on 2026-10-03 from:
+  - the Sparkles code and the specs F06, CI, C12, C12b and C13;
+  - the W3C SPARQL 1.1 Query Language and the RDF 1.2 Concepts and SPARQL 1.2 Query
+    drafts (reifiers, triple terms, `rdf:reifies`), cited from general knowledge;
+  - the documented behavior of SQL:2011 system-versioned tables, Datomic's `as-of`,
+    `since` and history databases, Dolt's `dolt_diff_<table>`, `dolt_history_<table>`
+    and `dolt_log` system tables, TerminusDB's document history, the R43ples paper
+    (Graube, Hensel and Urbas, 2014) and the Quit Store papers (Arndt, Naumann and Marx),
+    all cited from general knowledge. No code of these systems was read.
+  - **Implementation:** from the spec plus Sparkles code only (2026-10-03). No new
+    dependencies.
+  - **Rejected** (spec §11.7): syncing the change log in the commit path; keys in the
+    write-ahead log; history as a materialized named graph; new query syntax (a revision
+    keyword or `FOR SYSTEM_TIME`); answering history by replaying states; per-quad
+    validity periods as the primary output.
+
 ## Outcome
 
 **Delivered.** Phase 1 landed on 2026-09-30 in two commits: the engine (`d866c0c`) and the
@@ -1377,7 +1422,7 @@ past and live states never share entries.
   `history-memory` code.
 
 The open questions kept their defaults: retention is off unless set, and there are no
-relative selectors. Backup repositories ([F05](F05-snapshot-repositories.md)) later added
+relative selectors. Backup repositories ([F05](F05-snapshot-repositories/README.md)) later added
 a `backup:<name>` hold on the generation a backup uploads. A restored dataset starts
 without history.
 

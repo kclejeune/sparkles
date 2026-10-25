@@ -397,6 +397,29 @@ taking the conservative option in each case.
    C12 limits makes its counts a second source of disclosure to review. It can come later
    as a separate level above the classes.
 
+## Provenance
+
+This record preserves design sources, licensing and adoption decisions at the
+stages recorded below. Delivery statements in the record are historical. Current
+capabilities and remaining work are described by the spec status and Outcome.
+
+- **Spec:** [`U06-large-graph-rendering.md`](U06-large-graph-rendering.md), written on 2026-10-12 independently from:
+  - the public documentation of sigma.js 3 and graphology;
+  - Jacomy et al., "ForceAtlas2, a Continuous Graph Layout Algorithm for Handy Network
+    Visualization Designed for the Gephi Software", PLOS ONE, 2014;
+  - the public documentation of Cytoscape.js, cytoscape-fcose, cosmos.gl and Cosmograph;
+  - the WebGL 2 specification;
+  - the Sparkles code (`GraphView`, `lib/graph.ts`, `lib/explore.ts`) and specs C01, C02,
+    C12, F14 and X05.
+- **Implementation:** not built. Planned npm dependencies, loaded only by the large view:
+  `sigma` (MIT), `graphology` (MIT), `graphology-layout-forceatlas2` (MIT) and the
+  graphology utilities it needs (MIT).
+- **Rejected** (spec §10):
+  - raising Cytoscape's limits;
+  - cosmos.gl or Cosmograph (license review needed for Cosmograph);
+  - server-rendered tiles;
+  - aggregation in the browser.
+
 ## Outcome
 
 Phases 1 and 2 shipped on 2026-10-23 under [ROADMAP](../ROADMAP.md) item 29, ahead of

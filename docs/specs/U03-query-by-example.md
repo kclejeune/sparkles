@@ -20,8 +20,8 @@ documentation of Sparnatural (a visual SPARQL query builder driven by a configur
 classes and properties), the W3C SPARQL 1.1 Query Recommendation, and the Sparkles code
 and specs: stored queries ([C16](C16-stored-queries.md)), schema discovery and class
 profiles ([C02](C02-schema-discovery.md)), the Cypher frontend
-([F01](F01-cypher.md)), full-text search ([F03](F03-full-text-search.md)), the formatter
-([X02](X02-formatter.md)) and the MCP server ([C11](C11-mcp-server.md)). Sparnatural is
+([F01](F01-cypher.md)), full-text search ([F03](F03-full-text-search/README.md)), the formatter
+([X02](X02-formatter/README.md)) and the MCP server ([C11](C11-mcp-server.md)). Sparnatural is
 LGPL-licensed, and none of its code was read or used.
 
 ## 1. Summary, goals, non-goals
@@ -337,6 +337,27 @@ the person sees the same pattern they selected. Open question 2 of §10 is the s
 as U08's open question 1 and is decided there.
 
 `UNION`, which §1 leaves out of this spec, is in U08's Phase 3 subset.
+
+## Provenance
+
+This record preserves design sources, licensing and adoption decisions at the
+stages recorded below. Delivery statements in the record are historical. Current
+capabilities and remaining work are described by the spec status and Outcome.
+
+- **Spec:** [`U03-query-by-example.md`](U03-query-by-example.md), written on 2026-10-12 independently from:
+  - M. M. Zloof, "Query-by-Example: a data base language", IBM Systems Journal 16(4), 1977;
+  - the public documentation of Neo4j Bloom's search phrases;
+  - the public documentation of Sparnatural (LGPL-3.0), whose code was not read or used;
+  - the W3C SPARQL 1.1 Query Recommendation and the WAI-ARIA combobox pattern;
+  - the Sparkles code and specs C02, C11, C16, C17, F01, F03 and X02.
+- **Implementation:** not built. No new runtime dependency is planned. The tests use the
+  `oxigraph` npm package (MIT OR Apache-2.0), already a dev dependency, to parse
+  generated queries.
+- **Rejected** (spec §9):
+  - inferring the pattern from two selected nodes;
+  - generalizing constants by default;
+  - phrases matched by a model;
+  - a phrase store separate from stored queries.
 
 ## Outcome
 

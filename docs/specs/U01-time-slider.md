@@ -24,7 +24,7 @@ change feed and history queries ([F06](F06-snapshots-and-point-in-time.md)), bra
 the commit graph ([F09](F09-branches-and-merges.md)), commit identity
 ([CI](CI-commit-identity.md)), schema reports and schema diffs
 ([C02](C02-schema-discovery.md)) and the result comparison of
-[C18 §6.7.5](C18-natural-language-questions-and-ingest.md#675-comparing-results). It also
+[C18 §6.7.5](C18-natural-language-questions-and-ingest/SPEC.md#675-comparing-results). It also
 uses RFC 7089 (Memento) for the meaning of a state at a time, the WAI-ARIA Authoring
 Practices' slider pattern for keyboard and screen-reader behaviour, the Gephi
 documentation of its timeline for dynamic graphs as an example of a scrubbed graph view,
@@ -398,6 +398,27 @@ commit 2.
    unexpected re-run would cost a query per commit on a busy dataset.
 3. Whether the timeline route should also bucket by time with calendar boundaries, for a
    track by time over years of commits.
+
+## Provenance
+
+This record preserves design sources, licensing and adoption decisions at the
+stages recorded below. Delivery statements in the record are historical. Current
+capabilities and remaining work are described by the spec status and Outcome.
+
+- **Spec:** [`U01-time-slider.md`](U01-time-slider.md), written on 2026-10-12 independently from:
+  - RFC 7089 (Memento) for the state at a time;
+  - the WAI-ARIA Authoring Practices' slider pattern;
+  - the Gephi documentation of its timeline for dynamic graphs and the Cytoscape.js
+    documentation of element animation;
+  - the Sparkles UI code (`HistoryPanel`, `CommitGraph`, `MemoryTab`, `SchemaDiffDialog`,
+    the query page's `at` field) and specs CI, C02, C18, F06 and F09.
+- **Implementation:** not built. No new dependency is planned; the UI keeps Cytoscape.js
+  (MIT) and cytoscape-fcose (MIT).
+- **Rejected** (spec §9):
+  - rebuilding states in the browser from the change feed;
+  - a separate history page;
+  - animating every intermediate commit on a jump;
+  - server-side result diffs from Phase 1.
 
 ## Outcome
 

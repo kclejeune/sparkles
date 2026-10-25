@@ -20,7 +20,7 @@
 This design was written from the Sparkles code and specs: the executed plan with node
 ids that `/{ds}/sparql` returns in `meta.plan` and the query page draws with `PlanView`,
 the explanation of plans and the rewrite suggestions of
-[C18 §6.6 and §6.7](C18-natural-language-questions-and-ingest.md#66-explaining-a-query),
+[C18 §6.6 and §6.7](C18-natural-language-questions-and-ingest/SPEC.md#66-explaining-a-query),
 request ids, budgets and cancellation ([C01](C01-observability-and-budgets.md)),
 streamed execution ([X05](X05-streaming-query-execution.md)), graph access control
 ([C12](C12-graph-access-control.md)) and the library's `Control`
@@ -491,6 +491,28 @@ The dataset is §7's `big`.
    algebra.
 2. Whether edges should show an estimate from the schema report before any plan exists,
    which is U08's open question 3.
+
+## Provenance
+
+This record preserves design sources, licensing and adoption decisions at the
+stages recorded below. Delivery statements in the record are historical. Current
+capabilities and remaining work are described by the spec status and Outcome.
+
+- **Spec:** [`U04-live-query-profiling.md`](U04-live-query-profiling.md), written on 2026-10-12 independently from:
+  - the WHATWG HTML specification of server-sent events;
+  - PostgreSQL's documentation of `EXPLAIN ANALYZE` and the `pg_stat_progress_*` views,
+    and Microsoft SQL Server's documentation of Live Query Statistics, as public
+    descriptions of per-operator progress;
+  - the Sparkles code (`sparkles-core` executor and plan, `PlanView`, `explain.ts`) and
+    specs C01, C12, C18, P03, P06 and X05.
+- **Implementation:** not built. No new dependency is planned. The server uses its
+  existing HTTP and event-stream code, and the UI its existing `SseParser`.
+- **Rejected** (spec §9):
+  - progress inside the query response;
+  - WebSockets;
+  - polling as the UI's only mechanism;
+  - sampling the executor's stack;
+  - a server-assigned id returned before execution.
 
 ## Outcome
 
