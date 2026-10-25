@@ -30,8 +30,8 @@ def binary32(value):
 
 
 QUERY_SHAPES = {
-    "q6": "639a549bbbc6331c416b9211c516955396a3173085a9167dfe0cec5662962f4a",
-    "q7": "122c3e1a98f65df60bd604da8b10126d4729db4cf10ee6aeb7e2bcc87bf721e6",
+    "q6": "d709419bd15976bda998a0a786ef5f1c90228d5f3e512349740670b7b9f89412",
+    "q7": "8578fb1988308f75b996404145687b68cbfd85d7f14c83d87543c1b671e78dbd",
 }
 
 
@@ -41,7 +41,7 @@ def query_shape(text):
                   r"<http://www4.wiwiss.fu-berlin.de/bizer/bsbm/v01/instances/ProductType\d+>|"
                   r"<http://downlode.org/rdf/iso-3166/countries#[^>]+>", "<PARAM>", text)
     text = re.sub(r"(?i)\bLIMIT\s+\d+", "limit PARAM", text)
-    return hashlib.sha256(" ".join(text.lower().split()).encode()).hexdigest()
+    return hashlib.sha256(" ".join(text.split()).encode()).hexdigest()
 
 
 def parameters(text, kind, *, check_shape=True):
@@ -292,20 +292,37 @@ def main():
             engine = raw.name[len(name) + 1:-5]
             if args.engines is not None and engine not in args.engines:
                 continue
-            answer = json.loads(raw.read_text())
-            problems = check_q6(expected, answer) if kind == "q6" else check_q7(expected, answer)
+            raw_digest = None
+            try:
+                body = raw.read_bytes()
+                raw_digest = hashlib.sha256(body).hexdigest()
+                answer = json.loads(body)
+                if (not isinstance(answer, dict) or not isinstance(answer.get("head"), dict)
+                        or not isinstance(answer["head"].get("vars"), list)
+                        or not all(isinstance(v, str) for v in answer["head"]["vars"])
+                        or not isinstance(answer.get("results"), dict)
+                        or not isinstance(answer["results"].get("bindings"), list)
+                        or any(not isinstance(row, dict) or any(not isinstance(v, dict) for v in row.values())
+                               for row in answer["results"]["bindings"])):
+                    raise ValueError("invalid SPARQL JSON result structure")
+                problems = check_q6(expected, answer) if kind == "q6" else check_q7(expected, answer)
+                fingerprint = fingerprints.select_record(text, answer, False)
+            except (OSError, ValueError, TypeError, KeyError, AttributeError):
+                # bench-answers already marks an unparseable request as an error.
+                # Never turn an unreadable body into an acceptance verdict or stop peers.
+                engines[engine] = {"status": "capture-error", "problems": ["unreadable or invalid SPARQL JSON"],
+                    "query_sha256": hashlib.sha256(path.read_bytes()).hexdigest(), "raw_sha256": raw_digest}
+                continue
             engines[engine] = {"status": "ok" if not problems else "disagrees", "problems": problems,
                 "policy": "binary32-summation-equivalence" if kind == "q6" else "legal-inner-limit-ties",
                 "query_sha256": hashlib.sha256(path.read_bytes()).hexdigest(),
-                "raw_sha256": hashlib.sha256(raw.read_bytes()).hexdigest(),
-                "fingerprint": fingerprints.select_record(text, answer, False)}
+                "raw_sha256": raw_digest,
+                "fingerprint": fingerprint}
             if kind == "q6":
                 engines[engine]["datatypes"] = sorted({b.get("reviewerAvgScore", {}).get("datatype", "")
                     for b in answer["results"]["bindings"]})
         report["queries"][name] = engines
     Path(args.json).write_text(json.dumps(report, indent=1) + "\n")
-    if not any(report["queries"].values()):
-        parser.error("no captured answers were checked")
 
 
 if __name__ == "__main__":

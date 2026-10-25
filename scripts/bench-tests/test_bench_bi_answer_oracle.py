@@ -114,3 +114,42 @@ class CutoffTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+class CaptureTests(unittest.TestCase):
+    def run_cli(self, bodies):
+        from unittest.mock import patch
+        query = '''SELECT ?product WHERE { ?product a <http://www4.wiwiss.fu-berlin.de/bizer/bsbm/v01/instances/ProductType1> .
+        ?vendor <http://www4.wiwiss.fu-berlin.de/bizer/bsbm/v01/vocabulary/country> <http://downlode.org/rdf/iso-3166/countries#US> . } LIMIT 2'''
+        with tempfile.TemporaryDirectory() as d:
+            root = Path(d)
+            (root / "queries").mkdir()
+            (root / "raw").mkdir()
+            (root / "queries/bi-q7-1.rq").write_text(query)
+            (root / "data.nt").write_text('')
+            for engine, body in bodies.items():
+                (root / f"raw/bi-q7-1.{engine}.json").write_text(body)
+            out = root / "validation.json"
+            argv = [str(SCRIPT), str(root / "data.nt"), str(root / "queries"), str(root / "raw"), "--json", str(out)]
+            with patch("sys.argv", argv), patch.dict(oracle.QUERY_SHAPES, q7=oracle.query_shape(query)):
+                oracle.main()
+            return json.loads(out.read_text())
+
+    def test_case_sensitive_terms_have_distinct_shape_signatures(self):
+        query = 'SELECT ?product WHERE { ?product <urn:vocabulary/p> "Yes" }'
+        self.assertNotEqual(oracle.query_shape(query), oracle.query_shape(query.replace('vocabulary', 'Vocabulary')))
+        self.assertNotEqual(oracle.query_shape(query), oracle.query_shape(query.replace('?product', '?Product')))
+        self.assertNotEqual(oracle.query_shape(query), oracle.query_shape(query.replace('"Yes"', '"yes"')))
+
+    def test_timeout_only_capture_set_does_not_abort_the_suite(self):
+        receipt = self.run_cli({})
+        self.assertEqual(receipt["version"], 1)
+        self.assertEqual(receipt["queries"], {"bi-q7-1": {}})
+
+    def test_bad_capture_is_isolated_from_valid_peers(self):
+        valid = json.dumps(products_answer(()))
+        for body in ['{invalid', '{}', '{"head":{"vars":["product"]},"results":{"bindings":[null]}}']:
+            receipt = self.run_cli({"valid": valid, "broken": body})
+            self.assertEqual(receipt["queries"]["bi-q7-1"]["valid"]["status"], "ok")
+            broken = receipt["queries"]["bi-q7-1"]["broken"]
+            self.assertEqual(broken["status"], "capture-error")
+            self.assertNotIn("fingerprint", broken)
