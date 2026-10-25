@@ -331,6 +331,9 @@ check them against the W3C suites and Jena's own answers.
   starting from the side the join input binds.
 * The value space follows the specification for numeric promotion, comparisons, effective
   boolean values and the total order of ORDER BY.
+* Pure BIND expressions that read one variable can reuse their results across cursor
+  batches. The query owns and budgets the cache, preserving RDF term identity and
+  expression errors. Volatile expressions and application callbacks run per row.
 * The function library has the SPARQL 1.1 built-ins, the XSD casts, including the
   derived integer types with their ranges, `anyURI` and the Gregorian types, and ARQ's
   `fn:`, `afn:` and `math:` functions ([API.md](API.md#extension-functions-and-aggregates)).

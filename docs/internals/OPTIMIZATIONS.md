@@ -203,15 +203,22 @@ Each of these can be switched off per query (`QueryOptions::optimizations`) or p
 * **Pure expressions per distinct value** (`expr_cache`). A FILTER conjunct, BIND, ORDER BY
   key or aggregate argument that reads one variable and gives the same result for the same
   term is evaluated once per distinct id of that variable. Rows look up the result, errors
-  included. RAND, UUID, STRUUID, BNODE and EXISTS run per row. NOW and the base IRI are
-  fixed for the query. On a column sorted by the variable, the distinct ids are its runs.
+  included. RAND, UUID, STRUUID, BNODE and EXISTS run per row, as do the ARQ UUID
+  aliases, dynamic `fn:apply` and `afn:eval` calls, and effectful extension functions.
+  NOW and the base IRI are fixed for the query. On a column sorted by the variable, the distinct ids are its runs.
   Otherwise a sample estimates how often values repeat, and when fewer than half the rows
   repeat a value the operator runs row by row. EXPLAIN notes `[expr cache: …]` with the
   distinct count or the reason it ran row by row, and reports `exprCacheHits`,
   `exprCacheMisses` and `exprCacheSkipped`. A constant regular expression is compiled once
   per thread and reuses its match cache. The planner counts the cost of sorting an
   unsorted input column, so a single pattern under such a FILTER is read from the
-  permutation sorted on the filtered variable.
+  permutation sorted on the filtered variable. A cursor BIND can retain results across
+  batches after a bounded pilot finds repeated exact input IDs. The query owns the map,
+  including cached expression errors. It keeps at most 65,536 entries under the memory
+  budget, charged conservatively at about 6 MiB, while dense inline integers retain their
+  smaller 16,384-entry cap. A refused optional allocation or a full cache leaves uncached
+  inputs on ordinary evaluation. Identity copies, volatile expressions and application
+  callbacks do not enter this cache.
 * **Numeric range scans.** A FILTER that compares a scan's sort column with numeric
   constants reads only the id ranges that can match. Inline integers, and inline decimals
   of one scale, sort by value within their id segment, so each segment's matches form one

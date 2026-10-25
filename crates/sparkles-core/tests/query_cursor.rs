@@ -4414,3 +4414,233 @@ fn parallel_cursor_operators_release_their_memory_when_stopped() {
         assert_eq!(pool.granted(), 0, "{q}");
     }
 }
+
+#[test]
+fn temporal_bind_reuse_matches_an_independent_calendar_oracle() {
+    use oxrdf::{Literal, vocab::xsd};
+    // YEAR reads the local calendar component. Decimal division and FLOOR round
+    // negative years toward minus infinity. BIND errors retain an unbound value.
+    let cases = [
+        ("1999-12-31", xsd::DATE, Some(1999)),
+        ("2000-01-01", xsd::DATE, Some(2000)),
+        ("2000-01-01+00:00", xsd::DATE, Some(2000)),
+        ("2000-01-01-00:00", xsd::DATE, Some(2000)),
+        ("2000-02-29", xsd::DATE, Some(2000)),
+        ("1900-02-29", xsd::DATE, None),
+        ("2001-02-29", xsd::DATE, None),
+        ("1600-02-29", xsd::DATE, Some(1600)),
+        ("0000-01-01", xsd::DATE, Some(0)),
+        ("-0001-01-01", xsd::DATE, Some(-1)),
+        ("-0010-12-31", xsd::DATE, Some(-10)),
+        ("-0011-01-01", xsd::DATE, Some(-11)),
+        ("1999-12-31T24:00:00Z", xsd::DATE_TIME, Some(2000)),
+        ("1999-12-31T23:59:59.5-14:00", xsd::DATE_TIME, Some(1999)),
+        ("2000-01-01+14:01", xsd::DATE, None),
+        ("02000-01-01", xsd::DATE, None),
+        ("not-a-date", xsd::DATE, None),
+        ("2000-01-01", xsd::STRING, None),
+        ("1999-12-31-00:00", xsd::DATE, Some(1999)),
+    ];
+    let store = Store::in_memory(StoreOptions::default());
+    let repeats = 256;
+    let mut data = String::new();
+    let delta_case = cases.len() - 1;
+    for (i, (lex, datatype, _)) in cases.iter().enumerate().take(delta_case) {
+        for row in 0..repeats {
+            data += &format!(
+                "<urn:case:{i}:{row}> <urn:case> {i} ; <urn:date> {} .\n",
+                Literal::new_typed_literal(*lex, *datatype)
+            );
+        }
+    }
+    store
+        .load(&[Source::from_bytes(
+            data.into_bytes(),
+            RdfFormat::Turtle,
+            None,
+        )])
+        .unwrap();
+    let old = store.snapshot();
+    let text = "SELECT ?case ?date ?year ?decade WHERE { ?s <urn:case> ?case ; <urn:date> ?date BIND(YEAR(?date) AS ?year) BIND(FLOOR(YEAR(?date) / 10) * 10 AS ?decade) }";
+    let validate = |rows: Vec<Vec<Option<Term>>>, extra: usize| {
+        let mut counts = vec![0; cases.len()];
+        for row in rows {
+            let Some(Term::Literal(case)) = &row[0] else {
+                panic!("case ID must stay bound")
+            };
+            let i = case.value().parse::<usize>().unwrap();
+            counts[i] += 1;
+            let (lex, datatype, year) = cases[i];
+            assert_eq!(
+                row[1],
+                Some(Term::Literal(Literal::new_typed_literal(lex, datatype)))
+            );
+            match year {
+                Some(year) => {
+                    let Some(Term::Literal(actual)) = &row[2] else {
+                        panic!("valid calendar year became unbound: {lex}")
+                    };
+                    assert_eq!(actual.datatype(), xsd::INTEGER);
+                    assert_eq!(actual.value().parse::<i64>().unwrap(), year);
+                    let Some(Term::Literal(actual)) = &row[3] else {
+                        panic!("valid decade became unbound: {lex}")
+                    };
+                    assert_eq!(actual.datatype(), xsd::DECIMAL);
+                    assert_eq!(
+                        actual.value().parse::<f64>().unwrap(),
+                        (year.div_euclid(10) * 10) as f64
+                    );
+                }
+                None => assert!(row[2].is_none() && row[3].is_none(), "{lex}"),
+            }
+        }
+        for (i, count) in counts.into_iter().enumerate() {
+            assert_eq!(count, if i == delta_case { extra } else { repeats });
+        }
+    };
+    validate(
+        query(old.clone(), text, &Default::default())
+            .unwrap()
+            .rows(),
+        0,
+    );
+    for cache in [false, true] {
+        for batch in [1, 7, 4096] {
+            let opts = QueryOptions {
+                max_memory_bytes: Some(2 << 20),
+                optimizations: Some(sparkles_core::sparql::Optimizations {
+                    expr_cache: cache,
+                    ..Default::default()
+                }),
+                ..Default::default()
+            };
+            let cursor = select_cursor(old.clone(), text, &opts, &options(batch)).unwrap();
+            validate(all(cursor), 0);
+        }
+    }
+    for cache in [false, true] {
+        for (rows, produced) in [(Some(32), None), (None, Some(4096))] {
+            let opts = QueryOptions {
+                max_rows: rows,
+                max_rows_produced: produced,
+                optimizations: Some(sparkles_core::sparql::Optimizations {
+                    expr_cache: cache,
+                    ..Default::default()
+                }),
+                ..Default::default()
+            };
+            let mut cursor = select_cursor(old.clone(), text, &opts, &options(4096)).unwrap();
+            loop {
+                match cursor.next_batch() {
+                    Ok(Some(_)) => {}
+                    Err(Error::BudgetExceeded(b)) => {
+                        assert_eq!(
+                            b.kind,
+                            if rows.is_some() {
+                                BudgetKind::Rows
+                            } else {
+                                BudgetKind::RowsProduced
+                            }
+                        );
+                        break;
+                    }
+                    Err(e) => panic!("unexpected finite-work error: {e}"),
+                    Ok(None) => panic!("finite physical work must stay bounded"),
+                }
+            }
+        }
+    }
+    let cancel = Arc::new(AtomicBool::new(false));
+    let opts = QueryOptions {
+        cancel: Some(cancel.clone()),
+        ..Default::default()
+    };
+    let mut cursor = select_cursor(old.clone(), text, &opts, &options(4096)).unwrap();
+    assert_eq!(cursor.next_batch().unwrap().unwrap().len(), 4096);
+    cancel.store(true, Ordering::Relaxed);
+    assert!(matches!(cursor.next_batch(), Err(Error::Cancelled)));
+    let delta = (0..32)
+        .map(|i| {
+            format!(
+                "<urn:delta:{i}> <urn:case> {delta_case} ; <urn:date> \"1999-12-31-00:00\"^^<http://www.w3.org/2001/XMLSchema#date> ."
+            )
+        })
+        .collect::<String>();
+    sparkles_core::sparql::update::update(
+        &store,
+        &format!("INSERT DATA {{ {delta} }}"),
+        &Default::default(),
+    )
+    .unwrap();
+    let changed = store.snapshot();
+    let delta_id = changed
+        .lookup_term(&Term::Literal(Literal::new_typed_literal(
+            "1999-12-31-00:00",
+            xsd::DATE,
+        )))
+        .unwrap();
+    assert_eq!(delta_id.tag(), sparkles_core::id::Tag::Delta);
+    for (snapshot, extra) in [(old, 0), (changed, 32)] {
+        let cursor = select_cursor(snapshot, text, &Default::default(), &options(4096)).unwrap();
+        validate(all(cursor), extra);
+    }
+}
+
+#[test]
+fn arq_uuid_aliases_and_dynamic_calls_stay_volatile_across_cursor_morsels() {
+    let s = Store::in_memory(StoreOptions::default());
+    let data = (0..5000)
+        .map(|i| format!("<urn:uuid:{i}> <urn:key> \"repeated string\" .\n"))
+        .collect::<String>();
+    s.load(&[Source::from_bytes(
+        data.into_bytes(),
+        RdfFormat::Turtle,
+        None,
+    )])
+    .unwrap();
+    for fresh in [
+        "afn:uuid()",
+        "afn:struuid()",
+        "fn:apply(afn:uuid)",
+        "fn:apply(afn:struuid)",
+        "afn:eval(afn:uuid)",
+        "afn:eval(afn:struuid)",
+    ] {
+        let text = format!(
+            "PREFIX afn: <http://jena.apache.org/ARQ/function#> PREFIX fn: <http://www.w3.org/2005/xpath-functions#> SELECT ?fresh WHERE {{ ?s <urn:key> ?key BIND(CONCAT(STR(?key), STR({fresh})) AS ?fresh) }}"
+        );
+        for cache in [true, false] {
+            let opts = QueryOptions {
+                optimizations: Some(sparkles_core::sparql::Optimizations {
+                    expr_cache: cache,
+                    ..Default::default()
+                }),
+                ..Default::default()
+            };
+            let cursor = select_cursor(s.snapshot(), &text, &opts, &options(4096)).unwrap();
+            let rows = all(cursor);
+            assert_eq!(rows.len(), 5000);
+            let unique = rows
+                .iter()
+                .map(|r| r[0].clone())
+                .collect::<std::collections::HashSet<_>>();
+            assert_eq!(
+                unique.len(),
+                5000,
+                "native cursor {fresh}, cache={cache} must generate one UUID per row"
+            );
+            assert!(!unique.contains(&None));
+            let rows = query(s.snapshot(), &text, &opts).unwrap().rows();
+            let unique = rows
+                .iter()
+                .map(|r| r[0].clone())
+                .collect::<std::collections::HashSet<_>>();
+            assert_eq!(
+                unique.len(),
+                5000,
+                "eager {fresh}, cache={cache} must generate one UUID per row"
+            );
+            assert!(!unique.contains(&None));
+        }
+    }
+}

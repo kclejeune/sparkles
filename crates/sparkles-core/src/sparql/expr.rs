@@ -1471,9 +1471,9 @@ fn builtin(f: &Function, args: &[Expr], row: &Row<'_>, ctx: &Ctx) -> EvalResult<
 }
 
 pub const XSD: &str = "http://www.w3.org/2001/XMLSchema#";
-const FN: &str = "http://www.w3.org/2005/xpath-functions#";
+pub(super) const FN: &str = "http://www.w3.org/2005/xpath-functions#";
 const MATH: &str = "http://www.w3.org/2005/xpath-functions/math#";
-const AFN: &str = "http://jena.apache.org/ARQ/function#";
+pub(super) const AFN: &str = "http://jena.apache.org/ARQ/function#";
 
 /// Is `iri` a supported XSD cast function?
 pub fn is_cast(iri: &str) -> bool {
