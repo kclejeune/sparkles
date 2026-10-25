@@ -11,6 +11,11 @@ use crate::sparql::table::VarId;
 use crate::sparql::{Ctx, Table};
 use rustc_hash::{FxHashMap, FxHashSet};
 
+pub(super) struct Admission {
+    input: VarId,
+    expected_reuse: bool,
+}
+
 pub(super) struct Reuse {
     input: VarId,
     values: FxHashMap<Id, Id>,
@@ -22,23 +27,31 @@ pub(super) struct Reuse {
     evaluations: usize,
 }
 impl Reuse {
-    pub(super) fn new(ctx: &Ctx, expr: &Expr, source: Option<&Node>) -> Option<Self> {
+    pub(super) fn prepare(ctx: &Ctx, expr: &Expr, source: Option<&Node>) -> Option<Admission> {
         if !ctx.opt.expr_cache {
             return None;
         }
         let input = crate::sparql::exprcache::eligible(&[expr]).ok().flatten()?;
-        let charge = ctx.retained_charge(512).ok()?;
-        Some(Self {
+        Some(Admission {
             input,
-            values: Default::default(),
-            charge,
-            general_declined: false,
             expected_reuse: source.is_some_and(|source| {
                 source.est.is_finite()
                     && source.est > 0.0
                     && distinct_bound(ctx, source, input, &mut 64)
                         .is_some_and(|distinct| distinct as f64 <= source.est * 0.8)
             }),
+        })
+    }
+    pub(super) fn new(ctx: &Ctx, admission: Admission) -> Option<Self> {
+        // Compute the hint before building children, but retain optional memory
+        // only afterward. Optional caching must not starve child construction.
+        let charge = ctx.retained_charge(512).ok()?;
+        Some(Self {
+            input: admission.input,
+            values: Default::default(),
+            charge,
+            general_declined: false,
+            expected_reuse: admission.expected_reuse,
             max_entries: 16384,
             #[cfg(test)]
             evaluations: 0,
@@ -212,6 +225,10 @@ mod tests {
     use oxrdfio::RdfFormat;
     use spargebra::algebra::Function;
 
+    fn new_reuse(ctx: &Ctx, expr: &Expr, source: Option<&Node>) -> Option<Reuse> {
+        Reuse::new(ctx, Reuse::prepare(ctx, expr, source)?)
+    }
+
     #[test]
     fn stored_temporal_bind_reuses_exact_ids_across_morsels() {
         let store = Store::in_memory(StoreOptions::default());
@@ -250,7 +267,7 @@ mod tests {
             })
             .collect::<Vec<_>>();
         assert!(ids.iter().all(|id| id.tag() == Tag::Vocab));
-        let mut reuse = Reuse::new(&ctx, &expr, None).unwrap();
+        let mut reuse = new_reuse(&ctx, &expr, None).unwrap();
         for epoch in 0..3 {
             let mut table = Table::new(vec![input]);
             table.cols[0] = (0..4096)
@@ -299,13 +316,13 @@ mod tests {
         let mut table = Table::new(vec![input]);
         table.cols[0] = vec![date; 4096];
         table.len = 4096;
-        let mut reuse = Reuse::new(&ctx, &expr, None).unwrap();
+        let mut reuse = new_reuse(&ctx, &expr, None).unwrap();
         assert!(!reuse.apply(&ctx, &mut table, target, &expr).unwrap());
         assert!(reuse.values.is_empty());
         assert_eq!(reuse.evaluations, 0);
         ctx.check().unwrap();
         assert!(
-            Reuse::new(&ctx, &Expr::Var(input), None).is_none(),
+            new_reuse(&ctx, &Expr::Var(input), None).is_none(),
             "an identity copy does not need a map"
         );
         let effect = Expr::Arith(
@@ -313,7 +330,7 @@ mod tests {
             Box::new(Expr::Call(Func::Builtin(Function::Rand), vec![])),
             crate::sparql::expr::ArithOp::Add,
         );
-        assert!(Reuse::new(&ctx, &effect, None).is_none());
+        assert!(new_reuse(&ctx, &effect, None).is_none());
 
         let ctx = cursor_context(&store, 16 << 20);
         let input = ctx.var("date");
@@ -329,7 +346,7 @@ mod tests {
             })
             .collect();
         table.len = 4096;
-        let mut reuse = Reuse::new(&ctx, &expr, None).unwrap();
+        let mut reuse = new_reuse(&ctx, &expr, None).unwrap();
         assert!(!reuse.apply(&ctx, &mut table, target, &expr).unwrap());
         assert!(reuse.values.is_empty());
         // An all-distinct pilot declines the optional map for the query. Later
@@ -362,7 +379,7 @@ mod tests {
             keys[0], keys[1],
             "equal date values with different lexical forms are distinct terms"
         );
-        let mut reuse = Reuse::new(&ctx, &expr, None).unwrap();
+        let mut reuse = new_reuse(&ctx, &expr, None).unwrap();
         for epoch in 0..2 {
             let mut table = Table::new(vec![input]);
             table.cols[0] = (0..4096)
@@ -418,7 +435,7 @@ mod tests {
                 })
                 .collect();
             table.len = 4096;
-            let mut reuse = Reuse::new(&ctx, &expr, None).unwrap();
+            let mut reuse = new_reuse(&ctx, &expr, None).unwrap();
             assert!(
                 !reuse.apply(&ctx, &mut table, target, &expr).unwrap(),
                 "isolated or infrequent repetition must not retain mostly distinct results"
@@ -431,7 +448,7 @@ mod tests {
         let mut table = Table::new(vec![input]);
         table.cols[0] = (0..4096).map(|i| keys[i % 3072]).collect();
         table.len = 4096;
-        let mut reuse = Reuse::new(&ctx, &expr, None).unwrap();
+        let mut reuse = new_reuse(&ctx, &expr, None).unwrap();
         assert!(reuse.apply(&ctx, &mut table, target, &expr).unwrap());
         assert_eq!(
             reuse.evaluations, 3072,
@@ -466,6 +483,7 @@ mod tests {
         assert!(ctx.snap.delta.is_empty());
         let input = ctx.var("value");
         let target = ctx.var("bound");
+        let subject = ctx.var("subject");
         let predicate = ctx
             .snap
             .lookup_term(&Term::NamedNode(oxrdf::NamedNode::new("urn:p").unwrap()))
@@ -474,23 +492,30 @@ mod tests {
             Kind::Scan(ScanSpec {
                 perm: Perm::Pso,
                 prefix: vec![predicate.0],
-                cols: vec![(2, input)],
+                cols: vec![(1, subject), (2, input)],
                 eqs: vec![],
                 graph: GraphFilter::Default,
                 graph_col: 3,
                 dedup: false,
                 src: None,
             }),
-            vec![input],
+            vec![subject, input],
             4096.0,
             String::new(),
         );
         let expr = Expr::Call(Func::Builtin(Function::Str), vec![Expr::Var(input)]);
-        let mut reuse = Reuse::new(&ctx, &expr, Some(&source)).unwrap();
+        let before = ctx.live_bytes();
+        let admission = Reuse::prepare(&ctx, &expr, Some(&source)).unwrap();
+        assert_eq!(
+            ctx.live_bytes(),
+            before,
+            "metadata preparation must not retain optional memory before child construction"
+        );
+        let mut reuse = Reuse::new(&ctx, admission).unwrap();
         assert!(reuse.expected_reuse);
         let mut bind = Node::leaf(
             Kind::Extend(target, expr.clone()),
-            vec![input, target],
+            vec![subject, input, target],
             4096.0,
             String::new(),
         );
@@ -512,7 +537,7 @@ mod tests {
         let mut rows = 0;
         while let Some(batch) = operator.next(&ctx, &options, 1024).unwrap() {
             rows += batch.table.len;
-            assert_eq!(batch.table.cols[0], batch.table.cols[1]);
+            assert_eq!(batch.table.cols[1], batch.table.cols[2]);
         }
         assert_eq!(rows, 4096);
         assert_eq!(
@@ -543,11 +568,11 @@ mod tests {
             parent.children.push(deep);
             deep = parent;
         }
-        assert!(!Reuse::new(&ctx, &expr, Some(&deep)).unwrap().expected_reuse);
+        assert!(!new_reuse(&ctx, &expr, Some(&deep)).unwrap().expected_reuse);
         let mut hidden = Node::leaf(Kind::Project(vec![]), vec![], 4096.0, String::new());
         hidden.children.push(source.clone());
         assert!(
-            !Reuse::new(&ctx, &expr, Some(&hidden))
+            !new_reuse(&ctx, &expr, Some(&hidden))
                 .unwrap()
                 .expected_reuse
         );
@@ -560,7 +585,7 @@ mod tests {
         let changed = cursor_context(&store, 16 << 20);
         assert!(!changed.snap.delta.is_empty());
         assert_eq!(changed.var("value"), input);
-        let mut declined = Reuse::new(&changed, &expr, Some(&source)).unwrap();
+        let mut declined = new_reuse(&changed, &expr, Some(&source)).unwrap();
         assert!(!declined.expected_reuse);
         assert!(
             !declined
@@ -568,7 +593,7 @@ mod tests {
                 .unwrap()
         );
         assert!(
-            Reuse::new(&ctx, &expr, Some(&source))
+            new_reuse(&ctx, &expr, Some(&source))
                 .unwrap()
                 .expected_reuse,
             "the retained old snapshot keeps its own unchanged metadata"
@@ -586,7 +611,7 @@ mod tests {
             "2000-01-01+00:00",
             xsd::DATE,
         )));
-        let mut reuse = Reuse::new(&ctx, &expr, None).unwrap();
+        let mut reuse = new_reuse(&ctx, &expr, None).unwrap();
         let mut retained = None;
         for epoch in 0..4 {
             let mut table = Table::new(vec![input]);
