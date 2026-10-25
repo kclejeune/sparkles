@@ -474,6 +474,7 @@ answer_check() {
     local flag=()
     [[ " $COUNT_ONLY " == *" $n "* ]] && flag=(--count-only)
     [[ " $NO_CHECK " == *" $n "* ]] && flag+=(--no-check)
+    [[ " ${ANSWERS_TSV_QUERIES:-} " == *" $n "* ]] && flag+=(--stream-tsv)
     printf '%-16s' "$n"
     kv=()
     for e in $ENGINES; do
@@ -485,6 +486,7 @@ answer_check() {
       peak=$(hwm_of "$e")
       kv+=("${NAME[$e]}={\"before\": $(num "$before"), \"peak\": $(num "$peak"), \"delta\": $(minus "$peak" "$before")}")
       printf ' %12s' "$r"
+      revive "$e" "answer $n" "$RES"
     done
     setj "$RES/mem.json" "queries.$n" "${kv[@]}"
     echo

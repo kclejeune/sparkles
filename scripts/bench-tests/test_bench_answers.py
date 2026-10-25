@@ -4,7 +4,9 @@
 """
 
 import http.server
+import hashlib
 import importlib.util
+import io
 import json
 import os
 import subprocess
@@ -63,6 +65,51 @@ class CanonTests(unittest.TestCase):
     def test_without_blank_nodes_the_digest_is_the_plain_one(self):
         r = rows([u("a"), u("b")], [u("c"), u("d")])
         self.assertEqual(ba.canon(r), ba.digest(r))
+
+
+class StreamedTSVTests(unittest.TestCase):
+    def record(self, text, **kwargs):
+        return ba.streamed_tsv_record(io.BytesIO(text.encode()), "SELECT ?a ?b { ?a ?p ?b }", False, **kwargs)
+
+    def test_full_multiset_retains_duplicates_and_ignores_column_and_row_order(self):
+        first = self.record('?a\t?b\n<urn:a>\t"x"\n<urn:a>\t"x"\n<urn:b>\t"y"\n')
+        other = self.record('?b\t?a\n"y"\t<urn:b>\n"x"\t<urn:a>\n"x"\t<urn:a>\n')
+        shorter = self.record('?a\t?b\n<urn:a>\t"x"\n<urn:b>\t"y"\n')
+        self.assertEqual(first, other)
+        self.assertEqual(first["rows"], 3)
+        self.assertNotEqual(first["value"], shorter["value"])
+        self.assertTrue(first["exact"].startswith("row-sha256-v1:"))
+
+    def test_hashes_every_normalized_row_with_separate_term_identity_and_values(self):
+        text = '?a\t?b\n<urn:a>\t"caf\\u00e9"@EN\n\t"1.0"^^<' + ba.XSD + 'decimal>\n<urn:z>\t"1"^^<' + ba.XSD + 'integer>\n'
+        actual = self.record(text)
+        terms = [[u("urn:a"), lit("café", lang="EN")], [None, lit("1.0", "decimal")], [u("urn:z"), lit("1", "integer")]]
+        for key, by_value in (("exact", False), ("value", True)):
+            hashes = sorted(hashlib.sha256(repr(tuple(ba.term(t, by_value) for t in r)).encode()).hexdigest() + "\n" for r in terms)
+            expected = "row-sha256-v1:" + hashlib.sha256("".join(hashes).encode()).hexdigest()
+            self.assertEqual(actual[key], expected)
+
+    def test_numeric_and_boolean_tsv_shorthand_is_parsed_by_rdf_type(self):
+        for text, typ in (("1", "integer"), ("1.2", "decimal"), ("1e2", "double"), ("true", "boolean")):
+            self.assertEqual(ba.tsv_term(text), lit(text, typ))
+
+    def test_invalid_or_partial_responses_and_unsupported_semantics_are_rejected(self):
+        for text in ('?a\t?b\n<urn:a>\t"x"', '?a\t?b\n<urn:a>\n', '?a\t?a\n', 'error\n', '?a\t?b\n_:b\t"x"\n', '?a\t?b\nbad\t"x"\n'):
+            with self.subTest(text=text), self.assertRaises(ValueError):
+                self.record(text)
+        with self.assertRaises(ValueError):
+            ba.streamed_tsv_record(io.BytesIO(b'?a\n'), 'SELECT ?a {} ORDER BY ?a', False)
+
+    def test_raw_capture_is_complete_and_failed_capture_is_removed(self):
+        with tempfile.TemporaryDirectory() as d:
+            path = os.path.join(d, "q.tsv")
+            text = '?a\t?b\n<urn:a>\t"x"\n'
+            self.record(text, raw_path=path)
+            with open(path) as f:
+                self.assertEqual(f.read(), text)
+            with self.assertRaises(ValueError):
+                self.record('?a\t?b\ninvalid', raw_path=path)
+            self.assertFalse(os.path.exists(path + '.tmp'))
 
 
 class NTriplesTests(unittest.TestCase):

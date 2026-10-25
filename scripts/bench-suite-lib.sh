@@ -258,13 +258,21 @@ suite_run() {
   # An engine whose server does not start, or no longer starts, is left out of the rest of
   # the run, which goes on with the others and exits with status 1 at the end.
   local START_SOFT=1
-  start_all
-  answer_check
-  stop_all
+  local checking=$ENGINES checked="" e
+  for e in $checking; do
+    ENGINES=$e
+    start_all
+    if [ -n "$ENGINES" ]; then
+      checked="$checked $e"
+      answer_check
+    fi
+    stop_all
+  done
+  ENGINES=${checked# }
   if [ -n "${SUITE_VERIFY:-}" ]; then "$SUITE_VERIFY"; fi
   if [ -z "${ANSWERS_ONLY:-}" ]; then
-    # Each engine runs alone for the timings (docs/specs/X06 section 5.3). The answer check
-    # above may keep every server up, since it measures no time. A fresh server answers every
+    # Each engine runs alone for correctness and timings (docs/specs/X06 section 5.3).
+    # A fresh server answers every
     # selected query once before the timings, so it is as warm as the one that was checked.
     local all=$ENGINES e up=""
     for e in $all; do

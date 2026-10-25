@@ -574,6 +574,7 @@ esac
         resolve_tools() { :; }; suite_manifest() { :; }; load_all() { :; }; start_all() { :; }
         answer_check() { :; }; stop_all() { :; }; cold() { :; }; python3() { :; }
         start() { echo "start $1"; URL[$1]=u; }
+        start_all() { echo "check-start $ENGINES"; }; answer_check() { echo "check $ENGINES"; }; stop_all() { echo "check-stop $ENGINES"; }
         stop() { echo "stop $1"; }
         suite_time() { echo "time $ENGINES"; }
         q() { echo "echo warm $1 $2"; }
@@ -588,8 +589,10 @@ esac
             p = subprocess.run(["bash", "-c", script], cwd=d, env=env, capture_output=True, text=True)
         self.assertEqual(p.returncode, 0, p.stderr)
         self.assertEqual(p.stdout.split("\n")[:-1], [
+            "check-start sparkles", "check sparkles", "check-stop sparkles",
+            "check-start jena", "check jena", "check-stop jena",
             "start sparkles", "warm u a", "warm u b", "time sparkles", "stop sparkles",
-            "start jena", "warm u a", "warm u b", "time jena", "stop jena"])
+            "start jena", "warm u a", "warm u b", "time jena", "stop jena", "check-stop sparkles jena"])
 
     def test_an_engine_that_does_not_start_is_left_out_and_the_run_fails(self):
         stubs = """
