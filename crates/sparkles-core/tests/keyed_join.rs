@@ -615,3 +615,57 @@ fn graph_discounted_scan_estimates_do_not_make_a_keyed_ask_eager() {
     };
     assert!(answer.result().boolean);
 }
+
+#[test]
+fn forced_ask_probes_preserve_a_bounded_hash_cursor_for_repeated_keys() {
+    let store = Store::in_memory(StoreOptions::default());
+    let mut data = String::new();
+    for i in 0..1000 {
+        data.push_str(&format!(
+            "<urn:key> <urn:p> {i} . <urn:r{i}> <urn:q> {i} .\n"
+        ));
+    }
+    load(&store, data);
+    let values = (0..2000)
+        .map(|i| {
+            if i % 7 == 0 {
+                "<urn:missing>"
+            } else {
+                "<urn:key>"
+            }
+        })
+        .collect::<Vec<_>>()
+        .join(" ");
+    let text =
+        format!("ASK {{ VALUES ?x {{ {values} }} ?x <urn:p> ?a . ?r <urn:q> ?b FILTER(?a = ?b) }}");
+    for batch_rows in [4096, 64, 7, 1] {
+        for produced in [None, Some(5000)] {
+            let execution = query_execution(
+                store.snapshot(),
+                &text,
+                &QueryOptions {
+                    no_cache: true,
+                    max_rows: Some(10_000),
+                    max_rows_produced: produced,
+                    ..Default::default()
+                },
+                &CursorOptions {
+                    batch_rows,
+                    ..Default::default()
+                },
+                ExecutionMode::Auto,
+            )
+            .unwrap();
+            let QueryExecution::Ask(answer) = execution else {
+                panic!("the regression must execute the native ASK cursor");
+            };
+            assert!(answer.result().boolean);
+            if batch_rows > 1 || produced.is_some() {
+                assert!(
+                    !operators(&answer.result().plan, "HashJoin").is_empty(),
+                    "the bounded streaming hash input must remain available"
+                );
+            }
+        }
+    }
+}

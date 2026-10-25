@@ -210,9 +210,259 @@ pub(super) fn index_join(
 
 /// The index join of `drive` into the pattern `probe` whatever probing every key would
 /// cost, for an input read a few rows at a time (see `cursor::ripple`). `None` when the
-/// pattern cannot be probed on a variable `drive` always binds.
-pub(super) fn index_join_for_first_rows(drive: &Node, probe: &Node, ctx: &Ctx) -> Option<Node> {
-    offer(drive, probe, ctx, false).map(|offer| offer.build(drive.clone(), probe))
+/// pattern cannot be probed on a variable `drive` always binds, or conservative
+/// output and working-memory bounds do not justify its eager batch expansion.
+pub(super) fn index_join_for_first_rows(
+    drive: &Node,
+    probe: &Node,
+    ctx: &Ctx,
+    batch_rows: usize,
+) -> Option<Node> {
+    if !ctx.opt.batched_join || ctx.max_rows_produced != u64::MAX {
+        return None;
+    }
+    let offer = offer(drive, probe, ctx, false)?;
+    if !first_rows_fit(ctx, drive, probe, offer.spec, offer.key, batch_rows) {
+        return None;
+    }
+    Some(offer.build(drive.clone(), probe))
+}
+
+/// The eager probe kernel forms its whole batch before the cursor can yield. Do
+/// not replace a streaming hash join with an unbounded multiplicity expansion.
+fn first_rows_fit(
+    ctx: &Ctx,
+    drive: &Node,
+    probe: &Node,
+    scan: &ScanSpec,
+    key: VarId,
+    batch_rows: usize,
+) -> bool {
+    fn scan_rows(ctx: &Ctx, scan: &ScanSpec) -> u64 {
+        if let Some(n) = ctx.snap.predicate_count(scan.perm, &scan.prefix) {
+            return n;
+        }
+        let index = ctx.snap.perm(scan.perm);
+        let (lo, hi) = index.block_range(&scan.prefix);
+        let base = if lo < hi {
+            index.blocks[hi - 1].row_start + u64::from(index.blocks[hi - 1].rows)
+                - index.blocks[lo].row_start
+        } else {
+            0
+        };
+        base.saturating_add(crate::store::Delta::count_prefix(
+            &ctx.snap.delta.ins[scan.perm.index()],
+            &scan.prefix,
+        ))
+    }
+    fn unique(ctx: &Ctx, node: &Node, key: VarId, left: &mut usize) -> bool {
+        if *left == 0 {
+            return false;
+        }
+        *left -= 1;
+        match &node.kind {
+            Kind::Scan(scan)
+                if node.vars == [key]
+                    && scan.eqs.is_empty()
+                    && scan.cols.iter().all(|(_, v)| *v == key)
+                    && (scan.prefix.len()..4).all(|col| {
+                        scan.perm.order()[col] == G || scan.cols.contains(&(col, key))
+                    }) =>
+            {
+                let fixed = scan.graph_col < scan.prefix.len()
+                    || matches!(scan.graph, GraphFilter::Default | GraphFilter::One(_))
+                    || matches!(&scan.graph, GraphFilter::Set(gs) if gs.len() <= 1);
+                if fixed {
+                    return true;
+                }
+                let stats = &ctx.snap.generation.stats;
+                ctx.snap.delta.is_empty()
+                    && stats.quads == ctx.snap.perm(Perm::Pso).rows
+                    && matches!(stats.graphs.as_slice(), [(g, n)] if *n == stats.quads && scan.graph.accepts(*g))
+            }
+            Kind::Values(table) => table.len() <= 1,
+            Kind::Project(_) | Kind::Filter(_) | Kind::Sort(_) if node.children.len() == 1 => {
+                unique(ctx, &node.children[0], key, left)
+            }
+            Kind::Extend(v, _) if *v != key && node.children.len() == 1 => {
+                unique(ctx, &node.children[0], key, left)
+            }
+            _ => false,
+        }
+    }
+    let rows = scan_rows(ctx, scan);
+    let mut fanout = rows;
+    let order = scan.perm.order();
+    let stats = &ctx.snap.generation.stats;
+    if ctx.snap.delta.is_empty()
+        && let Some(pcol) = order
+            .iter()
+            .position(|c| *c == P)
+            .filter(|c| *c < scan.prefix.len())
+        && ctx
+            .snap
+            .predicate_count(Perm::Pso, &[scan.prefix[pcol]])
+            .is_some()
+        && let Some(stat) = stats.predicate(scan.prefix[pcol])
+        && let Some((col, _)) = scan.cols.iter().find(|(_, v)| *v == key)
+    {
+        let distinct = match order[*col] {
+            S => stat.distinct_subjects,
+            O => stat.distinct_objects,
+            _ => 0,
+        };
+        if distinct > 0 && distinct <= stat.count {
+            // Every other distinct key accounts for at least one row.
+            fanout = fanout.min(stat.count - distinct + 1);
+        }
+    }
+    let input = match &drive.kind {
+        Kind::Values(table) => (table.len() as u64).min(batch_rows.max(1) as u64),
+        _ => batch_rows.max(1) as u64,
+    };
+    let multiplicity = if unique(ctx, drive, key, &mut 64) {
+        1
+    } else {
+        input
+    };
+    let Some(output) = input
+        .checked_mul(fanout)
+        .zip(rows.checked_mul(multiplicity))
+        .map(|(a, b)| a.min(b))
+    else {
+        return false;
+    };
+    // Unknown repeated keys must not amplify a whole probe relation merely to
+    // answer one ASK. The ordinary costed hash cursor remains the fallback.
+    if output > rows.max(input) || rows.max(input).max(output) > ctx.max_rows as u64 {
+        return false;
+    }
+    let width = drive.vars.len()
+        + probe
+            .vars
+            .iter()
+            .filter(|v| !drive.vars.contains(v))
+            .count();
+    let bytes = rows
+        .checked_mul(probe.vars.len() as u64 * 16 + 32)
+        .and_then(|n| {
+            output
+                .checked_mul(width as u64 * 16 + 32)
+                .and_then(|m| n.checked_add(m))
+        })
+        .and_then(|n| {
+            input
+                .checked_mul(drive.vars.len() as u64 * 16 + 64)
+                .and_then(|m| n.checked_add(m))
+        })
+        .and_then(|n| {
+            n.checked_add(crate::index::BLOCK_ROWS as u64 * 32 + ctx.nvars() as u64 * 96 + 8192)
+        });
+    bytes.is_some_and(|n| n <= ctx.memory_room())
+}
+
+#[cfg(test)]
+mod first_rows_admission_tests {
+    use super::*;
+    use crate::io::Source;
+    use crate::store::{Store, StoreOptions};
+
+    #[test]
+    fn first_rows_admission_uses_actual_fanout_and_unique_keys() {
+        let store = Store::in_memory(StoreOptions::default());
+        let mut data = String::new();
+        for i in 0..1000 {
+            data.push_str(&format!("<urn:key> <urn:p> {i} . <urn:f{i}> <urn:q> {i} . <urn:d{i}> <urn:point> <urn:tag> .\n"));
+        }
+        store
+            .load(&[Source::from_bytes(
+                data.into_bytes(),
+                oxrdfio::RdfFormat::Turtle,
+                None,
+            )])
+            .unwrap();
+        let mut ctx = Ctx::new(store.snapshot());
+        let key = ctx.var("key");
+        let value = ctx.var("value");
+        ctx.max_rows = 10_000;
+        let scan = |p| ScanSpec {
+            perm: Perm::Pso,
+            prefix: vec![p],
+            cols: vec![(1, key), (2, value)],
+            eqs: Vec::new(),
+            graph: GraphFilter::Default,
+            graph_col: 3,
+            dedup: false,
+            src: None,
+        };
+        let probe = |s: ScanSpec| {
+            let mut node = Node::leaf(Kind::Scan(s), vec![key, value], 0.001, "probe".into());
+            node.sorted = vec![key, value];
+            node
+        };
+        let p = probe(scan(ctx.snap.lookup_iri("urn:p").unwrap().0));
+        let q = probe(scan(ctx.snap.lookup_iri("urn:q").unwrap().0));
+        let mut table = Table::new(vec![key]);
+        table.cols[0] = vec![ctx.snap.lookup_iri("urn:f0").unwrap(); 2000];
+        table.len = 2000;
+        let driver = Node::leaf(Kind::Values(table), vec![key], 0.001, "driver".into());
+        assert!(index_join_for_first_rows(&driver, &p, &ctx, 4096).is_none());
+        assert!(index_join_for_first_rows(&driver, &q, &ctx, 4096).is_some());
+        let unique = Node::leaf(
+            Kind::Scan(ScanSpec {
+                perm: Perm::Pos,
+                prefix: vec![
+                    ctx.snap.lookup_iri("urn:point").unwrap().0,
+                    ctx.snap.lookup_iri("urn:tag").unwrap().0,
+                ],
+                cols: vec![(2, key)],
+                eqs: Vec::new(),
+                graph: GraphFilter::Default,
+                graph_col: 3,
+                dedup: false,
+                src: None,
+            }),
+            vec![key],
+            0.001,
+            "unique driver".into(),
+        );
+        assert!(index_join_for_first_rows(&unique, &p, &ctx, 4096).is_some());
+        let mut projected = p.clone();
+        projected.vars = vec![key];
+        projected.certain = vec![key];
+        projected.sorted = vec![key];
+        assert!(
+            index_join_for_first_rows(&projected, &p, &ctx, 4096).is_none(),
+            "projecting a scan key does not remove its duplicates"
+        );
+        ctx.max_rows_produced = 10_000;
+        assert!(index_join_for_first_rows(&driver, &q, &ctx, 4096).is_none());
+        ctx.max_rows_produced = u64::MAX;
+        ctx.mem_limit = 1;
+        assert!(index_join_for_first_rows(&driver, &q, &ctx, 4096).is_none());
+        ctx.mem_limit = u64::MAX;
+        ctx.opt.batched_join = false;
+        assert!(index_join_for_first_rows(&driver, &q, &ctx, 4096).is_none());
+        ctx.opt.batched_join = true;
+        crate::sparql::update::update(
+            &store,
+            "INSERT DATA { <urn:f0> <urn:q> 9999 }",
+            &Default::default(),
+        )
+        .unwrap();
+        let mut changed = Ctx::new(store.snapshot());
+        assert_eq!(changed.var("key"), key);
+        assert_eq!(changed.var("value"), value);
+        changed.max_rows = 10_000;
+        assert!(
+            index_join_for_first_rows(&driver, &q, &changed, 4096).is_none(),
+            "a delta must not reuse stale functional-predicate statistics"
+        );
+        assert!(
+            index_join_for_first_rows(&driver, &q, &ctx, 4096).is_some(),
+            "the retained old snapshot still has valid statistics"
+        );
+    }
 }
 
 /// What the join ordering needs to know about a pattern to cost probing it: the
