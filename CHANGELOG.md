@@ -8,6 +8,9 @@ Indexed nearest-neighbour ordering can join candidate batches with independent q
 components. It continues searching when joins or filters discard an entire batch and
 preserves duplicate solutions.
 
+ARQ UUID aliases and unresolved dynamic function calls are excluded from result-cache
+reuse and repeated independent nearest-neighbour inputs.
+
 The full-text integrity check retries segment replacements made by merges even when the
 commit stamp stays the same. If the index keeps changing throughout its three attempts,
 it requests another check instead of reporting missing files from superseded metadata.

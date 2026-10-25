@@ -440,6 +440,61 @@ fn nearest_neighbours_keep_callback_cardinality_and_volatile_group_identity() {
 }
 
 #[test]
+fn nearest_neighbours_preserve_volatile_arq_group_identity_across_batches() {
+    let s = indexed_points(160);
+    for expression in [
+        "<http://jena.apache.org/ARQ/function#uuid>()",
+        "<http://jena.apache.org/ARQ/function#struuid>()",
+        "<http://www.w3.org/2005/xpath-functions#apply>(<http://jena.apache.org/ARQ/function#uuid>)",
+        "<http://jena.apache.org/ARQ/function#eval>(<http://jena.apache.org/ARQ/function#uuid>)",
+    ] {
+        let q = format!(
+            "SELECT ?g ?id {{ ?g geo:asWKT ?w ; ex:rank ?rank . \
+             {{ BIND({expression} AS ?id) }} \
+             BIND(geof:metricDistance(?w, \"POINT(0 0)\"^^geo:wktLiteral) AS ?d) \
+             FILTER(BOUND(?d) && ?rank >= 110) }} ORDER BY ?d LIMIT 40"
+        );
+        let r = run(&s.snapshot(), &q, &opts(true));
+        assert_eq!(r.table.len(), 40, "{expression}");
+        let got = r.rows();
+        assert!(
+            got.iter()
+                .all(|row| row[1].is_some() && row[1] == got[0][1]),
+            "{expression}: a group identity must survive every batch"
+        );
+        assert!(find(&r.plan, "SpatialKnn").is_none(), "{expression}");
+    }
+}
+
+#[test]
+fn nearest_neighbours_keep_connected_groups_within_the_batch_budget() {
+    let s = Store::in_memory(StoreOptions::default());
+    let mut data = String::new();
+    for i in 0..500 {
+        data.push_str(&format!(
+            "ex:g{i} a ex:Restaurant ; ex:label \"selected\" .\n"
+        ));
+        if i < 3 {
+            data.push_str(&format!(
+                "ex:g{i} geo:asWKT \"POINT({i} 0)\"^^geo:wktLiteral .\n"
+            ));
+        }
+    }
+    load(&s, &format!("{P}{data}"));
+    s.enable_geo(GeoConfig::default()).unwrap();
+    let q = "SELECT ?g ?label { ?g geo:asWKT ?w . \
+             { ?g a ex:Restaurant ; ex:label ?label FILTER(STRLEN(?label) > 0) } } \
+             ORDER BY geof:metricDistance(?w, \"POINT(0 0)\"^^geo:wktLiteral) LIMIT 5";
+    let expected = run(&s.snapshot(), q, &opts(false));
+    let mut fast = opts(true);
+    fast.max_rows = Some(150);
+    let fast = run(&s.snapshot(), q, &fast);
+    assert_eq!(fast.table.len(), 3);
+    assert_eq!(rows(&fast), rows(&expected));
+    assert!(find(&fast.plan, "SpatialKnn").is_some());
+}
+
+#[test]
 fn nearest_neighbour_shapes_that_stay_generic_warn() {
     let s = Store::in_memory(StoreOptions::default());
     load(&s, FIXTURE);

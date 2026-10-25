@@ -322,7 +322,10 @@ pub(crate) fn deterministic(e: &Expr) -> bool {
             ) && args.iter().all(deterministic)
         }
         Expr::Call(Func::Ext(name), args) => {
-            !name.ends_with("#now") && args.iter().all(deterministic)
+            !["#now", "#uuid", "#struuid", "#apply", "#eval"]
+                .iter()
+                .any(|suffix| name.ends_with(suffix))
+                && args.iter().all(deterministic)
         }
         Expr::Call(_, l) | Expr::Coalesce(l) => l.iter().all(deterministic),
         Expr::Or(a, b)
@@ -712,7 +715,32 @@ fn write_node(n: &Node, ctx: &Ctx, s: &mut String) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::anon_regex;
+    use super::{Expr, Func, anon_regex, deterministic};
+
+    #[test]
+    fn volatile_aliases_and_dynamic_calls_are_not_deterministic() {
+        for name in [
+            "http://jena.apache.org/ARQ/function#now",
+            "http://jena.apache.org/ARQ/function#uuid",
+            "http://jena.apache.org/ARQ/function#struuid",
+            "http://jena.apache.org/ARQ/function#eval",
+            "http://www.w3.org/2005/xpath-functions#apply",
+        ] {
+            assert!(
+                !deterministic(&Expr::Call(Func::Ext(name.into()), vec![])),
+                "{name}"
+            );
+        }
+        for name in [
+            "http://jena.apache.org/ARQ/function#strlen",
+            "http://www.opengis.net/def/function/geosparql/metricDistance",
+        ] {
+            assert!(
+                deterministic(&Expr::Call(Func::Ext(name.into()), vec![])),
+                "{name}"
+            );
+        }
+    }
 
     #[test]
     fn generated_names_without_zero_padding_are_recognized() {

@@ -1854,6 +1854,7 @@ Independent components run again for each batch, without an additional materiali
 Their local filters remain inside the component, preserving unbound variables and avoiding
 an unfiltered cross product. Application callbacks and components whose repeatability
 cannot be established keep the generic plan, including components with volatile functions.
+This includes the ARQ UUID aliases and unresolved dynamic function calls.
 The per-row nearest-neighbour join described below remains open under item 24.
 
 **The rest of Phase 3 and geometry limits** (item 24, Tier 3,

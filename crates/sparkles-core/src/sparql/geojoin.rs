@@ -579,15 +579,56 @@ mod on {
         (chain, n)
     }
 
-    /// The leaves and filters of a tree of joins; `false` when something else is in it.
+    /// Variables connected to the indexed scan by the group's join inputs.
+    fn connected_vars(n: &Node, geometry: VarId) -> Vec<VarId> {
+        fn inputs(n: &Node, out: &mut Vec<Vec<VarId>>) {
+            match &n.kind {
+                Kind::Join { .. } => {
+                    for child in &n.children {
+                        inputs(child, out);
+                    }
+                }
+                Kind::Sort(_) | Kind::Filter(_) => inputs(&n.children[0], out),
+                Kind::IndexJoin(j) => {
+                    inputs(&n.children[0], out);
+                    out.extend(
+                        j.probes
+                            .iter()
+                            .map(|p| p.scan.cols.iter().map(|c| c.1).collect()),
+                    );
+                }
+                _ => out.push(n.vars.clone()),
+            }
+        }
+        let mut parts = Vec::new();
+        inputs(n, &mut parts);
+        let mut vars = vec![geometry];
+        loop {
+            let previous = vars.len();
+            for part in &parts {
+                if part.iter().any(|v| vars.contains(v)) {
+                    for v in part {
+                        if !vars.contains(v) {
+                            vars.push(*v);
+                        }
+                    }
+                }
+            }
+            if vars.len() == previous {
+                return vars;
+            }
+        }
+    }
+
+    /// Decompose the indexed component while preserving independent subtrees.
     fn flatten(
         n: &Node,
         ctx: &Ctx,
-        geometry: VarId,
+        connected: &[VarId],
         leaves: &mut Vec<Node>,
         filters: &mut Vec<Expr>,
     ) -> bool {
-        if !n.vars.contains(&geometry) {
+        if !n.vars.iter().any(|v| connected.contains(v)) {
             // Preserve the independent subtree's binding scope and local filters.
             // Per-batch repetition needs the cache's conservative eligibility rules
             // to exclude volatile expressions, callbacks and external services.
@@ -601,8 +642,8 @@ mod on {
             Kind::Join { .. } => n
                 .children
                 .iter()
-                .all(|c| flatten(c, ctx, geometry, leaves, filters)),
-            Kind::Sort(_) => flatten(&n.children[0], ctx, geometry, leaves, filters),
+                .all(|c| flatten(c, ctx, connected, leaves, filters)),
+            Kind::Sort(_) => flatten(&n.children[0], ctx, connected, leaves, filters),
             Kind::Filter(es)
                 if es.iter().all(|e| {
                     super::super::cache::deterministic(e)
@@ -612,10 +653,10 @@ mod on {
                 }) =>
             {
                 filters.extend(es.iter().cloned());
-                flatten(&n.children[0], ctx, geometry, leaves, filters)
+                flatten(&n.children[0], ctx, connected, leaves, filters)
             }
             Kind::IndexJoin(j) => {
-                if !flatten(&n.children[0], ctx, geometry, leaves, filters) {
+                if !flatten(&n.children[0], ctx, connected, leaves, filters) {
                     return false;
                 }
                 // each probe as the scan it reads
@@ -777,9 +818,10 @@ mod on {
             s => return Err(format!("the spatial index is {s}")),
         }
         let (chain, core) = split_chain(child);
+        let connected = connected_vars(core, w);
         let mut leaves = Vec::new();
         let mut filters = Vec::new();
-        if !flatten(core, ctx, w, &mut leaves, &mut filters) {
+        if !flatten(core, ctx, &connected, &mut leaves, &mut filters) {
             return Err("the group is not a join of patterns under its filters and binds".into());
         }
         let at: Vec<usize> = (0..leaves.len())
