@@ -492,17 +492,20 @@ fn class_support(
 ) -> Result<JustifiedTarget> {
     let view = analysis::view(snapshot, options)?;
     let graphs = analysis::input_graphs(&view, program, options);
-    let copy = dataset.store().copy_view_to_memory(
-        &view,
-        crate::store::StoreOptions {
-            max_memory_bytes: options.max_memory.map(|limit| (limit / 8) as u64),
-            result_cache_bytes: 0,
-            service_cache_bytes: 0,
-            ..Default::default()
-        },
-        &control.write_options(),
-        |quad| Ok(graphs.contains(&quad[3])),
-    )?;
+    let copy = dataset
+        .store()
+        .copy_view_to_memory(
+            &view,
+            crate::store::StoreOptions {
+                max_memory_bytes: options.max_memory.map(|limit| (limit / 8) as u64),
+                result_cache_bytes: 0,
+                service_cache_bytes: 0,
+                ..Default::default()
+            },
+            &control.write_options(),
+            |quad| Ok(graphs.contains(&quad[3])),
+        )
+        .map_err(|error| control.error(error))?;
     let copied = Dataset::from_store(copy);
     let graph = NamedNode::new(format!(
         "urn:x-sparkles:class-probe:{}",

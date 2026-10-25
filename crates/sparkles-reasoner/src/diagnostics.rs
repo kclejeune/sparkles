@@ -661,7 +661,7 @@ pub struct DiagnosticControls {
     pub max_memory: Option<u64>,
 }
 
-fn check_control(
+pub(crate) fn check_control(
     deadline: Option<Instant>,
     cancel: Option<&std::sync::atomic::AtomicBool>,
 ) -> sparkles_core::Result<()> {

@@ -10,6 +10,9 @@
 //! derivations, so a persistent dataset keeps them in `reasoning-generalized.bin`, bound
 //! to the run's commit and rules by `reasoning-generalized.json`.
 
+mod diagnostic_summary;
+pub use diagnostic_summary::literal_typings_controlled;
+
 use crate::INFERRED_GRAPH;
 use crate::budget::{Budget, Held, MemoryExceeded, table_bytes, table_capacity};
 use crate::diagnostics::LiteralTypings;
@@ -775,7 +778,7 @@ pub(crate) fn keep(
         .try_reserve_rows((live / 64).max(1024), (live / 16).max(4096))?;
     budget.check_peak()?;
     cache.put(Kept {
-        dataset_id: receipt.dataset_id,
+        dataset_id: store.dataset_id(),
         commit: receipt.commit.seq,
         digest,
         inputs: inputs.to_vec(),
@@ -1228,7 +1231,7 @@ pub(crate) fn save(
         }
     };
     meta.inputs = (inputs != [GraphRef::Default]).then(|| inputs.to_vec());
-    meta.dataset_id = receipt.dataset_id.to_string();
+    meta.dataset_id = store.dataset_id().to_string();
     meta.commit = receipt.commit.seq;
     meta.rules = format!("{digest:016x}");
     write_atomic(root, SAVED_META, &serde_json::to_vec_pretty(&meta)?)?;

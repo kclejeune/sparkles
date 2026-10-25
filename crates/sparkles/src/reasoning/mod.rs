@@ -13,6 +13,8 @@ pub mod diff;
 pub mod explain;
 pub mod freshness;
 #[cfg(feature = "reasoning")]
+pub mod hypotheses;
+#[cfg(feature = "reasoning")]
 pub mod justify;
 pub mod rdfs;
 #[cfg(feature = "reasoning")]

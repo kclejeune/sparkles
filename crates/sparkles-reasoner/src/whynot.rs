@@ -110,6 +110,9 @@ pub struct Hypothesis {
     pub placeholders: Vec<String>,
     /// the derivation of the triple under the hypothesis
     pub tree: Derivation,
+    /// Whether adding these facts introduces a new diagnosed inconsistency.
+    /// `None` means that the caller has not completed a consistency check.
+    pub inconsistent: Option<bool>,
 }
 
 /// A why-not answer.
@@ -1312,6 +1315,7 @@ fn verify(
         missing,
         placeholders: labels,
         tree,
+        inconsistent: None,
     }))
 }
 

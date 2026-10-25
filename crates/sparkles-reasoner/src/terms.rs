@@ -111,7 +111,6 @@ impl LocalTable {
 pub(crate) struct Terms {
     pub snap: Arc<Snapshot>,
     analysis: Option<Arc<crate::analysis::AnalysisContext>>,
-    analysis_program: String,
     analysis_round: AtomicUsize,
     /// base vocabulary id range `[lo, hi)` holding literals
     lit_range: (u64, u64),
@@ -139,7 +138,6 @@ impl Terms {
         let mut t = Terms {
             snap,
             analysis: None,
-            analysis_program: String::new(),
             analysis_round: AtomicUsize::new(0),
             lit_range,
             locals: RwLock::new(Locals::default()),
@@ -171,14 +169,10 @@ impl Terms {
 
     pub fn set_analysis(
         &mut self,
-        context: Option<Arc<crate::analysis::AnalysisContext>>,
-        program: String,
+        context: Arc<crate::analysis::AnalysisContext>,
     ) -> Result<(), MemoryExceeded> {
-        if let Some(context) = &context {
-            self.now = self.try_id_for(&context.now)?;
-        }
-        self.analysis = context;
-        self.analysis_program = program;
+        self.now = self.try_id_for(&context.now)?;
+        self.analysis = Some(context);
         Ok(())
     }
 
@@ -197,7 +191,7 @@ impl Terms {
         skolem: Option<&[u64]>,
     ) -> Option<Result<u64, MemoryExceeded>> {
         let context = self.analysis.as_ref()?;
-        let mut key = vec![self.analysis_program.clone()];
+        let mut key = Vec::new();
         if let Some(inputs) = skolem {
             // makeSkolem is shared by argument tuple throughout an ordinary program.
             key.push("skolem".into());
@@ -346,11 +340,7 @@ impl Terms {
             return Ok(id.0);
         }
         if let Some(context) = &self.analysis {
-            return context.witness(vec![
-                self.analysis_program.clone(),
-                "rule-blank".into(),
-                node.as_str().into(),
-            ]);
+            return context.witness(vec!["rule-blank".into(), node.as_str().into()]);
         }
         let mut key = b"\0bn".to_vec();
         key.extend_from_slice(node.as_str().as_bytes());

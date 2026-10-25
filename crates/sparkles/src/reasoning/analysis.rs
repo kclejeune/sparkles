@@ -233,7 +233,6 @@ pub(crate) struct State {
     pub asserted: Facts,
     pub closure: Facts,
     pub diagnostics: sparkles_reasoner::diagnostics::DiagnosticsReport,
-    pub typings: sparkles_reasoner::diagnostics::LiteralTypings,
     pub bytes: usize,
     pub warnings: Vec<String>,
 }
@@ -262,36 +261,26 @@ pub(crate) fn stored(
 ) -> Result<State> {
     use sparkles_reasoner::diagnostics::{DiagnoseOptions, DiagnosticControls, MAX_LIMIT};
     let cache = &dataset.state().closure;
-    // Cached summaries have no independent read bound. Under an explicit grant,
-    // capture the summary through the private reasoner's bounded path instead.
-    let cached = if options.max_memory.is_none() {
-        sparkles_reasoner::literal_typings(dataset.store(), snapshot.commit, Some(cache))
-            .map_err(crate::handles::from_anyhow)?
-    } else {
-        None
-    };
-    let typings = match cached {
-        Some(typings) => typings,
-        None => {
-            analyze(
-                dataset,
-                snapshot,
-                program,
-                options,
-                control,
-                retained,
-                None,
-                &[],
-            )?
-            .typings
-        }
-    };
     let share = options.max_memory.map(|limit| {
         limit
             .saturating_sub(retained)
             .saturating_sub(control.witness_memory.unwrap_or(0))
             / 8
     });
+    let typings = sparkles_reasoner::literal_typings_controlled(
+        dataset.store(),
+        snapshot.commit,
+        Some(cache),
+        &DiagnosticControls {
+            deadline: control.deadline,
+            cancel: Some(control.cancel.clone()),
+            max_memory: share.map(|bytes| bytes as u64),
+            access: None,
+        },
+    )
+    .map_err(|error| materialization_error(control, error))?;
+    let summary_complete = typings.is_some();
+    let typings = typings.unwrap_or_default();
     let graphs = input_graphs(snapshot, program, options);
     let inferred = snapshot.lookup_iri(super::INFERRED_GRAPH);
     let mut asserted = Facts::new();
@@ -350,7 +339,7 @@ pub(crate) fn stored(
             }
         }
     }
-    let diagnostics = sparkles_reasoner::diagnostics::diagnose_controlled(
+    let mut diagnostics = sparkles_reasoner::diagnostics::diagnose_controlled(
         snapshot.clone(),
         &DiagnoseOptions {
             graphs: names,
@@ -368,6 +357,20 @@ pub(crate) fn stored(
         },
     )
     .map_err(|error| control.error(crate::handles::from_anyhow(error)))?;
+    if !summary_complete
+        && let Some(check) = diagnostics
+            .checks
+            .iter_mut()
+            .find(|check| check.id == sparkles_reasoner::diagnostics::LITERAL_NOT_IN_DATATYPE)
+    {
+        check.status = sparkles_reasoner::diagnostics::CheckStatus::Error;
+        check.error = Some(
+            "the selected materialization has no available generalized diagnostic summary".into(),
+        );
+        if diagnostics.findings.is_empty() {
+            diagnostics.status = sparkles_reasoner::diagnostics::ReportStatus::Incomplete;
+        }
+    }
     for finding in &diagnostics.findings {
         hold(
             share,
@@ -379,10 +382,22 @@ pub(crate) fn stored(
         asserted,
         closure,
         diagnostics,
-        typings,
         bytes,
         warnings: Vec::new(),
     })
+}
+
+fn materialization_error(control: &AnalysisControl, error: anyhow::Error) -> Error {
+    if let Err(stopped) = control.check() {
+        return stopped;
+    }
+    if let Some(error) = error.downcast_ref::<sparkles_reasoner::MemoryLimitExceeded>() {
+        budget(error.to_string())
+    } else if let Some(error) = error.downcast_ref::<sparkles_reasoner::InferredLimitExceeded>() {
+        budget(error.to_string())
+    } else {
+        control.error(crate::handles::from_anyhow(error))
+    }
 }
 
 /// Full-closure fallback on a private writable copy. Data and blank identities come
@@ -463,7 +478,17 @@ fn analyze_with_cache_limit(
             )
         })
         .clone();
-    let context = sparkles_reasoner::analysis::AnalysisContext::new(witnesses, share);
+    let context = sparkles_reasoner::analysis::AnalysisContext::new(
+        witnesses,
+        share,
+        format!(
+            "{}\n{:?}\n{:?}",
+            program.profile.text(),
+            program.extras,
+            program.inputs
+        ),
+    )
+    .map_err(|error| control.error(budget(error.to_string())))?;
     let copied = Dataset::from_store_with(
         copied,
         crate::DatasetOptions {
@@ -536,16 +561,7 @@ fn analyze_with_cache_limit(
         },
         &request,
     )
-    .map_err(|error| {
-        if let Some(error) = error.downcast_ref::<sparkles_reasoner::MemoryLimitExceeded>() {
-            budget(error.to_string())
-        } else if let Some(error) = error.downcast_ref::<sparkles_reasoner::InferredLimitExceeded>()
-        {
-            budget(error.to_string())
-        } else {
-            control.error(crate::handles::from_anyhow(error))
-        }
-    })?;
+    .map_err(|error| materialization_error(control, error))?;
     control.check()?;
     let snapshot = copied.store().snapshot();
     let mut closure = Facts::new();
@@ -617,7 +633,6 @@ fn analyze_with_cache_limit(
         asserted,
         closure,
         diagnostics,
-        typings,
         bytes,
         warnings: outcome.warnings,
     })
@@ -788,5 +803,21 @@ mod review_regressions {
                 .any(|finding| finding.check == "literal-not-in-datatype"),
             "optional caching lost an entailed literal typing conflict"
         );
+    }
+    #[test]
+    fn cancellation_during_diagnostic_capture_is_not_a_memory_refusal() {
+        let caller = Arc::new(AtomicBool::new(false));
+        let control = AnalysisControl::new(&AnalysisOptions {
+            cancel: Some(caller.clone()),
+            ..Default::default()
+        })
+        .unwrap();
+        caller.store(true, Ordering::Relaxed);
+        let capture = sparkles_reasoner::MemoryLimitExceeded {
+            limit: 1024,
+            context: " while stopping diagnostic capture".into(),
+        };
+        let error = materialization_error(&control, anyhow::Error::new(capture));
+        assert!(matches!(error, Error::Cancelled), "{error}");
     }
 }

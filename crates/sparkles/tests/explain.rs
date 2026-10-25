@@ -746,3 +746,153 @@ fn mixed_historical_refs_keep_their_materialized_read_context() {
     assert_eq!(child.read_at_head, read.read_at_head);
     found(child.explained);
 }
+
+#[cfg(feature = "reasoning")]
+#[test]
+fn why_not_marks_hypotheses_that_introduce_a_new_inconsistency() {
+    use sparkles::reasoning::explain::{ExplainMode, explanation_json};
+    let ds = Dataset::memory();
+    ds.load_str("@prefix ex: <http://ex.org/> . @prefix rdfs: <http://www.w3.org/2000/01/rdf-schema#> . @prefix owl: <http://www.w3.org/2002/07/owl#> . ex:alice a ex:Cat . ex:Cat owl:disjointWith ex:Dog . ex:Dog rdfs:subClassOf ex:Animal .",RdfFormat::Turtle).unwrap();
+    let head = ds.store().snapshot().commit;
+    let mut request = ExplainRequest::new([ex("alice"), ty(), ex("Animal")]);
+    request.mode = ExplainMode::WhyNot;
+    request.profile = Some("rdfs-simple".into());
+    request.max_missing = 1;
+    request.max_depth = 2;
+    let explanation = ds.reasoning().explain(&request).unwrap();
+    let value = explanation_json(&explanation);
+    let hypotheses = value["hypotheses"].as_array().unwrap();
+    let dog = hypotheses
+        .iter()
+        .find(|hypothesis| {
+            hypothesis["missing"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|triple| {
+                    triple["s"]["value"] == "http://ex.org/alice"
+                        && triple["p"]["value"] == oxrdf::vocab::rdf::TYPE.as_str()
+                        && triple["o"]["value"] == "http://ex.org/Dog"
+                })
+        })
+        .expect("the direct Dog type is a verified hypothesis");
+    assert_eq!(dog["inconsistent"], true, "{value}");
+    assert_eq!(dog["consistencyComplete"], true);
+    assert!(
+        hypotheses
+            .iter()
+            .any(|hypothesis| hypothesis["inconsistent"] == false),
+        "{value}"
+    );
+    assert_eq!(ds.store().snapshot().commit, head);
+}
+
+#[cfg(feature = "reasoning")]
+#[test]
+fn why_not_consistency_keeps_placeholders_visible_to_named_only_programs() {
+    use sparkles::reasoning::explain::{ExplainMode, explanation_json};
+    use sparkles::reasoning::reasoner::{GraphRef, ImportMode, Inputs, Profile};
+    let ds = Dataset::memory();
+    ds.load_str("@prefix ex: <http://ex.org/> . @prefix owl: <http://www.w3.org/2002/07/owl#> . ex:hr {ex:alice a ex:Cat . ex:Cat owl:disjointWith ex:Result .}",RdfFormat::TriG).unwrap();
+    ds.reasoning().run(&sparkles::reasoning::ReasonRequest { profile:Profile::Rules("[r: (?x <http://ex.org/p> ?y) -> (?x <http://www.w3.org/1999/02/22-rdf-syntax-ns#type> <http://ex.org/Result>)]".into()),inputs:Inputs {data_graphs:vec![GraphRef::Named("http://ex.org/hr".into())],ontology_graphs:Vec::new(),imports:ImportMode::None,location_mapping:Default::default()},..Default::default() }).unwrap();
+    let head = ds.store().snapshot().commit;
+    let mut request = ExplainRequest::new([ex("alice"), ty(), ex("Result")]);
+    request.mode = ExplainMode::WhyNot;
+    request.max_missing = 1;
+    let value = explanation_json(&ds.reasoning().explain(&request).unwrap());
+    let hypothesis = value["hypotheses"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|hypothesis| !hypothesis["placeholders"].as_array().unwrap().is_empty())
+        .expect("the missing variable gets a placeholder");
+    assert_eq!(hypothesis["inconsistent"], true, "{value}");
+    assert_eq!(ds.store().snapshot().commit, head);
+}
+
+#[cfg(feature = "reasoning")]
+#[test]
+fn existing_unrelated_inconsistencies_do_not_mark_every_hypothesis() {
+    use sparkles::reasoning::explain::{ExplainMode, explanation_json};
+    let ds = Dataset::memory();
+    ds.load_str("@prefix ex: <http://ex.org/> . @prefix owl: <http://www.w3.org/2002/07/owl#> . ex:alice a ex:Manager . ex:Cat owl:disjointWith ex:Dog . ex:unrelated a ex:Cat, ex:Dog .",RdfFormat::Turtle).unwrap();
+    let mut request = ExplainRequest::new([ex("alice"), ty(), ex("Employee")]);
+    request.mode = ExplainMode::WhyNot;
+    request.profile = Some("rdfs-simple".into());
+    request.max_missing = 1;
+    request.max_depth = 1;
+    let value = explanation_json(&ds.reasoning().explain(&request).unwrap());
+    let hypothesis = value["hypotheses"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|hypothesis| {
+            hypothesis["missing"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|triple| {
+                    triple["s"]["value"] == "http://ex.org/Manager"
+                        && triple["p"]["value"] == oxrdf::vocab::rdfs::SUB_CLASS_OF.as_str()
+                        && triple["o"]["value"] == "http://ex.org/Employee"
+                })
+        })
+        .expect("the subclass axiom is a verified hypothesis");
+    assert_eq!(hypothesis["inconsistent"], false, "{value}");
+}
+
+#[cfg(feature = "reasoning")]
+#[test]
+fn hypothesis_consistency_budget_is_unknown_and_cancellation_propagates() {
+    use sparkles::reasoning::analysis::AnalysisOptions;
+    use sparkles::reasoning::explain::ExplainMode;
+    use std::sync::atomic::AtomicBool;
+    let ds = Dataset::memory();
+    ds.load_str(
+        "@prefix ex: <http://ex.org/> . ex:alice a ex:Manager .",
+        RdfFormat::Turtle,
+    )
+    .unwrap();
+    let mut request = ExplainRequest::new([ex("alice"), ty(), ex("Employee")]);
+    request.mode = ExplainMode::WhyNot;
+    request.profile = Some("rdfs-simple".into());
+    request.max_missing = 1;
+    let mut answer = ds.reasoning().explain(&request).unwrap().why_not.unwrap();
+    let reasoner = ds
+        .query_reasoner(Some(sparkles::reasoning::reasoner::Profile::RdfsSimple))
+        .unwrap();
+    let snapshot = ds.store().snapshot();
+    sparkles::reasoning::hypotheses::check_consistency(
+        &ds,
+        &snapshot,
+        &reasoner,
+        &AnalysisOptions {
+            max_memory: Some(1),
+            ..Default::default()
+        },
+        &mut answer,
+    )
+    .unwrap();
+    let sparkles::reasoning::reasoner::whynot::WhyNot::NotEntailed { hypotheses, .. } = &answer
+    else {
+        panic!("expected hypotheses")
+    };
+    assert!(!hypotheses.is_empty());
+    assert!(
+        hypotheses
+            .iter()
+            .all(|hypothesis| hypothesis.inconsistent.is_none())
+    );
+    let error = sparkles::reasoning::hypotheses::check_consistency(
+        &ds,
+        &snapshot,
+        &reasoner,
+        &AnalysisOptions {
+            cancel: Some(Arc::new(AtomicBool::new(true))),
+            ..Default::default()
+        },
+        &mut answer,
+    )
+    .unwrap_err();
+    assert!(matches!(error, sparkles::Error::Cancelled));
+}

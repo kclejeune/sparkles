@@ -392,3 +392,90 @@ fn fresh_materialized_branches_compare_exact_stored_witness_terms() {
     assert_eq!(dataset.store().snapshot().commit, original.commit);
     assert_eq!(feature.store().snapshot().commit, proposed.commit);
 }
+
+fn clock_materializations(dataset: &Dataset) {
+    dataset
+        .update("INSERT DATA {<urn:anchor> <urn:anchor-p> <urn:anchor-o>}")
+        .unwrap();
+    dataset.create_branch("clock", &Default::default()).unwrap();
+    let clock = dataset.branch("clock").unwrap();
+    clock
+        .update("INSERT DATA {<urn:trigger> <urn:p> <urn:o>}")
+        .unwrap();
+    let request = sparkles::reasoning::ReasonRequest {profile:Profile::Rules("[clock: (<urn:trigger> <urn:p> <urn:o>) now(?t) -> (<urn:clock> <urn:value> ?t) (?t <http://www.w3.org/1999/02/22-rdf-syntax-ns#type> <http://www.w3.org/2001/XMLSchema#integer>)]".into()),..Default::default()};
+    dataset.reasoning().run(&request).unwrap();
+    clock.reasoning().run(&request).unwrap();
+}
+
+#[test]
+fn bounded_stored_typings_keep_the_actual_materialized_clock_values() {
+    for persistent in [false, true] {
+        let dir = tempfile::tempdir().unwrap();
+        let dataset = if persistent {
+            Dataset::open_with(
+                dir.path().join("db"),
+                sparkles::DatasetOptions {
+                    closure_cache_triples: 0,
+                    ..Default::default()
+                },
+            )
+            .unwrap()
+        } else {
+            Dataset::memory()
+        };
+        clock_materializations(&dataset);
+        let mut request = DiffRequest::new("head", "clock");
+        request.analysis.max_memory = Some(32 * 1024 * 1024);
+        let diff = dataset.reasoning().diff(&request).unwrap();
+        assert!(
+            diff.new_findings
+                .iter()
+                .any(|finding| finding.check == "literal-not-in-datatype"),
+            "actual clock typing lost (persistent={persistent}): {:?}",
+            diff.new_findings
+        );
+        assert!(diff.findings_complete);
+    }
+}
+
+#[test]
+fn unavailable_stored_generalized_summary_cannot_certify_absence() {
+    let dataset = Dataset::from_store_with(
+        sparkles::store::Store::in_memory(Default::default()),
+        sparkles::DatasetOptions {
+            closure_cache_triples: 0,
+            ..Default::default()
+        },
+    );
+    clock_materializations(&dataset);
+    let mut request = DiffRequest::new("head", "clock");
+    request.analysis.max_memory = Some(32 * 1024 * 1024);
+    let diff = dataset.reasoning().diff(&request).unwrap();
+    assert!(
+        !diff.findings_complete,
+        "an unavailable volatile summary was reported complete"
+    );
+    assert_eq!(diff.added, 1);
+}
+
+#[test]
+fn pinned_branch_selectors_follow_inherited_history_by_owner_identity() {
+    let dataset = Dataset::memory();
+    dataset.update("INSERT DATA {<urn:Manager> <http://www.w3.org/2000/01/rdf-schema#subClassOf> <urn:Employee>}").unwrap();
+    let base = dataset.store().snapshot().commit;
+    dataset
+        .create_branch("feature", &Default::default())
+        .unwrap();
+    let branch = dataset.branch("feature").unwrap();
+    branch
+        .update("INSERT DATA {<urn:alice> a <urn:Manager>}")
+        .unwrap();
+    let mut request = DiffRequest::new(format!("feature@{base}"), "feature");
+    request.analysis.program = Some(AnalysisProgram {
+        profile: Profile::RdfsSimple,
+        extras: Default::default(),
+        inputs: Default::default(),
+    });
+    let diff = dataset.reasoning().diff(&request).unwrap();
+    assert_eq!((diff.added, diff.removed), (1, 0));
+}

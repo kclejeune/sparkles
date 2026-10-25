@@ -195,80 +195,91 @@ impl EntailmentDiff {
     }
 }
 
-pub(crate) fn resolve(
+struct ResolvedState {
+    snapshot: Arc<Snapshot>,
+    materialization: Option<Dataset>,
+}
+
+fn resolve_state(
     dataset: &Dataset,
     selector: &str,
     control: &AnalysisControl,
-) -> Result<Arc<Snapshot>> {
+) -> Result<ResolvedState> {
     use crate::history::{At, HistoryOptions};
     let options = HistoryOptions {
         cancel: Some(control.cancel.clone()),
         deadline: control.deadline,
     };
-    let resolved = if let Some((branch, at)) = selector.rsplit_once('@') {
+    let (selected, at) = if let Some((branch, at)) = selector.rsplit_once('@') {
         if branch.is_empty() || at.is_empty() {
             return Err(crate::Error::invalid("a branch state needs branch@commit"));
         }
-        dataset
-            .store()
-            .branch_snapshot_at(branch, &at.parse::<At>()?, &options)
+        (dataset.branch(branch)?, at.parse::<At>()?)
     } else if let Ok(at) = selector.parse::<At>() {
-        dataset.store().snapshot_at(&at, &options)
+        (dataset.clone(), at)
     } else {
-        dataset
-            .store()
-            .branch_snapshot_at(selector, &At::Head, &options)
+        (dataset.branch(selector)?, At::Head)
     };
-    resolved
-        .map(|(snapshot, _)| snapshot)
-        .map_err(|error| control.error(error))
+    let (snapshot, _, owner) = dataset
+        .store()
+        .snapshot_at_with_branch(selected.store(), &at, &options)
+        .map_err(|error| control.error(error))?;
+    let materialization = (owner == selected.store().branch_id()).then_some(selected);
+    Ok(ResolvedState {
+        snapshot,
+        materialization,
+    })
+}
+
+pub(crate) fn resolve(
+    dataset: &Dataset,
+    selector: &str,
+    control: &AnalysisControl,
+) -> Result<Arc<Snapshot>> {
+    Ok(resolve_state(dataset, selector, control)?.snapshot)
 }
 
 pub fn diff(dataset: &Dataset, request: &DiffRequest) -> Result<EntailmentDiff> {
     let control = AnalysisControl::new(&request.analysis)?;
-    let from = resolve(dataset, &request.from, &control)?;
-    let to = resolve(dataset, &request.to, &control)?;
-    compare(dataset, &from, &to, request, &control)
+    let from = resolve_state(dataset, &request.from, &control)?;
+    let to = resolve_state(dataset, &request.to, &control)?;
+    compare_resolved(
+        dataset,
+        &from.snapshot,
+        &to.snapshot,
+        request,
+        &control,
+        from.materialization.zip(to.materialization),
+    )
 }
 
-/// A record proves freshness only for its own branch and at or after its position.
-/// Masked/unpublished snapshots and restricted views use the visible-input fallback.
+/// A record proves freshness only for the handle retained with the resolved view.
 fn selected_materialization(
     dataset: &Dataset,
-    selector: &str,
     snapshot: &Snapshot,
     program: &analysis::AnalysisProgram,
     options: &AnalysisOptions,
-) -> Result<Option<Dataset>> {
+) -> bool {
     if !snapshot.cacheable
         || options
             .access
             .as_ref()
             .is_some_and(|access| !access.reads_everything())
     {
-        return Ok(None);
+        return false;
     }
-    let selected = if let Some((branch, _)) = selector.rsplit_once('@') {
-        dataset.branch(branch)
-    } else if selector.parse::<crate::history::At>().is_ok() {
-        Ok(dataset.clone())
-    } else {
-        dataset.branch(selector)
+    let Some(record) = dataset.reasoning().record() else {
+        return false;
     };
-    let Ok(selected) = selected else {
-        return Ok(None);
+    let (Ok(profile), Ok(extras), Ok(inputs)) =
+        (record.profile(), record.extras(), record.run_inputs())
+    else {
+        return false;
     };
-    let Some(record) = selected.reasoning().record() else {
-        return Ok(None);
-    };
-    if record.profile()? != program.profile
-        || record.extras()? != program.extras
-        || record.run_inputs()? != program.inputs
-        || super::freshness(&record, selected.store(), snapshot.commit).stale != Some(false)
-    {
-        return Ok(None);
-    }
-    Ok(Some(selected))
+    profile == program.profile
+        && extras == program.extras
+        && inputs == program.inputs
+        && super::freshness(&record, dataset.store(), snapshot.commit).stale == Some(false)
 }
 
 /// Compare actual retained candidates; no reconstruction from a truncated preview patch.
@@ -279,15 +290,26 @@ pub(crate) fn compare(
     request: &DiffRequest,
     control: &AnalysisControl,
 ) -> Result<EntailmentDiff> {
+    compare_resolved(dataset, from, to, request, control, None)
+}
+
+fn compare_resolved(
+    dataset: &Dataset,
+    from: &Arc<Snapshot>,
+    to: &Arc<Snapshot>,
+    request: &DiffRequest,
+    control: &AnalysisControl,
+    pinned: Option<(Dataset, Dataset)>,
+) -> Result<EntailmentDiff> {
     let program = analysis::program(dataset, &request.analysis)?;
     let mut from_options = request.analysis.clone();
     from_options.access = request.from_access.clone().or(from_options.access);
     let mut to_options = request.analysis.clone();
     to_options.access = request.to_access.clone().or(to_options.access);
-    let materialized =
-        selected_materialization(dataset, &request.from, from, &program, &from_options)?.zip(
-            selected_materialization(dataset, &request.to, to, &program, &to_options)?,
-        );
+    let materialized = pinned.filter(|(from_dataset, to_dataset)| {
+        selected_materialization(from_dataset, from, &program, &from_options)
+            && selected_materialization(to_dataset, to, &program, &to_options)
+    });
     let (a, b) = if let Some((from_dataset, to_dataset)) = materialized {
         let a = analysis::stored(&from_dataset, from, &program, &from_options, control, 0)?;
         let b = analysis::stored(&to_dataset, to, &program, &to_options, control, a.bytes)?;
@@ -673,5 +695,83 @@ mod review_regressions {
             error.to_string().contains("inferred") || error.to_string().contains("memory"),
             "{error}"
         );
+    }
+    #[test]
+    fn newly_present_configured_graph_keeps_existing_witnesses() {
+        let dataset = Dataset::memory();
+        dataset
+            .update("INSERT DATA {<urn:z> <urn:p> <urn:t>}")
+            .unwrap();
+        let before = dataset.store().snapshot();
+        dataset
+            .update("INSERT DATA {GRAPH <urn:later> {<urn:a> <urn:other> <urn:t>}}")
+            .unwrap();
+        let after = dataset.store().snapshot();
+        let mut request = DiffRequest::new("before", "after");
+        request.analysis.program = Some(analysis::AnalysisProgram {
+            profile: sparkles_reasoner::Profile::Rules(
+                "[r: (?s <urn:p> <urn:t>) makeTemp(?w) -> (?s <urn:q> ?w)]".into(),
+            ),
+            extras: Default::default(),
+            inputs: sparkles_reasoner::Inputs {
+                data_graphs: vec![
+                    sparkles_reasoner::GraphRef::Default,
+                    sparkles_reasoner::GraphRef::Named("urn:later".into()),
+                ],
+                ..Default::default()
+            },
+        });
+        let control = AnalysisControl::new(&request.analysis).unwrap();
+        let diff = compare(&dataset, &before, &after, &request, &control).unwrap();
+        assert_eq!((diff.added, diff.removed), (0, 0));
+    }
+    #[test]
+    fn retained_views_cannot_take_freshness_from_a_replacement_branch_name() {
+        let dataset = Dataset::memory();
+        dataset.update("INSERT DATA {<urn:Manager> <http://www.w3.org/2000/01/rdf-schema#subClassOf> <urn:Employee>}").unwrap();
+        let run = super::super::ReasonRequest {
+            profile: sparkles_reasoner::Profile::RdfsSimple,
+            ..Default::default()
+        };
+        dataset.reasoning().run(&run).unwrap();
+        dataset
+            .create_branch("moving", &Default::default())
+            .unwrap();
+        let old = dataset.branch("moving").unwrap();
+        old.update("INSERT DATA {<urn:alice> a <urn:Manager>}")
+            .unwrap();
+        let request = DiffRequest::new("head", "moving");
+        let control = AnalysisControl::new(&request.analysis).unwrap();
+        let from_state = resolve_state(&dataset, "head", &control).unwrap();
+        let to_state = resolve_state(&dataset, "moving", &control).unwrap();
+        let from = from_state.snapshot.clone();
+        let to = to_state.snapshot.clone();
+        dataset.rename_branch("moving", "retained").unwrap();
+        dataset
+            .create_branch("moving", &Default::default())
+            .unwrap();
+        let replacement = dataset.branch("moving").unwrap();
+        replacement
+            .update("INSERT DATA {<urn:unrelated> <urn:p> <urn:o>}")
+            .unwrap();
+        replacement.reasoning().run(&run).unwrap();
+        assert_eq!(replacement.store().snapshot().commit, to.commit);
+        assert_eq!(
+            replacement.reasoning().status().unwrap().freshness.stale,
+            Some(false)
+        );
+        let diff = compare_resolved(
+            &dataset,
+            &from,
+            &to,
+            &request,
+            &control,
+            from_state.materialization.zip(to_state.materialization),
+        )
+        .unwrap();
+        assert_eq!((diff.added, diff.removed), (1, 0));
+        // An unpinned synthetic comparison also cannot reopen selector names.
+        let diff = compare(&dataset, &from, &to, &request, &control).unwrap();
+        assert_eq!((diff.added, diff.removed), (1, 0));
     }
 }

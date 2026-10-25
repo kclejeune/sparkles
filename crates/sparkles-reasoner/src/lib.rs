@@ -42,7 +42,7 @@ pub use extras::{Extras, UnknownVocabulary, Vocabulary};
 pub use inputs::{
     Fetched, GraphRef, Import, ImportMode, Inputs, LocationMapping, Resolved, fetch_imports,
 };
-pub use maintain::{Cache, DEFAULT_CACHE_TRIPLES, literal_typings};
+pub use maintain::{Cache, DEFAULT_CACHE_TRIPLES, literal_typings, literal_typings_controlled};
 pub use parser::{
     BuiltinCall, Clause, Direction, Node, Rule, RuleParseError, TriplePattern, parse_rules,
 };
@@ -365,10 +365,9 @@ fn derive_here(
     let mut g = graph::Graph::with_base(base.clone());
     g.set_budget(&budget)?;
     let mut terms = Terms::new(snap);
-    terms.set_analysis(
-        opts.analysis.clone(),
-        format!("{}\n{:?}\n{:?}", profile.text(), extras, opts.inputs),
-    )?;
+    if let Some(context) = &opts.analysis {
+        terms.set_analysis(context.clone())?;
+    }
     terms.set_budget(&budget)?;
     let mut defaults = None;
     if extras.geo_default_geometry {

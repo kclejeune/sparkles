@@ -8,14 +8,15 @@ use crate::diagnostics::LiteralTypings;
 use crate::terms::Terms;
 use oxrdf::{Literal, Term};
 use sparkles_core::id::Id;
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Instant;
 
 #[derive(Debug)]
 struct Witnesses {
-    keys: BTreeMap<Vec<String>, u64>,
+    keys: BTreeMap<(Arc<str>, Vec<String>), u64>,
+    programs: BTreeSet<Arc<str>>,
     next: u64,
 }
 
@@ -41,6 +42,7 @@ impl WitnessMap {
             ordinal,
             state: Mutex::new(Witnesses {
                 keys: BTreeMap::new(),
+                programs: BTreeSet::new(),
                 next: sparkles_core::branch::bnode_range_start(ordinal),
             }),
             budget: Budget::new(max_memory),
@@ -64,20 +66,37 @@ impl WitnessMap {
 pub struct AnalysisContext {
     witnesses: Arc<WitnessMap>,
     pub(crate) now: Term,
+    program: Arc<str>,
     typings: Mutex<Option<LiteralTypings>>,
     typing_budget: Arc<Budget>,
     failed: OnceLock<MemoryExceeded>,
 }
 
 impl AnalysisContext {
-    pub fn new(witnesses: Arc<WitnessMap>, max_typing_memory: Option<usize>) -> Arc<Self> {
-        Arc::new(Self {
+    pub fn new(
+        witnesses: Arc<WitnessMap>,
+        max_typing_memory: Option<usize>,
+        program: String,
+    ) -> Result<Arc<Self>, MemoryExceeded> {
+        let program = {
+            let mut state = witnesses.state.lock().unwrap();
+            if let Some(program) = state.programs.get(program.as_str()) {
+                program.clone()
+            } else {
+                witnesses.budget.try_charge(128 + program.capacity())?;
+                let program: Arc<str> = program.into();
+                state.programs.insert(program.clone());
+                program
+            }
+        };
+        Ok(Arc::new(Self {
             now: witnesses.now.clone(),
+            program,
             witnesses,
             typings: Mutex::new(None),
             typing_budget: Budget::new(max_typing_memory),
             failed: OnceLock::new(),
-        })
+        }))
     }
 
     pub(crate) fn check(&self) -> Result<(), MemoryExceeded> {
@@ -121,12 +140,13 @@ impl AnalysisContext {
             return Err(fail("stopping an entailment analysis"));
         }
         let mut state = self.witnesses.state.lock().unwrap();
+        let key = (self.program.clone(), key);
         if let Some(id) = state.keys.get(&key) {
             return Ok(*id);
         }
         let bytes = 192
-            + key.capacity() * std::mem::size_of::<String>()
-            + key.iter().map(String::capacity).sum::<usize>();
+            + key.1.capacity() * std::mem::size_of::<String>()
+            + key.1.iter().map(String::capacity).sum::<usize>();
         self.witnesses.budget.try_charge(bytes)?;
         if sparkles_core::branch::bnode_ordinal(state.next) != self.witnesses.ordinal as u64 {
             return Err(fail("exhausting the analysis witness range"));
