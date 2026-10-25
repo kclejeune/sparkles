@@ -45,6 +45,12 @@ fn graph_len(snap: &Snapshot, g: &GraphName) -> Result<u64> {
     }
 }
 
+/// Checks already made against one step's actual predecessor during a replay.
+pub(super) struct LogChecks {
+    pub validation: Option<Arc<ValidationSummary>>,
+    pub precondition: Option<std::result::Result<(), String>>,
+}
+
 /// The net changes of a WAL path change log: each quad whose presence differs at the
 /// end, with whether it was added, removals first. The log holds effective changes only,
 /// so a quad was present at the start iff its first change is a delete, and is present
@@ -68,13 +74,18 @@ fn net_log(log: &[(u8, [Id; 4])]) -> Vec<([Id; 4], bool)> {
 /// The outcome of a write's precondition, checked on the head (the writer lock is held,
 /// so this is the head the write would see).
 fn precondition(store: &Store, o: &WriteOptions) -> Option<std::result::Result<(), String>> {
-    o.precondition
-        .as_ref()
-        .map(|p| match p.check(&store.snapshot()) {
-            Ok(()) => Ok(()),
-            Err(Error::PreconditionFailed(m)) => Err(m),
-            Err(e) => Err(e.to_string()),
-        })
+    precondition_on(&store.snapshot(), o)
+}
+
+pub(super) fn precondition_on(
+    snapshot: &Snapshot,
+    o: &WriteOptions,
+) -> Option<std::result::Result<(), String>> {
+    o.precondition.as_ref().map(|p| match p.check(snapshot) {
+        Ok(()) => Ok(()),
+        Err(Error::PreconditionFailed(m)) => Err(m),
+        Err(e) => Err(e.to_string()),
+    })
 }
 
 /// `rows` budget error past `max` changes (0: no limit).
@@ -229,22 +240,41 @@ impl Store {
 impl WriteTxn<'_> {
     /// The preview of a commit through the WAL, made where `publish_log` would write it.
     pub(super) fn preview_log(&mut self, dr: &DryRun) -> Result<Preview> {
+        self.preview_log_inner(dr, None)
+    }
+
+    pub(super) fn preview_log_checked(
+        &mut self,
+        dr: &DryRun,
+        checks: &LogChecks,
+    ) -> Result<Preview> {
+        self.preview_log_inner(dr, Some(checks))
+    }
+
+    fn preview_log_inner(&mut self, dr: &DryRun, checks: Option<&LogChecks>) -> Result<Preview> {
         let store = self.store;
         let head = self.guard.head;
-        let pre = precondition(store, &self.opts);
-        let changed = self.net_ins != 0 || self.net_del != 0;
+        let pre = match checks {
+            Some(checks) => checks.precondition.clone(),
+            None => precondition(store, &self.opts),
+        };
+        let changed = self.net_ins != 0 || self.net_del != 0 || (checks.is_some() && self.force);
         let (commit, validation, storage, message) = if changed {
-            let validation = match store.run_guard(
-                &self.base,
-                || Arc::new(self.view()),
-                self.kind,
-                Changes::Log(&self.log),
-                &self.opts,
-                head.seq,
-            ) {
-                Ok(v) => v,
-                Err(Error::Rejected(r)) => Some(Arc::new(r.summary)),
-                Err(e) => return Err(e),
+            let validation = if let Some(checks) = checks {
+                checks.validation.clone()
+            } else {
+                match store.run_guard(
+                    &self.base,
+                    || Arc::new(self.view()),
+                    self.kind,
+                    Changes::Log(&self.log),
+                    &self.opts,
+                    head.seq,
+                ) {
+                    Ok(v) => v,
+                    Err(Error::Rejected(r)) => Some(Arc::new(r.summary)),
+                    Err(e) => return Err(e),
+                }
             };
             let message = match &self.opts.message {
                 Some(m) => crate::annotations::validate_message(m)?,

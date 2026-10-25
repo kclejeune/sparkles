@@ -810,3 +810,189 @@ fn retained_bulk_candidate_remains_readable_after_temporary_generation_cleanup()
         assert_eq!(store.snapshot().len(), 0);
     }
 }
+
+#[derive(Default)]
+struct ReplayPreviewGuard {
+    states: std::sync::Mutex<Vec<(u64, u64, u64)>>,
+    committed: AtomicUsize,
+    reject_bad: bool,
+}
+impl CommitGuard for ReplayPreviewGuard {
+    fn check(&self, c: &Candidate<'_>) -> sparkles_core::Result<ValidationSummary> {
+        assert!(c.opts.dry_run.is_some(), "the guard must see a preview");
+        self.states
+            .lock()
+            .unwrap()
+            .push((c.base.len(), c.view.len(), c.base.commit));
+        let bad = c.view.lookup_iri("urn:bad").is_some_and(|predicate| {
+            c.view
+                .count(sparkles_core::index::Perm::Pso, &[predicate.0])
+                .unwrap()
+                > 0
+        });
+        Ok(ValidationSummary::empty(
+            if self.reject_bad && bad {
+                GuardStatus::Rejected
+            } else {
+                GuardStatus::Passed
+            },
+            GuardMode::Reject,
+            Severity::Violation,
+        ))
+    }
+    fn committed(&self, _: u64) {
+        self.committed.fetch_add(1, Ordering::Relaxed);
+    }
+    fn describe(&self) -> String {
+        "replay preview test guard".into()
+    }
+}
+
+fn replay_preview_fixture() -> Store {
+    let main = Store::in_memory(StoreOptions::default());
+    upd(
+        &main,
+        "INSERT DATA {<urn:base> <urn:p> 0}",
+        Default::default(),
+    )
+    .unwrap();
+    main.create_branch("dev", &Default::default()).unwrap();
+    main
+}
+fn replay_preview(main: &Store, mut write: WriteOptions) -> Preview {
+    write.dry_run = Some(DryRun {
+        retain_states: true,
+        changes: 100,
+        ..Default::default()
+    });
+    match main.merge(
+        "dev",
+        "main",
+        &sparkles_core::branch::MergeOptions {
+            replay: true,
+            write,
+            ..Default::default()
+        },
+    ) {
+        Err(Error::DryRun(preview)) => *preview,
+        Err(error) => panic!("expected a replay preview: {error}"),
+        Ok(_) => panic!("a replay preview must not publish"),
+    }
+}
+
+#[test]
+fn replay_preview_retains_every_step_and_checks_each_actual_predecessor() {
+    let main = replay_preview_fixture();
+    let dev = main.branch("dev").unwrap();
+    upd(
+        &dev,
+        "INSERT DATA {<urn:alice> <urn:p> 1}",
+        Default::default(),
+    )
+    .unwrap();
+    upd(
+        &dev,
+        "INSERT DATA {<urn:bob> <urn:p> 2}",
+        Default::default(),
+    )
+    .unwrap();
+    let guard = Arc::new(ReplayPreviewGuard::default());
+    main.set_guard(Some(guard.clone()));
+    let preview = replay_preview(&main, Default::default());
+    assert_eq!(preview.outcome(), Outcome::Commit);
+    assert_eq!(preview.changes_total, Some(2));
+    assert_eq!(preview.commit.unwrap().seq, 3);
+    let states = preview.states.unwrap();
+    assert_eq!((states.before.len(), states.after.len()), (1, 3));
+    assert_eq!(*guard.states.lock().unwrap(), [(1, 2, 1), (2, 3, 2)]);
+    assert_eq!(guard.committed.load(Ordering::Relaxed), 0);
+    assert_eq!((main.head_commit().seq, main.snapshot().len()), (1, 1));
+    assert_eq!((dev.head_commit().seq, dev.snapshot().len()), (3, 3));
+}
+
+#[test]
+fn replay_preview_stops_at_an_intermediate_guard_refusal() {
+    let main = replay_preview_fixture();
+    let dev = main.branch("dev").unwrap();
+    upd(
+        &dev,
+        "INSERT DATA {<urn:alice> <urn:bad> 1}",
+        Default::default(),
+    )
+    .unwrap();
+    upd(
+        &dev,
+        "DELETE DATA {<urn:alice> <urn:bad> 1}",
+        Default::default(),
+    )
+    .unwrap();
+    let guard = Arc::new(ReplayPreviewGuard {
+        reject_bad: true,
+        ..Default::default()
+    });
+    main.set_guard(Some(guard.clone()));
+    let preview = replay_preview(&main, Default::default());
+    assert_eq!(preview.outcome(), Outcome::Rejected);
+    assert_eq!(*guard.states.lock().unwrap(), [(1, 2, 1)]);
+    assert_eq!(guard.committed.load(Ordering::Relaxed), 0);
+    assert_eq!((main.head_commit().seq, main.snapshot().len()), (1, 1));
+}
+
+#[test]
+fn replay_preview_can_make_commits_with_no_net_quad_change() {
+    let main = replay_preview_fixture();
+    let dev = main.branch("dev").unwrap();
+    upd(
+        &dev,
+        "INSERT DATA {<urn:alice> <urn:p> 1}",
+        Default::default(),
+    )
+    .unwrap();
+    upd(
+        &dev,
+        "DELETE DATA {<urn:alice> <urn:p> 1}",
+        Default::default(),
+    )
+    .unwrap();
+    let preview = replay_preview(&main, Default::default());
+    assert_eq!(preview.outcome(), Outcome::Commit);
+    assert_eq!(preview.changes_total, Some(0));
+    assert_eq!(preview.commit.unwrap().seq, 3);
+    assert_eq!(preview.states.unwrap().after.len(), 1);
+    assert_eq!(main.head_commit().seq, 1);
+}
+
+#[test]
+fn replay_preview_rechecks_preconditions_against_virtual_commit_heads() {
+    let main = replay_preview_fixture();
+    let dev = main.branch("dev").unwrap();
+    upd(
+        &dev,
+        "INSERT DATA {<urn:alice> <urn:p> 1}",
+        Default::default(),
+    )
+    .unwrap();
+    upd(
+        &dev,
+        "INSERT DATA {<urn:bob> <urn:p> 2}",
+        Default::default(),
+    )
+    .unwrap();
+    let preview = replay_preview(
+        &main,
+        WriteOptions {
+            precondition: Some(Precondition::new(|snapshot| {
+                if snapshot.commit == 1 {
+                    Ok(())
+                } else {
+                    Err(Error::PreconditionFailed(
+                        "head changed after the first replay step".into(),
+                    ))
+                }
+            })),
+            ..Default::default()
+        },
+    );
+    assert_eq!(preview.outcome(), Outcome::PreconditionFailed);
+    assert_eq!(main.head_commit().seq, 1);
+}

@@ -79,6 +79,9 @@ impl Store {
             let lo = if k == j { base.seq } else { after };
             commits.extend((lo + 1..=through).map(|s| (bid, s)));
         }
+        if !preview && let Some(dry) = &o.write.dry_run {
+            return self.preview_replay(tgt, &commits, &report, o, &dopts, dry);
+        }
         let inferred: Arc<[u8]> = crate::id::iri_key(INFERRED_GRAPH).into();
         let mut excluded = 0u64;
         let mut expected = report.target.seq;
@@ -173,5 +176,122 @@ impl Store {
             report.inferences_excluded = Some(excluded);
         }
         Ok(MergeOutcome::Merged(report))
+    }
+
+    /// Simulate every replayed commit in one rollback transaction. Guards see each
+    /// step's own predecessor and changes, while the retained preview covers the
+    /// complete proposed state. Nothing publishes a commit or guard-cache update.
+    fn preview_replay(
+        &self,
+        target: &Store,
+        commits: &[(uuid::Uuid, u64)],
+        report: &MergeReport,
+        options: &MergeOptions,
+        diff_options: &DiffOptions,
+        dry: &crate::preview::DryRun,
+    ) -> Result<MergeOutcome> {
+        let mut write = options.write.clone();
+        write.cancel = write.cancel.or_else(|| options.cancel.clone());
+        write.deadline = write.deadline.or(options.deadline);
+        let mut txn = target.try_write_with(CommitKind::Merge, write)?;
+        if txn.guard.head.seq != report.target.seq {
+            return Err(branch::conflict(
+                "head-moved",
+                "target moved before replay preview",
+            ));
+        }
+        let inferred: Arc<[u8]> = crate::id::iri_key(INFERRED_GRAPH).into();
+        for (index, &(branch_id, seq)) in commits.iter().enumerate() {
+            txn.opts.check()?;
+            options.progress.report(
+                index as f32 / commits.len().max(1) as f32,
+                "previewing replay",
+            );
+            let source = self.branch_by_id(branch_id)?;
+            let changes = source
+                .diff(&At::Commit(seq - 1), &At::Commit(seq), diff_options)
+                .map_err(super::merge::gone)?;
+            let mut before = txn.view();
+            before.commit = report.target.seq + index as u64;
+            let before = Arc::new(before);
+            txn.kind = source
+                .commit(seq)
+                .map_or(CommitKind::Transaction, |commit| commit.kind);
+            txn.opts.message = source
+                .annotation(seq)
+                .and_then(|annotation| annotation.message);
+            txn.opts.author = source
+                .commit_author(seq)
+                .or_else(|| options.write.author.clone());
+            txn.force = true;
+            txn.merge = Some(MergeRec {
+                seq: 0,
+                source: CommitRef { branch_id, seq },
+                resolved: 0,
+                flags: MERGE_REPLAYED,
+            });
+            txn.writable.clear();
+            txn.base_check = match txn
+                .opts
+                .graphs
+                .as_ref()
+                .and_then(|access| access.triples.as_ref())
+            {
+                Some(rules) => crate::access::triples::WriteCheck::new(rules, before.clone())?,
+                None => None,
+            };
+            let start = txn.log.len();
+            for (operation, key) in changes.keys() {
+                if !options.include_inferences && key[0] == inferred {
+                    continue;
+                }
+                let added = operation == DiffOp::Add;
+                match quad_ids(&mut txn, key, added)? {
+                    Some(quad) if added => {
+                        txn.insert(quad)?;
+                    }
+                    Some(quad) => {
+                        txn.delete(quad)?;
+                    }
+                    None => {}
+                }
+            }
+            txn.check_requested_all()?;
+            txn.opts.check()?;
+            let precondition = super::preview::precondition_on(&before, &txn.opts);
+            let validation = match target.run_guard(
+                &before,
+                || Arc::new(txn.view()),
+                txn.kind,
+                crate::guard::Changes::Log(&txn.log[start..]),
+                &txn.opts,
+                before.commit,
+            ) {
+                Ok(summary) => summary,
+                Err(Error::Rejected(rejected)) => Some(Arc::new(rejected.summary)),
+                Err(error) => return Err(error),
+            };
+            let refused = precondition
+                .as_ref()
+                .is_some_and(|outcome| outcome.is_err())
+                || validation
+                    .as_ref()
+                    .is_some_and(|summary| summary.status == crate::guard::GuardStatus::Rejected)
+                || txn.check_storage().is_err();
+            if refused || index + 1 == commits.len() {
+                let checks = super::preview::LogChecks {
+                    precondition,
+                    validation,
+                };
+                let mut preview = txn.preview_log_checked(dry, &checks)?;
+                if let Some(commit) = &mut preview.commit {
+                    commit.seq = before.commit + 1;
+                }
+                return Err(Error::DryRun(Box::new(preview)));
+            }
+        }
+        let mut unchanged = report.clone();
+        unchanged.up_to_date = true;
+        Ok(MergeOutcome::UpToDate(unchanged))
     }
 }
