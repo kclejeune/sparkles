@@ -225,9 +225,11 @@ impl EqualityIndex {
     fn new(ctx: &Ctx, build: &Table, column: usize, probe: usize) -> Result<Self> {
         let values = &build.cols[column];
         // The key of each row, unbound for a loose or unbound value, and the loose rows.
-        let charge = ctx.retained_charge(values.len() as u64 * 12 + 1024)?;
+        let mut charge = ctx.retained_charge(values.len() as u64 * 12 + 1024)?;
         let mut keys = Vec::with_capacity(values.len());
-        let mut loose = Vec::new();
+        // Reserve exactly the worst-case number of loose rows. Geometric growth
+        // can otherwise exceed the four bytes per row reserved alongside keys.
+        let mut loose = Vec::with_capacity(values.len());
         for (row, &value) in values.iter().enumerate() {
             if row.is_multiple_of(1024) {
                 ctx.check()?;
@@ -241,6 +243,9 @@ impl EqualityIndex {
                 EqKey::Unbound => Id::UNDEF,
             });
         }
+        debug_assert!(charge.as_ref().is_none_or(|charge| {
+            (keys.capacity() as u64 * 8 + loose.capacity() as u64 * 4) <= charge.bytes()
+        }));
         let keyed = Table {
             vars: vec![0],
             cols: vec![keys],
@@ -248,7 +253,13 @@ impl EqualityIndex {
             sorted: Vec::new(),
         };
         let by_key = HashIndex::new(ctx, &keyed, 0, probe)?;
+        // Free the temporary keys before a shrink can hold old and new loose
+        // allocations together. Both fit within the original twelve-byte charge.
+        drop(keyed);
         loose.shrink_to_fit();
+        if let Some(charge) = &mut charge {
+            charge.resize(loose.capacity() as u64 * 4 + 1024)?;
+        }
         Ok(Self {
             by_key,
             loose,
@@ -264,6 +275,36 @@ impl EqualityIndex {
             EqKey::Key(k) => Candidates::Keyed(self.by_key.keyed(k), &[]),
             EqKey::Loose => Candidates::Keyed(&[], &self.loose),
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::store::{Store, StoreOptions};
+
+    #[test]
+    fn equality_index_covers_loose_rows_across_vector_growth_boundaries() {
+        let store = Store::in_memory(StoreOptions::default());
+        let mut ctx = Ctx::new(store.snapshot());
+        ctx.mem_limit = 16 << 20;
+        ctx.enable_cursor_accounting().unwrap();
+        let ctx = Arc::new(ctx);
+        ctx.attach_cursor_owner();
+        for len in [65_536, 65_537] {
+            let mut build = Table::new(vec![0]);
+            for row in 0..len {
+                build.push_row(&[Id::from_i64(row as i64).unwrap()]);
+            }
+            // Building the index also checks that every temporary allocation
+            // fits its charge before the temporary keys have been dropped.
+            let index = EqualityIndex::new(&ctx, &build, 0, 0).unwrap();
+            assert_eq!(index.loose.len(), len);
+            assert_eq!(
+                index._charge.as_ref().unwrap().bytes(),
+                len as u64 * 4 + 1024
+            );
+        }
     }
 }
 
