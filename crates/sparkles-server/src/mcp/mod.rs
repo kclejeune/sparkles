@@ -40,6 +40,7 @@ pub(crate) mod memory;
 mod notify;
 mod paths;
 mod pins;
+pub(crate) mod relevance;
 pub(crate) mod render;
 pub mod rest;
 pub mod review_http;

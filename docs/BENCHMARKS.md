@@ -2484,10 +2484,10 @@ call the provider through a local proxy that holds every request against a cost 
 
 | Measurement context | |
 |---|---|
-| Date and host | 2026-10-24, on a development laptop with the DBpedia database on local disk |
-| Models | Claude Haiku 5.5, Sonnet 5.5 and Opus 5.5 at effort `medium`, with a 200,000-token context |
-| Builds | Ask from commit 03aa64bb, global answering from commit 847d8d0b |
-| Cost | $28.80 for the Ask runs and $11.25 for the evaluation of global answering |
+| Date and host | Ask measured on 2026-10-25 and global answering on 2026-10-24, on a development laptop with local data |
+| Models | Ask uses Claude Haiku 5.5 and Sonnet 5.5 at effort `medium`, with a 200,000-token context. Global answering uses Sonnet 5.5 with Opus 5.5 as judge. |
+| Builds | Ask from commit 0d4fdd8e, global answering from commit 847d8d0b |
+| Cost | $5.7450 for the full Ask run and $0.0397 for its separate pilot. Global answering cost $11.25. |
 
 ### Ask on DBpedia
 
@@ -2497,20 +2497,43 @@ the harness answers from the gold query by choosing one of the offered choices. 
 is correct when its rows match the gold's on the projected columns, and the equal-width
 row gives no credit for extra columns such as a label beside an IRI.
 
-| Set | Haiku 5.5 | Sonnet 5.5 | Opus 5.5 |
-|---|---|---|---|
-| QALD-9-plus, 107 questions | 16 (15%) | 35 (33%) | 40 (37%) |
-| QALD-9-plus, equal width | 13 | 15 | 15 |
-| DBpedia-only, 74 questions | 11 (15%) | 28 (38%) | 32 (43%) |
-| DBpedia-only, equal width | 9 | 14 | 13 |
-| Cost per correct answer, QALD-9-plus | $0.020 | $0.160 | $0.279 |
-| Median time per question, QALD-9-plus | 11.8 s | 12.7 s | 18.6 s |
+| Measurement over 107 QALD-9-plus questions | Haiku 5.5 | Sonnet 5.5 |
+|---|---|---|
+| Correct with projected columns | 26 (24%) | 31 (29%) |
+| Correct with equal width | 23 (21%) | 9 (8%) |
+| Clarifications answered by the harness | 84 | 84 |
+| Fresh cost including provider preflight | $0.2876 | $5.4574 |
+| Cost per correct projected answer | $0.0111 | $0.1760 |
+| Median wall time including clarification | 14.78 s | 14.98 s |
+| p95 wall time including clarification | 29.22 s | 33.88 s |
 
-Haiku found most questions unanswerable, because the grounding seldom lists the
-predicate a question needs. Sonnet and Opus guess the predicate and are often wrong.
-[C18](specs/C18-natural-language-questions-and-ingest.md#roadmap-follow-ups-2026-10-12)
-gives the failures and the earlier runs on the demo set and CK25, and
-[ROADMAP](ROADMAP.md) item 263 holds the follow-up.
+These are repeated regression questions used during diagnosis, not an unseen test of
+generalization. The ten-question Haiku pilot is separate from both 107-question
+denominators. Every gold query passed before any provider request, and all 107 gold
+relations matched the retained reference results. The
+[paid record](benchmarks/2026-10-25-ask-grounding-paid.json) gives both policies,
+paired changes, fresh ledger costs, tokens, timings and artifact digests.
+
+The result is mixed across models. Haiku answers more of the retained questions, while
+Sonnet answers fewer under both policies. Both have higher median wall time, with nearly
+unchanged p95. Provider variability and a GCC version difference prevent attributing
+these changes to grounding alone. [C18](specs/C18-natural-language-questions-and-ingest.md#ask-grounding-accuracy-item-263)
+records the comparison. [ROADMAP](ROADMAP.md) item 263 keeps the remaining accuracy work,
+and item 318 tracks the median latency increase.
+
+Current Ask grounding keeps half its schema budget for common vocabulary and fills the
+rest with question matches from the full visible schema. In an offline check against
+181 saved questions and an independently retrieved vocabulary of 58,564 predicates, this
+retrieves 189 of 304 existing predicate IRI constants mentioned in the gold, compared with
+151 from the count-only list. The check uses declared English or untagged property
+labels and includes `a` as `rdf:type`. It does not measure variable predicates, model
+answer accuracy or latency. The separate paid run above measures the complete pipeline
+with this retrieval and conservative resource/category ranking. The
+[offline record](benchmarks/2026-10-25-ask-grounding-offline.json) gives the source
+digests, per-question retrieval counts and the exact link to the old prompt's vocabulary.
+The resource preference only orders offered choices. An ambiguous mention still asks for
+a clarification, since the displayed candidate, type and alternate-label lists can be
+truncated. The paid run does not isolate this ranking's contribution to answer accuracy.
 
 ### Global answering
 

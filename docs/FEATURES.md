@@ -986,6 +986,11 @@ build community reports.
   `--model-config`, `GET /$/models` and `POST /$/models/{name}/test` configure and test
   them. The server detects structured output per model and falls back to JSON mode and
   plain text.
+* Ask keeps half of its schema budget for common vocabulary and retrieves the rest by
+  matching the question against every visible class and predicate. A guarded resource
+  preference can reorder the choices offered for an ambiguous mention. Every ambiguous
+  mention still asks for a clarification, because displayed candidates, types and labels
+  can be truncated. The generic `link_entities` verdict is unchanged.
 * `POST /{ds}/ask` runs as the caller and streams each step as a server-sent event, or
   answers one JSON object ([API.md](API.md#asking-in-the-server)). `assistant.json`,
   through `/$/assistant/{ds}`, turns the assistant on for a dataset and sets what may leave
@@ -1719,12 +1724,14 @@ links each item to its design spec.
 * Ask has been evaluated with Anthropic models only, on the demo set, CK25, QALD-9-plus
   and 74 DBpedia-only questions
   ([C18](specs/C18-natural-language-questions-and-ingest.md#roadmap-follow-ups-2026-10-12),
-  [BENCHMARKS.md](BENCHMARKS.md#natural-language-questions)). On DBpedia the best model
-  answers 40 of 107 QALD-9-plus questions. Most DBpedia questions stop at a
-  clarification, because `link_entities` offers a category or a namesake beside the main
-  resource, and the grounding seldom lists the predicate a question needs, roadmap item
-  263. Local and OpenAI-compatible models, LC-QuAD 2.0, which needs a Wikidata load from
-  the full dump, and an evaluation of independent roles have not run. Roadmap item 6.
+  [BENCHMARKS.md](BENCHMARKS.md#natural-language-questions)). On the retained 107-question
+  DBpedia repeat, Sonnet answers 31 under projected-column scoring and 9 with equal-width
+  scoring. Haiku answers 26 and 23 respectively. These
+  repeated regression questions do not measure unseen generalization. Model-dependent
+  accuracy and contextual namesake resolution remain roadmap item 263, and the higher
+  median end-to-end latency is item 318. Local and OpenAI-compatible models, LC-QuAD 2.0,
+  which needs a Wikidata load from the full dump, and an evaluation of independent roles
+  have not run. Roadmap item 6.
 * The UI's ingestion controls do not turn on assistant ingestion. Roadmap item 77.
 * An MCP tool operation that needs admin, such as deleting a protected branch, refuses an
   OAuth token without `sparkles:admin` as a tool error instead of a scope challenge.

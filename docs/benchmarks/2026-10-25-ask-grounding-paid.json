@@ -1,0 +1,1120 @@
+{
+  "schema": 1,
+  "measurement": "Ask grounding on retained QALD-9-plus DBpedia regression questions",
+  "date": "2026-10-25",
+  "host": "A development laptop used the original local DBpedia database. The global local heavy lock was reserved, with no concurrent build or benchmark.",
+  "scope": "Each model ran all 107 retained questions once. These questions were used during diagnosis and are regression evidence rather than unseen held-out generalization evidence. No Opus calls were made.",
+  "source": {
+    "commit": "0d4fdd8e8171739950fe6c487ed19c6104cf6d01",
+    "groundingCommit": "c341cf83e7d9970dcdd4d84c08a00827bed47095",
+    "binarySha256": "7fee24e01b21f4bd3aeb6f87ae87b85f6455a2849470d55f9e213e250104ba93",
+    "features": [
+      "auth",
+      "backup",
+      "default",
+      "fmt",
+      "geo",
+      "geo-epsg",
+      "graphql",
+      "mapping-parquet",
+      "mapping-sqlite",
+      "mcp",
+      "memory",
+      "mimalloc",
+      "office",
+      "otel",
+      "pdf",
+      "reasoning",
+      "shacl",
+      "shex",
+      "text",
+      "text-cjk-dict",
+      "tls"
+    ],
+    "profile": {
+      "name": "release",
+      "lto": "thin",
+      "codegenUnits": 4,
+      "coreCodegenUnits": 1,
+      "debugInfo": 1
+    },
+    "artifactProfile": {
+      "opt_level": "3",
+      "debuginfo": 1,
+      "debug_assertions": false,
+      "overflow_checks": false,
+      "test": false
+    },
+    "compilerComments": "\nString dump of section '.comment':\n  [     0]  Linker: LLD 22.1.8 (/checkout/src/llvm-project/llvm 52ed14fcd56afc30f9cccd8ca8ce237c2eef7e04)\n  [    5e]  rustc version 1.98.1 (48a229cea 2026-09-01)\n  [    8b]  GCC: (GNU) 16.2.0\n  [    9d]  clang version 21.1.8\n\n",
+    "contextConsumerIncluded": false,
+    "cargoArtifactFreshFlag": false
+  },
+  "baseline": {
+    "commit": "03aa64bb",
+    "binarySha256": "804169201d67ced2c40cb87318b6a9b123decad607d3e598c0e7c5ce4c08a4d8",
+    "reportSha256": "dcb55cc197f1c6ca4984fc965c5766d04309bf0699ac14978bca45104d0dc4fe",
+    "compilerComments": {
+      "rustc": "1.98.1",
+      "clang": "21.1.8",
+      "lld": "22.1.8",
+      "gcc": "15.3.0"
+    },
+    "exactOriginalBuildCommandRetained": false
+  },
+  "dataset": {
+    "release": "2022.12.01",
+    "questionSetSha256": "330687b410db3cbe4fdb1f7b69a7a7b832ab7b4212a5b9db2a952b8a63f78a45",
+    "source": {
+      "repository": "KGQA/QALD_9_plus",
+      "commit": "b9fb0380902e6935efc9505170bc3652e8c242c1",
+      "file": "data/qald_9_plus_test_dbpedia.json",
+      "sha256": "7831fd113d9c5ad66c429bfb39b079fdb101578e57c095777a468f206201787f",
+      "license": "CC BY 4.0"
+    },
+    "sourceLoadManifestSha256": "4b9494691e15485a8f83af356c3286c54e8adaa945d70352a27a6e95b3e4b569",
+    "retainedQuestions": 107,
+    "goldQueriesRevalidatedBeforeAnyProvider": 107,
+    "goldRelationsExactlyMatchingBaseline": 107,
+    "metadataHashesBeforeAndAfter": {
+      "CURRENT": {
+        "sha256": "a5645ccadf57d245a8e69e9e4129e606be98dbd0426f4632fa203746210c89ce",
+        "bytes": 8
+      },
+      "dataset.json": {
+        "sha256": "88dad95997d2c996ca58901d6585f0762be1f6a8aaad533a1f8c5385498dcff2",
+        "bytes": 174
+      }
+    },
+    "fullStoreDigestComputed": false
+  },
+  "settings": {
+    "effort": "medium",
+    "contextTokens": 200000,
+    "maxOutputTokens": 4096,
+    "requestTimeoutSecs": 120,
+    "askDeadlineSecs": 300,
+    "queryTimeoutSecs": 60,
+    "askTokenBudget": 100000,
+    "clarifications": "answer",
+    "projectionMargin": 1.25
+  },
+  "methodology": {
+    "scoringPolicy": "rdf-term-set-projected-columns-v2",
+    "equalWidthPolicy": "rdf-term-set-global-columns-v1",
+    "clarification": "The evaluator selects an offered choice using the retained gold query. It never supplies an unoffered answer. Both clarification calls contribute to wall time and cost.",
+    "percentiles": "Nearest rank uses the same definition for baseline and candidate. Wall time covers all 107 questions per model.",
+    "timingLimitations": "This is one provider-dependent run. The candidate GCC comment is 16.2.0 against 15.3.0 in the baseline, although Rust, Clang and LLD match. The comparison does not isolate engine latency. Final-query timing covers changing reported-result subsets and is not compared as an engine benchmark.",
+    "costAccounting": "Fresh cost uses new reserve and settle request IDs. Raw report case costs also include historical charges for reused case IDs. The pilot is excluded from both full-run denominators.",
+    "runtimeGoldSeparation": "Gold queries run only in evaluator preflight/scoring and offered-choice selection, not question-time schema grounding.",
+    "officialQaldScore": false
+  },
+  "budget": {
+    "capNanodollars": 50000000000,
+    "beforeSettledNanodollars": 28798618400,
+    "afterSettledNanodollars": 34583357600,
+    "remainingNanodollars": 15416642400,
+    "freshPilotNanodollars": 39705900,
+    "freshFullNanodollars": 5745033300,
+    "freshTotalNanodollars": 5784739200,
+    "firstRequestIdInclusive": 1011,
+    "lastRequestIdExclusive": 1447,
+    "unresolvedNanodollars": 0,
+    "positiveHeldAtBound": [],
+    "guardsUnchanged": true,
+    "freshLedgerReservedMessageRequests": 436
+  },
+  "pilot": {
+    "questions": 10,
+    "selection": "The first 10 questions sorted by SHA256 of the seed ask263-evaluation-sample-v1 followed by NUL and question ID were fixed before new results.",
+    "setSha256": "9ae1199bee2fb2d6426e208458635b9e08c02b563f106d1e79e7a9295ec2f1a9",
+    "correctProjected": 0,
+    "correctEqualWidth": 0,
+    "freshCostNanodollars": 39705900,
+    "reportSha256": "9b433d95cb87f34c363b8b335f7324d2760d62de812b15427cf38c4e36c65f45",
+    "includedInFullDenominator": false
+  },
+  "validation": {
+    "fullCampaignComplete": true,
+    "fullCases": 214,
+    "budgetStopped": false,
+    "binaryUnchangedAfterRun": true,
+    "metadataUnchangedAfterRun": true,
+    "affectedGate": {
+      "workspacePassed": 5529,
+      "preexistingSkipped": 42,
+      "doctests": true,
+      "format": true,
+      "workspaceAllTargetClippy": true,
+      "docPaths": true,
+      "realW3c": true,
+      "realShacl": true,
+      "realShex": true,
+      "plainSpill": true,
+      "encryptedSpill": true,
+      "sourceClean": true
+    },
+    "receiptHashes": {
+      "fullReport": "f3cd3df6dbf279f0ae421734f73fac13d08d06ee2fd81c4bf60205959aa09437",
+      "fullSummary": "3276d5e6e09bb59e45c458f802c0704dafbb59e5c9743c8769c75f6042ef8065",
+      "fullCosts": "c1da966673c7c5468c43957750501b19c3d7a597529acc875bbf6d12c6ea2d50",
+      "pilotCosts": "6474bf53236add29a6364547dda2accbdf92604587199b30a31af2302480b4bc",
+      "offlineGold": "c56faa53cbc2a5d9d6edbf5ff7dd4826cc3fd5b01412f1c0184750af5291b9b0",
+      "goldComparison": "c9989a6a662d43c16e363955d66957135b439b3a1e9a11a0faea02490f9785de",
+      "pairedComparison": "1685497d6aac1bf9619c1953e0e95f10f8c7b54084b5ea9f4d203108707f3aee",
+      "beforeLedgerAudit": "338e74219b27ab4babdd23519156a9985b43edc27a304f87624ef2257b0390aa",
+      "afterLedgerAudit": "d731dde5d38e6f80d343be1ecaf320ae52fbbaddbb3f71c62ddbd885f23a1107"
+    },
+    "caseHashesDigest": "24846e47803bf068c7692e6d8346ec6ef69fab49ff4148265c06cd9177bd2d82",
+    "ledgerRecordedMessageHttpStatuses": {
+      "200": 436
+    },
+    "freeTokenCountPreflights": {
+      "count": 2,
+      "statuses": [
+        200,
+        200
+      ],
+      "excludedFromLedgerReservedMessageCount": true
+    }
+  },
+  "followups": {
+    "quality": 263,
+    "latency": 318
+  },
+  "models": [
+    {
+      "model": "claude-haiku-5-5",
+      "servedModelIds": [
+        "claude-haiku-5-5"
+      ],
+      "metrics": {
+        "questions": 107,
+        "executionAccuracy": {
+          "numerator": 26,
+          "denominator": 107,
+          "value": 0.24299065420560748
+        },
+        "executionAccuracyEqualWidth": {
+          "numerator": 23,
+          "denominator": 107,
+          "value": 0.21495327102803738
+        },
+        "correctByProjection": 3,
+        "endToEndSuccess": {
+          "numerator": 26,
+          "denominator": 107,
+          "value": 0.24299065420560748
+        },
+        "repairRate": {
+          "numerator": 3,
+          "denominator": 107,
+          "value": 0.028037383177570093
+        },
+        "repairConditional": {
+          "numerator": 3,
+          "denominator": 43,
+          "value": 0.06976744186046512
+        },
+        "repairInvoked": {
+          "numerator": 26,
+          "denominator": 107,
+          "value": 0.24299065420560748
+        },
+        "firstDraftUnknown": {
+          "numerator": 41,
+          "denominator": 107,
+          "value": 0.38317757009345793
+        },
+        "firstDraftIncorrect": {
+          "numerator": 43,
+          "denominator": 107,
+          "value": 0.40186915887850466
+        },
+        "clarificationPrecision": {
+          "numerator": 0,
+          "denominator": 84,
+          "value": 0.0
+        },
+        "clarificationsAnswered": {
+          "numerator": 84,
+          "denominator": 107,
+          "value": 0.7850467289719626
+        },
+        "clarificationBasis": {
+          "gold-iri": 46,
+          "gold-words-tie": 28,
+          "first-choice": 7,
+          "gold-words": 3
+        },
+        "correctAfterClarification": 20,
+        "refusalAccuracy": {
+          "numerator": 0,
+          "denominator": 0,
+          "value": null
+        },
+        "macroPrecision": 0.2934711694955484,
+        "macroRecall": 0.31802582229032694,
+        "macroF1": 0.28381089731443016,
+        "microPrecision": {
+          "numerator": 311,
+          "denominator": 1909,
+          "value": 0.16291251964379255
+        },
+        "microRecall": {
+          "numerator": 311,
+          "denominator": 1791,
+          "value": 0.1736460078168621
+        },
+        "askExact": {
+          "numerator": 0,
+          "denominator": 4,
+          "value": 0.0
+        },
+        "byComplexity": {
+          "simple": {
+            "numerator": 0,
+            "denominator": 0,
+            "value": null
+          },
+          "medium": {
+            "numerator": 0,
+            "denominator": 0,
+            "value": null
+          },
+          "complex": {
+            "numerator": 0,
+            "denominator": 0,
+            "value": null
+          }
+        },
+        "repairByComplexity": {
+          "simple": {
+            "numerator": 0,
+            "denominator": 0,
+            "value": null
+          },
+          "medium": {
+            "numerator": 0,
+            "denominator": 0,
+            "value": null
+          },
+          "complex": {
+            "numerator": 0,
+            "denominator": 0,
+            "value": null
+          }
+        },
+        "citationChecks": "unjudged",
+        "cliInputTokens": 2227594,
+        "cliOutputTokens": 129694,
+        "incomplete": false,
+        "unattemptedQuestions": 0,
+        "failureStatuses": {}
+      },
+      "timing": {
+        "wallSecondsIncludingClarification": {
+          "n": 107,
+          "p50": 14.776945368968882,
+          "p95": 29.221914187073708,
+          "mean": 16.89049444093247,
+          "max": 70.5669725619955
+        },
+        "modelMsIncludingClarification": {
+          "n": 107,
+          "p50": 6181,
+          "p95": 17294,
+          "mean": 7503.22429906542,
+          "max": 21690
+        },
+        "pipelineMsIncludingClarification": {
+          "n": 107,
+          "p50": 14406,
+          "p95": 28663,
+          "mean": 16572.850467289718,
+          "max": 70145
+        },
+        "finalQueryElapsedMsReportedSubset": {
+          "n": 59,
+          "p50": 0.3,
+          "p95": 595.979,
+          "mean": 212.27781355932203,
+          "max": 7865.308
+        }
+      },
+      "outcomes": {
+        "answered": 48,
+        "unanswerable": 46,
+        "empty": 11,
+        "failed": 2
+      },
+      "freshCost": {
+        "settledNanodollars": 287631300,
+        "caseNanodollars": 287606400,
+        "preflightNanodollars": 24900,
+        "requests": 191
+      },
+      "baseline": {
+        "executionAccuracy": {
+          "numerator": 16,
+          "denominator": 107,
+          "value": 0.14953271028037382
+        },
+        "executionAccuracyEqualWidth": {
+          "numerator": 13,
+          "denominator": 107,
+          "value": 0.12149532710280374
+        },
+        "wallSecondsIncludingClarification": {
+          "n": 107,
+          "p50": 12.273115353076719,
+          "p95": 29.42091261211317,
+          "mean": 14.395909760015686,
+          "max": 51.78786585002672
+        },
+        "modelMsIncludingClarification": {
+          "n": 107,
+          "p50": 4368,
+          "p95": 14983,
+          "mean": 6027.897196261682,
+          "max": 20069
+        },
+        "pipelineMsIncludingClarification": {
+          "n": 107,
+          "p50": 11842,
+          "p95": 29162,
+          "mean": 14153.271028037383,
+          "max": 51243
+        }
+      },
+      "pairedComparison": {
+        "projected": {
+          "baselineCorrect": 16,
+          "candidateCorrect": 26,
+          "candidateDenominator": 107,
+          "pairedQuestions": 107,
+          "counts": {
+            "bothCorrect": 12,
+            "gained": 14,
+            "lost": 4,
+            "bothWrong": 77
+          },
+          "questionIds": {
+            "bothCorrect": [
+              "qald9p-128",
+              "qald9p-154",
+              "qald9p-160",
+              "qald9p-171",
+              "qald9p-174",
+              "qald9p-175",
+              "qald9p-188",
+              "qald9p-23",
+              "qald9p-45",
+              "qald9p-66",
+              "qald9p-68",
+              "qald9p-99"
+            ],
+            "gained": [
+              "qald9p-101",
+              "qald9p-115",
+              "qald9p-141",
+              "qald9p-143",
+              "qald9p-155",
+              "qald9p-20",
+              "qald9p-26",
+              "qald9p-27",
+              "qald9p-32",
+              "qald9p-40",
+              "qald9p-49",
+              "qald9p-62",
+              "qald9p-73",
+              "qald9p-87"
+            ],
+            "lost": [
+              "qald9p-117",
+              "qald9p-25",
+              "qald9p-52",
+              "qald9p-64"
+            ],
+            "bothWrong": [
+              "qald9p-102",
+              "qald9p-103",
+              "qald9p-104",
+              "qald9p-105",
+              "qald9p-110",
+              "qald9p-111",
+              "qald9p-113",
+              "qald9p-114",
+              "qald9p-120",
+              "qald9p-122",
+              "qald9p-123",
+              "qald9p-124",
+              "qald9p-125",
+              "qald9p-13",
+              "qald9p-131",
+              "qald9p-134",
+              "qald9p-135",
+              "qald9p-136",
+              "qald9p-137",
+              "qald9p-138",
+              "qald9p-139",
+              "qald9p-14",
+              "qald9p-140",
+              "qald9p-145",
+              "qald9p-148",
+              "qald9p-15",
+              "qald9p-150",
+              "qald9p-152",
+              "qald9p-156",
+              "qald9p-157",
+              "qald9p-158",
+              "qald9p-162",
+              "qald9p-163",
+              "qald9p-164",
+              "qald9p-168",
+              "qald9p-169",
+              "qald9p-176",
+              "qald9p-177",
+              "qald9p-178",
+              "qald9p-179",
+              "qald9p-182",
+              "qald9p-183",
+              "qald9p-192",
+              "qald9p-196",
+              "qald9p-197",
+              "qald9p-198",
+              "qald9p-203",
+              "qald9p-209",
+              "qald9p-212",
+              "qald9p-213",
+              "qald9p-214",
+              "qald9p-22",
+              "qald9p-24",
+              "qald9p-29",
+              "qald9p-34",
+              "qald9p-37",
+              "qald9p-4",
+              "qald9p-42",
+              "qald9p-43",
+              "qald9p-44",
+              "qald9p-50",
+              "qald9p-51",
+              "qald9p-56",
+              "qald9p-6",
+              "qald9p-60",
+              "qald9p-63",
+              "qald9p-7",
+              "qald9p-78",
+              "qald9p-79",
+              "qald9p-82",
+              "qald9p-83",
+              "qald9p-84",
+              "qald9p-86",
+              "qald9p-88",
+              "qald9p-92",
+              "qald9p-95",
+              "qald9p-98"
+            ]
+          }
+        },
+        "equalWidth": {
+          "baselineCorrect": 13,
+          "candidateCorrect": 23,
+          "candidateDenominator": 107,
+          "pairedQuestions": 107,
+          "counts": {
+            "bothCorrect": 10,
+            "gained": 13,
+            "lost": 3,
+            "bothWrong": 81
+          },
+          "questionIds": {
+            "bothCorrect": [
+              "qald9p-128",
+              "qald9p-160",
+              "qald9p-171",
+              "qald9p-174",
+              "qald9p-175",
+              "qald9p-188",
+              "qald9p-23",
+              "qald9p-45",
+              "qald9p-68",
+              "qald9p-99"
+            ],
+            "gained": [
+              "qald9p-101",
+              "qald9p-115",
+              "qald9p-141",
+              "qald9p-143",
+              "qald9p-154",
+              "qald9p-155",
+              "qald9p-26",
+              "qald9p-27",
+              "qald9p-32",
+              "qald9p-40",
+              "qald9p-62",
+              "qald9p-66",
+              "qald9p-73"
+            ],
+            "lost": [
+              "qald9p-117",
+              "qald9p-52",
+              "qald9p-64"
+            ],
+            "bothWrong": [
+              "qald9p-102",
+              "qald9p-103",
+              "qald9p-104",
+              "qald9p-105",
+              "qald9p-110",
+              "qald9p-111",
+              "qald9p-113",
+              "qald9p-114",
+              "qald9p-120",
+              "qald9p-122",
+              "qald9p-123",
+              "qald9p-124",
+              "qald9p-125",
+              "qald9p-13",
+              "qald9p-131",
+              "qald9p-134",
+              "qald9p-135",
+              "qald9p-136",
+              "qald9p-137",
+              "qald9p-138",
+              "qald9p-139",
+              "qald9p-14",
+              "qald9p-140",
+              "qald9p-145",
+              "qald9p-148",
+              "qald9p-15",
+              "qald9p-150",
+              "qald9p-152",
+              "qald9p-156",
+              "qald9p-157",
+              "qald9p-158",
+              "qald9p-162",
+              "qald9p-163",
+              "qald9p-164",
+              "qald9p-168",
+              "qald9p-169",
+              "qald9p-176",
+              "qald9p-177",
+              "qald9p-178",
+              "qald9p-179",
+              "qald9p-182",
+              "qald9p-183",
+              "qald9p-192",
+              "qald9p-196",
+              "qald9p-197",
+              "qald9p-198",
+              "qald9p-20",
+              "qald9p-203",
+              "qald9p-209",
+              "qald9p-212",
+              "qald9p-213",
+              "qald9p-214",
+              "qald9p-22",
+              "qald9p-24",
+              "qald9p-25",
+              "qald9p-29",
+              "qald9p-34",
+              "qald9p-37",
+              "qald9p-4",
+              "qald9p-42",
+              "qald9p-43",
+              "qald9p-44",
+              "qald9p-49",
+              "qald9p-50",
+              "qald9p-51",
+              "qald9p-56",
+              "qald9p-6",
+              "qald9p-60",
+              "qald9p-63",
+              "qald9p-7",
+              "qald9p-78",
+              "qald9p-79",
+              "qald9p-82",
+              "qald9p-83",
+              "qald9p-84",
+              "qald9p-86",
+              "qald9p-87",
+              "qald9p-88",
+              "qald9p-92",
+              "qald9p-95",
+              "qald9p-98"
+            ]
+          }
+        }
+      },
+      "wallMedianRatioToBaseline": 1.2040093280199216
+    },
+    {
+      "model": "claude-sonnet-5-5",
+      "servedModelIds": [
+        "claude-sonnet-5-5"
+      ],
+      "metrics": {
+        "questions": 107,
+        "executionAccuracy": {
+          "numerator": 31,
+          "denominator": 107,
+          "value": 0.2897196261682243
+        },
+        "executionAccuracyEqualWidth": {
+          "numerator": 9,
+          "denominator": 107,
+          "value": 0.08411214953271028
+        },
+        "correctByProjection": 22,
+        "endToEndSuccess": {
+          "numerator": 31,
+          "denominator": 107,
+          "value": 0.2897196261682243
+        },
+        "repairRate": {
+          "numerator": 4,
+          "denominator": 107,
+          "value": 0.037383177570093455
+        },
+        "repairConditional": {
+          "numerator": 4,
+          "denominator": 69,
+          "value": 0.057971014492753624
+        },
+        "repairInvoked": {
+          "numerator": 33,
+          "denominator": 107,
+          "value": 0.308411214953271
+        },
+        "firstDraftUnknown": {
+          "numerator": 11,
+          "denominator": 107,
+          "value": 0.102803738317757
+        },
+        "firstDraftIncorrect": {
+          "numerator": 69,
+          "denominator": 107,
+          "value": 0.6448598130841121
+        },
+        "clarificationPrecision": {
+          "numerator": 0,
+          "denominator": 84,
+          "value": 0.0
+        },
+        "clarificationsAnswered": {
+          "numerator": 84,
+          "denominator": 107,
+          "value": 0.7850467289719626
+        },
+        "clarificationBasis": {
+          "gold-iri": 46,
+          "gold-words-tie": 28,
+          "first-choice": 7,
+          "gold-words": 3
+        },
+        "correctAfterClarification": 23,
+        "refusalAccuracy": {
+          "numerator": 0,
+          "denominator": 0,
+          "value": null
+        },
+        "macroPrecision": 0.3860163969985449,
+        "macroRecall": 0.4587063183743622,
+        "macroF1": 0.3879027977741535,
+        "microPrecision": {
+          "numerator": 869,
+          "denominator": 2175,
+          "value": 0.3995402298850575
+        },
+        "microRecall": {
+          "numerator": 869,
+          "denominator": 1791,
+          "value": 0.4852037967615857
+        },
+        "askExact": {
+          "numerator": 1,
+          "denominator": 4,
+          "value": 0.25
+        },
+        "byComplexity": {
+          "simple": {
+            "numerator": 0,
+            "denominator": 0,
+            "value": null
+          },
+          "medium": {
+            "numerator": 0,
+            "denominator": 0,
+            "value": null
+          },
+          "complex": {
+            "numerator": 0,
+            "denominator": 0,
+            "value": null
+          }
+        },
+        "repairByComplexity": {
+          "simple": {
+            "numerator": 0,
+            "denominator": 0,
+            "value": null
+          },
+          "medium": {
+            "numerator": 0,
+            "denominator": 0,
+            "value": null
+          },
+          "complex": {
+            "numerator": 0,
+            "denominator": 0,
+            "value": null
+          }
+        },
+        "citationChecks": "unjudged",
+        "cliInputTokens": 2418837,
+        "cliOutputTokens": 61923,
+        "incomplete": false,
+        "unattemptedQuestions": 0,
+        "failureStatuses": {
+          "invalid_output": 2
+        }
+      },
+      "timing": {
+        "wallSecondsIncludingClarification": {
+          "n": 107,
+          "p50": 14.976526914048009,
+          "p95": 33.87790440302342,
+          "mean": 17.715829089966114,
+          "max": 88.39403886708897
+        },
+        "modelMsIncludingClarification": {
+          "n": 107,
+          "p50": 6369,
+          "p95": 15433,
+          "mean": 7579.682242990654,
+          "max": 18023
+        },
+        "pipelineMsIncludingClarification": {
+          "n": 107,
+          "p50": 14752,
+          "p95": 33438,
+          "mean": 17403.551401869157,
+          "max": 87205
+        },
+        "finalQueryElapsedMsReportedSubset": {
+          "n": 88,
+          "p50": 5.429,
+          "p95": 3571.331,
+          "mean": 950.8219772727273,
+          "max": 20140.319
+        }
+      },
+      "outcomes": {
+        "answered": 72,
+        "unanswerable": 15,
+        "failed": 4,
+        "empty": 16
+      },
+      "freshCost": {
+        "settledNanodollars": 5457402000,
+        "caseNanodollars": 5456904000,
+        "preflightNanodollars": 498000,
+        "requests": 224
+      },
+      "baseline": {
+        "executionAccuracy": {
+          "numerator": 35,
+          "denominator": 107,
+          "value": 0.32710280373831774
+        },
+        "executionAccuracyEqualWidth": {
+          "numerator": 15,
+          "denominator": 107,
+          "value": 0.14018691588785046
+        },
+        "wallSecondsIncludingClarification": {
+          "n": 107,
+          "p50": 12.983138777897693,
+          "p95": 34.01724008412566,
+          "mean": 15.744364630701847,
+          "max": 85.1093041949207
+        },
+        "modelMsIncludingClarification": {
+          "n": 107,
+          "p50": 5837,
+          "p95": 14668,
+          "mean": 7116.8317757009345,
+          "max": 30519
+        },
+        "pipelineMsIncludingClarification": {
+          "n": 107,
+          "p50": 12720,
+          "p95": 33303,
+          "mean": 15506.663551401869,
+          "max": 84911
+        }
+      },
+      "pairedComparison": {
+        "projected": {
+          "baselineCorrect": 35,
+          "candidateCorrect": 31,
+          "candidateDenominator": 107,
+          "pairedQuestions": 107,
+          "counts": {
+            "bothCorrect": 20,
+            "gained": 11,
+            "lost": 15,
+            "bothWrong": 61
+          },
+          "questionIds": {
+            "bothCorrect": [
+              "qald9p-102",
+              "qald9p-110",
+              "qald9p-120",
+              "qald9p-128",
+              "qald9p-160",
+              "qald9p-162",
+              "qald9p-171",
+              "qald9p-174",
+              "qald9p-175",
+              "qald9p-176",
+              "qald9p-188",
+              "qald9p-23",
+              "qald9p-26",
+              "qald9p-32",
+              "qald9p-40",
+              "qald9p-45",
+              "qald9p-6",
+              "qald9p-66",
+              "qald9p-86",
+              "qald9p-99"
+            ],
+            "gained": [
+              "qald9p-115",
+              "qald9p-138",
+              "qald9p-141",
+              "qald9p-155",
+              "qald9p-169",
+              "qald9p-20",
+              "qald9p-27",
+              "qald9p-49",
+              "qald9p-62",
+              "qald9p-73",
+              "qald9p-87"
+            ],
+            "lost": [
+              "qald9p-101",
+              "qald9p-124",
+              "qald9p-134",
+              "qald9p-140",
+              "qald9p-198",
+              "qald9p-22",
+              "qald9p-25",
+              "qald9p-44",
+              "qald9p-50",
+              "qald9p-51",
+              "qald9p-52",
+              "qald9p-64",
+              "qald9p-68",
+              "qald9p-79",
+              "qald9p-88"
+            ],
+            "bothWrong": [
+              "qald9p-103",
+              "qald9p-104",
+              "qald9p-105",
+              "qald9p-111",
+              "qald9p-113",
+              "qald9p-114",
+              "qald9p-117",
+              "qald9p-122",
+              "qald9p-123",
+              "qald9p-125",
+              "qald9p-13",
+              "qald9p-131",
+              "qald9p-135",
+              "qald9p-136",
+              "qald9p-137",
+              "qald9p-139",
+              "qald9p-14",
+              "qald9p-143",
+              "qald9p-145",
+              "qald9p-148",
+              "qald9p-15",
+              "qald9p-150",
+              "qald9p-152",
+              "qald9p-154",
+              "qald9p-156",
+              "qald9p-157",
+              "qald9p-158",
+              "qald9p-163",
+              "qald9p-164",
+              "qald9p-168",
+              "qald9p-177",
+              "qald9p-178",
+              "qald9p-179",
+              "qald9p-182",
+              "qald9p-183",
+              "qald9p-192",
+              "qald9p-196",
+              "qald9p-197",
+              "qald9p-203",
+              "qald9p-209",
+              "qald9p-212",
+              "qald9p-213",
+              "qald9p-214",
+              "qald9p-24",
+              "qald9p-29",
+              "qald9p-34",
+              "qald9p-37",
+              "qald9p-4",
+              "qald9p-42",
+              "qald9p-43",
+              "qald9p-56",
+              "qald9p-60",
+              "qald9p-63",
+              "qald9p-7",
+              "qald9p-78",
+              "qald9p-82",
+              "qald9p-83",
+              "qald9p-84",
+              "qald9p-92",
+              "qald9p-95",
+              "qald9p-98"
+            ]
+          }
+        },
+        "equalWidth": {
+          "baselineCorrect": 15,
+          "candidateCorrect": 9,
+          "candidateDenominator": 107,
+          "pairedQuestions": 107,
+          "counts": {
+            "bothCorrect": 5,
+            "gained": 4,
+            "lost": 10,
+            "bothWrong": 88
+          },
+          "questionIds": {
+            "bothCorrect": [
+              "qald9p-175",
+              "qald9p-188",
+              "qald9p-32",
+              "qald9p-6",
+              "qald9p-99"
+            ],
+            "gained": [
+              "qald9p-115",
+              "qald9p-20",
+              "qald9p-23",
+              "qald9p-73"
+            ],
+            "lost": [
+              "qald9p-101",
+              "qald9p-124",
+              "qald9p-128",
+              "qald9p-140",
+              "qald9p-171",
+              "qald9p-22",
+              "qald9p-26",
+              "qald9p-64",
+              "qald9p-79",
+              "qald9p-88"
+            ],
+            "bothWrong": [
+              "qald9p-102",
+              "qald9p-103",
+              "qald9p-104",
+              "qald9p-105",
+              "qald9p-110",
+              "qald9p-111",
+              "qald9p-113",
+              "qald9p-114",
+              "qald9p-117",
+              "qald9p-120",
+              "qald9p-122",
+              "qald9p-123",
+              "qald9p-125",
+              "qald9p-13",
+              "qald9p-131",
+              "qald9p-134",
+              "qald9p-135",
+              "qald9p-136",
+              "qald9p-137",
+              "qald9p-138",
+              "qald9p-139",
+              "qald9p-14",
+              "qald9p-141",
+              "qald9p-143",
+              "qald9p-145",
+              "qald9p-148",
+              "qald9p-15",
+              "qald9p-150",
+              "qald9p-152",
+              "qald9p-154",
+              "qald9p-155",
+              "qald9p-156",
+              "qald9p-157",
+              "qald9p-158",
+              "qald9p-160",
+              "qald9p-162",
+              "qald9p-163",
+              "qald9p-164",
+              "qald9p-168",
+              "qald9p-169",
+              "qald9p-174",
+              "qald9p-176",
+              "qald9p-177",
+              "qald9p-178",
+              "qald9p-179",
+              "qald9p-182",
+              "qald9p-183",
+              "qald9p-192",
+              "qald9p-196",
+              "qald9p-197",
+              "qald9p-198",
+              "qald9p-203",
+              "qald9p-209",
+              "qald9p-212",
+              "qald9p-213",
+              "qald9p-214",
+              "qald9p-24",
+              "qald9p-25",
+              "qald9p-27",
+              "qald9p-29",
+              "qald9p-34",
+              "qald9p-37",
+              "qald9p-4",
+              "qald9p-40",
+              "qald9p-42",
+              "qald9p-43",
+              "qald9p-44",
+              "qald9p-45",
+              "qald9p-49",
+              "qald9p-50",
+              "qald9p-51",
+              "qald9p-52",
+              "qald9p-56",
+              "qald9p-60",
+              "qald9p-62",
+              "qald9p-63",
+              "qald9p-66",
+              "qald9p-68",
+              "qald9p-7",
+              "qald9p-78",
+              "qald9p-82",
+              "qald9p-83",
+              "qald9p-84",
+              "qald9p-86",
+              "qald9p-87",
+              "qald9p-92",
+              "qald9p-95",
+              "qald9p-98"
+            ]
+          }
+        }
+      },
+      "wallMedianRatioToBaseline": 1.1535366886429521
+    }
+  ]
+}

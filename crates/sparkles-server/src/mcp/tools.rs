@@ -411,6 +411,7 @@ impl Section {
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields, rename_all = "camelCase")]
 struct DescribeSchemaArgs {
+    query: Option<String>,
     dataset: Option<String>,
     section: Option<Section>,
     graph: Option<String>,
@@ -748,6 +749,16 @@ impl Tools<'_> {
     fn describe_schema(&self, args: Map<String, Value>) -> Result<Outcome, ToolError> {
         let a: DescribeSchemaArgs = parse(args)?;
         let section = a.section.unwrap_or(Section::Summary);
+        if let Some(query) = &a.query
+            && (section != Section::Summary
+                || query.trim().is_empty()
+                || query.chars().count() > 2000)
+        {
+            return Err(ToolError::bad_argument(
+                "query is 1 to 2000 characters and applies only to section=summary",
+            ));
+        }
+        let question_words = super::relevance::words(a.query.as_deref().unwrap_or(""));
         let limit = bounded(
             "limit",
             a.limit,
@@ -929,18 +940,32 @@ impl Tools<'_> {
                     .take(25)
                     .map(|r| terms.iri(r))
                     .collect();
-                let mut top_classes = classes.clone();
-                top_classes.sort_by(|a, b| {
-                    b.observed
-                        .instances
-                        .cmp(&a.observed.instances)
+                // Rank all visible entries before truncation. Decorating once avoids
+                // tokenizing every label again at each comparison on large schemas.
+                let score = |iri: &str, labels: &[sparkles::schema::Lit]| {
+                    super::relevance::entry_score(
+                        iri,
+                        labels.iter().map(|l| l.value.as_str()),
+                        &question_words,
+                    )
+                };
+                let mut top_classes: Vec<_> = classes
+                    .iter()
+                    .map(|c| (score(&c.iri, &c.declared.labels), *c))
+                    .collect();
+                top_classes.sort_by(|(sa, a), (sb, b)| {
+                    sb.cmp(sa)
+                        .then_with(|| b.observed.instances.cmp(&a.observed.instances))
                         .then_with(|| a.iri.cmp(&b.iri))
                 });
-                let mut top_preds: Vec<&PredicateEntry> = report.predicates.iter().collect();
-                top_preds.sort_by(|a, b| {
-                    b.observed
-                        .triples
-                        .cmp(&a.observed.triples)
+                let mut top_preds: Vec<_> = report
+                    .predicates
+                    .iter()
+                    .map(|p| (score(&p.iri, &p.declared.labels), p))
+                    .collect();
+                top_preds.sort_by(|(sa, a), (sb, b)| {
+                    sb.cmp(sa)
+                        .then_with(|| b.observed.triples.cmp(&a.observed.triples))
                         .then_with(|| a.iri.cmp(&b.iri))
                 });
                 out["ontology"] = ontology.into();
@@ -948,10 +973,10 @@ impl Tools<'_> {
                 out["classes"] = top_classes
                     .iter()
                     .take(limit)
-                    .map(|c| class_json(c, &mut terms))
+                    .map(|(_, c)| class_json(c, &mut terms))
                     .collect();
                 let mut list = Vec::new();
-                for p in top_preds.iter().take(limit) {
+                for (_, p) in top_preds.iter().take(limit) {
                     list.push(listed(p, &mut terms)?);
                 }
                 out["predicates"] = list.into();

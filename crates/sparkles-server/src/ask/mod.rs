@@ -21,6 +21,7 @@
 mod cli;
 pub mod complexity;
 mod global;
+mod grounding;
 pub mod http;
 #[cfg(test)]
 mod http_tests;
@@ -37,7 +38,7 @@ use crate::mcp::errors::ToolError;
 use crate::mcp::{Call, McpServer, Outcome};
 use crate::models::{Level, Models, Pair, Role, StepError, StepRecord};
 use serde_json::{Map, Value, json};
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeMap;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
@@ -714,14 +715,30 @@ impl Asking<'_, '_> {
         };
         let mut ctx = String::new();
         let mut ground_event = json!({});
-        let q_words = words(&self.o.question);
-        let schema = self
+        // Keep common vocabulary for joins and labels alongside question matches.
+        // Both calls read the caller-visible cached report, never evaluation gold.
+        let common = self
             .tool(
                 "describe_schema",
-                json!({"section": "summary", "limit": 200}),
+                json!({"section":"summary","limit":max_predicates / 2}),
                 false,
             )
             .unwrap_or(Value::Null);
+        let mut schema = self
+            .tool(
+                "describe_schema",
+                json!({"section":"summary","limit":max_predicates,"query":self.o.question}),
+                false,
+            )
+            .unwrap_or(Value::Null);
+        let mut prefixes = schema["prefixes"].as_object().cloned().unwrap_or_default();
+        if let Some(common_prefixes) = common["prefixes"].as_object() {
+            prefixes.extend(common_prefixes.clone());
+        }
+        if schema.is_null() {
+            schema = json!({});
+        }
+        schema["prefixes"] = Value::Object(prefixes);
         if let Some(p) = schema["prefixes"].as_object()
             && !p.is_empty()
         {
@@ -730,21 +747,13 @@ impl Asking<'_, '_> {
                 ctx.push_str(&format!("{k}: <{}>\n", v.as_str().unwrap_or("")));
             }
         }
-        let ranked = |list: &Value, max: usize| -> Vec<Value> {
-            let mut v: Vec<(usize, Value)> = list
-                .as_array()
-                .into_iter()
-                .flatten()
-                .map(|e| (relevance(e, &q_words), e.clone()))
-                .collect();
-            if small {
-                // stable: the size order breaks ties
-                v.sort_by_key(|a| std::cmp::Reverse(a.0));
-            }
-            v.into_iter().take(max).map(|(_, e)| e).collect()
-        };
-        let classes = ranked(&schema["classes"], max_classes);
-        let predicates = ranked(&schema["predicates"], max_predicates);
+        let classes =
+            grounding::balanced_entries(&common["classes"], &schema["classes"], max_classes);
+        let predicates = grounding::balanced_entries(
+            &common["predicates"],
+            &schema["predicates"],
+            max_predicates,
+        );
         if !classes.is_empty() {
             ctx.push_str("\nClasses (IRI, label, instances):\n");
             for c in &classes {
@@ -830,8 +839,21 @@ impl Asking<'_, '_> {
                 for m in &ms {
                     let text = m["text"].as_str().unwrap_or("");
                     let verdict = m["verdict"].as_str().unwrap_or("none");
+                    let mut cands = m["candidates"].as_array().cloned().unwrap_or_default();
+                    if verdict == "ambiguous"
+                        && let Some(index) = grounding::preferred_display_candidate(
+                            text,
+                            &self.o.question,
+                            &cands,
+                            &v["prefixes"],
+                        )
+                    {
+                        // The bounded display is not proof of uniqueness. Reorder
+                        // offered choices without changing the linker's verdict.
+                        let chosen = cands.remove(index);
+                        cands.insert(0, chosen);
+                    }
                     exact |= verdict == "exact";
-                    let cands = m["candidates"].as_array().cloned().unwrap_or_default();
                     if verdict == "ambiguous" && ambiguous.is_none() {
                         ambiguous = Some((text.to_string(), cands.clone()));
                     }
@@ -1719,47 +1741,6 @@ fn expression_calls_service(e: &spargebra::algebra::Expression) -> bool {
         }
         E::Coalesce(list) | E::FunctionCall(_, list) => list.iter().any(expression_calls_service),
     }
-}
-
-/// The lowercase words of `s` of three letters or more, split at camel case, with a
-/// plural `s` removed.
-fn words(s: &str) -> BTreeSet<String> {
-    let mut out = BTreeSet::new();
-    let mut cur = String::new();
-    let mut prev_lower = false;
-    let mut push = |w: &mut String| {
-        if w.chars().count() >= 3 {
-            let mut x = w.to_lowercase();
-            if x.len() > 3 && x.ends_with('s') && !x.ends_with("ss") {
-                x.pop();
-            }
-            out.insert(x);
-        }
-        w.clear();
-    };
-    for c in s.chars() {
-        if c.is_alphanumeric() {
-            if c.is_uppercase() && prev_lower {
-                push(&mut cur);
-            }
-            prev_lower = c.is_lowercase();
-            cur.push(c);
-        } else {
-            push(&mut cur);
-            prev_lower = false;
-        }
-    }
-    push(&mut cur);
-    out
-}
-
-/// How many words of the question a schema entry's label or local name shares.
-fn relevance(e: &Value, q: &BTreeSet<String>) -> usize {
-    let iri = e["iri"].as_str().unwrap_or("");
-    let local = iri.rsplit(['#', '/', ':']).next().unwrap_or(iri);
-    let mut w = words(local);
-    w.extend(words(e["label"].as_str().unwrap_or("")));
-    w.intersection(q).count()
 }
 
 /// The names a question mentions: quoted strings and runs of capitalized words, with
