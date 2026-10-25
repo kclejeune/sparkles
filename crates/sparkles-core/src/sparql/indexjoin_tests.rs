@@ -222,7 +222,16 @@ fn forced(
 ) -> QueryResult {
     FORCE_INDEX_JOIN.with(|f| f.set(true));
     FORCE_WALK.with(|f| f.set(walk));
-    let r = run(snap, q, opt);
+    // Keep the physical join this helper forces. The cost-selected branch still
+    // compares all optimizations, including point-pattern elimination.
+    let r = run(
+        snap,
+        q,
+        Optimizations {
+            point_patterns: false,
+            ..opt
+        },
+    );
     FORCE_INDEX_JOIN.with(|f| f.set(false));
     FORCE_WALK.with(|f| f.set(None));
     r
