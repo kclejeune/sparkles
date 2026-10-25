@@ -4,6 +4,10 @@
 
 ### Changed
 
+Rust query callback bookkeeping remains available while thread-local owners are
+destroyed. Late snapshots and callbacks retain the existing family and captured-view
+checks, including sticky failures for a transaction retained by an earlier owner.
+
 Dropping the last dataset handle now waits for its incremental views worker to
 release the store before returning. Worker acquisition and shutdown are synchronized,
 so a temporary host reference cannot leave the dataset directory locked after close.

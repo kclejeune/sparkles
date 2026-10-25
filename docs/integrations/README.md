@@ -7,7 +7,8 @@ each stated scope.
 ## Libraries and bindings
 
 The engine is a Rust library, and the Python, JVM and Node.js packages embed the same
-engine in process.
+engine in process. Thread destruction preserves query callback family checks and
+the visibility limits of captured callback views.
 
 * The embedded Rust API is `sparkles::Dataset`, with a fluent query builder in
   `sparkles::querybuilder` ([USAGE.md](../USAGE.md#embedding-the-library),
@@ -57,9 +58,6 @@ dependencies are recorded in the [central roadmap](../ROADMAP.md).
   no Windows or Intel macOS packages, and Linux is the platform tested locally. The JVM
   library has no musl build. Roadmap item 58.
 * JVM functions registered in Java run through ARQ. Roadmap item 25.
-* Taking a store snapshot from a thread-local destructor can abort if callback-family
-  tracking has already been destroyed. Roadmap item 25 covers keeping those checks
-  available during thread destruction.
 
 ## Configuration and usage
 
