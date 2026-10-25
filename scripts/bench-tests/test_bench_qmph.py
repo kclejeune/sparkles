@@ -117,7 +117,7 @@ class QmphTests(unittest.TestCase):
         self.assertEqual(d["a"]["1"]["status"], "ok")
         self.assertEqual(d["a"]["4"]["status"], "ok")
         self.assertEqual(d["c"]["1"]["status"], "ok")
-        self.assertEqual(d["b"]["1"]["status"], "wrong-answer")
+        self.assertEqual(d["b"]["1"]["status"], "answer-disagreement")
         self.assertEqual(d["b"]["1"]["disagreeing_queries"], ["2"])
 
     def test_check_skips_the_named_queries(self):
@@ -158,7 +158,7 @@ class QmphTests(unittest.TestCase):
         self.add("b", 1, {"1": 5.0})
         self.add("c", 1, {"1": 0.0})
         self.run_qmph("--check", self.out)
-        self.assertEqual(self.result()["c"]["1"]["status"], "wrong-answer")
+        self.assertEqual(self.result()["c"]["1"]["status"], "answer-disagreement")
         self.add("a", 1, {"1": 0.0})
         self.add("b", 1, {"1": 0.0})
         self.run_qmph("--check", self.out)
@@ -174,7 +174,7 @@ class QmphTests(unittest.TestCase):
         self.run_qmph("--check", self.out)
         d = self.result()
         for clients in ("1", "4", "16"):
-            self.assertEqual(d["A"][clients]["status"], "wrong-answer")
+            self.assertEqual(d["A"][clients]["status"], "answer-disagreement")
         self.assertEqual(d["B"]["1"]["status"], "ok")
         self.assertEqual(d["C"]["1"]["status"], "ok")
 
@@ -205,7 +205,7 @@ class QmphTests(unittest.TestCase):
         d = self.result()
         for e in ("a", "b", "c"):
             self.assertEqual((d[e]["1"]["status"], d[e]["4"]["status"]), ("ok", "ok"))
-        self.assertEqual(d["d"]["1"]["status"], "wrong-answer")
+        self.assertEqual(d["d"]["1"]["status"], "answer-disagreement")
         self.assertEqual(d["d"]["1"]["disagreeing_queries"], ["8"])
 
     def test_overlapping_equally_supported_values_leave_the_query_undecided(self):
@@ -222,7 +222,7 @@ class QmphTests(unittest.TestCase):
         self.add("a", 16, {"1": 0.0})
         self.run_qmph("--check", self.out)
         d = self.result()["a"]
-        self.assertEqual(d["16"]["status"], "wrong-answer")
+        self.assertEqual(d["16"]["status"], "answer-disagreement")
         self.assertEqual(d["1"]["status"], "ok")
 
 

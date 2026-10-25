@@ -14,6 +14,8 @@ from the page cache, and the time to ready), `churn.json` (the commits of the up
 mode) and `mixed.json` (reads and writes of the mixed mode). Engines whose answer differs
 from the majority are footnoted and not ranked. The best value of each row is bold.
 """
+import importlib.util
+from pathlib import Path
 import json, os, statistics, sys
 d, names = sys.argv[1], sys.argv[2:]
 ORDER = ["sparkles", "jena-fuseki", "qlever", "fluree", "oxigraph"]
@@ -62,6 +64,15 @@ lr = load(f"{d}/load.json")
 if lr:
     row("**load** (s)", {c: lr[LOADNAME.get(c, c)] for c in cmds if LOADNAME.get(c, c) in lr}, f=lambda r: f"{r['mean']:.2f}")
 answers = json.load(open(f"{d}/answers.json")) if os.path.exists(f"{d}/answers.json") else {}
+verified = {}
+if os.path.exists(f"{d}/answer-validation.json"):
+    spec = importlib.util.spec_from_file_location("record", Path(__file__).with_name("bench-record.py"))
+    record = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(record)
+    manifest = json.load(open(f"{d}/manifest.json"))
+    validation = json.load(open(f"{d}/answer-validation.json"))
+    hashes = [v.get("sha256") for v in manifest.get("data", {}).values()]
+    verified = record.fingerprints(answers, validation, hashes)
 rows = json.load(open(f"{d}/rows.json")) if os.path.exists(f"{d}/rows.json") else {}
 notes = []
 for n in names:
@@ -76,15 +87,23 @@ for n in names:
         wrong = {c for c, v in by_value.items() if ref is not None and v != ref}
         # no majority (two engines that differ, or a tie): none is ranked
         split = set(by_value) if ref is None and len(set(by_value.values())) > 1 else set()
+        for c in ok:
+            verdict = verified.get((n, {"jena-fuseki": "jena", "jena-tdb2": "jena"}.get(c, c))) if verified else None
+            if verdict and verdict.get("verification", {}).get("method") == "data-oracle":
+                wrong.discard(c)
+                split.discard(c)
+                if verdict["agrees"] is False:
+                    wrong.add(c)
+                notes.append(f"`{n}`: {c} {'passed' if verdict['agrees'] else 'failed'} the independent data oracle")
         # same values but different RDF terms (lexical forms): footnoted, still ranked
-        same = {c: v["exact"] for c, v in ok.items() if c not in wrong and "exact" in v}
+        same = {c: v["exact"] for c, v in ok.items() if c not in wrong and by_value[c] == ref and "exact" in v}
         eref = majority(same)
         lexical = {c for c, v in same.items() if eref is not None and v != eref}
         mark = {c: " †" for c in wrong | split} | {c: " ‡" for c in lexical}
         row(n, rs, bad, err="error", mark=mark, unranked=wrong | split)
         if split:
             notes.append(f"† `{n}`: the answers differ and no answer has a majority (" + ", ".join(f"{c} {an[c]['rows']} rows" for c in sorted(split)) + "); not ranked")
-        notes += [f"† `{n}`: {c} returned a different answer ({an[c]['rows']} rows) than the majority; not ranked" for c in sorted(wrong)]
+        notes += [f"† `{n}`: {c} returned a different answer ({an[c]['rows']} rows) than the majority; not ranked" for c in sorted(wrong) if not verified.get((n, {"jena-fuseki": "jena", "jena-tdb2": "jena"}.get(c, c)), {}).get("verification")]
         notes += [f"‡ `{n}`: {c} returned equal values as different RDF terms (numeric datatype or lexical form)" for c in sorted(lexical)]
     else:
         # older runs recorded row counts only

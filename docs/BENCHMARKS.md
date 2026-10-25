@@ -857,7 +857,7 @@ pooled median of thirty HTTP samples, after two warm-up requests per instance, e
 `q5`'s paired Sparkles, QLever and Fluree cells, which pool ninety samples after ten
 warm-ups per instance. DESCRIBE
 answers are not compared because SPARQL leaves their contents to the engine. A dagger
-marks a wrong answer, whose latency is not ranked.
+marks an unresolved answer disagreement, whose latency is not ranked.
 `SPARKLES_ALLOW_GPL_BENCHMARK=1 mise run bench:bsbm 10m` reproduces the run.
 
 | Template, median ms | Sparkles | Jena | QLever | Fluree | Oxigraph |
@@ -879,7 +879,10 @@ marks a wrong answer, whose latency is not ranked.
 at `2ec8a266`. The [Explore record](benchmarks/2026-10-23-bsbm-10m-explore-forge.json)
 keeps the other cells, measured with Sparkles at `6699f27d`, and the driver status.*
 
-Fluree returned different answers for q8, q11 and q12. QLever differed on q12. The
+Direct checks against the generated triples independently confirm Sparkles' answers to
+all three instances of q8, q11 and q12. The checks reconstruct the selected reviews,
+product offers and CONSTRUCT triples without a SPARQL engine. Fluree's retained value
+fingerprints differ on those nine instances. QLever differs on q12. The
 q9 row is a DESCRIBE whose answers are not compared, so it is not ranked.
 Sparkles has the lower pooled q5 median in both paired passes. The closest instance
 takes a mean of 4.58 ms against Fluree's 4.76 ms, within 4%. Oxigraph was fastest on
@@ -921,8 +924,8 @@ the run.
 | q3 | 35.18 | 1,733.90 | **28.45** | 287.78 † | 3,287.87 |
 | q4 | **152.80** | 8,452.57 | 1,848.57 | 162.22 | 6,868.73 |
 | q5 | **27.32** | 198.17 | 98.63 | 693.70 | 138.93 |
-| q6 | **16.50** | 23.72 | 67.88 † | 338.27 † | 28.77 |
-| q7 | **52.62** | 74.60 | 59.38 | 210.01 † | timeout |
+| q6 | **16.50** | 23.72 | 67.88 | 338.27 | 28.77 |
+| q7 | **52.62** | 74.60 | 59.38 | 210.01 | timeout |
 | q8 | **35.04** | 121.75 | 68.09 † | 202.66 † | 184.04 |
 
 *The paired `q2` cells for Sparkles, QLever and Fluree come from the
@@ -938,21 +941,29 @@ floats. `scripts/bench-bsbm/bi-float-oracle.py` computes the exact mean of the
 float-rounded prices of every q4 and q5 instance from the data and accepts a value
 within the error bound of a float summation in any order. All five engines' q4 and q5
 answers pass it, with the same rows, counts and IRIs. Sparkles, Jena and Oxigraph return
-`xsd:float`, QLever `xsd:decimal` and Fluree `xsd:double`. On the other templates,
-Sparkles' answers agree with Jena's on every instance, with QLever's on all but q6 and
-two q8 instances, and with Oxigraph's except on q7. There Oxigraph timed out on one
-instance, and on another Oxigraph and Fluree return 79 rows where Sparkles, QLever and
-Jena return 81. Fluree differs from the others on q2, q3, q6, q7 and q8.
+`xsd:float`, QLever `xsd:decimal` and Fluree `xsd:double`.
+
+`scripts/bench-bsbm/bi-answer-oracle.py` independently computes q6 reviewer scores and
+its HAVING threshold from the same data. All five engines' three q6 captures pass the
+binary32 error bounds. This establishes numeric equivalence for the comparison, rather
+than identical RDF datatypes. The same tool checks every successful retained q7 capture
+against the offer counts and country exclusions. The inner LIMIT orders only by offer
+count. On the third instance 41 products tie for its last 21 places, and the outer
+country filter permits 75 to 85 rows. The 81-row Sparkles, Jena and QLever answers and
+the 79-row Fluree and Oxigraph answers are all valid. The checked Fluree captures total
+80 rows across the three instances. They replace an unavailable 77-row fingerprint in
+the record without changing any timing sample.
 
 The paired q2 answers also pass an independent streamed data oracle for Product
 membership, common-feature counts, anchor exclusion and the complete ordered top ten.
 Its pooled fingerprint matches the published Sparkles answer pool. Fluree's q2 pool
 differs from that independently verified result, and remains unranked.
 
-Sparkles has the lowest median on q1, q2 and q4 to q8. Its q4 lead over Fluree is within
-10%. QLever remains 1.24 times faster on q3, where its answers agree
-with Sparkles'. QLever's q6 answers and two of its three q8 answers differ from the
-majority, so those cells carry a dagger.
+Fluree's q3 and q8 answers and two QLever q8 answers remain unresolved fingerprint
+disagreements. The q3 and q8 exclusions have no independent data oracle. Sparkles has
+the lowest median on q1, q2 and q4 to q8. Its q4 lead over Fluree is within 10%.
+QLever remains 1.24 times faster on q3, where its answers agree with Sparkles'. Its two
+q8 instances whose answers differ from the majority carry a dagger.
 
 The driver uses generated parameters beyond the three fixed instances. It requested
 fifty warm-up mixes and five hundred measured mixes at each client count, with a
@@ -974,7 +985,7 @@ with a peak resident size of 282 MB under the default pool, where eager executio
 it. QLever's driver failed with a refused connection at one client and HTTP 500 at four and
 sixteen clients. Jena and Oxigraph timed out at every client count. Fluree alone completed
 two driver cells, but their result-count check has no successful competing engine to
-compare, and its fixed q2, q3, q6, q7 and q8 answers disagree, so its QMpH figures are not
+compare, and its fixed q2, q3 and q8 answers have unresolved disagreements, so its QMpH figures are not
 ranked.
 
 ## Full-text search
@@ -2900,7 +2911,10 @@ file, medians of 3 runs:
 before timing and fingerprints it by the row count, by the solution multiset under RDF
 term identity, and by the same multiset with numbers compared by value to 12 significant
 digits. An engine whose answer differs in value from the majority is marked † and not
-ranked. A ‡ marks equal values returned as different RDF terms. `export-500k` uses LIMIT
+ranked unless an independent data oracle accepts the difference. A majority is a screening
+rule, not proof that its answer is correct. Unresolved disagreements remain excluded,
+including the full DBpedia births-by-decade counts of 165 and 171, which have no retained
+independent data check. A ‡ marks equal values returned as different RDF terms. `export-500k` uses LIMIT
 without ORDER BY, so only its row count is checked.
 
 ### Engine failures

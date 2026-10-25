@@ -37,9 +37,9 @@ name in `answers.json`, which gives a query that was only answer-checked its ans
 `validate` checks a record against the shape below and exits with status 1 on the first
 file that does not conform.
 
-Record 1 (every field is required unless marked optional):
+Record 3 (every field is required unless marked optional):
 
-    record      2 for every new record (1 is still read, without the mode longrun); other versions are refused
+    record      3 for new records; versions 1 and 2 are still read, and unknown versions are refused
     suite       string, for example "bsbm-explore"
     scale       string, for example "10m"
     manifest    object (see `manifest`)
@@ -53,7 +53,7 @@ Record 1 (every field is required unless marked optional):
                      whose write result carries the per-minute `series`)
         clients      integer
         durability   synced | written | memory | null
-        status       ok | timeout | error | oom | wrong-answer
+        status       ok | timeout | error | oom | answer-disagreement | wrong-answer
         samples_ms   list of numbers (optional for throughput results)
         median_ms    number or null
         p95_ms       number or null
@@ -77,10 +77,10 @@ import statistics
 import subprocess
 import sys
 
-# Every new record is version 2, which added the mode `longrun` and its fields, so a checkout
-# that knows only version 1 refuses it. Version 1 records are still read (docs/specs/X06 section 7).
-RECORD = 2
-KNOWN_RECORDS = (1, 2)
+# Version 3 distinguishes unresolved answer disagreements from failed data oracles.
+# Versions 1 and 2 remain readable; older tools refuse the new version cleanly.
+RECORD = 3
+KNOWN_RECORDS = (1, 2, 3)
 ENGINE_NAMES = {"jena-fuseki": "jena", "jena-tdb2": "jena"}
 LICENSES = {
     "sparkles": "the repository's",
@@ -91,9 +91,9 @@ LICENSES = {
 }
 # written (OS cache), synced or memory: docs/specs/X06 §5.1, from each engine's documentation
 DURABILITY = {"sparkles": "synced", "jena": "synced", "oxigraph": "written", "qlever": "memory", "fluree": "synced"}
-STATUSES = {"ok", "timeout", "error", "oom", "wrong-answer"}
+STATUSES = {"ok", "timeout", "error", "oom", "answer-disagreement", "wrong-answer"}
 MODES = {"warm", "cold", "update", "throughput", "qmph", "load", "answer", "longrun"}
-AUX = {"load", "load-details", "answers", "mem", "rss", "rss-probe", "churn", "mixed", "cold", "cold-runs",
+AUX = {"load", "load-details", "answers", "answer-validation", "mem", "rss", "rss-probe", "churn", "mixed", "cold", "cold-runs",
        "qmph", "extra", "manifest", "record", "update-latency", "inference", "longwrite", "restarts"}
 CURL_TIMEOUT = 28
 MAX_TIME_S = None  # the harness's request limit in seconds, set by `build --max-time`
@@ -255,9 +255,11 @@ def load_json(d, name):
     return json.load(open(p)) if os.path.exists(p) else None
 
 
-def fingerprints(answers):
+def fingerprints(answers, validation=None, source_hashes=()):
     """Per query and engine: (rows, hash, agrees). Agreement is with the majority of the engines
-    that answered, on the digest by value; None when there is no majority."""
+    that answered, on the digest by value; None when there is no majority. A bound data oracle overrides this screen."""
+    if validation is not None and validation.get("version") != 1:
+        raise ValueError("unknown answer-validation version")
     out = {}
     for q, per in (answers or {}).items():
         # The DESCRIBE sentinel records an intentionally skipped comparison. It
@@ -282,11 +284,27 @@ def fingerprints(answers):
             else:
                 agrees = None if ref is None or len(vals) == 1 else digest[e] == ref
                 out[q, en] = {"rows": v["rows"], "hash": digest[e], "agrees": agrees}
+                verdict = ((validation or {}).get("queries", {}).get(q) or {}).get(e)
+                if verdict is not None:
+                    matched = verdict.get("fingerprint", {})
+                    policy = ("binary32-summation-equivalence" if q.startswith("bi-q6-") else
+                              "legal-inner-limit-ties" if q.startswith("bi-q7-") else None)
+                    if ((validation or {}).get("source_sha256") not in source_hashes
+                            or not v.get("query_sha256")
+                            or verdict.get("query_sha256") != v["query_sha256"]
+                            or any(matched.get(k) != v.get(k) for k in ("rows", "exact", "value", "order"))
+                            or verdict.get("status") not in {"ok", "disagrees"}
+                            or policy is None or verdict.get("policy") != policy):
+                        raise ValueError(f"stale or invalid data-oracle verdict for {q}/{e}")
+                    out[q, en]["agrees"] = verdict["status"] == "ok"
+                    out[q, en]["verification"] = {"method": "data-oracle", "policy": verdict["policy"],
+                        "source_sha256": validation["source_sha256"], "query_sha256": verdict["query_sha256"]}
     return out
 
 
 def status_of(codes, samples_s, answer):
-    """ok, timeout, error or wrong-answer. A failed run is a timeout when curl gave up (exit 28)
+    """Distinguish a failed oracle from an unresolved fingerprint disagreement.
+    A failed run is a timeout when curl gave up (exit 28)
     or when it took as long as the harness's request limit (--max-time), which is how a server's
     own timeout shows, since it answers with an HTTP error."""
     failed = [(c, t) for c, t in zip(codes or [], samples_s) if c != 0]
@@ -296,7 +314,7 @@ def status_of(codes, samples_s, answer):
             return "timeout"
         return "error"
     if answer is not None and answer["agrees"] is False:
-        return "wrong-answer"
+        return "wrong-answer" if answer.get("verification", {}).get("method") == "data-oracle" else "answer-disagreement"
     return "ok"
 
 
@@ -333,7 +351,7 @@ def pool(results):
     """Results of the instances `<template>-<i>` of one template, as one result per template: the
     samples of all instances together, the worst status, and one answer for the whole template, whose
     hash covers each instance's name and hash, so a change in which instance gives which answer shows."""
-    order = {"ok": 0, "wrong-answer": 1, "timeout": 2, "oom": 3, "error": 4}
+    order = {"ok": 0, "answer-disagreement": 1, "wrong-answer": 2, "timeout": 3, "oom": 4, "error": 5}
     groups, out = {}, []
     for r in results:
         m = re.fullmatch(r"(.+)-(\d+)", r["query"])
@@ -352,6 +370,9 @@ def pool(results):
             text = "\n".join(f"{name}\t{a['hash']}" for _, name, a in pairs)
             h = hashlib.sha256(text.encode()).hexdigest()[:16]
             answer = {"rows": sum(x["rows"] for x in answers), "hash": h, "agrees": agrees, "instances": len(rs)}
+            if all(x.get("verification", {}).get("method") == "data-oracle" for x in answers):
+                answer["verification"] = {"method": "data-oracle",
+                    "instances": {name: a["verification"] for _, name, a in pairs}}
         out.append({
             "engine": engine, "query": template, "mode": mode, "clients": clients,
             "durability": None, "samples_ms": samples,
@@ -409,7 +430,8 @@ def cmd_build(a):
     d = a.results
     man = json.load(open(a.manifest)) if a.manifest else {}
     answers = load_json(d, "answers.json")
-    fps = fingerprints(answers)
+    source_hashes = {v.get("sha256") for v in man.get("data", {}).values() if v.get("sha256")}
+    fps = fingerprints(answers, load_json(d, "answer-validation.json"), source_hashes)
     names = a.queries if a.queries is not None else sorted({f[:-5] for f in os.listdir(d)
                                  if f.endswith(".json") and f[:-5] not in AUX and not f.startswith("throughput")
                                  and not f.startswith("run-") and not f.startswith("qmph-")
@@ -425,7 +447,7 @@ def cmd_build(a):
             if (en, q) in timed:
                 continue
             fp = fps.get((q, en))
-            st = "error" if v.get("rows") == "error" else "wrong-answer" if fp and fp["agrees"] is False else "ok"
+            st = "error" if v.get("rows") == "error" else status_of([], [], fp)
             results.append({"engine": en, "query": q, "mode": "answer", "clients": 1, "durability": None,
                             "samples_ms": [], "median_ms": None, "p95_ms": None, "answer": fp, "status": st})
     results += hyperfine_results(d, "update-latency", "update", fps)

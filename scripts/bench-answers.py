@@ -670,6 +670,7 @@ def main():
                                     lambda text: json.loads(fetch(request(text), max_time)))
     except Exception as e:  # noqa: BLE001 - any failure is recorded, not raised
         rec = {"rows": "error", "error": str(e)[:200]}
+    rec["query_sha256"] = hashlib.sha256(query.encode()).hexdigest()
     d = {}
     if os.path.exists(out):
         with open(out) as f:

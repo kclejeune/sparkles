@@ -339,8 +339,8 @@ Sparkles is never run with synchronization off for a published table.
 - No engine-specific rewriting that changes the algorithm, such as adding a hint that
   only one engine understands, unless every engine gets its own equivalent hint.
 - Answers are checked first with `scripts/bench-answers.py`. An engine whose answer
-  differs from the majority is marked and not ranked, as today. For suites with
-  reference answers, the reference is the majority.
+  differs from the majority is marked and not ranked, as today. A majority mismatch is an unresolved disagreement, not a correctness oracle. Independent
+  data oracles take precedence when they accept a legal answer difference.
 
 ### 5.5 Failures and timeouts
 
@@ -397,7 +397,7 @@ Every suite writes one JSON file per run in the same shape, which
 }
 ```
 
-`status` is `ok`, `timeout`, `error`, `oom` or `wrong-answer`. Throughput results use
+`status` is `ok`, `timeout`, `error`, `oom`, `answer-disagreement` or `wrong-answer`. Throughput results use
 `qps` or `qmph` in place of the sample list. Long runs (§3.9) write a time series as
 `series` with one entry per minute.
 
@@ -624,7 +624,7 @@ numbers and the memory readings, and the LUBM record carries the materialization
 under `inference`. `build --pool-instances` merges query instances named `<template>-<i>`
 into one result per template, with the samples pooled. The agreement of an answer is judged
 against the majority of the engines that answered, as in `bench-summary.py`, and a result
-that disagrees is recorded as `wrong-answer`. An intentionally unchecked DESCRIBE answer has
+that disagrees is recorded as `answer-disagreement` unless an independent data oracle applies. An intentionally unchecked DESCRIBE answer has
 no fingerprint in the record and does not vote for the majority. The collector no
 longer treats matching unchecked markers as proof of agreement. The durability class of §5.1 is filled in for
 update results only, and no suite has a long write run yet.
@@ -1292,3 +1292,20 @@ the same answers for every query. It passed the regression threshold while accep
 small increases for `class-predicates`, `exists-join` and `two-hop-count`. These effects
 remain unconfirmed on Intel. Roadmap item 299 tracks matched Intel checks and a fix for
 any confirmed cost. The screen does not establish current parity with other engines.
+
+### Independent BSBM answer checks
+
+The correctness audit added a source-data oracle for BI q6 and q7 and record version 3.
+The recorder binds each verdict to the dataset digest, query digest and captured answer
+fingerprints. It preserves different fingerprints for equivalent numeric scores and legal
+LIMIT ties. BI q6 captures from all five engines pass the numeric bounds, and every
+successful retained q7 capture is a legal tied selection. The retained Fluree q7 capture
+has 80 pooled rows and replaces an unavailable 77-row fingerprint. Timing samples are
+unchanged. New unresolved majority mismatches use `answer-disagreement`, while a failed
+independent oracle uses `wrong-answer`. Readers retain support for versions 1 and 2 and
+refuse unknown versions.
+
+A separate direct check confirmed Sparkles' three fixed instances each of Explore q8,
+q11 and q12 against the generated triples. BI q2 also passed a direct feature-intersection
+oracle. BI q3 and q8 and the full DBpedia births-by-decade disagreement still lack direct
+data-oracle checks. No minority engine's semantic error follows from a majority alone.

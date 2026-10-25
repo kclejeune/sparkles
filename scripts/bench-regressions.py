@@ -53,8 +53,8 @@ def compare_main(argv):
         with open(f) as fh:
             rec = json.load(fh)
         # the record versions of scripts/bench-record.py that this comparison understands
-        if rec.get('record') not in (1, 2):
-            print(f'{f}: record version {rec.get("record")!r} is not one this tool knows (1, 2)', file=sys.stderr)
+        if rec.get('record') not in (1, 2, 3):
+            print(f'{f}: record version {rec.get("record")!r} is not one this tool knows (1, 2, 3)', file=sys.stderr)
             return 2
         recs.append(rec)
 
