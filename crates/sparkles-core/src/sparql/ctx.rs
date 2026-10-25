@@ -557,7 +557,7 @@ pub struct Ctx {
     /// [`Ctx::calls_algorithm`])
     algorithmic: AtomicBool,
     /// The whole eager ASK was admitted as a bounded pure UNION. Only that
-    /// consumer may reduce projection demand below the ordinary prefix policy.
+    /// consumer may reduce pure input demand below the ordinary prefix policy.
     pub(super) eager_union_demand: AtomicBool,
     /// The plan of the operator that failed, as far as it ran, keyed by the address of
     /// its node, until its parent takes it (see [`Ctx::take_failed`]). Execution state:

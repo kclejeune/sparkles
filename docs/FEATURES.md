@@ -394,10 +394,10 @@ check them against the W3C suites and Jena's own answers.
   FILTER scope, and it keeps the ordinary plan when that plan is estimated to be cheaper.
   This avoids enumerating unrelated coauthor walks in SP²Bench `q8` and `q12b`.
 * Eager ASK execution can visit a pure UNION branch with lower estimated work before
-  its first answer. The whole ASK must pass a bounded whitelist before projections
-  request only the rows the limit needs. Expression calls, EXISTS and external effects
-  retain their ordinary order and demand policy. Reordering requires an unchanged
-  snapshot, no total produced-row cap, and conservative output bounds that fit its
+  its first answer. On an unchanged snapshot without a total produced-row cap, a
+  bounded whitelist of the whole ASK lets pure input operators request only the rows
+  the limit needs. Expression calls, EXISTS and external effects retain their ordinary
+  order and demand policy. Reordering also requires conservative output bounds that fit its
   row and memory budgets. Joins through index probes retain their order because their
   duplicate-key fanout lacks such a bound. Explicit streaming keeps its policy.
 * An OPTIONAL whose sides share no variable, but whose condition contains `?a = ?b` with

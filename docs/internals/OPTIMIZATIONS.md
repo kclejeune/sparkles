@@ -304,17 +304,18 @@ Each of these can be switched off per query (`QueryOptions::optimizations`) or p
   unfiltered scan uses its requested prefix. VALUES, filters, sorts and probes retain
   their full costs, and joins include the input eager execution builds in full.
   Nested UNION estimates include later operands until they meet the remaining demand.
-  The whole ASK must pass the whitelist before projections pass the limited demand directly
-  instead of requesting at least 64 rows. SELECT and effectful consumers retain their
-  order and demand policy. Explicit streaming uses its existing operators.
-  Branch order changes only on an unchanged snapshot without a total produced-row cap.
-  Covering block counts bound scan rows before graph filtering. Join bounds use the
-  product of their inputs, including compatible UNDEF keys, and UNION bounds sum their
-  operands. Bounds must fit the per-table row and memory budgets. Index probes retain
-  their original order because cheap metadata does not bound duplicate-key fanout. Geometric prefix retries can exceed a
-  sum of full-plan rows, so finite produced-row caps retain the original operand order.
-  Pure projection admission is independent, so reducing excess demand can still avoid
-  unnecessary work.
+  On an unchanged snapshot without a total produced-row cap, the whole ASK must pass
+  the whitelist before pure projections, filters, constant bindings, index joins and
+  the limited side of joins pass the requested demand instead of at least 64 rows.
+  SELECT and effectful consumers retain their order and demand policy. Explicit
+  streaming uses its existing operators. A finite produced-row cap keeps the original
+  prefixes, since geometric retries can exceed a sum of full-plan rows.
+  Branch order changes only when conservative output bounds fit the row and memory
+  budgets. Covering block counts bound scan rows before graph filtering. Join bounds
+  use the product of their inputs, including compatible UNDEF keys, and UNION bounds
+  sum their operands. Index probes retain their original order because cheap metadata
+  does not bound duplicate-key fanout. Pure demand admission is independent, so reducing
+  excess demand can still avoid unnecessary work.
 * A pattern with one free variable and at most four estimated rows is eligible for
   `point_patterns`. The planner reads at most two rows and substitutes a constant only
   when exactly one row exists in the query snapshot. It restores the variable in the

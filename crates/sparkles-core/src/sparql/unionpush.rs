@@ -70,11 +70,18 @@ fn pure_union(ctx: &super::ctx::Ctx, node: &Node) -> bool {
         && plain(node, &mut 128, &mut 256)
 }
 
-/// Only a wholly admitted pure ASK may reduce projection demand. Subtree purity
+/// Only a wholly admitted pure ASK may reduce input demand. Subtree purity
 /// alone cannot rule out an effectful consumer outside that subtree.
-pub(super) fn limited_projection(ctx: &super::ctx::Ctx, node: &Node) -> bool {
+pub(super) fn limited_input(ctx: &super::ctx::Ctx, node: &Node) -> bool {
     !ctx.is_cursor()
-        && matches!(node.kind, Kind::Project(_))
+        && matches!(
+            node.kind,
+            Kind::Project(_)
+                | Kind::Filter(_)
+                | Kind::Extend(..)
+                | Kind::IndexJoin(_)
+                | Kind::Join { .. }
+        )
         && ctx
             .eager_union_demand
             .load(std::sync::atomic::Ordering::Relaxed)
@@ -160,9 +167,9 @@ fn first_work(
         Kind::Empty => 0.0,
         Kind::Project(_) => first_work(ctx, &node.children[0], want, remaining)?,
         Kind::Extend(..) => {
-            first_work(ctx, &node.children[0], want.max(64), remaining)?
+            first_work(ctx, &node.children[0], want, remaining)?
                 + (node.cost - node.children[0].cost).max(0.0)
-                    * (want.max(64) as f64 / node.est.max(1.0)).min(1.0)
+                    * (want as f64 / node.est.max(1.0)).min(1.0)
         }
         Kind::Join { .. } => {
             if node
@@ -183,9 +190,9 @@ fn first_work(
                 return None;
             }
             full_work(ctx, other, remaining)?
-                + first_work(ctx, part, want.max(64), remaining)?
+                + first_work(ctx, part, want, remaining)?
                 + (node.cost - part.cost - other.cost).max(0.0)
-                    * (want.max(64) as f64 / part.est.max(1.0)).min(1.0)
+                    * (want as f64 / part.est.max(1.0)).min(1.0)
         }
         Kind::Union => {
             let mut cost = 0.0;
@@ -276,7 +283,7 @@ pub(super) fn order_ask(ctx: &super::ctx::Ctx, node: &mut Node) {
         }
         union = &mut union.children[0];
     }
-    if !pure_union(ctx, union) {
+    if ctx.max_rows_produced != u64::MAX || !ctx.snap.delta.is_empty() || !pure_union(ctx, union) {
         return;
     }
     ctx.eager_union_demand
@@ -576,6 +583,107 @@ fn safe_expression(expr: &Expression, moved: &[Variable], bound: &[Variable]) ->
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn pure_limited_unary_inputs_read_only_their_requested_prefix() {
+        use crate::io::Source;
+        use crate::sparql::{PlanInfo, QueryOptions, query};
+        use crate::store::{Store, StoreOptions};
+        let store = Store::in_memory(StoreOptions::default());
+        let mut data = String::new();
+        for i in 0..128 {
+            data.push_str(&format!("<urn:s{i}> <urn:p> {i} .\n"));
+        }
+        for i in 0..20_000 {
+            data.push_str(&format!("<urn:s{i}> <urn:q> {} .\n", i + 1));
+        }
+        store
+            .load(&[Source::from_bytes(
+                data.into_bytes(),
+                oxrdfio::RdfFormat::Turtle,
+                None,
+            )])
+            .unwrap();
+        fn find<'a>(p: &'a PlanInfo, operator: &str, description: &str) -> Option<&'a PlanInfo> {
+            if p.operator == operator && p.description.contains(description) {
+                return Some(p);
+            }
+            p.children
+                .iter()
+                .find_map(|c| find(c, operator, description))
+        }
+        let mut observed = Vec::new();
+        for (pattern, indexed) in [
+            ("?s <urn:p> ?v BIND(1 AS ?tag)", false),
+            ("?s <urn:p> ?v FILTER(?v != ?s)", false),
+            ("?s <urn:p> ?v; <urn:q> ?n", true),
+        ] {
+            let text =
+                format!("ASK {{ {{ {pattern} }} UNION {{ ?s <urn:q> ?n FILTER(?n = ?s) }} }}");
+            let result = query(
+                store.snapshot(),
+                &text,
+                &QueryOptions {
+                    no_cache: true,
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+            assert!(result.boolean);
+            if indexed {
+                assert!(find(&result.plan, "IndexJoin", "").is_some(), "{pattern}");
+            }
+            let scan = find(&result.plan, "IndexScan", "urn:p").unwrap();
+            observed.push((pattern, scan.actual_rows));
+            assert!(scan.fidelity().stopped_early);
+            let capped = query(
+                store.snapshot(),
+                &text,
+                &QueryOptions {
+                    no_cache: true,
+                    max_rows_produced: Some(1_000_000),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+            assert!(capped.boolean);
+            assert_eq!(
+                find(&capped.plan, "IndexScan", "urn:p")
+                    .unwrap()
+                    .actual_rows,
+                64,
+                "a finite produced-row cap keeps the original prefix: {pattern}"
+            );
+        }
+        assert!(
+            observed.iter().all(|(_, rows)| *rows == 1),
+            "pure inputs: {observed:?}"
+        );
+        crate::sparql::update::update(
+            &store,
+            "INSERT DATA { <urn:new> <urn:q> 1 }",
+            &Default::default(),
+        )
+        .unwrap();
+        assert!(!store.snapshot().delta.is_empty());
+        let changed = query(
+            store.snapshot(),
+            "ASK { { ?s <urn:p> ?v BIND(1 AS ?tag) } UNION { ?s <urn:q> ?n FILTER(?n = ?s) } }",
+            &QueryOptions {
+                no_cache: true,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        assert!(changed.boolean);
+        assert_eq!(
+            find(&changed.plan, "IndexScan", "urn:p")
+                .unwrap()
+                .actual_rows,
+            64,
+            "an unmerged snapshot keeps the original prefix"
+        );
+    }
 
     #[test]
     fn compatible_undef_join_fanout_does_not_displace_a_bounded_answer() {
@@ -1093,21 +1201,15 @@ mod tests {
         let mut prepared =
             super::super::prepare_query(store.snapshot(), &parsed, &Default::default(), None, None)
                 .unwrap();
-        assert!(!limited_projection(
-            &prepared.ctx,
-            &prepared.node.children[0]
-        ));
+        assert!(!limited_input(&prepared.ctx, &prepared.node.children[0]));
         order_ask(&prepared.ctx, &mut prepared.node);
-        assert!(limited_projection(
-            &prepared.ctx,
-            &prepared.node.children[0]
-        ));
+        assert!(limited_input(&prepared.ctx, &prepared.node.children[0]));
         std::sync::Arc::get_mut(&mut prepared.ctx)
             .unwrap()
             .enable_cursor_accounting()
             .unwrap();
         assert!(
-            !limited_projection(&prepared.ctx, &prepared.node.children[0]),
+            !limited_input(&prepared.ctx, &prepared.node.children[0]),
             "a cursor fallback must retain its original eager prefix policy too"
         );
     }
@@ -1256,11 +1358,36 @@ mod tests {
                 filtered_wide,
                 &QueryOptions {
                     max_rows: Some(1),
+                    max_rows_produced: Some(1_000_000),
                     ..Default::default()
                 }
             )
             .is_err(),
-            "the retained filtered path still refuses its physical64-row input work"
+            "the total-work-capped filtered path still refuses its physical64-row input work"
+        );
+        let optimized = query(
+            store.snapshot(),
+            filtered_wide,
+            &QueryOptions {
+                no_cache: true,
+                max_rows: Some(1),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        assert!(optimized.boolean);
+        let mut todo = vec![&optimized.plan];
+        let mut input_rows = None;
+        while let Some(p) = todo.pop() {
+            if p.operator == "IndexScan" && p.description.contains("urn:wide") {
+                input_rows = Some(p.actual_rows);
+            }
+            todo.extend(p.children.iter());
+        }
+        assert_eq!(
+            input_rows,
+            Some(1),
+            "the admitted pure filter reads one physical row"
         );
     }
 
