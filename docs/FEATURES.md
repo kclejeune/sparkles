@@ -677,6 +677,17 @@ request or on every write, and the schema report counts what the data holds.
   `complete` reports whether the bounded search exhausted its candidates. The CLI,
   library, MCP, Python and Node bindings expose both modes, and Explore has a Why-not
   form beside a resource's properties.
+* Why-not hypotheses report whether their missing facts introduce a new inconsistency.
+  An unfinished check remains unknown. Existing unrelated findings are excluded.
+* Entailment diffs compare branch heads or retained commits under one program, with
+  complete counts, bounded samples, predicate and class counts, and new findings.
+  JSON write and merge previews can include reasoning changes over the complete
+  candidate. Merge and review pages display them ([API.md](API.md#entailment-diffs)).
+* Minimal justifications list asserted facts and their schema or assertion role for
+  inconsistency findings and unsatisfiable classes. Alternative supports share bounded
+  oracle checks. Diagnostics can attach a first support to each finding, and the UI
+  previews a selected support fact's removal on a new branch before explicit application
+  ([API.md](API.md#minimal-justifications)).
 * Sparkles records the commit at which inferences were made, and only a later change to a
   graph the run read makes them stale. `GET /$/reason/{ds}`, dataset info, `/$/stats` and
   the `Sparkles-Inferences` header report freshness. Automatic re-runs are opt-in with
@@ -1618,8 +1629,8 @@ links each item to its design spec.
   that follow only from derived instance facts may be missing from its answers, item 191.
   The derived-table cache's budget accounting is item 192. DESCRIBE is refused under
   derivation on demand, item 193.
-* Entailment diffs, minimal inconsistency justifications and provenance-based inferred
-  visibility remain roadmap item 18. Query result cells do not offer a Why? action,
+* Provenance-based inferred visibility remains roadmap item 18. Query result cells do
+  not offer a Why? action,
   item 285. `why_empty` adds hypotheses for a grounded failing intensional pattern.
   Abduction for patterns with unbound target variables remains item 286.
 * Derived facts use the ordinary inferred graph. A separate derived-fact layer and

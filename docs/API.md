@@ -683,6 +683,8 @@ per-dataset form and no concurrency caps. `preauth=off` turns it off.
 | DELETE | `/$/reason/{ds}/auto`        | *Extension.* Removes the dataset's own setting, so the server's `--auto-reason` applies again. Returns the `ReasoningStatus`. |
 | GET    | `/$/reason/{ds}/diagnostics` | `DiagnosticsReport`: OWL 2 RL inconsistency checks. |
 | POST   | `/$/reason/{ds}/explain`     | *Extension.* Derivation trees for an inferred triple, from the facts the caller reads. See [Explanations](#explanations). |
+| GET | `/$/reason/{ds}/diff` | *Extension.* Read-only entailment changes between retained states under one program. See [Entailment diffs](#entailment-diffs). |
+| POST | `/$/reason/{ds}/justify` | *Extension.* Subset-minimal supports for a finding or an unsatisfiable class. See [Minimal justifications](#minimal-justifications). |
 | DELETE | `/$/reason/{ds}`             | Drops materialized inferences. |
 | GET    | `/$/rdfs/{ds}`               | The dataset's RDFS-on-read setting, `{ "enabled": false }` when there is none. See [RDFS on read](#rdfs-on-read). |
 | PUT    | `/$/rdfs/{ds}`               | Sets RDFS on read, like Fuseki's `--rdfs`. The body is `{ "graph": IRI \| "default" }` for a schema graph of the dataset, or a schema document in an RDF syntax given by `Content-Type`. Needs `admin`. `400` for a malformed body, `415` for another content type, `403` on a read-only server. |
@@ -7846,6 +7848,102 @@ per line with its rule or graph. It exits with 1 when no derivation is found and
 when the search passes its limits. The MCP tool `explain_inference` returns the same
 answer with a one-line summary per tree.
 
+Each why-not hypothesis also has `inconsistent`, which is `true` when adding its missing
+facts introduces an inconsistency finding, `false` when the relevant checks complete
+without a new finding, and `null` when the consistency analysis could not finish.
+`consistencyComplete` distinguishes a completed check from an unknown result. These
+checks use the same visible snapshot, program and request controls as the explanation.
+An existing unrelated conflict does not mark every hypothesis inconsistent.
+
+## Entailment diffs
+
+`GET /$/reason/{ds}/diff?from=main&to=feature` compares the reasoning consequences of two
+retained states. A selector is a commit number, `head`, a branch name or `branch@commit`.
+The caller needs query read permission on both selected branches. Graph grants apply
+separately to each state. The comparison never changes either state or its materialization.
+
+Both sides use one program. Omit the program to use the dataset's recorded profile,
+rules, extras and inputs. With no recorded program an explicit program is required.
+Use profile=rules with empty rules for an asserted-only comparison.
+An explicit `profile` selects `rdfs`, `rdfs-simple`, `owl-rl` or `rules`, with Jena rule
+text in `rules` for the last one. `inputs` is a JSON-encoded object with `dataGraphs`,
+`ontologyGraphs`, `imports` and `locationMapping`. `vocabularies` is a JSON-encoded array,
+and `geoDefaultGeometry` enables default geometry inference. Analysis resolves configured
+inputs locally and does not fetch or persist imported documents.
+
+The JSON answer has `entailmentDiffFormat: 1`, `from` and `to` with their selector and
+resolved commit, and complete `added` and `removed` counts. A consequence asserted in the
+state that contains it is excluded. `byPredicate` and `byClass` map IRIs to added and
+removed counts. `sample.added` and `sample.removed` contain three-term RDF JSON arrays.
+`sampleLimit` bounds each direction independently, from 1 to 10,000 and 100 by default.
+`sampleTruncated` says whether a sample omits changes. `newFindings` lists inconsistency
+findings present only in the candidate, and `findingsComplete` reports whether the
+checks completed. `warnings` carries warnings from the selected program.
+
+`Accept: application/trig` returns the whole delta in `urn:x-sparkles:added` and
+`urn:x-sparkles:removed` graphs. `Accept: application/rdf-patch` returns add and delete
+rows for `urn:x-sparkles:inferred`. These forms refuse a delta that exceeds the retained
+sample allowance. They never return a truncated document as a complete patch.
+
+`timeout` is in seconds. `maxMemory` is in bytes and covers retained states, witness
+identities, summaries and results. `maxInferred` bounds materialization. The server caps
+these controls at its limits and uses its reasoning thread pool. Cancellation stops
+private analysis. `422 reasoning-budget` refuses an analysis that cannot fit its bounds.
+Pruned history answers `410`. Builds without reasoning answer `501`.
+
+A JSON write preview accepts `entailments=true` with `dryRun=true`, including SPARQL
+updates, Graph Store writes, uploads, mappings and RDF Patch. The response gains an
+`entailments` report over the complete state before and after the proposed write, even
+when its listed changes are truncated. The same program parameters apply. Requesting
+entailments on a real write is refused before the write runs. A preview without a
+usable candidate has `entailments: null` and `entailmentsUnavailable` explaining why.
+
+Merge, revert and cherry-pick JSON dry-run bodies accept `entailments: true` with the
+program and controls. `GET /$/merge/{ds}?source=feature&entailments=true` compares the
+actual merged target candidate against the pinned target state, preserving the target's
+independent changes. Unresolved merge conflicts leave the candidate unavailable.
+Heads that move between inspection and simulation refuse the stale preview.
+
+The library exposes `Dataset::reasoning().diff` and `.diff_preview`. Python and Node use
+`ds.reasoning.diff(from, to, options)`, and the JVM uses `ds.reasoning().diff(from, to,
+options)`. The CLI accepts `sparkles infer --loc DB --diff main..feature` with JSON,
+text, TriG or RDF Patch output. The read-only MCP tool `entailment_diff` accepts
+`dataset`, `from`, `to` and the bounded program options.
+
+## Minimal justifications
+
+`POST /$/reason/{ds}/justify` accepts exactly one target. `finding` carries the `check`,
+`focus` and `evidence` from a diagnostics finding. `class` is a class IRI to probe for
+unsatisfiability. `classes: "all"` probes the relevant superclass cones of disjointness,
+complement and `owl:Nothing` axioms. `at` selects the retained state, `head` by default.
+The same program and controls as entailment diffs apply.
+
+```json
+{"class":"http://ex.org/CatDog","profile":"owl-rl","maxJustifications":5,"maxChecks":500}
+```
+
+The answer has `justificationFormat: 1`, `commit`, `checks`, `complete` and `results`.
+Each result carries its class or finding, `holds`, its own `complete`, and
+`justifications`. A support contains `facts`, each with a three-term `triple`, a `graph`
+and a `role` of `schema` or `assertion`. `graph` is `"default"` or an RDF JSON graph term.
+Every returned support is subset-minimal. Removing any one fact makes that support
+insufficient. The class probe fact is excluded from the support.
+
+`maxJustifications` ranges from 1 to 100 and defaults to 5. `maxChecks` ranges from 1 to
+100,000 and defaults to 500 across all targets. The response reports incompleteness when
+the bounded search stops. A result with `holds: false` is conclusive only when its
+`complete` is true. Cancellation remains an error. Nonmonotone rules require exhaustive
+subset checks, which can exhaust the allowance sooner than monotone contraction.
+
+`GET /$/reason/{ds}/diagnostics?justify=true` attaches a first `justification` to each
+finding, or `null` when no support was certified within the allowance, together with
+`justificationComplete`. `justificationsComplete` and `justificationChecks` cover the
+whole report. Diagnostics and supports share one retained snapshot and deadline.
+The CLI adds `--justify` to `infer --check`. Python and Node expose
+`ds.reasoning.justify(target, options)`, and the JVM exposes
+`ds.reasoning().justify(request)`.
+
+
 ## RDFS on read
 
 The design and its rationale are in
@@ -10356,6 +10454,7 @@ open-world when SERVICE is allowed. The common arguments are:
 | `community_reports` | `query` (≤ 2000 characters), `level` (the finest level with at most 100 reports), `reviewedOnly` (false), `limit` (10, ≤ 100), `findings` (true), `timeoutSeconds` (30) | `{dataset, available, reason?, message?, reportsGraph, level, levels: [{level, reports}], ranking, stale, reports: [{iri, community, level, title, summary, status, rating, memberCount, score?, findings: [{iri, text, cites}]}]}`, described below. |
 | `why_empty` | `query` (required, ≤ 65536 characters), `timeoutSeconds` (30) | `{dataset, commit, empty, first?, steps, unchecked?, complete, message, prefixes}`, described in [Checking and explaining queries](#checking-and-explaining-queries). |
 | `explain_inference` | `triple` (required, Turtle with the dataset's prefixes, such as `ex:tom a ex:Animal`), `mode` (`why`; `whyNot` is not available), `maxTrees` (1, at most 10), `maxDepth` (32, at most 64), `timeoutSeconds` | The answer of [Explanations](#explanations) with `dataset`, `summaries` (one line per tree, such as `ex:tom a ex:Animal because ex:tom a ex:Cat (asserted) and ex:Cat rdfs:subClassOf ex:Animal (asserted), by rdfs9`) and `prefixes`. A triple with no derivation from facts the caller reads gives `entailed: false` and a `message`. Offered in builds with the `reasoning` feature. |
+| `entailment_diff` | `dataset`, `from`, `to`, program options and analysis limits | Complete entailment counts, bounded samples and new findings between two retained states. The tool is read-only and requires the reasoning feature. |
 | `share_query` | `query` (required, ≤ 65536 characters), `question` (≤ 2000 characters), `explanation` (≤ 400 characters), `assumptions` (≤ 5), `branch`, `atCommit` | `{url, dataset, commit, ok, issues, prefixes}`. The link opens the query in a new tab of the UI's query page with the question header. The query is checked and never run. Listed only when the server knows the UI's address, which is the request's own host over HTTP and `--ui-url` over stdio. A payload over 32 KiB is refused with `too-large`, and an update with `not-a-query`. |
 | `validate_shacl` | `shapes` (required: a shapes graph in Turtle, ≤ 1 MiB), `shapesFormat` (`turtle` or `shaclc`), `graph` (`default`\|`union`\|IRI), `maxResults` (20, ≤ `--mcp-max-rows`), `timeoutSeconds` (30) | `{dataset, commit, reasoning, conforms, total, bySeverity: {violation, warning, info}, results: [{focus, path?, value?, shape, constraint, severity, message?}], truncated, prefixes}`: the validation of [`/{ds}/shacl`](#shacl-validation). The most severe results come first, then results are ordered by shape and focus node. `severity` is `Violation`, `Warning` or `Info`. SHACL 1.2 `Debug` and `Trace` count as info. A complex `path` is a SPARQL property path. Only in builds with the `shacl` feature. |
 | `validate_shex` | `schema` (required: ShExC, or ShExJ when it starts with `{`; ≤ 1 MiB), `shapeMap` (required: a compact shape map, ≤ 65536 characters), `graph`, `onlyNonconformant` (true), `maxResults` (20, ≤ `--mcp-max-rows`), `timeoutSeconds` (30) | `{dataset, commit, reasoning, conforms, counts: {conformant, nonconformant}, results: [{node, shape, status, reason?, failures?}], truncated, warnings, prefixes}`: the validation of [`/{ds}/shex`](#shex-validation), with results in shape-map order. `shape` is `START` for a START association. `failures` are the report's `appinfo.failures`, with `value` as a term and `predicate` as an IRI. Prefixed names in the map use the schema's prefixes, then the dataset's. `IMPORT` is refused with `bad-argument`, so put the imported shapes into the schema. EXTERNAL shapes have no definition (`invalid-schema`). `SPARQL """…"""` node selectors run on the data graph under the call's row and memory budgets, without SERVICE, and with only their own prefixes. A failing selector query is `invalid-schema`. Only in builds with the `shex` feature. |

@@ -3376,6 +3376,25 @@ for the same answer in the CLI. `--source demand` derives from current inputs, a
 `--profile owl-rl` selects a program when none is recorded. `--source materialized`
 explains the recorded materialization at its original commit, including stale facts.
 
+The Diagnostics panel can show minimal supports for a finding and probe a class for
+unsatisfiability. Expand a support to see ontology axioms and assertions separately.
+**Preview removal** creates a new branch from the finding's commit and previews deleting
+that exact asserted fact, including its reasoning changes. Review the candidate before
+choosing **Apply to draft branch**. The source branch is unchanged.
+
+![Preview a support fact removal and its reasoning changes](images/reasoning-support-preview.png)
+
+The merge page's **Include reasoning changes** option compares the complete merged
+candidate with the target before the merge. Its program selector also permits an explicit
+profile. A branch review has **Compare entailments**, pinned to the upstream and review
+heads, so it shows the reasoning consequences alongside proposed facts.
+
+For scripts, compare two retained states with
+`sparkles infer --loc DB --diff main..feature --format json`. Use
+`sparkles infer --loc DB --check --justify --format json` for findings and their first
+minimal supports. [Entailment diffs](API.md#entailment-diffs) and
+[minimal justifications](API.md#minimal-justifications) document the HTTP and library forms.
+
 ## The validation overlay
 
 Explore can badge the SHACL and ShEx results of the nodes it draws. When the dataset has a
