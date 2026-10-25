@@ -1566,8 +1566,10 @@ than creating a separate unbudgeted load path in the binding.
 
 ### Remaining integration contract
 
-Roadmap item 45 owns typed branch relink with the Rust operation's semantics. Item 58
-owns publication and the claimed runtime/platform installation matrix. Item 32 owns
+Typed branch relink is available, as the later
+[F09 Outcome](F09-branches-and-merges.md#outcome) records. Earlier omissions above
+describe the original landing. Roadmap item 58 owns publication and the claimed
+runtime/platform installation matrix. Item 32 owns
 reusable plans, while 33 and 329 retain comparative per-call and full-consumption
 query/export measurements. Benchmark completion permits recorded close cases and
 does not require matching an in-memory competitor on every durable write.

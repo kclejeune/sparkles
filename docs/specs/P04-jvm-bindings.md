@@ -1933,9 +1933,10 @@ no permit.
 
 ### Remaining integration contract
 
-Roadmap item 45 owns the typed branch-relink surface, with the same identity,
-lineage and refusal behavior as the Rust operation. Item 76 owns batched ARQ fallback
-graph patterns, JVM metrics and expansion of the standalone HTTP harness to its
+Typed branch relink is available, as the later
+[F09 Outcome](F09-branches-and-merges.md#outcome) records. Earlier omissions above
+describe the original landing. Roadmap item 76 owns batched ARQ fallback graph
+patterns, JVM metrics and expansion of the standalone HTTP harness to its
 accepted 77-case scope. Acceptance compares supported native and fallback queries
 with reference Jena datasets, including blank nodes, transactions, access and
 cancellation, and checks that batching preserves duplicate solutions and filters.
