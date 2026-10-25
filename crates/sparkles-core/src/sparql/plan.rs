@@ -2958,7 +2958,7 @@ impl<'a> Planner<'a> {
         // exactly one row binds that variable to a constant for the rest of the group, as
         // the filter-equality substitution above does. Its FILTERs then test the constant,
         // so they can narrow scans of the group's other patterns.
-        if self.ctx.opt.point_patterns {
+        if self.ctx.opt.point_patterns && !self.ctx.calls_extensions {
             let mut i = 0;
             while i < triples.len() {
                 let point =
@@ -3132,7 +3132,9 @@ impl<'a> Planner<'a> {
             .any(|(j, o)| j != i && o.t.contains(&PT::V(v)))
             || filters.iter().any(|f| f.var_set().contains(&v));
         if !used
-            || filters.iter().any(Expr::has_exists)
+            || filters
+                .iter()
+                .any(|f| super::exprcache::impurity(f).is_some())
             || nodes.iter().any(|n| n.vars.contains(&v))
             || paths.iter().any(|p| p.s == PT::V(v) || p.o == PT::V(v))
             || unpacks

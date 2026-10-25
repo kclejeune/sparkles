@@ -2,9 +2,16 @@
 //! graph scope and the variables returned by the surrounding algebra.
 use oxrdfio::RdfFormat;
 use sparkles_core::io::Source;
+use sparkles_core::sparql::extensions::{
+    ExtensionRegistry, ScalarContext, ScalarDescriptor, ScalarResult,
+};
 use sparkles_core::sparql::update::update;
 use sparkles_core::sparql::{Optimizations, QueryOptions, query};
 use sparkles_core::store::{Store, StoreOptions};
+use std::sync::{
+    Arc,
+    atomic::{AtomicUsize, Ordering},
+};
 
 fn fixture() -> Store {
     let s = Store::in_memory(StoreOptions::default());
@@ -103,5 +110,76 @@ fn point_patterns_read_the_current_delta_and_keep_old_snapshots() {
             .unwrap();
             assert_eq!(r.rows().len(), expected);
         }
+    }
+}
+
+#[test]
+fn point_patterns_preserve_application_filter_evaluation_count() {
+    let s = fixture();
+    let text = "SELECT * WHERE { <urn:anchor> <urn:single> ?x . ?s <urn:name> ?n FILTER(<urn:test:tick>(?x)) }";
+    let run = |point_patterns| {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let count = calls.clone();
+        let tick = move |_: &ScalarContext<'_>, _: &[oxrdf::Term]| -> ScalarResult {
+            count.fetch_add(1, Ordering::SeqCst);
+            Ok(oxrdf::Literal::from(true).into())
+        };
+        let mut registry = ExtensionRegistry::builder();
+        registry
+            .register_scalar(ScalarDescriptor::new("urn:test:tick", 1..=1, tick).unwrap())
+            .unwrap();
+        let r = query(
+            s.snapshot(),
+            text,
+            &QueryOptions {
+                no_cache: true,
+                extensions: Some(registry.build()),
+                optimizations: Some(Optimizations {
+                    point_patterns,
+                    ..Optimizations::ALL
+                }),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        (r.rows().len(), calls.load(Ordering::SeqCst))
+    };
+    let baseline = run(false);
+    assert_eq!(baseline.0, 3);
+    assert_eq!(run(true), baseline);
+}
+
+#[test]
+fn point_patterns_leave_volatile_filters_at_their_original_input() {
+    fn assignments(p: &sparkles_core::sparql::PlanInfo) -> usize {
+        usize::from(p.description.contains(":="))
+            + p.children.iter().map(assignments).sum::<usize>()
+    }
+    let s = fixture();
+    for (condition, substituted) in [
+        ("BOUND(?x)", true),
+        ("BOUND(?x) && RAND() >= 0", false),
+        ("BOUND(?x) && isIRI(UUID())", false),
+        ("BOUND(?x) && STRLEN(STRUUID()) > 0", false),
+        ("BOUND(?x) && isBlank(BNODE())", false),
+    ] {
+        let text = format!(
+            "SELECT * WHERE {{ <urn:anchor> <urn:single> ?x . ?s <urn:name> ?n FILTER({condition}) }}"
+        );
+        let r = query(
+            s.snapshot(),
+            &text,
+            &QueryOptions {
+                no_cache: true,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(r.rows().len(), 3);
+        assert_eq!(
+            assignments(&r.plan),
+            usize::from(substituted),
+            "{condition}"
+        );
     }
 }
