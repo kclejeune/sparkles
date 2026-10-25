@@ -1,0 +1,110 @@
+{
+  "catalog_version": 1,
+  "sources": [
+    {
+      "run_id": "sha256-a3becee999d971f4f38230a39a62d0ea62541ee437a8d5ed1174f07571ade654",
+      "path": "../2026-10-25-ask-grounding-offline.json",
+      "sha256": "a3becee999d971f4f38230a39a62d0ea62541ee437a8d5ed1174f07571ade654",
+      "format": "legacy-assessment",
+      "context": {
+        "suite": null,
+        "scale": null,
+        "manifest": null,
+        "settings": null,
+        "durability_classes": [],
+        "legacy_metadata": {
+          "source": {
+            "binary": "/home/kclejeune/sparkles-ask-paid-20261024/bin/sparkles",
+            "binary_sha256": "804169201d67ced2c40cb87318b6a9b123decad607d3e598c0e7c5ce4c08a4d8",
+            "database": "/home/kclejeune/sparkles-ask-paid-20261024/db/dbpedia.db",
+            "dataset_metadata_sha256": "88dad95997d2c996ca58901d6585f0762be1f6a8aaad533a1f8c5385498dcff2",
+            "predicate_count": 58564,
+            "property_label_policy": "declared rdf:Property labels in English or without a language tag",
+            "predicate_counts_sha256": "d1ad9722d0a462da5fff44511c487705d9348632b28631cc77fc0c6d1d0c256d",
+            "property_labels_sha256": "2472310173a959340e702b704383e27aadbd097b1a00ddc288cbf56b5e598a9e",
+            "scope": "Gold is evaluation-only. Count and label queries are independent of all questions and gold. Recall covers existing predicate IRI constants mentioned in gold, excludes variable predicates, and is lexical retrieval only, not execution accuracy.",
+            "gold_reference_policy": "Literal/comment contents are masked, declared prefixes are expanded and a shorthand names rdf:type. References are intersected with existing predicate IRIs; variable predicates are not counted."
+          },
+          "method": "Fixed half-common and half-question schema budget, with actual runtime tokenization and balancing helpers. Selection receives independently retrieved vocabulary and question words before gold is read. Declared English or untagged property labels only. This is retrieval coverage, not model answer accuracy or latency.",
+          "kind": "ask-grounding-offline"
+        }
+      },
+      "metadata_note": "Null fields mean this metadata is not available in the common record fields. Read the raw assessment for its own provenance and correctness contract."
+    },
+    {
+      "run_id": "sha256-2c1c1e1c78ca959b41514a8f9f357dc2b2d12f36051dae4ad8527b2c8269bf19",
+      "path": "../2026-10-25-ask-grounding-paid.json",
+      "sha256": "2c1c1e1c78ca959b41514a8f9f357dc2b2d12f36051dae4ad8527b2c8269bf19",
+      "format": "legacy-assessment",
+      "context": {
+        "suite": null,
+        "scale": null,
+        "manifest": null,
+        "settings": {
+          "effort": "medium",
+          "contextTokens": 200000,
+          "maxOutputTokens": 4096,
+          "requestTimeoutSecs": 120,
+          "askDeadlineSecs": 300,
+          "queryTimeoutSecs": 60,
+          "askTokenBudget": 100000,
+          "clarifications": "answer",
+          "projectionMargin": 1.25
+        },
+        "durability_classes": [],
+        "legacy_metadata": {
+          "host": "A development laptop used the original local DBpedia database. The global local heavy lock was reserved, with no concurrent build or benchmark.",
+          "source": {
+            "commit": "0d4fdd8e8171739950fe6c487ed19c6104cf6d01",
+            "groundingCommit": "c341cf83e7d9970dcdd4d84c08a00827bed47095",
+            "binarySha256": "7fee24e01b21f4bd3aeb6f87ae87b85f6455a2849470d55f9e213e250104ba93",
+            "features": [
+              "auth",
+              "backup",
+              "default",
+              "fmt",
+              "geo",
+              "geo-epsg",
+              "graphql",
+              "mapping-parquet",
+              "mapping-sqlite",
+              "mcp",
+              "memory",
+              "mimalloc",
+              "office",
+              "otel",
+              "pdf",
+              "reasoning",
+              "shacl",
+              "shex",
+              "text",
+              "text-cjk-dict",
+              "tls"
+            ],
+            "profile": {
+              "name": "release",
+              "lto": "thin",
+              "codegenUnits": 4,
+              "coreCodegenUnits": 1,
+              "debugInfo": 1
+            },
+            "artifactProfile": {
+              "opt_level": "3",
+              "debuginfo": 1,
+              "debug_assertions": false,
+              "overflow_checks": false,
+              "test": false
+            },
+            "compilerComments": "\nString dump of section '.comment':\n  [     0]  Linker: LLD 22.1.8 (/checkout/src/llvm-project/llvm 52ed14fcd56afc30f9cccd8ca8ce237c2eef7e04)\n  [    5e]  rustc version 1.98.1 (48a229cea 2026-09-01)\n  [    8b]  GCC: (GNU) 16.2.0\n  [    9d]  clang version 21.1.8\n\n",
+            "contextConsumerIncluded": false,
+            "cargoArtifactFreshFlag": false
+          },
+          "measurement": "Ask grounding on retained QALD-9-plus DBpedia regression questions",
+          "scope": "Each model ran all 107 retained questions once. These questions were used during diagnosis and are regression evidence rather than unseen held-out generalization evidence. No Opus calls were made.",
+          "schema": 1
+        }
+      },
+      "metadata_note": "Null fields mean this metadata is not available in the common record fields. Read the raw assessment for its own provenance and correctness contract."
+    }
+  ]
+}

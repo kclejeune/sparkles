@@ -1,0 +1,102 @@
+{
+  "catalog_version": 1,
+  "sources": [
+    {
+      "run_id": "sha256-887b738735a05a4c91eaa86769e984acfa7c69c9dea284d8dfaad6cf622613e2",
+      "path": "../2026-10-25-jvm33-pattern-scratch-forge.json",
+      "sha256": "887b738735a05a4c91eaa86769e984acfa7c69c9dea284d8dfaad6cf622613e2",
+      "format": "legacy-assessment",
+      "context": {
+        "suite": null,
+        "scale": null,
+        "manifest": null,
+        "settings": null,
+        "durability_classes": [],
+        "legacy_metadata": {
+          "provenance": {
+            "base_source": "9fa4dbd257cf7b6e8054066370521d60eb8b2ed7",
+            "candidate_source": "536e462df0d508a6814fc415bf0347412161ce25",
+            "pair_archive_sha256": "2e13f8d73567280ece655a7a9cbbfdbbd4b785a91093e59abfa5a8c510a2dd97",
+            "native_sha256": "032366689fa7c253f5e453537f6597271e87b8c4e8ab8a926ed1b4c175c0f77c",
+            "classpaths": "Both Jena5.6.0/Kotlin2.4.20; baseline706/candidate709 verified manifest entries; benchmark driver and dependencies identical.",
+            "purpose": "Bounded isolated wrapper A/B, no engine or peer claim; exact runtime version must be captured on Forge.",
+            "canonical_harness_sha256": "ee6273f2314efcc7349eba809c9ba7660bd7d4c874f8c073e15da8f327fee073",
+            "routed_harness_sha256": "c84bfe72976f2cdfbd73fccac8feab2e06ba1389785810d53c6c2872d8b81eac",
+            "arm_labels": "base and pool have equal length; canonical per-process tags and timing behavior unchanged",
+            "runtime": "openjdk version \"21.0.12\" 2026-07-21 LTS\nOpenJDK Runtime Environment Temurin-21.0.12+8 (build 21.0.12+8-LTS)\nOpenJDK 64-Bit Server VM Temurin-21.0.12+8 (build 21.0.12+8-LTS, mixed mode, sharing)",
+            "host": "forge",
+            "cpu": "Intel Core i5-13500",
+            "method": "Six fresh timing JVMs per arm in ABBA repeated three times, CPUs0,2,4,6,8,10, six active processors, threads1/4, one-second warmup and two-second measurement per case,4GiB heap,105302 source triples.",
+            "harness_adaptation": "Only Runner.command chooses per-arm classpath and native path. The driver, cases, ordering and answer checks are identical.",
+            "metadata_caveat": "The raw commit string uses BENCH_COMMIT and appends dirty because the copied harness root is not a Git checkout. Source commits and artifact hashes above are authoritative.",
+            "revert": "21e26302",
+            "started_utc": "2026-10-25T14:14:37Z",
+            "finished_utc": "2026-10-25T14:22:11Z",
+            "harness_diff": "--- canonical/jena.py\n+++ pair-routing/jena.py\n@@ -118,12 +118,14 @@\n     def command(self, arm):\n         a = self.args\n         pin = [\"taskset\", \"-c\", a.cpus] if a.cpus else []\n+        pair = ROOT / \"pair\" / {\"base\": \"baseline\", \"pool\": \"candidate\"}[arm[\"label\"]]\n+        classpath = \":\".join(str(pair / p) for p in json.loads((pair / \"classpath.json\").read_text()))\n         jopts = [f\"-Xmx{a.jvm_heap}\", \"-Xss64m\", \"-Dorg.slf4j.simpleLogger.defaultLogLevel=warn\",\n-                 f\"-Dsparkles.native.path={ROOT / 'target' / 'release' / 'libsparkles_ffi.so'}\"]\n+                 f\"-Dsparkles.native.path={pair / 'libsparkles_ffi.so'}\"]\n         if a.cores:\n             jopts.append(f\"-XX:ActiveProcessorCount={a.cores}\")\n         jopts += a.jvm_opts.split() + arm[\"opts\"]\n-        return pin + [self.java, *jopts, \"-cp\", self.classpath, \"io.github.kclejeune.sparkles.jena.bench.JenaUseCases\"]\n+        return pin + [self.java, *jopts, \"-cp\", classpath, \"io.github.kclejeune.sparkles.jena.bench.JenaUseCases\"]\n \n     def launch(self, arm, mode, cfg, label, timeout):\n         cdir, ldir = self.args.workdir / \"configs\", self.args.workdir / \"logs\"\n"
+          }
+        }
+      },
+      "metadata_note": "Null fields mean this metadata is not available in the common record fields. Read the raw assessment for its own provenance and correctness contract."
+    },
+    {
+      "run_id": "sha256-081bf845b876e499fbec77db1df74cd7aaa3954100f7724a03cf796c83c75ebb",
+      "path": "../2026-10-25-node33-borrowed-validation-forge.json",
+      "sha256": "081bf845b876e499fbec77db1df74cd7aaa3954100f7724a03cf796c83c75ebb",
+      "format": "legacy-assessment",
+      "context": {
+        "suite": null,
+        "scale": null,
+        "manifest": null,
+        "settings": null,
+        "durability_classes": [],
+        "legacy_metadata": {
+          "host": {
+            "name": "forge",
+            "cpu": "Intel Core i5-13500",
+            "node": "v22.23.3",
+            "rayon_threads": 6,
+            "tokio_workers": 6
+          },
+          "base_commit": "9cf63d72",
+          "candidate_commit": "cc335905e13863afa1ba404e227e908c7aa9774d",
+          "native_compiler": "rustc 1.98.1 (48a229cea 2026-09-01)\nbinary: rustc\ncommit-hash: 48a229ceaefd4985c50990b14116b6d856af0985\ncommit-date: 2026-09-01\nhost: x86_64-unknown-linux-gnu\nrelease: 1.98.1\nLLVM version: 22.1.8\ncc (Debian 12.2.0-14+deb12u1) 12.2.0\nCopyright (C) 2022 Free Software Foundation, Inc.\nThis is free software; see the source for copying conditions.  There is NO\nwarranty; not even for MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.\n\n",
+          "native_sha256": {
+            "base": "bdd75ce01adafc901b0f94fb8383de5df8bc840dd409779af03d88ca958d9f76",
+            "candidate": "9831bfdc2053a13b645640be5d697d7ad3831fe54c0ecd74225e2ee51bc17af5"
+          },
+          "method": "Two quiet ABBA-times-three batches, six fresh processes per arm per batch. Matched source builds in the same Rust1.98.1 Debianbookworm container, path, flags and GCC12.2.0. No builds or competing servers on Forge. Both bench and heavy locks held during timing. Process medians are the unit of comparison; repeated lifecycle/control samples are not independent processes."
+        }
+      },
+      "metadata_note": "Null fields mean this metadata is not available in the common record fields. Read the raw assessment for its own provenance and correctness contract."
+    },
+    {
+      "run_id": "sha256-c28a89bc8cf4a2305ad6bb58189c3b05d4d667ffb656d5bdc60bcf7321e387ff",
+      "path": "../2026-10-25-python33-current-source-forge.json",
+      "sha256": "c28a89bc8cf4a2305ad6bb58189c3b05d4d667ffb656d5bdc60bcf7321e387ff",
+      "format": "legacy-assessment",
+      "context": {
+        "suite": null,
+        "scale": null,
+        "manifest": null,
+        "settings": null,
+        "durability_classes": [],
+        "legacy_metadata": {
+          "provenance": {
+            "source_commit": "b310d8b4a10a40ae975baecb9cb05ea4b96a7255",
+            "native_status": "current-source release build and285Python tests passed; Namespace destroyed at2026-10-25T12:07:08Z",
+            "baseline_diagnostic_source": "9fa4dbd2",
+            "diagnostic_only": false,
+            "engine_edits": false,
+            "native_sha256": "c15dfc841f321b1e225d1fa513ef0c4cf4f3b1d6557863b6c63d3f162bb128d6",
+            "source_archive_sha256": "e1a4b31c9932cdd5655e9d46f51a71cadaba18032e9bc09286b23485fb0bc7d7",
+            "compiler": "rustc 1.98.1 (48a229cea 2026-09-01)\nbinary: rustc\ncommit-hash: 48a229ceaefd4985c50990b14116b6d856af0985\ncommit-date: 2026-09-01\nhost: x86_64-unknown-linux-gnu\nrelease: 1.98.1\nLLVM version: 22.1.8\ncc (Debian 12.2.0-14+deb12u1) 12.2.0\nCopyright (C) 2022 Free Software Foundation, Inc.\nThis is free software; see the source for copying conditions.  There is NO\nwarranty; not even for MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.\n\n",
+            "build_runtime": "3.11.2 (main, Oct  7 2026, 12:35:07) [GCC 12.2.0]\n0.1.0 0.5.11\n"
+          },
+          "measurement_runtime": "CPython3.14.7; pyoxigraph0.5.11",
+          "method": "Quiet Forge Intel Core i5-13500;6rotated fresh processes perengine/mode,10warmup/30measured samples; CPUs0,2,4,6,8,10 are six distinct P cores. Both bench then heavy locks held; all native builds off host.105302input lines yield105300unique quads."
+        }
+      },
+      "metadata_note": "Null fields mean this metadata is not available in the common record fields. Read the raw assessment for its own provenance and correctness contract."
+    }
+  ]
+}

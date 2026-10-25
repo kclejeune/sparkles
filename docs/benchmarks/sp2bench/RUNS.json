@@ -1,0 +1,696 @@
+{
+  "catalog_version": 1,
+  "sources": [
+    {
+      "run_id": "sha256-608e54c93fb68acbd6663fefe143c2648c768b2a7c6a7db7f3acfb1ff57647d4",
+      "path": "../2026-10-23-sp2b-10m-forge.json",
+      "sha256": "608e54c93fb68acbd6663fefe143c2648c768b2a7c6a7db7f3acfb1ff57647d4",
+      "format": "bench-record-2",
+      "context": {
+        "suite": "sp2bench",
+        "scale": "10m",
+        "manifest": {
+          "suite": "sp2bench",
+          "started": "2026-10-23T04:40:24Z",
+          "ended": "2026-10-23T04:44:00Z",
+          "host": {
+            "name": "forge",
+            "cpu": "13th Gen Intel(R) Core(TM) i5-13500",
+            "cpus": 20,
+            "ram_mib": 15622,
+            "disk_model": "",
+            "kernel": "6.18.53",
+            "filesystem": "ext4",
+            "mount_options": "rw,relatime,discard,errors=remount-ro"
+          },
+          "sparkles": {
+            "binary": "/home/kclejeune/lanes/item1-refresh-20261023/bin/sparkles-6699f27d",
+            "version": "sparkles 0.1.0",
+            "sha256": "4a94efcb075ea6381b127ec6db5e85cc960d5abecf2426def5baaef264e02f20",
+            "scripts_commit": "e133a8069f69d64f75d6468dbcef46832a9d7389",
+            "binary_commit": "6699f27d",
+            "scripts_note": "The harness checkout was 6699f27d with one commit of the item 1 lane on top, e133a806. It was later rebased onto main as 2bd5ae45 and changes only scripts/bench-record.py and its tests."
+          },
+          "engines": {
+            "jena": {
+              "license": "Apache-2.0",
+              "binary": "/home/kclejeune/lanes/item1-bench/data/sp2b-10m/gcroots/apache-jena-fuseki/bin/fuseki-server",
+              "sha256": "7fb10cdec48244c13ea15e4c0607b29339e5d40c67a12cae2ced41903c1d2743",
+              "version": "Apache Jena Fuseki version 5.1.0",
+              "store_path": "/nix/store/q0dscszid7jzs66xq9dip95z2hc1zmsh-apache-jena-fuseki-5.1.0",
+              "package": "apache-jena-fuseki-5.1.0",
+              "reported_version": "Apache Jena Fuseki version 5.1.0"
+            },
+            "qlever": {
+              "license": "Apache-2.0",
+              "binary": "/home/kclejeune/lanes/item1-bench/data/sp2b-10m/gcroots/qlever/bin/qlever-server",
+              "sha256": "8a3d2eb5259918b6a22607a012e50bf0087dfc9205e37613a03a09a1e68a10dc",
+              "version": "0.5.48",
+              "store_path": "/nix/store/xn7f9c965zfza9nks2qzlrnx916xg3h2-qlever-0.5.48",
+              "package": "qlever-0.5.48",
+              "reported_version": "/home/kclejeune/lanes/item1-bench/data/sp2b-10m/gcroots/qlever/bin/qlever-server 0.0.0-unknown"
+            },
+            "oxigraph": {
+              "license": "MIT OR Apache-2.0",
+              "binary": "/home/kclejeune/lanes/item1-bench/data/sp2b-10m/gcroots/oxigraph/bin/oxigraph",
+              "sha256": "c99f9c4866b9d25f135729ac8b0e468cc0badd2c2cfe1c4b704f0db375ed8de3",
+              "version": "oxigraph 0.5.11",
+              "store_path": "/nix/store/g7ajfdk0g8bypdbsj23hnfq71izm3iz1-oxigraph-0.5.11",
+              "package": "oxigraph-0.5.11",
+              "reported_version": "oxigraph 0.5.11"
+            },
+            "fluree": {
+              "license": "BUSL-1.1",
+              "binary": "/home/kclejeune/lanes/item1-bench/data/sp2b-10m/fluree-4.2.2/fluree-db-cli-x86_64-unknown-linux-gnu/fluree",
+              "sha256": "8d59a9fee1bbb8dc3f77c12c3071ca1802ad64ac1df68e01e2f81d3f28057133",
+              "version": "fluree 4.2.2"
+            }
+          },
+          "memory_limit": "12G",
+          "client_cpu": "11",
+          "data": {
+            "sp2bench-10m": {
+              "license": "BSD",
+              "params": "SP2Bench v1.01 triples=10000000",
+              "sha256": "4486653f3ea16825923eb8a5410137df7ba712aa918442531c33cbeb854eb814",
+              "bytes": 1493565484
+            }
+          },
+          "license_check": {
+            "gpl_benchmark_allowed": false,
+            "notes": [
+              "SP2Bench v1.01 generator and queries: BSD license, fetched at build time"
+            ]
+          },
+          "reused": {
+            "jena": {
+              "started": "2026-10-19T05:30:09Z",
+              "ended": "2026-10-19T11:31:18Z",
+              "host": "forge",
+              "scripts_commit": "77032452",
+              "engine": {
+                "license": "Apache-2.0",
+                "binary": "/home/kclejeune/lanes/item1-bench/data/sp2b-10m/gcroots/apache-jena-fuseki/bin/fuseki-server",
+                "sha256": "7fb10cdec48244c13ea15e4c0607b29339e5d40c67a12cae2ced41903c1d2743",
+                "version": "Apache Jena Fuseki version 5.1.0",
+                "store_path": "/nix/store/q0dscszid7jzs66xq9dip95z2hc1zmsh-apache-jena-fuseki-5.1.0",
+                "package": "apache-jena-fuseki-5.1.0",
+                "reported_version": "Apache Jena Fuseki version 5.1.0"
+              },
+              "scripts_commit_source": "BENCHMARKS.md and the batch launcher, since the carried-over run's manifest lacks it"
+            },
+            "qlever": {
+              "started": "2026-10-19T05:30:09Z",
+              "ended": "2026-10-19T11:31:18Z",
+              "host": "forge",
+              "scripts_commit": "77032452",
+              "engine": {
+                "license": "Apache-2.0",
+                "binary": "/home/kclejeune/lanes/item1-bench/data/sp2b-10m/gcroots/qlever/bin/qlever-server",
+                "sha256": "8a3d2eb5259918b6a22607a012e50bf0087dfc9205e37613a03a09a1e68a10dc",
+                "version": "0.5.48",
+                "store_path": "/nix/store/xn7f9c965zfza9nks2qzlrnx916xg3h2-qlever-0.5.48",
+                "package": "qlever-0.5.48",
+                "reported_version": "/home/kclejeune/lanes/item1-bench/data/sp2b-10m/gcroots/qlever/bin/qlever-server 0.0.0-unknown"
+              },
+              "scripts_commit_source": "BENCHMARKS.md and the batch launcher, since the carried-over run's manifest lacks it"
+            },
+            "oxigraph": {
+              "started": "2026-10-19T05:30:09Z",
+              "ended": "2026-10-19T11:31:18Z",
+              "host": "forge",
+              "scripts_commit": "77032452",
+              "engine": {
+                "license": "MIT OR Apache-2.0",
+                "binary": "/home/kclejeune/lanes/item1-bench/data/sp2b-10m/gcroots/oxigraph/bin/oxigraph",
+                "sha256": "c99f9c4866b9d25f135729ac8b0e468cc0badd2c2cfe1c4b704f0db375ed8de3",
+                "version": "oxigraph 0.5.11",
+                "store_path": "/nix/store/g7ajfdk0g8bypdbsj23hnfq71izm3iz1-oxigraph-0.5.11",
+                "package": "oxigraph-0.5.11",
+                "reported_version": "oxigraph 0.5.11"
+              },
+              "scripts_commit_source": "BENCHMARKS.md and the batch launcher, since the carried-over run's manifest lacks it"
+            },
+            "fluree": {
+              "started": "2026-10-19T05:30:09Z",
+              "ended": "2026-10-19T11:31:18Z",
+              "host": "forge",
+              "scripts_commit": "77032452",
+              "engine": {
+                "license": "BUSL-1.1",
+                "binary": "/home/kclejeune/lanes/item1-bench/data/sp2b-10m/fluree-4.2.2/fluree-db-cli-x86_64-unknown-linux-gnu/fluree",
+                "sha256": "8d59a9fee1bbb8dc3f77c12c3071ca1802ad64ac1df68e01e2f81d3f28057133",
+                "version": "fluree 4.2.2"
+              },
+              "scripts_commit_source": "BENCHMARKS.md and the batch launcher, since the carried-over run's manifest lacks it"
+            }
+          }
+        },
+        "settings": {
+          "warmup": 2,
+          "runs": 10,
+          "timer": "hyperfine+curl",
+          "resultCache": false
+        },
+        "durability_classes": []
+      },
+      "metadata_note": "Null fields mean this metadata is not available in the common record fields. Read the raw assessment for its own provenance and correctness contract."
+    },
+    {
+      "run_id": "sha256-1ce65371443269c58192f58a61f19a43bf18fb28a377f2218830104da929f5a6",
+      "path": "../2026-10-25-competitive-query-pairs-forge.json",
+      "sha256": "1ce65371443269c58192f58a61f19a43bf18fb28a377f2218830104da929f5a6",
+      "format": "bench-record-2",
+      "context": {
+        "suite": "competitive-query-pairs",
+        "scale": "10m",
+        "manifest": {
+          "suite": "competitive-query-pairs",
+          "started": "2026-10-25T04:29:35Z",
+          "ended": "2026-10-25T04:41:27Z",
+          "host": {
+            "name": "forge",
+            "cpu": "13th Gen Intel(R) Core(TM) i5-13500",
+            "cpus": 20,
+            "ram_mib": 15620,
+            "disk_model": "",
+            "kernel": "7.2.9",
+            "filesystem": "ext4",
+            "mount_options": "rw,relatime,discard,errors=remount-ro"
+          },
+          "sparkles": {
+            "binary": "/home/kclejeune/lanes/competitive-losses-20261024/bin/sparkles-2ec8a266",
+            "version": "sparkles 0.1.0",
+            "sha256": "124ef64d1218845744c4c0a80ca400d90405cac300c5938d8ee5b6c58da5e5ad",
+            "scripts_commit": "a5847311dc2957c5cd9e62441c7f1815d51a152f",
+            "binary_commit": "2ec8a266a5a045fb1d73a0097e19462ffb2a9f15",
+            "scripts_note": "The shared suite and answer/timing helpers came from an exact a5847311 source archive. A subset runner selected these queries and repeated them in reverse engine order."
+          },
+          "engines": {
+            "jena": {
+              "license": "Apache-2.0",
+              "binary": "/home/kclejeune/lanes/item1-bench/data/sp2b-10m/gcroots/apache-jena-fuseki/bin/fuseki-server",
+              "sha256": "7fb10cdec48244c13ea15e4c0607b29339e5d40c67a12cae2ced41903c1d2743",
+              "version": "Apache Jena Fuseki version 5.1.0",
+              "store_path": "/nix/store/q0dscszid7jzs66xq9dip95z2hc1zmsh-apache-jena-fuseki-5.1.0",
+              "package": "apache-jena-fuseki-5.1.0",
+              "reported_version": "Apache Jena Fuseki version 5.1.0"
+            },
+            "oxigraph": {
+              "license": "MIT OR Apache-2.0",
+              "binary": "/home/kclejeune/lanes/item1-bench/data/sp2b-10m/gcroots/oxigraph/bin/oxigraph",
+              "sha256": "c99f9c4866b9d25f135729ac8b0e468cc0badd2c2cfe1c4b704f0db375ed8de3",
+              "version": "oxigraph 0.5.11",
+              "store_path": "/nix/store/g7ajfdk0g8bypdbsj23hnfq71izm3iz1-oxigraph-0.5.11",
+              "package": "oxigraph-0.5.11",
+              "reported_version": "oxigraph 0.5.11"
+            },
+            "qlever": {
+              "license": "Apache-2.0",
+              "binary": "/home/kclejeune/lanes/item1-bench/data/sp2b-10m/gcroots/qlever/bin/qlever-server",
+              "sha256": "8a3d2eb5259918b6a22607a012e50bf0087dfc9205e37613a03a09a1e68a10dc",
+              "version": "0.5.48",
+              "store_path": "/nix/store/xn7f9c965zfza9nks2qzlrnx916xg3h2-qlever-0.5.48",
+              "package": "qlever-0.5.48",
+              "reported_version": "/home/kclejeune/lanes/item1-bench/data/sp2b-10m/gcroots/qlever/bin/qlever-server 0.0.0-unknown"
+            },
+            "fluree": {
+              "license": "BUSL-1.1",
+              "binary": "/nix/store/jvhxwjlhzijkd1kvrh8l7wfkbclp8vnx-fluree-4.2.2/bin/fluree",
+              "sha256": "99629db65b6eb0d7d9b7cafdc48806eee8ab71e9568fe389b983accaaa35f7ff",
+              "version": "fluree 4.2.2",
+              "store_path": "/nix/store/jvhxwjlhzijkd1kvrh8l7wfkbclp8vnx-fluree-4.2.2",
+              "package": "fluree-4.2.2",
+              "reported_version": "fluree 4.2.2"
+            }
+          },
+          "memory_limit": "12G",
+          "client_cpu": "11",
+          "data": {
+            "sp2bench-10m": {
+              "license": "BSD",
+              "params": "SP2Bench v1.01 triples=10000000",
+              "sha256": "4486653f3ea16825923eb8a5410137df7ba712aa918442531c33cbeb854eb814",
+              "bytes": 1493565484
+            },
+            "bsbm-10m": {
+              "license": "GPL-3.0 (generator)",
+              "params": "BSBM tools0.2 products28480 forward-chaining seeddefault triples10095035",
+              "sha256": "db77a8d62274566c0fcf6a85634741b0313551cc217b59f4b1f26d444fd205be",
+              "bytes": 2619263591
+            }
+          },
+          "license_check": {
+            "gpl_benchmark_allowed": true,
+            "notes": [
+              "SP2Bench v1.01 generator and queries: BSD license, fetched at build time",
+              "BSBM tools 0.2 generator: GPL-3.0, run as a separate program; this run reuses its generated benchmark data."
+            ]
+          }
+        },
+        "settings": {
+          "warmup": 10,
+          "runs": 30,
+          "timer": "hyperfine+curl",
+          "resultCache": false,
+          "client_cpu": "11",
+          "server_affinity": "unpinned",
+          "memory_limit": "12G",
+          "scope": {
+            "sp2bench": [
+              "sparkles",
+              "jena",
+              "oxigraph"
+            ],
+            "bsbm": [
+              "sparkles",
+              "qlever",
+              "fluree"
+            ]
+          },
+          "query_instances": {
+            "bi-q2": 3,
+            "explore-q5": 3
+          },
+          "confirmation_pass": {
+            "warmup": 5,
+            "runs": 20,
+            "engine_order": {
+              "sp2bench": [
+                "sparkles",
+                "jena",
+                "oxigraph"
+              ],
+              "bsbm": [
+                "sparkles",
+                "qlever",
+                "fluree"
+              ]
+            }
+          },
+          "reported_pass": {
+            "engine_order": {
+              "sp2bench": [
+                "oxigraph",
+                "jena",
+                "sparkles"
+              ],
+              "bsbm": [
+                "fluree",
+                "qlever",
+                "sparkles"
+              ]
+            }
+          },
+          "sparkles_compiler_comments": [
+            "GCC: (GNU) 16.2.0",
+            "clang version 21.1.8",
+            "rustc version 1.98.1 (48a229cea 2026-09-01)",
+            "Linker: LLD 22.1.8 (/checkout/src/llvm-project/llvm 52ed14fcd56afc30f9cccd8ca8ce237c2eef7e04)"
+          ],
+          "method": "Each engine ran alone during timed requests. Both passes used the same data hashes and binary hashes. BSBM samples pool three fixed instances. SP2Bench summaries use means and sample standard deviations; BSBM summaries use pooled medians. The matched peers are the engines behind the published losses, with additional measured peers shown explicitly.",
+          "biq2_independent_oracle": {
+            "method": "RDF-set feature intersection, Product type membership, anchor exclusion, descending integer count and ascending IRI, top10.",
+            "oracle_source_sha256": "a2351c5f513b90ccb1f808baafdf4047559cfda2d60a90dc34de1a9c81d4660a",
+            "data_sha256": "db77a8d62274566c0fcf6a85634741b0313551cc217b59f4b1f26d444fd205be",
+            "data_lines": 10095035,
+            "published_pool_hash": "e6cda2d5377f1e64",
+            "verified_pool_hash": "e6cda2d5377f1e64",
+            "queries": [
+              {
+                "query": "bi-q2-1",
+                "query_sha256": "de64e60ea2989d361e14ee78ef62a22129d9bfaf832f0ee1c7922dcb0e08d6f0",
+                "anchor": "http://www4.wiwiss.fu-berlin.de/bizer/bsbm/v01/instances/dataFromProducer415/Product20476",
+                "anchor_feature_count": 25,
+                "expected_ordered_rows": [
+                  [
+                    "http://www4.wiwiss.fu-berlin.de/bizer/bsbm/v01/instances/dataFromProducer112/Product5279",
+                    12
+                  ],
+                  [
+                    "http://www4.wiwiss.fu-berlin.de/bizer/bsbm/v01/instances/dataFromProducer243/Product11864",
+                    12
+                  ],
+                  [
+                    "http://www4.wiwiss.fu-berlin.de/bizer/bsbm/v01/instances/dataFromProducer27/Product1255",
+                    11
+                  ],
+                  [
+                    "http://www4.wiwiss.fu-berlin.de/bizer/bsbm/v01/instances/dataFromProducer295/Product14488",
+                    11
+                  ],
+                  [
+                    "http://www4.wiwiss.fu-berlin.de/bizer/bsbm/v01/instances/dataFromProducer211/Product10268",
+                    10
+                  ],
+                  [
+                    "http://www4.wiwiss.fu-berlin.de/bizer/bsbm/v01/instances/dataFromProducer273/Product13363",
+                    10
+                  ],
+                  [
+                    "http://www4.wiwiss.fu-berlin.de/bizer/bsbm/v01/instances/dataFromProducer281/Product13781",
+                    10
+                  ],
+                  [
+                    "http://www4.wiwiss.fu-berlin.de/bizer/bsbm/v01/instances/dataFromProducer324/Product15748",
+                    10
+                  ],
+                  [
+                    "http://www4.wiwiss.fu-berlin.de/bizer/bsbm/v01/instances/dataFromProducer332/Product16179",
+                    10
+                  ],
+                  [
+                    "http://www4.wiwiss.fu-berlin.de/bizer/bsbm/v01/instances/dataFromProducer530/Product26162",
+                    10
+                  ]
+                ],
+                "raw_answer_sha256": "b9085bed10c5ad08c8c393a58662c418ce8d0ff0d1726f5efc78b2ab11e99a19",
+                "observed_ordered_rows": [
+                  [
+                    "http://www4.wiwiss.fu-berlin.de/bizer/bsbm/v01/instances/dataFromProducer112/Product5279",
+                    12
+                  ],
+                  [
+                    "http://www4.wiwiss.fu-berlin.de/bizer/bsbm/v01/instances/dataFromProducer243/Product11864",
+                    12
+                  ],
+                  [
+                    "http://www4.wiwiss.fu-berlin.de/bizer/bsbm/v01/instances/dataFromProducer27/Product1255",
+                    11
+                  ],
+                  [
+                    "http://www4.wiwiss.fu-berlin.de/bizer/bsbm/v01/instances/dataFromProducer295/Product14488",
+                    11
+                  ],
+                  [
+                    "http://www4.wiwiss.fu-berlin.de/bizer/bsbm/v01/instances/dataFromProducer211/Product10268",
+                    10
+                  ],
+                  [
+                    "http://www4.wiwiss.fu-berlin.de/bizer/bsbm/v01/instances/dataFromProducer273/Product13363",
+                    10
+                  ],
+                  [
+                    "http://www4.wiwiss.fu-berlin.de/bizer/bsbm/v01/instances/dataFromProducer281/Product13781",
+                    10
+                  ],
+                  [
+                    "http://www4.wiwiss.fu-berlin.de/bizer/bsbm/v01/instances/dataFromProducer324/Product15748",
+                    10
+                  ],
+                  [
+                    "http://www4.wiwiss.fu-berlin.de/bizer/bsbm/v01/instances/dataFromProducer332/Product16179",
+                    10
+                  ],
+                  [
+                    "http://www4.wiwiss.fu-berlin.de/bizer/bsbm/v01/instances/dataFromProducer530/Product26162",
+                    10
+                  ]
+                ],
+                "agrees": true
+              },
+              {
+                "query": "bi-q2-2",
+                "query_sha256": "d0a1c13bb3bef07d33da60b815668fca18cd83f95fdee61be8f9cc947cdbbe22",
+                "anchor": "http://www4.wiwiss.fu-berlin.de/bizer/bsbm/v01/instances/dataFromProducer495/Product24357",
+                "anchor_feature_count": 19,
+                "expected_ordered_rows": [
+                  [
+                    "http://www4.wiwiss.fu-berlin.de/bizer/bsbm/v01/instances/dataFromProducer134/Product6443",
+                    9
+                  ],
+                  [
+                    "http://www4.wiwiss.fu-berlin.de/bizer/bsbm/v01/instances/dataFromProducer344/Product16727",
+                    8
+                  ],
+                  [
+                    "http://www4.wiwiss.fu-berlin.de/bizer/bsbm/v01/instances/dataFromProducer374/Product18293",
+                    8
+                  ],
+                  [
+                    "http://www4.wiwiss.fu-berlin.de/bizer/bsbm/v01/instances/dataFromProducer519/Product25595",
+                    8
+                  ],
+                  [
+                    "http://www4.wiwiss.fu-berlin.de/bizer/bsbm/v01/instances/dataFromProducer570/Product28055",
+                    8
+                  ],
+                  [
+                    "http://www4.wiwiss.fu-berlin.de/bizer/bsbm/v01/instances/dataFromProducer146/Product7026",
+                    7
+                  ],
+                  [
+                    "http://www4.wiwiss.fu-berlin.de/bizer/bsbm/v01/instances/dataFromProducer153/Product7369",
+                    7
+                  ],
+                  [
+                    "http://www4.wiwiss.fu-berlin.de/bizer/bsbm/v01/instances/dataFromProducer18/Product852",
+                    7
+                  ],
+                  [
+                    "http://www4.wiwiss.fu-berlin.de/bizer/bsbm/v01/instances/dataFromProducer209/Product10139",
+                    7
+                  ],
+                  [
+                    "http://www4.wiwiss.fu-berlin.de/bizer/bsbm/v01/instances/dataFromProducer226/Product11020",
+                    7
+                  ]
+                ],
+                "raw_answer_sha256": "c7e2c757e4c4efab8e31c718107f3bb9f80efc576a2a8e2baea7492bdf945447",
+                "observed_ordered_rows": [
+                  [
+                    "http://www4.wiwiss.fu-berlin.de/bizer/bsbm/v01/instances/dataFromProducer134/Product6443",
+                    9
+                  ],
+                  [
+                    "http://www4.wiwiss.fu-berlin.de/bizer/bsbm/v01/instances/dataFromProducer344/Product16727",
+                    8
+                  ],
+                  [
+                    "http://www4.wiwiss.fu-berlin.de/bizer/bsbm/v01/instances/dataFromProducer374/Product18293",
+                    8
+                  ],
+                  [
+                    "http://www4.wiwiss.fu-berlin.de/bizer/bsbm/v01/instances/dataFromProducer519/Product25595",
+                    8
+                  ],
+                  [
+                    "http://www4.wiwiss.fu-berlin.de/bizer/bsbm/v01/instances/dataFromProducer570/Product28055",
+                    8
+                  ],
+                  [
+                    "http://www4.wiwiss.fu-berlin.de/bizer/bsbm/v01/instances/dataFromProducer146/Product7026",
+                    7
+                  ],
+                  [
+                    "http://www4.wiwiss.fu-berlin.de/bizer/bsbm/v01/instances/dataFromProducer153/Product7369",
+                    7
+                  ],
+                  [
+                    "http://www4.wiwiss.fu-berlin.de/bizer/bsbm/v01/instances/dataFromProducer18/Product852",
+                    7
+                  ],
+                  [
+                    "http://www4.wiwiss.fu-berlin.de/bizer/bsbm/v01/instances/dataFromProducer209/Product10139",
+                    7
+                  ],
+                  [
+                    "http://www4.wiwiss.fu-berlin.de/bizer/bsbm/v01/instances/dataFromProducer226/Product11020",
+                    7
+                  ]
+                ],
+                "agrees": true
+              },
+              {
+                "query": "bi-q2-3",
+                "query_sha256": "867bc45ecd65b5a2b5c399ef0d861160252c71e2c159aff6ebb15f58f34e63a7",
+                "anchor": "http://www4.wiwiss.fu-berlin.de/bizer/bsbm/v01/instances/dataFromProducer229/Product11168",
+                "anchor_feature_count": 25,
+                "expected_ordered_rows": [
+                  [
+                    "http://www4.wiwiss.fu-berlin.de/bizer/bsbm/v01/instances/dataFromProducer148/Product7150",
+                    11
+                  ],
+                  [
+                    "http://www4.wiwiss.fu-berlin.de/bizer/bsbm/v01/instances/dataFromProducer405/Product19977",
+                    11
+                  ],
+                  [
+                    "http://www4.wiwiss.fu-berlin.de/bizer/bsbm/v01/instances/dataFromProducer233/Product11380",
+                    10
+                  ],
+                  [
+                    "http://www4.wiwiss.fu-berlin.de/bizer/bsbm/v01/instances/dataFromProducer516/Product25490",
+                    10
+                  ],
+                  [
+                    "http://www4.wiwiss.fu-berlin.de/bizer/bsbm/v01/instances/dataFromProducer103/Product4856",
+                    9
+                  ],
+                  [
+                    "http://www4.wiwiss.fu-berlin.de/bizer/bsbm/v01/instances/dataFromProducer129/Product6203",
+                    9
+                  ],
+                  [
+                    "http://www4.wiwiss.fu-berlin.de/bizer/bsbm/v01/instances/dataFromProducer141/Product6782",
+                    9
+                  ],
+                  [
+                    "http://www4.wiwiss.fu-berlin.de/bizer/bsbm/v01/instances/dataFromProducer177/Product8536",
+                    9
+                  ],
+                  [
+                    "http://www4.wiwiss.fu-berlin.de/bizer/bsbm/v01/instances/dataFromProducer180/Product8741",
+                    9
+                  ],
+                  [
+                    "http://www4.wiwiss.fu-berlin.de/bizer/bsbm/v01/instances/dataFromProducer278/Product13648",
+                    9
+                  ]
+                ],
+                "raw_answer_sha256": "c8b18b7bdee29d9b3bdb1a20993bc297bd38b81790e2204cbc8f87adc8433ec0",
+                "observed_ordered_rows": [
+                  [
+                    "http://www4.wiwiss.fu-berlin.de/bizer/bsbm/v01/instances/dataFromProducer148/Product7150",
+                    11
+                  ],
+                  [
+                    "http://www4.wiwiss.fu-berlin.de/bizer/bsbm/v01/instances/dataFromProducer405/Product19977",
+                    11
+                  ],
+                  [
+                    "http://www4.wiwiss.fu-berlin.de/bizer/bsbm/v01/instances/dataFromProducer233/Product11380",
+                    10
+                  ],
+                  [
+                    "http://www4.wiwiss.fu-berlin.de/bizer/bsbm/v01/instances/dataFromProducer516/Product25490",
+                    10
+                  ],
+                  [
+                    "http://www4.wiwiss.fu-berlin.de/bizer/bsbm/v01/instances/dataFromProducer103/Product4856",
+                    9
+                  ],
+                  [
+                    "http://www4.wiwiss.fu-berlin.de/bizer/bsbm/v01/instances/dataFromProducer129/Product6203",
+                    9
+                  ],
+                  [
+                    "http://www4.wiwiss.fu-berlin.de/bizer/bsbm/v01/instances/dataFromProducer141/Product6782",
+                    9
+                  ],
+                  [
+                    "http://www4.wiwiss.fu-berlin.de/bizer/bsbm/v01/instances/dataFromProducer177/Product8536",
+                    9
+                  ],
+                  [
+                    "http://www4.wiwiss.fu-berlin.de/bizer/bsbm/v01/instances/dataFromProducer180/Product8741",
+                    9
+                  ],
+                  [
+                    "http://www4.wiwiss.fu-berlin.de/bizer/bsbm/v01/instances/dataFromProducer278/Product13648",
+                    9
+                  ]
+                ],
+                "agrees": true
+              }
+            ]
+          }
+        },
+        "durability_classes": []
+      },
+      "metadata_note": "Null fields mean this metadata is not available in the common record fields. Read the raw assessment for its own provenance and correctness contract."
+    },
+    {
+      "run_id": "sha256-a84e2bba19c8cb096924b1b5277eff125a3fd01b0a83b5860ce93960e57290d7",
+      "path": "../2026-10-25-pure-ask-prefix-q12b-forge.json",
+      "sha256": "a84e2bba19c8cb096924b1b5277eff125a3fd01b0a83b5860ce93960e57290d7",
+      "format": "bench-record-3",
+      "context": {
+        "suite": "pure-ask-prefix-q12b",
+        "scale": "10m",
+        "manifest": {
+          "suite": "pure-ask-prefix-q12b",
+          "started": "2026-10-25T09:23:17Z",
+          "ended": "2026-10-25T09:23:33Z",
+          "host": {
+            "name": "forge",
+            "cpu": "13th Gen Intel(R) Core(TM) i5-13500",
+            "cpus": 20,
+            "ram_mib": 15620,
+            "disk_model": "",
+            "kernel": "7.2.9",
+            "filesystem": "ext4",
+            "mount_options": "rw,relatime,discard,errors=remount-ro"
+          },
+          "sparkles": {
+            "binary": "/home/kclejeune/lanes/competitive-q12b-20261025/target-release/release/sparkles",
+            "version": "sparkles 0.1.0",
+            "sha256": "2eb92a1d8632eb7b114e79f3ff174385c9092c1c3634587019e3dc80f9149c17",
+            "scripts_commit": "a5847311dc2957c5cd9e62441c7f1815d51a152f",
+            "binary_commit": "b26ce6a9c4158eb53777108632a975927e1864cb",
+            "source_base": "c4380c1a",
+            "source_manifest_sha256": "ebfb0c5964c6314a01a9ae07b13cd5eb19076cffcf28600fa5616a8274519329",
+            "source_patch_sha256": "443ff13f3b20927e78271b3353efa05773e8897fffd5400be3c49430b5b7d21b",
+            "compiler_comments": [
+              "Linker: LLD 22.1.8 (/checkout/src/llvm-project/llvm 52ed14fcd56afc30f9cccd8ca8ce237c2eef7e04)",
+              "rustc version 1.98.1 (48a229cea 2026-09-01)",
+              "GCC: (GNU) 16.2.0",
+              "clang version 21.1.8"
+            ],
+            "generated_ui_sha256": "642c5ddfbacf03a14a9238d2304c3d4900be1f8ba6c9e792417a3bd965659aad"
+          },
+          "engines": {
+            "oxigraph": {
+              "license": "MIT OR Apache-2.0",
+              "binary": "/home/kclejeune/lanes/item1-bench/data/sp2b-10m/gcroots/oxigraph/bin/oxigraph",
+              "sha256": "c99f9c4866b9d25f135729ac8b0e468cc0badd2c2cfe1c4b704f0db375ed8de3",
+              "version": "oxigraph 0.5.11",
+              "store_path": "/nix/store/g7ajfdk0g8bypdbsj23hnfq71izm3iz1-oxigraph-0.5.11",
+              "package": "oxigraph-0.5.11",
+              "reported_version": "oxigraph 0.5.11"
+            }
+          },
+          "memory_limit": "12G",
+          "client_cpu": "11",
+          "data": {
+            "sp2bench-10m": {
+              "license": "BSD",
+              "params": "SP2Bench v1.01 triples=10000000",
+              "sha256": "4486653f3ea16825923eb8a5410137df7ba712aa918442531c33cbeb854eb814",
+              "bytes": 1493565484
+            }
+          },
+          "license_check": {
+            "gpl_benchmark_allowed": false,
+            "notes": [
+              "SP2Bench v1.01, its stock queries and the derived guard queries are BSD licensed."
+            ]
+          }
+        },
+        "settings": {
+          "warmup": 15,
+          "runs": 60,
+          "pooled_runs_per_engine": 120,
+          "timer": "hyperfine+curl",
+          "resultCache": false,
+          "engine_orders": [
+            [
+              "oxigraph",
+              "sparkles"
+            ],
+            [
+              "sparkles",
+              "oxigraph"
+            ]
+          ],
+          "client_cpu": "11",
+          "server_affinity": "unpinned",
+          "memory_limit": "12G",
+          "interpretation": "Oxigraph has the lower mean. The 7.8 percent difference is inside the comparison's ten-percent tie band."
+        },
+        "durability_classes": []
+      },
+      "metadata_note": "Null fields mean this metadata is not available in the common record fields. Read the raw assessment for its own provenance and correctness contract."
+    }
+  ]
+}

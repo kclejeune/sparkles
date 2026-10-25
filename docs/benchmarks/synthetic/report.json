@@ -1,0 +1,55 @@
+{
+  "report_version": 1,
+  "records": [
+    {
+      "run_id": "sha256-ff48d84d4653c833e71917dfcde32c0e3ce4bfc6ffffb03d9783f259dfea5884",
+      "path": "../2026-10-23-synthetic-1.05m-forge.json",
+      "sha256": "ff48d84d4653c833e71917dfcde32c0e3ce4bfc6ffffb03d9783f259dfea5884",
+      "suite": "synthetic",
+      "scale": "1.05m",
+      "host": "forge",
+      "binary_commit": "6699f27d",
+      "settings": {
+        "warmup": 2,
+        "runs": 10,
+        "timer": "hyperfine+curl",
+        "resultCache": false
+      },
+      "mode": "warm",
+      "clients": 1,
+      "engines": [
+        "sparkles",
+        "jena",
+        "qlever",
+        "fluree",
+        "oxigraph"
+      ],
+      "chart": "1.05m-warm.svg"
+    },
+    {
+      "run_id": "sha256-814597a4e8520ffa9ca5101f6e365135a8b2b3dd2d26199454d019802dbf3a18",
+      "path": "../2026-10-23-synthetic-10.5m-forge.json",
+      "sha256": "814597a4e8520ffa9ca5101f6e365135a8b2b3dd2d26199454d019802dbf3a18",
+      "suite": "synthetic",
+      "scale": "10.5m",
+      "host": "forge",
+      "binary_commit": "6699f27d",
+      "settings": {
+        "warmup": 2,
+        "runs": 10,
+        "timer": "hyperfine+curl",
+        "resultCache": false
+      },
+      "mode": "warm",
+      "clients": 1,
+      "engines": [
+        "sparkles",
+        "jena",
+        "qlever",
+        "fluree",
+        "oxigraph"
+      ],
+      "chart": "10.5m-warm.svg"
+    }
+  ]
+}

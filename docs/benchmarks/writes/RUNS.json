@@ -1,0 +1,779 @@
+{
+  "catalog_version": 1,
+  "sources": [
+    {
+      "run_id": "sha256-ff48d84d4653c833e71917dfcde32c0e3ce4bfc6ffffb03d9783f259dfea5884",
+      "path": "../2026-10-23-synthetic-1.05m-forge.json",
+      "sha256": "ff48d84d4653c833e71917dfcde32c0e3ce4bfc6ffffb03d9783f259dfea5884",
+      "format": "bench-record-2",
+      "context": {
+        "suite": "synthetic",
+        "scale": "1.05m",
+        "manifest": {
+          "suite": "synthetic",
+          "started": "2026-10-23T04:44:01Z",
+          "ended": "2026-10-23T05:50:18Z",
+          "host": {
+            "name": "forge",
+            "cpu": "13th Gen Intel(R) Core(TM) i5-13500",
+            "cpus": 20,
+            "ram_mib": 15622,
+            "disk_model": "",
+            "kernel": "6.18.53",
+            "filesystem": "ext4",
+            "mount_options": "rw,relatime,discard,errors=remount-ro"
+          },
+          "sparkles": {
+            "binary": "/home/kclejeune/lanes/item1-refresh-20261023/bin/sparkles-6699f27d",
+            "version": "sparkles 0.1.0",
+            "sha256": "4a94efcb075ea6381b127ec6db5e85cc960d5abecf2426def5baaef264e02f20",
+            "scripts_commit": "e133a8069f69d64f75d6468dbcef46832a9d7389",
+            "binary_commit": "6699f27d",
+            "scripts_note": "The harness checkout was 6699f27d with one commit of the item 1 lane on top, e133a806. It was later rebased onto main as 2bd5ae45 and changes only scripts/bench-record.py and its tests."
+          },
+          "engines": {
+            "jena": {
+              "license": "Apache-2.0",
+              "binary": "/home/kclejeune/lanes/item1-bench/runs/synthetic-1.05m/gcroots/apache-jena-fuseki/bin/fuseki-server",
+              "sha256": "7fb10cdec48244c13ea15e4c0607b29339e5d40c67a12cae2ced41903c1d2743",
+              "version": "Apache Jena Fuseki version 5.1.0",
+              "store_path": "/nix/store/q0dscszid7jzs66xq9dip95z2hc1zmsh-apache-jena-fuseki-5.1.0",
+              "package": "apache-jena-fuseki-5.1.0",
+              "reported_version": "Apache Jena Fuseki version 5.1.0"
+            },
+            "qlever": {
+              "license": "Apache-2.0",
+              "binary": "/home/kclejeune/lanes/item1-bench/runs/synthetic-1.05m/gcroots/qlever/bin/qlever-server",
+              "sha256": "8a3d2eb5259918b6a22607a012e50bf0087dfc9205e37613a03a09a1e68a10dc",
+              "version": "0.5.48",
+              "store_path": "/nix/store/xn7f9c965zfza9nks2qzlrnx916xg3h2-qlever-0.5.48",
+              "package": "qlever-0.5.48",
+              "reported_version": "/home/kclejeune/lanes/item1-bench/runs/synthetic-1.05m/gcroots/qlever/bin/qlever-server 0.0.0-unknown"
+            },
+            "oxigraph": {
+              "license": "MIT OR Apache-2.0",
+              "binary": "/home/kclejeune/lanes/item1-bench/runs/synthetic-1.05m/gcroots/oxigraph/bin/oxigraph",
+              "sha256": "c99f9c4866b9d25f135729ac8b0e468cc0badd2c2cfe1c4b704f0db375ed8de3",
+              "version": "oxigraph 0.5.11",
+              "store_path": "/nix/store/g7ajfdk0g8bypdbsj23hnfq71izm3iz1-oxigraph-0.5.11",
+              "package": "oxigraph-0.5.11",
+              "reported_version": "oxigraph 0.5.11"
+            },
+            "fluree": {
+              "license": "BUSL-1.1",
+              "binary": "/home/kclejeune/lanes/item1-bench/runs/synthetic-1.05m/fluree-4.2.2/fluree-db-cli-x86_64-unknown-linux-gnu/fluree",
+              "sha256": "8d59a9fee1bbb8dc3f77c12c3071ca1802ad64ac1df68e01e2f81d3f28057133",
+              "version": "fluree 4.2.2"
+            }
+          },
+          "memory_limit": "12G",
+          "client_cpu": "11",
+          "data": {
+            "synthetic-1.05m": {
+              "license": "synthetic",
+              "params": "scripts/gen-data.py 100000",
+              "sha256": "c2d387f07a0717fdcd1d001081507b5ac09608961f562f0102d971c36e36edd8",
+              "bytes": 110445630
+            }
+          },
+          "license_check": {
+            "gpl_benchmark_allowed": false,
+            "notes": []
+          },
+          "reused": {
+            "jena": {
+              "started": "2026-10-18T19:37:09Z",
+              "ended": "2026-10-18T20:22:19Z",
+              "host": "forge",
+              "scripts_commit": "81478fbe",
+              "engine": {
+                "license": "Apache-2.0",
+                "binary": "/home/kclejeune/lanes/item1-bench/runs/synthetic-1.05m/gcroots/apache-jena-fuseki/bin/fuseki-server",
+                "sha256": "7fb10cdec48244c13ea15e4c0607b29339e5d40c67a12cae2ced41903c1d2743",
+                "version": "Apache Jena Fuseki version 5.1.0",
+                "store_path": "/nix/store/q0dscszid7jzs66xq9dip95z2hc1zmsh-apache-jena-fuseki-5.1.0",
+                "package": "apache-jena-fuseki-5.1.0",
+                "reported_version": "Apache Jena Fuseki version 5.1.0"
+              },
+              "scripts_commit_source": "BENCHMARKS.md and the batch launcher, since the carried-over run's manifest lacks it"
+            },
+            "qlever": {
+              "started": "2026-10-18T19:37:09Z",
+              "ended": "2026-10-18T20:22:19Z",
+              "host": "forge",
+              "scripts_commit": "81478fbe",
+              "engine": {
+                "license": "Apache-2.0",
+                "binary": "/home/kclejeune/lanes/item1-bench/runs/synthetic-1.05m/gcroots/qlever/bin/qlever-server",
+                "sha256": "8a3d2eb5259918b6a22607a012e50bf0087dfc9205e37613a03a09a1e68a10dc",
+                "version": "0.5.48",
+                "store_path": "/nix/store/xn7f9c965zfza9nks2qzlrnx916xg3h2-qlever-0.5.48",
+                "package": "qlever-0.5.48",
+                "reported_version": "/home/kclejeune/lanes/item1-bench/runs/synthetic-1.05m/gcroots/qlever/bin/qlever-server 0.0.0-unknown"
+              },
+              "scripts_commit_source": "BENCHMARKS.md and the batch launcher, since the carried-over run's manifest lacks it"
+            },
+            "oxigraph": {
+              "started": "2026-10-18T19:37:09Z",
+              "ended": "2026-10-18T20:22:19Z",
+              "host": "forge",
+              "scripts_commit": "81478fbe",
+              "engine": {
+                "license": "MIT OR Apache-2.0",
+                "binary": "/home/kclejeune/lanes/item1-bench/runs/synthetic-1.05m/gcroots/oxigraph/bin/oxigraph",
+                "sha256": "c99f9c4866b9d25f135729ac8b0e468cc0badd2c2cfe1c4b704f0db375ed8de3",
+                "version": "oxigraph 0.5.11",
+                "store_path": "/nix/store/g7ajfdk0g8bypdbsj23hnfq71izm3iz1-oxigraph-0.5.11",
+                "package": "oxigraph-0.5.11",
+                "reported_version": "oxigraph 0.5.11"
+              },
+              "scripts_commit_source": "BENCHMARKS.md and the batch launcher, since the carried-over run's manifest lacks it"
+            },
+            "fluree": {
+              "started": "2026-10-18T19:37:09Z",
+              "ended": "2026-10-18T20:22:19Z",
+              "host": "forge",
+              "scripts_commit": "81478fbe",
+              "engine": {
+                "license": "BUSL-1.1",
+                "binary": "/home/kclejeune/lanes/item1-bench/runs/synthetic-1.05m/fluree-4.2.2/fluree-db-cli-x86_64-unknown-linux-gnu/fluree",
+                "sha256": "8d59a9fee1bbb8dc3f77c12c3071ca1802ad64ac1df68e01e2f81d3f28057133",
+                "version": "fluree 4.2.2"
+              },
+              "scripts_commit_source": "BENCHMARKS.md and the batch launcher, since the carried-over run's manifest lacks it"
+            }
+          }
+        },
+        "settings": {
+          "warmup": 2,
+          "runs": 10,
+          "timer": "hyperfine+curl",
+          "resultCache": false,
+          "mixedLoad": {
+            "note": "scripts/bench.sh MODE=mixed, 16 star-join readers and one writer for 30 s; Sparkles measured on 2026-10-23, the other engines carried over",
+            "results": {
+              "sparkles": {
+                "read_qps": 2491.3,
+                "read_p50_ms": 6.14,
+                "read_p99_ms": 10.89,
+                "read_errors": 0,
+                "writes_per_s": 374.2,
+                "write_p50_ms": 2.333,
+                "write_p99_ms": 6.433,
+                "write_errors": 0
+              },
+              "jena-fuseki": {
+                "read_qps": 80.6,
+                "read_p50_ms": 193.78,
+                "read_p99_ms": 376.17,
+                "read_errors": 0,
+                "writes_per_s": 15.2,
+                "write_p50_ms": 67.935,
+                "write_p99_ms": 86.63,
+                "write_errors": 0
+              },
+              "qlever": {
+                "read_qps": 522.9,
+                "read_p50_ms": 26.89,
+                "read_p99_ms": 36.31,
+                "read_errors": 30034,
+                "writes_per_s": 97.1,
+                "write_p50_ms": 6.219,
+                "write_p99_ms": 30.466,
+                "write_errors": 1046
+              },
+              "fluree": {
+                "read_qps": 36.5,
+                "read_p50_ms": 422.96,
+                "read_p99_ms": 739.69,
+                "read_errors": 0,
+                "writes_per_s": 249.2,
+                "write_p50_ms": 3.769,
+                "write_p99_ms": 14.228,
+                "write_errors": 0
+              },
+              "oxigraph": {
+                "read_qps": 15.0,
+                "read_p50_ms": 1014.17,
+                "read_p99_ms": 1854.97,
+                "read_errors": 0,
+                "writes_per_s": 1272.6,
+                "write_p50_ms": 0.776,
+                "write_p99_ms": 1.023,
+                "write_errors": 0
+              }
+            }
+          }
+        },
+        "durability_classes": [
+          "memory",
+          "synced",
+          "written"
+        ]
+      },
+      "metadata_note": "Null fields mean this metadata is not available in the common record fields. Read the raw assessment for its own provenance and correctness contract."
+    },
+    {
+      "run_id": "sha256-814597a4e8520ffa9ca5101f6e365135a8b2b3dd2d26199454d019802dbf3a18",
+      "path": "../2026-10-23-synthetic-10.5m-forge.json",
+      "sha256": "814597a4e8520ffa9ca5101f6e365135a8b2b3dd2d26199454d019802dbf3a18",
+      "format": "bench-record-2",
+      "context": {
+        "suite": "synthetic",
+        "scale": "10.5m",
+        "manifest": {
+          "suite": "synthetic",
+          "started": "2026-10-23T04:45:37Z",
+          "ended": "2026-10-23T05:52:26Z",
+          "host": {
+            "name": "forge",
+            "cpu": "13th Gen Intel(R) Core(TM) i5-13500",
+            "cpus": 20,
+            "ram_mib": 15622,
+            "disk_model": "",
+            "kernel": "6.18.53",
+            "filesystem": "ext4",
+            "mount_options": "rw,relatime,discard,errors=remount-ro"
+          },
+          "sparkles": {
+            "binary": "/home/kclejeune/lanes/item1-refresh-20261023/bin/sparkles-6699f27d",
+            "version": "sparkles 0.1.0",
+            "sha256": "4a94efcb075ea6381b127ec6db5e85cc960d5abecf2426def5baaef264e02f20",
+            "scripts_commit": "e133a8069f69d64f75d6468dbcef46832a9d7389",
+            "binary_commit": "6699f27d",
+            "scripts_note": "The harness checkout was 6699f27d with one commit of the item 1 lane on top, e133a806. It was later rebased onto main as 2bd5ae45 and changes only scripts/bench-record.py and its tests."
+          },
+          "engines": {
+            "jena": {
+              "license": "Apache-2.0",
+              "binary": "/home/kclejeune/lanes/item1-bench/runs/synthetic-10.5m/gcroots/apache-jena-fuseki/bin/fuseki-server",
+              "sha256": "7fb10cdec48244c13ea15e4c0607b29339e5d40c67a12cae2ced41903c1d2743",
+              "version": "Apache Jena Fuseki version 5.1.0",
+              "store_path": "/nix/store/q0dscszid7jzs66xq9dip95z2hc1zmsh-apache-jena-fuseki-5.1.0",
+              "package": "apache-jena-fuseki-5.1.0",
+              "reported_version": "Apache Jena Fuseki version 5.1.0"
+            },
+            "qlever": {
+              "license": "Apache-2.0",
+              "binary": "/home/kclejeune/lanes/item1-bench/runs/synthetic-10.5m/gcroots/qlever/bin/qlever-server",
+              "sha256": "8a3d2eb5259918b6a22607a012e50bf0087dfc9205e37613a03a09a1e68a10dc",
+              "version": "0.5.48",
+              "store_path": "/nix/store/xn7f9c965zfza9nks2qzlrnx916xg3h2-qlever-0.5.48",
+              "package": "qlever-0.5.48",
+              "reported_version": "/home/kclejeune/lanes/item1-bench/runs/synthetic-10.5m/gcroots/qlever/bin/qlever-server 0.0.0-unknown"
+            },
+            "oxigraph": {
+              "license": "MIT OR Apache-2.0",
+              "binary": "/home/kclejeune/lanes/item1-bench/runs/synthetic-10.5m/gcroots/oxigraph/bin/oxigraph",
+              "sha256": "c99f9c4866b9d25f135729ac8b0e468cc0badd2c2cfe1c4b704f0db375ed8de3",
+              "version": "oxigraph 0.5.11",
+              "store_path": "/nix/store/g7ajfdk0g8bypdbsj23hnfq71izm3iz1-oxigraph-0.5.11",
+              "package": "oxigraph-0.5.11",
+              "reported_version": "oxigraph 0.5.11"
+            },
+            "fluree": {
+              "license": "BUSL-1.1",
+              "binary": "/home/kclejeune/lanes/item1-bench/runs/synthetic-10.5m/fluree-4.2.2/fluree-db-cli-x86_64-unknown-linux-gnu/fluree",
+              "sha256": "8d59a9fee1bbb8dc3f77c12c3071ca1802ad64ac1df68e01e2f81d3f28057133",
+              "version": "fluree 4.2.2"
+            }
+          },
+          "memory_limit": "12G",
+          "client_cpu": "11",
+          "data": {
+            "synthetic-10.5m": {
+              "license": "synthetic",
+              "params": "scripts/gen-data.py 1000000",
+              "sha256": "10daf6486c20f8dd4579d819ea73bb5e7836e054cd6d2d1b73f99f35233635f8",
+              "bytes": 1121336097
+            }
+          },
+          "license_check": {
+            "gpl_benchmark_allowed": false,
+            "notes": []
+          },
+          "reused": {
+            "jena": {
+              "started": "2026-10-18T23:59:44Z",
+              "ended": "2026-10-19T05:23:43Z",
+              "host": "forge",
+              "scripts_commit": "77032452",
+              "engine": {
+                "license": "Apache-2.0",
+                "binary": "/home/kclejeune/lanes/item1-bench/runs/synthetic-10.5m/gcroots/apache-jena-fuseki/bin/fuseki-server",
+                "sha256": "7fb10cdec48244c13ea15e4c0607b29339e5d40c67a12cae2ced41903c1d2743",
+                "version": "Apache Jena Fuseki version 5.1.0",
+                "store_path": "/nix/store/q0dscszid7jzs66xq9dip95z2hc1zmsh-apache-jena-fuseki-5.1.0",
+                "package": "apache-jena-fuseki-5.1.0",
+                "reported_version": "Apache Jena Fuseki version 5.1.0"
+              },
+              "scripts_commit_source": "BENCHMARKS.md and the batch launcher, since the carried-over run's manifest lacks it"
+            },
+            "qlever": {
+              "started": "2026-10-18T23:59:44Z",
+              "ended": "2026-10-19T05:23:43Z",
+              "host": "forge",
+              "scripts_commit": "77032452",
+              "engine": {
+                "license": "Apache-2.0",
+                "binary": "/home/kclejeune/lanes/item1-bench/runs/synthetic-10.5m/gcroots/qlever/bin/qlever-server",
+                "sha256": "8a3d2eb5259918b6a22607a012e50bf0087dfc9205e37613a03a09a1e68a10dc",
+                "version": "0.5.48",
+                "store_path": "/nix/store/xn7f9c965zfza9nks2qzlrnx916xg3h2-qlever-0.5.48",
+                "package": "qlever-0.5.48",
+                "reported_version": "/home/kclejeune/lanes/item1-bench/runs/synthetic-10.5m/gcroots/qlever/bin/qlever-server 0.0.0-unknown"
+              },
+              "scripts_commit_source": "BENCHMARKS.md and the batch launcher, since the carried-over run's manifest lacks it"
+            },
+            "oxigraph": {
+              "started": "2026-10-18T23:59:44Z",
+              "ended": "2026-10-19T05:23:43Z",
+              "host": "forge",
+              "scripts_commit": "77032452",
+              "engine": {
+                "license": "MIT OR Apache-2.0",
+                "binary": "/home/kclejeune/lanes/item1-bench/runs/synthetic-10.5m/gcroots/oxigraph/bin/oxigraph",
+                "sha256": "c99f9c4866b9d25f135729ac8b0e468cc0badd2c2cfe1c4b704f0db375ed8de3",
+                "version": "oxigraph 0.5.11",
+                "store_path": "/nix/store/g7ajfdk0g8bypdbsj23hnfq71izm3iz1-oxigraph-0.5.11",
+                "package": "oxigraph-0.5.11",
+                "reported_version": "oxigraph 0.5.11"
+              },
+              "scripts_commit_source": "BENCHMARKS.md and the batch launcher, since the carried-over run's manifest lacks it"
+            },
+            "fluree": {
+              "started": "2026-10-18T23:59:44Z",
+              "ended": "2026-10-19T05:23:43Z",
+              "host": "forge",
+              "scripts_commit": "77032452",
+              "engine": {
+                "license": "BUSL-1.1",
+                "binary": "/home/kclejeune/lanes/item1-bench/runs/synthetic-10.5m/fluree-4.2.2/fluree-db-cli-x86_64-unknown-linux-gnu/fluree",
+                "sha256": "8d59a9fee1bbb8dc3f77c12c3071ca1802ad64ac1df68e01e2f81d3f28057133",
+                "version": "fluree 4.2.2"
+              },
+              "scripts_commit_source": "BENCHMARKS.md and the batch launcher, since the carried-over run's manifest lacks it"
+            }
+          }
+        },
+        "settings": {
+          "warmup": 2,
+          "runs": 10,
+          "timer": "hyperfine+curl",
+          "resultCache": false,
+          "mixedLoad": {
+            "note": "scripts/bench.sh MODE=mixed, 16 star-join readers and one writer for 30 s; Sparkles measured on 2026-10-23, the other engines carried over",
+            "results": {
+              "sparkles": {
+                "read_qps": 244.1,
+                "read_p50_ms": 64.55,
+                "read_p99_ms": 84.25,
+                "read_errors": 0,
+                "writes_per_s": 265.8,
+                "write_p50_ms": 3.452,
+                "write_p99_ms": 8.002,
+                "write_errors": 0
+              },
+              "jena-fuseki": {
+                "read_qps": 5.7,
+                "read_p50_ms": 2704.1,
+                "read_p99_ms": 3588.42,
+                "read_errors": 0,
+                "writes_per_s": 18.1,
+                "write_p50_ms": 67.306,
+                "write_p99_ms": 87.72,
+                "write_errors": 0
+              },
+              "qlever": {
+                "read_qps": 74.7,
+                "read_p50_ms": 212.07,
+                "read_p99_ms": 257.6,
+                "read_errors": 0,
+                "writes_per_s": 47.5,
+                "write_p50_ms": 10.663,
+                "write_p99_ms": 133.64,
+                "write_errors": 0
+              },
+              "fluree": {
+                "read_qps": 3.4,
+                "read_p50_ms": 4284.89,
+                "read_p99_ms": 6931.13,
+                "read_errors": 0,
+                "writes_per_s": 237.8,
+                "write_p50_ms": 3.813,
+                "write_p99_ms": 16.834,
+                "write_errors": 0
+              },
+              "oxigraph": {
+                "read_qps": 0.0,
+                "read_p50_ms": null,
+                "read_p99_ms": null,
+                "read_errors": 0,
+                "writes_per_s": 565.1,
+                "write_p50_ms": 1.623,
+                "write_p99_ms": 3.922,
+                "write_errors": 0
+              }
+            }
+          }
+        },
+        "durability_classes": [
+          "memory",
+          "synced",
+          "written"
+        ]
+      },
+      "metadata_note": "Null fields mean this metadata is not available in the common record fields. Read the raw assessment for its own provenance and correctness contract."
+    },
+    {
+      "run_id": "sha256-96a316330ed755b488bc929dcef718de69f97a6632db33577fe473f671dc2736",
+      "path": "../2026-10-23-synthetic-updates-1.05m-forge.json",
+      "sha256": "96a316330ed755b488bc929dcef718de69f97a6632db33577fe473f671dc2736",
+      "format": "bench-record-2",
+      "context": {
+        "suite": "synthetic-updates",
+        "scale": "1.05m",
+        "manifest": {
+          "suite": "synthetic",
+          "started": "2026-10-23T04:44:01Z",
+          "ended": "2026-10-23T05:50:18Z",
+          "host": {
+            "name": "forge",
+            "cpu": "13th Gen Intel(R) Core(TM) i5-13500",
+            "cpus": 20,
+            "ram_mib": 15622,
+            "disk_model": "",
+            "kernel": "6.18.53",
+            "filesystem": "ext4",
+            "mount_options": "rw,relatime,discard,errors=remount-ro"
+          },
+          "sparkles": {
+            "binary": "/home/kclejeune/lanes/item1-refresh-20261023/bin/sparkles-6699f27d",
+            "version": "sparkles 0.1.0",
+            "sha256": "4a94efcb075ea6381b127ec6db5e85cc960d5abecf2426def5baaef264e02f20",
+            "scripts_commit": "e133a8069f69d64f75d6468dbcef46832a9d7389",
+            "binary_commit": "6699f27d",
+            "scripts_note": "The harness checkout was 6699f27d with one commit of the item 1 lane on top, e133a806. It was later rebased onto main as 2bd5ae45 and changes only scripts/bench-record.py and its tests."
+          },
+          "engines": {
+            "jena": {
+              "license": "Apache-2.0",
+              "binary": "/home/kclejeune/lanes/item1-bench/runs/synthetic-1.05m/gcroots/apache-jena-fuseki/bin/fuseki-server",
+              "sha256": "7fb10cdec48244c13ea15e4c0607b29339e5d40c67a12cae2ced41903c1d2743",
+              "version": "Apache Jena Fuseki version 5.1.0",
+              "store_path": "/nix/store/q0dscszid7jzs66xq9dip95z2hc1zmsh-apache-jena-fuseki-5.1.0",
+              "package": "apache-jena-fuseki-5.1.0",
+              "reported_version": "Apache Jena Fuseki version 5.1.0"
+            },
+            "qlever": {
+              "license": "Apache-2.0",
+              "binary": "/home/kclejeune/lanes/item1-bench/runs/synthetic-1.05m/gcroots/qlever/bin/qlever-server",
+              "sha256": "8a3d2eb5259918b6a22607a012e50bf0087dfc9205e37613a03a09a1e68a10dc",
+              "version": "0.5.48",
+              "store_path": "/nix/store/xn7f9c965zfza9nks2qzlrnx916xg3h2-qlever-0.5.48",
+              "package": "qlever-0.5.48",
+              "reported_version": "/home/kclejeune/lanes/item1-bench/runs/synthetic-1.05m/gcroots/qlever/bin/qlever-server 0.0.0-unknown"
+            },
+            "oxigraph": {
+              "license": "MIT OR Apache-2.0",
+              "binary": "/home/kclejeune/lanes/item1-bench/runs/synthetic-1.05m/gcroots/oxigraph/bin/oxigraph",
+              "sha256": "c99f9c4866b9d25f135729ac8b0e468cc0badd2c2cfe1c4b704f0db375ed8de3",
+              "version": "oxigraph 0.5.11",
+              "store_path": "/nix/store/g7ajfdk0g8bypdbsj23hnfq71izm3iz1-oxigraph-0.5.11",
+              "package": "oxigraph-0.5.11",
+              "reported_version": "oxigraph 0.5.11"
+            },
+            "fluree": {
+              "license": "BUSL-1.1",
+              "binary": "/home/kclejeune/lanes/item1-bench/runs/synthetic-1.05m/fluree-4.2.2/fluree-db-cli-x86_64-unknown-linux-gnu/fluree",
+              "sha256": "8d59a9fee1bbb8dc3f77c12c3071ca1802ad64ac1df68e01e2f81d3f28057133",
+              "version": "fluree 4.2.2"
+            }
+          },
+          "memory_limit": "12G",
+          "client_cpu": "11",
+          "data": {
+            "synthetic-1.05m": {
+              "license": "synthetic",
+              "params": "scripts/gen-data.py 100000",
+              "sha256": "c2d387f07a0717fdcd1d001081507b5ac09608961f562f0102d971c36e36edd8",
+              "bytes": 110445630
+            }
+          },
+          "license_check": {
+            "gpl_benchmark_allowed": false,
+            "notes": []
+          },
+          "reused": {
+            "jena": {
+              "started": "2026-10-18T19:37:09Z",
+              "ended": "2026-10-18T20:22:19Z",
+              "host": "forge",
+              "scripts_commit": "81478fbe",
+              "engine": {
+                "license": "Apache-2.0",
+                "binary": "/home/kclejeune/lanes/item1-bench/runs/synthetic-1.05m/gcroots/apache-jena-fuseki/bin/fuseki-server",
+                "sha256": "7fb10cdec48244c13ea15e4c0607b29339e5d40c67a12cae2ced41903c1d2743",
+                "version": "Apache Jena Fuseki version 5.1.0",
+                "store_path": "/nix/store/q0dscszid7jzs66xq9dip95z2hc1zmsh-apache-jena-fuseki-5.1.0",
+                "package": "apache-jena-fuseki-5.1.0",
+                "reported_version": "Apache Jena Fuseki version 5.1.0"
+              },
+              "scripts_commit_source": "BENCHMARKS.md and the batch launcher, since the carried-over run's manifest lacks it"
+            },
+            "qlever": {
+              "started": "2026-10-18T19:37:09Z",
+              "ended": "2026-10-18T20:22:19Z",
+              "host": "forge",
+              "scripts_commit": "81478fbe",
+              "engine": {
+                "license": "Apache-2.0",
+                "binary": "/home/kclejeune/lanes/item1-bench/runs/synthetic-1.05m/gcroots/qlever/bin/qlever-server",
+                "sha256": "8a3d2eb5259918b6a22607a012e50bf0087dfc9205e37613a03a09a1e68a10dc",
+                "version": "0.5.48",
+                "store_path": "/nix/store/xn7f9c965zfza9nks2qzlrnx916xg3h2-qlever-0.5.48",
+                "package": "qlever-0.5.48",
+                "reported_version": "/home/kclejeune/lanes/item1-bench/runs/synthetic-1.05m/gcroots/qlever/bin/qlever-server 0.0.0-unknown"
+              },
+              "scripts_commit_source": "BENCHMARKS.md and the batch launcher, since the carried-over run's manifest lacks it"
+            },
+            "oxigraph": {
+              "started": "2026-10-18T19:37:09Z",
+              "ended": "2026-10-18T20:22:19Z",
+              "host": "forge",
+              "scripts_commit": "81478fbe",
+              "engine": {
+                "license": "MIT OR Apache-2.0",
+                "binary": "/home/kclejeune/lanes/item1-bench/runs/synthetic-1.05m/gcroots/oxigraph/bin/oxigraph",
+                "sha256": "c99f9c4866b9d25f135729ac8b0e468cc0badd2c2cfe1c4b704f0db375ed8de3",
+                "version": "oxigraph 0.5.11",
+                "store_path": "/nix/store/g7ajfdk0g8bypdbsj23hnfq71izm3iz1-oxigraph-0.5.11",
+                "package": "oxigraph-0.5.11",
+                "reported_version": "oxigraph 0.5.11"
+              },
+              "scripts_commit_source": "BENCHMARKS.md and the batch launcher, since the carried-over run's manifest lacks it"
+            },
+            "fluree": {
+              "started": "2026-10-18T19:37:09Z",
+              "ended": "2026-10-18T20:22:19Z",
+              "host": "forge",
+              "scripts_commit": "81478fbe",
+              "engine": {
+                "license": "BUSL-1.1",
+                "binary": "/home/kclejeune/lanes/item1-bench/runs/synthetic-1.05m/fluree-4.2.2/fluree-db-cli-x86_64-unknown-linux-gnu/fluree",
+                "sha256": "8d59a9fee1bbb8dc3f77c12c3071ca1802ad64ac1df68e01e2f81d3f28057133",
+                "version": "fluree 4.2.2"
+              },
+              "scripts_commit_source": "BENCHMARKS.md and the batch launcher, since the carried-over run's manifest lacks it"
+            }
+          }
+        },
+        "settings": {
+          "warmup": 2,
+          "runs": 10,
+          "timer": "hyperfine+curl",
+          "resultCache": false
+        },
+        "durability_classes": [
+          "memory",
+          "synced",
+          "written"
+        ]
+      },
+      "metadata_note": "Null fields mean this metadata is not available in the common record fields. Read the raw assessment for its own provenance and correctness contract."
+    },
+    {
+      "run_id": "sha256-d8739f9b0845bb54cccec339b9fa14144dbb714a5050be96253121ae5dd94160",
+      "path": "../2026-10-23-synthetic-updates-10.5m-forge.json",
+      "sha256": "d8739f9b0845bb54cccec339b9fa14144dbb714a5050be96253121ae5dd94160",
+      "format": "bench-record-2",
+      "context": {
+        "suite": "synthetic-updates",
+        "scale": "10.5m",
+        "manifest": {
+          "suite": "synthetic",
+          "started": "2026-10-23T04:45:37Z",
+          "ended": "2026-10-23T05:52:26Z",
+          "host": {
+            "name": "forge",
+            "cpu": "13th Gen Intel(R) Core(TM) i5-13500",
+            "cpus": 20,
+            "ram_mib": 15622,
+            "disk_model": "",
+            "kernel": "6.18.53",
+            "filesystem": "ext4",
+            "mount_options": "rw,relatime,discard,errors=remount-ro"
+          },
+          "sparkles": {
+            "binary": "/home/kclejeune/lanes/item1-refresh-20261023/bin/sparkles-6699f27d",
+            "version": "sparkles 0.1.0",
+            "sha256": "4a94efcb075ea6381b127ec6db5e85cc960d5abecf2426def5baaef264e02f20",
+            "scripts_commit": "e133a8069f69d64f75d6468dbcef46832a9d7389",
+            "binary_commit": "6699f27d",
+            "scripts_note": "The harness checkout was 6699f27d with one commit of the item 1 lane on top, e133a806. It was later rebased onto main as 2bd5ae45 and changes only scripts/bench-record.py and its tests."
+          },
+          "engines": {
+            "jena": {
+              "license": "Apache-2.0",
+              "binary": "/home/kclejeune/lanes/item1-bench/runs/synthetic-10.5m/gcroots/apache-jena-fuseki/bin/fuseki-server",
+              "sha256": "7fb10cdec48244c13ea15e4c0607b29339e5d40c67a12cae2ced41903c1d2743",
+              "version": "Apache Jena Fuseki version 5.1.0",
+              "store_path": "/nix/store/q0dscszid7jzs66xq9dip95z2hc1zmsh-apache-jena-fuseki-5.1.0",
+              "package": "apache-jena-fuseki-5.1.0",
+              "reported_version": "Apache Jena Fuseki version 5.1.0"
+            },
+            "qlever": {
+              "license": "Apache-2.0",
+              "binary": "/home/kclejeune/lanes/item1-bench/runs/synthetic-10.5m/gcroots/qlever/bin/qlever-server",
+              "sha256": "8a3d2eb5259918b6a22607a012e50bf0087dfc9205e37613a03a09a1e68a10dc",
+              "version": "0.5.48",
+              "store_path": "/nix/store/xn7f9c965zfza9nks2qzlrnx916xg3h2-qlever-0.5.48",
+              "package": "qlever-0.5.48",
+              "reported_version": "/home/kclejeune/lanes/item1-bench/runs/synthetic-10.5m/gcroots/qlever/bin/qlever-server 0.0.0-unknown"
+            },
+            "oxigraph": {
+              "license": "MIT OR Apache-2.0",
+              "binary": "/home/kclejeune/lanes/item1-bench/runs/synthetic-10.5m/gcroots/oxigraph/bin/oxigraph",
+              "sha256": "c99f9c4866b9d25f135729ac8b0e468cc0badd2c2cfe1c4b704f0db375ed8de3",
+              "version": "oxigraph 0.5.11",
+              "store_path": "/nix/store/g7ajfdk0g8bypdbsj23hnfq71izm3iz1-oxigraph-0.5.11",
+              "package": "oxigraph-0.5.11",
+              "reported_version": "oxigraph 0.5.11"
+            },
+            "fluree": {
+              "license": "BUSL-1.1",
+              "binary": "/home/kclejeune/lanes/item1-bench/runs/synthetic-10.5m/fluree-4.2.2/fluree-db-cli-x86_64-unknown-linux-gnu/fluree",
+              "sha256": "8d59a9fee1bbb8dc3f77c12c3071ca1802ad64ac1df68e01e2f81d3f28057133",
+              "version": "fluree 4.2.2"
+            }
+          },
+          "memory_limit": "12G",
+          "client_cpu": "11",
+          "data": {
+            "synthetic-10.5m": {
+              "license": "synthetic",
+              "params": "scripts/gen-data.py 1000000",
+              "sha256": "10daf6486c20f8dd4579d819ea73bb5e7836e054cd6d2d1b73f99f35233635f8",
+              "bytes": 1121336097
+            }
+          },
+          "license_check": {
+            "gpl_benchmark_allowed": false,
+            "notes": []
+          },
+          "reused": {
+            "jena": {
+              "started": "2026-10-18T23:59:44Z",
+              "ended": "2026-10-19T05:23:43Z",
+              "host": "forge",
+              "scripts_commit": "77032452",
+              "engine": {
+                "license": "Apache-2.0",
+                "binary": "/home/kclejeune/lanes/item1-bench/runs/synthetic-10.5m/gcroots/apache-jena-fuseki/bin/fuseki-server",
+                "sha256": "7fb10cdec48244c13ea15e4c0607b29339e5d40c67a12cae2ced41903c1d2743",
+                "version": "Apache Jena Fuseki version 5.1.0",
+                "store_path": "/nix/store/q0dscszid7jzs66xq9dip95z2hc1zmsh-apache-jena-fuseki-5.1.0",
+                "package": "apache-jena-fuseki-5.1.0",
+                "reported_version": "Apache Jena Fuseki version 5.1.0"
+              },
+              "scripts_commit_source": "BENCHMARKS.md and the batch launcher, since the carried-over run's manifest lacks it"
+            },
+            "qlever": {
+              "started": "2026-10-18T23:59:44Z",
+              "ended": "2026-10-19T05:23:43Z",
+              "host": "forge",
+              "scripts_commit": "77032452",
+              "engine": {
+                "license": "Apache-2.0",
+                "binary": "/home/kclejeune/lanes/item1-bench/runs/synthetic-10.5m/gcroots/qlever/bin/qlever-server",
+                "sha256": "8a3d2eb5259918b6a22607a012e50bf0087dfc9205e37613a03a09a1e68a10dc",
+                "version": "0.5.48",
+                "store_path": "/nix/store/xn7f9c965zfza9nks2qzlrnx916xg3h2-qlever-0.5.48",
+                "package": "qlever-0.5.48",
+                "reported_version": "/home/kclejeune/lanes/item1-bench/runs/synthetic-10.5m/gcroots/qlever/bin/qlever-server 0.0.0-unknown"
+              },
+              "scripts_commit_source": "BENCHMARKS.md and the batch launcher, since the carried-over run's manifest lacks it"
+            },
+            "oxigraph": {
+              "started": "2026-10-18T23:59:44Z",
+              "ended": "2026-10-19T05:23:43Z",
+              "host": "forge",
+              "scripts_commit": "77032452",
+              "engine": {
+                "license": "MIT OR Apache-2.0",
+                "binary": "/home/kclejeune/lanes/item1-bench/runs/synthetic-10.5m/gcroots/oxigraph/bin/oxigraph",
+                "sha256": "c99f9c4866b9d25f135729ac8b0e468cc0badd2c2cfe1c4b704f0db375ed8de3",
+                "version": "oxigraph 0.5.11",
+                "store_path": "/nix/store/g7ajfdk0g8bypdbsj23hnfq71izm3iz1-oxigraph-0.5.11",
+                "package": "oxigraph-0.5.11",
+                "reported_version": "oxigraph 0.5.11"
+              },
+              "scripts_commit_source": "BENCHMARKS.md and the batch launcher, since the carried-over run's manifest lacks it"
+            },
+            "fluree": {
+              "started": "2026-10-18T23:59:44Z",
+              "ended": "2026-10-19T05:23:43Z",
+              "host": "forge",
+              "scripts_commit": "77032452",
+              "engine": {
+                "license": "BUSL-1.1",
+                "binary": "/home/kclejeune/lanes/item1-bench/runs/synthetic-10.5m/fluree-4.2.2/fluree-db-cli-x86_64-unknown-linux-gnu/fluree",
+                "sha256": "8d59a9fee1bbb8dc3f77c12c3071ca1802ad64ac1df68e01e2f81d3f28057133",
+                "version": "fluree 4.2.2"
+              },
+              "scripts_commit_source": "BENCHMARKS.md and the batch launcher, since the carried-over run's manifest lacks it"
+            }
+          }
+        },
+        "settings": {
+          "warmup": 2,
+          "runs": 10,
+          "timer": "hyperfine+curl",
+          "resultCache": false
+        },
+        "durability_classes": [
+          "memory",
+          "synced",
+          "written"
+        ]
+      },
+      "metadata_note": "Null fields mean this metadata is not available in the common record fields. Read the raw assessment for its own provenance and correctness contract."
+    },
+    {
+      "run_id": "sha256-dd72453a4fc08d77bb6acdce3b74539b1f04130cdeb50ff9be37990f5fa777e0",
+      "path": "../2026-10-25-durable-write-assessment-forge.json",
+      "sha256": "dd72453a4fc08d77bb6acdce3b74539b1f04130cdeb50ff9be37990f5fa777e0",
+      "format": "legacy-assessment",
+      "context": {
+        "suite": "bounded-durable-write-assessment",
+        "scale": null,
+        "manifest": null,
+        "settings": null,
+        "durability_classes": [],
+        "legacy_metadata": {
+          "measurement_contract": {
+            "host": "forge",
+            "runtime": "4f2e1633",
+            "build_source": "c4380c1a, fixture-only differences",
+            "sparkles_sha256": "3fcc24ed7a99676d7da68c8a095aa73383056a5e6c988e993050b3fed52e5bab",
+            "oxigraph_version": "0.5.11",
+            "oxigraph_sha256": "c99f9c4866b9d25f135729ac8b0e468cc0badd2c2cfe1c4b704f0db375ed8de3",
+            "durability": {
+              "sparkles": "synchronization before successful acknowledgement",
+              "oxigraph": "unsynced commits, a distinct durability class"
+            },
+            "isolation": "One engine alone,7GiB/no swap, bench then heavy host locks",
+            "rounds": "Two rounds with reversed engine order, fresh complete store copies with sync and settle",
+            "serial": "5000 effective distinct changes per process,888 literal inserts2612 IRI inserts1500 deletes, fresh HTTP connection per request",
+            "mixed": "One new-literal writer and16 unpaced star-join readers for30seconds; count completedHTTP200/elapsed, record16 cancellation attempts separately",
+            "correctness": "All80000 before/after churn state checks and all Sparkles offline checks pass; initial mixed reader bags agree. Mixed run has no separate post-restart state oracle. No crash/power-loss evidence is inferred.",
+            "scope": "Bounded assessment only. No production write optimization was kept or measured as a candidate. Measurements are not an equal completed-read-work comparison."
+          },
+          "baseline_runtime_commit": "4f2e1633",
+          "assessment_version": 1
+        }
+      },
+      "metadata_note": "Null fields mean this metadata is not available in the common record fields. Read the raw assessment for its own provenance and correctness contract."
+    }
+  ]
+}

@@ -1,0 +1,467 @@
+{
+  "version": 1,
+  "anchors": {
+    "measurement-coverage": {
+      "path": "docs/benchmarks/overview/RESULTS.md",
+      "anchor": "measurement-coverage"
+    },
+    "summary": {
+      "path": "docs/benchmarks/overview/RESULTS.md",
+      "anchor": "summary"
+    },
+    "where-sparkles-loses": {
+      "path": "docs/benchmarks/overview/RESULTS.md",
+      "anchor": "where-sparkles-loses"
+    },
+    "synthetic-suite": {
+      "path": "docs/benchmarks/synthetic/RESULTS.md",
+      "anchor": "synthetic-suite"
+    },
+    "synthetic-suite-at-105m-triples": {
+      "path": "docs/benchmarks/synthetic/RESULTS.md",
+      "anchor": "synthetic-suite-at-105m-triples"
+    },
+    "synthetic-suite-at-105m-triples-1": {
+      "path": "docs/benchmarks/synthetic/RESULTS.md",
+      "anchor": "synthetic-suite-at-105m-triples-1"
+    },
+    "request-latency-without-client-startup": {
+      "path": "docs/benchmarks/synthetic/RESULTS.md",
+      "anchor": "request-latency-without-client-startup"
+    },
+    "cold-starts": {
+      "path": "docs/benchmarks/synthetic/RESULTS.md",
+      "anchor": "cold-starts"
+    },
+    "watdiv": {
+      "path": "docs/benchmarks/watdiv/RESULTS.md",
+      "anchor": "watdiv"
+    },
+    "sp\u00b2bench": {
+      "path": "docs/benchmarks/sp2bench/RESULTS.md",
+      "anchor": "sp\u00b2bench"
+    },
+    "lubm-and-reasoning": {
+      "path": "docs/benchmarks/reasoning/RESULTS.md",
+      "anchor": "lubm-and-reasoning"
+    },
+    "lubm100": {
+      "path": "docs/benchmarks/reasoning/RESULTS.md",
+      "anchor": "lubm100"
+    },
+    "materialization-at-scale": {
+      "path": "docs/benchmarks/reasoning/RESULTS.md",
+      "anchor": "materialization-at-scale"
+    },
+    "small-incremental-runs": {
+      "path": "docs/benchmarks/reasoning/RESULTS.md",
+      "anchor": "small-incremental-runs"
+    },
+    "dbpedia": {
+      "path": "docs/benchmarks/dbpedia/RESULTS.md",
+      "anchor": "dbpedia"
+    },
+    "dbpedia-at-the-50m-slice": {
+      "path": "docs/benchmarks/dbpedia/RESULTS.md",
+      "anchor": "dbpedia-at-the-50m-slice"
+    },
+    "dbpedia-at-124-billion-triples": {
+      "path": "docs/benchmarks/dbpedia/RESULTS.md",
+      "anchor": "dbpedia-at-124-billion-triples"
+    },
+    "why-count-all-and-predicate-counts-differ": {
+      "path": "docs/benchmarks/dbpedia/RESULTS.md",
+      "anchor": "why-count-all-and-predicate-counts-differ"
+    },
+    "numeric-literals-in-the-vocabulary": {
+      "path": "docs/benchmarks/dbpedia/RESULTS.md",
+      "anchor": "numeric-literals-in-the-vocabulary"
+    },
+    "prefix-filtering-and-large-results": {
+      "path": "docs/benchmarks/dbpedia/RESULTS.md",
+      "anchor": "prefix-filtering-and-large-results"
+    },
+    "cursor-expression-reuse-controls": {
+      "path": "docs/benchmarks/dbpedia/RESULTS.md",
+      "anchor": "cursor-expression-reuse-controls"
+    },
+    "bsbm": {
+      "path": "docs/benchmarks/bsbm/RESULTS.md",
+      "anchor": "bsbm"
+    },
+    "bsbm-explore-at-10m-triples": {
+      "path": "docs/benchmarks/bsbm/RESULTS.md",
+      "anchor": "bsbm-explore-at-10m-triples"
+    },
+    "bsbm-bi-at-10m-triples": {
+      "path": "docs/benchmarks/bsbm/RESULTS.md",
+      "anchor": "bsbm-bi-at-10m-triples"
+    },
+    "full-text-search": {
+      "path": "docs/benchmarks/full-text/RESULTS.md",
+      "anchor": "full-text-search"
+    },
+    "full-text-index-and-observability": {
+      "path": "docs/benchmarks/full-text/RESULTS.md",
+      "anchor": "full-text-index-and-observability"
+    },
+    "vector-search": {
+      "path": "docs/benchmarks/vector/RESULTS.md",
+      "anchor": "vector-search"
+    },
+    "spatial-queries": {
+      "path": "docs/benchmarks/spatial/RESULTS.md",
+      "anchor": "spatial-queries"
+    },
+    "geosparql-compliance-benchmark": {
+      "path": "docs/benchmarks/spatial/RESULTS.md",
+      "anchor": "geosparql-compliance-benchmark"
+    },
+    "paths-and-graph-algorithms": {
+      "path": "docs/benchmarks/graph/RESULTS.md",
+      "anchor": "paths-and-graph-algorithms"
+    },
+    "path-search": {
+      "path": "docs/benchmarks/graph/RESULTS.md",
+      "anchor": "path-search"
+    },
+    "weighted-pair-searches": {
+      "path": "docs/benchmarks/graph/RESULTS.md",
+      "anchor": "weighted-pair-searches"
+    },
+    "graph-algorithms": {
+      "path": "docs/benchmarks/graph/RESULTS.md",
+      "anchor": "graph-algorithms"
+    },
+    "engine-features-and-overheads": {
+      "path": "docs/benchmarks/engine/RESULTS.md",
+      "anchor": "engine-features-and-overheads"
+    },
+    "query-execution-features": {
+      "path": "docs/benchmarks/engine/RESULTS.md",
+      "anchor": "query-execution-features"
+    },
+    "the-fixed-cost-of-a-plain-query": {
+      "path": "docs/benchmarks/engine/RESULTS.md",
+      "anchor": "the-fixed-cost-of-a-plain-query"
+    },
+    "the-cost-of-plan-pattern-references": {
+      "path": "docs/benchmarks/engine/RESULTS.md",
+      "anchor": "the-cost-of-plan-pattern-references"
+    },
+    "the-cost-of-result-serialization": {
+      "path": "docs/benchmarks/engine/RESULTS.md",
+      "anchor": "the-cost-of-result-serialization"
+    },
+    "the-cost-of-the-query-memory-pool": {
+      "path": "docs/benchmarks/engine/RESULTS.md",
+      "anchor": "the-cost-of-the-query-memory-pool"
+    },
+    "planning-large-basic-graph-patterns": {
+      "path": "docs/benchmarks/engine/RESULTS.md",
+      "anchor": "planning-large-basic-graph-patterns"
+    },
+    "schema-reports-and-ask-on-dbpedia": {
+      "path": "docs/benchmarks/engine/RESULTS.md",
+      "anchor": "schema-reports-and-ask-on-dbpedia"
+    },
+    "the-explore-overview": {
+      "path": "docs/benchmarks/engine/RESULTS.md",
+      "anchor": "the-explore-overview"
+    },
+    "predicate-patterns": {
+      "path": "docs/benchmarks/engine/RESULTS.md",
+      "anchor": "predicate-patterns"
+    },
+    "fsst-vocabulary-suffixes": {
+      "path": "docs/benchmarks/engine/RESULTS.md",
+      "anchor": "fsst-vocabulary-suffixes"
+    },
+    "loading-and-index-builds": {
+      "path": "docs/benchmarks/loading/RESULTS.md",
+      "anchor": "loading-and-index-builds"
+    },
+    "bulk-loading": {
+      "path": "docs/benchmarks/loading/RESULTS.md",
+      "anchor": "bulk-loading"
+    },
+    "compressed-inputs": {
+      "path": "docs/benchmarks/loading/RESULTS.md",
+      "anchor": "compressed-inputs"
+    },
+    "index-builds": {
+      "path": "docs/benchmarks/loading/RESULTS.md",
+      "anchor": "index-builds"
+    },
+    "validation": {
+      "path": "docs/benchmarks/loading/RESULTS.md",
+      "anchor": "validation"
+    },
+    "compaction": {
+      "path": "docs/benchmarks/loading/RESULTS.md",
+      "anchor": "compaction"
+    },
+    "document-conversion-in-a-child-process": {
+      "path": "docs/benchmarks/loading/RESULTS.md",
+      "anchor": "document-conversion-in-a-child-process"
+    },
+    "tables-through-mappings": {
+      "path": "docs/benchmarks/loading/RESULTS.md",
+      "anchor": "tables-through-mappings"
+    },
+    "writes-and-updates": {
+      "path": "docs/benchmarks/writes/RESULTS.md",
+      "anchor": "writes-and-updates"
+    },
+    "durable-commit-latency": {
+      "path": "docs/benchmarks/writes/RESULTS.md",
+      "anchor": "durable-commit-latency"
+    },
+    "serial-writes-with-reader-work": {
+      "path": "docs/benchmarks/writes/RESULTS.md",
+      "anchor": "serial-writes-with-reader-work"
+    },
+    "concurrent-durable-commits": {
+      "path": "docs/benchmarks/writes/RESULTS.md",
+      "anchor": "concurrent-durable-commits"
+    },
+    "group-commit-on-indexed-datasets": {
+      "path": "docs/benchmarks/writes/RESULTS.md",
+      "anchor": "group-commit-on-indexed-datasets"
+    },
+    "serial-commits": {
+      "path": "docs/benchmarks/writes/RESULTS.md",
+      "anchor": "serial-commits"
+    },
+    "four-writers": {
+      "path": "docs/benchmarks/writes/RESULTS.md",
+      "anchor": "four-writers"
+    },
+    "readers-during-writes": {
+      "path": "docs/benchmarks/writes/RESULTS.md",
+      "anchor": "readers-during-writes"
+    },
+    "memory": {
+      "path": "docs/benchmarks/writes/RESULTS.md",
+      "anchor": "memory"
+    },
+    "limits-of-these-runs": {
+      "path": "docs/benchmarks/writes/RESULTS.md",
+      "anchor": "limits-of-these-runs"
+    },
+    "full-text-checkpoint": {
+      "path": "docs/benchmarks/writes/RESULTS.md",
+      "anchor": "full-text-checkpoint"
+    },
+    "reader-tail-of-group-commit": {
+      "path": "docs/benchmarks/writes/RESULTS.md",
+      "anchor": "reader-tail-of-group-commit"
+    },
+    "concurrent-writers-with-snapshot-readers": {
+      "path": "docs/benchmarks/writes/RESULTS.md",
+      "anchor": "concurrent-writers-with-snapshot-readers"
+    },
+    "write-throughput-with-one-client": {
+      "path": "docs/benchmarks/writes/RESULTS.md",
+      "anchor": "write-throughput-with-one-client"
+    },
+    "mixed-load": {
+      "path": "docs/benchmarks/writes/RESULTS.md",
+      "anchor": "mixed-load"
+    },
+    "queries-after-updates": {
+      "path": "docs/benchmarks/writes/RESULTS.md",
+      "anchor": "queries-after-updates"
+    },
+    "automatic-compaction": {
+      "path": "docs/benchmarks/writes/RESULTS.md",
+      "anchor": "automatic-compaction"
+    },
+    "validation-on-writes": {
+      "path": "docs/benchmarks/writes/RESULTS.md",
+      "anchor": "validation-on-writes"
+    },
+    "spatial-index-commit-cost": {
+      "path": "docs/benchmarks/writes/RESULTS.md",
+      "anchor": "spatial-index-commit-cost"
+    },
+    "branches-and-merges": {
+      "path": "docs/benchmarks/writes/RESULTS.md",
+      "anchor": "branches-and-merges"
+    },
+    "point-in-time-reads": {
+      "path": "docs/benchmarks/writes/RESULTS.md",
+      "anchor": "point-in-time-reads"
+    },
+    "diffs-grouped-by-class": {
+      "path": "docs/benchmarks/writes/RESULTS.md",
+      "anchor": "diffs-grouped-by-class"
+    },
+    "backup-repositories": {
+      "path": "docs/benchmarks/writes/RESULTS.md",
+      "anchor": "backup-repositories"
+    },
+    "incremental-views": {
+      "path": "docs/benchmarks/writes/RESULTS.md",
+      "anchor": "incremental-views"
+    },
+    "bindings": {
+      "path": "docs/benchmarks/bindings/RESULTS.md",
+      "anchor": "bindings"
+    },
+    "jvm": {
+      "path": "docs/benchmarks/bindings/RESULTS.md",
+      "anchor": "jvm"
+    },
+    "python": {
+      "path": "docs/benchmarks/bindings/RESULTS.md",
+      "anchor": "python"
+    },
+    "nodejs": {
+      "path": "docs/benchmarks/bindings/RESULTS.md",
+      "anchor": "nodejs"
+    },
+    "per-call-costs": {
+      "path": "docs/benchmarks/bindings/RESULTS.md",
+      "anchor": "per-call-costs"
+    },
+    "native-term-validation": {
+      "path": "docs/benchmarks/bindings/RESULTS.md",
+      "anchor": "native-term-validation"
+    },
+    "natural-language-questions": {
+      "path": "docs/benchmarks/natural-language/RESULTS.md",
+      "anchor": "natural-language-questions"
+    },
+    "ask-on-dbpedia": {
+      "path": "docs/benchmarks/natural-language/RESULTS.md",
+      "anchor": "ask-on-dbpedia"
+    },
+    "global-answering": {
+      "path": "docs/benchmarks/natural-language/RESULTS.md",
+      "anchor": "global-answering"
+    },
+    "memory-and-disk": {
+      "path": "docs/benchmarks/memory/RESULTS.md",
+      "anchor": "memory-and-disk"
+    },
+    "server-memory-and-index-size": {
+      "path": "docs/benchmarks/memory/RESULTS.md",
+      "anchor": "server-memory-and-index-size"
+    },
+    "memory-and-the-speed-it-buys": {
+      "path": "docs/benchmarks/memory/RESULTS.md",
+      "anchor": "memory-and-the-speed-it-buys"
+    },
+    "batch-kernels-and-disk-spill": {
+      "path": "docs/benchmarks/memory/RESULTS.md",
+      "anchor": "batch-kernels-and-disk-spill"
+    },
+    "groupings-with-exists": {
+      "path": "docs/benchmarks/memory/RESULTS.md",
+      "anchor": "groupings-with-exists"
+    },
+    "parallel-cursor-filters": {
+      "path": "docs/benchmarks/memory/RESULTS.md",
+      "anchor": "parallel-cursor-filters"
+    },
+    "compression-of-exports-and-backups": {
+      "path": "docs/benchmarks/memory/RESULTS.md",
+      "anchor": "compression-of-exports-and-backups"
+    },
+    "methodology-and-reproduction": {
+      "path": "docs/benchmarks/reference/README.md",
+      "anchor": "methodology-and-reproduction"
+    },
+    "setup": {
+      "path": "docs/benchmarks/reference/README.md",
+      "anchor": "setup"
+    },
+    "answer-checks": {
+      "path": "docs/benchmarks/reference/README.md",
+      "anchor": "answer-checks"
+    },
+    "engine-failures": {
+      "path": "docs/benchmarks/reference/README.md",
+      "anchor": "engine-failures"
+    },
+    "what-the-benchmarks-do-not-cover": {
+      "path": "docs/benchmarks/reference/README.md",
+      "anchor": "what-the-benchmarks-do-not-cover"
+    },
+    "reproducing": {
+      "path": "docs/benchmarks/reference/README.md",
+      "anchor": "reproducing"
+    },
+    "sp2bench": {
+      "path": "docs/benchmarks/sp2bench/RESULTS.md",
+      "anchor": "sp2bench"
+    },
+    "sp2bench-at-10m-triples": {
+      "path": "docs/benchmarks/sp2bench/RESULTS.md",
+      "anchor": "sp2bench-at-10m-triples"
+    },
+    "full-text-index-and-observability-105m-triples": {
+      "path": "docs/benchmarks/full-text/RESULTS.md",
+      "anchor": "full-text-index-and-observability-105m-triples"
+    },
+    "graph-algorithm-polling": {
+      "path": "docs/benchmarks/graph/RESULTS.md",
+      "anchor": "graph-algorithm-polling"
+    },
+    "partial-compaction-and-the-spatial-index": {
+      "path": "docs/benchmarks/loading/RESULTS.md",
+      "anchor": "partial-compaction-and-the-spatial-index"
+    },
+    "group-commit-on-indexed-datasets-on-forge": {
+      "path": "docs/benchmarks/writes/RESULTS.md",
+      "anchor": "group-commit-on-indexed-datasets-on-forge"
+    },
+    "bounded-full-text-checkpoint-on-forge": {
+      "path": "docs/benchmarks/writes/RESULTS.md",
+      "anchor": "bounded-full-text-checkpoint-on-forge"
+    },
+    "http-write-snapshot": {
+      "path": "docs/benchmarks/writes/RESULTS.md",
+      "anchor": "http-write-snapshot"
+    },
+    "automatic-compaction-105m-triples": {
+      "path": "docs/benchmarks/writes/RESULTS.md",
+      "anchor": "automatic-compaction-105m-triples"
+    },
+    "other-measurements": {
+      "path": "docs/benchmarks/writes/RESULTS.md",
+      "anchor": "other-measurements"
+    },
+    "branches-and-merges-105m-triples": {
+      "path": "docs/benchmarks/writes/RESULTS.md",
+      "anchor": "branches-and-merges-105m-triples"
+    },
+    "point-in-time-reads-105m-triples": {
+      "path": "docs/benchmarks/writes/RESULTS.md",
+      "anchor": "point-in-time-reads-105m-triples"
+    },
+    "backup-repositories-105m-triples": {
+      "path": "docs/benchmarks/writes/RESULTS.md",
+      "anchor": "backup-repositories-105m-triples"
+    },
+    "streaming-execution": {
+      "path": "docs/benchmarks/memory/RESULTS.md",
+      "anchor": "streaming-execution"
+    },
+    "automatic-exists": {
+      "path": "docs/benchmarks/memory/RESULTS.md",
+      "anchor": "automatic-exists"
+    },
+    "compression-105m-triples": {
+      "path": "docs/benchmarks/memory/RESULTS.md",
+      "anchor": "compression-105m-triples"
+    }
+  },
+  "import": {
+    "path": "docs/BENCHMARKS.md",
+    "revision": "8b8896a3bf23200a0addcd86716d9037732bcec0",
+    "sha256": "83a6266c4a46c1a2a9cd2ef2267db37d776bf6109625c86767a8e9d8df5367f3",
+    "table_rows": 1065
+  }
+}

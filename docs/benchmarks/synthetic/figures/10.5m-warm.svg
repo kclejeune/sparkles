@@ -1,0 +1,212 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1000" height="1117" viewBox="0 0 1000 1117" role="img" aria-labelledby="title desc">
+<title id="title">Synthetic 10.5m warm queries</title>
+<desc id="desc">Warm query medians in milliseconds on a logarithmic horizontal axis. Lower is faster. Unqualified or failed results have no point. Dots on the same row represent the same answer fingerprint.</desc>
+<rect width="100%" height="100%" fill="white"/>
+<g font-family="sans-serif" font-size="13" fill="#222">
+<text x="24" y="28" font-size="20">Synthetic 10.5m warm queries</text>
+<text x="24" y="50">Measured medians in ms · logarithmic axis · lower is faster</text>
+<circle cx="24" cy="76" r="4" fill="#1254a1"/>
+<text x="34" y="80">sparkles</text>
+<circle cx="209" cy="76" r="4" fill="#a84300"/>
+<text x="219" y="80">jena</text>
+<circle cx="394" cy="76" r="4" fill="#21734b"/>
+<text x="404" y="80">qlever</text>
+<circle cx="579" cy="76" r="4" fill="#8c3789"/>
+<text x="589" y="80">fluree</text>
+<circle cx="764" cy="76" r="4" fill="#555555"/>
+<text x="774" y="80">oxigraph</text>
+<line x1="210.00" x2="210.00" y1="96" y2="1075" stroke="#ddd"/>
+<text x="210.00" y="1097" text-anchor="middle">1</text>
+<line x1="331.67" x2="331.67" y1="96" y2="1075" stroke="#ddd"/>
+<text x="331.67" y="1097" text-anchor="middle">10</text>
+<line x1="453.33" x2="453.33" y1="96" y2="1075" stroke="#ddd"/>
+<text x="453.33" y="1097" text-anchor="middle">100</text>
+<line x1="575.00" x2="575.00" y1="96" y2="1075" stroke="#ddd"/>
+<text x="575.00" y="1097" text-anchor="middle">1000</text>
+<line x1="696.67" x2="696.67" y1="96" y2="1075" stroke="#ddd"/>
+<text x="696.67" y="1097" text-anchor="middle">10000</text>
+<line x1="818.33" x2="818.33" y1="96" y2="1075" stroke="#ddd"/>
+<text x="818.33" y="1097" text-anchor="middle">100000</text>
+<line x1="940.00" x2="940.00" y1="96" y2="1075" stroke="#ddd"/>
+<text x="940.00" y="1097" text-anchor="middle">1e+06</text>
+<text x="198" y="114" text-anchor="end">contains</text>
+<line x1="210" x2="940" y1="110" y2="110" stroke="#eee"/>
+<circle cx="312.41" cy="102" r="3.5" fill="#1254a1"><title>contains / sparkles: 6.946 ms</title></circle>
+<circle cx="626.60" cy="106" r="3.5" fill="#a84300"><title>contains / jena: 2655.333 ms</title></circle>
+<circle cx="555.31" cy="110" r="3.5" fill="#21734b"><title>contains / qlever: 688.868 ms</title></circle>
+<circle cx="361.75" cy="114" r="3.5" fill="#8c3789"><title>contains / fluree: 17.672 ms</title></circle>
+<circle cx="597.49" cy="118" r="3.5" fill="#555555"><title>contains / oxigraph: 1530.649 ms</title></circle>
+<text x="198" y="148" text-anchor="end">count-all</text>
+<line x1="210" x2="940" y1="144" y2="144" stroke="#eee"/>
+<circle cx="276.07" cy="136" r="3.5" fill="#1254a1"><title>count-all / sparkles: 3.492 ms</title></circle>
+<circle cx="607.60" cy="140" r="3.5" fill="#a84300"><title>count-all / jena: 1853.249 ms</title></circle>
+<circle cx="417.94" cy="144" r="3.5" fill="#21734b"><title>count-all / qlever: 51.176 ms</title></circle>
+<circle cx="623.58" cy="152" r="3.5" fill="#555555"><title>count-all / oxigraph: 2507.657 ms</title></circle>
+<text x="198" y="182" text-anchor="end">distinct-join</text>
+<line x1="210" x2="940" y1="178" y2="178" stroke="#eee"/>
+<circle cx="415.43" cy="170" r="3.5" fill="#1254a1"><title>distinct-join / sparkles: 48.804 ms</title></circle>
+<circle cx="653.44" cy="174" r="3.5" fill="#a84300"><title>distinct-join / jena: 4412.914 ms</title></circle>
+<circle cx="476.23" cy="178" r="3.5" fill="#21734b"><title>distinct-join / qlever: 154.232 ms</title></circle>
+<circle cx="675.22" cy="186" r="3.5" fill="#555555"><title>distinct-join / oxigraph: 6663.829 ms</title></circle>
+<text x="198" y="216" text-anchor="end">distinct-obj</text>
+<line x1="210" x2="940" y1="212" y2="212" stroke="#eee"/>
+<circle cx="275.40" cy="204" r="3.5" fill="#1254a1"><title>distinct-obj / sparkles: 3.448 ms</title></circle>
+<circle cx="591.18" cy="208" r="3.5" fill="#a84300"><title>distinct-obj / jena: 1358.180 ms</title></circle>
+<circle cx="491.57" cy="212" r="3.5" fill="#21734b"><title>distinct-obj / qlever: 206.187 ms</title></circle>
+<circle cx="277.90" cy="216" r="3.5" fill="#8c3789"><title>distinct-obj / fluree: 3.615 ms</title></circle>
+<circle cx="559.66" cy="220" r="3.5" fill="#555555"><title>distinct-obj / oxigraph: 747.976 ms</title></circle>
+<text x="198" y="250" text-anchor="end">employee-docs</text>
+<line x1="210" x2="940" y1="246" y2="246" stroke="#eee"/>
+<circle cx="278.06" cy="238" r="3.5" fill="#1254a1"><title>employee-docs / sparkles: 3.625 ms</title></circle>
+<circle cx="311.81" cy="242" r="3.5" fill="#a84300"><title>employee-docs / jena: 6.868 ms</title></circle>
+<circle cx="348.70" cy="246" r="3.5" fill="#21734b"><title>employee-docs / qlever: 13.803 ms</title></circle>
+<circle cx="288.53" cy="254" r="3.5" fill="#555555"><title>employee-docs / oxigraph: 4.420 ms</title></circle>
+<text x="198" y="284" text-anchor="end">exists-join</text>
+<line x1="210" x2="940" y1="280" y2="280" stroke="#eee"/>
+<circle cx="352.91" cy="272" r="3.5" fill="#1254a1"><title>exists-join / sparkles: 14.948 ms</title></circle>
+<circle cx="599.04" cy="276" r="3.5" fill="#a84300"><title>exists-join / jena: 1576.053 ms</title></circle>
+<circle cx="428.10" cy="280" r="3.5" fill="#21734b"><title>exists-join / qlever: 62.025 ms</title></circle>
+<circle cx="829.19" cy="288" r="3.5" fill="#555555"><title>exists-join / oxigraph: 122804.524 ms</title></circle>
+<text x="198" y="318" text-anchor="end">export-500k</text>
+<line x1="210" x2="940" y1="314" y2="314" stroke="#eee"/>
+<circle cx="440.44" cy="306" r="3.5" fill="#1254a1"><title>export-500k / sparkles: 78.344 ms</title></circle>
+<circle cx="541.52" cy="310" r="3.5" fill="#a84300"><title>export-500k / jena: 530.702 ms</title></circle>
+<circle cx="554.14" cy="314" r="3.5" fill="#21734b"><title>export-500k / qlever: 673.768 ms</title></circle>
+<circle cx="509.44" cy="318" r="3.5" fill="#8c3789"><title>export-500k / fluree: 289.175 ms</title></circle>
+<circle cx="614.48" cy="322" r="3.5" fill="#555555"><title>export-500k / oxigraph: 2110.887 ms</title></circle>
+<text x="198" y="352" text-anchor="end">expr-agg-arg</text>
+<line x1="210" x2="940" y1="348" y2="348" stroke="#eee"/>
+<circle cx="383.89" cy="340" r="3.5" fill="#1254a1"><title>expr-agg-arg / sparkles: 26.869 ms</title></circle>
+<circle cx="606.05" cy="344" r="3.5" fill="#a84300"><title>expr-agg-arg / jena: 1799.763 ms</title></circle>
+<circle cx="449.58" cy="348" r="3.5" fill="#21734b"><title>expr-agg-arg / qlever: 93.143 ms</title></circle>
+<circle cx="649.00" cy="356" r="3.5" fill="#555555"><title>expr-agg-arg / oxigraph: 4057.375 ms</title></circle>
+<text x="198" y="386" text-anchor="end">expr-bind-group</text>
+<line x1="210" x2="940" y1="382" y2="382" stroke="#eee"/>
+<circle cx="328.03" cy="374" r="3.5" fill="#1254a1"><title>expr-bind-group / sparkles: 9.335 ms</title></circle>
+<circle cx="529.91" cy="378" r="3.5" fill="#a84300"><title>expr-bind-group / jena: 426.003 ms</title></circle>
+<circle cx="394.24" cy="382" r="3.5" fill="#21734b"><title>expr-bind-group / qlever: 32.684 ms</title></circle>
+<circle cx="519.84" cy="390" r="3.5" fill="#555555"><title>expr-bind-group / oxigraph: 352.084 ms</title></circle>
+<text x="198" y="420" text-anchor="end">expr-order-key</text>
+<line x1="210" x2="940" y1="416" y2="416" stroke="#eee"/>
+<circle cx="356.46" cy="408" r="3.5" fill="#1254a1"><title>expr-order-key / sparkles: 15.989 ms</title></circle>
+<circle cx="567.94" cy="412" r="3.5" fill="#a84300"><title>expr-order-key / jena: 874.854 ms</title></circle>
+<circle cx="457.80" cy="416" r="3.5" fill="#21734b"><title>expr-order-key / qlever: 108.829 ms</title></circle>
+<circle cx="767.55" cy="424" r="3.5" fill="#555555"><title>expr-order-key / oxigraph: 38246.607 ms</title></circle>
+<text x="198" y="454" text-anchor="end">group-avg</text>
+<line x1="210" x2="940" y1="450" y2="450" stroke="#eee"/>
+<circle cx="414.21" cy="442" r="3.5" fill="#1254a1"><title>group-avg / sparkles: 47.688 ms</title></circle>
+<circle cx="647.13" cy="446" r="3.5" fill="#a84300"><title>group-avg / jena: 3915.762 ms</title></circle>
+<circle cx="449.76" cy="450" r="3.5" fill="#21734b"><title>group-avg / qlever: 93.462 ms</title></circle>
+<circle cx="543.57" cy="454" r="3.5" fill="#8c3789"><title>group-avg / fluree: 551.711 ms</title></circle>
+<circle cx="651.29" cy="458" r="3.5" fill="#555555"><title>group-avg / oxigraph: 4237.172 ms</title></circle>
+<text x="198" y="488" text-anchor="end">knows-reach</text>
+<line x1="210" x2="940" y1="484" y2="484" stroke="#eee"/>
+<circle cx="473.05" cy="476" r="3.5" fill="#1254a1"><title>knows-reach / sparkles: 145.219 ms</title></circle>
+<circle cx="582.40" cy="484" r="3.5" fill="#21734b"><title>knows-reach / qlever: 1150.348 ms</title></circle>
+<circle cx="659.41" cy="492" r="3.5" fill="#555555"><title>knows-reach / oxigraph: 4940.412 ms</title></circle>
+<text x="198" y="522" text-anchor="end">lang-filter</text>
+<line x1="210" x2="940" y1="518" y2="518" stroke="#eee"/>
+<circle cx="306.58" cy="510" r="3.5" fill="#1254a1"><title>lang-filter / sparkles: 6.221 ms</title></circle>
+<circle cx="607.59" cy="514" r="3.5" fill="#a84300"><title>lang-filter / jena: 1852.903 ms</title></circle>
+<circle cx="524.58" cy="518" r="3.5" fill="#21734b"><title>lang-filter / qlever: 385.133 ms</title></circle>
+<circle cx="566.76" cy="526" r="3.5" fill="#555555"><title>lang-filter / oxigraph: 855.585 ms</title></circle>
+<text x="198" y="556" text-anchor="end">minus</text>
+<line x1="210" x2="940" y1="552" y2="552" stroke="#eee"/>
+<circle cx="316.17" cy="544" r="3.5" fill="#1254a1"><title>minus / sparkles: 7.458 ms</title></circle>
+<circle cx="542.22" cy="548" r="3.5" fill="#a84300"><title>minus / jena: 537.729 ms</title></circle>
+<circle cx="367.12" cy="552" r="3.5" fill="#21734b"><title>minus / qlever: 19.561 ms</title></circle>
+<circle cx="520.20" cy="560" r="3.5" fill="#555555"><title>minus / oxigraph: 354.445 ms</title></circle>
+<text x="198" y="590" text-anchor="end">not-exists</text>
+<line x1="210" x2="940" y1="586" y2="586" stroke="#eee"/>
+<circle cx="352.87" cy="578" r="3.5" fill="#1254a1"><title>not-exists / sparkles: 14.938 ms</title></circle>
+<circle cx="539.60" cy="582" r="3.5" fill="#a84300"><title>not-exists / jena: 511.701 ms</title></circle>
+<circle cx="382.63" cy="586" r="3.5" fill="#21734b"><title>not-exists / qlever: 26.236 ms</title></circle>
+<circle cx="577.25" cy="594" r="3.5" fill="#555555"><title>not-exists / oxigraph: 1043.524 ms</title></circle>
+<text x="198" y="624" text-anchor="end">optional-chain</text>
+<line x1="210" x2="940" y1="620" y2="620" stroke="#eee"/>
+<circle cx="443.07" cy="612" r="3.5" fill="#1254a1"><title>optional-chain / sparkles: 82.343 ms</title></circle>
+<circle cx="631.44" cy="616" r="3.5" fill="#a84300"><title>optional-chain / jena: 2910.042 ms</title></circle>
+<circle cx="544.25" cy="620" r="3.5" fill="#21734b"><title>optional-chain / qlever: 558.856 ms</title></circle>
+<circle cx="659.15" cy="628" r="3.5" fill="#555555"><title>optional-chain / oxigraph: 4916.376 ms</title></circle>
+<text x="198" y="658" text-anchor="end">optional-count</text>
+<line x1="210" x2="940" y1="654" y2="654" stroke="#eee"/>
+<circle cx="332.63" cy="646" r="3.5" fill="#1254a1"><title>optional-count / sparkles: 10.184 ms</title></circle>
+<circle cx="578.35" cy="650" r="3.5" fill="#a84300"><title>optional-count / jena: 1065.507 ms</title></circle>
+<circle cx="411.82" cy="654" r="3.5" fill="#21734b"><title>optional-count / qlever: 45.586 ms</title></circle>
+<circle cx="459.74" cy="658" r="3.5" fill="#8c3789"><title>optional-count / fluree: 112.894 ms</title></circle>
+<circle cx="574.60" cy="662" r="3.5" fill="#555555"><title>optional-count / oxigraph: 992.386 ms</title></circle>
+<text x="198" y="692" text-anchor="end">order-by-full</text>
+<line x1="210" x2="940" y1="688" y2="688" stroke="#eee"/>
+<circle cx="522.00" cy="680" r="3.5" fill="#1254a1"><title>order-by-full / sparkles: 366.793 ms</title></circle>
+<circle cx="722.63" cy="684" r="3.5" fill="#a84300"><title>order-by-full / jena: 16346.286 ms</title></circle>
+<circle cx="592.00" cy="688" r="3.5" fill="#21734b"><title>order-by-full / qlever: 1379.604 ms</title></circle>
+<circle cx="607.94" cy="692" r="3.5" fill="#8c3789"><title>order-by-full / fluree: 1865.403 ms</title></circle>
+<circle cx="787.39" cy="696" r="3.5" fill="#555555"><title>order-by-full / oxigraph: 55680.625 ms</title></circle>
+<text x="198" y="726" text-anchor="end">path-plus</text>
+<line x1="210" x2="940" y1="722" y2="722" stroke="#eee"/>
+<circle cx="275.88" cy="714" r="3.5" fill="#1254a1"><title>path-plus / sparkles: 3.479 ms</title></circle>
+<circle cx="312.22" cy="718" r="3.5" fill="#a84300"><title>path-plus / jena: 6.921 ms</title></circle>
+<circle cx="326.94" cy="722" r="3.5" fill="#21734b"><title>path-plus / qlever: 9.145 ms</title></circle>
+<circle cx="417.14" cy="726" r="3.5" fill="#8c3789"><title>path-plus / fluree: 50.407 ms</title></circle>
+<circle cx="279.25" cy="730" r="3.5" fill="#555555"><title>path-plus / oxigraph: 3.708 ms</title></circle>
+<text x="198" y="760" text-anchor="end">predicate-counts</text>
+<line x1="210" x2="940" y1="756" y2="756" stroke="#eee"/>
+<circle cx="275.31" cy="748" r="3.5" fill="#1254a1"><title>predicate-counts / sparkles: 3.442 ms</title></circle>
+<circle cx="636.11" cy="752" r="3.5" fill="#a84300"><title>predicate-counts / jena: 3178.941 ms</title></circle>
+<circle cx="435.33" cy="756" r="3.5" fill="#21734b"><title>predicate-counts / qlever: 71.125 ms</title></circle>
+<circle cx="548.50" cy="760" r="3.5" fill="#8c3789"><title>predicate-counts / fluree: 605.588 ms</title></circle>
+<circle cx="629.66" cy="764" r="3.5" fill="#555555"><title>predicate-counts / oxigraph: 2813.701 ms</title></circle>
+<text x="198" y="794" text-anchor="end">range-topk</text>
+<line x1="210" x2="940" y1="790" y2="790" stroke="#eee"/>
+<circle cx="308.88" cy="782" r="3.5" fill="#1254a1"><title>range-topk / sparkles: 6.496 ms</title></circle>
+<circle cx="568.29" cy="786" r="3.5" fill="#a84300"><title>range-topk / jena: 880.721 ms</title></circle>
+<circle cx="367.99" cy="790" r="3.5" fill="#21734b"><title>range-topk / qlever: 19.887 ms</title></circle>
+<circle cx="475.84" cy="794" r="3.5" fill="#8c3789"><title>range-topk / fluree: 153.106 ms</title></circle>
+<circle cx="547.43" cy="798" r="3.5" fill="#555555"><title>range-topk / oxigraph: 593.423 ms</title></circle>
+<text x="198" y="828" text-anchor="end">regex-iri</text>
+<line x1="210" x2="940" y1="824" y2="824" stroke="#eee"/>
+<circle cx="321.68" cy="816" r="3.5" fill="#1254a1"><title>regex-iri / sparkles: 8.277 ms</title></circle>
+<circle cx="649.46" cy="820" r="3.5" fill="#a84300"><title>regex-iri / jena: 4092.745 ms</title></circle>
+<circle cx="553.10" cy="824" r="3.5" fill="#21734b"><title>regex-iri / qlever: 660.668 ms</title></circle>
+<circle cx="627.46" cy="832" r="3.5" fill="#555555"><title>regex-iri / oxigraph: 2699.083 ms</title></circle>
+<text x="198" y="862" text-anchor="end">star-join</text>
+<line x1="210" x2="940" y1="858" y2="858" stroke="#eee"/>
+<circle cx="399.51" cy="850" r="3.5" fill="#1254a1"><title>star-join / sparkles: 36.107 ms</title></circle>
+<circle cx="506.69" cy="854" r="3.5" fill="#a84300"><title>star-join / jena: 274.510 ms</title></circle>
+<circle cx="462.40" cy="858" r="3.5" fill="#21734b"><title>star-join / qlever: 118.726 ms</title></circle>
+<circle cx="471.17" cy="862" r="3.5" fill="#8c3789"><title>star-join / fluree: 140.153 ms</title></circle>
+<circle cx="657.56" cy="866" r="3.5" fill="#555555"><title>star-join / oxigraph: 4770.218 ms</title></circle>
+<text x="198" y="896" text-anchor="end">star-lookup</text>
+<line x1="210" x2="940" y1="892" y2="892" stroke="#eee"/>
+<circle cx="279.39" cy="884" r="3.5" fill="#1254a1"><title>star-lookup / sparkles: 3.718 ms</title></circle>
+<circle cx="311.77" cy="888" r="3.5" fill="#a84300"><title>star-lookup / jena: 6.862 ms</title></circle>
+<circle cx="378.29" cy="892" r="3.5" fill="#21734b"><title>star-lookup / qlever: 24.166 ms</title></circle>
+<circle cx="295.26" cy="900" r="3.5" fill="#555555"><title>star-lookup / oxigraph: 5.021 ms</title></circle>
+<text x="198" y="930" text-anchor="end">subquery-agg</text>
+<line x1="210" x2="940" y1="926" y2="926" stroke="#eee"/>
+<circle cx="290.24" cy="918" r="3.5" fill="#1254a1"><title>subquery-agg / sparkles: 4.566 ms</title></circle>
+<circle cx="547.11" cy="922" r="3.5" fill="#a84300"><title>subquery-agg / jena: 589.865 ms</title></circle>
+<circle cx="351.40" cy="926" r="3.5" fill="#21734b"><title>subquery-agg / qlever: 14.527 ms</title></circle>
+<circle cx="485.32" cy="934" r="3.5" fill="#555555"><title>subquery-agg / oxigraph: 183.177 ms</title></circle>
+<text x="198" y="964" text-anchor="end">two-hop-count</text>
+<line x1="210" x2="940" y1="960" y2="960" stroke="#eee"/>
+<circle cx="359.73" cy="952" r="3.5" fill="#1254a1"><title>two-hop-count / sparkles: 17.008 ms</title></circle>
+<circle cx="647.52" cy="956" r="3.5" fill="#a84300"><title>two-hop-count / jena: 3944.735 ms</title></circle>
+<circle cx="431.28" cy="960" r="3.5" fill="#21734b"><title>two-hop-count / qlever: 65.879 ms</title></circle>
+<circle cx="399.22" cy="964" r="3.5" fill="#8c3789"><title>two-hop-count / fluree: 35.910 ms</title></circle>
+<circle cx="686.71" cy="968" r="3.5" fill="#555555"><title>two-hop-count / oxigraph: 8282.131 ms</title></circle>
+<text x="198" y="998" text-anchor="end">types-grouped</text>
+<line x1="210" x2="940" y1="994" y2="994" stroke="#eee"/>
+<circle cx="277.77" cy="986" r="3.5" fill="#1254a1"><title>types-grouped / sparkles: 3.606 ms</title></circle>
+<circle cx="639.65" cy="990" r="3.5" fill="#a84300"><title>types-grouped / jena: 3399.132 ms</title></circle>
+<circle cx="306.07" cy="994" r="3.5" fill="#21734b"><title>types-grouped / qlever: 6.161 ms</title></circle>
+<circle cx="458.66" cy="998" r="3.5" fill="#8c3789"><title>types-grouped / fluree: 110.596 ms</title></circle>
+<circle cx="524.55" cy="1002" r="3.5" fill="#555555"><title>types-grouped / oxigraph: 384.861 ms</title></circle>
+<text x="198" y="1032" text-anchor="end">values-star</text>
+<line x1="210" x2="940" y1="1028" y2="1028" stroke="#eee"/>
+<circle cx="280.79" cy="1020" r="3.5" fill="#1254a1"><title>values-star / sparkles: 3.818 ms</title></circle>
+<circle cx="318.96" cy="1024" r="3.5" fill="#a84300"><title>values-star / jena: 7.863 ms</title></circle>
+<circle cx="336.28" cy="1028" r="3.5" fill="#21734b"><title>values-star / qlever: 10.913 ms</title></circle>
+<circle cx="282.30" cy="1036" r="3.5" fill="#555555"><title>values-star / oxigraph: 3.929 ms</title></circle>
+</g>
+</svg>

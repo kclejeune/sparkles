@@ -1,0 +1,333 @@
+{
+  "catalog_version": 1,
+  "sources": [
+    {
+      "run_id": "sha256-358fa3163afce43b86582b4b9102910749b5ccfc13c69d54c9bc3730952c5973",
+      "path": "../2026-10-20-watdiv-100-forge.json",
+      "sha256": "358fa3163afce43b86582b4b9102910749b5ccfc13c69d54c9bc3730952c5973",
+      "format": "bench-record-2",
+      "context": {
+        "suite": "watdiv",
+        "scale": "100",
+        "manifest": {
+          "suite": "watdiv",
+          "started": "2026-10-20T21:08:13Z",
+          "ended": "2026-10-20T21:26:50Z",
+          "host": {
+            "name": "forge",
+            "cpu": "13th Gen Intel(R) Core(TM) i5-13500",
+            "cpus": 20,
+            "ram_mib": 15622,
+            "disk_model": "",
+            "kernel": "6.18.53",
+            "filesystem": "ext4",
+            "mount_options": "rw,relatime,discard,errors=remount-ro"
+          },
+          "sparkles": {
+            "binary": "/home/kclejeune/lanes/item1-bench/bin/sparkles-81478fbe",
+            "version": "sparkles 0.1.0",
+            "sha256": "bdf866ebd1e2aea9ea472af6ad481d7c557c92e09c64eef3e799ee56cb6eb97d",
+            "scripts_commit": "aa53c0e661bbb2a173cd15ca569d50cc830c4bd6",
+            "binary_commit": "81478fbe"
+          },
+          "engines": {
+            "jena": {
+              "license": "Apache-2.0",
+              "binary": "/nix/store/q0dscszid7jzs66xq9dip95z2hc1zmsh-apache-jena-fuseki-5.1.0/bin/fuseki-server",
+              "sha256": "7fb10cdec48244c13ea15e4c0607b29339e5d40c67a12cae2ced41903c1d2743",
+              "version": "Apache Jena Fuseki version 5.1.0",
+              "store_path": "/nix/store/q0dscszid7jzs66xq9dip95z2hc1zmsh-apache-jena-fuseki-5.1.0",
+              "package": "apache-jena-fuseki-5.1.0",
+              "reported_version": "Apache Jena Fuseki version 5.1.0"
+            },
+            "qlever": {
+              "license": "Apache-2.0",
+              "binary": "/nix/store/xn7f9c965zfza9nks2qzlrnx916xg3h2-qlever-0.5.48/bin/qlever-server",
+              "sha256": "8a3d2eb5259918b6a22607a012e50bf0087dfc9205e37613a03a09a1e68a10dc",
+              "version": "0.5.48",
+              "store_path": "/nix/store/xn7f9c965zfza9nks2qzlrnx916xg3h2-qlever-0.5.48",
+              "package": "qlever-0.5.48",
+              "reported_version": "/nix/store/xn7f9c965zfza9nks2qzlrnx916xg3h2-qlever-0.5.48/bin/qlever-server 0.0.0-unknown"
+            },
+            "fluree": {
+              "license": "BUSL-1.1",
+              "binary": "/nix/store/jvhxwjlhzijkd1kvrh8l7wfkbclp8vnx-fluree-4.2.2/bin/fluree",
+              "sha256": "99629db65b6eb0d7d9b7cafdc48806eee8ab71e9568fe389b983accaaa35f7ff",
+              "version": "fluree 4.2.2",
+              "store_path": "/nix/store/jvhxwjlhzijkd1kvrh8l7wfkbclp8vnx-fluree-4.2.2",
+              "package": "fluree-4.2.2",
+              "reported_version": "fluree 4.2.2"
+            },
+            "oxigraph": {
+              "license": "MIT OR Apache-2.0",
+              "binary": "/nix/store/g7ajfdk0g8bypdbsj23hnfq71izm3iz1-oxigraph-0.5.11/bin/oxigraph",
+              "sha256": "c99f9c4866b9d25f135729ac8b0e468cc0badd2c2cfe1c4b704f0db375ed8de3",
+              "version": "oxigraph 0.5.11",
+              "store_path": "/nix/store/g7ajfdk0g8bypdbsj23hnfq71izm3iz1-oxigraph-0.5.11",
+              "package": "oxigraph-0.5.11",
+              "reported_version": "oxigraph 0.5.11"
+            }
+          },
+          "memory_limit": "12G",
+          "client_cpu": "11",
+          "data": {
+            "watdiv-100": {
+              "license": "WatDiv citation condition",
+              "params": "WatDiv0.6 scale=100 seed=1 instances=5",
+              "sha256": "980cee8905f8f3b982348df79d27fc21a800e7453971433d3fef51dc3d42b967",
+              "bytes": 1550231398
+            }
+          },
+          "license_check": {
+            "gpl_benchmark_allowed": false,
+            "notes": []
+          },
+          "aggregation": "Published geometric means use each template's instance means; common result rows retain pooled medians and p95.",
+          "answer_reference": "All five engines agreed by RDF value multiset for all88instances. The comparison uses their agreement, not an independent reference oracle.",
+          "run_driver": {
+            "pid": 3526847,
+            "start_ticks": 100824905,
+            "started": "2026-10-20T21:16:36.378632+00:00",
+            "harness_commit": "aa53c0e661bbb2a173cd15ca569d50cc830c4bd6",
+            "sparkles_binary_commit": "81478fbe",
+            "max_hours": 28,
+            "runner_sha256": "fae6093d58b0fe7a72a34831adbe7af82b0b06c5b618b147a05f7aada9210ccf",
+            "loader_adapter_sha256": "bc2377b6c11f483ae2021e713c806b13d7bceae03670ed04ada2fb16eb4eeaf7",
+            "run_directory": "/home/kclejeune/lanes/item1-bench/reruns/20261020-aa53c0e6",
+            "supersedes": "launch.json; first attempt retained in attempt1-before-java21",
+            "command": [
+              "nohup",
+              "bash",
+              "-c",
+              "timeout -k 120 28h bash \"$2\" all; rc=$?; printf \"%s\\n\" \"$rc\" > \"$1/supervisor-java21.exit\"; exit \"$rc\"",
+              "item1-rerun3-java21",
+              "/home/kclejeune/lanes/item1-bench/reruns/20261020-aa53c0e6",
+              "/home/kclejeune/lanes/item1-bench/forge-rerun3-java21-aa53c0e6.sh"
+            ]
+          }
+        },
+        "settings": {
+          "warmup": 2,
+          "runs": 10,
+          "timer": "hyperfine+curl",
+          "resultCache": false,
+          "measurementStages": {
+            "watdiv-sparkles": {
+              "exit_code": 0,
+              "started_epoch": 1792530492,
+              "ended_epoch": 1792530532
+            },
+            "watdiv-jena": {
+              "exit_code": 0,
+              "started_epoch": 1792530996,
+              "ended_epoch": 1792531240
+            },
+            "watdiv-qlever": {
+              "exit_code": 0,
+              "started_epoch": 1792530532,
+              "ended_epoch": 1792530604
+            },
+            "watdiv-fluree": {
+              "exit_code": 0,
+              "started_epoch": 1792530604,
+              "ended_epoch": 1792530653
+            },
+            "watdiv-oxigraph": {
+              "exit_code": 0,
+              "started_epoch": 1792531240,
+              "ended_epoch": 1792531610
+            }
+          },
+          "priorRunnerAttempt": "/home/kclejeune/lanes/item1-bench/reruns/20261020-aa53c0e6/attempt1-before-java21",
+          "jenaLoaderJava": "Jena6.2 package wrapper selects its pinned Java21; JAVA and JAVA_HOME removed only for the loader"
+        },
+        "durability_classes": []
+      },
+      "metadata_note": "Null fields mean this metadata is not available in the common record fields. Read the raw assessment for its own provenance and correctness contract."
+    },
+    {
+      "run_id": "sha256-8c45056d78a1a63b8b78be90d4653952b2e20756df20f291a6144e4f4a036151",
+      "path": "../2026-10-23-watdiv-100-forge.json",
+      "sha256": "8c45056d78a1a63b8b78be90d4653952b2e20756df20f291a6144e4f4a036151",
+      "format": "bench-record-2",
+      "context": {
+        "suite": "watdiv",
+        "scale": "100",
+        "manifest": {
+          "suite": "watdiv",
+          "started": "2026-10-23T04:48:30Z",
+          "ended": "2026-10-23T04:49:08Z",
+          "host": {
+            "name": "forge",
+            "cpu": "13th Gen Intel(R) Core(TM) i5-13500",
+            "cpus": 20,
+            "ram_mib": 15622,
+            "disk_model": "",
+            "kernel": "6.18.53",
+            "filesystem": "ext4",
+            "mount_options": "rw,relatime,discard,errors=remount-ro"
+          },
+          "sparkles": {
+            "binary": "/home/kclejeune/lanes/item1-refresh-20261023/bin/sparkles-6699f27d",
+            "version": "sparkles 0.1.0",
+            "sha256": "4a94efcb075ea6381b127ec6db5e85cc960d5abecf2426def5baaef264e02f20",
+            "scripts_commit": "e133a8069f69d64f75d6468dbcef46832a9d7389",
+            "binary_commit": "6699f27d",
+            "scripts_note": "The harness checkout was 6699f27d with one commit of the item 1 lane on top, e133a806. It was later rebased onto main as 2bd5ae45 and changes only scripts/bench-record.py and its tests."
+          },
+          "engines": {
+            "jena": {
+              "license": "Apache-2.0",
+              "binary": "/nix/store/q0dscszid7jzs66xq9dip95z2hc1zmsh-apache-jena-fuseki-5.1.0/bin/fuseki-server",
+              "sha256": "7fb10cdec48244c13ea15e4c0607b29339e5d40c67a12cae2ced41903c1d2743",
+              "version": "Apache Jena Fuseki version 5.1.0",
+              "store_path": "/nix/store/q0dscszid7jzs66xq9dip95z2hc1zmsh-apache-jena-fuseki-5.1.0",
+              "package": "apache-jena-fuseki-5.1.0",
+              "reported_version": "Apache Jena Fuseki version 5.1.0"
+            },
+            "qlever": {
+              "license": "Apache-2.0",
+              "binary": "/nix/store/xn7f9c965zfza9nks2qzlrnx916xg3h2-qlever-0.5.48/bin/qlever-server",
+              "sha256": "8a3d2eb5259918b6a22607a012e50bf0087dfc9205e37613a03a09a1e68a10dc",
+              "version": "0.5.48",
+              "store_path": "/nix/store/xn7f9c965zfza9nks2qzlrnx916xg3h2-qlever-0.5.48",
+              "package": "qlever-0.5.48",
+              "reported_version": "/nix/store/xn7f9c965zfza9nks2qzlrnx916xg3h2-qlever-0.5.48/bin/qlever-server 0.0.0-unknown"
+            },
+            "fluree": {
+              "license": "BUSL-1.1",
+              "binary": "/nix/store/jvhxwjlhzijkd1kvrh8l7wfkbclp8vnx-fluree-4.2.2/bin/fluree",
+              "sha256": "99629db65b6eb0d7d9b7cafdc48806eee8ab71e9568fe389b983accaaa35f7ff",
+              "version": "fluree 4.2.2",
+              "store_path": "/nix/store/jvhxwjlhzijkd1kvrh8l7wfkbclp8vnx-fluree-4.2.2",
+              "package": "fluree-4.2.2",
+              "reported_version": "fluree 4.2.2"
+            },
+            "oxigraph": {
+              "license": "MIT OR Apache-2.0",
+              "binary": "/nix/store/g7ajfdk0g8bypdbsj23hnfq71izm3iz1-oxigraph-0.5.11/bin/oxigraph",
+              "sha256": "c99f9c4866b9d25f135729ac8b0e468cc0badd2c2cfe1c4b704f0db375ed8de3",
+              "version": "oxigraph 0.5.11",
+              "store_path": "/nix/store/g7ajfdk0g8bypdbsj23hnfq71izm3iz1-oxigraph-0.5.11",
+              "package": "oxigraph-0.5.11",
+              "reported_version": "oxigraph 0.5.11"
+            }
+          },
+          "memory_limit": "12G",
+          "client_cpu": "11",
+          "data": {
+            "watdiv-100": {
+              "license": "WatDiv citation condition",
+              "params": "WatDiv0.6 scale=100 seed=1 instances=5",
+              "sha256": "980cee8905f8f3b982348df79d27fc21a800e7453971433d3fef51dc3d42b967",
+              "bytes": 1550231398
+            }
+          },
+          "license_check": {
+            "gpl_benchmark_allowed": false,
+            "notes": []
+          },
+          "reused": {
+            "jena": {
+              "started": "2026-10-20T21:08:13Z",
+              "ended": "2026-10-20T21:26:50Z",
+              "host": "forge",
+              "scripts_commit": "aa53c0e661bbb2a173cd15ca569d50cc830c4bd6",
+              "engine": {
+                "license": "Apache-2.0",
+                "binary": "/nix/store/q0dscszid7jzs66xq9dip95z2hc1zmsh-apache-jena-fuseki-5.1.0/bin/fuseki-server",
+                "sha256": "7fb10cdec48244c13ea15e4c0607b29339e5d40c67a12cae2ced41903c1d2743",
+                "version": "Apache Jena Fuseki version 5.1.0",
+                "store_path": "/nix/store/q0dscszid7jzs66xq9dip95z2hc1zmsh-apache-jena-fuseki-5.1.0",
+                "package": "apache-jena-fuseki-5.1.0",
+                "reported_version": "Apache Jena Fuseki version 5.1.0"
+              }
+            },
+            "qlever": {
+              "started": "2026-10-20T21:08:13Z",
+              "ended": "2026-10-20T21:26:50Z",
+              "host": "forge",
+              "scripts_commit": "aa53c0e661bbb2a173cd15ca569d50cc830c4bd6",
+              "engine": {
+                "license": "Apache-2.0",
+                "binary": "/nix/store/xn7f9c965zfza9nks2qzlrnx916xg3h2-qlever-0.5.48/bin/qlever-server",
+                "sha256": "8a3d2eb5259918b6a22607a012e50bf0087dfc9205e37613a03a09a1e68a10dc",
+                "version": "0.5.48",
+                "store_path": "/nix/store/xn7f9c965zfza9nks2qzlrnx916xg3h2-qlever-0.5.48",
+                "package": "qlever-0.5.48",
+                "reported_version": "/nix/store/xn7f9c965zfza9nks2qzlrnx916xg3h2-qlever-0.5.48/bin/qlever-server 0.0.0-unknown"
+              }
+            },
+            "fluree": {
+              "started": "2026-10-20T21:08:13Z",
+              "ended": "2026-10-20T21:26:50Z",
+              "host": "forge",
+              "scripts_commit": "aa53c0e661bbb2a173cd15ca569d50cc830c4bd6",
+              "engine": {
+                "license": "BUSL-1.1",
+                "binary": "/nix/store/jvhxwjlhzijkd1kvrh8l7wfkbclp8vnx-fluree-4.2.2/bin/fluree",
+                "sha256": "99629db65b6eb0d7d9b7cafdc48806eee8ab71e9568fe389b983accaaa35f7ff",
+                "version": "fluree 4.2.2",
+                "store_path": "/nix/store/jvhxwjlhzijkd1kvrh8l7wfkbclp8vnx-fluree-4.2.2",
+                "package": "fluree-4.2.2",
+                "reported_version": "fluree 4.2.2"
+              }
+            },
+            "oxigraph": {
+              "started": "2026-10-20T21:08:13Z",
+              "ended": "2026-10-20T21:26:50Z",
+              "host": "forge",
+              "scripts_commit": "aa53c0e661bbb2a173cd15ca569d50cc830c4bd6",
+              "engine": {
+                "license": "MIT OR Apache-2.0",
+                "binary": "/nix/store/g7ajfdk0g8bypdbsj23hnfq71izm3iz1-oxigraph-0.5.11/bin/oxigraph",
+                "sha256": "c99f9c4866b9d25f135729ac8b0e468cc0badd2c2cfe1c4b704f0db375ed8de3",
+                "version": "oxigraph 0.5.11",
+                "store_path": "/nix/store/g7ajfdk0g8bypdbsj23hnfq71izm3iz1-oxigraph-0.5.11",
+                "package": "oxigraph-0.5.11",
+                "reported_version": "oxigraph 0.5.11"
+              }
+            }
+          }
+        },
+        "settings": {
+          "warmup": 2,
+          "runs": 10,
+          "timer": "hyperfine+curl",
+          "resultCache": false,
+          "measurementStages": {
+            "watdiv-sparkles": {
+              "exit_code": 0,
+              "started_epoch": 1792530492,
+              "ended_epoch": 1792530532
+            },
+            "watdiv-jena": {
+              "exit_code": 0,
+              "started_epoch": 1792530996,
+              "ended_epoch": 1792531240
+            },
+            "watdiv-qlever": {
+              "exit_code": 0,
+              "started_epoch": 1792530532,
+              "ended_epoch": 1792530604
+            },
+            "watdiv-fluree": {
+              "exit_code": 0,
+              "started_epoch": 1792530604,
+              "ended_epoch": 1792530653
+            },
+            "watdiv-oxigraph": {
+              "exit_code": 0,
+              "started_epoch": 1792531240,
+              "ended_epoch": 1792531610
+            }
+          },
+          "priorRunnerAttempt": "/home/kclejeune/lanes/item1-bench/reruns/20261020-aa53c0e6/attempt1-before-java21",
+          "jenaLoaderJava": "Jena6.2 package wrapper selects its pinned Java21; JAVA and JAVA_HOME removed only for the loader"
+        },
+        "durability_classes": []
+      },
+      "metadata_note": "Null fields mean this metadata is not available in the common record fields. Read the raw assessment for its own provenance and correctness contract."
+    }
+  ]
+}

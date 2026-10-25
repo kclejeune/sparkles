@@ -1,0 +1,275 @@
+{
+  "catalog_version": 1,
+  "sources": [
+    {
+      "run_id": "sha256-fcb98cf3f247c636d9df2bd936cfad970a3afae6dc3f616182cb503332ab18c9",
+      "path": "../2026-10-20-text-1.05m-forge.json",
+      "sha256": "fcb98cf3f247c636d9df2bd936cfad970a3afae6dc3f616182cb503332ab18c9",
+      "format": "bench-record-2",
+      "context": {
+        "suite": "full-text",
+        "scale": "1.05m",
+        "manifest": {
+          "suite": "full-text",
+          "started": "2026-10-20T21:07:57Z",
+          "ended": "2026-10-20T21:08:12Z",
+          "host": {
+            "name": "forge",
+            "cpu": "13th Gen Intel(R) Core(TM) i5-13500",
+            "cpus": 20,
+            "ram_mib": 15622,
+            "disk_model": "",
+            "kernel": "6.18.53",
+            "filesystem": "ext4",
+            "mount_options": "rw,relatime,discard,errors=remount-ro"
+          },
+          "sparkles": {
+            "binary": "/home/kclejeune/lanes/item1-bench/bin/sparkles-81478fbe",
+            "version": "sparkles 0.1.0",
+            "sha256": "bdf866ebd1e2aea9ea472af6ad481d7c557c92e09c64eef3e799ee56cb6eb97d",
+            "scripts_commit": "aa53c0e661bbb2a173cd15ca569d50cc830c4bd6",
+            "binary_commit": "81478fbe"
+          },
+          "engines": {
+            "jena": {
+              "license": "Apache-2.0",
+              "binary": "/nix/store/q0dscszid7jzs66xq9dip95z2hc1zmsh-apache-jena-fuseki-5.1.0/bin/fuseki-server",
+              "sha256": "7fb10cdec48244c13ea15e4c0607b29339e5d40c67a12cae2ced41903c1d2743",
+              "version": "Apache Jena Fuseki version 5.1.0",
+              "store_path": "/nix/store/q0dscszid7jzs66xq9dip95z2hc1zmsh-apache-jena-fuseki-5.1.0",
+              "package": "apache-jena-fuseki-5.1.0",
+              "reported_version": "Apache Jena Fuseki version 5.1.0"
+            },
+            "qlever": {
+              "license": "Apache-2.0",
+              "binary": "/nix/store/xn7f9c965zfza9nks2qzlrnx916xg3h2-qlever-0.5.48/bin/qlever-server",
+              "sha256": "8a3d2eb5259918b6a22607a012e50bf0087dfc9205e37613a03a09a1e68a10dc",
+              "version": "0.5.48",
+              "store_path": "/nix/store/xn7f9c965zfza9nks2qzlrnx916xg3h2-qlever-0.5.48",
+              "package": "qlever-0.5.48",
+              "reported_version": "/nix/store/xn7f9c965zfza9nks2qzlrnx916xg3h2-qlever-0.5.48/bin/qlever-server 0.0.0-unknown"
+            }
+          },
+          "memory_limit": "12G",
+          "client_cpu": "11",
+          "data": {
+            "synthetic-1.05m": {
+              "license": "repository synthetic generator",
+              "params": "people=100000 seed=default",
+              "sha256": "c2d387f07a0717fdcd1d001081507b5ac09608961f562f0102d971c36e36edd8",
+              "bytes": 110445630
+            }
+          },
+          "license_check": {
+            "gpl_benchmark_allowed": false,
+            "notes": []
+          },
+          "retained_text_index_measurements": {
+            "measured": "2026-10-19",
+            "source": "Preserved first-rerun text-build.json and text-size.json; query-only rerun reused these indexes.",
+            "build": {
+              "results": [
+                {
+                  "command": "sparkles",
+                  "mean": 0.38976535684,
+                  "stddev": null,
+                  "median": 0.38976535684,
+                  "user": 1.1651740000000002,
+                  "system": 0.1190691,
+                  "min": 0.38976535684,
+                  "max": 0.38976535684,
+                  "times": [
+                    0.38976535684
+                  ],
+                  "memory_usage_byte": [
+                    362450944
+                  ],
+                  "exit_codes": [
+                    0
+                  ]
+                },
+                {
+                  "command": "jena-fuseki",
+                  "mean": 4.52707472584,
+                  "stddev": null,
+                  "median": 4.52707472584,
+                  "user": 13.62601,
+                  "system": 0.9736990999999999,
+                  "min": 4.52707472584,
+                  "max": 4.52707472584,
+                  "times": [
+                    4.52707472584
+                  ],
+                  "memory_usage_byte": [
+                    623706112
+                  ],
+                  "exit_codes": [
+                    0
+                  ]
+                },
+                {
+                  "command": "qlever",
+                  "mean": 1.8836023898399998,
+                  "stddev": null,
+                  "median": 1.8836023898399998,
+                  "user": 1.458452,
+                  "system": 0.7168561,
+                  "min": 1.8836023898399998,
+                  "max": 1.8836023898399998,
+                  "times": [
+                    1.8836023898399998
+                  ],
+                  "memory_usage_byte": [
+                    141303808
+                  ],
+                  "exit_codes": [
+                    0
+                  ]
+                }
+              ]
+            },
+            "size_bytes": {
+              "sparkles": "13230428",
+              "jena-fuseki": "24883979",
+              "qlever": "11110912"
+            }
+          }
+        },
+        "settings": {
+          "warmup": 2,
+          "runs": 10,
+          "timer": "hyperfine+curl",
+          "resultCache": false,
+          "textIndexBuildMeasurementsReused": true,
+          "textIndexBuildMeasurementsSource": "/home/kclejeune/lanes/item1-bench/reruns/20261020-aa53c0e6/checkpoints/text-1.05m/results",
+          "measurementStages": {
+            "text-sparkles": {
+              "exit_code": 0,
+              "started_epoch": 1792530476,
+              "ended_epoch": 1792530481
+            },
+            "text-jena": {
+              "exit_code": 0,
+              "started_epoch": 1792530481,
+              "ended_epoch": 1792530489
+            },
+            "text-qlever": {
+              "exit_code": 0,
+              "started_epoch": 1792530489,
+              "ended_epoch": 1792530492
+            }
+          }
+        },
+        "durability_classes": []
+      },
+      "metadata_note": "Null fields mean this metadata is not available in the common record fields. Read the raw assessment for its own provenance and correctness contract."
+    },
+    {
+      "run_id": "sha256-b12bb7dcc3089ee42f4caa720f36353edf95c5df74e2708140abf438922f1a9f",
+      "path": "../2026-10-23-text-1.05m-forge.json",
+      "sha256": "b12bb7dcc3089ee42f4caa720f36353edf95c5df74e2708140abf438922f1a9f",
+      "format": "bench-record-2",
+      "context": {
+        "suite": "full-text",
+        "scale": "1.05m",
+        "manifest": {
+          "suite": "full-text",
+          "started": "2026-10-23T04:49:09Z",
+          "ended": "2026-10-23T04:49:13Z",
+          "host": {
+            "name": "forge",
+            "cpu": "13th Gen Intel(R) Core(TM) i5-13500",
+            "cpus": 20,
+            "ram_mib": 15622,
+            "disk_model": "",
+            "kernel": "6.18.53",
+            "filesystem": "ext4",
+            "mount_options": "rw,relatime,discard,errors=remount-ro"
+          },
+          "sparkles": {
+            "binary": "/home/kclejeune/lanes/item1-refresh-20261023/bin/sparkles-6699f27d",
+            "version": "sparkles 0.1.0",
+            "sha256": "4a94efcb075ea6381b127ec6db5e85cc960d5abecf2426def5baaef264e02f20",
+            "scripts_commit": "e133a8069f69d64f75d6468dbcef46832a9d7389",
+            "binary_commit": "6699f27d",
+            "scripts_note": "The harness checkout was 6699f27d with one commit of the item 1 lane on top, e133a806. It was later rebased onto main as 2bd5ae45 and changes only scripts/bench-record.py and its tests."
+          },
+          "engines": {
+            "jena": {
+              "license": "Apache-2.0",
+              "binary": "/nix/store/q0dscszid7jzs66xq9dip95z2hc1zmsh-apache-jena-fuseki-5.1.0/bin/fuseki-server",
+              "sha256": "7fb10cdec48244c13ea15e4c0607b29339e5d40c67a12cae2ced41903c1d2743",
+              "version": "Apache Jena Fuseki version 5.1.0",
+              "store_path": "/nix/store/q0dscszid7jzs66xq9dip95z2hc1zmsh-apache-jena-fuseki-5.1.0",
+              "package": "apache-jena-fuseki-5.1.0",
+              "reported_version": "Apache Jena Fuseki version 5.1.0"
+            },
+            "qlever": {
+              "license": "Apache-2.0",
+              "binary": "/nix/store/xn7f9c965zfza9nks2qzlrnx916xg3h2-qlever-0.5.48/bin/qlever-server",
+              "sha256": "8a3d2eb5259918b6a22607a012e50bf0087dfc9205e37613a03a09a1e68a10dc",
+              "version": "0.5.48",
+              "store_path": "/nix/store/xn7f9c965zfza9nks2qzlrnx916xg3h2-qlever-0.5.48",
+              "package": "qlever-0.5.48",
+              "reported_version": "/nix/store/xn7f9c965zfza9nks2qzlrnx916xg3h2-qlever-0.5.48/bin/qlever-server 0.0.0-unknown"
+            }
+          },
+          "memory_limit": "12G",
+          "client_cpu": "11",
+          "data": {
+            "synthetic-1.05m": {
+              "license": "repository synthetic generator",
+              "params": "people=100000 seed=default",
+              "sha256": "c2d387f07a0717fdcd1d001081507b5ac09608961f562f0102d971c36e36edd8",
+              "bytes": 110445630
+            }
+          },
+          "license_check": {
+            "gpl_benchmark_allowed": false,
+            "notes": []
+          },
+          "reused": {
+            "jena": {
+              "started": "2026-10-20T21:07:57Z",
+              "ended": "2026-10-20T21:08:12Z",
+              "host": "forge",
+              "scripts_commit": "aa53c0e661bbb2a173cd15ca569d50cc830c4bd6",
+              "engine": {
+                "license": "Apache-2.0",
+                "binary": "/nix/store/q0dscszid7jzs66xq9dip95z2hc1zmsh-apache-jena-fuseki-5.1.0/bin/fuseki-server",
+                "sha256": "7fb10cdec48244c13ea15e4c0607b29339e5d40c67a12cae2ced41903c1d2743",
+                "version": "Apache Jena Fuseki version 5.1.0",
+                "store_path": "/nix/store/q0dscszid7jzs66xq9dip95z2hc1zmsh-apache-jena-fuseki-5.1.0",
+                "package": "apache-jena-fuseki-5.1.0",
+                "reported_version": "Apache Jena Fuseki version 5.1.0"
+              }
+            },
+            "qlever": {
+              "started": "2026-10-20T21:07:57Z",
+              "ended": "2026-10-20T21:08:12Z",
+              "host": "forge",
+              "scripts_commit": "aa53c0e661bbb2a173cd15ca569d50cc830c4bd6",
+              "engine": {
+                "license": "Apache-2.0",
+                "binary": "/nix/store/xn7f9c965zfza9nks2qzlrnx916xg3h2-qlever-0.5.48/bin/qlever-server",
+                "sha256": "8a3d2eb5259918b6a22607a012e50bf0087dfc9205e37613a03a09a1e68a10dc",
+                "version": "0.5.48",
+                "store_path": "/nix/store/xn7f9c965zfza9nks2qzlrnx916xg3h2-qlever-0.5.48",
+                "package": "qlever-0.5.48",
+                "reported_version": "/nix/store/xn7f9c965zfza9nks2qzlrnx916xg3h2-qlever-0.5.48/bin/qlever-server 0.0.0-unknown"
+              }
+            }
+          }
+        },
+        "settings": {
+          "warmup": 2,
+          "runs": 10,
+          "timer": "hyperfine+curl",
+          "resultCache": false
+        },
+        "durability_classes": []
+      },
+      "metadata_note": "Null fields mean this metadata is not available in the common record fields. Read the raw assessment for its own provenance and correctness contract."
+    }
+  ]
+}

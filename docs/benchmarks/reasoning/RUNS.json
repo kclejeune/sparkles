@@ -1,0 +1,336 @@
+{
+  "catalog_version": 1,
+  "sources": [
+    {
+      "run_id": "sha256-be4a233ea0f5c2893cc3d2ccc9b2d680ac69d118f9a81ffac52645de1992a536",
+      "path": "../2026-10-23-lubm-100-forge.json",
+      "sha256": "be4a233ea0f5c2893cc3d2ccc9b2d680ac69d118f9a81ffac52645de1992a536",
+      "format": "bench-record-2",
+      "context": {
+        "suite": "lubm-owl-rl",
+        "scale": "100",
+        "manifest": {
+          "suite": "lubm-owl-rl",
+          "started": "2026-10-23T04:52:33Z",
+          "ended": "2026-10-23T04:53:22Z",
+          "host": {
+            "name": "forge",
+            "cpu": "13th Gen Intel(R) Core(TM) i5-13500",
+            "cpus": 20,
+            "ram_mib": 15622,
+            "disk_model": "",
+            "kernel": "6.18.53",
+            "filesystem": "ext4",
+            "mount_options": "rw,relatime,discard,errors=remount-ro"
+          },
+          "sparkles": {
+            "binary": "/home/kclejeune/lanes/item1-refresh-20261023/bin/sparkles-6699f27d",
+            "version": "sparkles 0.1.0",
+            "sha256": "4a94efcb075ea6381b127ec6db5e85cc960d5abecf2426def5baaef264e02f20",
+            "scripts_commit": "e133a8069f69d64f75d6468dbcef46832a9d7389",
+            "binary_commit": "6699f27d",
+            "scripts_note": "The harness checkout was 6699f27d with one commit of the item 1 lane on top, e133a806. It was later rebased onto main as 2bd5ae45 and changes only scripts/bench-record.py and its tests."
+          },
+          "engines": {
+            "jena": {
+              "license": "Apache-2.0",
+              "binary": "/home/kclejeune/lanes/item1-bench/data/lubm-100/gcroots/apache-jena-fuseki/bin/fuseki-server",
+              "sha256": "7fb10cdec48244c13ea15e4c0607b29339e5d40c67a12cae2ced41903c1d2743",
+              "version": "Apache Jena Fuseki version 5.1.0",
+              "store_path": "/nix/store/q0dscszid7jzs66xq9dip95z2hc1zmsh-apache-jena-fuseki-5.1.0",
+              "package": "apache-jena-fuseki-5.1.0",
+              "reported_version": "Apache Jena Fuseki version 5.1.0"
+            },
+            "qlever": {
+              "license": "Apache-2.0",
+              "binary": "/home/kclejeune/lanes/item1-bench/data/lubm-100/gcroots/qlever/bin/qlever-server",
+              "sha256": "8a3d2eb5259918b6a22607a012e50bf0087dfc9205e37613a03a09a1e68a10dc",
+              "version": "0.5.48",
+              "store_path": "/nix/store/xn7f9c965zfza9nks2qzlrnx916xg3h2-qlever-0.5.48",
+              "package": "qlever-0.5.48",
+              "reported_version": "/home/kclejeune/lanes/item1-bench/data/lubm-100/gcroots/qlever/bin/qlever-server 0.0.0-unknown"
+            },
+            "oxigraph": {
+              "license": "MIT OR Apache-2.0",
+              "binary": "/home/kclejeune/lanes/item1-bench/data/lubm-100/gcroots/oxigraph/bin/oxigraph",
+              "sha256": "c99f9c4866b9d25f135729ac8b0e468cc0badd2c2cfe1c4b704f0db375ed8de3",
+              "version": "oxigraph 0.5.11",
+              "store_path": "/nix/store/g7ajfdk0g8bypdbsj23hnfq71izm3iz1-oxigraph-0.5.11",
+              "package": "oxigraph-0.5.11",
+              "reported_version": "oxigraph 0.5.11"
+            },
+            "fluree": {
+              "license": "BUSL-1.1",
+              "binary": "/home/kclejeune/lanes/item1-bench/data/lubm-100/fluree-4.2.2/fluree-db-cli-x86_64-unknown-linux-gnu/fluree",
+              "sha256": "8d59a9fee1bbb8dc3f77c12c3071ca1802ad64ac1df68e01e2f81d3f28057133",
+              "version": "fluree 4.2.2"
+            }
+          },
+          "memory_limit": "12G",
+          "client_cpu": "11",
+          "data": {
+            "lubm-100": {
+              "license": "none stated (UBA 1.7)",
+              "params": "LUBM(100) universities=100 seed=0 index=0, materialized with owl-rl",
+              "sha256": "06f7c75847b8921a1b72168bb931c4d6137e91878bb87f33ddd25c0bdc5fd39e",
+              "bytes": 4030893643
+            }
+          },
+          "license_check": {
+            "gpl_benchmark_allowed": false,
+            "notes": [
+              "UBA 1.7 and univ-bench.owl: no license stated, downloaded at run time and not committed"
+            ]
+          },
+          "reused": {
+            "jena": {
+              "started": "2026-10-19T12:20:43Z",
+              "ended": "2026-10-19T16:35:56Z",
+              "host": "forge",
+              "scripts_commit": "77032452",
+              "engine": {
+                "license": "Apache-2.0",
+                "binary": "/home/kclejeune/lanes/item1-bench/data/lubm-100/gcroots/apache-jena-fuseki/bin/fuseki-server",
+                "sha256": "7fb10cdec48244c13ea15e4c0607b29339e5d40c67a12cae2ced41903c1d2743",
+                "version": "Apache Jena Fuseki version 5.1.0",
+                "store_path": "/nix/store/q0dscszid7jzs66xq9dip95z2hc1zmsh-apache-jena-fuseki-5.1.0",
+                "package": "apache-jena-fuseki-5.1.0",
+                "reported_version": "Apache Jena Fuseki version 5.1.0"
+              },
+              "scripts_commit_source": "BENCHMARKS.md and the batch launcher, since the carried-over run's manifest lacks it"
+            },
+            "qlever": {
+              "started": "2026-10-19T12:20:43Z",
+              "ended": "2026-10-19T16:35:56Z",
+              "host": "forge",
+              "scripts_commit": "77032452",
+              "engine": {
+                "license": "Apache-2.0",
+                "binary": "/home/kclejeune/lanes/item1-bench/data/lubm-100/gcroots/qlever/bin/qlever-server",
+                "sha256": "8a3d2eb5259918b6a22607a012e50bf0087dfc9205e37613a03a09a1e68a10dc",
+                "version": "0.5.48",
+                "store_path": "/nix/store/xn7f9c965zfza9nks2qzlrnx916xg3h2-qlever-0.5.48",
+                "package": "qlever-0.5.48",
+                "reported_version": "/home/kclejeune/lanes/item1-bench/data/lubm-100/gcroots/qlever/bin/qlever-server 0.0.0-unknown"
+              },
+              "scripts_commit_source": "BENCHMARKS.md and the batch launcher, since the carried-over run's manifest lacks it"
+            },
+            "oxigraph": {
+              "started": "2026-10-19T12:20:43Z",
+              "ended": "2026-10-19T16:35:56Z",
+              "host": "forge",
+              "scripts_commit": "77032452",
+              "engine": {
+                "license": "MIT OR Apache-2.0",
+                "binary": "/home/kclejeune/lanes/item1-bench/data/lubm-100/gcroots/oxigraph/bin/oxigraph",
+                "sha256": "c99f9c4866b9d25f135729ac8b0e468cc0badd2c2cfe1c4b704f0db375ed8de3",
+                "version": "oxigraph 0.5.11",
+                "store_path": "/nix/store/g7ajfdk0g8bypdbsj23hnfq71izm3iz1-oxigraph-0.5.11",
+                "package": "oxigraph-0.5.11",
+                "reported_version": "oxigraph 0.5.11"
+              },
+              "scripts_commit_source": "BENCHMARKS.md and the batch launcher, since the carried-over run's manifest lacks it"
+            },
+            "fluree": {
+              "started": "2026-10-19T12:20:43Z",
+              "ended": "2026-10-19T16:35:56Z",
+              "host": "forge",
+              "scripts_commit": "77032452",
+              "engine": {
+                "license": "BUSL-1.1",
+                "binary": "/home/kclejeune/lanes/item1-bench/data/lubm-100/fluree-4.2.2/fluree-db-cli-x86_64-unknown-linux-gnu/fluree",
+                "sha256": "8d59a9fee1bbb8dc3f77c12c3071ca1802ad64ac1df68e01e2f81d3f28057133",
+                "version": "fluree 4.2.2"
+              },
+              "scripts_commit_source": "BENCHMARKS.md and the batch launcher, since the carried-over run's manifest lacks it"
+            }
+          }
+        },
+        "settings": {
+          "warmup": 2,
+          "runs": 10,
+          "timer": "hyperfine+curl",
+          "resultCache": false
+        },
+        "durability_classes": []
+      },
+      "metadata_note": "Null fields mean this metadata is not available in the common record fields. Read the raw assessment for its own provenance and correctness contract."
+    },
+    {
+      "run_id": "sha256-aad17f467c0d73f70f67b3077dfd6252cf11a9a7e9a7ce77f5a0e96d7cce47b8",
+      "path": "../2026-10-25-lubm-secondary-probes-forge.json",
+      "sha256": "aad17f467c0d73f70f67b3077dfd6252cf11a9a7e9a7ce77f5a0e96d7cce47b8",
+      "format": "bench-record-2",
+      "context": {
+        "suite": "lubm-owl-rl-secondary-probes",
+        "scale": "100",
+        "manifest": {
+          "suite": "lubm-owl-rl",
+          "started": "2026-10-25T05:18:02Z",
+          "ended": "2026-10-25T05:18:29Z",
+          "host": {
+            "name": "forge",
+            "cpu": "13th Gen Intel(R) Core(TM) i5-13500",
+            "cpus": 20,
+            "ram_mib": 15620,
+            "disk_model": "",
+            "kernel": "7.2.9",
+            "filesystem": "ext4",
+            "mount_options": "rw,relatime,discard,errors=remount-ro"
+          },
+          "sparkles": {
+            "binary": "/home/kclejeune/lanes/competitive-lubm-q2-20261025/target-release/release/sparkles",
+            "version": "sparkles 0.1.0",
+            "sha256": "bdb77ab796a1a888a979ae49622e7c44f7c5d7013354d370e2f21af2fe89c5a4",
+            "scripts_commit": "a5847311dc2957c5cd9e62441c7f1815d51a152f",
+            "binary_commit": "187f3170",
+            "scripts_note": "The shared benchmark helpers came from an exact a5847311 archive. The same precomputed closure indexes were reused after the source-only executor change."
+          },
+          "engines": {
+            "qlever": {
+              "license": "Apache-2.0",
+              "binary": "/home/kclejeune/lanes/item1-bench/data/lubm-100/gcroots/qlever/bin/qlever-server",
+              "sha256": "8a3d2eb5259918b6a22607a012e50bf0087dfc9205e37613a03a09a1e68a10dc",
+              "version": "0.5.48",
+              "store_path": "/nix/store/xn7f9c965zfza9nks2qzlrnx916xg3h2-qlever-0.5.48",
+              "package": "qlever-0.5.48",
+              "reported_version": "/home/kclejeune/lanes/item1-bench/data/lubm-100/gcroots/qlever/bin/qlever-server 0.0.0-unknown"
+            }
+          },
+          "memory_limit": "12G",
+          "client_cpu": "11",
+          "data": {
+            "lubm-100": {
+              "license": "none stated (UBA 1.7)",
+              "params": "LUBM(100) universities=100 seed=0 index=0, materialized with owl-rl",
+              "sha256": "06f7c75847b8921a1b72168bb931c4d6137e91878bb87f33ddd25c0bdc5fd39e",
+              "bytes": 4030893643
+            }
+          },
+          "license_check": {
+            "gpl_benchmark_allowed": false,
+            "notes": [
+              "UBA 1.7 and univ-bench.owl: no license stated, downloaded at run time and not committed"
+            ]
+          }
+        },
+        "settings": {
+          "warmup": 10,
+          "runs": 30,
+          "timer": "hyperfine+curl",
+          "resultCache": false,
+          "processes": 2,
+          "pooled_runs": 60,
+          "engine_orders": [
+            [
+              "qlever",
+              "sparkles"
+            ],
+            [
+              "sparkles",
+              "qlever"
+            ]
+          ],
+          "reported_statistics": "Mean and sample standard deviation of all60requests per engine across both process orders.",
+          "control": {
+            "warmup": 5,
+            "runs": 20,
+            "order": [
+              "A1",
+              "B2",
+              "B3",
+              "A4"
+            ],
+            "A_commit": "2ec8a266",
+            "B_commit": "187f3170",
+            "all14_answers_match_published_qlever": true,
+            "ratios": {
+              "q1": 1.0061617072437632,
+              "q2": 0.10605299267533772,
+              "q3": 0.9424561403508772,
+              "q4": 0.9912160307438924,
+              "q5": 0.9840794665940944,
+              "q6": 0.9619074683013302,
+              "q7": 0.9912752653773448,
+              "q8": 0.988470708960855,
+              "q9": 0.997679339294246,
+              "q10": 1.0396462785556375,
+              "q11": 1.003082795067528,
+              "q12": 0.9916953035509737,
+              "q13": 1.02449773169151,
+              "q14": 0.9846780836765663
+            },
+            "flags_at_10percent": []
+          },
+          "namespace_guard": {
+            "queries": 30,
+            "all_answers_match": true,
+            "rerun_queries": [
+              "path-plus",
+              "star-lookup",
+              "subquery-agg",
+              "types-grouped",
+              "values-star"
+            ],
+            "rerun_rounds": 8,
+            "rerun_requests": 100,
+            "rerun_warmup": 20,
+            "server_ratios": {
+              "path-plus": 0.982,
+              "star-lookup": 1.01,
+              "subquery-agg": 1.012,
+              "types-grouped": 1.025,
+              "values-star": 1.013
+            },
+            "client_max_ratio": 1.007
+          },
+          "pinned_intel_guard": {
+            "server_cpu": 2,
+            "client_cpu": 11,
+            "rounds": 8,
+            "requests": 100,
+            "warmup": 20,
+            "samples_per_variant_per_query": 1600,
+            "rayon_threads": 1,
+            "all_answers_match": true,
+            "ratios": {
+              "path-plus": {
+                "server": 1.0626600862122821,
+                "client": 1.0,
+                "baseline_server_ms": 0.0080035,
+                "candidate_server_ms": 0.008505
+              },
+              "star-lookup": {
+                "server": 1.0282816921848923,
+                "client": 1.0,
+                "baseline_server_ms": 0.055124,
+                "candidate_server_ms": 0.056683
+              },
+              "subquery-agg": {
+                "server": 0.9977707014702378,
+                "client": 1.0,
+                "baseline_server_ms": 0.19109150000000003,
+                "candidate_server_ms": 0.1906655
+              },
+              "types-grouped": {
+                "server": 1.0292578496669837,
+                "client": 1.0,
+                "baseline_server_ms": 0.006306,
+                "candidate_server_ms": 0.0064905
+              },
+              "values-star": {
+                "server": 1.028783139708073,
+                "client": 0.9924012158054711,
+                "baseline_server_ms": 0.013427999999999999,
+                "candidate_server_ms": 0.0138145
+              }
+            }
+          },
+          "accepted_guard_followup": 291
+        },
+        "durability_classes": []
+      },
+      "metadata_note": "Null fields mean this metadata is not available in the common record fields. Read the raw assessment for its own provenance and correctness contract."
+    }
+  ]
+}
