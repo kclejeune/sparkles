@@ -1188,25 +1188,28 @@ ledger operations of 2,000 cursor comparisons against a filter that compares not
 
 ### Remaining competitive benchmark losses
 
-Roadmap item 307 follows the competitive query and durable-write improvements. It
-rechecks the published losses with the resulting build before choosing further
-optimizations. Its work is separate from refreshing the comparison records in item 1.
-The remaining LUBM q2 gap belongs to the preceding competitive query work.
+Roadmap item 307 follows the competitive query improvements and bounded durable-write
+work. Its focused targets are bindings in every supported language, serial and
+mixed-reader write performance, and DBpedia 50M `births-by-decade`. Remeasure each
+with the resulting build before choosing further optimizations. Other published
+losses remain documented and deferred. This work is separate from refreshing the
+comparison records in item 1.
 
 The first step rebuilds the loss inventory from the full benchmark tables as well as
 [Where Sparkles loses](../BENCHMARKS.md#where-sparkles-loses). A case already brought
 within the comparison's ten-percent tie band needs a matching measurement and an updated
-record. A loss that remains needs a profile and a fix, followed by the comparison again.
-An internal A/B improvement alone does not establish that Sparkles leads the other engine.
+record. Prioritize material persistent costs among the losses that remain, using both
+the relative gap and its absolute cost. Roughly 10–25% gaps and 1–2 ms differences
+remain low priority unless a simple fix benefits many cases. Keep accepted close cases
+and deferred smaller losses visible with their measurements and reasons. An internal
+A/B improvement alone does not establish that Sparkles leads the other engine.
 
-| Work | Published evidence and required coverage |
+| Work | Published evidence and coverage |
 |---|---|
-| DBpedia | Recheck the 50M slice's `births-by-decade`, where QLever leads by 4.9 times warm and 1.7 times cold, and cold `outlink-classes-2` at 1.24 billion triples. Keep both dataset sizes so a win at full scale does not hide a smaller-scale regression. |
-| Remaining BSBM queries | Complete the investigation of BI q3 and Explore q7 and q8. Profiles of these cases do not count as closed competitor gaps. |
-| Cold reads | Recheck cold point lookups against Oxigraph and small cold scans against Fluree at 1.05M and 10.5M. Coordinate changes with item 4 and X07, including their warm-query and dense-read guards. |
-| Bindings | Recheck JVM and Python small queries, rdflib calls, Node adds and probes, and Node `export-500k`. Item 33 coordinates this work, including fresh quiet-host measurements of JVM resource descriptions and DELETE/INSERT WHERE, whose shared-host timings show further possible losses. |
-| Mixed reads and writes | Recheck the write-rate gap under concurrent readers as well as serial commits, while preserving durable acknowledgements. Compare the read rates and latency tails alongside the write rate, and keep the engines' synchronization policies explicit. |
-| Smaller query losses | Recheck WatDiv L1-1 and changed-store `two-hop-count`, whose published gaps are near ten percent. Use enough rounds to distinguish a persistent loss from measurement variation. |
+| Bindings in every supported language | Recheck every supported language API and binding, including the complete JVM, Python and Node comparisons, small queries, rdflib calls, adds, probes, exports and DELETE/INSERT WHERE. Item 33 coordinates changes and preserves transaction, term-conversion and iterator behavior. |
+| Write performance | Recheck serial commits and the write rate under concurrent readers while preserving durable acknowledgements. Compare read rates and write latency tails alongside throughput, and keep the engines' synchronization policies explicit. |
+| DBpedia `births-by-decade` | Recheck the 50M slice, where QLever leads by 4.9 times warm and 1.7 times cold. Guard the 1.24-billion-triple case and both cache states so that a smaller-scale win does not hide a full-scale regression. |
+| Deferred comparisons | Retain BI q3, Explore q7 and q8, cold outlink queries, sparse and small cold reads, WatDiv L1-1 and changed-store `two-hop-count` in the inventory. Further engine work on these cases is deferred unless a simple broad fix emerges from the focused targets. |
 
 The binding comparisons include Python's small VALUES query and rdflib's `contains`
 and `Graph.value` calls. The JVM microbenchmarks include the fixed cost of entering the
@@ -1217,7 +1220,9 @@ Each comparison uses the same input digest, query, result format and qualified a
 with matched compiler and cache settings where appropriate. Published numbers come from
 quiet forge runs. Warm and cold cases remain distinct, and every cold comparison records
 its eviction method. The write comparisons retain Sparkles' acknowledgement durability
-and report a competitor's unsynchronized commits as a different policy.
+and report a competitor's unsynchronized commits as a different policy. Keep this
+profiling bounded and preserve synchronization when deciding whether the remaining
+cost is worth further work.
 
 The loss inventory also retains the documented memory and index-size differences under
 item 40. Mapped file pages, reclaimable caches and private heap must be distinguished,
@@ -1230,8 +1235,11 @@ Implement and review changes in independent groups, with correctness tests and b
 regression screens. Update README, BENCHMARKS and the corresponding spec outcomes only
 when measurements support the new comparison. Record any accepted slowdown as roadmap
 work and any measured rejected optimization in PERFORMANCE-EXPERIMENTS, retaining its
-commit and revert. Item 307 remains open while confirmed speed losses remain, unless the
-user explicitly accepts a tradeoff or removes a case from scope.
+commit and revert. Completion requires current comparison records, treatment of the
+material persistent gaps in the focused targets, and documented deferrals for accepted
+close cases and the other published losses. The ten-percent tie band remains unchanged.
+Improvement of the focused targets and their matching records completes this bounded
+benchmarking work without requiring every comparison to lead.
 
 ### Keyed inner groups and short ASKs
 
@@ -1281,9 +1289,10 @@ A separate streamed data oracle derives the BI `q2` counts from feature-set
 intersections and Product membership. All three ordered answers agree with it, and
 their pooled fingerprint is the published Sparkles answer fingerprint.
 
-`q12b` remains slower than Oxigraph, at 5.0 ms against 3.8 ms, and stays open under
-roadmap item 91. LUBM `q2` probe fanout and serial durable commit overhead remain open
-under item 290. The write work retains synchronization before acknowledgement.
+The pure-demand comparison brings `q12b` inside the ten-percent tie band, at 4.0 ms
+against Oxigraph's 3.7 ms. Its remaining 7.8% difference is accepted. Large `q4` answers
+remain under roadmap item 91. LUBM `q2` probe fanout and serial durable commit overhead
+remain under item 290. The write work retains synchronization before acknowledgement.
 
 ### Limited pure UNION demand
 
@@ -1356,6 +1365,40 @@ They compare eager execution and cursor batches with independently enumerated an
 Pure UNION ASKs are checked against full SELECT answers for early, late and absent
 matches in both operand orders. These controls establish broader semantic coverage,
 without claiming that every workload becomes faster.
+### Pure ASK comparison and small costs
+
+The exact `b26ce6a9` build used the same compiler signatures and SP²Bench source digest
+as the `4f2e1633` baseline. Four interleaved processes with 20 timed requests each gave
+`q12b` a median ratio of 0.786. A native plan capture reduced produced rows from 18,022
+to 528 while keeping the original index-probe branch order. The final document prefix
+was 64 rows rather than 512 after the shorter retry ladder found an answer.
+
+Two reversed engine orders, each with 15 warm-ups and 60 timed requests, put Sparkles
+at 4.026 ± 0.139 ms and Oxigraph 0.5.11 at 3.735 ± 0.129 ms. Both returned the same
+boolean answer on the same data. Oxigraph retains the lower mean, and the 7.8%
+difference is accepted inside the ten-percent tie band. The
+[comparison record](../benchmarks/2026-10-25-pure-ask-prefix-q12b-forge.json) keeps the
+samples and source provenance. This closes the competitive `q12b` target without
+requiring further tuning of its residual cost.
+
+All 32 A/B answer checks matched, including true, false and empty ASK controls. An
+additional false query distributes the common anchor into both branches so that the
+native plan retains the admitted root UNION. Its median changed from 8.542 to 8.590 ms.
+Its produced rows rose from 43,497 to 44,387 and its maximum reported run count from
+four to ten. Finite produced-row caps therefore retain the original prefix policy.
+The remaining A/B controls accepted median increases of 0.5–4.7%, including small
+changes classified as variation. Roadmap item 292 retains these costs for low-priority
+verification and a fix only when a material persistent cost or a simple broad benefit
+justifies it.
+
+The 30-query Namespace screen returned matching answers and no pooled slowdown. Its
+tiny-query results varied substantially between server processes, so they do not
+establish broad speedups. A pinned Intel guard covered the twelve short-query cases
+with eight A/B/B/A rounds and 100 timed requests per query and process. All answers
+matched. `count-all` rose from 3.777 to 4.045 microseconds, or 7.1%, and `values-star`
+from 13.652 to 14.230 microseconds, or 4.2%. Other positive native changes were at most
+1.6%. These small costs are accepted under item 292, with no query at least 10% slower.
+The query subset is accepted without further tuning of the close `q12b` result.
 
 ### Short-query checks after keyed inner groups
 
