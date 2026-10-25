@@ -97,8 +97,9 @@ remaining scope of each capability.
 These comparisons use an Intel Core i5-13500 with 16 GiB of RAM, with engines running
 alone, result caches off and answers checked before timing.
 
-* At 10.5M synthetic triples, Sparkles loads in **3.67 s** and is fastest on all
-  **28 queries**, with a median **3.8×** speedup over QLever.
+* At 10.5M synthetic triples, Sparkles loads in **3.67 s** and has the lowest measured
+  mean on **27 of 28 queries**. It ties Fluree on `count-all` within the 10% band and has a
+  median **3.8×** speedup over QLever.
 * With 16 clients running `star-join` at that scale, throughput is **239 queries/s**,
   against QLever's 90.
 * On WatDiv at 10.97M triples, geometric mean latency is **4.63 ms**, against
