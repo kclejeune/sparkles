@@ -7,7 +7,9 @@
 Dropping the last dataset handle now waits for its incremental views worker to
 release the store before returning. Worker acquisition and shutdown are synchronized,
 so a temporary host reference cannot leave the dataset directory locked after close.
-A handle released by a worker callback finishes shutdown when that round ends.
+A handle released by a host callback finishes shutdown after its enclosing view
+operation releases its metadata locks. Synchronous callbacks, nested operations and
+host replacement follow the same lifetime protocol.
 
 Indexed nearest-neighbour ordering can join candidate batches with independent query
 components. It continues searching when joins or filters discard an entire batch and
