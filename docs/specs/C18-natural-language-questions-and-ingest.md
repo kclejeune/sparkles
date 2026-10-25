@@ -5415,3 +5415,38 @@ The shared profile can be used before the incremental core of
 remains in F13 and explanations in [F18](F18-explanations-and-entailment-diffs.md).
 Community reports from [C22](C22-graph-rag-community-summaries.md) will cite the same
 assertions and evidence, while retaining their own generated and reviewed status.
+
+### Ask grounding accuracy, item 263
+
+The schema summary accepts a question and ranks all caller-visible schema entries by
+words shared with labels and local names before applying its response limit. Ask retrieves
+common and question-ranked summaries separately, deduplicates their IRIs and keeps half
+its class and predicate budget for common vocabulary. Both context sizes use this rule.
+The reports remain immutable and a caller with a restricted graph view cannot read terms
+from an unrestricted cached report.
+
+Ask can resolve ambiguity introduced by a category when one substantive typed resource
+has a matching visible label and unqualified name. Another substantive candidate with
+the same label, a disambiguation page, a generic owl:Thing without a more specific type,
+a different substantive kind, or a category-free namesake choice keeps the clarification.
+The chosen resource is stated as an assumption in the grounding event, draft and final result. The generic link_entities
+contract and explicit clarification answers remain unchanged.
+
+Offline checks use independently retrieved DBpedia predicate counts and declared English
+property labels, plus the saved public-set questions. Gold predicate constants are read
+only after retrieval. A fixed half-common, half-question budget retrieves 189 of 304
+existing predicate constants mentioned by the gold queries, compared with 151 from the
+count-only list, across 181 questions and 58,564 predicates. This is vocabulary retrieval,
+not model execution accuracy, and it omits variable predicates and labels in other
+languages. The reference inventory expands the predicate shorthand `a` and masks
+literals and comments before reading gold IRI references. Pure lexical replacement
+retrieved 133 and was rejected because it displaced common structural terms.
+
+The saved paid run supplies 142 distinct clarification choice sets for a separate
+candidate-choice replay. The guarded selector resolves 7 and agrees with 5 saved choices.
+The other two saved choices use gold-word ties. Displayed choices omit alternate labels,
+and gold-word tie choices do not establish either selection's correctness. The
+replay does not measure candidate retrieval or the complete Ask pipeline. A harmful
+city-over-film preference found in an earlier draft now remains a clarification. No new
+provider calls were made. Item 263 remains open for context-sensitive namesake ranking and an end-to-end accuracy and
+latency evaluation.

@@ -225,6 +225,7 @@ pub fn tools(cfg: &McpConfig) -> Vec<ToolDef> {
             json!({"type":"object","additionalProperties":false,"properties":{
                 "dataset": ds(),
                 "section": {"enum":["summary","classes","predicates","constraints","profiles"],"default":"summary"},
+                "query": {"type":"string","minLength":1,"maxLength":2000,"description":"section=summary: rank all visible classes and predicates by question words before the limit"},
                 "graph": graph(),
                 "reasoning": rs(),
                 "includeBuiltin": {"type":"boolean","default":false,"description":"Also list rdf:, rdfs:, owl:, xsd:, sh: classes"},

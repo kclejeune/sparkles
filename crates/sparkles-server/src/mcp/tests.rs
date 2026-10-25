@@ -287,6 +287,7 @@ fn expected_input_schemas() -> Vec<(&'static str, Value)> {
             json!({"type":"object","additionalProperties":false,"properties":{
                 "dataset": ds,
                 "section": {"enum":["summary","classes","predicates","constraints","profiles"],"default":"summary"},
+                "query": {"type":"string","minLength":1,"maxLength":2000,"description":"section=summary: rank all visible classes and predicates by question words before the limit"},
                 "graph": {"type":"string","default":"default","description":"`default`, `union` (all graphs) or a graph IRI"},
                 "reasoning": rs,
                 "includeBuiltin": {"type":"boolean","default":false,"description":"Also list rdf:, rdfs:, owl:, xsd:, sh: classes"},
@@ -2346,4 +2347,71 @@ fn list_commits_requires_only_what_redaction_keeps() {
         assert!(commit.get(key).is_some(), "{key} is required but redacted");
     }
     assert!(item["properties"]["quads"].is_object());
+}
+
+/// A query retrieves a low-count term before truncation. The shared report remains
+/// in count order for the next caller that does not ask for relevance ranking.
+#[tokio::test(flavor = "multi_thread")]
+async fn describe_schema_question_ranks_before_limit_without_mutating_cache() {
+    let mut c = Client::start(fixture_server());
+    let baseline = c.structured("describe_schema", json!({"limit":1})).await;
+    assert_ne!(baseline["predicates"][0]["iri"], "ex:knows");
+    let ranked = c
+        .structured(
+            "describe_schema",
+            json!({"limit":1,"query":"Who knows someone?"}),
+        )
+        .await;
+    assert_eq!(ranked["predicates"][0]["iri"], "ex:knows", "{ranked}");
+    let after = c.structured("describe_schema", json!({"limit":1})).await;
+    assert_eq!(after, baseline);
+    for args in [
+        json!({"query":""}),
+        json!({"query":"a".repeat(2001)}),
+        json!({"section":"predicates","query":"knows"}),
+    ] {
+        let (_, error) = c.error("describe_schema", args).await;
+        assert_eq!(error["code"], "bad-argument");
+    }
+}
+
+#[test]
+fn question_schema_ranking_cannot_reveal_a_hidden_predicate_from_cached_report() {
+    let server = fixture_server();
+    server.state.datasets()["t"]
+        .store
+        .load(&[Source::from_bytes(
+            b"<urn:subject> <urn:secretPredicate> 1 .".to_vec(),
+            RdfFormat::Turtle,
+            Some(oxrdf::NamedNode::new("urn:hidden").unwrap()),
+        )])
+        .unwrap();
+    let summary = |principal| {
+        let call = Call {
+            arrived: Instant::now(),
+            cancel: Arc::new(AtomicBool::new(false)),
+            request_id: "schema-ranking".into(),
+            principal,
+            headers: None,
+            held: None,
+            grant: None,
+        };
+        let args = json!({"dataset":"t","graph":"union","query":"secret predicate","limit":1});
+        match server
+            .run_now("describe_schema", args.as_object().unwrap().clone(), &call)
+            .unwrap()
+        {
+            Outcome::Structured(value) => value,
+            Outcome::Text(_) => panic!("expected structured schema"),
+        }
+    };
+    // First populate the unrestricted report cache with the hidden predicate.
+    let visible = summary(Principal::local());
+    assert_eq!(visible["predicates"][0]["iri"], "<urn:secretPredicate>");
+    let restricted = summary(Principal::local().hiding_graphs(&["urn:hidden".into()]));
+    assert!(
+        !restricted.to_string().contains("secretPredicate"),
+        "{restricted}"
+    );
+    assert_eq!(summary(Principal::local()), visible);
 }

@@ -2458,11 +2458,27 @@ row gives no credit for extra columns such as a label beside an IRI.
 | Cost per correct answer, QALD-9-plus | $0.020 | $0.160 | $0.279 |
 | Median time per question, QALD-9-plus | 11.8 s | 12.7 s | 18.6 s |
 
-Haiku found most questions unanswerable, because the grounding seldom lists the
-predicate a question needs. Sonnet and Opus guess the predicate and are often wrong.
+In that run Haiku found most questions unanswerable because the grounding seldom listed
+the predicate a question needed. Sonnet and Opus guessed predicates and often returned
+wrong rows.
 [C18](specs/C18-natural-language-questions-and-ingest.md#roadmap-follow-ups-2026-10-12)
 gives the failures and the earlier runs on the demo set and CK25, and
-[ROADMAP](ROADMAP.md) item 263 holds the follow-up.
+[ROADMAP](ROADMAP.md) item 263 holds the remaining follow-up.
+
+Current Ask grounding keeps half its schema budget for common vocabulary and fills the
+rest with question matches from the full visible schema. In an offline check against
+181 saved questions and an independently retrieved vocabulary of 58,564 predicates, this
+retrieves 189 of 304 existing predicate IRI constants mentioned in the gold, compared with
+151 from the count-only list. The check uses declared English or untagged property
+labels and includes `a` as `rdf:type`. It does not measure variable predicates, model
+answer accuracy or latency. The model figures above have not been rerun with this
+retrieval or the conservative resource/category ranking. The
+[offline record](benchmarks/2026-10-25-ask-grounding-offline.json) gives the source
+digests, per-question retrieval counts and the exact link to the old prompt's vocabulary.
+Its separate candidate-choice replay resolves 7 of 142 saved choice sets, agreeing with
+5 saved choices. The other two saved choices use gold-word ties, so neither choice is
+independently established as correct. Displayed choices omit alternate labels, and this
+replay does not measure candidate retrieval or end-to-end answers.
 
 ### Global answering
 

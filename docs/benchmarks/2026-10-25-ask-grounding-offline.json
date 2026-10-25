@@ -1,0 +1,1347 @@
+{
+ "version": 1,
+ "kind": "ask-grounding-offline",
+ "method": "Fixed half-common and half-question schema budget, with actual runtime tokenization and balancing helpers. Selection receives independently retrieved vocabulary and question words before gold is read. Declared English or untagged property labels only. This is retrieval coverage, not model answer accuracy or latency.",
+ "budget": 150,
+ "common_budget": 75,
+ "retrieval": {
+  "goldPredicateConstants": 304,
+  "questions": 181,
+  "retrievedAfter": 189,
+  "retrievedBefore": 151,
+  "rows": [
+   {
+    "after": 1,
+    "before": 1,
+    "goldPredicateConstants": 1,
+    "id": "qald9p-99",
+    "set": "qald9plus"
+   },
+   {
+    "after": 1,
+    "before": 1,
+    "goldPredicateConstants": 1,
+    "id": "qald9p-98",
+    "set": "qald9plus"
+   },
+   {
+    "after": 1,
+    "before": 1,
+    "goldPredicateConstants": 3,
+    "id": "qald9p-86",
+    "set": "qald9plus"
+   },
+   {
+    "after": 1,
+    "before": 1,
+    "goldPredicateConstants": 2,
+    "id": "qald9p-84",
+    "set": "qald9plus"
+   },
+   {
+    "after": 1,
+    "before": 0,
+    "goldPredicateConstants": 1,
+    "id": "qald9p-73",
+    "set": "qald9plus"
+   },
+   {
+    "after": 2,
+    "before": 2,
+    "goldPredicateConstants": 2,
+    "id": "qald9p-66",
+    "set": "qald9plus"
+   },
+   {
+    "after": 0,
+    "before": 1,
+    "goldPredicateConstants": 1,
+    "id": "qald9p-64",
+    "set": "qald9plus"
+   },
+   {
+    "after": 1,
+    "before": 1,
+    "goldPredicateConstants": 1,
+    "id": "qald9p-6",
+    "set": "qald9plus"
+   },
+   {
+    "after": 0,
+    "before": 0,
+    "goldPredicateConstants": 3,
+    "id": "qald9p-56",
+    "set": "qald9plus"
+   },
+   {
+    "after": 2,
+    "before": 1,
+    "goldPredicateConstants": 2,
+    "id": "qald9p-49",
+    "set": "qald9plus"
+   },
+   {
+    "after": 1,
+    "before": 1,
+    "goldPredicateConstants": 2,
+    "id": "qald9p-44",
+    "set": "qald9plus"
+   },
+   {
+    "after": 1,
+    "before": 2,
+    "goldPredicateConstants": 2,
+    "id": "qald9p-42",
+    "set": "qald9plus"
+   },
+   {
+    "after": 2,
+    "before": 2,
+    "goldPredicateConstants": 5,
+    "id": "qald9p-4",
+    "set": "qald9plus"
+   },
+   {
+    "after": 0,
+    "before": 0,
+    "goldPredicateConstants": 1,
+    "id": "qald9p-37",
+    "set": "qald9plus"
+   },
+   {
+    "after": 1,
+    "before": 0,
+    "goldPredicateConstants": 1,
+    "id": "qald9p-32",
+    "set": "qald9plus"
+   },
+   {
+    "after": 1,
+    "before": 1,
+    "goldPredicateConstants": 3,
+    "id": "qald9p-29",
+    "set": "qald9plus"
+   },
+   {
+    "after": 2,
+    "before": 2,
+    "goldPredicateConstants": 3,
+    "id": "qald9p-23",
+    "set": "qald9plus"
+   },
+   {
+    "after": 2,
+    "before": 2,
+    "goldPredicateConstants": 3,
+    "id": "qald9p-68",
+    "set": "qald9plus"
+   },
+   {
+    "after": 0,
+    "before": 0,
+    "goldPredicateConstants": 1,
+    "id": "qald9p-22",
+    "set": "qald9plus"
+   },
+   {
+    "after": 1,
+    "before": 3,
+    "goldPredicateConstants": 3,
+    "id": "qald9p-214",
+    "set": "qald9plus"
+   },
+   {
+    "after": 0,
+    "before": 0,
+    "goldPredicateConstants": 1,
+    "id": "qald9p-203",
+    "set": "qald9plus"
+   },
+   {
+    "after": 1,
+    "before": 1,
+    "goldPredicateConstants": 2,
+    "id": "qald9p-197",
+    "set": "qald9plus"
+   },
+   {
+    "after": 0,
+    "before": 0,
+    "goldPredicateConstants": 1,
+    "id": "qald9p-196",
+    "set": "qald9plus"
+   },
+   {
+    "after": 1,
+    "before": 1,
+    "goldPredicateConstants": 1,
+    "id": "qald9p-188",
+    "set": "qald9plus"
+   },
+   {
+    "after": 0,
+    "before": 0,
+    "goldPredicateConstants": 1,
+    "id": "qald9p-176",
+    "set": "qald9plus"
+   },
+   {
+    "after": 1,
+    "before": 0,
+    "goldPredicateConstants": 1,
+    "id": "qald9p-62",
+    "set": "qald9plus"
+   },
+   {
+    "after": 0,
+    "before": 1,
+    "goldPredicateConstants": 1,
+    "id": "qald9p-168",
+    "set": "qald9plus"
+   },
+   {
+    "after": 1,
+    "before": 1,
+    "goldPredicateConstants": 1,
+    "id": "qald9p-160",
+    "set": "qald9plus"
+   },
+   {
+    "after": 1,
+    "before": 1,
+    "goldPredicateConstants": 2,
+    "id": "qald9p-158",
+    "set": "qald9plus"
+   },
+   {
+    "after": 3,
+    "before": 3,
+    "goldPredicateConstants": 3,
+    "id": "qald9p-157",
+    "set": "qald9plus"
+   },
+   {
+    "after": 1,
+    "before": 0,
+    "goldPredicateConstants": 1,
+    "id": "qald9p-155",
+    "set": "qald9plus"
+   },
+   {
+    "after": 2,
+    "before": 3,
+    "goldPredicateConstants": 3,
+    "id": "qald9p-150",
+    "set": "qald9plus"
+   },
+   {
+    "after": 2,
+    "before": 3,
+    "goldPredicateConstants": 3,
+    "id": "qald9p-25",
+    "set": "qald9plus"
+   },
+   {
+    "after": 1,
+    "before": 0,
+    "goldPredicateConstants": 1,
+    "id": "qald9p-143",
+    "set": "qald9plus"
+   },
+   {
+    "after": 1,
+    "before": 1,
+    "goldPredicateConstants": 3,
+    "id": "qald9p-140",
+    "set": "qald9plus"
+   },
+   {
+    "after": 3,
+    "before": 3,
+    "goldPredicateConstants": 3,
+    "id": "qald9p-139",
+    "set": "qald9plus"
+   },
+   {
+    "after": 1,
+    "before": 2,
+    "goldPredicateConstants": 2,
+    "id": "qald9p-137",
+    "set": "qald9plus"
+   },
+   {
+    "after": 0,
+    "before": 0,
+    "goldPredicateConstants": 1,
+    "id": "qald9p-136",
+    "set": "qald9plus"
+   },
+   {
+    "after": 1,
+    "before": 1,
+    "goldPredicateConstants": 1,
+    "id": "qald9p-134",
+    "set": "qald9plus"
+   },
+   {
+    "after": 1,
+    "before": 0,
+    "goldPredicateConstants": 1,
+    "id": "qald9p-128",
+    "set": "qald9plus"
+   },
+   {
+    "after": 1,
+    "before": 0,
+    "goldPredicateConstants": 2,
+    "id": "qald9p-125",
+    "set": "qald9plus"
+   },
+   {
+    "after": 0,
+    "before": 1,
+    "goldPredicateConstants": 1,
+    "id": "qald9p-124",
+    "set": "qald9plus"
+   },
+   {
+    "after": 1,
+    "before": 1,
+    "goldPredicateConstants": 2,
+    "id": "qald9p-123",
+    "set": "qald9plus"
+   },
+   {
+    "after": 0,
+    "before": 0,
+    "goldPredicateConstants": 1,
+    "id": "qald9p-122",
+    "set": "qald9plus"
+   },
+   {
+    "after": 1,
+    "before": 0,
+    "goldPredicateConstants": 1,
+    "id": "qald9p-111",
+    "set": "qald9plus"
+   },
+   {
+    "after": 1,
+    "before": 1,
+    "goldPredicateConstants": 1,
+    "id": "qald9p-117",
+    "set": "qald9plus"
+   },
+   {
+    "after": 2,
+    "before": 3,
+    "goldPredicateConstants": 3,
+    "id": "qald9p-113",
+    "set": "qald9plus"
+   },
+   {
+    "after": 0,
+    "before": 0,
+    "goldPredicateConstants": 2,
+    "id": "qald9p-104",
+    "set": "qald9plus"
+   },
+   {
+    "after": 1,
+    "before": 1,
+    "goldPredicateConstants": 1,
+    "id": "qald9p-178",
+    "set": "qald9plus"
+   },
+   {
+    "after": 0,
+    "before": 0,
+    "goldPredicateConstants": 1,
+    "id": "qald9p-183",
+    "set": "qald9plus"
+   },
+   {
+    "after": 1,
+    "before": 2,
+    "goldPredicateConstants": 7,
+    "id": "qald9p-7",
+    "set": "qald9plus"
+   },
+   {
+    "after": 1,
+    "before": 1,
+    "goldPredicateConstants": 1,
+    "id": "qald9p-135",
+    "set": "qald9plus"
+   },
+   {
+    "after": 2,
+    "before": 2,
+    "goldPredicateConstants": 4,
+    "id": "qald9p-50",
+    "set": "qald9plus"
+   },
+   {
+    "after": 1,
+    "before": 2,
+    "goldPredicateConstants": 2,
+    "id": "qald9p-83",
+    "set": "qald9plus"
+   },
+   {
+    "after": 1,
+    "before": 2,
+    "goldPredicateConstants": 2,
+    "id": "qald9p-213",
+    "set": "qald9plus"
+   },
+   {
+    "after": 1,
+    "before": 1,
+    "goldPredicateConstants": 2,
+    "id": "qald9p-209",
+    "set": "qald9plus"
+   },
+   {
+    "after": 1,
+    "before": 1,
+    "goldPredicateConstants": 2,
+    "id": "qald9p-105",
+    "set": "qald9plus"
+   },
+   {
+    "after": 2,
+    "before": 4,
+    "goldPredicateConstants": 4,
+    "id": "qald9p-52",
+    "set": "qald9plus"
+   },
+   {
+    "after": 2,
+    "before": 1,
+    "goldPredicateConstants": 2,
+    "id": "qald9p-102",
+    "set": "qald9plus"
+   },
+   {
+    "after": 0,
+    "before": 0,
+    "goldPredicateConstants": 1,
+    "id": "qald9p-34",
+    "set": "qald9plus"
+   },
+   {
+    "after": 0,
+    "before": 0,
+    "goldPredicateConstants": 1,
+    "id": "qald9p-145",
+    "set": "qald9plus"
+   },
+   {
+    "after": 1,
+    "before": 1,
+    "goldPredicateConstants": 2,
+    "id": "qald9p-154",
+    "set": "qald9plus"
+   },
+   {
+    "after": 1,
+    "before": 0,
+    "goldPredicateConstants": 1,
+    "id": "qald9p-198",
+    "set": "qald9plus"
+   },
+   {
+    "after": 0,
+    "before": 0,
+    "goldPredicateConstants": 1,
+    "id": "qald9p-162",
+    "set": "qald9plus"
+   },
+   {
+    "after": 2,
+    "before": 1,
+    "goldPredicateConstants": 2,
+    "id": "qald9p-212",
+    "set": "qald9plus"
+   },
+   {
+    "after": 1,
+    "before": 0,
+    "goldPredicateConstants": 1,
+    "id": "qald9p-40",
+    "set": "qald9plus"
+   },
+   {
+    "after": 1,
+    "before": 1,
+    "goldPredicateConstants": 1,
+    "id": "qald9p-79",
+    "set": "qald9plus"
+   },
+   {
+    "after": 1,
+    "before": 0,
+    "goldPredicateConstants": 1,
+    "id": "qald9p-141",
+    "set": "qald9plus"
+   },
+   {
+    "after": 2,
+    "before": 2,
+    "goldPredicateConstants": 2,
+    "id": "qald9p-163",
+    "set": "qald9plus"
+   },
+   {
+    "after": 0,
+    "before": 0,
+    "goldPredicateConstants": 1,
+    "id": "qald9p-51",
+    "set": "qald9plus"
+   },
+   {
+    "after": 1,
+    "before": 0,
+    "goldPredicateConstants": 1,
+    "id": "qald9p-131",
+    "set": "qald9plus"
+   },
+   {
+    "after": 1,
+    "before": 1,
+    "goldPredicateConstants": 3,
+    "id": "qald9p-120",
+    "set": "qald9plus"
+   },
+   {
+    "after": 0,
+    "before": 0,
+    "goldPredicateConstants": 1,
+    "id": "qald9p-164",
+    "set": "qald9plus"
+   },
+   {
+    "after": 1,
+    "before": 0,
+    "goldPredicateConstants": 1,
+    "id": "qald9p-88",
+    "set": "qald9plus"
+   },
+   {
+    "after": 0,
+    "before": 0,
+    "goldPredicateConstants": 1,
+    "id": "qald9p-63",
+    "set": "qald9plus"
+   },
+   {
+    "after": 2,
+    "before": 1,
+    "goldPredicateConstants": 2,
+    "id": "qald9p-27",
+    "set": "qald9plus"
+   },
+   {
+    "after": 2,
+    "before": 2,
+    "goldPredicateConstants": 2,
+    "id": "qald9p-156",
+    "set": "qald9plus"
+   },
+   {
+    "after": 1,
+    "before": 1,
+    "goldPredicateConstants": 1,
+    "id": "qald9p-24",
+    "set": "qald9plus"
+   },
+   {
+    "after": 1,
+    "before": 0,
+    "goldPredicateConstants": 1,
+    "id": "qald9p-103",
+    "set": "qald9plus"
+   },
+   {
+    "after": 2,
+    "before": 1,
+    "goldPredicateConstants": 4,
+    "id": "qald9p-15",
+    "set": "qald9plus"
+   },
+   {
+    "after": 1,
+    "before": 1,
+    "goldPredicateConstants": 1,
+    "id": "qald9p-45",
+    "set": "qald9plus"
+   },
+   {
+    "after": 0,
+    "before": 0,
+    "goldPredicateConstants": 1,
+    "id": "qald9p-82",
+    "set": "qald9plus"
+   },
+   {
+    "after": 1,
+    "before": 1,
+    "goldPredicateConstants": 1,
+    "id": "qald9p-171",
+    "set": "qald9plus"
+   },
+   {
+    "after": 1,
+    "before": 1,
+    "goldPredicateConstants": 2,
+    "id": "qald9p-182",
+    "set": "qald9plus"
+   },
+   {
+    "after": 3,
+    "before": 3,
+    "goldPredicateConstants": 4,
+    "id": "qald9p-13",
+    "set": "qald9plus"
+   },
+   {
+    "after": 0,
+    "before": 0,
+    "goldPredicateConstants": 1,
+    "id": "qald9p-114",
+    "set": "qald9plus"
+   },
+   {
+    "after": 1,
+    "before": 1,
+    "goldPredicateConstants": 2,
+    "id": "qald9p-92",
+    "set": "qald9plus"
+   },
+   {
+    "after": 1,
+    "before": 1,
+    "goldPredicateConstants": 1,
+    "id": "qald9p-175",
+    "set": "qald9plus"
+   },
+   {
+    "after": 1,
+    "before": 0,
+    "goldPredicateConstants": 1,
+    "id": "qald9p-26",
+    "set": "qald9plus"
+   },
+   {
+    "after": 1,
+    "before": 0,
+    "goldPredicateConstants": 1,
+    "id": "qald9p-60",
+    "set": "qald9plus"
+   },
+   {
+    "after": 1,
+    "before": 1,
+    "goldPredicateConstants": 2,
+    "id": "qald9p-110",
+    "set": "qald9plus"
+   },
+   {
+    "after": 1,
+    "before": 0,
+    "goldPredicateConstants": 1,
+    "id": "qald9p-20",
+    "set": "qald9plus"
+   },
+   {
+    "after": 2,
+    "before": 1,
+    "goldPredicateConstants": 2,
+    "id": "qald9p-169",
+    "set": "qald9plus"
+   },
+   {
+    "after": 1,
+    "before": 0,
+    "goldPredicateConstants": 1,
+    "id": "qald9p-192",
+    "set": "qald9plus"
+   },
+   {
+    "after": 0,
+    "before": 0,
+    "goldPredicateConstants": 1,
+    "id": "qald9p-78",
+    "set": "qald9plus"
+   },
+   {
+    "after": 1,
+    "before": 1,
+    "goldPredicateConstants": 1,
+    "id": "qald9p-174",
+    "set": "qald9plus"
+   },
+   {
+    "after": 2,
+    "before": 2,
+    "goldPredicateConstants": 2,
+    "id": "qald9p-152",
+    "set": "qald9plus"
+   },
+   {
+    "after": 2,
+    "before": 2,
+    "goldPredicateConstants": 3,
+    "id": "qald9p-95",
+    "set": "qald9plus"
+   },
+   {
+    "after": 2,
+    "before": 3,
+    "goldPredicateConstants": 3,
+    "id": "qald9p-115",
+    "set": "qald9plus"
+   },
+   {
+    "after": 2,
+    "before": 1,
+    "goldPredicateConstants": 2,
+    "id": "qald9p-138",
+    "set": "qald9plus"
+   },
+   {
+    "after": 2,
+    "before": 2,
+    "goldPredicateConstants": 2,
+    "id": "qald9p-177",
+    "set": "qald9plus"
+   },
+   {
+    "after": 1,
+    "before": 0,
+    "goldPredicateConstants": 1,
+    "id": "qald9p-101",
+    "set": "qald9plus"
+   },
+   {
+    "after": 0,
+    "before": 0,
+    "goldPredicateConstants": 2,
+    "id": "qald9p-14",
+    "set": "qald9plus"
+   },
+   {
+    "after": 2,
+    "before": 1,
+    "goldPredicateConstants": 2,
+    "id": "qald9p-87",
+    "set": "qald9plus"
+   },
+   {
+    "after": 2,
+    "before": 2,
+    "goldPredicateConstants": 3,
+    "id": "qald9p-148",
+    "set": "qald9plus"
+   },
+   {
+    "after": 1,
+    "before": 1,
+    "goldPredicateConstants": 2,
+    "id": "qald9p-43",
+    "set": "qald9plus"
+   },
+   {
+    "after": 2,
+    "before": 2,
+    "goldPredicateConstants": 2,
+    "id": "qald9p-179",
+    "set": "qald9plus"
+   },
+   {
+    "after": 1,
+    "before": 0,
+    "goldPredicateConstants": 2,
+    "id": "db25-1",
+    "set": "db25"
+   },
+   {
+    "after": 1,
+    "before": 2,
+    "goldPredicateConstants": 2,
+    "id": "db25-2",
+    "set": "db25"
+   },
+   {
+    "after": 1,
+    "before": 1,
+    "goldPredicateConstants": 1,
+    "id": "db25-3",
+    "set": "db25"
+   },
+   {
+    "after": 0,
+    "before": 0,
+    "goldPredicateConstants": 1,
+    "id": "db25-4",
+    "set": "db25"
+   },
+   {
+    "after": 1,
+    "before": 0,
+    "goldPredicateConstants": 1,
+    "id": "db25-5",
+    "set": "db25"
+   },
+   {
+    "after": 2,
+    "before": 1,
+    "goldPredicateConstants": 2,
+    "id": "db25-6",
+    "set": "db25"
+   },
+   {
+    "after": 1,
+    "before": 1,
+    "goldPredicateConstants": 1,
+    "id": "db25-7",
+    "set": "db25"
+   },
+   {
+    "after": 0,
+    "before": 1,
+    "goldPredicateConstants": 1,
+    "id": "db25-8",
+    "set": "db25"
+   },
+   {
+    "after": 0,
+    "before": 0,
+    "goldPredicateConstants": 1,
+    "id": "db25-9",
+    "set": "db25"
+   },
+   {
+    "after": 3,
+    "before": 3,
+    "goldPredicateConstants": 3,
+    "id": "db25-10",
+    "set": "db25"
+   },
+   {
+    "after": 1,
+    "before": 1,
+    "goldPredicateConstants": 3,
+    "id": "db25-11",
+    "set": "db25"
+   },
+   {
+    "after": 1,
+    "before": 0,
+    "goldPredicateConstants": 1,
+    "id": "db25-12",
+    "set": "db25"
+   },
+   {
+    "after": 1,
+    "before": 2,
+    "goldPredicateConstants": 2,
+    "id": "db25-13",
+    "set": "db25"
+   },
+   {
+    "after": 1,
+    "before": 1,
+    "goldPredicateConstants": 1,
+    "id": "db25-14",
+    "set": "db25"
+   },
+   {
+    "after": 1,
+    "before": 0,
+    "goldPredicateConstants": 1,
+    "id": "db25-15",
+    "set": "db25"
+   },
+   {
+    "after": 1,
+    "before": 0,
+    "goldPredicateConstants": 1,
+    "id": "db25-16",
+    "set": "db25"
+   },
+   {
+    "after": 1,
+    "before": 1,
+    "goldPredicateConstants": 1,
+    "id": "db25-18",
+    "set": "db25"
+   },
+   {
+    "after": 1,
+    "before": 1,
+    "goldPredicateConstants": 2,
+    "id": "db25-25",
+    "set": "db25"
+   },
+   {
+    "after": 1,
+    "before": 0,
+    "goldPredicateConstants": 1,
+    "id": "db25-26",
+    "set": "db25"
+   },
+   {
+    "after": 1,
+    "before": 0,
+    "goldPredicateConstants": 1,
+    "id": "db25-27",
+    "set": "db25"
+   },
+   {
+    "after": 1,
+    "before": 3,
+    "goldPredicateConstants": 3,
+    "id": "db25-28",
+    "set": "db25"
+   },
+   {
+    "after": 0,
+    "before": 0,
+    "goldPredicateConstants": 1,
+    "id": "db25-29",
+    "set": "db25"
+   },
+   {
+    "after": 1,
+    "before": 0,
+    "goldPredicateConstants": 1,
+    "id": "db25-30",
+    "set": "db25"
+   },
+   {
+    "after": 1,
+    "before": 1,
+    "goldPredicateConstants": 2,
+    "id": "db25-31",
+    "set": "db25"
+   },
+   {
+    "after": 1,
+    "before": 0,
+    "goldPredicateConstants": 2,
+    "id": "db25-32",
+    "set": "db25"
+   },
+   {
+    "after": 1,
+    "before": 1,
+    "goldPredicateConstants": 1,
+    "id": "db25-33",
+    "set": "db25"
+   },
+   {
+    "after": 1,
+    "before": 0,
+    "goldPredicateConstants": 1,
+    "id": "db25-37",
+    "set": "db25"
+   },
+   {
+    "after": 1,
+    "before": 0,
+    "goldPredicateConstants": 1,
+    "id": "db25-38",
+    "set": "db25"
+   },
+   {
+    "after": 2,
+    "before": 2,
+    "goldPredicateConstants": 2,
+    "id": "db25-41",
+    "set": "db25"
+   },
+   {
+    "after": 1,
+    "before": 0,
+    "goldPredicateConstants": 1,
+    "id": "db25-42",
+    "set": "db25"
+   },
+   {
+    "after": 2,
+    "before": 1,
+    "goldPredicateConstants": 2,
+    "id": "db25-43",
+    "set": "db25"
+   },
+   {
+    "after": 2,
+    "before": 1,
+    "goldPredicateConstants": 3,
+    "id": "db25-44",
+    "set": "db25"
+   },
+   {
+    "after": 0,
+    "before": 0,
+    "goldPredicateConstants": 1,
+    "id": "db25-45",
+    "set": "db25"
+   },
+   {
+    "after": 1,
+    "before": 0,
+    "goldPredicateConstants": 1,
+    "id": "db25-49",
+    "set": "db25"
+   },
+   {
+    "after": 1,
+    "before": 0,
+    "goldPredicateConstants": 1,
+    "id": "db25-50",
+    "set": "db25"
+   },
+   {
+    "after": 0,
+    "before": 0,
+    "goldPredicateConstants": 1,
+    "id": "db25-51",
+    "set": "db25"
+   },
+   {
+    "after": 1,
+    "before": 0,
+    "goldPredicateConstants": 1,
+    "id": "db25-52",
+    "set": "db25"
+   },
+   {
+    "after": 2,
+    "before": 1,
+    "goldPredicateConstants": 2,
+    "id": "db25-53",
+    "set": "db25"
+   },
+   {
+    "after": 1,
+    "before": 1,
+    "goldPredicateConstants": 2,
+    "id": "db25-54",
+    "set": "db25"
+   },
+   {
+    "after": 1,
+    "before": 0,
+    "goldPredicateConstants": 1,
+    "id": "db25-55",
+    "set": "db25"
+   },
+   {
+    "after": 2,
+    "before": 1,
+    "goldPredicateConstants": 2,
+    "id": "db25-56",
+    "set": "db25"
+   },
+   {
+    "after": 1,
+    "before": 0,
+    "goldPredicateConstants": 1,
+    "id": "db25-57",
+    "set": "db25"
+   },
+   {
+    "after": 0,
+    "before": 1,
+    "goldPredicateConstants": 1,
+    "id": "db25-58",
+    "set": "db25"
+   },
+   {
+    "after": 2,
+    "before": 1,
+    "goldPredicateConstants": 2,
+    "id": "db25-60",
+    "set": "db25"
+   },
+   {
+    "after": 0,
+    "before": 0,
+    "goldPredicateConstants": 1,
+    "id": "db25-61",
+    "set": "db25"
+   },
+   {
+    "after": 0,
+    "before": 0,
+    "goldPredicateConstants": 1,
+    "id": "db25-62",
+    "set": "db25"
+   },
+   {
+    "after": 1,
+    "before": 1,
+    "goldPredicateConstants": 1,
+    "id": "db25-65",
+    "set": "db25"
+   },
+   {
+    "after": 2,
+    "before": 1,
+    "goldPredicateConstants": 2,
+    "id": "db25-66",
+    "set": "db25"
+   },
+   {
+    "after": 1,
+    "before": 1,
+    "goldPredicateConstants": 1,
+    "id": "db25-67",
+    "set": "db25"
+   },
+   {
+    "after": 0,
+    "before": 1,
+    "goldPredicateConstants": 1,
+    "id": "db25-68",
+    "set": "db25"
+   },
+   {
+    "after": 0,
+    "before": 0,
+    "goldPredicateConstants": 1,
+    "id": "db25-70",
+    "set": "db25"
+   },
+   {
+    "after": 0,
+    "before": 0,
+    "goldPredicateConstants": 1,
+    "id": "db25-71",
+    "set": "db25"
+   },
+   {
+    "after": 1,
+    "before": 0,
+    "goldPredicateConstants": 1,
+    "id": "db25-72",
+    "set": "db25"
+   },
+   {
+    "after": 1,
+    "before": 0,
+    "goldPredicateConstants": 2,
+    "id": "db25-74",
+    "set": "db25"
+   },
+   {
+    "after": 1,
+    "before": 1,
+    "goldPredicateConstants": 1,
+    "id": "db25-75",
+    "set": "db25"
+   },
+   {
+    "after": 1,
+    "before": 1,
+    "goldPredicateConstants": 1,
+    "id": "db25-77",
+    "set": "db25"
+   },
+   {
+    "after": 2,
+    "before": 1,
+    "goldPredicateConstants": 3,
+    "id": "db25-78",
+    "set": "db25"
+   },
+   {
+    "after": 1,
+    "before": 1,
+    "goldPredicateConstants": 1,
+    "id": "db25-79",
+    "set": "db25"
+   },
+   {
+    "after": 1,
+    "before": 2,
+    "goldPredicateConstants": 2,
+    "id": "db25-80",
+    "set": "db25"
+   },
+   {
+    "after": 1,
+    "before": 0,
+    "goldPredicateConstants": 2,
+    "id": "db25-82",
+    "set": "db25"
+   },
+   {
+    "after": 0,
+    "before": 0,
+    "goldPredicateConstants": 1,
+    "id": "db25-85",
+    "set": "db25"
+   },
+   {
+    "after": 0,
+    "before": 0,
+    "goldPredicateConstants": 2,
+    "id": "db25-87",
+    "set": "db25"
+   },
+   {
+    "after": 2,
+    "before": 1,
+    "goldPredicateConstants": 2,
+    "id": "db25-88",
+    "set": "db25"
+   },
+   {
+    "after": 1,
+    "before": 1,
+    "goldPredicateConstants": 2,
+    "id": "db25-89",
+    "set": "db25"
+   },
+   {
+    "after": 2,
+    "before": 1,
+    "goldPredicateConstants": 2,
+    "id": "db25-90",
+    "set": "db25"
+   },
+   {
+    "after": 0,
+    "before": 0,
+    "goldPredicateConstants": 1,
+    "id": "db25-91",
+    "set": "db25"
+   },
+   {
+    "after": 2,
+    "before": 1,
+    "goldPredicateConstants": 3,
+    "id": "db25-92",
+    "set": "db25"
+   },
+   {
+    "after": 1,
+    "before": 1,
+    "goldPredicateConstants": 2,
+    "id": "db25-93",
+    "set": "db25"
+   },
+   {
+    "after": 1,
+    "before": 0,
+    "goldPredicateConstants": 1,
+    "id": "db25-94",
+    "set": "db25"
+   },
+   {
+    "after": 0,
+    "before": 0,
+    "goldPredicateConstants": 1,
+    "id": "db25-95",
+    "set": "db25"
+   },
+   {
+    "after": 1,
+    "before": 2,
+    "goldPredicateConstants": 2,
+    "id": "db25-96",
+    "set": "db25"
+   },
+   {
+    "after": 1,
+    "before": 0,
+    "goldPredicateConstants": 1,
+    "id": "db25-98",
+    "set": "db25"
+   },
+   {
+    "after": 2,
+    "before": 0,
+    "goldPredicateConstants": 2,
+    "id": "db25-99",
+    "set": "db25"
+   },
+   {
+    "after": 2,
+    "before": 1,
+    "goldPredicateConstants": 2,
+    "id": "db25-100",
+    "set": "db25"
+   }
+  ],
+  "scope": "Offline balanced schema retrieval at150, using the actual runtime selector. English/untyped declared labels only. Not end-to-end Ask accuracy or full runtime retrieval.",
+  "vocabulary": 58564
+ },
+ "candidate_choices": {
+  "agreesWithSavedChoice": 5,
+  "cases": 142,
+  "kind": "offline-candidate-choice-replay",
+  "note": "Candidate retrieval and end-to-end execution accuracy are not measured. No provider calls. Saved choices can themselves use gold-word heuristics.",
+  "preservedClarifications": 135,
+  "resolved": 7
+ },
+ "baseline_prompt_link": {
+  "saved_request_id": 25,
+  "captured_predicates": 150,
+  "exact_order_match": true,
+  "only_saved": [],
+  "only_recomputed": [],
+  "saved_section_sha256": "878910fd6a56fc2ed0855f886a5bff34432aa9f2353ba43f7ead9197fc4a7e40"
+ },
+ "source": {
+  "binary": "/home/kclejeune/sparkles-ask-paid-20261024/bin/sparkles",
+  "binary_sha256": "804169201d67ced2c40cb87318b6a9b123decad607d3e598c0e7c5ce4c08a4d8",
+  "database": "/home/kclejeune/sparkles-ask-paid-20261024/db/dbpedia.db",
+  "dataset_metadata_sha256": "88dad95997d2c996ca58901d6585f0762be1f6a8aaad533a1f8c5385498dcff2",
+  "predicate_count": 58564,
+  "property_label_policy": "declared rdf:Property labels in English or without a language tag",
+  "predicate_counts_sha256": "d1ad9722d0a462da5fff44511c487705d9348632b28631cc77fc0c6d1d0c256d",
+  "property_labels_sha256": "2472310173a959340e702b704383e27aadbd097b1a00ddc288cbf56b5e598a9e",
+  "scope": "Gold is evaluation-only. Count and label queries are independent of all questions and gold. Recall covers existing predicate IRI constants mentioned in gold, excludes variable predicates, and is lexical retrieval only, not execution accuracy.",
+  "gold_reference_policy": "Literal/comment contents are masked, declared prefixes are expanded and a shorthand names rdf:type. References are intersected with existing predicate IRIs; variable predicates are not counted."
+ },
+ "sets": {
+  "qald9plus": {
+   "set_sha256": "330687b410db3cbe4fdb1f7b69a7a7b832ab7b4212a5b9db2a952b8a63f78a45",
+   "source": {
+    "repository": "KGQA/QALD_9_plus",
+    "commit": "b9fb0380902e6935efc9505170bc3652e8c242c1",
+    "file": "data/qald_9_plus_test_dbpedia.json",
+    "sha256": "7831fd113d9c5ad66c429bfb39b079fdb101578e57c095777a468f206201787f",
+    "license": "CC BY 4.0"
+   },
+   "database_manifest_sha256": "4b9494691e15485a8f83af356c3286c54e8adaa945d70352a27a6e95b3e4b569"
+  },
+  "db25": {
+   "set_sha256": "3330b59c9c625de17ec80773f37d3b2847a6b68da049204d4794091d145df3b7",
+   "source": {
+    "questions": {
+     "repository": "AKSW/text2sparql.aksw.org",
+     "commit": "9254e7868bc8a90eca445e7486afd27c653af6c9",
+     "file": "docs/benchmark/questions_db25.yaml",
+     "sha256": "41c447c361f5315b066c157f1dd9801e60ce6029cb02f56af9937fae9cfcebb6"
+    },
+    "answers": {
+     "repository": "AKSW/text2sparql.aksw.org",
+     "commit": "9254e7868bc8a90eca445e7486afd27c653af6c9",
+     "file": "docs/benchmark/db25_true_result_set.json",
+     "sha256": "e5001e581283b43dbe16c0710bb718fb98e08845c67e2ddef2e8610533175302"
+    }
+   },
+   "database_manifest_sha256": "4b9494691e15485a8f83af356c3286c54e8adaa945d70352a27a6e95b3e4b569"
+  }
+ },
+ "implementation_sha256": {
+  "crates/sparkles-server/src/mcp/relevance.rs": "c2f30db1352165c6a09d8d99515aa8ff24b5c21fe01fd27169ad2b90668deb81",
+  "crates/sparkles-server/src/ask/grounding.rs": "1d7f73131400124128f201177df35bbe45d78ab7582cf026d445351b2837edb3"
+ }
+}

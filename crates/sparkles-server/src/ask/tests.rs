@@ -3,13 +3,14 @@
 //! clarification, the plain-text level, the trimming of A27, and the demo question set.
 
 use super::*;
+use crate::mcp::relevance::words;
 use crate::models::ModelsConfig;
 use crate::models::mock::{self, MockModel, Received};
 use crate::state::{AppState, DbType};
 use parking_lot::Mutex;
 use sparkles::io::{RdfFormat, Source};
 use sparkles::store::StoreOptions;
-use std::collections::VecDeque;
+use std::collections::{BTreeSet, VecDeque};
 
 pub(super) const ORG: &str = r#"@prefix ex:   <http://example.org/ontology#> .
 @prefix res:  <http://example.org/resource/> .
@@ -644,5 +645,72 @@ fn demo_set_gold_queries() {
         wrong.is_empty(),
         "complexity differs:\n{}",
         wrong.join("\n")
+    );
+}
+
+/// Question terms must be retrieved before a large schema is truncated, in both
+/// context sizes. The fake's draft is not evidence of model accuracy.
+#[test]
+fn question_predicate_beyond_largest_two_hundred_reaches_the_draft() {
+    let mut ttl = ORG.to_string();
+    for i in 0..210 {
+        for j in 0..2 {
+            ttl.push_str(&format!("<urn:p{j}> <urn:common{i}> {j} .\n"));
+        }
+    }
+    ttl.push_str("<urn:p0> <urn:timeZone> <urn:UTC> .\n");
+    let s = server(&ttl);
+    for context in [4096, 200000] {
+        let mock = scripted(
+            vec![draft(
+                "SELECT ?zone WHERE { <urn:p0> <urn:timeZone> ?zone }",
+            )],
+            json!({}),
+        );
+        let m = models(&mock.url(), json!({"contextTokens":context}));
+        let mut o = opts("What is the time zone?");
+        o.summary = false;
+        let (out, _) = run(&s, &m, &o);
+        assert_eq!(out["outcome"], "answered", "{out:#}");
+        let requests = mock.requests();
+        let prompt = mock::prompt_of(&requests[0]);
+        let predicates = prompt.split("Predicates (").nth(1).unwrap();
+        assert!(
+            predicates
+                .lines()
+                .skip(1)
+                .take_while(|line| !line.trim().is_empty())
+                .any(|line| line.contains("urn:timeZone")),
+            "{prompt}"
+        );
+    }
+}
+
+#[test]
+fn a_resource_and_its_category_do_not_force_an_unnecessary_clarification() {
+    let ttl = format!(
+        "{ORG} <http://dbpedia.org/resource/Berlin> a <http://dbpedia.org/ontology/City> ; <http://www.w3.org/2000/01/rdf-schema#label> \"Berlin\"@en . \
+    <http://dbpedia.org/resource/Category:Berlin> a <http://www.w3.org/2004/02/skos/core#Concept> ; <http://www.w3.org/2000/01/rdf-schema#label> \"Berlin\"@en ."
+    );
+    let s = server(&ttl);
+    let mock = scripted(
+        vec![draft(
+            "SELECT ?label WHERE { <http://dbpedia.org/resource/Berlin> rdfs:label ?label }",
+        )],
+        json!({}),
+    );
+    let m = models(&mock.url(), json!({}));
+    let mut o = opts("What is Berlin called?");
+    o.summary = false;
+    let (out, events) = run(&s, &m, &o);
+    assert_eq!(out["outcome"], "answered", "{out:#}");
+    assert!(!events.iter().any(|e| e == "clarify"));
+    assert!(
+        out["result"]["assumptions"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|a| a.as_str().unwrap_or("").contains("unqualified resource")),
+        "{out:#}"
     );
 }

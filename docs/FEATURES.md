@@ -960,6 +960,11 @@ build community reports.
   `--model-config`, `GET /$/models` and `POST /$/models/{name}/test` configure and test
   them. The server detects structured output per model and falls back to JSON mode and
   plain text.
+* Ask keeps half of its schema budget for common vocabulary and retrieves the rest by
+  matching the question against every visible class and predicate. A uniquely named,
+  typed resource can take precedence over its category, with a recorded assumption.
+  Disambiguation pages and substantive candidates with the same label still ask for a
+  clarification. The generic `link_entities` verdict is unchanged.
 * `POST /{ds}/ask` runs as the caller and streams each step as a server-sent event, or
   answers one JSON object ([API.md](API.md#asking-in-the-server)). `assistant.json`,
   through `/$/assistant/{ds}`, turns the assistant on for a dataset and sets what may leave
@@ -1692,10 +1697,10 @@ links each item to its design spec.
   and 74 DBpedia-only questions
   ([C18](specs/C18-natural-language-questions-and-ingest.md#roadmap-follow-ups-2026-10-12),
   [BENCHMARKS.md](BENCHMARKS.md#natural-language-questions)). On DBpedia the best model
-  answers 40 of 107 QALD-9-plus questions. Most DBpedia questions stop at a
-  clarification, because `link_entities` offers a category or a namesake beside the main
-  resource, and the grounding seldom lists the predicate a question needs, roadmap item
-  263. Local and OpenAI-compatible models, LC-QuAD 2.0, which needs a Wikidata load from
+  answers 40 of 107 QALD-9-plus questions. The measured run predates question-aware
+  schema retrieval and conservative resource/category ranking. Their effect on model answer accuracy and latency needs a
+  new run. Genuine namesake clarification and question-context ranking remain roadmap
+  item 263. Local and OpenAI-compatible models, LC-QuAD 2.0, which needs a Wikidata load from
   the full dump, and an evaluation of independent roles have not run. Roadmap item 6.
 * The UI's ingestion controls do not turn on assistant ingestion. Roadmap item 77.
 * An MCP tool operation that needs admin, such as deleting a protected branch, refuses an
