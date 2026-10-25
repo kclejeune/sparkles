@@ -169,6 +169,16 @@ only through a registered, tested dependency proof. A citation list alone is nev
 accepted as the footprint. Unknown or data-dependent reads use the whole selected
 visible input scope.
 
+The footprint includes lifecycle data used to interpret evidence, even when the
+business query does not read it directly. C25 admission and withdrawal decisions,
+source supersession, identity-resolution maps, evidence availability and review-policy
+revisions can change the status or independence of a support without changing an
+accepted business triple. Their relevant state and revision frontiers are declared
+inputs. C25's emitted changed-reference IDs can narrow work, but are not the sole
+authority if their stream has a gap. In that case reconciliation is conservative and
+the assessment cannot remain current merely because its old immutable references
+still resolve.
+
 The footprint also covers dependencies of the caller's visibility, even when those
 facts are outside the selected business input graphs. This includes data-dependent
 protection patterns, class membership used by a protection, schema rewrites and
