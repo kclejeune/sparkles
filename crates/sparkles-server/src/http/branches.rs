@@ -1368,6 +1368,8 @@ async fn execute(
             .min(sparkles::preview::MAX_LISTED_CHANGES as u64) as usize,
         all_changes: false,
         max_changes: st.limits.max_rows as u64,
+        retain_states: false,
+        state_max_memory: None,
     });
     o.write.dry_run = dr.clone();
     let tds = st.branch_dataset(&ds, op.target())?;

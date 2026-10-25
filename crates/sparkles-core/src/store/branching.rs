@@ -729,6 +729,16 @@ impl BranchSet {
         self.table.lock().next_ordinal as u64
     }
 
+    /// Reserve ranges already carried by copied data before this memory family forks.
+    pub(crate) fn reserve_memory_ordinals(&self, next: u64) -> Result<()> {
+        if !self.memory || next > u16::MAX as u64 + 1 {
+            return Err(Error::invalid("invalid copied memory-family branch ranges"));
+        }
+        let mut table = self.table.lock();
+        table.next_ordinal = table.next_ordinal.max(next as u32);
+        Ok(())
+    }
+
     /// Record the merges of store `id` (at its open) or one more (after a merge).
     pub(crate) fn note_merges(&self, id: uuid::Uuid, recs: &[MergeRec], replace: bool) {
         let mut m = self.merges.write();

@@ -79,6 +79,18 @@ impl Reasoning {
         )
     }
 
+    /// Diagnose and attach the first minimal support to each finding under one deadline
+    /// and a shared bound on oracle checks.
+    #[cfg(feature = "reasoning")]
+    pub fn diagnostics_justified(
+        &self,
+        options: &sparkles_reasoner::diagnostics::DiagnoseOptions,
+        analysis: &crate::reasoning::analysis::AnalysisOptions,
+        max_checks: usize,
+    ) -> Result<crate::reasoning::justify::JustifiedDiagnostics> {
+        crate::reasoning::justify::diagnose(&self.ds, options, analysis, max_checks)
+    }
+
     /// Remove the materialized inferences and the record; the triples removed.
     #[cfg(feature = "reasoning")]
     pub fn clear(&self) -> Result<u64> {
@@ -98,6 +110,35 @@ impl Reasoning {
         req: &crate::reasoning::explain::ExplainRequest,
     ) -> Result<crate::reasoning::explain::Explanation> {
         crate::reasoning::explain::explain(&self.ds, req)
+    }
+
+    /// Compare the entailments of two retained states under the same rule program.
+    /// The analysis writes only to private memory and leaves this dataset unchanged.
+    #[cfg(feature = "reasoning")]
+    pub fn diff(
+        &self,
+        request: &crate::reasoning::diff::DiffRequest,
+    ) -> Result<crate::reasoning::diff::EntailmentDiff> {
+        crate::reasoning::diff::diff(&self.ds, request)
+    }
+
+    /// Compute an entailment delta over the actual complete states of a write preview.
+    #[cfg(feature = "reasoning")]
+    pub fn diff_preview(
+        &self,
+        preview: &crate::preview::Preview,
+        request: &crate::reasoning::diff::DiffRequest,
+    ) -> Result<crate::reasoning::diff::EntailmentDiff> {
+        crate::reasoning::diff::preview(&self.ds, preview, request)
+    }
+
+    /// Find minimal asserted supports for a diagnostic finding or an unsatisfiable class.
+    #[cfg(feature = "reasoning")]
+    pub fn justify(
+        &self,
+        request: &crate::reasoning::justify::JustifyRequest,
+    ) -> Result<crate::reasoning::justify::JustificationReport> {
+        crate::reasoning::justify::justify(&self.ds, request)
     }
 
     /// RDFS on read.

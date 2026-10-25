@@ -92,6 +92,8 @@ pub(super) fn parse(
         changes,
         all_changes: patch,
         max_changes: st.limits.max_rows as u64,
+        retain_states: false,
+        state_max_memory: None,
     }))
 }
 

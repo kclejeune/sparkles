@@ -23,6 +23,8 @@ fn dry(changes: usize) -> WriteOptions {
             changes,
             all_changes: false,
             max_changes: 0,
+            retain_states: false,
+            state_max_memory: None,
         }),
         ..Default::default()
     }
@@ -34,6 +36,8 @@ fn all_changes() -> WriteOptions {
             changes: 0,
             all_changes: true,
             max_changes: 0,
+            retain_states: false,
+            state_max_memory: None,
         }),
         ..Default::default()
     }
@@ -623,6 +627,8 @@ fn a_full_listing_is_bounded() {
             changes: 0,
             all_changes: true,
             max_changes: 2,
+            retain_states: false,
+            state_max_memory: None,
         }),
         ..Default::default()
     };
@@ -720,4 +726,87 @@ fn a_put_logs_only_the_difference() {
     let r = put(body(100));
     assert!(!r.committed);
     assert_eq!(state(&s).len(), 100);
+}
+
+#[test]
+fn retained_candidate_preserves_new_terms_and_unlisted_changes_after_rollback() {
+    let s = Store::in_memory(Default::default());
+    let before = s.head_commit().seq;
+    let w = WriteOptions {
+        dry_run: Some(DryRun {
+            changes: 1,
+            retain_states: true,
+            ..Default::default()
+        }),
+        ..Default::default()
+    };
+    let preview = preview_upd(
+        &s,
+        "INSERT DATA { <urn:new> <urn:p> 1, 2, 3 . _:fresh <urn:p> <urn:new> }",
+        w,
+    )
+    .unwrap();
+    assert_eq!(preview.changes.len(), 1);
+    let states = preview.states.unwrap();
+    assert_eq!(states.before.len(), 0);
+    assert_eq!(states.after.len(), 4);
+    assert_eq!(s.snapshot().len(), 0);
+    assert_eq!(s.head_commit().seq, before);
+    let copy = s
+        .copy_view_to_memory(
+            &states.after,
+            Default::default(),
+            &Default::default(),
+            |_| Ok(true),
+        )
+        .unwrap();
+    assert_eq!(copy.snapshot().len(), 4);
+    assert!(copy.snapshot().lookup_iri("urn:new").is_some());
+}
+
+#[test]
+fn retained_bulk_candidate_remains_readable_after_temporary_generation_cleanup() {
+    for persistent in [false, true] {
+        let dir = tempfile::tempdir().unwrap();
+        let opts = StoreOptions {
+            bulk_threshold: 2,
+            ..Default::default()
+        };
+        let store = if persistent {
+            Store::open(&dir.path().join("db"), opts).unwrap()
+        } else {
+            Store::in_memory(opts)
+        };
+        let head = store.head_commit().seq;
+        let w = WriteOptions {
+            dry_run: Some(DryRun {
+                retain_states: true,
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let preview = preview::catch(store.load_with(
+            &[nt(
+                "<urn:s> <urn:p> \"1\" .\n<urn:s> <urn:p> \"2\" .\n<urn:s> <urn:p> \"3\" .\n",
+            )],
+            CommitKind::Load,
+            &w,
+        ))
+        .unwrap();
+        assert!(preview.commit.unwrap().bulk);
+        let views = preview.states.unwrap();
+        assert_eq!(views.before.len(), 0);
+        assert_eq!(views.after.len(), 3);
+        let copied = store
+            .copy_view_to_memory(
+                &views.after,
+                Default::default(),
+                &Default::default(),
+                |_| Ok(true),
+            )
+            .unwrap();
+        assert_eq!(copied.snapshot().len(), 3);
+        assert_eq!(store.head_commit().seq, head);
+        assert_eq!(store.snapshot().len(), 0);
+    }
 }

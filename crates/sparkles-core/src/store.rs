@@ -54,6 +54,7 @@ mod preview;
 mod quota;
 mod replay;
 mod schedule;
+mod simulation;
 #[cfg(feature = "text")]
 pub(crate) mod text_recovery;
 // the geometry tests are the only users

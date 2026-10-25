@@ -639,6 +639,8 @@ fn guard_failures(
             changes: 0,
             all_changes: false,
             max_changes: 0,
+            retain_states: false,
+            state_max_memory: None,
         }),
     };
     match sparkles::sparql::update::update_as(

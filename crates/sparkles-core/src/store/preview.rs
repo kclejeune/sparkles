@@ -218,6 +218,10 @@ impl Store {
             validation: b.validation,
             precondition: precondition(self, b.opts),
             storage: b.storage,
+            states: b.dr.retain_states.then(|| crate::preview::PreviewStates {
+                before: head_snap,
+                after: Arc::new(b.candidate.clone()),
+            }),
         })
     }
 }
@@ -311,6 +315,34 @@ impl WriteTxn<'_> {
         } else {
             (Vec::new(), None)
         };
+        // Rolling back truncates the transaction's delta vocabulary. Detach the
+        // complete candidate while that dictionary still exists, under the already
+        // held writer admission. Merely cloning `view` would retain dangling term IDs.
+        let states = if dr.retain_states {
+            let copied = store.copy_view_with_allocator(
+                &view,
+                StoreOptions {
+                    max_memory_bytes: dr.state_max_memory,
+                    result_cache_bytes: 0,
+                    service_cache_bytes: 0,
+                    ..Default::default()
+                },
+                &self.opts,
+                self.guard.next_bnode,
+                |_| Ok(true),
+            )?;
+            let mut after = (*copied.snapshot()).clone();
+            // This is a detached view of this family's candidate, not a new dataset.
+            after.dataset_id = store.owner_dataset_id();
+            after.commit = head.seq;
+            after.cacheable = false;
+            Some(crate::preview::PreviewStates {
+                before: self.base.clone(),
+                after: Arc::new(after),
+            })
+        } else {
+            None
+        };
         Ok(Preview {
             dataset_id: store.owner_dataset_id(),
             head,
@@ -323,6 +355,7 @@ impl WriteTxn<'_> {
             validation,
             precondition: pre,
             storage,
+            states,
         })
     }
 }

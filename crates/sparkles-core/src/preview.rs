@@ -27,6 +27,10 @@ pub struct DryRun {
     /// the most changes a full listing, or the state comparison of a bulk write's
     /// listing, may hold (0: no limit): a `rows` budget error beyond it
     pub max_changes: u64,
+    /// Retain the complete before/after views for read-only entailment analysis.
+    pub retain_states: bool,
+    /// Estimated heap limit for detaching a rollback candidate's mutable dictionary.
+    pub state_max_memory: Option<u64>,
 }
 
 /// The net change of one graph.
@@ -101,6 +105,27 @@ pub struct Preview {
     /// the write's precondition: `None` without one, else whether it holds
     pub precondition: Option<std::result::Result<(), String>>,
     pub storage: StorageCheck,
+    /// Complete immutable views, independent of the bounded listed changes.
+    pub states: Option<PreviewStates>,
+}
+
+/// Retained preview views keep their dictionaries and generation mappings alive after
+/// rollback. They never make an uncommitted candidate visible through the store.
+#[derive(Clone)]
+pub struct PreviewStates {
+    pub before: Arc<crate::store::Snapshot>,
+    pub after: Arc<crate::store::Snapshot>,
+}
+
+impl std::fmt::Debug for PreviewStates {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("PreviewStates")
+            .field("before_commit", &self.before.commit)
+            .field("before_quads", &self.before.len())
+            .field("after_quads", &self.after.len())
+            .finish()
+    }
 }
 
 impl Preview {

@@ -402,8 +402,26 @@ pub fn diagnose_with(
     cache: Option<&sparkles_reasoner::Cache>,
     opts: &DiagnoseOptions,
 ) -> Result<Diagnostics> {
+    diagnose_snapshot_with(
+        store,
+        record,
+        cache,
+        opts,
+        store.snapshot(),
+        &Default::default(),
+    )
+}
+
+/// Diagnose an already retained view under a parent request's controls.
+pub(crate) fn diagnose_snapshot_with(
+    store: &Store,
+    record: Option<&ReasoningRecord>,
+    cache: Option<&sparkles_reasoner::Cache>,
+    opts: &DiagnoseOptions,
+    snap: Arc<crate::store::Snapshot>,
+    controls: &sparkles_reasoner::diagnostics::DiagnosticControls,
+) -> Result<Diagnostics> {
     let start = std::time::Instant::now();
-    let snap = store.snapshot();
     let commit = snap.commit;
     let checked = opts.checks.is_empty()
         || opts
@@ -436,8 +454,9 @@ pub fn diagnose_with(
         }
         _ => opts,
     };
-    let report = sparkles_reasoner::diagnostics::diagnose_with(snap, opts, typings.as_ref())
-        .map_err(from_anyhow)?;
+    let report =
+        sparkles_reasoner::diagnostics::diagnose_controlled(snap, opts, typings.as_ref(), controls)
+            .map_err(from_anyhow)?;
     let inferences = record
         .filter(|_| opts.inferences)
         .map(|r| (r.profile.clone(), freshness(r, store, commit)));

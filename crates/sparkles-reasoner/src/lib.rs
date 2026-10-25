@@ -36,6 +36,7 @@ pub mod tables;
 mod terms;
 pub mod whynot;
 
+pub use budget::MemoryExceeded as MemoryLimitExceeded;
 pub use extras::{Extras, UnknownVocabulary, Vocabulary};
 pub use inputs::{
     Fetched, GraphRef, Import, ImportMode, Inputs, LocationMapping, Resolved, fetch_imports,
