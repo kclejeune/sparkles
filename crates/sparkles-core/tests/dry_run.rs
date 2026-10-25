@@ -996,3 +996,63 @@ fn replay_preview_rechecks_preconditions_against_virtual_commit_heads() {
     assert_eq!(preview.outcome(), Outcome::PreconditionFailed);
     assert_eq!(main.head_commit().seq, 1);
 }
+
+#[test]
+fn complete_replay_preview_leaves_files_and_the_published_snapshot_unchanged() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().join("replay");
+    let main = Store::open(&root, StoreOptions::default()).unwrap();
+    upd(
+        &main,
+        "INSERT DATA {<urn:base> <urn:p> 0}",
+        Default::default(),
+    )
+    .unwrap();
+    main.create_branch("dev", &Default::default()).unwrap();
+    let dev = main.branch("dev").unwrap();
+    upd(
+        &dev,
+        "INSERT DATA {_:source <urn:fresh-predicate> \"first fresh value\"}",
+        Default::default(),
+    )
+    .unwrap();
+    upd(
+        &dev,
+        "INSERT DATA {<urn:fresh-subject> <urn:another-predicate> \"second value\"}",
+        Default::default(),
+    )
+    .unwrap();
+    main.flush_change_log().unwrap();
+    dev.flush_change_log().unwrap();
+    let before = files(&root);
+    let published = main.snapshot();
+    let preview = replay_preview(&main, Default::default());
+    assert!(Arc::ptr_eq(&published, &main.snapshot()));
+    assert_eq!(files(&root), before);
+    let candidate = preview.states.unwrap().after;
+    let mut expected = BTreeSet::new();
+    candidate
+        .for_each_quad(|ids| {
+            expected.insert(candidate.quad_to_terms(ids).unwrap().to_string());
+            Ok(())
+        })
+        .unwrap();
+    main.merge(
+        "dev",
+        "main",
+        &sparkles_core::branch::MergeOptions {
+            replay: true,
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    let actual = main.snapshot();
+    let mut got = BTreeSet::new();
+    actual
+        .for_each_quad(|ids| {
+            got.insert(actual.quad_to_terms(ids).unwrap().to_string());
+            Ok(())
+        })
+        .unwrap();
+    assert_eq!(got, expected);
+}

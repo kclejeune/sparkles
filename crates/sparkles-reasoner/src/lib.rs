@@ -1725,3 +1725,47 @@ pub fn bench_derive(
     }
     Ok((facts.len(), d.iterations, set, seq))
 }
+
+#[cfg(test)]
+mod geometry_analysis_control_tests {
+    use super::*;
+    use crate::analysis::{AnalysisContext, WitnessMap};
+    use sparkles_core::io::{RdfFormat, Source};
+    use sparkles_core::store::StoreOptions;
+
+    #[test]
+    fn analysis_cancel_is_returned_by_geometry_before_rule_compilation() {
+        let store = Store::in_memory(StoreOptions::default());
+        store.load(&[Source::from_bytes(b"<urn:a> <http://www.opengis.net/ont/geosparql#hasGeometry> <urn:g> . <urn:b> <http://www.opengis.net/ont/geosparql#hasGeometry> <urn:h> .".to_vec(),RdfFormat::Turtle,None)]).unwrap();
+        let snapshot = store.snapshot();
+        let terms = Terms::new(snapshot.clone());
+        let base = facts::Base::new(snapshot, &[Id::DEFAULT_GRAPH]).unwrap();
+        let stopped = Arc::new(AtomicBool::new(false));
+        let context = AnalysisContext::new(
+            WitnessMap::new(1, None, stopped.clone(), None),
+            None,
+            "controlled geometry unit".into(),
+        )
+        .unwrap();
+        let flag = stopped.clone();
+        let options = ReasonOptions {
+            analysis: Some(context),
+            cancel: None,
+            progress: Some(Arc::new(move |_, message| {
+                if message == "finding default geometries" {
+                    flag.store(true, Ordering::Relaxed);
+                }
+            })),
+            ..Default::default()
+        };
+        let error = default_geometries_for_run(&base, &terms, &Budget::unlimited(), &options)
+            .expect_err(
+                "the wrapper must stop while constructing defaults, before any engine check",
+            );
+        assert!(stopped.load(Ordering::Relaxed));
+        assert!(
+            error.downcast_ref::<MemoryLimitExceeded>().is_some(),
+            "{error:#}"
+        );
+    }
+}
