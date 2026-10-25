@@ -5859,6 +5859,9 @@
             },
             "type": "array"
           },
+          "read": {
+            "$ref": "#/components/schemas/DerivationRead"
+          },
           "rule": {
             "properties": {
               "name": {
@@ -5906,6 +5909,29 @@
           "triple",
           "kind",
           "depth"
+        ],
+        "type": "object"
+      },
+      "DerivationRead": {
+        "properties": {
+          "commit": {
+            "type": "integer"
+          },
+          "readAtHead": {
+            "type": "boolean"
+          },
+          "source": {
+            "enum": [
+              "materialized",
+              "rdfsOnRead",
+              "demand"
+            ],
+            "type": "string"
+          }
+        },
+        "required": [
+          "commit",
+          "source"
         ],
         "type": "object"
       },

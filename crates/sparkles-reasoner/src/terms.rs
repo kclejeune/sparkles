@@ -52,6 +52,8 @@ pub(crate) enum LocalTerm {
     Key(Vec<u8>),
     /// a blank node that must be created when writing
     BNode,
+    /// A rule-level constant, keyed by its original label rather than a session slot.
+    RuleBNode(Vec<u8>),
 }
 
 #[derive(Default)]
@@ -229,10 +231,32 @@ impl Terms {
             if let Some(id) = self.snap.lookup_term(t) {
                 return Ok(id.0);
             }
-            // rule-level blank node constant: one local bnode per label
-            let mut key = b"\0bn".to_vec();
-            key.extend_from_slice(b.as_str().as_bytes());
-            return self.local_keyed(key, LocalTerm::BNode, strict);
+            // A returned rule constant has a stable label independent of local slots.
+            // Compile source labels through id_for_rule so an encoded-looking source
+            // constant cannot be mistaken for a reference to a different constant.
+            if let Some(encoded) = b.as_str().strip_prefix("spkrule_")
+                && encoded.len().is_multiple_of(2)
+            {
+                let decoded: Option<Vec<u8>> = encoded
+                    .as_bytes()
+                    .as_chunks::<2>()
+                    .0
+                    .iter()
+                    .map(|pair| {
+                        let hi = (pair[0] as char).to_digit(16)?;
+                        let lo = (pair[1] as char).to_digit(16)?;
+                        Some((hi * 16 + lo) as u8)
+                    })
+                    .collect();
+                if let Some(decoded) = decoded {
+                    let mut key = b"\0bn".to_vec();
+                    key.extend_from_slice(&decoded);
+                    if let Some(id) = self.locals.read().unwrap().map.get(&key) {
+                        return Ok(*id);
+                    }
+                }
+            }
+            return self.rule_bnode(b, strict);
         }
         let key = id::term_key(t);
         if let Some(id) = self.snap.lookup_key(&key) {
@@ -240,6 +264,25 @@ impl Terms {
         }
         // the table gets its copy of the key once the term is charged
         self.local_keyed(key, LocalTerm::Key(Vec::new()), strict)
+    }
+
+    /// Compile a source constant without interpreting a response's encoded label.
+    pub fn id_for_rule(&self, term: &Term) -> u64 {
+        match term {
+            Term::BlankNode(node) => self
+                .rule_bnode(node, false)
+                .expect("non-strict charges do not fail"),
+            _ => self.id_for(term),
+        }
+    }
+
+    fn rule_bnode(&self, node: &BlankNode, strict: bool) -> Result<u64, MemoryExceeded> {
+        if let Some(id) = self.snap.lookup_term(&Term::BlankNode(node.clone())) {
+            return Ok(id.0);
+        }
+        let mut key = b"\0bn".to_vec();
+        key.extend_from_slice(node.as_str().as_bytes());
+        self.local_keyed(key, LocalTerm::RuleBNode(Vec::new()), strict)
     }
 
     /// The local id of `key`, made with `term` (a key term gets a copy of `key`) when
@@ -259,7 +302,7 @@ impl Terms {
             return Ok(id);
         }
         let n = l.len;
-        let copy = matches!(term, LocalTerm::Key(_));
+        let copy = matches!(term, LocalTerm::Key(_) | LocalTerm::RuleBNode(_));
         let (cap, len) = (l.map.capacity(), l.map.len());
         let grow = if len == cap {
             table_bytes(table_grown(cap, len, 1), ENTRY_BYTES)
@@ -272,6 +315,7 @@ impl Terms {
         self.charge(bytes, strict)?;
         let term = match term {
             LocalTerm::Key(_) => LocalTerm::Key(key.clone()),
+            LocalTerm::RuleBNode(_) => LocalTerm::RuleBNode(key.clone()),
             t => t,
         };
         self.table.set(n, term);
@@ -305,6 +349,15 @@ impl Terms {
         self.local_keyed(key, LocalTerm::BNode, true)
     }
 
+    /// A program-local blank constant cannot be recreated by inserting an RDF blank.
+    pub fn is_rule_bnode(&self, id: u64) -> bool {
+        Id(id).tag() == Tag::Local
+            && matches!(
+                self.table.get(Id(id).payload()),
+                Some(LocalTerm::RuleBNode(_))
+            )
+    }
+
     pub fn local(&self, id: u64) -> Option<LocalTerm> {
         let i = Id(id);
         (i.tag() == Tag::Local)
@@ -315,7 +368,7 @@ impl Terms {
     /// The kind of a local id's term, without cloning it.
     fn local_kind(&self, id: u64) -> Kind {
         match self.table.get(Id(id).payload()) {
-            Some(LocalTerm::BNode) => Kind::BNode,
+            Some(LocalTerm::BNode | LocalTerm::RuleBNode(_)) => Kind::BNode,
             Some(LocalTerm::Key(k)) => key_kind(k),
             None => Kind::Other,
         }
@@ -356,6 +409,15 @@ impl Terms {
                 LocalTerm::BNode => {
                     Term::BlankNode(BlankNode::new_unchecked(format!("r{:x}", i.payload())))
                 }
+                LocalTerm::RuleBNode(key) => {
+                    use std::fmt::Write;
+                    let mut label = String::with_capacity(8 + 2 * (key.len() - 3));
+                    label.push_str("spkrule_");
+                    for byte in &key[3..] {
+                        write!(label, "{byte:02x}").expect("String write");
+                    }
+                    Term::BlankNode(BlankNode::new_unchecked(label))
+                }
             });
         }
         self.snap.term(i)
@@ -367,7 +429,7 @@ impl Terms {
         match i.tag() {
             Tag::Local => match self.local(id)? {
                 LocalTerm::Key(k) => Some(k),
-                LocalTerm::BNode => None,
+                LocalTerm::BNode | LocalTerm::RuleBNode(_) => None,
             },
             Tag::Vocab | Tag::Delta => self.snap.key(i).map(|k| k.into_owned()),
             _ => self.snap.term(i).map(|t| id::term_key(&t)),

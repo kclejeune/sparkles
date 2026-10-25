@@ -11,6 +11,7 @@
     how,
     maxId,
     sameRead,
+    readFor,
     MAX_TREES,
     premiseTriples,
     staleNote,
@@ -147,9 +148,14 @@
     expanding = new Set([...expanding, d.id]);
     refError = '';
     try {
-      const r = await explainTriple(ds, d.triple, { maxTrees: 1, signal: c.signal });
+      const expected = explanation ? readFor(d, explanation) : null;
+      const r = await explainTriple(ds, d.triple, {
+        maxTrees: 1,
+        source: expected?.source === 'rdfsOnRead' ? undefined : expected?.source,
+        signal: c.signal,
+      });
       if (gen !== generation) return;
-      if (r.ok && explanation && !sameRead(explanation, r.explanation)) {
+      if (r.ok && expected && !sameRead(expected, r.explanation)) {
         refError = CHANGED;
       } else if (r.ok && r.explanation.trees[0]) {
         const sub = r.explanation.trees[0];

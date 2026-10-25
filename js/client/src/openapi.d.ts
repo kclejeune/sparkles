@@ -5475,6 +5475,7 @@ export interface components {
             kind: "asserted" | "axiom" | "derived" | "ref" | "unexplained";
             missing?: boolean;
             premises?: components["schemas"]["Derivation"][];
+            read?: components["schemas"]["DerivationRead"];
             rule?: {
                 name: string;
                 owl2rl?: string;
@@ -5487,6 +5488,12 @@ export interface components {
                 p: components["schemas"]["RdfTerm"];
                 s: components["schemas"]["RdfTerm"];
             };
+        };
+        DerivationRead: {
+            commit: number;
+            readAtHead?: boolean;
+            /** @enum {string} */
+            source: "materialized" | "rdfsOnRead" | "demand";
         };
         DescribeSetting: {
             labels?: boolean;

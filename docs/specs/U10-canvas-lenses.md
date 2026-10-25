@@ -796,3 +796,7 @@ premises. These extensions complete follow-ups 135 to 139.
 Mixed RDFS explanations resolve each inferred physical leaf before selecting their proof.
 An unsupported inferred leaf therefore does not hide a supported alternative that uses
 a different inferred intermediate and readable schema facts.
+
+Depth-cut refs retain the materialized component's read context inside mixed trees. The
+panel requests the same source and checks the returned commit and fallback marker before
+grafting an expansion, including generalized premises from historical materializations.

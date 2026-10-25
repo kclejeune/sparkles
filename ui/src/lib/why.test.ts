@@ -10,6 +10,7 @@ import {
   staleNote,
   maxId,
   sameRead,
+  readFor,
   tripleKey,
   walk,
   type Derivation,
@@ -163,6 +164,14 @@ describe('derivation trees (U10 §2.4)', () => {
   });
 
   it('tells answers that read other inferences apart', () => {
+    const context = { commit: 300, source: 'materialized' as const, readAtHead: false };
+    const ref = { ...A7, kind: 'ref' as const, read: context };
+    expect(readFor(ref, explanation({ source: 'rdfsOnRead', commit: 301 }))).toEqual(context);
+    expect(sameRead(readFor(ref, explanation()), explanation(context))).toBe(true);
+    expect(sameRead(readFor(ref, explanation()), explanation({ ...context, commit: 302 }))).toBe(
+      false,
+    );
+    expect(readFor({ ...ref, read: undefined }, explanation())).toEqual(explanation());
     expect(sameRead(explanation(), explanation())).toBe(true);
     expect(sameRead(explanation(), explanation({ commit: 319 }))).toBe(false);
     expect(sameRead(explanation(), explanation({ source: 'rdfsOnRead' }))).toBe(false);
@@ -204,6 +213,13 @@ describe('explainTriple', () => {
       }),
     );
   const triple = t('alice', RDF_TYPE, 'Employee');
+
+  it('preserves a requested materialized source when expanding a reference', async () => {
+    answer(200, explanation());
+    await explainTriple('ds', triple, { source: 'materialized' });
+    const request = vi.mocked(fetch).mock.calls.at(-1)?.[1];
+    expect(JSON.parse(String(request?.body)).source).toBe('materialized');
+  });
 
   it('returns the trees', async () => {
     answer(200, explanation());

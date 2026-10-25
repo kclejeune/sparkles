@@ -745,7 +745,7 @@ fn why_not_verifies_smaller_sets_before_pruning_their_supersets() {
     else {
         panic!("entailed");
     };
-    let wanted = vec![
+    let wanted = [
         [ex("a"), ex("grant"), ex("b")],
         [ex("a"), ex("waiver"), ex("b")],
     ];
@@ -973,4 +973,90 @@ fn geometry_why_not_unfolds_the_implicit_default_rule() {
             "{hypotheses:?}"
         );
     }
+}
+
+#[test]
+fn review_r2_nested_blockers_do_not_accumulate_discarded_strings() {
+    let value = "z".repeat(1_000_000);
+    let s = store(&format!("ex:a ex:value \"{value}\" ."));
+    let alternatives: String = (0..20)
+        .map(|i| format!("[blocked{i}: (?x ex:value ?v), notLiteral(?v) -> (?x ex:mid ex:yes)]\n"))
+        .collect();
+    let p = Profile::Rules(format!(
+        "@prefix ex: <http://ex.org/> . [target: (?x ex:mid ex:yes) -> (?x ex:target ex:yes)] {alternatives}"
+    ));
+    let answer = whynot(
+        &s,
+        &p,
+        [ex("a"), ex("target"), ex("yes")],
+        &WhyNotOptions {
+            explain: ExplainOptions {
+                max_memory: Some(6_000_000),
+                ..Default::default()
+            },
+            ..Default::default()
+        },
+    );
+    let WhyNot::NotEntailed {
+        rules, hypotheses, ..
+    } = answer
+    else {
+        panic!("not entailed");
+    };
+    assert_eq!(rules.len(), 1);
+    assert!(rules[0].blocked_by.is_empty());
+    assert!(
+        hypotheses
+            .iter()
+            .any(|h| h.missing == [[ex("a"), ex("mid"), ex("yes")]])
+    );
+}
+
+#[test]
+fn rule_local_blank_constants_are_not_insertable_why_not_hypotheses() {
+    let s = store("");
+    let p = Profile::Rules(
+        "@prefix ex: <http://ex.org/> . [fixed: (_:anchor ex:p ex:b) -> (ex:a ex:target ex:b)]"
+            .into(),
+    );
+    let target = [ex("a"), ex("target"), ex("b")];
+    let WhyNot::NotEntailed {
+        hypotheses,
+        complete,
+        ..
+    } = whynot(&s, &p, target.clone(), &WhyNotOptions::default())
+    else {
+        panic!("not entailed");
+    };
+    for hypothesis in &hypotheses {
+        // Inserting the serialized blank allocates a store node, rather than recreating
+        // the compiler's rule-local constant. An overlay must not claim otherwise.
+        rematerialize("", &p, &hypothesis.missing, &target);
+    }
+    assert!(hypotheses.is_empty());
+    assert!(!complete);
+}
+
+#[test]
+fn blank_head_rules_do_not_claim_complete_abduction() {
+    let s = store("");
+    let p = Profile::Rules(
+        "@prefix ex: <http://ex.org/> . [blank: (?x ex:p ?y) -> (_:anchor ex:q ?y)]".into(),
+    );
+    let target = [
+        Term::BlankNode(BlankNode::new("anchor").unwrap()),
+        ex("q"),
+        ex("b"),
+    ];
+    let WhyNot::NotEntailed {
+        hypotheses,
+        complete,
+        rules,
+    } = whynot(&s, &p, target, &WhyNotOptions::default())
+    else {
+        panic!("not entailed");
+    };
+    assert_eq!(rules.len(), 1);
+    assert!(hypotheses.is_empty());
+    assert!(!complete);
 }

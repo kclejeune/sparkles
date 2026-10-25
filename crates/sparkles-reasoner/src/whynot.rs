@@ -163,6 +163,8 @@ struct Unfold<'a> {
     complete: bool,
     /// a derivation the unfolding asked for passed its limits
     lossy: bool,
+    /// Only top-level candidates are returned with their builtin blockers.
+    report_blockers: bool,
 }
 
 struct CallBytes(usize);
@@ -477,11 +479,19 @@ impl Unfold<'_> {
 
     /// Whether the rule makes terms (blank nodes in its head or a builtin that makes
     /// one), whose hypotheses are not verified (spec F18 §4.2).
-    fn makes_terms(r: &CRule) -> bool {
+    fn makes_terms(&self, r: &CRule) -> bool {
         r.builtins
             .iter()
             .any(|b| matches!(b.kind, BuiltinKind::MakeTemp | BuiltinKind::MakeSkolem))
-            || r.head.iter().any(|h| matches!(h, CHead::Action(..)))
+            || r.head.iter().any(|h| {
+                if matches!(h, CHead::Action(..)) {
+                    return true;
+                }
+                let (s, p, o) = head_slots(h);
+                [s, p, o]
+                    .iter()
+                    .any(|slot| matches!(slot, Slot::Const(id) if self.terms().is_rule_bnode(*id)))
+            })
     }
 
     /// The bindings of rule `ri`'s head `hi` unified with `t`, or `None`.
@@ -512,7 +522,9 @@ impl Unfold<'_> {
         ri: usize,
         b: Vec<u64>,
         blocked: &mut Vec<(String, Option<Triple>)>,
+        report_blockers: bool,
     ) -> anyhow::Result<Vec<Completion>> {
+        self.report_blockers = report_blockers;
         let mut out = Vec::new();
         let mut b = b;
         let mut missing = Vec::new();
@@ -683,8 +695,10 @@ impl Unfold<'_> {
                 }
             };
             if let Some(fact) = fail {
-                let call = blocker_call(terms, name, &args, &mut self.work)?;
-                blocked.push((call, fact));
+                if self.report_blockers {
+                    let call = blocker_call(terms, name, &args, &mut self.work)?;
+                    blocked.push((call, fact));
+                }
                 return Ok(());
             }
         }
@@ -786,7 +800,7 @@ impl Unfold<'_> {
                 let Some(b) = Self::unify(r, hi, &t) else {
                     continue;
                 };
-                if Self::makes_terms(r) {
+                if self.makes_terms(r) {
                     if let Some(c) = candidates.as_deref_mut() {
                         c.push((ri, b, Vec::new()));
                     }
@@ -805,7 +819,7 @@ impl Unfold<'_> {
                     self.cap = self.steps + STEPS_PER_RULE;
                 }
                 let mut blocked = Vec::new();
-                let comps = self.completions(ri, b.clone(), &mut blocked)?;
+                let comps = self.completions(ri, b.clone(), &mut blocked, candidates.is_some())?;
                 if let Some(c) = candidates.as_deref_mut() {
                     c.push((ri, b, blocked));
                 }
@@ -952,6 +966,7 @@ fn why_not_inner(
         cap: 0,
         complete: true,
         lossy: false,
+        report_blockers: false,
     };
     u.demanded.insert(root.map(Some));
     let t0 = std::time::Instant::now();
@@ -1193,6 +1208,16 @@ fn verify(
     complete: &mut bool,
 ) -> anyhow::Result<Option<Hypothesis>> {
     let from = u.session.terms();
+    // An overlay can refer to a compiler-local blank by its stable response label,
+    // but inserting that RDF label would create a different store node. Such a set
+    // cannot be advertised as an insertable hypothesis.
+    if h.iter()
+        .flatten()
+        .any(|&id| !is_hole(id) && from.is_rule_bnode(id))
+    {
+        *complete = false;
+        return Ok(None);
+    }
     // Hypotheses are additions to an RDF snapshot. Generalized intermediate facts
     // may occur in a proof, but a caller cannot insert a literal subject or a blank
     // predicate. A placeholder becomes a blank node and therefore cannot be a predicate.

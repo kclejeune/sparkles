@@ -8,6 +8,12 @@ import { termKey } from './rdf';
 
 export type WhyTriple = { s: Term; p: Term; o: Term };
 
+export type ReadContext = {
+  commit: number;
+  source: 'materialized' | 'rdfsOnRead' | 'demand';
+  readAtHead?: boolean;
+};
+
 export type Derivation = {
   id: number;
   triple: WhyTriple;
@@ -20,6 +26,8 @@ export type Derivation = {
   builtins?: { call: string; holds: true }[];
   generalized?: boolean;
   missing?: boolean;
+  /** The original read of a materialized subtree inside a mixed tree. */
+  read?: ReadContext;
   /** A repeat of the node with this id given earlier, without its premises. */
   shared?: boolean;
 };
@@ -54,7 +62,12 @@ const BUDGET = 'The derivation is deeper than the search limit.';
 export async function explainTriple(
   ds: string,
   triple: WhyTriple,
-  opts: { maxTrees?: number; maxDepth?: number; signal?: AbortSignal } = {},
+  opts: {
+    maxTrees?: number;
+    maxDepth?: number;
+    source?: 'materialized' | 'demand';
+    signal?: AbortSignal;
+  } = {},
 ): Promise<WhyResult> {
   try {
     const explanation = await api.json<Explanation>(`/$/reason/${encodeURIComponent(ds)}/explain`, {
@@ -65,6 +78,7 @@ export async function explainTriple(
         mode: 'why',
         maxTrees: opts.maxTrees ?? MAX_TREES,
         ...(opts.maxDepth ? { maxDepth: opts.maxDepth } : {}),
+        ...(opts.source ? { source: opts.source } : {}),
       }),
       signal: opts.signal,
     });
@@ -210,11 +224,13 @@ export function graft(
   return put(tree);
 }
 
-/**
- * Whether two answers read the same inferences: the same commit and source, and both or
- * neither at the head. An expansion that reads others cannot join the tree it expands.
- */
-export function sameRead(a: Explanation, b: Explanation): boolean {
+/** The original read of a mixed subtree, or the containing answer for older servers. */
+export function readFor(node: Derivation, parent: ReadContext): ReadContext {
+  return node.read ?? parent;
+}
+
+/** An expansion must retain its commit, source and history-fallback marker. */
+export function sameRead(a: ReadContext, b: ReadContext): boolean {
   return a.commit === b.commit && a.source === b.source && !!a.readAtHead === !!b.readAtHead;
 }
 

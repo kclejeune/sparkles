@@ -8,5 +8,6 @@ export function explanationDetails(answer: components['schemas']['Explanation'])
   const blockers = answer.rules?.flatMap((candidate) =>
     candidate.blockedBy?.map((blocker) => blocker.call),
   );
-  return { missing, blockers };
+  const reads = answer.trees?.map((tree) => tree.read?.source);
+  return { missing, blockers, reads };
 }

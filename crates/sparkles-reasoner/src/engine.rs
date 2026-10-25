@@ -199,7 +199,7 @@ fn compile_one(
     let slot = |n: &Node, var: &mut dyn FnMut(&str) -> usize| -> Result<Slot, String> {
         Ok(match n {
             Node::Var(v) => Slot::Var(var(v)),
-            Node::Const(t) => Slot::Const(terms.id_for(t)),
+            Node::Const(t) => Slot::Const(terms.id_for_rule(t)),
             Node::Any => Slot::Any,
             Node::Functor(name, _) => {
                 return Err(format!(

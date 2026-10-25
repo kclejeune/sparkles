@@ -7813,7 +7813,11 @@ that is not entailed. A search that passes its limits before it finds a tree ans
 with code `reasoning-budget`. A derivation through a generalized fact, such as a literal
 subject, is recovered from the demand engine, and generalized premises carry
 `generalized: true`. Such a reference can be expanded with a why request containing its
-literal subject or blank-node predicate. Why-not hypotheses remain valid RDF.
+literal subject or blank-node predicate. Rule-level blank nodes have opaque labels that
+round-trip through subsequent requests. A ref's optional `read` object gives its `commit`,
+`source` and `readAtHead` when it belongs to a materialized subtree. Expansion preserves
+that read, including within a mixed RDFS tree at a later head. Why-not hypotheses remain
+valid RDF.
 The `geo-default-geometry` rule explains a default geometry from the
 feature's single geometry. A derived node includes its variable `bindings` and the
 `builtins` its instance passed. When the search has reached a rule instance before a
@@ -7831,6 +7835,8 @@ placeholder, shared across its facts and listed in `placeholders`. These placeho
 stand for fresh resources when adding the facts. `complete: false` reports a search that
 stopped at its unfolding, candidate, matching or response limits. Hypotheses are verified
 against an uncached overlay of the caller's snapshot and never write to the dataset.
+Rules that create blank nodes and hypotheses that would need a compiler-local blank
+identity make the search incomplete. Such identities cannot be recreated by inserting RDF.
 
 The library call is `Dataset::reasoning().explain`, and the Python and Node.js bindings
 expose it as `ds.reasoning.explain(triple)` with the triple in Turtle. In the CLI,

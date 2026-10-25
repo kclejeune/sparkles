@@ -152,6 +152,16 @@ fn reasoning(put: &mut dyn FnMut(&str, J)) {
         ),
     );
     put(
+        "DerivationRead",
+        obj(
+            &["commit", "source"],
+            json!({
+                "commit":int(), "source":string_enum(&["materialized", "rdfsOnRead", "demand"]),
+                "readAtHead":boolean(),
+            }),
+        ),
+    );
+    put(
         "Derivation",
         doc(
             obj(
@@ -163,6 +173,7 @@ fn reasoning(put: &mut dyn FnMut(&str, J)) {
                     "bindings": {"type":"object","additionalProperties":sref("RdfTerm")},
                     "builtins": array(obj(&["call","holds"],json!({"call":string(),"holds":{"const":true}}))),
                     "generalized": boolean(),
+                    "read": sref("DerivationRead"),
                     "missing": boolean(),
                     "depth": int(),
                     "graph": { "type": "string", "description": "For an asserted node, `default` or the IRI of the graph that holds the triple. Absent for a triple of an RDFS-on-read schema given as a document." },

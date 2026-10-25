@@ -565,7 +565,7 @@ fn generalized_references_can_be_expanded_through_the_request_contract() {
         let (request, _, _) =
             request_from_json(&json).expect("a generalized ref is a valid why target");
         let explanation = ds.reasoning().explain(&request).unwrap();
-        assert_eq!(explanation.source, Some(ExplainSource::Demand));
+        assert_eq!(explanation.source, Some(ExplainSource::Materialized));
         assert!(found(explanation.explained)[0].generalized);
         let mut why_not = json.clone();
         why_not["mode"] = "whyNot".into();
@@ -576,7 +576,7 @@ fn generalized_references_can_be_expanded_through_the_request_contract() {
         "triple":{"s":term_json(&ex("a")),"p":term_json(&blank),"o":term_json(&oxrdf::Literal::from("1").into())}});
     let (request, _, _) = request_from_json(&json).unwrap();
     let explanation = ds.reasoning().explain(&request).unwrap();
-    assert_eq!(explanation.source, Some(ExplainSource::Demand));
+    assert_eq!(explanation.source, Some(ExplainSource::Materialized));
     assert!(found(explanation.explained)[0].generalized);
     let mut why_not = json;
     why_not["mode"] = "whyNot".into();
@@ -593,4 +593,156 @@ fn generalized_targets_round_trip_through_text_surfaces() {
     assert!(matches!(blank_predicate[1], oxrdf::Term::BlankNode(_)));
     assert!(triple_from_text("<urn:s> \"predicate\" <urn:o>", &[]).is_err());
     assert!(triple_from_text("?s <urn:p> <urn:o>", &[]).is_err());
+}
+
+#[cfg(feature = "reasoning")]
+#[test]
+fn review_r2_generalized_refs_keep_the_materialized_snapshot() {
+    use sparkles::reasoning::{ReasonRequest, reasoner::Profile};
+    for stale in [false, true] {
+        let (_dir, ds) = open();
+        ds.load_str(
+            "<urn:a> <urn:value> \"1\" . <urn:b> <urn:value> \"1\" .",
+            RdfFormat::Turtle,
+        )
+        .unwrap();
+        ds.reasoning().run(&ReasonRequest { profile: Profile::Rules("[reverse: (?x <urn:value> ?v) -> (?v <urn:of> ?x)] [pair: (?v <urn:of> ?x), (?v <urn:of> ?y), notEqual(?x,?y) -> (?x <urn:pair> ?y)]".into()), ..Default::default() }).unwrap();
+        let term = |iri: &str| Term::NamedNode(NamedNode::new(iri).unwrap());
+        let mut request = ExplainRequest::new([term("urn:a"), term("urn:pair"), term("urn:b")]);
+        request.source = Some(ExplainSource::Materialized);
+        request.max_depth = 1;
+        let parent = ds.reasoning().explain(&request).unwrap();
+        assert_eq!(parent.source, Some(ExplainSource::Materialized));
+        let reference = found(parent.explained)[0]
+            .premises
+            .iter()
+            .find(|d| d.generalized && d.kind == DerivationKind::Ref)
+            .unwrap()
+            .triple
+            .clone();
+        if stale {
+            ds.update("DELETE DATA { <urn:a> <urn:value> \"1\" }")
+                .unwrap();
+        }
+        let mut request = ExplainRequest::new(reference);
+        request.source = Some(ExplainSource::Materialized);
+        let child = ds.reasoning().explain(&request).unwrap();
+        assert_eq!(
+            child.commit, parent.commit,
+            "expansion must keep the selected historical read"
+        );
+        assert_eq!(
+            child.source, parent.source,
+            "the UI graft check requires the same source"
+        );
+        found(child.explained);
+    }
+}
+
+#[cfg(feature = "reasoning")]
+#[test]
+fn review_r2_returned_blank_predicate_ref_round_trips_verbatim() {
+    use sparkles::reasoning::explain::{request_from_json, term_json};
+    use sparkles::reasoning::{ReasonRequest, reasoner::Profile};
+    let ds = Dataset::memory();
+    ds.load_str("<urn:a> <urn:p> <urn:b> .", RdfFormat::Turtle)
+        .unwrap();
+    let labels = ["predicate", "λ", "spkrule_707265646963617465", "r6"];
+    let rules: String = labels.iter().enumerate().map(|(i,label)| format!("[blank{i}: (?s <urn:p> ?o) -> (?s _:{label} ?o)] [use{i}: (?s _:{label} ?o) -> (?s <urn:q{i}> ?o)] ")).collect();
+    ds.reasoning()
+        .run(&ReasonRequest {
+            profile: Profile::Rules(rules),
+            ..Default::default()
+        })
+        .unwrap();
+    let term = |iri: &str| Term::NamedNode(NamedNode::new(iri).unwrap());
+    let mut predicates = std::collections::HashSet::new();
+    for i in 0..labels.len() {
+        let mut parent =
+            ExplainRequest::new([term("urn:a"), term(&format!("urn:q{i}")), term("urn:b")]);
+        parent.source = Some(ExplainSource::Demand);
+        parent.max_depth = 1;
+        let tree = found(ds.reasoning().explain(&parent).unwrap().explained).remove(0);
+        let reference = tree
+            .premises
+            .iter()
+            .find(|d| d.generalized && d.kind == DerivationKind::Ref)
+            .expect("blank predicate is a generalized depth cut");
+        let t = &reference.triple;
+        assert_eq!(
+            sparkles::reasoning::explain::triple_from_text(
+                &format!("{} {} {}", t[0], t[1], t[2]),
+                &[],
+            )
+            .unwrap(),
+            *t
+        );
+        assert!(
+            predicates.insert(t[1].clone()),
+            "distinct source constants must not alias"
+        );
+        let json = serde_json::json!({"mode":"why","source":"demand","triple":{"s":term_json(&t[0]),"p":term_json(&t[1]),"o":term_json(&t[2])}});
+        let (request, _, _) = request_from_json(&json).unwrap();
+        let tree = found(ds.reasoning().explain(&request).unwrap().explained).remove(0);
+        assert_eq!(tree.triple, reference.triple);
+    }
+}
+
+#[cfg(feature = "reasoning")]
+#[test]
+fn mixed_historical_refs_keep_their_materialized_read_context() {
+    use sparkles::reasoning::explain::explanation_json;
+    use sparkles::reasoning::{ReasonRequest, rdfs::NewSchema, reasoner::Profile};
+    let (_dir, ds) = open();
+    ds.load_str(
+        "<urn:a> <urn:value> \"1\" . <urn:b> <urn:value> \"1\" .",
+        RdfFormat::Turtle,
+    )
+    .unwrap();
+    ds.reasoning().run(&ReasonRequest { profile: Profile::Rules("[reverse: (?x <urn:value> ?v) -> (?v <urn:of> ?x)] [pair: (?v <urn:of> ?x), (?v <urn:of> ?y), notEqual(?x,?y) -> (?x <urn:pair> ?y)] [type: (?x <urn:pair> ?y) -> (?x rdf:type <urn:Employee>)]".into()), ..Default::default() }).unwrap();
+    ds.reasoning()
+        .rdfs()
+        .set(NewSchema::Triples(vec![oxrdf::Triple::new(
+            NamedNode::new("urn:Employee").unwrap(),
+            oxrdf::vocab::rdfs::SUB_CLASS_OF.into_owned(),
+            NamedNode::new("urn:Person").unwrap(),
+        )]))
+        .unwrap();
+    ds.update("DELETE DATA { <urn:a> <urn:value> \"1\" }")
+        .unwrap();
+    let mut request = ExplainRequest::new([
+        Term::NamedNode(NamedNode::new("urn:a").unwrap()),
+        ty(),
+        Term::NamedNode(NamedNode::new("urn:Person").unwrap()),
+    ]);
+    request.source = Some(ExplainSource::Materialized);
+    request.max_depth = 3;
+    let parent = ds.reasoning().explain(&request).unwrap();
+    assert_eq!(parent.source, Some(ExplainSource::RdfsOnRead));
+    fn reference(node: &Derivation) -> Option<&Derivation> {
+        if node.generalized && node.kind == DerivationKind::Ref {
+            Some(node)
+        } else {
+            node.premises.iter().find_map(reference)
+        }
+    }
+    let trees = match &parent.explained {
+        Explained::Found { trees, .. } => trees,
+        _ => panic!("no mixed tree"),
+    };
+    let reference = reference(&trees[0]).expect("cut generalized materialized premise");
+    let read = reference
+        .read
+        .expect("mixed subtree keeps its historical context");
+    assert_ne!(read.commit, parent.commit);
+    assert_eq!(read.source, "materialized");
+    let json = explanation_json(&parent);
+    assert!(json.to_string().contains("\"read\""));
+    let mut request = ExplainRequest::new(reference.triple.clone());
+    request.source = Some(ExplainSource::Materialized);
+    let child = ds.reasoning().explain(&request).unwrap();
+    assert_eq!(child.commit, read.commit);
+    assert_eq!(child.source.unwrap().as_str(), read.source);
+    assert_eq!(child.read_at_head, read.read_at_head);
+    found(child.explained);
 }

@@ -47,6 +47,15 @@ pub struct RuleRef {
     pub owl2rl: Option<String>,
 }
 
+/// The read that an expansion must retain, including a materialized subtree of a
+/// mixed RDFS-on-read tree.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct DerivationRead {
+    pub commit: u64,
+    pub source: &'static str,
+    pub read_at_head: bool,
+}
+
 /// One node of a derivation tree.
 #[derive(Clone, Debug)]
 pub struct Derivation {
@@ -79,6 +88,8 @@ pub struct Derivation {
     /// for an asserted node of a why-not answer, the fact is one of the hypothesis's
     /// missing facts and not in the data
     pub missing: bool,
+    /// The selected read of this subtree, retained when it is cut as a ref.
+    pub read: Option<DerivationRead>,
 }
 
 impl Derivation {
@@ -97,6 +108,7 @@ impl Derivation {
             builtins: Vec::new(),
             generalized: false,
             missing: false,
+            read: None,
         }
     }
 
@@ -120,6 +132,7 @@ impl Derivation {
             builtins: Vec::new(),
             generalized: false,
             missing: false,
+            read: None,
         }
     }
 

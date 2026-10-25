@@ -171,8 +171,7 @@ pub fn explain(ds: &Dataset, req: &ExplainRequest) -> Result<Explanation> {
     #[cfg(feature = "reasoning")]
     {
         let rec = ds.reasoning_record();
-        let use_demand = generalized
-            || req.mode == ExplainMode::WhyNot
+        let use_demand = req.mode == ExplainMode::WhyNot
             || req.source == Some(ExplainSource::Demand)
             || req.profile.is_some()
             || (req.source.is_none()
@@ -407,13 +406,43 @@ fn materialized(
         } else {
             false
         };
-        if matches!(found, Explained::NotFound) && stored_inference {
+        if matches!(found, Explained::NotFound)
+            && (stored_inference
+                || matches!(req.triple[0], Term::Literal(_))
+                || matches!(req.triple[1], Term::BlankNode(_)))
+        {
             let mut fallback = req.clone();
             fallback.source = Some(ExplainSource::Demand);
-            let d = demand(ds, &fallback, snap.clone(), deadline)?;
+            let reasoner = sparkles_reasoner::query::QueryReasoner::new(
+                profile.clone(),
+                &extras,
+                rec.run_inputs()?,
+            )
+            .map_err(crate::handles::from_anyhow)?;
+            let d = demand_with(&fallback, snap.clone(), deadline, &reasoner)?;
             found = d.explained;
         }
         if !matches!(found, Explained::NotFound) {
+            let read = crate::explain::DerivationRead {
+                commit: snap.commit,
+                source: "materialized",
+                read_at_head,
+            };
+            fn mark(node: &mut crate::explain::Derivation, read: crate::explain::DerivationRead) {
+                node.read = Some(read);
+                for premise in &mut node.premises {
+                    mark(premise, read);
+                }
+            }
+            match &mut found {
+                Explained::Found { trees, .. } => {
+                    for tree in trees {
+                        mark(tree, read);
+                    }
+                }
+                Explained::Partial { tree, .. } => mark(tree, read),
+                Explained::NotFound => {}
+            }
             return Ok(Some(Explanation {
                 explained: found,
                 commit: snap.commit,
@@ -434,7 +463,6 @@ fn demand(
     snap: Arc<Snapshot>,
     deadline: Option<Instant>,
 ) -> Result<Explanation> {
-    use sparkles_reasoner::explain::{DemandInput, ExplainOptions};
     check_controls(req, deadline)?;
     let profile = req
         .profile
@@ -443,6 +471,18 @@ fn demand(
         .transpose()
         .map_err(|e: sparkles_reasoner::UnknownProfile| bad(e.to_string()))?;
     let reasoner = ds.query_reasoner(profile)?;
+    demand_with(req, snap, deadline, &reasoner)
+}
+
+#[cfg(feature = "reasoning")]
+fn demand_with(
+    req: &ExplainRequest,
+    snap: Arc<Snapshot>,
+    deadline: Option<Instant>,
+    reasoner: &sparkles_reasoner::query::QueryReasoner,
+) -> Result<Explanation> {
+    use sparkles_reasoner::explain::{DemandInput, ExplainOptions};
+    check_controls(req, deadline)?;
     let view = view_of(req.access.as_ref(), &snap)?;
     let readable = req.access.as_ref().map(|a| {
         let a = a.clone();
@@ -451,7 +491,7 @@ fn demand(
             as Arc<dyn Fn(Id) -> bool + Send + Sync>
     });
     let input = DemandInput {
-        reasoner: &reasoner,
+        reasoner,
         snap: view,
         readable,
     };
@@ -682,6 +722,12 @@ pub fn derivation_json(d: &crate::explain::Derivation) -> J {
     }
     if d.generalized {
         o["generalized"] = true.into();
+    }
+    if d.kind == crate::explain::DerivationKind::Ref
+        && let Some(read) = d.read
+    {
+        o["read"] =
+            json!({"commit":read.commit,"source":read.source,"readAtHead":read.read_at_head});
     }
     if d.missing {
         o["missing"] = true.into();

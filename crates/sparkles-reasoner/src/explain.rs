@@ -749,6 +749,7 @@ impl Builder<'_, '_> {
             builtins,
             generalized: self.generalized(f),
             missing: false,
+            read: None,
         })
     }
 
@@ -809,6 +810,7 @@ impl Builder<'_, '_> {
             builtins,
             generalized: self.generalized(f),
             missing: false,
+            read: None,
         })
     }
 }
@@ -1255,8 +1257,7 @@ mod partial_tests {
                     }
                 },
             )
-            .err()
-            .expect("control interrupts geometry construction");
+            .expect_err("control interrupts geometry construction");
             assert_eq!(calls, stop_at);
             assert!(
                 error

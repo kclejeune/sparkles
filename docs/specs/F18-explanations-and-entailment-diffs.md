@@ -564,8 +564,16 @@ Partial-tree depth and predecessor tables stay aligned with facts even when a de
 interrupts expansion. Geometry construction uses the compiled session term dictionary
 and checks cancellation in both scans and output construction. Generalized references
 accept literal subjects and blank-node predicates through JSON and text why requests.
-The generated client types include candidates, blockers and missing-fact hypotheses,
-with a compile check that consumes those fields.
+Generalized traversal within a materialized explanation retains the selected historical
+snapshot and response provenance. Materialized subtrees carry a read context that refs
+preserve when a mixed RDFS tree cuts them, and the panel expands against that context.
+Rule-level blank nodes use stable opaque response labels distinct from generated nodes.
+Source constants with encoded-looking labels remain distinct. Why-not does not propose
+compiler-local blank constants as insertable RDF facts, and blank-head rules make its
+search incomplete, as term-generating rules do. Nested builtin failures
+do not render blocker text when the candidate is not part of the response.
+The generated client types include candidates, blockers, missing-fact hypotheses and ref
+read contexts, with a compile check that consumes the explanation fields.
 
 Phase 2 and Phase 3 remain below item 18. No on-disk format changes are needed.
 
