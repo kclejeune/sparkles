@@ -1059,6 +1059,39 @@ runs, before the timeout fired. The test now checks each limit on its own. The t
 check raises the budget out of reach with `max_rows`, and the budget check sets no
 timeout and expects the budget's message.
 
+### Current-source per-call assessment
+
+A bounded item 33 assessment keeps the Python implementation unchanged. Source
+`b310d8b4` was built in an isolated container with Rust 1.98.1 and GCC 12.2.0. The
+release extension passes 285 tests with two existing skips on CPython 3.11.2, including
+cancellation, transactions, stored blank-node identities, snapshots and iterator behavior.
+The build instance was destroyed after its receipts were collected.
+
+The quiet Forge comparison uses CPython 3.14.7 and pyoxigraph 0.5.11. Six fresh processes
+per engine rotate their order and run on six distinct performance cores with ten warmups
+and thirty measured samples. There are 105,302 input lines and 105,300 unique quads.
+`in` takes 1.087 µs against 1.887 µs, a value lookup 2.030 µs against 1.359 µs, and a
+subject scan 11.207 µs against 9.144 µs. The two-hop `knows` query takes 63 µs against
+42 µs, `values-star` 131 µs against 120 µs, the star lookup 209 µs against 303 µs and
+the employee lookup 122 µs against 134 µs. Exporting every quad through SPARQL takes
+140.3 ms against 300.3 ms. Single writes cost 4.856 µs against 4.896 µs and bulk writes
+4.599 µs against 4.935 µs, using 10,000 fresh triples per sample.
+
+The value and small-query residuals are real, but small in absolute time. This assessment
+does not establish a simple general change that justifies altering the binding. Item 33
+retains the remaining per-call work. The current APIs keep cancellation, term identity and
+snapshot behavior. No optimization was built and discarded, and no performance win is
+claimed for a code change.
+
+Nine canonical read cases agree by value. A separate unlimited full export also agrees
+by value for all 105,300 rows. Its exact RDF-term hashes differ on 1,020 salary decimals
+because Sparkles preserves trailing zeros while pyoxigraph normalizes their lexical
+forms. Stronger checks confirm actual writes, reuse of stored blank identities, iterator
+snapshots and close. The [benchmark record](../benchmarks/2026-10-25-python33-current-source-forge.json)
+retains both hashes, examples, every process sample and native provenance. The raw host
+`rustc` version is separate from the compiler that built the extension, and peak timed
+process RSS includes accumulated writes, so it is not a read-only memory measurement.
+
 ### Graph overview
 
 `Dataset.graph.groups(within, *, by=None, limit=None, at=None, ...)` binds the library's

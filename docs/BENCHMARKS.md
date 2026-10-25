@@ -127,7 +127,7 @@ than 10%. Fluree's warm advantages on `distinct-obj` at 1.05M and on two small D
 | DBpedia server RSS | QLever 3.14× | Sparkles maps its index, so touched file pages count toward its RSS. |
 | Text index size | QLever about 1.18× at 1.05M and 1.23× at 10.5M | The indexed predicates and features differ. |
 | JVM small lookups | TIM 1.3–2.1× and TDB2 1.1–1.4× on `star-lookup`, `values-star` and `employee-docs` | A small query's fixed cost through Jena dominates. |
-| Python small lookups | pyoxigraph 1.2–2.5× on `knows-reach`, `values-star` and `employee-docs` | The same fixed cost per query. |
+| Python small lookups | pyoxigraph 1.49× on value lookups and `knows-reach`, and 1.23× on subject scans | The gaps are 0.67 µs per value, 20 µs per query and 2.06 µs per subject. `values-star` is within 10%, and Sparkles leads on employee and star lookups. |
 | Node.js small lookups and adds | Oxigraph's package 1.1–1.4× on four small queries, N3.js 1.2–1.5× on adds and `has()` | Each add crosses to the transaction's thread. |
 | Node.js `export-500k` | N3.js with Comunica 1.44× | Each row's terms cross into JavaScript. |
 
@@ -2340,7 +2340,11 @@ On four threads, `contains` reaches 1,680,000 operations per second against TDB2
 ### Python
 
 The native API runs against pyoxigraph 0.5.11, and the rdflib store plugin against
-rdflib's in-memory store.
+rdflib's in-memory store. The native export and four small-lookups rows use six fresh
+processes per engine on forge with CPython 3.14.7, pinned to six distinct performance
+cores, with ten warmups and thirty samples per process. The remaining rows and the
+full-suite totals use the complete binding comparison. The [current-source assessment](benchmarks/2026-10-25-python33-current-source-forge.json)
+records the exact native build, all samples and answer checks.
 
 | Case, ms | sparkles | pyoxigraph | rdflib on Sparkles | rdflib Memory |
 |---|---:|---:|---:|---:|
@@ -2350,11 +2354,11 @@ rdflib's in-memory store.
 | `two-hop-count` | **0.368** | 27.9 | 4.295 | 600.5 |
 | `group-avg` | **0.711** | 6.921 | 3.580 | 237.7 |
 | `order-by-full` | **20.5** | 41.6 | 76.5 | 511.1 |
-| `export-500k` | **233.1** | 308.9 | 881.9 | 2,234 |
-| `knows-reach` | 0.115 | **0.046** | 1.819 | 2.060 |
-| `star-lookup` | **0.291** | 0.316 | 3.928 | 4.625 |
-| `values-star` | 0.177 | **0.126** | 3.887 | 3.671 |
-| `employee-docs` | 0.164 | **0.140** | 2.337 | 3.234 |
+| `export-500k` | **140.3** | 300.3 | 881.9 | 2,234 |
+| `knows-reach` | 0.063 | **0.042** | 1.819 | 2.060 |
+| `star-lookup` | **0.209** | 0.303 | 3.928 | 4.625 |
+| `values-star` | 0.131 | **0.120** | 3.887 | 3.671 |
+| `employee-docs` | **0.122** | 0.134 | 2.337 | 3.234 |
 | Peak RSS, load process (MiB) | 65 | 65 | 127 | 160 |
 | Peak RSS, read process (MiB) | 135 | **97** | 197 | 291 |
 
@@ -2395,14 +2399,21 @@ cores, and four to six process medians per arm.
 
 | Python, per call | sparkles | pyoxigraph |
 |---|---:|---:|
-| Single `tx.add` | **6.0 µs** | 6.8 µs |
-| `add_all`, per quad | **5.2 µs** | 7.7 µs |
-| `in` | **1.1 µs** | 1.4 µs |
-| First object of `(s p ?)` | 1.7 µs | **1.6 µs** |
-| `(s ? ?)`, per subject | **9.4 µs** | 9.7 µs |
-| `(? p o)` over 2,983 matches | **2.5 ms** | 2.9 ms |
-| Iterate every quad | **102 ms** | 119 ms |
-| Small `SELECT` with a five-subject `VALUES` | 246 µs | **147 µs** |
+| Single `tx.add` | **4.856 µs** | 4.896 µs |
+| `extend`, per quad | **4.599 µs** | 4.935 µs |
+| `in` | **1.087 µs** | 1.887 µs |
+| First object of `(s p ?)` | 2.030 µs | **1.359 µs** |
+| `(s ? ?)`, per subject | 11.207 µs | **9.144 µs** |
+| `(? p o)` over 2,982 matches | 3.052 ms | **2.910 ms** |
+
+The native Python costs use the same quiet Forge assessment as the small-query rows.
+Each write sample inserts 10,000 fresh triples. Single-add timings use a Sparkles
+transaction and pyoxigraph's `extend`, while the bulk row uses Sparkles `extend` and
+pyoxigraph `bulk_extend`. Single-add costs are close. All nine read cases agree by value,
+and a separate full export checks every row and term. Decimal lexical spellings differ
+on 1,020 salary values, such as `92059.20` and `92059.2`, while their values agree.
+Actual-write checks confirm stored data, blank-node identity and iterator snapshots.
+The assessment leaves the Python binding unchanged.
 
 Through the rdflib plugin, against rdflib's Memory store, `(? p o)` takes 4.1 ms against
 4.1 ms, iterating every triple 122 ms against 155 ms, a `contains` probe 4.0 µs against
@@ -2424,8 +2435,9 @@ bound triple against TDB2's 27 µs, 22 µs for a `SELECT ?o` on a subject agains
 of one resource against 36 µs. A DELETE/INSERT WHERE on one resource in the in-memory
 store took 13 to 15 ms against TDB2's 2.3 to 3.2 ms.
 
-*Measured on 8-vCPU AMD EPYC instances of a cloud CI provider, not a quiet machine. Runs on
-different instances differed by up to 30%.*
+*The rdflib, Node.js and Jena per-call figures use 8-vCPU AMD EPYC cloud instances.
+Runs on different instances differed by up to 30%. The native Python figures use the
+quiet Forge assessment described above.*
 
 ## Natural-language questions
 
