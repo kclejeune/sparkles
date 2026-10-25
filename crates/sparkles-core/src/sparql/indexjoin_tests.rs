@@ -748,3 +748,67 @@ fn an_index_join_resumes_a_large_expansion_across_batches() {
         assert_eq!(got, want);
     }
 }
+
+#[test]
+fn secondary_index_keys_preserve_bags_graphs_deltas_and_native_batches() {
+    for union in [false, true] {
+        let store = Store::in_memory(StoreOptions {
+            union_default_graph: union,
+            ..Default::default()
+        });
+        let mut data = String::from("@prefix ex: <http://ex.org/> .\n");
+        for i in 0..20 {
+            data.push_str(&format!("ex:s{i} ex:p ex:u{} .\n", i / 10));
+        }
+        data.push_str(
+            "ex:g { ex:s0 ex:p ex:u0 . ex:s15 ex:p ex:u1 . ex:s99 ex:p ex:u0 }\n\
+             ex:h { ex:s2 ex:p ex:u0 }\n",
+        );
+        load(&store, &data);
+        let old = store.snapshot();
+        update(
+            &store,
+            "DELETE DATA { ex:s0 ex:p ex:u0 }; INSERT DATA { ex:s100 ex:p ex:u0 }",
+        );
+        let new = store.snapshot();
+        for snapshot in [&old, &new] {
+            for body in [
+                "?x ex:p ?y",
+                "?x ex:p ?y FILTER(?x != ex:s5)",
+                "GRAPH ex:g { ?x ex:p ?y }",
+                "GRAPH ?g { ?x ex:p ?y }",
+            ] {
+                // ?y is always bound, while one ?x is unbound. This admits the
+                // university key and exercises both secondary lookup and fallback.
+                let q = format!(
+                    "SELECT ?y ?x ?g WHERE {{
+                       VALUES (?y ?x) {{ (ex:u0 ex:s0) (ex:u0 ex:s0) (ex:u0 UNDEF)
+                                        (ex:u1 ex:s15) (ex:u1 ex:absent) }}
+                       {body}
+                     }}"
+                );
+                let mut want = rows(&run(snapshot, &q, Optimizations::NONE));
+                want.sort();
+                let mut eager = rows(&forced(snapshot, &q, Optimizations::ALL, None));
+                eager.sort();
+                assert_eq!(eager, want, "union={union}: {q}");
+                for batch in [1, 7, 4096] {
+                    let (got, plan, largest) = cursor_rows(snapshot, &q, batch);
+                    assert_eq!(got, want, "union={union}, batch={batch}: {q}");
+                    assert!(largest <= batch);
+                    let mut streamed = true;
+                    assert!(
+                        cursor_plan_has(&plan, "IndexJoin", &mut streamed),
+                        "{plan:#?}"
+                    );
+                    assert!(streamed, "{plan:#?}");
+                    let mut todo = vec![&plan];
+                    while let Some(node) = todo.pop() {
+                        assert!(!node.materializes, "{plan:#?}");
+                        todo.extend(&node.children);
+                    }
+                }
+            }
+        }
+    }
+}

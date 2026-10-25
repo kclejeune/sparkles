@@ -102,6 +102,8 @@ thread_local! {
     pub(crate) static FORCE_INDEX_JOIN: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
     /// tests: read fused stars by subject walks (`Some(true)`) or per pattern
     pub(crate) static FORCE_WALK: std::cell::Cell<Option<bool>> = const { std::cell::Cell::new(None) };
+    /// Physical compatibility checks, for regressions that must bound candidate work.
+    static COMBINE_CANDIDATES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
 
 fn forced() -> bool {
@@ -1530,6 +1532,20 @@ pub(super) fn run(
     Ok((out.project(vars), stats))
 }
 
+/// Whether the second column is ordered within every primary-key span. Check the
+/// actual table so alternate readers and filtered scans retain their fallback.
+fn ordered_secondary(ctx: &Ctx, table: &Table) -> Result<bool> {
+    for i in 0..table.len().saturating_sub(1) {
+        if i % 4096 == 0 {
+            ctx.check()?;
+        }
+        if table.cols[0][i] == table.cols[0][i + 1] && table.cols[1][i] > table.cols[1][i + 1] {
+            return Ok(false);
+        }
+    }
+    Ok(true)
+}
+
 /// Join every input row with the rows of its key in each pattern's table.
 fn combine(
     ctx: &Ctx,
@@ -1579,7 +1595,21 @@ fn combine(
     let mut li: Vec<u32> = Vec::new();
     let mut pj: Vec<Vec<u32>> = vec![Vec::new(); m];
     let mut js: Vec<u32> = vec![0; m];
+    // A two-column probe can share both variables with the input. Selecting only
+    // its primary key then compares each input row with the key's whole fanout.
+    // Narrow that span by the bound secondary key before forming combinations.
+    let secondary = if m == 1
+        && rs[0].width() == 2
+        && let Some(&(lc, _, _)) = shared.iter().find(|&&(_, k, c)| k == 0 && c == 1)
+        && ordered_secondary(ctx, &rs[0])?
+    {
+        Some(lc)
+    } else {
+        None
+    };
     let compatible = |i: usize, js: &[u32]| {
+        #[cfg(test)]
+        COMBINE_CANDIDATES.with(|n| n.set(n.get() + 1));
         shared.iter().all(|&(lc, k, c)| {
             let a = left.cols[lc][i];
             a.is_undef() || a == rs[k].cols[c][js[k] as usize]
@@ -1594,6 +1624,18 @@ fn combine(
                 li: &mut Vec<u32>,
                 pj: &mut [Vec<u32>]|
      -> Result<()> {
+        let narrowed;
+        let spans = if let Some(lc) = secondary.filter(|&lc| !left.cols[lc][i].is_undef()) {
+            let (start, end) = spans[0];
+            let values = &rs[0].cols[1][start as usize..end as usize];
+            let value = left.cols[lc][i];
+            let lo = values.partition_point(|v| *v < value);
+            let hi = values.partition_point(|v| *v <= value);
+            narrowed = [(start + lo as u32, start + hi as u32)];
+            &narrowed[..]
+        } else {
+            spans
+        };
         if spans.iter().any(|(s, e)| s >= e) {
             return Ok(());
         }
@@ -1759,6 +1801,179 @@ mod prefetch_tests {
             ));
             ctx.deadline = None;
             prefetch(&ctx, Perm::Spo, &ranges, ALL_COLS, &rule()).unwrap();
+        }
+    }
+}
+
+#[cfg(test)]
+mod combine_tests {
+    use super::*;
+    use crate::error::{Budget, BudgetKind};
+    use crate::store::{Store, StoreOptions};
+    use std::sync::atomic::Ordering;
+    use std::time::{Duration, Instant};
+
+    fn spec() -> IndexJoinSpec {
+        IndexJoinSpec {
+            key: 0,
+            probes: vec![Probe {
+                scan: ScanSpec {
+                    perm: Perm::Pos,
+                    prefix: vec![7],
+                    cols: vec![(1, 0), (2, 1)],
+                    eqs: Vec::new(),
+                    graph: GraphFilter::All,
+                    graph_col: 3,
+                    dedup: false,
+                    src: None,
+                },
+                filter: Vec::new(),
+                star: None,
+            }],
+        }
+    }
+
+    fn table(rows: &[[u64; 2]]) -> Table {
+        let mut table = Table::new(vec![0, 1]);
+        for row in rows {
+            table.push_row(&[Id(row[0]), Id(row[1])]);
+        }
+        table.sorted = vec![0];
+        table
+    }
+
+    fn run(ctx: &Ctx, left: &Table, right: Table) -> Result<Table> {
+        let mut keys: Vec<u64> = left.cols[0]
+            .iter()
+            .filter(|v| !v.is_undef())
+            .map(|v| v.0)
+            .collect();
+        keys.sort_unstable();
+        keys.dedup();
+        let unbound = left.cols[0].iter().any(|v| v.is_undef());
+        combine(ctx, &spec(), left, 0, &keys, unbound, &[right])
+    }
+
+    fn rows(table: &Table) -> Vec<(u64, u64)> {
+        table.cols[0]
+            .iter()
+            .zip(&table.cols[1])
+            .map(|(a, b)| (a.0, b.0))
+            .collect()
+    }
+
+    #[test]
+    fn bound_secondary_keys_avoid_enumerating_the_primary_span() {
+        let store = Store::in_memory(StoreOptions::default());
+        let ctx = Ctx::new(store.snapshot());
+        let left = Table {
+            vars: vec![0, 1],
+            cols: vec![vec![Id(10); 128], (1000..1128).map(Id).collect()],
+            len: 128,
+            sorted: vec![0, 1],
+        };
+        let right = Table {
+            vars: vec![0, 1],
+            cols: vec![vec![Id(10); 4096], (1000..5096).map(Id).collect()],
+            len: 4096,
+            sorted: vec![0, 1],
+        };
+        COMBINE_CANDIDATES.with(|n| n.set(0));
+        let output = combine(&ctx, &spec(), &left, 0, &[10], false, &[right]).unwrap();
+        assert_eq!(output.cols, left.cols);
+        assert_eq!(output.len(), left.len());
+        let candidates = COMBINE_CANDIDATES.with(|n| n.get());
+        assert_eq!(candidates, 128, "physical candidates checked");
+    }
+
+    #[test]
+    fn secondary_spans_preserve_duplicates_unbound_rows_and_input_order() {
+        let store = Store::in_memory(StoreOptions::default());
+        let ctx = Ctx::new(store.snapshot());
+        let left = table(&[[10, 1001], [10, 1001], [10, 0], [20, 1003], [20, 9999]]);
+        let right = table(&[[10, 1000], [10, 1001], [10, 1001], [20, 1003]]);
+        let output = run(&ctx, &left, right).unwrap();
+        assert_eq!(
+            rows(&output),
+            vec![
+                (10, 1001),
+                (10, 1001),
+                (10, 1001),
+                (10, 1001),
+                (10, 1000),
+                (10, 1001),
+                (10, 1001),
+                (20, 1003),
+            ]
+        );
+    }
+
+    #[test]
+    fn secondary_spans_fill_an_unbound_primary_key() {
+        let store = Store::in_memory(StoreOptions::default());
+        let ctx = Ctx::new(store.snapshot());
+        let left = table(&[[0, 1001], [10, 0]]);
+        let right = table(&[[10, 1001], [10, 1002], [20, 1001], [20, 1003]]);
+        assert_eq!(
+            rows(&run(&ctx, &left, right).unwrap()),
+            vec![(10, 1001), (20, 1001), (10, 1001), (10, 1002)]
+        );
+    }
+
+    #[test]
+    fn unordered_secondary_values_keep_the_complete_compatibility_scan() {
+        let store = Store::in_memory(StoreOptions::default());
+        let ctx = Ctx::new(store.snapshot());
+        let left = table(&[[10, 1001]]);
+        let right = table(&[[10, 1002], [10, 1001], [10, 1000]]);
+        COMBINE_CANDIDATES.with(|n| n.set(0));
+        assert_eq!(rows(&run(&ctx, &left, right).unwrap()), vec![(10, 1001)]);
+        assert_eq!(COMBINE_CANDIDATES.with(|n| n.get()), 3);
+    }
+
+    #[test]
+    fn narrowed_and_fallback_combinations_keep_resource_checks() {
+        let store = Store::in_memory(StoreOptions::default());
+        for secondary_bound in [true, false] {
+            let value = if secondary_bound { 1001 } else { 0 };
+            let left = table(&[[10, value], [10, value]]);
+            let right = table(&[[10, 1001], [10, 1001]]);
+            let mut ctx = Ctx::new(store.snapshot());
+            ctx.max_rows = 3;
+            assert!(matches!(
+                run(&ctx, &left, right.clone()),
+                Err(Error::BudgetExceeded(Budget {
+                    kind: BudgetKind::Rows,
+                    ..
+                }))
+            ));
+            let mut ctx = Ctx::new(store.snapshot());
+            ctx.max_rows_produced = 3;
+            assert!(matches!(
+                run(&ctx, &left, right.clone()),
+                Err(Error::BudgetExceeded(Budget {
+                    kind: BudgetKind::RowsProduced,
+                    ..
+                }))
+            ));
+            let mut ctx = Ctx::new(store.snapshot());
+            ctx.mem_limit = 1;
+            assert!(matches!(
+                run(&ctx, &left, right.clone()),
+                Err(Error::BudgetExceeded(Budget {
+                    kind: BudgetKind::Memory,
+                    ..
+                }))
+            ));
+            let ctx = Ctx::new(store.snapshot());
+            ctx.cancel.store(true, Ordering::Relaxed);
+            assert!(matches!(
+                run(&ctx, &left, right.clone()),
+                Err(Error::Cancelled)
+            ));
+            let mut ctx = Ctx::new(store.snapshot());
+            ctx.deadline = Some(Instant::now() - Duration::from_secs(1));
+            assert!(matches!(run(&ctx, &left, right), Err(Error::Timeout)));
         }
     }
 }
