@@ -109,6 +109,35 @@ fn a_thread_local_owner_can_snapshot_after_callback_tracking_cleanup() {
     );
 }
 
+type FamilyObservation = Arc<parking_lot::Mutex<Option<Result<(), String>>>>;
+
+fn observe_family_rejection<T, E: std::fmt::Display>(
+    observation: &FamilyObservation,
+    result: Result<T, E>,
+) {
+    const REFUSAL: &str = "nested operation on the callback's dataset family is forbidden";
+    let outcome = match result {
+        Err(error) => {
+            let message = error.to_string();
+            if message.contains(REFUSAL) {
+                Ok(())
+            } else {
+                Err(format!("different error: {message}"))
+            }
+        }
+        Ok(_) => Err("operation was accepted".into()),
+    };
+    *observation.lock() = Some(outcome);
+}
+
+fn assert_family_rejected(observation: &FamilyObservation, operation: &str) {
+    let outcome = observation.lock();
+    assert!(
+        matches!(outcome.as_ref(), Some(Ok(()))),
+        "{operation}: {outcome:?}"
+    );
+}
+
 fn during_thread_destruction(make: impl FnOnce() -> Box<dyn FnOnce()> + Send + 'static) {
     struct Owner {
         action: Option<Box<dyn FnOnce()>>,
@@ -149,7 +178,6 @@ fn late_callbacks_keep_snapshot_and_nested_family_restrictions() {
                 let a = Arc::new(Store::in_memory(StoreOptions::default()));
                 let b = Arc::new(Store::in_memory(StoreOptions::default()));
                 let snapshot = a.snapshot();
-                // Initialize every tracking path before the owner outlives its cleanup.
                 let warm = options(|_: &ScalarContext<'_>, _: &[Term]| text("warm"));
                 query(
                     snapshot.clone(),
@@ -160,60 +188,83 @@ fn late_callbacks_keep_snapshot_and_nested_family_restrictions() {
                 Box::new(move || {
                     let source = format!("SELECT (<{IRI}>() AS ?x) {{}}");
                     let safe_store = b.clone();
+                    let safe_succeeded = Arc::new(AtomicBool::new(false));
+                    let safe_observation = safe_succeeded.clone();
                     let safe = options(move |_: &ScalarContext<'_>, _: &[Term]| {
-                        assert!(
+                        safe_observation.store(
                             query(safe_store.snapshot(), "ASK {}", &Default::default())
-                                .unwrap()
-                                .boolean
+                                .is_ok_and(|result| result.boolean),
+                            Ordering::SeqCst,
                         );
                         text("safe")
                     });
-                    assert_eq!(
-                        query(a.snapshot(), &source, &safe).unwrap().rows()[0][0],
-                        Some(Literal::from("safe").into())
-                    );
+                    let result = query(a.snapshot(), &source, &safe).unwrap();
+                    assert!(safe_succeeded.load(Ordering::SeqCst));
+                    assert_eq!(result.rows()[0][0], Some(Literal::from("safe").into()));
 
                     let captured_store = a.clone();
                     let captured_snapshot = snapshot.clone();
-                    let active = options(move |_: &ScalarContext<'_>, _: &[Term]| {
-                        // Neither catching the infallible refusal nor suppressing the
-                        // captured snapshot error can clear the active fatal flag.
-                        assert!(
-                            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                                captured_store.snapshot()
-                            }))
-                            .is_err()
-                        );
-                        assert!(
-                            query(captured_snapshot.clone(), "ASK {}", &Default::default())
-                                .is_err()
+                    let snapshot_panicked = Arc::new(AtomicBool::new(false));
+                    let panic_observation = snapshot_panicked.clone();
+                    let sticky: FamilyObservation = Default::default();
+                    let sticky_observation = sticky.clone();
+                    let captured: FamilyObservation = Default::default();
+                    let captured_observation = captured.clone();
+                    let active = options(move |context: &ScalarContext<'_>, _: &[Term]| {
+                        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                            captured_store.snapshot()
+                        }));
+                        panic_observation.store(result.is_err(), Ordering::SeqCst);
+                        // Record the sticky family error before the next attempt can
+                        // set it. Assertions must run outside the dispatch boundary.
+                        observe_family_rejection(&sticky_observation, context.check());
+                        observe_family_rejection(
+                            &captured_observation,
+                            query(captured_snapshot.clone(), "ASK {}", &Default::default()),
                         );
                         text("suppressed")
                     });
-                    assert!(query(a.snapshot(), &source, &active).is_err());
+                    let result = query(a.snapshot(), &source, &active);
+                    assert!(snapshot_panicked.load(Ordering::SeqCst));
+                    assert_family_rejected(&sticky, "snapshot sticky state");
+                    assert_family_rejected(&captured, "active captured snapshot");
+                    assert!(result.is_err());
 
                     let captured_snapshot = snapshot.clone();
                     let nested_store = b.clone();
                     let nested_source = source.clone();
+                    let nested_snapshot: FamilyObservation = Default::default();
+                    let nested_query: FamilyObservation = Default::default();
+                    let snapshot_observation = nested_snapshot.clone();
+                    let query_observation = nested_query.clone();
                     let outer = options(move |_: &ScalarContext<'_>, _: &[Term]| {
                         let forbidden = captured_snapshot.clone();
+                        let observation = snapshot_observation.clone();
                         let inner = options(move |_: &ScalarContext<'_>, _: &[Term]| {
-                            assert!(
-                                query(forbidden.clone(), "ASK {}", &Default::default()).is_err()
+                            observe_family_rejection(
+                                &observation,
+                                query(forbidden.clone(), "ASK {}", &Default::default()),
                             );
                             text("inner suppressed")
                         });
-                        assert!(query(nested_store.snapshot(), &nested_source, &inner).is_err());
+                        observe_family_rejection(
+                            &query_observation,
+                            query(nested_store.snapshot(), &nested_source, &inner),
+                        );
                         text("outer suppressed")
                     });
-                    assert!(query(a.snapshot(), &source, &outer).is_err());
-                    // Normal access recovers after all nested guards have popped.
+                    let result = query(a.snapshot(), &source, &outer);
+                    assert_family_rejected(&nested_snapshot, "nested captured snapshot");
+                    assert_family_rejected(&nested_query, "nested query sticky state");
+                    assert!(result.is_err());
                     assert!(
                         query(a.snapshot(), "ASK {}", &Default::default())
                             .unwrap()
                             .boolean
                     );
+                    safe_succeeded.store(false, Ordering::SeqCst);
                     assert!(query(a.snapshot(), &source, &safe).is_ok());
+                    assert!(safe_succeeded.load(Ordering::SeqCst));
                 })
             });
         },
@@ -247,25 +298,28 @@ fn a_writer_retained_by_a_tls_owner_keeps_its_family_and_sticky_failure() {
                     ])
                     .unwrap();
                 Box::new(move || {
+                    let refusal: FamilyObservation = Default::default();
+                    let observation = refusal.clone();
                     let opts = options(move |_: &ScalarContext<'_>, _: &[Term]| {
-                        assert!(
-                            writer_store
-                                .try_write_with(
-                                    sparkles_core::commit::CommitKind::Transaction,
-                                    Default::default()
-                                )
-                                .is_err()
+                        observe_family_rejection(
+                            &observation,
+                            writer_store.try_write_with(
+                                sparkles_core::commit::CommitKind::Transaction,
+                                sparkles_core::guard::WriteOptions {
+                                    no_wait: true,
+                                    ..Default::default()
+                                },
+                            ),
                         );
                         text("suppressed")
                     });
-                    assert!(
-                        query(
-                            other.snapshot(),
-                            &format!("SELECT (<{IRI}>() AS ?x) {{}}"),
-                            &opts
-                        )
-                        .is_err()
+                    let result = query(
+                        other.snapshot(),
+                        &format!("SELECT (<{IRI}>() AS ?x) {{}}"),
+                        &opts,
                     );
+                    assert_family_rejected(&refusal, "retained writer refusal");
+                    assert!(result.is_err());
                     assert!(
                         transaction.commit().is_err(),
                         "suppressed callback failure reached the retained writer"
@@ -296,6 +350,7 @@ fn a_late_captured_property_view_preserves_visibility_and_family_rejection() {
                 struct ReadView {
                     snapshot: Arc<sparkles_core::store::Snapshot>,
                     seen: Arc<AtomicUsize>,
+                    refusal: FamilyObservation,
                 }
                 struct Empty;
                 impl PropertyStream for Empty {
@@ -318,14 +373,11 @@ fn a_late_captured_property_view_preserves_visibility_and_family_rejection() {
                             count += batch.triples().len();
                         }
                         self.seen.store(count, Ordering::SeqCst);
-                        assert_eq!(
-                            count, 1,
-                            "the captured view keeps the query's graph selection"
-                        );
-                        // The nested view guards have returned, but the outer callback
-                        // must still reject direct use of a captured snapshot.
-                        assert!(
-                            query(self.snapshot.clone(), "ASK {}", &Default::default()).is_err()
+                        // Record the direct result after the nested view guards
+                        // return. Dispatch must not turn an assertion into refusal.
+                        observe_family_rejection(
+                            &self.refusal,
+                            query(self.snapshot.clone(), "ASK {}", &Default::default()),
                         );
                         Ok(Box::new(Empty))
                     }
@@ -336,6 +388,7 @@ fn a_late_captured_property_view_preserves_visibility_and_family_rejection() {
                 &Default::default()).unwrap();
                 let snapshot = store.snapshot();
                 let seen = Arc::new(AtomicUsize::new(0));
+                let refusal: FamilyObservation = Default::default();
                 let mut registry = ExtensionRegistry::builder();
                 registry
                     .register_property(
@@ -348,6 +401,7 @@ fn a_late_captured_property_view_preserves_visibility_and_family_rejection() {
                             ReadView {
                                 snapshot,
                                 seen: seen.clone(),
+                                refusal: refusal.clone(),
                             },
                         )
                         .unwrap(),
@@ -359,15 +413,14 @@ fn a_late_captured_property_view_preserves_visibility_and_family_rejection() {
                     ..Default::default()
                 };
                 Box::new(move || {
-                    assert!(
-                        query(
-                            store.snapshot(),
-                            "ASK { <urn:input> <urn:late:view> ?out }",
-                            &opts
-                        )
-                        .is_err()
+                    let result = query(
+                        store.snapshot(),
+                        "ASK { <urn:input> <urn:late:view> ?out }",
+                        &opts,
                     );
                     assert_eq!(seen.load(Ordering::SeqCst), 1);
+                    assert_family_rejected(&refusal, "property captured snapshot");
+                    assert!(result.is_err());
                     assert_eq!(store.snapshot().len(), 2);
                 })
             });

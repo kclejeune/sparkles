@@ -407,7 +407,9 @@ Four subprocess regressions cover an owner registered before its first
 `Store::snapshot`, active and nested callback restrictions, a writer retained across
 bookkeeping cleanup, and a captured property view that keeps its graph selection.
 The first case aborts against the earlier implementation and exits normally after the
-repair. The 83 scalar, aggregate and property tests pass, as do 100 repetitions of each
+repair. Each rejection observation is checked outside the callback dispatcher. Tests
+distinguish the family error from an unrelated callback panic. The 83 scalar,
+aggregate and property tests pass, as do 100 repetitions of each
 of the four destruction cases and strict Clippy on the core crate and all its targets.
 This completes only the lifecycle acceptance under item 25. Its dispatch, foreign
 callbacks, batching, aggregate arities and measurements remain open.
