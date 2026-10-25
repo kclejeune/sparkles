@@ -252,6 +252,9 @@ fn child_writer() {
         }
         s.stop_text_merges_for_test();
         s.set_text_ticks(false);
+        // Drain an already admitted tick before starting any fixture transactions,
+        // so it cannot later clear the seed work of the forced checkpoint phase.
+        s.set_text_checkpoint_hook_for_test(None);
     }
     let out = Arc::new(Mutex::new(Vec::<String>::new()));
     let mut hs = Vec::new();

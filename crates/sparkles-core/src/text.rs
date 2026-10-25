@@ -3912,6 +3912,47 @@ mod imp {
             (entered_rx, release_tx)
         }
 
+        #[cfg(feature = "failpoints")]
+        #[test]
+        fn a_late_timer_completion_is_drained_before_the_forced_baseline() {
+            use std::sync::mpsc;
+            let (_root, inner, dir) = checkpoint_fixture();
+            publish_checkpoint_document(&inner, 1).unwrap();
+            inner.live.lock().dirty_since = Some(Instant::now() - CHECKPOINT_AFTER);
+            let publishing = inner.clone();
+            dir.before_checkpoint_file_sync(move || {
+                publish_checkpoint_document(&publishing, 2).unwrap();
+            });
+            let (entered, release) = pause_checkpoint_completion(&inner);
+            let timer_inner = inner.clone();
+            let timer = std::thread::spawn(move || timer_inner.tick());
+            entered.recv_timeout(Duration::from_secs(5)).unwrap();
+            inner.ticks.store(false, Ordering::SeqCst);
+            let (started_tx, started_rx) = mpsc::channel();
+            let (baseline_tx, baseline_rx) = mpsc::channel();
+            let phase_inner = inner.clone();
+            let phase = std::thread::spawn(move || {
+                let index = TextIndex {
+                    inner: phase_inner,
+                    ticker: None,
+                };
+                started_tx.send(()).unwrap();
+                index.set_checkpoint_hook_for_test(None);
+                assert!(index.checkpoint_background_for_test());
+                baseline_tx.send(index.inner.live.lock().raced).unwrap();
+            });
+            started_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+            let early = baseline_rx.recv_timeout(Duration::from_millis(100));
+            release.send(()).unwrap();
+            assert!(timer.join().unwrap());
+            phase.join().unwrap();
+            assert!(
+                early.is_err(),
+                "the forced baseline overtook an old timer completion"
+            );
+            assert_eq!(baseline_rx.recv_timeout(Duration::from_secs(5)).unwrap(), 0);
+        }
+
         #[test]
         fn a_completed_background_checkpoint_cannot_clear_a_newer_commit() {
             let (root, inner, dir) = checkpoint_fixture();
