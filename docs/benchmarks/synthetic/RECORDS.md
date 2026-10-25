@@ -10,6 +10,7 @@ across records, and these historical builds are not measurements of the current
 checkout. Only successful results with an agreeing answer fingerprint are plotted.
 Agreement is a majority screening rule, not an independent correctness proof.
 Failed, missing and unqualified results remain visible without a latency value.
+Untimed answer checks retain their status without becoming warm latency samples.
 For `export-500k`, LIMIT without ORDER BY permits different rows, so agreement
 checks only the row count. Other query checks use the retained value fingerprints.
 No speedup, winner count or significance claim is inferred from these tables.
