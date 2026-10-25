@@ -35,6 +35,14 @@ SPARKLES=${SPARKLES:-$ROOT/target/release/sparkles}
 ENGINES=${ENGINES-sparkles jena qlever fluree oxigraph}
 PORT_BASE=${PORT_BASE:-28300}
 MAX_TIME=${MAX_TIME:-600}
+# q4 returns about 1.96 GB of TSV at 10M triples. This benchmark needs a larger
+# response allowance than a production server, and its answer must not become JSON in RAM.
+case " ${SPARKLES_ARGS:-} " in
+  *" --max-result-mb "* | *" --max-result-mb="*) ;;
+  *) SPARKLES_ARGS="--max-result-mb 4096 ${SPARKLES_ARGS:-}" ;;
+esac
+ANSWERS_TSV_QUERIES=${ANSWERS_TSV_QUERIES-q4 q6}
+export ANSWERS_TSV_QUERIES
 export MAX_TIME
 SUITE=sp2bench
 case $SCALE in

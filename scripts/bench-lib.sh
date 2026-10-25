@@ -182,13 +182,13 @@ start() {
     jena)
       # Jena's scripts prefer JAVA_HOME over the JDK that the nixpkgs wrapper puts on PATH,
       # and a developer's JAVA_HOME may name a JDK too old for the jars
-      env -u JAVA_HOME JVM_ARGS="-Xmx${JENA_HEAP:-8G}" "${CAP[@]}" "$FUSEKI" --update --timeout="$((SERVER_TIMEOUT * 1000))" --port "$p" --loc "$(store_of jena)" /bench > "$STORE/fuseki.log" 2>&1 &
+      env -u JAVA_HOME JVM_ARGS="-Xmx${JENA_HEAP:-8G}${JENA_STACK:+ -Xss$JENA_STACK}" "${CAP[@]}" "$FUSEKI" --update --timeout="$((SERVER_TIMEOUT * 1000))" --port "$p" --loc "$(store_of jena)" /bench > "$STORE/fuseki.log" 2>&1 &
       URL[$e]=localhost:$p/bench/sparql
       UPDURL[$e]=localhost:$p/bench/update
       ready="localhost:$p/\$/ping"
       ;;
     qlever)
-      (cd "$(store_of qlever)" && exec "${CAP[@]}" "$QSERVER" -i bench -p "$p" -m 8G -c 2G -e 0B -s "${SERVER_TIMEOUT}s" -a bench -j 16 >> server.log 2>&1) &
+      (cd "$(store_of qlever)" && exec "${CAP[@]}" "$QSERVER" -i bench -p "$p" -m "${QLEVER_MEMORY:-8G}" -c 2G -e 0B -s "${SERVER_TIMEOUT}s" -a bench -j 16 >> server.log 2>&1) &
       URL[$e]=localhost:$p/
       UPDURL[$e]=localhost:$p/
       UPDFIELD[$e]=access-token=bench
@@ -216,6 +216,7 @@ start() {
     if curl -sf -o /dev/null --max-time 5 "$ready" 2> /dev/null; then
       t1=$(date +%s.%N)
       READY_S[$e]=$(awk "BEGIN {printf \"%.3f\", $t1 - $t0}")
+      engine_started "$e"
       return 0
     fi
     kill -0 "${PID[$e]}" 2> /dev/null || {
@@ -474,6 +475,7 @@ answer_check() {
     local flag=()
     [[ " $COUNT_ONLY " == *" $n "* ]] && flag=(--count-only)
     [[ " $NO_CHECK " == *" $n "* ]] && flag+=(--no-check)
+    [[ " ${ANSWERS_TSV_QUERIES:-} " == *" $n "* ]] && flag+=(--stream-tsv)
     printf '%-16s' "$n"
     kv=()
     for e in $ENGINES; do
@@ -485,6 +487,7 @@ answer_check() {
       peak=$(hwm_of "$e")
       kv+=("${NAME[$e]}={\"before\": $(num "$before"), \"peak\": $(num "$peak"), \"delta\": $(minus "$peak" "$before")}")
       printf ' %12s' "$r"
+      revive "$e" "answer $n" "$RES"
     done
     setj "$RES/mem.json" "queries.$n" "${kv[@]}"
     echo

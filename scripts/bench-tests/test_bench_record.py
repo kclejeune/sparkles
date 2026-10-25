@@ -96,6 +96,18 @@ class RecordTests(unittest.TestCase):
         self.assertEqual(rec["memory"]["oxigraph"]["rss_after_mib"], 200)
         self.assertEqual(subprocess.run([sys.executable, RECORD, "validate", out]).returncode, 0)
 
+    def test_mixed_fingerprint_algorithms_require_regenerating_every_engine(self):
+        fixture(self.res)
+        answers = jload(os.path.join(self.res, "answers.json"))
+        answers["q1"]["sparkles"].update(exact="row-sha256-v1:" + "a" * 64, value="row-sha256-v1:" + "a" * 64)
+        write(self.res, "answers.json", answers)
+        p = build(self.res, os.path.join(self.tmp.name, "record.json"))
+        self.assertNotEqual(p.returncode, 0)
+        self.assertIn("incompatible fingerprint algorithms", p.stderr)
+        summary = subprocess.run([sys.executable, os.path.join(SCRIPTS, "bench-summary.py"), self.res, "q1"], capture_output=True, text=True)
+        self.assertNotEqual(summary.returncode, 0)
+        self.assertIn("incompatible fingerprint algorithms", summary.stderr)
+
     def test_timeout_error_and_cold_and_qmph(self):
         rec, _ = self.record()
         self.assertEqual(self.find(rec, "jena", "q2")["status"], "timeout")
@@ -386,6 +398,19 @@ class CompareTests(unittest.TestCase):
         self.assertEqual(p.returncode, 0, p.stdout)
         self.assertIn("0 finding(s)", p.stdout)
 
+    def test_cross_algorithm_records_are_refused_without_a_false_answer_change(self):
+        old, new = self.rec("old"), self.rec("new")
+        record = jload(new)
+        for row in record["results"]:
+            if row.get("answer"):
+                row["answer"]["hash"] = "row-sha256-v1:" + "a" * 64
+                row["answer"]["algorithm"] = "row-sha256-v1"
+        write_path(new, record)
+        compared = self.compare(old, new)
+        self.assertEqual(compared.returncode, 2)
+        self.assertIn("incompatible fingerprint algorithms", compared.stderr)
+        self.assertNotIn("ANSWER CHANGED", compared.stdout)
+
     def test_regression_found(self):
         a, b = self.rec("a"), self.rec("b", slow_q1=1.15)
         p = self.compare(a, b)
@@ -574,6 +599,7 @@ esac
         resolve_tools() { :; }; suite_manifest() { :; }; load_all() { :; }; start_all() { :; }
         answer_check() { :; }; stop_all() { :; }; cold() { :; }; python3() { :; }
         start() { echo "start $1"; URL[$1]=u; }
+        start_all() { echo "check-start $ENGINES"; }; answer_check() { echo "check $ENGINES"; }; stop_all() { echo "check-stop $ENGINES"; }
         stop() { echo "stop $1"; }
         suite_time() { echo "time $ENGINES"; }
         q() { echo "echo warm $1 $2"; }
@@ -588,8 +614,54 @@ esac
             p = subprocess.run(["bash", "-c", script], cwd=d, env=env, capture_output=True, text=True)
         self.assertEqual(p.returncode, 0, p.stderr)
         self.assertEqual(p.stdout.split("\n")[:-1], [
+            "check-start sparkles", "check sparkles", "check-stop sparkles",
+            "check-start jena", "check jena", "check-stop jena",
             "start sparkles", "warm u a", "warm u b", "time sparkles", "stop sparkles",
-            "start jena", "warm u a", "warm u b", "time jena", "stop jena"])
+            "start jena", "warm u a", "warm u b", "time jena", "stop jena", "check-stop sparkles jena"])
+
+    def test_answer_only_check_never_has_two_servers_running(self):
+        stubs = """
+        resolve_tools() { :; }; suite_manifest() { :; }; load_all() { :; }
+        python3() { :; }; log() { :; }; sleep() { :; }; setj() { :; }; rss_of() { echo 1; }
+        start() { [ ! -f active ] || return 1; echo "$1" > active; echo "start $1"; }
+        stop() { if [ -f active ]; then echo "stop $1"; rm active; fi; }
+        answer_check() { [ "$(cat active)" = "$ENGINES" ] || exit 3; echo "check $ENGINES"; }
+        """
+        with tempfile.TemporaryDirectory() as d:
+            env = dict(os.environ, ROOT=os.path.dirname(SCRIPTS), WORK=d, ENGINES="sparkles jena")
+            lib, suite = os.path.join(SCRIPTS, "bench-lib.sh"), os.path.join(SCRIPTS, "bench-suite-lib.sh")
+            script = (f'source "{lib}"; source "{suite}"; {stubs}\n'
+                      "NAMES=(a); SUITE=s SCALE=1 SKIP_LOAD=1 ANSWERS_ONLY=1; suite_run")
+            p = subprocess.run(["bash", "-c", script], cwd=d, env=env, capture_output=True, text=True)
+        self.assertEqual(p.returncode, 0, p.stderr)
+        self.assertEqual(p.stdout.splitlines(), ["start sparkles", "check sparkles", "stop sparkles",
+                                               "start jena", "check jena", "stop jena"])
+
+    def test_successful_timing_start_recovers_after_a_failed_correctness_restart(self):
+        stubs = """
+        resolve_tools() { :; }; suite_manifest() { :; }; load_all() { :; }
+        python3() { :; }; log() { :; }; sleep() { :; }; setj() { :; }; rss_of() { echo 1; }
+        start() { touch up; URL[$1]=u; }
+        stop() { rm -f up; }
+        answer_check() {
+          rm -f up
+          start() { return 1; }
+          revive jena 'failed correctness restart' results
+          start() { touch up; URL[$1]=u; }
+        }
+        answering() { [ -f up ]; }
+        q() { echo true; }
+        merge() { :; }
+        hyperfine() { echo timed; }
+        suite_time() { time_query q1 results; }
+        """
+        with tempfile.TemporaryDirectory() as d:
+            env = dict(os.environ, ROOT=os.path.dirname(SCRIPTS), WORK=d, ENGINES="jena", CLIENT_CPU="none")
+            lib, suite = os.path.join(SCRIPTS, "bench-lib.sh"), os.path.join(SCRIPTS, "bench-suite-lib.sh")
+            script = (f'source "{lib}"; source "{suite}"; {stubs}\n'
+                      "NAMES=(q1); SUITE=s SCALE=1 SKIP_LOAD=1; suite_run; true")
+            run = subprocess.run(["bash", "-c", script], cwd=d, env=env, capture_output=True, text=True)
+        self.assertIn("timed", run.stdout, run.stderr)
 
     def test_an_engine_that_does_not_start_is_left_out_and_the_run_fails(self):
         stubs = """

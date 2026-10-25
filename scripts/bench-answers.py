@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Fingerprint an engine's answer to a benchmark query, for cross-engine comparison.
 
-    bench-answers.py <endpoint> <query-file> <answers.json> <query-name> <engine> [--count-only] [--no-check]
+    bench-answers.py <endpoint> <query-file> <answers.json> <query-name> <engine> [--count-only] [--no-check] [--stream-tsv]
 
 Fetches SPARQL JSON results (`application/sparql-results+json`) and records three
 things for <engine> under <query-name> in <answers.json>:
@@ -29,6 +29,12 @@ value. The fingerprints do not depend on it.
 
 `--count-only` records just the row count, for LIMIT-without-ORDER probes whose
 solutions are legitimately engine-dependent. A failed request records `error`.
+
+`--stream-tsv` fingerprints an unordered SELECT without blank nodes or triple terms in
+bounded memory. It normalizes RDF terms from TSV and sorts SHA-256 hashes of the complete
+multiset on disk, retaining duplicates. Its `row-sha256-v1:` digests must be compared only
+with the same algorithm. A 64 MiB sort buffer trades temporary disk space and extra
+fingerprinting time for bounded client memory. Timed requests do not fingerprint results.
 
 Blank nodes compare by structure. Each response is canonicalized on its own, so a blank
 node label (which only has meaning inside one response) never decides equality, and two
@@ -73,11 +79,14 @@ case for one query is twice MAX_TIME.
 """
 
 import hashlib
+import functools
 import json
 import os
 import re
 import signal
+import subprocess
 import sys
+import tempfile
 import urllib.parse
 import urllib.request
 from decimal import Decimal, InvalidOperation, localcontext
@@ -609,10 +618,12 @@ class Deadline(Exception):
     pass
 
 
-def fetch(req, seconds):
-    """The whole response body, or Deadline when it takes longer than `seconds` altogether. The
-    socket timeout of urlopen limits each wait, and a server that keeps sending slowly would
-    pass it, so an interval timer enforces the total."""
+def fetch(req, seconds, consume=None):
+    """The whole response body, or Deadline when it takes longer than `seconds` altogether.
+
+    A streaming consumer receives a callback to end the request deadline once it has
+    validated the complete HTTP body. Its later disk sorting is outside that deadline.
+    """
     def expire(*_):
         raise Deadline(f"no complete answer in {seconds:g} s")
 
@@ -620,16 +631,155 @@ def fetch(req, seconds):
     signal.setitimer(signal.ITIMER_REAL, seconds)
     try:
         with urllib.request.urlopen(req, timeout=seconds) as r:
-            return r.read()
+            return consume(r, lambda: signal.setitimer(signal.ITIMER_REAL, 0)) if consume else r.read()
     finally:
         signal.setitimer(signal.ITIMER_REAL, 0)
         signal.signal(signal.SIGALRM, old)
+
+
+def tsv_term(text):
+    """A SPARQL TSV field as a SPARQL JSON term. Reject syntax we cannot compare safely."""
+    if not text:
+        return None
+    if text.startswith("_:") or text.startswith("<<"):
+        raise ValueError("streamed TSV fingerprints do not support blank nodes or triple terms")
+    if text.startswith("<") and text.endswith(">"):
+        return {"type": "uri", "value": _unescape(text[1:-1])}
+    if NT_LITERAL.fullmatch(text):
+        return nt_term(text)
+    if text in ("true", "false"):
+        datatype = "boolean"
+    elif re.fullmatch(r"[+-]?[0-9]+", text):
+        datatype = "integer"
+    elif re.fullmatch(r"[+-]?(?:[0-9]+\.[0-9]*|\.[0-9]+)", text):
+        datatype = "decimal"
+    elif re.fullmatch(r"[+-]?(?:[0-9]+(?:\.[0-9]*)?|\.[0-9]+)[eE][+-]?[0-9]+", text):
+        datatype = "double"
+    else:
+        raise ValueError(f"invalid SPARQL TSV field {text[:80]!r}")
+    return {"type": "literal", "value": text, "datatype": XSD + datatype}
+
+
+def sorted_row_digest(path, directory):
+    """Hash the sorted SHA-256 row hashes, retaining duplicate solutions and bounding RAM.
+
+    This deliberately has a distinct algorithm tag from the legacy in-memory digest.
+    All engines in a query comparison must use the same fingerprint path.
+    """
+    h = hashlib.sha256()
+    with tempfile.TemporaryFile() as errors:
+        with subprocess.Popen(["sort", "--parallel=1", "-S", "64M", "-T", directory, path],
+                              stdout=subprocess.PIPE, stderr=errors,
+                              env=dict(os.environ, LC_ALL="C")) as proc:
+            for chunk in iter(lambda: proc.stdout.read(1 << 20), b""):
+                h.update(chunk)
+            proc.stdout.close()
+            if proc.wait():
+                errors.seek(0)
+                raise ValueError("sorting answer hashes failed: " + errors.read(200).decode(errors="replace"))
+    return "row-sha256-v1:" + h.hexdigest()
+
+
+@functools.lru_cache(maxsize=8192)
+def canonical_tsv_field(text):
+    """Cache a bounded number of repeated RDF terms, never solution rows."""
+    parsed = tsv_term(text)
+    return repr(term(parsed, False)), repr(term(parsed, True))
+
+
+def response_lines(response):
+    """Split a strict HTTP body reader into lines without hiding chunk framing failures."""
+    read = getattr(response, "read1", response.read)
+    pending = b""
+    while chunk := read(1 << 16):
+        pieces = (pending + chunk).split(b"\n")
+        pending = pieces.pop()
+        for piece in pieces:
+            yield piece + b"\n"
+    if pending:
+        yield pending
+
+
+def streamed_tsv_record(response, query, count_only, raw_path=None, finish_response=None):
+    """Consume a complete unordered SELECT response with one row in memory.
+
+    Disk holds one SHA-256 per solution, and a second copy only when value normalization
+    changes a term. ORDER BY and blank nodes need the legacy structure-aware checker.
+    """
+    if form(query) != "select" or _order_by_tail(query) is not None:
+        raise ValueError("streamed TSV fingerprints require an unordered SELECT")
+    raw = open(raw_path + ".tmp", "wb") if raw_path else None
+    try:
+        lines = iter(response_lines(response))
+
+        def line():
+            data = next(lines, b"")
+            if raw:
+                raw.write(data)
+            if data and not data.endswith(b"\n"):
+                raise ValueError("incomplete SPARQL TSV line")
+            return data.decode().removesuffix("\n").removesuffix("\r") if data else None
+
+        header = line()
+        names = header.split("\t") if header is not None else []
+        if not names or any(not re.fullmatch(r"\?[A-Za-z_][A-Za-z_0-9]*", n) for n in names) or len(set(names)) != len(names):
+            raise ValueError("invalid SPARQL TSV header")
+        order = sorted(range(len(names)), key=lambda i: names[i])
+        with tempfile.TemporaryDirectory(prefix="bench-answer-") as directory:
+            exact_path = os.path.join(directory, "exact")
+            value_path = os.path.join(directory, "value")
+            value = None
+            rows = 0
+            try:
+                with open(exact_path, "wb") as exact:
+                    while (text := line()) is not None:
+                        fields = text.split("\t")
+                        if len(fields) != len(names):
+                            raise ValueError("SPARQL TSV row has the wrong number of fields")
+                        terms = [canonical_tsv_field(fields[i]) for i in order]
+                        rows += 1
+                        if count_only:
+                            continue
+                        end = ",)" if len(terms) == 1 else ")"
+                        ex = ("(" + ", ".join(t[0] for t in terms) + end).encode()
+                        va = ("(" + ", ".join(t[1] for t in terms) + end).encode()
+                        eh = hashlib.sha256(ex).hexdigest().encode() + b"\n"
+                        if value is None and ex != va:
+                            exact.flush()
+                            value = open(value_path, "wb")
+                            with open(exact_path, "rb") as prior:
+                                for chunk in iter(lambda: prior.read(1 << 20), b""):
+                                    value.write(chunk)
+                        exact.write(eh)
+                        if value is not None:
+                            value.write(eh if ex == va else hashlib.sha256(va).hexdigest().encode() + b"\n")
+                    if getattr(response, "length", 0):
+                        raise ValueError("incomplete HTTP response body")
+                    if finish_response:
+                        finish_response()
+            finally:
+                if value is not None:
+                    value.close()
+            rec = {"rows": rows}
+            if not count_only:
+                rec["exact"] = sorted_row_digest(exact_path, directory)
+                rec["value"] = sorted_row_digest(value_path, directory) if value is not None else rec["exact"]
+            if raw:
+                raw.close()
+                os.replace(raw_path + ".tmp", raw_path)
+            return rec
+    finally:
+        if raw and not raw.closed:
+            raw.close()
+        if raw_path and os.path.exists(raw_path + ".tmp"):
+            os.remove(raw_path + ".tmp")
 
 
 def main():
     endpoint, qfile, out, name, engine = sys.argv[1:6]
     count_only = "--count-only" in sys.argv[6:]
     no_check = "--no-check" in sys.argv[6:]
+    stream_tsv = "--stream-tsv" in sys.argv[6:]
     with open(qfile) as f:
         query = f.read()
     kind = form(query)
@@ -639,7 +789,7 @@ def main():
     def request(text):
         return urllib.request.Request(
             url, data=urllib.parse.urlencode({"query": text}).encode(),
-            headers={"Accept": "application/n-triples" if graph else "application/sparql-results+json",
+            headers={"Accept": "text/tab-separated-values" if stream_tsv else "application/n-triples" if graph else "application/sparql-results+json",
                      "Content-Type": "application/x-www-form-urlencoded"})
 
     max_time = float(os.environ.get("MAX_TIME", "300"))
@@ -649,16 +799,23 @@ def main():
         # the whole response, for a later look at a disagreement the digests only detect. A
         # capture of an earlier run goes first, so a failed request leaves no answer behind.
         os.makedirs(raw_dir, exist_ok=True)
-        raw_path = os.path.join(raw_dir, f"{name}.{engine}.{'nt' if graph else 'json'}")
+        raw_path = os.path.join(raw_dir, f"{name}.{engine}.{'tsv' if stream_tsv else 'nt' if graph else 'json'}")
         if os.path.exists(raw_path):
             os.remove(raw_path)
     try:
-        body = fetch(request(query), max_time)
-        if raw_path:
+        if stream_tsv:
+            rec = fetch(request(query), max_time,
+                        lambda response, done: streamed_tsv_record(response, query, count_only, raw_path, done))
+        else:
+            rec = None
+            body = fetch(request(query), max_time)
+        if raw_path and not stream_tsv:
             with open(raw_path + ".tmp", "wb") as f:
                 f.write(body)
             os.replace(raw_path + ".tmp", raw_path)
-        if graph:
+        if stream_tsv:
+            pass
+        elif graph:
             rec = graph_record(body.decode(), count_only, no_check)
         else:
             res = json.loads(body)

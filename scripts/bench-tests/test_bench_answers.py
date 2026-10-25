@@ -4,7 +4,9 @@
 """
 
 import http.server
+import hashlib
 import importlib.util
+import io
 import json
 import os
 import subprocess
@@ -13,6 +15,7 @@ import tempfile
 import threading
 import time
 import unittest
+import unittest.mock
 
 SCRIPTS = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 PATH = os.path.join(SCRIPTS, "bench-answers.py")
@@ -63,6 +66,55 @@ class CanonTests(unittest.TestCase):
     def test_without_blank_nodes_the_digest_is_the_plain_one(self):
         r = rows([u("a"), u("b")], [u("c"), u("d")])
         self.assertEqual(ba.canon(r), ba.digest(r))
+
+
+class StreamedTSVTests(unittest.TestCase):
+    def record(self, text, **kwargs):
+        return ba.streamed_tsv_record(io.BytesIO(text.encode()), "SELECT ?a ?b { ?a ?p ?b }", False, **kwargs)
+
+    def test_full_multiset_retains_duplicates_and_ignores_column_and_row_order(self):
+        first = self.record('?a\t?b\n<urn:a>\t"x"\n<urn:a>\t"x"\n<urn:b>\t"y"\n')
+        other = self.record('?b\t?a\n"y"\t<urn:b>\n"x"\t<urn:a>\n"x"\t<urn:a>\n')
+        shorter = self.record('?a\t?b\n<urn:a>\t"x"\n<urn:b>\t"y"\n')
+        self.assertEqual(first, other)
+        self.assertEqual(first["rows"], 3)
+        self.assertNotEqual(first["value"], shorter["value"])
+        self.assertTrue(first["exact"].startswith("row-sha256-v1:"))
+
+    def test_hashes_every_normalized_row_with_separate_term_identity_and_values(self):
+        text = '?a\t?b\n<urn:a>\t"caf\\u00e9"@EN\n\t"1.0"^^<' + ba.XSD + 'decimal>\n<urn:z>\t"1"^^<' + ba.XSD + 'integer>\n'
+        actual = self.record(text)
+        terms = [[u("urn:a"), lit("café", lang="EN")], [None, lit("1.0", "decimal")], [u("urn:z"), lit("1", "integer")]]
+        for key, by_value in (("exact", False), ("value", True)):
+            hashes = sorted(hashlib.sha256(repr(tuple(ba.term(t, by_value) for t in r)).encode()).hexdigest() + "\n" for r in terms)
+            expected = "row-sha256-v1:" + hashlib.sha256("".join(hashes).encode()).hexdigest()
+            self.assertEqual(actual[key], expected)
+
+    def test_numeric_and_boolean_tsv_shorthand_is_parsed_by_rdf_type(self):
+        for text, typ in (("1", "integer"), ("1.2", "decimal"), ("1e2", "double"), ("true", "boolean")):
+            self.assertEqual(ba.tsv_term(text), lit(text, typ))
+
+    def test_invalid_or_partial_responses_and_unsupported_semantics_are_rejected(self):
+        for text in ('?a\t?b\n<urn:a>\t"x"', '?a\t?b\n<urn:a>\n', '?a\t?a\n', 'error\n', '?a\t?b\n_:b\t"x"\n', '?a\t?b\nbad\t"x"\n'):
+            with self.subTest(text=text), self.assertRaises(ValueError):
+                self.record(text)
+        with self.assertRaises(ValueError):
+            ba.streamed_tsv_record(io.BytesIO(b'?a\n'), 'SELECT ?a {} ORDER BY ?a', False)
+        truncated = io.BytesIO(b'?a\t?b\n<urn:a>\t"x"\n')
+        truncated.length = 20  # The server declared more bytes, even though the last row is whole.
+        with self.assertRaisesRegex(ValueError, "incomplete HTTP"):
+            ba.streamed_tsv_record(truncated, 'SELECT ?a ?b {}', False)
+
+    def test_raw_capture_is_complete_and_failed_capture_is_removed(self):
+        with tempfile.TemporaryDirectory() as d:
+            path = os.path.join(d, "q.tsv")
+            text = '?a\t?b\n<urn:a>\t"x"\n'
+            self.record(text, raw_path=path)
+            with open(path) as f:
+                self.assertEqual(f.read(), text)
+            with self.assertRaises(ValueError):
+                self.record('?a\t?b\ninvalid', raw_path=path)
+            self.assertFalse(os.path.exists(path + '.tmp'))
 
 
 class NTriplesTests(unittest.TestCase):
@@ -368,6 +420,18 @@ class Handler(http.server.BaseHTTPRequestHandler):
         n = int(self.headers.get("Content-Length") or 0)
         sent = self.rfile.read(n).decode()
         Handler.bodies.append((self.path, sent))
+        if self.path in ("/tsv", "/tsv-short", "/tsv-chunked-short"):
+            body = b'?x\n"1"\n"2"\n'
+            self.send_response(200)
+            self.send_header("Content-Type", "text/tab-separated-values")
+            if self.path == "/tsv-chunked-short":
+                self.send_header("Transfer-Encoding", "chunked")
+            else:
+                self.send_header("Content-Length", str(len(body) + (20 if self.path == "/tsv-short" else 0)))
+            self.end_headers()
+            self.wfile.write(f"{len(body):x}\r\n".encode() + body + b"\r\n" if self.path == "/tsv-chunked-short" else body)
+            self.close_connection = True
+            return
         if self.path == "/slow":
             # a body that keeps arriving, so no single wait is long
             self.send_response(200)
@@ -407,17 +471,41 @@ class RequestTests(unittest.TestCase):
         self.tmp = tempfile.TemporaryDirectory()
         self.addCleanup(self.tmp.cleanup)
 
-    def answer(self, path, query, max_time="5", **env):
+    def answer(self, path, query, max_time="5", flags=(), **env):
         qf = os.path.join(self.tmp.name, "q.rq")
         with open(qf, "w") as f:
             f.write(query)
         out = os.path.join(self.tmp.name, "answers.json")
         port = self.server.server_address[1]
         t0 = time.monotonic()
-        subprocess.run([sys.executable, PATH, f"127.0.0.1:{port}{path}", qf, out, "q", "e"],
+        subprocess.run([sys.executable, PATH, f"127.0.0.1:{port}{path}", qf, out, "q", "e", *flags],
                        env=dict(os.environ, MAX_TIME=max_time, **env), capture_output=True, text=True)
         with open(out) as f:
             return json.load(f)["q"]["e"], time.monotonic() - t0
+
+    def test_streamed_tsv_path_is_wired_and_detects_an_incomplete_http_body(self):
+        rec, _ = self.answer("/tsv", "SELECT ?x {}", flags=("--stream-tsv",))
+        self.assertEqual(rec["rows"], 2)
+        self.assertTrue(rec["value"].startswith("row-sha256-v1:"))
+        bad, _ = self.answer("/tsv-short", "SELECT ?x {}", flags=("--stream-tsv",))
+        self.assertEqual(bad["rows"], "error")
+        self.assertIn("incomplete HTTP", bad["error"])
+
+    def test_streamed_tsv_rejects_chunked_response_without_terminal_chunk(self):
+        bad, _ = self.answer("/tsv-chunked-short", "SELECT ?x {}", flags=("--stream-tsv",))
+        self.assertEqual(bad["rows"], "error")
+
+    def test_post_response_sorting_is_outside_the_request_deadline(self):
+        original = ba.sorted_row_digest
+
+        def slow_sort(*args):
+            time.sleep(0.3)
+            return original(*args)
+
+        req = ba.urllib.request.Request(f"http://127.0.0.1:{self.server.server_address[1]}/tsv", data=b"query=SELECT")
+        with unittest.mock.patch.object(ba, "sorted_row_digest", slow_sort):
+            record = ba.fetch(req, 0.2, lambda response, done: ba.streamed_tsv_record(response, "SELECT ?x {}", False, finish_response=done))
+        self.assertEqual(record["rows"], 2)
 
     def test_the_whole_request_has_a_deadline(self):
         rec, took = self.answer("/slow", "SELECT ?x { ?s ?p ?x }", max_time="1")
