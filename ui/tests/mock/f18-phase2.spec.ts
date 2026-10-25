@@ -392,3 +392,45 @@ test('authenticated branch writers can remove supports and open premises on thei
   await expect.poll(() => premiseReads.length).toBeGreaterThanOrEqual(3);
   expect(premiseReads.every((path) => path === `/${name}@dev/sparql`)).toBe(true);
 });
+
+test('a branch canvas reads its history and family path defaults in the correct scopes', async ({
+  page,
+  request,
+}) => {
+  const name = 'f18-canvas-branch';
+  await create(request, name);
+  await request.post(`/${name}/update`, {
+    headers: { 'Content-Type': 'application/sparql-update' },
+    data: 'INSERT DATA {<urn:Cat> <urn:p> <urn:base>}',
+  });
+  await request.post(`/$/branches/${name}`, { data: { name: 'dev' } });
+  await request.post(`/${name}@dev/update`, {
+    headers: { 'Content-Type': 'application/sparql-update' },
+    data: 'INSERT DATA {<urn:Cat> <urn:p> <urn:branch>}',
+  });
+  const commits: string[] = [];
+  const settings: string[] = [];
+  page.on('request', (request) => {
+    const url = new URL(request.url());
+    if (url.pathname === `/$/commits/${name}`)
+      commits.push(url.searchParams.get('branch') ?? 'main');
+    if (
+      decodeURIComponent(url.pathname).startsWith(`/$/settings/${name}`) &&
+      url.pathname.endsWith('/paths')
+    )
+      settings.push(decodeURIComponent(url.pathname));
+  });
+  await page.goto(`/ui/explore?ds=${name}&branch=dev&iri=urn%3ACat`);
+  await expect(page.getByRole('complementary', { name: 'Resource details' })).toBeVisible();
+  await page.getByRole('button', { name: 'Graph history', exact: true }).click();
+  const bar = page.getByRole('region', { name: 'Graph history time slider' });
+  await expect.poll(() => commits.includes('dev')).toBe(true);
+  expect(commits.every((branch) => branch === 'dev')).toBe(true);
+  await bar.getByRole('button', { name: 'Compare', exact: true }).click();
+  const choices = bar.getByRole('combobox', { name: 'Compare with' });
+  await expect(choices.locator('option[value="main"]')).toHaveCount(1);
+  await expect(choices.locator('option[value="dev"]')).toHaveCount(0);
+  await bar.getByRole('button', { name: 'Close the time slider' }).click();
+  await page.getByRole('button', { name: 'Paths', exact: true }).click();
+  await expect.poll(() => settings).toEqual([`/$/settings/${name}/paths`]);
+});

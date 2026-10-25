@@ -153,12 +153,25 @@
     if (previousResourceBranch === branch) return;
     previousResourceBranch = branch;
     untrack(() => {
+      graphRuns.claim('graph');
+      histRuns.claim('history');
+      graphReading = false;
+      graphPlaying = false;
+      histFor = '';
+      hist = null;
+      histError = null;
+      pathsOpen = false;
+      pathFrom = null;
+      pathTo = null;
+      clearPaths();
       resetGraph();
       focusId = null;
       selectedId = null;
       editable = {};
       creatable = {};
       editing = false;
+      const iri = page.url.searchParams.get('iri');
+      if (iri) void focusOn(iri, undefined, true);
     });
   });
 
@@ -370,7 +383,7 @@
   });
   function openDiff(to: string, from: string) {
     closePaths();
-    diffView = { to, from, branch: '', group: false };
+    diffView = { to, from, branch: overviewBranch ?? '', group: false };
     diffKey++;
     syncUrl(focusId && nodes[focusId] ? nodes[focusId].iri : null);
   }
@@ -394,13 +407,15 @@
   let branchNames = $state<string[]>([]);
   $effect(() => {
     const name = ds;
+    const selected = overviewBranch ?? 'main';
     branchNames = [];
     if (!name) return;
     const ctl = new AbortController();
     api
       .branches(name, ctl.signal)
       .then((l) => {
-        if (ds === name) branchNames = l.branches.map((b) => b.name).filter((n) => n !== 'main');
+        if (ds === name && selected === (overviewBranch ?? 'main'))
+          branchNames = l.branches.map((b) => b.name).filter((n) => n !== selected);
       })
       .catch(() => {});
     return () => ctl.abort();
@@ -1165,9 +1180,11 @@
    */
   async function rereadGraph() {
     const name = ds;
+    const target = resourceTarget;
     const root = focusId;
-    if (!name || !root) return;
-    const owns = graphRuns.claim('graph');
+    if (!name || !target || !root) return;
+    const requestOwns = graphRuns.claim('graph');
+    const owns = () => requestOwns() && target === resourceTarget;
     const signal = graphRuns.signal('graph');
     const at = graphTimeOpen && exAt ? exAt : undefined;
     graphReading = true;
@@ -1179,7 +1196,7 @@
       for (const id of [...expandLog]) {
         const term = seenTerms.get(id);
         if (!present.has(id) || !term || term.type !== 'uri') continue;
-        const r = await ex.neighbours(onBranch(name, overviewBranch), term.value, at, signal);
+        const r = await ex.neighbours(target!, term.value, at, signal);
         if (!owns()) return;
         fetched.set(id, r);
         for (const nb of [...r.out, ...r.inc]) {
@@ -1248,8 +1265,10 @@
    */
   async function lapseGraph(fromAt: string, toAt: string) {
     const name = ds;
-    if (!name || !focusId) return;
-    const owns = graphRuns.claim('graph');
+    const target = resourceTarget;
+    if (!name || !target || !focusId) return;
+    const requestOwns = graphRuns.claim('graph');
+    const owns = () => requestOwns() && target === resourceTarget;
     const signal = graphRuns.signal('graph');
     graphReading = true;
     graphNote = '';
@@ -1259,7 +1278,7 @@
         .filter((n) => n.term.type === 'uri')
         .map((n) => n.iri)
         .slice(0, 1000);
-      const d = await api.diff(onBranch(name, overviewBranch), {
+      const d = await api.diff(target!, {
         from: fromAt,
         to: toAt,
         terms: iris,
@@ -1309,7 +1328,7 @@
       // the state the diff resolved to, which a write after it does not move
       const holds = candidates.size
         ? await ex.presentEdges(
-            onBranch(name, overviewBranch),
+            target!,
             [...candidates.values()],
             `commit:${d.to.commit.seq}`,
             signal,
@@ -2019,7 +2038,6 @@
 
   // React to resource and branch changes from links into a retained support.
   $effect(() => {
-    void resourceTarget;
     const iri = page.url.searchParams.get('iri');
     const urlDs = page.url.searchParams.get('ds');
     untrack(() => {
@@ -2426,7 +2444,7 @@
           <div class="graph-time">
             <TimeSlider
               bind:this={graphSlider}
-              {ds}
+              ds={resourceTarget ?? ds}
               bind:at={exAt}
               bind:from={exFrom}
               bind:compare={exCompare}
@@ -2485,7 +2503,7 @@
           {#if canvasMode === 'map' && ds && !pathsOpen}
             <div class="cy-host">
               <GraphMap
-                {ds}
+                ds={resourceTarget ?? ds}
                 nodes={gNodes}
                 edges={gEdges}
                 at={mapAt}
@@ -2578,7 +2596,7 @@
       {#if facetsOpen && nodeCount > 0 && !pathsOpen && ds}
         <aside class="side side-facets" aria-label="Facets">
           <FacetPanel
-            {ds}
+            ds={resourceTarget ?? ds}
             within={facetWithin}
             setLabel={facetSet?.name ?? 'entities'}
             at={timeActive ? exAt : ''}
@@ -2610,11 +2628,12 @@
       {/if}
       {#if pathsOpen && ds}
         <aside class="side side-paths" aria-label="Path finder">
-          {#key ds}
+          {#key resourceTarget}
             <PathPanel
               bind:this={pathPanel}
               ds={resourceTarget ?? ds}
               {prefixes}
+              branch={overviewBranch ?? 'main'}
               at={graphTimeOpen ? exAt : ''}
               bind:from={pathFrom}
               bind:to={pathTo}
@@ -2796,7 +2815,8 @@
               <div class="side-body scroll">
                 {#key n.iri}
                   <ShapeForm
-                    ds={resourceTarget ?? ds}
+                    {ds}
+                    branch={overviewBranch}
                     iri={n.iri}
                     {prefixes}
                     title={labelFor(n.term, n.label)}

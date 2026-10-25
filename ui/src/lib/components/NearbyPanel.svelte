@@ -13,6 +13,7 @@
   // "Nearby" on the explorer's map card: the features within a radius of the resource's
   // geometry (`spatial:nearbyGeom`), nearest first.
   import { resolve } from '$app/paths';
+  import { exploreQuery } from '$lib/branches';
   import * as api from '$lib/api';
   import { shortLabel } from '$lib/graph';
   import { isGeoLiteral, nearbyQuery, type GeoLiteral } from '$lib/geo';
@@ -83,8 +84,7 @@
     }
   }
 
-  const href = (target: string) =>
-    `${resolve('/explore')}?ds=${encodeURIComponent(ds)}&iri=${encodeURIComponent(target)}`;
+  const href = (target: string) => `${resolve('/explore')}?${exploreQuery(ds, target)}`;
   const km = (d: number) => (d < 10 ? d.toFixed(2) : d < 100 ? d.toFixed(1) : d.toFixed(0));
 </script>
 
