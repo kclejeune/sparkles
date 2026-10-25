@@ -276,6 +276,20 @@ bsbm_check() {
 }
 SUITE_AFTER=bsbm_check
 
+# Data oracles run after all answer-check servers stop, before any timing starts.
+bsbm_verify() {
+  [ "$USECASE" = bi ] || return 0
+  local names=() engines=() n e
+  for n in "${NAMES[@]}"; do selected "$n" && names+=("$n"); done
+  for e in $ENGINES; do engines+=("${NAME[$e]}"); done
+  python3 "$ROOT/scripts/bench-bsbm/bi-answer-oracle.py" "$DATAFILE" queries "$ANSWERS_RAW_DIR" \
+    --json results/answer-validation.json --names "${names[@]}" --engines "${engines[@]}"
+}
+if [ "$USECASE" = bi ]; then
+  export ANSWERS_RAW_DIR=${ANSWERS_RAW_DIR:-$WORK/results/raw-answers}
+  SUITE_VERIFY=bsbm_verify
+fi
+
 DATA_SPECS=("bsbm-$SCALE=$WORK/$DATAFILE|GPL-3.0 (generator)|BSBM tools 0.2 $GENPARAMS triples=$TRIPLES")
 LICENSE_NOTES=("BSBM tools 0.2: GPL-3.0, downloaded at run time, run as separate processes and not committed")
 suite_run

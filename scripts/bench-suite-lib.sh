@@ -261,6 +261,7 @@ suite_run() {
   start_all
   answer_check
   stop_all
+  if [ -n "${SUITE_VERIFY:-}" ]; then "$SUITE_VERIFY"; fi
   if [ -z "${ANSWERS_ONLY:-}" ]; then
     # Each engine runs alone for the timings (docs/specs/X06 section 5.3). The answer check
     # above may keep every server up, since it measures no time. A fresh server answers every

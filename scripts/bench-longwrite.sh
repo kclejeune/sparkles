@@ -13,7 +13,7 @@
 # refuses other data. Every engine loads the same file, as in scripts/bench.sh. Then every
 # engine answers the read set on its loaded store, one at a time, and the answers are
 # compared: an engine whose answers differ from the majority is not run and is recorded as
-# wrong-answer, and one that fails a query is recorded as error, unless IGNORE_ANSWERS=1. Then, one engine at a time:
+# answer-disagreement, and one that fails a query is recorded as error, unless IGNORE_ANSWERS=1. Then, one engine at a time:
 #
 # 1. its loaded store is copied (reflinks where the file system has them) and served;
 # 2. scripts/bench-longwrite/longrun.py runs READERS readers (default 16) and WRITERS writers
@@ -199,7 +199,7 @@ declare -A VERDICT=()
 while read -r kind a b; do
   case $kind in
     error) [ -n "${VERDICT[$a]:-}" ] || VERDICT[$a]="error:failed $b" ;;
-    wrong) VERDICT[$a]="wrong-answer:differs from the majority on $b" ;;
+    wrong) VERDICT[$a]="answer-disagreement:differs from the majority on $b" ;;
     nomajority) log "the engines disagree on $a with no majority; every engine runs" ;;
   esac
 done <<< "$verdicts"

@@ -191,7 +191,7 @@ fn filter_str(ctx: &Ctx, filter: &[Expr]) -> String {
 }
 
 fn candidate(drive: &Node, probe: &Node, ctx: &Ctx) -> Option<Node> {
-    let offer = offer(drive, probe, ctx)?;
+    let offer = offer(drive, probe, ctx, true)?;
     Some(offer.build(drive.clone(), probe))
 }
 
@@ -202,10 +202,17 @@ pub(super) fn index_join(
     probe: &Node,
     ctx: &Ctx,
 ) -> std::result::Result<Node, Box<Node>> {
-    match offer(&drive, probe, ctx) {
+    match offer(&drive, probe, ctx, true) {
         Some(offer) => Ok(offer.build(drive, probe)),
         None => Err(Box::new(drive)),
     }
+}
+
+/// The index join of `drive` into the pattern `probe` whatever probing every key would
+/// cost, for an input read a few rows at a time (see `cursor::ripple`). `None` when the
+/// pattern cannot be probed on a variable `drive` always binds.
+pub(super) fn index_join_for_first_rows(drive: &Node, probe: &Node, ctx: &Ctx) -> Option<Node> {
+    offer(drive, probe, ctx, false).map(|offer| offer.build(drive.clone(), probe))
 }
 
 /// What the join ordering needs to know about a pattern to cost probing it: the
@@ -307,7 +314,9 @@ struct Offer<'p> {
     desc: String,
 }
 
-fn offer<'p>(drive: &Node, probe: &'p Node, ctx: &Ctx) -> Option<Offer<'p>> {
+/// `gated`: offered only when probing the input's keys costs less than reading the
+/// pattern (see [`ProbeSide::cost`]).
+fn offer<'p>(drive: &Node, probe: &'p Node, ctx: &Ctx, gated: bool) -> Option<Offer<'p>> {
     let (scan, spec, filter) = probe_leaf(probe)?;
     let side = probe_side(probe, ctx)?;
     let key = side.key;
@@ -326,7 +335,12 @@ fn offer<'p>(drive: &Node, probe: &'p Node, ctx: &Ctx) -> Option<Offer<'p>> {
         Some(k) if side.star => k,
         _ => drive.d(key).min(drive.est).max(1.0),
     };
-    let Some(probe_cost) = side.cost(keys_in, probe.cost) else {
+    let probe_cost = if gated {
+        side.cost(keys_in, probe.cost)
+    } else {
+        Some(side.cost(keys_in, probe.cost).unwrap_or(probe.cost))
+    };
+    let Some(probe_cost) = probe_cost else {
         tracing::debug!(
             target: "sparkles::sparql::indexjoin",
             "index join on {} into {} not offered: probing {keys_in:.0} keys costs more than scanning {:.0} rows",

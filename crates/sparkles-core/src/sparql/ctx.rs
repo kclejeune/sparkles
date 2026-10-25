@@ -166,6 +166,12 @@ pub struct Optimizations {
     /// an OPTIONAL whose sides share no variable and whose condition equates a variable
     /// of each side pairs the rows by that equality instead of forming their product
     pub keyed_left_join: bool,
+    /// two parts of a group that share no variable, linked by a FILTER conjunct that
+    /// equates a variable of each, are joined by that equality instead of their product
+    pub keyed_join: bool,
+    /// a triple pattern with one variable of which the store holds one row binds the
+    /// variable to that value for the rest of its group at planning time
+    pub point_patterns: bool,
     /// a FILTER conjunct over the variables of one triple pattern is tested on a sample
     /// of the pattern's rows, whose share that passes is the planner's estimate of the
     /// share of its input it keeps (instead of 30%)
@@ -218,7 +224,7 @@ pub struct Optimizations {
 }
 
 impl Optimizations {
-    pub const NAMES: [&str; 42] = [
+    pub const NAMES: [&str; 44] = [
         "range_pushdown",
         "incremental_group",
         "count_join_runs",
@@ -245,6 +251,8 @@ impl Optimizations {
         "gallop_index_join",
         "merge_left_join",
         "keyed_left_join",
+        "keyed_join",
+        "point_patterns",
         "sampled_filters",
         "characteristic_sets",
         "probed_keys",
@@ -291,6 +299,8 @@ impl Optimizations {
         gallop_index_join: true,
         merge_left_join: true,
         keyed_left_join: true,
+        keyed_join: true,
+        point_patterns: true,
         sampled_filters: true,
         characteristic_sets: true,
         probed_keys: true,
@@ -337,6 +347,8 @@ impl Optimizations {
         gallop_index_join: false,
         merge_left_join: false,
         keyed_left_join: false,
+        keyed_join: false,
+        point_patterns: false,
         sampled_filters: false,
         characteristic_sets: false,
         probed_keys: false,
@@ -383,6 +395,8 @@ impl Optimizations {
             "gallop_index_join" => &mut self.gallop_index_join,
             "merge_left_join" => &mut self.merge_left_join,
             "keyed_left_join" => &mut self.keyed_left_join,
+            "keyed_join" => &mut self.keyed_join,
+            "point_patterns" => &mut self.point_patterns,
             "sampled_filters" => &mut self.sampled_filters,
             "characteristic_sets" => &mut self.characteristic_sets,
             "probed_keys" => &mut self.probed_keys,

@@ -95,9 +95,10 @@ with result caches off, and every engine's answers were checked before timing.
 | Queries, English DBpedia, 1.24B triples | **Faster than QLever** on all 29 warm queries both answer correctly | Faster than QLever on 29 of 31 cold queries |
 | LUBM(100), 24.3M triples after OWL 2 RL closure | **Fastest on 13 of 14** | QLever is 3.7× faster on `q2` |
 
-Sparkles does not win everywhere. Jena answers the SP²Bench ASK query `q12a` 12× faster,
-QLever is 11.2× faster on BSBM BI `q2`, and Fluree is 2.9× faster on BSBM Explore `q5`.
-Oxigraph commits single writes faster because it does not synchronize them to disk, with a
+Paired forge runs put Sparkles ahead of Jena on SP²Bench `q12a` and QLever on BSBM BI `q2`.
+Sparkles has a lower pooled time than Fluree on BSBM Explore `q5`, with the closest
+instance tied within 4%. Oxigraph answers SP²Bench `q12b` 1.3× faster and commits
+single writes faster because it does not synchronize them to disk, with a
 median of 0.926 ms against 1.284 ms for a new literal at 10.5M triples. Sparkles also uses
 more memory than QLever at its peak in exchange for speed, 1,339 MiB against 939 MiB under
 16 readers at 10.5M triples, mostly for a 1 GiB decoded-block cache that can be made

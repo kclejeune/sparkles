@@ -5,6 +5,18 @@ use sparkles_core::sparql::{ExecutionMode, QueryExecution, QueryOptions, query, 
 use sparkles_core::store::{Store, StoreOptions};
 use sparkles_core::{BudgetKind, Error};
 
+// These tests exercise the fallback filtered-product executor. Keyed-join budgets
+// and short ASK prefixes have independent coverage in keyed_join.rs.
+fn cross_options() -> QueryOptions {
+    QueryOptions {
+        optimizations: Some(sparkles_core::sparql::Optimizations {
+            keyed_join: false,
+            ..sparkles_core::sparql::Optimizations::ALL
+        }),
+        ..Default::default()
+    }
+}
+
 fn fixture(n: usize, left: &str, right: &str) -> Store {
     fixture_sizes(n, n, left, right)
 }
@@ -55,7 +67,7 @@ fn automatic_ask_finds_a_binding_without_reserving_filtered_candidates() {
         let options = QueryOptions {
             max_rows: Some(1024),
             no_cache: true,
-            ..Default::default()
+            ..cross_options()
         };
         assert!(matches!(
             query(store.snapshot(), ASK, &options),
@@ -88,7 +100,7 @@ fn automatic_ask_keeps_actual_candidate_and_produced_row_limits() {
     let options = QueryOptions {
         max_rows: Some(1024),
         no_cache: true,
-        ..Default::default()
+        ..cross_options()
     };
     // No pair qualifies, so the cursor really does consume too many candidates.
     assert!(matches!(
@@ -101,7 +113,7 @@ fn automatic_ask_keeps_actual_candidate_and_produced_row_limits() {
         max_rows: Some(1024),
         no_cache: true,
         max_rows_produced: Some(1),
-        ..Default::default()
+        ..cross_options()
     };
     assert!(matches!(
         query_execution(
@@ -117,7 +129,7 @@ fn automatic_ask_avoids_candidate_memory_without_lifting_its_budget() {
     let options = QueryOptions {
         max_memory_bytes: Some(4 << 20),
         no_cache: true,
-        ..Default::default()
+        ..cross_options()
     };
     assert!(matches!(
         query(store.snapshot(), ASK, &options),
@@ -145,7 +157,7 @@ fn automatic_ask_can_prove_false_within_its_real_candidate_budget() {
         max_rows: Some(512 * 512),
         max_memory_bytes: Some(1 << 20),
         no_cache: true,
-        ..Default::default()
+        ..cross_options()
     };
     let execution = query_execution(
         store.snapshot(),
@@ -170,7 +182,7 @@ fn automatic_ask_preserves_errors_and_small_query_policy() {
     let options = QueryOptions {
         max_rows: Some(8192),
         no_cache: true,
-        ..Default::default()
+        ..cross_options()
     };
     assert!(matches!(
         query_execution(
@@ -187,7 +199,7 @@ fn automatic_ask_preserves_errors_and_small_query_policy() {
         max_rows: Some(1024),
         no_cache: true,
         cancel: Some(Arc::new(AtomicBool::new(true))),
-        ..Default::default()
+        ..cross_options()
     };
     assert!(matches!(
         query_execution(
@@ -203,7 +215,7 @@ fn automatic_ask_preserves_errors_and_small_query_policy() {
         max_rows: Some(1024),
         no_cache: true,
         deadline: Some(Instant::now()),
-        ..Default::default()
+        ..cross_options()
     };
     assert!(matches!(
         query_execution(
@@ -219,7 +231,7 @@ fn automatic_ask_preserves_errors_and_small_query_policy() {
         max_rows: Some(1024),
         no_cache: true,
         max_memory_bytes: Some(1),
-        ..Default::default()
+        ..cross_options()
     };
     assert!(matches!(query_execution(
         store.snapshot(), ASK, &options, &Default::default(), ExecutionMode::Auto,
@@ -233,7 +245,7 @@ fn automatic_ask_keeps_successful_cheap_asymmetric_prefixes_eager() {
         let options = QueryOptions {
             max_rows: Some(1024),
             no_cache: true,
-            ..Default::default()
+            ..cross_options()
         };
         assert!(query(store.snapshot(), ASK, &options).unwrap().boolean);
         let execution = query_execution(
@@ -258,7 +270,7 @@ fn automatic_ask_budget_failure_keeps_its_partial_execution_plan() {
     let options = QueryOptions {
         max_rows: Some(1024),
         no_cache: true,
-        ..Default::default()
+        ..cross_options()
     };
     let failed = query_execution_with_plan(
         store.snapshot(),
@@ -289,7 +301,7 @@ fn admitted_ask_builds_the_smaller_pure_input_without_renaming_values() {
     let options = QueryOptions {
         max_rows: Some(1024),
         no_cache: true,
-        ..Default::default()
+        ..cross_options()
     };
     assert!(query(store.snapshot(), ask, &options).unwrap().boolean);
     let execution = query_execution(
@@ -329,7 +341,7 @@ fn repeated_variable_scan_estimates_do_not_claim_a_cheap_eager_prefix() {
     let options = QueryOptions {
         max_rows: Some(1024),
         no_cache: true,
-        ..Default::default()
+        ..cross_options()
     };
     assert!(
         matches!(query(store.snapshot(), ask, &options), Err(Error::BudgetExceeded(b)) if b.kind == BudgetKind::Rows)
@@ -374,7 +386,7 @@ fn graph_ratio_estimates_do_not_claim_a_cheap_eager_prefix() {
     let options = QueryOptions {
         max_rows: Some(1024),
         no_cache: true,
-        ..Default::default()
+        ..cross_options()
     };
     assert!(
         matches!(query(store.snapshot(), ask, &options), Err(Error::BudgetExceeded(b)) if b.kind == BudgetKind::Rows)
@@ -400,7 +412,7 @@ fn exhausted_scan_with_failed_row_accounting_remains_incomplete() {
     let options = QueryOptions {
         max_rows: Some(32),
         no_cache: true,
-        ..Default::default()
+        ..cross_options()
     };
     let failed = query_execution_with_plan(
         store.snapshot(),
