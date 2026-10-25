@@ -203,8 +203,9 @@ Each of these can be switched off per query (`QueryOptions::optimizations`) or p
 * **Pure expressions per distinct value** (`expr_cache`). A FILTER conjunct, BIND, ORDER BY
   key or aggregate argument that reads one variable and gives the same result for the same
   term is evaluated once per distinct id of that variable. Rows look up the result, errors
-  included. RAND, UUID, STRUUID, BNODE and EXISTS run per row. NOW and the base IRI are
-  fixed for the query. On a column sorted by the variable, the distinct ids are its runs.
+  included. RAND, UUID, STRUUID, BNODE and EXISTS run per row, as do the ARQ UUID
+  aliases, dynamic `fn:apply` and `afn:eval` calls, and effectful extension functions.
+  NOW and the base IRI are fixed for the query. On a column sorted by the variable, the distinct ids are its runs.
   Otherwise a sample estimates how often values repeat, and when fewer than half the rows
   repeat a value the operator runs row by row. EXPLAIN notes `[expr cache: …]` with the
   distinct count or the reason it ran row by row, and reports `exprCacheHits`,

@@ -4585,3 +4585,62 @@ fn temporal_bind_reuse_matches_an_independent_calendar_oracle() {
         validate(all(cursor), extra);
     }
 }
+
+#[test]
+fn arq_uuid_aliases_and_dynamic_calls_stay_volatile_across_cursor_morsels() {
+    let s = Store::in_memory(StoreOptions::default());
+    let data = (0..5000)
+        .map(|i| format!("<urn:uuid:{i}> <urn:key> \"repeated string\" .\n"))
+        .collect::<String>();
+    s.load(&[Source::from_bytes(
+        data.into_bytes(),
+        RdfFormat::Turtle,
+        None,
+    )])
+    .unwrap();
+    for fresh in [
+        "afn:uuid()",
+        "afn:struuid()",
+        "fn:apply(afn:uuid)",
+        "fn:apply(afn:struuid)",
+        "afn:eval(afn:uuid)",
+        "afn:eval(afn:struuid)",
+    ] {
+        let text = format!(
+            "PREFIX afn: <http://jena.apache.org/ARQ/function#> PREFIX fn: <http://www.w3.org/2005/xpath-functions#> SELECT ?fresh WHERE {{ ?s <urn:key> ?key BIND(CONCAT(STR(?key), STR({fresh})) AS ?fresh) }}"
+        );
+        for cache in [true, false] {
+            let opts = QueryOptions {
+                optimizations: Some(sparkles_core::sparql::Optimizations {
+                    expr_cache: cache,
+                    ..Default::default()
+                }),
+                ..Default::default()
+            };
+            let cursor = select_cursor(s.snapshot(), &text, &opts, &options(4096)).unwrap();
+            let rows = all(cursor);
+            assert_eq!(rows.len(), 5000);
+            let unique = rows
+                .iter()
+                .map(|r| r[0].clone())
+                .collect::<std::collections::HashSet<_>>();
+            assert_eq!(
+                unique.len(),
+                5000,
+                "native cursor {fresh}, cache={cache} must generate one UUID per row"
+            );
+            assert!(!unique.contains(&None));
+            let rows = query(s.snapshot(), &text, &opts).unwrap().rows();
+            let unique = rows
+                .iter()
+                .map(|r| r[0].clone())
+                .collect::<std::collections::HashSet<_>>();
+            assert_eq!(
+                unique.len(),
+                5000,
+                "eager {fresh}, cache={cache} must generate one UUID per row"
+            );
+            assert!(!unique.contains(&None));
+        }
+    }
+}

@@ -6,7 +6,8 @@
 //! keys and aggregate arguments use it (GROUP BY on an expression is a BIND first).
 //!
 //! * Pure within a query: no RAND, UUID, STRUUID, BNODE (a fresh node per call, or one
-//!   per solution) or EXISTS (correlated with the whole row). NOW and the base IRI are
+//!   per solution), their volatile ARQ aliases, dynamic calls or EXISTS (correlated
+//!   with the whole row). NOW and the base IRI are
 //!   fixed for a query, and the rest of the context (snapshot, dataset, decoded values,
 //!   the geometry memo of `geof:` functions) is too.
 //! * Ids identify terms: an id is decoded the same way on every row (inline ids are
@@ -123,6 +124,17 @@ pub fn impurity(e: &Expr) -> Option<&'static str> {
     match e {
         Expr::Exists(_) => Some("EXISTS"),
         Expr::Call(Func::Registered(_), _) => Some("application function"),
+        Expr::Call(Func::Ext(iri), args) => {
+            let afn = iri.strip_prefix(super::expr::AFN);
+            match afn {
+                Some("uuid") => Some("UUID"),
+                Some("struuid") => Some("STRUUID"),
+                Some("wait" | "print" | "execTime") => Some("side effects"),
+                Some("eval") => Some("dynamic function"),
+                _ if iri.strip_prefix(super::expr::FN) == Some("apply") => Some("dynamic function"),
+                _ => args.iter().find_map(impurity),
+            }
+        }
         Expr::Call(Func::Builtin(f), args) => match f {
             Function::Rand => Some("RAND"),
             Function::Uuid => Some("UUID"),
@@ -1427,5 +1439,30 @@ mod tests {
         // NOW is fixed for a query
         assert_eq!(impurity(&call(Function::Now, vec![])), None);
         assert_eq!(impurity(&call(Function::UCase, vec![Expr::Var(1)])), None);
+    }
+
+    #[test]
+    fn volatile_extension_aliases_and_dynamic_calls_are_not_pure() {
+        for (base, local, reason) in [
+            (super::super::expr::AFN, "uuid", "UUID"),
+            (super::super::expr::AFN, "struuid", "STRUUID"),
+            (super::super::expr::AFN, "eval", "dynamic function"),
+            (super::super::expr::FN, "apply", "dynamic function"),
+            (super::super::expr::AFN, "wait", "side effects"),
+            (super::super::expr::AFN, "print", "side effects"),
+            (super::super::expr::AFN, "execTime", "side effects"),
+        ] {
+            let e = Expr::Call(Func::Ext(format!("{base}{local}")), vec![Expr::Var(1)]);
+            assert_eq!(impurity(&e), Some(reason));
+            assert!(eligible(&[&e]).is_err());
+        }
+        for (base, local) in [
+            (super::super::expr::FN, "upper-case"),
+            (super::super::expr::AFN, "strlen"),
+        ] {
+            let e = Expr::Call(Func::Ext(format!("{base}{local}")), vec![Expr::Var(1)]);
+            assert_eq!(impurity(&e), None);
+            assert_eq!(eligible(&[&e]).unwrap(), Some(1));
+        }
     }
 }

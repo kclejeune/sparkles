@@ -1367,3 +1367,11 @@ forms, timezones and the dateTime end-of-day boundary. Eager and native cursor a
 retain their values and RDF datatypes with caching enabled and disabled. Other controls
 cover distinct lexical forms, local and unbound values, changed stores and retained
 snapshots, optional memory refusal, finite physical work and cancellation.
+
+
+The shared purity check also excludes ARQ's UUID aliases and dynamic function calls.
+A dynamic target may invoke a volatile function even when its visible arguments repeat.
+These calls and effectful extension functions retain per-row evaluation in eager and
+cursor execution. A regression checks 5,000 distinct UUID outputs for direct aliases
+and both dynamic call forms, with expression reuse enabled and disabled. Ordinary pure
+extension functions remain eligible for reuse.
