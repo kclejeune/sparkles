@@ -182,7 +182,7 @@ start() {
     jena)
       # Jena's scripts prefer JAVA_HOME over the JDK that the nixpkgs wrapper puts on PATH,
       # and a developer's JAVA_HOME may name a JDK too old for the jars
-      env -u JAVA_HOME JVM_ARGS="-Xmx${JENA_HEAP:-8G}" "${CAP[@]}" "$FUSEKI" --update --timeout="$((SERVER_TIMEOUT * 1000))" --port "$p" --loc "$(store_of jena)" /bench > "$STORE/fuseki.log" 2>&1 &
+      env -u JAVA_HOME JVM_ARGS="-Xmx${JENA_HEAP:-8G}${JENA_STACK:+ -Xss$JENA_STACK}" "${CAP[@]}" "$FUSEKI" --update --timeout="$((SERVER_TIMEOUT * 1000))" --port "$p" --loc "$(store_of jena)" /bench > "$STORE/fuseki.log" 2>&1 &
       URL[$e]=localhost:$p/bench/sparql
       UPDURL[$e]=localhost:$p/bench/update
       ready="localhost:$p/\$/ping"
