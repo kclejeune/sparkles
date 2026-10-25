@@ -336,7 +336,6 @@ struct Asking<'a, 'e> {
 
 /// The grounding of §4.1 step 1.
 struct Ground {
-    assumptions: Vec<String>,
     context: String,
     /// a mention that links `ambiguous`, with its candidates
     ambiguous: Option<(String, Vec<Value>)>,
@@ -825,7 +824,6 @@ impl Asking<'_, '_> {
         ground_event["examples"] = examples.iter().map(|e| e["name"].clone()).collect();
         // linked mentions
         let mut ambiguous = None;
-        let mut assumptions = Vec::new();
         let mut exact = false;
         let mentions = mentions(&self.o.question);
         let mut entities = Vec::new();
@@ -840,20 +838,20 @@ impl Asking<'_, '_> {
                 let mut lines = String::new();
                 for m in &ms {
                     let text = m["text"].as_str().unwrap_or("");
-                    let mut verdict = m["verdict"].as_str().unwrap_or("none");
+                    let verdict = m["verdict"].as_str().unwrap_or("none");
                     let mut cands = m["candidates"].as_array().cloned().unwrap_or_default();
                     if verdict == "ambiguous"
-                        && self.o.clarification.is_none()
-                        && let Some(index) =
-                            grounding::preferred_candidate(text, &self.o.question, &cands)
+                        && let Some(index) = grounding::preferred_display_candidate(
+                            text,
+                            &self.o.question,
+                            &cands,
+                            &v["prefixes"],
+                        )
                     {
+                        // The bounded display is not proof of uniqueness. Reorder
+                        // offered choices without changing the linker's verdict.
                         let chosen = cands.remove(index);
-                        assumptions.push(format!(
-                            "Assumed {} means {} because its unqualified resource name matches the mention.",
-                            Value::from(text), chosen["iri"]
-                        ));
-                        cands = vec![chosen];
-                        verdict = "exact";
+                        cands.insert(0, chosen);
                     }
                     exact |= verdict == "exact";
                     if verdict == "ambiguous" && ambiguous.is_none() {
@@ -927,14 +925,6 @@ impl Asking<'_, '_> {
                 ground_event["communities"] = reports.iter().map(|r| r["iri"].clone()).collect();
             }
         }
-        if !assumptions.is_empty() {
-            ctx.push_str("\nEntity assumptions to state with the answer:\n");
-            for assumption in &assumptions {
-                ctx.push_str(assumption);
-                ctx.push('\n');
-            }
-            ground_event["assumptions"] = json!(assumptions);
-        }
         ground_event["entities"] = Value::Array(entities);
         self.trimmed = json!({
             "contextTokens": context_tokens,
@@ -946,7 +936,6 @@ impl Asking<'_, '_> {
         ground_event["trimmed"] = small.into();
         self.emit("ground", &ground_event);
         Ground {
-            assumptions,
             context: ctx,
             ambiguous,
             best_example,
@@ -1006,8 +995,7 @@ impl Asking<'_, '_> {
                     ));
                 }
             }
-            let mut d = normalize(&value);
-            d.assumptions.extend(ground.assumptions.iter().cloned());
+            let d = normalize(&value);
             self.answered_by = Some((role, pair.clone()));
             let mut record = json!({
                 "attempt": attempt,

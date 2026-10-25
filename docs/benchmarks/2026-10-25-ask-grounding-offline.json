@@ -1281,14 +1281,6 @@
   "scope": "Offline balanced schema retrieval at150, using the actual runtime selector. English/untyped declared labels only. Not end-to-end Ask accuracy or full runtime retrieval.",
   "vocabulary": 58564
  },
- "candidate_choices": {
-  "agreesWithSavedChoice": 5,
-  "cases": 142,
-  "kind": "offline-candidate-choice-replay",
-  "note": "Candidate retrieval and end-to-end execution accuracy are not measured. No provider calls. Saved choices can themselves use gold-word heuristics.",
-  "preservedClarifications": 135,
-  "resolved": 7
- },
  "baseline_prompt_link": {
   "saved_request_id": 25,
   "captured_predicates": 150,
@@ -1342,6 +1334,7 @@
  },
  "implementation_sha256": {
   "crates/sparkles-server/src/mcp/relevance.rs": "c2f30db1352165c6a09d8d99515aa8ff24b5c21fe01fd27169ad2b90668deb81",
-  "crates/sparkles-server/src/ask/grounding.rs": "1d7f73131400124128f201177df35bbe45d78ab7582cf026d445351b2837edb3"
- }
+  "crates/sparkles-server/src/ask/grounding.rs": "616644a56c46cff9c4aea74899c5b177ec20c03d063a310754ec117d8c737080"
+ },
+ "candidate_ranking_scope": "Display preference only. All ambiguous clarifications remain. No answer-accuracy or candidate-uniqueness claim follows from truncated saved choices."
 }

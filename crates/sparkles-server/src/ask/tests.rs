@@ -687,7 +687,7 @@ fn question_predicate_beyond_largest_two_hundred_reaches_the_draft() {
 }
 
 #[test]
-fn a_resource_and_its_category_do_not_force_an_unnecessary_clarification() {
+fn a_resource_and_its_category_remain_a_clarification_with_ranked_choices() {
     let ttl = format!(
         "{ORG} <http://dbpedia.org/resource/Berlin> a <http://dbpedia.org/ontology/City> ; <http://www.w3.org/2000/01/rdf-schema#label> \"Berlin\"@en . \
     <http://dbpedia.org/resource/Category:Berlin> a <http://www.w3.org/2004/02/skos/core#Concept> ; <http://www.w3.org/2000/01/rdf-schema#label> \"Berlin\"@en ."
@@ -703,14 +703,42 @@ fn a_resource_and_its_category_do_not_force_an_unnecessary_clarification() {
     let mut o = opts("What is Berlin called?");
     o.summary = false;
     let (out, events) = run(&s, &m, &o);
-    assert_eq!(out["outcome"], "answered", "{out:#}");
-    assert!(!events.iter().any(|e| e == "clarify"));
-    assert!(
-        out["result"]["assumptions"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .any(|a| a.as_str().unwrap_or("").contains("unqualified resource")),
-        "{out:#}"
+    assert_eq!(out["outcome"], "clarify", "{out:#}");
+    assert!(events.iter().any(|e| e == "clarify"));
+    assert_eq!(
+        out["clarify"]["choices"][0]["value"],
+        "<http://dbpedia.org/resource/Berlin>"
     );
+    assert_eq!(out["clarify"]["choices"].as_array().unwrap().len(), 2);
+    assert!(
+        mock.requests().is_empty(),
+        "an ambiguous mention must stop before drafting"
+    );
+}
+
+#[test]
+fn an_exact_namesake_outside_the_small_display_still_requires_clarification() {
+    let mut ttl = ORG.to_string();
+    for local in [
+        "Category:Salt_Lake_City",
+        "Category:Salt_Lake_City_culture",
+        "Salt_Lake_City",
+        "Salt_Lake_City_(fictional_city)",
+    ] {
+        let kind = if local.starts_with("Category:") {
+            "http://www.w3.org/2004/02/skos/core#Concept"
+        } else {
+            "http://dbpedia.org/ontology/City"
+        };
+        ttl.push_str(&format!("<http://dbpedia.org/resource/{local}> a <{kind}> ; rdfs:label \"Salt Lake City\"@en .\n"));
+    }
+    let s = server(&ttl);
+    for (context, choices) in [(4096, 3), (200000, 4)] {
+        let mock = scripted(vec![], json!({}));
+        let m = models(&mock.url(), json!({"contextTokens":context}));
+        let (out, _) = run(&s, &m, &opts("Where is Salt Lake City?"));
+        assert_eq!(out["outcome"], "clarify", "{out:#}");
+        assert_eq!(out["clarify"]["choices"].as_array().unwrap().len(), choices);
+        assert!(mock.requests().is_empty());
+    }
 }

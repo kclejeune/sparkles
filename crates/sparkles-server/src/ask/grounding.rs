@@ -46,20 +46,35 @@ fn folded(text: &str) -> String {
         .to_lowercase()
 }
 
+fn expanded(iri: &str, prefixes: &Value) -> String {
+    let iri = iri.trim_matches(['<', '>']);
+    if let Some((prefix, local)) = iri.split_once(':')
+        && let Some(namespace) = prefixes[prefix].as_str()
+    {
+        return format!("{namespace}{local}");
+    }
+    iri.to_string()
+}
+
 fn taxonomic(candidate: &Value) -> bool {
     candidate["iri"]
         .as_str()
-        .is_some_and(|iri| iri.contains("/Category:") || iri.starts_with("dbc:"))
+        .is_some_and(|iri| iri.starts_with("http://dbpedia.org/resource/Category:"))
         || candidate["types"]
             .as_array()
             .into_iter()
             .flatten()
             .filter_map(Value::as_str)
-            .filter_map(local)
-            .any(|t| {
+            .any(|iri| {
                 matches!(
-                    t.as_str(),
-                    "Concept" | "ConceptScheme" | "Class" | "Property"
+                    iri,
+                    "http://www.w3.org/2004/02/skos/core#Concept"
+                        | "http://www.w3.org/2004/02/skos/core#ConceptScheme"
+                        | "http://www.w3.org/2000/01/rdf-schema#Class"
+                        | "http://www.w3.org/2002/07/owl#Class"
+                        | "http://www.w3.org/1999/02/22-rdf-syntax-ns#Property"
+                        | "http://www.w3.org/2002/07/owl#ObjectProperty"
+                        | "http://www.w3.org/2002/07/owl#DatatypeProperty"
                 )
             })
 }
@@ -76,14 +91,32 @@ fn matching_label(candidate: &Value, normalized: &str) -> bool {
             .any(|label| folded(label) == normalized)
 }
 
-/// A unique unqualified name is stronger evidence than a category or a qualified
-/// namesake. Equally canonical names remain ambiguous. An explicit kind immediately
-/// before the mention must agree with the candidate's visible types.
-pub(super) fn preferred_candidate(
+/// A conservative display preference among choices already offered to the person.
+/// Display metadata is bounded and cannot prove uniqueness. This helper must never
+/// change an ambiguous verdict or suppress clarification.
+pub(super) fn preferred_display_candidate(
     mention: &str,
     question: &str,
     candidates: &[Value],
+    prefixes: &Value,
 ) -> Option<usize> {
+    let candidates: Vec<Value> = candidates
+        .iter()
+        .map(|candidate| {
+            let mut candidate = candidate.clone();
+            if let Some(iri) = candidate["iri"].as_str() {
+                candidate["iri"] = expanded(iri, prefixes).into();
+            }
+            if let Some(types) = candidate["types"].as_array() {
+                candidate["types"] = types
+                    .iter()
+                    .filter_map(Value::as_str)
+                    .map(|iri| Value::from(expanded(iri, prefixes)))
+                    .collect();
+            }
+            candidate
+        })
+        .collect();
     let normalized = folded(mention);
     if normalized.is_empty() || normalized.contains("category:") {
         return None;
@@ -130,46 +163,58 @@ pub(super) fn preferred_candidate(
     };
     let candidate = &candidates[*index];
     let types = candidate["types"].as_array()?;
-    if !types
-        .iter()
-        .filter_map(Value::as_str)
-        .filter_map(local)
-        .any(|t| !matches!(t.as_str(), "Thing" | "Resource" | "NamedIndividual"))
-        || taxonomic(candidate)
-        || !matching_label(candidate, &normalized)
-        || types
-            .iter()
-            .filter_map(Value::as_str)
-            .any(|t| t.to_lowercase().contains("disambiguation"))
-        || candidates
-            .iter()
-            .enumerate()
-            .any(|(i, c)| i != *index && !taxonomic(c) && matching_label(c, &normalized))
-    {
-        return None;
-    }
-    // A different kind of substantive entity can be the intended namesake even
-    // with a qualified label, such as a film and the city it is named after.
     let concrete_types = |c: &Value| -> std::collections::BTreeSet<String> {
         c["types"]
             .as_array()
             .into_iter()
             .flatten()
             .filter_map(Value::as_str)
-            .filter_map(local)
-            .filter(|t| !matches!(t.as_str(), "Thing" | "Resource" | "NamedIndividual"))
+            .filter(|iri| {
+                !matches!(
+                    *iri,
+                    "http://www.w3.org/2002/07/owl#Thing"
+                        | "http://www.w3.org/2000/01/rdf-schema#Resource"
+                        | "http://www.w3.org/2002/07/owl#NamedIndividual"
+                )
+            })
+            .map(str::to_owned)
             .collect()
     };
     let selected_types = concrete_types(candidate);
-    if candidates.iter().enumerate().any(|(i, c)| {
-        i != *index && !taxonomic(c) && selected_types.is_disjoint(&concrete_types(c))
-    }) {
+    if selected_types.is_empty()
+        || taxonomic(candidate)
+        || !matching_label(candidate, &normalized)
+        || types
+            .iter()
+            .filter_map(Value::as_str)
+            .any(|t| t.to_lowercase().contains("disambiguation"))
+        || candidates.iter().enumerate().any(|(i, c)| {
+            i != *index
+                && !taxonomic(c)
+                && (matching_label(c, &normalized)
+                    || c["matchedBy"]
+                        .as_array()
+                        .into_iter()
+                        .flatten()
+                        .any(|m| m == "exact" || m == "normalized"))
+        })
+    {
+        return None;
+    }
+    // A different kind of substantive entity can be the intended namesake even
+    // with a qualified label, such as a film and the city it is named after.
+    if candidates
+        .iter()
+        .enumerate()
+        .any(|(i, c)| i != *index && !taxonomic(c) && selected_types != concrete_types(c))
+    {
         return None;
     }
     // A canonical lexical match cannot overrule a person explicitly naming a kind.
     if let Some(pos) = q.find(&mention.to_lowercase()) {
-        let before =
-            q[..pos].trim_end_matches(|c: char| c.is_whitespace() || matches!(c, '\'' | '"' | '“'));
+        let before = q[..pos].trim_end_matches(|c: char| {
+            c.is_whitespace() || matches!(c, '\'' | '"' | '“' | '‘' | '’')
+        });
         let before = before
             .strip_suffix("called")
             .or_else(|| before.strip_suffix("named"))
@@ -201,6 +246,19 @@ pub(super) fn preferred_candidate(
 mod tests {
     use super::*;
     use serde_json::json;
+    fn preferred_candidate(mention: &str, question: &str, candidates: &[Value]) -> Option<usize> {
+        preferred_display_candidate(
+            mention,
+            question,
+            candidates,
+            &json!({
+                "dbr":"http://dbpedia.org/resource/", "dbc":"http://dbpedia.org/resource/Category:",
+                "dbo":"http://dbpedia.org/ontology/", "skos":"http://www.w3.org/2004/02/skos/core#",
+                "owl":"http://www.w3.org/2002/07/owl#", "rdf":"http://www.w3.org/1999/02/22-rdf-syntax-ns#",
+                "rdfs":"http://www.w3.org/2000/01/rdf-schema#"
+            }),
+        )
+    }
     fn candidates() -> Vec<Value> {
         vec![
             json!({"iri":"<http://dbpedia.org/resource/Category:Salt_Lake_City>","label":"Salt Lake City","types":["skos:Concept"]}),
@@ -360,5 +418,50 @@ mod tests {
         assert_eq!(balanced_entries(&Value::Null, &relevant, 4).len(), 4);
         assert_eq!(balanced_entries(&common, &Value::Null, 4).len(), 4);
         assert!(balanced_entries(&common, &relevant, 0).is_empty());
+    }
+    #[test]
+    fn display_preference_respects_type_namespaces_and_rival_match_evidence() {
+        let c = vec![
+            json!({"iri":"dbr:Berlin","label":"Berlin","types":["dbo:City"]}),
+            json!({"iri":"<http://other.example/Berlin>","label":"Berlin","types":["<http://example.org/Concept>"]}),
+        ];
+        assert_eq!(preferred_candidate("Berlin", "What is Berlin?", &c), None);
+        let c = vec![
+            json!({"iri":"dbr:Dune","label":"Dune","types":["dbo:Novel","dbo:Work"]}),
+            json!({"iri":"dbr:Dune_(film)","label":"Dune (film)","types":["dbo:Film","dbo:Work"]}),
+            json!({"iri":"dbc:Dune","label":"Dune","types":["skos:Concept"]}),
+        ];
+        assert_eq!(preferred_candidate("Dune", "Who directed Dune?", &c), None);
+        let c = vec![
+            json!({"iri":"dbr:Berlin","label":"Berlin","types":["dbo:City"]}),
+            json!({"iri":"dbr:Berlin_(town)","label":"Berlin (town)","types":["dbo:City"],"matchedBy":["exact"]}),
+            json!({"iri":"dbc:Berlin","label":"Berlin","types":["skos:Concept"]}),
+        ];
+        assert_eq!(preferred_candidate("Berlin", "Where is Berlin?", &c), None);
+        assert_eq!(
+            preferred_candidate(
+                "Salt Lake City",
+                "Who wrote the book ‘Salt Lake City’?",
+                &candidates()
+            ),
+            None
+        );
+    }
+
+    #[test]
+    fn rebound_vocabulary_prefix_is_not_a_standard_taxonomy_type() {
+        let c = vec![
+            json!({"iri":"<http://example.org/Berlin>","label":"Berlin","types":["<http://example.org/City>"]}),
+            json!({"iri":"<http://other.example/Berlin>","label":"Berlin","types":["skos:Concept"]}),
+        ];
+        assert_eq!(
+            preferred_display_candidate(
+                "Berlin",
+                "Berlin?",
+                &c,
+                &json!({"skos":"http://example.org/"})
+            ),
+            None
+        );
     }
 }

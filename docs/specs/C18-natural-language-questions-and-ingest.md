@@ -5425,12 +5425,13 @@ its class and predicate budget for common vocabulary. Both context sizes use thi
 The reports remain immutable and a caller with a restricted graph view cannot read terms
 from an unrestricted cached report.
 
-Ask can resolve ambiguity introduced by a category when one substantive typed resource
-has a matching visible label and unqualified name. Another substantive candidate with
-the same label, a disambiguation page, a generic owl:Thing without a more specific type,
-a different substantive kind, or a category-free namesake choice keeps the clarification.
-The chosen resource is stated as an assumption in the grounding event, draft and final result. The generic link_entities
-contract and explicit clarification answers remain unchanged.
+Ask can prefer a resource in the order of the offered clarification choices. The
+preference resolves namespaces using the tool's prefix map, keeps different visible
+concrete types separate, respects reported exact matches beyond the displayed labels and
+handles the quote forms that mention extraction accepts. It never changes an ambiguous
+verdict, suppresses a clarification or makes a heuristic link exact. Candidate, type and
+alternate-label displays are bounded and do not establish uniqueness. C22 routing and the
+generic link_entities contract retain their original verdicts.
 
 Offline checks use independently retrieved DBpedia predicate counts and declared English
 property labels, plus the saved public-set questions. Gold predicate constants are read
@@ -5442,11 +5443,11 @@ languages. The reference inventory expands the predicate shorthand `a` and masks
 literals and comments before reading gold IRI references. Pure lexical replacement
 retrieved 133 and was rejected because it displaced common structural terms.
 
-The saved paid run supplies 142 distinct clarification choice sets for a separate
-candidate-choice replay. The guarded selector resolves 7 and agrees with 5 saved choices.
-The other two saved choices use gold-word ties. Displayed choices omit alternate labels,
-and gold-word tie choices do not establish either selection's correctness. The
-replay does not measure candidate retrieval or the complete Ask pipeline. A harmful
-city-over-film preference found in an earlier draft now remains a clarification. No new
-provider calls were made. Item 263 remains open for context-sensitive namesake ranking and an end-to-end accuracy and
-latency evaluation.
+The saved paid run supplies 142 distinct clarification choice sets for separate display
+ranking checks. Their displayed choices omit alternate labels, and gold-word tie choices
+do not establish either selection's correctness. A prototype that automatically resolved
+some choices was rejected because omitted candidates, types and labels could hide a
+necessary clarification. Every ambiguous mention now retains its offered choices and
+stops before drafting. No new provider calls were made. Item 263 remains open for a
+complete visibility-safe evidence contract, context-sensitive namesake resolution and an
+end-to-end accuracy and latency evaluation.

@@ -2475,10 +2475,9 @@ answer accuracy or latency. The model figures above have not been rerun with thi
 retrieval or the conservative resource/category ranking. The
 [offline record](benchmarks/2026-10-25-ask-grounding-offline.json) gives the source
 digests, per-question retrieval counts and the exact link to the old prompt's vocabulary.
-Its separate candidate-choice replay resolves 7 of 142 saved choice sets, agreeing with
-5 saved choices. The other two saved choices use gold-word ties, so neither choice is
-independently established as correct. Displayed choices omit alternate labels, and this
-replay does not measure candidate retrieval or end-to-end answers.
+The resource preference only orders offered choices. An ambiguous mention still asks for
+a clarification, since the displayed candidate, type and alternate-label lists can be
+truncated. This ranking has no measured answer-accuracy claim.
 
 ### Global answering
 

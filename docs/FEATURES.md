@@ -961,10 +961,10 @@ build community reports.
   them. The server detects structured output per model and falls back to JSON mode and
   plain text.
 * Ask keeps half of its schema budget for common vocabulary and retrieves the rest by
-  matching the question against every visible class and predicate. A uniquely named,
-  typed resource can take precedence over its category, with a recorded assumption.
-  Disambiguation pages and substantive candidates with the same label still ask for a
-  clarification. The generic `link_entities` verdict is unchanged.
+  matching the question against every visible class and predicate. A guarded resource
+  preference can reorder the choices offered for an ambiguous mention. Every ambiguous
+  mention still asks for a clarification, because displayed candidates, types and labels
+  can be truncated. The generic `link_entities` verdict is unchanged.
 * `POST /{ds}/ask` runs as the caller and streams each step as a server-sent event, or
   answers one JSON object ([API.md](API.md#asking-in-the-server)). `assistant.json`,
   through `/$/assistant/{ds}`, turns the assistant on for a dataset and sets what may leave
