@@ -167,6 +167,28 @@ build community reports.
   `recall` with `communities`, the brief, `sparkles graphrag` and the UI's Communities tab
   expose them.
 
+### Valid-time profile
+
+The version 1 [valid-time resources](../../crates/sparkles/resources/valid-time/v1/README.md)
+provide an RDF vocabulary, SHACL shapes, an import normalization contract and typed
+stored-query definitions. The library exposes them through
+`sparkles::valid_time::profile(1)`. Unknown versions return `None`. Applications can
+install the active-claim and overlapping-claim templates through the existing stored
+query API and apply the shapes using ordinary SHACL validation.
+
+Intervals are half-open and preserve uncertain, unknown and explicitly unbounded
+endpoints. Query rows retain the claim, source revision, interval, temporal verdict
+and normalization status. A temporal match does not assert the claim's proposition
+or establish its acceptance. Recorded history still selects an actual retained commit;
+valid-time parameters do not change the meaning of `at`.
+
+C27 Phase 1 remains incomplete. The resources cannot authenticate local availability
+or refuse client backdating of an ordinary RDF timestamp. That A4 acceptance requirement
+needs C25's planned server-owned receipts and the shared protected-write boundary, or
+a separately reviewed runtime helper. Publication dates and arbitrary receipt triples
+do not establish a knowledge cutoff. The projection helper, event-time UI and expiry
+integration remain planned under item 341.
+
 ## Known gaps
 
 These limits name the roadmap items that address them. Current priorities and
@@ -211,9 +233,10 @@ dependencies are recorded in the [central roadmap](../ROADMAP.md).
 * Maintained analysis records with reproducible inputs, read dependencies and guarded
   result publication are planned in [F22](../specs/F22-analysis-lifecycle.md), roadmap item
   340. Existing reasoner and view maintenance does not provide that application lifecycle.
-* Valid-time profiles, uncertain interval matching, availability cutoffs and an event-time
-  control are planned in [C27](../specs/C27-valid-time-profiles.md), roadmap item 341.
-  Current time travel selects retained commits, with domain validity queried as data.
+* The [valid-time profile](#valid-time-profile) supplies static resources and temporal
+  queries. C27 Phase 1 remains incomplete until server-owned availability and backdating
+  refusal pass A4, dependent on C25 Phase 2 and protected writes. The runtime projection
+  helper, event-time control and expiry integration remain roadmap item 341.
 * A dataset has one GraphRAG configuration, so readers with different views cannot each
   have reports built from their own view, roadmap item 100. The evaluation of global
   answering covers one generated question set on the demo graph, compares it with BM25

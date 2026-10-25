@@ -4,6 +4,12 @@
 
 ### Changed
 
+The version 1 valid-time resource profile supplies RDF vocabulary, SHACL shapes, an
+import normalization contract and typed active-claim and overlapping-claim stored-query
+definitions. It preserves uncertain endpoints and temporal verdicts without asserting
+the claim's proposition. C27 Phase 1 remains incomplete until server-owned availability
+and backdating refusal pass A4; ordinary RDF timestamps do not authenticate that boundary.
+
 Rust query callback bookkeeping remains available while thread-local owners are
 destroyed. Late snapshots and callbacks retain the existing family and captured-view
 checks, including sticky failures for a transaction retained by an earlier owner.

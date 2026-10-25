@@ -1,0 +1,32 @@
+PREFIX vt: <urn:x-sparkles:valid-time:>
+PREFIX ev: <urn:x-sparkles:evidence:>
+PREFIX prov: <http://www.w3.org/ns/prov#>
+
+SELECT ?claim ?interval ?sourceRevision ?verdict ?normalizationStatus
+WHERE {
+  FILTER(REGEX(STR(?validAt), "(Z|[+-][0-9]{2}:[0-9]{2})$"))
+  GRAPH ?claimGraph {
+    ?claim a ev:Claim ; prov:wasDerivedFrom ?sourceRevision .
+    OPTIONAL {
+      ?claim vt:validDuring ?interval .
+      OPTIONAL { ?interval vt:normalization/vt:status ?status }
+      OPTIONAL { ?interval vt:start/vt:kind ?sk }
+      OPTIONAL { ?interval vt:end/vt:kind ?ek }
+      OPTIONAL { ?interval vt:start/vt:earliest ?s0 }
+      OPTIONAL { ?interval vt:start/vt:latest ?s1 }
+      OPTIONAL { ?interval vt:end/vt:earliest ?e0 }
+      OPTIONAL { ?interval vt:end/vt:latest ?e1 }
+    }
+  }
+  BIND(COALESCE(?status, vt:Missing) AS ?normalizationStatus)
+  BIND(IF(?normalizationStatus != vt:Normalized, "unknown",
+    IF(COALESCE((?sk = vt:Known && ?validAt < ?s0) || (?ek = vt:Known && ?validAt >= ?e1), false), "outside",
+      IF(!BOUND(?sk) || !BOUND(?ek) || ?sk = vt:Unknown || ?ek = vt:Unknown, "unknown",
+        IF(COALESCE((?sk = vt:Unbounded || (?sk = vt:Known && ?s1 <= ?validAt)) && (?ek = vt:Unbounded || (?ek = vt:Known && ?validAt < ?e0)), false), "definite", "possible")))) AS ?verdict)
+  FILTER(?policy = "all" ||
+    (?policy = "definiteOnly" && ?verdict = "definite") ||
+    (?policy = "possibleOrDefinite" && ?verdict IN ("possible", "definite")) ||
+    (?policy = "outsideOnly" && ?verdict = "outside") ||
+    (?policy = "unknownOnly" && ?verdict = "unknown"))
+}
+ORDER BY ?claim ?interval

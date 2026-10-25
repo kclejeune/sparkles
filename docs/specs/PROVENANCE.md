@@ -326,6 +326,8 @@ Read the [provenance record](C24-json-query-languages.md#provenance).
 ## Evidence, durable work and maintained analysis
 
 Read the [provenance record](shared/PROVENANCE.md#evidence-durable-work-and-maintained-analysis).
+[C27](C27-valid-time-profiles.md#provenance) also records the pinned temporal fixture
+sources and their resource-only scope.
 
 ## Personal ChatGPT-plan model access
 

@@ -1,0 +1,52 @@
+@prefix vt: <urn:x-sparkles:valid-time:> .
+@prefix rdf: <http://www.w3.org/1999/02/22-rdf-syntax-ns#> .
+@prefix rdfs: <http://www.w3.org/2000/01/rdf-schema#> .
+@prefix owl: <http://www.w3.org/2002/07/owl#> .
+
+<urn:x-sparkles:valid-time:profile:1> a owl:Ontology ;
+    owl:versionInfo "1" ; vt:profileVersion 1 ;
+    rdfs:comment "Resource profile for half-open validity and reported occurrence windows. It does not assert the propositions of claims or authenticate availability." .
+vt:Interval a rdfs:Class ; rdfs:comment "A nonempty half-open interval with independent endpoint envelopes." .
+vt:Boundary a rdfs:Class .
+vt:Normalization a rdfs:Class .
+vt:validDuring a rdf:Property ; rdfs:comment "Reported validity of a claim occurrence, independent of its acceptance." .
+vt:occurredDuring a rdf:Property ; rdfs:comment "A window in which an event occurred, not a claim that it lasted throughout the window." .
+vt:occurredAt a rdf:Property ; rdfs:comment "An exact event boundary, not a zero-length validity interval." .
+vt:start a rdf:Property .
+vt:end a rdf:Property .
+vt:kind a rdf:Property .
+vt:earliest a rdf:Property .
+vt:latest a rdf:Property .
+vt:precision a rdf:Property .
+vt:sourceValue a rdf:Property .
+vt:normalization a rdf:Property .
+vt:status a rdf:Property .
+vt:method a rdf:Property .
+vt:methodVersion a rdf:Property .
+vt:calendar a rdf:Property .
+vt:timezonePolicy a rdf:Property .
+vt:tzdbVersion a rdf:Property .
+vt:foldChoice a rdf:Property .
+vt:expiresAt a rdf:Property ; rdfs:comment "An assessment freshness deadline, independent of historical validity." .
+vt:Known a vt:BoundaryKind .
+vt:Unknown a vt:BoundaryKind .
+vt:Unbounded a vt:BoundaryKind .
+vt:Normalized a vt:NormalizationStatus ; rdfs:comment "The declared bounds, including explicit unknown or unbounded endpoints, are usable under this profile." .
+vt:Unresolved a vt:NormalizationStatus .
+vt:UnsupportedCalendar a vt:NormalizationStatus .
+vt:UnsupportedPrecision a vt:NormalizationStatus .
+vt:IndeterminateOrder a vt:NormalizationStatus .
+vt:NonexistentLocalTime a vt:NormalizationStatus .
+vt:Missing a vt:NormalizationStatus ; rdfs:comment "Query result marker for absent normalization metadata; not an importer status." .
+vt:Instant a vt:Precision .
+vt:Day a vt:Precision .
+vt:Month a vt:Precision .
+vt:Year a vt:Precision .
+vt:Gregorian a vt:Calendar .
+vt:profileVersion a rdf:Property .
+vt:contentDigest a rdf:Property .
+vt:resource a rdf:Property .
+vt:BoundaryKind a rdfs:Class .
+vt:NormalizationStatus a rdfs:Class .
+vt:Precision a rdfs:Class .
+vt:Calendar a rdfs:Class .

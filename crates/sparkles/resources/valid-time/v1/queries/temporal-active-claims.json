@@ -1,0 +1,27 @@
+{
+  "query": "PREFIX vt: <urn:x-sparkles:valid-time:>\nPREFIX ev: <urn:x-sparkles:evidence:>\nPREFIX prov: <http://www.w3.org/ns/prov#>\n\nSELECT ?claim ?interval ?sourceRevision ?verdict ?normalizationStatus\nWHERE {\n  FILTER(REGEX(STR(?validAt), \"(Z|[+-][0-9]{2}:[0-9]{2})$\"))\n  GRAPH ?claimGraph {\n    ?claim a ev:Claim ; prov:wasDerivedFrom ?sourceRevision .\n    OPTIONAL {\n      ?claim vt:validDuring ?interval .\n      OPTIONAL { ?interval vt:normalization/vt:status ?status }\n      OPTIONAL { ?interval vt:start/vt:kind ?sk }\n      OPTIONAL { ?interval vt:end/vt:kind ?ek }\n      OPTIONAL { ?interval vt:start/vt:earliest ?s0 }\n      OPTIONAL { ?interval vt:start/vt:latest ?s1 }\n      OPTIONAL { ?interval vt:end/vt:earliest ?e0 }\n      OPTIONAL { ?interval vt:end/vt:latest ?e1 }\n    }\n  }\n  BIND(COALESCE(?status, vt:Missing) AS ?normalizationStatus)\n  BIND(IF(?normalizationStatus != vt:Normalized, \"unknown\",\n    IF(COALESCE((?sk = vt:Known && ?validAt < ?s0) || (?ek = vt:Known && ?validAt >= ?e1), false), \"outside\",\n      IF(!BOUND(?sk) || !BOUND(?ek) || ?sk = vt:Unknown || ?ek = vt:Unknown, \"unknown\",\n        IF(COALESCE((?sk = vt:Unbounded || (?sk = vt:Known && ?s1 <= ?validAt)) && (?ek = vt:Unbounded || (?ek = vt:Known && ?validAt < ?e0)), false), \"definite\", \"possible\")))) AS ?verdict)\n  FILTER(?policy = \"all\" ||\n    (?policy = \"definiteOnly\" && ?verdict = \"definite\") ||\n    (?policy = \"possibleOrDefinite\" && ?verdict IN (\"possible\", \"definite\")) ||\n    (?policy = \"outsideOnly\" && ?verdict = \"outside\") ||\n    (?policy = \"unknownOnly\" && ?verdict = \"unknown\"))\n}\nORDER BY ?claim ?interval\n",
+  "description": "Select reported temporal validity without asserting or accepting the target proposition. Run on a pinned retained state.",
+  "parameters": {
+    "claimGraph": {
+      "type": "iri",
+      "description": "Authorized claim and interval metadata graph in the selected recorded state."
+    },
+    "policy": {
+      "type": "string",
+      "default": "possibleOrDefinite",
+      "enum": [
+        "all",
+        "definiteOnly",
+        "possibleOrDefinite",
+        "outsideOnly",
+        "unknownOnly"
+      ]
+    },
+    "validAt": {
+      "type": "dateTime",
+      "description": "Exact instant with explicit UTC offset. Offset-free selectors return no rows."
+    }
+  },
+  "results": "json",
+  "mcp": false
+}

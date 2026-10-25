@@ -192,7 +192,7 @@ implementation status.
 | [Shared evidence and review records](specs/C25-evidence-and-assessments.md) | Planned. | Item 81 specifies source revisions, unasserted claims and managed accepted projections. Existing memory writes retain their current scope. |
 | [Durable jobs and delivery](specs/C26-durable-jobs-and-delivery.md) | Planned. | Item 339 specifies checkpointed jobs, fenced workers and a transactional outbox. Current tasks and notifications do not provide that recovery contract. |
 | [Maintained analysis results](specs/F22-analysis-lifecycle.md) | Planned. | Item 340 specifies reproducible runs, dependency checks, freshness and guarded publication. |
-| [Valid-time queries and event history](specs/C27-valid-time-profiles.md) | Planned. | Item 341 specifies uncertain validity intervals and availability cutoffs. Existing history selects recorded commits. |
+| [Valid-time queries and event history](ai/README.md#valid-time-profile) | Partially complete. | Versioned RDF resources, SHACL shapes and temporal stored-query templates are available. Phase 1 still requires authenticated availability and backdating refusal. The projection helper, event-time UI and expiry integration remain planned. |
 | [Reports for distinct audiences](specs/C22b-report-configurations.md) | Planned. | Item 100 specifies multiple guarded GraphRAG configurations and shared budget enforcement. |
 | [ChatGPT-plan model access](specs/C28-chatgpt-model-access.md) | Planned. | Item 344 specifies personal sign-in, protected connections and Responses streaming. Existing OpenAI-compatible providers use API keys. |
 | [Batched updates and triggers](specs/C23-batched-updates-and-triggers.md) | Planned. | Item 36 specifies batched work and commit-trigger authoring. |

@@ -1,0 +1,69 @@
+@prefix vt: <urn:x-sparkles:valid-time:> .
+@prefix sh: <http://www.w3.org/ns/shacl#> .
+@prefix xsd: <http://www.w3.org/2001/XMLSchema#> .
+
+<urn:x-sparkles:valid-time:shapes:1> vt:profileVersion 1 .
+
+vt:DateTimeShape a sh:NodeShape ; sh:datatype xsd:dateTime ;
+    sh:pattern "(Z|[+-][0-9]{2}:[0-9]{2})$" .
+
+vt:BoundaryShape a sh:NodeShape ;
+    sh:targetClass vt:Boundary ; sh:targetObjectsOf vt:start, vt:end, vt:occurredAt ;
+    sh:nodeKind sh:BlankNodeOrIRI ; sh:class vt:Boundary ;
+    sh:property [ sh:path vt:kind ; sh:minCount 1 ; sh:maxCount 1 ; sh:in (vt:Known vt:Unknown vt:Unbounded) ] ;
+    sh:property [ sh:path vt:sourceValue ; sh:maxCount 1 ] ;
+    sh:property [ sh:path vt:precision ; sh:nodeKind sh:IRI ; sh:maxCount 1 ] ;
+    sh:or (
+        [ sh:property [ sh:path vt:kind ; sh:hasValue vt:Known ] ;
+          sh:property [ sh:path vt:earliest ; sh:minCount 1 ; sh:maxCount 1 ; sh:node vt:DateTimeShape ] ;
+          sh:property [ sh:path vt:latest ; sh:minCount 1 ; sh:maxCount 1 ; sh:node vt:DateTimeShape ] ;
+          sh:property [ sh:path vt:sourceValue ; sh:minCount 1 ] ;
+          sh:property [ sh:path vt:precision ; sh:minCount 1 ] ]
+        [ sh:property [ sh:path vt:kind ; sh:in (vt:Unknown vt:Unbounded) ] ;
+          sh:property [ sh:path vt:earliest ; sh:maxCount 0 ] ;
+          sh:property [ sh:path vt:latest ; sh:maxCount 0 ] ]
+    ) ;
+    sh:sparql [ sh:message "An endpoint envelope cannot be reversed." ;
+        sh:select """PREFIX vt: <urn:x-sparkles:valid-time:>
+SELECT $this WHERE { $this vt:earliest ?a ; vt:latest ?b . FILTER(?a > ?b) }""" ] .
+
+vt:NormalizationShape a sh:NodeShape ; sh:targetClass vt:Normalization ;
+    sh:targetObjectsOf vt:normalization ; sh:nodeKind sh:IRI ; sh:class vt:Normalization ;
+    sh:property [ sh:path vt:status ; sh:minCount 1 ; sh:maxCount 1 ;
+        sh:in (vt:Normalized vt:Unresolved vt:UnsupportedCalendar vt:UnsupportedPrecision vt:IndeterminateOrder vt:NonexistentLocalTime) ] ;
+    sh:property [ sh:path vt:method ; sh:minCount 1 ; sh:maxCount 1 ; sh:nodeKind sh:IRI ] ;
+    sh:property [ sh:path vt:methodVersion ; sh:minCount 1 ; sh:maxCount 1 ; sh:datatype xsd:string ; sh:minLength 1 ] ;
+    sh:property [ sh:path vt:calendar ; sh:minCount 1 ; sh:maxCount 1 ; sh:nodeKind sh:IRI ] ;
+    sh:property [ sh:path vt:timezonePolicy ; sh:maxCount 1 ; sh:datatype xsd:string ; sh:minLength 1 ] ;
+    sh:property [ sh:path vt:tzdbVersion ; sh:maxCount 1 ; sh:datatype xsd:string ; sh:minLength 1 ] ;
+    sh:property [ sh:path vt:foldChoice ; sh:maxCount 1 ; sh:in ("earlier" "later") ] ;
+    sh:sparql [ sh:message "Normalized version 1 values require the Gregorian calendar." ;
+        sh:select """PREFIX vt: <urn:x-sparkles:valid-time:>
+SELECT $this WHERE { $this vt:status vt:Normalized ; vt:calendar ?calendar . FILTER(?calendar != vt:Gregorian) }""" ] ;
+    sh:sparql [ sh:message "A named-zone fold choice requires a timezone policy and pinned database version." ;
+        sh:select """PREFIX vt: <urn:x-sparkles:valid-time:>
+SELECT $this WHERE {
+  $this vt:foldChoice ?choice .
+  FILTER NOT EXISTS { $this vt:timezonePolicy ?policy ; vt:tzdbVersion ?version }
+}""" ] .
+
+vt:IntervalShape a sh:NodeShape ; sh:targetClass vt:Interval ;
+    sh:targetObjectsOf vt:validDuring, vt:occurredDuring ; sh:nodeKind sh:IRI ; sh:class vt:Interval ;
+    sh:property [ sh:path vt:start ; sh:minCount 1 ; sh:maxCount 1 ; sh:node vt:BoundaryShape ] ;
+    sh:property [ sh:path vt:end ; sh:minCount 1 ; sh:maxCount 1 ; sh:node vt:BoundaryShape ] ;
+    sh:property [ sh:path vt:normalization ; sh:minCount 1 ; sh:maxCount 1 ; sh:node vt:NormalizationShape ] ;
+    sh:sparql [ sh:message "temporal-indeterminate-order: latest start must precede earliest end." ;
+        sh:select """PREFIX vt: <urn:x-sparkles:valid-time:>
+SELECT $this WHERE { $this vt:start/vt:latest ?start ; vt:end/vt:earliest ?end . FILTER(?start >= ?end) }""" ] .
+
+vt:ValidityShape a sh:NodeShape ; sh:targetSubjectsOf vt:validDuring ;
+    sh:nodeKind sh:IRI ; sh:property [ sh:path vt:validDuring ; sh:maxCount 1 ; sh:node vt:IntervalShape ] .
+
+vt:EventInstantShape a sh:NodeShape ; sh:targetSubjectsOf vt:occurredAt ;
+    sh:property [ sh:path vt:occurredAt ; sh:maxCount 1 ; sh:node vt:BoundaryShape ] ;
+    sh:sparql [ sh:message "An event instant must have equal known bounds." ;
+        sh:select """PREFIX vt: <urn:x-sparkles:valid-time:>
+SELECT $this WHERE {
+  $this vt:occurredAt ?b .
+  FILTER NOT EXISTS { ?b vt:kind vt:Known ; vt:earliest ?a ; vt:latest ?z . FILTER(?a = ?z) }
+}""" ] .

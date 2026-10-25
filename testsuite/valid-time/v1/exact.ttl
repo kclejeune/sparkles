@@ -1,0 +1,20 @@
+@prefix vt: <urn:x-sparkles:valid-time:> .
+@prefix ev: <urn:x-sparkles:evidence:> .
+@prefix prov: <http://www.w3.org/ns/prov#> .
+@prefix rdf: <http://www.w3.org/1999/02/22-rdf-syntax-ns#> .
+@prefix xsd: <http://www.w3.org/2001/XMLSchema#> .
+@prefix ex: <urn:test:> .
+
+ex:exact a ev:Claim ; prov:wasDerivedFrom ex:revision ; vt:validDuring ex:interval ;
+    rdf:reifies <<( ex:item ex:relatedTo ex:thing )>> .
+ex:interval a vt:Interval ; vt:start ex:s ; vt:end ex:e ; vt:normalization ex:n .
+ex:s a vt:Boundary ; vt:kind vt:Known ;
+    vt:earliest "2026-01-01T00:00:00.000000001Z"^^xsd:dateTime ;
+    vt:latest "2026-01-01T00:00:00.000000001Z"^^xsd:dateTime ;
+    vt:sourceValue "2025-12-31T19:00:00.000000001-05:00" ; vt:precision vt:Instant .
+ex:e a vt:Boundary ; vt:kind vt:Known ;
+    vt:earliest "2026-01-01T00:00:00.000000002Z"^^xsd:dateTime ;
+    vt:latest "2026-01-01T00:00:00.000000002Z"^^xsd:dateTime ;
+    vt:sourceValue "2026-01-01T00:00:00.000000002Z" ; vt:precision vt:Instant .
+ex:n a vt:Normalization ; vt:status vt:Normalized ; vt:method ex:explicit-offset ;
+    vt:methodVersion "1" ; vt:calendar vt:Gregorian .
