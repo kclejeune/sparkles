@@ -132,6 +132,16 @@ evaluation clock and C27 temporal selectors. A model request records its prompt 
 provider configuration identities subject to the caller's access and retention policy.
 Reproducibility does not promise deterministic output from a remote model.
 
+When inferred inputs are selected, the manifest also records C08's materialization
+source commit, source graph selection, program identity and freshness at the pinned
+view. Pinning a recent dataset commit does not make an older materialization fresh.
+The default input policy refuses stale or unknown materialized inputs. An explicit
+policy may retain them for a limited historical assessment, but the limitation and
+inherited stale or unknown state must appear in the result and prevent current
+publication. A later materialization does not retroactively change that run's inputs.
+A new run against fresh inferred inputs is required. Demand derivation records its
+exact visible snapshot and program under the same rule.
+
 Phase 1 accepts one input dataset branch per definition, initially `main`. External
 source revisions must already be imported or named by immutable artifact references.
 Several datasets can be represented as independent pinned inputs in a later phase,
@@ -158,6 +168,14 @@ external worker supplies a declared upper bound at definition time and may narro
 only through a registered, tested dependency proof. A citation list alone is never
 accepted as the footprint. Unknown or data-dependent reads use the whole selected
 visible input scope.
+
+The footprint also covers dependencies of the caller's visibility, even when those
+facts are outside the selected business input graphs. This includes data-dependent
+protection patterns, class membership used by a protection, schema rewrites and
+transitive disclosure guards. An unchanged policy definition or access fingerprint
+does not prove the visible data unchanged. Phase 1 conservatively treats any dataset
+change as relevant under data-dependent protections unless a tested dependency analysis
+proves it disjoint. Excluded control graphs can be ignored only after the same proof.
 
 An ordinary input change intersecting the footprint makes the assessment stale. A
 change proved disjoint may advance the checked frontier without recomputation. A gap
@@ -209,6 +227,14 @@ The initial implementation does not expose an assessment as current merely becau
 its queued refresh has not started. While consumers lag, reads must either prove the
 intervening footprint disjoint within a bounded check, or downgrade freshness to
 unknown. A durable subscriber cannot offer synchronous freshness by assumption.
+
+Publication and every freshness read also compare the assessment's recorded expiry
+and evaluation horizon with one resolved request clock. Reaching a definite deadline
+immediately downgrades current to stale, independently of when a queued timer executes.
+Uncertain expiry produces unknown when the policy cannot prove the result still valid.
+A historical read states its evaluation clock and recorded freshness and cannot reuse
+that historical label as a current assessment. A timer schedules maintenance; it is
+not the authority that makes expiration occur.
 
 C27 expiry and scheduled observation windows create durable invalidation timers.
 Timers refer to a definition revision and interval identity, so an old timer cannot
@@ -302,6 +328,14 @@ unsafe operations. No unversioned auxiliary persistence is allowed.
 | A10. A validity boundary passes during downtime. | Recovery queues its durable invalidation before treating the assessment as current. |
 | A11. A model proposes an actor connection. | The result remains a hypothesis with its method and sources. Review alone cannot turn it into an observation. |
 | A12. A report cites a generated report. | Its lineage reaches original evidence. It does not count the generated report as independent corroboration. |
+
+Additional acceptance cases add an ownership fact outside the selected inventory
+graph that changes a data-dependent protection, delay an expiry job beyond its
+assessment deadline, and select a stale materialization at a recent dataset commit.
+The first must invalidate the visible-count assessment, the second must stop returning
+current at the deadline even with no commits, and the third must refuse current
+publication or explicitly preserve inherited stale input state. Each case has a
+positive control with unchanged visible inputs, a future deadline or a fresh inference.
 
 Tests use a deterministic clock, fault injection at publication and queue boundaries,
 and separate principals with hidden supports. Differential tests compare incremental

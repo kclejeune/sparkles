@@ -301,6 +301,27 @@ gate are outside the downgrade boundary. Unmanaged evidence RDF remains readable
 ordinary grants, while future unknown profile versions are not writable through these
 operations.
 
+All profile-managed source, rendition, passage, claim, assessment, evidence-link,
+identity and review-decision graphs have typed writers. The same core admission
+check protects them from ordinary SPARQL Update, Graph Store writes, LOAD, RDF Patch,
+mapping output, imports, restore overlays and merges. Update permission permits a
+caller to submit an authorized typed operation, not to bypass that operation by
+mutating its RDF records directly. Internal batch imports use the same invariant checks.
+A typed operation appends immutable revisions and their provenance. It cannot replace
+an existing proposition, passage, evidence link or decision in place.
+
+The server authenticates availability receipts, review authors and protected creation
+fields. User-supplied copies of these predicates in unmanaged RDF are ordinary claims,
+not authenticated profile records. Resolvers and admission policies require a managed
+record and its verified publication origin. Raw namespace or class membership is
+insufficient. A matching IRI with conflicting content is refused rather than shadowing
+an authenticated record.
+
+Only an authorized retention or erasure operation can remove managed immutable content.
+It records the permitted audit state, invalidates affected projections and follows the
+retained-history limitations below. Detaching an accepted projection never turns its
+source or decision graphs into editable authenticated evidence.
+
 A proposal needs update rights for every graph it changes. A review needs the policy's
 review permission, read access to its complete evidence and update access to the
 decision and projection graphs. A caller cannot approve a decision using evidence it
@@ -362,6 +383,14 @@ partial claims or accepted triples after a failed check.
 | A13. Validity expires or a claim is withdrawn. | Historical evidence remains where permitted. Current admission and dependent freshness follow their explicit policies rather than changing truth implicitly. |
 | A14. A request is interrupted or retried. | It publishes either the complete operation or nothing. A retry with the same key cannot duplicate occurrence supports. |
 
+### Managed-write integrity acceptance
+
+Attempting to change an admitted claim's proposition, forge first availability or
+replace a review author through SPARQL, Graph Store, RDF Patch, import, mapping or
+merge must refuse before publication and leave accepted facts unchanged. An authorized
+successor operation creates a new record with separate admission. Unmanaged copies
+never resolve as authenticated records.
+
 Phase 1 ships vocabulary and shapes, valid and invalid RDF fixtures, mapping examples
 and deterministic competency queries. Parser and round-trip tests cover triple terms,
 directional language strings, precise literals and source selectors. Phase 2 adds
@@ -383,12 +412,6 @@ Automatic owl:sameAs links would make reversible matching into global logical id
 A separate evidence database would complicate transactional review and graph access.
 This design uses ordinary RDF with explicit profile operations instead.
 
-## Outcome
-
-This feature is specified and unimplemented. The existing C17 assertions and C18 source
-records retain their shipped behavior. No vocabulary, setting, claims endpoint or
-managed projection described here is available until its phase is implemented.
-
 ## Sources
 
 - [RDF 1.2 Concepts, Candidate Recommendation Snapshot](https://www.w3.org/TR/2026/CR-rdf12-concepts-20260407/)
@@ -402,3 +425,9 @@ managed projection described here is available until its phase is implemented.
 - The design also uses the existing contracts of C17, C18, C19, CI, F05, F06, F09,
   C12 and C12b. No external implementation is adopted and no runtime dependency is added
   by this specification.
+
+## Outcome
+
+This feature is specified and unimplemented. The existing C17 assertions and C18 source
+records retain their shipped behavior. No vocabulary, setting, claims endpoint or
+managed projection described here is available until its phase is implemented.

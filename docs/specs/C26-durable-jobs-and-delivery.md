@@ -182,12 +182,21 @@ events. Each registered kind defines exactly which results and transitions are l
 It cannot submit arbitrary protected graph mutations as part of its payload.
 
 The library publisher takes the dataset writer and rechecks the lease, cancellation,
-authorization and definition revision. F22 checks whether the declared input footprint
-changed after the pinned source commit. A lease or checkpoint commit advances the head,
-so the test cannot simply require the head to equal the original input commit. Only
-control graphs declared outside the input scope may be ignored. If a bounded footprint
-check cannot establish freshness under the writer, publication refuses and requires a
-new run. No estimate of freshness can authorize publication.
+authorization and definition revision. Publication preconditions belong to the
+registered operation kind. A maintained analysis uses F22's unchanged-input and
+freshness checks. A C23 batch instead verifies its pinned iterator identity, fenced
+batch position, prior checkpoint and current write preconditions. It intentionally
+applies each batch to current data and must not reject a later batch merely because
+its own earlier effects changed the iterator's original query inputs.
+
+For an F22 publication, the check covers the declared read footprint, including
+visibility dependencies, inferred-input freshness and expiry. A lease or checkpoint
+commit advances the head, so the test cannot simply require the head to equal the
+original input commit. Only control graphs proved outside the full input and protection
+footprint may be ignored. If a bounded check cannot establish freshness under the
+writer, an analysis publication refuses and requires a new run. A collector or batch
+uses its own typed checkpoint and publication contract rather than inheriting the
+analysis check accidentally. No estimate can substitute for any required precondition.
 It validates outputs and budgets, then stages business quads, immutable publication
 record, source checkpoint, completion state and outbox entries in one transaction.
 The actual sequence is assigned under that writer and is the publication's commit.
@@ -389,6 +398,15 @@ Measure submission, renewal and publication overhead with no jobs, idle jobs and
 workers, including durable single-write latency, retained history, ledger growth and
 recovery time. Record the memory tradeoff of the ready index and the throughput impact
 of checkpoint frequency. No benchmark threshold is weakened without a roadmap follow-up.
+
+### Batch publication acceptance
+
+A C23 iterator selects items without a completion timestamp at its pinned initial
+commit. Batch one adds timestamps and advances its checkpoint atomically. Batch two
+must apply the next pinned solutions to the current dataset successfully, although
+batch one's writes changed the iterator query's source. A stale worker replaying batch
+one must still be fenced or return the original publication receipt. This distinguishes
+batch semantics from F22's changed-input refusal without weakening either contract.
 
 ## 9. Delivery phases
 

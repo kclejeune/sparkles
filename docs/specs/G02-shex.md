@@ -1,16 +1,12 @@
-# G02: ShEx 2.1 validation
+# G02: ShEx validation
 
-> **Status:** implemented in part (Phases 1 and 2; Phase 3 except ShEx 2.2)
+> **Status:** implemented in part, Phases 1 and 2 and most of Phase 3.
 >
-> **Phases:** Phase 1 is the `sparkles-shex` crate with ShExC and ShExJ, imports, shape
-> maps and stratified typing, plus `POST /{ds}/shex`, `sparkles shex validate|parse`, the
-> shexTest harness and `bench:shex`. Phase 2 is write-time ShEx validation with
-> `validation.json` format 2, ShExR, `SPARQL """…"""` selectors, the UI's SHACL | ShEx
-> switch and `bench:shex-write`. Four Phase 3 items are built: the MCP tools
-> `validate_shacl` and `validate_shex`, the interval matcher, which became the Phase 1
-> matcher, incremental guard validation, which propagates typing changes, and ShExR
-> schemas stored in named graphs for the guard. The guard also has a grandfather mode.
-> ShEx 2.2 (`EXTENDS`, `ABSTRACT`) is not built.
+> **Phases:** ShExC, ShExJ, ShExR, imports, shape maps, interval matching and write-time
+> validation are available, with persisted typing, incremental propagation and
+> grandfather mode. ShEx 2.2 `ABSTRACT` and `EXTENDS` are supported. `RESTRICTS` and
+> `EXACTLY` reference syntax remain outside the supported language subset. Combined
+> validation guards and the remaining selector controls are planned under item 54.
 >
 > **User docs:** [API: ShEx validation](../API.md#shex-validation) ·
 > [API: Write-time validation](../API.md#write-time-validation) ·
