@@ -25,9 +25,9 @@ Jena and Fuseki have the protocols, tools and operational model that RDF applica
 depend on, and QLever has an index and executor built for speed. Sparkles puts the first
 on top of the second:
 
-1. **Jena-compatible where users can see it.** Anything that talks to Fuseki keeps
-   working. Sparkles implements the SPARQL 1.1 Query, Update and Graph Store protocols,
-   Fuseki's endpoints and `/$/` admin API, Jena's formats and dataset semantics, and
+1. **Jena-compatible where users can see it.** Clients using the supported Fuseki
+   protocols can keep their existing request format. Sparkles implements the SPARQL 1.1
+   Query, Update and Graph Store protocols, Fuseki's endpoints and `/$/` admin API, Jena's formats and dataset semantics, and
    TDB2's model of bulk loads, transactions, compaction and backups. The JVM binding
    brings that compatibility into the application: open a Sparkles dataset and keep
    using Jena's `Model`, RIOT, `Txn` and `QueryExecution` APIs.
@@ -37,8 +37,9 @@ on top of the second:
    transactions, durable commits, online compaction and a history that can be read,
    diffed and branched.
 3. **Library first.** The engine is a library with no HTTP server. The server, the CLI
-   and the Python, JVM and Node.js bindings are built on its public API, so an embedded
-   program gets the same features as the server. The term model, parsers and SPARQL
+   and the Python, JVM and Node.js bindings use its public API and query semantics.
+   The [feature list](docs/FEATURES.md#libraries-and-bindings) identifies the administration
+   and integration surfaces each binding exposes. The term model, parsers and SPARQL
    algebra come from the Oxigraph project's crates.
 
 ## Highlights
@@ -78,7 +79,24 @@ on top of the second:
   limits and query budgets. See [Access control](docs/FEATURES.md#access-control-and-security).
 
 [docs/FEATURES.md](docs/FEATURES.md) lists every feature and the
-[known gaps](docs/FEATURES.md#known-gaps).
+[known gaps](docs/FEATURES.md#known-gaps), including compatibility differences from Jena.
+
+## Capability status
+
+These labels describe availability within the stated scope. The
+[capability status matrix](docs/FEATURES.md#capability-status) gives the full breakdown.
+In progress means implementation has started but has not shipped. A written design is
+planned, and unfinished later phases make an available capability partially complete.
+
+| Capability | Status | Available scope and remaining work |
+|---|---|---|
+| RDF and SPARQL conformance | Complete for the documented suites | The listed W3C suites pass. Jena extension and protocol differences remain documented separately. |
+| Reasoning and explanations | Partially complete | Materialization, demand reasoning, why and why-not, entailment diffs and minimal supports are available. Automatic reasoning selection and provenance-aware inferred visibility remain planned. |
+| Incremental views | Partially complete | Table views and live SSE queries work on main. Graph views, commit-time maintenance and per-fact provenance remain planned. |
+| GraphRAG and agent memory | Partially complete | Cited memory, community reports, global answering and change-feed refresh are available. Multiple report configurations and view-driven refresh remain planned. |
+| GeoSPARQL | Partially complete | Spatial indexes, joins and indexed nearest-neighbour ordering are available. Per-row nearest-neighbour joins and some geometry and CRS operations remain planned. |
+| Bindings and web UI | Partially complete | Embedded engines, administration handles and graph, map and history workflows are available. Remaining surfaces and UI phases are listed by feature. |
+| Shared evidence and maintained analysis | Planned | The shared evidence, durable jobs, valid-time, maintained-analysis and audience-specific report specifications have no implementation. |
 
 ## Performance
 
@@ -92,17 +110,21 @@ with result caches off, and every engine's answers were checked before timing.
 | Throughput with 16 clients, 10.5M triples | **239 q/s** | QLever 90, Fluree 22, Fuseki 12, Oxigraph 1.7 |
 | WatDiv geometric mean, 10.97M triples | **4.63 ms** | Fluree 6.97 ms, Fuseki 13.6 ms, Oxigraph 16.2 ms, QLever 17.9 ms |
 | Bulk load, English DBpedia, 1.24B triples | **480 s** | QLever 1,674 s, Fluree 2,919 s |
-| Queries, English DBpedia, 1.24B triples | **Faster than QLever** on all 29 warm queries both answer correctly | Faster than QLever on 29 of 31 cold queries |
+| Queries, English DBpedia, 1.24B triples | Lower times on 29 warm queries with agreeing qualified answer checks in the [comparative tables](docs/BENCHMARKS.md#dbpedia) | Lower times on 29 of 31 cold queries in that measurement contract |
 | LUBM(100) `q2`, 24.3M triples after OWL 2 RL closure | **26.8 ms** | QLever 60.6 ms in paired runs |
 
 Paired forge runs put Sparkles ahead of Jena on SP²Bench `q12a` and QLever on BSBM BI `q2`.
 Sparkles has a lower pooled time than Fluree on BSBM Explore `q5`, with the closest
 instance tied within 4%. Sparkles answers SP²Bench `q12b` within 8% of Oxigraph, inside
-the ten-percent tie band. Oxigraph commits single writes faster without synchronizing
-them to disk, with a median of 0.926 ms against 1.284 ms for a new literal at 10.5M
-triples. Sparkles also uses
-more memory than QLever at its peak in exchange for speed, 1,339 MiB against 939 MiB under
-16 readers at 10.5M triples, mostly for a 1 GiB decoded-block cache that can be made
+the ten-percent tie band. The
+[focused comparison](docs/BENCHMARKS.md#cursor-expression-reuse-controls) times complete
+HTTP responses. QLever remains about 3.0× faster warm and 2.5× faster cold on DBpedia 50M
+`births-by-decade`. The full-data cursor guard is an internal comparison and does not
+establish a current peer ranking. The
+[focused write assessment](docs/BENCHMARKS.md#serial-writes-with-reader-work) puts
+new-literal commits near 1.2 ms for Sparkles and 0.6 ms for unsynced Oxigraph at 10.5M
+triples. Sparkles also uses more memory than QLever at its peak in exchange for speed,
+1,339 MiB against 939 MiB under 16 readers at 10.5M triples, mostly for a 1 GiB decoded-block cache that can be made
 smaller. [docs/BENCHMARKS.md](docs/BENCHMARKS.md) has every measurement, the cost of each
 memory tradeoff and [every case where Sparkles loses](docs/BENCHMARKS.md#where-sparkles-loses).
 

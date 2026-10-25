@@ -4,20 +4,24 @@ This page reports how fast Sparkles loads, queries and writes RDF, how much memo
 disk it uses for that speed, and how its Python, JVM and Node.js bindings compare with
 the libraries they replace. The comparisons run the same data and queries on every engine,
 check every engine's answers before timing them, and list every case where Sparkles loses.
-[BENCHMARKING.md](BENCHMARKING.md) explains how to run the harnesses.
+[BENCHMARKING.md](BENCHMARKING.md) explains how to run the harnesses. The reference setup
+below applies unless a section specifies another host, limit or timing contract.
 
 | Measurement context | |
 |---|---|
 | Hardware | `forge` has an Intel Core i5-13500 with 6 performance and 8 efficiency cores and 20 threads, 16 GiB of RAM and an NVMe SSD. `atlas` has the same CPU and runs the bindings. A development laptop or a Namespace instance is used only where a section says so. |
-| OS and kernel | NixOS, Linux 6.18 |
+| OS and kernel | NixOS for the reference runs. Each measurement record identifies its kernel. |
 | Sparkles | 0.1.0, release builds with default features, rustc 1.98 and 1.99 |
 | Other engines | QLever 0.5.48, Fluree 4.2.2 (the release binary), Oxigraph 0.5.11 (server, pyoxigraph and the JavaScript package), Apache Jena TDB2 6.2.0 with Fuseki 5.1.0, Jena 5.6.0 (TDB2 and TIM in the JVM comparison), rdflib 7.6.0, N3.js 2.13.11 with Comunica 5.4.1 |
 | Dates | Each table names the host, the date and the build it comes from. A section that names no date comes from the runs of 2026-10-03 to 2026-10-09 on forge. |
 
-Every engine is timed alone under a 12 GiB memory limit, with the timing client on CPU 11
-and result caches off. [Methodology and reproduction](#methodology-and-reproduction) gives
-the settings of each engine and the commands that reproduce each table.
+Reference engine comparisons run alone under a 12 GiB memory limit, with the timing
+client on CPU 11 and result caches off. Full-data DBpedia, bindings, cloud measurements
+and model evaluations specify their own limits and placement. [Methodology and
+reproduction](#methodology-and-reproduction) gives the settings and commands for each
+comparison.
 
+* [Measurement coverage](#measurement-coverage)
 * [Summary](#summary)
 * [Where Sparkles loses](#where-sparkles-loses)
 * [Synthetic suite](#synthetic-suite)
@@ -37,6 +41,21 @@ the settings of each engine and the commands that reproduce each table.
 * [Natural-language questions](#natural-language-questions)
 * [Memory and disk](#memory-and-disk)
 * [Methodology and reproduction](#methodology-and-reproduction)
+
+## Measurement coverage
+
+Implementation status and measurement coverage are separate. An available capability
+can have no peer comparison, and an internal regression guard does not establish a
+ranking against another engine. [FEATURES](FEATURES.md#capability-status) lists complete,
+partially complete and planned implementation scope. No unshipped capability is marked
+in progress solely because its specification exists.
+
+| Area | Measurement status | Scope |
+|---|---|---|
+| Query, load and write comparisons | Measured with partial coverage | Published tables cover their named data, engines and timing contracts. Larger suites, sustained workloads and broader hardware remain open. |
+| Bindings and model-assisted workflows | Partial coverage | The listed APIs, models and question sets have measurements. Selected API controls and internal A/B runs do not replace a complete peer-suite refresh. |
+| Spatial and query-time reasoning comparisons | Unmeasured against peers | Conformance and internal measurements do not establish comparative performance. |
+| Shared evidence and maintained-analysis specifications | Planned and unmeasured | C25, C26, C27, F22 and C22b are designs, with no implementation or performance claim. |
 
 ## Summary
 
@@ -61,11 +80,15 @@ On larger and standard workloads:
 
 * **DBpedia at the 50M slice.** Among the 27 queries with complete, agreeing content
   checks across all five engines, Sparkles has the lowest median on 24 warm and 26 cold.
-  QLever wins `births-by-decade` by 4.9× warm and 1.7× cold, and Fluree is within 5% ahead
-  on two small warm queries.
+  Fluree is within 5% ahead on two small warm queries. The focused complete-HTTP
+  [cursor assessment](#cursor-expression-reuse-controls) puts `births-by-decade` at
+  50.2 versus QLever's 16.6 ms warm and 68.1 versus 27.6 ms cold, about 3.0× and 2.5×
+  slower. Its timing contract differs from the comparative TSV tables.
 * **DBpedia, 1.24 billion triples.** Sparkles loads English DBpedia in 480 s, against
-  QLever's 1,674 s and Fluree's 2,919 s. It is faster than QLever on all 29 warm queries
-  that both answer correctly and on 29 of 31 cold ones.
+  QLever's 1,674 s and Fluree's 2,919 s. The comparative tables report lower times than
+  QLever on 29 warm queries with agreeing qualified answer checks and on 29 of 31 cold
+  queries. The full-data cursor assessment is an internal A/B and does not establish
+  a current peer ranking for `births-by-decade`.
 * **WatDiv at 10.97M triples.** Sparkles is fastest on 19 of the 20 templates and ties
   Fluree on S7, with a geometric mean of 4.63 ms against 6.97 ms for Fluree, 13.6 ms for
   Fuseki, 16.2 ms for Oxigraph and 17.9 ms for QLever.
@@ -88,11 +111,12 @@ On larger and standard workloads:
   within float rounding. The paired `q2` median is 20.54 ms against QLever's 162.30 ms.
   QLever remains 1.24× faster on q3. No engine completes a driver throughput run with
   answers qualified against the others.
-* **Durable writes.** A commit that adds a new literal takes a median of 1.13 ms at 1.05M
-  and 1.28 ms at 10.5M, synchronized to disk before it is acknowledged. Oxigraph commits
-  faster without synchronizing in that harness. In the suite's churn of 5,000 commits,
-  Sparkles commits 878 and 909 per second at 1.05M and 10.5M, ahead of every other
-  engine.
+* **Durable writes.** The focused [write assessment](#serial-writes-with-reader-work)
+  puts new-literal commits near 1.2 ms for Sparkles and 0.6 ms for unsynced Oxigraph at
+  10.5M. Sparkles synchronizes before acknowledgement. With sixteen readers, Oxigraph
+  completes 2.1–3.0× as many writes but no reads in the thirty-second 10.5M window,
+  against Sparkles' 232–245 reads/s. The separate suite churn table records 878 and
+  909 Sparkles commits/s at 1.05M and 10.5M under its own contract.
 * **Bindings.** Through Jena's own API, Sparkles answers 24 of 28 suite queries faster
   than TDB2 and than Jena's in-memory store. The Python package is faster than pyoxigraph
   on 25 of 28, and the Node.js package is faster than Oxigraph's JavaScript package on 24
@@ -111,14 +135,14 @@ than 10%. Fluree's warm advantages on `distinct-obj` at 1.05M and on two small D
 | Case | Reference advantage | Qualification |
 |---|---|---|
 | WatDiv `L1-1`, 10.97M | Fluree 1.11× | Sparkles has the lowest mean on 19 of 20 templates, ties Fluree on S7 and leads on 81 of 88 instances. |
-| BSBM Explore `q7` and `q8`, 10M | Oxigraph 1.2× on `q7` and 1.4× on `q8` | Pooled medians cover three instances per template. Wrong answers are excluded from the ranking. |
+| BSBM Explore `q7` and `q8`, 10M | Oxigraph 1.2× on `q7` and 1.4× on `q8` | Pooled medians cover three instances per template. Unresolved result differences are excluded from the ranking. |
 | BSBM BI `q3`, 10M | QLever 1.24× | The three fixed-instance answer checks agree. The driver cells have not been rerun since [roadmap](ROADMAP.md) item 96 removed the budget refusal that failed them. |
 | Changed-store `two-hop-count`, 1.05M | Fluree 1.10× | Sparkles takes 8.6 ms against 7.8 ms with 5,000 changes in its delta, and 5.1 ms on the loaded store. |
-| Serial durable commits | Oxigraph 1.84× on literal inserts at 1.05M and 1.39× at 10.5M | The same durability difference. |
-| Writes during mixed load | Oxigraph 3.4× at 1.05M and 2.1× at 10.5M | Oxigraph serves far fewer concurrent reads. |
+| Serial durable commits | Unsynced Oxigraph about 2.0× on literal inserts at 10.5M in the focused assessment | Sparkles takes 1.167–1.254 ms against 0.594–0.625 ms. The separate suite latency table gives Oxigraph a 1.84× advantage at 1.05M under its sampling contract. |
+| Writes during mixed load | Oxigraph 3.4× at 1.05M in the suite and 2.1–3.0× at 10.5M in the focused assessment | Oxigraph completes no reads in the thirty-second window, while Sparkles completes 232–245 reads/s. Durability and completed reader work differ. |
 | Cold point lookups | Oxigraph 1.5–3.0× at 1.05M and 1.3–2.9× at 10.5M | Listed under [Cold starts](#cold-starts). |
 | Cold small scans at 1.05M | Fluree 1.17–3.0× on `count-all`, `contains`, `distinct-obj` and `employee-docs` | Fluree is not ahead on any cold query at 10.5M. |
-| DBpedia 50M slice `births-by-decade` | QLever 4.9× warm and 1.7× cold | Sparkles takes 54.4 ms warm and 71.4 ms cold. At 1.24 billion triples Sparkles is faster on this query. |
+| DBpedia 50M slice `births-by-decade` | QLever 3.0× warm and 2.5× cold in the complete-HTTP assessment | Sparkles takes 50.2 ms warm and 68.1 ms cold, against 16.6 and 27.6 ms. The comparative TSV tables use another timer contract, and the full-data internal guard establishes no current peer ranking. |
 | DBpedia cold `outlink-classes-2` | QLever 1.25× | Sparkles wins 29 of 31 cold queries. |
 | Server RSS after the run, 1.05M | QLever 1.32× | Without its block cache, Sparkles holds 345 MiB. Sparkles has the lowest RSS after the run at 10.5M. |
 | Peak RSS under 16 readers | QLever 1.67× at 1.05M and 1.43× at 10.5M | Sparkles peaks at 567 and 1,339 MiB, against 339 and 939 MiB. |
@@ -3075,8 +3099,9 @@ harness errors.
 * **Spatial and query-time reasoning.** GeoSPARQL workloads and query-time reasoning were
   not compared with other engines.
 * **Result caches.** All runs had result caches off.
-* **Other hardware.** Every comparison ran on one 20-thread machine with 15 GiB of usable
-  RAM.
+* **Other hardware.** Most engine comparisons use the reference Intel host. Cloud
+  per-call and development-laptop model evaluations are identified separately. Broad
+  hardware comparisons remain open.
 
 ### Reproducing
 
