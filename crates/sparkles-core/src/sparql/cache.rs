@@ -307,37 +307,27 @@ impl ResultCache {
     }
 }
 
-/// Same result for the same variable bindings (no RAND/NOW/UUID/BNODE/EXISTS).
+/// Same result for the same variable bindings across queries, without side effects.
 pub(crate) fn deterministic(e: &Expr) -> bool {
+    // The shared classifier is query-local. Cached results also outlive a query's
+    // clock, so check NOW separately in a second linear walk.
+    super::exprcache::impurity(e).is_none() && timeless(e)
+}
+
+fn timeless(e: &Expr) -> bool {
     match e {
-        Expr::Call(Func::Registered(_), _) => false,
-        Expr::Call(Func::Builtin(f), args) => {
-            !matches!(
-                f,
-                Function::Rand
-                    | Function::Now
-                    | Function::Uuid
-                    | Function::StrUuid
-                    | Function::BNode
-            ) && args.iter().all(deterministic)
-        }
-        Expr::Call(Func::Ext(name), args) => {
-            !["#now", "#uuid", "#struuid", "#apply", "#eval"]
-                .iter()
-                .any(|suffix| name.ends_with(suffix))
-                && args.iter().all(deterministic)
-        }
-        Expr::Call(_, l) | Expr::Coalesce(l) => l.iter().all(deterministic),
+        Expr::Call(Func::Builtin(Function::Now), _) => false,
+        Expr::Call(Func::Ext(name), _) if name.ends_with("#now") => false,
+        Expr::Call(_, l) | Expr::Coalesce(l) => l.iter().all(timeless),
         Expr::Or(a, b)
         | Expr::And(a, b)
         | Expr::Eq(a, b)
         | Expr::SameTerm(a, b)
         | Expr::Cmp(a, b, _)
-        | Expr::Arith(a, b, _) => deterministic(a) && deterministic(b),
-        Expr::Not(a) | Expr::Neg(a) | Expr::Pos(a) => deterministic(a),
-        Expr::In(a, l) => deterministic(a) && l.iter().all(deterministic),
-        Expr::If(a, b, c) => deterministic(a) && deterministic(b) && deterministic(c),
-        // EXISTS results are memoized per query; the pattern text is not in the key
+        | Expr::Arith(a, b, _) => timeless(a) && timeless(b),
+        Expr::Not(a) | Expr::Neg(a) | Expr::Pos(a) => timeless(a),
+        Expr::In(a, l) => timeless(a) && l.iter().all(timeless),
+        Expr::If(a, b, c) => timeless(a) && timeless(b) && timeless(c),
         Expr::Exists(_) => false,
         Expr::Const(_) | Expr::Lit(..) | Expr::Var(_) | Expr::Bound(_) => true,
     }
@@ -724,6 +714,9 @@ mod tests {
             "http://jena.apache.org/ARQ/function#uuid",
             "http://jena.apache.org/ARQ/function#struuid",
             "http://jena.apache.org/ARQ/function#eval",
+            "http://jena.apache.org/ARQ/function#wait",
+            "http://jena.apache.org/ARQ/function#print",
+            "http://jena.apache.org/ARQ/function#execTime",
             "http://www.w3.org/2005/xpath-functions#apply",
         ] {
             assert!(
@@ -740,6 +733,28 @@ mod tests {
                 "{name}"
             );
         }
+    }
+
+    #[test]
+    fn cache_purity_keeps_effects_and_query_time_out_when_nested() {
+        use spargebra::algebra::Function;
+
+        for local in ["wait", "print", "execTime"] {
+            let effect = Expr::Call(
+                Func::Ext(format!("http://jena.apache.org/ARQ/function#{local}")),
+                vec![Expr::Var(0)],
+            );
+            let nested = Expr::Call(Func::Builtin(Function::StrLen), vec![effect]);
+            assert!(!deterministic(&nested), "{local}");
+        }
+        let now = Expr::Call(Func::Builtin(Function::Now), vec![]);
+        assert!(super::super::exprcache::impurity(&now).is_none());
+        assert!(!deterministic(&now));
+        assert!(!deterministic(&Expr::Coalesce(vec![Expr::Var(0), now])));
+        assert!(deterministic(&Expr::Call(
+            Func::Ext("http://jena.apache.org/ARQ/function#strlen".into()),
+            vec![Expr::Var(0)],
+        )));
     }
 
     #[test]

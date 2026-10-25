@@ -1854,8 +1854,10 @@ Independent components run again for each batch, without an additional materiali
 Their local filters remain inside the component, preserving unbound variables and avoiding
 an unfiltered cross product. Application callbacks and components whose repeatability
 cannot be established keep the generic plan, including components with volatile functions.
-This includes the ARQ UUID aliases and unresolved dynamic function calls. Connected
-filters are applied as soon as their original required bindings are available, before
+This includes the ARQ UUID aliases, unresolved dynamic function calls and effectful ARQ
+calls such as `wait`, `print` and `execTime`. Result caching and nearest-neighbour
+repeatability share the expression-purity classifier. Result caching also retains its
+stricter refusal of query-clock values across queries. Connected filters are applied as soon as their original required bindings are available, before
 unrelated components are crossed. Filters carried inside an index probe receive the same
 purity check as ordinary filters. Their visible bindings are the probe scan's columns,
 so a variable supplied by another join input cannot change an unbound test. When those

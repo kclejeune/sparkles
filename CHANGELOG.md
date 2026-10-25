@@ -10,8 +10,10 @@ preserves duplicate solutions. Connected filters run before unrelated cross prod
 Index-probe filters keep their original binding scope, with generic fallback for volatile
 filters or filters that could observe new bindings after a move.
 
-ARQ UUID aliases and unresolved dynamic function calls are excluded from result-cache
-reuse and repeated independent nearest-neighbour inputs.
+ARQ UUID aliases, unresolved dynamic function calls and effectful ARQ calls are excluded
+from result-cache reuse and repeated independent nearest-neighbour inputs. These paths
+share expression-purity checks while result caching retains its stricter treatment of
+query-clock values.
 
 The full-text integrity check retries segment replacements made by merges even when the
 commit stamp stays the same. If the index keeps changing throughout its three attempts,
