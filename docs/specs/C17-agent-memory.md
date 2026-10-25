@@ -1465,7 +1465,8 @@ counts use the same snapshot, reasoning selection, graphs and caller Query view.
 metadata can certify label scope only when that view agrees. No raw index-wide or
 hidden-candidate count is returned. Evidence-enabled calls refuse structured content over
 `--mcp-max-bytes` with `budget-result-bytes`. This bounds its compact JSON before the
-MCP adapter mirrors it as text and adds the protocol envelope.
+MCP adapter mirrors it as text and adds the protocol envelope. The count includes
+branch metadata and any other structured-content decoration.
 
 The richer evidence is information for contextual ranking and for deciding when another
 lookup is needed. It does not change `exact` or `ambiguous` advice, suppress clarification

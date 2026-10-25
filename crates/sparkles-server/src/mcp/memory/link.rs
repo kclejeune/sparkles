@@ -302,9 +302,6 @@ impl Tools<'_> {
             "search": { "text": text_used, "vector": vector_used },
             "prefixes": terms.used(),
         });
-        if a.evidence == Some(true) {
-            evidence_bytes(&value, self.cfg().max_bytes, &ctx)?;
-        }
         Ok(Outcome::Structured(value))
     }
 
@@ -733,33 +730,6 @@ impl Tools<'_> {
             })
             .collect())
     }
-}
-
-/// Bound structured evidence without allocating a second serialized response. MCP's
-/// mirrored text and protocol envelope are outside this structured-content budget.
-fn evidence_bytes(value: &Value, limit: usize, ctx: &ErrorContext) -> Result<(), ToolError> {
-    struct Limited {
-        remaining: usize,
-    }
-    impl std::io::Write for Limited {
-        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
-            if bytes.len() > self.remaining {
-                return Err(std::io::Error::other("evidence result byte limit"));
-            }
-            self.remaining -= bytes.len();
-            Ok(bytes.len())
-        }
-        fn flush(&mut self) -> std::io::Result<()> {
-            Ok(())
-        }
-    }
-    serde_json::to_writer(Limited { remaining: limit }, value).map_err(|_| {
-        ctx.engine(Error::BudgetExceeded(sparkles::error::Budget {
-            kind: sparkles::error::BudgetKind::ResultBytes,
-            limit: limit as u64,
-            requested: (limit as u64).saturating_add(1),
-        }))
-    })
 }
 
 /// The default label predicates: those of C11 §4.4, then `skos:altLabel`.

@@ -1238,3 +1238,53 @@ async fn link_evidence_review_does_not_certify_rdfs_expanded_inventory() {
         true
     );
 }
+
+#[tokio::test(flavor = "multi_thread")]
+async fn link_evidence_review_counts_branch_metadata_at_the_byte_boundary() {
+    let long_label = "x".repeat(2048);
+    let ttl = format!(
+        r#"<urn:item> <http://www.w3.org/2000/01/rdf-schema#label> "Berlin"@en ; <http://www.w3.org/2004/02/skos/core#altLabel> "{long_label}" ."#
+    );
+    let server = server_with(&[("t", &[&ttl])], McpConfig::default());
+    server
+        .state
+        .get("t")
+        .unwrap()
+        .store
+        .create_branch("scratch", &Default::default())
+        .unwrap();
+    let state = server.state.clone();
+    let mut c = Client::start(server);
+    let args = json!({"mentions":[{"text":"Berlin"}],"branch":"scratch","evidence":true});
+    let full = c.structured("link_entities", args.clone()).await;
+    assert_eq!(full["branch"], "scratch");
+    let complete_bytes = serde_json::to_vec(&full).unwrap().len();
+    let mut undecorated = full.clone();
+    undecorated.as_object_mut().unwrap().remove("branch");
+    let too_small = serde_json::to_vec(&undecorated).unwrap().len();
+    assert!(too_small >= 1024 && too_small < complete_bytes);
+    let mut bounded = Client::start(McpServer::new(
+        state.clone(),
+        McpConfig {
+            max_bytes: too_small,
+            ..Default::default()
+        },
+    ));
+    let error = bounded.call("link_entities", args.clone()).await;
+    assert_eq!(
+        error["isError"], true,
+        "branch metadata must fit in the same content budget: {error}"
+    );
+    assert_eq!(
+        error["_meta"]["io.github.kclejeune.sparkles/error"]["code"],
+        "budget-result-bytes"
+    );
+    let mut exact = Client::start(McpServer::new(
+        state,
+        McpConfig {
+            max_bytes: complete_bytes,
+            ..Default::default()
+        },
+    ));
+    assert_eq!(exact.structured("link_entities", args).await, full);
+}
