@@ -1111,6 +1111,8 @@ impl Tools<'_> {
                 changes,
                 all_changes: false,
                 max_changes: 0,
+                retain_states: false,
+                state_max_memory: None,
             }),
         };
         let elapsed = || (t0.elapsed().as_secs_f64() * 1e6).round() / 1000.0;

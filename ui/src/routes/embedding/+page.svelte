@@ -11,6 +11,7 @@
   import { onMount, untrack } from 'svelte';
   import * as api from '$lib/api';
   import { app, toasts } from '$lib/app.svelte';
+  import { branchParam, onBranch, exploreQuery } from '$lib/branches';
   import {
     byDistance,
     categories,
@@ -52,8 +53,10 @@
     const urlDs = params.get('ds');
     if (urlDs && urlDs !== app.current) app.setDataset(urlDs);
   }
-  const ds = $derived(app.current);
-  const prefixes = $derived(app.prefixes(ds));
+  const family = $derived(app.current);
+  const selectedBranch = $derived(branchParam(page.url.searchParams.get('branch')));
+  const ds = $derived(family ? onBranch(family, selectedBranch) : null);
+  const prefixes = $derived(app.prefixes(family));
 
   // --- the dataset's indexes -----------------------------------------------------------
   let vstatus = $state<api.VectorStatus | null>(null);
@@ -89,6 +92,13 @@
     if (!name) return;
     untrack(() => {
       if (lastDs != null && lastDs !== name) {
+        ctl?.abort();
+        runs.claim('load');
+        clearTimeout(polling);
+        task = null;
+        loading = false;
+        error = null;
+        bounds = null;
         indexName = '';
         proj = null;
       }
@@ -121,7 +131,8 @@
 
   function syncUrl() {
     const p = new URLSearchParams();
-    if (ds) p.set('ds', ds);
+    if (family) p.set('ds', family);
+    if (selectedBranch) p.set('branch', selectedBranch);
     if (indexName) p.set('index', indexName);
     if (method !== 'pca') p.set('method', method);
     if (colourIri) p.set('colour', colourIri);
@@ -143,7 +154,8 @@
     const name = ds;
     const ix = indexName;
     if (!name || !ix) return;
-    const owns = runs.claim('load');
+    const requestOwns = runs.claim('load');
+    const owns = () => requestOwns() && name === ds;
     ctl?.abort();
     const c = (ctl = new AbortController());
     loading = true;
@@ -178,7 +190,8 @@
     const name = ds;
     const ix = indexName;
     if (!name || !ix) return;
-    const owns = runs.claim('load');
+    const requestOwns = runs.claim('load');
+    const owns = () => requestOwns() && name === ds;
     loading = true;
     error = null;
     try {
@@ -442,13 +455,20 @@
         `The query takes the ${fmtInt(VALUES_CAP)} entities nearest the selection's centre`,
         `${fmtInt(ordered.length - VALUES_CAP)} more were left out.`,
       );
+    app.queryBranch = selectedBranch ?? '';
+    app.queryAt = '';
     app.pendingQuery = { query: valuesQuery(kept), title: 'Embedding map' };
     goto(resolve('/query'));
   }
 
   function openAsGraph() {
     if (!ds) return;
-    goto(`${resolve('/explore')}?ds=${encodeURIComponent(ds)}&selection=1`);
+    const params = new URLSearchParams({
+      ds: family!,
+      ...(selectedBranch ? { branch: selectedBranch } : {}),
+      selection: '1',
+    });
+    goto(`${resolve('/explore')}?${params}`);
   }
 
   // --- hover and click -----------------------------------------------------------------
@@ -507,7 +527,7 @@
   }
 
   function exploreHref(entity: string) {
-    return `${resolve('/explore')}?ds=${encodeURIComponent(ds ?? '')}&iri=${encodeURIComponent(entity)}`;
+    return `${resolve('/explore')}?${exploreQuery(ds ?? '', entity)}`;
   }
 
   function onopen(i: number) {
@@ -569,7 +589,7 @@
 
   const head = $derived(proj?.head ?? null);
   const datasetHref = $derived(
-    ds ? resolve('/datasets/[name]', { name: ds }) : resolve('/datasets'),
+    family ? resolve('/datasets/[name]', { name: family }) : resolve('/datasets'),
   );
   const pct = (x: number) => `${(x * 100).toFixed(x < 0.1 ? 1 : 0)}%`;
 

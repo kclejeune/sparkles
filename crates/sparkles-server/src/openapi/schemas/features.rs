@@ -6,6 +6,7 @@ use super::*;
 
 pub(super) fn put_all(put: &mut dyn FnMut(&str, J)) {
     reasoning(put);
+    entailments(put);
     search(put);
     rdfs(put);
     shex(put);
@@ -105,21 +106,9 @@ fn reasoning(put: &mut dyn FnMut(&str, J)) {
                             "error": string(),
                         }),
                     )),
-                    "findings": array(obj(
-                        &["check", "rule", "severity", "focus", "evidence", "basis", "message"],
-                        json!({
-                            "check": string(),
-                            "rule": string(),
-                            "severity": severity,
-                            "focus": sref("RdfTerm"),
-                            "evidence": {
-                                "type": "object",
-                                "additionalProperties": { "anyOf": [sref("RdfTerm"), array(sref("RdfTerm"))] },
-                            },
-                            "basis": string_enum(&["asserted", "uses-inferences"]),
-                            "message": string(),
-                        }),
-                    )),
+                    "findings": array(sref("DiagnosticFinding")),
+                    "justificationsComplete": boolean(),
+                    "justificationChecks": int(),
                 }),
             ),
             "OWL 2 RL inconsistency checks and their findings.",
@@ -131,7 +120,7 @@ fn reasoning(put: &mut dyn FnMut(&str, J)) {
         json!({ "s": sref("RdfTerm"), "p": sref("RdfTerm"), "o": sref("RdfTerm") }),
     );
     put(
-        "ExplainRequest",
+        "InferenceExplainRequest",
         doc(
             obj(
                 &["triple"],
@@ -210,6 +199,7 @@ fn reasoning(put: &mut dyn FnMut(&str, J)) {
             &["missing", "placeholders", "tree"],
             json!({
                 "missing":array(triple.clone()),"placeholders":array(string()),"tree":sref("Derivation"),
+                "inconsistent": nullable("boolean"), "consistencyComplete": boolean(),
             }),
         ),
     );
@@ -235,6 +225,156 @@ fn reasoning(put: &mut dyn FnMut(&str, J)) {
                 }),
             ),
             "Derivation trees of a triple, from facts the caller reads.",
+            "explanations",
+        ),
+    );
+}
+
+/// Shared explicit-program and bounded-analysis request members.
+pub(super) fn analysis_properties() -> J {
+    json!({
+        "profile": {"type":"string", "description":"The same profile for both states. Omit the program to use the dataset's recorded program. Without a record, an explicit program is required; empty rules select asserted-only analysis."},
+        "rules": string(), "inputs": sref("AnalysisInputs"),
+        "vocabularies": strings(), "geoDefaultGeometry": boolean(),
+        "timeout": {"type":"number", "exclusiveMinimum":0, "description":"Seconds. Capped at the server timeout."},
+        "maxMemory": {"type":"integer", "minimum":1, "description":"Bytes for retained states and the analysis, capped at the server budget."},
+        "maxInferred": {"type":"integer", "minimum":1},
+        "threads": {"type":"integer", "minimum":1, "description":"Library callers may choose parallelism. HTTP uses the server reasoning pool."},
+    })
+}
+
+fn entailments(put: &mut dyn FnMut(&str, J)) {
+    put(
+        "AnalysisInputs",
+        obj(
+            &[],
+            json!({
+                "dataGraphs": {"type":"array", "items":string(), "default":["default"]},
+                "ontologyGraphs": strings(), "imports": string_enum(&["none", "dataset", "fetch"]),
+                "locationMapping": array(json!({"anyOf":[
+                    obj(&["name","altName"], json!({"name":string(),"altName":string()})),
+                    obj(&["prefix","altPrefix"], json!({"prefix":string(),"altPrefix":string()}))
+                ]})),
+            }),
+        ),
+    );
+    put(
+        "DiagnosticFinding",
+        obj(
+            &[
+                "check", "rule", "severity", "focus", "evidence", "basis", "message",
+            ],
+            json!({
+                "check":string(), "rule":string(), "severity":string_enum(&["inconsistency","warning"]),
+                "focus":sref("RdfTerm"), "evidence": {"type":"object","additionalProperties":{"anyOf":[sref("RdfTerm"),array(sref("RdfTerm"))]}},
+                "basis":string_enum(&["asserted","uses-inferences"]), "message":string(),
+                "justification":{"anyOf":[sref("Justification"),{"type":"null"}]},
+                "justificationComplete":boolean(),
+            }),
+        ),
+    );
+    put(
+        "RdfTripleTerms",
+        json!({"type":"array","prefixItems":[sref("RdfTerm"),sref("RdfTerm"),sref("RdfTerm")],"minItems":3,"maxItems":3}),
+    );
+    put(
+        "SupportFact",
+        obj(
+            &["triple", "graph", "role"],
+            json!({
+                "triple":sref("RdfTripleTerms"),
+                "graph":{"anyOf":[{"const":"default"},sref("RdfTerm")]},
+                "role":string_enum(&["schema","assertion"]),
+            }),
+        ),
+    );
+    put(
+        "Justification",
+        obj(&["facts"], json!({"facts":array(sref("SupportFact"))})),
+    );
+    put(
+        "JustifiedTarget",
+        obj(
+            &["class", "finding", "holds", "complete", "justifications"],
+            json!({
+                "class":nullable("string"), "finding":{"anyOf":[sref("DiagnosticFinding"),{"type":"null"}]},
+                "holds":boolean(),"complete":boolean(),"justifications":array(sref("Justification")),
+            }),
+        ),
+    );
+    put(
+        "JustificationReport",
+        doc(
+            obj(
+                &[
+                    "justificationFormat",
+                    "commit",
+                    "checks",
+                    "complete",
+                    "results",
+                ],
+                json!({
+                    "justificationFormat":{"const":1},"commit":int(),"checks":int(),"complete":boolean(),"results":array(sref("JustifiedTarget")),
+                }),
+            ),
+            "Subset-minimal asserted supports. A negative result is conclusive only when complete is true.",
+            "explanations",
+        ),
+    );
+    let mut request = analysis_properties();
+    request.as_object_mut().unwrap().extend(json!({
+        "at":string(), "class":string(), "classes":{"const":"all"},
+        "finding":obj(&["check","focus","evidence"],json!({"check":string(),"rule":string(),"focus":sref("RdfTerm"),"evidence":{"type":"object","additionalProperties":{"anyOf":[sref("RdfTerm"),array(sref("RdfTerm"))]}}})),
+        "maxChecks":{"type":"integer","minimum":1,"maximum":100000,"default":500},
+        "maxJustifications":{"type":"integer","minimum":1,"maximum":100,"default":5},
+    }).as_object().unwrap().clone());
+    let mut request = obj(&[], request);
+    request["oneOf"] =
+        json!([{"required":["finding"]},{"required":["class"]},{"required":["classes"]}]);
+    put(
+        "JustifyRequest",
+        doc(
+            request,
+            "Exactly one finding, class IRI or classes=all target, with one bounded analysis program.",
+            "explanations",
+        ),
+    );
+    let state = obj(
+        &["selector", "commit"],
+        json!({"selector":string(),"commit":int()}),
+    );
+    let counts = obj(
+        &["added", "removed"],
+        json!({"added":int(),"removed":int()}),
+    );
+    put(
+        "EntailmentDiff",
+        doc(
+            obj(
+                &[
+                    "entailmentDiffFormat",
+                    "from",
+                    "to",
+                    "added",
+                    "removed",
+                    "byPredicate",
+                    "byClass",
+                    "sample",
+                    "sampleTruncated",
+                    "newFindings",
+                    "findingsComplete",
+                    "warnings",
+                ],
+                json!({
+                    "entailmentDiffFormat":{"const":1},"from":state.clone(),"to":state,
+                    "added":int(),"removed":int(),
+                    "byPredicate":{"type":"object","additionalProperties":counts.clone()},
+                    "byClass":{"type":"object","additionalProperties":counts},
+                    "sample":obj(&["added","removed"],json!({"added":array(sref("RdfTripleTerms")),"removed":array(sref("RdfTripleTerms"))})),
+                    "sampleTruncated":boolean(),"newFindings":array(sref("DiagnosticFinding")),"findingsComplete":boolean(),"warnings":strings(),
+                }),
+            ),
+            "Complete entailment counts over two retained states under the same program, with bounded samples and new inconsistency findings.",
             "explanations",
         ),
     );

@@ -49,6 +49,7 @@ const STOP_POLL: Duration = Duration::from_millis(5);
 
 struct Shared {
     profile: Profile,
+    extras: Extras,
     rules: Vec<Rule>,
     /// the profile or vocabulary of each rule of `rules`
     sources: Vec<String>,
@@ -84,6 +85,7 @@ impl QueryReasoner {
             shared: Arc::new(Shared {
                 digest: crate::rules_digest(&profile, extras),
                 profile,
+                extras: extras.clone(),
                 rules,
                 sources,
                 geo_default: extras.geo_default_geometry,
@@ -104,6 +106,7 @@ impl QueryReasoner {
         QueryReasoner {
             shared: Arc::new(Shared {
                 profile: s.profile.clone(),
+                extras: s.extras.clone(),
                 rules: s.rules.clone(),
                 sources: s.sources.clone(),
                 geo_default: s.geo_default,
@@ -124,6 +127,16 @@ impl QueryReasoner {
     /// The profile.
     pub fn profile(&self) -> &Profile {
         &self.shared.profile
+    }
+
+    /// The configured inputs of this query-time program.
+    pub fn inputs(&self) -> &Inputs {
+        &self.shared.inputs
+    }
+
+    /// The vocabularies and default-geometry setting of the configured program.
+    pub fn extras(&self) -> &Extras {
+        &self.shared.extras
     }
 
     /// This reasoner as the provider [`QueryOptions::reasoning`] takes.

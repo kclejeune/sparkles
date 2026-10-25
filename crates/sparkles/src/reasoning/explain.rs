@@ -13,8 +13,8 @@ use crate::access::GraphAccess;
 use crate::error::Result;
 use crate::explain::Explained;
 use crate::id::Id;
-pub use crate::overview::facets::term_json;
 use crate::sparql::rdfs::{SchemaLeaves, SchemaSource};
+pub use crate::sparql::results::term_json;
 use crate::store::Snapshot;
 use oxrdf::Term;
 use serde_json::{Value as J, json};
@@ -419,7 +419,7 @@ fn materialized(
                 rec.run_inputs()?,
             )
             .map_err(crate::handles::from_anyhow)?;
-            let d = demand_with(&fallback, snap.clone(), deadline, &reasoner)?;
+            let d = demand_with(ds, &fallback, snap.clone(), deadline, &reasoner)?;
             found = d.explained;
         }
         if !matches!(found, Explained::NotFound) {
@@ -471,11 +471,12 @@ fn demand(
         .transpose()
         .map_err(|e: sparkles_reasoner::UnknownProfile| bad(e.to_string()))?;
     let reasoner = ds.query_reasoner(profile)?;
-    demand_with(req, snap, deadline, &reasoner)
+    demand_with(ds, req, snap, deadline, &reasoner)
 }
 
 #[cfg(feature = "reasoning")]
 fn demand_with(
+    ds: &Dataset,
     req: &ExplainRequest,
     snap: Arc<Snapshot>,
     deadline: Option<Instant>,
@@ -514,8 +515,22 @@ fn demand_with(
             max_hypotheses: req.max_hypotheses.clamp(1, 100),
             max_unfold: req.max_depth.min(MAX_DEPTH),
         };
-        let answer =
+        let mut answer =
             sparkles_reasoner::whynot::why_not(&input, &req.triple, &opts).map_err(convert)?;
+        super::hypotheses::check_consistency(
+            ds,
+            &snap,
+            reasoner,
+            &super::analysis::AnalysisOptions {
+                timeout: deadline
+                    .map(|deadline| deadline.saturating_duration_since(Instant::now())),
+                cancel: req.cancel.clone(),
+                access: req.access.clone(),
+                max_memory: req.max_memory,
+                ..Default::default()
+            },
+            &mut answer,
+        )?;
         (Explained::NotFound, Some(answer))
     } else {
         (
@@ -684,7 +699,7 @@ pub fn request_from_json(j: &J) -> Result<(ExplainRequest, ExplainMode, Option<D
 }
 
 pub fn derivation_json(d: &crate::explain::Derivation) -> J {
-    use crate::overview::facets::term_json;
+    use crate::sparql::results::term_json;
     let mut o = json!({
         "id": d.id,
         "triple": {
@@ -747,7 +762,7 @@ pub fn explanation_json(e: &Explanation) -> J {
     let mut o = json!({ "mode": "why", "commit": e.commit });
     #[cfg(feature = "reasoning")]
     if let Some(w) = &e.why_not {
-        use crate::overview::facets::term_json;
+        use crate::sparql::results::term_json;
         use sparkles_reasoner::whynot::WhyNot;
         let triple =
             |t: &[Term; 3]| json!({"s":term_json(&t[0]),"p":term_json(&t[1]),"o":term_json(&t[2])});
@@ -771,7 +786,7 @@ pub fn explanation_json(e: &Explanation) -> J {
                     }).collect();
                     json!({"name":r.rule.name,"line":r.line,"unifier":unifier,"blockedBy":blocked})
                 }).collect();
-                o["hypotheses"] = hypotheses.iter().map(|h| json!({"missing":h.missing.iter().map(triple).collect::<Vec<_>>(),"placeholders":h.placeholders,"tree":derivation_json(&h.tree)})).collect();
+                o["hypotheses"] = hypotheses.iter().map(|h| json!({"missing":h.missing.iter().map(triple).collect::<Vec<_>>(),"placeholders":h.placeholders,"tree":derivation_json(&h.tree),"inconsistent":h.inconsistent,"consistencyComplete":h.inconsistent.is_some()})).collect();
             }
         }
         o["source"] = "demand".into();
@@ -993,6 +1008,13 @@ pub fn explanation_text(e: &Explanation, prefixes: &[(String, String)]) -> Strin
                     ));
                     for t in &h.missing {
                         out.push_str(&format!("  {}\n", short_triple(t, prefixes)));
+                    }
+                    match h.inconsistent {
+                        Some(true) => {
+                            out.push_str("  adding these facts introduces a new inconsistency\n")
+                        }
+                        Some(false) => {}
+                        None => out.push_str("  the consistency check is incomplete\n"),
                     }
                     tree_lines(&h.tree, 1, prefixes, &mut out);
                 }

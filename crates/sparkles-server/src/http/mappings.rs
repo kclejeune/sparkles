@@ -394,7 +394,19 @@ pub(super) async fn run(
         .opts
         .dry_run
         .as_ref()
-        .map(|d| super::dry_run::Request::new(&st, &headers, d, restricted));
+        .map(|d| {
+            super::dry_run::Request::for_write(
+                &st,
+                &headers,
+                &params,
+                d,
+                restricted,
+                principal.as_ref(),
+                &ds,
+                &wopts.opts,
+            )
+        })
+        .transpose()?;
     let mut mappings = Mappings::default();
     let mut q = Params(vec![("mapping".into(), name.clone())]);
     if let Some(v) = params.get("version") {
@@ -452,6 +464,7 @@ pub(super) async fn run(
     };
     let lookup = super::lookup_param(&params)?;
     let (mut wopts, timeout) = wopts.start();
+    let dry = dry.map(|request| request.started(&wopts));
     if wopts.message.is_none() {
         wopts.message = Some(format!("mapping {stored_name} (version {version})").into());
     }

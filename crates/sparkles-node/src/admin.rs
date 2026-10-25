@@ -219,6 +219,8 @@ fn writes(op: &str) -> bool {
             | "indexes.vector.recall"
             | "reasoning.diagnostics"
             | "reasoning.explain"
+            | "reasoning.diff"
+            | "reasoning.justify"
             | "history.query"
             | "schema.profiles"
             | "schema.draftShapes"
@@ -894,23 +896,71 @@ fn run_admin(
         }
         #[cfg(feature = "reasoning")]
         "reasoning.diagnostics" => {
-            let d =
-                ds.reasoning()
-                    .diagnostics(&sparkles_reasoner::diagnostics::DiagnoseOptions {
-                        checks: decode(&a["checks"]).unwrap_or_default(),
-                        graphs: decode(&a["graphs"]).unwrap_or_default(),
-                        limit: a["limit"].as_u64().unwrap_or(100) as usize,
-                        inferences: a["inferences"].as_bool().unwrap_or(false),
-                        timeout: ctl
-                            .deadline
-                            .map(|d| d.saturating_duration_since(Instant::now())),
-                        ..Default::default()
-                    })?;
-            json!({
-                "report": d.report.to_json(),
-                "commit": d.commit,
-                "inferences": d.inferences,
-            })
+            let options = sparkles_reasoner::diagnostics::DiagnoseOptions {
+                checks: decode(&a["checks"]).unwrap_or_default(),
+                graphs: decode(&a["graphs"]).unwrap_or_default(),
+                limit: a["limit"].as_u64().unwrap_or(100) as usize,
+                inferences: a["inferences"].as_bool().unwrap_or(false),
+                timeout: ctl
+                    .deadline
+                    .map(|deadline| deadline.saturating_duration_since(Instant::now())),
+                ..Default::default()
+            };
+            let supports = if a["justify"].as_bool().unwrap_or(false) {
+                Some(
+                    ds.reasoning().diagnostics_justified(
+                        &options,
+                        &sparkles::reasoning::analysis::AnalysisOptions {
+                            timeout: options.timeout,
+                            cancel: Some(ctl.cancel.flag()),
+                            max_memory: a["maxMemory"]
+                                .as_u64()
+                                .and_then(|value| usize::try_from(value).ok()),
+                            ..Default::default()
+                        },
+                        a["maxChecks"].as_u64().unwrap_or(500).min(100_000) as usize,
+                    )?,
+                )
+            } else {
+                None
+            };
+            let diagnostics = match &supports {
+                Some(supports) => supports.diagnostics.clone(),
+                None => ds.reasoning().diagnostics(&options)?,
+            };
+            let mut report = diagnostics.report.to_json();
+            if let Some(supports) = supports {
+                supports.attach(&mut report);
+            }
+            json!({"report":report,"commit":diagnostics.commit,"inferences":diagnostics.inferences})
+        }
+        #[cfg(feature = "reasoning")]
+        "reasoning.diff" => {
+            let mut request = sparkles::reasoning::diff::DiffRequest::from_json(a)?;
+            request.analysis.timeout = match (
+                request.analysis.timeout,
+                ctl.deadline
+                    .map(|deadline| deadline.saturating_duration_since(Instant::now())),
+            ) {
+                (Some(asked), Some(limit)) => Some(asked.min(limit)),
+                (asked, limit) => asked.or(limit),
+            };
+            request.analysis.cancel = Some(ctl.cancel.flag());
+            ds.reasoning().diff(&request)?.to_json()
+        }
+        #[cfg(feature = "reasoning")]
+        "reasoning.justify" => {
+            let mut request = sparkles::reasoning::justify::JustifyRequest::from_json(a)?;
+            request.analysis.timeout = match (
+                request.analysis.timeout,
+                ctl.deadline
+                    .map(|deadline| deadline.saturating_duration_since(Instant::now())),
+            ) {
+                (Some(asked), Some(limit)) => Some(asked.min(limit)),
+                (asked, limit) => asked.or(limit),
+            };
+            request.analysis.cancel = Some(ctl.cancel.flag());
+            ds.reasoning().justify(&request)?.to_json()
         }
         "reasoning.explain" => {
             use sparkles::reasoning::explain as ex;

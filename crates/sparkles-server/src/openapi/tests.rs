@@ -402,3 +402,31 @@ fn model_settings_schema_matches_the_configuration() {
         .collect();
     assert_eq!(names(roles), all);
 }
+
+#[test]
+fn entailment_contracts_preserve_distinct_explanation_requests_and_typed_supports() {
+    let doc = doc();
+    let schemas = &doc["components"]["schemas"];
+    assert_eq!(
+        schemas["InferenceExplainRequest"]["required"],
+        json!(["triple"])
+    );
+    assert_eq!(schemas["ExplainRequest"]["required"], json!(["query"]));
+    assert_eq!(
+        doc["paths"]["/$/reason/{ds}/explain"]["post"]["requestBody"]["content"]["application/json"]
+            ["schema"]["$ref"],
+        "#/components/schemas/InferenceExplainRequest"
+    );
+    assert_eq!(
+        schemas["EntailmentDiff"]["properties"]["sample"]["properties"]["added"]["items"]["$ref"],
+        "#/components/schemas/RdfTripleTerms"
+    );
+    assert_eq!(
+        schemas["SupportFact"]["properties"]["triple"]["$ref"],
+        "#/components/schemas/RdfTripleTerms"
+    );
+    assert_eq!(
+        schemas["ExplainHypothesis"]["properties"]["inconsistent"]["type"],
+        json!(["boolean", "null"])
+    );
+}

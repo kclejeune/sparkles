@@ -425,6 +425,8 @@ pub(super) async fn check(
             changes: 1000,
             all_changes: false,
             max_changes: 0,
+            retain_states: false,
+            state_max_memory: None,
         },
         pr.restricted,
     );

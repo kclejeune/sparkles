@@ -20,7 +20,7 @@ pub(super) enum Format {
 }
 
 /// What a dry-run request asked for, for its response.
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone)]
 pub(super) struct Request {
     format: Format,
     /// the changed quads to list in JSON
@@ -29,11 +29,19 @@ pub(super) struct Request {
     pub(super) restricted: bool,
     /// `--max-export-mb`
     max_bytes: Option<u64>,
+    #[cfg(feature = "reasoning")]
+    entailments: Option<sparkles::reasoning::analysis::AnalysisOptions>,
+    #[cfg(feature = "reasoning")]
+    analysis_deadline: Option<std::time::Instant>,
+    #[cfg(feature = "reasoning")]
+    max_result_bytes: Option<u64>,
+    #[cfg(feature = "reasoning")]
+    sample_limit: usize,
 }
 
 /// `true`, `false` or empty (true); anything else is refused, so that a misspelt flag
 /// never turns a preview into a write.
-fn flag(v: &str, what: &str) -> ApiResult<bool> {
+pub(super) fn flag(v: &str, what: &str) -> ApiResult<bool> {
     match v.trim().to_ascii_lowercase().as_str() {
         "" | "true" | "1" => Ok(true),
         "false" | "0" => Ok(false),
@@ -63,9 +71,52 @@ pub(super) fn parse(
         })?;
         on |= flag(v, "Sparkles-Dry-Run")?;
     }
+    let entailments = params
+        .get("entailments")
+        .map(|value| flag(value, "entailments"))
+        .transpose()?
+        .unwrap_or(false);
     if !on {
+        if entailments {
+            return Err(err(
+                StatusCode::BAD_REQUEST,
+                "entailments requires a dry run",
+            ));
+        }
         return Ok(None);
     }
+    #[cfg(not(feature = "reasoning"))]
+    if entailments {
+        return Err(err(
+            StatusCode::NOT_IMPLEMENTED,
+            "built without the reasoning feature",
+        ));
+    }
+    if entailments && format(headers) != Format::Json {
+        return Err(err(
+            StatusCode::BAD_REQUEST,
+            "entailments requires a JSON preview response",
+        ));
+    }
+    let memory = params
+        .get("maxMemory")
+        .map(|value| {
+            value
+                .parse::<u64>()
+                .ok()
+                .filter(|value| *value > 0)
+                .ok_or_else(|| {
+                    err(
+                        StatusCode::BAD_REQUEST,
+                        "maxMemory must be a positive number of bytes",
+                    )
+                })
+        })
+        .transpose()?;
+    let memory = match (memory, st.limits.query_memory_bytes) {
+        (Some(a), Some(b)) => Some(a.min(b)),
+        (a, b) => a.or(b),
+    };
     let changes = match params.get("changes") {
         Some(v) => v
             .trim()
@@ -92,6 +143,8 @@ pub(super) fn parse(
         changes,
         all_changes: patch,
         max_changes: st.limits.max_rows as u64,
+        retain_states: entailments,
+        state_max_memory: memory.map(|bytes| bytes / 8),
     }))
 }
 
@@ -123,6 +176,194 @@ impl Request {
             changes: dr.changes,
             restricted,
             max_bytes: st.limits.max_export_bytes,
+            #[cfg(feature = "reasoning")]
+            entailments: None,
+            #[cfg(feature = "reasoning")]
+            analysis_deadline: None,
+            #[cfg(feature = "reasoning")]
+            max_result_bytes: st.limits.max_result_bytes,
+            #[cfg(feature = "reasoning")]
+            sample_limit: st.limits.max_rows.min(100),
+        }
+    }
+
+    /// Bind analysis to the caller's read grants and the write request's controls.
+    #[allow(clippy::too_many_arguments)]
+    pub(super) fn for_write(
+        st: &AppState,
+        headers: &HeaderMap,
+        params: &Params,
+        dr: &DryRun,
+        restricted: bool,
+        principal: Option<&Principal>,
+        ds: &Dataset,
+        write: &sparkles::guard::WriteOptions,
+    ) -> ApiResult<Self> {
+        let request = Self::new(st, headers, dr, restricted);
+        if !dr.retain_states {
+            return Ok(request);
+        }
+        #[cfg(not(feature = "reasoning"))]
+        {
+            let _ = (params, principal, ds, write);
+            Err(err(
+                StatusCode::NOT_IMPLEMENTED,
+                "built without the reasoning feature",
+            ))
+        }
+        #[cfg(feature = "reasoning")]
+        {
+            let mut request = request;
+            let mut value = serde_json::Map::new();
+            for key in ["profile", "rules"] {
+                if let Some(text) = params.get(key) {
+                    value.insert(key.into(), text.into());
+                }
+            }
+            for key in [
+                "inputs",
+                "vocabularies",
+                "geoDefaultGeometry",
+                "timeout",
+                "maxMemory",
+                "maxInferred",
+                "threads",
+            ] {
+                if let Some(text) = params.get(key) {
+                    value.insert(
+                        key.into(),
+                        serde_json::from_str(text).map_err(|error| {
+                            err(StatusCode::BAD_REQUEST, format!("invalid {key}: {error}"))
+                        })?,
+                    );
+                }
+            }
+            let mut analysis =
+                sparkles::reasoning::analysis::AnalysisOptions::from_json(&J::Object(value))
+                    .map_err(|error| err(StatusCode::BAD_REQUEST, error.to_string()))?;
+            let local = Principal::local();
+            let principal = principal.unwrap_or(&local);
+            branches::check(
+                principal,
+                &ds.name,
+                &ds.store.branch_name(),
+                crate::auth::Level::Read,
+                Some(crate::auth::Endpoint::Query),
+            )?;
+            super::entailments::options(
+                st,
+                principal,
+                &crate::auth::on_branch(&ds.name, &ds.store.branch_name()),
+                &mut analysis,
+            );
+            analysis.cancel = write.cancel.clone();
+            let deadline = analysis
+                .timeout
+                .and_then(|timeout| std::time::Instant::now().checked_add(timeout));
+            request.analysis_deadline = match (deadline, write.deadline) {
+                (Some(a), Some(b)) => Some(a.min(b)),
+                (a, b) => a.or(b),
+            };
+            request.entailments = Some(analysis);
+            Ok(request)
+        }
+    }
+
+    /// Start the analysis clock with execution after a streamed body has arrived.
+    pub(super) fn started(self, write: &sparkles::guard::WriteOptions) -> Self {
+        #[cfg(feature = "reasoning")]
+        {
+            let mut request = self;
+            if let Some(analysis) = &mut request.entailments {
+                analysis.cancel = write.cancel.clone();
+                let deadline = analysis
+                    .timeout
+                    .and_then(|timeout| std::time::Instant::now().checked_add(timeout));
+                request.analysis_deadline = match (deadline, write.deadline) {
+                    (Some(a), Some(b)) => Some(a.min(b)),
+                    (a, b) => a.or(b),
+                };
+            }
+            request
+        }
+        #[cfg(not(feature = "reasoning"))]
+        {
+            let _ = write;
+            self
+        }
+    }
+
+    pub(super) fn unchanged_entailments(&self, ds: &Dataset, commit: u64) -> ApiResult<J> {
+        #[cfg(feature = "reasoning")]
+        if let Some(analysis) = &self.entailments {
+            let mut request =
+                sparkles::reasoning::diff::DiffRequest::new(commit.to_string(), commit.to_string());
+            request.analysis = analysis.clone();
+            request.sample_limit = self.sample_limit;
+            request.analysis.timeout = self
+                .analysis_deadline
+                .map(|deadline| deadline.saturating_duration_since(std::time::Instant::now()));
+            let document = ds.dataset.reasoning().diff(&request)?.to_json();
+            if let Some(limit) = self.max_result_bytes {
+                let size = serde_json::to_vec(&document).unwrap().len() as u64;
+                if size > limit {
+                    return Err(Error::BudgetExceeded(sparkles::Budget {
+                        kind: BudgetKind::ResultBytes,
+                        limit,
+                        requested: size,
+                    })
+                    .into());
+                }
+            }
+            return Ok(document);
+        }
+        let _ = (ds, commit);
+        Ok(J::Null)
+    }
+
+    pub(super) fn json_checked(&self, ds: &Dataset, preview: &Preview) -> ApiResult<J> {
+        let doc = self.json(ds, preview);
+        #[cfg(feature = "reasoning")]
+        {
+            let mut doc = doc;
+            if let Some(analysis) = &self.entailments {
+                if preview.states.is_some() {
+                    let mut request =
+                        sparkles::reasoning::diff::DiffRequest::new("before", "after");
+                    request.analysis = analysis.clone();
+                    request.sample_limit = self.sample_limit;
+                    request.analysis.timeout = self.analysis_deadline.map(|deadline| {
+                        deadline.saturating_duration_since(std::time::Instant::now())
+                    });
+                    doc["entailments"] = ds
+                        .dataset
+                        .reasoning()
+                        .diff_preview(preview, &request)?
+                        .to_json();
+                } else {
+                    doc["entailments"] = J::Null;
+                    doc["entailmentsUnavailable"] = json!(format!(
+                        "the {} preview has no candidate state",
+                        preview.outcome().name()
+                    ));
+                }
+                if let Some(limit) = self.max_result_bytes {
+                    let size = serde_json::to_vec(&doc).unwrap().len() as u64;
+                    if size > limit {
+                        return Err(Error::BudgetExceeded(sparkles::Budget {
+                            kind: BudgetKind::ResultBytes,
+                            limit,
+                            requested: size,
+                        })
+                        .into());
+                    }
+                }
+            }
+            Ok(doc)
+        }
+        #[cfg(not(feature = "reasoning"))]
+        {
+            Ok(doc)
         }
     }
 
@@ -142,12 +383,15 @@ impl Request {
                 Ok(r) => r,
                 Err(e) => return e.into_response(),
             },
-            _ => (
-                status,
-                [(header::CONTENT_TYPE, "application/json")],
-                self.json(ds, p).to_string(),
-            )
-                .into_response(),
+            _ => match self.json_checked(ds, p) {
+                Ok(doc) => (
+                    status,
+                    [(header::CONTENT_TYPE, "application/json")],
+                    doc.to_string(),
+                )
+                    .into_response(),
+                Err(error) => return error.into_response(),
+            },
         };
         let mut resp = with_commit(resp, ds, p.head.seq);
         let h = resp.headers_mut();
@@ -337,5 +581,40 @@ impl Request {
             doc["error"] = json!(e);
         }
         doc
+    }
+}
+
+#[cfg(all(test, feature = "reasoning"))]
+mod control_tests {
+    use super::*;
+
+    #[test]
+    fn started_analysis_uses_the_actual_write_deadline_and_cancellation() {
+        let deadline = std::time::Instant::now() + Duration::from_millis(100);
+        let cancel = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let write = sparkles::guard::WriteOptions {
+            deadline: Some(deadline),
+            cancel: Some(cancel.clone()),
+            ..Default::default()
+        };
+        let request = Request {
+            format: Format::Json,
+            changes: 0,
+            restricted: false,
+            max_bytes: None,
+            entailments: Some(sparkles::reasoning::analysis::AnalysisOptions {
+                timeout: Some(Duration::from_secs(30)),
+                ..Default::default()
+            }),
+            analysis_deadline: None,
+            max_result_bytes: None,
+            sample_limit: 1,
+        }
+        .started(&write);
+        assert_eq!(request.analysis_deadline, Some(deadline));
+        assert!(Arc::ptr_eq(
+            request.entailments.unwrap().cancel.as_ref().unwrap(),
+            &cancel
+        ));
     }
 }

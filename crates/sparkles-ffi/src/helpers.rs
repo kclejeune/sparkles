@@ -237,6 +237,9 @@ pub struct DiagnosticsRequest {
     pub inferences: bool,
     pub graphs: Vec<String>,
     pub closure: String,
+    pub justify: bool,
+    pub max_checks: u32,
+    pub max_memory: Option<u64>,
 }
 #[derive(uniffi::Record)]
 pub struct EmbeddingEnvironment {
@@ -444,6 +447,68 @@ impl FfiDataset {
             }
         }
     }
+    pub fn reason_diff(
+        &self,
+        request: Vec<u8>,
+        operation: Arc<FfiOperation>,
+    ) -> FfiResult<Vec<u8>> {
+        operation.control.check()?;
+        #[cfg(feature = "reasoning")]
+        {
+            let value: serde_json::Value = serde_json::from_slice(&request).map_err(bad)?;
+            let mut request = sparkles::reasoning::diff::DiffRequest::from_json(&value)?;
+            request.analysis.timeout = match (
+                request.analysis.timeout,
+                operation
+                    .control
+                    .deadline
+                    .map(|deadline| deadline.saturating_duration_since(Instant::now())),
+            ) {
+                (Some(asked), Some(limit)) => Some(asked.min(limit)),
+                (asked, limit) => asked.or(limit),
+            };
+            request.analysis.cancel = Some(operation.control.cancel.flag());
+            let result = self.inner.ds.reasoning().diff(&request)?;
+            operation.control.check()?;
+            encode(&result.to_json())
+        }
+        #[cfg(not(feature = "reasoning"))]
+        {
+            let _ = request;
+            Err(unsupported("reasoning"))
+        }
+    }
+    pub fn reason_justify(
+        &self,
+        request: Vec<u8>,
+        operation: Arc<FfiOperation>,
+    ) -> FfiResult<Vec<u8>> {
+        operation.control.check()?;
+        #[cfg(feature = "reasoning")]
+        {
+            let value: serde_json::Value = serde_json::from_slice(&request).map_err(bad)?;
+            let mut request = sparkles::reasoning::justify::JustifyRequest::from_json(&value)?;
+            request.analysis.timeout = match (
+                request.analysis.timeout,
+                operation
+                    .control
+                    .deadline
+                    .map(|deadline| deadline.saturating_duration_since(Instant::now())),
+            ) {
+                (Some(asked), Some(limit)) => Some(asked.min(limit)),
+                (asked, limit) => asked.or(limit),
+            };
+            request.analysis.cancel = Some(operation.control.cancel.flag());
+            let result = self.inner.ds.reasoning().justify(&request)?;
+            operation.control.check()?;
+            encode(&result.to_json())
+        }
+        #[cfg(not(feature = "reasoning"))]
+        {
+            let _ = request;
+            Err(unsupported("reasoning"))
+        }
+    }
     pub fn reason_status(&self) -> FfiResult<Option<Vec<u8>>> {
         self.inner
             .ds
@@ -473,10 +538,35 @@ impl FfiDataset {
                     .map(|d| d.saturating_duration_since(Instant::now())),
                 ..Default::default()
             };
-            let r = self.inner.ds.reasoning().diagnostics(&opts)?;
+            let supports = if req.justify {
+                Some(
+                    self.inner.ds.reasoning().diagnostics_justified(
+                        &opts,
+                        &sparkles::reasoning::analysis::AnalysisOptions {
+                            timeout: opts.timeout,
+                            cancel: Some(operation.control.cancel.flag()),
+                            max_memory: req
+                                .max_memory
+                                .map(|limit| usize::try_from(limit).unwrap_or(usize::MAX)),
+                            ..Default::default()
+                        },
+                        req.max_checks as usize,
+                    )?,
+                )
+            } else {
+                None
+            };
+            let diagnostics = match &supports {
+                Some(supports) => supports.diagnostics.clone(),
+                None => self.inner.ds.reasoning().diagnostics(&opts)?,
+            };
+            let mut report = diagnostics.report.to_json();
+            if let Some(supports) = supports {
+                supports.attach(&mut report);
+            }
             operation.control.check()?;
             encode(
-                &json!({"report":r.report.to_json(),"commit":r.commit,"inferences":r.inferences}),
+                &json!({"report":report,"commit":diagnostics.commit,"inferences":diagnostics.inferences}),
             )
         }
         #[cfg(not(feature = "reasoning"))]
@@ -523,6 +613,18 @@ mod tests {
             ErrorKind::Cancelled
         );
         assert_eq!(
+            ds.reason_diff(b"{}".to_vec(), op.clone())
+                .unwrap_err()
+                .kind(),
+            ErrorKind::Cancelled
+        );
+        assert_eq!(
+            ds.reason_justify(b"{}".to_vec(), op.clone())
+                .unwrap_err()
+                .kind(),
+            ErrorKind::Cancelled
+        );
+        assert_eq!(
             ds.explain("ASK {}".into(), op).unwrap_err().kind(),
             ErrorKind::Cancelled
         );
@@ -563,5 +665,50 @@ mod tests {
         )
         .unwrap();
         assert!(out["text"].as_str().unwrap().contains("# retained"));
+    }
+    #[cfg(feature = "reasoning")]
+    #[test]
+    fn reasoning_analysis_documents_are_read_only() {
+        let ds = FfiDataset::memory(crate::DatasetOptions {
+            blank_node_labels: crate::BlankNodeMode::Dataset,
+            read_only: false,
+            term_cache_size: 1000,
+        });
+        ds.inner.ds.update("INSERT DATA { <urn:Manager> <http://www.w3.org/2000/01/rdf-schema#subClassOf> <urn:Employee> }").unwrap();
+        ds.inner
+            .ds
+            .create_branch("feature", &Default::default())
+            .unwrap();
+        let branch = ds.inner.ds.branch("feature").unwrap();
+        branch
+            .update("INSERT DATA { <urn:alice> a <urn:Manager> }")
+            .unwrap();
+        let head = ds.inner.ds.head_commit().seq;
+        let result = ds
+            .reason_diff(
+                serde_json::to_vec(&json!({"from":"main","to":"feature","profile":"rdfs-simple"}))
+                    .unwrap(),
+                FfiOperation::new(None),
+            )
+            .unwrap();
+        let value: serde_json::Value = serde_json::from_slice(&result).unwrap();
+        assert_eq!(value["added"], 1);
+        assert_eq!(ds.inner.ds.head_commit().seq, head);
+        ds.inner.ds.update("INSERT DATA { <urn:CatDog> <http://www.w3.org/2000/01/rdf-schema#subClassOf> <urn:Cat>, <urn:Dog> . <urn:Cat> <http://www.w3.org/2002/07/owl#disjointWith> <urn:Dog> }").unwrap();
+        let result = ds
+            .reason_justify(
+                serde_json::to_vec(&json!({"class":"urn:CatDog","profile":"owl-rl"})).unwrap(),
+                FfiOperation::new(None),
+            )
+            .unwrap();
+        let value: serde_json::Value = serde_json::from_slice(&result).unwrap();
+        assert_eq!(value["results"][0]["holds"], true);
+        assert_eq!(
+            value["results"][0]["justifications"][0]["facts"]
+                .as_array()
+                .unwrap()
+                .len(),
+            3
+        );
     }
 }

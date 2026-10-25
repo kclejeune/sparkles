@@ -29,7 +29,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 /// A run went over its memory limit.
 #[derive(Debug, Clone, thiserror::Error)]
 #[error("reasoning exceeded the memory limit of {limit} bytes{context}")]
-pub(crate) struct MemoryExceeded {
+pub struct MemoryExceeded {
     pub limit: usize,
     /// what was being done, for the message (with a leading space), or empty
     pub context: String,

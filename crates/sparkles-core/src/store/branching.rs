@@ -729,6 +729,16 @@ impl BranchSet {
         self.table.lock().next_ordinal as u64
     }
 
+    /// Reserve ranges already carried by copied data before this memory family forks.
+    pub(crate) fn reserve_memory_ordinals(&self, next: u64) -> Result<()> {
+        if !self.memory || next > u16::MAX as u64 + 1 {
+            return Err(Error::invalid("invalid copied memory-family branch ranges"));
+        }
+        let mut table = self.table.lock();
+        table.next_ordinal = table.next_ordinal.max(next as u32);
+        Ok(())
+    }
+
     /// Record the merges of store `id` (at its open) or one more (after a merge).
     pub(crate) fn note_merges(&self, id: uuid::Uuid, recs: &[MergeRec], replace: bool) {
         let mut m = self.merges.write();
@@ -2509,23 +2519,48 @@ impl Store {
         &self,
         store: BranchStore<'_>,
         at: &At,
-        o: &crate::history::HistoryOptions,
+        options: &crate::history::HistoryOptions,
     ) -> Result<(Arc<Snapshot>, crate::history::Resolved)> {
-        match store.snapshot_at(at, o) {
-            Err(e) => match branch::inherited_commit(&e) {
-                Some(c) => {
-                    let owner = self.owned_set()?.normalize(c);
-                    let up = self.branch_by_id(owner.branch_id)?;
-                    drop(store);
+        self.snapshot_pinned(&store, at, options)
+            .map(|(snapshot, resolved, _)| (snapshot, resolved))
+    }
+
+    /// Resolve a view from an already retained branch store in this dataset family,
+    /// following inherited history by identity. Call on the family's owning store,
+    /// as for branch_snapshot_at. The UUID names the branch that owns the commit.
+    pub fn snapshot_at_with_branch(
+        &self,
+        store: &Store,
+        at: &At,
+        options: &crate::history::HistoryOptions,
+    ) -> Result<(Arc<Snapshot>, crate::history::Resolved, uuid::Uuid)> {
+        if self.owner_dataset_id() != store.owner_dataset_id() {
+            return Err(Error::invalid(
+                "the pinned branch belongs to a different dataset family",
+            ));
+        }
+        self.snapshot_pinned(store, at, options)
+    }
+
+    fn snapshot_pinned(
+        &self,
+        store: &Store,
+        at: &At,
+        options: &crate::history::HistoryOptions,
+    ) -> Result<(Arc<Snapshot>, crate::history::Resolved, uuid::Uuid)> {
+        match store.snapshot_at(at, options) {
+            Ok((snapshot, resolved)) => Ok((snapshot, resolved, store.branch_id())),
+            Err(error) => match branch::inherited_commit(&error) {
+                Some(commit) => {
+                    let owner = self.owned_set()?.normalize(commit);
+                    let upstream = self.branch_by_id(owner.branch_id)?;
                     match at {
-                        // the upstream resolves a time before the branch started
-                        At::Time(_) => self.snapshot_following(up, at, o),
-                        _ => self.snapshot_following(up, &At::Commit(c.seq), o),
+                        At::Time(_) => self.snapshot_pinned(&upstream, at, options),
+                        _ => self.snapshot_pinned(&upstream, &At::Commit(commit.seq), options),
                     }
                 }
-                None => Err(e),
+                None => Err(error),
             },
-            r => r,
         }
     }
 

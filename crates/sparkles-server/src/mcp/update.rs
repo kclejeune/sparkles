@@ -208,6 +208,8 @@ impl Tools<'_> {
                 changes,
                 all_changes: false,
                 max_changes: 0,
+                retain_states: false,
+                state_max_memory: None,
             }),
         };
         // a caller limited to some graphs learns that the guard refused, not its results

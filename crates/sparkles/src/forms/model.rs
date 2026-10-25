@@ -352,6 +352,8 @@ impl Forms {
             changes: 1000,
             all_changes: false,
             max_changes: 0,
+            retain_states: false,
+            state_max_memory: None,
         };
         let mut wopts = opts.write.clone();
         wopts.message = change.message.clone().map(Arc::from);

@@ -1,5 +1,6 @@
 <script lang="ts">
   import { resolve } from '$app/paths';
+  import { exploreQuery, splitTarget } from '$lib/branches';
   import type { Term } from '$lib/api';
   import * as ex from '$lib/explore';
   import { shortLabel } from '$lib/graph';
@@ -100,11 +101,11 @@
         )
       : [],
   );
-  const href = (target: string) =>
-    `${resolve('/explore')}?ds=${encodeURIComponent(ds)}&iri=${encodeURIComponent(target)}`;
+  const href = (target: string) => `${resolve('/explore')}?${exploreQuery(ds, target)}`;
   const similarHref = $derived(
     `${resolve('/similar')}?${new URLSearchParams({
-      ds,
+      ds: splitTarget(ds).name,
+      ...(splitTarget(ds).branch === 'main' ? {} : { branch: splitTarget(ds).branch }),
       ...(predicate ? { predicate } : {}),
       iri,
       ...(metric !== 'cosine' ? { metric } : {}),

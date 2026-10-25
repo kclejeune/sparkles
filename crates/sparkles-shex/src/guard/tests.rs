@@ -1560,3 +1560,170 @@ fn operation_controls_survive_guard_adapter_and_runtime() {
         );
     }
 }
+
+#[test]
+fn replay_preview_uses_each_simulated_graph_schema_without_publishing_it() {
+    let dir = tempfile::tempdir().unwrap();
+    let main = open(&dir.path().join("replay-schema"));
+    put_shexr(&main, SCHEMA, SCHEMA_GRAPH);
+    main.create_branch("dev", &Default::default()).unwrap();
+    let dev = main.branch("dev").unwrap();
+    // Replace in one source commit, without an invalid empty-schema intermediate step.
+    let tighter = crate::parse_schema(
+        &SCHEMA.replace("150", "50"),
+        None,
+        Some(SchemaFormat::ShExC),
+    )
+    .unwrap();
+    let mut txn = dev.write();
+    let view = txn.view();
+    let graph_id = view.lookup_iri(SCHEMA_GRAPH).unwrap();
+    let mut removed = Vec::new();
+    view.for_each_quad(|quad| {
+        if quad[3] == graph_id {
+            removed.push(*quad);
+        }
+        Ok(())
+    })
+    .unwrap();
+    for quad in removed {
+        txn.delete(quad).unwrap();
+    }
+    let mut labels = std::collections::HashMap::new();
+    for triple in tighter.to_shexr().iter() {
+        let quad = oxrdf::Quad::new(
+            triple.subject.into_owned(),
+            triple.predicate.into_owned(),
+            triple.object.into_owned(),
+            NamedNode::new_unchecked(SCHEMA_GRAPH),
+        );
+        let ids = txn.encode_quad(&quad, &mut labels).unwrap();
+        txn.insert(ids).unwrap();
+    }
+    txn.commit().unwrap();
+    upd(
+        &dev,
+        "INSERT DATA {ex:late a ex:Person; foaf:name \"Late\"; foaf:age 100}",
+    )
+    .unwrap();
+    let (guard, _) = installed(
+        set_config(
+            &main,
+            Some(graph_cfg("reject", &[SCHEMA_GRAPH])),
+            &NoImports,
+        )
+        .unwrap(),
+    );
+    let head = main.snapshot().commit;
+    let status_before = serde_json::to_value(guard.status()).unwrap();
+    let options = sparkles_core::branch::MergeOptions {
+        replay: true,
+        write: sparkles_core::guard::WriteOptions {
+            dry_run: Some(sparkles_core::preview::DryRun {
+                retain_states: true,
+                ..Default::default()
+            }),
+            ..Default::default()
+        },
+        ..Default::default()
+    };
+    let preview = match main.merge("dev", "main", &options) {
+        Err(Error::DryRun(preview)) => preview,
+        other => panic!("expected preview: {other:?}"),
+    };
+    assert_eq!(preview.outcome(), sparkles_core::preview::Outcome::Rejected);
+    assert_eq!(main.snapshot().commit, head);
+    assert_eq!(serde_json::to_value(guard.status()).unwrap(), status_before);
+    assert!(matches!(
+        main.merge(
+            "dev",
+            "main",
+            &sparkles_core::branch::MergeOptions {
+                replay: true,
+                ..Default::default()
+            }
+        ),
+        Err(Error::Rejected(_))
+    ));
+    assert_eq!(main.snapshot().commit, head + 1);
+}
+
+#[test]
+fn bulk_schema_preview_preserves_the_committed_grandfather_baseline() {
+    let dir = tempfile::tempdir().unwrap();
+    let main = Store::open(
+        &dir.path().join("bulk-schema"),
+        StoreOptions {
+            bulk_threshold: 1,
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    put_shexr(&main, SCHEMA, SCHEMA_GRAPH);
+    upd(
+        &main,
+        "INSERT DATA {ex:old a ex:Person; foaf:name \"Old\"; foaf:age 100}",
+    )
+    .unwrap();
+    let mut config = graph_cfg("reject", &[SCHEMA_GRAPH]);
+    config.baseline = BaselinePolicy::Grandfather;
+    let (guard, _) = installed(set_config(&main, Some(config), &NoImports).unwrap());
+    let head = main.snapshot().commit;
+    let before = serde_json::to_value(guard.status()).unwrap();
+    for preview in [true, false] {
+        let opts = sparkles_core::guard::WriteOptions {
+            dry_run: preview.then(sparkles_core::preview::DryRun::default),
+            ..Default::default()
+        };
+        let mut txn = main.write_with(CommitKind::Transaction, opts);
+        let view = txn.view();
+        let graph = view.lookup_iri(SCHEMA_GRAPH).unwrap();
+        let mut removed = Vec::new();
+        view.for_each_quad(|quad| {
+            if quad[3] == graph {
+                removed.push(*quad);
+            }
+            Ok(())
+        })
+        .unwrap();
+        for quad in removed {
+            txn.delete(quad).unwrap();
+        }
+        let tighter = crate::parse_schema(
+            &SCHEMA.replace("150", "50"),
+            None,
+            Some(SchemaFormat::ShExC),
+        )
+        .unwrap();
+        let mut labels = std::collections::HashMap::new();
+        for triple in tighter.to_shexr().iter() {
+            let quad = oxrdf::Quad::new(
+                triple.subject.into_owned(),
+                triple.predicate.into_owned(),
+                triple.object.into_owned(),
+                NamedNode::new_unchecked(SCHEMA_GRAPH),
+            );
+            let ids = txn.encode_quad(&quad, &mut labels).unwrap();
+            txn.insert(ids).unwrap();
+        }
+        let unrelated = oxrdf::Quad::new(
+            NamedNode::new_unchecked("urn:unrelated"),
+            NamedNode::new_unchecked("urn:p"),
+            Literal::from(1),
+            oxrdf::GraphName::DefaultGraph,
+        );
+        let ids = txn.encode_quad(&unrelated, &mut labels).unwrap();
+        txn.insert_bulk(vec![ids]).unwrap();
+        match txn.commit() {
+            Err(Error::DryRun(report)) if preview => {
+                assert_eq!(report.outcome(), sparkles_core::preview::Outcome::Rejected)
+            }
+            Err(Error::Rejected(_)) if !preview => {}
+            other => panic!("expected grandfather rejection, preview={preview}: {other:?}"),
+        }
+        assert_eq!(main.snapshot().commit, head);
+        if preview {
+            assert_eq!(serde_json::to_value(guard.status()).unwrap(), before);
+        }
+    }
+}

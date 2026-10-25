@@ -874,7 +874,10 @@ impl Vocab {
         Ok(())
     }
 
-    pub(crate) fn get_with_checked<T, E>(
+    /// Decode one key after `reserve` admits reconstruction capacity, including
+    /// intermediate front-coded keys. The callback borrows the reconstructed key.
+    /// Callers may admit decoded output separately before allocating it.
+    pub fn get_with_checked<T, E>(
         &self,
         id: u64,
         reserve: impl FnMut(usize) -> std::result::Result<(), E>,

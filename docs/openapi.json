@@ -1281,6 +1281,71 @@
         ],
         "type": "object"
       },
+      "AnalysisInputs": {
+        "properties": {
+          "dataGraphs": {
+            "default": [
+              "default"
+            ],
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          },
+          "imports": {
+            "enum": [
+              "none",
+              "dataset",
+              "fetch"
+            ],
+            "type": "string"
+          },
+          "locationMapping": {
+            "items": {
+              "anyOf": [
+                {
+                  "properties": {
+                    "altName": {
+                      "type": "string"
+                    },
+                    "name": {
+                      "type": "string"
+                    }
+                  },
+                  "required": [
+                    "name",
+                    "altName"
+                  ],
+                  "type": "object"
+                },
+                {
+                  "properties": {
+                    "altPrefix": {
+                      "type": "string"
+                    },
+                    "prefix": {
+                      "type": "string"
+                    }
+                  },
+                  "required": [
+                    "prefix",
+                    "altPrefix"
+                  ],
+                  "type": "object"
+                }
+              ]
+            },
+            "type": "array"
+          },
+          "ontologyGraphs": {
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          }
+        },
+        "type": "object"
+      },
       "AskFeedback": {
         "additionalProperties": false,
         "description": "Feedback on an answer.",
@@ -6284,6 +6349,75 @@
         ],
         "type": "object"
       },
+      "DiagnosticFinding": {
+        "properties": {
+          "basis": {
+            "enum": [
+              "asserted",
+              "uses-inferences"
+            ],
+            "type": "string"
+          },
+          "check": {
+            "type": "string"
+          },
+          "evidence": {
+            "additionalProperties": {
+              "anyOf": [
+                {
+                  "$ref": "#/components/schemas/RdfTerm"
+                },
+                {
+                  "items": {
+                    "$ref": "#/components/schemas/RdfTerm"
+                  },
+                  "type": "array"
+                }
+              ]
+            },
+            "type": "object"
+          },
+          "focus": {
+            "$ref": "#/components/schemas/RdfTerm"
+          },
+          "justification": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/Justification"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "justificationComplete": {
+            "type": "boolean"
+          },
+          "message": {
+            "type": "string"
+          },
+          "rule": {
+            "type": "string"
+          },
+          "severity": {
+            "enum": [
+              "inconsistency",
+              "warning"
+            ],
+            "type": "string"
+          }
+        },
+        "required": [
+          "check",
+          "rule",
+          "severity",
+          "focus",
+          "evidence",
+          "basis",
+          "message"
+        ],
+        "type": "object"
+      },
       "DiagnosticsReport": {
         "description": "OWL 2 RL inconsistency checks and their findings.",
         "externalDocs": {
@@ -6356,62 +6490,15 @@
           },
           "findings": {
             "items": {
-              "properties": {
-                "basis": {
-                  "enum": [
-                    "asserted",
-                    "uses-inferences"
-                  ],
-                  "type": "string"
-                },
-                "check": {
-                  "type": "string"
-                },
-                "evidence": {
-                  "additionalProperties": {
-                    "anyOf": [
-                      {
-                        "$ref": "#/components/schemas/RdfTerm"
-                      },
-                      {
-                        "items": {
-                          "$ref": "#/components/schemas/RdfTerm"
-                        },
-                        "type": "array"
-                      }
-                    ]
-                  },
-                  "type": "object"
-                },
-                "focus": {
-                  "$ref": "#/components/schemas/RdfTerm"
-                },
-                "message": {
-                  "type": "string"
-                },
-                "rule": {
-                  "type": "string"
-                },
-                "severity": {
-                  "enum": [
-                    "inconsistency",
-                    "warning"
-                  ],
-                  "type": "string"
-                }
-              },
-              "required": [
-                "check",
-                "rule",
-                "severity",
-                "focus",
-                "evidence",
-                "basis",
-                "message"
-              ],
-              "type": "object"
+              "$ref": "#/components/schemas/DiagnosticFinding"
             },
             "type": "array"
+          },
+          "justificationChecks": {
+            "type": "integer"
+          },
+          "justificationsComplete": {
+            "type": "boolean"
           },
           "note": {
             "description": "The report never claims consistency.",
@@ -6733,6 +6820,19 @@
           "dryRun": {
             "const": true
           },
+          "entailments": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/EntailmentDiff"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "entailmentsUnavailable": {
+            "type": "string"
+          },
           "error": {
             "description": "The error the write would get.",
             "type": "string"
@@ -6904,6 +7004,143 @@
         ],
         "type": "object"
       },
+      "EntailmentDiff": {
+        "description": "Complete entailment counts over two retained states under the same program, with bounded samples and new inconsistency findings.",
+        "externalDocs": {
+          "url": "https://github.com/kclejeune/sparkles/blob/main/docs/API.md#explanations"
+        },
+        "properties": {
+          "added": {
+            "type": "integer"
+          },
+          "byClass": {
+            "additionalProperties": {
+              "properties": {
+                "added": {
+                  "type": "integer"
+                },
+                "removed": {
+                  "type": "integer"
+                }
+              },
+              "required": [
+                "added",
+                "removed"
+              ],
+              "type": "object"
+            },
+            "type": "object"
+          },
+          "byPredicate": {
+            "additionalProperties": {
+              "properties": {
+                "added": {
+                  "type": "integer"
+                },
+                "removed": {
+                  "type": "integer"
+                }
+              },
+              "required": [
+                "added",
+                "removed"
+              ],
+              "type": "object"
+            },
+            "type": "object"
+          },
+          "entailmentDiffFormat": {
+            "const": 1
+          },
+          "findingsComplete": {
+            "type": "boolean"
+          },
+          "from": {
+            "properties": {
+              "commit": {
+                "type": "integer"
+              },
+              "selector": {
+                "type": "string"
+              }
+            },
+            "required": [
+              "selector",
+              "commit"
+            ],
+            "type": "object"
+          },
+          "newFindings": {
+            "items": {
+              "$ref": "#/components/schemas/DiagnosticFinding"
+            },
+            "type": "array"
+          },
+          "removed": {
+            "type": "integer"
+          },
+          "sample": {
+            "properties": {
+              "added": {
+                "items": {
+                  "$ref": "#/components/schemas/RdfTripleTerms"
+                },
+                "type": "array"
+              },
+              "removed": {
+                "items": {
+                  "$ref": "#/components/schemas/RdfTripleTerms"
+                },
+                "type": "array"
+              }
+            },
+            "required": [
+              "added",
+              "removed"
+            ],
+            "type": "object"
+          },
+          "sampleTruncated": {
+            "type": "boolean"
+          },
+          "to": {
+            "properties": {
+              "commit": {
+                "type": "integer"
+              },
+              "selector": {
+                "type": "string"
+              }
+            },
+            "required": [
+              "selector",
+              "commit"
+            ],
+            "type": "object"
+          },
+          "warnings": {
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          }
+        },
+        "required": [
+          "entailmentDiffFormat",
+          "from",
+          "to",
+          "added",
+          "removed",
+          "byPredicate",
+          "byClass",
+          "sample",
+          "sampleTruncated",
+          "newFindings",
+          "findingsComplete",
+          "warnings"
+        ],
+        "type": "object"
+      },
       "Error": {
         "additionalProperties": true,
         "description": "The body of every non-2xx response. Some errors add members of their own.",
@@ -7013,6 +7250,15 @@
       },
       "ExplainHypothesis": {
         "properties": {
+          "consistencyComplete": {
+            "type": "boolean"
+          },
+          "inconsistent": {
+            "type": [
+              "boolean",
+              "null"
+            ]
+          },
           "missing": {
             "items": {
               "properties": {
@@ -9318,6 +9564,79 @@
         ],
         "type": "object"
       },
+      "InferenceExplainRequest": {
+        "description": "The triple to explain and the limits of the search.",
+        "externalDocs": {
+          "url": "https://github.com/kclejeune/sparkles/blob/main/docs/API.md#explanations"
+        },
+        "properties": {
+          "maxDepth": {
+            "maximum": 64,
+            "minimum": 1,
+            "type": "integer"
+          },
+          "maxHypotheses": {
+            "maximum": 100,
+            "minimum": 1,
+            "type": "integer"
+          },
+          "maxMissing": {
+            "maximum": 4,
+            "minimum": 1,
+            "type": "integer"
+          },
+          "maxTrees": {
+            "maximum": 10,
+            "minimum": 1,
+            "type": "integer"
+          },
+          "mode": {
+            "enum": [
+              "why",
+              "whyNot"
+            ],
+            "type": "string"
+          },
+          "profile": {
+            "type": "string"
+          },
+          "source": {
+            "enum": [
+              "materialized",
+              "demand"
+            ],
+            "type": "string"
+          },
+          "timeout": {
+            "description": "Seconds, 10 by default, capped at `--max-timeout`.",
+            "exclusiveMinimum": 0,
+            "type": "number"
+          },
+          "triple": {
+            "properties": {
+              "o": {
+                "$ref": "#/components/schemas/RdfTerm"
+              },
+              "p": {
+                "$ref": "#/components/schemas/RdfTerm"
+              },
+              "s": {
+                "$ref": "#/components/schemas/RdfTerm"
+              }
+            },
+            "required": [
+              "s",
+              "p",
+              "o"
+            ],
+            "type": "object"
+          }
+        },
+        "required": [
+          "triple"
+        ],
+        "type": "object"
+      },
       "IngestForm": {
         "additionalProperties": false,
         "description": "An ingestion of an uploaded file, with the options of `IngestRequest` as fields.",
@@ -9739,6 +10058,214 @@
           "tasks",
           "capabilities"
         ],
+        "type": "object"
+      },
+      "Justification": {
+        "properties": {
+          "facts": {
+            "items": {
+              "$ref": "#/components/schemas/SupportFact"
+            },
+            "type": "array"
+          }
+        },
+        "required": [
+          "facts"
+        ],
+        "type": "object"
+      },
+      "JustificationReport": {
+        "description": "Subset-minimal asserted supports. A negative result is conclusive only when complete is true.",
+        "externalDocs": {
+          "url": "https://github.com/kclejeune/sparkles/blob/main/docs/API.md#explanations"
+        },
+        "properties": {
+          "checks": {
+            "type": "integer"
+          },
+          "commit": {
+            "type": "integer"
+          },
+          "complete": {
+            "type": "boolean"
+          },
+          "justificationFormat": {
+            "const": 1
+          },
+          "results": {
+            "items": {
+              "$ref": "#/components/schemas/JustifiedTarget"
+            },
+            "type": "array"
+          }
+        },
+        "required": [
+          "justificationFormat",
+          "commit",
+          "checks",
+          "complete",
+          "results"
+        ],
+        "type": "object"
+      },
+      "JustifiedTarget": {
+        "properties": {
+          "class": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "complete": {
+            "type": "boolean"
+          },
+          "finding": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/DiagnosticFinding"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "holds": {
+            "type": "boolean"
+          },
+          "justifications": {
+            "items": {
+              "$ref": "#/components/schemas/Justification"
+            },
+            "type": "array"
+          }
+        },
+        "required": [
+          "class",
+          "finding",
+          "holds",
+          "complete",
+          "justifications"
+        ],
+        "type": "object"
+      },
+      "JustifyRequest": {
+        "description": "Exactly one finding, class IRI or classes=all target, with one bounded analysis program.",
+        "externalDocs": {
+          "url": "https://github.com/kclejeune/sparkles/blob/main/docs/API.md#explanations"
+        },
+        "oneOf": [
+          {
+            "required": [
+              "finding"
+            ]
+          },
+          {
+            "required": [
+              "class"
+            ]
+          },
+          {
+            "required": [
+              "classes"
+            ]
+          }
+        ],
+        "properties": {
+          "at": {
+            "type": "string"
+          },
+          "class": {
+            "type": "string"
+          },
+          "classes": {
+            "const": "all"
+          },
+          "finding": {
+            "properties": {
+              "check": {
+                "type": "string"
+              },
+              "evidence": {
+                "additionalProperties": {
+                  "anyOf": [
+                    {
+                      "$ref": "#/components/schemas/RdfTerm"
+                    },
+                    {
+                      "items": {
+                        "$ref": "#/components/schemas/RdfTerm"
+                      },
+                      "type": "array"
+                    }
+                  ]
+                },
+                "type": "object"
+              },
+              "focus": {
+                "$ref": "#/components/schemas/RdfTerm"
+              },
+              "rule": {
+                "type": "string"
+              }
+            },
+            "required": [
+              "check",
+              "focus",
+              "evidence"
+            ],
+            "type": "object"
+          },
+          "geoDefaultGeometry": {
+            "type": "boolean"
+          },
+          "inputs": {
+            "$ref": "#/components/schemas/AnalysisInputs"
+          },
+          "maxChecks": {
+            "default": 500,
+            "maximum": 100000,
+            "minimum": 1,
+            "type": "integer"
+          },
+          "maxInferred": {
+            "minimum": 1,
+            "type": "integer"
+          },
+          "maxJustifications": {
+            "default": 5,
+            "maximum": 100,
+            "minimum": 1,
+            "type": "integer"
+          },
+          "maxMemory": {
+            "description": "Bytes for retained states and the analysis, capped at the server budget.",
+            "minimum": 1,
+            "type": "integer"
+          },
+          "profile": {
+            "description": "The same profile for both states. Omit the program to use the dataset's recorded program. Without a record, an explicit program is required; empty rules select asserted-only analysis.",
+            "type": "string"
+          },
+          "rules": {
+            "type": "string"
+          },
+          "threads": {
+            "description": "Library callers may choose parallelism. HTTP uses the server reasoning pool.",
+            "minimum": 1,
+            "type": "integer"
+          },
+          "timeout": {
+            "description": "Seconds. Capped at the server timeout.",
+            "exclusiveMinimum": 0,
+            "type": "number"
+          },
+          "vocabularies": {
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          }
+        },
         "type": "object"
       },
       "Level": {
@@ -10524,6 +11051,10 @@
           "dryRun": {
             "type": "boolean"
           },
+          "entailments": {
+            "description": "Include complete candidate entailment changes. Requires dryRun=true.",
+            "type": "boolean"
+          },
           "exempt": {
             "description": "Predicate IRIs whose cells never conflict in this merge, besides the dataset's.",
             "items": {
@@ -10551,6 +11082,9 @@
             ],
             "type": "string"
           },
+          "geoDefaultGeometry": {
+            "type": "boolean"
+          },
           "inferences": {
             "enum": [
               "exclude",
@@ -10558,7 +11092,16 @@
             ],
             "type": "string"
           },
+          "inputs": {
+            "$ref": "#/components/schemas/AnalysisInputs"
+          },
           "limit": {
+            "type": "integer"
+          },
+          "maxInferred": {
+            "type": "integer"
+          },
+          "maxMemory": {
             "type": "integer"
           },
           "message": {
@@ -10571,6 +11114,9 @@
               "theirs",
               "union"
             ],
+            "type": "string"
+          },
+          "profile": {
             "type": "string"
           },
           "resolutions": {
@@ -10613,6 +11159,9 @@
             },
             "type": "array"
           },
+          "rules": {
+            "type": "string"
+          },
           "source": {
             "type": "string"
           },
@@ -10623,6 +11172,19 @@
           "target": {
             "description": "Default `main`.",
             "type": "string"
+          },
+          "threads": {
+            "type": "integer"
+          },
+          "timeout": {
+            "exclusiveMinimum": 0,
+            "type": "number"
+          },
+          "vocabularies": {
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
           }
         },
         "required": [
@@ -10676,6 +11238,19 @@
             },
             "type": "object"
           },
+          "entailments": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/EntailmentDiff"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "entailmentsUnavailable": {
+            "type": "string"
+          },
           "fastForward": {
             "type": "boolean"
           },
@@ -10687,6 +11262,9 @@
           },
           "merged": {
             "type": "boolean"
+          },
+          "previewOutcome": {
+            "type": "string"
           },
           "replayed": {
             "description": "With `ff: \"replay\"`, the source commits replayed, in order, each with the commit it became (`null` in a preview).",
@@ -12970,6 +13548,10 @@
           "dryRun": {
             "type": "boolean"
           },
+          "entailments": {
+            "description": "Include complete candidate entailment changes. Requires dryRun=true.",
+            "type": "boolean"
+          },
           "exempt": {
             "items": {
               "type": "string"
@@ -12985,6 +13567,9 @@
             },
             "type": "object"
           },
+          "geoDefaultGeometry": {
+            "type": "boolean"
+          },
           "inferences": {
             "enum": [
               "exclude",
@@ -12992,7 +13577,16 @@
             ],
             "type": "string"
           },
+          "inputs": {
+            "$ref": "#/components/schemas/AnalysisInputs"
+          },
           "limit": {
+            "type": "integer"
+          },
+          "maxInferred": {
+            "type": "integer"
+          },
+          "maxMemory": {
             "type": "integer"
           },
           "message": {
@@ -13007,10 +13601,29 @@
             ],
             "type": "string"
           },
+          "profile": {
+            "type": "string"
+          },
           "resolutions": {
             "items": {
               "description": "As in a MergeRequest.",
               "type": "object"
+            },
+            "type": "array"
+          },
+          "rules": {
+            "type": "string"
+          },
+          "threads": {
+            "type": "integer"
+          },
+          "timeout": {
+            "exclusiveMinimum": 0,
+            "type": "number"
+          },
+          "vocabularies": {
+            "items": {
+              "type": "string"
             },
             "type": "array"
           }
@@ -13887,6 +14500,22 @@
           "value"
         ],
         "type": "object"
+      },
+      "RdfTripleTerms": {
+        "maxItems": 3,
+        "minItems": 3,
+        "prefixItems": [
+          {
+            "$ref": "#/components/schemas/RdfTerm"
+          },
+          {
+            "$ref": "#/components/schemas/RdfTerm"
+          },
+          {
+            "$ref": "#/components/schemas/RdfTerm"
+          }
+        ],
+        "type": "array"
       },
       "RdfsRequest": {
         "description": "The graph that holds the schema. A schema document in an RDF syntax is sent with its own media type instead.",
@@ -18499,6 +19128,36 @@
         "required": [
           "dataset",
           "suggestions"
+        ],
+        "type": "object"
+      },
+      "SupportFact": {
+        "properties": {
+          "graph": {
+            "anyOf": [
+              {
+                "const": "default"
+              },
+              {
+                "$ref": "#/components/schemas/RdfTerm"
+              }
+            ]
+          },
+          "role": {
+            "enum": [
+              "schema",
+              "assertion"
+            ],
+            "type": "string"
+          },
+          "triple": {
+            "$ref": "#/components/schemas/RdfTripleTerms"
+          }
+        },
+        "required": [
+          "triple",
+          "graph",
+          "role"
         ],
         "type": "object"
       },
@@ -30202,6 +30861,87 @@
             "$ref": "#/components/parameters/ds"
           },
           {
+            "description": "The shared reasoning profile. Omit it to use the recorded program.",
+            "in": "query",
+            "name": "profile",
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "Jena rule text for the rules profile.",
+            "in": "query",
+            "name": "rules",
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "JSON AnalysisInputs with dataGraphs, ontologyGraphs, imports and locationMapping.",
+            "in": "query",
+            "name": "inputs",
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "A JSON array of built-in vocabulary names.",
+            "in": "query",
+            "name": "vocabularies",
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "Include GeoSPARQL default geometry inference.",
+            "in": "query",
+            "name": "geoDefaultGeometry",
+            "schema": {
+              "type": "boolean"
+            }
+          },
+          {
+            "description": "The analysis memory allowance in bytes, capped at the server budget.",
+            "in": "query",
+            "name": "maxMemory",
+            "schema": {
+              "type": "integer"
+            }
+          },
+          {
+            "description": "The most inferred triples, capped at the server reasoning limit.",
+            "in": "query",
+            "name": "maxInferred",
+            "schema": {
+              "type": "integer"
+            }
+          },
+          {
+            "description": "HTTP uses the server reasoning pool.",
+            "in": "query",
+            "name": "threads",
+            "schema": {
+              "type": "integer"
+            }
+          },
+          {
+            "description": "Include reasoning changes for the complete merged candidate. Unresolved conflicts mark entailments unavailable.",
+            "in": "query",
+            "name": "entailments",
+            "schema": {
+              "type": "boolean"
+            }
+          },
+          {
+            "description": "Analysis timeout in seconds, capped at the server timeout.",
+            "in": "query",
+            "name": "timeout",
+            "schema": {
+              "exclusiveMinimum": 0,
+              "type": "number"
+            }
+          },
+          {
             "description": "The branch to merge.",
             "in": "query",
             "name": "source",
@@ -32238,7 +32978,7 @@
     },
     "/$/reason/{ds}/diagnostics": {
       "get": {
-        "description": "OWL 2 RL inconsistency checks.",
+        "description": "OWL 2 RL inconsistency checks. With justify=true, attach the first subset-minimal support to each finding under one deadline and check budget.",
         "externalDocs": {
           "url": "https://github.com/kclejeune/sparkles/blob/main/docs/API.md#reasoning-status-and-diagnostics"
         },
@@ -32246,6 +32986,22 @@
         "parameters": [
           {
             "$ref": "#/components/parameters/ds"
+          },
+          {
+            "description": "Attach first minimal supports.",
+            "in": "query",
+            "name": "justify",
+            "schema": {
+              "type": "boolean"
+            }
+          },
+          {
+            "description": "The most oracle checks shared by all requested supports.",
+            "in": "query",
+            "name": "maxChecks",
+            "schema": {
+              "type": "integer"
+            }
           }
         ],
         "responses": {
@@ -32279,6 +33035,183 @@
         "x-sparkles-permission": "read"
       }
     },
+    "/$/reason/{ds}/diff": {
+      "get": {
+        "description": "Reads both states under their branch-specific query graph grants. Uses the same program on both states and does not write or change materialization records. JSON counts cover the complete delta with bounded samples. TriG and RDF Patch require retaining every changed triple and refuse a truncated delta.",
+        "externalDocs": {
+          "url": "https://github.com/kclejeune/sparkles/blob/main/docs/API.md#explanations"
+        },
+        "operationId": "entailmentDiff",
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/ds"
+          },
+          {
+            "description": "The shared reasoning profile. Omit it to use the recorded program.",
+            "in": "query",
+            "name": "profile",
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "Jena rule text for the rules profile.",
+            "in": "query",
+            "name": "rules",
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "JSON AnalysisInputs with dataGraphs, ontologyGraphs, imports and locationMapping.",
+            "in": "query",
+            "name": "inputs",
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "A JSON array of built-in vocabulary names.",
+            "in": "query",
+            "name": "vocabularies",
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "Include GeoSPARQL default geometry inference.",
+            "in": "query",
+            "name": "geoDefaultGeometry",
+            "schema": {
+              "type": "boolean"
+            }
+          },
+          {
+            "description": "The analysis memory allowance in bytes, capped at the server budget.",
+            "in": "query",
+            "name": "maxMemory",
+            "schema": {
+              "type": "integer"
+            }
+          },
+          {
+            "description": "The most inferred triples, capped at the server reasoning limit.",
+            "in": "query",
+            "name": "maxInferred",
+            "schema": {
+              "type": "integer"
+            }
+          },
+          {
+            "description": "HTTP uses the server reasoning pool.",
+            "in": "query",
+            "name": "threads",
+            "schema": {
+              "type": "integer"
+            }
+          },
+          {
+            "description": "A branch, branch@commit or current-branch commit selector.",
+            "in": "query",
+            "name": "from",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "The second state selector, head by default.",
+            "in": "query",
+            "name": "to",
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "Seconds, capped at the server timeout.",
+            "in": "query",
+            "name": "timeout",
+            "schema": {
+              "exclusiveMinimum": 0,
+              "type": "number"
+            }
+          },
+          {
+            "description": "The most retained triples in each direction.",
+            "in": "query",
+            "name": "sampleLimit",
+            "schema": {
+              "default": 100,
+              "maximum": 10000,
+              "minimum": 1,
+              "type": "integer"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/EntailmentDiff"
+                }
+              },
+              "application/rdf-patch": {
+                "schema": {
+                  "type": "string"
+                }
+              },
+              "application/trig": {
+                "schema": {
+                  "type": "string"
+                }
+              },
+              "text/rdf-patch": {
+                "schema": {
+                  "type": "string"
+                }
+              }
+            },
+            "description": "The complete counts and samples, or all changed triples."
+          },
+          "400": {
+            "$ref": "#/components/responses/BadRequest"
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "403": {
+            "$ref": "#/components/responses/Forbidden"
+          },
+          "404": {
+            "$ref": "#/components/responses/NotFound"
+          },
+          "408": {
+            "$ref": "#/components/responses/Timeout"
+          },
+          "410": {
+            "$ref": "#/components/responses/Gone"
+          },
+          "422": {
+            "$ref": "#/components/responses/Unprocessable"
+          },
+          "501": {
+            "$ref": "#/components/responses/NotImplemented"
+          },
+          "507": {
+            "$ref": "#/components/responses/InsufficientStorage"
+          },
+          "default": {
+            "$ref": "#/components/responses/Error"
+          }
+        },
+        "summary": "Compare entailments between retained states",
+        "tags": [
+          "Reasoning"
+        ],
+        "x-sparkles-permission": "read"
+      }
+    },
     "/$/reason/{ds}/explain": {
       "post": {
         "description": "Derivation trees for a triple of the materialized inferences or of what RDFS on read answers, searched from the facts the caller reads. Mode `whyNot` returns verified sets of missing facts. Source `demand` derives from the current visible inputs, with an explicit profile when the dataset has no recorded program. A bounded partial tree marks unexplained premises. A triple with no derivation from readable facts answers `404` with code `no-visible-derivation`, as one that is not entailed does, and a search over its limits answers `422` with code `reasoning-budget`.",
@@ -32295,7 +33228,7 @@
           "content": {
             "application/json": {
               "schema": {
-                "$ref": "#/components/schemas/ExplainRequest"
+                "$ref": "#/components/schemas/InferenceExplainRequest"
               }
             }
           },
@@ -32351,6 +33284,96 @@
           }
         ],
         "summary": "Explain why a triple is inferred",
+        "tags": [
+          "Reasoning"
+        ],
+        "x-sparkles-permission": "read"
+      }
+    },
+    "/$/reason/{ds}/justify": {
+      "post": {
+        "description": "Targets one finding, one class IRI or classes=all. Supports contain asserted quads and their schema or assertion role. Alternative supports share one bounded search. Incomplete results never certify a negative result or return an uncertified support. Reads only query-visible graphs and writes no dataset state.",
+        "externalDocs": {
+          "url": "https://github.com/kclejeune/sparkles/blob/main/docs/API.md#explanations"
+        },
+        "operationId": "justifyFinding",
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/ds"
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/JustifyRequest"
+              }
+            }
+          },
+          "description": "",
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/JustificationReport"
+                }
+              }
+            },
+            "description": "Minimal supports and search completeness."
+          },
+          "400": {
+            "$ref": "#/components/responses/BadRequest"
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "403": {
+            "$ref": "#/components/responses/Forbidden"
+          },
+          "404": {
+            "$ref": "#/components/responses/NotFound"
+          },
+          "408": {
+            "$ref": "#/components/responses/Timeout"
+          },
+          "410": {
+            "$ref": "#/components/responses/Gone"
+          },
+          "422": {
+            "$ref": "#/components/responses/Unprocessable"
+          },
+          "501": {
+            "$ref": "#/components/responses/NotImplemented"
+          },
+          "507": {
+            "$ref": "#/components/responses/InsufficientStorage"
+          },
+          "default": {
+            "$ref": "#/components/responses/Error"
+          }
+        },
+        "security": [
+          {
+            "basicAuth": []
+          },
+          {
+            "apiToken": []
+          },
+          {
+            "oidcAccessToken": []
+          },
+          {
+            "csrfToken": [],
+            "sessionCookie": []
+          },
+          {
+            "cloudflareAccess": []
+          }
+        ],
+        "summary": "Find minimal inconsistency supports",
         "tags": [
           "Reasoning"
         ],
@@ -38065,6 +39088,78 @@
             "schema": {
               "type": "integer"
             }
+          },
+          {
+            "description": "Include complete candidate entailment changes in a JSON dry run. Requires dryRun=true.",
+            "in": "query",
+            "name": "entailments",
+            "schema": {
+              "type": "boolean"
+            }
+          },
+          {
+            "description": "The shared reasoning profile. Omit it to use the recorded program.",
+            "in": "query",
+            "name": "profile",
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "Jena rule text for the rules profile.",
+            "in": "query",
+            "name": "rules",
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "JSON AnalysisInputs with dataGraphs, ontologyGraphs, imports and locationMapping.",
+            "in": "query",
+            "name": "inputs",
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "A JSON array of built-in vocabulary names.",
+            "in": "query",
+            "name": "vocabularies",
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "Include GeoSPARQL default geometry inference.",
+            "in": "query",
+            "name": "geoDefaultGeometry",
+            "schema": {
+              "type": "boolean"
+            }
+          },
+          {
+            "description": "The analysis memory allowance in bytes, capped at the server budget.",
+            "in": "query",
+            "name": "maxMemory",
+            "schema": {
+              "type": "integer"
+            }
+          },
+          {
+            "description": "The most inferred triples, capped at the server reasoning limit.",
+            "in": "query",
+            "name": "maxInferred",
+            "schema": {
+              "type": "integer"
+            }
+          },
+          {
+            "description": "HTTP uses the server reasoning pool.",
+            "in": "query",
+            "name": "threads",
+            "schema": {
+              "type": "integer"
+            }
           }
         ],
         "responses": {
@@ -38384,6 +39479,78 @@
             }
           },
           {
+            "description": "Include complete candidate entailment changes in a JSON dry run. Requires dryRun=true.",
+            "in": "query",
+            "name": "entailments",
+            "schema": {
+              "type": "boolean"
+            }
+          },
+          {
+            "description": "The shared reasoning profile. Omit it to use the recorded program.",
+            "in": "query",
+            "name": "profile",
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "Jena rule text for the rules profile.",
+            "in": "query",
+            "name": "rules",
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "JSON AnalysisInputs with dataGraphs, ontologyGraphs, imports and locationMapping.",
+            "in": "query",
+            "name": "inputs",
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "A JSON array of built-in vocabulary names.",
+            "in": "query",
+            "name": "vocabularies",
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "Include GeoSPARQL default geometry inference.",
+            "in": "query",
+            "name": "geoDefaultGeometry",
+            "schema": {
+              "type": "boolean"
+            }
+          },
+          {
+            "description": "The analysis memory allowance in bytes, capped at the server budget.",
+            "in": "query",
+            "name": "maxMemory",
+            "schema": {
+              "type": "integer"
+            }
+          },
+          {
+            "description": "The most inferred triples, capped at the server reasoning limit.",
+            "in": "query",
+            "name": "maxInferred",
+            "schema": {
+              "type": "integer"
+            }
+          },
+          {
+            "description": "HTTP uses the server reasoning pool.",
+            "in": "query",
+            "name": "threads",
+            "schema": {
+              "type": "integer"
+            }
+          },
+          {
             "$ref": "#/components/parameters/defaultGraphUri"
           },
           {
@@ -38409,9 +39576,6 @@
           },
           {
             "$ref": "#/components/parameters/execution"
-          },
-          {
-            "$ref": "#/components/parameters/profile"
           },
           {
             "$ref": "#/components/parameters/nocache"
@@ -38845,6 +40009,78 @@
             "description": "The most validation results reported when a write is rejected.",
             "in": "query",
             "name": "validationLimit",
+            "schema": {
+              "type": "integer"
+            }
+          },
+          {
+            "description": "Include complete candidate entailment changes in a JSON dry run. Requires dryRun=true.",
+            "in": "query",
+            "name": "entailments",
+            "schema": {
+              "type": "boolean"
+            }
+          },
+          {
+            "description": "The shared reasoning profile. Omit it to use the recorded program.",
+            "in": "query",
+            "name": "profile",
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "Jena rule text for the rules profile.",
+            "in": "query",
+            "name": "rules",
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "JSON AnalysisInputs with dataGraphs, ontologyGraphs, imports and locationMapping.",
+            "in": "query",
+            "name": "inputs",
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "A JSON array of built-in vocabulary names.",
+            "in": "query",
+            "name": "vocabularies",
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "Include GeoSPARQL default geometry inference.",
+            "in": "query",
+            "name": "geoDefaultGeometry",
+            "schema": {
+              "type": "boolean"
+            }
+          },
+          {
+            "description": "The analysis memory allowance in bytes, capped at the server budget.",
+            "in": "query",
+            "name": "maxMemory",
+            "schema": {
+              "type": "integer"
+            }
+          },
+          {
+            "description": "The most inferred triples, capped at the server reasoning limit.",
+            "in": "query",
+            "name": "maxInferred",
+            "schema": {
+              "type": "integer"
+            }
+          },
+          {
+            "description": "HTTP uses the server reasoning pool.",
+            "in": "query",
+            "name": "threads",
             "schema": {
               "type": "integer"
             }
@@ -39330,6 +40566,78 @@
             "schema": {
               "type": "integer"
             }
+          },
+          {
+            "description": "Include complete candidate entailment changes in a JSON dry run. Requires dryRun=true.",
+            "in": "query",
+            "name": "entailments",
+            "schema": {
+              "type": "boolean"
+            }
+          },
+          {
+            "description": "The shared reasoning profile. Omit it to use the recorded program.",
+            "in": "query",
+            "name": "profile",
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "Jena rule text for the rules profile.",
+            "in": "query",
+            "name": "rules",
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "JSON AnalysisInputs with dataGraphs, ontologyGraphs, imports and locationMapping.",
+            "in": "query",
+            "name": "inputs",
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "A JSON array of built-in vocabulary names.",
+            "in": "query",
+            "name": "vocabularies",
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "Include GeoSPARQL default geometry inference.",
+            "in": "query",
+            "name": "geoDefaultGeometry",
+            "schema": {
+              "type": "boolean"
+            }
+          },
+          {
+            "description": "The analysis memory allowance in bytes, capped at the server budget.",
+            "in": "query",
+            "name": "maxMemory",
+            "schema": {
+              "type": "integer"
+            }
+          },
+          {
+            "description": "The most inferred triples, capped at the server reasoning limit.",
+            "in": "query",
+            "name": "maxInferred",
+            "schema": {
+              "type": "integer"
+            }
+          },
+          {
+            "description": "HTTP uses the server reasoning pool.",
+            "in": "query",
+            "name": "threads",
+            "schema": {
+              "type": "integer"
+            }
           }
         ],
         "requestBody": {
@@ -39678,6 +40986,78 @@
             "schema": {
               "type": "integer"
             }
+          },
+          {
+            "description": "Include complete candidate entailment changes in a JSON dry run. Requires dryRun=true.",
+            "in": "query",
+            "name": "entailments",
+            "schema": {
+              "type": "boolean"
+            }
+          },
+          {
+            "description": "The shared reasoning profile. Omit it to use the recorded program.",
+            "in": "query",
+            "name": "profile",
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "Jena rule text for the rules profile.",
+            "in": "query",
+            "name": "rules",
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "JSON AnalysisInputs with dataGraphs, ontologyGraphs, imports and locationMapping.",
+            "in": "query",
+            "name": "inputs",
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "A JSON array of built-in vocabulary names.",
+            "in": "query",
+            "name": "vocabularies",
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "Include GeoSPARQL default geometry inference.",
+            "in": "query",
+            "name": "geoDefaultGeometry",
+            "schema": {
+              "type": "boolean"
+            }
+          },
+          {
+            "description": "The analysis memory allowance in bytes, capped at the server budget.",
+            "in": "query",
+            "name": "maxMemory",
+            "schema": {
+              "type": "integer"
+            }
+          },
+          {
+            "description": "The most inferred triples, capped at the server reasoning limit.",
+            "in": "query",
+            "name": "maxInferred",
+            "schema": {
+              "type": "integer"
+            }
+          },
+          {
+            "description": "HTTP uses the server reasoning pool.",
+            "in": "query",
+            "name": "threads",
+            "schema": {
+              "type": "integer"
+            }
           }
         ],
         "requestBody": {
@@ -39864,6 +41244,78 @@
             "description": "The most validation results reported when a write is rejected.",
             "in": "query",
             "name": "validationLimit",
+            "schema": {
+              "type": "integer"
+            }
+          },
+          {
+            "description": "Include complete candidate entailment changes in a JSON dry run. Requires dryRun=true.",
+            "in": "query",
+            "name": "entailments",
+            "schema": {
+              "type": "boolean"
+            }
+          },
+          {
+            "description": "The shared reasoning profile. Omit it to use the recorded program.",
+            "in": "query",
+            "name": "profile",
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "Jena rule text for the rules profile.",
+            "in": "query",
+            "name": "rules",
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "JSON AnalysisInputs with dataGraphs, ontologyGraphs, imports and locationMapping.",
+            "in": "query",
+            "name": "inputs",
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "A JSON array of built-in vocabulary names.",
+            "in": "query",
+            "name": "vocabularies",
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "Include GeoSPARQL default geometry inference.",
+            "in": "query",
+            "name": "geoDefaultGeometry",
+            "schema": {
+              "type": "boolean"
+            }
+          },
+          {
+            "description": "The analysis memory allowance in bytes, capped at the server budget.",
+            "in": "query",
+            "name": "maxMemory",
+            "schema": {
+              "type": "integer"
+            }
+          },
+          {
+            "description": "The most inferred triples, capped at the server reasoning limit.",
+            "in": "query",
+            "name": "maxInferred",
+            "schema": {
+              "type": "integer"
+            }
+          },
+          {
+            "description": "HTTP uses the server reasoning pool.",
+            "in": "query",
+            "name": "threads",
             "schema": {
               "type": "integer"
             }
@@ -41596,6 +43048,78 @@
             "schema": {
               "type": "integer"
             }
+          },
+          {
+            "description": "Include complete candidate entailment changes in a JSON dry run. Requires dryRun=true.",
+            "in": "query",
+            "name": "entailments",
+            "schema": {
+              "type": "boolean"
+            }
+          },
+          {
+            "description": "The shared reasoning profile. Omit it to use the recorded program.",
+            "in": "query",
+            "name": "profile",
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "Jena rule text for the rules profile.",
+            "in": "query",
+            "name": "rules",
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "JSON AnalysisInputs with dataGraphs, ontologyGraphs, imports and locationMapping.",
+            "in": "query",
+            "name": "inputs",
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "A JSON array of built-in vocabulary names.",
+            "in": "query",
+            "name": "vocabularies",
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "Include GeoSPARQL default geometry inference.",
+            "in": "query",
+            "name": "geoDefaultGeometry",
+            "schema": {
+              "type": "boolean"
+            }
+          },
+          {
+            "description": "The analysis memory allowance in bytes, capped at the server budget.",
+            "in": "query",
+            "name": "maxMemory",
+            "schema": {
+              "type": "integer"
+            }
+          },
+          {
+            "description": "The most inferred triples, capped at the server reasoning limit.",
+            "in": "query",
+            "name": "maxInferred",
+            "schema": {
+              "type": "integer"
+            }
+          },
+          {
+            "description": "HTTP uses the server reasoning pool.",
+            "in": "query",
+            "name": "threads",
+            "schema": {
+              "type": "integer"
+            }
           }
         ],
         "requestBody": {
@@ -41815,6 +43339,78 @@
             "schema": {
               "type": "integer"
             }
+          },
+          {
+            "description": "Include complete candidate entailment changes in a JSON dry run. Requires dryRun=true.",
+            "in": "query",
+            "name": "entailments",
+            "schema": {
+              "type": "boolean"
+            }
+          },
+          {
+            "description": "The shared reasoning profile. Omit it to use the recorded program.",
+            "in": "query",
+            "name": "profile",
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "Jena rule text for the rules profile.",
+            "in": "query",
+            "name": "rules",
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "JSON AnalysisInputs with dataGraphs, ontologyGraphs, imports and locationMapping.",
+            "in": "query",
+            "name": "inputs",
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "A JSON array of built-in vocabulary names.",
+            "in": "query",
+            "name": "vocabularies",
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "Include GeoSPARQL default geometry inference.",
+            "in": "query",
+            "name": "geoDefaultGeometry",
+            "schema": {
+              "type": "boolean"
+            }
+          },
+          {
+            "description": "The analysis memory allowance in bytes, capped at the server budget.",
+            "in": "query",
+            "name": "maxMemory",
+            "schema": {
+              "type": "integer"
+            }
+          },
+          {
+            "description": "The most inferred triples, capped at the server reasoning limit.",
+            "in": "query",
+            "name": "maxInferred",
+            "schema": {
+              "type": "integer"
+            }
+          },
+          {
+            "description": "HTTP uses the server reasoning pool.",
+            "in": "query",
+            "name": "threads",
+            "schema": {
+              "type": "integer"
+            }
           }
         ],
         "requestBody": {
@@ -41985,6 +43581,78 @@
             "description": "The most validation results reported when a write is rejected.",
             "in": "query",
             "name": "validationLimit",
+            "schema": {
+              "type": "integer"
+            }
+          },
+          {
+            "description": "Include complete candidate entailment changes in a JSON dry run. Requires dryRun=true.",
+            "in": "query",
+            "name": "entailments",
+            "schema": {
+              "type": "boolean"
+            }
+          },
+          {
+            "description": "The shared reasoning profile. Omit it to use the recorded program.",
+            "in": "query",
+            "name": "profile",
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "Jena rule text for the rules profile.",
+            "in": "query",
+            "name": "rules",
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "JSON AnalysisInputs with dataGraphs, ontologyGraphs, imports and locationMapping.",
+            "in": "query",
+            "name": "inputs",
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "A JSON array of built-in vocabulary names.",
+            "in": "query",
+            "name": "vocabularies",
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "Include GeoSPARQL default geometry inference.",
+            "in": "query",
+            "name": "geoDefaultGeometry",
+            "schema": {
+              "type": "boolean"
+            }
+          },
+          {
+            "description": "The analysis memory allowance in bytes, capped at the server budget.",
+            "in": "query",
+            "name": "maxMemory",
+            "schema": {
+              "type": "integer"
+            }
+          },
+          {
+            "description": "The most inferred triples, capped at the server reasoning limit.",
+            "in": "query",
+            "name": "maxInferred",
+            "schema": {
+              "type": "integer"
+            }
+          },
+          {
+            "description": "HTTP uses the server reasoning pool.",
+            "in": "query",
+            "name": "threads",
             "schema": {
               "type": "integer"
             }
@@ -44635,6 +46303,78 @@
             "schema": {
               "type": "integer"
             }
+          },
+          {
+            "description": "Include complete candidate entailment changes in a JSON dry run. Requires dryRun=true.",
+            "in": "query",
+            "name": "entailments",
+            "schema": {
+              "type": "boolean"
+            }
+          },
+          {
+            "description": "The shared reasoning profile. Omit it to use the recorded program.",
+            "in": "query",
+            "name": "profile",
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "Jena rule text for the rules profile.",
+            "in": "query",
+            "name": "rules",
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "JSON AnalysisInputs with dataGraphs, ontologyGraphs, imports and locationMapping.",
+            "in": "query",
+            "name": "inputs",
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "A JSON array of built-in vocabulary names.",
+            "in": "query",
+            "name": "vocabularies",
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "Include GeoSPARQL default geometry inference.",
+            "in": "query",
+            "name": "geoDefaultGeometry",
+            "schema": {
+              "type": "boolean"
+            }
+          },
+          {
+            "description": "The analysis memory allowance in bytes, capped at the server budget.",
+            "in": "query",
+            "name": "maxMemory",
+            "schema": {
+              "type": "integer"
+            }
+          },
+          {
+            "description": "The most inferred triples, capped at the server reasoning limit.",
+            "in": "query",
+            "name": "maxInferred",
+            "schema": {
+              "type": "integer"
+            }
+          },
+          {
+            "description": "HTTP uses the server reasoning pool.",
+            "in": "query",
+            "name": "threads",
+            "schema": {
+              "type": "integer"
+            }
           }
         ],
         "requestBody": {
@@ -44928,6 +46668,78 @@
             "schema": {
               "type": "integer"
             }
+          },
+          {
+            "description": "Include complete candidate entailment changes in a JSON dry run. Requires dryRun=true.",
+            "in": "query",
+            "name": "entailments",
+            "schema": {
+              "type": "boolean"
+            }
+          },
+          {
+            "description": "The shared reasoning profile. Omit it to use the recorded program.",
+            "in": "query",
+            "name": "profile",
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "Jena rule text for the rules profile.",
+            "in": "query",
+            "name": "rules",
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "JSON AnalysisInputs with dataGraphs, ontologyGraphs, imports and locationMapping.",
+            "in": "query",
+            "name": "inputs",
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "A JSON array of built-in vocabulary names.",
+            "in": "query",
+            "name": "vocabularies",
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "Include GeoSPARQL default geometry inference.",
+            "in": "query",
+            "name": "geoDefaultGeometry",
+            "schema": {
+              "type": "boolean"
+            }
+          },
+          {
+            "description": "The analysis memory allowance in bytes, capped at the server budget.",
+            "in": "query",
+            "name": "maxMemory",
+            "schema": {
+              "type": "integer"
+            }
+          },
+          {
+            "description": "The most inferred triples, capped at the server reasoning limit.",
+            "in": "query",
+            "name": "maxInferred",
+            "schema": {
+              "type": "integer"
+            }
+          },
+          {
+            "description": "HTTP uses the server reasoning pool.",
+            "in": "query",
+            "name": "threads",
+            "schema": {
+              "type": "integer"
+            }
           }
         ],
         "requestBody": {
@@ -45150,6 +46962,78 @@
             "description": "The most validation results reported when a write is rejected.",
             "in": "query",
             "name": "validationLimit",
+            "schema": {
+              "type": "integer"
+            }
+          },
+          {
+            "description": "Include complete candidate entailment changes in a JSON dry run. Requires dryRun=true.",
+            "in": "query",
+            "name": "entailments",
+            "schema": {
+              "type": "boolean"
+            }
+          },
+          {
+            "description": "The shared reasoning profile. Omit it to use the recorded program.",
+            "in": "query",
+            "name": "profile",
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "Jena rule text for the rules profile.",
+            "in": "query",
+            "name": "rules",
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "JSON AnalysisInputs with dataGraphs, ontologyGraphs, imports and locationMapping.",
+            "in": "query",
+            "name": "inputs",
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "A JSON array of built-in vocabulary names.",
+            "in": "query",
+            "name": "vocabularies",
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "Include GeoSPARQL default geometry inference.",
+            "in": "query",
+            "name": "geoDefaultGeometry",
+            "schema": {
+              "type": "boolean"
+            }
+          },
+          {
+            "description": "The analysis memory allowance in bytes, capped at the server budget.",
+            "in": "query",
+            "name": "maxMemory",
+            "schema": {
+              "type": "integer"
+            }
+          },
+          {
+            "description": "The most inferred triples, capped at the server reasoning limit.",
+            "in": "query",
+            "name": "maxInferred",
+            "schema": {
+              "type": "integer"
+            }
+          },
+          {
+            "description": "HTTP uses the server reasoning pool.",
+            "in": "query",
+            "name": "threads",
             "schema": {
               "type": "integer"
             }
@@ -45492,6 +47376,78 @@
             "schema": {
               "type": "integer"
             }
+          },
+          {
+            "description": "Include complete candidate entailment changes in a JSON dry run. Requires dryRun=true.",
+            "in": "query",
+            "name": "entailments",
+            "schema": {
+              "type": "boolean"
+            }
+          },
+          {
+            "description": "The shared reasoning profile. Omit it to use the recorded program.",
+            "in": "query",
+            "name": "profile",
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "Jena rule text for the rules profile.",
+            "in": "query",
+            "name": "rules",
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "JSON AnalysisInputs with dataGraphs, ontologyGraphs, imports and locationMapping.",
+            "in": "query",
+            "name": "inputs",
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "A JSON array of built-in vocabulary names.",
+            "in": "query",
+            "name": "vocabularies",
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "Include GeoSPARQL default geometry inference.",
+            "in": "query",
+            "name": "geoDefaultGeometry",
+            "schema": {
+              "type": "boolean"
+            }
+          },
+          {
+            "description": "The analysis memory allowance in bytes, capped at the server budget.",
+            "in": "query",
+            "name": "maxMemory",
+            "schema": {
+              "type": "integer"
+            }
+          },
+          {
+            "description": "The most inferred triples, capped at the server reasoning limit.",
+            "in": "query",
+            "name": "maxInferred",
+            "schema": {
+              "type": "integer"
+            }
+          },
+          {
+            "description": "HTTP uses the server reasoning pool.",
+            "in": "query",
+            "name": "threads",
+            "schema": {
+              "type": "integer"
+            }
           }
         ],
         "requestBody": {
@@ -45675,6 +47631,78 @@
             "description": "The most validation results reported when a write is rejected.",
             "in": "query",
             "name": "validationLimit",
+            "schema": {
+              "type": "integer"
+            }
+          },
+          {
+            "description": "Include complete candidate entailment changes in a JSON dry run. Requires dryRun=true.",
+            "in": "query",
+            "name": "entailments",
+            "schema": {
+              "type": "boolean"
+            }
+          },
+          {
+            "description": "The shared reasoning profile. Omit it to use the recorded program.",
+            "in": "query",
+            "name": "profile",
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "Jena rule text for the rules profile.",
+            "in": "query",
+            "name": "rules",
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "JSON AnalysisInputs with dataGraphs, ontologyGraphs, imports and locationMapping.",
+            "in": "query",
+            "name": "inputs",
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "A JSON array of built-in vocabulary names.",
+            "in": "query",
+            "name": "vocabularies",
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "Include GeoSPARQL default geometry inference.",
+            "in": "query",
+            "name": "geoDefaultGeometry",
+            "schema": {
+              "type": "boolean"
+            }
+          },
+          {
+            "description": "The analysis memory allowance in bytes, capped at the server budget.",
+            "in": "query",
+            "name": "maxMemory",
+            "schema": {
+              "type": "integer"
+            }
+          },
+          {
+            "description": "The most inferred triples, capped at the server reasoning limit.",
+            "in": "query",
+            "name": "maxInferred",
+            "schema": {
+              "type": "integer"
+            }
+          },
+          {
+            "description": "HTTP uses the server reasoning pool.",
+            "in": "query",
+            "name": "threads",
             "schema": {
               "type": "integer"
             }

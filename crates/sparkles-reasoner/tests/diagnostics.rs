@@ -1007,3 +1007,51 @@ fn f16_typings_follow_the_checked_graphs() {
     u(r#"DELETE DATA { ex:a ex:p "abc" }"#);
     assert_eq!(foci(&[]), ["def"]);
 }
+
+#[test]
+fn controlled_diagnostics_honor_caller_cancellation_and_absolute_deadline() {
+    use sparkles_reasoner::diagnostics::{DiagnosticControls, diagnose_controlled};
+    use std::sync::{Arc, atomic::AtomicBool};
+    let store = store("ex:tom a ex:Cat, ex:Dog . ex:Cat owl:disjointWith ex:Dog .");
+    let cancelled = DiagnosticControls {
+        cancel: Some(Arc::new(AtomicBool::new(true))),
+        ..Default::default()
+    };
+    let error = diagnose_controlled(store.snapshot(), &opts(), None, &cancelled).unwrap_err();
+    assert!(matches!(
+        error.downcast_ref::<sparkles_core::Error>(),
+        Some(sparkles_core::Error::Cancelled)
+    ));
+    let expired = DiagnosticControls {
+        deadline: Some(std::time::Instant::now()),
+        ..Default::default()
+    };
+    let error = diagnose_controlled(store.snapshot(), &opts(), None, &expired).unwrap_err();
+    assert!(matches!(
+        error.downcast_ref::<sparkles_core::Error>(),
+        Some(sparkles_core::Error::Timeout)
+    ));
+}
+
+#[test]
+fn controlled_diagnostic_row_memory_limit_is_incomplete_not_absent() {
+    use sparkles_reasoner::diagnostics::{DiagnosticControls, diagnose_controlled};
+    let store = store("ex:tom a ex:Cat, ex:Dog . ex:Cat owl:disjointWith ex:Dog .");
+    let options = DiagnoseOptions {
+        checks: vec!["disjoint-classes".into()],
+        ..opts()
+    };
+    let report = diagnose_controlled(
+        store.snapshot(),
+        &options,
+        None,
+        &DiagnosticControls {
+            max_memory: Some(1),
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    assert_eq!(report.status, ReportStatus::Incomplete);
+    assert_eq!(report.checks[0].status, CheckStatus::Error);
+    assert!(report.findings.is_empty());
+}

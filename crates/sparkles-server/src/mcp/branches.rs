@@ -528,6 +528,8 @@ impl Tools<'_> {
                 changes,
                 all_changes: false,
                 max_changes: st.limits.max_rows as u64,
+                retain_states: false,
+                state_max_memory: None,
             });
             let prefix_map = dataset_prefixes(&ds);
             let prefixes = Prefixes::new(&prefix_map);

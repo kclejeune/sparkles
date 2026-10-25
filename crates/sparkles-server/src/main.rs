@@ -1974,6 +1974,15 @@ enum Cmd {
         /// is given); exits with 1 when violations are found, 2 when incomplete
         #[arg(long, conflicts_with = "clear")]
         check: bool,
+        /// Compare entailments of two states, such as main..feature, without writing
+        #[arg(long, value_name = "FROM..TO", conflicts_with_all = ["clear", "full", "status", "check", "why", "why_not"])]
+        diff: Option<String>,
+        /// Include the first minimal asserted support of each diagnostics finding
+        #[arg(long, requires = "check")]
+        justify: bool,
+        /// Oracle checks shared by all justification searches
+        #[arg(long, default_value_t = 500)]
+        max_checks: usize,
         /// Comma-separated check ids (default: all)
         #[arg(long, value_delimiter = ',', requires = "check")]
         checks: Vec<String>,
@@ -4250,6 +4259,9 @@ fn run() -> Result<()> {
             full,
             status,
             check,
+            diff,
+            justify,
+            max_checks,
             checks,
             limit,
             no_inferences,
@@ -4274,6 +4286,25 @@ fn run() -> Result<()> {
             outbound,
         } => {
             use sparkles_reasoner::diagnostics::{self, Closure, DiagnoseOptions};
+            if let Some(range) = diff {
+                return entailment_diff_cli(
+                    &loc,
+                    &range,
+                    opts,
+                    profile.as_deref(),
+                    rules.as_deref(),
+                    &vocab,
+                    geo_default_geometry,
+                    &data_graphs,
+                    &ontology_graphs,
+                    imports.as_deref(),
+                    location_mapping.as_deref(),
+                    threads,
+                    max_inferred,
+                    timeout,
+                    &format,
+                );
+            }
             if why.is_some() || why_not.is_some() {
                 let mode = if why_not.is_some() { "whyNot" } else { "why" };
                 let text = why.or(why_not).expect("explanation text");
@@ -4464,14 +4495,44 @@ fn run() -> Result<()> {
                 .file_name()
                 .map(|f| f.to_string_lossy().into_owned())
                 .unwrap_or_else(|| "db".into());
-            let (report, j) =
-                match reasoning::diagnostics_json(&name, &store, info.as_ref(), &dopts) {
-                    Ok(r) => r,
-                    Err(e) => {
-                        eprintln!("error: {e:#}");
-                        std::process::exit(2);
-                    }
-                };
+            let (diagnostic_dataset, _keep_main) = store.into_dataset();
+            let supports = if justify {
+                Some(diagnostic_dataset.reasoning().diagnostics_justified(
+                    &dopts,
+                    &sparkles::reasoning::analysis::AnalysisOptions {
+                        timeout: dopts.timeout,
+                        ..Default::default()
+                    },
+                    max_checks,
+                )?)
+            } else {
+                None
+            };
+            let (report, mut j) = match supports
+                .as_ref()
+                .map(|supports| {
+                    Ok(reasoning::diagnostics_render(
+                        &name,
+                        supports.diagnostics.clone(),
+                    ))
+                })
+                .unwrap_or_else(|| {
+                    reasoning::diagnostics_json(
+                        &name,
+                        diagnostic_dataset.store(),
+                        info.as_ref(),
+                        &dopts,
+                    )
+                }) {
+                Ok(r) => r,
+                Err(e) => {
+                    eprintln!("error: {e:#}");
+                    std::process::exit(2);
+                }
+            };
+            if let Some(supports) = &supports {
+                supports.attach(&mut j);
+            }
             if format == "json" {
                 println!("{}", serde_json::to_string_pretty(&j)?);
             } else if format == "turtle" {
@@ -4486,8 +4547,32 @@ fn run() -> Result<()> {
                         prefixes: &dopts.prefixes,
                     })
                 );
+                if let Some(supports) = &supports {
+                    print!("{}", supports.supports.to_turtle());
+                }
             } else {
                 print_diagnostics(&report, &j);
+                if let Some(supports) = &supports {
+                    for result in &supports.supports.results {
+                        if let Some(finding) = &result.finding {
+                            println!("justification for {} at {}", finding.check, finding.focus);
+                        }
+                        for support in &result.justifications {
+                            for fact in &support.facts {
+                                println!("  {} {}", fact.role, fact.quad);
+                            }
+                        }
+                        if !result.complete {
+                            println!("  support search incomplete");
+                        }
+                    }
+                }
+            }
+            if supports
+                .as_ref()
+                .is_some_and(|supports| !supports.supports.complete)
+            {
+                std::process::exit(2);
             }
             std::process::exit(match report.status {
                 diagnostics::ReportStatus::NoneFound => 0,
@@ -5841,4 +5926,143 @@ fn query_reasoning_options(
         }
         Some(other) => bail!("--reasoning must be materialized, demand or false, not {other}"),
     }
+}
+
+#[cfg(feature = "reasoning")]
+#[allow(clippy::too_many_arguments)]
+fn entailment_diff_cli(
+    loc: &std::path::Path,
+    range: &str,
+    options: StoreOptions,
+    profile: Option<&str>,
+    rules: Option<&std::path::Path>,
+    vocab: &[String],
+    geo: bool,
+    data_graphs: &[String],
+    ontology_graphs: &[String],
+    imports: Option<&str>,
+    location_mapping: Option<&std::path::Path>,
+    threads: Option<usize>,
+    max_inferred: usize,
+    timeout: Option<f64>,
+    format: &str,
+) -> Result<()> {
+    use sparkles::reasoning::analysis::AnalysisProgram;
+    use sparkles::reasoning::diff::DiffRequest;
+    use sparkles_reasoner::{GraphRef, Inputs, Profile};
+    let (from, to) = range
+        .split_once("..")
+        .filter(|(from, to)| !from.is_empty() && !to.is_empty())
+        .context("--diff needs FROM..TO")?;
+    if !loc.join("CURRENT").exists() {
+        bail!("{} is not a Sparkles database (no CURRENT)", loc.display());
+    }
+    let (dataset, _keep_main) = branch_cmd::open_db(loc, options)?.into_dataset();
+    let mut request = DiffRequest::new(from, to);
+    request.analysis.threads = threads;
+    request.analysis.max_inferred = Some(no_limit_if_zero(max_inferred));
+    request.analysis.timeout = timeout
+        .map(|seconds| {
+            if !seconds.is_finite() || seconds <= 0.0 {
+                bail!("--timeout must be a positive number of seconds");
+            }
+            Ok(Duration::try_from_secs_f64(seconds)?)
+        })
+        .transpose()?;
+    let record = dataset.reasoning().record();
+    let explicit = profile.is_some()
+        || rules.is_some()
+        || !vocab.is_empty()
+        || geo
+        || !data_graphs.is_empty()
+        || !ontology_graphs.is_empty()
+        || imports.is_some()
+        || location_mapping.is_some();
+    if explicit {
+        let profile = match (rules, profile) {
+            (Some(file), _) => Profile::Rules(std::fs::read_to_string(file)?),
+            (None, Some(name)) => name.parse()?,
+            _ => record
+                .as_ref()
+                .map(|record| record.profile())
+                .transpose()?
+                .unwrap_or(Profile::Rdfs),
+        };
+        let extras = if !vocab.is_empty() || geo {
+            sparkles_reasoner::Extras::parse(vocab, geo)?
+        } else {
+            record
+                .as_ref()
+                .filter(|record| record.profile == profile.name())
+                .map(|record| record.extras())
+                .transpose()?
+                .unwrap_or_default()
+        };
+        let mut inputs = record
+            .as_ref()
+            .map(|record| record.run_inputs())
+            .transpose()?
+            .unwrap_or_else(Inputs::default);
+        if !data_graphs.is_empty() {
+            inputs.data_graphs = data_graphs
+                .iter()
+                .map(|graph| GraphRef::parse(graph).map_err(anyhow::Error::msg))
+                .collect::<Result<_>>()?;
+        }
+        if !ontology_graphs.is_empty() {
+            inputs.ontology_graphs = ontology_graphs
+                .iter()
+                .map(|graph| GraphRef::parse(graph).map_err(anyhow::Error::msg))
+                .collect::<Result<_>>()?;
+        }
+        if let Some(mode) = imports {
+            inputs.imports = mode.parse().map_err(anyhow::Error::msg)?;
+        }
+        if let Some(file) = location_mapping {
+            let (format, _) =
+                sparkles::io::format_for_path(file).context("unknown location mapping format")?;
+            inputs.location_mapping =
+                sparkles_reasoner::LocationMapping::from_jena(&std::fs::read(file)?, format)?;
+        }
+        request.analysis.program = Some(AnalysisProgram {
+            profile,
+            extras,
+            inputs,
+        });
+    }
+    request.all_changes = matches!(format, "turtle" | "trig" | "patch");
+    if request.all_changes {
+        request.sample_limit = 100_000;
+    }
+    let result = dataset.reasoning().diff(&request)?;
+    match format {
+        "json" => println!("{}", serde_json::to_string_pretty(&result.to_json())?),
+        "turtle" | "trig" => print!("{}", result.to_trig()?),
+        "patch" => print!("{}", result.to_patch()?),
+        "text" => {
+            println!(
+                "{} inferred triples added, {} removed",
+                result.added, result.removed
+            );
+            for (marker, rows) in [("+", &result.added_triples), ("-", &result.removed_triples)] {
+                for [s, p, o] in rows {
+                    println!("{marker} {s} {p} {o} .");
+                }
+            }
+            for finding in &result.new_findings {
+                println!(
+                    "new inconsistency check {} at {}: {}",
+                    finding.check, finding.focus, finding.message
+                );
+            }
+            if result.sample_truncated {
+                println!("the displayed triple samples are truncated");
+            }
+            if !result.findings_complete {
+                println!("new-finding checks are incomplete");
+            }
+        }
+        _ => bail!("unknown diff format {format}: text, json, turtle, trig or patch"),
+    }
+    Ok(())
 }

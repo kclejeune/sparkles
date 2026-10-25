@@ -545,6 +545,14 @@ fn expected_input_schemas() -> Vec<(&'static str, Value)> {
                 "maxDepth": {"type":"integer","minimum":1,"maximum":64,"default":32,"description":"The depth of the trees; deeper nodes are cut as ref nodes"},
                 "timeoutSeconds": to}}),
         ),
+        #[cfg(feature = "reasoning")]
+        (
+            "entailment_diff",
+            json!({"type":"object","additionalProperties":false,"required":["from"],"properties":{
+                "dataset":ds,"from":{"type":"string","minLength":1},"to":{"type":"string","default":"head"},
+                "profile":{"type":"string"},"rules":{"type":"string"},"inputs":{"type":"object"},
+                "sampleLimit":{"type":"integer","minimum":1,"maximum":100,"default":100},"timeoutSeconds":to}}),
+        ),
         #[cfg(feature = "shacl")]
         (
             "validate_shacl",
@@ -647,6 +655,8 @@ async fn a03_tool_list() {
             "why_empty",
             #[cfg(feature = "reasoning")]
             "explain_inference",
+            #[cfg(feature = "reasoning")]
+            "entailment_diff",
             #[cfg(feature = "shacl")]
             "validate_shacl",
             #[cfg(feature = "shex")]

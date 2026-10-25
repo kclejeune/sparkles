@@ -53,7 +53,7 @@
   import OverviewView, { type OverviewCommunity } from '$components/OverviewView.svelte';
   import CommunityReport from '$components/CommunityReport.svelte';
   import * as gr from '$lib/graphrag';
-  import { branchParam } from '$lib/branches';
+  import { branchParam, onBranch } from '$lib/branches';
   import PathPanel from '$components/PathPanel.svelte';
   import type { Picked } from '$components/EntityPicker.svelte';
   import * as pf from '$lib/paths';
@@ -142,6 +142,55 @@
   let overviewFocus = $state(page.url.searchParams.get('community'));
   /** The reports belong to main: a page on another branch draws no communities. */
   const overviewBranch = $derived(branchParam(page.url.searchParams.get('branch')));
+  const resourceTarget = $derived(ds ? onBranch(ds, overviewBranch) : null);
+  let lastDs: string | null = null;
+  // Set the URL family before any branch-target effect can launch a read.
+  $effect(() => {
+    const urlDs = page.url.searchParams.get('ds');
+    untrack(() => {
+      if (urlDs && urlDs !== app.current && app.datasets.some((d) => d.name === urlDs)) {
+        lastDs = urlDs;
+        app.setDataset(urlDs);
+        void loadStarters(urlDs);
+      } else if (urlDs && urlDs !== app.current && !app.datasetsLoaded) {
+        app.setDataset(urlDs);
+        lastDs = urlDs;
+      }
+    });
+  });
+
+  let previousResourceTarget: string | null | undefined = undefined;
+  $effect(() => {
+    const target = resourceTarget;
+    if (previousResourceTarget === undefined) {
+      previousResourceTarget = target;
+      return;
+    }
+    if (previousResourceTarget === target) return;
+    previousResourceTarget = target;
+    untrack(() => {
+      graphRuns.claim('graph');
+      histRuns.claim('history');
+      graphReading = false;
+      graphPlaying = false;
+      histFor = '';
+      hist = null;
+      histError = null;
+      pathsOpen = false;
+      pathFrom = null;
+      pathTo = null;
+      clearPaths();
+      resetGraph();
+      focusId = null;
+      selectedId = null;
+      editable = {};
+      creatable = {};
+      editing = false;
+      const iri = page.url.searchParams.get('iri');
+      if (iri) void focusOn(iri, undefined, true);
+    });
+  });
+
   let community = $state<OverviewCommunity | null>(null);
   let communityDetail = $state<gr.Community | null>(null);
   let communityError = $state<unknown>(null);
@@ -350,7 +399,7 @@
   });
   function openDiff(to: string, from: string) {
     closePaths();
-    diffView = { to, from, branch: '', group: false };
+    diffView = { to, from, branch: overviewBranch ?? '', group: false };
     diffKey++;
     syncUrl(focusId && nodes[focusId] ? nodes[focusId].iri : null);
   }
@@ -374,13 +423,15 @@
   let branchNames = $state<string[]>([]);
   $effect(() => {
     const name = ds;
+    const selected = overviewBranch ?? 'main';
     branchNames = [];
     if (!name) return;
     const ctl = new AbortController();
     api
       .branches(name, ctl.signal)
       .then((l) => {
-        if (ds === name) branchNames = l.branches.map((b) => b.name).filter((n) => n !== 'main');
+        if (ds === name && selected === (overviewBranch ?? 'main'))
+          branchNames = l.branches.map((b) => b.name).filter((n) => n !== selected);
       })
       .catch(() => {});
     return () => ctl.abort();
@@ -430,9 +481,19 @@
     histError = null;
     try {
       const [subj, obj, head] = await Promise.all([
-        api.historyChanges(name, { subject: iri, order: 'asc', limit: 5000, signal }),
-        api.historyChanges(name, { object: iri, order: 'asc', limit: 5000, signal }),
-        api.commits(name, { limit: 1, signal }),
+        api.historyChanges(onBranch(name, overviewBranch), {
+          subject: iri,
+          order: 'asc',
+          limit: 5000,
+          signal,
+        }),
+        api.historyChanges(onBranch(name, overviewBranch), {
+          object: iri,
+          order: 'asc',
+          limit: 5000,
+          signal,
+        }),
+        api.commits(onBranch(name, overviewBranch), { limit: 1, signal }),
       ]);
       if (!owns()) return;
       const changes = entityChanges(subj.changes, obj.changes);
@@ -524,7 +585,7 @@
     const iri = n.iri;
     if (untrack(() => editable[`${name}|${iri}`]) !== undefined) return;
     const c = new AbortController();
-    getForm(name, iri, { signal: c.signal }).then(
+    getForm(onBranch(name, overviewBranch), iri, { signal: c.signal }).then(
       (m) => (editable[`${name}|${iri}`] = m.editable && m.fields.some((f) => f.editable)),
       () => {},
     );
@@ -697,12 +758,12 @@
     const triples = o.edges.map((e): [Term, Term, Term] => [e.s, { type: 'uri', value: e.p }, e.o]);
     Promise.all([
       ex.presentEdges(
-        against ? `${name}@${against}` : name,
+        against ? `${name}@${against}` : onBranch(name, overviewBranch),
         triples,
         against ? undefined : from,
         c.signal,
       ),
-      ex.presentEdges(name, triples, later || undefined, c.signal),
+      ex.presentEdges(onBranch(name, overviewBranch), triples, later || undefined, c.signal),
     ])
       .then(([before, after]) => {
         if (c.signal.aborted) return;
@@ -831,7 +892,7 @@
   /** Materialized inferences or RDFS on read: the inferred-edge lens exists (§2.7). */
   const hasReasoning = $derived(!!dsInfo?.reasoning || !!dsInfo?.rdfs);
   $effect(() => {
-    const name = ds;
+    const name = resourceTarget;
     if (!name) return;
     lenses.setInput({
       ds: name,
@@ -994,7 +1055,8 @@
     const n = nodes[id];
     if (!n || n.term.type !== 'uri' || !ds || expanding[id]) return;
     const gen = graphGen.current;
-    const stale = () => !graphGen.isCurrent(gen) || nodes[id] !== n;
+    const target = resourceTarget;
+    const stale = () => target !== resourceTarget || !graphGen.isCurrent(gen) || nodes[id] !== n;
     if (nodeCount > MAX_NODES) {
       toasts.push(
         'error',
@@ -1007,7 +1069,7 @@
     const signal = expandCtl.signal;
     try {
       const r = await ex.neighbours(
-        ds,
+        target!,
         n.iri,
         timeActive && graphTimeOpen ? exAt || undefined : undefined,
         signal,
@@ -1059,9 +1121,11 @@
       .filter((n) => n.term.type === 'uri')
       .map((n) => n.iri)
       .slice(0, 1000);
-    const d = await api.diff(name, {
-      // across branches, the later side is this branch (main here) and the earlier one the other's head
-      ...(exAgainst ? { fromBranch: exAgainst, toBranch: 'main' } : { from: exFrom }),
+    const d = await api.diff(onBranch(name, overviewBranch), {
+      // Across branches, compare the selected branch with the other's head.
+      ...(exAgainst
+        ? { fromBranch: exAgainst, toBranch: overviewBranch ?? 'main' }
+        : { from: exFrom }),
       to: exAt || 'head',
       terms: iris,
       quads: true,
@@ -1075,12 +1139,12 @@
     // a marked edge is checked against the state it was added to, and a ghost against the
     // state it was removed from, read as the graph is read
     if (plan.addedTriples.size || plan.ghostEdges.length) {
-      const leftDs = exAgainst ? `${name}@${exAgainst}` : name;
+      const leftDs = exAgainst ? `${name}@${exAgainst}` : onBranch(name, overviewBranch);
       const leftAt = exAgainst ? undefined : exFrom;
       const [before, after] = await Promise.all([
         ex.presentEdges(leftDs, [...plan.addedTriples.values()], leftAt, signal),
         ex.presentEdges(
-          name,
+          onBranch(name, overviewBranch),
           plan.ghostEdges.map((g) => g.triple),
           exAt || undefined,
           signal,
@@ -1133,9 +1197,11 @@
    */
   async function rereadGraph() {
     const name = ds;
+    const target = resourceTarget;
     const root = focusId;
-    if (!name || !root) return;
-    const owns = graphRuns.claim('graph');
+    if (!name || !target || !root) return;
+    const requestOwns = graphRuns.claim('graph');
+    const owns = () => requestOwns() && target === resourceTarget;
     const signal = graphRuns.signal('graph');
     const at = graphTimeOpen && exAt ? exAt : undefined;
     graphReading = true;
@@ -1147,7 +1213,7 @@
       for (const id of [...expandLog]) {
         const term = seenTerms.get(id);
         if (!present.has(id) || !term || term.type !== 'uri') continue;
-        const r = await ex.neighbours(name, term.value, at, signal);
+        const r = await ex.neighbours(target!, term.value, at, signal);
         if (!owns()) return;
         fetched.set(id, r);
         for (const nb of [...r.out, ...r.inc]) {
@@ -1216,8 +1282,10 @@
    */
   async function lapseGraph(fromAt: string, toAt: string) {
     const name = ds;
-    if (!name || !focusId) return;
-    const owns = graphRuns.claim('graph');
+    const target = resourceTarget;
+    if (!name || !target || !focusId) return;
+    const requestOwns = graphRuns.claim('graph');
+    const owns = () => requestOwns() && target === resourceTarget;
     const signal = graphRuns.signal('graph');
     graphReading = true;
     graphNote = '';
@@ -1227,7 +1295,7 @@
         .filter((n) => n.term.type === 'uri')
         .map((n) => n.iri)
         .slice(0, 1000);
-      const d = await api.diff(name, {
+      const d = await api.diff(target!, {
         from: fromAt,
         to: toAt,
         terms: iris,
@@ -1276,7 +1344,12 @@
       }
       // the state the diff resolved to, which a write after it does not move
       const holds = candidates.size
-        ? await ex.presentEdges(name, [...candidates.values()], `commit:${d.to.commit.seq}`, signal)
+        ? await ex.presentEdges(
+            target!,
+            [...candidates.values()],
+            `commit:${d.to.commit.seq}`,
+            signal,
+          )
         : new Set<string>();
       if (!owns()) return;
       const addedNodes = new Set<string>();
@@ -1465,7 +1538,7 @@
     const signal = detailRuns.signal('entity');
     let d: ex.Details | { error: string };
     try {
-      d = await ex.details(ds, n.iri, at || undefined, signal);
+      d = await ex.details(resourceTarget!, n.iri, at || undefined, signal);
       if (timeActive && at === exAt) strip?.accept();
     } catch (e) {
       if (isAbort(e)) return;
@@ -1943,7 +2016,6 @@
 
   // --- lifecycle / url sync -----------------------------------------------------
 
-  let lastDs: string | null = null;
   $effect(() => {
     const name = ds;
     if (name === lastDs) return;
@@ -1980,19 +2052,11 @@
       untrack(() => loadSchema(ds!));
   });
 
-  // React to ?iri= changes (e.g. clicking an IRI on the Query page).
+  // Focus only after initial time controls have reconciled, preserving a past-state URL.
   $effect(() => {
     const iri = page.url.searchParams.get('iri');
-    const urlDs = page.url.searchParams.get('ds');
+    void page.url.searchParams.get('ds');
     untrack(() => {
-      if (urlDs && urlDs !== app.current && app.datasets.some((d) => d.name === urlDs)) {
-        lastDs = urlDs;
-        app.setDataset(urlDs);
-        void loadStarters(urlDs);
-      } else if (urlDs && urlDs !== app.current && !app.datasetsLoaded) {
-        app.setDataset(urlDs);
-        lastDs = urlDs;
-      }
       if (iri && (!focusId || nodes[focusId]?.iri !== iri)) void focusOn(iri, undefined, true);
     });
   });
@@ -2388,7 +2452,7 @@
           <div class="graph-time">
             <TimeSlider
               bind:this={graphSlider}
-              {ds}
+              ds={resourceTarget ?? ds}
               bind:at={exAt}
               bind:from={exFrom}
               bind:compare={exCompare}
@@ -2447,7 +2511,7 @@
           {#if canvasMode === 'map' && ds && !pathsOpen}
             <div class="cy-host">
               <GraphMap
-                {ds}
+                ds={resourceTarget ?? ds}
                 nodes={gNodes}
                 edges={gEdges}
                 at={mapAt}
@@ -2540,7 +2604,7 @@
       {#if facetsOpen && nodeCount > 0 && !pathsOpen && ds}
         <aside class="side side-facets" aria-label="Facets">
           <FacetPanel
-            {ds}
+            ds={resourceTarget ?? ds}
             within={facetWithin}
             setLabel={facetSet?.name ?? 'entities'}
             at={timeActive ? exAt : ''}
@@ -2572,11 +2636,12 @@
       {/if}
       {#if pathsOpen && ds}
         <aside class="side side-paths" aria-label="Path finder">
-          {#key ds}
+          {#key resourceTarget}
             <PathPanel
               bind:this={pathPanel}
-              {ds}
+              ds={resourceTarget ?? ds}
               {prefixes}
+              branch={overviewBranch ?? 'main'}
               at={graphTimeOpen ? exAt : ''}
               bind:from={pathFrom}
               bind:to={pathTo}
@@ -2593,7 +2658,7 @@
         <aside class="side" aria-label="Resource details">
           {#if whyFor && ds}
             <WhyPanel
-              {ds}
+              ds={resourceTarget ?? ds}
               triple={whyFor}
               {prefixes}
               past={whyAtPast}
@@ -2708,7 +2773,7 @@
                   {#if hist}
                     <TimeSlider
                       bind:this={strip}
-                      {ds}
+                      ds={resourceTarget ?? ds}
                       commits={hist.commits}
                       head={hist.head}
                       authors={hist.authors}
@@ -2759,6 +2824,7 @@
                 {#key n.iri}
                   <ShapeForm
                     {ds}
+                    branch={overviewBranch}
                     iri={n.iri}
                     {prefixes}
                     title={labelFor(n.term, n.label)}
@@ -2771,7 +2837,12 @@
             {:else if sideTab === 'memory' && ds}
               <div class="side-body scroll">
                 {#key n.iri}
-                  <MemoryTab {ds} iri={n.iri} {prefixes} onopen={(iri) => focusOn(iri)} />
+                  <MemoryTab
+                    ds={resourceTarget ?? ds}
+                    iri={n.iri}
+                    {prefixes}
+                    onopen={(iri) => focusOn(iri)}
+                  />
                 {/key}
               </div>
             {:else if !detail}
@@ -2857,10 +2928,20 @@
                 </table>
 
                 {#key n.iri}
-                  <GeoMapCard {ds} iri={n.iri} props={detail.props} {prefixes} />
-                  <SimilarPanel {ds} iri={n.iri} props={detail.props} {prefixes} />
+                  <GeoMapCard
+                    ds={resourceTarget ?? ds}
+                    iri={n.iri}
+                    props={detail.props}
+                    {prefixes}
+                  />
+                  <SimilarPanel
+                    ds={resourceTarget ?? ds}
+                    iri={n.iri}
+                    props={detail.props}
+                    {prefixes}
+                  />
                   {#if ds && !timeActive}<WhyNotPanel
-                      {ds}
+                      ds={resourceTarget ?? ds}
                       subject={n.term}
                       {prefixes}
                       onopen={(iri) => focusOn(iri)}

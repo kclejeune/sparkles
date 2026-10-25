@@ -100,3 +100,78 @@ impl Tools<'_> {
         Ok(Outcome::Structured(out))
     }
 }
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields, rename_all = "camelCase")]
+struct DiffArgs {
+    dataset: Option<String>,
+    from: String,
+    to: Option<String>,
+    profile: Option<String>,
+    rules: Option<String>,
+    inputs: Option<Value>,
+    sample_limit: Option<usize>,
+    timeout_seconds: Option<f64>,
+}
+
+impl Tools<'_> {
+    pub(super) fn entailment_diff(&self, args: Map<String, Value>) -> Result<Outcome, ToolError> {
+        let args: DiffArgs = parse(args)?;
+        if args
+            .sample_limit
+            .is_some_and(|limit| limit == 0 || limit > 100)
+        {
+            return Err(ToolError::bad_argument("sampleLimit must be from 1 to 100"));
+        }
+        let dataset = self.dataset(args.dataset.as_deref())?;
+        let value = json!({"from":args.from,"to":args.to,"profile":args.profile,"rules":args.rules,"inputs":args.inputs,"sampleLimit":args.sample_limit});
+        let mut request = sparkles::reasoning::diff::DiffRequest::from_json(&value)
+            .map_err(|error| ToolError::bad_argument(error.to_string()))?;
+        request.analysis.timeout = Some(self.timeout(args.timeout_seconds)?);
+        request.analysis.max_memory = self
+            .cfg()
+            .query_memory_bytes
+            .map(|limit| usize::try_from(limit).unwrap_or(usize::MAX));
+        request.analysis.max_inferred = Some(self.server.state.reason_max_inferred);
+        request.analysis.cancel = Some(self.call.cancel.clone());
+        let view = |selector: &str| {
+            let branch = if selector.parse::<sparkles::history::At>().is_ok() {
+                dataset.store.branch_name()
+            } else {
+                selector
+                    .rsplit_once('@')
+                    .map_or(selector, |(branch, _)| branch)
+                    .to_string()
+            };
+            let name = crate::auth::on_branch(&dataset.name, &branch);
+            if !self.call.principal.can_at(
+                &name,
+                crate::auth::Endpoint::Query,
+                crate::auth::Level::Read,
+            ) {
+                return Err(ToolError::new(
+                    "not-permitted",
+                    403,
+                    format!("query access to branch {branch} is required"),
+                ));
+            }
+            Ok(self
+                .call
+                .principal
+                .view(&name, crate::auth::Endpoint::Query))
+        };
+        request.from_access = view(&request.from)?;
+        request.to_access = view(&request.to)?;
+        let result = dataset
+            .dataset
+            .reasoning()
+            .diff(&request)
+            .map_err(|error| {
+                self.ctx(&[], request.analysis.timeout.unwrap().as_secs_f64())
+                    .engine(error)
+            })?;
+        let mut value = result.to_json();
+        value["dataset"] = dataset.name.clone().into();
+        Ok(Outcome::Structured(value))
+    }
+}

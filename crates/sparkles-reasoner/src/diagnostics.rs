@@ -647,16 +647,76 @@ pub fn diagnose_with(
     opts: &DiagnoseOptions,
     typings: Option<&LiteralTypings>,
 ) -> anyhow::Result<DiagnosticsReport> {
+    diagnose_controlled(snap, opts, typings, &DiagnosticControls::default())
+}
+
+/// Additional controls shared by entailment diffs and justification oracle calls.
+#[derive(Clone, Debug, Default)]
+pub struct DiagnosticControls {
+    /// Visibility of every diagnostic query, including literal-typing evidence.
+    pub access: Option<Arc<sparkles_core::access::GraphAccess>>,
+    pub deadline: Option<Instant>,
+    pub cancel: Option<Arc<std::sync::atomic::AtomicBool>>,
+    /// Each query and the decoded rows it retains are held to this estimate.
+    pub max_memory: Option<u64>,
+}
+
+pub(crate) fn check_control(
+    deadline: Option<Instant>,
+    cancel: Option<&std::sync::atomic::AtomicBool>,
+) -> sparkles_core::Result<()> {
+    if cancel.is_some_and(|flag| flag.load(std::sync::atomic::Ordering::Relaxed)) {
+        return Err(Error::Cancelled);
+    }
+    if deadline.is_some_and(|limit| Instant::now() >= limit) {
+        return Err(Error::Timeout);
+    }
+    Ok(())
+}
+
+/// Run diagnostics within the parent analysis's absolute deadline and memory grant.
+pub fn diagnose_controlled(
+    snap: Arc<Snapshot>,
+    opts: &DiagnoseOptions,
+    typings: Option<&LiteralTypings>,
+    controls: &DiagnosticControls,
+) -> anyhow::Result<DiagnosticsReport> {
+    check_control(controls.deadline, controls.cancel.as_deref())?;
+    let mut visible_options;
+    let opts = if controls.access.as_ref().is_some_and(|access| {
+        !access.readable(Some(&Term::NamedNode(NamedNode::new_unchecked(
+            INFERRED_GRAPH,
+        ))))
+    }) {
+        visible_options = opts.clone();
+        visible_options.inferences = false;
+        &visible_options
+    } else {
+        opts
+    };
     let checks = select_checks(&opts.checks)
         .map_err(|bad| anyhow::anyhow!("unknown diagnostics check '{bad}'"))?;
     let limit = opts.limit.clamp(1, MAX_LIMIT);
-    let deadline = opts.timeout.map(|t| Instant::now() + t);
+    let relative = opts
+        .timeout
+        .and_then(|timeout| Instant::now().checked_add(timeout));
+    let deadline = match (controls.deadline, relative) {
+        (Some(a), Some(b)) => Some(a.min(b)),
+        (a, b) => a.or(b),
+    };
     let mut prefixes: BTreeMap<String, String> = sparkles_core::io::standard_prefixes();
     prefixes.extend(opts.prefixes.iter().cloned());
     let names = Names::new(&prefixes);
     let mut outcomes = Vec::new();
     let mut findings = Vec::new();
     for check in checks {
+        if controls
+            .cancel
+            .as_ref()
+            .is_some_and(|flag| flag.load(std::sync::atomic::Ordering::Relaxed))
+        {
+            return Err(Error::Cancelled.into());
+        }
         let t0 = Instant::now();
         let mut out = CheckOutcome {
             id: check.id,
@@ -682,6 +742,9 @@ pub fn diagnose_with(
             names: &names,
             typings: typings.filter(|_| opts.inferences),
             grant: opts.grant.as_ref(),
+            access: controls.access.as_ref(),
+            cancel: controls.cancel.as_ref(),
+            max_memory: controls.max_memory,
         };
         let found = if check.id == LITERAL_NOT_IN_DATATYPE {
             run.paged_findings(limit)
@@ -708,6 +771,13 @@ pub fn diagnose_with(
         }
         out.millis = t0.elapsed().as_millis() as u64;
         outcomes.push(out);
+    }
+    if controls
+        .cancel
+        .as_ref()
+        .is_some_and(|flag| flag.load(std::sync::atomic::Ordering::Relaxed))
+    {
+        return Err(Error::Cancelled.into());
     }
     let status = if outcomes
         .iter()
@@ -747,6 +817,9 @@ struct Run<'a> {
     /// the literal typings of the inferences, when the check reads them
     typings: Option<&'a LiteralTypings>,
     grant: Option<&'a Arc<sparkles_core::sparql::pool::PoolGrant>>,
+    access: Option<&'a Arc<sparkles_core::access::GraphAccess>>,
+    cancel: Option<&'a Arc<std::sync::atomic::AtomicBool>>,
+    max_memory: Option<u64>,
 }
 
 type Row = BTreeMap<String, Term>;
@@ -815,20 +888,38 @@ fn ill_typed(
     max: usize,
     deadline: Option<Instant>,
 ) -> sparkles_core::Result<IllTyped> {
+    ill_typed_controlled(snap, max, deadline, None)
+}
+
+fn ill_typed_controlled(
+    snap: &Snapshot,
+    max: usize,
+    deadline: Option<Instant>,
+    cancel: Option<&std::sync::atomic::AtomicBool>,
+) -> sparkles_core::Result<IllTyped> {
+    check_control(deadline, cancel)?;
     let generation = &snap.generation;
     let base = {
-        let mut slot = match deadline {
-            None => generation.ill_typed_literals.lock(),
-            Some(d) => generation
-                .ill_typed_literals
-                .try_lock_for(d.saturating_duration_since(Instant::now()))
-                .ok_or(Error::Timeout)?,
+        let mut slot = if deadline.is_none() && cancel.is_none() {
+            generation.ill_typed_literals.lock()
+        } else {
+            loop {
+                check_control(deadline, cancel)?;
+                let slice = deadline.map_or(Duration::from_millis(5), |limit| {
+                    limit
+                        .saturating_duration_since(Instant::now())
+                        .min(Duration::from_millis(5))
+                });
+                if let Some(locked) = generation.ill_typed_literals.try_lock_for(slice) {
+                    break locked;
+                }
+            }
         };
         match &*slot {
             // a list that stopped early serves only a cap below its end
             Some((ids, complete)) if *complete || ids.len() > max => ids.clone(),
             _ => {
-                let (ids, complete) = scan_base(generation, max + 1, deadline)?;
+                let (ids, complete) = scan_base(generation, max + 1, deadline, cancel)?;
                 let ids: Arc<[u64]> = ids.into();
                 *slot = Some((ids.clone(), complete));
                 ids
@@ -839,9 +930,7 @@ fn ill_typed(
     let mut delta = Vec::new();
     let mut at = 0;
     while at < snap.dvocab_len && delta.len() < room {
-        if deadline.is_some_and(|d| Instant::now() >= d) {
-            return Err(Error::Timeout);
-        }
+        check_control(deadline, cancel)?;
         let end = snap.dvocab_len.min(at + DELTA_CHUNK);
         generation.dvocab.with(|v| {
             for i in at..end {
@@ -867,6 +956,7 @@ fn scan_base(
     generation: &Generation,
     max: usize,
     deadline: Option<Instant>,
+    cancel: Option<&std::sync::atomic::AtomicBool>,
 ) -> sparkles_core::Result<(Vec<u64>, bool)> {
     #[cfg(test)]
     scan_seam(generation);
@@ -876,9 +966,7 @@ fn scan_base(
     let mut ids: Vec<u64> = Vec::new();
     let mut at = lo;
     while at < hi {
-        if deadline.is_some_and(|d| Instant::now() >= d) {
-            return Err(Error::Timeout);
-        }
+        check_control(deadline, cancel)?;
         let end = hi.min(at + (1 << 16));
         ids.clear();
         ids.extend(at..end);
@@ -971,11 +1059,16 @@ fn candidates_max() -> usize {
 const CANDIDATE_ORDER: &str = "ORDER BY ?x ?p ?range STR(?lit) DATATYPE(?lit) LANG(?lit) ?via";
 
 impl Run<'_> {
+    fn check(&self) -> sparkles_core::Result<()> {
+        check_control(self.deadline, self.cancel.map(Arc::as_ref))
+    }
+
     fn options(
         &self,
         inferences: bool,
         bindings: Vec<(String, Term)>,
     ) -> sparkles_core::Result<QueryOptions> {
+        self.check()?;
         let timeout = match self.deadline {
             Some(d) => Some(
                 d.checked_duration_since(Instant::now())
@@ -1008,6 +1101,10 @@ impl Run<'_> {
             default_graph_extra: extra,
             initial_bindings: bindings,
             grant: self.grant.cloned(),
+            graphs: self.access.cloned(),
+            deadline: self.deadline,
+            cancel: self.cancel.cloned(),
+            max_memory_bytes: self.max_memory,
             ..Default::default()
         })
     }
@@ -1020,16 +1117,31 @@ impl Run<'_> {
     ) -> sparkles_core::Result<Vec<Row>> {
         let opts = self.options(inferences, bindings)?;
         let r = sparkles_core::sparql::query(self.snap.clone(), text, &opts)?;
-        let vars = r.vars.clone();
-        Ok(r.rows()
-            .into_iter()
-            .map(|row| {
-                vars.iter()
-                    .zip(row)
-                    .filter_map(|(v, t)| Some((v.clone(), t?)))
-                    .collect()
-            })
-            .collect())
+        let mut rows = Vec::new();
+        let mut bytes = 0u64;
+        for i in 0..r.table.len() {
+            self.check()?;
+            let mut row = Row::new();
+            for (name, column) in r.vars.iter().zip(&r.table.cols) {
+                if let Some(term) = r.term(column[i]) {
+                    bytes = bytes.saturating_add(
+                        (64 + name.len() + sparkles_core::explain::term_bytes(&term)) as u64,
+                    );
+                    if let Some(limit) = self.max_memory
+                        && bytes > limit
+                    {
+                        return Err(Error::BudgetExceeded(sparkles_core::Budget {
+                            kind: sparkles_core::BudgetKind::Memory,
+                            limit,
+                            requested: bytes,
+                        }));
+                    }
+                    row.insert(name.clone(), term);
+                }
+            }
+            rows.push(row);
+        }
+        Ok(rows)
     }
 
     /// The deduplicated findings (at most `limit`) and whether more remain.
@@ -1111,7 +1223,12 @@ impl Run<'_> {
         seen: &mut HashSet<String>,
     ) -> sparkles_core::Result<bool> {
         let max = candidates_max();
-        let found = ill_typed(self.snap, max, self.deadline)?;
+        let found = match self.cancel {
+            Some(cancel) => {
+                ill_typed_controlled(self.snap, max, self.deadline, Some(cancel.as_ref()))?
+            }
+            None => ill_typed(self.snap, max, self.deadline)?,
+        };
         let truncated = found.len() > max;
         let ids: Vec<sparkles_core::id::Id> = found.ids().take(max).collect();
         let via = Term::Literal(Literal::new_simple_literal("datatype"));

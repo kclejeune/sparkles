@@ -567,8 +567,19 @@ export class Administration {
           graphs?: string[];
           limit?: number;
           inferences?: boolean;
+          justify?: boolean;
+          maxChecks?: number;
+          maxMemory?: number;
         } = {},
       ) => call<Configuration>('reasoning.diagnostics', { ...options }, options, false),
+      /** Inferred additions and removals under one program, without writing. */
+      diff: (from: string, to = 'head', options: OperationOptions & Configuration = {}) =>
+        call<Configuration>('reasoning.diff', { ...options, from, to }, options, false),
+      /** Minimal asserted supports for a finding, a class, or all relevant classes. */
+      justify: (
+        target: { finding?: Configuration; class?: string; classes?: 'all' },
+        options: OperationOptions & Configuration = {},
+      ) => call<Configuration>('reasoning.justify', { ...options, ...target }, options, false),
       /** Why the dataset entails a triple, given in Turtle with the dataset's prefixes: derivation trees, or `entailed: false`. */
       explain: (
         triple: string,

@@ -217,6 +217,8 @@ fn previews(put: &mut dyn FnMut(&str, J)) {
                         }),
                     ),
                     "validation": sref("ValidationSummary"),
+                    "entailments":{"anyOf":[sref("EntailmentDiff"),{"type":"null"}]},
+                    "entailmentsUnavailable":string(),
                     "precondition": obj(
                         &["status"],
                         json!({ "status": string_enum(&["passed", "failed"]), "error": string() }),

@@ -10,6 +10,7 @@
   import * as api from '$lib/api';
   import type { Term } from '$lib/api';
   import { app } from '$lib/app.svelte';
+  import { branchParam, onBranch, exploreQuery } from '$lib/branches';
   import * as ex from '$lib/explore';
   import { fmtBytes, fmtInt, fmtMs } from '$lib/format';
   import { shortLabel } from '$lib/graph';
@@ -39,8 +40,10 @@
 
   const KS = [5, 10, 20, 50, 100];
 
-  const ds = $derived(app.current);
-  const prefixes = $derived(app.prefixes(ds));
+  const family = $derived(app.current);
+  const selectedBranch = $derived(branchParam(page.url.searchParams.get('branch')));
+  const ds = $derived(family ? onBranch(family, selectedBranch) : null);
+  const prefixes = $derived(app.prefixes(family));
   const params = page.url.searchParams;
 
   // --- the dataset's indexes ---------------------------------------------------------
@@ -87,8 +90,18 @@
     if (!name) return;
     untrack(() => {
       if (lastDs != null && lastDs !== name) {
+        ctl?.abort();
+        runs.claim('search');
+        suggestRuns.claim('suggest');
+        entityRuns.claim('entity');
+        clearTimeout(suggestTimer);
+        suggestions = [];
+        entityVectors = null;
         target = '';
         result = null;
+        ran = null;
+        labels = new Map();
+        searching = false;
         error = null;
       }
       lastDs = name;
@@ -296,7 +309,8 @@
 
   function syncUrl() {
     const p = new URLSearchParams();
-    if (ds) p.set('ds', ds);
+    if (family) p.set('ds', family);
+    if (selectedBranch) p.set('branch', selectedBranch);
     if (chosenIndex) p.set('index', chosenIndex.name);
     else if (predicate) p.set('predicate', predicate);
     if (mode === 'entity' && entity) p.set('iri', entity);
@@ -311,7 +325,8 @@
     const s = search;
     const name = ds;
     if (!s || !name) return;
-    const owns = runs.claim('search');
+    const requestOwns = runs.claim('search');
+    const owns = () => requestOwns() && name === ds;
     ctl?.abort();
     const c = (ctl = new AbortController());
     searching = true;
@@ -360,6 +375,8 @@
   function openInQuery() {
     const s = ran ?? search;
     if (!s) return;
+    app.queryBranch = selectedBranch ?? '';
+    app.queryAt = '';
     app.pendingQuery = { query: buildVectorSearch(s.q), title: 'Similar' };
     goto(resolve('/query'));
   }
@@ -378,10 +395,9 @@
       ? `${fmtMs(elapsed)}${result.ms != null ? ` (${fmtMs(result.ms)} on the server)` : ''}`
       : '',
   );
-  const exploreHref = (iri: string) =>
-    `${resolve('/explore')}?ds=${encodeURIComponent(ds ?? '')}&iri=${encodeURIComponent(iri)}`;
+  const exploreHref = (iri: string) => `${resolve('/explore')}?${exploreQuery(ds ?? '', iri)}`;
   const datasetHref = $derived(
-    ds ? resolve('/datasets/[name]', { name: ds }) : resolve('/datasets'),
+    ds ? resolve('/datasets/[name]', { name: family ?? ds }) : resolve('/datasets'),
   );
   const vectorLabel = (t: Term | undefined) =>
     t?.type === 'literal' ? abbreviateVector(t.value, 8, t.datatype) : '';
@@ -402,9 +418,10 @@
     {#if ds && chosenIndex}
       <a
         class="btn"
-        href="{resolve('/embedding')}?ds={encodeURIComponent(ds)}&index={encodeURIComponent(
-          chosenIndex.name,
-        )}">Embedding map</a
+        href="{resolve('/embedding')}?{new URLSearchParams({
+          ds: family!,
+          ...(selectedBranch ? { branch: selectedBranch } : {}),
+        })}&index={encodeURIComponent(chosenIndex.name)}">Embedding map</a
       >
     {/if}
   </header>

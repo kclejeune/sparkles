@@ -6,8 +6,16 @@
 //! and its serde form is that of `reasoning.json`, which older versions also embedded in
 //! the server's registry (`config.json`).
 
+#[cfg(feature = "reasoning")]
+pub mod analysis;
+#[cfg(feature = "reasoning")]
+pub mod diff;
 pub mod explain;
 pub mod freshness;
+#[cfg(feature = "reasoning")]
+pub mod hypotheses;
+#[cfg(feature = "reasoning")]
+pub mod justify;
 pub mod rdfs;
 #[cfg(feature = "reasoning")]
 pub mod run;

@@ -120,9 +120,22 @@ pub(super) async fn apply(
         .opts
         .dry_run
         .as_ref()
-        .map(|d| super::dry_run::Request::new(&st, &headers, d, restricted));
+        .map(|d| {
+            super::dry_run::Request::for_write(
+                &st,
+                &headers,
+                &params,
+                d,
+                restricted,
+                Some(&p),
+                &ds,
+                &wopts.opts,
+            )
+        })
+        .transpose()?;
     let body = spool(body, &mut BodyBudget::new(&st.limits)).await?;
     let (wopts, timeout) = wopts.start();
+    let dry = dry.map(|request| request.started(&wopts));
     super::blocking(move || {
         let t0 = std::time::Instant::now();
         let opts = PatchOptions {

@@ -13,6 +13,7 @@
   import { shortLabel } from '$lib/graph';
   import { displayIri, termKey } from '$lib/rdf';
   import { datasetKindUrl, readKind } from '$lib/settings';
+  import { splitTarget } from '$lib/branches';
   import * as pf from '$lib/paths';
   import EntityPicker, { type Picked } from './EntityPicker.svelte';
   import Icon from './Icon.svelte';
@@ -71,7 +72,7 @@
   $effect(() => {
     const name = ds;
     const c = new AbortController();
-    readKind(datasetKindUrl(name, 'paths'), c.signal)
+    readKind(datasetKindUrl(splitTarget(name).name, 'paths'), c.signal)
       .then((k) => {
         const list = k.effective?.excludedPredicates;
         if (!excludedTouched && Array.isArray(list) && list.every((p) => typeof p === 'string'))
@@ -197,13 +198,14 @@
     const s = $state.snapshot(settings) as pf.PathSettings;
     // the state and the query of this search, which the slider may move away from
     const runAt = at;
+    const runTarget = ds;
     const runPhase1 = phase1;
-    const live = () => ctl === c && !c.signal.aborted;
+    const live = () => ctl === c && !c.signal.aborted && ds === runTarget;
     running = true;
     failure = null;
     announce = '';
     try {
-      const r = await pf.findPaths(ds, s, {
+      const r = await pf.findPaths(runTarget, s, {
         at: runAt || undefined,
         phase1: runPhase1,
         signal: c.signal,
@@ -215,7 +217,7 @@
       for (const p of [from, to]) if (p?.term.type === 'uri') iris.add(p.term.value);
       let found = new Map<string, string>();
       try {
-        found = await ex.labels(ds, [...iris]);
+        found = await ex.labels(runTarget, [...iris]);
       } catch {
         // labels are a nicety: the paths stand without them
       }

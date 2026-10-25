@@ -15,6 +15,7 @@
 //! [`materialize_incremental`] updates a previous materialization from the changes to
 //! the input graphs since its commit, with the same result as a full run.
 
+pub mod analysis;
 mod budget;
 mod builtins;
 mod demand;
@@ -36,11 +37,12 @@ pub mod tables;
 mod terms;
 pub mod whynot;
 
+pub use budget::MemoryExceeded as MemoryLimitExceeded;
 pub use extras::{Extras, UnknownVocabulary, Vocabulary};
 pub use inputs::{
     Fetched, GraphRef, Import, ImportMode, Inputs, LocationMapping, Resolved, fetch_imports,
 };
-pub use maintain::{Cache, DEFAULT_CACHE_TRIPLES, literal_typings};
+pub use maintain::{Cache, DEFAULT_CACHE_TRIPLES, literal_typings, literal_typings_controlled};
 pub use parser::{
     BuiltinCall, Clause, Direction, Node, Rule, RuleParseError, TriplePattern, parse_rules,
 };
@@ -57,7 +59,7 @@ use std::fmt;
 use std::mem::size_of;
 use std::str::FromStr;
 use std::sync::Arc;
-use std::sync::atomic::AtomicBool;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Instant;
 use terms::{LocalTerm, Terms};
 
@@ -156,6 +158,8 @@ pub struct InferredLimitExceeded {
 #[derive(Clone)]
 pub struct ReasonOptions {
     /// Maximum number of semi-naive iterations before giving up.
+    /// Request-local controls for isolated entailment analyses. Ordinary runs leave this absent.
+    pub analysis: Option<Arc<analysis::AnalysisContext>>,
     pub max_iterations: usize,
     /// Maximum number of derived triples before giving up, [`DEFAULT_MAX_INFERRED`] by
     /// default. A run that passes it fails with [`InferredLimitExceeded`]. `usize::MAX`
@@ -185,6 +189,7 @@ pub struct ReasonOptions {
 impl Default for ReasonOptions {
     fn default() -> Self {
         ReasonOptions {
+            analysis: None,
             max_iterations: 10_000,
             max_inferred: DEFAULT_MAX_INFERRED,
             cancel: None,
@@ -359,16 +364,22 @@ fn derive_here(
     let base = Arc::new(facts::Base::new(snap.clone(), graphs)?);
     let mut g = graph::Graph::with_base(base.clone());
     g.set_budget(&budget)?;
-    let terms = Terms::new(snap);
+    let mut terms = Terms::new(snap);
+    if let Some(context) = &opts.analysis {
+        terms.set_analysis(context.clone())?;
+    }
     terms.set_budget(&budget)?;
     let mut defaults = None;
     if extras.geo_default_geometry {
-        let d = default_geometries(&base, &terms, &budget)?;
+        let d = default_geometries_for_run(&base, &terms, &budget, opts)?;
         g.try_add_batch(d.0.iter().copied())?;
         defaults = Some(d);
     }
     let mut warnings = Vec::new();
     let compiled = engine::compile(&rules, &terms, &mut warnings);
+    if let Some(context) = &opts.analysis {
+        context.check()?;
+    }
     let limits = engine::Limits {
         max_iterations: opts.max_iterations,
         max_inferred: opts.max_inferred,
@@ -425,6 +436,35 @@ fn room_for_key(
 /// `geo:hasGeometry` (`G`) and no `geo:hasDefaultGeometry` (Jena's
 /// `applyDefaultGeometry`), sorted, with their charge to `budget`. Two scans of the
 /// input graphs, one per property.
+fn default_geometries_for_run(
+    base: &facts::Base,
+    terms: &Terms,
+    budget: &Arc<Budget>,
+    opts: &ReasonOptions,
+) -> anyhow::Result<(Vec<[u64; 3]>, Held)> {
+    let mut entered = false;
+    let mut reported = false;
+    default_geometries_controlled(base, terms, budget, || {
+        if !entered {
+            entered = true;
+        } else if !reported {
+            reported = true;
+            progress(opts, 0.0, "finding default geometries");
+        }
+        if let Some(context) = &opts.analysis {
+            context.check()?;
+        }
+        if opts
+            .cancel
+            .as_ref()
+            .is_some_and(|cancel| cancel.load(Ordering::Relaxed))
+        {
+            anyhow::bail!("reasoning cancelled");
+        }
+        Ok(())
+    })
+}
+
 fn default_geometries(
     base: &facts::Base,
     terms: &Terms,
@@ -1032,6 +1072,16 @@ fn finish(
     // a run that went over its limit fails before its commit, also when its charges are
     // back under it now
     done.budget.check_peak()?;
+    if let Some(context) = &opts.analysis {
+        if store.is_persistent() {
+            anyhow::bail!("analysis witnesses cannot be persisted");
+        }
+        if let Some(closure) = &done.closure {
+            context.capture_typings(closure.terms(), &done.generalized)?;
+        } else {
+            anyhow::bail!("analysis closure was unavailable before diagnostics capture");
+        }
+    }
     let receipt = txn.commit()?;
     progress(opts, 1.0, "done");
     let mut warnings = resolved.warnings.clone();
@@ -1674,4 +1724,48 @@ pub fn bench_derive(
         seq = maintain::fnv(&h.to_le_bytes(), seq);
     }
     Ok((facts.len(), d.iterations, set, seq))
+}
+
+#[cfg(test)]
+mod geometry_analysis_control_tests {
+    use super::*;
+    use crate::analysis::{AnalysisContext, WitnessMap};
+    use sparkles_core::io::{RdfFormat, Source};
+    use sparkles_core::store::StoreOptions;
+
+    #[test]
+    fn analysis_cancel_is_returned_by_geometry_before_rule_compilation() {
+        let store = Store::in_memory(StoreOptions::default());
+        store.load(&[Source::from_bytes(b"<urn:a> <http://www.opengis.net/ont/geosparql#hasGeometry> <urn:g> . <urn:b> <http://www.opengis.net/ont/geosparql#hasGeometry> <urn:h> .".to_vec(),RdfFormat::Turtle,None)]).unwrap();
+        let snapshot = store.snapshot();
+        let terms = Terms::new(snapshot.clone());
+        let base = facts::Base::new(snapshot, &[Id::DEFAULT_GRAPH]).unwrap();
+        let stopped = Arc::new(AtomicBool::new(false));
+        let context = AnalysisContext::new(
+            WitnessMap::new(1, None, stopped.clone(), None),
+            None,
+            "controlled geometry unit".into(),
+        )
+        .unwrap();
+        let flag = stopped.clone();
+        let options = ReasonOptions {
+            analysis: Some(context),
+            cancel: None,
+            progress: Some(Arc::new(move |_, message| {
+                if message == "finding default geometries" {
+                    flag.store(true, Ordering::Relaxed);
+                }
+            })),
+            ..Default::default()
+        };
+        let error = default_geometries_for_run(&base, &terms, &Budget::unlimited(), &options)
+            .expect_err(
+                "the wrapper must stop while constructing defaults, before any engine check",
+            );
+        assert!(stopped.load(Ordering::Relaxed));
+        assert!(
+            error.downcast_ref::<MemoryLimitExceeded>().is_some(),
+            "{error:#}"
+        );
+    }
 }

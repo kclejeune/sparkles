@@ -2,6 +2,7 @@ import { afterEach, describe, expect, it, vi } from 'vitest';
 import * as api from './api';
 import {
   aheadBehind,
+  exploreQuery,
   branchOption,
   branchParam,
   branchPath,
@@ -249,4 +250,13 @@ describe('requests on a branch', () => {
     expect(e.code).toBe('merge-conflict');
     expect(e.body?.cells).toHaveLength(1);
   });
+});
+
+it('resource links keep branch targets out of the family selector', () => {
+  const selected = exploreQuery('catalog@dev', 'urn:related?next=&branch=main');
+  expect(selected.get('ds')).toBe('catalog');
+  expect(selected.get('branch')).toBe('dev');
+  expect(selected.get('iri')).toBe('urn:related?next=&branch=main');
+  expect([...selected.keys()]).toEqual(['ds', 'iri', 'branch']);
+  expect(exploreQuery('catalog', 'urn:related').has('branch')).toBe(false);
 });

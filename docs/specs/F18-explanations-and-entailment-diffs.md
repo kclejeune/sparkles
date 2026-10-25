@@ -518,7 +518,7 @@ naming `cax-sco` (OWL 2 RL) or `rdfs9` (RDFS).
 ## Outcome
 
 Phase 1 extends the `why` mode of `POST /$/reason/{ds}/explain` shipped first with
-[U10 Phase 3](U10-canvas-lenses.md#phase-3-2026-10-24), and the rest is
+[U10 Phase 3](U10-canvas-lenses.md#phase-3-2026-10-24), and Phase 3 remains
 [ROADMAP](../ROADMAP.md) item 18.
 
 ### Phase 1, 2026-10-24
@@ -575,7 +575,45 @@ do not render blocker text when the candidate is not part of the response.
 The generated client types include candidates, blockers, missing-fact hypotheses and ref
 read contexts, with a compile check that consumes the explanation fields.
 
-Phase 2 and Phase 3 remain below item 18. No on-disk format changes are needed.
+Phase 3 remains below item 18. No on-disk format changes are needed.
+
+### Phase 2, 2026-10-25
+
+Read-only entailment comparisons cover branch heads, retained commits and complete
+write or merge candidates. Both sides use the same requested or recorded program and
+their own query-visible graph grants. Fresh stored graphs are compared using their exact
+terms and retained branch identities. Full fallback evaluations share a bounded semantic
+witness map for generated blank nodes and a fixed request clock. Program identity,
+builtin occurrence, bound RDF terms and recursive evaluation round preserve generated
+witness identity across unchanged states without changing ordinary reasoning semantics.
+Stored generalized datatype summaries are read under the same controls. Missing exact
+summaries leave the datatype check incomplete rather than recomputing volatile values.
+
+The general comparison uses full private materializations when the existing incremental
+API cannot safely preserve the required program or term semantics. It streams source
+quads into private views, then retains the two closures and bounded result structures.
+This trades memory and repeated reasoning work for isolation. Retained state, witness,
+summary and result bounds refuse oversized analyses. No speed claim is made for this
+fallback. The source store, materialization records and blank-node allocator stay intact.
+
+Findings and class probes use bounded contraction, single-deletion certification and
+hitting-set enumeration. Nonmonotone programs use exhaustive cardinality checks.
+Every emitted support is subset-minimal, including grouped diagnostics findings.
+Alternative conflicts about a probe remain valid across contraction, and anonymous
+classes are included in relevant class discovery. Initial diagnostics supports use the
+same visible snapshot and controls as the report. Why-not hypotheses compare their
+candidate against baseline inconsistency findings, preserving unknown markers when
+the shared budget cannot complete the check.
+
+HTTP, CLI, MCP, Rust, Python, Node, FFI and JVM surfaces expose comparisons and supports.
+Merge and write previews use retained full candidate views rather than reconstructing a
+state from listed changes. Replay previews validate each source step against its private
+predecessor, including graph-backed schemas and insertion/storage admission, and retain
+the complete candidate without publishing intermediate states. The UI displays entailment changes on merge and review pages,
+minimal supports and class probes in diagnostics, and a removal preview on a fresh branch
+with an explicit apply step. The removal patch retains stored blank identity and pins the
+draft branch's UUID and head. Generated OpenAPI types describe triples and supports and
+keep inference explanation requests separate from query-plan explanations.
 
 ### U10 Phase 3, 2026-10-24
 

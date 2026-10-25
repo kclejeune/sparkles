@@ -221,3 +221,90 @@ fn infer_why_not_returns_verified_missing_facts_without_materializing() {
         serde_json::from_slice::<serde_json::Value>(&output.stdout).unwrap()["reasoning"].is_null()
     );
 }
+
+#[test]
+fn infer_diff_compares_retained_states_without_materializing() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("db");
+    let dataset = sparkles::Dataset::open(&path).unwrap();
+    dataset.update("INSERT DATA { <urn:Manager> <http://www.w3.org/2000/01/rdf-schema#subClassOf> <urn:Employee> }").unwrap();
+    let from = dataset.head_commit().seq;
+    dataset
+        .update("INSERT DATA { <urn:alice> a <urn:Manager> }")
+        .unwrap();
+    let head = dataset.head_commit().seq;
+    drop(dataset);
+    let range = format!("{from}..head");
+    let result = expect(
+        &[
+            "infer",
+            "--loc",
+            path.to_str().unwrap(),
+            "--diff",
+            &range,
+            "--profile",
+            "rdfs-simple",
+            "--format",
+            "json",
+        ],
+        0,
+    );
+    let value: serde_json::Value = serde_json::from_slice(&result.stdout).unwrap();
+    assert_eq!(value["added"], 1);
+    assert_eq!(value["removed"], 0);
+    let dataset = sparkles::Dataset::open(&path).unwrap();
+    assert_eq!(dataset.head_commit().seq, head);
+    assert!(dataset.reasoning().record().is_none());
+}
+
+#[test]
+fn infer_check_justify_returns_first_minimal_support_under_one_bound() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("db");
+    let dataset = sparkles::Dataset::open(&path).unwrap();
+    dataset.update("INSERT DATA { <urn:Cat> <http://www.w3.org/2002/07/owl#disjointWith> <urn:Dog> . <urn:tom> a <urn:Cat>, <urn:Dog> }").unwrap();
+    let head = dataset.head_commit().seq;
+    drop(dataset);
+    let result = expect(
+        &[
+            "infer",
+            "--loc",
+            path.to_str().unwrap(),
+            "--check",
+            "--justify",
+            "--format",
+            "json",
+        ],
+        1,
+    );
+    let value: serde_json::Value = serde_json::from_slice(&result.stdout).unwrap();
+    assert_eq!(
+        value["findings"][0]["justification"]["facts"]
+            .as_array()
+            .unwrap()
+            .len(),
+        3
+    );
+    let result = expect(
+        &[
+            "infer",
+            "--loc",
+            path.to_str().unwrap(),
+            "--check",
+            "--justify",
+            "--max-checks",
+            "1",
+            "--format",
+            "json",
+        ],
+        2,
+    );
+    assert_eq!(
+        serde_json::from_slice::<serde_json::Value>(&result.stdout).unwrap()["justificationsComplete"],
+        false
+    );
+    assert_eq!(
+        sparkles::Dataset::open(&path).unwrap().head_commit().seq,
+        head
+    );
+}

@@ -37,6 +37,12 @@ export function splitTarget(target: string): { name: string; branch: string } {
     : { name: target.slice(0, i), branch: target.slice(i + 1) || MAIN };
 }
 
+/** A resource link keeps family selection separate from its API read target. */
+export function exploreQuery(target: string, iri: string): URLSearchParams {
+  const { name, branch } = splitTarget(target);
+  return new URLSearchParams({ ds: name, iri, ...(branch === MAIN ? {} : { branch }) });
+}
+
 /** Admin routes that take `branch=`; the server refuses a branch on the others. */
 const BRANCH_ROUTES = new Set([
   'commits',

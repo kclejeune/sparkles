@@ -583,6 +583,12 @@ fn entries() -> Vec<(&'static str, Entry)> {
                 ds.reasoning().diagnostics(&any());
             }
         ),
+        op_if!("reasoning", "entailmentDiff", "reasoning.diff", |ds| {
+            ds.reasoning().diff(&any());
+        }),
+        op_if!("reasoning", "justifyFinding", "reasoning.justify", |ds| {
+            ds.reasoning().justify(&any());
+        }),
         op!("explainInference", "reasoning.explain", |ds| {
             ds.reasoning().explain(&any());
         }),
