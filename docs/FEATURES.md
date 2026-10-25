@@ -624,8 +624,10 @@ every snapshot. They need the `geo` cargo feature, which the server enables.
   `ORDER BY geof:metricDistance(?w, C) LIMIT k`
   ([API.md](API.md#spatial-joins-and-nearest-neighbours)). The nearest-neighbour
   search also handles independent join components, continuing through candidate
-  batches that produce no rows after the joins and filters. EXPLAIN shows `SpatialScan`,
-  `SpatialPf`, `SpatialJoin` and `SpatialKnn`, and warns when a query misses a join or
+  batches that produce no rows after the joins and filters. It preserves local filter
+  scope and filters connected candidates before crossing independent inputs.
+  EXPLAIN shows `SpatialScan`, `SpatialPf`, `SpatialJoin` and `SpatialKnn`, and warns
+  when a query misses a join or
   nearest-neighbour plan.
 * Query rewrite of the 24 topological properties, over asserted triples and those derived
   through default geometries and serializations, is opt-in per dataset with

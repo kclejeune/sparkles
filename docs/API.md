@@ -7263,8 +7263,11 @@ found is below the bound of every row not read yet. A batch that produces no row
 the joins and filters does not end the search.
 
 Independent groups keep their own filter scope and apply local filters before joining
-candidate batches. Application callbacks and independent groups with volatile expressions
-keep the generic plan so their evaluations are not repeated per batch.
+candidate batches. Safe connected filters run before unrelated groups are crossed, so
+rejected candidates do not create an unfiltered cross product. Application callbacks,
+volatile probe filters and independent groups with volatile expressions keep the generic
+plan. A probe filter also keeps the generic plan when moving it would expose bindings
+that were unavailable to its original scan.
 
 Rows whose distance is an error come first in SPARQL's order. Their value is not a
 geometry, is malformed or empty, or is in a CRS without a transform. Without a

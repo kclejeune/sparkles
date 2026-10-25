@@ -628,6 +628,13 @@ mod on {
         vars
     }
 
+    /// Lift only pure filters whose variables were bound at their original input.
+    fn liftable(filters: &[Expr], bound: &[VarId]) -> bool {
+        filters.iter().all(|e| {
+            super::super::cache::deterministic(e) && e.var_set().iter().all(|v| bound.contains(v))
+        })
+    }
+
     /// Decompose the indexed component while preserving independent subtrees.
     fn flatten(
         n: &Node,
@@ -652,14 +659,7 @@ mod on {
                 .iter()
                 .all(|c| flatten(c, ctx, connected, leaves, filters)),
             Kind::Sort(_) => flatten(&n.children[0], ctx, connected, leaves, filters),
-            Kind::Filter(es)
-                if es.iter().all(|e| {
-                    super::super::cache::deterministic(e)
-                        && e.var_set()
-                            .iter()
-                            .all(|v| n.children[0].certain.contains(v))
-                }) =>
-            {
+            Kind::Filter(es) if liftable(es, &n.children[0].certain) => {
                 filters.extend(es.iter().cloned());
                 flatten(&n.children[0], ctx, connected, leaves, filters)
             }
@@ -670,6 +670,11 @@ mod on {
                 // each probe as the scan it reads
                 for p in &j.probes {
                     let vars: Vec<VarId> = p.scan.cols.iter().map(|c| c.1).collect();
+                    // A probe filters its own rows before meeting the other inputs.
+                    // Their bindings must not become visible to a lifted expression.
+                    if !liftable(&p.filter, &vars) {
+                        return false;
+                    }
                     let est = ctx
                         .snap
                         .count(p.scan.perm, &p.scan.prefix)
@@ -701,6 +706,24 @@ mod on {
                 true
             }
             _ => false,
+        }
+    }
+
+    /// Apply lifted pure filters once their original bindings are certainly available.
+    fn ready_filters(n: Node, pending: &mut Vec<Expr>, ctx: &Ctx) -> Node {
+        let mut ready = Vec::new();
+        pending.retain(|e| {
+            if e.var_set().iter().all(|v| n.certain.contains(v)) {
+                ready.push(e.clone());
+                false
+            } else {
+                true
+            }
+        });
+        if ready.is_empty() {
+            n
+        } else {
+            plan::filter(n, ready, ctx)
         }
     }
 
@@ -888,9 +911,11 @@ mod on {
             .iter()
             .map(|&v| (v, batch.min(scan_node.d(v))))
             .collect();
-        let mut t = ph;
+        let mut pending = filters.clone();
+        let mut t = ready_filters(ph, &mut pending, ctx);
         for leaf in joined {
             t = plan::join(t, leaf, ctx);
+            t = ready_filters(t, &mut pending, ctx);
         }
         while !leaves.is_empty() {
             let mut component = leaves.remove(0);
@@ -901,9 +926,10 @@ mod on {
                 component = plan::join(component, leaves.remove(i), ctx);
             }
             t = plan::join(t, component, ctx);
+            t = ready_filters(t, &mut pending, ctx);
         }
-        if !filters.is_empty() {
-            t = plan::filter(t, filters.clone(), ctx);
+        if !pending.is_empty() {
+            return Err("a probe filter needs bindings outside its join group".into());
         }
         t = super::super::indexjoin::fuse_stars(t, ctx);
         for c in chain.iter().rev() {

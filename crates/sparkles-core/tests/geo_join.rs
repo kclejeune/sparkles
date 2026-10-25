@@ -495,6 +495,115 @@ fn nearest_neighbours_keep_connected_groups_within_the_batch_budget() {
 }
 
 #[test]
+fn nearest_neighbours_preserve_volatile_connected_probe_filters() {
+    let s = indexed_points(3);
+    for i in 0..3 {
+        load(
+            &s,
+            &format!("{P} ex:g{i} a ex:Restaurant ; ex:label \"x\" ."),
+        );
+    }
+    // Make a label probe cheaper than scanning all labels, without changing the
+    // restaurant group's three results. The small balanced fixture uses a merge join.
+    for i in 0..500 {
+        load(&s, &format!("{P} ex:other{i} ex:label \"x\" ."));
+    }
+    s.wait_geo();
+    let q = "SELECT ?g ?label ?x { ?g geo:asWKT ?w . \
+             { ?g a ex:Restaurant ; ex:label ?label FILTER(RAND() < STRLEN(?label)) } \
+             VALUES ?x { 1 2 } } \
+             ORDER BY geof:metricDistance(?w, \"POINT(0 0)\"^^geo:wktLiteral) LIMIT 10";
+    let r = same(&s.snapshot(), q);
+    assert_eq!(r.table.len(), 6);
+    assert!(
+        find(&r.plan, "SpatialKnn").is_none(),
+        "a volatile connected probe must keep its original evaluation scope: {:#?}",
+        r.plan
+    );
+}
+
+#[test]
+fn nearest_neighbours_preserve_volatile_probe_copy_groups() {
+    let s = indexed_points(3);
+    for i in 0..3 {
+        load(
+            &s,
+            &format!("{P} ex:g{i} a ex:Restaurant ; ex:label \"x\" ."),
+        );
+    }
+    for i in 0..500 {
+        load(&s, &format!("{P} ex:other{i} ex:label \"x\" ."));
+    }
+    s.wait_geo();
+    let values = (0..100)
+        .map(|i| i.to_string())
+        .collect::<Vec<_>>()
+        .join(" ");
+    let q = format!(
+        "SELECT ?g ?x {{ ?g geo:asWKT ?w . {{ ?g a ex:Restaurant ; ex:label ?label FILTER(RAND() < STRLEN(?label) / 2) }} VALUES ?x {{ {values} }} }} ORDER BY geof:metricDistance(?w, \"POINT(0 0)\"^^geo:wktLiteral) LIMIT 300"
+    );
+    let r = run(&s.snapshot(), &q, &opts(true));
+    let mut copies = std::collections::BTreeMap::new();
+    for row in r.rows() {
+        *copies.entry(term(row[0].clone())).or_insert(0usize) += 1;
+    }
+    assert!(
+        copies.values().all(|&n| n == 100),
+        "partial volatile copy groups: {copies:?}"
+    );
+    assert!(find(&r.plan, "SpatialKnn").is_none());
+}
+
+#[test]
+fn nearest_neighbours_preserve_unbound_probe_filter_scope() {
+    let s = indexed_points(3);
+    for i in 0..3 {
+        load(
+            &s,
+            &format!("{P} ex:g{i} a ex:Restaurant ; ex:label \"x\" ; ex:guard 1 ."),
+        );
+    }
+    for i in 0..500 {
+        load(&s, &format!("{P} ex:other{i} ex:label \"x\" ."));
+    }
+    s.wait_geo();
+    let q = "SELECT ?g ?label ?guard ?x { ?g geo:asWKT ?w . ?g a ex:Restaurant ; ex:guard ?guard . { ?g ex:label ?label FILTER(!BOUND(?guard)) } VALUES ?x { 1 2 } } ORDER BY geof:metricDistance(?w, \"POINT(0 0)\"^^geo:wktLiteral) LIMIT 10";
+    let r = same(&s.snapshot(), q);
+    assert_eq!(r.table.len(), 6);
+}
+
+#[test]
+fn nearest_neighbours_filter_connected_groups_before_crossing() {
+    let s = indexed_points(3);
+    for i in 0..3 {
+        load(
+            &s,
+            &format!("{P} ex:g{i} a ex:Restaurant ; ex:label \"\" ."),
+        );
+    }
+    s.wait_geo();
+    let values = (0..100)
+        .map(|i| i.to_string())
+        .collect::<Vec<_>>()
+        .join(" ");
+    let q = format!(
+        "SELECT ?g ?label ?x {{ ?g geo:asWKT ?w . \
+         {{ ?g a ex:Restaurant ; ex:label ?label FILTER(STRLEN(?label) > 0) }} \
+         VALUES ?x {{ {values} }} }} \
+         ORDER BY geof:metricDistance(?w, \"POINT(0 0)\"^^geo:wktLiteral) LIMIT 5"
+    );
+    let mut fast = opts(true);
+    fast.max_rows = Some(150);
+    let mut slow = opts(false);
+    slow.max_rows = Some(150);
+    let expected = run(&s.snapshot(), &q, &slow);
+    let r = run(&s.snapshot(), &q, &fast);
+    assert_eq!(r.table.len(), 0);
+    assert_eq!(rows(&r), rows(&expected));
+    assert!(find(&r.plan, "SpatialKnn").is_some());
+}
+
+#[test]
 fn nearest_neighbour_shapes_that_stay_generic_warn() {
     let s = Store::in_memory(StoreOptions::default());
     load(&s, FIXTURE);

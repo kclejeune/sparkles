@@ -6,7 +6,9 @@
 
 Indexed nearest-neighbour ordering can join candidate batches with independent query
 components. It continues searching when joins or filters discard an entire batch and
-preserves duplicate solutions.
+preserves duplicate solutions. Connected filters run before unrelated cross products.
+Index-probe filters keep their original binding scope, with generic fallback for volatile
+filters or filters that could observe new bindings after a move.
 
 ARQ UUID aliases and unresolved dynamic function calls are excluded from result-cache
 reuse and repeated independent nearest-neighbour inputs.
