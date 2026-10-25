@@ -4,6 +4,8 @@
 Raw inputs remain unchanged. The bindings file pins their content hashes, source dataset,
 queries, host, binary and measurement contract. Qualified output is a derived record with
 explicit independent-data-oracle provenance, not an engine-majority vote.
+Only common record versions 1, 2 and 3 are interpreted. Output paths must be distinct
+from each other, the bindings file and every input, including filesystem aliases.
 """
 
 import argparse
@@ -13,6 +15,7 @@ import json
 import math
 import pathlib
 import re
+import statistics
 
 POLICY = "sp2bench-source-triple-reconstruction-v1"
 CANONICALIZATION = {
@@ -30,6 +33,44 @@ def require(condition, message):
         raise ValueError(message)
 
 
+def timing_summaries(row, timing):
+    times = timing["times"]
+    require(times and all(isinstance(value, (int, float)) and not isinstance(value, bool)
+                         and math.isfinite(value) and value > 0 for value in times), "invalid raw timing samples")
+    ordered = sorted(times)
+    stats = {"mean": statistics.mean(times), "median": statistics.median(times),
+             "stddev": statistics.stdev(times) if len(times) > 1 else 0.0,
+             "min": min(times), "max": max(times)}
+    for key, expected in stats.items():
+        if key not in timing:
+            continue
+        actual = timing[key]
+        require(isinstance(actual, (int, float)) and not isinstance(actual, bool) and math.isfinite(actual)
+                and math.isclose(actual, expected, rel_tol=1e-9, abs_tol=1e-9), f"stale raw timing summary: {key}")
+    expected_ms = {"median_ms": round(stats["median"] * 1000, 3),
+                   "p95_ms": round(ordered[max(0, math.ceil(.95 * len(times)) - 1)] * 1000, 3)}
+    for key, expected in expected_ms.items():
+        actual = row.get(key)
+        require(isinstance(actual, (int, float)) and not isinstance(actual, bool) and math.isfinite(actual)
+                and math.isclose(actual, expected, rel_tol=0, abs_tol=5e-7), f"stale timing summary: {key}")
+    for key in ("mean", "stddev", "min", "max"):
+        field = key + "_ms"
+        if field in row:
+            actual = row[field]
+            require(isinstance(actual, (int, float)) and not isinstance(actual, bool) and math.isfinite(actual)
+                    and math.isclose(actual, stats[key] * 1000, rel_tol=1e-9, abs_tol=.00051),
+                    f"stale timing summary: {field}")
+
+
+def distinct_outputs(binding_path, bindings, outputs):
+    inputs = [binding_path, *[binding_path.parent / item["path"] for item in bindings["inputs"].values()]]
+    for index, output in enumerate(outputs):
+        for other in [*inputs, *outputs[:index]]:
+            require(output.resolve() != other.resolve()
+                    and not (output.exists() and other.exists() and output.samefile(other)),
+                    f"output collision: {output} aliases {other}")
+
+
 def qualify(directory, bindings):
     directory = pathlib.Path(directory).resolve()
     require(bindings.get("bindings_version") == 1, "unknown bindings version")
@@ -42,6 +83,7 @@ def qualify(directory, bindings):
         require(hashlib.sha256(raw).hexdigest() == item["sha256"], f"changed input: {role}")
         sources[role] = json.loads(raw)
     record, answers, oracle = (sources[role] for role in ("raw_record", "raw_answers", "oracle"))
+    require(type(record.get("record")) is int and record["record"] in (1, 2, 3), "unknown or missing record version")
     require(record.get("suite") == "sp2bench" and record.get("scale") == bindings["scale"], "wrong suite or scale")
     manifest = record["manifest"]
     require(manifest["host"]["name"] == bindings["host"], "wrong measurement host")
@@ -76,8 +118,10 @@ def qualify(directory, bindings):
         require(len(samples) == len(timing["times"]) == expected_query["runs"], "wrong sample count")
         require(len(timing["exit_codes"]) == len(samples) and all(code == 0 for code in timing["exit_codes"]), "failed raw timing samples")
         require(all(isinstance(ms, (int, float)) and not isinstance(ms, bool) and math.isfinite(ms) and ms > 0
+                    and isinstance(seconds, (int, float)) and not isinstance(seconds, bool) and math.isfinite(seconds) and seconds > 0
                     and math.isclose(ms, seconds * 1000, rel_tol=1e-9, abs_tol=0.00051)
                     for ms, seconds in zip(samples, timing["times"])), "changed timing samples")
+        timing_summaries(row, timing)
         row["answer"]["agrees"] = True
         row["answer"]["verification"] = {"method": "independent-data-oracle", "policy": POLICY,
             "source_sha256": bindings["source_sha256"], "query_sha256": expected_query["sha256"],
@@ -102,6 +146,7 @@ def main():
     parser.add_argument("receipt", type=pathlib.Path)
     args = parser.parse_args()
     bindings = json.loads(args.bindings.read_text())
+    distinct_outputs(args.bindings, bindings, [args.out, args.receipt])
     record, receipt = qualify(args.bindings.parent, bindings)
     args.out.write_text(json.dumps(record, indent=1) + "\n")
     args.receipt.write_text(json.dumps(receipt, indent=2) + "\n")

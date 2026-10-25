@@ -5,6 +5,8 @@ import hashlib
 import importlib.util
 import json
 import pathlib
+import subprocess
+import sys
 import tempfile
 import unittest
 
@@ -22,7 +24,8 @@ class QualificationTests(unittest.TestCase):
                   "manifest": {"host": {"name": "forge"}, "sparkles": {"sha256": "c" * 64, "binary_commit": "actual-build"},
                                "data": {"sp2bench-10m": {"sha256": "d" * 64}}},
                   "results": [{"engine": "sparkles", "query": "q4", "mode": "warm", "clients": 1, "status": "ok",
-                               "samples_ms": [1000, 2000], "answer": {"rows": 2, "hash": digest, "agrees": None}}]}
+                               "samples_ms": [1000, 2000], "median_ms": 1500, "p95_ms": 2000,
+                               "answer": {"rows": 2, "hash": digest, "agrees": None}}]}
         documents = {"raw_record": record, "raw_answers": {"q4": {"sparkles": fp}},
                      "oracle": {"version": 1, "method": "source-triple-reconstruction", "source_sha256": "d" * 64, "queries": {"q4": copy.deepcopy(fp)}},
                      "q4_timing": {"results": [{"command": "sparkles", "times": [1, 2], "exit_codes": [0, 0]}]}}
@@ -60,6 +63,59 @@ class QualificationTests(unittest.TestCase):
             pathlib.Path(directory, "raw_record.json").write_text('{}')
             with self.assertRaisesRegex(ValueError, "changed input: raw_record"):
                 qualifier.qualify(directory, bindings)
+
+    def test_stale_reported_timing_summaries_are_rejected(self):
+        cases = [("raw_record", "median_ms"), ("raw_record", "p95_ms"),
+                 ("q4_timing", "mean"), ("q4_timing", "stddev"), ("q4_timing", "median")]
+        for role, field in cases:
+            with self.subTest(role=role, field=field), tempfile.TemporaryDirectory() as directory:
+                bindings, documents = self.fixture(directory)
+                documents[role]["results"][0][field] = 99
+                self.write(directory, bindings, role, documents[role])
+                with self.assertRaisesRegex(ValueError, "timing summary"):
+                    qualifier.qualify(directory, bindings)
+
+    def test_unknown_and_missing_record_versions_are_rejected(self):
+        for version in (None, 99):
+            with self.subTest(version=version), tempfile.TemporaryDirectory() as directory:
+                bindings, documents = self.fixture(directory)
+                if version is None:
+                    documents["raw_record"].pop("record")
+                else:
+                    documents["raw_record"]["record"] = version
+                self.write(directory, bindings, "raw_record", documents["raw_record"])
+                with self.assertRaisesRegex(ValueError, "record version"):
+                    qualifier.qualify(directory, bindings)
+
+    def test_cli_rejects_output_aliases_before_changing_evidence(self):
+        for kind in ("raw", "receipt-raw", "bindings", "symlink", "hardlink", "same-outputs", "linked-outputs"):
+            with self.subTest(kind=kind), tempfile.TemporaryDirectory() as directory:
+                root = pathlib.Path(directory)
+                bindings, _ = self.fixture(directory)
+                binding_file = root / "bindings.json"
+                binding_file.write_text(json.dumps(bindings))
+                out, receipt = root / "derived.json", root / "receipt.json"
+                if kind == "raw":
+                    out = root / "raw_record.json"
+                elif kind == "receipt-raw":
+                    receipt = root / "raw_answers.json"
+                elif kind == "bindings":
+                    out = binding_file
+                elif kind == "symlink":
+                    out.symlink_to(root / "oracle.json")
+                elif kind == "hardlink":
+                    out.hardlink_to(root / "raw_record.json")
+                elif kind == "same-outputs":
+                    receipt = out
+                elif kind == "linked-outputs":
+                    out.write_text("existing output")
+                    receipt.hardlink_to(out)
+                before = {p.name: p.read_bytes() for p in root.glob("*.json")}
+                run = subprocess.run([sys.executable, str(SCRIPT), str(binding_file), str(out), str(receipt)],
+                                     capture_output=True, text=True)
+                self.assertNotEqual(run.returncode, 0, run.stdout + run.stderr)
+                self.assertIn("output collision", run.stderr)
+                self.assertEqual(before, {name: (root / name).read_bytes() for name in before})
 
     def test_wrong_dataset_query_oracle_rows_binary_or_samples_cannot_be_admitted(self):
         cases = [
