@@ -209,8 +209,8 @@ test('an empty result says what matched nothing', async ({ page }) => {
   );
   await page.getByRole('button', { name: /^Run (Ctrl|⌘)/ }).click();
   const why = page.getByRole('note', { name: 'Why the result is empty' });
-  await expect(why).toContainText('No data you can read matched.');
+  await expect(why).toContainText('Nothing matched.');
   await expect(why).toContainText('?p foaf:name "Ana Lima"');
-  await expect(why).toContainText('Not in the data you can read');
+  await expect(why).toContainText('Not found in the data:');
   await expect(why).toContainText('only with a language tag');
 });

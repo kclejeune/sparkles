@@ -91,13 +91,13 @@
 
 <svelte:head><title>API tokens | Sparkles</title></svelte:head>
 
-<div class="page page-container">
-  <header class="head">
+<div class="page-container">
+  <header class="page-head">
     <div>
       <h1>API tokens</h1>
       <p class="muted">
-        Tokens let scripts and the <span class="mono">sparkles</span> CLI act for you. A token never exceeds
-        your own access, now or later.
+        Tokens let scripts and the <span class="mono">sparkles</span> CLI act as you. A token never has
+        more access than you do, even if your access changes later.
       </p>
     </div>
     <span class="spacer"></span>
@@ -117,7 +117,7 @@
   </header>
 
   {#if !auth.enabled && auth.loaded}
-    <div class="error-box">This server runs without authentication: there are no tokens.</div>
+    <div class="error-box">This server runs without authentication, so it has no tokens.</div>
   {:else if loadError}
     <div class="error-box"><strong>Could not load tokens.</strong> {loadError}</div>
   {/if}
@@ -184,7 +184,7 @@
 <Modal open={created !== null} title="Your new token" width={520} onclose={() => (created = null)}>
   {#if created}
     <p class="muted small">
-      Copy it now: <strong>you won't see it again.</strong> Use it as
+      Copy it now. <strong>It is shown only once.</strong> Use it as
       <span class="mono">Authorization: Bearer …</span> or with
       <span class="mono">sparkles auth login --token</span>.
     </p>
@@ -203,23 +203,6 @@
 </Modal>
 
 <style>
-  .page {
-    padding: 20px 24px 40px;
-    gap: 16px;
-  }
-  .head {
-    display: flex;
-    align-items: flex-start;
-    gap: 8px;
-    flex-wrap: wrap;
-  }
-  h1 {
-    margin: 0 0 4px;
-    font-size: 20px;
-  }
-  .head p {
-    margin: 0;
-  }
   .check {
     display: flex;
     align-items: center;

@@ -122,7 +122,9 @@
                 {/if}
               </div>
             {:else}
-              <p class="faint small">The answer uses this report's summary, not one finding.</p>
+              <p class="faint small">
+                The answer uses this report's summary rather than a specific finding.
+              </p>
             {/each}
           </details>
         </li>

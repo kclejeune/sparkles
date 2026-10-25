@@ -82,7 +82,9 @@
   {/snippet}
 
   {#if !auth.enabled && auth.loaded}
-    <p class="muted">This server runs without authentication; the CLI needs no login.</p>
+    <p class="muted">
+      This server runs without authentication, so the CLI does not need to sign in.
+    </p>
   {:else if outcome === 'approved'}
     <div class="done">
       <Icon name="check" size={18} />

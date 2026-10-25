@@ -36,7 +36,7 @@ test('the Memory tab lists facts with citations, badges and history', async ({ p
   const history = memory.getByRole('list', { name: 'History' });
   await expect(history).toContainText('res:platform');
   await expect(history).toContainText(/superseded on 2026-10-08 by \[\d+\]/);
-  await memory.getByRole('checkbox', { name: 'show superseded' }).check();
+  await memory.getByRole('checkbox', { name: 'Show superseded' }).check();
   await expect(facts.getByText('superseded')).toBeVisible();
 
   // a graph filter keeps that graph's facts
@@ -67,7 +67,7 @@ test('the Memory page shows agents, sources, activity, branches and settings', a
 
   const search = page.getByRole('region', { name: 'Search memory' });
   await search.getByRole('textbox', { name: 'Search memory' }).fill('payments team');
-  await search.getByRole('button', { name: 'Recall' }).click();
+  await search.getByRole('button', { name: 'Search' }).click();
   await expect(search).toContainText('"Payments team"');
   await expect(search.getByRole('region', { name: /Facts about/ }).first()).toBeVisible();
 });

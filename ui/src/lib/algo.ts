@@ -337,9 +337,7 @@ async function postRun(path: string, body: unknown, signal?: AbortSignal): Promi
       e.status === 400 &&
       /unknown field `(nodes|keep|async|top)`/.test(e.message)
     )
-      throw new NoViewRuns(
-        'Projection scope needs a server with view-only algorithm runs, and this one predates them.',
-      );
+      throw new NoViewRuns('Projection scope needs a newer server.');
     throw e;
   }
   const j = await res.json();
@@ -430,14 +428,14 @@ export async function runProjection(
     const detail = t.detail as { kept?: boolean; commit?: number; definition?: string } | undefined;
     if (detail?.kept === false)
       throw new Error(
-        'The run finished, but the server had no memory to keep its result. Narrow the projection, or try again later.',
+        'The run finished, but the server did not have the memory to keep its result. Narrow the projection or try again later.',
       );
     commit = detail?.commit;
     definition = detail?.definition;
     // read the kept result at the run's commit: a selector such as `head` may resolve to a
     // newer commit by now
     first = await ask(chunks[0], false, commit != null ? `commit:${commit}` : ctx.at);
-    if ('task' in first) throw new Error('The kept result went away before it could be read.');
+    if ('task' in first) throw new Error('The result was discarded before it could be loaded.');
   }
   const answers: RunAnswer[] = [first.answer];
   commit ??= first.answer.run?.commit;
@@ -446,21 +444,21 @@ export async function runProjection(
   for (const c of chunks.slice(1)) {
     check();
     const a = await ask(c, false, pinned);
-    if ('task' in a) throw new Error('The kept result went away before it could be read.');
+    if ('task' in a) throw new Error('The result was discarded before it could be loaded.');
     answers.push(a.answer);
   }
   for (const a of answers) {
     if (commit != null && a.run?.commit != null && a.run.commit !== commit)
       throw new Error(
-        `The dataset changed while the lens read the run: commit ${a.run.commit} instead of ${commit}.`,
+        `The dataset changed while the lens was loading. It is now at commit ${a.run.commit}, not ${commit}.`,
       );
     if (definition != null && a.run?.definition != null && a.run.definition !== definition)
       throw new Error(
-        'The projection changed while the lens read the run. Choose the lens again to run it on the new definition.',
+        'The projection changed while the lens was loading. Choose the lens again to rerun it.',
       );
     if (a.run?.truncated)
       throw new Error(
-        `The server cut the answer at its row limit, so the lens has only part of the run (${a.results.bindings.length} rows). Ask for fewer nodes, or raise the limit.`,
+        `The server's row limit cut the result to ${a.results.bindings.length} rows, so the lens is incomplete. Ask for fewer nodes or raise the limit.`,
       );
   }
   const rows = answers.flatMap((a) => a.results.bindings);

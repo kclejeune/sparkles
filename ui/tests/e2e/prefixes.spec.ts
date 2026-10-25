@@ -33,7 +33,7 @@ open('the Prefixes section shows, changes and resets prefixes', async ({ page, r
   await section.getByLabel('New prefix name').fill('1bad');
   await section.getByLabel('New prefix IRI').fill('http://ex.org/');
   await section.getByRole('button', { name: 'Add' }).click();
-  await expect(section.getByText('starts with a letter')).toBeVisible();
+  await expect(section.getByText('start with a letter')).toBeVisible();
 
   // edit a declared prefix: it overrides the server config
   await row('kclj').getByRole('button', { name: 'Edit kclj:' }).click();

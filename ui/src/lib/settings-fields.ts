@@ -13,7 +13,7 @@ export const ASSISTANT_FIELDS: readonly FieldDef[] = [
     label: 'Assistant',
     type: 'bool',
     fallback: false,
-    help: 'Whether the dataset has an assistant.',
+    help: 'Turn on the assistant for this dataset.',
   },
   {
     path: 'ask',
@@ -21,7 +21,7 @@ export const ASSISTANT_FIELDS: readonly FieldDef[] = [
     label: 'Questions',
     type: 'bool',
     fallback: true,
-    help: 'Whether people can ask questions in words (POST /{ds}/ask).',
+    help: 'Let people ask questions in plain language (POST /{ds}/ask).',
   },
   {
     path: 'ingest',
@@ -29,7 +29,7 @@ export const ASSISTANT_FIELDS: readonly FieldDef[] = [
     label: 'Server ingestion',
     type: 'bool',
     fallback: false,
-    help: 'Whether the server extracts facts from documents itself.',
+    help: 'Let the server extract facts from documents itself.',
   },
   { path: 'explain', group: 'Features', label: 'Explain', type: 'bool', fallback: false },
   { path: 'optimize', group: 'Features', label: 'Optimize', type: 'bool', fallback: false },
@@ -39,20 +39,20 @@ export const ASSISTANT_FIELDS: readonly FieldDef[] = [
     label: 'What may leave the server',
     type: 'enum',
     options: SEND,
-    help: 'schema sends the vocabulary, rows also sends result rows for summaries, and documents also sends document text for ingestion.',
+    help: 'schema sends the vocabulary and query context, such as entity labels, example queries and counts, but no result rows or documents. rows also sends result rows for summaries. documents also sends document text for ingestion.',
   },
   {
     path: 'sendByProvider',
     group: 'Sending',
-    label: 'Lower level per provider',
+    label: 'Per-provider limit',
     type: 'json',
     placeholder: '{ "claude": "schema" }',
-    help: 'A provider and the highest send level it may receive.',
+    help: 'The highest send level each provider may receive, when lower than the setting above.',
   },
   {
     path: 'rowsForSummary',
     group: 'Sending',
-    label: 'Rows sent to a summary',
+    label: 'Rows sent for a summary',
     type: 'int',
     min: 0,
     optional: true,
@@ -102,7 +102,7 @@ export const ASSISTANT_FIELDS: readonly FieldDef[] = [
     min: 0,
     optional: true,
     placeholder: "server's default",
-    help: '0 keeps nothing. Without a value, the server option --ask-history-days applies.',
+    help: '0 keeps nothing. When empty, the server option --ask-history-days applies.',
   },
 ];
 
@@ -113,7 +113,7 @@ export const MEMORY_FIELDS: readonly FieldDef[] = [
     label: 'Agent graphs',
     type: 'lines',
     placeholder: 'https://example.org/memory/agents/*',
-    help: 'Graph IRIs or patterns with *, one per line. Facts only these graphs assert are unreviewed.',
+    help: 'Graph IRIs or patterns with *, one per line. Facts that appear only in these graphs count as unreviewed.',
   },
   {
     path: 'consolidatedGraph',
@@ -129,16 +129,16 @@ export const MEMORY_FIELDS: readonly FieldDef[] = [
     label: 'Agents',
     type: 'json',
     placeholder: '{ "agent-7": { "conversationFacts": "immediate" } }',
-    help: 'Per agent, whether conversation facts are written at once (immediate) or for review.',
+    help: 'For each agent, whether conversation facts are written right away (immediate) or held for review.',
   },
   {
     path: 'imports.base',
     group: 'Imports',
-    label: 'Import graphs base',
+    label: 'Import graph base',
     type: 'text',
     optional: true,
     placeholder: 'https://example.org/memory/import/',
-    help: 'The prefix of every import graph. Agent graphs must cover it.',
+    help: 'The IRI prefix of every import graph. Agent graphs must include it.',
   },
   {
     path: 'imports.extract',
@@ -196,7 +196,7 @@ export const MEMORY_FIELDS: readonly FieldDef[] = [
     group: 'Retention',
     label: 'Session graphs',
     type: 'lines',
-    placeholder: 'graphs whose IRI holds /sessions/',
+    placeholder: 'graphs whose IRI contains /sessions/',
   },
   {
     path: 'retention.requireConsolidated',
@@ -204,7 +204,7 @@ export const MEMORY_FIELDS: readonly FieldDef[] = [
     label: 'Only consolidated graphs',
     type: 'bool',
     fallback: true,
-    help: 'Delete only graphs whose facts a reviewed graph also asserts.',
+    help: 'Delete only graphs whose facts also appear in a reviewed graph.',
   },
   {
     path: 'retention.every',
@@ -219,10 +219,10 @@ export const MEMORY_FIELDS: readonly FieldDef[] = [
 export const INGEST_FIELDS: readonly FieldDef[] = [
   {
     path: 'keepText',
-    label: 'Keep the text of sources',
+    label: 'Keep source text',
     type: 'bool',
     fallback: true,
-    help: 'Without it, sources keep only their digest and length, and every fact needs a quote.',
+    help: 'When off, sources keep only their digest and length, and every fact needs a quote.',
   },
   {
     path: 'confirmTokens',
@@ -231,7 +231,7 @@ export const INGEST_FIELDS: readonly FieldDef[] = [
     min: 0,
     optional: true,
     fallback: 200000,
-    help: 'The estimate above which an ingestion waits for a confirmation.',
+    help: 'Ingestions estimated above this many tokens wait for confirmation.',
   },
   {
     path: 'autoConfidence',
@@ -251,7 +251,7 @@ export const GRAPHRAG_FIELDS: readonly FieldDef[] = [
     label: 'Community reports',
     type: 'bool',
     fallback: false,
-    help: 'Whether the dataset can build GraphRAG community reports.',
+    help: 'Let this dataset build GraphRAG community reports.',
   },
   {
     path: 'principal',
@@ -260,7 +260,7 @@ export const GRAPHRAG_FIELDS: readonly FieldDef[] = [
     type: 'text',
     optional: true,
     placeholder: 'a user name',
-    help: 'The user whose view the build reads. Only callers whose access covers that view can read the reports.',
+    help: 'The build reads the data this user can see. Only people with at least that access can read the reports.',
   },
   {
     path: 'projection.graphs',
@@ -268,14 +268,14 @@ export const GRAPHRAG_FIELDS: readonly FieldDef[] = [
     label: 'Graphs',
     type: 'lines',
     placeholder: 'urn:graph:org',
-    help: 'Graph IRIs or patterns with *, one per line, whose resources are grouped.',
+    help: 'Graph IRIs or patterns with *, one per line. Resources in these graphs are grouped into communities.',
   },
   {
     path: 'projection.exclude',
     group: 'Build',
     label: 'Predicates left out',
     type: 'lines',
-    help: 'Predicates that do not join resources, such as rdf:type.',
+    help: 'Predicates that should not link resources, such as rdf:type.',
   },
   {
     path: 'levels',
@@ -285,7 +285,7 @@ export const GRAPHRAG_FIELDS: readonly FieldDef[] = [
     min: 0,
     max: 7,
     fallback: 3,
-    help: 'The deepest level of the hierarchy kept, from 0 (coarsest).',
+    help: 'The deepest hierarchy level to keep, counting from 0 (coarsest).',
   },
   {
     path: 'resolution',
@@ -313,7 +313,7 @@ export const GRAPHRAG_FIELDS: readonly FieldDef[] = [
     min: 1,
     max: 10000,
     fallback: 400,
-    help: 'The facts sent for a leaf community.',
+    help: 'The most facts sent for a leaf community.',
   },
   {
     path: 'reportsGraph',
@@ -321,7 +321,7 @@ export const GRAPHRAG_FIELDS: readonly FieldDef[] = [
     label: 'Reports graph',
     type: 'text',
     fallback: 'urn:x-sparkles:graphrag:reports',
-    help: 'Where the reports are stored. It must be under urn:x-sparkles:graphrag:.',
+    help: 'Where reports are stored. Must start with urn:x-sparkles:graphrag:.',
   },
   {
     path: 'language',
@@ -338,7 +338,7 @@ export const GRAPHRAG_FIELDS: readonly FieldDef[] = [
     min: 0,
     max: 1,
     fallback: 0.1,
-    help: "The share of a community's facts that must change before a refresh rewrites its report.",
+    help: "The fraction of a community's facts that must change before a refresh rewrites its report.",
   },
   {
     path: 'budget.tokensPerBuild',
@@ -374,7 +374,7 @@ const PATHS_FIELDS: readonly FieldDef[] = [
     label: 'Predicates skipped by default',
     type: 'lines',
     placeholder: 'http://www.w3.org/1999/02/22-rdf-syntax-ns#type',
-    help: 'Predicate IRIs, one per line, that a search in Explore skips unless the reader changes the list.',
+    help: 'Predicate IRIs, one per line. Path searches in Explore skip them unless the user changes the list.',
   },
 ];
 
@@ -383,11 +383,11 @@ const FORMS_FIELDS: readonly FieldDef[] = [
   {
     path: 'shapes',
     group: 'Shapes',
-    label: 'Shapes of the forms',
+    label: 'Form shapes',
     type: 'enum',
     options: ['guard', 'graphs', 'drafted'],
     fallback: 'guard',
-    help: 'guard reads the write-time SHACL guard, graphs reads the shapes graphs below, and drafted drafts shapes from the data.',
+    help: 'guard uses the write-time SHACL guard. graphs uses the shapes graphs below. drafted drafts shapes from the data.',
   },
   {
     path: 'graphs',
@@ -395,16 +395,16 @@ const FORMS_FIELDS: readonly FieldDef[] = [
     label: 'Shapes graphs',
     type: 'lines',
     placeholder: 'http://example.org/shapes',
-    help: 'Graph IRIs, one per line, that hold the shapes when the source is graphs.',
+    help: 'Graph IRIs, one per line, that hold the shapes when Form shapes is graphs.',
   },
   {
     path: 'saveTo',
     group: 'Saves',
-    label: 'Saves of a form on main go to',
+    label: 'Form saves on main go to',
     type: 'enum',
     options: ['auto', 'main', 'branch'],
     fallback: 'auto',
-    help: 'auto saves to main unless main is protected, and to a branch of the editor then.',
+    help: "auto saves to main, or to the editor's own branch when main is protected.",
   },
   {
     path: 'branchTemplate',
@@ -412,15 +412,15 @@ const FORMS_FIELDS: readonly FieldDef[] = [
     label: 'Branch name',
     type: 'text',
     fallback: 'edits.{user}.{date}',
-    help: 'The name of the branch of an editor. It must hold {user}, and {date} is the day as yyyymmdd.',
+    help: "The name of an editor's branch. It must contain {user}. {date} becomes the day as yyyymmdd.",
   },
   {
     path: 'targetGraph',
     group: 'Saves',
-    label: 'Graph of new values',
+    label: 'Graph for new values',
     type: 'text',
     fallback: 'type',
-    help: 'type writes into the graph of the resource’s rdf:type triple, default into the default graph, and an IRI into that graph.',
+    help: 'type writes into the graph that holds the resource’s rdf:type triple, default into the default graph, and an IRI into that graph.',
   },
   {
     path: 'newIri',
@@ -428,7 +428,7 @@ const FORMS_FIELDS: readonly FieldDef[] = [
     label: 'IRIs of new instances',
     type: 'text',
     fallback: 'urn:uuid',
-    help: 'urn:uuid, or a template that holds {uuid}, such as http://example.org/person/{uuid}.',
+    help: 'urn:uuid, or a template containing {uuid}, such as http://example.org/person/{uuid}.',
   },
 ];
 
@@ -444,26 +444,26 @@ export const DATASET_FIELDS: Record<DatasetKind, readonly FieldDef[]> = {
 export const KIND_TITLES: Record<DatasetKind, { title: string; text: string }> = {
   assistant: {
     title: 'Assistant',
-    text: 'Questions in words, summaries and server ingestion, and what may be sent to a model.',
+    text: 'Questions, summaries, server ingestion and what may be sent to a model.',
   },
   memory: {
     title: 'Memory',
-    text: 'The graphs that hold agent memory, imports, consolidation and retention.',
+    text: 'Agent memory graphs, imports, consolidation and retention.',
   },
   ingest: {
     title: 'Ingest',
-    text: 'What the dataset keeps of ingested documents, and when an ingestion asks first.',
+    text: 'What is kept from ingested documents, and when an ingestion asks for confirmation.',
   },
   graphrag: {
     title: 'GraphRAG',
-    text: 'Community reports: what the build reads, the hierarchy it keeps and its token budget.',
+    text: 'What community reports are built from, the hierarchy they keep and their token budget.',
   },
   paths: {
     title: 'Paths',
-    text: 'The predicates the path finder in Explore skips unless the reader changes the list.',
+    text: 'Predicates the path finder in Explore skips by default.',
   },
   forms: {
     title: 'Forms',
-    text: 'The shapes that editing forms read, and where their saves go.',
+    text: 'Which shapes editing forms use, and where saves go.',
   },
 };

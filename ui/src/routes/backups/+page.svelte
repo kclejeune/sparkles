@@ -110,15 +110,15 @@
 
 <svelte:head><title>Backups | Sparkles</title></svelte:head>
 
-<div class="page page-container">
-  <header class="head">
+<div class="page-container">
+  <header class="page-head">
     <div>
       <h1>Backups</h1>
       <p class="muted">
         {#if !loaded}Loading…{:else if unsupported}Not available on this server{:else}{repositories.length}
           repositor{repositories.length === 1 ? 'y' : 'ies'}{repositories.length !== reachableCount
             ? `, ${repositories.length - reachableCount} unreachable`
-            : ''}{admin ? '' : ' · the backups of the datasets you administer'}{/if}
+            : ''}{admin ? '' : ' · showing datasets you administer'}{/if}
       </p>
     </div>
     <span class="spacer"></span>
@@ -130,9 +130,9 @@
       <Icon name="archive" size={24} />
       <p>This server has no backup repositories.</p>
       <p class="faint small">
-        It predates them, or was built without the backup feature. <a href={resolve('/datasets')}
+        It is an older version or was built without backup support. <a href={resolve('/datasets')}
           >Datasets</a
-        > still offer the N-Quads dump.
+        > can still write an N-Quads dump.
       </p>
     </div>
   {:else}
@@ -189,19 +189,6 @@
 </div>
 
 <style>
-  .page {
-    padding: 24px 28px 40px;
-    gap: 16px;
-  }
-  .head {
-    display: flex;
-    align-items: flex-end;
-    gap: 8px;
-    flex-wrap: wrap;
-  }
-  .head p {
-    margin-top: 4px;
-  }
   .tabs {
     border-bottom: 1px solid var(--border);
   }
@@ -213,10 +200,5 @@
   }
   .small {
     font-size: var(--fs-sm);
-  }
-  @media (max-width: 760px) {
-    .page {
-      padding: 16px;
-    }
   }
 </style>

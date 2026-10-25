@@ -536,7 +536,8 @@
   async function deleteSaved() {
     const d = activeStored;
     if (!ds || !d) return;
-    if (!confirm(`Delete the saved query ${d.name} of /${ds}? Its versions go with it.`)) return;
+    if (!confirm(`Delete the saved query ${d.name} from /${ds}? This also deletes its versions.`))
+      return;
     try {
       await api.deleteStoredQuery(ds, d.name);
       delete storedDefs[`${ds}/${d.name}`];
@@ -746,7 +747,7 @@
       toasts.push(
         'success',
         'Suggested as an example',
-        `An admin of /${ds} can store it as a saved query.`,
+        `An admin of /${ds} can turn it into a saved query.`,
       );
     } catch (e) {
       toasts.error('Could not suggest the example', e);
@@ -1354,15 +1355,12 @@
         toasts.push(
           'error',
           e.line != null
-            ? `Can't format: syntax error at line ${e.line}`
-            : "Can't format: syntax error",
+            ? `Cannot format: syntax error at line ${e.line}`
+            : 'Cannot format: syntax error',
           e.message,
         );
       } else if (e instanceof api.ApiError && e.status === 422) {
-        toasts.push(
-          'error',
-          'The formatter could not format this query safely; it was left unchanged',
-        );
+        toasts.push('error', 'Could not format this query safely, so it was left unchanged');
       } else {
         toasts.error('Formatting failed', e);
       }
@@ -1813,7 +1811,7 @@
       const first = await patternLocal(text);
       // the person may have typed or switched tabs while the parser loaded
       if (active.id !== tab || (editor?.snapshot().text ?? active.query) !== text)
-        throw new Error('The query changed while the edit was being prepared. Try again');
+        throw new Error('The query changed before the edit was applied. Try again');
       if (!first.ok) throw new Error(`The query does not parse: ${first.error}`);
       const changes = composeEdits(text, parseNow, parseStrict, make(first, text));
       if (!changes.length || !editor) return false;
@@ -3377,14 +3375,15 @@
             <Icon name="info" size={14} />
             {#if diffView.cut}
               <span
-                >The read cut the rows ({fmtInt(diffView.left)} before, {fmtInt(diffView.right)} after),
-                so only the counts are compared and the later state is shown.</span
+                >The results were truncated ({fmtInt(diffView.left)} rows before, {fmtInt(
+                  diffView.right,
+                )} after), so only the counts are compared and the later state is shown.</span
               >
             {:else}
               <span
                 >More than {fmtInt(ROW_DIFF_LIMIT)} rows on one side ({fmtInt(diffView.left)} before,
-                {fmtInt(diffView.right)} after), so the browser does not compare them and shows the later
-                state.</span
+                {fmtInt(diffView.right)} after), too many to compare in the browser, so the later state
+                is shown.</span
               >
             {/if}
             {#if needsServer}{@render serverCompare()}{/if}
@@ -3713,8 +3712,8 @@
                   Showing {fmtInt(
                     choice.renderer === 'webgl' ? graph.nodes.length : canvasGraph.nodes.length,
                   )}
-                  of {fmtInt(graph.totalNodes)} nodes. Large graphs are hard to read; add a LIMIT or raise
-                  Max nodes.
+                  of {fmtInt(graph.totalNodes)} nodes. Add a LIMIT to narrow the result, or raise Max
+                  nodes.
                 </div>
               {/if}
               {#if choice.reason && graph.nodes.length > CANVAS_MAX}
@@ -4057,7 +4056,9 @@
 
 {#snippet emptyWhy(diag: EmptyDiagnosis | undefined)}
   {#if diag?.state === 'loading'}
-    <p class="faint small"><span class="spinner"></span> Looking for what matched nothing…</p>
+    <p class="faint small">
+      <span class="spinner"></span> Checking why nothing matched…
+    </p>
   {:else if diag?.state === 'done'}
     {@const why = emptyExplanation(diag.d)}
     {#if why}
@@ -4067,12 +4068,12 @@
         <p class="muted">{why.message}</p>
         {#if why.first}
           <p class="small">
-            <span class="faint">First {why.first.kind} without solutions</span>
+            <span class="faint">First {why.first.kind} with no matches</span>
             <code class="mono">{why.first.text}</code>
           </p>
           {#if why.first.missing.length}
             <p class="small">
-              <span class="faint">Not in the data you can read:</span>
+              <span class="faint">Not found in the data:</span>
               {#each why.first.missing as m, i (m)}{#if i},
                 {/if}<span class="mono"><TermView term={parseCompact(m, dp)} prefixes={dp} /></span
                 >{/each}
@@ -4093,8 +4094,9 @@
   width={560}
 >
   <p class="muted small">
-    {example ? 'The query' : "The editor's query"} is stored on the server for /{ds}. Runs bind each
-    parameter to one value of its type, so a value never changes the query. It is also an MCP tool.
+    {example ? 'The query' : "The editor's query"} is saved on the server for /{ds}. Each run binds
+    every parameter to a single value of its type, so a value can never change the query's shape. It
+    is also available as an MCP tool.
   </p>
   <div class="save-form">
     <label class="field">
@@ -4143,7 +4145,7 @@
             class="input sm"
             bind:value={r.default}
             disabled={!r.use}
-            placeholder="default (empty: required)"
+            placeholder="Default (leave empty to require a value)"
           />
         {/each}
       </div>

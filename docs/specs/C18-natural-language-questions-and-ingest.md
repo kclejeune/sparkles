@@ -5066,8 +5066,58 @@ evaluation scores as a failure. CK25 has a class `pv:Service`, and `sparkles ask
 that name for the SERVICE keyword and left two questions unrun for every model, a fault
 now fixed. Two gold queries order on values with ties before a limit. The runs of the
 two unrun questions, and of the empty drafts with replies recorded, need new requests.
-What remains is a paid run of the DBpedia sets, now that roadmap item 89 has landed, and the work
-listed below.
+The first paid run gave every model the default `contextTokens` of 8,192, so the
+grounding of each question was trimmed to fit that window, and its numbers describe
+Claude models treated as small ones. A run file now sets `contextTokens`, and the second
+run gave each model 200,000.
+
+The evaluator now answers a clarification as a person who means the gold query would.
+It picks one of the choices the pipeline offered, by an IRI the gold names or else by the
+words the choice shares with the gold, and scores a second Ask that carries the choice,
+so nothing from the gold that the pipeline did not propose reaches the model.
+`testsuite/ask/README.md` gives the rule. Against the harness's fake provider, which
+drafts the gold query, 84 of the 107 QALD-9-plus questions and 58 of the 74 DBpedia-only
+questions stopped at a clarification. Once those were answered, 105 of 107 and 74 of 74
+scored correct, so clarifications no longer decide the score.
+
+The second paid run, on 2026-10-24, asked QALD-9-plus and the 74 DBpedia questions on the
+DBpedia 2022.12.01 database of 1.01 billion quads, with Haiku 5.5, Sonnet 5.5 and Opus
+5.5 at effort `medium`, through the binary of commit 03aa64bb. It settled $28.80 over
+989 requests with no cap refusal and nothing held. The run showed a fault in the scorer.
+Ask runs a draft with the well-known prefixes of C20 §3.1, and `sparkles query --loc`,
+which the scorer used to run the same query again, does not declare them. A correct
+answer that wrote `rdfs:label` without declaring it therefore failed when it was scored,
+which happened to 53 Opus answers on QALD-9-plus and to none after the fix. The scorer now declares those prefixes
+first, and `scripts/eval-ask-rescore` scored the saved answers again without calling a
+model. The table gives the corrected scores, the same scores without credit for extra
+columns, and the cost of each model on each set.
+
+| Set | Haiku 5.5 | Sonnet 5.5 | Opus 5.5 |
+|---|---|---|---|
+| QALD-9-plus, projected columns | 16/107 | 35/107 | 40/107 |
+| QALD-9-plus, equal width | 13/107 | 15/107 | 15/107 |
+| QALD-9-plus, as first scored | 13/107 | 21/107 | 21/107 |
+| QALD-9-plus, cost | $0.31 | $5.61 | $11.14 |
+| DBpedia-only, projected columns | 11/74 | 28/74 | 32/74 |
+| DBpedia-only, equal width | 9/74 | 14/74 | 13/74 |
+| DBpedia-only, as first scored | 10/74 | 18/74 | 15/74 |
+| DBpedia-only, cost | $0.19 | $3.72 | $7.82 |
+
+Most questions asked a clarification, 84 or 85 of 107 and 58 or 59 of 74 for each model,
+because `link_entities` offers a category or a namesake beside the main resource, and the
+evaluator answered all of them. Haiku found 71 of the QALD-9-plus questions
+unanswerable. Its drafts said that no listed predicate fits, since the grounding lists
+150 of DBpedia's predicates and those seldom include the one a question needs. Sonnet and Opus write a query anyway, guessing the predicate from its name, and
+most of their failures are wrong rows from a guessed predicate or a different modelling
+choice than the gold's. Most of their correct answers add a label column beside the IRI,
+which only the projected policy credits. The cascade from Haiku to Sonnet to Opus scored
+as Haiku did, because a wrong answer from Haiku is not a failure that escalates. The
+median time of an Ask, counting the first Ask of a question that stopped at a
+clarification, was 11.8 s for Haiku, 12.7 s for Sonnet and 18.6 s for Opus on QALD-9-plus.
+With 107 and 74 questions, a difference of a few questions between Sonnet and Opus is
+within noise. [ROADMAP](../ROADMAP.md) item 263 holds the grounding that would show a
+question's predicates and the ranking that would spare the clarification. What remains
+is listed below.
 
 - Run the matrix of §11.4 with real providers on the demo set, QALD-9-plus (DBpedia
   questions, gold answers recomputed on the loaded release as §11.1 says) and the
@@ -5130,10 +5180,9 @@ listed below.
   CC BY-SA 4.0. The strict scorer compares rows as sets, so the two CK25 questions marked
   `RESULT_ORDER_MATTERS` are scored without their order, and their scores carry
   `orderNotScored`.
-- Publish per model and role the metrics of §11.1 and §11.4 (execution accuracy with
-  QALD's precision, recall and F1, valid-query rate, repair rate, latency and cost per
-  correct answer) in a section of [BENCHMARKS](../BENCHMARKS.md), and replace §3.7's
-  example role lists in the documentation with the measured ones, as §11.4 intends.
+- [BENCHMARKS](../BENCHMARKS.md#natural-language-questions) gives the Anthropic numbers
+  per model. Numbers per role, and §3.7's example role lists replaced in the
+  documentation with measured ones as §11.4 intends, remain.
 - Add LC-QuAD 2.0 and QALD-10, which §11.1 deferred until a Wikidata subset can be
   loaded. X06's Wikidata work ([X06](X06-benchmark-coverage.md)) provides the load. The
   subset is the closure of the gold queries' answers and the entities the questions

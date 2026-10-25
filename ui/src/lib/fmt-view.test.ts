@@ -84,19 +84,19 @@ describe('formatFailure', () => {
   it('names the line of a syntax error', () => {
     const e = new ApiError(400, 'expected a term', { code: 'syntax', line: 3, column: 7 });
     expect(formatFailure(e, 'these shapes')).toEqual({
-      title: "Can't format: syntax error at line 3",
+      title: 'Cannot format: syntax error at line 3',
       detail: 'expected a term',
       line: 3,
       column: 7,
     });
     const nowhere = new ApiError(400, 'bad', { code: 'syntax' });
-    expect(formatFailure(nowhere, 'these shapes')?.title).toBe("Can't format: syntax error");
+    expect(formatFailure(nowhere, 'these shapes')?.title).toBe('Cannot format: syntax error');
   });
 
   it('reports a refusal, and leaves other errors to the caller', () => {
     const refused = new ApiError(422, 'graph differs', { code: 'unsafe-format' });
     expect(formatFailure(refused, 'these shapes')).toEqual({
-      title: 'The formatter could not format these shapes safely; it was left unchanged',
+      title: 'Could not format these shapes safely, so it was left unchanged',
     });
     expect(formatFailure(new ApiError(415, 'not available'), 'these shapes')).toBeNull();
     expect(formatFailure(new ApiError(400, 'bad option', { code: 'bad-request' }), 'x')).toBeNull();

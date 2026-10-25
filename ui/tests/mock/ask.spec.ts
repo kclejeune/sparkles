@@ -130,7 +130,7 @@ test('a follow-up carries the earlier turn, and New question drops it', async ({
   await ask(page, 'Who is in the payments team?');
   await expect(page.getByRole('group', { name: 'Answer feedback' })).toBeVisible();
   const bar = page.getByRole('region', { name: 'Ask bar' });
-  await expect(bar).toContainText('Follow-up of “Who is in the payments team?”');
+  await expect(bar).toContainText('Following up on “Who is in the payments team?”');
   const sent = page.waitForRequest((r) => r.url().endsWith('/org/ask'));
   await ask(page, 'and their start dates?');
   expect((await sent).postDataJSON().context).toEqual([
@@ -141,7 +141,7 @@ test('a follow-up carries the earlier turn, and New question drops it', async ({
   ]);
   await expect(page.getByRole('group', { name: 'Answer feedback' })).toBeVisible();
   await bar.getByRole('button', { name: 'New question' }).click();
-  await expect(bar).not.toContainText('Follow-up of');
+  await expect(bar).not.toContainText('Following up on');
 });
 
 test('failure states say what went wrong', async ({ page }) => {

@@ -97,9 +97,9 @@ describe('saving', () => {
         { ...row, name: 'a' },
         { ...row, name: 'a' },
       ]),
-    ).toEqual(['A variable is a parameter twice.']);
+    ).toEqual(['Each variable can be a parameter only once.']);
     expect(saveProblems('ok', [{ ...row, name: 'timeout' }])).toEqual([
-      '?timeout has a reserved name.',
+      '?timeout is a reserved name.',
     ]);
   });
 });

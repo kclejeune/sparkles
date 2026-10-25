@@ -123,7 +123,7 @@
 
 <div class="map-editor">
   {#if entries.length === 0}
-    <p class="state">No {def.keyLabel ?? 'entry'} has options of its own.</p>
+    <p class="state">No {def.keyLabel ?? 'entry'} has its own options yet.</p>
   {:else}
     <ul class="cards" aria-label={def.label}>
       {#each entries as [name, x] (name)}

@@ -305,7 +305,7 @@
                   <span class="mono bname" style:color={laneColour(r.lane)}>{c.branch}</span>
                   <span class="kind">{commitKindLabel(c.kind)}</span>
                   {#each stubsByRow.get(i) ?? [] as s (s.label)}
-                    <span class="badge stub mono" title="Not in the graph">
+                    <span class="badge stub mono" title="Not shown in the graph">
                       {s.kind === 'merge' ? 'merged' : 'from'}
                       {s.label}</span
                     >
@@ -391,10 +391,10 @@
         </div>
         {#if c.message}<p class="faint">{c.message}</p>{/if}
         {#if diffLoading}
-          <p class="faint row"><span class="spinner"></span> Reading the changes…</p>
+          <p class="faint row"><span class="spinner"></span> Loading the changes…</p>
         {:else if diffError}
           <div class="error-box">
-            <strong>Could not read the changes.</strong>
+            <strong>Could not load the changes.</strong>
             <span class="muted">{api.errorMessage(diffError)}</span>
           </div>
         {:else if diff}

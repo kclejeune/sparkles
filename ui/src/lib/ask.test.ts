@@ -61,7 +61,7 @@ describe('the terms list', () => {
     ).toBe('res:payments "Payments team" · entity · ex:Team');
     expect(
       termLine(term({ term: 'ex:nope', iri: P.ex + 'nope', kind: 'entity', occurs: false })),
-    ).toBe('ex:nope · entity · not in the data you can read');
+    ).toBe('ex:nope · entity · not found in the data');
   });
 
   it('sums up a check', () => {
@@ -263,7 +263,7 @@ describe('an empty result', () => {
         issues: ['The names are tagged @en.'],
       },
     });
-    expect(EMPTY_HEADLINE).toBe('No data you can read matched.');
+    expect(EMPTY_HEADLINE).toBe('Nothing matched.');
   });
 
   it('says nothing when there is nothing to diagnose', () => {

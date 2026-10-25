@@ -223,8 +223,8 @@
 >
   {#if fromConfig}
     <p class="note">
-      Defined in the backup config file: change it there and reload the server (SIGHUP). You can
-      still run it now and preview its retention.
+      This policy is defined in the backup config file. To change it, edit the file and reload the
+      server (SIGHUP). You can still run it now or preview its retention.
     </p>
   {/if}
   <form id="policy-form" onsubmit={save}>
@@ -244,7 +244,7 @@
           {#if name && !nameOk}
             <span class="hint bad"
               >{taken.includes(name)
-                ? 'This name is taken (by a policy or a repository).'
+                ? 'A policy or repository already uses this name.'
                 : 'Lowercase letters, digits, “_” and “-”.'}</span
             >
           {/if}
@@ -291,10 +291,10 @@
           {#if patterns.length === 0}
             <span class="bad">Choose datasets or enter a pattern.</span>
           {:else if matched.length === 0}
-            No dataset matches now; datasets created later that match are included.
+            No datasets match yet. Matching datasets created later are included.
           {:else}
             Matches now: <span class="mono">{matched.join(', ')}</span>.{#if inMemory.length}
-              Each backup of an in-memory dataset first writes a temporary copy to disk:
+              In-memory datasets are copied to a temporary file on disk before each backup:
               <span class="mono">{inMemory.join(', ')}</span>.{/if}
           {/if}
         </p>
@@ -369,7 +369,7 @@
         <span class="hint"
           ><span class="mono">{'{policy} {dataset} {seq} {run} {time}'}</span> and
           <span class="mono">{'{date:%Y%m%d}'}</span> (%Y %m %d %H %M %S %j %V, in the policy's time zone).
-          A taken name gets -2, -3, …</span
+          If a name is taken, -2, -3, … is appended.</span
         >
       </label>
 
@@ -403,8 +403,10 @@
           </label>
         </div>
         <p class="hint" class:bad={!expireOk || !countsOk} aria-live="polite">
-          {#if !expireOk}Durations look like 30d, 12h, 2w or 1d 12h.{:else if !countsOk}Counts are
-            whole numbers (at most: 1 or more).{:else}{retentionSentence(retention)}{/if}
+          {#if !expireOk}Durations look like 30d, 12h, 2w or 1d 12h.{:else if !countsOk}Counts must
+            be whole numbers, and Keep at most must be 1 or more.{:else}{retentionSentence(
+              retention,
+            )}{/if}
         </p>
       </fieldset>
 
@@ -421,7 +423,7 @@
         <label class="check">
           After downtime
           <select class="select" bind:value={catchUp}>
-            <option value="one">run once for the missed runs</option>
+            <option value="one">run once to catch up</option>
             <option value="none">skip missed runs</option>
           </select>
         </label>

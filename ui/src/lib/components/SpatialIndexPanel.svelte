@@ -284,7 +284,7 @@
     {:else if loaded.kind === 'disabled'}
       <p class="faint">
         The spatial index is off for this dataset. GeoSPARQL functions and
-        <span class="mono">spatial:</span> property functions still work, by scanning; the index makes
+        <span class="mono">spatial:</span> property functions still work by scanning. The index makes
         them fast on large data.
       </p>
       <div class="row">
@@ -497,7 +497,7 @@
       </select>
     </label>
     <p class="faint small">
-      The index is built by a background task; queries run without it (by scanning) meanwhile.
+      The index builds in the background. Until it is ready, queries scan the data.
     </p>
     {#if configError}<div class="error-box">{configError}</div>{/if}
   </form>
@@ -513,7 +513,7 @@
 <Modal bind:open={disableOpen} title="Disable the spatial index?">
   <p>
     This deletes the spatial index of <span class="mono">{name}</span> and its files. GeoSPARQL queries
-    keep working, by scanning. The data is not changed.
+    keep working by scanning. The data is not changed.
   </p>
   {#snippet actions()}
     <button class="btn" type="button" onclick={() => (disableOpen = false)}>Cancel</button>

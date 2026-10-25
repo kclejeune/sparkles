@@ -116,8 +116,8 @@
       if (b.grantsChanged)
         toasts.push(
           'info',
-          'Review branch grants',
-          `${b.grantsChanged} grants still refer to the old name. Update them to grant access to ${b.name}.`,
+          'Update access grants',
+          `${b.grantsChanged} grants still use the old name. Update them to give access to ${b.name}.`,
         );
       if (current === r.branch.name) onselect?.(b.name);
       onchange?.();
@@ -264,10 +264,12 @@
           <tr>
             <th>Branch</th>
             <th class="num">Head</th>
-            <th title="The commit it started from, and its commits relative to that branch">
+            <th title="The branch and commit it started from, and how far ahead or behind it is">
               From
             </th>
-            <th title="Bytes only this branch uses, and bytes of other branches' files it keeps">
+            <th
+              title="Own is the bytes only this branch uses. Held is the bytes of other branches' files it keeps on disk."
+            >
               Disk
             </th>
             <th><span class="sr-only">Actions</span></th>
@@ -284,7 +286,7 @@
                   <a
                     class="mono"
                     href={branchHref(b.name)}
-                    title={b.name === current ? 'The branch on show' : `Show ${b.name}`}
+                    title={b.name === current ? 'The branch shown' : `Show ${b.name}`}
                     onclick={(e) => {
                       e.preventDefault();
                       onselect?.(b.name);
@@ -316,7 +318,7 @@
                   <div>
                     <span
                       class="badge"
-                      title="Reads the index files of the branch it started from until its first compaction"
+                      title="Shares index files with the branch it started from until its first compaction"
                       >linked</span
                     >
                   </div>
@@ -388,7 +390,8 @@
       /></label
     >
     <p class="faint">
-      Branch grants refer to names. Review grants that use the old name after renaming.
+      Access grants refer to branches by name. After renaming, update any grants that use the old
+      name.
     </p>
     {#if renameName && !renameOk}<p class="warn-text">Choose a valid, unused branch name.</p>{/if}
     {#if renaming.error}<div class="error-box">{renaming.error}</div>{/if}

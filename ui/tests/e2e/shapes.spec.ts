@@ -75,6 +75,6 @@ ex:PersonShape
 
   await setText(page, `@prefix ex: <${EX}> .\nex:s ex:p ex:o ;\n  ex:q ] .\n`);
   await page.keyboard.press('Shift+Alt+F');
-  await expect(page.getByText(/^Can't format: syntax error at line \d/)).toBeVisible();
+  await expect(page.getByText(/^Cannot format: syntax error at line \d/)).toBeVisible();
   await expect(page.locator('.cm-error-line')).toHaveCount(1);
 });

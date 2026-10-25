@@ -39,6 +39,6 @@ describe('upload table options', () => {
     // a mapping or template makes the base optional, and rules out a key
     const mapping = { name: 'people.csv-metadata.json' };
     expect(tableProblem(csv, { mapping })).toBeNull();
-    expect(tableProblem(csv, { mapping, key: 'id' })).toMatch(/default mapping only/);
+    expect(tableProblem(csv, { mapping, key: 'id' })).toMatch(/only with the default mapping/);
   });
 });

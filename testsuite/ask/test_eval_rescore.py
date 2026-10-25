@@ -166,6 +166,23 @@ class Rescore(unittest.TestCase):
         with self.assertRaises(Invalid):
             rescore.rescore(self.report, self.binary, self.root / "c")
 
+    def test_a_run_on_a_database_directory_needs_that_directory(self):
+        db = self.root / "db"
+        db.mkdir()
+        report = json.loads(self.report.read_text())
+        report.update(dataLoc=str(db.resolve()), dataSha256=None)
+        self.report.write_text(json.dumps(report))
+        with self.assertRaises(Invalid):
+            rescore.rescore(self.report, self.binary, self.root / "a")
+        with self.assertRaises(Invalid):
+            rescore.rescore(self.report, self.binary, self.root / "b", loc=self.root)
+        done = rescore.rescore(self.report, self.binary, self.root / "c", loc=db)
+        self.assertTrue(done["cases"][0]["correct"])
+
+    def test_a_directory_is_refused_for_a_run_on_a_file(self):
+        with self.assertRaises(Invalid):
+            rescore.rescore(self.report, self.binary, self.root / "a", loc=self.root)
+
     def test_a_case_file_must_belong_to_its_row(self):
         case_file = self.report.parent / (CASE + ".json")
         saved = json.loads(case_file.read_text())

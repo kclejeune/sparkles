@@ -214,7 +214,7 @@
       results = [];
       error = api.errorMessage(e);
       if (e instanceof api.ApiError && e.status === 507)
-        error = `The validation is over the server's budget, so the badges are off. ${error}`;
+        error = `Validation went over the server's limit, so the badges are hidden. ${error}`;
     } finally {
       if (!signal.aborted) {
         validating = false;
@@ -417,7 +417,7 @@
     {:else if probeError}
       <p class="danger small" role="alert">{probeError}</p>
     {:else if !probe}
-      <p class="faint small"><span class="spinner"></span> Looking for the dataset's shapes…</p>
+      <p class="faint small"><span class="spinner"></span> Loading shapes…</p>
     {:else}
       <div class="vo-head">
         <span class="small">
@@ -435,7 +435,7 @@
             )} nodes…
           {:else if !source}
             {sourceKind === 'graph'
-              ? 'Name a shapes graph of the dataset in the Lenses menu.'
+              ? 'Choose a shapes graph in the Lenses menu.'
               : 'No shapes to validate with.'}
           {:else if validatedAt}
             {fmtInt(withResults.length)} of {fmtInt(validatedAt.nodes)} nodes have results, {stateName}.
@@ -444,12 +444,14 @@
       </div>
       {#if error}<p class="danger small" role="alert">{error}</p>{/if}
       {#if targets.length >= MAX_DRAWN}
-        <p class="faint small">The overlay validates the first {fmtInt(MAX_DRAWN)} drawn nodes.</p>
+        <p class="faint small">
+          Only the first {fmtInt(MAX_DRAWN)} nodes on the canvas are validated.
+        </p>
       {/if}
       {#if hasSparql}
         <p class="faint small">
-          The overlay validates the drawn nodes as focus nodes. A SHACL-SPARQL constraint that is
-          not anchored at its focus node can give other results in a full validation.
+          Each node on the canvas is validated as a focus node. A SHACL-SPARQL constraint that looks
+          beyond its focus node can give different results in a full validation.
         </p>
       {/if}
     {/if}
@@ -510,7 +512,7 @@
           readonly={fix.busy}
           bind:value={fix.text}></textarea>
         {#if placeholder}
-          <p class="faint small">Fill in the placeholders, such as ?value, before the preview.</p>
+          <p class="faint small">Fill in placeholders such as ?value before you preview.</p>
         {/if}
         <div class="row vo-actions">
           <button class="btn sm primary" disabled={placeholder || fix.busy} onclick={preview}>
@@ -556,8 +558,8 @@
               {:else if fixResolution === 'remains'}
                 The guard would still report this result.
               {:else}
-                The preview does not say whether this result would be resolved. The overlay
-                validates again after the update runs.
+                The preview cannot tell whether this resolves the result. The canvas is validated
+                again after the update runs.
               {/if}
             </p>
             {#if fix.previewed !== fix.text}<p class="faint">
@@ -566,7 +568,7 @@
           </div>
         {/if}
         {#if fix.ran}<p class="ok small" role="status">
-            The update ran. The overlay validated the drawn nodes again.
+            Update applied. The canvas was validated again.
           </p>{/if}
       </section>
     {/if}

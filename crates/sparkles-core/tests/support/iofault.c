@@ -23,7 +23,9 @@
 //   u8 flag (write: 1 when the descriptor is O_DSYNC; end records: 1 when the call failed),
 //   u16 path length, path bytes, u64 offset, u64 length, then for a write the bytes and for
 //   a rename the new path (the path is the old one).
-// Only the shim's own bookkeeping is serialized: the real calls run concurrently.
+// Only the shim's own bookkeeping is serialized: the real calls run concurrently. A
+// process that exits while another thread appends a record can leave that last record
+// cut short, and the reader drops it.
 #define _GNU_SOURCE
 #include <dlfcn.h>
 #include <errno.h>

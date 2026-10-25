@@ -89,7 +89,7 @@
       if (draftOf(task?.result, 0)?.mapping) mappingText = mappingOf(task?.result);
     } catch (e) {
       if (!(e instanceof DOMException && e.name === 'AbortError'))
-        toasts.error('Lost track of the ingestion', e);
+        toasts.error('Could not get the ingestion status', e);
     } finally {
       if (poll === ctl) poll = null;
       void list();
@@ -106,7 +106,7 @@
       });
       void follow(t);
     } catch (e) {
-      toasts.error('The ingestion did not start', e);
+      toasts.error('Could not start the ingestion', e);
     } finally {
       busy = false;
     }
@@ -124,11 +124,18 @@
           what === 'confirm'
             ? await review.confirmIngest(ds, task.id)
             : await review.approveIngest(ds, task.id);
-        if (what === 'approve') toasts.push('success', 'The facts were written to main');
+        if (what === 'approve') toasts.push('success', 'Wrote the facts to main');
         void follow(t);
       }
     } catch (e) {
-      toasts.error(what === 'approve' ? 'The preview was not written' : `The ${what} failed`, e);
+      toasts.error(
+        what === 'approve'
+          ? 'Could not write the facts'
+          : what === 'confirm'
+            ? 'Could not continue the ingestion'
+            : 'Could not cancel the ingestion',
+        e,
+      );
     } finally {
       busy = false;
     }
@@ -141,7 +148,7 @@
     try {
       JSON.parse(mappingText);
     } catch (e) {
-      toasts.error('The mapping is not JSON', e);
+      toasts.error('The mapping is not valid JSON', e);
       return;
     }
     busy = true;
@@ -155,11 +162,11 @@
         typeof r === 'object' ? (commit?.inserted ?? r.tables?.[0]?.triples ?? r.count ?? 0) : 0;
       if (dry) dryRun = `The dry run would add ${fmtInt(n)} triples.`;
       else {
-        toasts.push('success', `Uploaded the table with its mapping`);
+        toasts.push('success', 'Uploaded the table with its mapping');
         dryRun = null;
       }
     } catch (e) {
-      toasts.error(dry ? 'The dry run failed' : 'The upload failed', e);
+      toasts.error(dry ? 'Could not run the dry run' : 'Could not upload the table', e);
     } finally {
       busy = false;
     }
@@ -184,8 +191,8 @@
       <p class="faint small">
         Markdown, HTML, text{caps.pdf ? ', PDF' : ''}{caps.office
           ? ', Word, PowerPoint, OpenDocument'
-          : ''}, CSV, TSV{caps.office ? ' or Excel' : ''}. A document becomes a source on a review
-        branch with the facts the dataset's model proposes; a table or a sheet gets a mapping draft.{caps.pdf &&
+          : ''}, CSV, TSV{caps.office ? ' or Excel' : ''}. Documents are registered as sources, and
+        the model proposes facts from them. Tables and sheets get a draft mapping instead.{caps.pdf &&
         !caps.ocr
           ? ' Scanned PDF pages are not read.'
           : ''}
@@ -242,15 +249,16 @@
 
           {#if task.estimate && task.status === 'awaiting-confirmation'}
             <p class="msg">
-              The extraction would take about {fmtInt(task.estimate.tokens)} tokens{task.estimate
+              Extraction needs about {fmtInt(task.estimate.tokens)} tokens{task.estimate
                 .estimatedCost != null
                 ? ` (about $${task.estimate.estimatedCost.toFixed(4)})`
-                : ''} over {task.estimate.chunks} chunk{task.estimate.chunks === 1 ? '' : 's'},
-              above the dataset's threshold of {fmtInt(task.estimate.threshold ?? 0)}.
+                : ''} across {task.estimate.chunks} chunk{task.estimate.chunks === 1 ? '' : 's'}.
+              That is above this dataset's threshold of {fmtInt(task.estimate.threshold ?? 0)}
+              tokens.
             </p>
             <div class="row">
               <button class="btn primary sm" disabled={busy} onclick={() => act('confirm')}
-                >Go on</button
+                >Continue</button
               >
             </div>
           {/if}
@@ -362,7 +370,7 @@
           {:else if r}
             <p class="msg">
               {#if r.outcome === 'already-registered'}
-                This text is already registered; nothing was written.
+                This source is already registered. Nothing was written.
               {:else if r.outcome === 'merged'}
                 {r.proposed} fact{r.proposed === 1 ? '' : 's'} merged into main.
               {:else if r.outcome === 'approved'}

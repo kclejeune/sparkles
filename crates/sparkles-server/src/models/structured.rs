@@ -99,13 +99,14 @@ fn check(s: &Value, v: &Value, at: &str, out: &mut Vec<String>) {
         }
         Value::Number(x) => {
             let x = x.as_f64().unwrap_or(f64::NAN);
+            // NaN compares as neither, so it fails both bounds
             if let Some(n) = s.get("minimum").and_then(Value::as_f64)
-                && !(x >= n)
+                && x.partial_cmp(&n).is_none_or(|o| o.is_lt())
             {
                 out.push(format!("{at} is below {n}"));
             }
             if let Some(n) = s.get("maximum").and_then(Value::as_f64)
-                && !(x <= n)
+                && x.partial_cmp(&n).is_none_or(|o| o.is_gt())
             {
                 out.push(format!("{at} is above {n}"));
             }

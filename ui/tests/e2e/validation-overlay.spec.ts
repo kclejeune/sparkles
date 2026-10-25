@@ -68,9 +68,7 @@ open('A10 and A11: badges, and a fix previewed and run', async ({ page, request 
   await expect(panel).toContainText('The update would commit.');
   // the guard validates incrementally, and p1 and p3 keep their results, so its summary
   // does not list every result of the state and cannot say this one is resolved
-  await expect(panel).toContainText(
-    'The preview does not say whether this result would be resolved.',
-  );
+  await expect(panel).toContainText('The preview cannot tell whether this resolves the result.');
   // nothing committed by the preview
   const before = await (await request.get('/$/commits/overlay?limit=1')).json();
   await panel.getByRole('button', { name: 'Run' }).click();

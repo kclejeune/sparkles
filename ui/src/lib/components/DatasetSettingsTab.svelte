@@ -76,10 +76,10 @@
 <div class="settings-tab">
   <p class="intro faint">
     {#if canAdmin}
-      Each field shows where its value comes from. A change here overrides the server's settings
-      file until it is reset, and fields the operator locked cannot be changed.
+      Each field shows where its value comes from. Changes here override the server's settings file
+      until you reset them. Fields locked by the operator cannot be changed.
     {:else}
-      <Icon name="lock" size={12} /> You can read these settings. Changing them needs admin on the dataset.
+      <Icon name="lock" size={12} /> You need admin access to this dataset to change these settings.
     {/if}
     {#if branch}
       Settings belong to the dataset and apply to every branch.

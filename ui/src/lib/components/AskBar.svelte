@@ -74,7 +74,7 @@
     </div>
     {#if context.length}
       <span class="followup faint" title={context.map((t) => t.question).join('\n')}>
-        Follow-up of “{context[context.length - 1].question}”
+        Following up on “{context[context.length - 1].question}”
       </span>
       <button type="button" class="btn ghost sm" onclick={onnew}>New question</button>
     {/if}

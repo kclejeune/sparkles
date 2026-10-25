@@ -43,3 +43,10 @@ slow-timeout = { period = "300s", terminate-after = 4 }
 [[profile.default.overrides]]
 filter = "binary(cli_memory) & test(memory_transcripts_review_and_export)"
 threads-required = "num-test-threads"
+
+# This test gives the producer 150 ms of active time while its slow reader takes
+# longer. Other tests can consume that budget between writes or before the blocking
+# task starts. Keep its deadline and assertions, and give it the runner's test slots.
+[[profile.default.overrides]]
+filter = "test(controlled_waits_do_not_count_against_the_deadline)"
+threads-required = "num-test-threads"

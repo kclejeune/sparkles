@@ -40,7 +40,7 @@ test('the Format button formats; a syntax error highlights its line', async ({ p
 
   await setText(page, 'ASK {\n  ?s ?p ?o .\n  FILTER(?o > 1))\n}');
   await page.keyboard.press('Shift+Alt+F');
-  await expect(page.getByText("Can't format: syntax error at line 3")).toBeVisible();
+  await expect(page.getByText('Cannot format: syntax error at line 3')).toBeVisible();
   await expect(page.locator('.cm-error-line')).toHaveCount(1);
   await expect(page.locator('.cm-error-line')).toContainText('FILTER(?o > 1))');
   // the text is left as it was

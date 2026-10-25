@@ -132,7 +132,7 @@
     if (e instanceof api.ApiError && e.status === 403)
       return {
         title: 'Embedding maps need access to every graph',
-        hint: 'A projection places every entity of the index, so it is offered only to callers who can read the whole dataset.',
+        hint: 'The map places every entity in the index, so it needs read access to the whole dataset.',
         forbidden: true,
       };
     return { title: api.errorMessage(e) };
@@ -584,8 +584,8 @@
 <svelte:head><title>Embedding map | Sparkles</title></svelte:head>
 <svelte:window onkeydown={onkey} />
 
-<div class="page page-container">
-  <header class="head">
+<div class="page-container">
+  <header class="page-head">
     <div>
       <h1>Embedding map</h1>
       <p class="muted">
@@ -597,8 +597,7 @@
 
   {#if app.queryAt}
     <p class="note faint">
-      The embedding map shows the head. The Query page reads an earlier state, which the map does
-      not project.
+      The map shows the latest data, not the earlier state selected on the Query page.
     </p>
   {/if}
 
@@ -808,13 +807,6 @@
 </div>
 
 <style>
-  .page {
-    padding: 24px 28px 40px;
-    gap: 10px;
-  }
-  .head h1 {
-    margin: 0;
-  }
   .note {
     margin: 4px 0;
   }
@@ -974,9 +966,6 @@
     background: color-mix(in srgb, var(--spark) 10%, transparent);
   }
   @media (max-width: 720px) {
-    .page {
-      padding: 16px 16px 32px;
-    }
     .body {
       grid-template-columns: 1fr;
     }

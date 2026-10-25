@@ -137,12 +137,12 @@
 
 <Modal bind:open title="Draft shapes from the data" width={760} onclose={() => ctl?.abort()}>
   <p class="muted small">
-    One shape per class, from exact counts over the {graph === 'default'
+    Drafts one shape per class from exact counts over the {graph === 'default'
       ? 'default graph'
       : graph === 'union'
         ? 'union of all graphs'
-        : displayIri(graph, prefixes)}. A constraint is drafted when at least the support's share of
-    the instances it applies to satisfy it; at support 1 the current data conforms.
+        : displayIri(graph, prefixes)}. A constraint is included when at least the support fraction
+    of the instances it applies to satisfy it. At support 1, the current data conforms.
   </p>
   <div class="opts">
     <label class="row small">
@@ -207,8 +207,8 @@
     <pre class="draft mono" aria-label="Draft text">{text}</pre>
     {#if confirming}
       <div class="confirm small">
-        Installing replaces any write-time validation of /{ds}. Writes still commit in warn mode;
-        the receipt and the header report what does not conform.
+        This replaces any write-time validation of /{ds}. In warn mode, writes still commit, and the
+        response reports anything that does not conform.
         <div class="row">
           <button class="btn sm" onclick={() => (confirming = false)}>Cancel</button>
           <button class="btn sm primary" onclick={install} disabled={installing}>

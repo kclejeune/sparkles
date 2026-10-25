@@ -65,8 +65,8 @@
 <Modal open={dataset != null} title="Back up {dataset ?? ''}" onclose={() => (dataset = null)}>
   <form id="backup-now" class="form" onsubmit={submit}>
     <p class="faint intro">
-      Copies the dataset at its current commit into a repository. Writes go on meanwhile; only files
-      the repository lacks are uploaded.
+      Copies the dataset at its current commit into a repository. Writes can continue during the
+      backup, and only files the repository does not already have are uploaded.
     </p>
     <label class="field">
       Repository
@@ -78,7 +78,9 @@
         {/each}
       </select>
       {#if !repositories.some(usable)}
-        <span class="hint bad">No writable, reachable repository. A server admin adds them.</span>
+        <span class="hint bad"
+          >No writable repository is reachable. A server admin can add one.</span
+        >
       {/if}
     </label>
     <label class="field">

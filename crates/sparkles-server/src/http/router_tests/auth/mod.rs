@@ -66,6 +66,7 @@ pub(super) struct Fixture {
     /// the values of `--gsp-direct-naming`
     pub gsp_direct_naming: Vec<String>,
     /// `serve --mcp` with these more MCP flags; `None`: no MCP endpoint
+    #[cfg_attr(not(feature = "mcp"), allow(dead_code))]
     pub mcp: Option<Vec<&'static str>>,
     /// `--rate-limit` values (`query@ds=1/min`); empty: no rate limiter
     pub rate_limits: Vec<&'static str>,

@@ -36,7 +36,7 @@
     if (!repository) return;
     const warn = l.stale
       ? ''
-      : '\n\nIt is not stale: its holder may still be working, and breaking it can let a garbage collection delete blobs that holder needs.';
+      : '\n\nThis lock is not stale. Its holder may still be working, and breaking the lock can let garbage collection delete blobs the holder needs.';
     if (!confirm(`Break the ${l.kind} ${l.operation} lock held by ${l.holder.host}?${warn}`))
       return;
     breaking = l.id;
@@ -59,15 +59,15 @@
   onclose={() => (repository = null)}
 >
   <p class="small muted">
-    Backups, restores and verifies hold shared locks; garbage collection holds an exclusive one
-    while it deletes. A lock not refreshed for 30 minutes is stale and ignored.
+    Backups, restores and verifications take shared locks. Garbage collection takes an exclusive
+    lock while it deletes. A lock that is not refreshed for 30 minutes is stale and ignored.
   </p>
   {#if error}
     <div class="error-box">{error}</div>
   {:else if !locks}
     <p class="faint small"><span class="spinner"></span> Loading…</p>
   {:else if locks.length === 0}
-    <p class="faint small">No locks: nothing is working on this repository.</p>
+    <p class="faint small">No locks. Nothing is using this repository.</p>
   {:else}
     <table class="data">
       <thead>

@@ -94,7 +94,7 @@
       {/each}
     </ol>
   {:else if loading}
-    <p class="faint"><span class="spinner"></span> Working out the next runs…</p>
+    <p class="faint"><span class="spinner"></span> Calculating the next runs…</p>
   {:else}
     <p class="faint">Enter a schedule to see its next runs.</p>
   {/if}

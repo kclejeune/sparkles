@@ -777,8 +777,8 @@
     if (pathsAlone)
       toasts.push(
         'info',
-        'Paths drawn on their own',
-        `The graph has ${nodeCount} nodes, so the paths are drawn without it.`,
+        'Showing paths only',
+        `The graph already has ${nodeCount} nodes, so the paths are shown on their own.`,
       );
     if (o.nodes.length > MAX_PATH_NODES) {
       const keep = new Set(o.nodes.slice(0, MAX_PATH_NODES).map((n) => n.key));
@@ -1110,9 +1110,7 @@
     graphAnnounce = `Commit ${d.to.commit.seq}: ${added} ${added === 1 ? 'edge' : 'edges'} added, ${removed} removed`;
     graphNote = [
       plan.truncated ? `Only ${plan.ghostEdges.length} removed edges are drawn.` : '',
-      partial
-        ? `The comparison listed ${fmtInt(listed)} of ${fmtInt(d.added + d.removed)} changes, so the marks are partial.`
-        : '',
+      partial ? `Only ${fmtInt(listed)} of ${fmtInt(d.added + d.removed)} changes are marked.` : '',
     ]
       .filter(Boolean)
       .join(' ');
@@ -1174,7 +1172,7 @@
       if (!(graphTimeOpen && exCompare)) {
         graphAnnounce = at
           ? `Commit ${at.replace(/^commit:/, '')}: ${Object.keys(nodes).length} nodes`
-          : 'The graph at the head';
+          : 'Latest commit';
       }
     } catch (e) {
       if (!owns() || isAbort(e)) return;
@@ -1188,7 +1186,7 @@
       }
       graphSlider?.fail();
       strip?.fail();
-      toasts.error('Could not read the graph at that commit', e);
+      toasts.error('Could not load the graph at that commit', e);
     } finally {
       if (owns()) graphReading = false;
     }
@@ -1245,7 +1243,7 @@
         graphReading = false;
         await rereadGraph();
         if (graphTimeOpen)
-          graphNote = `Commit ${d.to.commit.seq} changed more than a step can apply, so the graph was read again at it.`;
+          graphNote = `Commit ${d.to.commit.seq} changed too much to apply in one step, so the graph was reloaded.`;
         return;
       }
       // the diff lists every graph's changes and the drawn graph reads one view of them, so
@@ -1327,7 +1325,7 @@
         return;
       }
       graphSlider?.fail();
-      toasts.error('Could not read the changes of that commit', e);
+      toasts.error('Could not load the changes in that commit', e);
     } finally {
       if (owns()) graphReading = false;
     }
@@ -2676,7 +2674,7 @@
                     role="tab"
                     aria-selected={sideTab === 'memory'}
                     onclick={() => (sideTab = 'memory')}
-                    title="What the memory you can read holds about it, with citations"
+                    title="Facts agents recorded about this resource, with citations"
                     ><Icon name="brain" size={13} /> Memory</button
                   >
                 </div>
@@ -2702,7 +2700,7 @@
                       }}
                     />
                     {#if hist.commits.length === 0}
-                      <p class="faint small">The change log holds no change of this resource.</p>
+                      <p class="faint small">No changes to this resource.</p>
                     {/if}
                     {#if hist.truncated}
                       <p class="faint small">
@@ -2713,7 +2711,7 @@
                   {:else if histError}
                     <div class="error-box">{histError}</div>
                   {:else}
-                    <p class="faint row"><span class="spinner"></span> Reading the history…</p>
+                    <p class="faint row"><span class="spinner"></span> Loading history…</p>
                   {/if}
                 {/if}
               {/if}
@@ -2765,7 +2763,7 @@
                       <span class="faint">{histNet.length}</span>
                     </h3>
                     {#if histNet.length === 0}
-                      <p class="faint small">Nothing about this resource differs between them.</p>
+                      <p class="faint small">No differences between these commits.</p>
                     {:else}
                       <ul>
                         {#each histNet as c (c.op + c.dir + c.predicate + c.term + c.graph)}
@@ -2785,7 +2783,7 @@
                                 ? ` · “${c.message}”`
                                 : ''}{isReadable(c.commit, hist.readable)
                                 ? ''
-                                : ' · state not readable'}
+                                : ' · state unavailable'}
                             </span>
                           </li>
                         {/each}
@@ -2905,7 +2903,7 @@
               <div class="error-box">{api.errorMessage(communityError)}</div>
             {:else if communityLoading}
               <p class="faint">
-                <span class="spinner"></span> Reading the report of {community.title}…
+                <span class="spinner"></span> Loading the report for {community.title}…
               </p>
             {/if}
           </div>
@@ -2925,9 +2923,8 @@
           {#if schema}
             <span
               class="faint small"
-              title="Every count is exact at this snapshot of the data (triples {fmtInt(
-                schema.totals.triples,
-              )})">{ex.snapshotLine(schema.snapshot)}</span
+              title="Exact counts at this snapshot ({fmtInt(schema.totals.triples)} triples)"
+              >{ex.snapshotLine(schema.snapshot)}</span
             >
           {/if}
           <span class="spacer"></span>
@@ -3046,7 +3043,7 @@
         {/if}
         <div class="schema-body scroll">
           {#if schemaLoading && !schema}
-            <div class="empty"><span class="spinner"></span> Reading the ontology…</div>
+            <div class="empty"><span class="spinner"></span> Loading schema…</div>
           {:else if schemaErr}
             <div class="pad">
               <div class="error-box"><strong>Could not load the schema.</strong> {schemaErr}</div>

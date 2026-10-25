@@ -82,8 +82,10 @@ describe('history paging', () => {
     // retention only matters once the list reaches the oldest retained commit
     expect(historyNotes({ firstRetained: 10, complete: true }, 30)).toEqual([]);
     expect(historyNotes({ firstRetained: 10, complete: true }, 10)[0]).toContain(
-      'Commits before 10 are no longer retained',
+      'History starts at commit 10. Older commits are no longer kept.',
     );
-    expect(historyNotes({ firstRetained: 0, complete: false }, 5)[0]).toContain('behind');
+    expect(historyNotes({ firstRetained: 0, complete: false }, 5)[0]).toContain(
+      'newest commits may be missing',
+    );
   });
 });

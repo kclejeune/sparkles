@@ -66,10 +66,10 @@ open('the Models section edits providers, roles and keys', async ({ page, reques
   const keys = page.getByTestId('model-keys');
   const gw2 = keys.locator('[data-secret=gw2]');
   await expect(gw2).toContainText('not set');
-  await gw2.getByRole('button', { name: 'Replace the key of gw2' }).click();
+  await gw2.getByRole('button', { name: 'Replace the key for gw2' }).click();
   await gw2.getByLabel('New key for gw2').fill(RUNTIME_KEY);
   await gw2.getByRole('button', { name: 'Save key' }).click();
-  await expect(page.getByText('Stored a new key for gw2')).toBeVisible();
+  await expect(page.getByText('Saved a new key for gw2')).toBeVisible();
   // the server runs without --secrets-key, so it sealed the key with one it generated
   await expect(keys.getByTestId('secrets-storage')).toContainText('secrets.key');
   await expect(gw2).toContainText('set here');
@@ -80,7 +80,7 @@ open('the Models section edits providers, roles and keys', async ({ page, reques
   // a key stored over the declared one overrides it, and Use server config removes it
   const anthropic = keys.locator('[data-secret=anthropic]');
   await expect(anthropic).toContainText('server config');
-  await anthropic.getByRole('button', { name: 'Replace the key of anthropic' }).click();
+  await anthropic.getByRole('button', { name: 'Replace the key for anthropic' }).click();
   await anthropic.getByLabel('New key for anthropic').fill(RUNTIME_KEY);
   await anthropic.getByRole('button', { name: 'Save key' }).click();
   await expect(anthropic).toContainText('overrides server config');
@@ -126,16 +126,16 @@ open('the Models section edits providers, roles and keys', async ({ page, reques
   );
   await expect(row('providers.gw2.endpoint')).toHaveAttribute('data-source', 'runtime');
 
-  // the added provider is removed, and its stored key with Remove runtime value
+  // the added provider is removed, and its stored key with Remove stored key
   await panel.getByRole('button', { name: 'Remove provider gw2' }).click();
   await page
     .getByRole('dialog', { name: 'Remove provider gw2?' })
     .getByRole('button', { name: 'Remove' })
     .click();
   await expect(providers.locator('[data-provider=gw2]')).toHaveCount(0);
-  await gw2.getByRole('button', { name: 'Remove the runtime value of gw2' }).click();
+  await gw2.getByRole('button', { name: 'Remove the stored key for gw2' }).click();
   await page
-    .getByRole('dialog', { name: 'Remove the key of gw2?' })
+    .getByRole('dialog', { name: 'Remove the key for gw2?' })
     .getByRole('button', { name: 'Remove' })
     .click();
   await expect(gw2).toHaveCount(0);
@@ -168,7 +168,7 @@ open('the Models section edits providers, roles and keys', async ({ page, reques
   await skip.check();
   await panel.getByRole('button', { name: 'Save', exact: true }).click();
   const ask = page.getByRole('dialog', { name: 'Turn off certificate verification?' });
-  await expect(ask).toContainText('can be read');
+  await expect(ask).toContainText('read and change the API key');
   const turnOff = ask.getByRole('button', { name: 'Turn off verification' });
   await expect(turnOff).toBeDisabled();
   await ask.getByRole('button', { name: 'Cancel' }).click();

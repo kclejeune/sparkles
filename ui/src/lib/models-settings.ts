@@ -174,26 +174,26 @@ export function secretState(s: SecretInfo): {
           set: true,
           label: 'overrides server config',
           title:
-            "A key stored here is used in place of the key of the server's configuration (--model-secret).",
+            "A key saved here is used instead of the key from the server's configuration (--model-secret).",
           overrides: true,
         }
       : {
           set: true,
           label: 'set here',
-          title: 'A key stored here or through the API.',
+          title: 'Saved here or through the API.',
           overrides: false,
         };
   if (s.source === 'declared')
     return {
       set: true,
       label: 'server config',
-      title: "The key comes from the server's configuration (--model-secret).",
+      title: "Set in the server's configuration (--model-secret).",
       overrides: false,
     };
   return {
     set: false,
     label: 'not set',
-    title: 'No key: the providers that use this secret cannot be called.',
+    title: 'No key is set, so providers that use it cannot be called.',
     overrides: false,
   };
 }
@@ -286,7 +286,7 @@ export function modelFields(k: SettingsKind | null): FieldDef[] {
     for (const d of fieldsOf(PROVIDER_SCHEMA, ['providers', name], ctx)) {
       if (d.type === 'map') d.keyLabel = 'model';
       if (d.type === 'pairs') d.keyLabel = 'header';
-      if (d.type === 'list') d.emptyText = 'No model is allowed.';
+      if (d.type === 'list') d.emptyText = 'No models allowed.';
       out.push(d);
     }
   }
@@ -298,7 +298,7 @@ export function modelFields(k: SettingsKind | null): FieldDef[] {
         d.entry = d.entry?.map((f) =>
           f.path === 'provider' ? { ...f, type: 'enum', options: chat, openOptions: true } : f,
         );
-        d.emptyText = 'Empty list: the role is off.';
+        d.emptyText = 'No entries, so this role is off.';
         d.keyLabel = 'entry';
       }
       out.push(d);
@@ -356,10 +356,9 @@ export function roleErrors(
       const at = (m: string) => pathString(['roles', role, String(i), m]);
       if (!provider) return;
       const p = providers[provider];
-      if (!p || typeof p !== 'object')
-        out[at('provider')] = `No provider named ${provider} is defined`;
+      if (!p || typeof p !== 'object') out[at('provider')] = `No provider named ${provider}`;
       else if (p.kind === 'local')
-        out[at('provider')] = `${provider} computes embeddings and does not answer prompts`;
+        out[at('provider')] = `${provider} only computes embeddings and cannot answer prompts`;
       else if (model && Array.isArray(p.allowedModels) && !p.allowedModels.includes(model))
         out[at('model')] = `${provider} does not allow ${model} (allowed models)`;
     });
@@ -381,24 +380,23 @@ export function newProviderPatch(
   const name = input.name.trim();
   const endpoint = input.endpoint.trim();
   const secret = input.secret.trim();
-  if (!name) return { error: 'The provider needs a name.' };
+  if (!name) return { error: 'Enter a provider name.' };
   if (!/^[A-Za-z0-9_][A-Za-z0-9_.-]*$/.test(name))
-    return { error: 'A provider name has letters, digits, _, - and . only.' };
-  if (existing.includes(name)) return { error: `A provider named ${name} exists.` };
+    return { error: 'Provider names can contain only letters, digits, _, - and .' };
+  if (existing.includes(name)) return { error: `A provider named ${name} already exists.` };
   if (!(PROVIDER_KINDS as readonly string[]).includes(input.kind))
-    return { error: 'Pick the protocol the provider speaks.' };
+    return { error: 'Choose a protocol.' };
   let url: URL;
   try {
     url = new URL(endpoint);
   } catch {
-    return { error: 'The endpoint is not a URL.' };
+    return { error: 'Enter a valid endpoint URL.' };
   }
   if (url.protocol !== 'http:' && url.protocol !== 'https:')
-    return { error: 'The endpoint is an http or https URL.' };
+    return { error: 'The endpoint must be an http or https URL.' };
   if (secret && !SECRET_NAME.test(secret))
     return {
-      error:
-        'A secret name has 1 to 128 letters, digits, _, - and ., and does not start with . or -.',
+      error: 'Secret names have 1 to 128 letters, digits, _, - or ., and cannot start with . or -.',
     };
   const model = (input.model ?? '').trim();
   const provider: JsonObject = { kind: input.kind, endpoint };

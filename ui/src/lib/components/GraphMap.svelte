@@ -143,7 +143,7 @@
     emptyText="None of these entities has a geometry"
   />
   {#if failure}
-    <p class="warn small">Some positions could not be read: {failure}</p>
+    <p class="warn small">Could not load some positions: {failure}</p>
   {/if}
 </div>
 

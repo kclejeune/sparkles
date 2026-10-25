@@ -177,8 +177,8 @@
   </div>
 {/snippet}
 
-<div class="page page-container">
-  <header class="head">
+<div class="page-container">
+  <header class="page-head">
     <div>
       <h1>Server</h1>
       <p class="muted">{origin}</p>
@@ -282,7 +282,7 @@
                   <button
                     class="btn sm"
                     disabled={busy[d.name]}
-                    title="Merge the updates into a new sorted index generation"
+                    title="Merge pending updates into a new index generation"
                     onclick={() => compactNow(d.name)}
                     ><Icon name="layers" size={13} /> Compact</button
                   >
@@ -341,9 +341,9 @@
         </table>
       </div>
       <p class="note faint">
-        Rates cover the last {STATUS_POLL_MS / 1000} s. Latency percentiles do too when that interval
-        had traffic, and otherwise the time since the server started. Health checks, metrics and the UI's
-        own files are not counted.
+        Rates cover the last {STATUS_POLL_MS / 1000} s. Latency percentiles cover the same window when
+        it had traffic, and otherwise the time since the server started. Health checks, metrics and the
+        UI's own files are not counted.
       </p>
     {:else}
       <div class="panel-body faint">Loading…</div>
@@ -510,16 +510,8 @@
 </div>
 
 <style>
-  .page {
-    padding: 24px 28px 40px;
-    gap: 16px;
-  }
-  .head {
-    display: flex;
-    align-items: flex-end;
-  }
-  .head p {
-    margin-top: 4px;
+  /* the subtitle is the server's origin, so it is set in monospace */
+  .page-head p {
     font-family: var(--font-mono);
     font-size: var(--fs-sm);
   }
@@ -639,9 +631,6 @@
     font-size: var(--fs);
   }
   @media (max-width: 760px) {
-    .page {
-      padding: 16px;
-    }
     .kv,
     .limits {
       grid-template-columns: 1fr 1fr;

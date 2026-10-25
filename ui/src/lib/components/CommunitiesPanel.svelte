@@ -170,7 +170,7 @@
         if (!live()) return;
         task = next;
       } catch (e) {
-        if (live()) toasts.error('Lost track of the run', e);
+        if (live()) toasts.error('Could not check on the run', e);
         return;
       }
     }
@@ -193,7 +193,7 @@
       const t = await gr.start(ds, mode, false);
       if (ctx === context) void follow(t);
     } catch (e) {
-      toasts.error(`The ${mode} did not start`, e);
+      toasts.error(`Could not start the ${mode}`, e);
     } finally {
       starting = false;
     }
@@ -207,7 +207,7 @@
     try {
       await gr.confirm(ds, task.id, yes);
     } catch (e) {
-      toasts.error('The answer was not recorded', e);
+      toasts.error('Could not record the answer', e);
     }
   }
 
@@ -216,7 +216,7 @@
     try {
       await api.json(`/$/tasks/${encodeURIComponent(task.id)}`, { method: 'DELETE' });
     } catch (e) {
-      toasts.error('The run was not cancelled', e);
+      toasts.error('Could not cancel the run', e);
     }
   }
 
@@ -236,7 +236,7 @@
       await load();
       if (selected) await open(selected);
     } catch (e) {
-      toasts.error('The review was not saved', e);
+      toasts.error('Could not save the review', e);
     } finally {
       reviewing = false;
     }
@@ -266,7 +266,7 @@
       await load();
       if (selected) await open(selected);
     } catch (e) {
-      toasts.error('The edit was not saved', e);
+      toasts.error('Could not save the edit', e);
     } finally {
       reviewing = false;
     }
@@ -318,7 +318,7 @@
       <button
         class="btn sm primary"
         disabled={readOnly || running || starting}
-        title="Write a report for every community; the estimate is shown before anything is sent"
+        title="Write a report for every community. You see the estimate before anything is sent."
         onclick={() => start('build')}
         >{#if starting}<span class="spinner"></span>{:else}<Icon name="sparkle" size={13} />{/if} Build</button
       >
@@ -336,8 +336,8 @@
 
   {#if branch}
     <p class="pad faint" data-testid="communities-off-main">
-      <Icon name="branch" size={12} /> This tab shows the community reports of main only, and this page
-      shows the <span class="mono">{branch}</span> branch. Switch to main to read, build or review them.
+      <Icon name="branch" size={12} /> Community reports exist only on main, and you are on
+      <span class="mono">{branch}</span>. Switch to main to read, build or review them.
     </p>
   {:else if error && !st}
     <div class="pad">
@@ -348,14 +348,14 @@
     </div>
   {:else if st && !st.enabled}
     <p class="pad faint">
-      GraphRAG is off for this dataset. A dataset admin turns it on in the <a href={settingsHref}
+      GraphRAG is off for this dataset. A dataset admin can turn it on in the <a href={settingsHref}
         >GraphRAG settings</a
-      >, with the user whose view the build reads and the graphs it groups.
+      > and choose which graphs to group and which user the build reads as.
     </p>
   {:else if st && !st.available}
     <p class="pad faint" data-testid="communities-unavailable">
-      <Icon name="lock" size={12} /> The community reports are not available to you, because your access
-      does not cover everything the build read.
+      <Icon name="lock" size={12} /> You cannot open these reports because they draw on data you do not
+      have access to.
     </p>
   {:else if st}
     <div class="panel-body summary">

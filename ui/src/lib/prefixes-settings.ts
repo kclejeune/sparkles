@@ -82,18 +82,18 @@ export function prefixRows(k: PrefixesKind): PrefixRow[] {
  */
 export function prefixNameError(name: string): string | null {
   if (name === '') return null;
-  if (new TextEncoder().encode(name).length > 256) return 'A prefix name has at most 256 bytes.';
+  if (new TextEncoder().encode(name).length > 256) return 'Prefix names can be at most 256 bytes.';
   if (!/^[A-Za-z]([A-Za-z0-9_.-]*[A-Za-z0-9_-])?$/.test(name))
-    return 'A prefix name starts with a letter and holds letters, digits, "_", "-" and "." (not at the end).';
+    return 'Prefix names start with a letter, contain only letters, digits, "_", "-" and ".", and cannot end with ".".';
   return null;
 }
 
 /** Why a prefix IRI is refused, or null: it must be absolute and at most 4096 bytes. */
 export function prefixIriError(iri: string): string | null {
-  if (!iri) return 'Give the namespace IRI.';
-  if (new TextEncoder().encode(iri).length > 4096) return 'An IRI has at most 4096 bytes.';
+  if (!iri) return 'Enter the namespace IRI.';
+  if (new TextEncoder().encode(iri).length > 4096) return 'IRIs can be at most 4096 bytes.';
   if (!/^[A-Za-z][A-Za-z0-9+.-]*:[^\s<>"{}|^`\\]*$/.test(iri))
-    return 'Give an absolute IRI, such as https://example.org/ns#, without spaces or <>.';
+    return 'Enter an absolute IRI without spaces or <>, such as https://example.org/ns#.';
   return null;
 }
 
@@ -114,18 +114,18 @@ export const prefixField = (name: string) => pathString([name]);
 export function prefixSourceTitle(r: PrefixRow): string {
   switch (r.source) {
     case 'well-known':
-      return 'A prefix Sparkles knows without configuration.';
+      return 'Built into Sparkles.';
     case 'server config':
       return "The prefix comes from the server's settings file.";
     case 'locked':
-      return "The operator locked this prefix in the server's settings file, so it cannot be changed here.";
+      return "Locked in the server's settings file, so it cannot be changed here.";
     case 'removed':
       return r.declared
         ? `Removed here. The server's settings file binds it to ${r.declared}.`
         : 'A well-known prefix removed here.';
     case 'changed':
       return r.info.overrides !== undefined
-        ? `Changed here, in place of the server config's ${String(r.info.overrides)}.`
+        ? `Changed here. The server config binds it to ${String(r.info.overrides)}.`
         : 'Added or changed here, or bound by loaded data.';
   }
 }

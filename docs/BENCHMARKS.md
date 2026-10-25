@@ -34,6 +34,7 @@ the settings of each engine and the commands that reproduce each table.
 * [Loading and index builds](#loading-and-index-builds)
 * [Writes and updates](#writes-and-updates)
 * [Bindings](#bindings)
+* [Natural-language questions](#natural-language-questions)
 * [Memory and disk](#memory-and-disk)
 * [Methodology and reproduction](#methodology-and-reproduction)
 
@@ -1333,15 +1334,23 @@ the client in 150.8 ms against 220.4 ms, and every round was faster. `star-looku
 0.496 ms of client time against 0.526 ms, and `count-all`, `types-grouped` and
 `values-star` stay within 1.2%. A screen of all queries on forge, at 8
 rounds of 20 requests, found client time 19% lower for `order-by-full`, 30% lower for
-`star-join` and 5% lower for `distinct-join`. `two-hop-count` took 1.4% more server
-time in every round while it ran the same instructions, which roadmap item 242 follows
-up.
+`star-join` and 5% lower for `distinct-join`. `two-hop-count` keeps its speed. In 24
+pinned A,B,B,A rounds with 40 requests per server process on forge, its server time was
+27.63 ms against 27.68 ms for the build before the buffer, and its client time was
+28.32 ms against 28.37 ms,
+with the ranges of round medians overlapping.
 
 The buffer remembers where each row ends, so an answer that stops partway reports the rows
 whose bytes the response writer took. That accounting costs 7% of the instructions of
 `optional-chain`, 3.7% of those of `star-lookup` and 2% of those of `values-star` against
 a buffer that counts rows only when it is written out, and on forge `optional-chain` took
 150.8 ms of client time against 132.0 ms without it. Roadmap item 243 follows this up.
+
+A pinned forge comparison of the combined feature changes, with 16 A,B,B,A rounds and
+100 requests per server process, found `count-all` server time 12.5% higher at 6.0 µs
+against 5.3 µs and `distinct-obj` 14.5% higher at 4.2 µs against 3.6 µs. Every round was slower for both
+queries. Client time stayed within 1.2%, at about 0.30 ms. Item 306 tracks isolating and
+removing the server-time cost.
 
 ### The cost of the query memory pool
 
@@ -2343,6 +2352,62 @@ store took 13 to 15 ms against TDB2's 2.3 to 3.2 ms.
 
 *Measured on 8-vCPU AMD EPYC instances of a cloud CI provider, not a quiet machine. Runs on
 different instances differed by up to 30%.*
+
+## Natural-language questions
+
+These numbers measure `sparkles ask` and global answering from community reports with
+Anthropic models. They depend on the models and prompts more than on the engine.
+`testsuite/ask/README.md` and `testsuite/graphrag/README.md` explain the harnesses, which
+call the provider through a local proxy that holds every request against a cost cap.
+
+| Measurement context | |
+|---|---|
+| Date and host | 2026-10-24, on a development laptop with the DBpedia database on local disk |
+| Models | Claude Haiku 5.5, Sonnet 5.5 and Opus 5.5 at effort `medium`, with a 200,000-token context |
+| Builds | Ask from commit 03aa64bb, global answering from commit 847d8d0b |
+| Cost | $28.80 for the Ask runs and $11.25 for the evaluation of global answering |
+
+### Ask on DBpedia
+
+The questions run on the DBpedia 2022.12.01 database of 1.01 billion quads, against
+answers recomputed on that release. When the pipeline asks which resource a name means,
+the harness answers from the gold query by choosing one of the offered choices. An answer
+is correct when its rows match the gold's on the projected columns, and the equal-width
+row gives no credit for extra columns such as a label beside an IRI.
+
+| Set | Haiku 5.5 | Sonnet 5.5 | Opus 5.5 |
+|---|---|---|---|
+| QALD-9-plus, 107 questions | 16 (15%) | 35 (33%) | 40 (37%) |
+| QALD-9-plus, equal width | 13 | 15 | 15 |
+| DBpedia-only, 74 questions | 11 (15%) | 28 (38%) | 32 (43%) |
+| DBpedia-only, equal width | 9 | 14 | 13 |
+| Cost per correct answer, QALD-9-plus | $0.020 | $0.160 | $0.279 |
+| Median time per question, QALD-9-plus | 11.8 s | 12.7 s | 18.6 s |
+
+Haiku found most questions unanswerable, because the grounding seldom lists the
+predicate a question needs. Sonnet and Opus guess the predicate and are often wrong.
+[C18](specs/C18-natural-language-questions-and-ingest.md#roadmap-follow-ups-2026-10-12)
+gives the failures and the earlier runs on the demo set and CK25, and
+[ROADMAP](ROADMAP.md) item 263 holds the follow-up.
+
+### Global answering
+
+Sonnet 5.5 answered 30 generated questions about the whole demo organisation graph four
+ways, and Opus 5.5 judged each pair of answers in both orders on the criteria of Edge et
+al. The table gives the win rate of global answering from the finest level, which holds
+27 reports, against each other mode, with a tie counted as half.
+
+| Against | Comprehensiveness | Diversity | Empowerment | Directness |
+|---|---|---|---|---|
+| Local Ask | 0.88 | 0.97 | 0.92 | 0.68 |
+| BM25 over 20 documents | 1.00 | 1.00 | 0.98 | 1.00 |
+| Global from the coarsest level | 0.62 | 0.57 | 0.55 | 0.79 |
+
+A global answer took a median of 10.4 s against 4.7 s for local Ask. Every cited fact
+exists, and the judge found 44% of the claims of fine answers fully supported and 48%
+partly supported.
+[C22](specs/C22-graph-rag-community-summaries.md#paid-acceptance-and-evaluation-2026-10-24)
+gives the intervals and the other measures.
 
 ## Memory and disk
 

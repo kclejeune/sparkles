@@ -576,9 +576,9 @@ export function goneTitle(track: Track, g: Range): string {
   const range = g.from === g.to ? `Commit ${g.from}` : `Commits ${g.from}–${g.to}`;
   const oldest =
     track.oldestReadable != null
-      ? `The oldest commit that can be read is ${track.oldestReadable}.`
-      : 'No commit of this track can be read.';
-  return `${range} can no longer be read. ${oldest}`;
+      ? `The oldest available commit is ${track.oldestReadable}.`
+      : 'No commit on this track is available.';
+  return `${range} ${g.from === g.to ? 'is' : 'are'} no longer available. ${oldest}`;
 }
 
 // --- failed reads ------------------------------------------------------------------------------
@@ -623,15 +623,15 @@ export function timeFailure(e: unknown): TimeFailure | null {
     const oldest =
       typeof body.oldestReconstructable === 'number' ? body.oldestReconstructable : null;
     const detail = readable?.length
-      ? `Readable commits: ${readable.map(rangeText).join(', ')}.`
+      ? `Available commits: ${readable.map(rangeText).join(', ')}.`
       : oldest != null
-        ? `The oldest readable commit is ${oldest}.`
+        ? `The oldest available commit is ${oldest}.`
         : undefined;
     return {
       seq,
       readable,
       title:
-        seq != null ? `Commit ${seq} can no longer be read` : 'That commit can no longer be read',
+        seq != null ? `Commit ${seq} is no longer available` : 'That commit is no longer available',
       detail,
     };
   }
@@ -640,8 +640,8 @@ export function timeFailure(e: unknown): TimeFailure | null {
     return {
       title:
         body.budget === 'history-memory'
-          ? 'Reading this state needs more history cache than the server allows'
-          : 'Reading this state needs more memory than the server allows',
+          ? 'Loading this state needs more history cache than the server allows'
+          : 'Loading this state needs more memory than the server allows',
       detail: limit != null ? `The limit is ${fmtBytes(limit)}.` : undefined,
     };
   }

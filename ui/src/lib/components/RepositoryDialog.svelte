@@ -165,7 +165,7 @@
     <p class="intro">
       {added.test.ok
         ? 'The repository is registered and reachable.'
-        : 'The repository is registered, but the connection test failed: it is shown as unreachable until a test passes. Fix the location or credentials outside Sparkles and test again, or remove it and add it with other settings.'}
+        : 'The repository is registered, but the connection test failed. It shows as unreachable until a test passes. Fix the location or credentials outside Sparkles and test again, or remove it and add it again with different settings.'}
     </p>
     <TestReportView report={added.test} />
   {:else}
@@ -201,7 +201,7 @@
       </label>
 
       {#if type === 'gcs' || type === 'azure'}
-        <p class="note warn">Experimental: not covered by the test suite yet.</p>
+        <p class="note warn">Experimental. Not covered by the test suite.</p>
       {/if}
 
       {#if type === 'fs'}
@@ -296,10 +296,11 @@
             />
           </label>
           <p class="hint">
-            The name of a source the server's operator defined in its backup config file (<span
+            The name of a credential source defined in the server's backup config file (<span
               class="mono">[credentials.&lt;name&gt;]</span
-            >: environment variables, a file or the default chain). Sparkles never stores secrets,
-            and repositories added here cannot pick the server's variables or files themselves.
+            >), which reads environment variables, a file or the default chain. Sparkles never
+            stores secrets, and repositories added here cannot point at the server's variables or
+            files directly.
           </p>
         </fieldset>
       {/if}
@@ -310,13 +311,15 @@
           <label class="check">
             <input type="checkbox" bind:checked={readonly} /> Read-only
             <span class="faint"
-              >list, restore and verify only; never writes, not even locks (for restoring what
-              another server writes)</span
+              >list, restore and verify only. Never writes, not even locks. Use it to restore
+              backups that another server writes.</span
             >
           </label>
           <label class="check">
             <input type="checkbox" bind:checked={conditionalWrites} /> Conditional writes
-            <span class="faint">off for services without If-None-Match: then one writer only</span>
+            <span class="faint"
+              >turn off for services without If-None-Match, which allows only one writer</span
+            >
           </label>
           <div class="grid3">
             <label class="field">

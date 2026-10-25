@@ -29,7 +29,7 @@
         data = null;
         error =
           e instanceof api.ApiError && e.status === 404
-            ? 'This server has no ingest settings.'
+            ? 'Ingest settings are not available on this server.'
             : api.errorMessage(e);
       }
     }
@@ -49,10 +49,10 @@
     busy = true;
     try {
       await review.putKeepText(ds, on);
-      toasts.push('success', on ? 'Sources keep their text' : 'Sources keep no text');
+      toasts.push('success', on ? 'Source text will be kept' : 'Source text will not be kept');
       await load();
     } catch (e) {
-      toasts.error('The setting was not saved', e);
+      toasts.error('Could not save the setting', e);
     } finally {
       busy = false;
     }
@@ -81,11 +81,11 @@
     busy = true;
     try {
       await review.putProfile(ds, name, p);
-      toasts.push('success', `Saved the profile ${name}`);
+      toasts.push('success', `Saved profile ${name}`);
       editing = null;
       await load();
     } catch (e) {
-      toasts.error('The profile was not saved', e);
+      toasts.error('Could not save the profile', e);
     } finally {
       busy = false;
     }
@@ -95,10 +95,10 @@
     busy = true;
     try {
       await review.deleteProfile(ds, name);
-      toasts.push('success', `Removed the profile ${name}`);
+      toasts.push('success', `Removed profile ${name}`);
       await load();
     } catch (e) {
-      toasts.error('The profile was not removed', e);
+      toasts.error('Could not remove the profile', e);
     } finally {
       busy = false;
     }
@@ -119,11 +119,11 @@
         disabled={!canAdmin || busy}
         onchange={(e) => setKeepText(e.currentTarget.checked)}
       />
-      Keep the text of sources
+      Keep source text
     </label>
     {#if !data.keepText}
       <p class="faint small">
-        Sources keep only their digest and length, so every fact from them needs a quote.
+        Only each source's digest and length are stored, so every fact needs a quote.
       </p>
     {/if}
     <h3>Profiles</h3>
@@ -132,7 +132,9 @@
         <li>
           <span class="mono">{name}</span>
           <span class="faint small">
-            {p.classes?.length ?? 'all'} classes · {p.predicates?.length ?? 'all'} predicates
+            {p.classes?.length ?? 'All'}
+            {p.classes?.length === 1 ? 'class' : 'classes'} · {p.predicates?.length ?? 'all'}
+            {p.predicates?.length === 1 ? 'predicate' : 'predicates'}
             {#if p.language}· {p.language}{/if}
           </span>
           {#if canAdmin}
@@ -142,12 +144,12 @@
               class="btn danger sm"
               disabled={busy}
               onclick={() => remove(name)}
-              aria-label="Remove the profile {name}">Remove</button
+              aria-label="Remove profile {name}">Remove</button
             >
           {/if}
         </li>
       {:else}
-        <li class="faint small">No profile, so agents extract against the whole schema.</li>
+        <li class="faint small">No profiles. Agents extract against the whole schema.</li>
       {/each}
     </ul>
     {#if canAdmin && editing == null}

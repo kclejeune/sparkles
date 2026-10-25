@@ -91,8 +91,8 @@
         await load();
         toasts.push(
           'info',
-          'Someone else changed the prefixes',
-          'The section shows their version now. Make your change again.',
+          'The prefixes changed elsewhere',
+          'They now show the latest version. Make your change again.',
         );
       } else if (f.kind === 'locked') {
         conflict = f.fields;
@@ -121,7 +121,7 @@
       return;
     }
     if (
-      await write(`Added the prefix ${n}:`, `The prefix ${n}: was not added`, (etag) =>
+      await write(`Added the prefix ${n}:`, `Could not add the prefix ${n}:`, (etag) =>
         patchKind(url, bindPatch(n, iri), etag),
       )
     ) {
@@ -147,7 +147,7 @@
     if (
       await write(
         `Changed the prefix ${r.name}:`,
-        `The prefix ${r.name}: was not changed`,
+        `Could not change the prefix ${r.name}:`,
         (etag) => patchKind(url, bindPatch(r.name, iri), etag),
       )
     )
@@ -155,7 +155,7 @@
   }
 
   const remove = (r: PrefixRow) =>
-    write(`Deleted the prefix ${r.name}:`, `The prefix ${r.name}: was not deleted`, (etag) =>
+    write(`Deleted the prefix ${r.name}:`, `Could not delete the prefix ${r.name}:`, (etag) =>
       patchKind(url, deletePatch(r.name), etag),
     );
 
@@ -164,12 +164,12 @@
       r.declared || r.source === 'removed'
         ? `The prefix ${r.name}: uses the server config again`
         : `Reset the prefix ${r.name}:`,
-      `The prefix ${r.name}: was not reset`,
+      `Could not reset the prefix ${r.name}:`,
       (etag) => resetKind(url, prefixField(r.name), etag),
     );
 
   const useServerConfigForAll = () =>
-    write('The prefixes use the server config again', 'The prefixes were not reset', (etag) =>
+    write('The prefixes use the server config again', 'Could not reset the prefixes', (etag) =>
       resetFields(
         url,
         overrides.map((o) => o.path),
@@ -201,11 +201,11 @@
   </div>
   <div class="panel-body">
     <p class="faint intro">
-      The namespace prefixes of the dataset. The query editor completes them and adds their PREFIX
-      lines, and results are written with the ones from the server config and those added here.
+      Namespace prefixes for this dataset. The query editor completes them and adds their PREFIX
+      lines. Results are shown with prefixes from the server config and the ones added here.
     </p>
     {#if unsupported}
-      <p class="faint">This server keeps no declared prefixes.</p>
+      <p class="faint">This server does not support declared prefixes.</p>
     {:else if loadError}
       <div class="error-box"><strong>Could not load the prefixes.</strong> {loadError}</div>
     {:else if !k}
@@ -340,7 +340,7 @@
                           class="btn ghost icon sm"
                           disabled={busy}
                           onclick={() => remove(r)}
-                          title="Delete the prefix"
+                          title="Delete prefix"
                           aria-label="Delete {label(r)}"><Icon name="trash" size={12} /></button
                         >
                       {/if}

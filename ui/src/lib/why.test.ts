@@ -176,7 +176,7 @@ describe('derivation trees (U10 §2.4)', () => {
     );
     expect(staleNote(explanation())).toBeNull();
     expect(staleNote(explanation({ stale: true, commitsSince: 3 }))).toBe(
-      'The inferences are stale: this tree explains the closure as it was computed at commit 318. 3 commits since.',
+      'These inferences are out of date. This tree shows them as computed at commit 318. 3 commits since.',
     );
     expect(staleNote(explanation({ source: 'rdfsOnRead', stale: true }))).toBeNull();
     expect(staleNote(explanation({ readAtHead: true }))).toContain('current data');
@@ -216,7 +216,7 @@ describe('explainTriple', () => {
     expect(await explainTriple('ds', triple)).toEqual({
       ok: false,
       kind: 'none',
-      message: 'No derivation from facts you can read was found.',
+      message: 'No derivation found.',
     });
   });
 
@@ -224,7 +224,7 @@ describe('explainTriple', () => {
     answer(422, { error: 'too deep', code: 'reasoning-budget' });
     const b = await explainTriple('ds', triple);
     expect(!b.ok && b.kind).toBe('budget');
-    expect(!b.ok && b.message).toBe('The derivation is deeper than the search allows.');
+    expect(!b.ok && b.message).toBe('The derivation is deeper than the search limit.');
     answer(404, { error: 'Not Found' });
     const u = await explainTriple('ds', triple);
     expect(!u.ok && u.kind).toBe('unavailable');
