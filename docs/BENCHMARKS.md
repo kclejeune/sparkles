@@ -72,8 +72,8 @@ On larger and standard workloads:
 * **Full-text search.** Sparkles is fastest on all seven queries at 1.05M and on six of
   seven at 10.5M, against Fuseki with jena-text and QLever.
 * **LUBM(100).** Over the 24.3M triples of the OWL 2 RL closure, which Sparkles
-  materializes in 17.8 s, Sparkles is fastest on 13 of 14 queries. QLever is 3.7× faster
-  on `q2`.
+  materializes in 17.8 s, paired `q2` means are 26.8 ms for Sparkles and 60.6 ms for
+  QLever. The query guard preserves all fourteen answers.
 * **SP²Bench at 10M triples.** Paired forge runs put `q12a` at 3.8 ms against Jena's
   9.0 ms. `q12b` takes 4.0 ms against Oxigraph's 3.7 ms, inside the ten-percent tie band.
   Sparkles is the only
@@ -113,7 +113,6 @@ than 10%. Fluree's warm advantages on `distinct-obj` at 1.05M and on two small D
 | WatDiv `L1-1`, 10.97M | Fluree 1.11× | Sparkles has the lowest mean on 19 of 20 templates, ties Fluree on S7 and leads on 81 of 88 instances. |
 | BSBM Explore `q7` and `q8`, 10M | Oxigraph 1.2× on `q7` and 1.4× on `q8` | Pooled medians cover three instances per template. Wrong answers are excluded from the ranking. |
 | BSBM BI `q3`, 10M | QLever 1.24× | The three fixed-instance answer checks agree. The driver cells have not been rerun since [roadmap](ROADMAP.md) item 96 removed the budget refusal that failed them. |
-| LUBM(100) `q2` | QLever 3.7× | Sparkles is fastest on 13 of 14 queries. |
 | Changed-store `two-hop-count`, 1.05M | Fluree 1.10× | Sparkles takes 8.6 ms against 7.8 ms with 5,000 changes in its delta, and 5.1 ms on the loaded store. |
 | Serial durable commits | Oxigraph 1.84× on literal inserts at 1.05M and 1.39× at 10.5M | The same durability difference. |
 | Writes during mixed load | Oxigraph 3.4× at 1.05M and 2.1× at 10.5M | Oxigraph serves far fewer concurrent reads. |
@@ -487,13 +486,15 @@ LUBM's generator, UBA 1.7, made 13,876,262 triples for 100 universities. Sparkle
 reasoner materialized the OWL 2 RL closure, 10,907,029 derived triples, in 17.8 s at a
 peak RSS of 3,967 MiB, and every engine then loaded and queried the closure of 24,312,703
 triples, so no query needs reasoning at query time. All 14 queries returned the same
-answers on all five engines. Times are mean ± σ in ms over 10 runs after 2 warm-ups.
+answers on all five engines. Times are mean ± σ in ms. The paired Sparkles and QLever
+`q2` cells combine sixty samples across both engine orders, with ten warm-ups before
+each thirty-request process. The other cells use ten runs after two warm-ups.
 `mise run bench:lubm 100` reproduces the run.
 
 | query | sparkles (ms) | jena-fuseki (ms) | qlever (ms) | fluree (ms) | oxigraph (ms) |
 |---|---:|---:|---:|---:|---:|
 | q1 | **3.5 ± 0.1** | 7.5 ± 0.8 | 7.0 ± 0.7 | 3.6 ± 0.2 | 959.2 ± 7.0 |
-| q2 | 256.5 ± 1.2 | 1274.3 ± 27.3 | **68.8 ± 6.2** | 2856.2 ± 25.9 | 4295.6 ± 19.5 |
+| q2 | **26.8 ± 3.5** | 1274.3 ± 27.3 | 60.6 ± 6.9 | 2856.2 ± 25.9 | 4295.6 ± 19.5 |
 | q3 | **3.4 ± 0.1** | 6.9 ± 0.5 | 8.4 ± 1.0 | 3.7 ± 0.2 | 2388.5 ± 28.5 |
 | q4 | **3.6 ± 0.1** | 7.4 ± 0.3 | 11.7 ± 1.3 | 4.0 ± 0.1 | 286.4 ± 20.1 |
 | q5 | **3.7 ± 0.2** | 8.5 ± 0.5 | 7.5 ± 0.5 | 6.8 ± 0.2 | 3166.5 ± 17.2 |
@@ -507,13 +508,19 @@ answers on all five engines. Times are mean ± σ in ms over 10 runs after 2 war
 | q13 | **4.1 ± 0.2** | 8.4 ± 0.5 | 11.3 ± 0.6 | 5.9 ± 0.2 | 7.1 ± 1.2 |
 | q14 | **58.1 ± 0.8** | 561.3 ± 64.9 | 494.5 ± 4.8 | 328.6 ± 12.2 | 1370.7 ± 29.2 |
 
-*Sparkles was measured on forge on 2026-10-23 at commit 6699f27d, and the other engines on
-2026-10-19 over a closure with the same SHA-256. The
-[LUBM record](benchmarks/2026-10-23-lubm-100-forge.json) has the samples, answer
-fingerprints and materialization costs.*
+*The Sparkles and QLever `q2` cells come from the
+[secondary-probe record](benchmarks/2026-10-25-lubm-secondary-probes-forge.json), with
+Sparkles at `187f3170`. The [LUBM record](benchmarks/2026-10-23-lubm-100-forge.json)
+keeps the other cells, measured with Sparkles at `6699f27d`, and the materialization
+costs. Both records use a closure with the same SHA-256.*
 
-Sparkles is fastest on 13 of the 14 queries. QLever is 3.7× faster on `q2`, at 68.8 ms
-against 256.5 ms. In the cold runs, the median of 3 restarts with the engine's files
+The secondary-key probe avoids enumerating incompatible students within each
+university's range. An A/B/B/A comparison reduces the `q2` median by about 89%, and
+Sparkles beats QLever in both peer orders. All fourteen guarded answers match the
+published QLever fingerprints. The guard accepts small increases on `q10` and `q13`,
+tracked under [roadmap](ROADMAP.md) item 291.
+
+In the recorded cold runs, the median of 3 restarts with the engine's files
 evicted, Sparkles is fastest on all 14 queries and answers 0.09 s after a restart.
 
 Sparkles loads the closure in 7.57 s, against 18.96 s for QLever, 20.03 s for Fluree,

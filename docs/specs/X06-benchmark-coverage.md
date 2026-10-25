@@ -1291,8 +1291,8 @@ their pooled fingerprint is the published Sparkles answer fingerprint.
 
 The pure-demand comparison brings `q12b` inside the ten-percent tie band, at 4.0 ms
 against Oxigraph's 3.7 ms. Its remaining 7.8% difference is accepted. Large `q4` answers
-remain under roadmap item 91. LUBM `q2` probe fanout and serial durable commit overhead
-remain under item 290. The write work retains synchronization before acknowledgement.
+remain under roadmap item 91. Serial durable commit overhead remains under item 290.
+The write work retains synchronization before acknowledgement.
 
 ### Limited pure UNION demand
 
@@ -1365,6 +1365,7 @@ They compare eager execution and cursor batches with independently enumerated an
 Pure UNION ASKs are checked against full SELECT answers for early, late and absent
 matches in both operand orders. These controls establish broader semantic coverage,
 without claiming that every workload becomes faster.
+
 ### Pure ASK comparison and small costs
 
 The exact `b26ce6a9` build used the same compiler signatures and SP²Bench source digest
@@ -1399,6 +1400,34 @@ matched. `count-all` rose from 3.777 to 4.045 microseconds, or 7.1%, and `values
 from 13.652 to 14.230 microseconds, or 4.2%. Other positive native changes were at most
 1.6%. These small costs are accepted under item 292, with no query at least 10% slower.
 The query subset is accepted without further tuning of the close `q12b` result.
+
+### Secondary index probe spans
+
+LUBM `q2` spent most of its execution checking students against every degree row of
+their university, although both variables were already bound. A single two-column
+index probe now verifies secondary ordering within each primary-key span and narrows
+that span by the bound secondary value before checking combinations. It uses the
+existing table, preserves duplicate multiplicity and input order, and keeps the full
+compatibility scan for unbound or unordered secondary values.
+
+The physical-work regression falls from 524,288 compatibility checks to 128. Actual
+read tests compare generic and eager joins with native batches of one, seven and 4096
+over duplicate bindings, graph scopes, merged defaults, updates and old snapshots.
+Both narrowed and retained fallback cases keep row, produced-row, memory, cancellation
+and deadline checks.
+
+On the exact 24,312,703-triple closure, an A/B/B/A forge comparison reduced the `q2`
+median by about 89%. Both engine orders beat pinned QLever. The combined sixty-request
+means are 26.8 ms for Sparkles and 60.6 ms for QLever. All 56 answer checks across the
+four full-suite processes match the published QLever fingerprints. The
+[record](../benchmarks/2026-10-25-lubm-secondary-probes-forge.json) keeps those controls
+and both peer orders.
+
+No LUBM control or repeated Namespace flag reached the 10% regression threshold.
+The accepted LUBM guard medians include increases of 4.0% on `q10` and 2.4% on `q13`.
+A pinned Intel rerun of five synthetic flags kept client times flat while `path-plus`
+server time rose from 8.00 to 8.51 microseconds. Roadmap item 291 tracks these small
+costs, including possible code-placement effects. Durable single writes remain open.
 
 ### Short-query checks after keyed inner groups
 

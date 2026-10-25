@@ -93,7 +93,7 @@ with result caches off, and every engine's answers were checked before timing.
 | WatDiv geometric mean, 10.97M triples | **4.63 ms** | Fluree 6.97 ms, Fuseki 13.6 ms, Oxigraph 16.2 ms, QLever 17.9 ms |
 | Bulk load, English DBpedia, 1.24B triples | **480 s** | QLever 1,674 s, Fluree 2,919 s |
 | Queries, English DBpedia, 1.24B triples | **Faster than QLever** on all 29 warm queries both answer correctly | Faster than QLever on 29 of 31 cold queries |
-| LUBM(100), 24.3M triples after OWL 2 RL closure | **Fastest on 13 of 14** | QLever is 3.7× faster on `q2` |
+| LUBM(100) `q2`, 24.3M triples after OWL 2 RL closure | **26.8 ms** | QLever 60.6 ms in paired runs |
 
 Paired forge runs put Sparkles ahead of Jena on SP²Bench `q12a` and QLever on BSBM BI `q2`.
 Sparkles has a lower pooled time than Fluree on BSBM Explore `q5`, with the closest
