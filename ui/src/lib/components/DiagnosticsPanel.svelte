@@ -272,9 +272,15 @@
                       {prefixes}
                       initial={f.justification}
                       initialComplete={f.justificationComplete}
-                      onremove={canWrite && auth.can(target, 'write')
+                      profile={report.scope.inferences.included ? undefined : 'asserted'}
+                      onopen={openIri}
+                      onremove={canWrite && auth.can(name, 'write')
                         ? (fact) => {
-                            removal = { fact, commit: report!.commit };
+                            removal = {
+                              fact,
+                              commit: report!.commit,
+                              profile: report!.scope.inferences.included ? undefined : 'asserted',
+                            };
                           }
                         : undefined}
                     />
@@ -290,7 +296,8 @@
   <ClassJustificationProbe
     ds={target}
     {prefixes}
-    onremove={canWrite && auth.can(target, 'write')
+    onopen={openIri}
+    onremove={canWrite && auth.can(name, 'write')
       ? (fact, commit, profile) => {
           removal = { fact, commit, profile };
         }

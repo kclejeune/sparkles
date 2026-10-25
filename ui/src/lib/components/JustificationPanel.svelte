@@ -14,6 +14,7 @@
     onremove,
     classIri,
     profile,
+    onopen,
   }: {
     ds: string;
     finding: api.DiagnosticFinding;
@@ -25,6 +26,7 @@
     onremove?: (fact: api.SupportFact) => void;
     classIri?: string;
     profile?: string;
+    onopen?: (iri: string) => void;
   } = $props();
   let results = $state<api.Justification[]>([]);
   let complete = $state<boolean | null>(null);
@@ -99,11 +101,13 @@
                   >{#each fact.triple as term, k (k)}<TermView
                       {term}
                       {prefixes}
+                      {onopen}
                     />{' '}{/each}</span
                 ><span class="faint"
                   >in {#if fact.graph === 'default'}default graph{:else}<TermView
                       term={fact.graph}
                       {prefixes}
+                      {onopen}
                     />{/if}</span
                 >{#if onremove}<button class="btn ghost sm" onclick={() => onremove?.(fact)}
                     >Remove on a branch</button

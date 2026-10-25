@@ -1796,7 +1796,12 @@ export function justify(
   opts: { at?: string; profile?: string; signal?: AbortSignal } = {},
 ): Promise<JustificationReport> {
   return json<JustificationReport>(`/$/reason/${enc(ds)}/justify`, {
-    ...jsonBody({ ...target, at: opts.at, profile: opts.profile }),
+    ...jsonBody({
+      ...target,
+      at: opts.at,
+      profile: opts.profile === 'asserted' ? 'rules' : opts.profile,
+      rules: opts.profile === 'asserted' ? '' : undefined,
+    }),
     signal: opts.signal,
   });
 }

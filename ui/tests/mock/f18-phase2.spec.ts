@@ -102,6 +102,8 @@ test('diagnostic supports preview an inherited blank removal before applying it 
       previews++;
       expect(applies).toBe(0);
       expect(url.searchParams.get('entailments')).toBe('true');
+      expect(url.searchParams.get('profile')).toBe('rules');
+      expect(url.searchParams.get('rules')).toBe('');
       await route.fulfill({
         json: {
           dryRun: true,
@@ -216,4 +218,169 @@ test('review entailment comparison pins the actual upstream and review heads', a
     .toEqual([`${selected.upstream}@${upstream.head}`, `${branch}@${selected.head}`]);
   await expect(page.getByRole('region', { name: 'Reasoning changes' })).toContainText('Employee');
   await page.screenshot({ path: info.outputPath('f18-review-reasoning.png'), fullPage: true });
+});
+
+test('class probes distinguish an incomplete negative from a satisfiable result', async ({
+  page,
+  request,
+}) => {
+  const name = 'f18-class-incomplete';
+  await create(request, name);
+  await page.route(`**/$/reason/${name}/justify`, (route) =>
+    route.fulfill({
+      json: {
+        justificationFormat: 1,
+        commit: 1,
+        checks: 1,
+        complete: false,
+        results: [
+          { class: 'urn:CatDog', finding: null, holds: false, complete: false, justifications: [] },
+        ],
+      },
+    }),
+  );
+  await page.goto(`/ui/datasets/${name}`);
+  await page.getByText('Class satisfiability', { exact: true }).click();
+  await page.getByLabel('Class IRI', { exact: true }).fill('urn:CatDog');
+  await page.getByRole('button', { name: 'Test class', exact: true }).click();
+  await expect(
+    page.getByText('The search did not establish a result within its budget.', { exact: true }),
+  ).toBeVisible();
+  await expect(
+    page.getByText('No inconsistency was found for a fresh instance.', { exact: true }),
+  ).toHaveCount(0);
+});
+
+test('a program change discards an in-flight review comparison', async ({ page }) => {
+  let started: () => void = () => {};
+  const start = new Promise<void>((resolve) => {
+    started = resolve;
+  });
+  let release: () => void = () => {};
+  const pending = new Promise<void>((resolve) => {
+    release = resolve;
+  });
+  await page.route('**/$/reason/org/diff**', async (route) => {
+    started();
+    await pending;
+    await route.fulfill({ json: diff }).catch(() => {});
+  });
+  await page.goto('/ui/datasets/org/review/ingest.standup-2026-10-08-1');
+  const panel = page.getByRole('region', { name: 'Reasoning changes' });
+  await panel.getByRole('button', { name: 'Compare entailments' }).click();
+  await start;
+  await panel.getByRole('combobox', { name: 'Program' }).selectOption('rdfs-simple');
+  release();
+  await expect(panel.getByRole('button', { name: 'Compare entailments' })).toBeEnabled();
+  await expect(panel.getByText('1 inferred triple added', { exact: false })).toHaveCount(0);
+});
+
+test('switching branches discards pending diagnostics before a support can be removed', async ({
+  page,
+  request,
+}) => {
+  const name = 'f18-diagnostics-race';
+  await create(request, name);
+  await request.post(`/$/branches/${name}`, { data: { name: 'dev' } });
+  let started: () => void = () => {};
+  const start = new Promise<void>((resolve) => {
+    started = resolve;
+  });
+  let release: () => void = () => {};
+  const pending = new Promise<void>((resolve) => {
+    release = resolve;
+  });
+  let handled: () => void = () => {};
+  const done = new Promise<void>((resolve) => {
+    handled = resolve;
+  });
+  await page.route(`**/$/reason/${name}/diagnostics**`, async (route) => {
+    started();
+    await pending;
+    await route
+      .fulfill({
+        json: {
+          diagnosticsFormat: 1,
+          dataset: name,
+          commit: 7,
+          computedAt: '2026-10-25T00:00:00Z',
+          scope: { graph: 'default', inferences: { included: false }, closure: 'subclass' },
+          status: 'violations-found',
+          note: 'Checks selected rules.',
+          checks: [],
+          findings: [{ ...finding, message: 'Stale main-branch support must not appear on dev.' }],
+        },
+      })
+      .catch(() => {});
+    handled();
+  });
+  await page.goto(`/ui/datasets/${name}`);
+  await page.getByRole('button', { name: 'Run checks', exact: true }).click();
+  await start;
+  await page.getByRole('combobox', { name: 'Branch', exact: true }).selectOption('dev');
+  await expect(page).toHaveURL(/branch=dev/);
+  release();
+  await done;
+  await page.evaluate(
+    () =>
+      new Promise<void>((resolve) =>
+        requestAnimationFrame(() => requestAnimationFrame(() => resolve())),
+      ),
+  );
+  await expect(
+    page.getByText('Stale main-branch support must not appear on dev.', { exact: true }),
+  ).toHaveCount(0);
+  await expect(page.getByRole('button', { name: 'Run checks', exact: true })).toBeEnabled();
+});
+
+test('authenticated branch writers can remove supports and open premises on their branch', async ({
+  page,
+  request,
+}) => {
+  const name = 'f18-auth-support';
+  await create(request, name);
+  await request.post(`/$/branches/${name}`, { data: { name: 'dev' } });
+  await page.route('**/$/whoami', (route) =>
+    route.fulfill({
+      json: {
+        authEnabled: true,
+        principal: { kind: 'token', name: 'writer' },
+        method: 'bearer',
+        server: [],
+        datasets: { [name]: 'write' },
+        canMintTokens: false,
+        logout: false,
+      },
+    }),
+  );
+  await page.route(`**/$/reason/${name}/diagnostics**`, (route) =>
+    route.fulfill({
+      json: {
+        diagnosticsFormat: 1,
+        dataset: name,
+        commit: 7,
+        computedAt: '2026-10-25T00:00:00Z',
+        scope: { graph: 'default', inferences: { included: false }, closure: 'subclass' },
+        status: 'violations-found',
+        note: 'Checks selected rules.',
+        checks: [],
+        findings: [finding],
+      },
+    }),
+  );
+  await page.goto(`/ui/datasets/${name}?branch=dev`);
+  await page.getByRole('button', { name: 'Run checks', exact: true }).click();
+  await page.getByText('Minimal asserted supports', { exact: true }).first().click();
+  const support = page.getByRole('region', { name: 'Justification 1', exact: true });
+  await expect(
+    support.getByRole('button', { name: 'Remove on a branch', exact: true }),
+  ).toHaveCount(3);
+  await support.getByRole('button', { name: 'urn:Cat', exact: true }).first().click();
+  await expect(page).toHaveURL(
+    (url) =>
+      url.pathname === '/ui/explore' &&
+      url.searchParams.get('ds') === name &&
+      url.searchParams.get('branch') === 'dev' &&
+      url.searchParams.get('iri') === 'urn:Cat',
+  );
 });

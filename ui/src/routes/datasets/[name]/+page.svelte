@@ -573,7 +573,7 @@ ex:PersonShape a sh:NodeShape ;
     goto(resolve('/query'));
   }
   const explore = (iri: string) =>
-    `${resolve('/explore')}?ds=${encodeURIComponent(name)}&iri=${encodeURIComponent(iri)}`;
+    `${resolve('/explore')}?ds=${encodeURIComponent(name)}&iri=${encodeURIComponent(iri)}${branch ? `&branch=${encodeURIComponent(branch)}` : ''}`;
 </script>
 
 <svelte:head><title>{name} | Sparkles</title></svelte:head>
@@ -1475,7 +1475,7 @@ ex:PersonShape a sh:NodeShape ;
         <ReasoningPanel
           {name}
           {branch}
-          canWrite={auth.can(onBranch(name, branch), 'write') && !readOnly}
+          canWrite={auth.can(name, 'write') && !readOnly}
           {info}
           {prefixes}
           {explore}

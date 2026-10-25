@@ -7,9 +7,11 @@
     ds,
     prefixes,
     onremove,
+    onopen,
   }: {
     ds: string;
     prefixes: PrefixMap;
+    onopen?: (iri: string) => void;
     onremove?: (fact: api.SupportFact, commit: number, profile?: string) => void;
   } = $props();
   let classIri = $state('');
@@ -95,6 +97,7 @@
             classIri={result.class ?? undefined}
             profile={profile || undefined}
             initials={result.justifications}
+            {onopen}
             onremove={onremove
               ? (fact) => onremove?.(fact, report!.commit, profile || undefined)
               : undefined}
