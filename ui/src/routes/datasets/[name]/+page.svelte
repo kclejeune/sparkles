@@ -1475,6 +1475,7 @@ ex:PersonShape a sh:NodeShape ;
         <ReasoningPanel
           {name}
           {branch}
+          canWrite={auth.can(onBranch(name, branch), 'write') && !readOnly}
           {info}
           {prefixes}
           {explore}

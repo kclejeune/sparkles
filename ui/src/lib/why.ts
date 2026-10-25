@@ -267,7 +267,13 @@ export type WhyNotExplanation = {
     unifier: Record<string, Term>;
     blockedBy?: { call: string; fact?: WhyTriple }[];
   }[];
-  hypotheses?: { missing: WhyTriple[]; placeholders: string[]; tree: Derivation }[];
+  hypotheses?: {
+    missing: WhyTriple[];
+    placeholders: string[];
+    tree: Derivation;
+    inconsistent?: boolean | null;
+    consistencyComplete?: boolean;
+  }[];
   complete?: boolean;
 };
 

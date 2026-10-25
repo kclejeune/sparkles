@@ -1,10 +1,14 @@
 <script lang="ts">
   import { goto } from '$app/navigation';
+  import { auth } from '$lib/auth.svelte';
   import * as api from '$lib/api';
   import { onBranch } from '$lib/branches';
   import { fmtInt, fmtMs } from '$lib/format';
   import type { PrefixMap } from '$lib/rdf';
   import Icon from './Icon.svelte';
+  import JustificationPanel from './JustificationPanel.svelte';
+  import ClassJustificationProbe from './ClassJustificationProbe.svelte';
+  import SupportRemovalPreview from './SupportRemovalPreview.svelte';
   import TermView from './TermView.svelte';
 
   let {
@@ -14,6 +18,7 @@
     stale,
     prefixes,
     explore,
+    canWrite = false,
   }: {
     name: string;
     /** The branch to work on (null: `main`). */
@@ -24,6 +29,7 @@
     stale: boolean | null;
     prefixes: PrefixMap;
     explore: (iri: string) => string;
+    canWrite?: boolean;
   } = $props();
 
   const target = $derived(onBranch(name, branch));
@@ -57,9 +63,11 @@
   );
   let closure = $state<'subclass' | 'none'>('subclass');
   let useInferences = $state(true);
+  let includeSupports = $state(false);
   let running = $state(false);
   let error = $state<string | null>(null);
   let report = $state<api.DiagnosticsReport | null>(null);
+  let removal = $state<{ fact: api.SupportFact; commit: number; profile?: string } | null>(null);
   let ms = $state(0);
   let lastLimit = $state(100);
   let ctl: AbortController | null = null;
@@ -83,6 +91,7 @@
       report = await api.diagnostics(target, {
         checks: checks.length === CHECKS.length ? undefined : checks,
         closure,
+        justify: includeSupports,
         limit,
         reasoning: hasInferences ? useInferences : undefined,
         signal: ctl.signal,
@@ -156,6 +165,9 @@
         <input type="checkbox" bind:checked={useInferences} /> Use inferences
       </label>
     {/if}
+    <label class="inline check"
+      ><input type="checkbox" bind:checked={includeSupports} /> Find minimal supports</label
+    >
     <span class="spacer"></span>
     {#if running}<button class="btn sm" onclick={() => ctl?.abort()}>Cancel</button>{/if}
     <button class="btn sm" onclick={() => run()} disabled={running || !anySelected}>
@@ -249,13 +261,54 @@
                 </td>
                 <td class="cell msg" title={f.message}>{f.message}</td>
               </tr>
+              <tr
+                ><td colspan="6"
+                  ><details>
+                    <summary>Minimal asserted supports</summary>
+                    <JustificationPanel
+                      ds={target}
+                      finding={f}
+                      commit={report.commit}
+                      {prefixes}
+                      initial={f.justification}
+                      initialComplete={f.justificationComplete}
+                      onremove={canWrite && auth.can(target, 'write')
+                        ? (fact) => {
+                            removal = { fact, commit: report!.commit };
+                          }
+                        : undefined}
+                    />
+                  </details></td
+                ></tr
+              >
             {/each}
           </tbody>
         </table>
       </div>
     {/if}
   {/if}
+  <ClassJustificationProbe
+    ds={target}
+    {prefixes}
+    onremove={canWrite && auth.can(target, 'write')
+      ? (fact, commit, profile) => {
+          removal = { fact, commit, profile };
+        }
+      : undefined}
+  />
 </div>
+
+{#if removal}<SupportRemovalPreview
+    {name}
+    source={branch ?? 'main'}
+    commit={removal.commit}
+    fact={removal.fact}
+    initialProfile={removal.profile}
+    {prefixes}
+    onclose={() => {
+      removal = null;
+    }}
+  />{/if}
 
 <style>
   .diag {

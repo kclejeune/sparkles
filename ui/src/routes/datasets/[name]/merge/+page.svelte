@@ -11,7 +11,7 @@
   import { goto } from '$app/navigation';
   import { resolve } from '$app/paths';
   import { page } from '$app/state';
-  import { untrack } from 'svelte';
+  import { onDestroy, untrack } from 'svelte';
   import * as api from '$lib/api';
   import { app, toasts } from '$lib/app.svelte';
   import { auth } from '$lib/auth.svelte';
@@ -36,6 +36,7 @@
   import DiffLines from '$components/DiffLines.svelte';
   import GuardReportView from '$components/GuardReportView.svelte';
   import Icon from '$components/Icon.svelte';
+  import EntailmentDiffView from '$components/EntailmentDiffView.svelte';
 
   /** Conflicts the page lists at most. */
   const CONFLICT_LIMIT = 1000;
@@ -89,19 +90,30 @@
   let preview = $state<api.MergeOutcome | null>(null);
   let previewError = $state<string | null>(null);
   let loading = $state(false);
+  let includeReasoning = $state(false);
+  let analysisProfile = $state('');
+  let comparisonKey = '';
   /** Why the page read the branches again. */
   let note = $state<string | null>(null);
   let choices = $state<Choices>(noChoices());
   let onConflict = $state<'fail' | 'ours' | 'theirs' | 'union'>('fail');
   let message = $state('');
   const runs = new LatestRun();
+  onDestroy(() => runs.abortAll());
 
   async function load() {
     if (!name || !source) return;
     const owns = runs.claim('preview');
     loading = true;
     try {
-      const p = await api.mergePreview(name, source, target, undefined, CONFLICT_LIMIT);
+      const p = await api.mergePreview(
+        name,
+        source,
+        target,
+        runs.signal('preview'),
+        CONFLICT_LIMIT,
+        { entailments: includeReasoning, profile: analysisProfile || undefined },
+      );
       if (!owns()) return;
       preview = p;
       previewError = null;
@@ -119,13 +131,20 @@
     void name;
     void source;
     void target;
+    void includeReasoning;
+    void analysisProfile;
+    const key = `${name}\0${source}\0${target}`;
     untrack(() => {
       preview = null;
-      choices = noChoices();
-      onConflict = 'fail';
-      note = null;
-      refused = null;
-      error = null;
+      dry = null;
+      if (key !== comparisonKey) {
+        choices = noChoices();
+        onConflict = 'fail';
+        note = null;
+        refused = null;
+        error = null;
+      }
+      comparisonKey = key;
       void load();
     });
   });
@@ -172,15 +191,21 @@
     const owns = runs.claim('dry');
     dryLoading = true;
     try {
-      const d = await api.mergeDryRun(name, {
-        source,
-        target,
-        resolutions: resolutions.length ? resolutions : undefined,
-        // conflicts without a choice keep the target's values in the list
-        onConflict: onConflict !== 'fail' ? onConflict : open ? 'ours' : undefined,
-        expect,
-        changes: CHANGE_LIMIT,
-      });
+      const d = await api.mergeDryRun(
+        name,
+        {
+          source,
+          target,
+          resolutions: resolutions.length ? resolutions : undefined,
+          // conflicts without a choice keep the target's values in the list
+          onConflict: onConflict !== 'fail' ? onConflict : open ? 'ours' : undefined,
+          expect,
+          changes: CHANGE_LIMIT,
+          entailments: includeReasoning,
+          profile: includeReasoning ? analysisProfile || undefined : undefined,
+        },
+        runs.signal('dry'),
+      );
       if (!owns()) return;
       dry = d;
       dryError = null;
@@ -198,6 +223,13 @@
     void preview;
     void resolutions;
     void onConflict;
+    void includeReasoning;
+    void analysisProfile;
+    untrack(() => {
+      runs.claim('dry');
+      dry = null;
+      dryError = null;
+    });
     if (!canMerge) return;
     const t = setTimeout(() => untrack(() => void dryRun()), 250);
     return () => clearTimeout(t);
@@ -303,6 +335,18 @@
       again
     </button>
   </header>
+  <div class="row">
+    <label class="pick"
+      ><input type="checkbox" bind:checked={includeReasoning} /> Include reasoning changes</label
+    >
+    {#if includeReasoning}<label class="pick"
+        >Program <select class="select sm" bind:value={analysisProfile}
+          ><option value="">Recorded target program</option><option value="rdfs-simple"
+            >RDFS simple</option
+          ><option value="rdfs">RDFS</option><option value="owl-rl">OWL 2 RL</option></select
+        ></label
+      >{/if}
+  </div>
 
   {#if !source}
     <p class="faint">Choose the branch to merge.</p>
@@ -359,6 +403,29 @@
         {/if}
       </div>
     </section>
+
+    {#if includeReasoning}
+      {@const diff =
+        dry?.entailments ??
+        (resolutions.length === 0 && onConflict === 'fail' ? p.entailments : undefined)}
+      <section class="panel" aria-label="Merge reasoning changes">
+        <div class="panel-head"><h2>Reasoning changes</h2></div>
+        <div class="panel-body">
+          {#if diff}
+            {#if open > 0 && dry?.entailments}<p class="faint">
+                This preview keeps the target's values for conflicts that have no choice.
+              </p>{/if}
+            <EntailmentDiffView {prefixes} {diff} />
+          {:else if loading || dryLoading}<p class="faint">Computing reasoning changes…</p>
+          {:else}<p class="faint">
+              {dry?.entailmentsUnavailable ??
+                p.entailmentsUnavailable ??
+                dryError ??
+                'Resolve the merge conflicts to compute reasoning changes.'}
+            </p>{/if}
+        </div>
+      </section>
+    {/if}
 
     {#if total}
       <section class="panel conflicts" aria-labelledby="conflicts-title">

@@ -15,6 +15,7 @@
     info,
     busy = false,
     readOnly = false,
+    canWrite = false,
     prefixes,
     explore,
     onstart,
@@ -27,6 +28,7 @@
     /** Another action is starting; disables the task buttons. */
     busy?: boolean;
     readOnly?: boolean;
+    canWrite?: boolean;
     prefixes: PrefixMap;
     /** Explorer URL of an IRI. */
     explore: (iri: string) => string;
@@ -257,7 +259,7 @@
       </button>
     </div>
   </div>
-  <DiagnosticsPanel {name} {branch} hasInferences={!!r} {stale} {prefixes} {explore} />
+  <DiagnosticsPanel {name} {branch} hasInferences={!!r} {stale} {prefixes} {explore} {canWrite} />
 </section>
 
 <style>

@@ -372,7 +372,13 @@ export type Task = {
 export type Term =
   | { type: 'uri'; value: string }
   | { type: 'bnode'; value: string }
-  | { type: 'literal'; value: string; datatype?: string; 'xml:lang'?: string }
+  | {
+      type: 'literal';
+      value: string;
+      datatype?: string;
+      'xml:lang'?: string;
+      'its:dir'?: 'ltr' | 'rtl';
+    }
   | { type: 'triple'; value: { subject: Term; predicate: Term; object: Term } };
 
 export type PlanNode = {
@@ -1729,14 +1735,78 @@ export type DiagnosticsReport = {
     evidence: Record<string, Term | Term[]>;
     basis: 'asserted' | 'uses-inferences';
     message: string;
+    justification?: Justification | null;
+    justificationComplete?: boolean;
   }[];
+  justificationsComplete?: boolean;
+  justificationChecks?: number;
 };
+
+export type DiagnosticFinding = DiagnosticsReport['findings'][number];
+export type SupportFact = {
+  triple: [Term, Term, Term];
+  graph: 'default' | Term;
+  role: 'schema' | 'assertion';
+};
+export type Justification = { facts: SupportFact[] };
+export type JustificationResult = {
+  class: string | null;
+  finding: DiagnosticFinding | null;
+  holds: boolean;
+  justifications: Justification[];
+  complete: boolean;
+};
+export type JustificationReport = {
+  justificationFormat: 1;
+  commit: number;
+  results: JustificationResult[];
+  checks: number;
+  complete: boolean;
+};
+export type EntailmentDiff = {
+  entailmentDiffFormat: 1;
+  from: { selector: string; commit: number };
+  to: { selector: string; commit: number };
+  added: number;
+  removed: number;
+  sample: { added: [Term, Term, Term][]; removed: [Term, Term, Term][] };
+  byPredicate: Record<string, { added: number; removed: number }>;
+  byClass: Record<string, { added: number; removed: number }>;
+  newFindings: DiagnosticFinding[];
+  sampleTruncated: boolean;
+  findingsComplete: boolean;
+  warnings: string[];
+};
+export function entailmentDiff(
+  ds: string,
+  from: string,
+  to: string,
+  opts: { profile?: string; signal?: AbortSignal } = {},
+): Promise<EntailmentDiff> {
+  const query = new URLSearchParams({ from, to });
+  if (opts.profile) query.set('profile', opts.profile);
+  return json<EntailmentDiff>(`/$/reason/${enc(ds)}/diff?${query}`, {
+    signal: opts.signal,
+    cache: 'no-store',
+  });
+}
+export function justify(
+  ds: string,
+  target: { finding?: DiagnosticFinding; class?: string; classes?: 'all' },
+  opts: { at?: string; profile?: string; signal?: AbortSignal } = {},
+): Promise<JustificationReport> {
+  return json<JustificationReport>(`/$/reason/${enc(ds)}/justify`, {
+    ...jsonBody({ ...target, at: opts.at, profile: opts.profile }),
+    signal: opts.signal,
+  });
+}
 
 export type DiagnosticsOptions = {
   checks?: string[];
   limit?: number;
   reasoning?: boolean;
   closure?: 'subclass' | 'none';
+  justify?: boolean;
   signal?: AbortSignal;
 };
 
@@ -1747,6 +1817,7 @@ export function diagnostics(ds: string, opts: DiagnosticsOptions = {}): Promise<
   if (opts.limit != null) p.set('limit', String(opts.limit));
   if (opts.reasoning != null) p.set('reasoning', String(opts.reasoning));
   if (opts.closure) p.set('closure', opts.closure);
+  if (opts.justify) p.set('justify', 'true');
   const qs = p.toString();
   return json<DiagnosticsReport>(`/$/reason/${enc(ds)}/diagnostics${qs ? `?${qs}` : ''}`, {
     signal: opts.signal,
@@ -2033,6 +2104,7 @@ export type MergeOutcome = {
   /** The merge commit (`kind: "merge"`) of a merge that committed. */
   commit?: Commit | null;
   inferences?: { excluded: number; stale: boolean } | null;
+  entailments?: EntailmentDiff | null;
   /** When conflicts remain: how many (in a preview), and the report. */
   conflictCount?: number;
   error?: string;
@@ -2041,6 +2113,8 @@ export type MergeOutcome = {
   truncated?: boolean;
   graphs?: { graph: string | null; conflicts: number }[];
   cells?: ConflictCell[];
+  entailmentsUnavailable?: string;
+  previewOutcome?: string;
 };
 
 /** `GET /$/merge/{ds}?source=&target=`: what merging would do. It never writes. */
@@ -2051,9 +2125,12 @@ export function mergePreview(
   signal?: AbortSignal,
   /** the most conflicts listed (default 100, at most 10,000) */
   limit?: number,
+  analysis: { entailments?: boolean; profile?: string } = {},
 ): Promise<MergeOutcome> {
   const p = new URLSearchParams({ source, target });
   if (limit != null) p.set('limit', String(limit));
+  if (analysis.entailments) p.set('entailments', 'true');
+  if (analysis.profile) p.set('profile', analysis.profile);
   return json<MergeOutcome>(`/$/merge/${enc(ds)}?${p}`, { signal, cache: 'no-store' });
 }
 
@@ -2089,6 +2166,8 @@ export type MergeRequest = {
   message?: string;
   limit?: number;
   dryRun?: boolean;
+  entailments?: boolean;
+  profile?: string;
   /** with `dryRun`: list this many of the merge commit's changes */
   changes?: number;
 };
@@ -2114,11 +2193,14 @@ export type MergeDryRun = {
   validation?: GuardReport;
   error?: string;
   merge?: MergeOutcome;
+  entailments?: EntailmentDiff | null;
+  entailmentsUnavailable?: string;
 };
+export type WritePreview = MergeDryRun;
 
 /** `POST /$/merge/{ds}` with `dryRun: true`. */
-export const mergeDryRun = (ds: string, body: MergeRequest) =>
-  json<MergeDryRun>(`/$/merge/${enc(ds)}`, jsonBody({ ...body, dryRun: true }));
+export const mergeDryRun = (ds: string, body: MergeRequest, signal?: AbortSignal) =>
+  json<MergeDryRun>(`/$/merge/${enc(ds)}`, { ...jsonBody({ ...body, dryRun: true }), signal });
 
 /** `GET /$/commit-graph/{ds}`: the commits of several branches, newest first. */
 export function commitGraph(

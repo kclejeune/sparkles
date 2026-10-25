@@ -114,6 +114,12 @@
                 ? ''
                 : 's'}</summary
             >
+            {#if h.inconsistent === true}<p class="error-box">
+                Adding these facts introduces a new inconsistency.
+              </p>
+            {:else if h.consistencyComplete === false}<p class="faint small">
+                The consistency check is incomplete.
+              </p>{/if}
             <ul>
               {#each h.missing as t}<li>{@render triple(t)}</li>{/each}
             </ul>

@@ -26,6 +26,7 @@
   } from '$lib/review';
   import { LatestRun } from '$lib/supersede';
   import Icon from '$components/Icon.svelte';
+  import EntailmentComparison from '$components/EntailmentComparison.svelte';
 
   const name = $derived(page.params.name ?? '');
   const branch = $derived(page.params.branch ?? '');
@@ -35,6 +36,8 @@
   const canWrite = $derived(auth.can(name, 'write'));
 
   let data = $state<review.BranchReview | null>(null);
+  let upstream = $state<string | null>(null);
+  let comparisonTo = $state<string | null>(null);
   let error = $state<string | null>(null);
   let loading = $state(true);
   let busy = $state<string | null>(null);
@@ -51,9 +54,22 @@
     const owns = runs.claim('review');
     loading = true;
     error = null;
+    upstream = null;
+    comparisonTo = null;
     try {
-      const r = await review.branchReview(ds, b);
-      if (owns()) data = r;
+      const [r, metadata] = await Promise.all([
+        review.branchReview(ds, b),
+        api.branches(ds).catch(() => null),
+      ]);
+      if (owns()) {
+        data = r;
+        const selected = metadata?.branches.find((entry) => entry.name === b);
+        const parent = selected?.upstream;
+        const head = metadata?.branches.find((entry) => entry.name === parent)?.head;
+        upstream = parent && head !== undefined ? `${parent}@${head}` : null;
+        const branchHead = r.head ?? selected?.head;
+        comparisonTo = branchHead !== undefined ? `${b}@${branchHead}` : null;
+      }
     } catch (e) {
       if (owns()) {
         data = null;
@@ -160,6 +176,14 @@
   {:else if error}
     <div class="error-box">{error}</div>
   {:else if data}
+    {#if upstream && comparisonTo}
+      <EntailmentComparison
+        ds={name}
+        from={upstream}
+        to={comparisonTo}
+        prefixes={data.prefixes ?? {}}
+      />
+    {/if}
     {#if data.facts.length === 0 && data.retracts.length === 0}
       <p class="faint">This branch has no facts to review here. Open Merge to see every change.</p>
     {/if}
