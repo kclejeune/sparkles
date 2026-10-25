@@ -424,6 +424,23 @@
         ]
       },
       "metadata_note": "Null fields mean this metadata is not available in the common record fields. Read the raw assessment for its own provenance and correctness contract."
+    },
+    {
+      "run_id": "sha256-1b27aec88b78c9834f2e1d287bd10d854b809870ee3a95fc25e847d35335f715",
+      "path": "../2026-10-04-regressions.json",
+      "sha256": "1b27aec88b78c9834f2e1d287bd10d854b809870ee3a95fc25e847d35335f715",
+      "format": "legacy-assessment",
+      "context": {
+        "suite": null,
+        "scale": null,
+        "manifest": null,
+        "settings": null,
+        "durability_classes": [],
+        "legacy_metadata": {
+          "host": "forge"
+        }
+      },
+      "metadata_note": "Null fields mean this metadata is not available in the common record fields. Read the raw assessment for its own provenance and correctness contract."
     }
   ]
 }

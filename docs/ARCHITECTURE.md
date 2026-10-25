@@ -284,7 +284,7 @@ This separation explains a deliberate tradeoff: decoded caching and eager tables
 buy throughput at a memory cost. Performance is workload-dependent, and removing
 one cache does not remove the others. Consult
 [memory measurements](benchmarks/memory/RESULTS.md#memory-and-the-speed-it-buys) and
-[where Sparkles loses](benchmarks/overview/RESULTS.md#where-sparkles-loses), rather than assuming
+[where Sparkles loses](BENCHMARKS.md#where-sparkles-loses), rather than assuming
 every optimization beats every Jena or QLever query.
 
 Sources: [cursor execution](../crates/sparkles-core/src/sparql/cursor.rs),

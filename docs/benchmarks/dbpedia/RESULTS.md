@@ -4,6 +4,21 @@ This report was imported from the manually maintained benchmark page. Its tables
 qualifications are preserved, and are not regenerated from the JSON records. Read the
 [reference setup and answer rules](../reference/README.md) with each result.
 
+## Comparison summary
+
+At the 50M slice, among the 27 queries with complete, agreeing content
+  checks across all five engines, Sparkles has the lowest median on 24 warm and 26 cold.
+  Fluree is within 5% ahead on two small warm queries. The focused complete-HTTP
+  [cursor assessment](../dbpedia/RESULTS.md#cursor-expression-reuse-controls) puts `births-by-decade` at
+  50.2 versus QLever's 16.6 ms warm and 68.1 versus 27.6 ms cold, about 3.0× and 2.5×
+  slower. Its timing contract differs from the comparative TSV tables.
+
+At 1.24 billion triples, Sparkles loads English DBpedia in 480 s, against
+  QLever's 1,674 s and Fluree's 2,919 s. The comparative tables report lower times than
+  QLever on 29 warm queries with agreeing qualified answer checks and on 29 of 31 cold
+  queries. The full-data cursor assessment is an internal A/B and does not establish
+  a current peer ranking for `births-by-decade`.
+
 ## DBpedia
 
 ### DBpedia at the 50M slice

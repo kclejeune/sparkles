@@ -4,6 +4,12 @@ This report was imported from the manually maintained benchmark page. Its tables
 qualifications are preserved, and are not regenerated from the JSON records. Read the
 [reference setup and answer rules](../reference/README.md) with each result.
 
+## Comparison summary
+
+Over the 24.3M triples of the OWL 2 RL closure, which Sparkles
+  materializes in 17.8 s, paired `q2` means are 26.8 ms for Sparkles and 60.6 ms for
+  QLever. The query guard preserves all fourteen answers.
+
 ## LUBM and reasoning
 
 <a id="lubm100"></a>

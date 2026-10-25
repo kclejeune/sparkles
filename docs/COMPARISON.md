@@ -5,7 +5,7 @@ what each engine has that Sparkles lacks, the places where Sparkles departs from
 QLever on purpose. [ARCHITECTURE.md](ARCHITECTURE.md) explains the engine's design, and
 the [query optimization reference](internals/OPTIMIZATIONS.md) records its detailed
 fast paths. Benchmark results, including the
-queries Sparkles loses, are in [BENCHMARKS.md](benchmarks/overview/RESULTS.md#where-sparkles-loses). The
+queries Sparkles loses, are in [BENCHMARKS.md](BENCHMARKS.md#where-sparkles-loses). The
 full feature list is in [FEATURES.md](FEATURES.md).
 
 * [Feature gaps by engine](#feature-gaps-by-engine)

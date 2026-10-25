@@ -4,6 +4,15 @@ This report was imported from the manually maintained benchmark page. Its tables
 qualifications are preserved, and are not regenerated from the JSON records. Read the
 [reference setup and answer rules](../reference/README.md) with each result.
 
+## Comparison summary
+
+The focused [write assessment](../writes/RESULTS.md#serial-writes-with-reader-work)
+  puts new-literal commits near 1.2 ms for Sparkles and 0.6 ms for unsynced Oxigraph at
+  10.5M. Sparkles synchronizes before acknowledgement. With sixteen readers, Oxigraph
+  completes 2.1–3.0× as many writes but no reads in the thirty-second 10.5M window,
+  against Sparkles' 232–245 reads/s. The separate suite churn table records 878 and
+  909 Sparkles commits/s at 1.05M and 10.5M under its own contract.
+
 ## Writes and updates
 
 Every Sparkles write is durable when it is acknowledged, because the WAL record and any

@@ -230,7 +230,7 @@ roadmap item as unfinished or promise another implementation.
 
 These are implementation limits, missing controls, and features that other RDF stores
 have and Sparkles does not. [COMPARISON.md](COMPARISON.md) covers each engine, and
-[BENCHMARKS.md](benchmarks/overview/RESULTS.md#where-sparkles-loses) covers performance. The summaries below link to the full limits in each category guide. Those guides name
+[BENCHMARKS.md](BENCHMARKS.md#where-sparkles-loses) covers performance. The summaries below link to the full limits in each category guide. Those guides name
 the [roadmap](ROADMAP.md) items that address each gap, and the roadmap orders the work
 and links each item to its design spec.
 

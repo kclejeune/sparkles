@@ -20,25 +20,51 @@ identify exceptions to the reference hardware, memory limits and request timing.
 | LUBM over a precomputed OWL 2 RL closure of 24.3M triples | Paired `q2` means are 26.8 ms for Sparkles and 60.6 ms for QLever. These are query times after materialization. | [Reasoning](benchmarks/reasoning/RESULTS.md) |
 | Serial literal inserts at 10.5M triples | Sparkles acknowledges synchronized commits in 1.167–1.254 ms, against 0.594–0.625 ms for unsynchronized Oxigraph commits. The durability contracts differ. | [Writes with reader work](benchmarks/writes/RESULTS.md#serial-writes-with-reader-work) |
 
-## Remaining losses and tradeoffs
+## Where Sparkles loses
 
-Sparkles does not lead every comparison. These examples matter when choosing settings
-or deciding whether a workload resembles the published suites.
+This table lists recorded comparisons where another engine is ahead by more than 10%.
+Fluree's warm advantages on `distinct-obj` at 1.05M and on two small DBpedia 50M queries
+are within 10%. SP²Bench `q12b` is also within 8% of Oxigraph.
 
-* On the DBpedia 50M slice, QLever answers `births-by-decade` about 3.0× faster warm
-  and 2.5× faster cold in the complete-HTTP assessment. Sparkles takes 50.2 and
-  68.1 ms, against 16.6 and 27.6 ms. The full-data internal comparison establishes
-  no current peer ranking for that query.
-* Small lookups and crossing a language boundary can dominate embedded workloads.
-  Python value lookups take about 0.67 µs more than pyoxigraph, while Node.js
-  `export-500k` takes 1.44× as long as N3.js with Comunica under the recorded contract.
-* With 16 readers at 10.5M triples, peak server RSS is 1,339 MiB for Sparkles and
-  939 MiB for QLever. Sparkles' default 1 GiB decoded-block cache can be made smaller.
-  Lower cache memory can cost query speed.
+| Case | Reference advantage | Qualification |
+|---|---|---|
+| WatDiv `L1-1`, 10.97M | Fluree 1.11× | Sparkles has the lowest mean on 19 of 20 templates, ties Fluree on S7 and leads on 81 of 88 instances. |
+| BSBM Explore `q7` and `q8`, 10M | Oxigraph 1.2× on `q7` and 1.4× on `q8` | Pooled medians cover three instances per template. Unresolved result differences are excluded from the ranking. |
+| BSBM BI `q3`, 10M | QLever 1.24× | The three fixed-instance answer checks agree. The driver cells have not been rerun since [roadmap](ROADMAP.md) item 96 removed the budget refusal that failed them. |
+| Changed-store `two-hop-count`, 1.05M | Fluree 1.10× | Sparkles takes 8.6 ms against 7.8 ms with 5,000 changes in its delta, and 5.1 ms on the loaded store. |
+| Serial durable commits | Unsynced Oxigraph about 2.0× on literal inserts at 10.5M in the focused assessment | Sparkles takes 1.167–1.254 ms against 0.594–0.625 ms. The separate suite latency table gives Oxigraph a 1.84× advantage at 1.05M under its sampling contract. |
+| Writes during mixed load | Oxigraph 3.4× at 1.05M in the suite and 2.1–3.0× at 10.5M in the focused assessment | At 10.5M in the focused assessment, Oxigraph completes no reads in the thirty-second window, while Sparkles completes 232–245 reads/s. Durability and completed reader work differ. |
+| Cold point lookups | Oxigraph 1.5–3.0× at 1.05M and 1.3–2.9× at 10.5M | Listed under [Cold starts](benchmarks/synthetic/RESULTS.md#cold-starts). |
+| Cold small scans at 1.05M | Fluree 1.17–3.0× on `count-all`, `contains`, `distinct-obj` and `employee-docs` | Fluree is not ahead on any cold query at 10.5M. |
+| DBpedia 50M slice `births-by-decade` | QLever 3.0× warm and 2.5× cold in the complete-HTTP assessment | Sparkles takes 50.2 ms warm and 68.1 ms cold, against 16.6 and 27.6 ms. The comparative TSV tables use another timer contract, and the full-data internal guard establishes no current peer ranking. |
+| DBpedia cold `outlink-classes-2` | QLever 1.25× | Sparkles wins 29 of 31 cold queries. |
+| Server RSS after the run, 1.05M | QLever 1.32× | Without its block cache, Sparkles holds 345 MiB. Sparkles has the lowest RSS after the run at 10.5M. |
+| Peak RSS under 16 readers | QLever 1.67× at 1.05M and 1.43× at 10.5M | Sparkles peaks at 567 and 1,339 MiB, against 339 and 939 MiB. |
+| Bulk load peak RSS | QLever 2.90× on the LUBM(100) closure and 1.23× on SP²Bench, Fluree 1.26× on SP²Bench | Sparkles has the lowest peak at 1.05M and on DBpedia, and is within 10% of QLever at 10.5M. |
+| DBpedia server RSS | QLever 3.14× | Sparkles maps its index, so touched file pages count toward its RSS. |
+| Text index size | QLever about 1.18× at 1.05M and 1.23× at 10.5M | The indexed predicates and features differ. |
+| JVM small lookups | TIM 1.3–2.1× and TDB2 1.1–1.4× on `star-lookup`, `values-star` and `employee-docs` | A small query's fixed cost through Jena dominates. |
+| Python small lookups | pyoxigraph 1.49× on value lookups and `knows-reach`, and 1.23× on subject scans | The gaps are 0.67 µs per value, 20 µs per query and 2.06 µs per subject. `values-star` is within 10%, and Sparkles leads on employee and star lookups. |
+| Node.js small lookups and adds | Oxigraph's package 1.1–1.4× on four small queries, N3.js 1.2–1.5× on adds and `has()` | Each add crosses to the transaction's thread. |
+| Node.js `export-500k` | N3.js with Comunica 1.44× | Each row's terms cross into JavaScript. |
 
-The [complete loss table](benchmarks/overview/RESULTS.md#where-sparkles-loses) includes
-cold reads, standard-suite queries, writes, bindings and memory. The
+Sparkles trades memory for speed with a configurable decoded-block cache. Its default
+1 GiB cache can be made smaller at a cost to query speed. The
 [memory report](benchmarks/memory/RESULTS.md) separates cache, execution and index costs.
+
+## Measurement coverage
+
+Implementation status and measurement coverage are separate. An available capability
+can have no peer comparison, and an internal regression guard does not establish a
+ranking against another engine. [FEATURES](FEATURES.md#capability-status) lists complete,
+partially complete and planned implementation scope.
+
+| Area | Measurement status | Scope |
+|---|---|---|
+| Query, load and write comparisons | Measured with partial coverage | Published tables cover their named data, engines and timing contracts. Larger suites, sustained workloads and broader hardware remain open. |
+| Bindings and model-assisted workflows | Partial coverage | The listed APIs, models and question sets have measurements. Selected API controls and internal A/B runs do not replace a complete peer-suite refresh. |
+| Spatial and query-time reasoning comparisons | Unmeasured against peers | Conformance and internal measurements do not establish comparative performance. |
+| Shared evidence and maintained-analysis specifications | Planned and unmeasured | C25, C26, C27, F22 and C22b are designs, with no implementation or performance claim. |
 
 ## Reading the comparisons
 
@@ -50,9 +76,8 @@ Errors and timeouts are missing comparisons, not fast answers.
 Coverage is partial. The standard and synthetic suites do not represent every RDF graph
 or workload. Sustained writes and compaction, larger standard-suite scales and broad
 hardware comparisons remain open. Spatial workloads and query-time reasoning have no
-published peer comparison. The [coverage summary](benchmarks/overview/RESULTS.md#measurement-coverage)
-and [reference methodology](benchmarks/reference/README.md) describe the limits and
-answer checks.
+published peer comparison. The [reference methodology](benchmarks/reference/README.md)
+describes the limits and answer checks.
 
 Reports retain their own hosts, build identities, units and statistics. Full-response
 HTTP timings, internal execution timings, means and medians cannot be combined into

@@ -4,6 +4,11 @@ This report was imported from the manually maintained benchmark page. Its tables
 qualifications are preserved, and are not regenerated from the JSON records. Read the
 [reference setup and answer rules](../reference/README.md) with each result.
 
+## Comparison summary
+
+Sparkles is fastest on all seven queries at 1.05M and on six of
+  seven at 10.5M, against Fuseki with jena-text and QLever.
+
 ## Full-text search
 
 The comparison uses Sparkles' Tantivy-backed `text:query`, Fuseki's Lucene-backed

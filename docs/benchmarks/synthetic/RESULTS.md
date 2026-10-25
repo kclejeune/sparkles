@@ -4,6 +4,25 @@ This report was imported from the manually maintained benchmark page. Its tables
 qualifications are preserved, and are not regenerated from the JSON records. Read the
 [reference setup and answer rules](../reference/README.md) with each result.
 
+## Summary
+
+The synthetic suite has 28 queries over generated data at 1.05 million and 10.5 million
+triples. Medians are over the queries each engine completes.
+
+| | 1.05M triples | 10.5M triples |
+|---|---|---|
+| Bulk load | **0.47 s** (QLever 1.36, Fluree 1.38, Oxigraph 4.42, TDB2 4.80) | **3.67 s** (QLever 9.35, Fluree 10.20, Oxigraph 18.22, TDB2 45.70) |
+| Fastest of the five engines | 27 of 28 queries | 28 of 28 queries |
+| Clear losses | none | none |
+| Ties within 10% | Fluree on `count-all`, `distinct-obj`, `star-lookup` and `employee-docs`, Oxigraph on `path-plus` | Fluree on `distinct-obj`, Oxigraph on `path-plus` and `values-star` |
+| Against QLever | Faster on 28 of 28, median 2.9× | Faster on 28 of 28, median 3.8× |
+| Against Fluree | Faster on 27 of 28, median 3.5× | Faster on all 26 completed, median 10.3× |
+| Against Fuseki | Faster on all 27 completed, median 14× | Faster on all 27 completed, median 79× |
+| Against Oxigraph | Faster on all 28, median 24× | Faster on all 28, median 100× |
+| Throughput, 16 clients | **1,205 q/s** (QLever 475, Fluree 241, Fuseki 114, Oxigraph 25) | **239 q/s** (QLever 90, Fluree 22, Fuseki 12, Oxigraph 1.7) |
+| Server RSS after the run | 408 MiB (**QLever 310**, Oxigraph 1,231, Fuseki 1,882, Fluree 3,077) | **780 MiB** (QLever 795, Oxigraph 2,074, Fluree 2,357, Fuseki 4,923) |
+| Server RSS less the block cache | 345 MiB | 401 MiB |
+
 ## Synthetic suite
 
 `scripts/gen-data.py` generates people, organisations, documents, typed literals,

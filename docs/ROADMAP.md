@@ -9,7 +9,7 @@ and must be ready before the first release is cut.
 
 The [feature index](FEATURES.md) and its category guides describe what Sparkles does
 and does not do today. Every known gap names the roadmap item that addresses it.
-[BENCHMARKS.md](benchmarks/overview/RESULTS.md#where-sparkles-loses) records the measured results and the
+[BENCHMARKS.md](BENCHMARKS.md#where-sparkles-loses) records the measured results and the
 workloads where Sparkles loses. This document holds only the work that remains.
 
 ## Contents

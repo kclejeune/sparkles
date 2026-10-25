@@ -7,6 +7,15 @@ qualifications are preserved, and are not regenerated from the JSON records. Rea
 <a id="sp2bench"></a>
 <a id="sp2bench-at-10m-triples"></a>
 
+## Comparison summary
+
+At 10M triples, paired forge runs put `q12a` at 3.8 ms against Jena's
+  9.0 ms. `q12b` takes 4.0 ms against Oxigraph's 3.7 ms, inside the ten-percent tie band.
+  Sparkles is the only
+  engine that answers `q5a`, whose rows match an independent oracle. It answers `q6` in
+  0.95 s, 115× faster than Jena. Its `q4` answer of 1.96 GB is larger than the default
+  response budget.
+
 ## SP²Bench
 
 SP²Bench v1.01 generates bibliographic data in the style of DBLP. At 10M triples its

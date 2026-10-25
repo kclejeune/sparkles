@@ -108,7 +108,7 @@ alone, result caches off and answers checked before timing.
 
 The [benchmark reports](docs/benchmarks/README.md) give the full results, methodology,
 [memory tradeoffs](docs/benchmarks/memory/RESULTS.md) and
-[remaining losses](docs/benchmarks/overview/RESULTS.md#where-sparkles-loses).
+[remaining losses](docs/BENCHMARKS.md#where-sparkles-loses).
 
 ## Web UI
 

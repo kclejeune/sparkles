@@ -4,6 +4,12 @@ This report was imported from the manually maintained benchmark page. Its tables
 qualifications are preserved, and are not regenerated from the JSON records. Read the
 [reference setup and answer rules](../reference/README.md) with each result.
 
+## Comparison summary
+
+At 10.97M triples, Sparkles is fastest on 19 of the 20 templates and ties
+  Fluree on S7, with a geometric mean of 4.63 ms against 6.97 ms for Fluree, 13.6 ms for
+  Fuseki, 16.2 ms for Oxigraph and 17.9 ms for QLever.
+
 ## WatDiv
 
 WatDiv v0.6 basic testing at scale 100 has 10,973,381 triples and 20 templates with

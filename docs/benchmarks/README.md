@@ -3,12 +3,11 @@
 Sparkles benchmarks cover query latency, loading, durable writes, memory and language
 bindings. Start with the [benchmark summary](../BENCHMARKS.md) for representative
 results and tradeoffs. Each workload below has a methodology page and a result report.
-The [detailed overview](overview/RESULTS.md) collects suite summaries, coverage and the
-full loss table. The [reference setup](reference/README.md) explains timing and answer rules.
+The summary also records measurement coverage and the full loss table. The
+[reference setup](reference/README.md) explains timing and answer rules.
 
 | Workload | Methodology | Results |
 |---|---|---|
-| Benchmark overview | [Read](overview/README.md) | [Read](overview/RESULTS.md) |
 | Synthetic suite | [Read](synthetic/README.md) | [Read](synthetic/RESULTS.md) |
 | WatDiv | [Read](watdiv/README.md) | [Read](watdiv/RESULTS.md) |
 | SP²Bench | [Read](sp2bench/README.md) | [Read](sp2bench/RESULTS.md) |
