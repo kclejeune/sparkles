@@ -80,6 +80,44 @@ pub(super) fn limited_projection(ctx: &super::ctx::Ctx, node: &Node) -> bool {
             .load(std::sync::atomic::Ordering::Relaxed)
 }
 
+/// A prefix's live rows cannot exceed its covering base blocks and inserted keys.
+/// Unlike the planner's graph discount and midpoint estimate, this is an upper bound.
+fn scan_upper(ctx: &super::ctx::Ctx, scan: &ScanSpec) -> u64 {
+    if let Some(count) = ctx.snap.predicate_count(scan.perm, &scan.prefix) {
+        return count;
+    }
+    let index = ctx.snap.perm(scan.perm);
+    let (lo, hi) = index.block_range(&scan.prefix);
+    let base = if lo < hi {
+        index.blocks[hi - 1].row_start + u64::from(index.blocks[hi - 1].rows)
+            - index.blocks[lo].row_start
+    } else {
+        0
+    };
+    base.saturating_add(crate::store::Delta::count_prefix(
+        &ctx.snap.delta.ins[scan.perm.index()],
+        &scan.prefix,
+    ))
+}
+
+fn full_work(ctx: &super::ctx::Ctx, node: &Node, left: &mut usize) -> Option<f64> {
+    if *left == 0 || !node.cost.is_finite() || node.cost < 0.0 {
+        return None;
+    }
+    *left -= 1;
+    let own = match &node.kind {
+        Kind::Scan(scan) => node.cost.max(scan_upper(ctx, scan) as f64),
+        Kind::Values(table) => node.cost.max(table.len() as f64),
+        _ => node.cost,
+    };
+    let mut children = 0.0;
+    for child in &node.children {
+        children += full_work(ctx, child, left)?;
+    }
+    let work = own.max(children);
+    work.is_finite().then_some(work)
+}
+
 /// Work before the first limited result. A filtered or blocking input may have
 /// to run to completion, so keep its full cost rather than amortizing it over
 /// output rows. Eager joins also build their estimated smaller input in full.
@@ -115,10 +153,10 @@ fn first_work(
             if all {
                 node.cost * prefix(node.est)
             } else {
-                node.cost
+                node.cost.max(scan_upper(ctx, spec) as f64)
             }
         }
-        Kind::Values(_) => node.cost,
+        Kind::Values(table) => node.cost.max(table.len() as f64),
         Kind::Empty => 0.0,
         Kind::Project(_) => first_work(ctx, &node.children[0], want, remaining)?,
         Kind::Extend(..) => {
@@ -144,7 +182,7 @@ fn first_work(
             {
                 return None;
             }
-            other.cost
+            full_work(ctx, other, remaining)?
                 + first_work(ctx, part, want.max(64), remaining)?
                 + (node.cost - part.cost - other.cost).max(0.0)
                     * (want.max(64) as f64 / part.est.max(1.0)).min(1.0)
@@ -161,7 +199,11 @@ fn first_work(
             }
             cost
         }
-        Kind::Filter(_) | Kind::IndexJoin(_) | Kind::Sort(_) => node.cost,
+        Kind::Filter(_) | Kind::IndexJoin(_) | Kind::Sort(_) => {
+            // This node was counted above; the full walk counts it once itself.
+            *remaining += 1;
+            full_work(ctx, node, remaining)?
+        }
         _ => return None,
     };
     (work.is_finite() && work >= 0.0).then_some(work)
@@ -170,10 +212,15 @@ fn first_work(
 /// Decline a new operand order when full-plan estimates already exceed its
 /// resources. A cheaper materialized operand must not introduce a known refusal.
 fn ordering_fits(ctx: &super::ctx::Ctx, root: &Node) -> bool {
+    // Geometric prefix retries can produce more than one full scan. Keep the
+    // original order under a finite total-work cap instead of certifying a sum.
+    if ctx.max_rows_produced != u64::MAX || !ctx.snap.delta.is_empty() {
+        return false;
+    }
     fn visit(
+        ctx: &super::ctx::Ctx,
         node: &Node,
         left: &mut usize,
-        rows: &mut f64,
         bytes: &mut f64,
         max_rows: f64,
     ) -> bool {
@@ -183,28 +230,22 @@ fn ordering_fits(ctx: &super::ctx::Ctx, root: &Node) -> bool {
         *left -= 1;
         let count = match &node.kind {
             Kind::Values(table) => table.len() as f64,
+            Kind::Scan(scan) => scan_upper(ctx, scan) as f64,
             _ => node.est,
         };
         if count > max_rows {
             return false;
         }
-        *rows += count;
         *bytes += count * node.vars.len() as f64 * 8.0 + 128.0;
-        rows.is_finite()
-            && bytes.is_finite()
+        bytes.is_finite()
             && node
                 .children
                 .iter()
-                .all(|c| visit(c, left, rows, bytes, max_rows))
+                .all(|c| visit(ctx, c, left, bytes, max_rows))
     }
-    let (mut rows, mut bytes) = (0.0, 0.0);
+    let mut bytes = 0.0;
     let mut left = MAX_SCREEN_NODES;
-    visit(root, &mut left, &mut rows, &mut bytes, ctx.max_rows as f64)
-        && rows
-            <= ctx
-                .max_rows_produced
-                .saturating_sub(ctx.rows_produced.load(std::sync::atomic::Ordering::Relaxed))
-                as f64
+    visit(ctx, root, &mut left, &mut bytes, ctx.max_rows as f64)
         && bytes <= ctx.memory_room() as f64
 }
 
@@ -528,6 +569,85 @@ fn safe_expression(expr: &Expression, moved: &[Variable], bound: &[Variable]) ->
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn graph_discounted_scan_estimates_do_not_admit_an_oversized_prefix() {
+        use crate::io::Source;
+        use crate::sparql::{QueryOptions, query};
+        use crate::store::{Store, StoreOptions};
+        let store = Store::in_memory(StoreOptions::default());
+        let mut data = String::new();
+        for i in 0..100 {
+            data.push_str(&format!("<urn:s{i}> <urn:p> {i} .\n"));
+        }
+        data.push_str("<urn:g> {\n");
+        for i in 0..900 {
+            data.push_str(&format!("<urn:n{i}> <urn:q> {i} .\n"));
+        }
+        data.push_str("}\n");
+        store
+            .load(&[Source::from_bytes(
+                data.into_bytes(),
+                oxrdfio::RdfFormat::TriG,
+                None,
+            )])
+            .unwrap();
+        let values = (0..24)
+            .map(|i| format!("<urn:v{i}>"))
+            .collect::<Vec<_>>()
+            .join(" ");
+        let text = format!(
+            "ASK {{ {{ VALUES ?s {{ {values} }} }} UNION {{ ?s <urn:p> ?v FILTER(?v != ?s) }} }}"
+        );
+        let result = query(
+            store.snapshot(),
+            &text,
+            &QueryOptions {
+                no_cache: true,
+                max_rows: Some(40),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        assert!(result.boolean);
+    }
+
+    #[test]
+    fn finite_produced_row_caps_keep_prefix_retries_out_of_the_first_operand() {
+        use crate::io::Source;
+        use crate::sparql::{QueryOptions, query};
+        use crate::store::{Store, StoreOptions};
+        let store = Store::in_memory(StoreOptions::default());
+        let data = (0..400)
+            .map(|i| format!("<urn:s{i}> <urn:p> {i} .\n"))
+            .collect::<String>();
+        store
+            .load(&[Source::from_bytes(
+                data.into_bytes(),
+                oxrdfio::RdfFormat::Turtle,
+                None,
+            )])
+            .unwrap();
+        let values = (0..1000)
+            .map(|i| format!("<urn:v{i}>"))
+            .collect::<Vec<_>>()
+            .join(" ");
+        let text = format!(
+            "ASK {{ {{ VALUES ?s {{ {values} }} }} UNION {{ ?s <urn:p> ?v FILTER(?v = ?s) }} }}"
+        );
+        let result = query(
+            store.snapshot(),
+            &text,
+            &QueryOptions {
+                no_cache: true,
+                max_rows_produced: Some(3420),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        assert!(result.boolean);
+        assert_eq!(result.rows_produced, 3001);
+    }
 
     #[test]
     fn an_eager_values_operand_is_not_priced_as_a_single_row() {

@@ -396,8 +396,9 @@ check them against the W3C suites and Jena's own answers.
 * Eager ASK execution can visit a pure UNION branch with lower estimated work before
   its first answer. The whole ASK must pass a bounded whitelist before projections
   request only the rows the limit needs. Expression calls, EXISTS and external effects
-  retain their ordinary order and demand policy. Reordering also requires the estimates
-  for the plan to fit its query budgets. Explicit streaming keeps its policy.
+  retain their ordinary order and demand policy. Reordering requires an unchanged
+  snapshot, no total produced-row cap, and a plan whose scan upper bounds and other
+  estimates fit its row and memory budgets. Explicit streaming keeps its policy.
 * An OPTIONAL whose sides share no variable, but whose condition contains `?a = ?b` with
   one variable from each side, pairs its rows through that equality instead of forming
   their product ([internals](internals/OPTIMIZATIONS.md)). SP²Bench `q6` at 10M tests 7.4

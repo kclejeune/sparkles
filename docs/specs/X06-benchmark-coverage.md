@@ -1296,8 +1296,11 @@ consumer enables exact projection demand. Its ordinary minimum request of 64 row
 could otherwise make a one-row cheap branch continue into an unnecessary wide operand.
 SELECT and effectful consumers retain their order and demand policy. Explicit
 streaming retains its execution and budget paths.
-Reordering also requires estimates for the entire plan to fit the configured rows and
-remaining produced rows and memory. Pure projection admission remains independent.
+Reordering requires an unchanged snapshot without a total produced-row cap. Scan
+rows use covering block upper bounds before graph filtering, and the remaining plan
+estimates must fit the row and memory budgets. Full filtered work includes raw scan
+work even when graph selectivity discounts the planner estimate. Pure projection
+admission remains independent.
 
 The asymmetric join regression keeps the wide scan skipped after a cheap branch
 answers. An immediately answering scan reads only one row and skips a substantial
@@ -1312,7 +1315,11 @@ Competing-operand tests keep a 10,000-row eager VALUES table and a nested false 
 skipped when the first operand can already answer within a 64-row budget.
 The capped VALUES cases also cover 65 and 100 rows and a total produced-row limit of
 300. The physical-work controls run without row caps too, so a resource gate cannot
-hide an incorrect first-answer or nested-demand estimate.
+hide an incorrect first-answer or nested-demand estimate. A mixed default/named graph
+case keeps its 24-row VALUES answer within a 40-row cap despite a discounted competing
+scan estimate. A 400-row false filter behind 1,000 VALUES rows retains the original
+order under a 3,420 produced-row cap and produces exactly 3,001 rows. Reordering had
+added geometric scan retries and refused at 3,464 rows.
 
 ### Short-query checks after keyed inner groups
 
