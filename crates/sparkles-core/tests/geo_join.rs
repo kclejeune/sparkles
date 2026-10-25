@@ -310,6 +310,299 @@ fn nearest_neighbours_come_first() {
     );
 }
 
+fn indexed_points(n: u32) -> Store {
+    let s = Store::in_memory(StoreOptions::default());
+    let mut data = String::new();
+    for i in 0..n {
+        data.push_str(&format!(
+            "<http://example.org/g{i}> <http://www.opengis.net/ont/geosparql#asWKT> \
+             \"POINT({} 0)\"^^<http://www.opengis.net/ont/geosparql#wktLiteral> ; \
+             <http://example.org/rank> {i} .\n",
+            f64::from(i) / 1000.0
+        ));
+    }
+    data.push_str("<http://example.org/setting> <http://example.org/minRank> 140 ; <http://example.org/enabled> true .\n");
+    load(&s, &data);
+    s.enable_geo(GeoConfig::default()).unwrap();
+    s
+}
+
+#[test]
+fn nearest_neighbours_join_disconnected_patterns_after_empty_batches() {
+    let s = indexed_points(160);
+    let snap = s.snapshot();
+    for (independent, expected) in [
+        ("VALUES ?threshold { 140 145 }", 6),
+        ("VALUES ?threshold { 140 140 }", 6),
+        ("?setting ex:minRank ?threshold ; ex:enabled true .", 6),
+        ("VALUES ?threshold { 999 }", 0),
+    ] {
+        let q = format!(
+            "SELECT ?g ?threshold ?d {{ ?g geo:asWKT ?w ; ex:rank ?rank . \
+             {independent} \
+             BIND(geof:metricDistance(?w, \"POINT(0 0)\"^^geo:wktLiteral) AS ?d) \
+             FILTER(BOUND(?d) && ?rank >= ?threshold) }} \
+             ORDER BY ?d ?g ?threshold LIMIT 6"
+        );
+        let r = same(&snap, &q);
+        assert_eq!(r.table.len(), expected, "{q}");
+        let knn = find(&r.plan, "SpatialKnn").expect("disconnected nearest-neighbour join");
+        assert!(
+            knn.counters.as_ref().unwrap()["batches"].as_u64().unwrap() >= 2,
+            "the search must continue after an empty batch: {:#?}",
+            r.plan
+        );
+        assert!(
+            knn.counters.as_ref().unwrap()["emptyBatches"]
+                .as_u64()
+                .unwrap()
+                >= 1,
+            "{q}"
+        );
+    }
+}
+
+#[test]
+fn nearest_neighbours_preserve_independent_filter_scope_and_budget() {
+    let s = indexed_points(3);
+    let values = (0..100)
+        .map(|n| n.to_string())
+        .collect::<Vec<_>>()
+        .join(" ");
+    for independent in [
+        "{ VALUES ?x { 1 } FILTER(!BOUND(?g)) }".to_string(),
+        format!("{{ VALUES ?x {{ {values} }} FILTER(?x = 0) }}"),
+    ] {
+        let q = format!(
+            "SELECT ?g ?x {{ ?g geo:asWKT ?w . {independent} }} \
+             ORDER BY geof:metricDistance(?w, \"POINT(0 0)\"^^geo:wktLiteral) LIMIT 5"
+        );
+        let mut fast = opts(true);
+        fast.max_rows = Some(150);
+        let mut slow = opts(false);
+        slow.max_rows = Some(150);
+        let fast = run(&s.snapshot(), &q, &fast);
+        let slow = run(&s.snapshot(), &q, &slow);
+        assert_eq!(fast.table.len(), 3, "{q}");
+        assert_eq!(rows(&fast), rows(&slow), "{q}");
+        assert!(find(&fast.plan, "SpatialKnn").is_some(), "{q}");
+    }
+}
+
+#[test]
+fn nearest_neighbours_keep_callback_cardinality_and_volatile_group_identity() {
+    use sparkles_core::sparql::extensions::{ExtensionRegistry, ScalarContext, ScalarDescriptor};
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    let s = indexed_points(160);
+    let calls = Arc::new(AtomicUsize::new(0));
+    let count = calls.clone();
+    let mut registry = ExtensionRegistry::builder();
+    registry
+        .register_scalar(
+            ScalarDescriptor::new(
+                "urn:test:once",
+                0..=0,
+                move |_: &ScalarContext<'_>, _: &[Term]| {
+                    Ok(oxrdf::Literal::from(count.fetch_add(1, Ordering::SeqCst) == 0).into())
+                },
+            )
+            .unwrap(),
+        )
+        .unwrap();
+    let registry = registry.build();
+    let q = "SELECT ?g ?x { ?g geo:asWKT ?w ; ex:rank ?rank . \
+             { VALUES ?x { 1 } FILTER(<urn:test:once>()) } \
+             BIND(geof:metricDistance(?w, \"POINT(0 0)\"^^geo:wktLiteral) AS ?d) \
+             FILTER(BOUND(?d) && ?rank >= 140) } ORDER BY ?d LIMIT 6";
+    let mut fast = opts(true);
+    fast.extensions = Some(registry.clone());
+    let mut slow = opts(false);
+    slow.extensions = Some(registry);
+    let fast = run(&s.snapshot(), q, &fast);
+    assert_eq!(calls.swap(0, Ordering::SeqCst), 1);
+    let slow = run(&s.snapshot(), q, &slow);
+    assert_eq!(calls.load(Ordering::SeqCst), 1);
+    assert_eq!(fast.table.len(), 6);
+    assert_eq!(rows(&fast), rows(&slow));
+    assert!(find(&fast.plan, "SpatialKnn").is_none());
+
+    let q = "SELECT ?g ?id { ?g geo:asWKT ?w . { BIND(UUID() AS ?id) } } \
+             ORDER BY geof:metricDistance(?w, \"POINT(0 0)\"^^geo:wktLiteral) LIMIT 5";
+    let r = run(&s.snapshot(), q, &opts(true));
+    assert_eq!(r.table.len(), 5);
+    assert!(find(&r.plan, "SpatialKnn").is_none());
+    let got = r.rows();
+    assert!(
+        got.iter()
+            .all(|row| row[1].is_some() && row[1] == got[0][1])
+    );
+}
+
+#[test]
+fn nearest_neighbours_preserve_volatile_arq_group_identity_across_batches() {
+    let s = indexed_points(160);
+    for expression in [
+        "<http://jena.apache.org/ARQ/function#uuid>()",
+        "<http://jena.apache.org/ARQ/function#struuid>()",
+        "<http://www.w3.org/2005/xpath-functions#apply>(<http://jena.apache.org/ARQ/function#uuid>)",
+        "<http://jena.apache.org/ARQ/function#eval>(<http://jena.apache.org/ARQ/function#uuid>)",
+    ] {
+        let q = format!(
+            "SELECT ?g ?id {{ ?g geo:asWKT ?w ; ex:rank ?rank . \
+             {{ BIND({expression} AS ?id) }} \
+             BIND(geof:metricDistance(?w, \"POINT(0 0)\"^^geo:wktLiteral) AS ?d) \
+             FILTER(BOUND(?d) && ?rank >= 110) }} ORDER BY ?d LIMIT 40"
+        );
+        let r = run(&s.snapshot(), &q, &opts(true));
+        assert_eq!(r.table.len(), 40, "{expression}");
+        let got = r.rows();
+        assert!(
+            got.iter()
+                .all(|row| row[1].is_some() && row[1] == got[0][1]),
+            "{expression}: a group identity must survive every batch"
+        );
+        assert!(find(&r.plan, "SpatialKnn").is_none(), "{expression}");
+    }
+}
+
+#[test]
+fn nearest_neighbours_keep_connected_groups_within_the_batch_budget() {
+    let s = Store::in_memory(StoreOptions::default());
+    let mut data = String::new();
+    for i in 0..500 {
+        data.push_str(&format!(
+            "ex:g{i} a ex:Restaurant ; ex:label \"selected\" .\n"
+        ));
+        if i < 3 {
+            data.push_str(&format!(
+                "ex:g{i} geo:asWKT \"POINT({i} 0)\"^^geo:wktLiteral .\n"
+            ));
+        }
+    }
+    load(&s, &format!("{P}{data}"));
+    s.enable_geo(GeoConfig::default()).unwrap();
+    let q = "SELECT ?g ?label { ?g geo:asWKT ?w . \
+             { ?g a ex:Restaurant ; ex:label ?label FILTER(STRLEN(?label) > 0) } } \
+             ORDER BY geof:metricDistance(?w, \"POINT(0 0)\"^^geo:wktLiteral) LIMIT 5";
+    let expected = run(&s.snapshot(), q, &opts(false));
+    let mut fast = opts(true);
+    fast.max_rows = Some(150);
+    let fast = run(&s.snapshot(), q, &fast);
+    assert_eq!(fast.table.len(), 3);
+    assert_eq!(rows(&fast), rows(&expected));
+    assert!(find(&fast.plan, "SpatialKnn").is_some());
+}
+
+#[test]
+fn nearest_neighbours_preserve_volatile_connected_probe_filters() {
+    let s = indexed_points(3);
+    for i in 0..3 {
+        load(
+            &s,
+            &format!("{P} ex:g{i} a ex:Restaurant ; ex:label \"x\" ."),
+        );
+    }
+    // Make a label probe cheaper than scanning all labels, without changing the
+    // restaurant group's three results. The small balanced fixture uses a merge join.
+    for i in 0..500 {
+        load(&s, &format!("{P} ex:other{i} ex:label \"x\" ."));
+    }
+    s.wait_geo();
+    let q = "SELECT ?g ?label ?x { ?g geo:asWKT ?w . \
+             { ?g a ex:Restaurant ; ex:label ?label FILTER(RAND() < STRLEN(?label)) } \
+             VALUES ?x { 1 2 } } \
+             ORDER BY geof:metricDistance(?w, \"POINT(0 0)\"^^geo:wktLiteral) LIMIT 10";
+    let r = same(&s.snapshot(), q);
+    assert_eq!(r.table.len(), 6);
+    assert!(
+        find(&r.plan, "SpatialKnn").is_none(),
+        "a volatile connected probe must keep its original evaluation scope: {:#?}",
+        r.plan
+    );
+}
+
+#[test]
+fn nearest_neighbours_preserve_volatile_probe_copy_groups() {
+    let s = indexed_points(3);
+    for i in 0..3 {
+        load(
+            &s,
+            &format!("{P} ex:g{i} a ex:Restaurant ; ex:label \"x\" ."),
+        );
+    }
+    for i in 0..500 {
+        load(&s, &format!("{P} ex:other{i} ex:label \"x\" ."));
+    }
+    s.wait_geo();
+    let values = (0..100)
+        .map(|i| i.to_string())
+        .collect::<Vec<_>>()
+        .join(" ");
+    let q = format!(
+        "SELECT ?g ?x {{ ?g geo:asWKT ?w . {{ ?g a ex:Restaurant ; ex:label ?label FILTER(RAND() < STRLEN(?label) / 2) }} VALUES ?x {{ {values} }} }} ORDER BY geof:metricDistance(?w, \"POINT(0 0)\"^^geo:wktLiteral) LIMIT 300"
+    );
+    let r = run(&s.snapshot(), &q, &opts(true));
+    let mut copies = std::collections::BTreeMap::new();
+    for row in r.rows() {
+        *copies.entry(term(row[0].clone())).or_insert(0usize) += 1;
+    }
+    assert!(
+        copies.values().all(|&n| n == 100),
+        "partial volatile copy groups: {copies:?}"
+    );
+    assert!(find(&r.plan, "SpatialKnn").is_none());
+}
+
+#[test]
+fn nearest_neighbours_preserve_unbound_probe_filter_scope() {
+    let s = indexed_points(3);
+    for i in 0..3 {
+        load(
+            &s,
+            &format!("{P} ex:g{i} a ex:Restaurant ; ex:label \"x\" ; ex:guard 1 ."),
+        );
+    }
+    for i in 0..500 {
+        load(&s, &format!("{P} ex:other{i} ex:label \"x\" ."));
+    }
+    s.wait_geo();
+    let q = "SELECT ?g ?label ?guard ?x { ?g geo:asWKT ?w . ?g a ex:Restaurant ; ex:guard ?guard . { ?g ex:label ?label FILTER(!BOUND(?guard)) } VALUES ?x { 1 2 } } ORDER BY geof:metricDistance(?w, \"POINT(0 0)\"^^geo:wktLiteral) LIMIT 10";
+    let r = same(&s.snapshot(), q);
+    assert_eq!(r.table.len(), 6);
+}
+
+#[test]
+fn nearest_neighbours_filter_connected_groups_before_crossing() {
+    let s = indexed_points(3);
+    for i in 0..3 {
+        load(
+            &s,
+            &format!("{P} ex:g{i} a ex:Restaurant ; ex:label \"\" ."),
+        );
+    }
+    s.wait_geo();
+    let values = (0..100)
+        .map(|i| i.to_string())
+        .collect::<Vec<_>>()
+        .join(" ");
+    let q = format!(
+        "SELECT ?g ?label ?x {{ ?g geo:asWKT ?w . \
+         {{ ?g a ex:Restaurant ; ex:label ?label FILTER(STRLEN(?label) > 0) }} \
+         VALUES ?x {{ {values} }} }} \
+         ORDER BY geof:metricDistance(?w, \"POINT(0 0)\"^^geo:wktLiteral) LIMIT 5"
+    );
+    let mut fast = opts(true);
+    fast.max_rows = Some(150);
+    let mut slow = opts(false);
+    slow.max_rows = Some(150);
+    let expected = run(&s.snapshot(), &q, &slow);
+    let r = run(&s.snapshot(), &q, &fast);
+    assert_eq!(r.table.len(), 0);
+    assert_eq!(rows(&r), rows(&expected));
+    assert!(find(&r.plan, "SpatialKnn").is_some());
+}
+
 #[test]
 fn nearest_neighbour_shapes_that_stay_generic_warn() {
     let s = Store::in_memory(StoreOptions::default());
@@ -334,13 +627,6 @@ fn nearest_neighbour_shapes_that_stay_generic_warn() {
                 "SELECT ?g {{ ?g geo:asWKT ?w }} ORDER BY geof:distance(?w, {GA}, uom:degree) LIMIT 2"
             ),
             "angle",
-        ),
-        (
-            format!(
-                "SELECT ?g {{ ?g geo:asWKT ?w . ?x geo:hasGeometry ?y }} \
-                 ORDER BY geof:metricDistance(?w, {GA}) LIMIT 2"
-            ),
-            "join",
         ),
     ] {
         let r = same(&snap, &q);

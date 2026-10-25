@@ -1726,7 +1726,7 @@ these items.
 * `--geo-crs` registers projected CRSs from proj4 definitions, which transform through
   `proj4rs`.
 
-The rest of Phase 3 is not built. That is k-NN with arbitrary joins, simplified polygon
+The rest of Phase 3 is not built. That is k-NN with a query geometry bound per row, simplified polygon
 approximations, `geo:hasMetricArea` and similar properties by rewrite, QLever's
 `SERVICE spatialSearch:` syntax, and the Compliance Benchmark in CI.
 
@@ -1845,24 +1845,38 @@ one, for about 16 bytes per region vertex, up to 64 KiB per region.
 
 ### Roadmap follow-ups (2026-10-12)
 
+Nearest-neighbour ordering around a constant also handles independent join components.
+The planner joins each component on its own keys before crossing it with a batch of
+nearest candidates. Joins and filters can discard a whole batch, and the search continues
+until enough rows are proven or the index is exhausted. Duplicate solutions retain their
+multiplicity, and the existing query budgets apply to each template run and its output.
+Independent components run again for each batch, without an additional materialized cache.
+Their local filters remain inside the component, preserving unbound variables and avoiding
+an unfiltered cross product. Application callbacks and components whose repeatability
+cannot be established keep the generic plan, including components with volatile functions.
+This includes the ARQ UUID aliases, unresolved dynamic function calls and effectful ARQ
+calls such as `wait`, `print` and `execTime`. Result caching and nearest-neighbour
+repeatability share the expression-purity classifier. Result caching also retains its
+stricter refusal of query-clock values across queries. Connected filters are applied as soon as their original required bindings are available, before
+unrelated components are crossed. Filters carried inside an index probe receive the same
+purity check as ordinary filters. Their visible bindings are the probe scan's columns,
+so a variable supplied by another join input cannot change an unbound test. When those
+conditions cannot be established, the query keeps the generic plan. Differential tests
+cover volatile copy groups, scoped unbound probes and rejection before a cross product
+under the row budget.
+The per-row nearest-neighbour join described below remains open under item 24.
+
 **The rest of Phase 3 and geometry limits** (item 24, Tier 3,
 [ROADMAP](../ROADMAP.md)). The Outcome lists the first items below as not built, and
 FEATURES.md lists the geometry limits. The deliberate divergences in
 [COMPARISON.md](../COMPARISON.md#geosparql) stay the default; item 70 below adds an
 opt-in mode for Jena's answers.
 
-* **k-NN with arbitrary joins.** `geojoin.rs` turns `ORDER BY ASC(geof:distance(?w, C,
-  u)) LIMIT k` into a `SpatialKnnSpec` only when `C` is a constant in longitude and
-  latitude and the group's other patterns connect to one indexed scan (a star on its
-  subject or a path from it); every other shape keeps the generic plan with a
-  `geo-not-knn` warning. Two shapes are added. First, a group with patterns that do
-  not connect to the scan: the scan's side runs in increasing distance as now, and the
-  rest of the group is planned on its own and joined with each batch, so a batch can
-  yield no rows and the search goes on until `k` rows are proven, bounded by the
-  query's budget. Second, a k-NN join, where the query geometry is bound per row:
-  `?a` from one pattern and the `k` nearest `?b` per `?a`, written as a `LATERAL`
-  subquery with `ORDER BY … LIMIT k` (the [G06](G06-arq-query-extensions.md)
-  operator) or with QLever's syntax below. The planner runs one k-NN search per
+* **Per-row nearest-neighbour joins.** Constant-distance ordering supports connected
+  patterns and independent components as described above. The remaining query asks for
+  the `k` nearest `?b` for each geometry `?a` from another pattern. It uses a `LATERAL`
+  subquery with `ORDER BY … LIMIT k`, as defined in [G06](G06-arq-query-extensions.md),
+  or QLever's syntax below. The planner runs one k-NN search per
   distinct left geometry over the right side's tree. Acceptance: the five nearest
   restaurants of every station in a dataset of 10,000 stations and 100,000 restaurants
   equal the generic plan's answer and run at least 50 times faster.

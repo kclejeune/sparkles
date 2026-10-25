@@ -67,6 +67,7 @@ struct Runner<'a> {
     out: Table,
     runs: Vec<PlanInfo>,
     batches: u64,
+    empty_batches: u64,
     /// rows whose key was evaluated
     keyed: u64,
 }
@@ -112,6 +113,7 @@ impl Runner<'_> {
         leaf.kind = Kind::Values(batch);
         let (res, info) = execute(self.ctx, &t)?;
         self.batches += 1;
+        self.empty_batches += u64::from(res.is_empty());
         if self.runs.len() < RUNS_SHOWN {
             self.runs.push(info);
         }
@@ -160,6 +162,7 @@ pub fn spatial_knn(
         out: Table::new(vars.to_vec()),
         runs: Vec::new(),
         batches: 0,
+        empty_batches: 0,
         keyed: 0,
     };
     let mut st = SearchStats::default();
@@ -232,6 +235,7 @@ pub fn spatial_knn(
     c.insert("treeNodesVisited".into(), st.nodes.into());
     c.insert("rechecked".into(), st.rechecked.into());
     c.insert("batches".into(), run.batches.into());
+    c.insert("emptyBatches".into(), run.empty_batches.into());
     c.insert("errorRows".into(), (error_rows as u64).into());
     c.insert("index".into(), state(ctx).to_string().into());
     c.insert("fallback".into(), st.fallback.into());

@@ -14,8 +14,7 @@
 //!   spatial index instead of being read; any other is planned as usual and its distinct
 //!   geometries are packed into a tree for the query.
 //! * `ORDER BY ASC(geof:distance(?w, C, u)) LIMIT k` (or a variable bound to it) over a
-//!   group whose geometries come from one indexed scan, and whose other patterns connect
-//!   to that scan (a star on its subject, or a path from it), becomes a
+//!   group whose geometries come from one indexed scan becomes a
 //!   [`SpatialKnnSpec`] below the top-k: the group runs over the scan's rows in
 //!   increasing distance, in batches, until `k` rows are proven.
 //!
@@ -134,7 +133,7 @@ mod on {
         ScanShape, constant_geom, distance_text, fold_const, geof_call, number, scope_covers,
         unit_iri, warn,
     };
-    use super::super::plan::{self, JoinAlgo, Kind, merge_dist, short};
+    use super::super::plan::{self, Kind, merge_dist, short};
     use super::super::table::Table;
     use super::super::value::Value;
     use super::*;
@@ -142,6 +141,7 @@ mod on {
     use crate::geo::ops::relate;
     use crate::geo::units::{self, UnitKind};
     use crate::geo::{Fnv, GeoConfig, Geom, IndexState};
+    use rustc_hash::{FxHashMap, FxHashSet};
 
     const NOT_JOINED: &str = "geo-not-joined";
     const NOT_KNN: &str = "geo-not-knn";
@@ -580,24 +580,101 @@ mod on {
         (chain, n)
     }
 
-    /// The leaves and filters of a tree of joins; `false` when something else is in it.
-    fn flatten(n: &Node, ctx: &Ctx, leaves: &mut Vec<Node>, filters: &mut Vec<Expr>) -> bool {
-        match &n.kind {
-            Kind::Join { algo, .. } if !matches!(algo, JoinAlgo::Cross) => {
-                n.children.iter().all(|c| flatten(c, ctx, leaves, filters))
+    /// Variables connected to the indexed scan by the group's join inputs.
+    fn connected_vars(n: &Node, geometry: VarId) -> FxHashSet<VarId> {
+        fn inputs(n: &Node, out: &mut Vec<Vec<VarId>>) {
+            match &n.kind {
+                Kind::Join { .. } => {
+                    for child in &n.children {
+                        inputs(child, out);
+                    }
+                }
+                Kind::Sort(_) | Kind::Filter(_) => inputs(&n.children[0], out),
+                Kind::IndexJoin(j) => {
+                    inputs(&n.children[0], out);
+                    out.extend(
+                        j.probes
+                            .iter()
+                            .map(|p| p.scan.cols.iter().map(|c| c.1).collect()),
+                    );
+                }
+                _ => out.push(n.vars.clone()),
             }
-            Kind::Sort(_) => flatten(&n.children[0], ctx, leaves, filters),
-            Kind::Filter(es) if !es.iter().any(Expr::has_exists) => {
+        }
+        let mut parts = Vec::new();
+        inputs(n, &mut parts);
+        let mut by_var: FxHashMap<VarId, Vec<usize>> = FxHashMap::default();
+        for (i, part) in parts.iter().enumerate() {
+            for v in part {
+                by_var.entry(*v).or_default().push(i);
+            }
+        }
+        let mut taken = vec![false; parts.len()];
+        let mut vars = FxHashSet::default();
+        let mut pending = vec![geometry];
+        while let Some(v) = pending.pop() {
+            if !vars.insert(v) {
+                continue;
+            }
+            if let Some(adjacent) = by_var.get(&v) {
+                for &i in adjacent {
+                    if !taken[i] {
+                        taken[i] = true;
+                        pending.extend(parts[i].iter().copied());
+                    }
+                }
+            }
+        }
+        vars
+    }
+
+    /// Lift only pure filters whose variables were bound at their original input.
+    fn liftable(filters: &[Expr], bound: &[VarId]) -> bool {
+        filters.iter().all(|e| {
+            super::super::cache::deterministic(e) && e.var_set().iter().all(|v| bound.contains(v))
+        })
+    }
+
+    /// Decompose the indexed component while preserving independent subtrees.
+    fn flatten(
+        n: &Node,
+        ctx: &Ctx,
+        connected: &FxHashSet<VarId>,
+        leaves: &mut Vec<Node>,
+        filters: &mut Vec<Expr>,
+    ) -> bool {
+        if !n.vars.iter().any(|v| connected.contains(v)) {
+            // Preserve the independent subtree's binding scope and local filters.
+            // Per-batch repetition needs the cache's conservative eligibility rules
+            // to exclude volatile expressions, callbacks and external services.
+            if super::super::cache::key(n, ctx).is_none() {
+                return false;
+            }
+            leaves.push(n.clone());
+            return true;
+        }
+        match &n.kind {
+            Kind::Join { .. } => n
+                .children
+                .iter()
+                .all(|c| flatten(c, ctx, connected, leaves, filters)),
+            Kind::Sort(_) => flatten(&n.children[0], ctx, connected, leaves, filters),
+            Kind::Filter(es) if liftable(es, &n.children[0].certain) => {
                 filters.extend(es.iter().cloned());
-                flatten(&n.children[0], ctx, leaves, filters)
+                flatten(&n.children[0], ctx, connected, leaves, filters)
             }
             Kind::IndexJoin(j) => {
-                if !flatten(&n.children[0], ctx, leaves, filters) {
+                if !flatten(&n.children[0], ctx, connected, leaves, filters) {
                     return false;
                 }
                 // each probe as the scan it reads
                 for p in &j.probes {
                     let vars: Vec<VarId> = p.scan.cols.iter().map(|c| c.1).collect();
+                    // A probe filters its own rows before meeting the other inputs.
+                    // Their bindings must not become visible to a lifted expression.
+                    if !liftable(&p.filter, &vars) {
+                        return false;
+                    }
                     let est = ctx
                         .snap
                         .count(p.scan.perm, &p.scan.prefix)
@@ -629,6 +706,24 @@ mod on {
                 true
             }
             _ => false,
+        }
+    }
+
+    /// Apply lifted pure filters once their original bindings are certainly available.
+    fn ready_filters(n: Node, pending: &mut Vec<Expr>, ctx: &Ctx) -> Node {
+        let mut ready = Vec::new();
+        pending.retain(|e| {
+            if e.var_set().iter().all(|v| n.certain.contains(v)) {
+                ready.push(e.clone());
+                false
+            } else {
+                true
+            }
+        });
+        if ready.is_empty() {
+            n
+        } else {
+            plan::filter(n, ready, ctx)
         }
     }
 
@@ -726,6 +821,9 @@ mod on {
         ctx: &Ctx,
     ) -> std::result::Result<Node, String> {
         let w = dist.w;
+        if ctx.calls_extensions {
+            return Err("the query calls application extensions".into());
+        }
         let unit = dist.unit?;
         let metres_per_unit = match unit.kind {
             UnitKind::Length => unit.factor,
@@ -751,9 +849,10 @@ mod on {
             s => return Err(format!("the spatial index is {s}")),
         }
         let (chain, core) = split_chain(child);
+        let connected = connected_vars(core, w);
         let mut leaves = Vec::new();
         let mut filters = Vec::new();
-        if !flatten(core, ctx, &mut leaves, &mut filters) {
+        if !flatten(core, ctx, &connected, &mut leaves, &mut filters) {
             return Err("the group is not a join of patterns under its filters and binds".into());
         }
         let at: Vec<usize> = (0..leaves.len())
@@ -782,8 +881,9 @@ mod on {
         if !scope_covers(&view.config, &shape.graph_filter(&spec), ctx) {
             return Err("the query reads graphs out of the spatial index's scope".into());
         }
-        // the other patterns are read per batch, each joined on a variable bound before
-        // it (from the batch's subjects on), so that they are probed for its keys
+        // Read the scan's connected patterns per batch, probing the batch's keys.
+        // Independent components are joined on their own keys before crossing them
+        // with the batch, so their joins do not enumerate a cross product first.
         let mut bound = scan_node.vars.clone();
         let mut joined = Vec::new();
         while !leaves.is_empty() {
@@ -791,10 +891,7 @@ mod on {
                 .iter()
                 .position(|l| l.vars.iter().any(|v| bound.contains(v)))
             else {
-                return Err(format!(
-                    "the group's other patterns are not connected to the scan of {}",
-                    name(ctx, w)
-                ));
+                break;
             };
             let l = leaves.remove(i);
             bound.extend(l.vars.iter().copied());
@@ -814,12 +911,25 @@ mod on {
             .iter()
             .map(|&v| (v, batch.min(scan_node.d(v))))
             .collect();
-        let mut t = ph;
+        let mut pending = filters.clone();
+        let mut t = ready_filters(ph, &mut pending, ctx);
         for leaf in joined {
             t = plan::join(t, leaf, ctx);
+            t = ready_filters(t, &mut pending, ctx);
         }
-        if !filters.is_empty() {
-            t = plan::filter(t, filters.clone(), ctx);
+        while !leaves.is_empty() {
+            let mut component = leaves.remove(0);
+            while let Some(i) = leaves
+                .iter()
+                .position(|l| l.vars.iter().any(|v| component.vars.contains(v)))
+            {
+                component = plan::join(component, leaves.remove(i), ctx);
+            }
+            t = plan::join(t, component, ctx);
+            t = ready_filters(t, &mut pending, ctx);
+        }
+        if !pending.is_empty() {
+            return Err("a probe filter needs bindings outside its join group".into());
         }
         t = super::super::indexjoin::fuse_stars(t, ctx);
         for c in chain.iter().rev() {

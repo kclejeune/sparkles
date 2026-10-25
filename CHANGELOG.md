@@ -4,6 +4,17 @@
 
 ### Changed
 
+Indexed nearest-neighbour ordering can join candidate batches with independent query
+components. It continues searching when joins or filters discard an entire batch and
+preserves duplicate solutions. Connected filters run before unrelated cross products.
+Index-probe filters keep their original binding scope, with generic fallback for volatile
+filters or filters that could observe new bindings after a move.
+
+ARQ UUID aliases, unresolved dynamic function calls and effectful ARQ calls are excluded
+from result-cache reuse and repeated independent nearest-neighbour inputs. These paths
+share expression-purity checks while result caching retains its stricter treatment of
+query-clock values.
+
 The full-text integrity check retries segment replacements made by merges even when the
 commit stamp stays the same. If the index keeps changing throughout its three attempts,
 it requests another check instead of reporting missing files from superseded metadata.
