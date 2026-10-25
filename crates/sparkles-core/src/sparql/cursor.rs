@@ -2740,7 +2740,9 @@ impl Operator {
             }
         });
         let bind_reuse = match &node.kind {
-            Kind::Extend(_, expr) => bind::Reuse::new(ctx, expr).map(Box::new),
+            Kind::Extend(_, expr) => {
+                bind::Reuse::new(ctx, expr, node.children.first()).map(Box::new)
+            }
             _ => None,
         };
         let state = if let Some(merge) = merge {

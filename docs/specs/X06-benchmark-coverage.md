@@ -1350,8 +1350,10 @@ Automatic streaming of large groupings exposed a difference from eager expressio
 A computed BIND could evaluate the same stored temporal term again in every morsel,
 although eager execution evaluated the expression once per distinct input. The cursor
 now retains an optional map for pure expressions that read one variable. A bounded pilot
-requires observed repeated IDs, without inspecting query names, function names or data
-identifiers. Stored, delta, inline and query-local inputs use exact RDF term identity,
+requires substantial observed repetition, or a repeated ID together with unchanged
+snapshot predicate statistics indicating cross-batch reuse. It does not inspect query
+names, function names or data identifiers. A bounded 64-node walk supplies only an
+optional profitability hint. Estimates do not admit physical work or memory. Stored, delta, inline and query-local inputs use exact RDF term identity,
 including lexical form and datatype. Cached errors remain unbound BIND results.
 
 The map belongs to the query and its snapshot. It retains at most 65,536 entries and
@@ -1375,3 +1377,13 @@ These calls and effectful extension functions retain per-row evaluation in eager
 cursor execution. A regression checks 5,000 distinct UUID outputs for direct aliases
 and both dynamic call forms, with expression reuse enabled and disabled. Ordinary pure
 extension functions remain eligible for reuse.
+
+
+The first generic admission policy accepted any repeated pilot key. A matched forge
+pilot found that one duplicate among 65,536 cheap inputs slowed strings from 40.60 to
+47.26 ms and IRIs from 46.68 to 52.76 ms. The entirely distinct string control stayed
+at 40.47 and 40.55 ms. The corrected policy requires at least one quarter repeated
+pilot rows, or one observed repeat and a snapshot predicate-domain bound no larger
+than four fifths of the estimated input. Changed snapshots decline the metadata hint.
+Near-unique physical controls, bounded traversal and retained-snapshot controls cover
+this correction. The rejected admission policy is recorded in PERFORMANCE-EXPERIMENTS.
