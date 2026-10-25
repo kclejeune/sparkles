@@ -1,0 +1,30 @@
+Initialized Fluree in /home/kclejeune/lanes/benchmark-error-recovery-20261025/optional-chain-20261025T204405Z/fluree/fluree/.fluree
+Import settings: memory budget 8192 MB, parallelism 20 (auto), chunk size 16 MB
+  Override with --memory-budget-mb and --parallelism
+
+
+About ledger 'bench':
+Imported 10.5M flakes in 15.87s (0.66 M flakes/s) across 67 commits (t=67)
+Collapsed 4 duplicate statement(s); the index holds 10,527,319 distinct flakes
+
+  Top classes:
+         375,000  http://example.org/Article
+         300,191  http://example.org/Student
+         300,002  http://example.org/Researcher
+         299,672  http://example.org/Employee
+         125,000  http://example.org/Book
+
+  Top properties:
+       2,497,620  http://xmlns.com/foaf/0.1/knows
+       1,520,017  rdf:type
+       1,020,000  http://xmlns.com/foaf/0.1/name
+       1,000,000  http://xmlns.com/foaf/0.1/age
+       1,000,000  http://example.org/salary
+
+  Top connections:
+         421,642  http://example.org/Article -> http://example.org/cites -> http://example.org/Article
+         225,705  http://example.org/Student -> http://xmlns.com/foaf/0.1/knows -> http://example.org/Student
+         225,588  http://example.org/Student -> http://xmlns.com/foaf/0.1/knows -> http://example.org/Employee
+         225,188  http://example.org/Researcher -> http://xmlns.com/foaf/0.1/knows -> http://example.org/Employee
+         224,921  http://example.org/Student -> http://xmlns.com/foaf/0.1/knows -> http://example.org/Researcher
+

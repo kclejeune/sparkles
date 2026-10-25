@@ -2086,6 +2086,684 @@
         "durability_classes": []
       },
       "metadata_note": "The accompanying manual report and validation receipt select specific cells. Raw carried-over rows and common builder defaults do not broaden that measurement or correctness scope. Raw bytes remain unchanged."
+    },
+    {
+      "run_id": "sha256-b5874bf9f03d5a28c39fb95596407636571fbf1c272cd5b6681aae4c8429a4c4",
+      "path": "runs/2026-10-25-error-recovery-wally-q6/sparkles-record.json",
+      "sha256": "b5874bf9f03d5a28c39fb95596407636571fbf1c272cd5b6681aae4c8429a4c4",
+      "format": "bench-record-3",
+      "context": {
+        "suite": "sp2bench",
+        "scale": "10m",
+        "manifest": {
+          "suite": "sp2bench",
+          "started": "2026-10-25T19:50:43Z",
+          "ended": "2026-10-25T19:51:07Z",
+          "host": {
+            "name": "wally",
+            "cpu": "12th Gen Intel(R) Core(TM) i7-12800H",
+            "cpus": 20,
+            "ram_mib": 31766,
+            "disk_model": "",
+            "kernel": "6.18.51",
+            "filesystem": "ext4",
+            "mount_options": "rw,relatime,discard,errors=remount-ro"
+          },
+          "sparkles": {
+            "binary": "/home/kclejeune/lanes/competitive-births-release-20261025/target-D/release/sparkles",
+            "version": "sparkles 0.1.0",
+            "sha256": "cf6f4cf5fd754c8344fd0f0c02b81dce5016c8b8ccfcbe034f5fe7927cfd46c8",
+            "scripts_commit": "unknown",
+            "binary_commit": "6b7f32ce"
+          },
+          "engines": {},
+          "memory_limit": "24G",
+          "client_cpu": "11",
+          "data": {
+            "sp2bench-10m": {
+              "license": "BSD",
+              "params": "SP2Bench v1.01 triples=10000000",
+              "sha256": "4486653f3ea16825923eb8a5410137df7ba712aa918442531c33cbeb854eb814",
+              "bytes": 1493565484
+            }
+          },
+          "license_check": {
+            "gpl_benchmark_allowed": false,
+            "notes": [
+              "SP2Bench v1.01 generator and queries: BSD license, fetched at build time"
+            ]
+          }
+        },
+        "settings": {
+          "warmup": 2,
+          "runs": 3,
+          "timer": "hyperfine+curl",
+          "resultCache": false,
+          "maxTimeSeconds": 600,
+          "serverTimeoutSeconds": 615,
+          "sparklesArgs": "--max-result-mb 4096",
+          "answerStreamTSVQueries": "q4 q6",
+          "correctnessEngineIsolation": true,
+          "jenaHeap": "16G",
+          "jenaStack": "256m",
+          "qleverMemory": "20G"
+        },
+        "durability_classes": []
+      },
+      "metadata_note": "Completed targeted profile. Typed/source correctness, native serialization and timing disposition remain separate; failed or answer-only rows are not warm latency measurements."
+    },
+    {
+      "run_id": "sha256-c0d8b50f5eafa5e739de21ca14965ed15a242e8f31e3b89fdb0d5ca42e4d1b0c",
+      "path": "runs/2026-10-25-error-recovery-wally-q6/sparkles-qualified-record.json",
+      "sha256": "c0d8b50f5eafa5e739de21ca14965ed15a242e8f31e3b89fdb0d5ca42e4d1b0c",
+      "format": "bench-record-3",
+      "context": {
+        "suite": "sp2bench",
+        "scale": "10m",
+        "manifest": {
+          "suite": "sp2bench",
+          "started": "2026-10-25T19:50:43Z",
+          "ended": "2026-10-25T19:51:07Z",
+          "host": {
+            "name": "wally",
+            "cpu": "12th Gen Intel(R) Core(TM) i7-12800H",
+            "cpus": 20,
+            "ram_mib": 31766,
+            "disk_model": "",
+            "kernel": "6.18.51",
+            "filesystem": "ext4",
+            "mount_options": "rw,relatime,discard,errors=remount-ro"
+          },
+          "sparkles": {
+            "binary": "/home/kclejeune/lanes/competitive-births-release-20261025/target-D/release/sparkles",
+            "version": "sparkles 0.1.0",
+            "sha256": "cf6f4cf5fd754c8344fd0f0c02b81dce5016c8b8ccfcbe034f5fe7927cfd46c8",
+            "scripts_commit": "unknown",
+            "binary_commit": "6b7f32ce"
+          },
+          "engines": {},
+          "memory_limit": "24G",
+          "client_cpu": "11",
+          "data": {
+            "sp2bench-10m": {
+              "license": "BSD",
+              "params": "SP2Bench v1.01 triples=10000000",
+              "sha256": "4486653f3ea16825923eb8a5410137df7ba712aa918442531c33cbeb854eb814",
+              "bytes": 1493565484
+            }
+          },
+          "license_check": {
+            "gpl_benchmark_allowed": false,
+            "notes": [
+              "SP2Bench v1.01 generator and queries: BSD license, fetched at build time"
+            ]
+          },
+          "answer_validation": {
+            "method": "independent-data-oracle",
+            "policy": "sp2bench-source-triple-reconstruction-v1",
+            "canonicalization": {
+              "fingerprint": "row-sha256-v1",
+              "row": "UTF-8 Python repr of tuples of normalized RDF terms, projected variables sorted by name",
+              "multiset": "SHA-256 of sorted lowercase SHA-256 row hashes, each followed by LF; duplicates retained",
+              "exact_terms": "RDF term identity; xsd:string is explicit and language tags are lowercase",
+              "numeric_values": "12 significant decimal digits; normalized Decimal spelling",
+              "source_oracle": "Journal name-pair set unions for q4; earliest numeric year per author for q6; generated string names and integer years are checked explicitly"
+            },
+            "bindings": {
+              "bindings_version": 1,
+              "host": "wally",
+              "scale": "10m",
+              "engine": "sparkles",
+              "dataset": "sp2bench-10m",
+              "source_sha256": "4486653f3ea16825923eb8a5410137df7ba712aa918442531c33cbeb854eb814",
+              "binary_commit": "6b7f32ce",
+              "binary_sha256": "cf6f4cf5fd754c8344fd0f0c02b81dce5016c8b8ccfcbe034f5fe7927cfd46c8",
+              "settings": {
+                "warmup": 2,
+                "runs": 3,
+                "timer": "hyperfine+curl",
+                "resultCache": false,
+                "maxTimeSeconds": 600,
+                "serverTimeoutSeconds": 615,
+                "sparklesArgs": "--max-result-mb 4096",
+                "answerStreamTSVQueries": "q4 q6",
+                "correctnessEngineIsolation": true,
+                "jenaHeap": "16G",
+                "jenaStack": "256m",
+                "qleverMemory": "20G"
+              },
+              "queries": {
+                "q6": {
+                  "sha256": "e635ca91c381cfa5def7a93737e283a4ff9fc697385ac595e3b76338550ede65",
+                  "runs": 3,
+                  "timing_role": "q6_timing"
+                }
+              },
+              "inputs": {
+                "raw_record": {
+                  "path": "sparkles-record.json",
+                  "sha256": "b5874bf9f03d5a28c39fb95596407636571fbf1c272cd5b6681aae4c8429a4c4"
+                },
+                "raw_answers": {
+                  "path": "sparkles-answers.json",
+                  "sha256": "14d165efde7b0b44f1388190199d764497a7feb650e1ea42ccaaca90818863e3"
+                },
+                "oracle": {
+                  "path": "oracle.json",
+                  "sha256": "6f5e9d7b004948e2ead2ad686099f41151626641f9015e3e7adede4282f0cdd0"
+                },
+                "q6_timing": {
+                  "path": "sparkles-q6-timing.json",
+                  "sha256": "7f54d7114bc470982dbad86e83c0511f4029653b593ac2abb0490564353287b7"
+                }
+              },
+              "oracle_generator": {
+                "source_revision": "a44bdabfbe7499abe3d439a6f2bec18b12247209",
+                "script": "scripts/bench-sp2b/oracle.py",
+                "sha256": "97f359ccd2cc73fc57be01017c6f1c6453e5ec6d8d2645af0aee4bd9fb3c3f87"
+              },
+              "measurement_controls": {
+                "sparkles_args": "--max-result-mb 4096",
+                "max_time_s": 600,
+                "server_timeout_s": 615,
+                "server_memory_cap": "24G",
+                "engines_isolated_for_correctness_and_timing": true,
+                "answer_algorithm": "row-sha256-v1; complete TSV; external sort64MiB",
+                "timing": "hyperfine curl full TSV to /dev/null; no fingerprints in timing",
+                "warmup": 2,
+                "runs": 3,
+                "runtime_binary_revision": "6b7f32ce",
+                "index_source": "Copied each preserved fresh Wally SP2Bench index from sp2b-20261025T183539Z, same exact NT SHA256; no graph updates. All selected queries are unchanged.",
+                "jena_heap": "16G",
+                "jena_stack": "256m",
+                "qlever_memory": "20G",
+                "comparison_policy": "Same Wally host profile and600s request budget for all five engines; correctness precedes timing; only correct full answers timed."
+              }
+            },
+            "queries": {
+              "q6": {
+                "rows": 906313,
+                "exact_matches": true,
+                "value_matches": true,
+                "query_sha256": "e635ca91c381cfa5def7a93737e283a4ff9fc697385ac595e3b76338550ede65",
+                "timed_samples": 3,
+                "all_exit_codes_zero": true
+              }
+            }
+          }
+        },
+        "settings": {
+          "warmup": 2,
+          "runs": 3,
+          "timer": "hyperfine+curl",
+          "resultCache": false,
+          "maxTimeSeconds": 600,
+          "serverTimeoutSeconds": 615,
+          "sparklesArgs": "--max-result-mb 4096",
+          "answerStreamTSVQueries": "q4 q6",
+          "correctnessEngineIsolation": true,
+          "jenaHeap": "16G",
+          "jenaStack": "256m",
+          "qleverMemory": "20G"
+        },
+        "durability_classes": []
+      },
+      "metadata_note": "Completed targeted profile. Typed/source correctness, native serialization and timing disposition remain separate; failed or answer-only rows are not warm latency measurements."
+    },
+    {
+      "run_id": "sha256-3d73ee4602ca08bec64fbee67532da510158569ea2f8364a3c7c184f7a2701b1",
+      "path": "runs/2026-10-25-error-recovery-wally-q6/raw/sparkles-answer-results/record.json",
+      "sha256": "3d73ee4602ca08bec64fbee67532da510158569ea2f8364a3c7c184f7a2701b1",
+      "format": "bench-record-3",
+      "context": {
+        "suite": "sp2bench",
+        "scale": "10m",
+        "manifest": {
+          "suite": "sp2bench",
+          "started": "2026-10-25T19:50:28Z",
+          "ended": "2026-10-25T19:50:43Z",
+          "host": {
+            "name": "wally",
+            "cpu": "12th Gen Intel(R) Core(TM) i7-12800H",
+            "cpus": 20,
+            "ram_mib": 31766,
+            "disk_model": "",
+            "kernel": "6.18.51",
+            "filesystem": "ext4",
+            "mount_options": "rw,relatime,discard,errors=remount-ro"
+          },
+          "sparkles": {
+            "binary": "/home/kclejeune/lanes/competitive-births-release-20261025/target-D/release/sparkles",
+            "version": "sparkles 0.1.0",
+            "sha256": "cf6f4cf5fd754c8344fd0f0c02b81dce5016c8b8ccfcbe034f5fe7927cfd46c8",
+            "scripts_commit": "unknown",
+            "binary_commit": "6b7f32ce"
+          },
+          "engines": {},
+          "memory_limit": "24G",
+          "client_cpu": "11",
+          "data": {
+            "sp2bench-10m": {
+              "license": "BSD",
+              "params": "SP2Bench v1.01 triples=10000000",
+              "sha256": "4486653f3ea16825923eb8a5410137df7ba712aa918442531c33cbeb854eb814",
+              "bytes": 1493565484
+            }
+          },
+          "license_check": {
+            "gpl_benchmark_allowed": false,
+            "notes": [
+              "SP2Bench v1.01 generator and queries: BSD license, fetched at build time"
+            ]
+          }
+        },
+        "settings": {
+          "warmup": 2,
+          "runs": 3,
+          "timer": "hyperfine+curl",
+          "resultCache": false,
+          "maxTimeSeconds": 600,
+          "serverTimeoutSeconds": 615,
+          "sparklesArgs": "--max-result-mb 4096",
+          "answerStreamTSVQueries": "q4 q6",
+          "correctnessEngineIsolation": true,
+          "jenaHeap": "16G",
+          "jenaStack": "256m",
+          "qleverMemory": "20G"
+        },
+        "durability_classes": []
+      },
+      "metadata_note": "Completed targeted profile. Typed/source correctness, native serialization and timing disposition remain separate; failed or answer-only rows are not warm latency measurements."
+    },
+    {
+      "run_id": "sha256-b8be0db14f5b691f32b23e10fababafdcbfb3c6e84666590d6a8530b40f5cebf",
+      "path": "runs/2026-10-25-error-recovery-wally-q6/raw/qlever-answer-results/record.json",
+      "sha256": "b8be0db14f5b691f32b23e10fababafdcbfb3c6e84666590d6a8530b40f5cebf",
+      "format": "bench-record-3",
+      "context": {
+        "suite": "sp2bench",
+        "scale": "10m",
+        "manifest": {
+          "suite": "sp2bench",
+          "started": "2026-10-25T19:51:08Z",
+          "ended": "2026-10-25T19:51:25Z",
+          "host": {
+            "name": "wally",
+            "cpu": "12th Gen Intel(R) Core(TM) i7-12800H",
+            "cpus": 20,
+            "ram_mib": 31766,
+            "disk_model": "",
+            "kernel": "6.18.51",
+            "filesystem": "ext4",
+            "mount_options": "rw,relatime,discard,errors=remount-ro"
+          },
+          "sparkles": {
+            "binary": "/home/kclejeune/lanes/competitive-births-release-20261025/target-D/release/sparkles",
+            "version": "sparkles 0.1.0",
+            "sha256": "cf6f4cf5fd754c8344fd0f0c02b81dce5016c8b8ccfcbe034f5fe7927cfd46c8",
+            "scripts_commit": "unknown",
+            "binary_commit": "6b7f32ce"
+          },
+          "engines": {
+            "qlever": {
+              "license": "Apache-2.0",
+              "binary": "/nix/store/xn7f9c965zfza9nks2qzlrnx916xg3h2-qlever-0.5.48/bin/qlever-server",
+              "sha256": "8a3d2eb5259918b6a22607a012e50bf0087dfc9205e37613a03a09a1e68a10dc",
+              "version": "0.5.48",
+              "store_path": "/nix/store/xn7f9c965zfza9nks2qzlrnx916xg3h2-qlever-0.5.48",
+              "package": "qlever-0.5.48",
+              "reported_version": "/nix/store/xn7f9c965zfza9nks2qzlrnx916xg3h2-qlever-0.5.48/bin/qlever-server 0.0.0-unknown"
+            }
+          },
+          "memory_limit": "24G",
+          "client_cpu": "11",
+          "data": {
+            "sp2bench-10m": {
+              "license": "BSD",
+              "params": "SP2Bench v1.01 triples=10000000",
+              "sha256": "4486653f3ea16825923eb8a5410137df7ba712aa918442531c33cbeb854eb814",
+              "bytes": 1493565484
+            }
+          },
+          "license_check": {
+            "gpl_benchmark_allowed": false,
+            "notes": [
+              "SP2Bench v1.01 generator and queries: BSD license, fetched at build time"
+            ]
+          }
+        },
+        "settings": {
+          "warmup": 2,
+          "runs": 3,
+          "timer": "hyperfine+curl",
+          "resultCache": false,
+          "maxTimeSeconds": 600,
+          "serverTimeoutSeconds": 615,
+          "sparklesArgs": "--max-result-mb 4096",
+          "answerStreamTSVQueries": "q4 q6",
+          "correctnessEngineIsolation": true,
+          "jenaHeap": "16G",
+          "jenaStack": "256m",
+          "qleverMemory": "20G"
+        },
+        "durability_classes": []
+      },
+      "metadata_note": "Completed targeted profile. Typed/source correctness, native serialization and timing disposition remain separate; failed or answer-only rows are not warm latency measurements."
+    },
+    {
+      "run_id": "sha256-0b230480e3c580953b0a532ecc41220611c1934c2e328ad3ef9bcf757ad51a3e",
+      "path": "runs/2026-10-25-error-recovery-wally-q6/raw/jena-answer-results/record.json",
+      "sha256": "0b230480e3c580953b0a532ecc41220611c1934c2e328ad3ef9bcf757ad51a3e",
+      "format": "bench-record-3",
+      "context": {
+        "suite": "sp2bench",
+        "scale": "10m",
+        "manifest": {
+          "suite": "sp2bench",
+          "started": "2026-10-25T20:01:35Z",
+          "ended": "2026-10-25T20:03:57Z",
+          "host": {
+            "name": "wally",
+            "cpu": "12th Gen Intel(R) Core(TM) i7-12800H",
+            "cpus": 20,
+            "ram_mib": 31766,
+            "disk_model": "",
+            "kernel": "6.18.51",
+            "filesystem": "ext4",
+            "mount_options": "rw,relatime,discard,errors=remount-ro"
+          },
+          "sparkles": {
+            "binary": "/home/kclejeune/lanes/competitive-births-release-20261025/target-D/release/sparkles",
+            "version": "sparkles 0.1.0",
+            "sha256": "cf6f4cf5fd754c8344fd0f0c02b81dce5016c8b8ccfcbe034f5fe7927cfd46c8",
+            "scripts_commit": "unknown",
+            "binary_commit": "6b7f32ce"
+          },
+          "engines": {
+            "jena": {
+              "license": "Apache-2.0",
+              "binary": "/nix/store/q0dscszid7jzs66xq9dip95z2hc1zmsh-apache-jena-fuseki-5.1.0/bin/fuseki-server",
+              "sha256": "7fb10cdec48244c13ea15e4c0607b29339e5d40c67a12cae2ced41903c1d2743",
+              "version": "Apache Jena Fuseki version 5.1.0",
+              "store_path": "/nix/store/q0dscszid7jzs66xq9dip95z2hc1zmsh-apache-jena-fuseki-5.1.0",
+              "package": "apache-jena-fuseki-5.1.0",
+              "reported_version": "Apache Jena Fuseki version 5.1.0"
+            }
+          },
+          "memory_limit": "24G",
+          "client_cpu": "11",
+          "data": {
+            "sp2bench-10m": {
+              "license": "BSD",
+              "params": "SP2Bench v1.01 triples=10000000",
+              "sha256": "4486653f3ea16825923eb8a5410137df7ba712aa918442531c33cbeb854eb814",
+              "bytes": 1493565484
+            }
+          },
+          "license_check": {
+            "gpl_benchmark_allowed": false,
+            "notes": [
+              "SP2Bench v1.01 generator and queries: BSD license, fetched at build time"
+            ]
+          }
+        },
+        "settings": {
+          "warmup": 2,
+          "runs": 3,
+          "timer": "hyperfine+curl",
+          "resultCache": false,
+          "maxTimeSeconds": 600,
+          "serverTimeoutSeconds": 615,
+          "sparklesArgs": "--max-result-mb 4096",
+          "answerStreamTSVQueries": "q4 q6",
+          "correctnessEngineIsolation": true,
+          "jenaHeap": "16G",
+          "jenaStack": "256m",
+          "qleverMemory": "20G"
+        },
+        "durability_classes": []
+      },
+      "metadata_note": "Completed targeted profile. Typed/source correctness, native serialization and timing disposition remain separate; failed or answer-only rows are not warm latency measurements."
+    },
+    {
+      "run_id": "sha256-b7fd22e2bd4bcea7290486075d33570bb53370ca66325b56c6403a6e1fc1f67d",
+      "path": "runs/2026-10-25-error-recovery-wally-q6/raw/fluree-answer-results/record.json",
+      "sha256": "b7fd22e2bd4bcea7290486075d33570bb53370ca66325b56c6403a6e1fc1f67d",
+      "format": "bench-record-3",
+      "context": {
+        "suite": "sp2bench",
+        "scale": "10m",
+        "manifest": {
+          "suite": "sp2bench",
+          "started": "2026-10-25T19:51:27Z",
+          "ended": "2026-10-25T20:01:33Z",
+          "host": {
+            "name": "wally",
+            "cpu": "12th Gen Intel(R) Core(TM) i7-12800H",
+            "cpus": 20,
+            "ram_mib": 31766,
+            "disk_model": "",
+            "kernel": "6.18.51",
+            "filesystem": "ext4",
+            "mount_options": "rw,relatime,discard,errors=remount-ro"
+          },
+          "sparkles": {
+            "binary": "/home/kclejeune/lanes/competitive-births-release-20261025/target-D/release/sparkles",
+            "version": "sparkles 0.1.0",
+            "sha256": "cf6f4cf5fd754c8344fd0f0c02b81dce5016c8b8ccfcbe034f5fe7927cfd46c8",
+            "scripts_commit": "unknown",
+            "binary_commit": "6b7f32ce"
+          },
+          "engines": {
+            "fluree": {
+              "license": "BUSL-1.1",
+              "binary": "/home/kclejeune/lanes/benchmark-error-recovery-20261025/bin/fluree-4.2.2",
+              "sha256": "99629db65b6eb0d7d9b7cafdc48806eee8ab71e9568fe389b983accaaa35f7ff",
+              "version": "fluree 4.2.2"
+            }
+          },
+          "memory_limit": "24G",
+          "client_cpu": "11",
+          "data": {
+            "sp2bench-10m": {
+              "license": "BSD",
+              "params": "SP2Bench v1.01 triples=10000000",
+              "sha256": "4486653f3ea16825923eb8a5410137df7ba712aa918442531c33cbeb854eb814",
+              "bytes": 1493565484
+            }
+          },
+          "license_check": {
+            "gpl_benchmark_allowed": false,
+            "notes": [
+              "SP2Bench v1.01 generator and queries: BSD license, fetched at build time"
+            ]
+          }
+        },
+        "settings": {
+          "warmup": 2,
+          "runs": 3,
+          "timer": "hyperfine+curl",
+          "resultCache": false,
+          "maxTimeSeconds": 600,
+          "serverTimeoutSeconds": 615,
+          "sparklesArgs": "--max-result-mb 4096",
+          "answerStreamTSVQueries": "q4 q6",
+          "correctnessEngineIsolation": true,
+          "jenaHeap": "16G",
+          "jenaStack": "256m",
+          "qleverMemory": "20G"
+        },
+        "durability_classes": []
+      },
+      "metadata_note": "Completed targeted profile. Typed/source correctness, native serialization and timing disposition remain separate; failed or answer-only rows are not warm latency measurements."
+    },
+    {
+      "run_id": "sha256-7a510578d3bb8e66f5669a13b608f1660893d05fe39ffb3849d385f27dc8defa",
+      "path": "runs/2026-10-25-error-recovery-wally-q6/raw/oxigraph-answer-results/record.json",
+      "sha256": "7a510578d3bb8e66f5669a13b608f1660893d05fe39ffb3849d385f27dc8defa",
+      "format": "bench-record-3",
+      "context": {
+        "suite": "sp2bench",
+        "scale": "10m",
+        "manifest": {
+          "suite": "sp2bench",
+          "started": "2026-10-25T20:20:51Z",
+          "ended": "2026-10-25T20:30:57Z",
+          "host": {
+            "name": "wally",
+            "cpu": "12th Gen Intel(R) Core(TM) i7-12800H",
+            "cpus": 20,
+            "ram_mib": 31766,
+            "disk_model": "",
+            "kernel": "6.18.51",
+            "filesystem": "ext4",
+            "mount_options": "rw,relatime,discard,errors=remount-ro"
+          },
+          "sparkles": {
+            "binary": "/home/kclejeune/lanes/competitive-births-release-20261025/target-D/release/sparkles",
+            "version": "sparkles 0.1.0",
+            "sha256": "cf6f4cf5fd754c8344fd0f0c02b81dce5016c8b8ccfcbe034f5fe7927cfd46c8",
+            "scripts_commit": "unknown",
+            "binary_commit": "6b7f32ce"
+          },
+          "engines": {
+            "oxigraph": {
+              "license": "MIT OR Apache-2.0",
+              "binary": "/nix/store/g7ajfdk0g8bypdbsj23hnfq71izm3iz1-oxigraph-0.5.11/bin/oxigraph",
+              "sha256": "c99f9c4866b9d25f135729ac8b0e468cc0badd2c2cfe1c4b704f0db375ed8de3",
+              "version": "oxigraph 0.5.11",
+              "store_path": "/nix/store/g7ajfdk0g8bypdbsj23hnfq71izm3iz1-oxigraph-0.5.11",
+              "package": "oxigraph-0.5.11",
+              "reported_version": "oxigraph 0.5.11"
+            }
+          },
+          "memory_limit": "24G",
+          "client_cpu": "11",
+          "data": {
+            "sp2bench-10m": {
+              "license": "BSD",
+              "params": "SP2Bench v1.01 triples=10000000",
+              "sha256": "4486653f3ea16825923eb8a5410137df7ba712aa918442531c33cbeb854eb814",
+              "bytes": 1493565484
+            }
+          },
+          "license_check": {
+            "gpl_benchmark_allowed": false,
+            "notes": [
+              "SP2Bench v1.01 generator and queries: BSD license, fetched at build time"
+            ]
+          }
+        },
+        "settings": {
+          "warmup": 2,
+          "runs": 3,
+          "timer": "hyperfine+curl",
+          "resultCache": false,
+          "maxTimeSeconds": 600,
+          "serverTimeoutSeconds": 615,
+          "sparklesArgs": "--max-result-mb 4096",
+          "answerStreamTSVQueries": "q4 q6",
+          "correctnessEngineIsolation": true,
+          "jenaHeap": "16G",
+          "jenaStack": "256m",
+          "qleverMemory": "20G"
+        },
+        "durability_classes": []
+      },
+      "metadata_note": "Completed targeted profile. Typed/source correctness, native serialization and timing disposition remain separate; failed or answer-only rows are not warm latency measurements."
+    },
+    {
+      "run_id": "sha256-c525ccaf175f0184e3f2fff205a7a01051bbbcd6c0023b38a0a1ccee8ac8a173",
+      "path": "runs/2026-10-25-error-recovery-wally-q6/raw/jena-timing-results/record.json",
+      "sha256": "c525ccaf175f0184e3f2fff205a7a01051bbbcd6c0023b38a0a1ccee8ac8a173",
+      "format": "bench-record-3",
+      "context": {
+        "suite": "sp2bench",
+        "scale": "10m",
+        "manifest": {
+          "suite": "sp2bench",
+          "started": "2026-10-25T20:03:57Z",
+          "ended": "2026-10-25T20:20:49Z",
+          "host": {
+            "name": "wally",
+            "cpu": "12th Gen Intel(R) Core(TM) i7-12800H",
+            "cpus": 20,
+            "ram_mib": 31766,
+            "disk_model": "",
+            "kernel": "6.18.51",
+            "filesystem": "ext4",
+            "mount_options": "rw,relatime,discard,errors=remount-ro"
+          },
+          "sparkles": {
+            "binary": "/home/kclejeune/lanes/competitive-births-release-20261025/target-D/release/sparkles",
+            "version": "sparkles 0.1.0",
+            "sha256": "cf6f4cf5fd754c8344fd0f0c02b81dce5016c8b8ccfcbe034f5fe7927cfd46c8",
+            "scripts_commit": "unknown",
+            "binary_commit": "6b7f32ce"
+          },
+          "engines": {
+            "jena": {
+              "license": "Apache-2.0",
+              "binary": "/nix/store/q0dscszid7jzs66xq9dip95z2hc1zmsh-apache-jena-fuseki-5.1.0/bin/fuseki-server",
+              "sha256": "7fb10cdec48244c13ea15e4c0607b29339e5d40c67a12cae2ced41903c1d2743",
+              "version": "Apache Jena Fuseki version 5.1.0",
+              "store_path": "/nix/store/q0dscszid7jzs66xq9dip95z2hc1zmsh-apache-jena-fuseki-5.1.0",
+              "package": "apache-jena-fuseki-5.1.0",
+              "reported_version": "Apache Jena Fuseki version 5.1.0"
+            }
+          },
+          "memory_limit": "24G",
+          "client_cpu": "11",
+          "data": {
+            "sp2bench-10m": {
+              "license": "BSD",
+              "params": "SP2Bench v1.01 triples=10000000",
+              "sha256": "4486653f3ea16825923eb8a5410137df7ba712aa918442531c33cbeb854eb814",
+              "bytes": 1493565484
+            }
+          },
+          "license_check": {
+            "gpl_benchmark_allowed": false,
+            "notes": [
+              "SP2Bench v1.01 generator and queries: BSD license, fetched at build time"
+            ]
+          }
+        },
+        "settings": {
+          "warmup": 2,
+          "runs": 3,
+          "timer": "hyperfine+curl",
+          "resultCache": false,
+          "maxTimeSeconds": 600,
+          "serverTimeoutSeconds": 615,
+          "sparklesArgs": "--max-result-mb 4096",
+          "answerStreamTSVQueries": "q4 q6",
+          "correctnessEngineIsolation": true,
+          "jenaHeap": "16G",
+          "jenaStack": "256m",
+          "qleverMemory": "20G"
+        },
+        "durability_classes": []
+      },
+      "metadata_note": "Completed targeted profile. Typed/source correctness, native serialization and timing disposition remain separate; failed or answer-only rows are not warm latency measurements."
+    },
+    {
+      "run_id": "sha256-7bac5a591784c14e4db9ec2fb90bb50a560c70187952583e0706ae49445f3b02",
+      "path": "runs/2026-10-25-error-recovery-wally-fluree-resource/validation.json",
+      "sha256": "7bac5a591784c14e4db9ec2fb90bb50a560c70187952583e0706ae49445f3b02",
+      "format": "legacy-assessment",
+      "context": {
+        "suite": null,
+        "scale": null,
+        "manifest": null,
+        "settings": null,
+        "durability_classes": [],
+        "legacy_metadata": {
+          "host": "wally",
+          "method": "completed resource feasibility probe and retained wire-format diagnostic"
+        }
+      },
+      "metadata_note": "Completed targeted profile. Typed/source correctness, native serialization and timing disposition remain separate; failed or answer-only rows are not warm latency measurements."
     }
   ]
 }

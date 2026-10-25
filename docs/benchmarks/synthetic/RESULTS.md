@@ -12,11 +12,11 @@ triples. Medians are over the queries each engine completes.
 | | 1.05M triples | 10.5M triples |
 |---|---|---|
 | Bulk load | **0.47 s** (QLever 1.36, Fluree 1.38, Oxigraph 4.42, TDB2 4.80) | **3.67 s** (QLever 9.35, Fluree 10.20, Oxigraph 18.22, TDB2 45.70) |
-| Fastest of the five engines | 27 of 28 queries | 27 of 28 queries |
+| Lowest native endpoint mean | 27 of 28 queries | 27 of 28 queries |
 | Clear losses | none | none |
 | Ties within 10% | Fluree on `count-all`, `distinct-obj`, `star-lookup` and `employee-docs`, Oxigraph on `path-plus` | Fluree on `count-all` and `distinct-obj`, Oxigraph on `path-plus` and `values-star` |
 | Against QLever | Faster on 28 of 28, median 2.9× | Faster on 28 of 28, median 3.8× |
-| Against Fluree | Faster on 27 of 28, median 3.5× | Faster on 26 of 27 completed; `count-all` is within 10% |
+| Against Fluree | Lower native endpoint mean on 27 of 28; encoding differs | Faster on 26 of 27 completed; `count-all` is within 10% |
 | Against Fuseki | Faster on all 28 completed | Faster on all 28 completed |
 | Against Oxigraph | Faster on all 28, median 24× | Faster on all 28, median 100× |
 | Throughput, 16 clients | **1,205 q/s** (QLever 475, Fluree 241, Fuseki 114, Oxigraph 25) | **239 q/s** (QLever 90, Fluree 22, Fuseki 12, Oxigraph 1.7) |
@@ -42,6 +42,10 @@ source. Independent graph traversal verifies 89,090 reachable nodes at 1.05M and
 at 10.5M. A source triple-set count verifies Fluree's 10,527,319 distinct triples. Raw
 `agrees=null` values remain unchanged; these checks use source reconstruction rather
 than a majority vote. The Fluree and Sparkles `count-all` means differ by less than 10%.
+
+SELECT timers request TSV. Fluree returns a plain TSV dialect while its typed answer
+checks use JSON, so these are native endpoint times with different serialization costs.
+Fluree figures do not establish format-matched latency ratios.
 
 ### Synthetic suite at 1.05M triples
 
@@ -264,3 +268,29 @@ fixes that were tried. Warm instruction counts per request stay within 0.969 to 
 unsegmented blocks, and a warm pass makes no read hint. The store at 10.5M grows by 3.0%,
 from 300.6 MB to 309.7 MB, and the load takes 3.7 seconds with a peak of about 2.05 GB
 either way.
+
+## Separate Wally optional-chain profile
+
+The unchanged `optional-chain` query at 10.5M triples was also checked on the Core
+i7-12800H Wally profile with a 26 GiB server cap. Jena uses a 16 GiB heap and 256 MiB
+stack, and QLever's query allowance is 20 GiB. The generated source SHA-256 exactly
+matches the Forge corpus. An independent relation-based oracle reconstructs both nested
+OPTIONAL joins, preserving projected duplicates and unbound fields. All five engines'
+complete typed JSON answers match its 300,191 rows and exact and value fingerprints.
+
+| Engine | Native request mean ± σ ms | Answer and timing disposition |
+|---|---:|---|
+| Sparkles `6b7f32ce` | 90.3 ± 2.9 | Complete source-oracle match. |
+| Jena | 2878.8 ± 26.5 | Complete source-oracle match. |
+| QLever | 583.2 ± 14.5 | Complete source-oracle match. |
+| Fluree | unavailable | One complete correct answer succeeds. Repeated warm requests exceed the 26 GiB memory-cgroup cap. |
+| Oxigraph | 5448.8 ± 30.7 | Complete source-oracle match. |
+
+The [raw records and validation receipt](runs/2026-10-25-error-recovery-wally-optional-chain/validation.json)
+retain two warm-ups and three valid timed samples for each of the four completed timing
+cells. Fluree's failed fast samples are discarded, and its correct single answer does
+not establish a warm mean. Its first answer peaks at 12,067 MiB RSS. Kernel events bind
+the later failure to the memory cgroup. These results remain separate from Forge and
+do not replace its missing Fluree latency. The
+[recovery inventory](../2026-10-25-query-error-recovery-inventory.json) names the remaining
+changed-store and resource-limited comparisons without inferring success from this run.

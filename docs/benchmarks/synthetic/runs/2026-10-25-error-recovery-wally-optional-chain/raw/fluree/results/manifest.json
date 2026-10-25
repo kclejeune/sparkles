@@ -1,0 +1,44 @@
+{
+ "suite": "synthetic",
+ "started": "2026-10-25T20:51:03Z",
+ "ended": "2026-10-25T20:55:16Z",
+ "host": {
+  "name": "wally",
+  "cpu": "12th Gen Intel(R) Core(TM) i7-12800H",
+  "cpus": 20,
+  "ram_mib": 31766,
+  "disk_model": "",
+  "kernel": "6.18.51",
+  "filesystem": "ext4",
+  "mount_options": "rw,relatime,discard,errors=remount-ro"
+ },
+ "sparkles": {
+  "binary": "/home/kclejeune/lanes/competitive-births-release-20261025/target-D/release/sparkles",
+  "version": "sparkles 0.1.0",
+  "sha256": "cf6f4cf5fd754c8344fd0f0c02b81dce5016c8b8ccfcbe034f5fe7927cfd46c8",
+  "scripts_commit": "unknown",
+  "binary_commit": "6b7f32ce"
+ },
+ "engines": {
+  "fluree": {
+   "license": "BUSL-1.1",
+   "binary": "/home/kclejeune/lanes/benchmark-error-recovery-20261025/bin/fluree-4.2.2",
+   "sha256": "99629db65b6eb0d7d9b7cafdc48806eee8ab71e9568fe389b983accaaa35f7ff",
+   "version": "fluree 4.2.2"
+  }
+ },
+ "memory_limit": "26G",
+ "client_cpu": "11",
+ "data": {
+  "synthetic-10.5m": {
+   "license": "generated",
+   "params": "scripts/gen-data.py fixed seed42",
+   "sha256": "10daf6486c20f8dd4579d819ea73bb5e7836e054cd6d2d1b73f99f35233635f8",
+   "bytes": 1121336097
+  }
+ },
+ "license_check": {
+  "gpl_benchmark_allowed": false,
+  "notes": []
+ }
+}

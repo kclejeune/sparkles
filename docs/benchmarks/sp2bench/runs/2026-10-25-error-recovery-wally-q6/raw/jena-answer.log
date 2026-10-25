@@ -1,0 +1,6 @@
+[16:01:35] dataset: 10000091 triples
+
+rows              jena-fuseki
+q6                     906313
+results/record.json: 1 results
+[16:03:57] record: /home/kclejeune/lanes/benchmark-error-recovery-20261025/sp2b-q6-20261025T195019Z/jena/results/record.json, table: /home/kclejeune/lanes/benchmark-error-recovery-20261025/sp2b-q6-20261025T195019Z/jena/results/summary.md

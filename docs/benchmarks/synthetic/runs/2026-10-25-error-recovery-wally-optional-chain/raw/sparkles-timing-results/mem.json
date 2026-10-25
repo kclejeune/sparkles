@@ -1,0 +1,17 @@
+{
+ "idle": {
+  "sparkles": 91
+ },
+ "queries": {
+  "optional-chain": {
+   "sparkles": {
+    "before": 91,
+    "peak": 369,
+    "delta": 278
+   }
+  }
+ },
+ "warm": {
+  "sparkles": 159
+ }
+}

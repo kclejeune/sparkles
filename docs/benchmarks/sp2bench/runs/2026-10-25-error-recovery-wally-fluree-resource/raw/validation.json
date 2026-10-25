@@ -1,0 +1,12 @@
+{
+  "probe_version": 1,
+  "method": "separate complete-answer resource-feasibility probe, no warm latency estimate",
+  "server_memory_cap": "26G",
+  "cache_max_mb": 512,
+  "request_limit_seconds": 600,
+  "server_timeout_seconds": 615,
+  "rows": "error",
+  "value": null,
+  "error": "Remote end closed connection without response",
+  "source_oracle_agreement": false
+}

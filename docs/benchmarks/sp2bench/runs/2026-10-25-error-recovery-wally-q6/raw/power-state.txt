@@ -1,0 +1,4 @@
+/sys/class/power_supply/AC/online 1
+/sys/class/power_supply/BAT0/status Full
+/sys/devices/system/cpu/cpu0/cpufreq/scaling_governor powersave
+/sys/devices/system/cpu/intel_pstate/no_turbo 0

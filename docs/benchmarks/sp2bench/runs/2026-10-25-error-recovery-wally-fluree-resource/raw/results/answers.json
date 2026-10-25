@@ -1,0 +1,9 @@
+{
+ "q4": {
+  "fluree": {
+   "rows": "error",
+   "error": "Remote end closed connection without response",
+   "query_sha256": "ba7af5ada891455f72ba06917c031e25c9c1ffdf0f87c4f6e475623950ade60d"
+  }
+ }
+}

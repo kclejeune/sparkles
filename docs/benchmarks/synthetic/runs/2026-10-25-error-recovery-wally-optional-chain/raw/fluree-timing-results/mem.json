@@ -1,0 +1,17 @@
+{
+ "idle": {
+  "fluree": 271
+ },
+ "queries": {
+  "optional-chain": {
+   "fluree": {
+    "before": 271,
+    "peak": 12079,
+    "delta": 11808
+   }
+  }
+ },
+ "warm": {
+  "fluree": 12033
+ }
+}

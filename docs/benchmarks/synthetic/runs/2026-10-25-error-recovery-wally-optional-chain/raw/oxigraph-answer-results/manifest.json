@@ -1,0 +1,47 @@
+{
+ "suite": "synthetic",
+ "started": "2026-10-25T20:47:50Z",
+ "ended": "2026-10-25T20:48:31Z",
+ "host": {
+  "name": "wally",
+  "cpu": "12th Gen Intel(R) Core(TM) i7-12800H",
+  "cpus": 20,
+  "ram_mib": 31766,
+  "disk_model": "",
+  "kernel": "6.18.51",
+  "filesystem": "ext4",
+  "mount_options": "rw,relatime,discard,errors=remount-ro"
+ },
+ "sparkles": {
+  "binary": "/home/kclejeune/lanes/competitive-births-release-20261025/target-D/release/sparkles",
+  "version": "sparkles 0.1.0",
+  "sha256": "cf6f4cf5fd754c8344fd0f0c02b81dce5016c8b8ccfcbe034f5fe7927cfd46c8",
+  "scripts_commit": "unknown",
+  "binary_commit": "6b7f32ce"
+ },
+ "engines": {
+  "oxigraph": {
+   "license": "MIT OR Apache-2.0",
+   "binary": "/nix/store/g7ajfdk0g8bypdbsj23hnfq71izm3iz1-oxigraph-0.5.11/bin/oxigraph",
+   "sha256": "c99f9c4866b9d25f135729ac8b0e468cc0badd2c2cfe1c4b704f0db375ed8de3",
+   "version": "oxigraph 0.5.11",
+   "store_path": "/nix/store/g7ajfdk0g8bypdbsj23hnfq71izm3iz1-oxigraph-0.5.11",
+   "package": "oxigraph-0.5.11",
+   "reported_version": "oxigraph 0.5.11"
+  }
+ },
+ "memory_limit": "26G",
+ "client_cpu": "11",
+ "data": {
+  "synthetic-10.5m": {
+   "license": "generated",
+   "params": "scripts/gen-data.py fixed seed42",
+   "sha256": "10daf6486c20f8dd4579d819ea73bb5e7836e054cd6d2d1b73f99f35233635f8",
+   "bytes": 1121336097
+  }
+ },
+ "license_check": {
+  "gpl_benchmark_allowed": false,
+  "notes": []
+ }
+}

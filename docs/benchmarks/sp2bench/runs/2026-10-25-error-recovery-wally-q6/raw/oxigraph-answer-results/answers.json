@@ -1,0 +1,9 @@
+{
+ "q6": {
+  "oxigraph": {
+   "rows": "error",
+   "error": "no complete answer in 600 s",
+   "query_sha256": "e635ca91c381cfa5def7a93737e283a4ff9fc697385ac595e3b76338550ede65"
+  }
+ }
+}

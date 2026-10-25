@@ -1,0 +1,11 @@
+Some files like Wikidata dumps contain invalid IRIs or language tags. If you want to load them anyway use the `--lenient` option.
+1999998 triples loaded in 6s (308416 t/s)
+2999998 triples loaded in 8s (368727 t/s)
+3999998 triples loaded in 9s (410260 t/s)
+4999998 triples loaded in 11s (437518 t/s)
+5999998 triples loaded in 13s (451342 t/s)
+6999998 triples loaded in 15s (463755 t/s)
+7999997 triples loaded in 15s (501456 t/s)
+8999997 triples loaded in 17s (519297 t/s)
+10527319 triples loaded in 18s (559238 t/s)
+If you plan to run a read-heavy workload, consider running `oxigraph optimize -l oxigraph.db` before

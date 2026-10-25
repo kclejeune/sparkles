@@ -1,0 +1,1 @@
+[2m2026-10-25T20:01:31.358157Z[0m [31mERROR[0m [2mfluree_db_server::routes::query[0m[2m:[0m SPARQL query execution failed [3merror[0m[2m=[0mQuery error: Query cancelled: client_disconnected

@@ -1,0 +1,9 @@
+{
+  "query": "q6",
+  "eligible_for_timing": true,
+  "expected_rows": 906313,
+  "actual_rows": 906313,
+  "expected_value": "row-sha256-v1:9fce8c07ef87937ec498e9cdca8047e2c9cfab085a95c4817de2081f4db52479",
+  "actual_value": "row-sha256-v1:9fce8c07ef87937ec498e9cdca8047e2c9cfab085a95c4817de2081f4db52479",
+  "error": null
+}

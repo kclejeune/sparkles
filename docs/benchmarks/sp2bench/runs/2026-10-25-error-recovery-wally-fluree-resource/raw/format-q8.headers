@@ -1,0 +1,8 @@
+HTTP/1.1 200 OK
+content-type: text/tab-separated-values; charset=utf-8
+vary: origin, access-control-request-method, access-control-request-headers
+access-control-allow-origin: *
+access-control-expose-headers: content-range,etag,x-fluree-content-kind,x-fluree-block-type,x-fluree-policy-applied,x-fdb-time,x-fdb-fuel,x-fdb-policy,x-fdb-policy-enforcement,x-fdb-reasoning,x-fdb-warning
+content-length: 12385
+date: Sun, 25 Oct 2026 20:39:44 GMT
+

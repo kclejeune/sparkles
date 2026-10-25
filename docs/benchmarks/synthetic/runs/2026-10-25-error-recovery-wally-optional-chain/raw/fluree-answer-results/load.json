@@ -1,0 +1,15 @@
+{
+ "results": [
+  {
+   "command": "fluree",
+   "mean": 15.9986,
+   "stddev": 0.0,
+   "times": [
+    15.9986
+   ],
+   "exit_codes": [
+    0
+   ]
+  }
+ ]
+}

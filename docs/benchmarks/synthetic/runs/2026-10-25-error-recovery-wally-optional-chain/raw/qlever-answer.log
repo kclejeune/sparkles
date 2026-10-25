@@ -1,0 +1,7 @@
+[16:45:04] qlever: loading (log: logs/load-qlever.log)
+qlever: 19.2 s, peak RSS 1863 MiB, index 276 MiB
+
+rows                   qlever
+optional-chain         300191
+results/record.json: 1 results
+[16:45:31] record: /home/kclejeune/lanes/benchmark-error-recovery-20261025/optional-chain-20261025T204405Z/qlever/results/record.json, table: /home/kclejeune/lanes/benchmark-error-recovery-20261025/optional-chain-20261025T204405Z/qlever/results/summary.md

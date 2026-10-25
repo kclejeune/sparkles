@@ -1,0 +1,12 @@
+
+rows              jena-fuseki
+optional-chain         300191
+[16:47:26] jena: warm-up pass over the selected queries
+
+== optional-chain
+Benchmark 1: jena-fuseki
+  Time (mean ± σ):      2.879 s ±  0.026 s    [User: 0.001 s, System: 0.006 s]
+  Range (min … max):    2.851 s …  2.903 s    3 runs
+ 
+results/record.json: 1 results
+[16:47:50] record: /home/kclejeune/lanes/benchmark-error-recovery-20261025/optional-chain-20261025T204405Z/jena/results/record.json, table: /home/kclejeune/lanes/benchmark-error-recovery-20261025/optional-chain-20261025T204405Z/jena/results/summary.md

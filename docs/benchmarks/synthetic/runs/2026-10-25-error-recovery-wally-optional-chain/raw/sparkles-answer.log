@@ -1,0 +1,7 @@
+[16:44:36] sparkles: loading (log: logs/load-sparkles.log)
+sparkles: 6.5 s, peak RSS 1919 MiB, index 298 MiB
+
+rows                 sparkles
+optional-chain         300191
+results/record.json: 1 results
+[16:44:51] record: /home/kclejeune/lanes/benchmark-error-recovery-20261025/optional-chain-20261025T204405Z/sparkles/results/record.json, table: /home/kclejeune/lanes/benchmark-error-recovery-20261025/optional-chain-20261025T204405Z/sparkles/results/summary.md

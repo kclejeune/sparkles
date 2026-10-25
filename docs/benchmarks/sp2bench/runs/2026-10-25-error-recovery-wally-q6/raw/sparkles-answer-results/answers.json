@@ -1,0 +1,10 @@
+{
+ "q6": {
+  "sparkles": {
+   "rows": 906313,
+   "exact": "row-sha256-v1:6477ffd2896aeebcd125065dd3085bfae08334e416bbd6777b972acb05f5c6d4",
+   "value": "row-sha256-v1:9fce8c07ef87937ec498e9cdca8047e2c9cfab085a95c4817de2081f4db52479",
+   "query_sha256": "e635ca91c381cfa5def7a93737e283a4ff9fc697385ac595e3b76338550ede65"
+  }
+ }
+}

@@ -1,0 +1,43 @@
+{
+  "receipt_version": 1,
+  "host": "wally",
+  "method": "completed resource feasibility probe and retained wire-format diagnostic",
+  "cache_max_mb": 512,
+  "server_memory_cap": "26G",
+  "request_limit_seconds": 600,
+  "q4_status": "memory-cgroup OOMkill; no completeanswer; no timing",
+  "kernel_event_file": "raw/kernel-oom-events.txt",
+  "format": {
+    "format": "Fluree plain TSV dialect",
+    "content_type": "text/tab-separated-values; charset=utf-8",
+    "strict_sparql_tsv": false,
+    "observed_header": [
+      "name"
+    ],
+    "observed_first_value": "Maureo Benedict",
+    "rows": 656,
+    "schema_specific_value_hash": "1a095147849abf2b",
+    "verification_scope": "Known q8 name column decoded as xsd:string solely to compare lexical values with the source-matchedJSONreference. This is not a general RDF-term TSV decoder. The standard term parser correctly rejects bare strings.",
+    "standard": "https://www.w3.org/TR/sparql11-results-csv-tsv/#tsv-terms"
+  },
+  "startup_scope": "The initial private wrapper failed its project-directory check before executing any query. The archived corrected wrapper performs the actual bounded probe; that startup failure is not an engine-query result.",
+  "files": {
+    "run-cache-probe.sh": "e4d17c81d1ac8630114fceca75435aab59a059dccd65a0269351781256d1326e",
+    "startup-only-wrapper.sh": "01827a5db733b4cb38b962131dc2258554615328fd54917b345260ef0d49d46d",
+    "raw/server.log": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+    "raw/format-q8.headers": "3e156a8ad7cc93e2d2742a0ec1cede701cee116abbdb454ce00217636fa2d78d",
+    "raw/preflight.txt": "217f4b11e6c32f4fdfb8e33df2b229584e36c0fc9503f9f2934468549c1bb38f",
+    "raw/format-validation.json": "f506885e4d87a21e8ceb6918df0b619662f02d086f9ecdcf8ebfde3d711bf9c0",
+    "raw/kernel-oom-events.txt": "49375898cf8694a7654f59fcc2c3cdabbd804a122c4f71ff8c9f901dede731d8",
+    "raw/inputs.sha256": "0f6014aad0ea396d38b96d497daf22fa85416bd98ae0cd4b984f3ffd91b53215",
+    "raw/format-q8.response": "de7dabe5e6376f61e58b522768c46b54914d2c5af08ae704068b97151c2d724c",
+    "raw/query.log": "f097b5f4f46cda2da21b954c9ff4097e1e14ae7064ecdee2c2cec2d3c1f08e6b",
+    "raw/validation.json": "7f6386d8b4442f51719ea5b320a7f0af0a1cce4aea5da95af19d1b023d8878a6",
+    "raw/complete.txt": "5854cec7d32c541b28b931b881751d9d8b4cbdd25a58b2964a5015f6c6ca7cc6",
+    "raw/scope-events.txt": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+    "raw/results/answers.json": "da5394ab36b0c1a09fa660cfa0f6ebaaf81012e09a1afe6db928030776a3bc3c",
+    "raw/results/manifest.json": "fd463f4c5e46bb95e0c2be75664527a155fbbe2857e6042c739aa7bd4369164b",
+    "raw/queries/q8.rq": "29e2736f82bfc0ee91bdd597700eea247f5cf352e87ecf0dc872da0cb22eaac7",
+    "raw/queries/q4.rq": "ba7af5ada891455f72ba06917c031e25c9c1ffdf0f87c4f6e475623950ade60d"
+  }
+}

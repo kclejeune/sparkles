@@ -1,0 +1,21 @@
+{
+  "engine": "oxigraph",
+  "eligible_for_timing": true,
+  "expected": {
+    "oracle_version": 1,
+    "method": "source-relations-nested-left-join-bag",
+    "source_sha256": "10daf6486c20f8dd4579d819ea73bb5e7836e054cd6d2d1b73f99f35233635f8",
+    "query_sha256": "a88e5796dd345eb1caa7ca5723ef2687ae0def1b354a461febf3e20015b7afe2",
+    "students": 300191,
+    "rows": 300191,
+    "exact": "eb7b447880a4ce42",
+    "value": "eb7b447880a4ce42",
+    "semantics": "Source RDF triples are sets; every advisor/workplace path contributes a solution, including projected duplicates. Absent optional paths produce unbound projected values."
+  },
+  "actual": {
+    "rows": 300191,
+    "exact": "eb7b447880a4ce42",
+    "value": "eb7b447880a4ce42",
+    "query_sha256": "a88e5796dd345eb1caa7ca5723ef2687ae0def1b354a461febf3e20015b7afe2"
+  }
+}
