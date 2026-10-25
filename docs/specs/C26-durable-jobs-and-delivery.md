@@ -191,7 +191,10 @@ new run. No estimate of freshness can authorize publication.
 It validates outputs and budgets, then stages business quads, immutable publication
 record, source checkpoint, completion state and outbox entries in one transaction.
 The actual sequence is assigned under that writer and is the publication's commit.
-Validation or synchronization failure publishes none of these changes.
+Validation refusal publishes none of these changes. A synchronization error is not a
+success acknowledgement and can leave the transaction outcome uncertain until recovery.
+Recovery retains either the complete transaction or none of it, and the publication
+operation ID resolves retries without assuming an error proved rollback.
 
 The publication operation UUID and digest are checked before lease rejection on an
 otherwise authorized retry. A completed publication with the same digest returns its
@@ -420,5 +423,5 @@ No new runtime dependency is selected by this specification.
 
 ## Outcome
 
-The design is specified and no phase is implemented. The current task and notification
-APIs retain their existing process-local durability. Roadmap item 339 tracks this work.
+The design is specified and no phase is implemented. Current task records and the C21
+delivery queue remain process-local. Roadmap item 339 tracks this work.
