@@ -1696,12 +1696,14 @@ links each item to its design spec.
 * Ask has been evaluated with Anthropic models only, on the demo set, CK25, QALD-9-plus
   and 74 DBpedia-only questions
   ([C18](specs/C18-natural-language-questions-and-ingest.md#roadmap-follow-ups-2026-10-12),
-  [BENCHMARKS.md](BENCHMARKS.md#natural-language-questions)). On DBpedia the best model
-  answers 40 of 107 QALD-9-plus questions. The measured run predates question-aware
-  schema retrieval and conservative resource/category ranking. Their effect on model answer accuracy and latency needs a
-  new run. Genuine namesake clarification and question-context ranking remain roadmap
-  item 263. Local and OpenAI-compatible models, LC-QuAD 2.0, which needs a Wikidata load from
-  the full dump, and an evaluation of independent roles have not run. Roadmap item 6.
+  [BENCHMARKS.md](BENCHMARKS.md#natural-language-questions)). On the retained 107-question
+  DBpedia repeat, Sonnet answers 31 under projected-column scoring and 9 with equal-width
+  scoring. Haiku answers 26 and 23 respectively. These
+  repeated regression questions do not measure unseen generalization. Model-dependent
+  accuracy and contextual namesake resolution remain roadmap item 263, and the higher
+  median end-to-end latency is item 318. Local and OpenAI-compatible models, LC-QuAD 2.0,
+  which needs a Wikidata load from the full dump, and an evaluation of independent roles
+  have not run. Roadmap item 6.
 * The UI's ingestion controls do not turn on assistant ingestion. Roadmap item 77.
 * An MCP tool operation that needs admin, such as deleting a protected branch, refuses an
   OAuth token without `sparkles:admin` as a tool error instead of a scope challenge.

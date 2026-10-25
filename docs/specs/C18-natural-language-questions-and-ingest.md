@@ -5448,6 +5448,40 @@ ranking checks. Their displayed choices omit alternate labels, and gold-word tie
 do not establish either selection's correctness. A prototype that automatically resolved
 some choices was rejected because omitted candidates, types and labels could hide a
 necessary clarification. Every ambiguous mention now retains its offered choices and
-stops before drafting. No new provider calls were made. Item 263 remains open for a
-complete visibility-safe evidence contract, context-sensitive namesake resolution and an
-end-to-end accuracy and latency evaluation.
+stops before drafting. Those offline checks made no provider calls. Item 263 remains
+open for a complete visibility-safe evidence contract, context-sensitive namesake
+resolution and further model-dependent accuracy improvements.
+
+A paid repeat on 2026-10-25 measured the reviewed grounding with immutable source
+`0d4fdd8e` and binary SHA256
+`7fee24e01b21f4bd3aeb6f87ae87b85f6455a2849470d55f9e213e250104ba93`.
+It includes the reviewed native ASK admission correction, but not the separate contextual
+consumer. All 107 gold queries passed without provider access, and their RDF-term row
+sets and variables matched the retained reference. Each model then ran all 107 retained
+questions with the same dataset, medium effort, 200,000-token context, 4,096 output
+tokens, 300-second Ask deadline and 60-second query timeout. These questions had already
+been used during diagnosis, so this is regression evidence, not unseen generalization.
+
+| Measure | Haiku 5.5 | Sonnet 5.5 |
+|---|---|---|
+| Projected accuracy before and after | 16/107 to 26/107 | 35/107 to 31/107 |
+| Equal-width accuracy before and after | 13/107 to 23/107 | 15/107 to 9/107 |
+| Projected cases gained and lost | 14 gained and 4 lost | 11 gained and 15 lost |
+| Wall median before and after | 12.27 s to 14.78 s | 12.98 s to 14.98 s |
+| Wall p95 before and after | 29.42 s to 29.22 s | 34.02 s to 33.88 s |
+| Fresh full-run cost including preflight | $0.2876 | $5.4574 |
+
+Wall time includes both calls when the evaluator answers an offered clarification.
+There were 84 such cases for each model. The single run improves Haiku's measured
+accuracy but lowers Sonnet's under both policies. Rust, Clang and LLD versions match
+the earlier binary, but its GCC comment is 15.3.0 against 16.2.0 in this build. Together
+with provider variability, that prevents isolating the grounding's causal contribution.
+Roadmap item 318 records the higher median latency without treating its cause as proven.
+
+The fixed ten-question Haiku pilot scored 0/10 and cost $0.0397059. It is excluded from
+both full-run denominators. Total fresh spend was $5.7847392 across 436 ledger-reserved
+model requests, including both phases' paid provider preflights. The unchanged shared 50-dollar Ask ledger
+has $15.4166424 remaining and no unresolved or positive held charges. No Opus call was
+made. Costs use new request IDs, since raw case costs include charges from earlier runs
+with the same case IDs. The [paid record](../benchmarks/2026-10-25-ask-grounding-paid.json)
+retains exact policies, paired case changes, tokens, costs and provenance.
