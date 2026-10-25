@@ -601,6 +601,48 @@ mod tests {
     }
 
     #[test]
+    fn optional_cache_does_not_starve_mandatory_child_construction() {
+        use super::super::{CursorOptions, FallbackPolicy, Operator};
+        let store = Store::in_memory(StoreOptions::default());
+        let ctx = cursor_context(&store, 768);
+        let input = ctx.var("input");
+        let target = ctx.var("bound");
+        let plan = || {
+            let mut distinct = Node::leaf(Kind::Distinct, vec![input], 0.0, String::new());
+            distinct
+                .children
+                .push(Node::leaf(Kind::Empty, vec![input], 0.0, String::new()));
+            let expr = Expr::Call(Func::Builtin(Function::Str), vec![Expr::Var(input)]);
+            let mut bind = Node::leaf(
+                Kind::Extend(target, expr),
+                vec![input, target],
+                0.0,
+                String::new(),
+            );
+            bind.children.push(distinct);
+            bind
+        };
+        let early = ctx.retained_charge(512).unwrap();
+        assert!(
+            Operator::build(&ctx, plan(), FallbackPolicy::RejectMaterialization).is_err(),
+            "an early optional reservation can starve the child's mandatory264-byte state"
+        );
+        drop(early);
+        let mut operator = Operator::build(&ctx, plan(), FallbackPolicy::RejectMaterialization)
+            .expect(
+                "optional BIND state must decline after mandatory children use the memory budget",
+            );
+        assert!(operator.bind_reuse.is_none());
+        assert!(
+            operator
+                .next(&ctx, &CursorOptions::default(), 1024)
+                .unwrap()
+                .is_none()
+        );
+        ctx.check().unwrap();
+    }
+
+    #[test]
     fn cache_growth_refusal_retains_a_bounded_partial_map_and_normal_evaluation() {
         let store = Store::in_memory(StoreOptions::default());
         let ctx = cursor_context(&store, 64 << 10);
