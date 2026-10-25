@@ -181,8 +181,8 @@ fn commits(s: &Store, k: usize) -> (f64, f64, f64) {
     (pct(&mut lat, 0.5), pct(&mut lat, 0.99), k as f64 / total)
 }
 
-/// §11: write latency with 0, 10 and 100 async views (persistent store, group commit
-/// off), and how long the views take to catch up after the writes.
+/// §11: write latency with 0, 10 and 100 async views on a persistent store with the
+/// default store options, and how long the views take to catch up after the writes.
 #[test]
 #[ignore]
 fn commit_latency_with_views() {
