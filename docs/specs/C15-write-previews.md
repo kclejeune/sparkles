@@ -736,6 +736,10 @@ reinsertion cannot bypass an exceeded quota. Disk-size estimates remain approxim
 The source and target heads, published snapshot, files and guard publication state stay
 unchanged. An actual replay still publishes each successful source step separately.
 
+Bulk ShEx schema previews retain the committed schema for grandfather comparisons.
+Change detection reads batch IDs in their source dictionary before the rebuild's
+renumbering, so schema edits are checked in both previews and actual bulk commits.
+
 ### Roadmap follow-ups (2026-10-12)
 
 **Local dry-run flags, previews in the UI, read-only servers and costly bulk previews**

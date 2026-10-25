@@ -1103,7 +1103,13 @@ impl CommitGuard for ShexGuard {
         let live = c.opts.dry_run.is_none();
         // Replay predecessors are private transaction views. Their graph schema can
         // differ from the live cached model without any publication callback.
-        let model = if !live && !c.base.cacheable && self.cfg.schema.graphs.is_some() {
+        // Rebuilt candidates can use a post-log base that already contains this write's
+        // schema edits. Their old-model comparison must retain the committed cache.
+        let model = if !live
+            && !c.base.cacheable
+            && matches!(c.changes, Changes::Log(_))
+            && self.cfg.schema.graphs.is_some()
+        {
             c.opts.check()?;
             let loaded = load_graph_model(&self.cfg, c.base);
             c.opts.check()?;
@@ -1124,7 +1130,13 @@ impl CommitGuard for ShexGuard {
         } else {
             self.model()
         };
-        let (relevant, schema_changed) = self.relevant(&model, &c.view, &c.changes);
+        // A rebuild renumbers terms in its candidate. Its log and bulk IDs still
+        // belong to the pre-rebuild view, which contains every encoded input term.
+        let change_view = match c.changes {
+            Changes::Rebuilt { .. } => c.base,
+            _ => &c.view,
+        };
+        let (relevant, schema_changed) = self.relevant(&model, change_view, &c.changes);
         if schema_changed {
             return self.schema_write(c, &model, seq, live);
         }
