@@ -1341,6 +1341,20 @@ execution and one input row for each admitted case, with separate 64-row control
 finite produced budgets and an unmerged snapshot. This demand policy does not need
 to reorder index-probe branches or certify their estimated fanout.
 
+A broader execution check found that a filtered join with its first match at row nine
+rebuilt its thousand-row input three times under prefixes one, eight and sixty-four.
+The ordinary prefix built it once. Retrying operators now keep the ordinary prefix
+when their input would restart a full join build. Projections and constant bindings
+preserve exact demand so they do not drain additional UNION operands. The physical
+regression checks the same answer and one build in both cases, with result caching off.
+
+Additional data-oracle controls vary vocabulary, sizes, uniform and skewed keys,
+Unicode literals, duplicate solutions and updates while retaining old snapshots.
+They compare eager execution and cursor batches with independently enumerated answers.
+Pure UNION ASKs are checked against full SELECT answers for early, late and absent
+matches in both operand orders. These controls establish broader semantic coverage,
+without claiming that every workload becomes faster.
+
 ### Short-query checks after keyed inner groups
 
 The Namespace guard against `a5847311` used matching compiler signatures and returned

@@ -73,6 +73,40 @@ fn pure_union(ctx: &super::ctx::Ctx, node: &Node) -> bool {
 /// Only a wholly admitted pure ASK may reduce input demand. Subtree purity
 /// alone cannot rule out an effectful consumer outside that subtree.
 pub(super) fn limited_input(ctx: &super::ctx::Ctx, node: &Node) -> bool {
+    // A limited join builds one side in full on entry. An outer operator that
+    // retries smaller prefixes would rebuild that side each time. Keep the
+    // ordinary prefix for those inputs rather than multiplying their startup.
+    fn restarts_build(node: &Node, remaining: &mut usize) -> bool {
+        if *remaining == 0 {
+            return true;
+        }
+        *remaining -= 1;
+        match &node.kind {
+            Kind::Join { .. } | Kind::KeyedJoin { .. } => true,
+            // These either stream directly or finish in one call regardless of
+            // prefix. In particular VALUES and sorting do not trigger retries.
+            Kind::Scan(_) | Kind::Values(_) | Kind::Empty | Kind::Sort(_) => false,
+            _ => node.children.iter().any(|c| restarts_build(c, remaining)),
+        }
+    }
+
+    let retried = match &node.kind {
+        Kind::Filter(_) | Kind::IndexJoin(_) => node.children.first(),
+        Kind::Join { .. } if node.children.len() == 2 => {
+            // Match the limited executor's choice of the streamed input. Its
+            // other input is built once outside the retry loop.
+            let limited = if node.children[0].est >= node.children[1].est {
+                0
+            } else {
+                1
+            };
+            Some(&node.children[limited])
+        }
+        // Projection and constant BIND preserve rows, so a one-row child prefix
+        // already satisfies their demand. They must not drain more UNION arms.
+        _ => None,
+    };
+
     !ctx.is_cursor()
         && matches!(
             node.kind,
@@ -85,6 +119,7 @@ pub(super) fn limited_input(ctx: &super::ctx::Ctx, node: &Node) -> bool {
         && ctx
             .eager_union_demand
             .load(std::sync::atomic::Ordering::Relaxed)
+        && !retried.is_some_and(|c| restarts_build(c, &mut 128))
 }
 
 /// A prefix's live rows cannot exceed its covering base blocks and inserted keys.

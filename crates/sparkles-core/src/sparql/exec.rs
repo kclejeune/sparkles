@@ -8872,3 +8872,122 @@ mod string_cross_tests {
         assert!(peak <= 8 << 20);
     }
 }
+
+#[cfg(test)]
+mod limited_startup_tests {
+    use super::*;
+    use crate::io::{RdfFormat, Source};
+    use crate::store::{Store, StoreOptions};
+
+    fn unary(kind: Kind, child: Node, description: &str) -> Node {
+        let mut node = Node::leaf(kind, child.vars.clone(), child.est, description.into());
+        node.cost = child.cost;
+        node.children.push(child);
+        node
+    }
+
+    #[test]
+    fn admitted_ask_filters_do_not_restart_full_join_builds() {
+        let store = Store::in_memory(StoreOptions::default());
+        let data: String = (0..2000)
+            .map(|i| format!("<urn:record:{i:04}> <urn:key> <urn:bucket:0> .\n"))
+            .collect();
+        store
+            .load(&[Source::from_bytes(
+                data.into_bytes(),
+                RdfFormat::Turtle,
+                None,
+            )])
+            .unwrap();
+        let run = |reduced: bool| {
+            let mut ctx = Ctx::new(store.snapshot());
+            ctx.use_cache = false;
+            let subject = ctx.var("subject");
+            let key = ctx.var("key");
+            let target = ctx.var("target");
+            let term = |text: &str| ctx.intern_term(&oxrdf::NamedNode::new(text).unwrap().into());
+            let predicate = term("urn:key");
+            let witness = term("urn:record:0008");
+            let scan = Node::leaf(
+                Kind::Scan(ScanSpec {
+                    perm: Perm::Pso,
+                    prefix: vec![predicate.0],
+                    cols: vec![(1, subject), (2, key)],
+                    eqs: Vec::new(),
+                    graph: GraphFilter::Default,
+                    graph_col: 3,
+                    dedup: false,
+                    src: None,
+                }),
+                vec![subject, key],
+                2000.0,
+                "driving scan".into(),
+            );
+            let mut values = Table::new(vec![key, target]);
+            for i in 0..1000 {
+                values.push_row(&[term(&format!("urn:bucket:{i}")), witness]);
+            }
+            let build = Node::leaf(
+                Kind::Values(values),
+                vec![key, target],
+                1000.0,
+                "full build".into(),
+            );
+            let mut joined = Node::leaf(
+                Kind::Join {
+                    algo: JoinAlgo::Hash,
+                    keys: vec![key],
+                },
+                vec![subject, key, target],
+                2000.0,
+                "hash join".into(),
+            );
+            joined.children = vec![scan, build];
+            joined.cost = 6000.0;
+            let mut filtered = unary(
+                Kind::Filter(vec![Expr::SameTerm(
+                    Box::new(Expr::Var(subject)),
+                    Box::new(Expr::Var(target)),
+                )]),
+                joined,
+                "matching both inputs",
+            );
+            filtered.est = 1.0;
+            let mut union =
+                Node::leaf(Kind::Union, filtered.vars.clone(), 1.0, "pure union".into());
+            union.cost = filtered.cost;
+            union.children = vec![filtered, Node::empty(vec![subject, key, target])];
+            let mut root = unary(
+                Kind::Slice {
+                    offset: 0,
+                    limit: Some(1),
+                },
+                union,
+                "ASK demand",
+            );
+            super::super::unionpush::order_ask(&ctx, &mut root);
+            assert!(ctx.eager_union_demand.load(AtomicOrdering::Relaxed));
+            if !reduced {
+                ctx.eager_union_demand.store(false, AtomicOrdering::Relaxed);
+            }
+            let (output, plan) = execute(&ctx, &root).unwrap();
+            assert_eq!(output.len(), 1);
+            assert_eq!(output.cols[0][0], witness);
+            fn find_build(p: &PlanInfo) -> Option<&PlanInfo> {
+                if p.operator == "Values" && p.description == "full build" {
+                    return Some(p);
+                }
+                p.children.iter().find_map(find_build)
+            }
+            let build = find_build(&plan).unwrap();
+            assert_eq!(build.actual_rows, 1000);
+            build.fidelity().reruns + 1
+        };
+        assert_eq!(run(false), 1, "ordinary prefixes build the input once");
+        assert_eq!(
+            run(true),
+            1,
+            "reduced filter demand must not rebuild full inputs"
+        );
+    }
+}
