@@ -140,6 +140,53 @@ impl Config {
     }
 }
 
+/// Publish one transaction and record its receipt for replay against every crash image.
+fn child_commit(
+    s: &Store,
+    ack: &Mutex<std::fs::File>,
+    out: &Mutex<Vec<String>>,
+    begin: Option<&Mutex<std::fs::File>>,
+    t: u32,
+    k: u32,
+) -> bool {
+    if let Some(begin) = begin {
+        let mut rec = [0u8; 8];
+        rec[..4].copy_from_slice(&t.to_le_bytes());
+        rec[4..].copy_from_slice(&k.to_le_bytes());
+        begin.lock().unwrap().write_all(&rec).unwrap();
+    }
+    // every commit has a message, so the annotation of each acknowledged
+    // commit is checked after the crash
+    let mut w = s.write_with(
+        CommitKind::Update,
+        sparkles_core::guard::WriteOptions {
+            message: Some(message(t, k).into()),
+            ..Default::default()
+        },
+    );
+    // a transaction that begins on a poisoned store may already fail here
+    let staged = w
+        .encode_quad(&quad(t, k), &mut Default::default())
+        .and_then(|ids| w.insert(ids));
+    match staged.and_then(|_| w.commit()) {
+        Ok(r) => {
+            let mut rec = [0u8; 16];
+            rec[..8].copy_from_slice(&r.commit.seq.to_le_bytes());
+            rec[8..12].copy_from_slice(&t.to_le_bytes());
+            rec[12..].copy_from_slice(&k.to_le_bytes());
+            ack.lock().unwrap().write_all(&rec).unwrap();
+            out.lock()
+                .unwrap()
+                .push(format!("ok {t} {k} {}", r.commit.seq));
+        }
+        Err(e) => {
+            out.lock().unwrap().push(format!("err {t} {k} {e}"));
+            return false;
+        }
+    }
+    true
+}
+
 /// The writer process: `threads` threads make `commits` commits each. A thread writes an
 /// acknowledgement record to the ack file after each receipt, and stops at the first
 /// error. Prints one line per commit (`ok THREAD K SEQ` or `err THREAD K MESSAGE`) and the
@@ -189,10 +236,9 @@ fn child_writer() {
     if let Ok(arm) = std::env::var("SPARKLES_IO_ARM") {
         std::fs::write(arm, b"armed").unwrap();
     }
-    // In background mode merges are stopped, since a merge writes without the live
-    // writer lock and could race every locked pass, and the writers go on past their
-    // commits until a locked pass has cleared the marker, so that the images cover the
-    // marker removal of such a pass.
+    // The fixed workload exercises concurrent publication during sync. A separate
+    // bounded phase below forces the raced passes and a locked marker removal. Stop
+    // merges and the timer so only the fixture drives that phase.
     #[cfg(all(feature = "text", feature = "failpoints"))]
     if background {
         // the index opens in the background, and a writer replaced later would merge
@@ -205,26 +251,14 @@ fn child_writer() {
             std::thread::sleep(std::time::Duration::from_millis(5));
         }
         s.stop_text_merges_for_test();
-    }
-    fn locked_cleared(_s: &Store) -> bool {
-        #[cfg(all(feature = "text", feature = "failpoints"))]
-        {
-            _s.text_background_checkpoints_for_test()[1] > 0
-        }
-        #[cfg(not(all(feature = "text", feature = "failpoints")))]
-        {
-            true
-        }
+        s.set_text_ticks(false);
     }
     let out = Arc::new(Mutex::new(Vec::<String>::new()));
     let mut hs = Vec::new();
     for t in 1..=cfg.threads {
         let (s, ack, out, begin) = (s.clone(), ack.clone(), out.clone(), begin.clone());
         hs.push(std::thread::spawn(move || {
-            let more = |k: u32| {
-                k < cfg.commits || (background && k < cfg.commits * 10 && !locked_cleared(&s))
-            };
-            for k in (0..).take_while(|&k| more(k)) {
+            for k in 0..cfg.commits {
                 let designated = background && t == 1 && k == 0;
                 if designated {
                     let entered = PathBuf::from(std::env::var("SPARKLES_IO_SYNC_ENTERED").unwrap());
@@ -237,50 +271,15 @@ fn child_writer() {
                         std::thread::sleep(std::time::Duration::from_millis(1));
                     }
                 }
-                if let Some(begin) = &begin {
-                    let mut rec = [0u8; 8];
-                    rec[..4].copy_from_slice(&t.to_le_bytes());
-                    rec[4..].copy_from_slice(&k.to_le_bytes());
-                    begin.lock().unwrap().write_all(&rec).unwrap();
+                if !child_commit(&s, &ack, &out, begin.as_deref(), t, k) {
+                    return;
                 }
-                // every commit has a message, so the annotation of each acknowledged
-                // commit is checked after the crash
-                let mut w = s.write_with(
-                    CommitKind::Update,
-                    sparkles_core::guard::WriteOptions {
-                        message: Some(message(t, k).into()),
-                        ..Default::default()
-                    },
-                );
-                // a transaction that begins on a poisoned store may already fail here
-                let staged = w
-                    .encode_quad(&quad(t, k), &mut Default::default())
-                    .and_then(|ids| w.insert(ids));
-                match staged.and_then(|_| w.commit()) {
-                    Ok(r) => {
-                        let mut rec = [0u8; 16];
-                        rec[..8].copy_from_slice(&r.commit.seq.to_le_bytes());
-                        rec[8..12].copy_from_slice(&t.to_le_bytes());
-                        rec[12..].copy_from_slice(&k.to_le_bytes());
-                        ack.lock().unwrap().write_all(&rec).unwrap();
-                        out.lock()
-                            .unwrap()
-                            .push(format!("ok {t} {k} {}", r.commit.seq));
-                        if designated {
-                            std::fs::write(
-                                std::env::var("SPARKLES_IO_SYNC_RELEASE").unwrap(),
-                                b"1",
-                            )
-                            .unwrap();
-                            out.lock()
-                                .unwrap()
-                                .push("background-gate-released 1 0".into());
-                        }
-                    }
-                    Err(e) => {
-                        out.lock().unwrap().push(format!("err {t} {k} {e}"));
-                        return;
-                    }
+                if designated {
+                    std::fs::write(std::env::var("SPARKLES_IO_SYNC_RELEASE").unwrap(), b"1")
+                        .unwrap();
+                    out.lock()
+                        .unwrap()
+                        .push("background-gate-released 1 0".into());
                 }
             }
         }));
@@ -353,6 +352,81 @@ fn child_writer() {
     #[cfg(feature = "text")]
     if let Some(r) = reader {
         r.join().unwrap();
+    }
+    #[cfg(all(feature = "text", feature = "failpoints"))]
+    if background {
+        use std::sync::atomic::{AtomicU32, Ordering};
+        let query = || {
+            sparkles_core::sparql::query(
+                s.snapshot(),
+                "PREFIX text:<http://jena.apache.org/text#> \
+                 SELECT (COUNT(*) AS ?n) { ?s text:query \"value\" }",
+                &Default::default(),
+            )
+            .unwrap();
+        };
+        // No writer or reader remains. A search commits the last queued additions,
+        // and a quiescent background pass clears any earlier raced-pass count.
+        query();
+        if s.checkpoint_text_background_for_test() {
+            checkpoints.fetch_add(1, Ordering::Relaxed);
+        }
+        let before = s.text_background_checkpoints_for_test();
+        let t = cfg.threads + 1;
+        assert!(child_commit(&s, &ack, &out, begin.as_deref(), t, 0));
+        query();
+        let next = Arc::new(AtomicU32::new(1));
+        let (hook_store, hook_ack, hook_out, hook_begin, hook_next) = (
+            s.clone(),
+            ack.clone(),
+            out.clone(),
+            begin.clone(),
+            next.clone(),
+        );
+        s.set_text_checkpoint_hook_for_test(Some(Arc::new(move || {
+            let k = hook_next.fetch_add(1, Ordering::Relaxed);
+            assert!(child_commit(
+                &hook_store,
+                &hook_ack,
+                &hook_out,
+                hook_begin.as_deref(),
+                t,
+                k,
+            ));
+            // add_document queues work on a Tantivy thread. Searching commits it
+            // before returning, so no queued worker can race the later locked pass.
+            sparkles_core::sparql::query(
+                hook_store.snapshot(),
+                "PREFIX text:<http://jena.apache.org/text#> \
+                 SELECT (COUNT(*) AS ?n) { ?s text:query \"value\" }",
+                &Default::default(),
+            )
+            .unwrap();
+        })));
+        for _ in 0..4 {
+            assert!(s.checkpoint_text_background_for_test());
+            checkpoints.fetch_add(1, Ordering::Relaxed);
+        }
+        s.set_text_checkpoint_hook_for_test(None);
+        let after = s.text_background_checkpoints_for_test();
+        assert_eq!(after[0] - before[0], 1, "one actual locked pass must run");
+        assert_eq!(
+            after[1] - before[1],
+            1,
+            "the locked pass must clear the marker"
+        );
+        assert_eq!(
+            next.load(Ordering::Relaxed),
+            9,
+            "four raced ticks and four catch-up passes"
+        );
+        std::fs::write(
+            PathBuf::from(std::env::var("SPARKLES_PL_ACK").unwrap())
+                .with_file_name("locked-cleared"),
+            b"1",
+        )
+        .unwrap();
+        println!("LINE background-forced 8 1");
     }
     #[cfg(feature = "text")]
     if background {
@@ -1278,6 +1352,10 @@ fn crash_images(name: &str, cfg: Config, text: bool, background: bool) {
             .expect("the writer must report its background checkpoint attempts");
         assert!(count > 0, "{name}: no background checkpoint ran");
         assert!(
+            run.lines.iter().any(|line| line == "background-forced 8 1"),
+            "{name}: the bounded phase did not race every unlocked pass and clear a locked pass"
+        );
+        assert!(
             run.lines
                 .iter()
                 .any(|line| line == "background-gate-released 1 0"),
@@ -1298,8 +1376,8 @@ fn crash_images(name: &str, cfg: Config, text: bool, background: bool) {
         );
         // Every pass synchronizes only the files written since a pass last synchronized
         // them, so the images after a pass cleared the marker check that nothing the
-        // index refers to was left out. The reader's commits race the unlocked passes, so
-        // a locked pass runs, and with merges stopped nothing can race it.
+        // index refers to was left out. The bounded phase commits and drains one fresh
+        // transaction during every unlocked pass, then the locked pass clears the marker.
         assert!(
             locked_cleared > 0 && cleared >= locked_cleared,
             "{name}: {locked} locked passes cleared the marker {locked_cleared} times"
@@ -1331,7 +1409,11 @@ fn crash_images(name: &str, cfg: Config, text: bool, background: bool) {
             acked.push((seq, t, k));
         }
         model.apply(rec);
-        if i % stride != 0 && i + 1 != log.len() {
+        // Always check the clean state just after the forced locked pass, even when
+        // the evenly spaced crash points miss this short phase at the end of the run.
+        let locked_cleared =
+            matches!(rec, Rec::Write { path, .. } if path.ends_with("/locked-cleared"));
+        if i % stride != 0 && i + 1 != log.len() && !locked_cleared {
             continue;
         }
         let what = format!("{name}: crash after record {i} of {}", log.len());

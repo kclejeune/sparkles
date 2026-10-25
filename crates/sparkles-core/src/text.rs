@@ -1530,6 +1530,8 @@ mod imp {
         /// marker, and background passes of any kind that cleared it, for the crash tests
         #[cfg(feature = "failpoints")]
         background_passes: [AtomicU64; 3],
+        #[cfg(feature = "failpoints")]
+        before_unlocked_checkpoint: Mutex<Option<Arc<dyn Fn() + Send + Sync>>>,
         #[cfg(test)]
         before_install_checkpoint: Mutex<Option<Box<dyn FnOnce() + Send>>>,
         /// the quads of the commits since an online rebuild's snapshot, while one runs
@@ -2354,6 +2356,8 @@ mod imp {
             after_checkpoint_io: Mutex::new(None),
             #[cfg(feature = "failpoints")]
             background_passes: Default::default(),
+            #[cfg(feature = "failpoints")]
+            before_unlocked_checkpoint: Mutex::new(None),
             #[cfg(test)]
             before_install_checkpoint: Mutex::new(None),
             journal: Default::default(),
@@ -2614,7 +2618,7 @@ mod imp {
             self.inner.checkpoint()
         }
 
-        /// Drive the real background checkpoint without waiting for its timer. This
+        /// Drive the real background checkpoint even with its timer paused. This
         /// only ages existing dirty work; it does not stage or publish documents.
         #[cfg(feature = "failpoints")]
         pub(crate) fn checkpoint_background_for_test(&self) -> bool {
@@ -2624,11 +2628,22 @@ mod imp {
                     live.dirty_since = Some(Instant::now() - CHECKPOINT_AFTER);
                 }
             }
-            self.inner.tick()
+            self.inner.tick_due()
         }
 
-        /// Stop the live writer's segment merges, whose writes race a locked pass, so
-        /// that a crash test can count on such a pass clearing the marker.
+        /// Race the next unlocked checkpoint passes after their snapshots, without
+        /// holding live. The test must pause the timer and run only one checkpoint
+        /// driver, because its callback can acquire live while holding the path lease.
+        #[cfg(feature = "failpoints")]
+        pub(crate) fn set_checkpoint_hook_for_test(
+            &self,
+            hook: Option<Arc<dyn Fn() + Send + Sync>>,
+        ) {
+            *self.inner.before_unlocked_checkpoint.lock() = hook;
+        }
+
+        /// Stop the live writer's segment merges. Queued indexing work can still race
+        /// a locked pass until the test commits it.
         #[cfg(feature = "failpoints")]
         pub(crate) fn stop_merges_for_test(&self) {
             if let Some(writer) = self.inner.live.lock().writer.as_ref() {
@@ -3367,7 +3382,13 @@ mod imp {
         /// The tick: seal and settle what the last second staged, and checkpoint an
         /// index that has held unsynced commits for a second.
         fn tick(&self) -> bool {
-            if !self.ticks.load(Ordering::SeqCst) || !self.healthy() {
+            self.ticks.load(Ordering::SeqCst) && self.tick_due()
+        }
+
+        /// The due checkpoint body, also driven explicitly with the timer paused by
+        /// the crash fixture. Both drivers use the same pass and publication logic.
+        fn tick_due(&self) -> bool {
+            if !self.healthy() {
                 return false;
             }
             let mut live = self.live.lock();
@@ -3400,6 +3421,8 @@ mod imp {
             drop(live);
             // File syncing can wait for many journal commits. Publication needs live,
             // so keep only the pathname lease during this background I/O.
+            #[cfg(feature = "failpoints")]
+            let checkpoint = checkpoint.on_sync(self.before_unlocked_checkpoint.lock().clone());
             let io = Instant::now();
             let result = checkpoint.run();
             let io = io.elapsed();
@@ -3447,6 +3470,9 @@ mod imp {
                         let generation = live.commit_generation;
                         let checkpoint = dir.prepare_checkpoint();
                         drop(live);
+                        #[cfg(feature = "failpoints")]
+                        let checkpoint =
+                            checkpoint.on_sync(self.before_unlocked_checkpoint.lock().clone());
                         let io = Instant::now();
                         let result = checkpoint.run();
                         let io = io.elapsed();
