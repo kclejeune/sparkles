@@ -1215,8 +1215,28 @@ Adversarial coverage exercises native ASK at batch sizes one, seven and 4096, em
 disjoint inputs, late matches after EOF, graph-discounted estimates, value-equality
 errors, unbound values, cancellation, deadlines and resource limits. Singleton tests
 cover graph scope, duplicate solutions, RDF term identity, blank nodes, numeric bounds,
-OPTIONAL, subqueries, paths, EXISTS and snapshots with a delta. Published comparison
-refreshes remain under roadmap item 91.
+OPTIONAL, subqueries, paths, EXISTS and snapshots with a delta. The paired comparisons
+are recorded below. Roadmap item 91 retains the remaining `q12b` cost.
+
+### Matched query comparisons
+
+The paired forge record for `2ec8a266` compares Jena and Oxigraph on the SP²Bench ASKs,
+and QLever and Fluree on BSBM BI `q2` and Explore `q5`. Each engine ran alone, first
+with five warm-ups and twenty timed requests, then in reverse engine order with ten
+warm-ups and thirty requests. The input hashes and pinned engine binaries match the
+published suites. The [record](../benchmarks/2026-10-25-competitive-query-pairs-forge.json)
+keeps both passes and the answer fingerprints.
+
+Sparkles answers `q12a` in a mean of 3.8 ms against Jena's 9.0 ms. Its pooled median
+on BI `q2` is 20.54 ms against QLever's 162.30 ms, and on Explore `q5` it is 4.65 ms
+against Fluree's 5.59 ms. The closest Explore `q5` instance is within 4% of Fluree.
+A separate streamed data oracle derives the BI `q2` counts from feature-set
+intersections and Product membership. All three ordered answers agree with it, and
+their pooled fingerprint is the published Sparkles answer fingerprint.
+
+`q12b` remains slower than Oxigraph, at 5.0 ms against 3.8 ms, and stays open under
+roadmap item 91. LUBM `q2` probe fanout and serial durable commit overhead remain open
+under item 290. The write work retains synchronization before acknowledgement.
 
 ### Short-query checks after keyed inner groups
 
