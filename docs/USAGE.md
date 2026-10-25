@@ -2913,6 +2913,9 @@ worker and drawn with WebGL, so it settles while the page stays responsive. The 
 box stays at the top: a resource found there, or an IRI pasted into it, opens the
 resource graph as before.
 
+Resource captions prefer RDF labels. Without a label, the graph and details use the
+dataset's prefixes to shorten the IRI and update when those prefixes finish loading.
+
 A click or a tap on a class opens it in place. A class of at most 5,000 instances opens
 into its members with their links. A larger class opens into the communities that a
 graph algorithm run wrote back ([Graph algorithms](#graph-algorithms)), when its

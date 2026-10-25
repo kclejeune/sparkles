@@ -78,7 +78,8 @@
     id: string;
     term: Term;
     iri: string;
-    label: string;
+    /** An explicit RDF label. Fallback captions follow the current dataset prefixes. */
+    label?: string;
     expanded: boolean;
     lit: boolean;
   };
@@ -231,7 +232,7 @@
     const sid = termKey(r.focus);
     // a node the path finder drew joins the graph, so that its triples can be drawn
     const drawnNode = gNodes.find((n) => n.id === sid && n.change !== 'removed');
-    if (!nodes[sid] && drawnNode) ensureNode(r.focus, drawnNode.label);
+    if (!nodes[sid] && drawnNode) ensureNode(r.focus, pathLabels.get(sid));
     const out = { nodes: nodes[sid] ? [sid] : [], edges: [] as string[] };
     const shown = () => {
       // paths alone hide the explored graph, but not the triples of a result
@@ -568,7 +569,7 @@
   const gNodes = $derived.by((): GNode[] => {
     const toG = (n: ENode, change?: 'added' | 'removed'): GNode => ({
       id: n.id,
-      label: n.label,
+      label: labelFor(n.term, n.label),
       kind: n.term.type === 'uri' ? 'iri' : n.term.type,
       title: n.term.type === 'uri' ? n.term.value : undefined,
       focus: n.id === focusId,
@@ -614,12 +615,17 @@
       .filter(keep)
       .map((e) => ({
         ...e,
+        label: e.title ? shortLabel(e.title, prefixes) : e.label,
         triple: tripleOf(e),
         ...(changes?.addedEdges.has(e.id) ? { change: 'added' as const } : {}),
       }));
     const ghosts = Object.values(changes?.ghostEdges ?? {})
       .filter(keep)
-      .map((e) => ({ ...e, change: 'removed' as const }));
+      .map((e) => ({
+        ...e,
+        label: e.title ? shortLabel(e.title, prefixes) : e.label,
+        change: 'removed' as const,
+      }));
     if (!pathOverlay) return [...real, ...ghosts];
     const on = new Map(pathOverlay.edges.map((e) => [e.id, e]));
     const drawn = pathsAlone ? real.filter((e) => vShown.has(e.id)) : [...real, ...ghosts];
@@ -719,7 +725,7 @@
 
   const pickedOf = (id: string): Picked | null => {
     const n = nodes[id];
-    return n && n.term.type === 'uri' ? { term: n.term, label: n.label } : null;
+    return n && n.term.type === 'uri' ? { term: n.term, label: labelFor(n.term, n.label) } : null;
   };
 
   function openPaths(opts: { from?: string; to?: string } = {}) {
@@ -835,7 +841,10 @@
         .filter((e) => e.change !== 'removed')
         .map((e) => ({ id: e.id, source: e.source, target: e.target, triple: e.triple })),
       reasoning: hasReasoning,
-      label: (id) => nodes[id]?.label ?? id,
+      label: (id) => {
+        const n = nodes[id];
+        return n ? labelFor(n.term, n.label) : id;
+      },
       short: (iri) => shortLabel(iri, prefixes),
       // the left handle of a comparison in time, not one against another branch (§4.3)
       compareAt: graphTimeOpen && exCompare && exFrom && !exAgainst ? exFrom : undefined,
@@ -936,7 +945,7 @@
       id,
       term,
       iri: term.type === 'uri' ? term.value : '',
-      label: labelFor(term, label),
+      label,
       expanded: false,
       lit: term.type === 'literal',
     };
@@ -1015,7 +1024,7 @@
         );
       }
     } catch (e) {
-      if (!stale() && !isAbort(e)) toasts.error(`Could not expand ${n.label}`, e);
+      if (!stale() && !isAbort(e)) toasts.error(`Could not expand ${labelFor(n.term, n.label)}`, e);
     } finally {
       if (expanding[id] === gen) delete expanding[id];
     }
@@ -1087,7 +1096,6 @@
         id: g.id,
         term: g.term,
         iri: g.term.type === 'uri' ? g.term.value : '',
-        label: labelFor(g.term),
         expanded: false,
         lit,
       };
@@ -1162,7 +1170,7 @@
       }
       for (const [id, n] of Object.entries(nodes)) {
         const kept = keepLabels.get(id);
-        if (kept && n.term.type === 'uri' && n.label === labelFor(n.term)) n.label = kept;
+        if (kept && n.term.type === 'uri' && !n.label) n.label = kept;
       }
       await markChanges(owns, signal);
       if (!owns()) return;
@@ -2579,7 +2587,7 @@
             {@const n = selected}
             <div class="side-head">
               <div class="side-title">
-                <h2 title={n.label}>{n.label}</h2>
+                <h2 title={labelFor(n.term, n.label)}>{labelFor(n.term, n.label)}</h2>
                 {#if n.term.type === 'uri'}
                   <button class="iri-line mono" onclick={() => copy(n.iri)} title="Copy IRI">
                     {n.iri}
@@ -2735,7 +2743,7 @@
                     {ds}
                     iri={n.iri}
                     {prefixes}
-                    title={n.label}
+                    title={labelFor(n.term, n.label)}
                     oncancel={() => (editing = false)}
                     onsaved={() => formSaved(n.id)}
                     ondraft={() => (draftOpen = true)}
