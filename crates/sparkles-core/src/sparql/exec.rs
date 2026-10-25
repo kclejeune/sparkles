@@ -626,6 +626,7 @@ fn node_refs(ctx: &Ctx, n: &Node) -> Option<Box<PlanRefs>> {
             | Kind::CountJoinRuns { .. }
             | Kind::LeftJoin { .. }
             | Kind::KeyedLeftJoin { .. }
+            | Kind::KeyedJoin { .. }
             | Kind::Minus
             | Kind::HalfJoin { .. }
                 if n.children.len() == 2 =>
@@ -663,6 +664,7 @@ fn node_refs(ctx: &Ctx, n: &Node) -> Option<Box<PlanRefs>> {
         | Kind::CountJoinRuns { .. }
         | Kind::LeftJoin { .. }
         | Kind::KeyedLeftJoin { .. }
+        | Kind::KeyedJoin { .. }
         | Kind::Minus
         | Kind::HalfJoin { .. }
         | Kind::PatternCount(_)
@@ -1147,6 +1149,13 @@ fn run_node(
             let l = child(0, infos)?;
             let r = child(1, infos)?;
             keyed_left_join(ctx, &l, &r, expr, (*left, *right), &mut note)?
+        }
+        Kind::KeyedJoin {
+            expr, left, right, ..
+        } => {
+            let l = child(0, infos)?;
+            let r = child(1, infos)?;
+            keyed_join(ctx, &l, &r, expr, (*left, *right), false, &mut note)?
         }
         Kind::Minus => {
             let l = child(0, infos)?;
@@ -2712,7 +2721,7 @@ fn run_limited(
                 budget = budget.saturating_mul(8);
             }
         }
-        Kind::Join { algo, .. } => {
+        Kind::Join { .. } | Kind::KeyedJoin { .. } => {
             // limit the (estimated) larger side, compute the other one fully
             let lim = if n.children[0].est >= n.children[1].est {
                 0
@@ -2767,10 +2776,16 @@ fn run_limited(
                 } else {
                     (&other, &part)
                 };
-                let out = match algo {
-                    JoinAlgo::Cross => cross(ctx, l, r)?,
-                    JoinAlgo::Merge => join_tables(ctx, l, r, &[], true)?,
-                    JoinAlgo::Hash => join_tables(ctx, l, r, &[], false)?,
+                let out = match &n.kind {
+                    Kind::Join { algo, .. } => match algo {
+                        JoinAlgo::Cross => cross(ctx, l, r)?,
+                        JoinAlgo::Merge => join_tables(ctx, l, r, &[], true)?,
+                        JoinAlgo::Hash => join_tables(ctx, l, r, &[], false)?,
+                    },
+                    Kind::KeyedJoin {
+                        expr, left, right, ..
+                    } => keyed_join(ctx, l, r, expr, (*left, *right), false, &mut None)?,
+                    _ => unreachable!("limited inner join"),
                 };
                 if out.len() >= want || complete {
                     let infos = if lim == 0 {
@@ -2844,7 +2859,7 @@ fn run_limited(
 }
 
 /// Scan with an optional row limit; returns `(table, truncated)`.
-fn scan_limited(
+pub(super) fn scan_limited(
     ctx: &Ctx,
     spec: &ScanSpec,
     vars: &[VarId],
@@ -4828,32 +4843,53 @@ fn append_unmatched(l: &Table, joined: &mut Table, matched: &[bool]) {
 const KEYED_CHUNK: usize = 1 << 16;
 
 /// OPTIONAL keyed on its condition's conjunct `?a = ?b` (see [`Kind::KeyedLeftJoin`]).
-/// `=` holds between two different ids only when neither is an IRI or a blank node, as
-/// `val_eq` decides it. A left row whose value is an IRI or a blank node therefore meets
-/// only the right rows with the same id. A left row with another value meets every right
-/// row whose value is bound and is neither an IRI nor a blank node. An unbound value
-/// meets no row, because `=` raises an error on it and the conjunction cannot hold. The
-/// whole condition is tested on the candidate pairs a chunk at a time, so neither the
-/// product nor the candidate pairs are held at once.
 pub(super) fn keyed_left_join(
     ctx: &Ctx,
     l: &Table,
     r: &Table,
     expr: &Expr,
-    (a, b): (VarId, VarId),
+    keys: (VarId, VarId),
     note: &mut Option<String>,
 ) -> Result<Table> {
-    use super::ctx::TermKind;
+    keyed_join(ctx, l, r, expr, keys, true, note)
+}
+
+/// A join keyed on the conjunct `?a = ?b` of its condition `expr`, an OPTIONAL when
+/// `optional` is set ([`Kind::KeyedLeftJoin`]) and an inner join otherwise
+/// ([`Kind::KeyedJoin`]). Each value gets a candidate key ([`super::eqkey`]): a left row
+/// meets the right rows with the same key, a loose value meets every loose value, and an
+/// unbound value meets no row, because `=` raises an error on it and the conjunction
+/// cannot hold. The whole condition is tested on the candidate pairs a chunk at a time,
+/// so neither the product nor the candidate pairs are held at once.
+fn keyed_join(
+    ctx: &Ctx,
+    l: &Table,
+    r: &Table,
+    expr: &Expr,
+    (a, b): (VarId, VarId),
+    optional: bool,
+    note: &mut Option<String>,
+) -> Result<Table> {
+    use super::eqkey::{EqKey, eq_key};
     let lay = layout(l, r);
+    let generic = |note: &mut Option<String>| {
+        if optional {
+            left_join(ctx, l, r, Some(expr), note)
+        } else {
+            let mut t = cross(ctx, l, r)?;
+            let keep = left_filter(ctx, &t, expr);
+            t.filter_rows(&keep);
+            Ok(t)
+        }
+    };
     let (Some(lc), Some(rc)) = (l.col_of(a), r.col_of(b)) else {
-        return left_join(ctx, l, r, Some(expr), note);
+        return generic(note);
     };
     if !lay.shared.is_empty() {
-        return left_join(ctx, l, r, Some(expr), note);
+        return generic(note);
     }
-    let atomic = |id: Id| matches!(ctx.kind(id), TermKind::Iri | TermKind::BNode);
-    // The right rows by value: IRIs and blank nodes sorted by id, other bound values in
-    // row order. Both are charged before they are allocated, the second for its growth.
+    // The right rows by key, sorted, and the rows of loose values in row order. Both are
+    // charged before they are allocated, the second for its growth.
     let _index = ctx.charge((r.len() as u64).saturating_mul(16 + 8))?;
     let mut keyed: Vec<(Id, u32)> = Vec::with_capacity(r.len());
     let mut loose: Vec<u32> = Vec::new();
@@ -4861,13 +4897,10 @@ pub(super) fn keyed_left_join(
         if j % 65536 == 0 {
             ctx.check()?;
         }
-        if v.is_undef() {
-            continue;
-        }
-        if atomic(v) {
-            keyed.push((v, j as u32));
-        } else {
-            loose.push(j as u32);
+        match eq_key(ctx, v)? {
+            EqKey::Unbound => {}
+            EqKey::Key(k) => keyed.push((k, j as u32)),
+            EqKey::Loose => loose.push(j as u32),
         }
     }
     keyed.sort_unstable();
@@ -4885,7 +4918,11 @@ pub(super) fn keyed_left_join(
             .saturating_mul(per_pair)
             .saturating_add(l.len() as u64),
     )?;
-    let mut matched = vec![false; l.len()];
+    let mut matched = if optional {
+        vec![false; l.len()]
+    } else {
+        Vec::new()
+    };
     let mut out = Table::new(lay.vars.clone());
     let mut chunk: Vec<(u32, u32)> = Vec::with_capacity(cap);
     let mut candidates = 0u64;
@@ -4895,9 +4932,11 @@ pub(super) fn keyed_left_join(
             ctx.check_output(out.len().saturating_add(chunk.len()), w)?;
             let mut joined = materialize(l, r, &lay, chunk);
             let keep = left_filter(ctx, &joined, expr);
-            for (k, &(i, _)) in keep.iter().zip(chunk.iter()) {
-                if *k {
-                    matched[i as usize] = true;
+            if optional {
+                for (k, &(i, _)) in keep.iter().zip(chunk.iter()) {
+                    if *k {
+                        matched[i as usize] = true;
+                    }
                 }
             }
             joined.filter_rows(&keep);
@@ -4909,28 +4948,27 @@ pub(super) fn keyed_left_join(
         if i % 4096 == 0 {
             ctx.check()?;
         }
-        if v.is_undef() {
-            continue;
-        }
-        if atomic(v) {
-            let s = keyed.partition_point(|&(k, _)| k < v);
-            for &(k, j) in &keyed[s..] {
-                if k != v {
-                    break;
+        let rows: &[u32] = match eq_key(ctx, v)? {
+            EqKey::Unbound => continue,
+            EqKey::Key(k) => {
+                let s = keyed.partition_point(|&(x, _)| x < k);
+                let e = s + keyed[s..].partition_point(|&(x, _)| x == k);
+                for &(_, j) in &keyed[s..e] {
+                    chunk.push((i as u32, j));
+                    if chunk.len() >= cap {
+                        candidates += chunk.len() as u64;
+                        flush(&mut chunk, &mut out, &mut matched)?;
+                    }
                 }
-                chunk.push((i as u32, j));
-                if chunk.len() >= cap {
-                    candidates += chunk.len() as u64;
-                    flush(&mut chunk, &mut out, &mut matched)?;
-                }
+                continue;
             }
-        } else {
-            for &j in &loose {
-                chunk.push((i as u32, j));
-                if chunk.len() >= cap {
-                    candidates += chunk.len() as u64;
-                    flush(&mut chunk, &mut out, &mut matched)?;
-                }
+            EqKey::Loose => &loose,
+        };
+        for &j in rows {
+            chunk.push((i as u32, j));
+            if chunk.len() >= cap {
+                candidates += chunk.len() as u64;
+                flush(&mut chunk, &mut out, &mut matched)?;
             }
         }
     }
@@ -4938,7 +4976,9 @@ pub(super) fn keyed_left_join(
         candidates += chunk.len() as u64;
         flush(&mut chunk, &mut out, &mut matched)?;
     }
-    append_unmatched(l, &mut out, &matched);
+    if optional {
+        append_unmatched(l, &mut out, &matched);
+    }
     ctx.check_output(out.len(), lay.vars.len())?;
     *note = Some(format!(
         "[keyed on ?{} = ?{}: {} candidate pairs]",

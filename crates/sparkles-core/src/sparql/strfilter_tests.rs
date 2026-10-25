@@ -408,10 +408,20 @@ fn counts_from_runs_are_chosen_and_explained() {
     let q = "SELECT ?s WHERE { ?s ex:v ?v FILTER(REGEX(?v, \"^Ab\")) }";
     let r = run(&s, q, Optimizations::ALL);
     assert!(has_desc(&r.plan, "in 3 key ranges"), "{:#?}", r.plan);
-    // a generic expression is evaluated per value
+    // Length comparisons use vocabulary keys too.
     let q = "SELECT (COUNT(*) AS ?c) WHERE { ?s ex:v ?v FILTER(STRLEN(STR(?v)) > 3) }";
     let r = run(&s, q, Optimizations::ALL);
+    assert!(
+        has_desc(&r.plan, "values tested on vocabulary keys"),
+        "{:#?}",
+        r.plan
+    );
+    // A wrapper outside the key-filter matcher still exercises generic per-value
+    // evaluation, with the same answer as scalar execution.
+    let q = "SELECT (COUNT(*) AS ?c) WHERE { ?s ex:v ?v FILTER(ABS(STRLEN(STR(?v))) > 3) }";
+    let r = run(&s, q, Optimizations::ALL);
     assert!(has_desc(&r.plan, "values tested, "), "{:#?}", r.plan);
+    assert_eq!(solutions(&r), solutions(&run(&s, q, Optimizations::NONE)));
     // not over two variables, an impure expression or EXISTS, nor when switched off
     for q in [
         "SELECT (COUNT(*) AS ?c) WHERE { ?s ex:v ?v FILTER(CONTAINS(?v, \"b\") && ?s != ex:s1) }",
