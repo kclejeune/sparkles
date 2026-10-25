@@ -1,5 +1,5 @@
 {
- "record": 2,
+ "record": 3,
  "suite": "bsbm-bi",
  "scale": "10m",
  "manifest": {
@@ -363,6 +363,19 @@
       ]
      }
     }
+   }
+  },
+  "answerOracle": {
+   "tool": "scripts/bench-bsbm/bi-answer-oracle.py",
+   "receipt": "2026-10-25-bsbm-bi-answer-validation.json",
+   "receipt_sha256": "02a2c835e7cb86f889d845f28ee3f149fea6047bfd0e788cbaaf2f178272beab",
+   "source_sha256": "db77a8d62274566c0fcf6a85634741b0313551cc217b59f4b1f26d444fd205be",
+   "method": "Independent streaming N-Triples arithmetic and set membership; fingerprint code binds the verdict to the retained response and does not compute expected answers.",
+   "captures": {
+    "host": "atlas",
+    "same_binaries_as_record": true,
+    "dataset": "bsbm-10m",
+    "note": "Retained correctness captures are separate requests from timing samples. The 80-row pooled Fluree q7 capture replaces an unavailable earlier 77-row fingerprint; the earlier body was not checked."
    }
   }
  },
@@ -1029,7 +1042,7 @@
     "agrees": false,
     "instances": 3
    },
-   "status": "wrong-answer",
+   "status": "answer-disagreement",
    "instances": 3,
    "reused": true
   },
@@ -1278,7 +1291,7 @@
     "agrees": false,
     "instances": 3
    },
-   "status": "wrong-answer",
+   "status": "answer-disagreement",
    "instances": 3,
    "reused": true
   },
@@ -1913,7 +1926,30 @@
     "rows": 99,
     "hash": "c0bec2d6da973274",
     "agrees": true,
-    "instances": 3
+    "instances": 3,
+    "verification": {
+     "method": "data-oracle",
+     "instances": {
+      "bi-q6-1": {
+       "policy": "binary32-summation-equivalence",
+       "source_sha256": "db77a8d62274566c0fcf6a85634741b0313551cc217b59f4b1f26d444fd205be",
+       "query_sha256": "c6e24251db7918bb8283ddbd72feb7a9a4385d1772405f193131a5ae1ca6ccc0",
+       "raw_sha256": "18b250fa5d1303c8091567c5f6c2a22727fb53aae453ce7a06367ad527c73b30"
+      },
+      "bi-q6-2": {
+       "policy": "binary32-summation-equivalence",
+       "source_sha256": "db77a8d62274566c0fcf6a85634741b0313551cc217b59f4b1f26d444fd205be",
+       "query_sha256": "b47a5ffa51c4f3d17c4d560e37d8f3e439a4e9274b14f85f57c52c7309254db3",
+       "raw_sha256": "cef0ffbe4509417682ad8812fbb2b280cb1664539628817e14d00f27b76342d7"
+      },
+      "bi-q6-3": {
+       "policy": "binary32-summation-equivalence",
+       "source_sha256": "db77a8d62274566c0fcf6a85634741b0313551cc217b59f4b1f26d444fd205be",
+       "query_sha256": "fcb1b2012c2d28a985af0436079ea7e8babe3026805dd34627fe73ffe408082f",
+       "raw_sha256": "7f40e48a16a52dd7449f194dc44e60644d3fff977aace070b00b7cefbbfa7853"
+      }
+     }
+    }
    },
    "status": "ok",
    "instances": 3,
@@ -1959,7 +1995,35 @@
    ],
    "median_ms": 67.878,
    "p95_ms": 90.183,
-   "answer": null,
+   "answer": {
+    "rows": 99,
+    "hash": "b5ab84884fec1c75",
+    "agrees": true,
+    "instances": 3,
+    "verification": {
+     "method": "data-oracle",
+     "instances": {
+      "bi-q6-1": {
+       "policy": "binary32-summation-equivalence",
+       "source_sha256": "db77a8d62274566c0fcf6a85634741b0313551cc217b59f4b1f26d444fd205be",
+       "query_sha256": "c6e24251db7918bb8283ddbd72feb7a9a4385d1772405f193131a5ae1ca6ccc0",
+       "raw_sha256": "8df2c9f318bc6b97e9f0741930ef294b2170b299442378d7daf286bc1b263d54"
+      },
+      "bi-q6-2": {
+       "policy": "binary32-summation-equivalence",
+       "source_sha256": "db77a8d62274566c0fcf6a85634741b0313551cc217b59f4b1f26d444fd205be",
+       "query_sha256": "b47a5ffa51c4f3d17c4d560e37d8f3e439a4e9274b14f85f57c52c7309254db3",
+       "raw_sha256": "bccdb02692bd3a977511ec90cd513efc2ee50c9f27fc7285e8c9097f38fe06c0"
+      },
+      "bi-q6-3": {
+       "policy": "binary32-summation-equivalence",
+       "source_sha256": "db77a8d62274566c0fcf6a85634741b0313551cc217b59f4b1f26d444fd205be",
+       "query_sha256": "fcb1b2012c2d28a985af0436079ea7e8babe3026805dd34627fe73ffe408082f",
+       "raw_sha256": "dd0a0a99673b3ae5a55ad8de5c4aaef5b788d0e57c855c2de12111daa00f5dd3"
+      }
+     }
+    }
+   },
    "status": "ok",
    "instances": 3,
    "reused": true
@@ -2007,10 +2071,33 @@
    "answer": {
     "rows": 99,
     "hash": "b5ab84884fec1c75",
-    "agrees": false,
-    "instances": 3
+    "agrees": true,
+    "instances": 3,
+    "verification": {
+     "method": "data-oracle",
+     "instances": {
+      "bi-q6-1": {
+       "policy": "binary32-summation-equivalence",
+       "source_sha256": "db77a8d62274566c0fcf6a85634741b0313551cc217b59f4b1f26d444fd205be",
+       "query_sha256": "c6e24251db7918bb8283ddbd72feb7a9a4385d1772405f193131a5ae1ca6ccc0",
+       "raw_sha256": "db51949e5e645638c0c8acf709feb5ecf947301f13b1de9fed9bf25afefb1de1"
+      },
+      "bi-q6-2": {
+       "policy": "binary32-summation-equivalence",
+       "source_sha256": "db77a8d62274566c0fcf6a85634741b0313551cc217b59f4b1f26d444fd205be",
+       "query_sha256": "b47a5ffa51c4f3d17c4d560e37d8f3e439a4e9274b14f85f57c52c7309254db3",
+       "raw_sha256": "16e74ab840df20fca40c57bc3072b71cbeb308a796848534f1548f99eaef12f6"
+      },
+      "bi-q6-3": {
+       "policy": "binary32-summation-equivalence",
+       "source_sha256": "db77a8d62274566c0fcf6a85634741b0313551cc217b59f4b1f26d444fd205be",
+       "query_sha256": "fcb1b2012c2d28a985af0436079ea7e8babe3026805dd34627fe73ffe408082f",
+       "raw_sha256": "3b47aab8f14967745d8621a0c2f54f6cace383c46aa6bb95661b0dd6e6bdb0f3"
+      }
+     }
+    }
    },
-   "status": "wrong-answer",
+   "status": "ok",
    "instances": 3,
    "reused": true
   },
@@ -2058,7 +2145,30 @@
     "rows": 99,
     "hash": "c0bec2d6da973274",
     "agrees": true,
-    "instances": 3
+    "instances": 3,
+    "verification": {
+     "method": "data-oracle",
+     "instances": {
+      "bi-q6-1": {
+       "policy": "binary32-summation-equivalence",
+       "source_sha256": "db77a8d62274566c0fcf6a85634741b0313551cc217b59f4b1f26d444fd205be",
+       "query_sha256": "c6e24251db7918bb8283ddbd72feb7a9a4385d1772405f193131a5ae1ca6ccc0",
+       "raw_sha256": "fa84c2bdd4334ecbd4811390028307cefbe0a2679e53794efc87db0294e15ff1"
+      },
+      "bi-q6-2": {
+       "policy": "binary32-summation-equivalence",
+       "source_sha256": "db77a8d62274566c0fcf6a85634741b0313551cc217b59f4b1f26d444fd205be",
+       "query_sha256": "b47a5ffa51c4f3d17c4d560e37d8f3e439a4e9274b14f85f57c52c7309254db3",
+       "raw_sha256": "eef079f3c71294ecf5a6c4ac6ffae211c7c929af42903168aa07e7cb538948ae"
+      },
+      "bi-q6-3": {
+       "policy": "binary32-summation-equivalence",
+       "source_sha256": "db77a8d62274566c0fcf6a85634741b0313551cc217b59f4b1f26d444fd205be",
+       "query_sha256": "fcb1b2012c2d28a985af0436079ea7e8babe3026805dd34627fe73ffe408082f",
+       "raw_sha256": "f1a0a83d285dc1109f44aec4f61c782f4ca316ffb5d9be61b0abaacbd988a105"
+      }
+     }
+    }
    },
    "status": "ok",
    "instances": 3,
@@ -2108,7 +2218,30 @@
     "rows": 99,
     "hash": "c0bec2d6da973274",
     "agrees": true,
-    "instances": 3
+    "instances": 3,
+    "verification": {
+     "method": "data-oracle",
+     "instances": {
+      "bi-q6-1": {
+       "policy": "binary32-summation-equivalence",
+       "source_sha256": "db77a8d62274566c0fcf6a85634741b0313551cc217b59f4b1f26d444fd205be",
+       "query_sha256": "c6e24251db7918bb8283ddbd72feb7a9a4385d1772405f193131a5ae1ca6ccc0",
+       "raw_sha256": "7a7d128a0b6fa97298194285c4c3952505f2c7142bb94dca0841cf442f487b9c"
+      },
+      "bi-q6-2": {
+       "policy": "binary32-summation-equivalence",
+       "source_sha256": "db77a8d62274566c0fcf6a85634741b0313551cc217b59f4b1f26d444fd205be",
+       "query_sha256": "b47a5ffa51c4f3d17c4d560e37d8f3e439a4e9274b14f85f57c52c7309254db3",
+       "raw_sha256": "0369400102695465a6f31c1c5f1ec167cce84979ae86b41ca3e4cc9b7aefdeca"
+      },
+      "bi-q6-3": {
+       "policy": "binary32-summation-equivalence",
+       "source_sha256": "db77a8d62274566c0fcf6a85634741b0313551cc217b59f4b1f26d444fd205be",
+       "query_sha256": "fcb1b2012c2d28a985af0436079ea7e8babe3026805dd34627fe73ffe408082f",
+       "raw_sha256": "f16beba08c83d3a332769999c5fbac8951282cf77eceedaee95f3bea8a2f7bd3"
+      }
+     }
+    }
    },
    "status": "ok",
    "instances": 3
@@ -2157,7 +2290,30 @@
     "rows": 82,
     "hash": "c8a906a585581d69",
     "agrees": true,
-    "instances": 3
+    "instances": 3,
+    "verification": {
+     "method": "data-oracle",
+     "instances": {
+      "bi-q7-1": {
+       "policy": "legal-inner-limit-ties",
+       "source_sha256": "db77a8d62274566c0fcf6a85634741b0313551cc217b59f4b1f26d444fd205be",
+       "query_sha256": "bfaf68fec772f499d17bdfb36264152d0ea4d29ff3073bb15dbdd75810b4e00e",
+       "raw_sha256": "7131c075618a15ea050416a544979c0a26f29415b28e3d88a6051fb0de5343b9"
+      },
+      "bi-q7-2": {
+       "policy": "legal-inner-limit-ties",
+       "source_sha256": "db77a8d62274566c0fcf6a85634741b0313551cc217b59f4b1f26d444fd205be",
+       "query_sha256": "b9d293c8c6d37a0c9692d6a72097f492155573abd31715ee48828ceafa8aa473",
+       "raw_sha256": "3d7ece6af7c963bfcc2e24136a06579050c93509c05b9bc0a2265fc3eb011f0e"
+      },
+      "bi-q7-3": {
+       "policy": "legal-inner-limit-ties",
+       "source_sha256": "db77a8d62274566c0fcf6a85634741b0313551cc217b59f4b1f26d444fd205be",
+       "query_sha256": "4eeaeae4e1c73b1d3cfc243db22ee7cce73217c02b19a343013fea8092a0a1ab",
+       "raw_sha256": "a506515cbaefc42e0e1e1a48855eed1436334903f6659641c62bd9f25152145d"
+      }
+     }
+    }
    },
    "status": "ok",
    "instances": 3,
@@ -2203,7 +2359,35 @@
    ],
    "median_ms": 59.38,
    "p95_ms": 79.361,
-   "answer": null,
+   "answer": {
+    "rows": 82,
+    "hash": "c8a906a585581d69",
+    "agrees": true,
+    "instances": 3,
+    "verification": {
+     "method": "data-oracle",
+     "instances": {
+      "bi-q7-1": {
+       "policy": "legal-inner-limit-ties",
+       "source_sha256": "db77a8d62274566c0fcf6a85634741b0313551cc217b59f4b1f26d444fd205be",
+       "query_sha256": "bfaf68fec772f499d17bdfb36264152d0ea4d29ff3073bb15dbdd75810b4e00e",
+       "raw_sha256": "afe749f6dcef6775e33f5bfc786d34f4748edd72157d4cd12a8a0ef4527cee88"
+      },
+      "bi-q7-2": {
+       "policy": "legal-inner-limit-ties",
+       "source_sha256": "db77a8d62274566c0fcf6a85634741b0313551cc217b59f4b1f26d444fd205be",
+       "query_sha256": "b9d293c8c6d37a0c9692d6a72097f492155573abd31715ee48828ceafa8aa473",
+       "raw_sha256": "e2d479dd189a6d33e4695f96268330ef313c344d7259e7e18ac741576e472508"
+      },
+      "bi-q7-3": {
+       "policy": "legal-inner-limit-ties",
+       "source_sha256": "db77a8d62274566c0fcf6a85634741b0313551cc217b59f4b1f26d444fd205be",
+       "query_sha256": "4eeaeae4e1c73b1d3cfc243db22ee7cce73217c02b19a343013fea8092a0a1ab",
+       "raw_sha256": "26f5febd64d234f52d6792d482d8b3e59980e5d7c5fdfeb2eed57475eb9b3ac9"
+      }
+     }
+    }
+   },
    "status": "ok",
    "instances": 3,
    "reused": true
@@ -2249,12 +2433,41 @@
    "median_ms": 210.014,
    "p95_ms": 398.849,
    "answer": {
-    "rows": 77,
-    "hash": "b1f0408d5231da07",
-    "agrees": false,
-    "instances": 3
+    "rows": 80,
+    "hash": "578eca619bc548e8",
+    "agrees": true,
+    "instances": 3,
+    "verification": {
+     "method": "data-oracle",
+     "instances": {
+      "bi-q7-1": {
+       "policy": "legal-inner-limit-ties",
+       "source_sha256": "db77a8d62274566c0fcf6a85634741b0313551cc217b59f4b1f26d444fd205be",
+       "query_sha256": "bfaf68fec772f499d17bdfb36264152d0ea4d29ff3073bb15dbdd75810b4e00e",
+       "raw_sha256": "82eac67201d1c53b3898064daafffe093e2fc44a20dbe1aba5150a6982dce490"
+      },
+      "bi-q7-2": {
+       "policy": "legal-inner-limit-ties",
+       "source_sha256": "db77a8d62274566c0fcf6a85634741b0313551cc217b59f4b1f26d444fd205be",
+       "query_sha256": "b9d293c8c6d37a0c9692d6a72097f492155573abd31715ee48828ceafa8aa473",
+       "raw_sha256": "b95421dc5c80ee910226f86a23e7794efc8e459e69be2c7e900ba5c755cce444"
+      },
+      "bi-q7-3": {
+       "policy": "legal-inner-limit-ties",
+       "source_sha256": "db77a8d62274566c0fcf6a85634741b0313551cc217b59f4b1f26d444fd205be",
+       "query_sha256": "4eeaeae4e1c73b1d3cfc243db22ee7cce73217c02b19a343013fea8092a0a1ab",
+       "raw_sha256": "4969025208ab8f27f0a4d0cc213f7ffa7360c15578ab1b9663a782d2cbfa37f0"
+      }
+     }
+    },
+    "previous_unverified_capture": {
+     "rows": 77,
+     "hash": "b1f0408d5231da07",
+     "agrees": false,
+     "instances": 3
+    }
    },
-   "status": "wrong-answer",
+   "status": "ok",
    "instances": 3,
    "reused": true
   },
@@ -2327,7 +2540,30 @@
     "rows": 82,
     "hash": "c8a906a585581d69",
     "agrees": true,
-    "instances": 3
+    "instances": 3,
+    "verification": {
+     "method": "data-oracle",
+     "instances": {
+      "bi-q7-1": {
+       "policy": "legal-inner-limit-ties",
+       "source_sha256": "db77a8d62274566c0fcf6a85634741b0313551cc217b59f4b1f26d444fd205be",
+       "query_sha256": "bfaf68fec772f499d17bdfb36264152d0ea4d29ff3073bb15dbdd75810b4e00e",
+       "raw_sha256": "82eac67201d1c53b3898064daafffe093e2fc44a20dbe1aba5150a6982dce490"
+      },
+      "bi-q7-2": {
+       "policy": "legal-inner-limit-ties",
+       "source_sha256": "db77a8d62274566c0fcf6a85634741b0313551cc217b59f4b1f26d444fd205be",
+       "query_sha256": "b9d293c8c6d37a0c9692d6a72097f492155573abd31715ee48828ceafa8aa473",
+       "raw_sha256": "b95421dc5c80ee910226f86a23e7794efc8e459e69be2c7e900ba5c755cce444"
+      },
+      "bi-q7-3": {
+       "policy": "legal-inner-limit-ties",
+       "source_sha256": "db77a8d62274566c0fcf6a85634741b0313551cc217b59f4b1f26d444fd205be",
+       "query_sha256": "4eeaeae4e1c73b1d3cfc243db22ee7cce73217c02b19a343013fea8092a0a1ab",
+       "raw_sha256": "8e5f2d87a180ea43b8f72bfa265e9cd79a2e6c4e0cbf4e1080ea2bab8f53f470"
+      }
+     }
+    }
    },
    "status": "ok",
    "instances": 3
@@ -2473,7 +2709,7 @@
     "agrees": false,
     "instances": 3
    },
-   "status": "wrong-answer",
+   "status": "answer-disagreement",
    "instances": 3,
    "reused": true
   },

@@ -397,11 +397,20 @@ check them against the W3C suites and Jena's own answers.
   one variable from each side, pairs its rows through that equality instead of forming
   their product ([internals](internals/OPTIMIZATIONS.md)). SP²Bench `q6` at 10M tests 7.4
   million candidate pairs where the product had 1.6 × 10¹² rows.
+* Groups linked only by a FILTER equality also join through candidate keys and test the
+  full condition on those pairs. Large ASK queries read the inputs alternately and stop
+  at the first qualifying pair. They retain prefixes of both inputs while both can
+  produce rows, then discard obsolete history when either input ends.
+* A triple pattern with one free variable can bind it during planning when a bounded
+  snapshot read proves that the pattern has exactly one row. This makes other patterns
+  and numeric FILTER bounds constant while preserving the result variables. Volatile
+  filters, application callbacks and algebra boundaries retain the ordinary plan.
 * Queries can run eagerly or as streaming cursors
   ([X05](specs/X05-streaming-query-execution.md)). Automatic execution, the default over
   HTTP, in the CLI, in Node and in the JVM library, streams scans expected to return at
   least a thousand rows, groupings of an estimated 20,000 input rows or more, and bounded
-  ASK products whose eager candidates would exceed a budget. Other plans run eagerly, and
+  ASK products whose eager candidates would exceed a budget, and large equality-keyed
+  ASK joins. Other plans run eagerly, and
   `execution=eager` or `execution=streaming` overrides the choice.
 * Rust, Python and Node have snapshot-owning SELECT and graph cursors, and the JVM
   library pulls SELECT results. Result writers use bounded buffers with backpressure and

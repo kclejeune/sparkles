@@ -682,8 +682,8 @@ def cmd_merge(a):
               "check_reopen": load(a.check_reopen), "restart_s": float(a.restart_s) if a.restart_s else None,
               "crash_restart_s": float(a.crash_restart_s) if a.crash_restart_s else None})
     r["status"], r["status_reasons"] = run_status(r)
-    if a.answers in ("wrong-answer", "error"):
-        why = a.answers_reason or ("differs from the majority" if a.answers == "wrong-answer" else "failed a query")
+    if a.answers in ("wrong-answer", "answer-disagreement", "error"):
+        why = a.answers_reason or ("differs from the majority" if a.answers in ("wrong-answer", "answer-disagreement") else "failed a query")
         r["status"], r["status_reasons"] = a.answers, [f"not run: it {why} of the read set"]
     d[a.engine] = r
     with open(a.into, "w") as f:
@@ -797,7 +797,7 @@ def main():
     m.add_argument("--check-reopen", default="")
     m.add_argument("--restart-s", default="", help="seconds to the first answer after a normal restart")
     m.add_argument("--crash-restart-s", default="", help="seconds to the first answer after the SIGKILL")
-    m.add_argument("--answers", default="", help="ok, wrong-answer or error: the read set's answer check")
+    m.add_argument("--answers", default="", help="ok, answer-disagreement, wrong-answer or error: the read set's answer check")
     m.add_argument("--answers-reason", default="", help="the query that failed or differed")
     m.set_defaults(f=cmd_merge)
     s = sub.add_parser("summary")

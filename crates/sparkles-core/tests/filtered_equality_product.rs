@@ -3,7 +3,16 @@
 use oxrdf::{Literal, NamedNode, Term};
 use oxrdfio::RdfFormat;
 use sparkles_core::io::Source;
-use sparkles_core::sparql::{QueryOptions, query};
+use sparkles_core::sparql::{Optimizations, QueryOptions, query};
+
+// These plan and candidate-budget assertions describe the legacy filtered-product
+// kernel, which remains the fallback when the keyed rewrite is disabled.
+fn legacy_optimizations() -> Optimizations {
+    Optimizations {
+        keyed_join: false,
+        ..Optimizations::ALL
+    }
+}
 use sparkles_core::store::{Store, StoreOptions};
 
 const Q5A: &str = include_str!("fixtures/sp2b-q5a.rq");
@@ -78,6 +87,7 @@ fn expected_with_suffix(copies: usize, suffix: &str) -> Vec<String> {
 fn q5a_fixture_has_an_independent_distinct_and_duplicate_bag_oracle() {
     let store = fixture();
     let options = QueryOptions {
+        optimizations: Some(legacy_optimizations()),
         max_rows: Some(10_000),
         no_cache: true,
         ..Default::default()
@@ -93,6 +103,7 @@ fn q5a_fixture_has_an_independent_distinct_and_duplicate_bag_oracle() {
 fn q5a_string_equality_avoids_reserving_nonmatching_product_rows() {
     let store = fixture();
     let options = QueryOptions {
+        optimizations: Some(legacy_optimizations()),
         max_rows: Some(512),
         no_cache: true,
         ..Default::default()
@@ -119,6 +130,7 @@ fn equality_candidates(p: &sparkles_core::sparql::PlanInfo) -> Vec<i64> {
 fn q5a_candidate_index_keeps_bags_orientation_and_the_original_residual() {
     let store = fixture();
     let options = QueryOptions {
+        optimizations: Some(legacy_optimizations()),
         max_rows: Some(512),
         no_cache: true,
         ..Default::default()
@@ -137,6 +149,7 @@ fn q5a_candidate_index_keeps_bags_orientation_and_the_original_residual() {
             store.snapshot(),
             &text,
             &QueryOptions {
+                optimizations: Some(legacy_optimizations()),
                 max_rows: Some(10_000),
                 no_cache: true,
                 ..Default::default()
@@ -150,6 +163,7 @@ fn q5a_candidate_index_keeps_bags_orientation_and_the_original_residual() {
         store.snapshot(),
         Q5A,
         &QueryOptions {
+            optimizations: Some(legacy_optimizations()),
             max_rows: Some(10_000),
             no_cache: true,
             ..Default::default()
@@ -166,6 +180,7 @@ fn q5a_candidate_index_keeps_bags_orientation_and_the_original_residual() {
 fn filtered_candidates_never_poison_the_unfiltered_cross_cache_key() {
     let store = fixture();
     let options = QueryOptions {
+        optimizations: Some(legacy_optimizations()),
         max_rows: Some(512),
         ..Default::default()
     };
@@ -184,6 +199,7 @@ fn filtered_candidates_never_poison_the_unfiltered_cross_cache_key() {
         store.snapshot(),
         &unfiltered,
         &QueryOptions {
+            optimizations: Some(legacy_optimizations()),
             max_rows: Some(10_000),
             ..Default::default()
         },
@@ -196,6 +212,7 @@ fn filtered_candidates_never_poison_the_unfiltered_cross_cache_key() {
         store.snapshot(),
         &unfiltered,
         &QueryOptions {
+            optimizations: Some(legacy_optimizations()),
             max_rows: Some(10_000),
             ..Default::default()
         },
@@ -231,6 +248,7 @@ fn numeric_language_error_and_unbound_domains_keep_value_equality() {
             store.snapshot(),
             &text,
             &QueryOptions {
+                optimizations: Some(legacy_optimizations()),
                 no_cache: true,
                 ..Default::default()
             },
@@ -254,6 +272,7 @@ fn numeric_language_error_and_unbound_domains_keep_value_equality() {
         store.snapshot(),
         &text,
         &QueryOptions {
+            optimizations: Some(legacy_optimizations()),
             no_cache: true,
             ..Default::default()
         },
@@ -261,7 +280,7 @@ fn numeric_language_error_and_unbound_domains_keep_value_equality() {
     .unwrap();
     assert_eq!(result.len(), 257);
     assert!(
-        matches!(query(store.snapshot(), &text, &QueryOptions { max_rows: Some(64), no_cache: true, ..Default::default() }), Err(sparkles_core::Error::BudgetExceeded(b)) if b.kind == sparkles_core::BudgetKind::Rows)
+        matches!(query(store.snapshot(), &text, &QueryOptions { optimizations: Some(legacy_optimizations()), max_rows: Some(64), no_cache: true, ..Default::default() }), Err(sparkles_core::Error::BudgetExceeded(b)) if b.kind == sparkles_core::BudgetKind::Rows)
     );
 }
 
@@ -278,13 +297,14 @@ fn matching_output_and_produced_row_limits_are_still_real() {
         "?x = ?y",
     );
     assert!(
-        matches!(query(store.snapshot(), &text, &QueryOptions { max_rows: Some(512), no_cache: true, ..Default::default() }), Err(sparkles_core::Error::BudgetExceeded(b)) if b.kind == sparkles_core::BudgetKind::Rows)
+        matches!(query(store.snapshot(), &text, &QueryOptions { optimizations: Some(legacy_optimizations()), max_rows: Some(512), no_cache: true, ..Default::default() }), Err(sparkles_core::Error::BudgetExceeded(b)) if b.kind == sparkles_core::BudgetKind::Rows)
     );
     let store = fixture();
     let failed = sparkles_core::sparql::query_with_plan(
         store.snapshot(),
         Q5A,
         &QueryOptions {
+            optimizations: Some(legacy_optimizations()),
             max_rows: Some(512),
             max_rows_produced: Some(1_200),
             no_cache: true,
@@ -332,7 +352,7 @@ fn expressions_in_inputs_or_the_filter_do_not_move_evaluation_boundaries() {
         ),
     ] {
         assert!(
-            matches!(query(store.snapshot(), &text, &QueryOptions { max_rows: Some(512), no_cache: true, ..Default::default() }), Err(sparkles_core::Error::BudgetExceeded(b)) if b.kind == sparkles_core::BudgetKind::Rows),
+            matches!(query(store.snapshot(), &text, &QueryOptions { optimizations: Some(legacy_optimizations()), max_rows: Some(512), no_cache: true, ..Default::default() }), Err(sparkles_core::Error::BudgetExceeded(b)) if b.kind == sparkles_core::BudgetKind::Rows),
             "{text}"
         );
     }
@@ -346,6 +366,7 @@ fn equality_index_is_charged_and_empty_products_and_cancellation_stay_safe() {
         store.snapshot(),
         Q5A,
         &QueryOptions {
+            optimizations: Some(legacy_optimizations()),
             max_rows: Some(10_000),
             max_memory_bytes: Some(memory),
             no_cache: true,
@@ -356,15 +377,18 @@ fn equality_index_is_charged_and_empty_products_and_cancellation_stay_safe() {
     assert_eq!(bag(result.rows()), expected(1));
     assert_eq!(equality_candidates(&result.plan), [192]);
     assert!(result.mem_peak_bytes <= memory);
-    assert!(matches!(query(store.snapshot(), Q5A, &QueryOptions {
+    assert!(
+        matches!(query(store.snapshot(), Q5A, &QueryOptions { optimizations: Some(legacy_optimizations()),
         max_rows: Some(512), max_memory_bytes: Some(1_024), no_cache: true, ..Default::default()
-    }), Err(sparkles_core::Error::BudgetExceeded(b)) if b.kind == sparkles_core::BudgetKind::Memory));
+    }), Err(sparkles_core::Error::BudgetExceeded(b)) if b.kind == sparkles_core::BudgetKind::Memory)
+    );
     let cancel = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true));
     assert!(matches!(
         query(
             store.snapshot(),
             Q5A,
             &QueryOptions {
+                optimizations: Some(legacy_optimizations()),
                 max_rows: Some(512),
                 cancel: Some(cancel),
                 no_cache: true,
@@ -383,6 +407,7 @@ fn equality_index_is_charged_and_empty_products_and_cancellation_stay_safe() {
                 empty.snapshot(),
                 &text,
                 &QueryOptions {
+                    optimizations: Some(legacy_optimizations()),
                     max_rows: Some(1),
                     no_cache: true,
                     ..Default::default()
@@ -402,6 +427,7 @@ fn automatic_execution_uses_the_same_result_without_changing_explicit_streaming(
     };
     let store = fixture();
     let opts = QueryOptions {
+        optimizations: Some(legacy_optimizations()),
         max_rows: Some(512),
         no_cache: true,
         ..Default::default()
@@ -423,6 +449,7 @@ fn automatic_execution_uses_the_same_result_without_changing_explicit_streaming(
             store.snapshot(),
             Q5A,
             &QueryOptions {
+                optimizations: Some(legacy_optimizations()),
                 max_rows: Some(10_000),
                 no_cache: true,
                 ..Default::default()
@@ -451,6 +478,7 @@ fn oversized_single_string_reconstruction_is_budgeted() {
         store.snapshot(),
         Q5A,
         &QueryOptions {
+            optimizations: Some(legacy_optimizations()),
             max_rows: Some(512),
             max_memory_bytes: Some(32 << 10),
             no_cache: true,
@@ -477,6 +505,7 @@ fn retained_string_payloads_must_fit_the_same_query_memory_budget() {
         store.snapshot(),
         Q5A,
         &QueryOptions {
+            optimizations: Some(legacy_optimizations()),
             max_rows: Some(512),
             max_memory_bytes: Some(32 << 10),
             no_cache: true,
@@ -495,6 +524,7 @@ fn retained_string_payloads_must_fit_the_same_query_memory_budget() {
         store.snapshot(),
         Q5A,
         &QueryOptions {
+            optimizations: Some(legacy_optimizations()),
             max_rows: Some(512),
             max_memory_bytes: Some(128 << 10),
             no_cache: true,

@@ -47,6 +47,9 @@ pub(super) struct Filter {
     at: usize,
     /// the rows of the next enlarged read
     input: usize,
+    /// Input demand after consecutive batches without a qualifying row. The first
+    /// pull still honors a short LIMIT or ASK prefix.
+    empty_demand: usize,
     /// Whether the first read has chosen between morsels and the scan's own batches.
     chosen: bool,
     morsels: Option<Box<Morsels>>,
@@ -59,6 +62,7 @@ impl Filter {
             pending: None,
             at: 0,
             input: INPUT_ROWS,
+            empty_demand: 0,
             chosen: false,
             morsels: None,
         }
@@ -120,7 +124,9 @@ impl Filter {
             while input > INPUT_ROWS && (!ctx.opt.grow_input || !fits(input)) {
                 input /= 2;
             }
-            let enlarge = cap >= 4096 && ctx.max_rows_produced == u64::MAX && fits(input);
+            let enlarge = (cap >= 4096 || self.empty_demand >= 4096)
+                && ctx.max_rows_produced == u64::MAX
+                && fits(input);
             if enlarge {
                 self.input = (input * 2).min(MAX_INPUT_ROWS);
             }
@@ -143,7 +149,13 @@ impl Filter {
                 continue;
             }
             let mut input_options = options.clone();
-            let demand = if enlarge { input.max(cap) } else { cap };
+            let demand = if enlarge {
+                input.max(cap)
+            } else if self.empty_demand > cap && fits(self.empty_demand) {
+                self.empty_demand
+            } else {
+                cap
+            };
             input_options.batch_rows = demand.max(options.batch_rows);
             let Some(mut buffer) = child.next(ctx, &input_options, demand)? else {
                 return Ok(None);
@@ -157,7 +169,15 @@ impl Filter {
             buffer.reconcile()?;
             drop(scratch);
             if !buffer.table.is_empty() {
+                self.empty_demand = 0;
                 self.pending = Some(buffer);
+            } else if ctx.opt.grow_input && ctx.max_rows_produced == u64::MAX {
+                let next = demand.saturating_mul(4).min(INPUT_ROWS);
+                if ctx.max_rows.saturating_sub(child.rows) >= next
+                    && ctx.memory_remaining() >= headroom(next)
+                {
+                    self.empty_demand = next;
+                }
             }
         }
     }

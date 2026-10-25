@@ -15,6 +15,7 @@ use super::{Buffer, CursorOptions, Operator, merge};
 use crate::error::{Error, Result};
 use crate::id::Id;
 use crate::sparql::ctx::{Ctx, RetainedCharge};
+use crate::sparql::eqkey::{EqKey, eq_key};
 use crate::sparql::exec;
 use crate::sparql::expr::Expr;
 use crate::sparql::plan::{JoinAlgo, Kind, Node};
@@ -31,6 +32,7 @@ pub(super) fn eligible(node: &Node) -> bool {
                 | Kind::Minus
                 | Kind::LeftJoin { .. }
                 | Kind::KeyedLeftJoin { .. }
+                | Kind::KeyedJoin { .. }
         )
 }
 
@@ -206,44 +208,60 @@ impl HashIndex {
     }
 }
 
-/// The build rows of a keyed OPTIONAL by the value of its equality's build variable.
-/// `=` holds between two different ids only when neither is an IRI or a blank node, as
-/// `val_eq` decides it. A probe value that is one meets the rows with the same id, another
-/// bound value meets the rows whose value is bound and is neither, and an unbound value
-/// meets none, since `=` then raises an error. The condition is tested on every candidate.
+/// The build rows of a keyed join by the value of its equality's build variable. Each
+/// value has a candidate key ([`crate::sparql::eqkey`]): a probe value meets the build
+/// rows with the same key, a loose value meets every loose build value, and an unbound
+/// value meets none, since `=` then raises an error. The condition is tested on every
+/// candidate.
 pub(super) struct EqualityIndex {
-    /// The build rows by value, of which a probe reads only the rows of its own id.
-    by_id: HashIndex,
-    /// The build rows whose value is bound and is neither an IRI nor a blank node.
+    /// The build rows by key, of which a probe reads only the rows of its own key.
+    by_key: HashIndex,
+    /// The build rows whose value is loose.
     loose: Vec<u32>,
     _charge: Option<RetainedCharge>,
 }
 
 impl EqualityIndex {
     fn new(ctx: &Ctx, build: &Table, column: usize, probe: usize) -> Result<Self> {
-        let by_id = HashIndex::new(ctx, build, column, probe)?;
         let values = &build.cols[column];
-        let is_loose = |value: Id| !value.is_undef() && !atomic(ctx, value);
-        // count first, so the list is charged and allocated once at its exact size
-        let mut count = 0usize;
+        // The key of each row, unbound for a loose or unbound value, and the loose rows.
+        let mut charge = ctx.retained_charge(values.len() as u64 * 12 + 1024)?;
+        let mut keys = Vec::with_capacity(values.len());
+        // Reserve exactly the worst-case number of loose rows. Geometric growth
+        // can otherwise exceed the four bytes per row reserved alongside keys.
+        let mut loose = Vec::with_capacity(values.len());
         for (row, &value) in values.iter().enumerate() {
             if row.is_multiple_of(1024) {
                 ctx.check()?;
             }
-            count += usize::from(is_loose(value));
+            keys.push(match eq_key(ctx, value)? {
+                EqKey::Key(k) => k,
+                EqKey::Loose => {
+                    loose.push(row as u32);
+                    Id::UNDEF
+                }
+                EqKey::Unbound => Id::UNDEF,
+            });
         }
-        let charge = ctx.retained_charge(count as u64 * 4 + 1024)?;
-        let mut loose = Vec::with_capacity(count);
-        for (row, &value) in values.iter().enumerate() {
-            if row.is_multiple_of(1024) {
-                ctx.check()?;
-            }
-            if is_loose(value) {
-                loose.push(row as u32);
-            }
+        debug_assert!(charge.as_ref().is_none_or(|charge| {
+            (keys.capacity() as u64 * 8 + loose.capacity() as u64 * 4) <= charge.bytes()
+        }));
+        let keyed = Table {
+            vars: vec![0],
+            cols: vec![keys],
+            len: values.len(),
+            sorted: Vec::new(),
+        };
+        let by_key = HashIndex::new(ctx, &keyed, 0, probe)?;
+        // Free the temporary keys before a shrink can hold old and new loose
+        // allocations together. Both fit within the original twelve-byte charge.
+        drop(keyed);
+        loose.shrink_to_fit();
+        if let Some(charge) = &mut charge {
+            charge.resize(loose.capacity() as u64 * 4 + 1024)?;
         }
         Ok(Self {
-            by_id,
+            by_key,
             loose,
             _charge: charge,
         })
@@ -251,22 +269,13 @@ impl EqualityIndex {
 
     /// The build rows that probe value `value` may equal.
     #[inline]
-    fn candidates<'a>(&'a self, ctx: &Ctx, value: Id) -> Candidates<'a> {
-        if value.is_undef() {
-            Candidates::Keyed(&[], &[])
-        } else if atomic(ctx, value) {
-            Candidates::Keyed(self.by_id.keyed(value), &[])
-        } else {
-            Candidates::Keyed(&[], &self.loose)
-        }
+    fn candidates<'a>(&'a self, ctx: &Ctx, value: Id) -> Result<Candidates<'a>> {
+        Ok(match eq_key(ctx, value)? {
+            EqKey::Unbound => Candidates::Keyed(&[], &[]),
+            EqKey::Key(k) => Candidates::Keyed(self.by_key.keyed(k), &[]),
+            EqKey::Loose => Candidates::Keyed(&[], &self.loose),
+        })
     }
-}
-
-/// Whether `value` is an IRI or a blank node, which equals only itself.
-#[inline]
-fn atomic(ctx: &Ctx, value: Id) -> bool {
-    use crate::sparql::ctx::TermKind;
-    matches!(ctx.kind(value), TermKind::Iri | TermKind::BNode)
 }
 
 /// The build rows a probe row may match: every build row, or the rows of its key and
@@ -332,11 +341,11 @@ impl Binary {
         preferred.sort_by_key(|&(p, _)| !probe.certain.contains(&probe.vars[p]));
         let expression = match &node.kind {
             Kind::LeftJoin { expr } => expr.clone(),
-            Kind::KeyedLeftJoin { expr, .. } => Some(expr.clone()),
+            Kind::KeyedLeftJoin { expr, .. } | Kind::KeyedJoin { expr, .. } => Some(expr.clone()),
             _ => None,
         };
         let equality = match &node.kind {
-            Kind::KeyedLeftJoin { left, right, .. } => probe
+            Kind::KeyedLeftJoin { left, right, .. } | Kind::KeyedJoin { left, right, .. } => probe
                 .vars
                 .iter()
                 .position(|v| v == left)
@@ -566,11 +575,11 @@ impl Binary {
         probe: &Table,
         row: usize,
         all: usize,
-    ) -> Candidates<'a> {
+    ) -> Result<Candidates<'a>> {
         if let Some((p, equality)) = equality {
             return equality.candidates(ctx, probe.cols[p][row]);
         }
-        match index {
+        Ok(match index {
             Some(index) => {
                 let key = probe.cols[index.probe][row];
                 if key.is_undef() {
@@ -580,7 +589,7 @@ impl Binary {
                 }
             }
             None => Candidates::All(all),
-        }
+        })
     }
 
     /// Inner and OPTIONAL joins without a condition: the pairs of the current probe
@@ -659,7 +668,7 @@ impl Binary {
                 probe,
                 row,
                 build.len,
-            );
+            )?;
             let n = candidates.len();
             if !checks && self.offset == 0 && n <= room - lp.len() {
                 // Every candidate matches and the whole row fits.
@@ -756,7 +765,7 @@ impl Binary {
                 probe,
                 row,
                 build.len,
-            );
+            )?;
             let n = candidates.len();
             let begin = cl.len() as u32;
             let mut visited = 0usize;
@@ -788,7 +797,7 @@ impl Binary {
         // The merged candidate rows, and which of them pass the condition.
         let mut merged = Table::new(vars.to_vec());
         gather(&mut merged, &self.columns, probe, build, &cl, &cr);
-        let expression = self.expression.as_ref().expect("an OPTIONAL condition");
+        let expression = self.expression.as_ref().expect("a join condition");
         let pass = exec::filter_mask(ctx, &merged, std::slice::from_ref(expression))?;
         drop(merged);
         for (i, &(row, begin, complete)) in rows.iter().enumerate() {
@@ -802,7 +811,7 @@ impl Binary {
                 }
             }
             if complete {
-                if !matched {
+                if !matched && self.mode == Mode::Optional {
                     lp.push(row);
                     rp.push(NO_ROW);
                 }
@@ -843,7 +852,7 @@ impl Binary {
                 probe,
                 row,
                 build.len,
-            );
+            )?;
             let found = match candidates {
                 // Every keyed build row binds the key, so it matches a bound probe key
                 // and, for MINUS, shares that bound variable.
@@ -910,7 +919,7 @@ impl Binary {
             rp.clear();
             match self.mode {
                 Mode::Semi | Mode::Anti | Mode::Minus => self.filter(ctx, room, &mut lp)?,
-                Mode::Optional if self.expression.is_some() => {
+                Mode::Optional | Mode::Inner if self.expression.is_some() => {
                     self.condition(ctx, vars, room, &mut lp, &mut rp)?
                 }
                 Mode::Inner | Mode::Optional => self.pairs(ctx, room, &mut lp, &mut rp)?,
@@ -979,4 +988,34 @@ pub(super) fn gather(
         }
     }
     out.len += lp.len();
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::store::{Store, StoreOptions};
+
+    #[test]
+    fn equality_index_covers_loose_rows_across_vector_growth_boundaries() {
+        let store = Store::in_memory(StoreOptions::default());
+        let mut ctx = Ctx::new(store.snapshot());
+        ctx.mem_limit = 16 << 20;
+        ctx.enable_cursor_accounting().unwrap();
+        let ctx = Arc::new(ctx);
+        ctx.attach_cursor_owner();
+        for len in [65_536, 65_537] {
+            let mut build = Table::new(vec![0]);
+            for row in 0..len {
+                build.push_row(&[Id::from_i64(row as i64).unwrap()]);
+            }
+            // Building the index also checks that every temporary allocation
+            // fits its charge before the temporary keys have been dropped.
+            let index = EqualityIndex::new(&ctx, &build, 0, 0).unwrap();
+            assert_eq!(index.loose.len(), len);
+            assert_eq!(
+                index._charge.as_ref().unwrap().bytes(),
+                len as u64 * 4 + 1024
+            );
+        }
+    }
 }

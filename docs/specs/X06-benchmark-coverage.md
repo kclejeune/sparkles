@@ -339,8 +339,8 @@ Sparkles is never run with synchronization off for a published table.
 - No engine-specific rewriting that changes the algorithm, such as adding a hint that
   only one engine understands, unless every engine gets its own equivalent hint.
 - Answers are checked first with `scripts/bench-answers.py`. An engine whose answer
-  differs from the majority is marked and not ranked, as today. For suites with
-  reference answers, the reference is the majority.
+  differs from the majority is marked and not ranked, as today. A majority mismatch is an unresolved disagreement, not a correctness oracle. Independent
+  data oracles take precedence when they accept a legal answer difference.
 
 ### 5.5 Failures and timeouts
 
@@ -397,7 +397,7 @@ Every suite writes one JSON file per run in the same shape, which
 }
 ```
 
-`status` is `ok`, `timeout`, `error`, `oom` or `wrong-answer`. Throughput results use
+`status` is `ok`, `timeout`, `error`, `oom`, `answer-disagreement` or `wrong-answer`. Throughput results use
 `qps` or `qmph` in place of the sample list. Long runs (§3.9) write a time series as
 `series` with one entry per minute.
 
@@ -624,7 +624,7 @@ numbers and the memory readings, and the LUBM record carries the materialization
 under `inference`. `build --pool-instances` merges query instances named `<template>-<i>`
 into one result per template, with the samples pooled. The agreement of an answer is judged
 against the majority of the engines that answered, as in `bench-summary.py`, and a result
-that disagrees is recorded as `wrong-answer`. An intentionally unchecked DESCRIBE answer has
+that disagrees is recorded as `answer-disagreement` unless an independent data oracle applies. An intentionally unchecked DESCRIBE answer has
 no fingerprint in the record and does not vote for the majority. The collector no
 longer treats matching unchecked markers as proof of agreement. The durability class of §5.1 is filled in for
 update results only, and no suite has a long write run yet.
@@ -1185,3 +1185,160 @@ is released when the cursor ends. On atlas at 1M with four threads, an approxima
 measurement on a shared host, streamed `q4` execution fell from about 2.7 s to 1.4 s,
 eager execution stayed at about 0.4 s, and the answers stayed the same. A test counts the
 ledger operations of 2,000 cursor comparisons against a filter that compares nothing.
+
+### Remaining competitive benchmark losses
+
+Roadmap item 307 follows the competitive query and durable-write improvements. It
+rechecks the published losses with the resulting build before choosing further
+optimizations. Its work is separate from refreshing the comparison records in item 1.
+The remaining LUBM q2 gap belongs to the preceding competitive query work.
+
+The first step rebuilds the loss inventory from the full benchmark tables as well as
+[Where Sparkles loses](../BENCHMARKS.md#where-sparkles-loses). A case already brought
+within the comparison's ten-percent tie band needs a matching measurement and an updated
+record. A loss that remains needs a profile and a fix, followed by the comparison again.
+An internal A/B improvement alone does not establish that Sparkles leads the other engine.
+
+| Work | Published evidence and required coverage |
+|---|---|
+| DBpedia | Recheck the 50M slice's `births-by-decade`, where QLever leads by 4.9 times warm and 1.7 times cold, and cold `outlink-classes-2` at 1.24 billion triples. Keep both dataset sizes so a win at full scale does not hide a smaller-scale regression. |
+| Remaining BSBM queries | Complete the investigation of BI q3 and Explore q7 and q8. Profiles of these cases do not count as closed competitor gaps. |
+| Cold reads | Recheck cold point lookups against Oxigraph and small cold scans against Fluree at 1.05M and 10.5M. Coordinate changes with item 4 and X07, including their warm-query and dense-read guards. |
+| Bindings | Recheck JVM and Python small queries, rdflib calls, Node adds and probes, and Node `export-500k`. Item 33 coordinates this work, including fresh quiet-host measurements of JVM resource descriptions and DELETE/INSERT WHERE, whose shared-host timings show further possible losses. |
+| Mixed reads and writes | Recheck the write-rate gap under concurrent readers as well as serial commits, while preserving durable acknowledgements. Compare the read rates and latency tails alongside the write rate, and keep the engines' synchronization policies explicit. |
+| Smaller query losses | Recheck WatDiv L1-1 and changed-store `two-hop-count`, whose published gaps are near ten percent. Use enough rounds to distinguish a persistent loss from measurement variation. |
+
+The binding comparisons include Python's small VALUES query and rdflib's `contains`
+and `Graph.value` calls. The JVM microbenchmarks include the fixed cost of entering the
+native binding and constructing Jena results. A repair must preserve transaction,
+term-conversion and iterator behavior rather than remove work that the public API needs.
+
+Each comparison uses the same input digest, query, result format and qualified answers,
+with matched compiler and cache settings where appropriate. Published numbers come from
+quiet forge runs. Warm and cold cases remain distinct, and every cold comparison records
+its eviction method. The write comparisons retain Sparkles' acknowledgement durability
+and report a competitor's unsynchronized commits as a different policy.
+
+The loss inventory also retains the documented memory and index-size differences under
+item 40. Mapped file pages, reclaimable caches and private heap must be distinguished,
+and text indexes must be compared with their predicate scope and features stated. These
+are separate footprint tradeoffs. This follow-up does not silently reduce caches or
+remove features to improve a ranking, and the standing priority remains speed unless a
+memory cost is egregious.
+
+Implement and review changes in independent groups, with correctness tests and broad
+regression screens. Update README, BENCHMARKS and the corresponding spec outcomes only
+when measurements support the new comparison. Record any accepted slowdown as roadmap
+work and any measured rejected optimization in PERFORMANCE-EXPERIMENTS, retaining its
+commit and revert. Item 307 remains open while confirmed speed losses remain, unless the
+user explicitly accepts a tradeoff or removes a case from scope.
+
+### Keyed inner groups and short ASKs
+
+BSBM BI `q2` links two disconnected groups with a FILTER equality. They now use a
+keyed inner join instead of materializing their product. Candidate keys preserve value
+equality for numeric and temporal datatypes, language tags and triple terms, and the
+whole condition still tests each candidate. Eager LIMIT and ASK bound the larger input
+in growing prefixes rather than evaluating both inputs completely.
+
+Large native ASKs over these joins alternate input reads and stop at the first matching
+pair. This retains prefixes of both inputs while both can produce rows, which can use
+more memory than an ordinary hash join. When one input ends, the other input's old
+history is discarded and only its active probe batch remains. Both index growth and
+temporary buffers must fit the query budget before allocation. Automatic admission
+keeps a cheap eager prefix only when exact scan counts prove that it fits, including
+when named-graph statistics discount estimates.
+
+A singleton triple pattern can supply a constant to other patterns and arithmetic
+FILTER bounds in the same group. The planner reads at most two rows from a pattern
+with one free variable and at most four estimated rows, and substitutes only a proved
+single result. The output variable is reconstructed with its original RDF term.
+Volatile filters, application callbacks and occurrences across algebra boundaries keep
+the ordinary binding. This narrows BSBM Explore `q5` and SP²Bench `q12b` without changing
+their answers. STRLEN comparisons with integer constants can test vocabulary keys
+directly, preserving Unicode scalar counts, language strings and STR coercion.
+
+Adversarial coverage exercises native ASK at batch sizes one, seven and 4096, empty and
+disjoint inputs, late matches after EOF, graph-discounted estimates, value-equality
+errors, unbound values, cancellation, deadlines and resource limits. Singleton tests
+cover graph scope, duplicate solutions, RDF term identity, blank nodes, numeric bounds,
+OPTIONAL, subqueries, paths, EXISTS and snapshots with a delta. The paired comparisons
+are recorded below. Roadmap item 91 retains the remaining `q12b` cost.
+
+### Matched query comparisons
+
+The paired forge record for `2ec8a266` compares Jena and Oxigraph on the SP²Bench ASKs,
+and QLever and Fluree on BSBM BI `q2` and Explore `q5`. Each engine ran alone, first
+with five warm-ups and twenty timed requests, then in reverse engine order with ten
+warm-ups and thirty requests. The input hashes and pinned engine binaries match the
+published suites. The [record](../benchmarks/2026-10-25-competitive-query-pairs-forge.json)
+keeps both passes and the answer fingerprints.
+
+Sparkles answers `q12a` in a mean of 3.8 ms against Jena's 9.0 ms. Its pooled median
+on BI `q2` is 20.54 ms against QLever's 162.30 ms, and on Explore `q5` it is 4.65 ms
+against Fluree's 5.59 ms. The closest Explore `q5` instance is within 4% of Fluree.
+A separate streamed data oracle derives the BI `q2` counts from feature-set
+intersections and Product membership. All three ordered answers agree with it, and
+their pooled fingerprint is the published Sparkles answer fingerprint.
+
+`q12b` remains slower than Oxigraph, at 5.0 ms against 3.8 ms, and stays open under
+roadmap item 91. LUBM `q2` probe fanout and serial durable commit overhead remain open
+under item 290. The write work retains synchronization before acknowledgement.
+
+### Short-query checks after keyed inner groups
+
+The Namespace guard against `a5847311` used matching compiler signatures and returned
+the same answers for every query. It passed the regression threshold while accepting
+small increases for `class-predicates`, `exists-join` and `two-hop-count`. These effects
+remain unconfirmed on Intel. Roadmap item 299 tracks matched Intel checks and a fix for
+any confirmed cost. The screen does not establish current parity with other engines.
+
+### Independent BSBM answer checks
+
+The correctness audit added a source-data oracle for BI q6 and q7 and record version 3.
+The recorder binds each verdict to the dataset digest, query digest and captured answer
+fingerprints. It preserves different fingerprints for equivalent numeric scores and legal
+LIMIT ties. BI q6 captures from all five engines pass the numeric bounds, and every
+successful retained q7 capture is a legal tied selection. The retained Fluree q7 capture
+has 80 pooled rows and replaces an unavailable 77-row fingerprint. Timing samples are
+unchanged. New unresolved majority mismatches use `answer-disagreement`, while a failed
+independent oracle uses `wrong-answer`. Readers retain support for versions 1 and 2 and
+refuse unknown versions.
+
+A separate direct check confirmed Sparkles' three fixed instances each of Explore q8,
+q11 and q12 against the generated triples. BI q2 also passed a direct feature-intersection
+oracle. BI q3 and q8 and the full DBpedia births-by-decade disagreement still lack direct
+data-oracle checks. No minority engine's semantic error follows from a majority alone.
+
+### Small query costs in the integration screen
+
+The matching-compiler Namespace comparison of `a5847311` and `4f2e1633` returned the
+same answers for all 30 queries. Four A,B,B,A rounds at 100,000 generated people gave
+server and client geometric means of 0.970 and 0.956 for the later build over the earlier
+one. The first screen flagged `count-all`, `distinct-obj`, `employee-docs` and
+`exists-join`. Eight rounds with 20 warm-ups and 100 timed requests per process cleared
+them, with server ratios from 0.979 to 1.004 and client ratios from 0.991 to 1.003.
+These timings do not establish significance or a cost on Intel.
+
+The gate accepts the remaining small increases while roadmap item 328 tracks their
+Intel confirmation. This includes noise candidates and client-only variation. The
+ratios below use the longer rerun for its four queries and the initial screen otherwise.
+The existing items 299 and 306 remain open for their recorded comparisons.
+
+| Query | Server B/A | Client B/A |
+|---|---:|---:|
+| `class-predicate-list` | 1.003 | 0.942 |
+| `class-predicates` | 1.027 | 0.995 |
+| `contains` | 1.012 | 1.048 |
+| `distinct-join` | 1.042 | 1.057 |
+| `employee-docs` | 0.998 | 1.003 |
+| `exists-join` | 1.004 | 0.993 |
+| `expr-agg-arg` | 1.031 | 1.062 |
+| `expr-bind-group` | 1.030 | 1.022 |
+| `expr-order-key` | 1.007 | 0.975 |
+| `regex-iri` | 1.013 | 0.981 |
+
+The Intel check uses the same source revisions, compilers, data and query settings, with
+both engines run alone on the host. It checks the small queries that Namespace cannot
+resolve and profiles any repeated instruction or latency increase before choosing a fix.
+No row is removed merely because its increase is below the push gate.

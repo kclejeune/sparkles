@@ -74,17 +74,18 @@ On larger and standard workloads:
 * **LUBM(100).** Over the 24.3M triples of the OWL 2 RL closure, which Sparkles
   materializes in 17.8 s, Sparkles is fastest on 13 of 14 queries. QLever is 3.7× faster
   on `q2`.
-* **SP²Bench at 10M triples.** Sparkles is fastest on 13 of the 17 queries and is the only
+* **SP²Bench at 10M triples.** Paired forge runs put `q12a` at 3.8 ms against Jena's
+  9.0 ms, while `q12b` remains at 5.0 ms against Oxigraph's 3.8 ms. Sparkles is the only
   engine that answers `q5a`, whose rows match an independent oracle. It answers `q6` in
   0.95 s, 115× faster than Jena. Its `q4` answer of 1.96 GB is larger than the default
-  response budget. Jena is 12× faster on the ASK query `q12a` and Oxigraph 1.7× on `q12b`.
-* **BSBM Explore at 10M triples.** Sparkles has the lowest pooled median on seven of the
-  ten templates whose answers are checked. Fluree is 2.9× faster on q5, and Oxigraph is
-  faster on q7 and q8. Fluree's driver throughput is two to three times Sparkles' in both
+  response budget.
+* **BSBM Explore at 10M triples.** The paired `q5` pooled median is 4.65 ms against
+  Fluree's 5.59 ms, with the closest instance within 4%. Oxigraph is faster on q7 and
+  q8. Fluree's driver throughput is two to three times Sparkles' in both
   mixes, but it is not ranked because its q8, q11 and q12 answers differ.
 * **BSBM BI at 10M triples.** Every engine's q4 and q5 averages pass an exact oracle
-  within float rounding. Sparkles has the lowest median on q1 and q4 to q8, and QLever is
-  11.2× faster on q2 and 1.24× on q3. No engine completes a driver throughput run with
+  within float rounding. The paired `q2` median is 20.54 ms against QLever's 162.30 ms.
+  QLever remains 1.24× faster on q3. No engine completes a driver throughput run with
   answers qualified against the others.
 * **Durable writes.** A commit that adds a new literal takes a median of 1.13 ms at 1.05M
   and 1.28 ms at 10.5M, synchronized to disk before it is acknowledged. Oxigraph commits
@@ -108,10 +109,10 @@ than 10%. Fluree's warm advantages on `distinct-obj` at 1.05M and on two small D
 
 | Case | Reference advantage | Qualification |
 |---|---|---|
-| SP²Bench `q12a` and `q12b`, 10M | Jena 12× on `q12a`, Oxigraph 1.7× on `q12b` | Sparkles answers the ASK query `q12a` in 73.7 ms and `q12b` in 7.2 ms ([roadmap](ROADMAP.md) item 91). |
+| SP²Bench `q12b`, 10M | Oxigraph 1.33× | The paired mean is 5.0 ms for Sparkles against 3.8 ms for Oxigraph ([roadmap](ROADMAP.md) item 91). |
 | WatDiv `L1-1`, 10.97M | Fluree 1.11× | Sparkles has the lowest mean on 19 of 20 templates, ties Fluree on S7 and leads on 81 of 88 instances. |
-| BSBM Explore `q5`, `q7` and `q8`, 10M | Fluree 2.9× on `q5`, Oxigraph 1.2× on `q7` and 1.4× on `q8` | Pooled medians cover three instances per template. Wrong answers are excluded from the ranking. |
-| BSBM BI `q2` and `q3`, 10M | QLever 11.2× on `q2` and 1.24× on `q3` | The three fixed-instance answer checks agree. The driver cells have not been rerun since [roadmap](ROADMAP.md) item 96 removed the budget refusal that failed them. |
+| BSBM Explore `q7` and `q8`, 10M | Oxigraph 1.2× on `q7` and 1.4× on `q8` | Pooled medians cover three instances per template. Wrong answers are excluded from the ranking. |
+| BSBM BI `q3`, 10M | QLever 1.24× | The three fixed-instance answer checks agree. The driver cells have not been rerun since [roadmap](ROADMAP.md) item 96 removed the budget refusal that failed them. |
 | LUBM(100) `q2` | QLever 3.7× | Sparkles is fastest on 13 of 14 queries. |
 | Changed-store `two-hop-count`, 1.05M | Fluree 1.10× | Sparkles takes 8.6 ms against 7.8 ms with 5,000 changes in its delta, and 5.1 ms on the loaded store. |
 | Serial durable commits | Oxigraph 1.84× on literal inserts at 1.05M and 1.39× at 10.5M | The same durability difference. |
@@ -416,7 +417,8 @@ Testing of RDF Data Management Systems,” ISWC 2014.
 
 SP²Bench v1.01 generates bibliographic data in the style of DBLP. At 10M triples its
 N-Triples file is 1.49 GB. The 17 queries ran with a request limit of 600 s. Times are
-mean ± σ in ms over 10 runs after 2 warm-ups. In the answer check, which keeps all five
+mean ± σ in ms. The paired `q12a` and `q12b` cells use 30 runs after 10 warm-ups, and
+the other cells use 10 runs after 2 warm-ups. In the original answer check, which kept all five
 servers up, the servers of QLever and Fluree were killed during `q4`, so their answers
 from `q5a` on were not checked (§). `mise run bench:sp2b 10m` reproduces the run.
 
@@ -436,13 +438,15 @@ from `q5a` on were not checked (§). `mise run bench:sp2b 10m` reproduces the ru
 | q9 | **158.5 ± 33.5** | 4227.3 ± 15.1 | 284.1 ± 8.6 § | 6160.2 ± 46.5 § | 5202.0 ± 22.1 |
 | q10 | **3.8 ± 0.2** | 7.3 ± 0.5 | 6.8 ± 0.6 § | 4.2 ± 0.2 § | 7.6 ± 0.9 |
 | q11 | **103.1 ± 9.0** | 375.8 ± 21.4 | 42.8 ± 2.8 § | 51.7 ± 0.8 § | 31619.1 ± 97.9 |
-| q12a | 73.7 ± 3.2 | **6.2 ± 0.5** | 245.1 ± 7.3 § | 1670.3 ± 5.7 § | 4883.4 ± 46.4 |
-| q12b | 7.2 ± 0.3 | 7.3 ± 0.6 | error | 180.5 ± 2.9 § | **4.2 ± 0.2** |
+| q12a | **3.8 ± 0.1** | 9.0 ± 1.1 | 245.1 ± 7.3 § | 1670.3 ± 5.7 § | 6794.7 ± 61.5 |
+| q12b | 5.0 ± 0.2 | 9.7 ± 1.3 | error | 180.5 ± 2.9 § | **3.8 ± 0.1** |
 | q12c | **3.6 ± 0.1** | 6.7 ± 0.2 | 4.2 ± 0.1 § | 3.4 ± 0.1 § | 3.7 ± 0.1 |
 
-*Sparkles was measured on forge on 2026-10-23 at commit 6699f27d, and the other engines on
-2026-10-19. The [SP²Bench record](benchmarks/2026-10-23-sp2b-10m-forge.json) has the
-samples and answer fingerprints.*
+*The `q12a` and `q12b` cells for Sparkles, Jena and Oxigraph come from the
+[paired forge record](benchmarks/2026-10-25-competitive-query-pairs-forge.json), with
+Sparkles at `2ec8a266`. The other Sparkles cells were measured at `6699f27d`, and the
+[SP²Bench record](benchmarks/2026-10-23-sp2b-10m-forge.json) keeps their samples and the
+other engine cells.*
 
 Sparkles is the only engine that answers `q5a`, whose 385,208 rows match an independent
 oracle built from the data, in 3.9 s. Its answers to `q8`, `q12a` and `q12b` agree with
@@ -460,9 +464,8 @@ error with the default settings. With `--max-result-mb 4096` on one thread and w
 server cap, a streamed answer takes 30.4 s and an eager one 16.3 s. These figures come from
 forge on 2026-10-23.
 
-Two queries are losses. Jena answers the ASK query `q12a` in 6.2 ms, 12× faster than
-Sparkles' 73.7 ms, and Oxigraph answers `q12b` in 4.2 ms against Sparkles' 7.2 ms
-([roadmap](ROADMAP.md) item 91). On `q11` the unchecked times of QLever and Fluree, 42.8
+Sparkles answers `q12a` faster than Jena in both paired passes. `q12b` remains 1.33× slower than
+Oxigraph ([roadmap](ROADMAP.md) item 91). On `q11` the unchecked times of QLever and Fluree, 42.8
 and 51.7 ms, are lower than Sparkles' 103.1 ms.
 
 Sparkles loads the data in 3.93 s, against 8.90 s for Fluree, 9.70 s for QLever, 20.49 s
@@ -850,9 +853,11 @@ Requests for the next chunk overlap the writing of the current one. This holds u
 
 This run used 10,095,035 generated triples and 28,480 products. The configured driver mix
 produced three instances of each of eleven query templates. Each latency below is the
-pooled median of thirty HTTP samples, after two warm-up requests per instance. DESCRIBE
+pooled median of thirty HTTP samples, after two warm-up requests per instance, except
+`q5`'s paired Sparkles, QLever and Fluree cells, which pool ninety samples after ten
+warm-ups per instance. DESCRIBE
 answers are not compared because SPARQL leaves their contents to the engine. A dagger
-marks a wrong answer, whose latency is not ranked.
+marks an unresolved answer disagreement, whose latency is not ranked.
 `SPARKLES_ALLOW_GPL_BENCHMARK=1 mise run bench:bsbm 10m` reproduces the run.
 
 | Template, median ms | Sparkles | Jena | QLever | Fluree | Oxigraph |
@@ -861,7 +866,7 @@ marks a wrong answer, whose latency is not ranked.
 | q2 | **4.09** | 9.31 | 14.91 | 4.41 | 4.67 |
 | q3 | **4.02** | 8.22 | 12.64 | 4.53 | 4.79 |
 | q4 | **4.11** | 8.23 | 25.43 | 5.25 | 5.65 |
-| q5 | 15.91 | 629.44 | 20.93 | **5.58** | 42.65 |
+| q5 | **4.65** | 629.44 | 20.26 | 5.59 | 42.65 |
 | q7 | 5.27 | 7.23 | 90.64 | 5.07 | **4.51** |
 | q8 | 5.97 | 7.26 | 50.76 | 4.29 † | **4.13** |
 | q9, unranked | 3.46 | 6.61 | 6.24 | 3.61 | 3.67 |
@@ -869,14 +874,19 @@ marks a wrong answer, whose latency is not ranked.
 | q11 | **3.41** | 6.63 | 6.13 | 3.56 † | 3.54 |
 | q12 | **3.65** | 7.18 | 11.96 † | 3.96 † | 3.90 |
 
-*Sparkles was measured on forge on 2026-10-23 at commit 6699f27d, and the other engines on
-2026-10-19. The [Explore record](benchmarks/2026-10-23-bsbm-10m-explore-forge.json) has
-every result, fingerprint and driver status.*
+*The paired `q5` cells for Sparkles, QLever and Fluree come from the
+[query record](benchmarks/2026-10-25-competitive-query-pairs-forge.json), with Sparkles
+at `2ec8a266`. The [Explore record](benchmarks/2026-10-23-bsbm-10m-explore-forge.json)
+keeps the other cells, measured with Sparkles at `6699f27d`, and the driver status.*
 
-Fluree returned different answers for q8, q11 and q12. QLever differed on q12. The
+Direct checks against the generated triples independently confirm Sparkles' answers to
+all three instances of q8, q11 and q12. The checks reconstruct the selected reviews,
+product offers and CONSTRUCT triples without a SPARQL engine. Fluree's retained value
+fingerprints differ on those nine instances. QLever differs on q12. The
 q9 row is a DESCRIBE whose answers are not compared, so it is not ranked.
-Fluree was fastest on q5 among engines with correct answers, at 5.58 ms against
-Sparkles' 15.91 ms. Oxigraph was fastest on q7, 1.17 times faster, and on q8, 1.45 times.
+Sparkles has the lower pooled q5 median in both paired passes. The closest instance
+takes a mean of 4.58 ms against Fluree's 4.76 ms, within 4%. Oxigraph was fastest on
+q7, 1.17 times faster, and on q8, 1.45 times.
 
 The driver ran fifty warm-up mixes and five hundred measured mixes with each
 client count. The standard mix includes DESCRIBE and CONSTRUCT, which the driver
@@ -900,8 +910,9 @@ The 100M scale has not been measured.
 ### BSBM BI at 10M triples
 
 This run used the same 10,095,035 triples and 28,480 products. Each template has three
-fixed instances, timed ten times after two warm-ups per instance, and the table pools
-those thirty HTTP samples. A dagger marks an answer that differs from the majority and is
+fixed instances. The paired `q2` cells for Sparkles, QLever and Fluree pool ninety HTTP
+samples after ten warm-ups per instance. The other cells pool thirty samples after
+two warm-ups per instance. A dagger marks an answer that differs from the majority and is
 excluded from ranking. Oxigraph timed out on two q7 instances, so its pooled cell is a
 timeout. `SPARKLES_ALLOW_GPL_BENCHMARK=1 mise run bench:bsbm 10m --usecase bi` reproduces
 the run.
@@ -909,17 +920,18 @@ the run.
 | Template, median ms | Sparkles | Jena | QLever | Fluree | Oxigraph |
 |---|---:|---:|---:|---:|---:|
 | q1 | **13.59** | 3,241.71 | 52.51 | 155.26 | 2,077.28 |
-| q2 | 2,015.52 | 3,562.21 | **179.28** | 23.10 † | 32,569.39 |
+| q2 | **20.54** | 3,562.21 | 162.30 | 22.50 † | 32,569.39 |
 | q3 | 35.18 | 1,733.90 | **28.45** | 287.78 † | 3,287.87 |
 | q4 | **152.80** | 8,452.57 | 1,848.57 | 162.22 | 6,868.73 |
 | q5 | **27.32** | 198.17 | 98.63 | 693.70 | 138.93 |
-| q6 | **16.50** | 23.72 | 67.88 † | 338.27 † | 28.77 |
-| q7 | **52.62** | 74.60 | 59.38 | 210.01 † | timeout |
+| q6 | **16.50** | 23.72 | 67.88 | 338.27 | 28.77 |
+| q7 | **52.62** | 74.60 | 59.38 | 210.01 | timeout |
 | q8 | **35.04** | 121.75 | 68.09 † | 202.66 † | 184.04 |
 
-*Sparkles was measured on forge on 2026-10-23 at commit 6699f27d, and the other engines
-from 2026-10-20 to 2026-10-21. The [BI record](benchmarks/2026-10-23-bsbm-10m-bi-forge.json)
-preserves all 55 cells, including failures.*
+*The paired `q2` cells for Sparkles, QLever and Fluree come from the
+[query record](benchmarks/2026-10-25-competitive-query-pairs-forge.json), with Sparkles
+at `2ec8a266`. The [BI record](benchmarks/2026-10-23-bsbm-10m-bi-forge.json) preserves
+the other cells, measured with Sparkles at `6699f27d`, including failures.*
 
 The answer checks compare raw answers captured on atlas, where each engine served the same
 data alone with the same binaries, because QLever's check on forge left q4 to q8 without
@@ -929,16 +941,29 @@ floats. `scripts/bench-bsbm/bi-float-oracle.py` computes the exact mean of the
 float-rounded prices of every q4 and q5 instance from the data and accepts a value
 within the error bound of a float summation in any order. All five engines' q4 and q5
 answers pass it, with the same rows, counts and IRIs. Sparkles, Jena and Oxigraph return
-`xsd:float`, QLever `xsd:decimal` and Fluree `xsd:double`. On the other templates,
-Sparkles' answers agree with Jena's on every instance, with QLever's on all but q6 and
-two q8 instances, and with Oxigraph's except on q7. There Oxigraph timed out on one
-instance, and on another Oxigraph and Fluree return 79 rows where Sparkles, QLever and
-Jena return 81. Fluree differs from the others on q2, q3, q6, q7 and q8.
+`xsd:float`, QLever `xsd:decimal` and Fluree `xsd:double`.
 
-Sparkles has the lowest median on q1 and q4 to q8. Its q4 lead over Fluree is within
-10%. QLever is 11.2 times faster on q2 and 1.24 times on q3, where its answers agree
-with Sparkles'. QLever's q6 answers and two of its three q8 answers differ from the
-majority, so those cells carry a dagger.
+`scripts/bench-bsbm/bi-answer-oracle.py` independently computes q6 reviewer scores and
+its HAVING threshold from the same data. All five engines' three q6 captures pass the
+binary32 error bounds. This establishes numeric equivalence for the comparison, rather
+than identical RDF datatypes. The same tool checks every successful retained q7 capture
+against the offer counts and country exclusions. The inner LIMIT orders only by offer
+count. On the third instance 41 products tie for its last 21 places, and the outer
+country filter permits 75 to 85 rows. The 81-row Sparkles, Jena and QLever answers and
+the 79-row Fluree and Oxigraph answers are all valid. The checked Fluree captures total
+80 rows across the three instances. They replace an unavailable 77-row fingerprint in
+the record without changing any timing sample.
+
+The paired q2 answers also pass an independent streamed data oracle for Product
+membership, common-feature counts, anchor exclusion and the complete ordered top ten.
+Its pooled fingerprint matches the published Sparkles answer pool. Fluree's q2 pool
+differs from that independently verified result, and remains unranked.
+
+Fluree's q3 and q8 answers and two QLever q8 answers remain unresolved fingerprint
+disagreements. The q3 and q8 exclusions have no independent data oracle. Sparkles has
+the lowest median on q1, q2 and q4 to q8. Its q4 lead over Fluree is within 10%.
+QLever remains 1.24 times faster on q3, where its answers agree with Sparkles'. Its two
+q8 instances whose answers differ from the majority carry a dagger.
 
 The driver uses generated parameters beyond the three fixed instances. It requested
 fifty warm-up mixes and five hundred measured mixes at each client count, with a
@@ -960,7 +985,7 @@ with a peak resident size of 282 MB under the default pool, where eager executio
 it. QLever's driver failed with a refused connection at one client and HTTP 500 at four and
 sixteen clients. Jena and Oxigraph timed out at every client count. Fluree alone completed
 two driver cells, but their result-count check has no successful competing engine to
-compare, and its fixed q2, q3, q6, q7 and q8 answers disagree, so its QMpH figures are not
+compare, and its fixed q2, q3 and q8 answers have unresolved disagreements, so its QMpH figures are not
 ranked.
 
 ## Full-text search
@@ -1351,6 +1376,16 @@ A pinned forge comparison of the combined feature changes, with 16 A,B,B,A round
 against 5.3 µs and `distinct-obj` 14.5% higher at 4.2 µs against 3.6 µs. Every round was slower for both
 queries. Client time stayed within 1.2%, at about 0.30 ms. Item 306 tracks isolating and
 removing the server-time cost.
+
+A diagnostic A,B,B,A comparison of the same builds counted about 11% fewer user-space
+instructions for each complete HTTP request in the later build. It used 20,000 requests
+per query and server process over persistent connections, with the server on CPU 2, the
+client on CPU 4 and one Rayon thread on forge. The answers and operators agreed. These
+counters include parsing, planning and serialization, so their reduction does not
+establish that execution itself does less work. The index-count routine has the same
+instruction sequence in both binaries after addresses are normalized. Checks of the
+intermediate builds did not isolate a single responsible change. Item 306 remains open
+for a measurement confined to execution and its plan bookkeeping.
 
 ### The cost of the query memory pool
 
@@ -2241,6 +2276,14 @@ ratio of group medians changed from 3.40 to 0.30 and 0.18 across the three group
 run does not isolate a cost of the inference change. Item 265 tracks profiling this
 latency variation and obtaining a stable comparison.
 
+Syscall tracing of four more processes in A,B,B,A order, after SSD trimming on forge,
+located the large variation inside writes to the WAL and delta vocabulary. Blocks of
+3,000 aligned writes had median syscall times between about 0.24 and 1.55 ms. Both
+builds switched between faster and slower writes within a process. Tracing changes the
+timings, so these figures diagnose where the variation occurs rather than measure the
+inference change's cost. Item 265 requires a comparison with matched durable-write
+latency before attributing a difference to the engine.
+
 ## Bindings
 
 The bindings embed the engine in a JVM, Python or Node.js process. The comparison of
@@ -2868,7 +2911,10 @@ file, medians of 3 runs:
 before timing and fingerprints it by the row count, by the solution multiset under RDF
 term identity, and by the same multiset with numbers compared by value to 12 significant
 digits. An engine whose answer differs in value from the majority is marked † and not
-ranked. A ‡ marks equal values returned as different RDF terms. `export-500k` uses LIMIT
+ranked unless an independent data oracle accepts the difference. A majority is a screening
+rule, not proof that its answer is correct. Unresolved disagreements remain excluded,
+including the full DBpedia births-by-decade counts of 165 and 171, which have no retained
+independent data check. A ‡ marks equal values returned as different RDF terms. `export-500k` uses LIMIT
 without ORDER BY, so only its row count is checked.
 
 ### Engine failures

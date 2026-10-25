@@ -1,6 +1,26 @@
 //! Catalog rename through HTTP: identity, routing, live views and reservations.
 use super::*;
 
+fn create_without_background_views(st: &AppState, name: &str) -> Arc<crate::state::Dataset> {
+    let ds = st
+        .catalog
+        .create(
+            name,
+            &sparkles::catalog::CreateDataset {
+                kind: DbType::Persistent,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+    // Close the empty runtime before wrapping starts its worker. These tests isolate
+    // client handles from maintenance handles that can briefly outlive a request.
+    ds.inner_state().views.close(ds.store());
+    drop(ds);
+    let ds = st.get(name).unwrap();
+    assert!(ds.dataset.inner_state().views.is_closed());
+    ds
+}
+
 async fn rename(app: &Router, source: &str, target: &str) -> Resp {
     send(
         app,
@@ -18,7 +38,7 @@ async fn rename_preserves_identity_and_data_and_reopens() {
     let st = Arc::new(
         AppState::new(dir.path(), StoreOptions::default(), Duration::from_secs(30)).unwrap(),
     );
-    let ds = st.create("old", DbType::Persistent).unwrap();
+    let ds = create_without_background_views(&st, "old");
     ds.store
         .load(&[Source::from_bytes(
             b"<urn:s> <urn:p> 1 .".to_vec(),
@@ -54,8 +74,8 @@ async fn rename_rejects_invalid_missing_existing_reserved_and_live_branch() {
     let st = Arc::new(
         AppState::new(dir.path(), StoreOptions::default(), Duration::from_secs(30)).unwrap(),
     );
-    drop(st.create("old", DbType::Persistent).unwrap());
-    drop(st.create("existing", DbType::Persistent).unwrap());
+    drop(create_without_background_views(&st, "old"));
+    drop(create_without_background_views(&st, "existing"));
     let app = router(st.clone());
     assert_eq!(
         rename(&app, "old", "../bad").await.status,

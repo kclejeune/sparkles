@@ -29,6 +29,7 @@ mod group;
 mod joinspill;
 pub use graph::{GraphBatch, GraphCursor, graph_cursor};
 mod merge;
+mod ripple;
 mod topk;
 mod walk;
 
@@ -946,6 +947,28 @@ fn filtered_ask_admitted(ctx: &Ctx, node: &Node) -> bool {
         }
         filtered = &filtered.children[0];
     }
+    // A large keyed ASK can avoid reading either input whole. When the smaller
+    // input and a prefix of the larger one fit, limited eager execution is cheaper
+    // for estimated-small inputs, especially a selective filter that proves empty.
+    if let Kind::KeyedJoin { .. } = filtered.kind {
+        let [a, b] = filtered.children.as_slice() else {
+            return false;
+        };
+        if !a.est.is_finite() || !b.est.is_finite() || a.est < 0.0 || b.est < 0.0 {
+            return false;
+        }
+        let (small, large) = if a.est <= b.est { (a, b) } else { (b, a) };
+        let prefix = large.est.min(64.0);
+        let candidates = small.est * prefix;
+        let held =
+            small.est * (small.vars.len() * 8) as f64 + prefix * (large.vars.len() * 8) as f64;
+        let bytes = candidates * ((filtered.vars.len() + 1) * 8) as f64 + held;
+        let bounded = candidates <= ctx.max_rows as f64
+            && bytes <= ctx.memory_remaining() as f64
+            && exact_scan(ctx, a)
+            && exact_scan(ctx, b);
+        return (small.est >= AUTO_SCAN_ROWS || !bounded) && native(filtered);
+    }
     let Kind::Filter(expressions) = &filtered.kind else {
         return false;
     };
@@ -1034,7 +1057,7 @@ fn filtered_ask_admitted(ctx: &Ctx, node: &Node) -> bool {
 /// that eager limited execution collects, while streaming the larger one. Other
 /// cursor and eager plans retain their original children and variable order.
 /// Any other shape, which a future cursor admission might pass here, is left alone.
-fn orient_filtered_ask(node: &mut Node) {
+fn orient_filtered_ask(node: &mut Node, ctx: &Ctx) {
     use super::plan::JoinAlgo;
 
     let Some(mut filtered) = node.children.first_mut() else {
@@ -1045,6 +1068,14 @@ fn orient_filtered_ask(node: &mut Node) {
             break;
         }
         filtered = &mut filtered.children[0];
+    }
+    if let Kind::KeyedJoin { ripple, .. } = &mut filtered.kind {
+        // the first matching pair answers the ASK
+        *ripple = filtered.children.len() == 2;
+        for input in &mut filtered.children {
+            first_rows(input, ctx);
+        }
+        return;
     }
     if !matches!(filtered.kind, Kind::Filter(_)) {
         return;
@@ -1062,6 +1093,41 @@ fn orient_filtered_ask(node: &mut Node) {
         && product.children[0].est < product.children[1].est
     {
         product.children.swap(0, 1);
+    }
+}
+
+/// A ripple join reads its inputs a few rows at a time, so a hash join below it that
+/// reads one input whole before its first row costs more than probing the index of a
+/// pattern for each row it needs. Each hash join with a triple pattern as one input
+/// becomes an index join from its other input into that pattern, when that input
+/// always binds the pattern's key and the index join keeps the order the hash join
+/// promised.
+fn first_rows(node: &mut Node, ctx: &Ctx) {
+    use super::plan::JoinAlgo;
+    for child in &mut node.children {
+        first_rows(child, ctx);
+    }
+    if !matches!(
+        node.kind,
+        Kind::Join {
+            algo: JoinAlgo::Hash,
+            ..
+        }
+    ) || node.children.len() != 2
+    {
+        return;
+    }
+    for drive in [0, 1] {
+        if let Some(joined) = super::indexjoin::index_join_for_first_rows(
+            &node.children[drive],
+            &node.children[1 - drive],
+            ctx,
+        ) && joined.sorted.starts_with(&node.sorted)
+            && joined.vars.len() == node.vars.len()
+        {
+            *node = joined;
+            return;
+        }
     }
 }
 
@@ -1186,7 +1252,10 @@ fn cursor_state_bytes(ctx: &Ctx, node: &Node) -> f64 {
             // a join with no shared variable has no key, so it builds no hash index,
             // except a keyed OPTIONAL, which indexes its equality column
             if build.vars.iter().any(|v| probe.vars.contains(v))
-                || matches!(node.kind, Kind::KeyedLeftJoin { .. })
+                || matches!(
+                    node.kind,
+                    Kind::KeyedLeftJoin { .. } | Kind::KeyedJoin { .. }
+                )
             {
                 hashed(build, build.est)
             } else {
@@ -1483,7 +1552,7 @@ pub fn query_execution_with_plan(
                 && !matches!(&parsed, spargebra::Query::Select { pattern, .. } if calls_service(pattern));
             if prepared.ctx.is_cursor() {
                 if kind == QueryKind::Ask {
-                    orient_filtered_ask(&mut prepared.node);
+                    orient_filtered_ask(&mut prepared.node, &prepared.ctx);
                 }
                 let (cursor, _, _) = from_prepared(
                     prepared, &parsed, query, options, cursor, started, parse_ms, plan_ms, levels,
@@ -2081,6 +2150,7 @@ enum State {
     Merge(Box<merge::Merge>),
     Distinct(distinct::Distinct),
     Binary(Box<binary::Binary>),
+    Ripple(Box<ripple::Ripple>),
     Group(Box<group::Group>),
     Filter(Box<filter::Filter>),
     Expand(Box<expand::Expand>),
@@ -2171,7 +2241,7 @@ fn own_exprs(kind: &Kind) -> Vec<&Expr> {
         | Kind::CountFilterScan { filter: exprs, .. } => exprs.iter().collect(),
         Kind::Extend(_, expr) | Kind::Assign(_, expr) | Kind::Unfold { expr, .. } => vec![expr],
         Kind::LeftJoin { expr } => expr.iter().collect(),
-        Kind::KeyedLeftJoin { expr, .. } => vec![expr],
+        Kind::KeyedLeftJoin { expr, .. } | Kind::KeyedJoin { expr, .. } => vec![expr],
         Kind::OrderBy { keys, .. } => keys.iter().map(|(key, _)| key).collect(),
         Kind::Group { aggs, .. } => aggs
             .iter()
@@ -2283,6 +2353,7 @@ fn value_ordered(node: &Node) -> bool {
         | Kind::Minus
         | Kind::LeftJoin { .. }
         | Kind::KeyedLeftJoin { .. }
+        | Kind::KeyedJoin { .. }
         | Kind::Lateral(_) => first(),
         Kind::Union => node.children.len() == 1 && first(),
         // A merge join keeps its left input's order, and a hash join its probe side's,
@@ -2621,7 +2692,10 @@ impl Operator {
         if incremental_binary && !needed && ctx.spill.is_some() {
             order.clear();
         }
-        let binary = incremental_binary
+        let ripple = (incremental_binary && ripple::eligible(&node))
+            .then(|| ripple::Ripple::new(ctx, &node))
+            .transpose()?;
+        let binary = (incremental_binary && ripple.is_none())
             .then(|| binary::Binary::new(ctx, &node, !order.is_empty() || probe_value_ordered))
             .transpose()?;
         if binary.is_some()
@@ -2672,6 +2746,8 @@ impl Operator {
             State::Merge(Box::new(merge))
         } else if let Some(binary) = binary {
             State::Binary(Box::new(binary))
+        } else if let Some(ripple) = ripple {
+            State::Ripple(Box::new(ripple))
         } else if let Some(group) = group {
             State::Group(Box::new(group))
         } else if filter::eligible(&node, &children) {
@@ -3130,6 +3206,13 @@ impl Operator {
                     }
                     if batch.is_none() {
                         binary.release_working_sets();
+                    }
+                    batch
+                }
+                State::Ripple(ripple) => {
+                    let batch = ripple.next(ctx, &mut self.children, options, &self.vars, cap)?;
+                    if batch.is_none() {
+                        ripple.release_working_sets();
                     }
                     batch
                 }
@@ -4306,7 +4389,7 @@ mod tests {
                 format!("{:?}/{}[{}]", node.vars, node.est, children.join(","))
             }
             let before = shape(&p.node);
-            orient_filtered_ask(&mut p.node);
+            orient_filtered_ask(&mut p.node, &p.ctx);
             assert_eq!(shape(&p.node), before, "{text}");
         }
     }
@@ -4334,6 +4417,11 @@ mod tests {
             let options = QueryOptions {
                 max_rows: Some(max_rows),
                 no_cache: true,
+                // This decision table describes the legacy filtered-product path.
+                optimizations: Some(super::super::Optimizations {
+                    keyed_join: false,
+                    ..super::super::Optimizations::ALL
+                }),
                 ..Default::default()
             };
             super::super::prepare_query(store.snapshot(), &query, &options, None, None).unwrap()
