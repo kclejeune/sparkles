@@ -1,19 +1,16 @@
 # U02: Editing forms generated from SHACL shapes
 
-> **Status:** implemented (Phase 1 and most of Phase 2)
+> **Status:** implemented in part, Phase 1 and most of Phase 2.
 >
-> **Phases:** Phase 1 shipped on 2026-10-24. It is the form model endpoint, view and edit
-> forms for literal and IRI values, checks in the browser, previews and saves on a branch
-> or `main`, and review through the merge page. Phase 2 adds DASH editor and viewer hints,
-> nested forms, new instances and value search, and all of it except nested forms shipped
-> on the same day. Phase 3 adds SHACL 1.2 lists and alternatives with `sh:or` and
-> `sh:xone`.
+> **Phases:** Forms for literal and IRI values, browser checks, previews, branch saves,
+> review, DASH hints, new instances and value search are available. Nested forms,
+> list editors and choices from `sh:or` or `sh:xone` remain planned.
 >
-> **User docs:** [USAGE: Editing forms](../USAGE.md#editing-forms) and
-> [API: Editing forms](../API.md#editing-forms).
+> **User docs:** [Editing forms](../USAGE.md#editing-forms) and
+> [the forms API](../API.md#editing-forms).
 >
-> This is the design as written before implementation. The [Outcome](#outcome) section at
-> the end records how it landed.
+> This is the design as written before implementation. The [Outcome](#outcome) records
+> what shipped and the remaining work.
 
 This design was written from the W3C SHACL Recommendation, in particular its
 non-validating property shape characteristics (`sh:name`, `sh:description`, `sh:order`,

@@ -1,18 +1,19 @@
 # F18: Explanations and entailment diffs
 
-> **Status:** specified
+> **Status:** implemented in part, Phases 1 and 2.
 >
-> **Phases:** None shipped. Phase 1 is derivation trees for inferred triples ("why?"),
-> bounded "why not?", `POST /$/reason/{ds}/explain`, the CLI, the MCP tool and the UI's
-> inference badge and derivation tree. Phase 2 adds entailment diffs between commits and
-> branches, in merge previews and write previews, and minimal justifications for
-> inconsistencies and unsatisfiable classes. Phase 3 adds protections and `reviewedOnly`
-> that keep the inferred triples a caller's visible facts support.
+> **Phases:** Derivation trees, bounded why-not explanations, entailment diffs between
+> retained states and branch heads, write and merge previews, and minimal justifications
+> are available. Phase 3's provenance-aware inferred visibility and reviewed-only
+> protections remain planned and depend on F13's per-fact provenance.
 >
-> **User docs:** none, because nothing is built.
+> **User docs:** [Explanations](../API.md#explanations),
+> [entailment diffs](../API.md#entailment-diffs),
+> [minimal justifications](../API.md#minimal-justifications) and
+> [features](../FEATURES.md#reasoning-validation-and-schema).
 >
-> This is the design as written before implementation. The [Outcome](#outcome) section at
-> the end will record how it lands.
+> This is the design as written before implementation. The [Outcome](#outcome) records
+> what shipped and the remaining work.
 
 This design was written from the W3C OWL 2 Profiles recommendation (the OWL 2 RL/RDF
 rules), Kalyanpur, Parsia, Horridge and Sirin, "Finding all justifications of OWL DL

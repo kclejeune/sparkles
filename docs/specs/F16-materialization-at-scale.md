@@ -1,22 +1,19 @@
 # F16: Materialization at scale
 
-> **Status:** implemented in part, Phase 1 built and its acceptance open
+> **Status:** implemented in part, Phase 1 with scale acceptance and later follow-ups.
 >
-> **Phases:** Phase 1 shipped: rule evaluation over the store's index permutations, a
-> parallel merge of derived facts, snapshot statistics in the rule planner, `max_memory`,
-> the reasoning pool, incremental runs with GeoSPARQL default geometries, the `dt-not-type`
-> check and a LUBM-style reasoning run. Its acceptance runs are open under roadmap item 1.
-> Phase 2 is the derived-fact layer, kept apart from
-> the base indexes. Phase 3 is `owl:sameAs` through canonical representatives with
-> expansion at query time. Phase 4 is evaluation without iteration barriers and
-> incremental maintenance with equality. Phases 2 to 4 are not built.
+> **Phases:** Index-backed rule evaluation, parallel merging, planner statistics,
+> reasoning budgets and incremental closure maintenance are available. The scale
+> acceptance and datatype-check follow-ups are recorded in the Outcome. Phase 2's
+> separate derived-fact layer, Phase 3's canonical equality representatives and Phase 4's
+> evaluation without iteration barriers and incremental equality remain planned.
 >
-> **User docs:** [API: reasoning](../API.md#reasoning-status-and-diagnostics) ·
-> [Usage: `serve` options](../USAGE.md#serve-options) ·
-> [Features](../FEATURES.md#reasoning-validation-and-schema)
+> **User docs:** [Reasoning API](../API.md#reasoning-status-and-diagnostics),
+> [serve options](../USAGE.md#serve-options) and
+> [features](../FEATURES.md#reasoning-validation-and-schema).
 >
-> This is the design as written before implementation. The [Outcome](#outcome) section at
-> the end records how it landed.
+> This is the design as written before implementation. The [Outcome](#outcome) records
+> what shipped and the remaining work.
 
 This design was written from the W3C OWL 2 Profiles recommendation (the OWL 2 RL/RDF rules,
 including `eq-*` and `dt-*`), the W3C RDF 1.1 Semantics and XML Schema Datatypes 1.1

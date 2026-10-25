@@ -1,19 +1,18 @@
 # F17: Query-time reasoning
 
-> **Status:** specified
+> **Status:** implemented in part, Phase 1.
 >
-> **Phases:** None shipped. Phase 1 is on-demand derivation for a query through the
-> demand (magic-sets) transformation of the rule program, Jena backward rules, tables
-> cached per snapshot, budgets and EXPLAIN. Phase 2 adds the cost-based choice between
-> materialized and derived facts, dataset settings, OWL 2 QL query rewriting, tables kept
-> across commits that do not affect them, the MCP tool argument, the UI and the Fuseki
-> converter mapping. Phase 3 keeps tables current with the incremental core of F13 and
-> derives equality on demand.
+> **Phases:** Demand derivation, Jena backward rules, tables cached per snapshot and
+> view, budgets and EXPLAIN are available. Automatic cost selection, hybrid execution,
+> OWL 2 QL rewriting, additional settings and surfaces, and reuse across commits remain
+> planned in Phase 2. Incremental maintenance through F13 and later provenance remain
+> planned in Phase 3.
 >
-> **User docs:** none, because nothing is built.
+> **User docs:** [Query-time reasoning](../API.md#query-time-reasoning) and
+> [features](../FEATURES.md#reasoning-validation-and-schema).
 >
-> This is the design as written before implementation. The [Outcome](#outcome) section at
-> the end will record how it lands.
+> This is the design as written before implementation. The [Outcome](#outcome) records
+> what shipped and the remaining work.
 
 This design was written from Bancilhon, Maier, Sagiv and Ullman, "Magic sets and other
 strange ways to implement logic programs" (PODS 1986), Beeri and Ramakrishnan, "On the

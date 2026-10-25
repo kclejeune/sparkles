@@ -1,20 +1,16 @@
 # U07: A data-quality timeline and a schema diagram
 
-> **Status:** Phase 4 shipped on 2026-10-23
+> **Status:** implemented in part, Phase 4.
 >
-> **Phases:** Phase 4 shipped on 2026-10-23, and Phases 1 to 3 are not built. Phase 1 records a validation summary for every commit a
-> write-time guard validates, and draws it as a timeline on the dataset page with links
-> to the commits that introduced each result. Phase 2 backfills the timeline for past
-> commits and finds the introducing commit of results older than the record. Phase 3
-> adds the schema diagram with observed and declared cardinalities, and its export. Phase
-> 4, added on 2026-10-23 in §11, badges SHACL and ShEx results on the nodes of the Explore
-> graph, shows the failing shape and triples, and suggests a fix query.
+> **Phases:** The validation overlay badges results on graph nodes and offers the
+> related triples and fix previews. Phases 1 to 3's per-commit quality timeline,
+> backfill, introducing-commit search and schema diagram remain planned.
 >
-> **User docs:** [USAGE.md](../USAGE.md#the-validation-overlay) for the overlay, and
-> [API.md](../API.md#shacl-validation) for the routes' focus sets and stored shapes.
+> **User docs:** [Validation overlay](../USAGE.md#the-validation-overlay) and
+> [features](../FEATURES.md#web-ui).
 >
-> This is the design as written before implementation. The [Outcome](#outcome) section at
-> the end will record how it lands.
+> This is the design as written before implementation. The [Outcome](#outcome) records
+> what shipped and the remaining work.
 
 This design was written from the W3C SHACL Recommendation (validation reports and
 results), the ShEx 2.1 specification and the ShapeMap specification (result shape maps),

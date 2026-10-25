@@ -1,26 +1,19 @@
 # U11: Linked views beside the graph
 
-> **Status:** implemented
+> **Status:** implemented in part, Phases 1, 2 and 3 with recorded omissions.
 >
-> **Phases:** Phase 1 shipped on 2026-10-23. It draws the relations between located
-> entities as arcs in the map view, for the Explore graph and for query results, with
-> aggregation, clustering and one selection shared by the graph canvas and the maps.
-> Phase 2 shipped on 2026-10-24. It adds the facets route and facet histograms of the
-> properties of a set beside the canvas, where brushing a range filters the canvas and
-> **Apply to query** adds the matching `FILTER` to the query, and **Use in query**, which
-> writes a selection as a `VALUES` block. Phase 3 shipped on 2026-10-24. It adds the
-> projection routes of a vector index and the embedding map, a two-dimensional projection
-> coloured by class or by a predicate, where a lasso or a box selects entities that
-> **Use in query** writes as a `VALUES` block.
+> **Phases:** Located-entity arcs, server facets, linked graph and map selections and
+> the embedding map are available. Additional colouring and date facets, stored
+> projections, keyboard actions and hardware rendering measurements remain under items
+> 140 to 142.
 >
-> **User docs:** [Usage: Arcs on the map](../USAGE.md#arcs-on-the-map) ·
-> [Usage: Facets and Use in query](../USAGE.md#facets-and-use-in-query) ·
-> [Usage: The embedding map](../USAGE.md#the-embedding-map) ·
-> [API: Facets](../API.md#facets) · [API: Embedding map](../API.md#embedding-map) ·
-> [Features](../FEATURES.md#web-ui)
+> **User docs:** [Arcs on the map](../USAGE.md#arcs-on-the-map),
+> [facets](../USAGE.md#facets-and-use-in-query),
+> [the embedding map](../USAGE.md#the-embedding-map),
+> [facets API](../API.md#facets) and [embedding API](../API.md#embedding-map).
 >
-> This is the design as written before implementation. The [Outcome](#outcome) section at
-> the end records how the three phases landed.
+> This is the design as written before implementation. The [Outcome](#outcome) records
+> what shipped and the remaining work.
 
 This design was written from the Sparkles code and specs: GeoSPARQL and the UI's maps
 ([G01](G01-geosparql.md)), vector search and indexes ([F04](F04-vector-search.md)), local

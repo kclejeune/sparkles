@@ -1,17 +1,18 @@
 # F14: Graph algorithms
 
-> **Status:** implemented in part (Phases 1 and 2, and the embeddings of Phase 3)
+> **Status:** implemented in part, Phases 1 and 2 and the embeddings of Phase 3.
 >
-> **Phases:** Phases 1 and 2 shipped, apart from the full LDBC Graphalytics harness, the web
-> UI and the JVM binding. Of Phase 3, `algo:fastRP` and `algo:node2vec` shipped, and
-> their vectors reach F04 indexes through SPARQL Update or a write-back run. The
-> openCypher procedures wait for the Cypher frontend of [F01](F01-cypher.md), which is
-> not built.
+> **Phases:** The graph algorithms, projections, write-back runs and graph embeddings
+> are available. Algorithm lenses are available through [U10](U10-canvas-lenses.md).
+> The full Graphalytics harness, algorithm-name completion, richer background progress,
+> a typed JVM algorithm handle and C23 writer integration remain. openCypher procedures
+> wait for [F01](F01-cypher.md).
 >
-> **User docs:** [API: Graph algorithms](../API.md#graph-algorithms) · [Usage: Graph algorithms](../USAGE.md#graph-algorithms) · [Features](../FEATURES.md#search)
+> **User docs:** [Graph algorithms API](../API.md#graph-algorithms),
+> [usage](../USAGE.md#graph-algorithms) and [features](../FEATURES.md#search).
 >
-> This is the design as written before implementation. The [Outcome](#outcome) section at
-> the end records how it landed.
+> This is the design as written before implementation. The [Outcome](#outcome) records
+> what shipped and the remaining work.
 
 This design was written from the public documentation of the Neo4j Graph Data Science
 library (its algorithm pages, graph projections and execution modes), the public
