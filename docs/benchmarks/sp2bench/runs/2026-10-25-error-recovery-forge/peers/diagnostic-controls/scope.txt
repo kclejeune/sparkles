@@ -1,0 +1,1 @@
+Dataset-independent VALUES queries only; source stores contain SP2Bench or synthetic RDF but these queries access no graph patterns; original published benchmark queries and evidence are unchanged.

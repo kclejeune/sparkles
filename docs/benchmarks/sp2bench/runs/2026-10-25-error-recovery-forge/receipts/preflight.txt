@@ -1,0 +1,20 @@
+2026-10-25T17:29:12Z
+forge
+ 13:29:12  up  20:49,  0 users,  load average: 0.09, 0.19, 0.09
+               total        used        free      shared  buff/cache   available
+Mem:           15620        1167        2764          11       12117       14453
+Swap:           8191         187        8004
+Filesystem           Size  Used Avail Use% Mounted on
+/dev/mapper/vg-root  460G  360G   77G  83% /
+    PID %CPU COMMAND
+    908  0.7 .tailscaled-wra
+    937  0.3 netbird
+    811  0.2 otelcol-contrib
+   1698  0.2 herdr
+1908429  0.1 kworker/u81:21-kcryptd-254:0-1
+1908215  0.1 kworker/u81:19-kcryptd-254:0-1
+1908183  0.1 kworker/u81:14-kcryptd-254:0-1
+1908184  0.1 kworker/u81:15-kcryptd-254:0-1
+1908182  0.1 kworker/u81:13-kcryptd-254:0-1
+1908213  0.1 kworker/u81:17-kcryptd-254:0-1
+1908241  0.1 kworker/u81:20-kcryptd-254:0-1

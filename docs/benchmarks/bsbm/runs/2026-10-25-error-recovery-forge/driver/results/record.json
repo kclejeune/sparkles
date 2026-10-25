@@ -1,0 +1,85 @@
+{
+ "record": 3,
+ "suite": "bsbm-bi",
+ "scale": "10m",
+ "manifest": {
+  "suite": "bsbm-bi",
+  "started": "2026-10-25T19:08:47Z",
+  "ended": "2026-10-25T19:38:58Z",
+  "host": {
+   "name": "forge",
+   "cpu": "13th Gen Intel(R) Core(TM) i5-13500",
+   "cpus": 20,
+   "ram_mib": 15620,
+   "disk_model": "",
+   "kernel": "7.2.9",
+   "filesystem": "ext4",
+   "mount_options": "rw,relatime,discard,errors=remount-ro"
+  },
+  "sparkles": {
+   "binary": "/home/kclejeune/lanes/competitive-births-20261025/bin/sparkles-6b7f32ce",
+   "version": "sparkles 0.1.0",
+   "sha256": "cf6f4cf5fd754c8344fd0f0c02b81dce5016c8b8ccfcbe034f5fe7927cfd46c8",
+   "scripts_commit": "unknown",
+   "binary_commit": "6b7f32ce"
+  },
+  "engines": {},
+  "memory_limit": "12G",
+  "client_cpu": "11",
+  "data": {
+   "bsbm-10m": {
+    "license": "GPL-3.0 generator",
+    "params": "BSBM tools0.2 products28480 fixedseed",
+    "sha256": "db77a8d62274566c0fcf6a85634741b0313551cc217b59f4b1f26d444fd205be",
+    "bytes": 2619263591
+   }
+  },
+  "license_check": {
+   "gpl_benchmark_allowed": true,
+   "notes": []
+  }
+ },
+ "settings": {
+  "warmup": 2,
+  "runs": 10,
+  "timer": "hyperfine+curl",
+  "resultCache": false,
+  "bsbmWarmup": 50,
+  "bsbmRuns": 500,
+  "bsbmClients": [
+   1
+  ],
+  "bsbmMaxTimeSeconds": 1800,
+  "requestTimeoutSeconds": 300,
+  "sparklesArgs": "--max-rows 1000000000",
+  "maxIntermediateRows": 1000000000,
+  "serverMemoryCap": "12G"
+ },
+ "results": [
+  {
+   "engine": "sparkles",
+   "query": "bi-mix",
+   "mode": "qmph",
+   "clients": 1,
+   "durability": null,
+   "samples_ms": [],
+   "median_ms": null,
+   "p95_ms": null,
+   "answer": null,
+   "status": "timeout",
+   "qmph": null,
+   "driver_status": "timeout",
+   "status_reasons": [
+    "the whole driver exceeded its 1800 second wall budget"
+   ]
+  }
+ ],
+ "load": {
+  "sparkles": {
+   "seconds": 5.76126,
+   "max_rss_kib": 3898280,
+   "index_bytes": 652967936,
+   "index_apparent_bytes": 652883771
+  }
+ }
+}

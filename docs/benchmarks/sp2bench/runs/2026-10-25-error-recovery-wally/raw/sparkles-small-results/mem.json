@@ -1,0 +1,31 @@
+{
+ "idle": {
+  "sparkles": 74
+ },
+ "queries": {
+  "q4": {
+   "sparkles": {
+    "before": 76,
+    "peak": 6232,
+    "delta": 6156
+   }
+  },
+  "q8": {
+   "sparkles": {
+    "before": 74,
+    "peak": 163,
+    "delta": 89
+   }
+  },
+  "q12b": {
+   "sparkles": {
+    "before": 167,
+    "peak": 170,
+    "delta": 3
+   }
+  }
+ },
+ "warm": {
+  "sparkles": 170
+ }
+}

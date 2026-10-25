@@ -1,0 +1,14 @@
+{
+ "qlever": {
+  "1": {
+   "query": "explore-mix-select",
+   "status": "error",
+   "driver_status": "error",
+   "qmph": null,
+   "status_reasons": [
+    "the driver exited with status 255",
+    "the server stopped answering during the conservative driver run"
+   ]
+  }
+ }
+}

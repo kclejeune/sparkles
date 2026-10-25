@@ -1,0 +1,13 @@
+{
+ "sparkles": {
+  "1": {
+   "query": "bi-mix",
+   "status": "timeout",
+   "driver_status": "timeout",
+   "qmph": null,
+   "status_reasons": [
+    "the whole driver exceeded its 1800 second wall budget"
+   ]
+  }
+ }
+}

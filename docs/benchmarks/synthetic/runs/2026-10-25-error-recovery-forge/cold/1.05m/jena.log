@@ -1,0 +1,15 @@
+
+rows              jena-fuseki
+knows-reach                 1
+[15:39:50] jena: warm-up pass over the selected queries
+
+== knows-reach
+Benchmark 1: jena-fuseki
+  Time (mean ± σ):     355.7 ms ±  23.4 ms    [User: 2.0 ms, System: 2.3 ms]
+  Range (min … max):   334.9 ms … 407.2 ms    10 runs
+ 
+[15:39:58] cold jena knows-reach run 1: ready 1.222 s, query 0.971853 s
+[15:40:02] cold jena knows-reach run 2: ready 1.244 s, query 1.417885 s
+[15:40:05] cold jena knows-reach run 3: ready 1.215 s, query 1.419587 s
+results/record.json: 2 results
+[15:40:06] record: /home/kclejeune/lanes/benchmark-error-recovery-20261025/synthetic-cold-20261025T193938Z/1.05m/results/record.json, table: /home/kclejeune/lanes/benchmark-error-recovery-20261025/synthetic-cold-20261025T193938Z/1.05m/results/summary.md

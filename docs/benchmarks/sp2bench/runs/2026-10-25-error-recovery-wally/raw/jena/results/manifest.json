@@ -1,0 +1,49 @@
+{
+ "suite": "sp2bench",
+ "started": "2026-10-25T19:04:10Z",
+ "ended": "2026-10-25T19:04:25Z",
+ "host": {
+  "name": "wally",
+  "cpu": "12th Gen Intel(R) Core(TM) i7-12800H",
+  "cpus": 20,
+  "ram_mib": 31766,
+  "disk_model": "",
+  "kernel": "6.18.51",
+  "filesystem": "ext4",
+  "mount_options": "rw,relatime,discard,errors=remount-ro"
+ },
+ "sparkles": {
+  "binary": "/home/kclejeune/lanes/competitive-births-release-20261025/target-D/release/sparkles",
+  "version": "sparkles 0.1.0",
+  "sha256": "cf6f4cf5fd754c8344fd0f0c02b81dce5016c8b8ccfcbe034f5fe7927cfd46c8",
+  "scripts_commit": "unknown",
+  "binary_commit": "6b7f32ce"
+ },
+ "engines": {
+  "jena": {
+   "license": "Apache-2.0",
+   "binary": "/nix/store/q0dscszid7jzs66xq9dip95z2hc1zmsh-apache-jena-fuseki-5.1.0/bin/fuseki-server",
+   "sha256": "7fb10cdec48244c13ea15e4c0607b29339e5d40c67a12cae2ced41903c1d2743",
+   "version": "Apache Jena Fuseki version 5.1.0",
+   "store_path": "/nix/store/q0dscszid7jzs66xq9dip95z2hc1zmsh-apache-jena-fuseki-5.1.0",
+   "package": "apache-jena-fuseki-5.1.0",
+   "reported_version": "Apache Jena Fuseki version 5.1.0"
+  }
+ },
+ "memory_limit": "24G",
+ "client_cpu": "11",
+ "data": {
+  "sp2bench-10m": {
+   "license": "BSD",
+   "params": "SP2Bench v1.01 triples=10000000",
+   "sha256": "4486653f3ea16825923eb8a5410137df7ba712aa918442531c33cbeb854eb814",
+   "bytes": 1493565484
+  }
+ },
+ "license_check": {
+  "gpl_benchmark_allowed": false,
+  "notes": [
+   "SP2Bench v1.01 generator and queries: BSD license, fetched at build time"
+  ]
+ }
+}

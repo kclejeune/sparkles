@@ -1,0 +1,20 @@
+[14:52:46] dataset: 10000091 triples
+
+rows                   fluree
+q8                        656
+q12b                        1
+[14:52:54] fluree: warm-up pass over the selected queries
+
+== q8
+Benchmark 1: fluree
+  Time (mean ± σ):     232.5 ms ±  13.2 ms    [User: 2.8 ms, System: 1.5 ms]
+  Range (min … max):   210.3 ms … 247.7 ms    10 runs
+ 
+
+== q12b
+Benchmark 1: fluree
+  Time (mean ± σ):     223.8 ms ±  14.6 ms    [User: 2.6 ms, System: 2.3 ms]
+  Range (min … max):   203.3 ms … 246.0 ms    10 runs
+ 
+results/record.json: 2 results
+[14:53:02] record: /home/kclejeune/lanes/benchmark-error-recovery-20261025/sp2b-20261025T183539Z/fluree/results/record.json, table: /home/kclejeune/lanes/benchmark-error-recovery-20261025/sp2b-20261025T183539Z/fluree/results/summary.md

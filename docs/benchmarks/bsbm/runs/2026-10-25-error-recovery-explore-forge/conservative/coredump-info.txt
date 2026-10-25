@@ -1,0 +1,27 @@
+           PID: 2159751 (qlever-server)
+           TID: 2159757 (qlever-server)
+           UID: 1000 (kclejeune)
+           GID: 100 (users)
+        Signal: 11 (SEGV) si_code: SI_KERNEL
+     Timestamp: Sun 2026-10-25 16:12:51 EDT (11min ago)
+  Command Line: /nix/store/xn7f9c965zfza9nks2qzlrnx916xg3h2-qlever-0.5.48/bin/qlever-server -i bench -p 28521 -m 8G -c 0B -e 0B -E 0B -s 315s -a bench -j 1
+    Executable: /nix/store/xn7f9c965zfza9nks2qzlrnx916xg3h2-qlever-0.5.48/bin/qlever-server
+ Control Group: /user.slice/user-1000.slice/user@1000.service/app.slice/run-p2159751-i2136595.scope
+          Unit: user@1000.service
+     User Unit: run-p2159751-i2136595.scope
+         Slice: user-1000.slice
+     Owner UID: 1000 (kclejeune)
+       Boot ID: 890faff8382545f29098db509101231a
+    Machine ID: 2babc32118824298ac803858b8510dd3
+      Hostname: forge
+       Storage: /var/lib/systemd/coredump/core.qlever-server.1000.890faff8382545f29098db509101231a.2159751.1792959171000000.zst (truncated)
+  Size on Disk: 11.6M
+       Message: Process 2159751 (qlever-server) of user 1000 dumped core.
+                
+                Module /nix/store/xn7f9c965zfza9nks2qzlrnx916xg3h2-qlever-0.5.48/bin/qlever-server without build-id.
+                Stack trace of thread 2159757:
+                #0  0x00006273291ef570 _ZN5boost4asio6detail13epoll_reactor3runElRNS1_8op_queueINS1_19scheduler_operationEEE (/nix/store/xn7f9c965zfza9nks2qzlrnx916xg3h2-qlever-0.5.48/bin/qlever-server + 0x34c570)
+                
+                Stack trace of thread 2159808:
+                #0  0x0000760525ea5a22 n/a (n/a + 0x0)
+                ELF object binary architecture: AMD x86-64

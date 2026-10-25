@@ -1,0 +1,18 @@
+{
+ "q8": {
+  "qlever": {
+   "rows": 0,
+   "exact": "e3b0c44298fc1c14",
+   "value": "e3b0c44298fc1c14",
+   "query_sha256": "29e2736f82bfc0ee91bdd597700eea247f5cf352e87ecf0dc872da0cb22eaac7"
+  }
+ },
+ "q12b": {
+  "qlever": {
+   "rows": 1,
+   "exact": "59fc50d410790cde",
+   "value": "59fc50d410790cde",
+   "query_sha256": "8af476514e16d98c20da3f83a5c6d2e6704e80bc33ea304bc3af505e035aefbf"
+  }
+ }
+}

@@ -1,0 +1,13 @@
+HTTP/1.1 200 OK
+content-type: application/sparql-results+json
+sparkles-commit: 1
+sparkles-dataset-id: 9c883023-cd6c-4c42-9638-7bbea8142920
+vary: origin
+access-control-expose-headers: sparkles-commit,sparkles-dataset-id,sparkles-branch,sparkles-branch-id,x-request-id,sparkles-inferences,sparkles-at,sparkles-validation,sparkles-dry-run,sparkles-dry-run-outcome,sparkles-head,memento-datetime,sparkles-diff-from,sparkles-diff-to,sparkles-diff-added,sparkles-diff-removed,sparkles-changes-next,sparkles-query-version,sparkles-describe-truncated,content-location,vary,link,etag,retry-after,ratelimit,ratelimit-policy,traceresponse,mcp-session-id,sparkles-format-changed,www-authenticate
+x-content-type-options: nosniff
+x-frame-options: DENY
+content-security-policy: default-src 'none'; frame-ancestors 'none'
+x-request-id: f83cc157-000000000003
+content-length: 62
+date: Sun, 25 Oct 2026 19:45:35 GMT
+

@@ -1,0 +1,26 @@
+{
+ "results": [
+  {
+   "command": "jena-tdb2",
+   "mean": 46.2463,
+   "stddev": 0.0,
+   "times": [
+    46.2463
+   ],
+   "exit_codes": [
+    0
+   ]
+  },
+  {
+   "command": "fluree",
+   "mean": 10.6076,
+   "stddev": 0.0,
+   "times": [
+    10.6076
+   ],
+   "exit_codes": [
+    0
+   ]
+  }
+ ]
+}

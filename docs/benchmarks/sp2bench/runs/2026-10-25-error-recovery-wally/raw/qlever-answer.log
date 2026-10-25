@@ -1,0 +1,10 @@
+[14:44:07] dataset: 10000091 triples
+[14:44:08] qlever: loading (log: logs/load-qlever.log)
+qlever: 18.5 s, peak RSS 1850 MiB, index 294 MiB
+
+rows                   qlever
+q4                   41073618
+q8                          0
+q12b                        1
+results/record.json: 3 results
+[14:51:01] record: /home/kclejeune/lanes/benchmark-error-recovery-20261025/sp2b-20261025T183539Z/qlever/results/record.json, table: /home/kclejeune/lanes/benchmark-error-recovery-20261025/sp2b-20261025T183539Z/qlever/results/summary.md

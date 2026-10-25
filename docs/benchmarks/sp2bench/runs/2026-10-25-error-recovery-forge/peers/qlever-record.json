@@ -1,0 +1,451 @@
+{
+ "record": 3,
+ "suite": "sp2bench",
+ "scale": "10m",
+ "manifest": {
+  "suite": "sp2bench",
+  "started": "2026-10-25T17:49:21Z",
+  "ended": "2026-10-25T17:53:47Z",
+  "host": {
+   "name": "forge",
+   "cpu": "13th Gen Intel(R) Core(TM) i5-13500",
+   "cpus": 20,
+   "ram_mib": 15620,
+   "disk_model": "",
+   "kernel": "7.2.9",
+   "filesystem": "ext4",
+   "mount_options": "rw,relatime,discard,errors=remount-ro"
+  },
+  "sparkles": {
+   "binary": "/home/kclejeune/lanes/competitive-births-20261025/bin/sparkles-6b7f32ce",
+   "version": "sparkles 0.1.0",
+   "sha256": "cf6f4cf5fd754c8344fd0f0c02b81dce5016c8b8ccfcbe034f5fe7927cfd46c8",
+   "scripts_commit": "unknown",
+   "binary_commit": "6b7f32ce"
+  },
+  "engines": {
+   "qlever": {
+    "license": "Apache-2.0",
+    "binary": "/home/kclejeune/lanes/item1-bench/data/sp2b-10m/gcroots/qlever/bin/qlever-server",
+    "sha256": "8a3d2eb5259918b6a22607a012e50bf0087dfc9205e37613a03a09a1e68a10dc",
+    "version": "0.5.48",
+    "store_path": "/nix/store/xn7f9c965zfza9nks2qzlrnx916xg3h2-qlever-0.5.48",
+    "package": "qlever-0.5.48",
+    "reported_version": "/home/kclejeune/lanes/item1-bench/data/sp2b-10m/gcroots/qlever/bin/qlever-server 0.0.0-unknown"
+   }
+  },
+  "memory_limit": "12G",
+  "client_cpu": "11",
+  "data": {
+   "sp2bench-10m": {
+    "license": "BSD",
+    "params": "SP2Bench v1.01 triples=10000000",
+    "sha256": "4486653f3ea16825923eb8a5410137df7ba712aa918442531c33cbeb854eb814",
+    "bytes": 1493565484
+   }
+  },
+  "license_check": {
+   "gpl_benchmark_allowed": false,
+   "notes": [
+    "SP2Bench v1.01 generator and queries: BSD license, fetched at build time"
+   ]
+  }
+ },
+ "settings": {
+  "warmup": 2,
+  "runs": 10,
+  "timer": "hyperfine+curl",
+  "resultCache": false
+ },
+ "results": [
+  {
+   "engine": "qlever",
+   "query": "q1",
+   "mode": "warm",
+   "clients": 1,
+   "durability": null,
+   "samples_ms": [
+    8.111,
+    10.453,
+    10.642,
+    8.681,
+    8.408,
+    8.933,
+    8.308,
+    13.031,
+    11.179,
+    10.936
+   ],
+   "median_ms": 9.693,
+   "p95_ms": 13.031,
+   "answer": {
+    "rows": 1,
+    "hash": "07e0fcc293dd80d0",
+    "agrees": null
+   },
+   "status": "ok"
+  },
+  {
+   "engine": "qlever",
+   "query": "q2",
+   "mode": "warm",
+   "clients": 1,
+   "durability": null,
+   "samples_ms": [
+    3212.899,
+    3213.518,
+    3241.558,
+    3236.302,
+    3220.315,
+    3246.084,
+    3273.197,
+    3208.604,
+    3225.433,
+    3248.036
+   ],
+   "median_ms": 3230.867,
+   "p95_ms": 3273.197,
+   "answer": {
+    "rows": 618685,
+    "hash": "0593c93f3e693763/830855707685b6a8",
+    "agrees": null
+   },
+   "status": "ok"
+  },
+  {
+   "engine": "qlever",
+   "query": "q3a",
+   "mode": "warm",
+   "clients": 1,
+   "durability": null,
+   "samples_ms": [
+    252.766,
+    229.803,
+    242.576,
+    247.038,
+    230.31,
+    234.289,
+    232.184,
+    238.848,
+    231.666,
+    228.71
+   ],
+   "median_ms": 233.236,
+   "p95_ms": 252.766,
+   "answer": {
+    "rows": 324935,
+    "hash": "83b2c1f3bcae8017",
+    "agrees": null
+   },
+   "status": "ok"
+  },
+  {
+   "engine": "qlever",
+   "query": "q3b",
+   "mode": "warm",
+   "clients": 1,
+   "durability": null,
+   "samples_ms": [
+    11.371,
+    10.798,
+    9.177,
+    9.218,
+    10.571,
+    10.649,
+    9.924,
+    9.233,
+    9.134,
+    9.131
+   ],
+   "median_ms": 9.579,
+   "p95_ms": 11.371,
+   "answer": {
+    "rows": 2288,
+    "hash": "921863ed30be5497",
+    "agrees": null
+   },
+   "status": "ok"
+  },
+  {
+   "engine": "qlever",
+   "query": "q3c",
+   "mode": "warm",
+   "clients": 1,
+   "durability": null,
+   "samples_ms": [
+    7.028,
+    8.085,
+    6.951,
+    7.084,
+    7.001,
+    6.843,
+    7.046,
+    7.201,
+    9.05,
+    6.91
+   ],
+   "median_ms": 7.037,
+   "p95_ms": 9.05,
+   "answer": {
+    "rows": 0,
+    "hash": "e3b0c44298fc1c14",
+    "agrees": null
+   },
+   "status": "ok"
+  },
+  {
+   "engine": "qlever",
+   "query": "q5b",
+   "mode": "warm",
+   "clients": 1,
+   "durability": null,
+   "samples_ms": [
+    614.588,
+    607.67,
+    610.848,
+    606.963,
+    592.196,
+    589.403,
+    589.517,
+    625.456,
+    613.133,
+    661.509
+   ],
+   "median_ms": 609.259,
+   "p95_ms": 661.509,
+   "answer": {
+    "rows": 385208,
+    "hash": "1fd785a006f901a9",
+    "agrees": null
+   },
+   "status": "ok"
+  },
+  {
+   "engine": "qlever",
+   "query": "q6",
+   "mode": "warm",
+   "clients": 1,
+   "durability": null,
+   "samples_ms": [
+    1986.648,
+    1962.525,
+    1992.617,
+    2001.853,
+    2013.822,
+    1996.693,
+    1986.449,
+    2012.587,
+    1991.753,
+    1991.545
+   ],
+   "median_ms": 1992.185,
+   "p95_ms": 2013.822,
+   "answer": {
+    "rows": 1256087,
+    "hash": "row-sha256-v1:26905cf50617fe3ba1924520b9bfbbc6d2fe2a5c40538801e3d233c29cce9648",
+    "agrees": null
+   },
+   "status": "ok"
+  },
+  {
+   "engine": "qlever",
+   "query": "q7",
+   "mode": "warm",
+   "clients": 1,
+   "durability": null,
+   "samples_ms": [
+    307.851,
+    326.596,
+    301.605,
+    291.272,
+    282.527,
+    295.481,
+    316.479,
+    295.293,
+    322.594,
+    308.475
+   ],
+   "median_ms": 304.728,
+   "p95_ms": 326.596,
+   "answer": {
+    "rows": 2503,
+    "hash": "7e2a47949bac5a51",
+    "agrees": null
+   },
+   "status": "ok"
+  },
+  {
+   "engine": "qlever",
+   "query": "q8",
+   "mode": "warm",
+   "clients": 1,
+   "durability": null,
+   "samples_ms": [],
+   "median_ms": null,
+   "p95_ms": null,
+   "answer": null,
+   "status": "error"
+  },
+  {
+   "engine": "qlever",
+   "query": "q9",
+   "mode": "warm",
+   "clients": 1,
+   "durability": null,
+   "samples_ms": [
+    282.58,
+    278.183,
+    281.785,
+    282.488,
+    294.491,
+    286.127,
+    276.529,
+    290.445,
+    292.527,
+    274.635
+   ],
+   "median_ms": 282.534,
+   "p95_ms": 294.491,
+   "answer": {
+    "rows": 4,
+    "hash": "5da8327407b52b7b",
+    "agrees": null
+   },
+   "status": "ok"
+  },
+  {
+   "engine": "qlever",
+   "query": "q10",
+   "mode": "warm",
+   "clients": 1,
+   "durability": null,
+   "samples_ms": [
+    6.467,
+    6.693,
+    6.749,
+    6.333,
+    6.873,
+    7.845,
+    8.166,
+    6.704,
+    7.81,
+    7.828
+   ],
+   "median_ms": 6.811,
+   "p95_ms": 8.166,
+   "answer": {
+    "rows": 656,
+    "hash": "6271c45707c16c8c",
+    "agrees": null
+   },
+   "status": "ok"
+  },
+  {
+   "engine": "qlever",
+   "query": "q11",
+   "mode": "warm",
+   "clients": 1,
+   "durability": null,
+   "samples_ms": [
+    39.516,
+    38.367,
+    45.192,
+    43.218,
+    47.504,
+    40.116,
+    45.575,
+    46.535,
+    47.045,
+    42.324
+   ],
+   "median_ms": 44.205,
+   "p95_ms": 47.504,
+   "answer": {
+    "rows": 10,
+    "hash": "fba9c0ebb1734be4/f0c0253753657af0",
+    "agrees": null
+   },
+   "status": "ok"
+  },
+  {
+   "engine": "qlever",
+   "query": "q12a",
+   "mode": "warm",
+   "clients": 1,
+   "durability": null,
+   "samples_ms": [
+    255.256,
+    254.115,
+    249.061,
+    239.69,
+    251.296,
+    250.904,
+    250.086,
+    231.466,
+    251.107,
+    253.632
+   ],
+   "median_ms": 251.006,
+   "p95_ms": 255.256,
+   "answer": {
+    "rows": 1,
+    "hash": "7522d315bb64415d",
+    "agrees": null
+   },
+   "status": "ok"
+  },
+  {
+   "engine": "qlever",
+   "query": "q12b",
+   "mode": "warm",
+   "clients": 1,
+   "durability": null,
+   "samples_ms": [],
+   "median_ms": null,
+   "p95_ms": null,
+   "answer": null,
+   "status": "error"
+  },
+  {
+   "engine": "qlever",
+   "query": "q12c",
+   "mode": "warm",
+   "clients": 1,
+   "durability": null,
+   "samples_ms": [
+    4.266,
+    8.1,
+    6.529,
+    4.533,
+    4.161,
+    4.153,
+    4.336,
+    4.245,
+    7.203,
+    4.219
+   ],
+   "median_ms": 4.301,
+   "p95_ms": 8.1,
+   "answer": {
+    "rows": 1,
+    "hash": "59fc50d410790cde",
+    "agrees": null
+   },
+   "status": "ok"
+  }
+ ],
+ "load": {
+  "qlever": {
+   "seconds": 9.42954,
+   "max_rss_kib": 1948720,
+   "index_bytes": 307949568,
+   "index_apparent_bytes": 307881950
+  },
+  "fluree": {
+   "seconds": 8.89473,
+   "max_rss_kib": 2016908,
+   "index_bytes": 930619392,
+   "index_apparent_bytes": 869907159
+  }
+ }
+}

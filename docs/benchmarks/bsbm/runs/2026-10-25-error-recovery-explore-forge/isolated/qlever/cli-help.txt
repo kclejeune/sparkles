@@ -1,0 +1,138 @@
+Options for qlever-server:
+  -h [ --help ]                         Produce this help message.
+  -v [ --version ]                      Print version information.
+  -i [ --index-basename ] arg           The basename of the index files 
+                                        (required).
+  -p [ --port ] arg                     The port on which HTTP requests are 
+                                        served (required).
+  -a [ --access-token ] arg             Access token for restricted API calls 
+                                        (default: no access).
+  -n [ --no-access-check ]              If set to true, no access-token check 
+                                        is performed for restricted API calls 
+                                        (default: false).
+  -j [ --num-simultaneous-queries ] arg (=1)
+                                        The number of queries that can be 
+                                        processed simultaneously.
+  -m [ --memory-max-size ] arg (=4 GB)  Limit on the total amount of memory 
+                                        that can be used for query processing 
+                                        and caching. If exceeded, query will 
+                                        return with an error, but the engine 
+                                        will not crash.
+  -c [ --cache-max-size ] arg (=30 GB)  Maximum memory size for all cache 
+                                        entries (pinned and not pinned). Note 
+                                        that the cache is part of the total 
+                                        memory limited by --memory-max-size.
+  -e [ --cache-max-size-single-entry ] arg (=5 GB)
+                                        Maximum size for a single cache entry. 
+                                        That is, results larger than this will 
+                                        not be cached unless pinned.
+  -E [ --cache-max-size-lazy-result ] arg (=5 MB)
+                                        Maximum size up to which lazy results 
+                                        will be cached by aggregating partial 
+                                        results. Caching does cause significant
+                                        overhead for this case.
+  -k [ --cache-max-num-entries ] arg (=1000)
+                                        Maximum number of entries in the cache.
+                                        If exceeded, remove least-recently used
+                                        non-pinned entries from the cache. Note
+                                        that this condition and the size limit 
+                                        specified via --cache-max-size both 
+                                        have to hold (logical AND).
+  -P [ --no-patterns ]                  Disable the use of patterns. If 
+                                        disabled, the special predicate 
+                                        `ql:has-predicate` is not available.
+  -t [ --text ]                         Also load the text index. The text 
+                                        index must have been built before using
+                                        `qlever-index` with options `-d` and `-
+                                        w`.
+  -o [ --only-pso-and-pos-permutations ] 
+                                        Only load the PSO and POS permutations.
+                                        This disables queries with predicate 
+                                        variables.
+  -s [ --default-query-timeout ] arg (=30s)
+                                        Set the default timeout in seconds 
+                                        after which queries are 
+                                        cancelledautomatically.
+  -S [ --service-max-value-rows ] arg (=10000)
+                                        The maximal number of result rows to be
+                                        passed to a SERVICE operation as a 
+                                        VALUES clause to optimize its 
+                                        computation.
+  --throw-on-unbound-variables arg (=false)
+                                        If set to true, the queries that use 
+                                        GROUP BY, BIND, or ORDER BY with 
+                                        variables that are unbound in the query
+                                        throw an exception. These queries 
+                                        technically are allowed by the SPARQL 
+                                        standard, but typically are the result 
+                                        of typos and unintended by the user
+  --request-body-limit arg (=1 GB)      Set the maximum size for the body of 
+                                        requests the server will process. Set 
+                                        to zero to disable the limit.
+  --cache-service-results arg (=false)  SERVICE is not cached because we have 
+                                        to assume that any remote endpoint 
+                                        might change at any point in time. If 
+                                        you control the endpoints, you can 
+                                        override this setting. This will 
+                                        disable the sibling optimization where 
+                                        VALUES are dynamically pushed into 
+                                        `SERVICE`.
+  --persist-updates                     If set, then SPARQL UPDATES will be 
+                                        persisted on disk. Otherwise they will 
+                                        be lost when the engine is stopped
+  --syntax-test-mode arg (=false)       Make several query patterns that are 
+                                        syntactially valid, but otherwise 
+                                        erroneous silently into empty results 
+                                        (e.g. LOAD or SERVICE requests to 
+                                        nonexisting endpoints). This mode 
+                                        should only be used for running the 
+                                        syntax tests from the W3C SPARQL 1.1 
+                                        test suite.
+  --enable-prefilter-on-index-scans arg (=true)
+                                        If set to false, the prefilter 
+                                        procedures for FILTER expressions are 
+                                        disabled.
+  --spatial-join-max-num-threads arg (=8)
+                                        The maximum number of threads to be 
+                                        used for spatial join processing. If 
+                                        this option is set to `0`, the number 
+                                        of CPU threads will be used.
+  --spatial-join-prefilter-max-size arg (=2500)
+                                        The maximum size in square coordinates 
+                                        of the aggregated bounding box of the 
+                                        smaller join partner in a spatial join,
+                                        such that prefiltering will be 
+                                        employed. To disable prefiltering for 
+                                        non-point geometries, set this option 
+                                        to 0.
+  --materialized-view-writer-memory arg (=4 GB)
+                                        Memory limit for sorting rows during 
+                                        the writing of materialized views.
+  -l [ --preload-materialized-views ] arg
+                                        The names of materialized views to be 
+                                        loaded automatically on server start 
+                                        (this option takes an arbitrary number 
+                                        of arguments).
+  --enable-materialized-view-query-rewrite arg (=true)
+                                        If set to true, loaded materialized 
+                                        views will be considered as alternative
+                                        query plans for certain supported query
+                                        patterns.
+  --service-allowed-iri-prefixes arg    IRI prefixes that are allowed as 
+                                        SERVICE endpoints (this option takes an
+                                        arbitrary number of arguments). If none
+                                        are given (the default), all IRIs are 
+                                        allowed. If given, SERVICE requests to 
+                                        IRIs not matching any prefix are 
+                                        rejected. To disable all federated 
+                                        queries, set this option to an invalid 
+                                        IRI prefix like `-`. Magic services 
+                                        (for example spatial search or 
+                                        materialized views) are never affected.
+  --log-level arg (=INFO)               Runtime log level: FATAL, ERROR, WARN, 
+                                        INFO, DEBUG, TIMING, or TRACE. Default 
+                                        is INFO. The compile-time level (CMake 
+                                        -DLOGLEVEL=...) applies as an upper 
+                                        bound — messages above it are never 
+                                        emitted regardless of this setting.
+

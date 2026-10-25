@@ -1,0 +1,119 @@
+{
+ "record": 3,
+ "suite": "sp2bench",
+ "scale": "10m",
+ "manifest": {
+  "suite": "sp2bench",
+  "started": "2026-10-25T17:29:17Z",
+  "ended": "2026-10-25T17:46:53Z",
+  "host": {
+   "name": "forge",
+   "cpu": "13th Gen Intel(R) Core(TM) i5-13500",
+   "cpus": 20,
+   "ram_mib": 15620,
+   "disk_model": "",
+   "kernel": "7.2.9",
+   "filesystem": "ext4",
+   "mount_options": "rw,relatime,discard,errors=remount-ro"
+  },
+  "sparkles": {
+   "binary": "/home/kclejeune/lanes/competitive-births-20261025/bin/sparkles-6b7f32ce",
+   "version": "sparkles 0.1.0",
+   "sha256": "cf6f4cf5fd754c8344fd0f0c02b81dce5016c8b8ccfcbe034f5fe7927cfd46c8",
+   "scripts_commit": "120af294bb63d76db609cc6aa710ed454b1710f1",
+   "binary_commit": "6b7f32ce",
+   "scripts_commit_source": "Committed archive with harness.sha256 receipt; no remote compilation."
+  },
+  "engines": {},
+  "memory_limit": "12G",
+  "client_cpu": "11",
+  "data": {
+   "sp2bench-10m": {
+    "license": "BSD",
+    "params": "SP2Bench v1.01 triples=10000000",
+    "sha256": "4486653f3ea16825923eb8a5410137df7ba712aa918442531c33cbeb854eb814",
+    "bytes": 1493565484
+   }
+  },
+  "license_check": {
+   "gpl_benchmark_allowed": false,
+   "notes": [
+    "SP2Bench v1.01 generator and queries: BSD license, fetched at build time"
+   ]
+  },
+  "benchmark_controls": {
+   "sparkles_args": "--max-result-mb 4096",
+   "max_time_s": 600,
+   "server_timeout_s": 615,
+   "server_memory_cap": "12G",
+   "engines_isolated_for_correctness_and_timing": true,
+   "answer_algorithm": "row-sha256-v1; complete TSV; external sort64MiB",
+   "timing": "hyperfine curl full TSV to /dev/null; no fingerprints in timing",
+   "warmup": 2,
+   "runs": 10,
+   "runtime_binary_revision": "6b7f32ce"
+  }
+ },
+ "settings": {
+  "warmup": 2,
+  "runs": 10,
+  "timer": "hyperfine+curl",
+  "resultCache": false
+ },
+ "results": [
+  {
+   "engine": "sparkles",
+   "query": "q4",
+   "mode": "warm",
+   "clients": 1,
+   "durability": null,
+   "samples_ms": [
+    30666.757,
+    30627.416,
+    30640.154,
+    30617.276,
+    30615.811,
+    30559.754,
+    30593.592,
+    30681.608,
+    30620.346,
+    30637.27
+   ],
+   "median_ms": 30623.881,
+   "p95_ms": 30681.608,
+   "answer": {
+    "rows": 41073618,
+    "hash": "row-sha256-v1:94c3adc4557a846c5f12f6c39d3ecb0958b3d45b1dc014640f615e40019a374c",
+    "agrees": null
+   },
+   "status": "ok"
+  },
+  {
+   "engine": "sparkles",
+   "query": "q6",
+   "mode": "warm",
+   "clients": 1,
+   "durability": null,
+   "samples_ms": [
+    970.696,
+    971.167,
+    981.545,
+    959.759,
+    1001.363,
+    986.894,
+    969.732,
+    1016.661,
+    967.43,
+    959.226
+   ],
+   "median_ms": 970.931,
+   "p95_ms": 1016.661,
+   "answer": {
+    "rows": 906313,
+    "hash": "row-sha256-v1:9fce8c07ef87937ec498e9cdca8047e2c9cfab085a95c4817de2081f4db52479",
+    "agrees": null
+   },
+   "status": "ok"
+  }
+ ]
+}

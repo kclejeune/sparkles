@@ -1,0 +1,32 @@
+{
+  "eligible": [
+    "q8",
+    "q12b"
+  ],
+  "checks": {
+    "q4": {
+      "eligible_for_timing": false,
+      "expected_rows": 41073618,
+      "actual_rows": "error",
+      "expected_value": "row-sha256-v1:94c3adc4557a846c5f12f6c39d3ecb0958b3d45b1dc014640f615e40019a374c",
+      "actual_value": null,
+      "error": "no complete answer in 600 s"
+    },
+    "q8": {
+      "eligible_for_timing": true,
+      "expected_rows": 656,
+      "actual_rows": 656,
+      "expected_value": "1a095147849abf2b",
+      "actual_value": "1a095147849abf2b",
+      "error": null
+    },
+    "q12b": {
+      "eligible_for_timing": true,
+      "expected_rows": 1,
+      "actual_rows": 1,
+      "expected_value": "7522d315bb64415d",
+      "actual_value": "7522d315bb64415d",
+      "error": null
+    }
+  }
+}

@@ -1,0 +1,104 @@
+{
+ "record": 3,
+ "suite": "synthetic",
+ "scale": "1.05m",
+ "manifest": {
+  "suite": "synthetic",
+  "started": "2026-10-25T18:20:35Z",
+  "ended": "2026-10-25T18:20:51Z",
+  "host": {
+   "name": "forge",
+   "cpu": "13th Gen Intel(R) Core(TM) i5-13500",
+   "cpus": 20,
+   "ram_mib": 15620,
+   "disk_model": "",
+   "kernel": "7.2.9",
+   "filesystem": "ext4",
+   "mount_options": "rw,relatime,discard,errors=remount-ro"
+  },
+  "sparkles": {
+   "binary": "/home/kclejeune/lanes/competitive-births-20261025/bin/sparkles-6b7f32ce",
+   "version": "sparkles 0.1.0",
+   "sha256": "cf6f4cf5fd754c8344fd0f0c02b81dce5016c8b8ccfcbe034f5fe7927cfd46c8",
+   "scripts_commit": "unknown",
+   "binary_commit": "6b7f32ce"
+  },
+  "engines": {
+   "jena": {
+    "license": "Apache-2.0",
+    "binary": "/home/kclejeune/lanes/item1-bench/data/sp2b-10m/gcroots/apache-jena-fuseki/bin/fuseki-server",
+    "sha256": "7fb10cdec48244c13ea15e4c0607b29339e5d40c67a12cae2ced41903c1d2743",
+    "version": "Apache Jena Fuseki version 5.1.0",
+    "store_path": "/nix/store/q0dscszid7jzs66xq9dip95z2hc1zmsh-apache-jena-fuseki-5.1.0",
+    "package": "apache-jena-fuseki-5.1.0",
+    "reported_version": "Apache Jena Fuseki version 5.1.0"
+   }
+  },
+  "memory_limit": "12G",
+  "client_cpu": "11",
+  "data": {
+   "synthetic-1.05m": {
+    "license": "generated",
+    "params": "scripts/gen-data.py fixed seed42",
+    "sha256": "c2d387f07a0717fdcd1d001081507b5ac09608961f562f0102d971c36e36edd8",
+    "bytes": 110445630
+   }
+  },
+  "license_check": {
+   "gpl_benchmark_allowed": false,
+   "notes": []
+  }
+ },
+ "settings": {
+  "warmup": 2,
+  "runs": 10,
+  "timer": "hyperfine+curl",
+  "resultCache": false,
+  "maxTimeSeconds": 300,
+  "serverTimeoutSeconds": 315,
+  "sparklesArgs": "",
+  "answerStreamTSVQueries": "",
+  "correctnessEngineIsolation": true,
+  "jenaHeap": "8G",
+  "jenaStack": "256m",
+  "qleverMemory": "8G"
+ },
+ "results": [
+  {
+   "engine": "jena",
+   "query": "knows-reach",
+   "mode": "warm",
+   "clients": 1,
+   "durability": null,
+   "samples_ms": [
+    357.157,
+    381.656,
+    353.282,
+    339.667,
+    377.015,
+    338.239,
+    327.757,
+    348.254,
+    363.533,
+    454.376
+   ],
+   "median_ms": 355.22,
+   "p95_ms": 454.376,
+   "answer": {
+    "rows": 1,
+    "hash": "e8e929a30422b851",
+    "agrees": null,
+    "algorithm": "canonical-sha256-v1"
+   },
+   "status": "ok"
+  }
+ ],
+ "load": {
+  "jena": {
+   "seconds": 4.59757,
+   "max_rss_kib": 2159916,
+   "index_bytes": 137928704,
+   "index_apparent_bytes": 320287297
+  }
+ }
+}

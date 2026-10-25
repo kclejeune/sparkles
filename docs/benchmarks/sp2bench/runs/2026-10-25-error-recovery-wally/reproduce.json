@@ -1,0 +1,15 @@
+{
+  "recipe_version": 1,
+  "qualifier_commit": "c95aac27a397071847b80db4298a2280d88f7039",
+  "qualifier_sha256": "4ed8ff5e6bea8f3e5741cbbc16aa3456634de706bb3e5581b51f680ab9cefd93",
+  "command": [
+    "python3",
+    "scripts/bench-sp2b/qualify.py",
+    "docs/benchmarks/sp2bench/runs/2026-10-25-error-recovery-wally/bindings.json",
+    "NEW-OUTPUT-PATH.json",
+    "NEW-RECEIPT-PATH.json"
+  ],
+  "raw_record": "sparkles-record.json",
+  "derived_record": "sparkles-qualified-record.json",
+  "policy": "The raw record is unchanged; its timing samples and summaries are checked against the retained hyperfine files. Qualification uses independent source reconstruction and does not claim a majority vote."
+}

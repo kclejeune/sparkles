@@ -1,0 +1,10 @@
+{
+  "probe_version": 1,
+  "method": "extended-budget complete-answer verification, not a warm latency benchmark",
+  "request_limit_seconds": 1800,
+  "server_cap": "24G",
+  "rows": 41073618,
+  "value": "row-sha256-v1:94c3adc4557a846c5f12f6c39d3ecb0958b3d45b1dc014640f615e40019a374c",
+  "source_oracle_agreement": true,
+  "error": null
+}

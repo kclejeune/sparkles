@@ -1,0 +1,160 @@
+        FILTER (?date > "2008-06-20T00:00:00"^^<http://www.w3.org/2001/XMLSchema#dateTime> )
+    }
+    OPTIONAL {
+	?review bsbm:reviewFor <http://www4.wiwiss.fu-berlin.de/bizer/bsbm/v01/instances/dataFromProducer221/Product10772> .
+	?review rev:reviewer ?reviewer .
+	?reviewer foaf:name ?revName .
+	?review dc:title ?revTitle .
+    OPTIONAL { ?review bsbm:rating1 ?rating1 . }
+    OPTIONAL { ?review bsbm:rating2 ?rating2 . } 
+    }
+}
+
+2026-10-25 15:55:07.026 - INFO: Requested media types of the result are: "application/sparql-results+xml"
+2026-10-25 15:55:07.055 - INFO: Query planning done in 29 ms
+2026-10-25 15:55:07.119 - INFO: Result has unknown size (not computed yet)
+2026-10-25 15:55:07.120 - INFO: Done processing query and sending result, total time was 94 ms
+2026-10-25 15:55:07.121 - INFO: 
+2026-10-25 15:55:07.121 - INFO: Request received via GET, no content type specified
+2026-10-25 15:55:07.121 - INFO: Processing the following SPARQL query:
+PREFIX rdfs: <http://www.w3.org/2000/01/rdf-schema#>
+PREFIX rev: <http://purl.org/stuff/rev#>
+PREFIX foaf: <http://xmlns.com/foaf/0.1/>
+PREFIX bsbm: <http://www4.wiwiss.fu-berlin.de/bizer/bsbm/v01/vocabulary/>
+PREFIX dc: <http://purl.org/dc/elements/1.1/>
+
+SELECT ?productLabel ?offer ?price ?vendor ?vendorTitle ?review ?revTitle 
+       ?reviewer ?revName ?rating1 ?rating2
+WHERE { 
+	<http://www4.wiwiss.fu-berlin.de/bizer/bsbm/v01/instances/dataFromProducer568/Product27979> rdfs:label ?productLabel .
+    OPTIONAL {
+        ?offer bsbm:product <http://www4.wiwiss.fu-berlin.de/bizer/bsbm/v01/instances/dataFromProducer568/Product27979> .
+		?offer bsbm:price ?price .
+		?offer bsbm:vendor ?vendor .
+		?vendor rdfs:label ?vendorTitle .
+        ?vendor bsbm:country <http://downlode.org/rdf/iso-3166/countries#DE> .
+        ?offer dc:publisher ?vendor . 
+        ?offer bsbm:validTo ?date .
+        FILTER (?date > "2008-06-20T00:00:00"^^<http://www.w3.org/2001/XMLSchema#dateTime> )
+    }
+    OPTIONAL {
+	?review bsbm:reviewFor <http://www4.wiwiss.fu-berlin.de/bizer/bsbm/v01/instances/dataFromProducer568/Product27979> .
+	?review rev:reviewer ?reviewer .
+	?reviewer foaf:name ?revName .
+	?review dc:title ?revTitle .
+    OPTIONAL { ?review bsbm:rating1 ?rating1 . }
+    OPTIONAL { ?review bsbm:rating2 ?rating2 . } 
+    }
+}
+
+2026-10-25 15:55:07.121 - INFO: Requested media types of the result are: "application/sparql-results+xml"
+2026-10-25 15:55:07.150 - INFO: Query planning done in 29 ms
+2026-10-25 15:55:07.205 - INFO: Result has unknown size (not computed yet)
+2026-10-25 15:55:07.206 - INFO: Done processing query and sending result, total time was 85 ms
+2026-10-25 15:55:07.206 - INFO: 
+2026-10-25 15:55:07.206 - INFO: Request received via GET, no content type specified
+2026-10-25 15:55:07.207 - INFO: Processing the following SPARQL query:
+PREFIX bsbm: <http://www4.wiwiss.fu-berlin.de/bizer/bsbm/v01/vocabulary/>
+PREFIX dc: <http://purl.org/dc/elements/1.1/>
+PREFIX rev: <http://purl.org/stuff/rev#>
+PREFIX foaf: <http://xmlns.com/foaf/0.1/>
+
+SELECT ?title ?text ?reviewDate ?reviewer ?reviewerName ?rating1 ?rating2 ?rating3 ?rating4 
+WHERE { 
+	?review bsbm:reviewFor <http://www4.wiwiss.fu-berlin.de/bizer/bsbm/v01/instances/dataFromProducer32/Product1479> .
+	?review dc:title ?title .
+	?review rev:text ?text .
+	FILTER langMatches( lang(?text), "EN" ) 
+	?review bsbm:reviewDate ?reviewDate .
+	?review rev:reviewer ?reviewer .
+	?reviewer foaf:name ?reviewerName .
+	OPTIONAL { ?review bsbm:rating1 ?rating1 . }
+	OPTIONAL { ?review bsbm:rating2 ?rating2 . }
+	OPTIONAL { ?review bsbm:rating3 ?rating3 . }
+	OPTIONAL { ?review bsbm:rating4 ?rating4 . }
+}
+ORDER BY DESC(?reviewDate)
+LIMIT 20
+
+2026-10-25 15:55:07.207 - INFO: Requested media types of the result are: "application/sparql-results+xml"
+2026-10-25 15:55:07.215 - INFO: Query planning done in 8 ms
+2026-10-25 15:55:07.240 - INFO: Result has size 2 x 10
+2026-10-25 15:55:07.241 - INFO: Done processing query and sending result, total time was 34 ms
+2026-10-25 15:55:07.243 - INFO: 
+2026-10-25 15:55:07.243 - INFO: Request received via GET, no content type specified
+2026-10-25 15:55:07.244 - INFO: Processing the following SPARQL query:
+PREFIX bsbm: <http://www4.wiwiss.fu-berlin.de/bizer/bsbm/v01/vocabulary/>
+PREFIX dc: <http://purl.org/dc/elements/1.1/>
+PREFIX rev: <http://purl.org/stuff/rev#>
+PREFIX foaf: <http://xmlns.com/foaf/0.1/>
+
+SELECT ?title ?text ?reviewDate ?reviewer ?reviewerName ?rating1 ?rating2 ?rating3 ?rating4 
+WHERE { 
+	?review bsbm:reviewFor <http://www4.wiwiss.fu-berlin.de/bizer/bsbm/v01/instances/dataFromProducer410/Product20304> .
+	?review dc:title ?title .
+	?review rev:text ?text .
+	FILTER langMatches( lang(?text), "EN" ) 
+	?review bsbm:reviewDate ?reviewDate .
+	?review rev:reviewer ?reviewer .
+	?reviewer foaf:name ?reviewerName .
+	OPTIONAL { ?review bsbm:rating1 ?rating1 . }
+	OPTIONAL { ?review bsbm:rating2 ?rating2 . }
+	OPTIONAL { ?review bsbm:rating3 ?rating3 . }
+	OPTIONAL { ?review bsbm:rating4 ?rating4 . }
+}
+ORDER BY DESC(?reviewDate)
+LIMIT 20
+
+2026-10-25 15:55:07.244 - INFO: Requested media types of the result are: "application/sparql-results+xml"
+2026-10-25 15:55:07.255 - INFO: Query planning done in 11 ms
+2026-10-25 15:55:07.304 - INFO: Result has size 7 x 10
+2026-10-25 15:55:07.305 - INFO: Done processing query and sending result, total time was 61 ms
+2026-10-25 15:55:07.306 - INFO: 
+2026-10-25 15:55:07.306 - INFO: Request received via GET, no content type specified
+2026-10-25 15:55:07.307 - INFO: Processing the following SPARQL query:
+PREFIX bsbm: <http://www4.wiwiss.fu-berlin.de/bizer/bsbm/v01/vocabulary/>
+PREFIX xsd: <http://www.w3.org/2001/XMLSchema#> 
+PREFIX dc: <http://purl.org/dc/elements/1.1/>
+
+SELECT DISTINCT ?offer ?price
+WHERE {
+	?offer bsbm:product <http://www4.wiwiss.fu-berlin.de/bizer/bsbm/v01/instances/dataFromProducer493/Product24246> .
+	?offer bsbm:vendor ?vendor .
+    ?offer dc:publisher ?vendor .
+	?vendor bsbm:country <http://downlode.org/rdf/iso-3166/countries#US> .
+	?offer bsbm:deliveryDays ?deliveryDays .
+	FILTER (?deliveryDays <= 3)
+	?offer bsbm:price ?price .
+    ?offer bsbm:validTo ?date .
+    FILTER (?date > "2008-06-20T00:00:00"^^<http://www.w3.org/2001/XMLSchema#dateTime> )
+}
+ORDER BY xsd:double(str(?price))
+LIMIT 10
+
+2026-10-25 15:55:07.307 - INFO: Requested media types of the result are: "application/sparql-results+xml"
+2026-10-25 15:55:07.380 - INFO: Query planning done in 74 ms
+2026-10-25 15:55:07.478 - INFO: Result has size 1 x 6
+2026-10-25 15:55:07.478 - INFO: Done processing query and sending result, total time was 172 ms
+2026-10-25 15:55:07.478 - INFO: 
+2026-10-25 15:55:07.478 - INFO: Request received via GET, no content type specified
+2026-10-25 15:55:07.479 - INFO: Processing the following SPARQL query:
+PREFIX bsbm: <http://www4.wiwiss.fu-berlin.de/bizer/bsbm/v01/vocabulary/>
+PREFIX xsd: <http://www.w3.org/2001/XMLSchema#> 
+PREFIX dc: <http://purl.org/dc/elements/1.1/>
+
+SELECT DISTINCT ?offer ?price
+WHERE {
+	?offer bsbm:product <http://www4.wiwiss.fu-berlin.de/bizer/bsbm/v01/instances/dataFromProducer92/Product4406> .
+	?offer bsbm:vendor ?vendor .
+    ?offer dc:publisher ?vendor .
+	?vendor bsbm:country <http://downlode.org/rdf/iso-3166/countries#US> .
+	?offer bsbm:deliveryDays ?deliveryDays .
+	FILTER (?deliveryDays <= 3)
+	?offer bsbm:price ?price .
+    ?offer bsbm:validTo ?date .
+    FILTER (?date > "2008-06-20T00:00:00"^^<http://www.w3.org/2001/XMLSchema#dateTime> )
+}
+ORDER BY xsd:double(str(?price))
+LIMIT 10
+
+2026-10-25 15:55:07.479 - INFO: Requested media types of the result are: "application/sparql-results+xml"

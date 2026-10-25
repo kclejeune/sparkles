@@ -1,0 +1,31 @@
+{
+ "idle": {
+  "fluree": 284
+ },
+ "queries": {
+  "q4": {
+   "fluree": {
+    "before": 292,
+    "peak": "?",
+    "delta": "?"
+   }
+  },
+  "q8": {
+   "fluree": {
+    "before": 284,
+    "peak": 530,
+    "delta": 246
+   }
+  },
+  "q12b": {
+   "fluree": {
+    "before": 396,
+    "peak": 564,
+    "delta": 168
+   }
+  }
+ },
+ "warm": {
+  "fluree": 503
+ }
+}

@@ -1,0 +1,10 @@
+HTTP/1.1 200 OK
+Date: Sun, 25 Oct 2026 19:45:39 GMT
+Vary: Accept-Encoding
+Vary: Origin
+Fuseki-Request-Id: 2
+Cache-Control: must-revalidate,no-cache,no-store
+Pragma: no-cache
+Content-Type: application/sparql-results+json; charset=utf-8
+Transfer-Encoding: chunked
+

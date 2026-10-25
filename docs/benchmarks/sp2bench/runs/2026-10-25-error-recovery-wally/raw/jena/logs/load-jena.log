@@ -1,0 +1,32 @@
+14:53:05 INFO  loader          :: Loader = LoaderPhased
+14:53:05 INFO  loader          :: Start: data.nt
+14:53:08 INFO  loader          :: Add: 1,000,000 data.nt (Batch: 398,089 / Avg: 398,089)
+14:53:11 INFO  loader          :: Add: 2,000,000 data.nt (Batch: 298,151 / Avg: 340,947)
+14:53:16 INFO  loader          :: Add: 3,000,000 data.nt (Batch: 207,253 / Avg: 280,609)
+14:53:20 INFO  loader          :: Add: 4,000,000 data.nt (Batch: 243,724 / Avg: 270,379)
+14:53:24 INFO  loader          :: Add: 5,000,000 data.nt (Batch: 246,609 / Avg: 265,266)
+14:53:28 INFO  loader          :: Add: 6,000,000 data.nt (Batch: 243,724 / Avg: 261,415)
+14:53:32 INFO  loader          :: Add: 7,000,000 data.nt (Batch: 243,783 / Avg: 258,741)
+14:53:36 INFO  loader          :: Add: 8,000,000 data.nt (Batch: 237,586 / Avg: 255,893)
+14:53:40 INFO  loader          :: Add: 9,000,000 data.nt (Batch: 246,184 / Avg: 254,777)
+14:53:45 INFO  loader          :: Add: 10,000,000 data.nt (Batch: 248,077 / Avg: 254,090)
+14:53:45 INFO  loader          ::   Elapsed: 39.36 seconds [2026/10/25 14:53:45 EDT]
+14:53:45 INFO  loader          :: Finished: data.nt: 10,000,091 tuples in 39.37s (Avg: 253,983)
+14:53:49 INFO  loader          :: Finish - index SPO
+14:53:49 INFO  loader          :: Start replay index SPO
+14:53:49 INFO  loader          :: Index set:  SPO => SPO->POS, SPO->OSP
+14:53:49 INFO  loader          :: Add: 1,000,000 Index (Batch: 11,764,705 / Avg: 11,764,705)
+14:53:50 INFO  loader          :: Add: 2,000,000 Index (Batch: 1,114,827 / Avg: 2,036,659)
+14:53:51 INFO  loader          :: Add: 3,000,000 Index (Batch: 904,977 / Avg: 1,437,470)
+14:53:53 INFO  loader          :: Add: 4,000,000 Index (Batch: 900,090 / Avg: 1,250,781)
+14:53:54 INFO  loader          :: Add: 5,000,000 Index (Batch: 853,970 / Avg: 1,144,426)
+14:53:55 INFO  loader          :: Add: 6,000,000 Index (Batch: 852,514 / Avg: 1,082,641)
+14:53:56 INFO  loader          :: Add: 7,000,000 Index (Batch: 852,514 / Avg: 1,042,442)
+14:53:57 INFO  loader          :: Add: 8,000,000 Index (Batch: 911,577 / Avg: 1,024,065)
+14:53:58 INFO  loader          :: Add: 9,000,000 Index (Batch: 908,265 / Avg: 1,009,761)
+14:53:59 INFO  loader          :: Add: 10,000,000 Index (Batch: 861,326 / Avg: 992,654)
+14:53:59 INFO  loader          ::   Elapsed: 10.07 seconds [2026/10/25 14:53:59 EDT]
+14:54:00 INFO  loader          :: Index set:  SPO => SPO->POS, SPO->OSP [10,000,091 items, 10.4 seconds]
+14:54:00 INFO  loader          :: Finish - index OSP
+14:54:01 INFO  loader          :: Finish - index POS
+14:54:01 INFO  loader          :: Time = 55.856 seconds : Triples = 10,000,091 : Rate = 179,033 /s

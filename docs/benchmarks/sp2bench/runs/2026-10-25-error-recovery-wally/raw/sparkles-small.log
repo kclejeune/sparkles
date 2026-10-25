@@ -1,0 +1,20 @@
+[14:43:59] dataset: 10000091 triples
+
+rows                 sparkles
+q8                        656
+q12b                        1
+[14:44:05] sparkles: warm-up pass over the selected queries
+
+== q8
+Benchmark 1: sparkles
+  Time (mean ± σ):       9.8 ms ±   0.5 ms    [User: 2.5 ms, System: 2.9 ms]
+  Range (min … max):     8.9 ms …  10.6 ms    10 runs
+ 
+
+== q12b
+Benchmark 1: sparkles
+  Time (mean ± σ):       5.7 ms ±   0.3 ms    [User: 1.4 ms, System: 2.5 ms]
+  Range (min … max):     5.2 ms …   6.4 ms    10 runs
+ 
+results/record.json: 2 results
+[14:44:06] record: /home/kclejeune/lanes/benchmark-error-recovery-20261025/sp2b-20261025T183539Z/sparkles/results/record.json, table: /home/kclejeune/lanes/benchmark-error-recovery-20261025/sp2b-20261025T183539Z/sparkles/results/summary.md

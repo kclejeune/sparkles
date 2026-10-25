@@ -441,6 +441,371 @@
         }
       },
       "metadata_note": "Null fields mean this metadata is not available in the common record fields. Read the raw assessment for its own provenance and correctness contract."
+    },
+    {
+      "run_id": "sha256-908f6e5a1d5db83c7b68baf98105bf17e083a9e041e71e019d43a3c24a8e0d4d",
+      "path": "runs/2026-10-25-error-recovery-forge/raw/1.05m/jena-results/record.json",
+      "sha256": "908f6e5a1d5db83c7b68baf98105bf17e083a9e041e71e019d43a3c24a8e0d4d",
+      "format": "bench-record-3",
+      "context": {
+        "suite": "synthetic",
+        "scale": "1.05m",
+        "manifest": {
+          "suite": "synthetic",
+          "started": "2026-10-25T18:20:35Z",
+          "ended": "2026-10-25T18:20:51Z",
+          "host": {
+            "name": "forge",
+            "cpu": "13th Gen Intel(R) Core(TM) i5-13500",
+            "cpus": 20,
+            "ram_mib": 15620,
+            "disk_model": "",
+            "kernel": "7.2.9",
+            "filesystem": "ext4",
+            "mount_options": "rw,relatime,discard,errors=remount-ro"
+          },
+          "sparkles": {
+            "binary": "/home/kclejeune/lanes/competitive-births-20261025/bin/sparkles-6b7f32ce",
+            "version": "sparkles 0.1.0",
+            "sha256": "cf6f4cf5fd754c8344fd0f0c02b81dce5016c8b8ccfcbe034f5fe7927cfd46c8",
+            "scripts_commit": "unknown",
+            "binary_commit": "6b7f32ce"
+          },
+          "engines": {
+            "jena": {
+              "license": "Apache-2.0",
+              "binary": "/home/kclejeune/lanes/item1-bench/data/sp2b-10m/gcroots/apache-jena-fuseki/bin/fuseki-server",
+              "sha256": "7fb10cdec48244c13ea15e4c0607b29339e5d40c67a12cae2ced41903c1d2743",
+              "version": "Apache Jena Fuseki version 5.1.0",
+              "store_path": "/nix/store/q0dscszid7jzs66xq9dip95z2hc1zmsh-apache-jena-fuseki-5.1.0",
+              "package": "apache-jena-fuseki-5.1.0",
+              "reported_version": "Apache Jena Fuseki version 5.1.0"
+            }
+          },
+          "memory_limit": "12G",
+          "client_cpu": "11",
+          "data": {
+            "synthetic-1.05m": {
+              "license": "generated",
+              "params": "scripts/gen-data.py fixed seed42",
+              "sha256": "c2d387f07a0717fdcd1d001081507b5ac09608961f562f0102d971c36e36edd8",
+              "bytes": 110445630
+            }
+          },
+          "license_check": {
+            "gpl_benchmark_allowed": false,
+            "notes": []
+          }
+        },
+        "settings": {
+          "warmup": 2,
+          "runs": 10,
+          "timer": "hyperfine+curl",
+          "resultCache": false,
+          "maxTimeSeconds": 300,
+          "serverTimeoutSeconds": 315,
+          "sparklesArgs": "",
+          "answerStreamTSVQueries": "",
+          "correctnessEngineIsolation": true,
+          "jenaHeap": "8G",
+          "jenaStack": "256m",
+          "qleverMemory": "8G"
+        },
+        "durability_classes": []
+      },
+      "metadata_note": "The accompanying manual report and validation receipt select specific cells. Raw carried-over rows and common builder defaults do not broaden that measurement or correctness scope. Raw bytes remain unchanged."
+    },
+    {
+      "run_id": "sha256-8c18612ea8ae13f5cba929dab892eeeedd04923537fbfc956e567c6e08fb040a",
+      "path": "runs/2026-10-25-error-recovery-forge/raw/10.5m/jena-results/record.json",
+      "sha256": "8c18612ea8ae13f5cba929dab892eeeedd04923537fbfc956e567c6e08fb040a",
+      "format": "bench-record-3",
+      "context": {
+        "suite": "synthetic",
+        "scale": "10.5m",
+        "manifest": {
+          "suite": "synthetic",
+          "started": "2026-10-25T18:21:54Z",
+          "ended": "2026-10-25T18:23:45Z",
+          "host": {
+            "name": "forge",
+            "cpu": "13th Gen Intel(R) Core(TM) i5-13500",
+            "cpus": 20,
+            "ram_mib": 15620,
+            "disk_model": "",
+            "kernel": "7.2.9",
+            "filesystem": "ext4",
+            "mount_options": "rw,relatime,discard,errors=remount-ro"
+          },
+          "sparkles": {
+            "binary": "/home/kclejeune/lanes/competitive-births-20261025/bin/sparkles-6b7f32ce",
+            "version": "sparkles 0.1.0",
+            "sha256": "cf6f4cf5fd754c8344fd0f0c02b81dce5016c8b8ccfcbe034f5fe7927cfd46c8",
+            "scripts_commit": "unknown",
+            "binary_commit": "6b7f32ce"
+          },
+          "engines": {
+            "jena": {
+              "license": "Apache-2.0",
+              "binary": "/home/kclejeune/lanes/item1-bench/data/sp2b-10m/gcroots/apache-jena-fuseki/bin/fuseki-server",
+              "sha256": "7fb10cdec48244c13ea15e4c0607b29339e5d40c67a12cae2ced41903c1d2743",
+              "version": "Apache Jena Fuseki version 5.1.0",
+              "store_path": "/nix/store/q0dscszid7jzs66xq9dip95z2hc1zmsh-apache-jena-fuseki-5.1.0",
+              "package": "apache-jena-fuseki-5.1.0",
+              "reported_version": "Apache Jena Fuseki version 5.1.0"
+            }
+          },
+          "memory_limit": "12G",
+          "client_cpu": "11",
+          "data": {
+            "synthetic-10.5m": {
+              "license": "generated",
+              "params": "scripts/gen-data.py fixed seed42",
+              "sha256": "10daf6486c20f8dd4579d819ea73bb5e7836e054cd6d2d1b73f99f35233635f8",
+              "bytes": 1121336097
+            }
+          },
+          "license_check": {
+            "gpl_benchmark_allowed": false,
+            "notes": []
+          }
+        },
+        "settings": {
+          "warmup": 2,
+          "runs": 10,
+          "timer": "hyperfine+curl",
+          "resultCache": false,
+          "maxTimeSeconds": 300,
+          "serverTimeoutSeconds": 315,
+          "sparklesArgs": "",
+          "answerStreamTSVQueries": "",
+          "correctnessEngineIsolation": true,
+          "jenaHeap": "8G",
+          "jenaStack": "256m",
+          "qleverMemory": "8G"
+        },
+        "durability_classes": []
+      },
+      "metadata_note": "The accompanying manual report and validation receipt select specific cells. Raw carried-over rows and common builder defaults do not broaden that measurement or correctness scope. Raw bytes remain unchanged."
+    },
+    {
+      "run_id": "sha256-604a018c85ba14866d03c8739bd9dc3f96a29468f49374561c795b7c6a6be71e",
+      "path": "runs/2026-10-25-error-recovery-forge/raw/10.5m/fluree-results/record.json",
+      "sha256": "604a018c85ba14866d03c8739bd9dc3f96a29468f49374561c795b7c6a6be71e",
+      "format": "bench-record-3",
+      "context": {
+        "suite": "synthetic",
+        "scale": "10.5m",
+        "manifest": {
+          "suite": "synthetic",
+          "started": "2026-10-25T18:23:56Z",
+          "ended": "2026-10-25T18:24:03Z",
+          "host": {
+            "name": "forge",
+            "cpu": "13th Gen Intel(R) Core(TM) i5-13500",
+            "cpus": 20,
+            "ram_mib": 15620,
+            "disk_model": "",
+            "kernel": "7.2.9",
+            "filesystem": "ext4",
+            "mount_options": "rw,relatime,discard,errors=remount-ro"
+          },
+          "sparkles": {
+            "binary": "/home/kclejeune/lanes/competitive-births-20261025/bin/sparkles-6b7f32ce",
+            "version": "sparkles 0.1.0",
+            "sha256": "cf6f4cf5fd754c8344fd0f0c02b81dce5016c8b8ccfcbe034f5fe7927cfd46c8",
+            "scripts_commit": "unknown",
+            "binary_commit": "6b7f32ce"
+          },
+          "engines": {
+            "fluree": {
+              "license": "BUSL-1.1",
+              "binary": "/nix/store/jvhxwjlhzijkd1kvrh8l7wfkbclp8vnx-fluree-4.2.2/bin/fluree",
+              "sha256": "99629db65b6eb0d7d9b7cafdc48806eee8ab71e9568fe389b983accaaa35f7ff",
+              "version": "fluree 4.2.2",
+              "store_path": "/nix/store/jvhxwjlhzijkd1kvrh8l7wfkbclp8vnx-fluree-4.2.2",
+              "package": "fluree-4.2.2",
+              "reported_version": "fluree 4.2.2"
+            }
+          },
+          "memory_limit": "12G",
+          "client_cpu": "11",
+          "data": {
+            "synthetic-10.5m": {
+              "license": "generated",
+              "params": "scripts/gen-data.py fixed seed42",
+              "sha256": "10daf6486c20f8dd4579d819ea73bb5e7836e054cd6d2d1b73f99f35233635f8",
+              "bytes": 1121336097
+            }
+          },
+          "license_check": {
+            "gpl_benchmark_allowed": false,
+            "notes": []
+          }
+        },
+        "settings": {
+          "warmup": 2,
+          "runs": 10,
+          "timer": "hyperfine+curl",
+          "resultCache": false,
+          "maxTimeSeconds": 300,
+          "serverTimeoutSeconds": 315,
+          "sparklesArgs": "",
+          "answerStreamTSVQueries": "",
+          "correctnessEngineIsolation": true,
+          "jenaHeap": "8G",
+          "jenaStack": "256m",
+          "qleverMemory": "8G"
+        },
+        "durability_classes": []
+      },
+      "metadata_note": "The accompanying manual report and validation receipt select specific cells. Raw carried-over rows and common builder defaults do not broaden that measurement or correctness scope. Raw bytes remain unchanged."
+    },
+    {
+      "run_id": "sha256-7c80830e9530df570de45f50177db7082fae076c0b331d144712cf22d776a95d",
+      "path": "runs/2026-10-25-error-recovery-forge/cold/1.05m/results/record.json",
+      "sha256": "7c80830e9530df570de45f50177db7082fae076c0b331d144712cf22d776a95d",
+      "format": "bench-record-3",
+      "context": {
+        "suite": "synthetic",
+        "scale": "1.05m",
+        "manifest": {
+          "suite": "synthetic",
+          "started": "2026-10-25T19:39:40Z",
+          "ended": "2026-10-25T19:40:06Z",
+          "host": {
+            "name": "forge",
+            "cpu": "13th Gen Intel(R) Core(TM) i5-13500",
+            "cpus": 20,
+            "ram_mib": 15620,
+            "disk_model": "",
+            "kernel": "7.2.9",
+            "filesystem": "ext4",
+            "mount_options": "rw,relatime,discard,errors=remount-ro"
+          },
+          "sparkles": {
+            "binary": "/home/kclejeune/lanes/competitive-births-20261025/bin/sparkles-6b7f32ce",
+            "version": "sparkles 0.1.0",
+            "sha256": "cf6f4cf5fd754c8344fd0f0c02b81dce5016c8b8ccfcbe034f5fe7927cfd46c8",
+            "scripts_commit": "unknown",
+            "binary_commit": "6b7f32ce"
+          },
+          "engines": {
+            "jena": {
+              "license": "Apache-2.0",
+              "binary": "/home/kclejeune/lanes/item1-bench/data/sp2b-10m/gcroots/apache-jena-fuseki/bin/fuseki-server",
+              "sha256": "7fb10cdec48244c13ea15e4c0607b29339e5d40c67a12cae2ced41903c1d2743",
+              "version": "Apache Jena Fuseki version 5.1.0",
+              "store_path": "/nix/store/q0dscszid7jzs66xq9dip95z2hc1zmsh-apache-jena-fuseki-5.1.0",
+              "package": "apache-jena-fuseki-5.1.0",
+              "reported_version": "Apache Jena Fuseki version 5.1.0"
+            }
+          },
+          "memory_limit": "12G",
+          "client_cpu": "11",
+          "data": {
+            "synthetic-1.05m": {
+              "license": "generated",
+              "params": "scripts/gen-data.py fixed seed42",
+              "sha256": "c2d387f07a0717fdcd1d001081507b5ac09608961f562f0102d971c36e36edd8",
+              "bytes": 110445630
+            }
+          },
+          "license_check": {
+            "gpl_benchmark_allowed": false,
+            "notes": []
+          }
+        },
+        "settings": {
+          "warmup": 2,
+          "runs": 10,
+          "timer": "hyperfine+curl",
+          "resultCache": false,
+          "maxTimeSeconds": 300,
+          "serverTimeoutSeconds": 315,
+          "sparklesArgs": "",
+          "answerStreamTSVQueries": "",
+          "correctnessEngineIsolation": true,
+          "jenaHeap": "8G",
+          "jenaStack": "256m",
+          "qleverMemory": "8G"
+        },
+        "durability_classes": []
+      },
+      "metadata_note": "The accompanying manual report and validation receipt select specific cells. Raw carried-over rows and common builder defaults do not broaden that measurement or correctness scope. Raw bytes remain unchanged."
+    },
+    {
+      "run_id": "sha256-778538b99eb8214298edce7ef49aca9a8eec4b0025b5f7b89d18c2818f871a7a",
+      "path": "runs/2026-10-25-error-recovery-forge/cold/10.5m/results/record.json",
+      "sha256": "778538b99eb8214298edce7ef49aca9a8eec4b0025b5f7b89d18c2818f871a7a",
+      "format": "bench-record-3",
+      "context": {
+        "suite": "synthetic",
+        "scale": "10.5m",
+        "manifest": {
+          "suite": "synthetic",
+          "started": "2026-10-25T19:40:23Z",
+          "ended": "2026-10-25T19:43:12Z",
+          "host": {
+            "name": "forge",
+            "cpu": "13th Gen Intel(R) Core(TM) i5-13500",
+            "cpus": 20,
+            "ram_mib": 15620,
+            "disk_model": "",
+            "kernel": "7.2.9",
+            "filesystem": "ext4",
+            "mount_options": "rw,relatime,discard,errors=remount-ro"
+          },
+          "sparkles": {
+            "binary": "/home/kclejeune/lanes/competitive-births-20261025/bin/sparkles-6b7f32ce",
+            "version": "sparkles 0.1.0",
+            "sha256": "cf6f4cf5fd754c8344fd0f0c02b81dce5016c8b8ccfcbe034f5fe7927cfd46c8",
+            "scripts_commit": "unknown",
+            "binary_commit": "6b7f32ce"
+          },
+          "engines": {
+            "jena": {
+              "license": "Apache-2.0",
+              "binary": "/home/kclejeune/lanes/item1-bench/data/sp2b-10m/gcroots/apache-jena-fuseki/bin/fuseki-server",
+              "sha256": "7fb10cdec48244c13ea15e4c0607b29339e5d40c67a12cae2ced41903c1d2743",
+              "version": "Apache Jena Fuseki version 5.1.0",
+              "store_path": "/nix/store/q0dscszid7jzs66xq9dip95z2hc1zmsh-apache-jena-fuseki-5.1.0",
+              "package": "apache-jena-fuseki-5.1.0",
+              "reported_version": "Apache Jena Fuseki version 5.1.0"
+            }
+          },
+          "memory_limit": "12G",
+          "client_cpu": "11",
+          "data": {
+            "synthetic-10.5m": {
+              "license": "generated",
+              "params": "scripts/gen-data.py fixed seed42",
+              "sha256": "10daf6486c20f8dd4579d819ea73bb5e7836e054cd6d2d1b73f99f35233635f8",
+              "bytes": 1121336097
+            }
+          },
+          "license_check": {
+            "gpl_benchmark_allowed": false,
+            "notes": []
+          }
+        },
+        "settings": {
+          "warmup": 2,
+          "runs": 10,
+          "timer": "hyperfine+curl",
+          "resultCache": false,
+          "maxTimeSeconds": 300,
+          "serverTimeoutSeconds": 315,
+          "sparklesArgs": "",
+          "answerStreamTSVQueries": "",
+          "correctnessEngineIsolation": true,
+          "jenaHeap": "8G",
+          "jenaStack": "256m",
+          "qleverMemory": "8G"
+        },
+        "durability_classes": []
+      },
+      "metadata_note": "The accompanying manual report and validation receipt select specific cells. Raw carried-over rows and common builder defaults do not broaden that measurement or correctness scope. Raw bytes remain unchanged."
     }
   ]
 }

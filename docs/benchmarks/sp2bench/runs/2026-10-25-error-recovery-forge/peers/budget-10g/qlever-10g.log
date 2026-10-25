@@ -1,0 +1,22 @@
+[14:10:50] dataset: 10000091 triples
+
+rows                   qlever
+q8                          0
+q12b                        1
+[14:11:24] qlever: warm-up pass over the selected queries
+
+== q8
+Benchmark 1: qlever
+Error: The preparation command terminated with a non-zero exit code. Append ' || true' to the command if you are sure that this can be ignored.
+/home/kclejeune/lanes/benchmark-error-recovery-20261025/src-reviewed/scripts/bench-lib.sh: line 9: 1931436 Killed                     ( cd "$(store_of qlever)" && exec "${CAP[@]}" "$QSERVER" -i bench -p "$p" -m "${QLEVER_MEMORY:-8G}" -c 2G -e 0B -s "${SERVER_TIMEOUT}s" -a bench -j 16 >> server.log 2>&1 )
+[14:12:57] qlever: stopped answering while timing q8, recorded as an engine failure
+[14:12:57] qlever: no answer after q8, restarting it
+
+== q12b
+Benchmark 1: qlever
+Error: The preparation command terminated with a non-zero exit code. Append ' || true' to the command if you are sure that this can be ignored.
+/home/kclejeune/lanes/benchmark-error-recovery-20261025/src-reviewed/scripts/bench-lib.sh: line 9: 1932317 Killed                     ( cd "$(store_of qlever)" && exec "${CAP[@]}" "$QSERVER" -i bench -p "$p" -m "${QLEVER_MEMORY:-8G}" -c 2G -e 0B -s "${SERVER_TIMEOUT}s" -a bench -j 16 >> server.log 2>&1 )
+[14:14:29] qlever: stopped answering while timing q12b, recorded as an engine failure
+[14:14:29] qlever: no answer after q12b, restarting it
+results/record.json: 2 results
+[14:14:29] record: /home/kclejeune/lanes/benchmark-error-recovery-20261025/budget-20261025T181046Z/sp2b/results/record.json, table: /home/kclejeune/lanes/benchmark-error-recovery-20261025/budget-20261025T181046Z/sp2b/results/summary.md

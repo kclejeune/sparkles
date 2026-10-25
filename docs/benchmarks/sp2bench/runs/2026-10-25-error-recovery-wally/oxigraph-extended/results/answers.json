@@ -1,0 +1,10 @@
+{
+ "q4": {
+  "oxigraph": {
+   "rows": 41073618,
+   "exact": "row-sha256-v1:94c3adc4557a846c5f12f6c39d3ecb0958b3d45b1dc014640f615e40019a374c",
+   "value": "row-sha256-v1:94c3adc4557a846c5f12f6c39d3ecb0958b3d45b1dc014640f615e40019a374c",
+   "query_sha256": "ba7af5ada891455f72ba06917c031e25c9c1ffdf0f87c4f6e475623950ade60d"
+  }
+ }
+}

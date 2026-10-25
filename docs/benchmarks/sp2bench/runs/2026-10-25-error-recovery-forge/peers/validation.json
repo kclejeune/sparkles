@@ -1,0 +1,471 @@
+{
+  "validation_version": 1,
+  "scope": "Isolated Forge QLever and Fluree SP2Bench selected-query reruns. Raw records are preserved and source-identical reference agreement is recorded separately.",
+  "harness_source_revision": "a44bdabfbe7499abe3d439a6f2bec18b12247209",
+  "source_sha256": "4486653f3ea16825923eb8a5410137df7ba712aa918442531c33cbeb854eb814",
+  "controls": {
+    "host": "forge",
+    "server_memory_cap": "12G",
+    "request_timeout_seconds": 600,
+    "query_server_timeout_seconds": 615,
+    "warmups": 2,
+    "runs": 10,
+    "client_cpu": 11,
+    "qlever_query_memory": "8G",
+    "result_cache": false,
+    "one_engine_for_correctness_and_timing": true
+  },
+  "checks": {
+    "q1": {
+      "fresh_peer_agreement": true,
+      "qlever_rows": 1,
+      "fluree_rows": 1,
+      "qlever_value": "07e0fcc293dd80d0",
+      "fluree_value": "07e0fcc293dd80d0",
+      "query_sha256": "9b38c84b8e9ee973cf23cd97b8b124fcdd358a132595034c7977ca5ffe3be92a",
+      "retained_reference_agreement": true,
+      "qlever_reference_hash": "07e0fcc293dd80d0",
+      "fluree_reference_hash": "07e0fcc293dd80d0",
+      "retained_reference_matches": {
+        "qlever": [
+          "jena",
+          "oxigraph",
+          "sparkles"
+        ],
+        "fluree": [
+          "jena",
+          "oxigraph",
+          "sparkles"
+        ]
+      }
+    },
+    "q10": {
+      "fresh_peer_agreement": true,
+      "qlever_rows": 656,
+      "fluree_rows": 656,
+      "qlever_value": "6271c45707c16c8c",
+      "fluree_value": "6271c45707c16c8c",
+      "query_sha256": "b2604c1e57f0c6dc160b72302a5b998dd37aade0b5d5f4b1d1ec1b91fc99e56f",
+      "retained_reference_agreement": true,
+      "qlever_reference_hash": "6271c45707c16c8c",
+      "fluree_reference_hash": "6271c45707c16c8c",
+      "retained_reference_matches": {
+        "qlever": [
+          "jena",
+          "oxigraph",
+          "sparkles"
+        ],
+        "fluree": [
+          "jena",
+          "oxigraph",
+          "sparkles"
+        ]
+      }
+    },
+    "q11": {
+      "fresh_peer_agreement": true,
+      "qlever_rows": 10,
+      "fluree_rows": 10,
+      "qlever_value": "fba9c0ebb1734be4",
+      "fluree_value": "fba9c0ebb1734be4",
+      "query_sha256": "87da887e5a431588dc20c8989bd6f6ce6581b28c05cc3e1cffe53f2873bd729b",
+      "retained_reference_agreement": true,
+      "qlever_reference_hash": "fba9c0ebb1734be4/f0c0253753657af0",
+      "fluree_reference_hash": "fba9c0ebb1734be4/f0c0253753657af0",
+      "retained_reference_matches": {
+        "qlever": [
+          "jena",
+          "oxigraph",
+          "sparkles"
+        ],
+        "fluree": [
+          "jena",
+          "oxigraph",
+          "sparkles"
+        ]
+      }
+    },
+    "q12a": {
+      "fresh_peer_agreement": true,
+      "qlever_rows": 1,
+      "fluree_rows": 1,
+      "qlever_value": "7522d315bb64415d",
+      "fluree_value": "7522d315bb64415d",
+      "query_sha256": "e6bfec53673229855ab048c2fe763552cac20c811b26f66fbe18bd02ae4f083c",
+      "retained_reference_agreement": true,
+      "qlever_reference_hash": "7522d315bb64415d",
+      "fluree_reference_hash": "7522d315bb64415d",
+      "retained_reference_matches": {
+        "qlever": [
+          "jena",
+          "oxigraph",
+          "sparkles"
+        ],
+        "fluree": [
+          "jena",
+          "oxigraph",
+          "sparkles"
+        ]
+      }
+    },
+    "q12b": {
+      "fresh_peer_agreement": false,
+      "qlever_rows": "error",
+      "fluree_rows": 1,
+      "qlever_value": null,
+      "fluree_value": "7522d315bb64415d",
+      "query_sha256": "8af476514e16d98c20da3f83a5c6d2e6704e80bc33ea304bc3af505e035aefbf",
+      "retained_reference_agreement": true,
+      "fluree_reference_hash": "7522d315bb64415d",
+      "retained_reference_matches": {
+        "fluree": [
+          "jena",
+          "oxigraph",
+          "sparkles"
+        ]
+      }
+    },
+    "q12c": {
+      "fresh_peer_agreement": true,
+      "qlever_rows": 1,
+      "fluree_rows": 1,
+      "qlever_value": "59fc50d410790cde",
+      "fluree_value": "59fc50d410790cde",
+      "query_sha256": "e213637b51bc07fb139f9d22b504d4ed393fe1f3b82fb36579a501d01e5f3139",
+      "retained_reference_agreement": true,
+      "qlever_reference_hash": "59fc50d410790cde",
+      "fluree_reference_hash": "59fc50d410790cde",
+      "retained_reference_matches": {
+        "qlever": [
+          "jena",
+          "oxigraph",
+          "sparkles"
+        ],
+        "fluree": [
+          "jena",
+          "oxigraph",
+          "sparkles"
+        ]
+      }
+    },
+    "q2": {
+      "fresh_peer_agreement": true,
+      "qlever_rows": 618685,
+      "fluree_rows": 618685,
+      "qlever_value": "0593c93f3e693763",
+      "fluree_value": "0593c93f3e693763",
+      "query_sha256": "24000ad7b29fc70050fc74198162c1b0f5f4c33f905b736b944a9b4a248a50e7",
+      "retained_reference_agreement": true,
+      "qlever_reference_hash": "0593c93f3e693763/830855707685b6a8",
+      "fluree_reference_hash": "0593c93f3e693763/830855707685b6a8",
+      "retained_reference_matches": {
+        "qlever": [
+          "jena",
+          "oxigraph",
+          "sparkles"
+        ],
+        "fluree": [
+          "jena",
+          "oxigraph",
+          "sparkles"
+        ]
+      }
+    },
+    "q3a": {
+      "fresh_peer_agreement": true,
+      "qlever_rows": 324935,
+      "fluree_rows": 324935,
+      "qlever_value": "83b2c1f3bcae8017",
+      "fluree_value": "83b2c1f3bcae8017",
+      "query_sha256": "018c1ba91f830d40788cd46cc4002e250e7fe06d552aacf4340d66fd29c927ad",
+      "retained_reference_agreement": true,
+      "qlever_reference_hash": "83b2c1f3bcae8017",
+      "fluree_reference_hash": "83b2c1f3bcae8017",
+      "retained_reference_matches": {
+        "qlever": [
+          "jena",
+          "oxigraph",
+          "sparkles"
+        ],
+        "fluree": [
+          "jena",
+          "oxigraph",
+          "sparkles"
+        ]
+      }
+    },
+    "q3b": {
+      "fresh_peer_agreement": true,
+      "qlever_rows": 2288,
+      "fluree_rows": 2288,
+      "qlever_value": "921863ed30be5497",
+      "fluree_value": "921863ed30be5497",
+      "query_sha256": "b617d949de6bd38879583f66682cfdce3d840f8c9ded3dcd993219adbbed98ce",
+      "retained_reference_agreement": true,
+      "qlever_reference_hash": "921863ed30be5497",
+      "fluree_reference_hash": "921863ed30be5497",
+      "retained_reference_matches": {
+        "qlever": [
+          "jena",
+          "oxigraph",
+          "sparkles"
+        ],
+        "fluree": [
+          "jena",
+          "oxigraph",
+          "sparkles"
+        ]
+      }
+    },
+    "q3c": {
+      "fresh_peer_agreement": true,
+      "qlever_rows": 0,
+      "fluree_rows": 0,
+      "qlever_value": "e3b0c44298fc1c14",
+      "fluree_value": "e3b0c44298fc1c14",
+      "query_sha256": "cb87c7bff1e281711f5b3796581d165d5e5e266effdd8a35958048ab2cbb1ae2",
+      "retained_reference_agreement": true,
+      "qlever_reference_hash": "e3b0c44298fc1c14",
+      "fluree_reference_hash": "e3b0c44298fc1c14",
+      "retained_reference_matches": {
+        "qlever": [
+          "jena",
+          "oxigraph",
+          "sparkles"
+        ],
+        "fluree": [
+          "jena",
+          "oxigraph",
+          "sparkles"
+        ]
+      }
+    },
+    "q5b": {
+      "fresh_peer_agreement": true,
+      "qlever_rows": 385208,
+      "fluree_rows": 385208,
+      "qlever_value": "1fd785a006f901a9",
+      "fluree_value": "1fd785a006f901a9",
+      "query_sha256": "4338ea2d67cc5200e5be1cb9a85e1ab580018ac4ecffbd11427743205f64b61b",
+      "retained_reference_agreement": true,
+      "qlever_reference_hash": "1fd785a006f901a9",
+      "fluree_reference_hash": "1fd785a006f901a9",
+      "retained_reference_matches": {
+        "qlever": [
+          "jena",
+          "oxigraph",
+          "sparkles"
+        ],
+        "fluree": [
+          "jena",
+          "oxigraph",
+          "sparkles"
+        ]
+      }
+    },
+    "q6": {
+      "fresh_peer_agreement": false,
+      "qlever_rows": 1256087,
+      "fluree_rows": null,
+      "qlever_value": "row-sha256-v1:26905cf50617fe3ba1924520b9bfbbc6d2fe2a5c40538801e3d233c29cce9648",
+      "fluree_value": null,
+      "query_sha256": "e635ca91c381cfa5def7a93737e283a4ff9fc697385ac595e3b76338550ede65",
+      "retained_reference_agreement": false,
+      "source_oracle_agreement": false,
+      "expected_rows": 906313,
+      "expected_value": "row-sha256-v1:9fce8c07ef87937ec498e9cdca8047e2c9cfab085a95c4817de2081f4db52479",
+      "qlever_reference_hash": "row-sha256-v1:26905cf50617fe3ba1924520b9bfbbc6d2fe2a5c40538801e3d233c29cce9648",
+      "retained_reference_matches": {
+        "qlever": []
+      }
+    },
+    "q7": {
+      "fresh_peer_agreement": true,
+      "qlever_rows": 2503,
+      "fluree_rows": 2503,
+      "qlever_value": "7e2a47949bac5a51",
+      "fluree_value": "7e2a47949bac5a51",
+      "query_sha256": "75ee3f0d97c710a5be164e9b3c32617dd7d9537c971503eb8dd7604861a50d16",
+      "retained_reference_agreement": true,
+      "qlever_reference_hash": "7e2a47949bac5a51",
+      "fluree_reference_hash": "7e2a47949bac5a51",
+      "retained_reference_matches": {
+        "qlever": [
+          "sparkles"
+        ],
+        "fluree": [
+          "sparkles"
+        ]
+      }
+    },
+    "q8": {
+      "fresh_peer_agreement": false,
+      "qlever_rows": "error",
+      "fluree_rows": 656,
+      "qlever_value": null,
+      "fluree_value": "1a095147849abf2b",
+      "query_sha256": "29e2736f82bfc0ee91bdd597700eea247f5cf352e87ecf0dc872da0cb22eaac7",
+      "retained_reference_agreement": true,
+      "fluree_reference_hash": "1a095147849abf2b",
+      "retained_reference_matches": {
+        "fluree": [
+          "jena",
+          "oxigraph",
+          "sparkles"
+        ]
+      }
+    },
+    "q9": {
+      "fresh_peer_agreement": true,
+      "qlever_rows": 4,
+      "fluree_rows": 4,
+      "qlever_value": "5da8327407b52b7b",
+      "fluree_value": "5da8327407b52b7b",
+      "query_sha256": "72a540e6a337df0240a5da46374eee88632f6ad61715e110aafd063ff4da0a43",
+      "retained_reference_agreement": true,
+      "qlever_reference_hash": "5da8327407b52b7b",
+      "fluree_reference_hash": "5da8327407b52b7b",
+      "retained_reference_matches": {
+        "qlever": [
+          "jena",
+          "oxigraph",
+          "sparkles"
+        ],
+        "fluree": [
+          "jena",
+          "oxigraph",
+          "sparkles"
+        ]
+      }
+    }
+  },
+  "correctness_exclusions": {
+    "q6/qlever": "The complete 1256087-row TSV differs from the independent 906313-row source oracle. The latency is not comparable.",
+    "q8/qlever": "HTTP500 allocation failure at 8G; no qualified latency.",
+    "q12b/qlever": "HTTP500 allocation failure at 8G; no qualified latency."
+  },
+  "retained_reference": {
+    "path": "../../../../2026-10-23-sp2b-10m-forge.json",
+    "sha256": "608e54c93fb68acbd6663fefe143c2648c768b2a7c6a7db7f3acfb1ff57647d4"
+  },
+  "files": {
+    "qlever-q10.json": "89f5409efbd53c612ec1068379223a26519dc24ecb011c9c532e29e9c640c047",
+    "diagnostic-controls.sh": "69b0058c678ef49c8b7571358b77c6d542baf34f23ab08e7ade2f4834a58d4b4",
+    "fluree-q12b.json": "b056912cc025977745119dfbd1089a2ca57d77174a00c90c4bdf7f722e99896e",
+    "load-peers.log": "fe3dec083198c81eef37f1fd7d7979704d449d5bf05c875358d59673202dfeae",
+    "trim.txt": "34d446b93fa71dc567a04f612db5d2b54d070678a043e2956e3f99c24b094f38",
+    "fluree-q3c.json": "439b6dcf75924ea107c990d32ef99bc84927e9fa78dc2268ef175a2aece3babb",
+    "qlever-q3c.json": "bccde8fb0e1d189a5f71abfbe619fa0385c0655bec64165390c7c1b6d825f8e1",
+    "qlever-q12c.json": "ab01bb315aaef1523dbd05261ac1ea3cbd1b2aab1ac45b8eef7b889a14e423ab",
+    "qlever-q7.json": "aa0d6f2371df5030d06342ed2f4d07cd5accba607d20eac4edc71a2419be7bf8",
+    "fluree-manifest.json": "5173ca210d8ef0345228689ce76b0b993e39636905ee78919f82a4e6fb6b5d35",
+    "fluree-mem.json": "5e901f15a3e7fbb64217cc330aaf61e5fa65cf58c18586fe296054e02468b7b5",
+    "qlever-q9.json": "49cc5ed31cb983c5674b02bcd49ca04868adb09048d9f73359da3d8fda850b73",
+    "load-qlever.log": "d47022755a50bc816566988f6bf2009f09523e3187514f2ffc42c091cafd21b0",
+    "qlever-q3b.json": "7fd3cf9bbb13947eeccb7701a818f768284aedd32b147f0bd86a6ea73bba9545",
+    "qlever-q11.json": "60617aa926cc64ca1d009ab1a47a5bc6e4593ea1176c8e9556ff8124682299d0",
+    "qlever-q2.json": "f71997d4ed5be8800e2ac767ce289f5a770b57fe1ebf93606a63f54c934cd963",
+    "fluree-q11.json": "e792c65c0332da2e2ce2552590c0e1c726fd66ab173a4a5c99ea4af4c9d4d316",
+    "fluree-q10.json": "c971f4ff4643a5582f75a163bc28013fbe8aa20dc80ceb075115ff585b3d4536",
+    "fluree-q1.json": "f294d6b6b48f0bc800c66e3313820aaf4f00234cc88c571499be5474e51cf74b",
+    "qlever-answers.json": "5307ace7969777b6175dbc5abed6c70fa86b39efbc0f9fd50f6b598484b8a8bd",
+    "qlever-mem.json": "ab02426627b0b50b4c2e254f4892ae89157a76eec480f64b050854a28d14e6c0",
+    "qlever-q1.json": "2e8c8125c4400dad01d6d4b65a35e5fd17e1d5fd2a245c3b55e7503d5a48442b",
+    "preflight.txt": "7c6a3ed0b80f8836948f8f441e34de4eb12eeead76bd4560f817d90427a2a73f",
+    "fluree-q2.json": "5ae7df51f12b20d2c50366ae6cb5335c8c543b31673ffde1ba1729670e283868",
+    "fluree-q12a.json": "68d4ee8054675d9e6c36a02f23a8096d17ceca16f0db7423a2b3ce76229ac455",
+    "qlever-record.json": "a41e1019f4c425b88ad2ce4539d554b8584f1e8abfaaa6a429a552afc0fda02d",
+    "fluree-q3b.json": "c387965bc8182edd5db78efbda2d3ba43693c23daa19d3eaef27269e0f3bb692",
+    "qlever-q6.json": "ec44cdb0f8e3c3d205840e84994430ebce6c1119b7a1f777db166acf6f21481d",
+    "qlever-q8.json": "51717a9464c7ba6a1db49ef4b2be33b67ae28cbff34b54e96b30993b370c6f4a",
+    "diagnostic-qlever.sh": "7b58a035bd64a20f1208af9541a5e2e113be328f82b7161ccea731eb64fc91a3",
+    "fluree-q9.json": "0981908ceacaf9477697d304886d2e579b451d79cd5475facce1f55d526fc83a",
+    "fluree-answers.json": "4b1dbb6399b55b0e8c2e462d24cad24153c400ccfa286506094969584f150bf2",
+    "qlever-q5b.json": "02a99c4be73511b6bf11eb55fab8addb1a0579cb7dfdf3d61b917cb5bc0eee23",
+    "qlever-q6-witness.json": "b1d1182285eee99cf32c33d7121a59af8740702db4c67744f075d4afd8516a52",
+    "fluree-q6.json": "ec44cdb0f8e3c3d205840e84994430ebce6c1119b7a1f777db166acf6f21481d",
+    "fluree-q3a.json": "43203430f16901911f25edf8a59c307ea2f659788cb97684aa909ba1914e2fe0",
+    "fluree-q12c.json": "df3ff8d829cfe2b96f35e086ef283b578efdf22a770739997e5541a8d3113ea7",
+    "binaries.sha256": "063631a9ebffeb60bdebe89f87c6ff7dfe6d916b12953a29cab8b3b0900a9220",
+    "harness.sha256": "b229e724b18e206c79d101a4f97fc5d146e2bf01d41c81262a834d18b83cae96",
+    "fluree-q8.json": "092a7bf5d309d048a6050a0604d4520a54207b4c9a3118630abc45b80a4c454c",
+    "qlever-q3a.json": "b9150d1c2265172b9c8622cf14088b045bee8c3cc978acf9dcbed712a917b1b6",
+    "fluree-q5b.json": "d11ecc5043da02d9a3dd424bfad5bf2dee125d2d87787ace065cdba69769ec75",
+    "fluree-record.json": "f2160e1630bf0c01a230297aeab4aedb8ebf7431f2d158e229581d0543de9c23",
+    "qlever-manifest.json": "7dbf36bf6b0dc3a1f63f7291ce1ef74ce88223b0a808bfdf2b0180c9f541a8ce",
+    "qlever-q6-witness.py": "5cc1b30ecbbf1aa6382f069cc7d9bf209190a45611b33a0744682fe898c8abab",
+    "qlever-q12a.json": "926f12436c2f539943383472f2ebbe0c6f3c9007d016c5e8fd19a6b42ab506d2",
+    "fluree-q7.json": "41b1ba6ec3b6350ab61039ce7ecd8a90e9da3d9ab0c982ed97404800f169e45e",
+    "load-fluree.log": "7cc6802d0b453c72f5223bbbb8c13becadf4ddac9765b0825ad0e7ef027aa1bb",
+    "qlever-q12b.json": "cb4260dcd3f6b694371da6e04ebf6351b3dcccf2433892dab3e9c617417d8d87",
+    "diagnostic-qlever/string-less.headers": "5609e6073f4595e26b8937d365fd066220a5e5555b434699e19d510aa7a8a7d2",
+    "diagnostic-qlever/optional-values.headers": "5609e6073f4595e26b8937d365fd066220a5e5555b434699e19d510aa7a8a7d2",
+    "diagnostic-qlever/scope.txt": "a4c9ae72f22ce932dceb4632aace5a43725603d511c10745cb42d00d62a21aa9",
+    "diagnostic-qlever/optional-values.response.json": "a66954411b4a91d97a9ebecac29e02c7603332ce9725b894b3189681c6c15cd8",
+    "diagnostic-qlever/string-less.metrics": "e81627fd852bd1bd777461485674dc972987ada0989dc9b7979b06e239c4cd6c",
+    "diagnostic-qlever/stats.json": "91647b75fd302eea783c583115c162f6651d6a545cfb8765c8fc46e4416c7144",
+    "diagnostic-qlever/string-less.response.json": "de0fbccb49a613ac0a160c3416cb2ff21ed6543fd475fabf45e3f6d6bed75c22",
+    "diagnostic-qlever/optional-values.metrics": "5e8320825003310bea1072adcb7bef40ac5a7cb03c94ef80550bb47a1d8fcdd7",
+    "diagnostic-qlever/inputs.sha256": "60d9d49cd3b8e4b05477a7f23dafea8c994a906518aaaac1e317d84a43b1b4bf",
+    "diagnostic-qlever/complete.txt": "7720b28e35da8e7827de7ca5abf9fa9ecf3cde7526255c0229ab99ab35150053",
+    "budget-10g/trim.txt": "1899b066e0af370ce55e0404bf0911649c82ecda5cd63784af6d978fdffcd3b0",
+    "budget-10g/preflight.txt": "363f9ff2b063c8fbcbfb4fc355b8aa2e53055cc8f1e17d90b0bc21faf00e9b33",
+    "budget-10g/harness-source-commit.txt": "0a32eb9e279f7ac1daf0c441bdb1b02e73c025f10b983e0111a3753e19dd970e",
+    "budget-10g/binaries.sha256": "00900321d3147b69e0e6ff8a193eefc7ce8bda943eaffbbf53aa8ac1db1d0dae",
+    "budget-10g/harness.sha256": "0cb138c5cee780c48a2cfd632bec987eff3f9e6dd1cf8a53b895efa1733b4f4d",
+    "budget-10g/qlever-10g.log": "fc46d93e4bd2ebe3fa962de4ad462ee9ddd1c4bbe55bd989f47ecc048f53784c",
+    "budget-10g/complete.txt": "3ba4f84a99d534cb3c52d40fb7c02403567dff0d42b61458aade4e4ed7f29dd7",
+    "diagnostic-controls/sparkles-string-less.headers": "5e127b34deda0a3c6ae5703d92137f243e7c0d1a1b9051d2bbd4fa81cf9759b9",
+    "diagnostic-controls/qlever-optional-values.metrics": "635491c2bd797dab9a4d1a2e67de9a607aa93ca67c804a5cb813f0e341e21282",
+    "diagnostic-controls/sparkles-string-less.response.json": "b58ac166eb43c06bc1b198d9abc990a2ce52e8d2144413c54304714230e47455",
+    "diagnostic-controls/sparkles-string-less.metrics": "e17f0ac1728cb9b4ea0609eaede48bb17e8fc71bbc883d8afc45af54a1d0f3ec",
+    "diagnostic-controls/sparkles.log": "a523ab02fd8be53e7a39d5e103588ebf0d89f5ffeaf6410009f0023e295be761",
+    "diagnostic-controls/jena-string-less.response.json": "4dc98034f6d44780dd005ba66ea2dc1c1be7c92efe476b7ef950023f6b91adf6",
+    "diagnostic-controls/jena-optional-values.metrics": "134e37a3bd3e7e5c78d050db50909bde555a84862d1a3ddee9e49731a45924d8",
+    "diagnostic-controls/sparkles-optional-values.headers": "15e6555b207bc306be00b300a33509b85a32ded4d736250e0e1393bdacfb9050",
+    "diagnostic-controls/scope.txt": "6775564a6625b8c56e98e750b2aed47fa857280e4d571597ce3728ca8cf26274",
+    "diagnostic-controls/qlever-string-less.metrics": "39042a2149640ebe5660412a5c023fa1fca033a0dbeb3c5fa95f50052f257099",
+    "diagnostic-controls/qlever-string-less.headers": "5609e6073f4595e26b8937d365fd066220a5e5555b434699e19d510aa7a8a7d2",
+    "diagnostic-controls/jena-string-less.metrics": "e72144dcd977cfb477090555b70a6046f6b1379f2bf257896c43c0245f7776aa",
+    "diagnostic-controls/inputs.sha256": "23fd6e2b15e1060f21c27c2dd72d51eb1db1528367654d3b3fd53acf074be240",
+    "diagnostic-controls/jena-string-less.headers": "a42ca6ce842df1f9f4c9944e1275f52e6f7d6be276e227b91fec5d508cb110d9",
+    "diagnostic-controls/sparkles-optional-values.metrics": "9e319e85dbe3a061f55ca280f261294e31925066ada1ff28211f3e17b16b5cda",
+    "diagnostic-controls/qlever-optional-values.headers": "5609e6073f4595e26b8937d365fd066220a5e5555b434699e19d510aa7a8a7d2",
+    "diagnostic-controls/qlever-optional-values.response.json": "ca5250beb918e711f34157b517a063fb086aff4a3534150a75021cb0610bb57e",
+    "diagnostic-controls/jena-optional-values.response.json": "6740dd7f92e8a23cb81738d9548246be4deb1f44087561d50f3448c5d365f1b0",
+    "diagnostic-controls/fuseki.log": "808d3fed365201e47f0b6573f06a9b883c7b9fed647526c11df784ab23a28fb8",
+    "diagnostic-controls/jena-optional-values.headers": "ced01152e9d7b9c3092d52527d3b15a2cd5b589b369d449d1053240dcf3a0115",
+    "diagnostic-controls/sparkles-optional-values.response.json": "e90659dba8a02d786b9f556ef3cfe31b60929a17f0fe090b767b913991fb932a",
+    "diagnostic-controls/complete.txt": "f07df570017f96ad3fde17ae17e8406162835425017474ade65b852662c9c8b1",
+    "diagnostic-controls/qlever-string-less.response.json": "3ac85084d5f657a13a52e5fc7f89cb8eace02674a91eab8560958d13516cba36",
+    "diagnostic-controls/results/mem.json": "4808864e593ee9ed8c58732c2c4dba0ba92a2275384b6146fc387078a7f699fc",
+    "diagnostic-controls/queries/optional-values.rq": "39a5e878ebf7410eedb5e5628e44e39c95b548f838772692ba1111df690ca2ec",
+    "diagnostic-controls/queries/string-less.rq": "185695b5c78f343d20db56f2f3ec782d248f4502e653e61fe7720187c7553380",
+    "diagnostic-controls/sparkles-server/catalog.lock": "440346e71edc847db8aebffb38043a26d1b44fb9863ab340c1cc89f8b2078cb9",
+    "budget-10g/qlever-10g-results/q12b.qlever.hf.json": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+    "budget-10g/qlever-10g-results/q8.json": "edb3df9040c9480d265fdc8b3e35365a053195445ec89cddc639d85017aacfb2",
+    "budget-10g/qlever-10g-results/answers.json": "7f3e8cfddc8fe853b02413c0c844a5b590ee9a311d03043214a5e222da4ade8a",
+    "budget-10g/qlever-10g-results/extra.json": "7252469fb573d7ee898273484ce61cf22c47279e6ab9ba4e9a4e15a10af1902c",
+    "budget-10g/qlever-10g-results/q12b.json": "edb3df9040c9480d265fdc8b3e35365a053195445ec89cddc639d85017aacfb2",
+    "budget-10g/qlever-10g-results/summary.md": "35589a861e4f64709a512ad43313a83226f97f0f21f83a5c92b01cb30460ea25",
+    "budget-10g/qlever-10g-results/restarts.json": "147f912dc971942c3140a6cf05a6cb5e606ce351bac8338acef5a63f68d1f18c",
+    "budget-10g/qlever-10g-results/manifest.json": "d64109d953bb47243e99b2c78285d65502900f1d278fd66bc34c93b1d5f8b15c",
+    "budget-10g/qlever-10g-results/record.json": "aa4e47fa315e72ee623994423a7a26e1e9346ec30a928acf78cd1153539ef9f1",
+    "budget-10g/qlever-10g-results/q8.qlever.hf.json": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+    "budget-10g/qlever-10g-results/mem.json": "2253a1c32ff6d12e7e33b1954840e23b3c78aa6a270a298e37b35423fdfc31fc",
+    "budget-10g/sp2b/raw-answers/q12b.qlever.json": "fc3cf69b155b6dedca64f1ea6704fb12bdf6b213977bc8b296018298cba31b81",
+    "budget-10g/sp2b/raw-answers/q8.qlever.json": "f9919d96ced5c8f2418876262751dbf5710de91402d7493a89d17f0e2303686b",
+    "diagnostic-qlever/results/mem.json": "2c49a11876aad7d47e4662f0ce6136f628d37d91f6003b261e0adcad4439c923",
+    "diagnostic-qlever/queries/optional-values.rq": "39a5e878ebf7410eedb5e5628e44e39c95b548f838772692ba1111df690ca2ec",
+    "diagnostic-qlever/queries/string-less.rq": "185695b5c78f343d20db56f2f3ec782d248f4502e653e61fe7720187c7553380",
+    "diagnostic-qlever/qlever-index/server.log": "17ec10a8d24b93d27aeeeef6f0e63321e057056ffb8206d55a4a8e145166bcce"
+  },
+  "scope_note": "The raw Fluree record also retains QLever rows from its prior single-engine run. Only Fluree rows are eligible from that raw record; fresh QLever cells use the separate QLever record and its matching manifest.",
+  "additional_diagnostics": {
+    "q6": "qlever-q6-witness.json",
+    "q4_and_q6_minimal_controls": "diagnostic-controls",
+    "codepoint_collation_reference": "https://www.w3.org/TR/sparql11-query/#OperatorMapping",
+    "conclusion": "Dataset-independent queries return the expected results on Sparkles and Jena. QLever returns the excluded2001 binding for the OPTIONAL test and a string pair that violates Unicode codepoint less-than. Original published query texts remain unchanged."
+  },
+  "reference_comparison": "Compare full canonical value digest plus ORDER BY suffix when present, and row count, against status-ok, not-disagreed exact-source Sparkles/Jena/Oxigraph reference captures. q7 originally had one capture with agrees=null; two fresh peers now match it. This remains majority screening, not independent correctness proof. RDF-term identity differences are retained separately."
+}

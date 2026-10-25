@@ -1,0 +1,15 @@
+15:42:50 INFO  Server          :: Apache Jena Fuseki 5.1.0
+15:42:50 INFO  Config          :: FUSEKI_HOME=/nix/store/q0dscszid7jzs66xq9dip95z2hc1zmsh-apache-jena-fuseki-5.1.0
+15:42:50 INFO  Config          :: FUSEKI_BASE=/home/kclejeune/.local/fuseki
+15:42:50 INFO  Config          :: Shiro file: file:///home/kclejeune/.local/fuseki/shiro.ini
+15:42:50 INFO  Config          :: Template file: templates/config-tdb2-dir
+15:42:51 INFO  Server          :: Database: TDB2 dataset: location=/home/kclejeune/lanes/benchmark-error-recovery-20261025/synthetic-cold-20261025T193938Z/10.5m/jena.db
+15:42:51 INFO  Server          :: Path = /bench
+15:42:51 INFO  Server          ::   Memory: 8.0 GiB
+15:42:51 INFO  Server          ::   Java:   21.0.12.1
+15:42:51 INFO  Server          ::   OS:     Linux 7.2.9 amd64
+15:42:51 INFO  Server          ::   PID:    1940036
+15:42:51 INFO  Server          :: Started 2026/10/25 15:42:51 EDT on port 28472
+15:42:51 INFO  Fuseki          :: [1] POST http://localhost:28472/bench/sparql
+15:42:51 INFO  Fuseki          :: [1] Query = PREFIX ex: <http://example.org/> PREFIX foaf: <http://xmlns.com/foaf/0.1/> PREFIX rdfs: <http://www.w3.org/2000/01/rdf-schema#> PREFIX xsd: <http://www.w3.org/2001/XMLSchema#> SELECT (COUNT(*) AS ?c) WHERE { <http://example.org/person/0> foaf:knows* ?x }
+15:43:12 INFO  Fuseki          :: [1] 200 OK (21.015 s)

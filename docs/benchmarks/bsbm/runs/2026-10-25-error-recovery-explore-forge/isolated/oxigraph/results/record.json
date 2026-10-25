@@ -1,0 +1,95 @@
+{
+ "record": 3,
+ "suite": "bsbm-explore",
+ "scale": "10m",
+ "manifest": {
+  "suite": "bsbm-explore",
+  "started": "2026-10-25T19:56:33Z",
+  "ended": "2026-10-25T19:58:53Z",
+  "host": {
+   "name": "forge",
+   "cpu": "13th Gen Intel(R) Core(TM) i5-13500",
+   "cpus": 20,
+   "ram_mib": 15620,
+   "disk_model": "",
+   "kernel": "7.2.9",
+   "filesystem": "ext4",
+   "mount_options": "rw,relatime,discard,errors=remount-ro"
+  },
+  "sparkles": {
+   "binary": "/home/kclejeune/lanes/competitive-births-20261025/bin/sparkles-6b7f32ce",
+   "version": "sparkles 0.1.0",
+   "sha256": "cf6f4cf5fd754c8344fd0f0c02b81dce5016c8b8ccfcbe034f5fe7927cfd46c8",
+   "scripts_commit": "unknown",
+   "binary_commit": "6b7f32ce"
+  },
+  "engines": {
+   "oxigraph": {
+    "license": "MIT OR Apache-2.0",
+    "binary": "/nix/store/g7ajfdk0g8bypdbsj23hnfq71izm3iz1-oxigraph-0.5.11/bin/oxigraph",
+    "sha256": "c99f9c4866b9d25f135729ac8b0e468cc0badd2c2cfe1c4b704f0db375ed8de3",
+    "version": "oxigraph 0.5.11",
+    "store_path": "/nix/store/g7ajfdk0g8bypdbsj23hnfq71izm3iz1-oxigraph-0.5.11",
+    "package": "oxigraph-0.5.11",
+    "reported_version": "oxigraph 0.5.11"
+   }
+  },
+  "memory_limit": "12G",
+  "client_cpu": "11",
+  "data": {
+   "bsbm-10m": {
+    "license": "GPL-3.0 generator",
+    "params": "BSBMtools0.2 products28480 fixedseed",
+    "sha256": "db77a8d62274566c0fcf6a85634741b0313551cc217b59f4b1f26d444fd205be",
+    "bytes": 2619263591
+   }
+  },
+  "license_check": {
+   "gpl_benchmark_allowed": false,
+   "notes": []
+  }
+ },
+ "settings": {
+  "warmup": 2,
+  "runs": 10,
+  "timer": "hyperfine+curl",
+  "resultCache": false,
+  "bsbmWarmup": 50,
+  "bsbmRuns": 500,
+  "bsbmClients": [
+   1
+  ],
+  "bsbmMaxTimeSeconds": 1800,
+  "requestTimeoutSeconds": 300,
+  "serverTimeoutSeconds": 315,
+  "qleverMemory": "8G",
+  "serverMemoryCap": "12G"
+ },
+ "results": [
+  {
+   "engine": "oxigraph",
+   "query": "explore-mix-select",
+   "mode": "qmph",
+   "clients": 1,
+   "durability": null,
+   "samples_ms": [],
+   "median_ms": null,
+   "p95_ms": null,
+   "answer": null,
+   "status": "ok",
+   "qmph": 18144.31,
+   "runs": 500,
+   "timeouts": 0,
+   "seconds": 99.205,
+   "driver_status": "ok"
+  }
+ ],
+ "load": {
+  "oxigraph": {
+   "seconds": 23.4818,
+   "max_rss_kib": 2078248,
+   "index_bytes": 1881677824,
+   "index_apparent_bytes": 1881600083
+  }
+ }
+}

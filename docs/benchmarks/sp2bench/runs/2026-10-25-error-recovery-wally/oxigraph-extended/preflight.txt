@@ -1,0 +1,20 @@
+2026-10-25T19:23:56Z
+wally
+ 15:23:56  up 1 day 21:36,  0 users,  load average: 2.76, 2.80, 3.10
+               total        used        free      shared  buff/cache   available
+Mem:           31766        4878       17860          14        9516       26887
+Swap:           8191        2004        6187
+Filesystem           Size  Used Avail Use% Mounted on
+/dev/mapper/vg-root  460G  259G  178G  60% /
+    PID %CPU COMMAND
+   3057 11.8 .quickshell-wra
+   2969  7.3 .Hyprland-wrapp
+2650204  4.7 .vicinae-file-i
+2650387  1.2 thermald
+    154  1.0 irq/9-acpi
+    392  0.5 jbd2/dm-2-8
+  35825  0.4 brave
+4174320  0.4 kworker/u81:3+i915_flip
+4174321  0.3 kworker/u81:5-rb_allocator
+2649170  0.3 .tailscaled-wra
+     16  0.3 rcu_preempt

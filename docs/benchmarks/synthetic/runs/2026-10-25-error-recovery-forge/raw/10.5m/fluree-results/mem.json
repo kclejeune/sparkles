@@ -1,0 +1,26 @@
+{
+ "idle": {
+  "jena-fuseki": 258,
+  "fluree": 271
+ },
+ "queries": {
+  "knows-reach": {
+   "jena-fuseki": {
+    "before": 258,
+    "peak": 2175,
+    "delta": 1917
+   }
+  },
+  "count-all": {
+   "fluree": {
+    "before": 271,
+    "peak": 280,
+    "delta": 9
+   }
+  }
+ },
+ "warm": {
+  "jena-fuseki": 2182,
+  "fluree": 292
+ }
+}

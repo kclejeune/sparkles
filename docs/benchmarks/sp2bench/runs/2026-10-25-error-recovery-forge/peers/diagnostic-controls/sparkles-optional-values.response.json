@@ -1,0 +1,1 @@
+{"head":{"vars":["author","yr"]},"results":{"bindings":[{"author":{"type":"uri","value":"urn:author:a"},"yr":{"type":"literal","value":"2000","datatype":"http://www.w3.org/2001/XMLSchema#integer"}}]}}

@@ -1,0 +1,10 @@
+{
+ "knows-reach": {
+  "jena-fuseki": {
+   "rows": 1,
+   "exact": "7511ef374ecdf421",
+   "value": "cd6967d17c818d77",
+   "query_sha256": "144c9c0ca86e08938576a7c7788ee1c3e657fa6027683aa4777802942285c7d2"
+  }
+ }
+}

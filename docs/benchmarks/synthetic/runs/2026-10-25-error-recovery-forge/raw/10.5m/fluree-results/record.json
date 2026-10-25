@@ -1,0 +1,110 @@
+{
+ "record": 3,
+ "suite": "synthetic",
+ "scale": "10.5m",
+ "manifest": {
+  "suite": "synthetic",
+  "started": "2026-10-25T18:23:56Z",
+  "ended": "2026-10-25T18:24:03Z",
+  "host": {
+   "name": "forge",
+   "cpu": "13th Gen Intel(R) Core(TM) i5-13500",
+   "cpus": 20,
+   "ram_mib": 15620,
+   "disk_model": "",
+   "kernel": "7.2.9",
+   "filesystem": "ext4",
+   "mount_options": "rw,relatime,discard,errors=remount-ro"
+  },
+  "sparkles": {
+   "binary": "/home/kclejeune/lanes/competitive-births-20261025/bin/sparkles-6b7f32ce",
+   "version": "sparkles 0.1.0",
+   "sha256": "cf6f4cf5fd754c8344fd0f0c02b81dce5016c8b8ccfcbe034f5fe7927cfd46c8",
+   "scripts_commit": "unknown",
+   "binary_commit": "6b7f32ce"
+  },
+  "engines": {
+   "fluree": {
+    "license": "BUSL-1.1",
+    "binary": "/nix/store/jvhxwjlhzijkd1kvrh8l7wfkbclp8vnx-fluree-4.2.2/bin/fluree",
+    "sha256": "99629db65b6eb0d7d9b7cafdc48806eee8ab71e9568fe389b983accaaa35f7ff",
+    "version": "fluree 4.2.2",
+    "store_path": "/nix/store/jvhxwjlhzijkd1kvrh8l7wfkbclp8vnx-fluree-4.2.2",
+    "package": "fluree-4.2.2",
+    "reported_version": "fluree 4.2.2"
+   }
+  },
+  "memory_limit": "12G",
+  "client_cpu": "11",
+  "data": {
+   "synthetic-10.5m": {
+    "license": "generated",
+    "params": "scripts/gen-data.py fixed seed42",
+    "sha256": "10daf6486c20f8dd4579d819ea73bb5e7836e054cd6d2d1b73f99f35233635f8",
+    "bytes": 1121336097
+   }
+  },
+  "license_check": {
+   "gpl_benchmark_allowed": false,
+   "notes": []
+  }
+ },
+ "settings": {
+  "warmup": 2,
+  "runs": 10,
+  "timer": "hyperfine+curl",
+  "resultCache": false,
+  "maxTimeSeconds": 300,
+  "serverTimeoutSeconds": 315,
+  "sparklesArgs": "",
+  "answerStreamTSVQueries": "",
+  "correctnessEngineIsolation": true,
+  "jenaHeap": "8G",
+  "jenaStack": "256m",
+  "qleverMemory": "8G"
+ },
+ "results": [
+  {
+   "engine": "fluree",
+   "query": "count-all",
+   "mode": "warm",
+   "clients": 1,
+   "durability": null,
+   "samples_ms": [
+    3.718,
+    3.61,
+    3.598,
+    3.478,
+    3.392,
+    3.485,
+    3.476,
+    3.409,
+    3.465,
+    3.396
+   ],
+   "median_ms": 3.477,
+   "p95_ms": 3.718,
+   "answer": {
+    "rows": 1,
+    "hash": "92fc3e46501f3f63",
+    "agrees": null,
+    "algorithm": "canonical-sha256-v1"
+   },
+   "status": "ok"
+  }
+ ],
+ "load": {
+  "jena": {
+   "seconds": 46.2463,
+   "max_rss_kib": 3742256,
+   "index_bytes": 1398980608,
+   "index_apparent_bytes": 1570115931
+  },
+  "fluree": {
+   "seconds": 10.6076,
+   "max_rss_kib": 3204060,
+   "index_bytes": 417484800,
+   "index_apparent_bytes": 416766998
+  }
+ }
+}

@@ -1,0 +1,116 @@
+<?xml version="1.0"?>
+<sparql xmlns="http://www.w3.org/2005/sparql-results#">
+<head>
+  <variable name="productLabel"/>
+  <variable name="offer"/>
+  <variable name="price"/>
+  <variable name="vendor"/>
+  <variable name="vendorTitle"/>
+  <variable name="review"/>
+  <variable name="revTitle"/>
+  <variable name="reviewer"/>
+  <variable name="revName"/>
+  <variable name="rating1"/>
+  <variable name="rating2"/>
+</head>
+<results>
+  <result>
+    <binding name="productLabel"><literal>catching recondensed buzzards</literal></binding>
+    <binding name="review"><uri>http://www4.wiwiss.fu-berlin.de/bizer/bsbm/v01/instances/dataFromRatingSite1/Review10621</uri></binding>
+    <binding name="revTitle"><literal>rediscover misappropriate admixes momentoes unspecifically easterlies contexts assignors taxiing partitive spryness debarks</literal></binding>
+    <binding name="reviewer"><uri>http://www4.wiwiss.fu-berlin.de/bizer/bsbm/v01/instances/dataFromRatingSite1/Reviewer535</uri></binding>
+    <binding name="revName"><literal>Hideo-Mae</literal></binding>
+  </result>
+  <result>
+    <binding name="productLabel"><literal>catching recondensed buzzards</literal></binding>
+    <binding name="review"><uri>http://www4.wiwiss.fu-berlin.de/bizer/bsbm/v01/instances/dataFromRatingSite11/Review100386</uri></binding>
+    <binding name="revTitle"><literal>promontory meringues fireworks dreaminess verniers unsheltered tilting cooperator overscrupulous clumsiness ennoble amoroso loudmouth</literal></binding>
+    <binding name="reviewer"><uri>http://www4.wiwiss.fu-berlin.de/bizer/bsbm/v01/instances/dataFromRatingSite11/Reviewer5123</uri></binding>
+    <binding name="revName"><literal>Shigetoki-Kirk</literal></binding>
+    <binding name="rating1"><literal datatype="http://www.w3.org/2001/XMLSchema#int">1</literal></binding>
+  </result>
+  <result>
+    <binding name="productLabel"><literal>catching recondensed buzzards</literal></binding>
+    <binding name="review"><uri>http://www4.wiwiss.fu-berlin.de/bizer/bsbm/v01/instances/dataFromRatingSite12/Review113058</uri></binding>
+    <binding name="revTitle"><literal>chirker charladies icbm gremmy foreseers throwbacks subjacent narcissistic</literal></binding>
+    <binding name="reviewer"><uri>http://www4.wiwiss.fu-berlin.de/bizer/bsbm/v01/instances/dataFromRatingSite12/Reviewer5764</uri></binding>
+    <binding name="revName"><literal>Legarre-Polia</literal></binding>
+    <binding name="rating1"><literal datatype="http://www.w3.org/2001/XMLSchema#int">6</literal></binding>
+    <binding name="rating2"><literal datatype="http://www.w3.org/2001/XMLSchema#int">9</literal></binding>
+  </result>
+  <result>
+    <binding name="productLabel"><literal>catching recondensed buzzards</literal></binding>
+    <binding name="review"><uri>http://www4.wiwiss.fu-berlin.de/bizer/bsbm/v01/instances/dataFromRatingSite13/Review128704</uri></binding>
+    <binding name="revTitle"><literal>precontriving antiprotons accostable teleradiography bathetic nazify pardonable dints touted densest puniness kernelling bassoonist oystered pilotage</literal></binding>
+    <binding name="reviewer"><uri>http://www4.wiwiss.fu-berlin.de/bizer/bsbm/v01/instances/dataFromRatingSite13/Reviewer6568</uri></binding>
+    <binding name="revName"><literal>Tommy-Raquel</literal></binding>
+    <binding name="rating1"><literal datatype="http://www.w3.org/2001/XMLSchema#int">2</literal></binding>
+    <binding name="rating2"><literal datatype="http://www.w3.org/2001/XMLSchema#int">8</literal></binding>
+  </result>
+  <result>
+    <binding name="productLabel"><literal>catching recondensed buzzards</literal></binding>
+    <binding name="review"><uri>http://www4.wiwiss.fu-berlin.de/bizer/bsbm/v01/instances/dataFromRatingSite14/Review132614</uri></binding>
+    <binding name="revTitle"><literal>subchapter tracheotomized methinks tightly appealer containership quadrupled smears quietens defalcating dated sermonizer deeding</literal></binding>
+    <binding name="reviewer"><uri>http://www4.wiwiss.fu-berlin.de/bizer/bsbm/v01/instances/dataFromRatingSite14/Reviewer6765</uri></binding>
+    <binding name="revName"><literal>Sandra-Ennafa</literal></binding>
+    <binding name="rating2"><literal datatype="http://www.w3.org/2001/XMLSchema#int">5</literal></binding>
+  </result>
+  <result>
+    <binding name="productLabel"><literal>catching recondensed buzzards</literal></binding>
+    <binding name="review"><uri>http://www4.wiwiss.fu-berlin.de/bizer/bsbm/v01/instances/dataFromRatingSite16/Review158444</uri></binding>
+    <binding name="revTitle"><literal>unsurmountable saprophytic spattered lazyish shredding interlards</literal></binding>
+    <binding name="reviewer"><uri>http://www4.wiwiss.fu-berlin.de/bizer/bsbm/v01/instances/dataFromRatingSite16/Reviewer8074</uri></binding>
+    <binding name="revName"><literal>Pam-Bunjiro</literal></binding>
+  </result>
+  <result>
+    <binding name="productLabel"><literal>catching recondensed buzzards</literal></binding>
+    <binding name="review"><uri>http://www4.wiwiss.fu-berlin.de/bizer/bsbm/v01/instances/dataFromRatingSite16/Review161448</uri></binding>
+    <binding name="revTitle"><literal>abysm ponderer natrons truffles</literal></binding>
+    <binding name="reviewer"><uri>http://www4.wiwiss.fu-berlin.de/bizer/bsbm/v01/instances/dataFromRatingSite16/Reviewer8235</uri></binding>
+    <binding name="revName"><literal>Celena-Oniji</literal></binding>
+    <binding name="rating1"><literal datatype="http://www.w3.org/2001/XMLSchema#int">1</literal></binding>
+    <binding name="rating2"><literal datatype="http://www.w3.org/2001/XMLSchema#int">4</literal></binding>
+  </result>
+  <result>
+    <binding name="productLabel"><literal>catching recondensed buzzards</literal></binding>
+    <binding name="review"><uri>http://www4.wiwiss.fu-berlin.de/bizer/bsbm/v01/instances/dataFromRatingSite17/Review175792</uri></binding>
+    <binding name="revTitle"><literal>reproductive colonized humor flitching citeable desegregates</literal></binding>
+    <binding name="reviewer"><uri>http://www4.wiwiss.fu-berlin.de/bizer/bsbm/v01/instances/dataFromRatingSite17/Reviewer8971</uri></binding>
+    <binding name="revName"><literal>Roldan-Fico</literal></binding>
+    <binding name="rating1"><literal datatype="http://www.w3.org/2001/XMLSchema#int">8</literal></binding>
+  </result>
+  <result>
+    <binding name="productLabel"><literal>catching recondensed buzzards</literal></binding>
+    <binding name="review"><uri>http://www4.wiwiss.fu-berlin.de/bizer/bsbm/v01/instances/dataFromRatingSite19/Review199305</uri></binding>
+    <binding name="revTitle"><literal>brislings victuals commutes etymologist</literal></binding>
+    <binding name="reviewer"><uri>http://www4.wiwiss.fu-berlin.de/bizer/bsbm/v01/instances/dataFromRatingSite19/Reviewer10176</uri></binding>
+    <binding name="revName"><literal>Sashenka-Kokushi</literal></binding>
+    <binding name="rating1"><literal datatype="http://www.w3.org/2001/XMLSchema#int">4</literal></binding>
+    <binding name="rating2"><literal datatype="http://www.w3.org/2001/XMLSchema#int">7</literal></binding>
+  </result>
+  <result>
+    <binding name="productLabel"><literal>catching recondensed buzzards</literal></binding>
+    <binding name="review"><uri>http://www4.wiwiss.fu-berlin.de/bizer/bsbm/v01/instances/dataFromRatingSite21/Review211757</uri></binding>
+    <binding name="revTitle"><literal>overcooking overviolent reversers pawners fumiest</literal></binding>
+    <binding name="reviewer"><uri>http://www4.wiwiss.fu-berlin.de/bizer/bsbm/v01/instances/dataFromRatingSite21/Reviewer10819</uri></binding>
+    <binding name="revName"><literal>Shajeea-Anjana</literal></binding>
+    <binding name="rating2"><literal datatype="http://www.w3.org/2001/XMLSchema#int">6</literal></binding>
+  </result>
+  <result>
+    <binding name="productLabel"><literal>catching recondensed buzzards</literal></binding>
+    <binding name="review"><uri>http://www4.wiwiss.fu-berlin.de/bizer/bsbm/v01/instances/dataFromRatingSite25/Review249171</uri></binding>
+    <binding name="revTitle"><literal>diminishment blending lodestars southeaster infinitesimals chronics quaffing unclasping</literal></binding>
+    <binding name="reviewer"><uri>http://www4.wiwiss.fu-berlin.de/bizer/bsbm/v01/instances/dataFromRatingSite25/Reviewer12708</uri></binding>
+    <binding name="revName"><literal>Tobias-Athanasius</literal></binding>
+  </result>
+  <result>
+    <binding name="productLabel"><literal>catching recondensed buzzards</literal></binding>
+    <binding name="review"><uri>http://www4.wiwiss.fu-berlin.de/bizer/bsbm/v01/instances/dataFromRatingSite4/Review27662</uri></binding>
+    <binding name="revTitle"><literal>nebraskan rebroadcasts outrages censuring panels odometers factually</literal></binding>
+    <binding name="reviewer"><uri>http://www4.wiwiss.fu-berlin.de/bizer/bsbm/v01/instances/dataFromRatingSite4/Reviewer1409</uri></binding>
+    <binding name="revName"><literal>Ida-Mikhailova</literal></binding>
+    <binding name="rating1"><literal datatype="http://www.w3.org/2001/XMLSchema#int">6</literal></binding>
+    <binding name="rating2"><literal datatype="http://www.w3.org/2001/XMLSchema#int">8</literal></binding>
+  </result>
+</results>
+</sparql>

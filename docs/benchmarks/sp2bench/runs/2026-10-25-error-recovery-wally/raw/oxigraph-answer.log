@@ -1,0 +1,10 @@
+[15:04:25] dataset: 10000091 triples
+[15:04:27] oxigraph: loading (log: logs/load-oxigraph.log)
+oxigraph: 27.4 s, peak RSS 1688 MiB, index 1592 MiB
+
+rows                 oxigraph
+q4                      error
+q8                        656
+q12b                        1
+results/record.json: 3 results
+[15:15:01] record: /home/kclejeune/lanes/benchmark-error-recovery-20261025/sp2b-20261025T183539Z/oxigraph/results/record.json, table: /home/kclejeune/lanes/benchmark-error-recovery-20261025/sp2b-20261025T183539Z/oxigraph/results/summary.md

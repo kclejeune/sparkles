@@ -1,0 +1,15 @@
+{
+ "results": [
+  {
+   "command": "sparkles",
+   "mean": 6.6327,
+   "stddev": 0.0,
+   "times": [
+    6.6327
+   ],
+   "exit_codes": [
+    0
+   ]
+  }
+ ]
+}

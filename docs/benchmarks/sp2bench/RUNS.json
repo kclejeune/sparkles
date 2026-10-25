@@ -691,6 +691,1401 @@
         "durability_classes": []
       },
       "metadata_note": "Null fields mean this metadata is not available in the common record fields. Read the raw assessment for its own provenance and correctness contract."
+    },
+    {
+      "run_id": "sha256-ae65db698406de6950d43f68aede39d37d20977dfa0e6de37dd3311109624d27",
+      "path": "runs/2026-10-25-error-recovery-forge/sparkles-record.json",
+      "sha256": "ae65db698406de6950d43f68aede39d37d20977dfa0e6de37dd3311109624d27",
+      "format": "bench-record-3",
+      "context": {
+        "suite": "sp2bench",
+        "scale": "10m",
+        "manifest": {
+          "suite": "sp2bench",
+          "started": "2026-10-25T17:29:17Z",
+          "ended": "2026-10-25T17:46:53Z",
+          "host": {
+            "name": "forge",
+            "cpu": "13th Gen Intel(R) Core(TM) i5-13500",
+            "cpus": 20,
+            "ram_mib": 15620,
+            "disk_model": "",
+            "kernel": "7.2.9",
+            "filesystem": "ext4",
+            "mount_options": "rw,relatime,discard,errors=remount-ro"
+          },
+          "sparkles": {
+            "binary": "/home/kclejeune/lanes/competitive-births-20261025/bin/sparkles-6b7f32ce",
+            "version": "sparkles 0.1.0",
+            "sha256": "cf6f4cf5fd754c8344fd0f0c02b81dce5016c8b8ccfcbe034f5fe7927cfd46c8",
+            "scripts_commit": "120af294bb63d76db609cc6aa710ed454b1710f1",
+            "binary_commit": "6b7f32ce",
+            "scripts_commit_source": "Committed archive with harness.sha256 receipt; no remote compilation."
+          },
+          "engines": {},
+          "memory_limit": "12G",
+          "client_cpu": "11",
+          "data": {
+            "sp2bench-10m": {
+              "license": "BSD",
+              "params": "SP2Bench v1.01 triples=10000000",
+              "sha256": "4486653f3ea16825923eb8a5410137df7ba712aa918442531c33cbeb854eb814",
+              "bytes": 1493565484
+            }
+          },
+          "license_check": {
+            "gpl_benchmark_allowed": false,
+            "notes": [
+              "SP2Bench v1.01 generator and queries: BSD license, fetched at build time"
+            ]
+          },
+          "benchmark_controls": {
+            "sparkles_args": "--max-result-mb 4096",
+            "max_time_s": 600,
+            "server_timeout_s": 615,
+            "server_memory_cap": "12G",
+            "engines_isolated_for_correctness_and_timing": true,
+            "answer_algorithm": "row-sha256-v1; complete TSV; external sort64MiB",
+            "timing": "hyperfine curl full TSV to /dev/null; no fingerprints in timing",
+            "warmup": 2,
+            "runs": 10,
+            "runtime_binary_revision": "6b7f32ce"
+          }
+        },
+        "settings": {
+          "warmup": 2,
+          "runs": 10,
+          "timer": "hyperfine+curl",
+          "resultCache": false
+        },
+        "durability_classes": []
+      },
+      "metadata_note": "The accompanying manual report and validation receipt select specific cells. Raw carried-over rows and common builder defaults do not broaden that measurement or correctness scope. Raw bytes remain unchanged."
+    },
+    {
+      "run_id": "sha256-973679dd89c4df32a26294c26f52df18dc7e2cb35ad10171b736db1940cfed40",
+      "path": "runs/2026-10-25-error-recovery-forge/sparkles-qualified-record.json",
+      "sha256": "973679dd89c4df32a26294c26f52df18dc7e2cb35ad10171b736db1940cfed40",
+      "format": "bench-record-3",
+      "context": {
+        "suite": "sp2bench",
+        "scale": "10m",
+        "manifest": {
+          "suite": "sp2bench",
+          "started": "2026-10-25T17:29:17Z",
+          "ended": "2026-10-25T17:46:53Z",
+          "host": {
+            "name": "forge",
+            "cpu": "13th Gen Intel(R) Core(TM) i5-13500",
+            "cpus": 20,
+            "ram_mib": 15620,
+            "disk_model": "",
+            "kernel": "7.2.9",
+            "filesystem": "ext4",
+            "mount_options": "rw,relatime,discard,errors=remount-ro"
+          },
+          "sparkles": {
+            "binary": "/home/kclejeune/lanes/competitive-births-20261025/bin/sparkles-6b7f32ce",
+            "version": "sparkles 0.1.0",
+            "sha256": "cf6f4cf5fd754c8344fd0f0c02b81dce5016c8b8ccfcbe034f5fe7927cfd46c8",
+            "scripts_commit": "120af294bb63d76db609cc6aa710ed454b1710f1",
+            "binary_commit": "6b7f32ce",
+            "scripts_commit_source": "Committed archive with harness.sha256 receipt; no remote compilation."
+          },
+          "engines": {},
+          "memory_limit": "12G",
+          "client_cpu": "11",
+          "data": {
+            "sp2bench-10m": {
+              "license": "BSD",
+              "params": "SP2Bench v1.01 triples=10000000",
+              "sha256": "4486653f3ea16825923eb8a5410137df7ba712aa918442531c33cbeb854eb814",
+              "bytes": 1493565484
+            }
+          },
+          "license_check": {
+            "gpl_benchmark_allowed": false,
+            "notes": [
+              "SP2Bench v1.01 generator and queries: BSD license, fetched at build time"
+            ]
+          },
+          "benchmark_controls": {
+            "sparkles_args": "--max-result-mb 4096",
+            "max_time_s": 600,
+            "server_timeout_s": 615,
+            "server_memory_cap": "12G",
+            "engines_isolated_for_correctness_and_timing": true,
+            "answer_algorithm": "row-sha256-v1; complete TSV; external sort64MiB",
+            "timing": "hyperfine curl full TSV to /dev/null; no fingerprints in timing",
+            "warmup": 2,
+            "runs": 10,
+            "runtime_binary_revision": "6b7f32ce"
+          },
+          "answer_validation": {
+            "method": "independent-data-oracle",
+            "policy": "sp2bench-source-triple-reconstruction-v1",
+            "canonicalization": {
+              "fingerprint": "row-sha256-v1",
+              "row": "UTF-8 Python repr of tuples of normalized RDF terms, projected variables sorted by name",
+              "multiset": "SHA-256 of sorted lowercase SHA-256 row hashes, each followed by LF; duplicates retained",
+              "exact_terms": "RDF term identity; xsd:string is explicit and language tags are lowercase",
+              "numeric_values": "12 significant decimal digits; normalized Decimal spelling",
+              "source_oracle": "Journal name-pair set unions for q4; earliest numeric year per author for q6; generated string names and integer years are checked explicitly"
+            },
+            "bindings": {
+              "bindings_version": 1,
+              "host": "forge",
+              "scale": "10m",
+              "engine": "sparkles",
+              "dataset": "sp2bench-10m",
+              "source_sha256": "4486653f3ea16825923eb8a5410137df7ba712aa918442531c33cbeb854eb814",
+              "binary_commit": "6b7f32ce",
+              "binary_sha256": "cf6f4cf5fd754c8344fd0f0c02b81dce5016c8b8ccfcbe034f5fe7927cfd46c8",
+              "settings": {
+                "warmup": 2,
+                "runs": 10,
+                "timer": "hyperfine+curl",
+                "resultCache": false
+              },
+              "queries": {
+                "q4": {
+                  "sha256": "ba7af5ada891455f72ba06917c031e25c9c1ffdf0f87c4f6e475623950ade60d",
+                  "runs": 10,
+                  "timing_role": "q4_timing"
+                },
+                "q6": {
+                  "sha256": "e635ca91c381cfa5def7a93737e283a4ff9fc697385ac595e3b76338550ede65",
+                  "runs": 10,
+                  "timing_role": "q6_timing"
+                }
+              },
+              "inputs": {
+                "raw_record": {
+                  "path": "sparkles-record.json",
+                  "sha256": "ae65db698406de6950d43f68aede39d37d20977dfa0e6de37dd3311109624d27"
+                },
+                "raw_answers": {
+                  "path": "sparkles-answers.json",
+                  "sha256": "e9cfb12c86e82090115826b4f2e84eb18d1c2fbce00b7e6e5800a60f82ce80e0"
+                },
+                "oracle": {
+                  "path": "oracle.json",
+                  "sha256": "6f5e9d7b004948e2ead2ad686099f41151626641f9015e3e7adede4282f0cdd0"
+                },
+                "q4_timing": {
+                  "path": "sparkles-q4-timing.json",
+                  "sha256": "babd43ffa53427af8b860e2dcd62400453a0a19b940faac81c44ceea6a442fcf"
+                },
+                "q6_timing": {
+                  "path": "sparkles-q6-timing.json",
+                  "sha256": "797cb5d0eeeb6256c1e9d1a1a180dfaa55ca4764cbe8d9bc1275258657c5007c"
+                }
+              },
+              "oracle_generator": {
+                "source_revision": "a44bdabfbe7499abe3d439a6f2bec18b12247209",
+                "script": "scripts/bench-sp2b/oracle.py",
+                "sha256": "97f359ccd2cc73fc57be01017c6f1c6453e5ec6d8d2645af0aee4bd9fb3c3f87"
+              },
+              "measurement_controls": {
+                "sparkles_args": "--max-result-mb 4096",
+                "max_time_s": 600,
+                "server_timeout_s": 615,
+                "server_memory_cap": "12G",
+                "engines_isolated_for_correctness_and_timing": true,
+                "answer_algorithm": "row-sha256-v1; complete TSV; external sort64MiB",
+                "timing": "hyperfine curl full TSV to /dev/null; no fingerprints in timing",
+                "warmup": 2,
+                "runs": 10,
+                "runtime_binary_revision": "6b7f32ce",
+                "index_source": "Copied preserved SP2Bench store from competitive-losses-20261024/query-competitors-20261025T042932Z/sp2b/sparkles.db. Selected answers independently match the NT source oracle."
+              }
+            },
+            "queries": {
+              "q4": {
+                "rows": 41073618,
+                "exact_matches": true,
+                "value_matches": true,
+                "query_sha256": "ba7af5ada891455f72ba06917c031e25c9c1ffdf0f87c4f6e475623950ade60d",
+                "timed_samples": 10,
+                "all_exit_codes_zero": true
+              },
+              "q6": {
+                "rows": 906313,
+                "exact_matches": true,
+                "value_matches": true,
+                "query_sha256": "e635ca91c381cfa5def7a93737e283a4ff9fc697385ac595e3b76338550ede65",
+                "timed_samples": 10,
+                "all_exit_codes_zero": true
+              }
+            }
+          }
+        },
+        "settings": {
+          "warmup": 2,
+          "runs": 10,
+          "timer": "hyperfine+curl",
+          "resultCache": false
+        },
+        "durability_classes": []
+      },
+      "metadata_note": "The accompanying manual report and validation receipt select specific cells. Raw carried-over rows and common builder defaults do not broaden that measurement or correctness scope. Raw bytes remain unchanged."
+    },
+    {
+      "run_id": "sha256-a41e1019f4c425b88ad2ce4539d554b8584f1e8abfaaa6a429a552afc0fda02d",
+      "path": "runs/2026-10-25-error-recovery-forge/peers/qlever-record.json",
+      "sha256": "a41e1019f4c425b88ad2ce4539d554b8584f1e8abfaaa6a429a552afc0fda02d",
+      "format": "bench-record-3",
+      "context": {
+        "suite": "sp2bench",
+        "scale": "10m",
+        "manifest": {
+          "suite": "sp2bench",
+          "started": "2026-10-25T17:49:21Z",
+          "ended": "2026-10-25T17:53:47Z",
+          "host": {
+            "name": "forge",
+            "cpu": "13th Gen Intel(R) Core(TM) i5-13500",
+            "cpus": 20,
+            "ram_mib": 15620,
+            "disk_model": "",
+            "kernel": "7.2.9",
+            "filesystem": "ext4",
+            "mount_options": "rw,relatime,discard,errors=remount-ro"
+          },
+          "sparkles": {
+            "binary": "/home/kclejeune/lanes/competitive-births-20261025/bin/sparkles-6b7f32ce",
+            "version": "sparkles 0.1.0",
+            "sha256": "cf6f4cf5fd754c8344fd0f0c02b81dce5016c8b8ccfcbe034f5fe7927cfd46c8",
+            "scripts_commit": "unknown",
+            "binary_commit": "6b7f32ce"
+          },
+          "engines": {
+            "qlever": {
+              "license": "Apache-2.0",
+              "binary": "/home/kclejeune/lanes/item1-bench/data/sp2b-10m/gcroots/qlever/bin/qlever-server",
+              "sha256": "8a3d2eb5259918b6a22607a012e50bf0087dfc9205e37613a03a09a1e68a10dc",
+              "version": "0.5.48",
+              "store_path": "/nix/store/xn7f9c965zfza9nks2qzlrnx916xg3h2-qlever-0.5.48",
+              "package": "qlever-0.5.48",
+              "reported_version": "/home/kclejeune/lanes/item1-bench/data/sp2b-10m/gcroots/qlever/bin/qlever-server 0.0.0-unknown"
+            }
+          },
+          "memory_limit": "12G",
+          "client_cpu": "11",
+          "data": {
+            "sp2bench-10m": {
+              "license": "BSD",
+              "params": "SP2Bench v1.01 triples=10000000",
+              "sha256": "4486653f3ea16825923eb8a5410137df7ba712aa918442531c33cbeb854eb814",
+              "bytes": 1493565484
+            }
+          },
+          "license_check": {
+            "gpl_benchmark_allowed": false,
+            "notes": [
+              "SP2Bench v1.01 generator and queries: BSD license, fetched at build time"
+            ]
+          }
+        },
+        "settings": {
+          "warmup": 2,
+          "runs": 10,
+          "timer": "hyperfine+curl",
+          "resultCache": false
+        },
+        "durability_classes": []
+      },
+      "metadata_note": "The accompanying manual report and validation receipt select specific cells. Raw carried-over rows and common builder defaults do not broaden that measurement or correctness scope. Raw bytes remain unchanged."
+    },
+    {
+      "run_id": "sha256-f2160e1630bf0c01a230297aeab4aedb8ebf7431f2d158e229581d0543de9c23",
+      "path": "runs/2026-10-25-error-recovery-forge/peers/fluree-record.json",
+      "sha256": "f2160e1630bf0c01a230297aeab4aedb8ebf7431f2d158e229581d0543de9c23",
+      "format": "bench-record-3",
+      "context": {
+        "suite": "sp2bench",
+        "scale": "10m",
+        "manifest": {
+          "suite": "sp2bench",
+          "started": "2026-10-25T17:53:49Z",
+          "ended": "2026-10-25T18:02:33Z",
+          "host": {
+            "name": "forge",
+            "cpu": "13th Gen Intel(R) Core(TM) i5-13500",
+            "cpus": 20,
+            "ram_mib": 15620,
+            "disk_model": "",
+            "kernel": "7.2.9",
+            "filesystem": "ext4",
+            "mount_options": "rw,relatime,discard,errors=remount-ro"
+          },
+          "sparkles": {
+            "binary": "/home/kclejeune/lanes/competitive-births-20261025/bin/sparkles-6b7f32ce",
+            "version": "sparkles 0.1.0",
+            "sha256": "cf6f4cf5fd754c8344fd0f0c02b81dce5016c8b8ccfcbe034f5fe7927cfd46c8",
+            "scripts_commit": "unknown",
+            "binary_commit": "6b7f32ce"
+          },
+          "engines": {
+            "fluree": {
+              "license": "BUSL-1.1",
+              "binary": "/nix/store/jvhxwjlhzijkd1kvrh8l7wfkbclp8vnx-fluree-4.2.2/bin/fluree",
+              "sha256": "99629db65b6eb0d7d9b7cafdc48806eee8ab71e9568fe389b983accaaa35f7ff",
+              "version": "fluree 4.2.2",
+              "store_path": "/nix/store/jvhxwjlhzijkd1kvrh8l7wfkbclp8vnx-fluree-4.2.2",
+              "package": "fluree-4.2.2",
+              "reported_version": "fluree 4.2.2"
+            }
+          },
+          "memory_limit": "12G",
+          "client_cpu": "11",
+          "data": {
+            "sp2bench-10m": {
+              "license": "BSD",
+              "params": "SP2Bench v1.01 triples=10000000",
+              "sha256": "4486653f3ea16825923eb8a5410137df7ba712aa918442531c33cbeb854eb814",
+              "bytes": 1493565484
+            }
+          },
+          "license_check": {
+            "gpl_benchmark_allowed": false,
+            "notes": [
+              "SP2Bench v1.01 generator and queries: BSD license, fetched at build time"
+            ]
+          }
+        },
+        "settings": {
+          "warmup": 2,
+          "runs": 10,
+          "timer": "hyperfine+curl",
+          "resultCache": false
+        },
+        "durability_classes": []
+      },
+      "metadata_note": "The accompanying manual report and validation receipt select specific cells. Raw carried-over rows and common builder defaults do not broaden that measurement or correctness scope. Raw bytes remain unchanged."
+    },
+    {
+      "run_id": "sha256-aa4e47fa315e72ee623994423a7a26e1e9346ec30a928acf78cd1153539ef9f1",
+      "path": "runs/2026-10-25-error-recovery-forge/peers/budget-10g/qlever-10g-results/record.json",
+      "sha256": "aa4e47fa315e72ee623994423a7a26e1e9346ec30a928acf78cd1153539ef9f1",
+      "format": "bench-record-3",
+      "context": {
+        "suite": "sp2bench",
+        "scale": "10m",
+        "manifest": {
+          "suite": "sp2bench",
+          "started": "2026-10-25T18:10:50Z",
+          "ended": "2026-10-25T18:14:29Z",
+          "host": {
+            "name": "forge",
+            "cpu": "13th Gen Intel(R) Core(TM) i5-13500",
+            "cpus": 20,
+            "ram_mib": 15620,
+            "disk_model": "",
+            "kernel": "7.2.9",
+            "filesystem": "ext4",
+            "mount_options": "rw,relatime,discard,errors=remount-ro"
+          },
+          "sparkles": {
+            "binary": "/home/kclejeune/lanes/competitive-births-20261025/bin/sparkles-6b7f32ce",
+            "version": "sparkles 0.1.0",
+            "sha256": "cf6f4cf5fd754c8344fd0f0c02b81dce5016c8b8ccfcbe034f5fe7927cfd46c8",
+            "scripts_commit": "unknown",
+            "binary_commit": "6b7f32ce"
+          },
+          "engines": {
+            "qlever": {
+              "license": "Apache-2.0",
+              "binary": "/home/kclejeune/lanes/item1-bench/data/sp2b-10m/gcroots/qlever/bin/qlever-server",
+              "sha256": "8a3d2eb5259918b6a22607a012e50bf0087dfc9205e37613a03a09a1e68a10dc",
+              "version": "0.5.48",
+              "store_path": "/nix/store/xn7f9c965zfza9nks2qzlrnx916xg3h2-qlever-0.5.48",
+              "package": "qlever-0.5.48",
+              "reported_version": "/home/kclejeune/lanes/item1-bench/data/sp2b-10m/gcroots/qlever/bin/qlever-server 0.0.0-unknown"
+            }
+          },
+          "memory_limit": "12G",
+          "client_cpu": "11",
+          "data": {
+            "sp2bench-10m": {
+              "license": "BSD",
+              "params": "SP2Bench v1.01 triples=10000000",
+              "sha256": "4486653f3ea16825923eb8a5410137df7ba712aa918442531c33cbeb854eb814",
+              "bytes": 1493565484
+            }
+          },
+          "license_check": {
+            "gpl_benchmark_allowed": false,
+            "notes": [
+              "SP2Bench v1.01 generator and queries: BSD license, fetched at build time"
+            ]
+          }
+        },
+        "settings": {
+          "warmup": 2,
+          "runs": 10,
+          "timer": "hyperfine+curl",
+          "resultCache": false,
+          "maxTimeSeconds": 600,
+          "serverTimeoutSeconds": 615,
+          "sparklesArgs": "--max-result-mb 4096",
+          "answerStreamTSVQueries": "q4 q6",
+          "correctnessEngineIsolation": true,
+          "jenaHeap": "8G",
+          "jenaStack": "default",
+          "qleverMemory": "10G"
+        },
+        "durability_classes": []
+      },
+      "metadata_note": "The accompanying manual report and validation receipt select specific cells. Raw carried-over rows and common builder defaults do not broaden that measurement or correctness scope. Raw bytes remain unchanged."
+    },
+    {
+      "run_id": "sha256-af730337327ba0072e5371c5c01815950a22fd88a378b79b28c6b4e6e9931ddb",
+      "path": "runs/2026-10-25-error-recovery-wally/sparkles-record.json",
+      "sha256": "af730337327ba0072e5371c5c01815950a22fd88a378b79b28c6b4e6e9931ddb",
+      "format": "bench-record-3",
+      "context": {
+        "suite": "sp2bench",
+        "scale": "10m",
+        "manifest": {
+          "suite": "sp2bench",
+          "started": "2026-10-25T18:39:30Z",
+          "ended": "2026-10-25T18:43:59Z",
+          "host": {
+            "name": "wally",
+            "cpu": "12th Gen Intel(R) Core(TM) i7-12800H",
+            "cpus": 20,
+            "ram_mib": 31766,
+            "disk_model": "",
+            "kernel": "6.18.51",
+            "filesystem": "ext4",
+            "mount_options": "rw,relatime,discard,errors=remount-ro"
+          },
+          "sparkles": {
+            "binary": "/home/kclejeune/lanes/competitive-births-release-20261025/target-D/release/sparkles",
+            "version": "sparkles 0.1.0",
+            "sha256": "cf6f4cf5fd754c8344fd0f0c02b81dce5016c8b8ccfcbe034f5fe7927cfd46c8",
+            "scripts_commit": "unknown",
+            "binary_commit": "6b7f32ce"
+          },
+          "engines": {},
+          "memory_limit": "24G",
+          "client_cpu": "11",
+          "data": {
+            "sp2bench-10m": {
+              "license": "BSD",
+              "params": "SP2Bench v1.01 triples=10000000",
+              "sha256": "4486653f3ea16825923eb8a5410137df7ba712aa918442531c33cbeb854eb814",
+              "bytes": 1493565484
+            }
+          },
+          "license_check": {
+            "gpl_benchmark_allowed": false,
+            "notes": [
+              "SP2Bench v1.01 generator and queries: BSD license, fetched at build time"
+            ]
+          }
+        },
+        "settings": {
+          "warmup": 2,
+          "runs": 3,
+          "timer": "hyperfine+curl",
+          "resultCache": false,
+          "maxTimeSeconds": 600,
+          "serverTimeoutSeconds": 615,
+          "sparklesArgs": "--max-result-mb 4096",
+          "answerStreamTSVQueries": "q4 q6",
+          "correctnessEngineIsolation": true,
+          "jenaHeap": "16G",
+          "jenaStack": "256m",
+          "qleverMemory": "20G"
+        },
+        "durability_classes": []
+      },
+      "metadata_note": "The accompanying manual report and validation receipt select specific cells. Raw carried-over rows and common builder defaults do not broaden that measurement or correctness scope. Raw bytes remain unchanged."
+    },
+    {
+      "run_id": "sha256-cfab8e709ebb3e8c5375cf04e7bf4a406012f9812c7f5d4457be446402bbfa1a",
+      "path": "runs/2026-10-25-error-recovery-wally/sparkles-qualified-record.json",
+      "sha256": "cfab8e709ebb3e8c5375cf04e7bf4a406012f9812c7f5d4457be446402bbfa1a",
+      "format": "bench-record-3",
+      "context": {
+        "suite": "sp2bench",
+        "scale": "10m",
+        "manifest": {
+          "suite": "sp2bench",
+          "started": "2026-10-25T18:39:30Z",
+          "ended": "2026-10-25T18:43:59Z",
+          "host": {
+            "name": "wally",
+            "cpu": "12th Gen Intel(R) Core(TM) i7-12800H",
+            "cpus": 20,
+            "ram_mib": 31766,
+            "disk_model": "",
+            "kernel": "6.18.51",
+            "filesystem": "ext4",
+            "mount_options": "rw,relatime,discard,errors=remount-ro"
+          },
+          "sparkles": {
+            "binary": "/home/kclejeune/lanes/competitive-births-release-20261025/target-D/release/sparkles",
+            "version": "sparkles 0.1.0",
+            "sha256": "cf6f4cf5fd754c8344fd0f0c02b81dce5016c8b8ccfcbe034f5fe7927cfd46c8",
+            "scripts_commit": "unknown",
+            "binary_commit": "6b7f32ce"
+          },
+          "engines": {},
+          "memory_limit": "24G",
+          "client_cpu": "11",
+          "data": {
+            "sp2bench-10m": {
+              "license": "BSD",
+              "params": "SP2Bench v1.01 triples=10000000",
+              "sha256": "4486653f3ea16825923eb8a5410137df7ba712aa918442531c33cbeb854eb814",
+              "bytes": 1493565484
+            }
+          },
+          "license_check": {
+            "gpl_benchmark_allowed": false,
+            "notes": [
+              "SP2Bench v1.01 generator and queries: BSD license, fetched at build time"
+            ]
+          },
+          "answer_validation": {
+            "method": "independent-data-oracle",
+            "policy": "sp2bench-source-triple-reconstruction-v1",
+            "canonicalization": {
+              "fingerprint": "row-sha256-v1",
+              "row": "UTF-8 Python repr of tuples of normalized RDF terms, projected variables sorted by name",
+              "multiset": "SHA-256 of sorted lowercase SHA-256 row hashes, each followed by LF; duplicates retained",
+              "exact_terms": "RDF term identity; xsd:string is explicit and language tags are lowercase",
+              "numeric_values": "12 significant decimal digits; normalized Decimal spelling",
+              "source_oracle": "Journal name-pair set unions for q4; earliest numeric year per author for q6; generated string names and integer years are checked explicitly"
+            },
+            "bindings": {
+              "bindings_version": 1,
+              "host": "wally",
+              "scale": "10m",
+              "engine": "sparkles",
+              "dataset": "sp2bench-10m",
+              "source_sha256": "4486653f3ea16825923eb8a5410137df7ba712aa918442531c33cbeb854eb814",
+              "binary_commit": "6b7f32ce",
+              "binary_sha256": "cf6f4cf5fd754c8344fd0f0c02b81dce5016c8b8ccfcbe034f5fe7927cfd46c8",
+              "settings": {
+                "warmup": 2,
+                "runs": 3,
+                "timer": "hyperfine+curl",
+                "resultCache": false,
+                "maxTimeSeconds": 600,
+                "serverTimeoutSeconds": 615,
+                "sparklesArgs": "--max-result-mb 4096",
+                "answerStreamTSVQueries": "q4 q6",
+                "correctnessEngineIsolation": true,
+                "jenaHeap": "16G",
+                "jenaStack": "256m",
+                "qleverMemory": "20G"
+              },
+              "queries": {
+                "q4": {
+                  "sha256": "ba7af5ada891455f72ba06917c031e25c9c1ffdf0f87c4f6e475623950ade60d",
+                  "runs": 3,
+                  "timing_role": "q4_timing"
+                }
+              },
+              "inputs": {
+                "raw_record": {
+                  "path": "sparkles-record.json",
+                  "sha256": "af730337327ba0072e5371c5c01815950a22fd88a378b79b28c6b4e6e9931ddb"
+                },
+                "raw_answers": {
+                  "path": "sparkles-answers.json",
+                  "sha256": "f2cb189a1734ae31525d6fe19b5146a4162c74c1a08e612e7cc23ce6ad5a48ce"
+                },
+                "oracle": {
+                  "path": "oracle.json",
+                  "sha256": "6f5e9d7b004948e2ead2ad686099f41151626641f9015e3e7adede4282f0cdd0"
+                },
+                "q4_timing": {
+                  "path": "sparkles-q4-timing.json",
+                  "sha256": "3d475f7e38f20e1d9b0ccc27818ef7a81c89db242f10d51d162fc78220d00e04"
+                }
+              },
+              "oracle_generator": {
+                "source_revision": "a44bdabfbe7499abe3d439a6f2bec18b12247209",
+                "script": "scripts/bench-sp2b/oracle.py",
+                "sha256": "97f359ccd2cc73fc57be01017c6f1c6453e5ec6d8d2645af0aee4bd9fb3c3f87"
+              },
+              "measurement_controls": {
+                "sparkles_args": "--max-result-mb 4096",
+                "max_time_s": 600,
+                "server_timeout_s": 615,
+                "server_memory_cap": "24G",
+                "engines_isolated_for_correctness_and_timing": true,
+                "answer_algorithm": "row-sha256-v1; complete TSV; external sort64MiB",
+                "timing": "hyperfine curl full TSV to /dev/null; no fingerprints in timing",
+                "warmup": 2,
+                "runs": 3,
+                "runtime_binary_revision": "6b7f32ce",
+                "index_source": "Fresh index loaded from the SHA256-matched NT source on Wally. Full q4 response agrees with the independent source oracle.",
+                "comparison_policy": "Separate Wally host profile; no cross-host latency ratios.",
+                "qlever_query_memory": "20G",
+                "jena_heap": "16G",
+                "jena_stack": "256m",
+                "host_power_state": "AC online, battery Full, powersave governor, turbo enabled; captured preflight lists desktop processes."
+              }
+            },
+            "queries": {
+              "q4": {
+                "rows": 41073618,
+                "exact_matches": true,
+                "value_matches": true,
+                "query_sha256": "ba7af5ada891455f72ba06917c031e25c9c1ffdf0f87c4f6e475623950ade60d",
+                "timed_samples": 3,
+                "all_exit_codes_zero": true
+              }
+            }
+          }
+        },
+        "settings": {
+          "warmup": 2,
+          "runs": 3,
+          "timer": "hyperfine+curl",
+          "resultCache": false,
+          "maxTimeSeconds": 600,
+          "serverTimeoutSeconds": 615,
+          "sparklesArgs": "--max-result-mb 4096",
+          "answerStreamTSVQueries": "q4 q6",
+          "correctnessEngineIsolation": true,
+          "jenaHeap": "16G",
+          "jenaStack": "256m",
+          "qleverMemory": "20G"
+        },
+        "durability_classes": []
+      },
+      "metadata_note": "The accompanying manual report and validation receipt select specific cells. Raw carried-over rows and common builder defaults do not broaden that measurement or correctness scope. Raw bytes remain unchanged."
+    },
+    {
+      "run_id": "sha256-c9e7fcbaf08c938734d22569b7e66e0a4fe748c46aa135373b5ece40341192cd",
+      "path": "runs/2026-10-25-error-recovery-wally/oxigraph-extended/results/record.json",
+      "sha256": "c9e7fcbaf08c938734d22569b7e66e0a4fe748c46aa135373b5ece40341192cd",
+      "format": "bench-record-3",
+      "context": {
+        "suite": "sp2bench",
+        "scale": "10m",
+        "manifest": {
+          "suite": "sp2bench",
+          "started": "2026-10-25T19:23:56Z",
+          "ended": "2026-10-25T19:48:43Z",
+          "host": {
+            "name": "wally",
+            "cpu": "12th Gen Intel(R) Core(TM) i7-12800H",
+            "cpus": 20,
+            "ram_mib": 31766,
+            "disk_model": "",
+            "kernel": "6.18.51",
+            "filesystem": "ext4",
+            "mount_options": "rw,relatime,discard,errors=remount-ro"
+          },
+          "sparkles": {
+            "binary": "/home/kclejeune/lanes/competitive-births-release-20261025/target-D/release/sparkles",
+            "version": "sparkles 0.1.0",
+            "sha256": "cf6f4cf5fd754c8344fd0f0c02b81dce5016c8b8ccfcbe034f5fe7927cfd46c8",
+            "scripts_commit": "unknown",
+            "binary_commit": "6b7f32ce"
+          },
+          "engines": {
+            "oxigraph": {
+              "license": "MIT OR Apache-2.0",
+              "binary": "/nix/store/g7ajfdk0g8bypdbsj23hnfq71izm3iz1-oxigraph-0.5.11/bin/oxigraph",
+              "sha256": "c99f9c4866b9d25f135729ac8b0e468cc0badd2c2cfe1c4b704f0db375ed8de3",
+              "version": "oxigraph 0.5.11",
+              "store_path": "/nix/store/g7ajfdk0g8bypdbsj23hnfq71izm3iz1-oxigraph-0.5.11",
+              "package": "oxigraph-0.5.11",
+              "reported_version": "oxigraph 0.5.11"
+            }
+          },
+          "memory_limit": "24G",
+          "client_cpu": "11",
+          "data": {
+            "sp2bench-10m": {
+              "license": "BSD",
+              "params": "SP2Bench v1.01 triples=10000000",
+              "sha256": "4486653f3ea16825923eb8a5410137df7ba712aa918442531c33cbeb854eb814",
+              "bytes": 1493565484
+            }
+          },
+          "license_check": {
+            "gpl_benchmark_allowed": false,
+            "notes": [
+              "SP2Bench v1.01 generator and queries: BSD license, fetched at build time"
+            ]
+          }
+        },
+        "settings": {
+          "warmup": 2,
+          "runs": 10,
+          "timer": "hyperfine+curl",
+          "resultCache": false,
+          "maxTimeSeconds": 1800,
+          "serverTimeoutSeconds": 1815,
+          "sparklesArgs": "--max-result-mb 4096",
+          "answerStreamTSVQueries": "q4 q6",
+          "correctnessEngineIsolation": true,
+          "jenaHeap": "8G",
+          "jenaStack": "default",
+          "qleverMemory": "8G"
+        },
+        "durability_classes": []
+      },
+      "metadata_note": "The accompanying manual report and validation receipt select specific cells. Raw carried-over rows and common builder defaults do not broaden that measurement or correctness scope. Raw bytes remain unchanged."
+    },
+    {
+      "run_id": "sha256-fc3a9441c69535c05d2c61dec006aea9bc58b2eb5614ffcdf82291c1f8ca215f",
+      "path": "runs/2026-10-25-error-recovery-wally/raw/sparkles-answer-results/record.json",
+      "sha256": "fc3a9441c69535c05d2c61dec006aea9bc58b2eb5614ffcdf82291c1f8ca215f",
+      "format": "bench-record-3",
+      "context": {
+        "suite": "sp2bench",
+        "scale": "10m",
+        "manifest": {
+          "suite": "sp2bench",
+          "started": "2026-10-25T18:36:41Z",
+          "ended": "2026-10-25T18:39:29Z",
+          "host": {
+            "name": "wally",
+            "cpu": "12th Gen Intel(R) Core(TM) i7-12800H",
+            "cpus": 20,
+            "ram_mib": 31766,
+            "disk_model": "",
+            "kernel": "6.18.51",
+            "filesystem": "ext4",
+            "mount_options": "rw,relatime,discard,errors=remount-ro"
+          },
+          "sparkles": {
+            "binary": "/home/kclejeune/lanes/competitive-births-release-20261025/target-D/release/sparkles",
+            "version": "sparkles 0.1.0",
+            "sha256": "cf6f4cf5fd754c8344fd0f0c02b81dce5016c8b8ccfcbe034f5fe7927cfd46c8",
+            "scripts_commit": "unknown",
+            "binary_commit": "6b7f32ce"
+          },
+          "engines": {},
+          "memory_limit": "24G",
+          "client_cpu": "11",
+          "data": {
+            "sp2bench-10m": {
+              "license": "BSD",
+              "params": "SP2Bench v1.01 triples=10000000",
+              "sha256": "4486653f3ea16825923eb8a5410137df7ba712aa918442531c33cbeb854eb814",
+              "bytes": 1493565484
+            }
+          },
+          "license_check": {
+            "gpl_benchmark_allowed": false,
+            "notes": [
+              "SP2Bench v1.01 generator and queries: BSD license, fetched at build time"
+            ]
+          }
+        },
+        "settings": {
+          "warmup": 2,
+          "runs": 10,
+          "timer": "hyperfine+curl",
+          "resultCache": false,
+          "maxTimeSeconds": 600,
+          "serverTimeoutSeconds": 615,
+          "sparklesArgs": "--max-result-mb 4096",
+          "answerStreamTSVQueries": "q4 q6",
+          "correctnessEngineIsolation": true,
+          "jenaHeap": "16G",
+          "jenaStack": "256m",
+          "qleverMemory": "20G"
+        },
+        "durability_classes": []
+      },
+      "metadata_note": "The accompanying manual report and validation receipt select specific cells. Raw carried-over rows and common builder defaults do not broaden that measurement or correctness scope. Raw bytes remain unchanged."
+    },
+    {
+      "run_id": "sha256-91d3c8796c06d51f13221529d7a1baa899595baf00d09d246fdc002e80bc7244",
+      "path": "runs/2026-10-25-error-recovery-wally/raw/qlever-answer-results/record.json",
+      "sha256": "91d3c8796c06d51f13221529d7a1baa899595baf00d09d246fdc002e80bc7244",
+      "format": "bench-record-3",
+      "context": {
+        "suite": "sp2bench",
+        "scale": "10m",
+        "manifest": {
+          "suite": "sp2bench",
+          "started": "2026-10-25T18:44:07Z",
+          "ended": "2026-10-25T18:51:01Z",
+          "host": {
+            "name": "wally",
+            "cpu": "12th Gen Intel(R) Core(TM) i7-12800H",
+            "cpus": 20,
+            "ram_mib": 31766,
+            "disk_model": "",
+            "kernel": "6.18.51",
+            "filesystem": "ext4",
+            "mount_options": "rw,relatime,discard,errors=remount-ro"
+          },
+          "sparkles": {
+            "binary": "/home/kclejeune/lanes/competitive-births-release-20261025/target-D/release/sparkles",
+            "version": "sparkles 0.1.0",
+            "sha256": "cf6f4cf5fd754c8344fd0f0c02b81dce5016c8b8ccfcbe034f5fe7927cfd46c8",
+            "scripts_commit": "unknown",
+            "binary_commit": "6b7f32ce"
+          },
+          "engines": {
+            "qlever": {
+              "license": "Apache-2.0",
+              "binary": "/nix/store/xn7f9c965zfza9nks2qzlrnx916xg3h2-qlever-0.5.48/bin/qlever-server",
+              "sha256": "8a3d2eb5259918b6a22607a012e50bf0087dfc9205e37613a03a09a1e68a10dc",
+              "version": "0.5.48",
+              "store_path": "/nix/store/xn7f9c965zfza9nks2qzlrnx916xg3h2-qlever-0.5.48",
+              "package": "qlever-0.5.48",
+              "reported_version": "/nix/store/xn7f9c965zfza9nks2qzlrnx916xg3h2-qlever-0.5.48/bin/qlever-server 0.0.0-unknown"
+            }
+          },
+          "memory_limit": "24G",
+          "client_cpu": "11",
+          "data": {
+            "sp2bench-10m": {
+              "license": "BSD",
+              "params": "SP2Bench v1.01 triples=10000000",
+              "sha256": "4486653f3ea16825923eb8a5410137df7ba712aa918442531c33cbeb854eb814",
+              "bytes": 1493565484
+            }
+          },
+          "license_check": {
+            "gpl_benchmark_allowed": false,
+            "notes": [
+              "SP2Bench v1.01 generator and queries: BSD license, fetched at build time"
+            ]
+          }
+        },
+        "settings": {
+          "warmup": 2,
+          "runs": 10,
+          "timer": "hyperfine+curl",
+          "resultCache": false,
+          "maxTimeSeconds": 600,
+          "serverTimeoutSeconds": 615,
+          "sparklesArgs": "--max-result-mb 4096",
+          "answerStreamTSVQueries": "q4 q6",
+          "correctnessEngineIsolation": true,
+          "jenaHeap": "16G",
+          "jenaStack": "256m",
+          "qleverMemory": "20G"
+        },
+        "durability_classes": []
+      },
+      "metadata_note": "The accompanying manual report and validation receipt select specific cells. Raw carried-over rows and common builder defaults do not broaden that measurement or correctness scope. Raw bytes remain unchanged."
+    },
+    {
+      "run_id": "sha256-bc45c07d3b1ecd15c097cdfb03a9a4415a7e4d0da1d26f0a0072ca2e518288e4",
+      "path": "runs/2026-10-25-error-recovery-wally/raw/fluree-answer-results/record.json",
+      "sha256": "bc45c07d3b1ecd15c097cdfb03a9a4415a7e4d0da1d26f0a0072ca2e518288e4",
+      "format": "bench-record-3",
+      "context": {
+        "suite": "sp2bench",
+        "scale": "10m",
+        "manifest": {
+          "suite": "sp2bench",
+          "started": "2026-10-25T18:51:01Z",
+          "ended": "2026-10-25T18:52:46Z",
+          "host": {
+            "name": "wally",
+            "cpu": "12th Gen Intel(R) Core(TM) i7-12800H",
+            "cpus": 20,
+            "ram_mib": 31766,
+            "disk_model": "",
+            "kernel": "6.18.51",
+            "filesystem": "ext4",
+            "mount_options": "rw,relatime,discard,errors=remount-ro"
+          },
+          "sparkles": {
+            "binary": "/home/kclejeune/lanes/competitive-births-release-20261025/target-D/release/sparkles",
+            "version": "sparkles 0.1.0",
+            "sha256": "cf6f4cf5fd754c8344fd0f0c02b81dce5016c8b8ccfcbe034f5fe7927cfd46c8",
+            "scripts_commit": "unknown",
+            "binary_commit": "6b7f32ce"
+          },
+          "engines": {
+            "fluree": {
+              "license": "BUSL-1.1",
+              "binary": "/home/kclejeune/lanes/benchmark-error-recovery-20261025/bin/fluree-4.2.2",
+              "sha256": "99629db65b6eb0d7d9b7cafdc48806eee8ab71e9568fe389b983accaaa35f7ff",
+              "version": "fluree 4.2.2"
+            }
+          },
+          "memory_limit": "24G",
+          "client_cpu": "11",
+          "data": {
+            "sp2bench-10m": {
+              "license": "BSD",
+              "params": "SP2Bench v1.01 triples=10000000",
+              "sha256": "4486653f3ea16825923eb8a5410137df7ba712aa918442531c33cbeb854eb814",
+              "bytes": 1493565484
+            }
+          },
+          "license_check": {
+            "gpl_benchmark_allowed": false,
+            "notes": [
+              "SP2Bench v1.01 generator and queries: BSD license, fetched at build time"
+            ]
+          }
+        },
+        "settings": {
+          "warmup": 2,
+          "runs": 10,
+          "timer": "hyperfine+curl",
+          "resultCache": false,
+          "maxTimeSeconds": 600,
+          "serverTimeoutSeconds": 615,
+          "sparklesArgs": "--max-result-mb 4096",
+          "answerStreamTSVQueries": "q4 q6",
+          "correctnessEngineIsolation": true,
+          "jenaHeap": "16G",
+          "jenaStack": "256m",
+          "qleverMemory": "20G"
+        },
+        "durability_classes": []
+      },
+      "metadata_note": "The accompanying manual report and validation receipt select specific cells. Raw carried-over rows and common builder defaults do not broaden that measurement or correctness scope. Raw bytes remain unchanged."
+    },
+    {
+      "run_id": "sha256-ebec4aeef22ba0b2f8475b48bc9adb7fb0eee3e68b843fe7d6fa2c3730519633",
+      "path": "runs/2026-10-25-error-recovery-wally/raw/jena-answer-results/record.json",
+      "sha256": "ebec4aeef22ba0b2f8475b48bc9adb7fb0eee3e68b843fe7d6fa2c3730519633",
+      "format": "bench-record-3",
+      "context": {
+        "suite": "sp2bench",
+        "scale": "10m",
+        "manifest": {
+          "suite": "sp2bench",
+          "started": "2026-10-25T18:53:02Z",
+          "ended": "2026-10-25T19:04:09Z",
+          "host": {
+            "name": "wally",
+            "cpu": "12th Gen Intel(R) Core(TM) i7-12800H",
+            "cpus": 20,
+            "ram_mib": 31766,
+            "disk_model": "",
+            "kernel": "6.18.51",
+            "filesystem": "ext4",
+            "mount_options": "rw,relatime,discard,errors=remount-ro"
+          },
+          "sparkles": {
+            "binary": "/home/kclejeune/lanes/competitive-births-release-20261025/target-D/release/sparkles",
+            "version": "sparkles 0.1.0",
+            "sha256": "cf6f4cf5fd754c8344fd0f0c02b81dce5016c8b8ccfcbe034f5fe7927cfd46c8",
+            "scripts_commit": "unknown",
+            "binary_commit": "6b7f32ce"
+          },
+          "engines": {
+            "jena": {
+              "license": "Apache-2.0",
+              "binary": "/nix/store/q0dscszid7jzs66xq9dip95z2hc1zmsh-apache-jena-fuseki-5.1.0/bin/fuseki-server",
+              "sha256": "7fb10cdec48244c13ea15e4c0607b29339e5d40c67a12cae2ced41903c1d2743",
+              "version": "Apache Jena Fuseki version 5.1.0",
+              "store_path": "/nix/store/q0dscszid7jzs66xq9dip95z2hc1zmsh-apache-jena-fuseki-5.1.0",
+              "package": "apache-jena-fuseki-5.1.0",
+              "reported_version": "Apache Jena Fuseki version 5.1.0"
+            }
+          },
+          "memory_limit": "24G",
+          "client_cpu": "11",
+          "data": {
+            "sp2bench-10m": {
+              "license": "BSD",
+              "params": "SP2Bench v1.01 triples=10000000",
+              "sha256": "4486653f3ea16825923eb8a5410137df7ba712aa918442531c33cbeb854eb814",
+              "bytes": 1493565484
+            }
+          },
+          "license_check": {
+            "gpl_benchmark_allowed": false,
+            "notes": [
+              "SP2Bench v1.01 generator and queries: BSD license, fetched at build time"
+            ]
+          }
+        },
+        "settings": {
+          "warmup": 2,
+          "runs": 10,
+          "timer": "hyperfine+curl",
+          "resultCache": false,
+          "maxTimeSeconds": 600,
+          "serverTimeoutSeconds": 615,
+          "sparklesArgs": "--max-result-mb 4096",
+          "answerStreamTSVQueries": "q4 q6",
+          "correctnessEngineIsolation": true,
+          "jenaHeap": "16G",
+          "jenaStack": "256m",
+          "qleverMemory": "20G"
+        },
+        "durability_classes": []
+      },
+      "metadata_note": "The accompanying manual report and validation receipt select specific cells. Raw carried-over rows and common builder defaults do not broaden that measurement or correctness scope. Raw bytes remain unchanged."
+    },
+    {
+      "run_id": "sha256-24c96a3c44d7fbc90ccc9351ec637d4bb6900d32a84199b4c08feb451c4d566d",
+      "path": "runs/2026-10-25-error-recovery-wally/raw/oxigraph-answer-results/record.json",
+      "sha256": "24c96a3c44d7fbc90ccc9351ec637d4bb6900d32a84199b4c08feb451c4d566d",
+      "format": "bench-record-3",
+      "context": {
+        "suite": "sp2bench",
+        "scale": "10m",
+        "manifest": {
+          "suite": "sp2bench",
+          "started": "2026-10-25T19:04:25Z",
+          "ended": "2026-10-25T19:15:01Z",
+          "host": {
+            "name": "wally",
+            "cpu": "12th Gen Intel(R) Core(TM) i7-12800H",
+            "cpus": 20,
+            "ram_mib": 31766,
+            "disk_model": "",
+            "kernel": "6.18.51",
+            "filesystem": "ext4",
+            "mount_options": "rw,relatime,discard,errors=remount-ro"
+          },
+          "sparkles": {
+            "binary": "/home/kclejeune/lanes/competitive-births-release-20261025/target-D/release/sparkles",
+            "version": "sparkles 0.1.0",
+            "sha256": "cf6f4cf5fd754c8344fd0f0c02b81dce5016c8b8ccfcbe034f5fe7927cfd46c8",
+            "scripts_commit": "unknown",
+            "binary_commit": "6b7f32ce"
+          },
+          "engines": {
+            "oxigraph": {
+              "license": "MIT OR Apache-2.0",
+              "binary": "/nix/store/g7ajfdk0g8bypdbsj23hnfq71izm3iz1-oxigraph-0.5.11/bin/oxigraph",
+              "sha256": "c99f9c4866b9d25f135729ac8b0e468cc0badd2c2cfe1c4b704f0db375ed8de3",
+              "version": "oxigraph 0.5.11",
+              "store_path": "/nix/store/g7ajfdk0g8bypdbsj23hnfq71izm3iz1-oxigraph-0.5.11",
+              "package": "oxigraph-0.5.11",
+              "reported_version": "oxigraph 0.5.11"
+            }
+          },
+          "memory_limit": "24G",
+          "client_cpu": "11",
+          "data": {
+            "sp2bench-10m": {
+              "license": "BSD",
+              "params": "SP2Bench v1.01 triples=10000000",
+              "sha256": "4486653f3ea16825923eb8a5410137df7ba712aa918442531c33cbeb854eb814",
+              "bytes": 1493565484
+            }
+          },
+          "license_check": {
+            "gpl_benchmark_allowed": false,
+            "notes": [
+              "SP2Bench v1.01 generator and queries: BSD license, fetched at build time"
+            ]
+          }
+        },
+        "settings": {
+          "warmup": 2,
+          "runs": 10,
+          "timer": "hyperfine+curl",
+          "resultCache": false,
+          "maxTimeSeconds": 600,
+          "serverTimeoutSeconds": 615,
+          "sparklesArgs": "--max-result-mb 4096",
+          "answerStreamTSVQueries": "q4 q6",
+          "correctnessEngineIsolation": true,
+          "jenaHeap": "16G",
+          "jenaStack": "256m",
+          "qleverMemory": "20G"
+        },
+        "durability_classes": []
+      },
+      "metadata_note": "The accompanying manual report and validation receipt select specific cells. Raw carried-over rows and common builder defaults do not broaden that measurement or correctness scope. Raw bytes remain unchanged."
+    },
+    {
+      "run_id": "sha256-c739a6730634511530275c876656ea609e05461cbb5d6c0b0f30d3d244fd2140",
+      "path": "runs/2026-10-25-error-recovery-wally/raw/sparkles-small-results/record.json",
+      "sha256": "c739a6730634511530275c876656ea609e05461cbb5d6c0b0f30d3d244fd2140",
+      "format": "bench-record-3",
+      "context": {
+        "suite": "sp2bench",
+        "scale": "10m",
+        "manifest": {
+          "suite": "sp2bench",
+          "started": "2026-10-25T18:43:59Z",
+          "ended": "2026-10-25T18:44:06Z",
+          "host": {
+            "name": "wally",
+            "cpu": "12th Gen Intel(R) Core(TM) i7-12800H",
+            "cpus": 20,
+            "ram_mib": 31766,
+            "disk_model": "",
+            "kernel": "6.18.51",
+            "filesystem": "ext4",
+            "mount_options": "rw,relatime,discard,errors=remount-ro"
+          },
+          "sparkles": {
+            "binary": "/home/kclejeune/lanes/competitive-births-release-20261025/target-D/release/sparkles",
+            "version": "sparkles 0.1.0",
+            "sha256": "cf6f4cf5fd754c8344fd0f0c02b81dce5016c8b8ccfcbe034f5fe7927cfd46c8",
+            "scripts_commit": "unknown",
+            "binary_commit": "6b7f32ce"
+          },
+          "engines": {},
+          "memory_limit": "24G",
+          "client_cpu": "11",
+          "data": {
+            "sp2bench-10m": {
+              "license": "BSD",
+              "params": "SP2Bench v1.01 triples=10000000",
+              "sha256": "4486653f3ea16825923eb8a5410137df7ba712aa918442531c33cbeb854eb814",
+              "bytes": 1493565484
+            }
+          },
+          "license_check": {
+            "gpl_benchmark_allowed": false,
+            "notes": [
+              "SP2Bench v1.01 generator and queries: BSD license, fetched at build time"
+            ]
+          }
+        },
+        "settings": {
+          "warmup": 2,
+          "runs": 10,
+          "timer": "hyperfine+curl",
+          "resultCache": false,
+          "maxTimeSeconds": 600,
+          "serverTimeoutSeconds": 615,
+          "sparklesArgs": "--max-result-mb 4096",
+          "answerStreamTSVQueries": "q4 q6",
+          "correctnessEngineIsolation": true,
+          "jenaHeap": "16G",
+          "jenaStack": "256m",
+          "qleverMemory": "20G"
+        },
+        "durability_classes": []
+      },
+      "metadata_note": "The accompanying manual report and validation receipt select specific cells. Raw carried-over rows and common builder defaults do not broaden that measurement or correctness scope. Raw bytes remain unchanged."
+    },
+    {
+      "run_id": "sha256-420a2063226cc7605ffc1b9d13e6d1668a9ad856e75d8693bd424c8dc4633aba",
+      "path": "runs/2026-10-25-error-recovery-wally/raw/fluree-small-results/record.json",
+      "sha256": "420a2063226cc7605ffc1b9d13e6d1668a9ad856e75d8693bd424c8dc4633aba",
+      "format": "bench-record-3",
+      "context": {
+        "suite": "sp2bench",
+        "scale": "10m",
+        "manifest": {
+          "suite": "sp2bench",
+          "started": "2026-10-25T18:52:46Z",
+          "ended": "2026-10-25T18:53:02Z",
+          "host": {
+            "name": "wally",
+            "cpu": "12th Gen Intel(R) Core(TM) i7-12800H",
+            "cpus": 20,
+            "ram_mib": 31766,
+            "disk_model": "",
+            "kernel": "6.18.51",
+            "filesystem": "ext4",
+            "mount_options": "rw,relatime,discard,errors=remount-ro"
+          },
+          "sparkles": {
+            "binary": "/home/kclejeune/lanes/competitive-births-release-20261025/target-D/release/sparkles",
+            "version": "sparkles 0.1.0",
+            "sha256": "cf6f4cf5fd754c8344fd0f0c02b81dce5016c8b8ccfcbe034f5fe7927cfd46c8",
+            "scripts_commit": "unknown",
+            "binary_commit": "6b7f32ce"
+          },
+          "engines": {
+            "fluree": {
+              "license": "BUSL-1.1",
+              "binary": "/home/kclejeune/lanes/benchmark-error-recovery-20261025/bin/fluree-4.2.2",
+              "sha256": "99629db65b6eb0d7d9b7cafdc48806eee8ab71e9568fe389b983accaaa35f7ff",
+              "version": "fluree 4.2.2"
+            }
+          },
+          "memory_limit": "24G",
+          "client_cpu": "11",
+          "data": {
+            "sp2bench-10m": {
+              "license": "BSD",
+              "params": "SP2Bench v1.01 triples=10000000",
+              "sha256": "4486653f3ea16825923eb8a5410137df7ba712aa918442531c33cbeb854eb814",
+              "bytes": 1493565484
+            }
+          },
+          "license_check": {
+            "gpl_benchmark_allowed": false,
+            "notes": [
+              "SP2Bench v1.01 generator and queries: BSD license, fetched at build time"
+            ]
+          }
+        },
+        "settings": {
+          "warmup": 2,
+          "runs": 10,
+          "timer": "hyperfine+curl",
+          "resultCache": false,
+          "maxTimeSeconds": 600,
+          "serverTimeoutSeconds": 615,
+          "sparklesArgs": "--max-result-mb 4096",
+          "answerStreamTSVQueries": "q4 q6",
+          "correctnessEngineIsolation": true,
+          "jenaHeap": "16G",
+          "jenaStack": "256m",
+          "qleverMemory": "20G"
+        },
+        "durability_classes": []
+      },
+      "metadata_note": "The accompanying manual report and validation receipt select specific cells. Raw carried-over rows and common builder defaults do not broaden that measurement or correctness scope. Raw bytes remain unchanged."
+    },
+    {
+      "run_id": "sha256-0b4c5c0b531170a271edb9f8cdbbe714a93dd5617b44933cf0273f07801b11d5",
+      "path": "runs/2026-10-25-error-recovery-wally/raw/jena-small-results/record.json",
+      "sha256": "0b4c5c0b531170a271edb9f8cdbbe714a93dd5617b44933cf0273f07801b11d5",
+      "format": "bench-record-3",
+      "context": {
+        "suite": "sp2bench",
+        "scale": "10m",
+        "manifest": {
+          "suite": "sp2bench",
+          "started": "2026-10-25T19:04:10Z",
+          "ended": "2026-10-25T19:04:25Z",
+          "host": {
+            "name": "wally",
+            "cpu": "12th Gen Intel(R) Core(TM) i7-12800H",
+            "cpus": 20,
+            "ram_mib": 31766,
+            "disk_model": "",
+            "kernel": "6.18.51",
+            "filesystem": "ext4",
+            "mount_options": "rw,relatime,discard,errors=remount-ro"
+          },
+          "sparkles": {
+            "binary": "/home/kclejeune/lanes/competitive-births-release-20261025/target-D/release/sparkles",
+            "version": "sparkles 0.1.0",
+            "sha256": "cf6f4cf5fd754c8344fd0f0c02b81dce5016c8b8ccfcbe034f5fe7927cfd46c8",
+            "scripts_commit": "unknown",
+            "binary_commit": "6b7f32ce"
+          },
+          "engines": {
+            "jena": {
+              "license": "Apache-2.0",
+              "binary": "/nix/store/q0dscszid7jzs66xq9dip95z2hc1zmsh-apache-jena-fuseki-5.1.0/bin/fuseki-server",
+              "sha256": "7fb10cdec48244c13ea15e4c0607b29339e5d40c67a12cae2ced41903c1d2743",
+              "version": "Apache Jena Fuseki version 5.1.0",
+              "store_path": "/nix/store/q0dscszid7jzs66xq9dip95z2hc1zmsh-apache-jena-fuseki-5.1.0",
+              "package": "apache-jena-fuseki-5.1.0",
+              "reported_version": "Apache Jena Fuseki version 5.1.0"
+            }
+          },
+          "memory_limit": "24G",
+          "client_cpu": "11",
+          "data": {
+            "sp2bench-10m": {
+              "license": "BSD",
+              "params": "SP2Bench v1.01 triples=10000000",
+              "sha256": "4486653f3ea16825923eb8a5410137df7ba712aa918442531c33cbeb854eb814",
+              "bytes": 1493565484
+            }
+          },
+          "license_check": {
+            "gpl_benchmark_allowed": false,
+            "notes": [
+              "SP2Bench v1.01 generator and queries: BSD license, fetched at build time"
+            ]
+          }
+        },
+        "settings": {
+          "warmup": 2,
+          "runs": 10,
+          "timer": "hyperfine+curl",
+          "resultCache": false,
+          "maxTimeSeconds": 600,
+          "serverTimeoutSeconds": 615,
+          "sparklesArgs": "--max-result-mb 4096",
+          "answerStreamTSVQueries": "q4 q6",
+          "correctnessEngineIsolation": true,
+          "jenaHeap": "16G",
+          "jenaStack": "256m",
+          "qleverMemory": "20G"
+        },
+        "durability_classes": []
+      },
+      "metadata_note": "The accompanying manual report and validation receipt select specific cells. Raw carried-over rows and common builder defaults do not broaden that measurement or correctness scope. Raw bytes remain unchanged."
+    },
+    {
+      "run_id": "sha256-b329fcf272593e565375154879d0fd236eadf06e25ea5fe172f944a61491c3cd",
+      "path": "runs/2026-10-25-error-recovery-wally/raw/oxigraph-small-results/record.json",
+      "sha256": "b329fcf272593e565375154879d0fd236eadf06e25ea5fe172f944a61491c3cd",
+      "format": "bench-record-3",
+      "context": {
+        "suite": "sp2bench",
+        "scale": "10m",
+        "manifest": {
+          "suite": "sp2bench",
+          "started": "2026-10-25T19:15:02Z",
+          "ended": "2026-10-25T19:15:39Z",
+          "host": {
+            "name": "wally",
+            "cpu": "12th Gen Intel(R) Core(TM) i7-12800H",
+            "cpus": 20,
+            "ram_mib": 31766,
+            "disk_model": "",
+            "kernel": "6.18.51",
+            "filesystem": "ext4",
+            "mount_options": "rw,relatime,discard,errors=remount-ro"
+          },
+          "sparkles": {
+            "binary": "/home/kclejeune/lanes/competitive-births-release-20261025/target-D/release/sparkles",
+            "version": "sparkles 0.1.0",
+            "sha256": "cf6f4cf5fd754c8344fd0f0c02b81dce5016c8b8ccfcbe034f5fe7927cfd46c8",
+            "scripts_commit": "unknown",
+            "binary_commit": "6b7f32ce"
+          },
+          "engines": {
+            "oxigraph": {
+              "license": "MIT OR Apache-2.0",
+              "binary": "/nix/store/g7ajfdk0g8bypdbsj23hnfq71izm3iz1-oxigraph-0.5.11/bin/oxigraph",
+              "sha256": "c99f9c4866b9d25f135729ac8b0e468cc0badd2c2cfe1c4b704f0db375ed8de3",
+              "version": "oxigraph 0.5.11",
+              "store_path": "/nix/store/g7ajfdk0g8bypdbsj23hnfq71izm3iz1-oxigraph-0.5.11",
+              "package": "oxigraph-0.5.11",
+              "reported_version": "oxigraph 0.5.11"
+            }
+          },
+          "memory_limit": "24G",
+          "client_cpu": "11",
+          "data": {
+            "sp2bench-10m": {
+              "license": "BSD",
+              "params": "SP2Bench v1.01 triples=10000000",
+              "sha256": "4486653f3ea16825923eb8a5410137df7ba712aa918442531c33cbeb854eb814",
+              "bytes": 1493565484
+            }
+          },
+          "license_check": {
+            "gpl_benchmark_allowed": false,
+            "notes": [
+              "SP2Bench v1.01 generator and queries: BSD license, fetched at build time"
+            ]
+          }
+        },
+        "settings": {
+          "warmup": 2,
+          "runs": 10,
+          "timer": "hyperfine+curl",
+          "resultCache": false,
+          "maxTimeSeconds": 600,
+          "serverTimeoutSeconds": 615,
+          "sparklesArgs": "--max-result-mb 4096",
+          "answerStreamTSVQueries": "q4 q6",
+          "correctnessEngineIsolation": true,
+          "jenaHeap": "16G",
+          "jenaStack": "256m",
+          "qleverMemory": "20G"
+        },
+        "durability_classes": []
+      },
+      "metadata_note": "The accompanying manual report and validation receipt select specific cells. Raw carried-over rows and common builder defaults do not broaden that measurement or correctness scope. Raw bytes remain unchanged."
     }
   ]
 }

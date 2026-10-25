@@ -1,0 +1,22 @@
+[15:15:02] dataset: 10000091 triples
+
+rows                 oxigraph
+q8                        656
+q12b                        1
+[15:15:10] oxigraph: warm-up pass over the selected queries
+
+== q8
+Benchmark 1: oxigraph
+  Time (mean ± σ):      1.993 s ±  0.016 s    [User: 0.002 s, System: 0.003 s]
+  Range (min … max):    1.973 s …  2.017 s    10 runs
+ 
+
+== q12b
+Benchmark 1: oxigraph
+  Time (mean ± σ):       5.2 ms ±   0.3 ms    [User: 2.2 ms, System: 1.7 ms]
+  Range (min … max):     4.7 ms …   5.5 ms    10 runs
+ 
+  Warning: Command took less than 5 ms to complete. Note that the results might be inaccurate because hyperfine can not calibrate the shell startup time much more precise than this limit. You can try to use the `-N`/`--shell=none` option to disable the shell completely.
+ 
+results/record.json: 2 results
+[15:15:39] record: /home/kclejeune/lanes/benchmark-error-recovery-20261025/sp2b-20261025T183539Z/oxigraph/results/record.json, table: /home/kclejeune/lanes/benchmark-error-recovery-20261025/sp2b-20261025T183539Z/oxigraph/results/summary.md

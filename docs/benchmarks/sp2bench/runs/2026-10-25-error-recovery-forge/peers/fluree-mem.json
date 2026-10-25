@@ -1,0 +1,187 @@
+{
+ "idle": {
+  "qlever": 44,
+  "fluree": 287
+ },
+ "queries": {
+  "q1": {
+   "qlever": {
+    "before": 44,
+    "peak": 65,
+    "delta": 21
+   },
+   "fluree": {
+    "before": 287,
+    "peak": 304,
+    "delta": 17
+   }
+  },
+  "q2": {
+   "qlever": {
+    "before": 67,
+    "peak": 285,
+    "delta": 218
+   },
+   "fluree": {
+    "before": 312,
+    "peak": 9193,
+    "delta": 8881
+   }
+  },
+  "q3a": {
+   "qlever": {
+    "before": 199,
+    "peak": 268,
+    "delta": 69
+   },
+   "fluree": {
+    "before": 5140,
+    "peak": 5794,
+    "delta": 654
+   }
+  },
+  "q3b": {
+   "qlever": {
+    "before": 263,
+    "peak": 268,
+    "delta": 5
+   },
+   "fluree": {
+    "before": 5571,
+    "peak": 5592,
+    "delta": 21
+   }
+  },
+  "q3c": {
+   "qlever": {
+    "before": 268,
+    "peak": 273,
+    "delta": 5
+   },
+   "fluree": {
+    "before": 5602,
+    "peak": 5656,
+    "delta": 54
+   }
+  },
+  "q5b": {
+   "qlever": {
+    "before": 273,
+    "peak": 487,
+    "delta": 214
+   },
+   "fluree": {
+    "before": 5638,
+    "peak": 6611,
+    "delta": 973
+   }
+  },
+  "q6": {
+   "qlever": {
+    "before": 269,
+    "peak": 571,
+    "delta": 302
+   }
+  },
+  "q7": {
+   "qlever": {
+    "before": 468,
+    "peak": 795,
+    "delta": 327
+   },
+   "fluree": {
+    "before": 6091,
+    "peak": 6758,
+    "delta": 667
+   }
+  },
+  "q8": {
+   "qlever": {
+    "before": 486,
+    "peak": 6875,
+    "delta": 6389
+   },
+   "fluree": {
+    "before": 6627,
+    "peak": 6646,
+    "delta": 19
+   }
+  },
+  "q9": {
+   "qlever": {
+    "before": 626,
+    "peak": 839,
+    "delta": 213
+   },
+   "fluree": {
+    "before": 6646,
+    "peak": 7192,
+    "delta": 546
+   }
+  },
+  "q10": {
+   "qlever": {
+    "before": 661,
+    "peak": 661,
+    "delta": 0
+   },
+   "fluree": {
+    "before": 7123,
+    "peak": 7123,
+    "delta": 0
+   }
+  },
+  "q11": {
+   "qlever": {
+    "before": 659,
+    "peak": 687,
+    "delta": 28
+   },
+   "fluree": {
+    "before": 7123,
+    "peak": 7126,
+    "delta": 3
+   }
+  },
+  "q12a": {
+   "qlever": {
+    "before": 687,
+    "peak": 770,
+    "delta": 83
+   },
+   "fluree": {
+    "before": 7126,
+    "peak": 7126,
+    "delta": 0
+   }
+  },
+  "q12b": {
+   "qlever": {
+    "before": 705,
+    "peak": 7261,
+    "delta": 6556
+   },
+   "fluree": {
+    "before": 7126,
+    "peak": 7126,
+    "delta": 0
+   }
+  },
+  "q12c": {
+   "qlever": {
+    "before": 834,
+    "peak": 834,
+    "delta": 0
+   },
+   "fluree": {
+    "before": 7126,
+    "peak": 7126,
+    "delta": 0
+   }
+  }
+ },
+ "warm": {
+  "qlever": 829,
+  "fluree": 7126
+ }
+}

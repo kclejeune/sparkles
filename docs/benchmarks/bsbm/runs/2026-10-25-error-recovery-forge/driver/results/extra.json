@@ -1,0 +1,23 @@
+{
+  "settings": {
+    "bsbmWarmup": 50,
+    "bsbmRuns": 500,
+    "bsbmClients": [
+      1
+    ],
+    "bsbmMaxTimeSeconds": 1800,
+    "requestTimeoutSeconds": 300,
+    "sparklesArgs": "--max-rows 1000000000",
+    "maxIntermediateRows": 1000000000,
+    "serverMemoryCap": "12G"
+  },
+  "driver_contract": {
+    "class": "benchmark.testdriver.TestDriver",
+    "usecase": "businessIntelligence",
+    "jdk": "17.0.20.1+1",
+    "http_keepalive": false,
+    "driver_heap": "2g",
+    "client_cpu": "unrestricted; standard driver method",
+    "fixed_instance_answers": "Not rerun by this driver feasibility attempt"
+  }
+}

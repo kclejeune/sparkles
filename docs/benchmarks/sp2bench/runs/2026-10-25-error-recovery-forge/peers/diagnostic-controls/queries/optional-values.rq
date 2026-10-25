@@ -1,0 +1,8 @@
+SELECT ?author ?yr WHERE {
+  VALUES (?author ?yr) { (<urn:author:a> 2000) (<urn:author:a> 2001) }
+  OPTIONAL {
+    VALUES (?author2 ?yr2) { (<urn:author:a> 2000) }
+    FILTER (?author = ?author2 && ?yr2 < ?yr)
+  }
+  FILTER (!BOUND(?author2))
+}

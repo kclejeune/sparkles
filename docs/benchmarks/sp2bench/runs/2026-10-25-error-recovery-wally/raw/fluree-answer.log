@@ -1,0 +1,12 @@
+[14:51:01] dataset: 10000091 triples
+[14:51:03] fluree: loading (log: logs/load-fluree.log)
+fluree: 14.6 s, peak RSS 1818 MiB, index 888 MiB
+
+rows                   fluree
+q4              /home/kclejeune/lanes/benchmark-error-recovery-20261025/src-reviewed/scripts/bench-lib.sh: line 488: 4133014 Killed                     ( cd "$(store_of fluree)" && FLUREE_CACHE_MAX_MB=4096 FLUREE_PATH_MAX_VISITED=20000000 FLUREE_QUERY_TIMEOUT_MS=$((SERVER_TIMEOUT * 1000)) exec "${CAP[@]}" "$FLUREE" server run --listen-addr "127.0.0.1:$p" --storage-path "$(store_of fluree)/.fluree/storage" --log-level warn > "$STORE/fluree.log" 2>&1 )
+        error[14:52:42] fluree: no answer after answer q4, restarting it
+
+q8                        656
+q12b                        1
+results/record.json: 3 results
+[14:52:46] record: /home/kclejeune/lanes/benchmark-error-recovery-20261025/sp2b-20261025T183539Z/fluree/results/record.json, table: /home/kclejeune/lanes/benchmark-error-recovery-20261025/sp2b-20261025T183539Z/fluree/results/summary.md

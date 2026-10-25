@@ -1,0 +1,72 @@
+{
+  "bindings_version": 1,
+  "host": "wally",
+  "scale": "10m",
+  "engine": "sparkles",
+  "dataset": "sp2bench-10m",
+  "source_sha256": "4486653f3ea16825923eb8a5410137df7ba712aa918442531c33cbeb854eb814",
+  "binary_commit": "6b7f32ce",
+  "binary_sha256": "cf6f4cf5fd754c8344fd0f0c02b81dce5016c8b8ccfcbe034f5fe7927cfd46c8",
+  "settings": {
+    "warmup": 2,
+    "runs": 3,
+    "timer": "hyperfine+curl",
+    "resultCache": false,
+    "maxTimeSeconds": 600,
+    "serverTimeoutSeconds": 615,
+    "sparklesArgs": "--max-result-mb 4096",
+    "answerStreamTSVQueries": "q4 q6",
+    "correctnessEngineIsolation": true,
+    "jenaHeap": "16G",
+    "jenaStack": "256m",
+    "qleverMemory": "20G"
+  },
+  "queries": {
+    "q4": {
+      "sha256": "ba7af5ada891455f72ba06917c031e25c9c1ffdf0f87c4f6e475623950ade60d",
+      "runs": 3,
+      "timing_role": "q4_timing"
+    }
+  },
+  "inputs": {
+    "raw_record": {
+      "path": "sparkles-record.json",
+      "sha256": "af730337327ba0072e5371c5c01815950a22fd88a378b79b28c6b4e6e9931ddb"
+    },
+    "raw_answers": {
+      "path": "sparkles-answers.json",
+      "sha256": "f2cb189a1734ae31525d6fe19b5146a4162c74c1a08e612e7cc23ce6ad5a48ce"
+    },
+    "oracle": {
+      "path": "oracle.json",
+      "sha256": "6f5e9d7b004948e2ead2ad686099f41151626641f9015e3e7adede4282f0cdd0"
+    },
+    "q4_timing": {
+      "path": "sparkles-q4-timing.json",
+      "sha256": "3d475f7e38f20e1d9b0ccc27818ef7a81c89db242f10d51d162fc78220d00e04"
+    }
+  },
+  "oracle_generator": {
+    "source_revision": "a44bdabfbe7499abe3d439a6f2bec18b12247209",
+    "script": "scripts/bench-sp2b/oracle.py",
+    "sha256": "97f359ccd2cc73fc57be01017c6f1c6453e5ec6d8d2645af0aee4bd9fb3c3f87"
+  },
+  "measurement_controls": {
+    "sparkles_args": "--max-result-mb 4096",
+    "max_time_s": 600,
+    "server_timeout_s": 615,
+    "server_memory_cap": "24G",
+    "engines_isolated_for_correctness_and_timing": true,
+    "answer_algorithm": "row-sha256-v1; complete TSV; external sort64MiB",
+    "timing": "hyperfine curl full TSV to /dev/null; no fingerprints in timing",
+    "warmup": 2,
+    "runs": 3,
+    "runtime_binary_revision": "6b7f32ce",
+    "index_source": "Fresh index loaded from the SHA256-matched NT source on Wally. Full q4 response agrees with the independent source oracle.",
+    "comparison_policy": "Separate Wally host profile; no cross-host latency ratios.",
+    "qlever_query_memory": "20G",
+    "jena_heap": "16G",
+    "jena_stack": "256m",
+    "host_power_state": "AC online, battery Full, powersave governor, turbo enabled; captured preflight lists desktop processes."
+  }
+}

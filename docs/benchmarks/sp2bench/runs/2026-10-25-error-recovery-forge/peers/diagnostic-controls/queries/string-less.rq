@@ -1,0 +1,4 @@
+SELECT ?first ?second WHERE {
+  VALUES (?first ?second) { ("Abdullah Decker" "AbdulLateef Schriber") }
+  FILTER (?first < ?second)
+}

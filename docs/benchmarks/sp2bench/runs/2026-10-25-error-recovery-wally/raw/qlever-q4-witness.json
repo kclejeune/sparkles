@@ -1,0 +1,46 @@
+{
+  "witness_version": 1,
+  "method": "Find complete-response pairs violating the original string-less-than filter by Unicode codepoint order. Raw-byte candidates are decoded before acceptance.",
+  "source_path": "/home/kclejeune/lanes/benchmark-error-recovery-20261025/sp2b-20261025T183539Z/qlever/raw-answers/q4.qlever.tsv",
+  "source_rows_scanned": 437927,
+  "completed_full_scan": false,
+  "examples": [
+    {
+      "row": 437477,
+      "name1": "Abdullah Decker",
+      "name2": "AbdulLateef Schriber",
+      "violates_name1_less_name2": true,
+      "raw_tsv": "\"Abdullah Decker\"\t\"AbdulLateef Schriber\""
+    },
+    {
+      "row": 437664,
+      "name1": "Abdullah Lingefelt",
+      "name2": "AbdulLateef Wiegman",
+      "violates_name1_less_name2": true,
+      "raw_tsv": "\"Abdullah Lingefelt\"\t\"AbdulLateef Wiegman\""
+    },
+    {
+      "row": 437790,
+      "name1": "Abdullah Moscaritolo",
+      "name2": "AbdulLateef Decker",
+      "violates_name1_less_name2": true,
+      "raw_tsv": "\"Abdullah Moscaritolo\"\t\"AbdulLateef Decker\""
+    },
+    {
+      "row": 437884,
+      "name1": "Abdullah Schriber",
+      "name2": "AbdulLateef Lequire",
+      "violates_name1_less_name2": true,
+      "raw_tsv": "\"Abdullah Schriber\"\t\"AbdulLateef Lequire\""
+    },
+    {
+      "row": 437927,
+      "name1": "Abdullah Shamblin",
+      "name2": "AbdulLateef Lingefelt",
+      "violates_name1_less_name2": true,
+      "raw_tsv": "\"Abdullah Shamblin\"\t\"AbdulLateef Lingefelt\""
+    }
+  ],
+  "seconds_for_diagnostic_scan": 0.1700641929928679,
+  "prefix_sha256": "c4690be29b059a84979c83f9e72ac861493cfa7a1664521998faa7354895178b"
+}

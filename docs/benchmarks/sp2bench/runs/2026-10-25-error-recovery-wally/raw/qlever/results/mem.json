@@ -1,0 +1,31 @@
+{
+ "idle": {
+  "qlever": 41
+ },
+ "queries": {
+  "q4": {
+   "qlever": {
+    "before": 41,
+    "peak": 8549,
+    "delta": 8508
+   }
+  },
+  "q8": {
+   "qlever": {
+    "before": 2794,
+    "peak": 9973,
+    "delta": 7179
+   }
+  },
+  "q12b": {
+   "qlever": {
+    "before": 3959,
+    "peak": 11123,
+    "delta": 7164
+   }
+  }
+ },
+ "warm": {
+  "qlever": 5111
+ }
+}

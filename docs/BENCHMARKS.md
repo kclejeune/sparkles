@@ -13,7 +13,8 @@ identify exceptions to the reference hardware, memory limits and request timing.
 
 | Workload | Measured result | Full report |
 |---|---|---|
-| Synthetic queries at 10.5M triples | Sparkles has the lowest times on all 28 queries, with a median 3.8× speedup over QLever. | [Queries and throughput](benchmarks/synthetic/RESULTS.md) |
+| Synthetic queries at 10.5M triples | Sparkles has the lowest means on 27 of 28 queries and ties Fluree within 10% on `count-all`. Its median speedup over QLever is 3.8×. | [Queries and throughput](benchmarks/synthetic/RESULTS.md) |
+| SP²Bench at 10M triples | Complete source-verified answers take 30.626 s for `q4` and 978.4 ms for `q6` under a 12 GiB server cap. Other hard queries retain qualified timeouts or failures. | [SP²Bench](benchmarks/sp2bench/RESULTS.md) |
 | Bulk loading at 10.5M triples | Sparkles takes 3.67 s, against QLever's 9.35 s, Oxigraph's 18.22 s and TDB2's 45.70 s. | [Loading](benchmarks/loading/RESULTS.md) |
 | WatDiv at 10.97M triples | Geometric mean latency is 4.63 ms, against Fluree's 6.97 ms and QLever's 17.9 ms. | [WatDiv](benchmarks/watdiv/RESULTS.md) |
 | English DBpedia at 1.24B triples | Sparkles loads in 480 s, against QLever's 1,674 s and Fluree's 2,919 s. | [DBpedia](benchmarks/dbpedia/RESULTS.md) |
@@ -23,14 +24,15 @@ identify exceptions to the reference hardware, memory limits and request timing.
 ## Where Sparkles loses
 
 This table lists recorded comparisons where another engine is ahead by more than 10%.
-Fluree's warm advantages on `distinct-obj` at 1.05M and on two small DBpedia 50M queries
-are within 10%. SP²Bench `q12b` is also within 8% of Oxigraph.
+Fluree's warm advantages on `distinct-obj` at 1.05M, `count-all` at 10.5M and two small
+DBpedia 50M queries are within 10%. SP²Bench `q12b` is also within 8% of Oxigraph.
 
 | Case | Reference advantage | Qualification |
 |---|---|---|
 | WatDiv `L1-1`, 10.97M | Fluree 1.11× | Sparkles has the lowest mean on 19 of 20 templates, ties Fluree on S7 and leads on 81 of 88 instances. |
 | BSBM Explore `q7` and `q8`, 10M | Oxigraph 1.2× on `q7` and 1.4× on `q8` | Pooled medians cover three instances per template. Unresolved result differences are excluded from the ranking. |
-| BSBM BI `q3`, 10M | QLever 1.24× | The three fixed-instance answer checks agree. The driver cells have not been rerun since [roadmap](ROADMAP.md) item 96 removed the budget refusal that failed them. |
+| BSBM BI `q3`, 10M | QLever 1.24× | The three fixed-instance answer checks agree. A complete BI driver throughput result remains unavailable after a bounded retry. |
+| SP²Bench `q11`, 10M | QLever 2.37× and Fluree 1.98× | Fresh isolated peer means are 43.5 and 52.2 ms against retained Sparkles `6699f27d` at 103.1 ms. Complete values, ordering and row counts match retained references. |
 | Changed-store `two-hop-count`, 1.05M | Fluree 1.10× | Sparkles takes 8.6 ms against 7.8 ms with 5,000 changes in its delta, and 5.1 ms on the loaded store. |
 | Serial durable commits | Unsynced Oxigraph about 2.0× on literal inserts at 10.5M in the focused assessment | Sparkles takes 1.167–1.254 ms against 0.594–0.625 ms. The separate suite latency table gives Oxigraph a 1.84× advantage at 1.05M under its sampling contract. |
 | Writes during mixed load | Oxigraph 3.4× at 1.05M in the suite and 2.1–3.0× at 10.5M in the focused assessment | At 10.5M in the focused assessment, Oxigraph completes no reads in the thirty-second window, while Sparkles completes 232–245 reads/s. Durability and completed reader work differ. |

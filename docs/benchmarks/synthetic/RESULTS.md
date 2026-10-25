@@ -12,12 +12,12 @@ triples. Medians are over the queries each engine completes.
 | | 1.05M triples | 10.5M triples |
 |---|---|---|
 | Bulk load | **0.47 s** (QLever 1.36, Fluree 1.38, Oxigraph 4.42, TDB2 4.80) | **3.67 s** (QLever 9.35, Fluree 10.20, Oxigraph 18.22, TDB2 45.70) |
-| Fastest of the five engines | 27 of 28 queries | 28 of 28 queries |
+| Fastest of the five engines | 27 of 28 queries | 27 of 28 queries |
 | Clear losses | none | none |
-| Ties within 10% | Fluree on `count-all`, `distinct-obj`, `star-lookup` and `employee-docs`, Oxigraph on `path-plus` | Fluree on `distinct-obj`, Oxigraph on `path-plus` and `values-star` |
+| Ties within 10% | Fluree on `count-all`, `distinct-obj`, `star-lookup` and `employee-docs`, Oxigraph on `path-plus` | Fluree on `count-all` and `distinct-obj`, Oxigraph on `path-plus` and `values-star` |
 | Against QLever | Faster on 28 of 28, median 2.9× | Faster on 28 of 28, median 3.8× |
-| Against Fluree | Faster on 27 of 28, median 3.5× | Faster on all 26 completed, median 10.3× |
-| Against Fuseki | Faster on all 27 completed, median 14× | Faster on all 27 completed, median 79× |
+| Against Fluree | Faster on 27 of 28, median 3.5× | Faster on 26 of 27 completed; `count-all` is within 10% |
+| Against Fuseki | Faster on all 28 completed | Faster on all 28 completed |
 | Against Oxigraph | Faster on all 28, median 24× | Faster on all 28, median 100× |
 | Throughput, 16 clients | **1,205 q/s** (QLever 475, Fluree 241, Fuseki 114, Oxigraph 25) | **239 q/s** (QLever 90, Fluree 22, Fuseki 12, Oxigraph 1.7) |
 | Server RSS after the run | 408 MiB (**QLever 310**, Oxigraph 1,231, Fuseki 1,882, Fluree 3,077) | **780 MiB** (QLever 795, Oxigraph 2,074, Fluree 2,357, Fuseki 4,923) |
@@ -33,6 +33,15 @@ around `curl`, so each time includes about 3.5 ms of process start and round tri
 are mean ± σ in ms over 10 runs after 2 warm-ups, and bold marks the fastest engine. Most
 queries at 1.05M are close to the cost of starting curl and making the request.
 `mise run bench` reproduces these tables.
+
+The recovered Jena `knows-reach` cells use an explicit 256 MiB JVM thread stack with
+an 8 GiB heap under the same 12 GiB server cap. The recovered Fluree `count-all` cell
+uses a fresh isolated server. The [raw records and source-oracle receipt](runs/2026-10-25-error-recovery-forge/validation.json)
+retain ten timed requests after two warm-ups and bind each query to its exact generated
+source. Independent graph traversal verifies 89,090 reachable nodes at 1.05M and 892,556
+at 10.5M. A source triple-set count verifies Fluree's 10,527,319 distinct triples. Raw
+`agrees=null` values remain unchanged; these checks use source reconstruction rather
+than a majority vote. The Fluree and Sparkles `count-all` means differ by less than 10%.
 
 ### Synthetic suite at 1.05M triples
 
@@ -57,7 +66,7 @@ queries at 1.05M are close to the cost of starting curl and making the request.
 | exists-join | **5.0 ± 0.2** | 152.0 ± 1.0 | 9.9 ± 0.3 ‡ | 30.5 ± 6.3 | 1451.6 ± 21.6 |
 | subquery-agg | **3.7 ± 0.3** | 52.3 ± 1.3 | 4.9 ± 0.1 ‡ | 25.7 ± 16.5 | 27.7 ± 4.4 |
 | regex-iri | **4.3 ± 0.2** | 56.6 ± 2.0 | 72.8 ± 3.8 ‡ | 77.5 ± 0.7 | 171.7 ± 7.3 |
-| knows-reach | **16.1 ± 0.2** | error | 60.5 ± 6.1 ‡ | 58.2 ± 0.4 | 346.5 ± 4.0 |
+| knows-reach | **16.1 ± 0.2** | 364.1 ± 35.9 | 60.5 ± 6.1 ‡ | 58.2 ± 0.4 | 346.5 ± 4.0 |
 | distinct-join | **8.2 ± 0.2** | 423.4 ± 1.4 | 25.9 ± 4.7 | 90.8 ± 3.5 | 679.6 ± 14.0 |
 | lang-filter | **4.2 ± 0.2** | 32.3 ± 1.5 | 44.1 ± 3.8 ‡ | 6.3 ± 0.2 | 81.6 ± 6.1 |
 | star-lookup | **3.7 ± 0.2** ‡ | 6.0 ± 0.4 ‡ | 10.5 ± 0.5 ‡ | 3.7 ± 0.1 | 4.7 ± 0.3 |
@@ -76,7 +85,7 @@ has every sample and answer fingerprint.*
 
 | query | sparkles (ms) | jena-fuseki (ms) | qlever (ms) | fluree (ms) | oxigraph (ms) |
 |---|---:|---:|---:|---:|---:|
-| count-all | **3.6 ± 0.2** | 1855.8 ± 6.6 | 51.7 ± 3.3 ‡ | error | 2515.5 ± 18.0 |
+| count-all | 3.6 ± 0.2 | 1855.8 ± 6.6 | 51.7 ± 3.3 ‡ | **3.5 ± 0.1** | 2515.5 ± 18.0 |
 | types-grouped | **3.6 ± 0.2** | 3722.1 ± 792.9 | 6.1 ± 0.3 ‡ | 110.6 ± 0.9 | 386.4 ± 7.7 |
 | star-join | **36.7 ± 4.2** | 327.2 ± 136.4 | 118.5 ± 10.5 ‡ | 140.9 ± 3.3 | 4789.6 ± 32.7 |
 | two-hop-count | **17.5 ± 1.0** | 3954.2 ± 30.2 | 66.9 ± 6.4 ‡ | 35.9 ± 0.2 | 8294.6 ± 71.1 |
@@ -95,7 +104,7 @@ has every sample and answer fingerprint.*
 | exists-join | **15.3 ± 1.3** | 1582.9 ± 26.2 | 61.6 ± 3.6 ‡ | 263.2 ± 4.7 § | 122805.6 ± 269.9 |
 | subquery-agg | **4.6 ± 0.1** | 593.1 ± 9.4 | 14.8 ± 0.7 ‡ | 140.4 ± 3.0 § | 182.8 ± 1.6 |
 | regex-iri | **8.3 ± 0.1** | 4029.7 ± 119.8 | 660.3 ± 4.9 ‡ | 742.4 ± 2.4 § | 2701.9 ± 8.4 |
-| knows-reach | **145.5 ± 0.7** | error | 1142.2 ± 44.2 ‡ | 639.3 ± 6.4 § | 4952.2 ± 27.4 |
+| knows-reach | **145.5 ± 0.7** | 6287.4 ± 267.0 | 1142.2 ± 44.2 ‡ | 639.3 ± 6.4 § | 4952.2 ± 27.4 |
 | distinct-join | **49.0 ± 0.8** | 4415.9 ± 9.7 | 155.2 ± 6.6 | 1196.9 ± 10.2 § | 6666.6 ± 25.4 |
 | lang-filter | **6.2 ± 0.2** | 1683.5 ± 1324.2 | 385.8 ± 1.9 ‡ | 29.3 ± 0.5 § | 855.0 ± 10.2 |
 | star-lookup | **3.7 ± 0.1** ‡ | 7.1 ± 0.7 | 24.9 ± 3.2 ‡ | 4.1 ± 0.2 § | 5.1 ± 0.2 |
@@ -172,6 +181,13 @@ query, three times per query, and reports the median request time without proces
 startup. Eviction does not guarantee that the device itself is cold. A Sparkles server is
 ready 0.09 s after a restart at both scales. Sparkles is fastest on 21 of 28 cold queries
 at 1.05M and on 24 of 28 at 10.5M. The cold losses are these:
+
+Jena also completes `knows-reach` with the larger stack after three process restarts
+and file-cache evictions at each scale. Its median request times are 1,417.885 ms and
+20,563.924 ms, with readiness recorded separately. The [cold records](runs/2026-10-25-error-recovery-forge/validation.json)
+retain every request and the source-verified answer fingerprints. Changed-store cells
+keep their own measurements; a loaded-store recovery does not establish a changed-store
+result.
 
 | Query, cold | Faster engine | 1.05M | 10.5M |
 |---|---|---|---|

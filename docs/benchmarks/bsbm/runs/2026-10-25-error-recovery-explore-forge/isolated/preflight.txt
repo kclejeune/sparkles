@@ -1,0 +1,23 @@
+2026-10-25T19:49:37Z
+forge
+ 15:49:37  up  23:10,  0 users,  load average: 0.08, 0.46, 0.80
+               total        used        free      shared  buff/cache   available
+Mem:           15620        1082        2208          11       12759       14537
+Swap:           8191         197        7994
+Filesystem           Size  Used Avail Use% Mounted on
+/dev/mapper/vg-root  460G  370G   67G  85% /
+    PID %CPU   RSS COMMAND
+    908  0.7 57604 .tailscaled-wra
+1941054  0.5 11432 sshd-session
+    937  0.3 35692 netbird
+    811  0.2 47696 otelcol-contrib
+1937843  0.2     0 kworker/u81:8-kcryptd-254:0-1
+1938539  0.2     0 kworker/u81:12-kcryptd-254:0-1
+   1698  0.2 14732 herdr
+1939051  0.1     0 kworker/u81:22-kcryptd-254:0-1
+1938546  0.1     0 kworker/u81:21-kcryptd-254:0-1
+    805  0.1  1904 avahi-daemon
+1937704  0.0     0 kworker/u81:7-kcryptd-254:0-1
+    646  0.0  7584 systemd-resolve
+1909936  0.0     0 kworker/u81:18-kcryptd-254:0-1
+1938543  0.0     0 kworker/u81:17-ext4-rsv-conversion

@@ -1,0 +1,10 @@
+[14:53:02] dataset: 10000091 triples
+[14:53:04] jena: loading (log: logs/load-jena.log)
+jena-tdb2: 56.8 s, peak RSS 4780 MiB, index 1749 MiB
+
+rows              jena-fuseki
+q4                      error
+q8                        656
+q12b                        1
+results/record.json: 3 results
+[15:04:10] record: /home/kclejeune/lanes/benchmark-error-recovery-20261025/sp2b-20261025T183539Z/jena/results/record.json, table: /home/kclejeune/lanes/benchmark-error-recovery-20261025/sp2b-20261025T183539Z/jena/results/summary.md

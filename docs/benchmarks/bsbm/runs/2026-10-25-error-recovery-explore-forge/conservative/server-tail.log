@@ -1,0 +1,160 @@
+
+2026-10-25 16:12:50.919 - INFO: Requested media types of the result are: "application/sparql-results+xml"
+2026-10-25 16:12:50.991 - INFO: Query planning done in 72 ms
+2026-10-25 16:12:51.083 - INFO: Result has size 1 x 6
+2026-10-25 16:12:51.084 - INFO: Done processing query and sending result, total time was 165 ms
+2026-10-25 16:12:51.084 - INFO: 
+2026-10-25 16:12:51.084 - INFO: Request received via GET, no content type specified
+2026-10-25 16:12:51.084 - INFO: Processing the following SPARQL query:
+PREFIX bsbm: <http://www4.wiwiss.fu-berlin.de/bizer/bsbm/v01/vocabulary/>
+PREFIX xsd: <http://www.w3.org/2001/XMLSchema#> 
+PREFIX dc: <http://purl.org/dc/elements/1.1/>
+
+SELECT DISTINCT ?offer ?price
+WHERE {
+	?offer bsbm:product <http://www4.wiwiss.fu-berlin.de/bizer/bsbm/v01/instances/dataFromProducer354/Product17209> .
+	?offer bsbm:vendor ?vendor .
+    ?offer dc:publisher ?vendor .
+	?vendor bsbm:country <http://downlode.org/rdf/iso-3166/countries#US> .
+	?offer bsbm:deliveryDays ?deliveryDays .
+	FILTER (?deliveryDays <= 3)
+	?offer bsbm:price ?price .
+    ?offer bsbm:validTo ?date .
+    FILTER (?date > "2008-06-20T00:00:00"^^<http://www.w3.org/2001/XMLSchema#dateTime> )
+}
+ORDER BY xsd:double(str(?price))
+LIMIT 10
+
+2026-10-25 16:12:51.084 - INFO: Requested media types of the result are: "application/sparql-results+xml"
+2026-10-25 16:12:51.141 - INFO: Query planning done in 57 ms
+2026-10-25 16:12:51.230 - INFO: Result has size 6 x 6
+2026-10-25 16:12:51.230 - INFO: Done processing query and sending result, total time was 146 ms
+2026-10-25 16:12:51.230 - INFO: 
+2026-10-25 16:12:51.230 - INFO: Request received via GET, no content type specified
+2026-10-25 16:12:51.231 - INFO: Processing the following SPARQL query:
+SELECT ?property ?hasValue ?isValueOf
+WHERE {
+  { <http://www4.wiwiss.fu-berlin.de/bizer/bsbm/v01/instances/dataFromVendor88/Offer179088> ?property ?hasValue }
+  UNION
+  { ?isValueOf ?property <http://www4.wiwiss.fu-berlin.de/bizer/bsbm/v01/instances/dataFromVendor88/Offer179088> }
+}
+
+2026-10-25 16:12:51.231 - INFO: Requested media types of the result are: "application/sparql-results+xml"
+2026-10-25 16:12:51.231 - INFO: Query planning done in 0 ms
+2026-10-25 16:12:51.232 - INFO: Result has unknown size (not computed yet)
+2026-10-25 16:12:51.233 - INFO: Done processing query and sending result, total time was 2 ms
+2026-10-25 16:12:51.234 - INFO: 
+2026-10-25 16:12:51.234 - INFO: Request received via GET, no content type specified
+2026-10-25 16:12:51.234 - INFO: Processing the following SPARQL query:
+PREFIX bsbm-inst: <http://www4.wiwiss.fu-berlin.de/bizer/bsbm/v01/instances/>
+PREFIX bsbm: <http://www4.wiwiss.fu-berlin.de/bizer/bsbm/v01/vocabulary/>
+PREFIX rdfs: <http://www.w3.org/2000/01/rdf-schema#>
+PREFIX rdf: <http://www.w3.org/1999/02/22-rdf-syntax-ns#>
+
+SELECT DISTINCT ?product ?label
+WHERE { 
+    ?product rdfs:label ?label .
+    ?product a <http://www4.wiwiss.fu-berlin.de/bizer/bsbm/v01/instances/ProductType401> .
+    ?product bsbm:productFeature <http://www4.wiwiss.fu-berlin.de/bizer/bsbm/v01/instances/ProductFeature12957> . 
+    ?product bsbm:productFeature <http://www4.wiwiss.fu-berlin.de/bizer/bsbm/v01/instances/ProductFeature12953> . 
+    ?product bsbm:productPropertyNumeric1 ?value1 . 
+	FILTER (?value1 > 204) 
+	}
+ORDER BY ?label
+LIMIT 10
+
+2026-10-25 16:12:51.234 - INFO: Requested media types of the result are: "application/sparql-results+xml"
+2026-10-25 16:12:51.235 - INFO: Query planning done in 1 ms
+2026-10-25 16:12:51.239 - INFO: Result has size 1 x 3
+2026-10-25 16:12:51.239 - INFO: Done processing query and sending result, total time was 5 ms
+2026-10-25 16:12:51.239 - INFO: 
+2026-10-25 16:12:51.239 - INFO: Request received via GET, no content type specified
+2026-10-25 16:12:51.239 - INFO: Processing the following SPARQL query:
+PREFIX bsbm-inst: <http://www4.wiwiss.fu-berlin.de/bizer/bsbm/v01/instances/>
+PREFIX bsbm: <http://www4.wiwiss.fu-berlin.de/bizer/bsbm/v01/vocabulary/>
+PREFIX rdfs: <http://www.w3.org/2000/01/rdf-schema#>
+PREFIX dc: <http://purl.org/dc/elements/1.1/>
+
+SELECT ?label ?comment ?producer ?productFeature ?propertyTextual1 ?propertyTextual2 ?propertyTextual3
+ ?propertyNumeric1 ?propertyNumeric2 ?propertyTextual4 ?propertyTextual5 ?propertyNumeric4 
+WHERE {
+    <http://www4.wiwiss.fu-berlin.de/bizer/bsbm/v01/instances/dataFromProducer63/Product2981> rdfs:label ?label .
+    <http://www4.wiwiss.fu-berlin.de/bizer/bsbm/v01/instances/dataFromProducer63/Product2981> rdfs:comment ?comment .
+    <http://www4.wiwiss.fu-berlin.de/bizer/bsbm/v01/instances/dataFromProducer63/Product2981> bsbm:producer ?p .
+    ?p rdfs:label ?producer .
+    <http://www4.wiwiss.fu-berlin.de/bizer/bsbm/v01/instances/dataFromProducer63/Product2981> dc:publisher ?p . 
+    <http://www4.wiwiss.fu-berlin.de/bizer/bsbm/v01/instances/dataFromProducer63/Product2981> bsbm:productFeature ?f .
+    ?f rdfs:label ?productFeature .
+    <http://www4.wiwiss.fu-berlin.de/bizer/bsbm/v01/instances/dataFromProducer63/Product2981> bsbm:productPropertyTextual1 ?propertyTextual1 .
+    <http://www4.wiwiss.fu-berlin.de/bizer/bsbm/v01/instances/dataFromProducer63/Product2981> bsbm:productPropertyTextual2 ?propertyTextual2 .
+    <http://www4.wiwiss.fu-berlin.de/bizer/bsbm/v01/instances/dataFromProducer63/Product2981> bsbm:productPropertyTextual3 ?propertyTextual3 .
+    <http://www4.wiwiss.fu-berlin.de/bizer/bsbm/v01/instances/dataFromProducer63/Product2981> bsbm:productPropertyNumeric1 ?propertyNumeric1 .
+    <http://www4.wiwiss.fu-berlin.de/bizer/bsbm/v01/instances/dataFromProducer63/Product2981> bsbm:productPropertyNumeric2 ?propertyNumeric2 .
+    OPTIONAL { <http://www4.wiwiss.fu-berlin.de/bizer/bsbm/v01/instances/dataFromProducer63/Product2981> bsbm:productPropertyTextual4 ?propertyTextual4 }
+    OPTIONAL { <http://www4.wiwiss.fu-berlin.de/bizer/bsbm/v01/instances/dataFromProducer63/Product2981> bsbm:productPropertyTextual5 ?propertyTextual5 }
+    OPTIONAL { <http://www4.wiwiss.fu-berlin.de/bizer/bsbm/v01/instances/dataFromProducer63/Product2981> bsbm:productPropertyNumeric4 ?propertyNumeric4 }
+}
+
+2026-10-25 16:12:51.239 - INFO: Requested media types of the result are: "application/sparql-results+xml"
+2026-10-25 16:12:51.240 - INFO: Query planning done in 0 ms
+2026-10-25 16:12:51.248 - INFO: Result has unknown size (not computed yet)
+2026-10-25 16:12:51.249 - INFO: Done processing query and sending result, total time was 10 ms
+2026-10-25 16:12:51.250 - INFO: 
+2026-10-25 16:12:51.250 - INFO: Request received via GET, no content type specified
+2026-10-25 16:12:51.251 - INFO: Processing the following SPARQL query:
+PREFIX bsbm-inst: <http://www4.wiwiss.fu-berlin.de/bizer/bsbm/v01/instances/>
+PREFIX bsbm: <http://www4.wiwiss.fu-berlin.de/bizer/bsbm/v01/vocabulary/>
+PREFIX rdfs: <http://www.w3.org/2000/01/rdf-schema#>
+PREFIX dc: <http://purl.org/dc/elements/1.1/>
+
+SELECT ?label ?comment ?producer ?productFeature ?propertyTextual1 ?propertyTextual2 ?propertyTextual3
+ ?propertyNumeric1 ?propertyNumeric2 ?propertyTextual4 ?propertyTextual5 ?propertyNumeric4 
+WHERE {
+    <http://www4.wiwiss.fu-berlin.de/bizer/bsbm/v01/instances/dataFromProducer171/Product8262> rdfs:label ?label .
+    <http://www4.wiwiss.fu-berlin.de/bizer/bsbm/v01/instances/dataFromProducer171/Product8262> rdfs:comment ?comment .
+    <http://www4.wiwiss.fu-berlin.de/bizer/bsbm/v01/instances/dataFromProducer171/Product8262> bsbm:producer ?p .
+    ?p rdfs:label ?producer .
+    <http://www4.wiwiss.fu-berlin.de/bizer/bsbm/v01/instances/dataFromProducer171/Product8262> dc:publisher ?p . 
+    <http://www4.wiwiss.fu-berlin.de/bizer/bsbm/v01/instances/dataFromProducer171/Product8262> bsbm:productFeature ?f .
+    ?f rdfs:label ?productFeature .
+    <http://www4.wiwiss.fu-berlin.de/bizer/bsbm/v01/instances/dataFromProducer171/Product8262> bsbm:productPropertyTextual1 ?propertyTextual1 .
+    <http://www4.wiwiss.fu-berlin.de/bizer/bsbm/v01/instances/dataFromProducer171/Product8262> bsbm:productPropertyTextual2 ?propertyTextual2 .
+    <http://www4.wiwiss.fu-berlin.de/bizer/bsbm/v01/instances/dataFromProducer171/Product8262> bsbm:productPropertyTextual3 ?propertyTextual3 .
+    <http://www4.wiwiss.fu-berlin.de/bizer/bsbm/v01/instances/dataFromProducer171/Product8262> bsbm:productPropertyNumeric1 ?propertyNumeric1 .
+    <http://www4.wiwiss.fu-berlin.de/bizer/bsbm/v01/instances/dataFromProducer171/Product8262> bsbm:productPropertyNumeric2 ?propertyNumeric2 .
+    OPTIONAL { <http://www4.wiwiss.fu-berlin.de/bizer/bsbm/v01/instances/dataFromProducer171/Product8262> bsbm:productPropertyTextual4 ?propertyTextual4 }
+    OPTIONAL { <http://www4.wiwiss.fu-berlin.de/bizer/bsbm/v01/instances/dataFromProducer171/Product8262> bsbm:productPropertyTextual5 ?propertyTextual5 }
+    OPTIONAL { <http://www4.wiwiss.fu-berlin.de/bizer/bsbm/v01/instances/dataFromProducer171/Product8262> bsbm:productPropertyNumeric4 ?propertyNumeric4 }
+}
+
+2026-10-25 16:12:51.251 - INFO: Requested media types of the result are: "application/sparql-results+xml"
+2026-10-25 16:12:51.251 - INFO: Query planning done in 1 ms
+2026-10-25 16:12:51.261 - INFO: Result has unknown size (not computed yet)
+2026-10-25 16:12:51.263 - INFO: Done processing query and sending result, total time was 12 ms
+2026-10-25 16:12:51.263 - INFO: 
+2026-10-25 16:12:51.263 - INFO: Request received via GET, no content type specified
+2026-10-25 16:12:51.263 - INFO: Processing the following SPARQL query:
+PREFIX bsbm-inst: <http://www4.wiwiss.fu-berlin.de/bizer/bsbm/v01/instances/>
+PREFIX bsbm: <http://www4.wiwiss.fu-berlin.de/bizer/bsbm/v01/vocabulary/>
+PREFIX rdfs: <http://www.w3.org/2000/01/rdf-schema#>
+PREFIX rdf: <http://www.w3.org/1999/02/22-rdf-syntax-ns#>
+
+SELECT ?product ?label
+WHERE {
+    ?product rdfs:label ?label .
+    ?product a <http://www4.wiwiss.fu-berlin.de/bizer/bsbm/v01/instances/ProductType118> .
+	?product bsbm:productFeature <http://www4.wiwiss.fu-berlin.de/bizer/bsbm/v01/instances/ProductFeature347> .
+	?product bsbm:productPropertyNumeric1 ?p1 .
+	FILTER ( ?p1 > 143 ) 
+	?product bsbm:productPropertyNumeric3 ?p3 .
+	FILTER (?p3 < 155 )
+    OPTIONAL { 
+        ?product bsbm:productFeature <http://www4.wiwiss.fu-berlin.de/bizer/bsbm/v01/instances/ProductFeature377> .
+        ?product rdfs:label ?testVar }
+    FILTER (!bound(?testVar)) 
+}
+ORDER BY ?label
+LIMIT 10
+
+
+2026-10-25 16:12:51.263 - INFO: Requested media types of the result are: "application/sparql-results+xml"

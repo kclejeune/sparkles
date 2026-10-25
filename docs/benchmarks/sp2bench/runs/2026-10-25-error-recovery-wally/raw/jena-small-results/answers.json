@@ -1,0 +1,25 @@
+{
+ "q4": {
+  "jena-fuseki": {
+   "rows": "error",
+   "error": "no complete answer in 600 s",
+   "query_sha256": "ba7af5ada891455f72ba06917c031e25c9c1ffdf0f87c4f6e475623950ade60d"
+  }
+ },
+ "q8": {
+  "jena-fuseki": {
+   "rows": 656,
+   "exact": "1a095147849abf2b",
+   "value": "1a095147849abf2b",
+   "query_sha256": "29e2736f82bfc0ee91bdd597700eea247f5cf352e87ecf0dc872da0cb22eaac7"
+  }
+ },
+ "q12b": {
+  "jena-fuseki": {
+   "rows": 1,
+   "exact": "7522d315bb64415d",
+   "value": "7522d315bb64415d",
+   "query_sha256": "8af476514e16d98c20da3f83a5c6d2e6704e80bc33ea304bc3af505e035aefbf"
+  }
+ }
+}

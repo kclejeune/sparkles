@@ -1,0 +1,49 @@
+{
+ "suite": "sp2bench",
+ "started": "2026-10-25T18:10:50Z",
+ "ended": "2026-10-25T18:14:29Z",
+ "host": {
+  "name": "forge",
+  "cpu": "13th Gen Intel(R) Core(TM) i5-13500",
+  "cpus": 20,
+  "ram_mib": 15620,
+  "disk_model": "",
+  "kernel": "7.2.9",
+  "filesystem": "ext4",
+  "mount_options": "rw,relatime,discard,errors=remount-ro"
+ },
+ "sparkles": {
+  "binary": "/home/kclejeune/lanes/competitive-births-20261025/bin/sparkles-6b7f32ce",
+  "version": "sparkles 0.1.0",
+  "sha256": "cf6f4cf5fd754c8344fd0f0c02b81dce5016c8b8ccfcbe034f5fe7927cfd46c8",
+  "scripts_commit": "unknown",
+  "binary_commit": "6b7f32ce"
+ },
+ "engines": {
+  "qlever": {
+   "license": "Apache-2.0",
+   "binary": "/home/kclejeune/lanes/item1-bench/data/sp2b-10m/gcroots/qlever/bin/qlever-server",
+   "sha256": "8a3d2eb5259918b6a22607a012e50bf0087dfc9205e37613a03a09a1e68a10dc",
+   "version": "0.5.48",
+   "store_path": "/nix/store/xn7f9c965zfza9nks2qzlrnx916xg3h2-qlever-0.5.48",
+   "package": "qlever-0.5.48",
+   "reported_version": "/home/kclejeune/lanes/item1-bench/data/sp2b-10m/gcroots/qlever/bin/qlever-server 0.0.0-unknown"
+  }
+ },
+ "memory_limit": "12G",
+ "client_cpu": "11",
+ "data": {
+  "sp2bench-10m": {
+   "license": "BSD",
+   "params": "SP2Bench v1.01 triples=10000000",
+   "sha256": "4486653f3ea16825923eb8a5410137df7ba712aa918442531c33cbeb854eb814",
+   "bytes": 1493565484
+  }
+ },
+ "license_check": {
+  "gpl_benchmark_allowed": false,
+  "notes": [
+   "SP2Bench v1.01 generator and queries: BSD license, fetched at build time"
+  ]
+ }
+}

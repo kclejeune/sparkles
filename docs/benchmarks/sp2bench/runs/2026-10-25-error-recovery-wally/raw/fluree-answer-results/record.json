@@ -1,0 +1,121 @@
+{
+ "record": 3,
+ "suite": "sp2bench",
+ "scale": "10m",
+ "manifest": {
+  "suite": "sp2bench",
+  "started": "2026-10-25T18:51:01Z",
+  "ended": "2026-10-25T18:52:46Z",
+  "host": {
+   "name": "wally",
+   "cpu": "12th Gen Intel(R) Core(TM) i7-12800H",
+   "cpus": 20,
+   "ram_mib": 31766,
+   "disk_model": "",
+   "kernel": "6.18.51",
+   "filesystem": "ext4",
+   "mount_options": "rw,relatime,discard,errors=remount-ro"
+  },
+  "sparkles": {
+   "binary": "/home/kclejeune/lanes/competitive-births-release-20261025/target-D/release/sparkles",
+   "version": "sparkles 0.1.0",
+   "sha256": "cf6f4cf5fd754c8344fd0f0c02b81dce5016c8b8ccfcbe034f5fe7927cfd46c8",
+   "scripts_commit": "unknown",
+   "binary_commit": "6b7f32ce"
+  },
+  "engines": {
+   "fluree": {
+    "license": "BUSL-1.1",
+    "binary": "/home/kclejeune/lanes/benchmark-error-recovery-20261025/bin/fluree-4.2.2",
+    "sha256": "99629db65b6eb0d7d9b7cafdc48806eee8ab71e9568fe389b983accaaa35f7ff",
+    "version": "fluree 4.2.2"
+   }
+  },
+  "memory_limit": "24G",
+  "client_cpu": "11",
+  "data": {
+   "sp2bench-10m": {
+    "license": "BSD",
+    "params": "SP2Bench v1.01 triples=10000000",
+    "sha256": "4486653f3ea16825923eb8a5410137df7ba712aa918442531c33cbeb854eb814",
+    "bytes": 1493565484
+   }
+  },
+  "license_check": {
+   "gpl_benchmark_allowed": false,
+   "notes": [
+    "SP2Bench v1.01 generator and queries: BSD license, fetched at build time"
+   ]
+  }
+ },
+ "settings": {
+  "warmup": 2,
+  "runs": 10,
+  "timer": "hyperfine+curl",
+  "resultCache": false,
+  "maxTimeSeconds": 600,
+  "serverTimeoutSeconds": 615,
+  "sparklesArgs": "--max-result-mb 4096",
+  "answerStreamTSVQueries": "q4 q6",
+  "correctnessEngineIsolation": true,
+  "jenaHeap": "16G",
+  "jenaStack": "256m",
+  "qleverMemory": "20G"
+ },
+ "results": [
+  {
+   "engine": "fluree",
+   "query": "q4",
+   "mode": "answer",
+   "clients": 1,
+   "durability": null,
+   "samples_ms": [],
+   "median_ms": null,
+   "p95_ms": null,
+   "answer": null,
+   "status": "error"
+  },
+  {
+   "engine": "fluree",
+   "query": "q8",
+   "mode": "answer",
+   "clients": 1,
+   "durability": null,
+   "samples_ms": [],
+   "median_ms": null,
+   "p95_ms": null,
+   "answer": {
+    "rows": 656,
+    "hash": "1a095147849abf2b",
+    "agrees": null,
+    "algorithm": "canonical-sha256-v1"
+   },
+   "status": "ok"
+  },
+  {
+   "engine": "fluree",
+   "query": "q12b",
+   "mode": "answer",
+   "clients": 1,
+   "durability": null,
+   "samples_ms": [],
+   "median_ms": null,
+   "p95_ms": null,
+   "answer": {
+    "rows": 1,
+    "hash": "7522d315bb64415d",
+    "agrees": null,
+    "algorithm": "canonical-sha256-v1"
+   },
+   "status": "ok"
+  }
+ ],
+ "load": {
+  "fluree": {
+   "seconds": 14.5817,
+   "max_rss_kib": 1862440,
+   "index_bytes": 930623488,
+   "index_apparent_bytes": 869887170
+  }
+ }
+}

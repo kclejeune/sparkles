@@ -1,0 +1,10 @@
+[14:36:41] dataset: 10000091 triples
+[14:36:43] sparkles: loading (log: logs/load-sparkles.log)
+sparkles: 6.6 s, peak RSS 2263 MiB, index 318 MiB
+
+rows                 sparkles
+q4                   41073618
+q8                        656
+q12b                        1
+results/record.json: 3 results
+[14:39:29] record: /home/kclejeune/lanes/benchmark-error-recovery-20261025/sp2b-20261025T183539Z/sparkles/results/record.json, table: /home/kclejeune/lanes/benchmark-error-recovery-20261025/sp2b-20261025T183539Z/sparkles/results/summary.md

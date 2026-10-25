@@ -1,0 +1,18 @@
+{
+    "git-hash-index": "QLever ",
+    "git-hash-server": "QLever ",
+    "name-index": "no index name specified",
+    "name-text-index": "",
+    "num-entity-occurrences": 0,
+    "num-objects-internal": 0,
+    "num-objects-normal": 4662411,
+    "num-permutations": 6,
+    "num-predicates-internal": 1,
+    "num-predicates-normal": 77,
+    "num-subjects-internal": 0,
+    "num-subjects-normal": 1712642,
+    "num-text-records": 0,
+    "num-triples-internal": 1712642,
+    "num-triples-normal": 10000091,
+    "num-word-occurrences": 0
+}

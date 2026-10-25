@@ -1,0 +1,30 @@
+{
+  "receipt_version": 1,
+  "files": {
+    "receipts/released.txt": "8986155707f370c4977bfb5ef9365007c244fcd16363aeadd22f268dcb51fa04",
+    "receipts/trim.txt": "1b921ee6826a91cef8b9bb51566aaf5a7868b6580b9f981fb4f306c64e6102e2",
+    "receipts/binary.sha256": "d05d71c5c1688994121a0914d9b63c7df6bef442b05e1c93862ecf310f590da3",
+    "receipts/compiler-comment.txt": "e098ec0042a4e22e99bf1673dbe46dfa080f1f2877f633c7b204b7917aac7786",
+    "receipts/oracle-harness.sha256": "b229e724b18e206c79d101a4f97fc5d146e2bf01d41c81262a834d18b83cae96",
+    "receipts/server.log": "3ec008a072faafc073d8a0b284f3f7b1cef4f2f3ec00a3dee808f413512ab4a6",
+    "receipts/complete.json": "97b6d1631a5ad1b399e8b0f6664fe0600ae7593c2200f4d75194002218ec3dcf",
+    "receipts/preflight.txt": "fcc59260c184eec21ecbc0c2af2f7bfd88b06c03ef6609fe40b57e6a6289bb05",
+    "receipts/harness-source-commit.txt": "ba1cc63038f6fce892d098e24ac2a2ffd649c5407ad5f9919665768391257907",
+    "receipts/harness.sha256": "816050ce6409c713c6ccbb0bd495329388354db7418f4e49effad2bc1571f1f7",
+    "receipts/memory.json": "a19d19b44c265ed909cd3ad0324dd6a05b8ef28ca82fe43a75cc3cd01a2dea55"
+  },
+  "raw_tsv_responses": {
+    "q4": {
+      "bytes": 1955839207,
+      "rows": 41073618,
+      "stored_on": "forge",
+      "path": "~/lanes/benchmark-error-recovery-20261025/first-20261025T172912Z/sp2b/raw-answers/q4.sparkles.tsv"
+    },
+    "q6": {
+      "bytes": 94616181,
+      "rows": 906313,
+      "stored_on": "forge",
+      "path": "~/lanes/benchmark-error-recovery-20261025/first-20261025T172912Z/sp2b/raw-answers/q6.sparkles.tsv"
+    }
+  }
+}

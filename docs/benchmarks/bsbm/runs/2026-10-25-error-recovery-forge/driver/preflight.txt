@@ -1,0 +1,23 @@
+2026-10-25T19:08:44Z
+forge
+ 15:08:44  up  22:29,  0 users,  load average: 0.05, 0.07, 0.10
+               total        used        free      shared  buff/cache   available
+Mem:           15620        1090        3771          11       11187       14529
+Swap:           8191         193        7998
+Filesystem           Size  Used Avail Use% Mounted on
+/dev/mapper/vg-root  460G  366G   71G  84% /
+    PID %CPU COMMAND
+    908  0.7 .tailscaled-wra
+    937  0.3 netbird
+    811  0.2 otelcol-contrib
+   1698  0.2 herdr
+    805  0.1 avahi-daemon
+1935923  0.1 kworker/u81:9-kcryptd-254:0-1
+1908182  0.0 kworker/u81:13-kcryptd-254:0-1
+    646  0.0 systemd-resolve
+1909936  0.0 kworker/u81:18-kcryptd-254:0-1
+1908429  0.0 kworker/u81:21-kcryptd-254:0-1
+1911516  0.0 kworker/u81:0-kcryptd-254:0-1
+openjdk version "17.0.20.1" 2026-08-18
+OpenJDK Runtime Environment (build 17.0.20.1+1-nixos)
+OpenJDK 64-Bit Server VM (build 17.0.20.1+1-nixos, mixed mode, sharing)

@@ -34,7 +34,8 @@ Each kind of claim needs a host that can resolve it.
 |---|---|---|
 | Namespace instance, `mise run bench:nsc A B` | Quick A/B screens of changes of about 10% or more, and checks that a change leaves other queries alone | The instances are noisy shared AMD EPYC virtual machines, so they cannot confirm a change of a few percent. |
 | `atlas` or `forge`, Intel Core i5-13500 | Effects under about 5%, queries under 0.3 ms and changes sensitive to code generation | The published numbers come from this microarchitecture, and a result that depends on how one CPU schedules a loop has to be measured on that CPU. |
-| `forge` | Published numbers | Every comparison in [BENCHMARKS.md](BENCHMARKS.md) runs there, so new figures stay comparable with the old ones. |
+| `forge` | Published reference numbers | The main comparison tables use this host and preserve each run's environment. |
+| `wally`, Intel Core i7-12800H with 32 GiB RAM | Separately qualified memory-heavy query recovery | Run each engine alone, record power state and leave room for the OS. Keep these results separate from Forge and do not compute cross-host latency ratios. |
 
 The microarchitecture matters. A fix to the merge join's zipper made `optional-count`
 28.5% faster and `minus` 31.9% faster at 1.05M triples on atlas, and the same comparison
@@ -394,6 +395,10 @@ queries can run into the 600 second timeout. A timeout is a result and is printe
 
 The options are the ones of `scripts/bench.sh`, which are `ENGINES`, `QUERIES`, `RUNS`,
 `WARMUP`, `SKIP_LOAD`, `ANSWERS_ONLY`, `PORT_BASE`, `SERVER_MEM_MAX` and `CLIENT_CPU`.
+`JENA_HEAP` sets Jena's heap and `JENA_STACK` optionally sets its per-thread JVM stack.
+A larger stack increases potential memory use, so record it with the server cap.
+`QLEVER_MEMORY` sets QLever's query-and-cache allowance, defaulting to `8G`; it is distinct
+from the process scope's `SERVER_MEM_MAX`.
 `COLD_RUNS=3` adds the cold measurement, a restart with an evicted page cache before each
 sample. The suites default to the ports from 28300, and the long write harness to the
 ports from 28400, below the ephemeral range.
@@ -437,6 +442,29 @@ numbers with a constant, so a size always gives the same document. The 17 querie
 from the same release. The script converts the generated Turtle to N-Triples once with
 `sparkles convert`, so all engines load the same file. Requests time out after 600
 seconds.
+
+The benchmark supplies `--max-result-mb 4096` unless `SPARKLES_ARGS` already selects a
+response limit. This changes only the benchmark invocation; the production default is
+1 GiB. At 10M, `q4` has 41,073,618 rows and a 1,955,839,207-byte TSV response, so a full
+comparison needs the larger allowance rather than a row limit or truncated answer.
+
+The `q4` and `q6` answer checks consume complete TSV responses using `row-sha256-v1`.
+The versioned algorithm normalizes RDF terms and column names, preserves duplicate rows,
+and hashes externally sorted row hashes with a 64 MiB sort budget. It refuses unsupported
+blank-node or triple-term fields and ordered queries. The request deadline covers full
+response consumption; offline sorting follows after that deadline has ended. Fingerprint
+work is outside the timed HTTP requests. Legacy fingerprints and this algorithm cannot
+vote together. Use a fresh results directory or recapture every selected peer when an
+existing directory contains another algorithm for the same query.
+
+Correctness checks and timings start one engine at a time. A failed answer check revives
+a stopped server before later work. The [source oracle](../scripts/bench-sp2b/oracle.py)
+can reconstruct `q4` and `q6` directly from the generated N-Triples. The
+[qualification helper](../scripts/bench-sp2b/qualify.py) checks pinned Sparkles records,
+answer captures, source-oracle output and raw timing summaries before writing a separate
+derived record. Raw records stay unchanged, and independent-oracle qualification does
+not claim majority agreement. The manual SP²Bench report identifies that proof method;
+these derived records are not selected by the generic majority-screening renderer.
 
 #### LUBM
 

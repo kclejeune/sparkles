@@ -1,0 +1,22 @@
+{
+  "oracle_version": 1,
+  "method": "source-graph-traversal-and-canonical-generator-line-set",
+  "source_sha256": "10daf6486c20f8dd4579d819ea73bb5e7836e054cd6d2d1b73f99f35233635f8",
+  "input_lines": 10527323,
+  "distinct_triples": 10527319,
+  "reachable_nodes": 892556,
+  "queries": {
+    "knows-reach": {
+      "rows": 1,
+      "exact": "7511ef374ecdf421",
+      "value": "cd6967d17c818d77",
+      "query_sha256": "144c9c0ca86e08938576a7c7788ee1c3e657fa6027683aa4777802942285c7d2"
+    },
+    "count-all": {
+      "rows": 1,
+      "exact": "d54f252008a3dd82",
+      "value": "92fc3e46501f3f63",
+      "query_sha256": "920525f60d268d48728aa85cafd97b0a52cd584a3a137834696f8d82308cb8ef"
+    }
+  }
+}

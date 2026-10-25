@@ -1,0 +1,4 @@
+[13:49:02] qlever: loading (log: logs/load-qlever.log)
+qlever: 9.4 s, peak RSS 1903 MiB, index 294 MiB
+[13:49:12] fluree: loading (log: logs/load-fluree.log)
+fluree: 8.9 s, peak RSS 1969 MiB, index 888 MiB

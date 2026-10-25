@@ -1,0 +1,47 @@
+{
+ "suite": "bsbm-explore",
+ "started": "2026-10-25T20:07:33Z",
+ "ended": "2026-10-25T20:14:14Z",
+ "host": {
+  "name": "forge",
+  "cpu": "13th Gen Intel(R) Core(TM) i5-13500",
+  "cpus": 20,
+  "ram_mib": 15620,
+  "disk_model": "",
+  "kernel": "7.2.9",
+  "filesystem": "ext4",
+  "mount_options": "rw,relatime,discard,errors=remount-ro"
+ },
+ "sparkles": {
+  "binary": "/home/kclejeune/lanes/competitive-births-20261025/bin/sparkles-6b7f32ce",
+  "version": "sparkles 0.1.0",
+  "sha256": "cf6f4cf5fd754c8344fd0f0c02b81dce5016c8b8ccfcbe034f5fe7927cfd46c8",
+  "scripts_commit": "unknown",
+  "binary_commit": "6b7f32ce"
+ },
+ "engines": {
+  "qlever": {
+   "license": "Apache-2.0",
+   "binary": "/nix/store/xn7f9c965zfza9nks2qzlrnx916xg3h2-qlever-0.5.48/bin/qlever-server",
+   "sha256": "8a3d2eb5259918b6a22607a012e50bf0087dfc9205e37613a03a09a1e68a10dc",
+   "version": "0.5.48",
+   "store_path": "/nix/store/xn7f9c965zfza9nks2qzlrnx916xg3h2-qlever-0.5.48",
+   "package": "qlever-0.5.48",
+   "reported_version": "/nix/store/xn7f9c965zfza9nks2qzlrnx916xg3h2-qlever-0.5.48/bin/qlever-server 0.0.0-unknown"
+  }
+ },
+ "memory_limit": "12G",
+ "client_cpu": "11",
+ "data": {
+  "bsbm-10m": {
+   "license": "GPL-3.0 generator",
+   "params": "BSBMtools0.2 products28480 fixedseed",
+   "sha256": "db77a8d62274566c0fcf6a85634741b0313551cc217b59f4b1f26d444fd205be",
+   "bytes": 2619263591
+  }
+ },
+ "license_check": {
+  "gpl_benchmark_allowed": false,
+  "notes": []
+ }
+}

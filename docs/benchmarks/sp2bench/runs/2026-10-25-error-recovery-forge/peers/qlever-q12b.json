@@ -1,0 +1,22 @@
+{
+ "results": [
+  {
+   "command": "qlever",
+   "mean": 6.68942,
+   "stddev": null,
+   "median": 6.68942,
+   "user": 0.0,
+   "system": 0.0,
+   "min": 6.68942,
+   "max": 6.68942,
+   "times": [
+    6.68942
+   ],
+   "exit_codes": [
+    22
+   ],
+   "first_request_failed": true,
+   "timed_run_failed": false
+  }
+ ]
+}

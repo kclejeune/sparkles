@@ -1,0 +1,14 @@
+{
+ "jena-tdb2": {
+  "seconds": 46.2463,
+  "max_rss_kib": 3742256,
+  "index_bytes": 1398980608,
+  "index_apparent_bytes": 1570115931
+ },
+ "fluree": {
+  "seconds": 10.6076,
+  "max_rss_kib": 3204060,
+  "index_bytes": 417484800,
+  "index_apparent_bytes": 416766998
+ }
+}

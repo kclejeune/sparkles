@@ -1,0 +1,17 @@
+{
+ "idle": {
+  "oxigraph": 32
+ },
+ "queries": {
+  "q4": {
+   "oxigraph": {
+    "before": 32,
+    "peak": 5651,
+    "delta": 5619
+   }
+  }
+ },
+ "warm": {
+  "oxigraph": 4052
+ }
+}

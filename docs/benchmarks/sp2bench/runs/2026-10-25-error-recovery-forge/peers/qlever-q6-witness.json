@@ -1,0 +1,98 @@
+{
+  "witness_version": 1,
+  "method": "Actual complete QLever q6 rows checked against independently reconstructed author earliest years from the exact NT source.",
+  "full_raw_tsv_rows": 1256087,
+  "full_raw_tsv_bytes": 131041879,
+  "full_raw_tsv_sha256": "10d9ff32c30d1d08aa7e5bb1ea680f0bf203a5cb96b669fa12f369b00a524049",
+  "source_path": "/home/kclejeune/lanes/benchmark-error-recovery-20261025/peers-20261025T174653Z/sp2b/data.nt",
+  "raw_response_path": "/home/kclejeune/lanes/benchmark-error-recovery-20261025/peers-20261025T174653Z/sp2b/raw-answers/q6.qlever.tsv",
+  "oracle_script_sha256": "97f359ccd2cc73fc57be01017c6f1c6453e5ec6d8d2645af0aee4bd9fb3c3f87",
+  "datatype_contract": "The source oracle explicitly checks all issued terms as xsd:integer and names as xsd:string; documents are IRIs.",
+  "examples": [
+    {
+      "row": 1,
+      "document": "<http://localhost/publications/inprocs/Proceeding1/1995/Inproceeding9>",
+      "name": "Paul Erdoes",
+      "actual_year": 1995,
+      "raw_tsv": "1995\t\"Paul Erdoes\"\t<http://localhost/publications/inprocs/Proceeding1/1995/Inproceeding9>",
+      "authors": [
+        {
+          "author": "<http://localhost/persons/Paul_Erdoes>",
+          "earliest_year": 1950,
+          "earlier_document": "<http://localhost/publications/inprocs/Proceeding1/1950/Inproceeding5>",
+          "earlier_issued_source_terms": [
+            "\"1950\"^^<http://www.w3.org/2001/XMLSchema#integer>"
+          ]
+        }
+      ]
+    },
+    {
+      "row": 2,
+      "document": "<http://localhost/publications/inprocs/Proceeding1/1996/Inproceeding1>",
+      "name": "Paul Erdoes",
+      "actual_year": 1996,
+      "raw_tsv": "1996\t\"Paul Erdoes\"\t<http://localhost/publications/inprocs/Proceeding1/1996/Inproceeding1>",
+      "authors": [
+        {
+          "author": "<http://localhost/persons/Paul_Erdoes>",
+          "earliest_year": 1950,
+          "earlier_document": "<http://localhost/publications/inprocs/Proceeding1/1950/Inproceeding5>",
+          "earlier_issued_source_terms": [
+            "\"1950\"^^<http://www.w3.org/2001/XMLSchema#integer>"
+          ]
+        }
+      ]
+    },
+    {
+      "row": 3,
+      "document": "<http://localhost/publications/inprocs/Proceeding1/1977/Inproceeding1>",
+      "name": "Paul Erdoes",
+      "actual_year": 1977,
+      "raw_tsv": "1977\t\"Paul Erdoes\"\t<http://localhost/publications/inprocs/Proceeding1/1977/Inproceeding1>",
+      "authors": [
+        {
+          "author": "<http://localhost/persons/Paul_Erdoes>",
+          "earliest_year": 1950,
+          "earlier_document": "<http://localhost/publications/inprocs/Proceeding1/1950/Inproceeding5>",
+          "earlier_issued_source_terms": [
+            "\"1950\"^^<http://www.w3.org/2001/XMLSchema#integer>"
+          ]
+        }
+      ]
+    },
+    {
+      "row": 4,
+      "document": "<http://localhost/publications/inprocs/Proceeding1/1977/Inproceeding10>",
+      "name": "Paul Erdoes",
+      "actual_year": 1977,
+      "raw_tsv": "1977\t\"Paul Erdoes\"\t<http://localhost/publications/inprocs/Proceeding1/1977/Inproceeding10>",
+      "authors": [
+        {
+          "author": "<http://localhost/persons/Paul_Erdoes>",
+          "earliest_year": 1950,
+          "earlier_document": "<http://localhost/publications/inprocs/Proceeding1/1950/Inproceeding5>",
+          "earlier_issued_source_terms": [
+            "\"1950\"^^<http://www.w3.org/2001/XMLSchema#integer>"
+          ]
+        }
+      ]
+    },
+    {
+      "row": 5,
+      "document": "<http://localhost/publications/inprocs/Proceeding1/1977/Inproceeding2>",
+      "name": "Paul Erdoes",
+      "actual_year": 1977,
+      "raw_tsv": "1977\t\"Paul Erdoes\"\t<http://localhost/publications/inprocs/Proceeding1/1977/Inproceeding2>",
+      "authors": [
+        {
+          "author": "<http://localhost/persons/Paul_Erdoes>",
+          "earliest_year": 1950,
+          "earlier_document": "<http://localhost/publications/inprocs/Proceeding1/1950/Inproceeding5>",
+          "earlier_issued_source_terms": [
+            "\"1950\"^^<http://www.w3.org/2001/XMLSchema#integer>"
+          ]
+        }
+      ]
+    }
+  ]
+}

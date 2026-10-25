@@ -1,0 +1,29 @@
+Initialized Fluree in /home/kclejeune/lanes/benchmark-error-recovery-20261025/peers-20261025T174653Z/sp2b/fluree/.fluree
+Import settings: memory budget 8192 MB, parallelism 20 (auto), chunk size 16 MB
+  Override with --memory-budget-mb and --parallelism
+
+
+About ledger 'bench':
+Imported 10.0M flakes in 8.68s (1.15 M flakes/s) across 90 commits (t=90)
+
+  Top classes:
+         773,595  http://xmlns.com/foaf/0.1/Person
+         559,791  http://localhost/vocabulary/bench/Inproceedings
+         350,946  http://localhost/vocabulary/bench/Article
+           9,783  http://localhost/vocabulary/bench/Proceedings
+           7,328  rdf:Bag
+
+  Top properties:
+       1,996,701  http://purl.org/dc/elements/1.1/creator
+       1,712,633  rdf:type
+         931,709  http://purl.org/dc/elements/1.1/title
+         922,623  http://xmlns.com/foaf/0.1/homepage
+         857,821  http://swrc.ontoware.org/ontology#pages
+
+  Top connections:
+       1,248,114  http://localhost/vocabulary/bench/Inproceedings -> http://purl.org/dc/elements/1.1/creator -> http://xmlns.com/foaf/0.1/Person
+         740,355  http://localhost/vocabulary/bench/Article -> http://purl.org/dc/elements/1.1/creator -> http://xmlns.com/foaf/0.1/Person
+         448,411  http://localhost/vocabulary/bench/Inproceedings -> http://purl.org/dc/terms/partOf -> http://localhost/vocabulary/bench/Proceedings
+         350,946  http://localhost/vocabulary/bench/Article -> http://swrc.ontoware.org/ontology#journal -> http://localhost/vocabulary/bench/Journal
+          18,438  http://localhost/vocabulary/bench/Proceedings -> http://swrc.ontoware.org/ontology#editor -> http://xmlns.com/foaf/0.1/Person
+

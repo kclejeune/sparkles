@@ -1,0 +1,228 @@
+{
+ "sparkles": {
+  "1": {
+   "query": "explore-mix-select",
+   "status": "ok",
+   "driver_status": "ok",
+   "qmph": 38211.76,
+   "runs": 500,
+   "seconds": 47.106,
+   "timeouts": 0,
+   "avgresults": {
+    "1": 2.99,
+    "2": 21.24,
+    "3": 1.82,
+    "4": 1.55,
+    "5": 4.99,
+    "7": 13.8,
+    "8": 5.06,
+    "10": 1.98,
+    "11": 10.0
+   }
+  },
+  "4": {
+   "query": "explore-mix-select",
+   "status": "ok",
+   "driver_status": "ok",
+   "qmph": 171933.95,
+   "runs": 500,
+   "seconds": 10.469,
+   "timeouts": 0,
+   "avgresults": {
+    "1": 2.99,
+    "2": 21.24,
+    "3": 1.82,
+    "4": 1.55,
+    "5": 5.0,
+    "7": 13.8,
+    "8": 5.06,
+    "10": 1.98,
+    "11": 10.0
+   }
+  },
+  "16": {
+   "query": "explore-mix-select",
+   "status": "ok",
+   "driver_status": "ok",
+   "qmph": 206847.42,
+   "runs": 500,
+   "seconds": 8.702,
+   "timeouts": 0,
+   "avgresults": {
+    "1": 2.99,
+    "2": 21.24,
+    "3": 1.82,
+    "4": 1.55,
+    "5": 5.0,
+    "7": 13.8,
+    "8": 5.06,
+    "10": 1.98,
+    "11": 10.0
+   }
+  }
+ },
+ "jena-fuseki": {
+  "1": {
+   "query": "explore-mix-select",
+   "status": "ok",
+   "driver_status": "ok",
+   "qmph": 2105.26,
+   "runs": 500,
+   "seconds": 855.001,
+   "timeouts": 0,
+   "avgresults": {
+    "1": 2.99,
+    "2": 21.24,
+    "3": 1.82,
+    "4": 1.55,
+    "5": 4.99,
+    "7": 13.8,
+    "8": 5.06,
+    "10": 1.98,
+    "11": 10.0
+   }
+  },
+  "4": {
+   "query": "explore-mix-select",
+   "status": "ok",
+   "driver_status": "ok",
+   "qmph": 3237.19,
+   "runs": 500,
+   "seconds": 556.037,
+   "timeouts": 0,
+   "avgresults": {
+    "1": 2.99,
+    "2": 21.24,
+    "3": 1.82,
+    "4": 1.55,
+    "5": 5.0,
+    "7": 13.8,
+    "8": 5.06,
+    "10": 1.98,
+    "11": 10.0
+   }
+  },
+  "16": {
+   "query": "explore-mix-select",
+   "status": "error",
+   "driver_status": "error",
+   "qmph": null
+  }
+ },
+ "qlever": {
+  "1": {
+   "query": "explore-mix-select",
+   "status": "error",
+   "driver_status": "error",
+   "qmph": null
+  },
+  "4": {
+   "query": "explore-mix-select",
+   "status": "error",
+   "driver_status": "error",
+   "qmph": null
+  },
+  "16": {
+   "query": "explore-mix-select",
+   "status": "error",
+   "driver_status": "error",
+   "qmph": null
+  }
+ },
+ "fluree": {
+  "1": {
+   "query": "explore-mix-select",
+   "status": "ok",
+   "driver_status": "ok",
+   "qmph": 103488.66,
+   "runs": 500,
+   "seconds": 17.393,
+   "timeouts": 0,
+   "avgresults": {
+    "1": 2.99,
+    "2": 21.24,
+    "3": 1.82,
+    "4": 1.55,
+    "5": 4.99,
+    "7": 13.8,
+    "8": 5.06,
+    "10": 1.98,
+    "11": 10.0
+   }
+  },
+  "4": {
+   "query": "explore-mix-select",
+   "status": "ok",
+   "driver_status": "ok",
+   "qmph": 329815.64,
+   "runs": 500,
+   "seconds": 5.458,
+   "timeouts": 0,
+   "avgresults": {
+    "1": 2.99,
+    "2": 21.24,
+    "3": 1.82,
+    "4": 1.55,
+    "5": 5.0,
+    "7": 13.8,
+    "8": 5.06,
+    "10": 1.98,
+    "11": 10.0
+   }
+  },
+  "16": {
+   "query": "explore-mix-select",
+   "status": "ok",
+   "driver_status": "ok",
+   "qmph": 662847.46,
+   "runs": 500,
+   "seconds": 2.716,
+   "timeouts": 0,
+   "avgresults": {
+    "1": 2.99,
+    "2": 21.24,
+    "3": 1.82,
+    "4": 1.55,
+    "5": 5.0,
+    "7": 13.8,
+    "8": 5.06,
+    "10": 1.98,
+    "11": 10.0
+   }
+  }
+ },
+ "oxigraph": {
+  "1": {
+   "query": "explore-mix-select",
+   "status": "error",
+   "driver_status": "error",
+   "qmph": null
+  },
+  "4": {
+   "query": "explore-mix-select",
+   "status": "ok",
+   "driver_status": "ok",
+   "qmph": 74102.26,
+   "runs": 500,
+   "seconds": 24.291,
+   "timeouts": 0,
+   "avgresults": {
+    "1": 2.99,
+    "2": 21.24,
+    "3": 1.82,
+    "4": 1.55,
+    "5": 5.0,
+    "7": 13.8,
+    "8": 5.06,
+    "10": 1.98,
+    "11": 10.0
+   }
+  },
+  "16": {
+   "query": "explore-mix-select",
+   "status": "error",
+   "driver_status": "error",
+   "qmph": null
+  }
+ }
+}

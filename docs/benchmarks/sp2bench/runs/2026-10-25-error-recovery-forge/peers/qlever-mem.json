@@ -1,0 +1,115 @@
+{
+ "idle": {
+  "qlever": 44
+ },
+ "queries": {
+  "q1": {
+   "qlever": {
+    "before": 44,
+    "peak": 65,
+    "delta": 21
+   }
+  },
+  "q2": {
+   "qlever": {
+    "before": 67,
+    "peak": 285,
+    "delta": 218
+   }
+  },
+  "q3a": {
+   "qlever": {
+    "before": 199,
+    "peak": 268,
+    "delta": 69
+   }
+  },
+  "q3b": {
+   "qlever": {
+    "before": 263,
+    "peak": 268,
+    "delta": 5
+   }
+  },
+  "q3c": {
+   "qlever": {
+    "before": 268,
+    "peak": 273,
+    "delta": 5
+   }
+  },
+  "q5b": {
+   "qlever": {
+    "before": 273,
+    "peak": 487,
+    "delta": 214
+   }
+  },
+  "q6": {
+   "qlever": {
+    "before": 269,
+    "peak": 571,
+    "delta": 302
+   }
+  },
+  "q7": {
+   "qlever": {
+    "before": 468,
+    "peak": 795,
+    "delta": 327
+   }
+  },
+  "q8": {
+   "qlever": {
+    "before": 486,
+    "peak": 6875,
+    "delta": 6389
+   }
+  },
+  "q9": {
+   "qlever": {
+    "before": 626,
+    "peak": 839,
+    "delta": 213
+   }
+  },
+  "q10": {
+   "qlever": {
+    "before": 661,
+    "peak": 661,
+    "delta": 0
+   }
+  },
+  "q11": {
+   "qlever": {
+    "before": 659,
+    "peak": 687,
+    "delta": 28
+   }
+  },
+  "q12a": {
+   "qlever": {
+    "before": 687,
+    "peak": 770,
+    "delta": 83
+   }
+  },
+  "q12b": {
+   "qlever": {
+    "before": 705,
+    "peak": 7261,
+    "delta": 6556
+   }
+  },
+  "q12c": {
+   "qlever": {
+    "before": 834,
+    "peak": 834,
+    "delta": 0
+   }
+  }
+ },
+ "warm": {
+  "qlever": 829
+ }
+}

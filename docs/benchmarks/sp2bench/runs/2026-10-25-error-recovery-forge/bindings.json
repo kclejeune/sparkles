@@ -1,0 +1,68 @@
+{
+  "bindings_version": 1,
+  "host": "forge",
+  "scale": "10m",
+  "engine": "sparkles",
+  "dataset": "sp2bench-10m",
+  "source_sha256": "4486653f3ea16825923eb8a5410137df7ba712aa918442531c33cbeb854eb814",
+  "binary_commit": "6b7f32ce",
+  "binary_sha256": "cf6f4cf5fd754c8344fd0f0c02b81dce5016c8b8ccfcbe034f5fe7927cfd46c8",
+  "settings": {
+    "warmup": 2,
+    "runs": 10,
+    "timer": "hyperfine+curl",
+    "resultCache": false
+  },
+  "queries": {
+    "q4": {
+      "sha256": "ba7af5ada891455f72ba06917c031e25c9c1ffdf0f87c4f6e475623950ade60d",
+      "runs": 10,
+      "timing_role": "q4_timing"
+    },
+    "q6": {
+      "sha256": "e635ca91c381cfa5def7a93737e283a4ff9fc697385ac595e3b76338550ede65",
+      "runs": 10,
+      "timing_role": "q6_timing"
+    }
+  },
+  "inputs": {
+    "raw_record": {
+      "path": "sparkles-record.json",
+      "sha256": "ae65db698406de6950d43f68aede39d37d20977dfa0e6de37dd3311109624d27"
+    },
+    "raw_answers": {
+      "path": "sparkles-answers.json",
+      "sha256": "e9cfb12c86e82090115826b4f2e84eb18d1c2fbce00b7e6e5800a60f82ce80e0"
+    },
+    "oracle": {
+      "path": "oracle.json",
+      "sha256": "6f5e9d7b004948e2ead2ad686099f41151626641f9015e3e7adede4282f0cdd0"
+    },
+    "q4_timing": {
+      "path": "sparkles-q4-timing.json",
+      "sha256": "babd43ffa53427af8b860e2dcd62400453a0a19b940faac81c44ceea6a442fcf"
+    },
+    "q6_timing": {
+      "path": "sparkles-q6-timing.json",
+      "sha256": "797cb5d0eeeb6256c1e9d1a1a180dfaa55ca4764cbe8d9bc1275258657c5007c"
+    }
+  },
+  "oracle_generator": {
+    "source_revision": "a44bdabfbe7499abe3d439a6f2bec18b12247209",
+    "script": "scripts/bench-sp2b/oracle.py",
+    "sha256": "97f359ccd2cc73fc57be01017c6f1c6453e5ec6d8d2645af0aee4bd9fb3c3f87"
+  },
+  "measurement_controls": {
+    "sparkles_args": "--max-result-mb 4096",
+    "max_time_s": 600,
+    "server_timeout_s": 615,
+    "server_memory_cap": "12G",
+    "engines_isolated_for_correctness_and_timing": true,
+    "answer_algorithm": "row-sha256-v1; complete TSV; external sort64MiB",
+    "timing": "hyperfine curl full TSV to /dev/null; no fingerprints in timing",
+    "warmup": 2,
+    "runs": 10,
+    "runtime_binary_revision": "6b7f32ce",
+    "index_source": "Copied preserved SP2Bench store from competitive-losses-20261024/query-competitors-20261025T042932Z/sp2b/sparkles.db. Selected answers independently match the NT source oracle."
+  }
+}

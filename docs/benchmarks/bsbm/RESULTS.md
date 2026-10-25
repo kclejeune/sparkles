@@ -70,9 +70,27 @@ answers to q8, q11 and q12 disagree with the other engines.
 | Standard QMpH | 1 | 45,077 | 2,047 | error | 95,969 † | 15,622 |
 | Standard QMpH | 4 | 165,605 | 3,173 | error | 304,636 † | error |
 | Standard QMpH | 16 | 200,083 | 2,012 | error | 579,271 † | error |
-| SELECT-only QMpH | 1 | 36,687 | 2,105 | error | 103,489 † | error |
+| SELECT-only QMpH | 1 | 36,687 | 2,105 | error | 103,489 † | 18,144 |
 | SELECT-only QMpH | 4 | 169,528 | 3,237 | error | 329,816 † | 74,102 |
 | SELECT-only QMpH | 16 | 203,454 | error | error | 662,847 † | error |
+
+The recovered Oxigraph one-client SELECT-only cell comes from a fresh isolated Forge
+[driver record](runs/2026-10-25-error-recovery-explore-forge/isolated/oxigraph/results/record.json)
+with a 12 GiB server cap. It completes fifty warm-up mixes and all five hundred measured
+mixes with no timeouts. All nine per-query average result counts exactly match the
+retained Sparkles, Jena and Fluree references. The [validation receipt](runs/2026-10-25-error-recovery-explore-forge/validation.json)
+keeps the official driver version, source hash and raw XML. These counts and the retained
+fixed-instance answer checks screen for differences; they do not prove every generated
+solution correct.
+
+QLever's fresh isolated SELECT-only retry terminates with a native segmentation fault
+after 256 measured mixes. A conservative retry with caching disabled and one query slot
+also terminates with a segmentation fault after 292 measured mixes. Both retain
+`qmph=null`. The earlier failed fixed query answers successfully as JSON and XML in
+isolation, so the incomplete driver result is a server crash rather than an unsupported
+SELECT response format. The [crash-context receipts](runs/2026-10-25-error-recovery-explore-forge/validation.json)
+retain the last requests and actual process signal. The standard mix's RDF/XML refusal
+and the other incomplete driver cells remain missing comparisons.
 
 The 100M scale has not been measured.
 
@@ -140,7 +158,7 @@ fifty warm-up mixes and five hundred measured mixes at each client count, with a
 
 | BI QMpH | Clients | Sparkles | Jena | QLever | Fluree | Oxigraph |
 |---|---:|---:|---:|---:|---:|---:|
-| Standard mix | 1 | error | timeout | error | timeout | timeout |
+| Standard mix | 1 | timeout * | timeout | error | timeout | timeout |
 | Standard mix | 4 | error | timeout | error | 2,174 † | timeout |
 | Standard mix | 16 | error | timeout | error | 3,143 † | timeout |
 
@@ -150,8 +168,16 @@ At sixteen clients, q2 instances of about 450 MB each queued for the pool and so
 the admission wait. The current engine streams that q4 instance and answers it in 15.1 s
 with a peak resident size of 282 MB under the default pool, where eager execution takes
 17.7 s and 8.3 GB, and a request larger than the whole pool answers `507` without
-`Retry-After` ([roadmap](../../ROADMAP.md) item 96). The driver cells have not been rerun with
-it. QLever's driver failed with a refused connection at one client and HTTP 500 at four and
+`Retry-After` ([roadmap](../../ROADMAP.md) item 96). A one-client retry at identified build `6b7f32ce` first reaches a different budget:
+a generated BI `q6` requests 200,003,584 intermediate rows against the default limit of
+200 million. Enabling spill does not change that row limit. A benchmark-only
+`--max-rows 1000000000` completes that exact query with ten bindings, but the full driver
+still reaches its 1,800 s wall limit after 218 of 500 measured mixes. The starred timeout
+uses this larger row allowance and the 12 GiB server cap. The [raw record and receipt](runs/2026-10-25-error-recovery-forge/validation.json)
+retain the HTTP bodies, exact query, partial-mix count and null throughput. The single
+completed query is a feasibility result without a numeric oracle or competing answer;
+it is not a ranked latency measurement. Other client counts retain their own original
+failures. QLever's driver failed with a refused connection at one client and HTTP 500 at four and
 sixteen clients. Jena and Oxigraph timed out at every client count. Fluree alone completed
 two driver cells, but their result-count check has no successful competing engine to
 compare, and its fixed q2, q3 and q8 answers have unresolved disagreements, so its QMpH figures are not

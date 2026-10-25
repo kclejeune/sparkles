@@ -1,0 +1,12 @@
+{
+ "settings": {
+  "maxTimeSeconds": 1800,
+  "serverTimeoutSeconds": 1815,
+  "sparklesArgs": "--max-result-mb 4096",
+  "answerStreamTSVQueries": "q4 q6",
+  "correctnessEngineIsolation": true,
+  "jenaHeap": "8G",
+  "jenaStack": "default",
+  "qleverMemory": "8G"
+ }
+}

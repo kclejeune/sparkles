@@ -1,0 +1,22 @@
+{
+  "settings": {
+    "bsbmWarmup": 50,
+    "bsbmRuns": 500,
+    "bsbmClients": [
+      1
+    ],
+    "bsbmMaxTimeSeconds": 1800,
+    "requestTimeoutSeconds": 300,
+    "serverTimeoutSeconds": 315,
+    "qleverMemory": "8G",
+    "serverMemoryCap": "12G"
+  },
+  "driver_contract": {
+    "class": "benchmark.testdriver.TestDriver",
+    "usecase": "explore-select",
+    "jdk": "17.0.20.1+1",
+    "driver_heap": "2g",
+    "http_keepalive": false,
+    "correctness": "Full driver average counts require comparison before ranking; direct failed-query probes are preserved separately."
+  }
+}

@@ -1,0 +1,15 @@
+{
+ "results": [
+  {
+   "command": "oxigraph",
+   "mean": 23.4818,
+   "stddev": 0.0,
+   "times": [
+    23.4818
+   ],
+   "exit_codes": [
+    0
+   ]
+  }
+ ]
+}

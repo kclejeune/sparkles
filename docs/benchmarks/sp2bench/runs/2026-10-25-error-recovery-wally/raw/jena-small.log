@@ -1,0 +1,20 @@
+[15:04:10] dataset: 10000091 triples
+
+rows              jena-fuseki
+q8                        656
+q12b                        1
+[15:04:22] jena: warm-up pass over the selected queries
+
+== q8
+Benchmark 1: jena-fuseki
+  Time (mean ± σ):      53.2 ms ±  17.4 ms    [User: 3.2 ms, System: 2.6 ms]
+  Range (min … max):    33.0 ms …  79.1 ms    10 runs
+ 
+
+== q12b
+Benchmark 1: jena-fuseki
+  Time (mean ± σ):      12.0 ms ±   1.1 ms    [User: 2.1 ms, System: 2.6 ms]
+  Range (min … max):    10.9 ms …  14.0 ms    10 runs
+ 
+results/record.json: 2 results
+[15:04:25] record: /home/kclejeune/lanes/benchmark-error-recovery-20261025/sp2b-20261025T183539Z/jena/results/record.json, table: /home/kclejeune/lanes/benchmark-error-recovery-20261025/sp2b-20261025T183539Z/jena/results/summary.md

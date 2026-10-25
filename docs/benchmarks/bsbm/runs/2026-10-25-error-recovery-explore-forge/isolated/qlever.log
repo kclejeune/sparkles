@@ -1,0 +1,4 @@
+[15:49:39] qlever: loading (log: logs/load-qlever.log)
+qlever: 10.8 s, peak RSS 1988 MiB, index 384 MiB
+/home/kclejeune/lanes/benchmark-error-recovery-20261025/src-reviewed/scripts/bench-lib.sh: line 241: 1948996 Segmentation fault         (core dumped) ( cd "$(store_of qlever)" && exec "${CAP[@]}" "$QSERVER" -i bench -p "$p" -m "${QLEVER_MEMORY:-8G}" -c 2G -e 0B -s "${SERVER_TIMEOUT}s" -a bench -j 16 >> server.log 2>&1 )
+results/record.json: 1 results
