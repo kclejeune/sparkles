@@ -15,6 +15,7 @@ import tempfile
 import threading
 import time
 import unittest
+import unittest.mock
 
 SCRIPTS = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 PATH = os.path.join(SCRIPTS, "bench-answers.py")
@@ -486,6 +487,18 @@ class RequestTests(unittest.TestCase):
         bad, _ = self.answer("/tsv-short", "SELECT ?x {}", flags=("--stream-tsv",))
         self.assertEqual(bad["rows"], "error")
         self.assertIn("incomplete HTTP", bad["error"])
+
+    def test_post_response_sorting_is_outside_the_request_deadline(self):
+        original = ba.sorted_row_digest
+
+        def slow_sort(*args):
+            time.sleep(0.3)
+            return original(*args)
+
+        req = ba.urllib.request.Request(f"http://127.0.0.1:{self.server.server_address[1]}/tsv", data=b"query=SELECT")
+        with unittest.mock.patch.object(ba, "sorted_row_digest", slow_sort):
+            record = ba.fetch(req, 0.2, lambda response, done: ba.streamed_tsv_record(response, "SELECT ?x {}", False, finish_response=done))
+        self.assertEqual(record["rows"], 2)
 
     def test_the_whole_request_has_a_deadline(self):
         rec, took = self.answer("/slow", "SELECT ?x { ?s ?p ?x }", max_time="1")

@@ -619,9 +619,11 @@ class Deadline(Exception):
 
 
 def fetch(req, seconds, consume=None):
-    """The whole response body, or Deadline when it takes longer than `seconds` altogether. The
-    socket timeout of urlopen limits each wait, and a server that keeps sending slowly would
-    pass it, so an interval timer enforces the total."""
+    """The whole response body, or Deadline when it takes longer than `seconds` altogether.
+
+    A streaming consumer receives a callback to end the request deadline once it has
+    validated the complete HTTP body. Its later disk sorting is outside that deadline.
+    """
     def expire(*_):
         raise Deadline(f"no complete answer in {seconds:g} s")
 
@@ -629,7 +631,7 @@ def fetch(req, seconds, consume=None):
     signal.setitimer(signal.ITIMER_REAL, seconds)
     try:
         with urllib.request.urlopen(req, timeout=seconds) as r:
-            return consume(r) if consume else r.read()
+            return consume(r, lambda: signal.setitimer(signal.ITIMER_REAL, 0)) if consume else r.read()
     finally:
         signal.setitimer(signal.ITIMER_REAL, 0)
         signal.signal(signal.SIGALRM, old)
@@ -685,7 +687,7 @@ def canonical_tsv_field(text):
     return repr(term(parsed, False)), repr(term(parsed, True))
 
 
-def streamed_tsv_record(response, query, count_only, raw_path=None):
+def streamed_tsv_record(response, query, count_only, raw_path=None, finish_response=None):
     """Consume a complete unordered SELECT response with one row in memory.
 
     Disk holds one SHA-256 per solution, and a second copy only when value normalization
@@ -738,6 +740,8 @@ def streamed_tsv_record(response, query, count_only, raw_path=None):
                             value.write(eh if ex == va else hashlib.sha256(va).hexdigest().encode() + b"\n")
                     if getattr(response, "length", 0):
                         raise ValueError("incomplete HTTP response body")
+                    if finish_response:
+                        finish_response()
             finally:
                 if value is not None:
                     value.close()
@@ -786,7 +790,7 @@ def main():
     try:
         if stream_tsv:
             rec = fetch(request(query), max_time,
-                        lambda response: streamed_tsv_record(response, query, count_only, raw_path))
+                        lambda response, done: streamed_tsv_record(response, query, count_only, raw_path, done))
         else:
             rec = None
             body = fetch(request(query), max_time)
