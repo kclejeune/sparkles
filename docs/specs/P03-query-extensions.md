@@ -393,3 +393,18 @@ over 100,000 rows returns the right values with at most 100 foreign calls; a Jen
 function marked pure runs natively with the same answer as its ARQ fallback; `fn:apply`
 with a variable IRI that names a registered function calls it and the query is not
 cached.
+
+### Callback context during thread destruction
+
+A remaining lifecycle gap affects thread-local owners registered before their first
+store access. The callback-family key can be destroyed before a snapshot is taken
+from an owner's destructor, causing a process abort. This predates the incremental
+view operation-tracking repair. Roadmap item 25 covers keeping the bookkeeping
+available through thread destruction while preserving captured-view and snapshot-family
+checks.
+
+Acceptance includes a subprocess that registers its thread-local owner before the
+first `Store::snapshot`, takes a snapshot from that owner's destructor and exits
+normally. Active and nested callbacks must retain their captured-view restrictions
+and reject a snapshot from the wrong family. Failure to access the tracking key must
+not silently bypass those checks.

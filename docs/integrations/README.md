@@ -57,6 +57,9 @@ dependencies are recorded in the [central roadmap](../ROADMAP.md).
   no Windows or Intel macOS packages, and Linux is the platform tested locally. The JVM
   library has no musl build. Roadmap item 58.
 * JVM functions registered in Java run through ARQ. Roadmap item 25.
+* Taking a store snapshot from a thread-local destructor can abort if callback-family
+  tracking has already been destroyed. Roadmap item 25 covers keeping those checks
+  available during thread destruction.
 
 ## Configuration and usage
 
