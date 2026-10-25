@@ -1,5 +1,4 @@
 {
- "record": 1,
  "suite": "bounded-durable-write-assessment",
  "baseline_runtime_commit": "4f2e1633",
  "process_count": 16,
@@ -532,5 +531,7 @@
   "mixed": "One new-literal writer and16 unpaced star-join readers for30seconds; count completedHTTP200/elapsed, record16 cancellation attempts separately",
   "correctness": "All80000 before/after churn state checks and all Sparkles offline checks pass; initial mixed reader bags agree. Mixed run has no separate post-restart state oracle. No crash/power-loss evidence is inferred.",
   "scope": "Bounded assessment only. No production write optimization was kept or measured as a candidate. Measurements are not an equal completed-read-work comparison."
- }
+ },
+ "assessment_version": 1,
+ "format_note": "Supplemental assessment with raw samples and diagnostics, not a scripts/bench-record.py suite record."
 }

@@ -1,5 +1,4 @@
 {
- "record": 1,
  "suite": "cursor-bind-reuse-assessment",
  "host": {
   "name": "forge",
@@ -15184,5 +15183,23 @@
    "format_version": 2,
    "source": "Read-only clone of retained full generation0002; immutable files shared, mutable state copied independently. No full-source oracle is asserted."
   }
- }
+ },
+ "assessment_version": 1,
+ "published_runtime": {
+  "commit": "5dc001369b329d6245a78f44b4e6d474e6a2db02",
+  "measured_source": "6b7f32ce",
+  "equivalence": "Runtime sources match the published revision exactly. Independent git diff6b7f32ce..5dc00136 over crates,vendor,ui,js,jvm,Cargo.toml,Cargo.lock,build.rs exits0. The measured binary/archive identities remain unchanged; this is source equivalence, not a claim that5dc was rebuilt or timed.",
+  "compared_paths": [
+   "crates",
+   "vendor",
+   "ui",
+   "js",
+   "jvm",
+   "Cargo.toml",
+   "Cargo.lock",
+   "build.rs"
+  ],
+  "git_diff_exit": 0
+ },
+ "format_note": "Supplemental assessment with raw samples and diagnostics, not a scripts/bench-record.py suite record."
 }
