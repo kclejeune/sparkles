@@ -924,3 +924,232 @@ async fn recall_marks_conflicts() {
     assert_eq!(j["conflicts"][0]["p"], "org:memberOf", "{j}");
     assert_eq!(j["conflicts"][0]["values"].as_array().unwrap().len(), 2);
 }
+
+#[tokio::test(flavor = "multi_thread")]
+async fn link_evidence_exposes_retained_details_beyond_the_display() {
+    let ttl = r#"@prefix ex: <http://example.org/> .
+        @prefix rdfs: <http://www.w3.org/2000/01/rdf-schema#> .
+        @prefix skos: <http://www.w3.org/2004/02/skos/core#> .
+        ex:item a ex:A, ex:B, ex:C, ex:WikimediaDisambiguation ;
+          rdfs:label "Berlin"@en ; skos:altLabel "Alias1", "Alias2", "Alias3", "Alias4" ."#;
+    let mut c = Client::start(server_with(&[("t", &[ttl])], McpConfig::default()));
+    let plain = c
+        .structured("link_entities", json!({"mentions":[{"text":"Berlin"}]}))
+        .await;
+    assert!(plain["mentions"][0].get("evidence").is_none());
+    assert!(
+        plain["mentions"][0]["candidates"][0]
+            .get("evidence")
+            .is_none()
+    );
+    let result = c
+        .structured(
+            "link_entities",
+            json!({"mentions":[{"text":"Berlin"}],"evidence":true}),
+        )
+        .await;
+    let mention = &result["mentions"][0];
+    assert_eq!(mention["verdict"], plain["mentions"][0]["verdict"]);
+    assert_eq!(mention["evidence"]["version"], 1);
+    assert_eq!(
+        mention["evidence"]["exactStringLabelsComplete"], true,
+        "{result}"
+    );
+    assert_eq!(mention["evidence"]["candidateUniverseComplete"], false);
+    assert_eq!(mention["evidence"]["normalizedLabelsComplete"], false);
+    let candidate = &mention["candidates"][0];
+    assert_eq!(candidate["types"].as_array().unwrap().len(), 3);
+    assert_eq!(candidate["altLabels"].as_array().unwrap().len(), 3);
+    let evidence = &candidate["evidence"];
+    assert_eq!(evidence["version"], 1);
+    assert_eq!(evidence["types"].as_array().unwrap().len(), 4);
+    assert!(
+        evidence["types"]
+            .to_string()
+            .contains("WikimediaDisambiguation")
+    );
+    assert_eq!(evidence["typesComplete"], true);
+    assert_eq!(evidence["labelsComplete"], true);
+    assert_eq!(evidence["labels"].as_array().unwrap().len(), 5);
+    for alias in ["Alias1", "Alias2", "Alias3", "Alias4"] {
+        assert!(evidence["labels"].to_string().contains(alias));
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn link_evidence_retains_full_terms_beyond_presentation_character_limits() {
+    let entity_iri = format!("urn:entity:{}", "z".repeat(400));
+    let type_iri = format!("urn:type:{}", "x".repeat(400));
+    let label = format!("{}\"\nend", "a".repeat(400));
+    let ttl = format!(
+        "<{entity_iri}> a <{type_iri}> ; <http://www.w3.org/2000/01/rdf-schema#label> \"Berlin\"@en ; <http://www.w3.org/2004/02/skos/core#altLabel> {} .",
+        oxrdf::Literal::new_simple_literal(&label)
+    );
+    let mut c = Client::start(server_with(&[("t", &[&ttl])], McpConfig::default()));
+    let result = c
+        .structured(
+            "link_entities",
+            json!({"mentions":[{"text":"Berlin"}],"evidence":true}),
+        )
+        .await;
+    let candidate = &result["mentions"][0]["candidates"][0];
+    assert!(candidate["types"][0].as_str().unwrap().contains("…"));
+    assert!(candidate["iri"].as_str().unwrap().contains("…"));
+    assert_eq!(candidate["evidence"]["iri"], entity_iri);
+    assert_eq!(candidate["evidence"]["types"][0], type_iri);
+    assert_eq!(candidate["evidence"]["typesComplete"], true);
+    assert_eq!(candidate["evidence"]["labelsComplete"], true);
+    assert!(
+        candidate["evidence"]["labels"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|entry| entry["term"] == oxrdf::Literal::new_simple_literal(&label).to_string())
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn link_evidence_distinguishes_display_and_exact_lookup_caps() {
+    for (entities, k, exact_complete) in [(4, 3, true), (51, 2, false)] {
+        let mut ttl = String::new();
+        for n in 0..entities {
+            ttl.push_str(&format!(
+                "<urn:item{n:03}> <http://www.w3.org/2000/01/rdf-schema#label> \"Berlin\"@en .\n"
+            ));
+        }
+        let mut c = Client::start(server_with(&[("t", &[&ttl])], McpConfig::default()));
+        let result = c
+            .structured(
+                "link_entities",
+                json!({"mentions":[{"text":"Berlin"}],"k":k,"evidence":true}),
+            )
+            .await;
+        let mention = &result["mentions"][0];
+        assert_eq!(mention["verdict"], "ambiguous");
+        assert_eq!(mention["candidates"].as_array().unwrap().len(), k);
+        assert_eq!(mention["evidence"]["observedCandidates"], entities.min(50));
+        assert_eq!(mention["evidence"]["displayTruncated"], true);
+        assert_eq!(
+            mention["evidence"]["exactStringLabelsComplete"], exact_complete,
+            "{result}"
+        );
+        assert_eq!(mention["evidence"]["candidateUniverseComplete"], false);
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn link_evidence_marks_per_subject_and_global_detail_caps() {
+    for (type_count, label_count, global_cap) in [(25, 25, false), (41, 100, true)] {
+        let mut ttl = String::from(
+            "<urn:a> <http://www.w3.org/2000/01/rdf-schema#label> \"Berlin\"@en .\n<urn:b> <http://www.w3.org/2000/01/rdf-schema#label> \"Berlin\"@en ; a <urn:TypeB> .\n",
+        );
+        for n in 0..type_count {
+            ttl.push_str(&format!("<urn:a> a <urn:Type{n:03}> .\n"));
+        }
+        for n in 0..label_count {
+            ttl.push_str(&format!(
+                "<urn:a> <http://www.w3.org/2000/01/rdf-schema#label> \"Alias{n:03}\" .\n"
+            ));
+        }
+        let mut c = Client::start(server_with(&[("t", &[&ttl])], McpConfig::default()));
+        let result = c
+            .structured(
+                "link_entities",
+                json!({"mentions":[{"text":"Berlin"}],"evidence":true}),
+            )
+            .await;
+        let candidates = result["mentions"][0]["candidates"].as_array().unwrap();
+        let a = candidates
+            .iter()
+            .find(|c| c["iri"].as_str().unwrap().contains("urn:a"))
+            .unwrap();
+        let b = candidates
+            .iter()
+            .find(|c| c["iri"].as_str().unwrap().contains("urn:b"))
+            .unwrap();
+        assert_eq!(a["evidence"]["types"].as_array().unwrap().len(), 20);
+        assert_eq!(a["evidence"]["typesComplete"], false);
+        assert_eq!(a["evidence"]["labels"].as_array().unwrap().len(), 20);
+        assert_eq!(a["evidence"]["labelsComplete"], false);
+        assert_eq!(b["evidence"]["typesComplete"], !global_cap, "{result}");
+        assert_eq!(b["evidence"]["labelsComplete"], !global_cap, "{result}");
+        if b["evidence"]["types"].as_array().unwrap().is_empty() {
+            assert_eq!(
+                b["evidence"]["typesComplete"], false,
+                "an empty starved lookup is not absence"
+            );
+        }
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn link_evidence_does_not_certify_unsupported_label_forms() {
+    let ttl = "<urn:item> <http://www.w3.org/2000/01/rdf-schema#label> 7 .";
+    let mut c = Client::start(server_with(&[("t", &[ttl])], McpConfig::default()));
+    let result = c
+        .structured(
+            "link_entities",
+            json!({"mentions":[{"text":"7"}],"evidence":true}),
+        )
+        .await;
+    assert_eq!(
+        result["mentions"][0]["evidence"]["exactStringLabelsComplete"],
+        false
+    );
+    assert_eq!(
+        result["mentions"][0]["evidence"]["candidateUniverseComplete"],
+        false
+    );
+}
+
+#[test]
+fn link_evidence_counts_and_details_remain_in_the_query_view() {
+    let server = server_with(
+        &[(
+            "t",
+            &[
+                "<urn:visible> a <urn:PublicType> ; <http://www.w3.org/2000/01/rdf-schema#label> \"Berlin\"@en .",
+            ],
+        )],
+        McpConfig::default(),
+    );
+    server.state.datasets()["t"].store.load(&[Source::from_bytes(
+        b"<urn:hiddenEntity> a <urn:SecretType> ; <http://www.w3.org/2000/01/rdf-schema#label> \"Berlin\"@en .".to_vec(),
+        RdfFormat::Turtle, Some(oxrdf::NamedNode::new("urn:hiddenGraph").unwrap()),
+    )]).unwrap();
+    let read = |principal| {
+        let call = Call {
+            arrived: Instant::now(),
+            cancel: Arc::new(AtomicBool::new(false)),
+            request_id: "link-evidence".into(),
+            principal,
+            headers: None,
+            held: None,
+            grant: None,
+        };
+        let args = json!({"dataset":"t","mentions":[{"text":"Berlin"}],"evidence":true});
+        match server
+            .run_now("link_entities", args.as_object().unwrap().clone(), &call)
+            .unwrap()
+        {
+            Outcome::Structured(value) => value,
+            Outcome::Text(_) => panic!("expected structured link result"),
+        }
+    };
+    let full = read(Principal::local());
+    assert_eq!(full["mentions"][0]["evidence"]["observedCandidates"], 2);
+    let restricted = read(Principal::local().hiding_graphs(&["urn:hiddenGraph".into()]));
+    assert_eq!(
+        restricted["mentions"][0]["evidence"]["observedCandidates"],
+        1
+    );
+    assert!(
+        !restricted.to_string().contains("hiddenEntity"),
+        "{restricted}"
+    );
+    assert!(
+        !restricted.to_string().contains("SecretType"),
+        "{restricted}"
+    );
+    assert_eq!(read(Principal::local()), full);
+}

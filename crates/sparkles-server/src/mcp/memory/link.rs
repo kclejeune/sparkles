@@ -47,6 +47,8 @@ struct LinkArgs {
     timeout_seconds: Option<f64>,
     /// false leaves the vector index out, whatever indexes the dataset has
     vectors: Option<bool>,
+    /// Include scoped, versioned evidence beyond the bounded display lists.
+    evidence: Option<bool>,
 }
 
 #[derive(Deserialize)]
@@ -69,6 +71,10 @@ pub(crate) struct LinkSetup {
     pub text: Option<Vec<NamedNode>>,
     /// the predicate of the embedding index that covers labels or descriptions
     pub vector: Option<NamedNode>,
+    /// The language inventory covers the same caller view as the entity queries.
+    pub languages_complete: bool,
+    /// The known label literals use the simple or language-tagged forms looked up.
+    pub label_forms_complete: bool,
 }
 
 /// One mention to link.
@@ -94,6 +100,21 @@ pub(crate) struct Candidate {
     pub score: f64,
     pub same_as: Vec<NamedNode>,
     pub triples: Vec<(NamedNode, NamedNode, Term)>,
+    /// Proof applies to named types and literal labels in this call's query view.
+    pub evidence: Option<DetailEvidence>,
+}
+
+pub(crate) struct DetailEvidence {
+    pub types_complete: bool,
+    pub labels_complete: bool,
+}
+
+pub(crate) struct LinkEvidence {
+    pub observed_candidates: usize,
+    pub pool_truncated: bool,
+    pub display_truncated: bool,
+    pub exact_labels_complete: bool,
+    pub type_hierarchy_complete: bool,
 }
 
 impl Candidate {
@@ -111,6 +132,7 @@ impl Candidate {
             score: 0.0,
             same_as: Vec::new(),
             triples: Vec::new(),
+            evidence: None,
         }
     }
 
@@ -134,6 +156,7 @@ impl Candidate {
 pub(crate) struct Linked {
     pub verdict: &'static str,
     pub candidates: Vec<Candidate>,
+    pub evidence: Option<LinkEvidence>,
 }
 
 /// Ranks of a list of subjects in score order (best first, ties share a rank), one
@@ -244,18 +267,33 @@ impl Tools<'_> {
         let mut terms = Terms::new(&prefixes, 300);
         let mut out_mentions = Vec::with_capacity(mentions.len());
         for m in &mentions {
-            let (linked, t, v) = self.link(&r, &setup, m, k, &ctx)?;
+            let (linked, t, v) =
+                self.link_with_evidence(&r, &setup, m, k, a.evidence == Some(true), &ctx)?;
             text_used |= t;
             vector_used |= v;
-            out_mentions.push(json!({
+            let mut mention = json!({
                 "text": render::label_text(&m.text),
                 "verdict": linked.verdict,
                 "candidates": linked
                     .candidates
                     .iter()
-                    .map(|c| candidate_json(c, &mut terms))
+                    .map(|c| candidate_json(c, &mut terms, &setup.labels))
                     .collect::<Vec<_>>(),
-            }));
+            });
+            if let Some(evidence) = &linked.evidence {
+                mention["evidence"] = json!({
+                    "version": 1,
+                    "observedCandidates": evidence.observed_candidates,
+                    "poolTruncated": evidence.pool_truncated,
+                    "displayTruncated": evidence.display_truncated,
+                    "exactStringLabelsComplete": evidence.exact_labels_complete,
+                    "typeHintLookupComplete": evidence.type_hierarchy_complete,
+                    // Ranked text/vector search is bounded, not an exhaustive universe.
+                    "normalizedLabelsComplete": false,
+                    "candidateUniverseComplete": false,
+                });
+            }
+            out_mentions.push(mention);
         }
         Ok(Outcome::Structured(json!({
             "dataset": ds.name,
@@ -279,8 +317,20 @@ impl Tools<'_> {
         ctx: &ErrorContext,
     ) -> Result<LinkSetup, ToolError> {
         let mut tags: BTreeSet<String> = BTreeSet::new();
+        let same_scope = self
+            .call
+            .principal
+            .view(&ds.name, crate::auth::Endpoint::Info)
+            .as_deref()
+            == r.opts.graphs.as_deref();
+        let mut languages_complete = same_scope;
+        let mut label_forms_complete = same_scope;
         match self.view_report(ds, r, ctx)? {
             Some(rep) => {
+                // A report that does not enumerate every predicate cannot establish
+                // absence of another label form.
+                languages_complete &= rep.totals.predicates == rep.predicates.len();
+                label_forms_complete &= rep.totals.predicates == rep.predicates.len();
                 for p in &labels {
                     let Ok(i) = rep
                         .predicates
@@ -288,8 +338,26 @@ impl Tools<'_> {
                     else {
                         continue;
                     };
-                    let (objects, _) =
+                    let (objects, sampled) =
                         self.entry_objects(ds, &r.snap, &rep, &rep.predicates[i], r.deadline, ctx)?;
+                    languages_complete &= sampled.is_none()
+                        && objects.literals.iter().all(|group| {
+                            group.datatype
+                                != "http://www.w3.org/1999/02/22-rdf-syntax-ns#langString"
+                                || group.triples == 0
+                                || group
+                                    .languages
+                                    .as_ref()
+                                    .is_some_and(|languages| !languages.is_empty())
+                        });
+                    label_forms_complete &= sampled.is_none()
+                        && objects.literals.iter().all(|group| {
+                            matches!(
+                                group.datatype.as_str(),
+                                "http://www.w3.org/2001/XMLSchema#string"
+                                    | "http://www.w3.org/1999/02/22-rdf-syntax-ns#langString"
+                            )
+                        });
                     for g in &objects.literals {
                         for l in g.languages.iter().flatten() {
                             tags.insert(l.lang.clone());
@@ -303,7 +371,11 @@ impl Tools<'_> {
                     values_iris("lp", &labels),
                     r.quads("?s ?lp ?l", &graphs)
                 );
-                for row in r.rows(&q, Vec::new()).map_err(|e| ctx.engine(e))? {
+                let rows = r.rows(&q, Vec::new()).map_err(|e| ctx.engine(e))?;
+                languages_complete = rows.len() < 100;
+                // LANG alone does not establish which other literal forms occur.
+                label_forms_complete = false;
+                for row in rows {
                     if let Some(Some(Term::Literal(t))) = row.first() {
                         tags.insert(t.value().to_string());
                     }
@@ -354,6 +426,8 @@ impl Tools<'_> {
             tags: tags.into_iter().collect(),
             text,
             vector,
+            languages_complete,
+            label_forms_complete,
         })
     }
 
@@ -367,14 +441,30 @@ impl Tools<'_> {
         k: usize,
         ctx: &ErrorContext,
     ) -> Result<(Linked, bool, bool), ToolError> {
+        self.link_with_evidence(r, setup, m, k, false, ctx)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn link_with_evidence(
+        &self,
+        r: &Reader,
+        setup: &LinkSetup,
+        m: &Mention,
+        k: usize,
+        evidence: bool,
+        ctx: &ErrorContext,
+    ) -> Result<(Linked, bool, bool), ToolError> {
         let eng = |e| ctx.engine(e);
         let mut pool: BTreeMap<String, Candidate> = BTreeMap::new();
         // 1. exact labels, through the index: the text as a simple literal and with each
         // language tag of the label predicates
         let mut forms: Vec<String> = vec![Literal::new_simple_literal(m.text.as_str()).to_string()];
+        let mut forms_complete = setup.languages_complete && setup.label_forms_complete;
         for t in &setup.tags {
             if let Ok(l) = Literal::new_language_tagged_literal(m.text.as_str(), t.as_str()) {
                 forms.push(l.to_string());
+            } else {
+                forms_complete = false;
             }
         }
         let q = format!(
@@ -383,7 +473,9 @@ impl Tools<'_> {
             forms.join(" "),
             r.quads("?s ?lp ?l", &setup.graphs),
         );
-        for row in r.rows(&q, Vec::new()).map_err(eng)? {
+        let exact_rows = r.rows(&q, Vec::new()).map_err(eng)?;
+        let exact_labels_complete = forms_complete && exact_rows.len() < LIST_DEPTH;
+        for row in exact_rows {
             if let Some(Some(Term::NamedNode(s))) = row.first() {
                 pool.entry(s.as_str().to_string())
                     .or_insert_with(|| Candidate::new(s.clone()))
@@ -471,6 +563,7 @@ impl Tools<'_> {
             .sum();
         }
         // keep the label matches and the best of the rest
+        let observed_candidates = pool.len();
         let mut all: Vec<Candidate> = pool.into_values().collect();
         all.sort_by(|a, b| {
             a.tier()
@@ -481,17 +574,37 @@ impl Tools<'_> {
         all.truncate(LIST_DEPTH);
         // types and labels of the pool
         let iris: Vec<NamedNode> = all.iter().map(|c| c.iri.clone()).collect();
-        let types = types_of(r, &iris, &setup.graphs).map_err(eng)?;
-        let labels = literals_of(r, &iris, &setup.labels, &setup.graphs).map_err(eng)?;
-        let allowed = if m.types.is_empty() {
-            None
+        let types = type_details(r, &iris, &setup.graphs, evidence).map_err(eng)?;
+        let labels =
+            label_details(r, &iris, &setup.labels, &setup.graphs, evidence).map_err(eng)?;
+        let (allowed, type_hierarchy_complete) = if m.types.is_empty() {
+            (None, true)
         } else {
-            Some(subclasses(r, &m.types).map_err(eng)?)
+            let (allowed, complete) = subclass_details(r, &m.types).map_err(eng)?;
+            (Some(allowed), complete)
         };
         let mention_words = words(&m.text);
         for c in &mut all {
-            c.types = types.get(c.iri.as_str()).cloned().unwrap_or_default();
-            c.labels = labels.get(c.iri.as_str()).cloned().unwrap_or_default();
+            c.types = types
+                .values
+                .get(c.iri.as_str())
+                .cloned()
+                .unwrap_or_default();
+            c.labels = labels
+                .values
+                .get(c.iri.as_str())
+                .cloned()
+                .unwrap_or_default();
+            if evidence {
+                c.evidence = Some(DetailEvidence {
+                    types_complete: types.complete.get(c.iri.as_str()).copied().unwrap_or(false),
+                    labels_complete: labels
+                        .complete
+                        .get(c.iri.as_str())
+                        .copied()
+                        .unwrap_or(false),
+                });
+            }
             if let Some(allowed) = &allowed {
                 c.type_match = c.types.iter().any(|t| allowed.contains(t.as_str()));
             }
@@ -538,6 +651,13 @@ impl Tools<'_> {
             Linked {
                 verdict,
                 candidates: all,
+                evidence: evidence.then_some(LinkEvidence {
+                    observed_candidates,
+                    pool_truncated: observed_candidates > LIST_DEPTH,
+                    display_truncated: observed_candidates > k,
+                    exact_labels_complete,
+                    type_hierarchy_complete,
+                }),
             },
             text_used,
             vector_used,
@@ -619,31 +739,74 @@ pub(crate) fn default_labels() -> Vec<NamedNode> {
         .collect()
 }
 
-/// At most 20 `rdf:type`s of each IRI, in IRI order.
+struct Lookup<T> {
+    values: HashMap<String, Vec<T>>,
+    complete: HashMap<String, bool>,
+}
+
+fn completeness(
+    iris: &[NamedNode],
+    counts: Option<HashMap<String, usize>>,
+    query_complete: bool,
+) -> HashMap<String, bool> {
+    counts.map_or_else(HashMap::new, |counts| {
+        iris.iter()
+            .map(|iri| {
+                let count = counts.get(iri.as_str()).copied().unwrap_or(0);
+                (iri.as_str().to_string(), query_complete && count <= 20)
+            })
+            .collect()
+    })
+}
+
+/// At most 20 named `rdf:type`s of each IRI, in IRI order.
 pub(crate) fn types_of(
     r: &Reader,
     iris: &[NamedNode],
     graphs: &[NamedNode],
 ) -> Result<HashMap<String, Vec<NamedNode>>, Error> {
+    Ok(type_details(r, iris, graphs, false)?.values)
+}
+
+fn type_details(
+    r: &Reader,
+    iris: &[NamedNode],
+    graphs: &[NamedNode],
+    evidence: bool,
+) -> Result<Lookup<NamedNode>, Error> {
     let mut out: HashMap<String, Vec<NamedNode>> = HashMap::new();
     if iris.is_empty() {
-        return Ok(out);
+        return Ok(Lookup {
+            values: out,
+            complete: HashMap::new(),
+        });
     }
+    let limit = iris.len() * 20;
     let q = format!(
-        "SELECT DISTINCT ?x ?t WHERE {{ {} {} FILTER(isIRI(?t)) }} ORDER BY ?x ?t LIMIT {}",
+        "SELECT DISTINCT ?x ?t WHERE {{ {} {} FILTER(isIRI(?t)) }} ORDER BY ?x ?t LIMIT {limit}",
         values_iris("x", iris),
-        r.quads("?x a ?t", graphs),
-        iris.len() * 20
+        r.quads("?x a ?t", graphs)
     );
-    for row in r.rows(&q, Vec::new())? {
+    let rows = r.rows(&q, Vec::new())?;
+    let mut query_complete = rows.len() < limit;
+    let mut counts: Option<HashMap<String, usize>> = evidence.then(HashMap::new);
+    for row in rows {
         if let [Some(Term::NamedNode(x)), Some(Term::NamedNode(t))] = row.as_slice() {
+            if let Some(counts) = &mut counts {
+                *counts.entry(x.as_str().to_string()).or_default() += 1;
+            }
             let v = out.entry(x.as_str().to_string()).or_default();
             if v.len() < 20 {
                 v.push(t.clone());
             }
+        } else {
+            query_complete = false;
         }
     }
-    Ok(out)
+    Ok(Lookup {
+        values: out,
+        complete: completeness(iris, counts, query_complete),
+    })
 }
 
 /// The literals of `preds` of each IRI: `(predicate rank, literal)`, at most 20 per IRI.
@@ -653,18 +816,34 @@ pub(crate) fn literals_of(
     preds: &[NamedNode],
     graphs: &[NamedNode],
 ) -> Result<HashMap<String, Vec<(usize, Literal)>>, Error> {
+    Ok(label_details(r, iris, preds, graphs, false)?.values)
+}
+
+fn label_details(
+    r: &Reader,
+    iris: &[NamedNode],
+    preds: &[NamedNode],
+    graphs: &[NamedNode],
+    evidence: bool,
+) -> Result<Lookup<(usize, Literal)>, Error> {
     let mut out: HashMap<String, Vec<(usize, Literal)>> = HashMap::new();
     if iris.is_empty() || preds.is_empty() {
-        return Ok(out);
+        return Ok(Lookup {
+            values: out,
+            complete: HashMap::new(),
+        });
     }
+    let limit = iris.len() * 40;
     let q = format!(
-        "SELECT DISTINCT ?x ?lp ?l WHERE {{ {} {} {} FILTER(isLITERAL(?l)) }} LIMIT {}",
+        "SELECT DISTINCT ?x ?lp ?l WHERE {{ {} {} {} FILTER(isLITERAL(?l)) }} LIMIT {limit}",
         values_iris("x", iris),
         values_iris("lp", preds),
-        r.quads("?x ?lp ?l", graphs),
-        iris.len() * 40
+        r.quads("?x ?lp ?l", graphs)
     );
-    for row in r.rows(&q, Vec::new())? {
+    let rows = r.rows(&q, Vec::new())?;
+    let mut query_complete = rows.len() < limit;
+    let mut counts: Option<HashMap<String, usize>> = evidence.then(HashMap::new);
+    for row in rows {
         if let [
             Some(Term::NamedNode(x)),
             Some(Term::NamedNode(p)),
@@ -672,29 +851,39 @@ pub(crate) fn literals_of(
         ] = row.as_slice()
             && let Some(rank) = preds.iter().position(|q| q == p)
         {
+            if let Some(counts) = &mut counts {
+                *counts.entry(x.as_str().to_string()).or_default() += 1;
+            }
             let v = out.entry(x.as_str().to_string()).or_default();
             if v.len() < 20 {
                 v.push((rank, l.clone()));
             }
+        } else {
+            query_complete = false;
         }
     }
-    Ok(out)
+    Ok(Lookup {
+        values: out,
+        complete: completeness(iris, counts, query_complete),
+    })
 }
 
 /// The classes and their subclasses in the view.
-fn subclasses(r: &Reader, classes: &[NamedNode]) -> Result<BTreeSet<String>, Error> {
+fn subclass_details(r: &Reader, classes: &[NamedNode]) -> Result<(BTreeSet<String>, bool), Error> {
     let mut out: BTreeSet<String> = classes.iter().map(|c| c.as_str().to_string()).collect();
     let q = format!(
         "SELECT DISTINCT ?sub WHERE {{ {} {} }} LIMIT 10000",
         values_iris("c", classes),
         r.quads(&format!("?sub <{RDFS_SUBCLASS}>+ ?c"), &[])
     );
-    for row in r.rows(&q, Vec::new())? {
+    let rows = r.rows(&q, Vec::new())?;
+    let complete = rows.len() < 10000;
+    for row in rows {
         if let Some(Some(Term::NamedNode(s))) = row.first() {
             out.insert(s.as_str().to_string());
         }
     }
-    Ok(out)
+    Ok((out, complete))
 }
 
 /// For each of `iris`, the others it is linked with by `owl:sameAs` or
@@ -776,7 +965,7 @@ fn sample(
     Ok(out)
 }
 
-fn candidate_json(c: &Candidate, terms: &mut Terms) -> Value {
+fn candidate_json(c: &Candidate, terms: &mut Terms, label_predicates: &[NamedNode]) -> Value {
     let refs: Vec<(usize, &Literal)> = c.labels.iter().map(|(r, l)| (*r, l)).collect();
     let label = render::choose_ranked(&refs, "en");
     let mut alt: Vec<String> = Vec::new();
@@ -824,6 +1013,27 @@ fn candidate_json(c: &Candidate, terms: &mut Terms) -> Value {
             .map(|s| terms.iri(s.as_str()))
             .collect::<Vec<_>>()
             .into();
+    }
+    if let Some(evidence) = &c.evidence {
+        let labels: Vec<Value> = c
+            .labels
+            .iter()
+            .filter(|(_, literal)| !sparkles::vector::is_datatype(literal.datatype().as_str()))
+            .map(|(rank, literal)| {
+                json!({
+                    "predicate": label_predicates[*rank].as_str(),
+                    "term": literal.to_string(),
+                })
+            })
+            .collect();
+        j["evidence"] = json!({
+            "version": 1,
+            "iri": c.iri.as_str(),
+            "types": c.types.iter().map(NamedNode::as_str).collect::<Vec<_>>(),
+            "typesComplete": evidence.types_complete,
+            "labels": labels,
+            "labelsComplete": evidence.labels_complete,
+        });
     }
     j
 }
