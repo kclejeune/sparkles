@@ -105,4 +105,3 @@ that can multiply a dataset allowance.
   - `nixfmt` (MPL-2.0), the flake's formatter, pinned by `flake.lock`.
 - **Design source:** the tools' own documentation.
 - **Replaced:** Prettier and `prettier-plugin-svelte` (MIT), removed from the UI.
-
