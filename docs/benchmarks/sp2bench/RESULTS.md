@@ -13,7 +13,8 @@ The Forge benchmark answers `q4` in 30.626 s and `q6` in 978.4 ms with Sparkles 
 `6b7f32ce`. Both complete answers match independent reconstruction from the source data.
 The benchmark gives Sparkles a 4 GiB response allowance; the production default remains
 1 GiB. Sparkles is the only engine with a completed `q5a` measurement under the published
-600 s request budget. QLever and Fluree are faster on the checked `q11` comparison.
+600 s request budget. QLever is faster on the checked `q11` comparison. Fluree's native response encoding is
+qualified below.
 
 ## SP²Bench on Forge
 
@@ -21,6 +22,12 @@ SP²Bench v1.01 generates bibliographic data in the style of DBLP. The corpus co
 10,000,091 triples in a 1.49 GB N-Triples file. Times are mean ± sample standard deviation
 in milliseconds and consume the full HTTP response. The server cap is 12 GiB and the
 request budget is 600 s. Engines run separately for answer checking and timing.
+
+SELECT timings request `text/tab-separated-values`. Fluree returns a plain TSV dialect
+with unquoted string fields, rather than SPARQL RDF-term TSV. Its typed correctness
+captures use SPARQL JSON. These native endpoint times include different serialization
+costs, so Fluree's SELECT figures do not establish format-matched latency ratios. ASK
+timings request SPARQL JSON on every engine.
 
 The recovered Sparkles `q4` and `q6` cells and completed QLever and Fluree cells use two
 warm-ups and ten timed requests. The paired Sparkles and Jena `q12a` cells and Jena's `q12b` use thirty
