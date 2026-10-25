@@ -69,6 +69,7 @@ implementation status.
 | [Maintained analysis results](specs/F22-analysis-lifecycle.md) | Planned. | Item 340 specifies reproducible runs, dependency checks, freshness and guarded publication. |
 | [Valid-time queries and event history](specs/C27-valid-time-profiles.md) | Planned. | Item 341 specifies uncertain validity intervals and availability cutoffs. Existing history selects recorded commits. |
 | [Reports for distinct audiences](specs/C22b-report-configurations.md) | Planned. | Item 100 specifies multiple guarded GraphRAG configurations and shared budget enforcement. |
+| [ChatGPT-plan model access](specs/C28-chatgpt-model-access.md) | Planned. | Item 344 specifies personal sign-in, protected connections and Responses streaming. Existing OpenAI-compatible providers use API keys. |
 | [Batched updates and triggers](specs/C23-batched-updates-and-triggers.md) | Planned. | Item 36 specifies batched work and commit-trigger authoring. |
 | [Additional query languages](specs/C24-json-query-languages.md) | Planned. | JSON node-pattern and Datalog query surfaces remain item 72. openCypher remains item 20. |
 | [Query by example and notebooks](#known-gaps) | Planned. | Items 28 and 30 describe these interfaces. The existing visual query builder is available. |
@@ -1782,6 +1783,9 @@ links each item to its design spec.
 
 ### AI and agents
 
+* ChatGPT-plan model access is planned in [C28](specs/C28-chatgpt-model-access.md),
+  roadmap item 344. The existing OpenAI-compatible provider uses Chat Completions with
+  configured API credentials. It does not accept a ChatGPT subscription as model access.
 * Ask has been evaluated with Anthropic models only, on the demo set, CK25, QALD-9-plus
   and 74 DBpedia-only questions
   ([C18](specs/C18-natural-language-questions-and-ingest.md#roadmap-follow-ups-2026-10-12),

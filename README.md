@@ -97,6 +97,7 @@ planned, and unfinished later phases make an available capability partially comp
 | GeoSPARQL | Partially complete | Spatial indexes, joins and indexed nearest-neighbour ordering are available. Per-row nearest-neighbour joins and some geometry and CRS operations remain planned. |
 | Bindings and web UI | Partially complete | Embedded engines, administration handles and graph, map and history workflows are available. Remaining surfaces and UI phases are listed by feature. |
 | Shared evidence and maintained analysis | Planned | The shared evidence, durable jobs, valid-time, maintained-analysis and audience-specific report specifications have no implementation. |
+| ChatGPT-plan model access | Planned | Personal sign-in and Responses model access are specified in [C28](docs/specs/C28-chatgpt-model-access.md). Current OpenAI-compatible access uses API keys. |
 
 ## Performance
 

@@ -88,6 +88,7 @@ A completed phase does not imply every later extension or compatibility goal is 
 | [C25](C25-evidence-and-assessments.md) | Shared sources, unasserted claims, evidence references, review decisions, reversible identity matches and managed accepted projections | specified |
 | [C26](C26-durable-jobs-and-delivery.md) | Durable jobs, checkpoints, fenced workers and atomic output and outbox publication with restart recovery | specified |
 | [C27](C27-valid-time-profiles.md) | Validity intervals, uncertain temporal bounds, observation availability, temporal query helpers and an event-time control | specified |
+| [C28](C28-chatgpt-model-access.md) | Personal ChatGPT-plan model connections, local sign-in, protected credentials, Responses streaming and explicitly delegated background access | specified |
 | [F01](F01-cypher.md) | A read-only openCypher subset compiled to the SPARQL algebra over a property-graph view of RDF, with relationship identity and properties through RDF 1.2 reifiers, `/{ds}/cypher` and `sparkles cypher` | specified |
 | [F03](F03-full-text-search.md) | BM25 full-text search over literals with Tantivy, through Jena's `text:query`, with Lucene's query syntax, highlighting and stemming per language | implemented in part (Phases 1 and 2, most of Phase 3) |
 | [F04](F04-vector-search.md) | `spk:vector` literals, similarity functions, `spk:vectorSearch`, HNSW vector indexes per predicate, and hybrid ranking with full-text search | implemented in part (Phases 1, 1b and 2, most of Phase 3) |
