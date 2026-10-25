@@ -52,19 +52,26 @@ enum Test {
 }
 
 fn length_test(e: &Expr, v: VarId) -> Option<Test> {
+    fn integer(e: &Expr) -> Option<i64> {
+        match e {
+            Expr::Const(id) if id.tag() == crate::id::Tag::Int => Some(id.as_i64()),
+            Expr::Lit(_, Value::Integer(n)) => Some(i64::from(*n)),
+            _ => None,
+        }
+    }
     let Expr::Cmp(a, b, op) = e else { return None };
     let (length, constant, op) = match (&**a, &**b) {
-        (Expr::Call(Func::Builtin(Function::StrLen), args), Expr::Lit(_, Value::Integer(n))) => {
-            (args, *n, *op)
+        (Expr::Call(Func::Builtin(Function::StrLen), args), constant) => {
+            (args, integer(constant)?, *op)
         }
-        (Expr::Lit(_, Value::Integer(n)), Expr::Call(Func::Builtin(Function::StrLen), args)) => {
+        (constant, Expr::Call(Func::Builtin(Function::StrLen), args)) => {
             let reverse = match op {
                 CmpOp::Lt => CmpOp::Gt,
                 CmpOp::Le => CmpOp::Ge,
                 CmpOp::Gt => CmpOp::Lt,
                 CmpOp::Ge => CmpOp::Le,
             };
-            (args, *n, reverse)
+            (args, integer(constant)?, reverse)
         }
         _ => return None,
     };
@@ -74,7 +81,7 @@ fn length_test(e: &Expr, v: VarId) -> Option<Test> {
     Some(Test::Length {
         arg: Arg::of(arg, v)?,
         op,
-        bound: i64::from(constant),
+        bound: constant,
     })
 }
 

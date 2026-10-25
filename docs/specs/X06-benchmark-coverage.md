@@ -1185,3 +1185,35 @@ is released when the cursor ends. On atlas at 1M with four threads, an approxima
 measurement on a shared host, streamed `q4` execution fell from about 2.7 s to 1.4 s,
 eager execution stayed at about 0.4 s, and the answers stayed the same. A test counts the
 ledger operations of 2,000 cursor comparisons against a filter that compares nothing.
+
+### Keyed inner groups and short ASKs
+
+BSBM BI `q2` links two disconnected groups with a FILTER equality. They now use a
+keyed inner join instead of materializing their product. Candidate keys preserve value
+equality for numeric and temporal datatypes, language tags and triple terms, and the
+whole condition still tests each candidate. Eager LIMIT and ASK bound the larger input
+in growing prefixes rather than evaluating both inputs completely.
+
+Large native ASKs over these joins alternate input reads and stop at the first matching
+pair. This retains prefixes of both inputs while both can produce rows, which can use
+more memory than an ordinary hash join. When one input ends, the other input's old
+history is discarded and only its active probe batch remains. Both index growth and
+temporary buffers must fit the query budget before allocation. Automatic admission
+keeps a cheap eager prefix only when exact scan counts prove that it fits, including
+when named-graph statistics discount estimates.
+
+A singleton triple pattern can supply a constant to other patterns and arithmetic
+FILTER bounds in the same group. The planner reads at most two rows from a pattern
+with one free variable and at most four estimated rows, and substitutes only a proved
+single result. The output variable is reconstructed with its original RDF term.
+Volatile filters, application callbacks and occurrences across algebra boundaries keep
+the ordinary binding. This narrows BSBM Explore `q5` and SP²Bench `q12b` without changing
+their answers. STRLEN comparisons with integer constants can test vocabulary keys
+directly, preserving Unicode scalar counts, language strings and STR coercion.
+
+Adversarial coverage exercises native ASK at batch sizes one, seven and 4096, empty and
+disjoint inputs, late matches after EOF, graph-discounted estimates, value-equality
+errors, unbound values, cancellation, deadlines and resource limits. Singleton tests
+cover graph scope, duplicate solutions, RDF term identity, blank nodes, numeric bounds,
+OPTIONAL, subqueries, paths, EXISTS and snapshots with a delta. Published comparison
+refreshes remain under roadmap item 91.

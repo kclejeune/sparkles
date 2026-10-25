@@ -8,6 +8,42 @@ use sparkles_core::sparql::{
 use sparkles_core::store::{Store, StoreOptions};
 
 #[test]
+fn parsed_inline_integer_bounds_select_vocabulary_key_filtering() {
+    fn keys(p: &sparkles_core::sparql::PlanInfo) -> bool {
+        p.description.contains("on vocabulary keys") || p.children.iter().any(keys)
+    }
+    let store = Store::in_memory(StoreOptions {
+        bulk_threshold: 0,
+        ..Default::default()
+    });
+    let data = (0..100)
+        .map(|i| format!("<urn:s{i}> <urn:value> \"abc\" .\n"))
+        .collect::<String>();
+    store
+        .load(&[Source::from_bytes(
+            data.into_bytes(),
+            RdfFormat::Turtle,
+            None,
+        )])
+        .unwrap();
+    for condition in ["STRLEN(?v) > 2", "2 < STRLEN(?v)"] {
+        let text =
+            format!("SELECT (COUNT(*) AS ?n) WHERE {{ ?s <urn:value> ?v FILTER({condition}) }}");
+        let r = query(
+            store.snapshot(),
+            &text,
+            &QueryOptions {
+                no_cache: true,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(r.rows(), vec![vec![Some(oxrdf::Literal::from(100).into())]]);
+        assert!(keys(&r.plan), "{condition}: {:?}", r.plan);
+    }
+}
+
+#[test]
 fn length_filters_match_scalar_evaluation_and_stream_across_batches() {
     let store = Store::in_memory(StoreOptions::default());
     let terms = [
