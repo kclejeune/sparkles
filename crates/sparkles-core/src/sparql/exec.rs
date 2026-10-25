@@ -2721,7 +2721,7 @@ fn run_limited(
                 budget = budget.saturating_mul(8);
             }
         }
-        Kind::Join { algo, .. } => {
+        Kind::Join { .. } | Kind::KeyedJoin { .. } => {
             // limit the (estimated) larger side, compute the other one fully
             let lim = if n.children[0].est >= n.children[1].est {
                 0
@@ -2776,10 +2776,16 @@ fn run_limited(
                 } else {
                     (&other, &part)
                 };
-                let out = match algo {
-                    JoinAlgo::Cross => cross(ctx, l, r)?,
-                    JoinAlgo::Merge => join_tables(ctx, l, r, &[], true)?,
-                    JoinAlgo::Hash => join_tables(ctx, l, r, &[], false)?,
+                let out = match &n.kind {
+                    Kind::Join { algo, .. } => match algo {
+                        JoinAlgo::Cross => cross(ctx, l, r)?,
+                        JoinAlgo::Merge => join_tables(ctx, l, r, &[], true)?,
+                        JoinAlgo::Hash => join_tables(ctx, l, r, &[], false)?,
+                    },
+                    Kind::KeyedJoin {
+                        expr, left, right, ..
+                    } => keyed_join(ctx, l, r, expr, (*left, *right), false, &mut None)?,
+                    _ => unreachable!("limited inner join"),
                 };
                 if out.len() >= want || complete {
                     let infos = if lim == 0 {

@@ -9,7 +9,8 @@ use sparkles_core::sparql::extensions::{
     ExtensionRegistry, ScalarContext, ScalarDescriptor, ScalarResult,
 };
 use sparkles_core::sparql::{
-    CursorOptions, FallbackPolicy, Optimizations, PlanInfo, QueryOptions, query, select_cursor,
+    CursorOptions, ExecutionMode, FallbackPolicy, Optimizations, PlanInfo, QueryExecution,
+    QueryOptions, query, query_execution, select_cursor,
 };
 use sparkles_core::store::{Store, StoreOptions};
 use std::sync::Arc;
@@ -284,6 +285,85 @@ fn keyed_join_answers_ask_in_a_cursor_and_eagerly() {
     }
 }
 
+#[test]
+fn keyed_ask_limits_the_large_input_when_a_small_prefix_already_matches() {
+    for (left, right) in [(1, 2048), (2048, 1)] {
+        let store = Store::in_memory(StoreOptions::default());
+        let mut data = String::new();
+        for (rows, predicate) in [(left, "left"), (right, "right")] {
+            for i in 0..rows {
+                data += &format!("<urn:{predicate}{i}> <urn:{predicate}> \"same\" .\n");
+            }
+        }
+        load(&store, data);
+        let text = "ASK { ?l <urn:left> ?x . ?r <urn:right> ?y FILTER(?x = ?y) }";
+        let opts = options(1024, true);
+        let eager = query(store.snapshot(), text, &opts).unwrap();
+        assert!(eager.boolean);
+        assert_eq!(operators(&eager.plan, "KeyedJoin").len(), 1);
+        let auto = query_execution(
+            store.snapshot(),
+            text,
+            &opts,
+            &Default::default(),
+            ExecutionMode::Auto,
+        )
+        .unwrap();
+        assert!(matches!(auto, QueryExecution::Eager(_)));
+        let select = text.replacen("ASK", "SELECT * WHERE", 1) + " LIMIT 1";
+        assert_eq!(
+            query(store.snapshot(), &select, &opts)
+                .unwrap()
+                .rows()
+                .len(),
+            1
+        );
+    }
+}
+
+#[test]
+fn keyed_ask_admits_small_inputs_when_the_matching_prefix_exceeds_its_budget() {
+    let store = Store::in_memory(StoreOptions::default());
+    let mut data = String::new();
+    for side in ["left", "right"] {
+        for i in 0..64 {
+            data += &format!("<urn:{side}{i}> <urn:{side}> \"same\" .\n");
+        }
+    }
+    load(&store, data);
+    let text = "ASK { ?l <urn:left> ?x . ?r <urn:right> ?y FILTER(?x = ?y) }";
+    let opts = options(1024, true);
+    let execution = query_execution(
+        store.snapshot(),
+        text,
+        &opts,
+        &Default::default(),
+        ExecutionMode::Auto,
+    )
+    .unwrap();
+    let QueryExecution::Ask(answer) = execution else {
+        panic!("the matching eager prefix exceeds its row budget")
+    };
+    assert!(answer.result().boolean);
+    assert!(answer.result().rows_produced < 1024);
+    for (values, expected) in [("UNDEF 1", true), ("UNDEF", false)] {
+        let text =
+            format!("ASK {{ VALUES ?x {{ {values} }} VALUES ?y {{ UNDEF 1 }} FILTER(?x = ?y) }}");
+        let execution = query_execution(
+            store.snapshot(),
+            &text,
+            &opts,
+            &Default::default(),
+            ExecutionMode::Streaming,
+        )
+        .unwrap();
+        let QueryExecution::Ask(answer) = execution else {
+            panic!("forced native ASK")
+        };
+        assert_eq!(answer.result().boolean, expected);
+    }
+}
+
 /// An application callback in the FILTER sees every pair the product tests, so its
 /// calls and their order decide the answer as before.
 #[test]
@@ -344,5 +424,112 @@ fn ask_over_a_large_keyed_join_reads_both_sides_alternately() {
         let r = query(store.snapshot(), &text, &options(100_000_000, true)).unwrap();
         let keyed_ops = operators(&r.plan, "KeyedJoin");
         assert_eq!(keyed_ops.len(), 1, "{extra}");
+        for batch_rows in [1, 7, 4096] {
+            let execution = query_execution(
+                store.snapshot(),
+                &text,
+                &options(100_000_000, true),
+                &CursorOptions {
+                    batch_rows,
+                    ..Default::default()
+                },
+                ExecutionMode::Auto,
+            )
+            .unwrap();
+            let QueryExecution::Ask(answer) = execution else {
+                panic!("the large keyed ASK must exercise its native cursor");
+            };
+            assert_eq!(
+                answer.result().boolean,
+                expected,
+                "{extra}, batch {batch_rows}"
+            );
+        }
     }
+}
+
+#[test]
+fn native_keyed_ask_preserves_empty_inputs_value_errors_and_budgets() {
+    use sparkles_core::{BudgetKind, Error};
+    use std::sync::atomic::AtomicBool;
+    use std::time::Instant;
+
+    let store = Store::in_memory(StoreOptions::default());
+    let mut data = String::new();
+    for i in 0..3000 {
+        data += &format!(
+            "<urn:l{i}> <urn:left> \"left {i}\" . <urn:r{i}> <urn:right> \"right {i}\" .\n"
+        );
+    }
+    // The only equal values have distinct RDF terms, and the invalid literal's
+    // comparison raises a FILTER error rather than yielding a matching pair.
+    data += "<urn:ln> <urn:left> 1 . <urn:rn> <urn:right> 1.0 .\n";
+    data += "<urn:le> <urn:left> \"invalid\"^^<http://www.w3.org/2001/XMLSchema#integer> .\n";
+    load(&store, data);
+    let run = |condition: &str, opts: &QueryOptions, mode| {
+        let extra = if condition == "true" {
+            String::new()
+        } else {
+            format!(" && {condition}")
+        };
+        let text = format!("ASK {{ ?l <urn:left> ?x . ?r <urn:right> ?y FILTER(?x = ?y{extra}) }}");
+        query_execution(store.snapshot(), &text, opts, &Default::default(), mode)
+    };
+    for (condition, expected) in [
+        ("true", true),
+        ("!isNumeric(?x)", false),
+        ("STRLEN(STR(?x)) > 1000", false),
+        ("STRLEN(STR(?y)) > 1000", false),
+        ("?l = ?r", false),
+    ] {
+        let execution = run(condition, &options(100_000, true), ExecutionMode::Streaming).unwrap();
+        let QueryExecution::Ask(answer) = execution else {
+            panic!("must use native ASK: {condition}");
+        };
+        assert_eq!(answer.result().boolean, expected, "{condition}");
+    }
+    for (opts, kind) in [
+        (
+            QueryOptions {
+                max_rows: Some(100),
+                ..options(100_000, true)
+            },
+            BudgetKind::Rows,
+        ),
+        (
+            QueryOptions {
+                max_rows_produced: Some(1),
+                ..options(100_000, true)
+            },
+            BudgetKind::RowsProduced,
+        ),
+        (
+            QueryOptions {
+                max_memory_bytes: Some(1),
+                ..options(100_000, true)
+            },
+            BudgetKind::Memory,
+        ),
+    ] {
+        assert!(
+            matches!(run("true", &opts, ExecutionMode::Auto), Err(Error::BudgetExceeded(b)) if b.kind == kind),
+            "{kind:?}"
+        );
+    }
+    let cancelled = QueryOptions {
+        cancel: Some(Arc::new(AtomicBool::new(true))),
+        ..options(100_000, true)
+    };
+    assert!(matches!(
+        run("true", &cancelled, ExecutionMode::Auto),
+        Err(Error::Cancelled)
+    ));
+    let expired = QueryOptions {
+        deadline: Some(Instant::now()),
+        ..options(100_000, true)
+    };
+    assert!(matches!(
+        run("true", &expired, ExecutionMode::Auto),
+        Err(Error::Timeout)
+    ));
 }

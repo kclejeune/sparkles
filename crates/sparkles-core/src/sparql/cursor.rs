@@ -947,15 +947,24 @@ fn filtered_ask_admitted(ctx: &Ctx, node: &Node) -> bool {
         }
         filtered = &filtered.children[0];
     }
-    // A keyed join reads its inputs alternately under ASK (see `ripple`), so the first
-    // matching pair ends both. Small inputs are joined eagerly at less fixed cost.
+    // A large keyed ASK can avoid reading either input whole. When the smaller
+    // input and a prefix of the larger one fit, limited eager execution is cheaper
+    // for estimated-small inputs, especially a selective filter that proves empty.
     if let Kind::KeyedJoin { .. } = filtered.kind {
-        return filtered.children.len() == 2
-            && filtered
-                .children
-                .iter()
-                .any(|c| c.est.is_finite() && c.est >= AUTO_SCAN_ROWS)
-            && native(filtered);
+        let [a, b] = filtered.children.as_slice() else {
+            return false;
+        };
+        if !a.est.is_finite() || !b.est.is_finite() || a.est < 0.0 || b.est < 0.0 {
+            return false;
+        }
+        let (small, large) = if a.est <= b.est { (a, b) } else { (b, a) };
+        let prefix = large.est.min(64.0);
+        let candidates = small.est * prefix;
+        let held =
+            small.est * (small.vars.len() * 8) as f64 + prefix * (large.vars.len() * 8) as f64;
+        let bytes = candidates * ((filtered.vars.len() + 1) * 8) as f64 + held;
+        let bounded = candidates <= ctx.max_rows as f64 && bytes <= ctx.memory_remaining() as f64;
+        return (small.est >= AUTO_SCAN_ROWS || !bounded) && native(filtered);
     }
     let Kind::Filter(expressions) = &filtered.kind else {
         return false;
@@ -4405,6 +4414,11 @@ mod tests {
             let options = QueryOptions {
                 max_rows: Some(max_rows),
                 no_cache: true,
+                // This decision table describes the legacy filtered-product path.
+                optimizations: Some(super::super::Optimizations {
+                    keyed_join: false,
+                    ..super::super::Optimizations::ALL
+                }),
                 ..Default::default()
             };
             super::super::prepare_query(store.snapshot(), &query, &options, None, None).unwrap()
