@@ -1,0 +1,1468 @@
+{
+  "base_commit": "9cf63d72",
+  "candidate_commit": "cc335905e13863afa1ba404e227e908c7aa9774d",
+  "host": {
+    "name": "forge",
+    "cpu": "Intel Core i5-13500",
+    "node": "v22.23.3",
+    "rayon_threads": 6,
+    "tokio_workers": 6
+  },
+  "native_compiler": "rustc 1.98.1 (48a229cea 2026-09-01)\nbinary: rustc\ncommit-hash: 48a229ceaefd4985c50990b14116b6d856af0985\ncommit-date: 2026-09-01\nhost: x86_64-unknown-linux-gnu\nrelease: 1.98.1\nLLVM version: 22.1.8\ncc (Debian 12.2.0-14+deb12u1) 12.2.0\nCopyright (C) 2022 Free Software Foundation, Inc.\nThis is free software; see the source for copying conditions.  There is NO\nwarranty; not even for MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.\n\n",
+  "native_sha256": {
+    "base": "bdd75ce01adafc901b0f94fb8383de5df8bc840dd409779af03d88ca958d9f76",
+    "candidate": "9831bfdc2053a13b645640be5d697d7ad3831fe54c0ecd74225e2ee51bc17af5"
+  },
+  "data": {
+    "generator": "scripts/gen-data.py 10000",
+    "input_lines": 105302,
+    "unique_quads": 105300,
+    "sha256": "2304064437ecc90f549fa678d92dc428b43c42c1c1cce2317da7339a795bd2fd"
+  },
+  "method": "Two quiet ABBA-times-three batches, six fresh processes per arm per batch. Matched source builds in the same Rust1.98.1 Debianbookworm container, path, flags and GCC12.2.0. No builds or competing servers on Forge. Both bench and heavy locks held during timing. Process medians are the unit of comparison; repeated lifecycle/control samples are not independent processes.",
+  "primary_started": "2026-10-25T11:49:54Z",
+  "primary_finished": "2026-10-25T11:51:25Z",
+  "focused_started": "2026-10-25T11:52:33Z",
+  "focused_finished": "2026-10-25T11:53:27Z",
+  "primary": {
+    "runs": [
+      {
+        "index": 0,
+        "arm": "base",
+        "completed": {
+          "name": "completed",
+          "sink": 158389825,
+          "node": "v22.23.3",
+          "rows": 105300
+        },
+        "metrics": {
+          "has-api": 0.8246327794999999,
+          "term-encoding": 0.06613779599999987,
+          "native-contains": 0.6777095835,
+          "small-select-all-terms": 94.5391900000004,
+          "export-count-only": 0.944197938588161,
+          "export-all-terms": 1.0039280196264642,
+          "write-reused-subject-predicate-fresh-literal": 4.466044700000021,
+          "dataset-memory-birth-close": 75.75274899999977
+        },
+        "samples": {
+          "has-api": [
+            0.8246327794999999
+          ],
+          "term-encoding": [
+            0.06613779599999987
+          ],
+          "native-contains": [
+            0.6777095835
+          ],
+          "small-select-all-terms": [
+            94.5391900000004
+          ],
+          "export-count-only": [
+            0.944197938588161
+          ],
+          "export-all-terms": [
+            1.0039280196264642
+          ],
+          "write-reused-subject-predicate-fresh-literal": [
+            4.466044700000021
+          ],
+          "dataset-memory-birth-close": [
+            75.9843890000002,
+            76.73532300000079,
+            75.6972429999996,
+            74.82097299999987,
+            73.02192899999953,
+            74.10005300000012,
+            76.07554499999969,
+            75.80825499999992,
+            75.94335899999989,
+            73.76763900000061
+          ]
+        }
+      },
+      {
+        "index": 1,
+        "arm": "candidate",
+        "completed": {
+          "name": "completed",
+          "sink": 158389825,
+          "node": "v22.23.3",
+          "rows": 105300
+        },
+        "metrics": {
+          "has-api": 0.784476253,
+          "term-encoding": 0.06433128999999996,
+          "native-contains": 0.6378421525,
+          "small-select-all-terms": 83.41859600000042,
+          "export-count-only": 0.9446136049382717,
+          "export-all-terms": 0.9991534428616653,
+          "write-reused-subject-predicate-fresh-literal": 4.299629399999958,
+          "dataset-memory-birth-close": 73.88564099999985
+        },
+        "samples": {
+          "has-api": [
+            0.784476253
+          ],
+          "term-encoding": [
+            0.06433128999999996
+          ],
+          "native-contains": [
+            0.6378421525
+          ],
+          "small-select-all-terms": [
+            83.41859600000042
+          ],
+          "export-count-only": [
+            0.9446136049382717
+          ],
+          "export-all-terms": [
+            0.9991534428616653
+          ],
+          "write-reused-subject-predicate-fresh-literal": [
+            4.299629399999958
+          ],
+          "dataset-memory-birth-close": [
+            75.45954300000085,
+            73.95795999999973,
+            75.35657400000038,
+            72.57607300000018,
+            71.80568999999923,
+            73.03527400000077,
+            72.66126200000055,
+            75.47562099999959,
+            73.81332199999997,
+            74.50469499999963
+          ]
+        }
+      },
+      {
+        "index": 2,
+        "arm": "candidate",
+        "completed": {
+          "name": "completed",
+          "sink": 158389825,
+          "node": "v22.23.3",
+          "rows": 105300
+        },
+        "metrics": {
+          "has-api": 0.8137473245,
+          "term-encoding": 0.07339635450000002,
+          "native-contains": 0.6434713515000001,
+          "small-select-all-terms": 89.3959359999999,
+          "export-count-only": 0.9638104805318142,
+          "export-all-terms": 1.0050668211459322,
+          "write-reused-subject-predicate-fresh-literal": 4.2446954,
+          "dataset-memory-birth-close": 74.65799200000038
+        },
+        "samples": {
+          "has-api": [
+            0.8137473245
+          ],
+          "term-encoding": [
+            0.07339635450000002
+          ],
+          "native-contains": [
+            0.6434713515000001
+          ],
+          "small-select-all-terms": [
+            89.3959359999999
+          ],
+          "export-count-only": [
+            0.9638104805318142
+          ],
+          "export-all-terms": [
+            1.0050668211459322
+          ],
+          "write-reused-subject-predicate-fresh-literal": [
+            4.2446954
+          ],
+          "dataset-memory-birth-close": [
+            75.71182599999973,
+            79.74642799999945,
+            75.10497900000063,
+            73.87052099999984,
+            72.99560099999961,
+            75.89845300000071,
+            74.21100500000013,
+            73.78583199999957,
+            75.37541199999941,
+            73.23223700000017
+          ]
+        }
+      },
+      {
+        "index": 3,
+        "arm": "base",
+        "completed": {
+          "name": "completed",
+          "sink": 158389825,
+          "node": "v22.23.3",
+          "rows": 105300
+        },
+        "metrics": {
+          "has-api": 0.8321649535,
+          "term-encoding": 0.07373515399999997,
+          "native-contains": 0.671018344,
+          "small-select-all-terms": 148.8875999999991,
+          "export-count-only": 0.9538036752136753,
+          "export-all-terms": 1.010007653687876,
+          "write-reused-subject-predicate-fresh-literal": 4.462282600000071,
+          "dataset-memory-birth-close": 75.45708849999983
+        },
+        "samples": {
+          "has-api": [
+            0.8321649535
+          ],
+          "term-encoding": [
+            0.07373515399999997
+          ],
+          "native-contains": [
+            0.671018344
+          ],
+          "small-select-all-terms": [
+            148.8875999999991
+          ],
+          "export-count-only": [
+            0.9538036752136753
+          ],
+          "export-all-terms": [
+            1.010007653687876
+          ],
+          "write-reused-subject-predicate-fresh-literal": [
+            4.462282600000071
+          ],
+          "dataset-memory-birth-close": [
+            79.49937200000022,
+            79.41204500000005,
+            76.56202300000041,
+            75.5342899999996,
+            75.37988700000004,
+            87.8253369999993,
+            72.21549799999957,
+            73.1424710000001,
+            74.73198099999992,
+            73.0175389999995
+          ]
+        }
+      },
+      {
+        "index": 4,
+        "arm": "base",
+        "completed": {
+          "name": "completed",
+          "sink": 158389825,
+          "node": "v22.23.3",
+          "rows": 105300
+        },
+        "metrics": {
+          "has-api": 0.8310290865000001,
+          "term-encoding": 0.07198933299999986,
+          "native-contains": 0.671310737,
+          "small-select-all-terms": 128.20766999999978,
+          "export-count-only": 0.9678316999050331,
+          "export-all-terms": 1.0138800949667615,
+          "write-reused-subject-predicate-fresh-literal": 4.4298596000000545,
+          "dataset-memory-birth-close": 77.07813450000003
+        },
+        "samples": {
+          "has-api": [
+            0.8310290865000001
+          ],
+          "term-encoding": [
+            0.07198933299999986
+          ],
+          "native-contains": [
+            0.671310737
+          ],
+          "small-select-all-terms": [
+            128.20766999999978
+          ],
+          "export-count-only": [
+            0.9678316999050331
+          ],
+          "export-all-terms": [
+            1.0138800949667615
+          ],
+          "write-reused-subject-predicate-fresh-literal": [
+            4.4298596000000545
+          ],
+          "dataset-memory-birth-close": [
+            83.67324000000008,
+            76.88050600000044,
+            77.26962100000036,
+            75.52903499999957,
+            75.09151799999927,
+            81.74931699999979,
+            77.78190100000029,
+            76.4969510000001,
+            77.49718499999928,
+            76.8866479999997
+          ]
+        }
+      },
+      {
+        "index": 5,
+        "arm": "candidate",
+        "completed": {
+          "name": "completed",
+          "sink": 158389825,
+          "node": "v22.23.3",
+          "rows": 105300
+        },
+        "metrics": {
+          "has-api": 0.8059706945,
+          "term-encoding": 0.07755065600000001,
+          "native-contains": 0.6713460840000002,
+          "small-select-all-terms": 83.29998999999953,
+          "export-count-only": 0.9422326767964547,
+          "export-all-terms": 0.9977437879075657,
+          "write-reused-subject-predicate-fresh-literal": 4.328482600000006,
+          "dataset-memory-birth-close": 74.46931100000029
+        },
+        "samples": {
+          "has-api": [
+            0.8059706945
+          ],
+          "term-encoding": [
+            0.07755065600000001
+          ],
+          "native-contains": [
+            0.6713460840000002
+          ],
+          "small-select-all-terms": [
+            83.29998999999953
+          ],
+          "export-count-only": [
+            0.9422326767964547
+          ],
+          "export-all-terms": [
+            0.9977437879075657
+          ],
+          "write-reused-subject-predicate-fresh-literal": [
+            4.328482600000006
+          ],
+          "dataset-memory-birth-close": [
+            77.75613700000031,
+            77.15055200000005,
+            76.67987199999972,
+            75.2472770000004,
+            76.38925000000017,
+            73.07054400000015,
+            73.0209020000002,
+            72.63664600000084,
+            72.79882899999939,
+            73.69134500000017
+          ]
+        }
+      },
+      {
+        "index": 6,
+        "arm": "candidate",
+        "completed": {
+          "name": "completed",
+          "sink": 158389825,
+          "node": "v22.23.3",
+          "rows": 105300
+        },
+        "metrics": {
+          "has-api": 0.7909731055000001,
+          "term-encoding": 0.06781503550000002,
+          "native-contains": 0.6417619535000001,
+          "small-select-all-terms": 119.33958199999962,
+          "export-count-only": 0.9708863425134537,
+          "export-all-terms": 1.0110693415637864,
+          "write-reused-subject-predicate-fresh-literal": 4.256014899999991,
+          "dataset-memory-birth-close": 73.33474999999999
+        },
+        "samples": {
+          "has-api": [
+            0.7909731055000001
+          ],
+          "term-encoding": [
+            0.06781503550000002
+          ],
+          "native-contains": [
+            0.6417619535000001
+          ],
+          "small-select-all-terms": [
+            119.33958199999962
+          ],
+          "export-count-only": [
+            0.9708863425134537
+          ],
+          "export-all-terms": [
+            1.0110693415637864
+          ],
+          "write-reused-subject-predicate-fresh-literal": [
+            4.256014899999991
+          ],
+          "dataset-memory-birth-close": [
+            74.66595199999938,
+            74.48525400000015,
+            73.19786999999997,
+            72.15671399999975,
+            76.2643590000007,
+            73.47163,
+            72.01165500000025,
+            72.0978070000001,
+            73.0673939999997,
+            76.33840299999974
+          ]
+        }
+      },
+      {
+        "index": 7,
+        "arm": "base",
+        "completed": {
+          "name": "completed",
+          "sink": 158389825,
+          "node": "v22.23.3",
+          "rows": 105300
+        },
+        "metrics": {
+          "has-api": 0.8360095425,
+          "term-encoding": 0.07103569549999997,
+          "native-contains": 0.6712513679999998,
+          "small-select-all-terms": 82.76436999999989,
+          "export-count-only": 0.9437917524533079,
+          "export-all-terms": 1.0125006280468503,
+          "write-reused-subject-predicate-fresh-literal": 4.5398188000000115,
+          "dataset-memory-birth-close": 77.74205949999987
+        },
+        "samples": {
+          "has-api": [
+            0.8360095425
+          ],
+          "term-encoding": [
+            0.07103569549999997
+          ],
+          "native-contains": [
+            0.6712513679999998
+          ],
+          "small-select-all-terms": [
+            82.76436999999989
+          ],
+          "export-count-only": [
+            0.9437917524533079
+          ],
+          "export-all-terms": [
+            1.0125006280468503
+          ],
+          "write-reused-subject-predicate-fresh-literal": [
+            4.5398188000000115
+          ],
+          "dataset-memory-birth-close": [
+            76.5179880000005,
+            76.51846100000056,
+            78.73003099999914,
+            78.00955299999987,
+            77.47456599999988,
+            74.61860699999944,
+            80.91744199999994,
+            81.22444900000029,
+            76.70654000000012,
+            78.13473200000044
+          ]
+        }
+      },
+      {
+        "index": 8,
+        "arm": "base",
+        "completed": {
+          "name": "completed",
+          "sink": 158389825,
+          "node": "v22.23.3",
+          "rows": 105300
+        },
+        "metrics": {
+          "has-api": 0.83150406,
+          "term-encoding": 0.07006192699999997,
+          "native-contains": 0.6638867694999999,
+          "small-select-all-terms": 85.50218599999971,
+          "export-count-only": 0.9385458182969292,
+          "export-all-terms": 0.9999317435897438,
+          "write-reused-subject-predicate-fresh-literal": 4.336898999999994,
+          "dataset-memory-birth-close": 76.0275160000001
+        },
+        "samples": {
+          "has-api": [
+            0.83150406
+          ],
+          "term-encoding": [
+            0.07006192699999997
+          ],
+          "native-contains": [
+            0.6638867694999999
+          ],
+          "small-select-all-terms": [
+            85.50218599999971
+          ],
+          "export-count-only": [
+            0.9385458182969292
+          ],
+          "export-all-terms": [
+            0.9999317435897438
+          ],
+          "write-reused-subject-predicate-fresh-literal": [
+            4.336898999999994
+          ],
+          "dataset-memory-birth-close": [
+            76.18505600000026,
+            77.86909500000002,
+            86.2215100000003,
+            76.91995500000031,
+            76.59460200000014,
+            73.48071100000016,
+            74.49928600000021,
+            75.86997599999995,
+            73.73925899999995,
+            74.6803140000002
+          ]
+        }
+      },
+      {
+        "index": 9,
+        "arm": "candidate",
+        "completed": {
+          "name": "completed",
+          "sink": 158389825,
+          "node": "v22.23.3",
+          "rows": 105300
+        },
+        "metrics": {
+          "has-api": 0.795198701,
+          "term-encoding": 0.07036773999999991,
+          "native-contains": 0.6431993085000001,
+          "small-select-all-terms": 121.4991659999996,
+          "export-count-only": 0.9648742177904401,
+          "export-all-terms": 1.0004261209243432,
+          "write-reused-subject-predicate-fresh-literal": 4.259781700000076,
+          "dataset-memory-birth-close": 73.907463
+        },
+        "samples": {
+          "has-api": [
+            0.795198701
+          ],
+          "term-encoding": [
+            0.07036773999999991
+          ],
+          "native-contains": [
+            0.6431993085000001
+          ],
+          "small-select-all-terms": [
+            121.4991659999996
+          ],
+          "export-count-only": [
+            0.9648742177904401
+          ],
+          "export-all-terms": [
+            1.0004261209243432
+          ],
+          "write-reused-subject-predicate-fresh-literal": [
+            4.259781700000076
+          ],
+          "dataset-memory-birth-close": [
+            79.06204100000015,
+            76.2823929999995,
+            74.81166399999985,
+            72.3818769999998,
+            72.54372299999976,
+            73.77550700000029,
+            74.05708999999932,
+            73.08247599999959,
+            73.45938500000011,
+            74.03941899999974
+          ]
+        }
+      },
+      {
+        "index": 10,
+        "arm": "candidate",
+        "completed": {
+          "name": "completed",
+          "sink": 158389825,
+          "node": "v22.23.3",
+          "rows": 105300
+        },
+        "metrics": {
+          "has-api": 0.7976593425000001,
+          "term-encoding": 0.07127193499999998,
+          "native-contains": 0.644424013,
+          "small-select-all-terms": 107.91648400000032,
+          "export-count-only": 0.9540200417853751,
+          "export-all-terms": 1.0148302114593224,
+          "write-reused-subject-predicate-fresh-literal": 4.43060690000002,
+          "dataset-memory-birth-close": 73.69132900000021
+        },
+        "samples": {
+          "has-api": [
+            0.7976593425000001
+          ],
+          "term-encoding": [
+            0.07127193499999998
+          ],
+          "native-contains": [
+            0.644424013
+          ],
+          "small-select-all-terms": [
+            107.91648400000032
+          ],
+          "export-count-only": [
+            0.9540200417853751
+          ],
+          "export-all-terms": [
+            1.0148302114593224
+          ],
+          "write-reused-subject-predicate-fresh-literal": [
+            4.43060690000002
+          ],
+          "dataset-memory-birth-close": [
+            74.79842000000006,
+            74.60650499999974,
+            73.02156900000045,
+            76.51326400000018,
+            72.17016299999976,
+            74.33872599999995,
+            73.52529200000026,
+            72.47011399999974,
+            73.75096500000016,
+            73.63169300000025
+          ]
+        }
+      },
+      {
+        "index": 11,
+        "arm": "base",
+        "completed": {
+          "name": "completed",
+          "sink": 158389825,
+          "node": "v22.23.3",
+          "rows": 105300
+        },
+        "metrics": {
+          "has-api": 0.833918466,
+          "term-encoding": 0.07175724549999996,
+          "native-contains": 0.6740531064999997,
+          "small-select-all-terms": 84.85340600000018,
+          "export-count-only": 0.9578133871478314,
+          "export-all-terms": 1.012142883190883,
+          "write-reused-subject-predicate-fresh-literal": 4.503650599999946,
+          "dataset-memory-birth-close": 76.1813904999999
+        },
+        "samples": {
+          "has-api": [
+            0.833918466
+          ],
+          "term-encoding": [
+            0.07175724549999996
+          ],
+          "native-contains": [
+            0.6740531064999997
+          ],
+          "small-select-all-terms": [
+            84.85340600000018
+          ],
+          "export-count-only": [
+            0.9578133871478314
+          ],
+          "export-all-terms": [
+            1.012142883190883
+          ],
+          "write-reused-subject-predicate-fresh-literal": [
+            4.503650599999946
+          ],
+          "dataset-memory-birth-close": [
+            76.43879500000003,
+            79.96793699999944,
+            75.81206599999949,
+            74.7005680000002,
+            81.84543699999995,
+            78.43636400000015,
+            77.98180599999978,
+            74.55287600000067,
+            75.92398599999979,
+            75.3113060000005
+          ]
+        }
+      }
+    ],
+    "metrics": {
+      "has-api": {
+        "base_us": 0.8318345067499999,
+        "candidate_us": 0.7964290217500001,
+        "change_percent": -4.256313571112846,
+        "block_percent": [
+          -3.5353836097987923,
+          -4.204751334529522,
+          -4.357121473208647
+        ],
+        "process_values": {
+          "base": [
+            0.8246327794999999,
+            0.8321649535,
+            0.8310290865000001,
+            0.8360095425,
+            0.83150406,
+            0.833918466
+          ],
+          "candidate": [
+            0.784476253,
+            0.8137473245,
+            0.8059706945,
+            0.7909731055000001,
+            0.795198701,
+            0.7976593425000001
+          ]
+        }
+      },
+      "term-encoding": {
+        "base_us": 0.07139647049999996,
+        "candidate_us": 0.07081983749999995,
+        "change_percent": -0.8076491680355624,
+        "block_percent": [
+          -1.5337529522326254,
+          1.6365408380255797,
+          -0.12656786585044655
+        ],
+        "process_values": {
+          "base": [
+            0.06613779599999987,
+            0.07373515399999997,
+            0.07198933299999986,
+            0.07103569549999997,
+            0.07006192699999997,
+            0.07175724549999996
+          ],
+          "candidate": [
+            0.06433128999999996,
+            0.07339635450000002,
+            0.07755065600000001,
+            0.06781503550000002,
+            0.07036773999999991,
+            0.07127193499999998
+          ]
+        }
+      },
+      "native-contains": {
+        "base_us": 0.6712810524999999,
+        "candidate_us": 0.6433353300000001,
+        "change_percent": -4.163043541289257,
+        "block_percent": [
+          -4.998370844515643,
+          -2.193870018400357,
+          -3.760748551005866
+        ],
+        "process_values": {
+          "base": [
+            0.6777095835,
+            0.671018344,
+            0.671310737,
+            0.6712513679999998,
+            0.6638867694999999,
+            0.6740531064999997
+          ],
+          "candidate": [
+            0.6378421525,
+            0.6434713515000001,
+            0.6713460840000002,
+            0.6417619535000001,
+            0.6431993085000001,
+            0.644424013
+          ]
+        }
+      },
+      "small-select-all-terms": {
+        "base_us": 90.02068800000006,
+        "candidate_us": 98.65621000000012,
+        "change_percent": 9.592819375030825,
+        "block_percent": [
+          -29.00759526098148,
+          -3.94956033036441,
+          34.66869347030303
+        ],
+        "process_values": {
+          "base": [
+            94.5391900000004,
+            148.8875999999991,
+            128.20766999999978,
+            82.76436999999989,
+            85.50218599999971,
+            84.85340600000018
+          ],
+          "candidate": [
+            83.41859600000042,
+            89.3959359999999,
+            83.29998999999953,
+            119.33958199999962,
+            121.4991659999996,
+            107.91648400000032
+          ]
+        }
+      },
+      "export-count-only": {
+        "base_us": 0.9490008069009181,
+        "candidate_us": 0.9589152611585947,
+        "change_percent": 1.0447255877530148,
+        "block_percent": [
+          0.5491287042360682,
+          0.07823543646747755,
+          1.1883325725607685
+        ],
+        "process_values": {
+          "base": [
+            0.944197938588161,
+            0.9538036752136753,
+            0.9678316999050331,
+            0.9437917524533079,
+            0.9385458182969292,
+            0.9578133871478314
+          ],
+          "candidate": [
+            0.9446136049382717,
+            0.9638104805318142,
+            0.9422326767964547,
+            0.9708863425134537,
+            0.9648742177904401,
+            0.9540200417853751
+          ]
+        }
+      },
+      "export-all-terms": {
+        "base_us": 1.0110752684393796,
+        "candidate_us": 1.0027464710351377,
+        "change_percent": -0.8237564169774947,
+        "block_percent": [
+          -0.482409117405147,
+          -0.8669443674993893,
+          0.15813059618616787
+        ],
+        "process_values": {
+          "base": [
+            1.0039280196264642,
+            1.010007653687876,
+            1.0138800949667615,
+            1.0125006280468503,
+            0.9999317435897438,
+            1.012142883190883
+          ],
+          "candidate": [
+            0.9991534428616653,
+            1.0050668211459322,
+            0.9977437879075657,
+            1.0110693415637864,
+            1.0004261209243432,
+            1.0148302114593224
+          ]
+        }
+      },
+      "write-reused-subject-predicate-fresh-literal": {
+        "base_us": 4.464163650000046,
+        "candidate_us": 4.279705550000017,
+        "change_percent": -4.131974418097939,
+        "block_percent": [
+          -4.300945598176364,
+          -4.294255410540315,
+          -1.698548244102871
+        ],
+        "process_values": {
+          "base": [
+            4.466044700000021,
+            4.462282600000071,
+            4.4298596000000545,
+            4.5398188000000115,
+            4.336898999999994,
+            4.503650599999946
+          ],
+          "candidate": [
+            4.299629399999958,
+            4.2446954,
+            4.328482600000006,
+            4.256014899999991,
+            4.259781700000076,
+            4.43060690000002
+          ]
+        }
+      },
+      "dataset-memory-birth-close": {
+        "base_us": 76.10445325,
+        "candidate_us": 73.89655199999993,
+        "change_percent": -2.901145932613447,
+        "block_percent": [
+          -1.7632480426409969,
+          -4.531794476371498,
+          -3.0288073188409537
+        ],
+        "process_values": {
+          "base": [
+            75.75274899999977,
+            75.45708849999983,
+            77.07813450000003,
+            77.74205949999987,
+            76.0275160000001,
+            76.1813904999999
+          ],
+          "candidate": [
+            73.88564099999985,
+            74.65799200000038,
+            74.46931100000029,
+            73.33474999999999,
+            73.907463,
+            73.69132900000021
+          ]
+        }
+      }
+    }
+  },
+  "focused": {
+    "runs": [
+      {
+        "index": 0,
+        "arm": "base",
+        "completed": {
+          "name": "completed",
+          "rows": 105300,
+          "sink": 165333020,
+          "node": "v22.23.3"
+        },
+        "metrics": {
+          "small-select-all-terms": 60.79904049999999,
+          "export-count-only": 0.9499246027223802,
+          "export-all-terms": 1.0069528046850271
+        },
+        "samples": {
+          "small-select-all-terms": [
+            60.79904049999999,
+            61.685280500000005,
+            61.089499500000045,
+            60.593751499999996,
+            60.295841499999995
+          ],
+          "export-count-only": [
+            0.9494133491611272,
+            0.9517580626780621,
+            0.9499246027223802,
+            0.9434523456790128,
+            0.9542040519151639
+          ],
+          "export-all-terms": [
+            1.0214260018993353,
+            1.040632408990186,
+            1.0043134979423873,
+            1.0069528046850271,
+            1.0008767268122811
+          ]
+        }
+      },
+      {
+        "index": 1,
+        "arm": "candidate",
+        "completed": {
+          "name": "completed",
+          "rows": 105300,
+          "sink": 165333020,
+          "node": "v22.23.3"
+        },
+        "metrics": {
+          "small-select-all-terms": 62.82343350000002,
+          "export-count-only": 0.9504559480848375,
+          "export-all-terms": 1.0292960430515994
+        },
+        "samples": {
+          "small-select-all-terms": [
+            64.24881100000002,
+            62.82343350000002,
+            61.82427949999999,
+            61.8802005,
+            63.4103465
+          ],
+          "export-count-only": [
+            0.9691828141817032,
+            0.953864023425135,
+            0.9504559480848375,
+            0.9491392212725542,
+            0.9459263564419131
+          ],
+          "export-all-terms": [
+            1.0134941405508078,
+            1.0292960430515994,
+            1.0425201012978793,
+            0.9932017125672671,
+            1.0300829218107006
+          ]
+        }
+      },
+      {
+        "index": 2,
+        "arm": "candidate",
+        "completed": {
+          "name": "completed",
+          "rows": 105300,
+          "sink": 165333020,
+          "node": "v22.23.3"
+        },
+        "metrics": {
+          "small-select-all-terms": 84.10192799999993,
+          "export-count-only": 0.9375443653054756,
+          "export-all-terms": 1.0285751725229513
+        },
+        "samples": {
+          "small-select-all-terms": [
+            100.02426599999998,
+            73.888983,
+            106.772041,
+            75.98121399999997,
+            84.10192799999993
+          ],
+          "export-count-only": [
+            0.9365579677113007,
+            0.9335596707818928,
+            0.9379425862614752,
+            0.9375443653054756,
+            0.9468607597340922
+          ],
+          "export-all-terms": [
+            1.0336385248496356,
+            1.0827108262108263,
+            1.0144289205444756,
+            1.0285751725229513,
+            1.0139435802469146
+          ]
+        }
+      },
+      {
+        "index": 3,
+        "arm": "base",
+        "completed": {
+          "name": "completed",
+          "rows": 105300,
+          "sink": 165333020,
+          "node": "v22.23.3"
+        },
+        "metrics": {
+          "small-select-all-terms": 86.05438249999997,
+          "export-count-only": 0.9415477018043686,
+          "export-all-terms": 1.0135997309275089
+        },
+        "samples": {
+          "small-select-all-terms": [
+            98.85280550000002,
+            120.70720499999999,
+            86.05438249999997,
+            66.35114850000002,
+            81.05537700000002
+          ],
+          "export-count-only": [
+            0.9415477018043686,
+            0.9501124121557457,
+            0.973565140867364,
+            0.9273760683760679,
+            0.9394161696739471
+          ],
+          "export-all-terms": [
+            1.0135997309275089,
+            1.024162067109846,
+            0.9979139506172848,
+            1.010767986704653,
+            1.0167262994618549
+          ]
+        }
+      },
+      {
+        "index": 4,
+        "arm": "base",
+        "completed": {
+          "name": "completed",
+          "rows": 105300,
+          "sink": 165333020,
+          "node": "v22.23.3"
+        },
+        "metrics": {
+          "small-select-all-terms": 79.0096725,
+          "export-count-only": 0.9426286609686608,
+          "export-all-terms": 1.0444305318138654
+        },
+        "samples": {
+          "small-select-all-terms": [
+            79.0096725,
+            100.92322999999999,
+            66.97689299999996,
+            70.40026949999998,
+            85.96616650000004
+          ],
+          "export-count-only": [
+            0.9538697024374806,
+            0.9502883602405825,
+            0.9302394555239001,
+            0.9426286609686608,
+            0.9407514909781574
+          ],
+          "export-all-terms": [
+            1.0444305318138654,
+            1.0676981924659703,
+            0.9883028774928772,
+            0.9951920892687566,
+            1.0498097214308317
+          ]
+        }
+      },
+      {
+        "index": 5,
+        "arm": "candidate",
+        "completed": {
+          "name": "completed",
+          "rows": 105300,
+          "sink": 165333020,
+          "node": "v22.23.3"
+        },
+        "metrics": {
+          "small-select-all-terms": 68.85299,
+          "export-count-only": 0.954227866413422,
+          "export-all-terms": 1.0153722348844556
+        },
+        "samples": {
+          "small-select-all-terms": [
+            68.85299,
+            103.96953199999999,
+            106.09984750000001,
+            65.815832,
+            64.51004699999999
+          ],
+          "export-count-only": [
+            0.9405005603038937,
+            0.9521102880658435,
+            0.9758323836657167,
+            0.9836317980373533,
+            0.954227866413422
+          ],
+          "export-all-terms": [
+            1.0165716081038303,
+            1.0367718866729965,
+            1.0083732636910414,
+            1.014471180753403,
+            1.0153722348844556
+          ]
+        }
+      },
+      {
+        "index": 6,
+        "arm": "candidate",
+        "completed": {
+          "name": "completed",
+          "rows": 105300,
+          "sink": 165333020,
+          "node": "v22.23.3"
+        },
+        "metrics": {
+          "small-select-all-terms": 90.12732200000005,
+          "export-count-only": 0.9335791832858493,
+          "export-all-terms": 1.0075072934472933
+        },
+        "samples": {
+          "small-select-all-terms": [
+            105.27394400000003,
+            86.86233099999998,
+            67.3783775,
+            103.760379,
+            90.12732200000005
+          ],
+          "export-count-only": [
+            0.9335791832858493,
+            0.9313524944602718,
+            0.9375599588477368,
+            0.9299179772079775,
+            0.934231722063945
+          ],
+          "export-all-terms": [
+            1.012314979423868,
+            1.0263746755302314,
+            1.0075072934472933,
+            0.9916388983855631,
+            0.9938062329851219
+          ]
+        }
+      },
+      {
+        "index": 7,
+        "arm": "base",
+        "completed": {
+          "name": "completed",
+          "rows": 105300,
+          "sink": 165333020,
+          "node": "v22.23.3"
+        },
+        "metrics": {
+          "small-select-all-terms": 64.13142300000001,
+          "export-count-only": 0.9376566571699909,
+          "export-all-terms": 1.0081823266856589
+        },
+        "samples": {
+          "small-select-all-terms": [
+            82.22391299999998,
+            64.13142300000001,
+            62.24911599999996,
+            63.25509199999999,
+            89.12298599999997
+          ],
+          "export-count-only": [
+            0.9376566571699909,
+            0.9316274992086102,
+            0.9464062614751504,
+            0.9433077492877491,
+            0.9350689015511237
+          ],
+          "export-all-terms": [
+            1.0175487875910103,
+            1.012953805001583,
+            0.9957886356441911,
+            1.0014541595441604,
+            1.0081823266856589
+          ]
+        }
+      },
+      {
+        "index": 8,
+        "arm": "base",
+        "completed": {
+          "name": "completed",
+          "rows": 105300,
+          "sink": 165333020,
+          "node": "v22.23.3"
+        },
+        "metrics": {
+          "small-select-all-terms": 80.52231600000002,
+          "export-count-only": 0.9450743969610643,
+          "export-all-terms": 1.0136898765432096
+        },
+        "samples": {
+          "small-select-all-terms": [
+            83.9879565,
+            80.52231600000002,
+            98.06058300000001,
+            73.4023085,
+            78.25388600000008
+          ],
+          "export-count-only": [
+            0.940882516619183,
+            0.9545008040519154,
+            0.9463686134852799,
+            0.9376951946818601,
+            0.9450743969610643
+          ],
+          "export-all-terms": [
+            1.0421631370686935,
+            1.015443703703704,
+            1.0136898765432096,
+            1.0111798828743286,
+            1.0005415479582171
+          ]
+        }
+      },
+      {
+        "index": 9,
+        "arm": "candidate",
+        "completed": {
+          "name": "completed",
+          "rows": 105300,
+          "sink": 165333020,
+          "node": "v22.23.3"
+        },
+        "metrics": {
+          "small-select-all-terms": 63.34864799999997,
+          "export-count-only": 0.9433876036720479,
+          "export-all-terms": 1.030391098448876
+        },
+        "samples": {
+          "small-select-all-terms": [
+            66.23103599999999,
+            63.30754900000002,
+            62.65473349999996,
+            63.34864799999997,
+            65.49331749999999
+          ],
+          "export-count-only": [
+            0.937431342196898,
+            0.9826424564735678,
+            0.9433876036720479,
+            0.9375026337448558,
+            0.9719479233934787
+          ],
+          "export-all-terms": [
+            1.030391098448876,
+            1.0347491516302632,
+            1.0197736530547648,
+            1.0232275340297554,
+            1.115795751820195
+          ]
+        }
+      },
+      {
+        "index": 10,
+        "arm": "candidate",
+        "completed": {
+          "name": "completed",
+          "rows": 105300,
+          "sink": 165333020,
+          "node": "v22.23.3"
+        },
+        "metrics": {
+          "small-select-all-terms": 82.88815449999993,
+          "export-count-only": 0.9574194048749609,
+          "export-all-terms": 1.0484246502057621
+        },
+        "samples": {
+          "small-select-all-terms": [
+            87.0576365,
+            73.2827045,
+            85.12719599999997,
+            70.58051649999999,
+            82.88815449999993
+          ],
+          "export-count-only": [
+            0.9574194048749609,
+            0.9624865210509658,
+            0.9508168217790447,
+            0.9528998797087685,
+            0.969582779360556
+          ],
+          "export-all-terms": [
+            1.0233189522000623,
+            1.0657828268439387,
+            1.0053482336182342,
+            1.0484246502057621,
+            1.0608574897119332
+          ]
+        }
+      },
+      {
+        "index": 11,
+        "arm": "base",
+        "completed": {
+          "name": "completed",
+          "rows": 105300,
+          "sink": 165333020,
+          "node": "v22.23.3"
+        },
+        "metrics": {
+          "small-select-all-terms": 93.080536,
+          "export-count-only": 0.9441345520734411,
+          "export-all-terms": 1.0164148148148142
+        },
+        "samples": {
+          "small-select-all-terms": [
+            119.50562549999998,
+            99.40234149999998,
+            93.080536,
+            86.57496300000001,
+            86.239106
+          ],
+          "export-count-only": [
+            0.9438400981323204,
+            0.9441345520734411,
+            0.9457297467553026,
+            0.9443499493510594,
+            0.9432150332383663
+          ],
+          "export-all-terms": [
+            1.007377932890155,
+            1.0450067204811653,
+            1.0164148148148142,
+            1.0090147325102894,
+            1.0258369325735988
+          ]
+        }
+      }
+    ],
+    "metrics": {
+      "small-select-all-terms": {
+        "base_us": 79.76599425,
+        "candidate_us": 75.87057224999997,
+        "change_percent": -4.883562270647735,
+        "block_percent": [
+          0.04898660074132977,
+          11.065457089505127,
+          -15.76359442528059
+        ],
+        "process_values": {
+          "base": [
+            60.79904049999999,
+            86.05438249999997,
+            79.0096725,
+            64.13142300000001,
+            80.52231600000002,
+            93.080536
+          ],
+          "candidate": [
+            62.82343350000002,
+            84.10192799999993,
+            68.85299,
+            90.12732200000005,
+            63.34864799999997,
+            82.88815449999993
+          ]
+        }
+      },
+      "export-count-only": {
+        "base_us": 0.943381606521051,
+        "candidate_us": 0.9469217758784427,
+        "change_percent": 0.37526376737904155,
+        "block_percent": [
+          -0.18356024183523445,
+          0.40003139353690376,
+          0.6139108920921954
+        ],
+        "process_values": {
+          "base": [
+            0.9499246027223802,
+            0.9415477018043686,
+            0.9426286609686608,
+            0.9376566571699909,
+            0.9450743969610643,
+            0.9441345520734411
+          ],
+          "candidate": [
+            0.9504559480848375,
+            0.9375443653054756,
+            0.954227866413422,
+            0.9335791832858493,
+            0.9433876036720479,
+            0.9574194048749609
+          ]
+        }
+      },
+      "export-all-terms": {
+        "base_us": 1.0136448037353594,
+        "candidate_us": 1.0289356077872753,
+        "change_percent": 1.5084972561954846,
+        "block_percent": [
+          1.8469542020941088,
+          -1.4485600655113728,
+          2.399435728806165
+        ],
+        "process_values": {
+          "base": [
+            1.0069528046850271,
+            1.0135997309275089,
+            1.0444305318138654,
+            1.0081823266856589,
+            1.0136898765432096,
+            1.0164148148148142
+          ],
+          "candidate": [
+            1.0292960430515994,
+            1.0285751725229513,
+            1.0153722348844556,
+            1.0075072934472933,
+            1.030391098448876,
+            1.0484246502057621
+          ]
+        }
+      }
+    }
+  },
+  "drivers": {
+    "primary": "import {performance} from 'node:perf_hooks';\nimport {readFileSync} from 'node:fs';\nimport {Dataset, factory} from './js/engine/dist/index.js';\nconst ds=Dataset.memory();\nawait ds.loadFiles([new URL('./data.nt',import.meta.url).pathname]);\nconst datasetRows=Number(await ds.count());\nconst iri=factory.namedNode;\nconst rdfType=iri('http://www.w3.org/1999/02/22-rdf-syntax-ns#type');\nconst probes=JSON.parse(readFileSync(new URL('./probes.json',import.meta.url),'utf8')).map(([s,t])=>factory.quad(iri(s),rdfType,iri(t)));\nlet sink=0;\nlet probeHits=0;for(const q of probes) probeHits+=Number(await ds.has(q));\nif(probes.length!==1000 || probeHits!==500) throw new Error(`probe mismatch ${probes.length}/${probeHits}`);\nconst report=(name,ops,ms,extra={})=>console.log(JSON.stringify({name,ops,ms,usPerOp:ms*1000/ops,...extra}));\nconst timed=async(name,ops,fn)=>{global.gc?.();const start=performance.now();await fn();report(name,ops,performance.now()-start);};\nfor(let i=0;i<10000;i++)sink+=Number(await ds.has(probes[i%1000]));\nconst reps=2000000;\nawait timed('has-api',reps,async()=>{for(let i=0;i<reps;i++)sink+=Number(await ds.has(probes[i%1000]));});\nawait timed('term-encoding',reps,async()=>{for(let i=0;i<reps;i++)sink+=ds.terms.encodeQuad(probes[i%1000]).data[1];});\nconst requests=probes.map(q=>{const {text,data}=ds.terms.encodeQuad(q);return {text,data:data.slice(0,4+4*data[1]+4*data[2])};});\nawait timed('native-contains',reps,async()=>{for(let i=0;i<reps;i++){const r=requests[i%1000];sink+=Number(ds.handle.containsTerms(r.text,r.data));}});\nconst query='SELECT ?s ?name WHERE { VALUES ?s {<http://example.org/person/0> <http://example.org/person/10> <http://example.org/person/20> <http://example.org/person/30> <http://example.org/person/40>} ?s <http://xmlns.com/foaf/0.1/name> ?name }';\nlet selected=0;\nawait timed('small-select-all-terms',500,async()=>{for(let i=0;i<500;i++){const r=await ds.query(query,{noCache:true});for await(const row of r){selected++;sink+=row.get('s').value.length+row.get('name').value.length;}}});\nif(selected!==2500)throw new Error(`SELECT rows ${selected}`);\nconst exportQuery='SELECT ?s ?p ?o WHERE {?s ?p ?o}';\nfor(const decode of [false,true]){\n let rows=0;const start=performance.now();\n for(let i=0;i<15;i++){const r=await ds.query(exportQuery,{noCache:true});for await(const row of r){rows++;if(decode)for(const key of ['s','p','o']){const t=row.get(key);sink+=t.value.length;if(t.termType==='Literal')sink+=t.datatype.value.length+t.language.length;}}}\n if(rows!==15*datasetRows)throw new Error(`export rows ${rows} expected ${15*datasetRows}`);\n report(decode?'export-all-terms':'export-count-only',rows,performance.now()-start);\n}\nconst fresh=factory.namedNode('http://example.org/fresh');\nawait timed('write-reused-subject-predicate-fresh-literal',10000,async()=>{await ds.transaction(async tx=>{for(let i=0;i<10000;i++)await tx.add(factory.quad(iri(`http://example.org/person/${i%100}`),fresh,factory.literal(String(i))));});});\nconst writtenRows=Number(await ds.count());if(writtenRows!==datasetRows+10000)throw new Error(`write rows ${writtenRows}`);\nfor(let i=0;i<1000;i++){const d=Dataset.memory();await d.close();}\nfor(let round=0;round<10;round++) await timed('dataset-memory-birth-close',1000,async()=>{for(let i=0;i<1000;i++){const d=Dataset.memory();await d.close();}});\nawait ds.close();\nconsole.log(JSON.stringify({name:'completed',sink,node:process.version,rows:datasetRows}));\n",
+    "focused": "import {performance} from 'node:perf_hooks';\nimport {Dataset} from './js/engine/dist/index.js';\nconst ds=Dataset.memory();\nawait ds.loadFiles([new URL('./data.nt',import.meta.url).pathname]);\nconst rows=Number(await ds.count());\nconst query='SELECT ?s ?name WHERE { VALUES ?s {<http://example.org/person/0> <http://example.org/person/10> <http://example.org/person/20> <http://example.org/person/30> <http://example.org/person/40>} ?s <http://xmlns.com/foaf/0.1/name> ?name }';\nlet sink=0;\nasync function small(n){let selected=0;for(let i=0;i<n;i++){const r=await ds.query(query,{noCache:true});for await(const row of r){selected++;sink+=row.get('s').value.length+row.get('name').value.length;}}if(selected!==n*5)throw Error(`SELECT ${selected}`);}\nconst report=(name,ops,start)=>{const ms=performance.now()-start;console.log(JSON.stringify({name,ops,ms,usPerOp:ms*1000/ops}));};\nawait small(1000);\nfor(let i=0;i<5;i++){global.gc();const start=performance.now();await small(2000);report('small-select-all-terms',2000,start);}\nfor(const decode of [false,true]){\n const warm=await ds.query('SELECT ?s ?p ?o WHERE {?s ?p ?o}',{noCache:true});for await(const row of warm)if(decode)for(const k of ['s','p','o'])sink+=row.get(k).value.length;\n for(let i=0;i<5;i++){\n  global.gc();let seen=0;const start=performance.now();\n  for(let round=0;round<3;round++){const r=await ds.query('SELECT ?s ?p ?o WHERE {?s ?p ?o}',{noCache:true});for await(const row of r){seen++;if(decode)for(const k of ['s','p','o']){const t=row.get(k);sink+=t.value.length;if(t.termType==='Literal')sink+=t.datatype.value.length+t.language.length;}}}\n  if(seen!==rows*3)throw Error(`export ${seen}`);\n  report(decode?'export-all-terms':'export-count-only',seen,start);\n }\n}\nawait ds.close();console.log(JSON.stringify({name:'completed',rows,sink,node:process.version}));\n"
+  },
+  "limits": "Hot probes use1000 cached terms with50percent hits. Writes reuse100subjects and one predicate with10000 fresh literals in one transaction. SELECT returns5rows and disables the plan cache. Export reads105300unique rows with count-only and full term consumption. Lifecycle measures empty in-memory dataset creation and close, not the DBpedia births query. Small SELECT changes direction with large process variation; exports vary by about1.5percent. Roadmap329 retains these unresolved controls. No peer-engine comparison or closure of item33 is claimed."
+}

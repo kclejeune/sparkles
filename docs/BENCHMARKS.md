@@ -2427,6 +2427,31 @@ store took 13 to 15 ms against TDB2's 2.3 to 3.2 ms.
 *Measured on 8-vCPU AMD EPYC instances of a cloud CI provider, not a quiet machine. Runs on
 different instances differed by up to 30%.*
 
+### Native term validation
+
+Borrowing cached terms during native quad-position validation reduces the cost of hot
+Node operations on forge. Both builds use Rust 1.98.1 and GCC 12.2.0 in the same container
+and source path. Node 22.23.3 runs on the Intel Core i5-13500 with six worker threads.
+Three interleaved A/B/B/A blocks give six fresh processes per build over 105,300 unique
+quads. Each process checks two million cached probes with equal hits and misses, writes
+10,000 fresh literals with reused subjects and predicate, and measures 10,000 empty
+dataset creations and closes after warmup.
+
+| Operation | Before | After | Change |
+|---|---:|---:|---:|
+| `has()` through the public API | 0.832 µs | 0.796 µs | 4.3% faster |
+| Native contains call | 0.671 µs | 0.643 µs | 4.2% faster |
+| Add a fresh literal in a transaction | 4.464 µs | 4.280 µs | 4.1% faster |
+| Create and close an empty in-memory dataset | 76.104 µs | 73.897 µs | 2.9% faster |
+
+All three blocks improve these operations. Query and export controls have smaller or
+inconsistent effects. A five-row SELECT changes from 9.6% slower to 4.9% faster in a
+warmed repeat, with wide variation between processes. Fully decoded exports change from
+0.8% faster to 1.5% slower, and count-only exports from 1.0% to 0.4% slower. These small
+export costs are accepted alongside the probe and write gains. Roadmap item 329 tracks
+export variation and the unstable small-query control. The [raw samples and drivers](benchmarks/2026-10-25-node33-borrowed-validation-forge.json)
+record both batches, binary hashes, compiler versions and answer checks.
+
 ## Natural-language questions
 
 These numbers measure `sparkles ask` and global answering from community reports with
