@@ -3239,6 +3239,9 @@ graph in Explore and the query page's graph view have a **Lenses** menu in their
 (shortcut `Shift+L`) with one row per channel, and each channel has at most one lens on at
 a time.
 
+Explore keeps **Fit to view** and **Re-run layout** in the graph toolbar. The lens menu
+opens below the toolbar, and its phone sheet scrolls within the space below those controls.
+
 * **Size** draws a node's area in five steps of the drawn values, so that one outlier does
   not flatten the rest. It offers the degree in the drawn graph, the degree in the dataset
   and a numeric property of the drawn nodes. A node without a value keeps the smallest

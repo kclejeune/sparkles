@@ -205,6 +205,7 @@
     graphEpoch++;
   }
   let graphView: GraphView | undefined = $state();
+  let graphToolbar: HTMLDivElement | undefined = $state();
 
   // --- the validation overlay (docs/specs/U07-data-quality-and-schema-diagram.md §11) ---
   /**
@@ -2248,7 +2249,7 @@
     >
       <div class="canvas">
         {#if nodeCount > 0 || graphTimeOpen || pathsOpen}
-          <div class="gtools">
+          <div class="gtools" bind:this={graphToolbar}>
             <label class="row check"
               ><input type="checkbox" bind:checked={showLiterals} /> Literals</label
             >
@@ -2293,6 +2294,7 @@
               {#if canvasMode === 'graph'}
                 <LensMenu
                   {lenses}
+                  anchor={graphToolbar}
                   short={(iri) => shortLabel(iri, prefixes)}
                   keys={tab === 'graph' && canvasMode === 'graph'}
                 >
@@ -2307,6 +2309,20 @@
                     {/if}
                   {/snippet}
                 </LensMenu>
+                {#if !listView}
+                  <button
+                    class="btn sm icon graph-control"
+                    aria-label="Fit to view"
+                    title="Fit to view"
+                    onclick={() => graphView?.fit()}><Icon name="fit" size={14} /></button
+                  >
+                  <button
+                    class="btn sm icon graph-control"
+                    aria-label="Re-run layout"
+                    title="Re-run layout"
+                    onclick={() => graphView?.relayout()}><Icon name="refresh" size={14} /></button
+                  >
+                {/if}
                 <button
                   class="btn sm"
                   aria-pressed={listView}
@@ -2458,6 +2474,7 @@
               {:else}
                 <GraphView
                   bind:this={graphView}
+                  showControls={false}
                   animate={graphTimeOpen}
                   nodes={gNodes}
                   edges={gEdges}
@@ -4112,7 +4129,8 @@
       max-width: none;
     }
     /* taps need 44 px targets: the switch between the graph and the map */
-    .gtools .seg .btn {
+    .gtools .seg .btn,
+    .graph-control {
       min-height: 44px;
       min-width: 44px;
     }

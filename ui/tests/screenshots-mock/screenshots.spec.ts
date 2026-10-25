@@ -796,7 +796,7 @@ INSERT DATA {
       const g = JSON.parse((await graph.getAttribute('data-graph')) ?? '{"nodes":[]}');
       return (g.nodes as [string][]).map(([l]) => l);
     })
-    .toEqual(expect.arrayContaining(['Alice Ng', 'Person']));
+    .toEqual(expect.arrayContaining(['Alice Ng', 'ex:Person']));
   // the dashed edge from alice to Person, two subclass steps above her asserted type
   const at = await page
     .locator('.wrap canvas')
@@ -808,7 +808,9 @@ INSERT DATA {
       while (el && !('_cyreg' in el)) el = el.parentElement;
       const cy = (el as unknown as { _cyreg: { cy: { edges(): Edge[] } } })._cyreg.cy;
       const e = [...cy.edges()].find(
-        (x) => x.source().data('label') === 'Alice Ng' && x.target().data('label') === 'Person',
+        (x) =>
+          x.source().data('id') === '<http://example.org/resource/alice>' &&
+          x.target().data('id') === '<http://example.org/ontology#Person>',
       )!;
       const p = e.renderedMidpoint();
       const box = el!.getBoundingClientRect();
@@ -873,7 +875,7 @@ INSERT DATA {
       const g = JSON.parse((await graph.getAttribute('data-graph')) ?? '{"nodes":[]}');
       return (g.nodes as [string][]).map(([l]) => l);
     })
-    .toEqual(expect.arrayContaining(['Alice Ng', 'Employee']));
+    .toEqual(expect.arrayContaining(['Alice Ng', 'ex:Employee']));
   const why = page.getByRole('button', { name: /Why is rdf:type inferred\?/ }).first();
   await why.click();
   const panel = page.getByTestId('why-panel');

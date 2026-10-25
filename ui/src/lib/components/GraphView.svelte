@@ -80,6 +80,7 @@
     validation = null,
     onedge,
     whyMarked = null,
+    showControls = true,
   }: {
     nodes: GNode[];
     edges: GEdge[];
@@ -121,6 +122,8 @@
     onedge?: (id: string) => void;
     /** The derivation Show on graph drew (U10 §2.4): its nodes and edges stand out. */
     whyMarked?: { nodes: string[]; edges: string[] } | null;
+    /** Hide these when the embedding toolbar calls fit() and relayout() itself. */
+    showControls?: boolean;
   } = $props();
 
   let host: HTMLDivElement;
@@ -1011,14 +1014,17 @@
   {#if nodes.length === 0}
     <div class="empty-overlay">{emptyText}</div>
   {/if}
-  <div class="controls">
-    <button class="btn sm icon" title="Fit to view" aria-label="Fit to view" onclick={fit}
-      ><Icon name="fit" size={14} /></button
-    >
-    <button class="btn sm icon" title="Re-run layout" aria-label="Re-run layout" onclick={relayout}
-      ><Icon name="refresh" size={14} /></button
-    >
-  </div>
+  {#if showControls}<div class="controls">
+      <button class="btn sm icon" title="Fit to view" aria-label="Fit to view" onclick={fit}
+        ><Icon name="fit" size={14} /></button
+      >
+      <button
+        class="btn sm icon"
+        title="Re-run layout"
+        aria-label="Re-run layout"
+        onclick={relayout}><Icon name="refresh" size={14} /></button
+      >
+    </div>{/if}
 </div>
 
 <style>
