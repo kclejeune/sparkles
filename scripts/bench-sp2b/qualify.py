@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Bind an identified SP2Bench timing record to independent complete source-oracle results.
+"""Bind a Sparkles SP2Bench timing record to independent complete source-oracle results.
 
 Raw inputs remain unchanged. The bindings file pins their content hashes, source dataset,
 queries, host, binary and measurement contract. Qualified output is a derived record with
@@ -78,6 +78,7 @@ def distinct_outputs(binding_path, bindings, outputs):
 def qualify(directory, bindings):
     directory = pathlib.Path(directory).resolve()
     require(bindings.get("bindings_version") == 1, "unknown bindings version")
+    require(bindings.get("engine") == "sparkles", "unsupported engine: this qualifier binds Sparkles binaries only")
     require(bindings.get("queries") and set(bindings["queries"]) <= {"q4", "q6"}, "unknown source-oracle query")
     sources = {}
     for role, item in bindings["inputs"].items():

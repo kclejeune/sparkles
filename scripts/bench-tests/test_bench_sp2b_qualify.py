@@ -104,6 +104,19 @@ class QualificationTests(unittest.TestCase):
                 with self.assertRaisesRegex(ValueError, "record version"):
                     qualifier.qualify(directory, bindings)
 
+    def test_sparkles_binary_binding_cannot_qualify_a_vendor_engine(self):
+        with tempfile.TemporaryDirectory() as directory:
+            bindings, documents = self.fixture(directory)
+            bindings["engine"] = "qlever"
+            documents["raw_record"]["results"][0]["engine"] = "qlever"
+            documents["raw_record"]["manifest"]["engines"] = {"qlever": {"sha256": "e" * 64, "version": "0.5.48"}}
+            documents["raw_answers"]["q4"]["qlever"] = documents["raw_answers"]["q4"].pop("sparkles")
+            documents["q4_timing"]["results"][0]["command"] = "qlever"
+            for role in ("raw_record", "raw_answers", "q4_timing"):
+                self.write(directory, bindings, role, documents[role])
+            with self.assertRaisesRegex(ValueError, "unsupported engine"):
+                qualifier.qualify(directory, bindings)
+
     def test_cli_rejects_output_aliases_before_changing_evidence(self):
         for kind in ("raw", "receipt-raw", "bindings", "symlink", "hardlink", "same-outputs", "linked-outputs"):
             with self.subTest(kind=kind), tempfile.TemporaryDirectory() as directory:
