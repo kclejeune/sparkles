@@ -1,7 +1,9 @@
 # Development tools and tasks. `mise tasks` lists everything; `mise run <task>`.
 # Rust itself is pinned by rust-toolchain.toml (rustup), not here.
+min_version = "2026.8.16"
 
 [tools]
+mr-boxington = "1.28.0"
 node = "24"
 pnpm = "10.34.5"
 hyperfine = "1.20"
@@ -21,6 +23,16 @@ gradle = "9.7.1"
 # every failure at the end
 "github:nextest-rs/nextest" = { version = "0.9.146", version_prefix = "cargo-nextest-" }
 
+# Rust stays managed by rustup. This wrapper covers Cargo in every task and its
+# child scripts, including the binding workspaces, without changing the Rust pin.
+# Boxington shares compiler outputs per host while keeping active targets separate.
+[env]
+_.path = ["{{config_root}}/scripts"]
+
+[wrappers.cargo]
+command = "mbx"
+env = { MBX_CARGO_SHIM_MODE = "1" }
+
 # ---------------------------------------------------------------------- task caching ----
 # The check tasks of `ci` declare their inputs as `sources` and write no files
 # (`outputs = []`), so mise's task cache records each success under a key built from the
@@ -37,8 +49,13 @@ experimental = true
 [task_config]
 # rust-toolchain.toml pins the compiler, and its version is part of every key, so a
 # raised pin reruns every check. These variables change what the checks see, so they are part of it too.
-cache = { enabled = true, command_inputs = ["rustc -V"] }
-global_env = ["RUSTFLAGS", "CARGO_FEATURES", "SPARKLES_W3C_DIR", "SPARKLES_W3C_SPILL", "SPARKLES_SHACL_TESTS", "SPARKLES_SHEX_TESTS"]
+cache = { enabled = true, command_inputs = ["rustc -V", "mbx --version", "mbx-policy-key.py"] }
+global_env = [
+  "RUSTFLAGS", "CARGO_FEATURES", "CARGO_INCREMENTAL", "RUSTC_WRAPPER", "RUSTC_WORKSPACE_WRAPPER",
+  "MBX_INCREMENTAL", "MBX_LEARNED_INCREMENTAL", "MBX_EAGER_INCREMENTAL", "MBX_LINKER",
+  "MBX_SEED_INCREMENTAL", "MBX_VERIFY", "MBX_VERIFY_SAMPLE_RATE",
+  "SPARKLES_W3C_DIR", "SPARKLES_W3C_SPILL", "SPARKLES_SHACL_TESTS", "SPARKLES_SHEX_TESTS",
+]
 
 [task_config.input_groups]
 # Everything the Rust workspaces compile or read in their tests, listed by directory so the
@@ -47,6 +64,7 @@ rust = [
   "Cargo.toml",
   "Cargo.lock",
   "rust-toolchain.toml",
+  ".mbx.toml",
   ".config/nextest.toml",
   "crates/*/*.toml",
   "crates/*/Cargo.lock",
@@ -102,6 +120,23 @@ jvm = [
 ]
 # The documents that tests and the doc-path check read. docs/plans is left out.
 docs = ["README.md", "docs/*.md", "docs/*.json", "docs/specs/**", "docs/internals/**"]
+
+# ---------------------------------------------------------------------- build caches ----
+
+[tasks."cache:adopt"]
+description = "Move this idle checkout's existing target under Boxington management without deleting its contents"
+run = "mbx adopt ."
+cache = { enabled = false }
+
+[tasks."cache:stats"]
+description = "Show this host's shared compiler cache, managed targets and incremental-state storage"
+run = "mbx cache stats"
+cache = { enabled = false }
+
+[tasks."cache:gc:preview"]
+description = "Preview Boxington cache and managed-target collection without removing files"
+run = "mbx gc --dry-run"
+cache = { enabled = false }
 
 # ------------------------------------------------------------------------------ UI ----
 
@@ -190,8 +225,8 @@ description = "UI end-to-end tests (Playwright) against a real `sparkles serve` 
 depends = ["ui:build", "ui:e2e:browsers"]
 dir = "ui"
 run = '''
-[ -n "${SPARKLES_BIN:-}" ] || cargo build -p sparkles-server
-pnpm e2e
+[ -n "${SPARKLES_BIN:-}" ] || mbx build -p sparkles-server
+mbx sparkles-task -- pnpm e2e
 '''
 
 [tasks."ui:e2e:mock"]
@@ -234,10 +269,10 @@ description = "Format Rust and UI code"
 depends = ["ui:fmt", "node:fmt"]
 # Language-binding crates are their own workspaces, outside `--all`
 run = [
-  "cargo fmt --all",
-  "cargo fmt --manifest-path crates/sparkles-py/Cargo.toml",
-  "cargo fmt --manifest-path crates/sparkles-ffi/Cargo.toml",
-  "cargo fmt --manifest-path crates/sparkles-node/Cargo.toml",
+  "mbx fmt --all",
+  "mbx fmt --manifest-path crates/sparkles-py/Cargo.toml",
+  "mbx fmt --manifest-path crates/sparkles-ffi/Cargo.toml",
+  "mbx fmt --manifest-path crates/sparkles-node/Cargo.toml",
 ]
 
 [tasks."fmt:check"]
@@ -246,10 +281,10 @@ outputs = []
 description = "Check formatting (CI)"
 depends = ["ui:fmt:check", "node:fmt:check"]
 run = [
-  "cargo fmt --all --check",
-  "cargo fmt --manifest-path crates/sparkles-py/Cargo.toml --check",
-  "cargo fmt --manifest-path crates/sparkles-ffi/Cargo.toml --check",
-  "cargo fmt --manifest-path crates/sparkles-node/Cargo.toml --check",
+  "mbx fmt --all --check",
+  "mbx fmt --manifest-path crates/sparkles-py/Cargo.toml --check",
+  "mbx fmt --manifest-path crates/sparkles-ffi/Cargo.toml --check",
+  "mbx fmt --manifest-path crates/sparkles-node/Cargo.toml --check",
 ]
 
 [tasks."fmt:jsonld-compare"]
@@ -281,7 +316,7 @@ run = 'crates/sparkles-fmt/fuzz/run.sh --time "$usage_time" --jobs "$usage_jobs"
 sources = ["@group:rust"]
 outputs = []
 description = "Check that the formatter builds for the browser (wasm32-unknown-unknown, which rust-toolchain.toml installs), with Clippy"
-run = "cargo clippy -p sparkles-fmt-wasm --target wasm32-unknown-unknown -- -D warnings"
+run = "mbx clippy -p sparkles-fmt-wasm --target wasm32-unknown-unknown -- -D warnings"
 
 [tasks.lint]
 sources = ["@group:rust", "@group:ui"]
@@ -289,7 +324,7 @@ outputs = []
 description = "Clippy (warnings are errors) + svelte-check"
 # ui:build first: the server embeds ui/build, which a concurrent UI build rewrites
 depends = ["ui:check", "ui:build"]
-run = "cargo clippy --workspace --all-targets -- -D warnings"
+run = "mbx clippy --workspace --all-targets -- -D warnings"
 
 [tasks."lint:features"]
 sources = ["@group:rust", "@group:ui", "scripts/lint-features.sh"]
@@ -322,7 +357,7 @@ run = "python3 scripts/check-doc-paths.py --code"
 [tasks.check]
 description = "Fast compile check of all crates and targets + UI type check"
 depends = ["ui:check", "ui:build"]
-run = "cargo check --workspace --all-targets"
+run = "mbx check --workspace --all-targets"
 
 [tasks.test]
 sources = ["@group:rust", "@group:ui", "@group:docs", "testsuite/**"]
@@ -331,6 +366,8 @@ outputs = []
 # next to this repository when they exist, so their commits are part of the key.
 cache = { enabled = true, command_inputs = [
   "rustc -V",
+  "mbx --version",
+  "mbx-policy-key.py",
   "git -C ../../apache/jena rev-parse HEAD 2> /dev/null || echo absent",
   "git -C ../../oxigraph/oxigraph rev-parse HEAD 2> /dev/null || echo absent",
 ] }
@@ -340,29 +377,29 @@ depends = ["ui:build"]
 # that the integration tests run each compile the whole server crate, at about 10 GB and
 # 9 GB of rustc memory, and nextest would build them at the same time. Building them one
 # after the other halves the peak at the cost of a few minutes. nextest does not run
-# doctests, so `cargo test --doc` runs them afterwards.
+# doctests, so `mbx test --doc` runs them afterwards.
 run = [
-  "cargo test --workspace --no-run --bin sparkles",
-  "cargo nextest run --workspace --no-fail-fast",
-  "cargo test --workspace --doc",
+  "mbx test --workspace --no-run --bin sparkles",
+  "mbx nextest run --workspace --no-fail-fast",
+  "mbx test --workspace --doc",
 ]
 
 [tasks."test:cargo"]
-description = "All Rust tests with plain `cargo test`, one test binary after another"
+description = "All Rust tests with `mbx test`, one test binary after another"
 depends = ["ui:build"]
-run = "cargo test --workspace"
+run = "mbx test --workspace"
 
 [tasks."test:w3c"]
 description = "W3C SPARQL 1.0/1.1/1.2 conformance with per-suite summaries"
-run = "cargo test -p sparkles-core --test w3c -- --nocapture --test-threads=1"
+run = "mbx test -p sparkles-core --test w3c -- --nocapture --test-threads=1"
 
 [tasks."test:shacl"]
 description = "W3C SHACL Core + SHACL-SPARQL conformance, the SHACL 1.2 list and node expression tests and the SHACLC test pairs"
-run = "cargo test -p sparkles-shacl --test w3c_shacl -- --nocapture"
+run = "mbx test -p sparkles-shacl --test w3c_shacl -- --nocapture"
 
 [tasks."test:shex"]
 description = "shexTest conformance (syntax, negative syntax and structure, representation, validation) with the ShEx 2.2 tests under crates/sparkles-shex/tests/shex22"
-run = "cargo test -p sparkles-shex --test shextest -- --nocapture"
+run = "mbx test -p sparkles-shex --test shextest -- --nocapture"
 
 [tasks."test:bench-scripts"]
 description = "Unit tests of the benchmark record builder and the record comparison (scripts/bench-record.py, bench-regressions.py compare), and the crash harness's own tests (scripts/crash-harness.rs)"
@@ -373,21 +410,21 @@ run = [
 
 [tasks."test:jena-clients"]
 description = "Apache Jena's own HTTP clients (RDFConnectionRemote, RDFConnectionFuseki, GSP, DSP, QueryExecHTTP, UpdateExecHTTP) and Fuseki admin calls against a debug server on a temporary directory; Jena and a JDK come from nixpkgs unless JENA_HOME and JAVA are set (not part of ci; also the flake's jena-clients check)"
-run = "scripts/test-jena-clients.sh"
+run = "mbx sparkles-task -- scripts/test-jena-clients.sh"
 
 [tasks.ci]
-description = "Everything CI should run: formatting, lints, cited paths in the docs, the formatter's browser build, Rust, UI, Python, JVM and Node binding tests, third-party license notices up to date. Logs go to target/ci/logs, and target/ci/summary.txt shows each task's state while it runs"
+description = "Everything CI should run: formatting, lints, cited paths in the docs, the formatter's browser build, Rust, UI, Python, JVM and Node binding tests, third-party license notices up to date. Logs go to .artifacts/ci/logs, and .artifacts/ci/summary.txt shows each task's state while it runs"
 usage = '''
 flag "--fail-fast" help="stop the remaining tasks after the first failure"
 flag "--force" help="run every check even when the task cache has a pass for it"
 flag "--jobs <n>" help="tasks run at once" default="2"
 arg "[task]..." help="run only these CI tasks" var=#true
 '''
-run = 'scripts/ci.sh --jobs "$usage_jobs" ${usage_fail_fast:+--fail-fast} ${usage_force:+--force} ${usage_task:-}'
+run = 'mbx sparkles-task -- scripts/ci.sh --jobs "$usage_jobs" ${usage_fail_fast:+--fail-fast} ${usage_force:+--force} ${usage_task:-}'
 
 [tasks."ci:fast"]
 description = "The quick CI subset for iterating: formatting, cited doc paths, Clippy on the workspace and the Rust tests"
-run = "scripts/ci.sh --fast"
+run = "mbx sparkles-task -- scripts/ci.sh --fast"
 
 # ------------------------------------------------------------------- Python bindings ----
 # crates/sparkles-py is its own cargo workspace (see its Cargo.toml). These tasks build it
@@ -396,37 +433,37 @@ run = "scripts/ci.sh --fast"
 [tasks."py:build"]
 description = "Build the Python bindings' release wheel (abi3, CPython 3.10+) with maturin into target/wheels; extra args go to `maturin build`"
 tools = { "github:PyO3/maturin" = "1.15.0" }
-run = "maturin build --release --locked --manifest-path crates/sparkles-py/Cargo.toml --target-dir target --out target/wheels"
+run = "mbx sparkles-task -- maturin build --release --locked --manifest-path crates/sparkles-py/Cargo.toml --target-dir target --out target/wheels"
 
 [tasks."py:sdist"]
 description = "Build the Python bindings' source distribution into target/wheels, with the vendored spargebra that maturin leaves out"
 tools = { "github:PyO3/maturin" = "1.15.0" }
-run = "python3 scripts/py-sdist.py target/wheels"
+run = "mbx sparkles-task -- python3 scripts/py-sdist.py target/wheels"
 
 [tasks."py:test"]
 sources = ["@group:rust", "scripts/py-test.sh"]
 outputs = []
 description = "Build the Python extension and run its pytest suite (python3 from PATH, with pytest from the dev shell or a venv in target/py-venv); extra args go to pytest"
-run = "scripts/py-test.sh"
+run = "mbx sparkles-task -- scripts/py-test.sh"
 
 [tasks."py:wheel-test"]
 description = "Install a built wheel or sdist into a fresh venv for each given python and run the pytest suite against it: mise run py:wheel-test -- target/wheels/<file> python3"
-run = "scripts/py-wheel-test.sh"
+run = "mbx sparkles-task -- scripts/py-wheel-test.sh"
 
 [tasks."py:lint"]
 sources = ["@group:rust"]
 outputs = []
 description = "Clippy (warnings are errors) on the Python bindings, with their default features and with none"
 run = [
-  "cargo clippy --manifest-path crates/sparkles-py/Cargo.toml --target-dir target --all-targets -- -D warnings",
-  "cargo clippy --manifest-path crates/sparkles-py/Cargo.toml --target-dir target --all-targets --no-default-features -- -D warnings",
+  "mbx clippy --manifest-path crates/sparkles-py/Cargo.toml --target-dir target --all-targets -- -D warnings",
+  "mbx clippy --manifest-path crates/sparkles-py/Cargo.toml --target-dir target --all-targets --no-default-features -- -D warnings",
 ]
 
 [tasks."py:lock"]
 description = "Refresh crates/sparkles-py/Cargo.lock from the root Cargo.lock, after the workspace's dependencies change"
 run = [
   "cp Cargo.lock crates/sparkles-py/Cargo.lock",
-  "cargo metadata --manifest-path crates/sparkles-py/Cargo.toml --format-version 1 > /dev/null",
+  "mbx metadata --manifest-path crates/sparkles-py/Cargo.toml --format-version 1 > /dev/null",
 ]
 
 # ---------------------------------------------------------------------- JVM bindings ----
@@ -436,13 +473,13 @@ run = [
 
 [tasks."jvm:native"]
 description = "Build the JVM bindings' native library (crates/sparkles-ffi, release; JVM_PROFILE=dev for an unoptimized one) and generate its Kotlin bindings into target/jvm/uniffi"
-run = "scripts/jvm-native.sh"
+run = "mbx sparkles-task -- scripts/jvm-native.sh"
 
 [tasks."jvm:build"]
 description = "Build the sparkles-jena jar (jvm/sparkles-jena/build/libs), with the host's native library inside"
 depends = ["jvm:native"]
 dir = "jvm"
-run = "./gradlew --console=plain :sparkles-jena:assemble"
+run = "mbx sparkles-task -- ./gradlew --console=plain :sparkles-jena:assemble"
 
 [tasks."jvm:test"]
 sources = ["@group:rust", "@group:jvm", "scripts/jvm-native.sh"]
@@ -450,34 +487,34 @@ outputs = []
 description = "Jena's contract tests and the binding's own tests on the host's native library, once with the hand-written JNI calls and once without; extra args go to Gradle"
 depends = ["jvm:native"]
 dir = "jvm"
-run = "./gradlew --console=plain :sparkles-jena:test :sparkles-jena:testUniffi"
+run = "mbx sparkles-task -- ./gradlew --console=plain :sparkles-jena:test :sparkles-jena:testUniffi"
 
 [tasks."jvm:sample"]
 description = "Compile the Java sample (jvm/sample-java) with -Xlint:all -Werror against the library, run its tests, and run it"
 depends = ["jvm:native"]
 dir = "jvm"
-run = "./gradlew --console=plain :sample-java:build :sample-java:run"
+run = "mbx sparkles-task -- ./gradlew --console=plain :sample-java:build :sample-java:run"
 
 [tasks."jvm:lint"]
 sources = ["@group:rust"]
 outputs = []
 description = "Clippy (warnings are errors) on the JVM bindings' native library, with its default features and with none"
 run = [
-  "cargo clippy --manifest-path crates/sparkles-ffi/Cargo.toml --target-dir target --all-targets -- -D warnings",
-  "cargo clippy --manifest-path crates/sparkles-ffi/Cargo.toml --target-dir target --all-targets --no-default-features -- -D warnings",
+  "mbx clippy --manifest-path crates/sparkles-ffi/Cargo.toml --target-dir target --all-targets -- -D warnings",
+  "mbx clippy --manifest-path crates/sparkles-ffi/Cargo.toml --target-dir target --all-targets --no-default-features -- -D warnings",
 ]
 
 [tasks."jvm:rust-test"]
 sources = ["@group:rust"]
 outputs = []
 description = "The native library's Rust tests (the batch encoding and the objects the Kotlin library uses)"
-run = "cargo test --manifest-path crates/sparkles-ffi/Cargo.toml --target-dir target"
+run = "mbx test --manifest-path crates/sparkles-ffi/Cargo.toml --target-dir target"
 
 [tasks."jvm:lock"]
 description = "Refresh crates/sparkles-ffi/Cargo.lock from the root Cargo.lock, after the workspace's dependencies change"
 run = [
   "cp Cargo.lock crates/sparkles-ffi/Cargo.lock",
-  "cargo metadata --manifest-path crates/sparkles-ffi/Cargo.toml --format-version 1 > /dev/null",
+  "mbx metadata --manifest-path crates/sparkles-ffi/Cargo.toml --format-version 1 > /dev/null",
 ]
 
 [tasks."jvm:nix-deps"]
@@ -499,7 +536,7 @@ cache = { enabled = false }
 [tasks."node:native"]
 tools = { node = "24" }
 description = "Build and stage the host's Node-API addon (NODE_PROFILE=dev for a debug build)"
-run = "scripts/node-native.sh"
+run = "mbx sparkles-task -- scripts/node-native.sh"
 
 [tasks."node:build"]
 tools = { node = "24" }
@@ -515,9 +552,9 @@ description = "Test Node bindings, remote client and transaction/lifecycle contr
 depends = ["node:build"]
 dir = "js"
 run = [
-  "cargo build --locked --manifest-path ../Cargo.toml -p sparkles-server --bin sparkles",
+  "mbx build --locked --manifest-path ../Cargo.toml -p sparkles-server --bin sparkles",
   # the server cargo just built, under CARGO_TARGET_DIR when one is set
-  'SPARKLES_CLIENT_TEST_SERVER_BIN="${SPARKLES_CLIENT_TEST_SERVER_BIN:-${CARGO_TARGET_DIR:-{{config_root}}/target}/debug/sparkles}" node --test common/test/*.test.mjs client/test/*.test.mjs engine/test/*.test.mjs',
+  'SPARKLES_CLIENT_TEST_SERVER_BIN="${SPARKLES_CLIENT_TEST_SERVER_BIN:-${CARGO_TARGET_DIR:-{{config_root}}/target}/debug/sparkles}" mbx sparkles-task -- node --test common/test/*.test.mjs client/test/*.test.mjs engine/test/*.test.mjs',
 ]
 
 [tasks."node:lint"]
@@ -525,8 +562,8 @@ sources = ["@group:rust"]
 outputs = []
 description = "Clippy on the Node addon with default features and with none"
 run = [
-  "cargo clippy --manifest-path crates/sparkles-node/Cargo.toml --target-dir target --all-targets -- -D warnings",
-  "cargo clippy --manifest-path crates/sparkles-node/Cargo.toml --target-dir target --all-targets --no-default-features -- -D warnings",
+  "mbx clippy --manifest-path crates/sparkles-node/Cargo.toml --target-dir target --all-targets -- -D warnings",
+  "mbx clippy --manifest-path crates/sparkles-node/Cargo.toml --target-dir target --all-targets --no-default-features -- -D warnings",
 ]
 
 [tasks."node:client:gen"]
@@ -561,7 +598,7 @@ run = "pnpm --dir js format:check"
 description = "Refresh the Node addon's Cargo.lock from the workspace's lock"
 run = [
   "cp Cargo.lock crates/sparkles-node/Cargo.lock",
-  "cargo metadata --manifest-path crates/sparkles-node/Cargo.toml --format-version 1 > /dev/null",
+  "mbx metadata --manifest-path crates/sparkles-node/Cargo.toml --format-version 1 > /dev/null",
 ]
 
 # -------------------------------------------------------------------------- build / run ----
@@ -569,7 +606,7 @@ run = [
 [tasks.build]
 description = "Release build of the server/CLI with the embedded UI"
 depends = ["ui:build"]
-run = "cargo build --release -p sparkles-server"
+run = "mbx build --release -p sparkles-server"
 
 [tasks."docker:build"]
 description = "Build the Docker image of compose.yaml (Dockerfile: UI, formatter WebAssembly and release binary); SPARKLES_BUILD_JOBS=N caps the compile jobs; not part of ci"
@@ -604,16 +641,16 @@ run = [
 [tasks.serve]
 description = "Run the server (UI at http://localhost:3030/ui/); extra args go to `sparkles serve`"
 depends = ["build"]
-run = "./target/release/sparkles serve --data ./data"
+run = "mbx run --release -p sparkles-server -- serve --data ./data"
 
 [tasks.doc]
 description = "API docs for the library crates"
-run = "cargo doc --workspace --no-deps --exclude sparkles-server"
+run = "mbx doc --workspace --no-deps --exclude sparkles-server"
 
 [tasks.openapi]
 description = "Rewrite docs/openapi.json, the checked-in copy of the OpenAPI description (a test fails while it is out of date)"
 env = { SPARKLES_UPDATE_OPENAPI = "1" }
-run = "cargo test -p sparkles-server --bin sparkles openapi::tests::checked_in_copy_is_current"
+run = "mbx test -p sparkles-server --bin sparkles openapi::tests::checked_in_copy_is_current"
 
 [tasks."docs:screenshots"]
 description = "The README's screenshots (docs/images/*.png): the release build serves the demo dataset of docs/demo on a free port for the dark-mode pages, the mock backend serves the branch, agent, map-of-relations, Pattern pane, query-page path finder and model configuration pages, all in dark mode, Playwright drives the UI, oxipng shrinks the images (not part of ci)"
@@ -621,7 +658,7 @@ depends = ["build", "ui:e2e:browsers", "ui:wasm"]
 dir = "ui"
 tools = { "github:shssoichiro/oxipng" = "10.2.1" }
 run = '''
-pnpm screenshots
+mbx sparkles-task -- pnpm screenshots
 pnpm screenshots:mock
 oxipng --quiet --opt 4 --strip safe ../docs/images/*.png
 '''
@@ -640,7 +677,7 @@ oxipng --quiet --opt 4 --strip safe ../docs/images/*.png
 description = "Generate a synthetic N-Triples dataset (~10.5 triples per person)"
 usage = '''
 arg "[people]" default="100000" help="number of people to generate"
-arg "[out]" default="target/bench-data/data.nt" help="output file"
+arg "[out]" default=".artifacts/bench-data/data.nt" help="output file"
 '''
 run = '''
 mkdir -p "$(dirname "$usage_out")"
@@ -650,7 +687,7 @@ wc -l "$usage_out"
 
 [tasks.clean]
 description = "Remove build outputs"
-run = ["cargo clean", "rm -rf ui/build ui/.svelte-kit"]
+run = ["mbx clean", "rm -rf ui/build ui/.svelte-kit"]
 
 # ---------------------------------------------------------------------------- benchmarks ----
 
@@ -659,7 +696,7 @@ description = "Sparkles vs Jena/Fuseki, QLever, Fluree and Oxigraph over HTTP: l
 depends = ["build"]
 usage = '''
 arg "[people]" default="100000" help="dataset size in people (~10.5 triples each)"
-arg "[workdir]" default="target/bench" help="data, indexes and results/ (summary.md)"
+arg "[workdir]" default=".artifacts/bench" help="data, indexes and results/ (summary.md)"
 flag "--runs <n>" default="10" help="measured runs per query"
 flag "--warmup <n>" default="2" help="warm-up runs per query"
 flag "--skip-load" help="reuse indexes from a previous run in the same workdir"
@@ -675,11 +712,13 @@ flag "--cold-runs <n>" default="3" help="cold mode: restarts per query"
 flag "--port-base <port>" default="3931" help="the first of the five server ports"
 '''
 run = '''
+mbx sparkles-task -- bash -e <<'SPARKLES_TASK'
 RUNS="$usage_runs" WARMUP="$usage_warmup" ENGINES="$usage_engines" QUERIES="${usage_queries:-}" \
 SKIP_LOAD="${usage_skip_load:+1}" SKIP_QUERIES="${usage_skip_queries:+1}" \
 ANSWERS_ONLY="${usage_answers_only:+1}" MODE="$usage_mode" CHURN="$usage_churn" \
 MIXED_SECONDS="$usage_mixed_seconds" WRITE_RATE="$usage_write_rate" COLD_RUNS="$usage_cold_runs" \
 PORT_BASE="$usage_port_base" scripts/bench.sh "$usage_people" "$(realpath -m "$usage_workdir")"
+SPARKLES_TASK
 '''
 
 [tasks."bench:text"]
@@ -687,21 +726,23 @@ description = "Full-text search: Sparkles text:query vs Fuseki with jena-text vs
 depends = ["build"]
 usage = '''
 arg "[people]" default="100000" help="dataset size in people (~10.5 triples each)"
-arg "[workdir]" default="target/bench-text" help="data, stores, text indexes and results/ (text-summary.md)"
+arg "[workdir]" default=".artifacts/bench-text" help="data, stores, text indexes and results/ (text-summary.md)"
 flag "--runs <n>" default="10" help="measured runs per query"
 flag "--warmup <n>" default="2" help="warm-up runs per query"
 flag "--skip-load" help="reuse the stores and text indexes from a previous run in the same workdir"
 flag "--answers-only" help="only check answers across engines and rebuild the summary"
 flag "--engines <list>" default="sparkles jena qlever" help="engines to (re-)measure; others' results are kept"
 flag "--queries <list>" help="only these queries (default: all 7)"
-flag "--data <file>" help="reuse a generated dataset, e.g. target/bench/data.nt"
+flag "--data <file>" help="reuse a generated dataset, e.g. .artifacts/bench/data.nt"
 flag "--port-base <n>" default="3940" help="the servers listen on the three ports after it"
 '''
 run = '''
+mbx sparkles-task -- bash -e <<'SPARKLES_TASK'
 RUNS="$usage_runs" WARMUP="$usage_warmup" ENGINES="$usage_engines" QUERIES="${usage_queries:-}" \
 SKIP_LOAD="${usage_skip_load:+1}" ANSWERS_ONLY="${usage_answers_only:+1}" \
 DATA="${usage_data:+$(realpath "$usage_data")}" PORT_BASE="$usage_port_base" \
 scripts/bench-text.sh "$usage_people" "$(realpath -m "$usage_workdir")"
+SPARKLES_TASK
 '''
 
 [tasks."bench:vector"]
@@ -710,7 +751,7 @@ depends = ["build"]
 usage = '''
 arg "[n]" default="100000" help="vectors to generate and load"
 arg "[dim]" default="384" help="their dimension"
-arg "[workdir]" default="target/bench-vector" help="data, store and results/ (summary.md), per size"
+arg "[workdir]" default=".artifacts/bench-vector" help="data, store and results/ (summary.md), per size"
 flag "--queries <n>" default="1000" help="query vectors (recall and client latency)"
 flag "--efs <list>" default="16 32 64 128 256" help="efSearch values to measure"
 flag "--runs <n>" default="20" help="hyperfine runs per mode"
@@ -721,9 +762,11 @@ flag "--skip-load" help="reuse the store and index of an earlier run in the same
 flag "--port <n>" default="4800" help="the server's port"
 '''
 run = '''
+mbx sparkles-task -- bash -e <<'SPARKLES_TASK'
 QUERIES="$usage_queries" EFS="$usage_efs" RUNS="$usage_runs" WARMUP="$usage_warmup" M="$usage_m" \
 EFC="$usage_ef_construction" SKIP_LOAD="${usage_skip_load:+1}" PORT="$usage_port" \
 scripts/bench-vector.sh "$usage_n" "$usage_dim" "$(realpath -m "$usage_workdir")"
+SPARKLES_TASK
 '''
 
 [tasks."bench:watdiv"]
@@ -731,7 +774,7 @@ description = "WatDiv basic testing (20 templates: linear, star, snowflake, comp
 depends = ["build"]
 usage = '''
 arg "[scale]" default="100" help="WatDiv scale factor (1 is about 112k triples, 100 about 11.0M)"
-arg "[workdir]" default="target/bench-watdiv" help="generator, data, queries, indexes and results/ (summary.md)"
+arg "[workdir]" default=".artifacts/bench-watdiv" help="generator, data, queries, indexes and results/ (summary.md)"
 flag "--runs <n>" default="10" help="measured runs per query instance"
 flag "--warmup <n>" default="2" help="warm-up runs per query instance"
 flag "--instances <n>" default="5" help="query instances per template (fixed seed)"
@@ -741,9 +784,11 @@ flag "--engines <list>" default="sparkles jena qlever fluree oxigraph" help="eng
 flag "--queries <list>" help="only these templates or instances (L1 S3-2 …)"
 '''
 run = '''
+mbx sparkles-task -- bash -e <<'SPARKLES_TASK'
 RUNS="$usage_runs" WARMUP="$usage_warmup" INSTANCES="$usage_instances" ENGINES="$usage_engines" \
 QUERIES="${usage_queries:-}" SKIP_LOAD="${usage_skip_load:+1}" ANSWERS_ONLY="${usage_answers_only:+1}" \
 scripts/bench-watdiv.sh "$usage_scale" "$(realpath -m "$usage_workdir")"
+SPARKLES_TASK
 '''
 
 [tasks."bench:sp2b"]
@@ -751,7 +796,7 @@ description = "SP2Bench (17 queries over DBLP-like data): the five engines of be
 depends = ["build"]
 usage = '''
 arg "[scale]" default="50k" help="triples to generate: 50k (smoke), 1m, 10m or 100m"
-arg "[workdir]" default="target/bench-sp2b" help="generator, data, queries, indexes and results/ (summary.md, record.json)"
+arg "[workdir]" default=".artifacts/bench-sp2b" help="generator, data, queries, indexes and results/ (summary.md, record.json)"
 flag "--runs <n>" default="10" help="measured runs per query"
 flag "--warmup <n>" default="2" help="warm-up runs per query"
 flag "--cold-runs <n>" default="0" help="restarts per query for the cold measurement (0: none)"
@@ -762,9 +807,11 @@ flag "--queries <list>" help="only these queries (q1 q5a …)"
 flag "--port-base <port>" default="28300" help="the first of the five server ports"
 '''
 run = '''
+mbx sparkles-task -- bash -e <<'SPARKLES_TASK'
 RUNS="$usage_runs" WARMUP="$usage_warmup" COLD_RUNS="$usage_cold_runs" ENGINES="$usage_engines" \
 QUERIES="${usage_queries:-}" SKIP_LOAD="${usage_skip_load:+1}" ANSWERS_ONLY="${usage_answers_only:+1}" \
 PORT_BASE="$usage_port_base" scripts/bench-sp2b.sh "$usage_scale" "$(realpath -m "$usage_workdir")"
+SPARKLES_TASK
 '''
 
 [tasks."bench:lubm"]
@@ -772,7 +819,7 @@ description = "LUBM: Sparkles materializes the data (rdfs and owl-rl), then the 
 depends = ["build"]
 usage = '''
 arg "[universities]" default="1" help="LUBM scale: 1 (smoke), 100 or 1000"
-arg "[workdir]" default="target/bench-lubm" help="generator, data, materialized files, indexes and results/ (summary.md, record.json, inference.json)"
+arg "[workdir]" default=".artifacts/bench-lubm" help="generator, data, materialized files, indexes and results/ (summary.md, record.json, inference.json)"
 flag "--profile <p>" default="owl-rl" help="which materialization the engines load: owl-rl or rdfs"
 flag "--runs <n>" default="10" help="measured runs per query"
 flag "--warmup <n>" default="2" help="warm-up runs per query"
@@ -786,11 +833,13 @@ flag "--infer-profiles <list>" default="rdfs owl-rl" help="the materializations 
 flag "--jena-reasoners <list>" help="also time Jena's rule reasoners: rdfs, owl-micro, owl-mini, owl"
 '''
 run = '''
+mbx sparkles-task -- bash -e <<'SPARKLES_TASK'
 PROFILE="$usage_profile" RUNS="$usage_runs" WARMUP="$usage_warmup" COLD_RUNS="$usage_cold_runs" \
 ENGINES="$usage_engines" QUERIES="${usage_queries:-}" SKIP_LOAD="${usage_skip_load:+1}" \
 ANSWERS_ONLY="${usage_answers_only:+1}" PORT_BASE="$usage_port_base" \
 INFER_PROFILES="$usage_infer_profiles" JENA_REASONERS="${usage_jena_reasoners:-}" \
 scripts/bench-lubm.sh "$usage_universities" "$(realpath -m "$usage_workdir")"
+SPARKLES_TASK
 '''
 
 [tasks."bench:owl2bench"]
@@ -798,7 +847,7 @@ description = "OWL2Bench (OWL 2 RL): Sparkles materializes the data (and Jena's 
 depends = ["build"]
 usage = '''
 arg "[universities]" default="1" help="OWL2Bench scale: 1 (smoke), 2, 5, 10, 20, 50, 100 or 200"
-arg "[workdir]" default="target/bench-owl2bench" help="generator, data, materialized files, indexes and results/ (summary.md, record.json, inference.json)"
+arg "[workdir]" default=".artifacts/bench-owl2bench" help="generator, data, materialized files, indexes and results/ (summary.md, record.json, inference.json)"
 flag "--runs <n>" default="10" help="measured runs per query"
 flag "--warmup <n>" default="2" help="warm-up runs per query"
 flag "--cold-runs <n>" default="0" help="restarts per query for the cold measurement (0: none)"
@@ -810,10 +859,12 @@ flag "--port-base <port>" default="28300" help="the first of the five server por
 flag "--jena-reasoners <list>" help="also time Jena's rule reasoners: rdfs, owl-micro, owl-mini, owl"
 '''
 run = '''
+mbx sparkles-task -- bash -e <<'SPARKLES_TASK'
 RUNS="$usage_runs" WARMUP="$usage_warmup" COLD_RUNS="$usage_cold_runs" \
 ENGINES="$usage_engines" QUERIES="${usage_queries:-}" SKIP_LOAD="${usage_skip_load:+1}" \
 ANSWERS_ONLY="${usage_answers_only:+1}" PORT_BASE="$usage_port_base" JENA_REASONERS="${usage_jena_reasoners:-}" \
 scripts/bench-owl2bench.sh "$usage_universities" "$(realpath -m "$usage_workdir")"
+SPARKLES_TASK
 '''
 
 [tasks."bench:longwrite"]
@@ -821,7 +872,7 @@ description = "Sustained writes with compaction: an hour or more of concurrent r
 depends = ["build"]
 usage = '''
 arg "[data]" default="1000000" help="a person count for gen-data.py (1000000 is 10.5M triples), an N-Triples file, or a directory of .nt.zst files"
-arg "[workdir]" default="target/bench-longwrite" help="data, indexes, store copies and results/ (summary.md, longwrite.json, record.json)"
+arg "[workdir]" default=".artifacts/bench-longwrite" help="data, indexes, store copies and results/ (summary.md, longwrite.json, record.json)"
 flag "--seconds <n>" default="3600" help="length of each engine's run"
 flag "--readers <n>" default="16" help="reader processes"
 flag "--writers <n>" default="1" help="writer processes"
@@ -831,9 +882,11 @@ flag "--skip-load" help="reuse indexes from a previous run in the same workdir"
 flag "--port-base <port>" default="28400" help="the first of the five server ports"
 '''
 run = '''
+mbx sparkles-task -- bash -e <<'SPARKLES_TASK'
 SECONDS_RUN="$usage_seconds" READERS="$usage_readers" WRITERS="$usage_writers" WRITE_RATE="$usage_write_rate" \
 ENGINES="$usage_engines" SKIP_LOAD="${usage_skip_load:+1}" PORT_BASE="$usage_port_base" \
 scripts/bench-longwrite.sh "$usage_data" "$(realpath -m "$usage_workdir")"
+SPARKLES_TASK
 '''
 
 [tasks."bench:bsbm"]
@@ -841,7 +894,7 @@ description = "BSBM Explore or Business Intelligence: per-template times and que
 depends = ["build"]
 usage = '''
 arg "[scale]" default="2000" help="products (2000 is about 725k triples) or a size: 1m, 10m or 100m"
-arg "[workdir]" default="target/bench-bsbm" help="tools, data, queries, indexes and results/ (summary.md, record.json, driver XML)"
+arg "[workdir]" default=".artifacts/bench-bsbm" help="tools, data, queries, indexes and results/ (summary.md, record.json, driver XML)"
 flag "--usecase <u>" default="explore" help="explore or bi"
 flag "--instances <n>" default="3" help="query instances per template"
 flag "--clients <list>" default="1 4 16" help="client counts of the query-mix runs"
@@ -858,11 +911,13 @@ flag "--engines <list>" default="sparkles jena qlever fluree oxigraph" help="eng
 flag "--port-base <port>" default="28300" help="the first of the five server ports"
 '''
 run = '''
+mbx sparkles-task -- bash -e <<'SPARKLES_TASK'
 USECASE="$usage_usecase" INSTANCES="$usage_instances" CLIENTS="$usage_clients" BSBM_RUNS="$usage_bsbm_runs" \
 BSBM_WARMUP="$usage_bsbm_warmup" SKIP_QMPH="${usage_skip_qmph:+1}" RUNS="$usage_runs" WARMUP="$usage_warmup" \
 COLD_RUNS="$usage_cold_runs" QUERIES="${usage_queries:-}" \
 ENGINES="$usage_engines" SKIP_LOAD="${usage_skip_load:+1}" ANSWERS_ONLY="${usage_answers_only:+1}" \
 PORT_BASE="$usage_port_base" scripts/bench-bsbm.sh "$usage_scale" "$(realpath -m "$usage_workdir")"
+SPARKLES_TASK
 '''
 
 [tasks."bench:billion"]
@@ -870,7 +925,7 @@ description = "Real-data benchmark on English DBpedia 2022.12 at a chosen scale,
 depends = ["build"]
 usage = '''
 arg "[scale]" default="50m" help="triples to load (10m, 50m, 250m, 1b…) or full"
-flag "--workdir <dir>" default="target/bench-billion" help="downloads, normalized data, and per scale the indexes and results/ (summary.md)"
+flag "--workdir <dir>" default=".artifacts/bench-billion" help="downloads, normalized data, and per scale the indexes and results/ (summary.md)"
 flag "--engines <list>" default="sparkles qlever" help="engines: sparkles, qlever, jena (TDB2 xloader + Fuseki), oxigraph, fluree"
 flag "--steps <list>" default="fetch prepare slice load queries report" help="steps to run"
 flag "--reload" help="rebuild the engines' indexes at this scale"
@@ -881,10 +936,12 @@ flag "--answers-only" help="only check answers across engines and rebuild the su
 flag "--queries <list>" help="only these queries (names in scripts/bench-billion/queries)"
 '''
 run = '''
+mbx sparkles-task -- bash -e <<'SPARKLES_TASK'
 SCALE="$usage_scale" WORKDIR="$(realpath -m "$usage_workdir")" ENGINES="$usage_engines" \
 RELOAD="${usage_reload:+1}" RUNS="$usage_runs" WARMUP="$usage_warmup" COLD="${usage_no_cold:+0}" \
 ANSWERS_ONLY="${usage_answers_only:+1}" QUERIES="${usage_queries:-}" \
 scripts/bench-billion.sh $usage_steps
+SPARKLES_TASK
 '''
 
 [tasks."bench:reasoner"]
@@ -893,7 +950,7 @@ usage = '''
 arg "[triples]" default="100000"
 arg "[profile]" default="rdfs" help="rdfs | rdfs-simple | owl-rl"
 '''
-run = 'cargo run --release -p sparkles-reasoner --example reasoner-bench -- "$usage_triples" "$usage_profile"'
+run = 'mbx run --release -p sparkles-reasoner --example reasoner-bench -- "$usage_triples" "$usage_profile"'
 
 [tasks."bench:shacl"]
 description = "SHACL validation benchmark on generated data"
@@ -901,10 +958,12 @@ usage = '''
 arg "[people]" default="10000"
 '''
 run = '''
-mkdir -p target/bench-data
-f="target/bench-data/shacl-$usage_people.nt"
+mbx sparkles-task -- bash -e <<'SPARKLES_TASK'
+mkdir -p .artifacts/bench-data
+f=".artifacts/bench-data/shacl-$usage_people.nt"
 [ -f "$f" ] || python3 scripts/gen-data.py "$usage_people" > "$f"
-cargo run --release -p sparkles-shacl --example shacl-bench -- "$f" - 5
+mbx run --release -p sparkles-shacl --example shacl-bench -- "$f" - 5
+SPARKLES_TASK
 '''
 
 [tasks."bench:shex"]
@@ -914,13 +973,15 @@ arg "[people]" default="10000"
 flag "--compare-rudof" help="also compare the result map with an installed rudof (scripts/shex-diff.sh)"
 '''
 run = '''
-mkdir -p target/bench-data
-f="target/bench-data/shacl-$usage_people.nt"
+mbx sparkles-task -- bash -e <<'SPARKLES_TASK'
+mkdir -p .artifacts/bench-data
+f=".artifacts/bench-data/shacl-$usage_people.nt"
 [ -f "$f" ] || python3 scripts/gen-data.py "$usage_people" > "$f"
-cargo run --release -p sparkles-shex --example shex-bench -- "$f" - 5
+mbx run --release -p sparkles-shex --example shex-bench -- "$f" - 5
 if [ -n "${usage_compare_rudof:-}" ]; then
   scripts/shex-diff.sh --compare-rudof "$f" crates/sparkles-shex/examples/bench.shex crates/sparkles-shex/examples/bench.smap
 fi
+SPARKLES_TASK
 '''
 
 [tasks."bench:shacl-write"]
@@ -928,13 +989,15 @@ description = "Write-time SHACL validation: 1-triple INSERT DATA latency with va
 depends = ["build"]
 usage = '''
 arg "[people]" default="10000" help="dataset size in people (~10.5 triples each)"
-arg "[workdir]" default="target/bench-shacl-write" help="data, databases and results/ (shacl-write.md)"
+arg "[workdir]" default=".artifacts/bench-shacl-write" help="data, databases and results/ (shacl-write.md)"
 flag "--runs <n>" default="20" help="measured runs per configuration"
 flag "--warmup <n>" default="3" help="warm-up runs per configuration"
 flag "--delta <n>" default="10000" help="pending delta quads of the second round"
 '''
 run = '''
+mbx sparkles-task -- bash -e <<'SPARKLES_TASK'
 WARMUP="$usage_warmup" RUNS="$usage_runs" DELTA="$usage_delta" scripts/bench-shacl-write.sh "$usage_people" "$(realpath -m "$usage_workdir")"
+SPARKLES_TASK
 '''
 
 [tasks."bench:shex-write"]
@@ -942,13 +1005,15 @@ description = "Write-time ShEx validation: 1-triple INSERT DATA latency with val
 depends = ["build"]
 usage = '''
 arg "[people]" default="10000" help="dataset size in people (~10.5 triples each)"
-arg "[workdir]" default="target/bench-shex-write" help="data, databases and results/ (shex-write.md)"
+arg "[workdir]" default=".artifacts/bench-shex-write" help="data, databases and results/ (shex-write.md)"
 flag "--runs <n>" default="20" help="measured runs per configuration"
 flag "--warmup <n>" default="3" help="warm-up runs per configuration"
 flag "--delta <n>" default="10000" help="pending delta quads of the second round"
 '''
 run = '''
+mbx sparkles-task -- bash -e <<'SPARKLES_TASK'
 WARMUP="$usage_warmup" RUNS="$usage_runs" DELTA="$usage_delta" scripts/bench-shacl-write.sh --lang shex "$usage_people" "$(realpath -m "$usage_workdir")"
+SPARKLES_TASK
 '''
 
 [tasks."bench:bindings"]
@@ -956,7 +1021,7 @@ description = "Each binding against its incumbent: Jena on Sparkles vs TDB2 and 
 tools = { node = "24" }
 usage = '''
 arg "[people]" default="100000" help="dataset size in people (~10.5 triples each)"
-arg "[workdir]" default="target/bench-bindings" help="data, stores, the third-party libraries and results/ (summary.md, raw.json)"
+arg "[workdir]" default=".artifacts/bench-bindings" help="data, stores, the third-party libraries and results/ (summary.md, raw.json)"
 flag "--langs <list>" default="jvm,python,node" help="the bindings to compare, comma-separated"
 flag "--engines <list>" help="only these engines, e.g. jvm:tdb2,python:pyoxigraph"
 flag "--cases <list>" help="only these cases, e.g. iter-all,q:star-join"
@@ -972,6 +1037,7 @@ flag "--no-build" help="use the bindings as built"
 flag "--jvm-opts <opts>" help="more JVM options, e.g. -Dsparkles.jni=false for the UniFFI calls alone"
 '''
 run = '''
+mbx sparkles-task -- bash -e <<'SPARKLES_TASK'
 args=(--people "$usage_people" --workdir "$(realpath -m "$usage_workdir")" --langs "$usage_langs"
   --runs "$usage_runs" --warmup "$usage_warmup" --processes "$usage_processes"
   --timeout "$usage_timeout" --budget "$usage_budget")
@@ -983,13 +1049,14 @@ args=(--people "$usage_people" --workdir "$(realpath -m "$usage_workdir")" --lan
 [ -n "${usage_no_build:-}" ] && args+=(--no-build)
 [ -n "${usage_jvm_opts:-}" ] && args+=(--jvm-opts="$usage_jvm_opts")
 python3 scripts/bench-bindings/bench.py "${args[@]}"
+SPARKLES_TASK
 '''
 
 [tasks."bench:jena"]
 description = "Realistic Jena work (Model, RDFS, small SPARQL, updates, loads, Fuseki) on Sparkles against TDB2 and TIM, one and four threads, answers checked first"
 usage = '''
 arg "[people]" default="10000" help="dataset size in people (~10.5 triples each)"
-arg "[workdir]" default="target/bench-jena" help="data, stores and results/ (summary.md, raw.json)"
+arg "[workdir]" default=".artifacts/bench-jena" help="data, stores and results/ (summary.md, raw.json)"
 flag "--arm <arm>" var=#true help="LABEL=ENGINE[;JVM OPTION]..., repeatable, e.g. \"before=sparkles-mem;-Dsparkles.smallQueries=0\" (default: sparkles=sparkles-mem, sparkles-disk=sparkles, tdb2=tdb2, tim=tim)"
 flag "--cases <list>" help="only these cases, comma-separated"
 flag "--rounds <n>" default="2" help="timing processes per arm, in A/B/B/A order"
@@ -1000,6 +1067,7 @@ flag "--cpus <list>" help="pin every process with taskset, e.g. 8-15"
 flag "--no-build" help="use the bindings as built"
 '''
 run = '''
+mbx sparkles-task -- bash -e <<'SPARKLES_TASK'
 args=(--people "$usage_people" --workdir "$(realpath -m "$usage_workdir")" --rounds "$usage_rounds"
   --seconds "$usage_seconds" --warmup-seconds "$usage_warmup_seconds" --threads "$usage_threads")
 if [ -n "${usage_arm:-}" ]; then
@@ -1009,23 +1077,26 @@ fi
 [ -n "${usage_cpus:-}" ] && args+=(--cpus "$usage_cpus")
 [ -n "${usage_no_build:-}" ] && args+=(--no-build)
 python3 scripts/bench-bindings/jena.py "${args[@]}"
+SPARKLES_TASK
 '''
 
 [tasks."bench:jena-nsc"]
 description = "bench:jena on an ephemeral Namespace instance (needs nsc, uv and zstd); options as scripts/nsc-jena.sh --help, jena.py options after --"
-run = "scripts/nsc-jena.sh"
+run = "mbx sparkles-task -- scripts/nsc-jena.sh"
 
 [tasks."bench:backup"]
 description = "Backup repositories on an existing database: full and incremental backup, restore and verify times to an fs repository"
 depends = ["build"]
 usage = '''
 arg "<db>" help="the database directory (copied, never changed; it must not be open in a server)"
-arg "[workdir]" default="target/bench-backup" help="the repository, copies and results/ (backup.md); on the file system to measure"
+arg "[workdir]" default=".artifacts/bench-backup" help="the repository, copies and results/ (backup.md); on the file system to measure"
 flag "--runs <n>" default="3" help="rounds (each: full, commits, incremental, restore, verify)"
 flag "--commits <n>" default="1000" help="single-quad commits before the incremental backup"
 '''
 run = '''
+mbx sparkles-task -- bash -e <<'SPARKLES_TASK'
 RUNS="$usage_runs" COMMITS="$usage_commits" scripts/backup-bench.sh "$usage_db" "$(realpath -m "$usage_workdir")"
+SPARKLES_TASK
 '''
 
 [tasks."bench:nsc-writes"]
@@ -1042,14 +1113,16 @@ flag "--write-rate <n>" default="0" help="pace the writers of writers and mixed 
 flag "--index <kind>" default="none" help="an index configured on every store after loading: none, text, geo or embed"
 flag "--cargo-args <flags>" help="extra cargo build flags for revisions"
 flag "--duration <d>" default="2h" help="the instance's lifetime cap"
-flag "--out <dir>" help="results directory (default target/nsc-writes/<UTC time>)"
+flag "--out <dir>" help="results directory (default .artifacts/nsc-writes/<UTC time>)"
 '''
 run = '''
+mbx sparkles-task -- bash -e <<'SPARKLES_TASK'
 # shellcheck disable=SC2154,SC2086 # usage_variants is a list of variants
 scripts/nsc-writes.sh --people "$usage_people" --scenarios "$usage_scenarios" --rounds "$usage_rounds" \
   --changes "$usage_changes" --writer-changes "$usage_writer_changes" --mixed-changes "$usage_mixed_changes" \
   --write-rate "$usage_write_rate" --index "$usage_index" --duration "$usage_duration" ${usage_cargo_args:+--cargo-args "$usage_cargo_args"} \
   ${usage_out:+--out "$usage_out"} $usage_variants
+SPARKLES_TASK
 '''
 
 [tasks."bench:nsc"]
@@ -1069,13 +1142,15 @@ flag "--serve-args <flags>" help="extra sparkles serve flags for both servers"
 flag "--execution <mode>" help="execution=MODE with every query, or A_MODE,B_MODE per variant"
 flag "--cargo-args <flags>" help="extra cargo build flags for revisions"
 flag "--duration <d>" default="2h" help="the instance's lifetime cap"
-flag "--out <dir>" help="results directory (default target/nsc-bench/<UTC time>)"
+flag "--out <dir>" help="results directory (default .artifacts/nsc-bench/<UTC time>)"
 '''
 run = '''
+mbx sparkles-task -- bash -e <<'SPARKLES_TASK'
 scripts/nsc-bench.sh --people "$usage_people" --rounds "$usage_rounds" --reps "$usage_reps" \
   --warmup "$usage_warmup" --rayon-threads "$usage_rayon_threads" --duration "$usage_duration" \
   ${usage_queries:+--queries "$usage_queries"} ${usage_query_dir:+--query-dir "$usage_query_dir"} \
   ${usage_serve_args:+--serve-args "$usage_serve_args"} ${usage_execution:+--execution "$usage_execution"} \
   ${usage_cargo_args:+--cargo-args "$usage_cargo_args"} \
   ${usage_out:+--out "$usage_out"} ${usage_no_spin:+--no-spin} "$usage_a" "$usage_b"
+SPARKLES_TASK
 '''

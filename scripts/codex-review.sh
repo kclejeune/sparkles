@@ -11,12 +11,12 @@
 # BASE     the commit the lane started from (the review covers BASE..TIP)
 # CONTEXT  what the lane was meant to do: specs, scope, anything the reviewer needs
 #
-# Output goes to $AUDIT_DIR/NAME/ (default target/audits): review.md and review.log.
+# Output goes to $AUDIT_DIR/NAME/ (default .artifacts/audits): review.md and review.log.
 set -euo pipefail
 
 NAME=$1 TIP=$2 BASE=$3 CONTEXT=$4
 ROOT=$(git -C "$(dirname "$0")" rev-parse --show-toplevel)
-OUT=${AUDIT_DIR:-$ROOT/target/audits}/$NAME
+OUT=${AUDIT_DIR:-$ROOT/.artifacts/audits}/$NAME
 SCRATCH=$ROOT/../sparkles-audit-$NAME
 MODEL=(-m gpt-6.1-sol -c model_reasoning_effort="high")
 mkdir -p "$OUT"

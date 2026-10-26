@@ -33,7 +33,6 @@ on:
       - "rust-toolchain.toml"
       - "scripts/jvm-native.sh"
       - ".github/workflows/jvm-bindings.yml"
-      - ".github/actions/setup-rust/**"
   pull_request:
     paths: *paths
   workflow_dispatch:
@@ -74,12 +73,14 @@ jobs:
         with: { distribution: temurin, java-version: "17" }
       # saves Gradle's caches from main only, by default
       - uses: gradle/actions/setup-gradle@v4
-      - uses: ./.github/actions/setup-rust
+      - uses: actions-rust-lang/setup-rust-toolchain@v1
+        with: { cache: false, rustflags: "" }
+      - uses: jdx/mr-boxington-action@v1.7.3
         with:
-          cache-key: jvm-natives-${{ matrix.platform }}-${{ env.JVM_PROFILE }}
-          workspaces: |
-            . -> target
-            crates/sparkles-ffi -> ../../target
+          version: 1.28.0
+          github-cache-mode: objects
+          cache-generation: sparkles-jvm-natives-${{ matrix.platform }}-${{ env.JVM_PROFILE }}-v1
+          save-on-workflow-dispatch: ${{ github.ref == 'refs/heads/main' }}
       - name: Build native library and generate matching bindings
         shell: bash
         run: |
@@ -90,7 +91,7 @@ jobs:
       - name: Run native and Jena contract tests
         shell: bash
         run: |
-          cargo test --locked --manifest-path crates/sparkles-ffi/Cargo.toml --target-dir target --lib
+          mbx test --locked --manifest-path crates/sparkles-ffi/Cargo.toml --target-dir target --lib
           cd jvm
           ./gradlew --no-daemon --console=plain :sparkles-jena:test :sparkles-jena:testUniffi :sample-java:build
       - name: Stage platform resources
@@ -121,17 +122,19 @@ jobs:
         with: { distribution: temurin, java-version: "17" }
       # saves Gradle's caches from main only, by default
       - uses: gradle/actions/setup-gradle@v4
-      - uses: ./.github/actions/setup-rust
+      - uses: actions-rust-lang/setup-rust-toolchain@v1
+        with: { cache: false, rustflags: "" }
+      - uses: jdx/mr-boxington-action@v1.7.3
         with:
-          cache-key: jvm-bindgen
-          workspaces: |
-            . -> target
-            crates/sparkles-ffi -> ../../target
+          version: 1.28.0
+          github-cache-mode: objects
+          cache-generation: sparkles-jvm-bindgen-v1
+          save-on-workflow-dispatch: ${{ github.ref == 'refs/heads/main' }}
       - uses: actions/download-artifact@v4
         with: { pattern: "jvm-native-*", path: target/jvm/natives, merge-multiple: true }
       - name: Generate bindings and assemble all-platform artifacts
         run: |
-          cargo build --locked --manifest-path crates/sparkles-ffi/Cargo.toml --target-dir target --features bindgen --bin uniffi-bindgen
+          mbx build --locked --manifest-path crates/sparkles-ffi/Cargo.toml --target-dir target --features bindgen --bin uniffi-bindgen
           target/debug/uniffi-bindgen generate --library target/jvm/natives/linux-x86_64/libsparkles_ffi.so --language kotlin --no-format --metadata-no-deps --config crates/sparkles-ffi/bindgen.toml --out-dir target/jvm/uniffi
           cd jvm
           ./gradlew --no-daemon --console=plain -Psparkles.nativeDir=../target/jvm/natives :sparkles-jena:assemble :sparkles-jena-natives:assemble :sparkles-jena-all:assemble
@@ -157,16 +160,18 @@ jobs:
         with: { distribution: temurin, java-version: "${{ matrix.java }}" }
       # saves Gradle's caches from main only, by default
       - uses: gradle/actions/setup-gradle@v4
-      - uses: ./.github/actions/setup-rust
+      - uses: actions-rust-lang/setup-rust-toolchain@v1
+        with: { cache: false, rustflags: "" }
+      - uses: jdx/mr-boxington-action@v1.7.3
         with:
-          cache-key: jvm-bindgen
-          workspaces: |
-            . -> target
-            crates/sparkles-ffi -> ../../target
+          version: 1.28.0
+          github-cache-mode: objects
+          cache-generation: sparkles-jvm-bindgen-v1
+          save-on-workflow-dispatch: ${{ github.ref == 'refs/heads/main' }}
       - uses: actions/download-artifact@v4
         with: { name: jvm-native-linux-x86_64, path: target/jvm/natives }
       - run: |
-          cargo build --locked --manifest-path crates/sparkles-ffi/Cargo.toml --target-dir target --features bindgen --bin uniffi-bindgen
+          mbx build --locked --manifest-path crates/sparkles-ffi/Cargo.toml --target-dir target --features bindgen --bin uniffi-bindgen
           target/debug/uniffi-bindgen generate --library target/jvm/natives/linux-x86_64/libsparkles_ffi.so --language kotlin --no-format --metadata-no-deps --config crates/sparkles-ffi/bindgen.toml --out-dir target/jvm/uniffi
           cd jvm
           ./gradlew --no-daemon --console=plain -Psparkles.nativeDir=../target/jvm/natives -Psparkles.javaVersion=${{ matrix.java }} -Psparkles.jenaVersion=${{ matrix.jena }} :sparkles-jena:test :sample-java:build
@@ -183,12 +188,14 @@ jobs:
         with: { distribution: temurin, java-version: "17" }
       # saves Gradle's caches from main only, by default
       - uses: gradle/actions/setup-gradle@v4
-      - uses: ./.github/actions/setup-rust
+      - uses: actions-rust-lang/setup-rust-toolchain@v1
+        with: { cache: false, rustflags: "" }
+      - uses: jdx/mr-boxington-action@v1.7.3
         with:
-          cache-key: jvm-bindgen
-          workspaces: |
-            . -> target
-            crates/sparkles-ffi -> ../../target
+          version: 1.28.0
+          github-cache-mode: objects
+          cache-generation: sparkles-jvm-bindgen-v1
+          save-on-workflow-dispatch: ${{ github.ref == 'refs/heads/main' }}
       - uses: actions/download-artifact@v4
         with: { pattern: "jvm-native-*", path: target/jvm/natives, merge-multiple: true }
       # Maven Central through the Central Portal's OSSRH Staging API: Gradle deploys the
@@ -209,7 +216,7 @@ jobs:
           done
           version="${GITHUB_REF_NAME#jvm-v}"
           grep -qx "version=$version" jvm/gradle.properties || { echo "tag $GITHUB_REF_NAME does not match jvm/gradle.properties" >&2; exit 1; }
-          cargo build --locked --manifest-path crates/sparkles-ffi/Cargo.toml --target-dir target --features bindgen --bin uniffi-bindgen
+          mbx build --locked --manifest-path crates/sparkles-ffi/Cargo.toml --target-dir target --features bindgen --bin uniffi-bindgen
           target/debug/uniffi-bindgen generate --library target/jvm/natives/linux-x86_64/libsparkles_ffi.so --language kotlin --no-format --metadata-no-deps --config crates/sparkles-ffi/bindgen.toml --out-dir target/jvm/uniffi
           cd jvm
           # The publication and classifier-jar tasks cannot be stored in the configuration cache.

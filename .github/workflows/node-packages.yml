@@ -37,8 +37,11 @@ on:
       - 'Cargo.lock'
       - 'rust-toolchain.toml'
       - 'scripts/node-native.sh'
+      - 'scripts/install-mbx-container.sh'
+      - 'scripts/node-native.sh'
+      - 'scripts/ci-node-musl.sh'
+      - 'mise.toml'
       - '.github/workflows/node-packages.yml'
-      - '.github/actions/setup-rust/**'
   pull_request:
     paths: *paths
   workflow_dispatch:
@@ -81,12 +84,23 @@ jobs:
       - name: Check release tag matches package versions
         if: startsWith(github.ref, 'refs/tags/')
         run: node js/scripts/check-version.mjs "${{ github.ref_name }}"
-      - uses: ./.github/actions/setup-rust
+      - uses: actions-rust-lang/setup-rust-toolchain@v1
+        with: { cache: false, rustflags: "" }
+      - uses: jdx/mr-boxington-action@v1.7.3
         with:
-          cache-key: node-${{ matrix.platform }}-${{ env.NODE_PROFILE }}
-          workspaces: |
-            . -> target
-            crates/sparkles-node -> ../../target
+          version: 1.28.0
+          github-cache-mode: objects
+          cache-generation: sparkles-node-${{ matrix.platform }}-${{ env.NODE_PROFILE }}-v1
+          save-on-workflow-dispatch: ${{ github.ref == 'refs/heads/main' }}
+      # This build tool invokes Cargo itself.
+      - name: Route build-tool Cargo calls through Boxington
+        shell: bash
+        run: |
+          mbx setup --yes
+          case "$RUNNER_OS" in
+            Linux) printf '%s\n' "${XDG_DATA_HOME:-$HOME/.local/share}/mbx/bin" >> "$GITHUB_PATH" ;;
+            macOS) printf '%s\n' "$HOME/Library/Application Support/mbx/bin" >> "$GITHUB_PATH" ;;
+          esac
       - run: pnpm --dir js install --frozen-lockfile
       - name: Build native Node-API module
         working-directory: js/engine
@@ -99,7 +113,7 @@ jobs:
       # The remote client's real-server test runs on one runner, against a debug server.
       - name: Build the server for the remote client test
         if: matrix.platform == 'linux-x64'
-        run: cargo build --locked -p sparkles-server --bin sparkles
+        run: mbx build --locked -p sparkles-server --bin sparkles
       - name: Test Node 22, 24 and 26
         shell: bash
         env:
@@ -140,45 +154,47 @@ jobs:
       matrix:
         arch: [amd64, arm64]
     runs-on: ${{ matrix.arch == 'arm64' && 'ubuntu-24.04-arm' || 'ubuntu-24.04' }}
+    env:
+      MBX_CACHE_DIR: ${{ github.workspace }}/.cache/mbx
     steps:
       - uses: actions/checkout@v5
-      # The build runs in an Alpine container with the workspace mounted. Its Rust toolchain,
-      # Cargo registry, pnpm store and target directory live in the workspace so that the
-      # GitHub Actions cache keeps them between runs. The cache is separate from the
-      # glibc one because these artifacts are built for musl.
-      - uses: actions/cache@v4
+      - uses: actions-rust-lang/setup-rust-toolchain@v1
+        with: { cache: false, rustflags: "" }
+      - uses: jdx/mr-boxington-action@v1.7.3
+        with:
+          version: 1.28.0
+          github-cache-mode: objects
+          cache-generation: sparkles-node-musl-${{ env.NODE_PROFILE }}-v1
+          save-on-workflow-dispatch: ${{ github.ref == 'refs/heads/main' }}
+      # Rustup and pnpm remain tool caches. Compiler outputs
+      # are carried by the mbx action rather than a second cached target tree.
+      - uses: actions/cache/restore@v4
+        id: musl-tools
         with:
           path: |
-            target
-            .cache/musl
-          key: node-musl-${{ runner.os }}-${{ runner.arch }}-${{ env.NODE_PROFILE }}-${{ hashFiles('rust-toolchain.toml') }}-${{ hashFiles('Cargo.lock', 'crates/sparkles-node/Cargo.lock', 'js/pnpm-lock.yaml', '.github/workflows/node-packages.yml') }}
-          restore-keys: |
-            node-musl-${{ runner.os }}-${{ runner.arch }}-${{ env.NODE_PROFILE }}-${{ hashFiles('rust-toolchain.toml') }}-
+            .cache/musl/cargo/bin
+            .cache/musl/rustup
+            .cache/musl/pnpm
+          key: node-musl-tools-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('rust-toolchain.toml', 'js/pnpm-lock.yaml') }}
+          restore-keys: node-musl-tools-${{ runner.os }}-${{ runner.arch }}-
       - name: Build and test the addon on Alpine
         run: |
-          docker run --rm -e NODE_PROFILE -v "$PWD:/work" -w /work node:24-alpine sh -ec '
-            apk add --no-cache bash curl build-base cmake perl git
-            export CARGO_HOME=/work/.cache/musl/cargo RUSTUP_HOME=/work/.cache/musl/rustup
-            export PATH="$CARGO_HOME/bin:$PATH"
-            if [ ! -x "$CARGO_HOME/bin/cargo" ]; then
-              curl --proto "=https" --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal --no-modify-path
-            fi
-            npm install -g pnpm@10.34.5
-            pnpm config set store-dir /work/.cache/musl/pnpm
-            pnpm --dir js install --frozen-lockfile
-            bash scripts/node-native.sh
-            pnpm --dir js build
-            node --test js/common/test/*.test.mjs js/client/test/*.test.mjs js/engine/test/*.test.mjs
-            node js/scripts/platforms.mjs
-            node js/scripts/pack-runtime.mjs packed
-            mkdir installed
-            cd installed
-            npm init -y
-            npm install --offline --ignore-scripts --omit=optional ../packed/*.tgz
-            cp ../js/scripts/packed-smoke.mjs ../js/scripts/packed-types.mts .
-            node packed-smoke.mjs
-            node node_modules/typescript/bin/tsc --noEmit --strict --target es2023 --module nodenext packed-types.mts
-          '
+          docker run --rm -e CI=true -e NODE_PROFILE -e MBX_CACHE_EXPORT_GROUP \
+            -e MBX_CACHE_DIR=/work/.cache/mbx -e MBX_SHIMS_DIR=/work/.cache/container-shims \
+            -v "$PWD:/work" -w /work node:24-alpine \
+            sh -ec 'apk add --no-cache bash; exec bash scripts/ci-node-musl.sh'
+      - name: Restore host ownership of container cache files
+        if: always()
+        run: |
+          if [ -d .cache ]; then sudo chown -R "$(id -u):$(id -g)" .cache; fi
+      - uses: actions/cache/save@v4
+        if: github.ref == 'refs/heads/main' && steps.musl-tools.outputs.cache-hit != 'true'
+        with:
+          path: |
+            .cache/musl/cargo/bin
+            .cache/musl/rustup
+            .cache/musl/pnpm
+          key: ${{ steps.musl-tools.outputs.cache-primary-key }}
       - uses: actions/upload-artifact@v4
         with:
           name: node-musl-${{ matrix.arch }}

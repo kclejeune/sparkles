@@ -19,9 +19,9 @@ dir=debug
 
 # the generator runs once per build and needs no optimizations; it is built in the dev
 # profile so that the library's own build keeps its features
-cargo build --locked --manifest-path "$crate/Cargo.toml" --target-dir target \
+mbx build --locked --manifest-path "$crate/Cargo.toml" --target-dir target \
   --features bindgen --bin uniffi-bindgen
-cargo build --locked --manifest-path "$crate/Cargo.toml" --target-dir target \
+mbx build --locked --manifest-path "$crate/Cargo.toml" --target-dir target \
   --profile "$profile" --lib
 
 lib="target/$dir/libsparkles_ffi.so"

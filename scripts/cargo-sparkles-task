@@ -1,0 +1,11 @@
+#!/usr/bin/env bash
+# Cargo invokes subcommands with their name as the first argument. Running this
+# through mbx keeps the workspace's managed target leased until the task exits.
+set -euo pipefail
+[ "${1:-}" != sparkles-task ] || shift
+[ "${1:-}" != -- ] || shift
+if [ "$#" -eq 0 ]; then
+  echo 'usage: mbx sparkles-task -- COMMAND [ARGUMENT...]' >&2
+  exit 2
+fi
+exec "$@"
