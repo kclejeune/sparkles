@@ -267,3 +267,42 @@ fn complete_literal_components_are_budgeted_before_owned_or_decimal_validation()
             .all(|(_, largest, _)| *largest < 1024 * 1024)
     );
 }
+
+#[test]
+fn oversized_escaped_settings_iris_and_field_names_refuse_before_serde_scratch_copies() {
+    let _measure = MEASURE_LOCK.lock().unwrap();
+    let mut observations = Vec::new();
+    for target in ["sourceRecords", "proposals", "fieldName"] {
+        let large = format!(r"urn:\u0061{}", "a".repeat(12 * 1024 * 1024));
+        let json = match target {
+            "sourceRecords" => format!(
+                r#"{{"format":1,"profile":1,"enabled":false,"sourceRecords":["{large}"],"proposals":[]}}"#
+            ),
+            "proposals" => format!(
+                r#"{{"format":1,"profile":1,"enabled":false,"sourceRecords":[],"proposals":["{large}"]}}"#
+            ),
+            "fieldName" => format!(
+                r#"{{"format":1,"profile":1,"enabled":false,"sourceRecords":[],"proposals":[],"{large}":0}}"#
+            ),
+            _ => unreachable!(),
+        };
+        let control = Control::none();
+        let (result, largest, _) =
+            measure(|| sparkles_core::evidence::Settings::from_slice(json.as_bytes(), &control));
+        let budget = matches!(
+            result,
+            Err(Error::BudgetExceeded(Budget {
+                kind: BudgetKind::DecompressedBytes,
+                ..
+            }))
+        );
+        observations.push((target, largest, budget));
+    }
+    eprintln!("escaped settings allocations: {observations:?}");
+    assert!(observations.iter().all(|(_, _, budget)| *budget));
+    assert!(
+        observations
+            .iter()
+            .all(|(_, largest, _)| *largest < 1024 * 1024)
+    );
+}

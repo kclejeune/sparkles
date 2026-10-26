@@ -12,6 +12,11 @@ pub const MAX_SETTINGS_GRAPHS: usize = 1024;
 pub const MAX_SETTINGS_GRAPH_IRI_BYTES: usize = 4096;
 pub const MAX_SETTINGS_BYTES: usize = 16 * 1024 * 1024;
 
+// One decoded UTF-8 byte takes at most six raw JSON bytes (\u00xx).
+// Surrogate pairs take twelve raw bytes for four decoded bytes. This therefore
+// preserves every supported IRI while bounding Serde scratch before any visitor.
+const MAX_RAW_STRING_BYTES: usize = 6 * MAX_SETTINGS_GRAPH_IRI_BYTES;
+
 /// Complete effective settings, after C19's declared/runtime layering and locks.
 /// Unknown fields are refused even while disabled. Main-effective committed
 /// configuration and target-branch materialization remain separate runtime work.
@@ -67,11 +72,13 @@ impl Settings {
         control.check()?;
         input_bound(bytes.len())?;
         let mut scanner = nesting::Scanner::new(nesting::Syntax::Json, nesting::MAX_ELEMENTS);
+        let mut strings = StringBounds::default();
         for chunk in bytes.chunks(64 * 1024) {
             control.check()?;
             scanner
                 .feed(chunk)
                 .map_err(|_| Error::invalid("evidence settings exceed the JSON nesting bound"))?;
+            strings.feed(chunk)?;
         }
         #[derive(Deserialize)]
         struct Header {
@@ -169,6 +176,42 @@ impl Settings {
             bytes,
             digest,
         })
+    }
+}
+
+/// No decoding, allocation or semantic interpretation. Full JSON/Unicode and
+/// duplicate-field validation still belongs to Serde after universal input bounds.
+#[derive(Default)]
+struct StringBounds {
+    quoted: bool,
+    escaped: bool,
+    bytes: usize,
+}
+
+impl StringBounds {
+    fn feed(&mut self, bytes: &[u8]) -> Result<()> {
+        for byte in bytes {
+            if !self.quoted {
+                if *byte == b'"' {
+                    self.quoted = true;
+                    self.escaped = false;
+                    self.bytes = 0;
+                }
+            } else if *byte == b'"' && !self.escaped {
+                self.quoted = false;
+            } else {
+                self.bytes += 1;
+                if self.bytes > MAX_RAW_STRING_BYTES {
+                    return Err(Error::BudgetExceeded(Budget {
+                        kind: BudgetKind::DecompressedBytes,
+                        limit: MAX_RAW_STRING_BYTES as u64,
+                        requested: self.bytes as u64,
+                    }));
+                }
+                self.escaped = !self.escaped && *byte == b'\\';
+            }
+        }
+        Ok(())
     }
 }
 
@@ -431,6 +474,74 @@ mod tests {
         assert!(settings.validate(&Control::none()).is_err());
         let bytes = serde_json::to_vec(&settings).unwrap();
         assert!(Settings::from_slice(&bytes, &Control::none()).is_err());
+    }
+
+    fn escaped(value: &str) -> String {
+        value
+            .encode_utf16()
+            .map(|unit| format!("\\u{unit:04x}"))
+            .collect()
+    }
+
+    #[test]
+    fn preflight_preserves_limit_escaped_ascii_unicode_and_surrogate_iris_in_both_roles() {
+        for graph in [
+            format!("urn:{}", "a".repeat(MAX_SETTINGS_GRAPH_IRI_BYTES - 4)),
+            format!("urn:{}", "é".repeat((MAX_SETTINGS_GRAPH_IRI_BYTES - 4) / 2)),
+            format!(
+                "urn:{}",
+                "🚀".repeat((MAX_SETTINGS_GRAPH_IRI_BYTES - 4) / 4)
+            ),
+        ] {
+            assert_eq!(graph.len(), MAX_SETTINGS_GRAPH_IRI_BYTES);
+            let encoded = escaped(&graph);
+            let json = format!(
+                r#"{{"format":1,"profile":1,"enabled":true,"sourceRecords":["{encoded}"],"proposals":["{encoded}"]}}"#
+            );
+            let settings = Settings::from_slice(json.as_bytes(), &Control::none()).unwrap();
+            assert_eq!(
+                settings.source_records.as_slice(),
+                std::slice::from_ref(&graph)
+            );
+            assert_eq!(settings.proposals, [graph]);
+            settings.canonical(&Control::none()).unwrap();
+        }
+        for graph in [r"urn:\uD800", r"urn:\uDC00", r"urn:\uD800\u0061"] {
+            let json = format!(
+                r#"{{"format":1,"profile":1,"enabled":true,"sourceRecords":["{graph}"],"proposals":["urn:p"]}}"#
+            );
+            assert!(Settings::from_slice(json.as_bytes(), &Control::none()).is_err());
+        }
+    }
+
+    #[test]
+    fn string_preflight_does_not_decode_or_drop_escaped_field_and_version_semantics() {
+        let valid = br#"{"\u0066ormat":1,"profile":1,"enabled":false,"source\u0052ecords":[],"proposals":[]}"#;
+        assert_eq!(
+            Settings::from_slice(valid, &Control::none()).unwrap(),
+            Settings::default()
+        );
+        let duplicate = br#"{"format":1,"profile":1,"enabled":false,"sourceRecords":[],"source\u0052ecords":[],"proposals":[]}"#;
+        assert!(Settings::from_slice(duplicate, &Control::none()).is_err());
+        let future = br#"{"\u0066ormat":2,"profile":1,"sourceRecords":{"future":"shape"}}"#;
+        assert!(matches!(
+            Settings::from_slice(future, &Control::none()),
+            Err(Error::Unsupported(_))
+        ));
+        // Universal syntax/resource bounds precede version interpretation, as the
+        // raw-input and nesting limits already do.
+        let oversized = format!(
+            r#"{{"format":1,"profile":1,"{}":0}}"#,
+            "a".repeat(MAX_RAW_STRING_BYTES + 1)
+        );
+        assert!(matches!(
+            Settings::from_slice(oversized.as_bytes(), &Control::none()),
+            Err(Error::BudgetExceeded(_))
+        ));
+        let mut scanner = StringBounds::default();
+        scanner.feed(br#""a\""#).unwrap();
+        scanner.feed(br#"b\\c""#).unwrap();
+        assert!(!scanner.quoted);
     }
 
     #[test]
