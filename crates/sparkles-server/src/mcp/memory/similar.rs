@@ -118,9 +118,19 @@ impl Tools<'_> {
         {
             let deadline = self.call.arrived + timeout;
             let snap = self.snapshot(&ds, None, None, deadline)?;
-            let question = sparkles::store::embed_texts(&snap, predicate, &[&a.question], true);
+            let question = crate::ask::profile::nested(
+                crate::ask::profile::Stage::ExampleQueryEmbedding,
+                snap.commit,
+                1,
+                || sparkles::store::embed_texts(&snap, predicate, &[&a.question], true),
+            );
             let doc_refs: Vec<&str> = docs.iter().map(String::as_str).collect();
-            let stored = sparkles::store::embed_texts(&snap, predicate, &doc_refs, false);
+            let stored = crate::ask::profile::nested(
+                crate::ask::profile::Stage::ExampleDocumentEmbedding,
+                snap.commit,
+                doc_refs.len(),
+                || sparkles::store::embed_texts(&snap, predicate, &doc_refs, false),
+            );
             match (question, stored) {
                 (Ok(q), Ok(d)) if q.len() == 1 && d.len() == docs.len() => {
                     let sims: Vec<f64> = d.iter().map(|v| cosine(&q[0], v)).collect();

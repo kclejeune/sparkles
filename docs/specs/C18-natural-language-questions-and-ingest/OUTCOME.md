@@ -1639,3 +1639,36 @@ has $15.4166424 remaining and no unresolved or positive held charges. No Opus ca
 made. Costs use new request IDs, since raw case costs include charges from earlier runs
 with the same case IDs. The [paid record](../../benchmarks/2026-10-25-ask-grounding-paid.json)
 retains exact policies, paired case changes, tokens, costs and provenance.
+
+## Ask stage diagnostics for item 318
+
+The local Ask pipeline records bounded debug spans and completion events for total
+grounding, both schema projections, stored examples, entity linking, optional community
+recall, query checks and query execution. A completion records one call, inclusive
+nanoseconds, a finite outcome and error category, and the tool-returned commit when
+available. Every scoped completion also records a process-generated numeric pipeline
+identifier and the context-window size when selected. These fields survive the
+production JSON formatter without ancestor span lists. Nested synchronous asks and unwinding restore
+the previous scope, while standalone tool stages remain unscoped. No added field
+contains a client identifier, question, label, arbitrary IRI, prompt or error message.
+
+Separate nested stages identify the example query and document embedding preparation
+and the linker's vector search. Their times include cache lookup, admission and any
+local or remote model work. The vector-search stage also includes query execution, so
+it is not a measurement of remote inference alone. Parent stages include their children.
+The existing `usage.elapsedMs`, `modelMs`, token counts and role-step accounting retain
+their meanings. In particular, a clarification can have zero Ask role calls while its
+tools request embeddings.
+
+The provider-free regression fixture covers initial clarification and a follow-up,
+exact and absent mentions, optional recall, small and large context windows, and two
+principals with different graph visibility in both access orders. It compares answers,
+choices, ground events and draft prompts with tracing disabled and enabled. Only timing
+fields are excluded. A hidden namesake must appear only in the unrestricted choices.
+The embedding fixture uses a loopback mock and requires an actual embedding request
+while the initial clarification still reports zero Ask model calls and milliseconds.
+
+This checkpoint adds diagnostics and fixture measurements. It does not optimize the
+pipeline or explain the retained DBpedia campaign's multi-second residual. Item 318
+remains open for representative stage profiles, a justified optimization and matched
+validation of its latency and semantic effects. No paid provider was called.

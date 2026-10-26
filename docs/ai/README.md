@@ -81,6 +81,25 @@ build community reports.
   `/$/metrics`. `scripts/eval-ask` measures each model on the 68 questions of
   `testsuite/ask/demo.json`.
 
+### Ask stage diagnostics
+
+Set `RUST_LOG=warn,sparkles::ask::profile=debug` to record bounded stage timings
+through the existing log and tracing configuration. Local Ask records grounding,
+common and question-ranked schema retrieval, examples, entity linking, optional
+community recall, query checking and execution. Each completion records one call,
+inclusive nanoseconds, a finite outcome and error category, and the selected commit
+when the tool returns one. Each scoped completion also records a process-generated numeric pipeline identifier
+and the context-window size when selected. These remain in JSON logs without
+ancestor span lists. Standalone tool stages have no Ask identifier. These are diagnostic fields, not metric labels.
+The added fields contain no questions, labels, entity IRIs, prompts or error messages.
+
+Nested stages identify example-query and example-document embedding preparation and
+linker vector search. These include caches, admission and any local or remote model
+work. Vector search also includes query execution. Parent timings include their child
+stages and must not be summed together. These diagnostics do not change the API's
+`elapsedMs` or `modelMs`. The latter remains the inclusive Ask role-call time and does
+not include embeddings performed inside tools.
+
 ### Agent memory
 
 * `assert_facts`, over MCP or `POST /{ds}/facts`, writes facts into one named graph per
