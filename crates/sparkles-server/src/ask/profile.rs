@@ -5,10 +5,74 @@
 use super::Ground;
 use crate::mcp::errors::ToolError;
 use serde_json::Value;
+use std::cell::Cell;
+use std::marker::PhantomData;
+use std::rc::Rc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Instant;
 use tracing::Span;
 
 pub(crate) const TARGET: &str = "sparkles::ask::profile";
+
+#[derive(Clone, Copy)]
+struct Scope {
+    id: u64,
+    context_tokens: Option<u64>,
+}
+
+thread_local! {
+    static SCOPE: Cell<Option<Scope>> = const { Cell::new(None) };
+}
+static NEXT_PIPELINE: AtomicU64 = AtomicU64::new(1);
+
+/// Ask is synchronous. Restore the caller's diagnostic scope after a nested ask
+/// or unwinding, and prevent this guard from moving to another thread.
+pub(super) struct Pipeline {
+    previous: Option<Scope>,
+    id: Option<u64>,
+    _not_send: PhantomData<Rc<()>>,
+}
+
+impl Pipeline {
+    pub(super) fn id(&self) -> Option<u64> {
+        self.id
+    }
+}
+
+impl Drop for Pipeline {
+    fn drop(&mut self) {
+        let _ = SCOPE.try_with(|scope| scope.set(self.previous));
+    }
+}
+
+pub(super) fn pipeline() -> Pipeline {
+    let scope = if tracing::enabled!(target: TARGET, tracing::Level::DEBUG) {
+        // Stop assigning identifiers on exhaustion instead of reusing one.
+        NEXT_PIPELINE
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |id| id.checked_add(1))
+            .ok()
+            .map(|id| Scope {
+                id,
+                context_tokens: None,
+            })
+    } else {
+        None
+    };
+    Pipeline {
+        previous: SCOPE.with(|current| current.replace(scope)),
+        id: scope.map(|scope| scope.id),
+        _not_send: PhantomData,
+    }
+}
+
+pub(super) fn context_tokens(tokens: u64) {
+    SCOPE.with(|current| {
+        if let Some(mut scope) = current.get() {
+            scope.context_tokens = Some(tokens);
+            current.set(Some(scope));
+        }
+    });
+}
 
 #[derive(Clone, Copy)]
 pub(crate) enum Stage {
@@ -47,19 +111,29 @@ struct Timer {
     started: Option<Instant>,
     span: Span,
     stage: Stage,
+    pipeline_id: Option<u64>,
+    context_tokens: Option<u64>,
+    inputs: Option<usize>,
 }
 
 impl Timer {
     fn new(stage: Stage, context_tokens: Option<u64>, inputs: Option<usize>) -> Self {
         let enabled = tracing::enabled!(target: TARGET, tracing::Level::DEBUG);
+        let scope = if enabled { SCOPE.with(Cell::get) } else { None };
+        let pipeline_id = scope.map(|scope| scope.id);
+        let context_tokens =
+            context_tokens.or_else(|| scope.and_then(|scope| scope.context_tokens));
         Self {
             started: enabled.then(Instant::now),
             span: if enabled {
-                tracing::debug_span!(target: TARGET, "ask.stage", stage = stage.name(), context_tokens, inputs)
+                tracing::debug_span!(target: TARGET, "ask.stage", stage = stage.name(), pipeline_id, context_tokens, inputs)
             } else {
                 Span::none()
             },
             stage,
+            pipeline_id,
+            context_tokens,
+            inputs,
         }
     }
 
@@ -67,6 +141,8 @@ impl Timer {
         if let Some(started) = self.started {
             tracing::debug!(target: TARGET, parent: &self.span,
                 stage = self.stage.name(), calls = 1_u64,
+                pipeline_id = self.pipeline_id, context_tokens = self.context_tokens,
+                inputs = self.inputs,
                 elapsed_ns = started.elapsed().as_nanos().min(u128::from(u64::MAX)) as u64,
                 outcome, error_code, commit,
                 "Ask stage completed");

@@ -230,7 +230,8 @@ pub fn ask(
     on: &mut OnEvent,
 ) -> Value {
     let started = Instant::now();
-    let pipeline = tracing::debug_span!(target: profile::TARGET, "ask.pipeline", context_tokens = tracing::field::Empty);
+    let profile = profile::pipeline();
+    let pipeline = tracing::debug_span!(target: profile::TARGET, "ask.pipeline", pipeline_id = profile.id(), context_tokens = tracing::field::Empty);
     let _entered = pipeline.enter();
     let mut lists = o.lists.clone().unwrap_or_else(|| {
         Role::ALL
@@ -641,6 +642,7 @@ impl Asking<'_, '_> {
             .models
             .resolved(&draft_pair)
             .map_or(crate::models::DEFAULT_CONTEXT_TOKENS, |r| r.context_tokens);
+        profile::context_tokens(context_tokens);
         tracing::Span::current().record("context_tokens", context_tokens);
         let ground = self.ground(context_tokens);
         // C22 §7.1: a question that names an entity linked exactly is local

@@ -66,9 +66,15 @@ impl<S: Subscriber + for<'a> LookupSpan<'a>> Layer<S> for Capture {
 }
 
 fn capture<T>(f: impl FnOnce() -> T) -> (T, Vec<Value>) {
+    // Keep the multi-dispatcher path active while parallel tests first register
+    // shared callsites, following the HTTP access-log capture helpers.
+    let _second = tracing::Dispatch::new(tracing_subscriber::registry());
     let capture = Capture::default();
     let subscriber = tracing_subscriber::registry().with(capture.clone());
-    let result = tracing::subscriber::with_default(subscriber, f);
+    let result = tracing::subscriber::with_default(subscriber, || {
+        tracing::callsite::rebuild_interest_cache();
+        f()
+    });
     let records = capture.0.lock().clone();
     (result, records)
 }
@@ -328,8 +334,7 @@ fn stage_errors_are_bounded_and_checks_record_rejection() {
 }
 
 #[cfg(feature = "text")]
-#[test]
-fn embedding_work_is_nested_and_is_not_ask_role_model_time() {
+fn embedding_fixture() -> (McpServer, sparkles::vector::embed::mock::MockProvider) {
     use sparkles::vector::embed::{Environment, mock::MockProvider};
     let s = fixture();
     let ds = s.state.datasets()["org"].clone();
@@ -357,6 +362,13 @@ fn embedding_work_is_nested_and_is_not_ask_role_model_time() {
         .vector()
         .embed_until_idle(Duration::from_secs(30))
         .unwrap();
+    (s, provider)
+}
+
+#[cfg(feature = "text")]
+#[test]
+fn embedding_work_is_nested_and_is_not_ask_role_model_time() {
+    let (s, provider) = embedding_fixture();
     let before = provider.state().requests;
     let mock = scripted(vec![], json!({}));
     let m = models(&mock.url(), json!({}));
@@ -387,4 +399,223 @@ fn embedding_work_is_nested_and_is_not_ask_role_model_time() {
         );
     }
     assert!(!json!(stages).to_string().contains(&provider.url()));
+}
+
+#[derive(Clone, Default)]
+struct JsonBuffer(Arc<Mutex<Vec<u8>>>);
+
+impl std::io::Write for JsonBuffer {
+    fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+        self.0.lock().extend_from_slice(bytes);
+        Ok(bytes.len())
+    }
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for JsonBuffer {
+    type Writer = Self;
+    fn make_writer(&'a self) -> Self {
+        self.clone()
+    }
+}
+
+fn production_json<T>(call: impl FnOnce() -> T) -> (T, Vec<Value>) {
+    let _second = tracing::Dispatch::new(tracing_subscriber::registry());
+    let buffer = JsonBuffer::default();
+    let fmt = tracing_subscriber::fmt::layer()
+        .json()
+        .with_current_span(true)
+        .with_span_list(false)
+        .with_writer(buffer.clone());
+    let subscriber = tracing_subscriber::registry()
+        .with(tracing_subscriber::EnvFilter::new(
+            "warn,sparkles::ask::profile=debug",
+        ))
+        .with(fmt);
+    let result = tracing::subscriber::with_default(subscriber, || {
+        tracing::callsite::rebuild_interest_cache();
+        call()
+    });
+    let text = String::from_utf8(buffer.0.lock().clone()).unwrap();
+    let lines = text
+        .lines()
+        .map(|line| serde_json::from_str::<Value>(line).unwrap())
+        .filter(|line| line["target"] == TARGET)
+        .collect();
+    (result, lines)
+}
+
+#[cfg(feature = "text")]
+#[test]
+fn production_json_correlates_requests_after_grounding_and_nested_embeddings() {
+    let (s, provider) = embedding_fixture();
+    let mock = scripted(
+        vec![draft("SELECT ?v WHERE { VALUES ?v { 7 } }")],
+        json!({}),
+    );
+    let small = models(&mock.url(), json!({"contextTokens":4096}));
+    let large = models(&mock.url(), json!({"contextTokens":200000}));
+    let options = |clarification| AskOptions {
+        summary: false,
+        mode: AskMode::Local,
+        id: Some("private-client-identifier".into()),
+        clarification,
+        ..opts("Which team is Ana on?")
+    };
+    let first = options(None);
+    let second = options(Some("res:ana2".into()));
+    let before = provider.state().requests;
+    let (answers, logs) = production_json(|| {
+        let mut events = Vec::new();
+        let first = ask(&s, &small, &Principal::local(), &first, &mut |e, v| {
+            events.push(json!({"event":e,"value":v}))
+        });
+        let second = ask(&s, &large, &Principal::local(), &second, &mut |e, v| {
+            events.push(json!({"event":e,"value":v}))
+        });
+        (first, second, events)
+    });
+    assert!(provider.state().requests > before);
+    assert!(logs.iter().all(|line| line.get("spans").is_none()));
+    let baseline_first = observed(&s, &small, &Principal::local(), &first, false);
+    let baseline_second = observed(&s, &large, &Principal::local(), &second, false);
+    assert_eq!(semantic(answers.0.clone()), semantic(baseline_first.0));
+    assert_eq!(semantic(answers.1.clone()), semantic(baseline_second.0));
+    let mut baseline_events = baseline_first.1;
+    baseline_events.extend(baseline_second.1);
+    assert_eq!(semantic(json!(answers.2)), semantic(json!(baseline_events)));
+    assert_eq!(answers.0["outcome"], "clarify");
+    assert_eq!(answers.0["usage"]["modelCalls"], 0);
+    assert_eq!(answers.0["usage"]["modelMs"], 0);
+    assert_eq!(answers.1["outcome"], "answered");
+    let mut ids = BTreeSet::new();
+    for context in [4096, 200000] {
+        let scoped: Vec<&Value> = logs
+            .iter()
+            .map(|v| &v["fields"])
+            .filter(|v| v["context_tokens"] == context)
+            .collect();
+        assert!(!scoped.is_empty(), "missing context {context}: {logs:?}");
+        let id = scoped[0]["pipeline_id"]
+            .as_u64()
+            .expect("numeric process-generated pipeline identifier");
+        assert!(ids.insert(id), "two asks reused a pipeline identifier");
+        assert!(scoped.iter().all(|v| v["pipeline_id"] == id));
+        for stage in [
+            "schema_common",
+            "schema_question",
+            "examples",
+            "linker",
+            "ground",
+            "example_query_embedding",
+            "example_document_embedding",
+            "linker_vector_search",
+        ] {
+            assert!(
+                scoped.iter().any(|v| v["stage"] == stage),
+                "missing {stage} for {context}"
+            );
+        }
+        for stage in ["query_check", "query_execution"] {
+            assert_eq!(
+                scoped.iter().any(|v| v["stage"] == stage),
+                context == 200000
+            );
+        }
+    }
+    assert!(
+        logs.iter()
+            .all(|v| v["fields"]["pipeline_id"].is_u64() && v["fields"]["context_tokens"].is_u64())
+    );
+    for secret in [
+        "private-client-identifier",
+        "Ana",
+        "res:ana2",
+        "http:",
+        "urn:",
+        "SELECT",
+    ] {
+        assert!(
+            !json!(logs).to_string().contains(secret),
+            "profile logs leaked {secret}"
+        );
+    }
+}
+
+#[test]
+fn production_json_restores_scope_after_nested_asks_and_unwind() {
+    let s = fixture();
+    let mock = scripted(vec![], json!({}));
+    let small = models(&mock.url(), json!({"contextTokens":4096}));
+    let large = models(&mock.url(), json!({"contextTokens":200000}));
+    let o = AskOptions {
+        summary: false,
+        mode: AskMode::Local,
+        ..opts("Which team is Ana on?")
+    };
+    let (_, logs) = production_json(|| {
+        let outer = ask(&s, &small, &Principal::local(), &o, &mut |event, _| {
+            if event == "ground" {
+                let inner = ask(&s, &large, &Principal::local(), &o, &mut |_, _| {});
+                assert_eq!(inner["outcome"], "clarify");
+            }
+        });
+        assert_eq!(outer["outcome"], "clarify");
+        let standalone =
+            || profile::nested(profile::Stage::LinkerVectorSearch, 1, 0, || Ok::<_, ()>(()));
+        standalone().unwrap();
+        let unwind = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            ask(&s, &large, &Principal::local(), &o, &mut |event, _| {
+                if event == "ground" {
+                    panic!("intentional diagnostic-scope unwind");
+                }
+            })
+        }));
+        assert!(unwind.is_err());
+        standalone().unwrap();
+    });
+    assert!(mock.requests().is_empty());
+    let standalone: Vec<&Value> = logs
+        .iter()
+        .map(|v| &v["fields"])
+        .filter(|v| v["stage"] == "linker_vector_search")
+        .collect();
+    assert_eq!(standalone.len(), 2);
+    assert!(
+        standalone
+            .iter()
+            .all(|v| v["pipeline_id"].is_null() && v["context_tokens"].is_null())
+    );
+    let scoped: Vec<&Value> = logs
+        .iter()
+        .map(|v| &v["fields"])
+        .filter(|v| v["stage"] != "linker_vector_search")
+        .collect();
+    let ids: BTreeSet<u64> = scoped
+        .iter()
+        .map(|v| v["pipeline_id"].as_u64().unwrap())
+        .collect();
+    assert_eq!(ids.len(), 3);
+    let outer_id = scoped.iter().find(|v| v["context_tokens"] == 4096).unwrap()["pipeline_id"]
+        .as_u64()
+        .unwrap();
+    assert!(
+        scoped
+            .iter()
+            .filter(|v| v["context_tokens"] == 4096)
+            .all(|v| v["pipeline_id"] == outer_id)
+    );
+    assert!(
+        scoped
+            .iter()
+            .any(|v| v["stage"] == "ground" && v["pipeline_id"] == outer_id)
+    );
+    assert!(
+        scoped
+            .iter()
+            .filter(|v| v["context_tokens"] == 200000)
+            .all(|v| v["pipeline_id"] != outer_id)
+    );
 }
