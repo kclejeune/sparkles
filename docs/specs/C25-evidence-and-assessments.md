@@ -480,6 +480,13 @@ revision are resolved together, and literal components are budgeted before valid
 can copy them. Independent framing goldens, selector oracles, allocation checks and
 cancellation controls cover this preparation contract.
 
+The same module decodes complete versioned evidence settings and produces canonical
+bytes, values and digests. Source and proposal roles select unordered graph sets and
+may share a graph. The union is bounded to 1024 IRIs, each at most 4096 UTF-8 bytes.
+Raw JSON strings are bounded before decoding can allocate escaped-string scratch.
+Canonical settings are data for the managed configuration factory, not an authenticated
+revision, graph reservation or administration capability.
+
 `prepare_input` returns explicit requirements for references that need retained-view,
 identity or method resolution. A runtime must discharge those requirements through
 the caller's authorized view before publication. These helpers do not open a dataset,
@@ -493,3 +500,7 @@ projections and reversible identity decisions. C26 supplies the shared managed-w
 and admission boundary. Phase 3 integrates the new records with C17/C18, F22 and C22.
 The state-machine, authorization, direct-write, crash and retry acceptance cases remain
 required before those runtime phases are complete.
+
+Exact retained-reference resolution additionally uses item 395 and
+[C29](C29-bounded-view-preparation/README.md) for bounded history and permission
+preparation. A point-only reader does not complete the general guarded-view contract.

@@ -692,7 +692,7 @@ def tool_versions(langs):
 def main():
     ap = argparse.ArgumentParser(description=__doc__.split("\n\n")[0], formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--people", type=int, default=100000, help="dataset size in people (about 10.5 triples each)")
-    ap.add_argument("--workdir", type=Path, default=ROOT / "target" / "bench-bindings")
+    ap.add_argument("--workdir", type=Path, default=ROOT / ".artifacts" / "bench-bindings")
     ap.add_argument("--langs", default="jvm,python,node")
     ap.add_argument("--engines", default="", help="only these engines, e.g. jvm:tdb2,python:pyoxigraph")
     ap.add_argument("--cases", default="", help="only these cases, e.g. iter-all,q:star-join")

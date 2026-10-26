@@ -1605,3 +1605,42 @@ processes retain durable acknowledgements, pass80000 churn state checks and offl
 checks, and expose the different completed reader work in mixed throughput comparisons.
 Direct synchronization and small absolute serial differences support deferring further
 work under290. No change to durability or crash-recovery behavior is inferred.
+
+### Preparation-batch short-query control
+
+An initial optional-count client-wall flag did not recur with a larger interleaved
+Namespace sample or a pinned Intel control using the same binaries and matching
+answers. The preparation changes retain their functionality without a query-specific
+optimization. Item 328 remains the broader follow-up for short-query calibration and
+any reproducible costs; this check does not establish a cross-engine performance claim.
+
+
+### Short queries after evidence integration
+
+The matched `5a7e4238` to `adc2dcbe` integration screen initially flagged `minus`,
+`star-lookup` and `values-star` on Namespace. A longer rerun brought every change below
+10%, and a quiet pinned Intel control measured −0.7%, −0.3% and +2.8% in server
+execution. Client time stayed within 0.8%. All answers agree, with matching compilers
+and exact retained binary hashes. The [qualified result and immutable samples](../benchmarks/synthetic/RESULTS.md#short-query-integration-control)
+keep these internal comparisons separate from cross-engine tables.
+
+Item 328 retains the accepted `values-star` drift of about 0.4 microseconds. Recheck
+it when the short-query execution path next changes, distinguishing instruction cost
+from code placement. A material persistent cost or a simple broad improvement should
+drive further optimization.
+
+### Standard capability integration screen
+
+The `c0b2f7fb` to `a71fd2ab` comparison includes the standard local embedding, OCR and
+encrypted backup capabilities, macOS key handling and the history-gap correction.
+Matching compiler records and retained binary hashes identify both builds. The
+Namespace comparison used 1.05M triples and returned matching answers across all 30
+synthetic queries. Local model and OCR execution were unconfigured.
+
+An eight-round rerun with 100 timed requests per query and server process brought
+the initial `path-plus`,
+`predicate-subjects` and `subquery-agg` flags below the 10% integration gate. It also
+rechecked `optional-count` and `order-by-full`. Large timing spreads prevent a precise
+cost claim from these Namespace results. Item 328 retains matched quiet Intel checks
+of these queries, including the small accepted `order-by-full` increase. Further
+optimization remains reserved for a material persistent cost or a simple broad fix.

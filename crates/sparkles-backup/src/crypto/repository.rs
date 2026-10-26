@@ -629,7 +629,10 @@ pub(crate) async fn put_slot(store: &Arc<dyn ObjectStore>, slot: &Slot) -> Resul
 #[cfg(test)]
 mod tests {
     use super::*;
-    #[cfg(all(feature = "fs", any(target_os = "linux", target_os = "android")))]
+    #[cfg(all(
+        feature = "fs",
+        any(target_os = "linux", target_os = "android", target_os = "macos")
+    ))]
     #[tokio::test]
     async fn filesystem_initializer_cleanup_retries_directory_sync_without_rewriting_winner() {
         let tmp = tempfile::tempdir().unwrap();

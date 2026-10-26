@@ -18,12 +18,9 @@
   installShellFiles,
   makeBinaryWrapper,
   ui ? null,
-  # cargo features of sparkles-server on top of its defaults: the local embedding
-  # runtime of spec F12 by default, which adds about 5 MB to the binary and runs nothing
-  # until a local provider is configured, and on Linux encrypted backup repositories,
-  # whose protected key memory needs Linux; [ ] leaves them out. Runtime secrets are
-  # sealed in every build with the default `backup` feature, which this package keeps
-  features ? [ "embed-local" ] ++ lib.optional stdenv.hostPlatform.isLinux "backup-encryption",
+  # Additional features for a custom build. The standard Cargo defaults already
+  # include local embeddings, encrypted repositories and optional OCR runtime support.
+  features ? [ ],
 }:
 let
   featureArgs = lib.optionalString (
@@ -52,8 +49,9 @@ let
       ../crates
       ../vendor
       ../THIRD_PARTY_LICENSES.md
-      # vendored test data the crates' tests read (Jena's TriX files)
+      # Vendored fixtures read by engine and facade tests.
       ../testsuite/trix
+      ../testsuite/evidence
     ];
   };
 

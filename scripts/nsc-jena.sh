@@ -16,7 +16,7 @@
 # results directory, logs and env.txt (kernel, CPU, memory, Java) are downloaded to OUT.
 #
 # Options:
-#   --out DIR           results directory (default target/nsc-jena/<UTC time>)
+#   --out DIR           results directory (default .artifacts/nsc-jena/<UTC time>)
 #   --extra-lib PATH    another native library to ship, repeatable. An arm uses it with
 #                       -Dsparkles.native.path=/root/nsc-jena/repo/native/NAME
 #   --no-build          ship the bindings as they are built
@@ -68,7 +68,7 @@ while [ $# -gt 0 ]; do
   shift 2 || usage 1
 done
 for t in nsc zstd uv curl; do command -v "$t" > /dev/null || die "$t is not on PATH"; done
-OUT=$(realpath -m "${OUT:-$ROOT/target/nsc-jena/$(date -u +%Y%m%dT%H%M%SZ)}")
+OUT=$(realpath -m "${OUT:-$ROOT/.artifacts/nsc-jena/$(date -u +%Y%m%dT%H%M%SZ)}")
 mkdir -p "$OUT/logs"
 
 if [ "$BUILD" = 1 ]; then

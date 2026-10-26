@@ -7,8 +7,8 @@
 > benchmark. Phase 2 shipped: `sparkles models`, the server's model store flags, the
 > `local` provider kind, vector indexes that name a provider of the model configuration,
 > the model state in `GET /$/models` and on the index card, and the NixOS helper and
-> options. The build feature `embed-local` is off in cargo's default features and on in
-> the flake's packages.
+> options. The standard Cargo defaults, flake packages and Docker images include
+> the `embed-local` runtime. Model snapshots are loaded through runtime configuration.
 >
 > **User docs:** [API: Embeddings on write](../API.md#embeddings-on-write) · [API: Model providers](../API.md#model-providers) · [Usage: Local embedding models](../USAGE.md#local-embedding-models) · [Usage: NixOS](../USAGE.md#local-embedding-models-on-nixos)
 >
@@ -481,7 +481,8 @@ capabilities and remaining work are described by the spec status and Outcome.
   follows the layer structure of the Qwen3 configuration and was checked against the
   similarity matrix of the model card.
 - **Dependencies:** `sparkles-modelstore` is always built and adds no crate the server
-  did not already have. The opt-in feature `embed-local` adds `sparkles-embed` with
+  did not already have. The `embed-local` feature, included in the standard server,
+  adds `sparkles-embed` with
   `candle-core`, `candle-nn` and `candle-transformers` 0.9.2 (MIT OR Apache-2.0),
   `tokenizers` 0.23 without default features (Apache-2.0), `safetensors` (Apache-2.0)
   and `gemm` and `pulp` (MIT), 49 crates in all under MIT, Apache-2.0, Zlib or
@@ -544,18 +545,16 @@ capabilities and remaining work are described by the spec status and Outcome.
 **The default build.** The maintainer asked for a decision on the cargo default, the
 Nix package and the container image.
 
-* Cargo's default features leave `embed-local` out. Every `cargo test` and clippy run
-  of the server would otherwise compile Candle in debug mode, and the library crates
-  and the feature matrix stay as they were.
+* The standard server now includes `embed-local` in Cargo's default features.
+  This aligns source builds with the packaged server. Candle is compiled for
+  the standard profile, while models remain unloaded until configured.
 * The flake's `sparkles` and `sparkles-cli` packages include it (`nix/package.nix`
-  takes `features`, `[ "embed-local" ]` by default). The cost is about 5 MB of binary,
+  takes additional `features`, an empty list by default). The cost is about 5 MB of binary,
   nothing runs until a local provider is configured, and a NixOS deployment would
   otherwise rebuild the whole package from source to turn it on.
-* The container image should include it for the same reason, so that a Helm
-  deployment with a model store can use it. The Dockerfile belongs to another change.
-  The recommended form is an `ARG FEATURES=embed-local` passed as
-  `cargo build --release --locked -p sparkles-server --features "${FEATURES}"`, so an
-  image without the runtime stays one build argument away.
+* Container images use the same default-capability binary. The `FEATURES` build
+  argument adds custom features and defaults to empty. Model stores remain runtime
+  configuration.
 
 **Measurements.** All on one machine, an Intel Core Ultra X7 358H with 16 cores and
 30 GB of memory, while other work kept the load average at 5 to 12, so the absolute

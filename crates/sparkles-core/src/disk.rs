@@ -195,9 +195,11 @@ static STEADY_WRITEBACK: crate::index::EnvSwitch =
     crate::index::EnvSwitch::new("SPARKLES_WRITEBACK");
 
 /// A [`WritebackFile`] starts writeback of its data every this many bytes.
+#[cfg(target_os = "linux")]
 const WRITEBACK_EVERY: u64 = 8 << 20;
 /// A [`WritebackFile`] waits until the data this many bytes behind the end has reached
 /// the device before it writes on.
+#[cfg(target_os = "linux")]
 const WRITEBACK_BEHIND: u64 = 64 << 20;
 
 /// A file written front to back that sends its data to the device as it grows.
@@ -205,14 +207,15 @@ const WRITEBACK_BEHIND: u64 = 64 << 20;
 /// Linux keeps written data in dirty pages until a share of memory is dirty and then
 /// throttles every thread that writes, whatever file it writes to. A build that writes
 /// a large index in a few streams fills that share quickly and is then held in bursts.
-/// This file starts writeback of every [`WRITEBACK_EVERY`] bytes as soon as they are
-/// written (`sync_file_range`), and waits for the data [`WRITEBACK_BEHIND`] bytes
+/// This file starts writeback every 8 MiB as soon as those bytes are
+/// written (`sync_file_range`), and waits for the data 64 MiB
 /// back, so each file keeps a bounded amount of dirty data and its final `fsync` has
 /// little left to do. Elsewhere it is a plain file.
 pub struct WritebackFile {
     f: std::fs::File,
     written: u64,
     /// the end of the data whose writeback was started
+    #[cfg(target_os = "linux")]
     started: u64,
 }
 
@@ -221,6 +224,7 @@ impl WritebackFile {
         WritebackFile {
             f,
             written: 0,
+            #[cfg(target_os = "linux")]
             started: 0,
         }
     }

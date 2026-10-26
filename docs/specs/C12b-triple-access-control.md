@@ -674,3 +674,12 @@ validation for callers whose grants cover part of a dataset, is in
   after removing every triple that mentions a protected resource.
   `router_tests::auth::triples` checks that the feed answers instead of refusing, and
   that `ex:bob` appears in no answer to the managers-hidden caller with the option on.
+
+### Bounded read-view preparation
+
+Roadmap item 395 and [C29](C29-bounded-view-preparation/README.md) add request-scoped
+memory, cancellation and deadline control for historical state and permission
+preparation. Existing hidden-quad, pattern-row and shared-cache limits retain their
+scope. The extension covers temporary buffers, cached results and exact inherited
+origins before a bounded caller receives its view. No bounded preparation phase has
+shipped.

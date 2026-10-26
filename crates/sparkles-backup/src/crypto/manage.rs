@@ -772,7 +772,10 @@ mod tests {
             .sign(snapshot.key(descriptor.active()).unwrap())
             .unwrap();
     }
-    #[cfg(all(feature = "fs", any(target_os = "linux", target_os = "android")))]
+    #[cfg(all(
+        feature = "fs",
+        any(target_os = "linux", target_os = "android", target_os = "macos")
+    ))]
     async fn filesystem(path: &std::path::Path, options: &EncryptionOptions) -> Repository {
         Repository::open_encrypted(
             &crate::RepoConfig {
@@ -791,7 +794,10 @@ mod tests {
         .await
         .unwrap()
     }
-    #[cfg(all(feature = "fs", any(target_os = "linux", target_os = "android")))]
+    #[cfg(all(
+        feature = "fs",
+        any(target_os = "linux", target_os = "android", target_os = "macos")
+    ))]
     #[tokio::test]
     async fn filesystem_rotation_retirement_recovery_and_reopen() {
         for published in [false, true] {
@@ -921,7 +927,10 @@ mod tests {
             }));
         }
     }
-    #[cfg(all(feature = "fs", any(target_os = "linux", target_os = "android")))]
+    #[cfg(all(
+        feature = "fs",
+        any(target_os = "linux", target_os = "android", target_os = "macos")
+    ))]
     #[tokio::test]
     async fn filesystem_serializes_rotations_and_refuses_lost_lease() {
         let tmp = tempfile::tempdir().unwrap();
@@ -959,7 +968,10 @@ mod tests {
             Some(3)
         );
     }
-    #[cfg(all(feature = "fs", any(target_os = "linux", target_os = "android")))]
+    #[cfg(all(
+        feature = "fs",
+        any(target_os = "linux", target_os = "android", target_os = "macos")
+    ))]
     #[tokio::test]
     async fn filesystem_retargeted_alias_never_publishes_into_another_repository() {
         let tmp = tempfile::tempdir().unwrap();
@@ -987,7 +999,10 @@ mod tests {
         assert_eq!(marker(&b.store).await.unwrap().0, before_b);
         assert!(!second.join("sparkles-key-management.lock").exists());
     }
-    #[cfg(all(feature = "fs", any(target_os = "linux", target_os = "android")))]
+    #[cfg(all(
+        feature = "fs",
+        any(target_os = "linux", target_os = "android", target_os = "macos")
+    ))]
     #[tokio::test]
     async fn failed_key_management_releases_native_lease_before_return() {
         let tmp = tempfile::tempdir().unwrap();
@@ -1031,7 +1046,10 @@ mod tests {
         repo.store.delete(&Key::from(ROTATION)).await.unwrap();
         assert_eq!(repo.key_rotate(&Ctl::default()).await.unwrap(), 2);
     }
-    #[cfg(all(feature = "fs", any(target_os = "linux", target_os = "android")))]
+    #[cfg(all(
+        feature = "fs",
+        any(target_os = "linux", target_os = "android", target_os = "macos")
+    ))]
     #[tokio::test]
     async fn filesystem_lease_loss_or_expiry_during_preparation_refuses_publication() {
         for expired in [false, true] {
@@ -1084,7 +1102,10 @@ mod tests {
             assert_eq!(repo.key_rotate(&Ctl::default()).await.unwrap(), 2);
         }
     }
-    #[cfg(all(feature = "fs", any(target_os = "linux", target_os = "android")))]
+    #[cfg(all(
+        feature = "fs",
+        any(target_os = "linux", target_os = "android", target_os = "macos")
+    ))]
     #[tokio::test]
     async fn dropped_filesystem_preparation_only_cleans_staging_and_retains_lock_until_done() {
         let tmp = tempfile::tempdir().unwrap();
@@ -1131,7 +1152,10 @@ mod tests {
         assert_eq!(marker(&repo.store).await.unwrap().0, previous);
         assert_eq!(repo.key_rotate(&Ctl::default()).await.unwrap(), 2);
     }
-    #[cfg(all(feature = "fs", any(target_os = "linux", target_os = "android")))]
+    #[cfg(all(
+        feature = "fs",
+        any(target_os = "linux", target_os = "android", target_os = "macos")
+    ))]
     #[tokio::test]
     async fn canceled_or_dropped_directory_sync_retains_actual_lease_until_durability() {
         for aborted in [false, true] {
@@ -1221,7 +1245,10 @@ mod tests {
             assert!(repo.store.head(&Key::from(ROTATION)).await.is_err());
         }
     }
-    #[cfg(all(feature = "fs", any(target_os = "linux", target_os = "android")))]
+    #[cfg(all(
+        feature = "fs",
+        any(target_os = "linux", target_os = "android", target_os = "macos")
+    ))]
     #[tokio::test]
     async fn filesystem_recovery_retries_failed_directory_sync_before_removing_intent() {
         for retiring in [false, true] {
@@ -1304,7 +1331,7 @@ mod tests {
             }
         }
     }
-    #[cfg(any(target_os = "linux", target_os = "android"))]
+    #[cfg(any(target_os = "linux", target_os = "android", target_os = "macos"))]
     #[tokio::test]
     async fn injected_filesystem_config_keeps_object_store_cas_and_never_touches_path() {
         let tmp = tempfile::tempdir().unwrap();

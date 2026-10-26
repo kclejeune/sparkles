@@ -25,7 +25,7 @@ set -euo pipefail
 
 N=${1:-100000}
 DIM=${2:-384}
-WORK=${3:-target/bench-vector}
+WORK=${3:-.artifacts/bench-vector}
 QUERIES=${QUERIES:-1000}
 EFS=${EFS:-16 32 64 128 256}
 K=${K:-10}

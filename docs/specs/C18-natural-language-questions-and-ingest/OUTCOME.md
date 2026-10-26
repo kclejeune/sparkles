@@ -1,5 +1,10 @@
 # C18: Questions and ingestion in natural language — Delivery record
 
+The standard server now includes OCR code through its default `pdf-ocr` feature.
+PDFium, ONNX Runtime and model snapshots remain operator-supplied runtime inputs.
+No model or OCR library is loaded merely because the capability is compiled in.
+The OCR image adds native libraries to the standard capability profile.
+
 Current delivery status is summarized in the [landing page](README.md).
 The [design Outcome overview](SPEC.md#outcome) links the supported scope to this record.
 The recorded dates and measurements below describe their original delivery stages.
@@ -1672,3 +1677,48 @@ This checkpoint adds diagnostics and fixture measurements. It does not optimize 
 pipeline or explain the retained DBpedia campaign's multi-second residual. Item 318
 remains open for representative stage profiles, a justified optimization and matched
 validation of its latency and semantic effects. No paid provider was called.
+
+### Entity evidence bounds, item 263
+
+The optional version 1 evidence of C17 records the visible candidate pool and display
+bounds and exposes retained types and labels beyond the three display entries. It makes
+per-entity and global query truncation explicit. An exact-string lookup cannot claim
+complete scope from sampled language inventory, RDFS-on-read expansion or a different
+Info view. Normalized and
+vector search remain bounded, and the contract makes no complete-universe or unique
+intent claim. Ask continues to preserve every ambiguous clarification. Context-sensitive
+resolution and a fresh end-to-end model evaluation remain under item 263.
+
+
+The evidence producer counts escaped full fields before formatting and shares a
+construction allowance across mentions. The final check includes branch and policy
+decorations and retains exact-boundary acceptance. This bounds the added evidence
+copies without replacing the query memory budget. Ask uses this contract for identity
+and conservative display ordering, with the broader work retained under item 263.
+
+
+### Conservative candidate evidence consumption
+
+Ask requests version 1 candidate evidence from the caller's selected view. It restores
+an abbreviated choice identity only from a recognized, valid full IRI. When the question
+explicitly names a supported kind and one offered substantive candidate has the known
+ontology type, that candidate can appear first. Full retained types also guard the
+existing resource and category preference against disambiguation types beyond the
+presentation limit. An ambiguous initial request retains all offered choices and asks
+for clarification before drafting. This ordering does not establish unique intent or a
+complete candidate universe.
+
+Unknown versions, incomplete detail, conflicting kinds and competing substantive
+namesakes cannot justify a contextual preference. A result-byte refusal retries ordinary
+linking once under the same remaining deadline, cancellation, principal, graph and
+historical selection. This ordinary fallback keeps the shipped display rule. Recognized
+rich evidence that reveals disambiguation never falls through to the truncated-type
+shortcut. Other errors are not retried.
+
+Provider-free fixtures cover explicit kinds, full identities, ordinary fallback,
+recognized disambiguation, restricted views in both access orders, small and large
+contexts, branch and historical identities, cancellation and deadline expiry. Linker
+stage diagnostics count both attempts when a byte refusal requires fallback. The
+fixtures do not measure model accuracy, establish general contextual resolution or
+claim a latency improvement. Item 263 remains open for the broader evidence and
+model-dependent evaluation contract. No paid provider was called.

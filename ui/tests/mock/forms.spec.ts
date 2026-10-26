@@ -307,3 +307,69 @@ test('the fields wait while a save is in flight', async ({ page }) => {
   await expect(email).toBeEnabled();
   await expect(email).toHaveValue('valentina@andes.example');
 });
+
+test('a refused recheck cannot reuse an earlier reject-guard approval', async ({
+  page,
+  request,
+}) => {
+  await update(
+    request,
+    'INSERT DATA { ex:boundedCheck a ex:Person ; rdfs:label "Bounded Check"@en ; ex:worksFor ex:meridian }',
+  );
+  await page.route(
+    (url) => url.pathname === `/$/forms/${DS}`,
+    async (route) => {
+      const response = await route.fetch();
+      const model = await response.json();
+      await route.fulfill({
+        response,
+        json: { ...model, guard: { language: 'shacl', mode: 'reject' } },
+      });
+    },
+  );
+  let checks = 0;
+  let saves = 0;
+  await page.route(
+    (url) => url.pathname === `/$/forms/${DS}/check`,
+    async (route) => {
+      checks++;
+      if (checks === 1) return route.continue();
+      await route.fulfill({
+        status: 507,
+        json: {
+          error: 'Affected target discovery exceeded its allowance',
+          code: 'budget-exceeded',
+        },
+      });
+    },
+  );
+  await page.route(
+    (url) => url.pathname === `/$/forms/${DS}/save`,
+    async (route) => {
+      saves++;
+      await route.fulfill({ status: 507, json: { error: 'Unexpected save after refused check' } });
+    },
+  );
+  const form = await openEdit(page, 'boundedCheck');
+  await form.getByRole('textbox', { name: 'Name', exact: true }).fill('Bounded Check Updated');
+  await form.getByRole('button', { name: 'Preview', exact: true }).click();
+  await expect(form.getByRole('region', { name: 'Preview' })).toContainText(
+    'The save would commit.',
+  );
+  await form.getByRole('button', { name: 'Preview', exact: true }).click();
+  await expect(
+    form.getByRole('alert').filter({ hasText: 'Affected target discovery exceeded its allowance' }),
+  ).toBeVisible();
+  const attempted = page.waitForResponse((response) => {
+    const path = new URL(response.url()).pathname;
+    return path === `/$/forms/${DS}/check` || path === `/$/forms/${DS}/save`;
+  });
+  await form.getByRole('button', { name: 'Save', exact: true }).click();
+  const response = await attempted;
+  expect(
+    new URL(response.url()).pathname,
+    'a refused check must invalidate previous approval',
+  ).toBe(`/$/forms/${DS}/check`);
+  expect(checks).toBe(3);
+  expect(saves).toBe(0);
+});

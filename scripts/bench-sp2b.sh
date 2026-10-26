@@ -30,7 +30,7 @@ set -euo pipefail
 
 SCALE=${1:-50k}
 ROOT=$(cd "$(dirname "$0")/.." && pwd)
-WORK=${2:-$ROOT/target/bench-sp2b}
+WORK=${2:-$ROOT/.artifacts/bench-sp2b}
 SPARKLES=${SPARKLES:-$ROOT/target/release/sparkles}
 ENGINES=${ENGINES-sparkles jena qlever fluree oxigraph}
 PORT_BASE=${PORT_BASE:-28300}

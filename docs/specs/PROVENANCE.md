@@ -277,7 +277,7 @@ Read the [provenance record](U01-time-slider.md#provenance).
 
 ## Editing forms generated from SHACL shapes
 
-Read the [provenance record](U02-shape-driven-forms.md#provenance).
+Read the [provenance record](U02-shape-driven-forms/SPEC.md#provenance).
 
 ## Query by example and search phrases
 
@@ -343,3 +343,7 @@ Read the [provenance record](shared/PROVENANCE.md#development-tools-not-linked-i
 * [C06](C06-clone-to-sandbox.md#provenance) records its existing source evidence.
 * [C08](C08-inference-freshness.md#provenance) records its existing source evidence.
 * [X13](X13-per-crate-nix-builds.md#provenance) records its existing source evidence.
+
+## Bounded preparation of read views
+
+Read the [design provenance](C29-bounded-view-preparation/SPEC.md#provenance).

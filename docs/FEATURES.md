@@ -2,6 +2,8 @@
 
 Sparkles provides an RDF store, query engine, server and embedded libraries. The
 category guides below describe current capabilities, configuration, usage and limits.
+The standard server includes local embeddings, OCR support and encrypted repositories.
+Models, OCR libraries and encrypted repository keys require runtime configuration.
 The [capability matrix](#capability-status) distinguishes complete, partially complete
 and planned work. The [roadmap](ROADMAP.md) gives the path to completing the remaining
 phases, and the [design specs](specs/README.md) explain their contracts and decisions.
@@ -116,6 +118,8 @@ Connect agents through [MCP](ai/README.md#mcp-server), turn
 [cited memory](ai/README.md#agent-memory). Review
 [document ingestion](ai/README.md#document-ingestion) and build
 [GraphRAG community reports](ai/README.md#community-reports-graphrag).
+MCP entity linking exposes bounded, versioned candidate evidence. Ask uses it for full
+choice identities and conservative ordering while retaining required clarification.
 
 [Ask stage diagnostics](ai/README.md#ask-stage-diagnostics) separate grounding, tool
 and execution timings while the remaining accuracy and latency work stays open.
@@ -181,10 +185,10 @@ implementation status.
 | [GeoSPARQL](search/README.md#geosparql) | Partially complete. | Indexed spatial filters, joins and constant-geometry nearest-neighbour ordering are available. Per-row nearest-neighbour geometry and the listed geometry and CRS extensions remain. |
 | [Reasoning](reasoning/README.md#reasoning-validation-and-schema) | Partially complete. | RDFS, OWL 2 RL, Jena rules, incremental materialization and demand derivation are available. Automatic cost selection, the separate derived layer and canonical equality remain planned. |
 | [Explanations](reasoning/README.md#reasoning-validation-and-schema) | Partially complete. | Why, bounded why-not, entailment diffs and minimal supports are available. Provenance-aware inferred visibility and review protections remain planned. |
-| [Validation and forms](reasoning/README.md#reasoning-validation-and-schema) | Partially complete. | SHACL, ShEx, write guards and generated forms are available. The compatibility boundaries and remaining editors are listed below. |
+| [Validation and forms](reasoning/README.md#reasoning-validation-and-schema) | Partially complete. | SHACL, ShEx, write guards and generated forms are available. Form checks use bounded shape-dependent targets and refuse incomplete discovery. Remaining editors and target and query producer admission are described in the guides. |
 | [Schema discovery](reasoning/README.md#reasoning-validation-and-schema) | Complete within the documented discovery scope. | Class and predicate profiles, schema diffs and constrained shape drafts are available. Drafts retain the limits in the compatibility boundaries. |
 | [Server and Fuseki integration](server/README.md#server-and-protocols) | Partially complete. | Supported Fuseki protocols, configuration conversion and administration are available. Remaining ARQ, enhancer and integration surfaces are listed below. |
-| [Access control and authentication](server/README.md#access-control-and-security) | Partially complete. | Dataset, graph and triple protections, OIDC and API tokens are available. Supported derived visibility, further audit events and authentication extensions remain planned. |
+| [Access control and authentication](server/README.md#access-control-and-security) | Partially complete. | Dataset, graph and triple protections, OIDC and API tokens are available. Supported derived visibility, further audit events and authentication extensions remain planned. Request-scoped read-view preparation remains under item 395. |
 | [Settings and declared prefixes](server/README.md#server-and-protocols) | Complete within the documented settings scope. | Layered settings, operator locks, runtime administration and prefix completion are available. |
 | [Ask, ingestion and agent memory](ai/README.md#ai-and-agents) | Partially complete. | Checked queries, cited memory, ingestion review and source supersession are available. Accuracy, contextual linking and additional ingest formats remain open. |
 | [GraphRAG reports](ai/README.md#ai-and-agents) | Partially complete. | Community reports, global Ask, memory retrieval and change-feed refresh are available. View-based refresh and reports for distinct audiences remain planned. |

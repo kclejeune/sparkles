@@ -23,7 +23,7 @@ use crate::access::{GraphAccess, Graphs};
 use crate::commit::{self, Catalog, ForkedFrom};
 use oxrdf::NamedNode;
 use std::collections::{BTreeMap, HashSet};
-use std::fs::{File, OpenOptions};
+use std::fs::OpenOptions;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -679,7 +679,7 @@ fn share_file(
 #[cfg(any(target_os = "linux", target_os = "android"))]
 fn reflink_file(from: &Path, to: &Path) -> Result<bool> {
     use std::os::fd::AsRawFd;
-    let src = File::open(from)?;
+    let src = std::fs::File::open(from)?;
     let dst = OpenOptions::new().write(true).create_new(true).open(to)?;
     // SAFETY: both descriptors are open for the duration of the call, and FICLONE
     // takes the source descriptor as its argument

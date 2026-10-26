@@ -179,3 +179,11 @@ The remaining work described above refers to [item 37](../ROADMAP.md), [item 39]
 The central roadmap owns priority and dependencies. Its
 [completion paths](../ROADMAP.md#completion-paths-for-partially-complete-specs)
 link partially complete specs to their remaining work and acceptance criteria.
+
+### Read-view preparation limits
+
+Existing query execution, hidden-quad and pattern-row limits do not provide a shared
+request-scoped memory cap across historical replay and permission preparation.
+[C29](../specs/C29-bounded-view-preparation/README.md), roadmap item 395, adds those
+controlled reads and caller adoption. A bounded caller must refuse unsupported or
+excessive preparation rather than weaken the requested policy or select another state.

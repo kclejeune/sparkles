@@ -276,6 +276,12 @@ fn analyze(gp: &GraphPattern, reach: &Reach) -> R<(Reach, Vec<Read>)> {
     use GraphPattern as G;
     match gp {
         G::Bgp { patterns } => {
+            if patterns.iter().any(|triple| {
+                matches!(&triple.predicate,
+                NamedNodePattern::NamedNode(p) if crate::predicate_reads::computed(p.as_str()))
+            }) {
+                return Err(Global);
+            }
             let edges = patterns
                 .iter()
                 .map(|t| {

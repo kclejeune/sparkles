@@ -53,7 +53,7 @@
 #   --cargo-args "..."  extra `cargo build` flags, e.g. "--features text"
 #   --machine-type T    Namespace machine type (default linux/amd64:8x16)
 #   --duration D        instance lifetime cap, as nsc takes it (default 2h)
-#   --out DIR           results directory (default target/nsc-bench/<UTC time>)
+#   --out DIR           results directory (default .artifacts/nsc-bench/<UTC time>)
 #   --allow-mixed-compilers
 #                       compare binaries built with different compilers anyway
 set -euo pipefail
@@ -139,7 +139,7 @@ while [ $# -gt 0 ]; do
 done
 [ ${#ARGS[@]} -eq 2 ] || usage 1
 for t in nsc zstd python3 cargo readelf; do command -v "$t" > /dev/null || die "$t is not on PATH"; done
-OUT=$(realpath -m "${OUT:-$ROOT/target/nsc-bench/$(date -u +%Y%m%dT%H%M%SZ)}")
+OUT=$(realpath -m "${OUT:-$ROOT/.artifacts/nsc-bench/$(date -u +%Y%m%dT%H%M%SZ)}")
 mkdir -p "$OUT/stage/queries" "$OUT/logs" "$CACHE"/{bin,data,src}
 STAGE=$OUT/stage
 MANIFEST=$OUT/manifest.txt

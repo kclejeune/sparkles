@@ -1435,3 +1435,45 @@ contracts of [C18](C18-natural-language-questions-and-ingest/SPEC.md#outcome). H
 statements above that Phase 2 was not built describe the original landing, rather
 than an additional untracked model backend. Roadmap item 57 completes scratch expiry,
 and item 81 owns the shared representation specified at the end of this Outcome.
+
+### Scoped entity-link evidence, item 263
+
+`link_entities` accepts `evidence: true` without changing its default responses, searches
+or advisory verdicts. Each mention and displayed candidate then carries evidence version
+1. Callers must recognize that version before interpreting completeness. A later unknown
+version is not proof that a lookup is complete.
+
+Mention evidence reports the number of distinct visible candidates observed across the
+bounded search lists before display truncation. It distinguishes the 50-candidate pool
+limit from the requested display limit. `exactStringLabelsComplete` is true only when
+the simple and language-tagged string lookup did not reach its cap and its language and
+literal-form inventory is exact for the same query view. Sampling, unsupported literal
+forms, RDFS-on-read expansion or a different Info view leaves that proof incomplete. `typeHintLookupComplete`
+reports whether the existing per-graph subclass lookup reached its query limit. Neither
+flag establishes a complete normalized search, general entailment closure or user intent.
+`normalizedLabelsComplete` and `candidateUniverseComplete` remain false.
+
+Candidate evidence includes its full IRI, all retained named rdf:type values and non-vector literal
+labels from the requested label predicates, rather than the three presentation types and
+alternative labels. Evidence uses full type and predicate IRIs and escaped RDF literal
+terms without the display character limit. The lists retain
+at most 20 entries each. `typesComplete` and `labelsComplete` are true only when their
+queries ended below the global limit and every value for that entity fits its retained
+list. A global limit marks even a starved empty list incomplete. An empty complete list
+means that no value in that defined query scope was found. Returned candidate values and
+counts use the same snapshot, reasoning selection, graphs and caller Query view. Info
+metadata can certify label scope only when that view agrees. No raw index-wide or
+hidden-candidate count is returned. Evidence-enabled calls refuse structured content over
+`--mcp-max-bytes` with `budget-result-bytes`. This bounds its compact JSON before the
+MCP adapter mirrors it as text and adds the protocol envelope. The count includes
+branch metadata and any other structured-content decoration. A request-wide construction
+guard counts JSON-escaped full IRIs and RDF literal terms before allocating their
+strings. Completed candidates share the same byte allowance across repeated mentions.
+The final decorated check remains authoritative and accepts a result exactly at the
+configured limit. Detail rows and vectors move into their consumers without duplicate
+full-label clones. Query memory limits still govern lookup and ranking state.
+
+The richer evidence is information for contextual ranking and for deciding when another
+lookup is needed. It does not change `exact` or `ambiguous` advice, suppress clarification
+or authorize merging entities. Item 263 keeps contextual resolution and end-to-end
+accuracy and latency evaluation open.

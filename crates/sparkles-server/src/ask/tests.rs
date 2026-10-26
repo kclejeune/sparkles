@@ -745,3 +745,6 @@ fn an_exact_namesake_outside_the_small_display_still_requires_clarification() {
 
 #[path = "profile_tests.rs"]
 mod profile_tests;
+
+#[path = "consumer_tests.rs"]
+mod consumer_tests;

@@ -42,6 +42,13 @@ build community reports.
   `merge_branch` and `delete_branch` manage scratch branches. Merges preview by default,
   need the previewed heads and refuse conflicts. `--mcp-scratch-branch-ttl` deletes idle
   scratch branches.
+* `link_entities` can include versioned evidence about the named types and literal
+  labels retained for each candidate, with separate flags for display, per-entity and
+  query limits. It reports values and counts from the caller's query view. Bounded text
+  and vector search do not establish a complete candidate universe or unique intent. Full
+  evidence fields are counted before formatting and share the configured result-byte
+  allowance across mentions. The final check also includes branch and policy metadata.
+  Query memory limits govern lookup and ranking state.
 * Resources give each dataset's schema summary and prefixes and each stored query's
   definition. The prompts `explore_dataset`, `answer_question`, `run_stored_query`,
   `explain_term`, `agent_memory` and `ask_graph` start common workflows.
@@ -59,10 +66,17 @@ build community reports.
   them. The server detects structured output per model and falls back to JSON mode and
   plain text.
 * Ask keeps half of its schema budget for common vocabulary and retrieves the rest by
-  matching the question against every visible class and predicate. A guarded resource
-  preference can reorder the choices offered for an ambiguous mention. Every ambiguous
-  mention still asks for a clarification, because displayed candidates, types and labels
-  can be truncated. The generic `link_entities` verdict is unchanged.
+  matching the question against every visible class and predicate. Recognized candidate
+  evidence preserves full choice identities and can order explicitly named kinds using
+  known ontology types. Full retained types guard resource preferences against disambiguation
+  types beyond the display limit. An ambiguous initial request still asks for a clarification, because
+  bounded search does not prove unique intent. The generic `link_entities` verdict is
+  unchanged. If rich evidence exceeds the result-byte allowance, Ask retries ordinary
+  linking once under the same deadline and permissions and keeps its display rule.
+* The extra kind preference recognizes the English words film, movie, book, novel,
+  song, album, city, town, country, river and person through supported DBpedia,
+  schema.org and FOAF class IRIs. Unknown class namespaces and incomplete or competing
+  type evidence retain conservative clarification choices.
 * `POST /{ds}/ask` runs as the caller and streams each step as a server-sent event, or
   answers one JSON object ([API.md](../API.md#asking-in-the-server)). `assistant.json`,
   through `/$/assistant/{ds}`, turns the assistant on for a dataset and sets what may leave
@@ -159,7 +173,8 @@ not include embeddings performed inside tools.
   entities, and writes the facts on a review branch. `mode: "preview"` holds them for
   approval, and `mode: "auto"` merges them when every check passes.
 * PDF conversion uses pdf-inspector with the `pdf` cargo feature, on by default, and the
-  `pdf-ocr` feature reads scanned pages with OCR models that the operator provides. Office
+  `pdf-ocr` feature is included by default. Scanned pages use OCR models and native
+  libraries that the operator provides. Office
   files are read by `sparkles-office` under the `office` feature, on by default. On Linux
   each conversion runs in a child process with an address-space limit, which limits
   resources but is not a sandbox.
@@ -176,6 +191,10 @@ provide an RDF vocabulary, SHACL shapes, competency queries and read-only views 
 existing memory records. Rust applications select them with
 `sparkles::evidence::profile(1)`. Unknown versions return `None`. The CLI can validate
 profile RDF with `sparkles shacl` and run the supplied queries with `sparkles query`.
+
+Rust configuration adapters can decode `sparkles_core::evidence::Settings` and obtain
+canonical bytes and a digest. These helpers enforce version and graph-set bounds but
+do not select an authoritative configuration or authorize managed writes.
 
 Rust importers can prepare typed batches with `sparkles_core::evidence::prepare_input`.
 It checks local content digests and retained text or JSON selectors within its bounds.
@@ -262,8 +281,8 @@ dependencies are recorded in the [central roadmap](../ROADMAP.md).
   Roadmap item 270.
 * Agent memory does not import from Cursor's SQLite store or the editors' Copilot Chat
   storage, and redaction finds only the secrets its patterns describe. Roadmap item 15.
-* The server does not convert images or audio. Scanned PDF pages need a build with
-  `pdf-ocr` and OCR models from the operator. The Office converter is not registered with
+* The server does not convert images or audio. Scanned PDF pages need configured
+  OCR models, PDFium and ONNX Runtime. The standard binary includes the OCR code. The Office converter is not registered with
   the query memory pool, and a workbook's token estimate for `confirmTokens` does not
   cover all its sheets. Roadmap items 15 and 77.
 * A CSV mapping draft links an IRI column's values only to entities whose labels match

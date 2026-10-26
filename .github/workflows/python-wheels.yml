@@ -37,10 +37,11 @@ on:
       - "Cargo.toml"
       - "Cargo.lock"
       - "rust-toolchain.toml"
+      - "scripts/install-mbx-container.sh"
+      - "mise.toml"
       - "scripts/py-sdist.py"
       - "scripts/py-wheel-test.sh"
       - ".github/workflows/python-wheels.yml"
-      - ".github/actions/setup-rust/**"
   pull_request:
     paths: *paths
   workflow_dispatch:
@@ -78,38 +79,43 @@ jobs:
           - target: ${{ github.ref_type == 'branch' && github.event_name != 'workflow_dispatch' && 'aarch64' || 'none' }}
           - libc: ${{ github.ref_type == 'branch' && github.event_name != 'workflow_dispatch' && 'musllinux' || 'none' }}
     env:
+      CARGO_HOME: ${{ github.workspace }}/.cache/cargo
+      MBX_CACHE_DIR: ${{ github.workspace }}/.cache/mbx
       COMPAT: ${{ matrix.libc == 'manylinux' && '2_28' || 'musllinux_1_2' }}
     runs-on: ${{ matrix.target == 'aarch64' && 'ubuntu-24.04-arm' || 'ubuntu-24.04' }}
     steps:
       - uses: actions/checkout@v5
-      # maturin builds in a manylinux or musllinux container with the workspace mounted,
-      # so the cached target directory carries over between runs. Only pushes to main
-      # save it (see .github/actions/setup-rust).
-      - uses: actions/cache/restore@v4
-        id: cache
+      # The container and host action share one job store. Its object payload
+      # includes every binding compilation, independently of target placement.
+      - uses: actions-rust-lang/setup-rust-toolchain@v1
+        with: { cache: false, rustflags: "" }
+      - uses: jdx/mr-boxington-action@v1.7.3
         with:
-          path: target
-          key: python-${{ runner.os }}-${{ runner.arch }}-${{ matrix.libc }}-${{ env.PROFILE_ARG }}-${{ hashFiles('rust-toolchain.toml') }}-${{ hashFiles('Cargo.lock', 'crates/sparkles-py/Cargo.lock') }}
-          restore-keys: |
-            python-${{ runner.os }}-${{ runner.arch }}-${{ matrix.libc }}-${{ env.PROFILE_ARG }}-${{ hashFiles('rust-toolchain.toml') }}-
+          version: 1.28.0
+          github-cache-mode: objects
+          cache-generation: sparkles-python-linux-${{ matrix.libc }}-${{ env.PROFILE_ARG }}-v1
+          save-on-workflow-dispatch: ${{ github.ref == 'refs/heads/main' }}
       - name: Build the wheel
         uses: PyO3/maturin-action@v1
         with:
           maturin-version: ${{ env.MATURIN_VERSION }}
           target: ${{ matrix.target }}
           manylinux: ${{ env.COMPAT }}
+          docker-options: >-
+            -e MBX_CACHE_EXPORT_GROUP
+            -e MBX_CACHE_DIR=${{ github.workspace }}/.cache/mbx
+            -e MBX_SHIMS_DIR=${{ github.workspace }}/.cache/container-shims
+            -e CI=true
+          # Maturin first bootstraps Rust with its default Cargo home. Switch
+          # only the build's downloads after that bootstrap has completed.
+          before-script-linux: |
+            export CARGO_HOME="$GITHUB_WORKSPACE/.cache/cargo"
+            source scripts/install-mbx-container.sh
           args: ${{ env.PROFILE_ARG }} --locked --manifest-path ${{ env.MANIFEST }} --target-dir target --out dist
-      # The workspace's own crates change on nearly every push, so only the dependencies
-      # are worth keeping. The container writes as root.
-      - name: Save the dependency cache
-        if: github.ref == 'refs/heads/main' && steps.cache.outputs.cache-hit != 'true'
+      - name: Restore host ownership of container cache files
+        if: always()
         run: |
-          sudo find target -maxdepth 4 \( -name 'sparkles*' -o -name 'libsparkles*' \) -prune -exec rm -rf {} +
-      - if: github.ref == 'refs/heads/main' && steps.cache.outputs.cache-hit != 'true'
-        uses: actions/cache/save@v4
-        with:
-          path: target
-          key: ${{ steps.cache.outputs.cache-primary-key }}
+          if [ -d .cache ]; then sudo chown -R "$(id -u):$(id -g)" .cache; fi
       - name: Set up CPython 3.10 and 3.14
         if: matrix.libc == 'manylinux'
         uses: actions/setup-python@v6
@@ -143,12 +149,23 @@ jobs:
       CARGO_TARGET_DIR: ${{ github.workspace }}/target
     steps:
       - uses: actions/checkout@v5
-      - uses: ./.github/actions/setup-rust
+      - uses: actions-rust-lang/setup-rust-toolchain@v1
+        with: { cache: false, rustflags: "" }
+      - uses: jdx/mr-boxington-action@v1.7.3
         with:
-          cache-key: python-${{ env.PROFILE_ARG }}
-          workspaces: |
-            . -> target
-            crates/sparkles-py -> ../../target
+          version: 1.28.0
+          github-cache-mode: objects
+          cache-generation: sparkles-python-${{ env.PROFILE_ARG }}-v1
+          save-on-workflow-dispatch: ${{ github.ref == 'refs/heads/main' }}
+      # This build tool invokes Cargo itself.
+      - name: Route build-tool Cargo calls through Boxington
+        shell: bash
+        run: |
+          mbx setup --yes
+          case "$RUNNER_OS" in
+            Linux) printf '%s\n' "${XDG_DATA_HOME:-$HOME/.local/share}/mbx/bin" >> "$GITHUB_PATH" ;;
+            macOS) printf '%s\n' "$HOME/Library/Application Support/mbx/bin" >> "$GITHUB_PATH" ;;
+          esac
       - name: Set up CPython 3.10 and 3.14
         uses: actions/setup-python@v6
         with:
@@ -179,12 +196,23 @@ jobs:
       CARGO_TARGET_DIR: ${{ github.workspace }}/target
     steps:
       - uses: actions/checkout@v5
-      - uses: ./.github/actions/setup-rust
+      - uses: actions-rust-lang/setup-rust-toolchain@v1
+        with: { cache: false, rustflags: "" }
+      - uses: jdx/mr-boxington-action@v1.7.3
         with:
-          cache-key: python-sdist
-          workspaces: |
-            . -> target
-            crates/sparkles-py -> ../../target
+          version: 1.28.0
+          github-cache-mode: objects
+          cache-generation: sparkles-python-sdist-v1
+          save-on-workflow-dispatch: ${{ github.ref == 'refs/heads/main' }}
+      # This build tool invokes Cargo itself.
+      - name: Route build-tool Cargo calls through Boxington
+        shell: bash
+        run: |
+          mbx setup --yes
+          case "$RUNNER_OS" in
+            Linux) printf '%s\n' "${XDG_DATA_HOME:-$HOME/.local/share}/mbx/bin" >> "$GITHUB_PATH" ;;
+            macOS) printf '%s\n' "$HOME/Library/Application Support/mbx/bin" >> "$GITHUB_PATH" ;;
+          esac
       - name: Set up CPython 3.14
         uses: actions/setup-python@v6
         with:

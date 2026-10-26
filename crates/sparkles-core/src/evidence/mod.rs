@@ -8,6 +8,7 @@ mod canonical;
 mod model;
 mod prepare;
 mod primitives;
+mod settings;
 mod structured;
 
 pub use canonical::{IdentityNamespace, canonical_term_digest};
@@ -26,6 +27,11 @@ pub use model::{
 pub use prepare::{
     MAX_CLAIMS, MAX_LINKS, NormalizedSourceTime, NormalizedSourceTimes, PreparedContent,
     PreparedInput, ResolutionRequirement, prepare_input,
+};
+
+pub use settings::{
+    CanonicalSettings, MAX_SETTINGS_BYTES, MAX_SETTINGS_GRAPH_IRI_BYTES, MAX_SETTINGS_GRAPHS,
+    Settings,
 };
 
 pub use structured::{

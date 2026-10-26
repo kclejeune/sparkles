@@ -5,7 +5,7 @@ set -euo pipefail
 cd "$(dirname "$0")/.."
 
 scripts() {
-  git ls-files -z -- '*.sh' ':(glob,exclude)docs/benchmarks/*/runs/**'
+  git ls-files -z -- '*.sh' scripts/cargo-sparkles-task ':(glob,exclude)docs/benchmarks/*/runs/**'
 }
 
 scripts | xargs -0 shfmt --diff --indent 2 --case-indent --space-redirects

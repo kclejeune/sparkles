@@ -1462,20 +1462,24 @@ licenses are also permissive, adding BSD-2-Clause (rav1e, av1-grain, v_frame),
 BSL-1.0 (clipper2-rust), ISC (libloading) and CC0-1.0 or Apache-2.0 (imgref). Every one
 either ships a license file or names a license that the script has a standard text
 for. rav1e also ships a `PATENTS` file with the Alliance for Open Media patent license,
-which the script's file pattern does not collect, so a build that ships `pdf-ocr` must
-add it to the script's notices. `oar-ocr`'s crates and `ort` are Apache-2.0 or MIT, the
+which the notices script collects. The script also includes the bundled Oniguruma
+license from `onig_sys/oniguruma/COPYING`. `oar-ocr`'s crates and `ort` are Apache-2.0 or MIT, the
 PDFium library that the operator installs is BSD-3-Clause, and ONNX Runtime is MIT.
 The PP-OCR model files are reported as Apache-2.0 by the repackagings that pdf-inspector
-uses, and the official PaddleOCR model cards must confirm that before `pdf-ocr` ships.
-Sparkles redistributes none of the libraries or models.
+uses. Operators must check the licenses of the model snapshots they supply. The standard
+binary expects separately installed native libraries. The OCR container image bundles
+verified PDFium and ONNX Runtime libraries with their notices. Models are supplied
+separately.
 
-OCR is a second feature, `pdf-ocr`, off by default and not part of release builds. It
+OCR is the `pdf-ocr` feature, included in the standard server build. Runtime libraries
+and model snapshots are configured separately. It
 enables pdf-inspector's `render-pdfium` and `ocr-oar` features, which render pages with
 PDFium and run the PP-OCR models through ONNX Runtime. Both libraries are loaded
 dynamically from paths the operator gives, and the OCR models are read from a
 directory the operator provides through pdf-inspector's `model_directory` option.
-Sparkles does not enable pdf-inspector's `model-download` feature, so the server never
-fetches a model at run time. `serve --pdf-ocr-models DIR`, `--pdfium-lib PATH` and
+The OCR dependency compiles downloader code, but Sparkles configures
+`ModelDownloadPolicy::Offline` and only uses operator-supplied models.
+`serve --pdf-ocr-models DIR`, `--pdfium-lib PATH` and
 `--onnxruntime-lib PATH` configure it, and a server without them treats OCR as
 unavailable.
 
@@ -3203,9 +3207,9 @@ The efforts are focused agent-days, including tests and docs.
   of the UI components that runs in the host's sandbox without the session cookie. The
   main client is Claude Code in a terminal, and a person who wants the visual opens the
   Sparkles UI through a `share_query` link.
-- **OCR by default, and media transcription.** OCR needs native libraries and model
-  files that most deployments do not want, so it is an opt-in build feature with
-  operator-supplied models (§7.1.1). Audio and images need models that Sparkles does
+- **Automatic OCR activation, and media transcription.** The standard binary includes
+  OCR support, but using it requires native libraries and operator-supplied models
+  (§7.1.1). Audio and images need models that Sparkles does
   not run. An agent or an external converter can produce the text and register it.
 - **A built-in PDF text extractor.** The first draft planned one for the text layer of
   born-digital PDFs. pdf-inspector already classifies pages, finds tables and columns,
@@ -3315,7 +3319,7 @@ The maintainer decided these further questions later on 2026-10-09.
 
 12. **PDF conversion uses pdf-inspector.** It replaces the planned text-layer
     extractor, behind a `pdf` cargo feature with an exact version pin. OCR is a
-    separate opt-in feature, `pdf-ocr`. A PDF that needs OCR in a build or server
+    separate feature, `pdf-ocr`, included in the standard build. A PDF that needs OCR in a build or server
     without it is refused with `needs-ocr` and its pages, never registered with empty
     text. Spans and offsets count code points in the Markdown rendition (§7.1.1). This
     closes the only open question of the first revision.
@@ -3347,9 +3351,9 @@ The maintainer decided these further questions later on 2026-10-09.
     call the server's providers by default. `useServerModel: true` opts in for agents
     with weak models, with the `serverModels` grant and the cost counted against the
     calling principal (§9.6, §9.7).
-19. **OCR in release builds.** `pdf-ocr` stays out of release builds, because it needs
-    PDFium and ONNX Runtime at run time and adds about 132 crates. A separate artifact
-    can follow if operators ask for one.
+19. **OCR in release builds.** The standard binary includes `pdf-ocr`. PDFium, ONNX
+    Runtime and model snapshots remain runtime inputs. The OCR image adds the native
+    libraries to that capability profile.
 20. **Recording acceptance.** An answer that a person runs without comment counts as
     accepted with a weak weight in the routing log, beside **Correct**, the example
     buttons, **Not correct**, **Try harder** and `edited`.
@@ -3865,6 +3869,10 @@ design remains part of its original record.
 ## Outcome
 
 Ask, query explanations, document ingestion and agent-memory workflows are available. The remaining evaluation, ingestion, verified-rewrite, grounding and latency work is tracked under items 6, 15, 27, 77, 81, 90, 263 and 318.
+
+Ask consumes recognized candidate evidence for full choice identities and conservative
+ordering of explicitly named kinds. Every ambiguous mention still requires a
+clarification, with general contextual resolution retained under item 263.
 
 Bounded debug stage diagnostics distinguish local grounding, tool calls and nested
 embedding work with bounded process-generated request correlation and no change to

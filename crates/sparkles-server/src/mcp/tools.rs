@@ -56,6 +56,8 @@ pub fn run(
             .and_then(Value::as_str)
             .map(str::to_string)
     });
+    let bound_evidence =
+        name == "link_entities" && args.get("evidence") == Some(&Value::Bool(true));
     let out = dispatch(&t, name, args);
     if let Some(ds) = inbox
         && out.is_ok()
@@ -69,7 +71,38 @@ pub fn run(
         Some(n) => super::memory::policy::with_notice(out, n),
         None => out,
     };
-    super::branches::name_branch(out, call)
+    let out = super::branches::name_branch(out, call)?;
+    if bound_evidence && let Outcome::Structured(value) = &out {
+        evidence_bytes(value, t.cfg().max_bytes, &t.ctx(&[], 0.0))?;
+    }
+    Ok(out)
+}
+
+/// Bound structured evidence without allocating a second serialized response. MCP's
+/// mirrored text and protocol envelope are outside this structured-content budget.
+fn evidence_bytes(value: &Value, limit: usize, ctx: &ErrorContext) -> Result<(), ToolError> {
+    struct Limited {
+        remaining: usize,
+    }
+    impl std::io::Write for Limited {
+        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+            if bytes.len() > self.remaining {
+                return Err(std::io::Error::other("evidence result byte limit"));
+            }
+            self.remaining -= bytes.len();
+            Ok(bytes.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+    serde_json::to_writer(Limited { remaining: limit }, value).map_err(|_| {
+        ctx.engine(Error::BudgetExceeded(sparkles::error::Budget {
+            kind: sparkles::error::BudgetKind::ResultBytes,
+            limit: limit as u64,
+            requested: (limit as u64).saturating_add(1),
+        }))
+    })
 }
 
 /// `sparql_query` for the asking pipeline: its result, and the same result in the

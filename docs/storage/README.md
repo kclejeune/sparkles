@@ -226,6 +226,8 @@ stay readable.
   `Store::history_changes` return each added or removed quad with its commit's number,
   time, kind, author and message, and write the triple pattern as an RDF 1.2 reifier. The
   pattern's terms and the commit range can come from the rest of the join group.
+  HTTP, CLI and library results report unrecorded commits within that range, including
+  the covered portion of a gap that extends beyond the requested window.
 * History queries read a per-dataset change log that outlives compactions. It is written
   off the commit path, indexed by subject, predicate, object and graph, recovered from the
   write-ahead log after a crash, and trimmed by commit count, age or size. Diffs and the

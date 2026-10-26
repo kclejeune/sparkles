@@ -419,3 +419,7 @@ See the [section in its current document](C18-natural-language-questions-and-ing
 ### Ask grounding accuracy, item 263
 
 See the [section in its current document](C18-natural-language-questions-and-ingest/OUTCOME.md#ask-grounding-accuracy-item-263).
+
+### Entity evidence bounds, item 263
+
+See the [delivery record](C18-natural-language-questions-and-ingest/OUTCOME.md#entity-evidence-bounds-item-263).

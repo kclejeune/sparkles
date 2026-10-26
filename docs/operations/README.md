@@ -105,7 +105,11 @@ each stated scope.
   system calls, and an in-memory dataset is backed up through a temporary generation.
 * Backups are incremental and deduplicated in content-addressed 32 MiB pieces, and only
   the appended bytes of the WAL and catalog are copied. Repositories can be encrypted with
-  a local key or passphrase, and encryption is off by default.
+  a local key or passphrase. The standard binary includes encryption support, and
+  each repository opts in through operator configuration. Linux and Android use
+  locked pages excluded from dumps. Encrypted macOS CLI commands explicitly disable
+  process core dumps before reading keys, then use locked pages. The process and its
+  children inherit the zero hard limit.
 * A restore goes to a new dataset or replaces one in place, follows dataset-id rules, and
   runs an integrity check before publishing. During an in-place swap, requests get `503`
   with `Retry-After`. Backups can be verified at three levels.

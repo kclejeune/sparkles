@@ -18,9 +18,12 @@ mod brief;
 mod check;
 mod communities;
 mod diagnose;
+mod evidence_budget;
 pub(crate) mod inbox;
 pub(crate) mod ingest;
 mod link;
+#[cfg(test)]
+pub(crate) use link::evidence_probe;
 mod maintain;
 pub(crate) mod pending;
 pub(crate) mod policy;

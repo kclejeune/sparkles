@@ -568,6 +568,7 @@ impl Cli {
                     roots.push(path.into());
                 }
                 let context = sparkles::backup::keys::KeyContext::from_environment(roots);
+                sparkles_backup::crypto::prepare_key_memory_for_process()?;
                 let keys = self.block_on(sparkles::backup::keys::resolve(
                     settings,
                     &context,
@@ -854,6 +855,7 @@ fn run_repo_key(command: RepoKeyCmd, config: &ConfigArg, out: &OutputArg) -> Res
                 roots.push(path.into());
             }
             let context = sparkles::backup::keys::KeyContext::from_environment(roots);
+            sparkles_backup::crypto::prepare_key_memory_for_process()?;
             let inputs = cli.block_on(sparkles::backup::keys::resolve(
                 &settings,
                 &context,

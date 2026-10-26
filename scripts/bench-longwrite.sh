@@ -55,7 +55,7 @@ set -euo pipefail
 
 DATA=${1:-1000000}
 ROOT=$(cd "$(dirname "$0")/.." && pwd)
-WORK=${2:-$ROOT/target/bench-longwrite}
+WORK=${2:-$ROOT/.artifacts/bench-longwrite}
 SPARKLES=${SPARKLES:-$ROOT/target/release/sparkles}
 ENGINES=${ENGINES-sparkles jena qlever fluree oxigraph}
 PORT_BASE=${PORT_BASE:-28400}

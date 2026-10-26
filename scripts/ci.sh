@@ -8,16 +8,17 @@
 # Every task runs to the end unless --fail-fast is given, and the summary lists every
 # failure with the tail of its log.
 #
-# While it runs, target/ci/summary.txt holds each task's state and time, so another
-# terminal or an agent can follow it with `cat target/ci/summary.txt`. Logs are in
-# target/ci/logs/<task>.log.
+# While it runs, .artifacts/ci/summary.txt holds each task's state and time, so another
+# terminal or an agent can follow it with `cat .artifacts/ci/summary.txt`. Logs are in
+# .artifacts/ci/logs/<task>.log.
 #
 # Checks whose inputs are unchanged since they last passed are skipped through mise's task
 # cache (see the task caching section of mise.toml).
 #
-# Usage: scripts/ci.sh [--fast] [--fail-fast] [--force] [--jobs N] [task...]
-#   --fast       formatting, shell checks, doc paths, Clippy on the workspace and the Rust tests only. The
-#                per-feature test runs (test:features) belong to the full gate alone.
+# Usage: scripts/ci.sh [--fast] [--exhaustive-features] [--fail-fast] [--force] [--jobs N] [task...]
+#   --fast       formatting, shell checks, doc paths, workspace Clippy and Rust tests
+#   --exhaustive-features
+#                also run optional-feature Clippy and the six stripped-server test sets
 #   --fail-fast  stop the remaining tasks after the first failure
 #   --force      run every check even when the task cache has a pass for it
 #   --jobs N     tasks run at once (default 2). Cargo tasks share one build lock, so more
@@ -36,7 +37,7 @@ main() {
   full=(
     fmt:check ui:fmt:check node:fmt:check lint:shell lint:doc-paths test:bench-scripts
     lint ui:check fmt:wasm py:lint jvm:lint node:lint
-    test ui:test lint:features test:features
+    test ui:test
     py:test jvm:rust-test jvm:test node:test node:client:check licenses:check
   )
   fast=(fmt:check lint:shell lint:doc-paths lint test)
@@ -44,10 +45,12 @@ main() {
   jobs=2
   fail_fast=
   force=()
+  exhaustive_features=
   tasks=()
   while [ $# -gt 0 ]; do
     case "$1" in
       --fast) tasks=("${fast[@]}") ;;
+      --exhaustive-features) exhaustive_features=1 ;;
       --fail-fast) fail_fast=1 ;;
       --force) force=(--force) ;;
       --jobs)
@@ -63,11 +66,18 @@ main() {
     shift
   done
   [ ${#tasks[@]} -gt 0 ] || tasks=("${full[@]}")
+  if [ -n "$exhaustive_features" ]; then
+    for feature_task in lint:features test:features; do
+      if [[ " ${tasks[*]} " != *" $feature_task "* ]]; then
+        tasks+=("$feature_task")
+      fi
+    done
+  fi
 
-  out=target/ci
+  out=.artifacts/ci
   # One run per checkout: a second run would delete the first one's logs and state.
-  mkdir -p target
-  exec 9> target/ci.lock
+  mkdir -p .artifacts
+  exec 9> .artifacts/ci.lock
   if ! flock -n 9; then
     echo "another CI run is active in this checkout; see $out/summary.txt" >&2
     exit 1
@@ -194,12 +204,24 @@ main() {
     done
     return 0
   }
-  # reap: wait for one running task and record its result.
-  reap() {
+  # Bash can retire a completed job notification before wait -n observes it.
+  # Its recorded PID still retains the status for an explicit wait.
+  wait_recorded() {
+    done_pid=
     set +e
     wait -n -p done_pid
     rc=$?
+    if [ -z "${done_pid:-}" ]; then
+      for done_pid in "${!pids[@]}"; do break; done
+      wait "$done_pid"
+      rc=$?
+    fi
     set -e
+  }
+
+  # reap: wait for one running task and record its result.
+  reap() {
+    wait_recorded
     write_summary
     if [ $rc -ne 0 ]; then
       failed+=("${pids[$done_pid]}")
@@ -252,10 +274,7 @@ main() {
     write_summary
   fi
   while [ ${#pids[@]} -gt 0 ]; do
-    set +e
-    wait -n -p done_pid
-    rc=$?
-    set -e
+    wait_recorded
     if [ $rc -ne 0 ] && [ "$(cut -d' ' -f1 "$out/state/${pids[$done_pid]//:/_}")" = FAIL ]; then
       failed+=("${pids[$done_pid]}")
     fi

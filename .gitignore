@@ -11,3 +11,9 @@
 __pycache__/
 .pytest_cache/
 .mypy_cache/
+
+# Container CI compiler and download stores.
+/.cache
+
+# Validation evidence and benchmark results are not compiler-cache contents.
+/.artifacts

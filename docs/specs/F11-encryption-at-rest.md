@@ -329,7 +329,12 @@ gen-0004/spo.dat block 812 column 2 (dek v2)`. A query that touches it fails wit
 ### 4.5 Keys in memory
 
 Unwrapped keys live in `zeroize`-on-drop buffers. Their pages are locked with `mlock` and
-excluded from core dumps with `madvise(MADV_DONTDUMP)` on Linux. Short-lived copies are
+excluded from core dumps with `madvise(MADV_DONTDUMP)` on Linux. On macOS,
+`prepare_key_memory_for_process` explicitly sets both core-dump limits to zero before
+key resolution. Generic constructors verify both limits and never change process
+policy. `mlock` keeps each dedicated page resident, and `MADV_ZERO_WIRED_PAGES`
+requests deletion-time zeroing. It does not provide core-dump exclusion by itself.
+The CLI and trusted server path prepare the process only for encrypted operations. Short-lived copies are
 not fully covered. Moving a buffer in Rust copies its bytes and leaves the old stack
 slot unzeroized, and key material read from a file, a command or the environment passes
 through ordinary heap buffers before it reaches a locked page. Those buffers are
@@ -1537,6 +1542,15 @@ they hold.
 
 ## Provenance
 
+The macOS protected-key implementation uses the public `mlock`, `madvise` and
+`setrlimit` interfaces. Apple's [setrlimit manual](https://developer.apple.com/library/archive/documentation/System/Conceptual/ManPages_iPhoneOS/man2/setrlimit.2.html)
+describes soft and hard limits. The [Darwin mapping header](https://github.com/apple-oss-distributions/xnu/blob/main/bsd/sys/mman.h)
+describes `MADV_ZERO_WIRED_PAGES` as deletion-time zeroing, and the
+[core writer](https://github.com/apple-oss-distributions/xnu/blob/main/bsd/kern/kern_core.c)
+checks `RLIMIT_CORE`. The [Darwin wait header](https://github.com/apple-oss-distributions/xnu/blob/main/bsd/sys/wait.h)
+defines `waitid` and `WNOWAIT` for observing a provider exit while retaining its
+identity until group cleanup. No Apple implementation code was copied.
+
 This record preserves design sources, licensing and adoption decisions at the
 stages recorded below. Delivery statements in the record are historical. Current
 capabilities and remaining work are described by the spec status and Outcome.
@@ -1574,13 +1588,21 @@ capabilities and remaining work are described by the spec status and Outcome.
 
 ## Outcome
 
+The standard CLI and server include encrypted-repository support. macOS uses
+locked, zero-on-release pages after the host explicitly disables process core dumps
+with a zero hard limit. The CLI prepares that policy before reading encrypted key
+inputs. Library constructors require the policy to be established and never alter
+process limits themselves. Linux and Android retain per-mapping dump exclusion.
+The encrypted repository format and plaintext repository behavior are unchanged.
+F11 remains partial because its other key workflows and later phases remain open.
+
 The optional `sparkles-backup` `encryption` feature implements the local encrypted
-repository engine from part of Phase 1. Existing defaults and plaintext repositories
-retain their behavior. `Repository::open_encrypted` accepts explicitly resolved local
+repository engine from part of Phase 1. Plaintext repositories retain their behavior. `Repository::open_encrypted` accepts explicitly resolved local
 32-byte keys or passphrases. The facade adds reference-only file, environment, systemd
 credential, passphrase-file and literal-argv command providers. The offline CLI and
-trusted operator TOML server path resolve them before opening the engine. Both
-encryption features remain off by default.
+trusted operator TOML server path resolve them before opening the engine. The
+standard server enables repository encryption support by default. The library's
+`encryption` feature remains optional, and repositories opt in through configuration.
 This delivers part of the operator workflow, with further Phase 1 work remaining.
 
 Repositories use random master keys and wrapped keyslots, the specified AES-256-GCM,
@@ -1627,7 +1649,8 @@ preserve their ephemeral data/identity.
 
 Command cleanup kills the provider group and retains sole child ownership until it is
 reaped, including dropped resolution futures and runtime shutdown. A failed cleanup
-thread spawn reaps synchronously rather than abandoning the child.
+thread spawn reaps synchronously rather than abandoning the child. Linux, Android
+and macOS observe successful provider exits without reaping before group cleanup.
 
 Task cancellation reaches provider resolution and cache waits from backup/restore/verify/GC
 and scheduled-policy list/retention. Engine opening retains existing backend deadlines and
@@ -1706,9 +1729,9 @@ is missing at `537e048` and the order of the remaining work.
     no `export --paper` (§5.7).
   * Phases 2 to 4 have no code: no FastCDC, no write-only repositories, no keyring in
     dataset directories, and no encrypting Tantivy directory.
-  * Both cargo features (`sparkles-backup/encryption`, `backup-encryption`) are off by
-    default. The Nix package turns `backup-encryption` on for Linux; the `Dockerfile`
-    and a plain `cargo build` do not ([X12 §3.1](X12-release-engineering.md)).
+  * Standard server source builds and packages enable `backup-encryption`. The
+    library feature remains optional. Linux and Android provide per-mapping dump
+    exclusion; macOS uses locked pages after explicit process-wide core-dump refusal.
 * **Order.**
   1. **API and NixOS key workflows** (§8.3, §8.4) for repositories: `encryption` in
      `RepositoryConfig` limited to key sources the config file allows, the key slot

@@ -104,6 +104,9 @@ without a migration path, so keep backups of anything you cannot regenerate.
 
 ## Running the server
 
+Linux is the primary production server platform. The CLI also supports macOS for
+local administration, imports, queries and encrypted backup operations.
+
 ```sh
 sparkles serve --data ./data --port 3030   # UI at http://localhost:3030/ui/
 ```
@@ -1852,9 +1855,14 @@ server with the file, or send it SIGHUP. Then `POST /$/repositories` with
 
 ### Encrypted repositories
 
-Build the CLI with `--features backup-encryption` to enable encrypted repositories.
-The feature is off in the default build. It requires Linux or Android, because it keeps
-keys in protected memory. Plaintext repositories behave as before. The CLI and a server
+The standard CLI and server include encrypted repository support. Repositories stay
+plaintext unless encryption is configured. Linux and Android keep repository keys in
+locked pages excluded from core dumps. On macOS, an encrypted CLI operation first
+sets both process core-dump limits to zero before resolving key inputs. That limit
+cannot be raised again by an unprivileged process and is inherited by child processes.
+Embedded callers explicitly call `sparkles_backup::crypto::prepare_key_memory_for_process`
+or establish the same limits themselves. Generic key constructors refuse an
+unprepared macOS process. Keys are zeroed before their pages are unlocked and unmapped. The CLI and a server
 started with `serve --backup-config FILE` support the same local key providers. The
 HTTP API refuses encryption settings when it registers or updates a repository, so only
 the operator controls keys and the references to them.
@@ -2843,16 +2851,11 @@ named by a secret. The Python package does the same with
 
 ## Local embedding models
 
-A server built with the `embed-local` cargo feature runs sentence-embedding models
-itself, with no Ollama or other service next to it. The flake's packages have the
-feature, and so do the Docker images. A plain `cargo build` leaves it out, so build with it:
-
-```sh
-cargo build --release -p sparkles-server --features embed-local
-```
-
-Without the feature, the server still reads the configuration below and reports each
-local model with `runtime: false`.
+The standard server includes the local embedding runtime and can run sentence-embedding
+models without a separate embedding service. Compiling it does not load a model.
+A local provider must be configured with a model snapshot before it can run.
+Custom builds that omit `embed-local` still read the configuration below and report
+each local model with `runtime: false`.
 
 The models come from a model store, a directory of pinned snapshots that
 `sparkles models` fills from the Hugging Face Hub. Each snapshot is named by its
@@ -3454,7 +3457,7 @@ shows the error and no badges.
 ## Editing forms
 
 A dataset's SHACL shapes double as editing forms
-([U02](specs/U02-shape-driven-forms.md)). When a node shape targets the resource selected
+([U02](specs/U02-shape-driven-forms/README.md)). When a node shape targets the resource selected
 in Explore and the caller may save, the side panel shows **Edit**, which turns the
 properties into a form. `/ui/datasets/{name}/edit?iri=…&branch=…` opens the same form on
 a page of its own, for links from other tools. The shapes come from the dataset's
@@ -3490,7 +3493,10 @@ lengths, numeric and date ranges, allowed values, counts, `sh:languageIn` and
 and changes. **Preview** sends the change to the server, which runs it as a dry run and
 validates the touched resources against every constraint of the shapes, including
 `sh:class`, `sh:node` and SHACL-SPARQL. Its results appear under their fields, and the
-preview lists the triples the save would remove and add. **Save** commits the change as one
+preview lists the triples the save would remove and add. Checks follow the shapes beyond
+a fixed graph radius. If complete discovery exceeds its allowance, the preview refuses
+rather than presenting partial conformance. A refused recheck invalidates earlier
+approval of the same changes. **Save** commits the change as one
 commit with the message typed beside it. With a guard in `reject` mode, Save checks first
 and writes nothing when the guard would reject the change. Otherwise a save with problems
 asks once more with **Save with problems**. After a failed save, an error summary at the
@@ -4252,7 +4258,7 @@ PDF documents need a build with the `pdf` feature, which is on by default. Each 
 of the text starts with a `<!-- Page N -->` marker, and the review page shows the page
 of each fact. A scanned page fails the task with `needs-ocr` and the list of pages.
 `allowPartial=true` ingests the readable pages and records the others as left out. A
-server built with `--features pdf-ocr` reads scanned pages with the PP-OCR models in the
+standard server reads scanned pages with the PP-OCR models in the
 directory of `--pdf-ocr-models`. It loads PDFium from `--pdfium-lib` and ONNX Runtime
 from `--onnxruntime-lib`, or from their usual library paths, and never downloads a model.
 `--pdf-workers` (2 by default) limits the conversions that run at once.
@@ -6666,10 +6672,12 @@ never downloads. Mount their directory and pass `--pdf-ocr-models DIR`, as descr
 about 55 MB larger than the default one.
 
 `--build-arg FEATURES="..."` sets the cargo features of `sparkles-server` that both builds
-add, `embed-local` by default, and `--build-arg FEATURES=` leaves local embeddings out.
-`--build-arg NO_DEFAULT_FEATURES=1` starts from no default features, as `cargo build`
-does. Compose passes `SPARKLES_FEATURES` as `FEATURES`, and an empty value leaves the
-feature out. The two server builds keep separate cargo
+add to the standard defaults, and defaults to empty. Local embeddings, encrypted
+repositories and OCR code are already in the standard binary. OCR libraries and
+models remain separate runtime inputs. `--build-arg NO_DEFAULT_FEATURES=1` starts
+from no default features, as `cargo build`
+does. Compose passes `SPARKLES_FEATURES` as `FEATURES`, and an empty value keeps
+the standard capabilities. The two server builds keep separate cargo
 target directories in the build cache, so building both does not recompile either one
 from scratch.
 
@@ -7403,10 +7411,10 @@ itself. A `models.dir` outside the Nix store and the data directory is then adde
 the service's writable paths, and with downloads off to its read-only paths. With
 `models.dir` unset, the store is `models/` in the data directory.
 
-The flake's `sparkles` package has the `embed-local` feature. Its `features` argument
-lists the cargo features on top of the defaults, and
-`sparkles.override { features = [ ]; }` builds the package without the runtime, about
-5 MB smaller. A local provider of such a build reports `runtime: false`.
+The flake's `sparkles` package uses the standard Cargo defaults, including local
+embeddings, encrypted repositories and OCR support. Its `features` argument adds
+features to those defaults. An empty list keeps the standard runtime capabilities.
+Model snapshots and OCR libraries are configured separately.
 
 ### Declarative dataset settings
 

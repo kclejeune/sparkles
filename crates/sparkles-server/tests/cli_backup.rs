@@ -14,7 +14,7 @@ const BIN: &str = env!("CARGO_BIN_EXE_sparkles");
 
 #[cfg(all(
     feature = "backup-encryption",
-    any(target_os = "linux", target_os = "android")
+    any(target_os = "linux", target_os = "android", target_os = "macos")
 ))]
 fn private_key(path: &Path, bytes: &[u8]) {
     // Printable raw keys are refused as likely passwords, so write hex.
@@ -80,7 +80,7 @@ fn encrypted_configuration_is_rejected_by_the_server_without_opening_it() {
 #[test]
 #[cfg(all(
     feature = "backup-encryption",
-    any(target_os = "linux", target_os = "android")
+    any(target_os = "linux", target_os = "android", target_os = "macos")
 ))]
 fn encrypted_cli_roundtrip_rotation_and_independent_recovery() {
     let home = tempfile::tempdir().unwrap();
@@ -382,7 +382,7 @@ fn encrypted_cli_roundtrip_rotation_and_independent_recovery() {
 #[test]
 #[cfg(all(
     feature = "backup-encryption",
-    any(target_os = "linux", target_os = "android")
+    any(target_os = "linux", target_os = "android", target_os = "macos")
 ))]
 fn encrypted_cli_resolves_env_credential_command_and_refuses_dataset_keys() {
     let home = tempfile::tempdir().unwrap();
@@ -1851,7 +1851,7 @@ fn encrypted_offline_policy_default_off_refuses_before_mutation() {
 #[test]
 #[cfg(all(
     feature = "backup-encryption",
-    any(target_os = "linux", target_os = "android")
+    any(target_os = "linux", target_os = "android", target_os = "macos")
 ))]
 fn encrypted_offline_policy_roundtrip_epochs_retention_and_selected_only_inputs() {
     use sparkles::backup::config::{
@@ -2030,7 +2030,7 @@ fn encrypted_offline_policy_roundtrip_epochs_retention_and_selected_only_inputs(
 #[test]
 #[cfg(all(
     feature = "backup-encryption",
-    any(target_os = "linux", target_os = "android")
+    any(target_os = "linux", target_os = "android", target_os = "macos")
 ))]
 fn encrypted_offline_policy_validates_catalog_roots_and_overrides_before_open() {
     use sparkles::backup::config::KeySource;
@@ -2119,7 +2119,7 @@ fn encrypted_offline_policy_validates_catalog_roots_and_overrides_before_open() 
 #[test]
 #[cfg(all(
     feature = "backup-encryption",
-    any(target_os = "linux", target_os = "android")
+    any(target_os = "linux", target_os = "android", target_os = "macos")
 ))]
 fn encrypted_offline_zero_dataset_policy_provider_cancellation_is_reaped_and_redacted() {
     let home = tempfile::tempdir().unwrap();
@@ -2168,14 +2168,23 @@ fn encrypted_offline_zero_dataset_policy_provider_cancellation_is_reaped_and_red
     assert!(stderr(&output).contains("cancelled"), "{}", stderr(&output));
     assert!(!stderr(&output).contains(s(&script)));
     assert!(!repo.exists());
+    let provider_exists = || {
+        // SAFETY: signal zero inspects existence without sending a signal.
+        if unsafe { libc::kill(pid, 0) } == 0 {
+            return true;
+        }
+        assert_eq!(
+            std::io::Error::last_os_error().raw_os_error(),
+            Some(libc::ESRCH),
+            "provider absence must be confirmed"
+        );
+        false
+    };
     let deadline = Instant::now() + Duration::from_secs(5);
-    while Path::new(&format!("/proc/{pid}")).exists() && Instant::now() < deadline {
+    while provider_exists() && Instant::now() < deadline {
         std::thread::sleep(Duration::from_millis(10));
     }
-    assert!(
-        !Path::new(&format!("/proc/{pid}")).exists(),
-        "provider must be reaped"
-    );
+    assert!(!provider_exists(), "provider must be reaped");
     let key = h.join("recovery-key");
     private_key(&key, &[83; 32]);
     let mut file =

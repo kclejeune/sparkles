@@ -74,7 +74,7 @@ if cpu=$(client_cpu) && [ -n "$cpu" ]; then CLIENT=(taskset -c "$cpu"); fi
 
 SCALE=${1:-100}
 ROOT=$(cd "$(dirname "$0")/.." && pwd)
-WORK=${2:-$ROOT/target/bench-watdiv}
+WORK=${2:-$ROOT/.artifacts/bench-watdiv}
 WARMUP=${WARMUP:-2}
 RUNS=${RUNS:-10}
 INSTANCES=${INSTANCES:-5}
