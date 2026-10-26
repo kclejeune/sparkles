@@ -118,9 +118,24 @@ pub fn chunk_ends(buf: &[u8]) -> Result<Vec<usize>> {
     Ok(ends)
 }
 
-fn parse_delta_with(buf: &[u8], mut on_chunk: impl FnMut(usize)) -> Result<ParsedDelta<'_>> {
+fn parse_delta_with(buf: &[u8], on_chunk: impl FnMut(usize)) -> Result<ParsedDelta<'_>> {
+    parse_delta_inner(buf, on_chunk, None)
+}
+
+pub(crate) fn parse_delta_controlled<'a>(
+    buf: &'a [u8],
+    budget: &mut crate::store::cold::ColdBudget<'_>,
+) -> Result<ParsedDelta<'a>> {
+    parse_delta_inner(buf, |_| {}, Some(budget))
+}
+
+fn parse_delta_inner<'a>(
+    buf: &'a [u8],
+    mut on_chunk: impl FnMut(usize),
+    mut budget: Option<&mut crate::store::cold::ColdBudget<'_>>,
+) -> Result<ParsedDelta<'a>> {
     if buf.len() < MAGIC.len() || buf[..MAGIC.len()] != MAGIC {
-        let (keys, end) = legacy_entries(buf);
+        let (keys, end) = legacy_entries(buf, budget.as_deref_mut())?;
         return Ok(ParsedDelta {
             keys,
             end,
@@ -150,6 +165,9 @@ fn parse_delta_with(buf: &[u8], mut on_chunk: impl FnMut(usize)) -> Result<Parse
     }
     let mut pos = HEADER;
     while let Some(h) = buf.get(pos..pos + CHUNK_HEADER) {
+        if let Some(budget) = budget.as_deref_mut() {
+            budget.check()?;
+        }
         let word = |at: usize| u32::from_le_bytes(h[at..at + 4].try_into().unwrap());
         let (crc, n, plen) = (word(0), word(4) as usize, word(8) as usize);
         let first = u64::from_le_bytes(h[16..24].try_into().unwrap());
@@ -159,17 +177,28 @@ fn parse_delta_with(buf: &[u8], mut on_chunk: impl FnMut(usize)) -> Result<Parse
         let Some(payload) = buf.get(pos + CHUNK_HEADER..pos + CHUNK_HEADER + plen) else {
             break;
         };
-        if crc != chunk_crc(&h[4..], payload) {
+        let actual = match budget.as_deref_mut() {
+            Some(budget) => budget.crc32(&[&h[4..], payload])?,
+            None => chunk_crc(&h[4..], payload),
+        };
+        if crc != actual {
             break;
         }
         let (mut p, before) = (0usize, out.keys.len());
         for _ in 0..n {
+            if let Some(budget) = budget.as_deref_mut() {
+                budget.check()?;
+            }
             let len = match payload.get(p..p + 4) {
                 Some(l) => u32::from_le_bytes(l.try_into().unwrap()) as usize,
                 None => break,
             };
             if len == 0 || p + 4 + len > plen {
                 break;
+            }
+            if let Some(budget) = budget.as_deref_mut() {
+                let need = out.keys.len() + 1;
+                budget.reserve(&mut out.keys, need)?;
             }
             out.keys.push(&payload[p + 4..p + 4 + len]);
             p += 4 + len;
@@ -191,18 +220,43 @@ fn parse_delta_with(buf: &[u8], mut on_chunk: impl FnMut(usize)) -> Result<Parse
 /// entry cut short ends them, as does a tail of zero bytes: no key is empty, and a
 /// crash can leave zeros where the file's length reached the disk before its data (on
 /// file systems that do not order the two). Either is a torn tail.
-fn legacy_entries(buf: &[u8]) -> (Vec<&[u8]>, usize) {
+fn legacy_entries<'a>(
+    buf: &'a [u8],
+    mut budget: Option<&mut crate::store::cold::ColdBudget<'_>>,
+) -> Result<(Vec<&'a [u8]>, usize)> {
     let mut pos = 0;
     let mut keys = Vec::new();
     while pos + 4 <= buf.len() {
+        if let Some(budget) = budget.as_deref_mut() {
+            budget.check()?;
+        }
         let len = u32::from_le_bytes(buf[pos..pos + 4].try_into().unwrap()) as usize;
-        if pos + 4 + len > buf.len() || (len == 0 && buf[pos..].iter().all(|&b| b == 0)) {
+        if pos + 4 + len > buf.len() {
             break;
+        }
+        if len == 0 {
+            let mut zero = true;
+            for chunk in buf[pos..].chunks(64 << 10) {
+                if let Some(budget) = budget.as_deref_mut() {
+                    budget.check()?;
+                }
+                if chunk.iter().any(|&byte| byte != 0) {
+                    zero = false;
+                    break;
+                }
+            }
+            if zero {
+                break;
+            }
+        }
+        if let Some(budget) = budget.as_deref_mut() {
+            let need = keys.len() + 1;
+            budget.reserve(&mut keys, need)?;
         }
         keys.push(&buf[pos + 4..pos + 4 + len]);
         pos += 4 + len;
     }
-    (keys, pos)
+    Ok((keys, pos))
 }
 
 fn chunk_crc(header: &[u8], payload: &[u8]) -> u32 {
@@ -564,6 +618,13 @@ fn corrupt_in(path: &Path, e: Error) -> Error {
 }
 
 impl DeltaVocab {
+    pub(crate) fn resident_bytes_limited(
+        &self,
+        limit: &crate::history::ReadLimit<'_>,
+    ) -> Result<u64> {
+        let guard = limit.read_lock(&self.inner)?;
+        Ok(guard.cold_bytes() + std::mem::size_of::<RwLock<AppendVocab>>() as u64 + 64)
+    }
     pub(crate) fn fork_memory(&self, len: u64) -> DeltaVocab {
         let mut copy = AppendVocab::default();
         self.with(|v| {
@@ -597,6 +658,38 @@ impl DeltaVocab {
         Ok(DeltaVocab {
             inner: Arc::new(RwLock::new(v)),
             file: None,
+        })
+    }
+
+    /// The read-only dictionary of a retained generation, with its wire buffers,
+    /// entry index and sparse owned dictionary admitted before growth.
+    pub(crate) fn open_read_only_controlled(
+        path: &Path,
+        budget: &mut crate::store::cold::ColdBudget<'_>,
+    ) -> Result<crate::store::cold::Loaded<DeltaVocab>> {
+        let start = budget.used();
+        let buf = match budget.read_file(path) {
+            Ok(bytes) => bytes,
+            Err(Error::Io(error)) if error.kind() == std::io::ErrorKind::NotFound => Vec::new(),
+            Err(error) => return Err(error),
+        };
+        let parsed = parse_delta_controlled(&buf, budget).map_err(|e| corrupt_in(path, e))?;
+        let mut vocab = AppendVocab::default();
+        for key in &parsed.keys {
+            vocab.push_controlled(key, false, budget)?;
+        }
+        budget.drop_vec(parsed.keys);
+        budget.drop_vec(buf);
+        let bytes = vocab.cold_bytes();
+        let wrapper = std::mem::size_of::<RwLock<AppendVocab>>() as u64 + 64;
+        budget.charge(wrapper)?;
+        debug_assert_eq!(budget.used() - start, bytes + wrapper);
+        Ok(crate::store::cold::Loaded {
+            value: DeltaVocab {
+                inner: Arc::new(RwLock::new(vocab)),
+                file: None,
+            },
+            charge: bytes + wrapper,
         })
     }
 
@@ -960,6 +1053,82 @@ mod tests {
 
     fn entry(k: &[u8]) -> Vec<u8> {
         [&(k.len() as u32).to_le_bytes()[..], k].concat()
+    }
+
+    #[test]
+    fn controlled_read_only_dictionary_matches_wire_codecs_without_writes() {
+        use crate::{
+            history::{HistoryOptions, ReadLimit},
+            store::cold::ColdBudget,
+        };
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("delta.vocab");
+        let vocab = DeltaVocab::open(&path).unwrap();
+        for n in 0..2000 {
+            vocab.insert(format!("<urn:term:{n}>").as_bytes()).unwrap();
+        }
+        vocab.sync().unwrap();
+        drop(vocab);
+        let before = std::fs::read(&path).unwrap();
+        let options = HistoryOptions::default();
+        let mut budget = ColdBudget::new(ReadLimit {
+            options: &options,
+            memory: Some(16 << 20),
+            held: 0,
+        })
+        .unwrap();
+        let loaded = DeltaVocab::open_read_only_controlled(&path, &mut budget).unwrap();
+        assert_eq!(loaded.value.len(), 2000);
+        assert_eq!(loaded.value.get(0).unwrap(), b"<urn:term:0>");
+        assert_eq!(loaded.value.get(1999).unwrap(), b"<urn:term:1999>");
+        assert_eq!(budget.used(), loaded.charge);
+        assert_eq!(before, std::fs::read(&path).unwrap());
+        drop(loaded.value);
+        budget.release(loaded.charge);
+        assert_eq!(budget.used(), 0);
+        let mut small = ColdBudget::new(ReadLimit {
+            options: &options,
+            memory: Some(1024),
+            held: 0,
+        })
+        .unwrap();
+        assert!(matches!(
+            DeltaVocab::open_read_only_controlled(&path, &mut small),
+            Err(Error::BudgetExceeded(_))
+        ));
+        assert_eq!(before, std::fs::read(&path).unwrap());
+    }
+
+    #[test]
+    fn controlled_parser_keeps_legacy_torn_and_unknown_version_semantics() {
+        use crate::{
+            history::{HistoryOptions, ReadLimit},
+            store::cold::ColdBudget,
+        };
+        let options = HistoryOptions::default();
+        let mut source = entry(b"<urn:a>");
+        source.extend(entry(b"<urn:b>"));
+        source.extend([0; 64]);
+        let mut budget = ColdBudget::new(ReadLimit {
+            options: &options,
+            memory: Some(1 << 20),
+            held: 0,
+        })
+        .unwrap();
+        let controlled = parse_delta_controlled(&source, &mut budget).unwrap();
+        let legacy = parse_delta(&source).unwrap();
+        assert_eq!(controlled.keys, legacy.keys);
+        assert_eq!(controlled.end, legacy.end);
+        budget.drop_vec(controlled.keys);
+        assert_eq!(budget.used(), 0);
+        let mut unknown = Vec::from(MAGIC);
+        unknown.extend((VERSION + 1).to_le_bytes());
+        unknown.extend([0; 4]);
+        assert!(matches!(
+            parse_delta_controlled(&unknown, &mut budget),
+            Err(Error::Unsupported(_))
+        ));
+        assert_eq!(budget.used(), 0);
     }
 
     #[test]

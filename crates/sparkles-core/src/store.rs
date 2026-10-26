@@ -20,6 +20,7 @@ pub mod caches;
 mod changelog;
 mod changes;
 mod clone;
+pub(crate) mod cold;
 mod commit_graph;
 mod commit_stats;
 mod compaction;
@@ -161,6 +162,8 @@ pub struct Generation {
     pub(crate) wal_index: Mutex<Option<wal::WalIndex>>,
     /// a branch's linked generation: the upstream files it reads and its base delta
     pub(crate) link: Option<Arc<link::Linked>>,
+    /// Owned cold-loader storage, excluding mapped files and globally shared caches.
+    pub(crate) cold_bytes: u64,
 }
 
 impl Generation {
@@ -184,6 +187,7 @@ impl Generation {
             ill_typed_literals: Mutex::new(None),
             wal_index: Mutex::new(None),
             link: None,
+            cold_bytes: 0,
         }
     }
 
@@ -208,6 +212,7 @@ impl Generation {
             ill_typed_literals: Mutex::new(None),
             wal_index: Mutex::new(None),
             link: None,
+            cold_bytes: 0,
         }
     }
 
@@ -270,6 +275,7 @@ impl Generation {
             ill_typed_literals: Mutex::new(None),
             wal_index: Mutex::new(None),
             link: None,
+            cold_bytes: 0,
         })
     }
 
@@ -2590,9 +2596,18 @@ impl Store {
             }
         }
         if let Some(i) = cached {
-            limit.check(history_limited::preparation_delta_bytes(
-                &h.cache[i].snap.delta,
-            ))?;
+            let retained = if memory.is_some()
+                && !Arc::ptr_eq(&h.cache[i].snap.generation, &live.generation)
+            {
+                h.cache[i].snap.generation.retained_bytes_limited(&limit)?
+            } else {
+                0
+            };
+            limit
+                .holding(retained)?
+                .check(history_limited::preparation_delta_bytes(
+                    &h.cache[i].snap.delta,
+                ))?;
             let e = h.cache.remove(i);
             let snap = e.snap.clone();
             h.cache.insert(0, e);
@@ -2611,6 +2626,11 @@ impl Store {
             self.history_generation_limited(&mut h, owner, current, &live, &limit)?
         } else {
             self.history_generation(&mut h, owner, current, &live, &entry)?
+        };
+        let limit = if memory.is_some() && !Arc::ptr_eq(&generation, &live.generation) {
+            limit.holding(generation.retained_bytes_limited(&limit)?)?
+        } else {
+            limit
         };
         let budget = h.budget.capacity();
         let t0 = std::time::Instant::now();

@@ -111,15 +111,56 @@ impl Store {
             return Ok(live.generation.clone());
         }
         if let Some(index) = history.open.iter().position(|(number, _)| *number == owner) {
+            history.open[index].1.retained_bytes_limited(limit)?;
             let entry = history.open.remove(index);
             let generation = entry.1.clone();
             history.open.insert(0, entry);
             limit.check(0)?;
             return Ok(generation);
         }
-        Err(Error::HistoryUnsupported(
-            "bounded reads require a retained generation; cold opening is not controlled".into(),
-        ))
+        let entry = history.gens.get(&owner).ok_or_else(|| {
+            Error::HistoryUnsupported("the selected generation is no longer retained".into())
+        })?;
+        limit.check(0)?;
+        match std::fs::metadata(entry.dir.join(link::LINK_FILE)) {
+            Ok(_) => {
+                return Err(Error::HistoryUnsupported(
+                    "bounded linked-generation decoding is not available".into(),
+                ));
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error.into()),
+        }
+        let mut budget = cold::ColdBudget::new(*limit)?;
+        let loaded =
+            Generation::open_sealed_controlled(&entry.dir, &entry.name, None, &mut budget)?;
+        let generation = Arc::new(loaded.value);
+        // Caching the backing generation is optional. Do not grow an unrelated
+        // shared vector outside this request's remaining preparation allowance.
+        if history.open.capacity() < 2 {
+            let relocating = (history.open.capacity() + 2) as u64
+                * std::mem::size_of::<(u32, Arc<Generation>)>() as u64;
+            let fits = match limit.check(loaded.charge.saturating_add(relocating)) {
+                Ok(()) => true,
+                Err(Error::BudgetExceeded(_)) => false,
+                Err(error) => return Err(error),
+            };
+            if !fits
+                || history
+                    .open
+                    .try_reserve_exact(2 - history.open.len())
+                    .is_err()
+            {
+                limit.check(loaded.charge)?;
+                return Ok(generation);
+            }
+        }
+        while history.open.len() >= 2 {
+            history.open.pop();
+        }
+        history.open.insert(0, (owner, generation.clone()));
+        limit.check(loaded.charge)?;
+        Ok(generation)
     }
 
     #[allow(clippy::too_many_arguments)]

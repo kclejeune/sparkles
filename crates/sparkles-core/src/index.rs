@@ -1140,6 +1140,18 @@ pub(crate) struct Segments {
 
 impl Segments {
     fn open(path: &Path, perm: Perm, blocks: &[BlockMeta]) -> Result<Segments> {
+        Self::open_inner(path, perm, blocks, None)
+    }
+
+    fn open_inner(
+        path: &Path,
+        perm: Perm,
+        blocks: &[BlockMeta],
+        mut budget: Option<&mut crate::store::cold::ColdBudget<'_>>,
+    ) -> Result<Segments> {
+        if let Some(budget) = budget.as_deref_mut() {
+            budget.check()?;
+        }
         let bad = |m: String| Error::Corrupt(format!("{}.seg: {m}", perm.name()));
         let f = File::open(path)?;
         let map = map_random(&f)?;
@@ -1150,18 +1162,37 @@ impl Segments {
         if !supported_segment_rows(seg_rows) {
             return Err(bad(format!("segment size {seg_rows} is not supported")));
         }
-        let mut start = Vec::with_capacity(blocks.len() + 1);
+        let mut start = if let Some(budget) = budget.as_deref_mut() {
+            let mut entries = Vec::new();
+            let count = blocks
+                .len()
+                .checked_add(1)
+                .ok_or_else(|| budget.exhausted())?;
+            budget.reserve(&mut entries, count)?;
+            entries
+        } else {
+            Vec::with_capacity(blocks.len() + 1)
+        };
         let mut n = 0usize;
         for m in blocks {
+            if let Some(budget) = budget.as_deref_mut() {
+                budget.check()?;
+            }
             start.push(n);
-            n += (m.rows as usize).div_ceil(seg_rows);
+            n = n
+                .checked_add((m.rows as usize).div_ceil(seg_rows))
+                .ok_or_else(|| bad("segment count overflow".into()))?;
         }
         start.push(n);
-        if map.len() != SEG_HEADER + n * SEG_ENTRY {
+        let expected = n
+            .checked_mul(SEG_ENTRY)
+            .and_then(|bytes| bytes.checked_add(SEG_HEADER))
+            .ok_or_else(|| bad("segment layout overflow".into()))?;
+        if map.len() != expected {
             return Err(bad(format!(
                 "{} bytes, {} expected for {n} segments",
                 map.len(),
-                SEG_HEADER + n * SEG_ENTRY
+                expected
             )));
         }
         // A directory of at most this size is asked for whole at open, as the block
@@ -1172,13 +1203,23 @@ impl Segments {
         if map.len() <= READ_AT_OPEN {
             will_need(IoFile::of_perm(perm), &map, 0, map.len());
         }
+        let (hinted, sparse_reads) = match budget {
+            Some(budget) => (
+                budget.filled(blocks.len().div_ceil(64))?,
+                budget.filled(blocks.len())?,
+            ),
+            None => (
+                (0..blocks.len().div_ceil(64))
+                    .map(|_| Default::default())
+                    .collect(),
+                (0..blocks.len()).map(|_| Default::default()).collect(),
+            ),
+        };
         Ok(Segments {
             map,
             seg_rows,
-            hinted: (0..blocks.len().div_ceil(64))
-                .map(|_| Default::default())
-                .collect(),
-            sparse_reads: (0..blocks.len()).map(|_| Default::default()).collect(),
+            hinted,
+            sparse_reads,
             start,
         })
     }
@@ -1277,6 +1318,17 @@ pub struct PermIndex {
 }
 
 impl PermIndex {
+    pub(crate) fn resident_bytes(&self) -> u64 {
+        self.blocks.capacity() as u64 * std::mem::size_of::<BlockMeta>() as u64
+            + 128
+            + self.segs.as_ref().map_or(0, |s| {
+                s.start.capacity() as u64 * std::mem::size_of::<usize>() as u64
+                    + s.hinted.len() as u64 * 8
+                    + s.sparse_reads.len() as u64
+                    + std::mem::size_of::<Segments>() as u64
+                    + 64
+            })
+    }
     pub fn empty(perm: Perm) -> PermIndex {
         PermIndex {
             perm,
@@ -1300,20 +1352,70 @@ impl PermIndex {
         Self::open_layout(dir, perm, format >= 3)
     }
 
+    pub(crate) fn open_controlled(
+        dir: &Path,
+        perm: Perm,
+        format: u32,
+        budget: &mut crate::store::cold::ColdBudget<'_>,
+    ) -> Result<crate::store::cold::Loaded<PermIndex>> {
+        budget.check()?;
+        crate::formats::INDEX.check(&dir.display().to_string(), format, None)?;
+        let start = budget.used();
+        let value = Self::open_layout_inner(dir, perm, format >= 3, Some(budget))?;
+        Ok(crate::store::cold::Loaded {
+            value,
+            charge: budget.used() - start,
+        })
+    }
+
     fn open_layout(dir: &Path, perm: Perm, segmented: bool) -> Result<PermIndex> {
-        let meta = std::fs::read(dir.join(format!("{}.meta", perm.name())))?;
+        Self::open_layout_inner(dir, perm, segmented, None)
+    }
+
+    fn open_layout_inner(
+        dir: &Path,
+        perm: Perm,
+        segmented: bool,
+        mut budget: Option<&mut crate::store::cold::ColdBudget<'_>>,
+    ) -> Result<PermIndex> {
+        let path = dir.join(format!("{}.meta", perm.name()));
+        let meta = match budget.as_deref_mut() {
+            Some(budget) => budget.read_file(&path)?,
+            None => std::fs::read(&path)?,
+        };
         if meta.len() % META_BYTES != 0 {
             return Err(Error::Corrupt(format!("{} metadata size", perm.name())));
         }
-        let blocks: Vec<BlockMeta> = meta
-            .as_chunks::<META_BYTES>()
-            .0
-            .iter()
-            .map(|c| BlockMeta::read(c))
-            .collect();
-        let rows = blocks.last().map_or(0, |b| b.row_start + b.rows as u64);
+        let blocks: Vec<BlockMeta> = if let Some(budget) = budget.as_deref_mut() {
+            let mut blocks = Vec::new();
+            budget.reserve(&mut blocks, meta.len() / META_BYTES)?;
+            for record in meta.as_chunks::<META_BYTES>().0 {
+                budget.check()?;
+                blocks.push(BlockMeta::read(record));
+            }
+            blocks
+        } else {
+            meta.as_chunks::<META_BYTES>()
+                .0
+                .iter()
+                .map(|record| BlockMeta::read(record))
+                .collect()
+        };
+        if let Some(budget) = budget.as_deref_mut() {
+            budget.drop_vec(meta);
+        } else {
+            drop(meta);
+        }
+        let rows = blocks
+            .last()
+            .map(|block| block.row_start.checked_add(block.rows as u64))
+            .unwrap_or(Some(0))
+            .ok_or_else(|| Error::Corrupt("index row count overflow".into()))?;
         let f = File::open(dir.join(format!("{}.dat", perm.name())))?;
         let data = if f.metadata()?.len() > 0 {
+            if let Some(budget) = budget.as_deref_mut() {
+                budget.charge(64)?;
+            }
             Some(Arc::new(map_random(&f)?))
         } else {
             None
@@ -1326,10 +1428,19 @@ impl PermIndex {
                     perm.name()
                 )));
             }
-            Some(Arc::new(Segments::open(&path, perm, &blocks)?))
+            let value = if let Some(budget) = budget.as_deref_mut() {
+                budget.charge(std::mem::size_of::<Segments>() as u64 + 32)?;
+                Segments::open_inner(&path, perm, &blocks, Some(budget))?
+            } else {
+                Segments::open(&path, perm, &blocks)?
+            };
+            Some(Arc::new(value))
         } else {
             None
         };
+        if let Some(budget) = budget {
+            budget.charge(64)?;
+        }
         Ok(PermIndex {
             perm,
             data,
@@ -2863,6 +2974,46 @@ mod tests {
                 decode_point_column_limited(damaged, values.len(), &mut scratch, &limit, 1 << 20)
                     .is_err()
             );
+        }
+    }
+
+    #[test]
+    fn controlled_index_open_matches_both_layouts_and_retains_its_charge() {
+        use crate::{
+            history::{HistoryOptions, ReadLimit},
+            store::cold::ColdBudget,
+        };
+        let options = HistoryOptions::default();
+        let keys = run_keys();
+        let (dir3, normal3, dir2, normal2) = both_layouts(&keys);
+        for (directory, normal, format) in [(dir3.path(), &normal3, 3), (dir2.path(), &normal2, 2)]
+        {
+            let limit = ReadLimit {
+                options: &options,
+                memory: Some(1 << 20),
+                held: 0,
+            };
+            let mut budget = ColdBudget::new(limit).unwrap();
+            let loaded =
+                PermIndex::open_controlled(directory, Perm::Spo, format, &mut budget).unwrap();
+            assert_eq!(loaded.value.rows, normal.rows);
+            assert_eq!(loaded.value.blocks.len(), normal.blocks.len());
+            assert_eq!(loaded.value.segmented(), normal.segmented());
+            assert_eq!(budget.used(), loaded.charge);
+            let cache = BlockCache::new(1 << 20);
+            assert!(loaded.value.contains(&cache, &keys[12_345]).unwrap());
+            drop(loaded.value);
+            budget.release(loaded.charge);
+            assert_eq!(budget.used(), 0);
+            let mut low = ColdBudget::new(ReadLimit {
+                memory: Some(16),
+                ..limit
+            })
+            .unwrap();
+            assert!(matches!(
+                PermIndex::open_controlled(directory, Perm::Spo, format, &mut low),
+                Err(Error::BudgetExceeded(_))
+            ));
         }
     }
 
