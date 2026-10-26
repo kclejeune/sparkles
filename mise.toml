@@ -380,14 +380,32 @@ depends = ["ui:build"]
 # doctests, so `mbx test --doc` runs them afterwards.
 run = [
   "mbx test --workspace --no-run --bin sparkles",
-  "mbx nextest run --workspace --no-fail-fast",
-  "mbx test --workspace --doc",
+  '''
+set -e
+if [ "$(uname -s)" = Darwin ]; then
+  mbx test --locked -p sparkles-backup --features encryption --lib seal::memory::macos_tests::keys_require_explicit_process_preparation -- --exact
+  ulimit -c 0
+fi
+mbx nextest run --workspace --no-fail-fast
+''',
+  '''
+set -e
+if [ "$(uname -s)" = Darwin ]; then ulimit -c 0; fi
+mbx test --workspace --doc
+''',
 ]
 
 [tasks."test:cargo"]
 description = "All Rust tests with `mbx test`, one test binary after another"
 depends = ["ui:build"]
-run = "mbx test --workspace"
+run = '''
+set -e
+if [ "$(uname -s)" = Darwin ]; then
+  mbx test --locked -p sparkles-backup --features encryption --lib seal::memory::macos_tests::keys_require_explicit_process_preparation -- --exact
+  ulimit -c 0
+fi
+mbx test --workspace
+'''
 
 [tasks."test:w3c"]
 description = "W3C SPARQL 1.0/1.1/1.2 conformance with per-suite summaries"

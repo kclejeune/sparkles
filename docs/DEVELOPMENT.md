@@ -216,6 +216,20 @@ files. Failures are never cached. `mise run ci --force`, `mise run --force <task
 `MISE_TASK_CACHE=off` runs the checks regardless, and
 `mise run --dry-run --task-cache-explain <task>` lists the inputs of a key.
 
+On macOS, `mise run test` and `mise run test:cargo` run the native key-policy test
+before preparing their test shells with zero soft and hard core-dump limits. This
+preparation applies to those child shells, not the caller's shell. For standalone
+workspace tests, use the same explicit host preparation:
+
+```sh
+mbx test --locked -p sparkles-backup --features encryption --lib seal::memory::macos_tests::keys_require_explicit_process_preparation -- --exact
+(
+  ulimit -c 0
+  mbx nextest run --workspace --no-fail-fast
+  mbx test --workspace --doc
+)
+```
+
 The Rust tests run under cargo-nextest, which runs test binaries in parallel and lists
 every failure at the end. A test that runs past ten minutes is stopped and counted as a
 failure. `.config/nextest.toml` holds these settings. Debug builds keep line tables only,
@@ -634,7 +648,8 @@ checks, while binding release tags remain protected from cancellation. A manual 
 with **all-platforms** checked also runs Clippy and the tests on Linux arm64
 and macOS. The macOS nextest and doctest shells lower both core-dump limits to zero
 before running encrypted library tests. This preparation applies only to those test
-processes. The engine's shared state goes through snapshot swaps, locks and channels, and
+processes. The native key-policy test runs before that preparation to exercise the
+unprepared host policy. The engine's shared state goes through snapshot swaps, locks and channels, and
 its relaxed atomics are counters and flags, so the risk of a fault that only arm64's
 weaker memory ordering or macOS would show is low, and pushes test Linux x86_64 only.
 

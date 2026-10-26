@@ -115,7 +115,9 @@ class ManualPlatformShells(unittest.TestCase):
                 with self.subTest(platform=platform, command=command):
                     prefix = (
                         'before_soft=$(ulimit -S -c); before_hard=$(ulimit -H -c)\n'
-                        'mbx() { if [ "$RUNNER_OS" = macOS ]; then '
+                        'mbx() { if [[ "$*" == *keys_require_explicit_process_preparation* ]]; then '
+                        '[ "$(ulimit -S -c)" = "$before_soft" ] && [ "$(ulimit -H -c)" = "$before_hard" ]; '
+                        'elif [ "$RUNNER_OS" = macOS ]; then '
                         '[ "$(ulimit -S -c)" = 0 ] && [ "$(ulimit -H -c)" = 0 ]; '
                         'else [ "$(ulimit -S -c)" = "$before_soft" ] && '
                         '[ "$(ulimit -H -c)" = "$before_hard" ]; fi; }\n'
@@ -128,11 +130,84 @@ class ManualPlatformShells(unittest.TestCase):
     def test_failed_macos_preparation_never_starts_tests(self):
         for command in self.commands():
             result = subprocess.run(
-                ["bash", "-e", "-c", 'ulimit() { return 17; }; mbx() { echo unexpected-test; };\n' + command],
+                ["bash", "-e", "-c", 'ulimit() { return 17; }; mbx() { '
+                 'if [[ "$*" == *keys_require_explicit_process_preparation* ]]; then return 0; fi; '
+                 'echo unexpected-test; };\n' + command],
                 env=dict(os.environ, RUNNER_OS="macOS"), capture_output=True, text=True, timeout=10,
             )
             self.assertEqual(result.returncode, 17, result.stderr)
             self.assertNotIn("unexpected-test", result.stdout)
+
+    def test_manual_policy_probe_runs_before_preparation_and_suite(self):
+        command = next(command for command in self.commands() if "mbx nextest" in command)
+        prefix = (
+            'ulimit() { echo preparation; builtin ulimit "$@"; }; '
+            'mbx() { if [[ "$*" == *keys_require_explicit_process_preparation* ]]; then '
+            'echo policy; else echo suite; fi; };\n'
+        )
+        result = subprocess.run(["bash", "-e", "-c", prefix + command],
+                                env=dict(os.environ, RUNNER_OS="macOS"),
+                                capture_output=True, text=True, timeout=10)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(result.stdout.splitlines(), ["policy", "preparation", "suite"])
+
+    def test_failed_manual_policy_probe_blocks_suite(self):
+        command = next(command for command in self.commands() if "mbx nextest" in command)
+        prefix = (
+            'mbx() { if [[ "$*" == *keys_require_explicit_process_preparation* ]]; then '
+            'return 19; fi; echo unexpected-suite; };\n'
+        )
+        result = subprocess.run(["bash", "-e", "-c", prefix + command],
+                                env=dict(os.environ, RUNNER_OS="macOS"),
+                                capture_output=True, text=True, timeout=10)
+        self.assertEqual(result.returncode, 19, result.stderr)
+        self.assertNotIn("unexpected-suite", result.stdout)
+
+
+class LocalMacTestShells(unittest.TestCase):
+    def commands(self):
+        tasks = tomllib.loads((ROOT / "mise.toml").read_text())["tasks"]
+        return tasks["test"]["run"][1:] + [tasks["test:cargo"]["run"]]
+
+    def test_test_hosts_prepare_only_darwin_and_policy_runs_before_preparation(self):
+        for platform in ("Linux", "Darwin"):
+            for command in self.commands():
+                with self.subTest(platform=platform, command=command):
+                    prefix = (
+                        'before_soft=$(ulimit -S -c); before_hard=$(ulimit -H -c)\n'
+                        'uname() { printf "%s\\n" "$CI_TEST_PLATFORM"; }\n'
+                        'mbx() { if [[ "$*" == *keys_require_explicit_process_preparation* ]]; then '
+                        'echo policy; [ "$(ulimit -S -c)" = "$before_soft" ] && '
+                        '[ "$(ulimit -H -c)" = "$before_hard" ]; '
+                        'elif [ "$CI_TEST_PLATFORM" = Darwin ]; then '
+                        '[ "$(ulimit -S -c)" = 0 ] && [ "$(ulimit -H -c)" = 0 ]; '
+                        'else [ "$(ulimit -S -c)" = "$before_soft" ] && '
+                        '[ "$(ulimit -H -c)" = "$before_hard" ]; fi; }\n'
+                    )
+                    result = subprocess.run(["bash", "-c", prefix + command],
+                                            env=dict(os.environ, CI_TEST_PLATFORM=platform),
+                                            capture_output=True, text=True, timeout=10)
+                    self.assertEqual(result.returncode, 0, result.stderr)
+                    self.assertEqual("policy" in result.stdout,
+                                     platform == "Darwin" and "--doc" not in command)
+
+    def test_failed_preparation_or_policy_blocks_local_workspace_tests(self):
+        for command in self.commands():
+            for fail_policy in (False, True):
+                if fail_policy and "--doc" in command:
+                    continue
+                with self.subTest(command=command, fail_policy=fail_policy):
+                    prefix = (
+                        'uname() { echo Darwin; }; '
+                        'ulimit() { return 17; }; '
+                        'mbx() { if [[ "$*" == *keys_require_explicit_process_preparation* ]]; then '
+                        f'return {19 if fail_policy else 0}; fi; '
+                        'echo unexpected-workspace-tests; };\n'
+                    )
+                    result = subprocess.run(["bash", "-c", prefix + command],
+                                            capture_output=True, text=True, timeout=10)
+                    self.assertEqual(result.returncode, 19 if fail_policy else 17, result.stderr)
+                    self.assertNotIn("unexpected-workspace-tests", result.stdout)
 
 
 if __name__ == "__main__":
