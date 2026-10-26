@@ -311,6 +311,172 @@ fn compatibility_views_preserve_ids_and_legacy_asserting_semantics_without_write
     assert!(ds.write_guard().is_none());
 }
 
+fn compatibility_query(name: &str) -> &'static str {
+    profile()
+        .compatibility_queries
+        .iter()
+        .find(|q| q.name == name)
+        .unwrap()
+        .query
+}
+
+fn mapped_compatibility(ds: &Dataset, name: &str, visible: Option<&[&str]>) -> Dataset {
+    use sparkles::access::{GraphAccess, GraphRule, Graphs};
+    let opts = sparkles::sparql::QueryOptions {
+        graphs: visible.map(|names| {
+            std::sync::Arc::new(GraphAccess::graphs(
+                Graphs::Only(GraphRule::new(names.iter().copied(), &[])),
+                Graphs::none(),
+            ))
+        }),
+        ..Default::default()
+    };
+    let result = ds.query_with(compatibility_query(name), &opts).unwrap();
+    let mapped = Dataset::memory();
+    let text: String = result.triples.iter().map(|t| format!("{t} .\n")).collect();
+    mapped.load_str(&text, RdfFormat::NTriples).unwrap();
+    mapped
+}
+
+fn instances(ds: &Dataset, class: &str) -> BTreeSet<String> {
+    let rows = ds
+        .select(&format!("SELECT ?record WHERE {{ ?record a <{class}> }}"))
+        .unwrap();
+    rows.iter().map(|r| value(r, "record").to_owned()).collect()
+}
+
+#[test]
+fn reassertion_does_not_revive_invalidated_legacy_occurrences() {
+    let ds = Dataset::memory();
+    ds.load_str(
+        include_str!("../../../testsuite/evidence/v1/regressions/reasserted.trig"),
+        RdfFormat::TriG,
+    )
+    .unwrap();
+    let mapped = mapped_compatibility(&ds, "legacy-assertions.rq", None);
+    assert_eq!(
+        instances(&mapped, &format!("{EV}LegacyAssertion")),
+        [format!("{EX}newDefault"), format!("{EX}newNamed")]
+            .into_iter()
+            .collect()
+    );
+    assert!(ds.ask("PREFIX ex: <https://example.org/> PREFIX prov: <http://www.w3.org/ns/prov#> ASK { ex:oldDefault prov:wasInvalidatedBy ex:retraction . GRAPH ex:g { ex:oldNamed prov:wasInvalidatedBy ex:retraction } }").unwrap());
+}
+
+#[test]
+fn span_compatibility_joins_independently_visible_renditions_and_citations() {
+    let ds = Dataset::memory();
+    ds.load_str(
+        include_str!("../../../testsuite/evidence/v1/regressions/split-citations.trig"),
+        RdfFormat::TriG,
+    )
+    .unwrap();
+    struct VisibilityCase {
+        visible: Option<&'static [&'static str]>,
+        spans: &'static [&'static str],
+        renditions: &'static [&'static str],
+    }
+    let cases = [
+        VisibilityCase {
+            visible: None,
+            spans: &[
+                "defaultRendition#char=2,5",
+                "namedRendition#char=1,4",
+                "crossNamed#char=3,6",
+            ],
+            renditions: &[
+                "defaultRendition",
+                "namedRendition",
+                "crossNamed",
+                "uncited",
+            ],
+        },
+        VisibilityCase {
+            visible: Some(&["https://example.org/a"]),
+            spans: &[],
+            renditions: &["namedRendition", "crossNamed", "uncited"],
+        },
+        VisibilityCase {
+            visible: Some(&["https://example.org/a", "https://example.org/b"]),
+            spans: &["crossNamed#char=3,6"],
+            renditions: &["namedRendition", "crossNamed", "uncited"],
+        },
+        VisibilityCase {
+            visible: Some(&["default", "https://example.org/a"]),
+            spans: &["namedRendition#char=1,4"],
+            renditions: &[
+                "defaultRendition",
+                "namedRendition",
+                "crossNamed",
+                "uncited",
+            ],
+        },
+        VisibilityCase {
+            visible: Some(&["default", "https://example.org/b"]),
+            spans: &["defaultRendition#char=2,5"],
+            renditions: &["defaultRendition"],
+        },
+        VisibilityCase {
+            visible: Some(&["https://example.org/b"]),
+            spans: &[],
+            renditions: &[],
+        },
+    ];
+    for case in cases {
+        let mapped = mapped_compatibility(&ds, "legacy-source-spans.rq", case.visible);
+        assert_eq!(
+            instances(&mapped, "http://www.w3.org/ns/oa#SpecificResource"),
+            case.spans.iter().map(|s| format!("{EX}{s}")).collect(),
+            "visible={:?}",
+            case.visible
+        );
+        assert_eq!(
+            instances(&mapped, &format!("{EV}LegacyRendition")),
+            case.renditions.iter().map(|s| format!("{EX}{s}")).collect(),
+            "visible={:?}",
+            case.visible
+        );
+    }
+}
+
+#[test]
+fn evidence_query_retains_distinct_judgment_and_activity_identities() {
+    let ds = data();
+    ds.load_str(
+        include_str!("../../../testsuite/evidence/v1/regressions/duplicate-judgments.ttl"),
+        RdfFormat::Turtle,
+    )
+    .unwrap();
+    let rows = ds.select(query("evidence-relations.rq")).unwrap();
+    let supports: Vec<_> = rows
+        .iter()
+        .filter(|row| value(row, "relation") == format!("{EV}Supports"))
+        .collect();
+    let identities: BTreeSet<_> = supports
+        .iter()
+        .map(|row| (value(row, "link"), value(row, "activity")))
+        .collect();
+    assert_eq!(
+        identities,
+        [
+            ("https://example.org/link1", "https://example.org/import"),
+            (
+                "https://example.org/linkAgain",
+                "https://example.org/secondImport"
+            )
+        ]
+        .into_iter()
+        .collect()
+    );
+    assert!(
+        supports
+            .iter()
+            .all(|row| value(row, "target") == format!("{EX}claim1")
+                && value(row, "reference") == format!("{EX}fieldRef")
+                && value(row, "author") == format!("{EX}importer"))
+    );
+}
+
 #[cfg(feature = "shacl")]
 #[test]
 fn valid_profile_and_invalid_structural_overlays_have_independent_expected_results() {
@@ -321,76 +487,161 @@ fn valid_profile_and_invalid_structural_overlays_have_independent_expected_resul
         (
             "two propositions",
             include_str!("../../../testsuite/evidence/v1/invalid/duplicate-proposition.ttl"),
+            "MaxCountConstraintComponent",
+            Some("claim1"),
         ),
         (
             "not a triple",
             include_str!(
                 "../../../testsuite/evidence/v1/invalid/asserted-term-instead-of-triple.ttl"
             ),
+            "SPARQLConstraintComponent",
+            Some("bad"),
         ),
         (
             "unknown kind",
             include_str!("../../../testsuite/evidence/v1/invalid/unknown-kind.ttl"),
+            "InConstraintComponent",
+            Some("badKind"),
         ),
         (
             "short digest",
             include_str!("../../../testsuite/evidence/v1/invalid/short-digest.ttl"),
+            "PatternConstraintComponent",
+            Some("badDigest"),
         ),
         (
             "missing timezone",
             include_str!("../../../testsuite/evidence/v1/invalid/missing-timezone.ttl"),
+            "PatternConstraintComponent",
+            Some("revision2"),
         ),
         (
             "empty span",
             include_str!("../../../testsuite/evidence/v1/invalid/empty-span.ttl"),
+            "SPARQLConstraintComponent",
+            Some("empty"),
         ),
         (
             "unknown relation",
             include_str!("../../../testsuite/evidence/v1/invalid/unknown-relation.ttl"),
+            "InConstraintComponent",
+            Some("badRelation"),
         ),
         (
             "confidence",
             include_str!("../../../testsuite/evidence/v1/invalid/confidence-out-of-range.ttl"),
+            "OrConstraintComponent",
+            Some("badConfidence"),
         ),
         (
             "default graph",
             include_str!("../../../testsuite/evidence/v1/invalid/default-graph-with-name.ttl"),
+            "XoneConstraintComponent",
+            Some("factRef"),
         ),
         (
             "JSON pointer",
             include_str!("../../../testsuite/evidence/v1/invalid/invalid-json-pointer.ttl"),
+            "XoneConstraintComponent",
+            Some("badRef"),
         ),
         (
             "blank identity",
             include_str!("../../../testsuite/evidence/v1/invalid/blank-record-identity.ttl"),
+            "NodeKindConstraintComponent",
+            None,
         ),
         (
             "incomplete reference",
             include_str!("../../../testsuite/evidence/v1/invalid/incomplete-stored-reference.ttl"),
+            "XoneConstraintComponent",
+            Some("badFact"),
         ),
         (
             "missing extraction method",
             include_str!("../../../testsuite/evidence/v1/invalid/missing-extraction-method.ttl"),
+            "MinCountConstraintComponent",
+            Some("missingMethod"),
         ),
         (
             "missing source key",
             include_str!("../../../testsuite/evidence/v1/invalid/missing-source-key.ttl"),
+            "MinCountConstraintComponent",
+            Some("unkeyed"),
         ),
         (
             "mismatched passage revision",
             include_str!("../../../testsuite/evidence/v1/invalid/mismatched-passage-revision.ttl"),
+            "SPARQLConstraintComponent",
+            Some("wrongPassage"),
         ),
         (
             "mismatched passage reference",
             include_str!("../../../testsuite/evidence/v1/invalid/mismatched-passage-reference.ttl"),
+            "XoneConstraintComponent",
+            Some("wrongReference"),
         ),
     ];
-    for (name, overlay) in invalid {
+    for (name, overlay, component, focus) in invalid {
         let ds = data();
         ds.load_str(overlay, RdfFormat::Turtle).unwrap();
         let report = validate(&ds);
         assert!(!report.conforms, "{name} unexpectedly conforms");
-        assert!(report.violations() > 0, "{name}: {report:?}");
+        assert_eq!(
+            report.results.len(),
+            1,
+            "{name} has incidental failures: {report:?}"
+        );
+        let result = &report.results[0];
+        assert_eq!(
+            result.source_constraint_component.as_str(),
+            format!("http://www.w3.org/ns/shacl#{component}"),
+            "{name}: {report:?}"
+        );
+        match focus {
+            Some(local) => {
+                let expected =
+                    Term::NamedNode(oxrdf::NamedNode::new(format!("{EX}{local}")).unwrap());
+                assert_eq!(result.focus_node, expected, "{name}: {report:?}");
+            }
+            None => assert!(
+                matches!(result.focus_node, Term::BlankNode(_)),
+                "{name}: {report:?}"
+            ),
+        }
+        assert_eq!(report.violations(), 1, "{name}: {report:?}");
+    }
+}
+
+#[cfg(feature = "shacl")]
+#[test]
+fn isolated_invalid_values_conform_when_only_their_constraint_is_removed() {
+    let cases = [
+        (
+            r#"sh:pattern "^sha256:[0-9a-f]{64}$" ; "#,
+            include_str!("../../../testsuite/evidence/v1/invalid/short-digest.ttl"),
+        ),
+        (
+            "sh:in (ev:Reported ev:Observation ev:Hypothesis ev:Preference) ; ",
+            include_str!("../../../testsuite/evidence/v1/invalid/unknown-kind.ttl"),
+        ),
+        (
+            "sh:in (ev:Supports ev:Contradicts ev:Mentions) ; ",
+            include_str!("../../../testsuite/evidence/v1/invalid/unknown-relation.ttl"),
+        ),
+    ];
+    for (constraint, overlay) in cases {
+        assert!(profile().shapes.contains(constraint));
+        let mutant = profile().shapes.replacen(constraint, "", 1);
+        let shapes = sparkles_shacl::Shapes::parse(&mutant, RdfFormat::Turtle, None).unwrap();
+        let ds = data();
+        ds.load_str(overlay, RdfFormat::Turtle).unwrap();
+        let report = ds.validation().shacl(&shapes, &Default::default()).unwrap();
+        assert!(
+            report.conforms,
+            "fixture has a second unintended failure after removing {constraint:?}: {report:?}"
+        );
     }
 }
 

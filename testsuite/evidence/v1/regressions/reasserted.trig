@@ -1,0 +1,12 @@
+PREFIX ex: <https://example.org/>
+PREFIX prov: <http://www.w3.org/ns/prov#>
+PREFIX rdf: <http://www.w3.org/1999/02/22-rdf-syntax-ns#>
+PREFIX spk: <urn:x-sparkles:>
+ex:s ex:p ex:o .
+ex:oldDefault rdf:reifies <<(ex:s ex:p ex:o)>> ; prov:wasGeneratedBy ex:a ; prov:wasInvalidatedBy ex:retraction .
+ex:newDefault rdf:reifies <<(ex:s ex:p ex:o)>> ; prov:wasGeneratedBy ex:b .
+ex:a prov:wasAssociatedWith ex:person . ex:b prov:wasAssociatedWith ex:person .
+ex:g { ex:s ex:p ex:o .
+ex:oldNamed rdf:reifies <<(ex:s ex:p ex:o)>> ; prov:wasGeneratedBy ex:a ; prov:wasInvalidatedBy ex:retraction .
+ex:newNamed rdf:reifies <<(ex:s ex:p ex:o)>> ; prov:wasGeneratedBy ex:b .
+ex:a prov:wasAssociatedWith ex:person . ex:b prov:wasAssociatedWith ex:person . }

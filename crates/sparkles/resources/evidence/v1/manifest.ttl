@@ -9,7 +9,7 @@ PREFIX ev: <urn:x-sparkles:evidence:>
 <urn:x-sparkles:evidence:query:1:claim-occurrences.rq> ev:profileVersion 1 ;
   ev:contentDigest "sha256:0502c1395f1428c966a14e05953d900b6a7482e6495b36b7958eb6667c0d608d" .
 <urn:x-sparkles:evidence:query:1:evidence-relations.rq> ev:profileVersion 1 ;
-  ev:contentDigest "sha256:e015fc5934f5c000251e0361d4ff454767e827a2b3eab36da48d6dc2f4fee083" .
+  ev:contentDigest "sha256:903309ddfcea7c4cba6e43d2413fb6348dce3072b7299ffe1e162bd74cb563be" .
 <urn:x-sparkles:evidence:query:1:opposite-polarities.rq> ev:profileVersion 1 ;
   ev:contentDigest "sha256:976fd7252acf8bd5fb3a04eb1a9d13223f577afdc91eb7d4147b1651f4ea702e" .
 <urn:x-sparkles:evidence:query:1:passage-selectors.rq> ev:profileVersion 1 ;
@@ -21,6 +21,6 @@ PREFIX ev: <urn:x-sparkles:evidence:>
 <urn:x-sparkles:evidence:query:1:unsupported-claims.rq> ev:profileVersion 1 ;
   ev:contentDigest "sha256:3bbb18c56943b0b59cb0fe17710872fe118b00510564444681cd46867838831a" .
 <urn:x-sparkles:evidence:compatibility:1:legacy-assertions.rq> ev:profileVersion 1 ;
-  ev:contentDigest "sha256:7983ab60effa4d04f8b50f168357f480627f19f89b18d19a15680c5700917b76" .
+  ev:contentDigest "sha256:2791d6c2cd1e540d9c20513c0816bbe9140d71410ab492e52ce30d5b69c1cd45" .
 <urn:x-sparkles:evidence:compatibility:1:legacy-source-spans.rq> ev:profileVersion 1 ;
-  ev:contentDigest "sha256:f4bafe0eaa09d52d0f4555d4178ecdd6f578bda338376bc4911ae30d47dd933f" .
+  ev:contentDigest "sha256:ec04a89ff888d74b4ce8b9b7ddcfbc16330eabe34ba9bee271bf98fef6ea30c1" .

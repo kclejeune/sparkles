@@ -459,7 +459,12 @@ Independent expected query results distinguish occurrence identities, assertion 
 opposite-polarity candidates, mentions, missing visible support and unknown lineage.
 Invalid overlays exercise structural refusals and inconsistent passage identities.
 Compatibility views retain C17 and C18 identifiers and their original assertion
-semantics without inventing authenticated revisions or availability.
+semantics without inventing authenticated revisions or availability. Invalidated reifiers
+stay historical even after a new occurrence reasserts the same business triple. Rendition
+metadata and citations join across independently authorized graphs. Evidence query results
+retain each qualified link and creation activity. Invalid fixtures assert their intended
+constraint component, with mutation controls separating enum and digest failures from
+incidental cardinality failures.
 
 These resources are ordinary RDF under the caller's access policy. A conforming shape
 report does not authenticate a source, author, receipt or timestamp, resolve a retained

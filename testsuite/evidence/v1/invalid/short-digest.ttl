@@ -7,4 +7,4 @@ PREFIX prov: <http://www.w3.org/ns/prov#>
 PREFIX oa: <http://www.w3.org/ns/oa#>
 PREFIX ex: <https://example.org/>
 
-ex:revision2 ev:contentDigest "sha256:abc" .
+ex:badDigest a ev:SourceRevision ; prov:specializationOf ex:other ; ev:sourceKey "bad-digest/1" ; ev:contentDigest "sha256:abc" .

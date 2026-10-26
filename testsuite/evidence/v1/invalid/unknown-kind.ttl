@@ -7,4 +7,4 @@ PREFIX prov: <http://www.w3.org/ns/prov#>
 PREFIX oa: <http://www.w3.org/ns/oa#>
 PREFIX ex: <https://example.org/>
 
-ex:claim1 ev:claimKind ev:UnsupportedKind .
+ex:badKind a ev:Claim ; rdf:reifies <<( ex:release ex:affectedBy ex:vulnerability )>> ; ev:claimKind ev:UnsupportedKind ; ev:polarity ev:Positive ; prov:wasDerivedFrom ex:revision1 ; prov:wasGeneratedBy ex:import ; prov:wasAttributedTo ex:publisher .

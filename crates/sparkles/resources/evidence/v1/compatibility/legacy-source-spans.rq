@@ -15,13 +15,18 @@ CONSTRUCT {
 } WHERE {
   { ?rendition a spk:TextRendition ; prov:wasDerivedFrom ?source .
     OPTIONAL { ?rendition spk:length ?length }
-    OPTIONAL { ?reifier prov:wasDerivedFrom ?span . FILTER(REGEX(STR(?span), "#char=[0-9]+,[0-9]+$") && STR(?rendition) = REPLACE(STR(?span), "#char=[0-9]+,[0-9]+$", "")) } }
-  UNION { GRAPH ?graph {
+  }
+  UNION { GRAPH ?renditionGraph {
     ?rendition a spk:TextRendition ; prov:wasDerivedFrom ?source .
     OPTIONAL { ?rendition spk:length ?length }
-    OPTIONAL { ?reifier prov:wasDerivedFrom ?span . FILTER(REGEX(STR(?span), "#char=[0-9]+,[0-9]+$") && STR(?rendition) = REPLACE(STR(?span), "#char=[0-9]+,[0-9]+$", "")) }
   } }
-  BIND(IRI(CONCAT(STR(?span), ":selector")) AS ?selector)
-  BIND(xsd:integer(REPLACE(STR(?span), "^.*#char=([0-9]+),[0-9]+$", "$1")) AS ?start)
-  BIND(xsd:integer(REPLACE(STR(?span), "^.*#char=[0-9]+,([0-9]+)$", "$1")) AS ?end)
+  OPTIONAL {
+    { ?reifier prov:wasDerivedFrom ?span }
+    UNION { GRAPH ?citationGraph { ?reifier prov:wasDerivedFrom ?span } }
+    FILTER(isIRI(?span) && REGEX(STR(?span), "#char=[0-9]+,[0-9]+$"))
+    FILTER(STR(?rendition) = REPLACE(STR(?span), "#char=[0-9]+,[0-9]+$", ""))
+    BIND(IRI(CONCAT(STR(?span), ":selector")) AS ?selector)
+    BIND(xsd:integer(REPLACE(STR(?span), "^.*#char=([0-9]+),[0-9]+$", "$1")) AS ?start)
+    BIND(xsd:integer(REPLACE(STR(?span), "^.*#char=[0-9]+,([0-9]+)$", "$1")) AS ?end)
+  }
 }

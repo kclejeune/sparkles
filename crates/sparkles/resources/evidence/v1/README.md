@@ -102,7 +102,7 @@ visible RDF and do not grant trust or access.
 |---|---|
 | `claim-occurrences.rq` | Lists occurrence IDs, propositions, polarity, kind, authors and revisions without grouping equal propositions. |
 | `assertion-status.rq` | Reports whether each proposition also appears as an ordinary triple in the selected default graph. It does not admit the proposition. |
-| `evidence-relations.rq` | Retains supports, contradictions and mentions as separate qualified links. |
+| `evidence-relations.rq` | Retains each link IRI and creation activity alongside supports, contradictions and mentions. |
 | `source-lineage.rq` | Lists declared families and upstream sources. Missing lineage is reported as unknown. |
 | `passage-selectors.rq` | Lists exact revision, rendition, selector, digest and optional quote. |
 | `stored-fact-references.rq` | Lists the recorded view and expected triple, preserving default and named graphs. It does not resolve that view. |
@@ -115,13 +115,16 @@ visible RDF and do not grant trust or access.
 currently asserted C17 records while retaining their reifier IDs, source, activity,
 legacy confidence and quote where present. It keeps activity associations distinct
 from author attribution. It does not emit a new `ev:Claim` or copy the business triple
-into its output. The original C17 dataset still contains that assertion. A retracted
+into its output. The original C17 dataset still contains that assertion. An invalidated reifier stays
+absent even when a later occurrence reasserts the same business triple. A retracted
 record is absent from this current-assertion view unless an appropriate historical
 snapshot is explicitly selected.
 
 `compatibility/legacy-source-spans.rq` constructs `ev:LegacyRendition` descriptions of
 C18 renditions and Web Annotation selectors from their `#char=start,end` spans. Source,
-rendition and span IDs remain unchanged, including renditions with no cited span. It
+rendition and span IDs remain unchanged, including renditions with no cited span.
+Rendition metadata and citations can occupy different authorized graphs. Each side
+respects the caller's visible graph view. It
 does not invent immutable revision identities, availability receipts or text digests
 that the old records did not retain.
 

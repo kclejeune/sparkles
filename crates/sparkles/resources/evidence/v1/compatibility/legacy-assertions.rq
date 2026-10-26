@@ -19,6 +19,7 @@ CONSTRUCT {
     BIND(PREDICATE(?triple) AS ?p)
     BIND(OBJECT(?triple) AS ?o)
     ?s ?p ?o .
+    FILTER NOT EXISTS { ?reifier prov:wasInvalidatedBy ?invalidation }
     OPTIONAL { ?reifier prov:wasDerivedFrom ?source }
     OPTIONAL { ?reifier spk:confidence ?confidence }
     OPTIONAL { ?reifier spk:quote ?quote }
@@ -29,6 +30,7 @@ CONSTRUCT {
     BIND(PREDICATE(?triple) AS ?p)
     BIND(OBJECT(?triple) AS ?o)
     ?s ?p ?o .
+    FILTER NOT EXISTS { ?reifier prov:wasInvalidatedBy ?invalidation }
     OPTIONAL { ?reifier prov:wasDerivedFrom ?source }
     OPTIONAL { ?reifier spk:confidence ?confidence }
     OPTIONAL { ?reifier spk:quote ?quote }

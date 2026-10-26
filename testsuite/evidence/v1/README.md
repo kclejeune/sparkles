@@ -20,7 +20,10 @@ The stored-fact examples distinguish the default graph from a named graph whose 
 is `ev:DefaultGraph`. They do not claim that commit 7 exists.
 
 Every file under `invalid/` is an additive overlay on `valid.ttl`. The expected result
-is a non-conforming SHACL report with at least one violation. Cases cover duplicate or
+is a non-conforming SHACL report with its specific intended constraint component.
+The bad digest, claim kind and relation each use an otherwise valid fresh record, so
+a cardinality failure cannot substitute for the intended check. Mutation controls remove
+only those rules and require the isolated records to conform. Cases cover duplicate or
 non-triple propositions, invalid enums, malformed digests, a missing source key, a
 timestamp without timezone, empty selectors, inconsistent passage revisions and
 references, malformed JSON Pointers, incomplete stored references, forbidden graph
@@ -38,6 +41,14 @@ literal values without adopting this range.
 named graph. The compatibility queries preserve their identifiers without creating
 new claims or authenticated availability. An uncited rendition prevents an optional
 span match from accidentally dropping sources without spans.
+
+The `regressions/` fixtures preserve distinctions that compatibility and competency
+queries must retain. `reasserted.trig` keeps invalidated and current occurrences after
+reasserting a business triple in default and named graphs. `split-citations.trig` places
+renditions and citations independently across default and named graphs, with an uncited
+rendition as a control. Access-filtered tests check both sides of that join.
+`duplicate-judgments.ttl` adds a link with the same target, relation, reference and author
+as an existing link, but a different IRI and creation activity. Both identities survive.
 
 Run the resource integration tests with:
 
