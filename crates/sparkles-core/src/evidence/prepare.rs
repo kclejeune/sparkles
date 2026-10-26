@@ -520,6 +520,7 @@ impl Preparation<'_> {
     fn confidence(&mut self, value: Option<&Confidence>, extraction: bool) -> Result<()> {
         self.number(u64::from(value.is_some()))?;
         if let Some(value) = value {
+            self.frame.check_literal_capacity(&value.value)?;
             value.validate(extraction)?;
             self.node(&value.scale)?;
             self.frame.literal(&value.value)?;

@@ -80,7 +80,7 @@ impl<'a> FrameHash<'a> {
         Ok(frame)
     }
 
-    pub(super) fn charge_content(&mut self, len: usize) -> Result<()> {
+    fn content_total(&self, len: usize) -> Result<usize> {
         self.control.check()?;
         let requested = self.bytes.saturating_add(len);
         if requested > RecordKey::MAX_BYTES {
@@ -90,7 +90,11 @@ impl<'a> FrameHash<'a> {
                 requested: requested as u64,
             }));
         }
-        self.bytes = requested;
+        Ok(requested)
+    }
+
+    pub(super) fn charge_content(&mut self, len: usize) -> Result<()> {
+        self.bytes = self.content_total(len)?;
         Ok(())
     }
 
@@ -132,18 +136,33 @@ impl<'a> FrameHash<'a> {
         }
     }
 
+    fn literal_bytes(value: &oxrdf::Literal) -> usize {
+        value
+            .value()
+            .len()
+            .saturating_add(value.datatype().as_str().len())
+            .saturating_add(value.language().map_or(0, str::len))
+            .saturating_add(4 * 9 + 1)
+    }
+
+    pub(super) fn check_literal_capacity(&self, value: &oxrdf::Literal) -> Result<()> {
+        self.content_total(Self::literal_bytes(value)).map(|_| ())
+    }
+
     pub(super) fn literal(&mut self, value: &oxrdf::Literal) -> Result<()> {
-        self.control.check()?;
+        // Check every component before any validation can own a copy. The same
+        // arithmetic serves early confidence checks without changing the frame.
+        self.charge_content(Self::literal_bytes(value))?;
         oxiri::Iri::parse(value.datatype().as_str())
             .map_err(|_| Error::invalid("invalid literal datatype IRI"))?;
         if let Some(language) = value.language() {
             oxrdf::Literal::new_language_tagged_literal("", language)
                 .map_err(|_| Error::invalid("invalid literal language"))?;
         }
-        self.field(3, value.value().as_bytes())?;
-        self.field(4, value.datatype().as_str().as_bytes())?;
-        self.field(5, value.language().unwrap_or("").as_bytes())?;
-        self.field(
+        self.precharged_field(3, value.value().as_bytes())?;
+        self.precharged_field(4, value.datatype().as_str().as_bytes())?;
+        self.precharged_field(5, value.language().unwrap_or("").as_bytes())?;
+        self.precharged_field(
             6,
             &[match value.direction() {
                 None => 0,
@@ -338,6 +357,25 @@ mod tests {
                 canonical_term_digest(&literal.into(), &control).unwrap()
             );
         }
+    }
+
+    #[test]
+    fn literal_capacity_check_is_nonmutating_and_uses_all_frame_components() {
+        let control = Control::none();
+        let mut frame = FrameHash::new(b"sparkles-evidence-term-v1", &control).unwrap();
+        let literal = Literal::new_language_tagged_literal("café", "fr").unwrap();
+        let before = frame.bytes;
+        frame.check_literal_capacity(&literal).unwrap();
+        assert_eq!(frame.bytes, before);
+        frame.literal(&literal).unwrap();
+        assert_eq!(
+            frame.bytes - before,
+            literal.value().len() + literal.datatype().as_str().len() + 2 + 4 * 9 + 1
+        );
+        assert_eq!(
+            frame.finish().unwrap().to_string(),
+            "sha256:d3c0430b8c6f4003ea975d30d586074b913ddb620c94f209941ad5ffe19a060f"
+        );
     }
 
     #[test]

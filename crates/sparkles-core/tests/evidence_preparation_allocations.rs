@@ -211,3 +211,59 @@ fn sparse_pointer_refuses_before_actual_working_memory_exceeds_64_mib() {
     assert!(memory_budget);
     assert!(peak.saturating_add(pointer.len() + 2) <= 64 * 1024 * 1024);
 }
+
+#[test]
+fn complete_literal_components_are_budgeted_before_owned_or_decimal_validation() {
+    let _measure = MEASURE_LOCK.lock().unwrap();
+    let mut observations = Vec::new();
+    for component in [
+        "value",
+        "datatype",
+        "language",
+        "combined",
+        "invalid-decimal",
+    ] {
+        let mut input = input("confidence");
+        let confidence = input.claims[0].confidence.source.as_mut().unwrap();
+        confidence.value = match component {
+            "value" => Literal::new_simple_literal("0".repeat(RecordKey::MAX_BYTES + 1)),
+            "datatype" => Literal::new_typed_literal(
+                "x",
+                NamedNode::new_unchecked(format!("urn:{}", "a".repeat(RecordKey::MAX_BYTES))),
+            ),
+            "language" => Literal::new_language_tagged_literal_unchecked(
+                "x",
+                "a".repeat(RecordKey::MAX_BYTES + 1),
+            ),
+            "combined" => Literal::new_language_tagged_literal_unchecked(
+                "0".repeat(RecordKey::MAX_BYTES / 2),
+                "a".repeat(RecordKey::MAX_BYTES / 2),
+            ),
+            "invalid-decimal" => {
+                confidence.scale = node("urn:x-sparkles:evidence:ZeroToOne");
+                Literal::new_typed_literal(
+                    "invalid".repeat(RecordKey::MAX_BYTES / 7 + 1),
+                    xsd::DECIMAL,
+                )
+            }
+            _ => unreachable!(),
+        };
+        let control = Control::none();
+        let (result, largest, _) = measure(|| prepare_input(&input, &control));
+        let budget = matches!(
+            result,
+            Err(Error::BudgetExceeded(Budget {
+                kind: BudgetKind::DecompressedBytes,
+                ..
+            }))
+        );
+        observations.push((component, largest, budget));
+    }
+    eprintln!("literal component allocations and budget precedence: {observations:?}");
+    assert!(observations.iter().all(|(_, _, budget)| *budget));
+    assert!(
+        observations
+            .iter()
+            .all(|(_, largest, _)| *largest < 1024 * 1024)
+    );
+}
