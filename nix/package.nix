@@ -52,8 +52,9 @@ let
       ../crates
       ../vendor
       ../THIRD_PARTY_LICENSES.md
-      # vendored test data the crates' tests read (Jena's TriX files)
+      # Vendored fixtures read by engine and facade tests.
       ../testsuite/trix
+      ../testsuite/evidence
     ];
   };
 
