@@ -12,7 +12,7 @@ use crate::index::Perm;
 use crate::preview::{DryRun, Preview};
 use crate::sparql::QueryOptions;
 use crate::store::{Chunk, Snapshot};
-use oxrdf::{GraphName, Literal, NamedNode, Quad, Term};
+use oxrdf::{GraphName, NamedNode, Quad, Term};
 use parking_lot::Mutex;
 use serde::Serialize;
 use serde_json::{Value as J, json};
@@ -38,6 +38,10 @@ pub const CHECK_TIMEOUT: Duration = Duration::from_secs(10);
 pub const SAVE_ROUNDS: usize = 3;
 /// The most additional distinct affected targets admitted beyond directly touched nodes.
 pub const MAX_DEPENDENTS: usize = 500;
+
+#[path = "nested.rs"]
+mod nested;
+pub use nested::{NestedAnchor, NestedFormModel, NestedNode};
 
 const RDF_TYPE: &str = "http://www.w3.org/1999/02/22-rdf-syntax-ns#type";
 const INFERRED: &str = "urn:x-sparkles:inferred";
@@ -310,6 +314,19 @@ impl Forms {
     /// The form model of a resource at `req.at` (the head when `None`), read under the
     /// view, deadline and cancellation of `opts`.
     pub fn model(&self, req: &FormRequest, opts: &QueryOptions) -> Result<FormModel> {
+        let built = self.prepare_model(req, opts, None)?;
+        built.model(
+            req.writable && req.at.is_none(),
+            &self.ds.store().branch_name(),
+        )
+    }
+
+    fn prepare_model(
+        &self,
+        req: &FormRequest,
+        opts: &QueryOptions,
+        preparation: Option<nested::Preparation>,
+    ) -> Result<Built> {
         let store = self.ds.store();
         let deadline = deadline(opts);
         let snap = match &req.at {
@@ -322,20 +339,25 @@ impl Forms {
                 store.snapshot_at(at, &o)?.0
             }
         };
-        let mut built = self.build(
+        let mut built = self.build_prepared(
             &snap,
             &req.focus,
             &req.settings,
             opts,
-            req.class.as_deref(),
-            match &req.write_graphs {
-                Some(w) => w.as_ref(),
-                None => opts.graphs.as_ref(),
-            },
+            (
+                req.class.as_deref(),
+                match &req.write_graphs {
+                    Some(w) => w.as_ref(),
+                    None => opts.graphs.as_ref(),
+                },
+            ),
+            preparation,
         )?;
+        if let Some(lang) = &req.lang {
+            built.limits.lexical(lang)?;
+        }
         built.lang = req.lang.clone();
-        let writable = req.writable && req.at.is_none();
-        built.model(writable, &store.branch_name())
+        Ok(built)
     }
 
     /// Preview a change as a dry run, and validate the nodes it touches at the state it
@@ -541,8 +563,26 @@ impl Forms {
         class: Option<&str>,
         write: Option<&Arc<GraphAccess>>,
     ) -> Result<Built> {
-        let limits = Limits::of(opts);
+        self.build_prepared(snap, focus, settings, opts, (class, write), None)
+    }
+
+    fn build_prepared(
+        &self,
+        snap: &Arc<Snapshot>,
+        focus: &str,
+        settings: &FormSettings,
+        opts: &QueryOptions,
+        scope: (Option<&str>, Option<&Arc<GraphAccess>>),
+        preparation: Option<nested::Preparation>,
+    ) -> Result<Built> {
+        let (class, write) = scope;
+        let mut limits = Limits::of(opts);
+        limits.preparation = preparation;
         limits.check()?;
+        limits.lexical(focus)?;
+        if let Some(class) = class {
+            limits.lexical(class)?;
+        }
         let focus = NamedNode::new(focus)
             .map_err(|e| Error::invalid(format!("focus: invalid IRI '{focus}': {e}")))?;
         let focus = Term::NamedNode(focus);
@@ -613,7 +653,14 @@ impl Forms {
             sparkles_shacl::shapes_for_node(read.snap(), &shapes, &focus, &vopts)
                 .map_err(crate::handles::from_anyhow)?
         };
-        let layout = form_layout(&shapes, &node_shapes);
+        let layout = if limits.preparation.is_some() {
+            sparkles_shacl::form::form_layout_with(&shapes, &node_shapes, &mut || {
+                limits.unit().map_err(anyhow::Error::new)
+            })
+            .map_err(crate::handles::from_anyhow)?
+        } else {
+            form_layout(&shapes, &node_shapes)
+        };
         let target = target_graph(&read, &focus, settings)?;
         let mut prefixes = crate::io::standard_prefixes();
         prefixes.extend(self.ds.store().prefixes());
@@ -849,17 +896,22 @@ impl Built {
         let mut fields = Vec::new();
         let mut covered: BTreeSet<String> = BTreeSet::new();
         let mut unknown: BTreeSet<String> = BTreeSet::new();
+        if let Some(target) = &self.target {
+            self.limits.lexical(target)?;
+        }
         let target_term = self
             .target
             .as_ref()
             .map(|g| Term::NamedNode(NamedNode::new_unchecked(g.as_str())));
         for f in &self.layout.fields {
             if let FieldPath::Predicate(p) = &f.path {
+                self.limits.lexical(p.as_str())?;
                 covered.insert(p.as_str().to_string());
             }
             if self.hidden(f, target_term.as_ref()) {
                 continue;
             }
+            self.admit_metadata(f)?;
             for h in [&f.editor, &f.viewer].into_iter().flatten() {
                 if !known_hint(h) {
                     unknown.insert(h.as_str().to_string());
@@ -876,6 +928,9 @@ impl Built {
                 }
                 iri
             });
+            if let Some(preparation) = &self.limits.preparation {
+                preparation.field()?;
+            }
             let mut values = read.values(&self.focus, &f.path)?;
             let truncated = values.len() > MAX_FIELD_VALUES;
             values.truncate(MAX_FIELD_VALUES);
@@ -967,6 +1022,18 @@ impl Built {
                 }
             })
             .collect();
+        for value in &self.types {
+            self.limits.lexical(value)?;
+        }
+        self.limits.retained_term(&self.focus, 0)?;
+        self.limits.lexical(branch)?;
+        if let Some(value) = &self.target {
+            self.limits.lexical(value)?;
+        }
+        for shape in &self.node_shapes {
+            self.limits
+                .retained_term(&self.shapes.shapes()[*shape].node, 0)?;
+        }
         Ok(FormModel {
             form_format: FORM_FORMAT,
             focus: match &self.focus {
@@ -1444,6 +1511,7 @@ struct Limits {
     cancel: Option<Arc<std::sync::atomic::AtomicBool>>,
     cancellation: Option<sparkles_core::task::Cancellation>,
     deadline: Option<Instant>,
+    preparation: Option<nested::Preparation>,
 }
 
 impl Limits {
@@ -1452,6 +1520,54 @@ impl Limits {
             cancel: opts.cancel.clone(),
             cancellation: opts.cancellation.clone(),
             deadline: deadline(opts),
+            preparation: None,
+        }
+    }
+
+    fn unit(&self) -> Result<()> {
+        self.check()?;
+        if let Some(preparation) = &self.preparation {
+            preparation.unit()?;
+        }
+        Ok(())
+    }
+
+    fn lexical(&self, value: &str) -> Result<()> {
+        if self.preparation.is_some() {
+            for _ in 0..value.len().div_ceil(128) {
+                self.unit()?;
+            }
+        }
+        Ok(())
+    }
+
+    fn retained_term(&self, value: &Term, depth: usize) -> Result<()> {
+        if self.preparation.is_none() {
+            return Ok(());
+        }
+        self.unit()?;
+        if depth > 64 {
+            return Err(Error::invalid("form term preparation nesting exceeded"));
+        }
+        match value {
+            Term::NamedNode(n) => self.lexical(n.as_str()),
+            Term::BlankNode(n) => self.lexical(n.as_str()),
+            Term::Literal(l) => {
+                self.lexical(l.value())?;
+                self.lexical(l.datatype().as_str())?;
+                if let Some(language) = l.language() {
+                    self.lexical(language)?;
+                }
+                Ok(())
+            }
+            Term::Triple(triple) => {
+                match &triple.subject {
+                    oxrdf::NamedOrBlankNode::NamedNode(n) => self.lexical(n.as_str())?,
+                    oxrdf::NamedOrBlankNode::BlankNode(n) => self.lexical(n.as_str())?,
+                }
+                self.lexical(triple.predicate.as_str())?;
+                self.retained_term(&triple.object, depth + 1)
+            }
         }
     }
 
@@ -1604,24 +1720,33 @@ impl<'a> Reader<'a> {
         &self.snap
     }
 
-    fn graph(&self, g: Id) -> Option<Option<String>> {
+    fn graph(&self, g: Id) -> Result<Option<Option<String>>> {
         if g == Id::DEFAULT_GRAPH {
-            return self.readable(None).then_some(None);
+            return Ok(self.readable(None).then_some(None));
         }
-        let Some(Term::NamedNode(n)) = self.snap.term(g) else {
-            return None;
+        let n = match self.snap.term(g) {
+            Some(Term::NamedNode(n)) => n,
+            Some(term @ Term::BlankNode(_)) => {
+                if self.limits.preparation.is_some() && self.readable(Some(&term)) {
+                    return Err(Error::invalid(
+                        "blank-named graph context is not admitted by nested forms",
+                    ));
+                }
+                return Ok(None);
+            }
+            _ => return Ok(None),
         };
         if n.as_str() == INFERRED {
-            return None;
+            return Ok(None);
         }
         let t = Term::NamedNode(n);
         if !self.readable(Some(&t)) {
-            return None;
+            return Ok(None);
         }
         let Term::NamedNode(n) = t else {
             unreachable!()
         };
-        Some(Some(n.into_string()))
+        Ok(Some(Some(n.into_string())))
     }
 
     fn readable(&self, g: Option<&Term>) -> bool {
@@ -1637,10 +1762,14 @@ impl<'a> Reader<'a> {
             match c {
                 Chunk::Block(b, s, e) => {
                     for i in s..e {
+                        self.limits.unit()?;
                         out.push(perm.to_quad(&b.key(i)));
                     }
                 }
-                Chunk::Row(k) => out.push(perm.to_quad(&k)),
+                Chunk::Row(k) => {
+                    self.limits.unit()?;
+                    out.push(perm.to_quad(&k));
+                }
             }
             Ok(out.len() < limit)
         })?;
@@ -1664,7 +1793,7 @@ impl<'a> Reader<'a> {
         };
         let mut out = Vec::new();
         for q in quads {
-            let Some(graph) = self.graph(q[3]) else {
+            let Some(graph) = self.graph(q[3])? else {
                 continue;
             };
             let id = if matches!(path, FieldPath::Inverse(_)) {
@@ -1675,6 +1804,10 @@ impl<'a> Reader<'a> {
             let Some(term) = self.snap.term(id) else {
                 continue;
             };
+            self.limits.retained_term(&term, 0)?;
+            if let Some(graph) = &graph {
+                self.limits.lexical(graph)?;
+            }
             out.push(FormValue {
                 term,
                 graph,
@@ -1682,8 +1815,21 @@ impl<'a> Reader<'a> {
                 read_only: false,
             });
         }
-        out.sort_by(|a, b| (a.term.to_string(), &a.graph).cmp(&(b.term.to_string(), &b.graph)));
-        Ok(out)
+        if self.limits.preparation.is_none() {
+            out.sort_by(|a, b| (a.term.to_string(), &a.graph).cmp(&(b.term.to_string(), &b.graph)));
+            return Ok(out);
+        }
+        let mut keyed = Vec::new();
+        for value in out {
+            // Admit escaping/render scratch before generating the legacy sort key.
+            for _ in 0..6 {
+                self.limits.retained_term(&value.term, 0)?;
+            }
+            self.limits.unit()?;
+            keyed.push((value.term.to_string(), value));
+        }
+        keyed.sort_by(|a, b| (&a.0, &a.1.graph).cmp(&(&b.0, &b.1.graph)));
+        Ok(keyed.into_iter().map(|(_, value)| value).collect())
     }
 
     /// A label of an IRI in the readable graphs, in `lang` when it has one.
@@ -1695,16 +1841,19 @@ impl<'a> Reader<'a> {
             let Some(p) = self.snap.lookup_iri(lp) else {
                 continue;
             };
-            let lits: Vec<Literal> = self
-                .scan(Perm::Spo, &[s.0, p.0], 50)?
-                .into_iter()
-                .filter(|q| self.graph(q[3]).is_some())
-                .filter_map(|q| match self.snap.term(q[2]) {
-                    Some(Term::Literal(l)) => Some(l),
-                    _ => None,
-                })
-                .collect();
+            let mut lits = Vec::new();
+            for q in self.scan(Perm::Spo, &[s.0, p.0], 50)? {
+                if self.graph(q[3])?.is_none() {
+                    continue;
+                }
+                if let Some(Term::Literal(literal)) = self.snap.term(q[2]) {
+                    self.limits.lexical(literal.value())?;
+                    self.limits.unit()?;
+                    lits.push(literal);
+                }
+            }
             if let Some(l) = pick_lang(&lits, lang) {
+                self.limits.lexical(l.value())?;
                 return Ok(Some(l.value().to_string()));
             }
         }
@@ -1722,7 +1871,7 @@ impl<'a> Reader<'a> {
         };
         let mut by: BTreeMap<String, Vec<FormValue>> = BTreeMap::new();
         for q in self.scan(Perm::Spo, &[f.0], 100_000)? {
-            let Some(graph) = self.graph(q[3]) else {
+            let Some(graph) = self.graph(q[3])? else {
                 continue;
             };
             let Some(Term::NamedNode(p)) = self.snap.term(q[1]) else {
@@ -1734,6 +1883,7 @@ impl<'a> Reader<'a> {
             if !by.contains_key(p.as_str()) && by.len() >= MAX_OTHER {
                 continue;
             }
+            self.limits.lexical(p.as_str())?;
             let list = by.entry(p.into_string()).or_default();
             if list.len() >= MAX_OTHER {
                 continue;
@@ -1741,6 +1891,11 @@ impl<'a> Reader<'a> {
             let Some(term) = self.snap.term(q[2]) else {
                 continue;
             };
+            self.limits.retained_term(&term, 0)?;
+            if let Some(graph) = &graph {
+                self.limits.lexical(graph)?;
+            }
+            self.limits.unit()?;
             list.push(FormValue {
                 term,
                 graph,
@@ -1789,3 +1944,7 @@ mod tests {
         assert!(matches!(built.model(true, "main"), Err(Error::Cancelled)));
     }
 }
+
+#[cfg(test)]
+#[path = "model_allocations.rs"]
+mod model_allocations;

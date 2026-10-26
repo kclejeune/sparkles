@@ -127,6 +127,36 @@ DASH editors map to these widgets in Phase 2: `dash:TextFieldEditor`,
 `dash:LiteralViewer`, `dash:URIViewer` and `dash:DetailsViewer`. An editor or viewer the
 UI does not know falls back to the table above and is listed under **View shapes**.
 
+### 2.3.1 Nested read models in the Rust library
+
+`Forms::nested_model` returns the ordinary root model and a pool of declared blank-node
+children. Each child keeps its RDF identity, the visible parent field and graph anchors,
+and a layout built from every visible `sh:node` declaration that reaches it. Shared
+children use one identity. Cycles refer to an admitted child rather than expanding a
+second copy. Field values retain their graph provenance even when the same child and
+predicate occur in several graphs.
+
+The request admits at most 64 nested identities, 512 generated field views, 512 parent
+anchors and a first-discovery depth of 16. Every expansion shares up to 65,536
+preparation units. One unit admits a structural step or 128 lexical bytes, and a
+smaller `QueryOptions::max_memory_bytes` lowers that allowance by dividing its value by
+128. Field views generated again after another declaration joins a shared child use
+the same cumulative allowance. Cancellation or exhaustion refuses the whole model.
+Complex nested paths and matching composite range comparisons refuse before their
+uncontrolled producers run. Visible blank-named graph contexts also refuse until the
+form graph representation supports them. No truncated nested model is returned as complete.
+
+This admission covers layout preparation and adapter-owned traversal and retention.
+Raw scan work consumes units even when the caller's view filters out a row. Physical
+column and dictionary decoding and permission mask preparation need controlled-reader
+adoption through item 395. Source-shape parsing and prefix metadata admission also
+remain under item 21. The preparation allowance is not a total model heap bound.
+
+The nested model is a Rust library read primitive. The existing HTTP model, check/save
+bodies and browser editors retain their flat contract. Atomic nested changes, fresh
+child allocation, graph-specific conflict expectations and browser editing remain
+under item 21. A read model or a request-local child id grants no write authority.
+
 ### 2.4 Checks
 
 - **In the browser, on each change.** Lexical forms of XSD datatypes, `sh:pattern` with
@@ -415,8 +445,10 @@ hints, new instances and entity search. Checks use shape dependencies beyond a f
 graph radius and refuse incomplete discovery. The [delivery record](OUTCOME.md)
 describes the affected-target contract and the initial implementation history.
 
-The feature remains partially complete. Nested blank-node forms, list and alternative
-editors, and early admission for the remaining target-node expression producers remain
+The feature remains partially complete. The Rust library also exposes pooled nested
+read models with visible graph anchors, shared identities, cyclic references and cumulative preparation admission. Atomic
+nested edits, HTTP and browser consumers, list and alternative editors, and early
+admission for the remaining target-node expression producers remain
 under [roadmap item 21](../../ROADMAP.md). Strict physical reader admission uses the
 bounded-read preparation work of item 395; the discovery allowance is not a total
 SHACL heap limit.
