@@ -69,15 +69,9 @@ fn measured<T>(run: impl FnOnce() -> T) -> (T, usize, usize) {
     )
 }
 
-#[test]
-fn one_large_layout_label_is_admitted_before_copy() {
+fn assert_copy_is_admitted(text: &str) {
     let bytes = 1024 * 1024;
-    let text = format!(
-        "@prefix sh: <http://www.w3.org/ns/shacl#> .\n\
-         <http://ex.org/S> sh:property [ sh:path <http://ex.org/p> ; sh:name \"{}\" ] .",
-        "x".repeat(bytes)
-    );
-    let shapes = Shapes::parse(&text, RdfFormat::Turtle, None).unwrap();
+    let shapes = Shapes::parse(text, RdfFormat::Turtle, None).unwrap();
     let root = shapes
         .shape_id(&NamedNode::new("http://ex.org/S").unwrap().into())
         .unwrap();
@@ -107,13 +101,33 @@ fn one_large_layout_label_is_admitted_before_copy() {
             Ok(())
         })
     });
-    let error = limited.unwrap_err();
-    assert_eq!(error.to_string(), "layout allowance exhausted");
     assert!(
         largest < 16 * 1024,
         "refused producer allocated {largest} bytes under a 20-unit allowance"
     );
+    let error = match limited {
+        Err(error) => error,
+        Ok(_) => panic!("an unadmitted producer returned a layout"),
+    };
+    assert_eq!(error.to_string(), "layout allowance exhausted");
     eprintln!(
         "layout allocation: ordinary_largest={old_largest}, refused_largest={largest}, ordinary_outside_thread_largest={old_outside}, refused_outside_thread_largest={outside}"
     );
+}
+
+#[test]
+fn large_labels_and_custom_components_are_admitted_before_copy() {
+    let large = "x".repeat(1024 * 1024);
+    assert_copy_is_admitted(&format!(
+        "@prefix sh: <http://www.w3.org/ns/shacl#> .\n\
+         <http://ex.org/S> sh:property [ sh:path <http://ex.org/p> ; sh:name \"{large}\" ] ."
+    ));
+    assert_copy_is_admitted(&format!(
+        "@prefix sh: <http://www.w3.org/ns/shacl#> .\n\
+         @prefix ex: <http://ex.org/> .\n\
+         <http://ex.org/{large}> a sh:ConstraintComponent ;\n\
+           sh:parameter [ sh:path ex:flag ] ;\n\
+           sh:validator [ a sh:SPARQLAskValidator ; sh:ask \"ASK {{ FILTER(true) }}\" ] .\n\
+         ex:S sh:property [ sh:path ex:p ; ex:flag true ] ."
+    ));
 }

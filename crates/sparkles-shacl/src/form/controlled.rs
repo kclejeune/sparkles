@@ -339,6 +339,24 @@ fn admit_property(
                 languages = Some(tags);
             }
             Constraint::Node(node) => term(&shapes.shapes()[*node].node, check, 0)?,
+            Constraint::Component(component) => {
+                let iri = component.component.iri.as_str();
+                lexical(iri, check)?;
+                if let Some(previous) = previous {
+                    for old in &previous.constraints.server {
+                        check()?;
+                        lexical(iri, check)?;
+                        lexical(old, check)?;
+                    }
+                }
+                for other in &shape.constraints {
+                    check()?;
+                    if let Constraint::Component(other) = other {
+                        lexical(iri, check)?;
+                        lexical(other.component.iri.as_str(), check)?;
+                    }
+                }
+            }
             _ => {}
         }
     }
