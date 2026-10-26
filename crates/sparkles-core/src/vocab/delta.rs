@@ -668,7 +668,7 @@ impl DeltaVocab {
         budget: &mut crate::store::cold::ColdBudget<'_>,
     ) -> Result<crate::store::cold::Loaded<DeltaVocab>> {
         let start = budget.used();
-        let buf = match budget.read_file(path) {
+        let buf = match budget.read_mutable_prefix(path) {
             Ok(bytes) => bytes,
             Err(Error::Io(error)) if error.kind() == std::io::ErrorKind::NotFound => Vec::new(),
             Err(error) => return Err(error),
@@ -1103,7 +1103,7 @@ fn extend_read_only_controlled(
     end: Option<u64>,
     budget: &mut crate::store::cold::ColdBudget<'_>,
 ) -> Result<()> {
-    let bytes = match budget.read_file(path) {
+    let bytes = match budget.read_mutable_prefix(path) {
         Ok(bytes) => bytes,
         Err(Error::Io(error)) if error.kind() == std::io::ErrorKind::NotFound => Vec::new(),
         Err(error) => return Err(error),
@@ -1353,6 +1353,118 @@ mod tests {
         let v = DeltaVocab::open_layered(&prefix, &own, true).unwrap();
         assert_eq!(v.len(), 3);
         assert_eq!(v.get(2).unwrap(), b"<urn:c>");
+    }
+
+    #[test]
+    fn controlled_linked_dictionary_still_refuses_truncated_required_terms() {
+        use crate::{
+            history::{HistoryOptions, ReadLimit},
+            store::cold::ColdBudget,
+        };
+        use std::cell::Cell;
+        let dir = tempfile::tempdir().unwrap();
+        let upstream = dir.path().join("source");
+        let own = dir.path().join("own");
+        let first = entry(b"<urn:first>");
+        let mut wire = first.clone();
+        wire.extend(entry(b"<urn:required-second>"));
+        std::fs::write(&upstream, &wire).unwrap();
+        let fired = Cell::new(false);
+        let observer = |stage: &str, _| {
+            if stage == "mutable prefix length" && !fired.replace(true) {
+                OpenOptions::new()
+                    .write(true)
+                    .open(&upstream)
+                    .unwrap()
+                    .set_len(first.len() as u64)
+                    .unwrap();
+            }
+        };
+        let options = HistoryOptions::default();
+        let mut budget = ColdBudget::new(ReadLimit {
+            options: &options,
+            memory: Some(1 << 20),
+            held: 0,
+        })
+        .unwrap();
+        budget.observe_keys(&observer);
+        assert!(matches!(
+            DeltaVocab::open_layered_controlled(&[(upstream.clone(), 2)], &own, &mut budget),
+            Err(Error::Corrupt(_))
+        ));
+        assert!(fired.get());
+        assert_eq!(std::fs::read(upstream).unwrap(), first);
+    }
+
+    #[test]
+    fn controlled_linked_dictionary_tolerates_actual_upstream_compaction_trim() {
+        use crate::{
+            history::{HistoryOptions, ReadLimit},
+            store::{Store, StoreOptions, cold::ColdBudget},
+        };
+        use std::cell::Cell;
+        let root = tempfile::tempdir().unwrap();
+        let main = Store::open(
+            root.path(),
+            StoreOptions {
+                build: crate::builder::BuildOptions {
+                    threads: 1,
+                    ..Default::default()
+                },
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        crate::sparql::update::update(
+            &main,
+            "INSERT DATA {<urn:upstream:s> <urn:upstream:p> \"payload\"}",
+            &Default::default(),
+        )
+        .unwrap();
+        main.flush_change_log().unwrap();
+        main.create_branch("child", &Default::default()).unwrap();
+        let child = main.branch("child").unwrap();
+        child.flush_change_log().unwrap();
+        let source = main.snapshot().generation.clone();
+        let path = source.dir.as_ref().unwrap().join("delta.vocab");
+        let (logical, _, allocated) = source.dvocab.file_state();
+        assert!(
+            allocated > logical,
+            "fixture needs real unused preallocation"
+        );
+        let snapshot = child.snapshot();
+        let own = snapshot
+            .generation
+            .dir
+            .as_ref()
+            .unwrap()
+            .join("delta.vocab");
+        let prefix = [(path.clone(), snapshot.dvocab_len)];
+        let ordinary = DeltaVocab::open_layered(&prefix, &own, true).unwrap();
+        let fired = Cell::new(false);
+        let observer = |stage: &str, at: usize| {
+            if stage == "mutable prefix length" && at as u64 == allocated && !fired.replace(true) {
+                main.compact().unwrap();
+                assert_eq!(std::fs::metadata(&path).unwrap().len(), logical);
+            }
+        };
+        let options = HistoryOptions::default();
+        let mut budget = ColdBudget::new(ReadLimit {
+            options: &options,
+            memory: Some(16 << 20),
+            held: 0,
+        })
+        .unwrap();
+        budget.observe_keys(&observer);
+        let loaded = DeltaVocab::open_layered_controlled(&prefix, &own, &mut budget).unwrap();
+        assert!(fired.get(), "the compaction interleaving did not execute");
+        assert_eq!(loaded.value.len(), ordinary.len());
+        for id in 0..ordinary.len() {
+            let key = ordinary.get(id).unwrap();
+            assert_eq!(loaded.value.get(id), Some(key.clone()));
+            assert_eq!(loaded.value.find(&key), ordinary.find(&key));
+        }
+        assert_eq!(std::fs::metadata(path).unwrap().len(), logical);
     }
 
     #[test]

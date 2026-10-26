@@ -6,11 +6,7 @@ use crate::{
     history::ReadLimit,
 };
 use serde::de::DeserializeOwned;
-use std::{
-    fs::File,
-    io::{Read, Seek, SeekFrom},
-    path::Path,
-};
+use std::{fs::File, io::Read, path::Path};
 
 mod linked;
 pub(super) use linked::read_link_controlled;
@@ -152,18 +148,12 @@ impl<'a> ColdBudget<'a> {
         Ok(values.into_boxed_slice())
     }
 
-    /// Read only the selected immutable byte range. A concurrent truncation is an
-    /// error, never an invitation to recover or select another state.
-    pub(crate) fn read_range(&mut self, path: &Path, offset: u64, length: u64) -> Result<Vec<u8>> {
-        self.check()?;
-        let mut file = File::open(path)?;
-        file.seek(SeekFrom::Start(offset))?;
-        self.read_from(&mut file, length)
-    }
-
     pub(crate) fn read_from<R: Read>(&mut self, file: &mut R, length: u64) -> Result<Vec<u8>> {
         let mut bytes = Vec::new();
-        self.append_read(file, &mut bytes, length)?;
+        if let Err(error) = self.append_read(file, &mut bytes, length) {
+            self.drop_vec(bytes);
+            return Err(error);
+        }
         Ok(bytes)
     }
 
@@ -194,8 +184,58 @@ impl<'a> ColdBudget<'a> {
 
     pub(crate) fn read_file(&mut self, path: &Path) -> Result<Vec<u8>> {
         self.check()?;
-        let length = std::fs::metadata(path)?.len();
-        self.read_range(path, 0, length)
+        let mut file = File::open(path)?;
+        let length = file.metadata()?.len();
+        self.key_step(
+            "immutable file length",
+            usize::try_from(length).unwrap_or(usize::MAX),
+        )?;
+        self.read_from(&mut file, length)
+    }
+
+    /// Read one captured descriptor's appendable prefix. A writer may trim unused
+    /// allocation after its logical end; EOF is allowed here, while the caller's
+    /// existing wire parser and required-term bound still validate actual data.
+    /// Immutable file reads remain exact-length operations.
+    pub(crate) fn read_mutable_prefix(&mut self, path: &Path) -> Result<Vec<u8>> {
+        self.check()?;
+        let mut file = File::open(path)?;
+        let length = file.metadata()?.len();
+        self.key_step(
+            "mutable prefix length",
+            usize::try_from(length).unwrap_or(usize::MAX),
+        )?;
+        let length = usize::try_from(length).map_err(|_| self.exhausted())?;
+        let mut bytes = Vec::new();
+        let result: Result<()> = (|| {
+            while bytes.len() < length {
+                self.check()?;
+                let start = bytes.len();
+                let end = start.saturating_add(CHUNK).min(length);
+                self.reserve(&mut bytes, end)?;
+                bytes.resize(end, 0);
+                let mut read = start;
+                while read < end {
+                    self.key_step("mutable prefix read", read)?;
+                    match file.read(&mut bytes[read..end]) {
+                        Ok(0) => {
+                            bytes.truncate(read);
+                            self.check()?;
+                            return Ok(());
+                        }
+                        Ok(count) => read += count,
+                        Err(error) if error.kind() == std::io::ErrorKind::Interrupted => {}
+                        Err(error) => return Err(error.into()),
+                    }
+                }
+            }
+            self.check()
+        })();
+        if let Err(error) = result {
+            self.drop_vec(bytes);
+            return Err(error);
+        }
+        Ok(bytes)
     }
 
     /// Deserialize through a controlled reader, so cancellation also reaches Serde's
@@ -580,6 +620,103 @@ mod tests {
                 )
             })
             .collect()
+    }
+
+    #[test]
+    fn strict_file_read_captures_one_descriptor_and_still_refuses_real_truncation() {
+        use std::cell::Cell;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("metadata.json");
+        let replacement = dir.path().join("replacement.json");
+        let original = vec![b'k'; 100_000];
+        std::fs::write(&path, &original).unwrap();
+        std::fs::write(&replacement, b"{}").unwrap();
+        let replaced = Cell::new(false);
+        let observer = |stage: &str, _| {
+            if stage == "immutable file length" && !replaced.replace(true) {
+                std::fs::rename(&replacement, &path).unwrap();
+            }
+        };
+        let options = HistoryOptions::default();
+        let mut budget = ColdBudget::new(ReadLimit {
+            options: &options,
+            memory: Some(1 << 20),
+            held: 0,
+        })
+        .unwrap();
+        budget.observe_keys(&observer);
+        let bytes = budget.read_file(&path).unwrap();
+        assert!(replaced.get());
+        assert_eq!(bytes, original);
+        budget.drop_vec(bytes);
+        assert_eq!(budget.used(), 0);
+        assert_eq!(std::fs::read(&path).unwrap(), b"{}");
+        std::fs::write(&path, &original).unwrap();
+        let truncated = Cell::new(false);
+        let observer = |stage: &str, _| {
+            if stage == "immutable file length" && !truncated.replace(true) {
+                std::fs::OpenOptions::new()
+                    .write(true)
+                    .open(&path)
+                    .unwrap()
+                    .set_len(1)
+                    .unwrap();
+            }
+        };
+        let mut budget = ColdBudget::new(ReadLimit {
+            options: &options,
+            memory: Some(1 << 20),
+            held: 0,
+        })
+        .unwrap();
+        budget.observe_keys(&observer);
+        assert!(
+            matches!(budget.read_file(&path),Err(Error::Io(e)) if e.kind()==std::io::ErrorKind::UnexpectedEof)
+        );
+        assert!(truncated.get());
+        assert_eq!(budget.used(), 0);
+        assert_eq!(std::fs::read(&path).unwrap(), b"k");
+    }
+
+    #[test]
+    fn mutable_prefix_reads_cancel_inside_io_and_release_owned_buffers() {
+        use std::{
+            cell::Cell,
+            sync::{
+                Arc,
+                atomic::{AtomicBool, Ordering},
+            },
+        };
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("mutable.bin");
+        let wire = vec![7; 2 << 20];
+        std::fs::write(&path, &wire).unwrap();
+        let cancel = Arc::new(AtomicBool::new(false));
+        let options = HistoryOptions {
+            cancel: Some(cancel.clone()),
+            deadline: None,
+        };
+        let reached = Cell::new(false);
+        let observer = |stage: &str, at: usize| {
+            if stage == "mutable prefix read" && at >= CHUNK && at < wire.len() {
+                reached.set(true);
+                cancel.store(true, Ordering::Relaxed);
+            }
+        };
+        let mut budget = ColdBudget::new(ReadLimit {
+            options: &options,
+            memory: Some(8 << 20),
+            held: 0,
+        })
+        .unwrap();
+        budget.observe_keys(&observer);
+        assert!(matches!(
+            budget.read_mutable_prefix(&path),
+            Err(Error::Cancelled)
+        ));
+        assert!(reached.get());
+        assert_eq!(budget.used(), 0);
+        assert_eq!(std::fs::read(&path).unwrap(), wire);
     }
 
     #[test]
