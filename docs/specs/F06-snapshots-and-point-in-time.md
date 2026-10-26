@@ -1699,6 +1699,10 @@ CLI has `sparkles history`. The UI's history panel can list the changes of a sub
 predicate, newest first, with their authors and messages, and its **Diff** button now
 works for commits whose state is gone when the change log has their changes.
 
+History queries clip unrecorded gaps to the requested inclusive commit window,
+including windows contained within a longer gap. This applies to ascending,
+descending and filtered reads, in-memory indexes, sealed indexes and reopened logs.
+
 **Authors.** `WriteOptions` gained `author`. The server sets it to the authenticated
 caller (`user:bob`, `oidc:…`, or a minted token's owner) for SPARQL Update, Graph Store
 writes, uploads, RDF Patch and the MCP update tool. Without authentication there is no

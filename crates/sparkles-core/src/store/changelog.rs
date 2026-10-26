@@ -1478,7 +1478,16 @@ impl ChangeLog {
             let ix = self.index(&mut inner, i)?;
             let lo = ix.recs.partition_point(|r| r.seq < from);
             let hi = ix.recs.partition_point(|r| r.seq <= to);
-            for r in &ix.recs[lo..hi] {
+            // A gap can begin in the requested window but end after it. That
+            // first overhanging record has no candidate changes, yet its unknown
+            // range still intersects the query and must not look complete.
+            let hole_hi = hi
+                + usize::from(
+                    ix.recs
+                        .get(hi)
+                        .is_some_and(|record| record.hole.is_some_and(|(first, _)| first <= to)),
+                );
+            for r in &ix.recs[lo..hole_hi] {
                 if let Some((f, reason)) = r.hole {
                     holes.push(Unrecorded {
                         from: f.max(from),
