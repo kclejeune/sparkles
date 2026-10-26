@@ -1613,3 +1613,18 @@ Namespace sample or a pinned Intel control using the same binaries and matching
 answers. The preparation changes retain their functionality without a query-specific
 optimization. Item 328 remains the broader follow-up for short-query calibration and
 any reproducible costs; this check does not establish a cross-engine performance claim.
+
+
+### Short queries after evidence integration
+
+The matched `5a7e4238` to `adc2dcbe` integration screen initially flagged `minus`,
+`star-lookup` and `values-star` on Namespace. A longer rerun brought every change below
+10%, and a quiet pinned Intel control measured −0.7%, −0.3% and +2.8% in server
+execution. Client time stayed within 0.8%. All answers agree, with matching compilers
+and exact retained binary hashes. The [qualified result and immutable samples](../benchmarks/synthetic/RESULTS.md#short-query-integration-control)
+keep these internal comparisons separate from cross-engine tables.
+
+Item 385 retains the accepted `values-star` drift of about 0.4 microseconds. Recheck
+it when the short-query execution path next changes, distinguishing instruction cost
+from code placement. A material persistent cost or a simple broad improvement should
+drive further optimization.

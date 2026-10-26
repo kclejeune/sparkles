@@ -294,3 +294,21 @@ the later failure to the memory cgroup. These results remain separate from Forge
 do not replace its missing Fluree latency. The
 [recovery inventory](../2026-10-25-query-error-recovery-inventory.json) names the remaining
 changed-store and resource-limited comparisons without inferring success from this run.
+
+
+## Short-query integration control
+
+A quiet Intel control compares the matched public builds `5a7e4238` and `adc2dcbe`
+after three queries crossed the initial Namespace screen threshold. Ten longer
+Namespace rounds brought each below 10%. Twelve interleaved Forge rounds with
+200 timed requests per process then measured server execution changes of −0.7% for
+`minus`, −0.3% for `star-lookup` and +2.8% for `values-star`. Client time changed by
+−0.8%, +0.2% and −0.5%. The small `values-star` change is about 0.4 microseconds
+at a 14-microsecond baseline and remains under roadmap item 385.
+
+These are internal comparisons on 1.05 million generated triples. They do not replace
+the cross-engine tables. Both builds use identical compilers, run alone on Forge with
+pinned server and client cores, and return matching sorted TSV answers for all three
+queries. The [immutable run record](runs/2026-10-26-post-adc2dcbe-intel-control/validation.json)
+contains the source and binary identities, settings, initial flags, longer rerun and
+compressed request samples.
