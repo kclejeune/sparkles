@@ -336,7 +336,9 @@ pub struct AppState {
     /// Datasets being deleted or renamed. Lookups do not find them, so no request can
     /// take a handle that would make the delete or rename fail.
     leaving: Mutex<BTreeSet<String>>,
-    pub tasks: Mutex<Vec<Task>>,
+    /// Kept independently so completed workers release server ownership before
+    /// publishing their terminal task status.
+    pub tasks: Arc<Mutex<Vec<Task>>>,
     task_counter: AtomicU64,
     pub started: Instant,
     pub started_at: String,
@@ -654,7 +656,7 @@ impl AppState {
             admission: Default::default(),
             routing: Mutex::new(BTreeMap::new()),
             leaving: Mutex::new(BTreeSet::new()),
-            tasks: Mutex::new(Vec::new()),
+            tasks: Arc::new(Mutex::new(Vec::new())),
             task_counter: AtomicU64::new(1),
             started: Instant::now(),
             started_at: now(),
@@ -726,7 +728,7 @@ impl AppState {
             admission: Default::default(),
             routing: Mutex::new(BTreeMap::new()),
             leaving: Mutex::new(BTreeSet::new()),
-            tasks: Mutex::new(Vec::new()),
+            tasks: Arc::new(Mutex::new(Vec::new())),
             task_counter: AtomicU64::new(1),
             started: Instant::now(),
             started_at: now(),
@@ -1203,6 +1205,8 @@ impl AppState {
             let kind = kind.to_string();
             move |waited: bool| {
                 std::thread::spawn(move || {
+                    #[cfg(test)]
+                    tests::task_start_hook(&kind);
                     let handle = TaskHandle {
                         state: state.clone(),
                         id: id.clone(),
@@ -1224,12 +1228,23 @@ impl AppState {
                     let r = if start {
                         span.in_scope(|| work(&handle))
                     } else {
+                        // A queued task cancelled as its worker starts never calls
+                        // work, but its captures may still own the server or a name.
+                        drop(work);
                         Err(sparkles::Error::Cancelled.into())
                     };
-                    finish(&state.tasks, &id, r);
+                    // Terminal status must outlive the worker's server ownership.
+                    // Otherwise a caller can observe completion, close its last
+                    // handle and still race this thread for the catalog lock.
+                    let tasks = state.tasks.clone();
+                    drop(handle);
                     if counted {
                         state.task_queue.done(&kind);
                     }
+                    drop(state);
+                    finish(&tasks, &id, r);
+                    #[cfg(test)]
+                    tests::task_retirement_hook(&kind);
                 });
             }
         };
@@ -1563,6 +1578,82 @@ pub(crate) mod tests {
 
     type Hook = (String, Box<dyn FnOnce() + Send>);
     static DELETE_HOOK: Mutex<Option<Hook>> = Mutex::new(None);
+    type TaskHooks = Mutex<BTreeMap<String, Box<dyn FnOnce() + Send>>>;
+    static TASK_RETIREMENT_HOOK: TaskHooks = Mutex::new(BTreeMap::new());
+    static TASK_START_HOOK: TaskHooks = Mutex::new(BTreeMap::new());
+
+    pub(crate) fn task_retirement_hook(kind: &str) {
+        run_task_hook(&TASK_RETIREMENT_HOOK, kind);
+    }
+
+    pub(crate) fn task_start_hook(kind: &str) {
+        run_task_hook(&TASK_START_HOOK, kind);
+    }
+
+    fn run_task_hook(hook: &TaskHooks, kind: &str) {
+        let hook = hook.lock().remove(kind);
+        if let Some(f) = hook {
+            f();
+        }
+    }
+
+    #[test]
+    fn finished_tasks_release_server_ownership_before_worker_retirement() {
+        let dir = tempfile::tempdir().unwrap();
+        for (kind, expected) in [
+            ("retirement-success", task_state::DONE),
+            ("retirement-error", task_state::FAILED),
+            ("retirement-cancelled", task_state::CANCELLED),
+            ("backup-retirement", task_state::DONE),
+        ] {
+            let st = Arc::new(
+                AppState::new(dir.path(), StoreOptions::default(), Duration::from_secs(30))
+                    .unwrap(),
+            );
+            if kind == "retirement-success" {
+                drop(st.create("prod", DbType::Persistent).unwrap());
+            }
+            let tasks = st.tasks.clone();
+            let (retired, retired_rx) = mpsc::channel();
+            let (release, release_rx) = mpsc::channel();
+            TASK_RETIREMENT_HOOK.lock().insert(
+                kind.to_string(),
+                Box::new(move || {
+                    retired.send(()).unwrap();
+                    let _ = release_rx.recv_timeout(Duration::from_secs(30));
+                }),
+            );
+            let task = st.start_task(kind, "", move |_| {
+                match expected {
+                    task_state::FAILED => anyhow::bail!("synthetic task failure"),
+                    task_state::CANCELLED => return Err(sparkles::Error::Cancelled.into()),
+                    _ => {}
+                }
+                Ok("completed".into())
+            });
+            retired_rx.recv_timeout(Duration::from_secs(30)).unwrap();
+            let state = tasks
+                .lock()
+                .iter()
+                .find(|t| t.id == task.id)
+                .unwrap()
+                .state
+                .clone();
+            assert_eq!(state, expected);
+            let owners = Arc::strong_count(&st);
+            drop(st);
+            // Hold the retired worker open while proving the catalog is available.
+            let reopened =
+                AppState::new(dir.path(), StoreOptions::default(), Duration::from_secs(30))
+                    .expect("finished task must release the catalog before publishing completion");
+            assert_eq!(
+                owners, 1,
+                "finished task must release every worker-owned server handle"
+            );
+            release.send(()).unwrap();
+            drop(reopened);
+        }
+    }
 
     /// Runs the hook installed for dataset `name`, where a delete starts its catalog
     /// work.
@@ -1578,6 +1669,86 @@ pub(crate) mod tests {
         if let Some((_, f)) = hook {
             f();
         }
+    }
+
+    #[test]
+    fn a_cancelled_start_drops_unrun_work_before_terminal_status() {
+        let dir = tempfile::tempdir().unwrap();
+        let st = Arc::new(
+            AppState::new(dir.path(), StoreOptions::default(), Duration::from_secs(30)).unwrap(),
+        );
+        st.task_queue.set_max(1);
+        let (working, working_rx) = mpsc::channel();
+        let (finish_first, finish_first_rx) = mpsc::channel();
+        let first = st.start_task("retirement-blocker", "", move |_| {
+            working.send(()).unwrap();
+            finish_first_rx
+                .recv_timeout(Duration::from_secs(30))
+                .unwrap();
+            Ok("done".into())
+        });
+        working_rx.recv_timeout(Duration::from_secs(30)).unwrap();
+        let kind = "retirement-cancelled-start";
+        let (starting, starting_rx) = mpsc::channel();
+        let (start, start_rx) = mpsc::channel();
+        TASK_START_HOOK.lock().insert(
+            kind.to_string(),
+            Box::new(move || {
+                starting.send(()).unwrap();
+                let _ = start_rx.recv_timeout(Duration::from_secs(30));
+            }),
+        );
+        let (retired, retired_rx) = mpsc::channel();
+        let (release, release_rx) = mpsc::channel();
+        TASK_RETIREMENT_HOOK.lock().insert(
+            kind.to_string(),
+            Box::new(move || {
+                retired.send(()).unwrap();
+                let _ = release_rx.recv_timeout(Duration::from_secs(30));
+            }),
+        );
+        let captured = st.clone();
+        let task = st.start_task_opts(st.next_task_id(), kind, "", None, true, move |_| {
+            // The unrun closure retains a real catalog-owning server handle.
+            drop(captured);
+            panic!("cancelled queued work must not run");
+        });
+        assert_eq!(task.state, task_state::QUEUED);
+        finish_first.send(()).unwrap();
+        starting_rx.recv_timeout(Duration::from_secs(30)).unwrap();
+        let deadline = Instant::now() + Duration::from_secs(30);
+        while st
+            .tasks
+            .lock()
+            .iter()
+            .any(|t| t.id == first.id && t.active())
+        {
+            assert!(Instant::now() < deadline, "first task did not finish");
+            std::thread::yield_now();
+        }
+        // The task left the queue, but its worker has not checked cancellation.
+        st.cancel_task(&task.id).unwrap().unwrap();
+        start.send(()).unwrap();
+        retired_rx.recv_timeout(Duration::from_secs(30)).unwrap();
+        assert_eq!(
+            st.tasks
+                .lock()
+                .iter()
+                .find(|t| t.id == task.id)
+                .unwrap()
+                .state,
+            task_state::CANCELLED
+        );
+        assert_eq!(
+            Arc::strong_count(&st),
+            1,
+            "cancelled unrun work must release its captured server handle"
+        );
+        drop(st);
+        let reopened = AppState::new(dir.path(), StoreOptions::default(), Duration::from_secs(30))
+            .expect("cancelled unrun work must release its catalog before terminal status");
+        release.send(()).unwrap();
+        drop(reopened);
     }
 
     #[test]

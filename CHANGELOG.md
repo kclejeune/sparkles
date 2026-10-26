@@ -4,6 +4,10 @@
 
 ### Changed
 
+Background tasks release their server handles and task slots before publishing a final
+status, including cancelled tasks whose work never ran. Closing the last server handle
+after task completion releases the catalog lock without racing the worker's teardown.
+
 The version 1 valid-time resource profile supplies RDF vocabulary, SHACL shapes, an
 import normalization contract and typed active-claim and overlapping-claim stored-query
 definitions. It preserves uncertain endpoints and temporal verdicts without asserting
