@@ -9,6 +9,111 @@ impl Store {
         Ok(self.inherited_named(at, seq, &name))
     }
 
+    /// An unresolved time has no honest commit number after catalog pruning.
+    pub(super) fn unresolved_time_limited(&self, ms: i64, limit: &ReadLimit<'_>) -> Result<Error> {
+        let writer = limit.lock(&self.writer)?;
+        let head = writer.head.seq;
+        let current = commit::generation_number(&self.snapshot().generation.name);
+        let reconstructable = if let Some(history) = &self.history {
+            let history = limit.lock(history)?;
+            bounded_ranges(
+                history.gens.iter().map(|(&number, generation)| {
+                    (
+                        generation.base.seq,
+                        if number == current {
+                            head
+                        } else {
+                            generation.end
+                        },
+                    )
+                }),
+                limit,
+            )?
+        } else if let Some(history) = &self.mem_history {
+            let history = limit.lock(history)?;
+            bounded_ranges(
+                history
+                    .window
+                    .iter()
+                    .map(|snap| (snap.commit, snap.commit))
+                    .chain(
+                        history
+                            .pins
+                            .values()
+                            .map(|(commit, _)| (commit.seq, commit.seq)),
+                    )
+                    .chain(history.branch_bases.keys().map(|&seq| (seq, seq)))
+                    .chain(std::iter::once((head, head))),
+                limit,
+            )?
+        } else {
+            limit.check(16)?;
+            vec![(head, head)]
+        };
+        limit.check(512)?;
+        Ok(Error::HistoryGone(Box::new(crate::history::HistoryGone {
+            message: format!(
+                "{} cannot be resolved because its branch commit metadata is no longer retained",
+                At::Time(ms)
+            ),
+            seq: None,
+            at: Some(At::Time(ms)),
+            head,
+            snapshot: None,
+            reconstructable,
+            metadata: None,
+        })))
+    }
+
+    /// Prove only the immutable fork clock. This never opens a parent Store or
+    /// materializes its head just to decide whether time inheritance is legitimate.
+    pub(super) fn origin_timestamp_limited(
+        &self,
+        mut commit: crate::branch::CommitRef,
+        limit: &ReadLimit<'_>,
+    ) -> Result<i64> {
+        use branching::readonly::{OriginRead, Purpose};
+        for _ in 0..1024 {
+            limit.check(0)?;
+            commit = self.owned_set()?.normalize_limited(commit, limit)?;
+            let result = if commit.branch_id == self.dataset_id {
+                self.resolve_limited(&At::Commit(commit.seq), limit)
+                    .map(|resolved| OriginRead::Clock(resolved.commit.timestamp_ms))
+            } else {
+                match self.readonly_branch_read_limited(
+                    commit.branch_id,
+                    &At::Commit(commit.seq),
+                    Purpose::Clock,
+                    limit,
+                )? {
+                    OriginRead::Resident(store) => store
+                        .resolve_limited(&At::Commit(commit.seq), limit)
+                        .map(|resolved| OriginRead::Clock(resolved.commit.timestamp_ms)),
+                    value => Ok(value),
+                }
+            };
+            match result {
+                Ok(OriginRead::Clock(timestamp)) => {
+                    limit.check(0)?;
+                    return Ok(timestamp);
+                }
+                Ok(OriginRead::Inherited(parent)) => commit = parent,
+                Err(error) => {
+                    let Some(parent) = crate::branch::inherited_commit(&error) else {
+                        return Err(error);
+                    };
+                    commit = parent;
+                }
+                _ => {
+                    return Err(Error::Corrupt(
+                        "fork clock lookup returned a data view".into(),
+                    ));
+                }
+            }
+        }
+        Err(Error::invalid("fork clock has no acyclic retained origin"))
+    }
+
     pub(super) fn resolve_limited(&self, at: &At, limit: &ReadLimit<'_>) -> Result<Resolved> {
         if let At::Snapshot(name) = at
             && !crate::history::valid_name(name)
@@ -194,7 +299,8 @@ impl Store {
         limit.check(512)?;
         Ok(Error::HistoryGone(Box::new(crate::history::HistoryGone {
             message: format!("commit {seq} is no longer reconstructable{oldest}"),
-            seq,
+            seq: Some(seq),
+            at: None,
             head,
             snapshot,
             reconstructable,
@@ -232,7 +338,8 @@ impl Store {
             message: format!(
                 "commit {seq} is no longer reconstructable; an in-memory dataset keeps the states its snapshots and retention window hold"
             ),
-            seq,
+            seq: Some(seq),
+            at: None,
             head,
             snapshot,
             reconstructable,
@@ -402,39 +509,108 @@ impl Store {
         options: &HistoryOptions,
         memory: u64,
     ) -> Result<(Arc<Snapshot>, Resolved, uuid::Uuid)> {
+        enum Source<'a> {
+            Resident(branching::BranchStore<'a>),
+            Cold(uuid::Uuid),
+        }
+        use branching::readonly::OriginRead;
+        let capacity = self
+            .opts
+            .shared
+            .as_ref()
+            .map_or(self.opts.history_cache_bytes, |scope| {
+                scope.caches.history().capacity()
+            });
+        let memory = memory.min(capacity);
         let limit = ReadLimit {
             options,
             memory: Some(memory),
             held: crate::history::READ_METADATA_BYTES,
         };
-        let mut selected = branching::BranchStore::Main(store);
-        // Only time selectors need their original form after following ancestry.
-        // Other inherited selectors become the exact recorded commit identity.
+        let mut selected = Source::Resident(branching::BranchStore::Main(store));
         let mut inherited = None;
-        for _ in 0..1024 {
+        let mut hops = 0usize;
+        loop {
             limit.check(0)?;
+            if hops >= 1024 {
+                return Err(Error::invalid(
+                    "inherited history has no acyclic retained origin",
+                ));
+            }
             let requested = inherited.as_ref().unwrap_or(at);
-            match selected.snapshot_at_limited(requested, options, memory) {
-                Ok((snapshot, resolved)) => return Ok((snapshot, resolved, selected.branch_id())),
+            let (id, result) = match &selected {
+                Source::Resident(store) => (
+                    store.branch_id(),
+                    store
+                        .snapshot_at_limited(requested, options, memory)
+                        .map(|(snapshot, resolved)| OriginRead::View(snapshot, resolved)),
+                ),
+                Source::Cold(id) => (
+                    *id,
+                    self.readonly_branch_snapshot_limited(*id, requested, &limit),
+                ),
+            };
+            let outcome = match result {
+                Ok(outcome) => outcome,
                 Err(error) => {
-                    let origin = crate::branch::inherited_commit(&error);
-                    let Some(commit) = origin else {
+                    let Some(commit) = crate::branch::inherited_commit(&error) else {
                         return Err(error);
                     };
-                    // Do not retain one error/message allocation per ancestor or
-                    // grow the Rust call stack while following inherited reads.
                     drop(error);
+                    OriginRead::Inherited(commit)
+                }
+            };
+            match outcome {
+                OriginRead::View(snapshot, resolved) => {
+                    limit.check(0)?;
+                    return Ok((snapshot, resolved, id));
+                }
+                OriginRead::Resident(store) => {
+                    selected = Source::Resident(branching::BranchStore::Other(store))
+                }
+                OriginRead::Clock(_) => {
+                    return Err(Error::Corrupt(
+                        "snapshot lookup returned only a fork clock".into(),
+                    ));
+                }
+                OriginRead::Inherited(commit) => {
+                    if let At::Time(ms) = at {
+                        let fork = self.origin_timestamp_limited(commit, &limit)?;
+                        if *ms >= fork {
+                            return match &selected {
+                                Source::Resident(store) => {
+                                    Err(store.unresolved_time_limited(*ms, &limit)?)
+                                }
+                                Source::Cold(id) => match self.readonly_branch_read_limited(
+                                    *id,
+                                    at,
+                                    branching::readonly::Purpose::TimeGone(*ms),
+                                    &limit,
+                                ) {
+                                    Err(error) => Err(error),
+                                    Ok(OriginRead::Resident(store)) => {
+                                        Err(store.unresolved_time_limited(*ms, &limit)?)
+                                    }
+                                    _ => Err(Error::Corrupt(
+                                        "missing branch time produced a data view".into(),
+                                    )),
+                                },
+                            };
+                        }
+                    }
+                    hops += 1;
                     let owner = self.owned_set()?.normalize_limited(commit, &limit)?;
-                    selected = self.retained_branch_by_id_limited(owner.branch_id, &limit)?;
+                    selected = if owner.branch_id == self.dataset_id {
+                        Source::Resident(branching::BranchStore::Main(self))
+                    } else {
+                        Source::Cold(owner.branch_id)
+                    };
                     if !matches!(at, At::Time(_)) {
-                        inherited = Some(At::Commit(commit.seq));
+                        inherited = Some(At::Commit(owner.seq));
                     }
                 }
             }
         }
-        Err(Error::invalid(
-            "inherited history has no acyclic retained origin",
-        ))
     }
 }
 

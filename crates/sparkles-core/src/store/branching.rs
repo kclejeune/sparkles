@@ -11,6 +11,8 @@
 //! lock. An upstream's history lock may be taken while a branch's writer lock is held,
 //! never the reverse.
 
+pub(super) mod readonly;
+
 use super::link::{LINK_FILE, LinkFile, Segment};
 use super::*;
 use crate::branch::{
@@ -1389,41 +1391,6 @@ impl Store {
         Ok(BranchStore::Other(set.open_store(id)?))
     }
 
-    /// A bounded read must not invoke ordinary Store opening and recovery as a
-    /// hidden preparation step. Cold origin opening needs its own controlled seam.
-    pub(super) fn retained_branch_by_id_limited(
-        &self,
-        id: uuid::Uuid,
-        limit: &crate::history::ReadLimit<'_>,
-    ) -> Result<BranchStore<'_>> {
-        limit.check(0)?;
-        if id == self.dataset_id {
-            return Ok(BranchStore::Main(self));
-        }
-        let set = self.owned_set()?;
-        if limit
-            .lock(&set.table)?
-            .any_by_id_limited(id, limit)?
-            .is_none()
-        {
-            return Err(BranchError::error(
-                BranchErrorKind::Gone,
-                "merge-base-gone",
-                format!("branch {id} was deleted"),
-            ));
-        }
-        limit
-            .lock(&set.stores)?
-            .get(&id)
-            .cloned()
-            .map(BranchStore::Other)
-            .ok_or_else(|| {
-                Error::HistoryUnsupported(
-                    "bounded inherited reads require a retained origin store".into(),
-                )
-            })
-    }
-
     /// The id of branch `name`.
     pub fn branch_id_of(&self, name: &str) -> Result<uuid::Uuid> {
         if name == MAIN {
@@ -2633,6 +2600,16 @@ impl Store {
             Ok((snapshot, resolved)) => Ok((snapshot, resolved, store.branch_id())),
             Err(error) => match branch::inherited_commit(&error) {
                 Some(commit) => {
+                    if let At::Time(ms) = at {
+                        let limit = crate::history::ReadLimit {
+                            options,
+                            memory: None,
+                            held: 0,
+                        };
+                        if *ms >= self.origin_timestamp_limited(commit, &limit)? {
+                            return Err(store.unresolved_time_limited(*ms, &limit)?);
+                        }
+                    }
                     let owner = self.owned_set()?.normalize(commit);
                     let upstream = self.branch_by_id(owner.branch_id)?;
                     match at {
@@ -2663,6 +2640,17 @@ impl Store {
         match store.resolve(at) {
             Err(e) => match branch::inherited_commit(&e) {
                 Some(c) => {
+                    if let At::Time(ms) = at {
+                        let options = crate::history::HistoryOptions::default();
+                        let limit = crate::history::ReadLimit {
+                            options: &options,
+                            memory: None,
+                            held: 0,
+                        };
+                        if *ms >= self.origin_timestamp_limited(c, &limit)? {
+                            return Err(store.unresolved_time_limited(*ms, &limit)?);
+                        }
+                    }
                     let owner = self.owned_set()?.normalize(c);
                     let up = self.branch_by_id(owner.branch_id)?;
                     match at {

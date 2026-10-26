@@ -1586,3 +1586,49 @@ impl ReadOnlyLog {
         Ok((first, last))
     }
 }
+
+impl ChangeLog {
+    /// Read the same closed settings without a writer or startup preflight.
+    pub(crate) fn settings_controlled(
+        root: &Path,
+        budget: &mut ColdBudget<'_>,
+    ) -> Result<ChangeLogSettings> {
+        let start = budget.used();
+        budget.charge(
+            (root.as_os_str().len() as u64)
+                .saturating_mul(4)
+                .saturating_add(2048),
+        )?;
+        let result = (|| {
+            let bytes = match budget.read_file(&root.join(CHANGE_LOG_FILE)) {
+                Ok(bytes) => bytes,
+                Err(Error::Io(error)) if error.kind() == std::io::ErrorKind::NotFound => {
+                    return Ok(ChangeLogSettings::default());
+                }
+                Err(error) => return Err(error),
+            };
+            let mut raw: Loaded<serde_json::Value> = budget.json(&bytes)?;
+            if raw
+                .value
+                .get("format")
+                .is_some_and(|value| !value.is_null() && !value.is_number())
+            {
+                return Err(Error::Corrupt(
+                    "changelog.json: format is not a version".into(),
+                ));
+            }
+            crate::formats::check_settings(CHANGE_LOG_FILE, &raw.value)?;
+            if let Some(object) = raw.value.as_object_mut() {
+                object.entry("format").or_insert(1.into());
+            }
+            let file: SettingsFile = budget.value(raw.value)?;
+            budget.check()?;
+            Ok(file.settings)
+        })();
+        budget.release(budget.used() - start);
+        result.and_then(|value| {
+            budget.check()?;
+            Ok(value)
+        })
+    }
+}

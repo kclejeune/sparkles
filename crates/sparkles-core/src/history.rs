@@ -322,7 +322,10 @@ impl HistoryStatus {
 #[derive(Clone, Debug)]
 pub struct HistoryGone {
     pub message: String,
-    pub seq: u64,
+    /// The selected commit when its identity can still be resolved.
+    pub seq: Option<u64>,
+    /// The original selector when retained metadata cannot resolve its commit.
+    pub at: Option<At>,
     pub head: u64,
     pub snapshot: Option<String>,
     pub reconstructable: Vec<(u64, u64)>,

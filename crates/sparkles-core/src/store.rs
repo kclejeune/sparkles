@@ -2323,7 +2323,8 @@ impl Store {
         });
         Error::HistoryGone(Box::new(crate::history::HistoryGone {
             message: format!("commit {seq} is no longer reconstructable{oldest}"),
-            seq,
+            seq: Some(seq),
+            at: None,
             head,
             snapshot,
             reconstructable,

@@ -21,7 +21,8 @@ impl Store {
             message: format!(
                 "commit {seq} is no longer reconstructable; an in-memory dataset keeps the states its snapshots and retention window hold"
             ),
-            seq,
+            seq: Some(seq),
+            at: None,
             head,
             snapshot,
             reconstructable,

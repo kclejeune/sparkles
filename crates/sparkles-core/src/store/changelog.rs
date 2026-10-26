@@ -1426,12 +1426,7 @@ impl ChangeLog {
         }
     }
 
-    /// The commit whose timestamp is the newest at or before `ms` (`None`: none is
-    /// recorded that early).
-    pub(crate) fn commit_at_time(&self, ms: i64) -> Result<Option<u64>> {
-        self.commit_at_time_checked(ms, &mut || Ok(()))
-    }
-
+    /// The newest recorded commit at or before `ms`, with cooperative checks.
     pub(crate) fn commit_at_time_checked(
         &self,
         ms: i64,

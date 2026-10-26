@@ -66,6 +66,34 @@ fn durable_after(
 
 #[cfg(test)]
 mod tests {
+    #[allow(clippy::too_many_arguments)]
+    fn prove_prefix(
+        reader: &mut BufReader<File>,
+        extent: u64,
+        base: u64,
+        target: u64,
+        fold_legacy: bool,
+        strict_from: Option<u64>,
+        dvocab_len: u64,
+        annotated: Option<&[u64]>,
+        path: &Path,
+        budget: &ColdBudget<'_>,
+    ) -> Result<ProvenWal> {
+        prove_prefix_with(
+            reader,
+            extent,
+            base,
+            target,
+            fold_legacy,
+            strict_from,
+            dvocab_len,
+            annotated,
+            path,
+            budget,
+            &mut |_| Ok(()),
+        )
+    }
+
     use super::*;
     use crate::history::{HistoryOptions, ReadLimit};
 
@@ -433,34 +461,6 @@ pub(crate) struct ProvenWal {
 pub(crate) struct WalCommitObservation {
     pub(crate) point: WalPoint,
     pub(crate) metadata: Option<(i64, CommitKind, u8)>,
-}
-
-#[allow(clippy::too_many_arguments)]
-pub(crate) fn prove_prefix(
-    reader: &mut BufReader<File>,
-    extent: u64,
-    base: u64,
-    target: u64,
-    fold_legacy: bool,
-    strict_from: Option<u64>,
-    dvocab_len: u64,
-    annotated: Option<&[u64]>,
-    path: &Path,
-    budget: &ColdBudget<'_>,
-) -> Result<ProvenWal> {
-    prove_prefix_with(
-        reader,
-        extent,
-        base,
-        target,
-        fold_legacy,
-        strict_from,
-        dvocab_len,
-        annotated,
-        path,
-        budget,
-        &mut |_| Ok(()),
-    )
 }
 
 #[allow(clippy::too_many_arguments)]

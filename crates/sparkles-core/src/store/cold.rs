@@ -70,7 +70,7 @@ impl<'a> ColdBudget<'a> {
         self.limit.remaining().saturating_sub(self.used)
     }
 
-    fn owned_limit(&self) -> Result<ReadLimit<'a>> {
+    pub(super) fn owned_limit(&self) -> Result<ReadLimit<'a>> {
         self.limit.holding(self.used)
     }
 
