@@ -423,7 +423,10 @@ jobs:
         shell: bash
         run: |
           # Encrypted library tests opt in within this shell, lowering both limits.
-          if [ "$RUNNER_OS" = macOS ]; then ulimit -c 0; fi
+          if [ "$RUNNER_OS" = macOS ]; then
+            mbx test --locked -p sparkles-backup --features encryption --lib seal::memory::macos_tests::keys_require_explicit_process_preparation -- --exact
+            ulimit -c 0
+          fi
           mbx nextest run --locked --workspace --profile ci
       - name: Doctests
         if: ${{ !cancelled() }}
