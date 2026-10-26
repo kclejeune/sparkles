@@ -66,10 +66,17 @@ build community reports.
   them. The server detects structured output per model and falls back to JSON mode and
   plain text.
 * Ask keeps half of its schema budget for common vocabulary and retrieves the rest by
-  matching the question against every visible class and predicate. A guarded resource
-  preference can reorder the choices offered for an ambiguous mention. Every ambiguous
-  mention still asks for a clarification, because displayed candidates, types and labels
-  can be truncated. The generic `link_entities` verdict is unchanged.
+  matching the question against every visible class and predicate. Recognized candidate
+  evidence preserves full choice identities and can order explicitly named kinds using
+  known ontology types. Full retained types guard resource preferences against disambiguation
+  types beyond the display limit. An ambiguous initial request still asks for a clarification, because
+  bounded search does not prove unique intent. The generic `link_entities` verdict is
+  unchanged. If rich evidence exceeds the result-byte allowance, Ask retries ordinary
+  linking once under the same deadline and permissions and keeps its display rule.
+* The extra kind preference recognizes the English words film, movie, book, novel,
+  song, album, city, town, country, river and person through supported DBpedia,
+  schema.org and FOAF class IRIs. Unknown class namespaces and incomplete or competing
+  type evidence retain conservative clarification choices.
 * `POST /{ds}/ask` runs as the caller and streams each step as a server-sent event, or
   answers one JSON object ([API.md](../API.md#asking-in-the-server)). `assistant.json`,
   through `/$/assistant/{ds}`, turns the assistant on for a dataset and sets what may leave

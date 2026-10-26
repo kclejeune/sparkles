@@ -3866,6 +3866,10 @@ design remains part of its original record.
 
 Ask, query explanations, document ingestion and agent-memory workflows are available. The remaining evaluation, ingestion, verified-rewrite, grounding and latency work is tracked under items 6, 15, 27, 77, 81, 90, 263 and 318.
 
+Ask consumes recognized candidate evidence for full choice identities and conservative
+ordering of explicitly named kinds. Every ambiguous mention still requires a
+clarification, with general contextual resolution retained under item 263.
+
 Bounded debug stage diagnostics distinguish local grounding, tool calls and nested
 embedding work with bounded process-generated request correlation and no change to
 usage accounting. Item 318 remains open for

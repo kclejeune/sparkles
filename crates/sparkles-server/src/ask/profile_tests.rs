@@ -65,7 +65,7 @@ impl<S: Subscriber + for<'a> LookupSpan<'a>> Layer<S> for Capture {
     }
 }
 
-fn capture<T>(f: impl FnOnce() -> T) -> (T, Vec<Value>) {
+pub(super) fn capture<T>(f: impl FnOnce() -> T) -> (T, Vec<Value>) {
     // Keep the multi-dispatcher path active while parallel tests first register
     // shared callsites, following the HTTP access-log capture helpers.
     let _second = tracing::Dispatch::new(tracing_subscriber::registry());
