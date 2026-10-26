@@ -21,9 +21,9 @@
 # `--build-arg BUILD_JOBS=N` to cap the parallel compile jobs on a busy machine.
 #
 # `--build-arg FEATURES="a b"` sets the cargo features of sparkles-server that the server
-# builds add to its defaults. It defaults to `embed-local`, the local embedding runtime,
-# which adds about 5 MB and runs nothing until a local provider is configured, and
-# `--build-arg FEATURES=` leaves it out. `--build-arg NO_DEFAULT_FEATURES=1` starts from
+# builds add to its defaults. The defaults already include local embeddings, encrypted
+# backups and OCR support. FEATURES defaults to empty. Runtime models and OCR libraries
+# remain optional. `--build-arg NO_DEFAULT_FEATURES=1` starts from
 # no default features at all. The default `backup` feature also seals the model keys that
 # administrators store at runtime, so a build without it keeps them as plaintext files.
 # `docker build --target ocr -t sparkles:ocr .` builds the OCR variant. Its server finds
@@ -106,7 +106,7 @@ ARG BUILD_JOBS
 # the binary's 450 MB. The image drops them and keeps the symbol table, so backtraces
 # still name functions; `--build-arg KEEP_DEBUGINFO=1` keeps the line tables too.
 ARG KEEP_DEBUGINFO
-ARG FEATURES=embed-local
+ARG FEATURES=
 ARG NO_DEFAULT_FEATURES
 # the server embeds ui/build at compile time (crates/sparkles-server/src/ui.rs)
 COPY --from=ui /src/ui/build ui/build
@@ -123,7 +123,7 @@ RUN --mount=type=cache,id=sparkles-cargo-registry,target=/usr/local/cargo/regist
 FROM sources AS server-ocr
 ARG BUILD_JOBS
 ARG KEEP_DEBUGINFO
-ARG FEATURES=embed-local
+ARG FEATURES=
 ARG NO_DEFAULT_FEATURES
 COPY --from=ui /src/ui/build ui/build
 RUN --mount=type=cache,id=sparkles-cargo-registry,target=/usr/local/cargo/registry,sharing=locked \

@@ -1,5 +1,10 @@
 # C18: Questions and ingestion in natural language — Delivery record
 
+The standard server now includes OCR code through its default `pdf-ocr` feature.
+PDFium, ONNX Runtime and model snapshots remain operator-supplied runtime inputs.
+No model or OCR library is loaded merely because the capability is compiled in.
+The OCR image adds native libraries to the standard capability profile.
+
 Current delivery status is summarized in the [landing page](README.md).
 The [design Outcome overview](SPEC.md#outcome) links the supported scope to this record.
 The recorded dates and measurements below describe their original delivery stages.

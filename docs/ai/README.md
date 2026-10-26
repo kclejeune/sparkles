@@ -173,7 +173,8 @@ not include embeddings performed inside tools.
   entities, and writes the facts on a review branch. `mode: "preview"` holds them for
   approval, and `mode: "auto"` merges them when every check passes.
 * PDF conversion uses pdf-inspector with the `pdf` cargo feature, on by default, and the
-  `pdf-ocr` feature reads scanned pages with OCR models that the operator provides. Office
+  `pdf-ocr` feature is included by default. Scanned pages use OCR models and native
+  libraries that the operator provides. Office
   files are read by `sparkles-office` under the `office` feature, on by default. On Linux
   each conversion runs in a child process with an address-space limit, which limits
   resources but is not a sandbox.
@@ -280,8 +281,8 @@ dependencies are recorded in the [central roadmap](../ROADMAP.md).
   Roadmap item 270.
 * Agent memory does not import from Cursor's SQLite store or the editors' Copilot Chat
   storage, and redaction finds only the secrets its patterns describe. Roadmap item 15.
-* The server does not convert images or audio. Scanned PDF pages need a build with
-  `pdf-ocr` and OCR models from the operator. The Office converter is not registered with
+* The server does not convert images or audio. Scanned PDF pages need configured
+  OCR models, PDFium and ONNX Runtime. The standard binary includes the OCR code. The Office converter is not registered with
   the query memory pool, and a workbook's token estimate for `confirmTokens` does not
   cover all its sheets. Roadmap items 15 and 77.
 * A CSV mapping draft links an IRI column's values only to entities whose labels match

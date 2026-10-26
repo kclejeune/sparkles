@@ -12,7 +12,7 @@
 //! secret's name does not open.
 //!
 //! The operator's key is kept in a locked page that core dumps leave out where the
-//! platform has one (Linux and Android), and in a zeroizing heap buffer elsewhere or
+//! platform has one (Linux, Android and a prepared macOS process), and in a zeroizing heap buffer elsewhere or
 //! when the page cannot be locked. [`SecretSealer::key_memory`] says which.
 
 #[cfg_attr(not(feature = "encryption"), allow(dead_code))]
@@ -251,7 +251,7 @@ mod tests {
     #[test]
     fn round_trip_binds_key_and_name() {
         let s = SecretSealer::from_key(Zeroizing::new([7; 32]));
-        #[cfg(not(any(target_os = "linux", target_os = "android")))]
+        #[cfg(not(any(target_os = "linux", target_os = "android", target_os = "macos")))]
         assert_eq!(s.key_memory(), KeyMemory::Heap);
         check(&s, &SecretSealer::from_key(Zeroizing::new([8; 32])));
     }

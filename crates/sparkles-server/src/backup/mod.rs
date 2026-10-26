@@ -374,6 +374,7 @@ impl BackupState {
                     #[cfg(feature = "backup-encryption")]
                     {
                         use sparkles::backup::keys::{KeyContext, resolve};
+                        sparkles_backup::crypto::prepare_key_memory_for_process()?;
                         let mut forbidden = vec![self.data_dir.clone()];
                         forbidden.extend(
                             self.registry

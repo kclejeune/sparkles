@@ -67,7 +67,7 @@ rest of a query.
   split into overlapping chunks, and requests can be rate-limited by count and by
   estimated tokens. API keys come from operator-defined secrets, and Prometheus metrics
   report requests, failures, the backlog and the lag.
-* With the `embed-local` build feature, which the flake's packages include, the server
+* The standard server includes the `embed-local` runtime and
   runs BERT, XLM-RoBERTa, NomicBERT and Qwen3 sentence-embedding models itself with Candle
   ([API.md](../API.md#model-providers), [F12](../specs/F12-local-embeddings.md)). Models run on
   a small thread pool at a lower priority than queries, load at first use and unload when

@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Write THIRD_PARTY_LICENSES.md: the license and NOTICE files of every crate the
 `sparkles` binary links (the normal dependencies of sparkles-server with its default
-features and the opt-in features in OPT_IN, on every platform the flake builds for), from
+features, on every platform the flake builds for), from
 `cargo metadata`. Without an OUT
 argument it also writes crates/sparkles-py/THIRD_PARTY_LICENSES.md for the Python wheel and
 jvm/sparkles-jena/THIRD_PARTY_LICENSES.md for the JVM library's native part and
@@ -27,10 +27,6 @@ import sys
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 # what ships: the server binary on the platforms of flake.nix, and the formatter's
 # WebAssembly module the UI embeds
-# opt-in features of sparkles-server whose crates are listed too, so that a build with
-# them ships complete notices (the local embedding runtime of spec F12)
-OPT_IN = ["sparkles-server/embed-local"]
-
 ROOTS = [
     (
         "sparkles-server",
@@ -46,7 +42,7 @@ ROOTS = [
 BINDING_TARGETS = [*ROOTS[0][1], "x86_64-pc-windows-msvc"]
 NODE_TARGETS = [*BINDING_TARGETS, "x86_64-unknown-linux-musl", "aarch64-unknown-linux-musl"]
 # file names (case-insensitive) that carry a license or a notice
-LICENSE_FILE = re.compile(r"^(licen[cs]e|copying|copyright|notice|unlicense)([-._].*)?$", re.I)
+LICENSE_FILE = re.compile(r"^(licen[cs]e|copying|copyright|notice|unlicense|patents?)([-._].*)?$", re.I)
 
 # standard texts for crates without a license file ({holders}: the crate's authors)
 MIT = """MIT License
@@ -250,9 +246,7 @@ DATA_NOTICES = {
 
 def metadata(target, manifest=os.path.join(ROOT, "Cargo.toml"), locked=True):
     """`cargo metadata` for a platform. Without `locked`, cargo may add what the
-    manifest needs to its lock file first. The workspace's own manifest resolves the
-    opt-in features too."""
-    features = ["--features", ",".join(OPT_IN)] if manifest == os.path.join(ROOT, "Cargo.toml") else []
+    manifest needs to its lock file first."""
     out = subprocess.run(
         [
             "cargo",
@@ -264,7 +258,6 @@ def metadata(target, manifest=os.path.join(ROOT, "Cargo.toml"), locked=True):
             target,
             "--manifest-path",
             manifest,
-            *features,
         ],
         check=True,
         capture_output=True,
@@ -379,8 +372,8 @@ def fence(text):
 BINARY_INTRO = (
     "The `sparkles` binary links the crates below (the dependencies of `sparkles-server` "
     "on Linux and macOS, and of `sparkles-fmt-wasm`, the formatter's WebAssembly module "
-    "in the web UI). The list includes the crates of the opt-in `embed-local` feature, "
-    "which the default build leaves out. Their licenses and notices follow, each text once, with the crates "
+    "in the web UI). The default server includes local embeddings, OCR and encrypted backup support. "
+    "Their licenses, notices and patent notices follow, each text once, with the crates "
     "that ship it. The binary also includes EPSG-derived coordinate reference system "
     "definitions, whose terms of use are under Data notices.\n"
 )

@@ -2,6 +2,8 @@
 
 Sparkles provides an RDF store, query engine, server and embedded libraries. The
 category guides below describe current capabilities, configuration, usage and limits.
+The standard server includes local embeddings, OCR support and encrypted repositories.
+Models, OCR libraries and encrypted repository keys require runtime configuration.
 The [capability matrix](#capability-status) distinguishes complete, partially complete
 and planned work. The [roadmap](ROADMAP.md) gives the path to completing the remaining
 phases, and the [design specs](specs/README.md) explain their contracts and decisions.

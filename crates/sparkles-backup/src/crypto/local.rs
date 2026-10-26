@@ -260,7 +260,8 @@ pub(super) fn pause(
     let (entered, waiting) = tokio::sync::oneshot::channel();
     let (release, continuing) = std::sync::mpsc::channel();
     pauses().lock().unwrap().insert(
-        root.into(),
+        // The backend pins a canonical root, including Darwin's /private aliases.
+        std::fs::canonicalize(root).expect("canonical native test root"),
         Pause {
             entered,
             release: continuing,
@@ -305,7 +306,8 @@ fn pause_sync_inner(
     let (entered, waiting) = tokio::sync::oneshot::channel();
     let (release, continuing) = std::sync::mpsc::channel();
     sync_pauses().lock().unwrap().insert(
-        root.into(),
+        // The backend pins a canonical root, including Darwin's /private aliases.
+        std::fs::canonicalize(root).expect("canonical native test root"),
         Pause {
             entered,
             release: continuing,

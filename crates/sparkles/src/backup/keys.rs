@@ -110,7 +110,21 @@ fn read_private(
         std::fs::canonicalize(format!("/proc/self/fd/{}", file.as_raw_fd()))
             .map_err(|_| unavailable(label, "cannot validate opened key file"))?
     };
-    #[cfg(not(any(target_os = "linux", target_os = "android")))]
+    #[cfg(target_os = "macos")]
+    let opened = {
+        use std::os::{fd::AsRawFd, unix::ffi::OsStrExt};
+        let mut path = [0_u8; libc::PATH_MAX as usize];
+        // SAFETY: F_GETPATH writes a NUL-terminated path of at most PATH_MAX
+        // bytes for this still-open descriptor. Validate the result before use.
+        if unsafe { libc::fcntl(file.as_raw_fd(), libc::F_GETPATH, path.as_mut_ptr()) } == -1 {
+            return Err(unavailable(label, "cannot validate opened key file"));
+        }
+        let path = std::ffi::CStr::from_bytes_until_nul(&path)
+            .map_err(|_| unavailable(label, "cannot validate opened key file"))?;
+        std::fs::canonicalize(std::ffi::OsStr::from_bytes(path.to_bytes()))
+            .map_err(|_| unavailable(label, "cannot validate opened key file"))?
+    };
+    #[cfg(not(any(target_os = "linux", target_os = "android", target_os = "macos")))]
     let opened = canonical;
     // Offline CLI commands may not know every local catalog up front. Recognize
     // dataset/catalog ancestors in addition to the caller's explicit forbidden roots.
@@ -490,7 +504,11 @@ pub async fn resolve(
     ctl: &Ctl,
 ) -> Result<EncryptionOptions> {
     settings.validate()?;
-    if !cfg!(any(target_os = "linux", target_os = "android")) {
+    if !cfg!(any(
+        target_os = "linux",
+        target_os = "android",
+        target_os = "macos"
+    )) {
         bail!("protected repository key memory is unavailable on this platform");
     }
     let mut out = EncryptionOptions {
@@ -522,7 +540,7 @@ pub async fn resolve(
 #[cfg(all(
     test,
     feature = "backup-encryption",
-    any(target_os = "linux", target_os = "android")
+    any(target_os = "linux", target_os = "android", target_os = "macos")
 ))]
 mod tests {
     use super::super::config::KeyInput;

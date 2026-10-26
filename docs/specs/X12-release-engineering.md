@@ -187,14 +187,12 @@ binary runs on the same distributions as the wheels. The Debian bookworm image t
 distributions. The musl builds use the server's default `mimalloc` allocator, so musl's
 allocator does not slow them down.
 
-Every binary uses one feature set: the defaults of `sparkles-server`, `embed-local` and
-`backup-encryption`. Today the three image paths disagree. The `Dockerfile` adds
-`embed-local` only, `nix/package.nix` adds `embed-local` and, on Linux,
-`backup-encryption`, and a plain `cargo build` adds neither. §8's C19 dependency on
-sealed runtime secrets needs the default `backup` feature in published builds.
-Repository encryption keeps its separate `backup-encryption` feature and platform
-requirements. The `pdf-ocr`
-feature is in the `-ocr` image only, because it needs PDFium and ONNX Runtime at run time.
+Standard source builds and packages use the defaults of `sparkles-server`, including
+`embed-local`, `backup-encryption` and `pdf-ocr`. Repository encryption and model
+execution require runtime configuration. The `-ocr` image supplies PDFium and ONNX
+Runtime alongside that standard capability profile. C19 sealed runtime secrets use
+the default `backup` feature in published builds. macOS encrypted CLI operations
+prepare protected key memory by disabling process core dumps before resolving keys.
 
 The release profile keeps line tables (`debug = 1`), which the `Dockerfile` notes make
 up most of a 450 MB binary. Release binaries are stripped with `objcopy --strip-debug`

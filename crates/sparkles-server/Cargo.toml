@@ -134,7 +134,7 @@ sparkles-office = { workspace = true, features = ["fixtures"] }
 sparkles-client = { workspace = true, features = ["blocking"] }
 
 [features]
-default = ["reasoning", "shacl", "shex", "mimalloc", "text", "text-cjk-dict", "geo", "geo-epsg", "otel", "auth", "mcp", "memory", "backup", "fmt", "tls", "graphql", "pdf", "office", "mapping-sqlite", "mapping-parquet"]
+default = ["reasoning", "shacl", "shex", "mimalloc", "text", "text-cjk-dict", "geo", "geo-epsg", "otel", "auth", "mcp", "memory", "backup", "backup-encryption", "fmt", "tls", "graphql", "pdf", "pdf-ocr", "office", "embed-local", "mapping-sqlite", "mapping-parquet"]
 # SQLite connections of R2RML and RML mappings (`sparkles map`, `--connection`, the
 # `connections` settings kind); bundles SQLite's C sources
 mapping-sqlite = ["sparkles/mapping-sqlite"]
@@ -185,13 +185,14 @@ pdf = ["mcp", "dep:pdf-inspector"]
 office = ["mcp", "dep:sparkles-office"]
 # OCR of scanned PDF pages: PDFium and ONNX Runtime loaded at run time from paths the
 # operator gives, with the PP-OCR models from a directory (`serve --pdf-ocr-models`); never
-# downloads a model. Off by default and not part of release builds. pdf-inspector's OCR
+# downloads a model. Included by default; runtime libraries and models are supplied
+# separately by the operator. pdf-inspector's OCR
 # fusion compiles only under its `ocr` feature, which also builds its model downloader;
 # conversion sets the offline policy, so the downloader is never used
 pdf-ocr = ["pdf", "pdf-inspector/ocr"]
 # local embedding models run in the process with Candle (spec F12): the `local` provider
-# kind of the model configuration. Off by default; without it an index that uses a local
-# provider fails with a clear error, and `sparkles models` still manages the store
+# kind of the model configuration. Included by default; no model is loaded without
+# a configured local provider. Custom builds can omit the runtime.
 embed-local = ["dep:sparkles-embed"]
 # backup repositories on a filesystem or S3: `/$/repositories`, `/$/backups/{ds}`,
 # `/$/backup-policies`, `sparkles repo …`, `sparkles backup create|list|restore|…`
