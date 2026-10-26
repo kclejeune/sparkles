@@ -208,30 +208,50 @@ pub(super) fn validate_pointer(pointer: &str, control: &Control) -> Result<()> {
     Ok(())
 }
 
+struct PointerTokens<'a> {
+    tokens: Vec<Cow<'a, str>>,
+    charged: usize,
+}
+
 fn pointer_tokens<'a>(
     pointer: &'a str,
     memory: &mut Memory,
     control: &Control,
-) -> Result<Vec<Cow<'a, str>>> {
-    let mut tokens = Vec::new();
+) -> Result<PointerTokens<'a>> {
+    let mut tokens: Vec<Cow<'a, str>> = Vec::new();
+    let mut charged = 0;
     if let Some(pointer) = pointer.strip_prefix('/') {
         for raw in pointer.split('/') {
             control.check()?;
-            // Covers geometric Vec growth, and a decoded token when needed.
-            memory.add(
-                std::mem::size_of::<Cow<'_, str>>()
-                    .saturating_mul(2)
-                    .saturating_add(raw.len().saturating_mul(2)),
-            )?;
+            if tokens.len() == tokens.capacity() {
+                let old = tokens.capacity();
+                let capacity = old.saturating_mul(2).max(4);
+                // Charge the new buffer while the old buffer is still alive. An
+                // explicit reserve avoids an unaccounted implicit Vec growth.
+                let bytes = capacity.saturating_mul(std::mem::size_of::<Cow<'_, str>>());
+                memory.add(bytes)?;
+                tokens.reserve_exact(capacity - old);
+                let old_bytes = old.saturating_mul(std::mem::size_of::<Cow<'_, str>>());
+                memory.remove(old_bytes);
+                charged += bytes - old_bytes;
+            }
             let token = if raw.contains('~') {
-                Cow::Owned(raw.replace("~1", "/").replace("~0", "~"))
+                // Both replace results can coexist. Keep only the retained key's
+                // actual capacity charged after the temporary decode buffers drop.
+                let scratch = raw.len().saturating_mul(2);
+                memory.add(scratch)?;
+                let decoded = raw.replace("~1", "/").replace("~0", "~");
+                memory.remove(scratch);
+                memory.add(decoded.capacity())?;
+                charged += decoded.capacity();
+                Cow::Owned(decoded)
             } else {
                 Cow::Borrowed(raw)
             };
             tokens.push(token);
         }
     }
-    Ok(tokens)
+    Ok(PointerTokens { tokens, charged })
 }
 
 fn input_bound(len: usize) -> Result<()> {
@@ -251,6 +271,23 @@ struct PointerNode<'a> {
     outputs: Vec<usize>,
 }
 
+#[cfg(test)]
+std::thread_local! {
+    static TRIE_INSERTIONS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    static CANCEL_TRIE_AT: std::cell::Cell<Option<usize>> = const { std::cell::Cell::new(None) };
+}
+
+#[cfg(test)]
+fn trie_insertion_step(control: &Control) {
+    let steps = TRIE_INSERTIONS.with(|steps| {
+        steps.set(steps.get() + 1);
+        steps.get()
+    });
+    if CANCEL_TRIE_AT.with(|target| target.get() == Some(steps)) {
+        control.cancel.cancel();
+    }
+}
+
 fn pointer_trie<'a>(
     pointers: &[&'a str],
     memory: &mut Memory,
@@ -261,21 +298,35 @@ fn pointer_trie<'a>(
     for (output, pointer) in pointers.iter().enumerate() {
         validate_pointer(pointer, control)?;
         let mut node = 0;
-        for token in pointer_tokens(pointer, memory, control)? {
+        let PointerTokens { tokens, charged } = pointer_tokens(pointer, memory, control)?;
+        let mut retained_keys = 0;
+        for token in tokens {
+            #[cfg(test)]
+            trie_insertion_step(control);
+            control.check()?;
             if let Some(child) = nodes[node].children.get(token.as_ref()) {
                 node = *child;
             } else {
                 memory.add(
                     std::mem::size_of::<PointerNode<'_>>()
                         .saturating_mul(4)
-                        .saturating_add(96),
+                        .saturating_add(1024),
                 )?;
+                // A sparse BTreeMap allocates a complete leaf, not one small
+                // entry. The per-edge allowance covers a leaf and split overhead;
+                // prior edges retain their own allowance as the map grows.
+                if let Cow::Owned(key) = &token {
+                    retained_keys += key.capacity();
+                }
                 let child = nodes.len();
                 nodes.push(PointerNode::default());
                 nodes[node].children.insert(token, child);
                 node = child;
             }
         }
+        // The IntoIter and discarded duplicate keys are now gone. Only decoded
+        // keys transferred into newly created edges remain part of the trie.
+        memory.remove(charged - retained_keys);
         memory.add(std::mem::size_of::<usize>().saturating_mul(4))?;
         nodes[node].outputs.push(output);
     }
@@ -646,6 +697,63 @@ mod tests {
                 .unwrap()
                 .is_empty()
         );
+    }
+
+    #[test]
+    fn repeated_deep_pointers_release_temporary_tokens_and_keep_the_shared_trie() {
+        let source = format!("{}0{}", "{\"\":".repeat(1024), "}".repeat(1024));
+        let pointer = "/".repeat(1024);
+        let pointers = vec![pointer.as_str(); 2000];
+        let values = select_json_lexical_utf8_batch(&source, &pointers, &Control::none()).unwrap();
+        assert_eq!(values.len(), 2000);
+        assert!(values.iter().all(|value| value.utf8 == "0"));
+        let mut once = Memory::new(0).unwrap();
+        let one = pointer_trie(&[&pointer], &mut once, &Control::none()).unwrap();
+        let mut repeated = Memory::new(0).unwrap();
+        let many = pointer_trie(&pointers, &mut repeated, &Control::none()).unwrap();
+        assert_eq!(one.len(), 1025);
+        assert_eq!(many.len(), one.len());
+        assert!(repeated.0 < once.0 + pointers.len() * 64);
+        let source = format!("{}0{}", "{\"é/x~\":".repeat(1024), "}".repeat(1024));
+        let pointer = "/é~1x~0".repeat(1024);
+        let values =
+            select_json_lexical_utf8_batch(&source, &vec![pointer.as_str(); 200], &Control::none())
+                .unwrap();
+        assert_eq!(values.len(), 200);
+        assert!(values.iter().all(|value| value.utf8 == "0"));
+    }
+
+    #[test]
+    fn unique_and_duplicate_escaped_unicode_tokens_keep_exact_owned_keys() {
+        let source = format!(
+            "{{{}}}",
+            (0..64)
+                .map(|index| format!("\"é/{index}~\":{index}"))
+                .collect::<Vec<_>>()
+                .join(",")
+        );
+        let pointers: Vec<_> = (0..128)
+            .map(|index| format!("/é~1{}~0", index % 64))
+            .collect();
+        let references: Vec<_> = pointers.iter().map(String::as_str).collect();
+        let values =
+            select_json_lexical_utf8_batch(&source, &references, &Control::none()).unwrap();
+        for (index, value) in values.iter().enumerate() {
+            assert_eq!(value.utf8, (index % 64).to_string());
+        }
+    }
+
+    #[test]
+    fn cancellation_during_trie_insertion_stops_at_the_next_edge() {
+        let pointer = "/".repeat(120_000);
+        let control = Control::none();
+        TRIE_INSERTIONS.with(|steps| steps.set(0));
+        CANCEL_TRIE_AT.with(|target| target.set(Some(256)));
+        let result = select_json_lexical_utf8("{}", &pointer, &control);
+        CANCEL_TRIE_AT.with(|target| target.set(None));
+        let steps = TRIE_INSERTIONS.with(std::cell::Cell::get);
+        assert!(matches!(result, Err(Error::Cancelled)));
+        assert_eq!(steps, 256);
     }
 
     #[test]

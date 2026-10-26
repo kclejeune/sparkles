@@ -15,31 +15,66 @@ use sparkles_core::{
 use std::{
     alloc::{GlobalAlloc, Layout, System},
     collections::BTreeMap,
-    sync::atomic::{AtomicBool, AtomicUsize, Ordering},
+    sync::{
+        Mutex,
+        atomic::{AtomicBool, AtomicUsize, Ordering},
+    },
 };
 
 struct Counting;
 static ENABLED: AtomicBool = AtomicBool::new(false);
 static LARGEST: AtomicUsize = AtomicUsize::new(0);
+static LIVE: AtomicUsize = AtomicUsize::new(0);
+static PEAK: AtomicUsize = AtomicUsize::new(0);
+static MEASURE_LOCK: Mutex<()> = Mutex::new(());
 
 // SAFETY: every allocation, reallocation and deallocation is delegated unchanged
 // to System. The counters only observe sizes and never inspect or change a pointer.
 unsafe impl GlobalAlloc for Counting {
     unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
-        if ENABLED.load(Ordering::Relaxed) {
-            LARGEST.fetch_max(layout.size(), Ordering::Relaxed);
+        let pointer = unsafe { System.alloc(layout) };
+        if !pointer.is_null() {
+            let live = LIVE.fetch_add(layout.size(), Ordering::SeqCst) + layout.size();
+            if ENABLED.load(Ordering::SeqCst) {
+                LARGEST.fetch_max(layout.size(), Ordering::SeqCst);
+                PEAK.fetch_max(live, Ordering::SeqCst);
+            }
         }
-        unsafe { System.alloc(layout) }
+        pointer
     }
     unsafe fn dealloc(&self, pointer: *mut u8, layout: Layout) {
-        unsafe { System.dealloc(pointer, layout) }
+        unsafe { System.dealloc(pointer, layout) };
+        LIVE.fetch_sub(layout.size(), Ordering::SeqCst);
     }
     unsafe fn realloc(&self, pointer: *mut u8, layout: Layout, size: usize) -> *mut u8 {
-        if ENABLED.load(Ordering::Relaxed) {
-            LARGEST.fetch_max(size, Ordering::Relaxed);
+        let pointer = unsafe { System.realloc(pointer, layout, size) };
+        if !pointer.is_null() {
+            let live = if size >= layout.size() {
+                LIVE.fetch_add(size - layout.size(), Ordering::SeqCst) + size - layout.size()
+            } else {
+                LIVE.fetch_sub(layout.size() - size, Ordering::SeqCst) - (layout.size() - size)
+            };
+            if ENABLED.load(Ordering::SeqCst) {
+                LARGEST.fetch_max(size, Ordering::SeqCst);
+                PEAK.fetch_max(live, Ordering::SeqCst);
+            }
         }
-        unsafe { System.realloc(pointer, layout, size) }
+        pointer
     }
+}
+
+fn measure<T>(operation: impl FnOnce() -> T) -> (T, usize, usize) {
+    let base = LIVE.load(Ordering::SeqCst);
+    LARGEST.store(0, Ordering::SeqCst);
+    PEAK.store(base, Ordering::SeqCst);
+    ENABLED.store(true, Ordering::SeqCst);
+    let result = operation();
+    ENABLED.store(false, Ordering::SeqCst);
+    (
+        result,
+        LARGEST.load(Ordering::SeqCst),
+        PEAK.load(Ordering::SeqCst).saturating_sub(base),
+    )
 }
 
 #[global_allocator]
@@ -129,6 +164,7 @@ fn input(kind: &str) -> EvidenceInput {
 
 #[test]
 fn oversized_native_literal_fields_are_refused_without_copying_the_payload() {
+    let _measure = MEASURE_LOCK.lock().unwrap();
     let mut observations = Vec::new();
     for kind in [
         "publishedAt",
@@ -139,11 +175,7 @@ fn oversized_native_literal_fields_are_refused_without_copying_the_payload() {
         // Allocate the caller's input and any runtime initialization before measuring.
         let input = input(kind);
         let control = Control::none();
-        LARGEST.store(0, Ordering::Relaxed);
-        ENABLED.store(true, Ordering::Relaxed);
-        let result = prepare_input(&input, &control);
-        ENABLED.store(false, Ordering::Relaxed);
-        let largest = LARGEST.load(Ordering::Relaxed);
+        let (result, largest, _) = measure(|| prepare_input(&input, &control));
         let budget = matches!(result, Err(Error::BudgetExceeded(Budget {
             kind: BudgetKind::DecompressedBytes,
             limit,
@@ -159,4 +191,23 @@ fn oversized_native_literal_fields_are_refused_without_copying_the_payload() {
             .iter()
             .all(|(_, largest, _)| *largest < 1024 * 1024)
     );
+}
+
+#[test]
+fn sparse_pointer_refuses_before_actual_working_memory_exceeds_64_mib() {
+    let _measure = MEASURE_LOCK.lock().unwrap();
+    let pointer = "/".repeat(180_000);
+    let control = Control::none();
+    let (result, largest, peak) =
+        measure(|| sparkles_core::evidence::select_json_lexical_utf8("{}", &pointer, &control));
+    let memory_budget = matches!(
+        result,
+        Err(Error::BudgetExceeded(Budget {
+            kind: BudgetKind::Memory,
+            ..
+        }))
+    );
+    eprintln!("sparse pointer allocation: largest={largest} peak={peak} budget={memory_budget}");
+    assert!(memory_budget);
+    assert!(peak.saturating_add(pointer.len() + 2) <= 64 * 1024 * 1024);
 }
