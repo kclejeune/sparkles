@@ -336,7 +336,7 @@ impl Store {
         let limit = ReadLimit {
             options,
             memory: Some(max_memory_bytes),
-            held: 0,
+            held: crate::history::READ_METADATA_BYTES,
         };
         limit.check(0)?;
         if self.owner_dataset_id() != store.owner_dataset_id() {
@@ -354,31 +354,39 @@ impl Store {
         options: &HistoryOptions,
         memory: u64,
     ) -> Result<(Arc<Snapshot>, Resolved, uuid::Uuid)> {
-        match store.snapshot_at_limited(at, options, memory) {
-            Ok((snapshot, resolved)) => Ok((snapshot, resolved, store.branch_id())),
-            Err(error) => match crate::branch::inherited_commit(&error) {
-                Some(commit) => {
-                    // Follow only the branch's recorded origin. Never search by sequence.
-                    let limit = ReadLimit {
-                        options,
-                        memory: Some(memory),
-                        held: 0,
+        let limit = ReadLimit {
+            options,
+            memory: Some(memory),
+            held: crate::history::READ_METADATA_BYTES,
+        };
+        let mut selected = branching::BranchStore::Main(store);
+        // Only time selectors need their original form after following ancestry.
+        // Other inherited selectors become the exact recorded commit identity.
+        let mut inherited = None;
+        for _ in 0..1024 {
+            limit.check(0)?;
+            let requested = inherited.as_ref().unwrap_or(at);
+            match selected.snapshot_at_limited(requested, options, memory) {
+                Ok((snapshot, resolved)) => return Ok((snapshot, resolved, selected.branch_id())),
+                Err(error) => {
+                    let origin = crate::branch::inherited_commit(&error);
+                    let Some(commit) = origin else {
+                        return Err(error);
                     };
+                    // Do not retain one error/message allocation per ancestor or
+                    // grow the Rust call stack while following inherited reads.
+                    drop(error);
                     let owner = self.owned_set()?.normalize_limited(commit, &limit)?;
-                    let upstream = self.retained_branch_by_id_limited(owner.branch_id, &limit)?;
-                    match at {
-                        At::Time(_) => self.snapshot_pinned_limited(&upstream, at, options, memory),
-                        _ => self.snapshot_pinned_limited(
-                            &upstream,
-                            &At::Commit(commit.seq),
-                            options,
-                            memory,
-                        ),
+                    selected = self.retained_branch_by_id_limited(owner.branch_id, &limit)?;
+                    if !matches!(at, At::Time(_)) {
+                        inherited = Some(At::Commit(commit.seq));
                     }
                 }
-                None => Err(error),
-            },
+            }
         }
+        Err(Error::invalid(
+            "inherited history has no acyclic retained origin",
+        ))
     }
 }
 
@@ -590,16 +598,19 @@ mod tests {
         let read = store.clone();
         let started = Arc::new(std::sync::Barrier::new(2));
         let waiting = started.clone();
+        let (send, receive) = std::sync::mpsc::channel();
         let task = std::thread::spawn(move || {
             waiting.wait();
-            read.snapshot_at_limited(&At::Head, &options, 1 << 20)
+            send.send(read.snapshot_at_limited(&At::Head, &options, 1 << 20))
+                .unwrap();
         });
         started.wait();
         std::thread::sleep(Duration::from_millis(30));
         cancel.store(true, Ordering::Relaxed);
-        let result = task.join().unwrap();
+        let result = receive.recv_timeout(Duration::from_secs(1));
         drop(held);
-        assert!(matches!(result, Err(Error::Cancelled)));
+        task.join().unwrap();
+        assert!(matches!(result, Ok(Err(Error::Cancelled))));
     }
 
     #[test]
@@ -620,18 +631,21 @@ mod tests {
         .unwrap();
         let held = store.history.as_ref().unwrap().lock();
         let read = store.clone();
+        let (send, receive) = std::sync::mpsc::channel();
         let task = std::thread::spawn(move || {
-            read.snapshot_at_limited(
+            send.send(read.snapshot_at_limited(
                 &At::Commit(1),
                 &HistoryOptions {
                     cancel: None,
                     deadline: Some(Instant::now() + Duration::from_millis(40)),
                 },
                 1 << 20,
-            )
+            ))
+            .unwrap();
         });
-        let result = task.join().unwrap();
+        let result = receive.recv_timeout(Duration::from_secs(1));
         drop(held);
-        assert!(matches!(result, Err(Error::Timeout)));
+        task.join().unwrap();
+        assert!(matches!(result, Ok(Err(Error::Timeout))));
     }
 }

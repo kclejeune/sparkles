@@ -339,6 +339,9 @@ pub struct HistoryOptions {
     pub deadline: Option<std::time::Instant>,
 }
 
+/// Fixed selector/result/error metadata, including bounded snapshot names.
+pub(crate) const READ_METADATA_BYTES: u64 = 1024;
+
 /// One read's preparation limit. This does not resize the shared history cache.
 #[derive(Clone, Copy)]
 pub(crate) struct ReadLimit<'a> {

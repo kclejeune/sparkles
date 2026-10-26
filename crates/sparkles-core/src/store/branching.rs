@@ -171,6 +171,20 @@ impl TableFile {
             .or_else(|| self.retired.iter().find(|e| e.id == id))
     }
 
+    fn any_by_id_limited(
+        &self,
+        id: uuid::Uuid,
+        limit: &crate::history::ReadLimit<'_>,
+    ) -> Result<Option<&Entry>> {
+        for entry in self.branches.iter().chain(&self.retired) {
+            limit.check(0)?;
+            if entry.id == id {
+                return Ok(Some(entry));
+            }
+        }
+        Ok(None)
+    }
+
     /// The listed and the retired branches.
     fn all(&self) -> impl Iterator<Item = &Entry> {
         self.branches.iter().chain(self.retired.iter())
@@ -915,7 +929,23 @@ impl BranchSet {
         let table = limit.lock(&self.table)?;
         for _ in 0..1024 {
             limit.check(0)?;
-            match self.start_of(&table, commit.branch_id) {
+            let mut from: Option<CommitRef> = if commit.branch_id == self.dataset_id {
+                None
+            } else {
+                table
+                    .any_by_id_limited(commit.branch_id, limit)?
+                    .map(|entry| entry.from.into())
+            };
+            if from.is_none() && commit.branch_id != self.dataset_id {
+                for deleted in &table.deleted {
+                    limit.check(0)?;
+                    if deleted.id == commit.branch_id {
+                        from = Some(deleted.from.into());
+                        break;
+                    }
+                }
+            }
+            match from {
                 Some(from) if commit.seq <= from.seq => commit.branch_id = from.branch_id,
                 _ => break,
             }
@@ -1371,7 +1401,11 @@ impl Store {
             return Ok(BranchStore::Main(self));
         }
         let set = self.owned_set()?;
-        if limit.lock(&set.table)?.any_by_id(id).is_none() {
+        if limit
+            .lock(&set.table)?
+            .any_by_id_limited(id, limit)?
+            .is_none()
+        {
             return Err(BranchError::error(
                 BranchErrorKind::Gone,
                 "merge-base-gone",

@@ -111,3 +111,23 @@ fn cold_replay_refuses_transaction_growth_before_allocating_the_transaction() {
     assert_eq!(resolved.commit.seq, 1);
     assert_eq!(exact.commit, 1);
 }
+
+#[test]
+fn selector_metadata_is_refused_before_clone() {
+    let _lock = MEASURE_LOCK.lock().unwrap();
+    let store = Store::in_memory(StoreOptions::default());
+    let name = "a".repeat(64);
+    store.create_snapshot(&name, &At::Head, None).unwrap();
+    let selector = At::Snapshot(name);
+    let (result, largest, peak) =
+        measure(|| store.snapshot_at_limited(&selector, &HistoryOptions::default(), 16));
+    assert!(
+        matches!(result, Err(Error::BudgetExceeded(_))),
+        "selector name copied before metadata admission"
+    );
+    eprintln!("selector metadata refusal: largest={largest}, peak={peak}, cap=16");
+    assert!(
+        largest <= 16 && peak <= 16,
+        "selector metadata copied before refusal: {largest}/{peak}"
+    );
+}

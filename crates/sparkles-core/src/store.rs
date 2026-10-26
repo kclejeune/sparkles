@@ -2484,7 +2484,11 @@ impl Store {
         let limit = crate::history::ReadLimit {
             options: o,
             memory,
-            held: 0,
+            held: if memory.is_some() {
+                crate::history::READ_METADATA_BYTES
+            } else {
+                0
+            },
         };
         limit.check(0)?;
         let r = if memory.is_some() {
