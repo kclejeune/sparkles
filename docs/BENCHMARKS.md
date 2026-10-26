@@ -66,7 +66,7 @@ partially complete and planned implementation scope.
 | Query, load and write comparisons | Measured with partial coverage | Published tables cover their named data, engines and timing contracts. Larger suites, sustained workloads and broader hardware remain open. |
 | Bindings and model-assisted workflows | Partial coverage | The listed APIs, models and question sets have measurements. Selected API controls and internal A/B runs do not replace a complete peer-suite refresh. |
 | Spatial and query-time reasoning comparisons | Unmeasured against peers | Conformance and internal measurements do not establish comparative performance. |
-| Evidence and maintained analysis | Unmeasured | C25 supplies RDF profile resources. Its runtime operations and C26, C27, F22 and C22b remain planned, with no performance claim. |
+| Evidence and maintained analysis | Unmeasured | C25 and C27 supply RDF profile resources and queries. Their managed runtime operations and C26, F22 and C22b remain planned, with no performance claim. |
 
 ## Reading the comparisons
 

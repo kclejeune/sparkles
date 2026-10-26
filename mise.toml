@@ -57,6 +57,7 @@ rust = [
   "crates/*/benches/**",
   "crates/*/diagnostics/**",
   "crates/*/rules/**",
+  "crates/*/resources/**",
   "crates/*/vocab/**",
   "crates/*/fuzz/**",
   "crates/*/python/**",

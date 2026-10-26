@@ -86,9 +86,9 @@ on top of the second:
 * RDF and SPARQL support passes the documented conformance suites.
 * Reasoning, incremental views, GeoSPARQL, GraphRAG, bindings and the web UI are
   available, with further phases planned.
-* Evidence-profile vocabulary, shapes and query resources are available. Authenticated
-  evidence writes and review-controlled projections remain planned.
-* Durable jobs, maintained analysis, valid-time queries and ChatGPT-plan model access
+* Evidence and valid-time vocabularies, shapes and query resources are available.
+  Authenticated evidence writes and review-controlled projections remain planned.
+* Durable jobs, maintained analysis, temporal runtime helpers and ChatGPT-plan model access
   remain planned.
 
 The [feature matrix](docs/FEATURES.md#capability-status) gives the complete status and
