@@ -442,7 +442,7 @@ impl Preparation<'_> {
         match time {
             None => Ok(None),
             Some(time) => {
-                self.frame.term(&time.clone().into())?;
+                self.frame.literal(time)?;
                 Ok(Some(normalize_time(time)?))
             }
         }
@@ -522,7 +522,7 @@ impl Preparation<'_> {
         if let Some(value) = value {
             value.validate(extraction)?;
             self.node(&value.scale)?;
-            self.frame.term(&value.value.clone().into())?;
+            self.frame.literal(&value.value)?;
             self.node(&value.evaluator)?;
             self.number(u64::from(value.method.is_some()))?;
             if let Some(method) = &value.method {
@@ -569,7 +569,7 @@ impl Preparation<'_> {
         self.frame.term(&assessment.conclusion)?;
         self.method(&assessment.method)?;
         self.digest(assessment.configuration_digest)?;
-        self.frame.term(&assessment.evaluated_at.clone().into())?;
+        self.frame.literal(&assessment.evaluated_at)?;
         self.node(&assessment.attributed_evaluator)?;
         self.confidence(assessment.confidence.as_ref(), false)?;
         self.scope(&assessment.scope)

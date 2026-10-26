@@ -127,27 +127,30 @@ impl<'a> FrameHash<'a> {
                     .map_err(|_| Error::invalid("invalid scoped blank-node label"))?;
                 self.field(2, node.as_str().as_bytes())
             }
-            Term::Literal(value) => {
-                oxiri::Iri::parse(value.datatype().as_str())
-                    .map_err(|_| Error::invalid("invalid literal datatype IRI"))?;
-                if let Some(language) = value.language() {
-                    oxrdf::Literal::new_language_tagged_literal("", language)
-                        .map_err(|_| Error::invalid("invalid literal language"))?;
-                }
-                self.field(3, value.value().as_bytes())?;
-                self.field(4, value.datatype().as_str().as_bytes())?;
-                self.field(5, value.language().unwrap_or("").as_bytes())?;
-                self.field(
-                    6,
-                    &[match value.direction() {
-                        None => 0,
-                        Some(oxrdf::BaseDirection::Ltr) => 1,
-                        Some(oxrdf::BaseDirection::Rtl) => 2,
-                    }],
-                )
-            }
+            Term::Literal(value) => self.literal(value),
             Term::Triple(triple) => self.triple_inner(triple),
         }
+    }
+
+    pub(super) fn literal(&mut self, value: &oxrdf::Literal) -> Result<()> {
+        self.control.check()?;
+        oxiri::Iri::parse(value.datatype().as_str())
+            .map_err(|_| Error::invalid("invalid literal datatype IRI"))?;
+        if let Some(language) = value.language() {
+            oxrdf::Literal::new_language_tagged_literal("", language)
+                .map_err(|_| Error::invalid("invalid literal language"))?;
+        }
+        self.field(3, value.value().as_bytes())?;
+        self.field(4, value.datatype().as_str().as_bytes())?;
+        self.field(5, value.language().unwrap_or("").as_bytes())?;
+        self.field(
+            6,
+            &[match value.direction() {
+                None => 0,
+                Some(oxrdf::BaseDirection::Ltr) => 1,
+                Some(oxrdf::BaseDirection::Rtl) => 2,
+            }],
+        )
     }
 
     pub(super) fn triple(&mut self, triple: &oxrdf::Triple) -> Result<()> {
@@ -300,6 +303,41 @@ mod tests {
             borrowed.finish().unwrap().to_string(),
             "sha256:9dd0df9616bb436a01f5d84b48f74fcd264a5ee58da365bcd2f5c42aa9b471cd"
         );
+    }
+
+    #[test]
+    fn borrowed_literal_frames_preserve_independent_lexical_datatype_language_and_direction_goldens()
+     {
+        let cases = [
+            (
+                Literal::new_simple_literal("x"),
+                "0d9141e6312c1f3601297b5c28e59580a7e4cfac25a05c08e68dfa382deccc3a",
+            ),
+            (
+                Literal::new_typed_literal("0.75000000000000000001", xsd::DECIMAL),
+                "5c47a36024eec23e39aeb0ca376618c7302fda180925f0a33c43f0bea8d8b939",
+            ),
+            (
+                Literal::new_language_tagged_literal("café", "FR").unwrap(),
+                "d3c0430b8c6f4003ea975d30d586074b913ddb620c94f209941ad5ffe19a060f",
+            ),
+            (
+                Literal::new_directional_language_tagged_literal("تنبيه", "ar", BaseDirection::Rtl)
+                    .unwrap(),
+                "3a7e17ee535635a68ffa974c970ccafc220b5674263002853ec9c9d14a22ffcf",
+            ),
+        ];
+        for (literal, golden) in cases {
+            let control = Control::none();
+            let mut frame = FrameHash::new(b"sparkles-evidence-term-v1", &control).unwrap();
+            frame.literal(&literal).unwrap();
+            let borrowed = frame.finish().unwrap();
+            assert_eq!(borrowed.to_string(), format!("sha256:{golden}"));
+            assert_eq!(
+                borrowed,
+                canonical_term_digest(&literal.into(), &control).unwrap()
+            );
+        }
     }
 
     #[test]
