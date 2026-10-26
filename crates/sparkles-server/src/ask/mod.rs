@@ -20,6 +20,7 @@
 
 mod cli;
 pub mod complexity;
+mod entity_evidence;
 mod global;
 mod grounding;
 pub mod http;
@@ -865,22 +866,40 @@ impl Asking<'_, '_> {
         let mut entities = Vec::new();
         if !mentions.is_empty() {
             let list: Vec<Value> = mentions.iter().map(|m| json!({ "text": m })).collect();
-            if let Ok(v) = self.ground_tool(
-                profile::Stage::Linker,
-                "link_entities",
-                json!({"mentions": list, "k": candidates_k}),
-                true,
-            ) {
+            if let Ok(v) = self
+                .ground_tool(
+                    profile::Stage::Linker,
+                    "link_entities",
+                    json!({"mentions": list, "k": candidates_k, "evidence": true}),
+                    true,
+                )
+                .or_else(|error| {
+                    if error.code == "budget-result-bytes" {
+                        self.ground_tool(
+                            profile::Stage::Linker,
+                            "link_entities",
+                            json!({"mentions": list, "k": candidates_k}),
+                            true,
+                        )
+                    } else {
+                        Err(error)
+                    }
+                })
+            {
                 let ms = v["mentions"].as_array().cloned().unwrap_or_default();
                 let mut lines = String::new();
                 for m in &ms {
                     let text = m["text"].as_str().unwrap_or("");
                     let verdict = m["verdict"].as_str().unwrap_or("none");
                     let mut cands = m["candidates"].as_array().cloned().unwrap_or_default();
+                    for candidate in &mut cands {
+                        entity_evidence::restore_identity(candidate);
+                    }
                     if verdict == "ambiguous"
-                        && let Some(index) = grounding::preferred_display_candidate(
+                        && let Some(index) = entity_evidence::preferred_display_candidate(
                             text,
                             &self.o.question,
+                            &m["evidence"],
                             &cands,
                             &v["prefixes"],
                         )

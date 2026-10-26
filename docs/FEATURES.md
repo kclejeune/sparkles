@@ -116,8 +116,8 @@ Connect agents through [MCP](ai/README.md#mcp-server), turn
 [cited memory](ai/README.md#agent-memory). Review
 [document ingestion](ai/README.md#document-ingestion) and build
 [GraphRAG community reports](ai/README.md#community-reports-graphrag).
-MCP entity linking can expose bounded, versioned candidate evidence without changing
-its advisory verdicts or Ask's required clarification.
+MCP entity linking exposes bounded, versioned candidate evidence. Ask uses it for full
+choice identities and conservative ordering while retaining required clarification.
 
 [Ask stage diagnostics](ai/README.md#ask-stage-diagnostics) separate grounding, tool
 and execution timings while the remaining accuracy and latency work stays open.
