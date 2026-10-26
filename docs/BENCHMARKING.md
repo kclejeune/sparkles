@@ -165,13 +165,13 @@ seconds longer, 2m37s instead of 2m02s on atlas with six jobs.
 (Fuseki), QLever, Fluree and Oxigraph over HTTP. The mise task's `--mode` flag chooses
 what it measures. The script itself takes the size and the work directory as positional
 arguments and reads the mode from the `MODE` variable, as in
-`MODE=updates scripts/bench.sh 100000 target/bench`.
+`MODE=updates scripts/bench.sh 100000 .artifacts/bench`.
 
 ```sh
-mise run bench 100000 target/bench                   # load, queries and memory
-mise run bench 100000 target/bench --mode updates    # the queries after 5,000 commits
-mise run bench 100000 target/bench --mode mixed      # readers and a writer at once
-mise run bench 100000 target/bench --mode cold       # a restart with a cold page cache per query
+mise run bench 100000 .artifacts/bench                   # load, queries and memory
+mise run bench 100000 .artifacts/bench --mode updates    # the queries after 5,000 commits
+mise run bench 100000 .artifacts/bench --mode mixed      # readers and a writer at once
+mise run bench 100000 .artifacts/bench --mode cold       # a restart with a cold page cache per query
 ```
 
 The default mode loads every engine, checks the answers and times each query, a
@@ -283,7 +283,7 @@ mise run bench:billion full       # every file: 1.24B triples
 ```
 
 The first run downloads 12.7 GB, resumable and checksum-verified, into
-`target/bench-billion` (`--workdir`) and recompresses it as N-Triples with zstd, which
+`.artifacts/bench-billion` (`--workdir`) and recompresses it as N-Triples with zstd, which
 takes 16 GB more and keeps no uncompressed copies. The release's `.ttl` files are
 N-Triples except for 96,021 lines of `images` with a `\n` escape in an IRI, which no
 N-Triples parser takes. They are dropped, so every engine loads the same triples. Some
@@ -330,7 +330,7 @@ one triple there and two in Sparkles and QLever, 3 triples at `50m`. `count-all`
 engines of `scripts/bench.sh` on WatDiv, the Waterloo SPARQL Diversity Test Suite. Its
 20 basic query templates cover linear, star, snowflake and complex query shapes. Scale
 factor 1 generates about 112,000 triples. The default of 100 generates 11.0 million,
-of which 10.9 million are distinct. The workdir defaults to `target/bench-watdiv`.
+of which 10.9 million are distinct. The workdir defaults to `.artifacts/bench-watdiv`.
 
 WatDiv's generator is a C++ program, and its source is not part of this repository.
 The script builds it with Nix from the WatDiv v0.6 release, which
@@ -755,8 +755,8 @@ and checksum are unchanged, and names the engine under `manifest.reused`.
 whose names contain `=`.
 
 ```sh
-scripts/bench-record.py build --suite synthetic --scale 10.5m --results target/bench/results \
-    --manifest target/bench/results/manifest.json --out docs/benchmarks/2026-11-01-synthetic-forge.json
+scripts/bench-record.py build --suite synthetic --scale 10.5m --results .artifacts/bench/results \
+    --manifest .artifacts/bench/results/manifest.json --out docs/benchmarks/2026-11-01-synthetic-forge.json
 scripts/bench-regressions.py compare docs/benchmarks/2026-11-01-bsbm-explore-forge.json \
     docs/benchmarks/2026-11-15-bsbm-explore-forge.json
 ```
@@ -805,7 +805,7 @@ off), which halves the variation of the timings. In each server process every qu
 server's execution time (`execMs` of `application/x-sparkles+json`) and curl's wall time.
 Before the first timed run, each binary's sorted TSV answer to every query is checksummed.
 
-The results go to `target/nsc-bench/<time>` (`--out`). `summary.md` has, for each
+The results go to `.artifacts/nsc-bench/<time>` (`--out`). `summary.md` has, for each
 query and for both measures, the medians of A and B, the ratio B/A, the ratio within
 each round and the spread of each binary between its server processes, followed by the
 geometric mean of the ratios. It also reports differing answers and both load times.

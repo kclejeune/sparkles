@@ -8,9 +8,9 @@
 # Every task runs to the end unless --fail-fast is given, and the summary lists every
 # failure with the tail of its log.
 #
-# While it runs, target/ci/summary.txt holds each task's state and time, so another
-# terminal or an agent can follow it with `cat target/ci/summary.txt`. Logs are in
-# target/ci/logs/<task>.log.
+# While it runs, .artifacts/ci/summary.txt holds each task's state and time, so another
+# terminal or an agent can follow it with `cat .artifacts/ci/summary.txt`. Logs are in
+# .artifacts/ci/logs/<task>.log.
 #
 # Checks whose inputs are unchanged since they last passed are skipped through mise's task
 # cache (see the task caching section of mise.toml).
@@ -64,10 +64,10 @@ main() {
   done
   [ ${#tasks[@]} -gt 0 ] || tasks=("${full[@]}")
 
-  out=target/ci
+  out=.artifacts/ci
   # One run per checkout: a second run would delete the first one's logs and state.
-  mkdir -p target
-  exec 9> target/ci.lock
+  mkdir -p .artifacts
+  exec 9> .artifacts/ci.lock
   if ! flock -n 9; then
     echo "another CI run is active in this checkout; see $out/summary.txt" >&2
     exit 1

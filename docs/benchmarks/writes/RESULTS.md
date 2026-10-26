@@ -42,7 +42,7 @@ issued 14 device cache flushes.
 
 The comparative suite's `updates` mode applies the same 5,000 single-triple INSERT and
 DELETE requests, one at a time, to every engine's store. No engine failed a commit.
-`mise run bench 100000 target/bench --mode updates` reproduces it.
+`mise run bench 100000 .artifacts/bench --mode updates` reproduces it.
 
 | Churn of 5,000 commits | sparkles | jena-fuseki | qlever | fluree | oxigraph |
 |---|---:|---:|---:|---:|---:|
@@ -330,7 +330,7 @@ effective changes per second, without synchronizing its WAL. The ranges overlap.
 
 Sixteen `star-join` readers run for 30 s with `oha` while one writer commits
 single-triple `INSERT DATA` requests of new literals as fast as it can. Every request
-opens a new connection. `mise run bench 100000 target/bench --mode mixed` reproduces it.
+opens a new connection. `mise run bench 100000 .artifacts/bench --mode mixed` reproduces it.
 
 | Mixed load | sparkles | jena-fuseki | qlever | fluree | oxigraph |
 |---|---:|---:|---:|---:|---:|

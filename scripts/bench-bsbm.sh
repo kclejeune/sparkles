@@ -59,7 +59,7 @@ fi
 
 SCALE_ARG=${1:-2000}
 ROOT=$(cd "$(dirname "$0")/.." && pwd)
-WORK=${2:-$ROOT/target/bench-bsbm}
+WORK=${2:-$ROOT/.artifacts/bench-bsbm}
 SPARKLES=${SPARKLES:-$ROOT/target/release/sparkles}
 ENGINES=${ENGINES-sparkles jena qlever fluree oxigraph}
 PORT_BASE=${PORT_BASE:-28300}

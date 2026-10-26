@@ -37,7 +37,7 @@ set -euo pipefail
 
 UNIV=${1:-1}
 ROOT=$(cd "$(dirname "$0")/.." && pwd)
-WORK=${2:-$ROOT/target/bench-lubm}
+WORK=${2:-$ROOT/.artifacts/bench-lubm}
 SPARKLES=${SPARKLES:-$ROOT/target/release/sparkles}
 ENGINES=${ENGINES-sparkles jena qlever fluree oxigraph}
 PORT_BASE=${PORT_BASE:-28300}

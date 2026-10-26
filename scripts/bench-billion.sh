@@ -32,7 +32,7 @@
 # * report: WORKDIR/SCALE/results/summary.md (scripts/bench-summary.py), in the format of
 #   scripts/bench.sh.
 #
-# Env: WORKDIR (default target/bench-billion), SCALE (default 50m), ENGINES (default
+# Env: WORKDIR (default .artifacts/bench-billion), SCALE (default 50m), ENGINES (default
 # "sparkles qlever"; also jena, oxigraph, fluree), RELOAD=1, RUNS (5), WARMUP (1), COLD (1),
 # CONC (16), NREQ (64), THROUGHPUT ("entity-facts-1 place-births-1"), QUERIES (a subset of
 # query names), ANSWERS_ONLY=1 (check answers and rebuild the summary, time nothing),
@@ -57,7 +57,7 @@ set -euo pipefail
 ROOT=$(cd "$(dirname "$0")/.." && pwd)
 HERE=$ROOT/scripts/bench-billion
 MANIFEST=$HERE/dbpedia-2022.12.tsv
-WORK=${WORKDIR:-$ROOT/target/bench-billion}
+WORK=${WORKDIR:-$ROOT/.artifacts/bench-billion}
 SCALE=${SCALE:-50m}
 ENGINES=${ENGINES:-sparkles qlever}
 RUNS=${RUNS:-5}

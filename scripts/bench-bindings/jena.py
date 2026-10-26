@@ -240,7 +240,7 @@ def main():
     ap = argparse.ArgumentParser(description=__doc__.split("\n\n")[0], formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--people", type=int, default=10000, help="dataset size in people (about 10.5 triples each)")
     ap.add_argument("--small-people", type=int, default=1000, help="people in the bulk-load file")
-    ap.add_argument("--workdir", type=Path, default=ROOT / "target" / "bench-jena")
+    ap.add_argument("--workdir", type=Path, default=ROOT / ".artifacts" / "bench-jena")
     ap.add_argument("--arm", action="append", default=[], help="LABEL=ENGINE[;JVM OPTION]..., repeatable; the first is compared with tdb2")
     ap.add_argument("--cases", default="", help="only these cases, comma-separated")
     ap.add_argument("--skip", default="", help="leave out these cases, comma-separated")

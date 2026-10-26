@@ -12,9 +12,32 @@ work, and each item links to its design spec in [docs/specs](docs/specs/README.m
 
 - `scripts/ci.sh` is the full local gate. The conformance suites run separately with
   `mise run test:w3c`, `test:shacl` and `test:shex`.
-- Build and test each worktree in its own target directory. A shared `CARGO_TARGET_DIR`
-  lets one build replace another's `target/debug/sparkles` in the middle of a test run.
-- Prefer targeted runs (`cargo test -p <crate> --test <name>`) while iterating, and run the
+- Use Mr. Boxington as the Cargo drop-in on local and remote build hosts. Run
+  `mbx build`, `mbx check`, `mbx test` or `mbx nextest run` directly. Run
+  `mise install mr-boxington` once on each host to install the pinned tool. Mise
+  tasks call `mbx` and wrap Cargo calls made by child scripts and build tools.
+  Check that `mbx --version` matches the version in `mise.toml` on each host.
+  Having `mbx` on PATH does not prove that plain Cargo uses it.
+- Keep Boxington's cache shared across worktrees on each host. Do not set a private
+  `MBX_CACHE_DIR` for each checkout or share one mutable Cargo target directory.
+  Each machine has its own shared cache. For cache experiments, use explicit isolated
+  controls and record wrapper, incremental and linker settings.
+- Let Boxington manage the default `target` directory of each worktree. Keep
+  `target.views` enabled and avoid `CARGO_TARGET_DIR` or `--target-dir` for ordinary
+  worktree builds, since these overrides opt out of management. `mise run cache:adopt`
+  adopts an idle checkout's existing target without deleting its contents. Do not move
+  targets used by running jobs. Each worktree still has its own mutable target, so one
+  build cannot replace another worktree's test binary.
+- Use the mise tasks for benchmarks, browser tests and binding tests that consume
+  compiled files after a build. These tasks keep Boxington's managed-target lease
+  until their downstream processes exit. Ordinary builds and Rust tests call `mbx`
+  directly. A binary launched separately is not protected. Keep explicit isolated
+  targets for controlled performance comparisons.
+- Keep validation evidence and benchmark data in `.artifacts`, outside managed
+  compiler targets. CI writes `.artifacts/ci`, reviews write `.artifacts/audits`,
+  and benchmark tasks default to `.artifacts/bench…` or `.artifacts/nsc…`.
+  Their outputs must survive collection after a command's target lease ends.
+- Prefer targeted runs (`mbx test -p <crate> --test <name>`) while iterating, and run the
   full gate before reporting work as done.
 - When the local machine is busy, build and test on another host (atlas or forge), or on an
   ephemeral Namespace instance created with `nsc create --bare --duration …` and always
@@ -118,7 +141,7 @@ failures with their first error, edits across many files under an exact rule (re
 roadmap items, renaming a flag in the docs, adding a field to every fixture), fixtures
 generated from a documented format, and sweeps that list problems without fixing them. Each
 Haiku task states the rule, a fixed output format such as JSON rows of file, change and check
-result, and the check (`cargo check`, a test, a grep or a validator) before it starts. A task
+result, and the check (`mbx check`, a test, a grep or a validator) before it starts. A task
 whose check fails twice moves to Sonnet. Haiku does not rewrite documentation prose, touch
 engine, durability, concurrency, planner or performance code, or review and validate
 findings. If a plain script can do the job, use the script.
@@ -136,7 +159,7 @@ No lane lands without review:
 
 1. **Codex reviews.** `scripts/codex-review.sh NAME TIP BASE "CONTEXT"` runs
    `codex exec review` on `BASE..TIP` in a scratch worktree and writes `review.md` under
-   `$AUDIT_DIR/NAME` (default `target/audits`). CONTEXT names the roadmap item, the specs
+   `$AUDIT_DIR/NAME` (default `.artifacts/audits`). CONTEXT names the roadmap item, the specs
    and what the work was meant to do.
 2. **Opus validates and plans.** An Opus agent checks every finding independently and
    reproduces it where it can. It marks each one confirmed, refuted or plausible, decides

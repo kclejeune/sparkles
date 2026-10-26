@@ -28,10 +28,10 @@ mkdir -p "$logs"
 # as one that waits for a connection its own build can never make, is stopped after the
 # time that .config/nextest.toml allows instead of holding the run forever. Plain cargo
 # test is the fallback.
-if cargo nextest --version > /dev/null 2>&1; then
-  runner=(cargo nextest run --no-fail-fast)
+if mbx nextest --version > /dev/null 2>&1; then
+  runner=(mbx nextest run --no-fail-fast)
 else
-  runner=(cargo test --no-fail-fast)
+  runner=(mbx test --no-fail-fast)
 fi
 
 results=()

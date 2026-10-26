@@ -55,11 +55,48 @@ work.
 
 ```sh
 pnpm -C ui install && pnpm -C ui build        # optional: the UI is embedded at compile time
-cargo build --release
-./target/release/sparkles serve --data ./data --port 3030   # UI at http://localhost:3030/ui/
+mbx build --release
+mbx run --release -p sparkles-server -- serve --data ./data --port 3030   # UI at http://localhost:3030/ui/
 ```
 
 `rust-toolchain.toml` pins Rust and installs the `wasm32-unknown-unknown` target.
+Run `mise install mr-boxington` once on each build host to install the pinned
+compiler cache. Ensure `mbx --version` matches `mise.toml` and that the pinned
+binary is first on PATH. Use `mbx build`, `mbx check`, `mbx test` and `mbx nextest run`
+directly. Mise tasks use `mbx` and wrap Cargo calls made by their child scripts
+and build tools, including maturin. The same setup applies on atlas, forge, wally
+and ephemeral build runners. Rustup continues to select the pinned Rust toolchain.
+
+Boxington shares matching compiler outputs across projects and worktrees on each
+host. Keep its default cache directory rather than assigning one per checkout.
+Boxington manages each worktree's default target directory and leaves a `target`
+symlink in the checkout. Matching restored outputs can share storage through
+filesystem clones or hard links, while active Cargo targets and private incremental
+state remain separate for each worktree. `target.views` is enabled by default.
+Avoid `CARGO_TARGET_DIR` and `--target-dir` for ordinary worktree builds because
+these overrides opt out. Binding tasks retain their explicit target paths so their
+generated artifacts stay where the packaging scripts expect them.
+
+CI logs, review reports and benchmark results live under `.artifacts`, outside
+managed compiler targets. They remain available after the build or test command
+exits and after Boxington collects its target. `mbx clean` leaves this evidence
+alone. Existing explicit benchmark work directories remain supported.
+
+Run `mise run cache:adopt` in an idle checkout to adopt its existing target without
+discarding compiled outputs. Boxington skips directories that Cargo is using, and
+existing target symlinks remain unchanged. `mise run cache:stats` reports storage,
+and `mise run cache:gc:preview` previews collection without removing files. Do not
+move targets of active validation jobs. Keep explicit isolated targets for controlled
+benchmarks and binaries run after their build command exits, since those separate
+processes do not hold Boxington's target lease unless the task helper wraps them. See the
+[managed-target guide](https://mr-boxington.jdx.dev/managed-targets) for the placement
+and collection rules.
+
+Each machine has its own cache.
+GitHub Actions cache restoration is configured separately. See the
+[Boxington setup guide](https://mr-boxington.jdx.dev/setup) for editor integration.
+The wrapper preserves the existing linker selection. Linker and incremental
+experiments must record their settings and use separate targets.
 
 The formatter's WebAssembly module lets the UI format text in the page. It is optional.
 `mise run ui:wasm` builds `crates/sparkles-fmt-wasm` into `ui/src/lib/wasm/`, which is
@@ -73,7 +110,7 @@ Node, pnpm or Rust on the host. `mise run docker:build` builds the image of
 
 ## mise tasks
 
-[`mise.toml`](../mise.toml) pins Node, pnpm, hyperfine, prek, shfmt, shellcheck, a Java 17
+[`mise.toml`](../mise.toml) pins Mr. Boxington, Node, pnpm, hyperfine, prek, shfmt, shellcheck, a Java 17
 and a Java 21 JDK, and Gradle. Rust comes from `rust-toolchain.toml`. `mise.toml` also defines the everyday tasks, and
 `mise tasks` lists them all:
 
@@ -89,7 +126,7 @@ mise run lint:doc-paths # every crates/sparkles… path cited in the docs exists
 mise run fmt:wasm     # clippy for the formatter's wasm32 build (in ci)
 mise run fmt:fuzz     # fuzz the formatter with cargo-fuzz (needs nightly and cargo-fuzz; not in ci)
 mise run office:fuzz  # fuzz the Office converter of ingestion the same way
-mise run test         # all Rust tests with cargo-nextest, then doctests (test:cargo runs plain cargo test)
+mise run test         # all Rust tests with cargo-nextest, then doctests (test:cargo runs plain mbx test)
 mise run ui:wasm      # the formatter's WebAssembly module for the UI (optional)
 mise run ui:dev       # UI dev server, proxying the API to $SPARKLES_API (default http://localhost:3030)
 mise run ui:mock      # mock API server for UI work without the Rust backend
@@ -112,7 +149,7 @@ mise run openapi      # rewrite docs/openapi.json after an API change (a test fa
 mise run docs:screenshots # the README's screenshots (docs/images): the demo dataset in docs/demo, and the mock backend for branches, the agent pages, the arcs maps and the GraphRAG communities
 mise run docs:screenshots:mock # only the branch, agent, time slider, arcs and GraphRAG community screenshots, from the mock backend, without a release build
 mise run docker:build # the Docker image of compose.yaml (not in ci)
-mise run gen-data 1000000 target/bench-data/10m.nt
+mise run gen-data 1000000 .artifacts/bench-data/10m.nt
 mise run bench        # Sparkles vs Fuseki, QLever, Fluree and Oxigraph; `bench 1000000 --runs 5` for 10.5M triples
 mise run bench:text   # full-text search: Sparkles vs Fuseki with jena-text vs QLever
 mise run bench:watdiv # the same engines on WatDiv's 20 query templates, 11M triples
@@ -154,8 +191,8 @@ mise run test:jena-clients  # Apache Jena's own HTTP clients against a real serv
 
 `mise run ci` builds the UI, the Node addon and the JVM native library once, then runs
 the checks with the cheap ones first. It prints a line as each task passes or fails, and
-it writes each task's output to `target/ci/logs/<task>.log`. While it runs,
-`target/ci/summary.txt` shows which tasks are waiting, running, passed or failed, with
+it writes each task's output to `.artifacts/ci/logs/<task>.log`. While it runs,
+`.artifacts/ci/summary.txt` shows which tasks are waiting, running, passed or failed, with
 their times. Every task runs to the end, and the final summary repeats the last lines of
 each failed task's log. `--fail-fast` stops after the first failure, `--jobs N` runs more
 tasks at once, and naming tasks runs only those, as in `mise run ci lint test`. Only
@@ -183,7 +220,7 @@ The server crate has no library target, so its unit-test binary and the binary t
 integration tests run each compile the whole crate. In a debug build each of those rustc
 processes peaks at about 10 GB, mostly while it collects monomorphized items, and a
 build that runs both at once needs about 20 GB. `mise run test` therefore first runs
-`cargo test --workspace --no-run --bin sparkles` to build the unit-test binary on its own,
+`mbx test --workspace --no-run --bin sparkles` to build the unit-test binary on its own,
 and only then runs nextest. That keeps the peak near 10 GB and costs a few minutes of build
 time, because the two server compiles do not overlap.
 
@@ -237,7 +274,7 @@ any set failed. Names on the command line choose the sets, and a set with severa
 features is a comma-separated list, as in `scripts/test-features.sh none mcp,shacl`.
 Each set writes its output to `target/test-features/<set>.log`. The sets share the
 workspace target directory, so the dependencies compile once, and `CARGO_BUILD_JOBS`
-limits the compile jobs as it does for any cargo run. A test of a route that exists only
+limits the compile jobs as it does for any mbx run. A test of a route that exists only
 with a feature carries a `#[cfg(feature = "...")]` gate for that feature, and a test
 file that needs a feature has the gate on the whole file. `mise run ci` runs this task
 and `mise run ci:fast` leaves it out, because every set compiles the server crate again.
@@ -336,9 +373,9 @@ lot of memory, so they run outside ordinary CI, on a host with its own build tar
 ```sh
 set -eu
 for mode in plain encrypted; do
-  RAYON_NUM_THREADS=2 cargo run --release -p sparkles-core --example spill_acceptance --features text,geo-epsg,zstd,brotli -- sort "target/x08-acceptance-$mode/sort" 10000 2000 "$mode" 64
+  RAYON_NUM_THREADS=2 mbx run --release -p sparkles-core --example spill_acceptance --features text,geo-epsg,zstd,brotli -- sort "target/x08-acceptance-$mode/sort" 10000 2000 "$mode" 64
   for case in all count sum avg min max sample concat count-distinct distinct; do
-    RAYON_NUM_THREADS=2 cargo run --release -p sparkles-core --example spill_acceptance --features text,geo-epsg,zstd,brotli -- "$case" "target/x08-acceptance-$mode/$case" 10000 1000 "$mode" 64
+    RAYON_NUM_THREADS=2 mbx run --release -p sparkles-core --example spill_acceptance --features text,geo-epsg,zstd,brotli -- "$case" "target/x08-acceptance-$mode/$case" 10000 1000 "$mode" 64
   done
 done
 ```
@@ -355,7 +392,7 @@ free before starting the full matrix.
 
 `crates/sparkles-py` builds the `sparkles` Python package
 ([USAGE](USAGE.md#python), [spec P01](specs/P01-python-bindings.md)). The crate is its
-own cargo workspace, excluded from the root one, so `cargo build`, `mise run lint` and
+own cargo workspace, excluded from the root one, so `mbx build`, `mise run lint` and
 `mise run test` neither compile PyO3 nor need Python. It has its own `Cargo.lock`. When
 the library crates gain a dependency, `py:test`, `py:lint` and `mise run licenses` add it
 to that lock, as cargo does with the root lock, and the changed file is committed with
@@ -442,16 +479,16 @@ suite twice, as `test` with the JNI calls and as `testUniffi` without them, and
 dataset at one and four threads. Its cases are Model and Graph calls, Jena's RDFS
 reasoner, small SPARQL queries, parameterized queries, small updates and Model writes, a
 bulk load and queries through Fuseki. Every arm runs in fresh JVMs in A/B/B/A order, the
-answers are checked first, and the results go to `target/bench-jena/results` as
+answers are checked first, and the results go to `.artifacts/bench-jena/results` as
 `summary.md` and `raw.json`. An arm is an engine with JVM options, so a system property
 that turns a feature off gives a before arm. `scripts/nsc-jena.sh` (`mise run
 bench:jena-nsc`) runs the same comparison on an ephemeral Namespace instance. It builds
 the bindings here, ships them with a Temurin JDK and a standalone CPython, and downloads
-the results to `target/nsc-jena/<time>`.
+the results to `.artifacts/nsc-jena/<time>`.
 
 `./gradlew :sparkles-jena:perfCheck -Pdata=DATA.nt -Pqueries=QUERIES.tsv`, run in `jvm/`,
 times queries through Jena on Sparkles, through the native library alone and on an
-in-memory TDB2 dataset. `cargo run --release --example perf --manifest-path
+in-memory TDB2 dataset. `mbx run --release --example perf --manifest-path
 crates/sparkles-ffi/Cargo.toml --target-dir target -- DATA.nt QUERIES.tsv 10` times the same
 queries through the Rust API. Each line of `QUERIES.tsv` is a name, a tab and a query.
 
@@ -563,9 +600,9 @@ rather than to save runner minutes. `actionlint` checks the workflow files.
 
 | Job | What it runs |
 |---|---|
-| Checks | Formatting of the Rust, UI, JavaScript and shell sources, shellcheck, the cited doc paths, the benchmark scripts' tests, the license notices, the generated TypeScript client against `docs/openapi.json`, and the UI's build, type check and unit tests. It needs no Rust build and takes about three minutes. |
+| Checks | Formatting of the Rust, UI, JavaScript and shell sources, shellcheck, the cited doc paths, the benchmark scripts' tests, the license notices, the generated TypeScript client against `docs/openapi.json`, and the UI's build, type check and unit tests. It compiles small tooling fixtures and leaves the workspace crates unbuilt. |
 | Clippy | Clippy with warnings as errors on the workspace, on the formatter's wasm32 build and on the three binding crates with and without their default features. |
-| Build tests | `cargo nextest archive` builds every test binary once and uploads the archive. The doctests run here too. |
+| Build tests | `mbx nextest archive` builds every test binary once and uploads the archive. The doctests run here too. |
 | Test | Five jobs run the archive. Four take a quarter of the tests each (`--partition slice:N/4`), and one runs the `timing` group of `.config/nextest.toml`, which needs a machine to itself. |
 | Jena clients | Jena's own HTTP clients against the server binary from the archive (`mise run test:jena-clients`). |
 | Features | Six jobs run `scripts/test-features.sh` for one feature set each, with the default features off. They build apart from the archive and have a cache each. |
@@ -610,24 +647,52 @@ when their changed paths select the workflow. The [Nix](#nix) section describes 
 
 ### Caches
 
-GitHub keeps 10 GB of Actions caches per repository and evicts the least recently used
-entries beyond that. Caches saved on a branch serve only that branch, while those of
-`main` serve every branch and pull request, so the jobs that cache Cargo artifacts save
-only from pushes to `main`. `.github/actions/setup-rust` installs the toolchain that
-`rust-toolchain.toml` pins and restores `Swatinem/rust-cache` under a name per job, so the
-Clippy, test build, binding and JVM `uniffi-bindgen` jobs do not replace each other's
-entries. rust-cache keeps the dependencies' build artifacts and drops the workspace's
-own, which change on nearly every push. The Python container build caches its target
-directory the same way, `gradle/actions/setup-gradle` saves Gradle's caches from `main`
-only by default, and `actions/setup-node` caches pnpm's store. CI builds carry no debug
-information (`CARGO_PROFILE_DEV_DEBUG=0`, which `setup-rust-toolchain` sets), which keeps
-linking short. A cold test build still peaks above the runner's 16 GB, so that job adds
-16 GB of swap.
+GitHub Actions restores Rust build state with the pinned
+`jdx/mr-boxington-action`. Each workflow installs the toolchain from
+`rust-toolchain.toml` with `actions-rust-lang/setup-rust-toolchain`, then calls the
+Boxington action directly. Native build commands and shell build scripts call
+`mbx` directly. Maturin and napi builds use the supported Cargo shim because those
+tools invoke Cargo themselves. Root-workspace jobs use the action's Cargo target payload.
+Jobs building binding workspaces or using explicit targets use its object payload,
+which captures the completed builds across those workspaces. The action owns cache
+keys, restore and save. Its target payload includes Cargo downloads, while object
+jobs let Cargo download dependencies again. There is no separate Cargo download
+cache or Swatinem or sccache layer.
 
-A push with warm caches waits about 13 minutes for `ci.yml`, and a cold one about 25.
-The test build takes 7 minutes warm and 15 cold, and each test job about 5 to 6 minutes, of which
-downloading the test archive takes one to two. Compressing with a long zstd window shrinks the
-archive from 2.2 GB to about 1.4 GB, because the test binaries share most of their code.
+The Linux wheel and Alpine addon containers install the same pinned Boxington
+version from checksum-verified portable binaries. They mount their host job's
+store, use a separate compiler-shim directory, and contribute to that job's object
+export group. Container-built files are returned to the runner's ownership before
+the action exports them. Alpine keeps separate Rustup and pnpm download caches.
+
+Compiler cache entries are scoped by operating system, architecture, Rust identity
+and job contract. Successful pushes and explicitly allowed manual runs on `main` populate them.
+Pull requests restore them without saving. GitHub keeps a 10 GB repository cache budget,
+so cache sizes and restore, build and save durations need to be checked in actual
+CI runs. A first run of the new action starts a new cache series. Existing build
+timing does not establish the new action's performance.
+
+Local builds use Boxington's default learned incremental reuse and managed targets.
+CI uses Boxington's CI defaults, which disable learned and Cargo incremental reuse
+unless eager reuse is explicitly selected. No eager policy is forced for disposable
+runners. The target payload disables managed placement so it can archive the actual
+Cargo target tree. The object payload can represent explicit or managed targets.
+Production profiles, compiler optimization and linker selection stay unchanged.
+
+Mise tasks that use compiled outputs after a build internally wrap the downstream
+command with a small Cargo subcommand, `sparkles-task`. It keeps the workspace's
+managed-target lease alive for the full command, including benchmarks, binding
+tests, browser tests and the local CI gate. Collection cannot remove their target
+files while they run. A regression check covers collection both without and with
+the lease. Mise's cached validation keys also include the effective non-secret
+Boxington build policy, so changing a global linker or incremental setting reruns
+a check. Raw benchmark evidence still needs to be retained in its immutable record
+before temporary build data is collected.
+
+Gradle and pnpm retain their existing caches. Hermetic Nix builds retain their
+Crane dependency artifacts and Nix binary caches. CI builds carry no debug
+information through `CARGO_PROFILE_DEV_DEBUG=0`, and the largest test build retains
+16 GB of swap in addition to the runner's RAM.
 
 ## Releases
 

@@ -51,7 +51,7 @@
 #   --machine-type T    Namespace machine type (default linux/amd64:8x16)
 #   --duration D        instance lifetime cap, as nsc takes it (default 2h)
 #   --out DIR           new results directory; any existing path is refused
-#                       (default target/nsc-writes/<UTC time>.<unique suffix>)
+#                       (default .artifacts/nsc-writes/<UTC time>.<unique suffix>)
 set -euo pipefail
 
 ROOT=$(cd "$(dirname "$0")/.." && pwd)
@@ -126,8 +126,8 @@ if [ -n "$OUT" ]; then
   OUT=$OUT_PARENT/$OUT_NAME
   mkdir -- "$OUT" || die "results directory already exists or cannot be created: $OUT"
 else
-  mkdir -p "$ROOT/target/nsc-writes"
-  OUT=$(mktemp -d "$ROOT/target/nsc-writes/$(date -u +%Y%m%dT%H%M%SZ).XXXXXXXX")
+  mkdir -p "$ROOT/.artifacts/nsc-writes"
+  OUT=$(mktemp -d "$ROOT/.artifacts/nsc-writes/$(date -u +%Y%m%dT%H%M%SZ).XXXXXXXX")
 fi
 CACHE=$(realpath -m "$CACHE")
 WRITE_CACHE=$CACHE/writes-v1

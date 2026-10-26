@@ -7,7 +7,7 @@ if [[ $profile == release ]]; then
   args+=(--release)
   artifact_dir=release
 else artifact_dir=debug; fi
-cargo build "${args[@]}"
+mbx build "${args[@]}"
 case $(uname -s) in
   Linux)
     platform=linux
