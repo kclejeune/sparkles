@@ -10,13 +10,23 @@ ROOT = Path(__file__).resolve().parents[2]
 
 
 class CiProfiles(unittest.TestCase):
-    def run_profile(self, *args, failing=""):
+    def run_profile(self, *args, failing="", notify_completed=False):
         with tempfile.TemporaryDirectory(prefix="sparkles-ci-profile-") as directory:
             root = Path(directory)
             (root / "scripts").mkdir()
             (root / "bin").mkdir()
             script = root / "scripts/ci.sh"
-            script.write_bytes((ROOT / "scripts/ci.sh").read_bytes())
+            source = (ROOT / "scripts/ci.sh").read_text()
+            if notify_completed:
+                # Retire completed job notifications before wait -n. Explicit wait
+                # must still collect each recorded PID and preserve its status.
+                source = source.replace(
+                    "  set -m\n",
+                    "  set -m\n  set -T\n"
+                    "  trap 'if [[ $BASH_COMMAND == \"wait -n -p done_pid\" ]]; then "
+                    "sleep 0.02; jobs > /dev/null; fi' DEBUG\n",
+                )
+            script.write_text(source)
             frontend = root / "bin/mise"
             frontend.write_text(
                 '#!/bin/bash\n'
@@ -65,6 +75,20 @@ class CiProfiles(unittest.TestCase):
         self.assertEqual(result.returncode, 1, result.stderr)
         self.assertEqual(tasks, ["test:features"])
         self.assertIn("exit 29", result.stdout)
+
+    def test_completed_job_notifications_preserve_success_and_failure(self):
+        # Cover the final drain and the reap that makes room in a full queue.
+        for selection in (("lint:doc-paths",), ("lint:doc-paths", "lint:shell", "fmt:check")):
+            for failing, expected in (("", 0), ("lint:doc-paths", 1)):
+                with self.subTest(selection=selection, failing=failing):
+                    result, tasks, _ = self.run_profile(
+                        *selection, failing=failing, notify_completed=True,
+                    )
+                    self.assertEqual(result.returncode, expected, result.stderr)
+                    self.assertEqual(set(tasks), set(selection))
+                    self.assertNotIn("unbound variable", result.stderr)
+                    if failing:
+                        self.assertIn("exit 29", result.stdout)
 
     def test_mise_flag_reaches_local_gate(self):
         task = tomllib.loads((ROOT / "mise.toml").read_text())["tasks"]["ci"]

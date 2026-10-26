@@ -204,12 +204,24 @@ main() {
     done
     return 0
   }
-  # reap: wait for one running task and record its result.
-  reap() {
+  # Bash can retire a completed job notification before wait -n observes it.
+  # Its recorded PID still retains the status for an explicit wait.
+  wait_recorded() {
+    done_pid=
     set +e
     wait -n -p done_pid
     rc=$?
+    if [ -z "${done_pid:-}" ]; then
+      for done_pid in "${!pids[@]}"; do break; done
+      wait "$done_pid"
+      rc=$?
+    fi
     set -e
+  }
+
+  # reap: wait for one running task and record its result.
+  reap() {
+    wait_recorded
     write_summary
     if [ $rc -ne 0 ]; then
       failed+=("${pids[$done_pid]}")
@@ -262,10 +274,7 @@ main() {
     write_summary
   fi
   while [ ${#pids[@]} -gt 0 ]; do
-    set +e
-    wait -n -p done_pid
-    rc=$?
-    set -e
+    wait_recorded
     if [ $rc -ne 0 ] && [ "$(cut -d' ' -f1 "$out/state/${pids[$done_pid]//:/_}")" = FAIL ]; then
       failed+=("${pids[$done_pid]}")
     fi
