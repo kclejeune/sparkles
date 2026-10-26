@@ -5,7 +5,7 @@
 use oxrdf::{NamedNode, Term};
 use sparkles_core::io::{RdfFormat, Source};
 use sparkles_core::store::{Store, StoreOptions};
-use sparkles_shacl::form::{FieldGroup, FieldPath, form_layout, pick_lang};
+use sparkles_shacl::form::{FieldGroup, FieldPath, form_layout, form_layout_with, pick_lang};
 use sparkles_shacl::{Shapes, ValidateOptions, shapes_for_node};
 
 const SHAPES: &str = r#"
@@ -71,6 +71,100 @@ fn store() -> Store {
 
 fn shapes() -> Shapes {
     Shapes::parse(SHAPES, RdfFormat::Turtle, None).unwrap()
+}
+
+#[test]
+fn controlled_layout_keeps_merged_fields_and_uses_one_shared_allowance() {
+    let shapes = shapes();
+    let selected =
+        ["PersonShape", "EmployeeShape"].map(|name| shapes.shape_id(&ex(name).into()).unwrap());
+    let ordinary = form_layout(&shapes, &selected);
+    let mut spent = 0;
+    let mut check = || {
+        spent += 1;
+        anyhow::ensure!(spent <= 10_000, "layout allowance exhausted");
+        Ok(())
+    };
+    let controlled = form_layout_with(&shapes, &selected, &mut check).unwrap();
+    assert_eq!(format!("{controlled:?}"), format!("{ordinary:?}"));
+    let first = spent;
+    let mut check = || {
+        spent += 1;
+        anyhow::ensure!(spent < first * 2, "layout allowance exhausted");
+        Ok(())
+    };
+    let failure = form_layout_with(&shapes, &selected, &mut check).unwrap_err();
+    assert_eq!(failure.to_string(), "layout allowance exhausted");
+}
+
+#[test]
+fn controlled_layout_stops_before_copying_one_large_label_or_path() {
+    for predicate in [false, true] {
+        let large = "x".repeat(1024 * 1024);
+        let property = if predicate {
+            format!("sh:path <http://ex.org/{large}>")
+        } else {
+            format!("sh:path ex:p ; sh:name \"{large}\"")
+        };
+        let text = format!(
+            "@prefix sh: <http://www.w3.org/ns/shacl#> .\n\
+             @prefix ex: <http://ex.org/> .\n\
+             ex:S a sh:NodeShape ; sh:property [ {property} ] ."
+        );
+        let shapes = Shapes::parse(&text, RdfFormat::Turtle, None).unwrap();
+        let root = shapes.shape_id(&ex("S").into()).unwrap();
+        let mut spent = 0;
+        let failure = form_layout_with(&shapes, &[root], &mut || {
+            spent += 1;
+            anyhow::ensure!(spent <= 20, "layout allowance exhausted");
+            Ok(())
+        })
+        .unwrap_err();
+        assert_eq!(failure.to_string(), "layout allowance exhausted");
+        assert_eq!(spent, 21);
+    }
+}
+
+#[test]
+fn controlled_layout_preserves_cancellation_and_rejects_deep_expansion() {
+    let shapes = shapes();
+    let root = shapes.shape_id(&ex("PersonShape").into()).unwrap();
+    let failure =
+        form_layout_with(&shapes, &[root], &mut || anyhow::bail!("cancelled")).unwrap_err();
+    assert_eq!(failure.to_string(), "cancelled");
+
+    let mut text = String::from(
+        "@prefix sh: <http://www.w3.org/ns/shacl#> .\n\
+         @prefix ex: <http://ex.org/> .\n",
+    );
+    for n in 0..80 {
+        text.push_str(&format!("ex:S{n} sh:node ex:S{} .\n", n + 1));
+    }
+    text.push_str("ex:S80 sh:property [ sh:path ex:p ] .");
+    let shapes = Shapes::parse(&text, RdfFormat::Turtle, None).unwrap();
+    let root = shapes.shape_id(&ex("S0").into()).unwrap();
+    let failure = form_layout_with(&shapes, &[root], &mut || Ok(())).unwrap_err();
+    assert!(failure.to_string().contains("nesting exceeds"));
+}
+
+#[test]
+fn controlled_layout_handles_cycles_and_repeated_allowed_value_intersections() {
+    let text = r#"
+        @prefix sh: <http://www.w3.org/ns/shacl#> .
+        @prefix ex: <http://ex.org/> .
+        ex:A sh:node ex:B ; sh:property [ sh:path ex:p ; sh:in ("a" "b" "c") ] .
+        ex:B sh:node ex:A ; sh:property [ sh:path ex:p ; sh:in ("b" "c") ; sh:in ("c" "d") ] .
+    "#;
+    let shapes = Shapes::parse(text, RdfFormat::Turtle, None).unwrap();
+    let root = shapes.shape_id(&ex("A").into()).unwrap();
+    let ordinary = form_layout(&shapes, &[root]);
+    let controlled = form_layout_with(&shapes, &[root], &mut || Ok(())).unwrap();
+    assert_eq!(format!("{controlled:?}"), format!("{ordinary:?}"));
+    assert_eq!(controlled.fields.len(), 1);
+    assert_eq!(
+        controlled.fields[0].constraints.allowed.as_ref().unwrap(),
+        &vec![Term::Literal(oxrdf::Literal::new_simple_literal("c"))]
+    );
 }
 
 #[test]
