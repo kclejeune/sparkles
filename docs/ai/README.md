@@ -42,6 +42,13 @@ build community reports.
   `merge_branch` and `delete_branch` manage scratch branches. Merges preview by default,
   need the previewed heads and refuse conflicts. `--mcp-scratch-branch-ttl` deletes idle
   scratch branches.
+* `link_entities` can include versioned evidence about the named types and literal
+  labels retained for each candidate, with separate flags for display, per-entity and
+  query limits. It reports values and counts from the caller's query view. Bounded text
+  and vector search do not establish a complete candidate universe or unique intent. Full
+  evidence fields are counted before formatting and share the configured result-byte
+  allowance across mentions. The final check also includes branch and policy metadata.
+  Query memory limits govern lookup and ranking state.
 * Resources give each dataset's schema summary and prefixes and each stored query's
   definition. The prompts `explore_dataset`, `answer_question`, `run_stored_query`,
   `explain_term`, `agent_memory` and `ask_graph` start common workflows.

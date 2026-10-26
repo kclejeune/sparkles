@@ -77,6 +77,21 @@ pub(crate) fn why_empty_output() -> Value {
         "prefixes":prefixes()}})
 }
 
+fn link_mention_evidence() -> Value {
+    json!({"type":"object","required":["version","observedCandidates","poolTruncated","displayTruncated","exactStringLabelsComplete","typeHintLookupComplete","normalizedLabelsComplete","candidateUniverseComplete"],"properties":{
+                        "version":{"const":1},"observedCandidates":{"type":"integer"},
+                        "poolTruncated":{"type":"boolean"},"displayTruncated":{"type":"boolean"},
+                        "exactStringLabelsComplete":{"type":"boolean"},"typeHintLookupComplete":{"type":"boolean"},
+                        "normalizedLabelsComplete":{"const":false},"candidateUniverseComplete":{"const":false}}})
+}
+
+fn link_candidate_evidence() -> Value {
+    json!({"type":"object","required":["version","iri","types","typesComplete","labels","labelsComplete"],"properties":{
+                            "version":{"const":1},"iri":{"type":"string"},"types":strings(),"typesComplete":{"type":"boolean"},
+                            "labels":{"type":"array","items":{"type":"object","required":["predicate","term"],"properties":{"predicate":{"type":"string"},"term":{"type":"string"}}}},
+                            "labelsComplete":{"type":"boolean"}}})
+}
+
 pub struct ToolDef {
     pub name: &'static str,
     pub title: &'static str,
@@ -589,6 +604,7 @@ pub fn tools(cfg: &McpConfig) -> Vec<ToolDef> {
                 "labelPredicates": {"type":"array","items":{"type":"string"},"minItems":1,"maxItems":20,"description":"The predicates that hold labels (default: rdfs:label, skos:prefLabel, schema:name and the other usual ones, then skos:altLabel)"},
                 "graphs": {"type":"array","items":{"type":"string"},"minItems":1,"maxItems":20,"description":"Graph IRIs to search, or `default` (default: every graph you may read)"},
 "vectors": {"type":"boolean","default":true,"description":"false searches by label and full text only, so no mention or context is embedded by a vector index's provider"},
+                "evidence": {"type":"boolean","default":false,"description":"Include versioned query-view evidence, retained types and labels, and explicit completeness bounds; never a uniqueness proof"},
                 "reasoning": rs(),
                 "timeoutSeconds": to(cfg),
                 "atCommit": at(), "at": at_sel()}}),
@@ -597,11 +613,13 @@ pub fn tools(cfg: &McpConfig) -> Vec<ToolDef> {
                 "mentions":{"type":"array","items":{"type":"object","required":["text","verdict","candidates"],"properties":{
                     "text":{"type":"string"},
                     "verdict":{"enum":["exact","ambiguous","candidates","none"]},
+                    "evidence":link_mention_evidence(),
                     "candidates":{"type":"array","items":{"type":"object","required":["iri","types","score","typeMatch","matchedBy","triples"],"properties":{
                         "iri":{"type":"string"},"label":{"type":"string"},"altLabels":strings(),"types":strings(),
                         "score":{"type":["number","null"]},"typeMatch":{"type":"boolean"},
                         "matchedBy":{"type":"array","items":{"enum":["exact","normalized","text","vector"]}},
-                        "sameAs":strings(),"triples":strings()}}}}}},
+                        "sameAs":strings(),"triples":strings(),
+                        "evidence":link_candidate_evidence()}}}}}},
                 "search":{"type":"object","required":["text","vector"],"properties":{"text":{"type":"boolean"},"vector":{"type":"boolean"}}},
                 "prefixes":prefixes()}})),
         ),
