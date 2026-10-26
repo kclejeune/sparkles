@@ -365,3 +365,110 @@ fn visible_blank_named_graphs_refuse_instead_of_returning_an_incomplete_model() 
             .contains("blank graph child")
     );
 }
+
+#[test]
+fn child_target_graph_follows_its_own_type_without_hiding_readable_fields() {
+    use sparkles::access::triples::{Caller, Limits, Protection, Rule, TripleRules};
+    let (ds, mut req) = dataset(
+        "ex:R sh:targetNode ex:root ; sh:property [ sh:path ex:p ; sh:node ex:S ] . ex:S sh:property [ sh:path ex:name ] .",
+        "GRAPH <urn:root> { ex:root a ex:Parent . _:child ex:name \"secret in root graph\" . } ex:root ex:p _:child . _:child a ex:Child ; ex:name \"visible in default\" .",
+    );
+    let opts = QueryOptions {
+        graphs: Some(Arc::new(GraphAccess::with_triples(
+            Graphs::All,
+            Graphs::All,
+            TripleRules {
+                rules: vec![Rule {
+                    protection: Arc::new(Protection {
+                        name: "name-in-root".into(),
+                        predicates: Some(vec!["http://ex/name".into()]),
+                        classes: None,
+                        subclasses: false,
+                        graphs: Some(Graphs::Only(GraphRule::new(["urn:root"], &[]))),
+                        pattern: None,
+                        prefixes: Default::default(),
+                        hide_inferences: false,
+                    }),
+                    read: Graphs::none(),
+                    write: Graphs::none(),
+                }],
+                caller: Caller::default(),
+                limits: Limits::default(),
+            },
+        ))),
+        ..Default::default()
+    };
+    let model = ds.forms().nested_model(&req, &opts).unwrap();
+    assert_eq!(model.root.graph.as_deref(), Some("urn:root"));
+    let child = &model.nested_nodes[0].model;
+    assert_eq!(
+        child.graph, None,
+        "child target policy must resolve against its own type graph"
+    );
+    let name = child
+        .fields
+        .iter()
+        .find(|f| f.path == "http://ex/name")
+        .expect("readable default-graph child name was hidden");
+    assert_eq!(name.values.len(), 1);
+    assert_eq!(name.values[0].graph, None);
+    assert_eq!(
+        name.values[0].term,
+        oxrdf::Literal::new_simple_literal("visible in default").into()
+    );
+    for (policy, expected) in [("default", None), ("urn:fixed", Some("urn:fixed"))] {
+        req.settings.target_graph = policy.into();
+        let model = ds.forms().nested_model(&req, &opts).unwrap();
+        assert_eq!(model.root.graph.as_deref(), expected);
+        assert_eq!(model.nested_nodes[0].model.graph.as_deref(), expected);
+    }
+}
+
+#[test]
+fn unchanged_self_cycles_expand_each_child_once_within_the_existing_quota() {
+    let mut data = String::new();
+    for n in 0..64 {
+        data.push_str(&format!(
+            "ex:root ex:p _:n{n} . _:n{n} ex:a \"value\" ; ex:next _:n{n} . "
+        ));
+    }
+    let (ds, req) = dataset(
+        "ex:R sh:targetNode ex:root ; sh:property [ sh:path ex:p ; sh:node ex:S ] . ex:S sh:property [ sh:path ex:a ], [ sh:path ex:b ], [ sh:path ex:c ], [ sh:path ex:next ; sh:node ex:S ] .",
+        &data,
+    );
+    let model = ds
+        .forms()
+        .nested_model(&req, &Default::default())
+        .expect("unchanged self-cycles must not spend duplicate expansion quotas");
+    assert_eq!(model.nested_nodes.len(), 64);
+    assert_eq!(
+        model.root.fields.len()
+            + model
+                .nested_nodes
+                .iter()
+                .map(|n| n.model.fields.len())
+                .sum::<usize>(),
+        257
+    );
+    assert!(model.nested_nodes.iter().all(|n| n.anchors.len() == 2));
+}
+
+#[test]
+fn a_self_cycle_that_adds_a_declared_shape_is_expanded_again() {
+    let (ds, req) = dataset(
+        "ex:R sh:targetNode ex:root ; sh:property [ sh:path ex:p ; sh:node ex:S ] . ex:S sh:property [ sh:path ex:next ; sh:node ex:T ] . ex:T sh:property [ sh:path ex:extra ] .",
+        "ex:root ex:p _:child . _:child ex:next _:child ; ex:extra \"expanded declaration\" .",
+    );
+    let model = ds.forms().nested_model(&req, &Default::default()).unwrap();
+    assert_eq!(model.nested_nodes.len(), 1);
+    let child = &model.nested_nodes[0];
+    assert_eq!(child.model.fields.len(), 2);
+    assert!(
+        child
+            .model
+            .fields
+            .iter()
+            .any(|f| f.path == "http://ex/extra")
+    );
+    assert_eq!(child.anchors.len(), 2);
+}

@@ -134,7 +134,9 @@ children. Each child keeps its RDF identity, the visible parent field and graph 
 and a layout built from every visible `sh:node` declaration that reaches it. Shared
 children use one identity. Cycles refer to an admitted child rather than expanding a
 second copy. Field values retain their graph provenance even when the same child and
-predicate occur in several graphs.
+predicate occur in several graphs. Each child resolves the requested target-graph
+policy against its own focus. An unchanged self-cycle does not generate another
+layout; an actual addition to the declared shape union does.
 
 The request admits at most 64 nested identities, 512 generated field views, 512 parent
 anchors and a first-discovery depth of 16. Every expansion shares up to 65,536

@@ -8,7 +8,9 @@ preserves the initial delivery and the later affected-target validation contract
 `Forms::nested_model` supplies the ordinary root model plus declared blank-node
 children. It pools shared RDF identities, preserves every visible graph-bearing
 parent anchor and merges the declared child layouts. Cycles use references to an
-already admitted identity. Historical models remain read-only and require a retained
+already admitted identity and regenerate only when the declared shape union grows.
+Each child resolves the target-graph policy against its own type facts, preserving
+readable child fields when the root's type graph differs. Historical models remain read-only and require a retained
 history state, as other historical reads do.
 
 The request shares its preparation allowance across layouts, retained values, frontier

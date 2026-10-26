@@ -271,7 +271,9 @@ impl Pool {
                         inverse: field.inverse,
                     });
                 }
-                let mut changed = entry.model.is_none();
+                // Only a larger declaration union needs another generation.
+                // A self-edge can be discovered before this model is installed.
+                let mut changed = false;
                 for term in &source.constraints.node {
                     built.limits.unit()?;
                     if let Some(shape) = built.shapes.shape_id(term) {
@@ -439,9 +441,7 @@ impl Built {
         if let Some(lang) = &self.lang {
             self.limits.lexical(lang)?;
         }
-        if let Some(target) = &self.target {
-            self.limits.lexical(target)?;
-        }
+        self.limits.lexical(&self.target_policy)?;
         for graph in self
             .vopts
             .data_graph
@@ -456,6 +456,7 @@ impl Built {
         })
         .map_err(crate::handles::from_anyhow)?;
         let read = self.read()?;
+        let target = target_graph(&read, focus, &self.target_policy)?;
         let mut types = BTreeSet::new();
         for value in read.values(
             focus,
@@ -478,7 +479,8 @@ impl Built {
             missing: None,
             node_shapes: shapes.to_vec(),
             layout,
-            target: self.target.clone(),
+            target,
+            target_policy: self.target_policy.clone(),
             access: self.access.clone(),
             write_access: self.write_access.clone(),
             limits: self.limits.clone(),

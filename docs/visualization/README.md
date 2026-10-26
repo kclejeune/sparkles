@@ -166,7 +166,8 @@ The Rust library exposes `dataset.forms().nested_model(&request, &options)` for
 applications that need declared blank-node child layouts. The result retains the
 ordinary root form and a `nested_nodes` pool. Shared children keep one RDF identity,
 cycles reference that identity, and parent anchors and field values retain their graph
-provenance. The request uses the same shapes settings, visibility, historical-state
+provenance. The target-graph policy resolves independently for each child's focus.
+The request uses the same shapes settings, visibility, historical-state
 selection and cancellation controls as an ordinary form.
 
 One request admits at most 64 nested identities, 512 generated field views, 512 parent

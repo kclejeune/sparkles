@@ -484,7 +484,7 @@ impl Forms {
                 if c.is_empty() && !stale {
                     // new values go to a graph that depends on the state
                     let read = Reader::new(snap, access.as_deref())?;
-                    stale = target_graph(&read, &focus, &settings)? != target;
+                    stale = target_graph(&read, &focus, &settings.target_graph)? != target;
                 }
                 Ok::<_, Error>((c, stale))
             });
@@ -661,7 +661,9 @@ impl Forms {
         } else {
             form_layout(&shapes, &node_shapes)
         };
-        let target = target_graph(&read, &focus, settings)?;
+        let target = target_graph(&read, &focus, &settings.target_graph)?;
+        limits.lexical(&settings.target_graph)?;
+        let target_policy = settings.target_graph.clone();
         let mut prefixes = crate::io::standard_prefixes();
         prefixes.extend(self.ds.store().prefixes());
         let (read_snap, masked) = (read.snap().clone(), read.masked);
@@ -678,6 +680,7 @@ impl Forms {
             node_shapes,
             layout,
             target,
+            target_policy,
             access,
             write_access,
             limits,
@@ -772,8 +775,8 @@ fn deadline(opts: &QueryOptions) -> Option<Instant> {
 }
 
 /// The graph new values go into: `None` is the default graph.
-fn target_graph(read: &Reader<'_>, focus: &Term, s: &FormSettings) -> Result<Option<String>> {
-    Ok(match s.target_graph.as_str() {
+fn target_graph(read: &Reader<'_>, focus: &Term, policy: &str) -> Result<Option<String>> {
+    Ok(match policy {
         "default" => None,
         "type" => {
             let typed = read.values(
@@ -784,10 +787,13 @@ fn target_graph(read: &Reader<'_>, focus: &Term, s: &FormSettings) -> Result<Opt
             if typed.iter().any(|v| v.graph.is_none()) {
                 None
             } else {
-                typed.iter().filter_map(|v| v.graph.clone()).min()
+                typed.into_iter().filter_map(|v| v.graph).min()
             }
         }
-        iri => Some(iri.to_string()),
+        iri => {
+            read.limits.lexical(iri)?;
+            Some(iri.to_string())
+        }
     })
 }
 
@@ -805,6 +811,7 @@ struct Built {
     node_shapes: Vec<usize>,
     layout: FormLayout,
     target: Option<String>,
+    target_policy: String,
     access: Option<Arc<GraphAccess>>,
     /// the view writes go through, which decides what is writable
     write_access: Option<Arc<GraphAccess>>,
