@@ -255,7 +255,8 @@ pub fn prepare_input<'a>(input: &'a EvidenceInput, control: &Control) -> Result<
         }
     }
     verify_local_passages(input, passage_groups, control)?;
-    for reference in &input.references {
+    let mut structured_groups: BTreeMap<usize, Vec<usize>> = BTreeMap::new();
+    for (reference_index, reference) in input.references.iter().enumerate() {
         preparation.start(RecordKind::EvidenceRef, reference.key.as_str())?;
         preparation.text(reference.occurrence_key.as_str())?;
         match &reference.target {
@@ -335,17 +336,14 @@ pub fn prepare_input<'a>(input: &'a EvidenceInput, control: &Control) -> Result<
                 let verified = if method.method.as_str() == super::JSON_LEXICAL_UTF8_V1
                     && method.version.as_str() == super::JSON_LEXICAL_UTF8_VERSION
                     && let RecordRef::Local(key) = revision
-                    && let SourceContent::Retained { bytes, .. } =
-                        &input.revisions[preparation.local_index(key)].content
-                {
-                    let json = std::str::from_utf8(bytes)
-                        .map_err(|_| Error::invalid("JSON reference requires retained UTF-8"))?;
-                    let selected = super::select_json_lexical_utf8(json, pointer, control)?;
-                    if selected.digest != *value_digest {
-                        return Err(Error::invalid(
-                            "span-mismatch: JSON selected-value digest differs",
-                        ));
-                    }
+                    && matches!(
+                        &input.revisions[preparation.local_index(key)].content,
+                        SourceContent::Retained { .. }
+                    ) {
+                    structured_groups
+                        .entry(preparation.local_index(key))
+                        .or_default()
+                        .push(reference_index);
                     true
                 } else {
                     false
@@ -360,6 +358,7 @@ pub fn prepare_input<'a>(input: &'a EvidenceInput, control: &Control) -> Result<
             }
         }
     }
+    verify_local_structured(input, structured_groups, control)?;
     for claim in &input.claims {
         preparation.claim(claim)?;
     }
@@ -614,6 +613,47 @@ fn normalize_time(value: &Literal) -> Result<NormalizedSourceTime> {
 #[cfg(test)]
 std::thread_local! {
     pub(super) static PASSAGE_CHARACTER_VISITS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+fn verify_local_structured(
+    input: &EvidenceInput,
+    groups: BTreeMap<usize, Vec<usize>>,
+    control: &Control,
+) -> Result<()> {
+    for (revision, references) in groups {
+        control.check()?;
+        let SourceContent::Retained { bytes, .. } = &input.revisions[revision].content else {
+            unreachable!("only retained local revisions are grouped");
+        };
+        let json = std::str::from_utf8(bytes)
+            .map_err(|_| Error::invalid("JSON reference requires retained UTF-8"))?;
+        let pointers: Vec<_> = references
+            .iter()
+            .map(|index| {
+                let EvidenceRefTarget::Structured { pointer, .. } =
+                    &input.references[*index].target
+                else {
+                    unreachable!("only structured references are grouped");
+                };
+                pointer.as_str()
+            })
+            .collect();
+        let selected = super::structured::select_json_lexical_utf8_batch(json, &pointers, control)?;
+        for (index, selected) in references.into_iter().zip(selected) {
+            control.check()?;
+            let EvidenceRefTarget::Structured { value_digest, .. } =
+                &input.references[index].target
+            else {
+                unreachable!("only structured references are grouped");
+            };
+            if selected.digest != *value_digest {
+                return Err(Error::invalid(
+                    "span-mismatch: JSON selected-value digest differs",
+                ));
+            }
+        }
+    }
+    Ok(())
 }
 
 #[derive(Default)]

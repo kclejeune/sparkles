@@ -798,3 +798,62 @@ fn grouped_selectors_preserve_input_order_overlap_duplicates_and_unicode_eof() {
     input.renditions[0].content = RenditionContent::NormalizedText(String::new());
     assert!(prepare_input(&input, &Control::none()).is_err());
 }
+
+#[test]
+fn many_structured_references_validate_each_retained_revision_once() {
+    let mut input = sample();
+    input.revisions[0].content = SourceContent::Retained {
+        bytes: br#"{"a/b":{"m~n":[0,1]}}"#.to_vec(),
+        expected_digest: None,
+    };
+    let mut second = input.revisions[0].clone();
+    second.key = key("revision-two");
+    second.source_key = key("source/two");
+    second.content = SourceContent::Retained {
+        bytes: br#"{"a/b":{"m~n":[2,3]}}"#.to_vec(),
+        expected_digest: None,
+    };
+    input.revisions.push(second);
+    let template = input.references[0].clone();
+    input.references = (0..64)
+        .map(|index| {
+            let mut reference = template.clone();
+            reference.key = key(&if index == 0 {
+                "reference".into()
+            } else {
+                format!("reference/{index}")
+            });
+            reference.occurrence_key = key(&format!("reference/{index}"));
+            reference.target = EvidenceRefTarget::Structured {
+                revision: local(if index < 32 {
+                    "revision"
+                } else {
+                    "revision-two"
+                }),
+                pointer: format!("/a~1b/m~0n/{}", index % 2),
+                method: MethodRef {
+                    method: node(JSON_LEXICAL_UTF8_V1),
+                    version: key(JSON_LEXICAL_UTF8_VERSION),
+                },
+                value_digest: digest(
+                    (index % 2 + if index < 32 { 0 } else { 2 })
+                        .to_string()
+                        .as_bytes(),
+                ),
+            };
+            reference
+        })
+        .collect();
+    super::structured::JSON_REVISION_VALIDATIONS.with(|count| count.set(0));
+    let prepared = prepare_input(&input, &Control::none()).unwrap();
+    assert!(prepared.requirements().is_empty());
+    assert_eq!(
+        super::structured::JSON_REVISION_VALIDATIONS.with(std::cell::Cell::get),
+        2
+    );
+    assert_eq!(prepared.input().references.len(), 64);
+    if let EvidenceRefTarget::Structured { value_digest, .. } = &mut input.references[63].target {
+        *value_digest = digest(b"a changed digest on one duplicated selection");
+    }
+    assert!(prepare_input(&input, &Control::none()).is_err());
+}

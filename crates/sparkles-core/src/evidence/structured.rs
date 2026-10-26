@@ -31,23 +31,45 @@ pub fn select_json_lexical_utf8<'a>(
     pointer: &str,
     control: &Control,
 ) -> Result<SelectedJsonValue<'a>> {
+    let mut selected = select_json_lexical_utf8_batch(source, &[pointer], control)?;
+    Ok(selected.swap_remove(0))
+}
+
+/// A revision is validated and traversed once for its entire set of mandatory
+/// pointers. Outputs retain their input positions, including duplicate pointers.
+pub(super) fn select_json_lexical_utf8_batch<'a>(
+    source: &'a str,
+    pointers: &[&str],
+    control: &Control,
+) -> Result<Vec<SelectedJsonValue<'a>>> {
     control.check()?;
+    if pointers.is_empty() {
+        return Ok(Vec::new());
+    }
     input_bound(source.len())?;
-    validate_pointer(pointer, control)?;
-    let mut memory = Memory::new(source.len().saturating_add(pointer.len()))?;
-    let tokens = pointer_tokens(pointer, &mut memory, control)?;
+    let mut memory = Memory::new(pointers.iter().fold(source.len(), |total, pointer| {
+        total.saturating_add(pointer.len())
+    }))?;
+    memory.add(
+        pointers.len().saturating_mul(
+            (std::mem::size_of::<SelectedJsonValue<'_>>()
+                + std::mem::size_of::<Option<(usize, usize)>>())
+            .saturating_mul(4),
+        ),
+    )?;
+    let trie = pointer_trie(pointers, &mut memory, control)?;
     validate_json(source, control)?;
     let bytes = source.as_bytes();
     let mut position = whitespace(bytes, 0, control)?;
     let mut matched = Some(0);
     let mut stack: Vec<Frame> = Vec::new();
-    let mut selected = None;
+    let mut selected = vec![None; pointers.len()];
     loop {
         control.check()?;
         let start = position;
         match bytes[position] {
             b'{' | b'[' => {
-                memory.add(std::mem::size_of::<Frame>().saturating_mul(2))?;
+                memory.add(std::mem::size_of::<Frame>().saturating_mul(4))?;
                 stack.push(Frame {
                     start,
                     matched,
@@ -73,7 +95,7 @@ pub fn select_json_lexical_utf8<'a>(
                     let decoded = decode_string(raw, &mut memory, control)?;
                     memory.remove(decoded.capacity().saturating_add(96));
                 }
-                select(start, position, matched, tokens.len(), &mut selected);
+                select(start, position, matched, &trie, &mut selected);
             }
             _ => {
                 while position < bytes.len()
@@ -87,21 +109,33 @@ pub fn select_json_lexical_utf8<'a>(
                     }
                     position += 1;
                 }
-                select(start, position, matched, tokens.len(), &mut selected);
+                select(start, position, matched, &trie, &mut selected);
             }
         }
         loop {
             control.check()?;
             position = whitespace(bytes, position, control)?;
             let Some(frame) = stack.last_mut() else {
-                let (start, end) = selected.ok_or_else(|| {
-                    Error::invalid("span-mismatch: JSON Pointer does not select a retained value")
-                })?;
-                let utf8 = &source[start..end];
-                return Ok(SelectedJsonValue {
-                    utf8,
-                    digest: Sha256Digest::of_bytes(utf8.as_bytes(), control)?,
-                });
+                let mut values = Vec::with_capacity(selected.len());
+                let mut digests = std::collections::BTreeMap::new();
+                for range in selected {
+                    control.check()?;
+                    let (start, end) = range.ok_or_else(|| {
+                        Error::invalid(
+                            "span-mismatch: JSON Pointer does not select a retained value",
+                        )
+                    })?;
+                    let utf8 = &source[start..end];
+                    let digest = match digests.entry((start, end)) {
+                        std::collections::btree_map::Entry::Occupied(entry) => *entry.get(),
+                        std::collections::btree_map::Entry::Vacant(entry) => {
+                            memory.add(144)?;
+                            *entry.insert(Sha256Digest::of_bytes(utf8.as_bytes(), control)?)
+                        }
+                    };
+                    values.push(SelectedJsonValue { utf8, digest });
+                }
+                return Ok(values);
             };
             let closing = match frame.kind {
                 Children::Object { .. } => b'}',
@@ -110,17 +144,11 @@ pub fn select_json_lexical_utf8<'a>(
             if bytes[position] == closing {
                 position += 1;
                 let frame = stack.pop().expect("last frame exists");
-                select(
-                    frame.start,
-                    position,
-                    frame.matched,
-                    tokens.len(),
-                    &mut selected,
-                );
+                select(frame.start, position, frame.matched, &trie, &mut selected);
                 if let Children::Object { charged, .. } = frame.kind {
                     memory.remove(charged);
                 }
-                memory.remove(std::mem::size_of::<Frame>().saturating_mul(2));
+                memory.remove(std::mem::size_of::<Frame>().saturating_mul(4));
                 continue;
             }
             if !frame.first {
@@ -134,10 +162,9 @@ pub fn select_json_lexical_utf8<'a>(
                     let end = string_end(bytes, position, control)?;
                     let key = decode_string(&source[position..end], &mut memory, control)?;
                     let key_charge = key.capacity().saturating_add(96);
-                    let child = frame.matched.and_then(|depth| {
-                        (tokens.get(depth).map(Cow::as_ref) == Some(key.as_str()))
-                            .then_some(depth + 1)
-                    });
+                    let child = frame
+                        .matched
+                        .and_then(|node| trie[node].children.get(key.as_str()).copied());
                     if !keys.insert(key) {
                         return Err(Error::invalid(
                             "span-mismatch: duplicate decoded JSON object key",
@@ -149,9 +176,8 @@ pub fn select_json_lexical_utf8<'a>(
                     child
                 }
                 Children::Array { next } => {
-                    let child = frame.matched.and_then(|depth| {
-                        (tokens.get(depth).map(Cow::as_ref) == Some(next.to_string().as_str()))
-                            .then_some(depth + 1)
+                    let child = frame.matched.and_then(|node| {
+                        trie[node].children.get(next.to_string().as_str()).copied()
                     });
                     *next += 1;
                     child
@@ -219,15 +245,54 @@ fn input_bound(len: usize) -> Result<()> {
     Ok(())
 }
 
+#[derive(Default)]
+struct PointerNode<'a> {
+    children: std::collections::BTreeMap<Cow<'a, str>, usize>,
+    outputs: Vec<usize>,
+}
+
+fn pointer_trie<'a>(
+    pointers: &[&'a str],
+    memory: &mut Memory,
+    control: &Control,
+) -> Result<Vec<PointerNode<'a>>> {
+    memory.add(std::mem::size_of::<PointerNode<'_>>().saturating_mul(4))?;
+    let mut nodes = vec![PointerNode::default()];
+    for (output, pointer) in pointers.iter().enumerate() {
+        validate_pointer(pointer, control)?;
+        let mut node = 0;
+        for token in pointer_tokens(pointer, memory, control)? {
+            if let Some(child) = nodes[node].children.get(token.as_ref()) {
+                node = *child;
+            } else {
+                memory.add(
+                    std::mem::size_of::<PointerNode<'_>>()
+                        .saturating_mul(4)
+                        .saturating_add(96),
+                )?;
+                let child = nodes.len();
+                nodes.push(PointerNode::default());
+                nodes[node].children.insert(token, child);
+                node = child;
+            }
+        }
+        memory.add(std::mem::size_of::<usize>().saturating_mul(4))?;
+        nodes[node].outputs.push(output);
+    }
+    Ok(nodes)
+}
+
 fn select(
     start: usize,
     end: usize,
     matched: Option<usize>,
-    token_count: usize,
-    selected: &mut Option<(usize, usize)>,
+    trie: &[PointerNode<'_>],
+    selected: &mut [Option<(usize, usize)>],
 ) {
-    if matched == Some(token_count) {
-        *selected = Some((start, end));
+    if let Some(node) = matched {
+        for output in &trie[node].outputs {
+            selected[*output] = Some((start, end));
+        }
     }
 }
 
@@ -312,7 +377,14 @@ impl Memory {
     }
 }
 
+#[cfg(test)]
+std::thread_local! {
+    pub(super) static JSON_REVISION_VALIDATIONS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
 fn validate_json(source: &str, control: &Control) -> Result<()> {
+    #[cfg(test)]
+    JSON_REVISION_VALIDATIONS.with(|count| count.set(count.get() + 1));
     let mut nesting = nesting::Scanner::new(nesting::Syntax::Json, nesting::MAX_ELEMENTS);
     for chunk in source.as_bytes().chunks(CHUNK) {
         control.check()?;
@@ -521,8 +593,13 @@ mod tests {
                 serde_json::to_string(&value).unwrap(),
                 serde_json::to_string_pretty(&value).unwrap(),
             ] {
-                for pointer in &pointers {
+                let pointer_refs: Vec<_> = pointers.iter().map(String::as_str).collect();
+                let batch =
+                    select_json_lexical_utf8_batch(&source, &pointer_refs, &Control::none())
+                        .unwrap();
+                for (pointer, batched) in pointers.iter().zip(batch) {
                     let selected = selected(&source, pointer);
+                    assert_eq!(selected, batched);
                     let actual: serde_json::Value = serde_json::from_str(selected.utf8).unwrap();
                     assert_eq!(
                         Some(&actual),
@@ -532,6 +609,43 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[test]
+    fn batched_pointers_preserve_duplicates_parent_child_and_output_order() {
+        let source = r#"{ "array": [{"a/b":1}, {"a/b":2}], "~":7 }"#;
+        let pointers = [
+            "/array/1",
+            "",
+            "/array/1",
+            "/~0",
+            "/array/0/a~1b",
+            "/array/1/a~1b",
+        ];
+        JSON_REVISION_VALIDATIONS.with(|count| count.set(0));
+        let values = select_json_lexical_utf8_batch(source, &pointers, &Control::none()).unwrap();
+        assert_eq!(JSON_REVISION_VALIDATIONS.with(std::cell::Cell::get), 1);
+        assert_eq!(
+            values.iter().map(|value| value.utf8).collect::<Vec<_>>(),
+            [r#"{"a/b":2}"#, source, r#"{"a/b":2}"#, "7", "1", "2"]
+        );
+        assert_eq!(values[0].utf8.as_ptr(), values[2].utf8.as_ptr());
+        for pointers in [
+            ["/array/0", "/missing"],
+            ["/array/0", "/array/01"],
+            ["/array/0", "/bad~2"],
+        ] {
+            assert!(select_json_lexical_utf8_batch(source, &pointers, &Control::none()).is_err());
+        }
+        assert!(
+            select_json_lexical_utf8_batch(r#"{"x":1,"x":2}"#, &["", "/x"], &Control::none())
+                .is_err()
+        );
+        assert!(
+            select_json_lexical_utf8_batch(source, &[], &Control::none())
+                .unwrap()
+                .is_empty()
+        );
     }
 
     #[test]
