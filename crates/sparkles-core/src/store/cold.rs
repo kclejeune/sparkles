@@ -707,6 +707,95 @@ mod tests {
         atomic::{AtomicBool, Ordering},
     };
 
+    #[cfg(unix)]
+    fn metadata_outcome_after_short_read(annotation: bool) {
+        use std::{
+            ffi::CString,
+            io::Write,
+            os::{fd::AsRawFd, unix::ffi::OsStrExt, unix::fs::MetadataExt},
+            time::{Duration, Instant},
+        };
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join(if annotation {
+            crate::annotations::FILE
+        } else {
+            "commits.bin"
+        });
+        let native = CString::new(path.as_os_str().as_bytes()).unwrap();
+        // SAFETY: native is a live, NUL-terminated path and permissions are valid.
+        assert_eq!(unsafe { libc::mkfifo(native.as_ptr(), 0o600) }, 0);
+        let original = std::fs::metadata(&path).unwrap().ino();
+        let cancel = Arc::new(AtomicBool::new(false));
+        let flag = cancel.clone();
+        let writer_path = path.clone();
+        let writer = std::thread::spawn(move || {
+            let mut writer = std::fs::OpenOptions::new()
+                .write(true)
+                .open(writer_path)
+                .unwrap();
+            writer.write_all(b"partial!").unwrap();
+            let deadline = Instant::now() + Duration::from_secs(5);
+            loop {
+                let mut available: libc::c_int = -1;
+                // SAFETY: writer is a live pipe descriptor and available points to
+                // writable c_int storage of the size FIONREAD requires.
+                assert_eq!(
+                    unsafe { libc::ioctl(writer.as_raw_fd(), libc::FIONREAD, &mut available) },
+                    0
+                );
+                if available == 0 {
+                    break;
+                }
+                assert!(
+                    Instant::now() < deadline,
+                    "reader did not consume the prefix"
+                );
+                std::thread::yield_now();
+            }
+            // The reader consumed eight bytes and is blocked waiting for twelve.
+            // Cancel before closing the pipe, so EOF cannot legitimately return
+            // a successful missing-metadata result without observing this flag.
+            flag.store(true, Ordering::SeqCst);
+        });
+        let options = HistoryOptions {
+            cancel: Some(cancel),
+            deadline: Some(Instant::now() + Duration::from_secs(10)),
+        };
+        let mut budget = ColdBudget::new(ReadLimit {
+            options: &options,
+            memory: Some(4096),
+            held: 0,
+        })
+        .unwrap();
+        budget.charge(17).unwrap();
+        let result = if annotation {
+            crate::annotations::seqs_controlled(root.path(), uuid::Uuid::new_v4(), &mut budget)
+                .map(|loaded| drop(loaded.value))
+        } else {
+            crate::commit::walk_catalog_controlled(&path, &mut budget, |_, _| Ok(())).map(|_| ())
+        };
+        writer.join().unwrap();
+        assert!(
+            matches!(result, Err(Error::Cancelled)),
+            "short metadata read returned success after actual IO cancellation: {result:?}"
+        );
+        assert_eq!(budget.used(), 17);
+        assert_eq!(std::fs::metadata(&path).unwrap().ino(), original);
+        assert_eq!(std::fs::read_dir(root.path()).unwrap().count(), 1);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn metadata_outcome_catalog_cancellation_after_short_read() {
+        metadata_outcome_after_short_read(false);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn metadata_outcome_annotation_cancellation_after_short_read() {
+        metadata_outcome_after_short_read(true);
+    }
+
     #[test]
     fn controlled_utf8_and_trim_match_borrowed_standard_results_and_cancel_midscan() {
         let options = HistoryOptions::default();

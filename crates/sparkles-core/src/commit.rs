@@ -511,7 +511,10 @@ pub(crate) fn read_dataset_file_controlled(
     // Closure-owned paths, parser scratch and containers have dropped even on
     // interruption or version refusal. Only a scalar UUID escapes this scope.
     budget.release(budget.used() - start);
-    result
+    result.and_then(|value| {
+        budget.check()?;
+        Ok(value)
+    })
 }
 
 /// Exercise the actual closed scalar reader with caller-attributed allocation
@@ -1115,7 +1118,10 @@ pub(crate) fn walk_catalog_controlled(
     budget.check()?;
     let file = match File::open(path) {
         Ok(file) => file,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            budget.check()?;
+            return Ok(None);
+        }
         Err(error) => return Err(error.into()),
     };
     let capacity = (budget.available() / 8).clamp(REC as u64, 64 << 10);
@@ -1174,7 +1180,10 @@ pub(crate) fn walk_catalog_controlled(
     })();
     drop(reader);
     budget.release(capacity);
-    result
+    result.and_then(|value| {
+        budget.check()?;
+        Ok(value)
+    })
 }
 
 /// The commit catalog: every retained commit record, in memory, backed by `commits.bin`

@@ -59,7 +59,10 @@ pub(crate) fn pin_controlled(
     // Owned metadata and its parser scratch drop before their held charge returns
     // to the same request. Existing caller-held bytes remain untouched.
     budget.release(budget.used() - start);
-    result
+    result.and_then(|value| {
+        budget.check()?;
+        Ok(value)
+    })
 }
 
 #[cfg(test)]

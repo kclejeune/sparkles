@@ -599,6 +599,10 @@ pub(crate) fn seqs_controlled(
             charge: budget.used() - before,
         })
     })();
+    let result = result.and_then(|value| {
+        budget.check()?;
+        Ok(value)
+    });
     if result.is_err() {
         budget.release(budget.used() - before);
     }
