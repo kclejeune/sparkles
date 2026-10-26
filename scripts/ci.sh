@@ -16,7 +16,7 @@
 # cache (see the task caching section of mise.toml).
 #
 # Usage: scripts/ci.sh [--fast] [--fail-fast] [--force] [--jobs N] [task...]
-#   --fast       formatting, doc paths, Clippy on the workspace and the Rust tests only. The
+#   --fast       formatting, shell checks, doc paths, Clippy on the workspace and the Rust tests only. The
 #                per-feature test runs (test:features) belong to the full gate alone.
 #   --fail-fast  stop the remaining tasks after the first failure
 #   --force      run every check even when the task cache has a pass for it
@@ -34,12 +34,12 @@ main() {
   cd "$(dirname "$0")/.."
 
   full=(
-    fmt:check ui:fmt:check node:fmt:check lint:doc-paths test:bench-scripts
+    fmt:check ui:fmt:check node:fmt:check lint:shell lint:doc-paths test:bench-scripts
     lint ui:check fmt:wasm py:lint jvm:lint node:lint
     test ui:test lint:features test:features
     py:test jvm:rust-test jvm:test node:test node:client:check licenses:check
   )
-  fast=(fmt:check lint:doc-paths lint test)
+  fast=(fmt:check lint:shell lint:doc-paths lint test)
 
   jobs=2
   fail_fast=

@@ -306,6 +306,12 @@ description = "The server's unit and integration tests with the default features
 depends = ["ui:build"]
 run = "scripts/test-features.sh"
 
+[tasks."lint:shell"]
+# Read the Git index each time so newly tracked scripts cannot reuse an older pass.
+cache = { enabled = false }
+description = "Check formatting and ShellCheck for tracked shell scripts outside immutable benchmark run captures"
+run = "bash scripts/check-shell.sh"
+
 [tasks."lint:doc-paths"]
 sources = ["@group:rust", "@group:docs", "scripts/check-doc-paths.py"]
 outputs = []

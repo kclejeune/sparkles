@@ -84,6 +84,7 @@ mise run fmt          # cargo fmt + oxfmt        (fmt:check for CI)
 mise run lint         # clippy -D warnings + svelte-check
 mise run lint:features # clippy -D warnings over feature combinations (in ci)
 mise run test:features # the server's tests with default features off and one feature set on (in ci, not ci:fast)
+mise run lint:shell     # formatting and ShellCheck for maintained shell scripts (in ci)
 mise run lint:doc-paths # every crates/sparkles… path cited in the docs exists (in ci)
 mise run fmt:wasm     # clippy for the formatter's wasm32 build (in ci)
 mise run fmt:fuzz     # fuzz the formatter with cargo-fuzz (needs nightly and cargo-fuzz; not in ci)
@@ -105,7 +106,7 @@ mise run jvm:sample   # compile, test and run the Java sample (jvm/sample-java)
 mise run jvm:lock     # refresh crates/sparkles-ffi/Cargo.lock from Cargo.lock
 mise run jvm:nix-deps # refresh nix/jvm-deps.json after the Gradle dependencies change
 mise run ci           # every check below, with a log per task and a summary (scripts/ci.sh)
-mise run ci:fast      # fmt:check + lint:doc-paths + lint + test, for iterating
+mise run ci:fast      # fmt:check + lint:shell + lint:doc-paths + lint + test, for iterating
 mise run doc          # API docs of the library crates
 mise run openapi      # rewrite docs/openapi.json after an API change (a test fails until then)
 mise run docs:screenshots # the README's screenshots (docs/images): the demo dataset in docs/demo, and the mock backend for branches, the agent pages, the arcs maps and the GraphRAG communities
@@ -130,7 +131,9 @@ staged files, the hooks run:
 * `cargo fmt`;
 * oxfmt, the UI's formatter (a devDependency), on `ui/`;
 * `nix fmt` (nixfmt, from the flake) on `*.nix`;
-* shfmt and shellcheck on shell scripts.
+* shfmt and shellcheck on maintained shell scripts. Captured scripts under
+  `docs/benchmarks/<category>/runs/` remain unchanged as benchmark evidence and are
+  excluded from both checks and formatting hooks.
 
 Run `mise run hooks:install` once per clone to install the hook. `mise run hooks:run`
 runs every hook over the whole tree.

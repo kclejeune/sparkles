@@ -114,9 +114,7 @@ jobs:
           cargo fmt --manifest-path crates/sparkles-node/Cargo.toml --check
       - name: shfmt and shellcheck
         if: ${{ !cancelled() }}
-        run: |
-          git ls-files -z '*.sh' | xargs -0 shfmt --diff --indent 2 --case-indent --space-redirects
-          git ls-files -z '*.sh' | xargs -0 shellcheck
+        run: mise run lint:shell
       - name: Cited doc paths (mise run lint:doc-paths)
         if: ${{ !cancelled() }}
         run: python3 scripts/check-doc-paths.py --code
