@@ -127,9 +127,12 @@ request or on every write, and the schema report counts what the data holds.
   exact result counts of the head kept in `validation-status.json`. It skips writes that
   touch no relevant graph or only predicates no shape reads, and falls back to a full
   validation when the head's state is unknown, the shapes change or too much is affected.
-  SHACL-SPARQL constraints anchored at the focus node, `sh:targetWhere` targets and
+  SHACL-SPARQL constraints over ordinary stored predicates anchored at the focus node,
+  `sh:targetWhere` targets and
   `rdfs:subClassOf` changes validate incrementally. For recursive ShEx schemas the guard
-  keeps the head's typing and validates only where typings change.
+  keeps the head's typing and validates only where typings change. Computed SPARQL
+  predicates use full validation when their actual graph reads cannot be localized,
+  including list property functions and potentially rewritten spatial relations.
 * Results show in `sparkles_validation_*` metrics, the `validation` and `validation_ms`
   access-log fields, CLI summaries and `sparkles stats`.
 

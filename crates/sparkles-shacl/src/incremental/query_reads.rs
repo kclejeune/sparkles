@@ -91,6 +91,9 @@ fn path(
     use PropertyPathExpression as E;
     Ok(Some(match expression {
         E::NamedNode(n) => {
+            if crate::predicate_reads::computed(n.as_str()) {
+                return Ok(None);
+            }
             admission::admit_iri(n, control)?;
             P::Predicate(n.clone())
         }
@@ -185,6 +188,10 @@ fn analyze(
             let mut unanchored = false;
             for triple in patterns {
                 charge(control)?;
+                if matches!(&triple.predicate, NamedNodePattern::NamedNode(p) if crate::predicate_reads::computed(p.as_str()))
+                {
+                    return Ok(Reads::Unsupported);
+                }
                 let (prefix, forward) = if let Some(p) = anchor(&triple.subject, anchors) {
                     (p, true)
                 } else if let Some(p) = anchor(&triple.object, anchors) {

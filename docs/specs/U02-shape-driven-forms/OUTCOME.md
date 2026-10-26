@@ -18,7 +18,7 @@ The same allowance admits at most 500 additional distinct targets beyond the dir
 touched resources, shared across shapes and both states. Exactly 500 is accepted. The
 next target refuses the check rather than returning a partial conformance report.
 
-Dependency analysis admits owned path normalization, generated prefixes and memo copies before cloning them. Lexical copies charge each 128-byte chunk to the same structural work allowance. SPARQL dependency localization admits directly anchored triples and single path patterns with pure filters. Genuinely global queries still enumerate bounded actual targets. Indirect joins and other unadmitted query-dependency producers refuse the check rather than broadening it to unrelated targets. Streaming predicate and path traversal charges work before retaining new frontier
+Dependency analysis admits owned path normalization, generated prefixes and memo copies before cloning them. Lexical copies charge each 128-byte chunk to the same structural work allowance. SPARQL dependency localization admits directly anchored triples and single path patterns with pure filters. Genuinely global queries still enumerate bounded actual targets. Property functions and potentially computed predicates need their actual read producers. Indirect joins and other unadmitted query-dependency producers refuse the check rather than broadening it to unrelated targets. Streaming predicate and path traversal charges work before retaining new frontier
 entries. Cancellation and one absolute deadline cover discovery and validation. The
 allowance bounds target discovery and its retained state, not the entire SHACL heap or
 the existing cold index decoder. Controlled physical reader integration remains under

@@ -1120,6 +1120,14 @@ capabilities and remaining work are described by the spec status and Outcome.
 
 ## Outcome
 
+Computed SPARQL predicates use the existing full validation fallback until their actual
+read dependencies can be localized. This includes list and container property functions,
+search and predicate-discovery operators, spatial property functions and potentially
+rewritten GeoSPARQL relations. A downstream RDF list edit must therefore still reach a
+shape targeting its head. Regression fixtures verify ordinary validation detects the
+violation and a strict write guard rejects it without changing the conforming snapshot.
+
+
 **Phase 1 shipped on 2026-09-30** in three steps:
 
 1. The store's write guard. It checks every commit's post-state before anything is

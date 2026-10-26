@@ -41,6 +41,7 @@ mod localize;
 mod nodeeval;
 pub mod nodeexpr;
 pub mod path;
+mod predicate_reads;
 pub mod report;
 pub mod shapes;
 pub mod sparql;
