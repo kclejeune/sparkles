@@ -262,6 +262,106 @@ mod tests {
     }
 
     #[test]
+    fn scalar_commit_observations_are_controlled_and_provisional_until_final_proof() {
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("wal.log");
+        let data = data(0);
+        let wire: Vec<u8> = [
+            data,
+            commit_record(11, &data, 0),
+            data,
+            commit_record(12, &data, 0),
+        ]
+        .into_iter()
+        .flatten()
+        .collect();
+        std::fs::write(&path, &wire).unwrap();
+        let options = HistoryOptions::default();
+        let mut budget = ColdBudget::new(ReadLimit {
+            options: &options,
+            memory: Some(4096),
+            held: 0,
+        })
+        .unwrap();
+        let mut reader = budget.buffered(&path).unwrap().value;
+        let mut observed = Vec::new();
+        let proof = prove_prefix_with(
+            &mut reader,
+            wire.len() as u64,
+            10,
+            11,
+            false,
+            Some(132),
+            u64::MAX,
+            None,
+            &path,
+            &budget,
+            &mut |record| {
+                observed.push((record.point.seq, record.point.offset, record.metadata));
+                Ok(())
+            },
+        )
+        .unwrap();
+        assert_eq!(proof.head.seq, 12);
+        assert_eq!(
+            observed,
+            [
+                (11, 66, Some((100, CommitKind::Update, 0))),
+                (12, 132, Some((100, CommitKind::Update, 0)))
+            ]
+        );
+        std::fs::write(&path, &wire[..66]).unwrap();
+        let mut reader = budget.buffered(&path).unwrap().value;
+        observed.clear();
+        let result = prove_prefix_with(
+            &mut reader,
+            66,
+            10,
+            11,
+            false,
+            Some(132),
+            u64::MAX,
+            None,
+            &path,
+            &budget,
+            &mut |record| {
+                observed.push((record.point.seq, record.point.offset, record.metadata));
+                Ok(())
+            },
+        );
+        assert!(matches!(result, Err(Error::Corrupt(_))));
+        assert_eq!(
+            observed.len(),
+            1,
+            "observations must be discarded after the final refusal"
+        );
+        std::fs::write(&path, &wire).unwrap();
+        let mut reader = budget.buffered(&path).unwrap().value;
+        let mut visits = 0;
+        assert!(matches!(
+            prove_prefix_with(
+                &mut reader,
+                wire.len() as u64,
+                10,
+                11,
+                false,
+                Some(132),
+                u64::MAX,
+                None,
+                &path,
+                &budget,
+                &mut |_| {
+                    visits += 1;
+                    Err(Error::Cancelled)
+                }
+            ),
+            Err(Error::Cancelled)
+        ));
+        assert_eq!(visits, 1);
+        assert_eq!(std::fs::read(&path).unwrap(), wire);
+    }
+
+    #[test]
     fn streaming_durability_matches_existing_classifier_for_damage_and_fences() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("wal.log");
@@ -326,6 +426,15 @@ pub(crate) struct ProvenWal {
     pub(crate) selected: Option<WalPoint>,
 }
 
+/// Provisional metadata of one physically decoded commit. Observations may be
+/// used only after the complete probe succeeds, including its final durable bound.
+/// The origin reader resolves timestamps/counts; this is not admission or identity.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct WalCommitObservation {
+    pub(crate) point: WalPoint,
+    pub(crate) metadata: Option<(i64, CommitKind, u8)>,
+}
+
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn prove_prefix(
     reader: &mut BufReader<File>,
@@ -338,6 +447,35 @@ pub(crate) fn prove_prefix(
     annotated: Option<&[u64]>,
     path: &Path,
     budget: &ColdBudget<'_>,
+) -> Result<ProvenWal> {
+    prove_prefix_with(
+        reader,
+        extent,
+        base,
+        target,
+        fold_legacy,
+        strict_from,
+        dvocab_len,
+        annotated,
+        path,
+        budget,
+        &mut |_| Ok(()),
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn prove_prefix_with(
+    reader: &mut BufReader<File>,
+    extent: u64,
+    base: u64,
+    target: u64,
+    fold_legacy: bool,
+    strict_from: Option<u64>,
+    dvocab_len: u64,
+    annotated: Option<&[u64]>,
+    path: &Path,
+    budget: &ColdBudget<'_>,
+    visit: &mut dyn FnMut(WalCommitObservation) -> Result<()>,
 ) -> Result<ProvenWal> {
     check_strict_from(path, strict_from)?;
     reader.seek(SeekFrom::Start(0))?;
@@ -409,6 +547,15 @@ pub(crate) fn prove_prefix(
                 if head.seq == target {
                     selected = Some(head);
                 }
+                budget.check()?;
+                visit(WalCommitObservation {
+                    point: head,
+                    metadata: match meta {
+                        Some(Ok((_, timestamp, kind, flags))) => Some((timestamp, kind, flags)),
+                        _ => None,
+                    },
+                })?;
+                budget.check()?;
                 crc = flate2::Crc::new();
                 needed = 0;
             }

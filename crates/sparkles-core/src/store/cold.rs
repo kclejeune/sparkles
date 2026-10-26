@@ -9,7 +9,8 @@ use serde::de::DeserializeOwned;
 use std::{fs::File, io::Read, path::Path};
 
 mod linked;
-pub(super) use linked::read_link_controlled;
+mod value;
+pub(super) use linked::{head_vocabulary_controlled, read_link_controlled};
 
 const CHUNK: usize = 64 << 10;
 // The input stays live while Serde owns its scratch and decoded containers. Metadata
@@ -293,6 +294,54 @@ impl<'a> ColdBudget<'a> {
         Ok(bytes)
     }
 
+    /// Validate each UTF-8 chunk before borrowing the original bytes as text. A
+    /// chunk ends only at a code-point boundary and is never larger than64 KiB.
+    pub(crate) fn utf8<'b>(&self, bytes: &'b [u8]) -> Result<&'b str> {
+        let mut start = 0;
+        while start < bytes.len() {
+            self.key_step("cold UTF-8 chunk", start)?;
+            let mut end = start.saturating_add(CHUNK).min(bytes.len());
+            if end < bytes.len() {
+                while end > start && bytes[end] & 0xc0 == 0x80 {
+                    end -= 1;
+                }
+            }
+            if end == start || std::str::from_utf8(&bytes[start..end]).is_err() {
+                return Err(Error::Corrupt("historical metadata is not UTF-8".into()));
+            }
+            start = end;
+        }
+        self.check()?;
+        // SAFETY: contiguous chunks cover every byte, each was independently
+        // validated, and every split is a UTF-8 code-point boundary. No mutation
+        // occurs while the returned borrow of the same bytes remains live.
+        Ok(unsafe { std::str::from_utf8_unchecked(bytes) })
+    }
+
+    pub(crate) fn trim_text<'b>(&self, bytes: &'b [u8]) -> Result<&'b str> {
+        let text = self.utf8(bytes)?;
+        let mut start = 0;
+        for (index, ch) in text.char_indices() {
+            self.key_step("cold leading whitespace", index)?;
+            if !ch.is_whitespace() {
+                start = index;
+                break;
+            }
+            start = index + ch.len_utf8();
+        }
+        let mut end = text.len();
+        for (index, ch) in text[start..].char_indices().rev() {
+            self.key_step("cold trailing whitespace", index)?;
+            if !ch.is_whitespace() {
+                end = start + index + ch.len_utf8();
+                break;
+            }
+            end = start + index;
+        }
+        self.check()?;
+        Ok(&text[start..end])
+    }
+
     /// Deserialize through a controlled reader, so cancellation also reaches Serde's
     /// string, escape, object and sequence loops. The raw input is already admitted.
     pub(crate) fn json<T: DeserializeOwned>(&mut self, bytes: &[u8]) -> Result<Loaded<T>> {
@@ -316,6 +365,28 @@ impl<'a> ColdBudget<'a> {
             result.map_err(|error| Error::Corrupt(format!("historical metadata: {error}")))?;
         self.check()?;
         Ok(Loaded { value, charge })
+    }
+
+    /// Consume an already admitted metadata Value through its closed Serde schema.
+    /// Its JSON admission remains held across both old and replacement containers.
+    pub(crate) fn value<T: DeserializeOwned>(&self, value: serde_json::Value) -> Result<T> {
+        self.check()?;
+        let result = value::from_value(self, value)?;
+        self.check()?;
+        Ok(result)
+    }
+
+    /// Project fields from the same closed schema declaration before typed
+    /// conversion, so unknown extensions cannot enter an uncontrolled flatten pass.
+    pub(crate) fn value_fields<T: DeserializeOwned>(
+        &self,
+        value: serde_json::Value,
+        fields: &[&str],
+    ) -> Result<T> {
+        self.check()?;
+        let result = value::from_fields(self, value, fields)?;
+        self.check()?;
+        Ok(result)
     }
 
     /// Check checksums in bounded chunks while their admitted input remains live.
@@ -631,7 +702,180 @@ fn retain_parse<T>(loaded: Loaded<T>, retained: u64, budget: &mut ColdBudget<'_>
 mod tests {
     use super::*;
     use crate::history::HistoryOptions;
-    use std::sync::{Arc, atomic::AtomicBool};
+    use std::sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+    };
+
+    #[test]
+    fn controlled_utf8_and_trim_match_borrowed_standard_results_and_cancel_midscan() {
+        let options = HistoryOptions::default();
+        let budget = ColdBudget::new(ReadLimit {
+            options: &options,
+            memory: Some(0),
+            held: 0,
+        })
+        .unwrap();
+        for padding in (64 << 10) - 4..(64 << 10) + 4 {
+            let text = "a".repeat(padding) + "🦀éλ";
+            let actual = budget.utf8(text.as_bytes()).unwrap();
+            assert_eq!(actual, text);
+            assert_eq!(actual.as_ptr(), text.as_ptr());
+        }
+        for bytes in [
+            vec![0x80; 70_000],
+            vec![0xff],
+            vec![0xf0, 0x90, 0x80],
+            vec![0xc0, 0x80],
+        ] {
+            assert!(std::str::from_utf8(&bytes).is_err());
+            assert!(matches!(budget.utf8(&bytes), Err(Error::Corrupt(_))));
+        }
+        for text in [
+            "",
+            " ",
+            "\r\n\t",
+            "gen-0001",
+            "  gen-0001\n",
+            "\u{2003}gen-0001\u{3000}",
+            "🦀",
+            " x 🦀 x ",
+        ] {
+            assert_eq!(budget.trim_text(text.as_bytes()).unwrap(), text.trim());
+        }
+        let cancel = Arc::new(AtomicBool::new(false));
+        let options = HistoryOptions {
+            cancel: Some(cancel.clone()),
+            deadline: None,
+        };
+        let mut budget = ColdBudget::new(ReadLimit {
+            options: &options,
+            memory: Some(0),
+            held: 0,
+        })
+        .unwrap();
+        let observer = |stage: &str, at: usize| {
+            if stage == "cold UTF-8 chunk" && at > 0 {
+                cancel.store(true, Ordering::Relaxed);
+            }
+        };
+        budget.observe_keys(&observer);
+        assert!(matches!(
+            budget.utf8(&vec![b'x'; 256 << 10]),
+            Err(Error::Cancelled)
+        ));
+        cancel.store(false, Ordering::Relaxed);
+        let observer = |stage: &str, at: usize| {
+            if stage == "cold leading whitespace" && at == 1024 {
+                cancel.store(true, Ordering::Relaxed);
+            }
+        };
+        budget.observe_keys(&observer);
+        assert!(matches!(
+            budget.trim_text((" ".repeat(4096) + "gen-0001").as_bytes()),
+            Err(Error::Cancelled)
+        ));
+        assert_eq!(budget.used(), 0);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn head_dictionary_proof_preserves_linked_positions_without_opening_index_columns() {
+        use crate::{
+            io::{RdfFormat, Source},
+            sparql::update::update,
+            store::{Store, StoreOptions},
+        };
+        let root = tempfile::tempdir().unwrap();
+        let store = Store::open(
+            root.path(),
+            StoreOptions {
+                build: crate::builder::BuildOptions {
+                    threads: 1,
+                    ..Default::default()
+                },
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        store
+            .load(&[Source::from_bytes(
+                b"<urn:base> <urn:p> 1 .".to_vec(),
+                RdfFormat::Turtle,
+                None,
+            )])
+            .unwrap();
+        update(
+            &store,
+            "INSERT DATA { <urn:main> <urn:p> \"delta\" }",
+            &Default::default(),
+        )
+        .unwrap();
+        store.create_branch("dev", &Default::default()).unwrap();
+        let dev = store.branch("dev").unwrap();
+        update(
+            &dev,
+            "INSERT DATA { <urn:dev> <urn:p> \"own\" }",
+            &Default::default(),
+        )
+        .unwrap();
+        store.flush_change_log().unwrap();
+        dev.flush_change_log().unwrap();
+        let main = store.snapshot();
+        let child = dev.snapshot();
+        assert!(child.generation.link.is_some());
+        let base_dir = main.generation.dir.as_deref().unwrap();
+        let hidden = base_dir.join("vocab.dat.hidden");
+        std::fs::rename(base_dir.join("vocab.dat"), &hidden).unwrap();
+        assert!(crate::vocab::Vocab::open(base_dir).is_err());
+        let options = HistoryOptions::default();
+        for snapshot in [&main, &child] {
+            let dir = snapshot.generation.dir.as_deref().unwrap();
+            let branch_root = dir.parent().unwrap();
+            let expected: Vec<_> = (0..snapshot.generation.dvocab.len())
+                .map(|n| snapshot.generation.dvocab.get(n).unwrap())
+                .collect();
+            let before = durable_bytes(dir);
+            let mut budget = ColdBudget::new(ReadLimit {
+                options: &options,
+                memory: Some(16 << 20),
+                held: 0,
+            })
+            .unwrap();
+            budget.charge(17).unwrap();
+            let loaded = head_vocabulary_controlled(dir, branch_root, &mut budget).unwrap();
+            assert_eq!(budget.used(), loaded.charge + 17);
+            assert_eq!(loaded.value.len(), expected.len() as u64);
+            for (n, term) in expected.iter().enumerate() {
+                assert_eq!(loaded.value.get(n as u64).as_deref(), Some(term.as_slice()));
+            }
+            drop(loaded.value);
+            budget.release(loaded.charge);
+            assert_eq!(budget.used(), 17);
+            assert_eq!(durable_bytes(dir), before);
+        }
+        let dir = child.generation.dir.as_deref().unwrap();
+        let path = dir.join(super::super::link::LINK_FILE);
+        let mut file: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        file["segments"][0]["branchId"] = uuid::Uuid::new_v4().to_string().into();
+        let wire = serde_json::to_vec(&file).unwrap();
+        std::fs::write(&path, &wire).unwrap();
+        let mut budget = ColdBudget::new(ReadLimit {
+            options: &options,
+            memory: Some(16 << 20),
+            held: 0,
+        })
+        .unwrap();
+        budget.charge(17).unwrap();
+        assert!(matches!(
+            head_vocabulary_controlled(dir, dir.parent().unwrap(), &mut budget),
+            Err(Error::Corrupt(_))
+        ));
+        assert_eq!(budget.used(), 17);
+        assert_eq!(std::fs::read(&path).unwrap(), wire);
+        std::fs::rename(hidden, base_dir.join("vocab.dat")).unwrap();
+    }
 
     fn immutable_base(fsst: bool) -> tempfile::TempDir {
         use crate::{

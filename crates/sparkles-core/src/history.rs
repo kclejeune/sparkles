@@ -11,6 +11,9 @@
 //! `gen-NNNN.deleting` before removing it, so an interrupted collection is finished at
 //! the next open, and a directory it cannot attribute to this dataset is left alone.
 
+mod readonly;
+pub(crate) use readonly::pin_controlled;
+
 use crate::commit::{self, CommitInfo};
 use crate::error::{Error, Result};
 use crate::store::{Generation, Snapshot};

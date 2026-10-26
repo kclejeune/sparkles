@@ -20,6 +20,33 @@ static LIVE: AtomicUsize = AtomicUsize::new(0);
 static PEAK: AtomicUsize = AtomicUsize::new(0);
 static MEASURE_LOCK: Mutex<()> = Mutex::new(());
 
+// The measured replay/decoder path is synchronous and owns no worker-thread
+// allocations. Shared background work remains visible in global telemetry. A
+// future offload must propagate this scope before these assertions remain valid.
+// Cumulative allocation never subtracts frees, including cross-thread/pre-window
+// storage, and therefore conservatively bounds newly owned caller storage.
+#[derive(Clone, Copy)]
+struct CallerCounts {
+    active: bool,
+    largest: usize,
+    allocated: usize,
+}
+thread_local! {
+    static CALLER: std::cell::Cell<CallerCounts> = const {
+        std::cell::Cell::new(CallerCounts { active: false, largest: 0, allocated: 0 })
+    };
+}
+fn caller_allocated(bytes: usize) {
+    let _ = CALLER.try_with(|cell| {
+        let mut counts = cell.get();
+        if counts.active {
+            counts.largest = counts.largest.max(bytes);
+            counts.allocated = counts.allocated.saturating_add(bytes);
+            cell.set(counts);
+        }
+    });
+}
+
 // SAFETY: allocation/deallocation use System with the caller's layout. Reallocation
 // deliberately moves: allocate with the original alignment, copy the allocation
 // prefix, then free the old block. Failure preserves the original allocation. This
@@ -28,6 +55,7 @@ unsafe impl GlobalAlloc for Counting {
     unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
         let pointer = unsafe { System.alloc(layout) };
         if !pointer.is_null() {
+            caller_allocated(layout.size());
             let live = LIVE.fetch_add(layout.size(), Ordering::SeqCst) + layout.size();
             if ENABLED.load(Ordering::SeqCst) {
                 LARGEST.fetch_max(layout.size(), Ordering::SeqCst);
@@ -46,6 +74,7 @@ unsafe impl GlobalAlloc for Counting {
         };
         let moved = unsafe { System.alloc(replacement) };
         if !moved.is_null() {
+            caller_allocated(size);
             let live = LIVE.fetch_add(size, Ordering::SeqCst) + size;
             if ENABLED.load(Ordering::SeqCst) {
                 LARGEST.fetch_max(size, Ordering::SeqCst);
@@ -62,6 +91,13 @@ unsafe impl GlobalAlloc for Counting {
 }
 
 fn measure<T>(operation: impl FnOnce() -> T) -> (T, usize, usize) {
+    CALLER.with(|cell| {
+        cell.set(CallerCounts {
+            active: true,
+            largest: 0,
+            allocated: 0,
+        })
+    });
     let base = LIVE.load(Ordering::SeqCst);
     LARGEST.store(0, Ordering::SeqCst);
     PEAK.store(base, Ordering::SeqCst);
@@ -69,21 +105,93 @@ fn measure<T>(operation: impl FnOnce() -> T) -> (T, usize, usize) {
     impl Drop for Measuring {
         fn drop(&mut self) {
             ENABLED.store(false, Ordering::SeqCst);
+            let _ = CALLER.try_with(|cell| {
+                let mut counts = cell.get();
+                counts.active = false;
+                cell.set(counts);
+            });
         }
     }
     ENABLED.store(true, Ordering::SeqCst);
     let measuring = Measuring;
     let result = operation();
     drop(measuring);
-    (
-        result,
+    let caller = CALLER.with(std::cell::Cell::get);
+    eprintln!(
+        "allocation attribution: global_largest={}, global_peak={}, caller_largest={}, caller_total={}",
         LARGEST.load(Ordering::SeqCst),
         PEAK.load(Ordering::SeqCst).saturating_sub(base),
-    )
+        caller.largest,
+        caller.allocated
+    );
+    (result, caller.largest, caller.allocated)
 }
 
 #[global_allocator]
 static ALLOCATOR: Counting = Counting;
+#[test]
+fn measurement_excludes_explicit_background_allocation_from_caller_bound() {
+    use std::sync::{Arc, Barrier};
+    let _lock = MEASURE_LOCK
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let barrier = Arc::new(Barrier::new(2));
+    let other = barrier.clone();
+    let worker = std::thread::spawn(move || {
+        other.wait();
+        let allocation = vec![1u8; 700_000];
+        std::hint::black_box(&allocation);
+        other.wait();
+        other.wait();
+        drop(allocation);
+    });
+    let (allocation, largest, bound) = measure(|| {
+        barrier.wait();
+        barrier.wait();
+        let allocation = vec![2u8; 128];
+        std::hint::black_box(&allocation);
+        allocation
+    });
+    barrier.wait();
+    worker.join().unwrap();
+    let caller = CALLER.with(std::cell::Cell::get);
+    assert!(
+        LARGEST.load(Ordering::SeqCst) >= 700_000,
+        "outside allocation did not occur in the measured window"
+    );
+    assert!(caller.largest < 8192 && caller.allocated < 8192);
+    assert!(
+        largest < 8192 && bound < 8192,
+        "background allocation contaminated caller admission"
+    );
+    assert_eq!(allocation.len(), 128);
+}
+
+#[test]
+fn measurement_preexisting_frees_cannot_hide_new_caller_storage() {
+    let _lock = MEASURE_LOCK
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    for cross_thread in [false, true] {
+        let previous = if cross_thread {
+            std::thread::spawn(|| vec![1u8; 1 << 20]).join().unwrap()
+        } else {
+            vec![1u8; 1 << 20]
+        };
+        std::hint::black_box(&previous);
+        let (allocations, _, bound) = measure(|| {
+            drop(previous);
+            let allocations = (vec![2u8; 70_000], vec![3u8; 70_000]);
+            std::hint::black_box(&allocations);
+            allocations
+        });
+        let caller = CALLER.with(std::cell::Cell::get);
+        assert!(caller.allocated >= 140_000);
+        assert!(bound >= 140_000, "a pre-window free hid new caller storage");
+        assert_eq!(allocations.0.len() + allocations.1.len(), 140_000);
+    }
+}
+
 #[test]
 fn cold_replay_refuses_transaction_growth_before_allocating_the_transaction() {
     let _lock = MEASURE_LOCK
@@ -107,17 +215,17 @@ fn cold_replay_refuses_transaction_growth_before_allocating_the_transaction() {
     )
     .unwrap();
     let cap = 64 << 10;
-    let (result, largest, peak) =
+    let (result, largest, bound) =
         measure(|| store.snapshot_at_limited(&At::Commit(1), &HistoryOptions::default(), cap));
     assert!(matches!(result, Err(Error::BudgetExceeded(_))));
-    eprintln!("bounded WAL refusal: largest={largest}, peak={peak}, cap={cap}");
+    eprintln!("bounded WAL refusal: largest={largest}, allocation_bound={bound}, cap={cap}");
     assert!(
         largest <= cap as usize,
         "whole transaction was allocated first: {largest}"
     );
     assert!(
-        peak <= cap as usize,
-        "temporary allocation peak exceeded cap: {peak}"
+        bound <= cap as usize,
+        "cumulative caller allocation exceeded cap: {bound}"
     );
     // The refused attempt must not poison the history cache or select head.
     let (exact, resolved) = store
@@ -136,16 +244,16 @@ fn selector_metadata_is_refused_before_clone() {
     let name = "a".repeat(64);
     store.create_snapshot(&name, &At::Head, None).unwrap();
     let selector = At::Snapshot(name);
-    let (result, largest, peak) =
+    let (result, largest, bound) =
         measure(|| store.snapshot_at_limited(&selector, &HistoryOptions::default(), 16));
     assert!(
         matches!(result, Err(Error::BudgetExceeded(_))),
         "selector name copied before metadata admission"
     );
-    eprintln!("selector metadata refusal: largest={largest}, peak={peak}, cap=16");
+    eprintln!("selector metadata refusal: largest={largest}, allocation_bound={bound}, cap=16");
     assert!(
-        largest <= 16 && peak <= 16,
-        "selector metadata copied before refusal: {largest}/{peak}"
+        largest <= 16 && bound <= 16,
+        "selector metadata copied before refusal: {largest}/{bound}"
     );
 }
 
@@ -172,14 +280,14 @@ fn moving_transaction_growth_counts_old_and_replacement_together() {
     )
     .unwrap();
     let cap = 100 << 10;
-    let (result, largest, peak) =
+    let (result, largest, bound) =
         measure(|| store.snapshot_at_limited(&At::Commit(1), &HistoryOptions::default(), cap));
     assert!(matches!(result, Err(Error::BudgetExceeded(_))));
-    eprintln!("moving WAL refusal: largest={largest}, peak={peak}, cap={cap}");
+    eprintln!("moving WAL refusal: largest={largest}, allocation_bound={bound}, cap={cap}");
     assert!(largest <= cap as usize);
     assert!(
-        peak <= cap as usize,
-        "moving replacement exceeded cap: {peak}"
+        bound <= cap as usize,
+        "moving allocation bound exceeded cap: {bound}"
     );
 }
 
@@ -328,15 +436,15 @@ fn cold_nonempty_whole_column_base_is_admitted_before_decode() {
     store.flush_change_log().unwrap();
     let before = durable_bytes(root.path());
     let cap = 256 << 10;
-    let (result, largest, peak) =
+    let (result, largest, bound) =
         measure(|| store.snapshot_at_limited(&At::Commit(target), &HistoryOptions::default(), cap));
-    eprintln!("whole-column refusal: largest={largest}, peak={peak}, cap={cap}");
+    eprintln!("whole-column refusal: largest={largest}, allocation_bound={bound}, cap={cap}");
     assert!(
         matches!(result, Err(Error::BudgetExceeded(_))),
         "base index decoded without admission"
     );
     assert!(largest <= cap as usize);
-    assert!(peak <= cap as usize, "base decode exceeded cap: {peak}");
+    assert!(bound <= cap as usize, "base decode exceeded cap: {bound}");
     assert!(
         before == durable_bytes(root.path()),
         "refusal modified durable bytes"
@@ -382,17 +490,19 @@ fn backward_nonempty_whole_column_base_is_admitted_before_decode() {
     store.flush_change_log().unwrap();
     let before = durable_bytes(root.path());
     let cap = 512 << 10;
-    let (result, largest, peak) =
+    let (result, largest, bound) =
         measure(|| store.snapshot_at_limited(&At::Commit(target), &HistoryOptions::default(), cap));
-    eprintln!("backward whole-column refusal: largest={largest}, peak={peak}, cap={cap}");
+    eprintln!(
+        "backward whole-column refusal: largest={largest}, allocation_bound={bound}, cap={cap}"
+    );
     assert!(
         matches!(result, Err(Error::BudgetExceeded(_))),
         "backward base index decoded without admission"
     );
     assert!(largest <= cap as usize);
     assert!(
-        peak <= cap as usize,
-        "backward base decode exceeded cap: {peak}"
+        bound <= cap as usize,
+        "backward base decode exceeded cap: {bound}"
     );
     assert!(
         before == durable_bytes(root.path()),

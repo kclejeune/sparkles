@@ -511,6 +511,13 @@ pub(crate) fn seqs_controlled(
                 Err(error) if error.kind() == std::io::ErrorKind::UnexpectedEof => return Ok(None),
                 Err(error) => return Err(error.into()),
             }
+            if &header[..8] == MAGIC {
+                crate::formats::ANNOTATIONS.check(
+                    "retained commit annotations",
+                    u32::from_le_bytes(header[8..12].try_into().unwrap()),
+                    None,
+                )?;
+            }
             if decode_header(&header).map(|h| h.0) != Some(dataset_id) {
                 return Ok(None);
             }
@@ -658,6 +665,32 @@ pub fn nquads_line(q: &oxrdf::Quad) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn controlled_membership_refuses_future_primary_version_without_repair() {
+        use crate::{
+            history::{HistoryOptions, ReadLimit},
+            store::cold::ColdBudget,
+        };
+        let root = tempfile::tempdir().unwrap();
+        let id = uuid::Uuid::new_v4();
+        let mut bytes = encode_header(id, 0);
+        bytes[8..12].copy_from_slice(&99u32.to_le_bytes());
+        std::fs::write(root.path().join(FILE), bytes).unwrap();
+        let options = HistoryOptions::default();
+        let mut budget = ColdBudget::new(ReadLimit {
+            options: &options,
+            memory: Some(4096),
+            held: 0,
+        })
+        .unwrap();
+        assert!(matches!(
+            seqs_controlled(root.path(), id, &mut budget),
+            Err(Error::Unsupported(_))
+        ));
+        assert_eq!(budget.used(), 0);
+        assert_eq!(std::fs::read(root.path().join(FILE)).unwrap(), bytes);
+    }
 
     #[test]
     fn controlled_annotation_membership_preserves_valid_prefix_and_bytes() {

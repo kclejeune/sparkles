@@ -1148,6 +1148,9 @@ impl RecordView<'_> {
     }
 }
 
+type WalkVisitor<'a> =
+    dyn FnMut(usize, u64, &RecordView<'_>, &mut dyn FnMut() -> Result<()>) -> Result<bool> + 'a;
+
 impl ReadOnlyLog {
     /// Walk each segment's valid consecutive prefix without retaining the log or
     /// copying its changes. The callback may retain only data it needs for a query.
@@ -1155,12 +1158,7 @@ impl ReadOnlyLog {
         &self,
         maximum: u64,
         check: &mut dyn FnMut() -> Result<()>,
-        visit: &mut dyn FnMut(
-            usize,
-            u64,
-            &RecordView<'_>,
-            &mut dyn FnMut() -> Result<()>,
-        ) -> Result<bool>,
+        visit: &mut WalkVisitor<'_>,
     ) -> Result<()> {
         check()?;
         for (index, segment) in self.segments.iter().enumerate() {

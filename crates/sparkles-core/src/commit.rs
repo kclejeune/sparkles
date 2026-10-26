@@ -444,12 +444,19 @@ fn legacy_reader() -> u32 {
 fn parse_dataset(bytes: &[u8]) -> Result<DatasetFile> {
     let v: serde_json::Value =
         serde_json::from_slice(bytes).map_err(|e| Error::Corrupt(format!("dataset.json: {e}")))?;
+    check_dataset_value(&v)?;
+    serde_json::from_value(v).map_err(|e| Error::Corrupt(format!("dataset.json: {e}")))
+}
+
+/// Share version refusal with the bounded read-only decoder. This check grants
+/// no profile authority and does not publish or raise any reader requirement.
+fn check_dataset_value(v: &serde_json::Value) -> Result<()> {
     let member = |name: &str| -> Result<u64> {
         match v.get(name) {
             None | Some(serde_json::Value::Null) => Ok(1),
-            Some(n) => n.as_u64().ok_or_else(|| {
-                Error::Corrupt(format!("dataset.json: {name} {n} is not a version"))
-            }),
+            Some(n) => n
+                .as_u64()
+                .ok_or_else(|| Error::Corrupt(format!("dataset.json: {name} is not a version"))),
         }
     };
     let format = member("format")?;
@@ -458,6 +465,8 @@ fn parse_dataset(bytes: &[u8]) -> Result<DatasetFile> {
         let by = v
             .get("writtenBy")
             .and_then(|w| w.as_str())
+            // A damaged header must not format an unbounded native string.
+            .filter(|value| value.len() <= 256)
             .map(|v| format!(", written by Sparkles {v},"))
             .unwrap_or_default();
         return Err(Error::Unsupported(format!(
@@ -466,7 +475,60 @@ fn parse_dataset(bytes: &[u8]) -> Result<DatasetFile> {
             DATASET_READER
         )));
     }
-    serde_json::from_value(v).map_err(|e| Error::Corrupt(format!("dataset.json: {e}")))
+    Ok(())
+}
+
+/// Decode the same identity and version contract without mutable Store startup.
+/// Both Serde passes and their live buffers use the caller's preparation budget.
+pub(crate) fn read_dataset_file_controlled(
+    root: &Path,
+    budget: &mut crate::store::cold::ColdBudget<'_>,
+) -> Result<Option<uuid::Uuid>> {
+    let start = budget.used();
+    budget.charge(
+        (root.as_os_str().len() as u64)
+            .saturating_mul(2)
+            .saturating_add(128),
+    )?;
+    let result = (|| {
+        let bytes = match budget.read_file(&root.join("dataset.json")) {
+            Ok(bytes) => bytes,
+            Err(Error::Io(error)) if error.kind() == std::io::ErrorKind::NotFound => {
+                return Ok(None);
+            }
+            Err(error) => return Err(error),
+        };
+        let raw: crate::store::cold::Loaded<serde_json::Value> = budget.json(&bytes)?;
+        check_dataset_value(&raw.value)?;
+        let parsed: DatasetFile = budget.value_fields(raw.value, DATASET_FIELDS)?;
+        let id = parsed.id;
+        drop(parsed);
+        budget.release(raw.charge);
+        budget.drop_vec(bytes);
+        budget.check()?;
+        Ok(Some(id))
+    })();
+    // Closure-owned paths, parser scratch and containers have dropped even on
+    // interruption or version refusal. Only a scalar UUID escapes this scope.
+    budget.release(budget.used() - start);
+    result
+}
+
+/// Exercise the actual closed scalar reader with caller-attributed allocation
+/// instrumentation. This returns no source, access or managed-admission authority.
+#[doc(hidden)]
+#[cfg(feature = "failpoints")]
+pub fn read_dataset_identity_limited_for_test(
+    root: &Path,
+    options: &crate::history::HistoryOptions,
+    max_memory_bytes: u64,
+) -> Result<Option<uuid::Uuid>> {
+    let mut budget = crate::store::cold::ColdBudget::new(crate::history::ReadLimit {
+        options,
+        memory: Some(max_memory_bytes),
+        held: 0,
+    })?;
+    read_dataset_file_controlled(root, &mut budget)
 }
 
 /// The versions `<root>/dataset.json` records, if it exists and this build reads it.
@@ -535,36 +597,34 @@ pub(crate) fn require_reader(root: &Path, reader: u32) -> Result<()> {
     Ok(())
 }
 
-#[derive(Debug, serde::Serialize, serde::Deserialize)]
-struct DatasetFile {
-    format: u32,
-    #[serde(default = "legacy_reader", rename = "minimumReader")]
-    minimum_reader: u32,
-    /// the release that last opened the database for writing (absent before releases
-    /// recorded it)
-    #[serde(default, rename = "writtenBy", skip_serializing_if = "Option::is_none")]
-    written_by: Option<String>,
-    id: uuid::Uuid,
-    created: String,
-    origin: String,
-    /// the dataset and commit a clone was made from
-    #[serde(
-        default,
-        rename = "forkedFrom",
-        skip_serializing_if = "Option::is_none"
-    )]
-    forked_from: Option<ForkedFrom>,
-    /// the backup a restored dataset was made from
-    #[serde(
-        default,
-        rename = "restoredFrom",
-        skip_serializing_if = "Option::is_none"
-    )]
-    restored_from: Option<RestoredFrom>,
-    /// members a later release added; kept on rewrite so that an additive change survives
-    /// a write by this release (X12 §4.3)
-    #[serde(flatten)]
-    extra: serde_json::Map<String, serde_json::Value>,
+// The declaration owns both the ordinary schema and the read-only projection's
+// field names. A newly typed field cannot silently become an ignored extra there.
+macro_rules! dataset_file {
+    ($($(#[$attr:meta])* $field:ident: $ty:ty => $wire:literal),* $(,)?) => {
+        #[derive(Debug, serde::Serialize, serde::Deserialize)]
+        struct DatasetFile {
+            $($(#[$attr])* #[serde(rename = $wire)] $field: $ty,)*
+            // Ordinary readers preserve extensions on subsequent writes.
+            #[serde(flatten)]
+            extra: serde_json::Map<String, serde_json::Value>,
+        }
+        const DATASET_FIELDS: &[&str] = &[$($wire,)*];
+    };
+}
+
+dataset_file! {
+    format: u32 => "format",
+    #[serde(default = "legacy_reader")]
+    minimum_reader: u32 => "minimumReader",
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    written_by: Option<String> => "writtenBy",
+    id: uuid::Uuid => "id",
+    created: String => "created",
+    origin: String => "origin",
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    forked_from: Option<ForkedFrom> => "forkedFrom",
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    restored_from: Option<RestoredFrom> => "restoredFrom",
 }
 
 /// Where a cloned dataset came from: the source's dataset id and the commit (`seq`) of
@@ -1069,6 +1129,15 @@ pub(crate) fn walk_catalog_controlled(
             Err(error) => return Err(error.into()),
         }
         budget.check()?;
+        // A known primary-file magic with a future version must refuse before
+        // any valid-prefix/reconciliation path can treat it as a missing catalog.
+        if &record[..8] == MAGIC {
+            crate::formats::COMMITS.check(
+                "retained commit catalog",
+                u32::from_le_bytes(record[8..12].try_into().unwrap()),
+                None,
+            )?;
+        }
         let Some((id, first)) = decode_header(&record) else {
             return Ok(None);
         };
@@ -1559,6 +1628,182 @@ pub(crate) fn open_wal_commit_with_crc(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn controlled_dataset_identity_preserves_version_precedence_and_read_only_bytes() {
+        use crate::history::{HistoryOptions, ReadLimit};
+        use crate::store::cold::ColdBudget;
+        let root = tempfile::tempdir().unwrap();
+        let id = uuid::Uuid::new_v4();
+        let options = HistoryOptions::default();
+        let original = dataset_file_bytes(id, "create", 1234);
+        for bytes in [
+            original.clone(),
+            format!(
+                "{{\"format\":99,{}",
+                std::str::from_utf8(&original)
+                    .unwrap()
+                    .trim_start_matches('{')
+            )
+            .into_bytes(),
+            br#"{"format":99,"id":false}"#.to_vec(),
+            br#"{"format":1,"minimumReader":4294967295,"id":false}"#.to_vec(),
+            br#"{"format":1,"minimumReader":[],"id":false}"#.to_vec(),
+            br#"{"format":1,"minimumReader":1,"id":false}"#.to_vec(),
+        ] {
+            std::fs::write(root.path().join("dataset.json"), &bytes).unwrap();
+            let mut budget = ColdBudget::new(ReadLimit {
+                options: &options,
+                memory: Some(4 << 20),
+                held: 0,
+            })
+            .unwrap();
+            let actual = read_dataset_file_controlled(root.path(), &mut budget);
+            match read_dataset_file(root.path()) {
+                Ok(expected) => assert_eq!(actual.unwrap(), expected),
+                Err(Error::Unsupported(_)) => assert!(matches!(actual, Err(Error::Unsupported(_)))),
+                Err(Error::Corrupt(_)) => assert!(matches!(actual, Err(Error::Corrupt(_)))),
+                other => panic!("unexpected ordinary decode {other:?}"),
+            }
+            assert_eq!(budget.used(), 0);
+            assert_eq!(
+                std::fs::read(root.path().join("dataset.json")).unwrap(),
+                bytes
+            );
+        }
+        std::fs::write(root.path().join("dataset.json"), &original).unwrap();
+        let mut tiny = ColdBudget::new(ReadLimit {
+            options: &options,
+            memory: Some(1),
+            held: 0,
+        })
+        .unwrap();
+        assert!(matches!(
+            read_dataset_file_controlled(root.path(), &mut tiny),
+            Err(Error::BudgetExceeded(_))
+        ));
+        assert_eq!(tiny.used(), 0);
+        let cancel = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let controlled = HistoryOptions {
+            cancel: Some(cancel.clone()),
+            deadline: None,
+        };
+        let mut budget = ColdBudget::new(ReadLimit {
+            options: &controlled,
+            memory: Some(4 << 20),
+            held: 0,
+        })
+        .unwrap();
+        cancel.store(true, std::sync::atomic::Ordering::Relaxed);
+        assert!(matches!(
+            read_dataset_file_controlled(root.path(), &mut budget),
+            Err(Error::Cancelled)
+        ));
+        assert_eq!(budget.used(), 0);
+        assert_eq!(
+            std::fs::read(root.path().join("dataset.json")).unwrap(),
+            original
+        );
+    }
+
+    #[test]
+    fn controlled_dataset_extensions_are_preserved_on_disk_and_discarded_cooperatively() {
+        use crate::history::{HistoryOptions, ReadLimit};
+        use crate::store::cold::ColdBudget;
+        use std::sync::{
+            Arc,
+            atomic::{AtomicBool, Ordering},
+        };
+        let root = tempfile::tempdir().unwrap();
+        let id = uuid::Uuid::new_v4();
+        let mut value: serde_json::Value =
+            serde_json::from_slice(&dataset_file_bytes(id, "create", 1234)).unwrap();
+        let object = value.as_object_mut().unwrap();
+        for n in 0..4000 {
+            object.insert(
+                format!("extension{n}"),
+                serde_json::json!([n, {"unknown": [null, false]}]),
+            );
+        }
+        let bytes = serde_json::to_vec(&value).unwrap();
+        std::fs::write(root.path().join("dataset.json"), &bytes).unwrap();
+        let cancel = Arc::new(AtomicBool::new(false));
+        let options = HistoryOptions {
+            cancel: Some(cancel.clone()),
+            deadline: None,
+        };
+        let mut budget = ColdBudget::new(ReadLimit {
+            options: &options,
+            memory: Some(128 << 20),
+            held: 0,
+        })
+        .unwrap();
+        assert_eq!(
+            read_dataset_file_controlled(root.path(), &mut budget).unwrap(),
+            Some(id)
+        );
+        assert_eq!(budget.used(), 0);
+        // Ordinary codecs continue retaining extensions for subsequent rewrites.
+        assert_eq!(
+            read_dataset(root.path()).unwrap().unwrap().extra.len(),
+            4000
+        );
+        let observer = |stage: &str, at: usize| {
+            if stage == "metadata value decode" && at == 50 {
+                cancel.store(true, Ordering::Relaxed);
+            }
+        };
+        budget.observe_keys(&observer);
+        assert!(matches!(
+            read_dataset_file_controlled(root.path(), &mut budget),
+            Err(Error::Cancelled)
+        ));
+        assert_eq!(budget.used(), 0);
+        assert_eq!(
+            std::fs::read(root.path().join("dataset.json")).unwrap(),
+            bytes
+        );
+        cancel.store(false, Ordering::Relaxed);
+        for field in ["format", "minimumReader"] {
+            let bytes = format!("{{\"{field}\":\"{}\"}}", "x".repeat(512 << 10)).into_bytes();
+            std::fs::write(root.path().join("dataset.json"), &bytes).unwrap();
+            let error = read_dataset_file_controlled(root.path(), &mut budget).unwrap_err();
+            assert!(matches!(error, Error::Corrupt(_)));
+            assert!(error.to_string().len() < 128);
+            assert_eq!(budget.used(), 0);
+        }
+    }
+
+    #[test]
+    fn controlled_catalog_refuses_future_primary_version_without_reconciliation() {
+        use crate::history::{HistoryOptions, ReadLimit};
+        use crate::store::cold::ColdBudget;
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("commits.bin");
+        let mut bytes = encode_header(uuid::Uuid::new_v4(), 10);
+        bytes[8..12].copy_from_slice(&99u32.to_le_bytes());
+        let checksum = crc32(&[&bytes[..60]]);
+        bytes[60..].copy_from_slice(&checksum.to_le_bytes());
+        std::fs::write(&path, bytes).unwrap();
+        let options = HistoryOptions::default();
+        let mut budget = ColdBudget::new(ReadLimit {
+            options: &options,
+            memory: Some(4096),
+            held: 0,
+        })
+        .unwrap();
+        let mut visits = 0;
+        assert!(matches!(
+            walk_catalog_controlled(&path, &mut budget, |_, _| {
+                visits += 1;
+                Ok(())
+            }),
+            Err(Error::Unsupported(_))
+        ));
+        assert_eq!(visits, 0);
+        assert_eq!(budget.used(), 0);
+        assert_eq!(std::fs::read(&path).unwrap(), bytes);
+    }
 
     fn sample_commit(seq: u64) -> CommitInfo {
         CommitInfo {
