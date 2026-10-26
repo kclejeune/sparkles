@@ -18,11 +18,11 @@
 #   RUST_LOG             log filter (default: the server's own, as below)
 #   SPARKLES_LOG_FORMAT  text or json (default text)
 #   SPARKLES_BUILD_JOBS  parallel compile jobs of the image build (default: all cores)
-#   SPARKLES_FEATURES    cargo features of the image build (default: embed-local)
+#   SPARKLES_FEATURES    additional cargo features of the image build (default: empty)
 
 x-build-args: &build-args
   BUILD_JOBS: ${SPARKLES_BUILD_JOBS:-}
-  FEATURES: ${SPARKLES_FEATURES-embed-local}
+  FEATURES: ${SPARKLES_FEATURES-}
 
 x-server: &server
   environment:

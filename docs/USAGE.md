@@ -6676,8 +6676,8 @@ add to the standard defaults, and defaults to empty. Local embeddings, encrypted
 repositories and OCR code are already in the standard binary. OCR libraries and
 models remain separate runtime inputs. `--build-arg NO_DEFAULT_FEATURES=1` starts
 from no default features, as `cargo build`
-does. Compose passes `SPARKLES_FEATURES` as `FEATURES`, and an empty value leaves the
-feature out. The two server builds keep separate cargo
+does. Compose passes `SPARKLES_FEATURES` as `FEATURES`, and an empty value keeps
+the standard capabilities. The two server builds keep separate cargo
 target directories in the build cache, so building both does not recompile either one
 from scratch.
 

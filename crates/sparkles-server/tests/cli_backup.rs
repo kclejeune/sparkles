@@ -2168,14 +2168,23 @@ fn encrypted_offline_zero_dataset_policy_provider_cancellation_is_reaped_and_red
     assert!(stderr(&output).contains("cancelled"), "{}", stderr(&output));
     assert!(!stderr(&output).contains(s(&script)));
     assert!(!repo.exists());
+    let provider_exists = || {
+        // SAFETY: signal zero inspects existence without sending a signal.
+        if unsafe { libc::kill(pid, 0) } == 0 {
+            return true;
+        }
+        assert_eq!(
+            std::io::Error::last_os_error().raw_os_error(),
+            Some(libc::ESRCH),
+            "provider absence must be confirmed"
+        );
+        false
+    };
     let deadline = Instant::now() + Duration::from_secs(5);
-    while Path::new(&format!("/proc/{pid}")).exists() && Instant::now() < deadline {
+    while provider_exists() && Instant::now() < deadline {
         std::thread::sleep(Duration::from_millis(10));
     }
-    assert!(
-        !Path::new(&format!("/proc/{pid}")).exists(),
-        "provider must be reaped"
-    );
+    assert!(!provider_exists(), "provider must be reaped");
     let key = h.join("recovery-key");
     private_key(&key, &[83; 32]);
     let mut file =
