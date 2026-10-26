@@ -8,6 +8,7 @@ pub mod codec;
 pub mod commit;
 pub mod disk;
 pub mod error;
+pub mod evidence;
 pub mod explain;
 pub mod formats;
 pub mod geo;
