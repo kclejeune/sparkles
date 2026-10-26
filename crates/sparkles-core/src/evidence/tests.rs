@@ -529,3 +529,101 @@ fn locators_and_reported_rights_are_bound_as_data_without_fetch_or_authority() {
             .is_empty()
     );
 }
+
+#[test]
+fn local_lookup_keeps_the_record_index_and_kind_across_multiple_candidates() {
+    let mut input = sample();
+    let mut rendition = input.renditions[0].clone();
+    rendition.key = key("second-text");
+    rendition.occurrence_key = key("text/2");
+    rendition.content = RenditionContent::NormalizedText("ZZ".into());
+    input.renditions.push(rendition);
+    let mut passage = input.passages[0].clone();
+    passage.key = key("second-passage");
+    passage.occurrence_key = key("passage/2");
+    passage.rendition = local("second-text");
+    passage.start = 0;
+    passage.end = 1;
+    passage.quote = Some("Z".into());
+    passage.text_digest = digest(b"Z");
+    input.passages.push(passage);
+    input.references[0].target = EvidenceRefTarget::Passage {
+        revision: local("revision"),
+        rendition: local("second-text"),
+        passage: local("second-passage"),
+    };
+    assert!(
+        prepare_input(&input, &Control::none())
+            .unwrap()
+            .requirements()
+            .is_empty()
+    );
+}
+
+#[test]
+fn known_json_encoding_verifies_only_exact_local_retained_values() {
+    let mut input = sample();
+    input.revisions[0].content = SourceContent::Retained {
+        bytes: br#"{"a/b":{"m~n":1.00000000000000000000001}}"#.to_vec(),
+        expected_digest: None,
+    };
+    input.references[0].target = EvidenceRefTarget::Structured {
+        revision: local("revision"),
+        pointer: "/a~1b/m~0n".into(),
+        method: MethodRef {
+            method: node(JSON_LEXICAL_UTF8_V1),
+            version: key(JSON_LEXICAL_UTF8_VERSION),
+        },
+        value_digest: digest(b"1.00000000000000000000001"),
+    };
+    assert!(
+        prepare_input(&input, &Control::none())
+            .unwrap()
+            .requirements()
+            .is_empty()
+    );
+    let mut changed = input.clone();
+    if let EvidenceRefTarget::Structured { value_digest, .. } = &mut changed.references[0].target {
+        *value_digest = digest(b"1");
+    }
+    assert!(prepare_input(&changed, &Control::none()).is_err());
+    let mut changed = input.clone();
+    if let EvidenceRefTarget::Structured { method, .. } = &mut changed.references[0].target {
+        method.version = key("2");
+    }
+    assert!(matches!(
+        prepare_input(&changed, &Control::none())
+            .unwrap()
+            .requirements(),
+        [ResolutionRequirement::StructuredValue { .. }]
+    ));
+    let mut changed = input.clone();
+    changed.revisions[0].content = SourceContent::MetadataOnly {
+        digest: digest(b"not retained"),
+    };
+    assert!(matches!(
+        prepare_input(&changed, &Control::none())
+            .unwrap()
+            .requirements(),
+        [ResolutionRequirement::StructuredValue { .. }]
+    ));
+    let mut changed = input.clone();
+    if let EvidenceRefTarget::Structured { revision, .. } = &mut changed.references[0].target {
+        *revision = RecordRef::Existing(node("urn:existing-revision"));
+    }
+    assert!(
+        prepare_input(&changed, &Control::none())
+            .unwrap()
+            .requirements()
+            .iter()
+            .any(|requirement| matches!(
+                requirement,
+                ResolutionRequirement::StructuredValue { .. }
+            ))
+    );
+    input.revisions[0].content = SourceContent::Retained {
+        bytes: vec![0xff],
+        expected_digest: None,
+    };
+    assert!(prepare_input(&input, &Control::none()).is_err());
+}

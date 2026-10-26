@@ -99,11 +99,14 @@ pub fn prepare_input<'a>(input: &'a EvidenceInput, control: &Control) -> Result<
     let mut frame = FrameHash::new(b"sparkles-evidence-input-v1", control)?;
     macro_rules! register {
         ($records:expr, $kind:expr) => {
-            for record in $records {
+            for (index, record) in ($records).iter().enumerate() {
                 control.check()?;
                 // Meter every canonical header before allocating its lookup entry.
                 frame.charge_content(record.key.as_str().len().saturating_add(19))?;
-                if aliases.insert(record.key.as_str(), $kind).is_some() {
+                if aliases
+                    .insert(record.key.as_str(), LocalRecord { kind: $kind, index })
+                    .is_some()
+                {
                     return Err(Error::invalid("batch record aliases must be unique"));
                 }
             }
@@ -216,11 +219,7 @@ pub fn prepare_input<'a>(input: &'a EvidenceInput, control: &Control) -> Result<
         preparation.digest(passage.text_digest)?;
         preparation.optional_text(passage.quote.as_deref())?;
         if let RecordRef::Local(key) = &passage.rendition {
-            let rendition = input
-                .renditions
-                .iter()
-                .find(|r| &r.key == key)
-                .expect("validated local rendition");
+            let rendition = &input.renditions[preparation.local_index(key)];
             if rendition.revision != passage.revision {
                 preparation
                     .requirements
@@ -306,11 +305,7 @@ pub fn prepare_input<'a>(input: &'a EvidenceInput, control: &Control) -> Result<
                 preparation.reference(rendition, &[RecordKind::Rendition])?;
                 preparation.reference(passage, &[RecordKind::Passage])?;
                 if let RecordRef::Local(key) = passage {
-                    let selected = input
-                        .passages
-                        .iter()
-                        .find(|r| &r.key == key)
-                        .expect("validated local passage");
+                    let selected = &input.passages[preparation.local_index(key)];
                     if &selected.revision != revision || &selected.rendition != rendition {
                         preparation.requirements.push(
                             ResolutionRequirement::PassageReferenceIdentity {
@@ -328,15 +323,35 @@ pub fn prepare_input<'a>(input: &'a EvidenceInput, control: &Control) -> Result<
             } => {
                 preparation.number(3)?;
                 preparation.reference(revision, &[RecordKind::SourceRevision])?;
-                validate_pointer(pointer)?;
+                super::structured::validate_pointer(pointer, control)?;
                 preparation.text(pointer)?;
                 preparation.method(method)?;
                 preparation.digest(*value_digest)?;
-                preparation
-                    .requirements
-                    .push(ResolutionRequirement::StructuredValue {
-                        reference_key: reference.key.as_str().into(),
-                    });
+                let verified = if method.method.as_str() == super::JSON_LEXICAL_UTF8_V1
+                    && method.version.as_str() == super::JSON_LEXICAL_UTF8_VERSION
+                    && let RecordRef::Local(key) = revision
+                    && let SourceContent::Retained { bytes, .. } =
+                        &input.revisions[preparation.local_index(key)].content
+                {
+                    let json = std::str::from_utf8(bytes)
+                        .map_err(|_| Error::invalid("JSON reference requires retained UTF-8"))?;
+                    let selected = super::select_json_lexical_utf8(json, pointer, control)?;
+                    if selected.digest != *value_digest {
+                        return Err(Error::invalid(
+                            "span-mismatch: JSON selected-value digest differs",
+                        ));
+                    }
+                    true
+                } else {
+                    false
+                };
+                if !verified {
+                    preparation
+                        .requirements
+                        .push(ResolutionRequirement::StructuredValue {
+                            reference_key: reference.key.as_str().into(),
+                        });
+                }
             }
         }
     }
@@ -373,9 +388,14 @@ pub fn prepare_input<'a>(input: &'a EvidenceInput, control: &Control) -> Result<
     })
 }
 
+struct LocalRecord {
+    kind: RecordKind,
+    index: usize,
+}
+
 struct Preparation<'a> {
     frame: FrameHash<'a>,
-    aliases: BTreeMap<&'a str, RecordKind>,
+    aliases: BTreeMap<&'a str, LocalRecord>,
     requirements: Vec<ResolutionRequirement>,
     control: &'a Control,
 }
@@ -429,17 +449,24 @@ impl Preparation<'_> {
         self.text(method.version.as_str())
     }
     fn triple(&mut self, triple: &Triple) -> Result<()> {
-        self.frame.term(&Term::Triple(triple.clone().into()))
+        self.frame.triple(triple)
+    }
+
+    fn local_index(&self, key: &super::RecordKey) -> usize {
+        self.aliases
+            .get(key.as_str())
+            .expect("validated local reference")
+            .index
     }
 
     fn reference(&mut self, reference: &RecordRef, allowed: &[RecordKind]) -> Result<()> {
         match reference {
             RecordRef::Local(key) => {
-                let kind = self
+                let record = self
                     .aliases
                     .get(key.as_str())
                     .ok_or_else(|| Error::invalid("unknown batch-local record alias"))?;
-                if !allowed.contains(kind) {
+                if !allowed.contains(&record.kind) {
                     return Err(Error::invalid(
                         "batch-local reference has the wrong record kind",
                     ));
@@ -624,19 +651,4 @@ fn has_blank(triple: &Triple) -> bool {
             _ => return false,
         }
     }
-}
-
-fn validate_pointer(pointer: &str) -> Result<()> {
-    if !pointer.is_empty() && !pointer.starts_with('/') {
-        return Err(Error::invalid("JSON Pointer must be empty or start with /"));
-    }
-    let mut bytes = pointer.bytes();
-    while let Some(byte) = bytes.next() {
-        if byte == b'~' && !matches!(bytes.next(), Some(b'0' | b'1')) {
-            return Err(Error::invalid(
-                "JSON Pointer requires RFC 6901 ~0/~1 escapes",
-            ));
-        }
-    }
-    Ok(())
 }

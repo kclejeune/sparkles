@@ -146,24 +146,43 @@ impl<'a> FrameHash<'a> {
                     }],
                 )
             }
-            Term::Triple(triple) => {
-                self.field(7, &[])?;
-                match &triple.subject {
-                    NamedOrBlankNode::NamedNode(node) => {
-                        validate_iri(node)?;
-                        self.field(1, node.as_str().as_bytes())?;
-                    }
-                    NamedOrBlankNode::BlankNode(node) => {
-                        oxrdf::BlankNodeRef::new(node.as_str())
-                            .map_err(|_| Error::invalid("invalid scoped blank-node label"))?;
-                        self.field(2, node.as_str().as_bytes())?;
-                    }
-                }
-                validate_iri(&triple.predicate)?;
-                self.field(8, triple.predicate.as_str().as_bytes())?;
-                self.term_inner(&triple.object)
+            Term::Triple(triple) => self.triple_inner(triple),
+        }
+    }
+
+    pub(super) fn triple(&mut self, triple: &oxrdf::Triple) -> Result<()> {
+        let mut depth = 1;
+        let mut object = &triple.object;
+        while let Term::Triple(nested) = object {
+            self.control.check()?;
+            depth += 1;
+            if depth > crate::nesting::MAX_TRIPLE_TERMS {
+                return Err(Error::invalid(
+                    "evidence triple term exceeds the nesting bound",
+                ));
+            }
+            object = &nested.object;
+        }
+        self.triple_inner(triple)
+    }
+
+    fn triple_inner(&mut self, triple: &oxrdf::Triple) -> Result<()> {
+        self.control.check()?;
+        self.field(7, &[])?;
+        match &triple.subject {
+            NamedOrBlankNode::NamedNode(node) => {
+                validate_iri(node)?;
+                self.field(1, node.as_str().as_bytes())?;
+            }
+            NamedOrBlankNode::BlankNode(node) => {
+                oxrdf::BlankNodeRef::new(node.as_str())
+                    .map_err(|_| Error::invalid("invalid scoped blank-node label"))?;
+                self.field(2, node.as_str().as_bytes())?;
             }
         }
+        validate_iri(&triple.predicate)?;
+        self.field(8, triple.predicate.as_str().as_bytes())?;
+        self.term_inner(&triple.object)
     }
 
     pub(super) fn finish(self) -> Result<Sha256Digest> {
@@ -266,6 +285,20 @@ mod tests {
         assert_ne!(
             hash(triple.clone()),
             hash(Literal::new_simple_literal(triple.to_string()).into())
+        );
+        assert_eq!(
+            hash(triple.clone()).to_string(),
+            "sha256:9dd0df9616bb436a01f5d84b48f74fcd264a5ee58da365bcd2f5c42aa9b471cd"
+        );
+        let Term::Triple(triple) = &triple else {
+            unreachable!()
+        };
+        let control = Control::none();
+        let mut borrowed = FrameHash::new(b"sparkles-evidence-term-v1", &control).unwrap();
+        borrowed.triple(triple).unwrap();
+        assert_eq!(
+            borrowed.finish().unwrap().to_string(),
+            "sha256:9dd0df9616bb436a01f5d84b48f74fcd264a5ee58da365bcd2f5c42aa9b471cd"
         );
     }
 

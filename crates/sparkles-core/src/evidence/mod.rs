@@ -8,6 +8,7 @@ mod canonical;
 mod model;
 mod prepare;
 mod primitives;
+mod structured;
 
 pub use canonical::{IdentityNamespace, canonical_term_digest};
 pub use primitives::{
@@ -25,6 +26,10 @@ pub use model::{
 pub use prepare::{
     MAX_CLAIMS, MAX_LINKS, NormalizedSourceTime, NormalizedSourceTimes, PreparedContent,
     PreparedInput, ResolutionRequirement, prepare_input,
+};
+
+pub use structured::{
+    JSON_LEXICAL_UTF8_V1, JSON_LEXICAL_UTF8_VERSION, SelectedJsonValue, select_json_lexical_utf8,
 };
 
 #[cfg(test)]
