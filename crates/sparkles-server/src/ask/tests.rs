@@ -742,3 +742,6 @@ fn an_exact_namesake_outside_the_small_display_still_requires_clarification() {
         assert!(mock.requests().is_empty());
     }
 }
+
+#[path = "profile_tests.rs"]
+mod profile_tests;

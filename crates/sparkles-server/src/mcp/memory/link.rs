@@ -439,7 +439,12 @@ impl Tools<'_> {
                 Some(c) => format!("{}\n{c}", m.text),
                 None => m.text.clone(),
             };
-            match self.vector_hits(r, pred, &input, &setup.graphs) {
+            match crate::ask::profile::nested(
+                crate::ask::profile::Stage::LinkerVectorSearch,
+                r.snap.commit,
+                1,
+                || self.vector_hits(r, pred, &input, &setup.graphs),
+            ) {
                 Ok(hits) => {
                     for (s, rank) in ranked(hits, true) {
                         pool.entry(s.clone())

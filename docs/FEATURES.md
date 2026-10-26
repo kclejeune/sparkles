@@ -117,6 +117,9 @@ Connect agents through [MCP](ai/README.md#mcp-server), turn
 [document ingestion](ai/README.md#document-ingestion) and build
 [GraphRAG community reports](ai/README.md#community-reports-graphrag).
 
+[Ask stage diagnostics](ai/README.md#ask-stage-diagnostics) separate grounding, tool
+and execution timings while the remaining accuracy and latency work stays open.
+
 <a id="web-ui"></a>
 <a id="query-page"></a>
 <a id="explore"></a>

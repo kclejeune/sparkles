@@ -25,6 +25,7 @@ mod grounding;
 pub mod http;
 #[cfg(test)]
 mod http_tests;
+pub(crate) mod profile;
 mod prompts;
 #[cfg(test)]
 mod routing_tests;
@@ -229,6 +230,8 @@ pub fn ask(
     on: &mut OnEvent,
 ) -> Value {
     let started = Instant::now();
+    let pipeline = tracing::debug_span!(target: profile::TARGET, "ask.pipeline", context_tokens = tracing::field::Empty);
+    let _entered = pipeline.enter();
     let mut lists = o.lists.clone().unwrap_or_else(|| {
         Role::ALL
             .into_iter()
@@ -525,6 +528,15 @@ impl Asking<'_, '_> {
 
     /// Call a tool as the principal, on this thread, under the ask's deadline.
     fn tool(&self, name: &str, args: Value, timed: bool) -> Result<Value, ToolError> {
+        if name == "check_query" {
+            return profile::tool(profile::Stage::QueryCheck, || {
+                self.tool_unprofiled(name, args, timed)
+            });
+        }
+        self.tool_unprofiled(name, args, timed)
+    }
+
+    fn tool_unprofiled(&self, name: &str, args: Value, timed: bool) -> Result<Value, ToolError> {
         let (m, call) = self.tool_call(name, args, timed)?;
         Ok(match self.server.run_now(name, m, &call)? {
             Outcome::Structured(v) => v,
@@ -535,6 +547,10 @@ impl Asking<'_, '_> {
     /// Run a query with `sparql_query`: its compact result, and with `full_results` the
     /// same result in the form of `/{ds}/sparql`.
     fn run_query(&self, query: &str) -> Result<(Value, Option<Value>), ToolError> {
+        profile::execution(|| self.run_query_unprofiled(query))
+    }
+
+    fn run_query_unprofiled(&self, query: &str) -> Result<(Value, Option<Value>), ToolError> {
         let args = json!({
             "query": query,
             "format": "json",
@@ -625,6 +641,7 @@ impl Asking<'_, '_> {
             .models
             .resolved(&draft_pair)
             .map_or(crate::models::DEFAULT_CONTEXT_TOKENS, |r| r.context_tokens);
+        tracing::Span::current().record("context_tokens", context_tokens);
         let ground = self.ground(context_tokens);
         // C22 §7.1: a question that names an entity linked exactly is local
         if ground.exact {
@@ -707,6 +724,20 @@ impl Asking<'_, '_> {
     /// Step 1: the schema terms, the examples and the linked mentions, trimmed for a
     /// small context window.
     fn ground(&mut self, context_tokens: u64) -> Ground {
+        profile::ground(context_tokens, || self.ground_unprofiled(context_tokens))
+    }
+
+    fn ground_tool(
+        &self,
+        stage: profile::Stage,
+        name: &str,
+        args: Value,
+        timed: bool,
+    ) -> Result<Value, ToolError> {
+        profile::tool(stage, || self.tool(name, args, timed))
+    }
+
+    fn ground_unprofiled(&mut self, context_tokens: u64) -> Ground {
         let small = context_tokens < SMALL_CONTEXT;
         let (max_classes, max_predicates, examples_k, candidates_k) = if small {
             (30, 60, 2, 3)
@@ -718,14 +749,16 @@ impl Asking<'_, '_> {
         // Keep common vocabulary for joins and labels alongside question matches.
         // Both calls read the caller-visible cached report, never evaluation gold.
         let common = self
-            .tool(
+            .ground_tool(
+                profile::Stage::SchemaCommon,
                 "describe_schema",
                 json!({"section":"summary","limit":max_predicates / 2}),
                 false,
             )
             .unwrap_or(Value::Null);
         let mut schema = self
-            .tool(
+            .ground_tool(
+                profile::Stage::SchemaQuestion,
                 "describe_schema",
                 json!({"section":"summary","limit":max_predicates,"query":self.o.question}),
                 false,
@@ -787,7 +820,8 @@ impl Asking<'_, '_> {
         ground_event["predicates"] = predicates.iter().map(|c| c["iri"].clone()).collect();
         // stored examples
         let examples = self
-            .tool(
+            .ground_tool(
+                profile::Stage::Examples,
                 "similar_queries",
                 json!({"question": self.o.question, "k": examples_k, "withText": true}),
                 true,
@@ -829,7 +863,8 @@ impl Asking<'_, '_> {
         let mut entities = Vec::new();
         if !mentions.is_empty() {
             let list: Vec<Value> = mentions.iter().map(|m| json!({ "text": m })).collect();
-            if let Ok(v) = self.tool(
+            if let Ok(v) = self.ground_tool(
+                profile::Stage::Linker,
                 "link_entities",
                 json!({"mentions": list, "k": candidates_k}),
                 true,
@@ -896,7 +931,8 @@ impl Asking<'_, '_> {
             .collect();
         if !linked.is_empty()
             && self.o.report_context
-            && let Ok(v) = self.tool(
+            && let Ok(v) = self.ground_tool(
+                profile::Stage::CommunityRecall,
                 "recall",
                 json!({ "seeds": linked, "hops": 0, "maxTriples": 1, "communities": true, "format": "json" }),
                 true,
