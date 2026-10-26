@@ -1,15 +1,16 @@
 # C27: Valid-time profiles and temporal analysis
 
-> **Status:** specified
+> **Status:** implemented in part
 >
-> **Phases:** None shipped. Phase 1 defines the RDF profile, shapes and stored-query
-> templates. Phase 2 adds bounded temporal projections and a separate event-time
-> control in the UI. Phase 3 integrates scheduled expiry with durable jobs and analysis
-> invalidation. Temporal indexes require a measured workload and are outside these phases.
+> **Phases:** Version 1 profile resources, shapes, fixtures and stored-query templates
+> are available. Phase 1 remains incomplete because A4's authenticated local availability
+> and backdating refusal need C25 Phase 2 and the shared protected-write boundary, or
+> a separately reviewed runtime helper. Phase 2's projection helper and event-time UI,
+> and Phase 3's expiry integration, remain planned. No temporal index is added.
 >
-> **User docs:** none, because nothing is built.
+> **User docs:** [Valid-time profile](../ai/README.md#valid-time-profile).
 >
-> The [Outcome](#outcome) section will record implementation and deviations.
+> The [Outcome](#outcome) records the delivered scope and unmet acceptance.
 
 This design builds on [F06](F06-snapshots-and-point-in-time.md),
 [U01](U01-time-slider.md), [C25](C25-evidence-and-assessments.md),
@@ -342,6 +343,9 @@ Destructively expiring source facts was rejected because expiry is an assessment
   application semantics, not claims about OWL-Time entailment.
 - [XML Schema Datatypes](https://www.w3.org/TR/xmlschema11-2/) defines temporal lexical
   and value spaces. The profile requires an explicit offset for normalized endpoints.
+- [IANA timezone database 2025b](https://data.iana.org/time-zones/tzdb-2025b/northamerica)
+  supplies the pinned rules for the declared named-zone fold and gap fixtures. There is
+  no runtime timezone database dependency.
 - [F06](F06-snapshots-and-point-in-time.md), [CI](CI-commit-identity.md) and
   [U01](U01-time-slider.md) define the recorded-state and retention contracts.
 - [C25](C25-evidence-and-assessments.md), [C26](C26-durable-jobs-and-delivery.md) and
@@ -354,8 +358,46 @@ with C25, C26, C27, F22 and C22b. The record preserves their common standards
 and each profile's adopted and rejected decisions. It does not imply shared
 implementation status. This spec's status and Outcome describe its delivery.
 
+The named-zone fixtures use the public-domain IANA 2025b North America rules cited
+above as expected importer data. No timezone database code or runtime dependency is
+bundled. The half-open and uncertainty rules remain this profile's application
+semantics, with XML Schema value comparisons and independent enumeration controls.
+
 ## Outcome
 
-No phase is implemented. The profile, helper, configuration and event-time control are
-specified here. Existing commit-time reads and the U01 slider retain their current
-semantics. No dependency or on-disk format change has been made.
+The [version 1 resources](../../crates/sparkles/resources/valid-time/v1/README.md)
+include the vocabulary, SHACL Core and SPARQL constraints, an import normalization
+contract, typed C16 definitions and source-preserving fixtures. The Rust library exposes
+an explicit `valid_time::profile(1)` selection with no fallback for unknown versions.
+The manifest binds every packaged RDF resource, query and definition to its SHA-256
+digest. No dependency or on-disk format has changed.
+
+The active and overlapping claim templates preserve the claim IRI, interval IRI, exact
+source revision, temporal verdict and normalization status. They distinguish unknown
+from unbounded endpoints and keep half-open semantics. Missing temporal metadata stays
+unknown. Negative selection includes only rows proved outside. The templates return
+SELECT rows and never assert or admit their reified propositions.
+
+The `valid_time` integration tests exercise 432 generated selector/interval cases against
+an independent enumeration oracle, every verdict policy, equivalent offsets,
+nanosecond boundaries, touching intervals and invalid structural overlays. Declared
+named-zone fold and gap fixtures preserve importer policy and database version. The
+resources do not implement a date importer or verify an external timezone database.
+Actual retained-commit tests exclude late imports from prior states, preserve the
+original revision and assessment after correction, and check that proposed matches
+remain unasserted. Existing F06 selection semantics are unchanged.
+
+Phase 1 is not complete. A4 includes an actual refusal of client backdating through
+server-owned availability receipts. Ordinary RDF and SHACL cannot authenticate that
+field, and the tests explicitly demonstrate that ordinary RDF accepts an arbitrary
+availability value. The retained-commit test proves snapshot selection only. Full A4
+requires the C25 Phase 2 runtime to assign dataset, branch, actual accepting commit and
+server timestamp atomically with ingestion through the shared protected-write boundary,
+or a separately reviewed C27 helper. Availability receipts remain readable under
+ordinary grants while raw writes must be denied. No template trusts publication or
+client-written availability as admission authority. This requirement remains under
+roadmap items 81 and 341.
+
+The bounded projection helper, runtime configuration, event-time UI, expiry fencing
+and analysis invalidation remain unimplemented later phases. The existing U01 slider
+continues to select recorded history.

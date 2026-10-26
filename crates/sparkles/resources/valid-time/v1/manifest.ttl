@@ -1,0 +1,10 @@
+@prefix vt: <urn:x-sparkles:valid-time:> .
+
+<urn:x-sparkles:valid-time:profile:1> vt:profileVersion 1 ; vt:contentDigest "sha256:32d4d68c0d7938883cb2d03eab0957940ee678fa8baa3c88d6f9f98f781fa0e8" .
+<urn:x-sparkles:valid-time:shapes:1> vt:profileVersion 1 ; vt:contentDigest "sha256:4a28f14f92bd418e64026144acdb957b270bad889d3da9d6f259acbe1239e940" .
+<urn:x-sparkles:valid-time:query:1:temporal-active-claims> vt:profileVersion 1 ; vt:contentDigest "sha256:53313c292eb3819d206d6fbab263a64961b9778688da32a91dc4f3870fe77aab" .
+<urn:x-sparkles:valid-time:definition:1:temporal-active-claims> vt:profileVersion 1 ; vt:contentDigest "sha256:6cfddf7ca075cf5815de9161ac6f007810259664cdd63bfdca6ead01d652ac6d" .
+<urn:x-sparkles:valid-time:query:1:temporal-overlapping-claims> vt:profileVersion 1 ; vt:contentDigest "sha256:3d56df97c6b3769919af9afda074064598dac82e46141226f963163ec32bad1b" .
+<urn:x-sparkles:valid-time:definition:1:temporal-overlapping-claims> vt:profileVersion 1 ; vt:contentDigest "sha256:93f6a5b745ad56ab84807a4c6e889bbc9d5300578ad0e41b03a58b41dea6e904" .
+
+<urn:x-sparkles:valid-time:profile:1> vt:resource <urn:x-sparkles:valid-time:shapes:1>, <urn:x-sparkles:valid-time:query:1:temporal-active-claims>, <urn:x-sparkles:valid-time:definition:1:temporal-active-claims>, <urn:x-sparkles:valid-time:query:1:temporal-overlapping-claims>, <urn:x-sparkles:valid-time:definition:1:temporal-overlapping-claims> .

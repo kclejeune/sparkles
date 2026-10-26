@@ -1,0 +1,27 @@
+@prefix vt: <urn:x-sparkles:valid-time:> .
+@prefix ev: <urn:x-sparkles:evidence:> .
+@prefix prov: <http://www.w3.org/ns/prov#> .
+@prefix rdf: <http://www.w3.org/1999/02/22-rdf-syntax-ns#> .
+@prefix xsd: <http://www.w3.org/2001/XMLSchema#> .
+@prefix ex: <urn:test:> .
+ex:missing a ev:Claim ; prov:wasDerivedFrom ex:revision-missing .
+ex:date a ev:Claim ; prov:wasDerivedFrom ex:revision-date ; vt:validDuring ex:i-date .
+ex:i-date a vt:Interval ; vt:start ex:s-date ; vt:end ex:e-date ; vt:normalization ex:n-date .
+ex:s-date a vt:Boundary ; vt:kind vt:Unknown ; vt:sourceValue "2026-01-01" .
+ex:e-date a vt:Boundary ; vt:kind vt:Unknown ; vt:sourceValue "unresolved end" .
+ex:n-date a vt:Normalization ; vt:status vt:Unresolved ; vt:method ex:source-import ; vt:methodVersion "1" ; vt:calendar vt:Gregorian .
+ex:calendar a ev:Claim ; prov:wasDerivedFrom ex:revision-calendar ; vt:validDuring ex:i-calendar .
+ex:i-calendar a vt:Interval ; vt:start ex:s-calendar ; vt:end ex:e-calendar ; vt:normalization ex:n-calendar .
+ex:s-calendar a vt:Boundary ; vt:kind vt:Unknown ; vt:sourceValue "1447-07-12" .
+ex:e-calendar a vt:Boundary ; vt:kind vt:Unknown ; vt:sourceValue "unresolved end" .
+ex:n-calendar a vt:Normalization ; vt:status vt:UnsupportedCalendar ; vt:method ex:source-import ; vt:methodVersion "1" ; vt:calendar vt:UnresolvedCalendar .
+ex:precision a ev:Claim ; prov:wasDerivedFrom ex:revision-precision ; vt:validDuring ex:i-precision .
+ex:i-precision a vt:Interval ; vt:start ex:s-precision ; vt:end ex:e-precision ; vt:normalization ex:n-precision .
+ex:s-precision a vt:Boundary ; vt:kind vt:Unknown ; vt:sourceValue "2026-01-01T00:00:00.123456789012345678901Z" .
+ex:e-precision a vt:Boundary ; vt:kind vt:Unknown ; vt:sourceValue "unresolved end" .
+ex:n-precision a vt:Normalization ; vt:status vt:UnsupportedPrecision ; vt:method ex:source-import ; vt:methodVersion "1" ; vt:calendar vt:Gregorian .
+ex:order a ev:Claim ; prov:wasDerivedFrom ex:revision-order ; vt:validDuring ex:i-order .
+ex:i-order a vt:Interval ; vt:start ex:s-order ; vt:end ex:e-order ; vt:normalization ex:n-order .
+ex:s-order a vt:Boundary ; vt:kind vt:Unknown ; vt:sourceValue "start in January, end before January uncertainty resolves" .
+ex:e-order a vt:Boundary ; vt:kind vt:Unknown ; vt:sourceValue "unresolved end" .
+ex:n-order a vt:Normalization ; vt:status vt:IndeterminateOrder ; vt:method ex:source-import ; vt:methodVersion "1" ; vt:calendar vt:Gregorian .

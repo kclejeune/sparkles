@@ -1,0 +1,22 @@
+@prefix vt: <urn:x-sparkles:valid-time:> .
+@prefix ev: <urn:x-sparkles:evidence:> .
+@prefix prov: <http://www.w3.org/ns/prov#> .
+@prefix rdf: <http://www.w3.org/1999/02/22-rdf-syntax-ns#> .
+@prefix xsd: <http://www.w3.org/2001/XMLSchema#> .
+@prefix ex: <urn:test:> .
+
+# These importer outputs are declared fixtures, not a timezone resolver or proof
+# that the engine validates an external timezone database.
+ex:fold-earlier a vt:Boundary ; vt:kind vt:Known ;
+    vt:sourceValue "2026-11-01T01:30:00 America/New_York" ; vt:precision vt:Instant ;
+    vt:earliest "2026-11-01T05:30:00Z"^^xsd:dateTime ; vt:latest "2026-11-01T05:30:00Z"^^xsd:dateTime ; vt:normalization ex:earlier .
+ex:fold-later a vt:Boundary ; vt:kind vt:Known ;
+    vt:sourceValue "2026-11-01T01:30:00 America/New_York" ; vt:precision vt:Instant ;
+    vt:earliest "2026-11-01T06:30:00Z"^^xsd:dateTime ; vt:latest "2026-11-01T06:30:00Z"^^xsd:dateTime ; vt:normalization ex:later .
+ex:earlier a vt:Normalization ; vt:status vt:Normalized ; vt:method ex:named-zone-import ;
+    vt:methodVersion "1" ; vt:calendar vt:Gregorian ; vt:timezonePolicy "America/New_York" ; vt:tzdbVersion "2025b" ; vt:foldChoice "earlier" .
+ex:later a vt:Normalization ; vt:status vt:Normalized ; vt:method ex:named-zone-import ;
+    vt:methodVersion "1" ; vt:calendar vt:Gregorian ; vt:timezonePolicy "America/New_York" ; vt:tzdbVersion "2025b" ; vt:foldChoice "later" .
+ex:gap a vt:Boundary ; vt:kind vt:Unknown ; vt:sourceValue "2026-03-08T02:30:00 America/New_York" ; vt:normalization ex:quarantine .
+ex:quarantine a vt:Normalization ; vt:status vt:NonexistentLocalTime ; vt:method ex:named-zone-import ;
+    vt:methodVersion "1" ; vt:calendar vt:Gregorian ; vt:timezonePolicy "America/New_York" ; vt:tzdbVersion "2025b" .

@@ -28,6 +28,7 @@ pub mod reasoning;
 pub mod stats;
 pub mod syntax;
 pub mod terms;
+pub mod valid_time;
 pub mod write_guard;
 
 pub use catalog::{Catalog, CatalogOptions};

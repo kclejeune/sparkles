@@ -84,8 +84,10 @@ feature expansion.
 | Remaining completion and release | Finish the other adopted partial-feature phases and release contracts. | Required packaging, compatibility and operational acceptance are complete before release. |
 
 C25's first phase supplies vocabulary, shapes, fixtures and competency queries. It does
-not supply the managed runtime APIs of later phases. C26 Phase 1 and C27 Phase 1 can
-proceed independently. F13-backed incremental execution and F18-supported inferred
+not supply the managed runtime APIs of later phases. C26 Phase 1 and C27's static
+profile resources can proceed independently. Full C27 Phase 1 additionally requires
+A4's authenticated availability and backdating refusal through C25 Phase 2 and the
+shared protected-write boundary. F13-backed incremental execution and F18-supported inferred
 visibility follow their explicit prerequisites. Initial analyses use full recomputation
 and authorized projections, with the required freshness and access checks.
 
@@ -212,7 +214,7 @@ continues within its caller-visible evidence and measured-latency scope.
 |---|---|---|---|---|
 | 81 | **Shared evidence and review records.** Phase 1 provides the versioned vocabulary, shapes, fixtures and compatibility queries. Phase 2 adds authenticated source and claim writes, protected metadata, retained references, review-controlled projections and reversible identity decisions. Phase 3 integrates memory, ingestion, reports and maintained analysis. | [C25](specs/C25-evidence-and-assessments.md), [C17](specs/C17-agent-memory.md#shared-memory-representation) | M–L | High |
 | 339 | **Durable jobs and delivery.** Planned checkpointed jobs, fenced external workers and a transactional outbox make collection, analysis and delivery resumable after a restart. Publication and delivery intent share the dataset transaction. | [C26](specs/C26-durable-jobs-and-delivery.md) | L | High |
-| 341 | **Valid time and observation history.** Planned interval profiles, availability cutoffs, temporal query helpers and an event-time control distinguish when a statement applies from when it was recorded. Existing commit-time history remains available. | [C27](specs/C27-valid-time-profiles.md) | M–L | High |
+| 341 | **Valid time and observation history.** Versioned RDF resources, SHACL shapes and typed temporal templates are available. Phase 1 remains incomplete at A4 until C25 Phase 2 and protected writes establish server-owned availability and refuse backdating. Later phases add the projection helper, event-time UI and expiry integration. | [C27](specs/C27-valid-time-profiles.md) | M–L | High |
 | 340 | **Maintained analyses and evidence dependencies.** Planned immutable run manifests, conservative read dependencies and guarded publication track when assessments need review or recomputation. Begin with bounded full recomputation and add proven incremental maintenance through item 17. | [F22](specs/F22-analysis-lifecycle.md) | L | High |
 | 220 | **Backups and clones of view definitions.** The backup layout has no path for `views/{name}/view.json`, so a restored or cloned dataset has no views. The layout needs versioned nested definitions, consistent capture and restore with automatic jobs and deliveries paused. | [F05](specs/F05-snapshot-repositories/OUTCOME.md#recovery-of-managed-definitions), [F13](specs/F13-incremental-views-and-provenance.md#outcome) | S | High |
 | 263 | **Ask on DBpedia.** Question-aware grounding has mixed measured accuracy across models. A complete visibility-safe candidate evidence contract and context-sensitive namesake resolution remain, with genuine ambiguity kept as a clarification. Further changes need offline checks and end-to-end accuracy evaluation. | [C18](specs/C18-natural-language-questions-and-ingest/OUTCOME.md#ask-grounding-accuracy-item-263) | M | High |
