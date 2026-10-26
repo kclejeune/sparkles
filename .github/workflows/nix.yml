@@ -3,32 +3,19 @@
 # cache at https://cache.kclj.io, so that CI, development machines and benchmark hosts
 # download what another of them already built (docs/DEVELOPMENT.md, "Nix").
 #
-# Only pushes to main and manual runs push, and only when the repository has the
-# NIMBUS_ENDPOINT variable and the NIMBUS_AUTH_TOKEN secret. Pull requests, and runs
-# without them, build without pushing. `--skip-cached` skips whatever a substituter
-# already has, so a run builds only what changed since the last push.
+# This workflow runs only when dispatched manually. It publishes only when the
+# repository has NIMBUS_ENDPOINT and NIMBUS_AUTH_TOKEN; otherwise it only builds.
+# `--skip-cached` skips whatever a substituter already has.
 name: Nix
 
 on:
-  push:
-    branches: [main]
-    paths-ignore: &ignore
-      - "docs/**"
-      - "README.md"
-      - "js/**/*.md"
-      - ".github/workflows/ci.yml"
-      - ".github/workflows/python-wheels.yml"
-      - ".github/workflows/node-packages.yml"
-      - ".github/workflows/jvm-bindings.yml"
-  pull_request:
-    paths-ignore: *ignore
   workflow_dispatch:
 
 permissions:
   contents: read
 
 # Main runs have distinct groups so neither running nor pending checks are superseded.
-# Pull request updates supersede earlier checks.
+# Repeated manual runs on another branch supersede that branch's earlier run.
 concurrency:
   group: nix-${{ github.ref }}-${{ github.ref == 'refs/heads/main' && github.run_id || 'latest' }}
   cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
