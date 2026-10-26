@@ -18,7 +18,8 @@ use std::sync::Arc;
 pub struct AffectedLimits {
     /// Distinct actual target nodes in addition to directly touched nodes.
     pub additional_focus: usize,
-    /// Scanned rows, dependency visits and retained discovery entries.
+    /// Scanned rows, structural/copy work and retained discovery entries.
+    /// Analyzer lexical copies charge each 128-byte chunk before allocation.
     pub work: u64,
 }
 
@@ -45,12 +46,27 @@ pub fn check_target_producers(
             continue;
         }
         for target in &shape.targets {
-            if let crate::Target::Expr(e) = target {
-                super::targets::static_expression(shapes, *e, 0, &mut work)?;
+            match target {
+                crate::Target::Expr(e) => {
+                    super::targets::static_expression(shapes, *e, 0, &mut work)?
+                }
+                crate::Target::Where(w) => super::targets::local_filter(shapes, *w, 0, &mut work)?,
+                _ => {}
             }
         }
     }
     Ok(())
+}
+
+fn deadline_options(opts: &ValidateOptions, start: std::time::Instant) -> ValidateOptions {
+    let mut normalized = opts.clone();
+    normalized.deadline = opts
+        .deadline
+        .into_iter()
+        .chain(opts.timeout.map(|timeout| start + timeout))
+        .min();
+    normalized.timeout = None;
+    normalized
 }
 
 /// Validate directly touched and potentially affected targets of the changed quads.
@@ -66,6 +82,8 @@ pub fn validate_affected(
     opts: &ValidateOptions,
     limits: AffectedLimits,
 ) -> anyhow::Result<ValidationReport> {
+    let normalized = deadline_options(opts, std::time::Instant::now());
+    let opts = &normalized;
     if before.dataset_id != after.dataset_id || !Arc::ptr_eq(&before.generation, &after.generation)
     {
         return Err(Error::invalid(
@@ -209,4 +227,36 @@ pub fn validate_affected(
         conforms: results.is_empty(),
         results,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use sparkles_core::store::{Store, StoreOptions};
+    use std::time::{Duration, Instant};
+
+    #[test]
+    fn relative_timeout_is_one_absolute_bound_for_every_engine() {
+        let start = Instant::now() - Duration::from_secs(1);
+        let opts = ValidateOptions {
+            timeout: Some(Duration::from_secs(10)),
+            ..Default::default()
+        };
+        let normalized = deadline_options(&opts, start);
+        assert_eq!(normalized.deadline, Some(start + Duration::from_secs(10)));
+        assert_eq!(normalized.timeout, None);
+        let store = Store::in_memory(StoreOptions::default());
+        let shapes = Shapes::parse("", sparkles_core::io::RdfFormat::Turtle, None).unwrap();
+        let (data, ids) = DataGraph::new(store.snapshot(), None, &[], &[], &shapes).unwrap();
+        for _ in 0..2 {
+            let engine = Engine::new(&shapes, &data, ids.clone(), &normalized).unwrap();
+            assert_eq!(engine.deadline, normalized.deadline);
+        }
+        let earlier = start + Duration::from_secs(5);
+        let opts = ValidateOptions {
+            deadline: Some(earlier),
+            ..opts
+        };
+        assert_eq!(deadline_options(&opts, start).deadline, Some(earlier));
+    }
 }

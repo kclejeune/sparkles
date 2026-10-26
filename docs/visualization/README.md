@@ -174,7 +174,8 @@ dependencies are recorded in the [central roadmap](../ROADMAP.md).
   across shapes and snapshots. They refuse a larger or unfinished discovery instead of
   returning partial conformance. Forms admit graph-free target-node expressions made
   from constants, lists, focus variables, basic list operators, conditionals and simple
-  aggregates. Other target-node expression producers are refused before evaluation and
+  aggregates. Target filters that inspect only their input node are admitted. Graph-reading
+  target filters and other target-node expression producers are refused before evaluation and
   remain under roadmap item 21. Ordinary SHACL validation retains its separate language
   support. Discovery work bounds do not establish a total SHACL heap limit. Controlled
   cold-reader admission waits for item 395.

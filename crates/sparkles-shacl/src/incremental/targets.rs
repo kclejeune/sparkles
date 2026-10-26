@@ -4,7 +4,7 @@ use super::bounded::{self, Work};
 use crate::data::DataGraph;
 use crate::nodeeval::Scope;
 use crate::nodeexpr::{Expr, ExprId};
-use crate::shapes::{Candidates, ShapeId, Shapes, Target};
+use crate::shapes::{Candidates, Constraint, ShapeId, Shapes, Target};
 use crate::validate::{Cx, Engine};
 use sparkles_core::error::{Error, Result};
 use sparkles_core::id::{Id, Tag};
@@ -64,10 +64,82 @@ pub(super) fn static_expression(
     Ok(())
 }
 
+/// Filters that inspect only their input node may use the existing evaluator.
+/// Graph-reading filters need an early-bounded data producer before form admission.
+pub(super) fn local_filter(
+    shapes: &Shapes,
+    shape: ShapeId,
+    depth: usize,
+    work: &mut Work<'_>,
+) -> Result<()> {
+    work.charge()?;
+    if depth > 64 {
+        return Err(Error::unsupported(
+            "form target filter exceeds bounded discovery depth",
+        ));
+    }
+    let shape = &shapes.shapes[shape];
+    if shape.deactivated {
+        return Ok(());
+    }
+    if shape.path.is_some()
+        || shape.values.is_some()
+        || shape.default_value.is_some()
+        || shape.deactivated_expr.is_some()
+    {
+        return Err(Error::unsupported(
+            "form target filter requires an early-bounded data-reading producer",
+        ));
+    }
+    for constraint in &shape.constraints {
+        work.charge()?;
+        match constraint {
+            Constraint::Datatype(_)
+            | Constraint::NodeKind(_)
+            | Constraint::MinCount(_)
+            | Constraint::MaxCount(_)
+            | Constraint::MinExclusive(..)
+            | Constraint::MinInclusive(..)
+            | Constraint::MaxExclusive(..)
+            | Constraint::MaxInclusive(..)
+            | Constraint::MinLength(_)
+            | Constraint::MaxLength(_)
+            | Constraint::Pattern(_)
+            | Constraint::UniqueLang
+            | Constraint::HasValue(_) => {}
+            Constraint::LanguageIn(xs) => {
+                for _ in xs {
+                    work.charge()?;
+                }
+            }
+            Constraint::In(xs) => {
+                for _ in xs {
+                    work.charge()?;
+                }
+            }
+            Constraint::Not(s) | Constraint::Node(s) | Constraint::Property(s) => {
+                local_filter(shapes, *s, depth + 1, work)?
+            }
+            Constraint::And(ss) | Constraint::Or(ss) | Constraint::Xone(ss) => {
+                for &s in ss {
+                    local_filter(shapes, s, depth + 1, work)?;
+                }
+            }
+            _ => {
+                return Err(Error::unsupported(
+                    "form target filter requires an early-bounded data-reading producer",
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
 pub(super) struct Targets<'a, 'b> {
     pub(super) data: &'a DataGraph,
     pub(super) engine: &'b Engine<'a>,
-    expressions: std::cell::RefCell<std::collections::BTreeMap<ExprId, Vec<Id>>>,
+    filters: std::cell::RefCell<rustc_hash::FxHashSet<ShapeId>>,
+    expressions: std::cell::RefCell<std::collections::BTreeMap<(ShapeId, ExprId), Vec<Id>>>,
 }
 
 impl<'a, 'b> Targets<'a, 'b> {
@@ -76,6 +148,7 @@ impl<'a, 'b> Targets<'a, 'b> {
             data,
             engine,
             expressions: Default::default(),
+            filters: Default::default(),
         }
     }
 
@@ -85,7 +158,7 @@ impl<'a, 'b> Targets<'a, 'b> {
         shape: ShapeId,
         work: &mut Work<'_>,
     ) -> anyhow::Result<Vec<Id>> {
-        if let Some(nodes) = self.expressions.borrow().get(&e) {
+        if let Some(nodes) = self.expressions.borrow().get(&(shape, e)) {
             for _ in nodes {
                 work.charge()?;
             }
@@ -99,8 +172,20 @@ impl<'a, 'b> Targets<'a, 'b> {
         for _ in &nodes {
             work.charge()?;
         }
-        self.expressions.borrow_mut().insert(e, nodes.clone());
+        self.expressions
+            .borrow_mut()
+            .insert((shape, e), nodes.clone());
         Ok(nodes)
+    }
+
+    fn admit_filter(&self, shape: ShapeId, work: &mut Work<'_>) -> Result<()> {
+        work.charge()?;
+        if !self.filters.borrow().contains(&shape) {
+            local_filter(self.engine.shapes, shape, 0, work)?;
+            work.charge()?;
+            self.filters.borrow_mut().insert(shape);
+        }
+        Ok(())
     }
 
     fn where_candidates(&self, shape: ShapeId, work: &mut Work<'_>) -> anyhow::Result<Vec<Id>> {
@@ -165,6 +250,7 @@ impl<'a, 'b> Targets<'a, 'b> {
                 }
                 Target::Expr(e) => self.expression(e, shape, work)?.contains(&focus),
                 Target::Where(w) => {
+                    self.admit_filter(w, work)?;
                     let narrowed = !matches!(
                         self.engine.shapes.candidates(w),
                         Candidates::All | Candidates::Terms(_)
@@ -215,6 +301,7 @@ impl<'a, 'b> Targets<'a, 'b> {
                     }
                 }
                 Target::Where(w) => {
+                    self.admit_filter(w, work)?;
                     for n in self.where_candidates(w, work)? {
                         work.charge()?;
                         if self.engine.conforms(w, n, &mut Cx::default())? {

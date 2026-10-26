@@ -176,3 +176,156 @@ fn dense_delta_reverse_discovery_refuses_before_materializing_the_full_fanout() 
         "discovery retained unbounded traversal state: largest={largest}, total={total}"
     );
 }
+
+#[test]
+fn dependency_analysis_admits_long_paths_and_generated_prefixes_before_copying() {
+    let _serial = MEASURE_LOCK.lock().unwrap();
+    let store = Store::in_memory(StoreOptions::default());
+    update::update(
+        &store,
+        "INSERT DATA { <urn:focus> <urn:p> 1 }",
+        &QueryOptions::default(),
+    )
+    .unwrap();
+    let path = std::iter::repeat_n("<urn:p>", 300)
+        .collect::<Vec<_>>()
+        .join(" ");
+    let shapes = Shapes::parse(&format!(
+        "@prefix sh: <http://www.w3.org/ns/shacl#> . <urn:S> a sh:NodeShape ; sh:targetNode <urn:focus> ; sh:property [ sh:path ({path}) ; sh:minCount 1 ] ."
+    ), RdfFormat::Turtle, None).unwrap();
+    let snapshot = store.snapshot();
+    let opts = ValidateOptions {
+        parallel: false,
+        ..Default::default()
+    };
+    let touched = [Term::NamedNode(NamedNode::new("urn:focus").unwrap())];
+    // The first allowance refuses structural normalization. The second admits the
+    // source path but must stop the quadratic owned dependency-prefix producer.
+    for work in [20, 2_048] {
+        let (result, largest, total, outside_largest, outside_total) = measure(|| {
+            validate_affected(
+                &snapshot,
+                &snapshot,
+                &shapes,
+                &[],
+                &touched,
+                &opts,
+                AffectedLimits {
+                    additional_focus: 500,
+                    work,
+                },
+            )
+        });
+        let error =
+            result.expect_err("long dependency analysis must refuse without a partial report");
+        assert!(
+            matches!(
+                error.downcast_ref::<sparkles_core::Error>(),
+                Some(sparkles_core::Error::BudgetExceeded(_))
+            ),
+            "{error:#}"
+        );
+        eprintln!(
+            "affected_analyzer_allocation={{\"work\":{work},\"largest\":{largest},\"total\":{total},\"outside_largest\":{outside_largest},\"outside_total\":{outside_total}}}"
+        );
+        assert!(
+            total < 256 * 1024,
+            "dependency prefixes copied before admission: work={work}, largest={largest}, total={total}"
+        );
+    }
+}
+
+#[test]
+fn data_reading_target_filters_refuse_before_eager_membership_reads() {
+    let _serial = MEASURE_LOCK.lock().unwrap();
+    let store = Store::in_memory(StoreOptions::default());
+    let mut text = String::from("INSERT DATA { ");
+    for n in 0..16_000 {
+        text.push_str(&format!("<urn:focus> <urn:p> {n} . "));
+    }
+    text.push('}');
+    update::update(&store, &text, &QueryOptions::default()).unwrap();
+    let snapshot = store.snapshot();
+    assert_eq!(snapshot.generation.meta.quads, 0);
+    let shapes = Shapes::parse(r#"@prefix sh: <http://www.w3.org/ns/shacl#> . <urn:S> a sh:NodeShape ; sh:targetWhere [ sh:property [ sh:path <urn:p> ; sh:minCount 16001 ; sh:maxCount 0 ] ] ; sh:sparql [ sh:select "SELECT $this WHERE { ?s <urn:global> ?o }" ] ; sh:property [ sh:path <urn:missing> ; sh:minCount 1 ] ."#, RdfFormat::Turtle, None).unwrap();
+    let opts = ValidateOptions {
+        parallel: false,
+        ..Default::default()
+    };
+    for touched in [
+        vec![Term::NamedNode(NamedNode::new("urn:focus").unwrap())],
+        Vec::new(),
+    ] {
+        let (result, largest, total, outside_largest, outside_total) = measure(|| {
+            validate_affected(
+                &snapshot,
+                &snapshot,
+                &shapes,
+                &[],
+                &touched,
+                &opts,
+                AffectedLimits {
+                    additional_focus: 500,
+                    work: 2_048,
+                },
+            )
+        });
+        let error = result.expect_err("data-reading target membership needs producer admission");
+        assert!(
+            matches!(
+                error.downcast_ref::<sparkles_core::Error>(),
+                Some(sparkles_core::Error::Unsupported(_))
+            ),
+            "{error:#}"
+        );
+        eprintln!(
+            "affected_filter_allocation={{\"largest\":{largest},\"total\":{total},\"outside_largest\":{outside_largest},\"outside_total\":{outside_total}}}"
+        );
+        assert!(
+            total < 256 * 1024,
+            "target filter ran an eager membership read: {total}"
+        );
+    }
+}
+
+#[test]
+fn dependency_analysis_admits_a_large_single_predicate_before_cloning() {
+    let _serial = MEASURE_LOCK.lock().unwrap();
+    let store = Store::in_memory(StoreOptions::default());
+    let iri = format!("urn:predicate:{}", "x".repeat(1024 * 1024));
+    let shapes = Shapes::parse(&format!(
+        "@prefix sh: <http://www.w3.org/ns/shacl#> . <urn:S> a sh:NodeShape ; sh:targetNode <urn:focus> ; sh:property [ sh:path <{iri}> ; sh:minCount 1 ] ."
+    ), RdfFormat::Turtle, None).unwrap();
+    let snapshot = store.snapshot();
+    let opts = ValidateOptions {
+        parallel: false,
+        ..Default::default()
+    };
+    let (result, largest, total, _, _) = measure(|| {
+        validate_affected(
+            &snapshot,
+            &snapshot,
+            &shapes,
+            &[],
+            &[],
+            &opts,
+            AffectedLimits {
+                additional_focus: 500,
+                work: 20,
+            },
+        )
+    });
+    let error = result.expect_err("a large predicate copy must be admitted first");
+    assert!(
+        matches!(
+            error.downcast_ref::<sparkles_core::Error>(),
+            Some(sparkles_core::Error::BudgetExceeded(_))
+        ),
+        "{error:#}"
+    );
+    eprintln!("affected_lexical_allocation={{\"largest\":{largest},\"total\":{total}}}");
+    assert!(
+        total < 256 * 1024,
+        "large analyzer predicate cloned before admission: {total}"
+    );
+}

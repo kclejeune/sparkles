@@ -18,7 +18,7 @@ The same allowance admits at most 500 additional distinct targets beyond the dir
 touched resources, shared across shapes and both states. Exactly 500 is accepted. The
 next target refuses the check rather than returning a partial conformance report.
 
-Streaming predicate and path traversal charges work before retaining new frontier
+Dependency analysis admits owned path normalization, generated prefixes and memo copies before cloning them. Lexical copies charge each 128-byte chunk to the same structural work allowance. SPARQL dependency localization uses bounded global target enumeration because its existing analysis producer has no early admission. Streaming predicate and path traversal charges work before retaining new frontier
 entries. Cancellation and one absolute deadline cover discovery and validation. The
 allowance bounds target discovery and its retained state, not the entire SHACL heap or
 the existing cold index decoder. Controlled physical reader integration remains under
@@ -28,7 +28,7 @@ Form applicability checks admit graph-free target-node expressions before evalua
 their output. Constants, lists, focus variables, basic list operators, conditionals and
 simple aggregates are supported. Data-reading, shape-dependent, custom and SPARQL
 function or query target-node expression producers are refused until early admission
-is implemented. This boundary also applies when constructing a form model or saving
+is implemented. Target filters that inspect only their input node remain available. Graph-reading target filters are refused before ordinary conformance can materialize a property fanout. This boundary also applies when constructing a form model or saving
 through it. It does not remove those expressions from ordinary SHACL validation.
 
 A refused recheck invalidates the browser's previous approval of the same changes.
