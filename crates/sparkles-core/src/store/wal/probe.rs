@@ -157,6 +157,111 @@ mod tests {
     }
 
     #[test]
+    fn durable_boundary_refuses_eof_and_partial_record_truncation() {
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("wal.log");
+        let data = data(0);
+        let wire: Vec<u8> = [
+            data,
+            commit_record(11, &data, 0),
+            data,
+            commit_record(12, &data, 0),
+        ]
+        .into_iter()
+        .flatten()
+        .collect();
+        assert_eq!(wire.len(), 132);
+        let options = HistoryOptions::default();
+        for end in [0, 33, 66, 67, 98, 99, 131, 132] {
+            let bytes = &wire[..end];
+            std::fs::write(&path, bytes).unwrap();
+            let mut budget = ColdBudget::new(ReadLimit {
+                options: &options,
+                memory: Some(4096),
+                held: 0,
+            })
+            .unwrap();
+            let loaded = budget.buffered(&path).unwrap();
+            let mut reader = loaded.value;
+            let result = prove_prefix(
+                &mut reader,
+                end as u64,
+                10,
+                11,
+                false,
+                Some(132),
+                u64::MAX,
+                None,
+                &path,
+                &budget,
+            );
+            if end < 132 {
+                assert!(
+                    matches!(result, Err(Error::Corrupt(_))),
+                    "accepted durable truncation at{end}: {result:?}"
+                );
+            } else {
+                let result = result.unwrap();
+                assert_eq!(result.head.seq, 12);
+                assert_eq!(result.selected.unwrap().seq, 11);
+            }
+            assert_eq!(std::fs::read(&path).unwrap(), bytes);
+        }
+        // A complete first transaction is a valid prefix when only those bytes
+        // were recorded durable, even if a later transaction has not reached disk.
+        std::fs::write(&path, &wire[..66]).unwrap();
+        let mut budget = ColdBudget::new(ReadLimit {
+            options: &options,
+            memory: Some(4096),
+            held: 0,
+        })
+        .unwrap();
+        let mut reader = budget.buffered(&path).unwrap().value;
+        assert_eq!(
+            prove_prefix(
+                &mut reader,
+                66,
+                10,
+                11,
+                false,
+                Some(66),
+                u64::MAX,
+                None,
+                &path,
+                &budget
+            )
+            .unwrap()
+            .head
+            .seq,
+            11
+        );
+        let mut headed = header_record().to_vec();
+        headed.extend_from_slice(&wire);
+        std::fs::write(&path, &headed).unwrap();
+        let mut reader = budget.buffered(&path).unwrap().value;
+        // A real header supersedes a stale headerless marker, exactly as recovery.
+        assert_eq!(
+            prove_prefix(
+                &mut reader,
+                headed.len() as u64,
+                10,
+                11,
+                false,
+                Some(3300),
+                u64::MAX,
+                None,
+                &path,
+                &budget
+            )
+            .unwrap()
+            .head
+            .seq,
+            12
+        );
+        assert_eq!(std::fs::read(&path).unwrap(), headed);
+    }
+
+    #[test]
     fn streaming_durability_matches_existing_classifier_for_damage_and_fences() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("wal.log");
@@ -246,6 +351,7 @@ pub(crate) fn prove_prefix(
     let mut crc = flate2::Crc::new();
     let mut needed = 0;
     let mut seen_modern = false;
+    let mut header = false;
     let mut record = [0; WAL_REC];
     let corrupt = || Error::Corrupt(format!("{}: invalid committed WAL prefix", path.display()));
     for index in 0..(extent / WAL_REC as u64) as usize {
@@ -253,6 +359,7 @@ pub(crate) fn prove_prefix(
         reader.read_exact(&mut record)?;
         match record[0] {
             WAL_HEADER if index == 0 => {
+                header = true;
                 if header_version(&record, path)? == 1 {
                     framing = Framing::Strict { from: 1 };
                 }
@@ -313,6 +420,15 @@ pub(crate) fn prove_prefix(
                 break;
             }
         }
+    }
+    // A headerless generation recorded these bytes durable before raising its
+    // framing boundary. EOF and partial records cannot erase that evidence. A
+    // real header supersedes this legacy marker, as in ordinary recovery.
+    if let Some(boundary) = strict_from
+        && !header
+        && head.offset < boundary
+    {
+        return Err(corrupt());
     }
     budget.check()?;
     Ok(ProvenWal { head, selected })

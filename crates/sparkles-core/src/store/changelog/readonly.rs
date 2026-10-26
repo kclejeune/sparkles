@@ -120,7 +120,14 @@ impl ReadOnlyLog {
                 return Err(error);
             }
         };
-        budget.charge(std::mem::size_of::<Self>() as u64 + 64)?;
+        if let Err(error) = (|| {
+            budget.key_step("history capture envelope", 0)?;
+            budget.charge(std::mem::size_of::<Self>() as u64 + 64)
+        })() {
+            drop(value);
+            budget.release(budget.used() - start);
+            return Err(error);
+        }
         Ok(Loaded {
             value,
             charge: budget.used() - start,
@@ -588,6 +595,64 @@ mod tests {
             drop(loaded.value);
             budget.release(loaded.charge);
             assert_eq!(budget.used(), 0);
+        }
+    }
+
+    #[test]
+    fn late_capture_refusal_refunds_only_its_storage_and_preserves_files() {
+        let root = tempfile::tempdir().unwrap();
+        let dir = root.path().join(CHANGES_DIR);
+        std::fs::create_dir(&dir).unwrap();
+        let id = uuid::Uuid::new_v4();
+        for first in [1, 2, 3] {
+            std::fs::write(dir.join(seg_name(first)), seg_header(id)).unwrap();
+        }
+        let before = log_bytes(root.path());
+        for timeout in [false, true] {
+            let cancel = Arc::new(AtomicBool::new(false));
+            let deadline = timeout.then(|| Instant::now() + Duration::from_secs(1));
+            let options = HistoryOptions {
+                cancel: Some(cancel.clone()),
+                deadline,
+            };
+            let mut budget = ColdBudget::new(ReadLimit {
+                options: &options,
+                memory: Some(1 << 20),
+                held: 0,
+            })
+            .unwrap();
+            budget.charge(17).unwrap();
+            let reached = AtomicBool::new(false);
+            let observer = |stage: &str, _: usize| {
+                if stage == "history capture envelope" {
+                    reached.store(true, Ordering::Relaxed);
+                    if let Some(deadline) = deadline {
+                        std::thread::sleep(
+                            deadline.saturating_duration_since(Instant::now())
+                                + Duration::from_millis(2),
+                        );
+                    } else {
+                        cancel.store(true, Ordering::Relaxed);
+                    }
+                }
+            };
+            budget.observe_keys(&observer);
+            let result = ReadOnlyLog::capture(root.path(), id, 3, 3, &mut budget);
+            assert!(
+                reached.load(Ordering::Relaxed),
+                "did not exercise late envelope refusal"
+            );
+            match result {
+                Err(Error::Timeout) if timeout => {}
+                Err(Error::Cancelled) if !timeout => {}
+                _ => panic!("wrong late capture refusal"),
+            }
+            assert_eq!(
+                budget.used(),
+                17,
+                "late capture retained freed segment storage"
+            );
+            assert_eq!(log_bytes(root.path()), before);
         }
     }
 
