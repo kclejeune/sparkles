@@ -393,6 +393,13 @@ impl ReadLimit<'_> {
         })
     }
 
+    pub(crate) fn read_lock<'m, T>(
+        &self,
+        lock: &'m parking_lot::RwLock<T>,
+    ) -> Result<parking_lot::RwLockReadGuard<'m, T>> {
+        crate::task::read_lock(lock, || self.check(0))
+    }
+
     pub(crate) fn lock<'m, T>(
         &self,
         mutex: &'m parking_lot::Mutex<T>,

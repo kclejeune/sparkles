@@ -2421,13 +2421,17 @@ impl Store {
     /// The error for a commit a branch store shares with its upstream: reads of it are
     /// served by the upstream (see [`Store::branch_snapshot_at`]).
     fn inherited(&self, at: &crate::history::At, seq: u64) -> Error {
+        self.inherited_named(at, seq, &self.branch_name())
+    }
+
+    fn inherited_named(&self, at: &crate::history::At, seq: u64, name: &str) -> Error {
         let i = self.branching.ident.as_ref().expect("a branch store");
         let mut e = crate::branch::BranchError {
             kind: crate::branch::BranchErrorKind::NotFound,
             code: "inherited-commit",
             message: format!(
                 "{at} on branch {} is a commit of the history it shares with its upstream; read it there",
-                self.branch_name()
+                name
             ),
             conflicts: None,
             candidates: Vec::new(),
@@ -2480,7 +2484,14 @@ impl Store {
         o: &crate::history::HistoryOptions,
         memory: Option<u64>,
     ) -> Result<(Arc<Snapshot>, crate::history::Resolved)> {
-        let memory = memory.map(|n| n.min(self.opts.history_cache_bytes));
+        let capacity = self
+            .opts
+            .shared
+            .as_ref()
+            .map_or(self.opts.history_cache_bytes, |scope| {
+                scope.caches.history().capacity()
+            });
+        let memory = memory.map(|n| n.min(capacity));
         let limit = crate::history::ReadLimit {
             options: o,
             memory,
@@ -2624,7 +2635,11 @@ impl Store {
         h.materializations += 1;
         h.materialize_nanos += t0.elapsed().as_nanos() as u64;
         let bytes = delta_bytes(&delta);
-        let dvocab_len = generation.dvocab.len();
+        let dvocab_len = if memory.is_some() {
+            generation.dvocab.len_limited(&limit)?
+        } else {
+            generation.dvocab.len()
+        };
         let snap = Arc::new(Snapshot {
             cacheable: true,
             dataset_id: self.owner_dataset_id(),

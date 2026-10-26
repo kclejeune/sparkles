@@ -148,3 +148,85 @@ fn missing_memory_history_is_not_replaced_by_head() {
         Err(Error::HistoryGone(_))
     ));
 }
+
+fn shared_options(history: u64, local: u64) -> StoreOptions {
+    use sparkles_core::store::caches::{CacheSizes, SharedCaches};
+    StoreOptions {
+        history_cache_bytes: local,
+        shared: Some(
+            SharedCaches::new(CacheSizes {
+                blocks: 0,
+                results: 0,
+                service: 0,
+                history,
+            })
+            .scope(),
+        ),
+        ..Default::default()
+    }
+}
+
+#[test]
+fn effective_shared_capacity_precedes_live_memory_and_persistent_fast_paths() {
+    for memory in [false, true] {
+        let root = tempfile::tempdir().unwrap();
+        let options = shared_options(64 << 10, 512 << 20);
+        let store = if memory {
+            Store::in_memory(options)
+        } else {
+            Store::open(root.path(), options).unwrap()
+        };
+        write(&store, "INSERT DATA { <urn:a> <urn:p> 1 }");
+        store.create_snapshot("old", &At::Head, None).unwrap();
+        write(&store, "INSERT DATA { <urn:b> <urn:p> 2 }");
+        assert!(
+            matches!(
+                store.snapshot_at_limited(&At::Head, &HistoryOptions::default(), 2 << 20),
+                Err(Error::BudgetExceeded(_))
+            ),
+            "live scope bypass, memory={memory}"
+        );
+        assert!(
+            matches!(
+                store.snapshot_at_limited(&At::Commit(1), &HistoryOptions::default(), 2 << 20),
+                Err(Error::BudgetExceeded(_))
+            ),
+            "retained scope bypass, memory={memory}"
+        );
+        store
+            .snapshot_at(&At::Commit(1), &HistoryOptions::default())
+            .unwrap();
+        assert!(
+            matches!(
+                store.snapshot_at_limited(&At::Commit(1), &HistoryOptions::default(), 2 << 20),
+                Err(Error::BudgetExceeded(_))
+            ),
+            "cached scope bypass, memory={memory}"
+        );
+    }
+}
+
+#[test]
+fn ignored_zero_local_capacity_cannot_override_a_shared_scope() {
+    for memory in [false, true] {
+        let root = tempfile::tempdir().unwrap();
+        let options = shared_options(2 << 20, 0);
+        let store = if memory {
+            Store::in_memory(options)
+        } else {
+            Store::open(root.path(), options).unwrap()
+        };
+        write(&store, "INSERT DATA { <urn:a> <urn:p> 1 }");
+        store.create_snapshot("old", &At::Head, None).unwrap();
+        write(&store, "INSERT DATA { <urn:b> <urn:p> 2 }");
+        assert!(
+            store
+                .snapshot_at_limited(&At::Head, &HistoryOptions::default(), 2 << 20)
+                .is_ok()
+        );
+        let (_, resolved) = store
+            .snapshot_at_limited(&At::Commit(1), &HistoryOptions::default(), 2 << 20)
+            .unwrap();
+        assert_eq!(resolved.commit.seq, 1);
+    }
+}

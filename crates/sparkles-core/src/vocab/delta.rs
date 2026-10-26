@@ -702,6 +702,28 @@ impl DeltaVocab {
     pub fn len(&self) -> u64 {
         self.inner.read().len()
     }
+    pub(crate) fn len_limited(&self, limit: &crate::history::ReadLimit<'_>) -> Result<u64> {
+        Ok(limit.read_lock(&self.inner)?.len())
+    }
+
+    /// Borrow dictionary bytes only after controlled lock acquisition. The callback
+    /// must admit any owned copies against its own request budget before allocation.
+    pub fn with_controlled<R>(
+        &self,
+        control: &crate::task::Control,
+        f: impl FnOnce(&AppendVocab) -> Result<R>,
+    ) -> Result<R> {
+        let guard = crate::task::read_lock(&self.inner, || control.check())?;
+        let result = f(&guard)?;
+        control.check()?;
+        Ok(result)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn write_guard_for_test(&self) -> parking_lot::RwLockWriteGuard<'_, AppendVocab> {
+        self.inner.write()
+    }
+
     pub fn is_empty(&self) -> bool {
         self.len() == 0
     }

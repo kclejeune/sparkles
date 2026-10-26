@@ -3,6 +3,12 @@ use super::*;
 use crate::history::{At, HistoryOptions, ReadLimit, Resolved};
 
 impl Store {
+    fn inherited_limited(&self, at: &At, seq: u64, limit: &ReadLimit<'_>) -> Result<Error> {
+        let name = limit.read_lock(&self.branching.name)?;
+        limit.check(name.len() as u64)?;
+        Ok(self.inherited_named(at, seq, &name))
+    }
+
     pub(super) fn resolve_limited(&self, at: &At, limit: &ReadLimit<'_>) -> Result<Resolved> {
         if let At::Snapshot(name) = at
             && !crate::history::valid_name(name)
@@ -20,7 +26,7 @@ impl Store {
                     Some(commit) => commit.seq,
                     None if self.branching.ident.is_some() => {
                         drop(catalog);
-                        return Err(self.inherited(at, 0));
+                        return Err(self.inherited_limited(at, 0, limit)?);
                     }
                     None => {
                         return Err(Error::NotFound(format!(
@@ -58,7 +64,7 @@ impl Store {
                 _ => seq < identity.from.seq,
             };
             if before {
-                return Err(self.inherited(at, seq));
+                return Err(self.inherited_limited(at, seq, limit)?);
             }
         }
         let metadata = limit.lock(&self.catalog)?.get(seq);
@@ -548,6 +554,83 @@ mod tests {
     use super::*;
     use std::sync::atomic::AtomicBool;
     use std::time::{Duration, Instant};
+
+    #[test]
+    fn inherited_name_read_wait_is_interruptible() {
+        let root = tempfile::tempdir().unwrap();
+        let owner = Arc::new(Store::open(root.path(), StoreOptions::default()).unwrap());
+        crate::sparql::update::update(
+            &owner,
+            "INSERT DATA { <urn:a> <urn:p> 1 }",
+            &Default::default(),
+        )
+        .unwrap();
+        owner.create_branch("dev", &Default::default()).unwrap();
+        let branch = owner
+            .owned_set()
+            .unwrap()
+            .open_store(owner.branch_id_of("dev").unwrap())
+            .unwrap();
+        let held = branch.branching.name.write();
+        let read = branch.clone();
+        let cancel = Arc::new(AtomicBool::new(false));
+        let signal = cancel.clone();
+        let (send, receive) = std::sync::mpsc::channel();
+        let task = std::thread::spawn(move || {
+            send.send(read.snapshot_at_limited(
+                &At::Commit(0),
+                &HistoryOptions {
+                    cancel: Some(signal),
+                    deadline: None,
+                },
+                2 << 20,
+            ))
+            .unwrap();
+        });
+        std::thread::sleep(Duration::from_millis(30));
+        cancel.store(true, Ordering::Relaxed);
+        let result = receive.recv_timeout(Duration::from_secs(1));
+        drop(held);
+        task.join().unwrap();
+        assert!(matches!(result, Ok(Err(Error::Cancelled))));
+    }
+
+    #[test]
+    fn historical_vocabulary_length_wait_observes_deadline() {
+        let root = tempfile::tempdir().unwrap();
+        let store = Arc::new(Store::open(root.path(), StoreOptions::default()).unwrap());
+        crate::sparql::update::update(
+            &store,
+            "INSERT DATA { <urn:a> <urn:p> 1 }",
+            &Default::default(),
+        )
+        .unwrap();
+        crate::sparql::update::update(
+            &store,
+            "INSERT DATA { <urn:b> <urn:p> 2 }",
+            &Default::default(),
+        )
+        .unwrap();
+        let snapshot = store.snapshot();
+        let held = snapshot.generation.dvocab.write_guard_for_test();
+        let read = store.clone();
+        let (send, receive) = std::sync::mpsc::channel();
+        let task = std::thread::spawn(move || {
+            send.send(read.snapshot_at_limited(
+                &At::Commit(1),
+                &HistoryOptions {
+                    cancel: None,
+                    deadline: Some(Instant::now() + Duration::from_millis(40)),
+                },
+                2 << 20,
+            ))
+            .unwrap();
+        });
+        let result = receive.recv_timeout(Duration::from_secs(1));
+        drop(held);
+        task.join().unwrap();
+        assert!(matches!(result, Ok(Err(Error::Timeout))));
+    }
 
     #[test]
     fn controlled_ranges_agree_with_sorted_interval_union() {

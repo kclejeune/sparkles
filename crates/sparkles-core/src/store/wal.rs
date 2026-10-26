@@ -790,7 +790,12 @@ pub(crate) fn apply_forward_limited(
                 super::history_limited::preparation_mutation_bytes(delta).saturating_add(buffers),
             )?;
             let quad = record_quad(record);
-            let in_base = spo.contains(cache, &Perm::Spo.to_key(&quad))?;
+            let in_base = spo.contains_limited(
+                cache,
+                &Perm::Spo.to_key(&quad),
+                limit,
+                super::history_limited::preparation_mutation_bytes(delta).saturating_add(buffers),
+            )?;
             apply(delta, &quad, record[0] == WAL_INSERT, in_base);
             records += 1;
         }
@@ -1000,7 +1005,14 @@ pub(crate) fn apply_backward_limited(
                     .saturating_add(fwd.capacity() as u64),
             )?;
             let q = record_quad(r);
-            let in_base = spo.contains(cache, &Perm::Spo.to_key(&q))?;
+            let in_base = spo.contains_limited(
+                cache,
+                &Perm::Spo.to_key(&q),
+                limit,
+                super::history_limited::preparation_mutation_bytes(delta)
+                    .saturating_add(held_buffers)
+                    .saturating_add(fwd.capacity() as u64),
+            )?;
             apply(delta, &q, r[0] != WAL_INSERT, in_base);
             records += 1;
         }
