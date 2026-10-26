@@ -161,8 +161,8 @@ class Oracles(unittest.TestCase):
         pathlib.Path("/proc/self/smaps").exists(), "Linux dirty-page probe"
     )
     def test_fresh_ext4_clone_is_clean_before_server_start(self):
-        parent = SCRIPTS.parent / "target"
-        parent.mkdir(exist_ok=True)
+        parent = SCRIPTS.parent / ".artifacts" / "bench-tests"
+        parent.mkdir(parents=True, exist_ok=True)
         with tempfile.TemporaryDirectory(
             prefix="sparkles-clone-fence-", dir=parent
         ) as temp:
