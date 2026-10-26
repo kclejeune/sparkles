@@ -47,6 +47,8 @@ concurrency:
   cancel-in-progress: ${{ github.ref != 'refs/heads/main' && github.ref_type != 'tag' }}
 
 env:
+  # Only same-repository PRs may publish to the remote cache.
+  MBX_REMOTE_TRUST_WRITES: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name == github.repository && 'true' || 'false' }}
   # Pushes to main and pull requests build the bindings in the dev profile, which compiles
   # far faster than the release profile's thin LTO; tags and manual runs build what would
   # be published.
@@ -54,6 +56,9 @@ env:
 
 jobs:
   natives:
+    permissions:
+      contents: read
+      id-token: write
     timeout-minutes: 45
     # Pushes to main and pull requests build and test linux-x86_64 only. Tags and manual
     # runs build every platform, which the release jars need.
@@ -77,6 +82,11 @@ jobs:
         with: { cache: false, rustflags: "" }
       - uses: jdx/mr-boxington-action@v1.7.3
         with:
+          # Fork pull requests use GitHub cache because they cannot request an OIDC token.
+          backend: ${{ (github.event_name == 'push' && github.ref == 'refs/heads/main' || github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name == github.repository) && 'remote' || 'github' }}
+          remote-url: https://mbx.kclj.dev
+          namespace: kclejeune/sparkles
+          oidc-audience: https://mbx.kclj.dev
           version: 1.28.0
           github-cache-mode: objects
           cache-generation: sparkles-jvm-natives-${{ matrix.platform }}-${{ env.JVM_PROFILE }}-v1
@@ -112,6 +122,9 @@ jobs:
   # The all-platform jars and the Java and Jena version matrix: pull requests, tags and
   # manual runs. A push to main stops after the natives job's tests.
   jars:
+    permissions:
+      contents: read
+      id-token: write
     timeout-minutes: 30
     needs: natives
     if: github.event_name != 'push' || github.ref_type == 'tag'
@@ -126,6 +139,11 @@ jobs:
         with: { cache: false, rustflags: "" }
       - uses: jdx/mr-boxington-action@v1.7.3
         with:
+          # Fork pull requests use GitHub cache because they cannot request an OIDC token.
+          backend: ${{ (github.event_name == 'push' && github.ref == 'refs/heads/main' || github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name == github.repository) && 'remote' || 'github' }}
+          remote-url: https://mbx.kclj.dev
+          namespace: kclejeune/sparkles
+          oidc-audience: https://mbx.kclj.dev
           version: 1.28.0
           github-cache-mode: objects
           cache-generation: sparkles-jvm-bindgen-v1
@@ -145,6 +163,9 @@ jobs:
           if-no-files-found: error
 
   compatibility:
+    permissions:
+      contents: read
+      id-token: write
     timeout-minutes: 30
     needs: jars
     runs-on: ubuntu-24.04
@@ -164,6 +185,11 @@ jobs:
         with: { cache: false, rustflags: "" }
       - uses: jdx/mr-boxington-action@v1.7.3
         with:
+          # Fork pull requests use GitHub cache because they cannot request an OIDC token.
+          backend: ${{ (github.event_name == 'push' && github.ref == 'refs/heads/main' || github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name == github.repository) && 'remote' || 'github' }}
+          remote-url: https://mbx.kclj.dev
+          namespace: kclejeune/sparkles
+          oidc-audience: https://mbx.kclj.dev
           version: 1.28.0
           github-cache-mode: objects
           cache-generation: sparkles-jvm-bindgen-v1

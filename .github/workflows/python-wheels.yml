@@ -56,6 +56,8 @@ concurrency:
   cancel-in-progress: ${{ github.ref != 'refs/heads/main' && github.ref_type != 'tag' }}
 
 env:
+  # Only same-repository PRs may publish to the remote cache.
+  MBX_REMOTE_TRUST_WRITES: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name == github.repository && 'true' || 'false' }}
   MATURIN_VERSION: "1.15.0"
   MANIFEST: crates/sparkles-py/Cargo.toml
   # Pushes to main and pull requests build the wheels in the dev profile, which compiles
@@ -65,6 +67,9 @@ env:
 
 jobs:
   linux:
+    permissions:
+      contents: read
+      id-token: write
     timeout-minutes: 45
     name: Linux ${{ matrix.libc }} ${{ matrix.target }}
     # arm64 builds and tests natively on arm64 runners
@@ -91,6 +96,11 @@ jobs:
         with: { cache: false, rustflags: "" }
       - uses: jdx/mr-boxington-action@v1.7.3
         with:
+          # Fork pull requests use GitHub cache because they cannot request an OIDC token.
+          backend: ${{ (github.event_name == 'push' && github.ref == 'refs/heads/main' || github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name == github.repository) && 'remote' || 'github' }}
+          remote-url: https://mbx.kclj.dev
+          namespace: kclejeune/sparkles
+          oidc-audience: https://mbx.kclj.dev
           version: 1.28.0
           github-cache-mode: objects
           cache-generation: sparkles-python-linux-${{ matrix.libc }}-${{ env.PROFILE_ARG }}-v1
@@ -103,6 +113,10 @@ jobs:
           manylinux: ${{ env.COMPAT }}
           docker-options: >-
             -e MBX_CACHE_EXPORT_GROUP
+            -e MBX_REMOTE_URL -e MBX_REMOTE_NAMESPACE -e MBX_REMOTE_OIDC_AUDIENCE
+            -e MBX_REMOTE_TRUST_WRITES
+            -e ACTIONS_ID_TOKEN_REQUEST_URL -e ACTIONS_ID_TOKEN_REQUEST_TOKEN
+            -e GITHUB_ACTIONS -e GITHUB_EVENT_NAME -e GITHUB_REF -e GITHUB_REF_TYPE -e GITHUB_REF_PROTECTED
             -e MBX_CACHE_DIR=${{ github.workspace }}/.cache/mbx
             -e MBX_SHIMS_DIR=${{ github.workspace }}/.cache/container-shims
             -e CI=true
