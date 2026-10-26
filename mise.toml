@@ -413,14 +413,15 @@ description = "Apache Jena's own HTTP clients (RDFConnectionRemote, RDFConnectio
 run = "mbx sparkles-task -- scripts/test-jena-clients.sh"
 
 [tasks.ci]
-description = "Everything CI should run: formatting, lints, cited paths in the docs, the formatter's browser build, Rust, UI, Python, JVM and Node binding tests, third-party license notices up to date. Logs go to .artifacts/ci/logs, and .artifacts/ci/summary.txt shows each task's state while it runs"
+description = "The default CI gate: formatting, lints, cited paths in the docs, the formatter's browser build, Rust, UI, Python, JVM and Node binding tests, third-party license notices up to date. Logs go to .artifacts/ci/logs, and .artifacts/ci/summary.txt shows each task's state while it runs"
 usage = '''
+flag "--exhaustive-features" help="also run optional-feature Clippy and stripped-server tests"
 flag "--fail-fast" help="stop the remaining tasks after the first failure"
 flag "--force" help="run every check even when the task cache has a pass for it"
 flag "--jobs <n>" help="tasks run at once" default="2"
 arg "[task]..." help="run only these CI tasks" var=#true
 '''
-run = 'mbx sparkles-task -- scripts/ci.sh --jobs "$usage_jobs" ${usage_fail_fast:+--fail-fast} ${usage_force:+--force} ${usage_task:-}'
+run = 'mbx sparkles-task -- scripts/ci.sh --jobs "$usage_jobs" ${usage_exhaustive_features:+--exhaustive-features} ${usage_fail_fast:+--fail-fast} ${usage_force:+--force} ${usage_task:-}'
 
 [tasks."ci:fast"]
 description = "The quick CI subset for iterating: formatting, cited doc paths, Clippy on the workspace and the Rust tests"

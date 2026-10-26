@@ -15,9 +15,10 @@
 # Checks whose inputs are unchanged since they last passed are skipped through mise's task
 # cache (see the task caching section of mise.toml).
 #
-# Usage: scripts/ci.sh [--fast] [--fail-fast] [--force] [--jobs N] [task...]
-#   --fast       formatting, shell checks, doc paths, Clippy on the workspace and the Rust tests only. The
-#                per-feature test runs (test:features) belong to the full gate alone.
+# Usage: scripts/ci.sh [--fast] [--exhaustive-features] [--fail-fast] [--force] [--jobs N] [task...]
+#   --fast       formatting, shell checks, doc paths, workspace Clippy and Rust tests
+#   --exhaustive-features
+#                also run optional-feature Clippy and the six stripped-server test sets
 #   --fail-fast  stop the remaining tasks after the first failure
 #   --force      run every check even when the task cache has a pass for it
 #   --jobs N     tasks run at once (default 2). Cargo tasks share one build lock, so more
@@ -36,7 +37,7 @@ main() {
   full=(
     fmt:check ui:fmt:check node:fmt:check lint:shell lint:doc-paths test:bench-scripts
     lint ui:check fmt:wasm py:lint jvm:lint node:lint
-    test ui:test lint:features test:features
+    test ui:test
     py:test jvm:rust-test jvm:test node:test node:client:check licenses:check
   )
   fast=(fmt:check lint:shell lint:doc-paths lint test)
@@ -44,10 +45,12 @@ main() {
   jobs=2
   fail_fast=
   force=()
+  exhaustive_features=
   tasks=()
   while [ $# -gt 0 ]; do
     case "$1" in
       --fast) tasks=("${fast[@]}") ;;
+      --exhaustive-features) exhaustive_features=1 ;;
       --fail-fast) fail_fast=1 ;;
       --force) force=(--force) ;;
       --jobs)
@@ -63,6 +66,13 @@ main() {
     shift
   done
   [ ${#tasks[@]} -gt 0 ] || tasks=("${full[@]}")
+  if [ -n "$exhaustive_features" ]; then
+    for feature_task in lint:features test:features; do
+      if [[ " ${tasks[*]} " != *" $feature_task "* ]]; then
+        tasks+=("$feature_task")
+      fi
+    done
+  fi
 
   out=.artifacts/ci
   # One run per checkout: a second run would delete the first one's logs and state.

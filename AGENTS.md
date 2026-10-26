@@ -10,8 +10,9 @@ work, and each item links to its design spec in [docs/specs](docs/specs/README.m
 
 ## Building and testing
 
-- `scripts/ci.sh` is the full local gate. The conformance suites run separately with
-  `mise run test:w3c`, `test:shacl` and `test:shex`.
+- `scripts/ci.sh` is the default local gate. Add `--exhaustive-features` for the optional
+  feature lint and stripped-server compatibility matrix. The conformance suites run
+  separately with `mise run test:w3c`, `test:shacl` and `test:shex`.
 - Use Mr. Boxington as the Cargo drop-in on local and remote build hosts. Run
   `mbx build`, `mbx check`, `mbx test` or `mbx nextest run` directly. Run
   `mise install mr-boxington` once on each host to install the pinned tool. Mise
