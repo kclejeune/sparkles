@@ -1646,8 +1646,11 @@ The local Ask pipeline records bounded debug spans and completion events for tot
 grounding, both schema projections, stored examples, entity linking, optional community
 recall, query checks and query execution. A completion records one call, inclusive
 nanoseconds, a finite outcome and error category, and the tool-returned commit when
-available. The grounding span records the context-window size. No added field contains
-a question, label, arbitrary IRI, prompt or error message.
+available. Every scoped completion also records a process-generated numeric pipeline
+identifier and the context-window size when selected. These fields survive the
+production JSON formatter without ancestor span lists. Nested synchronous asks and unwinding restore
+the previous scope, while standalone tool stages remain unscoped. No added field
+contains a client identifier, question, label, arbitrary IRI, prompt or error message.
 
 Separate nested stages identify the example query and document embedding preparation
 and the linker's vector search. Their times include cache lookup, admission and any

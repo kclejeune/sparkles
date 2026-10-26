@@ -3867,7 +3867,8 @@ design remains part of its original record.
 Ask, query explanations, document ingestion and agent-memory workflows are available. The remaining evaluation, ingestion, verified-rewrite, grounding and latency work is tracked under items 6, 15, 27, 77, 81, 90, 263 and 318.
 
 Bounded debug stage diagnostics distinguish local grounding, tool calls and nested
-embedding work without changing usage accounting. Item 318 remains open for
+embedding work with bounded process-generated request correlation and no change to
+usage accounting. Item 318 remains open for
 representative latency measurements and evidence-based reductions in avoidable work.
 
 See the [delivery record](OUTCOME.md#outcome) for implementation departures,
