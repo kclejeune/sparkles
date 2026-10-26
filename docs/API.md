@@ -8474,7 +8474,7 @@ shape, is not written at all, and the error names those triples. The Rust API is
 ## Editing forms
 
 The design and its rationale are in
-[U02 Editing forms generated from SHACL shapes](specs/U02-shape-driven-forms.md).
+[U02 Editing forms generated from SHACL shapes](specs/U02-shape-driven-forms/README.md).
 
 The form routes turn a dataset's SHACL shapes into an editing form for one resource. The
 server reads the shapes, chooses the node shapes that target the resource, merges their
@@ -8488,6 +8488,19 @@ need the `shacl` cargo feature, which is on by default, and return `501` without
 | `GET /$/forms/{ds}?focus=IRI` | `read` | The form model of a resource, or with `class=IRI` the empty form of a new instance. |
 | `POST /$/forms/{ds}/check` | `write` | A dry run of a change and its validation against the form's shapes. |
 | `POST /$/forms/{ds}/save` | `write` | The commit of a change, unless another commit changed its fields. |
+
+Checks follow shape dependencies in the base and candidate states rather than a fixed
+number of graph hops. The allowance admits 500 additional distinct targets beyond the
+resources directly touched by the edit, shared across shapes. A larger or unfinished
+discovery returns an error without a partial successful report. Existing violations on
+admitted targets remain visible. Globally dependent shapes use their own actual targets
+within that allowance, without validating every unrelated shape.
+
+Forms preflight target-node expression producers before deciding field applicability.
+Graph-free constants, lists, focus variables, basic list operators, conditionals and
+simple aggregates are admitted. Other producers currently return an explicit unsupported
+error. This forms boundary does not change ordinary SHACL validation. Discovery bounds
+cover its target selection and work, not all SHACL heap use or cold index decoding.
 
 ### The form model
 

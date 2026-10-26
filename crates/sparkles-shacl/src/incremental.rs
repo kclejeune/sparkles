@@ -26,6 +26,13 @@
 //! constraints or components whose queries may read anything, and shapes that reach a
 //! reference cycle (recursive shapes).
 
+mod affected;
+mod analysis_control;
+pub(crate) mod bounded;
+mod query_reads;
+mod targets;
+pub use affected::{AffectedLimits, check_target_producers, validate_affected};
+
 use crate::data::DataGraph;
 use crate::nodeexpr::{Expr, ExprId};
 use crate::path::{CPath, PropertyPath};
@@ -159,6 +166,7 @@ enum Plan {
 /// The incremental analysis of a shapes graph.
 #[derive(Clone, Debug, Default)]
 pub struct Model {
+    producer_refused: bool,
     /// per shape: `None` for shapes that are not validated on their own (no targets, or
     /// deactivated)
     plans: Vec<Option<Plan>>,
@@ -177,8 +185,10 @@ const MAX_DEPS: usize = 4096;
 /// otherwise take exponential time while the guard is installed.
 const MAX_EXPR_STEPS: usize = 100_000;
 
-struct Analyzer<'a> {
+struct Analyzer<'a, 'c> {
+    producer_refused: bool,
     shapes: &'a Shapes,
+    control: Option<&'c mut dyn FnMut() -> Result<(), Fallback>>,
     memo: Vec<Option<Result<Vec<Dep>, Fallback>>>,
     on_stack: Vec<bool>,
     uses_classes: bool,
@@ -186,18 +196,56 @@ struct Analyzer<'a> {
     expr_steps: usize,
 }
 
-impl Analyzer<'_> {
-    fn pred(&self, t: crate::shapes::Tid) -> Option<NamedNode> {
+impl Analyzer<'_, '_> {
+    fn check(&mut self) -> Result<(), Fallback> {
+        match self.control.as_mut() {
+            Some(check) => check(),
+            None => Ok(()),
+        }
+    }
+
+    fn query_reads(
+        &mut self,
+        query: &spargebra::Query,
+        anchors: &[(&str, Vec<PropertyPath>)],
+    ) -> Result<Vec<Dep>, Fallback> {
+        if self.control.is_none() {
+            return crate::localize::reads(query, anchors)
+                .map(|reads| reads.into_iter().map(Dep::from).collect())
+                .ok_or(Fallback::Sparql);
+        }
+        match query_reads::reads(query, anchors, &mut self.control)? {
+            query_reads::Reads::Local(reads) => {
+                let mut out = Vec::new();
+                for read in reads {
+                    self.check()?;
+                    out.push(Dep::from(read));
+                }
+                Ok(out)
+            }
+            query_reads::Reads::Global => Err(Fallback::Sparql),
+            query_reads::Reads::Unsupported => {
+                self.producer_refused = true;
+                Err(Fallback::Sparql)
+            }
+        }
+    }
+
+    fn pred(&mut self, t: crate::shapes::Tid) -> Result<Option<NamedNode>, Fallback> {
         match self.shapes.term(t) {
-            Term::NamedNode(n) => Some(n.clone()),
-            _ => None,
+            Term::NamedNode(n) => {
+                analysis_control::admit_iri(n, &mut self.control)?;
+                Ok(Some(n.clone()))
+            }
+            _ => Ok(None),
         }
     }
 
     /// The reads of shape `si` at its focus node.
     fn deps(&mut self, si: ShapeId) -> Result<Vec<Dep>, Fallback> {
+        self.check()?;
         if let Some(d) = &self.memo[si] {
-            return d.clone();
+            return analysis_control::result(d, &mut self.control);
         }
         if self.on_stack[si] {
             return Err(Fallback::Recursive);
@@ -208,12 +256,13 @@ impl Analyzer<'_> {
         let r = self.compute(si);
         self.expr_steps = saved;
         self.on_stack[si] = false;
-        self.memo[si] = Some(r.clone());
+        self.memo[si] = Some(analysis_control::result(&r, &mut self.control));
         r
     }
 
     fn compute(&mut self, si: ShapeId) -> Result<Vec<Dep>, Fallback> {
-        let shape = &self.shapes.shapes[si];
+        let shapes = self.shapes;
+        let shape = &shapes.shapes[si];
         self.expr_steps = 0;
         let mut out: Vec<Dep> = Vec::new();
         if shape.deactivated {
@@ -221,9 +270,12 @@ impl Analyzer<'_> {
             return Ok(out);
         }
         // the value nodes are reached over the path
-        let path: Vec<PropertyPath> = shape.path.iter().map(|p| nnf(p, false)).collect();
+        let mut path = Vec::new();
+        if let Some(p) = &shape.path {
+            path.push(analysis_control::nnf(p, false, &mut self.control)?);
+        }
         for p in &path {
-            for (prefix, pred, dir) in steps(p) {
+            for (prefix, pred, dir) in analysis_control::steps(p, &mut self.control)? {
                 out.push(Dep {
                     prefix,
                     pred: Some(pred),
@@ -234,19 +286,15 @@ impl Analyzer<'_> {
         // the value nodes may include the nodes `sh:values` and `sh:defaultValue` compute;
         // `None`: some of them are not reached from the focus node
         let mut anchored_values = true;
-        let mut value_prefix: Vec<PropertyPath> = path.clone();
+        let mut value_prefix = analysis_control::prefix(&path, &mut self.control)?;
         if let Some(e) = shape.deactivated_expr {
             self.expr_deps(e, &Some(Vec::new()), &None, &mut out)?;
         }
         if shape.values.is_some() || shape.default_value.is_some() {
-            let mut reaches = vec![Some(path.clone())];
+            let mut reaches = vec![Some(analysis_control::prefix(&path, &mut self.control)?)];
             for e in [shape.values, shape.default_value].into_iter().flatten() {
-                reaches.push(self.expr_deps(
-                    e,
-                    &Some(Vec::new()),
-                    &Some(path.clone()),
-                    &mut out,
-                )?);
+                let value_path = Some(analysis_control::prefix(&path, &mut self.control)?);
+                reaches.push(self.expr_deps(e, &Some(Vec::new()), &value_path, &mut out)?);
             }
             match alt(reaches) {
                 Some(p) => value_prefix = p,
@@ -256,40 +304,50 @@ impl Analyzer<'_> {
         let path_for_values = value_prefix;
         // where an expression finds the variable `value`: the value nodes, when each is
         // reached over the path
-        let value_pre: Pre = anchored_values.then(|| path_for_values.clone());
+        let value_pre: Pre = if anchored_values {
+            Some(analysis_control::prefix(
+                &path_for_values,
+                &mut self.control,
+            )?)
+        } else {
+            None
+        };
         // only `sh:class` and `sh:closed` read the graph at the value nodes, and both
         // check `anchored_values` first
-        let at_values = |pred: Option<NamedNode>| Dep {
-            prefix: path_for_values.clone(),
-            pred,
-            dir: Dir::Out,
+        let at_values = |pred: Option<NamedNode>, control: &mut _| {
+            Ok::<_, Fallback>(Dep {
+                prefix: analysis_control::prefix(&path_for_values, control)?,
+                pred,
+                dir: Dir::Out,
+            })
         };
         let mut nested: Vec<ShapeId> = Vec::new();
         // shapes evaluated at the members of the value nodes (`sh:memberShape`)
         let mut members: Vec<ShapeId> = Vec::new();
         // a list constraint reads `rdf:first` and `rdf:rest` along each value node's list
-        let along_lists = || {
-            let mut prefix = path_for_values.clone();
+        let along_lists = |control: &mut _| {
+            let mut prefix = analysis_control::prefix(&path_for_values, control)?;
             prefix.push(PropertyPath::ZeroOrMore(Box::new(PropertyPath::Predicate(
                 rdf::REST.into_owned(),
             ))));
-            prefix
+            Ok::<_, Fallback>(prefix)
         };
         let mut lists = false;
         for c in &shape.constraints {
+            self.check()?;
             match c {
                 Constraint::Class(_) => {
                     if !anchored_values {
                         return Err(Fallback::Sparql);
                     }
                     self.uses_classes = true;
-                    out.push(at_values(Some(rdf::TYPE.into_owned())));
+                    out.push(at_values(Some(rdf::TYPE.into_owned()), &mut self.control)?);
                 }
                 Constraint::Equals(p)
                 | Constraint::Disjoint(p)
                 | Constraint::LessThan(p)
                 | Constraint::LessThanOrEquals(p) => {
-                    if let Some(p) = self.pred(*p) {
+                    if let Some(p) = self.pred(*p)? {
                         out.push(Dep {
                             prefix: Vec::new(),
                             pred: Some(p),
@@ -301,7 +359,7 @@ impl Analyzer<'_> {
                     if !anchored_values {
                         return Err(Fallback::Sparql);
                     }
-                    out.push(at_values(None));
+                    out.push(at_values(None, &mut self.control)?);
                 }
                 Constraint::Expression(e) => {
                     self.expr_deps(*e, &Some(Vec::new()), &value_pre, &mut out)?;
@@ -327,9 +385,7 @@ impl Analyzer<'_> {
                 }
                 // a query anchored at the focus node reads its neighbourhood
                 Constraint::Sparql(c) => {
-                    let reads = crate::localize::reads(&c.parsed, &[("this", Vec::new())])
-                        .ok_or(Fallback::Sparql)?;
-                    out.extend(reads.into_iter().map(Dep::from));
+                    out.extend(self.query_reads(&c.parsed, &[("this", Vec::new())])?);
                 }
                 Constraint::Component(c) => {
                     let mut anchors = vec![("this", Vec::new())];
@@ -339,11 +395,12 @@ impl Analyzer<'_> {
                         if !anchored_values {
                             return Err(Fallback::Sparql);
                         }
-                        anchors.push(("value", path_for_values.clone()));
+                        anchors.push((
+                            "value",
+                            analysis_control::prefix(&path_for_values, &mut self.control)?,
+                        ));
                     }
-                    let reads =
-                        crate::localize::reads(&c.parsed, &anchors).ok_or(Fallback::Sparql)?;
-                    out.extend(reads.into_iter().map(Dep::from));
+                    out.extend(self.query_reads(&c.parsed, &anchors)?);
                 }
                 Constraint::MemberShape(s) => {
                     lists = true;
@@ -377,7 +434,7 @@ impl Analyzer<'_> {
             }
             for p in [rdf::FIRST, rdf::REST] {
                 out.push(Dep {
-                    prefix: along_lists(),
+                    prefix: along_lists(&mut self.control)?,
                     pred: Some(p.into_owned()),
                     dir: Dir::Out,
                 });
@@ -389,7 +446,7 @@ impl Analyzer<'_> {
                 if !anchored_values {
                     return Err(Fallback::Sparql);
                 }
-                let mut prefix = along_lists();
+                let mut prefix = along_lists(&mut self.control)?;
                 prefix.push(PropertyPath::Predicate(rdf::FIRST.into_owned()));
                 prefix.extend(d.prefix);
                 out.push(Dep { prefix, ..d });
@@ -404,7 +461,7 @@ impl Analyzer<'_> {
                 if !anchored_values {
                     return Err(Fallback::Sparql);
                 }
-                let mut prefix = path_for_values.clone();
+                let mut prefix = analysis_control::prefix(&path_for_values, &mut self.control)?;
                 prefix.extend(d.prefix);
                 out.push(Dep { prefix, ..d });
             }
@@ -412,8 +469,22 @@ impl Analyzer<'_> {
                 return Err(Fallback::Budget);
             }
         }
+        if self.control.is_none() {
+            let mut seen = FxHashSet::default();
+            out.retain(|d| seen.insert(d.clone()));
+            return Ok(out);
+        }
         let mut seen = FxHashSet::default();
-        out.retain(|d| seen.insert(d.clone()));
+        let mut unique = Vec::new();
+        for d in out {
+            let copy = analysis_control::deps(std::slice::from_ref(&d), &mut self.control)?
+                .pop()
+                .unwrap();
+            if seen.insert(copy) {
+                unique.push(d);
+            }
+        }
+        let out = unique;
         Ok(out)
     }
 }
@@ -440,7 +511,7 @@ fn alt(rs: Vec<Pre>) -> Pre {
     }
 }
 
-impl Analyzer<'_> {
+impl Analyzer<'_, '_> {
     /// The reads of the node expression `e`, evaluated at the focus node that the prefix
     /// `base` reaches from the shape's focus node (`None`: an unanchored node), and the
     /// prefix that reaches its output nodes. `value` is the prefix of the nodes the
@@ -454,6 +525,7 @@ impl Analyzer<'_> {
         value: &Pre,
         out: &mut Vec<Dep>,
     ) -> Result<Pre, Fallback> {
+        self.check()?;
         let shapes = self.shapes;
         self.expr_steps += 1;
         if self.expr_steps > MAX_EXPR_STEPS {
@@ -461,29 +533,44 @@ impl Analyzer<'_> {
         }
         if out.len() > MAX_DEPS {
             // repeated reads of one path are one dependency
-            let mut seen = FxHashSet::default();
-            out.retain(|d| seen.insert(d.clone()));
+            if self.control.is_none() {
+                let mut seen = FxHashSet::default();
+                out.retain(|d| seen.insert(d.clone()));
+            } else {
+                let mut seen = FxHashSet::default();
+                let mut unique = Vec::new();
+                for d in out.drain(..) {
+                    let copy = analysis_control::deps(std::slice::from_ref(&d), &mut self.control)?
+                        .pop()
+                        .unwrap();
+                    if seen.insert(copy) {
+                        unique.push(d);
+                    }
+                }
+                *out = unique;
+            }
             if out.len() > MAX_DEPS {
                 return Err(Fallback::Budget);
             }
         }
-        let anchored = |at: &Pre| at.clone().ok_or(Fallback::Sparql);
+        let anchored =
+            |at: &Pre, control: &mut _| analysis_control::pre(at, control)?.ok_or(Fallback::Sparql);
         match &shapes.exprs[e] {
             Expr::Const(_) | Expr::Empty | Expr::List(_) => Ok(None),
             Expr::Var(n) => Ok(match n.as_str() {
-                "focusNode" => base.clone(),
-                "value" => value.clone(),
+                "focusNode" => analysis_control::pre(base, &mut self.control)?,
+                "value" => analysis_control::pre(value, &mut self.control)?,
                 _ => None,
             }),
             Expr::PathValues { path, focus } => {
                 let start = match focus {
-                    None => base.clone(),
+                    None => analysis_control::pre(base, &mut self.control)?,
                     Some(f) => self.expr_deps(*f, base, value, out)?,
                 };
-                let start = anchored(&start)?;
-                let p = nnf(path, false);
-                for (prefix, pred, dir) in steps(&p) {
-                    let mut full = start.clone();
+                let start = anchored(&start, &mut self.control)?;
+                let p = analysis_control::nnf(path, false, &mut self.control)?;
+                for (prefix, pred, dir) in analysis_control::steps(&p, &mut self.control)? {
+                    let mut full = analysis_control::prefix(&start, &mut self.control)?;
                     full.extend(prefix);
                     out.push(Dep {
                         prefix: full,
@@ -534,14 +621,14 @@ impl Analyzer<'_> {
             Expr::FlatMap { nodes, map } => {
                 let r = match nodes {
                     Some(n) => self.expr_deps(*n, base, value, out)?,
-                    None => base.clone(),
+                    None => analysis_control::pre(base, &mut self.control)?,
                 };
                 self.expr_deps(*map, &r, value, out)
             }
             Expr::FindFirst { nodes, shape } | Expr::MatchAll { nodes, shape } => {
                 let r = match nodes {
                     Some(n) => self.expr_deps(*n, base, value, out)?,
-                    None => base.clone(),
+                    None => analysis_control::pre(base, &mut self.control)?,
                 };
                 self.shape_at(*shape, &r, out)?;
                 Ok(if matches!(shapes.exprs[e], Expr::FindFirst { .. }) {
@@ -569,10 +656,8 @@ impl Analyzer<'_> {
                 Ok(None)
             }
             Expr::Select(q) | Expr::SparqlExpr(q) => {
-                let at = anchored(base)?;
-                let reads =
-                    crate::localize::reads(&q.query, &[("this", at)]).ok_or(Fallback::Sparql)?;
-                out.extend(reads.into_iter().map(Dep::from));
+                let at = anchored(base, &mut self.control)?;
+                out.extend(self.query_reads(&q.query, &[("this", at)])?);
                 Ok(None)
             }
             Expr::InstancesOf(_) | Expr::NodesMatching(_) | Expr::Custom { .. } | Expr::Arg(_) => {
@@ -587,9 +672,9 @@ impl Analyzer<'_> {
         if deps.is_empty() {
             return Ok(());
         }
-        let at = at.clone().ok_or(Fallback::Sparql)?;
+        let at = analysis_control::pre(at, &mut self.control)?.ok_or(Fallback::Sparql)?;
         for d in deps {
-            let mut prefix = at.clone();
+            let mut prefix = analysis_control::prefix(&at, &mut self.control)?;
             prefix.extend(d.prefix);
             out.push(Dep { prefix, ..d });
         }
@@ -658,9 +743,25 @@ pub(crate) fn steps(p: &PropertyPath) -> Vec<(Vec<PropertyPath>, NamedNode, Dir)
 impl Model {
     /// Analyze the shapes with targets.
     pub fn new(shapes: &Shapes) -> Model {
+        Self::new_controlled(shapes, None)
+    }
+
+    fn new_controlled(
+        shapes: &Shapes,
+        mut control: Option<&mut dyn FnMut() -> Result<(), Fallback>>,
+    ) -> Model {
         let n = shapes.shapes.len();
+        if let Some(check) = &mut control {
+            for _ in 0..n.saturating_mul(3) {
+                if check().is_err() {
+                    return Model::default();
+                }
+            }
+        }
         let mut a = Analyzer {
+            producer_refused: false,
             shapes,
+            control,
             memo: vec![None; n],
             on_stack: vec![false; n],
             uses_classes: false,
@@ -669,6 +770,10 @@ impl Model {
         let mut plans = vec![None; n];
         let mut reads: Option<FxHashSet<NamedNode>> = Some(FxHashSet::default());
         for (si, shape) in shapes.shapes.iter().enumerate() {
+            if a.check().is_err() {
+                plans[si] = Some(Plan::Global(Fallback::Budget));
+                continue;
+            }
             if shape.targets.is_empty() || shape.deactivated {
                 continue;
             }
@@ -677,6 +782,10 @@ impl Model {
                     // the targets read the focus node's own edges
                     let mut global = None;
                     for t in &shape.targets {
+                        if let Err(f) = a.check() {
+                            global = Some(f);
+                            break;
+                        }
                         let (pred, dir) = match *t {
                             Target::Node(_) => continue,
                             // a target expression that reads the data graph is not
@@ -717,8 +826,23 @@ impl Model {
                                 a.uses_classes = true;
                                 (Some(rdf::TYPE.into_owned()), Dir::Out)
                             }
-                            Target::SubjectsOf(p) => (a.pred(p), Dir::Out),
-                            Target::ObjectsOf(p) => (a.pred(p), Dir::In),
+                            Target::SubjectsOf(p) | Target::ObjectsOf(p) => {
+                                let pred = match a.pred(p) {
+                                    Ok(p) => p,
+                                    Err(f) => {
+                                        global = Some(f);
+                                        break;
+                                    }
+                                };
+                                (
+                                    pred,
+                                    if matches!(t, Target::SubjectsOf(_)) {
+                                        Dir::Out
+                                    } else {
+                                        Dir::In
+                                    },
+                                )
+                            }
                         };
                         // a target predicate that is not an IRI selects nothing
                         if let Some(pred) = pred {
@@ -734,7 +858,23 @@ impl Model {
                             reads = None;
                             Plan::Global(f)
                         }
-                        None => Plan::Local(group(deps, &mut reads)),
+                        None => {
+                            let admission = (|| {
+                                for d in &deps {
+                                    analysis_control::admit_prefix(&d.prefix, &mut a.control)?;
+                                    analysis_control::admit_prefix(&d.prefix, &mut a.control)?;
+                                    a.check()?;
+                                    if let Some(p) = &d.pred {
+                                        analysis_control::admit_iri(p, &mut a.control)?;
+                                    }
+                                }
+                                Ok::<_, Fallback>(())
+                            })();
+                            match admission {
+                                Ok(()) => Plan::Local(group(deps, &mut reads)),
+                                Err(f) => Plan::Global(f),
+                            }
+                        }
                     }
                 }
                 Err(f) => {
@@ -750,6 +890,7 @@ impl Model {
             r.insert(rdfs::SUB_CLASS_OF.into_owned());
         }
         Model {
+            producer_refused: a.producer_refused,
             plans,
             reads,
             uses_classes: a.uses_classes,

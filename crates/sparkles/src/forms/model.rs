@@ -12,7 +12,7 @@ use crate::index::Perm;
 use crate::preview::{DryRun, Preview};
 use crate::sparql::QueryOptions;
 use crate::store::{Chunk, Snapshot};
-use oxrdf::{Literal, NamedNode, Term};
+use oxrdf::{GraphName, Literal, NamedNode, Quad, Term};
 use parking_lot::Mutex;
 use serde::Serialize;
 use serde_json::{Value as J, json};
@@ -36,8 +36,7 @@ pub const CHECK_TIMEOUT: Duration = Duration::from_secs(10);
 /// How many times a save plans its update again when other commits move the values of
 /// its fields between graphs while it waits for the writer.
 pub const SAVE_ROUNDS: usize = 3;
-/// The most nodes a check validates besides those its change touches: the nodes that
-/// reach a touched node through one or two triples.
+/// The most additional distinct affected targets admitted beyond directly touched nodes.
 pub const MAX_DEPENDENTS: usize = 500;
 
 const RDF_TYPE: &str = "http://www.w3.org/1999/02/22-rdf-syntax-ns#type";
@@ -345,6 +344,9 @@ impl Forms {
     /// view that hides part of the data, no validation runs (`withheld`), as the
     /// validation routes refuse such callers.
     pub fn check(&self, change: &FormChange, opts: &QueryOptions) -> Result<FormCheck> {
+        let mut controlled = opts.clone();
+        controlled.deadline = deadline(opts);
+        let opts = &controlled;
         let store = self.ds.store();
         let head = store.snapshot();
         let mut built = self.build_for(&head, change, opts)?;
@@ -358,6 +360,7 @@ impl Forms {
         let mut wopts = opts.write.clone();
         wopts.message = change.message.clone().map(Arc::from);
         wopts.precondition = None;
+        wopts.deadline = wopts.deadline.into_iter().chain(opts.deadline).min();
         // a dry run from the start: however the check ends, the terms it added go again
         wopts.dry_run = Some(dry.clone());
         let mut txn = store.try_write_with(CommitKind::Update, wopts)?;
@@ -366,7 +369,8 @@ impl Forms {
             let base = txn.base().clone();
             built = self.build_for(&base, change, opts)?;
         }
-        let plan = built.plan(change)?;
+        let withheld = opts.graphs.as_ref().is_some_and(|a| !a.reads_everything());
+        let plan = built.plan(change, !withheld && !built.shapes.is_empty())?;
         let checks = expected(&built, &plan, change)?;
         let conflicts = conflicts_at(
             txn.base(),
@@ -377,18 +381,34 @@ impl Forms {
         )?
         .0;
         crate::sparql::update::update_in(&mut txn, &plan.update, opts)?;
-        let withheld = opts.graphs.as_ref().is_some_and(|a| !a.reads_everything());
         let (mut results, mut conforms, mut timed_out) = (None, None, false);
         if !withheld && !built.shapes.is_empty() {
             let post = Arc::new(txn.view());
-            let nodes = dependents(&post, &plan.touched, &Limits::of(opts))?;
             let mut v = built.vopts.clone();
-            v.timeout = Some(CHECK_TIMEOUT);
+            v.timeout = None;
             v.cancel = opts.cancel.clone();
             v.cancellation = opts.cancellation.clone();
-            v.deadline = deadline(opts);
+            v.deadline = opts
+                .deadline
+                .into_iter()
+                .chain([Instant::now() + CHECK_TIMEOUT])
+                .min();
             v.parallel = false;
-            match sparkles_shacl::validate_nodes(&post, &built.shapes, &nodes, &v) {
+            let discovery = sparkles_shacl::incremental::AffectedLimits {
+                additional_focus: MAX_DEPENDENTS,
+                work: opts
+                    .max_memory_bytes
+                    .map_or(100_000, |bytes| (bytes / 128).min(100_000)),
+            };
+            match sparkles_shacl::incremental::validate_affected(
+                txn.base(),
+                &post,
+                &built.shapes,
+                &plan.quads,
+                &plan.touched,
+                &v,
+                discovery,
+            ) {
                 Ok(report) => {
                     conforms = Some(report.conforms);
                     results = Some(built.map_results(&report));
@@ -422,7 +442,7 @@ impl Forms {
         let mut head = store.snapshot();
         for _ in 0..SAVE_ROUNDS {
             let built = self.build_for(&head, change, opts)?;
-            let plan = built.plan(change)?;
+            let plan = built.plan(change, false)?;
             let checks = expected(&built, &plan, change)?;
             let focus = built.focus.clone();
             let access = opts.graphs.clone();
@@ -581,6 +601,15 @@ impl Forms {
             )
             .map_err(crate::handles::from_anyhow)?
         } else {
+            // A form build decides applicability before the check's later discovery.
+            // Refuse an unadmitted target-list producer before that first evaluation.
+            sparkles_shacl::incremental::check_target_producers(
+                &shapes,
+                &vopts,
+                opts.max_memory_bytes
+                    .map_or(100_000, |bytes| (bytes / 128).min(100_000)),
+            )
+            .map_err(crate::handles::from_anyhow)?;
             sparkles_shacl::shapes_for_node(read.snap(), &shapes, &focus, &vopts)
                 .map_err(crate::handles::from_anyhow)?
         };
@@ -747,6 +776,8 @@ struct Plan {
     changed: Vec<(String, FieldPath)>,
     /// the nodes whose validation the change can affect
     touched: Vec<Term>,
+    /// Distinct changed triples in graphs of the validation data graph.
+    quads: Vec<Quad>,
 }
 
 /// Known DASH editors and viewers (spec U02 §2.3).
@@ -1052,8 +1083,64 @@ impl Built {
         }
     }
 
+    fn change_quad(
+        &self,
+        out: &mut Vec<Quad>,
+        predicate: &NamedNode,
+        value: &Term,
+        inverse: bool,
+        graph: Option<&str>,
+    ) -> Result<()> {
+        if graph.is_some_and(|g| self.vopts.exclude_graphs.iter().any(|x| x == g)) {
+            return Ok(());
+        }
+        let selected = match self.vopts.data_graph.as_deref() {
+            None => self.snap.union_default_graph || graph.is_none(),
+            Some("urn:x-arq:UnionGraph") => true,
+            Some("urn:x-arq:DefaultGraph") => graph.is_none(),
+            Some(g) => graph == Some(g),
+        } || graph.is_some_and(|g| self.vopts.extra_graphs.iter().any(|x| x == g));
+        if !selected {
+            return Ok(());
+        }
+        let Term::NamedNode(focus) = &self.focus else {
+            return Err(Error::invalid("form focus must be an IRI"));
+        };
+        let (subject, object) = if inverse {
+            let Term::NamedNode(subject) = value else {
+                return Err(Error::invalid("inverse form value must be an IRI"));
+            };
+            (subject, &self.focus)
+        } else {
+            (focus, value)
+        };
+        // A triple present in several selected graphs is one validation dependency.
+        // Compare before cloning values so graph multiplicity cannot multiply retained terms.
+        if out.iter().any(|q| {
+            q.subject.as_ref() == subject.as_ref().into()
+                && q.predicate == *predicate
+                && q.object == *object
+        }) {
+            return Ok(());
+        }
+        if out.len() > MAX_CHANGED_TERMS {
+            return Err(Error::invalid(
+                "form validation change admission exceeded its bound",
+            ));
+        }
+        out.push(Quad::new(
+            subject.clone(),
+            predicate.clone(),
+            object.clone(),
+            graph.map_or(GraphName::DefaultGraph, |g| {
+                GraphName::NamedNode(NamedNode::new_unchecked(g))
+            }),
+        ));
+        Ok(())
+    }
+
     /// The update of a change, after checking it against the fields.
-    fn plan(&self, change: &FormChange) -> Result<Plan> {
+    fn plan(&self, change: &FormChange, track_changes: bool) -> Result<Plan> {
         let read = self.read()?;
         let target = self
             .target
@@ -1071,6 +1158,7 @@ impl Built {
         }
         let mut del: BTreeMap<Option<String>, Vec<String>> = BTreeMap::new();
         let mut ins: BTreeMap<Option<String>, Vec<String>> = BTreeMap::new();
+        let mut quads = Vec::new();
         if let Some(c) = &self.new_class {
             // a new instance takes an IRI nothing describes yet
             if describes(&read, &self.focus)? {
@@ -1089,6 +1177,15 @@ impl Built {
                 self.focus,
                 c.as_str()
             ));
+            if track_changes {
+                self.change_quad(
+                    &mut quads,
+                    &NamedNode::new_unchecked(RDF_TYPE),
+                    &Term::NamedNode(c.clone()),
+                    false,
+                    self.target.as_deref(),
+                )?;
+            }
         }
         let mut changed = Vec::new();
         let mut touched: Vec<Term> = vec![self.focus.clone()];
@@ -1158,6 +1255,9 @@ impl Built {
                         )));
                     }
                     del.entry(g.clone()).or_default().push(line.clone());
+                    if track_changes {
+                        self.change_quad(&mut quads, p, v, inverse, g.as_deref())?;
+                    }
                 }
                 if let Term::NamedNode(_) = v {
                     touched.push(v.clone());
@@ -1174,6 +1274,9 @@ impl Built {
             for v in &c.add {
                 let line = triple(v)?;
                 ins.entry(self.target.clone()).or_default().push(line);
+                if track_changes {
+                    self.change_quad(&mut quads, p, v, inverse, self.target.as_deref())?;
+                }
                 if let Term::NamedNode(_) = v {
                     touched.push(v.clone());
                 }
@@ -1225,6 +1328,7 @@ impl Built {
             update,
             changed,
             touched,
+            quads,
         })
     }
 
@@ -1332,49 +1436,6 @@ fn used_iri(focus: &Term) -> Error {
     Error::invalid(format!(
         "focus: {focus} already describes a resource; a new instance needs a new IRI"
     ))
-}
-
-/// The nodes a check validates: those the change touches, and the nodes one or two
-/// triples away from one of them in `post`, in either direction, whose shapes can read
-/// the touched nodes along a path. At most [`MAX_DEPENDENTS`] are added.
-fn dependents(post: &Arc<Snapshot>, touched: &[Term], limits: &Limits) -> Result<Vec<Term>> {
-    let mut read = Reader::new(post, None)?;
-    read.limits = limits.clone();
-    let mut seen: BTreeSet<Id> = BTreeSet::new();
-    let mut out: Vec<Term> = touched.to_vec();
-    let mut frontier: Vec<Id> = touched.iter().filter_map(|t| post.lookup_term(t)).collect();
-    seen.extend(frontier.iter().copied());
-    let mut added = 0usize;
-    'hops: for _ in 0..2 {
-        let mut next = Vec::new();
-        for n in std::mem::take(&mut frontier) {
-            // a shape reads a node along a path from either end: the subjects of the
-            // triples into it and, for inverse steps, the objects of the triples out of it
-            let into = read.scan(Perm::Osp, &[n.0], MAX_DEPENDENTS + 1)?;
-            let out_of = read.scan(Perm::Spo, &[n.0], MAX_DEPENDENTS + 1)?;
-            let ends = into
-                .into_iter()
-                .map(|q| (q[0], q[3]))
-                .chain(out_of.into_iter().map(|q| (q[2], q[3])));
-            for (id, g) in ends {
-                if read.graph(g).is_none() || !seen.insert(id) {
-                    continue;
-                }
-                let Some(t) = post.term(id) else { continue };
-                if matches!(t, Term::Literal(_)) {
-                    continue;
-                }
-                out.push(t);
-                next.push(id);
-                added += 1;
-                if added >= MAX_DEPENDENTS {
-                    break 'hops;
-                }
-            }
-        }
-        frontier = next;
-    }
-    Ok(out)
 }
 
 /// The cancellation and the deadline of a request, checked while forms read.

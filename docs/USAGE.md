@@ -3454,7 +3454,7 @@ shows the error and no badges.
 ## Editing forms
 
 A dataset's SHACL shapes double as editing forms
-([U02](specs/U02-shape-driven-forms.md)). When a node shape targets the resource selected
+([U02](specs/U02-shape-driven-forms/README.md)). When a node shape targets the resource selected
 in Explore and the caller may save, the side panel shows **Edit**, which turns the
 properties into a form. `/ui/datasets/{name}/edit?iri=…&branch=…` opens the same form on
 a page of its own, for links from other tools. The shapes come from the dataset's
@@ -3490,7 +3490,10 @@ lengths, numeric and date ranges, allowed values, counts, `sh:languageIn` and
 and changes. **Preview** sends the change to the server, which runs it as a dry run and
 validates the touched resources against every constraint of the shapes, including
 `sh:class`, `sh:node` and SHACL-SPARQL. Its results appear under their fields, and the
-preview lists the triples the save would remove and add. **Save** commits the change as one
+preview lists the triples the save would remove and add. Checks follow the shapes beyond
+a fixed graph radius. If complete discovery exceeds its allowance, the preview refuses
+rather than presenting partial conformance. A refused recheck invalidates earlier
+approval of the same changes. **Save** commits the change as one
 commit with the message typed beside it. With a guard in `reject` mode, Save checks first
 and writes nothing when the guard would reject the change. Otherwise a save with problems
 asks once more with **Save with problems**. After a failed save, an error summary at the

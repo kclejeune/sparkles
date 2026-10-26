@@ -277,7 +277,7 @@ Read the [provenance record](U01-time-slider.md#provenance).
 
 ## Editing forms generated from SHACL shapes
 
-Read the [provenance record](U02-shape-driven-forms.md#provenance).
+Read the [provenance record](U02-shape-driven-forms/SPEC.md#provenance).
 
 ## Query by example and search phrases
 
