@@ -42,6 +42,8 @@
 //! `store::Framing`).
 
 use super::*;
+
+mod probe;
 use std::io::{BufReader, Seek, SeekFrom};
 
 /// The first eight bytes of a log's header record.

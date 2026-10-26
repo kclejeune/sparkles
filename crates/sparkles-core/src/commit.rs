@@ -1044,6 +1044,64 @@ pub fn read_catalog(path: &Path) -> Result<Option<(uuid::Uuid, Vec<CommitInfo>)>
     Ok(Some((id, out)))
 }
 
+/// Stream the same valid consecutive prefix as read_catalog. A caller can retain
+/// only the requested commit and head instead of copying an entire catalog.
+pub(crate) fn walk_catalog_controlled(
+    path: &Path,
+    budget: &mut crate::store::cold::ColdBudget<'_>,
+    mut visit: impl FnMut(CommitInfo, &mut crate::store::cold::ColdBudget<'_>) -> Result<()>,
+) -> Result<Option<(uuid::Uuid, u64, Option<CommitInfo>)>> {
+    use std::io::BufReader;
+    budget.check()?;
+    let file = match File::open(path) {
+        Ok(file) => file,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(error.into()),
+    };
+    let capacity = (budget.available() / 8).clamp(REC as u64, 64 << 10);
+    budget.charge(capacity)?;
+    let mut reader = BufReader::with_capacity(capacity as usize, file);
+    let result = (|| {
+        let mut record = [0; REC];
+        match reader.read_exact(&mut record) {
+            Ok(()) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::UnexpectedEof => return Ok(None),
+            Err(error) => return Err(error.into()),
+        }
+        budget.check()?;
+        let Some((id, first)) = decode_header(&record) else {
+            return Ok(None);
+        };
+        let mut last = None;
+        let mut offset = 0u64;
+        loop {
+            budget.check()?;
+            match reader.read_exact(&mut record) {
+                Ok(()) => {}
+                Err(error) if error.kind() == std::io::ErrorKind::UnexpectedEof => break,
+                Err(error) => return Err(error.into()),
+            }
+            let Some(commit) = decode_record(&record) else {
+                break;
+            };
+            if first.checked_add(offset) != Some(commit.seq) {
+                break;
+            }
+            visit(commit, budget)?;
+            last = Some(commit);
+            let Some(next) = offset.checked_add(1) else {
+                break;
+            };
+            offset = next;
+        }
+        budget.check()?;
+        Ok(Some((id, first, last)))
+    })();
+    drop(reader);
+    budget.release(capacity);
+    result
+}
+
 /// The commit catalog: every retained commit record, in memory, backed by `commits.bin`
 /// for persistent stores and bounded to the newest `ring` entries for in-memory ones.
 pub(crate) struct Catalog {
@@ -1471,8 +1529,23 @@ pub(crate) fn open_wal_commit(
     if rec[26] != WAL_COMMIT_V2 {
         return None;
     }
+    let mut crc = flate2::Crc::new();
+    crc.update(data);
+    open_wal_commit_with_crc(rec, crc)
+}
+
+/// The identical commit codec after a controlled streaming pass over its data.
+/// A decoded record is metadata, not proof of admission or actor authenticity.
+pub(crate) fn open_wal_commit_with_crc(
+    rec: &[u8],
+    mut data_crc: flate2::Crc,
+) -> Option<Result<(u64, i64, CommitKind, u8), ()>> {
+    if rec[26] != WAL_COMMIT_V2 {
+        return None;
+    }
     let crc = u32::from_le_bytes(rec[29..33].try_into().unwrap());
-    if crc != crc32(&[data, &rec[..29]]) {
+    data_crc.update(&rec[..29]);
+    if crc != data_crc.sum() {
         return Some(Err(()));
     }
     Some(Ok((
@@ -1549,6 +1622,92 @@ mod tests {
             read_gen_commit_controlled(dir.path(), &mut budget),
             Err(Error::Unsupported(_))
         ));
+    }
+
+    #[test]
+    fn controlled_catalog_streams_large_valid_prefix_without_retaining_the_catalog() {
+        use crate::{
+            history::{HistoryOptions, ReadLimit},
+            store::cold::ColdBudget,
+        };
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("commits.bin");
+        let id = uuid::Uuid::new_v4();
+        let mut bytes = encode_header(id, 10).to_vec();
+        for seq in 10..10_010 {
+            bytes.extend_from_slice(&encode_record(&sample_commit(seq)));
+        }
+        // Later valid records cannot skip an invalid entry in the consecutive prefix.
+        bytes[REC * 6001 + 20] ^= 1;
+        std::fs::write(&path, &bytes).unwrap();
+        let normal = read_catalog(&path).unwrap().unwrap();
+        assert_eq!(normal.1.len(), 6000);
+        let options = HistoryOptions::default();
+        let mut budget = ColdBudget::new(ReadLimit {
+            options: &options,
+            memory: Some(4096),
+            held: 0,
+        })
+        .unwrap();
+        let mut count = 0;
+        let mut selected = None;
+        let summary = walk_catalog_controlled(&path, &mut budget, |commit, _| {
+            assert_eq!(commit, normal.1[count]);
+            count += 1;
+            if commit.seq == 42 {
+                selected = Some(commit);
+            }
+            Ok(())
+        })
+        .unwrap()
+        .unwrap();
+        assert_eq!(summary, (id, 10, normal.1.last().copied()));
+        assert_eq!(count, 6000);
+        assert_eq!(selected, Some(sample_commit(42)));
+        assert_eq!(budget.used(), 0);
+        assert_eq!(bytes, std::fs::read(&path).unwrap());
+    }
+
+    #[test]
+    fn controlled_catalog_checks_inside_scan_and_releases_temporary_buffer_on_cancel() {
+        use crate::{
+            history::{HistoryOptions, ReadLimit},
+            store::cold::ColdBudget,
+        };
+        use std::sync::{
+            Arc,
+            atomic::{AtomicBool, Ordering},
+        };
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("commits.bin");
+        let mut bytes = encode_header(uuid::Uuid::new_v4(), 0).to_vec();
+        for seq in 0..200 {
+            bytes.extend_from_slice(&encode_record(&sample_commit(seq)));
+        }
+        std::fs::write(&path, &bytes).unwrap();
+        let cancel = Arc::new(AtomicBool::new(false));
+        let options = HistoryOptions {
+            cancel: Some(cancel.clone()),
+            deadline: None,
+        };
+        let mut budget = ColdBudget::new(ReadLimit {
+            options: &options,
+            memory: Some(4096),
+            held: 0,
+        })
+        .unwrap();
+        let mut visits = 0;
+        let result = walk_catalog_controlled(&path, &mut budget, |_, _| {
+            visits += 1;
+            if visits == 8 {
+                cancel.store(true, Ordering::Relaxed);
+            }
+            Ok(())
+        });
+        assert!(matches!(result, Err(Error::Cancelled)));
+        assert_eq!(visits, 8);
+        assert_eq!(budget.used(), 0);
+        assert_eq!(bytes, std::fs::read(&path).unwrap());
     }
 
     #[test]

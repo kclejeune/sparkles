@@ -56,6 +56,8 @@
 //!
 //! In-memory stores keep the same records in memory.
 
+mod readonly;
+
 use super::diff::{Keys, QuadKey};
 use super::*;
 use rustc_hash::FxHashMap;
@@ -743,6 +745,8 @@ struct Inner {
 
 /// A dataset's change log (see the module documentation).
 pub struct ChangeLog {
+    /// A cold attachment owns descriptors only, never a writer or index sidecar.
+    readonly: Option<readonly::ReadOnlyLog>,
     dataset_id: uuid::Uuid,
     /// `<root>/changes` (persistent stores)
     dir: Option<PathBuf>,
@@ -780,6 +784,10 @@ pub struct ChangeLogStatus {
 }
 
 impl ChangeLog {
+    pub(super) fn read_only_through(&self) -> Option<u64> {
+        self.readonly.as_ref().map(|reader| reader.through)
+    }
+
     /// An in-memory store's log.
     pub(crate) fn memory(dataset_id: uuid::Uuid, limits: LogLimits) -> Arc<ChangeLog> {
         Self::new(
@@ -788,6 +796,7 @@ impl ChangeLog {
             limits,
             ChangeLogSettings::default(),
             Inner::empty(),
+            None,
         )
     }
 
@@ -797,9 +806,11 @@ impl ChangeLog {
         limits: LogLimits,
         settings: ChangeLogSettings,
         inner: Inner,
+        readonly: Option<readonly::ReadOnlyLog>,
     ) -> Arc<ChangeLog> {
         let enabled = settings.enabled.unwrap_or(limits.default_on);
         Arc::new_cyclic(|me| ChangeLog {
+            readonly,
             dataset_id,
             dir: root.map(|r| r.join(CHANGES_DIR)),
             root: root.map(Path::to_path_buf),
@@ -828,7 +839,7 @@ impl ChangeLog {
             Some(i) => i,
             None => Inner::empty(),
         };
-        let log = Self::new(dataset_id, Some(root), limits, settings, inner);
+        let log = Self::new(dataset_id, Some(root), limits, settings, inner, None);
         if !log.enabled.load(Ordering::Relaxed) && dir.exists() {
             // turned off while the store was closed: nothing is kept
             log.remove_all()?;
@@ -1003,6 +1014,9 @@ impl ChangeLog {
 
     /// The newest commit recorded (queued commits not included).
     pub(crate) fn last(&self) -> Option<u64> {
+        if self.readonly.is_some() {
+            return self.status().last;
+        }
         self.inner.lock().last
     }
 
@@ -1014,7 +1028,7 @@ impl ChangeLog {
 
     /// Queue a commit (the commit path: no I/O).
     pub(crate) fn push(&self, p: Pending) {
-        if !self.is_enabled() {
+        if self.readonly.is_some() || !self.is_enabled() {
             return;
         }
         self.pending.lock().push_back(p);
@@ -1025,6 +1039,10 @@ impl ChangeLog {
 
     /// Append every queued commit. With `sync`, the log is durable afterwards.
     pub(crate) fn flush(&self, sync: bool) -> Result<()> {
+        if self.readonly.is_some() {
+            // This mode cannot queue a record or own a writable file.
+            return Ok(());
+        }
         let mut inner = self.inner.lock();
         self.scheduled.store(false, Ordering::Release);
         loop {
@@ -1272,6 +1290,7 @@ impl ChangeLog {
     /// Drop sealed segments that retention no longer keeps. `now_ms` applies the age
     /// limit (none without it).
     pub(crate) fn enforce(&self, now_ms: Option<i64>) -> Result<usize> {
+        self.require_writable()?;
         let mut inner = self.inner.lock();
         self.enforce_locked(&mut inner, now_ms)
     }
@@ -1320,6 +1339,7 @@ impl ChangeLog {
     }
 
     fn remove_all(&self) -> Result<()> {
+        self.require_writable()?;
         self.pending.lock().clear();
         let mut inner = self.inner.lock();
         *inner = Inner::empty();
@@ -1343,6 +1363,7 @@ impl ChangeLog {
     /// Change the settings: turning the log off removes it, and turning it on starts it
     /// at the next commit (`head` is the current one).
     pub(crate) fn set_settings(&self, s: ChangeLogSettings, head: u64) -> Result<()> {
+        self.require_writable()?;
         if let Some(root) = &self.root {
             write_settings(root, &s)?;
         }
@@ -1371,6 +1392,24 @@ impl ChangeLog {
     }
 
     pub fn status(&self) -> ChangeLogStatus {
+        if let Some(reader) = &self.readonly {
+            let settings = *self.settings.lock();
+            let (first, last, error) = match reader.coverage() {
+                Ok((first, last)) => (first, last, None),
+                Err(error) => (None, None, Some(error.to_string())),
+            };
+            return ChangeLogStatus {
+                enabled: self.is_enabled(),
+                first,
+                last,
+                segments: reader.segments.len(),
+                bytes: self.bytes(),
+                pending: 0,
+                settings,
+                max_bytes: settings.max_bytes.unwrap_or(self.limits.default_max_bytes),
+                error,
+            };
+        }
         let pending = self.pending.lock().len();
         let inner = self.inner.lock();
         let s = *self.settings.lock();
@@ -1390,6 +1429,18 @@ impl ChangeLog {
     /// The commit whose timestamp is the newest at or before `ms` (`None`: none is
     /// recorded that early).
     pub(crate) fn commit_at_time(&self, ms: i64) -> Result<Option<u64>> {
+        self.commit_at_time_checked(ms, &mut || Ok(()))
+    }
+
+    pub(crate) fn commit_at_time_checked(
+        &self,
+        ms: i64,
+        check: &mut dyn FnMut() -> Result<()>,
+    ) -> Result<Option<u64>> {
+        if let Some(reader) = &self.readonly {
+            return reader.commit_at_time(ms, check);
+        }
+        check()?;
         let mut inner = self.inner.lock();
         let mut best = None;
         for i in 0..inner.segs.len() {
@@ -1423,6 +1474,9 @@ impl ChangeLog {
         check: &mut dyn FnMut() -> Result<()>,
         visit: &mut Visit<'_>,
     ) -> Result<Vec<Unrecorded>> {
+        if let Some(reader) = &self.readonly {
+            return reader.scan(from, to, filter, descending, check, visit);
+        }
         let mut inner = self.inner.lock();
         let mut holes: Vec<Unrecorded> = Vec::new();
         if from > to {
@@ -1478,7 +1532,16 @@ impl ChangeLog {
             let ix = self.index(&mut inner, i)?;
             let lo = ix.recs.partition_point(|r| r.seq < from);
             let hi = ix.recs.partition_point(|r| r.seq <= to);
-            for r in &ix.recs[lo..hi] {
+            // A gap can begin in the requested window but end after it. That
+            // first overhanging record has no candidate changes, yet its unknown
+            // range still intersects the query and must not look complete.
+            let hole_hi = hi
+                + usize::from(
+                    ix.recs
+                        .get(hi)
+                        .is_some_and(|record| record.hole.is_some_and(|(first, _)| first <= to)),
+                );
+            for r in &ix.recs[lo..hole_hi] {
                 if let Some((f, reason)) = r.hole {
                     holes.push(Unrecorded {
                         from: f.max(from),
@@ -1566,6 +1629,9 @@ impl ChangeLog {
         check: &mut dyn FnMut() -> Result<()>,
         visit: &mut dyn FnMut(LogCommit) -> Result<bool>,
     ) -> Result<()> {
+        if let Some(reader) = &self.readonly {
+            return reader.commits(from, to, check, visit);
+        }
         if from > to {
             return Ok(());
         }
@@ -1611,6 +1677,9 @@ impl ChangeLog {
 
     /// The bytes on disk (or in memory).
     pub fn bytes(&self) -> u64 {
+        if let Some(reader) = &self.readonly {
+            return reader.segments.iter().map(|s| s.extent).sum();
+        }
         self.inner.lock().segs.iter().map(|s| s.bytes).sum()
     }
 }

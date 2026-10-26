@@ -65,6 +65,10 @@ impl<'a> ColdBudget<'a> {
         self.used
     }
 
+    pub(crate) fn available(&self) -> u64 {
+        self.limit.remaining().saturating_sub(self.used)
+    }
+
     fn owned_limit(&self) -> Result<ReadLimit<'a>> {
         self.limit.holding(self.used)
     }
@@ -178,6 +182,57 @@ impl<'a> ColdBudget<'a> {
             let start = bytes.len();
             bytes.resize(end, 0);
             file.read_exact(&mut bytes[start..end])?;
+        }
+        self.check()
+    }
+
+    pub(crate) fn buffered(&mut self, path: &Path) -> Result<Loaded<std::io::BufReader<File>>> {
+        self.check()?;
+        let file = File::open(path)?;
+        let charge = (self.available() / 8).clamp(64, CHUNK as u64);
+        self.charge(charge)?;
+        Ok(Loaded {
+            value: std::io::BufReader::with_capacity(charge as usize, file),
+            charge,
+        })
+    }
+
+    pub(crate) fn sort_u64(&self, values: &mut [u64]) -> Result<()> {
+        self.sort_by(values, Ord::cmp)
+    }
+
+    pub(crate) fn sort_by<T>(
+        &self,
+        values: &mut [T],
+        compare: impl Fn(&T, &T) -> std::cmp::Ordering,
+    ) -> Result<()> {
+        let sift = |values: &mut [T], mut root: usize, end: usize| -> Result<()> {
+            loop {
+                self.check()?;
+                let left = root.saturating_mul(2).saturating_add(1);
+                if left >= end {
+                    return Ok(());
+                }
+                let child = if left + 1 < end && compare(&values[left], &values[left + 1]).is_lt() {
+                    left + 1
+                } else {
+                    left
+                };
+                if !compare(&values[root], &values[child]).is_lt() {
+                    return Ok(());
+                }
+                values.swap(root, child);
+                root = child;
+            }
+        };
+        let len = values.len();
+        for root in (0..len / 2).rev() {
+            sift(values, root, len)?;
+        }
+        for end in (1..len).rev() {
+            self.check()?;
+            values.swap(0, end);
+            sift(values, 0, end)?;
         }
         self.check()
     }
