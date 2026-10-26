@@ -29,6 +29,28 @@ pub(super) fn fingerprint(key: &[u8]) -> u64 {
     hash_checked(key, |_| Ok(())).expect("the unchecked fingerprint cannot fail")
 }
 
+pub(super) fn compare_controlled(
+    left: &[u8],
+    right: &[u8],
+    budget: &ColdBudget<'_>,
+) -> Result<std::cmp::Ordering> {
+    let common = left.len().min(right.len());
+    for (index, (a, b)) in left[..common]
+        .chunks(CHUNK)
+        .zip(right[..common].chunks(CHUNK))
+        .enumerate()
+    {
+        budget.key_step("sparse compare", index * CHUNK)?;
+        let order = a.cmp(b);
+        if order != std::cmp::Ordering::Equal {
+            budget.check()?;
+            return Ok(order);
+        }
+    }
+    budget.key_step("sparse compare", common)?;
+    Ok(left.len().cmp(&right.len()))
+}
+
 fn equal_checked(
     left: &[u8],
     right: &[u8],

@@ -12,6 +12,9 @@ use std::{
     path::Path,
 };
 
+mod linked;
+pub(super) use linked::read_link_controlled;
+
 const CHUNK: usize = 64 << 10;
 // The input stays live while Serde owns its scratch and decoded containers. Metadata
 // has no compressed payloads. This covers sparse JSON nodes, vector relocation,
@@ -64,6 +67,21 @@ impl<'a> ColdBudget<'a> {
 
     pub(crate) fn used(&self) -> u64 {
         self.used
+    }
+
+    fn owned_limit(&self) -> Result<ReadLimit<'a>> {
+        self.limit.holding(self.used)
+    }
+
+    fn sha256(&self, bytes: &[u8]) -> Result<[u8; 32]> {
+        use sha2::{Digest, Sha256};
+        let mut digest = Sha256::new();
+        for chunk in bytes.chunks(CHUNK) {
+            self.check()?;
+            digest.update(chunk);
+        }
+        self.check()?;
+        Ok(digest.finalize().into())
     }
 
     pub(crate) fn charge(&mut self, bytes: u64) -> Result<()> {
@@ -143,11 +161,25 @@ impl<'a> ColdBudget<'a> {
         self.read_from(&mut file, length)
     }
 
-    pub(crate) fn read_from(&mut self, file: &mut File, length: u64) -> Result<Vec<u8>> {
+    pub(crate) fn read_from<R: Read>(&mut self, file: &mut R, length: u64) -> Result<Vec<u8>> {
+        let mut bytes = Vec::new();
+        self.append_read(file, &mut bytes, length)?;
+        Ok(bytes)
+    }
+
+    pub(crate) fn append_read<R: Read>(
+        &mut self,
+        file: &mut R,
+        bytes: &mut Vec<u8>,
+        length: u64,
+    ) -> Result<()> {
         self.check()?;
         let length = usize::try_from(length).map_err(|_| self.exhausted())?;
-        let mut bytes = Vec::new();
-        self.reserve(&mut bytes, length)?;
+        let length = bytes
+            .len()
+            .checked_add(length)
+            .ok_or_else(|| self.exhausted())?;
+        self.reserve(bytes, length)?;
         // The allocation was admitted before initialization. Chunking keeps both
         // initialization and file reads interruptible without a second eager buffer.
         while bytes.len() < length {
@@ -157,8 +189,7 @@ impl<'a> ColdBudget<'a> {
             bytes.resize(end, 0);
             file.read_exact(&mut bytes[start..end])?;
         }
-        self.check()?;
-        Ok(bytes)
+        self.check()
     }
 
     pub(crate) fn read_file(&mut self, path: &Path) -> Result<Vec<u8>> {
@@ -323,13 +354,26 @@ impl super::Generation {
         written_by: Option<&str>,
         budget: &mut ColdBudget<'_>,
     ) -> Result<Loaded<Self>> {
+        Self::open_base_controlled(dir, name, written_by, None, budget)
+    }
+
+    fn open_base_controlled(
+        dir: &Path,
+        name: &str,
+        written_by: Option<&str>,
+        dvocab: Option<Loaded<crate::vocab::DeltaVocab>>,
+        budget: &mut ColdBudget<'_>,
+    ) -> Result<Loaded<Self>> {
         use crate::{
             builder,
             index::Perm,
             vocab::{DeltaVocab, Vocab},
         };
         use std::sync::Arc;
-        let start = budget.used();
+        let start = budget
+            .used()
+            .checked_sub(dvocab.as_ref().map_or(0, |v| v.charge))
+            .expect("supplied dictionary is admitted by the same cold budget");
         // Paths/names and wrapper allocations remain live with the generation.
         budget.charge(
             std::mem::size_of::<Self>() as u64
@@ -373,7 +417,10 @@ impl super::Generation {
             Vocab::open_controlled(dir, meta.has_feature(builder::FEATURE_FSST_VOCAB), budget)?;
         budget.charge(64)?;
         let vocab = Arc::new(vocab.value);
-        let dvocab = DeltaVocab::open_read_only_controlled(&dir.join("delta.vocab"), budget)?;
+        let dvocab = match dvocab {
+            Some(vocab) => vocab,
+            None => DeltaVocab::open_read_only_controlled(&dir.join("delta.vocab"), budget)?,
+        };
         let mut perms = Vec::new();
         budget.reserve(&mut perms, Perm::ALL.len())?;
         for perm in Perm::ALL {

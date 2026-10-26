@@ -835,11 +835,25 @@ pub(crate) fn read_gen_commit(dir: &Path) -> Result<Option<(uuid::Uuid, CommitIn
         Err(e) => return Err(e.into()),
     };
     let f = parse_gen_commit(&path, &b)?;
+    let decoded = decode_gen_commit_file(f, &path)?;
+    Ok(Some((decoded.dataset_id, decoded.commit, decoded.origin)))
+}
+
+/// Physical generation identity decoded without opening or recovering a Store.
+/// This is historical metadata, not a managed-admission or authenticity token.
+pub(crate) struct RetainedGenerationCommit {
+    pub(crate) dataset_id: uuid::Uuid,
+    pub(crate) commit: CommitInfo,
+    pub(crate) origin: String,
+    pub(crate) wal_strict_from: Option<u64>,
+}
+
+fn decode_gen_commit_file(f: GenCommitFile, path: &Path) -> Result<RetainedGenerationCommit> {
     let bad = |m: &str| Error::Corrupt(format!("{}: {m}", path.display()));
     let c = f.commit;
-    Ok(Some((
-        f.dataset_id,
-        CommitInfo {
+    Ok(RetainedGenerationCommit {
+        dataset_id: f.dataset_id,
+        commit: CommitInfo {
             seq: c.seq,
             timestamp_ms: parse_rfc3339_ms(&c.timestamp).ok_or_else(|| bad("timestamp"))?,
             kind: CommitKind::from_name(&c.kind).unwrap_or(CommitKind::Unknown),
@@ -853,8 +867,40 @@ pub(crate) fn read_gen_commit(dir: &Path) -> Result<Option<(uuid::Uuid, CommitIn
             default_graph: c.default_graph,
             unvalidated: c.unvalidated,
         },
-        f.origin,
-    )))
+        origin: f.origin,
+        wal_strict_from: f.wal_strict_from,
+    })
+}
+
+pub(crate) fn read_gen_commit_controlled(
+    dir: &Path,
+    budget: &mut crate::store::cold::ColdBudget<'_>,
+) -> Result<Option<crate::store::cold::Loaded<RetainedGenerationCommit>>> {
+    let path = dir.join("commit.json");
+    let bytes = match budget.read_file(&path) {
+        Ok(bytes) => bytes,
+        Err(Error::Io(error)) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(error),
+    };
+    let parsed: crate::store::cold::Loaded<GenCommitFile> = budget.json(&bytes)?;
+    if parsed.value.format != 1 {
+        return Err(Error::Unsupported(format!(
+            "{} has format {}; this release reads format 1",
+            path.display(),
+            parsed.value.format
+        )));
+    }
+    budget.drop_vec(bytes);
+    let value = decode_gen_commit_file(parsed.value, &path)?;
+    let charge =
+        std::mem::size_of::<RetainedGenerationCommit>() as u64 + value.origin.capacity() as u64;
+    if charge > parsed.charge {
+        budget.charge(charge - parsed.charge)?;
+    } else {
+        budget.release(parsed.charge - charge);
+    }
+    budget.check()?;
+    Ok(Some(crate::store::cold::Loaded { value, charge }))
 }
 
 /// Parse `gen-NNNN/commit.json`, refusing a `format` this build does not read.
@@ -1440,6 +1486,70 @@ pub(crate) fn open_wal_commit(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn sample_commit(seq: u64) -> CommitInfo {
+        CommitInfo {
+            seq,
+            timestamp_ms: 1_700_000_000_000 + seq as i64,
+            kind: CommitKind::Update,
+            inserted: 2,
+            deleted: 1,
+            quads: 100 + seq,
+            generation: 7,
+            bulk: false,
+            exact: true,
+            reconstructed: false,
+            default_graph: false,
+            unvalidated: true,
+        }
+    }
+
+    #[test]
+    fn controlled_generation_commit_uses_the_existing_physical_codec_and_releases_scratch() {
+        use crate::{
+            history::{HistoryOptions, ReadLimit},
+            store::cold::ColdBudget,
+        };
+        let dir = tempfile::tempdir().unwrap();
+        let id = uuid::Uuid::new_v4();
+        let commit = sample_commit(42);
+        let path = dir.path().join("commit.json");
+        std::fs::write(&path, gen_commit_bytes(id, "compaction", &commit)).unwrap();
+        set_wal_strict_from(dir.path(), 33 * 8).unwrap();
+        let before = std::fs::read(&path).unwrap();
+        let options = HistoryOptions::default();
+        let mut budget = ColdBudget::new(ReadLimit {
+            options: &options,
+            memory: Some(1 << 20),
+            held: 0,
+        })
+        .unwrap();
+        let loaded = read_gen_commit_controlled(dir.path(), &mut budget)
+            .unwrap()
+            .unwrap();
+        let normal = read_gen_commit(dir.path()).unwrap().unwrap();
+        assert_eq!(
+            (
+                loaded.value.dataset_id,
+                loaded.value.commit,
+                loaded.value.origin.as_str()
+            ),
+            (normal.0, normal.1, normal.2.as_str())
+        );
+        assert_eq!(loaded.value.wal_strict_from, Some(33 * 8));
+        assert_eq!(budget.used(), loaded.charge);
+        drop(loaded.value);
+        budget.release(loaded.charge);
+        assert_eq!(budget.used(), 0);
+        assert_eq!(before, std::fs::read(&path).unwrap());
+        let mut value: serde_json::Value = serde_json::from_slice(&before).unwrap();
+        value["format"] = 123.into();
+        std::fs::write(&path, serde_json::to_vec(&value).unwrap()).unwrap();
+        assert!(matches!(
+            read_gen_commit_controlled(dir.path(), &mut budget),
+            Err(Error::Unsupported(_))
+        ));
+    }
 
     #[test]
     fn timestamps_round_trip() {

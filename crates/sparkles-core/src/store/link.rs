@@ -108,6 +108,11 @@ pub(crate) fn read_link(gen_dir: &Path) -> Result<Option<LinkFile>> {
     };
     let f: LinkFile = serde_json::from_slice(&bytes)
         .map_err(|e| Error::Corrupt(format!("{}: {e}", path.display())))?;
+    check_link(&path, &f)?;
+    Ok(Some(f))
+}
+
+pub(super) fn check_link(path: &Path, f: &LinkFile) -> Result<()> {
     if !matches!((f.format, f.overlay.is_some()), (1, false) | (2, true)) {
         return Err(Error::Corrupt(format!(
             "{} has unsupported format {} or incompatible overlay metadata",
@@ -121,7 +126,7 @@ pub(crate) fn read_link(gen_dir: &Path) -> Result<Option<LinkFile>> {
             path.display()
         )));
     }
-    Ok(Some(f))
+    Ok(())
 }
 
 /// The dataset directory of a branch store's root (`<dataset>/branches/<id>`).

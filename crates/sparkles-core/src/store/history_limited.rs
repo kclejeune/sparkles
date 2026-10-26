@@ -121,19 +121,20 @@ impl Store {
         let entry = history.gens.get(&owner).ok_or_else(|| {
             Error::HistoryUnsupported("the selected generation is no longer retained".into())
         })?;
-        limit.check(0)?;
-        match std::fs::metadata(entry.dir.join(link::LINK_FILE)) {
-            Ok(_) => {
-                return Err(Error::HistoryUnsupported(
-                    "bounded linked-generation decoding is not available".into(),
-                ));
-            }
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-            Err(error) => return Err(error.into()),
-        }
         let mut budget = cold::ColdBudget::new(*limit)?;
-        let loaded =
-            Generation::open_sealed_controlled(&entry.dir, &entry.name, None, &mut budget)?;
+        let loaded = match cold::read_link_controlled(&entry.dir, &mut budget)? {
+            Some(file) => Generation::open_linked_controlled(
+                &entry.dir,
+                &entry.name,
+                self.root.as_deref().ok_or_else(|| {
+                    Error::HistoryUnsupported("linked history needs a persistent origin".into())
+                })?,
+                file,
+                &self.cache,
+                &mut budget,
+            )?,
+            None => Generation::open_sealed_controlled(&entry.dir, &entry.name, None, &mut budget)?,
+        };
         let generation = Arc::new(loaded.value);
         // Caching the backing generation is optional. Do not grow an unrelated
         // shared vector outside this request's remaining preparation allowance.

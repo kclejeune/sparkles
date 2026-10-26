@@ -282,18 +282,32 @@ impl Sparse {
                 let off = u64_at(pos)?;
                 let len = u32_at(pos + 8)? as usize;
                 let key = buf.get(pos + 12..pos + 12 + len)?;
-                if off > data_len
-                    || s.offsets.last().is_some_and(|&o| o > off)
-                    || (!s.starts.is_empty() && s.key(s.len() - 1) >= key)
-                {
+                if off > data_len || s.offsets.last().is_some_and(|&o| o > off) {
+                    return None;
+                }
+                let unordered = if s.starts.is_empty() {
+                    false
+                } else if let Some(budget) = budget.as_deref_mut() {
+                    admit!(cold::compare_controlled(s.key(s.len() - 1), key, budget))
+                        != std::cmp::Ordering::Less
+                } else {
+                    s.key(s.len() - 1) >= key
+                };
+                if unordered {
                     return None;
                 }
                 s.starts.push(u32::try_from(s.keys.len()).ok()?);
                 if let Some(budget) = budget.as_deref_mut() {
                     let need = s.keys.len().checked_add(key.len())?;
                     admit!(budget.reserve(&mut s.keys, need));
+                    for (index, chunk) in key.chunks(64 << 10).enumerate() {
+                        admit!(budget.key_step("sparse copy", index * (64 << 10)));
+                        s.keys.extend_from_slice(chunk);
+                    }
+                    admit!(budget.key_step("sparse copy", key.len()));
+                } else {
+                    s.keys.extend_from_slice(key);
                 }
-                s.keys.extend_from_slice(key);
                 s.offsets.push(off);
                 pos += 12 + len;
             }
@@ -3215,6 +3229,49 @@ mod tests {
             assert!(loaded.value.sparse.is_none());
             assert!(loaded.charge < 64 << 10);
             assert_eq!(budget.used(), loaded.charge);
+        }
+    }
+
+    #[test]
+    fn controlled_sparse_keys_cancel_inside_copy_and_lexicographic_comparison() {
+        use crate::{
+            Error,
+            history::{HistoryOptions, ReadLimit},
+            store::cold::ColdBudget,
+        };
+        use std::{cell::Cell, sync::atomic::AtomicBool};
+        const CHUNK: usize = 64 << 10;
+        let mut first = vec![b'a'; CHUNK * 4 + 17];
+        *first.last_mut().unwrap() = b'b';
+        let mut second = first.clone();
+        *second.last_mut().unwrap() = b'c';
+        let wire = Sparse::encode(&[(0, first), (8, second)]);
+        for stage in ["sparse copy", "sparse compare"] {
+            let cancel = Arc::new(AtomicBool::new(false));
+            let options = HistoryOptions {
+                cancel: Some(cancel.clone()),
+                deadline: None,
+            };
+            let reached = Cell::new(false);
+            let observer = |current: &str, at: usize| {
+                if current == stage && (CHUNK..CHUNK * 4).contains(&at) {
+                    reached.set(true);
+                    cancel.store(true, AtomicOrdering::Relaxed);
+                }
+            };
+            let mut budget = ColdBudget::new(ReadLimit {
+                options: &options,
+                memory: Some(16 << 20),
+                held: 0,
+            })
+            .unwrap();
+            budget.observe_keys(&observer);
+            let result = Sparse::decode_inner(&wire, IDX_BLOCKS + 1, 16, Some(&mut budget));
+            assert!(matches!(result, Err(Error::Cancelled)), "stage={stage}");
+            assert!(
+                reached.get(),
+                "cancellation happened before processing a sparse key"
+            );
         }
     }
 

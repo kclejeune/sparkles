@@ -810,6 +810,38 @@ impl DeltaVocab {
         })
     }
 
+    pub(crate) fn open_layered_controlled(
+        prefix: &[(PathBuf, u64)],
+        own: &Path,
+        budget: &mut crate::store::cold::ColdBudget<'_>,
+    ) -> Result<crate::store::cold::Loaded<DeltaVocab>> {
+        let start = budget.used();
+        let mut vocab = AppendVocab::default();
+        for (path, end) in prefix {
+            budget.check()?;
+            if vocab.len() >= *end {
+                continue;
+            }
+            extend_read_only_controlled(&mut vocab, path, Some(*end), budget)?;
+            if vocab.len() < *end {
+                return Err(Error::Corrupt(format!(
+                    "{} has fewer delta terms than a branch's link names",
+                    path.display()
+                )));
+            }
+        }
+        extend_read_only_controlled(&mut vocab, own, None, budget)?;
+        budget.charge(std::mem::size_of::<RwLock<AppendVocab>>() as u64 + 64)?;
+        let charge = budget.used() - start;
+        Ok(crate::store::cold::Loaded {
+            value: DeltaVocab {
+                inner: Arc::new(RwLock::new(vocab)),
+                file: None,
+            },
+            charge,
+        })
+    }
+
     pub fn len(&self) -> u64 {
         self.inner.read().len()
     }
@@ -1065,6 +1097,30 @@ impl DeltaVocab {
     }
 }
 
+fn extend_read_only_controlled(
+    vocab: &mut AppendVocab,
+    path: &Path,
+    end: Option<u64>,
+    budget: &mut crate::store::cold::ColdBudget<'_>,
+) -> Result<()> {
+    let bytes = match budget.read_file(path) {
+        Ok(bytes) => bytes,
+        Err(Error::Io(error)) if error.kind() == std::io::ErrorKind::NotFound => Vec::new(),
+        Err(error) => return Err(error),
+    };
+    let parsed = parse_delta_controlled(&bytes, budget).map_err(|e| corrupt_in(path, e))?;
+    for key in &parsed.keys {
+        budget.check()?;
+        if end.is_some_and(|end| vocab.len() >= end) {
+            break;
+        }
+        vocab.push_controlled(key, true, budget)?;
+    }
+    budget.drop_vec(parsed.keys);
+    budget.drop_vec(bytes);
+    budget.check()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1297,5 +1353,69 @@ mod tests {
         let v = DeltaVocab::open_layered(&prefix, &own, true).unwrap();
         assert_eq!(v.len(), 3);
         assert_eq!(v.get(2).unwrap(), b"<urn:c>");
+    }
+
+    #[test]
+    fn controlled_layers_preserve_positional_duplicates_and_first_lookup_without_writes() {
+        use crate::{
+            history::{HistoryOptions, ReadLimit},
+            store::cold::ColdBudget,
+        };
+        let dir = tempfile::tempdir().unwrap();
+        let upstream = dir.path().join("upstream");
+        let middle = dir.path().join("middle");
+        let own = dir.path().join("own");
+        let first = [entry(b"<urn:a>"), entry(b"<urn:b>"), entry(b"<urn:a>")].concat();
+        let second = [entry(b"<urn:c>"), entry(b"<urn:a>")].concat();
+        let last = entry(b"<urn:d>");
+        std::fs::write(&upstream, &first).unwrap();
+        std::fs::write(&middle, &second).unwrap();
+        std::fs::write(&own, &last).unwrap();
+        let prefix = [
+            (upstream.clone(), 3),
+            (middle.clone(), 5),
+            (upstream.clone(), 2),
+        ];
+        let normal = DeltaVocab::open_layered(&prefix, &own, true).unwrap();
+        let options = HistoryOptions::default();
+        let limit = ReadLimit {
+            options: &options,
+            memory: Some(16 << 10),
+            held: 0,
+        };
+        let mut budget = ColdBudget::new(limit).unwrap();
+        let loaded = DeltaVocab::open_layered_controlled(&prefix, &own, &mut budget).unwrap();
+        assert_eq!(normal.len(), 6);
+        assert_eq!(loaded.value.len(), normal.len());
+        for id in 0..normal.len() {
+            assert_eq!(loaded.value.get(id), normal.get(id));
+        }
+        assert_eq!(loaded.value.find(b"<urn:a>"), Some(0));
+        assert_eq!(loaded.value.find(b"<urn:c>"), Some(3));
+        assert_eq!(
+            loaded.charge,
+            loaded.value.resident_bytes_limited(&limit).unwrap()
+        );
+        assert_eq!(budget.used(), loaded.charge);
+        drop(loaded.value);
+        budget.release(loaded.charge);
+        assert_eq!(budget.used(), 0);
+        assert_eq!(std::fs::read(&upstream).unwrap(), first);
+        assert_eq!(std::fs::read(&middle).unwrap(), second);
+        assert_eq!(std::fs::read(&own).unwrap(), last);
+        let mut small = ColdBudget::new(ReadLimit {
+            memory: Some(32),
+            ..limit
+        })
+        .unwrap();
+        assert!(matches!(
+            DeltaVocab::open_layered_controlled(&prefix, &own, &mut small),
+            Err(Error::BudgetExceeded(_))
+        ));
+        let mut budget = ColdBudget::new(limit).unwrap();
+        assert!(matches!(
+            DeltaVocab::open_layered_controlled(&[(upstream, 4)], &own, &mut budget),
+            Err(Error::Corrupt(_))
+        ));
     }
 }
