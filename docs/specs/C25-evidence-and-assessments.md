@@ -1,15 +1,17 @@
 # C25: Evidence, claims and assessments
 
-> **Status:** specified
+> **Status:** partially implemented
 >
-> **Phases:** None shipped. Phase 1 defines the vocabulary, shapes, source revisions,
-> claim proposals and compatibility mappings. Phase 2 adds review decisions, accepted
-> projections and reversible identity decisions. Phase 3 integrates recall, ingestion,
-> reports and dependency maintenance.
+> **Phases:** Phase 1 supplies versioned vocabulary, shapes, source and claim fixtures,
+> compatibility views and competency queries. Phase 2 adds authenticated typed writes,
+> retained-reference resolution, protected metadata, review decisions, accepted projections
+> and reversible identity decisions. Phase 3 integrates recall, ingestion, reports and
+> dependency maintenance.
 >
-> **User docs:** none, because nothing is built.
+> **User docs:** [Evidence profile](../ai/README.md#evidence-profile) and
+> [resource usage](../../crates/sparkles/resources/evidence/v1/README.md).
 >
-> The [Outcome](#outcome) section records implementation when it ships.
+> The [Outcome](#outcome) section records the delivered scope.
 
 This specification defines roadmap item 81. It builds on the cited writes and source
 records of [C17](C17-agent-memory.md) and [C18](C18-natural-language-questions-and-ingest/README.md),
@@ -435,6 +437,45 @@ implementation status. This spec's status and Outcome describe its delivery.
 
 ## Outcome
 
-This feature is specified and unimplemented. The existing C17 assertions and C18 source
-records retain their shipped behavior. No vocabulary, setting, claims endpoint or
-managed projection described here is available until its phase is implemented.
+Phase 1 delivers the version 1 RDF resource profile under
+[`crates/sparkles/resources/evidence/v1`](../../crates/sparkles/resources/evidence/v1/README.md).
+`sparkles::evidence::profile(1)` exposes the vocabulary, shapes, eight competency queries
+and two compatibility views without opening or changing a dataset. Unknown versions
+return `None`. An embedded manifest names the resources and records their full SHA-256
+content digests. The resource version does not alter the on-disk format or enable a
+managed-write capability.
+
+The shapes cover source revisions and renditions, unasserted occurrences, three exact
+reference structures, qualified evidence, assessments, confidence, authored records,
+review decisions and identity proposals. They preserve domain scope and distinguish
+source lineage from independent corroboration. The zero-to-one confidence domain is
+checked exactly from decimal lexical forms, including long fractions, without floating
+point rounding. Other scales remain uninterpreted.
+
+The [fixtures](../../testsuite/evidence/v1/README.md) retain actual source bytes and full
+SHA-256 digests. They cover Unicode selectors, RFC 6901 escaping, graph-kind identity,
+RDF 1.2 triple terms, directional language strings and precise literal round trips.
+Independent expected query results distinguish occurrence identities, assertion status,
+opposite-polarity candidates, mentions, missing visible support and unknown lineage.
+Invalid overlays exercise structural refusals and inconsistent passage identities.
+Compatibility views retain C17 and C18 identifiers and their original assertion
+semantics without inventing authenticated revisions or availability. Invalidated reifiers
+stay historical even after a new occurrence reasserts the same business triple. Rendition
+metadata and citations join across independently authorized graphs. Evidence query results
+retain each qualified link and creation activity. Invalid fixtures assert their intended
+constraint component, with mutation controls separating enum and digest failures from
+incidental cardinality failures.
+
+These resources are ordinary RDF under the caller's access policy. A conforming shape
+report does not authenticate a source, author, receipt or timestamp, resolve a retained
+snapshot, verify source bytes or enforce immutability. The existing C17 assertions,
+supersession and C18 source records retain their behavior. No evidence setting, claims
+endpoint, protected profile registry or accepted projection ships in Phase 1.
+
+Roadmap item 81 retains the rest of this contract. Phase 2 adds typed source, reference
+and claim creation with authenticated availability and guarded metadata, exact retained
+reference resolution, reader admission, idempotency, review, support ownership,
+projections and reversible identity decisions. C26 supplies the shared managed-write
+and admission boundary. Phase 3 integrates the new records with C17/C18, F22 and C22.
+The state-machine, authorization, direct-write, crash and retry acceptance cases remain
+required before those runtime phases are complete.

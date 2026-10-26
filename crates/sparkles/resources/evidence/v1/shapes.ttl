@@ -1,0 +1,209 @@
+PREFIX ev: <urn:x-sparkles:evidence:>
+PREFIX rdf: <http://www.w3.org/1999/02/22-rdf-syntax-ns#>
+PREFIX rdfs: <http://www.w3.org/2000/01/rdf-schema#>
+PREFIX owl: <http://www.w3.org/2002/07/owl#>
+PREFIX xsd: <http://www.w3.org/2001/XMLSchema#>
+PREFIX prov: <http://www.w3.org/ns/prov#>
+PREFIX oa: <http://www.w3.org/ns/oa#>
+PREFIX sh: <http://www.w3.org/ns/shacl#>
+
+<urn:x-sparkles:evidence:shapes:1> ev:profileVersion 1 .
+
+ev:SourceShape a sh:NodeShape ;
+  sh:targetClass ev:Source ;
+  sh:nodeKind sh:IRI ;
+  sh:message "Evidence profile version 1 requires the documented record structure." .
+
+ev:SourceRevisionShape a sh:NodeShape ;
+  sh:targetClass ev:SourceRevision ;
+  sh:nodeKind sh:IRI ;
+  sh:property [ sh:path prov:specializationOf ; sh:nodeKind sh:IRI ; sh:minCount 1 ; sh:maxCount 1 ; sh:class ev:Source ] ;
+  sh:property [ sh:path ev:contentDigest ; sh:datatype xsd:string ; sh:pattern "^sha256:[0-9a-f]{64}$" ; sh:minCount 1 ; sh:maxCount 1 ] ;
+  sh:property [ sh:path ev:sourceKey ; sh:datatype xsd:string ; sh:minLength 1 ; sh:minCount 1 ; sh:maxCount 1 ] ;
+  sh:property [ sh:path ev:upstreamVersion ; sh:datatype xsd:string ; sh:maxCount 1 ] ;
+  sh:property [ sh:path ev:publishedAt ; sh:datatype xsd:dateTime ; sh:pattern "(Z|[+-][0-9]{2}:[0-9]{2})$" ; sh:maxCount 1 ] ;
+  sh:property [ sh:path ev:firstAvailableAt ; sh:datatype xsd:dateTime ; sh:pattern "(Z|[+-][0-9]{2}:[0-9]{2})$" ; sh:maxCount 1 ] ;
+  sh:property [ sh:path ev:reportedAvailableAt ; sh:datatype xsd:dateTime ; sh:pattern "(Z|[+-][0-9]{2}:[0-9]{2})$" ; sh:maxCount 1 ] ;
+  sh:property [ sh:path ev:availabilityReceipt ; sh:nodeKind sh:IRI ; sh:maxCount 1 ] ;
+  sh:property [ sh:path ev:upstreamSource ; sh:nodeKind sh:IRI ] ;
+  sh:property [ sh:path ev:sourceFamily ; sh:nodeKind sh:IRI ] ;
+  sh:message "Evidence profile version 1 requires the documented record structure." .
+
+ev:RenditionShape a sh:NodeShape ;
+  sh:targetClass ev:Rendition ;
+  sh:nodeKind sh:IRI ;
+  sh:property [ sh:path prov:wasDerivedFrom ; sh:nodeKind sh:IRI ; sh:minCount 1 ; sh:maxCount 1 ; sh:class ev:SourceRevision ] ;
+  sh:property [ sh:path prov:wasGeneratedBy ; sh:nodeKind sh:IRI ; sh:minCount 1 ; sh:maxCount 1 ] ;
+  sh:property [ sh:path ev:contentDigest ; sh:datatype xsd:string ; sh:pattern "^sha256:[0-9a-f]{64}$" ; sh:minCount 1 ; sh:maxCount 1 ] ;
+  sh:property [ sh:path ev:mediaType ; sh:datatype xsd:string ; sh:minCount 1 ; sh:maxCount 1 ] ;
+  sh:property [ sh:path ev:language ; sh:datatype xsd:string ; sh:maxCount 1 ] ;
+  sh:property [ sh:path ev:normalizedText ; sh:datatype xsd:string ; sh:maxCount 1 ] ;
+  sh:message "Evidence profile version 1 requires the documented record structure." .
+
+ev:PositionSelectorShape a sh:NodeShape ;
+  sh:targetClass oa:TextPositionSelector ;
+  sh:nodeKind sh:BlankNodeOrIRI ;
+  sh:property [ sh:path oa:start ; sh:datatype xsd:integer ; sh:minInclusive 0 ; sh:minCount 1 ; sh:maxCount 1 ] ;
+  sh:property [ sh:path oa:end ; sh:datatype xsd:integer ; sh:minInclusive 0 ; sh:minCount 1 ; sh:maxCount 1 ] ;
+  sh:sparql [ sh:message "A text selector is a nonempty half-open interval." ; sh:select """PREFIX oa: <http://www.w3.org/ns/oa#>
+SELECT $this WHERE { $this oa:start ?start ; oa:end ?end . FILTER(?end <= ?start) }""" ] ;
+  sh:message "Evidence profile version 1 requires the documented record structure." .
+
+ev:PassageShape a sh:NodeShape ;
+  sh:targetClass ev:Passage ;
+  sh:nodeKind sh:IRI ;
+  sh:property [ sh:path oa:hasSource ; sh:nodeKind sh:IRI ; sh:minCount 1 ; sh:maxCount 1 ; sh:class ev:Rendition ] ;
+  sh:property [ sh:path ev:sourceRevision ; sh:nodeKind sh:IRI ; sh:minCount 1 ; sh:maxCount 1 ; sh:class ev:SourceRevision ] ;
+  sh:property [ sh:path oa:hasSelector ; sh:nodeKind sh:BlankNodeOrIRI ; sh:minCount 1 ; sh:maxCount 1 ; sh:class oa:TextPositionSelector ] ;
+  sh:property [ sh:path ev:textDigest ; sh:datatype xsd:string ; sh:pattern "^sha256:[0-9a-f]{64}$" ; sh:minCount 1 ; sh:maxCount 1 ] ;
+  sh:property [ sh:path oa:exact ; sh:nodeKind sh:Literal ; sh:maxCount 1 ] ;
+  sh:sparql [ sh:message "A passage and its rendition must identify the same revision." ; sh:select """PREFIX ev: <urn:x-sparkles:evidence:>
+PREFIX oa: <http://www.w3.org/ns/oa#>
+PREFIX prov: <http://www.w3.org/ns/prov#>
+SELECT $this WHERE { $this oa:hasSource ?rendition ; ev:sourceRevision ?revision . ?rendition prov:wasDerivedFrom ?actual . FILTER(?revision != ?actual) }""" ] ;
+  sh:message "Evidence profile version 1 requires the documented record structure." .
+
+ev:ClaimShape a sh:NodeShape ;
+  sh:targetClass ev:Claim ;
+  sh:nodeKind sh:IRI ;
+  sh:property [ sh:path rdf:reifies ; sh:minCount 1 ; sh:maxCount 1 ] ;
+  sh:property [ sh:path ev:claimKind ; sh:in (ev:Reported ev:Observation ev:Hypothesis ev:Preference) ; sh:minCount 1 ; sh:maxCount 1 ] ;
+  sh:property [ sh:path ev:polarity ; sh:in (ev:Positive ev:Negative ev:Uncertain) ; sh:minCount 1 ; sh:maxCount 1 ] ;
+  sh:property [ sh:path prov:wasDerivedFrom ; sh:nodeKind sh:IRI ; sh:minCount 1 ; sh:maxCount 1 ; sh:class ev:SourceRevision ] ;
+  sh:property [ sh:path prov:wasGeneratedBy ; sh:nodeKind sh:IRI ; sh:minCount 1 ; sh:maxCount 1 ] ;
+  sh:property [ sh:path prov:wasAttributedTo ; sh:nodeKind sh:IRI ; sh:minCount 1 ; sh:maxCount 1 ] ;
+  sh:sparql [ sh:message "The proposition must be an RDF 1.2 triple term." ; sh:select """PREFIX rdf: <http://www.w3.org/1999/02/22-rdf-syntax-ns#>
+SELECT $this WHERE { $this rdf:reifies ?triple . FILTER(!isTRIPLE(?triple)) }""" ] ;
+  sh:message "Evidence profile version 1 requires the documented record structure." .
+
+ev:StoredFactReferenceShape a sh:NodeShape ;
+  sh:nodeKind sh:IRI ;
+  sh:property [ sh:path ev:datasetId ; sh:datatype xsd:string ; sh:pattern "^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$" ; sh:minCount 1 ; sh:maxCount 1 ] ;
+  sh:property [ sh:path ev:branchId ; sh:datatype xsd:string ; sh:pattern "^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$" ; sh:minCount 1 ; sh:maxCount 1 ] ;
+  sh:property [ sh:path ev:commit ; sh:datatype xsd:integer ; sh:minInclusive 0 ; sh:minCount 1 ; sh:maxCount 1 ] ;
+  sh:property [ sh:path ev:expectedTriple ; sh:minCount 1 ; sh:maxCount 1 ] ;
+  sh:property [ sh:path ev:reifier ; sh:nodeKind sh:IRI ; sh:maxCount 1 ] ;
+  sh:property [ sh:path ev:skolemMap ; sh:nodeKind sh:IRI ; sh:maxCount 1 ] ;
+  sh:or (
+    [ sh:property [ sh:path ev:graphKind ; sh:hasValue ev:DefaultGraph ; sh:minCount 1 ; sh:maxCount 1 ] ; sh:property [ sh:path ev:graph ; sh:maxCount 0 ] ]
+    [ sh:property [ sh:path ev:graphKind ; sh:hasValue ev:NamedGraph ; sh:minCount 1 ; sh:maxCount 1 ] ; sh:property [ sh:path ev:graph ; sh:nodeKind sh:IRI ; sh:minCount 1 ; sh:maxCount 1 ] ]
+  ) ;
+  sh:sparql [ sh:message "The expected fact must be an RDF 1.2 triple term." ; sh:select """PREFIX ev: <urn:x-sparkles:evidence:>
+SELECT $this WHERE { $this ev:expectedTriple ?triple . FILTER(!isTRIPLE(?triple)) }""" ] ;
+  sh:message "Evidence profile version 1 requires the documented record structure." .
+
+ev:PassageReferenceShape a sh:NodeShape ;
+  sh:nodeKind sh:IRI ;
+  sh:property [ sh:path ev:sourceRevision ; sh:nodeKind sh:IRI ; sh:minCount 1 ; sh:maxCount 1 ; sh:class ev:SourceRevision ] ;
+  sh:property [ sh:path ev:rendition ; sh:nodeKind sh:IRI ; sh:minCount 1 ; sh:maxCount 1 ; sh:class ev:Rendition ] ;
+  sh:property [ sh:path ev:passage ; sh:nodeKind sh:IRI ; sh:minCount 1 ; sh:maxCount 1 ; sh:class ev:Passage ] ;
+  sh:sparql [ sh:message "A passage reference must preserve its passage's revision and rendition." ; sh:select """PREFIX ev: <urn:x-sparkles:evidence:>
+PREFIX oa: <http://www.w3.org/ns/oa#>
+SELECT $this WHERE { $this ev:passage ?passage ; ev:sourceRevision ?revision ; ev:rendition ?rendition . ?passage ev:sourceRevision ?actualRevision ; oa:hasSource ?actualRendition . FILTER(?revision != ?actualRevision || ?rendition != ?actualRendition) }""" ] ;
+  sh:message "Evidence profile version 1 requires the documented record structure." .
+
+ev:StructuredReferenceShape a sh:NodeShape ;
+  sh:nodeKind sh:IRI ;
+  sh:property [ sh:path ev:sourceRevision ; sh:nodeKind sh:IRI ; sh:minCount 1 ; sh:maxCount 1 ; sh:class ev:SourceRevision ] ;
+  sh:property [ sh:path ev:jsonPointer ; sh:datatype xsd:string ; sh:pattern "^(/([^~/]|~0|~1)*)*$" ; sh:minCount 1 ; sh:maxCount 1 ] ;
+  sh:property [ sh:path ev:valueDigest ; sh:datatype xsd:string ; sh:pattern "^sha256:[0-9a-f]{64}$" ; sh:minCount 1 ; sh:maxCount 1 ] ;
+  sh:property [ sh:path ev:method ; sh:nodeKind sh:IRI ; sh:minCount 1 ; sh:maxCount 1 ] ;
+  sh:property [ sh:path ev:methodVersion ; sh:datatype xsd:string ; sh:minCount 1 ; sh:maxCount 1 ] ;
+  sh:message "Evidence profile version 1 requires the documented record structure." .
+
+ev:EvidenceRefShape a sh:NodeShape ;
+  sh:targetClass ev:EvidenceRef ;
+  sh:nodeKind sh:IRI ;
+  sh:xone (ev:StoredFactReferenceShape ev:PassageReferenceShape ev:StructuredReferenceShape) ;
+  sh:message "Evidence profile version 1 requires the documented record structure." .
+
+ev:EvidenceLinkShape a sh:NodeShape ;
+  sh:targetClass ev:EvidenceLink ;
+  sh:nodeKind sh:IRI ;
+  sh:property [ sh:path ev:target ; sh:nodeKind sh:IRI ; sh:minCount 1 ; sh:maxCount 1 ; sh:or ( [ sh:class ev:Claim ] [ sh:class ev:Assessment ] ) ] ;
+  sh:property [ sh:path ev:evidence ; sh:nodeKind sh:IRI ; sh:minCount 1 ; sh:maxCount 1 ; sh:class ev:EvidenceRef ] ;
+  sh:property [ sh:path ev:relation ; sh:in (ev:Supports ev:Contradicts ev:Mentions) ; sh:minCount 1 ; sh:maxCount 1 ] ;
+  sh:property [ sh:path prov:wasGeneratedBy ; sh:nodeKind sh:IRI ; sh:minCount 1 ; sh:maxCount 1 ] ;
+  sh:property [ sh:path prov:wasAttributedTo ; sh:nodeKind sh:IRI ; sh:minCount 1 ; sh:maxCount 1 ] ;
+  sh:message "Evidence profile version 1 requires the documented record structure." .
+
+ev:AssessmentShape a sh:NodeShape ;
+  sh:targetClass ev:Assessment ;
+  sh:nodeKind sh:IRI ;
+  sh:property [ sh:path ev:target ; sh:nodeKind sh:IRI ; sh:minCount 1 ; sh:maxCount 1 ] ;
+  sh:property [ sh:path ev:conclusion ; sh:minCount 1 ; sh:maxCount 1 ] ;
+  sh:property [ sh:path ev:method ; sh:nodeKind sh:IRI ; sh:minCount 1 ; sh:maxCount 1 ] ;
+  sh:property [ sh:path ev:methodVersion ; sh:datatype xsd:string ; sh:minCount 1 ; sh:maxCount 1 ] ;
+  sh:property [ sh:path ev:configurationDigest ; sh:datatype xsd:string ; sh:pattern "^sha256:[0-9a-f]{64}$" ; sh:minCount 1 ; sh:maxCount 1 ] ;
+  sh:property [ sh:path ev:evaluatedAt ; sh:datatype xsd:dateTime ; sh:pattern "(Z|[+-][0-9]{2}:[0-9]{2})$" ; sh:maxCount 1 ; sh:minCount 1 ] ;
+  sh:property [ sh:path prov:wasGeneratedBy ; sh:nodeKind sh:IRI ; sh:minCount 1 ; sh:maxCount 1 ] ;
+  sh:property [ sh:path prov:wasAttributedTo ; sh:nodeKind sh:IRI ; sh:minCount 1 ; sh:maxCount 1 ] ;
+  sh:message "Evidence profile version 1 requires the documented record structure." .
+
+ev:ConfidenceShape a sh:NodeShape ;
+  sh:targetClass ev:Confidence ;
+  sh:nodeKind sh:BlankNodeOrIRI ;
+  sh:property [ sh:path ev:value ; sh:nodeKind sh:Literal ; sh:minCount 1 ; sh:maxCount 1 ] ;
+  sh:property [ sh:path ev:scale ; sh:nodeKind sh:IRI ; sh:minCount 1 ; sh:maxCount 1 ] ;
+  sh:property [ sh:path prov:wasAttributedTo ; sh:nodeKind sh:IRI ; sh:minCount 1 ; sh:maxCount 1 ] ;
+  sh:or (
+    [ sh:not [ sh:property [ sh:path ev:scale ; sh:hasValue ev:ZeroToOne ] ] ]
+    [ sh:property [ sh:path ev:value ; sh:datatype xsd:decimal ; sh:pattern "^[ \t\r\n]*([+]?(0+([.][0-9]*)?|[.][0-9]+|0*1([.]0*)?)|-(0+([.]0*)?|[.]0+))[ \t\r\n]*$" ] ]
+  ) ;
+  sh:message "Evidence profile version 1 requires the documented record structure." .
+
+ev:QualifiedConfidenceShape a sh:NodeShape ;
+  sh:nodeKind sh:IRI ;
+  sh:property [ sh:path ev:sourceConfidence ; sh:class ev:Confidence ] ;
+  sh:property [ sh:path ev:extractionConfidence ; sh:class ev:Confidence ] ;
+  sh:property [ sh:path ev:analystConfidence ; sh:class ev:Confidence ] ;
+  sh:message "Evidence profile version 1 requires the documented record structure." .
+
+ev:QualifiedConfidenceShape sh:targetSubjectsOf ev:sourceConfidence, ev:extractionConfidence, ev:analystConfidence .
+
+ev:ExtractionConfidenceShape a sh:NodeShape ;
+  sh:targetObjectsOf ev:extractionConfidence ;
+  sh:property [ sh:path ev:method ; sh:nodeKind sh:IRI ; sh:minCount 1 ; sh:maxCount 1 ] ;
+  sh:message "An extraction confidence records the method that evaluated it." .
+
+ev:ReviewDecisionShape a sh:NodeShape ;
+  sh:targetClass ev:ReviewDecision ;
+  sh:nodeKind sh:IRI ;
+  sh:property [ sh:path ev:target ; sh:nodeKind sh:IRI ; sh:minCount 1 ; sh:maxCount 1 ] ;
+  sh:property [ sh:path ev:targetDigest ; sh:datatype xsd:string ; sh:pattern "^sha256:[0-9a-f]{64}$" ; sh:minCount 1 ; sh:maxCount 1 ] ;
+  sh:property [ sh:path ev:reviewPolicy ; sh:nodeKind sh:IRI ; sh:minCount 1 ; sh:maxCount 1 ] ;
+  sh:property [ sh:path ev:policyVersion ; sh:datatype xsd:string ; sh:minCount 1 ; sh:maxCount 1 ] ;
+  sh:property [ sh:path ev:disposition ; sh:in (ev:Accepted ev:Rejected ev:NeedsEvidence) ; sh:minCount 1 ; sh:maxCount 1 ] ;
+  sh:property [ sh:path prov:wasGeneratedBy ; sh:nodeKind sh:IRI ; sh:minCount 1 ; sh:maxCount 1 ] ;
+  sh:property [ sh:path prov:wasAttributedTo ; sh:nodeKind sh:IRI ; sh:minCount 1 ; sh:maxCount 1 ] ;
+  sh:message "Evidence profile version 1 requires the documented record structure." .
+
+ev:IdentityProposalShape a sh:NodeShape ;
+  sh:targetClass ev:IdentityProposal ;
+  sh:nodeKind sh:IRI ;
+  sh:property [ sh:path ev:entity ; sh:nodeKind sh:IRI ; sh:minCount 2 ] ;
+  sh:property [ sh:path ev:relation ; sh:in (ev:PossibleMatch ev:DistinctEntities) ; sh:minCount 1 ; sh:maxCount 1 ] ;
+  sh:property [ sh:path prov:wasGeneratedBy ; sh:nodeKind sh:IRI ; sh:minCount 1 ; sh:maxCount 1 ] ;
+  sh:property [ sh:path prov:wasAttributedTo ; sh:nodeKind sh:IRI ; sh:minCount 1 ; sh:maxCount 1 ] ;
+  sh:message "Evidence profile version 1 requires the documented record structure." .
+
+ev:NoteShape a sh:NodeShape ;
+  sh:targetClass ev:Note ;
+  sh:nodeKind sh:IRI ;
+  sh:property [ sh:path prov:wasGeneratedBy ; sh:nodeKind sh:IRI ; sh:minCount 1 ; sh:maxCount 1 ] ;
+  sh:property [ sh:path prov:wasAttributedTo ; sh:nodeKind sh:IRI ; sh:minCount 1 ; sh:maxCount 1 ] ;
+  sh:message "Evidence profile version 1 requires the documented record structure." .
+
+ev:DecisionShape a sh:NodeShape ;
+  sh:targetClass ev:Decision ;
+  sh:nodeKind sh:IRI ;
+  sh:property [ sh:path prov:wasGeneratedBy ; sh:nodeKind sh:IRI ; sh:minCount 1 ; sh:maxCount 1 ] ;
+  sh:property [ sh:path prov:wasAttributedTo ; sh:nodeKind sh:IRI ; sh:minCount 1 ; sh:maxCount 1 ] ;
+  sh:message "Evidence profile version 1 requires the documented record structure." .
+
+ev:TaskShape a sh:NodeShape ;
+  sh:targetClass ev:Task ;
+  sh:nodeKind sh:IRI ;
+  sh:property [ sh:path prov:wasGeneratedBy ; sh:nodeKind sh:IRI ; sh:minCount 1 ; sh:maxCount 1 ] ;
+  sh:property [ sh:path prov:wasAttributedTo ; sh:nodeKind sh:IRI ; sh:minCount 1 ; sh:maxCount 1 ] ;
+  sh:message "Evidence profile version 1 requires the documented record structure." .

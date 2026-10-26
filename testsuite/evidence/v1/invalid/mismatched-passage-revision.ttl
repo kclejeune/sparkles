@@ -1,0 +1,5 @@
+PREFIX ev: <urn:x-sparkles:evidence:>
+PREFIX ex: <https://example.org/>
+PREFIX prov: <http://www.w3.org/ns/prov#>
+PREFIX oa: <http://www.w3.org/ns/oa#>
+ex:wrongPassage a ev:Passage ; oa:hasSource ex:text ; ev:sourceRevision ex:revision2 ; oa:hasSelector ex:selector ; ev:textDigest "sha256:73473dcc12b763085904a5279d048c4d5b3b008c46f1f32443b99de04aa83a14" .

@@ -1,0 +1,5 @@
+PREFIX ev: <urn:x-sparkles:evidence:>
+PREFIX ex: <https://example.org/>
+PREFIX prov: <http://www.w3.org/ns/prov#>
+PREFIX oa: <http://www.w3.org/ns/oa#>
+ex:wrongReference a ev:EvidenceRef ; ev:sourceRevision ex:revision2 ; ev:rendition ex:text ; ev:passage ex:passage .

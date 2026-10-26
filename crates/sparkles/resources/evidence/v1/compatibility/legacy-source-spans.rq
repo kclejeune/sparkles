@@ -1,0 +1,32 @@
+PREFIX ev: <urn:x-sparkles:evidence:>
+PREFIX rdf: <http://www.w3.org/1999/02/22-rdf-syntax-ns#>
+PREFIX prov: <http://www.w3.org/ns/prov#>
+PREFIX oa: <http://www.w3.org/ns/oa#>
+PREFIX spk: <urn:x-sparkles:>
+PREFIX rdfs: <http://www.w3.org/2000/01/rdf-schema#>
+PREFIX xsd: <http://www.w3.org/2001/XMLSchema#>
+
+# No source revision, authenticated availability or selected-text digest is invented.
+CONSTRUCT {
+  ?source a ev:Source .
+  ?rendition a ev:LegacyRendition ; prov:wasDerivedFrom ?source ; spk:length ?length .
+  ?span a oa:SpecificResource ; oa:hasSource ?rendition ; oa:hasSelector ?selector .
+  ?selector a oa:TextPositionSelector ; oa:start ?start ; oa:end ?end .
+} WHERE {
+  { ?rendition a spk:TextRendition ; prov:wasDerivedFrom ?source .
+    OPTIONAL { ?rendition spk:length ?length }
+  }
+  UNION { GRAPH ?renditionGraph {
+    ?rendition a spk:TextRendition ; prov:wasDerivedFrom ?source .
+    OPTIONAL { ?rendition spk:length ?length }
+  } }
+  OPTIONAL {
+    { ?reifier prov:wasDerivedFrom ?span }
+    UNION { GRAPH ?citationGraph { ?reifier prov:wasDerivedFrom ?span } }
+    FILTER(isIRI(?span) && REGEX(STR(?span), "#char=[0-9]+,[0-9]+$"))
+    FILTER(STR(?rendition) = REPLACE(STR(?span), "#char=[0-9]+,[0-9]+$", ""))
+    BIND(IRI(CONCAT(STR(?span), ":selector")) AS ?selector)
+    BIND(xsd:integer(REPLACE(STR(?span), "^.*#char=([0-9]+),[0-9]+$", "$1")) AS ?start)
+    BIND(xsd:integer(REPLACE(STR(?span), "^.*#char=[0-9]+,([0-9]+)$", "$1")) AS ?end)
+  }
+}

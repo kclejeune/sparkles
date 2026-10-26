@@ -1,0 +1,26 @@
+PREFIX ev: <urn:x-sparkles:evidence:>
+
+<urn:x-sparkles:evidence:profile:1> ev:profileVersion 1 ;
+  ev:contentDigest "sha256:c697ea47184f489e1c2ca6aaa2ff60d9f541ed6f2507d91a523d93a12e7db2d5" .
+<urn:x-sparkles:evidence:shapes:1> ev:profileVersion 1 ;
+  ev:contentDigest "sha256:21a1bd3055de9d6b810d36ddd95181824bafd7f4e3c9fde627a43504d670b636" .
+<urn:x-sparkles:evidence:query:1:assertion-status.rq> ev:profileVersion 1 ;
+  ev:contentDigest "sha256:f29e85f04e4c361166ba58cbb54047d28335db3ddef54fc4ff9bf80158c5c747" .
+<urn:x-sparkles:evidence:query:1:claim-occurrences.rq> ev:profileVersion 1 ;
+  ev:contentDigest "sha256:0502c1395f1428c966a14e05953d900b6a7482e6495b36b7958eb6667c0d608d" .
+<urn:x-sparkles:evidence:query:1:evidence-relations.rq> ev:profileVersion 1 ;
+  ev:contentDigest "sha256:903309ddfcea7c4cba6e43d2413fb6348dce3072b7299ffe1e162bd74cb563be" .
+<urn:x-sparkles:evidence:query:1:opposite-polarities.rq> ev:profileVersion 1 ;
+  ev:contentDigest "sha256:976fd7252acf8bd5fb3a04eb1a9d13223f577afdc91eb7d4147b1651f4ea702e" .
+<urn:x-sparkles:evidence:query:1:passage-selectors.rq> ev:profileVersion 1 ;
+  ev:contentDigest "sha256:16284db0d1892c272312a8098b555744e06656f23a8839464d8866552d122d2d" .
+<urn:x-sparkles:evidence:query:1:source-lineage.rq> ev:profileVersion 1 ;
+  ev:contentDigest "sha256:d06bc54088c427d4c45b3d5fed5446f4d8769e06966736be54560bcc25d35277" .
+<urn:x-sparkles:evidence:query:1:stored-fact-references.rq> ev:profileVersion 1 ;
+  ev:contentDigest "sha256:18f530c47b04dd33c8e30a1dfc724abd1ed0bba9320aad81f05459eed1749c37" .
+<urn:x-sparkles:evidence:query:1:unsupported-claims.rq> ev:profileVersion 1 ;
+  ev:contentDigest "sha256:3bbb18c56943b0b59cb0fe17710872fe118b00510564444681cd46867838831a" .
+<urn:x-sparkles:evidence:compatibility:1:legacy-assertions.rq> ev:profileVersion 1 ;
+  ev:contentDigest "sha256:2791d6c2cd1e540d9c20513c0816bbe9140d71410ab492e52ce30d5b69c1cd45" .
+<urn:x-sparkles:evidence:compatibility:1:legacy-source-spans.rq> ev:profileVersion 1 ;
+  ev:contentDigest "sha256:ec04a89ff888d74b4ce8b9b7ddcfbc16330eabe34ba9bee271bf98fef6ea30c1" .

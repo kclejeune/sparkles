@@ -1,0 +1,11 @@
+PREFIX ev: <urn:x-sparkles:evidence:>
+PREFIX rdf: <http://www.w3.org/1999/02/22-rdf-syntax-ns#>
+PREFIX prov: <http://www.w3.org/ns/prov#>
+PREFIX oa: <http://www.w3.org/ns/oa#>
+
+SELECT ?passage ?revision ?rendition ?start ?end ?quote ?digest WHERE {
+  ?passage a ev:Passage ; ev:sourceRevision ?revision ; oa:hasSource ?rendition ;
+    oa:hasSelector ?selector ; ev:textDigest ?digest .
+  ?selector oa:start ?start ; oa:end ?end .
+  OPTIONAL { ?passage oa:exact ?quote }
+} ORDER BY ?passage

@@ -1,0 +1,3 @@
+# Versioned evidence resources and retained fixture bytes have published SHA-256 digests.
+/crates/sparkles/resources/evidence/v1/** text eol=lf
+/testsuite/evidence/v1/** text eol=lf

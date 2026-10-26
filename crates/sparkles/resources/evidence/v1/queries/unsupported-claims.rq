@@ -1,0 +1,9 @@
+PREFIX ev: <urn:x-sparkles:evidence:>
+PREFIX rdf: <http://www.w3.org/1999/02/22-rdf-syntax-ns#>
+PREFIX prov: <http://www.w3.org/ns/prov#>
+PREFIX oa: <http://www.w3.org/ns/oa#>
+
+SELECT ?claim WHERE {
+  ?claim a ev:Claim .
+  FILTER NOT EXISTS { ?link a ev:EvidenceLink ; ev:target ?claim ; ev:relation ev:Supports }
+} ORDER BY ?claim

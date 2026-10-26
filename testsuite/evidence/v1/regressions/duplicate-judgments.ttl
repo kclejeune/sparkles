@@ -1,0 +1,6 @@
+PREFIX ev: <urn:x-sparkles:evidence:>
+PREFIX ex: <https://example.org/>
+PREFIX prov: <http://www.w3.org/ns/prov#>
+PREFIX rdf: <http://www.w3.org/1999/02/22-rdf-syntax-ns#>
+PREFIX spk: <urn:x-sparkles:>
+ex:linkAgain a ev:EvidenceLink ; ev:target ex:claim1 ; ev:evidence ex:fieldRef ; ev:relation ev:Supports ; prov:wasAttributedTo ex:importer ; prov:wasGeneratedBy ex:secondImport .

@@ -1,0 +1,13 @@
+PREFIX ex: <https://example.org/>
+PREFIX prov: <http://www.w3.org/ns/prov#>
+PREFIX rdf: <http://www.w3.org/1999/02/22-rdf-syntax-ns#>
+PREFIX spk: <urn:x-sparkles:>
+ex:defaultRendition a spk:TextRendition ; prov:wasDerivedFrom ex:source ; spk:length 20 .
+ex:defaultCitation prov:wasDerivedFrom <https://example.org/namedRendition#char=1,4> .
+ex:a {
+ex:namedRendition a spk:TextRendition ; prov:wasDerivedFrom ex:source ; spk:length 20 .
+ex:crossNamed a spk:TextRendition ; prov:wasDerivedFrom ex:source ; spk:length 20 .
+ex:uncited a spk:TextRendition ; prov:wasDerivedFrom ex:source ; spk:length 20 . }
+ex:b {
+ex:namedCitation prov:wasDerivedFrom <https://example.org/defaultRendition#char=2,5> .
+ex:otherCitation prov:wasDerivedFrom <https://example.org/crossNamed#char=3,6> . }
