@@ -1,0 +1,15 @@
+{
+ "results": [
+  {
+   "command": "qlever",
+   "mean": 19.1812,
+   "stddev": 0.0,
+   "times": [
+    19.1812
+   ],
+   "exit_codes": [
+    0
+   ]
+  }
+ ]
+}

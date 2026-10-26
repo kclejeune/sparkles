@@ -1,0 +1,22 @@
+{
+ "results": [
+  {
+   "command": "fluree",
+   "mean": 0.0,
+   "stddev": null,
+   "median": 0.0,
+   "user": 0.0,
+   "system": 0.0,
+   "min": 0.0,
+   "max": 0.0,
+   "times": [
+    0.0
+   ],
+   "exit_codes": [
+    1
+   ],
+   "first_request_failed": false,
+   "timed_run_failed": true
+  }
+ ]
+}

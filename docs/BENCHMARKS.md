@@ -13,7 +13,7 @@ identify exceptions to the reference hardware, memory limits and request timing.
 
 | Workload | Measured result | Full report |
 |---|---|---|
-| Synthetic queries at 10.5M triples | Sparkles has the lowest means on 27 of 28 queries and ties Fluree within 10% on `count-all`. Its median speedup over QLever is 3.8×. | [Queries and throughput](benchmarks/synthetic/RESULTS.md) |
+| Synthetic queries at 10.5M triples | Sparkles has the lowest native endpoint means on 27 of 28 queries and ties Fluree within 10% on `count-all`. Its median speedup over QLever is 3.8×. | [Queries and throughput](benchmarks/synthetic/RESULTS.md) |
 | SP²Bench at 10M triples | Complete source-verified answers take 30.626 s for `q4` and 978.4 ms for `q6` under a 12 GiB server cap. Other hard queries retain qualified timeouts or failures. | [SP²Bench](benchmarks/sp2bench/RESULTS.md) |
 | Bulk loading at 10.5M triples | Sparkles takes 3.67 s, against QLever's 9.35 s, Oxigraph's 18.22 s and TDB2's 45.70 s. | [Loading](benchmarks/loading/RESULTS.md) |
 | WatDiv at 10.97M triples | Geometric mean latency is 4.63 ms, against Fluree's 6.97 ms and QLever's 17.9 ms. | [WatDiv](benchmarks/watdiv/RESULTS.md) |

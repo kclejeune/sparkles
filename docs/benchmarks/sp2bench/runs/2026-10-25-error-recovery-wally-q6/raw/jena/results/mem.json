@@ -1,0 +1,17 @@
+{
+ "idle": {
+  "jena-fuseki": 288
+ },
+ "queries": {
+  "q6": {
+   "jena-fuseki": {
+    "before": 288,
+    "peak": 4134,
+    "delta": 3846
+   }
+  }
+ },
+ "warm": {
+  "jena-fuseki": 4139
+ }
+}

@@ -1,0 +1,15 @@
+{
+  "test": "RDF triple deduplication, projected bag duplicates, failed inner path and absent nested optional",
+  "expected_rows": 5,
+  "actual": {
+    "oracle_version": 1,
+    "method": "source-relations-nested-left-join-bag",
+    "source_sha256": "286dee2f6246beb62f450df6c272fce2d9da06a73c5ba6429188f7b031e31690",
+    "query_sha256": "a88e5796dd345eb1caa7ca5723ef2687ae0def1b354a461febf3e20015b7afe2",
+    "students": 4,
+    "rows": 5,
+    "exact": "866772231a414c67",
+    "value": "866772231a414c67",
+    "semantics": "Source RDF triples are sets; every advisor/workplace path contributes a solution, including projected duplicates. Absent optional paths produce unbound projected values."
+  }
+}

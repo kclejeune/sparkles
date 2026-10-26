@@ -1,0 +1,39 @@
+16:06:20 INFO  Server          :: Apache Jena Fuseki 5.1.0
+16:06:20 INFO  Config          :: FUSEKI_HOME=/nix/store/q0dscszid7jzs66xq9dip95z2hc1zmsh-apache-jena-fuseki-5.1.0
+16:06:20 INFO  Config          :: FUSEKI_BASE=/home/kclejeune/.local/fuseki
+16:06:20 INFO  Config          :: Shiro file: file:///home/kclejeune/.local/fuseki/shiro.ini
+16:06:20 INFO  Config          :: Template file: templates/config-tdb2-dir
+16:06:21 INFO  Server          :: Database: TDB2 dataset: location=/home/kclejeune/lanes/benchmark-error-recovery-20261025/sp2b-q6-20261025T195019Z/jena/jena.db
+16:06:21 INFO  Server          :: Path = /bench
+16:06:21 INFO  Server          ::   Memory: 16.0 GiB
+16:06:21 INFO  Server          ::   Java:   21.0.12.1
+16:06:21 INFO  Server          ::   OS:     Linux 6.18.51 amd64
+16:06:21 INFO  Server          ::   PID:    48177
+16:06:21 INFO  Server          :: Started 2026/10/25 16:06:21 EDT on port 28482
+16:06:21 INFO  Fuseki          :: [1] POST http://localhost:28482/bench/sparql
+16:06:21 INFO  Fuseki          :: [1] Query = PREFIX rdf:     <http://www.w3.org/1999/02/22-rdf-syntax-ns#> PREFIX rdfs:    <http://www.w3.org/2000/01/rdf-schema#> PREFIX foaf:    <http://xmlns.com/foaf/0.1/> PREFIX dc:      <http://purl.org/dc/elements/1.1/> PREFIX dcterms: <http://purl.org/dc/terms/>  SELECT ?yr ?name ?document WHERE {   ?class rdfs:subClassOf foaf:Document .   ?document rdf:type ?class .   ?document dcterms:issued ?yr .   ?document dc:creator ?author .   ?author foaf:name ?name   OPTIONAL {     ?class2 rdfs:subClassOf foaf:Document .     ?document2 rdf:type ?class2 .     ?document2 dcterms:issued ?yr2 .     ?document2 dc:creator ?author2      FILTER (?author=?author2 && ?yr2<?yr)   } FILTER (!bound(?author2)) } 
+16:08:31 INFO  Fuseki          :: [1] 200 OK (130.321 s)
+16:08:31 INFO  Fuseki          :: [2] POST http://localhost:28482/bench/sparql
+16:08:31 INFO  Fuseki          :: [2] Query = PREFIX rdf:     <http://www.w3.org/1999/02/22-rdf-syntax-ns#> PREFIX rdfs:    <http://www.w3.org/2000/01/rdf-schema#> PREFIX foaf:    <http://xmlns.com/foaf/0.1/> PREFIX dc:      <http://purl.org/dc/elements/1.1/> PREFIX dcterms: <http://purl.org/dc/terms/>  SELECT ?yr ?name ?document WHERE {   ?class rdfs:subClassOf foaf:Document .   ?document rdf:type ?class .   ?document dcterms:issued ?yr .   ?document dc:creator ?author .   ?author foaf:name ?name   OPTIONAL {     ?class2 rdfs:subClassOf foaf:Document .     ?document2 rdf:type ?class2 .     ?document2 dcterms:issued ?yr2 .     ?document2 dc:creator ?author2      FILTER (?author=?author2 && ?yr2<?yr)   } FILTER (!bound(?author2)) } 
+16:10:35 INFO  Fuseki          :: [2] 200 OK (123.600 s)
+16:10:35 INFO  Fuseki          :: [3] POST http://localhost:28482/bench/sparql
+16:10:35 INFO  Fuseki          :: [3] Query = PREFIX rdf:     <http://www.w3.org/1999/02/22-rdf-syntax-ns#> PREFIX rdfs:    <http://www.w3.org/2000/01/rdf-schema#> PREFIX foaf:    <http://xmlns.com/foaf/0.1/> PREFIX dc:      <http://purl.org/dc/elements/1.1/> PREFIX dcterms: <http://purl.org/dc/terms/>  SELECT ?yr ?name ?document WHERE {   ?class rdfs:subClassOf foaf:Document .   ?document rdf:type ?class .   ?document dcterms:issued ?yr .   ?document dc:creator ?author .   ?author foaf:name ?name   OPTIONAL {     ?class2 rdfs:subClassOf foaf:Document .     ?document2 rdf:type ?class2 .     ?document2 dcterms:issued ?yr2 .     ?document2 dc:creator ?author2      FILTER (?author=?author2 && ?yr2<?yr)   } FILTER (!bound(?author2)) } 
+16:12:38 INFO  Fuseki          :: [3] 200 OK (122.918 s)
+16:12:38 INFO  Fuseki          :: [4] POST http://localhost:28482/bench/sparql
+16:12:38 INFO  Fuseki          :: [4] Query = PREFIX rdf:     <http://www.w3.org/1999/02/22-rdf-syntax-ns#> PREFIX rdfs:    <http://www.w3.org/2000/01/rdf-schema#> PREFIX foaf:    <http://xmlns.com/foaf/0.1/> PREFIX dc:      <http://purl.org/dc/elements/1.1/> PREFIX dcterms: <http://purl.org/dc/terms/>  SELECT ?yr ?name ?document WHERE {   ?class rdfs:subClassOf foaf:Document .   ?document rdf:type ?class .   ?document dcterms:issued ?yr .   ?document dc:creator ?author .   ?author foaf:name ?name   OPTIONAL {     ?class2 rdfs:subClassOf foaf:Document .     ?document2 rdf:type ?class2 .     ?document2 dcterms:issued ?yr2 .     ?document2 dc:creator ?author2      FILTER (?author=?author2 && ?yr2<?yr)   } FILTER (!bound(?author2)) } 
+16:14:40 INFO  Fuseki          :: [4] 200 OK (122.390 s)
+16:14:40 INFO  Fuseki          :: [5] POST http://localhost:28482/bench/sparql
+16:14:40 INFO  Fuseki          :: [5] Query = PREFIX rdf:     <http://www.w3.org/1999/02/22-rdf-syntax-ns#> PREFIX rdfs:    <http://www.w3.org/2000/01/rdf-schema#> PREFIX foaf:    <http://xmlns.com/foaf/0.1/> PREFIX dc:      <http://purl.org/dc/elements/1.1/> PREFIX dcterms: <http://purl.org/dc/terms/>  SELECT ?yr ?name ?document WHERE {   ?class rdfs:subClassOf foaf:Document .   ?document rdf:type ?class .   ?document dcterms:issued ?yr .   ?document dc:creator ?author .   ?author foaf:name ?name   OPTIONAL {     ?class2 rdfs:subClassOf foaf:Document .     ?document2 rdf:type ?class2 .     ?document2 dcterms:issued ?yr2 .     ?document2 dc:creator ?author2      FILTER (?author=?author2 && ?yr2<?yr)   } FILTER (!bound(?author2)) } 
+16:16:43 INFO  Fuseki          :: [5] 200 OK (122.152 s)
+16:16:43 INFO  Fuseki          :: [6] POST http://localhost:28482/bench/sparql
+16:16:43 INFO  Fuseki          :: [6] Query = PREFIX rdf:     <http://www.w3.org/1999/02/22-rdf-syntax-ns#> PREFIX rdfs:    <http://www.w3.org/2000/01/rdf-schema#> PREFIX foaf:    <http://xmlns.com/foaf/0.1/> PREFIX dc:      <http://purl.org/dc/elements/1.1/> PREFIX dcterms: <http://purl.org/dc/terms/>  SELECT ?yr ?name ?document WHERE {   ?class rdfs:subClassOf foaf:Document .   ?document rdf:type ?class .   ?document dcterms:issued ?yr .   ?document dc:creator ?author .   ?author foaf:name ?name   OPTIONAL {     ?class2 rdfs:subClassOf foaf:Document .     ?document2 rdf:type ?class2 .     ?document2 dcterms:issued ?yr2 .     ?document2 dc:creator ?author2      FILTER (?author=?author2 && ?yr2<?yr)   } FILTER (!bound(?author2)) } 
+16:18:45 INFO  Fuseki          :: [6] 200 OK (122.528 s)
+16:18:45 INFO  Fuseki          :: [7] POST http://localhost:28482/bench/sparql
+16:18:45 INFO  Fuseki          :: [7] Query = PREFIX rdf:     <http://www.w3.org/1999/02/22-rdf-syntax-ns#> PREFIX rdfs:    <http://www.w3.org/2000/01/rdf-schema#> PREFIX foaf:    <http://xmlns.com/foaf/0.1/> PREFIX dc:      <http://purl.org/dc/elements/1.1/> PREFIX dcterms: <http://purl.org/dc/terms/>  SELECT ?yr ?name ?document WHERE {   ?class rdfs:subClassOf foaf:Document .   ?document rdf:type ?class .   ?document dcterms:issued ?yr .   ?document dc:creator ?author .   ?author foaf:name ?name   OPTIONAL {     ?class2 rdfs:subClassOf foaf:Document .     ?document2 rdf:type ?class2 .     ?document2 dcterms:issued ?yr2 .     ?document2 dc:creator ?author2      FILTER (?author=?author2 && ?yr2<?yr)   } FILTER (!bound(?author2)) } 
+16:20:48 INFO  Fuseki          :: [7] 200 OK (123.056 s)
+16:20:48 INFO  Fuseki          :: [8] POST http://localhost:28482/bench/sparql
+16:20:48 INFO  Fuseki          :: [8] Query = SELECT * WHERE { ?s ?p ?o } LIMIT 1
+16:20:48 INFO  Fuseki          :: [8] 200 OK (6 ms)
+16:20:48 INFO  Fuseki          :: [9] POST http://localhost:28482/bench/sparql
+16:20:48 INFO  Fuseki          :: [9] Query = SELECT * WHERE { ?s ?p ?o } LIMIT 1
+16:20:48 INFO  Fuseki          :: [9] 200 OK (4 ms)

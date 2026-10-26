@@ -1,0 +1,12 @@
+
+rows                 sparkles
+optional-chain         300191
+[16:45:01] sparkles: warm-up pass over the selected queries
+
+== optional-chain
+Benchmark 1: sparkles
+  Time (mean ± σ):      90.3 ms ±   2.9 ms    [User: 3.9 ms, System: 6.1 ms]
+  Range (min … max):    87.2 ms …  92.8 ms    3 runs
+ 
+results/record.json: 1 results
+[16:45:02] record: /home/kclejeune/lanes/benchmark-error-recovery-20261025/optional-chain-20261025T204405Z/sparkles/results/record.json, table: /home/kclejeune/lanes/benchmark-error-recovery-20261025/optional-chain-20261025T204405Z/sparkles/results/summary.md

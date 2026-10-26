@@ -182,3 +182,7 @@ sixteen clients. Jena and Oxigraph timed out at every client count. Fluree alone
 two driver cells, but their result-count check has no successful competing engine to
 compare, and its fixed q2, q3 and q8 answers have unresolved disagreements, so its QMpH figures are not
 ranked.
+
+The [completed recovery inventory](../2026-10-25-query-error-recovery-inventory.json)
+retains every remaining driver or fixed-instance failure with its source and next step.
+A completed single generated query does not fill a missing 500-mix throughput cell.

@@ -1,0 +1,14 @@
+
+rows                 oxigraph
+optional-chain         300191
+[16:48:47] oxigraph: warm-up pass over the selected queries
+
+== optional-chain
+Benchmark 1: oxigraph
+  Time (mean ± σ):      5.449 s ±  0.031 s    [User: 0.014 s, System: 0.036 s]
+  Range (min … max):    5.413 s …  5.467 s    3 runs
+ 
+  Warning: Statistical outliers were detected. Consider re-running this benchmark on a quiet system without any interferences from other programs.
+ 
+results/record.json: 1 results
+[16:49:26] record: /home/kclejeune/lanes/benchmark-error-recovery-20261025/optional-chain-20261025T204405Z/oxigraph/results/record.json, table: /home/kclejeune/lanes/benchmark-error-recovery-20261025/optional-chain-20261025T204405Z/oxigraph/results/summary.md

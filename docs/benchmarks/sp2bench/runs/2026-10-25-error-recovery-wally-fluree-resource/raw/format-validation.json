@@ -1,0 +1,13 @@
+{
+  "format": "Fluree plain TSV dialect",
+  "content_type": "text/tab-separated-values; charset=utf-8",
+  "strict_sparql_tsv": false,
+  "observed_header": [
+    "name"
+  ],
+  "observed_first_value": "Maureo Benedict",
+  "rows": 656,
+  "schema_specific_value_hash": "1a095147849abf2b",
+  "verification_scope": "Known q8 name column decoded as xsd:string solely to compare lexical values with the source-matchedJSONreference. This is not a general RDF-term TSV decoder. The standard term parser correctly rejects bare strings.",
+  "standard": "https://www.w3.org/TR/sparql11-results-csv-tsv/#tsv-terms"
+}

@@ -1,0 +1,47 @@
+{
+ "suite": "synthetic",
+ "started": "2026-10-25T20:45:02Z",
+ "ended": "2026-10-25T20:45:31Z",
+ "host": {
+  "name": "wally",
+  "cpu": "12th Gen Intel(R) Core(TM) i7-12800H",
+  "cpus": 20,
+  "ram_mib": 31766,
+  "disk_model": "",
+  "kernel": "6.18.51",
+  "filesystem": "ext4",
+  "mount_options": "rw,relatime,discard,errors=remount-ro"
+ },
+ "sparkles": {
+  "binary": "/home/kclejeune/lanes/competitive-births-release-20261025/target-D/release/sparkles",
+  "version": "sparkles 0.1.0",
+  "sha256": "cf6f4cf5fd754c8344fd0f0c02b81dce5016c8b8ccfcbe034f5fe7927cfd46c8",
+  "scripts_commit": "unknown",
+  "binary_commit": "6b7f32ce"
+ },
+ "engines": {
+  "qlever": {
+   "license": "Apache-2.0",
+   "binary": "/nix/store/xn7f9c965zfza9nks2qzlrnx916xg3h2-qlever-0.5.48/bin/qlever-server",
+   "sha256": "8a3d2eb5259918b6a22607a012e50bf0087dfc9205e37613a03a09a1e68a10dc",
+   "version": "0.5.48",
+   "store_path": "/nix/store/xn7f9c965zfza9nks2qzlrnx916xg3h2-qlever-0.5.48",
+   "package": "qlever-0.5.48",
+   "reported_version": "/nix/store/xn7f9c965zfza9nks2qzlrnx916xg3h2-qlever-0.5.48/bin/qlever-server 0.0.0-unknown"
+  }
+ },
+ "memory_limit": "26G",
+ "client_cpu": "11",
+ "data": {
+  "synthetic-10.5m": {
+   "license": "generated",
+   "params": "scripts/gen-data.py fixed seed42",
+   "sha256": "10daf6486c20f8dd4579d819ea73bb5e7836e054cd6d2d1b73f99f35233635f8",
+   "bytes": 1121336097
+  }
+ },
+ "license_check": {
+  "gpl_benchmark_allowed": false,
+  "notes": []
+ }
+}

@@ -1,0 +1,99 @@
+{
+  "validation_version": 1,
+  "status": "pass",
+  "correctness": {
+    "method": "independent-data-oracle",
+    "policy": "sp2bench-source-triple-reconstruction-v1",
+    "canonicalization": {
+      "fingerprint": "row-sha256-v1",
+      "row": "UTF-8 Python repr of tuples of normalized RDF terms, projected variables sorted by name",
+      "multiset": "SHA-256 of sorted lowercase SHA-256 row hashes, each followed by LF; duplicates retained",
+      "exact_terms": "RDF term identity; xsd:string is explicit and language tags are lowercase",
+      "numeric_values": "12 significant decimal digits; normalized Decimal spelling",
+      "source_oracle": "Journal name-pair set unions for q4; earliest numeric year per author for q6; generated string names and integer years are checked explicitly"
+    },
+    "bindings": {
+      "bindings_version": 1,
+      "host": "wally",
+      "scale": "10m",
+      "engine": "sparkles",
+      "dataset": "sp2bench-10m",
+      "source_sha256": "4486653f3ea16825923eb8a5410137df7ba712aa918442531c33cbeb854eb814",
+      "binary_commit": "6b7f32ce",
+      "binary_sha256": "cf6f4cf5fd754c8344fd0f0c02b81dce5016c8b8ccfcbe034f5fe7927cfd46c8",
+      "settings": {
+        "warmup": 2,
+        "runs": 3,
+        "timer": "hyperfine+curl",
+        "resultCache": false,
+        "maxTimeSeconds": 600,
+        "serverTimeoutSeconds": 615,
+        "sparklesArgs": "--max-result-mb 4096",
+        "answerStreamTSVQueries": "q4 q6",
+        "correctnessEngineIsolation": true,
+        "jenaHeap": "16G",
+        "jenaStack": "256m",
+        "qleverMemory": "20G"
+      },
+      "queries": {
+        "q6": {
+          "sha256": "e635ca91c381cfa5def7a93737e283a4ff9fc697385ac595e3b76338550ede65",
+          "runs": 3,
+          "timing_role": "q6_timing"
+        }
+      },
+      "inputs": {
+        "raw_record": {
+          "path": "sparkles-record.json",
+          "sha256": "b5874bf9f03d5a28c39fb95596407636571fbf1c272cd5b6681aae4c8429a4c4"
+        },
+        "raw_answers": {
+          "path": "sparkles-answers.json",
+          "sha256": "14d165efde7b0b44f1388190199d764497a7feb650e1ea42ccaaca90818863e3"
+        },
+        "oracle": {
+          "path": "oracle.json",
+          "sha256": "6f5e9d7b004948e2ead2ad686099f41151626641f9015e3e7adede4282f0cdd0"
+        },
+        "q6_timing": {
+          "path": "sparkles-q6-timing.json",
+          "sha256": "7f54d7114bc470982dbad86e83c0511f4029653b593ac2abb0490564353287b7"
+        }
+      },
+      "oracle_generator": {
+        "source_revision": "a44bdabfbe7499abe3d439a6f2bec18b12247209",
+        "script": "scripts/bench-sp2b/oracle.py",
+        "sha256": "97f359ccd2cc73fc57be01017c6f1c6453e5ec6d8d2645af0aee4bd9fb3c3f87"
+      },
+      "measurement_controls": {
+        "sparkles_args": "--max-result-mb 4096",
+        "max_time_s": 600,
+        "server_timeout_s": 615,
+        "server_memory_cap": "24G",
+        "engines_isolated_for_correctness_and_timing": true,
+        "answer_algorithm": "row-sha256-v1; complete TSV; external sort64MiB",
+        "timing": "hyperfine curl full TSV to /dev/null; no fingerprints in timing",
+        "warmup": 2,
+        "runs": 3,
+        "runtime_binary_revision": "6b7f32ce",
+        "index_source": "Copied each preserved fresh Wally SP2Bench index from sp2b-20261025T183539Z, same exact NT SHA256; no graph updates. All selected queries are unchanged.",
+        "jena_heap": "16G",
+        "jena_stack": "256m",
+        "qlever_memory": "20G",
+        "comparison_policy": "Same Wally host profile and600s request budget for all five engines; correctness precedes timing; only correct full answers timed."
+      }
+    },
+    "queries": {
+      "q6": {
+        "rows": 906313,
+        "exact_matches": true,
+        "value_matches": true,
+        "query_sha256": "e635ca91c381cfa5def7a93737e283a4ff9fc697385ac595e3b76338550ede65",
+        "timed_samples": 3,
+        "all_exit_codes_zero": true
+      }
+    }
+  },
+  "raw_sources_unchanged": true,
+  "qualification": "Unchanged timing samples qualified by complete independent source reconstruction. The raw single-engine record remains unchanged with agrees=null."
+}

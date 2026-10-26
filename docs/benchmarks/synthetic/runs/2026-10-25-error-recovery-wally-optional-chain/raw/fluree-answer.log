@@ -1,0 +1,7 @@
+[16:49:27] fluree: loading (log: logs/load-fluree.log)
+fluree: 16.0 s, peak RSS 2767 MiB, index 398 MiB
+
+rows                   fluree
+optional-chain         300191
+results/record.json: 1 results
+[16:51:03] record: /home/kclejeune/lanes/benchmark-error-recovery-20261025/optional-chain-20261025T204405Z/fluree/results/record.json, table: /home/kclejeune/lanes/benchmark-error-recovery-20261025/optional-chain-20261025T204405Z/fluree/results/summary.md

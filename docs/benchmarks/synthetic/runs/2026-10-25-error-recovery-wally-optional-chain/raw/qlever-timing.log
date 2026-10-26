@@ -1,0 +1,12 @@
+
+rows                   qlever
+optional-chain         300191
+[16:45:40] qlever: warm-up pass over the selected queries
+
+== optional-chain
+Benchmark 1: qlever
+  Time (mean ± σ):     583.2 ms ±  14.5 ms    [User: 3.3 ms, System: 4.2 ms]
+  Range (min … max):   572.1 ms … 599.6 ms    3 runs
+ 
+results/record.json: 1 results
+[16:45:45] record: /home/kclejeune/lanes/benchmark-error-recovery-20261025/optional-chain-20261025T204405Z/qlever/results/record.json, table: /home/kclejeune/lanes/benchmark-error-recovery-20261025/optional-chain-20261025T204405Z/qlever/results/summary.md

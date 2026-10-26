@@ -117,12 +117,13 @@ a `powersave` governor and turbo enabled. These results have no cross-host speed
 | Query, mean ± σ ms | Sparkles | Jena | QLever | Fluree | Oxigraph |
 |---|---:|---:|---:|---:|---:|
 | q4 | 15115.9 ± 41.9 | timeout | wrong answer | OOM | timeout |
+| q6 | **1104.5 ± 9.1** | 122587.3 ± 454.0 | wrong answer | timeout | timeout |
 | q8 | **9.8 ± 0.5** | 53.2 ± 17.4 | wrong answer | 232.5 ± 13.2 | 1993.2 ± 15.8 |
 | q12b | 5.7 ± 0.3 | 12.0 ± 1.1 | wrong answer | 223.8 ± 14.6 | **5.2 ± 0.3** |
 
 The [suite receipt](runs/2026-10-25-error-recovery-wally/suite-validation.json) binds the raw records, actual answer
 bodies and timing files. Correct answers alone received timings, with two warm-ups and
-three samples for `q4`, and two warm-ups and ten samples for `q8` and `q12b`.
+three samples for `q4` and `q6`, and two warm-ups and ten samples for `q8` and `q12b`.
 The [Sparkles `q4` proof](runs/2026-10-25-error-recovery-wally/validation.json) uses the same independent source
 oracle. Fluree exceeds the 24 GiB cap on `q4`; Jena and Oxigraph exceed the 600 s request
 budget. A separate [Oxigraph extended check](runs/2026-10-25-error-recovery-wally/oxigraph-extended/validation.json)
@@ -138,6 +139,23 @@ Its `q12b` body contains `false` where the checked peers return `true`. These ar
 semantic disagreements, not timing results. Tiny dataset-independent
 [control queries](runs/2026-10-25-error-recovery-forge/peers/diagnostic-controls) reproduce the string comparison and
 OPTIONAL disagreements on QLever; Sparkles and Jena return the expected answers.
+
+The separate [matched `q6` receipt](runs/2026-10-25-error-recovery-wally-q6/suite-validation.json)
+verifies Sparkles and Jena against the independent source oracle, including all 906,313
+rows and exact RDF terms. Their means above use three samples after two warm-ups on the
+same Wally profile. QLever again returns 1,256,087 wrong rows. Fluree and Oxigraph have
+no complete answer within 600 s.
+
+A further [Fluree resource probe](runs/2026-10-25-error-recovery-wally-fluree-resource/validation.json)
+uses a 512 MiB cache and 26 GiB server cap for the unchanged `q4`. Kernel events confirm
+a memory-cgroup OOM kill before a complete answer. The retained `q8` wire body and header
+also establish the plain-TSV serialization qualifier. No latency is inferred from that
+resource or format probe.
+
+The [completed recovery inventory](../2026-10-25-query-error-recovery-inventory.json)
+accounts for all 53 previously failed cells. It separates ten recovered timing or driver
+results, two answer-only recoveries, bounded failures, unsupported driver formats and
+contracts that were not rerun. Named follow-ups retain their own data, host and limits.
 
 ## Loading
 

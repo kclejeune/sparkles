@@ -1,0 +1,10 @@
+{
+ "q6": {
+  "qlever": {
+   "rows": 1256087,
+   "exact": "row-sha256-v1:4d9f91cc350153c33e61541d4d4775f94304f71816c28b16d0af55cd9f92affd",
+   "value": "row-sha256-v1:26905cf50617fe3ba1924520b9bfbbc6d2fe2a5c40538801e3d233c29cce9648",
+   "query_sha256": "e635ca91c381cfa5def7a93737e283a4ff9fc697385ac595e3b76338550ede65"
+  }
+ }
+}

@@ -1,0 +1,17 @@
+
+rows                   fluree
+optional-chain         300191
+[16:52:23] fluree: warm-up pass over the selected queries
+
+== optional-chain
+Benchmark 1: fluree
+  Time (mean ± σ):       5.5 ms ±   0.5 ms    [User: 1.8 ms, System: 3.4 ms]
+  Range (min … max):     5.1 ms …   6.0 ms    3 runs
+ 
+  Warning: Ignoring non-zero exit code.
+ 
+/home/kclejeune/lanes/benchmark-error-recovery-20261025/src-reviewed/scripts/bench-lib.sh: line 9: 122419 Killed                     ( cd "$(store_of fluree)" && FLUREE_CACHE_MAX_MB=4096 FLUREE_PATH_MAX_VISITED=20000000 FLUREE_QUERY_TIMEOUT_MS=$((SERVER_TIMEOUT * 1000)) exec "${CAP[@]}" "$FLUREE" server run --listen-addr "127.0.0.1:$p" --storage-path "$(store_of fluree)/.fluree/storage" --log-level warn > "$STORE/fluree.log" 2>&1 )
+[16:55:14] fluree: stopped answering while timing optional-chain, recorded as an engine failure
+[16:55:15] fluree: no answer after optional-chain, restarting it
+results/record.json: 1 results
+[16:55:16] record: /home/kclejeune/lanes/benchmark-error-recovery-20261025/optional-chain-20261025T204405Z/fluree/results/record.json, table: /home/kclejeune/lanes/benchmark-error-recovery-20261025/optional-chain-20261025T204405Z/fluree/results/summary.md

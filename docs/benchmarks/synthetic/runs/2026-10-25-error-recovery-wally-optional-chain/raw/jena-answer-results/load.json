@@ -1,0 +1,15 @@
+{
+ "results": [
+  {
+   "command": "jena-tdb2",
+   "mean": 58.1031,
+   "stddev": 0.0,
+   "times": [
+    58.1031
+   ],
+   "exit_codes": [
+    0
+   ]
+  }
+ ]
+}

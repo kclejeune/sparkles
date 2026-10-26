@@ -1,0 +1,7 @@
+[16:45:47] jena: loading (log: logs/load-jena.log)
+jena-tdb2: 58.1 s, peak RSS 4789 MiB, index 1334 MiB
+
+rows              jena-fuseki
+optional-chain         300191
+results/record.json: 1 results
+[16:47:04] record: /home/kclejeune/lanes/benchmark-error-recovery-20261025/optional-chain-20261025T204405Z/jena/results/record.json, table: /home/kclejeune/lanes/benchmark-error-recovery-20261025/optional-chain-20261025T204405Z/jena/results/summary.md
