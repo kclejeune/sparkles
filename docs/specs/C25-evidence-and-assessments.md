@@ -493,3 +493,7 @@ projections and reversible identity decisions. C26 supplies the shared managed-w
 and admission boundary. Phase 3 integrates the new records with C17/C18, F22 and C22.
 The state-machine, authorization, direct-write, crash and retry acceptance cases remain
 required before those runtime phases are complete.
+
+Exact retained-reference resolution additionally uses item 395 and
+[C29](C29-bounded-view-preparation/README.md) for bounded history and permission
+preparation. A point-only reader does not complete the general guarded-view contract.

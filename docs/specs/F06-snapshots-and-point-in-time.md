@@ -1909,3 +1909,12 @@ pins (§11.6) is listed with F03's follow-ups.
   dataset with its time, author, layer, the changed keys and their old and new values
   (secrets redacted), retained by count or age, and `GET /$/settings/{ds}/history`
   lists it.
+
+### Bounded read-view preparation
+
+Roadmap item 395 and [C29](C29-bounded-view-preparation/README.md) add request-scoped
+memory, cancellation and deadline control for historical state and permission
+preparation. Existing hidden-quad, pattern-row and shared-cache limits retain their
+scope. The extension covers temporary buffers, cached results and exact inherited
+origins before a bounded caller receives its view. No bounded preparation phase has
+shipped.

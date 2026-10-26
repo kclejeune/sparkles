@@ -1605,3 +1605,11 @@ processes retain durable acknowledgements, pass80000 churn state checks and offl
 checks, and expose the different completed reader work in mixed throughput comparisons.
 Direct synchronization and small absolute serial differences support deferring further
 work under290. No change to durability or crash-recovery behavior is inferred.
+
+### Preparation-batch short-query control
+
+An initial optional-count client-wall flag did not recur with a larger interleaved
+Namespace sample or a pinned Intel control using the same binaries and matching
+answers. The preparation changes retain their functionality without a query-specific
+optimization. Item 328 remains the broader follow-up for short-query calibration and
+any reproducible costs; this check does not establish a cross-engine performance claim.
