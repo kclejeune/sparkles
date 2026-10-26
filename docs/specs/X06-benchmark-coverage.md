@@ -1628,3 +1628,19 @@ Item 328 retains the accepted `values-star` drift of about 0.4 microseconds. Rec
 it when the short-query execution path next changes, distinguishing instruction cost
 from code placement. A material persistent cost or a simple broad improvement should
 drive further optimization.
+
+### Standard capability integration screen
+
+The `c0b2f7fb` to `a71fd2ab` comparison includes the standard local embedding, OCR and
+encrypted backup capabilities, macOS key handling and the history-gap correction.
+Matching compiler records and retained binary hashes identify both builds. The
+Namespace comparison used 1.05M triples and returned matching answers across all 30
+synthetic queries. Local model and OCR execution were unconfigured.
+
+An eight-round rerun with 100 timed requests per query and server process brought
+the initial `path-plus`,
+`predicate-subjects` and `subquery-agg` flags below the 10% integration gate. It also
+rechecked `optional-count` and `order-by-full`. Large timing spreads prevent a precise
+cost claim from these Namespace results. Item 328 retains matched quiet Intel checks
+of these queries, including the small accepted `order-by-full` increase. Further
+optimization remains reserved for a material persistent cost or a simple broad fix.
