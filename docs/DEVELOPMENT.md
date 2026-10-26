@@ -632,7 +632,9 @@ benchmark records, the images, the Kotlin sources or the binding workflows do no
 push preserves both running and queued checks. Pull request updates cancel earlier
 checks, while binding release tags remain protected from cancellation. A manual run
 with **all-platforms** checked also runs Clippy and the tests on Linux arm64
-and macOS. The engine's shared state goes through snapshot swaps, locks and channels, and
+and macOS. The macOS nextest and doctest shells lower both core-dump limits to zero
+before running encrypted library tests. This preparation applies only to those test
+processes. The engine's shared state goes through snapshot swaps, locks and channels, and
 its relaxed atomics are counters and flags, so the risk of a fault that only arm64's
 weaker memory ordering or macOS would show is low, and pushes test Linux x86_64 only.
 

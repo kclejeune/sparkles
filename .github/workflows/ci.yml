@@ -420,7 +420,14 @@ jobs:
       - name: Fetch the conformance suites
         run: scripts/fetch-test-suites.sh "$RUNNER_TEMP/test-suites" >> "$GITHUB_ENV"
       - name: mbx nextest
-        run: mbx nextest run --locked --workspace --profile ci
+        shell: bash
+        run: |
+          # Encrypted library tests opt in within this shell, lowering both limits.
+          if [ "$RUNNER_OS" = macOS ]; then ulimit -c 0; fi
+          mbx nextest run --locked --workspace --profile ci
       - name: Doctests
         if: ${{ !cancelled() }}
-        run: mbx test --locked --workspace --doc
+        shell: bash
+        run: |
+          if [ "$RUNNER_OS" = macOS ]; then ulimit -c 0; fi
+          mbx test --locked --workspace --doc

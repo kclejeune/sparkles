@@ -1,5 +1,6 @@
 """Exercise local CI profile selection without building workspace crates."""
 import os
+import re
 from pathlib import Path
 import subprocess
 import tempfile
@@ -96,6 +97,42 @@ class CiProfiles(unittest.TestCase):
         task = tomllib.loads((ROOT / "mise.toml").read_text())["tasks"]["ci"]
         self.assertIn('flag "--exhaustive-features"', task["usage"])
         self.assertIn("${usage_exhaustive_features:+--exhaustive-features}", task["run"])
+
+
+class ManualPlatformShells(unittest.TestCase):
+    def commands(self):
+        workflow = (ROOT / ".github/workflows/ci.yml").read_text().split("  other-platforms:", 1)[1]
+        runs = re.findall(r"        run: (?:\|\n((?:          [^\n]*\n?)+)|([^\n]+))", workflow)
+        commands = ["\n".join(line[10:] for line in block.splitlines()) if block else scalar
+                    for block, scalar in runs]
+        return [command for command in commands if "mbx nextest" in command or "mbx test" in command]
+
+    def test_macos_prepares_both_limits_and_linux_preserves_them(self):
+        commands = self.commands()
+        self.assertEqual(len(commands), 2)
+        for platform in ("Linux", "macOS"):
+            for command in commands:
+                with self.subTest(platform=platform, command=command):
+                    prefix = (
+                        'before_soft=$(ulimit -S -c); before_hard=$(ulimit -H -c)\n'
+                        'mbx() { if [ "$RUNNER_OS" = macOS ]; then '
+                        '[ "$(ulimit -S -c)" = 0 ] && [ "$(ulimit -H -c)" = 0 ]; '
+                        'else [ "$(ulimit -S -c)" = "$before_soft" ] && '
+                        '[ "$(ulimit -H -c)" = "$before_hard" ]; fi; }\n'
+                    )
+                    result = subprocess.run(["bash", "-e", "-c", prefix + command],
+                                            env=dict(os.environ, RUNNER_OS=platform),
+                                            capture_output=True, text=True, timeout=10)
+                    self.assertEqual(result.returncode, 0, result.stderr)
+
+    def test_failed_macos_preparation_never_starts_tests(self):
+        for command in self.commands():
+            result = subprocess.run(
+                ["bash", "-e", "-c", 'ulimit() { return 17; }; mbx() { echo unexpected-test; };\n' + command],
+                env=dict(os.environ, RUNNER_OS="macOS"), capture_output=True, text=True, timeout=10,
+            )
+            self.assertEqual(result.returncode, 17, result.stderr)
+            self.assertNotIn("unexpected-test", result.stdout)
 
 
 if __name__ == "__main__":
