@@ -176,7 +176,10 @@ dependencies are recorded in the [central roadmap](../ROADMAP.md).
   from constants, lists, focus variables, basic list operators, conditionals and simple
   aggregates. Target filters that inspect only their input node are admitted. Graph-reading
   target filters and other target-node expression producers are refused before evaluation and
-  remain under roadmap item 21. Ordinary SHACL validation retains its separate language
+  remain under roadmap item 21. Directly anchored SPARQL triple and path dependencies are
+  admitted. Indirect query-dependency producers refuse an incomplete check until bounded
+  localization is available, while genuinely global queries enumerate bounded targets.
+  Ordinary SHACL validation retains its separate language
   support. Discovery work bounds do not establish a total SHACL heap limit. Controlled
   cold-reader admission waits for item 395.
 * The Pattern pane builds and edits basic graph patterns, filters, one level of

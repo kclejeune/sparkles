@@ -117,6 +117,12 @@ pub fn validate_affected(
     if let Some(e) = failure {
         return Err(e.into());
     }
+    if model.producer_refused {
+        return Err(Error::unsupported(
+            "form query dependency requires an early-bounded localization producer",
+        )
+        .into());
+    }
     let (mut post, ids) = DataGraph::new(
         after.clone(),
         opts.data_graph.as_deref(),

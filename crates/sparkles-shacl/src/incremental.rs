@@ -29,6 +29,7 @@
 mod affected;
 mod analysis_control;
 pub(crate) mod bounded;
+mod query_reads;
 mod targets;
 pub use affected::{AffectedLimits, check_target_producers, validate_affected};
 
@@ -165,6 +166,7 @@ enum Plan {
 /// The incremental analysis of a shapes graph.
 #[derive(Clone, Debug, Default)]
 pub struct Model {
+    producer_refused: bool,
     /// per shape: `None` for shapes that are not validated on their own (no targets, or
     /// deactivated)
     plans: Vec<Option<Plan>>,
@@ -184,6 +186,7 @@ const MAX_DEPS: usize = 4096;
 const MAX_EXPR_STEPS: usize = 100_000;
 
 struct Analyzer<'a, 'c> {
+    producer_refused: bool,
     shapes: &'a Shapes,
     control: Option<&'c mut dyn FnMut() -> Result<(), Fallback>>,
     memo: Vec<Option<Result<Vec<Dep>, Fallback>>>,
@@ -198,6 +201,33 @@ impl Analyzer<'_, '_> {
         match self.control.as_mut() {
             Some(check) => check(),
             None => Ok(()),
+        }
+    }
+
+    fn query_reads(
+        &mut self,
+        query: &spargebra::Query,
+        anchors: &[(&str, Vec<PropertyPath>)],
+    ) -> Result<Vec<Dep>, Fallback> {
+        if self.control.is_none() {
+            return crate::localize::reads(query, anchors)
+                .map(|reads| reads.into_iter().map(Dep::from).collect())
+                .ok_or(Fallback::Sparql);
+        }
+        match query_reads::reads(query, anchors, &mut self.control)? {
+            query_reads::Reads::Local(reads) => {
+                let mut out = Vec::new();
+                for read in reads {
+                    self.check()?;
+                    out.push(Dep::from(read));
+                }
+                Ok(out)
+            }
+            query_reads::Reads::Global => Err(Fallback::Sparql),
+            query_reads::Reads::Unsupported => {
+                self.producer_refused = true;
+                Err(Fallback::Sparql)
+            }
         }
     }
 
@@ -355,17 +385,9 @@ impl Analyzer<'_, '_> {
                 }
                 // a query anchored at the focus node reads its neighbourhood
                 Constraint::Sparql(c) => {
-                    if self.control.is_some() {
-                        return Err(Fallback::Sparql);
-                    }
-                    let reads = crate::localize::reads(&c.parsed, &[("this", Vec::new())])
-                        .ok_or(Fallback::Sparql)?;
-                    out.extend(reads.into_iter().map(Dep::from));
+                    out.extend(self.query_reads(&c.parsed, &[("this", Vec::new())])?);
                 }
                 Constraint::Component(c) => {
-                    if self.control.is_some() {
-                        return Err(Fallback::Sparql);
-                    }
                     let mut anchors = vec![("this", Vec::new())];
                     if c.ask {
                         // `$value` is each value node, which a computed one is not
@@ -378,9 +400,7 @@ impl Analyzer<'_, '_> {
                             analysis_control::prefix(&path_for_values, &mut self.control)?,
                         ));
                     }
-                    let reads =
-                        crate::localize::reads(&c.parsed, &anchors).ok_or(Fallback::Sparql)?;
-                    out.extend(reads.into_iter().map(Dep::from));
+                    out.extend(self.query_reads(&c.parsed, &anchors)?);
                 }
                 Constraint::MemberShape(s) => {
                     lists = true;
@@ -636,13 +656,8 @@ impl Analyzer<'_, '_> {
                 Ok(None)
             }
             Expr::Select(q) | Expr::SparqlExpr(q) => {
-                if self.control.is_some() {
-                    return Err(Fallback::Sparql);
-                }
                 let at = anchored(base, &mut self.control)?;
-                let reads =
-                    crate::localize::reads(&q.query, &[("this", at)]).ok_or(Fallback::Sparql)?;
-                out.extend(reads.into_iter().map(Dep::from));
+                out.extend(self.query_reads(&q.query, &[("this", at)])?);
                 Ok(None)
             }
             Expr::InstancesOf(_) | Expr::NodesMatching(_) | Expr::Custom { .. } | Expr::Arg(_) => {
@@ -744,6 +759,7 @@ impl Model {
             }
         }
         let mut a = Analyzer {
+            producer_refused: false,
             shapes,
             control,
             memo: vec![None; n],
@@ -874,6 +890,7 @@ impl Model {
             r.insert(rdfs::SUB_CLASS_OF.into_owned());
         }
         Model {
+            producer_refused: a.producer_refused,
             plans,
             reads,
             uses_classes: a.uses_classes,
