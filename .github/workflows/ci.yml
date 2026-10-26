@@ -13,8 +13,8 @@
 #   test         the archive's tests in four shards, with the W3C SPARQL and RDF, SHACL,
 #                ShEx and JSON-LD suites fetched at pinned commits
 #   jena-clients Apache Jena's own HTTP clients against the server binary from the archive
-#   features     the server's tests with the default features off and one optional
-#                feature set on, one job for each of six sets, built apart from the archive
+#   features     an opt-in manual compatibility matrix with the server defaults off
+#                and one optional feature set on, built apart from the archive
 #
 # A manual run can also test Linux arm64 and macOS on Apple silicon, for example before
 # a release. The server embeds ui/build, and its build script writes a placeholder page
@@ -43,6 +43,10 @@ on:
       - ".github/workflows/jvm-bindings.yml"
   workflow_dispatch:
     inputs:
+      compatibility-features:
+        description: Also test the six stripped-server feature sets
+        type: boolean
+        default: false
       all-platforms:
         description: Also run Clippy and the tests on Linux arm64 and macOS arm64
         type: boolean
@@ -306,12 +310,13 @@ jobs:
   # set on (scripts/test-features.sh, mise run test:features). The archive above builds
   # the default features only, so a test that assumes a feature's routes, or their absence,
   # would pass there and fail here. Each set compiles the whole server crate again, so the
-  # sets are separate jobs with a cache each, and their time adds nothing to the longest
-  # chain. A new set goes in the script's default list and in this matrix.
+  # sets are separate manual compatibility jobs with a cache each. Ordinary pushes and
+  # pull requests validate the default server. A new set goes in the script's default
+  # list and in this matrix.
   features:
     name: Features (${{ matrix.set }})
     needs: changes
-    if: needs.changes.outputs.rust == 'true'
+    if: github.event_name == 'workflow_dispatch' && inputs.compatibility-features && needs.changes.outputs.rust == 'true'
     timeout-minutes: 45
     strategy:
       fail-fast: false
@@ -415,7 +420,14 @@ jobs:
       - name: Fetch the conformance suites
         run: scripts/fetch-test-suites.sh "$RUNNER_TEMP/test-suites" >> "$GITHUB_ENV"
       - name: mbx nextest
-        run: mbx nextest run --locked --workspace --profile ci
+        shell: bash
+        run: |
+          # Encrypted library tests opt in within this shell, lowering both limits.
+          if [ "$RUNNER_OS" = macOS ]; then ulimit -c 0; fi
+          mbx nextest run --locked --workspace --profile ci
       - name: Doctests
         if: ${{ !cancelled() }}
-        run: mbx test --locked --workspace --doc
+        shell: bash
+        run: |
+          if [ "$RUNNER_OS" = macOS ]; then ulimit -c 0; fi
+          mbx test --locked --workspace --doc

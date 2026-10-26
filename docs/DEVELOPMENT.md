@@ -119,8 +119,8 @@ mise run build        # UI + release binary
 mise run serve        # build, then serve ./data on :3030
 mise run fmt          # cargo fmt + oxfmt        (fmt:check for CI)
 mise run lint         # clippy -D warnings + svelte-check
-mise run lint:features # clippy -D warnings over feature combinations (in ci)
-mise run test:features # the server's tests with default features off and one feature set on (in ci, not ci:fast)
+mise run lint:features # clippy -D warnings over feature combinations (opt-in)
+mise run test:features # the stripped-server compatibility matrix (opt-in)
 mise run lint:shell     # formatting and ShellCheck for maintained shell scripts (in ci)
 mise run lint:doc-paths # every crates/sparkles… path cited in the docs exists (in ci)
 mise run fmt:wasm     # clippy for the formatter's wasm32 build (in ci)
@@ -179,15 +179,21 @@ runs every hook over the whole tree.
 
 ```sh
 mise run ci            # formatting, clippy, all workspace tests, UI, Python, JVM and JavaScript tests, license notices
+mise run ci --exhaustive-features # the default gate plus optional-feature lint and compatibility tests
 mise run ci:fast       # formatting, cited doc paths, workspace clippy and the Rust tests
-mise run lint:features # clippy over feature combinations (in ci)
-mise run test:features # the server's tests with one optional feature set at a time (in ci, not ci:fast)
+mise run lint:features # clippy over feature combinations (opt-in)
+mise run test:features # the stripped-server compatibility matrix (opt-in)
 mise run test:w3c      # W3C SPARQL 1.0 / 1.1 query / 1.1 update / 1.2 suites, with a summary
 mise run test:shacl    # W3C SHACL Core and SHACL-SPARQL suites, SHACL 1.2 list tests, SHACLC pairs
 mise run test:shex     # shexTest: syntax, negative syntax and structure, representation, ShExR, validation
 mise run ui:e2e        # Playwright end-to-end tests against a real server
 mise run test:jena-clients  # Apache Jena's own HTTP clients against a real server
 ```
+
+`mise run ci` validates the default Linux server and the binding contracts. The
+optional-feature lint and stripped-server tests run only when requested with
+`--exhaustive-features` or their task names. This flag also adds those checks to a
+named task selection or the fast gate.
 
 `mise run ci` builds the UI, the Node addon and the JVM native library once, then runs
 the checks with the cheap ones first. It prints a line as each task passes or fails, and
@@ -596,7 +602,10 @@ for public repositories: `ubuntu-24.04` for Linux x86_64 with 4 vCPUs and 16 GB,
 free, the workflows split their work into parallel jobs to shorten the wait for a push,
 rather than to save runner minutes. `actionlint` checks the workflow files.
 
-`ci.yml` runs on every push to `main` and every pull request. Its jobs start together.
+`ci.yml` runs on every push to `main` and every pull request. Linux is the production
+server platform. Ordinary runs validate the default server and keep binding feature
+contracts unchanged. The stripped-server compatibility matrix is opt-in through the
+manual **compatibility-features** input.
 
 | Job | What it runs |
 |---|---|
@@ -605,7 +614,7 @@ rather than to save runner minutes. `actionlint` checks the workflow files.
 | Build tests | `mbx nextest archive` builds every test binary once and uploads the archive. The doctests run here too. |
 | Test | Five jobs run the archive. Four take a quarter of the tests each (`--partition slice:N/4`), and one runs the `timing` group of `.config/nextest.toml`, which needs a machine to itself. |
 | Jena clients | Jena's own HTTP clients against the server binary from the archive (`mise run test:jena-clients`). |
-| Features | Six jobs run `scripts/test-features.sh` for one feature set each, with the default features off. They build apart from the archive and have a cache each. |
+| Features | A manual run with **compatibility-features** checked runs six jobs through `scripts/test-features.sh`, with the default features off and one feature set each. They build apart from the archive and have a cache each. |
 
 The transcript import integration test reserves all test slots while it runs in its
 shard. It sends a 5 MiB transcript through the real server, whose query deadline stays
@@ -623,7 +632,9 @@ benchmark records, the images, the Kotlin sources or the binding workflows do no
 push preserves both running and queued checks. Pull request updates cancel earlier
 checks, while binding release tags remain protected from cancellation. A manual run
 with **all-platforms** checked also runs Clippy and the tests on Linux arm64
-and macOS. The engine's shared state goes through snapshot swaps, locks and channels, and
+and macOS. The macOS nextest and doctest shells lower both core-dump limits to zero
+before running encrypted library tests. This preparation applies only to those test
+processes. The engine's shared state goes through snapshot swaps, locks and channels, and
 its relaxed atomics are counters and flags, so the risk of a fault that only arm64's
 weaker memory ordering or macOS would show is low, and pushes test Linux x86_64 only.
 
