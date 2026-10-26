@@ -224,7 +224,7 @@ pub fn shapes_for_class(
 /// The id of a focus node named by a caller: a blank node with the label of a stored one
 /// (`b…`) is that stored node, whatever the scope of the shapes' own blank nodes, and any
 /// other term resolves as the shapes' terms do.
-fn resolve_focus(data: &mut DataGraph, node: &Term, shapes: &Shapes) -> Id {
+pub(crate) fn resolve_focus(data: &mut DataGraph, node: &Term, shapes: &Shapes) -> Id {
     if let Term::BlankNode(b) = node
         && let Some(id) = sparkles_core::store::parse_bnode_label(b.as_str())
     {
@@ -242,6 +242,8 @@ pub(crate) enum Sel {
     All,
     /// those of these nodes that its targets select
     Nodes(Vec<Id>),
+    /// Already admitted actual targets; do not enumerate or retest targets.
+    Admitted(Vec<Id>),
 }
 
 /// The outcome of one shape of [`validate_selected`].
@@ -269,7 +271,7 @@ pub(crate) fn validate_selected(
     if let Some(after) = ids_of {
         let known = data.snap.dvocab_len;
         for s in &mut sel {
-            if let Sel::Nodes(nodes) = s {
+            if let Sel::Nodes(nodes) | Sel::Admitted(nodes) = s {
                 for n in nodes.iter_mut() {
                     // a delta id past the snapshot's vocabulary: a term it does not have
                     let unknown = n.tag() == sparkles_core::id::Tag::Delta && n.payload() >= known;
@@ -371,7 +373,7 @@ impl<'a> Engine<'a> {
         Engine::new(shapes, data, ids, opts)
     }
 
-    fn new(
+    pub(crate) fn new(
         shapes: &'a Shapes,
         data: &'a DataGraph,
         ids: Vec<Id>,
@@ -507,6 +509,7 @@ impl<'a> Engine<'a> {
                     continue;
                 }
                 Sel::All => self.focus_nodes(si)?,
+                Sel::Admitted(nodes) => nodes.clone(),
                 Sel::Nodes(nodes) => {
                     let mut seen = FxHashSet::default();
                     let mut out = Vec::new();
@@ -591,7 +594,7 @@ impl<'a> Engine<'a> {
         Ok(out)
     }
 
-    fn is_target(&self, si: ShapeId, f: Id) -> Result<bool> {
+    pub(crate) fn is_target(&self, si: ShapeId, f: Id) -> Result<bool> {
         for t in &self.shapes.shapes[si].targets {
             let hit = match *t {
                 Target::Node(t) => self.id(t) == f,

@@ -244,6 +244,8 @@
   async function runCheck(): Promise<FormCheckAnswer | null> {
     if (!nChanges) return null;
     const key = changeKey;
+    // A failed or incomplete recheck must not leave an earlier approval current.
+    check = null;
     checking = true;
     checkError = null;
     try {

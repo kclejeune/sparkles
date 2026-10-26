@@ -1151,7 +1151,7 @@ raises `InvalidInputError`.
 ### Editing forms
 
 `Dataset.forms.model`, `check` and `save` bind the library's `ds.forms()` from
-[U02](U02-shape-driven-forms.md#outcome). `model(focus, *, class_=None, settings=None,
+[U02](U02-shape-driven-forms/SPEC.md#outcome). `model(focus, *, class_=None, settings=None,
 at=None, lang=None, writable=True)` takes the resource, or the class of a new instance
 as `class_`, and returns the form as the dict that the HTTP route answers. `check(change)`
 and `save(change)` take the change as a dict with the members of the route's body, which

@@ -26,6 +26,11 @@
 //! constraints or components whose queries may read anything, and shapes that reach a
 //! reference cycle (recursive shapes).
 
+mod affected;
+pub(crate) mod bounded;
+mod targets;
+pub use affected::{AffectedLimits, check_target_producers, validate_affected};
+
 use crate::data::DataGraph;
 use crate::nodeexpr::{Expr, ExprId};
 use crate::path::{CPath, PropertyPath};
@@ -177,8 +182,9 @@ const MAX_DEPS: usize = 4096;
 /// otherwise take exponential time while the guard is installed.
 const MAX_EXPR_STEPS: usize = 100_000;
 
-struct Analyzer<'a> {
+struct Analyzer<'a, 'c> {
     shapes: &'a Shapes,
+    control: Option<&'c mut dyn FnMut() -> Result<(), Fallback>>,
     memo: Vec<Option<Result<Vec<Dep>, Fallback>>>,
     on_stack: Vec<bool>,
     uses_classes: bool,
@@ -186,7 +192,14 @@ struct Analyzer<'a> {
     expr_steps: usize,
 }
 
-impl Analyzer<'_> {
+impl Analyzer<'_, '_> {
+    fn check(&mut self) -> Result<(), Fallback> {
+        match self.control.as_mut() {
+            Some(check) => check(),
+            None => Ok(()),
+        }
+    }
+
     fn pred(&self, t: crate::shapes::Tid) -> Option<NamedNode> {
         match self.shapes.term(t) {
             Term::NamedNode(n) => Some(n.clone()),
@@ -196,6 +209,7 @@ impl Analyzer<'_> {
 
     /// The reads of shape `si` at its focus node.
     fn deps(&mut self, si: ShapeId) -> Result<Vec<Dep>, Fallback> {
+        self.check()?;
         if let Some(d) = &self.memo[si] {
             return d.clone();
         }
@@ -277,6 +291,7 @@ impl Analyzer<'_> {
         };
         let mut lists = false;
         for c in &shape.constraints {
+            self.check()?;
             match c {
                 Constraint::Class(_) => {
                     if !anchored_values {
@@ -440,7 +455,7 @@ fn alt(rs: Vec<Pre>) -> Pre {
     }
 }
 
-impl Analyzer<'_> {
+impl Analyzer<'_, '_> {
     /// The reads of the node expression `e`, evaluated at the focus node that the prefix
     /// `base` reaches from the shape's focus node (`None`: an unanchored node), and the
     /// prefix that reaches its output nodes. `value` is the prefix of the nodes the
@@ -454,6 +469,7 @@ impl Analyzer<'_> {
         value: &Pre,
         out: &mut Vec<Dep>,
     ) -> Result<Pre, Fallback> {
+        self.check()?;
         let shapes = self.shapes;
         self.expr_steps += 1;
         if self.expr_steps > MAX_EXPR_STEPS {
@@ -658,9 +674,17 @@ pub(crate) fn steps(p: &PropertyPath) -> Vec<(Vec<PropertyPath>, NamedNode, Dir)
 impl Model {
     /// Analyze the shapes with targets.
     pub fn new(shapes: &Shapes) -> Model {
+        Self::new_controlled(shapes, None)
+    }
+
+    fn new_controlled(
+        shapes: &Shapes,
+        control: Option<&mut dyn FnMut() -> Result<(), Fallback>>,
+    ) -> Model {
         let n = shapes.shapes.len();
         let mut a = Analyzer {
             shapes,
+            control,
             memo: vec![None; n],
             on_stack: vec![false; n],
             uses_classes: false,
@@ -669,6 +693,10 @@ impl Model {
         let mut plans = vec![None; n];
         let mut reads: Option<FxHashSet<NamedNode>> = Some(FxHashSet::default());
         for (si, shape) in shapes.shapes.iter().enumerate() {
+            if a.check().is_err() {
+                plans[si] = Some(Plan::Global(Fallback::Budget));
+                continue;
+            }
             if shape.targets.is_empty() || shape.deactivated {
                 continue;
             }

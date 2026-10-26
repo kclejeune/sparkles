@@ -637,3 +637,276 @@ ex:LinkedShape a sh:NodeShape ; sh:targetNode ex:target ;
         "{results:?}"
     );
 }
+
+fn add_check_shape(ds: &Dataset, shape: &str) {
+    ds.load_str_into(&format!("@prefix sh: <http://www.w3.org/ns/shacl#> . @prefix ex: <http://example.org/> . {shape}"),
+        sparkles::io::RdfFormat::Turtle, "urn:shapes").unwrap();
+}
+
+fn name_check(settings: FormSettings, replacement: &str) -> FormChange {
+    let mut c = change(
+        "name",
+        vec![lit("Alice Lima")],
+        vec![lit(replacement)],
+        vec![lit("Alice Lima")],
+    );
+    c.settings = settings;
+    c
+}
+
+#[test]
+fn checks_follow_shape_dependencies_beyond_two_hops() {
+    let (ds, settings) = dataset();
+    ds.update(&format!("PREFIX ex: <{EX}> INSERT DATA {{ ex:far ex:p ex:middle . ex:middle ex:q ex:near . ex:near ex:r ex:alice }}")).unwrap();
+    add_check_shape(
+        &ds,
+        "ex:Far a sh:NodeShape ; sh:targetNode ex:far ; sh:property [ sh:path (ex:p ex:q ex:r ex:name) ; sh:minLength 3 ] .",
+    );
+    let before = ds.snapshot();
+    let check = ds
+        .forms()
+        .check(&name_check(settings, "x"), &Default::default())
+        .unwrap();
+    assert_eq!(
+        check.conforms,
+        Some(false),
+        "a far affected target must not be missed by a fixed graph radius"
+    );
+    let results = check.results.unwrap();
+    assert!(
+        results.iter().any(|r| r["focusNode"]["value"] == ex("far")),
+        "{results:?}"
+    );
+    assert_eq!(ds.snapshot().commit, before.commit);
+    assert_eq!(
+        ds.snapshot().lookup_term(&lit("x")),
+        before.lookup_term(&lit("x"))
+    );
+}
+
+#[test]
+fn checks_exclude_unrelated_preexisting_violations_but_keep_direct_ones() {
+    let (ds, settings) = dataset();
+    ds.update(&format!(
+        "PREFIX ex: <{EX}> INSERT DATA {{ ex:alice ex:unrelatedLink ex:unrelated }}"
+    ))
+    .unwrap();
+    add_check_shape(
+        &ds,
+        "ex:Unrelated a sh:NodeShape ; sh:targetNode ex:unrelated ; sh:property [ sh:path ex:missing ; sh:minCount 1 ] .",
+    );
+    let c = name_check(settings.clone(), "Alice");
+    let check = ds.forms().check(&c, &Default::default()).unwrap();
+    assert_eq!(
+        check.conforms,
+        Some(true),
+        "unrelated nearby violations are outside the shape-aware affected target set"
+    );
+    assert!(check.results.unwrap().is_empty());
+    ds.update(&format!(r#"PREFIX ex: <{EX}> DELETE DATA {{ ex:alice ex:email "alice@example.org" }} ; INSERT DATA {{ ex:alice ex:email "invalid" }}"#)).unwrap();
+    let check = ds.forms().check(&c, &Default::default()).unwrap();
+    assert_eq!(
+        check.conforms,
+        Some(false),
+        "existing violations at a directly touched target remain visible"
+    );
+    assert!(
+        check
+            .results
+            .unwrap()
+            .iter()
+            .any(|r| r["focusNode"]["value"] == ex("alice"))
+    );
+}
+
+#[test]
+fn checks_admit_bounded_global_shape_targets_and_keep_their_current_violations() {
+    let (ds, settings) = dataset();
+    ds.update(&format!(
+        "PREFIX ex: <{EX}> INSERT DATA {{ ex:source ex:flag true }}"
+    ))
+    .unwrap();
+    add_check_shape(
+        &ds,
+        &format!(
+            r#"ex:Global a sh:NodeShape ; sh:targetNode ex:bob ; sh:sparql [ sh:select "SELECT $this WHERE {{ ?other <{EX}flag> true }}" ] ."#
+        ),
+    );
+    let check = ds
+        .forms()
+        .check(&name_check(settings, "Alice"), &Default::default())
+        .unwrap();
+    assert_eq!(check.conforms, Some(false));
+    assert!(
+        check
+            .results
+            .unwrap()
+            .iter()
+            .any(|r| r["focusNode"]["value"] == ex("bob"))
+    );
+}
+
+#[test]
+fn checks_accept_exactly_five_hundred_additional_targets_and_refuse_the_next() {
+    let (ds, settings) = dataset();
+    add_check_shape(
+        &ds,
+        "ex:Readers a sh:NodeShape ; sh:targetSubjectsOf ex:reads ; sh:property [ sh:path (ex:reads ex:name) ; sh:minLength 3 ] .",
+    );
+    let mut update = format!("PREFIX ex: <{EX}> INSERT DATA {{ ");
+    for n in 0..500 {
+        update.push_str(&format!("ex:reader{n} ex:reads ex:alice . "));
+    }
+    update.push('}');
+    ds.update(&update).unwrap();
+    let c = name_check(settings, "x");
+    let check = ds.forms().check(&c, &Default::default()).unwrap();
+    assert_eq!(check.conforms, Some(false));
+    assert_eq!(check.results.unwrap().len(), 500);
+    ds.update(&format!(
+        "PREFIX ex: <{EX}> INSERT DATA {{ ex:reader500 ex:reads ex:alice }}"
+    ))
+    .unwrap();
+    let before = ds.snapshot();
+    let error = ds.forms().check(&c, &Default::default()).unwrap_err();
+    assert!(
+        matches!(
+            error,
+            sparkles::Error::BudgetExceeded(sparkles::Budget {
+                kind: sparkles::BudgetKind::ValidationWork,
+                limit: 500,
+                requested: 501,
+            })
+        ),
+        "the 501st target must refuse, not return a silently truncated conformance result: {error:?}"
+    );
+    assert_eq!(ds.snapshot().commit, before.commit);
+    assert_eq!(
+        ds.snapshot().lookup_term(&lit("x")),
+        before.lookup_term(&lit("x"))
+    );
+}
+
+#[test]
+fn checks_refuse_an_incomplete_target_set_without_a_partial_report() {
+    let (ds, settings) = dataset();
+    add_check_shape(
+        &ds,
+        "ex:Readers a sh:NodeShape ; sh:targetSubjectsOf ex:reads ; sh:property [ sh:path (ex:reads ex:name) ; sh:minLength 3 ] .",
+    );
+    let mut update = format!("PREFIX ex: <{EX}> INSERT DATA {{ ");
+    for n in 0..501 {
+        update.push_str(&format!("ex:reader{n} ex:reads ex:alice . "));
+    }
+    update.push('}');
+    ds.update(&update).unwrap();
+    let c = name_check(settings, "x");
+    let before = ds.snapshot();
+    let error = ds.forms().check(&c, &Default::default()).expect_err(
+        "the 501st additional target must refuse instead of returning a partial report",
+    );
+    assert!(matches!(error, sparkles::Error::BudgetExceeded(_)));
+    assert_eq!(ds.snapshot().commit, before.commit);
+    assert_eq!(
+        ds.snapshot().lookup_term(&lit("x")),
+        before.lookup_term(&lit("x"))
+    );
+}
+
+#[test]
+fn checks_share_target_admission_across_shapes_without_double_charging_the_same_node() {
+    for shared in [false, true] {
+        let (ds, settings) = dataset();
+        for (shape, predicate) in [("First", "readsA"), ("Second", "readsB")] {
+            add_check_shape(
+                &ds,
+                &format!(
+                    "ex:{shape} a sh:NodeShape ; sh:targetSubjectsOf ex:{predicate} ; sh:property [ sh:path (ex:{predicate} ex:name) ; sh:minLength 3 ] ."
+                ),
+            );
+        }
+        let mut update = format!("PREFIX ex: <{EX}> INSERT DATA {{ ");
+        for (kind, count) in [
+            ("A", if shared { 500 } else { 300 }),
+            ("B", if shared { 500 } else { 250 }),
+        ] {
+            for n in 0..count {
+                let stem = if shared { "shared" } else { kind };
+                update.push_str(&format!("ex:{stem}{n} ex:reads{kind} ex:alice . "));
+            }
+        }
+        update.push('}');
+        ds.update(&update).unwrap();
+        let result = ds
+            .forms()
+            .check(&name_check(settings, "x"), &Default::default());
+        if shared {
+            assert_eq!(result.unwrap().results.unwrap().len(), 1000);
+        } else {
+            assert!(
+                matches!(result, Err(sparkles::Error::BudgetExceeded(_))),
+                "a new shape must not reset the shared500-target allowance"
+            );
+        }
+    }
+}
+
+#[test]
+fn forms_admit_static_target_expressions_and_refuse_unadmitted_data_reading_producers() {
+    let (ds, settings) = dataset();
+    add_check_shape(
+        &ds,
+        "@prefix shnex: <http://www.w3.org/ns/shacl-node-expr#> . ex:Static a sh:NodeShape ; sh:targetNode [ shnex:concat (ex:alice ex:bob) ] ; sh:property [ sh:path ex:name ; sh:minLength 3 ] .",
+    );
+    assert!(
+        !model(&ds, &settings, "alice")["fields"]
+            .as_array()
+            .unwrap()
+            .is_empty()
+    );
+    let check = ds
+        .forms()
+        .check(&name_check(settings.clone(), "x"), &Default::default())
+        .unwrap();
+    assert_eq!(check.conforms, Some(false));
+    ds.update(&format!(
+        "PREFIX ex: <{EX}> INSERT DATA {{ ex:source ex:targets ex:alice }}"
+    ))
+    .unwrap();
+    add_check_shape(
+        &ds,
+        "@prefix shnex: <http://www.w3.org/ns/shacl-node-expr#> . ex:Dynamic a sh:NodeShape ; sh:targetNode [ shnex:pathValues ex:targets ; shnex:focusNode ex:source ] ; sh:property [ sh:path ex:name ; sh:minCount 1 ] .",
+    );
+    // A class model does not evaluate other kinds of targets.
+    let mut request = FormRequest::new(settings.mint_iri(), settings.clone());
+    request.class = Some(ex("Person"));
+    assert!(
+        !ds.forms()
+            .model(&request, &Default::default())
+            .unwrap()
+            .fields
+            .is_empty()
+    );
+    let before = ds.snapshot();
+    let error = ds
+        .forms()
+        .model(
+            &FormRequest::new(ex("alice"), settings.clone()),
+            &Default::default(),
+        )
+        .expect_err("unadmitted target producers must refuse before form applicability evaluation");
+    assert!(
+        matches!(error, sparkles::Error::Unsupported(_)),
+        "{error:?}"
+    );
+    assert!(
+        ds.forms()
+            .check(&name_check(settings, "x"), &Default::default())
+            .is_err()
+    );
+    assert_eq!(ds.snapshot().commit, before.commit);
+    assert_eq!(
+        ds.snapshot().lookup_term(&lit("x")),
+        before.lookup_term(&lit("x"))
+    );
+}

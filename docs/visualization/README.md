@@ -136,13 +136,16 @@ The SvelteKit UI is embedded in the server binary.
   configures the guard and shows the head's results, the last validated write and recent
   rejections. The query editor shows the results of a rejected write.
 * Editing forms generated from SHACL shapes open from Explore's **Edit** or
-  `/datasets/{name}/edit?iri=…` ([U02](../specs/U02-shape-driven-forms.md#outcome),
+  `/datasets/{name}/edit?iri=…` ([U02](../specs/U02-shape-driven-forms/SPEC.md#outcome),
   [USAGE.md](../USAGE.md#editing-forms), [API.md](../API.md#editing-forms),
   [screenshot](../images/forms.png)). Fields merge every applying shape and follow
   `sh:group`, `sh:order`, `sh:name` and known DASH editors. The browser checks values as
   the person types, **Preview** runs a dry run, and **Save** commits one update, to `main`
   or to a session branch when `main` is protected. A concurrent change to a field shows a
-  conflict view. `Dataset::forms()` and Python's `Dataset.forms` expose the same forms.
+  conflict view. Checks follow shape dependencies beyond a fixed graph radius and
+  report all current violations on the affected targets. Incomplete discovery refuses
+  the check, and a failed recheck invalidates earlier browser approval.
+  `Dataset::forms()` and Python's `Dataset.forms` expose the same forms.
 * The Memory page shows what memory holds about an entity with each fact's source, quote
   and history, and its Inbox tab reviews facts with **Accept all that pass**. The
   Communities tab shows the GraphRAG hierarchy and reports.
@@ -166,9 +169,15 @@ dependencies are recorded in the [central roadmap](../ROADMAP.md).
 
 * Forms edit predicate and inverse paths with literal and IRI values. Blank node values
   with `dash:DetailsEditor`, list editors for `sh:memberShape` and choices for `sh:or` and
-  `sh:xone` are not built, and ShEx schemas do not drive forms. A check without a guard
-  does not validate shapes that reach the resource through more than two triples.
-  Roadmap item 21.
+  `sh:xone` remain planned, and ShEx schemas do not drive forms. Checks admit up to 500
+  additional distinct affected targets beyond the directly touched resources, shared
+  across shapes and snapshots. They refuse a larger or unfinished discovery instead of
+  returning partial conformance. Forms admit graph-free target-node expressions made
+  from constants, lists, focus variables, basic list operators, conditionals and simple
+  aggregates. Other target-node expression producers are refused before evaluation and
+  remain under roadmap item 21. Ordinary SHACL validation retains its separate language
+  support. Discovery work bounds do not establish a total SHACL heap limit. Controlled
+  cold-reader admission waits for item 395.
 * The Pattern pane builds and edits basic graph patterns, filters, one level of
   `OPTIONAL`, simple paths, the projection and the modifiers. `UNION`, `GRAPH`, inline
   `VALUES`, `MINUS` and `FILTER NOT EXISTS` are not editable on the canvas, a waiting node
