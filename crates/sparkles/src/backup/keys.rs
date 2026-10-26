@@ -312,6 +312,29 @@ impl Drop for Process {
     }
 }
 
+// Darwin siginfo_t contains raw pointers and is not Send. Keep it entirely
+// outside the async state so only a primitive exit observation crosses awaits.
+#[cfg(any(target_os = "linux", target_os = "android", target_os = "macos"))]
+fn provider_has_exited(pid: libc::pid_t) -> std::io::Result<bool> {
+    // SAFETY: waitid receives initialized storage for an owned child's status.
+    // WNOWAIT retains the child's identity until its group has been killed.
+    let mut info = unsafe { std::mem::zeroed::<libc::siginfo_t>() };
+    let rc = unsafe {
+        libc::waitid(
+            libc::P_PID,
+            pid as libc::id_t,
+            &mut info,
+            libc::WEXITED | libc::WNOWAIT | libc::WNOHANG,
+        )
+    };
+    if rc < 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    // SAFETY: successful waitid initialized the child-status fields. Zeroed
+    // storage also covers platforms that leave it untouched when no exit exists.
+    Ok(unsafe { info.si_pid() } > 0)
+}
+
 async fn command(
     argv: &[String],
     timeout: u64,
@@ -362,18 +385,19 @@ async fn command(
         }
         loop {
             ctl.check()?;
-            #[cfg(any(target_os="linux",target_os="android"))]
+            #[cfg(any(target_os="linux",target_os="android",target_os="macos"))]
             {
                 // Observe exit without reaping: the owned PID/group cannot be reused
                 // before descendants are killed. Tokio performs the actual reap below.
-                let mut info=unsafe { std::mem::zeroed::<libc::siginfo_t>() };
-                let rc=unsafe { libc::waitid(libc::P_PID,child.group as libc::id_t,&mut info,libc::WEXITED|libc::WNOWAIT|libc::WNOHANG) };
-                if rc<0 {
-                    if std::io::Error::last_os_error().kind()==std::io::ErrorKind::Interrupted {continue;}
-                    child.group=0; // An externally reaped PID must never be signaled after reuse.
-                    return Err(unavailable(label,"cannot inspect key command exit"));
-                }
-                if unsafe { info.si_pid() }>0 {
+                let exited = match provider_has_exited(child.group) {
+                    Ok(exited) => exited,
+                    Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
+                    Err(_) => {
+                        child.group=0; // An externally reaped PID must never be signaled after reuse.
+                        return Err(unavailable(label,"cannot inspect key command exit"));
+                    }
+                };
+                if exited {
                     child.kill_group();
                     let status=child.wait().await.map_err(|_| unavailable(label,"cannot reap key command"))?;
                     child.child = None;
@@ -385,7 +409,7 @@ async fn command(
                     _ = tokio::time::sleep(Duration::from_millis(25)) => {},
                 }
             }
-            #[cfg(not(any(target_os="linux",target_os="android")))]
+            #[cfg(not(any(target_os="linux",target_os="android",target_os="macos")))]
             tokio::select! {
                 _ = tokio::time::sleep_until(deadline) => return Err(unavailable(label,"key command timed out")),
                 _ = tokio::time::sleep(Duration::from_millis(25)) => {},
@@ -806,42 +830,104 @@ mod tests {
             .contains("timed out")
         );
     }
+    // A missing /proc entry is not a process oracle on macOS. Require a native
+    // state query, or an independently confirmed ESRCH when the process is absent.
+    fn process_stopped(pid: &str) -> bool {
+        let state = std::process::Command::new("ps")
+            .args(["-o", "stat=", "-p", pid])
+            .output()
+            .expect("query native process state");
+        let state_text = std::str::from_utf8(&state.stdout).unwrap().trim();
+        if !state_text.is_empty() {
+            assert!(state.status.success(), "native process query failed");
+            return state_text.starts_with('Z');
+        }
+        let pid: libc::pid_t = pid.parse().unwrap();
+        // SAFETY: signal zero only inspects existence and never sends a signal.
+        if unsafe { libc::kill(pid, 0) } == 0 {
+            return false;
+        }
+        assert_eq!(
+            std::io::Error::last_os_error().raw_os_error(),
+            Some(libc::ESRCH),
+            "process absence must be confirmed"
+        );
+        true
+    }
+
+    struct ProviderLifetime {
+        helper: PathBuf,
+        leader: PathBuf,
+    }
+    impl Drop for ProviderLifetime {
+        fn drop(&mut self) {
+            // Cooperative cleanup also runs when the old implementation leaves
+            // its helper alive. No stale PID is signaled after leader reaping.
+            let _ = std::fs::remove_file(&self.helper);
+            let _ = std::fs::remove_file(&self.leader);
+        }
+    }
+
     #[tokio::test]
     async fn successful_command_kills_detached_descendants_before_reaping() {
         let tmp = tempfile::tempdir().unwrap();
         let script = tmp.path().join("provider");
         let pidfile = tmp.path().join("pids");
-        std::fs::write(&script,"#!/bin/sh\nsleep 30 >/dev/null 2>&1 &\nprintf '%s %s' \"$$\" \"$!\" > \"$1\"\nprintf 'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa'\n").unwrap();
+        let lifetime = ProviderLifetime {
+            helper: tmp.path().join("helper-alive"),
+            leader: tmp.path().join("leader-wait"),
+        };
+        std::fs::write(&lifetime.helper, b"").unwrap();
+        std::fs::write(&lifetime.leader, b"").unwrap();
+        std::fs::write(
+            &script,
+            r#"#!/bin/sh
+/bin/sh -c 'while [ -f "$1" ]; do sleep 0.02; done' helper "$2" >/dev/null 2>&1 &
+printf '%s %s' "$$" "$!" > "$1.tmp"
+mv "$1.tmp" "$1"
+while [ -f "$3" ]; do sleep 0.02; done
+printf 'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa'
+"#,
+        )
+        .unwrap();
         use std::os::unix::fs::PermissionsExt;
         std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o700)).unwrap();
-        let output = command(
-            &[
-                script.to_str().unwrap().into(),
-                pidfile.to_str().unwrap().into(),
-            ],
-            5,
-            &Ctl::default(),
-            "test",
-        )
-        .await
-        .unwrap();
-        assert_eq!(output.as_slice(), &[b'a'; 32]);
-        let pids = std::fs::read_to_string(pidfile).unwrap();
-        tokio::time::timeout(Duration::from_secs(2), async {
-            loop {
-                let stopped = pids.split_whitespace().all(|pid| {
-                    std::fs::read_to_string(format!("/proc/{pid}/stat")).map_or(true, |stat| {
-                        stat.rsplit_once(')').unwrap().1.split_whitespace().next() == Some("Z")
-                    })
-                });
-                if stopped {
-                    break;
-                }
+        let argv = vec![
+            script.to_str().unwrap().into(),
+            pidfile.to_str().unwrap().into(),
+            lifetime.helper.to_str().unwrap().into(),
+            lifetime.leader.to_str().unwrap().into(),
+        ];
+        let task = tokio::spawn(async move { command(&argv, 5, &Ctl::default(), "test").await });
+        tokio::time::timeout(Duration::from_secs(3), async {
+            while !pidfile.exists() {
                 tokio::time::sleep(Duration::from_millis(10)).await;
             }
         })
         .await
         .unwrap();
+        let pids = std::fs::read_to_string(&pidfile).unwrap();
+        let pids: Vec<_> = pids.split_whitespace().collect();
+        assert_eq!(pids.len(), 2);
+        assert!(
+            !process_stopped(pids[1]),
+            "helper must be alive before leader exits"
+        );
+        assert!(!task.is_finished());
+        std::fs::remove_file(&lifetime.leader).unwrap();
+        let output = tokio::time::timeout(Duration::from_secs(5), task)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        assert_eq!(output.as_slice(), &[b'a'; 32]);
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while !pids.iter().all(|pid| process_stopped(pid)) {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("successful provider descendants were not killed");
     }
     #[tokio::test]
     async fn aborted_command_future_keeps_an_explicit_reaper_alive() {
@@ -994,11 +1080,7 @@ mod tests {
             loop {
                 // SIGKILL is asynchronous for descendants, which belong to their
                 // adopter after the owned provider is reaped. Require them stopped.
-                if descendants.iter().all(|pid| {
-                    std::fs::read_to_string(format!("/proc/{pid}/stat")).map_or(true, |stat| {
-                        stat.rsplit_once(')').unwrap().1.split_whitespace().next() == Some("Z")
-                    })
-                }) {
+                if descendants.iter().all(|pid| process_stopped(pid)) {
                     break;
                 }
                 tokio::time::sleep(Duration::from_millis(5)).await;

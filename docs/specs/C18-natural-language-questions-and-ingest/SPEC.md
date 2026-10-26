@@ -1462,7 +1462,8 @@ licenses are also permissive, adding BSD-2-Clause (rav1e, av1-grain, v_frame),
 BSL-1.0 (clipper2-rust), ISC (libloading) and CC0-1.0 or Apache-2.0 (imgref). Every one
 either ships a license file or names a license that the script has a standard text
 for. rav1e also ships a `PATENTS` file with the Alliance for Open Media patent license,
-which the notices script collects. `oar-ocr`'s crates and `ort` are Apache-2.0 or MIT, the
+which the notices script collects. The script also includes the bundled Oniguruma
+license from `onig_sys/oniguruma/COPYING`. `oar-ocr`'s crates and `ort` are Apache-2.0 or MIT, the
 PDFium library that the operator installs is BSD-3-Clause, and ONNX Runtime is MIT.
 The PP-OCR model files are reported as Apache-2.0 by the repackagings that pdf-inspector
 uses. Operators must check the licenses of the model snapshots they supply. The standard

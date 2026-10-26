@@ -1547,7 +1547,9 @@ The macOS protected-key implementation uses the public `mlock`, `madvise` and
 describes soft and hard limits. The [Darwin mapping header](https://github.com/apple-oss-distributions/xnu/blob/main/bsd/sys/mman.h)
 describes `MADV_ZERO_WIRED_PAGES` as deletion-time zeroing, and the
 [core writer](https://github.com/apple-oss-distributions/xnu/blob/main/bsd/kern/kern_core.c)
-checks `RLIMIT_CORE`. No Apple implementation code was copied.
+checks `RLIMIT_CORE`. The [Darwin wait header](https://github.com/apple-oss-distributions/xnu/blob/main/bsd/sys/wait.h)
+defines `waitid` and `WNOWAIT` for observing a provider exit while retaining its
+identity until group cleanup. No Apple implementation code was copied.
 
 This record preserves design sources, licensing and adoption decisions at the
 stages recorded below. Delivery statements in the record are historical. Current
@@ -1647,7 +1649,8 @@ preserve their ephemeral data/identity.
 
 Command cleanup kills the provider group and retains sole child ownership until it is
 reaped, including dropped resolution futures and runtime shutdown. A failed cleanup
-thread spawn reaps synchronously rather than abandoning the child.
+thread spawn reaps synchronously rather than abandoning the child. Linux, Android
+and macOS observe successful provider exits without reaping before group cleanup.
 
 Task cancellation reaches provider resolution and cache waits from backup/restore/verify/GC
 and scheduled-policy list/retention. Engine opening retains existing backend deadlines and

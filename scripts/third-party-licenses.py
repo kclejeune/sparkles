@@ -291,6 +291,7 @@ def linked(meta, package):
 # which are not at the top of the package
 BUNDLED_LICENSES = {
     "libmimalloc-sys": ["c_src/mimalloc/v3/LICENSE"],
+    "onig_sys": ["oniguruma/COPYING"],
 }
 
 
