@@ -75,6 +75,48 @@ fn fingerprints(paths: &[PathBuf]) -> Vec<Option<u64>> {
     paths.iter().map(|p| fingerprint(p)).collect()
 }
 
+/// The debounce state consumes observations, independently of thread scheduling.
+struct Debounce {
+    applied: Vec<Option<u64>>,
+    seen: Vec<Option<u64>>,
+    since: Instant,
+}
+
+impl Debounce {
+    fn new(initial: Vec<Option<u64>>, now: Instant) -> Self {
+        Self {
+            seen: initial.clone(),
+            applied: initial,
+            since: now,
+        }
+    }
+
+    fn observe(
+        &mut self,
+        current: Vec<Option<u64>>,
+        now: Instant,
+        settle: Duration,
+    ) -> Option<Vec<usize>> {
+        if current != self.seen {
+            self.seen = current;
+            self.since = now;
+            return None;
+        }
+        if self.seen == self.applied || now.saturating_duration_since(self.since) < settle {
+            return None;
+        }
+        let changed = self
+            .seen
+            .iter()
+            .zip(&self.applied)
+            .enumerate()
+            .filter_map(|(i, (seen, applied))| (seen != applied).then_some(i))
+            .collect();
+        self.applied.clone_from(&self.seen);
+        Some(changed)
+    }
+}
+
 /// Watch `paths` on a thread of its own and call `on_change` with the files that
 /// changed, once they have settled (see the module documentation).
 pub fn spawn(
@@ -85,31 +127,21 @@ pub fn spawn(
     let stop = Arc::new(AtomicBool::new(false));
     let flag = stop.clone();
     // the state to compare with is the one when this returns
-    let mut applied = fingerprints(&paths);
+    let applied = fingerprints(&paths);
     std::thread::Builder::new()
         .name("config-watch".into())
         .spawn(move || {
-            let mut seen = applied.clone();
-            let mut since = Instant::now();
+            let mut pending = Debounce::new(applied, Instant::now());
             loop {
                 std::thread::sleep(timing.interval);
                 if flag.load(Ordering::Relaxed) {
                     return;
                 }
-                let now = fingerprints(&paths);
-                if now != seen {
-                    seen = now;
-                    since = Instant::now();
-                    continue;
-                }
-                if seen != applied && since.elapsed() >= timing.settle {
-                    let changed: Vec<PathBuf> = paths
-                        .iter()
-                        .zip(seen.iter().zip(&applied))
-                        .filter(|(_, (a, b))| a != b)
-                        .map(|(p, _)| p.clone())
-                        .collect();
-                    applied = seen.clone();
+                if let Some(changed) =
+                    pending.observe(fingerprints(&paths), Instant::now(), timing.settle)
+                {
+                    let changed: Vec<PathBuf> =
+                        changed.into_iter().map(|i| paths[i].clone()).collect();
                     on_change(&changed);
                 }
             }
@@ -262,20 +294,58 @@ mod tests {
         let d = tempfile::tempdir().unwrap();
         let a = d.path().join("a.json");
         let b = d.path().join("b.json");
+        let paths = [a.clone(), b.clone()];
         std::fs::write(&a, "1").unwrap();
         std::fs::write(&b, "1").unwrap();
-        let (_w, calls) = watch(vec![a.clone(), b.clone()]);
-        // changes closer together than the settle time, across a poll or two
+        let start = Instant::now();
+        let mut pending = Debounce::new(fingerprints(&paths), start);
+        let mut last = start;
+        // A poll may see just one file of a multi-file update. Logical instants
+        // describe one burst without assuming the OS schedules sleeps on time.
         for i in 2..8 {
+            let observed = start + FAST.interval * (i - 1);
             std::fs::write(&a, i.to_string()).unwrap();
+            assert_eq!(
+                pending.observe(fingerprints(&paths), observed, FAST.settle),
+                None
+            );
             std::fs::write(&b, i.to_string()).unwrap();
-            std::thread::sleep(Duration::from_millis(5));
+            last = observed + Duration::from_millis(5);
+            assert_eq!(
+                pending.observe(fingerprints(&paths), last, FAST.settle),
+                None
+            );
         }
-        let c = expect_calls(&calls, 1);
-        assert_eq!(c[0], vec![a.clone(), b]);
-        // a later change is a second reload
+        assert_eq!(
+            pending.observe(
+                fingerprints(&paths),
+                last + FAST.settle - Duration::from_nanos(1),
+                FAST.settle
+            ),
+            None
+        );
+        assert_eq!(
+            pending.observe(fingerprints(&paths), last + FAST.settle, FAST.settle),
+            Some(vec![0, 1])
+        );
+        assert_eq!(
+            pending.observe(fingerprints(&paths), last + FAST.settle * 4, FAST.settle),
+            None
+        );
         std::fs::write(&a, "later").unwrap();
-        expect_calls(&calls, 2);
+        let later = last + FAST.settle * 5;
+        assert_eq!(
+            pending.observe(fingerprints(&paths), later, FAST.settle),
+            None
+        );
+        assert_eq!(
+            pending.observe(fingerprints(&paths), later + FAST.settle, FAST.settle),
+            Some(vec![0])
+        );
+        assert_eq!(
+            pending.observe(fingerprints(&paths), later + FAST.settle * 2, FAST.settle),
+            None
+        );
     }
 
     #[test]
@@ -283,9 +353,20 @@ mod tests {
         let d = tempfile::tempdir().unwrap();
         let a = d.path().join("a.json");
         std::fs::write(&a, "same").unwrap();
-        let (_w, calls) = watch(vec![a.clone()]);
+        let start = Instant::now();
+        let mut pending = Debounce::new(fingerprints(std::slice::from_ref(&a)), start);
         std::fs::write(&a, "same").unwrap();
-        // replaced by a rename, as editors do
+        assert_eq!(
+            pending.observe(
+                fingerprints(std::slice::from_ref(&a)),
+                start + FAST.settle * 4,
+                FAST.settle
+            ),
+            None
+        );
+        let (_w, calls) = watch(vec![a.clone()]);
+        // Publishing a fully written replacement is atomic. A non-atomic truncate
+        // paused longer than settle would legitimately be a separate change.
         let tmp = d.path().join("a.json.tmp");
         std::fs::write(&tmp, "same").unwrap();
         std::fs::rename(&tmp, &a).unwrap();
@@ -294,11 +375,25 @@ mod tests {
     }
 
     #[test]
+    fn a_change_needs_another_observation_even_without_a_settle_delay() {
+        let start = Instant::now();
+        let mut pending = Debounce::new(vec![Some(1)], start);
+        assert_eq!(pending.observe(vec![Some(2)], start, Duration::ZERO), None);
+        assert_eq!(
+            pending.observe(vec![Some(2)], start, Duration::ZERO),
+            Some(vec![0])
+        );
+        assert_eq!(pending.observe(vec![Some(2)], start, Duration::ZERO), None);
+    }
+
+    #[test]
     fn a_file_that_appears_or_goes_is_a_change() {
         let d = tempfile::tempdir().unwrap();
         let a = d.path().join("a.json");
         let (_w, calls) = watch(vec![a.clone()]);
-        std::fs::write(&a, "{}").unwrap();
+        let ready = d.path().join("ready.json");
+        std::fs::write(&ready, "{}").unwrap();
+        std::fs::rename(&ready, &a).unwrap();
         expect_calls(&calls, 1);
         std::fs::remove_file(&a).unwrap();
         expect_calls(&calls, 2);
