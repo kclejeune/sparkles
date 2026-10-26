@@ -191,6 +191,10 @@ existing memory records. Rust applications select them with
 `sparkles::evidence::profile(1)`. Unknown versions return `None`. The CLI can validate
 profile RDF with `sparkles shacl` and run the supplied queries with `sparkles query`.
 
+Rust configuration adapters can decode `sparkles_core::evidence::Settings` and obtain
+canonical bytes and a digest. These helpers enforce version and graph-set bounds but
+do not select an authoritative configuration or authorize managed writes.
+
 Rust importers can prepare typed batches with `sparkles_core::evidence::prepare_input`.
 It checks local content digests and retained text or JSON selectors within its bounds.
 The result keeps explicit requirements for references needing authorized runtime
