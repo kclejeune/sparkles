@@ -210,5 +210,42 @@ class LocalMacTestShells(unittest.TestCase):
                     self.assertNotIn("unexpected-workspace-tests", result.stdout)
 
 
+class StandaloneMacExample(unittest.TestCase):
+    def test_example_preserves_each_failure_and_parent_shell_limits(self):
+        blocks = re.findall(r"```sh\n(.*?)```", (ROOT / "docs/DEVELOPMENT.md").read_text(), re.S)
+        example = next(block for block in blocks if "keys_require_explicit_process_preparation" in block)
+        for failure, expected, stages in (
+            ("", 0, ["policy", "prepare", "nextest", "doctest"]),
+            ("policy", 19, ["policy"]),
+            ("prepare", 17, ["policy", "prepare"]),
+            ("nextest", 23, ["policy", "prepare", "nextest"]),
+            ("doctest", 29, ["policy", "prepare", "nextest", "doctest"]),
+        ):
+            with self.subTest(failure=failure), tempfile.TemporaryDirectory(prefix="sparkles-mac-example-") as directory:
+                calls = Path(directory) / "calls"
+                prefix = (
+                    'before_soft=$(ulimit -S -c); before_hard=$(ulimit -H -c)\n'
+                    'ulimit() { if [ "$*" = "-c 0" ]; then echo prepare >> "$CI_CALLS"; '
+                    'if [ "$CI_FAIL_STAGE" = prepare ]; then return 17; fi; fi; builtin ulimit "$@"; }\n'
+                    'mbx() { local stage status; '
+                    'if [[ "$*" == *keys_require_explicit_process_preparation* ]]; then stage=policy; status=19; '
+                    'elif [[ "$*" == *nextest* ]]; then stage=nextest; status=23; '
+                    'else stage=doctest; status=29; fi; '
+                    'echo "$stage" >> "$CI_CALLS"; '
+                    'if [ "$CI_FAIL_STAGE" = "$stage" ]; then return "$status"; fi; }\n'
+                )
+                suffix = (
+                    '\nresult=$?; '
+                    '[ "$(builtin ulimit -S -c)" = "$before_soft" ] && '
+                    '[ "$(builtin ulimit -H -c)" = "$before_hard" ] || exit 98; '
+                    'exit "$result"\n'
+                )
+                result = subprocess.run(["bash", "-c", prefix + example + suffix],
+                                        env=dict(os.environ, CI_CALLS=str(calls), CI_FAIL_STAGE=failure),
+                                        capture_output=True, text=True, timeout=10)
+                self.assertEqual(result.returncode, expected, result.stderr)
+                self.assertEqual(calls.read_text().splitlines(), stages)
+
+
 if __name__ == "__main__":
     unittest.main()

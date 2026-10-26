@@ -222,8 +222,9 @@ preparation applies to those child shells, not the caller's shell. For standalon
 workspace tests, use the same explicit host preparation:
 
 ```sh
-mbx test --locked -p sparkles-backup --features encryption --lib seal::memory::macos_tests::keys_require_explicit_process_preparation -- --exact
 (
+  set -e
+  mbx test --locked -p sparkles-backup --features encryption --lib seal::memory::macos_tests::keys_require_explicit_process_preparation -- --exact
   ulimit -c 0
   mbx nextest run --workspace --no-fail-fast
   mbx test --workspace --doc
