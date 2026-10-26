@@ -9,6 +9,7 @@
 //!   [`delta`]).
 //! * [`LocalVocab`] — per-query dictionary for computed terms.
 
+mod cold;
 pub mod delta;
 pub mod fsst;
 pub mod numeric;
@@ -2187,6 +2188,9 @@ pub fn add_numeric_column(dir: &Path) -> Result<u64> {
 pub struct AppendVocab {
     keys: Vec<Arc<[u8]>>,
     map: FxHashMap<Arc<[u8]>, u64>,
+    /// Cold readers use a fixed-fingerprint index rather than hashing payloads
+    /// during native HashMap growth. Ordinary live dictionaries keep `map`.
+    cold: Option<cold::Index>,
     /// total key length
     key_bytes: usize,
 }
@@ -2202,9 +2206,24 @@ impl AppendVocab {
         self.keys.get(id as usize).map(|k| &**k)
     }
     pub fn find(&self, key: &[u8]) -> Option<u64> {
+        if let Some(index) = &self.cold {
+            return index.find(&self.keys, key);
+        }
         self.map.get(key).copied()
     }
     pub fn insert(&mut self, key: &[u8]) -> (u64, bool) {
+        if let Some(index) = &mut self.cold {
+            let hash = cold::fingerprint(key);
+            if let Some(id) = index.find_hashed(&self.keys, key, hash) {
+                return (id, false);
+            }
+            let owned: Arc<[u8]> = key.into();
+            let id = self.keys.len() as u64;
+            self.key_bytes += owned.len();
+            index.insert(hash, id);
+            self.keys.push(owned);
+            return (id, true);
+        }
         if let Some(&i) = self.map.get(key) {
             return (i, false);
         }
@@ -2219,6 +2238,18 @@ impl AppendVocab {
     /// layers of a linked delta vocabulary are positional). A lookup by key finds the
     /// first position.
     pub(crate) fn push_dup(&mut self, key: &[u8]) {
+        if let Some(index) = &mut self.cold {
+            let hash = cold::fingerprint(key);
+            let existing = index.find_hashed(&self.keys, key, hash);
+            let owned: Arc<[u8]> = key.into();
+            let id = self.keys.len() as u64;
+            self.key_bytes += owned.len();
+            if existing.is_none() {
+                index.insert(hash, id);
+            }
+            self.keys.push(owned);
+            return;
+        }
         let k: Arc<[u8]> = key.into();
         let i = self.keys.len() as u64;
         self.key_bytes += k.len();
@@ -2235,7 +2266,23 @@ impl AppendVocab {
         budget: &mut crate::store::cold::ColdBudget<'_>,
     ) -> Result<(u64, bool)> {
         budget.check()?;
-        let existing = self.map.get(key).copied();
+        if self.cold.is_none() {
+            if !self.keys.is_empty()
+                || !self.map.is_empty()
+                || self.keys.capacity() != 0
+                || self.map.capacity() != 0
+            {
+                return Err(crate::Error::invalid(
+                    "controlled dictionary construction needs a fresh dictionary",
+                ));
+            }
+            self.cold = Some(cold::Index::default());
+        }
+        let (hash, existing) = self
+            .cold
+            .as_ref()
+            .unwrap()
+            .find_controlled(&self.keys, key, budget)?;
         if !positional && let Some(id) = existing {
             return Ok((id, false));
         }
@@ -2245,45 +2292,20 @@ impl AppendVocab {
             .checked_add(1)
             .ok_or_else(|| budget.exhausted())?;
         budget.reserve(&mut self.keys, need)?;
-        if existing.is_none() && self.map.len() == self.map.capacity() {
-            let capacity = self.map.capacity() as u64;
-            let old = capacity
-                .saturating_mul(128)
-                .saturating_add(u64::from(capacity != 0) * 1024);
-            let next = capacity
-                .checked_add(1)
-                .and_then(|n| n.checked_mul(4 * 128))
-                .and_then(|n| n.checked_add(1024))
-                .ok_or_else(|| budget.exhausted())?;
-            budget.charge(next)?;
-            if self
-                .map
-                .try_reserve(self.map.capacity().saturating_add(1))
-                .is_err()
-            {
-                budget.release(next);
-                return Err(budget.exhausted());
-            }
-            let actual = (self.map.capacity() as u64)
-                .saturating_mul(128)
-                .saturating_add(1024);
-            assert!(
-                actual <= next,
-                "cold map exceeded its sparse allocation allowance"
-            );
-            budget.release(old.saturating_add(next - actual));
-        }
         let bytes = (key.len() as u64)
             .checked_add(64)
             .ok_or_else(|| budget.exhausted())?;
         budget.charge(bytes)?;
-        let owned: Arc<[u8]> = key.into();
+        let owned = cold::copy_controlled(key, budget)?;
         let id = self.keys.len() as u64;
-        self.key_bytes += owned.len();
-        self.keys.push(owned.clone());
         if existing.is_none() {
-            self.map.insert(owned, id);
+            self.cold
+                .as_mut()
+                .unwrap()
+                .insert_controlled(hash, id, budget)?;
         }
+        self.key_bytes += owned.len();
+        self.keys.push(owned);
         budget.check()?;
         Ok((id, true))
     }
@@ -2291,8 +2313,14 @@ impl AppendVocab {
     pub(crate) fn cold_bytes(&self) -> u64 {
         (self.keys.capacity() as u64)
             .saturating_mul(std::mem::size_of::<Arc<[u8]>>() as u64)
-            .saturating_add((self.map.capacity() as u64).saturating_mul(128))
-            .saturating_add(u64::from(!self.map.is_empty()) * 1024)
+            .saturating_add(self.cold.as_ref().map_or_else(
+                || {
+                    (self.map.capacity() as u64)
+                        .saturating_mul(128)
+                        .saturating_add(u64::from(!self.map.is_empty()) * 1024)
+                },
+                cold::Index::bytes,
+            ))
             .saturating_add(self.key_bytes as u64)
             .saturating_add((self.keys.len() as u64).saturating_mul(64))
     }
@@ -2303,9 +2331,12 @@ impl AppendVocab {
             let k = self.keys.pop().expect("longer than n");
             self.key_bytes -= k.len();
             let i = self.keys.len() as u64;
-            if self.map.get(&k) == Some(&i) {
+            if self.cold.is_none() && self.map.get(&k) == Some(&i) {
                 self.map.remove(&k);
             }
+        }
+        if let Some(index) = &mut self.cold {
+            index.truncate(n);
         }
     }
     pub fn iter(&self) -> impl Iterator<Item = (u64, &[u8])> {

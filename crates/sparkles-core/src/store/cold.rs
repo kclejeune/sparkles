@@ -17,11 +17,15 @@ const CHUNK: usize = 64 << 10;
 // has no compressed payloads. This covers sparse JSON nodes, vector relocation,
 // decoded strings and conversion from Value into the closed metadata structures.
 const JSON_PARSE_BYTES_PER_INPUT: u64 = 128;
+#[cfg(test)]
+type KeyObserver<'a> = &'a dyn Fn(&str, usize);
 
 pub(crate) struct ColdBudget<'a> {
     limit: ReadLimit<'a>,
     used: u64,
     peak: u64,
+    #[cfg(test)]
+    key_observer: Option<KeyObserver<'a>>,
 }
 
 pub(crate) struct Loaded<T> {
@@ -36,11 +40,26 @@ impl<'a> ColdBudget<'a> {
             limit,
             used: 0,
             peak: 0,
+            #[cfg(test)]
+            key_observer: None,
         })
     }
 
     pub(crate) fn check(&self) -> Result<()> {
         self.limit.check(self.used)
+    }
+
+    pub(crate) fn key_step(&self, _stage: &str, _at: usize) -> Result<()> {
+        #[cfg(test)]
+        if let Some(observer) = self.key_observer {
+            observer(_stage, _at);
+        }
+        self.check()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn observe_keys(&mut self, observer: KeyObserver<'a>) {
+        self.key_observer = Some(observer);
     }
 
     pub(crate) fn used(&self) -> u64 {

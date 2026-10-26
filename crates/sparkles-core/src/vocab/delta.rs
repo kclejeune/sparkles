@@ -693,6 +693,24 @@ impl DeltaVocab {
         })
     }
 
+    /// Test support for observing the actual closed cold-reader allocation path.
+    #[doc(hidden)]
+    #[cfg(feature = "failpoints")]
+    pub fn open_read_only_limited_for_test(
+        path: &Path,
+        options: &crate::history::HistoryOptions,
+        memory: u64,
+    ) -> Result<(DeltaVocab, u64)> {
+        let limit = crate::history::ReadLimit {
+            options,
+            memory: Some(memory),
+            held: 0,
+        };
+        let mut budget = crate::store::cold::ColdBudget::new(limit)?;
+        let loaded = Self::open_read_only_controlled(path, &mut budget)?;
+        Ok((loaded.value, loaded.charge))
+    }
+
     /// The delta vocabulary of the generation being written. Nothing in the file
     /// changes until the first write or [`settle`](Self::settle).
     pub fn open(path: &Path) -> Result<DeltaVocab> {

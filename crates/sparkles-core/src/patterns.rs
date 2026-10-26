@@ -1036,23 +1036,23 @@ impl Loaded {
                 missing: None,
             },
             Ok(None) => {
-                let why = match info {
+                let why: Arc<str> = match info {
                     Some(PatternInfo {
                         skipped: Some(why), ..
-                    }) => why.clone(),
+                    }) => Arc::from(why.as_str()),
                     Some(i) if i.format > 0 => {
                         tracing::warn!(
                             target: "sparkles::store",
                             "{}: {FILE} is missing; queries read the permutations instead",
                             dir.display()
                         );
-                        format!("{FILE} is missing")
+                        format!("{FILE} is missing").into()
                     }
-                    _ => "the generation was built without predicate patterns".to_string(),
+                    _ => "the generation was built without predicate patterns".into(),
                 };
                 Loaded {
                     file: None,
-                    missing: Some(why.into()),
+                    missing: Some(why),
                 }
             }
             Err(e) => {
