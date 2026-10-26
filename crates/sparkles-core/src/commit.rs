@@ -1123,7 +1123,7 @@ pub(crate) fn walk_catalog_controlled(
     let mut reader = BufReader::with_capacity(capacity as usize, file);
     let result = (|| {
         let mut record = [0; REC];
-        match reader.read_exact(&mut record) {
+        match reader.read_exact(&mut record[..12]) {
             Ok(()) => {}
             Err(error) if error.kind() == std::io::ErrorKind::UnexpectedEof => return Ok(None),
             Err(error) => return Err(error.into()),
@@ -1138,6 +1138,12 @@ pub(crate) fn walk_catalog_controlled(
                 None,
             )?;
         }
+        match reader.read_exact(&mut record[12..]) {
+            Ok(()) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::UnexpectedEof => return Ok(None),
+            Err(error) => return Err(error.into()),
+        }
+        budget.check()?;
         let Some((id, first)) = decode_header(&record) else {
             return Ok(None);
         };
@@ -1780,29 +1786,47 @@ mod tests {
         use crate::store::cold::ColdBudget;
         let root = tempfile::tempdir().unwrap();
         let path = root.path().join("commits.bin");
-        let mut bytes = encode_header(uuid::Uuid::new_v4(), 10);
-        bytes[8..12].copy_from_slice(&99u32.to_le_bytes());
-        let checksum = crc32(&[&bytes[..60]]);
-        bytes[60..].copy_from_slice(&checksum.to_le_bytes());
-        std::fs::write(&path, bytes).unwrap();
+        let id = uuid::Uuid::new_v4();
         let options = HistoryOptions::default();
-        let mut budget = ColdBudget::new(ReadLimit {
-            options: &options,
-            memory: Some(4096),
-            held: 0,
-        })
-        .unwrap();
-        let mut visits = 0;
-        assert!(matches!(
-            walk_catalog_controlled(&path, &mut budget, |_, _| {
-                visits += 1;
-                Ok(())
-            }),
-            Err(Error::Unsupported(_))
-        ));
-        assert_eq!(visits, 0);
-        assert_eq!(budget.used(), 0);
-        assert_eq!(std::fs::read(&path).unwrap(), bytes);
+        for version in [1u32, 99] {
+            for len in [0, 7, 8, 11, 12, 13, 31, 32, REC - 1, REC] {
+                for known_magic in [true, false] {
+                    let mut bytes = encode_header(id, 10);
+                    bytes[8..12].copy_from_slice(&version.to_le_bytes());
+                    if !known_magic {
+                        bytes[0] ^= 1;
+                    }
+                    let checksum = crc32(&[&bytes[..60]]);
+                    bytes[60..].copy_from_slice(&checksum.to_le_bytes());
+                    let bytes = &bytes[..len];
+                    std::fs::write(&path, bytes).unwrap();
+                    let mut budget = ColdBudget::new(ReadLimit {
+                        options: &options,
+                        memory: Some(4096),
+                        held: 0,
+                    })
+                    .unwrap();
+                    let mut visits = 0;
+                    let result = walk_catalog_controlled(&path, &mut budget, |_, _| {
+                        visits += 1;
+                        Ok(())
+                    });
+                    if known_magic && version == 99 && len >= 12 {
+                        assert!(
+                            matches!(result, Err(Error::Unsupported(_))),
+                            "recognizable future catalog prefix must refuse: len={len}, result={result:?}"
+                        );
+                    } else if known_magic && version == 1 && len == REC {
+                        assert_eq!(result.unwrap(), Some((id, 10, None)));
+                    } else {
+                        assert_eq!(result.unwrap(), None);
+                    }
+                    assert_eq!(visits, 0);
+                    assert_eq!(budget.used(), 0);
+                    assert_eq!(std::fs::read(&path).unwrap(), bytes);
+                }
+            }
+        }
     }
 
     fn sample_commit(seq: u64) -> CommitInfo {

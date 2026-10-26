@@ -506,11 +506,12 @@ pub(crate) fn seqs_controlled(
         let mut reader = loaded.value;
         let mut header = [0; HEADER];
         let result: Result<Option<Vec<u64>>> = (|| {
-            match reader.read_exact(&mut header) {
+            match reader.read_exact(&mut header[..12]) {
                 Ok(()) => {}
                 Err(error) if error.kind() == std::io::ErrorKind::UnexpectedEof => return Ok(None),
                 Err(error) => return Err(error.into()),
             }
+            budget.check()?;
             if &header[..8] == MAGIC {
                 crate::formats::ANNOTATIONS.check(
                     "retained commit annotations",
@@ -518,6 +519,12 @@ pub(crate) fn seqs_controlled(
                     None,
                 )?;
             }
+            match reader.read_exact(&mut header[12..]) {
+                Ok(()) => {}
+                Err(error) if error.kind() == std::io::ErrorKind::UnexpectedEof => return Ok(None),
+                Err(error) => return Err(error.into()),
+            }
+            budget.check()?;
             if decode_header(&header).map(|h| h.0) != Some(dataset_id) {
                 return Ok(None);
             }
@@ -673,23 +680,44 @@ mod tests {
             store::cold::ColdBudget,
         };
         let root = tempfile::tempdir().unwrap();
+        let path = root.path().join(FILE);
         let id = uuid::Uuid::new_v4();
-        let mut bytes = encode_header(id, 0);
-        bytes[8..12].copy_from_slice(&99u32.to_le_bytes());
-        std::fs::write(root.path().join(FILE), bytes).unwrap();
         let options = HistoryOptions::default();
-        let mut budget = ColdBudget::new(ReadLimit {
-            options: &options,
-            memory: Some(4096),
-            held: 0,
-        })
-        .unwrap();
-        assert!(matches!(
-            seqs_controlled(root.path(), id, &mut budget),
-            Err(Error::Unsupported(_))
-        ));
-        assert_eq!(budget.used(), 0);
-        assert_eq!(std::fs::read(root.path().join(FILE)).unwrap(), bytes);
+        for version in [1u32, 99] {
+            for len in [0, 7, 8, 11, 12, 13, HEADER - 1, HEADER] {
+                for known_magic in [true, false] {
+                    let mut bytes = encode_header(id, 0);
+                    bytes[8..12].copy_from_slice(&version.to_le_bytes());
+                    if !known_magic {
+                        bytes[0] ^= 1;
+                    }
+                    let bytes = &bytes[..len];
+                    std::fs::write(&path, bytes).unwrap();
+                    let mut budget = ColdBudget::new(ReadLimit {
+                        options: &options,
+                        memory: Some(4096),
+                        held: 0,
+                    })
+                    .unwrap();
+                    let result = seqs_controlled(root.path(), id, &mut budget);
+                    if known_magic && version == 99 && len >= 12 {
+                        assert!(
+                            matches!(result, Err(Error::Unsupported(_))),
+                            "recognizable future annotation prefix must refuse: len={len}"
+                        );
+                    } else {
+                        let loaded = result.unwrap();
+                        assert_eq!(
+                            loaded.value,
+                            (known_magic && version == 1 && len == HEADER).then(Vec::new)
+                        );
+                        assert_eq!(loaded.charge, 0);
+                    }
+                    assert_eq!(budget.used(), 0);
+                    assert_eq!(std::fs::read(&path).unwrap(), bytes);
+                }
+            }
+        }
     }
 
     #[test]
