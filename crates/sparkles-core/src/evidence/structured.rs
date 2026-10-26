@@ -460,6 +460,106 @@ mod tests {
     }
 
     #[test]
+    fn iterative_selection_agrees_with_an_independent_value_pointer_walk() {
+        fn document(seed: u64, depth: usize) -> serde_json::Value {
+            use serde_json::{Value, json};
+            if depth == 0 {
+                return match seed % 5 {
+                    0 => Value::Null,
+                    1 => json!(seed.is_multiple_of(2)),
+                    2 => json!(seed % 100_000),
+                    3 => json!(format!("Café/{seed}~\n\"")),
+                    _ => json!(format!("e\u{301}🚀{seed}")),
+                };
+            }
+            if seed.is_multiple_of(2) {
+                Value::Array(
+                    (0..3)
+                        .map(|index| document(seed.wrapping_mul(17).wrapping_add(index), depth - 1))
+                        .collect(),
+                )
+            } else {
+                let keys = ["", "a/b", "m~n", "\"\\", "🚀", "\0"];
+                Value::Object(
+                    (0..3)
+                        .map(|index| {
+                            let key = keys[(seed as usize + index) % keys.len()];
+                            (
+                                key.to_owned(),
+                                document(
+                                    seed.wrapping_mul(13).wrapping_add(index as u64),
+                                    depth - 1,
+                                ),
+                            )
+                        })
+                        .collect(),
+                )
+            }
+        }
+        fn paths(value: &serde_json::Value, path: String, result: &mut Vec<String>) {
+            result.push(path.clone());
+            match value {
+                serde_json::Value::Array(array) => {
+                    for (index, child) in array.iter().enumerate() {
+                        paths(child, format!("{path}/{index}"), result);
+                    }
+                }
+                serde_json::Value::Object(object) => {
+                    for (key, child) in object {
+                        let token = key.replace('~', "~0").replace('/', "~1");
+                        paths(child, format!("{path}/{token}"), result);
+                    }
+                }
+                _ => {}
+            }
+        }
+        for seed in 0..16 {
+            let value = document(seed, 3);
+            let mut pointers = Vec::new();
+            paths(&value, String::new(), &mut pointers);
+            for source in [
+                serde_json::to_string(&value).unwrap(),
+                serde_json::to_string_pretty(&value).unwrap(),
+            ] {
+                for pointer in &pointers {
+                    let selected = selected(&source, pointer);
+                    let actual: serde_json::Value = serde_json::from_str(selected.utf8).unwrap();
+                    assert_eq!(
+                        Some(&actual),
+                        value.pointer(pointer),
+                        "seed {seed}, pointer {pointer:?}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn checked_json_reads_preserve_cancellation_and_deadline_errors() {
+        let control = Control::none();
+        let mut reader = ControlledRead {
+            bytes: b"true",
+            until_check: 0,
+            control: &control,
+            failure: None,
+        };
+        let mut one = [0];
+        assert_eq!(reader.read(&mut one).unwrap(), 1);
+        control.cancel.cancel();
+        reader.until_check = 0;
+        assert!(reader.read(&mut one).is_err());
+        assert!(matches!(reader.failure, Some(Error::Cancelled)));
+        let control = Control {
+            deadline: Some(std::time::Instant::now()),
+            ..Control::none()
+        };
+        assert!(matches!(
+            select_json_lexical_utf8("{}", "", &control),
+            Err(Error::Timeout)
+        ));
+    }
+
+    #[test]
     fn reference_nesting_memory_input_and_control_bounds_are_enforced() {
         let at_limit = format!(
             "{}0{}",

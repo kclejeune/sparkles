@@ -206,7 +206,8 @@ pub fn prepare_input<'a>(input: &'a EvidenceInput, control: &Control) -> Result<
             PreparedContent { digest, retained },
         );
     }
-    for passage in &input.passages {
+    let mut passage_groups: BTreeMap<usize, PassageGroup> = BTreeMap::new();
+    for (passage_index, passage) in input.passages.iter().enumerate() {
         preparation.start(RecordKind::Passage, passage.key.as_str())?;
         preparation.reference(&passage.revision, &[RecordKind::SourceRevision])?;
         preparation.reference(&passage.rendition, &[RecordKind::Rendition])?;
@@ -219,7 +220,8 @@ pub fn prepare_input<'a>(input: &'a EvidenceInput, control: &Control) -> Result<
         preparation.digest(passage.text_digest)?;
         preparation.optional_text(passage.quote.as_deref())?;
         if let RecordRef::Local(key) = &passage.rendition {
-            let rendition = &input.renditions[preparation.local_index(key)];
+            let rendition_index = preparation.local_index(key);
+            let rendition = &input.renditions[rendition_index];
             if rendition.revision != passage.revision {
                 preparation
                     .requirements
@@ -228,19 +230,10 @@ pub fn prepare_input<'a>(input: &'a EvidenceInput, control: &Control) -> Result<
                     });
             }
             match &rendition.content {
-                RenditionContent::NormalizedText(text) => {
-                    let selected = selected_text(text, passage.start, passage.end, control)?;
-                    if passage
-                        .quote
-                        .as_deref()
-                        .is_some_and(|quote| quote != selected)
-                        || Sha256Digest::of_bytes(selected.as_bytes(), control)?
-                            != passage.text_digest
-                    {
-                        return Err(Error::invalid(
-                            "span-mismatch: quote or text digest does not match",
-                        ));
-                    }
+                RenditionContent::NormalizedText(_) => {
+                    let group = passage_groups.entry(rendition_index).or_default();
+                    group.passages.push(passage_index);
+                    group.offsets.extend([passage.start, passage.end]);
                 }
                 _ => preparation
                     .requirements
@@ -251,11 +244,17 @@ pub fn prepare_input<'a>(input: &'a EvidenceInput, control: &Control) -> Result<
         } else {
             preparation
                 .requirements
+                .push(ResolutionRequirement::PassageIdentity {
+                    passage_key: passage.key.as_str().into(),
+                });
+            preparation
+                .requirements
                 .push(ResolutionRequirement::RetainedPassage {
                     passage_key: passage.key.as_str().into(),
                 });
         }
     }
+    verify_local_passages(input, passage_groups, control)?;
     for reference in &input.references {
         preparation.start(RecordKind::EvidenceRef, reference.key.as_str())?;
         preparation.text(reference.occurrence_key.as_str())?;
@@ -313,6 +312,12 @@ pub fn prepare_input<'a>(input: &'a EvidenceInput, control: &Control) -> Result<
                             },
                         );
                     }
+                } else {
+                    preparation.requirements.push(
+                        ResolutionRequirement::PassageReferenceIdentity {
+                            reference_key: reference.key.as_str().into(),
+                        },
+                    );
                 }
             }
             EvidenceRefTarget::Structured {
@@ -606,32 +611,91 @@ fn normalize_time(value: &Literal) -> Result<NormalizedSourceTime> {
     })
 }
 
-fn selected_text<'a>(text: &'a str, start: u64, end: u64, control: &Control) -> Result<&'a str> {
-    let mut beginning = None;
-    let mut ending = None;
+#[cfg(test)]
+std::thread_local! {
+    pub(super) static PASSAGE_CHARACTER_VISITS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+#[derive(Default)]
+struct PassageGroup {
+    passages: Vec<usize>,
+    offsets: Vec<u64>,
+}
+
+fn verify_local_passages(
+    input: &EvidenceInput,
+    groups: BTreeMap<usize, PassageGroup>,
+    control: &Control,
+) -> Result<()> {
+    for (rendition, mut group) in groups {
+        control.check()?;
+        let RenditionContent::NormalizedText(text) = &input.renditions[rendition].content else {
+            unreachable!("only normalized local renditions are grouped");
+        };
+        group.offsets.sort_unstable();
+        group.offsets.dedup();
+        let positions = locate_boundaries(text, &group.offsets, control)?;
+        let mut digests = BTreeMap::new();
+        for index in group.passages {
+            control.check()?;
+            let passage = &input.passages[index];
+            let start = positions[group
+                .offsets
+                .binary_search(&passage.start)
+                .expect("start was grouped")];
+            let end = positions[group
+                .offsets
+                .binary_search(&passage.end)
+                .expect("end was grouped")];
+            let selected = &text[start..end];
+            let digest = match digests.entry((start, end)) {
+                std::collections::btree_map::Entry::Occupied(entry) => *entry.get(),
+                std::collections::btree_map::Entry::Vacant(entry) => {
+                    *entry.insert(Sha256Digest::of_bytes(selected.as_bytes(), control)?)
+                }
+            };
+            if passage
+                .quote
+                .as_deref()
+                .is_some_and(|quote| quote != selected)
+                || digest != passage.text_digest
+            {
+                return Err(Error::invalid(
+                    "span-mismatch: quote or text digest does not match",
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
+fn locate_boundaries(text: &str, offsets: &[u64], control: &Control) -> Result<Vec<usize>> {
+    let mut positions = Vec::with_capacity(offsets.len());
     let mut count = 0u64;
     for (byte, _) in text.char_indices() {
+        #[cfg(test)]
+        PASSAGE_CHARACTER_VISITS.with(|visits| visits.set(visits.get() + 1));
         if count.is_multiple_of(16_384) {
             control.check()?;
         }
-        if count == start {
-            beginning = Some(byte);
-        }
-        if count == end {
-            ending = Some(byte);
-            break;
+        if offsets.get(positions.len()) == Some(&count) {
+            positions.push(byte);
+            if positions.len() == offsets.len() {
+                return Ok(positions);
+            }
         }
         count += 1;
     }
-    if ending.is_none() && count == end {
-        ending = Some(text.len());
+    if offsets.get(positions.len()) == Some(&count) {
+        positions.push(text.len());
     }
-    match (beginning, ending) {
-        (Some(start), Some(end)) => Ok(&text[start..end]),
-        _ => Err(Error::invalid(
+    if positions.len() != offsets.len() {
+        return Err(Error::invalid(
             "span-mismatch: selector exceeds normalized text",
-        )),
+        ));
     }
+    control.check()?;
+    Ok(positions)
 }
 
 fn has_blank(triple: &Triple) -> bool {

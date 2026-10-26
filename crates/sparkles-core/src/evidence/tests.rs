@@ -627,3 +627,174 @@ fn known_json_encoding_verifies_only_exact_local_retained_values() {
     };
     assert!(prepare_input(&input, &Control::none()).is_err());
 }
+
+#[test]
+fn unresolved_passage_coordinates_always_have_explicit_identity_requirements() {
+    let mut input = sample();
+    input.references[0].target = EvidenceRefTarget::Passage {
+        revision: local("revision"),
+        rendition: local("text"),
+        passage: RecordRef::Existing(node("urn:passage-from-another-revision")),
+    };
+    let prepared = prepare_input(&input, &Control::none()).unwrap();
+    assert!(
+        prepared
+            .requirements()
+            .contains(&ResolutionRequirement::PassageReferenceIdentity {
+                reference_key: "reference".into(),
+            })
+    );
+}
+
+#[test]
+fn unresolved_rendition_coordinates_always_have_explicit_identity_requirements() {
+    let mut input = sample();
+    input.references[0].target = EvidenceRefTarget::Passage {
+        revision: local("revision"),
+        rendition: RecordRef::Existing(node("urn:rendition-from-another-revision")),
+        passage: local("passage"),
+    };
+    input.passages[0].rendition = RecordRef::Existing(node("urn:rendition-from-another-revision"));
+    let prepared = prepare_input(&input, &Control::none()).unwrap();
+    assert!(
+        prepared
+            .requirements()
+            .contains(&ResolutionRequirement::PassageIdentity {
+                passage_key: "passage".into(),
+            })
+    );
+}
+
+#[test]
+fn many_passages_visit_each_rendition_character_at_most_once() {
+    let mut input = sample();
+    let text = "é🚀".repeat(2048);
+    input.renditions[0].content = RenditionContent::NormalizedText(text.clone());
+    let template = input.passages[0].clone();
+    input.passages = (0..128)
+        .map(|index| {
+            let mut passage = template.clone();
+            passage.key = key(&if index == 0 {
+                "passage".into()
+            } else {
+                format!("passage/{index}")
+            });
+            passage.occurrence_key = key(&format!("selected/{index}"));
+            passage.start = 4096 - 32 + index % 32;
+            passage.end = passage.start + 1;
+            let quote = if passage.start.is_multiple_of(2) {
+                "é"
+            } else {
+                "🚀"
+            };
+            passage.quote = Some(quote.into());
+            passage.text_digest = digest(quote.as_bytes());
+            passage
+        })
+        .collect();
+    super::prepare::PASSAGE_CHARACTER_VISITS.with(|visits| visits.set(0));
+    assert!(
+        prepare_input(&input, &Control::none())
+            .unwrap()
+            .requirements()
+            .is_empty()
+    );
+    let visits = super::prepare::PASSAGE_CHARACTER_VISITS.with(std::cell::Cell::get);
+    assert!(
+        visits <= text.chars().count(),
+        "visited {visits} characters for one 4096-code-point rendition"
+    );
+}
+
+#[test]
+fn overdeep_native_claims_and_stored_facts_return_an_error_before_cloning() {
+    const CHILD: &str = "SPARKLES_C25_DEEP_NATIVE_CHILD";
+    if let Ok(kind) = std::env::var(CHILD) {
+        std::thread::Builder::new()
+            .stack_size(128 * 1024)
+            .spawn(move || {
+                let mut term: Term = Literal::new_simple_literal("leaf").into();
+                for _ in 0..40_000 {
+                    term = Triple::new(
+                        node("urn:nested-subject"),
+                        node("urn:nested-predicate"),
+                        term,
+                    )
+                    .into();
+                }
+                let expected = Triple::new(node("urn:s"), node("urn:p"), term);
+                let mut input = sample();
+                if kind == "claim" {
+                    input.claims[0].proposition = expected;
+                } else {
+                    input.references[0].target = EvidenceRefTarget::StoredFact(StoredFactRef {
+                        dataset: Uuid::nil(),
+                        branch: Uuid::nil(),
+                        commit: 1,
+                        graph: GraphIdentity::Default,
+                        expected,
+                        anchor: None,
+                    });
+                }
+                let refused = matches!(
+                    prepare_input(&input, &Control::none()),
+                    Err(Error::Invalid(_))
+                );
+                // Native RDF structures deliberately exceed their safe drop depth. The
+                // isolated test process owns them until exit rather than recursively dropping.
+                std::mem::forget(input);
+                assert!(refused);
+            })
+            .unwrap()
+            .join()
+            .unwrap();
+        return;
+    }
+    for kind in ["claim", "fact"] {
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", "evidence::tests::overdeep_native_claims_and_stored_facts_return_an_error_before_cloning", "--nocapture"])
+            .env(CHILD, kind).output().unwrap();
+        assert!(
+            output.status.success(),
+            "{kind} input aborted: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+}
+
+#[test]
+fn grouped_selectors_preserve_input_order_overlap_duplicates_and_unicode_eof() {
+    let mut input = sample();
+    input.renditions[0].content = RenditionContent::NormalizedText("aé🚀z".into());
+    let template = input.passages[0].clone();
+    input.passages = [(2, 4, "🚀z"), (0, 2, "aé"), (1, 3, "é🚀"), (2, 4, "🚀z")]
+        .into_iter()
+        .enumerate()
+        .map(|(index, (start, end, quote))| {
+            let mut passage = template.clone();
+            passage.key = key(&if index == 0 {
+                "passage".into()
+            } else {
+                format!("passage/{index}")
+            });
+            passage.occurrence_key = key(&format!("selected/{index}"));
+            passage.start = start;
+            passage.end = end;
+            passage.quote = Some(quote.into());
+            passage.text_digest = digest(quote.as_bytes());
+            passage
+        })
+        .collect();
+    let prepared = prepare_input(&input, &Control::none()).unwrap();
+    assert_eq!(prepared.input().passages[0].start, 2);
+    assert_eq!(prepared.input().passages[1].start, 0);
+    assert!(prepared.requirements().is_empty());
+    let mut changed = input.clone();
+    changed.passages[3].text_digest = digest(b"incorrect duplicate-range digest");
+    assert!(prepare_input(&changed, &Control::none()).is_err());
+    let mut changed = input.clone();
+    changed.passages[0].end = 5;
+    assert!(prepare_input(&changed, &Control::none()).is_err());
+    input.renditions[0].content = RenditionContent::NormalizedText(String::new());
+    assert!(prepare_input(&input, &Control::none()).is_err());
+}
