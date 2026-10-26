@@ -6,6 +6,7 @@ use crate::shapes::{Constraint, ShapeId, Shapes};
 use anyhow::{Result, bail};
 use oxrdf::Term;
 use rustc_hash::FxHashSet;
+use sparkles_core::sparql::value::Value;
 
 type Control<'a> = &'a mut dyn FnMut() -> Result<()>;
 
@@ -14,6 +15,8 @@ type Control<'a> = &'a mut dyn FnMut() -> Result<()>;
 /// `check` consumes one unit for a structural step or 128 lexical bytes. It can
 /// reject a cumulative budget or cancellation. An error discards the whole layout.
 /// This controls layout preparation, not the physical reader or shape parser.
+/// Repeated matching composite range bounds refuse before the uncontrolled CDT
+/// comparison parser. A first composite bound only stores admitted metadata.
 pub fn form_layout_with(
     shapes: &Shapes,
     node_shapes: &[ShapeId],
@@ -192,6 +195,37 @@ impl Controlled<'_, '_> {
     }
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum CompositeKind {
+    List,
+    Map,
+}
+
+fn composite_kind(value: &Value) -> Option<CompositeKind> {
+    let Value::Other { dt, .. } = value else {
+        return None;
+    };
+    match dt.as_ref() {
+        sparkles_core::sparql::cdt::LIST => Some(CompositeKind::List),
+        sparkles_core::sparql::cdt::MAP => Some(CompositeKind::Map),
+        _ => None,
+    }
+}
+
+// None is an empty slot; Some(None) retains a non-composite bound. Comparisons
+// with a different kind are type errors, so the ordinary merge keeps that slot.
+fn admit_range(value: &Value, retained: &mut Option<Option<CompositeKind>>) -> Result<()> {
+    let incoming = composite_kind(value);
+    match retained {
+        None => *retained = Some(incoming),
+        Some(Some(old)) if Some(*old) == incoming => {
+            bail!("composite range comparison is not admitted by controlled form preparation");
+        }
+        _ => {}
+    }
+    Ok(())
+}
+
 fn admit_property(
     shapes: &Shapes,
     index: ShapeId,
@@ -227,6 +261,15 @@ fn admit_property(
         .and_then(|f| f.constraints.allowed.as_deref())
         .map(Allowed::Terms);
     let mut languages = previous.and_then(|f| f.constraints.language_in.as_deref());
+    let mut ranges = previous.map_or([None; 4], |field| {
+        [
+            field.constraints.min_inclusive.as_ref(),
+            field.constraints.min_exclusive.as_ref(),
+            field.constraints.max_inclusive.as_ref(),
+            field.constraints.max_exclusive.as_ref(),
+        ]
+        .map(|bound| bound.map(|bound| composite_kind(&bound.value)))
+    });
     for constraint in &shape.constraints {
         check()?;
         match constraint {
@@ -278,14 +321,24 @@ fn admit_property(
                         }
                     }
                 }
-                // The intersection is a subset of this list, so its borrowed
-                // source is a conservative bound for the next intersection.
-                allowed = Some(Allowed::Indices(values));
+                // Legacy intersections retain matching duplicates from the old
+                // list. A later singleton cannot bound its retained multiplicity.
+                if allowed.is_none() {
+                    allowed = Some(Allowed::Indices(values));
+                }
             }
-            Constraint::MinInclusive(t, _)
-            | Constraint::MinExclusive(t, _)
-            | Constraint::MaxInclusive(t, _)
-            | Constraint::MaxExclusive(t, _) => {
+            Constraint::MinInclusive(t, value)
+            | Constraint::MinExclusive(t, value)
+            | Constraint::MaxInclusive(t, value)
+            | Constraint::MaxExclusive(t, value) => {
+                let slot = match constraint {
+                    Constraint::MinInclusive(..) => 0,
+                    Constraint::MinExclusive(..) => 1,
+                    Constraint::MaxInclusive(..) => 2,
+                    Constraint::MaxExclusive(..) => 3,
+                    _ => unreachable!(),
+                };
+                admit_range(value, &mut ranges[slot])?;
                 // Bound stores both the source term and its parsed value.
                 term(t, check, 0)?;
                 term(t, check, 0)?;
@@ -336,9 +389,27 @@ fn admit_property(
                         }
                     }
                 }
-                languages = Some(tags);
+                if languages.is_none() {
+                    languages = Some(tags);
+                }
             }
-            Constraint::Node(node) => term(&shapes.shapes()[*node].node, check, 0)?,
+            Constraint::Node(node) => {
+                let value = &shapes.shapes()[*node].node;
+                term(value, check, 0)?;
+                if let Some(previous) = previous {
+                    for old in &previous.constraints.node {
+                        term(value, check, 0)?;
+                        term(old, check, 0)?;
+                    }
+                }
+                for other in &shape.constraints {
+                    check()?;
+                    if let Constraint::Node(other) = other {
+                        term(value, check, 0)?;
+                        term(&shapes.shapes()[*other].node, check, 0)?;
+                    }
+                }
+            }
             Constraint::Component(component) => {
                 let iri = component.component.iri.as_str();
                 lexical(iri, check)?;

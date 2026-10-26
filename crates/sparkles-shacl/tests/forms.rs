@@ -167,6 +167,133 @@ fn controlled_layout_handles_cycles_and_repeated_allowed_value_intersections() {
     );
 }
 
+fn controlled_with_allowance(
+    shapes: &Shapes,
+    selected: &[sparkles_shacl::shapes::ShapeId],
+    allowance: usize,
+) -> anyhow::Result<sparkles_shacl::form::FormLayout> {
+    let mut work = 0;
+    form_layout_with(shapes, selected, &mut || {
+        work += 1;
+        anyhow::ensure!(work <= allowance, "layout allowance exhausted");
+        Ok(())
+    })
+}
+
+#[test]
+fn controlled_layout_admits_node_constraint_comparisons() {
+    let mut text = String::from(
+        "@prefix sh: <http://www.w3.org/ns/shacl#> .\n@prefix ex: <http://ex.org/> .\n",
+    );
+    for n in 0..80 {
+        text.push_str(&format!(
+            "ex:S sh:property ex:P{n} . ex:P{n} sh:path ex:p ; sh:node ex:N{n} .\n"
+        ));
+    }
+    let shapes = Shapes::parse(&text, RdfFormat::Turtle, None).unwrap();
+    let root = shapes.shape_id(&ex("S").into()).unwrap();
+    let failure = controlled_with_allowance(&shapes, &[root], 4_000).unwrap_err();
+    assert_eq!(failure.to_string(), "layout allowance exhausted");
+    let ordinary = form_layout(&shapes, &[root]);
+    let controlled = controlled_with_allowance(&shapes, &[root], 100_000).unwrap();
+    assert_eq!(format!("{controlled:?}"), format!("{ordinary:?}"));
+    assert_eq!(controlled.fields[0].constraints.node.len(), 80);
+}
+
+fn repeated_intersection(language: bool) {
+    let predicate = if language { "sh:languageIn" } else { "sh:in" };
+    let mut text = format!(
+        "@prefix sh: <http://www.w3.org/ns/shacl#> .\n@prefix ex: <http://ex.org/> .\n\
+         ex:A sh:property [ sh:path ex:p ; {predicate} ( {} ) ] .\n\
+         ex:B sh:property ex:P . ex:P sh:path ex:p .\n",
+        "\"en\" ".repeat(128),
+    );
+    // Distinct list identities preserve every repeated intersection constraint.
+    for _ in 0..64 {
+        text.push_str(&format!("ex:P {predicate} ( \"en\" ) .\n"));
+    }
+    let shapes = Shapes::parse(&text, RdfFormat::Turtle, None).unwrap();
+    let selected = ["A", "B"].map(|name| shapes.shape_id(&ex(name).into()).unwrap());
+    let failure = controlled_with_allowance(&shapes, &selected, 4_000).unwrap_err();
+    assert_eq!(failure.to_string(), "layout allowance exhausted");
+    let ordinary = form_layout(&shapes, &selected);
+    let controlled = controlled_with_allowance(&shapes, &selected, 200_000).unwrap();
+    assert_eq!(format!("{controlled:?}"), format!("{ordinary:?}"));
+    let constraints = &controlled.fields[0].constraints;
+    let retained = if language {
+        constraints.language_in.as_ref().unwrap().len()
+    } else {
+        constraints.allowed.as_ref().unwrap().len()
+    };
+    assert_eq!(
+        retained, 128,
+        "legacy intersections retain matching duplicates"
+    );
+}
+
+#[test]
+fn controlled_layout_admits_retained_allowed_value_multiplicity() {
+    repeated_intersection(false);
+}
+
+#[test]
+fn controlled_layout_admits_retained_language_multiplicity() {
+    repeated_intersection(true);
+}
+
+#[test]
+fn controlled_layout_refuses_uncontrolled_composite_range_comparisons() {
+    let datatype = sparkles_core::sparql::cdt::LIST;
+    let large = format!("[{}0]", "0,".repeat(4_096));
+    let nested = format!("{}0{}", "[".repeat(32), "]".repeat(32));
+    for predicate in [
+        "minInclusive",
+        "minExclusive",
+        "maxInclusive",
+        "maxExclusive",
+    ] {
+        for lexical in [&large, &nested] {
+            assert!(sparkles_core::sparql::cdt::parse_list(lexical).is_some());
+            let text = format!(
+                "@prefix sh: <http://www.w3.org/ns/shacl#> .\n@prefix ex: <http://ex.org/> .\n\
+                 ex:A sh:property [ sh:path ex:p ; sh:{predicate} \"{lexical}\"^^<{datatype}> ] .\n\
+                 ex:B sh:property [ sh:path ex:p ; sh:{predicate} \"[1]\"^^<{datatype}> ] ."
+            );
+            let shapes = Shapes::parse(&text, RdfFormat::Turtle, None).unwrap();
+            let selected = ["A", "B"].map(|name| shapes.shape_id(&ex(name).into()).unwrap());
+            // A first bound only stores admitted metadata, with no CDT parser call.
+            let first = controlled_with_allowance(&shapes, &selected[..1], 1_000).unwrap();
+            assert_eq!(
+                format!("{first:?}"),
+                format!("{:?}", form_layout(&shapes, &selected[..1]))
+            );
+            let failure = controlled_with_allowance(&shapes, &selected, 1_000).unwrap_err();
+            assert!(failure.to_string().contains("composite range comparison"));
+        }
+    }
+}
+
+#[test]
+fn controlled_layout_keeps_incomparable_composite_bound_kinds() {
+    let list = sparkles_core::sparql::cdt::LIST;
+    let map = sparkles_core::sparql::cdt::MAP;
+    for first in ["0".to_owned(), format!("\"[0]\"^^<{list}>")] {
+        let text = format!(
+            "@prefix sh: <http://www.w3.org/ns/shacl#> .\n@prefix ex: <http://ex.org/> .\n\
+             ex:A sh:property [ sh:path ex:p ; sh:minInclusive {first} ] .\n\
+             ex:B sh:property [ sh:path ex:p ; sh:minInclusive \"{{}}\"^^<{map}> ] .\n\
+             ex:C sh:property [ sh:path ex:p ; sh:minInclusive \"{{}}\"^^<{map}> ] ."
+        );
+        let shapes = Shapes::parse(&text, RdfFormat::Turtle, None).unwrap();
+        let selected = ["A", "B", "C"].map(|name| shapes.shape_id(&ex(name).into()).unwrap());
+        let controlled = controlled_with_allowance(&shapes, &selected, 1_000).unwrap();
+        assert_eq!(
+            format!("{controlled:?}"),
+            format!("{:?}", form_layout(&shapes, &selected))
+        );
+    }
+}
+
 #[test]
 fn the_parser_keeps_names_orders_groups_and_dash_hints() {
     let shapes = shapes();
