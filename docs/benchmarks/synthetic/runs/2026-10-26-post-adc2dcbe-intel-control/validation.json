@@ -341,5 +341,5 @@
     "load.tsv.gz": "a880d51b7db106e1633d692ea6b95bb6cb45118e5592a5902b358dcf749bd8d3",
     "samples.tsv.gz": "07fa1a4a332c1b4952583a91b77dbec2a52ccfe624b5d78ea47a0a639dc58d64"
   },
-  "qualification": "This is a matched internal public-binary control, not a replacement cross-engine result. The initial Namespace flags were rerun with10rounds/100reps and then checked on quiet Intel. Both host benchmark/build locks were held together. All3sorted TSV answer hashes match. Values-star tiny execution drift is accepted under follow-up385; no runtime optimization is claimed."
+  "qualification": "This is a matched internal public-binary control, not a replacement cross-engine result. The initial Namespace flags were rerun with10rounds/100reps and then checked on quiet Intel. Both host benchmark/build locks were held together. All3sorted TSV answer hashes match. Values-star tiny execution drift is accepted under follow-up328; no runtime optimization is claimed."
 }

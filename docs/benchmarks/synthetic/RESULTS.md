@@ -304,7 +304,7 @@ Namespace rounds brought each below 10%. Twelve interleaved Forge rounds with
 200 timed requests per process then measured server execution changes of −0.7% for
 `minus`, −0.3% for `star-lookup` and +2.8% for `values-star`. Client time changed by
 −0.8%, +0.2% and −0.5%. The small `values-star` change is about 0.4 microseconds
-at a 14-microsecond baseline and remains under roadmap item 385.
+at a 14-microsecond baseline and remains under roadmap item 328.
 
 These are internal comparisons on 1.05 million generated triples. They do not replace
 the cross-engine tables. Both builds use identical compilers, run alone on Forge with

@@ -1624,7 +1624,7 @@ execution. Client time stayed within 0.8%. All answers agree, with matching comp
 and exact retained binary hashes. The [qualified result and immutable samples](../benchmarks/synthetic/RESULTS.md#short-query-integration-control)
 keep these internal comparisons separate from cross-engine tables.
 
-Item 385 retains the accepted `values-star` drift of about 0.4 microseconds. Recheck
+Item 328 retains the accepted `values-star` drift of about 0.4 microseconds. Recheck
 it when the short-query execution path next changes, distinguishing instruction cost
 from code placement. A material persistent cost or a simple broad improvement should
 drive further optimization.
