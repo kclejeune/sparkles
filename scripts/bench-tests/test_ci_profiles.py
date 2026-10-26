@@ -24,7 +24,9 @@ class CiProfiles(unittest.TestCase):
                     "  set -m\n",
                     "  set -m\n  set -T\n"
                     "  trap 'if [[ $BASH_COMMAND == \"wait -n -p done_pid\" ]]; then "
-                    "sleep 0.02; jobs > /dev/null; fi' DEBUG\n",
+                    "for ci_pid in \"${!pids[@]}\"; do "
+                    "while kill -0 \"$ci_pid\" 2>/dev/null; do sleep 0.001; done; done; "
+                    "jobs > /dev/null; fi' DEBUG\n",
                 )
             script.write_text(source)
             frontend = root / "bin/mise"
