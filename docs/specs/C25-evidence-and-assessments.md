@@ -472,6 +472,20 @@ snapshot, verify source bytes or enforce immutability. The existing C17 assertio
 supersession and C18 source records retain their behavior. No evidence setting, claims
 endpoint, protected profile registry or accepted projection ships in Phase 1.
 
+The engine's `sparkles_core::evidence` module supplies typed input records and bounded
+local preparation for Phase 2. It verifies retained content digests, normalized-text
+passages and explicitly versioned lexical JSON selections. JSON selection preserves
+exact retained UTF-8 bytes and rejects duplicate decoded keys. References sharing a
+revision are resolved together, and literal components are budgeted before validation
+can copy them. Independent framing goldens, selector oracles, allocation checks and
+cancellation controls cover this preparation contract.
+
+`prepare_input` returns explicit requirements for references that need retained-view,
+identity or method resolution. A runtime must discharge those requirements through
+the caller's authorized view before publication. These helpers do not open a dataset,
+authenticate source availability, register managed graphs or authorize a write. The
+Phase 2 runtime remains incomplete.
+
 Roadmap item 81 retains the rest of this contract. Phase 2 adds typed source, reference
 and claim creation with authenticated availability and guarded metadata, exact retained
 reference resolution, reader admission, idempotency, review, support ownership,

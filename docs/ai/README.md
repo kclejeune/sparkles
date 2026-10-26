@@ -177,6 +177,12 @@ existing memory records. Rust applications select them with
 `sparkles::evidence::profile(1)`. Unknown versions return `None`. The CLI can validate
 profile RDF with `sparkles shacl` and run the supplied queries with `sparkles query`.
 
+Rust importers can prepare typed batches with `sparkles_core::evidence::prepare_input`.
+It checks local content digests and retained text or JSON selectors within its bounds.
+The result keeps explicit requirements for references needing authorized runtime
+resolution. JSON selection uses the named lexical UTF-8 method and preserves exact
+retained value bytes. These local helpers provide no authenticated write or receipt.
+
 Source revisions, renditions and passages retain exact identities and digests. Claim
 occurrences describe a proposition with an RDF 1.2 triple term without asserting it.
 Evidence links distinguish support, contradiction and mention. Declared lineage stays
