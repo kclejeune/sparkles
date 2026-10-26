@@ -1683,3 +1683,10 @@ Info view. Normalized and
 vector search remain bounded, and the contract makes no complete-universe or unique
 intent claim. Ask continues to preserve every ambiguous clarification. Context-sensitive
 resolution and a fresh end-to-end model evaluation remain under item 263.
+
+
+The evidence producer counts escaped full fields before formatting and shares a
+construction allowance across mentions. The final check includes branch and policy
+decorations and retains exact-boundary acceptance. This bounds the added evidence
+copies without replacing the query memory budget. Ask's conservative evidence consumer
+remains separate work under item 263.

@@ -1,6 +1,7 @@
 //! `link_entities` (C17 §5.4): the entities of the caller's view that a mention may
 //! name, by exact label, normalized label, BM25 and vector similarity.
 
+use super::evidence_budget::EvidenceBudget;
 use super::text::{normalize, phrase_query, plain_query, words};
 use super::{
     OWL_SAME_AS, RDF_TYPE, RDFS_SUBCLASS, RRF_K, Reader, SKOS_ALT, SKOS_EXACT, graphs_arg, iri,
@@ -266,20 +267,31 @@ impl Tools<'_> {
         let mut vector_used = false;
         let mut terms = Terms::new(&prefixes, 300);
         let mut out_mentions = Vec::with_capacity(mentions.len());
+        let mut evidence_budget =
+            (a.evidence == Some(true)).then(|| EvidenceBudget::new(self.cfg().max_bytes));
         for m in &mentions {
             let (linked, t, v) =
                 self.link_with_evidence(&r, &setup, m, k, a.evidence == Some(true), &ctx)?;
             text_used |= t;
             vector_used |= v;
+            let candidates = linked
+                .candidates
+                .iter()
+                .map(|candidate| {
+                    candidate_json(
+                        candidate,
+                        &mut terms,
+                        &setup.labels,
+                        evidence_budget.as_mut(),
+                    )
+                    .map_err(|error| ctx.engine(error))
+                })
+                .collect::<Result<Vec<_>, _>>()?;
             let mut mention = json!({
                 "text": render::label_text(&m.text),
                 "verdict": linked.verdict,
-                "candidates": linked
-                    .candidates
-                    .iter()
-                    .map(|c| candidate_json(c, &mut terms, &setup.labels))
-                    .collect::<Vec<_>>(),
             });
+            mention["candidates"] = Value::Array(candidates);
             if let Some(evidence) = &linked.evidence {
                 mention["evidence"] = json!({
                     "version": 1,
@@ -294,14 +306,16 @@ impl Tools<'_> {
                 });
             }
             out_mentions.push(mention);
+            #[cfg(test)]
+            evidence_probe::retained(&out_mentions);
         }
-        let value = json!({
+        let mut value = json!({
             "dataset": ds.name,
             "commit": r.snap.commit,
-            "mentions": out_mentions,
             "search": { "text": text_used, "vector": vector_used },
             "prefixes": terms.used(),
         });
+        value["mentions"] = Value::Array(out_mentions);
         Ok(Outcome::Structured(value))
     }
 
@@ -576,8 +590,8 @@ impl Tools<'_> {
         all.truncate(LIST_DEPTH);
         // types and labels of the pool
         let iris: Vec<NamedNode> = all.iter().map(|c| c.iri.clone()).collect();
-        let types = type_details(r, &iris, &setup.graphs, evidence).map_err(eng)?;
-        let labels =
+        let mut types = type_details(r, &iris, &setup.graphs, evidence).map_err(eng)?;
+        let mut labels =
             label_details(r, &iris, &setup.labels, &setup.graphs, evidence).map_err(eng)?;
         let (allowed, type_hierarchy_complete) = if m.types.is_empty() {
             (None, true)
@@ -587,16 +601,8 @@ impl Tools<'_> {
         };
         let mention_words = words(&m.text);
         for c in &mut all {
-            c.types = types
-                .values
-                .get(c.iri.as_str())
-                .cloned()
-                .unwrap_or_default();
-            c.labels = labels
-                .values
-                .get(c.iri.as_str())
-                .cloned()
-                .unwrap_or_default();
+            c.types = types.values.remove(c.iri.as_str()).unwrap_or_default();
+            c.labels = labels.values.remove(c.iri.as_str()).unwrap_or_default();
             if evidence {
                 c.evidence = Some(DetailEvidence {
                     types_complete: types.complete.get(c.iri.as_str()).copied().unwrap_or(false),
@@ -793,13 +799,15 @@ fn type_details(
     let mut query_complete = rows.len() < limit;
     let mut counts: Option<HashMap<String, usize>> = evidence.then(HashMap::new);
     for row in rows {
-        if let [Some(Term::NamedNode(x)), Some(Term::NamedNode(t))] = row.as_slice() {
+        if let Ok([Some(Term::NamedNode(x)), Some(Term::NamedNode(t))]) =
+            <[Option<Term>; 2]>::try_from(row)
+        {
             if let Some(counts) = &mut counts {
                 *counts.entry(x.as_str().to_string()).or_default() += 1;
             }
             let v = out.entry(x.as_str().to_string()).or_default();
             if v.len() < 20 {
-                v.push(t.clone());
+                v.push(t);
             }
         } else {
             query_complete = false;
@@ -846,19 +854,21 @@ fn label_details(
     let mut query_complete = rows.len() < limit;
     let mut counts: Option<HashMap<String, usize>> = evidence.then(HashMap::new);
     for row in rows {
-        if let [
-            Some(Term::NamedNode(x)),
-            Some(Term::NamedNode(p)),
-            Some(Term::Literal(l)),
-        ] = row.as_slice()
-            && let Some(rank) = preds.iter().position(|q| q == p)
+        if let Ok(
+            [
+                Some(Term::NamedNode(x)),
+                Some(Term::NamedNode(p)),
+                Some(Term::Literal(l)),
+            ],
+        ) = <[Option<Term>; 3]>::try_from(row)
+            && let Some(rank) = preds.iter().position(|q| q == &p)
         {
             if let Some(counts) = &mut counts {
                 *counts.entry(x.as_str().to_string()).or_default() += 1;
             }
             let v = out.entry(x.as_str().to_string()).or_default();
             if v.len() < 20 {
-                v.push((rank, l.clone()));
+                v.push((rank, l));
             }
         } else {
             query_complete = false;
@@ -967,7 +977,27 @@ fn sample(
     Ok(out)
 }
 
-fn candidate_json(c: &Candidate, terms: &mut Terms, label_predicates: &[NamedNode]) -> Value {
+fn candidate_json(
+    c: &Candidate,
+    terms: &mut Terms,
+    label_predicates: &[NamedNode],
+    mut budget: Option<&mut EvidenceBudget>,
+) -> Result<Value, Error> {
+    if c.evidence.is_some()
+        && let Some(budget) = &budget
+    {
+        let mut preflight = budget.preflight();
+        preflight.string(c.iri.as_str())?;
+        for class in &c.types {
+            preflight.string(class.as_str())?;
+        }
+        for (rank, literal) in &c.labels {
+            if !sparkles::vector::is_datatype(literal.datatype().as_str()) {
+                preflight.string(label_predicates[*rank].as_str())?;
+                preflight.display(literal)?;
+            }
+        }
+    }
     let refs: Vec<(usize, &Literal)> = c.labels.iter().map(|(r, l)| (*r, l)).collect();
     let label = render::choose_ranked(&refs, "en");
     let mut alt: Vec<String> = Vec::new();
@@ -1022,20 +1052,91 @@ fn candidate_json(c: &Candidate, terms: &mut Terms, label_predicates: &[NamedNod
             .iter()
             .filter(|(_, literal)| !sparkles::vector::is_datatype(literal.datatype().as_str()))
             .map(|(rank, literal)| {
-                json!({
-                    "predicate": label_predicates[*rank].as_str(),
-                    "term": literal.to_string(),
-                })
+                let term = literal.to_string();
+                #[cfg(test)]
+                evidence_probe::formatted(&term);
+                let mut label = json!({ "predicate": label_predicates[*rank].as_str() });
+                label["term"] = Value::String(term);
+                label
             })
             .collect();
-        j["evidence"] = json!({
+        let mut details = json!({
             "version": 1,
             "iri": c.iri.as_str(),
             "types": c.types.iter().map(NamedNode::as_str).collect::<Vec<_>>(),
             "typesComplete": evidence.types_complete,
-            "labels": labels,
             "labelsComplete": evidence.labels_complete,
         });
+        details["labels"] = Value::Array(labels);
+        j["evidence"] = details;
     }
-    j
+    if let Some(budget) = &mut budget {
+        budget.charge(&j)?;
+    }
+    Ok(j)
+}
+
+/// Observe actual allocated String buffer capacities, rather than inferring work
+/// from the eventual byte-budget error. The retained count is a lower bound on
+/// live JSON heap storage; it excludes map/array allocations and query state.
+#[cfg(test)]
+pub(crate) mod evidence_probe {
+    use serde_json::Value;
+    use std::cell::Cell;
+
+    #[derive(Clone, Copy, Debug, Default, serde::Serialize)]
+    pub(crate) struct Observation {
+        pub(crate) formatted_term_buffers: usize,
+        pub(crate) formatted_term_bytes: usize,
+        pub(crate) largest_formatted_term: usize,
+        pub(crate) retained_string_peak: usize,
+    }
+    thread_local! {
+        static OBSERVATION: Cell<Option<Observation>> = const { Cell::new(None) };
+    }
+    pub(crate) fn measure<T>(call: impl FnOnce() -> T) -> (T, Observation) {
+        struct Reset(Option<Observation>);
+        impl Drop for Reset {
+            fn drop(&mut self) {
+                let _ = OBSERVATION.try_with(|state| state.set(self.0));
+            }
+        }
+        let _reset = Reset(OBSERVATION.with(|state| state.replace(Some(Observation::default()))));
+        let result = call();
+        (result, OBSERVATION.with(Cell::get).unwrap())
+    }
+    pub(super) fn formatted(value: &String) {
+        OBSERVATION.with(|state| {
+            if let Some(mut observation) = state.get() {
+                observation.formatted_term_buffers += 1;
+                observation.formatted_term_bytes = observation
+                    .formatted_term_bytes
+                    .saturating_add(value.capacity());
+                observation.largest_formatted_term =
+                    observation.largest_formatted_term.max(value.capacity());
+                state.set(Some(observation));
+            }
+        });
+    }
+    fn string_capacity(value: &Value) -> usize {
+        match value {
+            Value::String(value) => value.capacity(),
+            Value::Array(values) => values.iter().map(string_capacity).sum(),
+            Value::Object(values) => values
+                .iter()
+                .map(|(key, value)| key.capacity() + string_capacity(value))
+                .sum(),
+            _ => 0,
+        }
+    }
+    pub(super) fn retained(mentions: &[Value]) {
+        OBSERVATION.with(|state| {
+            if let Some(mut observation) = state.get() {
+                observation.retained_string_peak = observation
+                    .retained_string_peak
+                    .max(mentions.iter().map(string_capacity).sum());
+                state.set(Some(observation));
+            }
+        });
+    }
 }

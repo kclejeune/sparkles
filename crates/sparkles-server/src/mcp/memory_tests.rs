@@ -1288,3 +1288,133 @@ async fn link_evidence_review_counts_branch_metadata_at_the_byte_boundary() {
     ));
     assert_eq!(exact.structured("link_entities", args).await, full);
 }
+
+#[test]
+fn link_evidence_limits_large_term_construction_across_repeated_mentions() {
+    const LABEL_BYTES: usize = 16 << 20;
+    const MENTIONS: usize = 20;
+    const CAP: usize = 1024;
+    let alternative = "x".repeat(LABEL_BYTES);
+    let ttl = format!(
+        r#"<urn:item> <http://www.w3.org/2000/01/rdf-schema#label> "Berlin"@en ; <http://www.w3.org/2004/02/skos/core#altLabel> "{alternative}" ."#
+    );
+    let server = server_with(
+        &[("t", &[&ttl])],
+        McpConfig {
+            max_bytes: CAP,
+            max_timeout: Duration::from_secs(600),
+            ..Default::default()
+        },
+    );
+    let call = Call {
+        arrived: Instant::now(),
+        cancel: Arc::new(AtomicBool::new(false)),
+        request_id: "evidence-construction".into(),
+        principal: Principal::local(),
+        headers: None,
+        held: None,
+        grant: None,
+    };
+    let args = json!({"dataset":"t","mentions":vec![json!({"text":"Berlin"}); MENTIONS],"evidence":true,"timeoutSeconds":600});
+    let (result, observation) = crate::mcp::memory::evidence_probe::measure(|| {
+        server.run_now("link_entities", args.as_object().unwrap().clone(), &call)
+    });
+    eprintln!("evidence construction capacities {}", json!(observation));
+    let error = match result {
+        Err(error) => error,
+        Ok(_) => panic!("oversized evidence unexpectedly succeeded"),
+    };
+    assert_eq!(error.code, "budget-result-bytes");
+    assert_eq!(
+        observation.largest_formatted_term, 0,
+        "oversized evidence must be counted before allocating a formatted term: {observation:?}"
+    );
+    assert!(
+        observation.retained_string_peak <= CAP,
+        "repeated mentions retained evidence beyond the request cap: {observation:?}"
+    );
+}
+
+#[test]
+fn link_evidence_escaped_terms_keep_identity_and_exact_byte_acceptance() {
+    use oxrdf::{Literal, NamedNode};
+    let lexical = "quote\" slash\\ newline\n tab\t control\u{1b} unicode雪☃\u{2028}".repeat(24);
+    let labels = [
+        Literal::new_simple_literal(&lexical),
+        Literal::new_language_tagged_literal(&lexical, "en-Latn-GB").unwrap(),
+        Literal::new_typed_literal(&lexical, NamedNode::new("urn:datatype:雪").unwrap()),
+    ];
+    let ttl = format!(
+        "<urn:item> <http://www.w3.org/2000/01/rdf-schema#label> \"Berlin\"@en .\n{}",
+        labels
+            .iter()
+            .map(|literal| format!(
+                "<urn:item> <http://www.w3.org/2004/02/skos/core#altLabel> {literal} .\n"
+            ))
+            .collect::<String>()
+    );
+    let server = server_with(&[("t", &[&ttl])], McpConfig::default());
+    let read = |server: &McpServer, evidence| {
+        let call = Call {
+            arrived: Instant::now(),
+            cancel: Arc::new(AtomicBool::new(false)),
+            request_id: "escaped-evidence".into(),
+            principal: Principal::local(),
+            headers: None,
+            held: None,
+            grant: None,
+        };
+        let args = json!({"dataset":"t","mentions":[{"text":"Berlin"}],"evidence":evidence});
+        server
+            .run_now("link_entities", args.as_object().unwrap().clone(), &call)
+            .map(|outcome| match outcome {
+                Outcome::Structured(value) => value,
+                Outcome::Text(_) => panic!("expected structured evidence"),
+            })
+    };
+    let plain = read(&server, false).unwrap();
+    let full = read(&server, true).unwrap();
+    let retained = full["mentions"][0]["candidates"][0]["evidence"]["labels"]
+        .as_array()
+        .unwrap();
+    for literal in &labels {
+        assert!(
+            retained
+                .iter()
+                .any(|entry| entry["term"] == literal.to_string()),
+            "RDF lexical identity changed"
+        );
+    }
+    let mut stripped = full.clone();
+    for mention in stripped["mentions"].as_array_mut().unwrap() {
+        mention.as_object_mut().unwrap().remove("evidence");
+        for candidate in mention["candidates"].as_array_mut().unwrap() {
+            candidate.as_object_mut().unwrap().remove("evidence");
+        }
+    }
+    assert_eq!(
+        stripped, plain,
+        "evidence must preserve all ordinary fields"
+    );
+    let exact = serde_json::to_vec(&full).unwrap().len();
+    assert!(exact >= 1024);
+    for (cap, accepted) in [(exact, true), (exact - 1, false)] {
+        let bounded = McpServer::new(
+            server.state.clone(),
+            McpConfig {
+                max_bytes: cap,
+                ..Default::default()
+            },
+        );
+        match read(&bounded, true) {
+            Ok(value) => {
+                assert!(accepted);
+                assert_eq!(value, full);
+            }
+            Err(error) => {
+                assert!(!accepted);
+                assert_eq!(error.code, "budget-result-bytes");
+            }
+        }
+    }
+}

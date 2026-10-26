@@ -1466,7 +1466,12 @@ metadata can certify label scope only when that view agrees. No raw index-wide o
 hidden-candidate count is returned. Evidence-enabled calls refuse structured content over
 `--mcp-max-bytes` with `budget-result-bytes`. This bounds its compact JSON before the
 MCP adapter mirrors it as text and adds the protocol envelope. The count includes
-branch metadata and any other structured-content decoration.
+branch metadata and any other structured-content decoration. A request-wide construction
+guard counts JSON-escaped full IRIs and RDF literal terms before allocating their
+strings. Completed candidates share the same byte allowance across repeated mentions.
+The final decorated check remains authoritative and accepts a result exactly at the
+configured limit. Detail rows and vectors move into their consumers without duplicate
+full-label clones. Query memory limits still govern lookup and ranking state.
 
 The richer evidence is information for contextual ranking and for deciding when another
 lookup is needed. It does not change `exact` or `ambiguous` advice, suppress clarification
