@@ -907,6 +907,22 @@ impl BranchSet {
         c
     }
 
+    pub(super) fn normalize_limited(
+        &self,
+        mut commit: CommitRef,
+        limit: &crate::history::ReadLimit<'_>,
+    ) -> Result<CommitRef> {
+        let table = limit.lock(&self.table)?;
+        for _ in 0..1024 {
+            limit.check(0)?;
+            match self.start_of(&table, commit.branch_id) {
+                Some(from) if commit.seq <= from.seq => commit.branch_id = from.branch_id,
+                _ => break,
+            }
+        }
+        Ok(commit)
+    }
+
     /// The listed branches whose files can be read, in table order, each with its id,
     /// ordinal, starting commit and creation time (RFC 3339).
     pub(crate) fn readable_entries(&self) -> Vec<(String, uuid::Uuid, u16, CommitRef, String)> {
@@ -1341,6 +1357,37 @@ impl Store {
             ));
         }
         Ok(BranchStore::Other(set.open_store(id)?))
+    }
+
+    /// A bounded read must not invoke ordinary Store opening and recovery as a
+    /// hidden preparation step. Cold origin opening needs its own controlled seam.
+    pub(super) fn retained_branch_by_id_limited(
+        &self,
+        id: uuid::Uuid,
+        limit: &crate::history::ReadLimit<'_>,
+    ) -> Result<BranchStore<'_>> {
+        limit.check(0)?;
+        if id == self.dataset_id {
+            return Ok(BranchStore::Main(self));
+        }
+        let set = self.owned_set()?;
+        if limit.lock(&set.table)?.any_by_id(id).is_none() {
+            return Err(BranchError::error(
+                BranchErrorKind::Gone,
+                "merge-base-gone",
+                format!("branch {id} was deleted"),
+            ));
+        }
+        limit
+            .lock(&set.stores)?
+            .get(&id)
+            .cloned()
+            .map(BranchStore::Other)
+            .ok_or_else(|| {
+                Error::HistoryUnsupported(
+                    "bounded inherited reads require a retained origin store".into(),
+                )
+            })
     }
 
     /// The id of branch `name`.

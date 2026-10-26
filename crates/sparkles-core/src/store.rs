@@ -36,6 +36,7 @@ mod group;
 mod group_index_tests;
 #[cfg(test)]
 mod group_model;
+mod history_limited;
 mod history_query;
 pub mod keyset;
 mod link;
@@ -2459,9 +2460,41 @@ impl Store {
         at: &crate::history::At,
         o: &crate::history::HistoryOptions,
     ) -> Result<(Arc<Snapshot>, crate::history::Resolved)> {
-        let r = self.resolve(at)?;
+        self.snapshot_at_inner(at, o, None)
+    }
+
+    /// Resolve exactly the requested retained state within a per-read memory cap.
+    /// Index mappings remain shared; owned delta and replay buffers consume this cap.
+    pub fn snapshot_at_limited(
+        &self,
+        at: &crate::history::At,
+        o: &crate::history::HistoryOptions,
+        max_memory_bytes: u64,
+    ) -> Result<(Arc<Snapshot>, crate::history::Resolved)> {
+        self.snapshot_at_inner(at, o, Some(max_memory_bytes))
+    }
+
+    fn snapshot_at_inner(
+        &self,
+        at: &crate::history::At,
+        o: &crate::history::HistoryOptions,
+        memory: Option<u64>,
+    ) -> Result<(Arc<Snapshot>, crate::history::Resolved)> {
+        let memory = memory.map(|n| n.min(self.opts.history_cache_bytes));
+        let limit = crate::history::ReadLimit {
+            options: o,
+            memory,
+            held: 0,
+        };
+        limit.check(0)?;
+        let r = if memory.is_some() {
+            self.resolve_limited(at, &limit)?
+        } else {
+            self.resolve(at)?
+        };
         let live = self.snapshot();
         if r.commit.seq == live.commit {
+            limit.check(history_limited::preparation_delta_bytes(&live.delta))?;
             return Ok((
                 live,
                 crate::history::Resolved {
@@ -2472,9 +2505,15 @@ impl Store {
         }
         let seq = r.commit.seq;
         if let Some(mem) = &self.mem_history {
-            let mut m = mem.lock();
-            return match m.get(seq) {
+            let mut m = limit.lock(mem)?;
+            let found = if memory.is_some() {
+                m.get_limited(seq, &limit)?
+            } else {
+                m.get(seq)
+            };
+            return match found {
                 Some(snap) => {
+                    limit.check(history_limited::preparation_delta_bytes(&snap.delta))?;
                     m.hits += 1;
                     Ok((snap, r))
                 }
@@ -2484,7 +2523,11 @@ impl Store {
                         crate::history::At::Snapshot(n) => Some(n.clone()),
                         _ => None,
                     };
-                    Err(self.mem_gone(seq, r.head, name, Some(r.commit)))
+                    if memory.is_some() {
+                        Err(self.mem_gone_limited(seq, r.head, name, Some(r.commit), &limit)?)
+                    } else {
+                        Err(self.mem_gone(seq, r.head, name, Some(r.commit)))
+                    }
                 }
             };
         }
@@ -2499,15 +2542,42 @@ impl Store {
             _ => None,
         };
         // one materialization at a time: concurrent requests for a state wait for it
-        let mut h = hist.lock();
-        let Some(owner) = h.owner(seq, current, r.head) else {
-            return Err(self.history_gone(&h, seq, r.head, snapshot_name, Some(r.commit)));
+        let mut h = limit.lock(hist)?;
+        let limit = crate::history::ReadLimit {
+            memory: memory.map(|n| n.min(h.budget.capacity())),
+            ..limit
         };
-        if let Some(i) = h
-            .cache
-            .iter()
-            .position(|c| c.generation == owner && c.seq == seq)
-        {
+        let owner = if memory.is_some() {
+            h.owner_limited(seq, current, r.head, &limit)?
+        } else {
+            h.owner(seq, current, r.head)
+        };
+        let Some(owner) = owner else {
+            return if memory.is_some() {
+                Err(self.history_gone_limited(
+                    &h,
+                    seq,
+                    r.head,
+                    snapshot_name,
+                    Some(r.commit),
+                    &limit,
+                )?)
+            } else {
+                Err(self.history_gone(&h, seq, r.head, snapshot_name, Some(r.commit)))
+            };
+        };
+        let mut cached = None;
+        for (index, entry) in h.cache.iter().enumerate() {
+            limit.check(0)?;
+            if entry.generation == owner && entry.seq == seq {
+                cached = Some(index);
+                break;
+            }
+        }
+        if let Some(i) = cached {
+            limit.check(history_limited::preparation_delta_bytes(
+                &h.cache[i].snap.delta,
+            ))?;
             let e = h.cache.remove(i);
             let snap = e.snap.clone();
             h.cache.insert(0, e);
@@ -2515,29 +2585,38 @@ impl Store {
             return Ok((snap, r));
         }
         h.misses += 1;
+        // Snapshot/entry/path metadata remains live beside replay's owned buffers.
+        let limit = if memory.is_some() {
+            limit.holding(16 << 10)?
+        } else {
+            limit
+        };
         let entry = h.gens[&owner].clone();
-        let generation = self.history_generation(&mut h, owner, current, &live, &entry)?;
+        let generation = if memory.is_some() {
+            self.history_generation_limited(&mut h, owner, current, &live, &limit)?
+        } else {
+            self.history_generation(&mut h, owner, current, &live, &entry)?
+        };
         let budget = h.budget.capacity();
         let t0 = std::time::Instant::now();
         let mut check = |d: &Delta| -> Result<()> {
-            if o.cancel.as_ref().is_some_and(|c| c.load(Ordering::Relaxed)) {
-                return Err(Error::Cancelled);
-            }
-            if o.deadline.is_some_and(|t| std::time::Instant::now() > t) {
-                return Err(Error::Timeout);
-            }
-            let need = delta_bytes(d);
-            if need > budget {
+            let bytes = delta_bytes(d);
+            limit.check(bytes)?;
+            if bytes > budget {
                 return Err(Error::BudgetExceeded(crate::Budget {
                     kind: crate::BudgetKind::Memory,
                     limit: budget,
-                    requested: need,
+                    requested: bytes,
                 }));
             }
             Ok(())
         };
-        let (delta, end) =
-            self.materialize(&h, owner, &entry, &generation, &live, seq, &mut check)?;
+        let (delta, end) = if memory.is_some() {
+            self.materialize_limited(&h, owner, &entry, &generation, &live, seq, &limit)?
+        } else {
+            self.materialize(&h, owner, &entry, &generation, &live, seq, &mut check)?
+        };
+        limit.check(history_limited::preparation_delta_bytes(&delta))?;
         h.materializations += 1;
         h.materialize_nanos += t0.elapsed().as_nanos() as u64;
         let bytes = delta_bytes(&delta);
@@ -2561,6 +2640,20 @@ impl Store {
             historical: true,
             change_log: self.changelog.clone(),
         });
+        if memory.is_some() {
+            Self::cache_limited_snapshot(
+                &mut h,
+                crate::history::Cached {
+                    generation: owner,
+                    seq,
+                    snap: snap.clone(),
+                    bytes,
+                    end,
+                },
+                &limit,
+            )?;
+            return Ok((snap, r));
+        }
         h.cache.insert(
             0,
             crate::history::Cached {

@@ -509,6 +509,36 @@ pub(crate) struct WalCursor {
 }
 
 impl WalCursor {
+    /// A bounded reader keeps its I/O buffer small and refuses transaction growth
+    /// before allocation. `held` includes the caller's retained delta.
+    pub(crate) fn open_limited(
+        path: &Path,
+        from: WalPoint,
+        limit: &crate::history::ReadLimit<'_>,
+        held: u64,
+    ) -> Result<WalCursor> {
+        limit.check(held)?;
+        let capacity = limit
+            .remaining()
+            .saturating_sub(held)
+            .saturating_div(8)
+            .min(64 << 10)
+            .max(WAL_REC as u64);
+        limit.check(held.saturating_add(capacity.max(WAL_REC as u64)))?;
+        let mut file = File::open(path)?;
+        file.seek(SeekFrom::Start(from.offset))?;
+        Ok(WalCursor {
+            r: BufReader::with_capacity(capacity as usize, file),
+            path: path.to_path_buf(),
+            at: from,
+            txn: Vec::new(),
+        })
+    }
+
+    pub(crate) fn buffer_bytes(&self) -> u64 {
+        (self.r.capacity() + self.txn.capacity()) as u64
+    }
+
     pub fn new(mut file: File, path: &Path, from: WalPoint) -> Result<WalCursor> {
         file.seek(SeekFrom::Start(from.offset))?;
         Ok(WalCursor {
@@ -538,10 +568,28 @@ impl WalCursor {
     /// included. A checksum mismatch, an unknown record type or a number out of
     /// sequence is [`Error::Corrupt`].
     pub fn next(&mut self) -> Result<Option<(u64, &[u8])>> {
+        Ok(self.next_inner(None)?.map(|(seq, txn, _)| (seq, txn)))
+    }
+
+    pub(crate) fn next_limited(
+        &mut self,
+        limit: &crate::history::ReadLimit<'_>,
+        held: u64,
+    ) -> Result<Option<(u64, &[u8], u64)>> {
+        self.next_inner(Some((limit, held)))
+    }
+
+    fn next_inner(
+        &mut self,
+        limited: Option<(&crate::history::ReadLimit<'_>, u64)>,
+    ) -> Result<Option<(u64, &[u8], u64)>> {
         self.txn.clear();
         let mut rec = [0u8; WAL_REC];
         let mut offset = self.at.offset;
         loop {
+            if let Some((limit, held)) = limited {
+                limit.check(held.saturating_add(self.buffer_bytes()))?;
+            }
             match self.r.read_exact(&mut rec) {
                 Ok(()) => {}
                 Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => return Ok(None),
@@ -549,7 +597,28 @@ impl WalCursor {
             }
             offset += WAL_REC as u64;
             match rec[0] {
-                WAL_INSERT | WAL_DELETE => self.txn.extend_from_slice(&rec),
+                WAL_INSERT | WAL_DELETE => {
+                    if let Some((limit, held)) = limited
+                        && self.txn.len() + WAL_REC > self.txn.capacity()
+                    {
+                        let next = (self.txn.capacity().saturating_mul(2)).max(WAL_REC);
+                        // Old and replacement allocations can coexist during relocation.
+                        limit.check(
+                            held.saturating_add(self.buffer_bytes())
+                                .saturating_add(next as u64),
+                        )?;
+                        self.txn
+                            .try_reserve_exact(next - self.txn.len())
+                            .map_err(|_| {
+                                Error::BudgetExceeded(crate::Budget {
+                                    kind: crate::BudgetKind::Memory,
+                                    limit: limit.memory.unwrap_or(u64::MAX),
+                                    requested: limit.memory.unwrap_or(u64::MAX).saturating_add(1),
+                                })
+                            })?;
+                    }
+                    self.txn.extend_from_slice(&rec);
+                }
                 WAL_COMMIT => break,
                 // the header record where the log starts
                 WAL_HEADER if offset == WAL_REC as u64 => {
@@ -592,7 +661,7 @@ impl WalCursor {
             offset,
             folding,
         };
-        Ok(Some((seq, &self.txn)))
+        Ok(Some((seq, &self.txn, self.buffer_bytes())))
     }
 
     /// Move to the end of commit `seq` (at or after the cursor's position): the
@@ -669,6 +738,65 @@ pub(crate) fn apply_forward(
         }
     }
     if c.position() != to {
+        return Err(Error::Corrupt(format!(
+            "{}: commit {} does not end at byte {}",
+            path.display(),
+            to.seq,
+            to.offset
+        )));
+    }
+    Ok(records)
+}
+
+/// Bounded forward replay checks transaction relocation and each delta mutation.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn apply_forward_limited(
+    path: &Path,
+    generation: &Generation,
+    cache: &BlockCache,
+    delta: &mut Delta,
+    from: WalPoint,
+    to: WalPoint,
+    limit: &crate::history::ReadLimit<'_>,
+) -> Result<u64> {
+    limit.check(super::history_limited::preparation_delta_bytes(delta))?;
+    if from == to {
+        return Ok(0);
+    }
+    let mut cursor = WalCursor::open_limited(
+        path,
+        from,
+        limit,
+        super::history_limited::preparation_delta_bytes(delta),
+    )?;
+    let spo = generation.perm(Perm::Spo);
+    let mut records = 0;
+    while cursor.position().offset < to.offset {
+        let Some((_, txn, buffers)) = cursor.next_limited(
+            limit,
+            super::history_limited::preparation_delta_bytes(delta),
+        )?
+        else {
+            return Err(Error::Corrupt(format!(
+                "{}: the log ends before commit {}",
+                path.display(),
+                to.seq
+            )));
+        };
+        for record in txn.as_chunks::<WAL_REC>().0 {
+            // Each changed quad can add one key to every permutation. Check before
+            // mutation, while the validated transaction remains in memory.
+            limit.check(
+                super::history_limited::preparation_mutation_bytes(delta).saturating_add(buffers),
+            )?;
+            let quad = record_quad(record);
+            let in_base = spo.contains(cache, &Perm::Spo.to_key(&quad))?;
+            apply(delta, &quad, record[0] == WAL_INSERT, in_base);
+            records += 1;
+        }
+    }
+    limit.check(super::history_limited::preparation_delta_bytes(delta))?;
+    if cursor.position() != to {
         return Err(Error::Corrupt(format!(
             "{}: commit {} does not end at byte {}",
             path.display(),
@@ -798,6 +926,187 @@ pub(crate) fn apply_backward(
         )));
     }
     Ok(records)
+}
+
+/// Bounded reverse replay retains only one transaction and preflights both orders.\n#[allow(clippy::too_many_arguments)]
+pub(crate) fn apply_backward_limited(
+    path: &Path,
+    generation: &Generation,
+    cache: &BlockCache,
+    delta: &mut Delta,
+    lo: WalPoint,
+    hi: WalPoint,
+    limit: &crate::history::ReadLimit<'_>,
+) -> std::result::Result<u64, Backward> {
+    const CHUNK: u64 = (64 << 10) / WAL_REC as u64 * WAL_REC as u64;
+    limit.check(super::history_limited::preparation_delta_bytes(delta))?;
+    let corrupt = |m: String| Backward::Failed(Error::Corrupt(format!("{}: {m}", path.display())));
+    if hi.offset < lo.offset || !(hi.offset - lo.offset).is_multiple_of(WAL_REC as u64) {
+        return Err(corrupt(format!(
+            "no whole records between bytes {} and {}",
+            lo.offset, hi.offset
+        )));
+    }
+    let mut file = File::open(path)?;
+    let spo = generation.perm(Perm::Spo);
+    // the transaction being collected: its commit record, then its data records from
+    // the last to the first
+    let mut commit: Option<[u8; WAL_REC]> = None;
+    let mut data: Vec<[u8; WAL_REC]> = Vec::new();
+    let mut fwd: Vec<u8> = Vec::new();
+    let (mut seq, mut records) = (hi.seq, 0u64);
+    let mut undo = |commit: &[u8; WAL_REC],
+                    data: &[[u8; WAL_REC]],
+                    seq: &mut u64,
+                    delta: &mut Delta,
+                    held_buffers: u64|
+     -> std::result::Result<(), Backward> {
+        fwd.clear();
+        let need = data.len().saturating_mul(WAL_REC);
+        if need > fwd.capacity() {
+            limit.check(
+                super::history_limited::preparation_delta_bytes(delta)
+                    .saturating_add(held_buffers)
+                    .saturating_add(fwd.capacity() as u64)
+                    .saturating_add(need as u64),
+            )?;
+            fwd.try_reserve_exact(need)
+                .map_err(|_| allocation_refused(limit))?;
+        }
+        for r in data.iter().rev() {
+            limit.check(
+                super::history_limited::preparation_delta_bytes(delta)
+                    .saturating_add(held_buffers)
+                    .saturating_add(fwd.capacity() as u64),
+            )?;
+            fwd.extend_from_slice(r);
+        }
+        match commit::open_wal_commit(commit, &fwd) {
+            Some(Ok((s, _, _, _))) if s == *seq => {}
+            Some(Ok((s, _, _, _))) => {
+                return Err(corrupt(format!("found commit {s} where {seq} ends")));
+            }
+            Some(Err(())) => {
+                return Err(corrupt(format!(
+                    "checksum mismatch in the transaction of commit {seq}"
+                )));
+            }
+            None => return Err(Backward::Legacy),
+        }
+        for r in data {
+            limit.check(
+                super::history_limited::preparation_mutation_bytes(delta)
+                    .saturating_add(held_buffers)
+                    .saturating_add(fwd.capacity() as u64),
+            )?;
+            let q = record_quad(r);
+            let in_base = spo.contains(cache, &Perm::Spo.to_key(&q))?;
+            apply(delta, &q, r[0] != WAL_INSERT, in_base);
+            records += 1;
+        }
+        *seq -= 1;
+        Ok(())
+    };
+    let mut end = hi.offset;
+    let mut buf: Vec<u8> = Vec::new();
+    while end > lo.offset {
+        limit.check(
+            super::history_limited::preparation_delta_bytes(delta)
+                .saturating_add(buf.capacity() as u64)
+                .saturating_add((data.capacity() * WAL_REC * 2) as u64),
+        )?;
+        let remaining = limit
+            .remaining()
+            .saturating_sub(super::history_limited::preparation_delta_bytes(delta))
+            .saturating_sub((data.capacity() * WAL_REC * 2) as u64);
+        let chunk = CHUNK
+            .min(remaining / 8 / WAL_REC as u64 * WAL_REC as u64)
+            .max(WAL_REC as u64);
+        let start = end.saturating_sub(chunk).max(lo.offset);
+        let need = (end - start) as usize;
+        if need > buf.capacity() {
+            limit.check(
+                super::history_limited::preparation_delta_bytes(delta)
+                    .saturating_add((data.capacity() * WAL_REC * 2) as u64)
+                    .saturating_add(buf.capacity() as u64)
+                    .saturating_add(need as u64),
+            )?;
+            buf.try_reserve_exact(need.saturating_sub(buf.len()))
+                .map_err(|_| allocation_refused(limit))?;
+        }
+        buf.resize(need, 0);
+        file.seek(SeekFrom::Start(start))?;
+        file.read_exact(&mut buf)?;
+        for (i, rec) in buf.as_chunks::<WAL_REC>().0.iter().enumerate().rev() {
+            limit.check(
+                super::history_limited::preparation_delta_bytes(delta)
+                    .saturating_add(buf.capacity() as u64)
+                    .saturating_add((data.capacity() * WAL_REC * 2) as u64),
+            )?;
+            match rec[0] {
+                // the header record where the log starts
+                WAL_HEADER if start == 0 && i == 0 => {}
+                WAL_COMMIT => {
+                    if let Some(c) = commit.take() {
+                        undo(
+                            &c,
+                            &data,
+                            &mut seq,
+                            delta,
+                            (buf.capacity() + data.capacity() * WAL_REC) as u64,
+                        )?;
+                        data.clear();
+                    }
+                    commit = Some(*rec);
+                }
+                WAL_INSERT | WAL_DELETE if commit.is_some() => {
+                    if data.len() == data.capacity() {
+                        let next = data.capacity().saturating_mul(2).max(1);
+                        limit.check(
+                            super::history_limited::preparation_delta_bytes(delta)
+                                .saturating_add(buf.capacity() as u64)
+                                .saturating_add((data.capacity() * WAL_REC * 2) as u64)
+                                .saturating_add((next * WAL_REC * 2) as u64),
+                        )?;
+                        data.try_reserve_exact(next - data.len())
+                            .map_err(|_| allocation_refused(limit))?;
+                    }
+                    data.push(*rec);
+                }
+                op => {
+                    return Err(corrupt(format!(
+                        "unexpected record type {op} before byte {end}"
+                    )));
+                }
+            }
+        }
+        end = start;
+    }
+    if let Some(c) = commit.take() {
+        undo(
+            &c,
+            &data,
+            &mut seq,
+            delta,
+            (buf.capacity() + data.capacity() * WAL_REC) as u64,
+        )?;
+    }
+    if seq != lo.seq {
+        return Err(corrupt(format!(
+            "undoing commits from {} reached commit {seq}, not {}",
+            hi.seq, lo.seq
+        )));
+    }
+    Ok(records)
+}
+
+fn allocation_refused(limit: &crate::history::ReadLimit<'_>) -> Error {
+    let memory = limit.memory.unwrap_or(u64::MAX);
+    Error::BudgetExceeded(crate::Budget {
+        kind: crate::BudgetKind::Memory,
+        limit: memory,
+        requested: memory.saturating_add(1),
+    })
 }
 
 #[cfg(test)]
