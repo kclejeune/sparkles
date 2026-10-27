@@ -1,0 +1,13 @@
+#!/usr/bin/env bash
+# Swatinem's command formatter also wraps rustc identity probes.
+set -euo pipefail
+tool=$1
+shift
+case "$tool" in
+  cargo) exec mbx "$@" ;;
+  rustc | rustup) exec "$tool" "$@" ;;
+  *)
+    echo "Unsupported cache-action tool: $tool" >&2
+    exit 64
+    ;;
+esac

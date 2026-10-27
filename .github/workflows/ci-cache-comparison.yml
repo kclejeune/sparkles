@@ -1,0 +1,247 @@
+# Opt-in branch experiment. Production CI remains in ci.yml.
+# See .github/CI-CACHE-COMPARISON.md before publishing this exact branch.
+name: CI cache comparison
+on:
+  push:
+    branches:
+      - ci-cache-comparison-20261027
+permissions:
+  contents: read
+  id-token: write
+concurrency:
+  group: ci-cache-comparison-${{ github.ref }}
+  cancel-in-progress: false
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: "0"
+  CARGO_PROFILE_DEV_DEBUG: "0"
+  RUST_BACKTRACE: "1"
+  RUSTUP_TOOLCHAIN: 1.99.1
+  MBX_HTTP_TIMEOUT: 5m
+  MBX_GC_MAX_SIZE: 30GiB
+  MBX_GC_MIN_FREE_SIZE: 10GiB
+  MBX_REMOTE_TRUST_WRITES: "false"
+  MBX_REMOTE_MODE: read-write
+  MBX_CACHE_LINKS: "1"
+  MBX_INCREMENTAL: "0"
+  MBX_EAGER_INCREMENTAL: "0"
+  MBX_SHARE_OUT_DIR: "1"
+  MBX_BUILD_SCRIPT_EXECUTION: "1"
+  MBX_SUMMARY: full
+jobs:
+  seed:
+    name: Seed shared dependency target
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    env:
+      CACHE_COMPARISON_ARM: hybrid
+      CACHE_COMPARISON_PHASE: seed
+      CACHE_COMPARISON_RESULTS: ${{ runner.temp }}/ci-cache-results
+      MBX_TARGET_VIEWS: "0"
+    steps:
+      - name: Check out experiment helpers
+        uses: actions/checkout@v5
+        with:
+          fetch-depth: 2
+          persist-credentials: false
+      - name: Stage helpers outside the fixed source checkout
+        run: |
+          install -d "$RUNNER_TEMP/ci-cache-tools"
+          install -m 755 scripts/ci-cache-comparison.py scripts/ci-cache-comparison-tool "$RUNNER_TEMP/ci-cache-tools/"
+          echo "$RUNNER_TEMP/ci-cache-tools" >> "$GITHUB_PATH"
+          echo "CACHE_COMPARISON_SCRIPT=$RUNNER_TEMP/ci-cache-tools/ci-cache-comparison.py" >> "$GITHUB_ENV"
+      - name: Check out exact comparison source
+        uses: actions/checkout@v5
+        with:
+          ref: 55531c16e81f492b72f86f5f575f1659391cf7ac
+          fetch-depth: 2
+          persist-credentials: false
+      - uses: actions-rust-lang/setup-rust-toolchain@v1
+        with:
+          toolchain: 1.99.1
+          cache: false
+          rustflags: ""
+      - name: Keep only the pinned toolchain in the cache key
+        run: |
+          while IFS= read -r toolchain; do
+            if [[ "$toolchain" != 1.99.1-* ]]; then
+              rustup toolchain uninstall "$toolchain"
+            fi
+          done < <(rustup toolchain list | cut -d' ' -f1)
+          rustup toolchain list
+      - name: Add the same swap as production CI
+        run: |
+          sudo fallocate -l 16G /swapfile-ci
+          sudo chmod 600 /swapfile-ci
+          sudo mkswap /swapfile-ci > /dev/null
+          sudo swapon /swapfile-ci
+      - name: Install mbx with the selected transport
+        uses: jdx/mr-boxington-action@v1.7.3
+        with:
+          backend: remote
+          remote-url: https://mbx.kclj.dev
+          namespace: kclejeune/sparkles
+          oidc-audience: https://mbx.kclj.dev
+          version: 1.28.0
+          cache-links: true
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-nextest@0.9.146
+      - name: Verify pinned controls and remote write policy
+        run: python3 "$CACHE_COMPARISON_SCRIPT" controls
+      - name: Restore dependency target cache
+        id: target-cache
+        uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0
+        with:
+          prefix-key: sparkles-ci-cache-comparison-20261027-v1
+          shared-key: source-55531c16-${{ github.run_id }}
+          workspaces: . -> target
+          cache-targets: true
+          cache-workspace-crates: false
+          cache-all-crates: false
+          cache-bin: false
+          save-if: ${{ github.event_name == 'push' && github.ref == 'refs/heads/ci-cache-comparison-20261027' }}
+          cmd-format: ci-cache-comparison-tool {0}
+      - name: Repair supported build-script helper references
+        run: python3 "$CACHE_COMPARISON_SCRIPT" repair
+      - name: Record restored target and object-store ownership
+        run: python3 "$CACHE_COMPARISON_SCRIPT" snapshot restored
+      - name: Build the test archive
+        run: python3 "$CACHE_COMPARISON_SCRIPT" archive
+      - name: Record archive target and object-store sizes
+        run: python3 "$CACHE_COMPARISON_SCRIPT" snapshot archived
+      - name: Doctests
+        run: python3 "$CACHE_COMPARISON_SCRIPT" doctests
+      - name: Finalize command and cache receipts
+        run: |
+          python3 "$CACHE_COMPARISON_SCRIPT" finish
+          python3 "$CACHE_COMPARISON_SCRIPT" snapshot completed
+      - name: Upload diagnostic receipts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: cache-comparison-seed-${{ github.run_id }}
+          path: ${{ env.CACHE_COMPARISON_RESULTS }}
+          retention-days: 7
+          if-no-files-found: warn
+  warm:
+    name: Warm comparison (${{ matrix.arm }})
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    env:
+      CACHE_COMPARISON_ARM: ${{ matrix.arm }}
+      CACHE_COMPARISON_PHASE: warm
+      CACHE_COMPARISON_RESULTS: ${{ runner.temp }}/ci-cache-results
+      MBX_TARGET_VIEWS: ${{ matrix.arm == 'remote' && '1' || '0' }}
+    steps:
+      - name: Check out experiment helpers
+        uses: actions/checkout@v5
+        with:
+          fetch-depth: 2
+          persist-credentials: false
+      - name: Stage helpers outside the fixed source checkout
+        run: |
+          install -d "$RUNNER_TEMP/ci-cache-tools"
+          install -m 755 scripts/ci-cache-comparison.py scripts/ci-cache-comparison-tool "$RUNNER_TEMP/ci-cache-tools/"
+          echo "$RUNNER_TEMP/ci-cache-tools" >> "$GITHUB_PATH"
+          echo "CACHE_COMPARISON_SCRIPT=$RUNNER_TEMP/ci-cache-tools/ci-cache-comparison.py" >> "$GITHUB_ENV"
+      - name: Check out exact comparison source
+        uses: actions/checkout@v5
+        with:
+          ref: 55531c16e81f492b72f86f5f575f1659391cf7ac
+          fetch-depth: 2
+          persist-credentials: false
+      - uses: actions-rust-lang/setup-rust-toolchain@v1
+        with:
+          toolchain: 1.99.1
+          cache: false
+          rustflags: ""
+      - name: Keep only the pinned toolchain in the cache key
+        run: |
+          while IFS= read -r toolchain; do
+            if [[ "$toolchain" != 1.99.1-* ]]; then
+              rustup toolchain uninstall "$toolchain"
+            fi
+          done < <(rustup toolchain list | cut -d' ' -f1)
+          rustup toolchain list
+      - name: Add the same swap as production CI
+        run: |
+          sudo fallocate -l 16G /swapfile-ci
+          sudo chmod 600 /swapfile-ci
+          sudo mkswap /swapfile-ci > /dev/null
+          sudo swapon /swapfile-ci
+      - name: Install mbx with the selected transport
+        uses: jdx/mr-boxington-action@v1.7.3
+        with:
+          backend: ${{ matrix.arm == 'target-local' && 'local' || 'remote' }}
+          remote-url: https://mbx.kclj.dev
+          namespace: kclejeune/sparkles
+          oidc-audience: https://mbx.kclj.dev
+          version: 1.28.0
+          cache-links: true
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-nextest@0.9.146
+      - name: Verify pinned controls and remote write policy
+        run: python3 "$CACHE_COMPARISON_SCRIPT" controls
+      - name: Restore dependency target cache
+        id: target-cache
+        uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0
+        with:
+          prefix-key: sparkles-ci-cache-comparison-20261027-v1
+          shared-key: source-55531c16-${{ github.run_id }}
+          workspaces: . -> target
+          cache-targets: true
+          cache-workspace-crates: false
+          cache-all-crates: false
+          cache-bin: false
+          save-if: false
+          cmd-format: ci-cache-comparison-tool {0}
+        if: matrix.arm != 'remote'
+      - name: Require an exact warm target restore
+        if: matrix.arm != 'remote'
+        env:
+          TARGET_CACHE_HIT: ${{ steps.target-cache.outputs.cache-hit }}
+        run: test "$TARGET_CACHE_HIT" = true
+      - name: Repair supported build-script helper references
+        if: matrix.arm != 'remote'
+        run: python3 "$CACHE_COMPARISON_SCRIPT" repair
+      - name: Record restored target and object-store ownership
+        run: python3 "$CACHE_COMPARISON_SCRIPT" snapshot restored
+      - name: Build the test archive
+        run: python3 "$CACHE_COMPARISON_SCRIPT" archive
+      - name: Record archive target and object-store sizes
+        run: python3 "$CACHE_COMPARISON_SCRIPT" snapshot archived
+      - name: Upload the actual test archive
+        uses: actions/upload-artifact@v4
+        with:
+          name: cache-comparison-archive-${{ matrix.arm }}-${{ github.run_id }}
+          path: ${{ runner.temp }}/archive
+          retention-days: 1
+          compression-level: 0
+          if-no-files-found: error
+      - name: Doctests
+        run: python3 "$CACHE_COMPARISON_SCRIPT" doctests
+      - name: Validate archive test and binary listing separately
+        run: python3 "$CACHE_COMPARISON_SCRIPT" verify
+      - name: Finalize command and cache receipts
+        run: |
+          python3 "$CACHE_COMPARISON_SCRIPT" finish
+          python3 "$CACHE_COMPARISON_SCRIPT" snapshot completed
+      - name: Upload diagnostic receipts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: cache-comparison-${{ matrix.arm }}-${{ github.run_id }}
+          path: ${{ env.CACHE_COMPARISON_RESULTS }}
+          retention-days: 7
+          if-no-files-found: warn
+    needs: seed
+    strategy:
+      fail-fast: false
+      max-parallel: 1
+      matrix:
+        arm:
+          - remote
+          - target-local
+          - hybrid
