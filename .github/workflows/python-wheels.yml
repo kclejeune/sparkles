@@ -56,6 +56,7 @@ concurrency:
   cancel-in-progress: ${{ github.ref != 'refs/heads/main' && github.ref_type != 'tag' }}
 
 env:
+  MBX_HTTP_TIMEOUT: 1m
   # Only same-repository PRs may publish to the remote cache.
   MBX_REMOTE_TRUST_WRITES: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name == github.repository && 'true' || 'false' }}
   MATURIN_VERSION: "1.15.0"
@@ -114,7 +115,7 @@ jobs:
           docker-options: >-
             -e MBX_CACHE_EXPORT_GROUP
             -e MBX_REMOTE_URL -e MBX_REMOTE_NAMESPACE -e MBX_REMOTE_OIDC_AUDIENCE
-            -e MBX_REMOTE_TRUST_WRITES
+            -e MBX_REMOTE_TRUST_WRITES -e MBX_HTTP_TIMEOUT
             -e ACTIONS_ID_TOKEN_REQUEST_URL -e ACTIONS_ID_TOKEN_REQUEST_TOKEN
             -e GITHUB_ACTIONS -e GITHUB_EVENT_NAME -e GITHUB_REF -e GITHUB_REF_TYPE -e GITHUB_REF_PROTECTED
             -e MBX_CACHE_DIR=${{ github.workspace }}/.cache/mbx
