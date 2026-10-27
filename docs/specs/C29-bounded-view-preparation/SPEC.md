@@ -1,10 +1,10 @@
 # C29: Bounded preparation of read views
 
-> **Status:** specified.
+> **Status:** partially implemented.
 >
 > **Phases:** Additive bounded history reads come first, followed by controlled
 > permission preparation and adoption by callers that require an operation limit.
-> No phase has shipped.
+> Phase 1 provides bounded historical snapshots. Phases 2 and 3 remain open.
 
 ## Goals
 
@@ -104,7 +104,10 @@ that a requested fact is absent.
 
 ## Phases and acceptance
 
-Phase 1 delivers bounded history entry points. Tests cover live, cached and cold
+Phase 1 delivers bounded history entry points and trusted Dataset history handles.
+Those handles prepare physical snapshots without preparing permission masks or query
+guards. Phase 3 adopts the complete controlled preparation contract for guarded callers.
+Tests cover live, cached and cold
 states, oversized seeds, transaction buffers, lock contention, cancellation, missing
 retained state and inherited branch origins. Sufficient limits return the same state
 as the existing read. Actual allocation controls prove early refusal where a final
@@ -115,7 +118,7 @@ tests compare all current graph, predicate, class, subclass, caller, pattern and
 exemption behavior. Exercise low caps, cached masks, temporary-charge release, large
 enumerations and cancellation within preparation. Failure returns no partial mask.
 
-Phase 3 adopts the contract in bounded Dataset and query paths and C25's exact
+Phase 3 adopts the contract in guarded Dataset and query paths and C25's exact
 reference reader. Test caller changes, historical selectors, guarded views and uniform
 hidden-or-missing behavior. Old signatures retain their documented scope. The item
 is complete only when the adopted bounded callers use the real preparation contract.
@@ -133,6 +136,22 @@ implementation source is used.
 
 ## Outcome
 
-No phase has shipped. Existing hidden-quad and pattern-row limits and the shared
-history cache remain available. Request-scoped historical and permission preparation,
-its built-in provider adoption and the bounded caller integration remain item 395.
+Phase 1 provides `Store::snapshot_at_limited` and
+`Store::snapshot_at_with_branch_limited`, with matching trusted methods on
+`Dataset::history()`. A request cap covers retained delta state, replay and decoding,
+cold origin metadata and newly decoded historical provider configuration. Cancellation and deadlines
+apply to preparation and lock waiting. Sufficient caps preserve the exact selected
+commit, terms and origin. Refusal does not retry an unbounded read, repair a retained
+store or substitute another branch's state.
+
+Cold inherited reads reconcile supported missing catalog tails without writing and
+preserve original commit metadata across compaction. Historical full-text behavior
+remains unchanged. Historical spatial views retain their configuration without
+rebuilding a live index. A pruned branch-time selector whose commit cannot be resolved
+returns `HistoryGone` with an absent sequence and its original time selector. Time
+inheritance is allowed only strictly before the proven fork time.
+
+Phase 2's controlled permission masks and guard providers remain open. Phase 3's
+guarded Dataset and query adoption, C25 exact references and U02 physical-reader
+adoption remain under item 395. The trusted history handles do not provide managed
+write authority, source authenticity or a complete query preparation limit.

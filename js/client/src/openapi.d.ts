@@ -5860,10 +5860,14 @@ export interface components {
         };
         /** @description The body of every non-2xx response. Some errors add members of their own. */
         Error: {
+            /** @description The canonical original selector when a history-gone error cannot resolve its commit. */
+            at?: string;
             /** @description A machine-readable reason, such as `precondition-failed`, `history-gone`, `dataset-restoring` or a backup error code. */
             code?: string;
             /** @description 1-based column of a syntax error, in characters. */
             column?: number;
+            /** @description The resolved commit for a history-gone error. Omitted when pruned time metadata leaves the sequence unknown. */
+            commit?: number;
             /** @description The whole message when `error` was cut. */
             detail?: string;
             /** @description What went wrong, for people. */
@@ -10241,7 +10245,7 @@ export interface components {
                 "application/json": components["schemas"]["Error"];
             };
         };
-        /** @description The commit or state is no longer kept (`history-gone`). */
+        /** @description The commit or state is no longer kept (`history-gone`). An unresolved pruned time omits `commit` and includes its canonical `at` selector. */
         Gone: {
             headers: {
                 [name: string]: unknown;

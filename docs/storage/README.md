@@ -202,6 +202,22 @@ stay readable.
   through a sparse index, by replaying forward or undoing backward. In-memory datasets
   keep the states their snapshots and window hold.
 
+The Rust library provides `Store::snapshot_at_limited` and
+`Store::snapshot_at_with_branch_limited` for request-scoped history preparation.
+`Dataset::history()` exposes matching trusted methods. They accept a memory cap
+alongside `HistoryOptions`, preserve exact inherited origins, and check cancellation
+and deadlines while preparing live, cached or cold states. The cap cannot exceed the
+store's history capacity. Cold origin reads do not recover or rewrite another Store.
+
+These trusted handles return a snapshot for subsequent use. They do not prepare access
+masks or query guards, and their cap does not cover a later query. Controlled permission
+preparation and guarded Dataset, C25 and U02 adoption remain under item 395. Existing
+HTTP and query entry points retain their documented limits.
+
+A branch-time read inherits a parent state only strictly before the fork timestamp.
+If pruning removes the metadata needed to resolve its own state, the read returns
+`HistoryGone` with the original time selector and no invented commit sequence.
+
 ### Diffs, change feed and history queries
 
 * `GET /{ds}/diff`, `sparkles diff` and `Store::diff` compare any two readable commits

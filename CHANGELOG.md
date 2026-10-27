@@ -4,6 +4,12 @@
 
 ### Changed
 
+Rust Store snapshots and trusted Dataset history handles accept per-read memory,
+cancellation and deadline limits while preserving exact retained branch origins.
+Cold inherited reads prepare retained metadata and WAL state without recovery writes.
+Pruned branch-time reads refuse unresolved states with the original selector and no
+invented commit number, including equal timestamps after clock clamping.
+
 History queries report the overlapping part of a recorded gap when the requested
 window ends before the gap's final commit. The same inclusive bounds apply to
 ascending, descending and filtered requests.

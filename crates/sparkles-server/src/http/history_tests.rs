@@ -271,3 +271,55 @@ async fn snapshots_history_and_gone_commits() {
     assert_eq!(r.status, StatusCode::OK, "{}", r.text());
     assert_eq!(r.json()["retention"]["keepCommits"], 5);
 }
+
+#[tokio::test]
+async fn pruned_equal_branch_time_omits_unknown_commit_in_every_read_route() {
+    let dir = tempfile::tempdir().unwrap();
+    let state = Arc::new(
+        AppState::new(dir.path(), StoreOptions::default(), Duration::from_secs(30)).unwrap(),
+    );
+    let attached = state.attach("h", DbType::Persistent, None).unwrap();
+    let ds = &attached.dataset;
+    let t0 = ds.store().head_commit().timestamp_ms + 100_000;
+    ds.store().set_clock(Arc::new(move || t0));
+    ds.update("INSERT DATA { <urn:base> <urn:p> 1 }").unwrap();
+    ds.create_branch("child", &Default::default()).unwrap();
+    let child = ds.branch("child").unwrap();
+    child.store().set_clock(Arc::new(move || t0));
+    child
+        .update("INSERT DATA { <urn:equal> <urn:p> 2 }")
+        .unwrap();
+    let pruned = child.store().head_commit();
+    child.store().set_clock(Arc::new(move || t0 + 1_000));
+    child
+        .update("INSERT DATA { <urn:later> <urn:p> 3 }")
+        .unwrap();
+    child.store().compact().unwrap();
+    child
+        .store()
+        .set_catalog_horizon(sparkles::history::CatalogHorizon {
+            keep_commits: Some(1),
+            keep_age_ms: None,
+        })
+        .unwrap();
+    assert!(child.history().status().first_commit > pruned.seq);
+    let at = sparkles::history::At::Time(pruned.timestamp_ms).to_string();
+    let app = router(state);
+    for path in [
+        format!("/h/sparql?branch=child&query={}&at={}", enc(Q), enc(&at)),
+        format!("/h/data?branch=child&default&at={}", enc(&at)),
+        format!("/h/explain?branch=child&query={}&at={}", enc(Q), enc(&at)),
+    ] {
+        let r = get(&app, &path).await;
+        assert_eq!(r.status, StatusCode::GONE, "{}", r.text());
+        let body = r.json();
+        assert_eq!(body["code"], "history-gone");
+        assert_eq!(body["at"], at);
+        assert!(
+            body.get("commit").is_none(),
+            "unknown commit must be omitted: {body}"
+        );
+        assert_eq!(body["head"], child.store().head_commit().seq);
+        assert!(body["metadata"].is_null());
+    }
+}

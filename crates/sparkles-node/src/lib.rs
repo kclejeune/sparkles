@@ -1711,3 +1711,27 @@ impl NativeTransaction {
         })
     }
 }
+
+#[cfg(test)]
+mod history_error_tests {
+    use super::*;
+
+    #[test]
+    fn gone_history_keeps_node_classification_with_known_or_unresolved_sequence() {
+        for seq in [Some(12), None] {
+            let error = EngineError::HistoryGone(Box::new(sparkles::history::HistoryGone {
+                message: "retained state is gone".into(),
+                seq,
+                at: seq.is_none().then_some(sparkles::history::At::Time(1_000)),
+                head: 57,
+                snapshot: None,
+                reconstructable: vec![(40, 57)],
+                metadata: None,
+            }));
+            let error = err(error);
+            let wire: Value = serde_json::from_str(&error.reason).unwrap();
+            assert_eq!(wire["kind"], "NotFoundError");
+            assert_eq!(wire["message"], "retained state is gone");
+        }
+    }
+}

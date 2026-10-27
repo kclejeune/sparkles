@@ -164,6 +164,13 @@ The `410` body:
   "metadata": { "seq": 12, "timestamp": "…", "kind": "update", … } }
 ```
 
+When pruning removes the branch metadata needed to identify a time selector, the
+error remains `410 history-gone` with the original canonical `at=time:…` selector.
+The body omits `commit` and sets `metadata` to `null`. It never invents a zero, head
+or fork sequence. Known-commit errors retain their numeric `commit`. Inheritance
+from a parent is valid only strictly before the proven fork timestamp, including
+when child writes share that timestamp after clock clamping.
+
 `metadata` is the commit's catalog record, or `null` if the record is gone as well. When
 the selector was `snapshot:NAME`, the body adds `"snapshot": "NAME"` and the pin is kept
 (§4.4). The status is `410` because the loss is permanent (RFC 9110 §15.5.11).
@@ -301,7 +308,7 @@ impl Dataset {
 }
 // error.rs
 Error::NotFound(String)             // 404 (commit, snapshot, time before root)
-Error::HistoryGone(HistoryGone)     // 410; HistoryGone { seq, snapshot, oldest, reconstructable, metadata }
+Error::HistoryGone(HistoryGone)     // 410; HistoryGone { seq: Option<u64>, at: Option<At>, snapshot, head, reconstructable, metadata }
 Error::HistoryUnsupported(String)   // 501 (in-memory, text at a past commit)
 BudgetKind::HistoryMemory           // "history-memory"
 // StoreOptions

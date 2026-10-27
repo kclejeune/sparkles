@@ -939,45 +939,62 @@ pub(crate) fn read_gen_commit_controlled(
     dir: &Path,
     budget: &mut crate::store::cold::ColdBudget<'_>,
 ) -> Result<Option<crate::store::cold::Loaded<RetainedGenerationCommit>>> {
-    let path = dir.join("commit.json");
-    let bytes = match budget.read_file(&path) {
-        Ok(bytes) => bytes,
-        Err(Error::Io(error)) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
-        Err(error) => return Err(error),
-    };
-    let parsed: crate::store::cold::Loaded<GenCommitFile> = budget.json(&bytes)?;
-    if parsed.value.format != 1 {
-        return Err(Error::Unsupported(format!(
-            "{} has format {}; this release reads format 1",
-            path.display(),
-            parsed.value.format
-        )));
+    let start = budget.used();
+    let result = (|| {
+        let path = dir.join("commit.json");
+        let bytes = match budget.read_file(&path) {
+            Ok(bytes) => bytes,
+            Err(Error::Io(error)) if error.kind() == std::io::ErrorKind::NotFound => {
+                budget.check()?;
+                return Ok(None);
+            }
+            Err(error) => return Err(error),
+        };
+        let parsed: crate::store::cold::Loaded<serde_json::Value> = budget.json(&bytes)?;
+        check_gen_commit_value(&path, &parsed.value)?;
+        let file: GenCommitFile = budget.value(parsed.value)?;
+        budget.drop_vec(bytes);
+        let value = decode_gen_commit_file(file, &path)?;
+        let charge =
+            std::mem::size_of::<RetainedGenerationCommit>() as u64 + value.origin.capacity() as u64;
+        if charge > parsed.charge {
+            budget.charge(charge - parsed.charge)?;
+        } else {
+            budget.release(parsed.charge - charge);
+        }
+        budget.check()?;
+        Ok(Some(crate::store::cold::Loaded { value, charge }))
+    })();
+    if result.is_err() {
+        // Input and parse owners have dropped; preserve caller-held storage.
+        budget.release(budget.used() - start);
     }
-    budget.drop_vec(bytes);
-    let value = decode_gen_commit_file(parsed.value, &path)?;
-    let charge =
-        std::mem::size_of::<RetainedGenerationCommit>() as u64 + value.origin.capacity() as u64;
-    if charge > parsed.charge {
-        budget.charge(charge - parsed.charge)?;
-    } else {
-        budget.release(parsed.charge - charge);
-    }
-    budget.check()?;
-    Ok(Some(crate::store::cold::Loaded { value, charge }))
+    result
 }
 
 /// Parse `gen-NNNN/commit.json`, refusing a `format` this build does not read.
 fn parse_gen_commit(path: &Path, b: &[u8]) -> Result<GenCommitFile> {
-    let f: GenCommitFile = serde_json::from_slice(b)
+    let value: serde_json::Value = serde_json::from_slice(b)
         .map_err(|e| Error::Corrupt(format!("{}: {e}", path.display())))?;
-    if f.format != 1 {
+    check_gen_commit_value(path, &value)?;
+    serde_json::from_value(value).map_err(|e| Error::Corrupt(format!("{}: {e}", path.display())))
+}
+
+/// A recognizable future version is refused before interpreting the supported
+/// payload schema, which a newer writer is allowed to change.
+fn check_gen_commit_value(path: &Path, value: &serde_json::Value) -> Result<()> {
+    let format = value
+        .get("format")
+        .and_then(serde_json::Value::as_u64)
+        .ok_or_else(|| Error::Corrupt(format!("{}: format is not a version", path.display())))?;
+    if format != 1 {
         return Err(Error::Unsupported(format!(
             "{} has format {}; this release reads format 1",
             path.display(),
-            f.format
+            format
         )));
     }
-    Ok(f)
+    Ok(())
 }
 
 /// The strict-framing offset of a generation's headerless log (`walStrictFrom` of
@@ -1900,6 +1917,21 @@ mod tests {
             read_gen_commit_controlled(dir.path(), &mut budget),
             Err(Error::Unsupported(_))
         ));
+        assert_eq!(budget.used(), 0);
+        value["commit"] = false.into();
+        let future = serde_json::to_vec(&value).unwrap();
+        std::fs::write(&path, &future).unwrap();
+        budget.charge(17).unwrap();
+        assert!(matches!(
+            read_gen_commit_controlled(dir.path(), &mut budget),
+            Err(Error::Unsupported(_))
+        ));
+        assert_eq!(budget.used(), 17);
+        assert!(matches!(
+            read_gen_commit(dir.path()),
+            Err(Error::Unsupported(_))
+        ));
+        assert_eq!(std::fs::read(&path).unwrap(), future);
     }
 
     #[test]

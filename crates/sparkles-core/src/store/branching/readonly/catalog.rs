@@ -111,11 +111,8 @@ pub(super) fn reconcile_tail(
         let mut previous_time = current.base.timestamp_ms;
         prove_file_with(
             root,
-            &current.dir,
             id,
-            current.base,
-            current.folding,
-            current.strict_from,
+            current,
             u64::MAX,
             terms,
             budget,

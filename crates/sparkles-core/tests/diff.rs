@@ -401,9 +401,15 @@ fn the_change_feed_stops_at_gaps() {
     let page = s.changes(1, &Default::default()).unwrap();
     assert_eq!(page.next(), 3);
     let e = s.changes(3, &Default::default()).err().unwrap();
-    assert!(matches!(&e, Error::HistoryGone(g) if g.seq == 4), "{e}");
+    assert!(
+        matches!(&e, Error::HistoryGone(g) if g.seq == Some(4)),
+        "{e}"
+    );
     let e = s.changes(4, &Default::default()).err().unwrap();
-    assert!(matches!(&e, Error::HistoryGone(g) if g.seq == 4), "{e}");
+    assert!(
+        matches!(&e, Error::HistoryGone(g) if g.seq == Some(4)),
+        "{e}"
+    );
     // and after it
     let (seen, _) = follow(&s, 5, &Default::default());
     assert_eq!(seen, [6]);

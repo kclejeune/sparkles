@@ -177,36 +177,19 @@ fn current_controlled(
 
 fn prove_file(
     root: &Path,
-    dir: &Path,
     id: uuid::Uuid,
-    base: CommitInfo,
-    folding: bool,
-    strict_from: Option<u64>,
+    generation: &Current,
     target: u64,
     terms: u64,
     budget: &mut ColdBudget<'_>,
 ) -> Result<wal::probe::ProvenWal> {
-    prove_file_with(
-        root,
-        dir,
-        id,
-        base,
-        folding,
-        strict_from,
-        target,
-        terms,
-        budget,
-        &mut |_| Ok(()),
-    )
+    prove_file_with(root, id, generation, target, terms, budget, &mut |_| Ok(()))
 }
 
 fn prove_file_with(
     root: &Path,
-    dir: &Path,
     id: uuid::Uuid,
-    base: CommitInfo,
-    folding: bool,
-    strict_from: Option<u64>,
+    generation: &Current,
     target: u64,
     terms: u64,
     budget: &mut ColdBudget<'_>,
@@ -214,30 +197,30 @@ fn prove_file_with(
 ) -> Result<wal::probe::ProvenWal> {
     let start = budget.used();
     budget.charge(
-        (root.as_os_str().len() as u64 + dir.as_os_str().len() as u64)
+        (root.as_os_str().len() as u64 + generation.dir.as_os_str().len() as u64)
             .saturating_mul(4)
             .saturating_add(1024),
     )?;
     let result = (|| {
         let annotations = crate::annotations::seqs_controlled(root, id, budget)?;
-        let path = dir.join("wal.log");
+        let path = generation.dir.join("wal.log");
         let loaded = match budget.buffered(&path) {
             Ok(loaded) => loaded,
             Err(Error::Io(error)) if error.kind() == std::io::ErrorKind::NotFound => {
-                if strict_from.is_some() {
+                if generation.strict_from.is_some() {
                     return Err(Error::Corrupt(
                         "retained generation lost its recorded durable WAL".into(),
                     ));
                 }
                 budget.check()?;
                 let point = wal::WalPoint {
-                    seq: base.seq,
+                    seq: generation.base.seq,
                     offset: 0,
-                    folding,
+                    folding: generation.folding,
                 };
                 return Ok(wal::probe::ProvenWal {
                     head: point,
-                    selected: (target == base.seq).then_some(point),
+                    selected: (target == generation.base.seq).then_some(point),
                 });
             }
             Err(error) => return Err(error),
@@ -247,10 +230,10 @@ fn prove_file_with(
         wal::probe::prove_prefix_with(
             &mut reader,
             extent,
-            base.seq,
+            generation.base.seq,
             target,
-            folding,
-            strict_from,
+            generation.folding,
+            generation.strict_from,
             terms,
             annotations.value.as_deref(),
             &path,
@@ -273,17 +256,7 @@ fn head_controlled(
     let result = (|| {
         let vocab = crate::store::cold::head_vocabulary_controlled(&current.dir, root, budget)?;
         let terms = vocab.value.len_limited(&budget.owned_limit()?)?;
-        let proof = prove_file(
-            root,
-            &current.dir,
-            id,
-            current.base,
-            current.folding,
-            current.strict_from,
-            u64::MAX,
-            terms,
-            budget,
-        )?;
+        let proof = prove_file(root, id, current, u64::MAX, terms, budget)?;
         Ok(proof.head.seq)
     })();
     budget.release(budget.used() - start);
@@ -425,10 +398,10 @@ impl Store {
         limit: &crate::history::ReadLimit<'_>,
     ) -> Result<OriginRead> {
         limit.check(0)?;
-        if let At::Snapshot(name) = at
-            && !crate::history::valid_name(name)
-        {
-            return Err(Error::invalid("invalid snapshot name"));
+        if !matches!(at, At::Commit(_) | At::Time(_)) {
+            return Err(Error::invalid(
+                "cold inherited reads require a resolved commit or original time selector",
+            ));
         }
         let set = self.owned_set()?;
         let _opening = limit.lock(&set.opening)?;
@@ -469,13 +442,9 @@ impl Store {
             )?);
         }
         let wanted = match at {
-            At::Head => Some(head),
             At::Commit(seq) => Some(*seq),
-            At::Snapshot(name) => Some(
-                crate::history::pin_controlled(&root, id, name, &mut budget)?
-                    .ok_or_else(|| Error::NotFound(format!("no snapshot '{name}'")))?,
-            ),
             At::Time(_) => None,
+            _ => unreachable!("validated inherited selector"),
         };
         if let Some(seq) = wanted {
             if seq > head {
@@ -542,16 +511,7 @@ impl Store {
                 &mut budget,
             )?);
         };
-        // Configured auxiliary live providers need their own admitted preparation;
-        // returning a data view with silently changed provider semantics is unsafe.
-        for name in ["geo.json", "text.json"] {
-            budget.check()?;
-            if root.join(name).try_exists()? {
-                return Err(Error::HistoryUnsupported(
-                    "a cold origin's auxiliary provider preparation is incomplete".into(),
-                ));
-            }
-        }
+        let geo = historical_geo_controlled(&root, &set.opts, &mut budget)?;
         let loaded = match cold::read_link_controlled(&selected.value.dir, &mut budget)? {
             Some(file) => Generation::open_linked_controlled(
                 &selected.value.dir,
@@ -578,11 +538,8 @@ impl Store {
         let mut parent_point = None;
         let proof = prove_file_with(
             &root,
-            &selected.value.dir,
             id,
-            selected.value.base,
-            selected.value.folding,
-            selected.value.strict_from,
+            &selected.value,
             metadata.seq,
             terms,
             &mut budget,
@@ -658,8 +615,9 @@ impl Store {
             cacheable: true,
             dvocab_len: terms,
             commit: metadata.seq,
+            // Ordinary past snapshots deliberately have no live full-text index.
             text: None,
-            geo: None,
+            geo,
             union_default_graph: set.opts.union_default_graph,
             geo_op_vertices: set.opts.geo_op_vertices,
             historical: true,
@@ -716,20 +674,128 @@ fn generation_end(
     let result = (|| {
         let vocab = cold::head_vocabulary_controlled(&generation.dir, root, budget)?;
         let terms = vocab.value.len_limited(&budget.owned_limit()?)?;
-        let proof = prove_file(
-            root,
-            &generation.dir,
-            id,
-            generation.base,
-            generation.folding,
-            generation.strict_from,
-            u64::MAX,
-            terms,
-            budget,
-        )?;
+        let proof = prove_file(root, id, generation, u64::MAX, terms, budget)?;
         budget.check()?;
         Ok(proof.head.seq)
     })();
     budget.release(budget.used() - start);
     result
+}
+
+/// Match ordinary past-state provider semantics without mutable provider startup.
+/// Invalid spatial configuration disables the index at ordinary Store open too.
+fn historical_geo_controlled(
+    root: &Path,
+    options: &StoreOptions,
+    budget: &mut ColdBudget<'_>,
+) -> Result<Option<Arc<crate::geo::GeoView>>> {
+    #[cfg(not(feature = "geo"))]
+    {
+        let _ = (root, options);
+        budget.check()?;
+        Ok(None)
+    }
+    #[cfg(feature = "geo")]
+    {
+        let start = budget.used();
+        let result = (|| {
+            budget.charge(root.as_os_str().len() as u64 * 2 + 4096)?;
+            let bytes = match budget.read_file(&root.join(crate::geo::CONFIG_FILE)) {
+                Ok(bytes) => bytes,
+                Err(Error::Io(error)) if error.kind() == std::io::ErrorKind::NotFound => {
+                    return Ok(None);
+                }
+                Err(error) => return Err(error),
+            };
+            let mut config: Loaded<crate::geo::GeoConfig> = match budget.json(&bytes) {
+                Ok(config) => config,
+                Err(Error::Corrupt(_)) => return Ok(None),
+                Err(error) => return Err(error),
+            };
+            budget.drop_vec(bytes);
+            // Validation can format an offending configured IRI. Its diagnostic is
+            // covered by the retained parser charge, including owned strings.
+            match config.value.validate_controlled(|| budget.check()) {
+                Ok(()) => {}
+                Err(Error::Invalid(_)) => return Ok(None),
+                Err(error) => return Err(error),
+            }
+            config.value.query_rewrite &= options.geo_query_rewrite;
+            let view = crate::store::geo::historical_geo_view(Arc::new(config.value), 1);
+            budget.check()?;
+            Ok(Some(view))
+        })();
+        match result {
+            Ok(Some(view)) => {
+                // Keep the conservative decoded-config charge beside replay and
+                // the returned view. Empty defaults and provider headers fit in 4 KiB.
+                budget.check()?;
+                Ok(Some(view))
+            }
+            Ok(None) => {
+                budget.release(budget.used() - start);
+                budget.check()?;
+                Ok(None)
+            }
+            Err(error) => {
+                budget.release(budget.used() - start);
+                Err(error)
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::{
+        sync::atomic::{AtomicBool, Ordering},
+        time::{Duration, Instant},
+    };
+
+    #[test]
+    fn cold_origin_opening_wait_observes_cancellation_and_deadline() {
+        for deadline in [false, true] {
+            let root = tempfile::tempdir().unwrap();
+            let store = Arc::new(Store::open(root.path(), Default::default()).unwrap());
+            let set = store.owned_set().unwrap();
+            let held = set.opening.lock();
+            let flag = Arc::new(AtomicBool::new(false));
+            let read = store.clone();
+            let cancel = flag.clone();
+            let (send, receive) = std::sync::mpsc::channel();
+            let (started, wait) = std::sync::mpsc::channel();
+            let task = std::thread::spawn(move || {
+                let options = crate::history::HistoryOptions {
+                    cancel: Some(cancel),
+                    deadline: deadline.then(|| Instant::now() + Duration::from_millis(50)),
+                };
+                let limit = crate::history::ReadLimit {
+                    options: &options,
+                    memory: Some(8 << 20),
+                    held: 0,
+                };
+                started.send(()).unwrap();
+                send.send(read.readonly_branch_snapshot_limited(
+                    uuid::Uuid::new_v4(),
+                    &At::Commit(0),
+                    &limit,
+                ))
+                .unwrap();
+            });
+            wait.recv_timeout(Duration::from_secs(1)).unwrap();
+            if !deadline {
+                std::thread::sleep(Duration::from_millis(30));
+                flag.store(true, Ordering::Relaxed);
+            }
+            let result = receive.recv_timeout(Duration::from_secs(1));
+            drop(held);
+            task.join().unwrap();
+            if deadline {
+                assert!(matches!(result, Ok(Err(Error::Timeout))));
+            } else {
+                assert!(matches!(result, Ok(Err(Error::Cancelled))));
+            }
+        }
+    }
 }
