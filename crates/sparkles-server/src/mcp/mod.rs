@@ -445,11 +445,18 @@ impl McpServer {
         let server = self.clone();
         let name = name.to_string();
         let request_id = call.request_id.clone();
+        // These lifecycle operations emit after their actual mutation. Carry the
+        // original tracing context into their blocking worker as well as Call.
+        let audit = matches!(name.as_str(), "create_branch" | "delete_branch")
+            .then(|| crate::audit::Actor::tool(&call.principal, &call.request_id));
         let joined = tokio::task::spawn_blocking(move || {
             // the slot, and the request's rate-limit permits in `call.held`, are held
             // until the work itself ends, even if the caller is gone
             let _permit = permit;
-            tools::run(&server, &name, args, &call)
+            match audit {
+                Some(actor) => actor.in_scope(|| tools::run(&server, &name, args, &call)),
+                None => tools::run(&server, &name, args, &call),
+            }
         })
         .await;
         joined.unwrap_or_else(|e| {

@@ -4,6 +4,11 @@
 
 ### Changed
 
+Dataset and branch administration emit audit events across HTTP, local commands and
+MCP. Clone events follow actual registration and preserve the initiating actor and
+selected source commit. Successful scratch expiry records a system actor, while failed
+authorized operations record bounded codes without request payloads or credentials.
+
 Rust Store snapshots and trusted Dataset history handles accept per-read memory,
 cancellation and deadline limits while preserving exact retained branch origins.
 Cold inherited reads prepare retained metadata and WAL state without recovery writes.

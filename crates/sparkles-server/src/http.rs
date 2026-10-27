@@ -496,6 +496,22 @@ impl IntoResponse for ApiError {
 }
 
 impl ApiError {
+    pub(crate) fn audit_code(&self) -> &str {
+        self.1
+            .get("code")
+            .and_then(J::as_str)
+            .unwrap_or(match self.0 {
+                StatusCode::BAD_REQUEST => "bad-request",
+                StatusCode::FORBIDDEN => "forbidden",
+                StatusCode::NOT_FOUND => "not-found",
+                StatusCode::CONFLICT => "conflict",
+                StatusCode::UNSUPPORTED_MEDIA_TYPE => "unsupported-media-type",
+                StatusCode::REQUEST_TIMEOUT => "timeout",
+                StatusCode::SERVICE_UNAVAILABLE => "unavailable",
+                _ => "operation-failed",
+            })
+    }
+
     /// The error's message, for a task that reports it.
     pub(crate) fn message(&self) -> String {
         self.1
@@ -4115,9 +4131,38 @@ async fn get_dataset(
 
 async fn create_dataset(
     State(st): St,
+    Extension(p): Extension<Principal>,
     uri: Uri,
     headers: HeaderMap,
     AdminBody(body): AdminBody,
+) -> ApiResult {
+    let actor = crate::audit::Actor::request(&p);
+    let mut attempted = None;
+    let mut dispatched = false;
+    let result = create_dataset_inner(
+        st,
+        uri,
+        headers,
+        body,
+        &actor,
+        &mut attempted,
+        &mut dispatched,
+    )
+    .await;
+    if !dispatched && let Err(error) = &result {
+        actor.failed("dataset_created", attempted.as_deref(), error.audit_code());
+    }
+    result
+}
+
+async fn create_dataset_inner(
+    st: Arc<AppState>,
+    uri: Uri,
+    headers: HeaderMap,
+    body: Bytes,
+    actor: &crate::audit::Actor,
+    attempted: &mut Option<String>,
+    dispatched: &mut bool,
 ) -> ApiResult {
     if st.read_only {
         return Err(err(StatusCode::FORBIDDEN, "server is read-only"));
@@ -4201,6 +4246,7 @@ async fn create_dataset(
             ),
         ));
     }
+    *attempted = Some(name.clone());
     if st.get(&name).is_some() {
         return Err(err(
             StatusCode::CONFLICT,
@@ -4214,27 +4260,51 @@ async fn create_dataset(
         ));
     }
     let st2 = st.clone();
+    let actor = actor.clone();
+    // The continuing worker owns its terminal record once dispatched.
+    *dispatched = true;
     let ds = blocking(move || {
-        let ds = st2.create(&name, kind)?;
-        // a new dataset with its spatial and full-text indexes, or none at all
-        let enabled = (|| -> sparkles::Result<()> {
-            if let Some(cfg) = geo {
-                ds.store.enable_geo(cfg)?;
+        let result = (|| -> ApiResult<Arc<Dataset>> {
+            let ds = st2.create(&name, kind)?;
+            // a new dataset with its spatial and full-text indexes, or none at all
+            let enabled = (|| -> sparkles::Result<()> {
+                if let Some(cfg) = geo {
+                    ds.store.enable_geo(cfg)?;
+                }
+                #[cfg(feature = "text")]
+                if let Some(cfg) = text {
+                    ds.store.enable_text(cfg)?;
+                }
+                #[cfg(not(feature = "text"))]
+                let _ = text;
+                Ok(())
+            })();
+            if let Err(e) = enabled {
+                drop(ds);
+                st2.delete(&name)?;
+                return Err(e.into());
             }
-            #[cfg(feature = "text")]
-            if let Some(cfg) = text {
-                ds.store.enable_text(cfg)?;
-            }
-            #[cfg(not(feature = "text"))]
-            let _ = text;
-            Ok(())
+            Ok(ds)
         })();
-        if let Err(e) = enabled {
-            drop(ds);
-            st2.delete(&name)?;
-            return Err(e.into());
+        match &result {
+            Ok(ds) => crate::audit::dataset(
+                "dataset_created",
+                Some(&ds.name),
+                Some(ds.store.dataset_id()),
+                &actor,
+                crate::audit::Fields {
+                    kind: Some(if kind == DbType::Mem {
+                        "mem"
+                    } else {
+                        "persistent"
+                    }),
+                    declared: Some(ds.ephemeral),
+                    ..Default::default()
+                },
+            ),
+            Err(error) => actor.failed("dataset_created", Some(&name), error.audit_code()),
         }
-        Ok(ds)
+        result
     })
     .await?;
     Ok((StatusCode::CREATED, Json(dataset_info(&st, &ds))).into_response())
@@ -4249,6 +4319,23 @@ async fn clone_dataset(
     uri: Uri,
     headers: HeaderMap,
     AdminBody(body): AdminBody,
+) -> ApiResult {
+    let actor = crate::audit::Actor::request(&p);
+    let result = clone_dataset_inner(st, source.clone(), p, uri, headers, body, &actor).await;
+    if let Err(error) = &result {
+        actor.failed("dataset_cloned", Some(&source), error.audit_code());
+    }
+    result
+}
+
+async fn clone_dataset_inner(
+    st: Arc<AppState>,
+    source: String,
+    p: Principal,
+    uri: Uri,
+    headers: HeaderMap,
+    body: Bytes,
+    actor: &crate::audit::Actor,
 ) -> ApiResult {
     if st.read_only {
         return Err(err(StatusCode::FORBIDDEN, "server is read-only"));
@@ -4366,9 +4453,10 @@ async fn clone_dataset(
         .map_err(|m| err(StatusCode::CONFLICT, m))?;
     let st2 = st.clone();
     let target = name.clone();
+    let mut audit = crate::audit::PendingClone::new(actor.clone(), name.clone());
     let task = st.start_task_opts(id, "clone", &source, Some(&name), true, move |h| {
         let ctl = h.control();
-        let (_, rep) = st2.catalog.clone_from_reserved(
+        let result = st2.catalog.clone_from_reserved(
             &src.dataset,
             reservation,
             &sparkles::catalog::CloneRequest {
@@ -4380,7 +4468,16 @@ async fn clone_dataset(
                 spec,
             },
             &ctl,
-        )?;
+        );
+        let (created, rep) = match result {
+            Ok(created) => created,
+            Err(error) => {
+                audit.failed(error.code());
+                return Err(error.into());
+            }
+        };
+        audit.completed(created.dataset_id(), &src.name, &rep);
+        drop(created);
         h.set_cancellable(false);
         h.set_detail(json!({
             "method": rep.method.name(),
@@ -4456,13 +4553,32 @@ async fn rename_dataset(
         .into_response())
 }
 
-async fn delete_dataset(State(st): St, Path(name): Path<String>) -> ApiResult {
+async fn delete_dataset(
+    State(st): St,
+    Path(name): Path<String>,
+    Extension(p): Extension<Principal>,
+) -> ApiResult {
+    let actor = crate::audit::Actor::request(&p);
+    let mut dispatched = false;
+    let result = delete_dataset_inner(st, &name, &actor, &mut dispatched).await;
+    if !dispatched && let Err(error) = &result {
+        actor.failed("dataset_deleted", Some(&name), error.audit_code());
+    }
+    result
+}
+
+async fn delete_dataset_inner(
+    st: Arc<AppState>,
+    name: &str,
+    actor: &crate::audit::Actor,
+    dispatched: &mut bool,
+) -> ApiResult {
     if st.read_only {
         return Err(err(StatusCode::FORBIDDEN, "server is read-only"));
     }
     // the operator declared it on the command line, and the next start would attach it
     // again (spec C19 §5.1)
-    if st.get(&name).is_some_and(|ds| ds.ephemeral) {
+    if st.get(name).is_some_and(|ds| ds.ephemeral) {
         return Err(err_code(
             StatusCode::CONFLICT,
             "declared-dataset",
@@ -4472,16 +4588,30 @@ async fn delete_dataset(State(st): St, Path(name): Path<String>) -> ApiResult {
         ));
     }
     let st2 = st.clone();
-    let n = name.clone();
-    let deleted = blocking(move || Ok(st2.delete(&n)?)).await?;
-    if deleted {
-        Ok(StatusCode::OK.into_response())
-    } else {
-        Err(err(
-            StatusCode::NOT_FOUND,
-            format!("no such dataset: /{name}"),
-        ))
-    }
+    let n = name.to_string();
+    let actor = actor.clone();
+    *dispatched = true;
+    blocking(move || {
+        let result = (|| -> ApiResult {
+            let (deleted, identity) = st2.delete_with_audit_identity(&n)?;
+            if !deleted {
+                return Err(err(StatusCode::NOT_FOUND, format!("no such dataset: /{n}")));
+            }
+            crate::audit::dataset(
+                "dataset_deleted",
+                Some(&n),
+                identity,
+                &actor,
+                Default::default(),
+            );
+            Ok(StatusCode::OK.into_response())
+        })();
+        if let Err(error) = &result {
+            actor.failed("dataset_deleted", Some(&n), error.audit_code());
+        }
+        result
+    })
+    .await
 }
 
 async fn stats(State(st): St, Path(name): Path<String>, uri: Uri) -> ApiResult {

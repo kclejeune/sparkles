@@ -93,6 +93,12 @@ Authentication is off by default. Once it is on, access is denied unless a grant
   back-channel logout and optional idle timeouts. API clients can send the provider's JWT
   access tokens, checked against its JWKS with key rotation, and Cloudflare Access
   assertions are verified. Groups map to roles.
+* Dataset and branch administration emit INFO records under `sparkles::audit` with the
+  existing actor and completed operation identities. Clones record the selected source
+  commit after registration, and authorized failures record bounded codes. Continuing
+  mutation workers retain these records when an HTTP request is cancelled. The
+  [operations guide](../operations/README.md#observability) describes local commands and
+  automatic scratch expiry.
 * With an OIDC provider and `serve --mcp`, `/$/mcp` is an OAuth 2.1 protected resource
   ([API.md](../API.md#oauth-for-the-mcp-endpoint)). It publishes RFC 9728 metadata that
   names the provider, accepts access tokens whose audience is its own resource
