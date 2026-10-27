@@ -577,15 +577,14 @@ fn label(v: &Value, path: &str) -> R<Label> {
 /// The members of ShEx 2.2 drafts that no published form kept are errors that name the
 /// feature.
 fn no_2_2(o: &Map<String, Value>, path: &str) -> R<()> {
-    for key in ["restricts"] {
-        if let Some(v) = o.get(key)
-            && *v != Value::Bool(false)
-        {
-            return fail(
-                &member(path, key),
-                format!("\"{key}\" is ShEx 2.2, which is not supported"),
-            );
-        }
+    let key = "restricts";
+    if let Some(v) = o.get(key)
+        && *v != Value::Bool(false)
+    {
+        return fail(
+            &member(path, key),
+            format!("\"{key}\" is ShEx 2.2, which is not supported"),
+        );
     }
     Ok(())
 }

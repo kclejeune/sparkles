@@ -985,7 +985,7 @@ fn registered(
             Val::Id(id) | Val::Dec(id, _) => ctx.term(id).ok_or(TypeError)?,
             Val::V(v) => v.to_term(),
         };
-        let cost = super::extensions::term_bytes(&term).map_err(&fail)?;
+        let cost = super::extensions::term_bytes(&term).map_err(fail)?;
         bytes = bytes.saturating_add(cost);
         if bytes > MAX_BATCH_BYTES {
             return Err(fail(ScalarError::Execution(
@@ -1011,7 +1011,7 @@ fn registered(
         )));
     }
     let term = results.into_iter().next().unwrap().map_err(fail)?;
-    let bytes = super::extensions::term_bytes(&term).map_err(&fail)?;
+    let bytes = super::extensions::term_bytes(&term).map_err(fail)?;
     if bytes > MAX_BATCH_BYTES {
         return Err(fail(ScalarError::Execution(
             "callback output exceeds batch byte ceiling".into(),

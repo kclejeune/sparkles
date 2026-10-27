@@ -339,7 +339,7 @@ impl ObjectStore for Flaky {
         if !hit
             || self
                 .corrupt
-                .fetch_update(SeqCst, SeqCst, |n| n.checked_sub(1))
+                .try_update(SeqCst, SeqCst, |n| n.checked_sub(1))
                 .is_err()
         {
             return Ok(r);

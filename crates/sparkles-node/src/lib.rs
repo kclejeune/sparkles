@@ -936,7 +936,7 @@ fn pull(
         };
         if let Some(paused) = paused {
             let ns = returned.elapsed().as_nanos().min(u128::from(u64::MAX)) as u64;
-            let _ = paused.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |n| {
+            let _ = paused.try_update(Ordering::Relaxed, Ordering::Relaxed, |n| {
                 Some(n.saturating_add(ns))
             });
         }

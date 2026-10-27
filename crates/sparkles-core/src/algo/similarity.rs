@@ -132,7 +132,7 @@ fn dimension(n: usize) -> Result<()> {
 fn admit_pairs(pairs: &AtomicU64, count: usize, max: u64) -> Result<()> {
     let count =
         u64::try_from(count).map_err(|_| bad("nodeSimilarity", "candidate count overflows"))?;
-    pairs.fetch_update(Ordering::Relaxed,Ordering::Relaxed,|n|n.checked_add(count).filter(|&v|v<=max))
+    pairs.try_update(Ordering::Relaxed,Ordering::Relaxed,|n|n.checked_add(count).filter(|&v|v<=max))
         .map(|_|()).map_err(|_|bad("nodeSimilarity",format!("more than {max} candidate pairs; raise algo:maxPairs, or project fewer predicates")))
 }
 
@@ -1594,12 +1594,12 @@ mod regression_tests {
                 if add {
                     observed
                         .live
-                        .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |n| n.checked_add(bytes))
+                        .try_update(Ordering::SeqCst, Ordering::SeqCst, |n| n.checked_add(bytes))
                         .expect("physical capacity overflow");
                 } else {
                     observed
                         .live
-                        .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |n| n.checked_sub(bytes))
+                        .try_update(Ordering::SeqCst, Ordering::SeqCst, |n| n.checked_sub(bytes))
                         .expect("physical capacity owner underflow");
                 }
                 let _ = name;

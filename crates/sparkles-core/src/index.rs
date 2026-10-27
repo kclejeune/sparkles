@@ -1145,8 +1145,7 @@ impl Segments {
     fn note_sparse_read(&self, b: usize) {
         use std::sync::atomic::Ordering::Relaxed;
         let limit = self.dense_limit(b);
-        let _ =
-            self.sparse_reads[b].fetch_update(Relaxed, Relaxed, |n| (n < limit).then_some(n + 1));
+        let _ = self.sparse_reads[b].try_update(Relaxed, Relaxed, |n| (n < limit).then_some(n + 1));
     }
 
     /// Count a segment of block `b` that a prefetch decoded, short of the limit: the
@@ -1155,8 +1154,8 @@ impl Segments {
     fn note_warm_read(&self, b: usize) {
         use std::sync::atomic::Ordering::Relaxed;
         let limit = self.dense_limit(b);
-        let _ = self.sparse_reads[b]
-            .fetch_update(Relaxed, Relaxed, |n| (n + 1 < limit).then_some(n + 1));
+        let _ =
+            self.sparse_reads[b].try_update(Relaxed, Relaxed, |n| (n + 1 < limit).then_some(n + 1));
     }
 
     /// Have readers read block `b` whole from now on.

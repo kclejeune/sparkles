@@ -285,7 +285,7 @@ impl Control {
         }
         let prior = i
             .used
-            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |u| {
+            .try_update(Ordering::Relaxed, Ordering::Relaxed, |u| {
                 u.checked_add(bytes).filter(|n| *n <= i.limit)
             })
             .map_err(|u| {
@@ -327,7 +327,7 @@ impl Control {
         let _ = self
             .inner
             .used
-            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |u| {
+            .try_update(Ordering::Relaxed, Ordering::Relaxed, |u| {
                 Some(u.saturating_sub(bytes))
             });
     }

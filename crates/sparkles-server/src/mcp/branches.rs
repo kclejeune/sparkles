@@ -578,7 +578,7 @@ impl Tools<'_> {
             let fields = ds
                 .store
                 .preview_merge(&source, &target, &o)
-                .map_err(&refused)?;
+                .map_err(refused)?;
             out["expect"] = json!({ "source": fields.source.seq, "target": fields.target.seq });
             let mut m = crate::http::branches::merge_json(&fields, None);
             if restricted && let Some(obj) = m.as_object_mut() {

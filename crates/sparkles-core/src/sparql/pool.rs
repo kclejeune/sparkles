@@ -121,7 +121,7 @@ impl QueryPool {
     /// may have granted after the call.
     fn reserve(&self, bytes: u64, limit: u64) -> bool {
         self.granted
-            .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |g| {
+            .try_update(Ordering::SeqCst, Ordering::SeqCst, |g| {
                 g.checked_add(bytes).filter(|n| *n <= limit)
             })
             .is_ok()
@@ -404,7 +404,7 @@ impl PoolGrant {
     #[inline]
     fn add_usage(&self, bytes: u64) -> Result<u64, Error> {
         self.used
-            .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |used| {
+            .try_update(Ordering::SeqCst, Ordering::SeqCst, |used| {
                 used.checked_add(bytes)
             })
             .map(|prior| prior + bytes)

@@ -32,7 +32,7 @@
 
 # Rust is "stable" in rust-toolchain.toml; the image pins the release that was stable when
 # this file was last updated. Node and pnpm are the versions mise.toml pins.
-ARG RUST_VERSION=1.98.1
+ARG RUST_VERSION=1.99.1
 ARG NODE_VERSION=24.21.0
 ARG PNPM_VERSION=10.34.5
 # must equal the wasm-bindgen crate's version in Cargo.lock (scripts/build-fmt-wasm.sh checks)

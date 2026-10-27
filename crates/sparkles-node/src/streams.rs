@@ -165,7 +165,7 @@ impl Sink {
         };
         if let Some(pause) = &self.pause {
             let ns = waited.elapsed().as_nanos().min(u128::from(u64::MAX)) as u64;
-            let _ = pause.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |n| {
+            let _ = pause.try_update(Ordering::Relaxed, Ordering::Relaxed, |n| {
                 Some(n.saturating_add(ns))
             });
         }

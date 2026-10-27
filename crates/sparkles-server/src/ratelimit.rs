@@ -870,7 +870,7 @@ impl Slot {
         let inc = t.saturating_mul(u64::from(cost));
         let _ = self
             .tat
-            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |cur| {
+            .try_update(Ordering::Relaxed, Ordering::Relaxed, |cur| {
                 Some(cur.max(now).saturating_add(inc))
             });
     }
@@ -880,7 +880,7 @@ impl Slot {
         let dec = t.saturating_mul(u64::from(cost));
         let _ = self
             .tat
-            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |cur| {
+            .try_update(Ordering::Relaxed, Ordering::Relaxed, |cur| {
                 Some(cur.saturating_sub(dec))
             });
     }
