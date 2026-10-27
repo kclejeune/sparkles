@@ -116,65 +116,81 @@ keeps the handoff notes current.
 
 | Role | Model |
 |---|---|
-| Orchestration, validating review findings, remediation plans, consults | Claude Opus 5.5 |
-| Implementing engineering work, including remediation plans | Claude Opus 5.5 |
-| Implementing clear-cut work that needs no judgment | Claude Sonnet 5.5 at high effort |
-| Code review | Codex with gpt-6.1-sol at high effort |
-| Mechanical tasks with a deterministic check | Claude Haiku 5.5 |
+| Coordination, dispatch, monitoring and handoff maintenance | GPT-6.1 Terra or Claude Sonnet 5.5 |
+| Substantive planning, dependencies, validation gates and difficult consults | GPT-6.1 Sol or Claude Opus 5.5 |
+| Implementation requiring substantial engineering judgment | GPT-6.1 Sol or Claude Opus 5.5 |
+| Implementation of a well-defined plan and routine fixes | GPT-6.1 Terra or Claude Sonnet 5.5 |
+| Code review and finding validation | Prefer GPT-6.1 Sol for difficult work and GPT-6.1 Terra for straightforward work. Claude Opus 5.5 or Sonnet 5.5 may review when appropriate. |
+| Mechanical tasks with a deterministic check | A script first, then Terra, Sonnet or Claude Haiku 5.5 when language work is needed. |
 
-Opus implements by default. The Opus agent that validates a review and writes its
-`plan.md` goes on to implement that plan itself, because it already holds the code and the
-reasoning in its context and its prompt cache, and this holds for large plans as well as
-small ones. Opus also starts every lane whose work needs engineering judgment, such as a
-refactor whose shape is unclear, a bug whose cause is unknown, a spec that leaves behaviour
-or an API open, and any lane whose core is crash durability or WAL ordering, concurrency
-beyond a parallel iterator, an on-disk format, planner or executor cost decisions, or
-`unsafe` code.
+Choose the model for each responsibility, independently of the orchestrator's model.
+An orchestrator running Terra or Sonnet can coordinate the workflow, but delegates
+substantive plans, dependency decisions and validation strategy to Sol or Opus. A plan
+names the files and behaviour, edge cases, regression checks, acceptance gates and
+dependencies before a cheaper worker executes it. Do not assign difficult planning to
+the coordination model merely because it controls the session.
 
-A lane goes to Sonnet only when the work is clear-cut and needs no judgment at all. Examples
-are a loader or benchmark harness for a documented format, a conformance phase whose
-behaviour the test suite fixes, and a client binding that mirrors an existing API. When in
-doubt, use Opus.
+Sol or Opus owns work whose shape requires substantial judgment. Examples include a
+refactor whose shape is unclear, a bug whose cause is unknown, an open behaviour or API
+decision, crash durability or WAL ordering, concurrency beyond a parallel iterator,
+an on-disk format, planner or executor cost decisions, and `unsafe` code. Its validating
+planner normally implements that work itself to retain the code and reasoning context.
+It may hand a clearly specified routine portion to Terra or Sonnet with the required
+checks. A loader for a documented format, a conformance phase fixed by its test suite,
+and a binding that mirrors an existing API can usually go directly to Terra or Sonnet.
 
-Haiku takes tasks that need a model to read or write language but little judgment, and
-that end in a check a script can run. Examples are triaging test and benchmark logs into
-failures with their first error, edits across many files under an exact rule (renumbering
-roadmap items, renaming a flag in the docs, adding a field to every fixture), fixtures
-generated from a documented format, and sweeps that list problems without fixing them. Each
-Haiku task states the rule, a fixed output format such as JSON rows of file, change and check
-result, and the check (`mbx check`, a test, a grep or a validator) before it starts. A task
-whose check fails twice moves to Sonnet. Haiku does not rewrite documentation prose, touch
-engine, durability, concurrency, planner or performance code, or review and validate
-findings. If a plain script can do the job, use the script.
+Apply the same judgment to reviews and finding validation. Prefer Sol and Terra when
+they are suitable to preserve Claude usage limits. Sol at high effort is the default
+for substantial code review, difficult findings and remediation plans. Terra can review
+a small, straightforward change with deterministic checks. Opus remains available for
+difficult work or an additional independent perspective, and Sonnet can review clear-cut
+work. Model availability or quota pressure must not lower the required standard of
+reasoning or verification. Use a separate agent for independent review even when the
+author and reviewer use the same model.
 
-A Sonnet lane consults Opus by starting a read-only agent on Opus with its question, the
-relevant files and what it has tried, then applies the advice itself. It must consult when
-the same failure survives two different fixes, when the spec leaves a decision about
-behaviour, an API or a format open, when the work turns out to touch one of the Opus areas
-above, when a performance gate misses for no clear reason, and before it stops a phase early
-or declares a gate unmeetable. Its final report lists each consult.
+Mechanical language tasks state an exact rule, fixed output format and deterministic
+check before starting. Examples include listing the first error in logs, applying an
+exact renumbering rule, or generating fixtures from a fixed format. Haiku does not
+rewrite documentation prose, touch engine, durability, concurrency, planner or
+performance code, or review and validate findings. If its check fails twice, move the
+task to Terra or Sonnet. Use a plain script whenever it suffices.
+
+A Terra or Sonnet worker consults Sol or Opus through a read-only agent with its
+question, relevant files and attempted fixes. It must consult when the same failure
+survives two different fixes, the spec leaves behaviour, an API or a format open, the
+work enters one of the judgment-sensitive areas above, a performance gate misses for
+no clear reason, or before stopping a phase early or declaring a gate unmeetable. The
+consult decides whether to provide a bounded plan or transfer implementation to Sol
+or Opus. The final report lists each consult.
 
 ### Review before landing
 
 No lane lands without review:
 
-1. **Codex reviews.** `scripts/codex-review.sh NAME TIP BASE "CONTEXT"` runs
+1. **An independent agent reviews.** Prefer Codex with Sol or Terra according to the
+   model policy above. `scripts/codex-review.sh NAME TIP BASE "CONTEXT"` runs
    `codex exec review` on `BASE..TIP` in a scratch worktree and writes `review.md` under
    `$AUDIT_DIR/NAME` (default `.artifacts/audits`). CONTEXT names the roadmap item, the specs
-   and what the work was meant to do.
-2. **Opus validates and plans.** An Opus agent checks every finding independently and
+   and what the work was meant to do. The default is Sol at high effort; set
+   `CODEX_REVIEW_MODEL` and optionally `CODEX_REVIEW_REASONING_EFFORT` for another choice.
+2. **A capable agent validates and plans.** Sol or Opus handles substantive findings
+   and remediation plans; Terra or Sonnet may validate straightforward findings under
+   the same model policy. The validating agent checks every finding independently and
    reproduces it where it can. It marks each one confirmed, refuted or plausible, decides
    against the specs whether to fix it now, fix it later under a named roadmap item, or
    document it as a limitation, and writes `plan.md` beside the review. For every fix-now
    item the plan gives the files and functions to change, the behaviour to implement, the
    edge cases, the regression test that must fail before the fix, the docs to update and the
    commands that verify it. It also records serious problems the review missed.
-3. **Opus implements.** The validating Opus agent applies its own `plan.md` and reports
-   what it did for each item.
-4. **Re-review.** Codex reviews the fix commits and Opus validates them again. The lane
+3. **The assigned worker implements.** The validating planner normally implements
+   judgment-sensitive repairs itself. Terra or Sonnet can execute a well-defined
+   routine repair plan. The worker reports what it did for each item.
+4. **Re-review.** An independent reviewer checks the fix commits and the validating
+   agent validates the findings again, with the same model-selection policy. The lane
    merges once this comes back clean.
 
-The user decides only scope changes and disagreements with a spec that Opus raises.
+The user decides only scope changes and disagreements with a spec that the validating
+agent raises.
 
 ### Merging and pushing
 

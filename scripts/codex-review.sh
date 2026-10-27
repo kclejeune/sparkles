@@ -1,8 +1,7 @@
 #!/usr/bin/env bash
-# Codex review of one lane (gpt-6.1-sol, high effort) in a scratch worktree detached at the
-# lane's tip, so nothing touches the lane or the main checkout. The findings then go to an
-# Opus 5.5 agent that validates them and writes the remediation plan, and a Sonnet 5.5 agent
-# implements that plan. AGENTS.md describes the whole workflow.
+# Independent Codex review in a scratch worktree detached at the lane's tip. Sol at
+# high effort is the default; Terra can review straightforward work. AGENTS.md describes
+# model selection for review, independent validation, planning and implementation.
 #
 #   scripts/codex-review.sh NAME TIP BASE "CONTEXT"
 #
@@ -12,13 +11,14 @@
 # CONTEXT  what the lane was meant to do: specs, scope, anything the reviewer needs
 #
 # Output goes to $AUDIT_DIR/NAME/ (default .artifacts/audits): review.md and review.log.
+# CODEX_REVIEW_MODEL and CODEX_REVIEW_REASONING_EFFORT override the model and effort.
 set -euo pipefail
 
 NAME=$1 TIP=$2 BASE=$3 CONTEXT=$4
 ROOT=$(git -C "$(dirname "$0")" rev-parse --show-toplevel)
 OUT=${AUDIT_DIR:-$ROOT/.artifacts/audits}/$NAME
 SCRATCH=$ROOT/../sparkles-audit-$NAME
-MODEL=(-m gpt-6.1-sol -c model_reasoning_effort="high")
+MODEL=(-m "${CODEX_REVIEW_MODEL:-gpt-6.1-sol}" -c "model_reasoning_effort=\"${CODEX_REVIEW_REASONING_EFFORT:-high}\"")
 mkdir -p "$OUT"
 
 git -C "$ROOT" worktree add --detach "$SCRATCH" "$TIP" > /dev/null 2>&1 ||
