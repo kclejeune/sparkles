@@ -49,7 +49,7 @@ pub(super) fn pipeline() -> Pipeline {
     let scope = if tracing::enabled!(target: TARGET, tracing::Level::DEBUG) {
         // Stop assigning identifiers on exhaustion instead of reusing one.
         NEXT_PIPELINE
-            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |id| id.checked_add(1))
+            .try_update(Ordering::Relaxed, Ordering::Relaxed, |id| id.checked_add(1))
             .ok()
             .map(|id| Scope {
                 id,

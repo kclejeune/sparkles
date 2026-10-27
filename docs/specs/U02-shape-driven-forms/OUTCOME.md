@@ -3,6 +3,35 @@
 The [design's Outcome overview](SPEC.md#outcome) summarizes current scope. This record
 preserves the initial delivery and the later affected-target validation contract.
 
+## Nested library read models
+
+`Forms::nested_model` supplies the ordinary root model plus declared blank-node
+children. It pools shared RDF identities, preserves every visible graph-bearing
+parent anchor and merges the declared child layouts. Cycles use references to an
+already admitted identity and regenerate only when the declared shape union grows.
+Each child resolves the target-graph policy against its own type facts, preserving
+readable child fields when the root's type graph differs. Historical models remain read-only and require a retained
+history state, as other historical reads do.
+
+The request shares its preparation allowance across layouts, retained values, frontier
+entries and repeated declarations. Node, field, anchor and depth limits refuse the
+whole result. Complex nested paths and matching composite bound comparisons refuse
+before uncontrolled producer work. The [design](SPEC.md#231-nested-read-models-in-the-rust-library)
+records the finite limits, remaining model-source preparation and the separate item 395
+reader boundary.
+
+Native store fixtures cover shared and indistinguishable children, cycles, graph
+provenance, graph and predicate grants in both caller orders, retained historical
+state and resource refusal. The prepared-adapter allocation regression checks group
+labels before their owned model copy, with parsing and source metadata outside that
+measurement. Existing flat form behavior remains covered separately.
+
+This delivery does not add nested changes to check/save, allocate fresh children or
+wire the HTTP and browser editors. Those consumers, lists and alternative editors
+remain under item 21. Stored blank labels and request-local model ids confer no write
+authority; a future save must validate graph-bearing root anchors and changed-field
+expectations inside the same writer.
+
 ## Bounded affected-target checks
 
 Checks select targets from shape dependencies in both the writer's base and candidate

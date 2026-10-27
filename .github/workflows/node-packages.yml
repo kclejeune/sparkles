@@ -2,7 +2,7 @@
 #
 # Addons are built for Linux on x64 and arm64 (glibc and musl) and for macOS on Apple
 # silicon. The jobs run on standard GitHub-hosted runners with Cargo and pnpm
-# dependencies cached in GitHub Actions.
+# dependencies cached in GitHub Actions or the remote mbx server.
 name: Node packages
 # Pushes to main and pull requests run when the Node packages or a crate the addon builds
 # on changes, or when the server used by the remote client tests changes. Tests, benches
@@ -53,12 +53,19 @@ concurrency:
   group: node-packages-${{ github.ref }}-${{ github.ref == 'refs/heads/main' && github.run_id || 'latest' }}
   cancel-in-progress: ${{ github.ref != 'refs/heads/main' && github.ref_type != 'tag' }}
 env:
+  MBX_HTTP_TIMEOUT: 5m
+  MBX_GC_MAX_SIZE: 10GiB
+  # Only same-repository PRs may publish to the remote cache.
+  MBX_REMOTE_TRUST_WRITES: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name == github.repository && 'true' || 'false' }}
   # Pushes to main and pull requests build the bindings in the dev profile, which compiles
   # far faster than the release profile's thin LTO; tags and manual runs build what would
   # be published.
   NODE_PROFILE: ${{ github.ref_type == 'branch' && github.event_name != 'workflow_dispatch' && 'dev' || 'release' }}
 jobs:
   native:
+    permissions:
+      contents: read
+      id-token: write
     timeout-minutes: 45
     # Pushes to main and pull requests build and test linux-x64 only. Tags and manual runs
     # build every platform.
@@ -88,6 +95,11 @@ jobs:
         with: { cache: false, rustflags: "" }
       - uses: jdx/mr-boxington-action@v1.7.3
         with:
+          # Fork pull requests use GitHub cache because they cannot request an OIDC token.
+          backend: ${{ (github.event_name == 'push' && github.ref == 'refs/heads/main' || github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name == github.repository) && 'remote' || 'github' }}
+          remote-url: https://mbx.kclj.dev
+          namespace: kclejeune/sparkles
+          oidc-audience: https://mbx.kclj.dev
           version: 1.28.0
           github-cache-mode: objects
           cache-generation: sparkles-node-${{ matrix.platform }}-${{ env.NODE_PROFILE }}-v1
@@ -102,6 +114,8 @@ jobs:
             macOS) printf '%s\n' "$HOME/Library/Application Support/mbx/bin" >> "$GITHUB_PATH" ;;
           esac
       - run: pnpm --dir js install --frozen-lockfile
+      - name: Disk space before build
+        run: df -h "$GITHUB_WORKSPACE"
       - name: Build native Node-API module
         working-directory: js/engine
         shell: bash
@@ -109,6 +123,9 @@ jobs:
           if [ "$NODE_PROFILE" = release ]; then pnpm native; else
             pnpm exec napi build --manifest-path ../../crates/sparkles-node/Cargo.toml --platform --output-dir native
           fi
+      - name: Disk space after build
+        if: ${{ always() }}
+        run: df -h "$GITHUB_WORKSPACE"
       - run: pnpm --dir js build
       # The remote client's real-server test runs on one runner, against a debug server.
       - name: Build the server for the remote client test
@@ -179,7 +196,7 @@ jobs:
           restore-keys: node-musl-tools-${{ runner.os }}-${{ runner.arch }}-
       - name: Build and test the addon on Alpine
         run: |
-          docker run --rm -e CI=true -e NODE_PROFILE -e MBX_CACHE_EXPORT_GROUP \
+          docker run --rm -e CI=true -e NODE_PROFILE -e MBX_CACHE_EXPORT_GROUP -e MBX_GC_MAX_SIZE \
             -e MBX_CACHE_DIR=/work/.cache/mbx -e MBX_SHIMS_DIR=/work/.cache/container-shims \
             -v "$PWD:/work" -w /work node:24-alpine \
             sh -ec 'apk add --no-cache bash; exec bash scripts/ci-node-musl.sh'

@@ -1096,12 +1096,12 @@ pub fn convert(
     }
     let mut keys = match (&opts.keys, &metadata, table_ix) {
         (Some(reg), Some(m), Some(ti)) => {
-            Some(KeyCheck::new(reg.clone(), m, ti, &desc, &table.columns).map_err(&fail)?)
+            Some(KeyCheck::new(reg.clone(), m, ti, &desc, &table.columns).map_err(fail)?)
         }
         _ => None,
     };
     let standard = if opts.standard {
-        let s = Standard::new(metadata.as_deref(), &desc, &table, opts.part).map_err(&fail)?;
+        let s = Standard::new(metadata.as_deref(), &desc, &table, opts.part).map_err(fail)?;
         for t in s.head.clone() {
             stats.triples += 1;
             sink(t)?;
@@ -1178,7 +1178,7 @@ pub fn convert(
             line,
         };
         if let Some(k) = &mut keys {
-            k.row(&table, &r).map_err(&fail)?;
+            k.row(&table, &r).map_err(fail)?;
         }
         match &mut runner {
             None if standard.is_some() => {
@@ -1204,7 +1204,7 @@ pub fn convert(
                     .enumerate()
                     .filter(|(_, c)| !c.is_virtual)
                 {
-                    values.push(bind(&table, c, i, &r).map_err(&fail)?);
+                    values.push(bind(&table, c, i, &r).map_err(fail)?);
                 }
                 values.push(Some(GroundTerm::Literal(Literal::from(row as i64))));
                 batch.push(values);

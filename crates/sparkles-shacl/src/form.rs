@@ -19,6 +19,9 @@ use sparkles_core::sparql::value::Value;
 use std::cmp::Ordering;
 use std::collections::BTreeSet;
 
+mod controlled;
+pub use controlled::form_layout_with;
+
 /// The path of a field.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum FieldPath {

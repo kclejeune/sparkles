@@ -136,6 +136,11 @@ request or on every write, and the schema report counts what the data holds.
 * Results show in `sparkles_validation_*` metrics, the `validation` and `validation_ms`
   access-log fields, CLI summaries and `sparkles stats`.
 
+The Rust forms library can also read declared nested blank-node layouts, preserving
+shared identities, visible graph anchors and cycles within one preparation allowance.
+The [forms guide](../visualization/README.md#nested-form-read-models) describes this
+read primitive and the remaining atomic editing and HTTP/browser consumers.
+
 ### Schema discovery and drafted shapes
 
 * `GET /$/schema/{ds}`, `sparkles schema` and `sparkles::schema` list classes and

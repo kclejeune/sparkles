@@ -200,12 +200,11 @@ impl SwitchWriter {
                         tokio::time::timeout(Duration::from_millis(10), tx.reserve()).await
                     });
                     let ns = began.elapsed().as_nanos().min(u64::MAX as u128) as u64;
-                    let _ =
-                        control
-                            .wait_ns
-                            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |n| {
-                                Some(n.saturating_add(ns))
-                            });
+                    let _ = control
+                        .wait_ns
+                        .try_update(Ordering::Relaxed, Ordering::Relaxed, |n| {
+                            Some(n.saturating_add(ns))
+                        });
                     match capacity {
                         Ok(Ok(permit)) => {
                             control.check()?;

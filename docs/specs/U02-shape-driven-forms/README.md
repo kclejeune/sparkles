@@ -2,7 +2,9 @@
 
 Forms are partially complete. Literal and IRI editors, previews, branch saves, conflict
 handling, DASH hints, new instances and entity search are available. Checks discover
-shape-dependent targets beyond two hops and refuse incomplete admission.
+shape-dependent targets beyond two hops and refuse incomplete admission. The Rust
+library can read declared nested blank-node models with shared identities and visible
+graph anchors; atomic nested editing and its HTTP and browser consumers remain planned.
 
 ## Documents
 

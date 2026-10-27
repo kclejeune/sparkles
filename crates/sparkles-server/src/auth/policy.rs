@@ -618,7 +618,7 @@ struct Waiting<'a>(&'a AtomicUsize);
 
 impl<'a> Waiting<'a> {
     fn enter(n: &'a AtomicUsize, max: usize) -> Option<Waiting<'a>> {
-        n.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |w| {
+        n.try_update(Ordering::Relaxed, Ordering::Relaxed, |w| {
             (w < max).then_some(w + 1)
         })
         .ok()

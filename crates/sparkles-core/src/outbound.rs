@@ -434,7 +434,7 @@ impl RequestBudget {
         let n = u64::try_from(d.as_nanos()).unwrap_or(u64::MAX);
         let _ = self
             .nanos
-            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |t| {
+            .try_update(Ordering::Relaxed, Ordering::Relaxed, |t| {
                 Some(t.saturating_add(n))
             });
     }

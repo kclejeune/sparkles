@@ -1417,7 +1417,7 @@ impl Ctx {
         if self.is_cursor() {
             let prior = self
                 .rows_produced
-                .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |n| {
+                .try_update(Ordering::Relaxed, Ordering::Relaxed, |n| {
                     n.checked_add(rows as u64)
                 })
                 .map_err(|_| self.produced_exceeded(u64::MAX))?;

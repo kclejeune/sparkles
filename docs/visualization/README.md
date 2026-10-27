@@ -160,6 +160,29 @@ The SvelteKit UI is embedded in the server binary.
   a refusal from the server shows under the field it names, and the JSON view under
   **Advanced** shares the form's unsaved change.
 
+### Nested form read models
+
+The Rust library exposes `dataset.forms().nested_model(&request, &options)` for
+applications that need declared blank-node child layouts. The result retains the
+ordinary root form and a `nested_nodes` pool. Shared children keep one RDF identity,
+cycles reference that identity, and parent anchors and field values retain their graph
+provenance. The target-graph policy resolves independently for each child's focus.
+The request uses the same shapes settings, visibility, historical-state
+selection and cancellation controls as an ordinary form.
+
+One request admits at most 64 nested identities, 512 generated field views, 512 parent
+anchors and 16 levels of first discovery. A shared preparation allowance refuses a
+larger or unfinished model. Complex nested paths, visible blank-named graph contexts
+and matching composite range bounds also refuse until their representation or producers
+have controlled admission. The allowance covers adapter preparation and retention.
+Source-shape and prefix preparation remain under item 21, while physical reader and
+mask preparation depend on [item 395](../ROADMAP.md). The
+[specification](../specs/U02-shape-driven-forms/SPEC.md#231-nested-read-models-in-the-rust-library)
+explains the unit calculation.
+
+The HTTP forms and browser still use the existing flat model. Atomic nested changes,
+fresh children and nested check/save and browser consumers remain under item 21.
+
 ## Known gaps
 
 These limits name the roadmap items that address them. Current priorities and
