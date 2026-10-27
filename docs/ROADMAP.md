@@ -1,13 +1,15 @@
 # Roadmap
 
-This roadmap prioritizes completion of accepted capability contracts, reliability and
-measured performance for evidence-driven applications. Versioned sources, reviewable
-claims, durable work and reproducible analyses lead the new foundations. Existing
-storage, query, reasoning, search, security and recovery capabilities complete their
-required phases alongside them. Close competitive results can be accepted with their
-measurements and tradeoffs recorded.
-Packaging and the release contract follow the selected feature and reliability gates
-and must be ready before the first release is cut.
+This roadmap prioritizes completion of the capabilities marked partially complete and
+their adopted release contracts. AI memory and knowledge mapping and a production-ready
+RDF engine have a slight lead, while evidence-backed software supply-chain applications
+advance in parallel. New features enter the delivery path when a concrete use case or
+an adopted dependency requires them. A separate analyst workbench follows these goals.
+
+Existing storage, query, reasoning, search, security and recovery capabilities retain
+their required phases and acceptance gates. Close competitive results can be accepted
+with their measurements and tradeoffs recorded. Packaging, recovery, installed-artifact
+testing and the API compatibility contract advance alongside capability completion.
 
 The [feature index](FEATURES.md) and its category guides describe what Sparkles does
 and does not do today. Every known gap names the roadmap item that addresses it.
@@ -25,17 +27,18 @@ workloads where Sparkles loses. This document holds only the work that remains.
 - [Tier 3: big bets](#tier-3-big-bets)
 - [Tier 4: worth doing, not urgent](#tier-4-worth-doing-not-urgent)
 - [Tier 5: backlog](#tier-5-backlog)
-- [Tier 6: release work](#tier-6-release-work)
+- [Tier 6: later operational completion](#tier-6-later-operational-completion)
 - [Tier 7: compatibility leftovers](#tier-7-compatibility-leftovers)
 - [Completed](#completed)
 - [Keeping this current](#keeping-this-current)
 
 ## How the roadmap is organized
 
-The work is grouped into seven tiers in order of priority. Tiers 1 to 4 are the main plan,
-and Tiers 5 to 7 hold work that is wanted at a lower priority. The order weighs the effort
-of an item against its impact on the goal above, and items move between tiers as results
-come in. Within a tier, most items can run in parallel.
+The work is grouped into seven tiers. Complete the adopted requirements of partial
+capabilities and the selected release contracts before unrelated new breadth, including
+requirements whose follow-ups appear in a lower tier. The tiers order eligible phases
+and extensions by effort, dependencies and impact on the goals above. Independent phases
+can run in parallel. A deferred adopted requirement keeps its parent capability partial.
 
 Each item has a number that stays fixed for its lifetime. Specs, FEATURES and code
 comments refer to items by these numbers, so a number is never reused or changed. The
@@ -71,17 +74,21 @@ ordered by their tier alone.
 Complete named spec phases and their acceptance gates. A parent capability remains
 partially complete while adopted requirements remain. Building an application on a
 usable subset does not waive those requirements. Within the completion program, put
-correctness, recovery and capabilities used by the application ahead of unrelated
-feature expansion.
+correctness, recovery, bounded resources and source identity ahead of unrelated feature
+expansion. The parallel delivery streams are shared AI knowledge, engine completion and
+production, and application acceptance. Their common evidence, history, authorization,
+execution and recovery contracts have one implementation. Domain adapters and matching
+logic remain application work rather than duplicate engine infrastructure.
 
 | Milestone | Work | Acceptance |
 |---|---|---|
 | Reliable baseline | Close confirmed correctness failures and retain qualified measurements. | The integration passes its required review, tests, conformance and performance gates. |
 | Trusted sources and resumable work | Item 81 delivers C25 Phases 1–2, item 339 delivers C26 Phase 1, and item 341 delivers C27 Phase 1. Item 220 preserves managed definitions during backup and cloning. | Source revisions and decisions retain their identity and evidence. Interrupted work resumes safely, and restored external work stays paused. |
+| Production readiness | Items 58–60 complete packages, server artifacts and compatibility policy. Items 62, 64 and the adopted phases of 65 close audit, startup and key workflows. This work runs alongside feature completion. | Installed artifacts, supported platforms, upgrade and recovery tests pass before a release is cut. |
 | Reproducible assessments | Item 340 delivers F22 Phase 1 after C25's typed records and C26's fenced publication are available. Full recomputation is the initial execution model. | Inputs, outputs and methods are reproducible. New matching data, source withdrawals, expiry and authorization changes invalidate affected results. |
 | Unattended operation | Complete C26 Phase 2 and F22 Phase 2, including temporal scheduling. Item 100 supplies guarded report configurations when distinct audiences are required. | Fenced database publication rejects stale attempts and duplicate accepted database effects. External delivery is at least once with stable event IDs, so receivers deduplicate repeated deliveries. Recovery preserves current authorization. |
 | Shared capability completion | Close the relevant search, path, view, reasoning, explanation, validation, API and visualization phases from the completion paths below. | The declared scope passes its correctness, visibility, recovery and measured resource gates. |
-| Remaining completion and release | Finish the other adopted partial-feature phases and release contracts. | Required packaging, compatibility and operational acceptance are complete before release. |
+| Full partial-feature completion | Finish the other adopted partial-feature phases and release contracts, including explicitly scheduled large phases. | Required feature, compatibility, packaging and operational acceptance are complete before release. |
 
 C25's first phase supplies vocabulary, shapes, fixtures and competency queries. It does
 not supply the managed runtime APIs of later phases. C26 Phase 1 and C27's static
@@ -97,11 +104,15 @@ they prevent the accepted workflow from meeting its resource or latency goals. P
 durability, cancellation and visibility. Broader competitive refreshes and small
 benchmark costs remain tracked without driving this delivery sequence.
 
-Standalone live profiling under item 27, query by example under item 28, notebooks,
-additional query frontends and provider conveniences follow the application foundations
-and necessary capability completion. A prerequisite may bring a planned feature forward
-for the phase that requires it. Conditional language integrations do not delay independent
-core phases, and retain their declared dependencies.
+Existing partial UI and profiling contracts remain in the completion program and can
+follow the shared knowledge and production phases. New query-by-example, notebook,
+query-language, local-first and provider conveniences follow demonstrated use-case need.
+A prerequisite can bring a bounded planned feature forward. Conditional integrations do
+not delay independent core phases, and retain their declared dependencies.
+
+Virtual graphs in F19 and replication in F10 are substantial later phases of partial
+specs. They remain visible completion work with explicit phase boundaries. They are not
+prerequisites for the first memory or deterministic inventory/advisory workflow.
 
 ## Tracks and decisions
 
@@ -220,6 +231,12 @@ continues within its caller-visible evidence and measured-latency scope.
 | 341 | **Valid time and observation history.** Versioned RDF resources, SHACL shapes and typed temporal templates are available. Phase 1 remains incomplete at A4 until C25 Phase 2 and protected writes establish server-owned availability and refuse backdating. Later phases add the projection helper, event-time UI and expiry integration. | [C27](specs/C27-valid-time-profiles.md) | M–L | High |
 | 340 | **Maintained analyses and evidence dependencies.** Planned immutable run manifests, conservative read dependencies and guarded publication track when assessments need review or recomputation. Begin with bounded full recomputation and add proven incremental maintenance through item 17. | [F22](specs/F22-analysis-lifecycle.md) | L | High |
 | 220 | **Backups and clones of view definitions.** The backup layout has no path for `views/{name}/view.json`, so a restored or cloned dataset has no views. The layout needs versioned nested definitions, consistent capture and restore with automatic jobs and deliveries paused. | [F05](specs/F05-snapshot-repositories/OUTCOME.md#recovery-of-managed-definitions), [F13](specs/F13-incremental-views-and-provenance.md#outcome) | S | High |
+| 58 | **Packages.** Publishing to PyPI, Maven Central and npm, Windows and Intel macOS builds, a musl JVM build, PyPy and free-threaded wheels, and Python async wrappers. The workflows exist with their publish jobs switched off. | [X12](specs/X12-release-engineering.md), [P01](specs/P01-python-bindings.md#roadmap-follow-ups-2026-10-12), [P04](specs/P04-jvm-bindings/OUTCOME.md#roadmap-follow-ups-2026-10-12), [P05](specs/P05-node-bindings.md#roadmap-follow-ups-2026-10-12) | M–L | High |
+| 59 | **Server binaries and published container images.** | [X12](specs/X12-release-engineering.md) | M | High |
+| 60 | **API stability policy.** X12 Phase 4 adds a stability policy for the HTTP, CLI and library APIs, with its checks. The on-disk side is in place. | [X12](specs/X12-release-engineering.md) | S–M | High |
+| 61 | **Backup completion.** Whole-server and multi-dataset runs, remote CLI, repository copy and gated content-defined chunking remain. Add optional retained generations and pins, storage-class and Object Lock/WORM controls, and an explicit repository-zstd decision, with restoration and retention acceptance. | [F05](specs/F05-snapshot-repositories/OUTCOME.md#roadmap-follow-ups-2026-10-12), [X01](specs/X01-compression-codecs.md#remaining-codec-decisions) | L | High |
+| 62 | **Audit events** for creating, deleting and cloning datasets and for creating and deleting branches. | [C09](specs/C09-dataset-access-control.md#roadmap-follow-ups-2026-10-12) | S | High |
+| 64 | **Startup resilience.** Binding the listener before datasets open, and degraded startup when a dataset fails to open. | [C01](specs/C01-observability-and-budgets.md#roadmap-follow-ups-2026-10-12) | M | High |
 | 263 | **Ask on DBpedia.** Question-aware grounding has mixed measured accuracy, while bounded versioned candidate evidence preserves full choice identities and supports conservative display ordering. General contextual resolution and further accuracy work remain, with genuine ambiguity kept as a clarification. Changes need offline and end-to-end checks. | [C18](specs/C18-natural-language-questions-and-ingest/OUTCOME.md#ask-grounding-accuracy-item-263) | M | High |
 | 318 | **Ask median latency.** The retained 107-question repeat has higher median wall time for Haiku and Sonnet, while p95 is nearly unchanged. Bounded debug tracing separates grounding, tool calls and nested embedding work. Collect representative stage profiles and reduce avoidable work while preserving caller visibility and required clarification. The retained paid run does not establish the cause. | [C18](specs/C18-natural-language-questions-and-ingest/OUTCOME.md#ask-grounding-accuracy-item-263), [Benchmarks](benchmarks/natural-language/RESULTS.md#ask-on-dbpedia) | M | High |
 
@@ -233,6 +250,7 @@ continues within its caller-visible evidence and measured-latency scope.
 | 24 | **GeoSPARQL.** k-NN with a query geometry bound per row, better polygon approximations than the cell grid and QLever's spatial syntax. The geometry limits to lift are datums other than WGS 84, grid-based and exact Helmert shifts, curved GML segments and solids, 3D constructions, and lines split at crossings. | [G01](specs/G01-geosparql/OUTCOME.md#roadmap-follow-ups-2026-10-12) | M | Medium |
 | 21 | **Editing forms generated from SHACL shapes.** Complete atomic nested changes and browser editing from the Rust library's pooled read models, plus list and `sh:or`/`sh:xone` editors. Complete blank-named graph contexts and admission for model sources, complex nested paths, remaining target and query producers and controlled reader integration through item 395. | [U02](specs/U02-shape-driven-forms/SPEC.md#outcome) | M–L | Medium–high |
 | 100 | **Reports for distinct audiences.** Planned named GraphRAG configurations have separate principals, projections, guarded reports and review histories, with an explicit default and shared dataset spending limits. | [C22b](specs/C22b-report-configurations.md) | M | High |
+| 65 | **Encryption.** Finish key workflows, Vault/cloud KMS and recovery export, then Phase 2 write-only age-recipient repositories and age identities. Phase 3 live-dataset and Phase 4 derived-index encryption follow; item 61 owns the shared chunking gate. | [F11](specs/F11-encryption-at-rest.md#roadmap-follow-ups-2026-10-12) | L–XL | High |
 | 7 | **Batch-oriented execution and disk spill.** The full-scale spill matrix passes, while execution follow-ups and the default decision remain under item 93. Spill stays opt-in, and several cases still run eagerly. The [remaining work](#remaining-work-for-item-7) is listed below. | [X08](specs/X08-disk-spill-and-server-memory.md) Phase 2, [X05](specs/X05-streaming-query-execution.md#roadmap-follow-ups-2026-10-12) | L | Very high |
 | 8 | **Graph-algorithm library.** Algorithms and graph lenses are available. The full Graphalytics harness, algorithm-name completion, richer background progress, a JVM handle, the C23 writer and openCypher procedures remain. | [F14](specs/F14-graph-algorithms.md#outcome) | S–M | High |
 | 9 | **Materialization at scale.** Phase 1 materialization is available. The separate derived-fact layer of Phase 2, `owl:sameAs` representatives of Phase 3 and eligible execution without iteration barriers and equality maintenance in Phase 4 remain. | [F16](specs/F16-materialization-at-scale.md), [C08](specs/C08-inference-freshness.md#roadmap-follow-ups-2026-10-12) | L | High |
@@ -430,23 +448,18 @@ These items are smaller or narrower. Each has a design sketch in the linked spec
 | 270 | **Scope challenges inside MCP tools.** `/$/mcp` challenges a missing `sparkles:read` or `sparkles:update` before a message runs, but an operation inside a tool that needs admin, such as deleting a protected branch, is refused as a tool error without naming `sparkles:admin`. The tools need a way to return the challenge, or the message check needs to know which arguments need admin. | [C11](specs/C11-mcp-server.md#oauth-for-the-mcp-endpoint-item-67-2026-10-24) | S |
 | 329 | **Node query and export controls.** Recheck the small-query process variation and the accepted 0.4% to 1.5% export costs of borrowed native term validation on a quiet Intel host. Keep complete term consumption and fresh-process pairing. | [P05](specs/P05-node-bindings.md#borrowed-native-term-validation), [Benchmarks](benchmarks/bindings/RESULTS.md#native-term-validation) | S |
 
-## Tier 6: release work
+<a id="tier-6-release-work"></a>
 
-These items prepare the first release after Tiers 1 to 5 have landed. Packages,
-artifacts and the compatibility contract must pass their acceptance before cutting
-that release. The operational extensions keep the phase dependencies recorded in
-their specs.
+## Tier 6: later operational completion
+
+Release artifacts, recovery, startup, audit and the adopted encryption workflows advance
+in the parallel completion program above. These larger operational extensions retain
+their explicit adoption, compatibility and failure-model decisions. Their later placement
+does not waive a required phase or delay an independent accepted capability.
 
 | # | Item | Spec | Size |
 |---|---|---|---|
-| 58 | **Packages.** Publishing to PyPI, Maven Central and npm, Windows and Intel macOS builds, a musl JVM build, PyPy and free-threaded wheels, and Python async wrappers. The workflows exist with their publish jobs switched off. | [X12](specs/X12-release-engineering.md), [P01](specs/P01-python-bindings.md#roadmap-follow-ups-2026-10-12), [P04](specs/P04-jvm-bindings/OUTCOME.md#roadmap-follow-ups-2026-10-12), [P05](specs/P05-node-bindings.md#roadmap-follow-ups-2026-10-12) | M–L |
-| 59 | **Server binaries and published container images.** | [X12](specs/X12-release-engineering.md) | M |
-| 60 | **API stability policy.** X12 Phase 4 adds a stability policy for the HTTP, CLI and library APIs, with its checks. The on-disk side is in place. | [X12](specs/X12-release-engineering.md) | S–M |
-| 61 | **Backup completion.** Whole-server and multi-dataset runs, remote CLI, repository copy and gated content-defined chunking remain. Add optional retained generations and pins, storage-class and Object Lock/WORM controls, and an explicit repository-zstd decision, with restoration and retention acceptance. | [F05](specs/F05-snapshot-repositories/OUTCOME.md#roadmap-follow-ups-2026-10-12), [X01](specs/X01-compression-codecs.md#remaining-codec-decisions) | L |
-| 62 | **Audit events** for creating, deleting and cloning datasets and for creating and deleting branches. | [C09](specs/C09-dataset-access-control.md#roadmap-follow-ups-2026-10-12) | S |
 | 63 | **Authentication additions.** Mutual TLS, OCSP, opaque-token introspection, front-channel logout and Cloudflare group lookup. | [C09](specs/C09-dataset-access-control.md#roadmap-follow-ups-2026-10-12) | M |
-| 64 | **Startup resilience.** Binding the listener before datasets open, and degraded startup when a dataset fails to open. | [C01](specs/C01-observability-and-budgets.md#roadmap-follow-ups-2026-10-12) | M |
-| 65 | **Encryption.** Finish key workflows, Vault/cloud KMS and recovery export, then Phase 2 write-only age-recipient repositories and age identities. Phase 3 live-dataset and Phase 4 derived-index encryption follow; item 61 owns the shared chunking gate. | [F11](specs/F11-encryption-at-rest.md#roadmap-follow-ups-2026-10-12) | L–XL |
 | 280 | **Replication spec refresh.** Answer F10's open questions 15 to 23 before Phase 2 starts. They cover derived state on replicas, branches, encryption, the fencing and data-loss guarantees of lease-based failover, Kubernetes, scope, the estimate, how a peer joins and exchanges credentials, and one account of high availability with recovery targets and client routing. | [F10](specs/F10-replication.md#11-open-questions) | S |
 | 66 | **Replication.** Read replicas, preserved primary IDs, promotion, failover, synchronous replication, and a patch log or continuous archive. | [F10](specs/F10-replication.md#roadmap-follow-ups-2026-10-12) | XL |
 
