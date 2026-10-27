@@ -140,7 +140,8 @@ Phase 1 provides `Store::snapshot_at_limited` and
 `Store::snapshot_at_with_branch_limited`, with matching trusted methods on
 `Dataset::history()`. A request cap covers retained delta state, replay and decoding,
 cold origin metadata and newly decoded historical provider configuration. Cancellation and deadlines
-apply to preparation and lock waiting. Sufficient caps preserve the exact selected
+apply to preparation and lock waiting, including transaction checksums in forward and
+reverse WAL replay. Sufficient caps preserve the exact selected
 commit, terms and origin. Refusal does not retry an unbounded read, repair a retained
 store or substitute another branch's state.
 

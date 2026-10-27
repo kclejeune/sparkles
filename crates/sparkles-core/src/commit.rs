@@ -1631,8 +1631,50 @@ pub(crate) fn open_wal_commit(
         return None;
     }
     let mut crc = flate2::Crc::new();
+    #[cfg(test)]
+    if WAL_CRC_OBSERVER.with(|slot| slot.borrow().is_some()) {
+        // Identical CRC arithmetic, with test-only observations after real work.
+        // No control poll or synthetic error is introduced in the old codec.
+        let seq = u64::from_le_bytes(rec[9..17].try_into().unwrap());
+        let mut processed = 0;
+        for chunk in data.chunks(WAL_CRC_CHUNK) {
+            crc.update(chunk);
+            processed += chunk.len();
+            observe_wal_crc(seq, processed, data.len());
+        }
+        return open_wal_commit_with_crc(rec, crc);
+    }
     crc.update(data);
     open_wal_commit_with_crc(rec, crc)
+}
+
+pub(crate) const WAL_CRC_CHUNK: usize = 64 << 10;
+
+#[cfg(test)]
+type WalCrcObserver = std::sync::Arc<dyn Fn(u64, usize, usize) + Send + Sync>;
+#[cfg(test)]
+thread_local! {
+    static WAL_CRC_OBSERVER: std::cell::RefCell<Option<WalCrcObserver>> = const {
+        std::cell::RefCell::new(None)
+    };
+}
+#[cfg(test)]
+pub(crate) fn observe_wal_crc(seq: u64, processed: usize, total: usize) {
+    let observer = WAL_CRC_OBSERVER.with(|slot| slot.borrow().clone());
+    if let Some(observer) = observer {
+        observer(seq, processed, total);
+    }
+}
+#[cfg(test)]
+pub(crate) fn with_wal_crc_observer<T>(observer: WalCrcObserver, read: impl FnOnce() -> T) -> T {
+    struct Restore(Option<WalCrcObserver>);
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            WAL_CRC_OBSERVER.with(|slot| slot.replace(self.0.take()));
+        }
+    }
+    let _restore = Restore(WAL_CRC_OBSERVER.with(|slot| slot.replace(Some(observer))));
+    read()
 }
 
 /// The identical commit codec after a controlled streaming pass over its data.

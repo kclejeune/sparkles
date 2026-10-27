@@ -638,7 +638,19 @@ impl WalCursor {
             }
         }
         let prev = self.at.seq;
-        let (seq, folding) = match commit::open_wal_commit(&rec, &self.txn) {
+        let metadata = match limited {
+            Some((limit, held)) => commit::open_wal_commit_with_crc(
+                &rec,
+                replay_crc_limited(
+                    &rec,
+                    &self.txn,
+                    limit,
+                    held.saturating_add(self.buffer_bytes()),
+                )?,
+            ),
+            None => commit::open_wal_commit(&rec, &self.txn),
+        };
+        let (seq, folding) = match metadata {
             Some(Ok((seq, _, _, _))) => {
                 if seq != prev + 1 {
                     return Err(Error::Corrupt(format!(
@@ -988,7 +1000,17 @@ pub(crate) fn apply_backward_limited(
             )?;
             fwd.extend_from_slice(r);
         }
-        match commit::open_wal_commit(commit, &fwd) {
+        match commit::open_wal_commit_with_crc(
+            commit,
+            replay_crc_limited(
+                commit,
+                &fwd,
+                limit,
+                super::history_limited::preparation_delta_bytes(delta)
+                    .saturating_add(held_buffers)
+                    .saturating_add(fwd.capacity() as u64),
+            )?,
+        ) {
             Some(Ok((s, _, _, _))) if s == *seq => {}
             Some(Ok((s, _, _, _))) => {
                 return Err(corrupt(format!("found commit {s} where {seq} ends")));
@@ -1114,6 +1136,38 @@ pub(crate) fn apply_backward_limited(
     Ok(records)
 }
 
+/// The ordinary codec consumes this scalar without allocating another buffer.
+/// Legacy records have no modern checksum and retain their replay fallback.
+fn replay_crc_limited(
+    record: &[u8],
+    data: &[u8],
+    limit: &crate::history::ReadLimit<'_>,
+    held: u64,
+) -> Result<flate2::Crc> {
+    limit.check(held)?;
+    let mut crc = flate2::Crc::new();
+    if record[26] == commit::WAL_COMMIT_V2 {
+        #[cfg(test)]
+        let mut processed = 0;
+        for chunk in data.chunks(commit::WAL_CRC_CHUNK) {
+            limit.check(held)?;
+            crc.update(chunk);
+            #[cfg(test)]
+            {
+                processed += chunk.len();
+                commit::observe_wal_crc(
+                    u64::from_le_bytes(record[9..17].try_into().unwrap()),
+                    processed,
+                    data.len(),
+                );
+            }
+            limit.check(held)?;
+        }
+    }
+    limit.check(held)?;
+    Ok(crc)
+}
+
 fn allocation_refused(limit: &crate::history::ReadLimit<'_>) -> Error {
     let memory = limit.memory.unwrap_or(u64::MAX);
     Error::BudgetExceeded(crate::Budget {
@@ -1133,6 +1187,266 @@ mod tests {
             offset,
             folding: false,
         }
+    }
+
+    fn crc_fixture(backward: bool) -> (tempfile::TempDir, Store, PathBuf, WalPoint, WalPoint) {
+        let root = tempfile::tempdir().unwrap();
+        let store = Store::open(root.path(), Default::default()).unwrap();
+        for (commit, count) in [(1, 6_000), (2, if backward { 3_000 } else { 9_000 })] {
+            let mut body = String::from("INSERT DATA {");
+            use std::fmt::Write;
+            for n in 0..count {
+                write!(body, " <urn:c{commit}:{n}> <urn:p> {n} .").unwrap();
+            }
+            body.push('}');
+            crate::sparql::update::update(&store, &body, &Default::default()).unwrap();
+        }
+        store.flush_change_log().unwrap();
+        let snap = store.snapshot();
+        let path = snap.generation.dir.as_ref().unwrap().join("wal.log");
+        let base = p(0, 0);
+        let mut cursor = WalCursor::open(&path, base).unwrap();
+        assert_eq!(cursor.next().unwrap().unwrap().0, 1);
+        let first = cursor.position();
+        assert_eq!(cursor.next().unwrap().unwrap().0, 2);
+        let second = cursor.position();
+        // These are verified real boundaries. Dense fixture points exclude
+        // selector discovery from the checksum observer's replay scope.
+        *snap.generation.wal_index.lock() = Some(WalIndex {
+            points: vec![base, first, second],
+            last: second,
+            since: 0,
+        });
+        assert_eq!(backward, second.offset - first.offset < first.offset);
+        (root, store, path, first, second)
+    }
+
+    fn durable_files(root: &Path) -> std::collections::BTreeMap<PathBuf, Vec<u8>> {
+        let mut pending = vec![root.to_path_buf()];
+        let mut files = std::collections::BTreeMap::new();
+        while let Some(dir) = pending.pop() {
+            for entry in std::fs::read_dir(dir).unwrap() {
+                let entry = entry.unwrap();
+                if entry.file_type().unwrap().is_dir() {
+                    pending.push(entry.path());
+                } else {
+                    files.insert(entry.path(), std::fs::read(entry.path()).unwrap());
+                }
+            }
+        }
+        files
+    }
+
+    fn interrupt_crc(backward: bool, deadline: bool, damage: bool) {
+        use std::sync::{
+            Arc,
+            atomic::{AtomicBool, AtomicUsize, Ordering},
+        };
+        use std::time::{Duration, Instant};
+        let (root, store, path, first, second) = crc_fixture(backward);
+        let seq = if backward { 2 } else { 1 };
+        let end = if backward {
+            second.offset
+        } else {
+            first.offset
+        };
+        if damage {
+            let mut bytes = std::fs::read(&path).unwrap();
+            bytes[end as usize - 1] ^= 1;
+            std::fs::write(&path, bytes).unwrap();
+        }
+        let before = durable_files(root.path());
+        let cache_before = store.history.as_ref().unwrap().lock().cache.len();
+        let cancel = Arc::new(AtomicBool::new(false));
+        let until = deadline.then(|| Instant::now() + Duration::from_secs(2));
+        let options = crate::history::HistoryOptions {
+            cancel: Some(cancel.clone()),
+            deadline: until,
+        };
+        let processed = Arc::new(AtomicUsize::new(0));
+        let total = Arc::new(AtomicUsize::new(0));
+        let progress = processed.clone();
+        let size = total.clone();
+        let observer = Arc::new(move |found: u64, bytes: usize, length: usize| {
+            assert_eq!(found, seq, "fixture selected the wrong replay direction");
+            progress.store(bytes, Ordering::SeqCst);
+            size.store(length, Ordering::SeqCst);
+            if bytes < length {
+                if let Some(until) = until {
+                    while Instant::now() < until {
+                        std::thread::sleep(Duration::from_millis(1));
+                    }
+                } else {
+                    cancel.store(true, Ordering::SeqCst);
+                }
+            }
+        });
+        let result = crate::commit::with_wal_crc_observer(observer, || {
+            store.snapshot_at_limited(&crate::history::At::Commit(1), &options, 128 << 20)
+        });
+        let worked = processed.load(Ordering::SeqCst);
+        let complete = total.load(Ordering::SeqCst);
+        assert!(
+            complete > crate::commit::WAL_CRC_CHUNK,
+            "checksum was never reached"
+        );
+        assert_eq!(durable_files(root.path()), before);
+        assert_eq!(
+            store.history.as_ref().unwrap().lock().cache.len(),
+            cache_before
+        );
+        assert!(
+            worked < complete,
+            "checksum ignored the mid-pass control: processed {worked}/{complete} bytes"
+        );
+        if deadline {
+            assert!(matches!(result, Err(Error::Timeout)));
+        } else {
+            assert!(matches!(result, Err(Error::Cancelled)));
+        }
+    }
+
+    #[test]
+    fn bounded_crc_forward_cancel() {
+        interrupt_crc(false, false, false);
+    }
+    #[test]
+    fn bounded_crc_reverse_cancel() {
+        interrupt_crc(true, false, false);
+    }
+    #[test]
+    fn bounded_crc_forward_deadline() {
+        interrupt_crc(false, true, false);
+    }
+    #[test]
+    fn bounded_crc_reverse_deadline() {
+        interrupt_crc(true, true, false);
+    }
+    #[test]
+    fn bounded_crc_damaged_forward_cancel() {
+        interrupt_crc(false, false, true);
+    }
+    #[test]
+    fn bounded_crc_damaged_reverse_cancel() {
+        interrupt_crc(true, false, true);
+    }
+
+    #[test]
+    fn bounded_crc_state_matches_ordinary_in_both_directions() {
+        for backward in [false, true] {
+            let (root, store, _, _, _) = crc_fixture(backward);
+            let before = durable_files(root.path());
+            let at = crate::history::At::Commit(1);
+            let (bounded, resolved) = store
+                .snapshot_at_limited(&at, &Default::default(), 128 << 20)
+                .unwrap();
+            let mut bounded_quads = Vec::new();
+            bounded
+                .for_each_quad(|q| {
+                    bounded_quads.push(*q);
+                    Ok(())
+                })
+                .unwrap();
+            {
+                let mut history = store.history.as_ref().unwrap().lock();
+                history.cache.clear();
+                history.settle();
+            }
+            let (ordinary, expected) = store.snapshot_at(&at, &Default::default()).unwrap();
+            let mut ordinary_quads = Vec::new();
+            ordinary
+                .for_each_quad(|q| {
+                    ordinary_quads.push(*q);
+                    Ok(())
+                })
+                .unwrap();
+            bounded_quads.sort_unstable();
+            ordinary_quads.sort_unstable();
+            assert_eq!(bounded_quads.len(), 6_000);
+            assert_eq!(bounded_quads, ordinary_quads);
+            assert_eq!(resolved.commit, expected.commit);
+            assert_eq!(durable_files(root.path()), before);
+        }
+    }
+
+    #[test]
+    fn bounded_crc_damage_still_refuses_in_both_directions() {
+        for backward in [false, true] {
+            let (root, store, path, first, second) = crc_fixture(backward);
+            let end = if backward {
+                second.offset
+            } else {
+                first.offset
+            };
+            let mut bytes = std::fs::read(&path).unwrap();
+            bytes[end as usize - 1] ^= 1;
+            std::fs::write(&path, bytes).unwrap();
+            let before = durable_files(root.path());
+            let result = store.snapshot_at_limited(
+                &crate::history::At::Commit(1),
+                &Default::default(),
+                128 << 20,
+            );
+            assert!(matches!(result, Err(Error::Corrupt(_))));
+            assert!(store.history.as_ref().unwrap().lock().cache.is_empty());
+            assert_eq!(durable_files(root.path()), before);
+        }
+    }
+
+    #[test]
+    fn bounded_crc_headerless_legacy_keeps_forward_fallback() {
+        let (root, store, path, first, second) = crc_fixture(true);
+        let mut bytes = std::fs::read(&path).unwrap()[WAL_REC..second.offset as usize].to_vec();
+        for record in bytes.as_chunks_mut::<WAL_REC>().0 {
+            if record[0] == WAL_COMMIT {
+                record[9..].fill(0);
+            }
+        }
+        std::fs::write(&path, bytes).unwrap();
+        let snap = store.snapshot();
+        let first = p(1, first.offset - WAL_REC as u64);
+        let second = p(2, second.offset - WAL_REC as u64);
+        *snap.generation.wal_index.lock() = Some(WalIndex {
+            points: vec![p(0, 0), first, second],
+            last: second,
+            since: 0,
+        });
+        let before = durable_files(root.path());
+        let observer = std::sync::Arc::new(|_, _, _| panic!("legacy data has no modern CRC"));
+        let (bounded, _) = commit::with_wal_crc_observer(observer, || {
+            store.snapshot_at_limited(
+                &crate::history::At::Commit(1),
+                &Default::default(),
+                128 << 20,
+            )
+        })
+        .unwrap();
+        assert_eq!(bounded.len(), 6_000);
+        let mut history = store.history.as_ref().unwrap().lock();
+        history.cache.clear();
+        history.settle();
+        drop(history);
+        let (ordinary, _) = store
+            .snapshot_at(&crate::history::At::Commit(1), &Default::default())
+            .unwrap();
+        let mut bounded_quads = Vec::new();
+        bounded
+            .for_each_quad(|q| {
+                bounded_quads.push(*q);
+                Ok(())
+            })
+            .unwrap();
+        let mut ordinary_quads = Vec::new();
+        ordinary
+            .for_each_quad(|q| {
+                ordinary_quads.push(*q);
+                Ok(())
+            })
+            .unwrap();
+        bounded_quads.sort_unstable();
+        ordinary_quads.sort_unstable();
+        assert_eq!(bounded_quads, ordinary_quads);
+        assert_eq!(durable_files(root.path()), before);
     }
 
     /// Direct writes, buffered writes in between, and block boundaries leave the file
