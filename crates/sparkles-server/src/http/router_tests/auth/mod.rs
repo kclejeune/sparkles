@@ -10,6 +10,7 @@ use std::path::PathBuf;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 mod algo_view;
+mod audit;
 mod branches;
 mod cli_grants;
 #[cfg(feature = "reasoning")]

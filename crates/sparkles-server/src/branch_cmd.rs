@@ -209,6 +209,31 @@ pub enum BranchCmd {
 }
 
 pub fn run_branch(cmd: BranchCmd, opts: StoreOptions) -> Result<()> {
+    let attempted = match &cmd {
+        BranchCmd::Create { target, name, .. } if target.loc.is_some() => {
+            Some(("branch_created", name.clone()))
+        }
+        BranchCmd::Delete { target, name, .. } if target.loc.is_some() => {
+            Some(("branch_deleted", name.clone()))
+        }
+        _ => None,
+    };
+    let actor = crate::audit::Actor::local();
+    let result = run_branch_inner(cmd, opts, &actor);
+    if let (Some((operation, name)), Err(error)) = (attempted, &result) {
+        actor.failed_branch(
+            operation,
+            None,
+            &name,
+            error
+                .downcast_ref::<sparkles::Error>()
+                .map_or("operation-failed", |e| e.code()),
+        );
+    }
+    result
+}
+
+fn run_branch_inner(cmd: BranchCmd, opts: StoreOptions, actor: &crate::audit::Actor) -> Result<()> {
     match cmd {
         BranchCmd::Relink { loc, name, format } => {
             if name == MAIN {
@@ -259,7 +284,21 @@ pub fn run_branch(cmd: BranchCmd, opts: StoreOptions) -> Result<()> {
                         protected,
                         note,
                     };
-                    branch_json(&s.create_branch(&name, &o)?)
+                    let info = s.create_branch(&name, &o)?;
+                    crate::audit::dataset(
+                        "branch_created",
+                        None,
+                        Some(s.dataset_id()),
+                        actor,
+                        crate::audit::Fields {
+                            branch: Some(&info.name),
+                            branch_id: Some(info.id),
+                            source: info.from.as_ref().and_then(|from| from.branch.as_deref()),
+                            source_commit: info.from.as_ref().map(|from| from.seq),
+                            ..Default::default()
+                        },
+                    );
+                    branch_json(&info)
                 }
                 None => {
                     let mut body = json!({ "name": name, "protected": protected });
@@ -314,10 +353,23 @@ pub fn run_branch(cmd: BranchCmd, opts: StoreOptions) -> Result<()> {
             reparent,
         } => {
             match &target.loc {
-                Some(loc) => Store::open(loc, opts)?.delete_branch_with(
-                    &name,
-                    &sparkles::branch::DeleteOptions { force, reparent },
-                )?,
+                Some(loc) => {
+                    let store = Store::open(loc, opts)?;
+                    store.delete_branch_with(
+                        &name,
+                        &sparkles::branch::DeleteOptions { force, reparent },
+                    )?;
+                    crate::audit::dataset(
+                        "branch_deleted",
+                        None,
+                        Some(store.dataset_id()),
+                        actor,
+                        crate::audit::Fields {
+                            branch: Some(&name),
+                            ..Default::default()
+                        },
+                    );
+                }
                 None => {
                     let q = match (force, reparent) {
                         (false, false) => "",

@@ -393,7 +393,10 @@ impl Tools<'_> {
                 ds.name
             )));
         }
-        let at = match selector(None, a.at.as_ref())? {
+        let actor = crate::audit::Actor::tool(&p, &self.call.request_id);
+        let at = match selector(None, a.at.as_ref()).inspect_err(|error| {
+            actor.failed_branch("branch_created", Some(&ds.name), &name, error.code);
+        })? {
             Some(at) => at,
             None => At::Head,
         };
@@ -404,9 +407,10 @@ impl Tools<'_> {
             note: a.note,
         };
         let rid = &self.call.request_id;
-        ds.store
-            .create_branch(&name, &o)
-            .map_err(|e| store_error(e, rid))?;
+        ds.store.create_branch(&name, &o).map_err(|e| {
+            actor.failed_branch("branch_created", Some(&ds.name), &name, e.code());
+            store_error(e, rid)
+        })?;
         let marked = ds
             .store
             .set_branch_scratch(&name, Some(Scratch { creator: p.id() }));
@@ -421,9 +425,23 @@ impl Tools<'_> {
                         reparent: false,
                     },
                 );
+                actor.failed_branch("branch_created", Some(&ds.name), &name, e.code());
                 return Err(store_error(e, rid));
             }
         };
+        crate::audit::dataset(
+            "branch_created",
+            Some(&ds.name),
+            Some(ds.store.dataset_id()),
+            &actor,
+            crate::audit::Fields {
+                branch: Some(&info.name),
+                branch_id: Some(info.id),
+                source: info.from.as_ref().and_then(|from| from.branch.as_deref()),
+                source_commit: info.from.as_ref().map(|from| from.seq),
+                ..Default::default()
+            },
+        );
         let mut j = json!({
             "dataset": ds.name,
             "name": info.name,
@@ -650,10 +668,13 @@ impl Tools<'_> {
             )));
         }
         let rid = &self.call.request_id;
-        let info = ds
-            .store
-            .branch_info(&name)
-            .map_err(|e| store_error(e, rid))?;
+        let actor = crate::audit::Actor::tool(&p, rid);
+        let info = ds.store.branch_info(&name).map_err(|e| {
+            if !p.restricted(&q) {
+                actor.failed_branch("branch_deleted", Some(&ds.name), &name, e.code());
+            }
+            store_error(e, rid)
+        })?;
         if info.protected && p.level(&q).is_none_or(|l| l < Level::Admin) {
             return Err(forbidden(format!(
                 "branch {name} is protected: admin access required"
@@ -673,7 +694,20 @@ impl Tools<'_> {
                     reparent: false,
                 },
             )
-            .map_err(|e| store_error(e, rid))?;
+            .map_err(|e| {
+                actor.failed_branch("branch_deleted", Some(&ds.name), &name, e.code());
+                store_error(e, rid)
+            })?;
+        crate::audit::dataset(
+            "branch_deleted",
+            Some(&ds.name),
+            Some(ds.store.dataset_id()),
+            &actor,
+            crate::audit::Fields {
+                branch: Some(&name),
+                ..Default::default()
+            },
+        );
         ds.branches.lock().remove(&name);
         Ok(Outcome::Structured(json!({
             "dataset": ds.name,
@@ -840,6 +874,17 @@ pub(crate) fn sweep(st: &AppState, ttl: Duration, now_ms: i64) -> Vec<String> {
                 },
             ) {
                 Ok(_) => {
+                    crate::audit::dataset(
+                        "branch_deleted",
+                        Some(&ds.name),
+                        Some(ds.store.dataset_id()),
+                        &crate::audit::Actor::expiry(),
+                        crate::audit::Fields {
+                            branch: Some(&b.name),
+                            reason: Some("idle-expiry"),
+                            ..Default::default()
+                        },
+                    );
                     ds.branches.lock().remove(&b.name);
                     EXPIRED.fetch_add(1, Ordering::Relaxed);
                     tracing::info!(

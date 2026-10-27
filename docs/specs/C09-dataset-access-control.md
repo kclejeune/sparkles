@@ -6,8 +6,8 @@
 > trusted proxy headers, CLI logins, remote `query`/`update`/`load`, and the UI pages.
 > Phase 2 shipped: rate limiting of failed logins, a Content Security Policy for the
 > UI, native TLS, the OIDC provider's access tokens on the API, Cloudflare Access
-> assertions, idle timeouts for sessions and back-channel logout (§12.5). Its audit
-> events for dataset admin operations were not built. Open questions 9 and 10 were
+> assertions, idle timeouts for sessions and back-channel logout (§12.5). Dataset and
+> branch administration emit audit events. Open questions 9 and 10 were
 > decided with it. Phase 3, graph-level ACLs and endpoint permissions,
 > shipped as [C12](C12-graph-access-control.md).
 >
@@ -2241,35 +2241,48 @@ storing it, because a token at rest would violate §1.1.
 
 **Not built.** Sparkles has no client certificates (mutual TLS), OCSP stapling, token
 introspection (RFC 7662) for opaque access tokens or front-channel logout, and it does
-not read groups from Access's identity endpoint. Phase 2's audit events for dataset
-admin operations were not built either. Sign-ins, tokens and backups emit audit events
-under `sparkles::audit`, but creating, deleting and cloning a dataset do not.
+not read groups from Access's identity endpoint.
 Endpoint-level permissions and graph-level ACLs (Phase 3) were built later,
 as [C12](C12-graph-access-control.md) describes.
 
+### Dataset administration audit
+
+Item 62 adds the INFO events `dataset_created`, `dataset_deleted`, `dataset_cloned`,
+`branch_created` and `branch_deleted` on the existing `sparkles::audit` target.
+HTTP administration, stopped-catalog dataset commands, local branch commands and
+explicit MCP branch operations share the emitter. Remote commands rely on the server
+event. Existing authentication, backup, restore, settings and notification audit
+records keep their transport and meaning.
+
+Success follows the completed operation. A clone emits after target registration and
+records the actual selected source commit and both identities. Accepting a queued task
+does not emit success. A failed or abandoned clone emits `dataset_admin_failed` with
+its initiating principal and a bounded error code. Rollback during dataset creation or
+scratch marking does not produce a false creation or a second deletion event.
+HTTP dataset and branch mutation workers retain terminal records and the initiating
+actor when the request is cancelled. Worker errors emit once, while authorized
+validation failures before dispatch remain with the request handler.
+
+Records carry the existing principal and tracing context. Offline commands use
+`local:<user>`, with `local:unknown` when no process user name is available. Successful
+automatic scratch expiry uses `system:scratch-expiry` and `reason=idle-expiry` without
+claiming the creator performed the deletion or inventing a request identifier. Existing
+expiry failure logs remain operational logs.
+
+Creation records include returned identities. Deletion records include stable family
+identity and validated object names, omitting a deleted branch UUID or quad count that
+the existing operation cannot prove atomically. A pre-delete lookup is not such proof
+under concurrent deletion, recreation or writing. This bounds the metadata contract
+without introducing a core mutation API or retaining handles that would prevent deletion.
+
+Authorized operation failures emit a code without request bodies, notes, credentials,
+paths or raw error messages. Authentication refusals and hidden-object checks retain
+their existing access-log behavior. Events use the configured tracing output and
+filters; they do not add a separate durable audit journal.
+
 ### Roadmap follow-ups (2026-10-12)
 
-**Audit events for dataset administration** (item 62, Tier 6,
-[ROADMAP](../ROADMAP.md)).
-
-* **What is missing today.** The Outcome's last paragraph still holds. Events under the
-  `sparkles::audit` target come from `auth/handlers.rs`, `auth/policy.rs`, the backup
-  routes and policies, `notify/http.rs` and the settings routes
-  (`settings/secrets.rs`, `settings/server.rs`). `create_dataset`, the dataset
-  `DELETE` and `clone_dataset` in `crates/sparkles-server/src/http.rs` log nothing
-  under that target, and neither do branch creation and deletion
-  (`http/branches.rs`) or the offline `sparkles dataset` commands. Restores already log
-  `restore_started` and `restore_finished` (`backup/http.rs`, `backup/ops.rs`).
-* **Design.** One helper, `audit::dataset(event, name, id, principal, fields)`, called
-  after the operation succeeds, with the events `dataset_created` (type, declared or
-  runtime), `dataset_deleted` (id, quads at deletion), `dataset_cloned` (source, source
-  commit, target), `branch_created` and `branch_deleted`. Failures that reach the handler after authorization log
-  `dataset_admin_failed` with the error code, so an operator can see attempts by an
-  authorized principal. The offline commands log the same events with the principal
-  `local:<user>` from the process's user. Fields follow the existing events (`event`,
-  the object's name, `principal`), and the router test that runs every admin route
-  under auth gains a check that each state-changing dataset route emits exactly one
-  event.
+Item 62's [dataset administration audit](#dataset-administration-audit) is available.
 
 **Mutual TLS, OCSP, opaque-token introspection, front-channel logout and Cloudflare
 group lookup** (item 63, Tier 6, [ROADMAP](../ROADMAP.md)).

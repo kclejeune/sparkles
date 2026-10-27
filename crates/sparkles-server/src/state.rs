@@ -1011,6 +1011,16 @@ impl AppState {
     /// lock is held only for the map change, so other requests go on during a slow
     /// delete. Requests still holding the dataset make the delete fail with a conflict.
     pub fn delete(&self, name: &str) -> Result<bool> {
+        self.delete_with_audit_identity(name)
+            .map(|(deleted, _)| deleted)
+    }
+
+    /// Capture only scalar identity inside the existing leave boundary. An audit
+    /// handle must neither keep the dataset in use nor sample racy deletion counts.
+    pub(crate) fn delete_with_audit_identity(
+        &self,
+        name: &str,
+    ) -> Result<(bool, Option<uuid::Uuid>)> {
         let leaving = self.leave(name)?;
         let cached = self.routing.lock().remove(name);
         // Only a managed persistent dataset has files that an old handle could write.
@@ -1028,6 +1038,10 @@ impl AppState {
         let offline = cached
             .as_ref()
             .is_some_and(|ds| ds.offline.load(Ordering::Relaxed));
+        let identity = cached
+            .as_ref()
+            .map(|ds| ds.store.dataset_id())
+            .or_else(|| self.catalog.info(name).map(|info| info.id));
         drop(cached);
         #[cfg(test)]
         tests::delete_hook(name);
@@ -1039,7 +1053,7 @@ impl AppState {
                     self.metrics.forget(name);
                     self.volatile.forget(name);
                 }
-                Ok(deleted)
+                Ok((deleted, deleted.then_some(identity).flatten()))
             }
             Err(e) => {
                 if let Some(ds) = self.get(name) {

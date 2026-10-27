@@ -98,6 +98,12 @@ Authentication is off by default. Once it is on, access is denied unless a grant
   stored group changes invalidate prepared authentication. A password verification
   that finishes after a reload cannot restore the previous grants in the cache
   or create a session from them. Last-used bookkeeping does not revoke access.
+* Dataset and branch administration emit INFO records under `sparkles::audit` with the
+  existing actor and completed operation identities. Clones record the selected source
+  commit after registration, and authorized failures record bounded codes. Continuing
+  mutation workers retain these records when an HTTP request is cancelled. The
+  [operations guide](../operations/README.md#observability) describes local commands and
+  automatic scratch expiry.
 * With an OIDC provider and `serve --mcp`, `/$/mcp` is an OAuth 2.1 protected resource
   ([API.md](../API.md#oauth-for-the-mcp-endpoint)). It publishes RFC 9728 metadata that
   names the provider, accepts access tokens whose audience is its own resource

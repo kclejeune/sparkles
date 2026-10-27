@@ -10,6 +10,7 @@ mod alloc;
 mod ask;
 mod assist;
 mod assistant;
+mod audit;
 mod auth;
 #[cfg(feature = "backup")]
 mod backup;
@@ -2620,6 +2621,7 @@ fn run() -> Result<()> {
         Cmd::Serve { .. } | Cmd::Load { .. } | Cmd::Compact { .. } => {
             "sparkles=info,sparkles_server=info,tower_http=warn"
         }
+        Cmd::Dataset { .. } | Cmd::Branch { .. } => "warn,sparkles::audit=info",
         _ => "warn",
     };
     let filter = tracing_subscriber::EnvFilter::try_from_default_env()

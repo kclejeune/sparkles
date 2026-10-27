@@ -679,6 +679,23 @@ pub(crate) async fn create(
     Extension(p): Extension<Principal>,
     body: Bytes,
 ) -> ApiResult {
+    let actor = crate::audit::Actor::request(&p);
+    let mut pending_failure = None;
+    let result = create_inner(st, name.clone(), p, body, &actor, &mut pending_failure).await;
+    if let (Some(branch), Err(error)) = (&pending_failure, &result) {
+        actor.failed_branch("branch_created", Some(&name), branch, error.audit_code());
+    }
+    result
+}
+
+async fn create_inner(
+    st: Arc<AppState>,
+    name: String,
+    p: Principal,
+    body: Bytes,
+    actor: &crate::audit::Actor,
+    pending_failure: &mut Option<String>,
+) -> ApiResult {
     writable(&st)?;
     let ds = main_dataset(&st, &name)?;
     let b: CreateBody = serde_json::from_slice(&body)
@@ -697,6 +714,7 @@ pub(crate) async fn create(
     }
     whole(&p, &name, &from)?;
     whole(&p, &name, &b.name)?;
+    *pending_failure = Some(b.name.clone());
     let at = match &b.at {
         Some(a) => a.parse::<At>()?,
         None => At::Head,
@@ -708,7 +726,37 @@ pub(crate) async fn create(
         note: b.note,
     };
     let new = b.name.clone();
-    let info = blocking(move || Ok(ds.store.create_branch(&new, &o)?)).await?;
+    let identity = ds.store.dataset_id();
+    let actor = actor.clone();
+    let audit_name = name.clone();
+    // Failure ownership transfers from the authorized handler to its worker.
+    *pending_failure = None;
+    let info = blocking(move || {
+        let result: ApiResult<_> = ds.store.create_branch(&new, &o).map_err(Into::into);
+        match &result {
+            Ok(info) => crate::audit::dataset(
+                "branch_created",
+                Some(&audit_name),
+                Some(identity),
+                &actor,
+                crate::audit::Fields {
+                    branch: Some(&info.name),
+                    branch_id: Some(info.id),
+                    source: info.from.as_ref().and_then(|from| from.branch.as_deref()),
+                    source_commit: info.from.as_ref().map(|from| from.seq),
+                    ..Default::default()
+                },
+            ),
+            Err(error) => actor.failed_branch(
+                "branch_created",
+                Some(&audit_name),
+                &new,
+                error.audit_code(),
+            ),
+        }
+        result
+    })
+    .await?;
     let loc = format!("/$/branches/{name}/{}", info.name);
     Ok((
         StatusCode::CREATED,
@@ -840,6 +888,18 @@ pub(crate) async fn delete_branch(
     Extension(p): Extension<Principal>,
     uri: Uri,
 ) -> ApiResult {
+    let actor = crate::audit::Actor::request(&p);
+    delete_branch_inner(st, name, branch, p, uri, &actor).await
+}
+
+async fn delete_branch_inner(
+    st: Arc<AppState>,
+    name: String,
+    branch: String,
+    p: Principal,
+    uri: Uri,
+    actor: &crate::audit::Actor,
+) -> ApiResult {
     writable(&st)?;
     let ds = main_dataset(&st, &name)?;
     let params = Params::from_query(&uri);
@@ -863,13 +923,34 @@ pub(crate) async fn delete_branch(
             whole(&p, &name, &branch)?;
         }
     }
-    let d = ds.clone();
-    let b = branch.clone();
-    blocking(move || Ok(d.dataset.delete_branch_with(&b, &o)?)).await?;
-    ds.branches.lock().remove(&branch);
-    #[cfg(feature = "mcp")]
-    crate::mcp::memory::pending::touch(&st, &name);
-    Ok(StatusCode::NO_CONTENT.into_response())
+    // Authorization is complete. The following work and its record stay owned by
+    // the blocking worker, including after the request future is dropped.
+    let actor = actor.clone();
+    let identity = ds.store.dataset_id();
+    blocking(move || {
+        let result = (|| -> ApiResult {
+            ds.dataset.delete_branch_with(&branch, &o)?;
+            ds.branches.lock().remove(&branch);
+            #[cfg(feature = "mcp")]
+            crate::mcp::memory::pending::touch(&st, &name);
+            crate::audit::dataset(
+                "branch_deleted",
+                Some(&name),
+                Some(identity),
+                &actor,
+                crate::audit::Fields {
+                    branch: Some(&branch),
+                    ..Default::default()
+                },
+            );
+            Ok(StatusCode::NO_CONTENT.into_response())
+        })();
+        if let Err(error) = &result {
+            actor.failed_branch("branch_deleted", Some(&name), &branch, error.audit_code());
+        }
+        result
+    })
+    .await
 }
 
 /// A term of a resolution, in N-Triples (Turtle literals such as `33` too).

@@ -177,6 +177,71 @@ fn a22_branches_and_merges_on_a_local_database() {
     assert!(!o.status.success());
 }
 
+#[test]
+fn item62_audit_local_branch_create_delete_records_actual_branch_identity() {
+    let dir = tempfile::tempdir().unwrap();
+    ok(
+        dir.path(),
+        &[
+            "update",
+            "--loc",
+            "db",
+            "INSERT DATA { <urn:local> <urn:p> 1 }",
+        ],
+    );
+    let audited = |args: &[&str]| {
+        let output = Command::new(BIN)
+            .current_dir(dir.path())
+            .args(["--log-format", "json"])
+            .args(args)
+            .env_remove("SPARKLES_SERVER")
+            .env("RUST_LOG", "sparkles::audit=info")
+            .env("USER", "audit-local")
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        String::from_utf8_lossy(&output.stderr)
+            .lines()
+            .filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
+            .filter(|record| record["target"] == "sparkles::audit")
+            .collect::<Vec<_>>()
+    };
+    let created = audited(&["branch", "create", "--loc", "db", "audit-review"]);
+    let info = ok(
+        dir.path(),
+        &[
+            "branch",
+            "show",
+            "--loc",
+            "db",
+            "audit-review",
+            "--format",
+            "json",
+        ],
+    );
+    let info: serde_json::Value = serde_json::from_slice(&info.stdout).unwrap();
+    let deleted = audited(&["branch", "delete", "--loc", "db", "audit-review"]);
+    for (name, events) in [("branch_created", created), ("branch_deleted", deleted)] {
+        assert_eq!(
+            events.len(),
+            1,
+            "missing or duplicate local {name} audit event: {events:?}"
+        );
+        assert_eq!(events[0]["fields"]["event"], name);
+        assert_eq!(events[0]["fields"]["principal"], "local:audit-local");
+        assert_eq!(events[0]["fields"]["branch"], "audit-review");
+        if name == "branch_created" {
+            assert_eq!(events[0]["fields"]["branch_id"], info["id"]);
+        } else {
+            assert!(events[0]["fields"].get("branch_id").is_none());
+        }
+    }
+}
+
 /// A free port in 5600–5619.
 fn port() -> u16 {
     (5600..5620)

@@ -80,6 +80,27 @@ fn info(d: DatasetInfo) -> J {
 }
 
 pub fn run(cmd: DatasetCmd, opts: StoreOptions) -> Result<()> {
+    let attempted = cmd.target().data_dir.as_ref().and_then(|_| match &cmd {
+        DatasetCmd::Create { name, .. } => Some(("dataset_created", name.clone())),
+        DatasetCmd::Delete { name, .. } => Some(("dataset_deleted", name.clone())),
+        DatasetCmd::Clone { name, .. } => Some(("dataset_cloned", name.clone())),
+        _ => None,
+    });
+    let actor = crate::audit::Actor::local();
+    let result = run_inner(cmd, opts, &actor);
+    if let (Some((operation, name)), Err(error)) = (attempted, &result) {
+        actor.failed(
+            operation,
+            Some(&name),
+            error
+                .downcast_ref::<sparkles::Error>()
+                .map_or("operation-failed", |e| e.code()),
+        );
+    }
+    result
+}
+
+fn run_inner(cmd: DatasetCmd, opts: StoreOptions, actor: &crate::audit::Actor) -> Result<()> {
     if crate::branch_cmd::branch().is_some() {
         bail!("dataset commands manage whole datasets; --branch is not supported");
     }
@@ -91,7 +112,7 @@ pub fn run(cmd: DatasetCmd, opts: StoreOptions) -> Result<()> {
                 json!({"datasets": catalog.list().into_iter().map(info).collect::<Vec<_>>()})
             }
             DatasetCmd::Create { name, kind, .. } => {
-                drop(catalog.create(
+                let created = catalog.create(
                     name,
                     &CreateDataset {
                         kind: if kind == "persistent" {
@@ -101,13 +122,31 @@ pub fn run(cmd: DatasetCmd, opts: StoreOptions) -> Result<()> {
                         },
                         ..Default::default()
                     },
-                )?);
+                )?;
+                crate::audit::dataset(
+                    "dataset_created",
+                    Some(name),
+                    Some(created.dataset_id()),
+                    actor,
+                    crate::audit::Fields {
+                        kind: Some(if kind == "persistent" {
+                            "persistent"
+                        } else {
+                            "mem"
+                        }),
+                        declared: Some(false),
+                        ..Default::default()
+                    },
+                );
+                drop(created);
                 info(catalog.info(name).context("created dataset")?)
             }
             DatasetCmd::Delete { name, .. } => {
+                let id = catalog.info(name).map(|info| info.id);
                 if !catalog.delete(name)? {
                     bail!("no dataset /{name}");
                 }
+                crate::audit::dataset("dataset_deleted", Some(name), id, actor, Default::default());
                 json!({"deleted": name})
             }
             DatasetCmd::Rename { name, new_name, .. } => {
@@ -121,22 +160,39 @@ pub fn run(cmd: DatasetCmd, opts: StoreOptions) -> Result<()> {
                 inferences,
                 ..
             } => {
-                drop(
-                    catalog.clone_dataset(
-                        source,
-                        name,
-                        &CloneRequest {
-                            spec: sparkles::cloning::Spec {
-                                at: at.as_deref().map(str::parse).transpose()?,
-                                inferences: sparkles::cloning::Inferences::parse(inferences)
-                                    .context("inferences")?,
-                                ..Default::default()
-                            },
-                            ..Default::default()
-                        },
-                        &Default::default(),
-                    )?,
+                let request = CloneRequest {
+                    spec: sparkles::cloning::Spec {
+                        at: at.as_deref().map(str::parse).transpose()?,
+                        inferences: sparkles::cloning::Inferences::parse(inferences)
+                            .context("inferences")?,
+                        ..Default::default()
+                    },
+                    ..Default::default()
+                };
+                let reservation =
+                    catalog.reserve(name, sparkles::catalog::ReservationKind::Clone, "clone")?;
+                let source_dataset = catalog
+                    .get(source)
+                    .ok_or_else(|| sparkles::Error::NotFound(format!("no dataset /{source}")))?;
+                let (created, report) = catalog.clone_from_reserved(
+                    &source_dataset,
+                    reservation,
+                    &request,
+                    &Default::default(),
+                )?;
+                crate::audit::dataset(
+                    "dataset_cloned",
+                    Some(name),
+                    Some(created.dataset_id()),
+                    actor,
+                    crate::audit::Fields {
+                        source: Some(source),
+                        source_id: Some(report.forked_from.id),
+                        source_commit: Some(report.forked_from.seq),
+                        ..Default::default()
+                    },
                 );
+                drop(created);
                 info(catalog.info(name).context("cloned dataset")?)
             }
         }

@@ -101,6 +101,127 @@ fn catalog_dataset_cli_crud_clone_and_lock() {
     assert!(String::from_utf8_lossy(&locked.stderr).contains("in use by another process"));
 }
 
+#[test]
+fn item62_audit_dataset_commands_log_local_identity_and_actual_clone_commit() {
+    let temp = tempfile::tempdir().unwrap();
+    let dir = temp.path();
+    let audited = |args: &[&str]| {
+        let output = Command::new(BIN)
+            .current_dir(dir)
+            .args(["--log-format", "json"])
+            .args(args)
+            .env_remove("SPARKLES_SERVER")
+            .env_remove("SPARKLES_TOKEN")
+            .env("XDG_CONFIG_HOME", dir.join("config"))
+            .env("RUST_LOG", "sparkles::audit=info")
+            .env("USER", "audit-local")
+            .output()
+            .unwrap();
+        let events: Vec<J> = String::from_utf8_lossy(&output.stderr)
+            .lines()
+            .filter_map(|line| serde_json::from_str::<J>(line).ok())
+            .filter(|record| record["target"] == "sparkles::audit")
+            .collect();
+        (output, events)
+    };
+    let (created, create_events) = audited(&[
+        "dataset",
+        "create",
+        "audit-source",
+        "--data-dir",
+        "data",
+        "--json",
+    ]);
+    assert!(
+        created.status.success(),
+        "{}",
+        String::from_utf8_lossy(&created.stderr)
+    );
+    let source: J = serde_json::from_slice(&created.stdout).unwrap();
+    for number in [1, 2] {
+        let updated = run(
+            dir,
+            &[
+                "update",
+                "--loc",
+                "data/databases/audit-source",
+                &format!("INSERT DATA {{ <urn:local:{number}> <urn:p> {number} }}"),
+            ],
+        );
+        assert!(
+            updated.status.success(),
+            "{}",
+            String::from_utf8_lossy(&updated.stderr)
+        );
+    }
+    let (cloned, clone_events) = audited(&[
+        "dataset",
+        "clone",
+        "audit-source",
+        "audit-copy",
+        "--at",
+        "1",
+        "--data-dir",
+        "data",
+        "--json",
+    ]);
+    assert!(
+        cloned.status.success(),
+        "{}",
+        String::from_utf8_lossy(&cloned.stderr)
+    );
+    let target: J = serde_json::from_slice(&cloned.stdout).unwrap();
+    let (deleted, delete_events) = audited(&[
+        "dataset",
+        "delete",
+        "audit-source",
+        "--data-dir",
+        "data",
+        "--json",
+    ]);
+    assert!(
+        deleted.status.success(),
+        "{}",
+        String::from_utf8_lossy(&deleted.stderr)
+    );
+    let value: J = serde_json::from_slice(&deleted.stdout).unwrap();
+    assert_eq!(value["deleted"], "audit-source");
+    for (name, events) in [
+        ("dataset_created", &create_events),
+        ("dataset_cloned", &clone_events),
+        ("dataset_deleted", &delete_events),
+    ] {
+        assert_eq!(
+            events.len(),
+            1,
+            "missing or duplicate local {name} audit event: {events:?}"
+        );
+        assert_eq!(events[0]["fields"]["event"], name);
+        assert_eq!(events[0]["fields"]["principal"], "local:audit-local");
+    }
+    assert_eq!(create_events[0]["fields"]["id"], source["id"]);
+    assert_eq!(clone_events[0]["fields"]["id"], target["id"]);
+    assert_eq!(clone_events[0]["fields"]["source_commit"], 1);
+    assert_eq!(delete_events[0]["fields"]["id"], source["id"]);
+    assert!(delete_events[0]["fields"].get("quads").is_none());
+    let (failed, events) = audited(&[
+        "dataset",
+        "delete",
+        "missing",
+        "--data-dir",
+        "data",
+        "--json",
+    ]);
+    assert!(!failed.status.success());
+    assert_eq!(
+        events.len(),
+        1,
+        "missing local failure audit event: {events:?}"
+    );
+    assert_eq!(events[0]["fields"]["event"], "dataset_admin_failed");
+    assert!(events[0]["fields"]["code"].is_string());
+}
+
 #[cfg(feature = "auth")]
 #[test]
 fn online_dataset_cli_crud_clone() {

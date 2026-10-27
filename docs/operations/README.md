@@ -85,6 +85,15 @@ each stated scope.
 
 ### Observability
 
+* Dataset creation, deletion and cloning and branch creation and deletion emit INFO
+  events under `sparkles::audit`. Each completed operation carries its actor and proven
+  identity metadata; authorized failures carry a bounded code without request payloads
+  or credentials. Clone success follows target registration rather than task acceptance.
+* Local dataset and branch commands use `local:<user>` and the existing stderr tracing
+  output, with audit INFO enabled by default. Remote commands rely on the server event.
+  Automatic scratch expiry records `system:scratch-expiry` and `reason=idle-expiry`.
+  Deletion records omit counts and branch UUIDs that cannot be proved atomically.
+  `RUST_LOG` retains control over event filtering.
 * Every request gets an `X-Request-Id` and one structured access-log line in text or
   JSON. `/$/metrics` serves Prometheus metrics and `/$/ready` readiness. The metrics
   include each query's rows and peak memory and index rebuilds by reason and duration.
