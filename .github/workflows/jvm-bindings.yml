@@ -47,7 +47,7 @@ concurrency:
   cancel-in-progress: ${{ github.ref != 'refs/heads/main' && github.ref_type != 'tag' }}
 
 env:
-  MBX_HTTP_TIMEOUT: 1m
+  MBX_HTTP_TIMEOUT: 5m
   # Only same-repository PRs may publish to the remote cache.
   MBX_REMOTE_TRUST_WRITES: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name == github.repository && 'true' || 'false' }}
   # Pushes to main and pull requests build the bindings in the dev profile, which compiles
