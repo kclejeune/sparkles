@@ -36,7 +36,6 @@ jobs:
     env:
       CACHE_COMPARISON_ARM: hybrid
       CACHE_COMPARISON_PHASE: seed
-      CACHE_COMPARISON_RESULTS: ${{ runner.temp }}/ci-cache-results
       MBX_TARGET_VIEWS: "0"
     steps:
       - name: Check out experiment helpers
@@ -50,6 +49,7 @@ jobs:
           install -m 755 scripts/ci-cache-comparison.py scripts/ci-cache-comparison-tool "$RUNNER_TEMP/ci-cache-tools/"
           echo "$RUNNER_TEMP/ci-cache-tools" >> "$GITHUB_PATH"
           echo "CACHE_COMPARISON_SCRIPT=$RUNNER_TEMP/ci-cache-tools/ci-cache-comparison.py" >> "$GITHUB_ENV"
+          echo "CACHE_COMPARISON_RESULTS=$RUNNER_TEMP/ci-cache-results" >> "$GITHUB_ENV"
       - name: Check out exact comparison source
         uses: actions/checkout@v5
         with:
@@ -131,7 +131,6 @@ jobs:
     env:
       CACHE_COMPARISON_ARM: ${{ matrix.arm }}
       CACHE_COMPARISON_PHASE: warm
-      CACHE_COMPARISON_RESULTS: ${{ runner.temp }}/ci-cache-results
       MBX_TARGET_VIEWS: ${{ matrix.arm == 'remote' && '1' || '0' }}
     steps:
       - name: Check out experiment helpers
@@ -145,6 +144,7 @@ jobs:
           install -m 755 scripts/ci-cache-comparison.py scripts/ci-cache-comparison-tool "$RUNNER_TEMP/ci-cache-tools/"
           echo "$RUNNER_TEMP/ci-cache-tools" >> "$GITHUB_PATH"
           echo "CACHE_COMPARISON_SCRIPT=$RUNNER_TEMP/ci-cache-tools/ci-cache-comparison.py" >> "$GITHUB_ENV"
+          echo "CACHE_COMPARISON_RESULTS=$RUNNER_TEMP/ci-cache-results" >> "$GITHUB_ENV"
       - name: Check out exact comparison source
         uses: actions/checkout@v5
         with:

@@ -184,6 +184,12 @@ class WorkflowControls(unittest.TestCase):
             "yq", "-o=json", ".", str(ROOT / ".github/workflows/ci-cache-comparison.yml"),
         ], text=True))
 
+    def test_runner_paths_are_set_only_after_a_runner_starts(self):
+        for job in self.workflow["jobs"].values():
+            self.assertFalse(any("runner." in str(value) for value in job["env"].values()))
+            staging = next(step for step in job["steps"] if step["name"].startswith("Stage helpers"))
+            self.assertIn('echo "CACHE_COMPARISON_RESULTS=$RUNNER_TEMP/ci-cache-results" >> "$GITHUB_ENV"', staging["run"])
+
     def test_exact_branch_one_seed_three_fresh_warm_arms(self):
         self.assertEqual(self.workflow["on"], {"push": {"branches": ["ci-cache-comparison-20261027"]}})
         jobs = self.workflow["jobs"]
@@ -226,6 +232,29 @@ class WorkflowControls(unittest.TestCase):
         self.assertEqual(env["MBX_REMOTE_TRUST_WRITES"], "false")
         self.assertNotIn("MBX_CACHE_DIR", env)
         self.assertNotIn("CARGO_TARGET_DIR", env)
+
+
+class WorkflowSemanticValidation(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        cls.actionlint = os.environ.get("ACTIONLINT") or shutil.which("actionlint")
+        if not cls.actionlint:
+            raise RuntimeError("actionlint is required; set ACTIONLINT to the verified executable")
+
+    def test_complete_workflow_passes_actionlint_including_run_blocks(self):
+        result = subprocess.run([
+            self.actionlint, str(ROOT / ".github/workflows/ci-cache-comparison.yml"),
+        ], cwd=ROOT, capture_output=True, text=True)
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+
+    def test_actionlint_rejects_the_original_job_runner_context_error(self):
+        text = (ROOT / ".github/workflows/ci-cache-comparison.yml").read_text()
+        marker = "      CACHE_COMPARISON_PHASE: seed\n"
+        self.assertIn(marker, text)
+        bad = text.replace(marker, marker + "      CACHE_COMPARISON_RESULTS: ${{ runner.temp }}/ci-cache-results\n", 1)
+        result = subprocess.run([self.actionlint, "-"], input=bad, cwd=ROOT, capture_output=True, text=True)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn('context "runner" is not allowed here', result.stdout + result.stderr)
 
 
 if __name__ == "__main__":
