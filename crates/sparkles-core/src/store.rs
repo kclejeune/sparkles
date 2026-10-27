@@ -20,6 +20,7 @@ pub mod caches;
 mod changelog;
 mod changes;
 mod clone;
+pub(crate) mod cold;
 mod commit_graph;
 mod commit_stats;
 mod compaction;
@@ -36,6 +37,7 @@ mod group;
 mod group_index_tests;
 #[cfg(test)]
 mod group_model;
+mod history_limited;
 mod history_query;
 pub mod keyset;
 mod link;
@@ -160,6 +162,8 @@ pub struct Generation {
     pub(crate) wal_index: Mutex<Option<wal::WalIndex>>,
     /// a branch's linked generation: the upstream files it reads and its base delta
     pub(crate) link: Option<Arc<link::Linked>>,
+    /// Owned cold-loader storage, excluding mapped files and globally shared caches.
+    pub(crate) cold_bytes: u64,
 }
 
 impl Generation {
@@ -183,6 +187,7 @@ impl Generation {
             ill_typed_literals: Mutex::new(None),
             wal_index: Mutex::new(None),
             link: None,
+            cold_bytes: 0,
         }
     }
 
@@ -207,6 +212,7 @@ impl Generation {
             ill_typed_literals: Mutex::new(None),
             wal_index: Mutex::new(None),
             link: None,
+            cold_bytes: 0,
         }
     }
 
@@ -269,6 +275,7 @@ impl Generation {
             ill_typed_literals: Mutex::new(None),
             wal_index: Mutex::new(None),
             link: None,
+            cold_bytes: 0,
         })
     }
 
@@ -2316,7 +2323,8 @@ impl Store {
         });
         Error::HistoryGone(Box::new(crate::history::HistoryGone {
             message: format!("commit {seq} is no longer reconstructable{oldest}"),
-            seq,
+            seq: Some(seq),
+            at: None,
             head,
             snapshot,
             reconstructable,
@@ -2420,13 +2428,17 @@ impl Store {
     /// The error for a commit a branch store shares with its upstream: reads of it are
     /// served by the upstream (see [`Store::branch_snapshot_at`]).
     fn inherited(&self, at: &crate::history::At, seq: u64) -> Error {
+        self.inherited_named(at, seq, &self.branch_name())
+    }
+
+    fn inherited_named(&self, at: &crate::history::At, seq: u64, name: &str) -> Error {
         let i = self.branching.ident.as_ref().expect("a branch store");
         let mut e = crate::branch::BranchError {
             kind: crate::branch::BranchErrorKind::NotFound,
             code: "inherited-commit",
             message: format!(
                 "{at} on branch {} is a commit of the history it shares with its upstream; read it there",
-                self.branch_name()
+                name
             ),
             conflicts: None,
             candidates: Vec::new(),
@@ -2459,9 +2471,52 @@ impl Store {
         at: &crate::history::At,
         o: &crate::history::HistoryOptions,
     ) -> Result<(Arc<Snapshot>, crate::history::Resolved)> {
-        let r = self.resolve(at)?;
+        self.snapshot_at_inner(at, o, None)
+    }
+
+    /// Resolve exactly the requested retained state within a per-read memory cap.
+    /// Index mappings remain shared; owned delta and replay buffers consume this cap.
+    pub fn snapshot_at_limited(
+        &self,
+        at: &crate::history::At,
+        o: &crate::history::HistoryOptions,
+        max_memory_bytes: u64,
+    ) -> Result<(Arc<Snapshot>, crate::history::Resolved)> {
+        self.snapshot_at_inner(at, o, Some(max_memory_bytes))
+    }
+
+    fn snapshot_at_inner(
+        &self,
+        at: &crate::history::At,
+        o: &crate::history::HistoryOptions,
+        memory: Option<u64>,
+    ) -> Result<(Arc<Snapshot>, crate::history::Resolved)> {
+        let capacity = self
+            .opts
+            .shared
+            .as_ref()
+            .map_or(self.opts.history_cache_bytes, |scope| {
+                scope.caches.history().capacity()
+            });
+        let memory = memory.map(|n| n.min(capacity));
+        let limit = crate::history::ReadLimit {
+            options: o,
+            memory,
+            held: if memory.is_some() {
+                crate::history::READ_METADATA_BYTES
+            } else {
+                0
+            },
+        };
+        limit.check(0)?;
+        let r = if memory.is_some() {
+            self.resolve_limited(at, &limit)?
+        } else {
+            self.resolve(at)?
+        };
         let live = self.snapshot();
         if r.commit.seq == live.commit {
+            limit.check(history_limited::preparation_delta_bytes(&live.delta))?;
             return Ok((
                 live,
                 crate::history::Resolved {
@@ -2472,9 +2527,15 @@ impl Store {
         }
         let seq = r.commit.seq;
         if let Some(mem) = &self.mem_history {
-            let mut m = mem.lock();
-            return match m.get(seq) {
+            let mut m = limit.lock(mem)?;
+            let found = if memory.is_some() {
+                m.get_limited(seq, &limit)?
+            } else {
+                m.get(seq)
+            };
+            return match found {
                 Some(snap) => {
+                    limit.check(history_limited::preparation_delta_bytes(&snap.delta))?;
                     m.hits += 1;
                     Ok((snap, r))
                 }
@@ -2484,7 +2545,11 @@ impl Store {
                         crate::history::At::Snapshot(n) => Some(n.clone()),
                         _ => None,
                     };
-                    Err(self.mem_gone(seq, r.head, name, Some(r.commit)))
+                    if memory.is_some() {
+                        Err(self.mem_gone_limited(seq, r.head, name, Some(r.commit), &limit)?)
+                    } else {
+                        Err(self.mem_gone(seq, r.head, name, Some(r.commit)))
+                    }
                 }
             };
         }
@@ -2499,15 +2564,51 @@ impl Store {
             _ => None,
         };
         // one materialization at a time: concurrent requests for a state wait for it
-        let mut h = hist.lock();
-        let Some(owner) = h.owner(seq, current, r.head) else {
-            return Err(self.history_gone(&h, seq, r.head, snapshot_name, Some(r.commit)));
+        let mut h = limit.lock(hist)?;
+        let limit = crate::history::ReadLimit {
+            memory: memory.map(|n| n.min(h.budget.capacity())),
+            ..limit
         };
-        if let Some(i) = h
-            .cache
-            .iter()
-            .position(|c| c.generation == owner && c.seq == seq)
-        {
+        let owner = if memory.is_some() {
+            h.owner_limited(seq, current, r.head, &limit)?
+        } else {
+            h.owner(seq, current, r.head)
+        };
+        let Some(owner) = owner else {
+            return if memory.is_some() {
+                Err(self.history_gone_limited(
+                    &h,
+                    seq,
+                    r.head,
+                    snapshot_name,
+                    Some(r.commit),
+                    &limit,
+                )?)
+            } else {
+                Err(self.history_gone(&h, seq, r.head, snapshot_name, Some(r.commit)))
+            };
+        };
+        let mut cached = None;
+        for (index, entry) in h.cache.iter().enumerate() {
+            limit.check(0)?;
+            if entry.generation == owner && entry.seq == seq {
+                cached = Some(index);
+                break;
+            }
+        }
+        if let Some(i) = cached {
+            let retained = if memory.is_some()
+                && !Arc::ptr_eq(&h.cache[i].snap.generation, &live.generation)
+            {
+                h.cache[i].snap.generation.retained_bytes_limited(&limit)?
+            } else {
+                0
+            };
+            limit
+                .holding(retained)?
+                .check(history_limited::preparation_delta_bytes(
+                    &h.cache[i].snap.delta,
+                ))?;
             let e = h.cache.remove(i);
             let snap = e.snap.clone();
             h.cache.insert(0, e);
@@ -2515,33 +2616,51 @@ impl Store {
             return Ok((snap, r));
         }
         h.misses += 1;
+        // Snapshot/entry/path metadata remains live beside replay's owned buffers.
+        let limit = if memory.is_some() {
+            limit.holding(16 << 10)?
+        } else {
+            limit
+        };
         let entry = h.gens[&owner].clone();
-        let generation = self.history_generation(&mut h, owner, current, &live, &entry)?;
+        let generation = if memory.is_some() {
+            self.history_generation_limited(&mut h, owner, current, &live, &limit)?
+        } else {
+            self.history_generation(&mut h, owner, current, &live, &entry)?
+        };
+        let limit = if memory.is_some() && !Arc::ptr_eq(&generation, &live.generation) {
+            limit.holding(generation.retained_bytes_limited(&limit)?)?
+        } else {
+            limit
+        };
         let budget = h.budget.capacity();
         let t0 = std::time::Instant::now();
         let mut check = |d: &Delta| -> Result<()> {
-            if o.cancel.as_ref().is_some_and(|c| c.load(Ordering::Relaxed)) {
-                return Err(Error::Cancelled);
-            }
-            if o.deadline.is_some_and(|t| std::time::Instant::now() > t) {
-                return Err(Error::Timeout);
-            }
-            let need = delta_bytes(d);
-            if need > budget {
+            let bytes = delta_bytes(d);
+            limit.check(bytes)?;
+            if bytes > budget {
                 return Err(Error::BudgetExceeded(crate::Budget {
                     kind: crate::BudgetKind::Memory,
                     limit: budget,
-                    requested: need,
+                    requested: bytes,
                 }));
             }
             Ok(())
         };
-        let (delta, end) =
-            self.materialize(&h, owner, &entry, &generation, &live, seq, &mut check)?;
+        let (delta, end) = if memory.is_some() {
+            self.materialize_limited(&h, owner, &entry, &generation, &live, seq, &limit)?
+        } else {
+            self.materialize(&h, owner, &entry, &generation, &live, seq, &mut check)?
+        };
+        limit.check(history_limited::preparation_delta_bytes(&delta))?;
         h.materializations += 1;
         h.materialize_nanos += t0.elapsed().as_nanos() as u64;
         let bytes = delta_bytes(&delta);
-        let dvocab_len = generation.dvocab.len();
+        let dvocab_len = if memory.is_some() {
+            generation.dvocab.len_limited(&limit)?
+        } else {
+            generation.dvocab.len()
+        };
         let snap = Arc::new(Snapshot {
             cacheable: true,
             dataset_id: self.owner_dataset_id(),
@@ -2561,6 +2680,20 @@ impl Store {
             historical: true,
             change_log: self.changelog.clone(),
         });
+        if memory.is_some() {
+            Self::cache_limited_snapshot(
+                &mut h,
+                crate::history::Cached {
+                    generation: owner,
+                    seq,
+                    snap: snap.clone(),
+                    bytes,
+                    end,
+                },
+                &limit,
+            )?;
+            return Ok((snap, r));
+        }
         h.cache.insert(
             0,
             crate::history::Cached {

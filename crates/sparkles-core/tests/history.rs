@@ -121,7 +121,7 @@ fn compaction_ends_unpinned_history() {
     let Err(Error::HistoryGone(g)) = at(&s, "1") else {
         panic!("gone")
     };
-    assert_eq!((g.seq, g.head), (1, 4));
+    assert_eq!((g.seq, g.head), (Some(1), 4));
     assert_eq!(g.reconstructable, [(4, 4)]);
     assert_eq!(g.metadata.map(|m| m.seq), Some(1));
     assert_eq!(at(&s, "4").unwrap().len(), 2);

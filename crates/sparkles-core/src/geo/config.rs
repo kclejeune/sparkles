@@ -114,6 +114,12 @@ impl Default for GeoConfig {
 impl GeoConfig {
     /// Check the configuration; the error names the offending field.
     pub fn validate(&self) -> Result<()> {
+        self.validate_controlled(|| Ok(()))
+    }
+
+    /// Share the policy checks with bounded preparation, including long IRI lists.
+    pub(crate) fn validate_controlled(&self, mut check: impl FnMut() -> Result<()>) -> Result<()> {
+        check()?;
         let bad = |m: String| Err(Error::invalid(m));
         if self.format_version != FORMAT_VERSION {
             return bad(format!(
@@ -124,11 +130,13 @@ impl GeoConfig {
         if self.predicates.is_empty() {
             return bad("predicates: at least one predicate is needed".into());
         }
-        let iris = |field: &str, v: &[String]| -> Result<()> {
+        let mut iris = |field: &str, v: &[String]| -> Result<()> {
             for iri in v {
+                check()?;
                 if oxiri::Iri::parse(iri.as_str()).is_err() {
                     return Err(Error::invalid(format!("{field}: {iri:?} is not an IRI")));
                 }
+                check()?;
             }
             Ok(())
         };
@@ -144,7 +152,7 @@ impl GeoConfig {
         if self.max_vertices == 0 {
             return bad("maxVertices: must be positive".into());
         }
-        Ok(())
+        check()
     }
 
     /// FNV-1a of the canonical JSON form: equal for equal configurations, so an index
@@ -318,6 +326,27 @@ pub struct GeoBuild {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn controlled_validation_stops_inside_iri_lists() {
+        let mut config = GeoConfig {
+            feature_links: (0..10_000).map(|n| format!("urn:link:{n}")).collect(),
+            ..Default::default()
+        };
+        config.feature_links.push("not an IRI".into());
+        assert!(matches!(config.validate(), Err(Error::Invalid(_))));
+        let mut polls = 0;
+        let result = config.validate_controlled(|| {
+            polls += 1;
+            if polls == 100 {
+                Err(Error::Cancelled)
+            } else {
+                Ok(())
+            }
+        });
+        assert!(matches!(result, Err(Error::Cancelled)));
+        assert!(polls < config.feature_links.len());
+    }
 
     #[test]
     fn empty_object_is_the_default() {

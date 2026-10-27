@@ -9,6 +9,7 @@
 //!   [`delta`]).
 //! * [`LocalVocab`] — per-query dictionary for computed terms.
 
+mod cold;
 pub mod delta;
 pub mod fsst;
 pub mod numeric;
@@ -180,40 +181,142 @@ impl Sparse {
         s
     }
 
-    fn decode(buf: &[u8], blocks: usize, data_len: u64) -> Option<Sparse> {
-        let u32_at = |p: usize| Some(u32::from_le_bytes(buf.get(p..p + 4)?.try_into().ok()?));
-        let u64_at = |p: usize| Some(u64::from_le_bytes(buf.get(p..p + 8)?.try_into().ok()?));
-        if buf.get(..8)? != IDX_MAGIC || u32_at(8)? as usize != IDX_BLOCKS {
-            return None;
-        }
-        let n = u64_at(16)? as usize;
-        if n != blocks.div_ceil(IDX_BLOCKS) {
-            return None;
-        }
-        let mut s = Sparse {
-            keys: Vec::new(),
-            starts: Vec::with_capacity(n),
-            offsets: Vec::with_capacity(n),
-            hinted: (0..n.div_ceil(64)).map(|_| AtomicU64::new(0)).collect(),
-            warm_keys: (0..WARM_KEY_SLOTS).map(|_| AtomicU64::new(0)).collect(),
+    fn read_controlled(
+        path: &Path,
+        blocks: usize,
+        data_len: u64,
+        budget: &mut crate::store::cold::ColdBudget<'_>,
+    ) -> crate::error::Result<Option<crate::store::cold::Loaded<Sparse>>> {
+        let start = budget.used();
+        let bytes = match budget.read_file(path) {
+            Ok(bytes) => bytes,
+            Err(crate::Error::Io(_)) => {
+                budget.release(budget.used() - start);
+                return Ok(None);
+            }
+            Err(error) => return Err(error),
         };
-        let mut pos = 24;
-        for _ in 0..n {
-            let off = u64_at(pos)?;
-            let len = u32_at(pos + 8)? as usize;
-            let key = buf.get(pos + 12..pos + 12 + len)?;
-            if off > data_len
-                || s.offsets.last().is_some_and(|&o| o > off)
-                || (!s.starts.is_empty() && s.key(s.len() - 1) >= key)
-            {
+        let parsed = match Self::decode_inner(&bytes, blocks, data_len, Some(budget)) {
+            Ok(parsed) => parsed,
+            Err(error) => {
+                budget.drop_vec(bytes);
+                budget.release(budget.used() - start);
+                return Err(error);
+            }
+        };
+        budget.drop_vec(bytes);
+        match parsed {
+            Some(value) => Ok(Some(crate::store::cold::Loaded {
+                value,
+                charge: budget.used() - start,
+            })),
+            None => {
+                // The invalid optional index and all of its partial storage dropped.
+                budget.release(budget.used() - start);
+                Ok(None)
+            }
+        }
+    }
+
+    fn decode(buf: &[u8], blocks: usize, data_len: u64) -> Option<Sparse> {
+        Self::decode_inner(buf, blocks, data_len, None)
+            .ok()
+            .flatten()
+    }
+
+    fn decode_inner(
+        buf: &[u8],
+        blocks: usize,
+        data_len: u64,
+        mut budget: Option<&mut crate::store::cold::ColdBudget<'_>>,
+    ) -> crate::error::Result<Option<Sparse>> {
+        let mut failure = None;
+        macro_rules! admit {
+            ($expression:expr) => {
+                match $expression {
+                    Ok(value) => value,
+                    Err(error) => {
+                        failure = Some(error);
+                        return None;
+                    }
+                }
+            };
+        }
+        let value = (|| {
+            let u32_at = |p: usize| Some(u32::from_le_bytes(buf.get(p..p + 4)?.try_into().ok()?));
+            let u64_at = |p: usize| Some(u64::from_le_bytes(buf.get(p..p + 8)?.try_into().ok()?));
+            if buf.get(..8)? != IDX_MAGIC || u32_at(8)? as usize != IDX_BLOCKS {
                 return None;
             }
-            s.starts.push(u32::try_from(s.keys.len()).ok()?);
-            s.keys.extend_from_slice(key);
-            s.offsets.push(off);
-            pos += 12 + len;
+            let n = u64_at(16)? as usize;
+            if n != blocks.div_ceil(IDX_BLOCKS) {
+                return None;
+            }
+            let (starts, offsets, hinted, warm_keys) = if let Some(budget) = budget.as_deref_mut() {
+                let (mut starts, mut offsets) = (Vec::new(), Vec::new());
+                admit!(budget.reserve(&mut starts, n));
+                admit!(budget.reserve(&mut offsets, n));
+                let hinted = admit!(budget.filled(n.div_ceil(64)));
+                let warm_keys = admit!(budget.filled(WARM_KEY_SLOTS));
+                (starts, offsets, hinted, warm_keys)
+            } else {
+                (
+                    Vec::with_capacity(n),
+                    Vec::with_capacity(n),
+                    (0..n.div_ceil(64)).map(|_| AtomicU64::new(0)).collect(),
+                    (0..WARM_KEY_SLOTS).map(|_| AtomicU64::new(0)).collect(),
+                )
+            };
+            let mut s = Sparse {
+                keys: Vec::new(),
+                starts,
+                offsets,
+                hinted,
+                warm_keys,
+            };
+            let mut pos = 24;
+            for _ in 0..n {
+                if let Some(budget) = budget.as_deref_mut() {
+                    admit!(budget.check());
+                }
+                let off = u64_at(pos)?;
+                let len = u32_at(pos + 8)? as usize;
+                let key = buf.get(pos + 12..pos + 12 + len)?;
+                if off > data_len || s.offsets.last().is_some_and(|&o| o > off) {
+                    return None;
+                }
+                let unordered = if s.starts.is_empty() {
+                    false
+                } else if let Some(budget) = budget.as_deref_mut() {
+                    admit!(cold::compare_controlled(s.key(s.len() - 1), key, budget))
+                        != std::cmp::Ordering::Less
+                } else {
+                    s.key(s.len() - 1) >= key
+                };
+                if unordered {
+                    return None;
+                }
+                s.starts.push(u32::try_from(s.keys.len()).ok()?);
+                if let Some(budget) = budget.as_deref_mut() {
+                    let need = s.keys.len().checked_add(key.len())?;
+                    admit!(budget.reserve(&mut s.keys, need));
+                    for (index, chunk) in key.chunks(64 << 10).enumerate() {
+                        admit!(budget.key_step("sparse copy", index * (64 << 10)));
+                        s.keys.extend_from_slice(chunk);
+                    }
+                    admit!(budget.key_step("sparse copy", key.len()));
+                } else {
+                    s.keys.extend_from_slice(key);
+                }
+                s.offsets.push(off);
+                pos += 12 + len;
+            }
+            (pos == buf.len()).then_some(s)
+        })();
+        match failure {
+            Some(error) => Err(error),
+            None => Ok(value),
         }
-        (pos == buf.len()).then_some(s)
     }
 }
 
@@ -360,6 +463,24 @@ impl Entry {
 }
 
 impl Vocab {
+    pub(crate) fn resident_bytes(&self) -> u64 {
+        let sparse = self.sparse.as_ref().map_or(0, |s| {
+            s.keys.capacity() as u64
+                + s.starts.capacity() as u64 * 4
+                + s.offsets.capacity() as u64 * 8
+                + (s.hinted.len() + s.warm_keys.len()) as u64 * 8
+        });
+        sparse
+            + self.prefetched.len() as u64 * 8
+            + self
+                .num
+                .as_ref()
+                .map_or(0, numeric::NumColumn::resident_bytes)
+            + self
+                .fsst
+                .as_ref()
+                .map_or(0, |_| std::mem::size_of::<fsst::Tables>() as u64)
+    }
     pub fn empty() -> Vocab {
         Vocab {
             data: Bytes::Vec(Vec::new()),
@@ -451,6 +572,206 @@ impl Vocab {
             v.num = numeric::NumColumn::open(dir, v.len, v.first_triple);
         }
         Ok(v)
+    }
+
+    pub(crate) fn open_controlled(
+        dir: &Path,
+        fsst: bool,
+        budget: &mut crate::store::cold::ColdBudget<'_>,
+    ) -> crate::error::Result<crate::store::cold::Loaded<Vocab>> {
+        use crate::error::Error;
+        budget.check()?;
+        let start = budget.used();
+        let tables = if fsst {
+            let path = dir.join(fsst::FILE);
+            let version = fsst::file_version(&path)?;
+            budget.check()?;
+            crate::formats::VOCAB_FSST.check(fsst::FILE, version, None)?;
+            // Two tables have at most 255 nine-byte symbols in the current codec.
+            if std::fs::metadata(&path)?.len() > 32 + 2 * (1 + 255 * 9) {
+                return Err(Error::Corrupt("vocab.fsst: trailing bytes".into()));
+            }
+            let bytes = budget.read_file(&path)?;
+            budget.charge(std::mem::size_of::<fsst::Tables>() as u64 + 64 + 4096)?;
+            let tables = fsst::Tables::decode(&bytes)?;
+            budget.release(4096);
+            budget.drop_vec(bytes);
+            Some(Box::new(tables))
+        } else {
+            None
+        };
+        budget.check()?;
+        let data = Bytes::open(&dir.join("vocab.dat"), true)?;
+        let offsets = Bytes::open(&dir.join("vocab.off"), true)?;
+        let off = offsets.as_slice();
+        if !off.len().is_multiple_of(8) {
+            return Err(Error::Corrupt("vocabulary offset length".into()));
+        }
+        let blocks = (off.len() / 8).saturating_sub(1);
+        let len = if off.len() >= 8 {
+            u64::from_le_bytes(off[off.len() - 8..].try_into().unwrap())
+        } else {
+            0
+        };
+        if usize::try_from(len).ok().map(|n| n.div_ceil(FC_BLOCK)) != Some(blocks) {
+            return Err(Error::Corrupt(
+                "vocabulary offsets disagree with its term count".into(),
+            ));
+        }
+        let sparse = if crate::index::sparse_vocab() {
+            let before = budget.used();
+            match Sparse::read_controlled(
+                &dir.join("vocab.idx"),
+                blocks,
+                data.as_slice().len() as u64,
+                budget,
+            ) {
+                Ok(loaded) => loaded.map(|loaded| loaded.value),
+                Err(crate::Error::BudgetExceeded(_)) => {
+                    // This derived accelerator is optional. Its failed decoder owns
+                    // no surviving storage; the controlled base lookup remains exact.
+                    budget.release(budget.used() - before);
+                    None
+                }
+                Err(error) => return Err(error),
+            }
+        } else {
+            None
+        };
+        let prefetched = budget.filled(blocks.div_ceil(64))?;
+        let mut vocab = Vocab {
+            data,
+            offsets,
+            len,
+            first_iri: 0,
+            first_triple: 0,
+            sparse,
+            prefetched,
+            num: None,
+            fsst: tables,
+        };
+        if let Some(sparse) = &vocab.sparse
+            && let Some(last) = sparse.len().checked_sub(1)
+            && (sparse.offsets[0] != vocab.block_offset(0) as u64
+                || sparse.offsets[last] != vocab.block_offset(last * IDX_BLOCKS) as u64)
+        {
+            // This optional derived accelerator and its actual owned storage drop.
+            let sparse = vocab.sparse.take().unwrap();
+            let bytes = sparse.keys.capacity() as u64
+                + sparse.starts.capacity() as u64 * 4
+                + sparse.offsets.capacity() as u64 * 8
+                + (sparse.hinted.len() + sparse.warm_keys.len()) as u64 * 8;
+            drop(sparse);
+            budget.release(bytes);
+        }
+        // Type boundaries need one byte, not a reconstructed giant literal.
+        vocab.first_iri = vocab.boundary_controlled(b'<', budget)?;
+        vocab.first_triple = vocab.boundary_controlled(b'(', budget)?;
+        if crate::index::numeric_column() {
+            let before = budget.used();
+            vocab.num =
+                match numeric::NumColumn::open_controlled(dir, len, vocab.first_triple, budget) {
+                    Ok(loaded) => loaded.map(|loaded| loaded.value),
+                    Err(crate::Error::BudgetExceeded(_)) => {
+                        // Numeric values can be decoded from keys when this optional
+                        // column cannot fit. Do not invoke the old uncontrolled opener.
+                        budget.release(budget.used() - before);
+                        None
+                    }
+                    Err(error) => return Err(error),
+                };
+        }
+        budget.check()?;
+        Ok(crate::store::cold::Loaded {
+            value: vocab,
+            charge: budget.used() - start,
+        })
+    }
+
+    fn entry_controlled(&self, position: &mut usize, first: bool) -> crate::error::Result<Entry> {
+        let bad = || crate::Error::Corrupt("invalid vocabulary entry".into());
+        let data = self.data.as_slice();
+        let shared =
+            usize::try_from(crate::index::read_varint_checked(data, position).ok_or_else(bad)?)
+                .map_err(|_| bad())?;
+        let word =
+            usize::try_from(crate::index::read_varint_checked(data, position).ok_or_else(bad)?)
+                .map_err(|_| bad())?;
+        let (len, coded) = if self.fsst.is_some() && !first {
+            (word >> 1, word & 1 != 0)
+        } else {
+            (word, false)
+        };
+        let start = *position;
+        let end = start.checked_add(len).ok_or_else(bad)?;
+        data.get(start..end).ok_or_else(bad)?;
+        *position = end;
+        Ok(Entry {
+            shared,
+            start,
+            len,
+            coded,
+        })
+    }
+
+    fn boundary_controlled(
+        &self,
+        threshold: u8,
+        budget: &crate::store::cold::ColdBudget<'_>,
+    ) -> crate::error::Result<u64> {
+        let count = self.num_blocks();
+        let first_byte = |block: usize| -> crate::error::Result<Option<u8>> {
+            budget.check()?;
+            let mut position = usize::try_from(u64::from_le_bytes(
+                self.offsets.as_slice()[block * 8..block * 8 + 8]
+                    .try_into()
+                    .unwrap(),
+            ))
+            .map_err(|_| crate::Error::Corrupt("vocabulary offset overflows".into()))?;
+            let entry = self.entry_controlled(&mut position, true)?;
+            Ok(self.data.as_slice()[entry.start..entry.start + entry.len]
+                .first()
+                .copied())
+        };
+        let (mut lo, mut hi) = (0usize, count);
+        while lo < hi {
+            let mid = lo + (hi - lo) / 2;
+            if first_byte(mid)?.is_some_and(|byte| byte >= threshold) {
+                hi = mid;
+            } else {
+                lo = mid + 1;
+            }
+        }
+        if lo == 0 {
+            budget.check()?;
+            return Ok(0);
+        }
+        let block = lo - 1;
+        let mut position = usize::try_from(u64::from_le_bytes(
+            self.offsets.as_slice()[block * 8..block * 8 + 8]
+                .try_into()
+                .unwrap(),
+        ))
+        .map_err(|_| crate::Error::Corrupt("vocabulary offset overflows".into()))?;
+        let mut previous = None;
+        for index in 0..FC_BLOCK.min(self.len as usize - block * FC_BLOCK) {
+            budget.check()?;
+            let entry = self.entry_controlled(&mut position, index == 0)?;
+            if entry.shared == 0 || previous.is_none() {
+                let suffix = &self.data.as_slice()[entry.start..entry.start + entry.len];
+                previous = match &self.fsst {
+                    Some(tables) if entry.coded => tables
+                        .table((block * FC_BLOCK + index) as u64)
+                        .first_byte_checked(suffix, || budget.check())?,
+                    _ => suffix.first().copied(),
+                };
+            }
+            if previous.is_some_and(|byte| byte >= threshold) {
+                return Ok((block * FC_BLOCK + index) as u64);
+            }
+        }
+        budget.check()?;
+        Ok(((block + 1) * FC_BLOCK).min(self.len as usize) as u64)
     }
 
     #[inline]
@@ -1881,6 +2202,9 @@ pub fn add_numeric_column(dir: &Path) -> Result<u64> {
 pub struct AppendVocab {
     keys: Vec<Arc<[u8]>>,
     map: FxHashMap<Arc<[u8]>, u64>,
+    /// Cold readers use a fixed-fingerprint index rather than hashing payloads
+    /// during native HashMap growth. Ordinary live dictionaries keep `map`.
+    cold: Option<cold::Index>,
     /// total key length
     key_bytes: usize,
 }
@@ -1896,9 +2220,24 @@ impl AppendVocab {
         self.keys.get(id as usize).map(|k| &**k)
     }
     pub fn find(&self, key: &[u8]) -> Option<u64> {
+        if let Some(index) = &self.cold {
+            return index.find(&self.keys, key);
+        }
         self.map.get(key).copied()
     }
     pub fn insert(&mut self, key: &[u8]) -> (u64, bool) {
+        if let Some(index) = &mut self.cold {
+            let hash = cold::fingerprint(key);
+            if let Some(id) = index.find_hashed(&self.keys, key, hash) {
+                return (id, false);
+            }
+            let owned: Arc<[u8]> = key.into();
+            let id = self.keys.len() as u64;
+            self.key_bytes += owned.len();
+            index.insert(hash, id);
+            self.keys.push(owned);
+            return (id, true);
+        }
         if let Some(&i) = self.map.get(key) {
             return (i, false);
         }
@@ -1913,11 +2252,91 @@ impl AppendVocab {
     /// layers of a linked delta vocabulary are positional). A lookup by key finds the
     /// first position.
     pub(crate) fn push_dup(&mut self, key: &[u8]) {
+        if let Some(index) = &mut self.cold {
+            let hash = cold::fingerprint(key);
+            let existing = index.find_hashed(&self.keys, key, hash);
+            let owned: Arc<[u8]> = key.into();
+            let id = self.keys.len() as u64;
+            self.key_bytes += owned.len();
+            if existing.is_none() {
+                index.insert(hash, id);
+            }
+            self.keys.push(owned);
+            return;
+        }
         let k: Arc<[u8]> = key.into();
         let i = self.keys.len() as u64;
         self.key_bytes += k.len();
         self.keys.push(k.clone());
         self.map.entry(k).or_insert(i);
+    }
+
+    /// Insert into a freshly admitted cold dictionary. Positional layers keep
+    /// duplicate entries, while ordinary dictionaries reuse the first key.
+    pub(crate) fn push_controlled(
+        &mut self,
+        key: &[u8],
+        positional: bool,
+        budget: &mut crate::store::cold::ColdBudget<'_>,
+    ) -> Result<(u64, bool)> {
+        budget.check()?;
+        if self.cold.is_none() {
+            if !self.keys.is_empty()
+                || !self.map.is_empty()
+                || self.keys.capacity() != 0
+                || self.map.capacity() != 0
+            {
+                return Err(crate::Error::invalid(
+                    "controlled dictionary construction needs a fresh dictionary",
+                ));
+            }
+            self.cold = Some(cold::Index::default());
+        }
+        let (hash, existing) = self
+            .cold
+            .as_ref()
+            .unwrap()
+            .find_controlled(&self.keys, key, budget)?;
+        if !positional && let Some(id) = existing {
+            return Ok((id, false));
+        }
+        let need = self
+            .keys
+            .len()
+            .checked_add(1)
+            .ok_or_else(|| budget.exhausted())?;
+        budget.reserve(&mut self.keys, need)?;
+        let bytes = (key.len() as u64)
+            .checked_add(64)
+            .ok_or_else(|| budget.exhausted())?;
+        budget.charge(bytes)?;
+        let owned = cold::copy_controlled(key, budget)?;
+        let id = self.keys.len() as u64;
+        if existing.is_none() {
+            self.cold
+                .as_mut()
+                .unwrap()
+                .insert_controlled(hash, id, budget)?;
+        }
+        self.key_bytes += owned.len();
+        self.keys.push(owned);
+        budget.check()?;
+        Ok((id, true))
+    }
+
+    pub(crate) fn cold_bytes(&self) -> u64 {
+        (self.keys.capacity() as u64)
+            .saturating_mul(std::mem::size_of::<Arc<[u8]>>() as u64)
+            .saturating_add(self.cold.as_ref().map_or_else(
+                || {
+                    (self.map.capacity() as u64)
+                        .saturating_mul(128)
+                        .saturating_add(u64::from(!self.map.is_empty()) * 1024)
+                },
+                cold::Index::bytes,
+            ))
+            .saturating_add(self.key_bytes as u64)
+            .saturating_add((self.keys.len() as u64).saturating_mul(64))
     }
 
     /// Keep the first `n` entries only.
@@ -1926,9 +2345,12 @@ impl AppendVocab {
             let k = self.keys.pop().expect("longer than n");
             self.key_bytes -= k.len();
             let i = self.keys.len() as u64;
-            if self.map.get(&k) == Some(&i) {
+            if self.cold.is_none() && self.map.get(&k) == Some(&i) {
                 self.map.remove(&k);
             }
+        }
+        if let Some(index) = &mut self.cold {
+            index.truncate(n);
         }
     }
     pub fn iter(&self) -> impl Iterator<Item = (u64, &[u8])> {
@@ -2741,6 +3163,116 @@ mod tests {
             w.push(k).unwrap();
         }
         w.finish().unwrap();
+    }
+
+    #[test]
+    fn controlled_vocabulary_open_matches_both_codecs_and_type_boundaries() {
+        use crate::{
+            history::{HistoryOptions, ReadLimit},
+            store::cold::ColdBudget,
+        };
+        let options = HistoryOptions::default();
+        let mut keys = mixed_keys(5000);
+        keys.extend([b"(".to_vec(), b"(urn:triple".to_vec()]);
+        keys.sort();
+        keys.dedup();
+        for fsst in [false, true] {
+            let directory = tempfile::tempdir().unwrap();
+            write_codec(directory.path(), &keys, fsst);
+            let normal = Vocab::open_codec(directory.path(), fsst).unwrap();
+            let mut budget = ColdBudget::new(ReadLimit {
+                options: &options,
+                memory: Some(16 << 20),
+                held: 0,
+            })
+            .unwrap();
+            let loaded = Vocab::open_controlled(directory.path(), fsst, &mut budget).unwrap();
+            assert_eq!(loaded.value.len(), normal.len());
+            assert_eq!(loaded.value.first_iri(), normal.first_iri());
+            assert_eq!(loaded.value.first_triple(), normal.first_triple());
+            assert_eq!(budget.used(), loaded.charge);
+            for (index, key) in keys.iter().enumerate().step_by(127) {
+                assert_eq!(loaded.value.get(index as u64).as_ref(), Some(key));
+                assert_eq!(loaded.value.find(key), normal.find(key));
+            }
+            drop(loaded.value);
+            budget.release(loaded.charge);
+            assert_eq!(budget.used(), 0);
+        }
+    }
+
+    #[test]
+    fn controlled_type_boundaries_do_not_reconstruct_giant_mapped_keys() {
+        use crate::{
+            history::{HistoryOptions, ReadLimit},
+            store::cold::ColdBudget,
+        };
+        let options = HistoryOptions::default();
+        let mut keys = vec![
+            format!("{}{}", '"', "literal".repeat(200_000)).into_bytes(),
+            b"(urn:triple".to_vec(),
+            format!("<urn:{}", "iri".repeat(400_000)).into_bytes(),
+        ];
+        keys.sort();
+        for fsst in [false, true] {
+            let directory = tempfile::tempdir().unwrap();
+            write_codec(directory.path(), &keys, fsst);
+            let mut budget = ColdBudget::new(ReadLimit {
+                options: &options,
+                memory: Some(64 << 10),
+                held: 0,
+            })
+            .unwrap();
+            let loaded = Vocab::open_controlled(directory.path(), fsst, &mut budget).unwrap();
+            assert_eq!(loaded.value.first_triple(), 1);
+            assert_eq!(loaded.value.first_iri(), 2);
+            assert!(loaded.value.sparse.is_none());
+            assert!(loaded.charge < 64 << 10);
+            assert_eq!(budget.used(), loaded.charge);
+        }
+    }
+
+    #[test]
+    fn controlled_sparse_keys_cancel_inside_copy_and_lexicographic_comparison() {
+        use crate::{
+            Error,
+            history::{HistoryOptions, ReadLimit},
+            store::cold::ColdBudget,
+        };
+        use std::{cell::Cell, sync::atomic::AtomicBool};
+        const CHUNK: usize = 64 << 10;
+        let mut first = vec![b'a'; CHUNK * 4 + 17];
+        *first.last_mut().unwrap() = b'b';
+        let mut second = first.clone();
+        *second.last_mut().unwrap() = b'c';
+        let wire = Sparse::encode(&[(0, first), (8, second)]);
+        for stage in ["sparse copy", "sparse compare"] {
+            let cancel = Arc::new(AtomicBool::new(false));
+            let options = HistoryOptions {
+                cancel: Some(cancel.clone()),
+                deadline: None,
+            };
+            let reached = Cell::new(false);
+            let observer = |current: &str, at: usize| {
+                if current == stage && (CHUNK..CHUNK * 4).contains(&at) {
+                    reached.set(true);
+                    cancel.store(true, AtomicOrdering::Relaxed);
+                }
+            };
+            let mut budget = ColdBudget::new(ReadLimit {
+                options: &options,
+                memory: Some(16 << 20),
+                held: 0,
+            })
+            .unwrap();
+            budget.observe_keys(&observer);
+            let result = Sparse::decode_inner(&wire, IDX_BLOCKS + 1, 16, Some(&mut budget));
+            assert!(matches!(result, Err(Error::Cancelled)), "stage={stage}");
+            assert!(
+                reached.get(),
+                "cancellation happened before processing a sparse key"
+            );
+        }
     }
 
     /// Random subsets of a block decode to the keys asked for, whichever keys before

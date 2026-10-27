@@ -788,6 +788,69 @@ pub(crate) fn decode_frame_into(bytes: &[u8], out: &mut [u64]) -> Result<()> {
     })
 }
 
+/// Decode the same LZ4/zigzag-varint format with admitted local storage. The
+/// ordinary fast decoder stays unchanged for callers without preparation limits.
+fn decode_point_column_limited(
+    bytes: &[u8],
+    rows: usize,
+    scratch: &mut Vec<u8>,
+    limit: &crate::history::ReadLimit<'_>,
+    admitted: u64,
+) -> Result<Col> {
+    limit.check(admitted)?;
+    let bad = |message: &str| Error::Corrupt(format!("block column: {message}"));
+    let size = bytes
+        .get(..4)
+        .map(|b| u32::from_le_bytes(b.try_into().unwrap()) as usize)
+        .ok_or_else(|| bad("shorter than its size prefix"))?;
+    if size > rows.saturating_mul(10) {
+        return Err(bad("decompressed size is too large for the column rows"));
+    }
+    if size > scratch.capacity() {
+        scratch
+            .try_reserve_exact(size.saturating_sub(scratch.len()))
+            .map_err(|_| {
+                let cap = limit.memory.unwrap_or(u64::MAX);
+                Error::BudgetExceeded(crate::Budget {
+                    kind: crate::BudgetKind::Memory,
+                    limit: cap,
+                    requested: cap.saturating_add(1),
+                })
+            })?;
+    }
+    scratch.resize(size, 0);
+    let actual = lz4_flex::block::decompress_into(&bytes[4..], scratch)
+        .map_err(|error| Error::Corrupt(format!("block decompression: {error}")))?;
+    if actual != size {
+        return Err(bad("decompressed length differs from its prefix"));
+    }
+    let mut values = Vec::new();
+    values.try_reserve_exact(rows).map_err(|_| {
+        let cap = limit.memory.unwrap_or(u64::MAX);
+        Error::BudgetExceeded(crate::Budget {
+            kind: crate::BudgetKind::Memory,
+            limit: cap,
+            requested: cap.saturating_add(1),
+        })
+    })?;
+    let (mut position, mut previous) = (0usize, 0u64);
+    for row in 0..rows {
+        if row.is_multiple_of(1024) {
+            limit.check(admitted)?;
+        }
+        let value = read_varint_checked(scratch, &mut position)
+            .ok_or_else(|| bad("holds fewer values than the column rows"))?;
+        let difference = ((value >> 1) as i64) ^ -((value & 1) as i64);
+        previous = previous.wrapping_add(difference as u64);
+        values.push(previous);
+    }
+    if position != scratch.len() {
+        return Err(bad("trailing bytes after the column values"));
+    }
+    limit.check(admitted)?;
+    Ok(Col::from(values))
+}
+
 /// The `out.len()` zigzag-delta varints that make up all of `raw`, written to `out`.
 fn decode_varints_into(raw: &[u8], out: &mut [u64]) -> Result<()> {
     let rows = out.len();
@@ -1077,6 +1140,18 @@ pub(crate) struct Segments {
 
 impl Segments {
     fn open(path: &Path, perm: Perm, blocks: &[BlockMeta]) -> Result<Segments> {
+        Self::open_inner(path, perm, blocks, None)
+    }
+
+    fn open_inner(
+        path: &Path,
+        perm: Perm,
+        blocks: &[BlockMeta],
+        mut budget: Option<&mut crate::store::cold::ColdBudget<'_>>,
+    ) -> Result<Segments> {
+        if let Some(budget) = budget.as_deref_mut() {
+            budget.check()?;
+        }
         let bad = |m: String| Error::Corrupt(format!("{}.seg: {m}", perm.name()));
         let f = File::open(path)?;
         let map = map_random(&f)?;
@@ -1087,18 +1162,37 @@ impl Segments {
         if !supported_segment_rows(seg_rows) {
             return Err(bad(format!("segment size {seg_rows} is not supported")));
         }
-        let mut start = Vec::with_capacity(blocks.len() + 1);
+        let mut start = if let Some(budget) = budget.as_deref_mut() {
+            let mut entries = Vec::new();
+            let count = blocks
+                .len()
+                .checked_add(1)
+                .ok_or_else(|| budget.exhausted())?;
+            budget.reserve(&mut entries, count)?;
+            entries
+        } else {
+            Vec::with_capacity(blocks.len() + 1)
+        };
         let mut n = 0usize;
         for m in blocks {
+            if let Some(budget) = budget.as_deref_mut() {
+                budget.check()?;
+            }
             start.push(n);
-            n += (m.rows as usize).div_ceil(seg_rows);
+            n = n
+                .checked_add((m.rows as usize).div_ceil(seg_rows))
+                .ok_or_else(|| bad("segment count overflow".into()))?;
         }
         start.push(n);
-        if map.len() != SEG_HEADER + n * SEG_ENTRY {
+        let expected = n
+            .checked_mul(SEG_ENTRY)
+            .and_then(|bytes| bytes.checked_add(SEG_HEADER))
+            .ok_or_else(|| bad("segment layout overflow".into()))?;
+        if map.len() != expected {
             return Err(bad(format!(
                 "{} bytes, {} expected for {n} segments",
                 map.len(),
-                SEG_HEADER + n * SEG_ENTRY
+                expected
             )));
         }
         // A directory of at most this size is asked for whole at open, as the block
@@ -1109,13 +1203,23 @@ impl Segments {
         if map.len() <= READ_AT_OPEN {
             will_need(IoFile::of_perm(perm), &map, 0, map.len());
         }
+        let (hinted, sparse_reads) = match budget {
+            Some(budget) => (
+                budget.filled(blocks.len().div_ceil(64))?,
+                budget.filled(blocks.len())?,
+            ),
+            None => (
+                (0..blocks.len().div_ceil(64))
+                    .map(|_| Default::default())
+                    .collect(),
+                (0..blocks.len()).map(|_| Default::default()).collect(),
+            ),
+        };
         Ok(Segments {
             map,
             seg_rows,
-            hinted: (0..blocks.len().div_ceil(64))
-                .map(|_| Default::default())
-                .collect(),
-            sparse_reads: (0..blocks.len()).map(|_| Default::default()).collect(),
+            hinted,
+            sparse_reads,
             start,
         })
     }
@@ -1213,6 +1317,17 @@ pub struct PermIndex {
 }
 
 impl PermIndex {
+    pub(crate) fn resident_bytes(&self) -> u64 {
+        self.blocks.capacity() as u64 * std::mem::size_of::<BlockMeta>() as u64
+            + 128
+            + self.segs.as_ref().map_or(0, |s| {
+                s.start.capacity() as u64 * std::mem::size_of::<usize>() as u64
+                    + s.hinted.len() as u64 * 8
+                    + s.sparse_reads.len() as u64
+                    + std::mem::size_of::<Segments>() as u64
+                    + 64
+            })
+    }
     pub fn empty(perm: Perm) -> PermIndex {
         PermIndex {
             perm,
@@ -1236,20 +1351,70 @@ impl PermIndex {
         Self::open_layout(dir, perm, format >= 3)
     }
 
+    pub(crate) fn open_controlled(
+        dir: &Path,
+        perm: Perm,
+        format: u32,
+        budget: &mut crate::store::cold::ColdBudget<'_>,
+    ) -> Result<crate::store::cold::Loaded<PermIndex>> {
+        budget.check()?;
+        crate::formats::INDEX.check(&dir.display().to_string(), format, None)?;
+        let start = budget.used();
+        let value = Self::open_layout_inner(dir, perm, format >= 3, Some(budget))?;
+        Ok(crate::store::cold::Loaded {
+            value,
+            charge: budget.used() - start,
+        })
+    }
+
     fn open_layout(dir: &Path, perm: Perm, segmented: bool) -> Result<PermIndex> {
-        let meta = std::fs::read(dir.join(format!("{}.meta", perm.name())))?;
+        Self::open_layout_inner(dir, perm, segmented, None)
+    }
+
+    fn open_layout_inner(
+        dir: &Path,
+        perm: Perm,
+        segmented: bool,
+        mut budget: Option<&mut crate::store::cold::ColdBudget<'_>>,
+    ) -> Result<PermIndex> {
+        let path = dir.join(format!("{}.meta", perm.name()));
+        let meta = match budget.as_deref_mut() {
+            Some(budget) => budget.read_file(&path)?,
+            None => std::fs::read(&path)?,
+        };
         if meta.len() % META_BYTES != 0 {
             return Err(Error::Corrupt(format!("{} metadata size", perm.name())));
         }
-        let blocks: Vec<BlockMeta> = meta
-            .as_chunks::<META_BYTES>()
-            .0
-            .iter()
-            .map(|c| BlockMeta::read(c))
-            .collect();
-        let rows = blocks.last().map_or(0, |b| b.row_start + b.rows as u64);
+        let blocks: Vec<BlockMeta> = if let Some(budget) = budget.as_deref_mut() {
+            let mut blocks = Vec::new();
+            budget.reserve(&mut blocks, meta.len() / META_BYTES)?;
+            for record in meta.as_chunks::<META_BYTES>().0 {
+                budget.check()?;
+                blocks.push(BlockMeta::read(record));
+            }
+            blocks
+        } else {
+            meta.as_chunks::<META_BYTES>()
+                .0
+                .iter()
+                .map(|record| BlockMeta::read(record))
+                .collect()
+        };
+        if let Some(budget) = budget.as_deref_mut() {
+            budget.drop_vec(meta);
+        } else {
+            drop(meta);
+        }
+        let rows = blocks
+            .last()
+            .map(|block| block.row_start.checked_add(block.rows as u64))
+            .unwrap_or(Some(0))
+            .ok_or_else(|| Error::Corrupt("index row count overflow".into()))?;
         let f = File::open(dir.join(format!("{}.dat", perm.name())))?;
         let data = if f.metadata()?.len() > 0 {
+            if let Some(budget) = budget.as_deref_mut() {
+                budget.charge(64)?;
+            }
             Some(Arc::new(map_random(&f)?))
         } else {
             None
@@ -1262,10 +1427,19 @@ impl PermIndex {
                     perm.name()
                 )));
             }
-            Some(Arc::new(Segments::open(&path, perm, &blocks)?))
+            let value = if let Some(budget) = budget.as_deref_mut() {
+                budget.charge(std::mem::size_of::<Segments>() as u64 + 32)?;
+                Segments::open_inner(&path, perm, &blocks, Some(budget))?
+            } else {
+                Segments::open(&path, perm, &blocks)?
+            };
+            Some(Arc::new(value))
         } else {
             None
         };
+        if let Some(budget) = budget {
+            budget.charge(64)?;
+        }
         Ok(PermIndex {
             perm,
             data,
@@ -2526,6 +2700,113 @@ impl PermIndex {
         Ok(true)
     }
 
+    /// Bounded point lookup for historical replay. Fresh local scratch avoids the
+    /// ordinary decoder's unaccounted thread-local buffer; cache identity is shared.
+    pub(crate) fn contains_limited(
+        &self,
+        cache: &BlockCache,
+        key: &Key,
+        limit: &crate::history::ReadLimit<'_>,
+        held: u64,
+    ) -> Result<bool> {
+        limit.check(held)?;
+        let b = self.blocks.partition_point(|block| block.last < *key);
+        if b >= self.blocks.len() || self.blocks[b].first > *key {
+            return Ok(false);
+        }
+        // A full key occurs in at most one segment. Budgeted probes keep that
+        // choice even when a previous unlimited reader marked the block dense.
+        let segment = self.segs.as_ref().map(|directory| {
+            partition(directory.count(b), |s| directory.first_key(b, s) <= *key).saturating_sub(1)
+        });
+        let rows = segment.map_or(self.blocks[b].rows as usize, |s| {
+            let (start, end) = self.segment_rows(b, s);
+            end - start
+        });
+        // Four output columns, old+replacement varint scratch and reference-count
+        // headers. This is admitted before touching any cache/decode allocation.
+        let workspace = (rows as u64)
+            .saturating_mul(4 * 8 + 2 * 10)
+            .saturating_add(1024);
+        limit.check(held.saturating_add(workspace))?;
+        let mut scratch = Vec::new();
+        let mut columns = std::array::from_fn(|_| empty_col());
+        for (column, output) in columns.iter_mut().enumerate() {
+            limit.check(held.saturating_add(workspace))?;
+            let part = segment.map_or(WHOLE, |s| s as u32 + 1);
+            let cache_key = cache.key(self, b, column, part);
+            if let Some(cached) = cache.cache.get(&cache_key) {
+                cache.count_hits(1);
+                *output = cached;
+                continue;
+            }
+            if let Some(s) = segment
+                && let Some(whole) = cache.cache.get(&cache.key(self, b, column, WHOLE))
+            {
+                let (start, end) = self.segment_rows(b, s);
+                *output = Col::from(whole[start..end].to_vec());
+                cache.count_hits(1);
+            } else {
+                cache
+                    .misses
+                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                let metadata = &self.blocks[b];
+                let mut offset = usize::try_from(metadata.offset)
+                    .ok()
+                    .and_then(|base| {
+                        metadata.col_len[..column]
+                            .iter()
+                            .try_fold(base, |sum, length| sum.checked_add(*length as usize))
+                    })
+                    .ok_or_else(|| Error::Corrupt("bounded point column offset overflow".into()))?;
+                let mut length = metadata.col_len[column] as usize;
+                if let (Some(s), Some(directory)) = (segment, &self.segs) {
+                    let before: usize = (0..s)
+                        .map(|part| directory.frame_len(b, part, column))
+                        .sum();
+                    let frame = directory.frame_len(b, s, column);
+                    if before.checked_add(frame).is_none_or(|end| end > length) {
+                        return Err(Error::Corrupt(
+                            "bounded point segment ends past its column".into(),
+                        ));
+                    }
+                    offset = offset.checked_add(before).ok_or_else(|| {
+                        Error::Corrupt("bounded point segment offset overflow".into())
+                    })?;
+                    length = frame;
+                }
+                let end = offset
+                    .checked_add(length)
+                    .ok_or_else(|| Error::Corrupt("bounded point column length overflow".into()))?;
+                let data = self
+                    .data
+                    .as_ref()
+                    .ok_or_else(|| Error::Corrupt("no data".into()))?;
+                let frame = data.get(offset..end).ok_or_else(|| {
+                    Error::Corrupt("bounded point column ends past the index".into())
+                })?;
+                *output = decode_point_column_limited(
+                    frame,
+                    rows,
+                    &mut scratch,
+                    limit,
+                    held.saturating_add(workspace),
+                )?;
+                crate::ioacct::column_decoded(self.perm, rows, length);
+            }
+            if cache.fill {
+                cache.cache.insert(cache_key, output.clone());
+            }
+        }
+        let block = Block {
+            cols: columns,
+            rows,
+        };
+        let (start, end) = block.prefix_range(key);
+        limit.check(held.saturating_add(workspace))?;
+        Ok(start < end)
+    }
+
     /// Point lookup of a full key.
     pub fn contains(&self, cache: &BlockCache, key: &Key) -> Result<bool> {
         let b = self.blocks.partition_point(|m| m.last < *key);
@@ -2628,6 +2909,111 @@ mod tests {
         let (d2, i2) = write(false);
         assert!(i3.segmented() && !i2.segmented());
         (d3, i3, d2, i2)
+    }
+
+    #[test]
+    fn bounded_points_match_both_index_layouts_and_cached_columns() {
+        let options = crate::history::HistoryOptions::default();
+        let limit = crate::history::ReadLimit {
+            options: &options,
+            memory: Some(8 << 20),
+            held: 0,
+        };
+        let keys = run_keys();
+        let (_d3, segmented, _d2, whole) = both_layouts(&keys);
+        for index in [&segmented, &whole] {
+            let cache = BlockCache::new(32 << 20);
+            for key in keys.iter().step_by(509) {
+                assert!(index.contains_limited(&cache, key, &limit, 0).unwrap());
+                assert!(index.contains(&cache, key).unwrap());
+                assert!(index.contains_limited(&cache, key, &limit, 0).unwrap());
+                let mut absent = *key;
+                absent[3] ^= 1 << 50;
+                assert_eq!(
+                    index.contains_limited(&cache, &absent, &limit, 0).unwrap(),
+                    index.contains(&cache, &absent).unwrap()
+                );
+            }
+            let tiny = crate::history::ReadLimit {
+                memory: Some(16),
+                ..limit
+            };
+            assert!(matches!(
+                index.contains_limited(&cache, &keys[0], &tiny, 0),
+                Err(Error::BudgetExceeded(_))
+            ));
+        }
+    }
+
+    #[test]
+    fn bounded_point_decoder_matches_all_varint_widths_and_refuses_damage() {
+        let options = crate::history::HistoryOptions::default();
+        let limit = crate::history::ReadLimit {
+            options: &options,
+            memory: Some(8 << 20),
+            held: 0,
+        };
+        let values: Vec<u64> = (0..4096)
+            .map(|n| (n as u64).wrapping_mul(0x9e3779b97f4a7c15))
+            .collect();
+        let mut encoding = Vec::new();
+        let frame = encode_column(&values, &mut encoding);
+        let mut scratch = Vec::new();
+        let decoded =
+            decode_point_column_limited(&frame, values.len(), &mut scratch, &limit, 1 << 20)
+                .unwrap();
+        assert_eq!(&*decoded, values.as_slice());
+        assert_eq!(&*decoded, &*decode_column(&frame, values.len()).unwrap());
+        for damaged in [
+            &[][..],
+            &[255, 255, 255, 255][..],
+            &frame[..frame.len() / 2],
+        ] {
+            assert!(
+                decode_point_column_limited(damaged, values.len(), &mut scratch, &limit, 1 << 20)
+                    .is_err()
+            );
+        }
+    }
+
+    #[test]
+    fn controlled_index_open_matches_both_layouts_and_retains_its_charge() {
+        use crate::{
+            history::{HistoryOptions, ReadLimit},
+            store::cold::ColdBudget,
+        };
+        let options = HistoryOptions::default();
+        let keys = run_keys();
+        let (dir3, normal3, dir2, normal2) = both_layouts(&keys);
+        for (directory, normal, format) in [(dir3.path(), &normal3, 3), (dir2.path(), &normal2, 2)]
+        {
+            let limit = ReadLimit {
+                options: &options,
+                memory: Some(1 << 20),
+                held: 0,
+            };
+            let mut budget = ColdBudget::new(limit).unwrap();
+            let loaded =
+                PermIndex::open_controlled(directory, Perm::Spo, format, &mut budget).unwrap();
+            assert_eq!(loaded.value.rows, normal.rows);
+            assert_eq!(loaded.value.blocks.len(), normal.blocks.len());
+            assert_eq!(loaded.value.segmented(), normal.segmented());
+            assert_eq!(budget.used(), loaded.charge);
+            let cache = BlockCache::new(1 << 20);
+            assert!(loaded.value.contains(&cache, &keys[12_345]).unwrap());
+            drop(loaded.value);
+            budget.release(loaded.charge);
+            assert_eq!(budget.used(), 0);
+            let mut low = ColdBudget::new(ReadLimit {
+                memory: Some(16),
+                ..limit
+            })
+            .unwrap();
+            assert!(matches!(
+                PermIndex::open_controlled(directory, Perm::Spo, format, &mut low),
+                Err(Error::BudgetExceeded(_))
+            ));
+        }
     }
 
     /// Keys of runs of 1 to 40 rows per subject, with large id gaps, over five blocks.

@@ -437,10 +437,13 @@ fn decode_records(buf: &[u8], head: Option<u64>) -> (BTreeMap<u64, Annotation>, 
     (map, pos)
 }
 
-fn decode_record(buf: &[u8], start: usize) -> Option<(u64, Annotation, usize)> {
+/// Borrow the wire fields so read-only probes need not allocate discarded messages.
+type BorrowedRecord<'a> = (u64, Option<&'a str>, Option<[u8; 32]>, usize);
+
+fn decode_record_borrowed(buf: &[u8], start: usize) -> Option<BorrowedRecord<'_>> {
     let mut pos = start;
     let take = |pos: &mut usize, n: usize| -> Option<&[u8]> {
-        let s = buf.get(*pos..*pos + n)?;
+        let s = buf.get(*pos..pos.checked_add(n)?)?;
         *pos += n;
         Some(s)
     };
@@ -449,20 +452,161 @@ fn decode_record(buf: &[u8], start: usize) -> Option<(u64, Annotation, usize)> {
     if flags & !(REC_MESSAGE | REC_DIGEST) != 0 {
         return None;
     }
-    let mut a = Annotation::default();
-    if flags & REC_DIGEST != 0 {
-        a.digest = Some(take(&mut pos, 32)?.try_into().ok()?);
-    }
-    if flags & REC_MESSAGE != 0 {
+    let digest = if flags & REC_DIGEST != 0 {
+        Some(take(&mut pos, 32)?.try_into().ok()?)
+    } else {
+        None
+    };
+    let message = if flags & REC_MESSAGE != 0 {
         let n = u16::from_le_bytes(take(&mut pos, 2)?.try_into().ok()?) as usize;
-        let m = std::str::from_utf8(take(&mut pos, n)?).ok()?;
-        a.message = Some(Arc::from(m));
-    }
+        Some(std::str::from_utf8(take(&mut pos, n)?).ok()?)
+    } else {
+        None
+    };
     let body_end = pos;
     let crc = u32::from_le_bytes(take(&mut pos, 4)?.try_into().ok()?);
     let mut c = flate2::Crc::new();
     c.update(&buf[start..body_end]);
-    (c.sum() == crc).then_some((seq, a, pos))
+    (c.sum() == crc).then_some((seq, message, digest, pos))
+}
+
+fn decode_record(buf: &[u8], start: usize) -> Option<(u64, Annotation, usize)> {
+    let (seq, message, digest, end) = decode_record_borrowed(buf, start)?;
+    Some((
+        seq,
+        Annotation {
+            message: message.map(Arc::from),
+            digest,
+        },
+        end,
+    ))
+}
+
+/// Read only sequence membership, preserving the existing annotation valid-prefix
+/// semantics. The returned membership is recovery metadata, never actor authority.
+/// This does not create, repair, rename or truncate the annotation file.
+pub(crate) fn seqs_controlled(
+    root: &Path,
+    dataset_id: uuid::Uuid,
+    budget: &mut crate::store::cold::ColdBudget<'_>,
+) -> Result<crate::store::cold::Loaded<Option<Vec<u64>>>> {
+    use crate::store::cold::Loaded;
+    let before = budget.used();
+    let result = (|| {
+        let loaded = match budget.buffered(&root.join(FILE)) {
+            Ok(loaded) => loaded,
+            Err(Error::Io(error)) if error.kind() == std::io::ErrorKind::NotFound => {
+                return Ok(Loaded {
+                    value: None,
+                    charge: 0,
+                });
+            }
+            Err(error) => return Err(error),
+        };
+        let mut reader = loaded.value;
+        let mut header = [0; HEADER];
+        let result: Result<Option<Vec<u64>>> = (|| {
+            match reader.read_exact(&mut header[..12]) {
+                Ok(()) => {}
+                Err(error) if error.kind() == std::io::ErrorKind::UnexpectedEof => return Ok(None),
+                Err(error) => return Err(error.into()),
+            }
+            budget.check()?;
+            if &header[..8] == MAGIC {
+                crate::formats::ANNOTATIONS.check(
+                    "retained commit annotations",
+                    u32::from_le_bytes(header[8..12].try_into().unwrap()),
+                    None,
+                )?;
+            }
+            match reader.read_exact(&mut header[12..]) {
+                Ok(()) => {}
+                Err(error) if error.kind() == std::io::ErrorKind::UnexpectedEof => return Ok(None),
+                Err(error) => return Err(error.into()),
+            }
+            budget.check()?;
+            if decode_header(&header).map(|h| h.0) != Some(dataset_id) {
+                return Ok(None);
+            }
+            let mut seqs = Vec::new();
+            let mut wire = Vec::new();
+            let scan = (|| {
+                loop {
+                    budget.key_step("annotation record", seqs.len())?;
+                    wire.clear();
+                    if let Err(error) = budget.append_read(&mut reader, &mut wire, 9) {
+                        if matches!(&error, Error::Io(e) if e.kind() == std::io::ErrorKind::UnexpectedEof)
+                        {
+                            break;
+                        }
+                        return Err(error);
+                    }
+                    let flags = wire[8];
+                    if flags & !(REC_MESSAGE | REC_DIGEST) != 0 {
+                        break;
+                    }
+                    let extra = if flags & REC_DIGEST != 0 { 32 } else { 0 };
+                    let extra = extra + if flags & REC_MESSAGE != 0 { 2 } else { 0 };
+                    if let Err(error) = budget.append_read(&mut reader, &mut wire, extra) {
+                        if matches!(&error, Error::Io(e) if e.kind() == std::io::ErrorKind::UnexpectedEof)
+                        {
+                            break;
+                        }
+                        return Err(error);
+                    }
+                    let message = if flags & REC_MESSAGE != 0 {
+                        u16::from_le_bytes(wire[wire.len() - 2..].try_into().unwrap()) as u64
+                    } else {
+                        0
+                    };
+                    if let Err(error) = budget.append_read(&mut reader, &mut wire, message + 4) {
+                        if matches!(&error, Error::Io(e) if e.kind() == std::io::ErrorKind::UnexpectedEof)
+                        {
+                            break;
+                        }
+                        return Err(error);
+                    }
+                    let Some((seq, _, _, _)) = decode_record_borrowed(&wire, 0) else {
+                        break;
+                    };
+                    let need = seqs.len().saturating_add(1);
+                    budget.reserve(&mut seqs, need)?;
+                    seqs.push(seq);
+                }
+                budget.sort_u64(&mut seqs)?;
+                let mut keep = 0;
+                for index in 0..seqs.len() {
+                    if index.is_multiple_of(1024) {
+                        budget.check()?;
+                    }
+                    if keep == 0 || seqs[index] != seqs[keep - 1] {
+                        seqs[keep] = seqs[index];
+                        keep += 1;
+                    }
+                }
+                seqs.truncate(keep);
+                Ok(())
+            })();
+            budget.drop_vec(wire);
+            scan?;
+            Ok(Some(seqs))
+        })();
+        drop(reader);
+        budget.release(loaded.charge);
+        let value = result?;
+        Ok(Loaded {
+            value,
+            charge: budget.used() - before,
+        })
+    })();
+    let result = result.and_then(|value| {
+        budget.check()?;
+        Ok(value)
+    });
+    if result.is_err() {
+        budget.release(budget.used() - before);
+    }
+    result
 }
 
 pub(crate) fn hex(b: &[u8]) -> String {
@@ -532,6 +676,146 @@ pub fn nquads_line(q: &oxrdf::Quad) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn controlled_membership_refuses_future_primary_version_without_repair() {
+        use crate::{
+            history::{HistoryOptions, ReadLimit},
+            store::cold::ColdBudget,
+        };
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join(FILE);
+        let id = uuid::Uuid::new_v4();
+        let options = HistoryOptions::default();
+        for version in [1u32, 99] {
+            for len in [0, 7, 8, 11, 12, 13, HEADER - 1, HEADER] {
+                for known_magic in [true, false] {
+                    let mut bytes = encode_header(id, 0);
+                    bytes[8..12].copy_from_slice(&version.to_le_bytes());
+                    if !known_magic {
+                        bytes[0] ^= 1;
+                    }
+                    let bytes = &bytes[..len];
+                    std::fs::write(&path, bytes).unwrap();
+                    let mut budget = ColdBudget::new(ReadLimit {
+                        options: &options,
+                        memory: Some(4096),
+                        held: 0,
+                    })
+                    .unwrap();
+                    let result = seqs_controlled(root.path(), id, &mut budget);
+                    if known_magic && version == 99 && len >= 12 {
+                        assert!(
+                            matches!(result, Err(Error::Unsupported(_))),
+                            "recognizable future annotation prefix must refuse: len={len}"
+                        );
+                    } else {
+                        let loaded = result.unwrap();
+                        assert_eq!(
+                            loaded.value,
+                            (known_magic && version == 1 && len == HEADER).then(Vec::new)
+                        );
+                        assert_eq!(loaded.charge, 0);
+                    }
+                    assert_eq!(budget.used(), 0);
+                    assert_eq!(std::fs::read(&path).unwrap(), bytes);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn controlled_annotation_membership_preserves_valid_prefix_and_bytes() {
+        use crate::{
+            history::{HistoryOptions, ReadLimit},
+            store::cold::ColdBudget,
+        };
+        let root = tempfile::tempdir().unwrap();
+        let id = uuid::Uuid::new_v4();
+        let mut bytes = encode_header(id, 0).to_vec();
+        for seq in [9, 2, 9, 5] {
+            bytes.extend(encode_record(
+                seq,
+                &Annotation {
+                    message: Some(Arc::from("z".repeat(60_000))),
+                    digest: Some([3; 32]),
+                },
+            ));
+        }
+        bytes.extend_from_slice(&[0; 12]); // incomplete/bad trailing record
+        std::fs::write(root.path().join(FILE), &bytes).unwrap();
+        let options = HistoryOptions::default();
+        let mut budget = ColdBudget::new(ReadLimit {
+            options: &options,
+            memory: Some(512 << 10),
+            held: 0,
+        })
+        .unwrap();
+        let loaded = seqs_controlled(root.path(), id, &mut budget).unwrap();
+        assert_eq!(loaded.value.as_deref(), Some([2, 5, 9].as_slice()));
+        assert_eq!(budget.used(), loaded.charge);
+        assert_eq!(
+            loaded.charge,
+            loaded.value.as_ref().unwrap().capacity() as u64 * 8
+        );
+        assert_eq!(std::fs::read(root.path().join(FILE)).unwrap(), bytes);
+        drop(loaded.value);
+        budget.release(loaded.charge);
+        assert_eq!(budget.used(), 0);
+        let mismatch = seqs_controlled(root.path(), uuid::Uuid::new_v4(), &mut budget).unwrap();
+        assert!(mismatch.value.is_none());
+        assert_eq!(budget.used(), 0);
+    }
+
+    #[test]
+    fn controlled_annotation_scan_refuses_and_cancels_without_repair() {
+        use crate::{
+            history::{HistoryOptions, ReadLimit},
+            store::cold::ColdBudget,
+        };
+        use std::sync::atomic::{AtomicBool, Ordering};
+        let root = tempfile::tempdir().unwrap();
+        let id = uuid::Uuid::new_v4();
+        let mut bytes = encode_header(id, 0).to_vec();
+        for seq in 0..100 {
+            bytes.extend(encode_record(seq, &Annotation::default()));
+        }
+        std::fs::write(root.path().join(FILE), &bytes).unwrap();
+        let cancel = Arc::new(AtomicBool::new(false));
+        let options = HistoryOptions {
+            cancel: Some(cancel.clone()),
+            ..Default::default()
+        };
+        let mut budget = ColdBudget::new(ReadLimit {
+            options: &options,
+            memory: Some(64),
+            held: 0,
+        })
+        .unwrap();
+        assert!(matches!(
+            seqs_controlled(root.path(), id, &mut budget),
+            Err(Error::BudgetExceeded(_))
+        ));
+        assert_eq!(budget.used(), 0);
+        let observer = |stage: &str, at: usize| {
+            if stage == "annotation record" && at == 8 {
+                cancel.store(true, Ordering::Relaxed);
+            }
+        };
+        let mut budget = ColdBudget::new(ReadLimit {
+            options: &options,
+            memory: Some(4096),
+            held: 0,
+        })
+        .unwrap();
+        budget.observe_keys(&observer);
+        assert!(matches!(
+            seqs_controlled(root.path(), id, &mut budget),
+            Err(Error::Cancelled)
+        ));
+        assert_eq!(budget.used(), 0);
+        assert_eq!(std::fs::read(root.path().join(FILE)).unwrap(), bytes);
+    }
 
     #[test]
     fn messages_are_trimmed_and_checked() {

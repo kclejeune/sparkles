@@ -220,76 +220,159 @@ fn layout(positions: u64, count: u64, segments: u64) -> Option<(usize, usize, us
 }
 
 impl NumColumn {
+    pub(super) fn resident_bytes(&self) -> u64 {
+        self.head.as_ref().map_or(0, |b| b.len() as u64)
+            + self.hinted.len() as u64 * 8
+            + self.segments.len() as u64 * std::mem::size_of::<Segment>() as u64
+    }
     /// Open the column of a vocabulary of `len` ids whose literals are the ids
     /// `0..literals`. `None` when the file is missing, or does not describe this
     /// vocabulary (then numbers are decoded from their keys).
     pub(super) fn open(dir: &Path, len: u64, literals: u64) -> Option<NumColumn> {
-        let path = dir.join(FILE);
-        let f = File::open(&path).ok()?;
-        let bytes = match f.metadata() {
-            Ok(m) if m.len() >= HEADER as u64 => Bytes::open(&path, true).ok()?,
-            _ => return None,
-        };
-        let b = bytes.as_slice();
-        let (covered, count, positions, nsegs) =
-            (word(b, 16), word(b, 24), word(b, 32), word(b, 40));
-        let segments = || -> Option<(usize, usize, Box<[Segment]>)> {
-            if b[..8] != *MAGIC
-                || word(b, 8) != len
-                || covered != literals
-                || count > positions
-                || positions > covered
-            {
-                return None;
+        Self::open_inner(dir, len, literals, None).ok().flatten()
+    }
+
+    pub(super) fn open_controlled(
+        dir: &Path,
+        len: u64,
+        literals: u64,
+        budget: &mut crate::store::cold::ColdBudget<'_>,
+    ) -> Result<Option<crate::store::cold::Loaded<NumColumn>>> {
+        budget.check()?;
+        let start = budget.used();
+        match Self::open_inner(dir, len, literals, Some(budget)) {
+            Ok(Some(value)) => Ok(Some(crate::store::cold::Loaded {
+                value,
+                charge: budget.used() - start,
+            })),
+            Ok(None) => {
+                budget.release(budget.used() - start);
+                Ok(None)
             }
-            let (rank, values, segs, end) = layout(positions, count, nsegs)?;
-            if end != b.len() {
-                return None;
+            Err(error) => {
+                budget.release(budget.used() - start);
+                Err(error)
             }
-            let list: Box<[Segment]> = (0..nsegs as usize)
-                .map(|i| {
-                    let at = segs + i * 24;
-                    (word(b, at), word(b, at + 8), word(b, at + 16))
-                })
-                .collect();
-            // ascending, apart, inside the literals, and their ids are the positions
-            let mut next = (0, 0);
-            for &(lo, hi, base) in &list {
-                if lo < next.0 || hi <= lo || hi > covered || base != next.1 {
+        }
+    }
+
+    fn open_inner(
+        dir: &Path,
+        len: u64,
+        literals: u64,
+        mut budget: Option<&mut crate::store::cold::ColdBudget<'_>>,
+    ) -> Result<Option<NumColumn>> {
+        let mut failure = None;
+        macro_rules! admit {
+            ($expression:expr) => {
+                match $expression {
+                    Ok(value) => value,
+                    Err(error) => {
+                        failure = Some(error);
+                        return None;
+                    }
+                }
+            };
+        }
+        let value = (|| {
+            let path = dir.join(FILE);
+            let mut f = File::open(&path).ok()?;
+            let bytes = match f.metadata() {
+                Ok(m) if m.len() >= HEADER as u64 => Bytes::open(&path, true).ok()?,
+                _ => return None,
+            };
+            let b = bytes.as_slice();
+            let (covered, count, positions, nsegs) =
+                (word(b, 16), word(b, 24), word(b, 32), word(b, 40));
+            let mut segments = || -> Option<(usize, usize, Box<[Segment]>)> {
+                if b[..8] != *MAGIC
+                    || word(b, 8) != len
+                    || covered != literals
+                    || count > positions
+                    || positions > covered
+                {
                     return None;
                 }
-                next = (hi, base + (hi - lo));
-            }
-            (next.1 == positions).then_some((rank, values, list))
-        };
-        let Some((rank, values, segments)) = segments() else {
-            tracing::warn!(
-                target: "sparkles::vocab",
-                "{} does not match its vocabulary; numbers are decoded from their keys",
-                path.display()
-            );
-            return None;
-        };
-        let head = (values <= RESIDENT)
-            .then(|| {
-                // one read, where the mapping would fault page after page
-                let mut h = vec![0u8; values];
-                (&f).read_exact(&mut h).ok().map(|()| h.into_boxed_slice())
+                let (rank, values, segs, end) = layout(positions, count, nsegs)?;
+                if end != b.len() {
+                    return None;
+                }
+                let list: Box<[Segment]> = if let Some(budget) = budget.as_deref_mut() {
+                    let mut list = Vec::new();
+                    admit!(budget.reserve(&mut list, nsegs as usize));
+                    for index in 0..nsegs as usize {
+                        admit!(budget.check());
+                        let at = segs + index * 24;
+                        list.push((word(b, at), word(b, at + 8), word(b, at + 16)));
+                    }
+                    list.into_boxed_slice()
+                } else {
+                    (0..nsegs as usize)
+                        .map(|index| {
+                            let at = segs + index * 24;
+                            (word(b, at), word(b, at + 8), word(b, at + 16))
+                        })
+                        .collect()
+                };
+                // ascending, apart, inside the literals, and their ids are the positions
+                let mut next = (0, 0);
+                for &(lo, hi, base) in &list {
+                    if let Some(budget) = budget.as_deref_mut() {
+                        admit!(budget.check());
+                    }
+                    if lo < next.0 || hi <= lo || hi > covered || base != next.1 {
+                        return None;
+                    }
+                    next = (hi, base + (hi - lo));
+                }
+                (next.1 == positions).then_some((rank, values, list))
+            };
+            let Some((rank, values, segments)) = segments() else {
+                if failure.is_some() {
+                    return None;
+                }
+                tracing::warn!(
+                    target: "sparkles::vocab",
+                    "{} does not match its vocabulary; numbers are decoded from their keys",
+                    path.display()
+                );
+                return None;
+            };
+            let head = if values <= RESIDENT {
+                if let Some(budget) = budget.as_deref_mut() {
+                    Some(admit!(budget.read_from(&mut f, values as u64)).into_boxed_slice())
+                } else {
+                    let mut head = vec![0u8; values];
+                    (&f).read_exact(&mut head)
+                        .ok()
+                        .map(|()| head.into_boxed_slice())
+                }
+            } else {
+                None
+            };
+            let chunks = b.len().div_ceil(HINT_CHUNK);
+            let hinted = if let Some(budget) = budget.as_deref_mut() {
+                admit!(budget.filled(chunks.div_ceil(64)))
+            } else {
+                (0..chunks.div_ceil(64))
+                    .map(|_| AtomicU64::new(0))
+                    .collect()
+            };
+            Some(NumColumn {
+                head,
+                hinted,
+                bytes,
+                covered,
+                count,
+                rank,
+                values,
+                segments,
             })
-            .flatten();
-        let chunks = b.len().div_ceil(HINT_CHUNK);
-        Some(NumColumn {
-            head,
-            hinted: (0..chunks.div_ceil(64))
-                .map(|_| AtomicU64::new(0))
-                .collect(),
-            bytes,
-            covered,
-            count,
-            rank,
-            values,
-            segments,
-        })
+        })();
+        match failure {
+            Some(error) => Err(error),
+            None => Ok(value),
+        }
     }
 
     /// Ranges of ids that hold every number.

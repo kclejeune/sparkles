@@ -459,22 +459,29 @@ impl Store {
         #[cfg(feature = "geo")]
         {
             let idx = self.geo.load_full()?;
-            Some(Arc::new(GeoView {
-                config: idx.config.clone(),
-                epoch: idx.epoch(),
-                generation: 0,
-                commit: 0,
-                state: ViewState::Historical,
-                lookup: Arc::new(Lookup::empty(&idx.config)),
-                base: None,
-                overlay: Arc::new(Overlay::empty()),
-                tail: imbl::Vector::new(),
-                skipped: imbl::Vector::new(),
-            }))
+            Some(historical_geo_view(idx.config.clone(), idx.epoch()))
         }
         #[cfg(not(feature = "geo"))]
         None
     }
+}
+
+/// A historical view retains configuration only; preparing it never starts an index.
+#[cfg(feature = "geo")]
+pub(super) fn historical_geo_view(config: Arc<GeoConfig>, epoch: u64) -> Arc<GeoView> {
+    let lookup = Arc::new(Lookup::empty(&config));
+    Arc::new(GeoView {
+        config,
+        epoch,
+        generation: 0,
+        commit: 0,
+        state: ViewState::Historical,
+        lookup,
+        base: None,
+        overlay: Arc::new(Overlay::empty()),
+        tail: imbl::Vector::new(),
+        skipped: imbl::Vector::new(),
+    })
 }
 
 #[cfg(feature = "geo")]

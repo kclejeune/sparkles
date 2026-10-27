@@ -113,12 +113,17 @@ pub(super) fn gone_body(g: &sparkles::history::HistoryGone) -> J {
     let mut j = json!({
         "error": g.message,
         "code": "history-gone",
-        "commit": g.seq,
         "head": g.head,
         "oldestReconstructable": g.reconstructable.first().map(|r| r.0),
         "reconstructable": ranges(&g.reconstructable),
         "metadata": g.metadata,
     });
+    if let Some(seq) = g.seq {
+        j["commit"] = json!(seq);
+    }
+    if let Some(at) = &g.at {
+        j["at"] = json!(at.to_string());
+    }
     if let Some(s) = &g.snapshot {
         j["snapshot"] = json!(s);
     }

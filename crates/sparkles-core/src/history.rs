@@ -319,7 +319,10 @@ impl HistoryStatus {
 #[derive(Clone, Debug)]
 pub struct HistoryGone {
     pub message: String,
-    pub seq: u64,
+    /// The selected commit when its identity can still be resolved.
+    pub seq: Option<u64>,
+    /// The original selector when retained metadata cannot resolve its commit.
+    pub at: Option<At>,
     pub head: u64,
     pub snapshot: Option<String>,
     pub reconstructable: Vec<(u64, u64)>,
@@ -337,6 +340,81 @@ impl std::fmt::Display for HistoryGone {
 pub struct HistoryOptions {
     pub cancel: Option<Arc<std::sync::atomic::AtomicBool>>,
     pub deadline: Option<std::time::Instant>,
+}
+
+/// Fixed selector/result/error metadata, including bounded snapshot names.
+pub(crate) const READ_METADATA_BYTES: u64 = 1024;
+
+/// One read's preparation limit. This does not resize the shared history cache.
+#[derive(Clone, Copy)]
+pub(crate) struct ReadLimit<'a> {
+    pub(crate) options: &'a HistoryOptions,
+    pub(crate) memory: Option<u64>,
+    pub(crate) held: u64,
+}
+
+impl ReadLimit<'_> {
+    pub(crate) fn check(&self, bytes: u64) -> Result<()> {
+        use std::sync::atomic::Ordering;
+        if self
+            .options
+            .cancel
+            .as_ref()
+            .is_some_and(|c| c.load(Ordering::Relaxed))
+        {
+            return Err(Error::Cancelled);
+        }
+        if self
+            .options
+            .deadline
+            .is_some_and(|t| std::time::Instant::now() >= t)
+        {
+            return Err(Error::Timeout);
+        }
+        if let Some(limit) = self.memory
+            && bytes.saturating_add(self.held) > limit
+        {
+            return Err(Error::BudgetExceeded(crate::Budget {
+                kind: crate::BudgetKind::Memory,
+                limit,
+                // Physical/control cardinalities are not part of this error API.
+                requested: limit.saturating_add(1),
+            }));
+        }
+        Ok(())
+    }
+
+    pub(crate) fn remaining(&self) -> u64 {
+        self.memory.unwrap_or(u64::MAX).saturating_sub(self.held)
+    }
+
+    pub(crate) fn holding(self, bytes: u64) -> Result<Self> {
+        self.check(bytes)?;
+        Ok(Self {
+            held: self.held.saturating_add(bytes),
+            ..self
+        })
+    }
+
+    pub(crate) fn read_lock<'m, T>(
+        &self,
+        lock: &'m parking_lot::RwLock<T>,
+    ) -> Result<parking_lot::RwLockReadGuard<'m, T>> {
+        crate::task::read_lock(lock, || self.check(0))
+    }
+
+    pub(crate) fn lock<'m, T>(
+        &self,
+        mutex: &'m parking_lot::Mutex<T>,
+    ) -> Result<parking_lot::MutexGuard<'m, T>> {
+        loop {
+            self.check(0)?;
+            if let Some(guard) = mutex.try_lock_for(std::time::Duration::from_millis(10)) {
+                self.check(0)?;
+                return Ok(guard);
+            }
+        }
+    }
 }
 
 // -------------------------------------------------------------- history.json ------
@@ -567,6 +645,11 @@ impl HistoryState {
     /// cache changes.
     pub fn settle(&mut self) {
         let now: u64 = self.cache.iter().map(|e| e.bytes).sum();
+        self.settle_precounted(now);
+    }
+
+    /// A controlled caller has already summed the entries before publishing a change.
+    pub(crate) fn settle_precounted(&mut self, now: u64) {
         self.budget.settle(self.charged, now);
         self.charged = now;
     }
@@ -620,6 +703,28 @@ impl HistoryState {
             .rev()
             .find(|&(_, b, e)| b <= seq && seq <= e)
             .map(|(no, _, _)| no)
+    }
+
+    /// The same newest covering generation without materializing all ranges.
+    pub(crate) fn owner_limited(
+        &self,
+        seq: u64,
+        current: u32,
+        head: u64,
+        limit: &ReadLimit<'_>,
+    ) -> Result<Option<u32>> {
+        for (&number, generation) in self.gens.iter().rev() {
+            limit.check(0)?;
+            let end = if number == current {
+                head
+            } else {
+                generation.end
+            };
+            if generation.base.seq <= seq && seq <= end {
+                return Ok(Some(number));
+            }
+        }
+        Ok(None)
     }
 
     /// The readable commits, as ascending disjoint ranges.
@@ -806,6 +911,24 @@ pub(crate) struct MemHistory {
 }
 
 impl MemHistory {
+    pub(crate) fn get_limited(
+        &self,
+        seq: u64,
+        limit: &ReadLimit<'_>,
+    ) -> Result<Option<Arc<Snapshot>>> {
+        limit.check(0)?;
+        if let Some((_, snapshot)) = self.branch_bases.get(&seq) {
+            return Ok(Some(snapshot.clone()));
+        }
+        for snapshot in self.window.iter().chain(self.pins.values().map(|(_, s)| s)) {
+            limit.check(0)?;
+            if snapshot.commit == seq {
+                return Ok(Some(snapshot.clone()));
+            }
+        }
+        Ok(None)
+    }
+
     /// The kept state of commit `seq`.
     pub fn get(&self, seq: u64) -> Option<Arc<Snapshot>> {
         self.branch_bases

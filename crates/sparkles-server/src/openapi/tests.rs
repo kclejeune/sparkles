@@ -430,3 +430,24 @@ fn entailment_contracts_preserve_distinct_explanation_requests_and_typed_support
         json!(["boolean", "null"])
     );
 }
+
+#[test]
+fn gone_commit_is_optional_and_never_a_nullable_or_sentinel_sequence() {
+    let doc = doc();
+    let error = &doc["components"]["schemas"]["Error"];
+    assert_eq!(error["properties"]["commit"]["type"], "integer");
+    assert_eq!(error["properties"]["at"]["type"], "string");
+    assert!(
+        !error["required"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|p| p == "commit")
+    );
+    assert!(
+        doc["components"]["responses"]["Gone"]["description"]
+            .as_str()
+            .unwrap()
+            .contains("omits `commit`")
+    );
+}

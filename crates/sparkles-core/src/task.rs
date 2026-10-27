@@ -16,6 +16,20 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Instant;
 
+/// Wait for an internal read lock without losing the caller's controls.
+pub(crate) fn read_lock<'a, T>(
+    lock: &'a parking_lot::RwLock<T>,
+    check: impl Fn() -> Result<()>,
+) -> Result<parking_lot::RwLockReadGuard<'a, T>> {
+    loop {
+        check()?;
+        if let Some(guard) = lock.try_read_for(std::time::Duration::from_millis(10)) {
+            check()?;
+            return Ok(guard);
+        }
+    }
+}
+
 /// A progress callback: the fraction done in `[0, 1]` and a short message.
 pub type ProgressFn = Arc<dyn Fn(f32, &str) + Send + Sync>;
 

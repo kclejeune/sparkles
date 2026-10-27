@@ -188,6 +188,12 @@ impl ChangeLog {
     /// Run a history query against the commits up to `upto` (the state the caller
     /// reads). Bounds given as [`HistoryBound::At`] must already be resolved.
     pub fn query(&self, q: &HistoryQuery, upto: u64) -> Result<HistoryResult> {
+        let upto = self
+            .read_only_through()
+            .map_or(upto, |through| upto.min(through));
+        if self.read_only_through().is_some() {
+            q.check()?;
+        }
         if !self.is_enabled() {
             return Err(Error::HistoryUnsupported(
                 "the change log of this dataset is off; history queries need it".into(),
@@ -200,7 +206,7 @@ impl ChangeLog {
             None => 1,
             Some(HistoryBound::Commit(n)) => (*n).max(1),
             Some(HistoryBound::Time(ms)) => self
-                .commit_at_time(ms.saturating_sub(1))?
+                .commit_at_time_checked(ms.saturating_sub(1), &mut || q.check())?
                 .map_or(1, |c| c + 1),
             Some(HistoryBound::At(a)) => {
                 return Err(Error::Invalid(format!(
@@ -211,7 +217,10 @@ impl ChangeLog {
         let to = match &q.to {
             None => upto,
             Some(HistoryBound::Commit(n)) => (*n).min(upto),
-            Some(HistoryBound::Time(ms)) => self.commit_at_time(*ms)?.unwrap_or(0).min(upto),
+            Some(HistoryBound::Time(ms)) => self
+                .commit_at_time_checked(*ms, &mut || q.check())?
+                .unwrap_or(0)
+                .min(upto),
             Some(HistoryBound::At(a)) => {
                 return Err(Error::Invalid(format!(
                     "the selector {a} must be resolved by the store"
@@ -226,6 +235,9 @@ impl ChangeLog {
         let mut n = 0u64;
         let mut check = || {
             n += 1;
+            if self.read_only_through().is_some() {
+                return q.check();
+            }
             if n & 0xFF != 0 {
                 return Ok(());
             }

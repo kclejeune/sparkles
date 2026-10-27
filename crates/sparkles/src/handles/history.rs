@@ -95,6 +95,51 @@ pub struct History {
 }
 
 impl History {
+    /// Prepare the selected physical snapshot within a per-read memory cap.
+    ///
+    /// This trusted low-level read returns RDF state without preparing access masks
+    /// or query guards. The cap covers history preparation, not subsequent queries.
+    /// Inherited branch selectors return their usual inherited-commit error; use
+    /// [`Self::snapshot_at_with_branch_limited`] on the owning dataset to follow them.
+    pub fn snapshot_at_limited(
+        &self,
+        at: &At,
+        options: &crate::history::HistoryOptions,
+        max_memory_bytes: u64,
+    ) -> Result<(
+        std::sync::Arc<crate::store::Snapshot>,
+        crate::history::Resolved,
+    )> {
+        self.ds
+            .store()
+            .snapshot_at_limited(at, options, max_memory_bytes)
+    }
+
+    /// Prepare an exact physical view of a retained branch in this dataset family.
+    ///
+    /// Call on the owning dataset's history handle. Inherited selectors follow
+    /// retained origins under the same cap and return the actual branch UUID.
+    /// This is trusted physical access, with the same scope as
+    /// [`Self::snapshot_at_limited`]. A refusal never retries an unbounded read.
+    pub fn snapshot_at_with_branch_limited(
+        &self,
+        branch: &Dataset,
+        at: &At,
+        options: &crate::history::HistoryOptions,
+        max_memory_bytes: u64,
+    ) -> Result<(
+        std::sync::Arc<crate::store::Snapshot>,
+        crate::history::Resolved,
+        uuid::Uuid,
+    )> {
+        self.ds.store().snapshot_at_with_branch_limited(
+            branch.store(),
+            at,
+            options,
+            max_memory_bytes,
+        )
+    }
+
     /// What history is kept: the reconstructable commits, the retention window, the
     /// catalog horizon and the cache.
     pub fn status(&self) -> HistoryStatus {

@@ -4329,6 +4329,12 @@ longer kept is `410 history-gone`, and the body lists the readable ranges:
   "reconstructable": [ { "from": 40, "to": 57 } ], "metadata": { "seq": 12, … } }
 ```
 
+When a branch's pruned time metadata cannot identify its commit, the response remains
+`410 history-gone`. It includes the original canonical `at=time:…` selector, omits
+`commit`, and sets `metadata` to `null`. A known commit keeps its numeric `commit`.
+Time selectors inherit a parent's state only strictly before the branch's fork time.
+Equal timestamps and clocks clamped to the fork time do not justify inheritance.
+
 Materializing a past state is bounded by `--history-cache-mb` (default 512 for the whole
 server, `507` beyond it) and by the request timeout. Results are cached, and one materialization runs
 at a time. A state starts from the nearest known state of its generation in the

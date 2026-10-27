@@ -69,6 +69,29 @@ impl std::fmt::Debug for Table {
 }
 
 impl Table {
+    pub(crate) fn first_byte_checked(
+        &self,
+        codes: &[u8],
+        check: impl Fn() -> Result<()>,
+    ) -> Result<Option<u8>> {
+        let mut index = 0usize;
+        while index < codes.len() {
+            if index.is_multiple_of(64 << 10) {
+                check()?;
+            }
+            let code = codes[index];
+            if code == ESCAPE {
+                return Ok(codes.get(index + 1).copied());
+            }
+            if self.lens[code as usize] != 0 {
+                return Ok(Some(self.syms[code as usize][0]));
+            }
+            index += 1;
+        }
+        check()?;
+        Ok(None)
+    }
+
     /// The number of symbols.
     pub fn symbols(&self) -> usize {
         self.n as usize

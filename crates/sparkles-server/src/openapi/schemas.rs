@@ -78,6 +78,8 @@ pub(super) fn schemas() -> Map<String, J> {
                     "line": { "type": "integer", "description": "1-based line of a syntax error." },
                     "column": { "type": "integer", "description": "1-based column of a syntax error, in characters." },
                     "code": { "type": "string", "description": "A machine-readable reason, such as `precondition-failed`, `history-gone`, `dataset-restoring` or a backup error code." },
+                    "commit": { "type": "integer", "minimum": 0, "description": "The resolved commit for a history-gone error. Omitted when pruned time metadata leaves the sequence unknown." },
+                    "at": { "type": "string", "description": "The canonical original selector when a history-gone error cannot resolve its commit." },
                     "requestId": { "type": "string", "description": "The response's `X-Request-Id`." },
                 },
                 "additionalProperties": true,

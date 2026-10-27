@@ -440,7 +440,9 @@ fn error_responses() -> Map<String, J> {
     );
     put(
         "Gone",
-        err("The commit or state is no longer kept (`history-gone`)."),
+        err(
+            "The commit or state is no longer kept (`history-gone`). An unresolved pruned time omits `commit` and includes its canonical `at` selector.",
+        ),
     );
     put(
         "PreconditionFailed",

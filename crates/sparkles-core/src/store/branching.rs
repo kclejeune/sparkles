@@ -11,6 +11,8 @@
 //! lock. An upstream's history lock may be taken while a branch's writer lock is held,
 //! never the reverse.
 
+pub(super) mod readonly;
+
 use super::link::{LINK_FILE, LinkFile, Segment};
 use super::*;
 use crate::branch::{
@@ -169,6 +171,20 @@ impl TableFile {
     fn any_by_id(&self, id: uuid::Uuid) -> Option<&Entry> {
         self.by_id(id)
             .or_else(|| self.retired.iter().find(|e| e.id == id))
+    }
+
+    fn any_by_id_limited(
+        &self,
+        id: uuid::Uuid,
+        limit: &crate::history::ReadLimit<'_>,
+    ) -> Result<Option<&Entry>> {
+        for entry in self.branches.iter().chain(&self.retired) {
+            limit.check(0)?;
+            if entry.id == id {
+                return Ok(Some(entry));
+            }
+        }
+        Ok(None)
     }
 
     /// The listed and the retired branches.
@@ -905,6 +921,38 @@ impl BranchSet {
             }
         }
         c
+    }
+
+    pub(super) fn normalize_limited(
+        &self,
+        mut commit: CommitRef,
+        limit: &crate::history::ReadLimit<'_>,
+    ) -> Result<CommitRef> {
+        let table = limit.lock(&self.table)?;
+        for _ in 0..1024 {
+            limit.check(0)?;
+            let mut from: Option<CommitRef> = if commit.branch_id == self.dataset_id {
+                None
+            } else {
+                table
+                    .any_by_id_limited(commit.branch_id, limit)?
+                    .map(|entry| entry.from.into())
+            };
+            if from.is_none() && commit.branch_id != self.dataset_id {
+                for deleted in &table.deleted {
+                    limit.check(0)?;
+                    if deleted.id == commit.branch_id {
+                        from = Some(deleted.from.into());
+                        break;
+                    }
+                }
+            }
+            match from {
+                Some(from) if commit.seq <= from.seq => commit.branch_id = from.branch_id,
+                _ => break,
+            }
+        }
+        Ok(commit)
     }
 
     /// The listed branches whose files can be read, in table order, each with its id,
@@ -2552,6 +2600,16 @@ impl Store {
             Ok((snapshot, resolved)) => Ok((snapshot, resolved, store.branch_id())),
             Err(error) => match branch::inherited_commit(&error) {
                 Some(commit) => {
+                    if let At::Time(ms) = at {
+                        let limit = crate::history::ReadLimit {
+                            options,
+                            memory: None,
+                            held: 0,
+                        };
+                        if *ms >= self.origin_timestamp_limited(commit, &limit)? {
+                            return Err(store.unresolved_time_limited(*ms, &limit)?);
+                        }
+                    }
                     let owner = self.owned_set()?.normalize(commit);
                     let upstream = self.branch_by_id(owner.branch_id)?;
                     match at {
@@ -2582,6 +2640,17 @@ impl Store {
         match store.resolve(at) {
             Err(e) => match branch::inherited_commit(&e) {
                 Some(c) => {
+                    if let At::Time(ms) = at {
+                        let options = crate::history::HistoryOptions::default();
+                        let limit = crate::history::ReadLimit {
+                            options: &options,
+                            memory: None,
+                            held: 0,
+                        };
+                        if *ms >= self.origin_timestamp_limited(c, &limit)? {
+                            return Err(store.unresolved_time_limited(*ms, &limit)?);
+                        }
+                    }
                     let owner = self.owned_set()?.normalize(c);
                     let up = self.branch_by_id(owner.branch_id)?;
                     match at {
