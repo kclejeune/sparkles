@@ -57,6 +57,7 @@ concurrency:
 
 env:
   MBX_HTTP_TIMEOUT: 5m
+  MBX_GC_MAX_SIZE: 10GiB
   # Only same-repository PRs may publish to the remote cache.
   MBX_REMOTE_TRUST_WRITES: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name == github.repository && 'true' || 'false' }}
   MATURIN_VERSION: "1.15.0"
@@ -106,6 +107,8 @@ jobs:
           github-cache-mode: objects
           cache-generation: sparkles-python-linux-${{ matrix.libc }}-${{ env.PROFILE_ARG }}-v1
           save-on-workflow-dispatch: ${{ github.ref == 'refs/heads/main' }}
+      - name: Disk space before build
+        run: df -h "$GITHUB_WORKSPACE"
       - name: Build the wheel
         uses: PyO3/maturin-action@v1
         with:
@@ -115,7 +118,7 @@ jobs:
           docker-options: >-
             -e MBX_CACHE_EXPORT_GROUP
             -e MBX_REMOTE_URL -e MBX_REMOTE_NAMESPACE -e MBX_REMOTE_OIDC_AUDIENCE
-            -e MBX_REMOTE_TRUST_WRITES -e MBX_HTTP_TIMEOUT
+            -e MBX_REMOTE_TRUST_WRITES -e MBX_HTTP_TIMEOUT -e MBX_GC_MAX_SIZE
             -e ACTIONS_ID_TOKEN_REQUEST_URL -e ACTIONS_ID_TOKEN_REQUEST_TOKEN
             -e GITHUB_ACTIONS -e GITHUB_EVENT_NAME -e GITHUB_REF -e GITHUB_REF_TYPE -e GITHUB_REF_PROTECTED
             -e MBX_CACHE_DIR=${{ github.workspace }}/.cache/mbx
@@ -127,6 +130,9 @@ jobs:
             export CARGO_HOME="$GITHUB_WORKSPACE/.cache/cargo"
             source scripts/install-mbx-container.sh
           args: ${{ env.PROFILE_ARG }} --locked --manifest-path ${{ env.MANIFEST }} --target-dir target --out dist
+      - name: Disk space after build
+        if: ${{ always() }}
+        run: df -h "$GITHUB_WORKSPACE"
       - name: Restore host ownership of container cache files
         if: always()
         run: |

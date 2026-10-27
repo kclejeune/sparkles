@@ -48,6 +48,7 @@ concurrency:
 
 env:
   MBX_HTTP_TIMEOUT: 5m
+  MBX_GC_MAX_SIZE: 10GiB
   # Only same-repository PRs may publish to the remote cache.
   MBX_REMOTE_TRUST_WRITES: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name == github.repository && 'true' || 'false' }}
   # Pushes to main and pull requests build the bindings in the dev profile, which compiles
@@ -92,6 +93,8 @@ jobs:
           github-cache-mode: objects
           cache-generation: sparkles-jvm-natives-${{ matrix.platform }}-${{ env.JVM_PROFILE }}-v1
           save-on-workflow-dispatch: ${{ github.ref == 'refs/heads/main' }}
+      - name: Disk space before build
+        run: df -h "$GITHUB_WORKSPACE"
       - name: Build native library and generate matching bindings
         shell: bash
         run: |
@@ -99,6 +102,9 @@ jobs:
             test "${GITHUB_REF_NAME#jvm-v}" = "$(sed -n 's/^version=//p' jvm/gradle.properties)"
           fi
           scripts/jvm-native.sh
+      - name: Disk space after build
+        if: ${{ always() }}
+        run: df -h "$GITHUB_WORKSPACE"
       - name: Run native and Jena contract tests
         shell: bash
         run: |

@@ -63,6 +63,7 @@ concurrency:
 
 env:
   MBX_HTTP_TIMEOUT: 5m
+  MBX_GC_MAX_SIZE: 10GiB
   # Only same-repository PRs may publish to the remote cache.
   MBX_REMOTE_TRUST_WRITES: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name == github.repository && 'true' || 'false' }}
   CARGO_TERM_COLOR: always
@@ -194,6 +195,8 @@ jobs:
           github-cache-mode: objects
           cache-generation: sparkles-${{ matrix.platform }}-v1
           save-on-workflow-dispatch: ${{ github.ref == 'refs/heads/main' }}
+      - name: Disk space before Clippy
+        run: df -h "$GITHUB_WORKSPACE"
       - name: Workspace
         run: mbx clippy --locked --workspace --all-targets -- -D warnings
       - name: Formatter for wasm32 (mise run fmt:wasm)
@@ -209,6 +212,9 @@ jobs:
               echo "::endgroup::"
             done
           done
+      - name: Disk space after Clippy
+        if: ${{ always() }}
+        run: df -h "$GITHUB_WORKSPACE"
 
   # The tests are built once and archived, and the shards run the archive. nextest does
   # not run doctests, so they run here.
@@ -252,6 +258,8 @@ jobs:
       # download. nextest reads windows up to 128 MB (--long=27). The server's build script
       # writes a placeholder ui/build, which debug builds read from disk at run time, so the
       # shards get it next to the archive.
+      - name: Disk space before test archive
+        run: df -h "$GITHUB_WORKSPACE"
       - name: Build the test archive
         run: |
           mkdir -p "$RUNNER_TEMP/archive"
@@ -260,6 +268,9 @@ jobs:
           rm "$RUNNER_TEMP/raw.tar.zst"
           ls -l "$RUNNER_TEMP/archive/tests.tar.zst"
           tar -cf "$RUNNER_TEMP/archive/ui-build.tar" ui/build
+      - name: Disk space after test archive
+        if: ${{ always() }}
+        run: df -h "$GITHUB_WORKSPACE"
       - uses: actions/upload-artifact@v4
         with:
           name: nextest-archive
