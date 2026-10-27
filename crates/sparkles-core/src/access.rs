@@ -11,6 +11,7 @@
 //! hidden quads as extra deletions, so every scan, count and index of the engine sees
 //! only the visible triples.
 
+pub mod authority;
 pub mod triples;
 pub use triples::{Caller, Limits, Mask, Protection, Rule, TripleRules};
 

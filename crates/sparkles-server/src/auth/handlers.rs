@@ -260,6 +260,7 @@ async fn login(
     };
     let b_password = b.password.map(Zeroizing::new);
     let b_token = b.token.map(Zeroizing::new);
+    let generation = auth.epoch();
     let policy = auth.policy();
     let now = auth.now();
     let invalid = || failed(json_error(StatusCode::UNAUTHORIZED, "invalid credentials"));
@@ -346,8 +347,17 @@ async fn login(
         Some(id) => format!("token:{id}"),
         None => who.log_name(),
     };
-    let (raw, _) = match auth.sessions.create(method, who, token_id, now, expires) {
+    let (raw, _) = match auth
+        .sessions
+        .create_checked(generation, method, who, token_id, now, expires)
+    {
         Ok(x) => x,
+        Err(e) if e.is::<super::session::SessionGenerationChanged>() => {
+            return json_error(
+                StatusCode::FORBIDDEN,
+                "authorization changed; retry request",
+            );
+        }
         Err(e) => {
             tracing::error!("cannot store the session: {e:#}");
             auth.count_login(method, "error");

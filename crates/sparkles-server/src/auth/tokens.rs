@@ -6,8 +6,10 @@ use super::{Identity, Scope, crypto};
 use anyhow::{Context, Result, bail};
 use parking_lot::Mutex;
 use serde::{Deserialize, Serialize};
+use sparkles::access::authority::AuthorityRegistry;
 use std::collections::{BTreeMap, HashMap};
 use std::path::PathBuf;
+use std::sync::Arc;
 
 /// Links of a token chain (a token minted by a token minted by …).
 pub const MAX_CHAIN: usize = 4;
@@ -66,6 +68,7 @@ struct Inner {
 pub struct TokenStore {
     path: PathBuf,
     inner: Mutex<Inner>,
+    authority: Arc<AuthorityRegistry>,
 }
 
 /// `tok_` and 12 lowercase base32 characters (60 random bits).
@@ -83,7 +86,15 @@ pub fn new_id() -> String {
 
 impl TokenStore {
     /// Open (or start) the store; a corrupt file is an error, never silently reset.
+    #[cfg(test)]
     pub fn open(path: PathBuf) -> Result<TokenStore> {
+        Self::open_with_registry(path, Arc::new(AuthorityRegistry::default()))
+    }
+
+    pub(super) fn open_with_registry(
+        path: PathBuf,
+        authority: Arc<AuthorityRegistry>,
+    ) -> Result<TokenStore> {
         let mut inner = Inner::default();
         match std::fs::read(&path) {
             Ok(bytes) => {
@@ -105,6 +116,7 @@ impl TokenStore {
         Ok(TokenStore {
             path,
             inner: Mutex::new(inner),
+            authority,
         })
     }
 
@@ -173,6 +185,7 @@ impl TokenStore {
     /// not stored.
     pub fn insert_within(&self, rec: TokenRecord, now: i64, max: usize) -> Result<bool> {
         let digest = super::config::parse_token_hash(&rec.hash).context("token hash")?;
+        let _update = self.authority.begin_update();
         let mut inner = self.inner.lock();
         let mut next = inner.clone();
         prune(&mut next, now);
@@ -191,6 +204,7 @@ impl TokenStore {
 
     /// Remove tokens, and the tokens they minted. Returns how many were removed.
     pub fn remove(&self, ids: &[String]) -> Result<usize> {
+        let _update = self.authority.begin_update();
         let mut inner = self.inner.lock();
         let mut gone: Vec<String> = ids.to_vec();
         let mut i = 0;
@@ -231,6 +245,7 @@ impl TokenStore {
         let token = zeroize::Zeroizing::new(super::policy::new_token());
         let hash = super::policy::token_hash(&token);
         let digest = super::config::parse_token_hash(&hash).context("token hash")?;
+        let _update = self.authority.begin_update();
         let mut inner = self.inner.lock();
         let mut next = inner.clone();
         let Some(rec) = next.by_id.get_mut(id).filter(|r| r.expires_at() > now) else {
@@ -248,6 +263,16 @@ impl TokenStore {
     /// Record the groups an OIDC or proxy identity has now in the tokens it owns, so that
     /// their permissions follow the provider. Returns how many tokens changed.
     pub fn refresh_groups(&self, who: &Identity) -> Result<usize> {
+        // Do not invalidate an ordinary provider login when no stored credential
+        // changes. Release this mutex before waiting for the authority updater.
+        if !self.inner.lock().by_id.values().any(|token| {
+            token.owner.kind == who.kind
+                && token.owner.name == who.name
+                && token.owner.groups != who.groups
+        }) {
+            return Ok(0);
+        }
+        let _update = self.authority.begin_update();
         let mut inner = self.inner.lock();
         let mut next = inner.clone();
         let mut n = 0;

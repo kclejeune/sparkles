@@ -93,6 +93,11 @@ Authentication is off by default. Once it is on, access is denied unless a grant
   back-channel logout and optional idle timeouts. API clients can send the provider's JWT
   access tokens, checked against its JWKS with key rotation, and Cloudflare Access
   assertions are verified. Groups map to roles.
+* Requests that overlap a policy or credential change may receive `403` and must
+  retry with current credentials. Token revocation, reissue, session logout and
+  stored group changes invalidate prepared authentication. A password verification
+  that finishes after a reload cannot restore the previous grants in the cache
+  or create a session from them. Last-used bookkeeping does not revoke access.
 * With an OIDC provider and `serve --mcp`, `/$/mcp` is an OAuth 2.1 protected resource
   ([API.md](../API.md#oauth-for-the-mcp-endpoint)). It publishes RFC 9728 metadata that
   names the provider, accepts access tokens whose audience is its own resource

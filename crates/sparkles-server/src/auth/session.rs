@@ -13,8 +13,10 @@ use axum::http::{HeaderMap, HeaderValue, header};
 use base64::Engine;
 use parking_lot::Mutex;
 use serde::{Deserialize, Serialize};
+use sparkles::access::authority::AuthorityRegistry;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 /// Sessions kept at most. When the store is full, the owner that holds the most loses its
@@ -145,9 +147,13 @@ impl SessionRecord {
     /// When the session ends: its absolute expiry, or `idle` seconds after its last use
     /// when that comes first.
     pub fn ends_at(&self, idle: Option<i64>) -> i64 {
+        self.ends_at_with_seen(idle, None)
+    }
+
+    fn ends_at_with_seen(&self, idle: Option<i64>, seen: Option<i64>) -> i64 {
         let abs = self.expires_at();
         match idle {
-            Some(i) => abs.min(self.seen_at().saturating_add(i)),
+            Some(i) => abs.min(seen.unwrap_or_else(|| self.seen_at()).saturating_add(i)),
             None => abs,
         }
     }
@@ -165,6 +171,7 @@ struct SessionFile {
 
 pub struct SessionStore {
     path: PathBuf,
+    authority: Arc<AuthorityRegistry>,
     inner: Mutex<HashMap<[u8; 32], SessionRecord>>,
     /// last use of sessions since the last write (Unix seconds)
     seen: Mutex<HashMap<[u8; 32], i64>>,
@@ -173,6 +180,25 @@ pub struct SessionStore {
     next_seq: AtomicU64,
     /// [`MAX_SESSIONS`] and [`MAX_SESSIONS_PER_OWNER`]
     caps: (usize, usize),
+}
+
+#[derive(Debug)]
+pub(super) struct SessionGenerationChanged;
+impl std::fmt::Display for SessionGenerationChanged {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("authentication changed before session creation")
+    }
+}
+impl std::error::Error for SessionGenerationChanged {}
+
+struct SessionCreation {
+    method: Method,
+    principal: Identity,
+    token_id: Option<String>,
+    now: i64,
+    expires: i64,
+    sid: Option<String>,
+    sub: Option<String>,
 }
 
 /// Drop the oldest session of the owner that holds the most (of those tied, the one
@@ -199,7 +225,16 @@ fn digest_of(id: &str) -> Option<[u8; 32]> {
 }
 
 impl SessionStore {
+    #[cfg(test)]
     pub fn open(path: PathBuf, now: i64) -> Result<SessionStore> {
+        Self::open_with_registry(path, now, Arc::new(AuthorityRegistry::default()))
+    }
+
+    pub(super) fn open_with_registry(
+        path: PathBuf,
+        now: i64,
+        authority: Arc<AuthorityRegistry>,
+    ) -> Result<SessionStore> {
         let mut map = HashMap::new();
         match std::fs::read(&path) {
             Ok(bytes) => {
@@ -224,6 +259,7 @@ impl SessionStore {
         let next = map.values().map(|s| s.seq + 1).max().unwrap_or(0);
         Ok(SessionStore {
             path,
+            authority,
             inner: Mutex::new(map),
             seen: Mutex::new(HashMap::new()),
             id_tokens: Mutex::new(HashMap::new()),
@@ -256,6 +292,7 @@ impl SessionStore {
     }
 
     /// Start a session; returns the raw session id (the cookie value before signing).
+    #[cfg(test)]
     pub fn create(
         &self,
         method: Method,
@@ -267,8 +304,33 @@ impl SessionStore {
         self.create_oidc(method, principal, token_id, now, expires, None, None)
     }
 
-    /// [`create`](Self::create), remembering the provider's `sid` and `sub` of an OIDC
-    /// login for back-channel logout.
+    /// Create from one original successful authentication generation. The
+    /// comparison happens under the same exclusive fence as visible issuance.
+    pub(super) fn create_checked(
+        &self,
+        original_generation: u64,
+        method: Method,
+        principal: Identity,
+        token_id: Option<String>,
+        now: i64,
+        expires: i64,
+    ) -> Result<(String, [u8; 32])> {
+        self.create_session(
+            SessionCreation {
+                method,
+                principal,
+                token_id,
+                now,
+                expires,
+                sid: None,
+                sub: None,
+            },
+            Some(original_generation),
+        )
+    }
+
+    /// Start an OIDC session, remembering the provider's `sid` and `sub` for
+    /// back-channel logout.
     #[allow(clippy::too_many_arguments)]
     pub fn create_oidc(
         &self,
@@ -280,9 +342,37 @@ impl SessionStore {
         sid: Option<String>,
         sub: Option<String>,
     ) -> Result<(String, [u8; 32])> {
+        self.create_session(
+            SessionCreation {
+                method,
+                principal,
+                token_id,
+                now,
+                expires,
+                sid,
+                sub,
+            },
+            None,
+        )
+    }
+
+    fn create_session(
+        &self,
+        input: SessionCreation,
+        original_generation: Option<u64>,
+    ) -> Result<(String, [u8; 32])> {
+        let SessionCreation {
+            method,
+            principal,
+            token_id,
+            now,
+            expires,
+            sid,
+            sub,
+        } = input;
         let raw = crypto::random_token(32);
         let digest = crypto::sha256(raw.as_bytes());
-        let rec = SessionRecord {
+        let mut rec = SessionRecord {
             id: format!("sha256:{}", crypto::hex(&digest)),
             method,
             principal,
@@ -292,9 +382,16 @@ impl SessionStore {
             last_seen: None,
             sid,
             sub,
-            seq: self.next_seq.fetch_add(1, Ordering::Relaxed),
+            seq: 0,
         };
         let (max, per_owner) = self.caps;
+        let update = self.authority.begin_update();
+        if original_generation
+            .is_some_and(|original| original & 1 != 0 || original != update.previous_generation())
+        {
+            return Err(SessionGenerationChanged.into());
+        }
+        rec.seq = self.next_seq.fetch_add(1, Ordering::Relaxed);
         let mut ended = Vec::new();
         let mut map = self.inner.lock();
         map.retain(|_, s| s.expires_at() > now);
@@ -349,6 +446,7 @@ impl SessionStore {
     }
 
     pub fn remove(&self, digest: &[u8; 32]) -> Result<Option<SessionRecord>> {
+        let _update = self.authority.begin_update();
         self.id_tokens.lock().remove(digest);
         self.seen.lock().remove(digest);
         let mut map = self.inner.lock();
@@ -363,6 +461,7 @@ impl SessionStore {
     /// `sid` (of subject `sub` when both are given), or every session of `sub`. Returns
     /// how many ended.
     pub fn end_oidc(&self, sid: Option<&str>, sub: Option<&str>) -> Result<usize> {
+        let _update = self.authority.begin_update();
         let mut map = self.inner.lock();
         let gone: Vec<[u8; 32]> = map
             .iter()
@@ -397,6 +496,14 @@ impl SessionStore {
     /// Record the groups an identity has now in its sessions (an OIDC login refreshed
     /// them). Returns how many sessions changed.
     pub fn refresh_groups(&self, who: &Identity) -> Result<usize> {
+        if !self.inner.lock().values().any(|session| {
+            session.principal.kind == who.kind
+                && session.principal.name == who.name
+                && session.principal.groups != who.groups
+        }) {
+            return Ok(0);
+        }
+        let _update = self.authority.begin_update();
         let mut map = self.inner.lock();
         let mut n = 0;
         for s in map.values_mut() {
@@ -424,16 +531,23 @@ impl SessionStore {
 
     /// Drop expired and idle sessions, and write the times of last use (hourly).
     pub fn prune(&self, now: i64, idle: Option<i64>) -> Result<()> {
+        let removes_session = {
+            let map = self.inner.lock();
+            let seen = self.seen.lock();
+            map.iter().any(|(key, session)| {
+                session.ends_at_with_seen(idle, seen.get(key).copied()) <= now
+            })
+        };
+        // Flushing last use alone does not change rights. Release both store
+        // mutexes before either this flush or waiting for the common updater.
+        if !removes_session {
+            return self.flush();
+        }
+        let _update = self.authority.begin_update();
         let mut map = self.inner.lock();
         let before = map.len();
         let seen = self.seen.lock().clone();
-        map.retain(|k, s| {
-            let mut s = s.clone();
-            if let Some(t) = seen.get(k) {
-                s.last_seen = Some(rfc3339(*t));
-            }
-            s.ends_at(idle) > now
-        });
+        map.retain(|k, s| s.ends_at_with_seen(idle, seen.get(k).copied()) > now);
         if map.len() != before || !seen.is_empty() {
             self.save(&mut map)?;
         }
@@ -498,6 +612,89 @@ impl CookieMode {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn pruning_only_last_seen_does_not_revoke_but_actual_expiry_does() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("sessions.json");
+        let registry = Arc::new(AuthorityRegistry::default());
+        let sessions = SessionStore::open_with_registry(path.clone(), 0, registry.clone()).unwrap();
+        let initial = registry.generation();
+        sessions.prune(100, Some(10)).unwrap();
+        assert_eq!(registry.generation(), initial);
+        assert!(!path.exists());
+        let owner = Identity {
+            kind: super::super::Kind::User,
+            name: "idle-owner".into(),
+            groups: vec![],
+            display_name: None,
+        };
+        let (_, digest) = sessions
+            .create(Method::Password, owner, None, 100, 1000)
+            .unwrap();
+        let accepted = registry.generation();
+        let before = std::fs::read(&path).unwrap();
+        sessions.prune(105, Some(10)).unwrap();
+        assert_eq!(registry.generation(), accepted);
+        assert_eq!(std::fs::read(&path).unwrap(), before);
+        assert!(sessions.get(&digest, 109, Some(10)).is_some());
+        // The unsaved last use keeps this session live past created+idle.
+        sessions.prune(111, Some(10)).unwrap();
+        assert_eq!(registry.generation(), accepted);
+        let saved = std::fs::read(&path).unwrap();
+        assert_ne!(saved, before);
+        let reopened = SessionStore::open(path.clone(), 111).unwrap();
+        assert!(reopened.get(&digest, 118, Some(10)).is_some());
+        drop(reopened);
+        sessions.prune(119, Some(10)).unwrap();
+        assert_ne!(registry.generation(), accepted);
+        assert!(sessions.get(&digest, 119, Some(10)).is_none());
+        let reopened = SessionStore::open(path, 119).unwrap();
+        assert_eq!(reopened.active(119), 0);
+    }
+
+    #[test]
+    fn checked_issuance_rejects_stale_or_changing_authentication_before_mutation() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("sessions.json");
+        let registry = Arc::new(AuthorityRegistry::default());
+        let sessions = SessionStore::open_with_registry(path.clone(), 0, registry.clone())
+            .unwrap()
+            .with_caps(1, 1);
+        let owner = || Identity {
+            kind: super::super::Kind::User,
+            name: "checked-owner".into(),
+            groups: vec![],
+            display_name: None,
+        };
+        let original = registry.generation();
+        let (_, kept) = sessions
+            .create_checked(original, Method::Password, owner(), None, 100, 200)
+            .unwrap();
+        let before = std::fs::read(&path).unwrap();
+        let next_sequence = sessions.next_seq.load(Ordering::Relaxed);
+
+        // The accepted first issuance invalidated this original generation.
+        // At cap=1 an accidental insertion would also evict the existing session.
+        for rejected in [original, registry.generation() + 1] {
+            let error = sessions
+                .create_checked(rejected, Method::Password, owner(), None, 100, 200)
+                .unwrap_err();
+            assert!(error.downcast_ref::<SessionGenerationChanged>().is_some());
+            assert_eq!(std::fs::read(&path).unwrap(), before);
+            assert_eq!(sessions.next_seq.load(Ordering::Relaxed), next_sequence);
+            assert!(sessions.get(&kept, 100, None).is_some());
+            assert_eq!(sessions.active(100), 1);
+        }
+        let current = registry.generation();
+        let (_, replacement) = sessions
+            .create_checked(current, Method::Password, owner(), None, 100, 200)
+            .unwrap();
+        assert!(sessions.get(&kept, 100, None).is_none());
+        assert!(sessions.get(&replacement, 100, None).is_some());
+        let reopened = SessionStore::open(path, 100).unwrap();
+        assert!(reopened.get(&replacement, 100, None).is_some());
+    }
 
     #[test]
     fn keys_cookies_and_store() {

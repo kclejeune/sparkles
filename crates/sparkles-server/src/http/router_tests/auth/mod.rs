@@ -16,6 +16,7 @@ mod cli_grants;
 mod explain;
 #[cfg(feature = "shacl")]
 mod forms;
+mod generation;
 #[cfg(feature = "graphql")]
 mod graphql;
 mod graphrag;

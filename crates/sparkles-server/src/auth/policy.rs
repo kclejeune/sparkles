@@ -636,9 +636,9 @@ impl Drop for Waiting<'_> {
 /// login flows in progress and the password machinery.
 pub struct Auth {
     path: Option<PathBuf>,
-    /// the number of policy reloads; a long-lived read made before ends when it sees a
-    /// new value (spec C22 §6.3)
-    epoch: AtomicU64,
+    /// One registry shared by policy and credential stores. Its atomic generation
+    /// invalidates prepared reads and asynchronous authentication lookups.
+    authority: Arc<sparkles::access::authority::AuthorityRegistry>,
     policy: ArcSwap<Policy>,
     creds: Mutex<Creds>,
     argon: Argon,
@@ -692,8 +692,9 @@ impl Auth {
             .map_err(anyhow::Error::msg)?;
         let cloudflare = parking_lot::RwLock::new(None);
         rebuild_cloudflare(&cloudflare, &policy)?;
+        let authority = Arc::new(sparkles::access::authority::AuthorityRegistry::default());
         Ok(Auth {
-            epoch: AtomicU64::new(0),
+            authority: authority.clone(),
             path: None,
             policy: ArcSwap::from_pointee(policy),
             creds: Mutex::new(Creds::default()),
@@ -706,8 +707,8 @@ impl Auth {
             },
             throttle,
             hmac_key: crypto::random_bytes(32),
-            tokens: TokenStore::open(dir.join("tokens.json"))?,
-            sessions: SessionStore::open(dir.join("sessions.json"), now)?,
+            tokens: TokenStore::open_with_registry(dir.join("tokens.json"), authority.clone())?,
+            sessions: SessionStore::open_with_registry(dir.join("sessions.json"), now, authority)?,
             keys: Keys::load_or_create(&key_file)?,
             oidc,
             cloudflare,
@@ -771,6 +772,7 @@ impl Auth {
                 .context("no configuration file to reload")?;
             let (cfg, warnings) = FileConfig::load(path)?;
             let p = Policy::build(&cfg)?;
+            let _update = self.authority.begin_update();
             self.oidc.reconfigure(&p)?;
             rebuild_cloudflare(&self.cloudflare, &p)?;
             // the throttle keeps its clients' state
@@ -779,8 +781,6 @@ impl Auth {
                 .map_err(anyhow::Error::msg)?;
             self.policy.store(Arc::new(p));
             self.creds.lock().cache.clear();
-            // long-lived reads made under the old policy end (spec C22 §6.3)
-            self.epoch.fetch_add(1, Ordering::SeqCst);
             Ok(warnings)
         })();
         self.metrics.reloads[usize::from(r.is_err())].fetch_add(1, Ordering::Relaxed);
@@ -828,9 +828,10 @@ impl Auth {
         CookieMode { secure }
     }
 
-    /// The number of policy reloads.
+    /// The nonblocking authority generation. Odd values mean a visible rights
+    /// mutation is in progress. Lookup callers require one unchanged even value.
     pub fn epoch(&self) -> u64 {
-        self.epoch.load(Ordering::SeqCst)
+        self.authority.generation()
     }
 
     /// The configured user `name` as a principal, without a credential, for work the
@@ -1334,10 +1335,23 @@ impl Auth {
             scheme: "basic",
             failure,
         };
-        let mut msg = Zeroizing::new(Vec::with_capacity(user.len() + password.len() + 1));
+        // A verification completing after a reload must not repopulate a cache or
+        // single-flight slot that a new-generation request could reuse. Checking
+        // the actual borrowed policy also prevents capturing a new generation for
+        // a policy that authenticate() loaded before the swap.
+        let generation = self.epoch();
+        let current = self.policy.load_full();
+        if generation & 1 != 0
+            || !std::ptr::eq(policy, current.as_ref())
+            || self.epoch() != generation
+        {
+            return Err(err(Failure::Invalid));
+        }
+        let mut msg = Zeroizing::new(Vec::with_capacity(user.len() + password.len() + 9));
         msg.extend_from_slice(user.as_bytes());
         msg.push(0);
         msg.extend_from_slice(password.as_bytes());
+        msg.extend_from_slice(&generation.to_be_bytes());
         let key = crypto::hmac_sha256(&self.hmac_key, &msg);
         let cell = {
             let mut c = self.creds.lock();
@@ -1421,6 +1435,10 @@ impl Auth {
         admission: Option<&Admission>,
         client: Option<&ClientKey>,
     ) -> Result<Option<Principal>, AuthError> {
+        let generation = self.epoch();
+        if generation & 1 != 0 {
+            return Ok(None);
+        }
         if admission.is_some_and(|a| !a.reserve()) {
             return Err(AuthError {
                 scheme: "session",
@@ -1440,8 +1458,13 @@ impl Auth {
             ),
             None => (policy.dummy_hash.clone(), None),
         };
-        self.verify(Zeroizing::new(password.to_string()), phc, principal, client)
-            .await
+        let verified = self
+            .verify(Zeroizing::new(password.to_string()), phc, principal, client)
+            .await?;
+        if self.epoch() != generation {
+            return Ok(None);
+        }
+        Ok(verified)
     }
 
     /// One argon2 run under a permit: `Some(principal)` when the password matches.
@@ -1706,5 +1729,191 @@ mod tests {
         assert!(h.starts_with("$argon2id$v=19$m=8,t=1,p=1$"), "{h}");
         assert!(verify_password(b"pw", &h));
         assert!(!verify_password(b"px", &h));
+    }
+
+    fn epoch_auth() -> (tempfile::TempDir, Auth) {
+        let directory = tempfile::tempdir().unwrap();
+        let config: FileConfig = toml::from_str("version = 1").unwrap();
+        let auth = Auth::from_config(&config, directory.path()).unwrap();
+        (directory, auth)
+    }
+
+    fn epoch_owner() -> Identity {
+        Identity {
+            kind: Kind::User,
+            name: "epoch-owner".into(),
+            groups: vec![],
+            display_name: None,
+        }
+    }
+
+    fn epoch_token(auth: &Auth) -> TokenRecord {
+        TokenRecord {
+            id: "tok_epoch_fixture".into(),
+            name: "epoch fixture".into(),
+            hash: token_hash(&new_token()),
+            owner: epoch_owner(),
+            parent: None,
+            scope: super::super::Scope::all(),
+            created: store::rfc3339(auth.now()),
+            expires: store::rfc3339(auth.now() + 3600),
+            via: "api".into(),
+            client: None,
+            last_used: None,
+        }
+    }
+
+    #[test]
+    fn token_reissue_changes_the_real_auth_epoch_without_policy_reload() {
+        let (_directory, auth) = epoch_auth();
+        let record = epoch_token(&auth);
+        auth.tokens.insert(record.clone(), auth.now()).unwrap();
+        let before = auth.epoch();
+        auth.tokens
+            .reissue(&record.id, auth.now())
+            .unwrap()
+            .unwrap();
+        assert_ne!(
+            auth.epoch(),
+            before,
+            "token reissue must invalidate already authenticated grants"
+        );
+        let stable = auth.epoch();
+        auth.tokens.touch(&record.id, auth.now());
+        assert_eq!(
+            auth.epoch(),
+            stable,
+            "last-used bookkeeping must not revoke authority"
+        );
+    }
+
+    #[test]
+    fn token_revocation_changes_the_real_auth_epoch_without_policy_reload() {
+        let (_directory, auth) = epoch_auth();
+        let record = epoch_token(&auth);
+        auth.tokens.insert(record.clone(), auth.now()).unwrap();
+        let before = auth.epoch();
+        assert_eq!(auth.tokens.remove(&[record.id]).unwrap(), 1);
+        assert_ne!(
+            auth.epoch(),
+            before,
+            "token revocation must invalidate already authenticated grants"
+        );
+    }
+
+    #[test]
+    fn session_logout_changes_the_real_auth_epoch_without_policy_reload() {
+        let (_directory, auth) = epoch_auth();
+        let (_, digest) = auth
+            .sessions
+            .create(
+                Method::Password,
+                epoch_owner(),
+                None,
+                auth.now(),
+                auth.now() + 3600,
+            )
+            .unwrap();
+        let before = auth.epoch();
+        assert!(auth.sessions.remove(&digest).unwrap().is_some());
+        assert_ne!(
+            auth.epoch(),
+            before,
+            "session logout must invalidate already authenticated grants"
+        );
+    }
+
+    #[test]
+    fn unchanged_provider_groups_do_not_revoke_an_ordinary_authentication() {
+        let (_directory, auth) = epoch_auth();
+        let before = auth.epoch();
+        auth.refresh_owner(&epoch_owner());
+        assert_eq!(auth.epoch(), before);
+    }
+
+    #[tokio::test]
+    async fn password_login_completion_after_reload_cannot_issue_old_grants() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("auth-config.toml");
+        let password = hash_password_with("pw", 8, 1, 1).unwrap();
+        let config = |level| {
+            format!(
+                "version = 1\n[[users]]\nname = \"race\"\npassword = {password:?}\n[users.datasets]\nwiki = \"{level}\"\n"
+            )
+        };
+        std::fs::write(&path, config("write")).unwrap();
+        let (auth, _) = Auth::open(&path, directory.path()).unwrap();
+        let auth = Arc::new(auth);
+        let hold = auth.hold_verifications();
+        let old_auth = auth.clone();
+        let old =
+            tokio::spawn(async move { old_auth.check_password("race", "pw", None, None).await });
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while auth.argon_load().1 == 0 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("password login must be queued before reload");
+        std::fs::write(&path, config("read")).unwrap();
+        auth.reload().unwrap();
+        drop(hold);
+        assert!(
+            old.await.unwrap().unwrap().is_none(),
+            "old password completion must not escape as issuable session authority"
+        );
+        let current = auth
+            .check_password("race", "pw", None, None)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(current.level("wiki"), Some(Level::Read));
+    }
+
+    #[tokio::test]
+    async fn old_basic_completion_after_reload_cannot_repopulate_current_grants() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("auth-config.toml");
+        let password = hash_password_with("pw", 8, 1, 1).unwrap();
+        let config = |level| {
+            format!(
+                "version = 1\n[[users]]\nname = \"race\"\npassword = {password:?}\n[users.datasets]\nwiki = \"{level}\"\n"
+            )
+        };
+        std::fs::write(&path, config("write")).unwrap();
+        let (auth, _) = Auth::open(&path, directory.path()).unwrap();
+        let auth = Arc::new(auth);
+        let hold = auth.hold_verifications();
+        let old_auth = auth.clone();
+        let old = tokio::spawn(async move {
+            let policy = old_auth.policy();
+            old_auth.password(&policy, "race", "pw", None, None).await
+        });
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while auth.argon_load().1 == 0 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("old verification must be queued before reload");
+        std::fs::write(&path, config("read")).unwrap();
+        auth.reload().unwrap();
+        drop(hold);
+        let old_principal = old.await.unwrap().unwrap();
+        assert_eq!(
+            old_principal.level("wiki"),
+            Some(Level::Write),
+            "fixture must finish its old-generation verification after reload"
+        );
+        let policy = auth.policy();
+        let current = auth
+            .password(&policy, "race", "pw", None, None)
+            .await
+            .unwrap();
+        assert_eq!(
+            current.level("wiki"),
+            Some(Level::Read),
+            "old Basic completion must not repopulate current-generation grants"
+        );
     }
 }

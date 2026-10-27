@@ -1124,6 +1124,15 @@ async fn enforce(st: &AppState, auth: &super::Auth, mut req: Request, next: Next
         // unmatched: the router's 404, no dataset involved
         return next.run(req).await;
     };
+    // Include every policy-dependent gate, including the local proxy and OAuth
+    // audience checks, in the same before/after authentication handshake.
+    let epoch = st.access_epoch();
+    if epoch & 1 != 0 {
+        return json_error(
+            StatusCode::FORBIDDEN,
+            "authorization changed; retry request",
+        );
+    }
     let policy = auth.policy();
     let realm = policy.realm.as_str();
     let basic = policy.has_users();
@@ -1175,8 +1184,6 @@ async fn enforce(st: &AppState, auth: &super::Auth, mut req: Request, next: Next
         .extensions()
         .get::<crate::ratelimit::ClientAddr>()
         .map(|c| c.0.network());
-    // read before the policy is, so a reload during authentication ends long-lived reads
-    let epoch = st.access_epoch();
     let authed = match auth
         .authenticate(
             req.headers(),
@@ -1271,6 +1278,14 @@ async fn enforce(st: &AppState, auth: &super::Auth, mut req: Request, next: Next
             );
         }
     };
+    // An ordinary query must not attach a post-reload generation to grants from
+    // before the reload. This also covers token/session/group-store changes.
+    if auth.epoch() != epoch {
+        return json_error(
+            StatusCode::FORBIDDEN,
+            "authorization changed; retry request",
+        );
+    }
     // grants are checked on the branch the request chose
     let branch = req
         .extensions()

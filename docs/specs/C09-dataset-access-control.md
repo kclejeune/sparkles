@@ -2150,6 +2150,15 @@ The steps were merged as `acd6da3`. Auth sits behind the default-on `auth` featu
 `sparkles-server`. Without `--auth-config`, the auth layer only inserts the local
 principal.
 
+Policy reloads and token/session authority changes now use one revocation registry.
+Lookups require an unchanged stable generation across authentication, including
+ordinary query and identity routes. Password cache and single-flight keys include
+that generation, so a verification completing after reload cannot refill current
+grants. Password/token session creation checks the original generation under the
+same mutation fence before eviction or persistence. Requests overlapping real
+authority changes are refused for retry. Last-used bookkeeping and unchanged group
+assertions do not advance the generation. Private auth file formats remain unchanged.
+
 **Deviations from the spec.**
 
 - `openidconnect` and `cookie` were not adopted. Sparkles implements the relying party
