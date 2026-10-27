@@ -58,8 +58,8 @@ concurrency:
 env:
   MBX_HTTP_TIMEOUT: 5m
   MBX_GC_MAX_SIZE: 10GiB
-  # Only same-repository PRs may publish to the remote cache.
-  MBX_REMOTE_TRUST_WRITES: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name == github.repository && 'true' || 'false' }}
+  # Permit same-repository PRs and this workflow's release tags to publish.
+  MBX_REMOTE_TRUST_WRITES: ${{ (github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name == github.repository || github.event_name == 'push' && startsWith(github.ref, 'refs/tags/py-v')) && 'true' || 'false' }}
   MATURIN_VERSION: "1.15.0"
   MANIFEST: crates/sparkles-py/Cargo.toml
   # Pushes to main and pull requests build the wheels in the dev profile, which compiles
@@ -92,6 +92,7 @@ jobs:
     runs-on: ${{ matrix.target == 'aarch64' && 'ubuntu-24.04-arm' || 'ubuntu-24.04' }}
     steps:
       - uses: actions/checkout@v5
+        with: { fetch-depth: 2 }
       # The container and host action share one job store. Its object payload
       # includes every binding compilation, independently of target placement.
       - uses: actions-rust-lang/setup-rust-toolchain@v1
@@ -99,7 +100,7 @@ jobs:
       - uses: jdx/mr-boxington-action@v1.7.3
         with:
           # Fork pull requests use GitHub cache because they cannot request an OIDC token.
-          backend: ${{ (github.event_name == 'push' && github.ref == 'refs/heads/main' || github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name == github.repository) && 'remote' || 'github' }}
+          backend: ${{ (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) && 'remote' || 'github' }}
           remote-url: https://mbx.kclj.dev
           namespace: kclejeune/sparkles
           oidc-audience: https://mbx.kclj.dev
@@ -159,6 +160,9 @@ jobs:
           if-no-files-found: error
 
   macos:
+    permissions:
+      contents: read
+      id-token: write
     timeout-minutes: 45
     name: macOS arm64
     # tags and manual runs only
@@ -170,14 +174,16 @@ jobs:
       CARGO_TARGET_DIR: ${{ github.workspace }}/target
     steps:
       - uses: actions/checkout@v5
+        with: { fetch-depth: 2 }
       - uses: actions-rust-lang/setup-rust-toolchain@v1
         with: { cache: false, rustflags: "" }
       - uses: jdx/mr-boxington-action@v1.7.3
         with:
+          backend: remote
+          remote-url: https://mbx.kclj.dev
+          namespace: kclejeune/sparkles
+          oidc-audience: https://mbx.kclj.dev
           version: 1.28.0
-          github-cache-mode: objects
-          cache-generation: sparkles-python-${{ env.PROFILE_ARG }}-v1
-          save-on-workflow-dispatch: ${{ github.ref == 'refs/heads/main' }}
       # This build tool invokes Cargo itself.
       - name: Route build-tool Cargo calls through Boxington
         shell: bash
@@ -208,6 +214,9 @@ jobs:
           if-no-files-found: error
 
   sdist:
+    permissions:
+      contents: read
+      id-token: write
     timeout-minutes: 45
     name: Source distribution
     # tags and manual runs only
@@ -217,14 +226,16 @@ jobs:
       CARGO_TARGET_DIR: ${{ github.workspace }}/target
     steps:
       - uses: actions/checkout@v5
+        with: { fetch-depth: 2 }
       - uses: actions-rust-lang/setup-rust-toolchain@v1
         with: { cache: false, rustflags: "" }
       - uses: jdx/mr-boxington-action@v1.7.3
         with:
+          backend: remote
+          remote-url: https://mbx.kclj.dev
+          namespace: kclejeune/sparkles
+          oidc-audience: https://mbx.kclj.dev
           version: 1.28.0
-          github-cache-mode: objects
-          cache-generation: sparkles-python-sdist-v1
-          save-on-workflow-dispatch: ${{ github.ref == 'refs/heads/main' }}
       # This build tool invokes Cargo itself.
       - name: Route build-tool Cargo calls through Boxington
         shell: bash

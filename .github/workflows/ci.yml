@@ -182,12 +182,13 @@ jobs:
     runs-on: ${{ matrix.platform == 'macos-arm64' && 'macos-15' || matrix.platform == 'linux-arm64' && 'ubuntu-24.04-arm' || 'ubuntu-24.04' }}
     steps:
       - uses: actions/checkout@v5
+        with: { fetch-depth: 2 }
       - uses: actions-rust-lang/setup-rust-toolchain@v1
         with: { cache: false, rustflags: "" }
       - uses: jdx/mr-boxington-action@v1.7.3
         with:
           # Fork pull requests use GitHub cache because they cannot request an OIDC token.
-          backend: ${{ (github.event_name == 'push' && github.ref == 'refs/heads/main' || github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name == github.repository) && 'remote' || 'github' }}
+          backend: ${{ (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) && 'remote' || 'github' }}
           remote-url: https://mbx.kclj.dev
           namespace: kclejeune/sparkles
           oidc-audience: https://mbx.kclj.dev
@@ -227,8 +228,13 @@ jobs:
     if: needs.changes.outputs.rust == 'true'
     timeout-minutes: 45
     runs-on: ubuntu-24.04
+    env:
+      # The archive build exceeds the shared 10 GiB remote download allowance.
+      MBX_GC_MAX_SIZE: 30GiB
+      MBX_GC_MIN_FREE_SIZE: 10GiB
     steps:
       - uses: actions/checkout@v5
+        with: { fetch-depth: 2 }
       - uses: actions-rust-lang/setup-rust-toolchain@v1
         with: { cache: false, rustflags: "" }
       # The test build can exceed the runner's physical memory.
@@ -243,7 +249,7 @@ jobs:
       - uses: jdx/mr-boxington-action@v1.7.3
         with:
           # Fork pull requests use GitHub cache because they cannot request an OIDC token.
-          backend: ${{ (github.event_name == 'push' && github.ref == 'refs/heads/main' || github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name == github.repository) && 'remote' || 'github' }}
+          backend: ${{ (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) && 'remote' || 'github' }}
           remote-url: https://mbx.kclj.dev
           namespace: kclejeune/sparkles
           oidc-audience: https://mbx.kclj.dev
@@ -358,6 +364,7 @@ jobs:
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v5
+        with: { fetch-depth: 2 }
       - uses: actions-rust-lang/setup-rust-toolchain@v1
         with: { cache: false, rustflags: "" }
       # The test build can exceed the runner's physical memory.
@@ -372,7 +379,7 @@ jobs:
       - uses: jdx/mr-boxington-action@v1.7.3
         with:
           # Fork pull requests use GitHub cache because they cannot request an OIDC token.
-          backend: ${{ (github.event_name == 'push' && github.ref == 'refs/heads/main' || github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name == github.repository) && 'remote' || 'github' }}
+          backend: ${{ (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) && 'remote' || 'github' }}
           remote-url: https://mbx.kclj.dev
           namespace: kclejeune/sparkles
           oidc-audience: https://mbx.kclj.dev
@@ -426,6 +433,9 @@ jobs:
   # Linux arm64 and macOS on Apple silicon, for a manual run with all-platforms checked:
   # one job per platform that builds and runs the tests, with the conformance suites.
   other-platforms:
+    permissions:
+      contents: read
+      id-token: write
     name: Test (${{ matrix.platform }})
     if: inputs.all-platforms
     timeout-minutes: 75
@@ -436,6 +446,7 @@ jobs:
     runs-on: ${{ matrix.platform == 'macos-arm64' && 'macos-15' || 'ubuntu-24.04-arm' }}
     steps:
       - uses: actions/checkout@v5
+        with: { fetch-depth: 2 }
       - uses: actions-rust-lang/setup-rust-toolchain@v1
         with: { cache: false, rustflags: "" }
       # The test build can exceed the runner's physical memory.
@@ -449,9 +460,11 @@ jobs:
           sudo swapon /swapfile-ci
       - uses: jdx/mr-boxington-action@v1.7.3
         with:
+          backend: remote
+          remote-url: https://mbx.kclj.dev
+          namespace: kclejeune/sparkles
+          oidc-audience: https://mbx.kclj.dev
           version: 1.28.0
-          cache-generation: sparkles-tests-${{ matrix.platform }}-v1
-          save-on-workflow-dispatch: ${{ github.ref == 'refs/heads/main' }}
       - uses: taiki-e/install-action@v2
         with:
           tool: cargo-nextest@${{ env.NEXTEST_VERSION }}

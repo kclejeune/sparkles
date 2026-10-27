@@ -49,8 +49,8 @@ concurrency:
 env:
   MBX_HTTP_TIMEOUT: 5m
   MBX_GC_MAX_SIZE: 10GiB
-  # Only same-repository PRs may publish to the remote cache.
-  MBX_REMOTE_TRUST_WRITES: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name == github.repository && 'true' || 'false' }}
+  # Permit same-repository PRs and this workflow's release tags to publish.
+  MBX_REMOTE_TRUST_WRITES: ${{ (github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name == github.repository || github.event_name == 'push' && startsWith(github.ref, 'refs/tags/jvm-v')) && 'true' || 'false' }}
   # Pushes to main and pull requests build the bindings in the dev profile, which compiles
   # far faster than the release profile's thin LTO; tags and manual runs build what would
   # be published.
@@ -76,6 +76,7 @@ jobs:
       MACOSX_DEPLOYMENT_TARGET: "11.0"
     steps:
       - uses: actions/checkout@v5
+        with: { fetch-depth: 2 }
       - uses: actions/setup-java@v5
         with: { distribution: temurin, java-version: "17" }
       # saves Gradle's caches from main only, by default
@@ -85,7 +86,7 @@ jobs:
       - uses: jdx/mr-boxington-action@v1.7.3
         with:
           # Fork pull requests use GitHub cache because they cannot request an OIDC token.
-          backend: ${{ (github.event_name == 'push' && github.ref == 'refs/heads/main' || github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name == github.repository) && 'remote' || 'github' }}
+          backend: ${{ (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) && 'remote' || 'github' }}
           remote-url: https://mbx.kclj.dev
           namespace: kclejeune/sparkles
           oidc-audience: https://mbx.kclj.dev
@@ -138,6 +139,7 @@ jobs:
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v5
+        with: { fetch-depth: 2 }
       - uses: actions/setup-java@v5
         with: { distribution: temurin, java-version: "17" }
       # saves Gradle's caches from main only, by default
@@ -147,7 +149,7 @@ jobs:
       - uses: jdx/mr-boxington-action@v1.7.3
         with:
           # Fork pull requests use GitHub cache because they cannot request an OIDC token.
-          backend: ${{ (github.event_name == 'push' && github.ref == 'refs/heads/main' || github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name == github.repository) && 'remote' || 'github' }}
+          backend: ${{ (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) && 'remote' || 'github' }}
           remote-url: https://mbx.kclj.dev
           namespace: kclejeune/sparkles
           oidc-audience: https://mbx.kclj.dev
@@ -174,7 +176,8 @@ jobs:
       contents: read
       id-token: write
     timeout-minutes: 30
-    needs: jars
+    needs: natives
+    if: github.event_name != 'push' || github.ref_type == 'tag'
     runs-on: ubuntu-24.04
     strategy:
       fail-fast: false
@@ -184,6 +187,7 @@ jobs:
           - { java: "21", jena: "6.2.0" }
     steps:
       - uses: actions/checkout@v5
+        with: { fetch-depth: 2 }
       - uses: actions/setup-java@v5
         with: { distribution: temurin, java-version: "${{ matrix.java }}" }
       # saves Gradle's caches from main only, by default
@@ -193,7 +197,7 @@ jobs:
       - uses: jdx/mr-boxington-action@v1.7.3
         with:
           # Fork pull requests use GitHub cache because they cannot request an OIDC token.
-          backend: ${{ (github.event_name == 'push' && github.ref == 'refs/heads/main' || github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name == github.repository) && 'remote' || 'github' }}
+          backend: ${{ (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) && 'remote' || 'github' }}
           remote-url: https://mbx.kclj.dev
           namespace: kclejeune/sparkles
           oidc-audience: https://mbx.kclj.dev
@@ -210,6 +214,9 @@ jobs:
           ./gradlew --no-daemon --console=plain -Psparkles.nativeDir=../target/jvm/natives -Psparkles.javaVersion=${{ matrix.java }} -Psparkles.jenaVersion=${{ matrix.jena }} :sparkles-jena:test :sample-java:build
 
   publish:
+    permissions:
+      contents: read
+      id-token: write
     timeout-minutes: 30
     if: startsWith(github.ref, 'refs/tags/jvm-v') && vars.MAVEN_PUBLISH == 'true'
     needs: [jars, compatibility]
@@ -217,6 +224,7 @@ jobs:
     environment: maven
     steps:
       - uses: actions/checkout@v5
+        with: { fetch-depth: 2 }
       - uses: actions/setup-java@v5
         with: { distribution: temurin, java-version: "17" }
       # saves Gradle's caches from main only, by default
@@ -225,10 +233,11 @@ jobs:
         with: { cache: false, rustflags: "" }
       - uses: jdx/mr-boxington-action@v1.7.3
         with:
+          backend: remote
+          remote-url: https://mbx.kclj.dev
+          namespace: kclejeune/sparkles
+          oidc-audience: https://mbx.kclj.dev
           version: 1.28.0
-          github-cache-mode: objects
-          cache-generation: sparkles-jvm-bindgen-v1
-          save-on-workflow-dispatch: ${{ github.ref == 'refs/heads/main' }}
       - uses: actions/download-artifact@v4
         with: { pattern: "jvm-native-*", path: target/jvm/natives, merge-multiple: true }
       # Maven Central through the Central Portal's OSSRH Staging API: Gradle deploys the

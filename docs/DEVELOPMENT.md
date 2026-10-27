@@ -660,9 +660,10 @@ leaving out those crates' tests, benches and examples. Such a run builds the bin
 the dev profile and tests it on Linux x86_64 only, in one job. The Node workflow also
 tracks the default-feature server and its dependencies for the remote client test. Shared
 core patch fixtures also trigger the Python wheel tests that read them. Pull requests also run
-the JVM compatibility matrix. Release tags and manual runs build and test every platform
-in the release profile. Every job has a timeout, so a hung job stops instead of running
-for GitHub's default six hours.
+the JVM compatibility matrix. The matrix and JAR assembly run in parallel after the native
+artifacts are available. Release tags and manual runs build and test every platform in the
+release profile. Every job has a timeout, so a hung job stops instead of running for GitHub's
+default six hours.
 
 Jena 6 removed the query builder's initial-binding API. Its compatibility run skips
 that API's test, and the Jena 5 run keeps it. The remaining small-query tests run on both
@@ -674,30 +675,30 @@ Pushes and pull requests do not start Nix jobs. The [Nix](#nix) section describe
 
 ### Caches
 
-GitHub Actions restores Rust build state with the pinned
-`jdx/mr-boxington-action`. Each workflow installs the toolchain from
-`rust-toolchain.toml` with `actions-rust-lang/setup-rust-toolchain`, then calls the
-Boxington action directly. Native build commands and shell build scripts call
-`mbx` directly. Maturin and napi builds use the supported Cargo shim because those
-tools invoke Cargo themselves. Root-workspace jobs use the action's Cargo target payload.
-Jobs building binding workspaces or using explicit targets use its object payload,
-which captures the completed builds across those workspaces. The action owns cache
-keys, restore and save. Its target payload includes Cargo downloads, while object
-jobs let Cargo download dependencies again. There is no separate Cargo download
-cache or Swatinem or sccache layer.
+GitHub Actions installs the pinned `jdx/mr-boxington-action` after the toolchain from
+`rust-toolchain.toml`. Main pushes, same-repository pull requests, release tags and manual
+runs use the remote cache in the `kclejeune/sparkles` namespace. The cache server uses
+GitHub OIDC and grants writes to main pushes, same-repository pull requests and tag pushes.
+The binding workflows enable tag writes only for their release-tag prefixes. The server
+matches claims exactly, so its tag grant covers every tag push in the repository. Manual
+runs read the remote cache without publishing. Fork pull requests use GitHub Actions
+cache instead, since they cannot request the OIDC token. This is a backend selection at
+job start, not automatic failover if the remote cache becomes unavailable.
 
-The Linux wheel and Alpine addon containers install the same pinned Boxington
-version from checksum-verified portable binaries. They mount their host job's
-store, use a separate compiler-shim directory, and contribute to that job's object
-export group. Container-built files are returned to the runner's ownership before
-the action exports them. Alpine keeps separate Rustup and pnpm download caches.
+Cache-backed checkouts fetch two commits so Boxington can borrow predictions from the base
+commit of a pull request when the lockfile changes. Native build commands and shell build
+scripts call `mbx` directly. Maturin and napi builds use the supported Cargo shim because
+those tools invoke Cargo themselves. The GitHub cache fallback carries a Cargo target
+payload for root-workspace jobs and an object payload for binding workspaces or explicit
+targets. The target payload includes Cargo downloads, while object jobs let Cargo download
+dependencies again. There is no separate Cargo download cache or Swatinem or sccache layer.
 
-Compiler cache entries are scoped by operating system, architecture, Rust identity
-and job contract. Successful pushes and explicitly allowed manual runs on `main` populate them.
-Pull requests restore them without saving. GitHub keeps a 10 GB repository cache budget,
-so cache sizes and restore, build and save durations need to be checked in actual
-CI runs. A first run of the new action starts a new cache series. Existing build
-timing does not establish the new action's performance.
+The Linux wheel and Alpine addon containers install the pinned Boxington version from
+checksum-verified portable binaries. They mount their host job's store and use a separate
+compiler-shim directory. The Linux wheel forwards the remote settings and OIDC credentials
+when its job uses the remote cache. The Alpine addon uses the remote cache for release and
+manual runs. Container-built files are returned to the runner's ownership before any GitHub
+cache export. Alpine keeps separate Rustup and pnpm download caches.
 
 Local builds use Boxington's default learned incremental reuse and managed targets.
 CI uses Boxington's CI defaults, which disable learned and Cargo incremental reuse
@@ -717,8 +718,8 @@ a check. Raw benchmark evidence still needs to be retained in its immutable reco
 before temporary build data is collected.
 
 Gradle and pnpm retain their existing caches. Hermetic Nix builds retain their
-Crane dependency artifacts and Nix binary caches. CI builds carry no debug
-information through `CARGO_PROFILE_DEV_DEBUG=0`, and the largest test build retains
+Crane dependency artifacts and Nix binary caches. The dev profile keeps line tables for
+workspace crates and disables dependency debug information. The largest test build retains
 16 GB of swap in addition to the runner's RAM.
 
 ## Releases
