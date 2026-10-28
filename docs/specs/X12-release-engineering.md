@@ -633,7 +633,27 @@ capabilities and remaining work are described by the spec status and Outcome.
 
 ## Outcome
 
-Phases 1 and 2 are not built. Phase 4a supplies HTTP and standard CLI development-baseline guards. The rest of Phase 4 remains incomplete. See [ROADMAP](../ROADMAP.md) items 58–60.
+Phase 1 has an unpublished GNU x86_64 candidate pipeline. Its platform and installed
+runtime acceptance remain unverified. Unified release versions, publishing,
+attestations, the other Phase 1 server targets and verbose build information remain
+open. Phase 2 is not built. Phase 4a supplies HTTP and standard CLI development-baseline
+guards, and the rest of Phase 4 remains incomplete. See [ROADMAP](../ROADMAP.md) items 58–60.
+
+### Phase 1 candidate packaging
+
+`scripts/server-artifact.py` assembles the default-feature server with a required
+production UI and formatter Wasm, generated man pages, shell completions and OpenAPI,
+both third-party notices, debug symbols and checksums. It rejects incompatible ELF
+requirements and verifies archive contents before extraction. Build records are
+unsigned metadata and do not provide artifact attestations.
+
+`server-artifacts.yml` defines a pinned manylinux 2.28 build and separate installed
+smoke jobs on pinned Rocky Linux 8 and Debian 11 images. The smoke controller checks
+readiness, exact SELECT and ASK answers, writes and reopening a persistent dataset,
+using only the extracted distribution and a new data directory. No baseline build
+or runtime acceptance result is recorded for this tranche. The remaining Linux,
+macOS and Windows targets, container images, registry installation and release
+orchestration remain open. The candidate workflow publishes no release or image.
 
 ### Phase 3 (2026-10-13)
 

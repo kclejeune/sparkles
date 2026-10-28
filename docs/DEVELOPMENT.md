@@ -788,6 +788,61 @@ until someone presses Publish. Set the variable `MAVEN_PUBLISHING_TYPE` to `auto
 to release them as soon as they validate. Artifacts on Maven Central can never be
 changed or deleted, so check a deployment in the Portal before you release it.
 
+### Server artifact candidates
+
+The build-only `server-artifacts.yml` workflow defines one unpublished GNU x86_64
+candidate. It runs UI, formatter Wasm and the default-feature Rust release build
+sequentially in one pinned manylinux 2.28 job container. Boxington 1.28.0 manages the
+workspace target and routes child Cargo calls through its shims. Separate smoke jobs
+download the archive and start its extracted binary in pinned Rocky Linux 8 and
+Debian 11 images, without the checkout or host libraries. No release, image, registry
+package or cryptographic attestation is published.
+
+The image digests in `scripts/server-artifact-images.json` identify the builder and
+clean runtimes. Update a digest only after reading its official registry metadata and
+repeating baseline and installed acceptance. A GNU candidate must use only the
+baseline system libraries, have no runtime search path and require no GLIBC version
+newer than 2.28. A Nix or Forge binary does not establish that baseline. The default
+OCR and embedding features remain enabled, while model execution requires separate
+configuration and is outside the installed query smoke.
+
+The following packaging regressions compile nothing and run no container.
+
+```sh
+mise run test:server-artifact
+```
+
+Inside the pinned builder job container, run the following command with
+`SPARKLES_ARTIFACT_BUILDER_IMAGE` set to that exact image reference. The source tree
+must be committed and clean, and the output directory must be new.
+
+```sh
+mise run server:artifact -- .artifacts/server-candidate
+```
+
+The archive contains generated documentation, both license notices and an unsigned
+build record. `SHA256SUMS` covers the archive, separate debug archive and external
+records. The packer checks the GNU debug link against the separate debug file before
+assembly. A checksum proves file integrity relative to its checksum file, without
+proving who built it. Effective feature reporting in `--version` remains open.
+
+Pull the runtime image named by the checked-in pins separately. Then run the smoke
+with the archive, checksum file, exact version, runtime key and a new output directory.
+The controller never builds or pulls an image. It verifies the checksum before
+extraction, uses an unprivileged container with a read-only distribution and a new
+writable data directory, and removes its containers even after startup failures.
+
+```sh
+mise run server:artifact:smoke -- \
+  .artifacts/server-candidate/sparkles-0.1.0-x86_64-unknown-linux-gnu.tar.gz \
+  .artifacts/server-candidate/SHA256SUMS 0.1.0 rocky8 .artifacts/server-smoke-rocky8
+```
+
+Repeat with `debian11` and a separate output directory. The receipts record the image
+digest, source commit, archive checksum and result. These commands define acceptance
+gates whose actual baseline and runtime evidence is pending. The wider platform
+matrix, signed provenance and published artifacts remain item 59 work.
+
 ## Engineering invariants
 
 ### Changing an on-disk format

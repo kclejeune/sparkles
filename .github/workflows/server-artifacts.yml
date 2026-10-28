@@ -1,0 +1,118 @@
+# Unpublished GNU x86_64 candidates. No registry/release/tag operations.
+name: Server artifact candidates
+
+on:
+  push:
+    branches: [main]
+    paths: &paths
+      - '.github/workflows/server-artifacts.yml'
+      - 'scripts/server-artifact*'
+      - 'scripts/server-installed-smoke.py'
+      - 'scripts/cargo-sparkles-task'
+      - 'scripts/build-fmt-wasm.sh'
+      - 'scripts/bench-tests/test_server_artifact.py'
+      - 'crates/**'
+      - 'vendor/**'
+      - 'ui/**'
+      - 'Cargo.toml'
+      - 'Cargo.lock'
+      - 'rust-toolchain.toml'
+      - 'mise.toml'
+      - 'LICENSE'
+      - 'THIRD_PARTY_LICENSES*.md'
+      - 'docs/openapi.json'
+  pull_request:
+    paths: *paths
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: server-artifacts-${{ github.ref }}-${{ github.ref == 'refs/heads/main' && github.run_id || 'latest' }}
+  cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
+
+env:
+  MBX_HTTP_TIMEOUT: 5m
+  MBX_GC_MAX_SIZE: 10GiB
+  MBX_REMOTE_TRUST_WRITES: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name == github.repository && 'true' || 'false' }}
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90
+    permissions:
+      contents: read
+      id-token: write
+    # UI, Wasm and Rust use one workspace and one managed target in this container.
+    container:
+      image: quay.io/pypa/manylinux_2_28_x86_64@sha256:e0adf18521ad35192df733a6c62d35df7801957d24e0470238aacecfab2188a3
+    defaults:
+      run:
+        shell: bash
+    env:
+      CARGO_BUILD_JOBS: '2'
+      SPARKLES_ARTIFACT_BUILDER_IMAGE: quay.io/pypa/manylinux_2_28_x86_64@sha256:e0adf18521ad35192df733a6c62d35df7801957d24e0470238aacecfab2188a3
+    steps:
+      - uses: actions/checkout@v5
+        with: {persist-credentials: false}
+      - name: Use the builder's Python 3.13
+        run: echo /opt/python/cp313-cp313/bin >> "$GITHUB_PATH"
+      - uses: actions-rust-lang/setup-rust-toolchain@v1
+        with: {cache: false, rustflags: ''}
+      - uses: jdx/mise-action@v5
+        with:
+          install_args: node pnpm mr-boxington
+      - uses: jdx/mr-boxington-action@v1.7.3
+        with:
+          backend: ${{ (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) && 'remote' || 'github' }}
+          remote-url: https://mbx.kclj.dev
+          namespace: kclejeune/sparkles
+          oidc-audience: https://mbx.kclj.dev
+          version: 1.28.0
+          github-cache-mode: objects
+          cache-generation: sparkles-server-manylinux228-release-v1
+          save-on-workflow-dispatch: ${{ github.ref == 'refs/heads/main' }}
+      - name: Packaging regressions without compilation
+        run: python3 -m unittest discover -s scripts/bench-tests -p test_server_artifact.py
+      - name: Build and assemble the default-feature candidate
+        run: mise run server:artifact -- .artifacts/server-candidate
+      - uses: actions/upload-artifact@v4
+        with:
+          name: server-candidate-x86_64-unknown-linux-gnu
+          path: .artifacts/server-candidate/*
+          if-no-files-found: error
+
+  installed:
+    needs: build
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    strategy:
+      fail-fast: false
+      matrix:
+        runtime: [rocky8, debian11]
+    steps:
+      - uses: actions/checkout@v5
+        with: {persist-credentials: false}
+      - uses: actions/download-artifact@v4
+        with:
+          name: server-candidate-x86_64-unknown-linux-gnu
+          path: .artifacts/server-candidate
+      - name: Pull the pinned clean runtime and test the installed archive
+        shell: bash
+        env:
+          RUNTIME: ${{ matrix.runtime }}
+        run: |
+          image=$(python3 -c 'import json,os; print(json.load(open("scripts/server-artifact-images.json"))["runtimes"][os.environ["RUNTIME"]])')
+          docker pull --platform=linux/amd64 "$image"
+          version=$(python3 -c 'import tomllib; print(tomllib.load(open("Cargo.toml","rb"))["workspace"]["package"]["version"])')
+          python3 scripts/server-installed-smoke.py \
+            --archive ".artifacts/server-candidate/sparkles-$version-x86_64-unknown-linux-gnu.tar.gz" \
+            --checksums .artifacts/server-candidate/SHA256SUMS \
+            --version "$version" --runtime "$RUNTIME" --out ".artifacts/smoke-$RUNTIME"
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: installed-server-${{ matrix.runtime }}
+          path: .artifacts/smoke-${{ matrix.runtime }}
+          if-no-files-found: error
