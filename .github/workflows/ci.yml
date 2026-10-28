@@ -229,9 +229,9 @@ jobs:
     timeout-minutes: 45
     runs-on: ubuntu-24.04
     env:
-      # The archive build exceeds the shared 10 GiB remote download allowance.
+      # Keep the archive build's remote download allowance above the shared 10 GiB.
       MBX_GC_MAX_SIZE: 30GiB
-      MBX_GC_MIN_FREE_SIZE: 10GiB
+      MBX_GC_MIN_FREE_SIZE: 5GiB
     steps:
       - uses: actions/checkout@v5
         with: { fetch-depth: 2 }
