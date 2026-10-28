@@ -8,6 +8,7 @@ import subprocess
 import tempfile
 
 MBX_VERSION = "1.28.0"
+CARGO_EXECUTABLE = re.compile(r"build[-_]script[-_][A-Za-z0-9_]+(?:-[0-9a-f]+)?")
 LAUNCHER = re.compile(
     rb'\A#!/bin/sh\nMBX_BUILD_SCRIPT_SHIM_PATH="\$0" exec '
     rb'"\$\(dirname "\$0"\)/(?P<relative>\.\./\.\./\.mbx-build-script-shims/'
@@ -25,8 +26,7 @@ def repair_launchers(target, binary):
     if not target.is_dir():
         raise ValueError("Swatinem must own an ordinary target directory")
     target = target.resolve()
-    destinations = set()
-    launchers = 0
+    candidates = set()
     for root, directories, files in os.walk(target, followlinks=False):
         root = Path(root)
         # Cargo profile/build directories and the helper tree must be ordinary paths.
@@ -40,35 +40,47 @@ def repair_launchers(target, binary):
                 or name in ("build", ".mbx-build-script-shims")
             ):
                 raise ValueError(f"Unexpected symlink at a cached build-script directory: {path}")
-        for name in files:
-            if not name.endswith(".mbx-real"):
-                continue
-            real = root / name
-            launcher = real.with_name(name.removesuffix(".mbx-real"))
-            if real.is_symlink() or launcher.is_symlink():
-                raise ValueError("Unexpected symlink at a cached build-script executable")
-            if not real.is_file() or not launcher.is_file():
-                raise ValueError(f"Missing cached build-script executable pair: {real}")
-            if launcher.parent.parent.name != "build":
-                raise ValueError(f"Unsupported cached build-script layout: {launcher}")
-            # A supported launcher is tiny. Never read arbitrary binaries into memory.
-            with launcher.open("rb") as stream:
-                data = stream.read(4097)
-            match = LAUNCHER.fullmatch(data)
-            if not match:
-                raise ValueError(f"Unsupported cached build-script launcher: {launcher}")
-            lexical = launcher.parent / match["relative"].decode("ascii")
-            destination = lexical.resolve()
-            if not destination.is_relative_to(target):
-                raise ValueError("Cached helper path escapes target")
-            # Refuse even internal symlinks rather than replacing their destinations.
-            normalized = Path(os.path.abspath(lexical))
-            if destination != normalized or destination.is_symlink():
-                raise ValueError("Unexpected symlink at a cached helper path")
-            if destination.exists() and not destination.is_file():
-                raise ValueError(f"Unsupported cached helper destination: {destination}")
-            destinations.add(destination)
-            launchers += 1
+        # Discover both sides: an orphan launcher has no .mbx-real name to find.
+        # Cargo's executable names exclude sidecars and nested generated outputs.
+        if root.parent.name == "build":
+            candidates.update(
+                root / name for name in files + directories if CARGO_EXECUTABLE.fullmatch(name)
+            )
+        candidates.update(
+            root / name.removesuffix(".mbx-real") for name in files if name.endswith(".mbx-real")
+        )
+    destinations = set()
+    launchers = 0
+    for launcher in sorted(candidates):
+        real = launcher.with_name(launcher.name + ".mbx-real")
+        if real.is_symlink() or launcher.is_symlink():
+            raise ValueError("Unexpected symlink at a cached build-script executable")
+        if not launcher.is_file():
+            raise ValueError(f"Missing cached build-script executable pair: {launcher}")
+        if launcher.parent.parent.name != "build":
+            raise ValueError(f"Unsupported cached build-script layout: {launcher}")
+        # Read only enough to recognize a native ELF or the tiny supported launcher.
+        with launcher.open("rb") as stream:
+            data = stream.read(4097)
+        if not real.exists() and data.startswith(b"\x7fELF"):
+            continue
+        if not real.is_file():
+            raise ValueError(f"Missing cached build-script executable pair: {real}")
+        match = LAUNCHER.fullmatch(data)
+        if not match:
+            raise ValueError(f"Unsupported cached build-script launcher: {launcher}")
+        lexical = launcher.parent / match["relative"].decode("ascii")
+        destination = lexical.resolve()
+        if not destination.is_relative_to(target):
+            raise ValueError("Cached helper path escapes target")
+        # Refuse even internal symlinks rather than replacing their destinations.
+        normalized = Path(os.path.abspath(lexical))
+        if destination != normalized or destination.is_symlink():
+            raise ValueError("Unexpected symlink at a cached helper path")
+        if destination.exists() and not destination.is_file():
+            raise ValueError(f"Unsupported cached helper destination: {destination}")
+        destinations.add(destination)
+        launchers += 1
     # Validate every launcher before changing anything. Replacing a copied inode also
     # avoids overwriting a cached helper that is hard-linked to another store entry.
     for destination in sorted(destinations):

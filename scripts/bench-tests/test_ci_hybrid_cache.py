@@ -1,5 +1,6 @@
 """No-build contracts for the hosted hybrid dependency cache and mbx launcher repair."""
 import importlib.util
+import io
 import json
 import os
 from pathlib import Path
@@ -8,6 +9,7 @@ import subprocess
 import sys
 import tempfile
 import unittest
+from unittest.mock import patch
 
 ROOT = Path(__file__).resolve().parents[2]
 SPEC = importlib.util.spec_from_file_location("cache_rehydrate", ROOT / "scripts/ci-cache-rehydrate.py")
@@ -96,6 +98,90 @@ class RestoredBuildScripts(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "Missing"):
             self.repair()
         self.assertFalse(self.helper.exists())
+
+    def test_supported_orphan_launcher_is_refused_for_all_cargo_names(self):
+        for name in ("build_script_build", "build-script-build", "build_script_build-0123456789abcdef",
+                     "build-script-build-0123456789abcdef", "build_script_custom_build"):
+            with self.subTest(name=name):
+                path = self.launcher()
+                path.with_name(path.name + ".mbx-real").unlink()
+                orphan = path.with_name(name)
+                path.rename(orphan)
+                with self.assertRaisesRegex(ValueError, "Missing"):
+                    self.repair()
+                self.assertFalse(self.helper.exists())
+                orphan.unlink()
+
+    def test_malformed_orphan_refuses_mixed_target_before_publishing_any_helper(self):
+        # The valid pair sorts first, so publication inside validation would fail.
+        self.launcher("aaa-valid-123")
+        orphan = self.launcher("zzz-orphan-456")
+        orphan.with_name(orphan.name + ".mbx-real").unlink()
+        marker = self.root / "must-not-exist"
+        for content in (f'#!/bin/sh\ntouch {marker}\n'.encode(), b"\xff", b"x" * 4097):
+            with self.subTest(content=content[:80]):
+                orphan.write_bytes(content)
+                with self.assertRaises(ValueError):
+                    self.repair()
+                self.assertFalse(self.helper.exists())
+                self.assertFalse(marker.exists())
+
+    def test_orphan_launcher_symlinks_are_refused_without_following_them(self):
+        path = self.launcher()
+        path.with_name(path.name + ".mbx-real").unlink()
+        path.unlink()
+        for destination in (self.binary, self.root / "absent", self.root):
+            with self.subTest(destination=destination):
+                path.symlink_to(destination)
+                try:
+                    with self.assertRaisesRegex(ValueError, "symlink"):
+                        self.repair()
+                    self.assertFalse(self.helper.exists())
+                finally:
+                    path.unlink()
+
+    def test_directory_at_cargo_executable_path_is_refused(self):
+        path = self.launcher()
+        path.with_name(path.name + ".mbx-real").unlink()
+        path.unlink()
+        path.mkdir()
+        with self.assertRaisesRegex(ValueError, "executable"):
+            self.repair()
+        self.assertFalse(self.helper.exists())
+
+    def test_native_elf_without_private_pair_and_nonexecutable_outputs_are_valid(self):
+        path = self.launcher()
+        path.with_name(path.name + ".mbx-real").unlink()
+        path.write_bytes(b"\x7fELF" + b"native executable fixture" * 4096)
+        for name in ("build_script_build-0123456789abcdef.d", "build_script_build.mbx-action", "output", "stderr"):
+            path.with_name(name).write_bytes(b"not an mbx launcher")
+        output = path.parent / "out/build_script_build"
+        output.parent.mkdir()
+        output.write_bytes(b"generated output, not a Cargo launcher")
+        before = (path.read_bytes(), path.stat().st_mtime_ns)
+        self.assertEqual(self.repair(), {"launchers": 0, "helpers": 0})
+        self.assertEqual(before, (path.read_bytes(), path.stat().st_mtime_ns))
+        self.assertFalse(self.helper.exists())
+
+    def test_candidate_reads_are_bounded_for_native_and_mbx_executables(self):
+        class BoundedReader(io.BytesIO):
+            def read(self, size=-1):
+                if not 0 <= size <= 4097:
+                    raise AssertionError(f"Unbounded cached executable read: {size}")
+                self.requests.append(size)
+                return super().read(size)
+
+        for native in (False, True):
+            with self.subTest(native=native):
+                path = self.launcher()
+                if native:
+                    path.with_name(path.name + ".mbx-real").unlink()
+                    path.write_bytes(b"\x7fELF" + b"x" * 8192)
+                stream = BoundedReader(path.read_bytes())
+                stream.requests = []
+                with patch.object(Path, "open", return_value=stream):
+                    self.repair()
+                self.assertEqual(stream.requests, [4097])
 
     def test_executable_symlinks_are_refused(self):
         for which in ("launcher", "real"):
