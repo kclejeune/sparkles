@@ -154,6 +154,23 @@ not include embeddings performed inside tools.
   `sparkles://{ds}/memory/review`. `recall` takes `recency`, a half-life that ranks recent
   and corroborated facts first.
 
+Recall citations identify a registered passage's document source through visible
+rendition metadata. A source IRI may differ from the fact's graph IRI. When several
+documents apply, the singular source field prefers relationships in the fact's graph,
+then elsewhere in the caller's view, with lexical IRI ordering within each group.
+Opaque legacy sources follow those documents, while recognized passages and visible
+derivation reifiers are excluded from that fallback. This is a bounded provenance
+representative and does not rank evidence or establish complete provenance. Historical
+and branch recall use their own metadata snapshots, and all metadata reads respect
+the caller's view without loading source text or chunks.
+
+The deterministic [project handover corpus](../../testsuite/memory/acceptance/README.md)
+checks current MCP and HTTP memory workflows with independently specified source
+occurrences, correction, withdrawal, retained-commit recall, graph visibility, branch
+separation and citation fidelity. It uses explicit entity seeds and does not establish
+retrieval quality, model accuracy or latency. Shared-profile independence, accepted
+support ownership and dependent freshness remain under items 81 and 340.
+
 ### Document ingestion
 
 * An agent registers a document's text as a source with `register_source`, reads it back

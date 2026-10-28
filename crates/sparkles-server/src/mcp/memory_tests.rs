@@ -4,6 +4,9 @@
 
 use super::*;
 
+#[path = "memory_citation_tests.rs"]
+mod citations;
+
 /// The `mem` dataset of C17 §14 before the stand-up notes of 2026-10-08 (commit 1).
 const MEM: &str = r#"@prefix ex:     <http://example.org/> .
 @prefix schema: <http://schema.org/> .

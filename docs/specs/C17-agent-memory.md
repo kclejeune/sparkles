@@ -537,6 +537,29 @@ A citation names the graph, the reifier, the source, the time, the principal and
 recorded, the confidence and the quote. A fact without a reifier is cited by its graph
 alone.
 
+The singular source field uses a representative from the selected live reifier's
+sampled derivations. A passage is recognized only when the caller can read its typed
+text rendition and its offsets fit the recorded length. Its document source takes
+precedence over opaque derivation values. Source relationships in the fact's graph
+come first, followed by relationships elsewhere in the caller's view. Ties use
+lexical IRI order. Recognized passages and visible derivation reifiers are excluded
+from the legacy source fallback, which uses lexical term order. An unregistered IRI
+remains opaque even when its text resembles a passage fragment. A recognized passage
+without a visible document relationship supplies no source of its own.
+
+This selection represents provenance and does not rank evidence or decide which
+claim is true. Recall keeps its first selected live reifier and bounded provenance
+sampling. Each query batch holds at most 200 input facts and has a shared row cap
+of 32 times that batch's input fact count. Dense provenance can exhaust that sample
+before every fact is represented. For each selected fact and reifier, recall retains
+at most 32 distinct derivation candidates from the returned rows.
+Metadata lookups use at most 200 candidate IRIs or rendition IRIs per batch, and
+retain at most 20 metadata rows per rendition. The metadata query has a shared cap
+of 20 times its rendition count, so dense metadata can exhaust that sample before
+all renditions are represented. These bounds do not establish complete provenance.
+Every lookup uses the call's existing snapshot, graph view and query budgets, and
+reads no rendition text or chunks.
+
 **Conflicts.** When the constraints layer says that a predicate has `sh:maxCount 1` for
 the entity's class, and the view holds several values from different graphs, the facts are
 marked as a conflict. This happens when two sources disagree and neither superseded the
@@ -1145,6 +1168,11 @@ capabilities and remaining work are described by the spec status and Outcome.
 
 ## Outcome
 
+Recall distinguishes document sources from passage IRIs and derivation reifiers in
+C18 provenance. Its singular source field uses the bounded representative rule in
+section 5.5. Source, passage and reifier metadata stay in the call's actual historical,
+branch and permission view. The persisted provenance representation is unchanged.
+
 **Phase 1a delivered on 2026-10-09.** Phases 1b and 1c followed the same day, and are
 recorded after Phase 1a below. Phase 2 is not built.
 
@@ -1384,10 +1412,20 @@ Phases 1b and 1c). See the [roadmap](../ROADMAP.md).
 
 ### Shared memory representation
 
+The deterministic [project handover corpus](../../testsuite/memory/acceptance/README.md)
+exercises current source registration, checked spans, cited writes, correction,
+withdrawal, historical recall, graph visibility and scratch branches through MCP and
+HTTP. Its expected source occurrences are independent of the driver. Copied-source
+lineage is fixture ground truth, while shared-profile independence, accepted support
+ownership, authenticated availability and dependent freshness remain adopted gates
+under items 81, 341 and 340. Explicit seeds make this a compatibility test rather than
+a retrieval-quality or latency evaluation.
+
 [Roadmap](../ROADMAP.md) item 81 extends the existing memory model with the shared
 profile specified by [C25](C25-evidence-and-assessments.md). It connects evidence,
-claims, authored records and review decisions. The profile is unimplemented, and the
-current vocabulary and shipped behaviour remain as recorded above. The workflow
+claims, authored records and review decisions. Static profile resources and bounded
+preparation helpers are available. Managed runtime operations and memory integration
+remain planned, and current asserting behavior remains as recorded above. The workflow
 requirements are in [C18](C18-natural-language-questions-and-ingest/OUTCOME.md#shared-memory-workflows).
 
 The profile will connect sources and document renditions, cited assertions, shared

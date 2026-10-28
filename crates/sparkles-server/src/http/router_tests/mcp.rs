@@ -11,6 +11,8 @@ use clap::Parser;
 use serde_json::json;
 
 mod ingest;
+#[cfg(all(feature = "auth", feature = "shacl"))]
+mod memory_acceptance;
 mod memory_writes;
 
 const FIXTURE: &str = r#"@prefix ex:   <http://ex.org/> .

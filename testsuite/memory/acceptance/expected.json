@@ -1,0 +1,40 @@
+{
+  "initial": [
+    ["handover","ex:ana","org:memberOf","ex:platform"],
+    ["roster","ex:ana","org:memberOf","ex:platform"],
+    ["mirror","ex:ana","org:memberOf","ex:platform"],
+    ["standup","ex:ana","org:memberOf","ex:payments"],
+    ["private","ex:ana","org:memberOf","ex:security"],
+    ["instruction","ex:ana","schema:description","\"Untrusted instruction in a source note\""]
+  ],
+  "public": [
+    ["handover","ex:ana","org:memberOf","ex:platform"],
+    ["roster","ex:ana","org:memberOf","ex:platform"],
+    ["mirror","ex:ana","org:memberOf","ex:platform"],
+    ["standup","ex:ana","org:memberOf","ex:payments"],
+    ["instruction","ex:ana","schema:description","\"Untrusted instruction in a source note\""]
+  ],
+  "corrected": [
+    ["handover","ex:ana","org:memberOf","ex:payments"],
+    ["roster","ex:ana","org:memberOf","ex:platform"],
+    ["mirror","ex:ana","org:memberOf","ex:platform"],
+    ["standup","ex:ana","org:memberOf","ex:payments"],
+    ["private","ex:ana","org:memberOf","ex:security"],
+    ["instruction","ex:ana","schema:description","\"Untrusted instruction in a source note\""]
+  ],
+  "withdrawn": [
+    ["handover","ex:ana","org:memberOf","ex:payments"],
+    ["roster","ex:ana","org:memberOf","ex:platform"],
+    ["mirror","ex:ana","org:memberOf","ex:platform"],
+    ["private","ex:ana","org:memberOf","ex:security"],
+    ["instruction","ex:ana","schema:description","\"Untrusted instruction in a source note\""]
+  ],
+  "scratch": [
+    ["handover","ex:ana","org:memberOf","ex:payments"],
+    ["roster","ex:ana","org:memberOf","ex:platform"],
+    ["mirror","ex:ana","org:memberOf","ex:platform"],
+    ["private","ex:ana","org:memberOf","ex:security"],
+    ["instruction","ex:ana","schema:description","\"Untrusted instruction in a source note\""],
+    ["scratch","ex:ana","org:memberOf","ex:research"]
+  ]
+}

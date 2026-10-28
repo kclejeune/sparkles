@@ -36,6 +36,13 @@ const QUOTE_CHARS: usize = 300;
 /// Literals longer than this are cited by their graph alone (their reifiers are not
 /// looked up).
 const CITED_LITERAL_BYTES: usize = 4096;
+/// Provenance rows sampled per fact, including the writer's 20 derivation reifiers,
+/// a passage, its document source and an explicit source.
+const PROVENANCE_ROWS_PER_FACT: usize = 32;
+/// Metadata rows retained per rendition. No passage text or chunks are read.
+const CITATION_RENDITION_ROWS: usize = 20;
+/// Terms in a citation metadata lookup's VALUES clause.
+const CITATION_METADATA_TERMS: usize = 200;
 /// Superseded reifiers read at most.
 const SUPERSEDED_ROWS: usize = 10_000;
 
@@ -112,6 +119,155 @@ struct Communities {
     reports: Vec<(crate::graphrag::read::ReportRef, Vec<usize>)>,
     /// why no report is shown, when none can be
     unavailable: Option<&'static str>,
+}
+
+/// Only the metadata needed to distinguish documents, passages and derivation
+/// reifiers in the caller's actual snapshot. Counts are bounded independently of
+/// source text, which this reader never loads.
+#[derive(Default)]
+struct CitationSourceMetadata {
+    reifiers: HashSet<NamedNode>,
+    renditions: HashMap<NamedNode, Vec<CitationRenditionRow>>,
+}
+
+struct CitationRenditionRow {
+    length: usize,
+    source: Option<(NamedNode, NamedNode)>,
+}
+
+impl CitationSourceMetadata {
+    fn read(
+        r: &Reader,
+        candidates: &HashMap<String, (NamedNode, Vec<Term>)>,
+    ) -> Result<Self, Error> {
+        let nodes: BTreeSet<NamedNode> = candidates
+            .values()
+            .flat_map(|(_, values)| values)
+            .filter_map(|term| match term {
+                Term::NamedNode(node) => Some(node.clone()),
+                _ => None,
+            })
+            .collect();
+        let mut out = Self::default();
+        let nodes: Vec<_> = nodes.into_iter().collect();
+        for chunk in nodes.chunks(CITATION_METADATA_TERMS) {
+            let values = chunk
+                .iter()
+                .map(ToString::to_string)
+                .collect::<Vec<_>>()
+                .join(" ");
+            let q = format!(
+                "SELECT DISTINCT ?candidate WHERE {{ VALUES ?candidate {{ {values} }} {} }} LIMIT {}",
+                r.quads(&format!("?candidate <{RDF_REIFIES}> ?triple"), &[]),
+                chunk.len(),
+            );
+            for row in r.rows(&q, Vec::new())? {
+                if let [Some(Term::NamedNode(node))] = row.as_slice() {
+                    out.reifiers.insert(node.clone());
+                }
+            }
+        }
+        // Parsing an IRI only supplies a lookup key. A passage is recognized below
+        // only after visible type and length metadata confirms its bounds.
+        let renditions: BTreeSet<_> = nodes
+            .iter()
+            .filter_map(|node| super::ingest::parse_span(node.as_str()))
+            .filter_map(|(rendition, start, end)| {
+                (start < end)
+                    .then(|| NamedNode::new(rendition).ok())
+                    .flatten()
+            })
+            .collect();
+        let renditions: Vec<_> = renditions.into_iter().collect();
+        for chunk in renditions.chunks(CITATION_METADATA_TERMS) {
+            let values = chunk
+                .iter()
+                .map(ToString::to_string)
+                .collect::<Vec<_>>()
+                .join(" ");
+            let q = format!(
+                "SELECT DISTINCT ?rendition ?length ?sourceGraph ?source WHERE {{ \
+                 VALUES ?rendition {{ {values} }} {} OPTIONAL {{ {} }} }} \
+                 ORDER BY ?rendition ?sourceGraph ?source ?length LIMIT {}",
+                r.quads(
+                    &format!("?rendition <{RDF_TYPE}> <{SPK}TextRendition> ; <{SPK}length> ?length"),
+                    &[],
+                ),
+                r.quads_in(
+                    &format!("{{ ?source <{SPK}rendition> ?rendition }} UNION {{ ?rendition <{PROV}wasDerivedFrom> ?source }}"),
+                    &[],
+                    "sourceGraph",
+                ),
+                chunk.len() * CITATION_RENDITION_ROWS,
+            );
+            for row in r.rows(&q, Vec::new())? {
+                let [
+                    Some(Term::NamedNode(rendition)),
+                    Some(Term::Literal(length)),
+                    graph,
+                    source,
+                ] = row.as_slice()
+                else {
+                    continue;
+                };
+                let Ok(length) = length.value().parse::<usize>() else {
+                    continue;
+                };
+                let rows = out.renditions.entry(rendition.clone()).or_default();
+                if rows.len() < CITATION_RENDITION_ROWS {
+                    rows.push(CitationRenditionRow {
+                        length,
+                        source: match (graph, source) {
+                            (Some(Term::NamedNode(graph)), Some(Term::NamedNode(source))) => {
+                                Some((graph.clone(), source.clone()))
+                            }
+                            _ => None,
+                        },
+                    });
+                }
+            }
+        }
+        Ok(out)
+    }
+
+    /// A stable representative, not an enumeration or a truth/evidence ranking.
+    /// Prefer a recognized passage's document in the fact graph, then elsewhere in
+    /// the view, then opaque legacy sources. Ties use lexical IRI/term ordering.
+    fn source(&self, graph: &NamedNode, candidates: &[Term]) -> Option<Term> {
+        let mut document: Option<(u8, &NamedNode)> = None;
+        let mut legacy: Option<(String, &Term)> = None;
+        for candidate in candidates {
+            if let Term::NamedNode(node) = candidate {
+                let mut passage = false;
+                if let Some((rendition, start, end)) = super::ingest::parse_span(node.as_str())
+                    && start < end
+                    && let Some(rows) = self.renditions.get(&NamedNode::new_unchecked(rendition))
+                {
+                    for row in rows.iter().filter(|row| end <= row.length) {
+                        passage = true;
+                        if let Some((source_graph, source)) = &row.source {
+                            let rank = u8::from(source_graph != graph);
+                            if document.is_none_or(|(old_rank, old)| {
+                                (rank, source.as_str()) < (old_rank, old.as_str())
+                            }) {
+                                document = Some((rank, source));
+                            }
+                        }
+                    }
+                }
+                if passage || self.reifiers.contains(node) {
+                    continue;
+                }
+            }
+            let lexical = candidate.to_string();
+            if legacy.as_ref().is_none_or(|(old, _)| lexical < *old) {
+                legacy = Some((lexical, candidate));
+            }
+        }
+        document
+            .map(|(_, source)| Term::NamedNode(source.clone()))
+            .or_else(|| legacy.map(|(_, source)| source.clone()))
+    }
 }
 
 /// One quad of the view.
@@ -819,8 +975,9 @@ impl Tools<'_> {
                 "SELECT ?s ?p ?o ?g ?r ?src ?at ?by ?conf ?quote WHERE {{ VALUES (?s ?p ?o) {{ {} }} {} }} LIMIT {}",
                 chunk.join(" "),
                 r.quads(&pattern, &[]),
-                chunk.len() * 20
+                chunk.len() * PROVENANCE_ROWS_PER_FACT
             );
+            let mut candidates: HashMap<String, (NamedNode, Vec<Term>)> = HashMap::new();
             for row in r.rows(&q, Vec::new())? {
                 let [
                     Some(s),
@@ -844,14 +1001,32 @@ impl Tools<'_> {
                     g: g.clone(),
                 }
                 .key();
-                out.entry(key).or_insert_with(|| Provenance {
+                let provenance = out.entry(key.clone()).or_insert_with(|| Provenance {
                     reifier: Some(reifier.clone()),
-                    source: src.clone(),
+                    source: None,
                     at: at.clone(),
                     by: by.clone(),
                     confidence: conf.clone(),
                     quote: quote.clone(),
                 });
+                // Source, passage and derivation reifiers share wasDerivedFrom. Keep
+                // candidates only for the reifier whose other fields were selected.
+                if provenance.reifier.as_ref() == Some(reifier)
+                    && let Some(src) = src
+                {
+                    let (_, values) = candidates
+                        .entry(key)
+                        .or_insert_with(|| (g.clone(), Vec::new()));
+                    if values.len() < PROVENANCE_ROWS_PER_FACT && !values.contains(src) {
+                        values.push(src.clone());
+                    }
+                }
+            }
+            let metadata = CitationSourceMetadata::read(r, &candidates)?;
+            for (key, (graph, values)) in candidates {
+                if let Some(provenance) = out.get_mut(&key) {
+                    provenance.source = metadata.source(&graph, &values);
+                }
             }
         }
         Ok(out)

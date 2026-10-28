@@ -55,6 +55,11 @@ The recorded dates and measurements below describe their original delivery stage
 
 ## Outcome
 
+Recall reads the document identity from visible rendition metadata when a reifier
+also derives from a passage or another reifier. C17 section 5.5 records the stable
+representative rule and its sampling bounds. This repairs citation source selection
+without changing the section 7.6 writer or persisted provenance vocabulary.
+
 **Amendment.** [C19 §11](../C19-layered-settings.md#11-server-wide-model-settings)
 reverses the decision of §3.4 that no HTTP route creates or changes a provider. Server
 administrators can now change the model configuration, endpoints included, and store
@@ -1538,10 +1543,18 @@ in `recall` and the brief.
 
 ### Shared memory workflows
 
+The deterministic [project handover corpus](../../../testsuite/memory/acceptance/README.md)
+covers current MCP and HTTP source registration, checked spans, cited recall, source
+correction, withdrawal, retained-commit recall, graph visibility and branch separation.
+Independent expected source occurrences preserve repeated and conflicting claims.
+The corpus records copied lineage and the remaining decision, task, availability and
+shared-profile gates without treating them as implemented workflows.
+
 [Roadmap](../../ROADMAP.md) item 81 has a shared representation specified by
 [C25](../C25-evidence-and-assessments.md), building on [C17](../C17-agent-memory.md#shared-memory-representation).
-The profile is unimplemented. This follow-up defines how ingestion, recall, review and
-maintenance use it without changing the shipped phases. Current asserting writes stay
+Static profile resources and bounded preparation helpers are available. Managed
+runtime operations and application integration remain planned. This follow-up defines
+how ingestion, recall, review and maintenance use them without changing the shipped phases. Current asserting writes stay
 asserting writes, while C25's additive proposal operation records claims without
 asserting their propositions.
 
