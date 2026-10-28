@@ -270,29 +270,6 @@ jobs:
       - uses: taiki-e/install-action@v2
         with:
           tool: cargo-nextest@${{ env.NEXTEST_VERSION }}
-      # Swatinem owns the dependency target; mbx retains its separate remote object
-      # store. Forks keep the mbx action's existing GitHub target-cache fallback.
-      - name: Configure hybrid target ownership
-        if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
-        run: echo "MBX_TARGET_VIEWS=0" >> "$GITHUB_ENV"
-      - name: Restore dependency target cache
-        if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
-        uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0
-        with:
-          prefix-key: sparkles-ci-tests-v1
-          shared-key: mbx-1.28.0
-          workspaces: . -> target
-          cache-targets: true
-          cache-workspace-crates: false
-          cache-all-crates: false
-          cache-bin: false
-          save-if: ${{ github.ref == 'refs/heads/main' && (github.event_name == 'push' || github.event_name == 'workflow_dispatch') }}
-          cmd-format: bash scripts/ci-cache-tool.sh {0}
-      - name: Rehydrate cached build-script helpers
-        if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
-        run: |
-          python3 scripts/ci-cache-rehydrate.py
-          mbx metadata --locked --format-version 1 > /dev/null
       # The 188 test binaries share most of their code, which zstd finds with a long
       # window: the archive shrinks from 2.2 GB to about 1.4 GB, which the five test jobs
       # download. nextest reads windows up to 128 MB (--long=27). The server's build script

@@ -710,27 +710,11 @@ payload for root-workspace jobs and an object payload for binding workspaces or 
 targets. The target payload includes Cargo downloads, while object jobs let Cargo download
 dependencies again.
 
-The hosted **Build tests** job combines remote mbx objects with a pinned Swatinem
-cache for Cargo registry/git downloads and dependency targets. Swatinem excludes
-workspace crates, installed Cargo tools and the mbx object store. Its production key
-is stable across runs and includes the mbx version, platform, Rust compiler and build
-environment, manifests and lockfiles. Only successful main pushes and manual runs on
-main save this target cache. Pull requests may restore it. A cache miss builds normally.
-Fork pull requests retain the mbx action's GitHub target-cache fallback instead.
-
-The hybrid job disables managed target views so Swatinem owns an ordinary `target`
-directory. After restoration, `scripts/ci-cache-rehydrate.py` validates the supported
-mbx launchers and recreates their pruned helper binaries from the pinned installed mbx.
-It discovers both Cargo launcher paths and preserved executable siblings. Cargo's
-unhashed aliases resolve through a unique hashed sibling with identical launcher
-bytes, matching the pinned mbx lookup. The repair refuses incomplete or ambiguous
-pairs, unknown launcher forms and paths escaping the target. Native ELF
-build artifacts remain valid without a private mbx sibling. The repair preserves
-launcher and build-script mtimes and never evaluates cached shell text. A fresh mbx
-metadata call follows the repair. Swatinem's Cargo metadata calls also pass through
-mbx with `--locked` using
-`scripts/ci-cache-tool.sh`. The other remote-cache jobs use mbx alone. There is no
-sccache layer.
+The hosted **Build tests** job uses mbx remote caching and managed target views.
+Boxington holds the target lease while `mbx nextest archive` builds and writes its
+archive under `RUNNER_TEMP`. Recompression and artifact upload read that archive
+outside the managed target directory, so collection after the command cannot remove
+the upload. The job uses the mbx action's GitHub cache backend for fork pull requests.
 
 The Linux wheel and Alpine addon containers install the pinned Boxington version from
 checksum-verified portable binaries. They mount their host job's store and use a separate
