@@ -57,6 +57,13 @@ jobs:
     steps:
       - uses: actions/checkout@v5
         with: {persist-credentials: false}
+      - name: Trust and check the container workspace before setup
+        run: |
+          # Checkout's safe.directory entry uses a temporary HOME in containers.
+          # BEGIN SERVER ARTIFACT WORKSPACE TRUST
+          git config --global --add safe.directory "$GITHUB_WORKSPACE"
+          git -C "$GITHUB_WORKSPACE" status --porcelain --untracked-files=normal
+          # END SERVER ARTIFACT WORKSPACE TRUST
       - name: Admit builder capacity and tools before setup
         run: |
           /opt/python/cp313-cp313/bin/python3 - <<'PY'

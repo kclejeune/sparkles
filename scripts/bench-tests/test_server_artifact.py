@@ -333,6 +333,88 @@ class ElfContracts(unittest.TestCase):
 
 
 class WorkflowContracts(unittest.TestCase):
+    def builder_fixture(self, work):
+        source = work / "checked out source"
+        (source / "scripts").mkdir(parents=True)
+        for name in ("server-artifact-build.sh", "server-artifact-images.json"):
+            shutil.copyfile(ROOT / "scripts" / name, source / "scripts" / name)
+        env = {key: value for key, value in os.environ.items()
+               if not key.startswith("GIT_") and key != "CARGO_TARGET_DIR"}
+        env.update({"GIT_CONFIG_GLOBAL": str(work / "gitconfig"), "GIT_CONFIG_NOSYSTEM": "1"})
+        for arguments in (("init",), ("add", "."),
+                          ("-c", "user.name=Fixture", "-c", "user.email=fixture@example.invalid",
+                           "commit", "-m", "Fixture")):
+            subprocess.run(["git", "-C", str(source), *arguments], check=True,
+                           capture_output=True, env=env)
+        tools = work / "tools"
+        tools.mkdir()
+        (tools / "mbx").write_text('''#!/bin/bash
+echo "$*" >> "$BUILDER_CALLS"
+case "$1" in
+  --version) echo 'mbx 1.28.0';;
+  setup) exit 0;;
+  sparkles-task) exit 42;;
+  *) exit 99;;
+esac
+''')
+        (tools / "uname").write_text("#!/bin/sh\necho x86_64\n")
+        cargo = work / "data/mbx/bin/cargo"
+        cargo.parent.mkdir(parents=True)
+        cargo.write_text("#!/bin/sh\necho 'fixture Cargo shim'\n")
+        for tool in (tools / "mbx", tools / "uname", cargo):
+            tool.chmod(0o755)
+        env.update({"PATH": f"{tools}:{env['PATH']}", "XDG_DATA_HOME": str(work / "data"),
+                    "BUILDER_CALLS": str(work / "builder-calls"),
+                    "AUDITWHEEL_POLICY": "manylinux_2_28", "GIT_TEST_ASSUME_DIFFERENT_OWNER": "1",
+                    "SPARKLES_ARTIFACT_BUILDER_IMAGE": artifact.IMAGES["builder"],
+                    "GITHUB_WORKSPACE": str(source)})
+        return source, env
+
+    def run_builder(self, source, env):
+        return subprocess.run(["bash", str(source / "scripts/server-artifact-build.sh"),
+                               str(source.parent / "output")], env=env, capture_output=True,
+                              text=True, timeout=20)
+
+    def trust_workspace(self, source, env):
+        workflow = (ROOT / ".github/workflows/server-artifacts.yml").read_text()
+        code = textwrap.dedent(workflow.split("# BEGIN SERVER ARTIFACT WORKSPACE TRUST", 1)[1]
+                               .split("# END SERVER ARTIFACT WORKSPACE TRUST", 1)[0])
+        subprocess.run(["bash", "-euo", "pipefail", "-c", code], env=env, cwd=source,
+                       check=True, capture_output=True, text=True, timeout=20)
+
+    def test_untrusted_source_stops_before_any_build(self):
+        with tempfile.TemporaryDirectory(prefix="artifact ownership ") as temporary:
+            work = Path(temporary)
+            source, env = self.builder_fixture(work)
+            result = self.run_builder(source, env)
+            self.assertIn("dubious ownership", result.stderr)
+            self.assertNotEqual(result.returncode, 0)
+            self.assertNotEqual(result.returncode, 42, "Git failure must not reach the build lease")
+            self.assertNotIn("sparkles-task", (work / "builder-calls").read_text())
+
+    def test_workspace_trust_is_exact_and_preserves_dirty_source_refusal(self):
+        for dirty in (None, "tracked", "untracked"):
+            with self.subTest(dirty=dirty), \
+                    tempfile.TemporaryDirectory(prefix="artifact ownership ") as temporary:
+                work = Path(temporary)
+                source, env = self.builder_fixture(work)
+                self.trust_workspace(source, env)
+                safe = subprocess.run(["git", "config", "--global", "--get-all", "safe.directory"],
+                                      env=env, check=True, capture_output=True, text=True).stdout
+                self.assertEqual(safe.splitlines(), [str(source)])
+                if dirty == "tracked":
+                    with (source / "scripts/server-artifact-build.sh").open("a") as stream:
+                        stream.write("\n# changed tracked source\n")
+                elif dirty == "untracked":
+                    (source / "untracked-source").write_text("changed\n")
+                result = self.run_builder(source, env)
+                if dirty:
+                    self.assertIn("source must be committed and clean", result.stderr)
+                    self.assertNotEqual(result.returncode, 42)
+                    self.assertNotIn("sparkles-task", (work / "builder-calls").read_text())
+                else:
+                    self.assertEqual(result.returncode, 42, result.stderr)
+
     def preflight(self, total=15 * 1024**3, available=14 * 1024**3,
                   free=24 * 1024**3, cpus=4, missing=(), machine="x86_64"):
         workflow = (ROOT / ".github/workflows/server-artifacts.yml").read_text()
