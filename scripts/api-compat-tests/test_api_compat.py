@@ -489,6 +489,263 @@ class ReviewSchemaRegressions(unittest.TestCase):
         self.assertNotEqual(api.shape(old), api.shape(new))
 
 
+class TraversalContexts(unittest.TestCase):
+    reserved = ('default', 'description', 'title', 'enum', 'const', '$ref')
+
+    def compare(self, before, after=None, targets=None):
+        return ReviewSchemaRegressions.compare(self, before, copy.deepcopy(before) if after is None else after, targets=targets)
+
+    def valid_compare(self, before, after=None, targets=None):
+        try:
+            return self.compare(before, after, targets)
+        except (api.InputError, TypeError) as error:
+            self.fail(f'Valid literal or named data was treated as a schema: {error}')
+
+    def test_dependent_required_narrowing_behind_unchanged_refs(self):
+        # {x: {default: null, a: 1}} loses validity when dependent b is required.
+        for outer in ('patternProperties', 'not'):
+            for name in self.reserved:
+                with self.subTest(outer=outer, name=name):
+                    ref = {'$ref': '#/components/schemas/Word'}
+                    schema = {outer: {'^x': ref} if outer == 'patternProperties' else ref}
+                    ds = self.valid_compare(schema, targets=({'Word': {'dependentRequired': {name: ['a']}}}, {'Word': {'dependentRequired': {name: ['a', 'b']}}}))
+                    self.assertTrue(any(d.rule == 'constraint-review' and d.severity == 'review' for d in ds), ds)
+
+    def test_dependent_required_removal_remains_unproven(self):
+        schema = {'not': {'$ref': '#/components/schemas/Word'}}
+        ds = self.valid_compare(schema, targets=({'Word': {'dependentRequired': {'default': ['a', 'b']}}}, {'Word': {'dependentRequired': {'default': ['a']}}}))
+        self.assertTrue(any(d.rule == 'constraint-review' for d in ds), ds)
+
+    def test_identical_named_data_maps_and_reference_looking_strings_are_literal(self):
+        for name in self.reserved:
+            with self.subTest(name=name):
+                data = {'dependentRequired': {name: ['$ref', '#/components/schemas/Missing', 'description']}}
+                self.assertEqual(self.valid_compare(data), [])
+                self.assertEqual(api.shape(data), data)
+
+    def test_nested_recursive_target_data_map_change_is_not_lost(self):
+        schema = {'not': {'$ref': '#/components/schemas/Word'}}
+        old = {'Word': {'properties': {'next': {'$ref': '#/components/schemas/Word'}, 'child': {'$ref': '#/components/schemas/Leaf'}}}, 'Leaf': {'dependentRequired': {'description': ['a']}}}
+        new = copy.deepcopy(old)
+        new['Leaf']['dependentRequired']['description'].append('b')
+        ds = self.valid_compare(schema, targets=(old, new))
+        self.assertTrue(any(d.rule == 'constraint-review' for d in ds), ds)
+        self.assertLess(len(ds), 5)
+
+    def test_recursive_target_annotations_are_ignored_only_in_schema_positions(self):
+        schema = {'not': {'$ref': '#/components/schemas/Word'}}
+        old = {'Word': {'description': 'old', 'properties': {'next': {'$ref': '#/components/schemas/Word'}}, 'dependentRequired': {'description': ['a']}}}
+        new = copy.deepcopy(old)
+        new['Word']['description'] = 'new'
+        self.assertEqual(self.valid_compare(schema, targets=(old, new)), [])
+
+    def test_mixed_dependency_map_schema_and_literal_values_remain_distinct(self):
+        schema = {'not': {'$ref': '#/components/schemas/Word'}}
+        old = {'Word': {'dependencies': {'default': {'$ref': '#/components/schemas/Leaf'}, '$ref': ['a']}}, 'Leaf': {'type': 'string'}}
+        new = copy.deepcopy(old)
+        new['Leaf']['type'] = 'integer'
+        ds = self.valid_compare(schema, targets=(old, new))
+        self.assertTrue(any(d.rule == 'constraint-review' for d in ds), ds)
+        self.assertEqual(self.valid_compare(schema, targets=(old, copy.deepcopy(old))), [])
+
+    def test_missing_ref_in_mixed_dependency_schema_still_fails(self):
+        with self.assertRaises(api.InputError):
+            self.compare({'dependencies': {'default': {'$ref': '#/components/schemas/Missing'}, '$ref': ['literal']}})
+
+    def test_all_known_single_schema_positions_follow_changed_targets(self):
+        for key in ('not', 'if', 'then', 'else', 'contains', 'propertyNames', 'unevaluatedProperties', 'unevaluatedItems', 'contentSchema', 'additionalItems'):
+            with self.subTest(key=key):
+                schema = {key: {'$ref': '#/components/schemas/Word'}}
+                old = {'Word': {'dependentRequired': {'default': ['a']}}}
+                new = {'Word': {'dependentRequired': {'default': ['a', 'b']}}}
+                ds = self.valid_compare(schema, targets=(old, new))
+                self.assertTrue(any(d.rule == 'constraint-review' for d in ds), ds)
+
+    def test_prefix_item_schema_array_context_follows_refs(self):
+        schema = {'prefixItems': [{'$ref': '#/components/schemas/Word'}]}
+        ds = self.valid_compare(schema, targets=({'Word': {'dependentRequired': {'title': ['a']}}}, {'Word': {'dependentRequired': {'title': ['a', 'b']}}}))
+        self.assertTrue(any(d.rule == 'constraint-review' for d in ds), ds)
+
+    def test_unknown_structured_data_preserves_all_annotation_named_members(self):
+        schema = {'not': {'$ref': '#/components/schemas/Word'}}
+        for name in self.reserved[:-1]:
+            with self.subTest(name=name):
+                old = {'Word': {'unknown-validator': {name: {'description': 'a'}}}}
+                new = {'Word': {'unknown-validator': {name: {'description': 'b'}}}}
+                ds = self.valid_compare(schema, targets=(old, new))
+                self.assertTrue(any(d.rule == 'constraint-review' for d in ds), ds)
+
+    def test_unknown_reference_shaped_structure_explicitly_refuses_ambiguity(self):
+        for value in ({'$ref': '#/components/schemas/Input'}, {'literal': {'$ref': 'data'}}, [{'$dynamicRef': '#word'}]):
+            with self.subTest(value=value):
+                with self.assertRaisesRegex(api.InputError, 'unsupported.*context'):
+                    self.compare({'unknown-validator': value})
+
+    def test_nonlocal_resource_scopes_and_dynamic_refs_are_explicitly_unsupported(self):
+        for key, value in (('$id', 'https://example.invalid/resource'), ('$dynamicRef', '#word'), ('$recursiveRef', '#'), ('$schema', 'https://example.invalid/dialect')):
+            with self.subTest(key=key):
+                with self.assertRaisesRegex(api.InputError, 'unsupported'):
+                    self.compare({key: value})
+
+    def test_resource_and_ref_looking_keys_in_literals_are_data(self):
+        payload = {'$id': 'literal', '$ref': 'literal', '$dynamicRef': 'literal', 'description': {'default': 'data'}}
+        for key in ('enum', 'const', 'default', 'example', 'examples'):
+            with self.subTest(key=key):
+                schema = {key: [payload] if key in ('enum', 'examples') else payload}
+                self.assertEqual(self.valid_compare(schema), [])
+
+    def test_literal_discriminator_mapping_names_are_not_reference_objects(self):
+        schema = {'discriminator': {'propertyName': 'kind', 'mapping': {'$ref': '#/components/schemas/Input', 'default': 'literal'}}}
+        self.assertEqual(self.valid_compare(schema), [])
+        self.assertEqual(api.shape(schema), schema)
+
+    def test_data_map_vocabulary_is_retained_without_schema_interpretation(self):
+        schema = {'$vocabulary': {'https://example.invalid/vocab': True}}
+        self.assertEqual(self.valid_compare(schema), [])
+        self.assertEqual(api.shape(schema), schema)
+
+    def test_named_schema_map_child_with_data_map_is_not_reclassified(self):
+        for name in self.reserved:
+            with self.subTest(name=name):
+                schema = {'dependentSchemas': {name: {'dependentRequired': {'$ref': ['default']}}}}
+                self.assertEqual(self.valid_compare(schema), [])
+                self.assertEqual(api.shape(schema), schema)
+
+    def test_reference_validation_follows_target_then_terminates_cycles(self):
+        d = document()
+        d['components']['schemas']['Word'] = {'properties': {'self': {'$ref': '#/components/schemas/Word'}, 'missing': {'$ref': '#/components/schemas/Missing'}}}
+        with self.assertRaises(api.InputError):
+            api.Schemas(d).validate_refs({'$ref': '#/components/schemas/Word'})
+        del d['components']['schemas']['Word']['properties']['missing']
+        api.Schemas(d).validate_refs({'$ref': '#/components/schemas/Word'})
+
+    def test_malformed_schema_containers_fail_as_input_errors(self):
+        for schema in ({'properties': []}, {'dependentSchemas': {'name': 7}}, {'prefixItems': {}}, {'not': []}):
+            with self.subTest(schema=schema):
+                with self.assertRaises(api.InputError):
+                    self.compare(schema)
+
+    def test_openapi_example_values_and_link_parameters_are_literal(self):
+        old = document()
+        old['components']['examples'] = {'default': {'value': {'$ref': 'literal data', 'schema': {'$ref': 'also data'}}}}
+        old['components']['links'] = {'$ref': {'operationId': 'read', 'parameters': {'$ref': '#/components/schemas/Missing'}, 'requestBody': {'schema': {'$ref': 'literal'}}}}
+        media = old['paths']['/books']['post']['responses']['200']['content']['application/json']
+        media['examples'] = {'description': {'$ref': '#/components/examples/default'}}
+        try:
+            self.assertEqual(api.compare_http(old, copy.deepcopy(old)), [])
+        except api.InputError as error:
+            self.fail(f'OpenAPI literal data was treated as a reference: {error}')
+
+    def test_openapi_true_example_reference_is_validated(self):
+        old = document()
+        old['components']['examples'] = {'default': {'$ref': '#/components/examples/Missing'}}
+        with self.assertRaises(api.InputError):
+            api.compare_http(old, copy.deepcopy(old))
+
+    def test_openapi_named_header_data_and_schema_ref_contexts(self):
+        old = document()
+        old['paths']['/books']['post']['responses']['200']['headers'] = {'$ref': {'schema': {'enum': [{'$ref': 'literal'}]}}}
+        try:
+            self.assertEqual(api.compare_http(old, copy.deepcopy(old)), [])
+        except api.InputError as error:
+            self.fail(f'Header map key was treated as a reference: {error}')
+        old['paths']['/books']['post']['responses']['200']['headers']['$ref']['schema'] = {'$ref': '#/components/schemas/Missing'}
+        with self.assertRaises(api.InputError):
+            api.compare_http(old, copy.deepcopy(old))
+
+    def test_openapi_unknown_reference_context_is_explicitly_unsupported(self):
+        old = document()
+        old['x-custom'] = {'description': {'$ref': '#/components/schemas/Input'}}
+        with self.assertRaisesRegex(api.InputError, 'unsupported.*context'):
+            api.compare_http(old, copy.deepcopy(old))
+
+    def test_openapi_unknown_dialect_is_not_assumed_to_be_default(self):
+        old = document()
+        old['jsonSchemaDialect'] = 'https://example.invalid/dialect'
+        with self.assertRaisesRegex(api.InputError, 'unsupported'):
+            api.compare_http(old, copy.deepcopy(old))
+
+    def test_invalid_reference_and_dialect_types_raise_input_errors(self):
+        for value in ([], {}, 1, None):
+            with self.subTest(value=value):
+                old = document()
+                old['components']['responses'] = {'Probe': {'$ref': value}}
+                with self.assertRaises(api.InputError):
+                    api.compare_http(old, copy.deepcopy(old))
+                with self.assertRaises(api.InputError):
+                    self.compare({'$schema': value})
+                old = document()
+                old['jsonSchemaDialect'] = value
+                with self.assertRaises(api.InputError):
+                    api.compare_http(old, copy.deepcopy(old))
+
+    def test_openapi_reference_only_cycles_and_nonobjects_fail(self):
+        for targets in ({'A': {'$ref': '#/components/responses/B'}, 'B': {'$ref': '#/components/responses/A'}}, {'A': False}):
+            with self.subTest(targets=targets):
+                old = document()
+                old['components']['responses'] = {'Probe': {'$ref': '#/components/responses/A'}, **targets}
+                with self.assertRaises(api.InputError):
+                    api.compare_http(old, copy.deepcopy(old))
+
+    def test_openapi_reference_object_contexts_keep_valid_data_and_check_missing_targets(self):
+        targets = {
+            'parameters': {'in': 'query', 'name': 'p', 'schema': {'$ref': '#/components/schemas/Input'}},
+            'headers': {'schema': {'enum': [{'$ref': 'literal'}]}},
+            'requestBodies': {'content': {'application/json': {'schema': {'$ref': '#/components/schemas/Input'}}}},
+            'responses': {'description': 'ok'},
+            'pathItems': {'get': {'responses': {'200': {'description': 'ok'}}}},
+            'callbacks': {'{$request.query.url}': {'get': {'responses': {'200': {'description': 'ok'}}}}},
+            'links': {'operationId': 'read', 'parameters': {'$ref': 'literal'}},
+            'examples': {'value': {'$ref': 'literal'}},
+            'securitySchemes': {'type': 'apiKey', 'name': 'key', 'in': 'header'},
+        }
+        for category, target in targets.items():
+            with self.subTest(category=category):
+                old = document()
+                old['components'][category] = {'Alias': {'$ref': f'#/components/{category}/Target'}, 'Target': target}
+                try:
+                    self.assertEqual(api.compare_http(old, copy.deepcopy(old)), [])
+                except api.InputError as error:
+                    self.fail(f'Valid OpenAPI {category} reference rejected: {error}')
+                del old['components'][category]['Target']
+                with self.assertRaises(api.InputError):
+                    api.compare_http(old, copy.deepcopy(old))
+
+    def test_recursive_openapi_callback_is_finite_and_checks_other_edges(self):
+        old = document()
+        operation = {'callbacks': {'again': {'$ref': '#/components/callbacks/C'}}, 'responses': {'200': {'description': 'ok'}}}
+        old['components']['callbacks'] = {'C': {'{$request.query.url}': {'post': operation}}}
+        self.assertEqual(api.compare_http(old, copy.deepcopy(old)), [])
+        operation['requestBody'] = {'$ref': '#/components/requestBodies/Missing'}
+        with self.assertRaises(api.InputError):
+            api.compare_http(old, copy.deepcopy(old))
+
+    def test_openapi_oauth_scope_names_are_literal_data(self):
+        old = document()
+        old['components']['securitySchemes'] = {'oauth': {'type': 'oauth2', 'flows': {'clientCredentials': {'tokenUrl': 'https://example.invalid/token', 'scopes': {'$ref': 'read', 'default': 'write'}}}}}
+        old['security'] = [{'oauth': ['$ref', 'default']}]
+        try:
+            self.assertEqual(api.compare_http(old, copy.deepcopy(old)), [])
+        except api.InputError as error:
+            self.fail(f'Valid OAuth scope names were treated as references: {error}')
+
+    def test_callback_reference_descriptions_do_not_become_map_entries(self):
+        old = document()
+        old['components']['responses'] = {'R': {'description': 'ok'}}
+        old['components']['callbacks'] = {
+            'Alias': {'$ref': '#/components/callbacks/Inner', 'summary': 'reference metadata', 'description': 'outer'},
+            'Inner': {'$ref': '#/components/callbacks/C', 'description': 'inner'},
+            'C': {'description': {'post': {'responses': {'200': {'$ref': '#/components/responses/R'}}}}},
+        }
+        try:
+            self.assertEqual(api.compare_http(old, copy.deepcopy(old)), [])
+        except api.InputError as error:
+            self.fail(f'Reference descriptions were interpreted as callback map entries: {error}')
+        del old['components']['responses']['R']
+        with self.assertRaises(api.InputError):
+            api.compare_http(old, copy.deepcopy(old))
+
+
 class CliContracts(unittest.TestCase):
     def setUp(self):
         self.old = cli()

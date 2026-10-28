@@ -813,10 +813,14 @@ response types, enum values and error codes beyond formal output subtyping. Base
 experimental members alone are excluded. Exact reviewed development differences require
 a Compatibility changelog entry. Released patch or stable-minor breaks cannot be waived.
 Finite value comparisons preserve the conjunction of enum and const. Unknown validators
-include changes to referenced targets in their review diagnostics. The checker uses
-named schema-map context, including `dependentSchemas`, when validating references
-and comparing fingerprints. User-selected map names retain their meaning even when
-they match schema annotation or literal-data keywords. The CLI serializer
+include changes to referenced targets in their review diagnostics. One shared traversal
+distinguishes schemas, named schema and data maps, and literal payloads when validating
+references and comparing fingerprints. It preserves arbitrary map names and ignores
+annotations only at actual schema positions. Known OpenAPI containers locate schemas
+and reference objects without treating example values, link parameters or OAuth scope
+names as schemas. Ambiguous unknown reference contexts, dynamic references, schema
+resource identifiers and unsupported dialects fail explicitly. These checks remain
+bounded and do not prove general JSON Schema implication. The CLI serializer
 records positional argument IDs as well as indices, preserving the distinction between
 equally shaped arguments when their order changes.
 The CLI bootstrap was recaptured with that corrected test-only serializer from the

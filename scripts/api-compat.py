@@ -24,10 +24,44 @@ ROOT = Path(__file__).resolve().parents[1]
 METHODS = {'get', 'head', 'post', 'put', 'delete', 'patch', 'options', 'trace'}
 ANNOTATIONS = {'title', 'description', 'summary', 'examples', 'example', 'default', 'deprecated', 'externalDocs', 'x-sparkles-experimental'}
 SCHEMA_KEYS = {'$ref', 'type', 'enum', 'const', 'properties', 'required', 'items', 'additionalProperties', 'allOf', 'anyOf', 'oneOf'} | ANNOTATIONS
-# These objects map arbitrary user names to schemas. Interpret only their values
-# as schemas, even when a name is spelled default, enum, const or $ref.
+# The same context registry drives shaping, validation and reachable signatures.
+# Only a schema object interprets keywords. User map names and literal payloads do
+# not acquire schema meaning merely because they are spelled default or $ref.
 SCHEMA_MAP_KEYS = frozenset({'properties', 'patternProperties', '$defs', 'definitions', 'dependentSchemas'})
-OPENAPI_MAP_KEYS = frozenset({'schemas', 'responses', 'requestBodies', 'headers', 'content', 'paths', 'securitySchemes', 'parameters'})
+SCHEMA_CONTEXTS = {
+    **dict.fromkeys(SCHEMA_MAP_KEYS, 'schema-map'),
+    **dict.fromkeys({'allOf', 'anyOf', 'oneOf', 'prefixItems'}, 'schema-list'),
+    **dict.fromkeys({'items', 'additionalProperties', 'unevaluatedProperties', 'unevaluatedItems', 'propertyNames', 'contains', 'not', 'if', 'then', 'else', 'contentSchema', 'additionalItems'}, 'schema'),
+    **dict.fromkeys({'dependentRequired', '$vocabulary'}, 'data-map'),
+    **dict.fromkeys({'enum', 'const', 'required', 'type', 'discriminator', 'xml'}, 'literal'),
+    'dependencies': 'dependency-map',
+}
+REFERENCE_KEYS = frozenset({'$ref', '$dynamicRef', '$recursiveRef', '$id'})
+SCHEMA_DIALECTS = frozenset({'https://json-schema.org/draft/2020-12/schema', 'https://spec.openapis.org/oas/3.1/dialect/base'})
+
+# These contexts locate actual schemas and OpenAPI reference objects. Other object
+# fields retain opaque data, unless an explicitly literal field permits any value.
+OPENAPI_CONTEXTS = {
+    'document': {'paths': 'map:path-item', 'webhooks': 'map:path-item', 'components': 'components'},
+    'components': {'schemas': 'map:schema', 'parameters': 'map:parameter', 'headers': 'map:header', 'requestBodies': 'map:request-body', 'responses': 'map:response', 'pathItems': 'map:path-item', 'callbacks': 'map:callback', 'links': 'map:link', 'examples': 'map:example', 'securitySchemes': 'map:security-scheme'},
+    'path-item': {**dict.fromkeys(METHODS, 'operation'), 'parameters': 'list:parameter'},
+    'operation': {'parameters': 'list:parameter', 'requestBody': 'request-body', 'responses': 'map:response', 'callbacks': 'map:callback'},
+    'parameter': {'schema': 'schema', 'content': 'map:media', 'examples': 'map:example'},
+    'header': {'schema': 'schema', 'content': 'map:media', 'examples': 'map:example'},
+    'request-body': {'content': 'map:media'},
+    'response': {'content': 'map:media', 'headers': 'map:header', 'links': 'map:link'},
+    'media': {'schema': 'schema', 'examples': 'map:example', 'encoding': 'map:encoding'},
+    'encoding': {'headers': 'map:header'},
+    'link': {}, 'example': {}, 'security-scheme': {},
+}
+OPENAPI_REF_CONTEXTS = frozenset({'path-item', 'parameter', 'header', 'request-body', 'response', 'callback', 'link', 'example', 'security-scheme'})
+OPENAPI_LITERAL_FIELDS = {
+    'document': {'security', 'servers'}, 'operation': {'security', 'servers'},
+    'path-item': {'servers'}, 'parameter': {'example'}, 'header': {'example'},
+    'media': {'example'}, 'example': {'value'},
+    'link': {'parameters', 'requestBody', 'server'},
+    'security-scheme': {'flows'},
+}
 
 
 # One inherited description error in the unpublished bootstrap. Only the registered
@@ -43,7 +77,7 @@ LEGACY_RENAME_SCHEMA = {
 
 
 class InputError(ValueError):
-    """Malformed input is not evidence of compatibility."""
+    """Invalid or unsupported input is not evidence of compatibility."""
 
 
 @dataclass(frozen=True, order=True)
@@ -69,23 +103,63 @@ def canonical(value):
     return json.dumps(value, sort_keys=True, separators=(',', ':'), ensure_ascii=False)
 
 
-def shape(value):
-    """Discard schema annotations without stripping user member names or data."""
+def opaque_data(value):
+    """Keep unknown data verbatim; do not guess reference or annotation meaning."""
     if isinstance(value, dict):
-        out = {}
-        for k, v in value.items():
-            if k in ANNOTATIONS:
-                continue
-            if k in SCHEMA_MAP_KEYS and isinstance(v, dict):
-                out[k] = {name: shape(member) for name, member in v.items()}
-            elif k in {'enum', 'const'}:
-                out[k] = v
-            else:
-                out[k] = shape(v)
-        return out
-    if isinstance(value, list):
-        return [shape(v) for v in value]
+        if REFERENCE_KEYS & value.keys():
+            raise InputError('unsupported reference context in opaque structured data')
+        for child in value.values():
+            opaque_data(child)
+    elif isinstance(value, list):
+        for child in value:
+            opaque_data(child)
     return value
+
+
+def schema_tree(value, context='schema', on_ref=None):
+    """Walk explicit contexts once for all schema consumers; never mutate input."""
+    if context == 'literal':
+        return value
+    if context == 'opaque':
+        return opaque_data(value)
+    if context in {'schema-map', 'data-map', 'dependency-map'}:
+        if not isinstance(value, dict):
+            raise InputError(f'{context} must be an object')
+        if context == 'data-map':
+            return value
+        return {name: schema_tree(child, 'literal' if context == 'dependency-map' and isinstance(child, list) else 'schema', on_ref) for name, child in value.items()}
+    if context == 'schema-list':
+        if not isinstance(value, list):
+            raise InputError('schema-list must be an array')
+        return [schema_tree(child, 'schema', on_ref) for child in value]
+    if context != 'schema':
+        raise InputError('unsupported schema traversal context')
+    if isinstance(value, bool):
+        return value
+    if not isinstance(value, dict):
+        raise InputError('schema must be an object or boolean')
+    out = {}
+    for key, child in value.items():
+        if key in ANNOTATIONS:
+            continue
+        if key in {'$id', '$dynamicRef', '$recursiveRef'}:
+            raise InputError(f'unsupported schema resource or reference scope: {key}')
+        if key == '$schema' and (not isinstance(child, str) or child not in SCHEMA_DIALECTS):
+            raise InputError('unsupported schema dialect')
+        if key == '$ref':
+            if not isinstance(child, str):
+                raise InputError('schema reference must be a string')
+            if on_ref is not None:
+                on_ref(child)
+            out[key] = child
+        else:
+            out[key] = schema_tree(child, SCHEMA_CONTEXTS.get(key, 'opaque'), on_ref)
+    return out
+
+
+def shape(value):
+    """Discard annotations only at actual schema positions, retaining all data."""
+    return schema_tree(value)
 
 
 def experimental(schema):
@@ -111,60 +185,92 @@ class Schemas:
             value = value[part]
         return value
 
-    def validate_refs(self, node, named=False):
-        # Literal enum/const/example data may itself have a member called $ref.
-        if isinstance(node, dict):
-            if named:
-                for child in node.values():
-                    self.validate_refs(child)
+    def validate_refs(self, node):
+        seen = set()
+        def visit(ref):
+            target = self.ref(ref)
+            if ref not in seen:
+                seen.add(ref)
+                schema_tree(target, on_ref=visit)
+        schema_tree(node, on_ref=visit)
+
+    def validate_document_refs(self):
+        seen = set()
+        def visit(value, context):
+            if context == 'schema':
+                self.validate_refs(value)
                 return
-            if '$ref' in node:
-                self.ref(node['$ref'])
-            for k, v in node.items():
-                if k not in {'enum', 'const', 'examples', 'example', 'default'}:
-                    self.validate_refs(v, named=k in SCHEMA_MAP_KEYS | OPENAPI_MAP_KEYS and isinstance(v, dict))
-        elif isinstance(node, list):
-            for v in node:
-                self.validate_refs(v)
+            if context.startswith('map:'):
+                if not isinstance(value, dict):
+                    raise InputError('OpenAPI named container must be an object')
+                for child in value.values():
+                    visit(child, context[4:])
+                return
+            if context.startswith('list:'):
+                if not isinstance(value, list):
+                    raise InputError('OpenAPI sequence must be an array')
+                for child in value:
+                    visit(child, context[5:])
+                return
+            if not isinstance(value, dict):
+                raise InputError(f'OpenAPI {context} must be an object')
+            if '$ref' in value:
+                if context not in OPENAPI_REF_CONTEXTS:
+                    raise InputError(f'unsupported OpenAPI reference context: {context}')
+                ref = value['$ref']
+                # Resolve before the visited check so reference-only cycles and
+                # invalid reference types never become a successful early return.
+                resolved = self.resolve_object(value, omit_reference_descriptions=True)
+                key = (ref, context)
+                if key in seen:
+                    return
+                seen.add(key)
+                value = resolved
+            if context == 'callback':
+                for child in value.values():
+                    visit(child, 'path-item')
+                return
+            fields = OPENAPI_CONTEXTS[context]
+            for key, child in value.items():
+                if context == 'document' and key == 'jsonSchemaDialect' and (not isinstance(child, str) or child not in SCHEMA_DIALECTS):
+                    raise InputError('unsupported OpenAPI schema dialect')
+                if key in fields:
+                    visit(child, fields[key])
+                elif key not in OPENAPI_LITERAL_FIELDS.get(context, set()):
+                    opaque_data(child)
+        visit(self.doc, 'document')
 
     def signature(self, node):
-        # Include reachable referenced definitions, not unchanged $ref strings.
-        # Each reference is visited once, including recursive graphs.
+        # The shared walker distinguishes real refs from map names and literal
+        # payloads. Register each target before following it to terminate cycles.
         key = id(node)
         if key in self.signatures:
             return self.signatures[key][1]
         definitions = {}
-        def walk(value, named=False):
-            if isinstance(value, dict):
-                if named:
-                    for child in value.values():
-                        walk(child)
-                    return
-                if '$ref' in value and value['$ref'] not in definitions:
-                    target = self.ref(value['$ref'])
-                    definitions[value['$ref']] = shape(target)
-                    walk(target)
-                for k, child in value.items():
-                    if k not in {'enum', 'const', 'examples', 'example', 'default'}:
-                        walk(child, named=k in SCHEMA_MAP_KEYS and isinstance(child, dict))
-            elif isinstance(value, list):
-                for child in value:
-                    walk(child)
-        walk(node)
-        result = canonical([shape(node), definitions])
+        def visit(ref):
+            if ref not in definitions:
+                target = self.ref(ref)
+                definitions[ref] = None
+                definitions[ref] = schema_tree(target, on_ref=visit)
+        root = schema_tree(node, on_ref=visit)
+        result = canonical([root, definitions])
         self.signatures[key] = (node, result)
         return result
 
-    def resolve_object(self, node):
+    def resolve_object(self, node, omit_reference_descriptions=False):
         seen = set()
         while isinstance(node, dict) and '$ref' in node:
             ref = node['$ref']
+            target = self.ref(ref)
             if ref in seen:
                 raise InputError('reference-only cycle')
             seen.add(ref)
-            target = self.ref(ref)
-            # Non-schema OpenAPI reference objects permit descriptive siblings.
-            node = {**target, **{k: v for k, v in node.items() if k != '$ref'}}
+            if not isinstance(target, dict):
+                raise InputError('OpenAPI reference target must be an object')
+            # Reference descriptions are metadata, even when the referenced value
+            # is a named callback map. Preserve the target's own map member names.
+            excluded = {'$ref', 'summary', 'description'} if omit_reference_descriptions else {'$ref'}
+            node = {**target, **{k: v for k, v in node.items() if k not in excluded}}
         return node
 
     def schema(self, node, trail=frozenset()):
@@ -431,7 +537,7 @@ class HttpDiff:
 
     def run(self):
         for resolver in (self.old, self.new):
-            resolver.validate_refs(resolver.doc)
+            resolver.validate_document_refs()
             validate_media_content(resolver)
         self.identity = '$document'
         for k in ('security',):

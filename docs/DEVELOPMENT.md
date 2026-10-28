@@ -1025,9 +1025,15 @@ schemas are traversed. Changed ambiguous unions, unknown constraints and securit
 metadata require review. The checker does not prove general JSON Schema implication.
 Enum and const constraints apply together. Unknown validators are checked for changes
 in reachable local reference targets even when the reference text stays the same.
-Named schema maps, including `dependentSchemas`, retain arbitrary member names during
-reference validation and comparison. Names such as `default` and `$ref` are not
-interpreted as schema keywords at the map level.
+One shared traversal distinguishes schemas, named schema maps, named data maps and
+literal values. Schema annotations are ignored only at schema positions. Names such
+as `default` and `$ref` remain data in `dependentRequired` and other named maps.
+Known schema positions follow local references, including recursive targets.
+OpenAPI schemas and reference objects use their declared container positions, while
+example values, link parameters and OAuth scope names remain literal data.
+Ambiguous reference-shaped structures under unknown keywords fail as unsupported
+contexts. Dynamic references, schema resource identifiers and other schema dialects
+also fail explicitly. These refusals do not establish compatibility.
 The CLI tree records positional argument identities and indices, so exchanging two
 equally shaped arguments changes the contract.
 Existing real-response, protocol and authorization tests remain necessary.
