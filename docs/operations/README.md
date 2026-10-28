@@ -33,6 +33,8 @@ support. Published server downloads, signed provenance, the other server platfor
 and published container images remain open under [item 59](../ROADMAP.md). Candidate
 build records are unsigned metadata. [DEVELOPMENT](../DEVELOPMENT.md#server-artifact-candidates)
 describes the commands and evidence boundaries.
+Installed acceptance requires a nonzero host UID and GID. The smoke refuses root
+callers and records the selected numeric user in its receipt.
 
 ### Settings and notifications
 
