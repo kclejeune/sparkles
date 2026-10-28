@@ -180,6 +180,9 @@ jobs:
       matrix:
         platform: ${{ fromJSON(inputs.all-platforms && '["linux-amd64", "linux-arm64", "macos-arm64"]' || '["linux-amd64"]') }}
     runs-on: ${{ matrix.platform == 'macos-arm64' && 'macos-15' || matrix.platform == 'linux-arm64' && 'ubuntu-24.04-arm' || 'ubuntu-24.04' }}
+    env:
+      # Workspace and binding checks exceed the shared 10 GiB download allowance.
+      MBX_GC_MAX_SIZE: 30GiB
     steps:
       - uses: actions/checkout@v5
         with: { fetch-depth: 2 }
