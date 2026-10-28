@@ -807,6 +807,11 @@ newer than 2.28. A Nix or Forge binary does not establish that baseline. The def
 OCR and embedding features remain enabled, while model execution requires separate
 configuration and is outside the installed query smoke.
 
+Linux embedding workers obtain their kernel thread ID through `syscall(SYS_gettid)`
+when adjusting priority. This preserves per-thread scheduling on the glibc 2.28
+baseline, which predates the glibc 2.30 `gettid` wrapper. The kernel task ID remains
+distinct from Rust and POSIX thread identifiers.
+
 The following packaging regressions compile nothing and run no container.
 
 ```sh

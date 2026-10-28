@@ -648,8 +648,15 @@ unsigned metadata and do not provide artifact attestations.
 `server-artifacts.yml` defines a pinned manylinux 2.28 build and separate installed
 smoke jobs on pinned Rocky Linux 8 and Debian 11 images. The smoke controller checks
 readiness, exact SELECT and ASK answers, writes and reopening a persistent dataset,
-using only the extracted distribution and a new data directory. No baseline build
-or runtime acceptance result is recorded for this tranche. The remaining Linux,
+using only the extracted distribution and a new data directory. The first baseline
+attempt at `b8dd824c` built the formatter and UI and compiled the default-feature
+server, but its final link failed because embedding-worker priority used the
+`gettid` wrapper added in glibc 2.30
+([run 40697027746](https://github.com/kclejeune/sparkles/actions/runs/40697027746)).
+The source repair uses the Linux kernel syscall while retaining the actual kernel
+thread identity and per-thread priority behavior. Its focused Linux identity and
+priority tests and the repaired baseline build remain unexecuted. No archive or
+installed runtime acceptance has passed. The remaining Linux,
 macOS and Windows targets, container images, registry installation and release
 orchestration remain open. The candidate workflow publishes no release or image.
 
