@@ -323,6 +323,10 @@ Read the [provenance record](F21-ontology-api.md#provenance).
 
 Read the [provenance record](C24-json-query-languages.md#provenance).
 
+## Shared entity representation
+
+Read the [provenance record](A01-shared-entity-representation/SPEC.md#provenance).
+
 ## Evidence, durable work and maintained analysis
 
 Read the [provenance record](shared/PROVENANCE.md#evidence-durable-work-and-maintained-analysis).

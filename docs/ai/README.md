@@ -232,6 +232,19 @@ or enable execution. Existing `assert_facts` and source registration keep their 
 behavior. [C25](../specs/C25-evidence-and-assessments.md#outcome) records the exact phase
 boundary and remaining managed operations.
 
+### Shared entity representation
+
+[A01](../specs/A01-shared-entity-representation/README.md) specifies application
+profiles for shared entities, source descriptions, scoped identifiers and reviewed
+resolution maps. It reuses the evidence and valid-time resources. Source revisions,
+world changes, resolution decisions and ontology or mapping migrations retain
+separate identities and history.
+
+The model resources, domain mappings and replay fixtures remain planned under
+roadmap item 396. Their first phases use ordinary RDF, SHACL and SPARQL. Managed
+ingestion, live review, authenticated availability and maintained results use the
+C25, C27, C26 and F22 contracts as those runtimes become available.
+
 ### Community reports (GraphRAG)
 
 * A GraphRAG build groups a projection's resources into the Leiden hierarchy and has the
@@ -349,7 +362,7 @@ or library workflows. Exact HTTP contracts remain in the API reference.
 
 ## Roadmap
 
-The remaining work described above refers to [item 6](../ROADMAP.md), [item 12](../ROADMAP.md), [item 15](../ROADMAP.md), [item 77](../ROADMAP.md), [item 81](../ROADMAP.md), [item 100](../ROADMAP.md), [item 260](../ROADMAP.md), [item 261](../ROADMAP.md), [item 262](../ROADMAP.md), [item 263](../ROADMAP.md), [item 270](../ROADMAP.md), [item 318](../ROADMAP.md), [item 339](../ROADMAP.md), [item 340](../ROADMAP.md), [item 341](../ROADMAP.md), [item 344](../ROADMAP.md).
+The remaining work described above refers to [item 6](../ROADMAP.md), [item 12](../ROADMAP.md), [item 15](../ROADMAP.md), [item 77](../ROADMAP.md), [item 81](../ROADMAP.md), [item 100](../ROADMAP.md), [item 260](../ROADMAP.md), [item 261](../ROADMAP.md), [item 262](../ROADMAP.md), [item 263](../ROADMAP.md), [item 270](../ROADMAP.md), [item 318](../ROADMAP.md), [item 339](../ROADMAP.md), [item 340](../ROADMAP.md), [item 341](../ROADMAP.md), [item 344](../ROADMAP.md), [item 396](../ROADMAP.md).
 The central roadmap owns priority and dependencies. Its
 [completion paths](../ROADMAP.md#completion-paths-for-partially-complete-specs)
 link partially complete specs to their remaining work and acceptance criteria.

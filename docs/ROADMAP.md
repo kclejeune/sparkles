@@ -83,12 +83,18 @@ logic remain application work rather than duplicate engine infrastructure.
 | Milestone | Work | Acceptance |
 |---|---|---|
 | Reliable baseline | Close confirmed correctness failures and retain qualified measurements. | The integration passes its required review, tests, conformance and performance gates. |
+| Shared entity representation | Item 396 defines versioned entity, identifier, resolution and evolution profiles over C25 and C27. Model resources and offline fixtures can proceed before managed runtime integration. | Independent query fixtures preserve source claims through conflicting identifiers, merge and split decisions, source correction and mapping migrations. |
 | Trusted sources and resumable work | Item 81 delivers C25 Phases 1–2, item 339 delivers C26 Phase 1, and item 341 delivers C27 Phase 1. Item 220 preserves managed definitions during backup and cloning. | Source revisions and decisions retain their identity and evidence. Interrupted work resumes safely, and restored external work stays paused. |
 | Production readiness | Items 58–60 complete packages, server artifacts and compatibility policy. Item 64 and the adopted phases of 65 close startup and key workflows. This work runs alongside feature completion. | Installed artifacts, supported platforms, upgrade and recovery tests pass before a release is cut. |
 | Reproducible assessments | Item 340 delivers F22 Phase 1 after C25's typed records and C26's fenced publication are available. Full recomputation is the initial execution model. | Inputs, outputs and methods are reproducible. New matching data, source withdrawals, expiry and authorization changes invalidate affected results. |
 | Unattended operation | Complete C26 Phase 2 and F22 Phase 2, including temporal scheduling. Item 100 supplies guarded report configurations when distinct audiences are required. | Fenced database publication rejects stale attempts and duplicate accepted database effects. External delivery is at least once with stable event IDs, so receivers deduplicate repeated deliveries. Recovery preserves current authorization. |
 | Shared capability completion | Close the relevant search, path, view, reasoning, explanation, validation, API and visualization phases from the completion paths below. | The declared scope passes its correctness, visibility, recovery and measured resource gates. |
 | Full partial-feature completion | Finish the other adopted partial-feature phases and release contracts, including explicitly scheduled large phases. | Required feature, compatibility, packaging and operational acceptance are complete before release. |
+
+Item 396 defines shared entities and domain mappings without duplicating C25 review
+operations, C27 time semantics or F22 dependency maintenance. Its first phases use
+ordinary RDF, SHACL and SPARQL with pinned evidence and expected answers. Live managed
+integration follows the exact C25, C26, C27 and F22 contracts it consumes.
 
 C25's first phase supplies vocabulary, shapes, fixtures and competency queries. It does
 not supply the managed runtime APIs of later phases. C26 Phase 1 and C27's static
@@ -124,7 +130,7 @@ not to every extension in a spec or to phases that have already shipped.
 | **Performance** | 1 refreshes the evidence while 7, 86 and 4 address their remaining gates. Item 93 controls the spill default, and 111, 112 and 171 close the indexed group-commit gates. | X06, X08 Phase 2, X09 Phase 4, X07 |
 | **Graph features** | 8 closes algorithm surfaces and acceptance. Item 12's view-based refresh waits for 17, while 20 supplies openCypher before its algorithm procedures can finish. | F14, C22, F13, F01 |
 | **Reasoning** | 9 and 19 complete their remaining scale and query-time phases. Item 17 Phase 3 precedes 19 Phase 3 and 18 Phase 3, while existing explanations remain available. | F16, F17, F13, F18 |
-| **Evidence and maintained analyses** | 81 and 339 can run independently, and both feed 340's shared representation and durable execution. Item 341 adds validity independently, and later incremental maintenance uses 17. | C25, C26, F22, C27, C22b |
+| **Evidence and maintained analyses** | 81 and 339 can run independently, and both feed 340's shared representation and durable execution. Item 396 specializes the available evidence and temporal profiles with entity modeling and offline fixtures. Item 341 adds validity, and later incremental maintenance uses 17. | C25, C26, A01, F22, C27, C22b |
 
 The following dependencies describe the remaining phase contracts. Independent work can
 proceed in parallel, including full recomputation of maintained analyses before later
@@ -226,6 +232,7 @@ continues within its caller-visible evidence and measured-latency scope.
 | # | Item | Spec | Size | Value |
 |---|---|---|---|---|
 | 81 | **Shared evidence and review records.** Versioned profile resources, bounded local input preparation, typed settings helpers and a deterministic MCP and HTTP corpus for current memory compatibility are available. Phase 2 still requires safe closure of shared source stores, authenticated source and claim writes, protected metadata, retained references, review-controlled projections and reversible identity decisions. Shared-record integration with memory, ingestion, reports and maintained analysis remains planned for Phase 3. | [C25](specs/C25-evidence-and-assessments.md), [C17](specs/C17-agent-memory.md#shared-memory-representation) | M–L | High |
+| 396 | **Shared entity representation and evolution.** Define versioned profiles for entity descriptions, scoped identifiers and reviewed resolution maps, preserving source claims through merge, split and correction. Deliver shared and software examples, representative cross-domain fixtures, shapes and replay queries, then integrate with the C25, C27, C26 and F22 runtimes as their contracts land. | [A01](specs/A01-shared-entity-representation/README.md) | M–L | High |
 | 395 | **Bounded preparation of read views.** Capped historical snapshots and trusted Dataset history handles preserve exact retained origins. Complete controlled permission masks and guard providers, then adopt the shared preparation budget in guarded Dataset queries, exact evidence references and U02 readers. | [C29](specs/C29-bounded-view-preparation/README.md) | M | High |
 | 339 | **Durable jobs and delivery.** Planned checkpointed jobs, fenced external workers and a transactional outbox make collection, analysis and delivery resumable after a restart. Publication and delivery intent share the dataset transaction. | [C26](specs/C26-durable-jobs-and-delivery.md) | L | High |
 | 341 | **Valid time and observation history.** Versioned RDF resources, SHACL shapes and typed temporal templates are available. Phase 1 remains incomplete at A4 until C25 Phase 2 and protected writes establish server-owned availability and refuse backdating. Later phases add the projection helper, event-time UI and expiry integration. | [C27](specs/C27-valid-time-profiles.md) | M–L | High |

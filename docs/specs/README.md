@@ -1,8 +1,9 @@
 # Feature specs
 
-These are the design specs for the features Sparkles added beyond its port of Jena,
-Fuseki and QLever's engine. Each spec was written before the feature was built. The
-sources were public standards, published papers, the Sparkles code, and the documentation
+These are the design specs for Sparkles capabilities and application data profiles,
+including features beyond its port of Jena, Fuseki and QLever's engine. Each spec was
+written before the feature was built. The sources were public standards, published
+papers, the Sparkles code, and the documentation
 and permissively licensed code of other projects. The [provenance index](PROVENANCE.md)
 locates each spec's source and dependency records.
 
@@ -81,6 +82,7 @@ several feature pages.
 
 | Prefix | Group |
 |---|---|
+| `A` | Application data profiles, source mappings and acceptance contracts that specialize shared evidence and temporal resources without adding native engine semantics. |
 | `CI` | Durable commit identity. The commit sequence, dataset ids and receipts that most later features build on. |
 | `C` | Smaller server and engine capabilities: observability and budgets, schema discovery, a GraphQL adapter, CSV and TSV imports, cloning, inference freshness, access control, write-time validation, the MCP server, automatic compaction, write previews, stored queries, agent memory over MCP, questions and ingestion in natural language, layered settings, declared prefixes, outbound notifications, GraphRAG community summaries, batched updates with commit triggers, JSON query languages, shared evidence, durable jobs, valid-time profiles and personal ChatGPT-plan model access. |
 | `F` | Larger data features: a Cypher frontend, full-text and vector search, path search, embeddings computed on write, local embedding models, backups to object storage, retained history and point-in-time reads, branches and merges, replication, encryption at rest, incremental views with provenance, graph algorithms, reasoning at scale and at query time, explanations, mapping languages with virtual graphs, a local-first engine, an ontology API, and maintained analysis lifecycles. |
@@ -106,6 +108,7 @@ A completed phase does not imply every later extension or compatibility goal is 
 
 | Spec | Summary | Status |
 |---|---|---|
+| [A01](A01-shared-entity-representation/README.md) | Shared entity descriptions, scoped identifiers, reviewed convergence and evolution over evidence and temporal profiles, with domain mappings and replay fixtures | specified |
 | [CI](CI-commit-identity.md) | Durable dataset ids, a gap-free commit sequence, commit receipts and headers, `/$/commits` and `sparkles log`, commit messages, change digests, entity tags, the catalog horizon and the change feed | implemented (Phases 1–3) |
 | [C01](C01-observability-and-budgets.md) | Request ids, access log, Prometheus metrics, readiness, OpenTelemetry, memory and result-size budgets, cancellation on disconnect | implemented in part |
 | [C02](C02-schema-discovery.md) | `GET /$/schema/{ds}` with paginated class and predicate listings computed on the server, a VoID export, a SHACL constraints layer, subject classes per predicate, class profiles, schema diffs between commits, reports kept up to date from the changes, shapes drafted from the data, `sparkles schema`, and the UI's schema browser | implemented |
