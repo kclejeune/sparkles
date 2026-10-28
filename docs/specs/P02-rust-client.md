@@ -536,8 +536,8 @@ would have reflected that load rather than the client.
   because they read process-wide environment variables. The file format is tested.
 - The original schema, statistics, stored-query and backup methods retain their
   `serde_json::Value` signatures. Typed counterparts are recorded below.
-- The change feed, diffs between commits, snapshots, clones, search, reasoning and
-  validation calls, which are reachable through `call_json` only.
+- The original landing left change feeds, diffs, snapshots, clones, search, reasoning
+  and validation reachable through `call_json`. Later typed reads are recorded below.
 
 ### Typed administration models
 
@@ -574,6 +574,28 @@ No performance claim or benchmark result accompanies this tranche.
 Item 47 remains open for the remaining typed administration methods, opt-in pacing and
 isolated credential integration tests described below.
 
+### Typed retained-history reads
+
+Item 47 adds five typed history reads to both async and blocking clients. `snapshots`
+and `snapshot` return the retained snapshot list and one named snapshot. `branches`
+and `branch` return branch metadata. `diff` reads the server's bounded JSON diff.
+`HistoryOptions` carries deadlines and cancellation for metadata reads, and
+`DiffOptions` selects retained states, branches, graph and term filters, limits and
+class grouping. A union graph filter is refused before dispatch.
+
+The existing generic and JSON methods keep their signatures. These methods do not
+add snapshot or branch mutations, RDF Patch streaming or change-feed streaming.
+Generated response models retain unknown members and lossless JSON integers. Required
+nullable fields must be present, including an explicit null. This keeps a diff group's
+literal and IRI alternatives distinct from its nullable class alternative. Dot-only
+snapshot and branch path segments are refused rather than normalized to another URL.
+
+Independent HTTP fixtures cover both client forms, exact query parameters, retained
+selectors, encoded path segments, required-nullable alternatives, unknown members,
+integer boundaries, cancellation and deadlines. The default client suite passed 35
+unit and integration tests plus two doctests. Without default features, 33 tests and
+one doctest passed. These are correctness results and make no performance claim.
+
 ### Roadmap follow-ups (2026-10-12)
 
 **Typed admin calls, rate-limit pacing and credential tests** (item 47, Tier 5,
@@ -583,8 +605,9 @@ isolated credential integration tests described below.
   `Client::stats` and `backup_files` and `Dataset::stats`, `schema`, `backups`,
   `stored_queries`, `stored_query` and `put_stored_query` retain their JSON signatures.
   Their additive `*_typed` counterparts cover the first group of generated models.
-  The change feed, diffs, snapshots, clones, search, reasoning, validation, branches and
-  settings are reachable through `call_json` only. `RateLimit` is parsed
+  Typed snapshot and branch metadata reads and bounded JSON diffs are also available.
+  Change feeds, snapshot and branch mutations, clones, merges, search, reasoning,
+  validation and settings still use `call_json` where no typed method exists. `RateLimit` is parsed
   (`retry.rs`) and used to wait after a `429`, but never before one. `from_env` and
   `saved_credentials` have no integration test.
 * **Typed bodies.** The OpenAPI description now names every admin body (X03's Phase 2

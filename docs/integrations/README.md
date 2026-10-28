@@ -53,6 +53,8 @@ dataset directory. In-memory branches share runtime ownership without a file loc
   it adds point-in-time reads, stored queries, uploads, batches, commits, datasets, tasks,
   backups, statistics and the schema report. The `*_typed` methods read generated models
   for schema reports, server and dataset statistics, stored queries and backup listings.
+  Typed history methods read snapshot and branch metadata and bounded JSON diffs, with
+  per-call cancellation and deadlines in both client forms.
   The existing JSON methods keep their signatures. It retries as `Retry-After` and
   `RateLimit` direct, and never repeats a write whose outcome is unknown.
 
@@ -68,9 +70,9 @@ dependencies are recorded in the [central roadmap](../ROADMAP.md).
 
 ### Rust HTTP client
 
-The remaining administration routes use `call_json`. Typed change feeds, diffs,
-snapshots, clones, branches, merges, search, reasoning, validation and settings remain
-under roadmap item 47. Proactive rate-limit pacing and isolated integration tests for
+The remaining administration routes use `call_json` where no typed method exists.
+Typed change feeds, snapshot and branch mutations, clones, merges, search, reasoning,
+validation and settings remain under roadmap item 47. Proactive rate-limit pacing and isolated integration tests for
 environment and saved credentials remain under the same item.
 
 ### Bindings and packaging
