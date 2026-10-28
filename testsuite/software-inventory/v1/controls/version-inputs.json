@@ -1,0 +1,1028 @@
+{
+  "profile": "software-inventory-fixture/1",
+  "advisory_source_channel": "https://example.invalid/sparkles-fixture/corpus-v1/source/control-advisory",
+  "profiles": {
+    "base": {
+      "path": "controls/version-profiles/base.json",
+      "sha256": "873fc52252f74c16ce54becb9c2d77a134b0a1370fb373125fdfa1c158d15d12",
+      "bytes": 520
+    },
+    "prerelease": {
+      "path": "controls/version-profiles/prerelease.json",
+      "sha256": "021f4e5c50618305e1d414b2c2936466895b55b7eac8d5c3edfb55c8375b9645",
+      "bytes": 525
+    },
+    "alpha": {
+      "path": "controls/version-profiles/alpha.json",
+      "sha256": "a3c7f7fd5b128f0facf0fa46868ed5500c3650990b9f05b7b033e56263f9175a",
+      "bytes": 531
+    },
+    "sentinel": {
+      "path": "controls/version-profiles/sentinel.json",
+      "sha256": "19ff490a6cb9f3f3755815838041bb915766dd83b89a57322ca21973f28a1d2a",
+      "bytes": 516
+    },
+    "open": {
+      "path": "controls/version-profiles/open.json",
+      "sha256": "dc72e5509055b7626ff35da19c70ae3036a194ea6dc10281525455d47c74e9c3",
+      "bytes": 460
+    },
+    "last": {
+      "path": "controls/version-profiles/last.json",
+      "sha256": "a3850980760a26e2acee56752b320f627012e0c7a69e48954a513ea70fb7a12b",
+      "bytes": 528
+    },
+    "limit": {
+      "path": "controls/version-profiles/limit.json",
+      "sha256": "81a15d6a68f943c6bbf08d18d322ff70e4b89e052a7e10433ddf8eff2f8f081a",
+      "bytes": 520
+    },
+    "multiple_limits": {
+      "path": "controls/version-profiles/multiple_limits.json",
+      "sha256": "281e69bef36cb5a2dd724566eb83302e4ff608214672c3d6245f0f037c5425de",
+      "bytes": 580
+    },
+    "star_limit": {
+      "path": "controls/version-profiles/star_limit.json",
+      "sha256": "f3f0680300979b44084287c4f58db836b5c4683f9b320daab64edfd8f2de9ad7",
+      "bytes": 516
+    },
+    "reopened": {
+      "path": "controls/version-profiles/reopened.json",
+      "sha256": "0bc78a09b62fda556effc603085138c60b1d46c9a9df6b656c1655c31373782e",
+      "bytes": 645
+    },
+    "list": {
+      "path": "controls/version-profiles/list.json",
+      "sha256": "ddcfbca83e500f853b78ff533b25762b5c0e76b9458b5f1840eeaa4f2a5d8ba0",
+      "bytes": 332
+    },
+    "list_union": {
+      "path": "controls/version-profiles/list_union.json",
+      "sha256": "ce13a589033e268c1f79c85bdc90f86238e8a02facbe43e63d3bbcd4122c4b37",
+      "bytes": 565
+    },
+    "unsorted": {
+      "path": "controls/version-profiles/unsorted.json",
+      "sha256": "722ed9602cc1eb6babbf99eb289350f29981e54c74b38637fbaa6b7aae80bae5",
+      "bytes": 520
+    },
+    "singleton": {
+      "path": "controls/version-profiles/singleton.json",
+      "sha256": "f3a50a00c5ca610fc0184f7ff78b4fa15b1de4c93a410f2b469ae39a069bf0ff",
+      "bytes": 528
+    },
+    "numeric_pre": {
+      "path": "controls/version-profiles/numeric_pre.json",
+      "sha256": "f48dd39e9b88b0d2f4b9e82b1582a184581e32bbed760237259a2c8ff7251010",
+      "bytes": 528
+    },
+    "ascii_case": {
+      "path": "controls/version-profiles/ascii_case.json",
+      "sha256": "06339d21591296e14924ac066ae5136e254737e91d74552407079d5d3b3b0734",
+      "bytes": 524
+    },
+    "listed_build": {
+      "path": "controls/version-profiles/listed_build.json",
+      "sha256": "10174d459fc0f14aa3c7df2ff264ef7fd7eff63cb7dc972964fe6d378fa52f1e",
+      "bytes": 338
+    },
+    "mixed_positive": {
+      "path": "controls/version-profiles/mixed_positive.json",
+      "sha256": "a90d74c304939ee746da3e478aee7f742d9947ad0f5324ad64d68f72a87026ca",
+      "bytes": 666
+    },
+    "mixed_negative": {
+      "path": "controls/version-profiles/mixed_negative.json",
+      "sha256": "a90d74c304939ee746da3e478aee7f742d9947ad0f5324ad64d68f72a87026ca",
+      "bytes": 666
+    },
+    "singleton_unsorted": {
+      "path": "controls/version-profiles/singleton_unsorted.json",
+      "sha256": "a76e0bd31875903ab89bdf9e034aaf258debe63f3c1a83e57e644c0d710ca193",
+      "bytes": 528
+    },
+    "fixed_build": {
+      "path": "controls/version-profiles/fixed_build.json",
+      "sha256": "02991e82299080ea2ccf2e6437c9c23f39890bdf8bb4de9ba8a45bf70552ffb8",
+      "bytes": 530
+    },
+    "limit_reopened": {
+      "path": "controls/version-profiles/limit_reopened.json",
+      "sha256": "039fd6c03da6acf813b14fe305f448f1a0474134384e24508e8d9066d6f67a9a",
+      "bytes": 705
+    },
+    "limit_multiple_unsorted": {
+      "path": "controls/version-profiles/limit_multiple_unsorted.json",
+      "sha256": "a6e18d0651b3a0e928745b7970b64a258a8688a044dc7f0561cfa52d8905c317",
+      "bytes": 580
+    },
+    "empty_information": {
+      "path": "controls/version-profiles/empty_information.json",
+      "sha256": "889f47ed1ce0caf902778da984409455453c0d20645cf5f324e4010b7b6ff234",
+      "bytes": 329
+    }
+  },
+  "inputs": [
+    {
+      "id": "V01",
+      "advisory": "controls/version-profiles/base.json",
+      "member": {
+        "scope": "https://example.invalid/sparkles-fixture/corpus-v1/",
+        "ecosystem": "crates.io",
+        "name": "sparkles-fixture-only-leaf",
+        "source": "registry+https://github.com/rust-lang/crates.io-index",
+        "version": "1.1.99"
+      },
+      "expected_case": "cases.json#V01"
+    },
+    {
+      "id": "V02",
+      "advisory": "controls/version-profiles/base.json",
+      "member": {
+        "scope": "https://example.invalid/sparkles-fixture/corpus-v1/",
+        "ecosystem": "crates.io",
+        "name": "sparkles-fixture-only-leaf",
+        "source": "registry+https://github.com/rust-lang/crates.io-index",
+        "version": "1.2.0-rc.1"
+      },
+      "expected_case": "cases.json#V02"
+    },
+    {
+      "id": "V03",
+      "advisory": "controls/version-profiles/base.json",
+      "member": {
+        "scope": "https://example.invalid/sparkles-fixture/corpus-v1/",
+        "ecosystem": "crates.io",
+        "name": "sparkles-fixture-only-leaf",
+        "source": "registry+https://github.com/rust-lang/crates.io-index",
+        "version": "1.2.0"
+      },
+      "expected_case": "cases.json#V03"
+    },
+    {
+      "id": "V04",
+      "advisory": "controls/version-profiles/base.json",
+      "member": {
+        "scope": "https://example.invalid/sparkles-fixture/corpus-v1/",
+        "ecosystem": "crates.io",
+        "name": "sparkles-fixture-only-leaf",
+        "source": "registry+https://github.com/rust-lang/crates.io-index",
+        "version": "1.2.0+build.01"
+      },
+      "expected_case": "cases.json#V04"
+    },
+    {
+      "id": "V05",
+      "advisory": "controls/version-profiles/base.json",
+      "member": {
+        "scope": "https://example.invalid/sparkles-fixture/corpus-v1/",
+        "ecosystem": "crates.io",
+        "name": "sparkles-fixture-only-leaf",
+        "source": "registry+https://github.com/rust-lang/crates.io-index",
+        "version": "1.3.0"
+      },
+      "expected_case": "cases.json#V05"
+    },
+    {
+      "id": "V06",
+      "advisory": "controls/version-profiles/base.json",
+      "member": {
+        "scope": "https://example.invalid/sparkles-fixture/corpus-v1/",
+        "ecosystem": "crates.io",
+        "name": "sparkles-fixture-only-leaf",
+        "source": "registry+https://github.com/rust-lang/crates.io-index",
+        "version": "1.4.0-rc.1"
+      },
+      "expected_case": "cases.json#V06"
+    },
+    {
+      "id": "V07",
+      "advisory": "controls/version-profiles/base.json",
+      "member": {
+        "scope": "https://example.invalid/sparkles-fixture/corpus-v1/",
+        "ecosystem": "crates.io",
+        "name": "sparkles-fixture-only-leaf",
+        "source": "registry+https://github.com/rust-lang/crates.io-index",
+        "version": "1.4.0-rc.10"
+      },
+      "expected_case": "cases.json#V07"
+    },
+    {
+      "id": "V08",
+      "advisory": "controls/version-profiles/base.json",
+      "member": {
+        "scope": "https://example.invalid/sparkles-fixture/corpus-v1/",
+        "ecosystem": "crates.io",
+        "name": "sparkles-fixture-only-leaf",
+        "source": "registry+https://github.com/rust-lang/crates.io-index",
+        "version": "1.4.0"
+      },
+      "expected_case": "cases.json#V08"
+    },
+    {
+      "id": "V09",
+      "advisory": "controls/version-profiles/base.json",
+      "member": {
+        "scope": "https://example.invalid/sparkles-fixture/corpus-v1/",
+        "ecosystem": "crates.io",
+        "name": "sparkles-fixture-only-leaf",
+        "source": "registry+https://github.com/rust-lang/crates.io-index",
+        "version": "1.4.0+build.01"
+      },
+      "expected_case": "cases.json#V09"
+    },
+    {
+      "id": "V10",
+      "advisory": "controls/version-profiles/base.json",
+      "member": {
+        "scope": "https://example.invalid/sparkles-fixture/corpus-v1/",
+        "ecosystem": "crates.io",
+        "name": "sparkles-fixture-only-leaf",
+        "source": "registry+https://github.com/rust-lang/crates.io-index",
+        "version": "1.10.0"
+      },
+      "expected_case": "cases.json#V10"
+    },
+    {
+      "id": "V11",
+      "advisory": "controls/version-profiles/prerelease.json",
+      "member": {
+        "scope": "https://example.invalid/sparkles-fixture/corpus-v1/",
+        "ecosystem": "crates.io",
+        "name": "sparkles-fixture-only-leaf",
+        "source": "registry+https://github.com/rust-lang/crates.io-index",
+        "version": "1.0.0-rc.1"
+      },
+      "expected_case": "cases.json#V11"
+    },
+    {
+      "id": "V12",
+      "advisory": "controls/version-profiles/prerelease.json",
+      "member": {
+        "scope": "https://example.invalid/sparkles-fixture/corpus-v1/",
+        "ecosystem": "crates.io",
+        "name": "sparkles-fixture-only-leaf",
+        "source": "registry+https://github.com/rust-lang/crates.io-index",
+        "version": "1.0.0-rc.2"
+      },
+      "expected_case": "cases.json#V12"
+    },
+    {
+      "id": "V13",
+      "advisory": "controls/version-profiles/prerelease.json",
+      "member": {
+        "scope": "https://example.invalid/sparkles-fixture/corpus-v1/",
+        "ecosystem": "crates.io",
+        "name": "sparkles-fixture-only-leaf",
+        "source": "registry+https://github.com/rust-lang/crates.io-index",
+        "version": "1.0.0-rc.10"
+      },
+      "expected_case": "cases.json#V13"
+    },
+    {
+      "id": "V14",
+      "advisory": "controls/version-profiles/prerelease.json",
+      "member": {
+        "scope": "https://example.invalid/sparkles-fixture/corpus-v1/",
+        "ecosystem": "crates.io",
+        "name": "sparkles-fixture-only-leaf",
+        "source": "registry+https://github.com/rust-lang/crates.io-index",
+        "version": "1.0.0"
+      },
+      "expected_case": "cases.json#V14"
+    },
+    {
+      "id": "V15",
+      "advisory": "controls/version-profiles/prerelease.json",
+      "member": {
+        "scope": "https://example.invalid/sparkles-fixture/corpus-v1/",
+        "ecosystem": "crates.io",
+        "name": "sparkles-fixture-only-leaf",
+        "source": "registry+https://github.com/rust-lang/crates.io-index",
+        "version": "1.0.0+001"
+      },
+      "expected_case": "cases.json#V15"
+    },
+    {
+      "id": "V16",
+      "advisory": "controls/version-profiles/alpha.json",
+      "member": {
+        "scope": "https://example.invalid/sparkles-fixture/corpus-v1/",
+        "ecosystem": "crates.io",
+        "name": "sparkles-fixture-only-leaf",
+        "source": "registry+https://github.com/rust-lang/crates.io-index",
+        "version": "1.0.0-alpha.1"
+      },
+      "expected_case": "cases.json#V16"
+    },
+    {
+      "id": "V17",
+      "advisory": "controls/version-profiles/alpha.json",
+      "member": {
+        "scope": "https://example.invalid/sparkles-fixture/corpus-v1/",
+        "ecosystem": "crates.io",
+        "name": "sparkles-fixture-only-leaf",
+        "source": "registry+https://github.com/rust-lang/crates.io-index",
+        "version": "1.0.0-alpha.beta"
+      },
+      "expected_case": "cases.json#V17"
+    },
+    {
+      "id": "V18",
+      "advisory": "controls/version-profiles/alpha.json",
+      "member": {
+        "scope": "https://example.invalid/sparkles-fixture/corpus-v1/",
+        "ecosystem": "crates.io",
+        "name": "sparkles-fixture-only-leaf",
+        "source": "registry+https://github.com/rust-lang/crates.io-index",
+        "version": "1.0.0-beta"
+      },
+      "expected_case": "cases.json#V18"
+    },
+    {
+      "id": "V19",
+      "advisory": "controls/version-profiles/sentinel.json",
+      "member": {
+        "scope": "https://example.invalid/sparkles-fixture/corpus-v1/",
+        "ecosystem": "crates.io",
+        "name": "sparkles-fixture-only-leaf",
+        "source": "registry+https://github.com/rust-lang/crates.io-index",
+        "version": "0.0.0-0"
+      },
+      "expected_case": "cases.json#V19"
+    },
+    {
+      "id": "V20",
+      "advisory": "controls/version-profiles/sentinel.json",
+      "member": {
+        "scope": "https://example.invalid/sparkles-fixture/corpus-v1/",
+        "ecosystem": "crates.io",
+        "name": "sparkles-fixture-only-leaf",
+        "source": "registry+https://github.com/rust-lang/crates.io-index",
+        "version": "0.0.0"
+      },
+      "expected_case": "cases.json#V20"
+    },
+    {
+      "id": "V21",
+      "advisory": "controls/version-profiles/sentinel.json",
+      "member": {
+        "scope": "https://example.invalid/sparkles-fixture/corpus-v1/",
+        "ecosystem": "crates.io",
+        "name": "sparkles-fixture-only-leaf",
+        "source": "registry+https://github.com/rust-lang/crates.io-index",
+        "version": "0.0.1"
+      },
+      "expected_case": "cases.json#V21"
+    },
+    {
+      "id": "V22",
+      "advisory": "controls/version-profiles/open.json",
+      "member": {
+        "scope": "https://example.invalid/sparkles-fixture/corpus-v1/",
+        "ecosystem": "crates.io",
+        "name": "sparkles-fixture-only-leaf",
+        "source": "registry+https://github.com/rust-lang/crates.io-index",
+        "version": "99.0.0"
+      },
+      "expected_case": "cases.json#V22"
+    },
+    {
+      "id": "V23",
+      "advisory": "controls/version-profiles/open.json",
+      "member": {
+        "scope": "https://example.invalid/sparkles-fixture/corpus-v1/",
+        "ecosystem": "crates.io",
+        "name": "sparkles-fixture-only-leaf",
+        "source": "registry+https://github.com/rust-lang/crates.io-index",
+        "version": "1.1.0"
+      },
+      "expected_case": "cases.json#V23"
+    },
+    {
+      "id": "V24",
+      "advisory": "controls/version-profiles/last.json",
+      "member": {
+        "scope": "https://example.invalid/sparkles-fixture/corpus-v1/",
+        "ecosystem": "crates.io",
+        "name": "sparkles-fixture-only-leaf",
+        "source": "registry+https://github.com/rust-lang/crates.io-index",
+        "version": "1.3.0"
+      },
+      "expected_case": "cases.json#V24"
+    },
+    {
+      "id": "V25",
+      "advisory": "controls/version-profiles/last.json",
+      "member": {
+        "scope": "https://example.invalid/sparkles-fixture/corpus-v1/",
+        "ecosystem": "crates.io",
+        "name": "sparkles-fixture-only-leaf",
+        "source": "registry+https://github.com/rust-lang/crates.io-index",
+        "version": "1.3.0+build"
+      },
+      "expected_case": "cases.json#V25"
+    },
+    {
+      "id": "V26",
+      "advisory": "controls/version-profiles/last.json",
+      "member": {
+        "scope": "https://example.invalid/sparkles-fixture/corpus-v1/",
+        "ecosystem": "crates.io",
+        "name": "sparkles-fixture-only-leaf",
+        "source": "registry+https://github.com/rust-lang/crates.io-index",
+        "version": "1.3.1"
+      },
+      "expected_case": "cases.json#V26"
+    },
+    {
+      "id": "V27",
+      "advisory": "controls/version-profiles/limit.json",
+      "member": {
+        "scope": "https://example.invalid/sparkles-fixture/corpus-v1/",
+        "ecosystem": "crates.io",
+        "name": "sparkles-fixture-only-leaf",
+        "source": "registry+https://github.com/rust-lang/crates.io-index",
+        "version": "1.3.0"
+      },
+      "expected_case": "cases.json#V27"
+    },
+    {
+      "id": "V28",
+      "advisory": "controls/version-profiles/limit.json",
+      "member": {
+        "scope": "https://example.invalid/sparkles-fixture/corpus-v1/",
+        "ecosystem": "crates.io",
+        "name": "sparkles-fixture-only-leaf",
+        "source": "registry+https://github.com/rust-lang/crates.io-index",
+        "version": "1.3.0-rc.1"
+      },
+      "expected_case": "cases.json#V28"
+    },
+    {
+      "id": "V29",
+      "advisory": "controls/version-profiles/multiple_limits.json",
+      "member": {
+        "scope": "https://example.invalid/sparkles-fixture/corpus-v1/",
+        "ecosystem": "crates.io",
+        "name": "sparkles-fixture-only-leaf",
+        "source": "registry+https://github.com/rust-lang/crates.io-index",
+        "version": "1.4.0"
+      },
+      "expected_case": "cases.json#V29"
+    },
+    {
+      "id": "V30",
+      "advisory": "controls/version-profiles/multiple_limits.json",
+      "member": {
+        "scope": "https://example.invalid/sparkles-fixture/corpus-v1/",
+        "ecosystem": "crates.io",
+        "name": "sparkles-fixture-only-leaf",
+        "source": "registry+https://github.com/rust-lang/crates.io-index",
+        "version": "1.5.0"
+      },
+      "expected_case": "cases.json#V30"
+    },
+    {
+      "id": "V31",
+      "advisory": "controls/version-profiles/star_limit.json",
+      "member": {
+        "scope": "https://example.invalid/sparkles-fixture/corpus-v1/",
+        "ecosystem": "crates.io",
+        "name": "sparkles-fixture-only-leaf",
+        "source": "registry+https://github.com/rust-lang/crates.io-index",
+        "version": "99.0.0"
+      },
+      "expected_case": "cases.json#V31"
+    },
+    {
+      "id": "V32",
+      "advisory": "controls/version-profiles/reopened.json",
+      "member": {
+        "scope": "https://example.invalid/sparkles-fixture/corpus-v1/",
+        "ecosystem": "crates.io",
+        "name": "sparkles-fixture-only-leaf",
+        "source": "registry+https://github.com/rust-lang/crates.io-index",
+        "version": "1.5.0"
+      },
+      "expected_case": "cases.json#V32"
+    },
+    {
+      "id": "V33",
+      "advisory": "controls/version-profiles/reopened.json",
+      "member": {
+        "scope": "https://example.invalid/sparkles-fixture/corpus-v1/",
+        "ecosystem": "crates.io",
+        "name": "sparkles-fixture-only-leaf",
+        "source": "registry+https://github.com/rust-lang/crates.io-index",
+        "version": "2.0.0"
+      },
+      "expected_case": "cases.json#V33"
+    },
+    {
+      "id": "V34",
+      "advisory": "controls/version-profiles/reopened.json",
+      "member": {
+        "scope": "https://example.invalid/sparkles-fixture/corpus-v1/",
+        "ecosystem": "crates.io",
+        "name": "sparkles-fixture-only-leaf",
+        "source": "registry+https://github.com/rust-lang/crates.io-index",
+        "version": "2.1.0"
+      },
+      "expected_case": "cases.json#V34"
+    },
+    {
+      "id": "V35",
+      "advisory": "controls/version-profiles/list.json",
+      "member": {
+        "scope": "https://example.invalid/sparkles-fixture/corpus-v1/",
+        "ecosystem": "crates.io",
+        "name": "sparkles-fixture-only-leaf",
+        "source": "registry+https://github.com/rust-lang/crates.io-index",
+        "version": "1.3.0"
+      },
+      "expected_case": "cases.json#V35"
+    },
+    {
+      "id": "V36",
+      "advisory": "controls/version-profiles/list.json",
+      "member": {
+        "scope": "https://example.invalid/sparkles-fixture/corpus-v1/",
+        "ecosystem": "crates.io",
+        "name": "sparkles-fixture-only-leaf",
+        "source": "registry+https://github.com/rust-lang/crates.io-index",
+        "version": "1.3.0+build"
+      },
+      "expected_case": "cases.json#V36"
+    },
+    {
+      "id": "V37",
+      "advisory": "controls/version-profiles/list.json",
+      "member": {
+        "scope": "https://example.invalid/sparkles-fixture/corpus-v1/",
+        "ecosystem": "crates.io",
+        "name": "sparkles-fixture-only-leaf",
+        "source": "registry+https://github.com/rust-lang/crates.io-index",
+        "version": "1.3.1"
+      },
+      "expected_case": "cases.json#V37"
+    },
+    {
+      "id": "V38",
+      "advisory": "controls/version-profiles/list_union.json",
+      "member": {
+        "scope": "https://example.invalid/sparkles-fixture/corpus-v1/",
+        "ecosystem": "crates.io",
+        "name": "sparkles-fixture-only-leaf",
+        "source": "registry+https://github.com/rust-lang/crates.io-index",
+        "version": "1.4.0"
+      },
+      "expected_case": "cases.json#V38"
+    },
+    {
+      "id": "V39",
+      "advisory": "controls/version-profiles/unsorted.json",
+      "member": {
+        "scope": "https://example.invalid/sparkles-fixture/corpus-v1/",
+        "ecosystem": "crates.io",
+        "name": "sparkles-fixture-only-leaf",
+        "source": "registry+https://github.com/rust-lang/crates.io-index",
+        "version": "1.3.0"
+      },
+      "expected_case": "cases.json#V39"
+    },
+    {
+      "id": "V40",
+      "advisory": "controls/version-profiles/base.json",
+      "member": {
+        "scope": "https://example.invalid/sparkles-fixture/corpus-v1/",
+        "ecosystem": "crates.io",
+        "name": "sparkles-fixture-only-leaf",
+        "source": "registry+https://github.com/rust-lang/crates.io-index",
+        "version": "v1.3.0"
+      },
+      "expected_case": "cases.json#V40"
+    },
+    {
+      "id": "V41",
+      "advisory": "controls/version-profiles/base.json",
+      "member": {
+        "scope": "https://example.invalid/sparkles-fixture/corpus-v1/",
+        "ecosystem": "crates.io",
+        "name": "sparkles-fixture-only-leaf",
+        "source": "registry+https://github.com/rust-lang/crates.io-index",
+        "version": "1.3"
+      },
+      "expected_case": "cases.json#V41"
+    },
+    {
+      "id": "V42",
+      "advisory": "controls/version-profiles/base.json",
+      "member": {
+        "scope": "https://example.invalid/sparkles-fixture/corpus-v1/",
+        "ecosystem": "crates.io",
+        "name": "sparkles-fixture-only-leaf",
+        "source": "registry+https://github.com/rust-lang/crates.io-index",
+        "version": "01.3.0"
+      },
+      "expected_case": "cases.json#V42"
+    },
+    {
+      "id": "V43",
+      "advisory": "controls/version-profiles/base.json",
+      "member": {
+        "scope": "https://example.invalid/sparkles-fixture/corpus-v1/",
+        "ecosystem": "crates.io",
+        "name": "sparkles-fixture-only-leaf",
+        "source": "registry+https://github.com/rust-lang/crates.io-index",
+        "version": "1.3.0-rc.01"
+      },
+      "expected_case": "cases.json#V43"
+    },
+    {
+      "id": "V44",
+      "advisory": "controls/version-profiles/base.json",
+      "member": {
+        "scope": "https://example.invalid/sparkles-fixture/corpus-v1/",
+        "ecosystem": "crates.io",
+        "name": "sparkles-fixture-only-leaf",
+        "source": "registry+https://github.com/rust-lang/crates.io-index",
+        "version": "1.3.0+"
+      },
+      "expected_case": "cases.json#V44"
+    },
+    {
+      "id": "V45",
+      "advisory": "controls/version-profiles/base.json",
+      "member": {
+        "scope": "https://example.invalid/sparkles-fixture/corpus-v1/",
+        "ecosystem": "crates.io",
+        "name": "sparkles-fixture-only-leaf",
+        "source": "registry+https://github.com/rust-lang/crates.io-index",
+        "version": " 1.3.0"
+      },
+      "expected_case": "cases.json#V45"
+    },
+    {
+      "id": "V46",
+      "advisory": "controls/version-profiles/base.json",
+      "member": {
+        "scope": "https://example.invalid/sparkles-fixture/corpus-v1/",
+        "ecosystem": "crates.io",
+        "name": "sparkles-fixture-only-leaf",
+        "source": "registry+https://github.com/rust-lang/crates.io-index",
+        "version": "1.3.0 "
+      },
+      "expected_case": "cases.json#V46"
+    },
+    {
+      "id": "V47",
+      "advisory": "controls/version-profiles/base.json",
+      "member": {
+        "scope": "https://example.invalid/sparkles-fixture/corpus-v1/",
+        "ecosystem": "crates.io",
+        "name": "sparkles-fixture-only-leaf",
+        "source": "registry+https://github.com/rust-lang/crates.io-index",
+        "version": "18446744073709551616.0.0"
+      },
+      "expected_case": "cases.json#V47"
+    },
+    {
+      "id": "V48",
+      "advisory": "controls/version-profiles/base.json",
+      "member": {
+        "scope": "https://example.invalid/sparkles-fixture/corpus-v1/",
+        "ecosystem": "crates.io",
+        "name": "sparkles-fixture-only-leaf",
+        "source": "registry+https://github.com/rust-lang/crates.io-index",
+        "version": "^1.3.0"
+      },
+      "expected_case": "cases.json#V48"
+    },
+    {
+      "id": "V49",
+      "advisory": "controls/version-profiles/base.json",
+      "member": {
+        "scope": "https://example.invalid/sparkles-fixture/corpus-v1/",
+        "ecosystem": "crates.io",
+        "name": "sparkles-fixture-only-leaf",
+        "source": "registry+https://github.com/rust-lang/crates.io-index",
+        "version": "1.*"
+      },
+      "expected_case": "cases.json#V49"
+    },
+    {
+      "id": "V50",
+      "advisory": "controls/version-profiles/base.json",
+      "member": {
+        "scope": "https://example.invalid/sparkles-fixture/corpus-v1/",
+        "ecosystem": "crates.io",
+        "name": "sparkles-fixture-only-leaf",
+        "source": "registry+https://github.com/rust-lang/crates.io-index",
+        "version": "１.3.0"
+      },
+      "expected_case": "cases.json#V50"
+    },
+    {
+      "id": "V51",
+      "advisory": "controls/version-profiles/singleton.json",
+      "member": {
+        "scope": "https://example.invalid/sparkles-fixture/corpus-v1/",
+        "ecosystem": "crates.io",
+        "name": "sparkles-fixture-only-leaf",
+        "source": "registry+https://github.com/rust-lang/crates.io-index",
+        "version": "1.2.0"
+      },
+      "expected_case": "cases.json#V51"
+    },
+    {
+      "id": "V52",
+      "advisory": "controls/version-profiles/singleton.json",
+      "member": {
+        "scope": "https://example.invalid/sparkles-fixture/corpus-v1/",
+        "ecosystem": "crates.io",
+        "name": "sparkles-fixture-only-leaf",
+        "source": "registry+https://github.com/rust-lang/crates.io-index",
+        "version": "1.2.1"
+      },
+      "expected_case": "cases.json#V52"
+    },
+    {
+      "id": "V53",
+      "advisory": "controls/version-profiles/numeric_pre.json",
+      "member": {
+        "scope": "https://example.invalid/sparkles-fixture/corpus-v1/",
+        "ecosystem": "crates.io",
+        "name": "sparkles-fixture-only-leaf",
+        "source": "registry+https://github.com/rust-lang/crates.io-index",
+        "version": "1.0.0-2"
+      },
+      "expected_case": "cases.json#V53"
+    },
+    {
+      "id": "V54",
+      "advisory": "controls/version-profiles/numeric_pre.json",
+      "member": {
+        "scope": "https://example.invalid/sparkles-fixture/corpus-v1/",
+        "ecosystem": "crates.io",
+        "name": "sparkles-fixture-only-leaf",
+        "source": "registry+https://github.com/rust-lang/crates.io-index",
+        "version": "1.0.0-alpha"
+      },
+      "expected_case": "cases.json#V54"
+    },
+    {
+      "id": "V55",
+      "advisory": "controls/version-profiles/ascii_case.json",
+      "member": {
+        "scope": "https://example.invalid/sparkles-fixture/corpus-v1/",
+        "ecosystem": "crates.io",
+        "name": "sparkles-fixture-only-leaf",
+        "source": "registry+https://github.com/rust-lang/crates.io-index",
+        "version": "1.0.0-Z"
+      },
+      "expected_case": "cases.json#V55"
+    },
+    {
+      "id": "V56",
+      "advisory": "controls/version-profiles/ascii_case.json",
+      "member": {
+        "scope": "https://example.invalid/sparkles-fixture/corpus-v1/",
+        "ecosystem": "crates.io",
+        "name": "sparkles-fixture-only-leaf",
+        "source": "registry+https://github.com/rust-lang/crates.io-index",
+        "version": "1.0.0-a"
+      },
+      "expected_case": "cases.json#V56"
+    },
+    {
+      "id": "V57",
+      "advisory": "controls/version-profiles/listed_build.json",
+      "member": {
+        "scope": "https://example.invalid/sparkles-fixture/corpus-v1/",
+        "ecosystem": "crates.io",
+        "name": "sparkles-fixture-only-leaf",
+        "source": "registry+https://github.com/rust-lang/crates.io-index",
+        "version": "1.3.0+build"
+      },
+      "expected_case": "cases.json#V57"
+    },
+    {
+      "id": "V58",
+      "advisory": "controls/version-profiles/listed_build.json",
+      "member": {
+        "scope": "https://example.invalid/sparkles-fixture/corpus-v1/",
+        "ecosystem": "crates.io",
+        "name": "sparkles-fixture-only-leaf",
+        "source": "registry+https://github.com/rust-lang/crates.io-index",
+        "version": "1.3.0"
+      },
+      "expected_case": "cases.json#V58"
+    },
+    {
+      "id": "V59",
+      "advisory": "controls/version-profiles/listed_build.json",
+      "member": {
+        "scope": "https://example.invalid/sparkles-fixture/corpus-v1/",
+        "ecosystem": "crates.io",
+        "name": "sparkles-fixture-only-leaf",
+        "source": "registry+https://github.com/rust-lang/crates.io-index",
+        "version": "1.3.0+other"
+      },
+      "expected_case": "cases.json#V59"
+    },
+    {
+      "id": "V60",
+      "advisory": "controls/version-profiles/mixed_positive.json",
+      "member": {
+        "scope": "https://example.invalid/sparkles-fixture/corpus-v1/",
+        "ecosystem": "crates.io",
+        "name": "sparkles-fixture-only-leaf",
+        "source": "registry+https://github.com/rust-lang/crates.io-index",
+        "version": "1.3.0"
+      },
+      "expected_case": "cases.json#V60"
+    },
+    {
+      "id": "V61",
+      "advisory": "controls/version-profiles/mixed_negative.json",
+      "member": {
+        "scope": "https://example.invalid/sparkles-fixture/corpus-v1/",
+        "ecosystem": "crates.io",
+        "name": "sparkles-fixture-only-leaf",
+        "source": "registry+https://github.com/rust-lang/crates.io-index",
+        "version": "1.4.0"
+      },
+      "expected_case": "cases.json#V61"
+    },
+    {
+      "id": "V62",
+      "advisory": "controls/version-profiles/singleton_unsorted.json",
+      "member": {
+        "scope": "https://example.invalid/sparkles-fixture/corpus-v1/",
+        "ecosystem": "crates.io",
+        "name": "sparkles-fixture-only-leaf",
+        "source": "registry+https://github.com/rust-lang/crates.io-index",
+        "version": "1.2.0"
+      },
+      "expected_case": "cases.json#V62"
+    },
+    {
+      "id": "V63",
+      "advisory": "controls/version-profiles/singleton_unsorted.json",
+      "member": {
+        "scope": "https://example.invalid/sparkles-fixture/corpus-v1/",
+        "ecosystem": "crates.io",
+        "name": "sparkles-fixture-only-leaf",
+        "source": "registry+https://github.com/rust-lang/crates.io-index",
+        "version": "1.2.1"
+      },
+      "expected_case": "cases.json#V63"
+    },
+    {
+      "id": "V64",
+      "advisory": "controls/version-profiles/singleton.json",
+      "member": {
+        "scope": "https://example.invalid/sparkles-fixture/corpus-v1/",
+        "ecosystem": "crates.io",
+        "name": "sparkles-fixture-only-leaf",
+        "source": "registry+https://github.com/rust-lang/crates.io-index",
+        "version": "1.2.0+001"
+      },
+      "expected_case": "cases.json#V64"
+    },
+    {
+      "id": "V65",
+      "advisory": "controls/version-profiles/fixed_build.json",
+      "member": {
+        "scope": "https://example.invalid/sparkles-fixture/corpus-v1/",
+        "ecosystem": "crates.io",
+        "name": "sparkles-fixture-only-leaf",
+        "source": "registry+https://github.com/rust-lang/crates.io-index",
+        "version": "1.4.0"
+      },
+      "expected_case": "cases.json#V65"
+    },
+    {
+      "id": "V66",
+      "advisory": "controls/version-profiles/fixed_build.json",
+      "member": {
+        "scope": "https://example.invalid/sparkles-fixture/corpus-v1/",
+        "ecosystem": "crates.io",
+        "name": "sparkles-fixture-only-leaf",
+        "source": "registry+https://github.com/rust-lang/crates.io-index",
+        "version": "1.4.0-rc.1"
+      },
+      "expected_case": "cases.json#V66"
+    },
+    {
+      "id": "V67",
+      "advisory": "controls/version-profiles/limit_reopened.json",
+      "member": {
+        "scope": "https://example.invalid/sparkles-fixture/corpus-v1/",
+        "ecosystem": "crates.io",
+        "name": "sparkles-fixture-only-leaf",
+        "source": "registry+https://github.com/rust-lang/crates.io-index",
+        "version": "1.5.0"
+      },
+      "expected_case": "cases.json#V67"
+    },
+    {
+      "id": "V68",
+      "advisory": "controls/version-profiles/limit_reopened.json",
+      "member": {
+        "scope": "https://example.invalid/sparkles-fixture/corpus-v1/",
+        "ecosystem": "crates.io",
+        "name": "sparkles-fixture-only-leaf",
+        "source": "registry+https://github.com/rust-lang/crates.io-index",
+        "version": "2.0.1"
+      },
+      "expected_case": "cases.json#V68"
+    },
+    {
+      "id": "V69",
+      "advisory": "controls/version-profiles/limit_reopened.json",
+      "member": {
+        "scope": "https://example.invalid/sparkles-fixture/corpus-v1/",
+        "ecosystem": "crates.io",
+        "name": "sparkles-fixture-only-leaf",
+        "source": "registry+https://github.com/rust-lang/crates.io-index",
+        "version": "2.0.5"
+      },
+      "expected_case": "cases.json#V69"
+    },
+    {
+      "id": "V70",
+      "advisory": "controls/version-profiles/limit_multiple_unsorted.json",
+      "member": {
+        "scope": "https://example.invalid/sparkles-fixture/corpus-v1/",
+        "ecosystem": "crates.io",
+        "name": "sparkles-fixture-only-leaf",
+        "source": "registry+https://github.com/rust-lang/crates.io-index",
+        "version": "1.4.0"
+      },
+      "expected_case": "cases.json#V70"
+    },
+    {
+      "id": "V71",
+      "advisory": "controls/version-profiles/base.json",
+      "member": {
+        "scope": "https://example.invalid/sparkles-fixture/corpus-v1/",
+        "ecosystem": "crates.io",
+        "name": "sparkles-fixture-only-leaf",
+        "source": "registry+https://github.com/rust-lang/crates.io-index",
+        "version": "~1.3.0"
+      },
+      "expected_case": "cases.json#V71"
+    },
+    {
+      "id": "V72",
+      "advisory": "controls/version-profiles/base.json",
+      "member": {
+        "scope": "https://example.invalid/sparkles-fixture/corpus-v1/",
+        "ecosystem": "crates.io",
+        "name": "sparkles-fixture-only-leaf",
+        "source": "registry+https://github.com/rust-lang/crates.io-index",
+        "version": "1.3.0-alpha_1"
+      },
+      "expected_case": "cases.json#V72"
+    },
+    {
+      "id": "V73",
+      "advisory": "controls/version-profiles/base.json",
+      "member": {
+        "scope": "https://example.invalid/sparkles-fixture/corpus-v1/",
+        "ecosystem": "crates.io",
+        "name": "sparkles-fixture-only-leaf",
+        "source": "registry+https://github.com/rust-lang/crates.io-index",
+        "version": "1.3.0-"
+      },
+      "expected_case": "cases.json#V73"
+    },
+    {
+      "id": "V74",
+      "advisory": "controls/version-profiles/base.json",
+      "member": {
+        "scope": "https://example.invalid/sparkles-fixture/corpus-v1/",
+        "ecosystem": "crates.io",
+        "name": "sparkles-fixture-only-leaf",
+        "source": "registry+https://github.com/rust-lang/crates.io-index",
+        "version": "1.3.0+001"
+      },
+      "expected_case": "cases.json#V74"
+    },
+    {
+      "id": "V75",
+      "advisory": "controls/version-profiles/empty_information.json",
+      "member": {
+        "scope": "https://example.invalid/sparkles-fixture/corpus-v1/",
+        "ecosystem": "crates.io",
+        "name": "sparkles-fixture-only-leaf",
+        "source": "registry+https://github.com/rust-lang/crates.io-index",
+        "version": "1.3.0"
+      },
+      "expected_case": "cases.json#V75"
+    }
+  ]
+}

@@ -1,0 +1,260 @@
+{
+  "profile": "software-inventory-fixture-fixed-identity-contract/1",
+  "scope": "https://example.invalid/sparkles-fixture/corpus-v1/",
+  "authority": "Fixture-local constants only. No authenticated, global package, issuer, deployment or managed-runtime identity is established.",
+  "inputs": {
+    ".artifacts/handoffs/software-inventory-fixture-plan-20261028/PLAN.md": "5d88c382d2a49a253bef3ffa64ff69f0a63dc189090cb9271f34059b2556cefc",
+    ".artifacts/audits/software-inventory-oracle-20261028/adjudicated-oracle.json": "c5f7f057266107675aa9a65cb1820c88fde7f3d22448a484838fdf5e526e3a71"
+  },
+  "source_channels": {
+    "real_lock": {
+      "source_key": "https://example.invalid/sparkles-fixture/corpus-v1/source/sparkles-cargo-lock",
+      "upstream_revision": "0b34dd317ec3e29160265131f0d1dc53d77279fa",
+      "artifact": "raw/sparkles-Cargo.lock",
+      "repository_locator": "https://github.com/kclejeune/sparkles",
+      "repository_path": "Cargo.lock",
+      "verification_commit": "64092533a3a3b4103c1843536aa7fbe91b445aad"
+    },
+    "synthetic_lock": {
+      "source_key": "https://example.invalid/sparkles-fixture/corpus-v1/source/synthetic-cargo-lock",
+      "upstream_revision": null,
+      "artifacts": [
+        "raw/synthetic-before.Cargo.lock",
+        "raw/synthetic-after.Cargo.lock"
+      ]
+    },
+    "synthetic_advisory": {
+      "source_key": "https://example.invalid/sparkles-fixture/corpus-v1/source/synthetic-osv-primary",
+      "upstream_revision": null,
+      "artifacts": [
+        "raw/advisory-r1.json",
+        "raw/advisory-r2.json",
+        "raw/advisory-withdrawn.json"
+      ],
+      "advisory_id": "x_SPARKLES_FIXTURE-0001"
+    },
+    "synthetic_advisory_mirror": {
+      "source_key": "https://example.invalid/sparkles-fixture/corpus-v1/source/synthetic-osv-mirror",
+      "upstream_revision": null,
+      "use": "Only the already-adjudicated mirror control; preserve distinct source observations and explicit declared shared lineage."
+    },
+    "lock_controls": {
+      "source_key": "https://example.invalid/sparkles-fixture/corpus-v1/source/control-lock",
+      "upstream_revision": null,
+      "use": "Explicitly declared lock parser, resolution and lexical control envelopes."
+    },
+    "advisory_controls": {
+      "source_key": "https://example.invalid/sparkles-fixture/corpus-v1/source/control-advisory",
+      "upstream_revision": null,
+      "use": "Explicitly declared advisory, JSON lexical, version and condition control envelopes."
+    }
+  },
+  "source_channel_rules": [
+    "Source keys are continuing declared channels, not content hashes, filenames or temporary checkout paths.",
+    "Before/after and initial/correction/withdrawal observations retain their channel source key; their exact raw SHA-256 digests enter sourceRevision separately.",
+    "Synthetic labels such as r1, r2, before and after are local artifact labels, not invented upstream revision values; upstreamRevisionOrNull is null.",
+    "The real frozen sample retains the original observation commit as its supplied upstream revision. The later verification commit stays separate metadata. A current-root smoke input supplies its own observed commit and digest.",
+    "Each control envelope declares its channel. Reorder and whitespace controls reuse the declared channel while retaining their distinct raw revision digests.",
+    "Mirror lineage is explicit metadata and never collapses source keys, revision keys, claim occurrences or issuer identities."
+  ],
+  "methods": {
+    "matcher": {
+      "iri": "https://example.invalid/sparkles-fixture/corpus-v1/method/osv-semver-membership",
+      "version": "1",
+      "semver_library": "1.0.28",
+      "comparison": "Version::cmp_precedence",
+      "profile": "software-inventory-fixture/1",
+      "osv_schema": "1.9.2"
+    },
+    "cargo_adapter": {
+      "iri": "https://example.invalid/sparkles-fixture/corpus-v1/method/cargo-lock-v4",
+      "version": "1",
+      "toml_library": "1.1.6+spec-1.1.0"
+    },
+    "toml_selection": {
+      "iri": "https://example.invalid/sparkles-fixture/corpus-v1/method/toml-spanned-string-utf8",
+      "version": "1",
+      "convention": "The independently observed Spanned<String> half-open UTF-8 spans include string delimiters; code-point coordinates and selected-byte digests are recorded separately."
+    },
+    "json_selection": {
+      "iri": "urn:x-sparkles:evidence:normalization:json-lexical-utf8:1",
+      "version": "1",
+      "implementation": "Existing C25 selector and constants, without an alternate lexical parser."
+    },
+    "rdf_export": {
+      "iri": "https://example.invalid/sparkles-fixture/corpus-v1/method/rdf-export",
+      "version": "1"
+    }
+  },
+  "framing": {
+    "status": "unchanged",
+    "magic_hex": "53504b5357495200",
+    "version": 1,
+    "field_count": "u32 big-endian",
+    "field_encoding": "one-byte tag then u64 big-endian UTF-8 byte length then exact bytes; tag 0 is null and requires zero length; tag 1 is a string including empty",
+    "ordinal_encoding": "unsigned decimal strings without leading zeros",
+    "key_encoding": "kind + colon + lowercase SHA-256 hex of complete frame",
+    "normalization": "None. Preserve exact strings, null versus empty, field order, raw build metadata and Unicode bytes."
+  },
+  "tuple_fields": {
+    "sourceRevision": [
+      "scope",
+      "sourceKey",
+      "upstreamRevisionOrNull",
+      "rawDigest"
+    ],
+    "family": [
+      "scope",
+      "ecosystemOrNull",
+      "sourceIdentity",
+      "packageName"
+    ],
+    "release": [
+      "familyKey",
+      "rawVersion"
+    ],
+    "member": [
+      "inventoryRevisionKey",
+      "releaseKey",
+      "packageOrdinal"
+    ],
+    "dependency": [
+      "inventoryRevisionKey",
+      "parentMemberKey",
+      "dependencyOrdinal",
+      "rawToken"
+    ],
+    "advisory": [
+      "scope",
+      "issuerSourceKey",
+      "advisoryId"
+    ],
+    "evaluation": [
+      "inventoryRevisionKey",
+      "memberKey",
+      "advisoryRevisionKey",
+      "affectedOrdinal",
+      "matcherMethod",
+      "matcherVersion"
+    ]
+  },
+  "family_source_identity": "For a source-less member, exact literal inventory-local: followed by its inventory revision key. Preserve every established Cargo source string exactly otherwise; no URL canonicalization or source aliasing.",
+  "rdf_record_iri": {
+    "accepted_key_regex": "^(sourceRevision|family|release|member|dependency|advisory|evaluation):([0-9a-f]{64})$",
+    "mapping": "https://example.invalid/sparkles-fixture/corpus-v1/id/{kind}/{lowercase_hex_digest}",
+    "operation": "Split only the accepted fixed record kind from its lowercase 64-hex digest. Append these two parts literally under the fixed scope id/ prefix. Do not rehash, normalize, drop the kind or mint a managed C25 record ID.",
+    "example_key": "sourceRevision:a9fec51d42f9b85ddae5e048c1c56869095f70c792247ab3a5e729fc487f43d5",
+    "example_iri": "https://example.invalid/sparkles-fixture/corpus-v1/id/sourceRevision/a9fec51d42f9b85ddae5e048c1c56869095f70c792247ab3a5e729fc487f43d5"
+  },
+  "unchanged_semantics": "All adjudicated memberships, applicability states, lineage qualifications, source-less identity limits, coverage states and RDF nonassertion controls remain unchanged. This packet chooses no semantic expected result and grants no matcher/resource adoption.",
+  "raw_digest": {
+    "algorithm": "SHA-256",
+    "representation": "bare lowercase 64-character hexadecimal string",
+    "accepted_regex": "^[0-9a-f]{64}$",
+    "tuple_string_bytes": "Exactly 64 ASCII UTF-8 bytes, encoded using existing string tag 1 and unsigned big-endian u64 length 64. This is neither a 32-byte binary digest nor an algorithm-prefixed string.",
+    "source_bytes": "Hash the exact retained raw source bytes. Compare with the declared field before accepting the source record.",
+    "normalization": "None. Do not add or remove sha256:, lowercase uppercase input, trim whitespace, decode a URI or reinterpret the string.",
+    "manifest_mapping": "Use the exact bare manifest files[artifact].sha256 value for sourceRevision rawDigest.",
+    "rdf_content_digest_mapping": "For the existing C25 ev:contentDigest property, explicitly render the validated IR value as the string sha256: followed by rawDigest. This presentation matches the C25 shape and never feeds back into the tuple field.",
+    "original_vector_scope": "The original seven vectors remain generic framing vectors. Their empty placeholder fields test encoding and are not valid complete sourceRevision records. This field contract does not change those vectors or the generic framer."
+  },
+  "raw_digest_controls": {
+    "positive_known_sources": [
+      {
+        "id": "real-lock",
+        "artifact": "raw/sparkles-Cargo.lock",
+        "raw_bytes": 188764,
+        "raw_digest": "2d895d116a4312467db84a9a096babd119c2abf844791ecc938e37edcbe6c187",
+        "expected_validation": "accept-retained-byte-digest",
+        "rdf_content_digest": "sha256:2d895d116a4312467db84a9a096babd119c2abf844791ecc938e37edcbe6c187",
+        "fields": [
+          "sourceRevision",
+          "https://example.invalid/sparkles-fixture/corpus-v1/",
+          "https://example.invalid/sparkles-fixture/corpus-v1/source/sparkles-cargo-lock",
+          "0b34dd317ec3e29160265131f0d1dc53d77279fa",
+          "2d895d116a4312467db84a9a096babd119c2abf844791ecc938e37edcbe6c187"
+        ],
+        "frame_hex": "53504b5357495200000000010000000501000000000000000e736f757263655265766973696f6e01000000000000003368747470733a2f2f6578616d706c652e696e76616c69642f737061726b6c65732d666978747572652f636f727075732d76312f01000000000000004d68747470733a2f2f6578616d706c652e696e76616c69642f737061726b6c65732d666978747572652f636f727075732d76312f736f757263652f737061726b6c65732d636172676f2d6c6f636b0100000000000000283062333464643331376563336532393136303236353133316630643164633533643737323739666101000000000000004032643839356431313661343331323436376462383461396130393662616264313139633261626638343437393165636339333865333765646362653663313837",
+        "key": "sourceRevision:96a485f439cd33513494713120bd8c4e6fd28e73eb0ab6b85f457e1b8034406c"
+      },
+      {
+        "id": "synthetic-before",
+        "artifact": "raw/synthetic-before.Cargo.lock",
+        "raw_bytes": 1128,
+        "raw_digest": "e4ea7018a1d921f6934ecb75e88b4c54f59b4ec5d2077dcad207d739236ea52a",
+        "expected_validation": "accept-retained-byte-digest",
+        "rdf_content_digest": "sha256:e4ea7018a1d921f6934ecb75e88b4c54f59b4ec5d2077dcad207d739236ea52a",
+        "fields": [
+          "sourceRevision",
+          "https://example.invalid/sparkles-fixture/corpus-v1/",
+          "https://example.invalid/sparkles-fixture/corpus-v1/source/synthetic-cargo-lock",
+          null,
+          "e4ea7018a1d921f6934ecb75e88b4c54f59b4ec5d2077dcad207d739236ea52a"
+        ],
+        "frame_hex": "53504b5357495200000000010000000501000000000000000e736f757263655265766973696f6e01000000000000003368747470733a2f2f6578616d706c652e696e76616c69642f737061726b6c65732d666978747572652f636f727075732d76312f01000000000000004e68747470733a2f2f6578616d706c652e696e76616c69642f737061726b6c65732d666978747572652f636f727075732d76312f736f757263652f73796e7468657469632d636172676f2d6c6f636b00000000000000000001000000000000004065346561373031386131643932316636393334656362373565383862346335346635396234656335643230373764636164323037643733393233366561353261",
+        "key": "sourceRevision:d788e0a7b40b3b0aa4d5e12ea0297dfcdb5a3cbdad0b3400683eca6d73b156bb"
+      },
+      {
+        "id": "advisory-r1",
+        "artifact": "raw/advisory-r1.json",
+        "raw_bytes": 520,
+        "raw_digest": "873fc52252f74c16ce54becb9c2d77a134b0a1370fb373125fdfa1c158d15d12",
+        "expected_validation": "accept-retained-byte-digest",
+        "rdf_content_digest": "sha256:873fc52252f74c16ce54becb9c2d77a134b0a1370fb373125fdfa1c158d15d12",
+        "fields": [
+          "sourceRevision",
+          "https://example.invalid/sparkles-fixture/corpus-v1/",
+          "https://example.invalid/sparkles-fixture/corpus-v1/source/synthetic-osv-primary",
+          null,
+          "873fc52252f74c16ce54becb9c2d77a134b0a1370fb373125fdfa1c158d15d12"
+        ],
+        "frame_hex": "53504b5357495200000000010000000501000000000000000e736f757263655265766973696f6e01000000000000003368747470733a2f2f6578616d706c652e696e76616c69642f737061726b6c65732d666978747572652f636f727075732d76312f01000000000000004f68747470733a2f2f6578616d706c652e696e76616c69642f737061726b6c65732d666978747572652f636f727075732d76312f736f757263652f73796e7468657469632d6f73762d7072696d61727900000000000000000001000000000000004038373366633532323532663734633136636535346265636239633264373761313334623061313337306662333733313235666466613163313538643135643132",
+        "key": "sourceRevision:5066b3937cbcba43685b62b2aa32e30aeb1434361bac41a1e03123772c4bcee7"
+      }
+    ],
+    "negative_known_source_inputs": [
+      {
+        "id": "algorithm-prefix",
+        "artifact": "raw/sparkles-Cargo.lock",
+        "raw_digest_field": "sha256:2d895d116a4312467db84a9a096babd119c2abf844791ecc938e37edcbe6c187",
+        "expected_validation": "reject-raw-digest-format",
+        "generic_unvalidated_frame_hex": "53504b5357495200000000010000000501000000000000000e736f757263655265766973696f6e01000000000000003368747470733a2f2f6578616d706c652e696e76616c69642f737061726b6c65732d666978747572652f636f727075732d76312f01000000000000004d68747470733a2f2f6578616d706c652e696e76616c69642f737061726b6c65732d666978747572652f636f727075732d76312f736f757263652f737061726b6c65732d636172676f2d6c6f636b010000000000000028306233346464333137656333653239313630323635313331663064316463353364373732373966610100000000000000477368613235363a32643839356431313661343331323436376462383461396130393662616264313139633261626638343437393165636339333865333765646362653663313837",
+        "generic_unvalidated_key": "sourceRevision:c37d17f4443978b05eec54d7a0c0600df6dc464dc326731edfb59263ef6d378b",
+        "must_not_equal_valid_key": "sourceRevision:96a485f439cd33513494713120bd8c4e6fd28e73eb0ab6b85f457e1b8034406c",
+        "rule": "Generic encoding exposes the different bytes; the source record must be refused before the source record is accepted. Never normalize this input into the positive record."
+      },
+      {
+        "id": "uppercase",
+        "artifact": "raw/sparkles-Cargo.lock",
+        "raw_digest_field": "2D895D116A4312467DB84A9A096BABD119C2ABF844791ECC938E37EDCBE6C187",
+        "expected_validation": "reject-raw-digest-format",
+        "generic_unvalidated_frame_hex": "53504b5357495200000000010000000501000000000000000e736f757263655265766973696f6e01000000000000003368747470733a2f2f6578616d706c652e696e76616c69642f737061726b6c65732d666978747572652f636f727075732d76312f01000000000000004d68747470733a2f2f6578616d706c652e696e76616c69642f737061726b6c65732d666978747572652f636f727075732d76312f736f757263652f737061726b6c65732d636172676f2d6c6f636b0100000000000000283062333464643331376563336532393136303236353133316630643164633533643737323739666101000000000000004032443839354431313641343331323436374442383441394130393642414244313139433241424638343437393145434339333845333745444342453643313837",
+        "generic_unvalidated_key": "sourceRevision:1e996b276d64dbe53cc5f95b9ca5e134e1ee50f1b1cfba043f7edc50f486bc47",
+        "must_not_equal_valid_key": "sourceRevision:96a485f439cd33513494713120bd8c4e6fd28e73eb0ab6b85f457e1b8034406c",
+        "rule": "Generic encoding exposes the different bytes; the source record must be refused before the source record is accepted. Never normalize this input into the positive record."
+      },
+      {
+        "id": "leading-space",
+        "artifact": "raw/sparkles-Cargo.lock",
+        "raw_digest_field": " 2d895d116a4312467db84a9a096babd119c2abf844791ecc938e37edcbe6c187",
+        "expected_validation": "reject-raw-digest-format",
+        "generic_unvalidated_frame_hex": "53504b5357495200000000010000000501000000000000000e736f757263655265766973696f6e01000000000000003368747470733a2f2f6578616d706c652e696e76616c69642f737061726b6c65732d666978747572652f636f727075732d76312f01000000000000004d68747470733a2f2f6578616d706c652e696e76616c69642f737061726b6c65732d666978747572652f636f727075732d76312f736f757263652f737061726b6c65732d636172676f2d6c6f636b010000000000000028306233346464333137656333653239313630323635313331663064316463353364373732373966610100000000000000412032643839356431313661343331323436376462383461396130393662616264313139633261626638343437393165636339333865333765646362653663313837",
+        "generic_unvalidated_key": "sourceRevision:055086909476fba120424c4330789e2d03b08bc45a19a5c07b0d6a0b4ebd49ec",
+        "must_not_equal_valid_key": "sourceRevision:96a485f439cd33513494713120bd8c4e6fd28e73eb0ab6b85f457e1b8034406c",
+        "rule": "Generic encoding exposes the different bytes; the source record must be refused before the source record is accepted. Never normalize this input into the positive record."
+      },
+      {
+        "id": "changed-bare-digest",
+        "artifact": "raw/sparkles-Cargo.lock",
+        "raw_digest_field": "0d895d116a4312467db84a9a096babd119c2abf844791ecc938e37edcbe6c187",
+        "expected_validation": "reject-retained-byte-digest-mismatch",
+        "generic_unvalidated_frame_hex": "53504b5357495200000000010000000501000000000000000e736f757263655265766973696f6e01000000000000003368747470733a2f2f6578616d706c652e696e76616c69642f737061726b6c65732d666978747572652f636f727075732d76312f01000000000000004d68747470733a2f2f6578616d706c652e696e76616c69642f737061726b6c65732d666978747572652f636f727075732d76312f736f757263652f737061726b6c65732d636172676f2d6c6f636b0100000000000000283062333464643331376563336532393136303236353133316630643164633533643737323739666101000000000000004030643839356431313661343331323436376462383461396130393662616264313139633261626638343437393165636339333865333765646362653663313837",
+        "generic_unvalidated_key": "sourceRevision:e0d5a9d27ce6d46f9f02b210234652d43d0b51d1a74901c75143241dd6617917",
+        "must_not_equal_valid_key": "sourceRevision:96a485f439cd33513494713120bd8c4e6fd28e73eb0ab6b85f457e1b8034406c",
+        "rule": "Generic encoding exposes the different bytes; the source record must be refused before the source record is accepted. Never normalize this input into the positive record."
+      }
+    ],
+    "original_seven_vectors_verified_unchanged": true,
+    "adjudicated_oracle_sha256": "c5f7f057266107675aa9a65cb1820c88fde7f3d22448a484838fdf5e526e3a71"
+  }
+}

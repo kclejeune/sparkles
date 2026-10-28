@@ -1,0 +1,166 @@
+{
+  "lock-version-3.toml": {
+    "case": "P06",
+    "positive_control": "raw/synthetic-before.Cargo.lock"
+  },
+  "duplicate-package.toml": {
+    "case": "P05",
+    "positive_control": "raw/synthetic-before.Cargo.lock"
+  },
+  "legacy-replace.toml": {
+    "case": "A35",
+    "positive_control": "raw/synthetic-before.Cargo.lock",
+    "expected": "unsupported-top-level-field",
+    "field_path": "replace",
+    "failure_stage": "lock-field-validation"
+  },
+  "dependency-trailing-space.toml": {
+    "case": "A08",
+    "positive_control": "raw/synthetic-before.Cargo.lock"
+  },
+  "checksum-invalid.toml": {
+    "case": "A09",
+    "positive_control": "raw/synthetic-before.Cargo.lock"
+  },
+  "package-extension.toml": {
+    "case": "A35",
+    "positive_control": "raw/synthetic-before.Cargo.lock"
+  },
+  "advisory-schema-missing.json": {
+    "case": "A21",
+    "positive_control": "raw/advisory-r1.json"
+  },
+  "advisory-schema-1.0.0.json": {
+    "case": "A21",
+    "positive_control": "raw/advisory-r1.json"
+  },
+  "advisory-schema-1.9.3.json": {
+    "case": "A21",
+    "positive_control": "raw/advisory-r1.json"
+  },
+  "advisory-schema-2.0.0.json": {
+    "case": "A21",
+    "positive_control": "raw/advisory-r1.json"
+  },
+  "advisory-nonstring-event.json": {
+    "case": "A22",
+    "positive_control": "raw/advisory-r1.json"
+  },
+  "advisory-multiple-event-types.json": {
+    "case": "R01",
+    "positive_control": "raw/advisory-r1.json"
+  },
+  "duplicate-decoded-json-key.json": {
+    "case": "E04",
+    "positive_control": "raw/json-lexical/pointer.json"
+  },
+  "advisory-no-introduction.json": {
+    "case": "R02",
+    "positive_control": "raw/advisory-r1.json"
+  },
+  "advisory-fixed-and-last.json": {
+    "case": "R03",
+    "positive_control": "raw/advisory-r1.json"
+  },
+  "advisory-equal-fixed.json": {
+    "case": "R04",
+    "positive_control": "raw/advisory-r1.json"
+  },
+  "advisory-reversed.json": {
+    "case": "R05",
+    "positive_control": "raw/advisory-r1.json"
+  },
+  "advisory-empty-event.json": {
+    "case": "A22",
+    "positive_control": "raw/advisory-r1.json"
+  },
+  "advisory-duplicate-introduced.json": {
+    "case": "A25",
+    "positive_control": "raw/advisory-r1.json"
+  },
+  "duplicate-empty-affected.json": {
+    "case": "A32",
+    "positive_control": "raw/advisory-empty-affected.json"
+  },
+  "dependency-ambiguous-name.toml": {
+    "case": "P01",
+    "positive_control": "raw/synthetic-before.Cargo.lock"
+  },
+  "dependency-ambiguous-source.toml": {
+    "case": "P02",
+    "positive_control": "raw/qualified-custom-registry.Cargo.lock"
+  },
+  "dependency-dangling.toml": {
+    "case": "P04",
+    "positive_control": "raw/synthetic-before.Cargo.lock"
+  },
+  "dependency-double-space.toml": {
+    "case": "A08",
+    "positive_control": "raw/synthetic-before.Cargo.lock"
+  },
+  "checksum-missing.toml": {
+    "case": "A09",
+    "positive_control": "raw/synthetic-before.Cargo.lock"
+  },
+  "checksum-non-string.toml": {
+    "case": "A09",
+    "positive_control": "raw/synthetic-before.Cargo.lock"
+  },
+  "patch-unused.toml": {
+    "case": "P07",
+    "positive_control": "raw/synthetic-before.Cargo.lock"
+  },
+  "selector-bad-digest.json": {
+    "case": "E05",
+    "positive_control": "expected/json-lexical.json"
+  },
+  "selector-wrong-pointer.json": {
+    "case": "E05",
+    "positive_control": "expected/json-lexical.json"
+  },
+  "selector-inside-codepoint.json": {
+    "case": "A36",
+    "positive_control": "expected/json-lexical.json"
+  },
+  "malformed-sibling.json": {
+    "case": "A18",
+    "positive_control": "raw/advisory-r1.json"
+  },
+  "overlapping-ranges.json": {
+    "case": "A29",
+    "positive_control": "controls/adjacent-ranges.json"
+  },
+  "asserted-affected-by.trig": {
+    "case": "A33",
+    "positive_control": "expected/fixture.trig",
+    "expected_default_ask": true,
+    "expected_named_ask": true
+  },
+  "advisory-equal-limit.json": {
+    "case": "A28",
+    "positive_control": "controls/version-profiles/singleton.json"
+  },
+  "source-digest-algorithm-prefix.json": {
+    "case": "E05",
+    "positive_control": "identity-contract.json"
+  },
+  "source-digest-uppercase.json": {
+    "case": "E05",
+    "positive_control": "identity-contract.json"
+  },
+  "source-digest-leading-space.json": {
+    "case": "E05",
+    "positive_control": "identity-contract.json"
+  },
+  "source-digest-changed-bare-digest.json": {
+    "case": "E05",
+    "positive_control": "identity-contract.json"
+  },
+  "package-replace.toml": {
+    "case": "P07",
+    "positive_control": "raw/synthetic-before.Cargo.lock",
+    "expected": "unsupported-package-replacement",
+    "field_path": "package[1].replace",
+    "failure_stage": "package-field-validation"
+  }
+}

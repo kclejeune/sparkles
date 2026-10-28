@@ -1,0 +1,43 @@
+version = 4
+
+[[package]]
+name = "sparkles-fixture-only-app"
+version = "0.1.0"
+dependencies = [
+ "sparkles-fixture-only-left",
+ "sparkles-fixture-only-left",
+ "sparkles-fixture-only-right",
+]
+
+[[package]]
+name = "sparkles-fixture-only-left"
+version = "1.0.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc"
+dependencies = [
+ "sparkles-fixture-only-leaf 1.3.0",
+]
+
+[[package]]
+name = "sparkles-fixture-only-right"
+version = "1.0.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc"
+dependencies = [
+ "sparkles-fixture-only-leaf 1.3.0",
+]
+
+[[package]]
+name = "sparkles-fixture-only-leaf"
+version = "1.3.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc"
+dependencies = [
+ "sparkles-fixture-only-app",
+]
+
+[[package]]
+name = "sparkles-fixture-only-leaf"
+version = "1.3.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc"

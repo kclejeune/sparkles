@@ -1,0 +1,16 @@
+PREFIX si: <https://example.invalid/sparkles-fixture/corpus-v1/vocab/>
+PREFIX ev: <urn:x-sparkles:evidence:>
+PREFIX prov: <http://www.w3.org/ns/prov#>
+PREFIX rdf: <http://www.w3.org/1999/02/22-rdf-syntax-ns#>
+SELECT ?revision ?source ?digest ?label ?role ?lineage ?advisory ?claim ?evidence ?independence WHERE {
+  ?revision a ev:SourceRevision ; prov:specializationOf ?source ; ev:contentDigest ?digest ; si:localLabel ?label ; si:revisionRole ?role .
+  OPTIONAL { ?source ev:sourceFamily ?lineage }
+  OPTIONAL {
+    ?claim a ev:Claim ; prov:wasDerivedFrom ?revision ; rdf:reifies ?proposition .
+    BIND(OBJECT(?proposition) AS ?advisory)
+    ?link a ev:EvidenceLink ; ev:target ?claim ; ev:evidence ?evidence .
+    ?evidence ev:sourceRevision ?revision .
+  }
+  BIND("unknown" AS ?independence)
+}
+ORDER BY ?revision

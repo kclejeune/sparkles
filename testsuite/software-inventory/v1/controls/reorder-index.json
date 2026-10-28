@@ -1,0 +1,12 @@
+{
+  "lock": {
+    "control": "controls/reordered-lock.toml",
+    "positive_control": "raw/synthetic-before.Cargo.lock",
+    "expectation": "Same package tuples and raw dependency tokens, with new source revision and changed package ordinals. Do not equate occurrence keys across revisions."
+  },
+  "advisory": {
+    "control": "controls/reordered-advisory.json",
+    "positive_control": "raw/advisory-r1.json",
+    "expectation": "Same decoded advisory data and membership. Raw revision changes; do not assume every selected lexical value digest changes."
+  }
+}

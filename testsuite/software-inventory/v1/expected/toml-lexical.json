@@ -1,0 +1,95 @@
+{
+  "parser": "toml 1.1.6+spec-1.1.0",
+  "field_type": "toml::Spanned<String>",
+  "convention": "Half-open UTF-8 byte ranges include the lexical string delimiters.",
+  "probe_source_sha256": "1ccfd057e7af77c39189fb04c4521adf4613a874d7d1917a68bd06ba6853979f",
+  "probe_lock_sha256": "7ef9e9f59e2c609ccae22821100f3dba516e8a1125a2834976b5241933d0d459",
+  "probe_stdout_sha256": "759f09e28c120f0b80db413d27cfec9f7f1af62ff894d68b8e3b82b451a472a6",
+  "slices": [
+    {
+      "source": "raw/lexical/ascii.toml",
+      "source_sha256": "0d339ccc128188817f4ee876e2496b63291c99ae4cf23c8404dbe816450a460b",
+      "source_ordinal": 0,
+      "field": "selected",
+      "byte_range": [
+        11,
+        18
+      ],
+      "codepoint_range": [
+        11,
+        18
+      ],
+      "selected_utf8": "\"hello\"",
+      "selected_sha256": "5aa762ae383fbb727af3c7a36d4940a5b8c40a989452d2304fc958ff3f354e7a",
+      "decoded_value": "hello"
+    },
+    {
+      "source": "raw/lexical/basic-escape.toml",
+      "source_sha256": "84ce598a8f930148f28652add48cf8f4145bb8ce5ed9b76368991f6e0f6162fd",
+      "source_ordinal": 0,
+      "field": "selected",
+      "byte_range": [
+        11,
+        17
+      ],
+      "codepoint_range": [
+        11,
+        17
+      ],
+      "selected_utf8": "\"a\\nb\"",
+      "selected_sha256": "8cb67f89f9ff0e25bb064da96907151d8e0eb7a5c0d4cde1b72ad1c9a30c065e",
+      "decoded_value": "a\nb"
+    },
+    {
+      "source": "raw/lexical/literal.toml",
+      "source_sha256": "7dd7edb0df2fcd26e8999bc3be145659071a93ba78c317fb55c33e12aa8aebd5",
+      "source_ordinal": 0,
+      "field": "selected",
+      "byte_range": [
+        11,
+        17
+      ],
+      "codepoint_range": [
+        11,
+        17
+      ],
+      "selected_utf8": "'a\\nb'",
+      "selected_sha256": "34662832ed01812c990f782c660c0c4aeb99a0758037a82a9fee239c1e21e3b5",
+      "decoded_value": "a\\nb"
+    },
+    {
+      "source": "raw/lexical/unicode-before.toml",
+      "source_sha256": "b88b4bdb141480df686170d5f295100b261c78d490d3b13dbf533b1828a64906",
+      "source_ordinal": 0,
+      "field": "selected",
+      "byte_range": [
+        28,
+        35
+      ],
+      "codepoint_range": [
+        25,
+        32
+      ],
+      "selected_utf8": "\"hello\"",
+      "selected_sha256": "5aa762ae383fbb727af3c7a36d4940a5b8c40a989452d2304fc958ff3f354e7a",
+      "decoded_value": "hello"
+    },
+    {
+      "source": "raw/lexical/crlf.toml",
+      "source_sha256": "82e76a6f7338cc86c62a3d4bbda6d0051a3a91a31a2c2e52373c30f0f88f584a",
+      "source_ordinal": 0,
+      "field": "selected",
+      "byte_range": [
+        29,
+        36
+      ],
+      "codepoint_range": [
+        29,
+        36
+      ],
+      "selected_utf8": "\"hello\"",
+      "selected_sha256": "5aa762ae383fbb727af3c7a36d4940a5b8c40a989452d2304fc958ff3f354e7a",
+      "decoded_value": "hello"
+    }
+  ]
+}

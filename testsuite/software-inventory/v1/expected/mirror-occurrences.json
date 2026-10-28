@@ -1,0 +1,103 @@
+{
+  "case_ids": [
+    "A01",
+    "I10"
+  ],
+  "primary_and_mirror": [
+    {
+      "source_label": "r1",
+      "source": "raw/advisory-r1.json",
+      "source_key": "https://example.invalid/sparkles-fixture/corpus-v1/source/synthetic-osv-primary",
+      "source_revision": "https://example.invalid/sparkles-fixture/corpus-v1/id/sourceRevision/5066b3937cbcba43685b62b2aa32e30aeb1434361bac41a1e03123772c4bcee7",
+      "source_sha256": "873fc52252f74c16ce54becb9c2d77a134b0a1370fb373125fdfa1c158d15d12",
+      "advisory": "https://example.invalid/sparkles-fixture/corpus-v1/id/advisory/3843f39dd1db71231b982dee3871ccf967a63034095dd36b76b7928643a76671",
+      "claim": "https://example.invalid/sparkles-fixture/corpus-v1/claim/r1-leaf-1.3.0",
+      "evidence": "https://example.invalid/sparkles-fixture/corpus-v1/evidence/r1/affected-0",
+      "evidence_link": "https://example.invalid/sparkles-fixture/corpus-v1/link/r1-affected-0",
+      "pointer": "/affected/0",
+      "method": "urn:x-sparkles:evidence:normalization:json-lexical-utf8:1",
+      "method_version": "1",
+      "byte_range": [
+        167,
+        513
+      ],
+      "codepoint_range": [
+        167,
+        513
+      ],
+      "selected_utf8": "{\n      \"package\": {\n        \"ecosystem\": \"crates.io\",\n        \"name\": \"sparkles-fixture-only-leaf\"\n      },\n      \"ranges\": [\n        {\n          \"type\": \"SEMVER\",\n          \"events\": [\n            {\n              \"introduced\": \"1.2.0\"\n            },\n            {\n              \"fixed\": \"1.4.0\"\n            }\n          ]\n        }\n      ]\n    }",
+      "selected_sha256": "ff56a5714f4b81b0685d542eb7d83527f174e599f5225e66c3946c138cd54be8",
+      "decoded_value": {
+        "package": {
+          "ecosystem": "crates.io",
+          "name": "sparkles-fixture-only-leaf"
+        },
+        "ranges": [
+          {
+            "type": "SEMVER",
+            "events": [
+              {
+                "introduced": "1.2.0"
+              },
+              {
+                "fixed": "1.4.0"
+              }
+            ]
+          }
+        ]
+      },
+      "lineage": "https://example.invalid/sparkles-fixture/corpus-v1/lineage/synthetic-osv",
+      "independence": "unknown"
+    },
+    {
+      "source_label": "mirror",
+      "source": "raw/advisory-r1.json",
+      "source_key": "https://example.invalid/sparkles-fixture/corpus-v1/source/synthetic-osv-mirror",
+      "source_revision": "https://example.invalid/sparkles-fixture/corpus-v1/id/sourceRevision/e11ba4e7abb236fee9888ea5972c612b0bb05fa6e5dcb97382fba16fdd82bc2e",
+      "source_sha256": "873fc52252f74c16ce54becb9c2d77a134b0a1370fb373125fdfa1c158d15d12",
+      "advisory": "https://example.invalid/sparkles-fixture/corpus-v1/id/advisory/2b9d256acba637101bb3f0b01e36b906797a1fb1a3c355381f628b5f76d2e4e7",
+      "claim": "https://example.invalid/sparkles-fixture/corpus-v1/claim/mirror-leaf-1.3.0",
+      "evidence": "https://example.invalid/sparkles-fixture/corpus-v1/evidence/mirror/affected-0",
+      "evidence_link": "https://example.invalid/sparkles-fixture/corpus-v1/link/mirror-affected-0",
+      "pointer": "/affected/0",
+      "method": "urn:x-sparkles:evidence:normalization:json-lexical-utf8:1",
+      "method_version": "1",
+      "byte_range": [
+        167,
+        513
+      ],
+      "codepoint_range": [
+        167,
+        513
+      ],
+      "selected_utf8": "{\n      \"package\": {\n        \"ecosystem\": \"crates.io\",\n        \"name\": \"sparkles-fixture-only-leaf\"\n      },\n      \"ranges\": [\n        {\n          \"type\": \"SEMVER\",\n          \"events\": [\n            {\n              \"introduced\": \"1.2.0\"\n            },\n            {\n              \"fixed\": \"1.4.0\"\n            }\n          ]\n        }\n      ]\n    }",
+      "selected_sha256": "ff56a5714f4b81b0685d542eb7d83527f174e599f5225e66c3946c138cd54be8",
+      "decoded_value": {
+        "package": {
+          "ecosystem": "crates.io",
+          "name": "sparkles-fixture-only-leaf"
+        },
+        "ranges": [
+          {
+            "type": "SEMVER",
+            "events": [
+              {
+                "introduced": "1.2.0"
+              },
+              {
+                "fixed": "1.4.0"
+              }
+            ]
+          }
+        ]
+      },
+      "lineage": "https://example.invalid/sparkles-fixture/corpus-v1/lineage/synthetic-osv",
+      "independence": "unknown"
+    }
+  ],
+  "distinct_claim_occurrences": 2,
+  "declared_lineage_origins": 1,
+  "independent_vote_count": null,
+  "nonassertion_default": false,
+  "nonassertion_named": false
+}

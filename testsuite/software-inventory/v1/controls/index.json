@@ -1,0 +1,50 @@
+{
+  "unsupported-sibling.json": {
+    "case": "A17",
+    "inventory": "raw/synthetic-before.Cargo.lock",
+    "positive_control": "raw/advisory-r1.json",
+    "expected": "For leaf 1.3.0 the supported included branch makes union membership included when there is no unresolved required condition."
+  },
+  "unknown-platform.json": {
+    "case": "A15",
+    "inventory": "raw/synthetic-before.Cargo.lock",
+    "positive_control": "raw/advisory-r1.json",
+    "expected": "For leaf 1.3.0 version membership is included and overall applicability remains unknown."
+  },
+  "database-metadata.json": {
+    "case": "A16",
+    "inventory": "raw/synthetic-before.Cargo.lock",
+    "positive_control": "raw/advisory-r1.json",
+    "expected": "For leaf 1.3.0 version membership and applicability remain as in the positive control."
+  },
+  "partial-star-limit.json": {
+    "case": "A23",
+    "positive_control": "raw/advisory-r1.json",
+    "inventory": "raw/synthetic-before.Cargo.lock",
+    "expected": "Unsupported bound, never an exclusion."
+  },
+  "fixed-with-limit.json": {
+    "case": "A24",
+    "positive_control": "raw/advisory-r1.json",
+    "inventory": "raw/synthetic-before.Cargo.lock",
+    "expected": "The fixed transition and independent limit guard are retained."
+  },
+  "entries-excluded-unknown.json": {
+    "case": "A19",
+    "positive_control": "raw/advisory-r1.json",
+    "inventory": "raw/synthetic-before.Cargo.lock",
+    "expected": "For leaf 1.3.0 retain excluded and unknown entry rows; the aggregate is unknown."
+  },
+  "entries-included-unknown.json": {
+    "case": "A20",
+    "positive_control": "raw/advisory-r1.json",
+    "inventory": "raw/synthetic-before.Cargo.lock",
+    "expected": "For leaf 1.3.0 retain included and unknown entry rows; the aggregate is included when conditions are resolved."
+  },
+  "adjacent-ranges.json": {
+    "case": "A29",
+    "positive_control": "raw/advisory-r1.json",
+    "inventory": "raw/synthetic-before.Cargo.lock",
+    "expected": "Adjacent nonoverlapping intervals are supported."
+  }
+}

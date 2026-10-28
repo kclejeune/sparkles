@@ -1,0 +1,34 @@
+@prefix si: <https://example.invalid/sparkles-fixture/corpus-v1/vocab/> .
+@prefix rdfs: <http://www.w3.org/2000/01/rdf-schema#> .
+@prefix rdf: <http://www.w3.org/1999/02/22-rdf-syntax-ns#> .
+
+si:Member a rdfs:Class ; rdfs:comment "A member of one supplied lock revision." .
+si:Dependency a rdfs:Class ; rdfs:comment "One occurrence in a lock record, including its source ordinal." .
+si:Witness a rdfs:Class ; rdfs:comment "One bounded lock-graph path, without runtime implications." .
+si:Evaluation a rdfs:Class ; rdfs:comment "An offline per-entry evaluation, not an accepted affectedBy assertion." .
+si:Coverage a rdfs:Class ; rdfs:comment "An explicit limitation of the supplied offline evidence." .
+si:inventoryRevision a rdf:Property .
+si:packageName a rdf:Property .
+si:rawVersion a rdf:Property .
+si:release a rdf:Property .
+si:sourceIdentity a rdf:Property .
+si:declaredChecksum a rdf:Property .
+si:member a rdf:Property .
+si:parent a rdf:Property .
+si:target a rdf:Property .
+si:ordinal a rdf:Property .
+si:rawToken a rdf:Property .
+si:root a rdf:Property .
+si:path a rdf:Property .
+si:advisoryRevision a rdf:Property .
+si:membership a rdf:Property .
+si:applicability a rdf:Property .
+si:coverageKind a rdf:Property .
+si:coverageState a rdf:Property .
+si:localLabel a rdf:Property .
+si:revisionRole a rdf:Property .
+si:affectedBy a rdf:Property ; rdfs:comment "A proposition only. Fixture source reports do not assert it." .
+
+si:Advisory a rdfs:Class .
+si:advisoryId a rdf:Property .
+si:issuerSource a rdf:Property .

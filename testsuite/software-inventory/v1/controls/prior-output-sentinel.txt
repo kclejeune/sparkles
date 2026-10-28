@@ -1,0 +1,1 @@
+pre-existing software-inventory fixture output

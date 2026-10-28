@@ -1,0 +1,29 @@
+@prefix si: <https://example.invalid/sparkles-fixture/corpus-v1/vocab/> .
+@prefix sh: <http://www.w3.org/ns/shacl#> .
+@prefix xsd: <http://www.w3.org/2001/XMLSchema#> .
+
+si:MemberShape a sh:NodeShape ; sh:targetClass si:Member ; sh:nodeKind sh:IRI ;
+  sh:property [ sh:path si:inventoryRevision ; sh:nodeKind sh:IRI ; sh:minCount 1 ; sh:maxCount 1 ] ;
+  sh:property [ sh:path si:release ; sh:nodeKind sh:IRI ; sh:minCount 1 ; sh:maxCount 1 ] ;
+  sh:property [ sh:path si:sourceIdentity ; sh:datatype xsd:string ; sh:minCount 1 ; sh:maxCount 1 ] ;
+  sh:property [ sh:path si:declaredChecksum ; sh:datatype xsd:string ; sh:pattern "^[0-9a-f]{64}$" ; sh:maxCount 1 ] ;
+  sh:property [ sh:path si:packageName ; sh:datatype xsd:string ; sh:minCount 1 ; sh:maxCount 1 ] ;
+  sh:property [ sh:path si:rawVersion ; sh:datatype xsd:string ; sh:minCount 1 ; sh:maxCount 1 ] .
+si:DependencyShape a sh:NodeShape ; sh:targetClass si:Dependency ; sh:nodeKind sh:IRI ;
+  sh:property [ sh:path si:inventoryRevision ; sh:nodeKind sh:IRI ; sh:minCount 1 ; sh:maxCount 1 ] ;
+  sh:property [ sh:path si:parent ; sh:nodeKind sh:IRI ; sh:minCount 1 ; sh:maxCount 1 ] ;
+  sh:property [ sh:path si:target ; sh:nodeKind sh:IRI ; sh:minCount 1 ; sh:maxCount 1 ] ;
+  sh:property [ sh:path si:ordinal ; sh:datatype xsd:integer ; sh:minInclusive 0 ; sh:minCount 1 ; sh:maxCount 1 ] ;
+  sh:property [ sh:path si:rawToken ; sh:datatype xsd:string ; sh:minCount 1 ; sh:maxCount 1 ] .
+si:EvaluationShape a sh:NodeShape ; sh:targetClass si:Evaluation ; sh:nodeKind sh:IRI ;
+  sh:property [ sh:path si:member ; sh:nodeKind sh:IRI ; sh:minCount 1 ; sh:maxCount 1 ] ;
+  sh:property [ sh:path si:advisoryRevision ; sh:nodeKind sh:IRI ; sh:minCount 1 ; sh:maxCount 1 ] ;
+  sh:property [ sh:path si:membership ; sh:in ( "included" "excluded" "unknown" "not-evaluated" ) ; sh:minCount 1 ; sh:maxCount 1 ] ;
+  sh:property [ sh:path si:applicability ; sh:in ( "affected-in-declared-scope" "not-affected-in-declared-scope" "unknown" "not-applicable-identity" ) ; sh:minCount 1 ; sh:maxCount 1 ] .
+si:CoverageShape a sh:NodeShape ; sh:targetClass si:Coverage ; sh:nodeKind sh:IRI ;
+  sh:property [ sh:path si:coverageKind ; sh:datatype xsd:string ; sh:minCount 1 ; sh:maxCount 1 ] ;
+  sh:property [ sh:path si:coverageState ; sh:hasValue "unknown" ; sh:minCount 1 ; sh:maxCount 1 ] .
+
+si:AdvisoryShape a sh:NodeShape ; sh:targetClass si:Advisory ; sh:nodeKind sh:IRI ;
+  sh:property [ sh:path si:advisoryId ; sh:datatype xsd:string ; sh:minCount 1 ; sh:maxCount 1 ] ;
+  sh:property [ sh:path si:issuerSource ; sh:nodeKind sh:IRI ; sh:minCount 1 ; sh:maxCount 1 ] .

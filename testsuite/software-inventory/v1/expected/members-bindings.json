@@ -1,0 +1,298 @@
+[
+  {
+    "member": {
+      "type": "uri",
+      "value": "https://example.invalid/sparkles-fixture/corpus-v1/id/member/0c9527554b5b2479546d36f51362b5fa111274b591d37c244d6c92777e7207bf"
+    },
+    "revision": {
+      "type": "uri",
+      "value": "https://example.invalid/sparkles-fixture/corpus-v1/id/sourceRevision/7fb1fac121e74940f348f9f003b0bf5c37218b422f819a5400a4c17d6e988ef8"
+    },
+    "release": {
+      "type": "uri",
+      "value": "https://example.invalid/sparkles-fixture/corpus-v1/id/release/c7d3b8ceda1bff76d8dee71483fb87f7412f860054559857be305418ae486696"
+    },
+    "name": {
+      "type": "literal",
+      "value": "sparkles-fixture-only-unrelated",
+      "datatype": "http://www.w3.org/2001/XMLSchema#string"
+    },
+    "version": {
+      "type": "literal",
+      "value": "1.3.0",
+      "datatype": "http://www.w3.org/2001/XMLSchema#string"
+    },
+    "source": {
+      "type": "literal",
+      "value": "registry+https://github.com/rust-lang/crates.io-index",
+      "datatype": "http://www.w3.org/2001/XMLSchema#string"
+    },
+    "checksum": {
+      "type": "literal",
+      "value": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      "datatype": "http://www.w3.org/2001/XMLSchema#string"
+    }
+  },
+  {
+    "member": {
+      "type": "uri",
+      "value": "https://example.invalid/sparkles-fixture/corpus-v1/id/member/4fa2ae75b6a81756210d08f3d171053d293f59466fa545228ac8ad5cf2bb896d"
+    },
+    "revision": {
+      "type": "uri",
+      "value": "https://example.invalid/sparkles-fixture/corpus-v1/id/sourceRevision/d788e0a7b40b3b0aa4d5e12ea0297dfcdb5a3cbdad0b3400683eca6d73b156bb"
+    },
+    "release": {
+      "type": "uri",
+      "value": "https://example.invalid/sparkles-fixture/corpus-v1/id/release/f2b5e566a5035f294efe160c5403893605c3bd3cd3086d8896e381977abd3001"
+    },
+    "name": {
+      "type": "literal",
+      "value": "sparkles-fixture-only-bridge",
+      "datatype": "http://www.w3.org/2001/XMLSchema#string"
+    },
+    "version": {
+      "type": "literal",
+      "value": "1.0.0",
+      "datatype": "http://www.w3.org/2001/XMLSchema#string"
+    },
+    "source": {
+      "type": "literal",
+      "value": "registry+https://github.com/rust-lang/crates.io-index",
+      "datatype": "http://www.w3.org/2001/XMLSchema#string"
+    },
+    "checksum": {
+      "type": "literal",
+      "value": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      "datatype": "http://www.w3.org/2001/XMLSchema#string"
+    }
+  },
+  {
+    "member": {
+      "type": "uri",
+      "value": "https://example.invalid/sparkles-fixture/corpus-v1/id/member/909145c10ac5d985c3f396853d8ec3b49d53157028f9001a88f4fbf66c7d30f8"
+    },
+    "revision": {
+      "type": "uri",
+      "value": "https://example.invalid/sparkles-fixture/corpus-v1/id/sourceRevision/7fb1fac121e74940f348f9f003b0bf5c37218b422f819a5400a4c17d6e988ef8"
+    },
+    "release": {
+      "type": "uri",
+      "value": "https://example.invalid/sparkles-fixture/corpus-v1/id/release/f2b5e566a5035f294efe160c5403893605c3bd3cd3086d8896e381977abd3001"
+    },
+    "name": {
+      "type": "literal",
+      "value": "sparkles-fixture-only-bridge",
+      "datatype": "http://www.w3.org/2001/XMLSchema#string"
+    },
+    "version": {
+      "type": "literal",
+      "value": "1.0.0",
+      "datatype": "http://www.w3.org/2001/XMLSchema#string"
+    },
+    "source": {
+      "type": "literal",
+      "value": "registry+https://github.com/rust-lang/crates.io-index",
+      "datatype": "http://www.w3.org/2001/XMLSchema#string"
+    },
+    "checksum": {
+      "type": "literal",
+      "value": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      "datatype": "http://www.w3.org/2001/XMLSchema#string"
+    }
+  },
+  {
+    "member": {
+      "type": "uri",
+      "value": "https://example.invalid/sparkles-fixture/corpus-v1/id/member/92020e88d28f268d3a6e696e4c79e3e8d25426386065a00cdd958305d76b09e9"
+    },
+    "revision": {
+      "type": "uri",
+      "value": "https://example.invalid/sparkles-fixture/corpus-v1/id/sourceRevision/7fb1fac121e74940f348f9f003b0bf5c37218b422f819a5400a4c17d6e988ef8"
+    },
+    "release": {
+      "type": "uri",
+      "value": "https://example.invalid/sparkles-fixture/corpus-v1/id/release/3b5d53959c8dca0f9db894dc63203dbe40355d35185a9a65c5a26b0f16387556"
+    },
+    "name": {
+      "type": "literal",
+      "value": "sparkles-fixture-only-leaf",
+      "datatype": "http://www.w3.org/2001/XMLSchema#string"
+    },
+    "version": {
+      "type": "literal",
+      "value": "1.4.0",
+      "datatype": "http://www.w3.org/2001/XMLSchema#string"
+    },
+    "source": {
+      "type": "literal",
+      "value": "registry+https://github.com/rust-lang/crates.io-index",
+      "datatype": "http://www.w3.org/2001/XMLSchema#string"
+    },
+    "checksum": {
+      "type": "literal",
+      "value": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      "datatype": "http://www.w3.org/2001/XMLSchema#string"
+    }
+  },
+  {
+    "member": {
+      "type": "uri",
+      "value": "https://example.invalid/sparkles-fixture/corpus-v1/id/member/968b1542b19b17fa7d64b8dfb7ea3c4e98cc546a1bba2ea1d3a4e571465d12ad"
+    },
+    "revision": {
+      "type": "uri",
+      "value": "https://example.invalid/sparkles-fixture/corpus-v1/id/sourceRevision/7fb1fac121e74940f348f9f003b0bf5c37218b422f819a5400a4c17d6e988ef8"
+    },
+    "release": {
+      "type": "uri",
+      "value": "https://example.invalid/sparkles-fixture/corpus-v1/id/release/eeef4181910c5b684fa5386542a5135c6aa946d544aff7ef8f31bdcd78c1e4c9"
+    },
+    "name": {
+      "type": "literal",
+      "value": "sparkles-fixture-only-app",
+      "datatype": "http://www.w3.org/2001/XMLSchema#string"
+    },
+    "version": {
+      "type": "literal",
+      "value": "0.1.0",
+      "datatype": "http://www.w3.org/2001/XMLSchema#string"
+    },
+    "source": {
+      "type": "literal",
+      "value": "inventory-local:sourceRevision:7fb1fac121e74940f348f9f003b0bf5c37218b422f819a5400a4c17d6e988ef8",
+      "datatype": "http://www.w3.org/2001/XMLSchema#string"
+    }
+  },
+  {
+    "member": {
+      "type": "uri",
+      "value": "https://example.invalid/sparkles-fixture/corpus-v1/id/member/a7a310898656b198c77070e86d2b2d547f465fe9df9bffe1a1db89bda216d8c1"
+    },
+    "revision": {
+      "type": "uri",
+      "value": "https://example.invalid/sparkles-fixture/corpus-v1/id/sourceRevision/d788e0a7b40b3b0aa4d5e12ea0297dfcdb5a3cbdad0b3400683eca6d73b156bb"
+    },
+    "release": {
+      "type": "uri",
+      "value": "https://example.invalid/sparkles-fixture/corpus-v1/id/release/c536a57ed898b8645d43f2b4597dfc79093861febef1d2901a3aac9ff28e310e"
+    },
+    "name": {
+      "type": "literal",
+      "value": "sparkles-fixture-only-app",
+      "datatype": "http://www.w3.org/2001/XMLSchema#string"
+    },
+    "version": {
+      "type": "literal",
+      "value": "0.1.0",
+      "datatype": "http://www.w3.org/2001/XMLSchema#string"
+    },
+    "source": {
+      "type": "literal",
+      "value": "inventory-local:sourceRevision:d788e0a7b40b3b0aa4d5e12ea0297dfcdb5a3cbdad0b3400683eca6d73b156bb",
+      "datatype": "http://www.w3.org/2001/XMLSchema#string"
+    }
+  },
+  {
+    "member": {
+      "type": "uri",
+      "value": "https://example.invalid/sparkles-fixture/corpus-v1/id/member/c0cb5449bf6dc20292d12eeb77241457eb3819ba7a9cf07942478ce314d5941c"
+    },
+    "revision": {
+      "type": "uri",
+      "value": "https://example.invalid/sparkles-fixture/corpus-v1/id/sourceRevision/d788e0a7b40b3b0aa4d5e12ea0297dfcdb5a3cbdad0b3400683eca6d73b156bb"
+    },
+    "release": {
+      "type": "uri",
+      "value": "https://example.invalid/sparkles-fixture/corpus-v1/id/release/3b5d53959c8dca0f9db894dc63203dbe40355d35185a9a65c5a26b0f16387556"
+    },
+    "name": {
+      "type": "literal",
+      "value": "sparkles-fixture-only-leaf",
+      "datatype": "http://www.w3.org/2001/XMLSchema#string"
+    },
+    "version": {
+      "type": "literal",
+      "value": "1.4.0",
+      "datatype": "http://www.w3.org/2001/XMLSchema#string"
+    },
+    "source": {
+      "type": "literal",
+      "value": "registry+https://github.com/rust-lang/crates.io-index",
+      "datatype": "http://www.w3.org/2001/XMLSchema#string"
+    },
+    "checksum": {
+      "type": "literal",
+      "value": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      "datatype": "http://www.w3.org/2001/XMLSchema#string"
+    }
+  },
+  {
+    "member": {
+      "type": "uri",
+      "value": "https://example.invalid/sparkles-fixture/corpus-v1/id/member/c14af2cc4008fd4f96abef4876171fdd3ea8e2d2a1dcf62d59c6c732755d34bf"
+    },
+    "revision": {
+      "type": "uri",
+      "value": "https://example.invalid/sparkles-fixture/corpus-v1/id/sourceRevision/d788e0a7b40b3b0aa4d5e12ea0297dfcdb5a3cbdad0b3400683eca6d73b156bb"
+    },
+    "release": {
+      "type": "uri",
+      "value": "https://example.invalid/sparkles-fixture/corpus-v1/id/release/a31bfc2e36725aac33ee7b3179caa5e8ae84fef459ddb8ce5c311b0e32863d17"
+    },
+    "name": {
+      "type": "literal",
+      "value": "sparkles-fixture-only-leaf",
+      "datatype": "http://www.w3.org/2001/XMLSchema#string"
+    },
+    "version": {
+      "type": "literal",
+      "value": "1.3.0",
+      "datatype": "http://www.w3.org/2001/XMLSchema#string"
+    },
+    "source": {
+      "type": "literal",
+      "value": "registry+https://github.com/rust-lang/crates.io-index",
+      "datatype": "http://www.w3.org/2001/XMLSchema#string"
+    },
+    "checksum": {
+      "type": "literal",
+      "value": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      "datatype": "http://www.w3.org/2001/XMLSchema#string"
+    }
+  },
+  {
+    "member": {
+      "type": "uri",
+      "value": "https://example.invalid/sparkles-fixture/corpus-v1/id/member/e750290ee52fa20486a5dd6b1c365d1b2002153c5dc4378851ea3c79178fc522"
+    },
+    "revision": {
+      "type": "uri",
+      "value": "https://example.invalid/sparkles-fixture/corpus-v1/id/sourceRevision/d788e0a7b40b3b0aa4d5e12ea0297dfcdb5a3cbdad0b3400683eca6d73b156bb"
+    },
+    "release": {
+      "type": "uri",
+      "value": "https://example.invalid/sparkles-fixture/corpus-v1/id/release/c7d3b8ceda1bff76d8dee71483fb87f7412f860054559857be305418ae486696"
+    },
+    "name": {
+      "type": "literal",
+      "value": "sparkles-fixture-only-unrelated",
+      "datatype": "http://www.w3.org/2001/XMLSchema#string"
+    },
+    "version": {
+      "type": "literal",
+      "value": "1.3.0",
+      "datatype": "http://www.w3.org/2001/XMLSchema#string"
+    },
+    "source": {
+      "type": "literal",
+      "value": "registry+https://github.com/rust-lang/crates.io-index",
+      "datatype": "http://www.w3.org/2001/XMLSchema#string"
+    },
+    "checksum": {
+      "type": "literal",
+      "value": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      "datatype": "http://www.w3.org/2001/XMLSchema#string"
+    }
+  }
+]

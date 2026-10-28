@@ -1,0 +1,289 @@
+{
+  "fixture_scope": "https://example.invalid/sparkles-fixture/corpus-v1/",
+  "root": {
+    "name": "sparkles-fixture-only-app",
+    "version": "0.1.0",
+    "source": null
+  },
+  "before": {
+    "members": [
+      {
+        "name": "sparkles-fixture-only-app",
+        "version": "0.1.0",
+        "source": null
+      },
+      {
+        "name": "sparkles-fixture-only-bridge",
+        "version": "1.0.0",
+        "source": "registry+https://github.com/rust-lang/crates.io-index"
+      },
+      {
+        "name": "sparkles-fixture-only-leaf",
+        "version": "1.3.0",
+        "source": "registry+https://github.com/rust-lang/crates.io-index"
+      },
+      {
+        "name": "sparkles-fixture-only-leaf",
+        "version": "1.4.0",
+        "source": "registry+https://github.com/rust-lang/crates.io-index"
+      },
+      {
+        "name": "sparkles-fixture-only-unrelated",
+        "version": "1.3.0",
+        "source": "registry+https://github.com/rust-lang/crates.io-index"
+      }
+    ],
+    "occurrences": [
+      {
+        "parent": {
+          "name": "sparkles-fixture-only-app",
+          "version": "0.1.0",
+          "source": null
+        },
+        "raw": "sparkles-fixture-only-bridge",
+        "target": {
+          "name": "sparkles-fixture-only-bridge",
+          "version": "1.0.0",
+          "source": "registry+https://github.com/rust-lang/crates.io-index"
+        }
+      },
+      {
+        "parent": {
+          "name": "sparkles-fixture-only-app",
+          "version": "0.1.0",
+          "source": null
+        },
+        "raw": "sparkles-fixture-only-leaf 1.4.0",
+        "target": {
+          "name": "sparkles-fixture-only-leaf",
+          "version": "1.4.0",
+          "source": "registry+https://github.com/rust-lang/crates.io-index"
+        }
+      },
+      {
+        "parent": {
+          "name": "sparkles-fixture-only-bridge",
+          "version": "1.0.0",
+          "source": "registry+https://github.com/rust-lang/crates.io-index"
+        },
+        "raw": "sparkles-fixture-only-leaf 1.3.0",
+        "target": {
+          "name": "sparkles-fixture-only-leaf",
+          "version": "1.3.0",
+          "source": "registry+https://github.com/rust-lang/crates.io-index"
+        }
+      }
+    ],
+    "root_witnesses": [
+      [
+        {
+          "name": "sparkles-fixture-only-app",
+          "version": "0.1.0",
+          "source": null
+        },
+        {
+          "name": "sparkles-fixture-only-bridge",
+          "version": "1.0.0",
+          "source": "registry+https://github.com/rust-lang/crates.io-index"
+        }
+      ],
+      [
+        {
+          "name": "sparkles-fixture-only-app",
+          "version": "0.1.0",
+          "source": null
+        },
+        {
+          "name": "sparkles-fixture-only-leaf",
+          "version": "1.4.0",
+          "source": "registry+https://github.com/rust-lang/crates.io-index"
+        }
+      ],
+      [
+        {
+          "name": "sparkles-fixture-only-app",
+          "version": "0.1.0",
+          "source": null
+        },
+        {
+          "name": "sparkles-fixture-only-bridge",
+          "version": "1.0.0",
+          "source": "registry+https://github.com/rust-lang/crates.io-index"
+        },
+        {
+          "name": "sparkles-fixture-only-leaf",
+          "version": "1.3.0",
+          "source": "registry+https://github.com/rust-lang/crates.io-index"
+        }
+      ]
+    ],
+    "r1_evaluations": [
+      {
+        "member": {
+          "name": "sparkles-fixture-only-leaf",
+          "version": "1.3.0",
+          "source": "registry+https://github.com/rust-lang/crates.io-index"
+        },
+        "membership": "included",
+        "applicability": "affected-in-declared-scope"
+      },
+      {
+        "member": {
+          "name": "sparkles-fixture-only-leaf",
+          "version": "1.4.0",
+          "source": "registry+https://github.com/rust-lang/crates.io-index"
+        },
+        "membership": "excluded",
+        "applicability": "not-affected-in-declared-scope"
+      }
+    ],
+    "r2_evaluations": [
+      {
+        "member": {
+          "name": "sparkles-fixture-only-leaf",
+          "version": "1.3.0",
+          "source": "registry+https://github.com/rust-lang/crates.io-index"
+        },
+        "membership": "excluded",
+        "applicability": "not-affected-in-declared-scope"
+      },
+      {
+        "member": {
+          "name": "sparkles-fixture-only-leaf",
+          "version": "1.4.0",
+          "source": "registry+https://github.com/rust-lang/crates.io-index"
+        },
+        "membership": "excluded",
+        "applicability": "not-affected-in-declared-scope"
+      }
+    ]
+  },
+  "after": {
+    "members": [
+      {
+        "name": "sparkles-fixture-only-app",
+        "version": "0.1.0",
+        "source": null
+      },
+      {
+        "name": "sparkles-fixture-only-bridge",
+        "version": "1.0.0",
+        "source": "registry+https://github.com/rust-lang/crates.io-index"
+      },
+      {
+        "name": "sparkles-fixture-only-leaf",
+        "version": "1.4.0",
+        "source": "registry+https://github.com/rust-lang/crates.io-index"
+      },
+      {
+        "name": "sparkles-fixture-only-unrelated",
+        "version": "1.3.0",
+        "source": "registry+https://github.com/rust-lang/crates.io-index"
+      }
+    ],
+    "occurrences": [
+      {
+        "parent": {
+          "name": "sparkles-fixture-only-app",
+          "version": "0.1.0",
+          "source": null
+        },
+        "raw": "sparkles-fixture-only-bridge",
+        "target": {
+          "name": "sparkles-fixture-only-bridge",
+          "version": "1.0.0",
+          "source": "registry+https://github.com/rust-lang/crates.io-index"
+        }
+      },
+      {
+        "parent": {
+          "name": "sparkles-fixture-only-app",
+          "version": "0.1.0",
+          "source": null
+        },
+        "raw": "sparkles-fixture-only-leaf 1.4.0",
+        "target": {
+          "name": "sparkles-fixture-only-leaf",
+          "version": "1.4.0",
+          "source": "registry+https://github.com/rust-lang/crates.io-index"
+        }
+      },
+      {
+        "parent": {
+          "name": "sparkles-fixture-only-bridge",
+          "version": "1.0.0",
+          "source": "registry+https://github.com/rust-lang/crates.io-index"
+        },
+        "raw": "sparkles-fixture-only-leaf 1.4.0",
+        "target": {
+          "name": "sparkles-fixture-only-leaf",
+          "version": "1.4.0",
+          "source": "registry+https://github.com/rust-lang/crates.io-index"
+        }
+      }
+    ],
+    "root_witnesses": [
+      [
+        {
+          "name": "sparkles-fixture-only-app",
+          "version": "0.1.0",
+          "source": null
+        },
+        {
+          "name": "sparkles-fixture-only-bridge",
+          "version": "1.0.0",
+          "source": "registry+https://github.com/rust-lang/crates.io-index"
+        }
+      ],
+      [
+        {
+          "name": "sparkles-fixture-only-app",
+          "version": "0.1.0",
+          "source": null
+        },
+        {
+          "name": "sparkles-fixture-only-leaf",
+          "version": "1.4.0",
+          "source": "registry+https://github.com/rust-lang/crates.io-index"
+        }
+      ],
+      [
+        {
+          "name": "sparkles-fixture-only-app",
+          "version": "0.1.0",
+          "source": null
+        },
+        {
+          "name": "sparkles-fixture-only-bridge",
+          "version": "1.0.0",
+          "source": "registry+https://github.com/rust-lang/crates.io-index"
+        },
+        {
+          "name": "sparkles-fixture-only-leaf",
+          "version": "1.4.0",
+          "source": "registry+https://github.com/rust-lang/crates.io-index"
+        }
+      ]
+    ],
+    "r1_evaluations": [
+      {
+        "member": {
+          "name": "sparkles-fixture-only-leaf",
+          "version": "1.4.0",
+          "source": "registry+https://github.com/rust-lang/crates.io-index"
+        },
+        "membership": "excluded",
+        "applicability": "not-affected-in-declared-scope"
+      }
+    ]
+  },
+  "withdrawal": "inactive-historical-no-contrary-assertion",
+  "absent_after": [
+    {
+      "name": "sparkles-fixture-only-leaf",
+      "version": "1.3.0",
+      "source": "registry+https://github.com/rust-lang/crates.io-index"
+    }
+  ],
+  "coverage": "The disconnected unrelated member has no root witness. No deployment or runtime claim follows."
+}

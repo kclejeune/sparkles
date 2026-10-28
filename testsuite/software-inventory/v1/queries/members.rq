@@ -1,0 +1,6 @@
+PREFIX si: <https://example.invalid/sparkles-fixture/corpus-v1/vocab/>
+SELECT ?member ?revision ?release ?name ?version ?source ?checksum WHERE {
+  ?member a si:Member ; si:inventoryRevision ?revision ; si:release ?release ; si:packageName ?name ; si:rawVersion ?version ; si:sourceIdentity ?source .
+  OPTIONAL { ?member si:declaredChecksum ?checksum }
+}
+ORDER BY ?member

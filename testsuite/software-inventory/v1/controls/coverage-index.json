@@ -1,0 +1,500 @@
+{
+  "mapped_controls": {
+    "P06": [
+      {
+        "input": "invalid/lock-version-3.toml",
+        "control": "raw/synthetic-before.Cargo.lock"
+      }
+    ],
+    "P05": [
+      {
+        "input": "invalid/duplicate-package.toml",
+        "control": "raw/synthetic-before.Cargo.lock"
+      }
+    ],
+    "P07": [
+      {
+        "input": "invalid/package-replace.toml",
+        "control": "raw/synthetic-before.Cargo.lock"
+      },
+      {
+        "input": "invalid/patch-unused.toml",
+        "control": "raw/synthetic-before.Cargo.lock"
+      }
+    ],
+    "A08": [
+      {
+        "input": "invalid/dependency-trailing-space.toml",
+        "control": "raw/synthetic-before.Cargo.lock"
+      },
+      {
+        "input": "invalid/dependency-double-space.toml",
+        "control": "raw/synthetic-before.Cargo.lock"
+      }
+    ],
+    "A09": [
+      {
+        "input": "invalid/checksum-invalid.toml",
+        "control": "raw/synthetic-before.Cargo.lock"
+      },
+      {
+        "input": "invalid/checksum-missing.toml",
+        "control": "raw/synthetic-before.Cargo.lock"
+      },
+      {
+        "input": "invalid/checksum-non-string.toml",
+        "control": "raw/synthetic-before.Cargo.lock"
+      }
+    ],
+    "A35": [
+      {
+        "input": "invalid/package-extension.toml",
+        "control": "raw/synthetic-before.Cargo.lock"
+      },
+      {
+        "input": "invalid/legacy-replace.toml",
+        "control": "raw/synthetic-before.Cargo.lock"
+      }
+    ],
+    "A21": [
+      {
+        "input": "invalid/advisory-schema-missing.json",
+        "control": "raw/advisory-r1.json"
+      },
+      {
+        "input": "invalid/advisory-schema-1.0.0.json",
+        "control": "raw/advisory-r1.json"
+      },
+      {
+        "input": "invalid/advisory-schema-1.9.3.json",
+        "control": "raw/advisory-r1.json"
+      },
+      {
+        "input": "invalid/advisory-schema-2.0.0.json",
+        "control": "raw/advisory-r1.json"
+      }
+    ],
+    "A22": [
+      {
+        "input": "invalid/advisory-nonstring-event.json",
+        "control": "raw/advisory-r1.json"
+      },
+      {
+        "input": "invalid/advisory-empty-event.json",
+        "control": "raw/advisory-r1.json"
+      }
+    ],
+    "R01": [
+      {
+        "input": "invalid/advisory-multiple-event-types.json",
+        "control": "raw/advisory-r1.json"
+      }
+    ],
+    "E04": [
+      {
+        "input": "invalid/duplicate-decoded-json-key.json",
+        "control": "raw/json-lexical/pointer.json"
+      }
+    ],
+    "R02": [
+      {
+        "input": "invalid/advisory-no-introduction.json",
+        "control": "raw/advisory-r1.json"
+      }
+    ],
+    "R03": [
+      {
+        "input": "invalid/advisory-fixed-and-last.json",
+        "control": "raw/advisory-r1.json"
+      }
+    ],
+    "R04": [
+      {
+        "input": "invalid/advisory-equal-fixed.json",
+        "control": "raw/advisory-r1.json"
+      }
+    ],
+    "R05": [
+      {
+        "input": "invalid/advisory-reversed.json",
+        "control": "raw/advisory-r1.json"
+      }
+    ],
+    "A25": [
+      {
+        "input": "invalid/advisory-duplicate-introduced.json",
+        "control": "raw/advisory-r1.json"
+      }
+    ],
+    "A32": [
+      {
+        "input": "invalid/duplicate-empty-affected.json",
+        "control": "raw/advisory-empty-affected.json"
+      }
+    ],
+    "P01": [
+      {
+        "input": "invalid/dependency-ambiguous-name.toml",
+        "control": "raw/synthetic-before.Cargo.lock"
+      }
+    ],
+    "P02": [
+      {
+        "input": "invalid/dependency-ambiguous-source.toml",
+        "control": "raw/qualified-custom-registry.Cargo.lock"
+      }
+    ],
+    "P04": [
+      {
+        "input": "invalid/dependency-dangling.toml",
+        "control": "raw/synthetic-before.Cargo.lock"
+      }
+    ],
+    "E05": [
+      {
+        "input": "invalid/selector-bad-digest.json",
+        "control": "expected/json-lexical.json"
+      },
+      {
+        "input": "invalid/selector-wrong-pointer.json",
+        "control": "expected/json-lexical.json"
+      },
+      {
+        "input": "invalid/source-digest-algorithm-prefix.json",
+        "control": "identity-contract.json"
+      },
+      {
+        "input": "invalid/source-digest-uppercase.json",
+        "control": "identity-contract.json"
+      },
+      {
+        "input": "invalid/source-digest-leading-space.json",
+        "control": "identity-contract.json"
+      },
+      {
+        "input": "invalid/source-digest-changed-bare-digest.json",
+        "control": "identity-contract.json"
+      }
+    ],
+    "A36": [
+      {
+        "input": "invalid/selector-inside-codepoint.json",
+        "control": "expected/json-lexical.json"
+      }
+    ],
+    "A18": [
+      {
+        "input": "invalid/malformed-sibling.json",
+        "control": "raw/advisory-r1.json"
+      }
+    ],
+    "A29": [
+      {
+        "input": "invalid/overlapping-ranges.json",
+        "control": "controls/adjacent-ranges.json"
+      },
+      {
+        "input": "controls/adjacent-ranges.json",
+        "control": "raw/advisory-r1.json"
+      }
+    ],
+    "A33": [
+      {
+        "input": "invalid/asserted-affected-by.trig",
+        "control": "expected/fixture.trig"
+      },
+      {
+        "input": "expected/fixture.trig",
+        "control": "invalid/asserted-affected-by.trig",
+        "expected": "expected/nonassertion.json"
+      }
+    ],
+    "A17": [
+      {
+        "input": "controls/unsupported-sibling.json",
+        "control": "raw/advisory-r1.json"
+      }
+    ],
+    "A15": [
+      {
+        "input": "controls/unknown-platform.json",
+        "control": "raw/advisory-r1.json"
+      }
+    ],
+    "A16": [
+      {
+        "input": "controls/database-metadata.json",
+        "control": "raw/advisory-r1.json"
+      }
+    ],
+    "A23": [
+      {
+        "input": "controls/partial-star-limit.json",
+        "control": "raw/advisory-r1.json"
+      }
+    ],
+    "A24": [
+      {
+        "input": "controls/fixed-with-limit.json",
+        "control": "raw/advisory-r1.json"
+      }
+    ],
+    "A19": [
+      {
+        "input": "controls/entries-excluded-unknown.json",
+        "control": "raw/advisory-r1.json"
+      }
+    ],
+    "A20": [
+      {
+        "input": "controls/entries-included-unknown.json",
+        "control": "raw/advisory-r1.json"
+      }
+    ],
+    "I01": [
+      {
+        "envelope": "controls/identity/index.json#I01"
+      }
+    ],
+    "I02": [
+      {
+        "envelope": "controls/identity/index.json#I02"
+      }
+    ],
+    "I03": [
+      {
+        "envelope": "controls/identity/index.json#I03"
+      }
+    ],
+    "I05": [
+      {
+        "envelope": "controls/identity/index.json#I05"
+      }
+    ],
+    "I06": [
+      {
+        "envelope": "controls/identity/index.json#I06"
+      }
+    ],
+    "I04": [
+      {
+        "envelope": "controls/identity/index.json#I04"
+      }
+    ],
+    "A01": [
+      {
+        "envelope": "controls/identity/index.json#A01"
+      }
+    ],
+    "I10": [
+      {
+        "envelope": "controls/identity/index.json#I10"
+      }
+    ],
+    "A02": [
+      {
+        "envelope": "controls/identity/index.json#A02"
+      }
+    ],
+    "A03": [
+      {
+        "envelope": "controls/identity/index.json#A03"
+      }
+    ],
+    "A04": [
+      {
+        "envelope": "controls/identity/index.json#A04"
+      }
+    ],
+    "A06": [
+      {
+        "envelope": "controls/identity/index.json#A06"
+      }
+    ],
+    "A05": [
+      {
+        "envelope": "controls/identity/index.json#A05"
+      }
+    ],
+    "I07": [
+      {
+        "envelope": "controls/operation-cases.json#I07"
+      }
+    ],
+    "I08": [
+      {
+        "envelope": "controls/operation-cases.json#I08"
+      }
+    ],
+    "I09": [
+      {
+        "envelope": "controls/operation-cases.json#I09"
+      }
+    ],
+    "I11": [
+      {
+        "envelope": "controls/operation-cases.json#I11"
+      }
+    ],
+    "I12": [
+      {
+        "envelope": "controls/operation-cases.json#I12"
+      }
+    ],
+    "I13": [
+      {
+        "envelope": "controls/operation-cases.json#I13"
+      }
+    ],
+    "P03": [
+      {
+        "envelope": "controls/operation-cases.json#P03"
+      }
+    ],
+    "A07": [
+      {
+        "envelope": "controls/operation-cases.json#A07"
+      }
+    ],
+    "A10": [
+      {
+        "envelope": "controls/operation-cases.json#A10"
+      }
+    ],
+    "A14": [
+      {
+        "envelope": "controls/operation-cases.json#A14"
+      },
+      {
+        "input": "controls/bound-recipes.json",
+        "control": "positive recipes with exact admitted boundary counts and supported syntax"
+      }
+    ],
+    "E07": [
+      {
+        "envelope": "controls/operation-cases.json#E07"
+      }
+    ],
+    "A26": [
+      {
+        "envelope": "controls/operation-cases.json#A26"
+      }
+    ],
+    "A27": [
+      {
+        "envelope": "controls/operation-cases.json#A27"
+      }
+    ],
+    "A28": [
+      {
+        "envelope": "controls/operation-cases.json#A28"
+      },
+      {
+        "input": "invalid/advisory-equal-limit.json",
+        "control": "controls/version-profiles/singleton.json"
+      }
+    ],
+    "A34": [
+      {
+        "envelope": "controls/operation-cases.json#A34"
+      }
+    ],
+    "P08": [
+      {
+        "input": "raw/path-controls.Cargo.lock",
+        "expected": "expected/path-controls.json"
+      }
+    ],
+    "P10": [
+      {
+        "input": "raw/path-controls.Cargo.lock",
+        "expected": "expected/path-controls.json"
+      }
+    ],
+    "P11": [
+      {
+        "input": "raw/path-controls.Cargo.lock",
+        "expected": "expected/path-controls.json"
+      }
+    ],
+    "A11": [
+      {
+        "input": "raw/path-controls.Cargo.lock",
+        "expected": "expected/path-controls.json"
+      }
+    ],
+    "P09": [
+      {
+        "input": "raw/depth-controls.Cargo.lock",
+        "expected": "expected/traversal-limits.json"
+      },
+      {
+        "input": "controls/bound-recipes.json#expansions-over",
+        "control": "controls/bound-recipes.json#expansions-at"
+      }
+    ],
+    "A12": [
+      {
+        "input": "raw/depth-controls.Cargo.lock",
+        "expected": "expected/traversal-limits.json"
+      }
+    ],
+    "A13": [
+      {
+        "input": "raw/path-count-controls.Cargo.lock",
+        "expected": "expected/traversal-limits.json"
+      }
+    ],
+    "E01": [
+      {
+        "input": "expected/toml-lexical.json",
+        "control": "expected/json-lexical.json"
+      }
+    ],
+    "E02": [
+      {
+        "input": "expected/toml-lexical.json",
+        "control": "expected/json-lexical.json"
+      }
+    ],
+    "A30": [
+      {
+        "input": "expected/toml-lexical.json",
+        "control": "expected/json-lexical.json"
+      }
+    ],
+    "E03": [
+      {
+        "input": "expected/json-lexical.json"
+      }
+    ],
+    "A31": [
+      {
+        "input": "expected/json-lexical.json"
+      }
+    ],
+    "E06": [
+      {
+        "input": "expected/fixture.trig",
+        "control": "invalid/asserted-affected-by.trig",
+        "expected": "expected/nonassertion.json"
+      }
+    ],
+    "R06": [
+      {
+        "input": "controls/version-profiles/mixed_negative.json",
+        "control": "raw/advisory-r1.json"
+      },
+      {
+        "input": "invalid/advisory-schema-missing.json",
+        "control": "raw/advisory-r1.json"
+      },
+      {
+        "input": "invalid/advisory-schema-1.9.3.json",
+        "control": "raw/advisory-r1.json"
+      }
+    ]
+  },
+  "pending_concrete_controls": [],
+  "version_inputs": "controls/version-inputs.json"
+}

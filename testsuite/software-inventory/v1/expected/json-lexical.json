@@ -1,0 +1,62 @@
+[
+  {
+    "source": "raw/json-lexical/pointer.json",
+    "source_sha256": "dd30cfe3b8e99a63bfd7620e27e4aa45a9bfeb61b4cecdee234f4ed835a5ad08",
+    "method": "urn:x-sparkles:evidence:normalization:json-lexical-utf8:1",
+    "method_version": "1",
+    "pointer": "/a~0b/c~1d",
+    "byte_range": [
+      28,
+      36
+    ],
+    "codepoint_range": [
+      25,
+      33
+    ],
+    "selected_utf8": "[\"a\\nb\"]",
+    "selected_sha256": "93ef86c5de37fed4fcdf3f02a56abe2dbefbc2c8166769241b2fa35062c0d6a8",
+    "decoded_value": [
+      "a\nb"
+    ]
+  },
+  {
+    "source": "raw/json-lexical/whitespace-outside.json",
+    "source_sha256": "9085bc2131c9bb9aefb5fcf16f3e4ee26a33fa412193b3b84feeeff2357a0ca2",
+    "method": "urn:x-sparkles:evidence:normalization:json-lexical-utf8:1",
+    "method_version": "1",
+    "pointer": "/a~0b/c~1d",
+    "byte_range": [
+      30,
+      38
+    ],
+    "codepoint_range": [
+      27,
+      35
+    ],
+    "selected_utf8": "[\"a\\nb\"]",
+    "selected_sha256": "93ef86c5de37fed4fcdf3f02a56abe2dbefbc2c8166769241b2fa35062c0d6a8",
+    "decoded_value": [
+      "a\nb"
+    ]
+  },
+  {
+    "source": "raw/json-lexical/whitespace-inside.json",
+    "source_sha256": "8420e8aefb51c437ca750c3089214b399dbd23bd3720ac75c8ae8b8c86452dd0",
+    "method": "urn:x-sparkles:evidence:normalization:json-lexical-utf8:1",
+    "method_version": "1",
+    "pointer": "/a~0b/c~1d",
+    "byte_range": [
+      28,
+      38
+    ],
+    "codepoint_range": [
+      25,
+      35
+    ],
+    "selected_utf8": "[ \"a\\nb\" ]",
+    "selected_sha256": "04b6af807b274c0931407c9ea83115a84e3eb45c7680dab43f6b255ab35bb7bd",
+    "decoded_value": [
+      "a\nb"
+    ]
+  }
+]

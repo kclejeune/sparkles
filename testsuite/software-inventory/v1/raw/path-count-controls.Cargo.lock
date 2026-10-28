@@ -1,0 +1,46 @@
+version = 4
+
+[[package]]
+name = "sparkles-fixture-only-root"
+version = "1.0.0"
+dependencies = [
+ "sparkles-fixture-only-target",
+ "sparkles-fixture-only-target",
+ "sparkles-fixture-only-target",
+ "sparkles-fixture-only-target",
+ "sparkles-fixture-only-target",
+ "sparkles-fixture-only-target",
+ "sparkles-fixture-only-target",
+ "sparkles-fixture-only-target",
+ "sparkles-fixture-only-target",
+ "sparkles-fixture-only-target",
+ "sparkles-fixture-only-target",
+ "sparkles-fixture-only-target",
+ "sparkles-fixture-only-target",
+ "sparkles-fixture-only-target",
+ "sparkles-fixture-only-target",
+ "sparkles-fixture-only-target",
+ "sparkles-fixture-only-target",
+ "sparkles-fixture-only-target",
+ "sparkles-fixture-only-target",
+ "sparkles-fixture-only-target",
+ "sparkles-fixture-only-target",
+ "sparkles-fixture-only-target",
+ "sparkles-fixture-only-target",
+ "sparkles-fixture-only-target",
+ "sparkles-fixture-only-target",
+ "sparkles-fixture-only-target",
+ "sparkles-fixture-only-target",
+ "sparkles-fixture-only-target",
+ "sparkles-fixture-only-target",
+ "sparkles-fixture-only-target",
+ "sparkles-fixture-only-target",
+ "sparkles-fixture-only-target",
+ "sparkles-fixture-only-target",
+]
+
+[[package]]
+name = "sparkles-fixture-only-target"
+version = "1.0.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd"

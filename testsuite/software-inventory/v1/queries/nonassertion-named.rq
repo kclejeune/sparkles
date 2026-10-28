@@ -1,0 +1,2 @@
+PREFIX si: <https://example.invalid/sparkles-fixture/corpus-v1/vocab/>
+ASK { GRAPH ?graph { ?release si:affectedBy ?advisory } }

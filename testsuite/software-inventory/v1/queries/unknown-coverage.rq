@@ -1,0 +1,5 @@
+PREFIX si: <https://example.invalid/sparkles-fixture/corpus-v1/vocab/>
+SELECT ?coverage ?kind ?state WHERE {
+  ?coverage a si:Coverage ; si:coverageKind ?kind ; si:coverageState ?state .
+}
+ORDER BY ?coverage

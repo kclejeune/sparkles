@@ -1,0 +1,7 @@
+PREFIX si: <https://example.invalid/sparkles-fixture/corpus-v1/vocab/>
+SELECT ?kind ?record ?parent ?target ?ordinal ?token ?path WHERE {
+  { ?record a si:Dependency ; si:parent ?parent ; si:target ?target ; si:ordinal ?ordinal ; si:rawToken ?token . BIND("occurrence" AS ?kind) }
+  UNION
+  { ?witness a si:Witness ; si:root ?parent ; si:target ?target ; si:path ?path . BIND(?path AS ?record) BIND("witness" AS ?kind) }
+}
+ORDER BY ?kind ?record

@@ -1,0 +1,20 @@
+{
+  "source": "raw/json-lexical/pointer.json",
+  "source_sha256": "dd30cfe3b8e99a63bfd7620e27e4aa45a9bfeb61b4cecdee234f4ed835a5ad08",
+  "method": "urn:x-sparkles:evidence:normalization:json-lexical-utf8:1",
+  "method_version": "1",
+  "pointer": "/a~0b/missing",
+  "byte_range": [
+    28,
+    36
+  ],
+  "codepoint_range": [
+    25,
+    33
+  ],
+  "selected_utf8": "[\"a\\nb\"]",
+  "selected_sha256": "93ef86c5de37fed4fcdf3f02a56abe2dbefbc2c8166769241b2fa35062c0d6a8",
+  "decoded_value": [
+    "a\nb"
+  ]
+}

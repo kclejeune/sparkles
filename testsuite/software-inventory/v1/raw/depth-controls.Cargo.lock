@@ -1,0 +1,158 @@
+version = 4
+
+[[package]]
+name = "sparkles-fixture-only-node00"
+version = "1.0.0"
+dependencies = [
+ "sparkles-fixture-only-node01",
+]
+
+[[package]]
+name = "sparkles-fixture-only-node01"
+version = "1.0.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd"
+dependencies = [
+ "sparkles-fixture-only-node02",
+]
+
+[[package]]
+name = "sparkles-fixture-only-node02"
+version = "1.0.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd"
+dependencies = [
+ "sparkles-fixture-only-node03",
+]
+
+[[package]]
+name = "sparkles-fixture-only-node03"
+version = "1.0.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd"
+dependencies = [
+ "sparkles-fixture-only-node04",
+]
+
+[[package]]
+name = "sparkles-fixture-only-node04"
+version = "1.0.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd"
+dependencies = [
+ "sparkles-fixture-only-node05",
+]
+
+[[package]]
+name = "sparkles-fixture-only-node05"
+version = "1.0.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd"
+dependencies = [
+ "sparkles-fixture-only-node06",
+]
+
+[[package]]
+name = "sparkles-fixture-only-node06"
+version = "1.0.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd"
+dependencies = [
+ "sparkles-fixture-only-node07",
+]
+
+[[package]]
+name = "sparkles-fixture-only-node07"
+version = "1.0.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd"
+dependencies = [
+ "sparkles-fixture-only-node08",
+]
+
+[[package]]
+name = "sparkles-fixture-only-node08"
+version = "1.0.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd"
+dependencies = [
+ "sparkles-fixture-only-node09",
+]
+
+[[package]]
+name = "sparkles-fixture-only-node09"
+version = "1.0.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd"
+dependencies = [
+ "sparkles-fixture-only-node10",
+]
+
+[[package]]
+name = "sparkles-fixture-only-node10"
+version = "1.0.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd"
+dependencies = [
+ "sparkles-fixture-only-node11",
+]
+
+[[package]]
+name = "sparkles-fixture-only-node11"
+version = "1.0.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd"
+dependencies = [
+ "sparkles-fixture-only-node12",
+]
+
+[[package]]
+name = "sparkles-fixture-only-node12"
+version = "1.0.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd"
+dependencies = [
+ "sparkles-fixture-only-node13",
+]
+
+[[package]]
+name = "sparkles-fixture-only-node13"
+version = "1.0.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd"
+dependencies = [
+ "sparkles-fixture-only-node14",
+]
+
+[[package]]
+name = "sparkles-fixture-only-node14"
+version = "1.0.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd"
+dependencies = [
+ "sparkles-fixture-only-node15",
+]
+
+[[package]]
+name = "sparkles-fixture-only-node15"
+version = "1.0.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd"
+dependencies = [
+ "sparkles-fixture-only-node16",
+]
+
+[[package]]
+name = "sparkles-fixture-only-node16"
+version = "1.0.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd"
+dependencies = [
+ "sparkles-fixture-only-node17",
+]
+
+[[package]]
+name = "sparkles-fixture-only-node17"
+version = "1.0.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd"

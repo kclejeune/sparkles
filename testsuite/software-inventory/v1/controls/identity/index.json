@@ -1,0 +1,104 @@
+{
+  "I01": {
+    "input": "controls/identity/source-less.toml",
+    "advisory": "raw/advisory-r1.json",
+    "positive_control": "controls/identity/exact.toml",
+    "root_mode": "none",
+    "expected": "unresolved-identity"
+  },
+  "I02": {
+    "input": "controls/identity/custom-registry.toml",
+    "advisory": "raw/advisory-r1.json",
+    "positive_control": "controls/identity/exact.toml",
+    "root_mode": "none",
+    "expected": "different-source"
+  },
+  "I03": {
+    "input": "controls/identity/git.toml",
+    "advisory": "raw/advisory-r1.json",
+    "positive_control": "controls/identity/exact.toml",
+    "root_mode": "none",
+    "expected": "no-automatic-registry-alias"
+  },
+  "I05": {
+    "input": "controls/identity/case-variant.toml",
+    "advisory": "raw/advisory-r1.json",
+    "positive_control": "controls/identity/exact.toml",
+    "root_mode": "none",
+    "expected": "unresolved-alias"
+  },
+  "I06": {
+    "input": "controls/identity/underscore-variant.toml",
+    "advisory": "raw/advisory-r1.json",
+    "positive_control": "controls/identity/exact.toml",
+    "root_mode": "none",
+    "expected": "unresolved-alias"
+  },
+  "I04": {
+    "input": "controls/identity/exact.toml",
+    "advisory": "controls/identity/npm-advisory.json",
+    "positive_control": "controls/identity/exact.toml",
+    "root_mode": "none",
+    "expected": "different-ecosystem"
+  },
+  "A01": {
+    "inputs": [
+      "raw/advisory-r1.json",
+      "raw/advisory-r1.json"
+    ],
+    "source_keys": [
+      "https://example.invalid/sparkles-fixture/corpus-v1/source/synthetic-osv-primary",
+      "https://example.invalid/sparkles-fixture/corpus-v1/source/synthetic-osv-mirror"
+    ],
+    "expected": "distinct-advisory-and-revision-identities",
+    "positive_control": "raw/advisory-r1.json",
+    "fixed_occurrence_oracle": "expected/mirror-occurrences.json"
+  },
+  "I10": {
+    "inputs": [
+      "raw/advisory-r1.json",
+      "raw/advisory-r1.json"
+    ],
+    "source_keys": [
+      "https://example.invalid/sparkles-fixture/corpus-v1/source/synthetic-osv-primary",
+      "https://example.invalid/sparkles-fixture/corpus-v1/source/synthetic-osv-mirror"
+    ],
+    "declared_shared_lineage": "https://example.invalid/sparkles-fixture/corpus-v1/lineage/synthetic-osv",
+    "expected": "distinct-occurrences-one-declared-origin",
+    "positive_control": "raw/advisory-r1.json",
+    "fixed_occurrence_oracle": "expected/mirror-occurrences.json"
+  },
+  "A02": {
+    "input": "controls/identity/aliases-related.json",
+    "positive_control": "raw/advisory-r1.json",
+    "expected": "metadata-only-no-owl-sameAs-no-dedup"
+  },
+  "A03": {
+    "inputs": [
+      "raw/advisory-r1.json",
+      "raw/advisory-r2.json"
+    ],
+    "source_key": "https://example.invalid/sparkles-fixture/corpus-v1/source/synthetic-osv-primary",
+    "forced_upstream_revision": "fixture-unchanged-upstream-revision",
+    "positive_control": "raw/advisory-r1.json",
+    "expected": "immutable-revision-conflict"
+  },
+  "A04": {
+    "inventory": "raw/synthetic-before.Cargo.lock",
+    "advisory": "raw/advisory-r1.json",
+    "advisory_scope": "https://example.invalid/sparkles-fixture/corpus-v1/different-scope/",
+    "positive_control": "raw/advisory-r1.json",
+    "expected": "identity-nonmatch-no-real-positive"
+  },
+  "A06": {
+    "input": "controls/identity/git-precision.toml",
+    "positive_control": "raw/qualified-custom-registry.Cargo.lock",
+    "expected": "unsupported-source-resolution-retain-candidates-not-dangling"
+  },
+  "A05": {
+    "input": "controls/identity/build-versions.toml",
+    "advisory": "raw/advisory-r1.json",
+    "positive_control": "controls/identity/exact.toml",
+    "expected": "distinct-release-keys-same-range-precedence"
+  }
+}

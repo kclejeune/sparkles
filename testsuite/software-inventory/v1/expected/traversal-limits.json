@@ -1,0 +1,68 @@
+{
+  "depth": {
+    "source": "raw/depth-controls.Cargo.lock",
+    "root_ordinal": 0,
+    "sixteen_edge_target_ordinal": 16,
+    "seventeen_edge_target_ordinal": 17,
+    "expected": "The 16-edge witness is allowed; the next expansion marks incomplete coverage rather than proving absence."
+  },
+  "path_count": {
+    "source": "raw/path-count-controls.Cargo.lock",
+    "root_ordinal": 0,
+    "target_ordinal": 1,
+    "dependency_ordinals": [
+      0,
+      1,
+      2,
+      3,
+      4,
+      5,
+      6,
+      7,
+      8,
+      9,
+      10,
+      11,
+      12,
+      13,
+      14,
+      15,
+      16,
+      17,
+      18,
+      19,
+      20,
+      21,
+      22,
+      23,
+      24,
+      25,
+      26,
+      27,
+      28,
+      29,
+      30,
+      31,
+      32
+    ],
+    "expected": "Keep at most 32 distinct occurrence paths and mark incomplete when the 33rd is discoverable.",
+    "positive_control": "raw/path-count-32.Cargo.lock",
+    "positive_expected": "A complete traversal can retain all 32 occurrence paths without a path-count cutoff."
+  },
+  "total_expansions": {
+    "recipes": "controls/bound-recipes.json",
+    "positive_recipe": "expansions-at",
+    "over_limit_recipe": "expansions-over",
+    "accounting": "One outgoing dependency occurrence visited from a retained simple-path prefix consumes one expansion, even if the child is later refused for cycle/depth. Root initialization consumes none. Refuse the visit that would exceed 100000; do not discard witnesses already found.",
+    "positive_expected": "All 100,000 occurrence visits fit, with complete witness coverage, depth 3 and at most 16 paths per target.",
+    "over_limit_expected": "The 100,001st visit yields incomplete witness coverage and a recorded total-expansion cutoff, with at most 100,000 completed visits and at most 17 paths per target. Found witnesses remain valid and missing witnesses never prove absence.",
+    "other_bounds": {
+      "packages": 6266,
+      "maximum_dependency_occurrences": 6281,
+      "maximum_depth": 3,
+      "maximum_paths_per_target": 17,
+      "each_source_bytes_below": 8388608
+    },
+    "evaluations_depend_on_traversal": false
+  }
+}

@@ -1,0 +1,162 @@
+[
+  {
+    "coverage": {
+      "type": "uri",
+      "value": "https://example.invalid/sparkles-fixture/corpus-v1/coverage/active-features"
+    },
+    "kind": {
+      "type": "literal",
+      "value": "active-features",
+      "datatype": "http://www.w3.org/2001/XMLSchema#string"
+    },
+    "state": {
+      "type": "literal",
+      "value": "unknown",
+      "datatype": "http://www.w3.org/2001/XMLSchema#string"
+    }
+  },
+  {
+    "coverage": {
+      "type": "uri",
+      "value": "https://example.invalid/sparkles-fixture/corpus-v1/coverage/artifact-checksum-verification"
+    },
+    "kind": {
+      "type": "literal",
+      "value": "artifact-checksum-verification",
+      "datatype": "http://www.w3.org/2001/XMLSchema#string"
+    },
+    "state": {
+      "type": "literal",
+      "value": "unknown",
+      "datatype": "http://www.w3.org/2001/XMLSchema#string"
+    }
+  },
+  {
+    "coverage": {
+      "type": "uri",
+      "value": "https://example.invalid/sparkles-fixture/corpus-v1/coverage/authenticated-first-availability"
+    },
+    "kind": {
+      "type": "literal",
+      "value": "authenticated-first-availability",
+      "datatype": "http://www.w3.org/2001/XMLSchema#string"
+    },
+    "state": {
+      "type": "literal",
+      "value": "unknown",
+      "datatype": "http://www.w3.org/2001/XMLSchema#string"
+    }
+  },
+  {
+    "coverage": {
+      "type": "uri",
+      "value": "https://example.invalid/sparkles-fixture/corpus-v1/coverage/deployed-presence"
+    },
+    "kind": {
+      "type": "literal",
+      "value": "deployed-presence",
+      "datatype": "http://www.w3.org/2001/XMLSchema#string"
+    },
+    "state": {
+      "type": "literal",
+      "value": "unknown",
+      "datatype": "http://www.w3.org/2001/XMLSchema#string"
+    }
+  },
+  {
+    "coverage": {
+      "type": "uri",
+      "value": "https://example.invalid/sparkles-fixture/corpus-v1/coverage/exploitability"
+    },
+    "kind": {
+      "type": "literal",
+      "value": "exploitability",
+      "datatype": "http://www.w3.org/2001/XMLSchema#string"
+    },
+    "state": {
+      "type": "literal",
+      "value": "unknown",
+      "datatype": "http://www.w3.org/2001/XMLSchema#string"
+    }
+  },
+  {
+    "coverage": {
+      "type": "uri",
+      "value": "https://example.invalid/sparkles-fixture/corpus-v1/coverage/feed-completeness"
+    },
+    "kind": {
+      "type": "literal",
+      "value": "feed-completeness",
+      "datatype": "http://www.w3.org/2001/XMLSchema#string"
+    },
+    "state": {
+      "type": "literal",
+      "value": "unknown",
+      "datatype": "http://www.w3.org/2001/XMLSchema#string"
+    }
+  },
+  {
+    "coverage": {
+      "type": "uri",
+      "value": "https://example.invalid/sparkles-fixture/corpus-v1/coverage/maintained-current"
+    },
+    "kind": {
+      "type": "literal",
+      "value": "maintained-current",
+      "datatype": "http://www.w3.org/2001/XMLSchema#string"
+    },
+    "state": {
+      "type": "literal",
+      "value": "unknown",
+      "datatype": "http://www.w3.org/2001/XMLSchema#string"
+    }
+  },
+  {
+    "coverage": {
+      "type": "uri",
+      "value": "https://example.invalid/sparkles-fixture/corpus-v1/coverage/reachability-in-running-artifact"
+    },
+    "kind": {
+      "type": "literal",
+      "value": "reachability-in-running-artifact",
+      "datatype": "http://www.w3.org/2001/XMLSchema#string"
+    },
+    "state": {
+      "type": "literal",
+      "value": "unknown",
+      "datatype": "http://www.w3.org/2001/XMLSchema#string"
+    }
+  },
+  {
+    "coverage": {
+      "type": "uri",
+      "value": "https://example.invalid/sparkles-fixture/corpus-v1/coverage/runtime-kind"
+    },
+    "kind": {
+      "type": "literal",
+      "value": "runtime-kind",
+      "datatype": "http://www.w3.org/2001/XMLSchema#string"
+    },
+    "state": {
+      "type": "literal",
+      "value": "unknown",
+      "datatype": "http://www.w3.org/2001/XMLSchema#string"
+    }
+  },
+  {
+    "coverage": {
+      "type": "uri",
+      "value": "https://example.invalid/sparkles-fixture/corpus-v1/coverage/selected-target"
+    },
+    "kind": {
+      "type": "literal",
+      "value": "selected-target",
+      "datatype": "http://www.w3.org/2001/XMLSchema#string"
+    },
+    "state": {
+      "type": "literal",
+      "value": "unknown",
+      "datatype": "http://www.w3.org/2001/XMLSchema#string"
+    }
+  }
+]

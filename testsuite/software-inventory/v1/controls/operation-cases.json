@@ -1,0 +1,199 @@
+{
+  "I07": {
+    "input": "raw/synthetic-before.Cargo.lock",
+    "advisory": "raw/advisory-r1.json",
+    "expected": "preserve-both-release-evaluations"
+  },
+  "I08": {
+    "input": "raw/sparkles-Cargo.lock",
+    "advisory": "raw/advisory-r1.json",
+    "advisory_scope": "https://example.invalid/sparkles-fixture/corpus-v1/",
+    "expected": "zero-matches-and-unknown-real-coverage",
+    "positive_control": "raw/synthetic-before.Cargo.lock"
+  },
+  "I09": {
+    "inputs": [
+      "raw/advisory-empty-affected.json",
+      null
+    ],
+    "expected": "unknown-overall-safety",
+    "positive_control": "raw/advisory-r1.json"
+  },
+  "I11": {
+    "input": "raw/advisory-withdrawn.json",
+    "prior": [
+      "raw/advisory-r1.json",
+      "raw/advisory-r2.json"
+    ],
+    "expected": "historical-retained-no-active-assertion",
+    "positive_control": "raw/advisory-r1.json"
+  },
+  "I12": {
+    "input": "controls/unknown-platform.json",
+    "expected": "unknown-overall-applicability",
+    "positive_control": "raw/advisory-r1.json"
+  },
+  "I13": {
+    "input": "controls/version-profiles/mixed_negative.json",
+    "member_version": "1.4.0",
+    "expected": "unknown-overall-membership",
+    "positive_control": "raw/advisory-r1.json"
+  },
+  "P03": {
+    "input": "raw/qualified-custom-registry.Cargo.lock",
+    "expected": "exact-target-only"
+  },
+  "A07": {
+    "input": "raw/qualified-custom-registry.Cargo.lock",
+    "expected": "resolve-custom-edge-preserve-advisory-identity-nonmatch"
+  },
+  "A10": {
+    "input": "raw/synthetic-before.Cargo.lock",
+    "selectors": [
+      null,
+      {
+        "name": "sparkles-fixture-only-leaf"
+      },
+      {
+        "name": "sparkles-fixture-only-missing",
+        "version": "1.0.0",
+        "source": null
+      }
+    ],
+    "expected": "selection-error-or-explicit-no-reachability-mode",
+    "positive_control": "raw/synthetic-before.Cargo.lock"
+  },
+  "A14": {
+    "input": "raw/synthetic-before.Cargo.lock",
+    "injections": [
+      "input-bound",
+      "parse-cancel",
+      "walk-cancel",
+      "export-cancel"
+    ],
+    "output_precondition": "existing unequal output",
+    "expected": "no-successful-dossier-prior-output-unchanged",
+    "bound_controls": {
+      "source_bytes": {
+        "recipe_version": 1,
+        "recipes": "controls/bound-recipes.json",
+        "positive_recipe": "source-bytes-at",
+        "over_limit_recipe": "source-bytes-over",
+        "expected_failure_stage": "source-byte-admission"
+      },
+      "package_records": {
+        "recipe_version": 1,
+        "recipes": "controls/bound-recipes.json",
+        "positive_recipe": "packages-at",
+        "over_limit_recipe": "packages-over",
+        "expected_failure_stage": "package-record-accounting"
+      },
+      "dependency_occurrences": {
+        "recipe_version": 1,
+        "recipes": "controls/bound-recipes.json",
+        "positive_recipe": "dependencies-at",
+        "over_limit_recipe": "dependencies-over",
+        "expected_failure_stage": "dependency-occurrence-accounting"
+      },
+      "advisory_events_and_list_entries": {
+        "recipe_version": 1,
+        "recipes": "controls/bound-recipes.json",
+        "positive_recipe": "advisory-entries-at",
+        "over_limit_recipe": "advisory-entries-over",
+        "expected_failure_stage": "advisory-entry-accounting"
+      }
+    },
+    "cancellation_points": {
+      "before-parse": {
+        "phase": "parse",
+        "hook": "before-library-parse",
+        "completed_units": 0,
+        "stimulus": "cancellation flag is already true on entry"
+      },
+      "during-parse": {
+        "phase": "parse-normalization",
+        "hook": "after-package-record-validation",
+        "completed_units": 1,
+        "package_ordinal": 0,
+        "stimulus": "set cancellation flag immediately after validating package record zero, before the next record"
+      },
+      "during-walk": {
+        "phase": "walk",
+        "hook": "after-outgoing-occurrence-visit",
+        "completed_units": 1,
+        "parent_package_ordinal": 0,
+        "dependency_ordinal": 0,
+        "stimulus": "set cancellation flag immediately after visiting the first outgoing occurrence, before the next traversal step"
+      },
+      "during-export": {
+        "phase": "export",
+        "hook": "after-staged-file-close-before-publication",
+        "completed_units": 1,
+        "file": "manifest.json",
+        "file_order": [
+          "manifest.json",
+          "inventory.json",
+          "evaluations.json",
+          "dossier.json",
+          "fixture.trig"
+        ],
+        "stimulus": "set cancellation flag after closing the first staging file; no destination rename has happened"
+      }
+    },
+    "positive_control": "raw/synthetic-before.Cargo.lock",
+    "bound_stage_policy": "Each positive sibling must pass syntax and bound accounting. The overrun must fail the named bound stage, not an unrelated syntax/schema/root-selection error. No-root mode isolates input bounds from witness traversal.",
+    "cancellation_root": {
+      "name": "sparkles-fixture-only-app",
+      "version": "0.1.0",
+      "source": null
+    },
+    "cancellation_expected": {
+      "phase": "the injected phase must observe cancellation",
+      "successful_dossier": false,
+      "prior_output": "unchanged",
+      "staging_cleanup": true,
+      "positive_control": "Same supported inputs and exact root with no cancellation and a fresh destination must complete. Separately, no cancellation with an unequal destination must report output conflict and preserve its bytes."
+    },
+    "stage_isolation": "Run the named parser/walk/export helper stimulus with a fresh destination first, proving the requested bound or cancellation phase. Separately replay with the existing unequal output sentinel. A prior-output conflict or unrelated parse error does not count as exercising the named phase.",
+    "output_sentinel": {
+      "destination_file": "manifest.json",
+      "fixture": "controls/prior-output-sentinel.txt",
+      "sha256": "4fcf753377bee291c063641bd51f0d277b15943328b68975259cb88e5b3edb6e"
+    }
+  },
+  "E07": {
+    "inputs": [
+      "raw/synthetic-before.Cargo.lock",
+      "raw/advisory-r1.json"
+    ],
+    "runs": 2,
+    "expected": "byte-identical-without-durable-job-claim"
+  },
+  "A26": {
+    "input": "controls/version-profiles/unsorted.json",
+    "member_version": "1.3.0",
+    "positive_control": "controls/version-profiles/base.json",
+    "expected": "accept-equivalent-unsorted-events"
+  },
+  "A27": {
+    "input": "invalid/advisory-reversed.json",
+    "positive_control": "raw/advisory-r1.json",
+    "expected": "profile-input-error-first-transition-is-closure"
+  },
+  "A28": {
+    "inputs": [
+      "invalid/advisory-equal-fixed.json",
+      "controls/version-profiles/singleton.json"
+    ],
+    "positive_control": "controls/version-profiles/singleton.json",
+    "expected": "profile-error-for-empty-interval-accept-inclusive-singleton"
+  },
+  "A34": {
+    "inputs": [
+      "raw/advisory-r1.json",
+      "raw/advisory-r2.json",
+      "raw/advisory-withdrawn.json"
+    ],
+    "expected": "retain-all-revisions-no-authenticated-availability-or-maintained-current"
+  }
+}

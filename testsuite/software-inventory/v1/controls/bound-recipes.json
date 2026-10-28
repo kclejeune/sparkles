@@ -1,0 +1,210 @@
+{
+  "recipe_version": 1,
+  "construction": "controls/materialize-bound-controls.py with exact UTF-8 LF bytes, field order and decimal formatting; no semantic matching or output generation",
+  "source_channel": "https://example.invalid/sparkles-fixture/corpus-v1/source/control-lock",
+  "advisory_channel": "https://example.invalid/sparkles-fixture/corpus-v1/source/control-advisory",
+  "recipes": {
+    "source-bytes-at": {
+      "kind": "supported-lock-padding",
+      "parameters": {
+        "base": "raw/synthetic-before.Cargo.lock",
+        "base_sha256": "e4ea7018a1d921f6934ecb75e88b4c54f59b4ec5d2077dcad207d739236ea52a",
+        "total_bytes": 8388608
+      },
+      "bound": "retained-source-bytes",
+      "maximum": 8388608,
+      "actual_bound_value": 8388608,
+      "expected_failure_stage": null,
+      "root_mode": "none",
+      "successful_partial_dossier": false,
+      "prior_output": "unchanged",
+      "bytes": 8388608,
+      "sha256": "d3e9f1fc07af6c852333d376e26b7ed7d37d4d261420d209f0e0374fba261cb7",
+      "expected": "supported-input-with-unknown-coverage-no-root-claim"
+    },
+    "source-bytes-over": {
+      "kind": "supported-lock-padding",
+      "parameters": {
+        "base": "raw/synthetic-before.Cargo.lock",
+        "base_sha256": "e4ea7018a1d921f6934ecb75e88b4c54f59b4ec5d2077dcad207d739236ea52a",
+        "total_bytes": 8388609
+      },
+      "bound": "retained-source-bytes",
+      "maximum": 8388608,
+      "actual_bound_value": 8388609,
+      "expected_failure_stage": "source-byte-admission",
+      "root_mode": "none",
+      "successful_partial_dossier": false,
+      "prior_output": "unchanged",
+      "bytes": 8388609,
+      "sha256": "cc7a50211e9408379e6993707cef7e914ab52039a06d464740be5c511c1ee855",
+      "expected": "input-bound-no-successful-dossier"
+    },
+    "packages-at": {
+      "kind": "package-count",
+      "parameters": {
+        "packages": 10000
+      },
+      "bound": "package-records",
+      "maximum": 10000,
+      "actual_bound_value": 10000,
+      "expected_failure_stage": null,
+      "root_mode": "none",
+      "successful_partial_dossier": false,
+      "prior_output": "unchanged",
+      "bytes": 740012,
+      "sha256": "73d27c9badda27f908164247ae1b0b6c03c825775c787f0be215d7bb0da486a4",
+      "expected": "supported-input-with-unknown-coverage-no-root-claim"
+    },
+    "packages-over": {
+      "kind": "package-count",
+      "parameters": {
+        "packages": 10001
+      },
+      "bound": "package-records",
+      "maximum": 10000,
+      "actual_bound_value": 10001,
+      "expected_failure_stage": "package-record-accounting",
+      "root_mode": "none",
+      "successful_partial_dossier": false,
+      "prior_output": "unchanged",
+      "bytes": 740086,
+      "sha256": "68544b19a68803526427f6777be60e2a6feb7ff09ffff5041c1887d203a3613b",
+      "expected": "input-bound-no-successful-dossier"
+    },
+    "dependencies-at": {
+      "kind": "dependency-count",
+      "parameters": {
+        "dependencies": 100000
+      },
+      "bound": "dependency-occurrences",
+      "maximum": 100000,
+      "actual_bound_value": 100000,
+      "expected_failure_stage": null,
+      "root_mode": "none",
+      "successful_partial_dossier": false,
+      "prior_output": "unchanged",
+      "bytes": 3700177,
+      "sha256": "8939940cfea5c1106e3909e6c550fb780f95753b51e9471dfaca49cd8085ca3e",
+      "expected": "supported-input-with-unknown-coverage-no-root-claim"
+    },
+    "dependencies-over": {
+      "kind": "dependency-count",
+      "parameters": {
+        "dependencies": 100001
+      },
+      "bound": "dependency-occurrences",
+      "maximum": 100000,
+      "actual_bound_value": 100001,
+      "expected_failure_stage": "dependency-occurrence-accounting",
+      "root_mode": "none",
+      "successful_partial_dossier": false,
+      "prior_output": "unchanged",
+      "bytes": 3700214,
+      "sha256": "2c3db6dd3722d12af4c98209deb8e9d032f51b38ce2fb67c14ef7cea5af819b0",
+      "expected": "input-bound-no-successful-dossier"
+    },
+    "advisory-entries-at": {
+      "kind": "aggregate-advisory-entries",
+      "parameters": {
+        "first_list": 50000,
+        "second_list": 49999
+      },
+      "bound": "aggregate-advisory-events-and-versions",
+      "maximum": 100000,
+      "actual_bound_value": 100000,
+      "expected_failure_stage": null,
+      "root_mode": "none",
+      "successful_partial_dossier": false,
+      "prior_output": "unchanged",
+      "bytes": 1178180,
+      "sha256": "9b18cff76d83893aa2e37f79df0622b32b428276990820265c814372d98cdf0e",
+      "expected": "supported-input-with-unknown-coverage-no-root-claim"
+    },
+    "advisory-entries-over": {
+      "kind": "aggregate-advisory-entries",
+      "parameters": {
+        "first_list": 50000,
+        "second_list": 50000
+      },
+      "bound": "aggregate-advisory-events-and-versions",
+      "maximum": 100000,
+      "actual_bound_value": 100001,
+      "expected_failure_stage": "advisory-entry-accounting",
+      "root_mode": "none",
+      "successful_partial_dossier": false,
+      "prior_output": "unchanged",
+      "bytes": 1178192,
+      "sha256": "98c882dc8e76f822cba651598a4b774d1d064da3f5dcb634b35b7e2111a39388",
+      "expected": "input-bound-no-successful-dossier"
+    },
+    "expansions-at": {
+      "kind": "shared-hub-expansions",
+      "parameters": {
+        "branches": 16,
+        "leaves": 6248,
+        "direct_first_leaf": false
+      },
+      "bound": "total-traversal-expansions",
+      "maximum": 100000,
+      "actual_bound_value": 100000,
+      "expected_failure_stage": null,
+      "root_mode": "exact-root",
+      "successful_partial_dossier": false,
+      "prior_output": "unchanged",
+      "bytes": 765251,
+      "sha256": "9f97f5233bf366a2cd9473517d40f6677c0b19b17f0e38ac61b0d42be07a2ea2",
+      "expected_witness_coverage": "complete",
+      "expected_completed_expansions": 100000,
+      "expected_attempted_expansions": 100000,
+      "root": {
+        "name": "sparkles-fixture-only-bound-root",
+        "version": "0.1.0",
+        "source": null
+      },
+      "maximum_depth": 3,
+      "maximum_paths_per_target": 16,
+      "packages": 6266,
+      "dependency_occurrences": 6280,
+      "expected_dossier": "Complete validated dossier with the declared complete or incomplete witness coverage; traversal cutoff is not an input-bound failure."
+    },
+    "expansions-over": {
+      "kind": "shared-hub-expansions",
+      "parameters": {
+        "branches": 16,
+        "leaves": 6248,
+        "direct_first_leaf": true
+      },
+      "bound": "total-traversal-expansions",
+      "maximum": 100000,
+      "actual_bound_value": 100001,
+      "expected_failure_stage": null,
+      "root_mode": "exact-root",
+      "successful_partial_dossier": false,
+      "prior_output": "unchanged",
+      "bytes": 765294,
+      "sha256": "8fdbe7502d86600a6f2a7428d1c6edb3d4033346b27e7a42fd0d1e460aee0e24",
+      "expected_witness_coverage": "incomplete",
+      "expected_completed_expansions": 100000,
+      "expected_attempted_expansions": 100001,
+      "root": {
+        "name": "sparkles-fixture-only-bound-root",
+        "version": "0.1.0",
+        "source": null
+      },
+      "maximum_depth": 3,
+      "maximum_paths_per_target": 17,
+      "packages": 6266,
+      "dependency_occurrences": 6281,
+      "expected_dossier": "Complete validated dossier with the declared complete or incomplete witness coverage; traversal cutoff is not an input-bound failure."
+    }
+  },
+  "operation_companions": {
+    "lock_recipe_advisory": "raw/advisory-r1.json",
+    "advisory_recipe_inventory": "raw/synthetic-before.Cargo.lock",
+    "input_bound_root_mode": "none",
+    "witness_recipe_root": "the explicit exact root tuple in that recipe",
+    "admitted_boundary": "Supported syntax and accounting pass, not merely a differently named parse failure."
+  },
+  "fixture_scope": "https://example.invalid/sparkles-fixture/corpus-v1/"
+}

@@ -1,0 +1,282 @@
+[
+  {
+    "evaluation": {
+      "type": "uri",
+      "value": "https://example.invalid/sparkles-fixture/corpus-v1/id/evaluation/5129b80473a8179c66ee8d834471b36410b6b77472b6e6d86030a9a135f884c4"
+    },
+    "member": {
+      "type": "uri",
+      "value": "https://example.invalid/sparkles-fixture/corpus-v1/id/member/c0cb5449bf6dc20292d12eeb77241457eb3819ba7a9cf07942478ce314d5941c"
+    },
+    "revision": {
+      "type": "uri",
+      "value": "https://example.invalid/sparkles-fixture/corpus-v1/id/sourceRevision/5066b3937cbcba43685b62b2aa32e30aeb1434361bac41a1e03123772c4bcee7"
+    },
+    "membership": {
+      "type": "literal",
+      "value": "excluded",
+      "datatype": "http://www.w3.org/2001/XMLSchema#string"
+    },
+    "applicability": {
+      "type": "literal",
+      "value": "not-affected-in-declared-scope",
+      "datatype": "http://www.w3.org/2001/XMLSchema#string"
+    },
+    "evidence": {
+      "type": "uri",
+      "value": "https://example.invalid/sparkles-fixture/corpus-v1/evidence/r1/event-0"
+    }
+  },
+  {
+    "evaluation": {
+      "type": "uri",
+      "value": "https://example.invalid/sparkles-fixture/corpus-v1/id/evaluation/5129b80473a8179c66ee8d834471b36410b6b77472b6e6d86030a9a135f884c4"
+    },
+    "member": {
+      "type": "uri",
+      "value": "https://example.invalid/sparkles-fixture/corpus-v1/id/member/c0cb5449bf6dc20292d12eeb77241457eb3819ba7a9cf07942478ce314d5941c"
+    },
+    "revision": {
+      "type": "uri",
+      "value": "https://example.invalid/sparkles-fixture/corpus-v1/id/sourceRevision/5066b3937cbcba43685b62b2aa32e30aeb1434361bac41a1e03123772c4bcee7"
+    },
+    "membership": {
+      "type": "literal",
+      "value": "excluded",
+      "datatype": "http://www.w3.org/2001/XMLSchema#string"
+    },
+    "applicability": {
+      "type": "literal",
+      "value": "not-affected-in-declared-scope",
+      "datatype": "http://www.w3.org/2001/XMLSchema#string"
+    },
+    "evidence": {
+      "type": "uri",
+      "value": "https://example.invalid/sparkles-fixture/corpus-v1/evidence/r1/event-1"
+    }
+  },
+  {
+    "evaluation": {
+      "type": "uri",
+      "value": "https://example.invalid/sparkles-fixture/corpus-v1/id/evaluation/5ad0a6c6afe1f8b6fd2536f195bd6ca5d82b7072f54039b9e28e67dc998c1e67"
+    },
+    "member": {
+      "type": "uri",
+      "value": "https://example.invalid/sparkles-fixture/corpus-v1/id/member/c0cb5449bf6dc20292d12eeb77241457eb3819ba7a9cf07942478ce314d5941c"
+    },
+    "revision": {
+      "type": "uri",
+      "value": "https://example.invalid/sparkles-fixture/corpus-v1/id/sourceRevision/0cb8966fc983660e004a7057a8c413a729b1680e35065d46be6e93e42f989d66"
+    },
+    "membership": {
+      "type": "literal",
+      "value": "excluded",
+      "datatype": "http://www.w3.org/2001/XMLSchema#string"
+    },
+    "applicability": {
+      "type": "literal",
+      "value": "not-affected-in-declared-scope",
+      "datatype": "http://www.w3.org/2001/XMLSchema#string"
+    },
+    "evidence": {
+      "type": "uri",
+      "value": "https://example.invalid/sparkles-fixture/corpus-v1/evidence/r2/event-0"
+    }
+  },
+  {
+    "evaluation": {
+      "type": "uri",
+      "value": "https://example.invalid/sparkles-fixture/corpus-v1/id/evaluation/5ad0a6c6afe1f8b6fd2536f195bd6ca5d82b7072f54039b9e28e67dc998c1e67"
+    },
+    "member": {
+      "type": "uri",
+      "value": "https://example.invalid/sparkles-fixture/corpus-v1/id/member/c0cb5449bf6dc20292d12eeb77241457eb3819ba7a9cf07942478ce314d5941c"
+    },
+    "revision": {
+      "type": "uri",
+      "value": "https://example.invalid/sparkles-fixture/corpus-v1/id/sourceRevision/0cb8966fc983660e004a7057a8c413a729b1680e35065d46be6e93e42f989d66"
+    },
+    "membership": {
+      "type": "literal",
+      "value": "excluded",
+      "datatype": "http://www.w3.org/2001/XMLSchema#string"
+    },
+    "applicability": {
+      "type": "literal",
+      "value": "not-affected-in-declared-scope",
+      "datatype": "http://www.w3.org/2001/XMLSchema#string"
+    },
+    "evidence": {
+      "type": "uri",
+      "value": "https://example.invalid/sparkles-fixture/corpus-v1/evidence/r2/event-1"
+    }
+  },
+  {
+    "evaluation": {
+      "type": "uri",
+      "value": "https://example.invalid/sparkles-fixture/corpus-v1/id/evaluation/8161aa1036367a7b81940b1ea692c94e36ea07d211e48a1c005f9114c3016540"
+    },
+    "member": {
+      "type": "uri",
+      "value": "https://example.invalid/sparkles-fixture/corpus-v1/id/member/c14af2cc4008fd4f96abef4876171fdd3ea8e2d2a1dcf62d59c6c732755d34bf"
+    },
+    "revision": {
+      "type": "uri",
+      "value": "https://example.invalid/sparkles-fixture/corpus-v1/id/sourceRevision/5066b3937cbcba43685b62b2aa32e30aeb1434361bac41a1e03123772c4bcee7"
+    },
+    "membership": {
+      "type": "literal",
+      "value": "included",
+      "datatype": "http://www.w3.org/2001/XMLSchema#string"
+    },
+    "applicability": {
+      "type": "literal",
+      "value": "affected-in-declared-scope",
+      "datatype": "http://www.w3.org/2001/XMLSchema#string"
+    },
+    "evidence": {
+      "type": "uri",
+      "value": "https://example.invalid/sparkles-fixture/corpus-v1/evidence/r1/event-0"
+    }
+  },
+  {
+    "evaluation": {
+      "type": "uri",
+      "value": "https://example.invalid/sparkles-fixture/corpus-v1/id/evaluation/8161aa1036367a7b81940b1ea692c94e36ea07d211e48a1c005f9114c3016540"
+    },
+    "member": {
+      "type": "uri",
+      "value": "https://example.invalid/sparkles-fixture/corpus-v1/id/member/c14af2cc4008fd4f96abef4876171fdd3ea8e2d2a1dcf62d59c6c732755d34bf"
+    },
+    "revision": {
+      "type": "uri",
+      "value": "https://example.invalid/sparkles-fixture/corpus-v1/id/sourceRevision/5066b3937cbcba43685b62b2aa32e30aeb1434361bac41a1e03123772c4bcee7"
+    },
+    "membership": {
+      "type": "literal",
+      "value": "included",
+      "datatype": "http://www.w3.org/2001/XMLSchema#string"
+    },
+    "applicability": {
+      "type": "literal",
+      "value": "affected-in-declared-scope",
+      "datatype": "http://www.w3.org/2001/XMLSchema#string"
+    },
+    "evidence": {
+      "type": "uri",
+      "value": "https://example.invalid/sparkles-fixture/corpus-v1/evidence/r1/event-1"
+    }
+  },
+  {
+    "evaluation": {
+      "type": "uri",
+      "value": "https://example.invalid/sparkles-fixture/corpus-v1/id/evaluation/dc8209cba23dd57fea00726a194d435310ae9c513c3a1c0b55c711f36966b207"
+    },
+    "member": {
+      "type": "uri",
+      "value": "https://example.invalid/sparkles-fixture/corpus-v1/id/member/92020e88d28f268d3a6e696e4c79e3e8d25426386065a00cdd958305d76b09e9"
+    },
+    "revision": {
+      "type": "uri",
+      "value": "https://example.invalid/sparkles-fixture/corpus-v1/id/sourceRevision/5066b3937cbcba43685b62b2aa32e30aeb1434361bac41a1e03123772c4bcee7"
+    },
+    "membership": {
+      "type": "literal",
+      "value": "excluded",
+      "datatype": "http://www.w3.org/2001/XMLSchema#string"
+    },
+    "applicability": {
+      "type": "literal",
+      "value": "not-affected-in-declared-scope",
+      "datatype": "http://www.w3.org/2001/XMLSchema#string"
+    },
+    "evidence": {
+      "type": "uri",
+      "value": "https://example.invalid/sparkles-fixture/corpus-v1/evidence/r1/event-0"
+    }
+  },
+  {
+    "evaluation": {
+      "type": "uri",
+      "value": "https://example.invalid/sparkles-fixture/corpus-v1/id/evaluation/dc8209cba23dd57fea00726a194d435310ae9c513c3a1c0b55c711f36966b207"
+    },
+    "member": {
+      "type": "uri",
+      "value": "https://example.invalid/sparkles-fixture/corpus-v1/id/member/92020e88d28f268d3a6e696e4c79e3e8d25426386065a00cdd958305d76b09e9"
+    },
+    "revision": {
+      "type": "uri",
+      "value": "https://example.invalid/sparkles-fixture/corpus-v1/id/sourceRevision/5066b3937cbcba43685b62b2aa32e30aeb1434361bac41a1e03123772c4bcee7"
+    },
+    "membership": {
+      "type": "literal",
+      "value": "excluded",
+      "datatype": "http://www.w3.org/2001/XMLSchema#string"
+    },
+    "applicability": {
+      "type": "literal",
+      "value": "not-affected-in-declared-scope",
+      "datatype": "http://www.w3.org/2001/XMLSchema#string"
+    },
+    "evidence": {
+      "type": "uri",
+      "value": "https://example.invalid/sparkles-fixture/corpus-v1/evidence/r1/event-1"
+    }
+  },
+  {
+    "evaluation": {
+      "type": "uri",
+      "value": "https://example.invalid/sparkles-fixture/corpus-v1/id/evaluation/ee4eeb90df7946c8c41ed5050440333584ed71f7ee4fd1ea6bf2e10f58fb77a7"
+    },
+    "member": {
+      "type": "uri",
+      "value": "https://example.invalid/sparkles-fixture/corpus-v1/id/member/c14af2cc4008fd4f96abef4876171fdd3ea8e2d2a1dcf62d59c6c732755d34bf"
+    },
+    "revision": {
+      "type": "uri",
+      "value": "https://example.invalid/sparkles-fixture/corpus-v1/id/sourceRevision/0cb8966fc983660e004a7057a8c413a729b1680e35065d46be6e93e42f989d66"
+    },
+    "membership": {
+      "type": "literal",
+      "value": "excluded",
+      "datatype": "http://www.w3.org/2001/XMLSchema#string"
+    },
+    "applicability": {
+      "type": "literal",
+      "value": "not-affected-in-declared-scope",
+      "datatype": "http://www.w3.org/2001/XMLSchema#string"
+    },
+    "evidence": {
+      "type": "uri",
+      "value": "https://example.invalid/sparkles-fixture/corpus-v1/evidence/r2/event-0"
+    }
+  },
+  {
+    "evaluation": {
+      "type": "uri",
+      "value": "https://example.invalid/sparkles-fixture/corpus-v1/id/evaluation/ee4eeb90df7946c8c41ed5050440333584ed71f7ee4fd1ea6bf2e10f58fb77a7"
+    },
+    "member": {
+      "type": "uri",
+      "value": "https://example.invalid/sparkles-fixture/corpus-v1/id/member/c14af2cc4008fd4f96abef4876171fdd3ea8e2d2a1dcf62d59c6c732755d34bf"
+    },
+    "revision": {
+      "type": "uri",
+      "value": "https://example.invalid/sparkles-fixture/corpus-v1/id/sourceRevision/0cb8966fc983660e004a7057a8c413a729b1680e35065d46be6e93e42f989d66"
+    },
+    "membership": {
+      "type": "literal",
+      "value": "excluded",
+      "datatype": "http://www.w3.org/2001/XMLSchema#string"
+    },
+    "applicability": {
+      "type": "literal",
+      "value": "not-affected-in-declared-scope",
+      "datatype": "http://www.w3.org/2001/XMLSchema#string"
+    },
+    "evidence": {
+      "type": "uri",
+      "value": "https://example.invalid/sparkles-fixture/corpus-v1/evidence/r2/event-1"
+    }
+  }
+]

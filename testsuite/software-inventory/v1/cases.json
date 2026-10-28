@@ -1,0 +1,1855 @@
+{
+  "profile": "software-inventory-fixture-adjudicated-oracle/1",
+  "range_profiles": {
+    "base": {
+      "ranges": [
+        {
+          "type": "SEMVER",
+          "events": [
+            {
+              "introduced": "1.2.0"
+            },
+            {
+              "fixed": "1.4.0"
+            }
+          ]
+        }
+      ]
+    },
+    "prerelease": {
+      "ranges": [
+        {
+          "type": "SEMVER",
+          "events": [
+            {
+              "introduced": "1.0.0-rc.2"
+            },
+            {
+              "fixed": "1.0.0"
+            }
+          ]
+        }
+      ]
+    },
+    "alpha": {
+      "ranges": [
+        {
+          "type": "SEMVER",
+          "events": [
+            {
+              "introduced": "1.0.0-alpha"
+            },
+            {
+              "fixed": "1.0.0-beta"
+            }
+          ]
+        }
+      ]
+    },
+    "sentinel": {
+      "ranges": [
+        {
+          "type": "SEMVER",
+          "events": [
+            {
+              "introduced": "0"
+            },
+            {
+              "fixed": "0.0.1"
+            }
+          ]
+        }
+      ]
+    },
+    "open": {
+      "ranges": [
+        {
+          "type": "SEMVER",
+          "events": [
+            {
+              "introduced": "1.2.0"
+            }
+          ]
+        }
+      ]
+    },
+    "last": {
+      "ranges": [
+        {
+          "type": "SEMVER",
+          "events": [
+            {
+              "introduced": "1.2.0"
+            },
+            {
+              "last_affected": "1.3.0"
+            }
+          ]
+        }
+      ]
+    },
+    "limit": {
+      "ranges": [
+        {
+          "type": "SEMVER",
+          "events": [
+            {
+              "introduced": "1.2.0"
+            },
+            {
+              "limit": "1.3.0"
+            }
+          ]
+        }
+      ]
+    },
+    "multiple_limits": {
+      "ranges": [
+        {
+          "type": "SEMVER",
+          "events": [
+            {
+              "introduced": "1.2.0"
+            },
+            {
+              "limit": "1.3.0"
+            },
+            {
+              "limit": "1.5.0"
+            }
+          ]
+        }
+      ]
+    },
+    "star_limit": {
+      "ranges": [
+        {
+          "type": "SEMVER",
+          "events": [
+            {
+              "introduced": "1.2.0"
+            },
+            {
+              "limit": "*"
+            }
+          ]
+        }
+      ]
+    },
+    "reopened": {
+      "ranges": [
+        {
+          "type": "SEMVER",
+          "events": [
+            {
+              "introduced": "1.0.0"
+            },
+            {
+              "fixed": "1.2.0"
+            },
+            {
+              "introduced": "2.0.0"
+            },
+            {
+              "fixed": "2.1.0"
+            }
+          ]
+        }
+      ]
+    },
+    "list": {
+      "versions": [
+        "1.3.0"
+      ]
+    },
+    "list_union": {
+      "ranges": [
+        {
+          "type": "SEMVER",
+          "events": [
+            {
+              "introduced": "1.2.0"
+            },
+            {
+              "fixed": "1.4.0"
+            }
+          ]
+        }
+      ],
+      "versions": [
+        "1.4.0"
+      ]
+    },
+    "unsorted": {
+      "ranges": [
+        {
+          "type": "SEMVER",
+          "events": [
+            {
+              "fixed": "1.4.0"
+            },
+            {
+              "introduced": "1.2.0"
+            }
+          ]
+        }
+      ]
+    },
+    "singleton": {
+      "ranges": [
+        {
+          "type": "SEMVER",
+          "events": [
+            {
+              "introduced": "1.2.0"
+            },
+            {
+              "last_affected": "1.2.0"
+            }
+          ]
+        }
+      ]
+    },
+    "numeric_pre": {
+      "ranges": [
+        {
+          "type": "SEMVER",
+          "events": [
+            {
+              "introduced": "1.0.0-1"
+            },
+            {
+              "fixed": "1.0.0-alpha"
+            }
+          ]
+        }
+      ]
+    },
+    "ascii_case": {
+      "ranges": [
+        {
+          "type": "SEMVER",
+          "events": [
+            {
+              "introduced": "1.0.0-A"
+            },
+            {
+              "fixed": "1.0.0-a"
+            }
+          ]
+        }
+      ]
+    },
+    "listed_build": {
+      "versions": [
+        "1.3.0+build"
+      ]
+    },
+    "mixed_positive": {
+      "ranges": [
+        {
+          "type": "SEMVER",
+          "events": [
+            {
+              "introduced": "1.2.0"
+            },
+            {
+              "fixed": "1.4.0"
+            }
+          ]
+        },
+        {
+          "type": "ECOSYSTEM",
+          "events": [
+            {
+              "introduced": "0"
+            }
+          ]
+        }
+      ]
+    },
+    "mixed_negative": {
+      "ranges": [
+        {
+          "type": "SEMVER",
+          "events": [
+            {
+              "introduced": "1.2.0"
+            },
+            {
+              "fixed": "1.4.0"
+            }
+          ]
+        },
+        {
+          "type": "ECOSYSTEM",
+          "events": [
+            {
+              "introduced": "0"
+            }
+          ]
+        }
+      ]
+    },
+    "singleton_unsorted": {
+      "ranges": [
+        {
+          "type": "SEMVER",
+          "events": [
+            {
+              "last_affected": "1.2.0"
+            },
+            {
+              "introduced": "1.2.0"
+            }
+          ]
+        }
+      ]
+    },
+    "fixed_build": {
+      "ranges": [
+        {
+          "type": "SEMVER",
+          "events": [
+            {
+              "introduced": "1.2.0+intro"
+            },
+            {
+              "fixed": "1.4.0+fix"
+            }
+          ]
+        }
+      ]
+    },
+    "limit_reopened": {
+      "ranges": [
+        {
+          "type": "SEMVER",
+          "events": [
+            {
+              "introduced": "1.0.0"
+            },
+            {
+              "fixed": "1.2.0"
+            },
+            {
+              "introduced": "2.0.0"
+            },
+            {
+              "fixed": "2.1.0"
+            },
+            {
+              "limit": "2.0.5"
+            }
+          ]
+        }
+      ]
+    },
+    "limit_multiple_unsorted": {
+      "ranges": [
+        {
+          "type": "SEMVER",
+          "events": [
+            {
+              "limit": "1.3.0"
+            },
+            {
+              "limit": "1.5.0"
+            },
+            {
+              "introduced": "1.2.0"
+            }
+          ]
+        }
+      ]
+    },
+    "empty_information": {
+      "ranges": [],
+      "versions": []
+    }
+  },
+  "version_cases": [
+    {
+      "id": "V01",
+      "range_profile": "base",
+      "version": "1.1.99",
+      "expected_membership": "excluded",
+      "reason": "Below introduction.",
+      "disposition": "accepted-unchanged",
+      "basis": "semver-and-osv-evaluation",
+      "source_refs": [
+        "semver",
+        "osv-evaluation"
+      ]
+    },
+    {
+      "id": "V02",
+      "range_profile": "base",
+      "version": "1.2.0-rc.1",
+      "expected_membership": "excluded",
+      "reason": "Prerelease precedes the introduced release.",
+      "disposition": "accepted-unchanged",
+      "basis": "semver-and-osv-evaluation",
+      "source_refs": [
+        "semver",
+        "osv-evaluation"
+      ]
+    },
+    {
+      "id": "V03",
+      "range_profile": "base",
+      "version": "1.2.0",
+      "expected_membership": "included",
+      "reason": "Inclusive introduced boundary.",
+      "disposition": "accepted-unchanged",
+      "basis": "semver-and-osv-evaluation",
+      "source_refs": [
+        "semver",
+        "osv-evaluation"
+      ]
+    },
+    {
+      "id": "V04",
+      "range_profile": "base",
+      "version": "1.2.0+build.01",
+      "expected_membership": "included",
+      "reason": "Build metadata does not change range precedence.",
+      "disposition": "accepted-unchanged",
+      "basis": "semver-and-osv-evaluation",
+      "source_refs": [
+        "semver",
+        "osv-evaluation"
+      ]
+    },
+    {
+      "id": "V05",
+      "range_profile": "base",
+      "version": "1.3.0",
+      "expected_membership": "included",
+      "reason": "Inside base interval.",
+      "disposition": "accepted-unchanged",
+      "basis": "semver-and-osv-evaluation",
+      "source_refs": [
+        "semver",
+        "osv-evaluation"
+      ]
+    },
+    {
+      "id": "V06",
+      "range_profile": "base",
+      "version": "1.4.0-rc.1",
+      "expected_membership": "included",
+      "reason": "Prerelease remains below the fixed release.",
+      "disposition": "accepted-unchanged",
+      "basis": "semver-and-osv-evaluation",
+      "source_refs": [
+        "semver",
+        "osv-evaluation"
+      ]
+    },
+    {
+      "id": "V07",
+      "range_profile": "base",
+      "version": "1.4.0-rc.10",
+      "expected_membership": "included",
+      "reason": "Cargo requirement prerelease exclusions do not apply.",
+      "disposition": "accepted-unchanged",
+      "basis": "semver-and-osv-evaluation",
+      "source_refs": [
+        "semver",
+        "osv-evaluation"
+      ]
+    },
+    {
+      "id": "V08",
+      "range_profile": "base",
+      "version": "1.4.0",
+      "expected_membership": "excluded",
+      "reason": "Exclusive fixed boundary.",
+      "disposition": "accepted-unchanged",
+      "basis": "semver-and-osv-evaluation",
+      "source_refs": [
+        "semver",
+        "osv-evaluation"
+      ]
+    },
+    {
+      "id": "V09",
+      "range_profile": "base",
+      "version": "1.4.0+build.01",
+      "expected_membership": "excluded",
+      "reason": "Build metadata cannot put a fixed release back in range.",
+      "disposition": "accepted-unchanged",
+      "basis": "semver-and-osv-evaluation",
+      "source_refs": [
+        "semver",
+        "osv-evaluation"
+      ]
+    },
+    {
+      "id": "V10",
+      "range_profile": "base",
+      "version": "1.10.0",
+      "expected_membership": "excluded",
+      "reason": "Numeric minor comparison, never lexical string comparison.",
+      "disposition": "accepted-unchanged",
+      "basis": "semver-and-osv-evaluation",
+      "source_refs": [
+        "semver",
+        "osv-evaluation"
+      ]
+    },
+    {
+      "id": "V11",
+      "range_profile": "prerelease",
+      "version": "1.0.0-rc.1",
+      "expected_membership": "excluded",
+      "reason": "Below prerelease introduction.",
+      "disposition": "accepted-unchanged",
+      "basis": "semver-and-osv-evaluation",
+      "source_refs": [
+        "semver",
+        "osv-evaluation"
+      ]
+    },
+    {
+      "id": "V12",
+      "range_profile": "prerelease",
+      "version": "1.0.0-rc.2",
+      "expected_membership": "included",
+      "reason": "Inclusive prerelease introduction.",
+      "disposition": "accepted-unchanged",
+      "basis": "semver-and-osv-evaluation",
+      "source_refs": [
+        "semver",
+        "osv-evaluation"
+      ]
+    },
+    {
+      "id": "V13",
+      "range_profile": "prerelease",
+      "version": "1.0.0-rc.10",
+      "expected_membership": "included",
+      "reason": "Numeric prerelease identifier 10 exceeds 2.",
+      "disposition": "accepted-unchanged",
+      "basis": "semver-and-osv-evaluation",
+      "source_refs": [
+        "semver",
+        "osv-evaluation"
+      ]
+    },
+    {
+      "id": "V14",
+      "range_profile": "prerelease",
+      "version": "1.0.0",
+      "expected_membership": "excluded",
+      "reason": "Fixed stable release.",
+      "disposition": "accepted-unchanged",
+      "basis": "semver-and-osv-evaluation",
+      "source_refs": [
+        "semver",
+        "osv-evaluation"
+      ]
+    },
+    {
+      "id": "V15",
+      "range_profile": "prerelease",
+      "version": "1.0.0+001",
+      "expected_membership": "excluded",
+      "reason": "Build metadata does not change fixed precedence.",
+      "disposition": "accepted-unchanged",
+      "basis": "semver-and-osv-evaluation",
+      "source_refs": [
+        "semver",
+        "osv-evaluation"
+      ]
+    },
+    {
+      "id": "V16",
+      "range_profile": "alpha",
+      "version": "1.0.0-alpha.1",
+      "expected_membership": "included",
+      "reason": "Longer prerelease identifier sequence after alpha.",
+      "disposition": "accepted-unchanged",
+      "basis": "semver-and-osv-evaluation",
+      "source_refs": [
+        "semver",
+        "osv-evaluation"
+      ]
+    },
+    {
+      "id": "V17",
+      "range_profile": "alpha",
+      "version": "1.0.0-alpha.beta",
+      "expected_membership": "included",
+      "reason": "Alpha sequence is before beta.",
+      "disposition": "accepted-unchanged",
+      "basis": "semver-and-osv-evaluation",
+      "source_refs": [
+        "semver",
+        "osv-evaluation"
+      ]
+    },
+    {
+      "id": "V18",
+      "range_profile": "alpha",
+      "version": "1.0.0-beta",
+      "expected_membership": "excluded",
+      "reason": "Exclusive fixed prerelease.",
+      "disposition": "accepted-unchanged",
+      "basis": "semver-and-osv-evaluation",
+      "source_refs": [
+        "semver",
+        "osv-evaluation"
+      ]
+    },
+    {
+      "id": "V19",
+      "range_profile": "sentinel",
+      "version": "0.0.0-0",
+      "expected_membership": "included",
+      "reason": "Introduced 0 precedes every version.",
+      "disposition": "accepted-unchanged",
+      "basis": "semver-and-osv-evaluation",
+      "source_refs": [
+        "osv-events",
+        "osv-evaluation",
+        "semver"
+      ]
+    },
+    {
+      "id": "V20",
+      "range_profile": "sentinel",
+      "version": "0.0.0",
+      "expected_membership": "included",
+      "reason": "Sentinel is not ordinary 0.0.0.",
+      "disposition": "accepted-unchanged",
+      "basis": "semver-and-osv-evaluation",
+      "source_refs": [
+        "osv-events",
+        "osv-evaluation",
+        "semver"
+      ]
+    },
+    {
+      "id": "V21",
+      "range_profile": "sentinel",
+      "version": "0.0.1",
+      "expected_membership": "excluded",
+      "reason": "Fixed boundary.",
+      "disposition": "accepted-unchanged",
+      "basis": "semver-and-osv-evaluation",
+      "source_refs": [
+        "osv-events",
+        "osv-evaluation",
+        "semver"
+      ]
+    },
+    {
+      "id": "V22",
+      "range_profile": "open",
+      "version": "99.0.0",
+      "expected_membership": "included",
+      "reason": "No upper event means open interval.",
+      "disposition": "accepted-unchanged",
+      "basis": "semver-and-osv-evaluation",
+      "source_refs": [
+        "semver",
+        "osv-evaluation"
+      ]
+    },
+    {
+      "id": "V23",
+      "range_profile": "open",
+      "version": "1.1.0",
+      "expected_membership": "excluded",
+      "reason": "Below introduction.",
+      "disposition": "accepted-unchanged",
+      "basis": "semver-and-osv-evaluation",
+      "source_refs": [
+        "semver",
+        "osv-evaluation"
+      ]
+    },
+    {
+      "id": "V24",
+      "range_profile": "last",
+      "version": "1.3.0",
+      "expected_membership": "included",
+      "reason": "Inclusive last affected.",
+      "disposition": "accepted-unchanged",
+      "basis": "semver-and-osv-evaluation",
+      "source_refs": [
+        "semver",
+        "osv-evaluation"
+      ]
+    },
+    {
+      "id": "V25",
+      "range_profile": "last",
+      "version": "1.3.0+build",
+      "expected_membership": "included",
+      "reason": "Same precedence as last affected.",
+      "disposition": "accepted-unchanged",
+      "basis": "semver-and-osv-evaluation",
+      "source_refs": [
+        "semver",
+        "osv-evaluation"
+      ]
+    },
+    {
+      "id": "V26",
+      "range_profile": "last",
+      "version": "1.3.1",
+      "expected_membership": "excluded",
+      "reason": "Above last affected, without evidence of a fix.",
+      "disposition": "accepted-unchanged",
+      "basis": "semver-and-osv-evaluation",
+      "source_refs": [
+        "semver",
+        "osv-evaluation"
+      ]
+    },
+    {
+      "id": "V27",
+      "range_profile": "limit",
+      "version": "1.3.0",
+      "expected_membership": "excluded",
+      "reason": "Exclusive limit boundary, without evidence of a fix.",
+      "disposition": "accepted-unchanged",
+      "basis": "semver-and-osv-evaluation",
+      "source_refs": [
+        "semver",
+        "osv-evaluation"
+      ]
+    },
+    {
+      "id": "V28",
+      "range_profile": "limit",
+      "version": "1.3.0-rc.1",
+      "expected_membership": "included",
+      "reason": "Before exclusive limit.",
+      "disposition": "accepted-unchanged",
+      "basis": "semver-and-osv-evaluation",
+      "source_refs": [
+        "semver",
+        "osv-evaluation"
+      ]
+    },
+    {
+      "id": "V29",
+      "range_profile": "multiple_limits",
+      "version": "1.4.0",
+      "expected_membership": "included",
+      "reason": "Before at least one limit; limits are alternatives.",
+      "disposition": "accepted-unchanged",
+      "basis": "semver-and-osv-evaluation",
+      "source_refs": [
+        "osv-events",
+        "osv-evaluation",
+        "semver"
+      ]
+    },
+    {
+      "id": "V30",
+      "range_profile": "multiple_limits",
+      "version": "1.5.0",
+      "expected_membership": "excluded",
+      "reason": "At the largest limit.",
+      "disposition": "accepted-unchanged",
+      "basis": "semver-and-osv-evaluation",
+      "source_refs": [
+        "osv-events",
+        "osv-evaluation",
+        "semver"
+      ]
+    },
+    {
+      "id": "V31",
+      "range_profile": "star_limit",
+      "version": "99.0.0",
+      "expected_membership": "included",
+      "reason": "Infinity marker is not a SemVer string.",
+      "disposition": "accepted-unchanged",
+      "basis": "semver-and-osv-evaluation",
+      "source_refs": [
+        "osv-events",
+        "osv-evaluation",
+        "semver"
+      ]
+    },
+    {
+      "id": "V32",
+      "range_profile": "reopened",
+      "version": "1.5.0",
+      "expected_membership": "excluded",
+      "reason": "Between the two intervals.",
+      "disposition": "accepted-unchanged",
+      "basis": "semver-and-osv-evaluation",
+      "source_refs": [
+        "semver",
+        "osv-evaluation"
+      ]
+    },
+    {
+      "id": "V33",
+      "range_profile": "reopened",
+      "version": "2.0.0",
+      "expected_membership": "included",
+      "reason": "Inclusive second introduction.",
+      "disposition": "accepted-unchanged",
+      "basis": "semver-and-osv-evaluation",
+      "source_refs": [
+        "semver",
+        "osv-evaluation"
+      ]
+    },
+    {
+      "id": "V34",
+      "range_profile": "reopened",
+      "version": "2.1.0",
+      "expected_membership": "excluded",
+      "reason": "Exclusive second fix.",
+      "disposition": "accepted-unchanged",
+      "basis": "semver-and-osv-evaluation",
+      "source_refs": [
+        "semver",
+        "osv-evaluation"
+      ]
+    },
+    {
+      "id": "V35",
+      "range_profile": "list",
+      "version": "1.3.0",
+      "expected_membership": "included",
+      "reason": "Exact listed spelling.",
+      "disposition": "accepted-unchanged",
+      "basis": "explicit-list-fixture-policy",
+      "source_refs": [
+        "osv-evaluation",
+        "semver"
+      ]
+    },
+    {
+      "id": "V36",
+      "range_profile": "list",
+      "version": "1.3.0+build",
+      "expected_membership": "unknown",
+      "reason": "Bounded profile does not assume list spelling equivalence.",
+      "disposition": "accepted-unchanged",
+      "basis": "explicit-list-fixture-policy",
+      "source_refs": [
+        "osv-evaluation",
+        "semver"
+      ]
+    },
+    {
+      "id": "V37",
+      "range_profile": "list",
+      "version": "1.3.1",
+      "expected_membership": "excluded",
+      "reason": "Not enumerated in this complete supplied list.",
+      "disposition": "accepted-unchanged",
+      "basis": "explicit-list-fixture-policy",
+      "source_refs": [
+        "osv-evaluation",
+        "semver"
+      ]
+    },
+    {
+      "id": "V38",
+      "range_profile": "list_union",
+      "version": "1.4.0",
+      "expected_membership": "included",
+      "reason": "Explicit list adds a version excluded by the range.",
+      "disposition": "accepted-unchanged",
+      "basis": "semver-and-osv-evaluation",
+      "source_refs": [
+        "semver",
+        "osv-evaluation"
+      ]
+    },
+    {
+      "id": "V39",
+      "range_profile": "unsorted",
+      "version": "1.3.0",
+      "expected_membership": "included",
+      "reason": "Sort supported events while retaining original pointers.",
+      "disposition": "accepted-unchanged",
+      "basis": "semver-and-osv-evaluation",
+      "source_refs": [
+        "osv-events",
+        "osv-evaluation",
+        "semver"
+      ]
+    },
+    {
+      "id": "V40",
+      "range_profile": "base",
+      "version": "v1.3.0",
+      "expected_membership": "unknown",
+      "reason": "Unsupported strict version lexical form.",
+      "disposition": "accepted-unchanged",
+      "basis": "strict-semver-input-refusal",
+      "source_refs": [
+        "semver"
+      ]
+    },
+    {
+      "id": "V41",
+      "range_profile": "base",
+      "version": "1.3",
+      "expected_membership": "unknown",
+      "reason": "Missing patch component.",
+      "disposition": "accepted-unchanged",
+      "basis": "strict-semver-input-refusal",
+      "source_refs": [
+        "semver"
+      ]
+    },
+    {
+      "id": "V42",
+      "range_profile": "base",
+      "version": "01.3.0",
+      "expected_membership": "unknown",
+      "reason": "Forbidden leading zero.",
+      "disposition": "accepted-unchanged",
+      "basis": "strict-semver-input-refusal",
+      "source_refs": [
+        "semver"
+      ]
+    },
+    {
+      "id": "V43",
+      "range_profile": "base",
+      "version": "1.3.0-rc.01",
+      "expected_membership": "unknown",
+      "reason": "Forbidden leading zero in numeric prerelease identifier.",
+      "disposition": "accepted-unchanged",
+      "basis": "strict-semver-input-refusal",
+      "source_refs": [
+        "semver"
+      ]
+    },
+    {
+      "id": "V44",
+      "range_profile": "base",
+      "version": "1.3.0+",
+      "expected_membership": "unknown",
+      "reason": "Empty build identifier.",
+      "disposition": "accepted-unchanged",
+      "basis": "strict-semver-input-refusal",
+      "source_refs": [
+        "semver"
+      ]
+    },
+    {
+      "id": "V45",
+      "range_profile": "base",
+      "version": " 1.3.0",
+      "expected_membership": "unknown",
+      "reason": "No whitespace stripping.",
+      "disposition": "accepted-unchanged",
+      "basis": "strict-semver-input-refusal",
+      "source_refs": [
+        "semver"
+      ]
+    },
+    {
+      "id": "V46",
+      "range_profile": "base",
+      "version": "1.3.0 ",
+      "expected_membership": "unknown",
+      "reason": "No whitespace stripping.",
+      "disposition": "accepted-unchanged",
+      "basis": "strict-semver-input-refusal",
+      "source_refs": [
+        "semver"
+      ]
+    },
+    {
+      "id": "V47",
+      "range_profile": "base",
+      "version": "18446744073709551616.0.0",
+      "expected_membership": "unknown",
+      "reason": "Exceeds selected library u64 component bound.",
+      "disposition": "accepted-unchanged",
+      "basis": "u64-library-bound-not-semver-invalid",
+      "source_refs": [
+        "semver-library"
+      ]
+    },
+    {
+      "id": "V48",
+      "range_profile": "base",
+      "version": "^1.3.0",
+      "expected_membership": "unknown",
+      "reason": "Requirement language is not an exact lock version.",
+      "disposition": "accepted-unchanged",
+      "basis": "strict-semver-input-refusal",
+      "source_refs": [
+        "semver"
+      ]
+    },
+    {
+      "id": "V49",
+      "range_profile": "base",
+      "version": "1.*",
+      "expected_membership": "unknown",
+      "reason": "Wildcard is not an exact version.",
+      "disposition": "accepted-unchanged",
+      "basis": "strict-semver-input-refusal",
+      "source_refs": [
+        "semver"
+      ]
+    },
+    {
+      "id": "V50",
+      "range_profile": "base",
+      "version": "１.3.0",
+      "expected_membership": "unknown",
+      "reason": "Unicode digit is not strict SemVer lexical input.",
+      "disposition": "accepted-unchanged",
+      "basis": "strict-semver-input-refusal",
+      "source_refs": [
+        "semver"
+      ]
+    },
+    {
+      "id": "V51",
+      "range_profile": "singleton",
+      "version": "1.2.0",
+      "expected_membership": "included",
+      "reason": "Inclusive introduced and last-affected boundaries form a singleton.",
+      "disposition": "accepted-unchanged",
+      "basis": "inclusive-boundaries-with-profile-tie-order",
+      "source_refs": [
+        "semver",
+        "osv-evaluation"
+      ]
+    },
+    {
+      "id": "V52",
+      "range_profile": "singleton",
+      "version": "1.2.1",
+      "expected_membership": "excluded",
+      "reason": "Above the inclusive singleton, without claiming a fix.",
+      "disposition": "accepted-unchanged",
+      "basis": "inclusive-boundaries-with-profile-tie-order",
+      "source_refs": [
+        "semver",
+        "osv-evaluation"
+      ]
+    },
+    {
+      "id": "V53",
+      "range_profile": "numeric_pre",
+      "version": "1.0.0-2",
+      "expected_membership": "included",
+      "reason": "Numeric prerelease identifier precedes a nonnumeric identifier.",
+      "disposition": "accepted-unchanged",
+      "basis": "semver-and-osv-evaluation",
+      "source_refs": [
+        "semver",
+        "osv-evaluation"
+      ]
+    },
+    {
+      "id": "V54",
+      "range_profile": "numeric_pre",
+      "version": "1.0.0-alpha",
+      "expected_membership": "excluded",
+      "reason": "Exclusive nonnumeric prerelease fix boundary.",
+      "disposition": "accepted-unchanged",
+      "basis": "semver-and-osv-evaluation",
+      "source_refs": [
+        "semver",
+        "osv-evaluation"
+      ]
+    },
+    {
+      "id": "V55",
+      "range_profile": "ascii_case",
+      "version": "1.0.0-Z",
+      "expected_membership": "included",
+      "reason": "ASCII uppercase Z precedes lowercase a.",
+      "disposition": "added-independent-control",
+      "basis": "explicit-adjudicated-profile"
+    },
+    {
+      "id": "V56",
+      "range_profile": "ascii_case",
+      "version": "1.0.0-a",
+      "expected_membership": "excluded",
+      "reason": "Exclusive lowercase fix; lowercasing would change the earlier control.",
+      "disposition": "added-independent-control",
+      "basis": "explicit-adjudicated-profile"
+    },
+    {
+      "id": "V57",
+      "range_profile": "listed_build",
+      "version": "1.3.0+build",
+      "expected_membership": "included",
+      "reason": "Exact listed spelling includes even with build metadata.",
+      "disposition": "added-independent-control",
+      "basis": "explicit-adjudicated-profile"
+    },
+    {
+      "id": "V58",
+      "range_profile": "listed_build",
+      "version": "1.3.0",
+      "expected_membership": "unknown",
+      "reason": "Different retained spelling with equal precedence is deliberately unknown for list-only matching.",
+      "disposition": "added-independent-control",
+      "basis": "explicit-adjudicated-profile"
+    },
+    {
+      "id": "V59",
+      "range_profile": "listed_build",
+      "version": "1.3.0+other",
+      "expected_membership": "unknown",
+      "reason": "Equal precedence alone is insufficient for exact-list fixture policy.",
+      "disposition": "added-independent-control",
+      "basis": "explicit-adjudicated-profile"
+    },
+    {
+      "id": "V60",
+      "range_profile": "mixed_positive",
+      "version": "1.3.0",
+      "expected_membership": "included",
+      "reason": "A known true union branch suffices despite an unsupported sibling.",
+      "disposition": "added-independent-control",
+      "basis": "explicit-adjudicated-profile"
+    },
+    {
+      "id": "V61",
+      "range_profile": "mixed_negative",
+      "version": "1.4.0",
+      "expected_membership": "unknown",
+      "reason": "Known exclusion cannot settle an unsupported union sibling.",
+      "disposition": "added-independent-control",
+      "basis": "explicit-adjudicated-profile"
+    },
+    {
+      "id": "V62",
+      "range_profile": "singleton_unsorted",
+      "version": "1.2.0",
+      "expected_membership": "included",
+      "reason": "Source order does not invalidate singleton.",
+      "disposition": "added-independent-control",
+      "basis": "explicit-adjudicated-profile"
+    },
+    {
+      "id": "V63",
+      "range_profile": "singleton_unsorted",
+      "version": "1.2.1",
+      "expected_membership": "excluded",
+      "reason": "Tie is applied introduced before last_affected.",
+      "disposition": "added-independent-control",
+      "basis": "explicit-adjudicated-profile"
+    },
+    {
+      "id": "V64",
+      "range_profile": "singleton",
+      "version": "1.2.0+001",
+      "expected_membership": "included",
+      "reason": "Valid build metadata shares singleton precedence.",
+      "disposition": "added-independent-control",
+      "basis": "explicit-adjudicated-profile"
+    },
+    {
+      "id": "V65",
+      "range_profile": "fixed_build",
+      "version": "1.4.0",
+      "expected_membership": "excluded",
+      "reason": "Metadata on endpoint must not change boundary.",
+      "disposition": "added-independent-control",
+      "basis": "explicit-adjudicated-profile"
+    },
+    {
+      "id": "V66",
+      "range_profile": "fixed_build",
+      "version": "1.4.0-rc.1",
+      "expected_membership": "included",
+      "reason": "Stable fix metadata must not reject prior prerelease.",
+      "disposition": "added-independent-control",
+      "basis": "explicit-adjudicated-profile"
+    },
+    {
+      "id": "V67",
+      "range_profile": "limit_reopened",
+      "version": "1.5.0",
+      "expected_membership": "excluded",
+      "reason": "Limit guard does not reopen fixed gap.",
+      "disposition": "added-independent-control",
+      "basis": "explicit-adjudicated-profile"
+    },
+    {
+      "id": "V68",
+      "range_profile": "limit_reopened",
+      "version": "2.0.1",
+      "expected_membership": "included",
+      "reason": "Reopened interval below global limit remains included.",
+      "disposition": "added-independent-control",
+      "basis": "explicit-adjudicated-profile"
+    },
+    {
+      "id": "V69",
+      "range_profile": "limit_reopened",
+      "version": "2.0.5",
+      "expected_membership": "excluded",
+      "reason": "Exclusive global limit restricts reopened interval without identifying a fix.",
+      "disposition": "added-independent-control",
+      "basis": "explicit-adjudicated-profile"
+    },
+    {
+      "id": "V70",
+      "range_profile": "limit_multiple_unsorted",
+      "version": "1.4.0",
+      "expected_membership": "included",
+      "reason": "Limits remain alternatives independent of source event ordering.",
+      "disposition": "added-independent-control",
+      "basis": "explicit-adjudicated-profile"
+    },
+    {
+      "id": "V71",
+      "range_profile": "base",
+      "version": "~1.3.0",
+      "expected_membership": "unknown",
+      "reason": "Requirement syntax is unsupported.",
+      "disposition": "added-independent-control",
+      "basis": "explicit-adjudicated-profile"
+    },
+    {
+      "id": "V72",
+      "range_profile": "base",
+      "version": "1.3.0-alpha_1",
+      "expected_membership": "unknown",
+      "reason": "Underscore is outside SemVer identifier syntax.",
+      "disposition": "added-independent-control",
+      "basis": "explicit-adjudicated-profile"
+    },
+    {
+      "id": "V73",
+      "range_profile": "base",
+      "version": "1.3.0-",
+      "expected_membership": "unknown",
+      "reason": "Empty prerelease is invalid.",
+      "disposition": "added-independent-control",
+      "basis": "explicit-adjudicated-profile"
+    },
+    {
+      "id": "V74",
+      "range_profile": "base",
+      "version": "1.3.0+001",
+      "expected_membership": "included",
+      "reason": "Leading zeros are valid in build identifiers.",
+      "disposition": "added-independent-control",
+      "basis": "explicit-adjudicated-profile"
+    },
+    {
+      "id": "V75",
+      "range_profile": "empty_information",
+      "version": "1.3.0",
+      "expected_membership": "unknown",
+      "reason": "No membership evidence is not a complete negative in this fixture profile.",
+      "disposition": "added-independent-control",
+      "basis": "explicit-adjudicated-profile"
+    }
+  ],
+  "contract_cases": [
+    {
+      "id": "I01",
+      "trigger": "Source-less local package shares advisory name/version",
+      "expected": "unresolved-identity",
+      "disposition": "accepted",
+      "basis": "fixture-identity-policy",
+      "adjudicated_rationale": "Source absence identifies an inventory-local member, not a globally identified path artifact or crates.io release.",
+      "source_refs": []
+    },
+    {
+      "id": "I02",
+      "trigger": "Custom registry shares crates.io package name/version",
+      "expected": "different-source",
+      "disposition": "accepted",
+      "basis": "fixture-identity-policy",
+      "adjudicated_rationale": "Known distinct source is an identity non-match; version membership is not-evaluated and component safety stays unknown.",
+      "source_refs": []
+    },
+    {
+      "id": "I03",
+      "trigger": "Git source shares registry name/version",
+      "expected": "no-automatic-registry-alias",
+      "disposition": "accepted",
+      "basis": "fixture-identity-policy",
+      "adjudicated_rationale": "Preserve Git source spelling; neither a registry alias nor commit-ancestry support follows.",
+      "source_refs": []
+    },
+    {
+      "id": "I04",
+      "trigger": "Same package spelling in npm",
+      "expected": "different-ecosystem",
+      "disposition": "accepted",
+      "basis": "fixture-identity-policy",
+      "adjudicated_rationale": "Do not invoke Rust version comparison for a different ecosystem.",
+      "source_refs": []
+    },
+    {
+      "id": "I05",
+      "trigger": "Case-only name variant",
+      "expected": "unresolved-alias",
+      "disposition": "accepted",
+      "basis": "fixture-identity-policy",
+      "adjudicated_rationale": "Alias candidate remains unresolved; do not lowercase.",
+      "source_refs": []
+    },
+    {
+      "id": "I06",
+      "trigger": "Hyphen versus underscore name variant",
+      "expected": "unresolved-alias",
+      "disposition": "accepted",
+      "basis": "fixture-identity-policy",
+      "adjudicated_rationale": "Alias candidate remains unresolved; do not replace underscores or hyphens.",
+      "source_refs": []
+    },
+    {
+      "id": "I07",
+      "trigger": "Two exact same-name registry versions",
+      "expected": "preserve-both-release-evaluations",
+      "disposition": "accepted",
+      "basis": "fixture-identity-policy",
+      "adjudicated_rationale": "Release identity keeps exact version spelling, including build metadata; evaluate all matching release occurrences.",
+      "source_refs": []
+    },
+    {
+      "id": "I08",
+      "trigger": "Real inventory versus fixture-scoped advisory",
+      "expected": "zero-matches-and-unknown-real-coverage",
+      "disposition": "accepted",
+      "basis": "fixture-isolation-policy",
+      "adjudicated_rationale": "Both inventory and advisory require identical explicit fixture scope for any synthetic positive.",
+      "source_refs": []
+    },
+    {
+      "id": "I09",
+      "trigger": "Missing advisories or empty affected list",
+      "expected": "unknown-overall-safety",
+      "disposition": "accepted",
+      "basis": "coverage-policy",
+      "adjudicated_rationale": "No source-scope hit proves neither feed completeness nor overall safety; emit explicit coverage summary, not invented package/advisory negatives.",
+      "source_refs": []
+    },
+    {
+      "id": "I10",
+      "trigger": "Mirrored advisory with shared upstream lineage",
+      "expected": "distinct-occurrences-one-declared-origin",
+      "disposition": "accepted",
+      "basis": "lineage-policy",
+      "adjudicated_rationale": "Keep issuer/source revision and claim occurrence identity; explicit common lineage is one declared origin, not an independent vote.",
+      "source_refs": []
+    },
+    {
+      "id": "I11",
+      "trigger": "Withdrawn advisory revision",
+      "expected": "historical-retained-no-active-assertion",
+      "disposition": "accepted",
+      "basis": "historical-policy",
+      "adjudicated_rationale": "Membership can be replayed for a retained prior revision; withdrawn current-use applicability is unknown with inactive state, not excluded.",
+      "source_refs": []
+    },
+    {
+      "id": "I12",
+      "trigger": "Included version with unknown required platform",
+      "expected": "unknown-overall-applicability",
+      "disposition": "accepted",
+      "basis": "conservative-applicability-policy",
+      "adjudicated_rationale": "Keep included interval result separately from unknown required platform/configuration and unknown deployed presence.",
+      "source_refs": []
+    },
+    {
+      "id": "I13",
+      "trigger": "Excluded supported interval plus unsupported sibling",
+      "expected": "unknown-overall-membership",
+      "disposition": "clarified",
+      "basis": "three-valued-union-policy",
+      "adjudicated_rationale": "If every supported branch excludes and another branch is unsupported, union membership is unknown. A supported positive instead establishes union inclusion unless input parsing fails.",
+      "source_refs": []
+    },
+    {
+      "id": "P01",
+      "trigger": "Name-only dependency has multiple versions",
+      "expected": "unresolved-not-first-match",
+      "disposition": "accepted",
+      "basis": "bounded-cargo-resolution",
+      "adjudicated_rationale": "Retain every exact candidate tuple and raw occurrence selector; do not pick by ordinal.",
+      "source_refs": []
+    },
+    {
+      "id": "P02",
+      "trigger": "Name/version dependency has multiple sources",
+      "expected": "unresolved-with-candidate-identities",
+      "disposition": "accepted",
+      "basis": "bounded-cargo-resolution",
+      "adjudicated_rationale": "Explicit registry source can disambiguate; unresolved identity does not imply absence.",
+      "source_refs": []
+    },
+    {
+      "id": "P03",
+      "trigger": "Fully name/version/source-qualified edge",
+      "expected": "exact-target-only",
+      "disposition": "clarified",
+      "basis": "bounded-cargo-resolution",
+      "adjudicated_rationale": "Exact source-qualified registry token resolves only that exact tuple. Git tokens whose precision differs from package source remain unsupported-source-resolution with candidates; do not label valid Cargo encoding malformed or dangling.",
+      "source_refs": []
+    },
+    {
+      "id": "P04",
+      "trigger": "Missing dependency target",
+      "expected": "dangling-and-incomplete-coverage",
+      "disposition": "accepted",
+      "basis": "bounded-cargo-resolution",
+      "adjudicated_rationale": "Only a syntactically supported token with no exact candidates is dangling; retain it and set graph coverage incomplete.",
+      "source_refs": []
+    },
+    {
+      "id": "P05",
+      "trigger": "Duplicate exact package tuple",
+      "expected": "input-error",
+      "disposition": "accepted",
+      "basis": "profile-refusal",
+      "adjudicated_rationale": "Reject a repeated exact raw (name,version,source-or-null) tuple. Two sources or versions are distinct tuples.",
+      "source_refs": []
+    },
+    {
+      "id": "P06",
+      "trigger": "Unknown lock version",
+      "expected": "unsupported-input-no-complete-success",
+      "disposition": "accepted",
+      "basis": "profile-refusal",
+      "adjudicated_rationale": "Require integer lock version 4 exactly; other versions are explicit unsupported input, not invalid Cargo as a whole.",
+      "source_refs": []
+    },
+    {
+      "id": "P07",
+      "trigger": "Legacy replace or nonempty patch.unused",
+      "expected": "unsupported-input-no-complete-success",
+      "disposition": "accepted",
+      "basis": "profile-refusal",
+      "adjudicated_rationale": "Reject package replace and nonempty patch.unused before producing successful complete output. Empty patch.unused may be accepted without creating a member.",
+      "source_refs": []
+    },
+    {
+      "id": "P08",
+      "trigger": "Cycle or diamond",
+      "expected": "bounded-deterministic-termination",
+      "disposition": "clarified",
+      "basis": "bounded-path-policy",
+      "adjudicated_rationale": "Preserve dependency occurrences and enumerate bounded simple paths using a per-path visited set. A global visited set must not discard distinct diamond paths.",
+      "source_refs": []
+    },
+    {
+      "id": "P09",
+      "trigger": "Path depth/result budget reached",
+      "expected": "incomplete-never-proven-absence",
+      "disposition": "clarified",
+      "basis": "bounded-path-policy",
+      "adjudicated_rationale": "Depth, per-target path count or total expansion exhaustion marks witness coverage incomplete. A found witness remains valid; no missing witness proves absence after truncation.",
+      "source_refs": []
+    },
+    {
+      "id": "P10",
+      "trigger": "Disconnected included member",
+      "expected": "included-inventory-member-and-no-complete-root-witness",
+      "disposition": "clarified",
+      "basis": "bounded-path-policy",
+      "adjudicated_rationale": "No root witness means unreachable-in-this-lock-graph only after complete resolved traversal. A disconnected member is still evaluated.",
+      "source_refs": []
+    },
+    {
+      "id": "P11",
+      "trigger": "Duplicate dependency occurrences",
+      "expected": "distinct-occurrence-keys",
+      "disposition": "accepted",
+      "basis": "occurrence-identity-policy",
+      "adjudicated_rationale": "Dependency key includes parent member and raw dependency ordinal. Repeated endpoints are not duplicate occurrence identities.",
+      "source_refs": []
+    },
+    {
+      "id": "E01",
+      "trigger": "Cargo span after non-ASCII text",
+      "expected": "exact-code-point-selection",
+      "disposition": "accepted",
+      "basis": "existing-C25-text-reference-contract",
+      "adjudicated_rationale": "Convert UTF-8 byte boundaries to Unicode scalar indices; do not count graphemes or UTF-16 units.",
+      "source_refs": []
+    },
+    {
+      "id": "E02",
+      "trigger": "CRLF source or escaped TOML lexical text",
+      "expected": "preserve-exact-raw-bytes-and-selection",
+      "disposition": "clarified",
+      "basis": "exact-byte-evidence-policy",
+      "adjudicated_rationale": "Golden checks must establish whether toml::Spanned includes the lexical quotes. Publish actual raw span and decoded value separately; never guess quote inclusion.",
+      "source_refs": []
+    },
+    {
+      "id": "E03",
+      "trigger": "OSV lexical escape/whitespace change",
+      "expected": "new-byte-digest-not-reserialized-selector",
+      "disposition": "clarified",
+      "basis": "existing-C25-lexical-reference-contract",
+      "adjudicated_rationale": "Whitespace outside a selected value changes revision digest but need not change selected-value digest. Escapes or whitespace inside its exact lexical bytes change that digest.",
+      "source_refs": []
+    },
+    {
+      "id": "E04",
+      "trigger": "Duplicate decoded JSON key outside selected subtree",
+      "expected": "input-error",
+      "disposition": "accepted",
+      "basis": "existing-C25-lexical-reference-contract",
+      "adjudicated_rationale": "Validate the whole JSON document, including escaped-equivalent decoded object keys, even for an empty affected list or a root selection.",
+      "source_refs": []
+    },
+    {
+      "id": "E05",
+      "trigger": "Tampered bytes/pointer/value digest",
+      "expected": "evidence-verification-error",
+      "disposition": "accepted",
+      "basis": "exact-byte-evidence-policy",
+      "adjudicated_rationale": "Verify source and selected bytes before a successful dossier; preserve prior output on failure.",
+      "source_refs": []
+    },
+    {
+      "id": "E06",
+      "trigger": "Source claim of affected release",
+      "expected": "reified-only-plain-affectedBy-ASK-false",
+      "disposition": "accepted",
+      "basis": "existing-C25-nonassertion-contract",
+      "adjudicated_rationale": "Use C25 unasserted occurrence/reifier terms. Check accepted affectedBy in default and named graphs, without any review/availability receipts.",
+      "source_refs": []
+    },
+    {
+      "id": "E07",
+      "trigger": "Identical offline export replay",
+      "expected": "byte-identical-without-durable-job-claim",
+      "disposition": "accepted",
+      "basis": "offline-replay-policy",
+      "adjudicated_rationale": "Same inputs, methods, roots, limits and fixed clock yield byte-identical outputs. This is not restart-safe C26 publication.",
+      "source_refs": []
+    },
+    {
+      "id": "R01",
+      "trigger": "Event contains introduced and fixed",
+      "expected": "input-error",
+      "disposition": "accepted",
+      "basis": "osv-event-requirement",
+      "adjudicated_rationale": "Reject event with more than one recognized event type.",
+      "source_refs": [
+        "osv-events"
+      ]
+    },
+    {
+      "id": "R02",
+      "trigger": "Event sequence lacks introduction",
+      "expected": "input-error",
+      "disposition": "accepted",
+      "basis": "osv-event-requirement",
+      "adjudicated_rationale": "Reject nonempty event sequence without introduction.",
+      "source_refs": [
+        "osv-events"
+      ]
+    },
+    {
+      "id": "R03",
+      "trigger": "Fixed and last_affected occur in same sequence",
+      "expected": "input-error",
+      "disposition": "accepted",
+      "basis": "osv-event-requirement",
+      "adjudicated_rationale": "Within a single events array, fixed and last_affected are mutually exclusive. Separate ranges may use either.",
+      "source_refs": [
+        "osv-events"
+      ]
+    },
+    {
+      "id": "R04",
+      "trigger": "Opposite transitions at equal precedence, except valid introduced/last_affected singleton",
+      "expected": "input-error",
+      "disposition": "clarified",
+      "basis": "profile-refusal",
+      "adjudicated_rationale": "After precedence sorting, reject ambiguous ties except a single introduced/last_affected singleton. Apply introduction first at that tie; limits are separately evaluated guards.",
+      "source_refs": []
+    },
+    {
+      "id": "R05",
+      "trigger": "Reversed/empty interval or overlapping SEMVER ranges",
+      "expected": "profile-input-error",
+      "disposition": "clarified",
+      "basis": "profile-refusal",
+      "adjudicated_rationale": "Sort first. Reject invalid sorted transition structure, empty effective interval, and pairwise overlapping SEMVER sets. This is stricter than OSV evaluation, not an OSV MUST. Source-order reversal alone is not invalid.",
+      "source_refs": []
+    },
+    {
+      "id": "R06",
+      "trigger": "GIT/ECOSYSTEM range or schema other than pinned 1.9.2",
+      "expected": "unknown-or-explicit-unsupported-never-false-negative",
+      "disposition": "clarified",
+      "basis": "profile-refusal-and-unknown",
+      "adjudicated_rationale": "Split outcomes: schema other than exact 1.9.2 is explicit unsupported-input with no complete dossier; structurally valid GIT/ECOSYSTEM range preserves entry and unknown branch membership. No unsupported branch yields a negative.",
+      "source_refs": []
+    }
+  ],
+  "additional_contract_cases": [
+    {
+      "id": "A01",
+      "trigger": "Same advisory ID at issuer source A and source B",
+      "expected": "distinct-advisory-and-revision-identities",
+      "disposition": "added-independent-control",
+      "basis": "adjudicated-bounded-contract"
+    },
+    {
+      "id": "A02",
+      "trigger": "aliases or related IDs name another record",
+      "expected": "metadata-only-no-owl-sameAs-no-dedup",
+      "disposition": "added-independent-control",
+      "basis": "adjudicated-bounded-contract"
+    },
+    {
+      "id": "A03",
+      "trigger": "Same source key/upstream revision and changed raw digest",
+      "expected": "immutable-revision-conflict",
+      "disposition": "added-independent-control",
+      "basis": "adjudicated-bounded-contract"
+    },
+    {
+      "id": "A04",
+      "trigger": "Exact fixture names/source with different fixture scope",
+      "expected": "identity-nonmatch-no-real-positive",
+      "disposition": "added-independent-control",
+      "basis": "adjudicated-bounded-contract"
+    },
+    {
+      "id": "A05",
+      "trigger": "Package version name same but +build changes",
+      "expected": "distinct-release-keys-same-range-precedence",
+      "disposition": "added-independent-control",
+      "basis": "adjudicated-bounded-contract"
+    },
+    {
+      "id": "A06",
+      "trigger": "Qualified Git edge omits package #precise commit",
+      "expected": "unsupported-source-resolution-retain-candidates-not-dangling",
+      "disposition": "added-independent-control",
+      "basis": "adjudicated-bounded-contract"
+    },
+    {
+      "id": "A07",
+      "trigger": "Explicit exact custom registry edge and distinct crates.io tuple",
+      "expected": "resolve-custom-edge-preserve-advisory-identity-nonmatch",
+      "disposition": "added-independent-control",
+      "basis": "adjudicated-bounded-contract"
+    },
+    {
+      "id": "A08",
+      "trigger": "Malformed edge has trailing space, doubled separator or source without version",
+      "expected": "input-error-with-raw-occurrence-context",
+      "disposition": "added-independent-control",
+      "basis": "adjudicated-bounded-contract"
+    },
+    {
+      "id": "A09",
+      "trigger": "Registry checksum missing, non-string or not 64 lowercase hex",
+      "expected": "profile-field-error-no-artifact-verification",
+      "disposition": "added-independent-control",
+      "basis": "adjudicated-bounded-contract"
+    },
+    {
+      "id": "A10",
+      "trigger": "Root selector absent, ambiguous or resolves no tuple",
+      "expected": "selection-error-or-explicit-no-reachability-mode",
+      "disposition": "added-independent-control",
+      "basis": "adjudicated-bounded-contract"
+    },
+    {
+      "id": "A11",
+      "trigger": "Two path diamond plus parallel edges and cycle",
+      "expected": "retain-both-bounded-occurrence-paths-no-global-visited-loss",
+      "disposition": "added-independent-control",
+      "basis": "adjudicated-bounded-contract"
+    },
+    {
+      "id": "A12",
+      "trigger": "Exactly 16-edge path versus 17-edge path",
+      "expected": "first-witness-valid-second-truncated-no-absence",
+      "disposition": "added-independent-control",
+      "basis": "adjudicated-bounded-contract"
+    },
+    {
+      "id": "A13",
+      "trigger": "At most 32 paths versus 33rd discoverable path",
+      "expected": "32-kept-extra-sets-incomplete",
+      "disposition": "added-independent-control",
+      "basis": "adjudicated-bounded-contract"
+    },
+    {
+      "id": "A14",
+      "trigger": "Input bound or cancellation during parsing/walk/export",
+      "expected": "no-successful-dossier-prior-output-unchanged",
+      "disposition": "added-independent-control",
+      "basis": "adjudicated-bounded-contract"
+    },
+    {
+      "id": "A15",
+      "trigger": "Nonempty unknown ecosystem_specific field",
+      "expected": "unknown-required-condition-never-complete-negative",
+      "disposition": "added-independent-control",
+      "basis": "adjudicated-bounded-contract"
+    },
+    {
+      "id": "A16",
+      "trigger": "Nonempty database_specific metadata only",
+      "expected": "preserve-metadata-without-membership-or-applicability-change",
+      "disposition": "added-independent-control",
+      "basis": "adjudicated-bounded-contract"
+    },
+    {
+      "id": "A17",
+      "trigger": "Included supported range plus valid unsupported sibling",
+      "expected": "included-membership-and-affected-in-declared-scope-if-no-conditions",
+      "disposition": "added-independent-control",
+      "basis": "adjudicated-bounded-contract"
+    },
+    {
+      "id": "A18",
+      "trigger": "Positive range plus malformed sibling event",
+      "expected": "input-error-no-successful-partial-dossier",
+      "disposition": "added-independent-control",
+      "basis": "adjudicated-bounded-contract"
+    },
+    {
+      "id": "A19",
+      "trigger": "Two exact-package affected entries, one excluded one unknown",
+      "expected": "keep-two-rows-aggregate-unknown",
+      "disposition": "added-independent-control",
+      "basis": "adjudicated-bounded-contract"
+    },
+    {
+      "id": "A20",
+      "trigger": "Two exact-package affected entries, one included one unknown",
+      "expected": "keep-two-rows-aggregate-included-unless-unresolved-conditions",
+      "disposition": "added-independent-control",
+      "basis": "adjudicated-bounded-contract"
+    },
+    {
+      "id": "A21",
+      "trigger": "Missing schema, 1.0.0, 1.9.3 or 2.0.0",
+      "expected": "explicit-profile-unsupported-not-claim-OSV-invalid",
+      "disposition": "added-independent-control",
+      "basis": "adjudicated-bounded-contract"
+    },
+    {
+      "id": "A22",
+      "trigger": "Event endpoint non-string, empty event, no introduction or empty events",
+      "expected": "input-error-with-json-pointer",
+      "disposition": "added-independent-control",
+      "basis": "adjudicated-bounded-contract"
+    },
+    {
+      "id": "A23",
+      "trigger": "Limit contains star but is not exactly star, for example 1.*",
+      "expected": "unsupported-bound-never-coerce-semver-or-negative",
+      "disposition": "added-independent-control",
+      "basis": "adjudicated-bounded-contract"
+    },
+    {
+      "id": "A24",
+      "trigger": "Limit and fixed supplied in same valid range",
+      "expected": "limit-guard-plus-fixed-transition-not-two-closures",
+      "disposition": "added-independent-control",
+      "basis": "adjudicated-bounded-contract"
+    },
+    {
+      "id": "A25",
+      "trigger": "Sorted duplicate introductions or fixes",
+      "expected": "profile-input-error",
+      "disposition": "added-independent-control",
+      "basis": "adjudicated-bounded-contract"
+    },
+    {
+      "id": "A26",
+      "trigger": "Source-order fixed then introduced with sorted valid interval",
+      "expected": "accept-equivalent-unsorted-events",
+      "disposition": "added-independent-control",
+      "basis": "adjudicated-bounded-contract"
+    },
+    {
+      "id": "A27",
+      "trigger": "Introduction numerically above fixed after sorting",
+      "expected": "profile-input-error-first-transition-is-closure",
+      "disposition": "added-independent-control",
+      "basis": "adjudicated-bounded-contract"
+    },
+    {
+      "id": "A28",
+      "trigger": "Introduction equals fixed/limit versus equals last_affected",
+      "expected": "profile-error-for-empty-interval-accept-inclusive-singleton",
+      "disposition": "added-independent-control",
+      "basis": "adjudicated-bounded-contract"
+    },
+    {
+      "id": "A29",
+      "trigger": "Two SEMVER ranges overlap versus meet at exclusive fixed endpoint",
+      "expected": "profile-reject-overlap-accept-nonoverlap-adjacency",
+      "disposition": "added-independent-control",
+      "basis": "adjudicated-bounded-contract"
+    },
+    {
+      "id": "A30",
+      "trigger": "JSON Pointer ~0/~1, Unicode before TOML field, escaped TOML value",
+      "expected": "exact-lexical-bytes-and-separate-decoded-semantics",
+      "disposition": "added-independent-control",
+      "basis": "adjudicated-bounded-contract"
+    },
+    {
+      "id": "A31",
+      "trigger": "JSON whitespace outside versus inside selected value",
+      "expected": "both-revision-digests-change-only-inside-selection-changes-selected-digest",
+      "disposition": "added-independent-control",
+      "basis": "adjudicated-bounded-contract"
+    },
+    {
+      "id": "A32",
+      "trigger": "Duplicate escaped-equivalent JSON key with empty affected list",
+      "expected": "reject-entire-document-before-empty-result",
+      "disposition": "added-independent-control",
+      "basis": "adjudicated-bounded-contract"
+    },
+    {
+      "id": "A33",
+      "trigger": "Source claim and qualified included evaluation RDF",
+      "expected": "no-accepted-affectedBy-in-default-or-any-named-graph",
+      "disposition": "added-independent-control",
+      "basis": "adjudicated-bounded-contract"
+    },
+    {
+      "id": "A34",
+      "trigger": "Withdrawal and correction supplied with source-reported timestamps",
+      "expected": "retain-all-revisions-no-authenticated-availability-or-maintained-current",
+      "disposition": "added-independent-control",
+      "basis": "adjudicated-bounded-contract"
+    },
+    {
+      "id": "A35",
+      "trigger": "Cargo top-level or package semantic extension outside allowed fields",
+      "expected": "explicit-unsupported-no-complete-success",
+      "disposition": "added-independent-control",
+      "basis": "adjudicated-bounded-contract"
+    },
+    {
+      "id": "A36",
+      "trigger": "Byte span starts inside UTF-8 character or selected digest mismatches",
+      "expected": "reference-verification-error-no-guessed-selection",
+      "disposition": "added-independent-control",
+      "basis": "adjudicated-bounded-contract"
+    }
+  ]
+}

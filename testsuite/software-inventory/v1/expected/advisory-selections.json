@@ -1,0 +1,110 @@
+[
+  {
+    "source": "raw/advisory-r1.json",
+    "source_sha256": "873fc52252f74c16ce54becb9c2d77a134b0a1370fb373125fdfa1c158d15d12",
+    "pointer": "/affected/0/ranges/0/events/0/introduced",
+    "method": "urn:x-sparkles:evidence:normalization:json-lexical-utf8:1",
+    "method_version": "1",
+    "byte_range": [
+      396,
+      403
+    ],
+    "codepoint_range": [
+      396,
+      403
+    ],
+    "selected_utf8": "\"1.2.0\"",
+    "selected_sha256": "c1f37a273eb978ee4b91191a6e9dbec7421e1e74af306df33b469e6d37308ce6",
+    "decoded_value": "1.2.0"
+  },
+  {
+    "source": "raw/advisory-r1.json",
+    "source_sha256": "873fc52252f74c16ce54becb9c2d77a134b0a1370fb373125fdfa1c158d15d12",
+    "pointer": "/affected/0/ranges/0/events/1/fixed",
+    "method": "urn:x-sparkles:evidence:normalization:json-lexical-utf8:1",
+    "method_version": "1",
+    "byte_range": [
+      456,
+      463
+    ],
+    "codepoint_range": [
+      456,
+      463
+    ],
+    "selected_utf8": "\"1.4.0\"",
+    "selected_sha256": "2d01580d3f7af3b843c9ce1aae086168af4028afa1416ff099ccbaacadd96b44",
+    "decoded_value": "1.4.0"
+  },
+  {
+    "source": "raw/advisory-r2.json",
+    "source_sha256": "f9a1d64a2c3075e7c4331064b1f58a2bbba217eb792d9fdfb2a4ac3f0eb813bf",
+    "pointer": "/affected/0/ranges/0/events/0/introduced",
+    "method": "urn:x-sparkles:evidence:normalization:json-lexical-utf8:1",
+    "method_version": "1",
+    "byte_range": [
+      396,
+      403
+    ],
+    "codepoint_range": [
+      396,
+      403
+    ],
+    "selected_utf8": "\"1.3.1\"",
+    "selected_sha256": "e8fcf91677c83253d0f6e98e1504dd180e5139ea9e5a2cef8fe4e468f4f011ad",
+    "decoded_value": "1.3.1"
+  },
+  {
+    "source": "raw/advisory-r2.json",
+    "source_sha256": "f9a1d64a2c3075e7c4331064b1f58a2bbba217eb792d9fdfb2a4ac3f0eb813bf",
+    "pointer": "/affected/0/ranges/0/events/1/fixed",
+    "method": "urn:x-sparkles:evidence:normalization:json-lexical-utf8:1",
+    "method_version": "1",
+    "byte_range": [
+      456,
+      463
+    ],
+    "codepoint_range": [
+      456,
+      463
+    ],
+    "selected_utf8": "\"1.4.0\"",
+    "selected_sha256": "2d01580d3f7af3b843c9ce1aae086168af4028afa1416ff099ccbaacadd96b44",
+    "decoded_value": "1.4.0"
+  },
+  {
+    "source": "raw/advisory-withdrawn.json",
+    "source_sha256": "714d0a5f7648903314e6bc5b9b1c3533dc7e241081aa2da2b420c170ca3be6b4",
+    "pointer": "/affected/0/ranges/0/events/0/introduced",
+    "method": "urn:x-sparkles:evidence:normalization:json-lexical-utf8:1",
+    "method_version": "1",
+    "byte_range": [
+      396,
+      403
+    ],
+    "codepoint_range": [
+      396,
+      403
+    ],
+    "selected_utf8": "\"1.3.1\"",
+    "selected_sha256": "e8fcf91677c83253d0f6e98e1504dd180e5139ea9e5a2cef8fe4e468f4f011ad",
+    "decoded_value": "1.3.1"
+  },
+  {
+    "source": "raw/advisory-withdrawn.json",
+    "source_sha256": "714d0a5f7648903314e6bc5b9b1c3533dc7e241081aa2da2b420c170ca3be6b4",
+    "pointer": "/affected/0/ranges/0/events/1/fixed",
+    "method": "urn:x-sparkles:evidence:normalization:json-lexical-utf8:1",
+    "method_version": "1",
+    "byte_range": [
+      456,
+      463
+    ],
+    "codepoint_range": [
+      456,
+      463
+    ],
+    "selected_utf8": "\"1.4.0\"",
+    "selected_sha256": "2d01580d3f7af3b843c9ce1aae086168af4028afa1416ff099ccbaacadd96b44",
+    "decoded_value": "1.4.0"
+  }
+]

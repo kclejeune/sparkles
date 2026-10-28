@@ -1,0 +1,77 @@
+{
+  "cases": [
+    "P08",
+    "P10",
+    "P11",
+    "A11"
+  ],
+  "root_ordinal": 0,
+  "target_ordinal": 3,
+  "occurrences": [
+    [
+      0,
+      0,
+      1
+    ],
+    [
+      0,
+      1,
+      1
+    ],
+    [
+      0,
+      2,
+      2
+    ],
+    [
+      1,
+      0,
+      3
+    ],
+    [
+      2,
+      0,
+      3
+    ],
+    [
+      3,
+      0,
+      0
+    ]
+  ],
+  "simple_witness_occurrences": [
+    [
+      [
+        0,
+        0
+      ],
+      [
+        1,
+        0
+      ]
+    ],
+    [
+      [
+        0,
+        1
+      ],
+      [
+        1,
+        0
+      ]
+    ],
+    [
+      [
+        0,
+        2
+      ],
+      [
+        2,
+        0
+      ]
+    ]
+  ],
+  "disconnected_included_member_ordinal": 4,
+  "advisory": "raw/advisory-r1.json",
+  "coverage": "Per-path cycle detection retains the two parallel-edge paths and the other diamond branch. A complete traversal finds no path to ordinal 4."
+}

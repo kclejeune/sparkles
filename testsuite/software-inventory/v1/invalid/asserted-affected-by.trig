@@ -1,0 +1,4 @@
+<https://example.invalid/sparkles-fixture/corpus-v1/id/release/a31bfc2e36725aac33ee7b3179caa5e8ae84fef459ddb8ce5c311b0e32863d17> <https://example.invalid/sparkles-fixture/corpus-v1/vocab/affectedBy> <https://example.invalid/sparkles-fixture/corpus-v1/id/advisory/3843f39dd1db71231b982dee3871ccf967a63034095dd36b76b7928643a76671> .
+<https://example.invalid/sparkles-fixture/corpus-v1/graph/invalid> {
+  <https://example.invalid/sparkles-fixture/corpus-v1/id/release/a31bfc2e36725aac33ee7b3179caa5e8ae84fef459ddb8ce5c311b0e32863d17> <https://example.invalid/sparkles-fixture/corpus-v1/vocab/affectedBy> <https://example.invalid/sparkles-fixture/corpus-v1/id/advisory/3843f39dd1db71231b982dee3871ccf967a63034095dd36b76b7928643a76671> .
+}

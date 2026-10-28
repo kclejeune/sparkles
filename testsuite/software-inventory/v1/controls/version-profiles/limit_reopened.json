@@ -1,0 +1,36 @@
+{
+  "schema_version": "1.9.2",
+  "id": "x_SPARKLES_FIXTURE-0001",
+  "modified": "2026-01-01T00:00:00Z",
+  "summary": "Synthetic fixture advisory",
+  "affected": [
+    {
+      "package": {
+        "ecosystem": "crates.io",
+        "name": "sparkles-fixture-only-leaf"
+      },
+      "ranges": [
+        {
+          "type": "SEMVER",
+          "events": [
+            {
+              "introduced": "1.0.0"
+            },
+            {
+              "fixed": "1.2.0"
+            },
+            {
+              "introduced": "2.0.0"
+            },
+            {
+              "fixed": "2.1.0"
+            },
+            {
+              "limit": "2.0.5"
+            }
+          ]
+        }
+      ]
+    }
+  ]
+}

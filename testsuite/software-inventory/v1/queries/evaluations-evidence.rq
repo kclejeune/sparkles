@@ -1,0 +1,7 @@
+PREFIX si: <https://example.invalid/sparkles-fixture/corpus-v1/vocab/>
+PREFIX ev: <urn:x-sparkles:evidence:>
+SELECT ?evaluation ?member ?revision ?membership ?applicability ?evidence WHERE {
+  ?evaluation a si:Evaluation ; si:member ?member ; si:advisoryRevision ?revision ;
+    si:membership ?membership ; si:applicability ?applicability ; ev:evidence ?evidence .
+}
+ORDER BY ?evaluation
