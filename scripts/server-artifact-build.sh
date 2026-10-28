@@ -36,7 +36,10 @@ if [[ -e $out ]]; then
   echo 'server-artifact: output already exists; use a fresh evidence directory' >&2
   exit 2
 fi
-if [[ -n $(git status --porcelain --untracked-files=normal) ]]; then
+# Assignment preserves Git's exit status under errexit. A command substitution
+# inside the condition would turn a Git failure into an apparently clean tree.
+source_status=$(git status --porcelain --untracked-files=normal)
+if [[ -n $source_status ]]; then
   echo 'server-artifact: source must be committed and clean' >&2
   exit 2
 fi
