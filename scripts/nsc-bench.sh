@@ -6,7 +6,7 @@
 #
 # A and B are git revisions of this repository or paths to built `sparkles` binaries. A
 # revision is built here, before any instance exists, from a `git archive` of it with
-# `cargo build --release -p sparkles-server`, and the binary is cached under
+# `mbx build --release -p sparkles-server`, and the binary is cached under
 # $SPARKLES_NSC_CACHE/bin/<commit> (default ~/.cache/sparkles-nsc). The dataset comes from
 # scripts/gen-data.py and is cached there as zstd. The queries are those of scripts/bench.sh
 # unless --query-dir names a directory of *.rq files.
@@ -138,7 +138,7 @@ while [ $# -gt 0 ]; do
   shift 2
 done
 [ ${#ARGS[@]} -eq 2 ] || usage 1
-for t in nsc zstd python3 cargo readelf; do command -v "$t" > /dev/null || die "$t is not on PATH"; done
+for t in nsc zstd python3 mbx cargo readelf; do command -v "$t" > /dev/null || die "$t is not on PATH"; done
 OUT=$(realpath -m "${OUT:-$ROOT/.artifacts/nsc-bench/$(date -u +%Y%m%dT%H%M%SZ)}")
 mkdir -p "$OUT/stage/queries" "$OUT/logs" "$CACHE"/{bin,data,src}
 STAGE=$OUT/stage
@@ -167,9 +167,8 @@ binary() {
       echo "building $ref ($sha); log: $OUT/logs/build-$v.log"
       rm -rf "${CACHE:?}/src/$sha"
       mkdir -p "$CACHE/src/$sha" "$CACHE/bin/$sha"
-      # -m gives the files the time of extraction. Cargo shares artifacts between source
-      # trees in the shared target directory and compares mtimes, and an archive keeps
-      # the commit time, which can be older than an earlier build of another revision.
+      # Keep source mtimes current. Each archive has its own managed mutable target;
+      # Boxington shares immutable build results rather than one Cargo target.
       git -C "$ROOT" archive "$sha" | tar -x -m -C "$CACHE/src/$sha"
       # the server embeds ui/build; its build script writes a placeholder, but does not
       # rerun for a second source tree in the shared target directory
@@ -177,7 +176,7 @@ binary() {
       echo '<!doctype html><title>Sparkles</title><p>The UI was not built for this benchmark binary.</p>' \
         > "$CACHE/src/$sha/ui/build/index.html"
       # shellcheck disable=SC2086 # CARGO_ARGS is a list of flags
-      (cd "$CACHE/src/$sha" && CARGO_TARGET_DIR=$CACHE/target cargo build --release -p sparkles-server $CARGO_ARGS) \
+      (cd "$CACHE/src/$sha" && bash "$ROOT/scripts/nsc-build.sh" "$bin" $CARGO_ARGS) \
         > "$OUT/logs/build-$v.log" 2>&1 || die "build of $ref failed, see $OUT/logs/build-$v.log"
       # the shell's compilers, beside the binary's own record of them in .comment
       {
@@ -187,8 +186,6 @@ binary() {
         echo "c++: $(c++ --version 2> /dev/null | head -1)"
         (cd "$CACHE/src/$sha" && rustc -V)
       } > "$CACHE/bin/$sha/build.txt"
-      cp "$CACHE/target/release/sparkles" "$bin.tmp"
-      mv "$bin.tmp" "$bin"
       rm -rf "${CACHE:?}/src/$sha"
     fi
     src="commit $sha ($ref)"

@@ -784,6 +784,14 @@ whatever compilers the shell provides, so run it inside `nix develop`. The datas
 from `scripts/gen-data.py` and is cached there as zstd. The queries are those of
 `scripts/bench.sh` except `export-500k`.
 
+Revision builds use Boxington's shared immutable cache and a separate managed target
+for each archived source tree. The build and binary copy hold one target lease, so
+collection cannot remove the executable before it is staged. Revision builds accept
+feature flags and `--locked`, `--offline` or `--frozen`. Configuration files, target
+selectors and output overrides are refused. Supply a prebuilt binary when a comparison
+needs other settings. The commit-only binary cache still requires manual
+invalidation when compiler or feature settings change.
+
 ```sh
 mise run bench:nsc main my-branch                                   # 1.05M triples, every query
 mise run bench:nsc ba547b89 c2fe4b92 --queries "optional-count minus regex-iri"
