@@ -18,3 +18,5 @@ ex:A8:sourceClaim a ev:Claim ; rdf:reifies <<( ex:A8:entity rdfs:label "Unchange
 ex:A8:migration a sr:Migration ; sr:profileVersion 1 ; sr:fromVersion ex:mapping1 ; sr:toVersion ex:mapping2 ; sr:method ex:mappingMigration1 ; sr:inputManifest ex:A8:view2:manifest ; sr:generatedRecord ex:A8:projection2 .
 ex:A8:view1:manifest sr:inputId <urn:x-sparkles:representation:policy:1>, ex:A8:sourceClaim, ex:mapping1, ex:normalization1, ex:ontology1, ex:r1, ex:simulatedSnapshot .
 ex:A8:view2:manifest sr:inputId <urn:x-sparkles:representation:policy:1>, ex:A8:sourceClaim, ex:mapping2, ex:normalization1, ex:ontology1, ex:r1, ex:simulatedSnapshot .
+<urn:example:a01:A8:view1:manifest> sr:contentDigest "sha256:f260df9e57c3f873b988385350467cf02ac50f3b4cc290beb67ce23b1a466236" .
+<urn:example:a01:A8:view2:manifest> sr:contentDigest "sha256:0258055f063cf873c579d7615ab1adaa8d56bcd1b8f1f994df8536bac6bb2680" .

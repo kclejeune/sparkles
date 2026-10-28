@@ -7,3 +7,4 @@ PREFIX rdfs: <http://www.w3.org/2000/01/rdf-schema#>
 PREFIX xsd: <http://www.w3.org/2001/XMLSchema#>
 PREFIX prov: <http://www.w3.org/ns/prov#>
 ex:controlManifest a sr:InputManifest ; sr:profileVersion 1 ; sr:inputId ex:r1 .
+<urn:example:a01:controlManifest> sr:contentDigest "sha256:f668ed65fe69b6b2455e69e14c37519dd21fe3e1035c481b885f5201f19b59de" .

@@ -34,3 +34,27 @@ Required unknown extensions refuse semantic replay. Optional extensions remain
 uninterpreted and are excluded from query semantics. A01 reference replay and managed
 runtime integration remain separate phases in the
 [specification](../../../../../docs/specs/A01-shared-entity-representation/SPEC.md).
+
+The explicit `positiveMatchRule` is `AcceptedPossibleMatch`. Selected accepted terminal
+PossibleMatch decisions contribute prospective resolve-together connectivity. Rejected,
+needs-evidence-only and undecided proposals contribute none. Conflicting terminal
+outcomes retain positive prospective connectivity and make the affected component
+unresolved. This application policy does not supply reviewer authority or logical
+equality. Missing and unknown positive rules are invalid policy records.
+
+Each InputManifest has exactly one `contentDigest`, a `sha256:` prefix followed by
+64 lowercase hexadecimal characters. Its retained payload is compact UTF-8 JSON with
+fields `profileVersion`, `inputIds`, `requiredExtensions` and `extensionIds` in that
+order. Version is the integer 1. The other fields are sorted unique arrays of IRI
+strings using the A01 scalar encoding rules. No whitespace, byte-order mark or trailing
+newline occurs. The record identifier and digest metadata are not payload fields.
+An input-ID set must not contain the manifest's own identifier. The recognized
+semantic manifest fields are all represented, including required extension profiles
+and linked extension record IDs. This is a small declared payload convention rather
+than general RDF canonicalization. Shapes check digest syntax and structure; reference
+replay separately verifies the digest against retained bytes.
+
+An artifact digest carries its algorithm and value together. A Verified declaration
+also names its versioned `verificationMethod` IRI. An unknown verification can remain
+unknown without inventing a digest. Structural completeness does not authenticate the
+verifier or demonstrate that a production artifact was checked.

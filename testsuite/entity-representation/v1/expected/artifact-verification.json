@@ -1,0 +1,8 @@
+{
+  "artifact": "urn:example:a01:verifiedArtifact",
+  "payload": "raw/artifact-bytes.txt",
+  "algorithm": "urn:example:a01:sha256",
+  "digest": "cad96633953a55b6ad55e5160d1e44756ecb77d9c26857255275aa45c3410057",
+  "method": "urn:example:a01:sha256Bytes:1",
+  "authority": "synthetic offline declaration, not authenticated verification"
+}

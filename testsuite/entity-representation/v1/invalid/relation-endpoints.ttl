@@ -11,4 +11,3 @@ ex:A2:account a sr:Entity ; sr:profileVersion 1 ; sr:domainScope ex:A2 ; sr:enti
 ex:A2:control:claim a ev:Claim ; rdf:reifies <<( ex:A2:person sr:ControlsAccount ex:A2:account )>> ; ev:claimKind ev:Reported ; ev:polarity ev:Positive ; prov:wasDerivedFrom ex:r1 ; prov:wasGeneratedBy ex:import ; prov:wasAttributedTo ex:author .
 ex:A2:control:role a sr:RoleAssignment ; sr:profileVersion 1 ; sr:participant ex:A2:person ; sr:role ex:accountController .
 ex:A2:control a sr:Relation ; sr:profileVersion 1 ; sr:domainScope ex:A2 ; sr:subject ex:A2:account ; sr:relationKind sr:ControlsAccount ; sr:object ex:A2:account ; sr:claim ex:A2:control:claim ; sr:roleAssignment ex:A2:control:role .
-

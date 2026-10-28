@@ -128,6 +128,86 @@
       "component": "SPARQLConstraintComponent",
       "focus": "urn:example:a01:controlDescription",
       "base": "valid/common.ttl"
+    },
+    {
+      "id": "missing-positive-rule",
+      "invalid": "invalid/missing-positive-rule.ttl",
+      "positive": "valid/control-missing-positive-rule.ttl",
+      "component": "MinCountConstraintComponent",
+      "focus": "urn:x-sparkles:representation:policy:1",
+      "base": "valid/common.ttl"
+    },
+    {
+      "id": "unknown-positive-rule",
+      "invalid": "invalid/unknown-positive-rule.ttl",
+      "positive": "valid/control-unknown-positive-rule.ttl",
+      "component": "InConstraintComponent",
+      "focus": "urn:x-sparkles:representation:policy:1",
+      "base": "valid/common.ttl"
+    },
+    {
+      "id": "verified-missing-method",
+      "invalid": "invalid/verified-missing-method.ttl",
+      "positive": "valid/artifact-verified.ttl",
+      "component": "OrConstraintComponent",
+      "focus": "urn:example:a01:verifiedArtifact",
+      "base": "valid/common.ttl"
+    },
+    {
+      "id": "verified-missing-digest",
+      "invalid": "invalid/verified-missing-digest.ttl",
+      "positive": "valid/artifact-verified.ttl",
+      "component": "OrConstraintComponent",
+      "focus": "urn:example:a01:verifiedArtifact",
+      "base": "valid/common.ttl"
+    },
+    {
+      "id": "unpaired-digest-algorithm",
+      "invalid": "invalid/unpaired-digest-algorithm.ttl",
+      "positive": "valid/artifact-verified.ttl",
+      "component": "OrConstraintComponent",
+      "focus": "urn:example:a01:verifiedArtifact",
+      "base": "valid/common.ttl"
+    },
+    {
+      "id": "unpaired-digest-value",
+      "invalid": "invalid/unpaired-digest-value.ttl",
+      "positive": "valid/artifact-verified.ttl",
+      "component": "OrConstraintComponent",
+      "focus": "urn:example:a01:verifiedArtifact",
+      "base": "valid/common.ttl"
+    },
+    {
+      "id": "manifest-missing-digest",
+      "invalid": "invalid/manifest-missing-digest.ttl",
+      "positive": "valid/control-manifest-missing-digest.ttl",
+      "component": "MinCountConstraintComponent",
+      "focus": "urn:example:a01:manifestDigestControl",
+      "base": "valid/common.ttl"
+    },
+    {
+      "id": "manifest-malformed-digest",
+      "invalid": "invalid/manifest-malformed-digest.ttl",
+      "positive": "valid/control-manifest-malformed-digest.ttl",
+      "component": "PatternConstraintComponent",
+      "focus": "urn:example:a01:manifestDigestControl",
+      "base": "valid/common.ttl"
+    },
+    {
+      "id": "manifest-duplicate-digest",
+      "invalid": "invalid/manifest-duplicate-digest.ttl",
+      "positive": "valid/control-manifest-duplicate-digest.ttl",
+      "component": "MaxCountConstraintComponent",
+      "focus": "urn:example:a01:manifestDigestControl",
+      "base": "valid/common.ttl"
+    },
+    {
+      "id": "manifest-self-input",
+      "invalid": "invalid/manifest-self-input.ttl",
+      "positive": "valid/control-manifest-self-input.ttl",
+      "component": "SPARQLConstraintComponent",
+      "focus": "urn:example:a01:manifestDigestControl",
+      "base": "valid/common.ttl"
     }
   ],
   "semanticOracle": "expected/semantic-oracle.json",

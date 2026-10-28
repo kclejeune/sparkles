@@ -1,0 +1,11 @@
+PREFIX sr: <urn:x-sparkles:representation:>
+PREFIX ev: <urn:x-sparkles:evidence:>
+PREFIX vt: <urn:x-sparkles:valid-time:>
+PREFIX rdf: <http://www.w3.org/1999/02/22-rdf-syntax-ns#>
+PREFIX rdfs: <http://www.w3.org/2000/01/rdf-schema#>
+PREFIX xsd: <http://www.w3.org/2001/XMLSchema#>
+PREFIX prov: <http://www.w3.org/ns/prov#>
+<urn:x-sparkles:representation:policy:1> a sr:Policy ;
+  sr:profileVersion 1 ; sr:positiveMatchRule sr:AcceptedPossibleMatch ; sr:separationRule sr:PairwiseSeparation ;
+  sr:conflictRule sr:WholeComponentConflict ; sr:kindRule sr:ExactKind ;
+  sr:representativeRule sr:LeastUtf8Iri ; sr:stringRule sr:ScalarJson1 .

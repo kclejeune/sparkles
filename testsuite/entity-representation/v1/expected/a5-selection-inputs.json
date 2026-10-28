@@ -1,0 +1,67 @@
+{
+  "profileVersion": 1,
+  "mode": "offline-simulated-declarations",
+  "policy": {
+    "iri": "urn:example:a01:A5:simulatedClaimAdmission:1",
+    "version": "1",
+    "rule": "For this frozen offline example only, a selected accepted terminal decision admits its exact occurrence; a selected rejecting successor withdraws that occurrence. These declarations do not authenticate C25 review or perform real C25 admission."
+  },
+  "decisions": [
+    {
+      "id": "A5:accept1",
+      "target": "A5:claim1",
+      "disposition": "Accepted",
+      "supersedes": null
+    },
+    {
+      "id": "A5:accept2",
+      "target": "A5:claim2",
+      "disposition": "Accepted",
+      "supersedes": null
+    },
+    {
+      "id": "A5:withdraw1",
+      "target": "A5:claim1",
+      "disposition": "Rejected",
+      "supersedes": "A5:accept1"
+    },
+    {
+      "id": "A5:withdraw2",
+      "target": "A5:claim2",
+      "disposition": "Rejected",
+      "supersedes": "A5:accept2"
+    }
+  ],
+  "states": [
+    {
+      "projection": "A5:both",
+      "view": "A5:both:view",
+      "coordinate": "A5:snapshotBoth",
+      "selectedDecisions": [
+        "A5:accept1",
+        "A5:accept2"
+      ]
+    },
+    {
+      "projection": "A5:afterFirst",
+      "view": "A5:afterFirst:view",
+      "coordinate": "A5:snapshotAfterFirst",
+      "selectedDecisions": [
+        "A5:accept1",
+        "A5:accept2",
+        "A5:withdraw1"
+      ]
+    },
+    {
+      "projection": "A5:afterFinal",
+      "view": "A5:afterFinal:view",
+      "coordinate": "A5:snapshotAfterFinal",
+      "selectedDecisions": [
+        "A5:accept1",
+        "A5:accept2",
+        "A5:withdraw1",
+        "A5:withdraw2"
+      ]
+    }
+  ]
+}

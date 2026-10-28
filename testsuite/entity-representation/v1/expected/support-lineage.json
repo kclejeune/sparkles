@@ -6,7 +6,12 @@
     "sourceRevision",
     "sourceFamily",
     "upstream",
-    "independence"
+    "independence",
+    "decision",
+    "decisionTarget",
+    "disposition",
+    "previous",
+    "coordinate"
   ],
   "rows": [
     [
@@ -16,7 +21,12 @@
       "<urn:example:a01:r1>",
       "<urn:example:a01:bulletinFamily>",
       null,
-      "\"unknown\""
+      "\"unknown\"",
+      null,
+      null,
+      null,
+      null,
+      null
     ],
     [
       "<urn:example:a01:A5:claim2>",
@@ -25,7 +35,12 @@
       "<urn:example:a01:independent>",
       null,
       null,
-      "\"unknown\""
+      "\"unknown\"",
+      null,
+      null,
+      null,
+      null,
+      null
     ],
     [
       "<urn:example:a01:A6:bulletinClaim>",
@@ -34,7 +49,12 @@
       "<urn:example:a01:r1>",
       "<urn:example:a01:bulletinFamily>",
       null,
-      "\"unknown\""
+      "\"unknown\"",
+      null,
+      null,
+      null,
+      null,
+      null
     ],
     [
       "<urn:example:a01:A6:mirrorClaim>",
@@ -43,7 +63,12 @@
       "<urn:example:a01:mirror>",
       "<urn:example:a01:bulletinFamily>",
       "<urn:example:a01:r1>",
-      "\"unknown\""
+      "\"unknown\"",
+      null,
+      null,
+      null,
+      null,
+      null
     ],
     [
       "<urn:example:a01:A6:translationClaim>",
@@ -52,7 +77,12 @@
       "<urn:example:a01:translation>",
       "<urn:example:a01:bulletinFamily>",
       "<urn:example:a01:r1>",
-      "\"unknown\""
+      "\"unknown\"",
+      null,
+      null,
+      null,
+      null,
+      null
     ],
     [
       "<urn:example:a01:A5:both>",
@@ -61,7 +91,12 @@
       "<urn:example:a01:r1>",
       "<urn:example:a01:bulletinFamily>",
       null,
-      "\"unknown\""
+      "\"unknown\"",
+      null,
+      null,
+      null,
+      null,
+      "<urn:example:a01:A5:snapshotBoth>"
     ],
     [
       "<urn:example:a01:A5:both>",
@@ -70,7 +105,12 @@
       "<urn:example:a01:independent>",
       null,
       null,
-      "\"unknown\""
+      "\"unknown\"",
+      null,
+      null,
+      null,
+      null,
+      "<urn:example:a01:A5:snapshotBoth>"
     ],
     [
       "<urn:example:a01:A5:afterFirst>",
@@ -79,7 +119,12 @@
       "<urn:example:a01:independent>",
       null,
       null,
-      "\"unknown\""
+      "\"unknown\"",
+      null,
+      null,
+      null,
+      null,
+      "<urn:example:a01:A5:snapshotAfterFirst>"
     ],
     [
       "<urn:example:a01:A5:afterFinal>",
@@ -88,7 +133,138 @@
       null,
       null,
       null,
-      "\"unknown\""
+      "\"unknown\"",
+      null,
+      null,
+      null,
+      null,
+      "<urn:example:a01:A5:snapshotAfterFinal>"
+    ],
+    [
+      "<urn:example:a01:A5:both>",
+      "\"selected-review\"",
+      null,
+      null,
+      null,
+      null,
+      "\"unknown\"",
+      "<urn:example:a01:A5:accept1>",
+      "<urn:example:a01:A5:claim1>",
+      "<urn:x-sparkles:evidence:Accepted>",
+      null,
+      "<urn:example:a01:A5:snapshotBoth>"
+    ],
+    [
+      "<urn:example:a01:A5:both>",
+      "\"selected-review\"",
+      null,
+      null,
+      null,
+      null,
+      "\"unknown\"",
+      "<urn:example:a01:A5:accept2>",
+      "<urn:example:a01:A5:claim2>",
+      "<urn:x-sparkles:evidence:Accepted>",
+      null,
+      "<urn:example:a01:A5:snapshotBoth>"
+    ],
+    [
+      "<urn:example:a01:A5:afterFirst>",
+      "\"selected-review\"",
+      null,
+      null,
+      null,
+      null,
+      "\"unknown\"",
+      "<urn:example:a01:A5:accept1>",
+      "<urn:example:a01:A5:claim1>",
+      "<urn:x-sparkles:evidence:Accepted>",
+      null,
+      "<urn:example:a01:A5:snapshotAfterFirst>"
+    ],
+    [
+      "<urn:example:a01:A5:afterFirst>",
+      "\"selected-review\"",
+      null,
+      null,
+      null,
+      null,
+      "\"unknown\"",
+      "<urn:example:a01:A5:accept2>",
+      "<urn:example:a01:A5:claim2>",
+      "<urn:x-sparkles:evidence:Accepted>",
+      null,
+      "<urn:example:a01:A5:snapshotAfterFirst>"
+    ],
+    [
+      "<urn:example:a01:A5:afterFirst>",
+      "\"selected-review\"",
+      null,
+      null,
+      null,
+      null,
+      "\"unknown\"",
+      "<urn:example:a01:A5:withdraw1>",
+      "<urn:example:a01:A5:claim1>",
+      "<urn:x-sparkles:evidence:Rejected>",
+      "<urn:example:a01:A5:accept1>",
+      "<urn:example:a01:A5:snapshotAfterFirst>"
+    ],
+    [
+      "<urn:example:a01:A5:afterFinal>",
+      "\"selected-review\"",
+      null,
+      null,
+      null,
+      null,
+      "\"unknown\"",
+      "<urn:example:a01:A5:accept1>",
+      "<urn:example:a01:A5:claim1>",
+      "<urn:x-sparkles:evidence:Accepted>",
+      null,
+      "<urn:example:a01:A5:snapshotAfterFinal>"
+    ],
+    [
+      "<urn:example:a01:A5:afterFinal>",
+      "\"selected-review\"",
+      null,
+      null,
+      null,
+      null,
+      "\"unknown\"",
+      "<urn:example:a01:A5:accept2>",
+      "<urn:example:a01:A5:claim2>",
+      "<urn:x-sparkles:evidence:Accepted>",
+      null,
+      "<urn:example:a01:A5:snapshotAfterFinal>"
+    ],
+    [
+      "<urn:example:a01:A5:afterFinal>",
+      "\"selected-review\"",
+      null,
+      null,
+      null,
+      null,
+      "\"unknown\"",
+      "<urn:example:a01:A5:withdraw1>",
+      "<urn:example:a01:A5:claim1>",
+      "<urn:x-sparkles:evidence:Rejected>",
+      "<urn:example:a01:A5:accept1>",
+      "<urn:example:a01:A5:snapshotAfterFinal>"
+    ],
+    [
+      "<urn:example:a01:A5:afterFinal>",
+      "\"selected-review\"",
+      null,
+      null,
+      null,
+      null,
+      "\"unknown\"",
+      "<urn:example:a01:A5:withdraw2>",
+      "<urn:example:a01:A5:claim2>",
+      "<urn:x-sparkles:evidence:Rejected>",
+      "<urn:example:a01:A5:accept2>",
+      "<urn:example:a01:A5:snapshotAfterFinal>"
     ]
   ]
 }

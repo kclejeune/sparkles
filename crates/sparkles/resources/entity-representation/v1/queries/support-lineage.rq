@@ -5,20 +5,27 @@ PREFIX rdf: <http://www.w3.org/1999/02/22-rdf-syntax-ns#>
 PREFIX rdfs: <http://www.w3.org/2000/01/rdf-schema#>
 PREFIX xsd: <http://www.w3.org/2001/XMLSchema#>
 PREFIX prov: <http://www.w3.org/ns/prov#>
-# Run against one explicitly authorized recorded view. No query admits claims.
-SELECT ?record ?kind ?claim ?sourceRevision ?sourceFamily ?upstream ?independence WHERE {
+# Inspect one validated authorized view. Review coordinates are synthetic in the fixtures.
+SELECT ?record ?kind ?claim ?sourceRevision ?sourceFamily ?upstream ?independence ?decision ?decisionTarget ?disposition ?previous ?coordinate WHERE {
   { ?record a ev:Claim ; prov:wasDerivedFrom ?sourceRevision .
     BIND(?record AS ?claim) BIND("occurrence" AS ?kind)
     OPTIONAL { ?sourceRevision ev:sourceFamily ?sourceFamily }
     OPTIONAL { ?sourceRevision ev:upstreamSource ?upstream }
   }
   UNION
-  { ?record a sr:Projection ; sr:projectionKind sr:OfflineExpected .
+  { ?record a sr:Projection ; sr:projectionKind sr:OfflineExpected ; sr:recordedView ?coordinate .
     OPTIONAL { ?record sr:claim ?claim . ?claim prov:wasDerivedFrom ?sourceRevision .
       OPTIONAL { ?sourceRevision ev:sourceFamily ?sourceFamily }
       OPTIONAL { ?sourceRevision ev:upstreamSource ?upstream }
     }
     BIND("simulated-projection" AS ?kind)
+  }
+  UNION
+  { ?record a sr:Projection ; sr:projectionKind sr:OfflineExpected ; sr:recordedView ?coordinate ; sr:inputManifest ?manifest .
+    ?manifest sr:inputId ?decision .
+    ?decision a ev:ReviewDecision ; ev:target ?decisionTarget ; ev:disposition ?disposition .
+    OPTIONAL { ?decision prov:wasRevisionOf ?previous }
+    BIND("selected-review" AS ?kind)
   }
   BIND("unknown" AS ?independence)
 }

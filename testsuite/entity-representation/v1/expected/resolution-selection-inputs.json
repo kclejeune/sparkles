@@ -1,0 +1,73 @@
+{
+  "profileVersion": 1,
+  "mode": "offline-simulated-declarations",
+  "successors": [
+    {
+      "id": "A4:AB:rejected",
+      "target": "A4:AB",
+      "disposition": "Rejected",
+      "supersedes": "A4:AB:d"
+    },
+    {
+      "id": "A4:AC:rejected",
+      "target": "A4:AC",
+      "disposition": "Rejected",
+      "supersedes": "A4:AC:d"
+    },
+    {
+      "id": "A11:groupRejected",
+      "target": "A11:group",
+      "disposition": "Rejected",
+      "supersedes": "A11:groupAccepted"
+    }
+  ],
+  "states": [
+    {
+      "view": "A4:merged",
+      "coordinate": "A4:snapshotMerged",
+      "selectedDecisions": [
+        "A4:AB:d",
+        "A4:AC:d",
+        "A4:BC:d"
+      ]
+    },
+    {
+      "view": "A4:stillConnected",
+      "coordinate": "A4:snapshotAttemptedSplit",
+      "selectedDecisions": [
+        "A4:AB:d",
+        "A4:AC:d",
+        "A4:BC:d",
+        "A4:separateAB:d",
+        "A4:AB:rejected"
+      ]
+    },
+    {
+      "view": "A4:split",
+      "coordinate": "A4:snapshotSplit",
+      "selectedDecisions": [
+        "A4:AB:d",
+        "A4:AC:d",
+        "A4:BC:d",
+        "A4:separateAB:d",
+        "A4:AB:rejected",
+        "A4:AC:rejected"
+      ]
+    },
+    {
+      "view": "A11:oldGrouping",
+      "coordinate": "A11:snapshotGrouped",
+      "selectedDecisions": [
+        "A11:groupAccepted"
+      ]
+    },
+    {
+      "view": "A11:splitGrouping",
+      "coordinate": "A11:snapshotSplit",
+      "selectedDecisions": [
+        "A11:groupAccepted",
+        "A11:groupRejected"
+      ]
+    }
+  ]
+}

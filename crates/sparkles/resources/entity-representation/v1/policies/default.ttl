@@ -6,7 +6,6 @@ PREFIX rdfs: <http://www.w3.org/2000/01/rdf-schema#>
 PREFIX xsd: <http://www.w3.org/2001/XMLSchema#>
 PREFIX prov: <http://www.w3.org/ns/prov#>
 <urn:x-sparkles:representation:policy:1> a sr:Policy ;
-  sr:profileVersion 1 ; sr:separationRule sr:PairwiseSeparation ;
+  sr:profileVersion 1 ; sr:positiveMatchRule sr:AcceptedPossibleMatch ; sr:separationRule sr:PairwiseSeparation ;
   sr:conflictRule sr:WholeComponentConflict ; sr:kindRule sr:ExactKind ;
-  sr:representativeRule sr:LeastUtf8Iri ; sr:stringRule sr:ScalarJson1 ;
-  rdfs:comment "This policy interprets selected C25 declarations. It does not authenticate review or introduce logical equality." .
+  sr:representativeRule sr:LeastUtf8Iri ; sr:stringRule sr:ScalarJson1 .

@@ -1,0 +1,9 @@
+PREFIX ex: <urn:example:a01:>
+PREFIX sr: <urn:x-sparkles:representation:>
+PREFIX ev: <urn:x-sparkles:evidence:>
+PREFIX vt: <urn:x-sparkles:valid-time:>
+PREFIX rdf: <http://www.w3.org/1999/02/22-rdf-syntax-ns#>
+PREFIX rdfs: <http://www.w3.org/2000/01/rdf-schema#>
+PREFIX xsd: <http://www.w3.org/2001/XMLSchema#>
+PREFIX prov: <http://www.w3.org/ns/prov#>
+ex:verifiedArtifact a sr:Entity ; sr:profileVersion 1 ; sr:domainScope ex:A9 ; sr:entityKind sr:Artifact ; sr:digestValue "cad96633953a55b6ad55e5160d1e44756ecb77d9c26857255275aa45c3410057" ; sr:verificationStatus sr:Verified ; sr:verificationMethod ex:sha256Bytes:1 .

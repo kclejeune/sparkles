@@ -18,6 +18,7 @@ sr:OrdinaryEntityShape a sh:NodeShape ;
   sh:property [ sh:path sr:digestAlgorithm ; sh:nodeKind sh:IRI ; sh:maxCount 1 ;  ] ;
   sh:property [ sh:path sr:digestValue ; sh:datatype xsd:string ; sh:maxCount 1 ;  ] ;
   sh:property [ sh:path sr:verificationStatus ; sh:nodeKind sh:IRI ; sh:maxCount 1 ; sh:in (sr:UnknownVerification sr:Verified) ;  ] ;
+  sh:property [ sh:path sr:verificationMethod ; sh:nodeKind sh:IRI ; sh:maxCount 1 ] ;
   sh:sparql [ sh:message "Digest fields qualify artifacts and do not verify their bytes." ; sh:select """PREFIX sr: <urn:x-sparkles:representation:>
 PREFIX ev: <urn:x-sparkles:evidence:>
 PREFIX vt: <urn:x-sparkles:valid-time:>
@@ -26,7 +27,13 @@ PREFIX rdfs: <http://www.w3.org/2000/01/rdf-schema#>
 PREFIX xsd: <http://www.w3.org/2001/XMLSchema#>
 PREFIX prov: <http://www.w3.org/ns/prov#>
 PREFIX sh: <http://www.w3.org/ns/shacl#>
-SELECT $this WHERE { $this sr:entityKind ?kind . $this ?p ?v . FILTER(?p IN (sr:digestAlgorithm, sr:digestValue, sr:verificationStatus) && ?kind != sr:Artifact) }""" ] .
+SELECT $this WHERE { $this sr:entityKind ?kind . $this ?p ?v . FILTER(?p IN (sr:digestAlgorithm, sr:digestValue, sr:verificationStatus, sr:verificationMethod) && ?kind != sr:Artifact) }""" ] ;
+  sh:sparql [ sh:message "Digest algorithm and value are paired. Verified also declares the versioned verification method." ; sh:select """PREFIX sr: <urn:x-sparkles:representation:>
+SELECT $this WHERE {
+  { $this sr:digestAlgorithm ?algorithm . FILTER NOT EXISTS { $this sr:digestValue ?value } }
+  UNION { $this sr:digestValue ?value . FILTER NOT EXISTS { $this sr:digestAlgorithm ?algorithm } }
+  UNION { $this sr:verificationStatus sr:Verified . FILTER NOT EXISTS { $this sr:digestAlgorithm ?algorithm ; sr:digestValue ?value ; sr:verificationMethod ?method } }
+}""" ] .
 
 sr:PlaceShape a sh:NodeShape ;
   sh:nodeKind sh:IRI ;
@@ -303,6 +310,7 @@ sr:InputManifestShape a sh:NodeShape ;
   sh:property [ sh:path sr:profileVersion ; sh:datatype xsd:integer ; sh:minCount 1 ; sh:maxCount 1 ; sh:hasValue 1 ] ;
   sh:property [ sh:path sr:extension ; sh:nodeKind sh:IRI ; sh:class sr:Extension ;  ] ;
   sh:property [ sh:path sr:inputId ; sh:nodeKind sh:IRI ; sh:minCount 1 ;  ] ;
+  sh:property [ sh:path sr:contentDigest ; sh:datatype xsd:string ; sh:minCount 1 ; sh:maxCount 1 ; sh:pattern "^sha256:[0-9a-f]{64}$" ] ;
   sh:property [ sh:path sr:requiredExtension ; sh:nodeKind sh:IRI ;  ] ;
   sh:sparql [ sh:message "Version 1 has no adopted required extension profiles." ; sh:select """PREFIX sr: <urn:x-sparkles:representation:>
 PREFIX ev: <urn:x-sparkles:evidence:>
@@ -312,13 +320,16 @@ PREFIX rdfs: <http://www.w3.org/2000/01/rdf-schema#>
 PREFIX xsd: <http://www.w3.org/2001/XMLSchema#>
 PREFIX prov: <http://www.w3.org/ns/prov#>
 PREFIX sh: <http://www.w3.org/ns/shacl#>
-SELECT $this WHERE { $this sr:requiredExtension ?extension }""" ] .
+SELECT $this WHERE { $this sr:requiredExtension ?extension }""" ] ;
+  sh:sparql [ sh:message "The manifest identifier is excluded from its own input set." ; sh:select """PREFIX sr: <urn:x-sparkles:representation:>
+SELECT $this WHERE { $this sr:inputId $this }""" ] .
 
 sr:PolicyShape a sh:NodeShape ;
   sh:targetClass sr:Policy ;
   sh:nodeKind sh:IRI ;
   sh:closed true ;
   sh:ignoredProperties (rdf:type rdfs:label) ;
+  sh:property [ sh:path sr:positiveMatchRule ; sh:nodeKind sh:IRI ; sh:minCount 1 ; sh:maxCount 1 ; sh:in (sr:AcceptedPossibleMatch) ] ;
   sh:property [ sh:path sr:profileVersion ; sh:datatype xsd:integer ; sh:minCount 1 ; sh:maxCount 1 ; sh:hasValue 1 ] ;
   sh:property [ sh:path sr:extension ; sh:nodeKind sh:IRI ; sh:class sr:Extension ;  ] ;
   sh:property [ sh:path sr:separationRule ; sh:nodeKind sh:IRI ; sh:minCount 1 ; sh:maxCount 1 ; sh:in (sr:PairwiseSeparation) ;  ] ;
@@ -326,4 +337,3 @@ sr:PolicyShape a sh:NodeShape ;
   sh:property [ sh:path sr:kindRule ; sh:nodeKind sh:IRI ; sh:minCount 1 ; sh:maxCount 1 ; sh:in (sr:ExactKind) ;  ] ;
   sh:property [ sh:path sr:representativeRule ; sh:nodeKind sh:IRI ; sh:minCount 1 ; sh:maxCount 1 ; sh:in (sr:LeastUtf8Iri) ;  ] ;
   sh:property [ sh:path sr:stringRule ; sh:nodeKind sh:IRI ; sh:minCount 1 ; sh:maxCount 1 ; sh:in (sr:ScalarJson1) ;  ] .
-

@@ -135,3 +135,6 @@ sr:WholeComponentConflict a rdfs:Resource ; rdfs:comment "A conflict makes its p
 sr:ExactKind a rdfs:Resource ; rdfs:comment "Different application kinds cannot co-resolve in version 1." .
 sr:LeastUtf8Iri a rdfs:Resource ; rdfs:comment "The view representative is the least member IRI by UTF-8 byte order." .
 sr:ScalarJson1 a rdfs:Resource ; rdfs:comment "A01 fixed JSON field order and Unicode scalar escaping rules." .
+sr:positiveMatchRule a rdf:Property ; rdfs:comment "The explicit application rule admitting selected positive identity decisions." .
+sr:AcceptedPossibleMatch a rdfs:Resource ; rdfs:comment "A selected accepted terminal PossibleMatch decision contributes prospective resolve-together connectivity. Rejected, needs-evidence-only and undecided proposals contribute none. Contradictory terminals preserve positive prospective edges and cause whole-component conflict. This is neither review authority nor owl:sameAs." .
+sr:verificationMethod a rdf:Property ; rdfs:comment "The declared versioned verifier method IRI, required for a Verified artifact description without authenticating it." .

@@ -41,3 +41,25 @@ No health connector, operational public-health workflow or forecast is implement
 Phase 3 requires actual shared-runtime authorization, availability, durable publication
 and maintained freshness. A conforming fixture shape is not authenticated provenance.
 The corpus does not implement a resolution matcher or close those runtime requirements.
+
+The A5 input envelope fixes synthetic accepted declarations and their rejecting
+successors, along with distinct simulated recorded coordinates. It declares the
+fixture's admission policy explicitly. The lineage query returns selected decision
+inputs separately from the expected support outputs, including the final empty
+support state. Both original claim occurrences remain historical. A4 and A11 likewise
+retain the rejecting successors that explain later split selections. These input
+records are not a new ledger or live review operation.
+
+Input-manifest payloads are retained as compact JSON under `raw/input-manifests`.
+Their fixture/record/path/digest associations are fixed in
+`expected/input-manifests.json`. Identical payload bytes can be shared by separate
+fixture records because the record identifier is excluded from the payload. Structural
+invalid siblings are evaluated separately and retain their intended missing, malformed,
+duplicate or self-referential fields. They are never combined as admitted history.
+The full `expected/a12-comparison.json` fixes the complete comparison object, including
+selected inputs, all three assignments, the normalized conflict and the empty unknown
+set. Its bytes have no trailing newline and are not produced by a resolver.
+
+The standalone verified-artifact declaration has retained synthetic bytes, a digest
+and a declared versioned method. It tests record completeness, not authenticated
+verification. The original software artifact retains unknown verification.
