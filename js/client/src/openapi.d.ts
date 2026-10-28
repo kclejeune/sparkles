@@ -12706,9 +12706,10 @@ export interface operations {
                     [name: string]: unknown;
                 };
                 content: {
-                    properties: unknown;
-                    required: unknown;
-                    type: unknown;
+                    "application/json": {
+                        name: string;
+                        renamedFrom: string;
+                    };
                 };
             };
             400: components["responses"]["BadRequest"];

@@ -48,6 +48,11 @@ retained writers and finishes pending output, then propagates the original unwin
   backups, statistics and the schema report. It retries as `Retry-After` and `RateLimit`
   direct, and never repeats a write whose outcome is unknown.
 
+The [API compatibility policy](../DEVELOPMENT.md#api-compatibility) identifies the
+covered package roots and version rules. HTTP and standard CLI development-baseline
+checks are available. Public Rust and binding release comparisons remain under
+roadmap item 60. Native libraries and JVM JARs must still have matching versions.
+
 ## Known gaps
 
 These limits name the roadmap items that address them. Current priorities and
@@ -55,6 +60,7 @@ dependencies are recorded in the [central roadmap](../ROADMAP.md).
 
 ### Bindings and packaging
 
+* Public library and binding release compatibility checks remain. Roadmap item 60.
 * There is no WebAssembly build of the engine. Roadmap item 44.
 * The Python package is not on PyPI and has no PyPy or free-threaded wheels. The JVM
   library is not on Maven Central, and the JavaScript packages are not on npm. Release
@@ -76,7 +82,7 @@ or library workflows. Exact HTTP contracts remain in the API reference.
 
 ## Roadmap
 
-The remaining work described above refers to [item 25](../ROADMAP.md), [item 44](../ROADMAP.md), [item 58](../ROADMAP.md).
+The remaining work described above refers to [item 25](../ROADMAP.md), [item 44](../ROADMAP.md), [item 58](../ROADMAP.md) and [item 60](../ROADMAP.md).
 The central roadmap owns priority and dependencies. Its
 [completion paths](../ROADMAP.md#completion-paths-for-partially-complete-specs)
 link partially complete specs to their remaining work and acceptance criteria.

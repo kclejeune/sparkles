@@ -666,6 +666,15 @@ run = "mbx run --release -p sparkles-server -- serve --data ./data"
 description = "API docs for the library crates"
 run = "mbx doc --workspace --no-deps --exclude sparkles-server"
 
+[tasks."api:check"]
+description = "Check the API baseline inventory, HTTP compatibility and comparator fixtures without compiling Rust"
+sources = ["scripts/api-compat.py", "scripts/api-compat-tests/**", "docs/api-compatibility.toml", "docs/api-breaks.toml", "docs/openapi*.json", "testsuite/api/**", "CHANGELOG.md", "Cargo.toml", "crates/sparkles-server/Cargo.toml"]
+outputs = []
+run = [
+  "python3 -m unittest discover -s scripts/api-compat-tests",
+  "python3 scripts/api-compat.py --check-manifest",
+]
+
 [tasks.openapi]
 description = "Rewrite docs/openapi.json, the checked-in copy of the OpenAPI description (a test fails while it is out of date)"
 env = { SPARKLES_UPDATE_OPENAPI = "1" }

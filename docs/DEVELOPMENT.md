@@ -624,7 +624,7 @@ manual **compatibility-features** input.
 
 | Job | What it runs |
 |---|---|
-| Checks | Formatting of the Rust, UI, JavaScript and shell sources, shellcheck, the cited doc paths, the benchmark scripts' tests, the license notices, the generated TypeScript client against `docs/openapi.json`, and the UI's build, type check and unit tests. It compiles small tooling fixtures and leaves the workspace crates unbuilt. |
+| Checks | Formatting of the Rust, UI, JavaScript and shell sources, shellcheck, the cited doc paths, the benchmark scripts' tests, the license notices, the generated TypeScript client against `docs/openapi.json`, the API compatibility inventory and checker fixtures, and the UI's build, type check and unit tests. It compiles small tooling fixtures and leaves the workspace crates unbuilt. |
 | Clippy | Clippy with warnings as errors on the workspace, on the formatter's wasm32 build and on the three binding crates with and without their default features. |
 | Build tests | `mbx nextest archive` builds every test binary once and uploads the archive. The doctests run here too. |
 | Test | Five jobs run the archive. Four take a quarter of the tests each (`--partition slice:N/4`), and one runs the `timing` group of `.config/nextest.toml`, which needs a machine to itself. |
@@ -981,3 +981,115 @@ the UI build, and because `sparkles-cli` ships without the UI. `mise run license
 the UI and copies the file. `mise run licenses:check` fails when either file is out of
 date. It is part of `mise run ci`, and the flake check `ui-licenses` fails in the same
 case.
+
+## API compatibility
+
+X12 defines compatibility for the HTTP description, CLI, public libraries, MCP and
+metrics. Before 1.0, a minor release may break a covered contract and lists each
+break under its Compatibility changelog heading. A patch release breaks none.
+From 1.0, minor releases add without removing or changing existing contracts.
+A removal is announced in a minor release and the old form works until the next
+major release. Deprecated HTTP routes or parameters are to carry Deprecation and,
+when scheduled, Sunset headers. CLI use is to warn on stderr and bindings are to
+use their language's warning mechanism. Those warning mechanisms remain unimplemented.
+
+HTTP coverage follows `docs/openapi.json` and includes paths, methods, parameters,
+request and response members, status codes and represented error codes. Error-message
+prose, private UI routes and baseline members marked `x-sparkles-experimental` are
+excluded. Adding that marker to a covered member does not erase protection.
+Supported SPARQL and Fuseki behavior follows the existing Jena conformance scope.
+Deliberate differences stay in COMPARISON and require a changelog entry when changed.
+CLI coverage includes visible command names, aliases, flags, exit codes and explicit
+`--format json` output. Human-readable prose and hidden flags are excluded.
+
+The public Rust roots are `sparkles` and `sparkles-client`. Core items reexported
+through `sparkles` are covered even though the core crate is internal. Public Python
+exports include declarations reexported from `_sparkles.pyi` and exception classes
+from `_errors.py`, along with the public query-builder and rdflib modules. Public
+protocol methods retain coverage despite underscore spelling. Node coverage includes
+common, engine and client package roots and their transitive declaration exports.
+JVM coverage includes public package APIs outside `internal`. Native libraries and
+JARs still require an exact matching crate and encoding version. That pairing is
+separate from public source compatibility and the database reader window.
+MCP tool names, input schemas and output members are covered, while descriptions
+are excluded. Metric names and label keys are covered, while help prose is excluded.
+
+### Implemented compatibility checks
+
+`mise run api:check` runs the standard-library Python checker fixtures, validates the
+versioned tooling inventory and compares the checked-in HTTP description. Python 3.11
+or later is required for this developer task and the Rust compatibility tests.
+Installed servers and libraries do not require Python for these checks.
+The existing OpenAPI freshness test ties the description to source. An additional
+Rust unit test compares the generated description against the selected baseline.
+Another unit test compares the real built clap tree for the complete standard feature
+profile. Stripped builds run serializer fixtures without comparing their optional
+command omissions to that standard profile.
+
+The manifest `docs/api-compatibility.toml` names the explicit baseline source, feature
+profile, package version, files and SHA-256 digests. The current bootstrap names an
+unreleased commit. Its HTTP description retains `info.version` of `0.0.0` and is not
+a fictitious published 0.1.0 API. CI checks baseline immutability against its explicit
+base revision. Initial trust requires the fixed approved bootstrap source and digest,
+that source in the current history, and a trusted base on the same ancestor chain.
+Shallow or missing history fails proof. The checker never fetches missing Git objects. Missing files, bad versions and an unavailable source commit fail.
+They do not become successful comparisons. The cheap task compares HTTP only.
+The standard CLI comparison requires the generated tree from the Rust test.
+
+The checker rejects removed operations, statuses, content types, parameters and
+members, newly required inputs, narrowed input types or enums, and widened response
+types or enums. It also flags removal of documented response values and guarantees,
+as X12 requires beyond formal output subtyping. Optional input and response-member
+additions pass. Local references, array items, nullable types and combined object
+schemas are traversed. Changed ambiguous unions, unknown constraints and security
+metadata require review. The checker does not prove general JSON Schema implication.
+Enum and const constraints apply together. Unknown validators are checked for changes
+in reachable local reference targets even when the reference text stays the same.
+One shared traversal distinguishes schemas, named schema maps, named data maps and
+literal values. Schema annotations are ignored only at schema positions. Names such
+as `default` and `$ref` remain data in `dependentRequired` and other named maps.
+Known schema positions follow local references, including recursive targets.
+Covered map value schemas are compared even when their reference text is unchanged.
+OpenAPI schemas and reference objects use their declared container positions, while
+example values, link parameters and OAuth scope names remain literal data.
+Specification Extensions in Paths, Responses and Callback objects retain an opaque
+extension context. Component names, property names, header names, callback names and
+OAuth scopes retain their meaning when they begin with `x-`.
+Ambiguous reference-shaped structures under unknown keywords fail as unsupported
+contexts. Dynamic references, schema resource identifiers and other schema dialects
+also fail explicitly. These refusals do not establish compatibility.
+The CLI tree records positional argument identities and indices, so exchanging two
+equally shaped arguments changes the contract.
+Existing real-response, protocol and authorization tests remain necessary.
+
+### Reviewing differences and capturing baselines
+
+`docs/api-breaks.toml` accepts exact diagnostic identities with a baseline, target
+version, reason and Compatibility changelog anchor. Wildcards, stale entries and
+unmatched diagnostics fail. Bootstrap changes use the `development` disposition and
+`unreleased-compatibility` anchor. Equal package versions in unreleased development
+do not establish a patch-release guarantee. An actual release baseline forbids that
+bootstrap disposition. A pre-1.0 minor break may use `break` with its release heading.
+A proven break cannot be relabeled as `nonbreaking-review`. Unknown cases may receive
+that disposition only after independent review establishes their compatibility.
+Patch and stable-minor breaks cannot be waived. Major-removal announcement evidence
+and release baseline updates remain part of Phase 4c.
+
+Baseline regeneration is never an automatic response to a failed comparison. The HTTP
+bootstrap must match the selected source's checked-in description byte for byte.
+The CLI baseline is captured from that same source with only the test serializer
+added. `SPARKLES_API_CAPTURE` supplies an absolute, new output filename to the
+`cli_docs::compatibility::capture_standard_cli_contract` test. Capture requires the
+complete default feature profile and refuses an existing output file. Review the
+source diff and captured file before installing it into the immutable inventory.
+Use a mise task that holds the managed-target lease for any capture workflow that
+launches compiled files separately. Ordinary `mbx test` holds its own lease.
+
+Phase 4a enforces HTTP and standard CLI development-baseline checks only. Rust and
+binding release comparisons remain Phase 4b. The HTTP guard starts from documented
+operations. Unused generated component declarations and their public `.d.ts` types
+remain part of the binding comparison gate in Phase 4b. Phase 4c retains CLI JSON and exit-code
+coverage, MCP and metrics guards, deprecation signaling, release baselines and
+installed-artifact checks. Roadmap item 60 stays open. Items 58 and 59 own publication
+and additional platforms. No released artifact or platform guarantee follows merely
+from passing a source-tree compatibility check.

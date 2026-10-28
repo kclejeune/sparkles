@@ -1,6 +1,6 @@
 # X12: Distribution and format compatibility
 
-> **Status:** partially implemented (Phase 3)
+> **Status:** partially implemented (Phase 3 and Phase 4a)
 >
 > **Phases:** Phase 3 shipped: the on-disk format policy with older-format fixtures,
 > in-place upgrades and `sparkles migrate`. Phase 1 is one release workflow for every
@@ -8,7 +8,8 @@
 > with checksums and provenance attestations, and published container images. Phase 2
 > widens the platform matrix to Windows, Intel macOS, musl for the JVM, and PyPy and
 > free-threaded CPython wheels. Phase 4 is the HTTP, CLI and library compatibility
-> policy with its checks.
+> policy with its checks. Phase 4a supplies the policy and HTTP and standard CLI
+> development-baseline guards. Library, remaining surface and deprecation checks remain.
 >
 > **User docs:** [USAGE: Upgrading databases](../USAGE.md#upgrading-databases) and
 > [DEVELOPMENT: Changing an on-disk format](../DEVELOPMENT.md#changing-an-on-disk-format).
@@ -794,3 +795,65 @@ The broader Phase 1 changelog and release work remain pending. Not built in this
 are the fixture job of the release workflow, `sparkles --version --verbose`, and
 the background rebuild of a vector or spatial index whose file version is unknown, which
 already happens for the full-text index (A12).
+
+
+### Phase 4a. HTTP and standard CLI development guards
+
+The compatibility policy in DEVELOPMENT follows section 5. A commit-labeled bootstrap
+at `7c533eaa9042` records the unpublished 0.1.0 source. The HTTP baseline preserves
+its checked-in `0.0.0` description version and records the package version separately.
+It is not evidence of a published release. The real clap command tree is captured by
+a test-only serializer, with no installed command or endpoint added.
+
+The repository-owned Python checker traverses local references and combined object
+schemas, checks covered operations, request and response members, parameter requirements,
+response status codes and directional value constraints, and reports uncertain
+composition or security changes for review. X12 also protects removal of documented
+response types, enum values and error codes beyond formal output subtyping. Baseline
+experimental members alone are excluded. Exact reviewed development differences require
+a Compatibility changelog entry. Released patch or stable-minor breaks cannot be waived.
+Finite value comparisons preserve the conjunction of enum and const. Unknown validators
+include changes to referenced targets in their review diagnostics. One shared traversal
+distinguishes schemas, named schema and data maps, and literal payloads when validating
+references and comparing fingerprints. It preserves arbitrary map names and ignores
+annotations only at actual schema positions. Known OpenAPI containers locate schemas
+and reference objects without treating example values, link parameters or OAuth scope
+names as schemas. Ambiguous unknown reference contexts, dynamic references, schema
+resource identifiers and unsupported dialects fail explicitly. These checks remain
+bounded and do not prove general JSON Schema implication. The CLI serializer
+records positional argument IDs as well as indices, preserving the distinction between
+equally shaped arguments when their order changes.
+The CLI bootstrap was recaptured with that corrected test-only serializer from the
+same unchanged production definitions at `7c533eaa9042`. Removing only the 117 added
+positional IDs reproduces the original genuine captured tree exactly. Both captures
+contain 666 command nodes with a maximum depth of four. The original capture and
+validation receipts are preserved separately. This remains an unpublished source
+bootstrap, with no production parser or command behavior changed.
+
+HTTP comparison starts from documented operations and follows map value schemas even
+when their reference text is unchanged. Unused generated component declarations and
+their public `.d.ts` compatibility remain part of the binding gate in Phase 4b.
+Specification Extensions in Paths, Responses and Callback objects use an opaque
+extension context. Component names, property names, header names, callback names and
+OAuth scopes retain their meaning when they begin with `x-`.
+
+The cheap API task checks the inventory, source identity and HTTP description. Rust
+unit tests compare the generated description and standard command tree, while stripped
+profiles retain serializer checks without claiming standard-profile compatibility.
+Existing freshness, real response, authorization and protocol tests remain.
+
+Phase 4b retains Rust and binding release comparisons after facade export review.
+Phase 4c retains deprecation signals, broader CLI JSON and exit-code coverage, MCP and
+metric release guards and release/install integration. Phase 4 is incomplete, and
+Phases 1 and 2 remain separate release and platform work.
+
+
+The baseline exposed a pre-existing rename-response description error. The successful
+rename body's schema had been placed directly under OpenAPI `content`, where a media
+type map belongs. The descriptor now puts the same schema under
+`application/json.schema`, preserving `name`, `renamedFrom`, their requiredness and
+the existing wire behavior. One old-only normalization is registered by the exact
+bootstrap source, full file digest, JSON pointer and expected schema digest in the
+compatibility inventory. Current descriptions must use the valid media-type layout.
+Changed old bytes, another malformed location or extra old schema annotations do not
+qualify for the rule. The historical baseline itself remains byte-preserved.

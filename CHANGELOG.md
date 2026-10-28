@@ -2,7 +2,18 @@
 
 ## Unreleased
 
+### Compatibility
+
+The adopted HTTP, CLI and public library compatibility policy is documented.
+HTTP descriptions and the standard CLI command tree have compatibility guards against
+a commit-labeled development baseline. No published release baseline exists.
+Library and binding checks, broader machine-readable contracts and deprecation
+signals remain incomplete.
+
 ### Changed
+
+The successful dataset rename response is described under OpenAPI's `application/json`
+media type. Its `name` and `renamedFrom` fields and wire behavior are unchanged.
 
 Dataset and branch administration emit audit events across HTTP, local commands and
 MCP. Clone events follow actual registration and preserve the initiating actor and

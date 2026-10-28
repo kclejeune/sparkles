@@ -56,3 +56,6 @@ pub fn write_stdout(bytes: &[u8]) -> Result<()> {
         r => Ok(r?),
     }
 }
+
+#[cfg(test)]
+pub(crate) mod compatibility;
