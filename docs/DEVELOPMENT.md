@@ -691,7 +691,24 @@ scripts call `mbx` directly. Maturin and napi builds use the supported Cargo shi
 those tools invoke Cargo themselves. The GitHub cache fallback carries a Cargo target
 payload for root-workspace jobs and an object payload for binding workspaces or explicit
 targets. The target payload includes Cargo downloads, while object jobs let Cargo download
-dependencies again. There is no separate Cargo download cache or Swatinem or sccache layer.
+dependencies again.
+
+The hosted **Build tests** job combines remote mbx objects with a pinned Swatinem
+cache for Cargo registry/git downloads and dependency targets. Swatinem excludes
+workspace crates, installed Cargo tools and the mbx object store. Its production key
+is stable across runs and includes the mbx version, platform, Rust compiler and build
+environment, manifests and lockfiles. Only successful main pushes and manual runs on
+main save this target cache. Pull requests may restore it. A cache miss builds normally.
+Fork pull requests retain the mbx action's GitHub target-cache fallback instead.
+
+The hybrid job disables managed target views so Swatinem owns an ordinary `target`
+directory. After restoration, `scripts/ci-cache-rehydrate.py` validates the supported
+mbx launchers and recreates their pruned helper binaries from the pinned installed mbx.
+It refuses unknown launcher forms and paths escaping the target, preserves launcher
+and build-script mtimes and never evaluates cached shell text. A fresh mbx metadata call follows the
+repair. Swatinem's Cargo metadata calls also pass through mbx with `--locked` using
+`scripts/ci-cache-tool.sh`. The other remote-cache jobs use mbx alone. There is no
+sccache layer.
 
 The Linux wheel and Alpine addon containers install the pinned Boxington version from
 checksum-verified portable binaries. They mount their host job's store and use a separate
