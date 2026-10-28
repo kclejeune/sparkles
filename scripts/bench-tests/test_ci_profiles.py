@@ -9,6 +9,18 @@ import unittest
 
 ROOT = Path(__file__).resolve().parents[2]
 
+FULL_TASKS = {
+    "fmt:check", "ui:fmt:check", "node:fmt:check", "lint:shell", "lint:doc-paths",
+    "test:bench-scripts", "api:check", "client:types:check", "lint", "ui:check",
+    "fmt:wasm", "py:lint", "jvm:lint", "node:lint", "test", "ui:test", "py:test",
+    "jvm:rust-test", "jvm:test", "node:test", "node:client:check", "licenses:check",
+}
+FAST_TASKS = {
+    "fmt:check", "lint:shell", "lint:doc-paths", "api:check", "client:types:check",
+    "lint", "test",
+}
+FEATURE_TASKS = {"lint:features", "test:features"}
+
 
 class CiProfiles(unittest.TestCase):
     def run_profile(self, *args, failing="", notify_completed=False):
@@ -49,16 +61,14 @@ class CiProfiles(unittest.TestCase):
     def test_default_preserves_full_suite_without_exhaustive_feature_builds(self):
         result, tasks, _ = self.run_profile()
         self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertEqual(set(tasks), {
-            "fmt:check", "ui:fmt:check", "node:fmt:check", "lint:shell", "lint:doc-paths",
-            "test:bench-scripts", "lint", "ui:check", "fmt:wasm", "py:lint", "jvm:lint",
-            "node:lint", "test", "ui:test", "py:test", "jvm:rust-test", "jvm:test",
-            "node:test", "node:client:check", "licenses:check",
-        })
+        self.assertEqual(set(tasks), FULL_TASKS)
+        self.assertEqual(len(tasks), len(FULL_TASKS))
 
     def test_exhaustive_features_adds_both_checks_once(self):
         result, tasks, lines = self.run_profile("--exhaustive-features", "--force")
         self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(set(tasks), FULL_TASKS | FEATURE_TASKS)
+        self.assertEqual(len(tasks), len(FULL_TASKS | FEATURE_TASKS))
         self.assertEqual(tasks.count("lint:features"), 1)
         self.assertEqual(tasks.count("test:features"), 1)
         self.assertTrue(all("--force" in line for line in lines if "--skip-deps" in line))
@@ -69,9 +79,27 @@ class CiProfiles(unittest.TestCase):
             with self.subTest(selection=selection):
                 result, tasks, _ = self.run_profile(*selection, "--exhaustive-features")
                 self.assertEqual(result.returncode, 0, result.stderr)
+                expected = FEATURE_TASKS if selection == ("lint:features",) else FAST_TASKS | FEATURE_TASKS
+                self.assertEqual(set(tasks), expected)
+                self.assertEqual(len(tasks), len(expected))
                 self.assertEqual(tasks.count("lint:features"), 1)
                 self.assertEqual(tasks.count("test:features"), 1)
                 self.assertNotIn("py:test", tasks)
+
+    def test_default_fast_preserves_its_exact_suite(self):
+        result, tasks, _ = self.run_profile("--fast")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(set(tasks), FAST_TASKS)
+        self.assertEqual(len(tasks), len(FAST_TASKS))
+
+    def test_api_and_client_check_failures_propagate(self):
+        for failing in ("api:check", "client:types:check"):
+            with self.subTest(failing=failing):
+                result, tasks, _ = self.run_profile("--fast", failing=failing)
+                self.assertEqual(result.returncode, 1, result.stderr)
+                self.assertEqual(set(tasks), FAST_TASKS)
+                self.assertEqual(len(tasks), len(FAST_TASKS))
+                self.assertIn("exit 29", result.stdout)
 
     def test_explicit_feature_task_still_runs_and_failure_propagates(self):
         result, tasks, _ = self.run_profile("test:features", failing="test:features")
