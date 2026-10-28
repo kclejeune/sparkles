@@ -207,9 +207,21 @@ publish a complete or current view.
 Version 1 interprets an admitted `ev:PossibleMatch` proposal as a resolve-together
 constraint only when the selected matching policy explicitly admits that decision as
 a match. An undecided proposal remains possible and contributes no equality edge.
-An admitted `ev:DistinctEntities` proposal contributes a keep-separate constraint.
-Rejection of a possible match does not imply a keep-separate decision. Decisions and
-constraints retain their contributing proposal IDs and do not assert `owl:sameAs`.
+An accepted `ev:DistinctEntities` proposal means pairwise separation of every distinct
+unordered pair of its members under A01 version 1. This is an A01 matching-policy rule
+over C25 records, not a change to the C25 record contract. Each logical separation
+retains the original proposal and accepted decision IDs. A rejected or needs-evidence
+terminal outcome alone establishes no match or separation. Rejection of a possible
+match does not imply a keep-separate decision. Decisions and constraints retain their
+contributing proposal IDs and do not assert `owl:sameAs`.
+
+A separation proposal with conflicting accepted and rejected terminal outcomes creates
+a decision conflict in each prospective component containing any of its members. It
+does not connect those components. This also applies to any other disagreement between
+terminal dispositions. Thus a contradicted separation over three otherwise singleton
+entities makes each singleton unresolved, with three separate component diagnostics.
+The same accepted separation without contradictory terminal outcomes leaves all three
+self-assigned when no positive match connects them.
 
 Replay applies the following rules to a set, not to arrival order.
 
@@ -223,14 +235,23 @@ Replay applies the following rules to a set, not to arrival order.
 3. Build the undirected prospective graph of resolve-together constraints. A positive
    terminal outcome contributes an edge even when a conflicting terminal outcome also
    exists; the conflict check below prevents admission of that component. A proposal that
-   names more than two entities contributes one jointly constrained component. Preserve
-   every contributing edge and keep-separate constraint in the diagnostic output.
+   names more than two entities contributes one jointly constrained component. It may
+   use a star anchored at its least member to avoid materializing all positive pairs.
+   Preserve each original proposal's membership and contributing terminal decision IDs
+   in the diagnostic graph. N-ary separation remains one compact membership constraint;
+   the diagnostic graph need not materialize its quadratic logical pair expansion.
 4. For each prospective connected component, check kind compatibility, conflicting
    terminal decisions and every admitted keep-separate constraint. If a keep-separate
    pair is connected, or an entity has a conflicting terminal decision affecting that
    component, mark the whole prospective component unresolved. Do not choose a maximal
    consistent subset, drop a nonmatch or select the newest edge. Conflicts outside it
-   do not contaminate an unrelated component.
+   do not contaminate an unrelated component. For each accepted n-ary separation,
+   group its members by prospective component and test whether a group contains at
+   least two distinct members. Such a group creates a `distinct-conflict` for that
+   component. Use component counts and original proposal membership rather than an
+   eagerly allocated pair set. A singleton touched by accepted separation alone has
+   no conflict. Conflicting terminal dispositions create `decision-conflict` for every
+   component touched by that proposal. Kind incompatibility creates `kind-conflict`.
 5. For a consistent component, assign its members the lexicographically least entity
    IRI by UTF-8 byte order as its view representative. A singleton is assigned to itself.
    This tie-break chooses a display/join representative, not a privileged real-world
@@ -241,18 +262,71 @@ Replay applies the following rules to a set, not to arrival order.
    of Turtle prefix, triple order or whitespace. The replay manifest also defines a
    deterministic JSON comparison form for exact fixture checks.
 
+The full diagnostic graph retains each original proposal, terminal decision, compact
+constraint and its affected prospective components. The JSON form normalizes that
+graph to exactly one conflict row for each pair of prospective component and conflict
+code. Its `entities` contains every entity in that component, sorted uniquely, even
+when a particular cause names only some of them. Its `decisions` is the sorted unique
+union of all terminal decisions causing that code there and all terminal decisions
+contributing positive connectivity in that component. Multiple independent causes of
+the same code therefore combine into one row, without losing their individual proposal
+provenance from the full graph. An accepted separation's decision contributes only
+where its members collide; a contradictory separation's terminal decisions contribute
+to every touched component. A decision conflict on singleton A and one on singleton B
+produce separate rows with `[A]` and `[B]`, not a fictitious joined `[A,B]` component.
+
 The JSON comparison form is UTF-8 JSON with an object containing `profileVersion`,
-`scope`, `inputIds`, `assignments`, `conflicts` and `unknowns`. Input IDs are sorted
-unique strings. Assignment objects have `entity`, `status`, `representative` and
-`decisions`; an unresolved representative is null. Assignment status is `resolved` or `unresolved`. Conflict codes are `distinct-conflict`,
-`kind-conflict` and `decision-conflict`. Unknown codes include `possible-match` and
-`unavailable-input`. Input IDs include the manifest, policy and mapping version IRIs
-as well as entity, claim, proposal and decision IDs. All string sets are sorted by
-UTF-8 bytes. Rows sort by entity; conflicts by sorted entity tuple then code; unknowns
-by record ID then code. JSON has no insignificant whitespace, emits non-ASCII UTF-8,
-and uses fixed field order as listed here. Each conflict has `code`, `entities` and
-`decisions`; each unknown has `record`, `code`. A SHA-256 over these bytes identifies
-the comparison artifact, not the entity or an authenticated C25 record.
+`scope`, `inputIds`, `assignments`, `conflicts` and `unknowns` in that field order.
+`profileVersion` is the integer `1`. Input IDs are sorted unique strings, including
+the manifest, policy and mapping version IRIs as well as entity, claim, proposal and
+decision IDs. Assignment objects have `entity`, `status`, `representative` and
+`decisions` in that order. Status is `resolved` or `unresolved`; an unresolved
+representative is null. Every assignment in a consistent component lists all terminal
+decisions contributing its positive connectivity. Every assignment in an unresolved
+component lists the union of that component's normalized conflict decision sets.
+A self-assigned singleton with no such decisions lists an empty array. A path witness
+must not replace either complete decision set.
+
+Each conflict object has `code`, `entities` and `decisions` in that order. Conflict
+codes are `distinct-conflict`, `kind-conflict` and `decision-conflict`. Each unknown
+object has `record`, `code` in that order. Unknown codes include `possible-match` and
+`unavailable-input`. Repeated identical unknown `(record, code)` pairs collapse to
+one row. All string sets are sorted uniquely by UTF-8 bytes. Assignments sort by
+entity; normalized conflicts sort by their entity tuple then code; unknowns sort by
+record then code. Arrays use commas and objects use commas and colons without
+whitespace. Only the declared fields appear. The null token is lowercase `null`.
+
+String encoding preserves Unicode scalar values without normalization. Surround each
+string with ASCII quotation marks. Encode U+0022 as the two bytes `5c 22` and U+005C
+as `5c 5c`. Encode each U+0000 through U+001F as the six ASCII bytes for `\u00xx`,
+with two lowercase hexadecimal digits. Do not use short escapes such as `\n` or `\t`.
+Encode every other scalar directly as UTF-8, including U+002F, U+007F, U+2028,
+U+2029 and non-ASCII characters. Do not escape a solidus or emit a byte-order mark.
+An unpaired surrogate or invalid UTF-8 refuses as `invalid-domain-record`. This small
+string-only rule needs no external canonicalization library.
+
+These fixed string vectors include the surrounding JSON quotation bytes. The input
+column lists Unicode code points and the output column lists the exact UTF-8 bytes
+in hexadecimal, with spaces only for readability.
+
+| Input code points | Encoded bytes |
+|---|---|
+| The ASCII string `https://example.org/A` | `22 68 74 74 70 73 3a 2f 2f 65 78 61 6d 70 6c 65 2e 6f 72 67 2f 41 22` |
+| `0022 005C 002F` | `22 5c 22 5c 5c 2f 22` |
+| `0000 0008 0009 000A 000C 000D 001F` | `22 5c 75 30 30 30 30 5c 75 30 30 30 38 5c 75 30 30 30 39 5c 75 30 30 30 61 5c 75 30 30 30 63 5c 75 30 30 30 64 5c 75 30 30 31 66 22` |
+| `00E9 0065 0301 1F600 2028` | `22 c3 a9 65 cc 81 f0 9f 98 80 e2 80 a8 22` |
+
+Two contradictory proposals on the same A–B prospective component, with terminal
+decisions d1/d2 and d3/d4, yield the following single conflict object. Its exact JSON
+bytes have no trailing newline. Reversed proposal order or repeated identical records
+must yield the same object. Other codes in that component receive their own row.
+
+```json
+{"code":"decision-conflict","entities":["https://example.org/A","https://example.org/B"],"decisions":["urn:example:d1","urn:example:d2","urn:example:d3","urn:example:d4"]}
+```
+
+A SHA-256 over the complete comparison object bytes identifies the comparison
+artifact, not the entity or an authenticated C25 record.
 
 A merge is a successor view in which previously separate anchors share a representative.
 A split is a successor view in which they no longer do, following superseding decisions,
@@ -373,7 +447,7 @@ before replay implementation. No network or model is required to evaluate the co
 |---|---|
 | A1. Two aliases and two same-name organizations | Aliases can identify one entity under a scoped decision. The distinct same-name entities remain separate. A missing authority or realm fails identifier shape validation. |
 | A2. Account and person | A control relationship is queryable. A proposed identity merge conflicts on kind and yields unresolved assignments. |
-| A3. A–B and B–C match, A–C nonmatch | All three assignments are unresolved, with every contributing decision retained. Permutation and duplicate delivery give identical comparison bytes. |
+| A3. Binary and n-ary nonmatch | A–B and B–C match with A–C nonmatch makes all three unresolved. Accepted n-ary separation of A/B/C with only A–B matched makes A/B unresolved and C self-assigned. With no positive edges all three self-assign, and a completely unrelated component resolves in every case. |
 | A4. Merge followed by split | Both views remain queryable. A split with another surviving transitive path stays conflicted. A valid split separates the anchors without rewriting earlier claims. |
 | A5. Withdraw one of two admitted occurrences | The surviving occurrence retains simulated projection support. Withdrawing the final support removes current admission while preserving history. |
 | A6. Bulletin, mirror and translation | Three occurrences retain common lineage. Independent corroboration is unknown unless separately assessed, never three votes. |
@@ -382,7 +456,7 @@ before replay implementation. No network or model is required to evaluate the co
 | A9. Software family, version, release, build, artifact and deployment | All retain separate IDs and kinds. A lockfile version alone returns unknown deployed exposure. Unverified digest claims remain unverified. |
 | A10. Duplicate health reports and cumulative revision | Reports can group to one episode, with distinct observation IDs and 10 then 12 cumulative cases. The current revision is 12 under the declared selection; no query sums them to 22 incident cases. |
 | A11. Episode split and geography revision | A successor grouping and geometry version change their projections without altering old reports. Unknown denominator and coarse location remain explicit. |
-| A12. Conflicting terminal decisions | No timestamp tie-break chooses a winner. The affected component is unresolved; unrelated components still resolve. A supersession cycle refuses replay. |
+| A12. Conflicting terminal decisions | Accepted/rejected n-ary separation marks every touched component unresolved without connecting them. Two contradictory proposals on the same A–B component normalize to one decision-conflict row containing all causal decision IDs. Reversed order, identical duplicates, HTTPS IRIs and fixed escaping vectors preserve exact bytes while unrelated components resolve, and a supersession cycle refuses replay. |
 | A13. Source ID or digest conflict | Equal IDs with unequal content or tampered source bytes refuse with their exact codes. Quarantine retains diagnostic references without overwriting admitted history. |
 | A14. Unknown fields, extensions and limits | Unknown required semantics refuse. Optional uninterpreted extensions stay excluded from semantic answers. Limit-plus-one and cancellation produce no partial output. |
 | A15. Access boundary | Hidden supports, entity labels and conflicts do not appear in a restricted result or error. A public projection cannot reuse a private complete resolution view. |
