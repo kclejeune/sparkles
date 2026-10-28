@@ -6,6 +6,7 @@ use sparkles::history::{At, SnapshotOptions};
 mod algo_stats_probe;
 #[cfg(test)]
 mod algo_stats_tests;
+mod mapping_control;
 fn value<T: Serialize>(v: T) -> sparkles::Result<Value> {
     serde_json::to_value(v).map_err(|e| EngineError::invalid(e.to_string()))
 }
@@ -681,7 +682,10 @@ fn run_admin(
             json!({"receipt": r.receipt, "stats": r.stats})
         }
         "runMapping" => {
-            let r = ds.run_mapping(text(a, "text")?, mapping_kind(a)?, &mapping_inputs(a)?, &mapping_options(a, ctl), a["graph"].as_str())?;
+            let mut write = write_options(v, ctl.cancel.flag())?;
+            // Retain the operation's absolute deadline across conversion and load.
+            write.deadline = ctl.deadline;
+            let r = mapping_control::run(ds, text(a, "text")?, mapping_kind(a)?, &mapping_inputs(a)?, &mapping_options(a, ctl), a["graph"].as_str(), &write)?;
             json!({"receipt": r.receipt, "stats": r.stats})
         }
         "queries.list" => value(ds.queries().list())?,

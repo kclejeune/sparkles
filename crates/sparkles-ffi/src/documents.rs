@@ -2,6 +2,8 @@
 //! nested field. The Java surface uses Jena's JSON trees and typed outer records.
 use crate::{ErrorKind, FfiDataset, FfiError, FfiOperation, FfiReadTxn, FfiResult, FfiWriteTxn};
 use std::sync::Arc;
+#[path = "mapping_control.rs"]
+mod mapping_control;
 pub(crate) fn encode<T: serde::Serialize>(value: &T) -> FfiResult<Vec<u8>> {
     serde_json::to_vec(value).map_err(|e| FfiError::new(ErrorKind::Invalid, e.to_string()))
 }
@@ -249,12 +251,19 @@ impl FfiDataset {
     ) -> FfiResult<Vec<u8>> {
         self.inner.check_writable()?;
         operation.control.check()?;
-        let r = self.inner.ds.run_mapping(
+        let write = sparkles::guard::WriteOptions {
+            cancel: Some(operation.control.cancel.flag()),
+            deadline: operation.control.deadline,
+            ..Default::default()
+        };
+        let r = mapping_control::run(
+            &self.inner.ds,
             &text,
             mapping_kind(kind.as_deref())?,
             &mapping_inputs(&input)?,
             &mapping_opts(&input, &operation),
             graph.as_deref(),
+            &write,
         )?;
         encode(&serde_json::json!({"receipt": r.receipt, "stats": r.stats}))
     }
