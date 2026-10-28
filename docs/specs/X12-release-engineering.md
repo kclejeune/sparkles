@@ -633,7 +633,7 @@ capabilities and remaining work are described by the spec status and Outcome.
 
 ## Outcome
 
-Phases 1, 2 and 4 are not built. See [ROADMAP](../ROADMAP.md) items 58–60.
+Phases 1 and 2 are not built. Phase 4a supplies HTTP and standard CLI development-baseline guards. The rest of Phase 4 remains incomplete. See [ROADMAP](../ROADMAP.md) items 58–60.
 
 ### Phase 3 (2026-10-13)
 
