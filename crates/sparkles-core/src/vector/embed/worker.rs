@@ -175,6 +175,16 @@ impl Record {
         }
     }
 
+    /// Finish buffered output while Store still owns its directory exclusion.
+    /// Retained Embedder Arcs must have no output left to flush when they drop.
+    fn close_output(&mut self) {
+        if let Some(mut out) = self.out.take()
+            && let Err(error) = out.flush()
+        {
+            tracing::warn!(target: "sparkles::vector::embed::worker", "embedding record: {error}");
+        }
+    }
+
     /// Forget every pair (`reembed`, a new identity).
     pub fn clear(&mut self, identity: u64) {
         self.map.clear();
@@ -448,6 +458,9 @@ impl Embedder {
     pub(crate) fn close(&self) {
         self.closed.store(true, Ordering::SeqCst);
         self.notify();
+        for work in self.works.lock().values_mut() {
+            work.record.close_output();
+        }
     }
 
     /// Wake the worker: there is work.

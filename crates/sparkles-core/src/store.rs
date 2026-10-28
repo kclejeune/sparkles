@@ -20,6 +20,8 @@ pub mod caches;
 mod changelog;
 mod changes;
 mod clone;
+#[cfg(test)]
+mod close_tests;
 pub(crate) mod cold;
 mod commit_graph;
 mod commit_stats;
@@ -4491,6 +4493,8 @@ impl Store {
     /// Call this before any writer exists, or while holding the writer lock through a
     /// drained transaction, as validation configuration changes do. This keeps a
     /// speculative transaction on the guard it began with until its check completes.
+    /// If the guard's clean-close callback panics, shutdown revokes retained writers
+    /// and finishes buffered output before resuming that panic.
     pub fn set_guard(&self, g: Option<Arc<dyn crate::guard::CommitGuard>>) {
         crate::sparql::extensions::assert_family(self.owner_dataset_id());
         *self.guard.write() = g;
@@ -6835,6 +6839,7 @@ impl Collector {
 
 impl Drop for Store {
     fn drop(&mut self) {
+        let mut close_panic = None;
         #[cfg(feature = "text")]
         self.stop_text_recovery();
         // Checkpoint/join derived writers while the dataset OS lock is still held.
@@ -6851,7 +6856,13 @@ impl Drop for Store {
             {
                 let snap = self.snapshot();
                 if snap.commit == w.head.seq && !snap.historical {
-                    g.close(&w.head, &snap);
+                    // A user callback must not skip revocation of independently
+                    // retained writers or their buffered output. Keep its original
+                    // unwind until those shutdown boundaries have finished.
+                    close_panic = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                        g.close(&w.head, &snap);
+                    }))
+                    .err();
                 }
             }
             w.closed = true;
@@ -6869,6 +6880,9 @@ impl Drop for Store {
             tracing::warn!(target: "sparkles::store", error = %e, "could not write the change log on close");
         }
         self.embed.close();
+        if let Some(payload) = close_panic {
+            std::panic::resume_unwind(payload);
+        }
     }
 }
 
