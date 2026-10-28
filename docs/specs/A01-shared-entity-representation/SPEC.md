@@ -1,9 +1,9 @@
 # A01: Shared entity representation, convergence and evolution
 
-> **Status:** specified and unimplemented.
+> **Status:** implemented in part. Phase 1 resources and acceptance fixtures are available.
 >
-> **Phases:** Phase 1 defines installable profile resources and independent acceptance
-> fixtures. Phase 2 implements bounded offline reference replay and selected mappings.
+> **Phases:** Phase 1 supplies versioned resources and independent acceptance
+> fixtures. Phase 2 adds bounded offline reference replay and selected mappings.
 > Phase 3 adopts the shared managed runtimes after their required acceptance gates.
 
 ## 1. Purpose and scope
@@ -478,15 +478,15 @@ and access-revocation tests against the actual shared runtimes.
 
 ## 11. Delivery files and validation gates
 
-Phase 1 adds the planned `../../../crates/sparkles/resources/entity-representation/v1/` directory
+Phase 1 provides the `../../../crates/sparkles/resources/entity-representation/v1/` directory
 with `README.md`, `vocabulary.ttl`, `shapes.ttl`, `manifest.ttl`, `policies/default.ttl`
 and eight `queries/*.rq` resources. It adds `../../../testsuite/entity-representation/v1/`
 with `README.md`, `manifest.json`, `cases.json`, `raw/`, `valid/`, `invalid/` and
 `expected/` directories. The manifest records supported profile versions and digests.
 
-The planned `../../../crates/sparkles/src/shared_entity.rs` resource accessor follows
-existing explicit profile selection without opening or modifying a dataset. Expose it
-from `../../../crates/sparkles/src/lib.rs`. The planned
+The `../../../crates/sparkles/src/shared_entity.rs` resource accessor follows
+existing explicit profile selection without opening or modifying a dataset. It is
+exposed from `../../../crates/sparkles/src/lib.rs`. The
 `../../../crates/sparkles/tests/shared_entity_profile.rs` integration test validates
 manifest digests, unknown-version refusal, shapes, query bindings and nonassertion.
 Adding an accessor requires the ordinary additive API policy checks.
@@ -535,7 +535,23 @@ The reference corpus uses synthetic examples and separately declared supplied fi
 
 ## Outcome
 
-A01 is specified and unimplemented. No vocabulary, shape, fixture, replay executable,
-managed integration or operational domain capability has shipped under this spec.
-Roadmap item 396 owns its three phases. Existing C25 and C27 resources remain delivered
-under their own specifications and are prerequisites to reuse, not A01 delivery claims.
+Phase 1 provides the version 1 vocabulary, closed structural shapes, matching policy,
+digest manifest and eight SPARQL competency queries. The Rust
+`shared_entity::profile(1)` accessor selects these static resources and refuses unknown
+versions. It opens no dataset. The fixed corpus supplies independent expectations
+for A1–A15, with retained source bytes, exact selectors, input-manifest payloads,
+scalar encoding vectors and manually
+specified query answers. Acceptance checks include 28 conforming graphs and 26 exact
+structural refusals, nonassertion and explicit unknown values.
+
+Synthetic successor decisions explain support withdrawal and merge/split histories.
+A separate offline observation-series profile and distinct input states explain the
+cumulative revision from 10 to 12 without summing the reports. These declarations do
+not authenticate review, prove source independence or implement domain operations.
+
+Roadmap item 396 retains Phase 2 bounded offline replay and selected source mappings.
+Phase 3 still requires actual C25 managed review and protected records, C27 authenticated
+availability, C26 durable publication and F22 freshness. Scoped visibility and later
+mixed-access inference use their adopted access contracts. No matcher, managed
+projection, health connector or operational public-health workflow is delivered by
+Phase 1.

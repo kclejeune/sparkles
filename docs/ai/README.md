@@ -234,16 +234,27 @@ boundary and remaining managed operations.
 
 ### Shared entity representation
 
-[A01](../specs/A01-shared-entity-representation/README.md) specifies application
-profiles for shared entities, source descriptions, scoped identifiers and reviewed
-resolution maps. It reuses the evidence and valid-time resources. Source revisions,
-world changes, resolution decisions and ontology or mapping migrations retain
-separate identities and history.
+[A01](../specs/A01-shared-entity-representation/README.md) provides versioned RDF
+resources for shared entities, source descriptions, scoped identifiers and reviewed
+resolution maps. Source revisions, world changes, identity decisions and ontology or
+mapping migrations retain separate identities and history. The profile reuses C25
+claims and C27 temporal records.
 
-The model resources, domain mappings and replay fixtures remain planned under
-roadmap item 396. Their first phases use ordinary RDF, SHACL and SPARQL. Managed
-ingestion, live review, authenticated availability and maintained results use the
-C25, C27, C26 and F22 contracts as those runtimes become available.
+In Rust, `sparkles::shared_entity::profile(1)` returns the vocabulary, structural
+shapes, matching policy, digest manifest and eight competency queries. Unknown
+versions return `None`. Selecting these static resources opens no dataset. The
+[resource package](../../crates/sparkles/resources/entity-representation/v1/README.md)
+and [fixed corpus](../../testsuite/entity-representation/v1/README.md) provide software,
+organization, place, event and aggregate-observation examples with exact query
+answers, retained source bytes and explicit unknowns. They can be loaded and queried
+with the existing RDF, SHACL and SPARQL interfaces.
+
+Roadmap item 396 retains bounded offline reference replay and selected source
+mappings. Resolution and projection fixtures are declared expected states. They do
+not compute matches or authenticate decisions. Live ingestion, review and protected
+records require C25 managed operations. Authenticated availability, durable publication
+and maintained results depend on the C27, C26 and F22 runtime contracts. Synthetic
+count examples define no operational health policy or connector.
 
 ### Community reports (GraphRAG)
 

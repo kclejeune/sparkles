@@ -108,7 +108,7 @@ A completed phase does not imply every later extension or compatibility goal is 
 
 | Spec | Summary | Status |
 |---|---|---|
-| [A01](A01-shared-entity-representation/README.md) | Shared entity descriptions, scoped identifiers, reviewed convergence and evolution over evidence and temporal profiles, with domain mappings and replay fixtures | specified |
+| [A01](A01-shared-entity-representation/README.md) | Versioned entity profiles, shapes and fixed cross-domain fixtures over evidence and temporal records. Offline replay, source mappings and managed integration remain. | implemented in part (Phase 1 resources) |
 | [CI](CI-commit-identity.md) | Durable dataset ids, a gap-free commit sequence, commit receipts and headers, `/$/commits` and `sparkles log`, commit messages, change digests, entity tags, the catalog horizon and the change feed | implemented (Phases 1–3) |
 | [C01](C01-observability-and-budgets.md) | Request ids, access log, Prometheus metrics, readiness, OpenTelemetry, memory and result-size budgets, cancellation on disconnect | implemented in part |
 | [C02](C02-schema-discovery.md) | `GET /$/schema/{ds}` with paginated class and predicate listings computed on the server, a VoID export, a SHACL constraints layer, subject classes per predicate, class profiles, schema diffs between commits, reports kept up to date from the changes, shapes drafted from the data, `sparkles schema`, and the UI's schema browser | implemented |
