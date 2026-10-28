@@ -2,6 +2,8 @@
 //! body keeps the members it does not know in `extra`, so a newer server does not break
 //! an older client.
 
+pub mod generated;
+
 use oxrdf::NamedNode;
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};

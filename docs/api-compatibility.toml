@@ -1,0 +1,28 @@
+# X12 Phase 4a. This commit baseline is not a published release.
+schema_version = 1
+enforced = ["http", "cli"]
+pending = ["rust", "bindings", "mcp", "metrics", "cli-json-exit", "deprecation", "release-install"]
+
+[baseline]
+id = "bootstrap-7c533eaa9042"
+kind = "bootstrap"
+source = "7c533eaa9042a456cbb6352bbe3983a4558e7bf7"
+version = "0.1.0"
+released = false
+profile = "standard"
+features = ["reasoning", "shacl", "shex", "mimalloc", "text", "text-cjk-dict", "geo", "geo-epsg", "otel", "auth", "mcp", "memory", "backup", "backup-encryption", "fmt", "tls", "graphql", "pdf", "pdf-ocr", "office", "embed-local", "mapping-sqlite", "mapping-parquet"]
+
+[http]
+path = "docs/openapi-bootstrap-7c533eaa9042.json"
+sha256 = "6b6d4a8e05a59c9ddd812403c21b5a850a208307dec86c212ff9ef23090a4f3a"
+
+# Exact old-only normalization of one malformed bootstrap description.
+[http.legacy_rename_content]
+source = "7c533eaa9042a456cbb6352bbe3983a4558e7bf7"
+baseline_sha256 = "6b6d4a8e05a59c9ddd812403c21b5a850a208307dec86c212ff9ef23090a4f3a"
+pointer = "/paths/~1$~1datasets~1{ds}~1rename/post/responses/200/content"
+expected_shape_sha256 = "99778077da26cc4442473fe8016017bc83e69eca9911fbcec529bf5db46e8448"
+
+[cli]
+path = "testsuite/api/bootstrap-7c533eaa9042/cli-standard.json"
+sha256 = "5819c79c78215147d3a580ea59dc8f9b64ab0187475a747ee85c5e103c09dcd0"

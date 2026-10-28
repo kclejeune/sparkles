@@ -585,6 +585,16 @@ run = [
   "mbx clippy --manifest-path crates/sparkles-node/Cargo.toml --target-dir target --all-targets --no-default-features -- -D warnings",
 ]
 
+[tasks."client:types"]
+description = "Regenerate the Rust client's OpenAPI administration models"
+run = "python3 scripts/client-types.py"
+
+[tasks."client:types:check"]
+sources = ["scripts/client-types.py", "scripts/test-client-types.py", "crates/sparkles-client/src/types/generated.rs", "docs/openapi.json"]
+outputs = []
+description = "Check that the Rust client's generated OpenAPI models are current"
+run = ["python3 scripts/test-client-types.py", "python3 scripts/client-types.py --check"]
+
 [tasks."node:client:gen"]
 tools = { node = "24" }
 description = "Regenerate the remote TypeScript client's OpenAPI types"
@@ -665,6 +675,15 @@ run = "mbx run --release -p sparkles-server -- serve --data ./data"
 [tasks.doc]
 description = "API docs for the library crates"
 run = "mbx doc --workspace --no-deps --exclude sparkles-server"
+
+[tasks."api:check"]
+description = "Check the API baseline inventory, HTTP compatibility and comparator fixtures without compiling Rust"
+sources = ["scripts/api-compat.py", "scripts/api-compat-tests/**", "docs/api-compatibility.toml", "docs/api-breaks.toml", "docs/openapi*.json", "testsuite/api/**", "CHANGELOG.md", "Cargo.toml", "crates/sparkles-server/Cargo.toml"]
+outputs = []
+run = [
+  "python3 -m unittest discover -s scripts/api-compat-tests",
+  "python3 scripts/api-compat.py --check-manifest",
+]
 
 [tasks.openapi]
 description = "Rewrite docs/openapi.json, the checked-in copy of the OpenAPI description (a test fails while it is out of date)"

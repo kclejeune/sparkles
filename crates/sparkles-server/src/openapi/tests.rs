@@ -451,3 +451,21 @@ fn gone_commit_is_optional_and_never_a_nullable_or_sentinel_sequence() {
             .contains("omits `commit`")
     );
 }
+
+/// A real generated description must preserve the selected baseline contract.
+#[test]
+fn compatible_with_api_baseline() {
+    crate::cli_docs::compatibility::compare_current("http", &doc());
+}
+
+#[test]
+fn rename_response_uses_a_media_type_and_preserves_its_wire_members() {
+    let built = doc();
+    let content = &built["paths"]["/$/datasets/{ds}/rename"]["post"]["responses"]["200"]["content"];
+    assert_eq!(content.as_object().unwrap().len(), 1);
+    let schema = &content["application/json"]["schema"];
+    assert_eq!(schema["type"], "object");
+    assert_eq!(schema["required"], json!(["name", "renamedFrom"]));
+    assert_eq!(schema["properties"]["name"]["type"], "string");
+    assert_eq!(schema["properties"]["renamedFrom"]["type"], "string");
+}

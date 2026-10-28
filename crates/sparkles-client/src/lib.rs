@@ -61,6 +61,10 @@ mod types;
 #[cfg(feature = "blocking")]
 pub mod blocking;
 
+/// Generated response models for typed administration calls.
+/// Open objects use JSON maps and string enums remain extensible strings.
+pub use types::generated as admin_types;
+
 pub use body::{RdfBody, UploadPart};
 pub use client::{CallOptions, Client, ClientBuilder, TokenSource};
 pub use dataset::{CommitsOptions, Dataset, UpdateBatch, UploadOptions};

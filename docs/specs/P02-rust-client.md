@@ -534,20 +534,56 @@ would have reflected that load rather than the client.
 - Proactive pacing from the `RateLimit` field (§5.5).
 - `Client::from_env` and `saved_credentials` are not covered by an integration test,
   because they read process-wide environment variables. The file format is tested.
-- A typed `SchemaSummary`, statistics and backups, which stay `serde_json::Value`.
+- The original schema, statistics, stored-query and backup methods retain their
+  `serde_json::Value` signatures. Typed counterparts are recorded below.
 - The change feed, diffs between commits, snapshots, clones, search, reasoning and
   validation calls, which are reachable through `call_json` only.
+
+### Typed administration models
+
+The first item 47 tranche adds `*_typed` counterparts to the eight existing JSON
+administration methods in both async and blocking clients. They expose
+`SchemaSummary`, `DatasetStats`, `FusekiStats`, `StoredQuery`, `StoredQueryList`,
+`BackupList` and `BackupFiles` through `sparkles_client::admin_types`. Existing method
+signatures and `call_json` remain unchanged. The routes already have operation entries,
+and their typed response schemas join the existing contract checks.
+
+`mise run client:types` generates checked-in response models from the selected
+OpenAPI schemas and their references. The generator has no build-time role. It retains
+unknown members, leaves open objects as JSON maps and treats enum strings as extensible.
+Nullable fields use `Option`, and optional fields are omitted during serialization
+when absent. Integer fields use `i128` to retain signed and unsigned 64-bit JSON
+integers. `BackupList` keeps both OpenAPI alternatives and tries the more specific
+dataset listing first. Generated models represent shapes rather than enforce schema
+bounds, enum choices or string formats.
+
+The generator checks unsupported shapes and naming collisions. Its selected-schema
+digest makes contract changes visible even when they do not alter a Rust field type.
+The local gate checks regeneration and generator edge cases, and the client contract
+suite checks the generated file, required and full schema samples and route mappings.
+HTTP fixtures cover all eight calls in async and blocking form, encoded paths, point-in-time
+parameters, JSON schema negotiation, stored-query bodies, malformed responses,
+unknown members, nullable backup metadata, list alternatives and integer boundaries.
+These fixtures need no credentials or server executable.
+
+The added methods and public types extend the Rust client API. They do not change HTTP
+or CLI contracts. Item 60's independent HTTP and CLI compatibility work does not freeze
+these new Rust signatures. Rust library compatibility remains under its library phase.
+No performance claim or benchmark result accompanies this tranche.
+
+Item 47 remains open for the remaining typed administration methods, opt-in pacing and
+isolated credential integration tests described below.
 
 ### Roadmap follow-ups (2026-10-12)
 
 **Typed admin calls, rate-limit pacing and credential tests** (item 47, Tier 5,
 [ROADMAP](../ROADMAP.md)).
 
-* **What is missing today.** `routes.rs` still holds 31 operations, against 264
-  operations on 165 paths in `docs/openapi.json`. `Client::stats` and `backup_files`
-  (`admin.rs`) and `Dataset::stats`, `schema`, `backups`, `stored_queries`,
-  `stored_query` and `put_stored_query` (`dataset.rs`) return `serde_json::Value`. The
-  change feed, diffs, snapshots, clones, search, reasoning, validation, branches and
+* **What remains.** `routes.rs` holds the operations the client calls. The original
+  `Client::stats` and `backup_files` and `Dataset::stats`, `schema`, `backups`,
+  `stored_queries`, `stored_query` and `put_stored_query` retain their JSON signatures.
+  Their additive `*_typed` counterparts cover the first group of generated models.
+  The change feed, diffs, snapshots, clones, search, reasoning, validation, branches and
   settings are reachable through `call_json` only. `RateLimit` is parsed
   (`retry.rs`) and used to wait after a `429`, but never before one. `from_env` and
   `saved_credentials` have no integration test.
