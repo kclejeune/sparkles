@@ -466,14 +466,14 @@ mod tests {
             Some("boolean") => json!(true),
             Some("null") => Value::Null,
             Some("array") => {
-                if depth > 4 {
+                if depth > 16 {
                     return json!([]);
                 }
                 json!([sample(doc, &s["items"], all, depth + 1)])
             }
             _ => {
                 let mut m = Map::new();
-                if depth > 4 {
+                if depth > 16 {
                     return Value::Object(m);
                 }
                 let required: BTreeSet<&str> = s["required"]
@@ -519,6 +519,14 @@ mod tests {
         check::<Whoami>(&doc, "Whoami");
         check::<CommitResponse>(&doc, "CommitResponse");
         check::<DatasetList>(&doc, "DatasetList");
+        use crate::admin_types::*;
+        check::<SchemaSummary>(&doc, "SchemaSummary");
+        check::<DatasetStats>(&doc, "DatasetStats");
+        check::<FusekiStats>(&doc, "FusekiStats");
+        check::<StoredQuery>(&doc, "StoredQuery");
+        check::<StoredQueryList>(&doc, "StoredQueryList");
+        check::<BackupList>(&doc, "BackupList");
+        check::<BackupFiles>(&doc, "BackupFiles");
     }
 
     /// The schema of an operation's first 2xx response: `Name`, or `[Name]` for an array.
@@ -560,9 +568,33 @@ mod tests {
             (&LIST_DATASETS, "DatasetList"),
             (&SERVER, "ServerInfo"),
             (&WHOAMI, "Whoami"),
+            (&SCHEMA, "SchemaSummary"),
+            (&DATASET_STATS, "DatasetStats"),
+            (&SERVER_STATS, "FusekiStats"),
+            (&LIST_STORED, "StoredQueryList"),
+            (&GET_STORED, "StoredQuery"),
+            (&PUT_STORED, "StoredQuery"),
+            (&DATASET_BACKUPS, "BackupList"),
+            (&BACKUP_FILES, "BackupFiles"),
         ] {
             assert_eq!(response_schema(&doc, op), schema, "{}", op.id);
         }
+    }
+
+    #[test]
+    fn generated_admin_models_are_current() {
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+        let result = std::process::Command::new("python3")
+            .arg(root.join("scripts/client-types.py"))
+            .arg("--check")
+            .output()
+            .expect("checking generated admin models requires Python 3 and rustfmt");
+        assert!(
+            result.status.success(),
+            "{}\n{}",
+            String::from_utf8_lossy(&result.stdout),
+            String::from_utf8_lossy(&result.stderr)
+        );
     }
 
     #[test]

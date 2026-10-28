@@ -1,6 +1,7 @@
 //! The server-wide parts of the Sparkles admin API: the server, datasets, tasks, backups
 //! and statistics.
 
+use crate::admin_types::{BackupFiles, FusekiStats};
 use crate::client::{Client, read_bytes, read_json, read_typed};
 use crate::dataset::Dataset;
 use crate::error::Result;
@@ -88,9 +89,21 @@ impl Client {
         read_json(self.send(r).await?).await
     }
 
+    /// Typed form of [`Self::backup_files`], using the checked-in OpenAPI model.
+    pub async fn backup_files_typed(&self) -> Result<BackupFiles> {
+        let r = self.op_req(&routes::BACKUP_FILES, &[])?;
+        read_typed(self.send(r).await?).await
+    }
+
     /// Fuseki's request statistics of every dataset (`GET /$/stats`).
     pub async fn stats(&self) -> Result<Value> {
         let r = self.op_req(&routes::SERVER_STATS, &[])?;
         read_json(self.send(r).await?).await
+    }
+
+    /// Typed form of [`Self::stats`], using the checked-in OpenAPI model.
+    pub async fn stats_typed(&self) -> Result<FusekiStats> {
+        let r = self.op_req(&routes::SERVER_STATS, &[])?;
+        read_typed(self.send(r).await?).await
     }
 }

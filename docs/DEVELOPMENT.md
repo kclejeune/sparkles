@@ -550,6 +550,23 @@ protocol and streaming-parser tests, and its generated administrative types are
 checked against the OpenAPI document. The release workflow builds the native target
 matrix and runs runtime checks. [Releases](#releases) describes publication to npm.
 
+## Rust HTTP client models
+
+`mise run client:types` regenerates the checked-in administration models in
+`crates/sparkles-client/src/types/generated.rs` from `docs/openapi.json`.
+`mise run client:types:check` checks the generator's schema edge cases and verifies
+that the generated file is current. The local gate runs that check, and the client's
+route contract tests also check regeneration. These development checks require
+Python 3 and the pinned toolchain's rustfmt. Library builds do not run the generator
+or read the OpenAPI file.
+
+The generator follows the selected models' references and records a digest of those
+schemas in its output. Unsupported schema shapes fail generation. Response models
+keep unknown object members, open JSON maps and extensible strings for enums.
+The additive methods preserve the existing JSON methods and `call_json`. Their
+public models and method signatures are part of the Rust client API to assess under
+release engineering's remaining library compatibility work.
+
 ## Benchmark scripts
 
 [BENCHMARKING.md](BENCHMARKING.md) documents the harnesses, modes, outputs and

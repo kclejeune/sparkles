@@ -14,6 +14,9 @@
 //! # Ok::<(), sparkles_client::Error>(())
 //! ```
 
+use crate::admin_types::{
+    BackupFiles, BackupList, DatasetStats, FusekiStats, SchemaSummary, StoredQuery, StoredQueryList,
+};
 use crate::error::{Error, Result};
 use crate::{
     At, CommitList, CommitsOptions, DatasetInfo, DatasetType, Graph, QueryOptions, QuerySolution,
@@ -125,8 +128,16 @@ impl Client {
     pub fn backup_files(&self) -> Result<Value> {
         self.wait(self.inner.backup_files())
     }
+    /// Typed form of [`Self::backup_files`].
+    pub fn backup_files_typed(&self) -> Result<BackupFiles> {
+        self.wait(self.inner.backup_files_typed())
+    }
     pub fn stats(&self) -> Result<Value> {
         self.wait(self.inner.stats())
+    }
+    /// Typed form of [`Self::stats`].
+    pub fn stats_typed(&self) -> Result<FusekiStats> {
+        self.wait(self.inner.stats_typed())
     }
     pub fn call_json(
         &self,
@@ -330,11 +341,27 @@ impl Dataset {
     pub fn stored_queries(&self) -> Result<Value> {
         self.wait(self.ds().stored_queries())
     }
+    /// Typed form of [`Self::stored_queries`].
+    pub fn stored_queries_typed(&self) -> Result<StoredQueryList> {
+        self.wait(self.ds().stored_queries_typed())
+    }
     pub fn stored_query(&self, name: &str) -> Result<Value> {
         self.wait(self.ds().stored_query(name))
     }
+    /// Typed form of [`Self::stored_query`].
+    pub fn stored_query_typed(&self, name: &str) -> Result<StoredQuery> {
+        self.wait(self.ds().stored_query_typed(name))
+    }
     pub fn put_stored_query(&self, name: &str, definition: &Value) -> Result<Value> {
         self.wait(self.ds().put_stored_query(name, definition))
+    }
+    /// Typed form of [`Self::put_stored_query`].
+    pub fn put_stored_query_typed(
+        &self,
+        name: &str,
+        definition: &StoredQuery,
+    ) -> Result<StoredQuery> {
+        self.wait(self.ds().put_stored_query_typed(name, definition))
     }
     pub fn delete_stored_query(&self, name: &str) -> Result<()> {
         self.wait(self.ds().delete_stored_query(name))
@@ -351,11 +378,23 @@ impl Dataset {
     pub fn stats(&self, at: Option<At>) -> Result<Value> {
         self.wait(self.ds().stats(at))
     }
+    /// Typed form of [`Self::stats`].
+    pub fn stats_typed(&self, at: Option<At>) -> Result<DatasetStats> {
+        self.wait(self.ds().stats_typed(at))
+    }
     pub fn schema(&self, at: Option<At>) -> Result<Value> {
         self.wait(self.ds().schema(at))
     }
+    /// Typed form of [`Self::schema`].
+    pub fn schema_typed(&self, at: Option<At>) -> Result<SchemaSummary> {
+        self.wait(self.ds().schema_typed(at))
+    }
     pub fn backups(&self) -> Result<Value> {
         self.wait(self.ds().backups())
+    }
+    /// Typed form of [`Self::backups`].
+    pub fn backups_typed(&self) -> Result<BackupList> {
+        self.wait(self.ds().backups_typed())
     }
     pub fn backup_nquads(&self) -> Result<Task> {
         self.wait(self.ds().backup_nquads())

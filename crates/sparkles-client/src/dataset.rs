@@ -2,6 +2,7 @@
 //! [`Endpoint`] plus uploads, batches, stored queries, commits, statistics, the schema
 //! report and backups.
 
+use crate::admin_types::{BackupList, DatasetStats, SchemaSummary, StoredQuery, StoredQueryList};
 use crate::body::UploadPart;
 use crate::client::{CallOptions, Client, ReqBody, call_options, read_json, read_typed};
 use crate::endpoint::{Endpoint, QueryOptions, UpdateOptions, WriteCommon, receipt};
@@ -316,12 +317,26 @@ impl Dataset {
         read_json(self.client.send(r).await?).await
     }
 
+    /// Typed form of [`Self::stored_queries`], using the checked-in OpenAPI model.
+    pub async fn stored_queries_typed(&self) -> Result<StoredQueryList> {
+        let r = self.client.op_req(&routes::LIST_STORED, &self.params())?;
+        read_typed(self.client.send(r).await?).await
+    }
+
     /// A stored query's definition (`GET /$/queries/{ds}/{name}`).
     pub async fn stored_query(&self, name: &str) -> Result<Value> {
         let r = self
             .client
             .op_req(&routes::GET_STORED, &[("ds", &self.name), ("name", name)])?;
         read_json(self.client.send(r).await?).await
+    }
+
+    /// Typed form of [`Self::stored_query`], using the checked-in OpenAPI model.
+    pub async fn stored_query_typed(&self, name: &str) -> Result<StoredQuery> {
+        let r = self
+            .client
+            .op_req(&routes::GET_STORED, &[("ds", &self.name), ("name", name)])?;
+        read_typed(self.client.send(r).await?).await
     }
 
     /// Store a query's definition as its next version (`PUT /$/queries/{ds}/{name}`).
@@ -331,6 +346,21 @@ impl Dataset {
             .op_req(&routes::PUT_STORED, &[("ds", &self.name), ("name", name)])?;
         r.body(ReqBody::json(definition));
         read_json(self.client.send(r).await?).await
+    }
+
+    /// Typed form of [`Self::put_stored_query`], using the checked-in OpenAPI model.
+    pub async fn put_stored_query_typed(
+        &self,
+        name: &str,
+        definition: &StoredQuery,
+    ) -> Result<StoredQuery> {
+        let mut r = self
+            .client
+            .op_req(&routes::PUT_STORED, &[("ds", &self.name), ("name", name)])?;
+        r.body(ReqBody::json(
+            &serde_json::to_value(definition).map_err(|e| Error::parse("JSON", e))?,
+        ));
+        read_typed(self.client.send(r).await?).await
     }
 
     /// Remove a stored query and its versions.
@@ -387,6 +417,15 @@ impl Dataset {
         read_json(self.client.send(r).await?).await
     }
 
+    /// Typed form of [`Self::stats`], using the checked-in OpenAPI model.
+    pub async fn stats_typed(&self, at: Option<At>) -> Result<DatasetStats> {
+        let mut r = self.client.op_req(&routes::DATASET_STATS, &self.params())?;
+        if let Some(a) = at {
+            r.param("at", a.to_string());
+        }
+        read_typed(self.client.send(r).await?).await
+    }
+
     /// The schema report: classes and predicates with their counts and declarations
     /// (`GET /$/schema/{ds}`).
     pub async fn schema(&self, at: Option<At>) -> Result<Value> {
@@ -398,12 +437,30 @@ impl Dataset {
         read_json(self.client.send(r).await?).await
     }
 
+    /// Typed form of [`Self::schema`], using the checked-in OpenAPI model.
+    pub async fn schema_typed(&self, at: Option<At>) -> Result<SchemaSummary> {
+        let mut r = self.client.op_req(&routes::SCHEMA, &self.params())?;
+        if let Some(a) = at {
+            r.param("at", a.to_string());
+        }
+        r.accept = Some("application/json");
+        read_typed(self.client.send(r).await?).await
+    }
+
     /// The dataset's backups in the backup repositories (`GET /$/backups/{ds}`).
     pub async fn backups(&self) -> Result<Value> {
         let r = self
             .client
             .op_req(&routes::DATASET_BACKUPS, &self.params())?;
         read_json(self.client.send(r).await?).await
+    }
+
+    /// Typed form of [`Self::backups`], using the checked-in OpenAPI model.
+    pub async fn backups_typed(&self) -> Result<BackupList> {
+        let r = self
+            .client
+            .op_req(&routes::DATASET_BACKUPS, &self.params())?;
+        read_typed(self.client.send(r).await?).await
     }
 
     /// Start Fuseki's N-Quads backup into the server's `backups` directory

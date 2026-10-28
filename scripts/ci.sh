@@ -37,10 +37,10 @@ main() {
   full=(
     fmt:check ui:fmt:check node:fmt:check lint:shell lint:doc-paths api:check test:bench-scripts
     lint ui:check fmt:wasm py:lint jvm:lint node:lint
-    test ui:test
+    test ui:test client:types:check
     py:test jvm:rust-test jvm:test node:test node:client:check licenses:check
   )
-  fast=(fmt:check lint:shell lint:doc-paths api:check lint test)
+  fast=(fmt:check lint:shell lint:doc-paths api:check client:types:check lint test)
 
   jobs=2
   fail_fast=

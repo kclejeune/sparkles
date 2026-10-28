@@ -45,8 +45,10 @@ retained writers and finishes pending output, then propagates the original unwin
   speaks the SPARQL 1.1 Protocol and the Graph Store Protocol to Sparkles, Fuseki,
   QLever, Oxigraph or Wikidata and streams results as `oxrdf` terms. On a Sparkles server
   it adds point-in-time reads, stored queries, uploads, batches, commits, datasets, tasks,
-  backups, statistics and the schema report. It retries as `Retry-After` and `RateLimit`
-  direct, and never repeats a write whose outcome is unknown.
+  backups, statistics and the schema report. The `*_typed` methods read generated models
+  for schema reports, server and dataset statistics, stored queries and backup listings.
+  The existing JSON methods keep their signatures. It retries as `Retry-After` and
+  `RateLimit` direct, and never repeats a write whose outcome is unknown.
 
 The [API compatibility policy](../DEVELOPMENT.md#api-compatibility) identifies the
 covered package roots and version rules. HTTP and standard CLI development-baseline
@@ -57,6 +59,13 @@ roadmap item 60. Native libraries and JVM JARs must still have matching versions
 
 These limits name the roadmap items that address them. Current priorities and
 dependencies are recorded in the [central roadmap](../ROADMAP.md).
+
+### Rust HTTP client
+
+The remaining administration routes use `call_json`. Typed change feeds, diffs,
+snapshots, clones, branches, merges, search, reasoning, validation and settings remain
+under roadmap item 47. Proactive rate-limit pacing and isolated integration tests for
+environment and saved credentials remain under the same item.
 
 ### Bindings and packaging
 
@@ -80,9 +89,20 @@ or library workflows. Exact HTTP contracts remain in the API reference.
 * Read [JavaScript and TypeScript](../USAGE.md#javascript-and-typescript).
 * Read [Rust client](../USAGE.md#rust-client).
 
+For example, `dataset.schema_typed(None).await?` returns
+`sparkles_client::admin_types::SchemaSummary`, and
+`dataset.stats_typed(None).await?` returns `DatasetStats`. The blocking client exposes
+the same methods. `put_stored_query_typed` accepts a `StoredQuery` model and returns
+the stored definition. Generated objects retain unknown members in `extra`, and open
+objects retain JSON maps. String enums remain strings so new server values remain
+readable. Integer fields use `i128` to retain signed and unsigned 64-bit JSON integers.
+Models represent response shapes and do not validate schema bounds or enum values.
+`BackupList` uses an untagged enum for pages and dataset listings, with the dataset
+listing tried first.
+
 ## Roadmap
 
-The remaining work described above refers to [item 25](../ROADMAP.md), [item 44](../ROADMAP.md), [item 58](../ROADMAP.md) and [item 60](../ROADMAP.md).
+The remaining work described above refers to [item 25](../ROADMAP.md), [item 44](../ROADMAP.md), [item 47](../ROADMAP.md), [item 58](../ROADMAP.md) and [item 60](../ROADMAP.md).
 The central roadmap owns priority and dependencies. Its
 [completion paths](../ROADMAP.md#completion-paths-for-partially-complete-specs)
 link partially complete specs to their remaining work and acceptance criteria.

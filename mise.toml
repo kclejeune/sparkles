@@ -585,6 +585,16 @@ run = [
   "mbx clippy --manifest-path crates/sparkles-node/Cargo.toml --target-dir target --all-targets --no-default-features -- -D warnings",
 ]
 
+[tasks."client:types"]
+description = "Regenerate the Rust client's OpenAPI administration models"
+run = "python3 scripts/client-types.py"
+
+[tasks."client:types:check"]
+sources = ["scripts/client-types.py", "scripts/test-client-types.py", "crates/sparkles-client/src/types/generated.rs", "docs/openapi.json"]
+outputs = []
+description = "Check that the Rust client's generated OpenAPI models are current"
+run = ["python3 scripts/test-client-types.py", "python3 scripts/client-types.py --check"]
+
 [tasks."node:client:gen"]
 tools = { node = "24" }
 description = "Regenerate the remote TypeScript client's OpenAPI types"
