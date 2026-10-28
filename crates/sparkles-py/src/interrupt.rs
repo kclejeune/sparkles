@@ -29,6 +29,7 @@ const CALLER_SPIN: Duration = Duration::from_micros(200);
 #[pyclass(frozen, module = "sparkles", name = "CancelToken", skip_from_py_object)]
 pub struct PyCancelToken {
     pub flag: Arc<AtomicBool>,
+    pub(crate) additional: Option<sparkles::task::Cancellation>,
 }
 
 #[pymethods]
@@ -37,6 +38,7 @@ impl PyCancelToken {
     fn new() -> Self {
         PyCancelToken {
             flag: Arc::new(AtomicBool::new(false)),
+            additional: None,
         }
     }
 
@@ -48,6 +50,25 @@ impl PyCancelToken {
     #[getter]
     fn cancelled(&self) -> bool {
         self.flag.load(Ordering::Relaxed)
+            || self
+                .additional
+                .as_ref()
+                .is_some_and(|sources| sources.check().is_err())
+    }
+
+    /// Internal async plumbing: combine flags without mutating a caller's token.
+    fn _with_cancel(&self, other: PyRef<'_, PyCancelToken>) -> Self {
+        let mut additional = sparkles::task::Cancellation::from_flags([other.flag.clone()]);
+        if let Some(sources) = &self.additional {
+            additional = additional.combine(sources);
+        }
+        if let Some(sources) = &other.additional {
+            additional = additional.combine(sources);
+        }
+        Self {
+            flag: self.flag.clone(),
+            additional: Some(additional),
+        }
     }
 
     fn __repr__(&self) -> String {
@@ -64,6 +85,21 @@ pub fn flag(token: Option<&Bound<'_, PyAny>>) -> PyResult<Arc<AtomicBool>> {
             .map_err(|_| pyo3::exceptions::PyTypeError::new_err("cancel must be a CancelToken"))?
             .get()
             .flag
+            .clone()),
+    }
+}
+
+/// Additional async-owned/caller cancellation sources, absent for ordinary tokens.
+pub(crate) fn additional(
+    token: Option<&Bound<'_, PyAny>>,
+) -> PyResult<Option<sparkles::task::Cancellation>> {
+    match token.filter(|token| !token.is_none()) {
+        None => Ok(None),
+        Some(token) => Ok(token
+            .cast::<PyCancelToken>()
+            .map_err(|_| pyo3::exceptions::PyTypeError::new_err("cancel must be a CancelToken"))?
+            .get()
+            .additional
             .clone()),
     }
 }

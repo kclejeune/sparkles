@@ -117,6 +117,7 @@ impl PyStoredQueries {
                             py,
                             crate::interrupt::PyCancelToken {
                                 flag: ctl.cancel.flag(),
+                                additional: None,
                             },
                         )?,
                     )?;

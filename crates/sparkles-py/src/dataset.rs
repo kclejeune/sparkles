@@ -124,6 +124,7 @@ pub fn query_options(args: &QueryArgs<'_>) -> PyResult<(QueryOptions, Option<At>
         max_memory_bytes: args.max_memory_bytes,
         max_rows_produced: args.max_rows_produced,
         cancel: Some(interrupt::flag(args.cancel.as_ref())?),
+        cancellation: interrupt::additional(args.cancel.as_ref())?,
         ..Default::default()
     };
     if let Some(b) = &args.bindings {
@@ -1108,6 +1109,34 @@ impl PyDataset {
     fn transaction(&self, py: Python<'_>) -> PyResult<PyTransaction> {
         let ds = self.ds_for_write(py)?;
         PyTransaction::begin(py, ds, self.writer.clone())
+    }
+
+    /// Internal async admission path using existing controlled transaction semantics.
+    #[pyo3(signature = (cancel, *, timeout = None))]
+    fn _transaction(
+        &self,
+        py: Python<'_>,
+        cancel: Bound<'_, PyAny>,
+        timeout: Option<f64>,
+    ) -> PyResult<PyTransaction> {
+        let ds = self.ds_for_write(py)?;
+        let deadline = timeout
+            .map(|seconds| {
+                let duration = std::time::Duration::try_from_secs_f64(seconds).map_err(|_| {
+                    crate::errors::invalid(py, "timeout must be finite and nonnegative")
+                })?;
+                std::time::Instant::now()
+                    .checked_add(duration)
+                    .ok_or_else(|| crate::errors::invalid(py, "timeout is too large"))
+            })
+            .transpose()?;
+        let options = sparkles::guard::WriteOptions {
+            cancel: Some(interrupt::flag(Some(&cancel))?),
+            cancellation: interrupt::additional(Some(&cancel))?,
+            deadline,
+            ..Default::default()
+        };
+        PyTransaction::begin_with(py, ds, self.writer.clone(), options)
     }
 
     // ----------------------------------------------------------- output, admin ----
