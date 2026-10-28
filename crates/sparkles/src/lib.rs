@@ -25,6 +25,7 @@ pub mod handles;
 pub mod overview;
 pub mod querybuilder;
 pub mod reasoning;
+pub mod shared_entity;
 pub mod stats;
 pub mod syntax;
 pub mod terms;
