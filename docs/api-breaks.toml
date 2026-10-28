@@ -1,0 +1,3 @@
+# Exact reviewed differences only. See DEVELOPMENT.md#api-compatibility.
+schema_version = 1
+entry = []

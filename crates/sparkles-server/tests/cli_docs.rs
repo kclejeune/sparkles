@@ -80,3 +80,9 @@ fn openapi_document() {
     let y = run(&["openapi", "--format", "yaml"]);
     assert!(out(&y).contains("\nopenapi: \"3.1.0\"\n"));
 }
+
+#[test]
+fn help_and_unknown_option_exit_codes() {
+    assert_eq!(run(&["--help"]).status.code(), Some(0));
+    assert_eq!(run(&["--item60-unknown-option"]).status.code(), Some(2));
+}

@@ -25968,19 +25968,23 @@
         "responses": {
           "200": {
             "content": {
-              "properties": {
-                "name": {
-                  "type": "string"
-                },
-                "renamedFrom": {
-                  "type": "string"
+              "application/json": {
+                "schema": {
+                  "properties": {
+                    "name": {
+                      "type": "string"
+                    },
+                    "renamedFrom": {
+                      "type": "string"
+                    }
+                  },
+                  "required": [
+                    "name",
+                    "renamedFrom"
+                  ],
+                  "type": "object"
                 }
-              },
-              "required": [
-                "name",
-                "renamedFrom"
-              ],
-              "type": "object"
+              }
             },
             "description": "Renamed."
           },

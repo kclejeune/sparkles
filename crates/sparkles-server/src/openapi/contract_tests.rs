@@ -717,3 +717,35 @@ async fn backup_answers(doc: &J, app: &axum::Router) {
     assert!(j["state"]["lastRun"].is_object(), "{j}");
     c("GET", "/$/backup-policies", "/$/backup-policies", None).await;
 }
+
+#[tokio::test]
+async fn rename_response_matches_the_corrected_media_schema() {
+    let dir = tempfile::tempdir().unwrap();
+    let st =
+        Arc::new(AppState::new(dir.path(), Default::default(), Duration::from_secs(30)).unwrap());
+    let ds = st
+        .catalog
+        .create(
+            "old",
+            &sparkles::catalog::CreateDataset {
+                kind: DbType::Persistent,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+    // As in the rename route tests, exclude temporary view-maintenance handles.
+    ds.inner_state().views.close(ds.store());
+    drop(ds);
+    let app = crate::http::router(st);
+    let answer = checked(
+        &build("0.0.0"),
+        &app,
+        "POST",
+        "/$/datasets/{ds}/rename",
+        "/$/datasets/old/rename",
+        Some(json!({"name": "new"})),
+    )
+    .await;
+    assert_eq!(answer["name"], "new");
+    assert_eq!(answer["renamedFrom"], "old");
+}

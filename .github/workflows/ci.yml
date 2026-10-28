@@ -104,7 +104,9 @@ jobs:
     timeout-minutes: 20
     runs-on: ubuntu-24.04
     steps:
+      # The fixed bootstrap source and trusted base need complete ancestry proof.
       - uses: actions/checkout@v5
+        with: { fetch-depth: 0 }
       # rustfmt for the formatting check and rustc for the crash harness's tests
       - uses: actions-rust-lang/setup-rust-toolchain@v1
         with: { cache: false, rustflags: "" }
@@ -125,6 +127,15 @@ jobs:
       - name: Cited doc paths (mise run lint:doc-paths)
         if: ${{ !cancelled() }}
         run: python3 scripts/check-doc-paths.py --code
+      - name: API compatibility inventory and fixtures
+        if: ${{ !cancelled() }}
+        env:
+          API_BASE_REF: ${{ github.event.pull_request.base.sha || github.event.before }}
+        run: |
+          mise run api:check
+          if [ -n "$API_BASE_REF" ]; then
+            python3 scripts/api-compat.py --check-manifest --base-ref "$API_BASE_REF"
+          fi
       - name: Benchmark scripts and crash harness (mise run test:bench-scripts)
         if: ${{ !cancelled() }}
         run: |

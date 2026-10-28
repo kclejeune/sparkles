@@ -830,8 +830,8 @@ fn datasets(p: &mut Paths) {
             .body(true, "The new name.", json!({"application/json": {"schema": {
                 "type": "object", "required": ["name"], "properties": {"name": {"type": "string"}}
             }}}))
-            .resp("200", "Renamed.", Some(json!({"type": "object", "required": ["name", "renamedFrom"],
-                "properties": {"name": {"type": "string"}, "renamedFrom": {"type": "string"}}})))
+            .json_inline("200", "Renamed.", json!({"type": "object", "required": ["name", "renamedFrom"],
+                "properties": {"name": {"type": "string"}, "renamedFrom": {"type": "string"}}}))
             .errors(&[400, 409]),
     );
     p.add(

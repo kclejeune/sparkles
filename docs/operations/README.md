@@ -145,6 +145,16 @@ each stated scope.
   flight `--shutdown-grace` seconds to finish. It then cancels the rest, and a cancelled
   write commits nothing.
 
+### API compatibility
+
+The [compatibility policy](../DEVELOPMENT.md#api-compatibility) covers HTTP, CLI and
+public library APIs. HTTP descriptions and the standard CLI command tree are checked
+against a development commit baseline. That baseline does not represent a published
+release. Existing router, authorization, response and protocol tests remain separate.
+Library and binding comparisons, CLI JSON and exit-code coverage, MCP and metrics
+guards, deprecation signals and released-artifact checks remain under roadmap item 60.
+The on-disk reader window remains separate from API compatibility.
+
 ## Known gaps
 
 The [server, security and operations gaps](../server/README.md#server-access-control-and-operations)
