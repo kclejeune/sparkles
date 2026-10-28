@@ -1029,8 +1029,12 @@ One shared traversal distinguishes schemas, named schema maps, named data maps a
 literal values. Schema annotations are ignored only at schema positions. Names such
 as `default` and `$ref` remain data in `dependentRequired` and other named maps.
 Known schema positions follow local references, including recursive targets.
+Covered map value schemas are compared even when their reference text is unchanged.
 OpenAPI schemas and reference objects use their declared container positions, while
 example values, link parameters and OAuth scope names remain literal data.
+Specification Extensions in Paths, Responses and Callback objects retain an opaque
+extension context. Component names, property names, header names, callback names and
+OAuth scopes retain their meaning when they begin with `x-`.
 Ambiguous reference-shaped structures under unknown keywords fail as unsupported
 contexts. Dynamic references, schema resource identifiers and other schema dialects
 also fail explicitly. These refusals do not establish compatibility.
@@ -1062,7 +1066,9 @@ Use a mise task that holds the managed-target lease for any capture workflow tha
 launches compiled files separately. Ordinary `mbx test` holds its own lease.
 
 Phase 4a enforces HTTP and standard CLI development-baseline checks only. Rust and
-binding release comparisons remain Phase 4b. Phase 4c retains CLI JSON and exit-code
+binding release comparisons remain Phase 4b. The HTTP guard starts from documented
+operations. Unused generated component declarations and their public `.d.ts` types
+remain part of the binding comparison gate in Phase 4b. Phase 4c retains CLI JSON and exit-code
 coverage, MCP and metrics guards, deprecation signaling, release baselines and
 installed-artifact checks. Roadmap item 60 stays open. Items 58 and 59 own publication
 and additional platforms. No released artifact or platform guarantee follows merely

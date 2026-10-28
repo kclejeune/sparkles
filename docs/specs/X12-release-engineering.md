@@ -830,6 +830,13 @@ contain 666 command nodes with a maximum depth of four. The original capture and
 validation receipts are preserved separately. This remains an unpublished source
 bootstrap, with no production parser or command behavior changed.
 
+HTTP comparison starts from documented operations and follows map value schemas even
+when their reference text is unchanged. Unused generated component declarations and
+their public `.d.ts` compatibility remain part of the binding gate in Phase 4b.
+Specification Extensions in Paths, Responses and Callback objects use an opaque
+extension context. Component names, property names, header names, callback names and
+OAuth scopes retain their meaning when they begin with `x-`.
+
 The cheap API task checks the inventory, source identity and HTTP description. Rust
 unit tests compare the generated description and standard command tree, while stripped
 profiles retain serializer checks without claiming standard-profile compatibility.

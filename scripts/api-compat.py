@@ -42,10 +42,10 @@ SCHEMA_DIALECTS = frozenset({'https://json-schema.org/draft/2020-12/schema', 'ht
 # These contexts locate actual schemas and OpenAPI reference objects. Other object
 # fields retain opaque data, unless an explicitly literal field permits any value.
 OPENAPI_CONTEXTS = {
-    'document': {'paths': 'map:path-item', 'webhooks': 'map:path-item', 'components': 'components'},
+    'document': {'paths': 'paths', 'webhooks': 'map:path-item', 'components': 'components'},
     'components': {'schemas': 'map:schema', 'parameters': 'map:parameter', 'headers': 'map:header', 'requestBodies': 'map:request-body', 'responses': 'map:response', 'pathItems': 'map:path-item', 'callbacks': 'map:callback', 'links': 'map:link', 'examples': 'map:example', 'securitySchemes': 'map:security-scheme'},
     'path-item': {**dict.fromkeys(METHODS, 'operation'), 'parameters': 'list:parameter'},
-    'operation': {'parameters': 'list:parameter', 'requestBody': 'request-body', 'responses': 'map:response', 'callbacks': 'map:callback'},
+    'operation': {'parameters': 'list:parameter', 'requestBody': 'request-body', 'responses': 'responses', 'callbacks': 'map:callback'},
     'parameter': {'schema': 'schema', 'content': 'map:media', 'examples': 'map:example'},
     'header': {'schema': 'schema', 'content': 'map:media', 'examples': 'map:example'},
     'request-body': {'content': 'map:media'},
@@ -54,6 +54,7 @@ OPENAPI_CONTEXTS = {
     'encoding': {'headers': 'map:header'},
     'link': {}, 'example': {}, 'security-scheme': {},
 }
+OPENAPI_PATTERNED_CONTEXTS = {'paths': 'path-item', 'responses': 'response', 'callback': 'path-item'}
 OPENAPI_REF_CONTEXTS = frozenset({'path-item', 'parameter', 'header', 'request-body', 'response', 'callback', 'link', 'example', 'security-scheme'})
 OPENAPI_LITERAL_FIELDS = {
     'document': {'security', 'servers'}, 'operation': {'security', 'servers'},
@@ -114,6 +115,17 @@ def opaque_data(value):
         for child in value:
             opaque_data(child)
     return value
+
+
+def openapi_patterned_entries(value):
+    """Separate extensions from entries in Paths, Responses and Callback objects."""
+    if not isinstance(value, dict):
+        raise InputError('OpenAPI patterned container must be an object')
+    for name, child in value.items():
+        if name.startswith('x-'):
+            opaque_data(child)
+        else:
+            yield name, child
 
 
 def schema_tree(value, context='schema', on_ref=None):
@@ -226,9 +238,9 @@ class Schemas:
                     return
                 seen.add(key)
                 value = resolved
-            if context == 'callback':
-                for child in value.values():
-                    visit(child, 'path-item')
+            if context in OPENAPI_PATTERNED_CONTEXTS:
+                for _, child in openapi_patterned_entries(value):
+                    visit(child, OPENAPI_PATTERNED_CONTEXTS[context])
                 return
             fields = OPENAPI_CONTEXTS[context]
             for key, child in value.items():
@@ -367,13 +379,13 @@ def validate_media_content(resolver):
         obj = resolver.resolve_object(value)
         if 'content' in obj:
             content(obj['content'])
-    for item in resolver.doc.get('paths', {}).values():
+    for _, item in openapi_patterned_entries(resolver.doc.get('paths', {})):
         item = resolver.resolve_object(item)
         for method in METHODS & set(item):
             op = item[method]
             if 'requestBody' in op:
                 body(op['requestBody'])
-            for response in op.get('responses', {}).values():
+            for _, response in openapi_patterned_entries(op.get('responses', {})):
                 body(response)
             for parameter in item.get('parameters', []) + op.get('parameters', []):
                 body(parameter)
@@ -470,8 +482,9 @@ class HttpDiff:
             widening = oa is False and na is not False or isinstance(oa, dict) and na is True
             if direction == 'request' and narrowing or direction == 'response' and widening:
                 self.add(pointer(at, 'additionalProperties'), 'additional-properties')
-            if isinstance(oa, dict) and isinstance(na, dict):
-                self.schema(oa, na, pointer(at, 'additionalProperties'), direction)
+        # Equal raw refs and equal inline schemas may reach changed definitions.
+        if isinstance(oa, dict) and isinstance(na, dict):
+            self.schema(oa, na, pointer(at, 'additionalProperties'), direction)
         for kind in ('anyOf', 'oneOf'):
             a, b = old.get(kind), new.get(kind)
             if kind == 'oneOf' and a is not None and b is not None:
@@ -545,7 +558,7 @@ class HttpDiff:
                 self.add(pointer('', k), 'security-review', 'review')
         if self.old.doc.get('components', {}).get('securitySchemes') != self.new.doc.get('components', {}).get('securitySchemes'):
             self.add('/components/securitySchemes', 'security-review', 'review')
-        for path, item in self.old.doc.get('paths', {}).items():
+        for path, item in openapi_patterned_entries(self.old.doc.get('paths', {})):
             item = self.old.resolve_object(item)
             new_item = self.new.resolve_object(self.new.doc.get('paths', {}).get(path, {}))
             for method in sorted(METHODS & set(item)):
@@ -595,7 +608,7 @@ class HttpDiff:
                         self.content(ob, nb, pointer(at, 'requestBody'), 'request')
                 elif nb is not None and self.new.resolve_object(nb).get('required', False):
                     self.add(pointer(at, 'requestBody'), 'request-required')
-                for status, response in old.get('responses', {}).items():
+                for status, response in openapi_patterned_entries(old.get('responses', {})):
                     ra = pointer(pointer(at, 'responses'), status)
                     if status not in new.get('responses', {}):
                         self.add(ra, 'status-removed')

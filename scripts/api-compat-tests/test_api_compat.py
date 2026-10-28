@@ -746,6 +746,184 @@ class TraversalContexts(unittest.TestCase):
             api.compare_http(old, copy.deepcopy(old))
 
 
+class MapAndExtensionContracts(unittest.TestCase):
+    def compare(self, before, after, direction='request', targets=None):
+        return ReviewSchemaRegressions.compare(self, before, after, direction, targets=targets)
+
+    def test_equal_additional_properties_refs_follow_request_and_response_targets(self):
+        schema = {'type': 'object', 'additionalProperties': {'$ref': '#/components/schemas/Word'}}
+        for direction in ('request', 'response'):
+            with self.subTest(direction=direction):
+                ds = self.compare(schema, copy.deepcopy(schema), direction, ({'Word': {'type': 'string'}}, {'Word': {'type': 'integer'}}))
+                self.assertTrue(any(d.rule == 'type-incompatible' and d.identity == 'POST /books' and '/additionalProperties/' in d.pointer for d in ds), ds)
+
+    def test_equal_inline_map_value_schema_follows_nested_refs(self):
+        schema = {'additionalProperties': {'properties': {'leaf': {'$ref': '#/components/schemas/Word'}}}}
+        for direction in ('request', 'response'):
+            with self.subTest(direction=direction):
+                ds = self.compare(schema, copy.deepcopy(schema), direction, ({'Word': {'enum': ['a', 'b']}}, {'Word': {'enum': ['a']}}))
+                self.assertTrue(any(d.rule == 'enum-incompatible' and d.pointer.endswith('/additionalProperties/properties/leaf/enum') for d in ds), ds)
+
+    def test_map_value_boolean_numeric_enum_difference_is_not_raw_equality(self):
+        for direction in ('request', 'response'):
+            with self.subTest(direction=direction):
+                ds = self.compare({'additionalProperties': {'enum': [True]}}, {'additionalProperties': {'enum': [1]}}, direction)
+                self.assertTrue(any(d.rule == 'enum-incompatible' for d in ds), ds)
+
+    def test_recursive_additional_properties_terminates_and_detects_member_deletion(self):
+        schema = {'additionalProperties': {'$ref': '#/components/schemas/Word'}}
+        old = {'Word': {'properties': {'value': {'type': 'string'}}, 'additionalProperties': {'$ref': '#/components/schemas/Word'}}}
+        new = copy.deepcopy(old)
+        del new['Word']['properties']['value']
+        ds = self.compare(schema, copy.deepcopy(schema), targets=(old, new))
+        self.assertTrue(any(d.rule == 'member-removed' and d.pointer.endswith('/properties/value') for d in ds), ds)
+        self.assertLess(len(ds), 10)
+        self.assertEqual(self.compare(schema, copy.deepcopy(schema), targets=(old, copy.deepcopy(old))), [])
+
+    def test_map_value_experimental_exclusions_still_use_baseline_only(self):
+        schema = {'additionalProperties': {'$ref': '#/components/schemas/Word'}}
+        old = {'Word': {'type': 'string', 'x-sparkles-experimental': True}}
+        self.assertEqual(self.compare(schema, copy.deepcopy(schema), targets=(old, {'Word': {'type': 'integer'}})), [])
+        ds = self.compare(schema, copy.deepcopy(schema), targets=({'Word': {'type': 'string'}}, {'Word': {'type': 'integer', 'x-sparkles-experimental': True}}))
+        self.assertTrue(any(d.rule == 'type-incompatible' for d in ds), ds)
+
+    def test_existing_boolean_and_schema_map_direction_rules_are_preserved(self):
+        word = {'type': 'string'}
+        cases = [('request', True, False, True), ('request', True, word, True), ('request', word, False, True), ('request', False, True, False), ('request', False, word, False), ('request', word, True, False), ('response', False, True, True), ('response', False, word, True), ('response', word, True, True), ('response', True, False, False), ('response', True, word, False), ('response', word, False, False)]
+        for direction, old, new, incompatible in cases:
+            with self.subTest(direction=direction, old=old, new=new):
+                ds = self.compare({'additionalProperties': old}, {'additionalProperties': new}, direction)
+                self.assertEqual(any(d.rule == 'additional-properties' for d in ds), incompatible, ds)
+
+    def test_recursive_container_raw_equality_does_not_replace_comparison(self):
+        ref = {'$ref': '#/components/schemas/Word'}
+        for container in ({'properties': {'field': ref}}, {'items': ref}, {'additionalProperties': ref}, {'allOf': [ref]}, {'anyOf': [ref]}, {'oneOf': [ref]}, {'prefixItems': [ref]}, {'not': ref}):
+            with self.subTest(container=container):
+                ds = self.compare(container, copy.deepcopy(container), targets=({'Word': {'type': 'string'}}, {'Word': {'type': 'integer'}}))
+                self.assertTrue(ds, ds)
+
+    def test_genuine_model_schema_chain_under_explicit_test_only_operation(self):
+        root = Path(__file__).resolve().parents[2]
+        old = api.load_json(root / 'docs/openapi.json')
+        # ModelsSettings is a generated component declaration, not referenced by
+        # the actual paths. This fixture adds an explicit test-only HTTP root.
+        path = '/__compatibility_test_only__/models'
+        old['paths'][path] = {'put': {'requestBody': {'content': {'application/json': {'schema': {'$ref': '#/components/schemas/ModelsSettings'}}}}, 'responses': {'200': {'description': 'fixture'}}}}
+        new = copy.deepcopy(old)
+        del new['components']['schemas']['ModelOptions']['properties']['contextTokens']
+        ds = api.compare_http(old, new)
+        self.assertTrue(any(d.rule == 'member-removed' and d.pointer.endswith('/properties/contextTokens') and d.identity == 'PUT ' + path for d in ds), ds)
+
+    def test_unused_generated_component_is_not_invented_as_wire_operation(self):
+        root = Path(__file__).resolve().parents[2]
+        old = api.load_json(root / 'docs/openapi.json')
+        new = copy.deepcopy(old)
+        del new['components']['schemas']['ModelOptions']['properties']['contextTokens']
+        self.assertEqual(api.compare_http(old, new), [])
+
+    def test_actual_settings_kind_map_member_deletion_has_real_operation_context(self):
+        root = Path(__file__).resolve().parents[2]
+        old = api.load_json(root / 'docs/openapi.json')
+        new = copy.deepcopy(old)
+        del new['components']['schemas']['SettingsKind']['properties']['etag']
+        ds = api.compare_http(old, new)
+        self.assertTrue(any(d.rule == 'member-removed' and d.pointer.endswith('/properties/kinds/additionalProperties/properties/etag') and d.identity == 'GET /$/settings/{ds}' for d in ds), ds)
+
+    def callback_document(self, extension=None, referenced=False):
+        old = document()
+        callback = {'{$request.query.url}': {'post': {'responses': {'200': {'description': 'ok'}}}}}
+        old['components']['callbacks'] = {'C': callback}
+        old['paths']['/books']['post']['callbacks'] = {'x-real-callback-name': {'$ref': '#/components/callbacks/C'} if referenced else callback}
+        if extension is not None:
+            callback['x-note'] = extension
+        return old
+
+    def assert_valid_pair(self, old, new):
+        try:
+            self.assertEqual(api.compare_http(old, new), [])
+        except (api.InputError, TypeError, AttributeError) as error:
+            self.fail(f'Valid extension was interpreted as an ordinary entry: {error}')
+
+    def test_direct_and_referenced_callback_extensions_are_opaque(self):
+        for value in ('prose', ['prose', {'description': 'data'}], {'post': {'responses': {'200': {'description': 'data'}}}}):
+            for referenced in (False, True):
+                with self.subTest(value=value, referenced=referenced):
+                    old = self.callback_document(referenced=referenced)
+                    new = self.callback_document(value, referenced)
+                    self.assert_valid_pair(new, copy.deepcopy(new))
+                    self.assert_valid_pair(old, new)
+                    self.assert_valid_pair(new, old)
+
+    def test_recursive_callback_with_extension_checks_real_missing_edges(self):
+        old = self.callback_document('prose', referenced=True)
+        operation = old['components']['callbacks']['C']['{$request.query.url}']['post']
+        operation['callbacks'] = {'again': {'$ref': '#/components/callbacks/C'}}
+        self.assert_valid_pair(old, copy.deepcopy(old))
+        operation['requestBody'] = {'$ref': '#/components/requestBodies/Missing'}
+        with self.assertRaises(api.InputError):
+            api.compare_http(old, copy.deepcopy(old))
+
+    def test_ambiguous_callback_extension_refs_remain_unsupported(self):
+        old = self.callback_document({'$ref': '#/components/schemas/Input'})
+        with self.assertRaisesRegex(api.InputError, 'unsupported.*context'):
+            api.compare_http(old, copy.deepcopy(old))
+
+    def test_paths_and_responses_extensions_are_not_paths_or_statuses(self):
+        for kind in ('paths', 'responses'):
+            for value in ('prose', ['data'], {'get': {'responses': {'200': {'description': 'data'}}}, 'content': {'application/json': {'schema': {'type': 'string'}}}}):
+                with self.subTest(kind=kind, value=value):
+                    old = document()
+                    container = old['paths'] if kind == 'paths' else old['paths']['/books']['post']['responses']
+                    container['x-note'] = value
+                    new = copy.deepcopy(old)
+                    other = new['paths'] if kind == 'paths' else new['paths']['/books']['post']['responses']
+                    del other['x-note']
+                    self.assert_valid_pair(old, copy.deepcopy(old))
+                    self.assert_valid_pair(old, new)
+                    self.assert_valid_pair(new, old)
+
+    def test_extensions_on_fixed_objects_follow_same_opaque_policy(self):
+        old = document()
+        for obj in (old, old['components'], old['paths']['/books'], old['paths']['/books']['post'], old['paths']['/books']['post']['responses']['200']):
+            obj['x-note'] = ['data', {'description': 'text'}]
+        self.assert_valid_pair(old, copy.deepcopy(old))
+
+    def test_genuine_x_prefixed_schema_and_property_names_are_compared(self):
+        ref = {'$ref': '#/components/schemas/x-word'}
+        old = {'x-word': {'properties': {'x-field': {'type': 'string'}}}}
+        new = copy.deepcopy(old)
+        del new['x-word']['properties']['x-field']
+        ds = self.compare(ref, copy.deepcopy(ref), targets=(old, new))
+        self.assertTrue(any(d.rule == 'member-removed' and d.pointer.endswith('/properties/x-field') for d in ds), ds)
+
+    def test_genuine_x_prefixed_component_entries_are_not_extensions(self):
+        for category in ('parameters', 'headers', 'requestBodies', 'responses', 'pathItems', 'callbacks', 'links', 'examples', 'securitySchemes'):
+            with self.subTest(category=category):
+                old = document()
+                old['components'][category] = {'x-real-name': {'$ref': f'#/components/{category}/Missing'}}
+                with self.assertRaises(api.InputError):
+                    api.compare_http(old, copy.deepcopy(old))
+
+    def test_genuine_x_prefixed_header_and_webhook_names_keep_reference_validation(self):
+        for kind in ('header', 'webhook'):
+            with self.subTest(kind=kind):
+                old = document()
+                if kind == 'header':
+                    old['paths']['/books']['post']['responses']['200']['headers'] = {'x-real-header': {'schema': {'$ref': '#/components/schemas/Missing'}}}
+                else:
+                    old['webhooks'] = {'x-real-webhook': {'post': {'responses': {'200': {'$ref': '#/components/responses/Missing'}}}}}
+                with self.assertRaises(api.InputError):
+                    api.compare_http(old, copy.deepcopy(old))
+
+    def test_x_prefixed_oauth_scope_is_preserved_as_security_metadata(self):
+        old = document()
+        old['components']['securitySchemes'] = {'oauth': {'type': 'oauth2', 'flows': {'clientCredentials': {'tokenUrl': 'https://example.invalid/token', 'scopes': {'x-real-scope': 'read'}}}}}
+        new = copy.deepcopy(old)
+        new['components']['securitySchemes']['oauth']['flows']['clientCredentials']['scopes']['x-real-scope'] = 'write'
+        ds = api.compare_http(old, new)
+        self.assertTrue(any(d.rule == 'security-review' for d in ds), ds)
+
+
 class CliContracts(unittest.TestCase):
     def setUp(self):
         self.old = cli()
