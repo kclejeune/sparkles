@@ -601,9 +601,10 @@ fn finish(shared: &Shared, job: Job, result: Result<Vec<Vec<f32>>>) {
 fn lower_priority(n: i32) {
     #[cfg(target_os = "linux")]
     if n > 0 {
-        // SAFETY: plain system calls on the calling thread's id
+        let tid = linux_thread_id();
+        // SAFETY: errno_location returns this thread's valid errno cell, and the
+        // priority functions receive only scalar arguments, without user pointers.
         unsafe {
-            let tid = libc::gettid() as libc::id_t;
             *libc::__errno_location() = 0;
             let cur = libc::getpriority(libc::PRIO_PROCESS, tid);
             let _ = libc::setpriority(libc::PRIO_PROCESS, tid, (cur + n).min(19));
@@ -611,4 +612,69 @@ fn lower_priority(n: i32) {
     }
     #[cfg(not(target_os = "linux"))]
     let _ = n;
+}
+
+/// The calling Linux task's ID, including on glibc before its 2.30 gettid wrapper.
+#[cfg(target_os = "linux")]
+fn linux_thread_id() -> libc::id_t {
+    // SAFETY: Linux gettid takes no arguments or user pointers. libc supplies the
+    // architecture-specific syscall number and the syscall function's C ABI.
+    unsafe { libc::syscall(libc::SYS_gettid) as libc::id_t }
+}
+
+#[cfg(all(test, target_os = "linux"))]
+mod priority_tests {
+    use super::{linux_thread_id, lower_priority};
+
+    fn nice(tid: libc::id_t) -> i32 {
+        // SAFETY: errno_location returns this thread's valid errno cell, and
+        // getpriority accepts scalar arguments. Zero denotes the calling task.
+        unsafe {
+            *libc::__errno_location() = 0;
+            let value = libc::getpriority(libc::PRIO_PROCESS, tid);
+            assert_eq!(*libc::__errno_location(), 0, "getpriority failed");
+            value
+        }
+    }
+
+    #[test]
+    fn linux_thread_id_matches_kernel_task_identity() {
+        std::thread::spawn(|| {
+            let tid = linux_thread_id();
+            let status = std::fs::read_to_string("/proc/thread-self/status").unwrap();
+            let kernel_tid: libc::id_t = status
+                .lines()
+                .find_map(|line| line.strip_prefix("Pid:"))
+                .unwrap()
+                .trim()
+                .parse()
+                .unwrap();
+            assert_eq!(tid, kernel_tid);
+            assert_ne!(tid, std::process::id() as libc::id_t);
+        })
+        .join()
+        .unwrap();
+    }
+
+    #[test]
+    fn lowering_priority_changes_only_the_calling_worker() {
+        let caller_tid = linux_thread_id();
+        let caller_nice = nice(caller_tid);
+        let leader_tid = std::process::id() as libc::id_t;
+        let leader_nice = nice(leader_tid);
+        std::thread::spawn(|| {
+            let tid = linux_thread_id();
+            let before = nice(tid);
+            lower_priority(0);
+            assert_eq!(nice(tid), before);
+            lower_priority(1);
+            let expected = (before + 1).min(19);
+            assert_eq!(nice(tid), expected);
+            assert_eq!(nice(0), expected);
+        })
+        .join()
+        .unwrap();
+        assert_eq!(nice(caller_tid), caller_nice);
+        assert_eq!(nice(leader_tid), leader_nice);
+    }
 }
