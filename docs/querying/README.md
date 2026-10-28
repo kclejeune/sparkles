@@ -279,8 +279,10 @@ dependencies are recorded in the [central roadmap](../ROADMAP.md).
   Roadmap items 230 and 237.
 * RML join conditions written as expression maps are not read, and function maps call 20
   of SPARQL's functions. Roadmap items 232 and 236.
-* Stored mapping runs are not tasks, the web UI has no Mappings page, and the JVM and
-  Node.js bindings cannot run mappings. Roadmap items 231, 233 and 234.
+* Stored mapping runs are not tasks, and the web UI has no Mappings page.
+  Roadmap items 233 and 234.
+* The native Rust direct mapping conversion check does not control its final load.
+  Roadmap item 397.
 * The W3C CSVW test suite does not run. Roadmap item 235.
 * A template lookup that binds a blank node of the dataset writes a new node, and a JSON
   number with a fraction or an exponent loses its source form. Roadmap items 238 and 239.
