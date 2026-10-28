@@ -101,6 +101,10 @@ These read paths are tuned for queries over data that is not yet in memory
 
 * Reads use MVCC snapshots with a single writer, and a write-ahead log replays safely
   after a crash.
+* The main store, branch stores and branch set share the dataset root's exclusive
+  process lock on `sparkles.lock`. A retained branch store keeps that lock through
+  resource destruction after main closes, including when the branch was removed or
+  retired.
 * A commit is acknowledged once its WAL record and any new vocabulary entries are
   synchronized. The two writes are issued in parallel, and the update vocabulary is
   written in checksummed chunks, so a torn tail is detected and trimmed at open.

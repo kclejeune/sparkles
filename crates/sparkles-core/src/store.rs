@@ -33,6 +33,9 @@ mod describe;
 mod diff;
 mod diff_groups;
 mod embed;
+mod family;
+#[cfg(test)]
+mod family_tests;
 mod geo;
 mod group;
 #[cfg(test)]
@@ -1481,8 +1484,11 @@ pub struct Store {
     #[cfg(any(test, feature = "failpoints"))]
     failpoints: Mutex<BTreeMap<&'static str, backup::Failpoint>>,
     /// Keep exclusion through Drop and every other owned field's destructor.
-    /// Fields drop in declaration order, so this must remain last.
-    _lock: Option<ProcessLock>,
+    /// Fields drop in declaration order. Only the family root lease follows this.
+    _lock: Option<Arc<ProcessLock>>,
+    /// Keep the root process lock through member resources and their own lock.
+    /// This must remain last, including when a member outlives the main Store.
+    family: Arc<family::Family>,
 }
 
 pub(crate) const WAL_INSERT: u8 = 1;
@@ -1673,6 +1679,31 @@ impl Store {
         dataset_id: uuid::Uuid,
         forked_from: Option<ForkedFrom>,
     ) -> Store {
+        Self::in_memory_in_family(
+            opts,
+            gen_,
+            next_bnode,
+            prefixes,
+            root,
+            dataset_id,
+            forked_from,
+            family::Family::new(None),
+        )
+    }
+
+    /// Construct a member with the original opening's runtime identity before any
+    /// resource can be exposed. Ordinary memory clones start their own family.
+    #[allow(clippy::too_many_arguments)]
+    fn in_memory_in_family(
+        opts: StoreOptions,
+        gen_: Arc<Generation>,
+        next_bnode: u64,
+        prefixes: BTreeMap<String, String>,
+        root: CommitInfo,
+        dataset_id: uuid::Uuid,
+        forked_from: Option<ForkedFrom>,
+        family: Arc<family::Family>,
+    ) -> Store {
         let cache = Store::block_cache_for(&opts);
         let results = Store::result_cache_for(&opts);
         let dvocab_len = gen_.dvocab.len();
@@ -1723,6 +1754,7 @@ impl Store {
             removed_prefixes: Mutex::new(BTreeSet::new()),
             prefix_filter: Mutex::new(None),
             _lock: None,
+            family: family.clone(),
             dataset_id,
             forked_mem: forked_from,
             catalog: Arc::new(Mutex::new(Catalog::memory(root, opts.memory_commit_ring))),
@@ -1760,6 +1792,7 @@ impl Store {
             &store.opts,
             store.cache.clone(),
             store.quota.clone(),
+            family,
         );
         set.set_main(&store.current);
         let mut store = store;
@@ -1807,7 +1840,7 @@ impl Store {
         }
         commit::check_dataset_compatibility(root)?;
         std::fs::create_dir_all(root)?;
-        let lock = lock_dir(root)?;
+        let lock = Arc::new(lock_dir(root)?);
         if ctx.is_none() {
             crate::migrate::check_not_pending(root)?;
         }
@@ -1815,6 +1848,12 @@ impl Store {
         // migration renames, after which only file identity detects the stale lock.
         // Branch roots follow the same identity rule under their parent's exclusion.
         verify_database_lock(root, &lock)?;
+        // Declare both leases before opening resources, so failed construction also
+        // destroys those resources before releasing root process exclusion.
+        let family = ctx.as_ref().map_or_else(
+            || family::Family::new(Some(lock.clone())),
+            |c| c.family.clone(),
+        );
         // Refuse incompatible metadata in active and retained branches before any
         // root writer runs, agreeing with the physical tree migrate --check inspects.
         if ctx.is_none() {
@@ -2105,7 +2144,14 @@ impl Store {
                 branching.next_ordinal = AtomicU64::new(c.next_ordinal);
             }
             None => {
-                let set = BranchSet::load(root, dataset_id, &opts, cache.clone(), quota.clone())?;
+                let set = BranchSet::load(
+                    root,
+                    dataset_id,
+                    &opts,
+                    cache.clone(),
+                    quota.clone(),
+                    family.clone(),
+                )?;
                 branching.protected = AtomicBool::new(set.main_protected());
                 branching.next_ordinal = AtomicU64::new(set.next_ordinal());
                 branching.set = branching::SetRef::Owner(set);
@@ -2157,7 +2203,8 @@ impl Store {
             prefixes: Mutex::new(prefixes),
             removed_prefixes: Mutex::new(removed_prefixes),
             prefix_filter: Mutex::new(None),
-            _lock: Some(lock),
+            _lock: Some(lock.clone()),
+            family: family.clone(),
             dataset_id,
             forked_mem: None,
             catalog: Arc::new(Mutex::new(catalog)),
@@ -4120,12 +4167,18 @@ impl Store {
     pub fn write_with(&self, kind: CommitKind, opts: crate::guard::WriteOptions) -> WriteTxn<'_> {
         let waiting = Waiting::new(&self.writers_waiting);
         crate::sparql::extensions::assert_family(self.owner_dataset_id());
+        let family = Arc::new(
+            self.family
+                .gate
+                .enter(&Default::default())
+                .expect("uncancellable family entry"),
+        );
         let mut guard = self.writer.lock();
         if !self.speculative_base(kind, &opts, &guard) {
             self.drain_group(&mut guard, None).ok();
         }
         drop(waiting);
-        self.begin(guard, kind, opts)
+        self.begin(WriterGuard { guard, family }, kind, opts)
     }
 
     /// Write transactions waiting for the writer lock right now. A long holder of the
@@ -4166,10 +4219,16 @@ impl Store {
         Ok(self.begin(guard, kind, opts))
     }
 
-    /// The writer lock, waited for in slices while `o` can be cancelled or time out.
-    /// Then the write's precondition, if it has one, is checked on the head snapshot.
-    fn raw_writer(&self, o: &crate::guard::WriteOptions) -> Result<MutexGuard<'_, WriterState>> {
+    /// Enter before any branch writer or lifecycle table lock. Internal shutdown
+    /// and nested branch capture use guarded_writer without entering a second time.
+    fn shared_family(&self, o: &crate::guard::WriteOptions) -> Result<family::FamilyPermit> {
         crate::sparql::extensions::check_family(self.owner_dataset_id())?;
+        self.family.gate.enter(o)
+    }
+
+    /// The family and writer locks, waited for under the same request controls.
+    fn raw_writer(&self, o: &crate::guard::WriteOptions) -> Result<WriterGuard<'_>> {
+        let family = Arc::new(self.shared_family(o)?);
         let w = {
             // counted while it waits, so a long holder of the lock can give way
             let _waiting = Waiting::new(&self.writers_waiting);
@@ -4192,10 +4251,10 @@ impl Store {
                 }
             }
         };
-        Ok(w)
+        Ok(WriterGuard { guard: w, family })
     }
 
-    fn lock_writer(&self, o: &crate::guard::WriteOptions) -> Result<MutexGuard<'_, WriterState>> {
+    fn lock_writer(&self, o: &crate::guard::WriteOptions) -> Result<WriterGuard<'_>> {
         let mut w = self.raw_writer(o)?;
         self.drain_group(&mut w, Some(o))?;
         self.check_write_options(o, &mut w)?;
@@ -4454,7 +4513,7 @@ impl Store {
 
     fn begin<'a>(
         &'a self,
-        guard: MutexGuard<'a, WriterState>,
+        guard: WriterGuard<'a>,
         kind: CommitKind,
         opts: crate::guard::WriteOptions,
     ) -> WriteTxn<'a> {
@@ -5622,10 +5681,30 @@ fn apply(delta: &mut Delta, q: &[Id; 4], insert: bool, in_base: bool) {
     }
 }
 
-struct TxnGuard<'a>(Option<MutexGuard<'a, WriterState>>);
+/// Declaration order releases the writer mutex before the last permit, including
+/// on unwind. Pending publication clones this Arc rather than entering again.
+struct WriterGuard<'a> {
+    guard: MutexGuard<'a, WriterState>,
+    family: Arc<family::FamilyPermit>,
+}
+
+impl std::ops::Deref for WriterGuard<'_> {
+    type Target = WriterState;
+    fn deref(&self) -> &WriterState {
+        &self.guard
+    }
+}
+
+impl std::ops::DerefMut for WriterGuard<'_> {
+    fn deref_mut(&mut self) -> &mut WriterState {
+        &mut self.guard
+    }
+}
+
+struct TxnGuard<'a>(Option<WriterGuard<'a>>);
 
 impl<'a> std::ops::Deref for TxnGuard<'a> {
-    type Target = MutexGuard<'a, WriterState>;
+    type Target = WriterGuard<'a>;
     fn deref(&self) -> &Self::Target {
         self.0.as_ref().expect("transaction writer held")
     }

@@ -14,6 +14,12 @@ Store shutdown finishes embedding record output even if a caller retains the
 Embedder. If a clean-close validation callback panics, shutdown first revokes
 retained writers and finishes pending output, then propagates the original unwind.
 
+Stores in one persistent opening and their BranchSet share ownership of the dataset
+root's process lock. Dropping main leaves that lock held while an embedded caller retains
+a branch Store or BranchSet. Removed and retired branch stores keep the same lease
+until their resources are destroyed. Release those owners before reopening the
+dataset directory. In-memory branches share runtime ownership without a file lock.
+
 * The embedded Rust API is `sparkles::Dataset`, with a fluent query builder in
   `sparkles::querybuilder` ([USAGE.md](../USAGE.md#embedding-the-library),
   [P06](../specs/P06-library-admin-api.md)). Opening a dataset installs its write-time

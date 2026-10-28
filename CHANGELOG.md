@@ -15,6 +15,10 @@ signals remain incomplete.
 The successful dataset rename response is described under OpenAPI's `application/json`
 media type. Its `name` and `renamedFrom` fields and wire behavior are unchanged.
 
+Persistent datasets remain locked while an embedded caller retains a branch Store
+or BranchSet after main closes, including when the branch was removed or retired.
+The root lock stays held through those owners' resource destruction.
+
 Dataset and branch administration emit audit events across HTTP, local commands and
 MCP. Clone events follow actual registration and preserve the initiating actor and
 selected source commit. Successful scratch expiry records a system actor, while failed

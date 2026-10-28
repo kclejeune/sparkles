@@ -34,6 +34,8 @@ pub(super) struct Pending {
     /// the commit's full-text changes, applied to the live index at publication
     #[cfg(feature = "text")]
     pub text: Option<crate::text::Staged>,
+    /// Retained through publication, refusal and destruction of pending resources.
+    _family: Arc<family::FamilyPermit>,
 }
 
 #[derive(Default)]
@@ -472,6 +474,7 @@ impl WriteTxn<'_> {
         // annotation is there.
         let (annotation, ann_file) =
             store.annotate_unsynced(&c, message, || Some(self.change_lines()))?;
+        let family = self.guard.family.clone();
         let w = &mut **self.guard;
         let wal = w.wal.as_mut().expect("persistent grouped transaction");
         let mut data = Vec::with_capacity(bytes as usize);
@@ -594,6 +597,7 @@ impl WriteTxn<'_> {
             ann_file,
             #[cfg(feature = "text")]
             text,
+            _family: family,
         };
         w.head = c;
         w.staged = Some(snapshot);
@@ -601,6 +605,7 @@ impl WriteTxn<'_> {
             w.poisoned = true;
             return Err(e);
         }
+        store.failpoint("group-enqueued-writer-held");
         // Nothing below accesses the writer guard. Waiting keeps Store borrowed,
         // but releases the single writer for later speculative transactions.
         drop(self.guard.0.take());

@@ -482,6 +482,7 @@ pub(crate) struct OpenCtx {
     pub next_ordinal: u64,
     /// generations whose block-cache identities the store's linked generation shares
     pub share: Vec<Arc<Generation>>,
+    pub family: Arc<family::Family>,
 }
 
 // --------------------------------------------------------------- branch set ------
@@ -512,6 +513,8 @@ pub struct BranchSet {
     /// cached blocks with
     main_current: Mutex<Weak<ArcSwap<Snapshot>>>,
     me: Weak<BranchSet>,
+    /// Outlive all resident member resources without owning the main Store.
+    family: Arc<family::Family>,
 }
 
 /// The generation holds that the generations of the branch rooted at `root` need: the
@@ -576,6 +579,7 @@ impl BranchSet {
         opts: &StoreOptions,
         cache: Arc<BlockCache>,
         quota: Arc<quota::Quota>,
+        family: Arc<family::Family>,
     ) -> Arc<Self> {
         Arc::new_cyclic(|me| Self {
             memory: true,
@@ -593,6 +597,7 @@ impl BranchSet {
             unlinked: AtomicBool::new(false),
             main_current: Default::default(),
             me: me.clone(),
+            family,
         })
     }
 
@@ -612,6 +617,7 @@ impl BranchSet {
         opts: &StoreOptions,
         cache: Arc<BlockCache>,
         quota: Arc<quota::Quota>,
+        family: Arc<family::Family>,
     ) -> Result<Arc<BranchSet>> {
         let table = match read_table(root)? {
             Some(t) if t.dataset_id != dataset_id => {
@@ -694,6 +700,7 @@ impl BranchSet {
             unlinked: AtomicBool::new(false),
             main_current: Mutex::new(Weak::new()),
             me: me.clone(),
+            family,
         }))
     }
 
@@ -839,6 +846,7 @@ impl BranchSet {
             protected: entry.protected || retired,
             next_ordinal,
             share,
+            family: self.family.clone(),
         };
         let store = Arc::new(Store::open_branch(
             &self.branch_root(id),
@@ -1603,6 +1611,7 @@ impl Store {
 
     /// Set the predicates exempt from conflicts in this dataset's merges (empty: none).
     pub fn set_merge_exempt(&self, predicates: &[NamedNode]) -> Result<Vec<NamedNode>> {
+        let _family = self.shared_family(&Default::default())?;
         if predicates.len() > 1024 {
             return Err(branch::invalid_merge("at most 1024 exempt predicates"));
         }
@@ -1653,6 +1662,7 @@ impl Store {
         name: &str,
         f: impl Fn(&mut MainEntry, Option<&mut Entry>),
     ) -> Result<()> {
+        let _family = self.shared_family(&Default::default())?;
         let set = self.owned_set()?;
         let mut t = set.table.lock();
         let mut next = t.clone();
@@ -1690,6 +1700,7 @@ impl Store {
     /// [`StoreOptions::max_branch_depth`] log segments, the branch's index is built
     /// instead.
     pub fn create_branch(&self, name: &str, o: &BranchOptions) -> Result<BranchInfo> {
+        let _family = self.shared_family(&Default::default())?;
         branch::check_name(name)?;
         if o.note.as_ref().is_some_and(|n| n.len() > 1024) {
             return Err(branch::invalid_branch("the note is longer than 1024 bytes"));
@@ -1882,7 +1893,7 @@ impl Store {
             ..resolved.commit
         };
         let gen_ = Arc::new(Generation::memory_branch(&snap.generation, snap.dvocab_len));
-        let mut store = Store::in_memory_from(
+        let mut store = Store::in_memory_in_family(
             self.opts.clone(),
             gen_,
             branch::bnode_range_start(ordinal),
@@ -1890,6 +1901,7 @@ impl Store {
             root,
             id,
             None,
+            set.family.clone(),
         );
         store.cache = set.cache.clone();
         store.quota = set.quota.clone();
@@ -2180,6 +2192,7 @@ impl Store {
     /// refused while the branch has commits that neither its upstream descends from nor
     /// a re-parented branch keeps in its history.
     pub fn delete_branch_with(&self, name: &str, o: &branch::DeleteOptions) -> Result<()> {
+        let _family = self.shared_family(&Default::default())?;
         if name == MAIN {
             return Err(branch::invalid_branch("branch main cannot be deleted"));
         }
@@ -2319,6 +2332,7 @@ impl Store {
     /// open store, and the branches created from it keep it as their upstream. Requests
     /// that name the old name answer `404 no-such-branch` afterwards.
     pub fn rename_branch(&self, name: &str, new: &str) -> Result<BranchInfo> {
+        let _family = self.shared_family(&Default::default())?;
         if name == MAIN {
             return Err(branch::invalid_branch("branch main cannot be renamed"));
         }

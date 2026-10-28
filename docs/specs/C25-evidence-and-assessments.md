@@ -493,6 +493,28 @@ the caller's authorized view before publication. These helpers do not open a dat
 authenticate source availability, register managed graphs or authorize a write. The
 Phase 2 runtime remains incomplete.
 
+The runtime ownership prerequisite gives each opening one shared family identity.
+Persistent families retain a lease on the root process lock. Persistent and in-memory
+members inherit their family's identity.
+Writer permits span acquisition through grouped publication or refusal, including
+when a submitting caller unwinds. Branch creation, deletion, renaming and table
+settings enter the same gate before their branch locks. Store resources and branch
+locks are destroyed before the final root lease. A retained persistent member or
+branch set can therefore outlive main without releasing process exclusion early.
+
+Exclusive admission is exercised only by internal tests. This prerequisite provides
+no production protocol for closing a family or constructor closing authority. Facade ownership
+and public Store method signatures remain unchanged. Operational observation, managed
+admission, privacy visibility and durable source ownership for Jobs remain separate
+dependencies of the runtime phases.
+
+All 14 ownership tests pass without optional features and with `text,geo`. The
+control for retained members also passes in a separate exact run. Another 131 tests
+cover grouped commits, process locks, memory branches, branch operations and shutdown.
+Strict core lint checks pass for all targets in both feature configurations. The
+original implementation fails the control's assertion that the root stays locked
+while a member outlives main.
+
 Roadmap item 81 retains the rest of this contract. Phase 2 adds typed source, reference
 and claim creation with authenticated availability and guarded metadata, exact retained
 reference resolution, reader admission, idempotency, review, support ownership,
