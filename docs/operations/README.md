@@ -25,6 +25,15 @@ each stated scope.
   deliver local models, and reloads through `serve --watch-config`
   ([USAGE.md](../USAGE.md#kubernetes-helm)).
 
+An unpublished GNU x86_64 candidate workflow assembles archives with generated man
+pages, completions, OpenAPI, license notices and separate debug symbols. Its gates
+require a manylinux 2.28 build and installed query and persistence checks in pinned
+Rocky Linux 8 and Debian 11 containers. Those gates have not established platform
+support. Published server downloads, signed provenance, the other server platforms
+and published container images remain open under [item 59](../ROADMAP.md). Candidate
+build records are unsigned metadata. [DEVELOPMENT](../DEVELOPMENT.md#server-artifact-candidates)
+describes the commands and evidence boundaries.
+
 ### Settings and notifications
 
 * A dataset's assistant, memory, ingest and prefix settings combine built-in defaults,
