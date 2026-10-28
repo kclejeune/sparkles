@@ -34,6 +34,63 @@ artifact = module("artifact_test", "server-artifact.py")
 smoke = module("installed_test", "server-installed-smoke.py")
 
 
+class OpenApiComparison(unittest.TestCase):
+    def setUp(self):
+        self.source = {"openapi": "3.1.0", "info": {"version": "0.0.0", "title": "Sparkles"},
+                       "components": {"schemas": {"A": {"required": ["name"],
+                           "properties": {"name": {"$ref": "#/components/schemas/Name"}}}}}}
+        self.runtime = json.loads(json.dumps(self.source))
+        self.runtime["info"]["version"] = "0.1.0"
+
+    def check(self):
+        artifact.check_openapi(json.dumps(self.runtime), json.dumps(self.source), "0.1.0")
+
+    def test_runtime_version_is_the_only_permitted_difference(self):
+        before = json.dumps(self.runtime, sort_keys=True)
+        self.assertNotEqual(self.runtime, self.source)  # The old direct comparison refused this pair.
+        self.check()
+        self.assertEqual(json.dumps(self.runtime, sort_keys=True), before)
+
+    def test_wrong_missing_and_nonstring_runtime_version_are_refused(self):
+        for value in ("0.0.0", None, 1, True):
+            with self.subTest(value=value):
+                self.runtime["info"]["version"] = value
+                with self.assertRaisesRegex(ValueError, "/info/version"):
+                    self.check()
+        del self.runtime["info"]["version"]
+        with self.assertRaisesRegex(ValueError, "/info/version"):
+            self.check()
+        del self.runtime["info"]
+        with self.assertRaisesRegex(ValueError, "/info/version"):
+            self.check()
+
+    def test_wrong_or_missing_source_placeholder_is_refused(self):
+        for value in ("0.1.0", None, 1):
+            with self.subTest(value=value):
+                self.source["info"]["version"] = value
+                with self.assertRaisesRegex(ValueError, "/info/version"):
+                    self.check()
+        del self.source["info"]["version"]
+        with self.assertRaisesRegex(ValueError, "/info/version"):
+            self.check()
+        del self.source["info"]
+        with self.assertRaisesRegex(ValueError, "/info/version"):
+            self.check()
+
+    def test_other_contract_changes_are_refused_with_json_pointers(self):
+        cases = [
+            (lambda d: d["info"].update(title="Changed"), "/info/title"),
+            (lambda d: d["components"]["schemas"]["A"].update(required=[]), "/components/schemas/A/required"),
+            (lambda d: d["components"]["schemas"]["A"]["properties"]["name"].update({"$ref": "#/other"}), "/components/schemas/A/properties/name/$ref"),
+        ]
+        for change, pointer in cases:
+            with self.subTest(pointer=pointer):
+                self.runtime = json.loads(json.dumps(self.source))
+                self.runtime["info"]["version"] = "0.1.0"
+                change(self.runtime)
+                with self.assertRaisesRegex(ValueError, re.escape(pointer)):
+                    self.check()
+
 class ArchiveContracts(unittest.TestCase):
     def setUp(self):
         self.uid = patch.object(smoke.os, "getuid", return_value=1500)
@@ -187,6 +244,48 @@ class ArchiveContracts(unittest.TestCase):
         with patch.object(artifact, "run", fake_run):
             with self.assertRaisesRegex(ValueError, "version mismatch"):
                 artifact.pack(self.work / "binary", source, output, artifact.IMAGES["builder"])
+        self.assertFalse(output.exists())
+
+    def test_pack_keeps_generated_openapi_bytes_after_placeholder_comparison(self):
+        source = self.work / "source"
+        source.mkdir()
+        (source / "docs").mkdir()
+        (source / "Cargo.toml").write_text('[workspace.package]\nversion="0.1.0"\n')
+        (source / "Cargo.lock").write_text("fixture lock")
+        (source / "docs/openapi.json").write_text('{"info":{"version":"0.0.0"}}')
+        for name in ("LICENSE", "THIRD_PARTY_LICENSES.md", "THIRD_PARTY_LICENSES-UI.md"):
+            (source / name).write_text("fixture notice")
+        binary = self.work / "binary"
+        binary.write_bytes(b"prebuilt fixture")
+        output = self.work / "output"
+        generated = b'{ "info": { "version": "0.1.0" } }\n'
+        captured = []
+
+        def fake_run(args, **kwargs):
+            words = [str(arg) for arg in args]
+            if "status" in words:
+                return ""
+            if "rev-parse" in words:
+                return "a" * 40
+            if "show" in words:
+                return "1000"
+            if "--section-headers" in words:
+                return "[12] .debug_line PROGBITS"
+            if words[-1] == "openapi":
+                return generated
+            if len(words) > 1 and words[1] == "man":
+                tree = Path(words[-1]).parents[2]
+                captured.append((tree / artifact.DOC / "openapi.json").read_bytes())
+                raise ValueError("stop after capture")
+            if words[-1] == "--version":
+                return "sparkles 0.1.0" if words[0] == str(binary) else "mbx 1.28.0"
+            raise AssertionError(words)
+
+        with patch.object(artifact, "run", fake_run), patch.object(artifact, "ui_inputs", return_value={}), \
+                patch.object(artifact, "audit_elf", return_value=({}, {})):
+            with self.assertRaisesRegex(ValueError, "stop after capture"):
+                artifact.pack(binary, source, output, artifact.IMAGES["builder"])
+        self.assertEqual(captured, [generated])
         self.assertFalse(output.exists())
 
     def test_late_pack_failure_removes_partial_distribution(self):

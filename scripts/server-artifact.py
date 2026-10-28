@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """Assemble and verify unpublished Linux GNU server candidates; never publish."""
 import argparse
+import copy
 import gzip
 import hashlib
 import json
@@ -45,6 +46,44 @@ def sha256(path):
 def require(condition, message):
     if not condition:
         raise ValueError(message)
+
+
+def first_json_difference(left, right, pointer=""):
+    """Return the first differing JSON pointer without printing document values."""
+    if isinstance(left, dict) and isinstance(right, dict):
+        for key in sorted(left.keys() | right.keys()):
+            path = pointer + "/" + key.replace("~", "~0").replace("/", "~1")
+            if key not in left or key not in right:
+                return path
+            difference = first_json_difference(left[key], right[key], path)
+            if difference is not None:
+                return difference
+        return None
+    if isinstance(left, list) and isinstance(right, list):
+        for index, (a, b) in enumerate(zip(left, right)):
+            difference = first_json_difference(a, b, pointer + "/" + str(index))
+            if difference is not None:
+                return difference
+        return pointer if len(left) != len(right) else None
+    if isinstance(left, bool) != isinstance(right, bool) or left != right:
+        return pointer or "/"
+    return None
+
+
+def check_openapi(generated, source, version):
+    """Compare the full runtime contract with the checked-in version placeholder."""
+    runtime = json.loads(generated)
+    checked_in = json.loads(source)
+    for document, expected, label in ((runtime, version, "runtime"),
+                                      (checked_in, "0.0.0", "source")):
+        info = document.get("info") if isinstance(document, dict) else None
+        require(isinstance(info, dict) and isinstance(info.get("version"), str) and
+                info["version"] == expected,
+                f"generated OpenAPI differs from source at /info/version ({label} version)")
+    comparison = copy.deepcopy(runtime)
+    comparison["info"]["version"] = "0.0.0"
+    difference = first_json_difference(comparison, checked_in)
+    require(difference is None, f"generated OpenAPI differs from source at {difference}")
 
 
 def parse_elf(header, program, dynamic, versions):
@@ -237,8 +276,7 @@ def pack(binary, source, destination, builder):
             require((source / notice).stat().st_size > 0, f"empty notice: {notice}")
             shutil.copyfile(source / notice, doc / notice)
         generated = run([installed, "openapi"])
-        require(json.loads(generated) == json.loads((source / "docs/openapi.json").read_bytes()),
-                "generated OpenAPI differs from source")
+        check_openapi(generated, (source / "docs/openapi.json").read_bytes(), version)
         (doc / "openapi.json").write_bytes(generated)
         run([installed, "man", "--dir", tree / "share/man/man1"])
         for shell, relative in (
