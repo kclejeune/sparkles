@@ -1,0 +1,238 @@
+[
+  {
+    "revision": "urn:example:a01:health1",
+    "path": "raw/health1.json",
+    "digest": "sha256:8e48b7494c975b57bc994d8404e47a125e2a80500fad83f32dd18a49f6c960c8",
+    "selections": [
+      {
+        "reference": "urn:example:a01:A10:descriptionClaim:report1:ref",
+        "pointer": "/claims/A10:descriptionClaim:report1",
+        "selectedUtf8": "{\"subject\":\"ex:A10:report1\",\"predicate\":\"rdfs:label\",\"object\":\"\\\"Synthetic report\\\"\"}",
+        "digest": "sha256:40263e50f6e98cfa7530d824520beeb9f1916ae8540315f3a52ced26ecec16a8"
+      },
+      {
+        "reference": "urn:example:a01:A10:reportRelation1:claim:ref",
+        "pointer": "/claims/A10:reportRelation1:claim",
+        "selectedUtf8": "{\"subject\":\"ex:A10:report1\",\"predicate\":\"sr:ReportAboutEpisode\",\"object\":\"ex:A10:episode\"}",
+        "digest": "sha256:570107574cad88e69b1d4f6293fa46f45cfb1fa6e8eb75a68fac9595af63e634"
+      },
+      {
+        "reference": "urn:example:a01:A10:obs1:valueClaim:ref",
+        "pointer": "/claims/A10:obs1:valueClaim",
+        "selectedUtf8": "{\"subject\":\"ex:A10:episode\",\"predicate\":\"ex:reportedCumulativeCases\",\"object\":\"10\"}",
+        "digest": "sha256:249dba359b3a133511a797d1ea82c33ce14af922fccecb19174c86eccd9c6631"
+      },
+      {
+        "reference": "urn:example:a01:A10:observationRelation1:claim:ref",
+        "pointer": "/claims/A10:observationRelation1:claim",
+        "selectedUtf8": "{\"subject\":\"ex:A10:obs1\",\"predicate\":\"sr:ObservationAboutEpisode\",\"object\":\"ex:A10:episode\"}",
+        "digest": "sha256:fb39aa69d23c7f366488181913c4db738992d4bfb2ca7980bee0e9a14012b9c8"
+      }
+    ]
+  },
+  {
+    "revision": "urn:example:a01:health2",
+    "path": "raw/health2.json",
+    "digest": "sha256:43969f4ae338e502d1d4dbc3df6557a4b00bd2f9b1888f309be16da7e7e725dc",
+    "selections": [
+      {
+        "reference": "urn:example:a01:A10:descriptionClaim:report2:ref",
+        "pointer": "/claims/A10:descriptionClaim:report2",
+        "selectedUtf8": "{\"subject\":\"ex:A10:report2\",\"predicate\":\"rdfs:label\",\"object\":\"\\\"Synthetic report\\\"\"}",
+        "digest": "sha256:1749c3784418dff129599d9789b467b675a8b89c73e4736e5b9ea37afa80df76"
+      },
+      {
+        "reference": "urn:example:a01:A10:reportRelation2:claim:ref",
+        "pointer": "/claims/A10:reportRelation2:claim",
+        "selectedUtf8": "{\"subject\":\"ex:A10:report2\",\"predicate\":\"sr:ReportAboutEpisode\",\"object\":\"ex:A10:episode\"}",
+        "digest": "sha256:d991f43700e250e1fd81d238c91bd41e59964131d838b3eb20f024af5ae29847"
+      },
+      {
+        "reference": "urn:example:a01:A10:obs2:valueClaim:ref",
+        "pointer": "/claims/A10:obs2:valueClaim",
+        "selectedUtf8": "{\"subject\":\"ex:A10:episode\",\"predicate\":\"ex:reportedCumulativeCases\",\"object\":\"12\"}",
+        "digest": "sha256:2d19372a19db41b1a900b01936afdce9c5ac6ee5c7440d51090a1be512550685"
+      },
+      {
+        "reference": "urn:example:a01:A10:observationRelation2:claim:ref",
+        "pointer": "/claims/A10:observationRelation2:claim",
+        "selectedUtf8": "{\"subject\":\"ex:A10:obs2\",\"predicate\":\"sr:ObservationAboutEpisode\",\"object\":\"ex:A10:episode\"}",
+        "digest": "sha256:01e8b71453fba7f8ce34e5f1d5ad31a885f2708b3a79bd67f5d54233da3499d4"
+      }
+    ]
+  },
+  {
+    "revision": "urn:example:a01:independent",
+    "path": "raw/independent.json",
+    "digest": "sha256:59721998761ec89ff5a81a49b3fd80262e6bc7928f1f1d50b9b4854874c4fff8",
+    "selections": [
+      {
+        "reference": "urn:example:a01:A5:claim2:ref",
+        "pointer": "/claims/A5:claim2",
+        "selectedUtf8": "{\"subject\":\"ex:A5:release\",\"predicate\":\"sr:ReleaseContains\",\"object\":\"ex:A5:version\"}",
+        "digest": "sha256:d2e4b666e2d14b031e3bb2377f9f1e822f23efce469ff98e103a4b3791f6b3c4"
+      }
+    ]
+  },
+  {
+    "revision": "urn:example:a01:late",
+    "path": "raw/late.json",
+    "digest": "sha256:49a52ae0af9f68f2a24c661decf73fc43474607e814c5f349e66fd53776a01cf",
+    "selections": [
+      {
+        "reference": "urn:example:a01:A7:lateClaim:ref",
+        "pointer": "/claims/A7:lateClaim",
+        "selectedUtf8": "{\"subject\":\"ex:A7:event\",\"predicate\":\"sr:LocatedAt\",\"object\":\"ex:A7:place\"}",
+        "digest": "sha256:83bfdb442f5a3c9a2119bb7fe7d2c8cadae35080d1401cab69a1279b5865c876"
+      }
+    ]
+  },
+  {
+    "revision": "urn:example:a01:mirror",
+    "path": "raw/mirror.json",
+    "digest": "sha256:663b7c3300285bae0bf552c70c3ea896606e14d9516dc8007828c8ed5131ec7f",
+    "selections": [
+      {
+        "reference": "urn:example:a01:A6:mirrorClaim:ref",
+        "pointer": "/claims/A6:mirrorClaim",
+        "selectedUtf8": "{\"subject\":\"ex:A6:release\",\"predicate\":\"sr:ReleaseContains\",\"object\":\"ex:A6:version\"}",
+        "digest": "sha256:95ba3461eccf2360edadd8d75d860e703c519eaba8779a3e753119756a6129bf"
+      }
+    ]
+  },
+  {
+    "revision": "urn:example:a01:public",
+    "path": "raw/public.json",
+    "digest": "sha256:eb9f019fabdb6321592e0e570c918386d8a675043c1311335041519791d66aff",
+    "selections": [
+      {
+        "reference": "urn:example:a01:A15:descriptionClaim:publicDescription:ref",
+        "pointer": "/claims/A15:descriptionClaim:publicDescription",
+        "selectedUtf8": "{\"subject\":\"ex:A15:publicDescription\",\"predicate\":\"rdfs:label\",\"object\":\"\\\"Synthetic report\\\"\"}",
+        "digest": "sha256:163e03548d3cb2ea8a0355c0f32e2d47d0c7e006a06359a2bb4a872bf9c122b9"
+      }
+    ]
+  },
+  {
+    "revision": "urn:example:a01:r1",
+    "path": "raw/r1.json",
+    "digest": "sha256:7883e7012c2176ba20856710b38ed58f92ca5a8ecd901f4a36dc551108326ce7",
+    "selections": [
+      {
+        "reference": "urn:example:a01:A1:descriptionClaim:description1:ref",
+        "pointer": "/claims/A1:descriptionClaim:description1",
+        "selectedUtf8": "{\"subject\":\"ex:A1:description1\",\"predicate\":\"rdfs:label\",\"object\":\"\\\"North Star\\\"\"}",
+        "digest": "sha256:7a527f4188438caf15d609fa0e91de643565179445a57f3de2f3db40e2c065c0"
+      },
+      {
+        "reference": "urn:example:a01:A1:descriptionClaim:description2:ref",
+        "pointer": "/claims/A1:descriptionClaim:description2",
+        "selectedUtf8": "{\"subject\":\"ex:A1:description2\",\"predicate\":\"rdfs:label\",\"object\":\"\\\"North Star\\\"\"}",
+        "digest": "sha256:8991d541cd0a13338bce073e9104f6d6b5ad9fbad7218226aeb4ae5c2dbc3475"
+      },
+      {
+        "reference": "urn:example:a01:A1:descriptionClaim:ambiguousDescription:ref",
+        "pointer": "/claims/A1:descriptionClaim:ambiguousDescription",
+        "selectedUtf8": "{\"subject\":\"ex:A1:ambiguousDescription\",\"predicate\":\"rdfs:label\",\"object\":\"\\\"North Star\\\"\"}",
+        "digest": "sha256:513a800eb82bc89b6523b73d2a50844491abc5a07962e8684bffd7f3e90aba34"
+      },
+      {
+        "reference": "urn:example:a01:A1:alias1:claim:ref",
+        "pointer": "/claims/A1:alias1:claim",
+        "selectedUtf8": "{\"subject\":\"ex:A1:org1\",\"predicate\":\"sr:identifier\",\"object\":\"ex:A1:alias1\"}",
+        "digest": "sha256:ac0a98d0d0379977e0e33c94d0594b62be33961b25eecd761270287af7224c63"
+      },
+      {
+        "reference": "urn:example:a01:A1:alias2:claim:ref",
+        "pointer": "/claims/A1:alias2:claim",
+        "selectedUtf8": "{\"subject\":\"ex:A1:org1\",\"predicate\":\"sr:identifier\",\"object\":\"ex:A1:alias2\"}",
+        "digest": "sha256:1e5e3f9a683a66f412ff7a6a3c7eb05fdda7e9ddad3366a497f64c95c59e219c"
+      },
+      {
+        "reference": "urn:example:a01:A1:sameName:claim:ref",
+        "pointer": "/claims/A1:sameName:claim",
+        "selectedUtf8": "{\"subject\":\"ex:A1:org2\",\"predicate\":\"sr:identifier\",\"object\":\"ex:A1:sameName\"}",
+        "digest": "sha256:2e52a5659034228f8fd68d7787fab134ff7013a50d3c5327c2df157759e9b615"
+      },
+      {
+        "reference": "urn:example:a01:A1:leadingZero:claim:ref",
+        "pointer": "/claims/A1:leadingZero:claim",
+        "selectedUtf8": "{\"subject\":\"ex:A1:org1\",\"predicate\":\"sr:identifier\",\"object\":\"ex:A1:leadingZero\"}",
+        "digest": "sha256:4951d5cb519c56272518c0cbec869bf2f82d3d084f4765529a9f19e26f5f87bb"
+      },
+      {
+        "reference": "urn:example:a01:A1:withoutZero:claim:ref",
+        "pointer": "/claims/A1:withoutZero:claim",
+        "selectedUtf8": "{\"subject\":\"ex:A1:org2\",\"predicate\":\"sr:identifier\",\"object\":\"ex:A1:withoutZero\"}",
+        "digest": "sha256:221c8187d7c36b8b74a57bf0de5436d3dfb8b47349170d148f497680c52d3740"
+      },
+      {
+        "reference": "urn:example:a01:A1:composed:claim:ref",
+        "pointer": "/claims/A1:composed:claim",
+        "selectedUtf8": "{\"subject\":\"ex:A1:org1\",\"predicate\":\"sr:identifier\",\"object\":\"ex:A1:composed\"}",
+        "digest": "sha256:1c493afd7f9facf1a9901cbdcb449a1b5221065276c96b5777c19c1dc417d42d"
+      },
+      {
+        "reference": "urn:example:a01:A1:decomposed:claim:ref",
+        "pointer": "/claims/A1:decomposed:claim",
+        "selectedUtf8": "{\"subject\":\"ex:A1:org2\",\"predicate\":\"sr:identifier\",\"object\":\"ex:A1:decomposed\"}",
+        "digest": "sha256:2c0c02b1605bb0b109141d7b99686429cca1a1fda6ff1873aa9d8fcd3b9e32b0"
+      },
+      {
+        "reference": "urn:example:a01:A1:caseUpper:claim:ref",
+        "pointer": "/claims/A1:caseUpper:claim",
+        "selectedUtf8": "{\"subject\":\"ex:A1:org2\",\"predicate\":\"sr:identifier\",\"object\":\"ex:A1:caseUpper\"}",
+        "digest": "sha256:974c2f910a16f2d22fe2c38c24564c3c2895da944efbce403fce60f33320eda7"
+      },
+      {
+        "reference": "urn:example:a01:A2:control:claim:ref",
+        "pointer": "/claims/A2:control:claim",
+        "selectedUtf8": "{\"subject\":\"ex:A2:person\",\"predicate\":\"sr:ControlsAccount\",\"object\":\"ex:A2:account\"}",
+        "digest": "sha256:7dad9dc8fa39991c01add95af746da55b76708dd87bcd46fc220087de1b1c4b7"
+      },
+      {
+        "reference": "urn:example:a01:A5:claim1:ref",
+        "pointer": "/claims/A5:claim1",
+        "selectedUtf8": "{\"subject\":\"ex:A5:release\",\"predicate\":\"sr:ReleaseContains\",\"object\":\"ex:A5:version\"}",
+        "digest": "sha256:d2e4b666e2d14b031e3bb2377f9f1e822f23efce469ff98e103a4b3791f6b3c4"
+      },
+      {
+        "reference": "urn:example:a01:A6:bulletinClaim:ref",
+        "pointer": "/claims/A6:bulletinClaim",
+        "selectedUtf8": "{\"subject\":\"ex:A6:release\",\"predicate\":\"sr:ReleaseContains\",\"object\":\"ex:A6:version\"}",
+        "digest": "sha256:95ba3461eccf2360edadd8d75d860e703c519eaba8779a3e753119756a6129bf"
+      },
+      {
+        "reference": "urn:example:a01:A8:sourceClaim:ref",
+        "pointer": "/claims/A8:sourceClaim",
+        "selectedUtf8": "{\"subject\":\"ex:A8:entity\",\"predicate\":\"rdfs:label\",\"object\":\"\\\"Unchanged raw statement\\\"\"}",
+        "digest": "sha256:ea09f628cabc9529e7224a0d01277c3910b206f6f7f5e727b93ba2fa7979a053"
+      },
+      {
+        "reference": "urn:example:a01:A9:versionOf:claim:ref",
+        "pointer": "/claims/A9:versionOf:claim",
+        "selectedUtf8": "{\"subject\":\"ex:A9:version\",\"predicate\":\"sr:VersionOf\",\"object\":\"ex:A9:family\"}",
+        "digest": "sha256:c3e65f50c1dfee6b11cd69d70c80cc6d788858eed850b27b0eddc490af8c6a26"
+      },
+      {
+        "reference": "urn:example:a01:A9:releaseContains:claim:ref",
+        "pointer": "/claims/A9:releaseContains:claim",
+        "selectedUtf8": "{\"subject\":\"ex:A9:release\",\"predicate\":\"sr:ReleaseContains\",\"object\":\"ex:A9:version\"}",
+        "digest": "sha256:76543c5c4c00d886ef5a8ec3ee68ac7c913e847858f5055714e78fc204a0aeb9"
+      }
+    ]
+  },
+  {
+    "revision": "urn:example:a01:translation",
+    "path": "raw/translation.json",
+    "digest": "sha256:1229b2a0f0853239c65f5f667ef927c98529a00720b3c44617c9d508b2748217",
+    "selections": [
+      {
+        "reference": "urn:example:a01:A6:translationClaim:ref",
+        "pointer": "/claims/A6:translationClaim",
+        "selectedUtf8": "{\"subject\":\"ex:A6:release\",\"predicate\":\"sr:ReleaseContains\",\"object\":\"ex:A6:version\"}",
+        "digest": "sha256:95ba3461eccf2360edadd8d75d860e703c519eaba8779a3e753119756a6129bf"
+      }
+    ]
+  }
+]

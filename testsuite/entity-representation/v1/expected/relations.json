@@ -1,0 +1,26 @@
+{
+  "columns": [
+    "relation",
+    "subject",
+    "relationKind",
+    "object",
+    "scope",
+    "claim",
+    "validity",
+    "participant",
+    "role"
+  ],
+  "rows": [
+    [
+      "<urn:example:a01:A2:control>",
+      "<urn:example:a01:A2:person>",
+      "<urn:x-sparkles:representation:ControlsAccount>",
+      "<urn:example:a01:A2:account>",
+      "<urn:example:a01:A2>",
+      "<urn:example:a01:A2:control:claim>",
+      null,
+      "<urn:example:a01:A2:person>",
+      "<urn:example:a01:accountController>"
+    ]
+  ]
+}

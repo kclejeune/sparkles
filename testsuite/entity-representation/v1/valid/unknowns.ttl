@@ -1,0 +1,17 @@
+PREFIX ex: <urn:example:a01:>
+PREFIX sr: <urn:x-sparkles:representation:>
+PREFIX vt: <urn:x-sparkles:valid-time:>
+ex:unknownObservation a sr:Entity ; sr:profileVersion 1 ; sr:domainScope ex:A11 ;
+  sr:entityKind sr:CountObservation ; sr:measure ex:reportedCases1 ;
+  sr:caseDefinition ex:suspectedCases1 ; sr:countMode sr:Incident ;
+  sr:population ex:regionalPopulation1 ; sr:place ex:unknownPlace ;
+  sr:geometryVersion ex:geometry1 ; sr:reportingAuthority ex:healthAuthority ;
+  sr:observedDuring ex:unknownWindow ; sr:valueStatus sr:UnknownValue ;
+  sr:denominatorStatus sr:UnknownDenominator .
+ex:unknownPlace a sr:Entity ; sr:profileVersion 1 ; sr:domainScope ex:A11 ;
+  sr:entityKind sr:Place ; sr:administrativeLevel ex:province ;
+  sr:geometry ex:boundary1 ; sr:geometryVersion ex:geometry1 ;
+  sr:spatialUncertainty ex:administrativeArea .
+ex:unknownWindow a vt:Interval ; vt:start ex:unknownBoundary ;
+  vt:end ex:eventEnd ; vt:normalization ex:normalization .
+ex:unknownBoundary a vt:Boundary ; vt:kind vt:Unknown ; vt:sourceValue "onset date unknown" .

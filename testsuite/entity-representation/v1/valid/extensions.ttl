@@ -1,0 +1,11 @@
+PREFIX ex: <urn:example:a01:>
+PREFIX sr: <urn:x-sparkles:representation:>
+PREFIX ev: <urn:x-sparkles:evidence:>
+PREFIX vt: <urn:x-sparkles:valid-time:>
+PREFIX rdf: <http://www.w3.org/1999/02/22-rdf-syntax-ns#>
+PREFIX rdfs: <http://www.w3.org/2000/01/rdf-schema#>
+PREFIX xsd: <http://www.w3.org/2001/XMLSchema#>
+PREFIX prov: <http://www.w3.org/ns/prov#>
+ex:A14:entity a sr:Entity ; sr:profileVersion 1 ; sr:domainScope ex:A14 ; sr:entityKind sr:Organization .
+ex:A14:entity sr:extension ex:A14:optional .
+ex:A14:optional a sr:Extension ; sr:profileVersion 1 ; sr:extensionProfile ex:unsupportedOptionalProfile ; sr:payloadDigest "sha256:d96b6b5731059547b108436c132fb1004f6a6433a2e98d8cbf67504d67bcf8f5" ; sr:status sr:Uninterpreted .

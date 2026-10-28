@@ -1,0 +1,391 @@
+{
+  "profileVersion": 1,
+  "spec": "A01",
+  "availability": "simulated-only",
+  "queryFixtures": [
+    {
+      "query": "descriptions.rq",
+      "fixture": "valid/descriptions.ttl",
+      "expected": "expected/descriptions.json",
+      "base": "valid/common.ttl"
+    },
+    {
+      "query": "identifiers.rq",
+      "fixture": "valid/identifiers.ttl",
+      "expected": "expected/identifiers.json",
+      "base": "valid/common.ttl"
+    },
+    {
+      "query": "relations.rq",
+      "fixture": "valid/relations.ttl",
+      "expected": "expected/relations.json",
+      "base": "valid/common.ttl"
+    },
+    {
+      "query": "resolution.rq",
+      "fixture": "valid/resolution.ttl",
+      "expected": "expected/resolution.json",
+      "base": "valid/common.ttl"
+    },
+    {
+      "query": "support-lineage.rq",
+      "fixture": "valid/support-lineage.ttl",
+      "expected": "expected/support-lineage.json",
+      "base": "valid/common.ttl"
+    },
+    {
+      "query": "evolution.rq",
+      "fixture": "valid/evolution.ttl",
+      "expected": "expected/evolution.json",
+      "base": "valid/common.ttl"
+    },
+    {
+      "query": "software-boundaries.rq",
+      "fixture": "valid/software-boundaries.ttl",
+      "expected": "expected/software-boundaries.json",
+      "base": "valid/common.ttl"
+    },
+    {
+      "query": "episode-observations.rq",
+      "fixture": "valid/episode-observations.ttl",
+      "expected": "expected/episode-observations.json",
+      "base": "valid/common.ttl"
+    }
+  ],
+  "positiveFixtures": [
+    {
+      "path": "valid/control-authority-term-kind.ttl",
+      "base": "valid/common.ttl"
+    },
+    {
+      "path": "valid/control-identifier-literal-type.ttl",
+      "base": "valid/common.ttl"
+    },
+    {
+      "path": "valid/control-missing-authority.ttl",
+      "base": "valid/common.ttl"
+    },
+    {
+      "path": "valid/control-missing-identifierScope.ttl",
+      "base": "valid/common.ttl"
+    },
+    {
+      "path": "valid/control-missing-realm.ttl",
+      "base": "valid/common.ttl"
+    },
+    {
+      "path": "valid/control-required-extension.ttl",
+      "base": "valid/common.ttl"
+    },
+    {
+      "path": "valid/control-source-selection-mismatch.ttl",
+      "base": "valid/common.ttl"
+    },
+    {
+      "path": "valid/control-unknown-control-field.ttl",
+      "base": "valid/common.ttl"
+    },
+    {
+      "path": "valid/descriptions.ttl",
+      "base": "valid/common.ttl"
+    },
+    {
+      "path": "valid/episode-observations.ttl",
+      "base": "valid/common.ttl"
+    },
+    {
+      "path": "valid/evolution.ttl",
+      "base": "valid/common.ttl"
+    },
+    {
+      "path": "valid/extensions.ttl",
+      "base": "valid/common.ttl"
+    },
+    {
+      "path": "valid/geometry-successor.ttl",
+      "base": "valid/common.ttl"
+    },
+    {
+      "path": "valid/identifiers.ttl",
+      "base": "valid/common.ttl"
+    },
+    {
+      "path": "valid/public-boundary.ttl",
+      "base": "valid/public-common.ttl"
+    },
+    {
+      "path": "valid/relations.ttl",
+      "base": "valid/common.ttl"
+    },
+    {
+      "path": "valid/resolution.ttl",
+      "base": "valid/common.ttl"
+    },
+    {
+      "path": "valid/software-boundaries.ttl",
+      "base": "valid/common.ttl"
+    },
+    {
+      "path": "valid/support-lineage.ttl",
+      "base": "valid/common.ttl"
+    },
+    {
+      "path": "valid/unknowns.ttl",
+      "base": "valid/common.ttl"
+    }
+  ],
+  "files": [
+    {
+      "path": "README.md",
+      "digest": "sha256:defee10f39a25a89da79ad4ed8db22f24d8cfe3dba68996090bfbc39cc3a5811"
+    },
+    {
+      "path": "cases.json",
+      "digest": "sha256:20b4b43d8e75f2fcd73bab73a4c3e834de1d9014afaa5acbdc2e5a82751dab10"
+    },
+    {
+      "path": "expected/a12-conflict.json",
+      "digest": "sha256:46f977a6aea8db8018d76998b891a79aa5564c85837df1d3e1791e7dfefcc39a"
+    },
+    {
+      "path": "expected/descriptions.json",
+      "digest": "sha256:ad0f85453cdd3b9eb36f7eb9c38e85d867fc73b8b86c7e5c557e92c198193d50"
+    },
+    {
+      "path": "expected/encoding-vectors.json",
+      "digest": "sha256:bd15eab0a65e400b03c55cf59fb4b7557627a431a2a81bf51b95f208ba54a814"
+    },
+    {
+      "path": "expected/episode-observations.json",
+      "digest": "sha256:d019fe31e506d42b6eef556f286721ab06f95166ca087605a04e4348ad0dd0be"
+    },
+    {
+      "path": "expected/evolution.json",
+      "digest": "sha256:adcbb3a69f3fd39fce06503b980b6d8c9b9885c7dd02c3a6bc5b5194fa50391a"
+    },
+    {
+      "path": "expected/identifiers.json",
+      "digest": "sha256:d05e3213abcb018be9c0bdb2438ed740bbbd736ba01e305c617e45d231d14475"
+    },
+    {
+      "path": "expected/relations.json",
+      "digest": "sha256:3203b98994bfeb99e9a0673885e9456680a6fe7697616f358eee1cfbc58c09bf"
+    },
+    {
+      "path": "expected/resolution.json",
+      "digest": "sha256:19af34bfd8620972d43ad31dbcb48fdda0e0cc9799a7ec7c3b3d4f607d524c72"
+    },
+    {
+      "path": "expected/semantic-oracle.json",
+      "digest": "sha256:cde3dd67650db23abc4569868433338b119483b7364fb3c672c8a0256c97ec08"
+    },
+    {
+      "path": "expected/software-boundaries.json",
+      "digest": "sha256:edccb8d241bfe71e4a6f9920f273a4c5e1ab9c1607162cdb6f4dc5233a741f95"
+    },
+    {
+      "path": "expected/source-conflicts.json",
+      "digest": "sha256:1c91f7f9d2e09602469ce4923da39cb353af68d5850ce922d82ed883fe347854"
+    },
+    {
+      "path": "expected/source-selections.json",
+      "digest": "sha256:5f8a46b58e9ae8854c122730bfc457640945b0569f7069a6fa358b5a15909349"
+    },
+    {
+      "path": "expected/support-lineage.json",
+      "digest": "sha256:f6f6fb767698a71ce9b6018ccda57d934052a00651d0fa039cedd5e5ac808761"
+    },
+    {
+      "path": "invalid/authority-term-kind.ttl",
+      "digest": "sha256:5302c2efcd04176006ed022219d1dad8008d0c139fc40c760cb41d3c65b948c8"
+    },
+    {
+      "path": "invalid/count-and-unknown.ttl",
+      "digest": "sha256:8e67b928f8bd714d4fe3d4fc1766f3a5bf72b2290b3d735bbc9368111168cf07"
+    },
+    {
+      "path": "invalid/identifier-literal-type.ttl",
+      "digest": "sha256:1cb640c191b37b13e629dd3e3fe2cf00e02c25013109128289ea27a8eec185f6"
+    },
+    {
+      "path": "invalid/missing-authority.ttl",
+      "digest": "sha256:16bdc488c4f996ba87c8aee9b364b17ec8a2b0db0f361510309c90f557634d5a"
+    },
+    {
+      "path": "invalid/missing-count.ttl",
+      "digest": "sha256:de2d5fa6f7eec3e1e7799acc410e3a2740ff4d316b86b21ecd7bc65d6fb43891"
+    },
+    {
+      "path": "invalid/missing-denominator.ttl",
+      "digest": "sha256:dc3256318ada4330188f81fa52dc838b336285cf79e3314f1fef9e72867534b4"
+    },
+    {
+      "path": "invalid/missing-geometry-version.ttl",
+      "digest": "sha256:b20f03264d2247b73446a1653650741f5cbf13c04d9524d93b1a5640bd5bf1d4"
+    },
+    {
+      "path": "invalid/missing-identifierScope.ttl",
+      "digest": "sha256:7df576e3fc8e4694e25f219cc2ff2550ce854577434fba86d427da805ccc8c7d"
+    },
+    {
+      "path": "invalid/missing-realm.ttl",
+      "digest": "sha256:7eaede8d47f71764ba4d2975d769f69a8916c98449ed127881b57fb706aa4759"
+    },
+    {
+      "path": "invalid/negative-count.ttl",
+      "digest": "sha256:26e32110d05dbe2db86b48ea64cd130e199ae3fe7cc09faffa3aa9303d763925"
+    },
+    {
+      "path": "invalid/relation-endpoints.ttl",
+      "digest": "sha256:3edec7a34b2d85dbaf46a467f8468fcb28b804f80a40bec651a296782a8d01f6"
+    },
+    {
+      "path": "invalid/required-extension.ttl",
+      "digest": "sha256:3d0e90f485e07773820d0239e50ffc17deaf85c43c0a50c9ad089be0f66a02b1"
+    },
+    {
+      "path": "invalid/source-selection-mismatch.ttl",
+      "digest": "sha256:ef9006e5c869700903f80b0fbfebafb4ae30cbf3e1f04322ee08e2c3c78b8052"
+    },
+    {
+      "path": "invalid/uncertainty-order.ttl",
+      "digest": "sha256:0db7c9b066a84a399bd34e2051e7fd079b4372b05332b58a8c151a804edc2f2b"
+    },
+    {
+      "path": "invalid/unknown-control-field.ttl",
+      "digest": "sha256:24ae1e6791deb5938724658cea18b8605e3c2c2ccb0b5a917caa99d3e051a963"
+    },
+    {
+      "path": "invalid/unknown-count-mode.ttl",
+      "digest": "sha256:aa46d4cdd9ef2c0e7846a614f0be91ec88b72a070aedc458eb67dbf93bf83a5e"
+    },
+    {
+      "path": "raw/health1.json",
+      "digest": "sha256:8e48b7494c975b57bc994d8404e47a125e2a80500fad83f32dd18a49f6c960c8"
+    },
+    {
+      "path": "raw/health2.json",
+      "digest": "sha256:43969f4ae338e502d1d4dbc3df6557a4b00bd2f9b1888f309be16da7e7e725dc"
+    },
+    {
+      "path": "raw/independent.json",
+      "digest": "sha256:59721998761ec89ff5a81a49b3fd80262e6bc7928f1f1d50b9b4854874c4fff8"
+    },
+    {
+      "path": "raw/late.json",
+      "digest": "sha256:49a52ae0af9f68f2a24c661decf73fc43474607e814c5f349e66fd53776a01cf"
+    },
+    {
+      "path": "raw/mirror.json",
+      "digest": "sha256:663b7c3300285bae0bf552c70c3ea896606e14d9516dc8007828c8ed5131ec7f"
+    },
+    {
+      "path": "raw/optional-extension.txt",
+      "digest": "sha256:d96b6b5731059547b108436c132fb1004f6a6433a2e98d8cbf67504d67bcf8f5"
+    },
+    {
+      "path": "raw/public.json",
+      "digest": "sha256:eb9f019fabdb6321592e0e570c918386d8a675043c1311335041519791d66aff"
+    },
+    {
+      "path": "raw/r1.json",
+      "digest": "sha256:7883e7012c2176ba20856710b38ed58f92ca5a8ecd901f4a36dc551108326ce7"
+    },
+    {
+      "path": "raw/tampered-r1.json",
+      "digest": "sha256:77a2650471bce458cb460a531f86e41bdc6f870f195143e2e8860d5808cdd615"
+    },
+    {
+      "path": "raw/translation.json",
+      "digest": "sha256:1229b2a0f0853239c65f5f667ef927c98529a00720b3c44617c9d508b2748217"
+    },
+    {
+      "path": "valid/common.ttl",
+      "digest": "sha256:dc8056ca4496d40c55b3c2b778cd36b90c42b8cc17a418a56b98b553ec981b3c"
+    },
+    {
+      "path": "valid/control-authority-term-kind.ttl",
+      "digest": "sha256:079c3da09235663ca096228425c8909b90473a68054f129327963b53f969cdda"
+    },
+    {
+      "path": "valid/control-identifier-literal-type.ttl",
+      "digest": "sha256:079c3da09235663ca096228425c8909b90473a68054f129327963b53f969cdda"
+    },
+    {
+      "path": "valid/control-missing-authority.ttl",
+      "digest": "sha256:079c3da09235663ca096228425c8909b90473a68054f129327963b53f969cdda"
+    },
+    {
+      "path": "valid/control-missing-identifierScope.ttl",
+      "digest": "sha256:079c3da09235663ca096228425c8909b90473a68054f129327963b53f969cdda"
+    },
+    {
+      "path": "valid/control-missing-realm.ttl",
+      "digest": "sha256:079c3da09235663ca096228425c8909b90473a68054f129327963b53f969cdda"
+    },
+    {
+      "path": "valid/control-required-extension.ttl",
+      "digest": "sha256:aaa0d4754850a5519429989ff469e9cec36c0cdc0d5ab7d1f483a3d344c6a557"
+    },
+    {
+      "path": "valid/control-source-selection-mismatch.ttl",
+      "digest": "sha256:131c3b79a39ee41d281ea304287fb600088b1d96107d88b35938a930c67e3906"
+    },
+    {
+      "path": "valid/control-unknown-control-field.ttl",
+      "digest": "sha256:079c3da09235663ca096228425c8909b90473a68054f129327963b53f969cdda"
+    },
+    {
+      "path": "valid/descriptions.ttl",
+      "digest": "sha256:221e336ed626de6f92530fce26271d9ca1a5b3a0ab435a9f3d307e530fe30dcd"
+    },
+    {
+      "path": "valid/episode-observations.ttl",
+      "digest": "sha256:f5d7a785cbeb246a446267f2c080a68011e04a6a026d6f589dd71e7854fdddac"
+    },
+    {
+      "path": "valid/evolution.ttl",
+      "digest": "sha256:b709854a9404cfe3dba09d27bed8ee51de6f076bf4e37ce5abb0101f878948d8"
+    },
+    {
+      "path": "valid/extensions.ttl",
+      "digest": "sha256:07d0d9f19439ab846c6a7a4dd9eeddcf6de9d3c01ba15d130327f67d46c023fe"
+    },
+    {
+      "path": "valid/geometry-successor.ttl",
+      "digest": "sha256:c66c4304bb231b737e54c32218a6e16bb628645ec1e813cadf82f4ef679ed6ee"
+    },
+    {
+      "path": "valid/identifiers.ttl",
+      "digest": "sha256:fd9004f43275a1cac4a7c294682ace6f014b186f2ecce2769715e902d54622d9"
+    },
+    {
+      "path": "valid/public-boundary.ttl",
+      "digest": "sha256:6f95389d29cc120678d79a1dcc09069e200a37803fa81424138b0e0b71eb4654"
+    },
+    {
+      "path": "valid/public-common.ttl",
+      "digest": "sha256:48272fcc022b62ffeb6e9e5bcd8450f6fb71709e9cf122fc4ee3f998d05fd107"
+    },
+    {
+      "path": "valid/relations.ttl",
+      "digest": "sha256:0e842b56054177ad2040c1b3558212c5f8d596da0476af28c705913cd846fa57"
+    },
+    {
+      "path": "valid/resolution.ttl",
+      "digest": "sha256:e9573235465b0eb8e108f1ea1b288870232fe145e1bebf7d2033b72b9195a437"
+    },
+    {
+      "path": "valid/software-boundaries.ttl",
+      "digest": "sha256:0578957742108325ee554e3bac600cf46aa24459a07eb661fbbac4f6afcb028b"
+    },
+    {
+      "path": "valid/support-lineage.ttl",
+      "digest": "sha256:5c73c71d40b821f5282919f8b769e3af2ad63264560ecc473cae1dcdb114123c"
+    },
+    {
+      "path": "valid/unknowns.ttl",
+      "digest": "sha256:5e0b7505cde818c93047b38dfbc138270a3720c7b5576d23f61781a552276c83"
+    }
+  ]
+}

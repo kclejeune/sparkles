@@ -1,0 +1,19 @@
+PREFIX sr: <urn:x-sparkles:representation:>
+PREFIX ev: <urn:x-sparkles:evidence:>
+PREFIX vt: <urn:x-sparkles:valid-time:>
+PREFIX rdf: <http://www.w3.org/1999/02/22-rdf-syntax-ns#>
+PREFIX rdfs: <http://www.w3.org/2000/01/rdf-schema#>
+PREFIX xsd: <http://www.w3.org/2001/XMLSchema#>
+PREFIX prov: <http://www.w3.org/ns/prov#>
+# Run against one explicitly authorized recorded view. No query admits claims.
+SELECT ?record ?changeKind ?sourceRevision ?mappingVersion ?previous ?publication ?availability WHERE {
+  { ?record a sr:Projection ; sr:mappingVersion ?mappingVersion ; sr:claim ?claim .
+    ?claim prov:wasDerivedFrom ?sourceRevision .
+    OPTIONAL { ?record prov:wasRevisionOf ?previous } BIND("projection" AS ?changeKind) }
+  UNION
+  { ?record a sr:Migration ; sr:fromVersion ?previous ; sr:toVersion ?mappingVersion ; sr:generatedRecord ?projection .
+    ?projection sr:claim ?claim . ?claim prov:wasDerivedFrom ?sourceRevision . BIND("mapping-migration" AS ?changeKind) }
+  UNION
+  { ?record a ev:Claim ; prov:wasDerivedFrom ?sourceRevision ; vt:occurredDuring ?window .
+    ?sourceRevision ev:publishedAt ?publication ; ev:firstAvailableAt ?availability . BIND("source-observation" AS ?changeKind) }
+}

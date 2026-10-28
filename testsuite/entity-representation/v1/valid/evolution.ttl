@@ -1,0 +1,20 @@
+PREFIX ex: <urn:example:a01:>
+PREFIX sr: <urn:x-sparkles:representation:>
+PREFIX ev: <urn:x-sparkles:evidence:>
+PREFIX vt: <urn:x-sparkles:valid-time:>
+PREFIX rdf: <http://www.w3.org/1999/02/22-rdf-syntax-ns#>
+PREFIX rdfs: <http://www.w3.org/2000/01/rdf-schema#>
+PREFIX xsd: <http://www.w3.org/2001/XMLSchema#>
+PREFIX prov: <http://www.w3.org/ns/prov#>
+ex:A7:lateClaim a ev:Claim ; rdf:reifies <<( ex:A7:event sr:LocatedAt ex:A7:place )>> ; ev:claimKind ev:Reported ; ev:polarity ev:Positive ; prov:wasDerivedFrom ex:late ; prov:wasGeneratedBy ex:import ; prov:wasAttributedTo ex:author .
+ex:A7:lateClaim vt:occurredDuring ex:eventWindow .
+ex:A8:view1:manifest a sr:InputManifest ; sr:profileVersion 1 ; sr:inputId ex:r1, <urn:x-sparkles:representation:policy:1>, ex:mapping1 .
+ex:A8:view1 a sr:ResolutionView ; sr:profileVersion 1 ; sr:domainScope ex:A8 ; sr:matchingPolicy <urn:x-sparkles:representation:policy:1> ; sr:ontologyVersion ex:ontology1 ; sr:mappingVersion ex:mapping1 ; sr:normalizationVersion ex:normalization1 ; sr:recordedView ex:simulatedSnapshot ; sr:inputManifest ex:A8:view1:manifest .
+ex:A8:view2:manifest a sr:InputManifest ; sr:profileVersion 1 ; sr:inputId ex:r1, <urn:x-sparkles:representation:policy:1>, ex:mapping2 .
+ex:A8:view2 a sr:ResolutionView ; sr:profileVersion 1 ; sr:domainScope ex:A8 ; sr:matchingPolicy <urn:x-sparkles:representation:policy:1> ; sr:ontologyVersion ex:ontology1 ; sr:mappingVersion ex:mapping2 ; sr:normalizationVersion ex:normalization1 ; sr:recordedView ex:simulatedSnapshot ; sr:inputManifest ex:A8:view2:manifest .
+ex:A8:projection1 a sr:Projection ; sr:profileVersion 1 ; sr:domainScope ex:A8 ; sr:matchingPolicy <urn:x-sparkles:representation:policy:1> ; sr:ontologyVersion ex:ontology1 ; sr:mappingVersion ex:mapping1 ; sr:normalizationVersion ex:normalization1 ; sr:recordedView ex:simulatedSnapshot ; sr:inputManifest ex:A8:view1:manifest ; sr:resolutionView ex:A8:view1 ; sr:projectionKind sr:OfflineExpected ; sr:claim ex:A8:sourceClaim .
+ex:A8:projection2 a sr:Projection ; sr:profileVersion 1 ; sr:domainScope ex:A8 ; sr:matchingPolicy <urn:x-sparkles:representation:policy:1> ; sr:ontologyVersion ex:ontology1 ; sr:mappingVersion ex:mapping2 ; sr:normalizationVersion ex:normalization1 ; sr:recordedView ex:simulatedSnapshot ; sr:inputManifest ex:A8:view2:manifest ; sr:resolutionView ex:A8:view2 ; sr:projectionKind sr:OfflineExpected ; sr:claim ex:A8:sourceClaim ; prov:wasRevisionOf ex:A8:projection1 .
+ex:A8:sourceClaim a ev:Claim ; rdf:reifies <<( ex:A8:entity rdfs:label "Unchanged raw statement" )>> ; ev:claimKind ev:Reported ; ev:polarity ev:Positive ; prov:wasDerivedFrom ex:r1 ; prov:wasGeneratedBy ex:import ; prov:wasAttributedTo ex:author .
+ex:A8:migration a sr:Migration ; sr:profileVersion 1 ; sr:fromVersion ex:mapping1 ; sr:toVersion ex:mapping2 ; sr:method ex:mappingMigration1 ; sr:inputManifest ex:A8:view2:manifest ; sr:generatedRecord ex:A8:projection2 .
+ex:A8:view1:manifest sr:inputId <urn:x-sparkles:representation:policy:1>, ex:A8:sourceClaim, ex:mapping1, ex:normalization1, ex:ontology1, ex:r1, ex:simulatedSnapshot .
+ex:A8:view2:manifest sr:inputId <urn:x-sparkles:representation:policy:1>, ex:A8:sourceClaim, ex:mapping2, ex:normalization1, ex:ontology1, ex:r1, ex:simulatedSnapshot .

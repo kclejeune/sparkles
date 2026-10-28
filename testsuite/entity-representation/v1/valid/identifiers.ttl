@@ -1,0 +1,34 @@
+PREFIX ex: <urn:example:a01:>
+PREFIX sr: <urn:x-sparkles:representation:>
+PREFIX ev: <urn:x-sparkles:evidence:>
+PREFIX vt: <urn:x-sparkles:valid-time:>
+PREFIX rdf: <http://www.w3.org/1999/02/22-rdf-syntax-ns#>
+PREFIX rdfs: <http://www.w3.org/2000/01/rdf-schema#>
+PREFIX xsd: <http://www.w3.org/2001/XMLSchema#>
+PREFIX prov: <http://www.w3.org/ns/prov#>
+ex:A1:alias1 a sr:Identifier ; sr:profileVersion 1 ; sr:authority ex:registry ; sr:realm ex:realm1 ; sr:identifierScope ex:A1 ; sr:lexicalValue "North Star" .
+ex:A1:alias1:claim a ev:Claim ; rdf:reifies <<( ex:A1:org1 sr:identifier ex:A1:alias1 )>> ; ev:claimKind ev:Reported ; ev:polarity ev:Positive ; prov:wasDerivedFrom ex:r1 ; prov:wasGeneratedBy ex:import ; prov:wasAttributedTo ex:author .
+ex:A1:alias1:binding a sr:Identification ; sr:profileVersion 1 ; sr:domainScope ex:A1 ; sr:identifier ex:A1:alias1 ; sr:entity ex:A1:org1 ; sr:claim ex:A1:alias1:claim .
+ex:A1:alias2 a sr:Identifier ; sr:profileVersion 1 ; sr:authority ex:registry ; sr:realm ex:realm1 ; sr:identifierScope ex:A1 ; sr:lexicalValue "Northstar" .
+ex:A1:alias2:claim a ev:Claim ; rdf:reifies <<( ex:A1:org1 sr:identifier ex:A1:alias2 )>> ; ev:claimKind ev:Reported ; ev:polarity ev:Positive ; prov:wasDerivedFrom ex:r1 ; prov:wasGeneratedBy ex:import ; prov:wasAttributedTo ex:author .
+ex:A1:alias2:binding a sr:Identification ; sr:profileVersion 1 ; sr:domainScope ex:A1 ; sr:identifier ex:A1:alias2 ; sr:entity ex:A1:org1 ; sr:claim ex:A1:alias2:claim .
+ex:A1:sameName a sr:Identifier ; sr:profileVersion 1 ; sr:authority ex:registry ; sr:realm ex:realm2 ; sr:identifierScope ex:A1 ; sr:lexicalValue "North Star" .
+ex:A1:sameName:claim a ev:Claim ; rdf:reifies <<( ex:A1:org2 sr:identifier ex:A1:sameName )>> ; ev:claimKind ev:Reported ; ev:polarity ev:Positive ; prov:wasDerivedFrom ex:r1 ; prov:wasGeneratedBy ex:import ; prov:wasAttributedTo ex:author .
+ex:A1:sameName:binding a sr:Identification ; sr:profileVersion 1 ; sr:domainScope ex:A1 ; sr:identifier ex:A1:sameName ; sr:entity ex:A1:org2 ; sr:claim ex:A1:sameName:claim .
+ex:A1:leadingZero a sr:Identifier ; sr:profileVersion 1 ; sr:authority ex:registry ; sr:realm ex:realm1 ; sr:identifierScope ex:A1 ; sr:lexicalValue "001" .
+ex:A1:leadingZero:claim a ev:Claim ; rdf:reifies <<( ex:A1:org1 sr:identifier ex:A1:leadingZero )>> ; ev:claimKind ev:Reported ; ev:polarity ev:Positive ; prov:wasDerivedFrom ex:r1 ; prov:wasGeneratedBy ex:import ; prov:wasAttributedTo ex:author .
+ex:A1:leadingZero:binding a sr:Identification ; sr:profileVersion 1 ; sr:domainScope ex:A1 ; sr:identifier ex:A1:leadingZero ; sr:entity ex:A1:org1 ; sr:claim ex:A1:leadingZero:claim .
+ex:A1:withoutZero a sr:Identifier ; sr:profileVersion 1 ; sr:authority ex:registry ; sr:realm ex:realm1 ; sr:identifierScope ex:A1 ; sr:lexicalValue "1" .
+ex:A1:withoutZero:claim a ev:Claim ; rdf:reifies <<( ex:A1:org2 sr:identifier ex:A1:withoutZero )>> ; ev:claimKind ev:Reported ; ev:polarity ev:Positive ; prov:wasDerivedFrom ex:r1 ; prov:wasGeneratedBy ex:import ; prov:wasAttributedTo ex:author .
+ex:A1:withoutZero:binding a sr:Identification ; sr:profileVersion 1 ; sr:domainScope ex:A1 ; sr:identifier ex:A1:withoutZero ; sr:entity ex:A1:org2 ; sr:claim ex:A1:withoutZero:claim .
+ex:A1:composed a sr:Identifier ; sr:profileVersion 1 ; sr:authority ex:registry ; sr:realm ex:realm1 ; sr:identifierScope ex:A1 ; sr:lexicalValue "é" .
+ex:A1:composed:claim a ev:Claim ; rdf:reifies <<( ex:A1:org1 sr:identifier ex:A1:composed )>> ; ev:claimKind ev:Reported ; ev:polarity ev:Positive ; prov:wasDerivedFrom ex:r1 ; prov:wasGeneratedBy ex:import ; prov:wasAttributedTo ex:author .
+ex:A1:composed:binding a sr:Identification ; sr:profileVersion 1 ; sr:domainScope ex:A1 ; sr:identifier ex:A1:composed ; sr:entity ex:A1:org1 ; sr:claim ex:A1:composed:claim .
+ex:A1:decomposed a sr:Identifier ; sr:profileVersion 1 ; sr:authority ex:registry ; sr:realm ex:realm1 ; sr:identifierScope ex:A1 ; sr:lexicalValue "é" .
+ex:A1:decomposed:claim a ev:Claim ; rdf:reifies <<( ex:A1:org2 sr:identifier ex:A1:decomposed )>> ; ev:claimKind ev:Reported ; ev:polarity ev:Positive ; prov:wasDerivedFrom ex:r1 ; prov:wasGeneratedBy ex:import ; prov:wasAttributedTo ex:author .
+ex:A1:decomposed:binding a sr:Identification ; sr:profileVersion 1 ; sr:domainScope ex:A1 ; sr:identifier ex:A1:decomposed ; sr:entity ex:A1:org2 ; sr:claim ex:A1:decomposed:claim .
+ex:A1:caseUpper a sr:Identifier ; sr:profileVersion 1 ; sr:authority ex:registry ; sr:realm ex:realm1 ; sr:identifierScope ex:A1 ; sr:lexicalValue "NORTHSTAR" .
+ex:A1:caseUpper:claim a ev:Claim ; rdf:reifies <<( ex:A1:org2 sr:identifier ex:A1:caseUpper )>> ; ev:claimKind ev:Reported ; ev:polarity ev:Positive ; prov:wasDerivedFrom ex:r1 ; prov:wasGeneratedBy ex:import ; prov:wasAttributedTo ex:author .
+ex:A1:caseUpper:binding a sr:Identification ; sr:profileVersion 1 ; sr:domainScope ex:A1 ; sr:identifier ex:A1:caseUpper ; sr:entity ex:A1:org2 ; sr:claim ex:A1:caseUpper:claim .
+ex:A1:org1 a sr:Entity ; sr:profileVersion 1 ; sr:domainScope ex:A1 ; sr:entityKind sr:Organization .
+ex:A1:org2 a sr:Entity ; sr:profileVersion 1 ; sr:domainScope ex:A1 ; sr:entityKind sr:Organization .

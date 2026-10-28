@@ -1,0 +1,49 @@
+{
+  "columns": [
+    "record",
+    "changeKind",
+    "sourceRevision",
+    "mappingVersion",
+    "previous",
+    "publication",
+    "availability"
+  ],
+  "rows": [
+    [
+      "<urn:example:a01:A8:projection1>",
+      "\"projection\"",
+      "<urn:example:a01:r1>",
+      "<urn:example:a01:mapping1>",
+      null,
+      null,
+      null
+    ],
+    [
+      "<urn:example:a01:A8:projection2>",
+      "\"projection\"",
+      "<urn:example:a01:r1>",
+      "<urn:example:a01:mapping2>",
+      "<urn:example:a01:A8:projection1>",
+      null,
+      null
+    ],
+    [
+      "<urn:example:a01:A8:migration>",
+      "\"mapping-migration\"",
+      "<urn:example:a01:r1>",
+      "<urn:example:a01:mapping2>",
+      "<urn:example:a01:mapping1>",
+      null,
+      null
+    ],
+    [
+      "<urn:example:a01:A7:lateClaim>",
+      "\"source-observation\"",
+      "<urn:example:a01:late>",
+      null,
+      null,
+      "\"2026-01-02T00:00:00Z\"^^<http://www.w3.org/2001/XMLSchema#dateTime>",
+      "\"2026-03-01T00:00:00Z\"^^<http://www.w3.org/2001/XMLSchema#dateTime>"
+    ]
+  ]
+}

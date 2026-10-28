@@ -1,0 +1,36 @@
+{
+  "columns": [
+    "description",
+    "sourceRevision",
+    "selection",
+    "entity",
+    "kind",
+    "status"
+  ],
+  "rows": [
+    [
+      "<urn:example:a01:A1:description1>",
+      "<urn:example:a01:r1>",
+      "<urn:example:a01:A1:descriptionClaim:description1:ref>",
+      "<urn:example:a01:A1:org1>",
+      "<urn:x-sparkles:representation:Organization>",
+      "\"described\""
+    ],
+    [
+      "<urn:example:a01:A1:description2>",
+      "<urn:example:a01:r1>",
+      "<urn:example:a01:A1:descriptionClaim:description2:ref>",
+      "<urn:example:a01:A1:org2>",
+      "<urn:x-sparkles:representation:Organization>",
+      "\"described\""
+    ],
+    [
+      "<urn:example:a01:A1:ambiguousDescription>",
+      "<urn:example:a01:r1>",
+      "<urn:example:a01:A1:descriptionClaim:ambiguousDescription:ref>",
+      null,
+      null,
+      "\"unresolved\""
+    ]
+  ]
+}

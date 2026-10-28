@@ -1,0 +1,13 @@
+PREFIX sr: <urn:x-sparkles:representation:>
+<urn:x-sparkles:representation:manifest:1> sr:profileVersion 1 .
+<urn:x-sparkles:representation:resource:1:vocabulary.ttl> sr:resourcePath "vocabulary.ttl" ; sr:contentDigest "sha256:013c398f58ba57625ea256621b9ef3ffad94d03963f0d3a3ae7033f44e2eaa6f" .
+<urn:x-sparkles:representation:resource:1:shapes.ttl> sr:resourcePath "shapes.ttl" ; sr:contentDigest "sha256:bc09bc1829e02660c4e4690eef906bc12ff80470a1b69e2f710275871fbac891" .
+<urn:x-sparkles:representation:resource:1:policies/default.ttl> sr:resourcePath "policies/default.ttl" ; sr:contentDigest "sha256:d6a43d457ca1f11952b20c9958662bace71a3ce5da21c1177e2c6136837e7fdd" .
+<urn:x-sparkles:representation:resource:1:queries/descriptions.rq> sr:resourcePath "queries/descriptions.rq" ; sr:contentDigest "sha256:e49f5b33411af2b7726989e26bea807b5f5008df9048819962b6c179c0904320" .
+<urn:x-sparkles:representation:resource:1:queries/identifiers.rq> sr:resourcePath "queries/identifiers.rq" ; sr:contentDigest "sha256:80dfa7a61d426f301c3d738f050152157ccf6a3293cbedaf8cd3a1846fb11d47" .
+<urn:x-sparkles:representation:resource:1:queries/relations.rq> sr:resourcePath "queries/relations.rq" ; sr:contentDigest "sha256:f5abdda1f8861899e2545ea6dd8eb76454da4cc920274efc99880d42890d5993" .
+<urn:x-sparkles:representation:resource:1:queries/resolution.rq> sr:resourcePath "queries/resolution.rq" ; sr:contentDigest "sha256:756066da6460f1c8cdf922e57e4c258ab28c984be174653645a36eb63116c3f1" .
+<urn:x-sparkles:representation:resource:1:queries/support-lineage.rq> sr:resourcePath "queries/support-lineage.rq" ; sr:contentDigest "sha256:2936344e5b523073b967b27350303db6594c4d153eeb3a79ddcb56f68e396c27" .
+<urn:x-sparkles:representation:resource:1:queries/evolution.rq> sr:resourcePath "queries/evolution.rq" ; sr:contentDigest "sha256:20f82fcf337dd3645326c970cb4c4f8e3aae0ad0427c98f4e713629043ad606e" .
+<urn:x-sparkles:representation:resource:1:queries/software-boundaries.rq> sr:resourcePath "queries/software-boundaries.rq" ; sr:contentDigest "sha256:6ec7233fa868f267590dcbc9375d2f887ae114c7fdfd3b79d86d73c5d065e6e3" .
+<urn:x-sparkles:representation:resource:1:queries/episode-observations.rq> sr:resourcePath "queries/episode-observations.rq" ; sr:contentDigest "sha256:971711b8f699deeacb4ca243126298bc824999ff1970b22f4081ec202a731f78" .

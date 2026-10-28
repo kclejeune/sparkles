@@ -1,0 +1,137 @@
+PREFIX sr: <urn:x-sparkles:representation:>
+PREFIX ev: <urn:x-sparkles:evidence:>
+PREFIX vt: <urn:x-sparkles:valid-time:>
+PREFIX rdf: <http://www.w3.org/1999/02/22-rdf-syntax-ns#>
+PREFIX rdfs: <http://www.w3.org/2000/01/rdf-schema#>
+PREFIX xsd: <http://www.w3.org/2001/XMLSchema#>
+PREFIX prov: <http://www.w3.org/ns/prov#>
+<urn:x-sparkles:representation:profile:1> sr:profileVersion 1 .
+sr:Entity a rdfs:Class ; rdfs:comment "A stable application domain identity anchor, never a rewritten source description." .
+sr:Description a rdfs:Class ; rdfs:comment "One exact source-specific description with a C25 evidence selection." .
+sr:Identifier a rdfs:Class ; rdfs:comment "A designation under explicit authority, realm and identifier scope." .
+sr:Identification a rdfs:Class ; rdfs:comment "A source-backed qualified identifier binding, not a global identity assertion." .
+sr:Relation a rdfs:Class ; rdfs:comment "A scoped directed relationship retaining its C25 claim occurrences." .
+sr:RoleAssignment a rdfs:Class ; rdfs:comment "A participant and role qualifier belonging to a relationship." .
+sr:ResolutionView a rdfs:Class ; rdfs:comment "An immutable, scoped interpretation of exact review and policy inputs." .
+sr:Assignment a rdfs:Class ; rdfs:comment "An entity representative or unresolved diagnostic within one resolution view." .
+sr:Conflict a rdfs:Class ; rdfs:comment "A normalized component and code diagnostic retaining its original decision causes." .
+sr:Projection a rdfs:Class ; rdfs:comment "An immutable read-view artifact, separate from its current publication pointer." .
+sr:Migration a rdfs:Class ; rdfs:comment "A versioned mapping or ontology transformation over exact source revisions." .
+sr:Denominator a rdfs:Class ; rdfs:comment "A qualified count denominator with population, unit and observation interval." .
+sr:Extension a rdfs:Class ; rdfs:comment "An explicitly profiled extension payload retained without implicit interpretation." .
+sr:Policy a rdfs:Class ; rdfs:comment "An application matching policy that grants no reviewer or managed-write authority." .
+sr:InputManifest a rdfs:Class ; rdfs:comment "Exact record and version identifiers selected for an offline expected view." .
+sr:profileVersion a rdf:Property ; rdfs:comment "Explicit resource contract version." .
+sr:domainScope a rdf:Property ; rdfs:comment "The application boundary for a record or resolution." .
+sr:entityKind a rdf:Property ; rdfs:comment "One application kind, separate from a source description." .
+sr:sourceRevision a rdf:Property ; rdfs:comment "The exact C25 source revision described." .
+sr:selection a rdf:Property ; rdfs:comment "The exact C25 evidence reference selecting source content." .
+sr:describes a rdf:Property ; rdfs:comment "A proposed or reviewed entity anchor described by this source record." .
+sr:authority a rdf:Property ; rdfs:comment "The issuer of an identifier designation." .
+sr:realm a rdf:Property ; rdfs:comment "The authority namespace or account system." .
+sr:identifierScope a rdf:Property ; rdfs:comment "The explicitly declared scope of a designation." .
+sr:lexicalValue a rdf:Property ; rdfs:comment "The original case-sensitive designation string without implicit normalization." .
+sr:identifier a rdf:Property ; rdfs:comment "The designation used in a qualified binding." .
+sr:entity a rdf:Property ; rdfs:comment "The stable anchor in an identification or assignment." .
+sr:claim a rdf:Property ; rdfs:comment "An exact attributed C25 claim occurrence supporting the record." .
+sr:subject a rdf:Property ; rdfs:comment "The source end of a directed qualified relationship." .
+sr:object a rdf:Property ; rdfs:comment "The destination end of a qualified relationship." .
+sr:relationKind a rdf:Property ; rdfs:comment "The declared meaning of a directed relationship." .
+sr:roleAssignment a rdf:Property ; rdfs:comment "A participant-role qualifier for a relationship." .
+sr:participant a rdf:Property ; rdfs:comment "The entity participating in a role." .
+sr:role a rdf:Property ; rdfs:comment "The declared role IRI." .
+sr:matchingPolicy a rdf:Property ; rdfs:comment "The exact application matching policy version." .
+sr:ontologyVersion a rdf:Property ; rdfs:comment "The selected ontology version IRI." .
+sr:mappingVersion a rdf:Property ; rdfs:comment "The selected adapter mapping version IRI." .
+sr:normalizationVersion a rdf:Property ; rdfs:comment "The selected temporal normalization version IRI." .
+sr:recordedView a rdf:Property ; rdfs:comment "The retained recorded coordinate, or an explicitly synthetic fixture coordinate." .
+sr:inputManifest a rdf:Property ; rdfs:comment "The exact input record manifest IRI." .
+sr:resolutionView a rdf:Property ; rdfs:comment "The immutable map revision used by this artifact." .
+sr:representative a rdf:Property ; rdfs:comment "A view-specific join representative, never a rewritten entity identity." .
+sr:status a rdf:Property ; rdfs:comment "An explicit resolved, unresolved or uninterpreted state." .
+sr:decision a rdf:Property ; rdfs:comment "A contributing immutable C25 decision ID." .
+sr:proposal a rdf:Property ; rdfs:comment "An original C25 identity proposal whose membership and provenance remain inspectable." .
+sr:component a rdf:Property ; rdfs:comment "The prospective positive-connectivity component in one resolution view." .
+sr:code a rdf:Property ; rdfs:comment "A stable diagnostic code." .
+sr:projectionKind a rdf:Property ; rdfs:comment "The declared projection mode; fixture expected artifacts are not managed admission." .
+sr:fromVersion a rdf:Property ; rdfs:comment "The immutable previous ontology or mapping version." .
+sr:toVersion a rdf:Property ; rdfs:comment "The immutable successor ontology or mapping version." .
+sr:method a rdf:Property ; rdfs:comment "The versioned migration method IRI." .
+sr:generatedRecord a rdf:Property ; rdfs:comment "A record generated by an explicit migration." .
+sr:measure a rdf:Property ; rdfs:comment "The versioned observation measure." .
+sr:caseDefinition a rdf:Property ; rdfs:comment "The versioned suspected or confirmed case definition." .
+sr:countMode a rdf:Property ; rdfs:comment "Incident or cumulative interpretation of a count." .
+sr:population a rdf:Property ; rdfs:comment "The declared observed population." .
+sr:place a rdf:Property ; rdfs:comment "The observed place identity, separate from its geometry revision." .
+sr:geometryVersion a rdf:Property ; rdfs:comment "The exact geometry version used in interpretation." .
+sr:reportingAuthority a rdf:Property ; rdfs:comment "The source authority reporting an observation." .
+sr:observedDuring a rdf:Property ; rdfs:comment "A C27 interval for the observation window." .
+sr:count a rdf:Property ; rdfs:comment "A nonnegative integer observation value." .
+sr:valueStatus a rdf:Property ; rdfs:comment "An explicit unknown observation value." .
+sr:denominator a rdf:Property ; rdfs:comment "A qualified known denominator record." .
+sr:denominatorStatus a rdf:Property ; rdfs:comment "An explicit unknown denominator." .
+sr:denominatorValue a rdf:Property ; rdfs:comment "The nonnegative denominator value." .
+sr:unit a rdf:Property ; rdfs:comment "The declared measure unit." .
+sr:uncertaintyExpression a rdf:Property ; rdfs:comment "The source uncertainty expression retained without probability conversion." .
+sr:lowerCount a rdf:Property ; rdfs:comment "The lower nonnegative count uncertainty bound." .
+sr:upperCount a rdf:Property ; rdfs:comment "The upper nonnegative count uncertainty bound." .
+sr:administrativeLevel a rdf:Property ; rdfs:comment "The declared administrative level of a place." .
+sr:geometry a rdf:Property ; rdfs:comment "The retained geometry resource." .
+sr:spatialUncertainty a rdf:Property ; rdfs:comment "The versioned policy for spatial uncertainty." .
+sr:digestAlgorithm a rdf:Property ; rdfs:comment "The declared artifact digest algorithm." .
+sr:digestValue a rdf:Property ; rdfs:comment "A source-reported artifact digest string." .
+sr:verificationStatus a rdf:Property ; rdfs:comment "Whether retained artifact bytes have been verified by the declared method." .
+sr:extension a rdf:Property ; rdfs:comment "A linked extension record." .
+sr:extensionProfile a rdf:Property ; rdfs:comment "The exact extension contract IRI." .
+sr:payloadDigest a rdf:Property ; rdfs:comment "The SHA-256 digest of retained extension bytes." .
+sr:requiredExtension a rdf:Property ; rdfs:comment "An extension whose semantics are mandatory to replay." .
+sr:inputId a rdf:Property ; rdfs:comment "An exact input record or immutable version IRI." .
+sr:contentDigest a rdf:Property ; rdfs:comment "The SHA-256 digest of a resource or retained manifest." .
+sr:resourcePath a rdf:Property ; rdfs:comment "The relative packaged resource path." .
+sr:separationRule a rdf:Property ; rdfs:comment "The n-ary separation rule selected by this policy." .
+sr:conflictRule a rdf:Property ; rdfs:comment "The component conflict aggregation rule selected by this policy." .
+sr:kindRule a rdf:Property ; rdfs:comment "The entity-kind compatibility rule selected by this policy." .
+sr:representativeRule a rdf:Property ; rdfs:comment "The deterministic representative ordering selected by this policy." .
+sr:stringRule a rdf:Property ; rdfs:comment "The exact JSON scalar encoding rule selected by this policy." .
+sr:Person a rdfs:Resource ; rdfs:comment "The Person application kind, distinct from its source descriptions." .
+sr:Account a rdfs:Resource ; rdfs:comment "The Account application kind, distinct from its source descriptions." .
+sr:Organization a rdfs:Resource ; rdfs:comment "The Organization application kind, distinct from its source descriptions." .
+sr:LegalEntity a rdfs:Resource ; rdfs:comment "The LegalEntity application kind, distinct from its source descriptions." .
+sr:Place a rdfs:Resource ; rdfs:comment "The Place application kind, distinct from its source descriptions." .
+sr:EventEpisode a rdfs:Resource ; rdfs:comment "The EventEpisode application kind, distinct from its source descriptions." .
+sr:PackageFamily a rdfs:Resource ; rdfs:comment "The PackageFamily application kind, distinct from its source descriptions." .
+sr:PackageVersion a rdfs:Resource ; rdfs:comment "The PackageVersion application kind, distinct from its source descriptions." .
+sr:SoftwareRelease a rdfs:Resource ; rdfs:comment "The SoftwareRelease application kind, distinct from its source descriptions." .
+sr:Build a rdfs:Resource ; rdfs:comment "The Build application kind, distinct from its source descriptions." .
+sr:Artifact a rdfs:Resource ; rdfs:comment "The Artifact application kind, distinct from its source descriptions." .
+sr:Deployment a rdfs:Resource ; rdfs:comment "The Deployment application kind, distinct from its source descriptions." .
+sr:DeviceModel a rdfs:Resource ; rdfs:comment "The DeviceModel application kind, distinct from its source descriptions." .
+sr:DeviceInstance a rdfs:Resource ; rdfs:comment "The DeviceInstance application kind, distinct from its source descriptions." .
+sr:Disease a rdfs:Resource ; rdfs:comment "The Disease application kind, distinct from its source descriptions." .
+sr:CountObservation a rdfs:Resource ; rdfs:comment "The CountObservation application kind, distinct from its source descriptions." .
+sr:ControlsAccount a rdfs:Resource ; rdfs:comment "A scoped claim of human control of an account, not identity." .
+sr:RealizesOrganization a rdfs:Resource ; rdfs:comment "A legal entity realizes an organizational identity." .
+sr:AccountingParentOf a rdfs:Resource ; rdfs:comment "A scoped accounting parent relationship, not beneficial ownership." .
+sr:LocatedAt a rdfs:Resource ; rdfs:comment "A scoped location relationship without citizenship or sponsorship implication." .
+sr:VersionOf a rdfs:Resource ; rdfs:comment "An ecosystem package version belongs to a package family." .
+sr:ReleaseContains a rdfs:Resource ; rdfs:comment "A release includes a package version without implying selected build or deployment." .
+sr:BuildProduces a rdfs:Resource ; rdfs:comment "A build produces an artifact under the declared digest policy." .
+sr:DeploymentUses a rdfs:Resource ; rdfs:comment "An observation of deployment use with environment and dates." .
+sr:InstanceOfModel a rdfs:Resource ; rdfs:comment "A device instance is associated with a product model." .
+sr:ReportAboutEpisode a rdfs:Resource ; rdfs:comment "A source description is associated with a reviewed local episode." .
+sr:ObservationAboutEpisode a rdfs:Resource ; rdfs:comment "A count observation belongs to an event episode." .
+sr:Resolved a rdfs:Resource ; rdfs:comment "A consistent assignment under the pinned policy and selected input boundary." .
+sr:Unresolved a rdfs:Resource ; rdfs:comment "A component cannot be assigned a representative under the pinned policy." .
+sr:Uninterpreted a rdfs:Resource ; rdfs:comment "An optional extension is retained and excluded from semantic answers." .
+sr:Incident a rdfs:Resource ; rdfs:comment "Count values describe new observations in the declared interval." .
+sr:Cumulative a rdfs:Resource ; rdfs:comment "Count values describe a running total, not incident values to add." .
+sr:UnknownValue a rdfs:Resource ; rdfs:comment "The observation value is explicitly unknown." .
+sr:UnknownDenominator a rdfs:Resource ; rdfs:comment "The denominator is unknown rather than zero." .
+sr:UnknownVerification a rdfs:Resource ; rdfs:comment "Artifact bytes have not been verified." .
+sr:Verified a rdfs:Resource ; rdfs:comment "A separately declared method verified artifact bytes." .
+sr:OfflineExpected a rdfs:Resource ; rdfs:comment "An independently declared fixture projection, not authenticated admission." .
+sr:PairwiseSeparation a rdfs:Resource ; rdfs:comment "Each distinct pair in an accepted n-ary separation is kept separate." .
+sr:WholeComponentConflict a rdfs:Resource ; rdfs:comment "A conflict makes its prospective positive component unresolved." .
+sr:ExactKind a rdfs:Resource ; rdfs:comment "Different application kinds cannot co-resolve in version 1." .
+sr:LeastUtf8Iri a rdfs:Resource ; rdfs:comment "The view representative is the least member IRI by UTF-8 byte order." .
+sr:ScalarJson1 a rdfs:Resource ; rdfs:comment "A01 fixed JSON field order and Unicode scalar escaping rules." .

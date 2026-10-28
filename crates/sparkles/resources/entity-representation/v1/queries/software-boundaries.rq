@@ -1,0 +1,15 @@
+PREFIX sr: <urn:x-sparkles:representation:>
+PREFIX ev: <urn:x-sparkles:evidence:>
+PREFIX vt: <urn:x-sparkles:valid-time:>
+PREFIX rdf: <http://www.w3.org/1999/02/22-rdf-syntax-ns#>
+PREFIX rdfs: <http://www.w3.org/2000/01/rdf-schema#>
+PREFIX xsd: <http://www.w3.org/2001/XMLSchema#>
+PREFIX prov: <http://www.w3.org/ns/prov#>
+# Run against one explicitly authorized recorded view. No query admits claims.
+SELECT ?entity ?kind ?verification ?deploymentRelation ?deploymentEvidenceStatus WHERE {
+  ?entity a sr:Entity ; sr:entityKind ?kind .
+  VALUES ?kind { sr:PackageFamily sr:PackageVersion sr:SoftwareRelease sr:Build sr:Artifact sr:Deployment }
+  OPTIONAL { ?entity sr:verificationStatus ?verification }
+  OPTIONAL { ?deploymentRelation a sr:Relation ; sr:relationKind sr:DeploymentUses ; sr:object ?entity }
+  BIND(IF(BOUND(?deploymentRelation), "reported-use", "unknown") AS ?deploymentEvidenceStatus)
+}

@@ -1,0 +1,329 @@
+PREFIX sr: <urn:x-sparkles:representation:>
+PREFIX ev: <urn:x-sparkles:evidence:>
+PREFIX vt: <urn:x-sparkles:valid-time:>
+PREFIX rdf: <http://www.w3.org/1999/02/22-rdf-syntax-ns#>
+PREFIX rdfs: <http://www.w3.org/2000/01/rdf-schema#>
+PREFIX xsd: <http://www.w3.org/2001/XMLSchema#>
+PREFIX prov: <http://www.w3.org/ns/prov#>
+PREFIX sh: <http://www.w3.org/ns/shacl#>
+<urn:x-sparkles:representation:shapes:1> sr:profileVersion 1 .
+sr:OrdinaryEntityShape a sh:NodeShape ;
+  sh:nodeKind sh:IRI ;
+  sh:closed true ;
+  sh:ignoredProperties (rdf:type rdfs:label) ;
+  sh:property [ sh:path sr:profileVersion ; sh:datatype xsd:integer ; sh:minCount 1 ; sh:maxCount 1 ; sh:hasValue 1 ] ;
+  sh:property [ sh:path sr:extension ; sh:nodeKind sh:IRI ; sh:class sr:Extension ;  ] ;
+  sh:property [ sh:path sr:domainScope ; sh:nodeKind sh:IRI ; sh:minCount 1 ; sh:maxCount 1 ;  ] ;
+  sh:property [ sh:path sr:entityKind ; sh:nodeKind sh:IRI ; sh:minCount 1 ; sh:maxCount 1 ; sh:in (sr:Person sr:Account sr:Organization sr:LegalEntity sr:EventEpisode sr:PackageFamily sr:PackageVersion sr:SoftwareRelease sr:Build sr:Artifact sr:Deployment sr:DeviceModel sr:DeviceInstance sr:Disease) ;  ] ;
+  sh:property [ sh:path sr:digestAlgorithm ; sh:nodeKind sh:IRI ; sh:maxCount 1 ;  ] ;
+  sh:property [ sh:path sr:digestValue ; sh:datatype xsd:string ; sh:maxCount 1 ;  ] ;
+  sh:property [ sh:path sr:verificationStatus ; sh:nodeKind sh:IRI ; sh:maxCount 1 ; sh:in (sr:UnknownVerification sr:Verified) ;  ] ;
+  sh:sparql [ sh:message "Digest fields qualify artifacts and do not verify their bytes." ; sh:select """PREFIX sr: <urn:x-sparkles:representation:>
+PREFIX ev: <urn:x-sparkles:evidence:>
+PREFIX vt: <urn:x-sparkles:valid-time:>
+PREFIX rdf: <http://www.w3.org/1999/02/22-rdf-syntax-ns#>
+PREFIX rdfs: <http://www.w3.org/2000/01/rdf-schema#>
+PREFIX xsd: <http://www.w3.org/2001/XMLSchema#>
+PREFIX prov: <http://www.w3.org/ns/prov#>
+PREFIX sh: <http://www.w3.org/ns/shacl#>
+SELECT $this WHERE { $this sr:entityKind ?kind . $this ?p ?v . FILTER(?p IN (sr:digestAlgorithm, sr:digestValue, sr:verificationStatus) && ?kind != sr:Artifact) }""" ] .
+
+sr:PlaceShape a sh:NodeShape ;
+  sh:nodeKind sh:IRI ;
+  sh:closed true ;
+  sh:ignoredProperties (rdf:type rdfs:label) ;
+  sh:property [ sh:path sr:profileVersion ; sh:datatype xsd:integer ; sh:minCount 1 ; sh:maxCount 1 ; sh:hasValue 1 ] ;
+  sh:property [ sh:path sr:extension ; sh:nodeKind sh:IRI ; sh:class sr:Extension ;  ] ;
+  sh:property [ sh:path sr:domainScope ; sh:nodeKind sh:IRI ; sh:minCount 1 ; sh:maxCount 1 ;  ] ;
+  sh:property [ sh:path sr:entityKind ; sh:nodeKind sh:IRI ; sh:minCount 1 ; sh:maxCount 1 ; sh:in (sr:Place) ;  ] ;
+  sh:property [ sh:path sr:administrativeLevel ; sh:nodeKind sh:IRI ; sh:minCount 1 ; sh:maxCount 1 ;  ] ;
+  sh:property [ sh:path sr:geometry ; sh:nodeKind sh:IRI ; sh:minCount 1 ; sh:maxCount 1 ;  ] ;
+  sh:property [ sh:path sr:geometryVersion ; sh:nodeKind sh:IRI ; sh:minCount 1 ; sh:maxCount 1 ;  ] ;
+  sh:property [ sh:path sr:spatialUncertainty ; sh:nodeKind sh:IRI ; sh:minCount 1 ; sh:maxCount 1 ;  ] .
+
+sr:CountObservationShape a sh:NodeShape ;
+  sh:nodeKind sh:IRI ;
+  sh:closed true ;
+  sh:ignoredProperties (rdf:type rdfs:label) ;
+  sh:property [ sh:path sr:profileVersion ; sh:datatype xsd:integer ; sh:minCount 1 ; sh:maxCount 1 ; sh:hasValue 1 ] ;
+  sh:property [ sh:path sr:extension ; sh:nodeKind sh:IRI ; sh:class sr:Extension ;  ] ;
+  sh:property [ sh:path sr:domainScope ; sh:nodeKind sh:IRI ; sh:minCount 1 ; sh:maxCount 1 ;  ] ;
+  sh:property [ sh:path sr:entityKind ; sh:nodeKind sh:IRI ; sh:minCount 1 ; sh:maxCount 1 ; sh:in (sr:CountObservation) ;  ] ;
+  sh:property [ sh:path sr:measure ; sh:nodeKind sh:IRI ; sh:minCount 1 ; sh:maxCount 1 ;  ] ;
+  sh:property [ sh:path sr:caseDefinition ; sh:nodeKind sh:IRI ; sh:minCount 1 ; sh:maxCount 1 ;  ] ;
+  sh:property [ sh:path sr:population ; sh:nodeKind sh:IRI ; sh:minCount 1 ; sh:maxCount 1 ;  ] ;
+  sh:property [ sh:path sr:geometryVersion ; sh:nodeKind sh:IRI ; sh:minCount 1 ; sh:maxCount 1 ;  ] ;
+  sh:property [ sh:path sr:reportingAuthority ; sh:nodeKind sh:IRI ; sh:minCount 1 ; sh:maxCount 1 ;  ] ;
+  sh:property [ sh:path sr:place ; sh:nodeKind sh:IRI ; sh:minCount 1 ; sh:maxCount 1 ; sh:class sr:Entity ;  ] ;
+  sh:property [ sh:path sr:observedDuring ; sh:nodeKind sh:IRI ; sh:minCount 1 ; sh:maxCount 1 ; sh:class vt:Interval ;  ] ;
+  sh:property [ sh:path sr:countMode ; sh:nodeKind sh:IRI ; sh:minCount 1 ; sh:maxCount 1 ; sh:in (sr:Incident sr:Cumulative) ;  ] ;
+  sh:property [ sh:path sr:count ; sh:datatype xsd:integer ; sh:maxCount 1 ; sh:minInclusive 0 ] ;
+  sh:property [ sh:path sr:valueStatus ; sh:nodeKind sh:IRI ; sh:maxCount 1 ; sh:in (sr:UnknownValue) ;  ] ;
+  sh:property [ sh:path sr:denominator ; sh:nodeKind sh:IRI ; sh:maxCount 1 ; sh:class sr:Denominator ;  ] ;
+  sh:property [ sh:path sr:denominatorStatus ; sh:nodeKind sh:IRI ; sh:maxCount 1 ; sh:in (sr:UnknownDenominator) ;  ] ;
+  sh:property [ sh:path sr:uncertaintyExpression ; sh:datatype xsd:string ; sh:maxCount 1 ;  ] ;
+  sh:property [ sh:path sr:lowerCount ; sh:datatype xsd:integer ; sh:maxCount 1 ; sh:minInclusive 0 ] ;
+  sh:property [ sh:path sr:upperCount ; sh:datatype xsd:integer ; sh:maxCount 1 ; sh:minInclusive 0 ] ;
+  sh:xone (
+    [ sh:property [ sh:path sr:count ; sh:minCount 1 ] ; sh:property [ sh:path sr:valueStatus ; sh:maxCount 0 ] ]
+    [ sh:property [ sh:path sr:valueStatus ; sh:hasValue sr:UnknownValue ] ; sh:property [ sh:path sr:count ; sh:maxCount 0 ] ]
+  ) ;
+  sh:xone (
+    [ sh:property [ sh:path sr:denominator ; sh:minCount 1 ] ; sh:property [ sh:path sr:denominatorStatus ; sh:maxCount 0 ] ]
+    [ sh:property [ sh:path sr:denominatorStatus ; sh:hasValue sr:UnknownDenominator ] ; sh:property [ sh:path sr:denominator ; sh:maxCount 0 ] ]
+  ) ;
+  sh:or (
+    [ sh:property [ sh:path sr:lowerCount ; sh:maxCount 0 ] ; sh:property [ sh:path sr:upperCount ; sh:maxCount 0 ] ]
+    [ sh:property [ sh:path sr:lowerCount ; sh:minCount 1 ] ; sh:property [ sh:path sr:upperCount ; sh:minCount 1 ] ]
+  ) ;
+  sh:sparql [ sh:message "Count uncertainty bounds are ordered and the observation references a place." ; sh:select """PREFIX sr: <urn:x-sparkles:representation:>
+PREFIX ev: <urn:x-sparkles:evidence:>
+PREFIX vt: <urn:x-sparkles:valid-time:>
+PREFIX rdf: <http://www.w3.org/1999/02/22-rdf-syntax-ns#>
+PREFIX rdfs: <http://www.w3.org/2000/01/rdf-schema#>
+PREFIX xsd: <http://www.w3.org/2001/XMLSchema#>
+PREFIX prov: <http://www.w3.org/ns/prov#>
+PREFIX sh: <http://www.w3.org/ns/shacl#>
+SELECT $this WHERE { { $this sr:lowerCount ?lo ; sr:upperCount ?hi . FILTER(?lo > ?hi) } UNION { $this sr:place ?place . FILTER NOT EXISTS { ?place sr:entityKind sr:Place } } }""" ] .
+
+sr:EntityShape a sh:NodeShape ;
+  sh:targetClass sr:Entity ;
+  sh:nodeKind sh:IRI ;
+  sh:or (sr:OrdinaryEntityShape sr:PlaceShape sr:CountObservationShape) .
+
+sr:DescriptionShape a sh:NodeShape ;
+  sh:targetClass sr:Description ;
+  sh:nodeKind sh:IRI ;
+  sh:closed true ;
+  sh:ignoredProperties (rdf:type rdfs:label) ;
+  sh:property [ sh:path sr:profileVersion ; sh:datatype xsd:integer ; sh:minCount 1 ; sh:maxCount 1 ; sh:hasValue 1 ] ;
+  sh:property [ sh:path sr:extension ; sh:nodeKind sh:IRI ; sh:class sr:Extension ;  ] ;
+  sh:property [ sh:path sr:domainScope ; sh:nodeKind sh:IRI ; sh:minCount 1 ; sh:maxCount 1 ;  ] ;
+  sh:property [ sh:path sr:sourceRevision ; sh:nodeKind sh:IRI ; sh:minCount 1 ; sh:maxCount 1 ; sh:class ev:SourceRevision ;  ] ;
+  sh:property [ sh:path sr:selection ; sh:nodeKind sh:IRI ; sh:minCount 1 ; sh:maxCount 1 ; sh:class ev:EvidenceRef ;  ] ;
+  sh:property [ sh:path sr:describes ; sh:nodeKind sh:IRI ; sh:maxCount 1 ; sh:class sr:Entity ;  ] ;
+  sh:sparql [ sh:message "Description and selection must retain the same source revision." ; sh:select """PREFIX sr: <urn:x-sparkles:representation:>
+PREFIX ev: <urn:x-sparkles:evidence:>
+PREFIX vt: <urn:x-sparkles:valid-time:>
+PREFIX rdf: <http://www.w3.org/1999/02/22-rdf-syntax-ns#>
+PREFIX rdfs: <http://www.w3.org/2000/01/rdf-schema#>
+PREFIX xsd: <http://www.w3.org/2001/XMLSchema#>
+PREFIX prov: <http://www.w3.org/ns/prov#>
+PREFIX sh: <http://www.w3.org/ns/shacl#>
+SELECT $this WHERE { $this sr:sourceRevision ?revision ; sr:selection ?ref . FILTER NOT EXISTS { ?ref ev:sourceRevision ?revision } }""" ] .
+
+sr:IdentifierShape a sh:NodeShape ;
+  sh:targetClass sr:Identifier ;
+  sh:nodeKind sh:IRI ;
+  sh:closed true ;
+  sh:ignoredProperties (rdf:type rdfs:label) ;
+  sh:property [ sh:path sr:profileVersion ; sh:datatype xsd:integer ; sh:minCount 1 ; sh:maxCount 1 ; sh:hasValue 1 ] ;
+  sh:property [ sh:path sr:extension ; sh:nodeKind sh:IRI ; sh:class sr:Extension ;  ] ;
+  sh:property [ sh:path sr:authority ; sh:nodeKind sh:IRI ; sh:minCount 1 ; sh:maxCount 1 ;  ] ;
+  sh:property [ sh:path sr:realm ; sh:nodeKind sh:IRI ; sh:minCount 1 ; sh:maxCount 1 ;  ] ;
+  sh:property [ sh:path sr:identifierScope ; sh:nodeKind sh:IRI ; sh:minCount 1 ; sh:maxCount 1 ;  ] ;
+  sh:property [ sh:path sr:lexicalValue ; sh:datatype xsd:string ; sh:minCount 1 ; sh:maxCount 1 ;  ] .
+
+sr:IdentificationShape a sh:NodeShape ;
+  sh:targetClass sr:Identification ;
+  sh:nodeKind sh:IRI ;
+  sh:closed true ;
+  sh:ignoredProperties (rdf:type rdfs:label) ;
+  sh:property [ sh:path sr:profileVersion ; sh:datatype xsd:integer ; sh:minCount 1 ; sh:maxCount 1 ; sh:hasValue 1 ] ;
+  sh:property [ sh:path sr:extension ; sh:nodeKind sh:IRI ; sh:class sr:Extension ;  ] ;
+  sh:property [ sh:path sr:domainScope ; sh:nodeKind sh:IRI ; sh:minCount 1 ; sh:maxCount 1 ;  ] ;
+  sh:property [ sh:path sr:identifier ; sh:nodeKind sh:IRI ; sh:minCount 1 ; sh:maxCount 1 ; sh:class sr:Identifier ;  ] ;
+  sh:property [ sh:path sr:entity ; sh:nodeKind sh:IRI ; sh:minCount 1 ; sh:maxCount 1 ; sh:class sr:Entity ;  ] ;
+  sh:property [ sh:path sr:claim ; sh:nodeKind sh:IRI ; sh:minCount 1 ; sh:class ev:Claim ;  ] ;
+  sh:property [ sh:path vt:validDuring ; sh:nodeKind sh:IRI ; sh:maxCount 1 ; sh:class vt:Interval ;  ] .
+
+sr:RelationShape a sh:NodeShape ;
+  sh:targetClass sr:Relation ;
+  sh:nodeKind sh:IRI ;
+  sh:closed true ;
+  sh:ignoredProperties (rdf:type rdfs:label) ;
+  sh:property [ sh:path sr:profileVersion ; sh:datatype xsd:integer ; sh:minCount 1 ; sh:maxCount 1 ; sh:hasValue 1 ] ;
+  sh:property [ sh:path sr:extension ; sh:nodeKind sh:IRI ; sh:class sr:Extension ;  ] ;
+  sh:property [ sh:path sr:domainScope ; sh:nodeKind sh:IRI ; sh:minCount 1 ; sh:maxCount 1 ;  ] ;
+  sh:property [ sh:path sr:subject ; sh:nodeKind sh:IRI ; sh:minCount 1 ; sh:maxCount 1 ;  ] ;
+  sh:property [ sh:path sr:object ; sh:nodeKind sh:IRI ; sh:minCount 1 ; sh:maxCount 1 ; sh:class sr:Entity ;  ] ;
+  sh:property [ sh:path sr:relationKind ; sh:nodeKind sh:IRI ; sh:minCount 1 ; sh:maxCount 1 ; sh:in (sr:ControlsAccount sr:RealizesOrganization sr:AccountingParentOf sr:LocatedAt sr:VersionOf sr:ReleaseContains sr:BuildProduces sr:DeploymentUses sr:InstanceOfModel sr:ReportAboutEpisode sr:ObservationAboutEpisode) ;  ] ;
+  sh:property [ sh:path sr:claim ; sh:nodeKind sh:IRI ; sh:minCount 1 ; sh:class ev:Claim ;  ] ;
+  sh:property [ sh:path sr:roleAssignment ; sh:nodeKind sh:IRI ; sh:class sr:RoleAssignment ;  ] ;
+  sh:property [ sh:path vt:validDuring ; sh:nodeKind sh:IRI ; sh:maxCount 1 ; sh:class vt:Interval ;  ] ;
+  sh:property [ sh:path vt:occurredDuring ; sh:nodeKind sh:IRI ; sh:maxCount 1 ; sh:class vt:Interval ;  ] ;
+  sh:sparql [ sh:message "Relationship endpoints must match their declared directed meaning." ; sh:select """PREFIX sr: <urn:x-sparkles:representation:>
+PREFIX ev: <urn:x-sparkles:evidence:>
+PREFIX vt: <urn:x-sparkles:valid-time:>
+PREFIX rdf: <http://www.w3.org/1999/02/22-rdf-syntax-ns#>
+PREFIX rdfs: <http://www.w3.org/2000/01/rdf-schema#>
+PREFIX xsd: <http://www.w3.org/2001/XMLSchema#>
+PREFIX prov: <http://www.w3.org/ns/prov#>
+PREFIX sh: <http://www.w3.org/ns/shacl#>
+SELECT $this WHERE {
+  $this sr:subject ?sub ; sr:object ?obj ; sr:relationKind ?kind .
+  FILTER NOT EXISTS {
+    { ?sub a sr:Entity ; sr:entityKind ?sk . ?obj sr:entityKind ?ok .
+      FILTER(
+        (?kind = sr:ControlsAccount && ?sk = sr:Person && ?ok = sr:Account) ||
+        (?kind = sr:RealizesOrganization && ?sk = sr:LegalEntity && ?ok = sr:Organization) ||
+        (?kind = sr:AccountingParentOf && ?sk = sr:LegalEntity && ?ok = sr:LegalEntity) ||
+        (?kind = sr:LocatedAt && ?sk IN (sr:Organization, sr:LegalEntity, sr:Deployment, sr:DeviceInstance) && ?ok = sr:Place) ||
+        (?kind = sr:VersionOf && ?sk = sr:PackageVersion && ?ok = sr:PackageFamily) ||
+        (?kind = sr:ReleaseContains && ?sk = sr:SoftwareRelease && ?ok = sr:PackageVersion) ||
+        (?kind = sr:BuildProduces && ?sk = sr:Build && ?ok = sr:Artifact) ||
+        (?kind = sr:DeploymentUses && ?sk = sr:Deployment && ?ok = sr:Artifact) ||
+        (?kind = sr:InstanceOfModel && ?sk = sr:DeviceInstance && ?ok = sr:DeviceModel) ||
+        (?kind = sr:ObservationAboutEpisode && ?sk = sr:CountObservation && ?ok = sr:EventEpisode)
+      )
+    }
+    UNION { FILTER(?kind = sr:ReportAboutEpisode) ?sub a sr:Description . ?obj sr:entityKind sr:EventEpisode . }
+  }
+}""" ] .
+
+sr:RoleAssignmentShape a sh:NodeShape ;
+  sh:targetClass sr:RoleAssignment ;
+  sh:nodeKind sh:IRI ;
+  sh:closed true ;
+  sh:ignoredProperties (rdf:type rdfs:label) ;
+  sh:property [ sh:path sr:profileVersion ; sh:datatype xsd:integer ; sh:minCount 1 ; sh:maxCount 1 ; sh:hasValue 1 ] ;
+  sh:property [ sh:path sr:extension ; sh:nodeKind sh:IRI ; sh:class sr:Extension ;  ] ;
+  sh:property [ sh:path sr:participant ; sh:nodeKind sh:IRI ; sh:minCount 1 ; sh:maxCount 1 ; sh:class sr:Entity ;  ] ;
+  sh:property [ sh:path sr:role ; sh:nodeKind sh:IRI ; sh:minCount 1 ; sh:maxCount 1 ;  ] .
+
+sr:ResolutionViewShape a sh:NodeShape ;
+  sh:targetClass sr:ResolutionView ;
+  sh:nodeKind sh:IRI ;
+  sh:closed true ;
+  sh:ignoredProperties (rdf:type rdfs:label) ;
+  sh:property [ sh:path sr:profileVersion ; sh:datatype xsd:integer ; sh:minCount 1 ; sh:maxCount 1 ; sh:hasValue 1 ] ;
+  sh:property [ sh:path sr:extension ; sh:nodeKind sh:IRI ; sh:class sr:Extension ;  ] ;
+  sh:property [ sh:path sr:domainScope ; sh:nodeKind sh:IRI ; sh:minCount 1 ; sh:maxCount 1 ;  ] ;
+  sh:property [ sh:path sr:matchingPolicy ; sh:nodeKind sh:IRI ; sh:minCount 1 ; sh:maxCount 1 ;  ] ;
+  sh:property [ sh:path sr:ontologyVersion ; sh:nodeKind sh:IRI ; sh:minCount 1 ; sh:maxCount 1 ;  ] ;
+  sh:property [ sh:path sr:mappingVersion ; sh:nodeKind sh:IRI ; sh:minCount 1 ; sh:maxCount 1 ;  ] ;
+  sh:property [ sh:path sr:normalizationVersion ; sh:nodeKind sh:IRI ; sh:minCount 1 ; sh:maxCount 1 ;  ] ;
+  sh:property [ sh:path sr:recordedView ; sh:nodeKind sh:IRI ; sh:minCount 1 ; sh:maxCount 1 ;  ] ;
+  sh:property [ sh:path sr:inputManifest ; sh:nodeKind sh:IRI ; sh:minCount 1 ; sh:maxCount 1 ; sh:class sr:InputManifest ;  ] ;
+  sh:property [ sh:path sr:proposal ; sh:nodeKind sh:IRI ; sh:class ev:IdentityProposal ;  ] ;
+  sh:property [ sh:path sr:decision ; sh:nodeKind sh:IRI ; sh:class ev:ReviewDecision ;  ] .
+
+sr:AssignmentShape a sh:NodeShape ;
+  sh:targetClass sr:Assignment ;
+  sh:nodeKind sh:IRI ;
+  sh:closed true ;
+  sh:ignoredProperties (rdf:type rdfs:label) ;
+  sh:property [ sh:path sr:profileVersion ; sh:datatype xsd:integer ; sh:minCount 1 ; sh:maxCount 1 ; sh:hasValue 1 ] ;
+  sh:property [ sh:path sr:extension ; sh:nodeKind sh:IRI ; sh:class sr:Extension ;  ] ;
+  sh:property [ sh:path sr:resolutionView ; sh:nodeKind sh:IRI ; sh:minCount 1 ; sh:maxCount 1 ; sh:class sr:ResolutionView ;  ] ;
+  sh:property [ sh:path sr:component ; sh:nodeKind sh:IRI ; sh:minCount 1 ; sh:maxCount 1 ;  ] ;
+  sh:property [ sh:path sr:entity ; sh:nodeKind sh:IRI ; sh:minCount 1 ; sh:maxCount 1 ; sh:class sr:Entity ;  ] ;
+  sh:property [ sh:path sr:representative ; sh:nodeKind sh:IRI ; sh:maxCount 1 ; sh:class sr:Entity ;  ] ;
+  sh:property [ sh:path sr:status ; sh:nodeKind sh:IRI ; sh:minCount 1 ; sh:maxCount 1 ; sh:in (sr:Resolved sr:Unresolved) ;  ] ;
+  sh:property [ sh:path sr:decision ; sh:nodeKind sh:IRI ; sh:class ev:ReviewDecision ;  ] ;
+  sh:xone (
+    [ sh:property [ sh:path sr:status ; sh:hasValue sr:Resolved ] ; sh:property [ sh:path sr:representative ; sh:minCount 1 ] ]
+    [ sh:property [ sh:path sr:status ; sh:hasValue sr:Unresolved ] ; sh:property [ sh:path sr:representative ; sh:maxCount 0 ] ]
+  ) .
+
+sr:ConflictShape a sh:NodeShape ;
+  sh:targetClass sr:Conflict ;
+  sh:nodeKind sh:IRI ;
+  sh:closed true ;
+  sh:ignoredProperties (rdf:type rdfs:label) ;
+  sh:property [ sh:path sr:profileVersion ; sh:datatype xsd:integer ; sh:minCount 1 ; sh:maxCount 1 ; sh:hasValue 1 ] ;
+  sh:property [ sh:path sr:extension ; sh:nodeKind sh:IRI ; sh:class sr:Extension ;  ] ;
+  sh:property [ sh:path sr:resolutionView ; sh:nodeKind sh:IRI ; sh:minCount 1 ; sh:maxCount 1 ; sh:class sr:ResolutionView ;  ] ;
+  sh:property [ sh:path sr:component ; sh:nodeKind sh:IRI ; sh:minCount 1 ; sh:maxCount 1 ;  ] ;
+  sh:property [ sh:path sr:entity ; sh:nodeKind sh:IRI ; sh:minCount 1 ; sh:class sr:Entity ;  ] ;
+  sh:property [ sh:path sr:code ; sh:datatype xsd:string ; sh:minCount 1 ; sh:maxCount 1 ; sh:in ("distinct-conflict" "kind-conflict" "decision-conflict") ;  ] ;
+  sh:property [ sh:path sr:decision ; sh:nodeKind sh:IRI ; sh:minCount 1 ; sh:class ev:ReviewDecision ;  ] ;
+  sh:property [ sh:path sr:proposal ; sh:nodeKind sh:IRI ; sh:minCount 1 ; sh:class ev:IdentityProposal ;  ] .
+
+sr:ProjectionShape a sh:NodeShape ;
+  sh:targetClass sr:Projection ;
+  sh:nodeKind sh:IRI ;
+  sh:closed true ;
+  sh:ignoredProperties (rdf:type rdfs:label) ;
+  sh:property [ sh:path sr:profileVersion ; sh:datatype xsd:integer ; sh:minCount 1 ; sh:maxCount 1 ; sh:hasValue 1 ] ;
+  sh:property [ sh:path sr:extension ; sh:nodeKind sh:IRI ; sh:class sr:Extension ;  ] ;
+  sh:property [ sh:path sr:domainScope ; sh:nodeKind sh:IRI ; sh:minCount 1 ; sh:maxCount 1 ;  ] ;
+  sh:property [ sh:path sr:matchingPolicy ; sh:nodeKind sh:IRI ; sh:minCount 1 ; sh:maxCount 1 ;  ] ;
+  sh:property [ sh:path sr:ontologyVersion ; sh:nodeKind sh:IRI ; sh:minCount 1 ; sh:maxCount 1 ;  ] ;
+  sh:property [ sh:path sr:mappingVersion ; sh:nodeKind sh:IRI ; sh:minCount 1 ; sh:maxCount 1 ;  ] ;
+  sh:property [ sh:path sr:normalizationVersion ; sh:nodeKind sh:IRI ; sh:minCount 1 ; sh:maxCount 1 ;  ] ;
+  sh:property [ sh:path sr:recordedView ; sh:nodeKind sh:IRI ; sh:minCount 1 ; sh:maxCount 1 ;  ] ;
+  sh:property [ sh:path sr:resolutionView ; sh:nodeKind sh:IRI ; sh:minCount 1 ; sh:maxCount 1 ; sh:class sr:ResolutionView ;  ] ;
+  sh:property [ sh:path sr:inputManifest ; sh:nodeKind sh:IRI ; sh:minCount 1 ; sh:maxCount 1 ; sh:class sr:InputManifest ;  ] ;
+  sh:property [ sh:path sr:projectionKind ; sh:nodeKind sh:IRI ; sh:minCount 1 ; sh:maxCount 1 ; sh:in (sr:OfflineExpected) ;  ] ;
+  sh:property [ sh:path sr:claim ; sh:nodeKind sh:IRI ; sh:class ev:Claim ;  ] ;
+  sh:property [ sh:path prov:wasRevisionOf ; sh:nodeKind sh:IRI ; sh:maxCount 1 ; sh:class sr:Projection ;  ] .
+
+sr:MigrationShape a sh:NodeShape ;
+  sh:targetClass sr:Migration ;
+  sh:nodeKind sh:IRI ;
+  sh:closed true ;
+  sh:ignoredProperties (rdf:type rdfs:label) ;
+  sh:property [ sh:path sr:profileVersion ; sh:datatype xsd:integer ; sh:minCount 1 ; sh:maxCount 1 ; sh:hasValue 1 ] ;
+  sh:property [ sh:path sr:extension ; sh:nodeKind sh:IRI ; sh:class sr:Extension ;  ] ;
+  sh:property [ sh:path sr:fromVersion ; sh:nodeKind sh:IRI ; sh:minCount 1 ; sh:maxCount 1 ;  ] ;
+  sh:property [ sh:path sr:toVersion ; sh:nodeKind sh:IRI ; sh:minCount 1 ; sh:maxCount 1 ;  ] ;
+  sh:property [ sh:path sr:method ; sh:nodeKind sh:IRI ; sh:minCount 1 ; sh:maxCount 1 ;  ] ;
+  sh:property [ sh:path sr:inputManifest ; sh:nodeKind sh:IRI ; sh:minCount 1 ; sh:maxCount 1 ; sh:class sr:InputManifest ;  ] ;
+  sh:property [ sh:path sr:generatedRecord ; sh:nodeKind sh:IRI ; sh:minCount 1 ;  ] .
+
+sr:DenominatorShape a sh:NodeShape ;
+  sh:targetClass sr:Denominator ;
+  sh:nodeKind sh:IRI ;
+  sh:closed true ;
+  sh:ignoredProperties (rdf:type rdfs:label) ;
+  sh:property [ sh:path sr:profileVersion ; sh:datatype xsd:integer ; sh:minCount 1 ; sh:maxCount 1 ; sh:hasValue 1 ] ;
+  sh:property [ sh:path sr:extension ; sh:nodeKind sh:IRI ; sh:class sr:Extension ;  ] ;
+  sh:property [ sh:path sr:denominatorValue ; sh:datatype xsd:decimal ; sh:minCount 1 ; sh:maxCount 1 ; sh:minInclusive 0 ] ;
+  sh:property [ sh:path sr:unit ; sh:nodeKind sh:IRI ; sh:minCount 1 ; sh:maxCount 1 ;  ] ;
+  sh:property [ sh:path sr:population ; sh:nodeKind sh:IRI ; sh:minCount 1 ; sh:maxCount 1 ;  ] ;
+  sh:property [ sh:path sr:observedDuring ; sh:nodeKind sh:IRI ; sh:minCount 1 ; sh:maxCount 1 ; sh:class vt:Interval ;  ] .
+
+sr:ExtensionShape a sh:NodeShape ;
+  sh:targetClass sr:Extension ;
+  sh:nodeKind sh:IRI ;
+  sh:closed true ;
+  sh:ignoredProperties (rdf:type rdfs:label) ;
+  sh:property [ sh:path sr:profileVersion ; sh:datatype xsd:integer ; sh:minCount 1 ; sh:maxCount 1 ; sh:hasValue 1 ] ;
+  sh:property [ sh:path sr:extension ; sh:nodeKind sh:IRI ; sh:class sr:Extension ;  ] ;
+  sh:property [ sh:path sr:extensionProfile ; sh:nodeKind sh:IRI ; sh:minCount 1 ; sh:maxCount 1 ;  ] ;
+  sh:property [ sh:path sr:payloadDigest ; sh:datatype xsd:string ; sh:minCount 1 ; sh:maxCount 1 ; sh:pattern "^sha256:[0-9a-f]{64}$" ] ;
+  sh:property [ sh:path sr:status ; sh:nodeKind sh:IRI ; sh:minCount 1 ; sh:maxCount 1 ; sh:in (sr:Uninterpreted) ;  ] .
+
+sr:InputManifestShape a sh:NodeShape ;
+  sh:targetClass sr:InputManifest ;
+  sh:nodeKind sh:IRI ;
+  sh:closed true ;
+  sh:ignoredProperties (rdf:type rdfs:label) ;
+  sh:property [ sh:path sr:profileVersion ; sh:datatype xsd:integer ; sh:minCount 1 ; sh:maxCount 1 ; sh:hasValue 1 ] ;
+  sh:property [ sh:path sr:extension ; sh:nodeKind sh:IRI ; sh:class sr:Extension ;  ] ;
+  sh:property [ sh:path sr:inputId ; sh:nodeKind sh:IRI ; sh:minCount 1 ;  ] ;
+  sh:property [ sh:path sr:requiredExtension ; sh:nodeKind sh:IRI ;  ] ;
+  sh:sparql [ sh:message "Version 1 has no adopted required extension profiles." ; sh:select """PREFIX sr: <urn:x-sparkles:representation:>
+PREFIX ev: <urn:x-sparkles:evidence:>
+PREFIX vt: <urn:x-sparkles:valid-time:>
+PREFIX rdf: <http://www.w3.org/1999/02/22-rdf-syntax-ns#>
+PREFIX rdfs: <http://www.w3.org/2000/01/rdf-schema#>
+PREFIX xsd: <http://www.w3.org/2001/XMLSchema#>
+PREFIX prov: <http://www.w3.org/ns/prov#>
+PREFIX sh: <http://www.w3.org/ns/shacl#>
+SELECT $this WHERE { $this sr:requiredExtension ?extension }""" ] .
+
+sr:PolicyShape a sh:NodeShape ;
+  sh:targetClass sr:Policy ;
+  sh:nodeKind sh:IRI ;
+  sh:closed true ;
+  sh:ignoredProperties (rdf:type rdfs:label) ;
+  sh:property [ sh:path sr:profileVersion ; sh:datatype xsd:integer ; sh:minCount 1 ; sh:maxCount 1 ; sh:hasValue 1 ] ;
+  sh:property [ sh:path sr:extension ; sh:nodeKind sh:IRI ; sh:class sr:Extension ;  ] ;
+  sh:property [ sh:path sr:separationRule ; sh:nodeKind sh:IRI ; sh:minCount 1 ; sh:maxCount 1 ; sh:in (sr:PairwiseSeparation) ;  ] ;
+  sh:property [ sh:path sr:conflictRule ; sh:nodeKind sh:IRI ; sh:minCount 1 ; sh:maxCount 1 ; sh:in (sr:WholeComponentConflict) ;  ] ;
+  sh:property [ sh:path sr:kindRule ; sh:nodeKind sh:IRI ; sh:minCount 1 ; sh:maxCount 1 ; sh:in (sr:ExactKind) ;  ] ;
+  sh:property [ sh:path sr:representativeRule ; sh:nodeKind sh:IRI ; sh:minCount 1 ; sh:maxCount 1 ; sh:in (sr:LeastUtf8Iri) ;  ] ;
+  sh:property [ sh:path sr:stringRule ; sh:nodeKind sh:IRI ; sh:minCount 1 ; sh:maxCount 1 ; sh:in (sr:ScalarJson1) ;  ] .
+

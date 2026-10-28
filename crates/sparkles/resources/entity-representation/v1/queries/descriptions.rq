@@ -1,0 +1,13 @@
+PREFIX sr: <urn:x-sparkles:representation:>
+PREFIX ev: <urn:x-sparkles:evidence:>
+PREFIX vt: <urn:x-sparkles:valid-time:>
+PREFIX rdf: <http://www.w3.org/1999/02/22-rdf-syntax-ns#>
+PREFIX rdfs: <http://www.w3.org/2000/01/rdf-schema#>
+PREFIX xsd: <http://www.w3.org/2001/XMLSchema#>
+PREFIX prov: <http://www.w3.org/ns/prov#>
+# Run against one explicitly authorized recorded view. No query admits claims.
+SELECT ?description ?sourceRevision ?selection ?entity ?kind ?status WHERE {
+  ?description a sr:Description ; sr:sourceRevision ?sourceRevision ; sr:selection ?selection .
+  OPTIONAL { ?description sr:describes ?entity . ?entity sr:entityKind ?kind }
+  BIND(IF(BOUND(?entity), "described", "unresolved") AS ?status)
+}

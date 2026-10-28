@@ -1,0 +1,143 @@
+{
+  "profileVersion": 1,
+  "structuralCases": [
+    {
+      "id": "missing-authority",
+      "invalid": "invalid/missing-authority.ttl",
+      "positive": "valid/control-missing-authority.ttl",
+      "component": "MinCountConstraintComponent",
+      "focus": "urn:example:a01:control",
+      "base": "valid/common.ttl"
+    },
+    {
+      "id": "missing-realm",
+      "invalid": "invalid/missing-realm.ttl",
+      "positive": "valid/control-missing-realm.ttl",
+      "component": "MinCountConstraintComponent",
+      "focus": "urn:example:a01:control",
+      "base": "valid/common.ttl"
+    },
+    {
+      "id": "missing-identifierScope",
+      "invalid": "invalid/missing-identifierScope.ttl",
+      "positive": "valid/control-missing-identifierScope.ttl",
+      "component": "MinCountConstraintComponent",
+      "focus": "urn:example:a01:control",
+      "base": "valid/common.ttl"
+    },
+    {
+      "id": "unknown-control-field",
+      "invalid": "invalid/unknown-control-field.ttl",
+      "positive": "valid/control-unknown-control-field.ttl",
+      "component": "ClosedConstraintComponent",
+      "focus": "urn:example:a01:control",
+      "base": "valid/common.ttl"
+    },
+    {
+      "id": "identifier-literal-type",
+      "invalid": "invalid/identifier-literal-type.ttl",
+      "positive": "valid/control-identifier-literal-type.ttl",
+      "component": "DatatypeConstraintComponent",
+      "focus": "urn:example:a01:control",
+      "base": "valid/common.ttl"
+    },
+    {
+      "id": "authority-term-kind",
+      "invalid": "invalid/authority-term-kind.ttl",
+      "positive": "valid/control-authority-term-kind.ttl",
+      "component": "NodeKindConstraintComponent",
+      "focus": "urn:example:a01:control",
+      "base": "valid/common.ttl"
+    },
+    {
+      "id": "relation-endpoints",
+      "invalid": "invalid/relation-endpoints.ttl",
+      "positive": "valid/relations.ttl",
+      "component": "SPARQLConstraintComponent",
+      "focus": "urn:example:a01:A2:control",
+      "base": "valid/common.ttl"
+    },
+    {
+      "id": "negative-count",
+      "invalid": "invalid/negative-count.ttl",
+      "positive": "valid/episode-observations.ttl",
+      "component": "OrConstraintComponent",
+      "focus": "urn:example:a01:A10:obs1",
+      "base": "valid/common.ttl"
+    },
+    {
+      "id": "missing-count",
+      "invalid": "invalid/missing-count.ttl",
+      "positive": "valid/episode-observations.ttl",
+      "component": "OrConstraintComponent",
+      "focus": "urn:example:a01:A10:obs1",
+      "base": "valid/common.ttl"
+    },
+    {
+      "id": "count-and-unknown",
+      "invalid": "invalid/count-and-unknown.ttl",
+      "positive": "valid/episode-observations.ttl",
+      "component": "OrConstraintComponent",
+      "focus": "urn:example:a01:A10:obs1",
+      "base": "valid/common.ttl"
+    },
+    {
+      "id": "missing-denominator",
+      "invalid": "invalid/missing-denominator.ttl",
+      "positive": "valid/episode-observations.ttl",
+      "component": "OrConstraintComponent",
+      "focus": "urn:example:a01:A10:obs1",
+      "base": "valid/common.ttl"
+    },
+    {
+      "id": "unknown-count-mode",
+      "invalid": "invalid/unknown-count-mode.ttl",
+      "positive": "valid/episode-observations.ttl",
+      "component": "OrConstraintComponent",
+      "focus": "urn:example:a01:A10:obs1",
+      "base": "valid/common.ttl"
+    },
+    {
+      "id": "uncertainty-order",
+      "invalid": "invalid/uncertainty-order.ttl",
+      "positive": "valid/episode-observations.ttl",
+      "component": "OrConstraintComponent",
+      "focus": "urn:example:a01:A10:obs1",
+      "base": "valid/common.ttl"
+    },
+    {
+      "id": "missing-geometry-version",
+      "invalid": "invalid/missing-geometry-version.ttl",
+      "positive": "valid/episode-observations.ttl",
+      "component": "OrConstraintComponent",
+      "focus": "urn:example:a01:A11:place1",
+      "base": "valid/common.ttl"
+    },
+    {
+      "id": "required-extension",
+      "invalid": "invalid/required-extension.ttl",
+      "positive": "valid/control-required-extension.ttl",
+      "component": "SPARQLConstraintComponent",
+      "focus": "urn:example:a01:controlManifest",
+      "base": "valid/common.ttl"
+    },
+    {
+      "id": "source-selection-mismatch",
+      "invalid": "invalid/source-selection-mismatch.ttl",
+      "positive": "valid/control-source-selection-mismatch.ttl",
+      "component": "SPARQLConstraintComponent",
+      "focus": "urn:example:a01:controlDescription",
+      "base": "valid/common.ttl"
+    }
+  ],
+  "semanticOracle": "expected/semantic-oracle.json",
+  "semanticRuntimeChecksDeferred": [
+    "decision-cycle",
+    "source-digest-mismatch",
+    "immutable-record-conflict",
+    "unsupported-extension",
+    "replay-limit",
+    "replay-cancelled",
+    "real-auth-availability"
+  ]
+}

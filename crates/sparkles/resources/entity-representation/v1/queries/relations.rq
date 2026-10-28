@@ -1,0 +1,13 @@
+PREFIX sr: <urn:x-sparkles:representation:>
+PREFIX ev: <urn:x-sparkles:evidence:>
+PREFIX vt: <urn:x-sparkles:valid-time:>
+PREFIX rdf: <http://www.w3.org/1999/02/22-rdf-syntax-ns#>
+PREFIX rdfs: <http://www.w3.org/2000/01/rdf-schema#>
+PREFIX xsd: <http://www.w3.org/2001/XMLSchema#>
+PREFIX prov: <http://www.w3.org/ns/prov#>
+# Run against one explicitly authorized recorded view. No query admits claims.
+SELECT ?relation ?subject ?relationKind ?object ?scope ?claim ?validity ?participant ?role WHERE {
+  ?relation a sr:Relation ; sr:subject ?subject ; sr:relationKind ?relationKind ; sr:object ?object ; sr:domainScope ?scope ; sr:claim ?claim .
+  OPTIONAL { ?relation vt:validDuring ?validity }
+  OPTIONAL { ?relation sr:roleAssignment ?assignment . ?assignment sr:participant ?participant ; sr:role ?role }
+}

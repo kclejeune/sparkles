@@ -1,0 +1,14 @@
+PREFIX sr: <urn:x-sparkles:representation:>
+PREFIX ev: <urn:x-sparkles:evidence:>
+PREFIX vt: <urn:x-sparkles:valid-time:>
+PREFIX rdf: <http://www.w3.org/1999/02/22-rdf-syntax-ns#>
+PREFIX rdfs: <http://www.w3.org/2000/01/rdf-schema#>
+PREFIX xsd: <http://www.w3.org/2001/XMLSchema#>
+PREFIX prov: <http://www.w3.org/ns/prov#>
+# Run against one explicitly authorized recorded view. No query admits claims.
+SELECT ?view ?assignment ?entity ?status ?representative ?component ?conflict ?code ?decision WHERE {
+  ?assignment a sr:Assignment ; sr:resolutionView ?view ; sr:entity ?entity ; sr:status ?status ; sr:component ?component .
+  OPTIONAL { ?assignment sr:representative ?representative }
+  OPTIONAL { ?assignment sr:decision ?decision }
+  OPTIONAL { ?conflict a sr:Conflict ; sr:resolutionView ?view ; sr:component ?component ; sr:code ?code }
+}

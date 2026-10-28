@@ -1,0 +1,11 @@
+PREFIX ex: <urn:example:a01:>
+PREFIX sr: <urn:x-sparkles:representation:>
+PREFIX ev: <urn:x-sparkles:evidence:>
+PREFIX vt: <urn:x-sparkles:valid-time:>
+PREFIX rdf: <http://www.w3.org/1999/02/22-rdf-syntax-ns#>
+PREFIX rdfs: <http://www.w3.org/2000/01/rdf-schema#>
+PREFIX xsd: <http://www.w3.org/2001/XMLSchema#>
+PREFIX prov: <http://www.w3.org/ns/prov#>
+ex:public:channel a ev:Source .
+ex:public a ev:SourceRevision ; prov:specializationOf ex:public:channel ; ev:sourceKey "synthetic/public" ; ev:contentDigest "sha256:eb9f019fabdb6321592e0e570c918386d8a675043c1311335041519791d66aff" .
+ex:A15:descriptionClaim:publicDescription:ref a ev:EvidenceRef ; ev:sourceRevision ex:public ; ev:jsonPointer "/claims/A15:descriptionClaim:publicDescription" ; ev:valueDigest "sha256:163e03548d3cb2ea8a0355c0f32e2d47d0c7e006a06359a2bb4a872bf9c122b9" ; ev:method <urn:x-sparkles:evidence:normalization:json-lexical-utf8:1> ; ev:methodVersion "1" .

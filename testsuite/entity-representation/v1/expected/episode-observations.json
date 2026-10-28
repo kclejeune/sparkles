@@ -1,0 +1,43 @@
+{
+  "columns": [
+    "projection",
+    "observation",
+    "episode",
+    "count",
+    "countMode",
+    "caseDefinition",
+    "population",
+    "denominatorStatus",
+    "geometryVersion",
+    "claim",
+    "sourceRevision"
+  ],
+  "rows": [
+    [
+      "<urn:example:a01:A10:old>",
+      "<urn:example:a01:A10:obs1>",
+      "<urn:example:a01:A10:episode>",
+      "\"10\"^^<http://www.w3.org/2001/XMLSchema#integer>",
+      "<urn:x-sparkles:representation:Cumulative>",
+      "<urn:example:a01:confirmedCases1>",
+      "<urn:example:a01:regionalPopulation1>",
+      "<urn:x-sparkles:representation:UnknownDenominator>",
+      "<urn:example:a01:geometry1>",
+      "<urn:example:a01:A10:observationRelation1:claim>",
+      "<urn:example:a01:health1>"
+    ],
+    [
+      "<urn:example:a01:A10:current>",
+      "<urn:example:a01:A10:obs2>",
+      "<urn:example:a01:A10:episode>",
+      "\"12\"^^<http://www.w3.org/2001/XMLSchema#integer>",
+      "<urn:x-sparkles:representation:Cumulative>",
+      "<urn:example:a01:confirmedCases1>",
+      "<urn:example:a01:regionalPopulation1>",
+      "<urn:x-sparkles:representation:UnknownDenominator>",
+      "<urn:example:a01:geometry1>",
+      "<urn:example:a01:A10:observationRelation2:claim>",
+      "<urn:example:a01:health2>"
+    ]
+  ]
+}

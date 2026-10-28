@@ -1,0 +1,10 @@
+{
+  "revision": "urn:example:a01:r1",
+  "original": "raw/r1.json",
+  "conflicting": "raw/tampered-r1.json",
+  "originalDigest": "sha256:7883e7012c2176ba20856710b38ed58f92ca5a8ecd901f4a36dc551108326ce7",
+  "conflictingDigest": "sha256:77a2650471bce458cb460a531f86e41bdc6f870f195143e2e8860d5808cdd615",
+  "recordConflictCode": "immutable-record-conflict",
+  "retainedBytesMismatchCode": "source-digest-mismatch",
+  "executionPhase": 2
+}

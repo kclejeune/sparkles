@@ -1,0 +1,25 @@
+PREFIX ex: <urn:example:a01:>
+PREFIX sr: <urn:x-sparkles:representation:>
+PREFIX ev: <urn:x-sparkles:evidence:>
+PREFIX vt: <urn:x-sparkles:valid-time:>
+PREFIX rdf: <http://www.w3.org/1999/02/22-rdf-syntax-ns#>
+PREFIX rdfs: <http://www.w3.org/2000/01/rdf-schema#>
+PREFIX xsd: <http://www.w3.org/2001/XMLSchema#>
+PREFIX prov: <http://www.w3.org/ns/prov#>
+ex:A5:claim1 a ev:Claim ; rdf:reifies <<( ex:A5:release sr:ReleaseContains ex:A5:version )>> ; ev:claimKind ev:Reported ; ev:polarity ev:Positive ; prov:wasDerivedFrom ex:r1 ; prov:wasGeneratedBy ex:import ; prov:wasAttributedTo ex:author .
+ex:A5:claim2 a ev:Claim ; rdf:reifies <<( ex:A5:release sr:ReleaseContains ex:A5:version )>> ; ev:claimKind ev:Reported ; ev:polarity ev:Positive ; prov:wasDerivedFrom ex:independent ; prov:wasGeneratedBy ex:import ; prov:wasAttributedTo ex:author .
+ex:A6:bulletinClaim a ev:Claim ; rdf:reifies <<( ex:A6:release sr:ReleaseContains ex:A6:version )>> ; ev:claimKind ev:Reported ; ev:polarity ev:Positive ; prov:wasDerivedFrom ex:r1 ; prov:wasGeneratedBy ex:import ; prov:wasAttributedTo ex:author .
+ex:A6:mirrorClaim a ev:Claim ; rdf:reifies <<( ex:A6:release sr:ReleaseContains ex:A6:version )>> ; ev:claimKind ev:Reported ; ev:polarity ev:Positive ; prov:wasDerivedFrom ex:mirror ; prov:wasGeneratedBy ex:import ; prov:wasAttributedTo ex:author .
+ex:A6:translationClaim a ev:Claim ; rdf:reifies <<( ex:A6:release sr:ReleaseContains ex:A6:version )>> ; ev:claimKind ev:Reported ; ev:polarity ev:Positive ; prov:wasDerivedFrom ex:translation ; prov:wasGeneratedBy ex:import ; prov:wasAttributedTo ex:author .
+ex:A5:both:view:manifest a sr:InputManifest ; sr:profileVersion 1 ; sr:inputId ex:r1, <urn:x-sparkles:representation:policy:1>, ex:mapping1 .
+ex:A5:both:view a sr:ResolutionView ; sr:profileVersion 1 ; sr:domainScope ex:A5 ; sr:matchingPolicy <urn:x-sparkles:representation:policy:1> ; sr:ontologyVersion ex:ontology1 ; sr:mappingVersion ex:mapping1 ; sr:normalizationVersion ex:normalization1 ; sr:recordedView ex:simulatedSnapshot ; sr:inputManifest ex:A5:both:view:manifest .
+ex:A5:both a sr:Projection ; sr:profileVersion 1 ; sr:domainScope ex:A5 ; sr:matchingPolicy <urn:x-sparkles:representation:policy:1> ; sr:ontologyVersion ex:ontology1 ; sr:mappingVersion ex:mapping1 ; sr:normalizationVersion ex:normalization1 ; sr:recordedView ex:simulatedSnapshot ; sr:inputManifest ex:A5:both:view:manifest ; sr:resolutionView ex:A5:both:view ; sr:projectionKind sr:OfflineExpected ; sr:claim ex:A5:claim1, ex:A5:claim2 .
+ex:A5:afterFirst:view:manifest a sr:InputManifest ; sr:profileVersion 1 ; sr:inputId ex:r1, <urn:x-sparkles:representation:policy:1>, ex:mapping1 .
+ex:A5:afterFirst:view a sr:ResolutionView ; sr:profileVersion 1 ; sr:domainScope ex:A5 ; sr:matchingPolicy <urn:x-sparkles:representation:policy:1> ; sr:ontologyVersion ex:ontology1 ; sr:mappingVersion ex:mapping1 ; sr:normalizationVersion ex:normalization1 ; sr:recordedView ex:simulatedSnapshot ; sr:inputManifest ex:A5:afterFirst:view:manifest .
+ex:A5:afterFirst a sr:Projection ; sr:profileVersion 1 ; sr:domainScope ex:A5 ; sr:matchingPolicy <urn:x-sparkles:representation:policy:1> ; sr:ontologyVersion ex:ontology1 ; sr:mappingVersion ex:mapping1 ; sr:normalizationVersion ex:normalization1 ; sr:recordedView ex:simulatedSnapshot ; sr:inputManifest ex:A5:afterFirst:view:manifest ; sr:resolutionView ex:A5:afterFirst:view ; sr:projectionKind sr:OfflineExpected ; sr:claim ex:A5:claim2 .
+ex:A5:afterFinal:view:manifest a sr:InputManifest ; sr:profileVersion 1 ; sr:inputId ex:r1, <urn:x-sparkles:representation:policy:1>, ex:mapping1 .
+ex:A5:afterFinal:view a sr:ResolutionView ; sr:profileVersion 1 ; sr:domainScope ex:A5 ; sr:matchingPolicy <urn:x-sparkles:representation:policy:1> ; sr:ontologyVersion ex:ontology1 ; sr:mappingVersion ex:mapping1 ; sr:normalizationVersion ex:normalization1 ; sr:recordedView ex:simulatedSnapshot ; sr:inputManifest ex:A5:afterFinal:view:manifest .
+ex:A5:afterFinal a sr:Projection ; sr:profileVersion 1 ; sr:domainScope ex:A5 ; sr:matchingPolicy <urn:x-sparkles:representation:policy:1> ; sr:ontologyVersion ex:ontology1 ; sr:mappingVersion ex:mapping1 ; sr:normalizationVersion ex:normalization1 ; sr:recordedView ex:simulatedSnapshot ; sr:inputManifest ex:A5:afterFinal:view:manifest ; sr:resolutionView ex:A5:afterFinal:view ; sr:projectionKind sr:OfflineExpected .
+ex:A5:both:view:manifest sr:inputId <urn:x-sparkles:representation:policy:1>, ex:A5:claim1, ex:A5:claim2, ex:independent, ex:mapping1, ex:normalization1, ex:ontology1, ex:r1, ex:simulatedSnapshot .
+ex:A5:afterFirst:view:manifest sr:inputId <urn:x-sparkles:representation:policy:1>, ex:A5:claim1, ex:A5:claim2, ex:independent, ex:mapping1, ex:normalization1, ex:ontology1, ex:r1, ex:simulatedSnapshot .
+ex:A5:afterFinal:view:manifest sr:inputId <urn:x-sparkles:representation:policy:1>, ex:A5:claim1, ex:A5:claim2, ex:independent, ex:mapping1, ex:normalization1, ex:ontology1, ex:r1, ex:simulatedSnapshot .

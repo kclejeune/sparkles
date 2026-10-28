@@ -1,0 +1,19 @@
+PREFIX ex: <urn:example:a01:>
+PREFIX sr: <urn:x-sparkles:representation:>
+PREFIX ev: <urn:x-sparkles:evidence:>
+PREFIX vt: <urn:x-sparkles:valid-time:>
+PREFIX rdf: <http://www.w3.org/1999/02/22-rdf-syntax-ns#>
+PREFIX rdfs: <http://www.w3.org/2000/01/rdf-schema#>
+PREFIX xsd: <http://www.w3.org/2001/XMLSchema#>
+PREFIX prov: <http://www.w3.org/ns/prov#>
+ex:A9:family a sr:Entity ; sr:profileVersion 1 ; sr:domainScope ex:A9 ; sr:entityKind sr:PackageFamily .
+ex:A9:version a sr:Entity ; sr:profileVersion 1 ; sr:domainScope ex:A9 ; sr:entityKind sr:PackageVersion .
+ex:A9:release a sr:Entity ; sr:profileVersion 1 ; sr:domainScope ex:A9 ; sr:entityKind sr:SoftwareRelease .
+ex:A9:build a sr:Entity ; sr:profileVersion 1 ; sr:domainScope ex:A9 ; sr:entityKind sr:Build .
+ex:A9:artifact a sr:Entity ; sr:profileVersion 1 ; sr:domainScope ex:A9 ; sr:entityKind sr:Artifact .
+ex:A9:deployment a sr:Entity ; sr:profileVersion 1 ; sr:domainScope ex:A9 ; sr:entityKind sr:Deployment .
+ex:A9:artifact sr:digestAlgorithm ex:sha256 ; sr:digestValue "declared-only" ; sr:verificationStatus sr:UnknownVerification .
+ex:A9:versionOf:claim a ev:Claim ; rdf:reifies <<( ex:A9:version sr:VersionOf ex:A9:family )>> ; ev:claimKind ev:Reported ; ev:polarity ev:Positive ; prov:wasDerivedFrom ex:r1 ; prov:wasGeneratedBy ex:import ; prov:wasAttributedTo ex:author .
+ex:A9:versionOf a sr:Relation ; sr:profileVersion 1 ; sr:domainScope ex:A9 ; sr:subject ex:A9:version ; sr:relationKind sr:VersionOf ; sr:object ex:A9:family ; sr:claim ex:A9:versionOf:claim .
+ex:A9:releaseContains:claim a ev:Claim ; rdf:reifies <<( ex:A9:release sr:ReleaseContains ex:A9:version )>> ; ev:claimKind ev:Reported ; ev:polarity ev:Positive ; prov:wasDerivedFrom ex:r1 ; prov:wasGeneratedBy ex:import ; prov:wasAttributedTo ex:author .
+ex:A9:releaseContains a sr:Relation ; sr:profileVersion 1 ; sr:domainScope ex:A9 ; sr:subject ex:A9:release ; sr:relationKind sr:ReleaseContains ; sr:object ex:A9:version ; sr:claim ex:A9:releaseContains:claim .

@@ -1,0 +1,53 @@
+{
+  "columns": [
+    "entity",
+    "kind",
+    "verification",
+    "deploymentRelation",
+    "deploymentEvidenceStatus"
+  ],
+  "rows": [
+    [
+      "<urn:example:a01:A9:family>",
+      "<urn:x-sparkles:representation:PackageFamily>",
+      null,
+      null,
+      "\"unknown\""
+    ],
+    [
+      "<urn:example:a01:A9:version>",
+      "<urn:x-sparkles:representation:PackageVersion>",
+      null,
+      null,
+      "\"unknown\""
+    ],
+    [
+      "<urn:example:a01:A9:release>",
+      "<urn:x-sparkles:representation:SoftwareRelease>",
+      null,
+      null,
+      "\"unknown\""
+    ],
+    [
+      "<urn:example:a01:A9:build>",
+      "<urn:x-sparkles:representation:Build>",
+      null,
+      null,
+      "\"unknown\""
+    ],
+    [
+      "<urn:example:a01:A9:artifact>",
+      "<urn:x-sparkles:representation:Artifact>",
+      "<urn:x-sparkles:representation:UnknownVerification>",
+      null,
+      "\"unknown\""
+    ],
+    [
+      "<urn:example:a01:A9:deployment>",
+      "<urn:x-sparkles:representation:Deployment>",
+      null,
+      null,
+      "\"unknown\""
+    ]
+  ]
+}
