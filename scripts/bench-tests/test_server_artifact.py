@@ -1,14 +1,21 @@
 """No-build server distribution contract and cleanup regressions."""
 import importlib.util
 import hashlib
+import contextlib
 import io
 import json
+import os
 from pathlib import Path
+import platform
+import re
+import shutil
 import struct
 import subprocess
 import tarfile
 import tempfile
 import tomllib
+import textwrap
+from types import SimpleNamespace
 import unittest
 from unittest.mock import patch
 import zlib
@@ -326,6 +333,71 @@ class ElfContracts(unittest.TestCase):
 
 
 class WorkflowContracts(unittest.TestCase):
+    def preflight(self, total=15 * 1024**3, available=14 * 1024**3,
+                  free=24 * 1024**3, cpus=4, missing=(), machine="x86_64"):
+        workflow = (ROOT / ".github/workflows/server-artifacts.yml").read_text()
+        code = textwrap.dedent(workflow.split("# BEGIN SERVER ARTIFACT PREFLIGHT", 1)[1]
+                               .split("# END SERVER ARTIFACT PREFLIGHT", 1)[0])
+
+        def read_text(path, *args, **kwargs):
+            if str(path) == "/proc/meminfo":
+                return f"MemTotal: {total // 1024} kB\nMemAvailable: {available // 1024} kB\n"
+            if str(path) == "/etc/os-release":
+                return 'ID="almalinux"\nVERSION_ID="8"\n'
+            raise AssertionError(f"unexpected preflight read: {path}")
+
+        output = io.StringIO()
+        failure = None
+        with patch.object(Path, "read_text", read_text), \
+                patch.object(platform, "system", return_value="Linux"), \
+                patch.object(platform, "machine", return_value=machine), \
+                patch.object(os, "cpu_count", return_value=cpus), \
+                patch.object(shutil, "disk_usage", return_value=SimpleNamespace(free=free)), \
+                patch.object(shutil, "which", side_effect=lambda tool: None if tool in missing else f"/bin/{tool}"), \
+                contextlib.redirect_stdout(output):
+            try:
+                exec(compile(code, "workflow-capacity-preflight", "exec"), {})
+            except SystemExit as error:
+                failure = str(error)
+        return json.loads(output.getvalue()), failure
+
+    def test_preflight_accepts_exact_capacity_boundaries(self):
+        record, failure = self.preflight()
+        self.assertIsNone(failure)
+        self.assertEqual(record["failures"], [])
+        self.assertEqual(record["capacity"]["host_memory_total_bytes"], 15 * 1024**3)
+
+    def test_preflight_rejects_insufficient_host_memory_and_storage(self):
+        for argument, value, reason in (
+            ("total", 15 * 1024**3 - 1024, "physical host memory"),
+            ("available", 14 * 1024**3 - 1024, "available host memory"),
+            ("free", 24 * 1024**3 - 1, "free workspace storage"),
+            ("cpus", 3, "host CPUs"),
+        ):
+            with self.subTest(argument=argument):
+                record, failure = self.preflight(**{argument: value})
+                self.assertIn(reason, failure)
+                self.assertTrue(record["failures"])
+
+    def test_preflight_rejects_missing_tools_and_wrong_architecture(self):
+        record, failure = self.preflight(missing=("cmake", "objcopy"))
+        self.assertIn("missing native build tools", failure)
+        self.assertEqual(record["capacity"]["missing_tools"], ["cmake", "objcopy"])
+        _, failure = self.preflight(machine="aarch64")
+        self.assertIn("Linux x86_64", failure)
+
+    def test_acceptance_ref_and_resource_limits_are_exact_and_precede_builds(self):
+        workflow = (ROOT / ".github/workflows/server-artifacts.yml").read_text()
+        branches = re.search(r"^    branches: \[([^\]]+)\]$", workflow, re.M).group(1)
+        self.assertEqual([value.strip() for value in branches.split(",")],
+                         ["main", "item59-artifact-acceptance-20261028"])
+        self.assertIn("options: --cpus 4 --memory 14g --memory-swap 14g --pids-limit 2048", workflow)
+        self.assertEqual(re.findall(r"timeout-minutes: (\d+)", workflow), ["90", "10"])
+        self.assertLess(workflow.index("# BEGIN SERVER ARTIFACT PREFLIGHT"),
+                        workflow.index("actions-rust-lang/setup-rust-toolchain"))
+        self.assertLess(workflow.index("# BEGIN SERVER ARTIFACT PREFLIGHT"),
+                        workflow.index("mise run server:artifact"))
+
     def test_outer_artifact_task_activates_the_locked_formatter_tool(self):
         config = tomllib.loads((ROOT / "mise.toml").read_text())
         key = "github:wasm-bindgen/wasm-bindgen"
