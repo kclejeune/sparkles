@@ -474,6 +474,12 @@ public class DatasetGraphSparkles internal constructor(
     public fun reasoning(): SparklesReasoning = SparklesReasoning(this)
     public fun validation(): SparklesValidation = SparklesValidation(this)
     public fun backups(repository: SparklesBackupRepository): SparklesBackups = SparklesBackups(this, repository)
+    public fun mappings(): SparklesMappings = SparklesMappings(this)
+    @JvmOverloads public fun runMapping(text: String, inputs: MappingInputs = MappingInputs(), kind: String? = null, graph: String? = null): org.apache.jena.atlas.json.JsonObject = SparklesOperation().use { runMapping(text, inputs, kind, graph, it) }
+    public fun runMapping(text: String, inputs: MappingInputs, kind: String?, graph: String?, operation: SparklesOperation): org.apache.jena.atlas.json.JsonObject {
+        checkNoTxn("runMapping")
+        return document(ffi { handle.ffi.runMapping(text, kind, inputs.native(), graph, operation.native) }).asObject
+    }
     public fun queries(): SparklesQueries = SparklesQueries(this)
     public fun schema(): SparklesSchema = SparklesSchema(this)
     public fun graphql(): SparklesGraphQl = SparklesGraphQl(this)

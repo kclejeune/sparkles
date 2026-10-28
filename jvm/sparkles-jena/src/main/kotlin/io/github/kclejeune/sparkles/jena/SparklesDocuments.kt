@@ -1,6 +1,8 @@
 package io.github.kclejeune.sparkles.jena
 import io.github.kclejeune.sparkles.jena.internal.ffi
 import io.github.kclejeune.sparkles.jena.internal.ffi.QueryChange
+import io.github.kclejeune.sparkles.jena.internal.ffi.MappingInputs as NativeMappingInputs
+import io.github.kclejeune.sparkles.jena.internal.ffi.MappingRunRequest
 import io.github.kclejeune.sparkles.jena.internal.ffi.SchemaRequest
 import org.apache.jena.atlas.json.JSON
 import org.apache.jena.atlas.json.JsonObject
@@ -30,6 +32,28 @@ public class SparklesQueries internal constructor(private val owner: DatasetGrap
         val builder = QueryExec.dataset(owner).query(bound.query)
         bound.bindings.forEach { (variable, term) -> builder.substitution(variable, NodeFactoryExtra.parseNode(term)) }
         return builder.build()
+    }
+}
+/** File and connection names used by a mapping, with an optional base directory and IRI. */
+public data class MappingInputs @JvmOverloads public constructor(
+    public val sources: Map<String, String> = emptyMap(),
+    public val connections: Map<String, String> = emptyMap(),
+    public val directory: String? = null,
+    public val base: String? = null,
+) {
+    internal fun native(): NativeMappingInputs = NativeMappingInputs(sources, connections, directory, base)
+}
+public class SparklesMappings internal constructor(private val owner: DatasetGraphSparkles) {
+    public fun list(): JsonArray { owner.checkOpen(); return document(ffi { owner.handle.ffi.mappingsList() }).asArray }
+    @JvmOverloads public fun get(name: String, version: Long? = null): JsonObject? { owner.checkOpen(); require(version == null || version >= 0); return ffi { owner.handle.ffi.mappingsGet(name, version?.toULong()) }?.let { document(it).asObject } }
+    public fun versions(name: String): JsonArray? { owner.checkOpen(); return ffi { owner.handle.ffi.mappingsVersions(name) }?.let { document(it).asArray } }
+    public fun lastRun(name: String): JsonObject? { owner.checkOpen(); return ffi { owner.handle.ffi.mappingsLastRun(name) }?.let { document(it).asObject } }
+    @JvmOverloads public fun put(name: String, text: String, kind: String? = null, description: String? = null, change: DefinitionChange = DefinitionChange()): JsonObject { owner.checkNoTxn("mappings.put"); return document(ffi { owner.handle.ffi.mappingsPut(name, text, kind, description, change.native()) }).asObject }
+    @JvmOverloads public fun delete(name: String, ifVersion: Long? = null): Boolean { owner.checkNoTxn("mappings.delete"); require(ifVersion == null || ifVersion >= 0); return ffi { owner.handle.ffi.mappingsDelete(name, ifVersion?.toULong()) } }
+    @JvmOverloads public fun run(name: String, inputs: MappingInputs = MappingInputs(), version: Long? = null, replace: Boolean = false, author: String? = null, message: String? = null): JsonObject = SparklesOperation().use { run(name, inputs, version, replace, author, message, it) }
+    public fun run(name: String, inputs: MappingInputs, version: Long?, replace: Boolean, author: String?, message: String?, operation: SparklesOperation): JsonObject {
+        owner.checkNoTxn("mappings.run"); require(version == null || version >= 0)
+        return document(ffi { owner.handle.ffi.mappingsRun(name, MappingRunRequest(version?.toULong(), inputs.native(), replace, author, message), operation.native) }).asObject
     }
 }
 public data class SchemaOptions @JvmOverloads public constructor(public val at: String? = null, public val limit: Int = 1000, public val cursor: String? = null)

@@ -498,6 +498,21 @@ export class Dataset extends Queryable {
   get settings() {
     return this.administration.settings;
   }
+  get mappings() {
+    return this.administration.mappings;
+  }
+  runMapping(
+    text: string,
+    options: import('./admin.js').MappingInputs &
+      UpdateOptions & { kind?: string; graph?: string } = {},
+  ) {
+    return this.admin<import('./admin.js').MappingRun>(
+      'runMapping',
+      { ...options, text },
+      options,
+      true,
+    );
+  }
   get queries() {
     return this.administration.queries;
   }

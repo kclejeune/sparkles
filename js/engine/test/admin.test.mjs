@@ -21,7 +21,7 @@ const test = (name, options, callback) => {
   });
 };
 import assert from 'node:assert/strict';
-import { mkdtemp, rm } from 'node:fs/promises';
+import { mkdtemp, rm, writeFile } from 'node:fs/promises';
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
 import { spawn } from 'node:child_process';
@@ -625,5 +625,89 @@ test('entailment diffs and minimal justifications stay read-only', async (t) => 
   } finally {
     await t.cleanup();
     await rm(path, { recursive: true, force: true });
+  }
+});
+
+test('stored mappings and mapping runs preserve revisions and atomicity', async (t) => {
+  const dir = await mkdtemp(join(tmpdir(), 'sparkles-mappings-'));
+  try {
+    const csv = join(dir, 'people.csv');
+    await writeFile(csv, 'id,name\n1,Ann\n2,Bo\n');
+    const mapping = `prefixes:
+  ex: http://ex.org/
+mappings:
+  person:
+    sources:
+      - [people.csv~csv]
+    s: ex:person/$(id)
+    graphs: ex:g
+    po:
+      - [ex:name, $(name)]
+`;
+    const ds = t.resource(Dataset.memory());
+    const mappings = ds.mappings;
+    const saved = await mappings.put('people', mapping, { description: 'People' });
+    assert.equal(saved.created, true);
+    assert.equal(saved.stored.definition.kind, 'yarrrml');
+    assert.deepEqual(saved.summary.files, ['people.csv']);
+    assert.equal((await mappings.list())[0].name, 'people');
+    assert.equal((await mappings.get('people')).definition.text, mapping);
+    assert.equal((await mappings.versions('people')).length, 1);
+    assert.equal(await mappings.get('missing'), null);
+    assert.equal(await mappings.get('people', 999), null);
+    await assert.rejects(mappings.run('missing'));
+    await mappings.put('people', mapping, { description: 'Revised', ifVersion: 1 });
+    assert.equal((await mappings.versions('people')).length, 2);
+    assert.equal((await mappings.get('people', 1)).definition.description, 'People');
+    await assert.rejects(mappings.put('people', mapping, { ifVersion: 999 }));
+    await assert.rejects(mappings.delete('people', { ifVersion: 999 }));
+    const result = await mappings.run('people', { version: 1, sources: { 'people.csv': csv } });
+    assert.equal(result.stats.rows, 2n);
+    assert.equal(result.stats.quads, 2n);
+    assert.equal(result.receipt.committed, true);
+    assert.deepEqual(result.stats.warnings, []);
+    assert.deepEqual(result.stats.joins, []);
+    assert.equal(await ds.count(), 2n);
+    assert.equal((await mappings.lastRun('people')).version, 1n);
+    await ds.transaction(async () => {
+      await assert.rejects(mappings.run('people', { directory: dir }), ConflictError);
+      await assert.rejects(ds.runMapping(mapping, { directory: dir }), ConflictError);
+    });
+    const tx = await ds.beginTransaction();
+    const controller = new AbortController();
+    const queued = mappings.run('people', { directory: dir, signal: controller.signal });
+    controller.abort(new Error('cancel mapping'));
+    await assert.rejects(queued, /cancel mapping/);
+    await tx.rollback();
+    assert.equal(await ds.count(), 2n);
+    await assert.rejects(mappings.run('people'));
+    await assert.rejects(mappings.run('people', { connections: { default: 'invalid:' } }));
+    assert.equal(await ds.count(), 2n);
+    await writeFile(csv, 'id,name\n1,Ann\n');
+    await mappings.run('people', { directory: dir, replace: true });
+    assert.equal(await ds.count(), 1n);
+    assert.equal((await mappings.lastRun('people')).mode, 'replace');
+    const dynamic = mapping.replace('graphs: ex:g', 'graphs: ex:$(id)');
+    await mappings.put('dynamic', dynamic);
+    await assert.rejects(mappings.run('dynamic', { directory: dir, replace: true }));
+    assert.equal(await ds.count(), 1n);
+    const other = t.resource(Dataset.memory());
+    assert.equal((await other.runMapping(mapping, { directory: dir })).stats.quads, 1n);
+    await assert.rejects(other.runMapping('mappings: [nope', { kind: 'yarrrml' }));
+    assert.equal(await other.count(), 1n);
+    assert.equal(await mappings.delete('people'), true);
+    assert.equal(await mappings.get('people'), null);
+    const readOnly = t.resource(Dataset.memory({ readOnly: true }));
+    await assert.rejects(readOnly.mappings.put('x', mapping));
+    await assert.rejects(readOnly.runMapping(mapping, { directory: dir }));
+    const held = await ds.beginTransaction();
+    const pending = mappings.run('dynamic', { directory: dir });
+    const rejected = assert.rejects(pending);
+    await ds.close();
+    await rejected;
+    await held.rollback();
+    await assert.rejects(mappings.list());
+  } finally {
+    await rm(dir, { recursive: true, force: true });
   }
 });
