@@ -15,13 +15,14 @@
 //! ```
 
 use crate::admin_types::{
-    BackupFiles, BackupList, DatasetStats, FusekiStats, SchemaSummary, StoredQuery, StoredQueryList,
+    BackupFiles, BackupList, Branch, BranchList, DatasetStats, Diff, FusekiStats, NamedSnapshot,
+    SchemaSummary, SnapshotList, StoredQuery, StoredQueryList,
 };
 use crate::error::{Error, Result};
 use crate::{
-    At, CommitList, CommitsOptions, DatasetInfo, DatasetType, Graph, QueryOptions, QuerySolution,
-    RdfBody, ReadOptions, Receipt, ResponseMeta, ServerInfo, Task, UpdateOptions, UploadOptions,
-    UploadPart, Whoami, WriteOptions,
+    At, CommitList, CommitsOptions, DatasetInfo, DatasetType, DiffOptions, Graph, HistoryOptions,
+    QueryOptions, QuerySolution, RdfBody, ReadOptions, Receipt, ResponseMeta, ServerInfo, Task,
+    UpdateOptions, UploadOptions, UploadPart, Whoami, WriteOptions,
 };
 use oxrdf::{Quad, Triple, Variable};
 use serde_json::Value;
@@ -365,6 +366,33 @@ impl Dataset {
     }
     pub fn delete_stored_query(&self, name: &str) -> Result<()> {
         self.wait(self.ds().delete_stored_query(name))
+    }
+    pub fn snapshots(&self) -> Result<SnapshotList> {
+        self.wait(self.ds().snapshots())
+    }
+    pub fn snapshots_with(&self, options: &HistoryOptions) -> Result<SnapshotList> {
+        self.wait(self.ds().snapshots_with(options))
+    }
+    pub fn snapshot(&self, name: &str) -> Result<NamedSnapshot> {
+        self.wait(self.ds().snapshot(name))
+    }
+    pub fn snapshot_with(&self, name: &str, options: &HistoryOptions) -> Result<NamedSnapshot> {
+        self.wait(self.ds().snapshot_with(name, options))
+    }
+    pub fn branches(&self) -> Result<BranchList> {
+        self.wait(self.ds().branches())
+    }
+    pub fn branches_with(&self, options: &HistoryOptions) -> Result<BranchList> {
+        self.wait(self.ds().branches_with(options))
+    }
+    pub fn branch(&self, name: &str) -> Result<Branch> {
+        self.wait(self.ds().branch(name))
+    }
+    pub fn branch_with(&self, name: &str, options: &HistoryOptions) -> Result<Branch> {
+        self.wait(self.ds().branch_with(name, options))
+    }
+    pub fn diff(&self, options: &DiffOptions) -> Result<Diff> {
+        self.wait(self.ds().diff(options))
     }
     pub fn commits(&self, opts: &CommitsOptions) -> Result<CommitList> {
         self.wait(self.ds().commits(opts))

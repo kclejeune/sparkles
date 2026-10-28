@@ -257,6 +257,29 @@ op!(LIST_TASKS, "listTasks", GET, "/$/tasks");
 op!(GET_TASK, "getTask", GET, "/$/tasks/{id}");
 op!(CANCEL_TASK, "cancelTask", DELETE, "/$/tasks/{id}");
 
+// typed retained history reads
+op!(LIST_SNAPSHOTS, "listSnapshots", GET, "/$/snapshots/{ds}");
+op!(GET_SNAPSHOT, "getSnapshot", GET, "/$/snapshots/{ds}/{name}");
+op!(LIST_BRANCHES, "listBranches", GET, "/$/branches/{ds}");
+op!(GET_BRANCH, "getBranch", GET, "/$/branches/{ds}/{name}");
+op!(
+    DIFF,
+    "diff",
+    GET,
+    "/{ds}/diff",
+    &[
+        "from",
+        "to",
+        "graph",
+        "term",
+        "quads",
+        "group",
+        "limit",
+        "fromBranch",
+        "toBranch"
+    ]
+);
+
 // the server
 op!(PING, "ping", GET, "/$/ping");
 op!(SERVER, "getServer", GET, "/$/server");
@@ -296,6 +319,11 @@ pub const ALL: &[&Op] = &[
     &PING,
     &SERVER,
     &WHOAMI,
+    &LIST_SNAPSHOTS,
+    &GET_SNAPSHOT,
+    &LIST_BRANCHES,
+    &GET_BRANCH,
+    &DIFF,
 ];
 
 /// Characters escaped in a path segment: everything but RFC 3986's unreserved ones.
@@ -322,6 +350,12 @@ impl Op {
                 .find(|(k, _)| *k == name)
                 .map(|(_, v)| *v)
                 .ok_or_else(|| format!("{}: no value for path parameter {name}", self.id))?;
+            if matches!(value, "." | "..") {
+                return Err(format!(
+                    "{}: dot-only path parameter {name} cannot be represented without URL normalization",
+                    self.id
+                ));
+            }
             out.extend(percent_encoding::utf8_percent_encode(value, SEGMENT));
             rest = &rest[end + 1..];
         }
@@ -341,6 +375,20 @@ mod tests {
         let text =
             std::fs::read_to_string(&p).unwrap_or_else(|e| panic!("reading {}: {e}", p.display()));
         serde_json::from_str(&text).unwrap()
+    }
+
+    #[test]
+    fn history_segments_keep_literal_slashes_and_refuse_dot_only_names() {
+        assert_eq!(
+            GET_SNAPSHOT
+                .fill(&[("ds", "my ds"), ("name", "a/../é%")])
+                .unwrap(),
+            "/$/snapshots/my%20ds/a%2F..%2F%C3%A9%25"
+        );
+        for value in [".", ".."] {
+            assert!(GET_SNAPSHOT.fill(&[("ds", "ds"), ("name", value)]).is_err());
+            assert!(LIST_BRANCHES.fill(&[("ds", value)]).is_err());
+        }
     }
 
     /// Follow a `$ref` within the document.
@@ -510,7 +558,7 @@ mod tests {
     fn typed_bodies_read_the_described_schemas() {
         use crate::types::*;
         let doc = openapi();
-        check::<Commit>(&doc, "Commit");
+        check::<crate::types::Commit>(&doc, "Commit");
         check::<CommitList>(&doc, "CommitList");
         check::<ReceiptBody>(&doc, "Receipt");
         check::<Task>(&doc, "Task");
@@ -527,6 +575,11 @@ mod tests {
         check::<StoredQueryList>(&doc, "StoredQueryList");
         check::<BackupList>(&doc, "BackupList");
         check::<BackupFiles>(&doc, "BackupFiles");
+        check::<SnapshotList>(&doc, "SnapshotList");
+        check::<NamedSnapshot>(&doc, "NamedSnapshot");
+        check::<BranchList>(&doc, "BranchList");
+        check::<Branch>(&doc, "Branch");
+        check::<Diff>(&doc, "Diff");
     }
 
     /// The schema of an operation's first 2xx response: `Name`, or `[Name]` for an array.
@@ -576,6 +629,11 @@ mod tests {
             (&PUT_STORED, "StoredQuery"),
             (&DATASET_BACKUPS, "BackupList"),
             (&BACKUP_FILES, "BackupFiles"),
+            (&LIST_SNAPSHOTS, "SnapshotList"),
+            (&GET_SNAPSHOT, "NamedSnapshot"),
+            (&LIST_BRANCHES, "BranchList"),
+            (&GET_BRANCH, "Branch"),
+            (&DIFF, "Diff"),
         ] {
             assert_eq!(response_schema(&doc, op), schema, "{}", op.id);
         }

@@ -47,6 +47,15 @@ class GeneratorTests(unittest.TestCase):
         self.assertIn('deserialize_with = "deserialize_optional_integer"', output)
         self.assertIn('default, skip_serializing_if = "Option::is_none"', output)
 
+    def test_required_nullable_members_cannot_disappear_into_union_extras(self):
+        self.generator.model("RequiredNullable", {"type": "object", "properties": {
+            "class": {"type": ["string", "null"]},
+            "optional": {"type": ["string", "null"]},
+        }, "required": ["class"]})
+        output = self.generator.definitions["RequiredNullable"]
+        self.assertIn('    #[serde(deserialize_with = "deserialize_required_nullable")]\n    pub class: Option<String>,', output)
+        self.assertIn('    #[serde(default, skip_serializing_if = "Option::is_none")]\n    pub optional: Option<String>,', output)
+
     def test_keyword_names_are_valid_identifiers(self):
         self.assertEqual(module.snake("type"), "r#type")
         self.assertEqual(module.snake("datasetId"), "dataset_id")

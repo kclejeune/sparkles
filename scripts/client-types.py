@@ -19,6 +19,7 @@ OUTPUT = ROOT / "crates/sparkles-client/src/types/generated.rs"
 ROOTS = (
     "SchemaSummary", "DatasetStats", "FusekiStats", "StoredQuery",
     "StoredQueryList", "BackupList", "BackupFiles",
+    "SnapshotList", "NamedSnapshot", "BranchList", "Branch", "Diff",
 )
 
 
@@ -135,6 +136,8 @@ class Generator:
                 lines.append('    #[serde(deserialize_with = "deserialize_integer")]')
             elif ty == "Option<i128>":
                 lines.append('    #[serde(deserialize_with = "deserialize_optional_integer")]')
+            elif key in required and ty.startswith("Option<"):
+                lines.append('    #[serde(deserialize_with = "deserialize_required_nullable")]')
             if field.removeprefix("r#") != key:
                 lines.append(f"    #[serde(rename = {json.dumps(key)})]")
             lines.append(f"    pub {field}: {ty},")
@@ -152,6 +155,16 @@ class Generator:
         source += "// i128 retains every signed and unsigned 64-bit JSON integer.\n\n"
         source += "\n\n".join(self.definitions[name] for name in sorted(self.definitions)) + "\n"
         source += r"""
+// A nullable member can still be required. A custom deserializer keeps Serde
+// from silently supplying None for a missing Option field in an untagged branch.
+fn deserialize_required_nullable<'de, D, T>(deserializer: D) -> Result<Option<T>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+    T: serde::Deserialize<'de>,
+{
+    <Option<T> as serde::Deserialize>::deserialize(deserializer)
+}
+
 // Serde's untagged enum buffer lacks deserialize_i128. Reading Number through
 // deserialize_any keeps nested integers usable in untagged models without copying
 // the response body. Floats are refused even when mathematically integral.
