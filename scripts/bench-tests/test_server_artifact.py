@@ -8,6 +8,7 @@ import struct
 import subprocess
 import tarfile
 import tempfile
+import tomllib
 import unittest
 from unittest.mock import patch
 import zlib
@@ -28,6 +29,12 @@ smoke = module("installed_test", "server-installed-smoke.py")
 
 class ArchiveContracts(unittest.TestCase):
     def setUp(self):
+        self.uid = patch.object(smoke.os, "getuid", return_value=1500)
+        self.gid = patch.object(smoke.os, "getgid", return_value=1600)
+        self.uid.start()
+        self.gid.start()
+        self.addCleanup(self.uid.stop)
+        self.addCleanup(self.gid.stop)
         self.temp = tempfile.TemporaryDirectory(prefix="server artifact contracts ")
         self.addCleanup(self.temp.cleanup)
         self.work = Path(self.temp.name)
@@ -229,8 +236,11 @@ class ArchiveContracts(unittest.TestCase):
         self.assertIn("--pull=never", create)
         self.assertIn("--read-only", create)
         self.assertIn("127.0.0.1::3030", create)
+        self.assertEqual(create[create.index("--user") + 1], "1500:1600")
         self.assertNotIn(str(ROOT), " ".join(create))
-        self.assertFalse(json.loads((self.work / "evidence/receipt.json").read_text())["passed"])
+        receipt = json.loads((self.work / "evidence/receipt.json").read_text())
+        self.assertFalse(receipt["passed"])
+        self.assertEqual(receipt["container_user"], {"uid": 1500, "gid": 1600})
 
     def test_create_timeout_also_cleans_container(self):
         calls = []
@@ -266,6 +276,39 @@ class ArchiveContracts(unittest.TestCase):
             runtime.cleanup()
         self.assertTrue(runtime.created)
 
+    def test_root_caller_is_refused_before_docker_creation(self):
+        calls = []
+
+        def execute(command, **kwargs):
+            calls.append(command)
+            raise AssertionError("Docker must not be called for a root caller")
+
+        with patch.object(smoke.os, "getuid", return_value=0), \
+                patch.object(smoke.os, "getgid", return_value=0):
+            with self.assertRaisesRegex(ValueError, "non-root"):
+                smoke.Runtime("image", self.work, self.work, self.work / "logs", execute).start()
+        self.assertEqual(calls, [])
+
+    def test_root_group_is_also_refused_before_docker_creation(self):
+        def execute(command, **kwargs):
+            raise AssertionError("Docker must not be called with root group")
+
+        with patch.object(smoke.os, "getgid", return_value=0):
+            with self.assertRaisesRegex(ValueError, "non-root"):
+                smoke.Runtime("image", self.work, self.work, self.work / "logs", execute).start()
+
+    def test_root_smoke_records_failure_without_docker_execution(self):
+        self.fixture()
+        output = self.work / "root-evidence"
+        with patch.object(smoke.os, "getuid", return_value=0), \
+                patch.object(smoke.os, "getgid", return_value=0), \
+                patch.object(smoke.subprocess, "run", side_effect=AssertionError("unexpected Docker")):
+            with self.assertRaisesRegex(ValueError, "non-root"):
+                smoke.smoke(self.archive, self.sums, self.version, "rocky8", output)
+        receipt = json.loads((output / "receipt.json").read_text())
+        self.assertFalse(receipt["passed"])
+        self.assertEqual(receipt["container_user"], {"uid": 0, "gid": 0})
+
 
 class ElfContracts(unittest.TestCase):
     def test_gnu_floor_and_dependency_audit(self):
@@ -283,6 +326,18 @@ class ElfContracts(unittest.TestCase):
 
 
 class WorkflowContracts(unittest.TestCase):
+    def test_outer_artifact_task_activates_the_locked_formatter_tool(self):
+        config = tomllib.loads((ROOT / "mise.toml").read_text())
+        key = "github:wasm-bindgen/wasm-bindgen"
+        formatter_pin = config["tasks"]["ui:wasm"]["tools"][key]
+        outer_pin = config["tasks"]["server:artifact"].get("tools", {}).get(key)
+        locked = next(package["version"] for package in
+                      tomllib.loads((ROOT / "Cargo.lock").read_text())["package"]
+                      if package["name"] == "wasm-bindgen")
+        self.assertEqual(outer_pin, formatter_pin,
+                         "the parent packer must retain the formatter task's tool activation")
+        self.assertEqual(outer_pin, locked)
+
     def test_builder_pin_does_not_drift_from_candidate_configuration(self):
         workflow = (ROOT / ".github/workflows/server-artifacts.yml").read_text()
         self.assertEqual(workflow.count(artifact.IMAGES["builder"]), 2)

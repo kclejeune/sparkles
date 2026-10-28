@@ -798,6 +798,10 @@ download the archive and start its extracted binary in pinned Rocky Linux 8 and
 Debian 11 images, without the checkout or host libraries. No release, image, registry
 package or cryptographic attestation is published.
 
+The outer `server:artifact` task activates the same pinned wasm-bindgen CLI as
+`ui:wasm`, so the packer can record its version after the formatter task exits. A
+regression keeps both task pins equal to the wasm-bindgen version in Cargo.lock.
+
 The image digests in `scripts/server-artifact-images.json` identify the builder and
 clean runtimes. Update a digest only after reading its official registry metadata and
 repeating baseline and installed acceptance. A GNU candidate must use only the
@@ -831,6 +835,8 @@ with the archive, checksum file, exact version, runtime key and a new output dir
 The controller never builds or pulls an image. It verifies the checksum before
 extraction, uses an unprivileged container with a read-only distribution and a new
 writable data directory, and removes its containers even after startup failures.
+The caller must have a nonzero host UID and GID. A root caller is refused before
+Docker execution, and receipts record the selected numeric user for both processes.
 
 ```sh
 mise run server:artifact:smoke -- \

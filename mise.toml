@@ -643,6 +643,8 @@ run = "docker compose build"
 
 [tasks."server:artifact"]
 description = "Build an unpublished GNU x86_64 candidate inside the pinned manylinux job container"
+# The packer records this CLI after ui:wasm's child task has exited.
+tools = { "github:wasm-bindgen/wasm-bindgen" = "0.2.129" }
 cache = { enabled = false }
 usage = 'arg "[out]" default=".artifacts/server-candidate" help="fresh output directory outside target"'
 run = 'bash scripts/server-artifact-build.sh "$usage_out"'

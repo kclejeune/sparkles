@@ -32,9 +32,10 @@ def expected_bindings(extra=False):
 
 
 class Runtime:
-    def __init__(self, image, root, data, logs, execute=None):
+    def __init__(self, image, root, data, logs, execute=None, user=None):
         self.image, self.root, self.data, self.logs = image, root, data, logs
         self.execute = execute or subprocess.run
+        self.user = user if user is not None else (os.getuid(), os.getgid())
         self.name = "sparkles-installed-" + uuid.uuid4().hex
         self.created = False
         self.base = None
@@ -51,11 +52,13 @@ class Runtime:
 
     def start(self):
         # No image is built and no runtime packages or libraries are installed.
+        artifact.require(all(value > 0 for value in self.user),
+                         "installed smoke requires a non-root host UID and GID")
         # Even a timed-out create may leave the uniquely named container behind.
         self.created = True
         self.docker("create", "--name", self.name, "--pull=never", "--platform=linux/amd64",
                     "--read-only", "--cap-drop=ALL", "--security-opt=no-new-privileges",
-                    "--user", f"{os.getuid()}:{os.getgid()}",
+                    "--user", f"{self.user[0]}:{self.user[1]}",
                     "--tmpfs", "/tmp:rw,nosuid,nodev,mode=1777",
                     "--mount", f"type=bind,source={self.root},target=/opt/sparkles,readonly",
                     "--mount", f"type=bind,source={self.data},target=/data",
@@ -129,9 +132,13 @@ def smoke(archive, checksums, version, runtime, output):
     output = Path(output).resolve()
     output.mkdir(parents=True, exist_ok=False)
     image = artifact.IMAGES["runtimes"][runtime]
+    user = (os.getuid(), os.getgid())
     receipt = {"passed": False, "runtime": runtime, "image": image,
+               "container_user": {"uid": user[0], "gid": user[1]},
                "archive_sha256": artifact.sha256(archive), "version": version}
     try:
+        artifact.require(all(value > 0 for value in user),
+                         "installed smoke requires a non-root host UID and GID")
         with tempfile.TemporaryDirectory(prefix="sparkles-installed-") as temporary:
             work = Path(temporary)
             root, record = artifact.verify(archive, checksums, work / "installed", version)
@@ -142,7 +149,7 @@ def smoke(archive, checksums, version, runtime, output):
             data = work / "data"
             data.mkdir()
             for generation in range(2):
-                process = Runtime(image, root, data, output / f"server-{generation}.log")
+                process = Runtime(image, root, data, output / f"server-{generation}.log", user=user)
                 try:
                     process.start()
                     artifact.require(process.binary("--version").strip() == f"sparkles {version}",
