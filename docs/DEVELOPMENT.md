@@ -721,8 +721,10 @@ Fork pull requests retain the mbx action's GitHub target-cache fallback instead.
 The hybrid job disables managed target views so Swatinem owns an ordinary `target`
 directory. After restoration, `scripts/ci-cache-rehydrate.py` validates the supported
 mbx launchers and recreates their pruned helper binaries from the pinned installed mbx.
-It discovers both Cargo launcher paths and preserved executable siblings, refusing
-incomplete pairs, unknown launcher forms and paths escaping the target. Native ELF
+It discovers both Cargo launcher paths and preserved executable siblings. Cargo's
+unhashed aliases resolve through a unique hashed sibling with identical launcher
+bytes, matching the pinned mbx lookup. The repair refuses incomplete or ambiguous
+pairs, unknown launcher forms and paths escaping the target. Native ELF
 build artifacts remain valid without a private mbx sibling. The repair preserves
 launcher and build-script mtimes and never evaluates cached shell text. A fresh mbx
 metadata call follows the repair. Swatinem's Cargo metadata calls also pass through

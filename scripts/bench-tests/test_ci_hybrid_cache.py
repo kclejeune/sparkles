@@ -48,6 +48,19 @@ class RestoredBuildScripts(unittest.TestCase):
     def repair(self):
         return MODULE.repair_launchers(self.target, self.binary)
 
+    def cargo_alias(self, package="ahash-9d896b9c59613343", name="build-script-build", copied=False):
+        hashed = self.launcher(package)
+        real = hashed.with_name(hashed.name + ".mbx-real")
+        hashed_name = name.replace("-", "_") + "-" + package.rsplit("-", 1)[1]
+        hashed = hashed.rename(hashed.with_name(hashed_name))
+        real = real.rename(hashed.with_name(hashed.name + ".mbx-real"))
+        alias = hashed.with_name(name)
+        if copied:
+            shutil.copy2(hashed, alias)
+        else:
+            os.link(hashed, alias)
+        return alias, hashed, real
+
     def test_pruned_shared_helper_is_executable_and_launcher_and_real_mtimes_survive(self):
         first = self.launcher()
         second = self.launcher("other-456")
@@ -96,6 +109,117 @@ class RestoredBuildScripts(unittest.TestCase):
         path = self.launcher()
         path.unlink()
         with self.assertRaisesRegex(ValueError, "Missing"):
+            self.repair()
+        self.assertFalse(self.helper.exists())
+
+    def test_cargo_alias_resolves_the_preserved_hashed_executable(self):
+        # Cargo hard-links this hyphenated alias after mbx wraps rustc's hashed
+        # output. Only the hashed output gets a .mbx-real sibling in mbx 1.28.
+        paths = self.cargo_alias()
+        alias = paths[0]
+        fingerprint = self.target / "debug/.fingerprint/ahash-9d896b9c59613343/build-script-build-script-build.json"
+        fingerprint.parent.mkdir(parents=True)
+        fingerprint.write_text('{"rustc":123,"profile":456}')
+        paths = [*paths, fingerprint]
+        before = [(p.read_bytes(), p.stat().st_mtime_ns) for p in paths]
+        self.assertEqual(self.repair(), {"launchers": 2, "helpers": 1})
+        self.assertEqual(before, [(p.read_bytes(), p.stat().st_mtime_ns) for p in paths])
+        self.assertFalse(alias.with_name(alias.name + ".mbx-real").exists())
+        self.assertEqual(self.helper.read_bytes(), self.binary.read_bytes())
+
+    def test_copied_aliases_custom_stems_and_multiple_units_resolve(self):
+        for index, name in enumerate(("build-script-build", "build_script_build",
+                                      "build-script-custom-build", "build_script_custom_build")):
+            self.cargo_alias(f"package-{index:016x}", name, copied=True)
+        self.assertEqual(self.repair(), {"launchers": 8, "helpers": 1})
+
+    def test_incomplete_alias_siblings_are_refused(self):
+        for missing in ("hashed", "real"):
+            with self.subTest(missing=missing):
+                alias, hashed, real = self.cargo_alias()
+                (hashed if missing == "hashed" else real).unlink()
+                with self.assertRaisesRegex(ValueError, "Missing"):
+                    self.repair()
+                self.assertFalse(self.helper.exists())
+                shutil.rmtree(self.target)
+
+    def test_alias_siblings_must_be_unique_even_for_unknown_hashes(self):
+        for second_hash in ("fedcba9876543210", "not-a-hex-hash"):
+            with self.subTest(second_hash=second_hash):
+                alias, hashed, real = self.cargo_alias()
+                second = hashed.with_name("build_script_build-" + second_hash)
+                shutil.copy2(hashed, second)
+                shutil.copy2(real, second.with_name(second.name + ".mbx-real"))
+                with self.assertRaisesRegex(ValueError, "Ambiguous"):
+                    self.repair()
+                self.assertFalse(self.helper.exists())
+                shutil.rmtree(self.target)
+
+    def test_alias_cannot_pair_with_an_unknown_hashed_name(self):
+        alias, hashed, real = self.cargo_alias()
+        unknown = hashed.with_name("build_script_build-not-a-hex-hash")
+        hashed.rename(unknown)
+        real.rename(unknown.with_name(unknown.name + ".mbx-real"))
+        with self.assertRaisesRegex(ValueError, "Unsupported"):
+            self.repair()
+        self.assertFalse(self.helper.exists())
+
+    def test_alias_cannot_pair_with_a_different_launcher_or_native_binary(self):
+        for content in (b"\x7fELFnative", b"#!/bin/sh\nfalse\n", "other-helper"):
+            with self.subTest(content=content):
+                alias, hashed, real = self.cargo_alias(copied=True)
+                if content == "other-helper":
+                    content = hashed.read_bytes().replace(IDENTITY.encode(), b"b" * 64)
+                hashed.write_bytes(content)
+                with self.assertRaisesRegex(ValueError, "Mismatched"):
+                    self.repair()
+                self.assertFalse(self.helper.exists())
+                shutil.rmtree(self.target)
+
+    def test_alias_sibling_symlinks_are_refused_including_dangling_links(self):
+        for which in ("hashed", "real"):
+            for destination in (self.binary, self.root / "absent", self.root):
+                with self.subTest(which=which, destination=destination):
+                    alias, hashed, real = self.cargo_alias()
+                    path = hashed if which == "hashed" else real
+                    path.unlink()
+                    path.symlink_to(destination)
+                    with self.assertRaisesRegex(ValueError, "symlink|Unsupported"):
+                        self.repair()
+                    self.assertFalse(self.helper.exists())
+                    shutil.rmtree(self.target)
+
+    def test_alias_cannot_use_an_unrelated_unit_or_build_script_stem(self):
+        for other_unit in (False, True):
+            with self.subTest(other_unit=other_unit):
+                alias, hashed, real = self.cargo_alias()
+                alias.unlink()
+                moved = hashed.with_name("build-script-other") if not other_unit else (
+                    self.target / "debug/build/other-123/build-script-build")
+                moved.parent.mkdir(parents=True, exist_ok=True)
+                shutil.copy2(hashed, moved)
+                with self.assertRaisesRegex(ValueError, "Missing"):
+                    self.repair()
+                self.assertFalse(self.helper.exists())
+                shutil.rmtree(self.target)
+
+    def test_malformed_alias_refuses_before_publication_in_either_unit_order(self):
+        marker = self.root / "never-executed"
+        for malformed_unit in ("aaa-123", "zzz-123"):
+            with self.subTest(malformed_unit=malformed_unit):
+                self.launcher("middle-456")
+                alias, hashed, real = self.cargo_alias(malformed_unit, copied=True)
+                alias.write_bytes(alias.read_bytes() + f"touch {marker}\n".encode())
+                with self.assertRaisesRegex(ValueError, "Unsupported"):
+                    self.repair()
+                self.assertFalse(self.helper.exists())
+                self.assertFalse(marker.exists())
+                shutil.rmtree(self.target)
+
+    def test_native_binary_with_private_mbx_pair_is_refused(self):
+        path = self.launcher()
+        path.write_bytes(b"\x7fELFnative")
+        with self.assertRaisesRegex(ValueError, "Unsupported"):
             self.repair()
         self.assertFalse(self.helper.exists())
 

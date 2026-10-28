@@ -8,7 +8,7 @@ import subprocess
 import tempfile
 
 MBX_VERSION = "1.28.0"
-CARGO_EXECUTABLE = re.compile(r"build[-_]script[-_][A-Za-z0-9_]+(?:-[0-9a-f]+)?")
+CARGO_EXECUTABLE = re.compile(r"(?:build-script-|build_script_)[A-Za-z0-9_-]+")
 LAUNCHER = re.compile(
     rb'\A#!/bin/sh\nMBX_BUILD_SCRIPT_SHIM_PATH="\$0" exec '
     rb'"\$\(dirname "\$0"\)/(?P<relative>\.\./\.\./\.mbx-build-script-shims/'
@@ -64,11 +64,39 @@ def repair_launchers(target, binary):
             data = stream.read(4097)
         if not real.exists() and data.startswith(b"\x7fELF"):
             continue
-        if not real.is_file():
-            raise ValueError(f"Missing cached build-script executable pair: {real}")
         match = LAUNCHER.fullmatch(data)
         if not match:
             raise ValueError(f"Unsupported cached build-script launcher: {launcher}")
+        if not real.exists():
+            # Cargo's build-script-build is an alias of rustc's hashed
+            # build_script_build-<unit> launcher. mbx 1.28 preserves the real
+            # binary only beside the hashed output and resolves this unique
+            # sibling when Cargo invokes the alias. Match that lookup without
+            # accepting a missing executable or unrelated launcher as a pair.
+            prefix = launcher.name.replace("-", "_") + "-"
+            siblings = [
+                path for path in candidates
+                if path.parent == launcher.parent and path.name.startswith(prefix)
+                and (path.with_name(path.name + ".mbx-real").exists()
+                     or path.with_name(path.name + ".mbx-real").is_symlink())
+            ]
+            if len(siblings) > 1:
+                raise ValueError(f"Ambiguous cached build-script executable pair: {launcher}")
+            if siblings:
+                sibling = siblings[0]
+                if not re.fullmatch(r"[0-9a-f]+", sibling.name[len(prefix):]):
+                    raise ValueError(f"Unsupported cached build-script sibling: {sibling}")
+                real = sibling.with_name(sibling.name + ".mbx-real")
+                if sibling.is_symlink() or real.is_symlink():
+                    raise ValueError("Unexpected symlink at a cached build-script executable")
+                if not sibling.is_file():
+                    raise ValueError(f"Missing cached build-script executable pair: {sibling}")
+                with sibling.open("rb") as stream:
+                    sibling_data = stream.read(4097)
+                if sibling_data != data:
+                    raise ValueError(f"Mismatched cached build-script alias: {launcher}")
+        if not real.is_file():
+            raise ValueError(f"Missing cached build-script executable pair: {real}")
         lexical = launcher.parent / match["relative"].decode("ascii")
         destination = lexical.resolve()
         if not destination.is_relative_to(target):
