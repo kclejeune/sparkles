@@ -1,3 +1,4 @@
+PREFIX app: <urn:example:a01:application:>
 PREFIX sr: <urn:x-sparkles:representation:>
 PREFIX ev: <urn:x-sparkles:evidence:>
 PREFIX vt: <urn:x-sparkles:valid-time:>
@@ -6,8 +7,10 @@ PREFIX rdfs: <http://www.w3.org/2000/01/rdf-schema#>
 PREFIX xsd: <http://www.w3.org/2001/XMLSchema#>
 PREFIX prov: <http://www.w3.org/ns/prov#>
 # Run against one explicitly authorized recorded view. No query admits claims.
-SELECT ?projection ?observation ?episode ?count ?countMode ?caseDefinition ?population ?denominatorStatus ?geometryVersion ?claim ?sourceRevision WHERE {
-  ?projection a sr:Projection ; sr:projectionKind sr:OfflineExpected ; sr:claim ?claim .
+SELECT ?projection ?observation ?episode ?count ?countMode ?caseDefinition ?population ?denominatorStatus ?geometryVersion ?claim ?sourceRevision ?recordedView ?inputManifest ?selectionProfile ?selectionRule WHERE {
+  ?projection a sr:Projection ; sr:projectionKind sr:OfflineExpected ; sr:claim ?claim ; sr:recordedView ?recordedView ; sr:inputManifest ?inputManifest .
+  ?inputManifest sr:inputId ?selectionProfile, ?sourceRevision, ?claim .
+  ?selectionProfile app:revisionSelectionRule ?selectionRule ; app:seriesObservation ?observation .
   ?relation a sr:Relation ; sr:relationKind sr:ObservationAboutEpisode ; sr:subject ?observation ; sr:object ?episode ; sr:claim ?claim .
   ?observation sr:countMode ?countMode ; sr:caseDefinition ?caseDefinition ; sr:population ?population ; sr:geometryVersion ?geometryVersion .
   OPTIONAL { ?observation sr:count ?count }

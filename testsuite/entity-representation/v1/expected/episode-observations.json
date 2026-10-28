@@ -10,7 +10,11 @@
     "denominatorStatus",
     "geometryVersion",
     "claim",
-    "sourceRevision"
+    "sourceRevision",
+    "recordedView",
+    "inputManifest",
+    "selectionProfile",
+    "selectionRule"
   ],
   "rows": [
     [
@@ -24,7 +28,11 @@
       "<urn:x-sparkles:representation:UnknownDenominator>",
       "<urn:example:a01:geometry1>",
       "<urn:example:a01:A10:observationRelation1:claim>",
-      "<urn:example:a01:health1>"
+      "<urn:example:a01:health1>",
+      "<urn:example:a01:A10:snapshotInitial>",
+      "<urn:example:a01:A10:oldView:manifest>",
+      "<urn:example:a01:A10:selectionProfile1>",
+      "<urn:example:a01:application:UniqueTerminalSelectedSourceRevision>"
     ],
     [
       "<urn:example:a01:A10:current>",
@@ -37,7 +45,11 @@
       "<urn:x-sparkles:representation:UnknownDenominator>",
       "<urn:example:a01:geometry1>",
       "<urn:example:a01:A10:observationRelation2:claim>",
-      "<urn:example:a01:health2>"
+      "<urn:example:a01:health2>",
+      "<urn:example:a01:A10:snapshotRevised>",
+      "<urn:example:a01:A10:currentView:manifest>",
+      "<urn:example:a01:A10:selectionProfile1>",
+      "<urn:example:a01:application:UniqueTerminalSelectedSourceRevision>"
     ]
   ]
 }

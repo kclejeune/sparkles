@@ -63,3 +63,13 @@ set. Its bytes have no trailing newline and are not produced by a resolver.
 The standalone verified-artifact declaration has retained synthetic bytes, a digest
 and a declared versioned method. It tests record completeness, not authenticated
 verification. The original software artifact retains unknown verification.
+
+The A10 input envelope in `expected/a10-selection-inputs.json` fixes one synthetic
+observation series and a unique-terminal selected-revision rule. The earlier input
+state contains only the first report's revision and claims. The later state also
+contains the superseding revision and its distinct claims. Simulated recorded
+coordinates differ, and each manifest selects the immutable offline profile. The
+rule uses revision lineage within that fixed series. It never compares count values
+or invents incident sums. Empty, cyclic, incompatible or competing terminal states
+remain unknown. The profile is an input declaration, not an operational health
+policy or authenticated admission. Both historical reports and observations remain.

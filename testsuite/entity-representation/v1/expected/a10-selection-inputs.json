@@ -1,0 +1,95 @@
+{
+  "profileVersion": 1,
+  "mode": "offline-simulated-input-declaration",
+  "profile": "urn:example:a01:A10:selectionProfile1",
+  "rule": "urn:example:a01:application:UniqueTerminalSelectedSourceRevision",
+  "selection": "Within this fixed observation series, select the unique terminal selected source revision using the declared revision edges. Do not choose by count, identifier order or publication time.",
+  "series": {
+    "episode": "A10:episode",
+    "measure": "reportedCases1",
+    "caseDefinition": "confirmedCases1",
+    "countMode": "Cumulative",
+    "population": "regionalPopulation1",
+    "place": "A11:place1",
+    "geometryVersion": "geometry1",
+    "reportingAuthority": "healthAuthority",
+    "observedDuring": "eventWindow"
+  },
+  "candidates": [
+    {
+      "sourceRevision": "health1",
+      "observation": "A10:obs1",
+      "relationClaim": "A10:observationRelation1:claim",
+      "valueClaim": "A10:obs1:valueClaim",
+      "count": 10
+    },
+    {
+      "sourceRevision": "health2",
+      "observation": "A10:obs2",
+      "relationClaim": "A10:observationRelation2:claim",
+      "valueClaim": "A10:obs2:valueClaim",
+      "count": 12
+    }
+  ],
+  "successors": [
+    {
+      "revision": "health2",
+      "supersedes": "health1"
+    }
+  ],
+  "states": [
+    {
+      "projection": "A10:old",
+      "view": "A10:oldView",
+      "coordinate": "A10:snapshotInitial",
+      "selectedRevisions": [
+        "health1"
+      ],
+      "selectedClaimIds": [
+        "A10:descriptionClaim:report1",
+        "A10:obs1:valueClaim",
+        "A10:observationRelation1:claim",
+        "A10:reportRelation1:claim"
+      ],
+      "expected": {
+        "sourceRevision": "health1",
+        "observation": "A10:obs1",
+        "relationClaim": "A10:observationRelation1:claim",
+        "count": 10
+      }
+    },
+    {
+      "projection": "A10:current",
+      "view": "A10:currentView",
+      "coordinate": "A10:snapshotRevised",
+      "selectedRevisions": [
+        "health1",
+        "health2"
+      ],
+      "selectedClaimIds": [
+        "A10:descriptionClaim:report1",
+        "A10:descriptionClaim:report2",
+        "A10:obs1:valueClaim",
+        "A10:obs2:valueClaim",
+        "A10:observationRelation1:claim",
+        "A10:observationRelation2:claim",
+        "A10:reportRelation1:claim",
+        "A10:reportRelation2:claim"
+      ],
+      "expected": {
+        "sourceRevision": "health2",
+        "observation": "A10:obs2",
+        "relationClaim": "A10:observationRelation2:claim",
+        "count": 12
+      }
+    }
+  ],
+  "unknownOutcomes": [
+    "NoSelectedCandidate",
+    "RevisionCycle",
+    "ConflictingTerminalRevisions",
+    "IncompatibleObservationSeries",
+    "UnknownSelectionRule"
+  ],
+  "bounds": "These fixed synthetic inputs do not supply general clinical revision selection, authenticated admission or current-view availability."
+}

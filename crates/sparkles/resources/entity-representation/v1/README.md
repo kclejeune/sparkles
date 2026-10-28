@@ -58,3 +58,9 @@ An artifact digest carries its algorithm and value together. A Verified declarat
 also names its versioned `verificationMethod` IRI. An unknown verification can remain
 unknown without inventing a digest. Structural completeness does not authenticate the
 verifier or demonstrate that a production artifact was checked.
+
+The aggregate-observation query returns selected source membership, recorded
+coordinate, input manifest and offline selection profile alongside each expected
+observation. The A10 fixture envelope fixes a unique terminal revision within one
+explicit synthetic series. Its earlier and revised states have distinct inputs.
+This example does not define a general health revision or admission policy.
