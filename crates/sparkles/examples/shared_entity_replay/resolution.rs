@@ -215,6 +215,7 @@ pub(crate) fn resolve(
         if !graph.records.contains_key(id) && !external.contains(id) {
             return Err(Failure::IncompleteInput);
         }
+        graph.validate_input_role(id, operation)?;
     }
     let mut entity_ids = Vec::new();
     let mut kinds = Vec::new();

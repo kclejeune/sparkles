@@ -1067,16 +1067,29 @@ impl RetainedSources {
             .into_iter()
             .collect();
         let mut references = std::collections::BTreeSet::new();
-        for id in &ids {
+        let mut visited = std::collections::BTreeSet::new();
+        let mut pending: Vec<_> = ids.iter().cloned().collect();
+        while let Some(id) = pending.pop() {
             operation.check()?;
-            if graph.has_type(id, &format!("{EV}SourceRevision")) && !self.bytes.contains_key(id) {
+            if !visited.insert(id.clone()) {
+                continue;
+            }
+            graph.validate_input_role(&id, operation)?;
+            if graph.has_type(&id, &format!("{EV}SourceRevision")) && !self.bytes.contains_key(&id)
+            {
                 return Err(Failure::IncompleteInput);
             }
-            if graph.has_type(id, &format!("{EV}EvidenceRef")) {
+            if graph.has_type(&id, &format!("{EV}EvidenceRef")) {
                 references.insert(id.clone());
             }
-            if graph.has_type(id, &format!("{SR}Description")) {
-                references.insert(graph.one_iri(id, &format!("{SR}selection"))?);
+            for dependency in graph.evidence_dependencies(&id, operation)? {
+                operation.check()?;
+                if !graph.records.contains_key(&dependency) {
+                    return Err(Failure::UnresolvedReference);
+                }
+                if !visited.contains(&dependency) {
+                    pending.push(dependency);
+                }
             }
         }
         for reference in references {
@@ -1186,6 +1199,7 @@ impl Graph {
             if !self.records.contains_key(id) && !external.contains(id) {
                 return Err(Failure::IncompleteInput);
             }
+            self.validate_input_role(id, operation)?;
         }
         Ok(Owned {
             value: ids,
@@ -1211,5 +1225,116 @@ impl Graph {
             self.require_type(&target, namespace, kind)?;
         }
         Ok(())
+    }
+}
+
+impl Graph {
+    /// Interpreted control fields require their declared role even if an input
+    /// has lost its type triple. Such a record must not disappear in filtering.
+    pub fn validate_input_role(&self, id: &str, operation: &Operation<'_>) -> ReplayResult<()> {
+        for (namespace, kind, fields) in [
+            (
+                EV,
+                "ReviewDecision",
+                &["reviewPolicy", "disposition", "targetDigest"][..],
+            ),
+            (EV, "IdentityProposal", &["entity", "relation"][..]),
+            (EV, "Claim", &["claimKind", "polarity"][..]),
+            (EV, "SourceRevision", &["sourceKey", "contentDigest"][..]),
+            (
+                EV,
+                "EvidenceRef",
+                &["jsonPointer", "valueDigest", "methodVersion"][..],
+            ),
+            (SR, "Entity", &["entityKind"][..]),
+            (
+                SR,
+                "Description",
+                &["selection", "sourceRevision", "describes"][..],
+            ),
+            (
+                SR,
+                "Identifier",
+                &["lexicalValue", "authority", "realm", "identifierScope"][..],
+            ),
+            (SR, "Identification", &["identifier"][..]),
+            (SR, "Relation", &["relationKind", "roleAssignment"][..]),
+            (SR, "RoleAssignment", &["participant", "role"][..]),
+            (
+                SR,
+                "Policy",
+                &[
+                    "positiveMatchRule",
+                    "separationRule",
+                    "conflictRule",
+                    "kindRule",
+                    "representativeRule",
+                    "stringRule",
+                ][..],
+            ),
+        ] {
+            operation.check()?;
+            if fields
+                .iter()
+                .any(|field| !self.objects(id, &format!("{namespace}{field}")).is_empty())
+            {
+                self.require_type(id, namespace, kind)?;
+            }
+        }
+        if !self
+            .objects(id, "http://www.w3.org/1999/02/22-rdf-syntax-ns#reifies")
+            .is_empty()
+        {
+            self.require_type(id, EV, "Claim")?;
+        }
+        Ok(())
+    }
+    /// Only declared record-valued links are followed. Vocabulary, version and
+    /// authority IRIs do not become invented records or source locators.
+    fn evidence_dependencies(
+        &self,
+        id: &str,
+        operation: &Operation<'_>,
+    ) -> ReplayResult<Vec<String>> {
+        let mut result = Vec::new();
+        for (kind, fields) in [
+            (
+                "Relation",
+                &["subject", "object", "claim", "roleAssignment"][..],
+            ),
+            ("Identification", &["identifier", "entity", "claim"][..]),
+            ("RoleAssignment", &["participant"][..]),
+            (
+                "Description",
+                &["sourceRevision", "selection", "describes"][..],
+            ),
+        ] {
+            operation.check()?;
+            if self.has_type(id, &format!("{SR}{kind}")) {
+                for field in fields {
+                    result.extend(self.iris(id, &format!("{SR}{field}"))?);
+                }
+            }
+        }
+        if self.has_type(id, &format!("{EV}EvidenceRef")) {
+            result.extend(self.iris(id, &format!("{EV}sourceRevision"))?);
+        }
+        if self.has_type(id, &format!("{EV}Claim")) {
+            result.extend(self.iris(id, "http://www.w3.org/ns/prov#wasDerivedFrom")?);
+            for term in self.objects(id, "http://www.w3.org/1999/02/22-rdf-syntax-ns#reifies") {
+                operation.check()?;
+                if let oxrdf::Term::Triple(triple) = term
+                    && let oxrdf::NamedOrBlankNode::NamedNode(subject) = &triple.subject
+                {
+                    let subject = subject.as_str();
+                    if self.has_type(subject, &format!("{SR}Description"))
+                        || !self.objects(subject, &format!("{SR}selection")).is_empty()
+                    {
+                        result.push(subject.to_owned());
+                    }
+                }
+            }
+        }
+        Ok(result)
     }
 }

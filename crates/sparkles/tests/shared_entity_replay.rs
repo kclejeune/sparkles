@@ -1671,3 +1671,171 @@ fn missing_selected_record_and_unknown_matching_rule_refuse_with_fixed_codes() {
         Failure::UnsupportedProfile
     );
 }
+
+#[test]
+fn rereview_regression_type_stripped_selected_withdrawal_refuses() {
+    with_evolution_graph(|graph, operation| {
+        graph
+            .records
+            .get_mut(&ex("A5:withdraw1"))
+            .unwrap()
+            .retain(|s| s.predicate != RDF_TYPE);
+        assert!(matches!(
+            admitted_occurrences(
+                graph,
+                &ex("A5:afterFirst:view"),
+                &ex("A5:simulatedClaimAdmission:1"),
+                1,
+                operation
+            ),
+            Err(Failure::UnresolvedReference)
+        ));
+    });
+}
+#[test]
+fn rereview_regression_indirect_description_evidence_is_mandatory() {
+    with_evolution_graph(|graph, operation| {
+        let view = ex("A10:indirectView");
+        let declaration = supplied_view(
+            &ex("A10"),
+            &view,
+            &[
+                ex("A10:reportRelation1"),
+                ex("A10:reportRelation1:claim"),
+                ex("A10:episode"),
+                ex("health1"),
+            ],
+            operation,
+        );
+        let delivery =
+            Graph::load_documents(&[(&declaration, oxrdfio::RdfFormat::Turtle)], operation)
+                .unwrap();
+        graph.merge_delivery(delivery, operation).unwrap();
+        let mut retained = RetainedSources::default();
+        retained
+            .insert(
+                graph,
+                &ex("health1"),
+                fixture("raw/health1.json").as_slice(),
+                operation,
+            )
+            .unwrap();
+        let manifest = format!("{view}:manifest");
+        retained
+            .verify_selected(graph, &manifest, operation)
+            .unwrap();
+        let reference = ex("A10:descriptionClaim:report1:ref");
+        let predicate = format!("{EV}valueDigest");
+        graph
+            .records
+            .get_mut(&reference)
+            .unwrap()
+            .retain(|s| s.predicate != predicate);
+        graph
+            .records
+            .get_mut(&reference)
+            .unwrap()
+            .insert(Statement {
+                graph: "DEFAULT".into(),
+                predicate,
+                object: oxrdf::Literal::new_simple_literal(format!("sha256:{}", "0".repeat(64)))
+                    .into(),
+            });
+        assert_eq!(
+            retained.verify_selected(graph, &manifest, operation),
+            Err(Failure::SourceDigestMismatch)
+        );
+    });
+}
+
+#[test]
+fn type_stripped_mandatory_roles_and_indirect_selector_controls_refuse() {
+    with_evolution_graph(|graph, operation| {
+        let view = ex("A10:indirectControlsView");
+        let declaration = supplied_view(
+            &ex("A10"),
+            &view,
+            &[
+                ex("A10:reportRelation1"),
+                ex("A10:reportRelation1:claim"),
+                ex("A10:episode"),
+                ex("health1"),
+            ],
+            operation,
+        );
+        let delivery =
+            Graph::load_documents(&[(&declaration, oxrdfio::RdfFormat::Turtle)], operation)
+                .unwrap();
+        graph.merge_delivery(delivery, operation).unwrap();
+        let mut retained = RetainedSources::default();
+        retained
+            .insert(
+                graph,
+                &ex("health1"),
+                fixture("raw/health1.json").as_slice(),
+                operation,
+            )
+            .unwrap();
+        let manifest = format!("{view}:manifest");
+        retained
+            .verify_selected(graph, &manifest, operation)
+            .unwrap();
+        let reference = ex("A10:descriptionClaim:report1:ref");
+        let original = graph.records[&reference].clone();
+        for (field, value, error) in [
+            (
+                "method",
+                oxrdf::NamedNode::new("urn:unsupported:indirect-method")
+                    .unwrap()
+                    .into(),
+                Failure::UnsupportedProfile,
+            ),
+            (
+                "jsonPointer",
+                oxrdf::Literal::new_simple_literal("/missing/indirect").into(),
+                Failure::InvalidDomainRecord,
+            ),
+        ] {
+            let predicate = format!("{EV}{field}");
+            graph
+                .records
+                .get_mut(&reference)
+                .unwrap()
+                .retain(|s| s.predicate != predicate);
+            graph
+                .records
+                .get_mut(&reference)
+                .unwrap()
+                .insert(Statement {
+                    graph: "DEFAULT".into(),
+                    predicate,
+                    object: value,
+                });
+            assert_eq!(
+                retained.verify_selected(graph, &manifest, operation),
+                Err(error)
+            );
+            graph.records.insert(reference.clone(), original.clone());
+        }
+        graph
+            .records
+            .get_mut(&reference)
+            .unwrap()
+            .retain(|s| s.predicate != RDF_TYPE);
+        assert_eq!(
+            retained.verify_selected(graph, &manifest, operation),
+            Err(Failure::UnresolvedReference)
+        );
+        graph.records.insert(reference, original);
+        let description = ex("A10:report1");
+        graph
+            .records
+            .get_mut(&description)
+            .unwrap()
+            .retain(|s| s.predicate != RDF_TYPE);
+        assert_eq!(
+            retained.verify_selected(graph, &manifest, operation),
+            Err(Failure::UnresolvedReference)
+        );
+    });
+}
