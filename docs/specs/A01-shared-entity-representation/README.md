@@ -1,7 +1,7 @@
 # Shared entity representation, convergence and evolution
 
-A01 defines roadmap item 396. Phase 1 provides versioned profile resources and
-independent acceptance fixtures. Offline replay and managed integration remain.
+A01 defines roadmap item 396. Versioned profile resources, independent acceptance
+fixtures and bounded private offline replay are available. Managed integration remains.
 
 The application profile separates source descriptions from domain entities and makes
 identity resolution, qualified relationships and changes reproducible. It reuses C25
@@ -10,7 +10,7 @@ format, logical equality machinery or managed-write authority.
 
 Phase 1 provides versioned vocabulary, shapes, fixed fixtures and eight competency
 queries through `sparkles::shared_entity::profile(1)`.
-Phase 2 adds bounded offline reference replay and selected adapter mappings. Phase 3
+Phase 2 provides bounded offline reference replay and selected fixture mappings. Phase 3
 integrates the profile with the actual shared evidence, temporal, durable execution
 and analysis runtimes after their required contracts pass acceptance.
 

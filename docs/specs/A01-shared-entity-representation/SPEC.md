@@ -1,9 +1,10 @@
 # A01: Shared entity representation, convergence and evolution
 
-> **Status:** implemented in part. Phase 1 resources and acceptance fixtures are available.
+> **Status:** implemented in part. Versioned resources, acceptance fixtures and bounded
+> private offline replay are available.
 >
 > **Phases:** Phase 1 supplies versioned resources and independent acceptance
-> fixtures. Phase 2 adds bounded offline reference replay and selected mappings.
+> fixtures. Phase 2 provides bounded offline reference replay and selected fixture mappings.
 > Phase 3 adopts the shared managed runtimes after their required acceptance gates.
 
 ## 1. Purpose and scope
@@ -491,11 +492,11 @@ exposed from `../../../crates/sparkles/src/lib.rs`. The
 manifest digests, unknown-version refusal, shapes, query bindings and nonassertion.
 Adding an accessor requires the ordinary additive API policy checks.
 
-Phase 2 adds a private example under the planned
+Phase 2 provides a private example under the
 `../../../crates/sparkles/examples/shared_entity_replay/` directory, with `model.rs`,
-`resolution.rs`, `evolution.rs`, `output.rs` and a `mod.rs`, invoked by the planned
+`resolution.rs`, `evolution.rs`, `output.rs` and a `mod.rs`, invoked by
 `../../../crates/sparkles/examples/shared_entity_replay.rs`. Keep reusable helper code
-private until an API requirement is adopted. Integration tests in the planned
+private until an API requirement is adopted. Integration tests in
 `../../../crates/sparkles/tests/shared_entity_replay.rs` consume the independent oracle.
 Reuse the existing software-inventory fixture's immutable supplied source bytes and
 identity boundaries through an explicit versioned mapping. Do not copy its offline
@@ -546,12 +547,41 @@ structural refusals, nonassertion and explicit unknown values.
 
 Synthetic successor decisions explain support withdrawal and merge/split histories.
 A separate offline observation-series profile and distinct input states explain the
-cumulative revision from 10 to 12 without summing the reports. These declarations do
-not authenticate review, prove source independence or implement domain operations.
+cumulative revision from 10 to 12 without summing the reports. These Phase 1 declarations
+do not authenticate review, prove source independence or implement managed operations.
 
-Roadmap item 396 retains Phase 2 bounded offline replay and selected source mappings.
-Phase 3 still requires actual C25 managed review and protected records, C27 authenticated
-availability, C26 durable publication and F22 freshness. Scoped visibility and later
-mixed-access inference use their adopted access contracts. No matcher, managed
-projection, health connector or operational public-health workflow is delivered by
-Phase 1.
+Phase 2 provides the private local comparison CLI and bounded RDF record registry.
+Complete deliveries preserve graph coordinates and immutable record identities.
+Selected manifests and decision histories drive component resolution, including
+n-ary constraints, conflicts with every causal decision, explicit unknowns and retained
+older views.
+The matcher does not consume authored assignment or conflict rows. Its canonical
+comparison encoder preserves the independently fixed bytes.
+
+Retained source and mandatory selector verification reuse C25 digest and lexical JSON
+helpers. Record caps are checked during ingestion, decoded bytes accumulate across
+deliveries and operation memory, source bytes, cancellation and deadlines remain
+bounded. Refusals produce no comparison artifact or current-pointer update.
+
+Private evolution helpers compute the fixed rules for occurrence withdrawal, lineage,
+simulated availability, mapping migration and terminal observation selection. The
+observation adapter supports reported positive occurrences in its declared synthetic
+series. Availability uses canonical fixed-width UTC timestamps. An explicit Cargo.lock
+version 4 adapter reuses software-inventory source bytes with supplied offline family
+and version bindings. It establishes no release, build, artifact or deployment facts.
+The CLI emits resolution comparisons, while evolution helpers remain private and are
+exercised by integration tests.
+
+The replay suite covers 51 cases against independent input and semantic oracles,
+including source tampering, mandatory dependencies, malformed roles, permutations,
+duplicate delivery, caps, cancellation and isolated public input. The original
+source and expected-answer fixtures remain unchanged. The separate Phase 1 query and
+SHACL suites retain their resource and nonassertion coverage.
+
+Roadmap item 396 retains Phase 3 integration with actual C25 managed review and
+protected records, C27 authenticated availability, C26 durable publication and F22
+freshness. Supplied declarations and availability remain simulated, and separately
+supplied public scopes do not implement real authorization. Scoped visibility and
+later mixed-access inference use their adopted access contracts. General domain
+mappings, health connectors and operational public-health workflows remain outside
+the delivered reference scope.
