@@ -390,6 +390,212 @@ class FacadeTests(unittest.IsolatedAsyncioTestCase):
             await asyncio.gather(opening, return_exceptions=True)
             await ds.aclose()
 
+    async def test_cancelled_open_waiter_does_not_close_independent_opener(
+        self,
+    ) -> None:
+        self.factory.block_open = True
+        ds = self.aio.Dataset()
+        first = asyncio.create_task(ds.query("read"))
+        second = None
+        try:
+            await event(self.factory.open_started)
+            second = asyncio.create_task(ds.query("read"))
+            await asyncio.sleep(0)
+            self.assertEqual(len(ds._open_lock._waiters), 1)
+            second.cancel()
+            await asyncio.sleep(0)
+            self.assertFalse(ds.closed)
+            self.factory.open_release.set()
+            with self.assertRaises(asyncio.CancelledError):
+                await second
+            self.assertEqual(await first, ["one", "two", "three"])
+            self.assertEqual(await ds.query("read"), ["one", "two", "three"])
+            self.assertFalse(ds._worker._closed)
+        finally:
+            self.factory.open_release.set()
+            await asyncio.gather(
+                first, *([second] if second else []), return_exceptions=True
+            )
+            await ds.aclose()
+        self.assertTrue(ds._worker._closed)
+
+    async def test_explicit_close_during_opening_closes_created_native(self) -> None:
+        self.factory.block_open = True
+        ds = self.aio.Dataset()
+        opening = asyncio.create_task(ds.query("read"))
+        closing = None
+        try:
+            await event(self.factory.open_started)
+            closing = asyncio.create_task(ds.aclose())
+            await asyncio.sleep(0)
+            self.assertTrue(ds.closed)
+            self.assertFalse(closing.done())
+            self.factory.open_release.set()
+            with self.assertRaises(NativeInvalid):
+                await opening
+            await closing
+            self.assertTrue(self.factory.datasets[0].closed)
+            self.assertTrue(ds._worker._closed)
+        finally:
+            self.factory.open_release.set()
+            await asyncio.gather(
+                opening, *([closing] if closing else []), return_exceptions=True
+            )
+            await ds.aclose()
+
+    async def test_foreign_cursor_close_preserves_owner_cleanup(self) -> None:
+        ds = self.aio.Dataset()
+        cursor = await ds.select_cursor("rows")
+        native = cursor._native
+        try:
+            with self.assertRaisesRegex(RuntimeError, "one event loop"):
+                await asyncio.to_thread(lambda: asyncio.run(cursor.aclose()))
+            self.assertFalse(cursor._closed)
+            self.assertIsNone(cursor._close_task)
+            self.assertIs(cursor._native, native)
+            self.assertFalse(cursor._token.cancelled)
+            self.assertEqual(ds._worker._owners, 2)
+            self.assertEqual(await anext(cursor), "one")
+            await cursor.aclose()
+            self.assertEqual(native.status, "stopped")
+            await ds.aclose()
+            self.assertEqual(ds._worker._owners, 0)
+            self.assertTrue(ds._worker._closed)
+        finally:
+            # Before the repair, the foreign close strands this fixture lease.
+            # Explicit test-only cleanup keeps the failing regression finite.
+            if not ds._worker._closed:
+                await ds._worker.call(native.close, Token(), interruptible=False)
+                await ds._worker.call(
+                    self.factory.datasets[0].close, Token(), interruptible=False
+                )
+                while ds._worker._owners:
+                    await ds._worker.release()
+
+    async def test_foreign_dataset_close_preserves_owner_cleanup(self) -> None:
+        ds = self.aio.Dataset()
+        await ds.__aenter__()
+        native = self.factory.datasets[0]
+        try:
+            with self.assertRaisesRegex(RuntimeError, "one event loop"):
+                await asyncio.to_thread(lambda: asyncio.run(ds.aclose()))
+            self.assertFalse(ds.closed)
+            self.assertIsNone(ds._close_task)
+            self.assertIs(ds._native, native)
+            self.assertEqual(ds._worker._owners, 1)
+            self.assertTrue(await ds.ask("read"))
+            await ds.aclose()
+            self.assertTrue(native.closed)
+            self.assertTrue(ds._worker._closed)
+        finally:
+            if not ds._worker._closed:
+                await ds._worker.call(native.close, Token(), interruptible=False)
+                while ds._worker._owners:
+                    await ds._worker.release()
+
+    async def test_foreign_transaction_end_preserves_writer_and_owner_cleanup(
+        self,
+    ) -> None:
+        ds = self.aio.Dataset()
+        tx = ds.transaction()
+        await tx.__aenter__()
+        native = tx._native
+        try:
+            for method in (tx.commit, tx.rollback, tx.aclose):
+                with self.assertRaisesRegex(RuntimeError, "one event loop"):
+                    await asyncio.to_thread(lambda method=method: asyncio.run(method()))
+                self.assertFalse(tx._ended)
+                self.assertFalse(tx._ending)
+                self.assertIsNone(tx._end_task)
+                self.assertIs(tx._native, native)
+                self.assertFalse(tx._lifetime.cancelled)
+                self.assertTrue(self.factory.datasets[0].writer)
+            self.assertEqual(await tx.query("read"), ["one", "two", "three"])
+            await tx.rollback()
+            self.assertFalse(self.factory.datasets[0].writer)
+            await ds.aclose()
+            self.assertEqual(ds._worker._owners, 0)
+            self.assertTrue(ds._worker._closed)
+        finally:
+            if not ds._worker._closed:
+                await ds._worker.call(native.rollback, Token(), interruptible=False)
+                await ds._worker.call(
+                    self.factory.datasets[0].close, Token(), interruptible=False
+                )
+                while ds._worker._owners:
+                    await ds._worker.release()
+
+    async def test_foreign_cursor_fast_paths_preserve_buffer_and_state(self) -> None:
+        async with self.aio.Dataset() as ds:
+            cursor = await ds.select_cursor("rows", batch_rows=2)
+            try:
+                self.assertEqual(await anext(cursor), "one")
+                for method in (
+                    cursor.__aenter__,
+                    cursor.stats,
+                    cursor.plan,
+                    lambda: anext(cursor),
+                ):
+                    with self.assertRaisesRegex(RuntimeError, "one event loop"):
+                        await asyncio.to_thread(
+                            lambda method=method: asyncio.run(method())
+                        )
+                    self.assertEqual(list(cursor._pending), ["two"])
+                    self.assertEqual(cursor._emitted, 1)
+                    self.assertIsNone(cursor._error)
+                    self.assertFalse(cursor._busy)
+                self.assertEqual([row async for row in cursor], ["two", "three"])
+                # Cached metadata and idempotent close still enforce loop ownership.
+                for method in (cursor.stats, cursor.plan, cursor.aclose):
+                    with self.assertRaisesRegex(RuntimeError, "one event loop"):
+                        await asyncio.to_thread(
+                            lambda method=method: asyncio.run(method())
+                        )
+            finally:
+                await cursor.aclose()
+
+    async def test_foreign_transaction_admission_does_not_consume_context(self) -> None:
+        async with self.aio.Dataset() as ds:
+            tx = ds.transaction()
+            with self.assertRaisesRegex(RuntimeError, "one event loop"):
+                await asyncio.to_thread(lambda: asyncio.run(tx.__aenter__()))
+            self.assertFalse(tx._entered)
+            self.assertFalse(tx._ended)
+            self.assertFalse(self.factory.datasets[0].writer)
+            with self.assertRaisesRegex(RuntimeError, "one event loop"):
+                await asyncio.to_thread(lambda: asyncio.run(ds.__aenter__()))
+            async with tx:
+                for method in (
+                    lambda: tx.query("read"),
+                    lambda: tx.update("foreign"),
+                ):
+                    with self.assertRaisesRegex(RuntimeError, "one event loop"):
+                        await asyncio.to_thread(
+                            lambda method=method: asyncio.run(method())
+                        )
+                self.assertFalse(tx._lifetime.cancelled)
+                self.assertEqual(await tx.query("read"), ["one", "two", "three"])
+            self.assertNotIn("foreign", self.factory.datasets[0].data)
+            with self.assertRaisesRegex(RuntimeError, "one event loop"):
+                await asyncio.to_thread(lambda: asyncio.run(tx.aclose()))
+
+    async def test_foreign_open_admission_does_not_touch_opening_owner(self) -> None:
+        self.factory.block_open = True
+        ds = self.aio.Dataset()
+        first = asyncio.create_task(ds.query("read"))
+        try:
+            await event(self.factory.open_started)
+            with self.assertRaisesRegex(RuntimeError, "one event loop"):
+                await asyncio.to_thread(lambda: asyncio.run(ds.query("foreign")))
+            self.assertFalse(ds.closed)
+            self.assertFalse(ds._worker._closed)
+            self.factory.open_release.set()
+            self.assertEqual(await first, ["one", "two", "three"])
+        finally:
+            self.factory.open_release.set()
+            await asyncio.gather(first, return_exceptions=True)
+            await ds.aclose()
+
     async def test_dataset_close_cancels_active_query_and_joins(self) -> None:
         ds = self.aio.Dataset()
         await ds.__aenter__()

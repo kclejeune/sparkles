@@ -47,13 +47,16 @@ class Dataset:
         return self._closed
 
     async def _ensure_open(self) -> _NativeDataset:
+        self._worker._bind()
         if self._closed:
             raise InvalidInputError("the dataset is closed")
+        owns_open = False
         try:
             async with self._open_lock:
                 if self._closed:
                     raise InvalidInputError("the dataset is closed")
                 if self._native is None:
+                    owns_open = True
                     path, union, group = self._arguments
                     native = await self._worker.call(
                         lambda: _NativeDataset(
@@ -70,7 +73,7 @@ class Dataset:
                     self._native = native
                 return self._native
         except BaseException:
-            if self._native is None:
+            if owns_open and self._native is None:
                 await self.aclose()
             raise
 
@@ -175,6 +178,7 @@ class Dataset:
         return Transaction(self, cancel=cancel, timeout=timeout)
 
     async def aclose(self) -> None:
+        self._worker._bind()
         if self._close_task is None:
             self._closed = True
             self._worker.cancel_calls()
@@ -221,6 +225,7 @@ class _Cursor(Generic[_T]):
         return self
 
     async def __aenter__(self) -> _Cursor[_T]:
+        self._worker._bind()
         return self
 
     async def __aexit__(self, *_args: object) -> bool:
@@ -228,6 +233,7 @@ class _Cursor(Generic[_T]):
         return False
 
     async def __anext__(self) -> _T:
+        self._worker._bind()
         if self._error is not None:
             raise InvalidInputError("the cursor failed") from self._error
         if self._closed:
@@ -274,6 +280,7 @@ class _Cursor(Generic[_T]):
             self._busy = False
 
     async def stats(self) -> dict[str, Any]:
+        self._worker._bind()
         if self._busy:
             raise InvalidInputError("a cursor operation is in progress")
         if not self._closed:
@@ -283,6 +290,7 @@ class _Cursor(Generic[_T]):
         return dict(self._stats, status=self.status, emittedRows=self._emitted)
 
     async def plan(self) -> dict[str, Any]:
+        self._worker._bind()
         if self._busy:
             raise InvalidInputError("a cursor operation is in progress")
         if not self._closed:
@@ -292,6 +300,7 @@ class _Cursor(Generic[_T]):
         return dict(self._plan)
 
     async def aclose(self) -> None:
+        self._worker._bind()
         if self._close_task is None:
             self._closed = True
             self._token.cancel()

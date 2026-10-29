@@ -50,6 +50,7 @@ class Transaction:
         self._commit_succeeded = False
 
     async def __aenter__(self) -> Transaction:
+        self._worker._bind()
         if self._entered or self._ended:
             raise InvalidInputError(
                 "the async transaction was already entered or ended"
@@ -83,6 +84,7 @@ class Transaction:
     async def __aexit__(
         self, exc_type: type[BaseException] | None, *_args: object
     ) -> bool:
+        self._worker._bind()
         if not self._ended:
             if exc_type is None:
                 await self.commit()
@@ -91,6 +93,7 @@ class Transaction:
         return False
 
     def _require_open(self) -> Any:
+        self._worker._bind()
         if self._native is None or self._ended:
             raise InvalidInputError("the transaction has ended or was not entered")
         if self._ending:
@@ -187,6 +190,7 @@ class Transaction:
         await self._end(False)
 
     async def aclose(self) -> None:
+        self._worker._bind()
         if self._ended:
             return
         if self._ending:
