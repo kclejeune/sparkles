@@ -634,7 +634,46 @@ capabilities and remaining work are described by the spec status and Outcome.
 
 ## Outcome
 
-Phases 1 and 2 are not built. Phase 4a supplies HTTP and standard CLI development-baseline guards. The rest of Phase 4 remains incomplete. See [ROADMAP](../ROADMAP.md) items 58–60.
+Phase 1 has an unpublished GNU x86_64 candidate pipeline. A candidate archive built
+successfully and passed local and hosted installed runtime checks on the pinned
+Debian 11 and Rocky Linux 8 images. Unified release versions, publishing,
+attestations, the other Phase 1 server targets and verbose build information remain
+open. Phase 2 is not built. Phase 4a supplies HTTP and standard CLI development-baseline
+guards, and the rest of Phase 4 remains incomplete. See [ROADMAP](../ROADMAP.md) items 58–60.
+
+The bare Debian smoke fixture uses a declared, pinned public CA bundle copied from
+the pinned Rocky image without starting the donor container. The client needs CA data
+at initialization, including for the HTTP ping used by the smoke. The data is mounted
+read-only and does not add runtime libraries. The same candidate passed local two-generation
+smokes on Debian with that fixture and Rocky with startup connection-reset retry.
+The hosted jobs passed both runtimes with the same controller. The fixture is not
+Debian's default trust policy.
+
+### Phase 1 candidate packaging
+
+`scripts/server-artifact.py` assembles the default-feature server with a required
+production UI and formatter Wasm, generated man pages, shell completions and OpenAPI,
+both third-party notices, debug symbols and checksums. It rejects incompatible ELF
+requirements and verifies archive contents before extraction. Build records are
+unsigned metadata and do not provide artifact attestations.
+
+`server-artifacts.yml` defines a pinned manylinux 2.28 build and separate installed
+smoke jobs on pinned Rocky Linux 8 and Debian 11 images. The smoke controller checks
+readiness, exact SELECT and ASK answers, writes and reopening a persistent dataset,
+using the extracted distribution, a new data directory and the declared Debian CA fixture.
+The first baseline
+attempt at `b8dd824c` built the formatter and UI and compiled the default-feature
+server, but its final link failed because embedding-worker priority used the
+`gettid` wrapper added in glibc 2.30
+([run 40697027746](https://github.com/kclejeune/sparkles/actions/runs/40697027746)).
+The source repair uses the Linux kernel syscall while retaining the actual kernel
+thread identity and per-thread priority behavior. A later default-feature baseline build
+produced the candidate archive. Local replay of the repaired smoke controller passed
+both pinned runtimes. The repaired build and both hosted installed-runtime jobs passed
+[run 40940609152](https://github.com/kclejeune/sparkles/actions/runs/40940609152)
+at `d6e05127`. The remaining Linux,
+macOS and Windows targets, container images, registry installation and release
+orchestration remain open. The candidate workflow publishes no release or image.
 
 ### Phase 3 (2026-10-13)
 

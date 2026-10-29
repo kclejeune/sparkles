@@ -641,6 +641,32 @@ run = "mbx build --release -p sparkles-server"
 description = "Build the Docker image of compose.yaml (Dockerfile: UI, formatter WebAssembly and release binary); SPARKLES_BUILD_JOBS=N caps the compile jobs; not part of ci"
 run = "docker compose build"
 
+[tasks."server:artifact"]
+description = "Build an unpublished GNU x86_64 candidate inside the pinned manylinux job container"
+# The packer records this CLI after ui:wasm's child task has exited.
+tools = { "github:wasm-bindgen/wasm-bindgen" = "0.2.129" }
+cache = { enabled = false }
+usage = 'arg "[out]" default=".artifacts/server-candidate" help="fresh output directory outside target"'
+run = 'bash scripts/server-artifact-build.sh "$usage_out"'
+
+[tasks."server:artifact:smoke"]
+description = "Test an extracted GNU candidate in a previously pulled, pinned clean runtime image"
+cache = { enabled = false }
+usage = '''
+arg "<archive>" help="candidate tar.gz"
+arg "<checksums>" help="SHA256SUMS"
+arg "<version>" help="expected package version"
+arg "<runtime>" help="rocky8 or debian11"
+arg "<out>" help="fresh evidence directory"
+'''
+run = 'python3 scripts/server-installed-smoke.py --archive "$usage_archive" --checksums "$usage_checksums" --version "$usage_version" --runtime "$usage_runtime" --out "$usage_out"'
+
+[tasks."test:server-artifact"]
+description = "Server archive, baseline audit and smoke cleanup regressions without compilation or containers"
+sources = ["scripts/server-artifact*", "scripts/server-installed-smoke.py", "scripts/bench-tests/test_server_artifact.py", ".github/workflows/server-artifacts.yml"]
+outputs = []
+run = "python3 -m unittest discover -s scripts/bench-tests -p test_server_artifact.py"
+
 [tasks."helm:test"]
 description = "Lint the Helm chart (deploy/helm/sparkles) with each ci/*-values.yaml and check the rendered manifests; needs helm and yq; not part of ci"
 run = "scripts/helm-template-test.sh"

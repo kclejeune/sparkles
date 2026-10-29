@@ -1,0 +1,175 @@
+# Unpublished GNU x86_64 candidates. No registry/release/tag operations.
+name: Server artifact candidates
+
+on:
+  push:
+    branches: [main, item59-artifact-acceptance-20261028]
+    paths: &paths
+      - '.github/workflows/server-artifacts.yml'
+      - 'scripts/server-artifact*'
+      - 'scripts/server-installed-smoke.py'
+      - 'scripts/cargo-sparkles-task'
+      - 'scripts/build-fmt-wasm.sh'
+      - 'scripts/bench-tests/test_server_artifact.py'
+      - 'crates/**'
+      - 'vendor/**'
+      - 'ui/**'
+      - 'Cargo.toml'
+      - 'Cargo.lock'
+      - 'rust-toolchain.toml'
+      - 'mise.toml'
+      - 'LICENSE'
+      - 'THIRD_PARTY_LICENSES*.md'
+      - 'docs/openapi.json'
+  pull_request:
+    paths: *paths
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: server-artifacts-${{ github.ref }}-${{ github.ref == 'refs/heads/main' && github.run_id || 'latest' }}
+  cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
+
+env:
+  MBX_HTTP_TIMEOUT: 5m
+  MBX_GC_MAX_SIZE: 10GiB
+  MBX_REMOTE_TRUST_WRITES: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name == github.repository && 'true' || 'false' }}
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90
+    permissions:
+      contents: read
+      id-token: write
+    # UI, Wasm and Rust use one workspace and one managed target in this container.
+    container:
+      image: quay.io/pypa/manylinux_2_28_x86_64@sha256:e0adf18521ad35192df733a6c62d35df7801957d24e0470238aacecfab2188a3
+      options: --cpus 4 --memory 14g --memory-swap 14g --pids-limit 2048
+    defaults:
+      run:
+        shell: bash
+    env:
+      CARGO_BUILD_JOBS: '2'
+      SPARKLES_ARTIFACT_BUILDER_IMAGE: quay.io/pypa/manylinux_2_28_x86_64@sha256:e0adf18521ad35192df733a6c62d35df7801957d24e0470238aacecfab2188a3
+    steps:
+      - uses: actions/checkout@v5
+        with: {persist-credentials: false}
+      - name: Trust and check the container workspace before setup
+        run: |
+          # Checkout's safe.directory entry uses a temporary HOME in containers.
+          # BEGIN SERVER ARTIFACT WORKSPACE TRUST
+          git config --global --add safe.directory "$GITHUB_WORKSPACE"
+          git -C "$GITHUB_WORKSPACE" status --porcelain --untracked-files=normal
+          # END SERVER ARTIFACT WORKSPACE TRUST
+      - name: Admit builder capacity and tools before setup
+        run: |
+          /opt/python/cp313-cp313/bin/python3 - <<'PY'
+          # BEGIN SERVER ARTIFACT PREFLIGHT
+          import json
+          import os
+          from pathlib import Path
+          import platform
+          import shutil
+
+          gib = 1024 ** 3
+          memory = {}
+          for line in Path('/proc/meminfo').read_text().splitlines():
+              fields = line.split()
+              if fields and fields[0] in ('MemTotal:', 'MemAvailable:'):
+                  memory[fields[0][:-1]] = int(fields[1]) * 1024
+          tools = ('bash', 'git', 'curl', 'cc', 'c++', 'cmake', 'perl', 'readelf', 'objcopy')
+          capacity = {
+              'system': platform.system(),
+              'machine': platform.machine(),
+              'os_release': Path('/etc/os-release').read_text(),
+              'cpu_count': os.cpu_count() or 0,
+              'host_memory_total_bytes': memory.get('MemTotal', 0),
+              'host_memory_available_bytes': memory.get('MemAvailable', 0),
+              'workspace_free_bytes': shutil.disk_usage('.').free,
+              'missing_tools': [tool for tool in tools if shutil.which(tool) is None],
+          }
+          failures = []
+          if capacity['system'] != 'Linux' or capacity['machine'] != 'x86_64':
+              failures.append('requires Linux x86_64')
+          if capacity['cpu_count'] < 4:
+              failures.append('requires at least 4 host CPUs')
+          if capacity['host_memory_total_bytes'] < 15 * gib:
+              failures.append('requires at least 15 GiB physical host memory')
+          if capacity['host_memory_available_bytes'] < 14 * gib:
+              failures.append('requires at least 14 GiB available host memory')
+          if capacity['workspace_free_bytes'] < 24 * gib:
+              failures.append('requires at least 24 GiB free workspace storage')
+          if capacity['missing_tools']:
+              failures.append('missing native build tools')
+          print(json.dumps({'capacity': capacity, 'failures': failures}, sort_keys=True))
+          if failures:
+              raise SystemExit('server artifact preflight refused: ' + '; '.join(failures))
+          # END SERVER ARTIFACT PREFLIGHT
+          PY
+      - name: Use the builder's Python 3.13
+        run: echo /opt/python/cp313-cp313/bin >> "$GITHUB_PATH"
+      - uses: actions-rust-lang/setup-rust-toolchain@v1
+        with: {cache: false, rustflags: ''}
+      - uses: jdx/mise-action@v5
+        with:
+          install_args: node pnpm mr-boxington
+      - uses: jdx/mr-boxington-action@v1.7.3
+        with:
+          backend: ${{ (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) && 'remote' || 'github' }}
+          remote-url: https://mbx.kclj.dev
+          namespace: kclejeune/sparkles
+          oidc-audience: https://mbx.kclj.dev
+          version: 1.28.0
+          github-cache-mode: objects
+          cache-generation: sparkles-server-manylinux228-release-v1
+          save-on-workflow-dispatch: ${{ github.ref == 'refs/heads/main' }}
+      - name: Packaging regressions and tiny ELF fixture
+        run: python3 -m unittest discover -s scripts/bench-tests -p test_server_artifact.py
+      - name: Build and assemble the default-feature candidate
+        run: mise run server:artifact -- .artifacts/server-candidate
+      - uses: actions/upload-artifact@v4
+        with:
+          name: server-candidate-x86_64-unknown-linux-gnu
+          path: .artifacts/server-candidate/*
+          if-no-files-found: error
+
+  installed:
+    needs: build
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    strategy:
+      fail-fast: false
+      matrix:
+        runtime: [rocky8, debian11]
+    steps:
+      - uses: actions/checkout@v5
+        with: {persist-credentials: false}
+      - uses: actions/download-artifact@v4
+        with:
+          name: server-candidate-x86_64-unknown-linux-gnu
+          path: .artifacts/server-candidate
+      - name: Pull the pinned clean runtime and test the installed archive
+        shell: bash
+        env:
+          RUNTIME: ${{ matrix.runtime }}
+        run: |
+          image=$(python3 -c 'import json,os; print(json.load(open("scripts/server-artifact-images.json"))["runtimes"][os.environ["RUNTIME"]])')
+          docker pull --platform=linux/amd64 "$image"
+          if [[ "$RUNTIME" == debian11 ]]; then
+            donor=$(python3 -c 'import json; j=json.load(open("scripts/server-artifact-images.json")); print(j["runtimes"][j["debian_trust_fixture"]["donor_runtime"]])')
+            docker pull --platform=linux/amd64 "$donor"
+          fi
+          version=$(python3 -c 'import tomllib; print(tomllib.load(open("Cargo.toml","rb"))["workspace"]["package"]["version"])')
+          python3 scripts/server-installed-smoke.py \
+            --archive ".artifacts/server-candidate/sparkles-$version-x86_64-unknown-linux-gnu.tar.gz" \
+            --checksums .artifacts/server-candidate/SHA256SUMS \
+            --version "$version" --runtime "$RUNTIME" --out ".artifacts/smoke-$RUNTIME"
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: installed-server-${{ matrix.runtime }}
+          path: .artifacts/smoke-${{ matrix.runtime }}
+          if-no-files-found: error

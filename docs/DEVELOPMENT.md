@@ -788,6 +788,76 @@ until someone presses Publish. Set the variable `MAVEN_PUBLISHING_TYPE` to `auto
 to release them as soon as they validate. Artifacts on Maven Central can never be
 changed or deleted, so check a deployment in the Portal before you release it.
 
+### Server artifact candidates
+
+The build-only `server-artifacts.yml` workflow defines one unpublished GNU x86_64
+candidate. It runs UI, formatter Wasm and the default-feature Rust release build
+sequentially in one pinned manylinux 2.28 job container. Boxington 1.28.0 manages the
+workspace target and routes child Cargo calls through its shims. Separate smoke jobs
+download the archive and start its extracted binary in pinned Rocky Linux 8 and
+Debian 11 images, without the checkout or host libraries. No release, image, registry
+package or cryptographic attestation is published.
+
+The outer `server:artifact` task activates the same pinned wasm-bindgen CLI as
+`ui:wasm`, so the packer can record its version after the formatter task exits. A
+regression keeps both task pins equal to the wasm-bindgen version in Cargo.lock.
+
+The image digests in `scripts/server-artifact-images.json` identify the builder and
+clean runtimes. Update a digest only after reading its official registry metadata and
+repeating baseline and installed acceptance. A GNU candidate must use only the
+baseline system libraries, have no runtime search path and require no GLIBC version
+newer than 2.28. A Nix or Forge binary does not establish that baseline. The default
+OCR and embedding features remain enabled, while model execution requires separate
+configuration and is outside the installed query smoke.
+
+Linux embedding workers obtain their kernel thread ID through `syscall(SYS_gettid)`
+when adjusting priority. This preserves per-thread scheduling on the glibc 2.28
+baseline, which predates the glibc 2.30 `gettid` wrapper. The kernel task ID remains
+distinct from Rust and POSIX thread identifiers.
+
+The following packaging regressions compile nothing and run no container.
+
+```sh
+mise run test:server-artifact
+```
+
+Inside the pinned builder job container, run the following command with
+`SPARKLES_ARTIFACT_BUILDER_IMAGE` set to that exact image reference. The source tree
+must be committed and clean, and the output directory must be new.
+
+```sh
+mise run server:artifact -- .artifacts/server-candidate
+```
+
+The archive contains generated documentation, both license notices and an unsigned
+build record. `SHA256SUMS` covers the archive, separate debug archive and external
+records. The packer checks the GNU debug link against the separate debug file before
+assembly. A checksum proves file integrity relative to its checksum file, without
+proving who built it. Effective feature reporting in `--version` remains open.
+
+Pull the runtime image named by the checked-in pins separately. Then run the smoke
+with the archive, checksum file, exact version, runtime key and a new output directory.
+The controller never builds or pulls an image. It verifies the checksum before
+extraction, uses an unprivileged container with a read-only distribution and a new
+writable data directory, and removes its containers even after startup failures.
+The caller must have a nonzero host UID and GID. A root caller is refused before
+Docker execution, and receipts record the selected numeric user for both processes.
+
+```sh
+mise run server:artifact:smoke -- \
+  .artifacts/server-candidate/sparkles-0.1.0-x86_64-unknown-linux-gnu.tar.gz \
+  .artifacts/server-candidate/SHA256SUMS 0.1.0 rocky8 .artifacts/server-smoke-rocky8
+```
+
+Repeat with `debian11` and a separate output directory. Bare Debian also needs public
+CA data for the installed HTTP client. Pull the pinned Rocky image as the declared
+fixture donor before the Debian run. The controller copies its pinned CA bundle from a
+never-started donor, checks the file and mounts it read-only; it installs no runtime
+libraries. The receipt records the donor, package, digest and archive identity. This
+fixture is not Debian's default trust policy. Each smoke container has a 1 GiB memory
+limit, no extra swap, a 256-process limit and one CPU. The wider platform matrix, signed
+provenance and published artifacts remain item 59 work.
+
 ## Engineering invariants
 
 ### Changing an on-disk format
