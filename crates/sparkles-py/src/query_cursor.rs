@@ -312,6 +312,34 @@ impl PyQueryCursor {
         Ok(values.map(|values| PyQuerySolution::new(self.vars.clone(), values)))
     }
 
+    /// Internal async bridge: deliver one remaining native batch, without prefetch.
+    fn _next_batch(&self, py: Python<'_>) -> PyResult<Option<Vec<Py<PyQuerySolution>>>> {
+        let Some(first) = self.__next__(py)? else {
+            return Ok(None);
+        };
+        let remaining = py
+            .detach(|| {
+                let state = self
+                    .state
+                    .try_lock()
+                    .map_err(|_| sparkles::Error::invalid("a cursor operation is in progress"))?;
+                Ok(state
+                    .batch
+                    .as_ref()
+                    .map_or(0, |batch| batch.len() - state.row))
+            })
+            .py(py)?;
+        let mut rows = Vec::with_capacity(remaining + 1);
+        rows.push(Py::new(py, first)?);
+        for _ in 0..remaining {
+            let row = self
+                .__next__(py)?
+                .ok_or_else(|| invalid(py, "cursor changed while reading a batch"))?;
+            rows.push(Py::new(py, row)?);
+        }
+        Ok(Some(rows))
+    }
+
     fn close(&self, py: Python<'_>) -> PyResult<()> {
         let ok = py
             .detach(|| -> sparkles::Result<bool> {
@@ -560,6 +588,34 @@ impl PyGraphCursor {
         values
             .map(|quad| crate::terms::quad_to_py(py, quad))
             .transpose()
+    }
+
+    /// Internal async bridge: deliver one remaining native batch, without prefetch.
+    fn _next_batch(&self, py: Python<'_>) -> PyResult<Option<Vec<Py<PyAny>>>> {
+        let Some(first) = self.__next__(py)? else {
+            return Ok(None);
+        };
+        let remaining = py
+            .detach(|| {
+                let state = self
+                    .state
+                    .try_lock()
+                    .map_err(|_| sparkles::Error::invalid("a cursor operation is in progress"))?;
+                Ok(state
+                    .batch
+                    .as_ref()
+                    .map_or(0, |batch| batch.len() - state.row))
+            })
+            .py(py)?;
+        let mut rows = Vec::with_capacity(remaining + 1);
+        rows.push(first.unbind());
+        for _ in 0..remaining {
+            let row = self
+                .__next__(py)?
+                .ok_or_else(|| invalid(py, "cursor changed while reading a batch"))?;
+            rows.push(row.unbind());
+        }
+        Ok(Some(rows))
     }
 
     fn close(&self, py: Python<'_>) -> PyResult<()> {

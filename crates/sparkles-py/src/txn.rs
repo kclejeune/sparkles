@@ -81,17 +81,29 @@ pub struct PyTransaction {
     owner: ThreadId,
     /// the dataset's query defaults when the transaction began
     defaults: sparkles::sparql::QueryOptions,
+    /// Explicit end joins this worker without the GIL before acknowledging teardown.
+    worker: Mutex<Option<std::thread::JoinHandle<()>>>,
 }
 
 impl PyTransaction {
     /// Begin a transaction on `ds`: waits for the writer lock without the GIL.
     pub fn begin(py: Python<'_>, ds: sparkles::Dataset, writer: WriterSlot) -> PyResult<Self> {
+        Self::begin_with(py, ds, writer, Default::default())
+    }
+
+    /// Binding-private controlled admission; the Rust worker still owns the guard.
+    pub(crate) fn begin_with(
+        py: Python<'_>,
+        ds: sparkles::Dataset,
+        writer: WriterSlot,
+        options: sparkles::guard::WriteOptions,
+    ) -> PyResult<Self> {
         let defaults = ds.query_options();
         let (req_tx, req_rx) = channel::<Req>();
         let (resp_tx, resp_rx) = channel::<Resp>();
-        std::thread::Builder::new()
+        let worker = std::thread::Builder::new()
             .name("sparkles-txn".into())
-            .spawn(move || run(ds, req_rx, resp_tx))
+            .spawn(move || run(ds, req_rx, resp_tx, options))
             .map_err(pyo3::PyErr::from)?;
         // the first answer comes once the worker holds the writer lock
         let (resp_rx, started) = py.detach(move || {
@@ -100,8 +112,12 @@ impl PyTransaction {
         });
         match started {
             Ok(Resp::Done) => {}
-            Ok(Resp::Err(e)) => return Err(crate::errors::engine(py, e)),
+            Ok(Resp::Err(e)) => {
+                let _ = py.detach(|| worker.join());
+                return Err(crate::errors::engine(py, e));
+            }
             _ => {
+                let _ = py.detach(|| worker.join());
                 return Err(new_err(
                     py,
                     "SparklesError",
@@ -119,6 +135,7 @@ impl PyTransaction {
             writer,
             owner,
             defaults,
+            worker: Mutex::new(Some(worker)),
         })
     }
 
@@ -195,15 +212,26 @@ impl PyTransaction {
         *self.slot.lock().unwrap() = Slot::Ended;
         self.release();
         let chan = chan?;
+        let worker = self.worker.lock().unwrap().take();
         py.detach(move || {
-            chan.req
-                .send(req)
-                .map_err(|_| sparkles::Error::invalid("the transaction has ended"))?;
-            match chan.resp.recv() {
-                Ok(Resp::Err(e)) => Err(e),
-                Ok(_) => Ok(()),
-                Err(_) => Err(sparkles::Error::invalid("the transaction has ended")),
+            let answer = (|| {
+                chan.req
+                    .send(req)
+                    .map_err(|_| sparkles::Error::invalid("the transaction has ended"))?;
+                match chan.resp.recv() {
+                    Ok(Resp::Err(e)) => Err(e),
+                    Ok(_) => Ok(()),
+                    Err(_) => Err(sparkles::Error::invalid("the transaction has ended")),
+                }
+            })();
+            let joined = worker.map(|worker| worker.join());
+            answer?;
+            if joined.is_some_and(|result| result.is_err()) {
+                return Err(sparkles::Error::invalid(
+                    "the transaction worker stopped unexpectedly",
+                ));
             }
+            Ok(())
         })
         .py(py)
     }
@@ -529,9 +557,14 @@ fn for_each_label(q: &Quad, f: &mut impl FnMut(&str)) {
 }
 
 /// The worker: one write transaction, driven by the requests.
-fn run(ds: sparkles::Dataset, req: Receiver<Req>, resp: Sender<Resp>) {
+fn run(
+    ds: sparkles::Dataset,
+    req: Receiver<Req>,
+    resp: Sender<Resp>,
+    options: sparkles::guard::WriteOptions,
+) {
     let mut rolled_back = false;
-    let r = ds.transaction(|tx| {
+    let r = ds.transaction_receipt_with(options, |tx| {
         let _ = resp.send(Resp::Done);
         // set by a failure that may have left part of its changes behind
         let mut aborted: Option<String> = None;
@@ -601,7 +634,7 @@ fn run(ds: sparkles::Dataset, req: Receiver<Req>, resp: Sender<Resp>) {
         }
     });
     let last = match r {
-        Ok(()) => Resp::Done,
+        Ok(_) => Resp::Done,
         Err(_) if rolled_back => Resp::Done,
         Err(e) => Resp::Err(e),
     };

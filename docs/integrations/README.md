@@ -34,6 +34,8 @@ dataset directory. In-memory branches share runtime ownership without a file loc
   [P01](../specs/P01-python-bindings.md)). It covers datasets, loads, SPARQL, transactions,
   history, search indexes, reasoning and validation, and has an rdflib store plugin and
   the query builder. Calls release the GIL, and Ctrl-C stops a running query.
+  `sparkles.aio` provides async queries, bounded cursors and transactions, with owned
+  cancellation and explicit async cleanup.
 * `sparkles-jena` is a Jena `DatasetGraph` backed by Sparkles for JVM programs
   ([USAGE.md](../USAGE.md#jvm-apache-jena)). It has Jena's transactions, query and update
   engines that run in Sparkles with ARQ as the fallback, bulk loads, historical reads,
@@ -91,6 +93,8 @@ environment and saved credentials remain under the same item.
   workflows build for Linux on x86_64 and arm64 and for macOS on Apple silicon only, with
   no Windows or Intel macOS packages, and Linux is the platform tested locally. The JVM
   library has no musl build. Roadmap item 58.
+* Python async administration and bulk operations remain under roadmap item 58.
+  The available async surface covers queries, updates, bounded cursors and transactions.
 * JVM functions registered in Java run through ARQ. Roadmap item 25.
 
 ## Configuration and usage
@@ -99,7 +103,7 @@ The following guides describe configuration and supported UI, command-line, HTTP
 or library workflows. Exact HTTP contracts remain in the API reference.
 
 * Read [Embedding the library](../USAGE.md#embedding-the-library).
-* Read [Python](../USAGE.md#python).
+* Read [Python](../USAGE.md#python) and [async datasets and cursors](../USAGE.md#async-datasets-and-cursors).
 * Read [JVM (Apache Jena)](../USAGE.md#jvm-apache-jena).
 * Read [JavaScript and TypeScript](../USAGE.md#javascript-and-typescript).
 * Read [Rust client](../USAGE.md#rust-client).
