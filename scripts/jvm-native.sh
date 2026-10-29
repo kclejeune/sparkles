@@ -21,8 +21,12 @@ dir=debug
 # profile so that the library's own build keeps its features
 mbx build --locked --manifest-path "$crate/Cargo.toml" --target-dir target \
   --features bindgen --bin uniffi-bindgen
+features=()
+if [ "${SPARKLES_JVM_TEST_ALGORITHM_PROBE:-0}" = 1 ]; then
+  features+=(--features algorithm-test-probe)
+fi
 mbx build --locked --manifest-path "$crate/Cargo.toml" --target-dir target \
-  --profile "$profile" --lib
+  --profile "$profile" --lib "${features[@]}"
 
 lib="target/$dir/libsparkles_ffi.so"
 [ -e "$lib" ] || lib="target/$dir/libsparkles_ffi.dylib"

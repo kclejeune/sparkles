@@ -481,6 +481,7 @@ public class DatasetGraphSparkles internal constructor(
         return document(ffi { handle.ffi.runMapping(text, kind, inputs.native(), graph, operation.native) }).asObject
     }
     public fun queries(): SparklesQueries = SparklesQueries(this)
+    public fun algorithms(): SparklesAlgorithms = SparklesAlgorithms(this)
     public fun schema(): SparklesSchema = SparklesSchema(this)
     public fun graphql(): SparklesGraphQl = SparklesGraphQl(this)
     public fun graph(): SparklesGraphOverview = SparklesGraphOverview(this)

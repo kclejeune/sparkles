@@ -14,6 +14,7 @@ uniffi::setup_scaffolding!();
 static GLOBAL: sparkles_alloc::Mimalloc = sparkles_alloc::Mimalloc;
 
 mod admin;
+mod algorithms;
 pub mod encode;
 mod error;
 mod patch;
@@ -39,6 +40,7 @@ pub use advanced::{
     GeoInfo, GeoSettings, GuardInfo, GuardSettings, ReasonInfo, ReasonSettings, ShaclReport,
     ShaclResult, ShexReport, ShexResult, VectorInfo, VectorSettings,
 };
+pub use algorithms::AlgorithmOpts;
 pub use backups::{
     BackupInfo, BackupVerification, FfiBackupRepository, GcInfo, LockInfo, RepositoryTest,
     VerifyInfo,

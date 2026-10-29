@@ -3253,6 +3253,7 @@ name = "sparkles-ffi"
 version = "0.1.0"
 dependencies = [
  "jni-sys",
+ "nix",
  "oxrdf",
  "oxrdfio",
  "parking_lot",
