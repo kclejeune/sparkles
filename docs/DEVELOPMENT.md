@@ -854,10 +854,9 @@ CA data for the installed HTTP client. Pull the pinned Rocky image as the declar
 fixture donor before the Debian run. The controller copies its pinned CA bundle from a
 never-started donor, checks the file and mounts it read-only; it installs no runtime
 libraries. The receipt records the donor, package, digest and archive identity. This
-fixture is not Debian's default trust policy. Local replay of the same candidate passed
-both runtime checks with this fixture and the startup readiness retry. Repaired hosted
-acceptance remains pending. The wider platform
-matrix, signed provenance and published artifacts remain item 59 work.
+fixture is not Debian's default trust policy. Each smoke container has a 1 GiB memory
+limit, no extra swap, a 256-process limit and one CPU. The wider platform matrix, signed
+provenance and published artifacts remain item 59 work.
 
 ## Engineering invariants
 
