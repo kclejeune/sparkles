@@ -49,6 +49,74 @@ def assert_no_async_workers() -> None:
     ]
 
 
+def cancellation_failure(error: asyncio.CancelledError) -> BaseException | None:
+    # CPython 3.10 transports a cancelled Task's original exception through an
+    # implicit CancelledError context. Newer versions expose its cause directly.
+    seen = {id(error)}
+    while error.__cause__ is None:
+        context = error.__context__
+        if not isinstance(context, asyncio.CancelledError) or id(context) in seen:
+            break
+        seen.add(id(context))
+        error = context
+    return error.__cause__
+
+
+class AdmissionFailure:
+    """Record the actual native admission failure without replacing its operation."""
+
+    def __init__(self, native) -> None:
+        self.native = native
+        self.failure: BaseException | None = None
+
+    def __getattr__(self, name):
+        return getattr(self.native, name)
+
+    def _transaction(self, *args, **kwargs):
+        try:
+            return self.native._transaction(*args, **kwargs)
+        except BaseException as error:
+            self.failure = error
+            raise
+
+
+def test_cancelled_task_keeps_native_failure_identity() -> None:
+    async def run() -> None:
+        native_error = CancelledError("native operation stopped")
+        entered = asyncio.Event()
+
+        async def operation() -> None:
+            try:
+                entered.set()
+                await asyncio.Event().wait()
+            except asyncio.CancelledError as cancelled:
+                raise cancelled from native_error
+
+        task = asyncio.create_task(operation())
+        await entered.wait()
+        task.cancel()
+        done, _ = await asyncio.wait({task}, timeout=3)
+        assert task in done
+        with pytest.raises(asyncio.CancelledError) as caught:
+            await task
+        assert cancellation_failure(caught.value) is native_error
+
+    asyncio.run(run())
+
+
+def test_cancellation_failure_refuses_missing_unrelated_or_cyclic_context() -> None:
+    missing = asyncio.CancelledError()
+    assert cancellation_failure(missing) is None
+    unrelated = asyncio.CancelledError()
+    context = RuntimeError("unrelated context")
+    context.__cause__ = CancelledError("must not be accepted")
+    unrelated.__context__ = context
+    assert cancellation_failure(unrelated) is None
+    cyclic = asyncio.CancelledError()
+    cyclic.__context__ = cyclic
+    assert cancellation_failure(cyclic) is None
+
+
 class Published:
     """Delegate every real operation, delaying only its successful acknowledgement."""
 
@@ -76,6 +144,8 @@ def test_native_task_cancel_during_observed_writer_admission(tmp_path) -> None:
         path = tmp_path / "admission"
         ds = aio.Dataset(path)
         native = await ds._ensure_open()
+        admission = AdmissionFailure(native)
+        ds._native = admission
         before_head = native.head_commit.seq
         after_head = None
         loop = asyncio.get_running_loop()
@@ -95,7 +165,8 @@ def test_native_task_cancel_during_observed_writer_admission(tmp_path) -> None:
             assert pending in done, "cancellation waited for the unrelated holder"
             with pytest.raises(asyncio.CancelledError) as caught:
                 await pending
-            assert isinstance(caught.value.__cause__, CancelledError)
+            assert isinstance(admission.failure, CancelledError)
+            assert cancellation_failure(caught.value) is admission.failure
             assert not caller.cancelled
             assert not (transaction_threads() & created)
             # The independent holder is still live after cancellation settled.
