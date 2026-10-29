@@ -583,8 +583,8 @@ and `branch` return branch metadata. `diff` reads the server's bounded JSON diff
 `DiffOptions` selects retained states, branches, graph and term filters, limits and
 class grouping. A union graph filter is refused before dispatch.
 
-The existing generic and JSON methods keep their signatures. These methods do not
-add snapshot or branch mutations, RDF Patch streaming or change-feed streaming.
+The existing generic and JSON methods keep their signatures. These reads do not add
+RDF Patch streaming or change-feed streaming.
 Generated response models retain unknown members and lossless JSON integers. Required
 nullable fields must be present, including an explicit null. This keeps a diff group's
 literal and IRI alternatives distinct from its nullable class alternative. Dot-only
@@ -596,6 +596,22 @@ integer boundaries, cancellation and deadlines. The default client suite passed 
 unit and integration tests plus two doctests. Without default features, 33 tests and
 one doctest passed. These are correctness results and make no performance claim.
 
+### Typed snapshot and branch mutations
+
+Both client forms create and delete snapshots and branches with generated request and
+response models. `SnapshotRequest` and `BranchCreate` carry the request bodies.
+`HistoryOptions` supplies per-call controls, and `BranchDeleteOptions` adds the `force`
+and `reparent` query flags independently of those controls. The generated scalar unions
+preserve boolean or string values and string or integer values without coercion.
+
+The methods use the existing path segment escaping and retry policy. A successful delete
+returns unit for HTTP 204, while a missing resource retains the server's 404 error.
+POST requests do not gain retries for ambiguous write outcomes. Independent HTTP fixtures
+cover both client forms, request bodies, options, encoded paths, cancellation, deadlines
+and error responses. The client suite passed 40 tests and two doctests with default
+features, and 37 tests and one doctest without default features. Strict Clippy passed
+for both profiles. These are correctness results and make no performance claim.
+
 ### Roadmap follow-ups (2026-10-12)
 
 **Typed admin calls, rate-limit pacing and credential tests** (item 47, Tier 5,
@@ -605,8 +621,8 @@ one doctest passed. These are correctness results and make no performance claim.
   `Client::stats` and `backup_files` and `Dataset::stats`, `schema`, `backups`,
   `stored_queries`, `stored_query` and `put_stored_query` retain their JSON signatures.
   Their additive `*_typed` counterparts cover the first group of generated models.
-  Typed snapshot and branch metadata reads and bounded JSON diffs are also available.
-  Change feeds, snapshot and branch mutations, clones, merges, search, reasoning,
+  Typed snapshot and branch reads and mutations and bounded JSON diffs are also available.
+  Change feeds, clones, merges, search, reasoning,
   validation and settings still use `call_json` where no typed method exists. `RateLimit` is parsed
   (`retry.rs`) and used to wait after a `429`, but never before one. `from_env` and
   `saved_credentials` have no integration test.
