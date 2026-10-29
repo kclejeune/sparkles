@@ -167,13 +167,10 @@ pub(crate) fn resolve(
     operation.check()?;
     // One conservative workspace admission covers temporary indexes and property
     // copies. Per-assignment output support lists are charged separately below.
-    let count = graph.records.values().try_fold(0usize, |n, r| {
-        n.checked_add(r.len()).ok_or(Failure::ReplayLimit)
-    })?;
     let _workspace = operation.charge(
-        count
-            .checked_mul(512)
-            .and_then(|v| v.checked_add(4096))
+        graph
+            .workspace_bytes()?
+            .checked_mul(2)
             .ok_or(Failure::ReplayLimit)?,
     )?;
     graph.validate_domain(operation)?;
@@ -437,7 +434,7 @@ pub(crate) fn resolve(
             conflicts,
             unknowns,
         },
-        charges,
+        _charges: charges,
     })
 }
 

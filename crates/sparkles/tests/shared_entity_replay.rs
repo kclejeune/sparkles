@@ -1,4 +1,4 @@
-//! First private reference tranche: comparison bytes, not RDF/identity replay.
+//! Private offline replay against independently fixed input and semantic oracles.
 #[path = "../examples/shared_entity_replay/mod.rs"]
 mod replay;
 
@@ -538,4 +538,771 @@ fn rdf_unknown_fields_and_scope_reuse_refuse_without_label_diagnostics() {
             Err(Failure::ScopeMismatch)
         ));
     });
+}
+
+fn with_evolution_graph(run: impl FnOnce(&mut Graph, &Operation<'_>)) {
+    let control = Control::none();
+    let operation = Operation::new(&control, Limits::default()).unwrap();
+    let docs: Vec<_> = [
+        "valid/common.ttl",
+        "valid/support-lineage.ttl",
+        "valid/evolution.ttl",
+        "valid/episode-observations.ttl",
+    ]
+    .map(fixture)
+    .into();
+    let supplied: Vec<_> = docs
+        .iter()
+        .map(|d| (d.as_slice(), oxrdfio::RdfFormat::Turtle))
+        .collect();
+    let mut graph = Graph::load_documents(&supplied, &operation).unwrap();
+    let authored: Vec<_> = graph
+        .records
+        .keys()
+        .filter(|id| {
+            ["Projection", "Assignment", "Conflict"]
+                .iter()
+                .any(|kind| graph.has_type(id, &format!("{SR}{kind}")))
+        })
+        .cloned()
+        .collect();
+    for id in authored {
+        graph.records.remove(&id);
+    }
+    run(&mut graph, &operation);
+}
+fn ex(local: &str) -> String {
+    format!("urn:example:a01:{local}")
+}
+fn candidates() -> Vec<ObservationCandidate> {
+    let declared: serde_json::Value =
+        serde_json::from_slice(&fixture("expected/a10-selection-inputs.json")).unwrap();
+    declared["candidates"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|c| ObservationCandidate {
+            revision: ex(c["sourceRevision"].as_str().unwrap()),
+            observation: ex(c["observation"].as_str().unwrap()),
+            relation_claim: ex(c["relationClaim"].as_str().unwrap()),
+            value_claim: ex(c["valueClaim"].as_str().unwrap()),
+        })
+        .collect()
+}
+#[test]
+fn a5_admission_is_computed_from_decisions_after_projection_rows_are_removed() {
+    with_evolution_graph(|graph, operation| {
+        let oracle: serde_json::Value =
+            serde_json::from_slice(&fixture("expected/semantic-oracle.json")).unwrap();
+        let expected = &oracle["cases"][4]["outcome"];
+        for (view, key) in [
+            ("both", "bothOccurrences"),
+            ("afterFirst", "afterFirstWithdrawal"),
+            ("afterFinal", "afterFinalWithdrawal"),
+        ] {
+            let selected = admitted_occurrences(
+                graph,
+                &ex(&format!("A5:{view}:view")),
+                &ex("A5:simulatedClaimAdmission:1"),
+                1,
+                operation,
+            )
+            .unwrap();
+            let Selection::Known(actual) = selected else {
+                panic!("fixed policy must select");
+            };
+            let fixed: Vec<_> = expected[key]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|id| ex(&format!("A5:{}", id.as_str().unwrap())))
+                .collect();
+            assert_eq!(actual.value, fixed);
+        }
+        assert!(graph.has_type(&ex("A5:claim1"), &format!("{EV}Claim")));
+        assert!(graph.has_type(&ex("A5:claim2"), &format!("{EV}Claim")));
+        assert_eq!(
+            admitted_occurrences(
+                graph,
+                &ex("A5:both:view"),
+                "urn:unknown:policy",
+                1,
+                operation
+            )
+            .unwrap_err(),
+            Failure::UnsupportedProfile
+        );
+    });
+}
+#[test]
+fn a10_selects_terminal_revision_without_summing_or_reading_projection_rows() {
+    with_evolution_graph(|graph, operation| {
+        let oracle: serde_json::Value =
+            serde_json::from_slice(&fixture("expected/a10-selection-inputs.json")).unwrap();
+        for state in oracle["states"].as_array().unwrap() {
+            let Selection::Known(actual) = select_observation(
+                graph,
+                &ex(state["view"].as_str().unwrap()),
+                &ex("A10:selectionProfile1"),
+                &candidates(),
+                operation,
+            )
+            .unwrap() else {
+                panic!("fixed series must select");
+            };
+            assert_eq!(
+                actual.revision,
+                ex(state["expected"]["sourceRevision"].as_str().unwrap())
+            );
+            assert_eq!(
+                actual.observation,
+                ex(state["expected"]["observation"].as_str().unwrap())
+            );
+            assert_eq!(
+                actual.count,
+                state["expected"]["count"].as_u64().unwrap().to_string()
+            );
+            assert_eq!(actual.episode, ex("A10:episode"));
+            assert_eq!(
+                actual.denominator_status,
+                Some(format!("{SR}UnknownDenominator"))
+            );
+            assert_eq!(actual.geometry_version, ex("geometry1"));
+        }
+    });
+}
+#[test]
+fn revision_unknowns_are_explicit_and_never_resolved_by_count_or_order() {
+    let control = Control::none();
+    let operation = Operation::new(&control, Limits::default()).unwrap();
+    assert_eq!(
+        terminal_revision(&[], &[], &operation).unwrap(),
+        Selection::Unknown("NoSelectedCandidate")
+    );
+    let ids = vec![ex("one"), ex("two")];
+    assert_eq!(
+        terminal_revision(&ids, &[], &operation).unwrap(),
+        Selection::Unknown("ConflictingTerminalRevisions")
+    );
+    assert_eq!(
+        terminal_revision(
+            &ids,
+            &[
+                (ids[0].clone(), ids[1].clone()),
+                (ids[1].clone(), ids[0].clone())
+            ],
+            &operation
+        )
+        .unwrap(),
+        Selection::Unknown("RevisionCycle")
+    );
+    assert_eq!(
+        terminal_revision(&ids, &[(ids[1].clone(), ids[0].clone())], &operation).unwrap(),
+        Selection::Known(ids[1].as_str())
+    );
+}
+#[test]
+fn a10_unknown_selection_rule_and_incompatible_series_stay_unknown() {
+    with_evolution_graph(|graph, operation| {
+        let id = ex("A10:selectionProfile1");
+        let predicate = ex("application:revisionSelectionRule");
+        let old = graph.records[&id].clone();
+        graph
+            .records
+            .get_mut(&id)
+            .unwrap()
+            .retain(|s| s.predicate != predicate);
+        graph.records.get_mut(&id).unwrap().insert(Statement {
+            graph: "DEFAULT".into(),
+            predicate,
+            object: oxrdf::NamedNode::new("urn:unknown:rule").unwrap().into(),
+        });
+        assert!(matches!(
+            select_observation(graph, &ex("A10:currentView"), &id, &candidates(), operation)
+                .unwrap(),
+            Selection::Unknown("UnknownSelectionRule")
+        ));
+        graph.records.insert(id.clone(), old);
+        let observation = ex("A10:obs2");
+        let predicate = format!("{SR}geometryVersion");
+        graph
+            .records
+            .get_mut(&observation)
+            .unwrap()
+            .retain(|s| s.predicate != predicate);
+        graph
+            .records
+            .get_mut(&observation)
+            .unwrap()
+            .insert(Statement {
+                graph: "DEFAULT".into(),
+                predicate,
+                object: oxrdf::NamedNode::new(ex("geometry2")).unwrap().into(),
+            });
+        assert!(matches!(
+            select_observation(graph, &ex("A10:currentView"), &id, &candidates(), operation)
+                .unwrap(),
+            Selection::Unknown("IncompatibleObservationSeries")
+        ));
+    });
+}
+#[test]
+fn a6_lineage_and_a7_availability_use_explicit_declarations() {
+    with_evolution_graph(|graph, operation| {
+        let occurrences =
+            ["bulletinClaim", "mirrorClaim", "translationClaim"].map(|id| ex(&format!("A6:{id}")));
+        let Selection::Known(groups) = source_lineages(graph, &occurrences, operation).unwrap()
+        else {
+            panic!("fixed lineage");
+        };
+        assert_eq!(groups.value.len(), 1);
+        assert_eq!(groups.value[&ex("bulletinFamily")], occurrences);
+        assert_eq!(
+            simulated_available(graph, &ex("late"), "2026-02-01T00:00:00Z", operation).unwrap(),
+            Selection::Known(false)
+        );
+        assert_eq!(
+            simulated_available(graph, &ex("late"), "2026-03-01T00:00:00Z", operation).unwrap(),
+            Selection::Known(true)
+        );
+        assert_eq!(
+            simulated_available(graph, &ex("r1"), "2026-03-01T00:00:00Z", operation).unwrap(),
+            Selection::Unknown("UnknownAvailability")
+        );
+    });
+}
+#[test]
+fn a8_mapping_migration_retains_source_identity_and_old_views() {
+    with_evolution_graph(|graph, operation| {
+        let old = graph.records[&ex("A8:view1")].clone();
+        let revision = graph.records[&ex("r1")].clone();
+        assert_eq!(
+            mapping_migration(
+                graph,
+                &ex("A8:view1"),
+                &ex("A8:view2"),
+                &ex("A8:migration"),
+                operation
+            )
+            .unwrap(),
+            Selection::Known(true)
+        );
+        assert_eq!(graph.records[&ex("A8:view1")], old);
+        assert_eq!(graph.records[&ex("r1")], revision);
+    });
+}
+#[test]
+fn retained_source_digests_and_selected_values_match_all_pinned_source_records() {
+    with_evolution_graph(|graph, operation| {
+        let declared: serde_json::Value =
+            serde_json::from_slice(&fixture("expected/source-selections.json")).unwrap();
+        let mut retained = RetainedSources::default();
+        for source in declared.as_array().unwrap() {
+            let bytes = fixture(source["path"].as_str().unwrap());
+            retained
+                .insert(
+                    graph,
+                    source["revision"].as_str().unwrap(),
+                    bytes.as_slice(),
+                    operation,
+                )
+                .unwrap();
+            for selection in source["selections"].as_array().unwrap() {
+                retained
+                    .verify_reference(graph, selection["reference"].as_str().unwrap(), operation)
+                    .unwrap();
+            }
+        }
+        retained
+            .verify_selected(graph, &ex("A10:currentView:manifest"), operation)
+            .unwrap();
+        assert_eq!(
+            retained.insert(
+                graph,
+                &ex("r1"),
+                fixture("raw/tampered-r1.json").as_slice(),
+                operation
+            ),
+            Err(Failure::SourceDigestMismatch)
+        );
+        let empty = RetainedSources::default();
+        assert_eq!(
+            empty.verify_selected(graph, &ex("A10:currentView:manifest"), operation),
+            Err(Failure::IncompleteInput)
+        );
+    });
+}
+#[test]
+fn existing_software_bytes_map_only_explicit_family_version_bindings() {
+    let path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("../../testsuite/software-inventory/v1/raw/synthetic-before.Cargo.lock");
+    let bytes = std::fs::read(path).unwrap();
+    let control = Control::none();
+    let operation = Operation::new(&control, Limits::default()).unwrap();
+    let bindings = [SoftwareBinding {
+        name: text("sparkles-fixture-only-leaf"),
+        version: text("1.3.0"),
+        source: Some(text(
+            "registry+https://github.com/rust-lang/crates.io-index",
+        )),
+        family_id: ex("offline:leaf"),
+        version_id: ex("offline:leaf:1.3.0"),
+    }];
+    let Selection::Known(actual) = software_inventory(&bytes, 1, &bindings, &operation).unwrap()
+    else {
+        panic!("fixed binding");
+    };
+    assert_eq!(
+        actual.packages,
+        vec![(ex("offline:leaf"), ex("offline:leaf:1.3.0"))]
+    );
+    assert_eq!(
+        actual.deployed_exposure,
+        Selection::Unknown("NoDeploymentEvidence")
+    );
+    assert!(actual.source_digest.starts_with("sha256:"));
+    assert!(matches!(
+        software_inventory(&bytes, 2, &bindings, &operation).unwrap(),
+        Selection::Unknown("UnsupportedMapping")
+    ));
+}
+
+#[test]
+fn rdf_permutations_duplicate_triples_and_batched_complete_records_keep_exact_bytes() {
+    let control = Control::none();
+    let operation = Operation::new(&control, Limits::default()).unwrap();
+    let docs = [fixture("valid/common.ttl"), fixture("valid/resolution.ttl")];
+    let policy = sparkles::shared_entity::profile(1).unwrap().policy;
+    let mut subjects = std::collections::BTreeMap::<String, Vec<String>>::new();
+    for bytes in docs.iter().map(Vec::as_slice).chain([policy.as_bytes()]) {
+        for quad in oxrdfio::RdfParser::from_format(oxrdfio::RdfFormat::Turtle).for_slice(bytes) {
+            let quad = quad.unwrap();
+            subjects
+                .entry(quad.subject.to_string())
+                .or_default()
+                .push(format!("{quad} .\n"));
+        }
+    }
+    let mut graph = Graph::default();
+    for (_, mut triples) in subjects.into_iter().rev() {
+        triples.reverse();
+        let bytes = triples.concat().repeat(2);
+        let delivery = Graph::load_documents(
+            &[(bytes.as_bytes(), oxrdfio::RdfFormat::NQuads)],
+            &operation,
+        )
+        .unwrap();
+        graph.merge_delivery(delivery, &operation).unwrap();
+    }
+    let computed = resolve(&graph, &ex("A12:pair"), &operation).unwrap();
+    assert_eq!(
+        encode_resolved(&computed.comparison, &operation).unwrap(),
+        fixture("expected/a12-comparison.json")
+    );
+}
+#[test]
+fn graph_coordinates_are_content_and_blank_labels_cannot_be_durable_ids() {
+    let control = Control::none();
+    let operation = Operation::new(&control, Limits::default()).unwrap();
+    let default = b"<urn:record> <urn:value> \"value\" .\n";
+    let named = b"<urn:record> <urn:value> \"value\" <urn:graph> .\n";
+    let mut graph =
+        Graph::load_documents(&[(default, oxrdfio::RdfFormat::NQuads)], &operation).unwrap();
+    let same_id =
+        Graph::load_documents(&[(named, oxrdfio::RdfFormat::NQuads)], &operation).unwrap();
+    assert_eq!(
+        graph.merge_delivery(same_id, &operation),
+        Err(Failure::ImmutableRecordConflict)
+    );
+    for bytes in [
+        b"_:blank <urn:value> <urn:object> .".as_slice(),
+        b"<urn:record> <urn:value> _:blank .".as_slice(),
+    ] {
+        assert!(matches!(
+            Graph::load_documents(&[(bytes, oxrdfio::RdfFormat::Turtle)], &operation),
+            Err(Failure::InvalidDomainRecord)
+        ));
+    }
+}
+#[test]
+fn all_record_caps_refuse_plus_one_and_accept_the_supported_sibling() {
+    for kind in [
+        "Entity",
+        "Description",
+        "Claim",
+        "ReviewDecision",
+        "Relation",
+    ] {
+        let control = Control::none();
+        let mut limits = Limits::default();
+        match kind {
+            "Entity" => limits.entities = 1,
+            "Description" => limits.descriptions = 1,
+            "Claim" => limits.claims = 1,
+            "ReviewDecision" => limits.decisions = 1,
+            _ => limits.relations = 1,
+        }
+        let operation = Operation::new(&control, limits).unwrap();
+        let namespace = if matches!(kind, "Claim" | "ReviewDecision") {
+            EV
+        } else {
+            SR
+        };
+        let one = format!("<urn:one> a <{namespace}{kind}> .\n");
+        let two = format!("{one}<urn:two> a <{namespace}{kind}> .\n");
+        assert!(
+            Graph::load_documents(&[(one.as_bytes(), oxrdfio::RdfFormat::Turtle)], &operation)
+                .is_ok()
+        );
+        assert!(matches!(
+            Graph::load_documents(&[(two.as_bytes(), oxrdfio::RdfFormat::Turtle)], &operation),
+            Err(Failure::ReplayLimit)
+        ));
+        assert_eq!(operation.used(), 0);
+    }
+}
+#[test]
+fn byte_memory_source_caps_deadline_and_owned_result_lifetimes_are_enforced() {
+    let data = b"<urn:record> <urn:value> \"value\" .\n";
+    let control = Control::none();
+    let operation = Operation::new(
+        &control,
+        Limits {
+            decoded: data.len() - 1,
+            ..Limits::default()
+        },
+    )
+    .unwrap();
+    assert!(matches!(
+        Graph::load_documents(&[(data, oxrdfio::RdfFormat::NTriples)], &operation),
+        Err(Failure::ReplayLimit)
+    ));
+    assert_eq!(operation.used(), 0);
+    let operation = Operation::new(
+        &control,
+        Limits {
+            memory: 1,
+            ..Limits::default()
+        },
+    )
+    .unwrap();
+    assert!(matches!(
+        Graph::load_documents(&[(data, oxrdfio::RdfFormat::NTriples)], &operation),
+        Err(Failure::ReplayLimit)
+    ));
+    assert_eq!(operation.used(), 0);
+    let elapsed = Control {
+        deadline: Some(Instant::now()),
+        ..Control::none()
+    };
+    assert!(matches!(
+        Operation::new(&elapsed, Limits::default()),
+        Err(Failure::ReplayCancelled)
+    ));
+    with_evolution_graph(|graph, operation| {
+        let baseline = operation.used();
+        let admitted = admitted_occurrences(
+            graph,
+            &ex("A5:both:view"),
+            &ex("A5:simulatedClaimAdmission:1"),
+            1,
+            operation,
+        )
+        .unwrap();
+        assert!(operation.used() > baseline);
+        drop(admitted);
+        assert_eq!(operation.used(), baseline);
+        let control = Control::none();
+        let small = Operation::new(
+            &control,
+            Limits {
+                source: 1,
+                ..Limits::default()
+            },
+        )
+        .unwrap();
+        let mut retained = RetainedSources::default();
+        assert_eq!(
+            retained.insert(graph, &ex("r1"), fixture("raw/r1.json").as_slice(), &small),
+            Err(Failure::ReplayLimit)
+        );
+        assert_eq!(small.used(), 0);
+    });
+}
+#[test]
+fn selected_value_digest_tampering_refuses_without_overwriting_retained_source() {
+    with_evolution_graph(|graph, operation| {
+        let mut retained = RetainedSources::default();
+        retained
+            .insert(
+                graph,
+                &ex("r1"),
+                fixture("raw/r1.json").as_slice(),
+                operation,
+            )
+            .unwrap();
+        let reference = ex("A5:claim1:ref");
+        retained
+            .verify_reference(graph, &reference, operation)
+            .unwrap();
+        let original = graph.records[&reference].clone();
+        let predicate = format!("{EV}valueDigest");
+        graph
+            .records
+            .get_mut(&reference)
+            .unwrap()
+            .retain(|s| s.predicate != predicate);
+        graph
+            .records
+            .get_mut(&reference)
+            .unwrap()
+            .insert(Statement {
+                graph: "DEFAULT".into(),
+                predicate,
+                object: oxrdf::Literal::new_simple_literal(format!("sha256:{}", "0".repeat(64)))
+                    .into(),
+            });
+        assert_eq!(
+            retained.verify_reference(graph, &reference, operation),
+            Err(Failure::SourceDigestMismatch)
+        );
+        graph.records.insert(reference.clone(), original);
+        retained
+            .verify_reference(graph, &reference, operation)
+            .unwrap();
+    });
+}
+#[test]
+fn a11_successors_keep_old_grouping_and_immutable_geography_records() {
+    with_evolution_graph(|graph, operation| {
+        let policy = sparkles::shared_entity::profile(1).unwrap().policy;
+        let policy = Graph::load_documents(
+            &[(policy.as_bytes(), oxrdfio::RdfFormat::Turtle)],
+            operation,
+        )
+        .unwrap();
+        graph.merge_delivery(policy, operation).unwrap();
+        let old = resolve(graph, &ex("A11:oldGrouping"), operation).unwrap();
+        let split = resolve(graph, &ex("A11:splitGrouping"), operation).unwrap();
+        assert_eq!(old.comparison.assignments.len(), 3);
+        assert!(
+            old.comparison
+                .assignments
+                .iter()
+                .all(|r| r.representative == Some(ex("A11:episode1")))
+        );
+        assert!(
+            split
+                .comparison
+                .assignments
+                .iter()
+                .all(|r| r.representative.as_ref() == Some(&r.entity))
+        );
+        let old_bytes = encode_resolved(&old.comparison, operation).unwrap();
+        assert_eq!(
+            encode_resolved(
+                &resolve(graph, &ex("A11:oldGrouping"), operation)
+                    .unwrap()
+                    .comparison,
+                operation
+            )
+            .unwrap(),
+            old_bytes
+        );
+        let geography = graph.records[&ex("A11:place1")].clone();
+        let changed = fixture("valid/geometry-successor.ttl");
+        let delivery = Graph::load_documents(
+            &[(changed.as_slice(), oxrdfio::RdfFormat::Turtle)],
+            operation,
+        )
+        .unwrap();
+        assert_eq!(
+            graph.merge_delivery(delivery, operation),
+            Err(Failure::ImmutableRecordConflict)
+        );
+        assert_eq!(graph.records[&ex("A11:place1")], geography);
+        assert_eq!(
+            graph
+                .one_iri(&ex("A11:place2"), &format!("{SR}geometryVersion"))
+                .unwrap(),
+            ex("geometry2")
+        );
+    });
+}
+
+fn supplied_view(
+    scope: &str,
+    view: &str,
+    entities: &[String],
+    operation: &Operation<'_>,
+) -> Vec<u8> {
+    let manifest = format!("{view}:manifest");
+    let mut ids = entities.to_vec();
+    ids.extend([
+        ex("ontology1"),
+        ex("mapping1"),
+        ex("normalization1"),
+        ex("simulatedSnapshot"),
+        format!("{SR}policy:1"),
+    ]);
+    ids.sort();
+    let payload = serde_json::json!({"profileVersion":1,"inputIds":ids,"requiredExtensions":[],"extensionIds":[]});
+    // Fixed profile property order, independent of semantic answer computation.
+    let payload = format!(
+        "{{\"profileVersion\":1,\"inputIds\":{},\"requiredExtensions\":[],\"extensionIds\":[]}}",
+        serde_json::to_string(&payload["inputIds"]).unwrap()
+    );
+    let digest =
+        sparkles_core::evidence::Sha256Digest::of_bytes(payload.as_bytes(), operation.control)
+            .unwrap();
+    let ids = ids
+        .iter()
+        .map(|id| format!("<{id}>"))
+        .collect::<Vec<_>>()
+        .join(", ");
+    format!("PREFIX sr: <{SR}>\n<{view}> a sr:ResolutionView ; sr:profileVersion 1 ; sr:domainScope <{scope}> ; sr:matchingPolicy <{SR}policy:1> ; sr:ontologyVersion <{}> ; sr:mappingVersion <{}> ; sr:normalizationVersion <{}> ; sr:recordedView <{}> ; sr:inputManifest <{manifest}> .\n<{manifest}> a sr:InputManifest ; sr:profileVersion 1 ; sr:inputId {ids} ; sr:contentDigest \"{digest}\" .",ex("ontology1"),ex("mapping1"),ex("normalization1"),ex("simulatedSnapshot")).into_bytes()
+}
+#[test]
+fn a15_public_replay_starts_from_separate_complete_scope_and_has_no_hidden_labels() {
+    let control = Control::none();
+    let operation = Operation::new(&control, Limits::default()).unwrap();
+    let common = fixture("valid/public-common.ttl");
+    let public = fixture("valid/public-boundary.ttl");
+    let policy = sparkles::shared_entity::profile(1).unwrap().policy;
+    let view = ex("A15:publicView");
+    let scope = ex("A15:public");
+    let declaration = supplied_view(
+        &scope,
+        &view,
+        &[ex("A15:publicEntity"), ex("public")],
+        &operation,
+    );
+    let graph = Graph::load_documents(
+        &[
+            (&common, oxrdfio::RdfFormat::Turtle),
+            (&public, oxrdfio::RdfFormat::Turtle),
+            (policy.as_bytes(), oxrdfio::RdfFormat::Turtle),
+            (&declaration, oxrdfio::RdfFormat::Turtle),
+        ],
+        &operation,
+    )
+    .unwrap();
+    let result = resolve_in_scope(&graph, &view, &scope, &operation).unwrap();
+    assert_eq!(result.comparison.assignments.len(), 1);
+    assert_eq!(
+        result.comparison.assignments[0].entity,
+        ex("A15:publicEntity")
+    );
+    let bytes = encode_resolved(&result.comparison, &operation).unwrap();
+    let text = std::str::from_utf8(&bytes).unwrap();
+    assert!(!text.contains("hidden"));
+    assert!(!text.contains("private"));
+    assert_eq!(
+        resolve_in_scope(&graph, &view, &ex("A15:private"), &operation)
+            .err()
+            .unwrap()
+            .code(),
+        "scope-mismatch"
+    );
+}
+#[test]
+fn a1_alias_bindings_preserve_scope_and_do_not_merge_same_name_organizations() {
+    let control = Control::none();
+    let operation = Operation::new(&control, Limits::default()).unwrap();
+    let docs = [
+        fixture("valid/common.ttl"),
+        fixture("valid/descriptions.ttl"),
+        fixture("valid/identifiers.ttl"),
+    ];
+    let policy = sparkles::shared_entity::profile(1).unwrap().policy;
+    let view = ex("A1:offlineView");
+    let declaration = supplied_view(
+        &ex("A1"),
+        &view,
+        &[ex("A1:org1"), ex("A1:org2"), ex("r1")],
+        &operation,
+    );
+    let mut input: Vec<_> = docs
+        .iter()
+        .map(|d| (d.as_slice(), oxrdfio::RdfFormat::Turtle))
+        .collect();
+    input.push((policy.as_bytes(), oxrdfio::RdfFormat::Turtle));
+    input.push((&declaration, oxrdfio::RdfFormat::Turtle));
+    let graph = Graph::load_documents(&input, &operation).unwrap();
+    let result = resolve(&graph, &view, &operation).unwrap();
+    assert!(
+        result
+            .comparison
+            .assignments
+            .iter()
+            .all(|r| r.representative.as_ref() == Some(&r.entity))
+    );
+    assert_eq!(
+        graph
+            .one_iri(&ex("A1:alias1:binding"), &format!("{SR}entity"))
+            .unwrap(),
+        ex("A1:org1")
+    );
+    assert_eq!(
+        graph
+            .one_iri(&ex("A1:alias2:binding"), &format!("{SR}entity"))
+            .unwrap(),
+        ex("A1:org1")
+    );
+    assert_ne!(
+        graph
+            .one_iri(&ex("A1:alias1"), &format!("{SR}realm"))
+            .unwrap(),
+        graph
+            .one_iri(&ex("A1:sameName"), &format!("{SR}realm"))
+            .unwrap()
+    );
+}
+#[test]
+fn replay_never_asserts_same_as_or_described_business_triples() {
+    with_resolution_graph(&[], |graph, operation| {
+        let original = graph.records.clone();
+        resolve(graph, &ex("A2:view"), operation).unwrap();
+        assert_eq!(graph.records, original);
+        assert!(
+            !graph
+                .records
+                .values()
+                .flatten()
+                .any(|s| s.predicate == "http://www.w3.org/2002/07/owl#sameAs"
+                    || s.predicate == format!("{SR}ControlsAccount"))
+        );
+    });
+}
+#[test]
+fn local_cli_requires_explicit_inputs_and_returns_only_completed_comparison() {
+    let root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../");
+    let mut args = vec![text("--view"), ex("A12:pair"), text("--scope"), ex("A12")];
+    for path in [
+        "testsuite/entity-representation/v1/valid/common.ttl",
+        "testsuite/entity-representation/v1/valid/resolution.ttl",
+        "crates/sparkles/resources/entity-representation/v1/policies/default.ttl",
+    ] {
+        args.extend([text("--rdf"), format!("ttl={}", root.join(path).display())]);
+    }
+    args.extend([
+        text("--source"),
+        format!(
+            "{}={}",
+            ex("r1"),
+            root.join("testsuite/entity-representation/v1/raw/r1.json")
+                .display()
+        ),
+    ]);
+    assert_eq!(
+        run_cli(&args).unwrap(),
+        fixture("expected/a12-comparison.json")
+    );
+    let mut cancelled = args.clone();
+    cancelled.extend([text("--deadline-ms"), text("0")]);
+    assert_eq!(run_cli(&cancelled), Err(Failure::ReplayCancelled));
+    let mut unknown = args;
+    unknown.extend([text("--unknown"), text("hidden label")]);
+    assert_eq!(run_cli(&unknown), Err(Failure::UnknownControlField));
+    assert_eq!(run_cli(&[]), Err(Failure::IncompleteInput));
 }

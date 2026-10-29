@@ -1,4 +1,4 @@
-//! Typed comparison values supplied by the future verified-input resolution layer.
+//! Private typed comparison values and bounded supplied RDF/source delivery.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct Comparison {
     pub profile_version: u32,
@@ -221,6 +221,13 @@ pub(crate) struct Statement {
     pub object: oxrdf::Term,
 }
 impl Graph {
+    /// Conservative retained registry size also bounds copies made by temporary
+    /// semantic indexes. This includes full term bytes rather than just row count.
+    pub fn workspace_bytes(&self) -> ReplayResult<usize> {
+        self.charges.iter().try_fold(4096usize, |n, c| {
+            n.checked_add(c.bytes).ok_or(Failure::ReplayLimit)
+        })
+    }
     pub fn load_documents(
         documents: &[(&[u8], oxrdfio::RdfFormat)],
         operation: &Operation<'_>,
@@ -428,9 +435,21 @@ impl Graph {
 
 /// Charges live as long as the computed owned values; no partial value escapes
 /// a failed replay. The caller may then encode through the fixed byte contract.
+/// An owned helper result keeps its conservative budget debit until its backing
+/// has dropped. Charges cannot be cloned independently of their allocation.
+pub(crate) struct Owned<T> {
+    pub value: T,
+    pub _charges: Vec<Charge>,
+}
+impl<T: std::fmt::Debug> std::fmt::Debug for Owned<T> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        self.value.fmt(f)
+    }
+}
+
 pub(crate) struct ComputedComparison {
     pub comparison: Comparison,
-    pub charges: Vec<Charge>,
+    pub _charges: Vec<Charge>,
 }
 
 impl Graph {
@@ -897,6 +916,129 @@ impl Graph {
                 .map_err(|_| Failure::ReplayCancelled)?
                 .to_string();
         if digest != self.digest_literal(id, "contentDigest")? {
+            return Err(Failure::SourceDigestMismatch);
+        }
+        operation.check()
+    }
+}
+
+/// Explicit local retained bytes. No locator is fetched or interpreted as authority.
+#[derive(Default)]
+pub(crate) struct RetainedSources {
+    bytes: std::collections::BTreeMap<String, Vec<u8>>,
+    charges: Vec<Charge>,
+}
+impl RetainedSources {
+    pub fn insert(
+        &mut self,
+        graph: &Graph,
+        revision: &str,
+        mut reader: impl std::io::Read,
+        operation: &Operation<'_>,
+    ) -> ReplayResult<()> {
+        operation.check()?;
+        if !graph.has_type(revision, &format!("{EV}SourceRevision")) {
+            return Err(Failure::UnresolvedReference);
+        }
+        let declared = graph.literal(revision, &format!("{EV}contentDigest"))?;
+        declared
+            .parse::<sparkles_core::evidence::Sha256Digest>()
+            .map_err(|_| Failure::InvalidDomainRecord)?;
+        let mut bytes = Vec::new();
+        let mut charges = vec![operation.charge(revision.len() + 256)?];
+        loop {
+            operation.check()?;
+            let mut block = [0u8; 8192];
+            let n = reader
+                .read(&mut block)
+                .map_err(|_| Failure::IncompleteInput)?;
+            if n == 0 {
+                break;
+            }
+            if bytes.len().checked_add(n).ok_or(Failure::ReplayLimit)? > operation.limits.source {
+                return Err(Failure::ReplayLimit);
+            }
+            // Reserve conservative Vec growth before retaining input bytes.
+            charges.push(
+                operation.charge(
+                    n.checked_mul(2)
+                        .and_then(|v| v.checked_add(64))
+                        .ok_or(Failure::ReplayLimit)?,
+                )?,
+            );
+            bytes.extend_from_slice(&block[..n]);
+        }
+        let digest = sparkles_core::evidence::Sha256Digest::of_bytes(&bytes, operation.control)
+            .map_err(|_| Failure::ReplayCancelled)?
+            .to_string();
+        if digest != declared {
+            return Err(Failure::SourceDigestMismatch);
+        }
+        if let Some(old) = self.bytes.get(revision) {
+            if old != &bytes {
+                return Err(Failure::ImmutableRecordConflict);
+            }
+            return Ok(());
+        }
+        self.bytes.insert(revision.to_owned(), bytes);
+        self.charges.append(&mut charges);
+        operation.check()
+    }
+    pub fn verify_selected(
+        &self,
+        graph: &Graph,
+        manifest: &str,
+        operation: &Operation<'_>,
+    ) -> ReplayResult<()> {
+        graph.verify_manifest(manifest, operation)?;
+        for id in graph.iris(manifest, &format!("{SR}inputId"))? {
+            operation.check()?;
+            if graph.has_type(&id, &format!("{EV}SourceRevision")) && !self.bytes.contains_key(&id)
+            {
+                return Err(Failure::IncompleteInput);
+            }
+        }
+        Ok(())
+    }
+    /// Reuse C25's strict lexical JSON selector and digest owner. This verifies
+    /// retained values, not the truth of their claims or their real admission.
+    pub fn verify_reference(
+        &self,
+        graph: &Graph,
+        reference: &str,
+        operation: &Operation<'_>,
+    ) -> ReplayResult<()> {
+        operation.check()?;
+        if !graph.has_type(reference, &format!("{EV}EvidenceRef")) {
+            return Err(Failure::UnresolvedReference);
+        }
+        if graph.one_iri(reference, &format!("{EV}method"))?
+            != sparkles_core::evidence::JSON_LEXICAL_UTF8_V1
+            || graph.literal(reference, &format!("{EV}methodVersion"))? != "1"
+        {
+            return Err(Failure::UnsupportedProfile);
+        }
+        let revision = graph.one_iri(reference, &format!("{EV}sourceRevision"))?;
+        let source = self.bytes.get(&revision).ok_or(Failure::IncompleteInput)?;
+        let _workspace = operation.charge(
+            source
+                .len()
+                .checked_mul(4)
+                .and_then(|v| v.checked_add(8192))
+                .ok_or(Failure::ReplayLimit)?,
+        )?;
+        let source = std::str::from_utf8(source).map_err(|_| Failure::InvalidDomainRecord)?;
+        let pointer = graph.literal(reference, &format!("{EV}jsonPointer"))?;
+        let selected =
+            sparkles_core::evidence::select_json_lexical_utf8(source, &pointer, operation.control)
+                .map_err(|_| {
+                    if operation.check().is_err() {
+                        Failure::ReplayCancelled
+                    } else {
+                        Failure::InvalidDomainRecord
+                    }
+                })?;
+        if selected.digest.to_string() != graph.literal(reference, &format!("{EV}valueDigest"))? {
             return Err(Failure::SourceDigestMismatch);
         }
         operation.check()
