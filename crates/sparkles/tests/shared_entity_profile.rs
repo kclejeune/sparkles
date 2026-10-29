@@ -202,7 +202,9 @@ fn fixed_scalar_encoding_vectors_decode_and_conflict_example_is_exact() {
         let hex = vector["encodedUtf8Hex"].as_str().unwrap();
         let bytes: Vec<_> = hex
             .as_bytes()
-            .chunks_exact(2)
+            .as_chunks::<2>()
+            .0
+            .iter()
             .map(|pair| u8::from_str_radix(std::str::from_utf8(pair).unwrap(), 16).unwrap())
             .collect();
         let actual: String = serde_json::from_slice(&bytes).unwrap();
