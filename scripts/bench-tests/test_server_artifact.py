@@ -91,6 +91,78 @@ class OpenApiComparison(unittest.TestCase):
                 with self.assertRaisesRegex(ValueError, re.escape(pointer)):
                     self.check()
 
+class DebugSplitContracts(unittest.TestCase):
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory(prefix="sparkles-debug-split-")
+        self.addCleanup(self.temp.cleanup)
+        self.work = Path(self.temp.name)
+
+    @unittest.skipUnless(platform.system() == "Linux" and all(shutil.which(t) for t in ("rustc", "objcopy", "readelf")),
+                         "real ELF probe needs Linux, rustc and binutils")
+    def test_real_rust_elf_old_marker_failure_and_new_separation(self):
+        source = self.work / "main.rs"
+        source.write_text('fn main() { println!("debug section probe"); }\n')
+        original = self.work / "original"
+        subprocess.run(["rustc", "-C", "debuginfo=1", source, "-o", original], check=True, capture_output=True)
+        expected_debug = self.work / "expected.debug"
+        subprocess.run(["objcopy", "--only-keep-debug", original, expected_debug], check=True, capture_output=True)
+        old = self.work / "old"
+        shutil.copy2(original, old)
+        subprocess.run(["objcopy", "--strip-debug", old], check=True, capture_output=True)
+        subprocess.run(["objcopy", f"--add-gnu-debuglink={expected_debug}", old], check=True, capture_output=True)
+        old_headers = subprocess.run(["readelf", "--wide", "--section-headers", old], check=True, capture_output=True, text=True).stdout
+        self.assertIn(".debug_gdb_scripts", artifact.section_summary(old_headers))
+        self.assertRegex(old_headers, r"\]\s+\.debug_")
+        installed, debug, diagnostics = self.work / "sparkles", self.work / "sparkles.debug", self.work / "diagnostics"
+        shutil.copy2(original, installed)
+        before = subprocess.run(["readelf", "--wide", "--section-headers", installed], check=True, capture_output=True, text=True).stdout
+        with contextlib.redirect_stdout(io.StringIO()):
+            artifact.split_debug(installed, debug, diagnostics, before)
+        after = (diagnostics / "sections-after.txt").read_text()
+        sections = artifact.section_summary(after)
+        self.assertIn(".symtab", sections)
+        self.assertIn(".gnu_debuglink", sections)
+        self.assertFalse([name for name in sections if name.startswith(".debug_")])
+        self.assertEqual(debug.read_bytes(), expected_debug.read_bytes())
+        self.assertIn(".debug_line", artifact.section_summary((diagnostics / "debug-sections.txt").read_text()))
+        self.assertEqual(subprocess.run([installed], check=True, capture_output=True, text=True).stdout.strip(), "debug section probe")
+        artifact.check_debuglink((diagnostics / "debuglink").read_bytes(), debug)
+        self.assertEqual((diagnostics / "sections-before.txt").read_text(), before)
+
+    def test_tool_failure_retains_stderr_and_before_headers(self):
+        diag = self.work / "tool-error"
+        def fake_run(args, **kwargs):
+            raise subprocess.CalledProcessError(1, args, stderr=b"fixture objcopy failure")
+        output = io.StringIO()
+        with patch.object(artifact, "run", fake_run), contextlib.redirect_stdout(output):
+            with self.assertRaises(subprocess.CalledProcessError):
+                artifact.split_debug(self.work / "installed", self.work / "debug", diag, "before headers")
+        self.assertEqual((diag / "sections-before.txt").read_text(), "before headers")
+        self.assertEqual((diag / "tool-error.txt").read_text(), "fixture objcopy failure")
+        self.assertIn("objcopy --only-keep-debug failed", output.getvalue())
+        self.assertIn("fixture objcopy failure", output.getvalue())
+
+    def test_unparsed_debug_section_is_still_refused(self):
+        headers = "  [ 1] .symtab SYMTAB 0 0 0 00 0 0 1\n  [ 2] .debug_line malformed\n"
+        def fake_run(args, **kwargs):
+            return headers if str(args[0]) == "readelf" else b""
+        with patch.object(artifact, "run", fake_run), contextlib.redirect_stdout(io.StringIO()):
+            with self.assertRaisesRegex(ValueError, "unparsed readelf section"):
+                artifact.split_debug(self.work / "installed", self.work / "debug", self.work / "unparsed", "before")
+
+    def test_substantive_debug_sections_are_still_rejected_and_reported(self):
+        for name in (".debug_line", ".debug_info"):
+            with self.subTest(name=name):
+                diag = self.work / name[1:]
+                headers = f"  [ 1] .symtab SYMTAB 0 0 0 00 0 0 1\n  [ 2] {name} PROGBITS 0 0 0 00 A 0 0 1\n"
+                def fake_run(args, **kwargs):
+                    return headers if str(args[0]) == "readelf" else b""
+                with patch.object(artifact, "run", fake_run), contextlib.redirect_stdout(io.StringIO()):
+                    with self.assertRaisesRegex(ValueError, re.escape(name)):
+                        artifact.split_debug(self.work / "installed", self.work / "debug", diag, "before")
+                self.assertEqual((diag / "sections-after.txt").read_text(), headers)
+                self.assertEqual(artifact.section_summary(headers)[name], "A")
+
 class ArchiveContracts(unittest.TestCase):
     def setUp(self):
         self.uid = patch.object(smoke.os, "getuid", return_value=1500)

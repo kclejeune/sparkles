@@ -126,7 +126,7 @@ jobs:
           github-cache-mode: objects
           cache-generation: sparkles-server-manylinux228-release-v1
           save-on-workflow-dispatch: ${{ github.ref == 'refs/heads/main' }}
-      - name: Packaging regressions without compilation
+      - name: Packaging regressions and tiny ELF fixture
         run: python3 -m unittest discover -s scripts/bench-tests -p test_server_artifact.py
       - name: Build and assemble the default-feature candidate
         run: mise run server:artifact -- .artifacts/server-candidate

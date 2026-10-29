@@ -142,6 +142,57 @@ def check_debuglink(section, debug):
     require(zlib.crc32(Path(debug).read_bytes()) == expected, "GNU debug link CRC mismatch")
 
 
+def section_summary(headers):
+    """Return section names and flags from wide readelf headers."""
+    result = {}
+    for line in headers.splitlines():
+        match = re.match(r"^\s*\[\s*\d+\]\s+(.*)$", line)
+        if not match:
+            continue
+        fields = match.group(1).split()
+        if len(fields) < 9 or not fields[0].startswith("."):
+            continue
+        result[fields[0]] = fields[6] if len(fields) >= 10 else ""
+    return result
+
+
+def split_debug(installed, debug, diagnostics, before):
+    """Separate debug data, preserving raw section reports outside temporary staging."""
+    diagnostics = Path(diagnostics)
+    diagnostics.mkdir(parents=True, exist_ok=False)
+    (diagnostics / "sections-before.txt").write_text(before)
+    print("server-artifact: section headers before stripping:\n" + before, flush=True)
+
+    def tool(args, *, text=False):
+        try:
+            return run(args, text=text)
+        except (subprocess.CalledProcessError, subprocess.TimeoutExpired) as error:
+            stderr = error.stderr or b""
+            if isinstance(stderr, bytes):
+                stderr = stderr.decode("utf-8", errors="replace")
+            (diagnostics / "tool-error.txt").write_text(stderr)
+            print(f"server-artifact: {args[0]} {args[1]} failed; stderr:\n{stderr}", flush=True)
+            raise
+
+    tool(["objcopy", "--only-keep-debug", installed, debug])
+    tool(["objcopy", "--strip-debug", "--remove-section=.debug_gdb_scripts", installed])
+    tool(["objcopy", f"--add-gnu-debuglink={debug}", installed])
+    after = tool(["readelf", "--wide", "--section-headers", installed], text=True)
+    (diagnostics / "sections-after.txt").write_text(after)
+    print("server-artifact: section headers after stripping:\n" + after, flush=True)
+    sections = section_summary(after)
+    require(".symtab" in sections, "stripping removed the symbol table")
+    remaining = {name: flags for name, flags in sections.items() if name.startswith(".debug_")}
+    require(not re.search(r"\]\s+\.debug_", after),
+            f"stripping retained debug sections: {remaining or 'unparsed readelf section'}")
+    debug_headers = tool(["readelf", "--wide", "--section-headers", debug], text=True)
+    (diagnostics / "debug-sections.txt").write_text(debug_headers)
+    require(".debug_line" in section_summary(debug_headers), "debug companion lost line information")
+    link = diagnostics / "debuglink"
+    tool(["objcopy", f"--dump-section=.gnu_debuglink={link}", installed])
+    check_debuglink(link.read_bytes(), debug)
+
+
 def archive(tree, destination, epoch):
     with destination.open("wb") as stream, gzip.GzipFile(
         fileobj=stream, mode="wb", filename="", mtime=epoch
@@ -292,15 +343,9 @@ def pack(binary, source, destination, builder):
         debug_tree = work / (name + ".debug")
         debug_tree.mkdir()
         debug = debug_tree / "sparkles.debug"
-        run(["objcopy", "--only-keep-debug", installed, debug])
-        run(["objcopy", "--strip-debug", installed])
-        run(["objcopy", f"--add-gnu-debuglink={debug}", installed])
-        stripped = run(["readelf", "--wide", "--section-headers", installed], text=True)
-        require(re.search(r"\]\s+\.symtab\s", stripped), "stripping removed the symbol table")
-        require(not re.search(r"\]\s+\.debug_", stripped), "stripping retained debug information")
-        section = work / "debuglink"
-        run(["objcopy", f"--dump-section=.gnu_debuglink={section}", installed])
-        check_debuglink(section.read_bytes(), debug)
+        diagnostics = Path(tempfile.mkdtemp(prefix=f".{destination.name}.diagnostics-", dir=destination.parent))
+        # mkdtemp creates the directory, so use a fresh child for the persistent reports.
+        split_debug(installed, debug, diagnostics / "elf", sections)
         record["binary_sha256"] = sha256(installed)
         record["debug_sha256"] = sha256(debug)
         (doc / "build-record.json").write_text(json.dumps(record, indent=2, sort_keys=True) + "\n")
