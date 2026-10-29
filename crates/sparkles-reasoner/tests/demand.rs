@@ -817,3 +817,521 @@ fn negation_through_list_for_all_is_refused() {
         Ok(r) => panic!("answered {:?}", rows(&r)),
     }
 }
+
+fn derived_schema_profile() -> Profile {
+    Profile::Rules(format!(
+        "{PREFIXES}
+        [middle: (?x ex:seed ?y) -> (?x ex:middle ?y)]
+        [instance: (?x ex:middle ?y) -> (?x ex:derived ?y), (?x rdf:type ex:Generated)]
+        [class: (?x rdf:type ex:Generated) -> (ex:Generated rdf:type rdfs:Class)]
+        [property: (?x ex:derived ?y) -> (ex:derived rdf:type rdf:Property)]
+        [domain: (ex:derived rdf:type rdf:Property) -> (ex:derived rdfs:domain ex:Person)]
+        [person: (?x ex:derived ?y), (ex:derived rdfs:domain ex:Person) -> (?x rdf:type ex:Person)]
+        [stored_class: (?x ex:observed ?y) -> (ex:SeededClass rdf:type rdfs:Class)]
+        [stored_property: (?x ex:observed ?y) -> (ex:seededProperty rdf:type rdf:Property)]
+        [unrelated: (?x ex:unrelatedSeed ?y) -> (?x ex:unrelatedDerived ?y)]"
+    ))
+}
+const DERIVED_SCHEMA_DATA: &str = "ex:alice ex:seed ex:bob . ex:Existing a rdfs:Class .
+    ex:existingProperty a rdf:Property . ex:base ex:observed ex:input .";
+
+#[test]
+fn derived_schema_class_property_and_downstream_answers_match_fixed_oracle() {
+    let profile = derived_schema_profile();
+    let s = store(DERIVED_SCHEMA_DATA);
+    let reference = store(DERIVED_SCHEMA_DATA);
+    materialize(&reference, &profile, &ReasonOptions::default()).unwrap();
+    let qr = reasoner(&profile);
+    let cases = [
+        (
+            "SELECT ?c { ?c a rdfs:Class }",
+            vec![
+                "<http://ex.org/Existing>",
+                "<http://ex.org/Generated>",
+                "<http://ex.org/SeededClass>",
+            ],
+        ),
+        (
+            "SELECT ?p { ?p a rdf:Property }",
+            vec![
+                "<http://ex.org/derived>",
+                "<http://ex.org/existingProperty>",
+                "<http://ex.org/seededProperty>",
+            ],
+        ),
+        (
+            "SELECT ?x { ?x a ex:Person }",
+            vec!["<http://ex.org/alice>"],
+        ),
+    ];
+    for (q, expected) in cases {
+        let expected: Vec<String> = expected.into_iter().map(String::from).collect();
+        assert_eq!(
+            rows(&run(&reference, q, &materialized())),
+            expected,
+            "independent materialized oracle: {q}"
+        );
+        for no_cache in [false, true, false] {
+            let mut options = demand(&qr);
+            options.no_cache = no_cache;
+            assert_eq!(
+                rows(&run(&s, q, &options)),
+                expected,
+                "demand oracle, no_cache={no_cache}: {q}"
+            );
+        }
+    }
+}
+
+#[test]
+fn derived_schema_equality_reaches_domain_and_instance_answers() {
+    let profile = Profile::Rules(format!(
+        "{PREFIXES}
+        [middle: (?x ex:seed ?y) -> (?x ex:middle ?y)]
+        [edge: (?x ex:middle ?y) -> (?x ex:p ?y)]
+        [equality: (?x ex:middle ?y) -> (ex:p owl:sameAs ex:aliasProperty)]
+        [domain: (?p owl:sameAs ?q), (?q rdfs:domain ?c) -> (?p rdfs:domain ?c)]
+        [instance: (?p rdfs:domain ?c), (?x ?p ?y) -> (?x rdf:type ?c)]"
+    ));
+    let data = "ex:alice ex:seed ex:bob . ex:aliasProperty rdfs:domain ex:Person .";
+    let s = store(data);
+    let reference = store(data);
+    materialize(&reference, &profile, &ReasonOptions::default()).unwrap();
+    let qr = reasoner(&profile);
+    let cases = [
+        (
+            "SELECT ?s ?o { ?s owl:sameAs ?o }",
+            vec!["<http://ex.org/p> <http://ex.org/aliasProperty>"],
+        ),
+        (
+            "SELECT ?c { ex:p rdfs:domain ?c }",
+            vec!["<http://ex.org/Person>"],
+        ),
+        (
+            "SELECT ?x { ?x a ex:Person }",
+            vec!["<http://ex.org/alice>"],
+        ),
+    ];
+    for (q, expected) in cases {
+        let expected: Vec<String> = expected.into_iter().map(String::from).collect();
+        assert_eq!(rows(&run(&reference, q, &materialized())), expected);
+        for _ in 0..2 {
+            assert_eq!(rows(&run(&s, q, &demand(&qr))), expected, "{q}");
+        }
+    }
+}
+
+#[test]
+fn derived_schema_variable_predicate_producer_declares_its_property() {
+    let profile = Profile::Rules(format!("{PREFIXES}
+        [name: (?x ex:seed ?y) -> (?x ex:which ex:generatedProperty)]
+        [edge: (?x ex:which ?p), (?x ex:seed ?y) -> (?x ?p ?y)]
+        [declare: (?x ?p ?y), notEqual(?p, ex:seed), notEqual(?p, ex:which) -> (?p rdf:type rdf:Property)]"));
+    let s = store("ex:alice ex:seed ex:bob .");
+    let reference = store("ex:alice ex:seed ex:bob .");
+    materialize(&reference, &profile, &ReasonOptions::default()).unwrap();
+    let q = "SELECT ?p { ?p a rdf:Property FILTER(?p = ex:generatedProperty) }";
+    let expected = vec!["<http://ex.org/generatedProperty>"];
+    assert_eq!(rows(&run(&reference, q, &materialized())), expected);
+    let qr = reasoner(&profile);
+    assert_eq!(rows(&run(&s, q, &demand(&qr))), expected);
+}
+
+#[test]
+fn derived_schema_cache_respects_graph_visibility_and_snapshot_deletion() {
+    use sparkles_core::access::{GraphAccess, GraphRule, Graphs};
+    use std::sync::Arc;
+    let profile = derived_schema_profile();
+    let inputs = Inputs {
+        data_graphs: vec![
+            sparkles_reasoner::GraphRef::Default,
+            sparkles_reasoner::GraphRef::Named("http://ex.org/hidden".into()),
+        ],
+        ..Inputs::default()
+    };
+    let qr = QueryReasoner::new(profile.clone(), &Extras::default(), inputs).unwrap();
+    let s = store(DERIVED_SCHEMA_DATA);
+    s.load(&[Source::from_bytes(
+        format!("{PREFIXES} GRAPH <http://ex.org/hidden> {{ ex:mallory ex:seed ex:eve . }}")
+            .into_bytes(),
+        RdfFormat::TriG,
+        None,
+    )])
+    .unwrap();
+    let q = "SELECT ?x { ?x a ex:Person }";
+    assert_eq!(
+        rows(&run(&s, q, &demand(&qr))),
+        vec!["<http://ex.org/alice>", "<http://ex.org/mallory>"]
+    );
+    let mut visible = demand(&qr);
+    visible.graphs = Some(Arc::new(GraphAccess::graphs(
+        Graphs::Only(GraphRule::new(["default"], &[])),
+        Graphs::none(),
+    )));
+    for _ in 0..2 {
+        assert_eq!(rows(&run(&s, q, &visible)), vec!["<http://ex.org/alice>"]);
+    }
+    assert!(
+        rows(&run(
+            &s,
+            "SELECT ?x { ?x a ex:Person FILTER(?x = ex:mallory) }",
+            &visible
+        ))
+        .is_empty()
+    );
+    let pinned = s.snapshot();
+    sparkles_core::sparql::update::update(
+        &s,
+        "DELETE DATA { <http://ex.org/alice> <http://ex.org/seed> <http://ex.org/bob> }",
+        &QueryOptions::default(),
+    )
+    .unwrap();
+    assert!(rows(&run(&s, q, &visible)).is_empty());
+    assert_eq!(
+        rows(&query(pinned, q, &visible).unwrap()),
+        vec!["<http://ex.org/alice>"]
+    );
+}
+
+#[test]
+fn derived_schema_selective_query_avoids_unrelated_instance_closure() {
+    let mut data = String::from(DERIVED_SCHEMA_DATA);
+    for i in 0..1000 {
+        data.push_str(&format!("ex:u{i} ex:unrelatedSeed ex:v{i} .\n"));
+    }
+    let s = store(&data);
+    let qr = reasoner(&derived_schema_profile());
+    let result = run(&s, "SELECT ?x { ?x a ex:Person }", &demand(&qr));
+    assert_eq!(rows(&result), vec!["<http://ex.org/alice>"]);
+    assert!(
+        result.ctx.reasoning.as_ref().unwrap().report.derived < 100,
+        "unrelated instance closure was derived"
+    );
+    let mut cancelled = demand(&qr);
+    cancelled.cancel = Some(std::sync::Arc::new(std::sync::atomic::AtomicBool::new(
+        true,
+    )));
+    assert!(matches!(
+        query(s.snapshot(), "SELECT ?x { ?x a ex:Person }", &cancelled),
+        Err(sparkles_core::Error::Cancelled)
+    ));
+}
+
+// A capped schema analysis must retain implicit positive dependencies.
+#[test]
+fn derived_schema_list_for_all_remains_complete_when_abstract_fact_cap_falls_back() {
+    let profile = Profile::Rules(format!(
+        "{PREFIXES}
+        [middle: (?s ex:seed ?o) -> (?s ex:middle ?o)]
+        [edge: (?s ex:middle ?o) -> (?s ex:edge ?o)]
+        [schema: (ex:list ex:marker ex:yes), listForAll(ex:list, ex:origin, ex:edge)
+          -> (ex:Generated rdf:type rdfs:Class)]"
+    ));
+    let seed = "ex:origin ex:seed ex:item .
+        ex:list ex:marker ex:yes ; rdf:first ex:item ; rdf:rest rdf:nil .";
+    let query_text = "SELECT ?c { ?c a rdfs:Class }";
+    let expected = vec!["<http://ex.org/Generated>"];
+    for padding in [0, 4096] {
+        let mut data = seed.to_string();
+        for i in 0..padding {
+            // Predicates are always kept by the abstraction, so these force its
+            // FACTS cap regardless of concrete subject/object abstraction/order.
+            data.push_str(&format!("\nex:filler ex:pad{i} ex:value ."));
+        }
+        let input = store(&data);
+        let reference = store(&data);
+        materialize(&reference, &profile, &ReasonOptions::default()).unwrap();
+        assert_eq!(
+            rows(&run(&reference, query_text, &materialized())),
+            expected
+        );
+        let qr = reasoner(&profile);
+        for no_cache in [true, false, false] {
+            let mut options = demand(&qr);
+            options.no_cache = no_cache;
+            let result = run(&input, query_text, &options);
+            assert_eq!(
+                rows(&result),
+                expected,
+                "listForAll schema consequence, padding={padding}, no_cache={no_cache}"
+            );
+            assert!(
+                result.ctx.reasoning.as_ref().unwrap().report.derived < 100,
+                "the selective schema demand must not derive the unrelated padding"
+            );
+        }
+    }
+}
+
+fn materialization_implicit_delta(marker: &str, predicate: &str) {
+    let profile = Profile::Rules(format!(
+        "{PREFIXES}
+        [middle: (?s ex:seed ?o) -> (?s ex:middle ?o)]
+        [edge: (?s ex:middle ?o) -> (?s ex:edge ?o)]
+        [schema: {marker} listForAll(ex:list, ex:origin, {predicate})
+            -> (ex:Generated rdf:type rdfs:Class)]"
+    ));
+    let reference = store(
+        "ex:origin ex:seed ex:item .
+        ex:list ex:marker ex:edge ; rdf:first ex:item ; rdf:rest rdf:nil .",
+    );
+    materialize(&reference, &profile, &ReasonOptions::default()).unwrap();
+    assert_eq!(
+        rows(&run(
+            &reference,
+            "SELECT ?c { ?c a rdfs:Class }",
+            &materialized()
+        )),
+        vec!["<http://ex.org/Generated>"]
+    );
+}
+
+#[test]
+fn derived_schema_list_for_all_materialization_constant_delta() {
+    materialization_implicit_delta("(ex:list ex:marker ex:edge),", "ex:edge");
+}
+
+#[test]
+fn derived_schema_list_for_all_materialization_variable_delta() {
+    materialization_implicit_delta("(ex:list ex:marker ?p),", "?p");
+}
+
+#[test]
+fn derived_schema_list_for_all_materialization_without_explicit_atoms() {
+    materialization_implicit_delta("", "ex:edge");
+}
+
+// An implicit delta must not replay an entirely old generative instance.
+#[test]
+fn implicit_fact_replay_does_not_refire_a_satisfied_fresh_witness_instance() {
+    let profile = Profile::Rules(format!(
+        "{PREFIXES}
+        [one: (ex:list ex:marker ?p),
+              listForAll(ex:list, ex:origin, ?p), makeTemp(?b)
+              -> (?b ex:tag ex:value)]"
+    ));
+    let reference = store(
+        "ex:list ex:marker ex:edge ;
+        rdf:first ex:item ; rdf:rest rdf:nil .
+        ex:origin ex:edge ex:item .",
+    );
+    let options = ReasonOptions {
+        max_iterations: 8,
+        max_inferred: 16,
+        ..ReasonOptions::default()
+    };
+    // There is exactly one successful input binding (?p=ex:edge). All list and
+    // edge data already exist before the initial naive round. No new marker,
+    // edge or list fact is produced by this program.
+    materialize(&reference, &profile, &options)
+        .expect("one successful body instance must reach its finite fixpoint");
+    let result = run(
+        &reference,
+        "SELECT ?b { ?b ex:tag ex:value }",
+        &materialized(),
+    );
+    assert_eq!(rows(&result).len(), 1);
+}
+
+#[test]
+fn implicit_fact_replay_ignores_unrelated_members_of_a_constant_predicate() {
+    let profile = Profile::Rules(format!(
+        "{PREFIXES}
+        [middle: (ex:start ex:seed ex:yes) -> (ex:start ex:middle ex:yes)]
+        [irrelevant: (ex:start ex:middle ex:yes) -> (ex:other ex:edge ex:otherItem)]
+        [one: (ex:list ex:marker ex:yes), listForAll(ex:list, ex:origin, ex:edge), makeTemp(?b)
+            -> (?b ex:tag ex:value)]"
+    ));
+    let reference = store(
+        "ex:list ex:marker ex:yes ; rdf:first ex:item ; rdf:rest rdf:nil .
+        ex:origin ex:edge ex:item . ex:start ex:seed ex:yes .",
+    );
+    let options = ReasonOptions {
+        max_iterations: 8,
+        max_inferred: 16,
+        ..ReasonOptions::default()
+    };
+    materialize(&reference, &profile, &options).unwrap();
+    assert_eq!(
+        rows(&run(
+            &reference,
+            "SELECT ?b { ?b ex:tag ex:value }",
+            &materialized()
+        ))
+        .len(),
+        1
+    );
+}
+
+#[test]
+fn implicit_fact_replay_preserves_new_explicit_bindings_before_a_split() {
+    let profile = Profile::Rules(format!(
+        "{PREFIXES}
+        [middle: (ex:start ex:seed ex:yes) -> (ex:start ex:middle ex:yes)]
+        [new: (ex:start ex:middle ex:yes) -> (ex:new ex:marker ex:edge)]
+        [one: (?config ex:marker ?p), (?x ex:allow ex:yes),
+            listForAll(ex:list, ex:origin, ?p) -> (?config ex:tag ?x)]"
+    ));
+    let mut data = String::from(
+        "ex:old ex:marker ex:edge .
+        ex:list rdf:first ex:item ; rdf:rest rdf:nil .
+        ex:origin ex:edge ex:item . ex:start ex:seed ex:yes .",
+    );
+    for i in 0..10 {
+        data.push_str(&format!("ex:allowed{i} ex:allow ex:yes .\n"));
+    }
+    let reference = store(&data);
+    let options = ReasonOptions {
+        max_iterations: 8,
+        max_inferred: 128,
+        ..ReasonOptions::default()
+    };
+    materialize(&reference, &profile, &options).unwrap();
+    // Two marker bindings and ten allow bindings admit exactly twenty facts.
+    assert_eq!(
+        rows(&run(
+            &reference,
+            "SELECT ?s ?o { ?s ex:tag ?o }",
+            &materialized()
+        ))
+        .len(),
+        20
+    );
+}
+
+fn fresh_schema_witness_count(mixed: bool) {
+    let producer = if mixed {
+        "[derived: (?s ex:spawn ?o) -> (?s ex:p ?o)]"
+    } else {
+        ""
+    };
+    let profile = Profile::Rules(format!(
+        "{PREFIXES}
+        {producer}
+        [schema: (?s ex:p ?o), makeTemp(?c) -> (?c rdf:type rdfs:Class)]"
+    ));
+    let data = if mixed {
+        "ex:a ex:p ex:b . ex:c ex:spawn ex:d ."
+    } else {
+        "ex:a ex:p ex:b ."
+    };
+    let expected_count = if mixed { 2 } else { 1 };
+    let input = store(data);
+    let reference = store(data);
+    materialize(&reference, &profile, &ReasonOptions::default()).unwrap();
+    let text = "SELECT ?c { ?c a rdfs:Class }";
+    assert_eq!(
+        rows(&run(&reference, text, &materialized())).len(),
+        expected_count,
+        "fixed count of stored and separately derived rule inputs"
+    );
+    let qr = reasoner(&profile);
+    for no_cache in [true, false, false] {
+        let mut options = demand(&qr);
+        options.no_cache = no_cache;
+        assert_eq!(
+            rows(&run(&input, text, &options)).len(),
+            expected_count,
+            "fresh schema count, mixed={mixed}, no_cache={no_cache}"
+        );
+    }
+}
+
+#[test]
+fn fresh_schema_stored_inputs_have_one_witness() {
+    fresh_schema_witness_count(false);
+}
+
+#[test]
+fn fresh_schema_mixed_inputs_have_one_witness_each() {
+    fresh_schema_witness_count(true);
+}
+
+#[test]
+fn fresh_schema_multihead_and_downstream_relations_share_witnesses() {
+    let profile = Profile::Rules(format!(
+        "{PREFIXES}
+        [derived: (?s ex:spawn ?o) -> (?s ex:p ?o)]
+        [schema: (?s ex:p ?o), makeTemp(?c)
+            -> (?s ex:made ?c), (?c rdf:type rdfs:Class)]
+        [downstream: (?c rdf:type rdfs:Class) -> (?c rdfs:subClassOf ex:Root)]"
+    ));
+    let data = "ex:a ex:p ex:b . ex:c ex:spawn ex:d .";
+    let input = store(data);
+    let reference = store(data);
+    materialize(&reference, &profile, &ReasonOptions::default()).unwrap();
+    let joins = "SELECT ?s { ?s ex:made ?c . ?c a rdfs:Class }";
+    let downstream = "SELECT ?c { ?c rdfs:subClassOf ex:Root . ?c a rdfs:Class }";
+    let expected = vec!["<http://ex.org/a>", "<http://ex.org/c>"];
+    assert_eq!(rows(&run(&reference, joins, &materialized())), expected);
+    assert_eq!(rows(&run(&reference, downstream, &materialized())).len(), 2);
+    let qr = reasoner(&profile);
+    for no_cache in [true, false, false] {
+        let mut options = demand(&qr);
+        options.no_cache = no_cache;
+        assert_eq!(rows(&run(&input, joins, &options)), expected);
+        assert_eq!(rows(&run(&input, downstream, &options)).len(), 2);
+    }
+}
+
+#[test]
+fn fresh_schema_keeps_complete_negative_lower_stages() {
+    let profile = Profile::Rules(format!(
+        "{PREFIXES}
+        [flag: (ex:a ex:p ex:b), makeTemp(?c)
+            -> (ex:a ex:flag ex:yes), (?c rdf:type rdfs:Class)]
+        [upper: (ex:a ex:p ex:b), noValue(ex:a, ex:flag, ex:yes)
+            -> (ex:a rdf:type ex:Upper)]"
+    ));
+    let input = store("ex:a ex:p ex:b .");
+    let qr = reasoner(&profile);
+    for no_cache in [true, false, false] {
+        let mut options = demand(&qr);
+        options.no_cache = no_cache;
+        assert!(run(&input, "ASK { ex:a ex:flag ex:yes }", &options).boolean);
+        // The lower flag is entailed, so the negative premise cannot hold.
+        assert!(!run(&input, "ASK { ex:a a ex:Upper }", &options).boolean);
+    }
+}
+
+#[test]
+fn fresh_schema_stable_skolem_terms_are_not_duplicated() {
+    let profile = Profile::Rules(format!(
+        "{PREFIXES}
+        [schema: (?s ex:p ?o), makeSkolem(?c, ?s, ?o) -> (?c rdf:type rdfs:Class)]"
+    ));
+    let input = store("ex:a ex:p ex:b .");
+    let reference = store("ex:a ex:p ex:b .");
+    materialize(&reference, &profile, &ReasonOptions::default()).unwrap();
+    let text = "SELECT ?c { ?c a rdfs:Class }";
+    assert_eq!(rows(&run(&reference, text, &materialized())).len(), 1);
+    let qr = reasoner(&profile);
+    for no_cache in [true, false, false] {
+        let mut options = demand(&qr);
+        options.no_cache = no_cache;
+        assert_eq!(rows(&run(&input, text, &options)).len(), 1);
+    }
+}
+
+#[test]
+fn fresh_schema_unreached_generators_keep_result_tables() {
+    let profile = Profile::Rules(format!(
+        "{PREFIXES}
+        [stable: (?s ex:p ?o) -> (?s rdf:type ex:Stable)]
+        [unreached: (?s ex:absent ?o), makeTemp(?c) -> (?c rdf:type rdfs:Class)]"
+    ));
+    let input = store("ex:a ex:p ex:b .");
+    let qr = reasoner(&profile);
+    let text = "SELECT ?s { ?s a ex:Stable }";
+    let first = run(&input, text, &demand(&qr));
+    assert_eq!(rows(&first), vec!["<http://ex.org/a>"]);
+    assert_eq!(first.ctx.reasoning.as_ref().unwrap().report.cached, 0);
+    let second = run(&input, text, &demand(&qr));
+    assert_eq!(rows(&second), rows(&first));
+    assert_eq!(second.ctx.reasoning.as_ref().unwrap().report.cached, 1);
+    let mut options = demand(&qr);
+    options.no_cache = true;
+    let uncached = run(&input, text, &options);
+    assert_eq!(rows(&uncached), rows(&first));
+    assert_eq!(uncached.ctx.reasoning.as_ref().unwrap().report.cached, 0);
+}

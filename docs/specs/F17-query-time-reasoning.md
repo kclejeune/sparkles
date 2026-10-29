@@ -651,11 +651,12 @@ capabilities and remaining work are described by the spec status and Outcome.
 2. A derivation has no iteration limit. §8 asks for materialization's 10,000, but A1's
    chain of 100,000 takes one iteration per node, so the fact limit, the deadline and the
    memory budget bound a run instead.
-3. The schema pass reads instance facts as stored. A query whose demands can read schema
-   facts, those with a variable predicate, a variable class, a schema predicate or a class
-   of properties and classes, uses the program over the unspecialized rules, since
-   `rdf1` and `rdf:type rdfs:range rdfs:Class` give schema facts from instance facts.
-   Schema facts go to a query only when one of its demands can read them.
+3. The preliminary schema pass reads instance facts as stored. Its valid facts are
+   reusable seeds, while a separate completeness proof decides which schema relations
+   can be specialized or treated as closed. Ordinary demand follows derived instance
+   premises for schema-producing heads. Schema facts go to a query when its demands
+   can read them. Programs containing `makeTemp` use one ordinary demand program with
+   their complete normal lower stages, preserving fresh witnesses across the query.
 4. `nocache=true` bypasses the tables of the query's demands but not the schema's table,
    which every query of the view shares like the compiled rules.
 5. The rules in a `Derive` node are the static dependency cone of its pattern over the
@@ -674,7 +675,8 @@ capabilities and remaining work are described by the spec status and Outcome.
 9. DESCRIBE is refused rather than answered from the asserted facts, so a description is
    never silently incomplete.
 
-**Measurements.** Development measurements on an nsc instance (16 vCPUs of an AMD EPYC
+**Measurements.** These measurements precede the schema-completeness changes and do
+not establish current-head performance. Development measurements on an nsc instance (16 vCPUs of an AMD EPYC
 host, 32 GiB) on 2026-10-24 at `d80c0ce7`, with the server alone on it. Each query ran
 once to warm up and then five rounds of the three modes interleaved, and the tables give
 the median with the range. "Materialized" reads a store materialized with the profile.
@@ -791,12 +793,11 @@ classes of `rdf:type`, which it now keeps apart (`negation_check_keeps_classes_a
 and a fifth that it left out the facts a `listForAll` tests
 (`negation_through_list_for_all_is_refused`).
 
-**Limitations.** Schema facts that follow only from derived instance facts can be missing
-from a query that reads them, as decision 3 describes, and `owl:sameAs` that rules derive
-between schema terms does not reach the schema (item 191). Equality is not kept as
-canonical representatives, so an entity with many aliases still costs a fact per alias and
-property in the equality stage. `MAX_SEEDS` and the specialization caps are not tuned by
-measurement. DESCRIBE is refused under `reasoning=demand` (item 193).
+**Limitations.** Equality is not kept as canonical representatives, so an entity with
+many aliases still costs a fact per alias and property in the equality stage.
+`MAX_SEEDS` and the specialization caps are not tuned by measurement. Schema analysis
+and program setup remain per-query costs under item 190. DESCRIBE is refused under
+`reasoning=demand` under item 193.
 
 
 ### Explanation sessions, 2026-10-24
@@ -806,3 +807,36 @@ single triple and exposes their facts to the well-founded derivation search. The
 sessions keep the original linear-recursive rules and bypass result tables so the
 search can see every intermediate premise. Why-not overlays also bypass the schema table,
 because application rules can derive schema facts from a hypothesis.
+
+
+### Instance-derived schema facts
+
+Demand derives class and property declarations, schema relations and schema-term
+`owl:sameAs` consequences that depend on derived instance facts. Valid cached schema
+seeds remain separate from proven-complete relations. A conservative program analysis
+and a finite abstract model determine which schema joins can be specialized. Unproven
+relations remain in the ordinary demand program, which follows their derived premises.
+The abstract model admits its workspace before allocating and falls back to the
+conservative proof at its fact or binding cap. Input failures, cancellation, deadlines
+and memory exhaustion fail the derivation.
+
+An uncovered `listForAll` reads positive facts outside its explicit rule atoms. New
+facts for those reads reconsider the rule, and a replay emits heads only when that
+particular match used a new explicit fact or an actual bound list-member fact. This
+prevents an old satisfied match from regenerating fresh witnesses. Programs containing
+per-evaluation `makeTemp` generators use one ordinary demand derivation, with normal
+list, equality and negative lower stages. Their result-table policy remains unchanged.
+Stable `makeSkolem` terms retain their existing identity within a session.
+
+The completeness model can stream visible inputs twice per query, even with warm
+schema tables, and reserves a conservative workspace. `makeTemp` programs forgo staged
+schema specialization and reuse. A replay may allocate a temporary generator term before
+an old head is refused. Item 190 retains these setup and memory costs for measurement
+and optimization. This correctness change supplies no current-head performance claim.
+
+The acceptance checks cover fixed schema answers, snapshot and graph visibility,
+cold and warm tables, `no_cache`, schema-term equality, analysis-cap fallback,
+negative lower stages, coherent multihead relations and fresh-witness counts. The
+explanation sample now requires every sampled materialized fact to have a demand
+answer and retains its proof soundness and replay checks. The strengthened checks
+include schema facts rather than allowing missing answers for W3C terms.

@@ -424,22 +424,16 @@ fn every_inferred_triple_has_a_sound_demand_tree() {
             let step = (all.len() / 40).max(1);
             let qr = reasoner(&p);
             for t in all.iter().step_by(step) {
-                // F17's query-time reasoning misses some schema facts of the built-in
-                // vocabulary (ROADMAP item 191); the trees cover what it derives
                 let ask = format!("ASK {{ {} {} {} }}", t[0], t[1], t[2]);
                 let o = sparkles_core::sparql::QueryOptions {
                     reasoning: Some(qr.provider()),
                     ..Default::default()
                 };
                 let r = sparkles_core::sparql::query(s.snapshot(), &ask, &o).unwrap();
-                if !r.boolean {
-                    assert!(
-                        t.iter()
-                            .any(|x| x.to_string().contains("http://www.w3.org/")),
-                        "{p}: demand misses {t:?}"
-                    );
-                    continue;
-                }
+                assert!(
+                    r.boolean,
+                    "{p} seed {seed}: demand misses materialized {t:?}\n{ttl}"
+                );
                 let e = demand(&s, &p, t.clone(), &ExplainOptions::default());
                 let Explained::Found { trees: ts, .. } = e else {
                     panic!("{p} seed {seed}: {t:?} has no demand tree: {e:?}\n{ttl}");

@@ -192,12 +192,6 @@ fn rest(r: &CRule, atoms: &[usize], builtins: &[usize], vals: &[Option<u64>]) ->
 /// [`specialize`].
 pub(crate) struct Specialized {
     pub rules: Vec<CRule>,
-    /// whether a rule left out gives schema facts from instance facts, such as `rdf1`
-    /// (every predicate used is an `rdf:Property`) or `prp-rng` over
-    /// `rdf:type rdfs:range rdfs:Class` (every class with an instance is a class). The
-    /// schema pass reads instance facts as they are, without those rules derive, so a
-    /// demand that reads the schema needs the program over the rules as they are.
-    pub reads_instances: bool,
 }
 
 /// The rules of a demand program over the schema that `g` holds in full: each rule
@@ -216,19 +210,16 @@ pub(crate) fn specialize(
     let abort = AtomicBool::new(false);
     let mut out: Vec<CRule> = Vec::new();
     let mut made = 0usize;
-    let mut reads_instances = false;
     let left_out = |r: &CRule| {
         r.head
             .iter()
             .all(|h| matches!(h, CHead::Triple(..)) && closed.closes(&head_atom(h)))
     };
-    let reads = |r: &CRule| r.atoms.iter().any(|a| !closed.closes(a));
     for r in rules {
         if cancel.load(Ordering::Relaxed) {
             break;
         }
         if left_out(r) {
-            reads_instances |= reads(r);
             continue;
         }
         let Some((atoms, builtins, bound)) = prefix(r, closed, lists) else {
@@ -281,7 +272,6 @@ pub(crate) fn specialize(
             let vals: Vec<Option<u64>> = (0..r.nvars).map(|v| bound[v].then_some(c[v])).collect();
             let s = expand_lists(rest(r, &atoms, &builtins, &vals), g, terms);
             if left_out(&s) {
-                reads_instances |= reads(&s);
                 continue;
             }
             // the same rule from another binding, its atoms in another order
@@ -302,10 +292,7 @@ pub(crate) fn specialize(
             }
         }
     }
-    Ok(Specialized {
-        rules: out,
-        reads_instances,
-    })
+    Ok(Specialized { rules: out })
 }
 
 /// `r` with each `listForAll(L, ?y, P)` whose list and predicate are constants replaced by

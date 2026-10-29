@@ -656,6 +656,10 @@ pub(crate) struct Eval<'a> {
     pub max_out: usize,
     ticks: u32,
     pub mode: Mode<'a>,
+    /// Only full implicit-read replays need actual-instance delta admission.
+    delta_since: Option<u32>,
+    /// The current explicit atom path consumed a fact from that delta.
+    matched_delta: bool,
     /// facts matched by the atoms of the current partial instance ([`Mode::Instances`])
     trail: smallvec::SmallVec<[Triple; 4]>,
     /// facts read by builtins of the current partial instance ([`Mode::Instances`])
@@ -746,6 +750,8 @@ impl<'a> Eval<'a> {
             max_out,
             ticks: 0,
             mode,
+            delta_since: None,
+            matched_delta: false,
             trail: smallvec::SmallVec::new(),
             implicit: smallvec::SmallVec::new(),
             stop: false,
@@ -1156,6 +1162,8 @@ impl<'a> Eval<'a> {
             && unify(a.p, t[1], b, &mut newly, &mut n)
             && unify(a.o, t[2], b, &mut newly, &mut n);
         if ok {
+            let previous_delta = self.matched_delta;
+            self.matched_delta |= self.delta_fact(&t);
             if self.collecting() {
                 self.trail.push(t);
                 self.run(k + 1, b, None);
@@ -1163,6 +1171,7 @@ impl<'a> Eval<'a> {
             } else {
                 self.run(k + 1, b, None);
             }
+            self.matched_delta = previous_delta;
         }
         for &v in &newly[..n] {
             b[v] = 0;
@@ -1189,6 +1198,39 @@ impl<'a> Eval<'a> {
         }
     }
 
+    /// An actual matched fact belongs to the current replay's delta. The base
+    /// tier is wholly old unless the range includes it, matching Graph's ranges.
+    fn delta_fact(&self, t: &Triple) -> bool {
+        self.delta_since.is_some_and(|since| {
+            self.g
+                .position(t)
+                .map_or_else(|| self.g.reads_base(since, self.end), |row| row >= since)
+        })
+    }
+
+    fn replay_consumed_delta(&mut self, bindings: &[u64]) -> bool {
+        if self.matched_delta {
+            return true;
+        }
+        let rule = self.rule;
+        for (builtin, read) in implicit_fact_builtins(rule) {
+            let head = self.val(builtin.args[0], bindings);
+            let subject = self.val(read.s, bindings);
+            let predicate = self.val(read.p, bindings);
+            if let Some(members) = self.list(head) {
+                for &member in members.iter() {
+                    if self.aborted() {
+                        return false;
+                    }
+                    if self.delta_fact(&[subject, predicate, member]) {
+                        return true;
+                    }
+                }
+            }
+        }
+        false
+    }
+
     fn emit(&mut self, b: &[u64]) {
         let rule = self.rule;
         if let Mode::Instances { head, target, .. } = &self.mode {
@@ -1209,6 +1251,15 @@ impl<'a> Eval<'a> {
                     }
                 }
             }
+            return;
+        }
+        // Full replay finds candidate bindings, not permission to fire old
+        // instances again. In particular their fresh witnesses are not duplicate
+        // concrete triples and cannot be filtered by the graph's set index.
+        if matches!(self.mode, Mode::New)
+            && self.delta_since.is_some()
+            && !self.replay_consumed_delta(b)
+        {
             return;
         }
         let existing = matches!(self.mode, Mode::Existing);
@@ -1580,6 +1631,19 @@ pub(crate) fn run(
                 }
                 continue;
             }
+            // An uncovered listForAll also reads positive facts outside the
+            // atoms. A relevant implicit delta must reconsider the whole body;
+            // one full plan covers its ordinary atom deltas as well.
+            let implicit_delta = implicit_fact_delta(g, r, ds, de);
+            if implicit_delta {
+                let ranges = vec![(0, de); r.atoms.len()];
+                if !empty(r, &ranges, g)
+                    && let Some(p) = plan(r, &ranges, Some(g))
+                {
+                    tasks.push((ri, p));
+                }
+                continue;
+            }
             // semi-naive: atom d reads the delta, atoms before it the old rows, atoms
             // after it everything
             for d in 0..r.atoms.len() {
@@ -1629,7 +1693,11 @@ pub(crate) fn run(
             // a first step with few candidates followed by a large join runs on one
             // thread: then the bindings up to the next atom are worked out first, and the
             // work is split on that atom's candidates
-            let deeper = (first.len() < split_min)
+            let implicit_replay =
+                !(iteration == 0 && start.is_none()) && implicit_fact_delta(gr, r, ds, de);
+            // Prefix bindings do not retain their consumed-delta bit. Replays
+            // still shard first-atom candidates but traverse each binding whole.
+            let deeper = (!implicit_replay && first.len() < split_min)
                 .then(|| {
                     p.iter()
                         .skip(1)
@@ -1698,6 +1766,11 @@ pub(crate) fn run(
                     Mode::New,
                     &limits.budget,
                 );
+                // Facts are immutable until the merge, so this is the same
+                // replay classification used for planning and work splitting.
+                if !(iteration == 0 && start.is_none()) && implicit_fact_delta(gr, r, ds, de) {
+                    ev.delta_since = Some(ds);
+                }
                 if item.b.is_empty() {
                     ev.run(item.k, &mut vec![0u64; r.nvars], item.first);
                 }
@@ -1884,6 +1957,38 @@ pub(crate) fn incremental_blocker(r: &CRule, terms: &Terms) -> Option<String> {
         }
     }
     None
+}
+
+/// Positive facts a builtin reads outside the rule's explicit atoms.
+pub(crate) fn builtin_fact_read(kind: crate::builtins::BuiltinKind, args: &[Slot]) -> Option<Atom> {
+    (kind == crate::builtins::BuiltinKind::ListForAll).then(|| Atom {
+        s: args[1],
+        p: args[2],
+        o: Slot::Any,
+    })
+}
+
+/// Covered listForAll facts already have an explicit atom delta. Other positive
+/// fact reads need their own scheduling and completeness dependencies.
+fn implicit_fact_builtins(r: &CRule) -> impl Iterator<Item = (&CBuiltin, Atom)> + '_ {
+    r.builtins.iter().filter_map(|b| {
+        if list_for_all_covered(r, b) {
+            None
+        } else {
+            builtin_fact_read(b.kind, &b.args).map(|read| (b, read))
+        }
+    })
+}
+
+pub(crate) fn implicit_fact_reads(r: &CRule) -> impl Iterator<Item = Atom> + '_ {
+    implicit_fact_builtins(r).map(|(_, read)| read)
+}
+
+fn implicit_fact_delta(g: &Graph, r: &CRule, start: u32, end: u32) -> bool {
+    implicit_fact_reads(r).any(|a| match a.p {
+        Slot::Const(p) => g.count_p(p, start, end) > 0,
+        _ => end > start,
+    })
 }
 
 /// `listForAll(?l, ?y, P)` is covered when the rule also has `listMember(?l, ?m)` and

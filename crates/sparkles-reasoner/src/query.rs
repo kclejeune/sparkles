@@ -531,7 +531,16 @@ impl Session {
         let roots = demand::schema_roots(&vocab, rdf_type);
         self.make_graph()?;
         let t0 = std::time::Instant::now();
-        if roots.is_empty() {
+        // A preliminary pass would allocate a second fresh witness for stored
+        // bindings when ordinary demand later reaches the same rule. Keep these
+        // non-idempotent programs in one demand derivation, with their complete
+        // ordinary lower stages and existing result-table policy.
+        let fresh_witnesses = self.rules.iter().any(|r| {
+            r.builtins
+                .iter()
+                .any(|b| b.kind == crate::builtins::BuiltinKind::MakeTemp)
+        });
+        if roots.is_empty() || fresh_witnesses {
             let program = self.transform(&self.rules, &self.keys, Pass::Plain)?;
             self.hide(&program.magic_preds);
             self.program = Some(program);
@@ -589,7 +598,40 @@ impl Session {
                 self.lower_rows = Some((schema_from, lower_end));
             }
         }
-        let closed = crate::specialize::closed(&vocab, rdf_type);
+        // Cached schema rows are valid seeds even when a relation is not yet
+        // complete. Keep that vocabulary for exposure independently of closure.
+        self.closed = Some(crate::specialize::closed(&vocab, rdf_type));
+        let same_as = self.id_of(&iri("http://www.w3.org/2002/07/owl#sameAs"));
+        let flag = AtomicBool::new(false);
+        let (complete, stopped) = watched(&self.stop, &flag, || {
+            demand::complete_schema(&self.rules, &vocab, rdf_type, same_as, &self.budget, &flag)
+        });
+        if let Some(error) = stopped {
+            return Err(error);
+        }
+        let mut complete = complete
+            .map_err(|e| memory_error(e, "schema completeness"))?
+            .expect("an unstopped completeness analysis returns its result");
+        let flag = AtomicBool::new(false);
+        let (refined, stopped) = watched(&self.stop, &flag, || {
+            demand::refine_schema(
+                &self.rules,
+                &vocab,
+                &self.terms,
+                self.graph.as_ref().expect("graph made"),
+                &mut complete.closed,
+                &self.budget,
+                &flag,
+            )
+        });
+        if let Some(error) = stopped {
+            return Err(error);
+        }
+        refined.map_err(|e| match e.downcast::<MemoryExceeded>() {
+            Ok(e) => memory_error(e, "schema completeness"),
+            Err(e) => component("reasoning-failed", format!("{e:#}")),
+        })?;
+        let closed = &complete.closed;
         // RDF lists are read as stored unless a rule gives their facts
         let lists: Vec<u64> = ["first", "rest"]
             .into_iter()
@@ -613,7 +655,7 @@ impl Session {
         let (rules, stopped) = watched(&self.stop, &flag, || {
             crate::specialize::specialize(
                 &self.rules,
-                &closed,
+                closed,
                 &lists,
                 g,
                 &self.terms,
@@ -625,18 +667,6 @@ impl Session {
             return Err(e);
         }
         let rules = rules.map_err(|e| memory_error(e, "the rules specialized to the schema"))?;
-        self.closed = Some(closed);
-        if rules.reads_instances && (0..self.keys.len()).any(|d| self.reads_schema(d)) {
-            // the schema the pass derived may lack facts that follow from derived
-            // instance facts, which this query reads
-            let program = self.transform(&self.rules, &self.keys, Pass::Plain)?;
-            self.hide(&program.magic_preds);
-            self.program = Some(program);
-            self.lower_done = false;
-            return Ok(());
-        }
-        let closed = self.closed.as_ref().expect("set above");
-        let same_as = self.id_of(&iri("http://www.w3.org/2002/07/owl#sameAs"));
         let g = self.graph.as_ref().expect("graph made");
         let rules = crate::specialize::without_equality(rules.rules, same_as, g);
         let t2 = std::time::Instant::now();

@@ -38,11 +38,13 @@ request or on every write, and the schema report counts what the data holds.
 * Query-time reasoning with `reasoning=demand` derives the facts a query's patterns need
   as it runs, from RDFS, RDFS simple, OWL 2 RL or a Jena rule file, without the inferred
   graph ([API.md](../API.md#query-time-reasoning), [F17](../specs/F17-query-time-reasoning.md#outcome)).
-  Jena backward rules answer this way. A demand (magic sets) transformation starts from
-  the query's constants and bindings over rules specialized to the schema, so LUBM query 1
-  under OWL 2 RL derives no facts beyond the schema. Derived tables are cached per
-  snapshot and view, and `maxDerived`, the deadline and the memory budget bound them.
-  EXPLAIN shows a `Derive` node per pattern.
+  Jena backward rules answer this way. A demand transformation starts from the query's
+  constants and bindings and specializes schema relations proven complete. Schema facts
+  can follow from derived instance facts, including class and property declarations and
+  equality between schema terms. Programs containing `makeTemp` run in one ordinary
+  demand program with their normal lower stages. Derived tables are cached per snapshot
+  and view, and `maxDerived`, the deadline and the memory budget bound them. Tables that
+  contain generated blank nodes are not cached. EXPLAIN shows a `Derive` node per pattern.
 * `POST /$/reason/{ds}/explain` returns derivation trees from materialized inferences,
   RDFS on read or the demand engine ([API.md](../API.md#explanations),
   [F18](../specs/F18-explanations-and-entailment-diffs.md#outcome)). A tree has well-founded
@@ -186,12 +188,16 @@ dependencies are recorded in the [central roadmap](../ROADMAP.md).
   Derivation on demand has no cost-based choice against a materialization, no OWL 2 QL
   rewriting, no reuse of tables across commits and no dataset setting, and Jena's hybrid
   rules are flattened. Roadmap item 19.
-* With cached tables, the selective LUBM queries take 1.4 to 2.5 times as long on demand
-  as over a materialization under RDFS and 2.5 to 17 times under OWL 2 RL, and queries
-  that read millions of facts take tens to over a hundred times as long. Roadmap item 190.
-* A query on demand that reads schema facts uses the rules unspecialized, and schema facts
-  that follow only from derived instance facts may be missing from its answers, item 191.
-  The derived-table cache's budget accounting is item 192. DESCRIBE is refused under
+* Demand reasoning has per-query schema analysis and program setup costs. Schema
+  completeness analysis can stream the visible inputs twice, including when schema
+  tables are warm, and reserves a conservative workspace against the memory budget.
+  Analysis caps keep memory bounded and leave unproven relations for ordinary demand.
+  Programs containing `makeTemp` forgo schema specialization and reuse. Implicit fact
+  replay can allocate a temporary generator term before refusing an old output.
+  Roadmap item 190 covers these costs and measurement. The
+  [recorded demand measurements](../specs/F17-query-time-reasoning.md#outcome) identify
+  their source revision and do not establish current-head performance.
+* The derived-table cache's budget accounting is item 192. DESCRIBE is refused under
   derivation on demand, item 193.
 * Provenance-based inferred visibility remains roadmap item 18. Query result cells do
   not offer a Why? action,
@@ -236,7 +242,7 @@ or library workflows. Exact HTTP contracts remain in the API reference.
 
 ## Roadmap
 
-The remaining work described above refers to [item 9](../ROADMAP.md), [item 18](../ROADMAP.md), [item 19](../ROADMAP.md), [item 48](../ROADMAP.md), [item 53](../ROADMAP.md), [item 54](../ROADMAP.md), [item 75](../ROADMAP.md), [item 78](../ROADMAP.md), [item 83](../ROADMAP.md), [item 113](../ROADMAP.md), [item 190](../ROADMAP.md), [item 191](../ROADMAP.md), [item 192](../ROADMAP.md), [item 193](../ROADMAP.md), [item 285](../ROADMAP.md), [item 286](../ROADMAP.md).
+The remaining work described above refers to [item 9](../ROADMAP.md), [item 18](../ROADMAP.md), [item 19](../ROADMAP.md), [item 48](../ROADMAP.md), [item 53](../ROADMAP.md), [item 54](../ROADMAP.md), [item 75](../ROADMAP.md), [item 78](../ROADMAP.md), [item 83](../ROADMAP.md), [item 113](../ROADMAP.md), [item 190](../ROADMAP.md), [item 192](../ROADMAP.md), [item 193](../ROADMAP.md), [item 285](../ROADMAP.md), [item 286](../ROADMAP.md).
 The central roadmap owns priority and dependencies. Its
 [completion paths](../ROADMAP.md#completion-paths-for-partially-complete-specs)
 link partially complete specs to their remaining work and acceptance criteria.

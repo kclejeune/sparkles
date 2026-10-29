@@ -43,13 +43,17 @@
 //! magic predicates of its own, evaluated to its fixpoint first. A program whose stages
 //! do not end is not stratified and is refused.
 
-use crate::budget::MemoryExceeded;
+use crate::budget::{Budget, Held, MemoryExceeded};
 use crate::builtins::{BuiltinKind, HeadAction};
 use crate::engine::{Atom, CBuiltin, CHead, CRule, Slot, Step};
 use crate::graph::Triple;
 use crate::terms::Terms;
 use rustc_hash::{FxHashMap, FxHashSet};
 use std::collections::{BTreeSet, VecDeque};
+use std::sync::{
+    Arc,
+    atomic::{AtomicBool, Ordering},
+};
 
 /// The most rules a demand program may have, over all its stages. A program past it is
 /// refused, since its evaluation would plan that many rules in every iteration.
@@ -400,7 +404,11 @@ fn list_reads(kind: BuiltinKind, args: &[Slot], action: Option<HeadAction>) -> V
         ListMember | ListContains | ListNotContains | ListLength | ListEntry => {
             vec![Read::List]
         }
-        ListForAll => vec![Read::List, Read::Facts(args[1], args[2])],
+        ListForAll => {
+            let read =
+                crate::engine::builtin_fact_read(kind, args).expect("listForAll reads facts");
+            vec![Read::List, Read::Facts(read.s, read.p)]
+        }
         _ => Vec::new(),
     }
 }
@@ -614,40 +622,10 @@ impl StageBuilder<'_> {
         self.terms.try_fresh_bnode().map_err(TransformError::Memory)
     }
 
-    /// Whether every head of a copy gives schema facts: a predicate of the RDFS and OWL
-    /// vocabularies, or `rdf:type` with an RDF, RDFS or OWL class of properties and classes.
-    fn schema_head(&self, heads: &[CHead]) -> bool {
-        heads.iter().all(|h| match h {
-            CHead::Triple(_, Slot::Const(p), o) => {
-                self.vocab.schema.contains(p)
-                    || (*p == self.rdf_type
-                        && matches!(o, Slot::Const(c) if self.vocab.meta.contains(c)))
-            }
-            _ => false,
-        })
-    }
-
-    /// Whether a body atom of a copy asks for derived facts. A copy that gives schema facts
-    /// reads instance facts as they are and asks only for schema facts and types, so the
-    /// schema never asks for the instances of a class or the facts of a property: which
-    /// classes have instances (`rdf:type rdfs:range rdfs:Class`) or which properties are
-    /// used (`rdf1`) is read from the facts at hand.
+    /// Only the preliminary schema pass suppresses derived instance premises.
+    /// Ordinary demand must follow them even when its head is a schema fact.
     fn asks(&self, a: &Atom, schema_copy: bool) -> bool {
-        if !self.intensional(a) {
-            return false;
-        }
-        if !schema_copy {
-            return true;
-        }
-        match a.p {
-            Slot::Const(p) if self.vocab.schema.contains(&p) => true,
-            Slot::Const(p) if p == self.rdf_type => match a.o {
-                Slot::Const(c) => self.vocab.meta.contains(&c),
-                Slot::Var(_) => true,
-                Slot::Any => false,
-            },
-            _ => false,
-        }
+        self.intensional(a) && (!schema_copy || schema_reads(a, self.vocab, self.rdf_type))
     }
 
     fn intensional(&self, a: &Atom) -> bool {
@@ -689,7 +667,7 @@ impl StageBuilder<'_> {
         if let Some(i) = skip {
             body.atoms.remove(i);
         }
-        let schema_copy = self.schema_only || self.schema_head(&head);
+        let schema_copy = self.schema_only;
         let Some(steps) = sip(
             &body,
             prebound,
@@ -1202,6 +1180,492 @@ impl Closed {
     }
 }
 
+/// Body relations the preliminary schema pass follows beyond their stored facts.
+fn schema_reads(a: &Atom, vocab: &Vocab, rdf_type: u64) -> bool {
+    match a.p {
+        Slot::Const(p) if vocab.schema.contains(&p) => true,
+        Slot::Const(p) if p == rdf_type => match a.o {
+            Slot::Const(c) => vocab.meta.contains(&c),
+            Slot::Var(_) => true,
+            Slot::Any => false,
+        },
+        _ => false,
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+enum Relation {
+    Predicate(u64),
+    Class(u64),
+    Types,
+    Any,
+}
+impl Relation {
+    fn of(p: Slot, o: Slot, rdf_type: u64) -> Self {
+        match p {
+            Slot::Const(p) if p == rdf_type => match o {
+                Slot::Const(c) => Self::Class(c),
+                _ => Self::Types,
+            },
+            Slot::Const(p) => Self::Predicate(p),
+            _ => Self::Any,
+        }
+    }
+    fn overlaps(self, other: Self) -> bool {
+        match (self, other) {
+            (Self::Any, _) | (_, Self::Any) => true,
+            (Self::Types, Self::Class(_) | Self::Types) | (Self::Class(_), Self::Types) => true,
+            _ => self == other,
+        }
+    }
+}
+
+/// Completeness is distinct from valid cached schema seeds. Own the analysis's
+/// admission until the returned closure sets have also finished being consumed.
+pub(crate) struct CompleteSchema {
+    pub closed: Closed,
+    _held: Held,
+}
+
+/// Retain only schema relations whose preliminary pass cannot have missed a
+/// derived premise. This analyzes the program, never the dataset or its closure.
+/// A consumed waiter bucket cannot be visited again, even for wildcard heads.
+/// None means the caller's watched cancellation flag stopped the analysis.
+pub(crate) fn complete_schema(
+    rules: &[CRule],
+    vocab: &Vocab,
+    rdf_type: u64,
+    same_as: u64,
+    budget: &Arc<Budget>,
+    cancel: &AtomicBool,
+) -> Result<Option<CompleteSchema>, MemoryExceeded> {
+    if cancel.load(Ordering::Relaxed) {
+        return Ok(None);
+    }
+    let heads = rules.iter().map(|r| r.head.len()).sum::<usize>();
+    let atoms = rules.iter().map(|r| r.atoms.len()).sum::<usize>();
+    // Bounds include hash-table spare capacity/growth, per-key Vec headers and
+    // old/new Vec storage during growth. No analysis allocation precedes this.
+    let bytes = heads
+        .saturating_mul(512)
+        .saturating_add(atoms.saturating_mul(256))
+        .saturating_add(rules.len().saturating_mul(64))
+        .saturating_add((vocab.schema.len() + vocab.meta.len()).saturating_mul(128))
+        .saturating_add(4096);
+    let held = Held::try_new(budget, bytes)?;
+    let mut possible = FxHashSet::default();
+    for r in rules {
+        if cancel.load(Ordering::Relaxed) {
+            return Ok(None);
+        }
+        for h in &r.head {
+            let (_, p, o) = head_slots(h);
+            possible.insert(Relation::of(p, o, rdf_type));
+        }
+    }
+    let any_head = possible.contains(&Relation::Any);
+    let type_head = possible.contains(&Relation::Types)
+        || possible.iter().any(|r| matches!(r, Relation::Class(_)));
+    let can_derive = |a: &Atom| match Relation::of(a.p, a.o, rdf_type) {
+        Relation::Any => !possible.is_empty(),
+        Relation::Types => any_head || type_head,
+        Relation::Class(c) => {
+            any_head
+                || possible.contains(&Relation::Types)
+                || possible.contains(&Relation::Class(c))
+        }
+        relation => any_head || possible.contains(&relation),
+    };
+    let mut waiting: FxHashMap<Relation, Vec<usize>> = FxHashMap::default();
+    let mut active = vec![false; rules.len()];
+    let mut incomplete = FxHashSet::default();
+    let mut queue = VecDeque::new();
+    let activate = |ri: usize,
+                    active: &mut [bool],
+                    incomplete: &mut FxHashSet<Relation>,
+                    queue: &mut VecDeque<Relation>| {
+        if std::mem::replace(&mut active[ri], true) {
+            return;
+        }
+        for h in &rules[ri].head {
+            let (_, p, o) = head_slots(h);
+            let relation = Relation::of(p, o, rdf_type);
+            if incomplete.insert(relation) {
+                queue.push_back(relation);
+            }
+        }
+    };
+    // The preliminary pass reads equality as stored and omits equality-only
+    // producers. Its equality and every dependent relation must remain open.
+    let omitted_equality = equality(rules, same_as);
+    for (ri, r) in rules.iter().enumerate() {
+        if cancel.load(Ordering::Relaxed) {
+            return Ok(None);
+        }
+        let omitted = omitted_equality
+            && r.head
+                .iter()
+                .any(|h| head_slots(h).1 == Slot::Const(same_as));
+        let blocked = r
+            .atoms
+            .iter()
+            .any(|a| !schema_reads(a, vocab, rdf_type) && can_derive(a))
+            // These positive reads are demanded, but their schema-pass copies
+            // can still miss transitive instance premises. Decline a static
+            // completeness proof; the bounded abstract model may prove coverage.
+            || crate::engine::implicit_fact_reads(r).any(|a| can_derive(&a));
+        if omitted || blocked {
+            activate(ri, &mut active, &mut incomplete, &mut queue);
+        } else {
+            for a in &r.atoms {
+                if cancel.load(Ordering::Relaxed) {
+                    return Ok(None);
+                }
+                if schema_reads(a, vocab, rdf_type) && can_derive(a) {
+                    waiting
+                        .entry(Relation::of(a.p, a.o, rdf_type))
+                        .or_default()
+                        .push(ri);
+                }
+            }
+        }
+    }
+    while let Some(relation) = queue.pop_front() {
+        if cancel.load(Ordering::Relaxed) {
+            return Ok(None);
+        }
+        // Wildcard events consume the matching buckets once. Constant events
+        // need only their own bucket and the two possible wildcard buckets.
+        let affected: Vec<Relation> = match relation {
+            Relation::Any => waiting.keys().copied().collect(),
+            Relation::Types => waiting
+                .keys()
+                .copied()
+                .filter(|r| relation.overlaps(*r))
+                .collect(),
+            Relation::Class(_) => vec![relation, Relation::Types, Relation::Any],
+            Relation::Predicate(_) => vec![relation, Relation::Any],
+        };
+        for key in affected {
+            if let Some(users) = waiting.remove(&key) {
+                for ri in users {
+                    if cancel.load(Ordering::Relaxed) {
+                        return Ok(None);
+                    }
+                    activate(ri, &mut active, &mut incomplete, &mut queue);
+                }
+            }
+        }
+    }
+    let any = incomplete.contains(&Relation::Any);
+    let types = incomplete.contains(&Relation::Types);
+    let mut closed = Closed {
+        preds: FxHashSet::default(),
+        classes: FxHashSet::default(),
+        rdf_type,
+    };
+    for &p in &vocab.schema {
+        if cancel.load(Ordering::Relaxed) {
+            return Ok(None);
+        }
+        if !any && !incomplete.contains(&Relation::Predicate(p)) {
+            closed.preds.insert(p);
+        }
+    }
+    for &c in &vocab.meta {
+        if cancel.load(Ordering::Relaxed) {
+            return Ok(None);
+        }
+        if !any && !types && !incomplete.contains(&Relation::Class(c)) {
+            closed.classes.insert(c);
+        }
+    }
+    Ok(Some(CompleteSchema {
+        closed,
+        _held: held,
+    }))
+}
+
+/// The finite abstraction keeps every schema/program constant, every predicate and
+/// every type class. Other instance positions become `None` (any term). Concrete
+/// instance rows are never inferred here. Unsupported tests are ignored and their
+/// outputs remain wildcards, so the model can only overestimate rule consequences.
+/// If either workspace cap is reached, retain the conservative dependency answer.
+pub(crate) fn refine_schema(
+    rules: &[CRule],
+    vocab: &Vocab,
+    terms: &Terms,
+    graph: &crate::graph::Graph,
+    closed: &mut Closed,
+    budget: &Arc<Budget>,
+    cancel: &AtomicBool,
+) -> anyhow::Result<()> {
+    let rdf_type = closed.rdf_type;
+    const FACTS: usize = 4096;
+    const BINDINGS: usize = 1024;
+    type Abstract = [Option<u64>; 3];
+    fn visit(
+        graph: &crate::graph::Graph,
+        mut f: impl FnMut(Triple) -> bool,
+    ) -> anyhow::Result<bool> {
+        if let Some(base) = graph.base()
+            && !base.for_each(None, None, None, |t| graph.is_hidden(t[1]) || f(t))?
+        {
+            return Ok(false);
+        }
+        for row in graph.offset()..graph.len() {
+            let t = graph.triple(row);
+            if graph.alive(row) && !graph.is_hidden(t[1]) && !f(t) {
+                return Ok(false);
+            }
+        }
+        Ok(true)
+    }
+    let max_vars = rules.iter().map(|r| r.nvars).max().unwrap_or(0);
+    // Include hash-table growth, old/new join buffers, per-binding Vec headers,
+    // critical constants and the eventual closure sets, before any allocation.
+    let bytes = FACTS
+        .saturating_mul(1024)
+        .saturating_add(BINDINGS.saturating_mul(max_vars.saturating_mul(96) + 256))
+        .saturating_add((vocab.schema.len() + vocab.meta.len()).saturating_mul(128));
+    let _held = Held::try_new(budget, bytes)?;
+    let full = crate::specialize::closed(vocab, rdf_type);
+    let mut critical = FxHashSet::default();
+    let mut schema_seen = FxHashSet::default();
+    for r in rules {
+        if cancel.load(Ordering::Relaxed) {
+            return Ok(());
+        }
+        for a in &r.atoms {
+            for s in [a.s, a.p, a.o] {
+                if let Slot::Const(c) = s {
+                    critical.insert(c);
+                    if critical.len() > FACTS {
+                        return Ok(());
+                    }
+                }
+            }
+        }
+        for h in &r.head {
+            let (s, p, o) = head_slots(h);
+            for s in [s, p, o] {
+                if let Slot::Const(c) = s {
+                    critical.insert(c);
+                    if critical.len() > FACTS {
+                        return Ok(());
+                    }
+                }
+            }
+        }
+        if critical.len() > FACTS {
+            return Ok(());
+        }
+    }
+    if !visit(graph, |t| {
+        if cancel.load(Ordering::Relaxed) {
+            return false;
+        }
+        if full.closes(&Atom {
+            s: Slot::Const(t[0]),
+            p: Slot::Const(t[1]),
+            o: Slot::Const(t[2]),
+        }) {
+            schema_seen.insert(t);
+            critical.extend(t);
+        }
+        if t[1] == terms.rdf_first || t[1] == terms.rdf_rest {
+            critical.extend(t);
+        }
+        critical.len() <= FACTS && schema_seen.len() <= FACTS
+    })? {
+        return Ok(());
+    }
+    let mut facts: Vec<Abstract> = Vec::new();
+    let mut seen = FxHashSet::default();
+    if !visit(graph, |t| {
+        if cancel.load(Ordering::Relaxed) {
+            return false;
+        }
+        let a = [
+            critical.contains(&t[0]).then_some(t[0]),
+            Some(t[1]),
+            (t[1] == rdf_type || critical.contains(&t[2])).then_some(t[2]),
+        ];
+        if seen.insert(a) {
+            facts.push(a);
+        }
+        facts.len() < FACTS
+    })? {
+        return Ok(());
+    }
+    loop {
+        let before = facts.len();
+        for r in rules {
+            if cancel.load(Ordering::Relaxed) {
+                return Ok(());
+            }
+            let mut bindings = vec![vec![None; r.nvars]];
+            for a in &r.atoms {
+                let mut next = Vec::new();
+                let mut unique = FxHashSet::default();
+                for binding in &bindings {
+                    for fact in &facts {
+                        if cancel.load(Ordering::Relaxed) {
+                            return Ok(());
+                        }
+                        let mut candidate = binding.clone();
+                        let mut matches = true;
+                        for (slot, value) in [a.s, a.p, a.o].into_iter().zip(*fact) {
+                            let known = match slot {
+                                Slot::Const(c) => Some(c),
+                                Slot::Var(v) => candidate[v],
+                                Slot::Any => None,
+                            };
+                            if known.zip(value).is_some_and(|(x, y)| x != y) {
+                                matches = false;
+                                break;
+                            }
+                            if let Slot::Var(v) = slot {
+                                candidate[v] = known.or(value);
+                            }
+                        }
+                        if matches && unique.insert(candidate.clone()) {
+                            next.push(candidate);
+                            if next.len() >= BINDINGS {
+                                return Ok(());
+                            }
+                        }
+                    }
+                }
+                bindings = next;
+                if bindings.is_empty() {
+                    break;
+                }
+            }
+            // Every actual list member is the object of a first link. Reading
+            // all such links is an overestimate even for derived/malformed lists;
+            // retain their constants instead of inventing arbitrary class values.
+            for builtin in &r.builtins {
+                if !matches!(
+                    builtin.kind,
+                    BuiltinKind::ListMember | BuiltinKind::ListEntry
+                ) {
+                    continue;
+                }
+                let output = if builtin.kind == BuiltinKind::ListMember {
+                    1
+                } else {
+                    2
+                };
+                let mut next = Vec::new();
+                let mut unique = FxHashSet::default();
+                for binding in &bindings {
+                    for fact in &facts {
+                        if cancel.load(Ordering::Relaxed) {
+                            return Ok(());
+                        }
+                        if fact[1].is_some_and(|p| p != terms.rdf_first) {
+                            continue;
+                        }
+                        let slot = builtin.args[output];
+                        let known = match slot {
+                            Slot::Const(c) => Some(c),
+                            Slot::Var(v) => binding[v],
+                            Slot::Any => None,
+                        };
+                        if known
+                            .zip(fact[2])
+                            .is_some_and(|(a, b)| !crate::builtins::same_value(terms, a, b))
+                        {
+                            continue;
+                        }
+                        let mut candidate = binding.clone();
+                        if let Slot::Var(v) = slot {
+                            candidate[v] = known.or(fact[2]);
+                        }
+                        if unique.insert(candidate.clone()) {
+                            next.push(candidate);
+                            if next.len() >= BINDINGS {
+                                return Ok(());
+                            }
+                        }
+                    }
+                }
+                bindings = next;
+            }
+            for binding in bindings {
+                let value = |s: Slot| match s {
+                    Slot::Const(c) => Some(c),
+                    Slot::Var(v) => binding[v],
+                    Slot::Any => None,
+                };
+                let impossible = r
+                    .builtins
+                    .iter()
+                    .any(|b| match (b.kind, b.args.as_slice()) {
+                        (BuiltinKind::NotEqual, [a, b]) => value(*a)
+                            .zip(value(*b))
+                            .is_some_and(|(a, b)| crate::builtins::same_value(terms, a, b)),
+                        (BuiltinKind::Equal, [a, b]) => value(*a)
+                            .zip(value(*b))
+                            .is_some_and(|(a, b)| !crate::builtins::same_value(terms, a, b)),
+                        _ => false,
+                    });
+                if impossible {
+                    continue;
+                }
+                for h in &r.head {
+                    let (s, p, o) = head_slots(h);
+                    let fact = [value(s), value(p), value(o)];
+                    if seen.insert(fact) {
+                        facts.push(fact);
+                        if facts.len() >= FACTS {
+                            return Ok(());
+                        }
+                    }
+                }
+            }
+        }
+        if before == facts.len() {
+            break;
+        }
+    }
+    // A wildcard cannot prove a schema seed present. Concrete schema facts are
+    // checked against the same visible graph; missing facts keep the relation open.
+    let mut preds = full.preds;
+    let mut classes = full.classes;
+    for fact in facts {
+        if cancel.load(Ordering::Relaxed) {
+            return Ok(());
+        }
+        let present = match fact {
+            [Some(s), Some(p), Some(o)] => schema_seen.contains(&[s, p, o]),
+            _ => false,
+        };
+        if present {
+            continue;
+        }
+        match fact[1] {
+            Some(p) if p == rdf_type => match fact[2] {
+                Some(c) => {
+                    classes.remove(&c);
+                }
+                None => classes.clear(),
+            },
+            Some(p) => {
+                preds.remove(&p);
+            }
+            None => {
+                preds.clear();
+                classes.clear();
+            }
+        }
+    }
+    closed.preds = preds;
+    closed.classes = classes;
+    Ok(())
+}
+
 /// Whether rules derive `owl:sameAs` (`same_as`) and read it, which makes equality a
 /// stage of its own.
 pub(crate) fn equality(rules: &[CRule], same_as: u64) -> bool {
@@ -1605,4 +2069,357 @@ pub(crate) enum TransformError {
     TooLarge(usize),
     #[error(transparent)]
     Memory(MemoryExceeded),
+}
+
+#[cfg(test)]
+mod schema_completeness_tests {
+    use super::*;
+
+    fn rule(predicate: Slot, object: Slot, body: Vec<(u64, Slot)>) -> CRule {
+        CRule {
+            name: "schema dependency fixture".into(),
+            nvars: 2,
+            atoms: body
+                .into_iter()
+                .map(|(p, o)| Atom {
+                    s: Slot::Var(0),
+                    p: Slot::Const(p),
+                    o,
+                })
+                .collect(),
+            builtins: vec![],
+            head: vec![CHead::Triple(Slot::Var(0), predicate, object)],
+        }
+    }
+    fn vocabulary() -> Vocab {
+        Vocab {
+            schema: [30, 50, 51, 52].into_iter().collect(),
+            meta: [100, 101].into_iter().collect(),
+        }
+    }
+    #[test]
+    fn schema_completeness_implicit_list_fact_dependencies_remain_open() {
+        for predicate in [Slot::Const(20), Slot::Var(1)] {
+            let mut consumer = rule(Slot::Const(1), Slot::Const(100), vec![(11, Slot::Var(1))]);
+            consumer.builtins.push(CBuiltin {
+                origin: 0,
+                kind: BuiltinKind::ListForAll,
+                args: vec![Slot::Const(900), Slot::Const(901), predicate],
+                inputs: vec![],
+                outputs: vec![],
+                regex: None,
+            });
+            let rules = vec![
+                rule(Slot::Const(10), Slot::Var(1), vec![(9, Slot::Var(1))]),
+                rule(Slot::Const(20), Slot::Var(1), vec![(10, Slot::Var(1))]),
+                consumer,
+            ];
+            let budget = Budget::unlimited();
+            let complete = complete_schema(
+                &rules,
+                &vocabulary(),
+                1,
+                30,
+                &budget,
+                &AtomicBool::new(false),
+            )
+            .unwrap()
+            .unwrap();
+            assert!(
+                !complete.closed.classes.contains(&100),
+                "implicit predicate {predicate:?}"
+            );
+            assert!(complete.closed.classes.contains(&101));
+            drop(complete);
+            assert_eq!(budget.used(), 0);
+        }
+    }
+
+    fn abstract_fixture() -> (Terms, crate::graph::Graph, Closed) {
+        let store =
+            sparkles_core::store::Store::in_memory(sparkles_core::store::StoreOptions::default());
+        let terms = Terms::new(store.snapshot());
+        let graph = crate::graph::Graph::with_capacity(0);
+        let closed = Closed {
+            preds: FxHashSet::default(),
+            classes: FxHashSet::default(),
+            rdf_type: 1,
+        };
+        (terms, graph, closed)
+    }
+
+    fn declaration_rule() -> CRule {
+        CRule {
+            name: "property declaration".into(),
+            nvars: 3,
+            atoms: vec![Atom {
+                s: Slot::Var(0),
+                p: Slot::Var(1),
+                o: Slot::Var(2),
+            }],
+            builtins: vec![],
+            head: vec![CHead::Triple(
+                Slot::Var(1),
+                Slot::Const(1),
+                Slot::Const(100),
+            )],
+        }
+    }
+
+    #[test]
+    fn schema_completeness_abstract_proves_covered_declarations() {
+        let (terms, mut graph, mut closed) = abstract_fixture();
+        graph.add_batch([[9, 10, 11], [10, 1, 100], [1, 1, 100]]);
+        let rules = vec![declaration_rule()];
+        let vocab = Vocab {
+            schema: [50].into_iter().collect(),
+            meta: [100].into_iter().collect(),
+        };
+        let budget = Budget::unlimited();
+        refine_schema(
+            &rules,
+            &vocab,
+            &terms,
+            &graph,
+            &mut closed,
+            &budget,
+            &AtomicBool::new(false),
+        )
+        .unwrap();
+        assert_eq!(closed.preds, [50].into_iter().collect());
+        assert_eq!(closed.classes, [100].into_iter().collect());
+        assert_eq!(budget.used(), 0);
+        let new = rule(Slot::Const(20), Slot::Var(1), vec![(10, Slot::Var(1))]);
+        refine_schema(
+            &[declaration_rule(), new],
+            &vocab,
+            &terms,
+            &graph,
+            &mut closed,
+            &budget,
+            &AtomicBool::new(false),
+        )
+        .unwrap();
+        assert!(closed.classes.is_empty());
+        assert_eq!(closed.preds, [50].into_iter().collect());
+    }
+
+    #[test]
+    fn schema_completeness_abstract_keeps_unknown_and_equality_consequences_open() {
+        let (terms, mut graph, mut closed) = abstract_fixture();
+        graph.add([9, 10, 11]);
+        let rules = vec![
+            rule(Slot::Const(30), Slot::Var(1), vec![(10, Slot::Var(1))]),
+            rule(Slot::Const(50), Slot::Var(1), vec![(30, Slot::Var(1))]),
+        ];
+        let budget = Budget::unlimited();
+        refine_schema(
+            &rules,
+            &vocabulary(),
+            &terms,
+            &graph,
+            &mut closed,
+            &budget,
+            &AtomicBool::new(false),
+        )
+        .unwrap();
+        assert!(!closed.preds.contains(&50));
+        assert!(closed.preds.contains(&51));
+        let rules = vec![rule(Slot::Var(1), Slot::Var(0), vec![(10, Slot::Var(1))])];
+        refine_schema(
+            &rules,
+            &vocabulary(),
+            &terms,
+            &graph,
+            &mut closed,
+            &budget,
+            &AtomicBool::new(false),
+        )
+        .unwrap();
+        assert!(closed.preds.is_empty());
+        assert!(closed.classes.is_empty());
+    }
+
+    #[test]
+    fn schema_completeness_abstract_equal_uses_literal_values() {
+        let (terms, graph, mut closed) = abstract_fixture();
+        let integer = terms.id_for(&oxrdf::Term::Literal(oxrdf::Literal::new_typed_literal(
+            "1",
+            oxrdf::vocab::xsd::INTEGER,
+        )));
+        let decimal = terms.id_for(&oxrdf::Term::Literal(oxrdf::Literal::new_typed_literal(
+            "1.0",
+            oxrdf::vocab::xsd::DECIMAL,
+        )));
+        assert_ne!(integer, decimal);
+        assert!(crate::builtins::same_value(&terms, integer, decimal));
+        let mut producer = rule(Slot::Const(50), Slot::Const(21), vec![]);
+        producer.builtins.push(CBuiltin {
+            origin: 0,
+            kind: BuiltinKind::Equal,
+            args: vec![Slot::Const(integer), Slot::Const(decimal)],
+            inputs: vec![],
+            outputs: vec![],
+            regex: None,
+        });
+        refine_schema(
+            &[producer],
+            &vocabulary(),
+            &terms,
+            &graph,
+            &mut closed,
+            &Budget::unlimited(),
+            &AtomicBool::new(false),
+        )
+        .unwrap();
+        assert!(!closed.preds.contains(&50));
+        assert!(closed.preds.contains(&51));
+    }
+
+    #[test]
+    fn schema_completeness_abstract_caps_cancel_and_memory_leave_no_partial_proof() {
+        let (terms, mut graph, mut closed) = abstract_fixture();
+        closed.preds.insert(50);
+        graph.add_batch((1000..5100).map(|p| [9, p, 11]));
+        let budget = Budget::unlimited();
+        refine_schema(
+            &[],
+            &vocabulary(),
+            &terms,
+            &graph,
+            &mut closed,
+            &budget,
+            &AtomicBool::new(false),
+        )
+        .unwrap();
+        assert_eq!(closed.preds, [50].into_iter().collect());
+        assert!(closed.classes.is_empty());
+        refine_schema(
+            &[],
+            &vocabulary(),
+            &terms,
+            &graph,
+            &mut closed,
+            &budget,
+            &AtomicBool::new(true),
+        )
+        .unwrap();
+        assert_eq!(closed.preds, [50].into_iter().collect());
+        let small = Budget::new(Some(1));
+        assert!(
+            refine_schema(
+                &[],
+                &vocabulary(),
+                &terms,
+                &graph,
+                &mut closed,
+                &small,
+                &AtomicBool::new(false)
+            )
+            .is_err()
+        );
+        assert_eq!(small.used(), 0);
+        assert_eq!(budget.used(), 0);
+    }
+
+    #[test]
+    fn schema_completeness_keeps_unrelated_closed_relations() {
+        let rules = vec![
+            rule(Slot::Const(20), Slot::Var(1), vec![(10, Slot::Var(1))]),
+            rule(Slot::Const(50), Slot::Var(1), vec![(20, Slot::Var(1))]),
+            rule(Slot::Const(52), Slot::Var(1), vec![(50, Slot::Var(1))]),
+            rule(Slot::Const(51), Slot::Var(1), vec![(11, Slot::Var(1))]),
+            rule(Slot::Const(1), Slot::Const(100), vec![(20, Slot::Var(1))]),
+            rule(Slot::Const(1), Slot::Const(101), vec![(11, Slot::Var(1))]),
+        ];
+        let budget = Budget::unlimited();
+        let complete = complete_schema(
+            &rules,
+            &vocabulary(),
+            1,
+            30,
+            &budget,
+            &AtomicBool::new(false),
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(complete.closed.preds, [30, 51].into_iter().collect());
+        assert_eq!(complete.closed.classes, [101].into_iter().collect());
+        assert!(budget.used() > 0);
+        drop(complete);
+        assert_eq!(budget.used(), 0);
+    }
+    #[test]
+    fn schema_completeness_propagates_equality_and_unknown_heads() {
+        let mut rules = vec![
+            rule(Slot::Const(30), Slot::Var(1), vec![(10, Slot::Var(1))]),
+            rule(Slot::Const(50), Slot::Var(1), vec![(30, Slot::Var(1))]),
+            rule(Slot::Const(51), Slot::Var(1), vec![(11, Slot::Var(1))]),
+        ];
+        let budget = Budget::unlimited();
+        let complete = complete_schema(
+            &rules,
+            &vocabulary(),
+            1,
+            30,
+            &budget,
+            &AtomicBool::new(false),
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(complete.closed.preds, [51, 52].into_iter().collect());
+        drop(complete);
+        rules.push(rule(
+            Slot::Const(20),
+            Slot::Var(1),
+            vec![(10, Slot::Var(1))],
+        ));
+        rules.push(rule(Slot::Var(1), Slot::Var(0), vec![(20, Slot::Var(1))]));
+        let complete = complete_schema(
+            &rules,
+            &vocabulary(),
+            1,
+            30,
+            &budget,
+            &AtomicBool::new(false),
+        )
+        .unwrap()
+        .unwrap();
+        assert!(complete.closed.preds.is_empty());
+        assert!(complete.closed.classes.is_empty());
+    }
+    #[test]
+    fn schema_completeness_refuses_memory_and_observes_cancellation() {
+        let rules = vec![rule(
+            Slot::Const(50),
+            Slot::Var(1),
+            vec![(10, Slot::Var(1))],
+        )];
+        let budget = Budget::new(Some(1));
+        assert!(
+            complete_schema(
+                &rules,
+                &vocabulary(),
+                1,
+                30,
+                &budget,
+                &AtomicBool::new(false)
+            )
+            .is_err()
+        );
+        assert_eq!(budget.used(), 0);
+        assert!(
+            complete_schema(
+                &rules,
+                &vocabulary(),
+                1,
+                30,
+                &budget,
+                &AtomicBool::new(true)
+            )
+            .unwrap()
+            .is_none()
+        );
+        assert_eq!(budget.used(), 0);
+    }
 }
