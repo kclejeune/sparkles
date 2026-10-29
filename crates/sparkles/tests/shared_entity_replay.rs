@@ -1839,3 +1839,84 @@ fn type_stripped_mandatory_roles_and_indirect_selector_controls_refuse() {
         );
     });
 }
+
+#[test]
+fn observation_header_regression_negative_relation_is_not_positive_support() {
+    with_evolution_graph(|graph, operation| {
+        let claim = ex("A10:observationRelation2:claim");
+        let predicate = format!("{EV}polarity");
+        graph
+            .records
+            .get_mut(&claim)
+            .unwrap()
+            .retain(|s| s.predicate != predicate);
+        graph.records.get_mut(&claim).unwrap().insert(Statement {
+            graph: "DEFAULT".into(),
+            predicate,
+            object: oxrdf::NamedNode::new(format!("{EV}Negative"))
+                .unwrap()
+                .into(),
+        });
+        assert!(matches!(
+            select_observation(
+                graph,
+                &ex("A10:currentView"),
+                &ex("A10:selectionProfile1"),
+                &candidates(),
+                operation
+            ),
+            Err(Failure::UnsupportedProfile)
+        ));
+        assert!(matches!(
+            select_observation(
+                graph,
+                &ex("A10:oldView"),
+                &ex("A10:selectionProfile1"),
+                &candidates(),
+                operation
+            )
+            .unwrap(),
+            Selection::Known(_)
+        ));
+    });
+}
+#[test]
+fn observation_header_regression_unknown_claim_kind_is_not_interpreted() {
+    with_evolution_graph(|graph, operation| {
+        let claim = ex("A10:obs2:valueClaim");
+        let predicate = format!("{EV}claimKind");
+        graph
+            .records
+            .get_mut(&claim)
+            .unwrap()
+            .retain(|s| s.predicate != predicate);
+        graph.records.get_mut(&claim).unwrap().insert(Statement {
+            graph: "DEFAULT".into(),
+            predicate,
+            object: oxrdf::NamedNode::new("urn:unsupported:claim-kind")
+                .unwrap()
+                .into(),
+        });
+        assert!(matches!(
+            select_observation(
+                graph,
+                &ex("A10:currentView"),
+                &ex("A10:selectionProfile1"),
+                &candidates(),
+                operation
+            ),
+            Err(Failure::UnsupportedProfile)
+        ));
+        assert!(matches!(
+            select_observation(
+                graph,
+                &ex("A10:oldView"),
+                &ex("A10:selectionProfile1"),
+                &candidates(),
+                operation
+            )
+            .unwrap(),
+            Selection::Known(_)
+        ));
+    });
+}

@@ -236,6 +236,15 @@ pub(crate) fn select_observation(
         {
             return Err(Failure::InvalidDomainRecord);
         }
+        // This fixed observation adapter supports reported positive occurrences
+        // only. A negated or unknown claim cannot become positive series support.
+        for claim in [&candidate.relation_claim, &candidate.value_claim] {
+            if graph.one_iri(claim, &format!("{EV}claimKind"))? != format!("{EV}Reported")
+                || graph.one_iri(claim, &format!("{EV}polarity"))? != format!("{EV}Positive")
+            {
+                return Err(Failure::UnsupportedProfile);
+            }
+        }
         let relationship = claim_triple(graph, &candidate.relation_claim)?;
         let value = claim_triple(graph, &candidate.value_claim)?;
         if relationship.subject.to_string() != format!("<{}>", candidate.observation)
