@@ -313,6 +313,38 @@ pub(crate) struct Program {
     pub magic_preds: FxHashSet<u64>,
     /// the value of the positions a magic fact does not hold
     pub dummy: u64,
+    _compact_allocation: Option<Held>,
+}
+
+/// Root labels for a compact evaluation of the original positive rules. The
+/// labels remain hidden, but no adorned rule copies need to consume them.
+pub(crate) fn compact_roots(terms: &Terms, roots: &[Key]) -> Result<Program, MemoryExceeded> {
+    let bytes = roots
+        .len()
+        .saturating_mul(4 * (std::mem::size_of::<Key>() + std::mem::size_of::<u64>() + 16))
+        .saturating_add(512);
+    let allocation = Held::try_new(&terms.budget(), bytes)?;
+    let dummy = terms.try_fresh_bnode()?;
+    let mut magic = FxHashMap::default();
+    let mut magic_preds = FxHashSet::default();
+    for root in roots {
+        if let std::collections::hash_map::Entry::Vacant(entry) = magic.entry(*root) {
+            let predicate = terms.try_fresh_bnode()?;
+            entry.insert(predicate);
+            magic_preds.insert(predicate);
+        }
+    }
+    Ok(Program {
+        stages: vec![Stage {
+            rules: Vec::new(),
+            magic,
+            seeds: Vec::new(),
+            only_if: None,
+        }],
+        magic_preds,
+        dummy,
+        _compact_allocation: Some(allocation),
+    })
 }
 
 /// The magic fact of key `k` in a stage whose magic predicate is `m`, for the values
@@ -2054,6 +2086,7 @@ fn transform_in(
         stages,
         magic_preds,
         dummy,
+        _compact_allocation: None,
     })
 }
 
@@ -2421,5 +2454,25 @@ mod schema_completeness_tests {
             .is_none()
         );
         assert_eq!(budget.used(), 0);
+    }
+
+    #[test]
+    fn compact_roots_charge_owned_maps_and_keep_internal_predicates_hidden() {
+        let store = sparkles_core::store::Store::in_memory(Default::default());
+        let terms = Terms::new(store.snapshot());
+        let budget = Budget::new(Some(64 << 20));
+        terms.set_budget(&budget).unwrap();
+        let root = Key::new(false, KeyP::Free, false);
+        let program = compact_roots(&terms, &[root, root]).unwrap();
+        assert!(program._compact_allocation.is_some());
+        assert!(program.stages[0].rules.is_empty());
+        assert_eq!(program.stages[0].keys().count(), 1);
+        let predicate = program.stages[0].magic(&root).unwrap();
+        assert!(program.magic_preds.contains(&predicate));
+        let before_drop = budget.used();
+        drop(program);
+        assert!(budget.used() < before_drop);
+        let _occupied = Held::try_new(&budget, budget.available()).unwrap();
+        assert!(compact_roots(&terms, &[root]).is_err());
     }
 }

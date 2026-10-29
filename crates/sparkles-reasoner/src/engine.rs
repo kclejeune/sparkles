@@ -1572,7 +1572,23 @@ pub(crate) fn run(
     limits: &Limits,
     start: Option<u32>,
 ) -> anyhow::Result<Outcome> {
+    run_observed(g, rules, terms, limits, start, None)
+}
+
+/// Observe immutable merge boundaries for the bounded positive proof plan.
+/// With no observer this is exactly the ordinary evaluator.
+pub(crate) fn run_observed(
+    g: &mut Graph,
+    rules: &[CRule],
+    terms: &Terms,
+    limits: &Limits,
+    start: Option<u32>,
+    mut boundary: Option<&mut dyn FnMut(u32)>,
+) -> anyhow::Result<Outcome> {
     let base_len = g.len();
+    if let Some(note) = boundary.as_mut() {
+        note(base_len);
+    }
     let abort = AtomicBool::new(false);
     let cancelled = || {
         limits
@@ -1875,6 +1891,9 @@ pub(crate) fn run(
                 Ok(m) => memory(m.with_context(overflow.clone()), iteration),
                 Err(e) => e,
             })?;
+        if let Some(note) = boundary.as_mut() {
+            note(g.len());
+        }
         iteration += 1;
         let new = g.len() - before;
         tracing::debug!(

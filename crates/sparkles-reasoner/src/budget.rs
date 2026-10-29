@@ -81,6 +81,10 @@ impl Budget {
         self.used.load(Ordering::Relaxed)
     }
 
+    pub fn available(&self) -> usize {
+        self.limit.saturating_sub(self.used())
+    }
+
     pub fn peak(&self) -> usize {
         self.peak.load(Ordering::Relaxed)
     }

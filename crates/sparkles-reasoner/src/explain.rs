@@ -32,8 +32,8 @@
 //! charged to the request's memory budget. The deadline is read between rules and inside
 //! each rule's evaluation, so a rule whose candidates all fail stops at it too.
 
-use crate::budget::Budget;
-use crate::engine::{self, CRule, Eval, Mode, RuleInfo, Slot};
+use crate::budget::{Budget, Held};
+use crate::engine::{self, CRule, Eval, Mode, RuleInfo, Slot, Step};
 use crate::facts::Base;
 use crate::graph::{Graph, Triple};
 use crate::incremental::{Plans, bind_head};
@@ -179,6 +179,8 @@ struct Search<'a> {
     extra: &'a FxHashSet<Triple>,
     budget: &'a Arc<Budget>,
     opts: &'a ExplainOptions,
+    /// Complete synchronous positive rounds, for a single minimum-depth tree.
+    rounds: &'a [u32],
     abort: AtomicBool,
     facts: Vec<Triple>,
     index: FxHashMap<Triple, u32>,
@@ -196,6 +198,9 @@ struct Search<'a> {
     via: Vec<u32>,
     /// the bytes of `depth` and `via` charged to the budget
     kept: usize,
+    /// Discovery restarts after a prefix proof, without a fresh search allowance.
+    full_schedule: Option<Vec<bool>>,
+    _full_schedule_allocation: Option<Held>,
 }
 
 /// Why a search stopped before its answer.
@@ -225,7 +230,7 @@ impl<'a> Search<'a> {
         if let Some(&i) = self.index.get(&t) {
             return Ok((i, false));
         }
-        self.charge(FACT_BYTES + 8)?;
+        self.charge(FACT_BYTES + 8 + if self.full_schedule.is_some() { 4 } else { 0 })?;
         let i = self.facts.len() as u32;
         let leaf = self.asserted(&t);
         self.facts.push(t);
@@ -237,6 +242,9 @@ impl<'a> Search<'a> {
         self.depth.push(if leaf.is_some() { 0 } else { NONE });
         self.via.push(NONE);
         self.kept += 8;
+        if let Some(scheduled) = &mut self.full_schedule {
+            scheduled.push(false);
+        }
         Ok((i, true))
     }
 
@@ -280,6 +288,15 @@ impl<'a> Search<'a> {
     fn expand(&mut self, f: u32, next: &mut Vec<u32>) -> Result<(), Stop> {
         self.check_time()?;
         let t = self.facts[f as usize];
+        // Every new positive fact has a witness in the preceding immutable
+        // round. Restrict only candidate premises; builtins still see the whole
+        // current graph and every advertised instance is replayed there.
+        let cutoff = self.g.position(&t).and_then(|row| {
+            self.rounds
+                .windows(2)
+                .find(|ends| ends[0] <= row && row < ends[1])
+                .map(|ends| ends[0])
+        });
         // a default geometry follows from the feature's one geometry
         if let Some((has, default)) = self.rs.geo
             && t[1] == default
@@ -296,6 +313,32 @@ impl<'a> Search<'a> {
             let Some((steps, pre)) = &self.plans.back[ri][hi] else {
                 continue;
             };
+            let _limited_allocation = cutoff
+                .map(|_| {
+                    Held::try_new(
+                        self.budget,
+                        steps.len().saturating_mul(std::mem::size_of::<Step>()),
+                    )
+                })
+                .transpose()
+                .map_err(|e| Stop::Error(e.into()))?;
+            let limited;
+            let steps = if let Some(end) = cutoff {
+                limited = steps
+                    .iter()
+                    .map(|step| match *step {
+                        Step::Atom { atom, lo, hi } => Step::Atom {
+                            atom,
+                            lo,
+                            hi: hi.min(end),
+                        },
+                        Step::Builtin(builtin) => Step::Builtin(builtin),
+                    })
+                    .collect::<Vec<_>>();
+                &limited
+            } else {
+                steps
+            };
             let rule = &self.rs.rules[ri];
             let Some(mut b) = bind_head(rule, hi, pre, t) else {
                 continue;
@@ -309,6 +352,14 @@ impl<'a> Search<'a> {
             let budget = self.budget;
             let failed = {
                 let mut sink = |matched: &[Triple], implicit: &[Triple], vals: &[u64]| -> bool {
+                    if cutoff.is_some_and(|end| {
+                        matched
+                            .iter()
+                            .chain(implicit)
+                            .any(|fact| self.g.position(fact).is_some_and(|row| row >= end))
+                    }) {
+                        return true;
+                    }
                     if found.len() >= room
                         || deadline.is_some_and(|d| found.len() % 64 == 63 && Instant::now() >= d)
                     {
@@ -409,8 +460,17 @@ impl<'a> Search<'a> {
         for u in body {
             let (m, new) = self.fact(u)?;
             self.premises.push(m);
-            if new && self.leaf[m as usize].is_none() {
-                next.push(m);
+            if self.leaf[m as usize].is_none() {
+                let queue = if let Some(scheduled) = &mut self.full_schedule {
+                    let queued = scheduled[m as usize];
+                    scheduled[m as usize] = true;
+                    !queued
+                } else {
+                    new
+                };
+                if queue {
+                    next.push(m);
+                }
             }
         }
         let binds = self.binds.len() as u32;
@@ -887,6 +947,7 @@ fn materialized(
         &budget,
         root,
         opts,
+        &[],
     )
 }
 
@@ -902,6 +963,7 @@ fn search(
     budget: &Arc<Budget>,
     root: Triple,
     opts: &ExplainOptions,
+    rounds: &[u32],
 ) -> anyhow::Result<Explained> {
     let plans = Plans::new(g, rs.rules)?;
     let g: &Graph = g;
@@ -916,6 +978,7 @@ fn search(
         extra,
         budget,
         opts,
+        rounds: if max_trees == 1 { rounds } else { &[] },
         abort: AtomicBool::new(false),
         facts: Vec::new(),
         index: FxHashMap::default(),
@@ -928,6 +991,8 @@ fn search(
         depth: Vec::new(),
         via: Vec::new(),
         kept: 0,
+        full_schedule: None,
+        _full_schedule_allocation: None,
     };
     let stop = |e: Stop| -> anyhow::Error {
         match e {
@@ -960,6 +1025,27 @@ fn search(
         s.settle().map_err(stop)?;
         if s.depth[r as usize] != NONE && found_at.is_none() {
             found_at = Some(level);
+        }
+        // The prefix proves one minimum-depth tree, not completeness under
+        // root exclusion. Discover alternatives with the original unpruned BFS:
+        // a later independent support can be hidden by an earlier root-dependent
+        // witness. Keep all consumed budgets and already proven instances.
+        if found_at.is_some()
+            && !s.rounds.is_empty()
+            && s.leaf[r as usize].is_none()
+            && s.root_tops(r).map_err(stop)?.2.len() <= max_trees
+        {
+            let allocation =
+                Held::try_new(budget, s.facts.len().saturating_mul(4).saturating_add(64))
+                    .map_err(|error| stop(Stop::Error(error.into())))?;
+            let mut scheduled = vec![false; s.facts.len()];
+            scheduled[r as usize] = true;
+            s.full_schedule = Some(scheduled);
+            s._full_schedule_allocation = Some(allocation);
+            s.rounds = &[];
+            frontier = vec![r];
+            level = 0;
+            continue;
         }
         let enough = match found_at {
             None => false,
@@ -1150,7 +1236,16 @@ pub(crate) fn search_session(
         geo: p.geo_default.then(|| crate::geo_ids(p.terms)),
     };
     search(
-        p.snap, p.graph, p.terms, &rs, p.inputs, extra, p.budget, root, opts,
+        p.snap,
+        p.graph,
+        p.terms,
+        &rs,
+        p.inputs,
+        extra,
+        p.budget,
+        root,
+        opts,
+        p.compact_rounds,
     )
 }
 
@@ -1307,6 +1402,7 @@ mod partial_tests {
             extra: &extra,
             budget: &budget,
             opts: &opts,
+            rounds: &[],
             abort: AtomicBool::new(false),
             facts: Vec::new(),
             index: FxHashMap::default(),
@@ -1319,6 +1415,8 @@ mod partial_tests {
             depth: Vec::new(),
             via: Vec::new(),
             kept: 0,
+            full_schedule: None,
+            _full_schedule_allocation: None,
         };
         let (root, _) = search.fact(root).ok().expect("unlimited fact allocation");
         search
