@@ -3,8 +3,9 @@
 //! [`config_language`] tells the server and the CLI which validator installs the guard.
 //!
 //! Format 1 is SHACL (`sparkles_shacl::guard::ValidationConfig`). Format 2 adds
-//! `language` (`"shacl"` or `"shex"`) and is what both guards write; a file without
-//! `language` is SHACL, so format 1 files keep working unchanged.
+//! `language` (`"shacl"` or `"shex"`) and is what SHACL writes. ShEx writes format 3,
+//! which adds a verified hash of the stored schema copy, and also reads format 2.
+//! A file without `language` is SHACL, so format 1 files keep working unchanged.
 
 use super::{GuardLanguage, GuardStatus, SeverityCounts, Strategy, ValidationSummary};
 use crate::error::{Error, Result};
@@ -467,6 +468,15 @@ mod tests {
             config_language(dir.path()).unwrap(),
             Some(GuardLanguage::Shex)
         );
+        write(r#"{"format":3,"language":"shex","mode":"warn"}"#);
+        assert_eq!(
+            config_language(dir.path()).unwrap(),
+            Some(GuardLanguage::Shex)
+        );
+        write(r#"{"format":3,"language":"shacl","mode":"warn"}"#);
+        assert!(config_language(dir.path()).is_err());
+        write(r#"{"format":4,"language":"shex","mode":"warn"}"#);
+        assert!(config_language(dir.path()).is_err());
         write(r#"{"format":2,"language":"owl","mode":"warn"}"#);
         assert!(config_language(dir.path()).is_err());
         write("not json");

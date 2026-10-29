@@ -9719,7 +9719,7 @@ export interface components {
             /** @enum {string} */
             baseline?: "strict" | "grandfather";
             dataGraph?: ("default" | "union") | string[];
-            /** @description 2 when stored. */
+            /** @description 2 for stored SHACL configurations and 3 for stored ShEx configurations. ShEx format 2 is also read. */
             format?: number;
             includeInferences?: boolean;
             /** @enum {string} */
@@ -9727,7 +9727,7 @@ export interface components {
             /** @enum {string} */
             mode: "reject" | "warn" | "off";
             reportLimit?: number;
-            /** @description ShEx: `{inline, format?, base?, source?}` or `{graphs, prefixes?, base?}`, stored with `file`, `format` and `sha256`. */
+            /** @description ShEx: `{inline, format?, base?, source?}` or `{graphs, prefixes?, base?}`. Copied schemas store `file`, `format`, original-source `sha256` and verified-copy `copySha256`. */
             schema?: {
                 [key: string]: unknown;
             };

@@ -90,7 +90,8 @@ Derive facts with [RDFS, OWL 2 RL and Jena rules](reasoning/README.md#reasoning)
 and inspect explanations. Validate data with [SHACL](reasoning/README.md#shacl),
 [ShEx](reasoning/README.md#shex) and write guards, or
 [discover schema and draft shapes](reasoning/README.md#schema-discovery-and-drafted-shapes)
-from existing data.
+from existing data. ShEx write guards verify copied schemas before installation or
+reuse. Legacy configurations without a copy digest validate the head in full at install.
 
 <a id="server-and-protocols"></a>
 <a id="sparql-protocol-and-fuseki-compatibility"></a>

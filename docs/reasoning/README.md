@@ -120,7 +120,10 @@ request or on every write, and the schema report counts what the data holds.
   the results a write introduces.
 * SHACL shapes come from dataset graphs, a file, or both. ShEx uses a schema, which can
   also live in ShExR graphs of the dataset, and a query shape map expanded per write.
-  When a schema is set, its imports are resolved and copied into the database.
+  When a schema is set, its imports are resolved and copied into the database. A copied
+  schema's digest is verified before installation or reuse in a settings change. A
+  mismatch refuses the guard. Legacy ShEx configurations without a copy digest receive
+  a full validation at installation and gain the digest when their settings are saved.
 * `/$/validation/{ds}`, `sparkles validation` and `serve --validate` configure it in
   `validation.json`. The CLI's `--no-validate` skips it, and writes that bypass
   validation are flagged `unvalidated` in the commit log. If a dataset's guard cannot be
@@ -219,8 +222,7 @@ dependencies are recorded in the [central roadmap](../ROADMAP.md).
   anchored at the focus node, in full on every write. Roadmap item 78.
 * ShEx keeps no typing when the process is killed or exits without closing the store, so
   the first writes afterwards to a recursive schema over a large connected graph may
-  validate in full. A ShEx schema copy edited outside Sparkles is trusted without a digest
-  check. Roadmap items 54 and 83.
+  validate in full. Roadmap item 54.
 * Validation endpoints refuse callers whose grants cover only some graphs or triples.
   Roadmap item 75.
 
@@ -242,7 +244,7 @@ or library workflows. Exact HTTP contracts remain in the API reference.
 
 ## Roadmap
 
-The remaining work described above refers to [item 9](../ROADMAP.md), [item 18](../ROADMAP.md), [item 19](../ROADMAP.md), [item 48](../ROADMAP.md), [item 53](../ROADMAP.md), [item 54](../ROADMAP.md), [item 75](../ROADMAP.md), [item 78](../ROADMAP.md), [item 83](../ROADMAP.md), [item 113](../ROADMAP.md), [item 190](../ROADMAP.md), [item 192](../ROADMAP.md), [item 193](../ROADMAP.md), [item 285](../ROADMAP.md), [item 286](../ROADMAP.md).
+The remaining work described above refers to [item 9](../ROADMAP.md), [item 18](../ROADMAP.md), [item 19](../ROADMAP.md), [item 48](../ROADMAP.md), [item 53](../ROADMAP.md), [item 54](../ROADMAP.md), [item 75](../ROADMAP.md), [item 78](../ROADMAP.md), [item 113](../ROADMAP.md), [item 190](../ROADMAP.md), [item 192](../ROADMAP.md), [item 193](../ROADMAP.md), [item 285](../ROADMAP.md), [item 286](../ROADMAP.md).
 The central roadmap owns priority and dependencies. Its
 [completion paths](../ROADMAP.md#completion-paths-for-partially-complete-specs)
 link partially complete specs to their remaining work and acceptance criteria.

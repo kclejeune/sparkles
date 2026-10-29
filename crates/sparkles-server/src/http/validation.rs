@@ -130,7 +130,7 @@ mod handlers {
         Ok(ds.dataset.validation().guard().set_shacl(cfg)?)
     }
 
-    /// Set a ShEx configuration (format 2). The schema's imports resolve as for
+    /// Set a ShEx configuration (format 3; format 2 is also read). Imports resolve as for
     /// `/{ds}/shex`: `file:` IRIs under `--load-dir` (and relative IRIs against it),
     /// http(s) through the outbound policy; there are no inline import bodies or
     /// externs, so an EXTERNAL shape is an error.

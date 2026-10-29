@@ -1,6 +1,6 @@
 //! Write-time ShEx validation: a [`CommitGuard`] that validates the post-state of every
 //! commit against a schema and a query shape map, configured per dataset in
-//! `<db>/validation.json` (format 2, `"language": "shex"`).
+//! `<db>/validation.json` (format 3, `"language": "shex"`).
 //!
 //! The decisions are those of write-time SHACL validation (`sparkles_shacl::guard`):
 //!
@@ -75,13 +75,13 @@ use std::time::{Duration, Instant};
 pub use sparkles_core::guard::config::{SHEX_SCHEMA_SHEXC_FILE, SHEX_SCHEMA_SHEXJ_FILE};
 
 /// The `format` of a ShEx `validation.json`.
-pub const CONFIG_FORMAT: u32 = 2;
+pub const CONFIG_FORMAT: u32 = 3;
 
-/// Write-time ShEx validation of one dataset (`validation.json`, format 2).
+/// Write-time ShEx validation of one dataset (`validation.json`, format 3; format 2 is also read).
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct ShexValidationConfig {
-    #[serde(default = "two")]
+    #[serde(default = "current_format")]
     pub format: u32,
     /// `shex`
     pub language: GuardLanguage,
@@ -105,7 +105,7 @@ pub struct ShexValidationConfig {
     pub updated: Option<String>,
 }
 
-fn two() -> u32 {
+fn current_format() -> u32 {
     CONFIG_FORMAT
 }
 fn ten() -> f64 {
@@ -140,6 +140,10 @@ pub struct SchemaSource {
     pub source: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub sha256: Option<String>,
+    /// SHA-256 of the exact copied bytes, after imports and syntax conversion;
+    /// required for copied schemas stored in configuration format 3
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub copy_sha256: Option<String>,
     /// schema text given when setting the configuration (not stored in the file)
     #[serde(default, skip_serializing)]
     pub inline: Option<String>,
@@ -160,9 +164,9 @@ pub enum MapSource {
 impl ShexValidationConfig {
     /// Check the fields (not the schema or the shape map).
     pub fn check(&self) -> Result<()> {
-        if self.format != CONFIG_FORMAT {
+        if !(2..=CONFIG_FORMAT).contains(&self.format) {
             bail!(
-                "a ShEx configuration is validation.json format {CONFIG_FORMAT}, not {}",
+                "a ShEx configuration is validation.json format 2 or {CONFIG_FORMAT}, not {}",
                 self.format
             );
         }
@@ -1487,6 +1491,16 @@ fn load_copy(cfg: &ShexValidationConfig, root: &Path) -> Result<Loaded> {
     };
     let text =
         std::fs::read_to_string(root.join(file)).with_context(|| format!("reading {file}"))?;
+    match cfg.schema.copy_sha256.as_deref() {
+        Some(expected) if sha256_hex(text.as_bytes()) != expected => bail!(
+            "schema.copySha256 does not match {file}; restore the configured copy or set the schema again"
+        ),
+        None if cfg.format >= 3 => bail!(
+            "schema.copySha256 is required for a copied schema in validation.json format {}",
+            cfg.format
+        ),
+        _ => {}
+    }
     load(
         text,
         Some(format),
@@ -1549,6 +1563,9 @@ pub fn install(store: &Store) -> Result<Option<Arc<ShexGuard>>> {
     let Some(root) = store.root() else {
         return Ok(None);
     };
+    // Keep settings changes and the validated head stable until the guard and its
+    // baseline are installed.
+    let txn = store.write_as(CommitKind::Transaction);
     let Some((cfg, hash)) = read_config_hashed(root)? else {
         return Ok(None);
     };
@@ -1556,8 +1573,10 @@ pub fn install(store: &Store) -> Result<Option<Arc<ShexGuard>>> {
         store.set_guard_required(false);
         return Ok(None);
     }
+    let snap = Arc::new(txn.view());
+    let legacy_copy = cfg.schema.graphs.is_none() && cfg.schema.copy_sha256.is_none();
     let loaded = match &cfg.schema.graphs {
-        Some(_) => load_graphs(&cfg, &store.snapshot())?,
+        Some(_) => load_graphs(&cfg, &snap)?,
         None => load_copy(&cfg, root)?,
     };
     let map = parse_map(&cfg.shape_map, &loaded.compiled)?;
@@ -1568,10 +1587,28 @@ pub fn install(store: &Store) -> Result<Option<Arc<ShexGuard>>> {
         Some((root.to_path_buf(), hash.clone())),
     ));
     // the state of the head, when the status file records it for this configuration
-    let snap = store.snapshot();
-    let head_commit = store.head_commit();
-    let head = head_commit.seq;
-    if let Some(b) = StatusFile::read(root, head, &hash) {
+    // The transaction already owns the writer. Read metadata for its exact
+    // committed view without reentering Store::head_commit's writer lock.
+    let head = snap.commit;
+    let head_commit = store
+        .commit(head)
+        .context("cannot install ShEx validation: current commit metadata is unavailable")?;
+    if legacy_copy {
+        // Format 2 has only the original source's informational hash, which may
+        // legitimately differ from a converted or import-closed copy. Establish the
+        // current copy's state without trusting either persisted baseline or typing.
+        let model = g.model();
+        let (summary, typing) = g.validate_state(&model, &snap, None, &WriteOptions::default())?;
+        *g.exact.lock() = Some(Exact {
+            commit: head,
+            nonconformant: summary.blocking,
+            total: summary.total,
+        });
+        *g.baseline.lock() = Some(baseline_of(&summary, head));
+        if model.keeps_typing() {
+            *g.typing.lock() = Some(HeadTyping::new(head, snap.generation.uid, typing));
+        }
+    } else if let Some(b) = StatusFile::read(root, head, &hash) {
         *g.exact.lock() = Some(Exact {
             commit: head,
             nonconformant: b.blocking,
@@ -1584,6 +1621,7 @@ pub fn install(store: &Store) -> Result<Option<Arc<ShexGuard>>> {
     }
     store.set_guard(Some(g.clone()));
     store.set_guard_required(true);
+    drop(txn);
     Ok(Some(g))
 }
 
@@ -1647,7 +1685,10 @@ pub fn set_config(
     // the configuration as written
     cfg.format = CONFIG_FORMAT;
     cfg.updated = Some(sparkles_core::guard::config::now_rfc3339());
-    if !in_graphs {
+    if in_graphs {
+        cfg.schema.copy_sha256 = None;
+    } else {
+        cfg.schema.copy_sha256 = Some(sha256_hex(loaded.text.as_bytes()));
         cfg.schema.file = Some(loaded.file.to_string());
         cfg.schema.format = Some(loaded.format.to_string());
         cfg.schema.prefixes = loaded.prefixes.iter().cloned().collect();

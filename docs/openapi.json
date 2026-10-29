@@ -19789,7 +19789,7 @@
             ]
           },
           "format": {
-            "description": "2 when stored.",
+            "description": "2 for stored SHACL configurations and 3 for stored ShEx configurations. ShEx format 2 is also read.",
             "type": "integer"
           },
           "includeInferences": {
@@ -19815,7 +19815,7 @@
           },
           "schema": {
             "additionalProperties": true,
-            "description": "ShEx: `{inline, format?, base?, source?}` or `{graphs, prefixes?, base?}`, stored with `file`, `format` and `sha256`.",
+            "description": "ShEx: `{inline, format?, base?, source?}` or `{graphs, prefixes?, base?}`. Copied schemas store `file`, `format`, original-source `sha256` and verified-copy `copySha256`.",
             "type": "object"
           },
           "shapeMap": {

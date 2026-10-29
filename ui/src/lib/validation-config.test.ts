@@ -19,7 +19,13 @@ describe('editable guard configuration', () => {
   it('retains installed sources and advanced settings', () => {
     const v = validation('shex', {
       mode: 'reject',
-      schema: { file: 'validation-schema.shexj', format: 'shexj', prefixes: { ex: 'urn:ex:' } },
+      schema: {
+        file: 'validation-schema.shexj',
+        format: 'shexj',
+        sha256: 'original-source',
+        copySha256: 'stored-copy',
+        prefixes: { ex: 'urn:ex:' },
+      },
       shapeMap: [{ node: 'urn:n', shape: 'urn:S' }],
       dataGraph: ['urn:g'],
       includeInferences: true,

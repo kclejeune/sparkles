@@ -3044,6 +3044,7 @@ export type ValidationSource = {
   format?: string;
   source?: string;
   sha256?: string;
+  copySha256?: string;
   base?: string;
   prefixes?: Record<string, string>;
 };

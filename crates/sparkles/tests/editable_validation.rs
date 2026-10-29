@@ -76,6 +76,39 @@ fn memory_shex_json_source_retains_shape_map_prefixes() {
 }
 
 #[test]
+fn memory_shex_backup_copy_keeps_its_digest_after_conversion() {
+    let ds = Dataset::memory();
+    let turtle = sparkles_shex::Schema::parse_shexc("<urn:S> {}", None)
+        .unwrap()
+        .to_shexr_turtle();
+    let config = json!({"language":"shex", "mode":"reject", "schema":{"inline":turtle, "format":"shexr"}, "shapeMap":"<urn:n>@<urn:S>"});
+    ds.validation()
+        .guard()
+        .set_shex(
+            serde_json::from_value(config).unwrap(),
+            &sparkles_shex::NoImports,
+        )
+        .unwrap();
+    let files = ds.validation().guard().get().unwrap().memory_files();
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().join("restored");
+    std::fs::create_dir(&root).unwrap();
+    for (file, bytes) in files {
+        std::fs::write(root.join(file), bytes).unwrap();
+    }
+    let config: Value =
+        serde_json::from_slice(&std::fs::read(root.join("validation.json")).unwrap()).unwrap();
+    assert_eq!(config["format"], 3);
+    assert_ne!(config["schema"]["sha256"], config["schema"]["copySha256"]);
+    let restored = Dataset::open(&root).unwrap();
+    assert!(restored.validation().guard().get().is_some());
+    assert_eq!(
+        restored.validation().guard().get().unwrap().json()["config"]["schema"]["copySha256"],
+        config["schema"]["copySha256"]
+    );
+}
+
+#[test]
 fn memory_compact_shacl_backup_source_is_reusable_turtle() {
     let ds = Dataset::memory();
     let cfg = json!({"mode":"reject", "shapes":{"inline":"PREFIX ex: <urn:ex:> shape ex:S -> ex:Person { ex:name [1..1] . }", "format":"text/shaclc"}});

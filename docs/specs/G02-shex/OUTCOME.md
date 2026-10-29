@@ -40,9 +40,10 @@ third-party crates were added.
 * **Told blank nodes.** The store does not keep blank-node labels. The harness therefore
   skips the `LexicalBNode` validation tests, counting them, and lists one more test in
   `known-failures.txt`.
-* **`validation.json` is always written as format 2**, with `"language"`, for SHACL
-  configurations too. Format 1 files are still read. The maintainer decided this because
-  the file is internal to Sparkles and only older Sparkles binaries are affected.
+* This delivery wrote `validation.json` format 2 with `"language"` for both languages
+  and retained format 1 reads for SHACL. ShEx subsequently moved to format 3 for
+  [verified schema copies](../C10-write-time-validation.md#known-gap-schema-copy-digest-2026-10-16),
+  retaining format 2 reads through full validation at installation. SHACL keeps format 2.
 * Node-constraint annotations and semantic actions stay rejected, because ShExJ 2.1 has
   no slot for them. An exhausted outbound budget while fetching imports answers `507`,
   not `400`. Imports are capped at 64 schemas and 16 MiB per validation by default.

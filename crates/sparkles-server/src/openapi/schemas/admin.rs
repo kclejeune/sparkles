@@ -926,11 +926,11 @@ fn validation(put: &mut dyn FnMut(&str, J)) {
             obj(
                 &["mode"],
                 json!({
-                    "format": { "type": "integer", "description": "2 when stored." },
+                    "format": { "type": "integer", "description": "2 for stored SHACL configurations and 3 for stored ShEx configurations. ShEx format 2 is also read." },
                     "language": string_enum(&["shacl", "shex"]),
                     "mode": string_enum(&["reject", "warn", "off"]),
                     "shapes": { "type": "object", "additionalProperties": true, "description": "SHACL: `{graphs?, inline?, format?}`, stored with `file` and `sha256`." },
-                    "schema": { "type": "object", "additionalProperties": true, "description": "ShEx: `{inline, format?, base?, source?}` or `{graphs, prefixes?, base?}`, stored with `file`, `format` and `sha256`." },
+                    "schema": { "type": "object", "additionalProperties": true, "description": "ShEx: `{inline, format?, base?, source?}` or `{graphs, prefixes?, base?}`. Copied schemas store `file`, `format`, original-source `sha256` and verified-copy `copySha256`." },
                     "shapeMap": { "oneOf": [string(), array(obj(&["node", "shape"], json!({ "node": string(), "shape": string() })))] },
                     "dataGraph": { "oneOf": [string_enum(&["default", "union"]), strings()] },
                     "includeInferences": boolean(),

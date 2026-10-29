@@ -84,6 +84,50 @@ fn stored_config(root: &Path) -> serde_json::Value {
 }
 
 #[test]
+fn install_uses_held_writer_head_metadata() {
+    const CHILD_ROOT: &str = "SPARKLES_SHEX_INSTALL_WRITER_CHILD_ROOT";
+    if let Some(root) = std::env::var_os(CHILD_ROOT) {
+        let root = PathBuf::from(root).join("db");
+        let store = loaded(&root);
+        installed(set_config(&store, Some(cfg("warn", SCHEMA, MAP)), &NoImports).unwrap());
+        let expected_head = store.head_commit().seq;
+        drop(store);
+        let reopened = open(&root);
+        let guard = install(&reopened).unwrap().unwrap();
+        assert_eq!(guard.config().mode, GuardMode::Warn);
+        assert_eq!(guard.status().baseline.unwrap().commit, expected_head);
+        assert_eq!(reopened.head_commit().seq, expected_head);
+        return;
+    }
+
+    // A broken install must fail this control promptly rather than hang the
+    // whole suite. The parent owns cleanup even when it must kill its child.
+    let directory = tempfile::tempdir().unwrap();
+    let mut child = std::process::Command::new(std::env::current_exe().unwrap())
+        .args([
+            "--exact",
+            "guard::tests::install_uses_held_writer_head_metadata",
+            "--test-threads=1",
+        ])
+        .env(CHILD_ROOT, directory.path())
+        .spawn()
+        .unwrap();
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        if let Some(status) = child.try_wait().unwrap() {
+            assert!(status.success(), "ShEx install child failed: {status}");
+            return;
+        }
+        if Instant::now() >= deadline {
+            let _ = child.kill();
+            child.wait().unwrap();
+            panic!("ShEx install timed out while the transaction held its writer");
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    }
+}
+
+#[test]
 fn configuration_fields() {
     let c = config(serde_json::json!({
         "format": 2, "language": "shex", "mode": "reject",
@@ -105,7 +149,7 @@ fn configuration_fields() {
         "shapeMap": [{"node": "<http://ex.org/a>", "shape": "<http://ex.org/S>"}],
     }))
     .unwrap();
-    assert_eq!(c.format, 2);
+    assert_eq!(c.format, CONFIG_FORMAT);
     assert!(matches!(c.shape_map, MapSource::Json(_)));
     // the inline schema is not written back
     assert!(
@@ -203,11 +247,12 @@ fn reject_mode_over_the_acceptance_example() {
     let j = stored_config(&root);
     assert_eq!(
         (j["format"].as_u64(), j["language"].as_str()),
-        (Some(2), Some("shex"))
+        (Some(u64::from(CONFIG_FORMAT)), Some("shex"))
     );
     assert_eq!(j["schema"]["file"], SHEX_SCHEMA_SHEXC_FILE);
     assert_eq!(j["schema"]["format"], "shexc");
     assert_eq!(j["schema"]["sha256"], sha256_hex(SCHEMA.as_bytes()));
+    assert_eq!(j["schema"]["copySha256"], sha256_hex(SCHEMA.as_bytes()));
     assert!(j["schema"].get("inline").is_none() && j.get("updated").is_some());
     let st = g.status();
     assert_eq!((st.shape_count, st.associations), (2, Some(3)));
@@ -365,6 +410,8 @@ fn imports_are_resolved_once_and_the_copy_reinstalls() {
     assert_eq!(j["schema"]["sha256"], sha256_hex(schema.as_bytes()));
     let copy = std::fs::read_to_string(root.join(SHEX_SCHEMA_SHEXJ_FILE)).unwrap();
     assert!(copy.contains("http://ex.org/Named") && !copy.contains("imports"));
+    assert_eq!(j["schema"]["copySha256"], sha256_hex(copy.as_bytes()));
+    assert_ne!(j["schema"]["copySha256"], j["schema"]["sha256"]);
     drop(s);
 
     let s = open(&root);
@@ -407,6 +454,20 @@ fn imports_are_resolved_once_and_the_copy_reinstalls() {
     assert!(exists(&copy, SHEX_SCHEMA_SHEXJ_FILE));
     let c = open(&copy);
     assert_eq!(install(&c).unwrap().unwrap().config().mode, GuardMode::Warn);
+    drop(c);
+    // Older imported-schema configurations keep the original source hash too.
+    let mut legacy = stored_config(&copy);
+    legacy["format"] = 2.into();
+    legacy["schema"]
+        .as_object_mut()
+        .unwrap()
+        .remove("copySha256");
+    std::fs::write(copy.join(CONFIG_FILE), serde_json::to_vec(&legacy).unwrap()).unwrap();
+    let c = open(&copy);
+    let guard = install(&c).unwrap().unwrap();
+    assert!(guard.status().last_full_millis.is_some());
+    assert_eq!(guard.status().baseline.unwrap().blocking, 0);
+    assert_eq!(guard.config().schema.prefixes["ex"], "http://ex.org/");
 }
 
 #[test]
@@ -429,6 +490,10 @@ fn shexj_schemas_are_copied_verbatim() {
     );
     assert_eq!(g.config().schema.format.as_deref(), Some("shexj"));
     assert!(g.config().schema.prefixes.is_empty());
+    assert_eq!(
+        g.config().schema.copy_sha256.as_deref(),
+        Some(sha256_hex(shexj.as_bytes()).as_str())
+    );
     drop(s);
     let s = open(&root);
     install(&s).unwrap().unwrap();
@@ -718,6 +783,8 @@ fn shexr_schemas_are_copied_as_shexj() {
     assert_eq!(g.status().shape_count, 2);
     // the copy is the schema
     let copy = std::fs::read_to_string(root.join(SHEX_SCHEMA_SHEXJ_FILE)).unwrap();
+    assert_eq!(j["schema"]["copySha256"], sha256_hex(copy.as_bytes()));
+    assert_ne!(j["schema"]["copySha256"], j["schema"]["sha256"]);
     let from_c = crate::Schema::parse_shexc(SCHEMA, None).unwrap();
     assert_eq!(
         crate::Schema::from_shexj(&copy).unwrap().to_shexj(),
@@ -744,6 +811,20 @@ fn shexr_schemas_are_copied_as_shexj() {
     let e = set_config(&s, Some(c), &NoImports).err().unwrap();
     assert!(format!("{e:#}").contains("sx:Schema"), "{e:#}");
     assert_eq!(stored_config(&root)["schema"]["format"], "shexj");
+    drop(s);
+    // Legacy ShExR copies must not compare their ShExJ bytes with the Turtle hash.
+    let mut legacy = stored_config(&root);
+    legacy["format"] = 2.into();
+    legacy["schema"]
+        .as_object_mut()
+        .unwrap()
+        .remove("copySha256");
+    std::fs::write(root.join(CONFIG_FILE), serde_json::to_vec(&legacy).unwrap()).unwrap();
+    let s = open(&root);
+    let guard = install(&s).unwrap().unwrap();
+    assert!(guard.status().last_full_millis.is_some());
+    assert_eq!(guard.status().baseline.unwrap().blocking, 0);
+    assert_eq!(guard.config().schema.prefixes["ex"], "http://ex.org/");
 }
 
 /// SPARQL selectors, which every validated write would run, are refused when the
@@ -1078,6 +1159,10 @@ fn the_typing_survives_a_restart() {
     let s = open(&root);
     let g = install(&s).unwrap().unwrap();
     assert_eq!(typing_commit(&g), Some(head));
+    assert!(
+        g.status().last_full_millis.is_none(),
+        "a verified current copy keeps its cached state"
+    );
     assert!(exists(&root, TYPING_FILE), "reading leaves the file");
     // a write after the restart is judged as in a store that never closed
     let v = summary(
@@ -1432,44 +1517,252 @@ fn unusable_schema_graphs_are_refused() {
     assert!(format!("{e:#}").contains("shapeMap"), "{e:#}");
 }
 
-/// An edit of the schema copy that keeps the pair numbering (a datatype
-/// changes) must not let the typing of the old schema be restored.
+/// A changed copy is refused before its old baseline or typing can be installed.
 #[test]
-fn typing_of_another_schema_is_not_restored() {
-    use sparkles_core::guard::config::SHEX_SCHEMA_SHEXC_FILE;
-    let n = 20;
+fn changed_schema_copy_refuses_install_and_keeps_writes_closed() {
     let dir = tempfile::tempdir().unwrap();
     let root = dir.path().join("db");
-    let s = open(&root);
-    s.load(&[Source::from_bytes(
-        ring(n).into_bytes(),
-        RdfFormat::Turtle,
-        None,
-    )])
-    .unwrap();
-    let (g, _) = installed(set_config(&s, Some(cfg("reject", SCHEMA, MAP)), &NoImports).unwrap());
-    upd(&s, "INSERT DATA { ex:p0 foaf:knows ex:p7 }").unwrap();
+    let s = loaded(&root);
+    let (g, _) = installed(set_config(&s, Some(cfg("warn", SCHEMA, MAP)), &NoImports).unwrap());
     drop(g);
     drop(s);
-    assert!(exists(&root, TYPING_FILE));
-    // the copy now asks for boolean names: no person conforms any more
-    let copy = root.join(SHEX_SCHEMA_SHEXC_FILE);
-    let text = std::fs::read_to_string(&copy).unwrap();
-    assert!(text.contains("xsd:string"), "{text}");
-    std::fs::write(&copy, text.replace("xsd:string", "xsd:boolean")).unwrap();
+    assert!(exists(&root, STATUS_FILE) && exists(&root, TYPING_FILE));
+    let config = std::fs::read(root.join(CONFIG_FILE)).unwrap();
+    let status = std::fs::read(root.join(STATUS_FILE)).unwrap();
+    let typing = std::fs::read(root.join(TYPING_FILE)).unwrap();
+    std::fs::write(
+        root.join(SHEX_SCHEMA_SHEXC_FILE),
+        SCHEMA.replace("xsd:string", "xsd:boolean"),
+    )
+    .unwrap();
     let s = open(&root);
-    let g = install(&s).unwrap().unwrap();
-    assert_eq!(
-        typing_commit(&g),
-        None,
-        "the typing of the old schema was restored for the new one"
+    let error = install(&s)
+        .err()
+        .expect("a changed copy must refuse installation");
+    assert!(
+        format!("{error:#}").contains("schema.copySha256"),
+        "{error:#}"
     );
-    // the first write validates in full against the new schema
-    let r = upd(
-        &s,
-        "INSERT DATA { ex:new a ex:Person ; foaf:name true ; foaf:knows ex:p3 }",
-    );
-    assert!(matches!(r, Err(sparkles_core::Error::Rejected(_))), "{r:?}");
+    assert!(s.guard().is_none() && s.guard_required());
+    assert!(matches!(
+        upd(&s, "INSERT DATA { ex:x a ex:Person }"),
+        Err(Error::GuardMissing(_))
+    ));
+    assert_eq!(std::fs::read(root.join(CONFIG_FILE)).unwrap(), config);
+    assert_eq!(std::fs::read(root.join(STATUS_FILE)).unwrap(), status);
+    assert_eq!(std::fs::read(root.join(TYPING_FILE)).unwrap(), typing);
+}
+
+#[test]
+fn schema_copy_digest_is_required_and_cannot_be_bypassed_by_settings_edits() {
+    for expected in [None, Some("not a digest".to_string()), Some("0".repeat(64))] {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("db");
+        let s = loaded(&root);
+        let (g, _) = installed(set_config(&s, Some(cfg("warn", SCHEMA, MAP)), &NoImports).unwrap());
+        let mut config = g.config().clone();
+        config.schema.copy_sha256 = expected;
+        let before = std::fs::read(root.join(CONFIG_FILE)).unwrap();
+        let error = set_config(&s, Some(config.clone()), &NoImports)
+            .err()
+            .unwrap();
+        assert!(
+            format!("{error:#}").contains("schema.copySha256"),
+            "{error:#}"
+        );
+        assert_eq!(std::fs::read(root.join(CONFIG_FILE)).unwrap(), before);
+        assert!(Arc::ptr_eq(
+            &s.guard().unwrap(),
+            &(g.clone() as Arc<dyn CommitGuard>)
+        ));
+        // Reopening a malformed configuration is refused with no installed guard.
+        drop(g);
+        drop(s);
+        std::fs::write(root.join(CONFIG_FILE), serde_json::to_vec(&config).unwrap()).unwrap();
+        let s = open(&root);
+        assert!(install(&s).is_err());
+        assert!(s.guard().is_none() && s.guard_required());
+    }
+}
+
+#[test]
+fn inline_schema_replacement_recomputes_copy_digest_and_keeps_relative_base() {
+    for persistent in [false, true] {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("db");
+        let s = if persistent {
+            open(&root)
+        } else {
+            Store::in_memory(StoreOptions::default())
+        };
+        upd(&s, "INSERT DATA { ex:a ex:p \"value\" }").unwrap();
+        let schema = "PREFIX ex: <http://ex.org/> <S> { <p> . }";
+        let mut config = cfg("reject", schema, "ex:a@ex:S");
+        config.schema.base = Some("http://ex.org/".into());
+        config.schema.copy_sha256 = Some("the caller's old copy digest".into());
+        let (g, _) = installed(set_config(&s, Some(config), &NoImports).unwrap());
+        assert_eq!(
+            g.config().schema.copy_sha256.as_deref(),
+            Some(sha256_hex(schema.as_bytes()).as_str())
+        );
+        assert_eq!(g.config().schema.base.as_deref(), Some("http://ex.org/"));
+        if persistent {
+            drop(g);
+            drop(s);
+            let s = open(&root);
+            let g = install(&s).unwrap().unwrap();
+            assert_eq!(g.config().schema.base.as_deref(), Some("http://ex.org/"));
+            assert!(matches!(
+                upd(&s, "DELETE DATA { ex:a ex:p \"value\" }"),
+                Err(Error::Rejected(_))
+            ));
+        } else {
+            let (_, copy) = g.schema_copy().unwrap();
+            assert_eq!(
+                g.config().schema.copy_sha256.as_deref(),
+                Some(sha256_hex(copy.as_bytes()).as_str())
+            );
+        }
+    }
+}
+
+/// Legacy parse errors and an exhausted validation budget fail closed without
+/// changing the saved configuration, status or typing.
+#[test]
+fn legacy_schema_copy_install_errors_preserve_saved_files() {
+    for malformed in [false, true] {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("db");
+        let s = loaded(&root);
+        let (g, _) = installed(set_config(&s, Some(cfg("warn", SCHEMA, MAP)), &NoImports).unwrap());
+        drop(g);
+        drop(s);
+        let mut config = stored_config(&root);
+        config["format"] = 2.into();
+        config["schema"]
+            .as_object_mut()
+            .unwrap()
+            .remove("copySha256");
+        if malformed {
+            std::fs::write(root.join(SHEX_SCHEMA_SHEXC_FILE), "not a schema").unwrap();
+        } else {
+            config["timeoutSeconds"] = 1e-300.into();
+        }
+        std::fs::write(root.join(CONFIG_FILE), serde_json::to_vec(&config).unwrap()).unwrap();
+        let files = [
+            CONFIG_FILE,
+            STATUS_FILE,
+            TYPING_FILE,
+            SHEX_SCHEMA_SHEXC_FILE,
+        ];
+        let before: Vec<_> = files
+            .iter()
+            .map(|file| std::fs::read(root.join(file)).unwrap())
+            .collect();
+        let s = open(&root);
+        let error = install(&s).err().expect("legacy install must fail");
+        if !malformed {
+            assert!(
+                matches!(error.downcast_ref::<Error>(), Some(Error::Timeout)),
+                "{error:#}"
+            );
+        }
+        assert!(s.guard().is_none() && s.guard_required());
+        for (file, bytes) in files.iter().zip(before) {
+            assert_eq!(std::fs::read(root.join(file)).unwrap(), bytes, "{file}");
+        }
+    }
+}
+
+/// Legacy copies have no digest of their stored bytes. Even a status file whose
+/// configuration hash matches must not supply their baseline or cached typing.
+#[test]
+fn legacy_schema_copy_rebuilds_baseline_and_typing_before_install() {
+    let n = 20;
+    for (mode, policy) in [
+        ("warn", BaselinePolicy::Strict),
+        ("reject", BaselinePolicy::Strict),
+        ("reject", BaselinePolicy::Grandfather),
+    ] {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("db");
+        let s = open(&root);
+        s.load(&[Source::from_bytes(
+            ring(n).into_bytes(),
+            RdfFormat::Turtle,
+            None,
+        )])
+        .unwrap();
+        let mut config = cfg(mode, SCHEMA, MAP);
+        config.baseline = policy;
+        let (g, _) = installed(set_config(&s, Some(config), &NoImports).unwrap());
+        let old_baseline = g.status().baseline.unwrap();
+        assert_eq!(old_baseline.blocking, 0);
+        let head = s.head_commit().seq;
+        drop(g);
+        drop(s);
+        assert!(exists(&root, TYPING_FILE));
+        let mut config = stored_config(&root);
+        config["format"] = 2.into();
+        config["schema"]
+            .as_object_mut()
+            .unwrap()
+            .remove("copySha256");
+        let config = serde_json::to_vec_pretty(&config).unwrap();
+        std::fs::write(root.join(CONFIG_FILE), &config).unwrap();
+        StatusFile::of(&old_baseline, &sha256_hex(&config))
+            .write(&root)
+            .unwrap();
+        // Pair numbering is unchanged, but every string name now fails.
+        std::fs::write(
+            root.join(SHEX_SCHEMA_SHEXC_FILE),
+            SCHEMA.replace("xsd:string", "xsd:boolean"),
+        )
+        .unwrap();
+        let s = open(&root);
+        let g = install(&s).unwrap().unwrap();
+        let baseline = g.status().baseline.unwrap();
+        assert_eq!(
+            (baseline.commit, baseline.blocking, baseline.total),
+            (head, n, n)
+        );
+        assert_eq!(typing_commit(&g), Some(head));
+        assert!(g.status().last_full_millis.is_some());
+        let model = g.model();
+        assert_eq!(nonconformant(&verdicts(&g, &s.snapshot())).len() as u64, n);
+        assert!(
+            g.typing
+                .lock()
+                .as_ref()
+                .unwrap()
+                .values
+                .iter()
+                .any(|((_, pair), verdict)| {
+                    model.schema.ir().pairs[pair.index()].label.is_some() && !verdict.holds()
+                })
+        );
+        // An invalid existing association remains in strict mode, while grandfather
+        // mode and warn mode allow a write that introduces no new failure.
+        let result = upd(&s, "INSERT DATA { ex:p0 foaf:age 20 }");
+        if mode == "reject" && policy == BaselinePolicy::Strict {
+            assert!(matches!(result, Err(Error::Rejected(_))), "{result:?}");
+        } else {
+            assert_eq!(summary(&result.unwrap()).blocking, n);
+        }
+        assert_eq!(stored_config(&root)["format"], 2);
+        // Saving a legacy configuration fully validates and upgrades it, preserving
+        // source provenance even though the copy has changed.
+        let mut config = g.config().clone();
+        config.mode = GuardMode::Warn;
+        let (g, sum) = installed(set_config(&s, Some(config), &NoImports).unwrap());
+        assert_eq!(sum.blocking, n);
+        assert_eq!(g.config().format, CONFIG_FORMAT);
+        assert_eq!(
+            g.config().schema.sha256.as_deref(),
+            Some(sha256_hex(SCHEMA.as_bytes()).as_str())
+        );
+        assert_ne!(g.config().schema.copy_sha256, g.config().schema.sha256);
+    }
 }
 
 /// A typing file of a version this build does not read is discarded, and the typing is

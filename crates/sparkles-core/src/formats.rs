@@ -574,7 +574,7 @@ pub const SETTINGS: &[SettingsFile] = &[
     ds("queries.json", 1),
     ds("mappings.json", 1),
     ds("algo.json", 2),
-    ds("validation.json", 2),
+    ds("validation.json", 3),
     ds("validation-status.json", 1),
     ds("text.json", 1),
     named(ds("reasoning.json", 2), "reasoningFormat"),
@@ -749,6 +749,18 @@ fn registered(name: &str) -> &'static SettingsFile {
     }
 }
 
+fn settings_max_format(s: &SettingsFile, v: &serde_json::Value) -> u32 {
+    // Validation format 3 is specific to ShEx's verified schema copies. SHACL
+    // keeps its format 1/2 contract, including files without a language member.
+    if s.name == "validation.json"
+        && v.get("language").and_then(serde_json::Value::as_str) != Some("shex")
+    {
+        2
+    } else {
+        s.writes
+    }
+}
+
 /// The version of a settings file's JSON object, from its member: absent is 1. A
 /// version newer than this build writes is refused, since the file may mean something
 /// this build would misread.
@@ -763,10 +775,10 @@ pub fn check_settings(name: &str, v: &serde_json::Value) -> Result<u32> {
             .filter(|&f| f >= 1)
             .ok_or_else(|| Error::Corrupt(format!("{name}: {member} {f} is not a version")))?,
     };
-    if found > s.writes {
+    let max = settings_max_format(s, v);
+    if found > max {
         return Err(Error::Unsupported(format!(
-            "{name} has {member} {found}; Sparkles {SPARKLES_VERSION} reads {member} up to {}. It was written by a newer release",
-            s.writes
+            "{name} has {member} {found}; Sparkles {SPARKLES_VERSION} reads {member} up to {max}. It was written by a newer release"
         )));
     }
     Ok(found)
@@ -776,8 +788,9 @@ pub fn check_settings(name: &str, v: &serde_json::Value) -> Result<u32> {
 /// writes. A value that is not an object is left as it is.
 pub fn stamp_settings(name: &str, v: &mut serde_json::Value) {
     let s = registered(name);
+    let format = settings_max_format(s, v);
     if let Some(o) = v.as_object_mut() {
-        o.insert(s.member.into(), s.writes.into());
+        o.insert(s.member.into(), format.into());
     }
 }
 
@@ -798,13 +811,14 @@ pub fn settings_to_vec_at<T: Serialize + ?Sized>(
     format: u32,
 ) -> Result<Vec<u8>> {
     let s = registered(name);
-    if format < 1 || format > s.writes {
+    let mut v = serde_json::to_value(value).map_err(|e| Error::Invalid(format!("{name}: {e}")))?;
+    let max = settings_max_format(s, &v);
+    if format < 1 || format > max {
         return Err(Error::Invalid(format!(
-            "{name}: cannot write {} {format}; this build writes 1 to {}",
-            s.member, s.writes
+            "{name}: cannot write {} {format}; this build writes 1 to {max}",
+            s.member
         )));
     }
-    let mut v = serde_json::to_value(value).map_err(|e| Error::Invalid(format!("{name}: {e}")))?;
     if let Some(o) = v.as_object_mut() {
         o.insert(s.member.into(), format.into());
     }
@@ -925,6 +939,40 @@ mod tests {
         );
         assert_eq!(WAL.readable(), "0 and 1");
         assert_eq!(list(&[0, 1, 2]), "0, 1 and 2");
+    }
+
+    #[test]
+    fn validation_formats_are_language_specific() {
+        use serde_json::json;
+        assert_eq!(settings_file("validation.json").unwrap().writes, 3);
+        for language in [None, Some("shacl"), Some("shex")] {
+            let mut value = json!({});
+            if let Some(language) = language {
+                value["language"] = language.into();
+            }
+            stamp_settings("validation.json", &mut value);
+            assert_eq!(
+                value["format"],
+                if language == Some("shex") { 3 } else { 2 }
+            );
+            assert!(check_settings("validation.json", &value).is_ok());
+            assert_eq!(
+                settings_to_vec_at("validation.json", &value, 3).is_ok(),
+                language == Some("shex")
+            );
+            for format in [1, 2, 3, 4] {
+                let mut value = json!({"format": format});
+                if let Some(language) = language {
+                    value["language"] = language.into();
+                }
+                let accepted = format <= if language == Some("shex") { 3 } else { 2 };
+                let result = check_settings("validation.json", &value);
+                assert_eq!(result.is_ok(), accepted, "{value}: {result:?}");
+                if !accepted {
+                    assert!(matches!(result, Err(Error::Unsupported(_))));
+                }
+            }
+        }
     }
 
     #[test]

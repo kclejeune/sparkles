@@ -8130,8 +8130,8 @@ The design and its rationale are in [C10 Write-time SHACL validation](specs/C10-
 
 A dataset can validate every write against SHACL shapes or a ShEx schema before it
 commits. It uses one language at a time. The configuration lives in the database
-directory as `validation.json`, format 2. SHACL configurations from older Sparkles
-versions, format 1 without `language`, are still read:
+directory as `validation.json`. SHACL writes format 2 and also reads format 1 without
+`language`. ShEx writes format 3 and also reads format 2:
 
 ```json
 { "format": 2, "language": "shacl", "mode": "reject", "shapes": { "graphs": ["urn:x-shapes:main"] },
@@ -8152,18 +8152,28 @@ versions, format 1 without `language`, are still read:
 **ShEx.** A ShEx configuration names a schema and a query shape map instead of shapes:
 
 ```json
-{ "format": 2, "language": "shex", "mode": "reject",
-  "schema": { "file": "validation-schema.shex", "format": "shexc", "sha256": "…" },
+{ "format": 3, "language": "shex", "mode": "reject",
+  "schema": { "file": "validation-schema.shex", "format": "shexc", "sha256": "…", "copySha256": "…" },
   "shapeMap": "{FOCUS a ex:Person}@ex:Person, {FOCUS a ex:Org}@ex:Org",
   "dataGraph": "default", "includeInferences": false, "timeoutSeconds": 10, "reportLimit": 100 }
 ```
 
 | Field | Values | Meaning |
 |---|---|---|
-| `schema` | `PUT`: `{ "inline": "<schema>", "format"?: "shexc" \| "shexj" \| "shexr", "base"?: iri, "source"?: text }` | The schema text, and the base its relative IRIs resolve against. The text is ShExC, ShExJ, or ShExR in Turtle. Without `format` the language is sniffed, and text that starts with `{` is ShExJ. The schema is copied into the database. Without imports, it is stored verbatim as `validation-schema.shex` (ShExC) or `validation-schema.json` (ShExJ). With imports, the imports are resolved during the `PUT` and the merged schema is written as ShExJ to `validation-schema.json`. The schema's prefixes are then kept in `schema.prefixes` for the shape map. The stored configuration names the copy (`file`, `format`), keeps `base` and `source`, and records the SHA-256 of the text given. A later write never fetches anything. To change the other fields, a `PUT` may send the stored `schema` back, with its `file` and without `inline`. The schema may instead live in the dataset: `{ "graphs": [iri, …], "prefixes"?: { prefix: iri }, "base"?: iri }` names named graphs that hold it in ShExR. It is then read from the state each write leaves, nothing is copied, and the shape map may use the prefixes given here or full IRIs. Imports are not fetched for a schema in graphs. |
+| `schema` | `PUT`: `{ "inline": "<schema>", "format"?: "shexc" \| "shexj" \| "shexr", "base"?: iri, "source"?: text }` | The schema text, and the base its relative IRIs resolve against. The text is ShExC, ShExJ, or ShExR in Turtle. Without `format` the language is sniffed, and text that starts with `{` is ShExJ. The schema is copied into the database. Without imports, it is stored verbatim as `validation-schema.shex` (ShExC) or `validation-schema.json` (ShExJ). With imports, the imports are resolved during the `PUT` and the merged schema is written as ShExJ to `validation-schema.json`. The schema's prefixes are then kept in `schema.prefixes` for the shape map. The stored configuration names the copy (`file`, `format`), keeps `base` and `source`, and records the original text's SHA-256 in `sha256` and the stored copy's SHA-256 in `copySha256`. A later write never fetches anything. To change the other fields, a `PUT` may send the stored `schema` back, with its `file` and without `inline`. The schema may instead live in the dataset: `{ "graphs": [iri, …], "prefixes"?: { prefix: iri }, "base"?: iri }` names named graphs that hold it in ShExR. It is then read from the state each write leaves, nothing is copied, and the shape map may use the prefixes given here or full IRIs. Imports are not fetched for a schema in graphs. |
 | `shapeMap` | compact string, or the JSON form `[{ "node", "shape" }]` | A query map. It is expanded again on every validated state, so new focus nodes are picked up. Prefixed names use the schema's prefixes unless the map has its own `PREFIX`es. |
 | `threshold` | — | Not accepted. Every nonconformant association blocks. |
 | `baseline` | `strict`, `grandfather` | As for SHACL. In grandfather mode a write is blocked only by the nonconformant associations it introduces. When a write changes a schema graph, the state before it is judged under the old schema, so its associations are compared with those the old schema gave. |
+
+A copied schema's `copySha256` is checked before the guard is installed or a stored
+source is reused in a settings change. A mismatch or a missing digest in format 3 is an
+error and leaves writes requiring a guard refused. Restore the configured copy or set
+the schema again to replace it. The original-source `sha256` remains informational
+because imported schemas and ShExR sources can have different stored bytes. Format 2
+copies without `copySha256` receive a full validation of the head during installation,
+within `timeoutSeconds`, without trusting persisted baseline counts or typing. Saving
+the configuration again writes format 3. Installation does not rewrite a legacy file.
+Older releases that read only format 2 refuse format 3 databases.
 
 A schema in graphs works as SHACL shapes graphs do. The schema graphs are never part of
 the data graph, and a `dataGraph` list that names one is a `400`. A write that changes a

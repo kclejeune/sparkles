@@ -1348,15 +1348,34 @@ browser and real-server browser tests cover source retention, configuration conf
 memory datasets and rejected writes that leave the data unchanged. Rust regressions
 cover editable memory sources, ShExJ prefix preservation and SHACLC backup conversion.
 
-### Known gap, schema copy digest (2026-10-16)
+<a id="known-gap-schema-copy-digest-2026-10-16"></a>
 
-`validation.json` records the SHA-256 of the ShEx schema copy as `schema.sha256`, but the
-guard does not compare it with the copy when it loads. `load_copy` in `guard.rs` ignores
-the digest. A copy edited outside Sparkles is therefore compiled and used, and the
-stored baseline counts are trusted for it until the next full validation. The persisted
-typing does not depend on this, because its fingerprint covers the digest of the copy
-itself. Roadmap item 83 will check the digest at install and refuse the guard or validate in
-full on a mismatch.
+### Schema copy digest verification
+
+Item 83 closes the schema-copy integrity gap. ShEx writes `validation.json` format 3
+with `schema.copySha256`, which hashes the exact stored bytes after import closure and
+ShExR conversion. `schema.sha256` keeps its existing meaning as the hash of the original
+submitted source, which can legitimately differ from the copy. SHACL keeps format 2.
+The shared settings preflight accepts format 3 only for ShEx, and older readers refuse
+that version before opening the database.
+
+Loading a copied schema checks its copy digest before parsing or trusting baseline
+counts or persisted typing. A mismatched digest, or a missing digest in format 3,
+refuses installation and leaves the store requiring a guard. Reusing the stored source
+in a settings change performs the same check. Inline replacements recompute their copy
+digest from the resolved stored representation. Schema graphs have no copy digest.
+
+A format 2 copy without a copy digest receives a full validation of the stable head
+under the writer lock at installation. Its runtime baseline and typing come from that
+validation, without reading the old cached state. This preserves warn, strict reject
+and grandfather behavior, including existing violations. Parse and timeout failures
+leave the guard uninstalled and the saved files unchanged. Installation leaves legacy
+configuration files unchanged, and saving their settings upgrades them to format 3.
+
+Regressions cover changed copies with saved baseline and typing files, missing and
+malformed digests, failed source reuse that retains the installed guard, legacy cached
+state and validation failures, original-source provenance for converted and imported
+schemas, relative base IRIs, prefix preservation, memory copies, clones and reopen.
 
 ### Roadmap follow-ups (2026-10-12)
 
