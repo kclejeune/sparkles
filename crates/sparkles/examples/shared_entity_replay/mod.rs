@@ -1,7 +1,9 @@
 //! Private bounded A01 offline replay; supplied declarations convey no authority.
 #[allow(dead_code)]
 mod evolution;
+#[cfg_attr(not(test), allow(dead_code))]
 mod model;
+#[cfg_attr(not(test), allow(dead_code))]
 mod output;
 mod resolution;
 
@@ -10,7 +12,9 @@ pub(crate) use output::encode_comparison;
 #[cfg(test)]
 pub(crate) use output::encode_scalar;
 
-pub(crate) use resolution::{resolve, resolve_in_scope};
+#[cfg(test)]
+pub(crate) use resolution::resolve;
+pub(crate) use resolution::resolve_in_scope;
 
 #[cfg(test)]
 pub(crate) use evolution::*;
@@ -97,7 +101,7 @@ pub(crate) fn run_cli(args: &[String]) -> Result<Vec<u8>, Failure> {
             if decoded > limits.decoded {
                 return Err(Failure::ReplayLimit);
             }
-            charges.push(operation.charge(n * 2 + 64)?);
+            charges.push(operation.charge(n * 3 + 64)?);
             bytes.extend_from_slice(&block[..n]);
         }
         backing.push((bytes, format));

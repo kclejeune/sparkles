@@ -150,6 +150,7 @@ pub(crate) struct Operation<'a> {
     pub control: &'a sparkles::task::Control,
     pub limits: Limits,
     used: std::rc::Rc<std::cell::Cell<usize>>,
+    decoded: std::cell::Cell<usize>,
 }
 pub(crate) struct Charge {
     used: std::rc::Rc<std::cell::Cell<usize>>,
@@ -178,6 +179,7 @@ impl<'a> Operation<'a> {
             control,
             limits,
             used: Default::default(),
+            decoded: Default::default(),
         };
         result.check()?;
         Ok(result)
@@ -200,6 +202,19 @@ impl<'a> Operation<'a> {
             used: self.used.clone(),
             bytes,
         })
+    }
+    fn consume_decoded(&self, bytes: usize) -> ReplayResult<()> {
+        self.check()?;
+        let next = self
+            .decoded
+            .get()
+            .checked_add(bytes)
+            .ok_or(Failure::ReplayLimit)?;
+        if next > self.limits.decoded {
+            return Err(Failure::ReplayLimit);
+        }
+        self.decoded.set(next);
+        Ok(())
     }
     pub fn used(&self) -> usize {
         self.used.get()
@@ -236,13 +251,12 @@ impl Graph {
         let total = documents.iter().try_fold(0usize, |sum, (bytes, _)| {
             sum.checked_add(bytes.len()).ok_or(Failure::ReplayLimit)
         })?;
-        if total > operation.limits.decoded {
-            return Err(Failure::ReplayLimit);
-        }
+        operation.consume_decoded(total)?;
         let mut result = Self::default();
         result
             .charges
             .push(operation.charge(total.checked_add(256).ok_or(Failure::ReplayLimit)?)?);
+        let mut category_counts = [0usize; 5];
         for (bytes, format) in documents {
             operation.check()?;
             // Charge parser/transient owned terms before the parser can allocate.
@@ -269,6 +283,39 @@ impl Graph {
                     return Err(Failure::InvalidDomainRecord);
                 }
                 let predicate = quad.predicate.as_str();
+                if predicate == RDF_TYPE
+                    && let oxrdf::Term::NamedNode(kind) = &quad.object
+                {
+                    let category = match kind.as_str() {
+                        "urn:x-sparkles:representation:Entity" => {
+                            Some((0, operation.limits.entities))
+                        }
+                        "urn:x-sparkles:representation:Description" => {
+                            Some((1, operation.limits.descriptions))
+                        }
+                        "urn:x-sparkles:evidence:Claim" => Some((2, operation.limits.claims)),
+                        "urn:x-sparkles:evidence:ReviewDecision" => {
+                            Some((3, operation.limits.decisions))
+                        }
+                        "urn:x-sparkles:representation:Relation" => {
+                            Some((4, operation.limits.relations))
+                        }
+                        _ => None,
+                    };
+                    if let Some((index, cap)) = category
+                        && !result.records.get(subject).is_some_and(|record| {
+                            record
+                                .iter()
+                                .any(|s| s.predicate == RDF_TYPE && s.object == quad.object)
+                        })
+                    {
+                        category_counts[index] += 1;
+                        if category_counts[index] > cap {
+                            return Err(Failure::ReplayLimit);
+                        }
+                    }
+                }
+
                 let estimate = subject
                     .len()
                     .checked_add(graph.len())
@@ -597,6 +644,9 @@ impl Graph {
                 }
             }
             "Description" => {
+                self.require_references(id, "sourceRevision", EV, "SourceRevision", operation)?;
+                self.require_references(id, "selection", EV, "EvidenceRef", operation)?;
+                self.require_references(id, "describes", SR, "Entity", operation)?;
                 required.extend(["domainScope", "sourceRevision", "selection"]);
                 optional.push("describes");
                 let selection = self.one_iri(id, &format!("{SR}selection"))?;
@@ -612,15 +662,30 @@ impl Graph {
                 self.literal_typed(id, "lexicalValue", "string", true)?;
             }
             "Identification" => {
+                self.require_references(id, "identifier", SR, "Identifier", operation)?;
+                self.require_references(id, "entity", SR, "Entity", operation)?;
+                self.require_references(id, "claim", EV, "Claim", operation)?;
                 required.extend(["domainScope", "identifier", "entity"]);
                 sets.push("claim");
             }
             "Relation" => {
+                self.require_references(id, "object", SR, "Entity", operation)?;
+                self.require_references(id, "claim", EV, "Claim", operation)?;
+                self.require_references(id, "roleAssignment", SR, "RoleAssignment", operation)?;
+                let subject = self.one_iri(id, &format!("{SR}subject"))?;
+                if !self.has_type(&subject, &format!("{SR}Entity"))
+                    && !self.has_type(&subject, &format!("{SR}Description"))
+                {
+                    return Err(Failure::UnresolvedReference);
+                }
                 required.extend(["domainScope", "subject", "object", "relationKind"]);
                 sets.extend(["claim", "roleAssignment"]);
                 self.validate_relation(id)?;
             }
-            "RoleAssignment" => required.extend(["participant", "role"]),
+            "RoleAssignment" => {
+                self.require_references(id, "participant", SR, "Entity", operation)?;
+                required.extend(["participant", "role"]);
+            }
             "ResolutionView" | "Projection" => {
                 required.extend([
                     "domainScope",
@@ -961,7 +1026,7 @@ impl RetainedSources {
             // Reserve conservative Vec growth before retaining input bytes.
             charges.push(
                 operation.charge(
-                    n.checked_mul(2)
+                    n.checked_mul(3)
                         .and_then(|v| v.checked_add(64))
                         .ok_or(Failure::ReplayLimit)?,
                 )?,
@@ -990,13 +1055,37 @@ impl RetainedSources {
         manifest: &str,
         operation: &Operation<'_>,
     ) -> ReplayResult<()> {
+        let _verification = operation.charge(
+            graph
+                .workspace_bytes()?
+                .checked_mul(2)
+                .ok_or(Failure::ReplayLimit)?,
+        )?;
         graph.verify_manifest(manifest, operation)?;
-        for id in graph.iris(manifest, &format!("{SR}inputId"))? {
+        let ids: std::collections::BTreeSet<_> = graph
+            .iris(manifest, &format!("{SR}inputId"))?
+            .into_iter()
+            .collect();
+        let mut references = std::collections::BTreeSet::new();
+        for id in &ids {
             operation.check()?;
-            if graph.has_type(&id, &format!("{EV}SourceRevision")) && !self.bytes.contains_key(&id)
-            {
+            if graph.has_type(id, &format!("{EV}SourceRevision")) && !self.bytes.contains_key(id) {
                 return Err(Failure::IncompleteInput);
             }
+            if graph.has_type(id, &format!("{EV}EvidenceRef")) {
+                references.insert(id.clone());
+            }
+            if graph.has_type(id, &format!("{SR}Description")) {
+                references.insert(graph.one_iri(id, &format!("{SR}selection"))?);
+            }
+        }
+        for reference in references {
+            operation.check()?;
+            let revision = graph.one_iri(&reference, &format!("{EV}sourceRevision"))?;
+            if !ids.contains(&revision) {
+                return Err(Failure::IncompleteInput);
+            }
+            self.verify_reference(graph, &reference, operation)?;
         }
         Ok(())
     }
@@ -1042,5 +1131,85 @@ impl RetainedSources {
             return Err(Failure::SourceDigestMismatch);
         }
         operation.check()
+    }
+}
+
+impl Graph {
+    /// The four declared version coordinates may be supplied external IRIs.
+    /// Every other selected immutable input must be present before filtering.
+    pub fn view_inputs(
+        &self,
+        view: &str,
+        external_policy: Option<&str>,
+        operation: &Operation<'_>,
+    ) -> ReplayResult<Owned<std::collections::BTreeSet<String>>> {
+        operation.check()?;
+        let charge = operation.charge(
+            self.workspace_bytes()?
+                .checked_mul(2)
+                .ok_or(Failure::ReplayLimit)?,
+        )?;
+        if !self.has_type(view, &format!("{SR}ResolutionView")) {
+            return Err(Failure::UnresolvedReference);
+        }
+        self.validate_control(view, "ResolutionView", operation)?;
+        let manifest = self.one_iri(view, &format!("{SR}inputManifest"))?;
+        if !self.records.contains_key(&manifest) {
+            return Err(Failure::IncompleteInput);
+        }
+        self.verify_manifest(&manifest, operation)?;
+        let ids: std::collections::BTreeSet<_> = self
+            .iris(&manifest, &format!("{SR}inputId"))?
+            .into_iter()
+            .collect();
+        let mut external = std::collections::BTreeSet::new();
+        if let Some(policy) = external_policy {
+            external.insert(policy.to_owned());
+        }
+        for field in [
+            "ontologyVersion",
+            "mappingVersion",
+            "normalizationVersion",
+            "recordedView",
+        ] {
+            let id = self.one_iri(view, &format!("{SR}{field}"))?;
+            if !ids.contains(&id) {
+                return Err(Failure::IncompleteInput);
+            }
+            external.insert(id);
+        }
+        if !ids.contains(&self.one_iri(view, &format!("{SR}matchingPolicy"))?) {
+            return Err(Failure::IncompleteInput);
+        }
+        for id in &ids {
+            operation.check()?;
+            if !self.records.contains_key(id) && !external.contains(id) {
+                return Err(Failure::IncompleteInput);
+            }
+        }
+        Ok(Owned {
+            value: ids,
+            _charges: vec![charge],
+        })
+    }
+    fn require_type(&self, id: &str, namespace: &str, kind: &str) -> ReplayResult<()> {
+        if !self.has_type(id, &format!("{namespace}{kind}")) {
+            return Err(Failure::UnresolvedReference);
+        }
+        Ok(())
+    }
+    fn require_references(
+        &self,
+        id: &str,
+        field: &str,
+        namespace: &str,
+        kind: &str,
+        operation: &Operation<'_>,
+    ) -> ReplayResult<()> {
+        for target in self.iris(id, &format!("{SR}{field}"))? {
+            operation.check()?;
+            self.require_type(&target, namespace, kind)?;
+        }
+        Ok(())
     }
 }

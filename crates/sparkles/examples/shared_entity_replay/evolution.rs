@@ -29,12 +29,8 @@ pub(crate) fn admitted_occurrences(
             .checked_mul(2)
             .ok_or(Failure::ReplayLimit)?,
     )?;
-    let manifest = graph.one_iri(view, &format!("{SR}inputManifest"))?;
-    graph.verify_manifest(&manifest, operation)?;
-    let ids: BTreeSet<_> = graph
-        .iris(&manifest, &format!("{SR}inputId"))?
-        .into_iter()
-        .collect();
+    let selected = graph.view_inputs(view, Some(declared_policy), operation)?;
+    let ids = &selected.value;
     if !ids.contains(declared_policy) {
         return Err(Failure::IncompleteInput);
     }
@@ -169,12 +165,8 @@ pub(crate) fn select_observation(
             .checked_mul(2)
             .ok_or(Failure::ReplayLimit)?,
     )?;
-    let manifest = graph.one_iri(view, &format!("{SR}inputManifest"))?;
-    graph.verify_manifest(&manifest, operation)?;
-    let inputs: BTreeSet<_> = graph
-        .iris(&manifest, &format!("{SR}inputId"))?
-        .into_iter()
-        .collect();
+    let selected_inputs = graph.view_inputs(view, None, operation)?;
+    let inputs = &selected_inputs.value;
     if !inputs.contains(selection_profile) {
         return Err(Failure::IncompleteInput);
     }
@@ -198,6 +190,32 @@ pub(crate) fn select_observation(
         )
         .ok_or(Failure::ReplayLimit)
     })?)?;
+    // The selected relation claims declare the complete eligible series. A
+    // caller cannot silently omit a selected successor candidate binding.
+    for id in inputs {
+        operation.check()?;
+        if !graph.has_type(id, &format!("{EV}Claim")) {
+            continue;
+        }
+        let triple = claim_triple(graph, id)?;
+        if triple.predicate.as_str() != format!("{SR}ObservationAboutEpisode") {
+            continue;
+        }
+        let observation = triple.subject.to_string();
+        let observation = observation
+            .strip_prefix('<')
+            .and_then(|v| v.strip_suffix('>'))
+            .ok_or(Failure::InvalidDomainRecord)?;
+        if observations.contains(observation)
+            && !candidates.iter().any(|c| {
+                c.observation == observation
+                    && c.relation_claim == *id
+                    && inputs.contains(&c.revision)
+            })
+        {
+            return Err(Failure::IncompleteInput);
+        }
+    }
     let mut eligible = std::collections::BTreeMap::new();
     let mut series = None;
     for candidate in candidates {
@@ -266,13 +284,11 @@ pub(crate) fn select_observation(
         if let Some(old) = eligible.insert(
             candidate.revision.clone(),
             (candidate, episode.as_str().to_owned(), count),
-        ) {
-            if old.0.observation != candidate.observation
-                || old.0.relation_claim != candidate.relation_claim
-                || old.0.value_claim != candidate.value_claim
-            {
-                return Ok(Selection::Unknown("IncompatibleObservationSeries"));
-            }
+        ) && (old.0.observation != candidate.observation
+            || old.0.relation_claim != candidate.relation_claim
+            || old.0.value_claim != candidate.value_claim)
+        {
+            return Ok(Selection::Unknown("IncompatibleObservationSeries"));
         }
     }
     let revisions: Vec<_> = eligible.keys().cloned().collect();
@@ -328,11 +344,13 @@ fn claim_triple<'a>(graph: &'a Graph, id: &str) -> ReplayResult<&'a oxrdf::Tripl
 
 /// The explicit occurrence IDs remain visible even when several sources share
 /// one lineage. No independence score or vote count is inferred.
+type LineageGroups = std::collections::BTreeMap<String, Vec<String>>;
+
 pub(crate) fn source_lineages(
     graph: &Graph,
     occurrences: &[String],
     operation: &Operation<'_>,
-) -> ReplayResult<Selection<Owned<std::collections::BTreeMap<String, Vec<String>>>>> {
+) -> ReplayResult<Selection<Owned<LineageGroups>>> {
     if occurrences.len() > operation.limits.claims {
         return Err(Failure::ReplayLimit);
     }
@@ -402,7 +420,10 @@ pub(crate) fn simulated_available(
 ) -> ReplayResult<Selection<bool>> {
     operation.check()?;
     let valid = |value: &str| {
-        value.len() == 20 && value.ends_with('Z') && value.parse::<toml::value::Datetime>().is_ok()
+        value.len() == 20
+            && value.as_bytes().get(10) == Some(&b'T')
+            && value.ends_with('Z')
+            && value.parse::<toml::value::Datetime>().is_ok()
     };
     if !valid(cutoff) {
         return Ok(Selection::Unknown("UnsupportedAvailabilityTime"));

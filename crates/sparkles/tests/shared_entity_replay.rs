@@ -556,6 +556,13 @@ fn with_evolution_graph(run: impl FnOnce(&mut Graph, &Operation<'_>)) {
         .map(|d| (d.as_slice(), oxrdfio::RdfFormat::Turtle))
         .collect();
     let mut graph = Graph::load_documents(&supplied, &operation).unwrap();
+    let policy = sparkles::shared_entity::profile(1).unwrap().policy;
+    let delivery = Graph::load_documents(
+        &[(policy.as_bytes(), oxrdfio::RdfFormat::Turtle)],
+        &operation,
+    )
+    .unwrap();
+    graph.merge_delivery(delivery, &operation).unwrap();
     let authored: Vec<_> = graph
         .records
         .keys()
@@ -1305,4 +1312,362 @@ fn local_cli_requires_explicit_inputs_and_returns_only_completed_comparison() {
     unknown.extend([text("--unknown"), text("hidden label")]);
     assert_eq!(run_cli(&unknown), Err(Failure::UnknownControlField));
     assert_eq!(run_cli(&[]), Err(Failure::IncompleteInput));
+}
+
+#[test]
+fn regression_decoded_cap_covers_all_deliveries() {
+    let control = Control::none();
+    let bytes = b"<urn:record> <urn:value> \"value\" .\n";
+    let operation = Operation::new(
+        &control,
+        Limits {
+            decoded: bytes.len() * 2 - 1,
+            ..Limits::default()
+        },
+    )
+    .unwrap();
+    let graph =
+        Graph::load_documents(&[(bytes, oxrdfio::RdfFormat::NTriples)], &operation).unwrap();
+    assert!(matches!(
+        Graph::load_documents(&[(bytes, oxrdfio::RdfFormat::NTriples)], &operation),
+        Err(Failure::ReplayLimit)
+    ));
+    drop(graph);
+    assert_eq!(operation.used(), 0);
+}
+#[test]
+fn regression_record_cap_refuses_before_parsing_trailing_payload() {
+    let control = Control::none();
+    let operation = Operation::new(
+        &control,
+        Limits {
+            entities: 0,
+            ..Limits::default()
+        },
+    )
+    .unwrap();
+    let bytes = b"<urn:entity> a <urn:x-sparkles:representation:Entity> .\n this is malformed RDF";
+    assert!(matches!(
+        Graph::load_documents(&[(bytes, oxrdfio::RdfFormat::Turtle)], &operation),
+        Err(Failure::ReplayLimit)
+    ));
+    assert_eq!(operation.used(), 0);
+}
+#[test]
+fn regression_missing_selected_observation_binding_refuses() {
+    with_evolution_graph(|graph, operation| {
+        let mut missing = candidates();
+        missing.pop();
+        assert!(matches!(
+            select_observation(
+                graph,
+                &ex("A10:currentView"),
+                &ex("A10:selectionProfile1"),
+                &missing,
+                operation
+            ),
+            Err(Failure::IncompleteInput)
+        ));
+        assert!(matches!(
+            select_observation(
+                graph,
+                &ex("A10:oldView"),
+                &ex("A10:selectionProfile1"),
+                &missing,
+                operation
+            )
+            .unwrap(),
+            Selection::Known(_)
+        ));
+    });
+}
+#[test]
+fn regression_missing_selected_withdrawal_refuses_instead_of_readmitting_support() {
+    with_evolution_graph(|graph, operation| {
+        graph.records.remove(&ex("A5:withdraw1"));
+        assert!(matches!(
+            admitted_occurrences(
+                graph,
+                &ex("A5:afterFirst:view"),
+                &ex("A5:simulatedClaimAdmission:1"),
+                1,
+                operation
+            ),
+            Err(Failure::IncompleteInput)
+        ));
+    });
+}
+#[test]
+fn regression_dangling_domain_record_reference_refuses() {
+    let extra=b"PREFIX sr: <urn:x-sparkles:representation:>\n<urn:test:identification> a sr:Identification ; sr:profileVersion 1 ; sr:domainScope <urn:example:a01:A2> ; sr:identifier <urn:missing:identifier> ; sr:entity <urn:example:a01:A2:person> ; sr:claim <urn:example:a01:A2:control:claim> .";
+    with_resolution_graph(extra, |graph, operation| {
+        assert_eq!(
+            graph.validate_control("urn:test:identification", "Identification", operation),
+            Err(Failure::UnresolvedReference)
+        );
+    });
+}
+#[test]
+fn regression_noncanonical_utc_spellings_never_compare_as_earlier_instants() {
+    with_evolution_graph(|graph, operation| {
+        let revision = ex("late");
+        let predicate = format!("{EV}firstAvailableAt");
+        graph
+            .records
+            .get_mut(&revision)
+            .unwrap()
+            .retain(|s| s.predicate != predicate);
+        graph.records.get_mut(&revision).unwrap().insert(Statement {
+            graph: "DEFAULT".into(),
+            predicate,
+            object: oxrdf::Literal::new_typed_literal(
+                "2026-03-01 23:00:00Z",
+                oxrdf::NamedNode::new("http://www.w3.org/2001/XMLSchema#dateTime").unwrap(),
+            )
+            .into(),
+        });
+        assert_eq!(
+            simulated_available(graph, &revision, "2026-03-01T00:00:00Z", operation).unwrap(),
+            Selection::Unknown("UnsupportedAvailabilityTime")
+        );
+    });
+}
+#[test]
+fn regression_cli_verifies_selected_evidence_without_reference_flag() {
+    let control = Control::none();
+    let operation = Operation::new(&control, Limits::default()).unwrap();
+    let temp = tempfile::tempdir().unwrap();
+    let scope = ex("A15:public");
+    let view = ex("A15:publicView");
+    let reference = ex("A15:descriptionClaim:publicDescription:ref");
+    let declaration = supplied_view(
+        &scope,
+        &view,
+        &[ex("A15:publicEntity"), ex("public"), reference],
+        &operation,
+    );
+    let common = String::from_utf8(fixture("valid/public-common.ttl"))
+        .unwrap()
+        .replace(
+            "sha256:163e03548d3cb2ea8a0355c0f32e2d47d0c7e006a06359a2bb4a872bf9c122b9",
+            &format!("sha256:{}", "0".repeat(64)),
+        );
+    let public = fixture("valid/public-boundary.ttl");
+    let paths = [
+        ("common.ttl", common.as_bytes()),
+        ("public.ttl", public.as_slice()),
+        ("view.ttl", declaration.as_slice()),
+        (
+            "policy.ttl",
+            sparkles::shared_entity::profile(1)
+                .unwrap()
+                .policy
+                .as_bytes(),
+        ),
+    ];
+    let mut args = vec![text("--view"), view, text("--scope"), scope];
+    for (name, bytes) in paths {
+        let path = temp.path().join(name);
+        std::fs::write(&path, bytes).unwrap();
+        args.extend([text("--rdf"), format!("ttl={}", path.display())]);
+    }
+    let source = temp.path().join("source.json");
+    std::fs::write(&source, fixture("raw/public.json")).unwrap();
+    args.extend([
+        text("--source"),
+        format!("{}={}", ex("public"), source.display()),
+    ]);
+    assert_eq!(run_cli(&args), Err(Failure::SourceDigestMismatch));
+}
+
+#[test]
+fn exact_cumulative_delivery_budget_and_repeated_graph_types_are_supported() {
+    let bytes=b"<urn:entity> <http://www.w3.org/1999/02/22-rdf-syntax-ns#type> <urn:x-sparkles:representation:Entity> .\n<urn:entity> <http://www.w3.org/1999/02/22-rdf-syntax-ns#type> <urn:x-sparkles:representation:Entity> <urn:named> .\n";
+    let control = Control::none();
+    let operation = Operation::new(
+        &control,
+        Limits {
+            decoded: bytes.len() * 2,
+            entities: 1,
+            ..Limits::default()
+        },
+    )
+    .unwrap();
+    let mut graph =
+        Graph::load_documents(&[(bytes, oxrdfio::RdfFormat::NQuads)], &operation).unwrap();
+    let delivery =
+        Graph::load_documents(&[(bytes, oxrdfio::RdfFormat::NQuads)], &operation).unwrap();
+    graph.merge_delivery(delivery, &operation).unwrap();
+    assert_eq!(graph.records.len(), 1);
+    assert_eq!(graph.records["urn:entity"].len(), 2);
+}
+#[test]
+fn wrong_class_and_missing_domain_dependencies_have_supported_siblings() {
+    for (kind, fields) in [
+        (
+            "Identification",
+            "sr:identifier <urn:example:a01:A2:person> ; sr:entity <urn:example:a01:A2:person> ; sr:claim <urn:example:a01:A2:control:claim>",
+        ),
+        (
+            "Identification",
+            "sr:identifier <urn:missing:identifier> ; sr:entity <urn:missing:entity> ; sr:claim <urn:missing:claim>",
+        ),
+        (
+            "Relation",
+            "sr:subject <urn:example:a01:A2:person> ; sr:object <urn:example:a01:A2:account> ; sr:relationKind sr:ControlsAccount ; sr:claim <urn:missing:claim>",
+        ),
+        (
+            "Relation",
+            "sr:subject <urn:example:a01:A2:person> ; sr:object <urn:example:a01:A2:account> ; sr:relationKind sr:ControlsAccount ; sr:claim <urn:example:a01:A2:control:claim> ; sr:roleAssignment <urn:missing:role>",
+        ),
+        (
+            "RoleAssignment",
+            "sr:participant <urn:missing:participant> ; sr:role <urn:role>",
+        ),
+        (
+            "Description",
+            "sr:sourceRevision <urn:example:a01:r1> ; sr:selection <urn:missing:selection>",
+        ),
+    ] {
+        let extra = format!(
+            "PREFIX sr: <{SR}>\n<urn:test:record> a sr:{kind} ; sr:profileVersion 1 ; sr:domainScope <urn:example:a01:A2> ; {fields} ."
+        );
+        // RoleAssignment has no domainScope property in its closed shape.
+        let extra = if kind == "RoleAssignment" {
+            extra.replace("sr:domainScope <urn:example:a01:A2> ; ", "")
+        } else {
+            extra
+        };
+        with_resolution_graph(extra.as_bytes(), |graph, operation| {
+            assert_eq!(
+                graph.validate_control("urn:test:record", kind, operation),
+                Err(Failure::UnresolvedReference)
+            );
+        });
+    }
+    with_resolution_graph(&[], |graph, operation| {
+        graph
+            .validate_control(&ex("A2:control"), "Relation", operation)
+            .unwrap();
+        graph
+            .validate_control(&ex("A2:control:role"), "RoleAssignment", operation)
+            .unwrap();
+    });
+}
+#[test]
+fn mandatory_description_selection_is_verified_without_reference_id_conventions() {
+    let control = Control::none();
+    let operation = Operation::new(&control, Limits::default()).unwrap();
+    let common = fixture("valid/public-common.ttl");
+    let public = fixture("valid/public-boundary.ttl");
+    let declaration = supplied_view(
+        &ex("A15:public"),
+        &ex("A15:view"),
+        &[
+            ex("A15:publicEntity"),
+            ex("A15:publicDescription"),
+            ex("public"),
+        ],
+        &operation,
+    );
+    let mut graph = Graph::load_documents(
+        &[
+            (&common, oxrdfio::RdfFormat::Turtle),
+            (&public, oxrdfio::RdfFormat::Turtle),
+            (&declaration, oxrdfio::RdfFormat::Turtle),
+        ],
+        &operation,
+    )
+    .unwrap();
+    let mut retained = RetainedSources::default();
+    retained
+        .insert(
+            &graph,
+            &ex("public"),
+            fixture("raw/public.json").as_slice(),
+            &operation,
+        )
+        .unwrap();
+    let manifest = ex("A15:view:manifest");
+    retained
+        .verify_selected(&graph, &manifest, &operation)
+        .unwrap();
+    let reference = ex("A15:descriptionClaim:publicDescription:ref");
+    let original = graph.records[&reference].clone();
+    for (field, value, error) in [
+        (
+            "valueDigest",
+            oxrdf::Literal::new_simple_literal(format!("sha256:{}", "0".repeat(64))).into(),
+            Failure::SourceDigestMismatch,
+        ),
+        (
+            "method",
+            oxrdf::NamedNode::new("urn:unsupported:normalization")
+                .unwrap()
+                .into(),
+            Failure::UnsupportedProfile,
+        ),
+        (
+            "jsonPointer",
+            oxrdf::Literal::new_simple_literal("/missing").into(),
+            Failure::InvalidDomainRecord,
+        ),
+    ] {
+        let predicate = format!("{EV}{field}");
+        graph
+            .records
+            .get_mut(&reference)
+            .unwrap()
+            .retain(|s| s.predicate != predicate);
+        graph
+            .records
+            .get_mut(&reference)
+            .unwrap()
+            .insert(Statement {
+                graph: "DEFAULT".into(),
+                predicate,
+                object: value,
+            });
+        assert_eq!(
+            retained.verify_selected(&graph, &manifest, &operation),
+            Err(error)
+        );
+        graph.records.insert(reference.clone(), original.clone());
+    }
+}
+#[test]
+fn missing_selected_record_and_unknown_matching_rule_refuse_with_fixed_codes() {
+    let control = Control::none();
+    let operation = Operation::new(&control, Limits::default()).unwrap();
+    let common = fixture("valid/common.ttl");
+    let source = fixture("valid/resolution.ttl");
+    let policy = sparkles::shared_entity::profile(1).unwrap().policy;
+    let mut graph = Graph::load_documents(
+        &[
+            (&common, oxrdfio::RdfFormat::Turtle),
+            (&source, oxrdfio::RdfFormat::Turtle),
+            (policy.as_bytes(), oxrdfio::RdfFormat::Turtle),
+        ],
+        &operation,
+    )
+    .unwrap();
+    graph.records.remove("https://example.org/A");
+    assert_eq!(
+        resolve(&graph, &ex("A12:pair"), &operation).err().unwrap(),
+        Failure::IncompleteInput
+    );
+    let changed = policy.replace("AcceptedPossibleMatch", "UnknownFutureMatch");
+    let graph = Graph::load_documents(
+        &[
+            (&common, oxrdfio::RdfFormat::Turtle),
+            (&source, oxrdfio::RdfFormat::Turtle),
+            (changed.as_bytes(), oxrdfio::RdfFormat::Turtle),
+        ],
+        &operation,
+    )
+    .unwrap();
+    assert_eq!(
+        resolve(&graph, &ex("A12:pair"), &operation).err().unwrap(),
+        Failure::UnsupportedProfile
+    );
 }
