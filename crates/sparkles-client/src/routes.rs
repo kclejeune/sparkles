@@ -257,10 +257,41 @@ op!(LIST_TASKS, "listTasks", GET, "/$/tasks");
 op!(GET_TASK, "getTask", GET, "/$/tasks/{id}");
 op!(CANCEL_TASK, "cancelTask", DELETE, "/$/tasks/{id}");
 
-// typed retained history reads
+// typed retained history operations
 op!(LIST_SNAPSHOTS, "listSnapshots", GET, "/$/snapshots/{ds}");
+op!(
+    CREATE_SNAPSHOT,
+    "createSnapshot",
+    POST,
+    "/$/snapshots/{ds}",
+    &[],
+    &[],
+    &["application/json"]
+);
+op!(
+    DELETE_SNAPSHOT,
+    "deleteSnapshot",
+    DELETE,
+    "/$/snapshots/{ds}/{name}"
+);
 op!(GET_SNAPSHOT, "getSnapshot", GET, "/$/snapshots/{ds}/{name}");
 op!(LIST_BRANCHES, "listBranches", GET, "/$/branches/{ds}");
+op!(
+    CREATE_BRANCH,
+    "createBranch",
+    POST,
+    "/$/branches/{ds}",
+    &[],
+    &[],
+    &["application/json"]
+);
+op!(
+    DELETE_BRANCH,
+    "deleteBranch",
+    DELETE,
+    "/$/branches/{ds}/{name}",
+    &["force", "reparent"]
+);
 op!(GET_BRANCH, "getBranch", GET, "/$/branches/{ds}/{name}");
 op!(
     DIFF,
@@ -320,8 +351,12 @@ pub const ALL: &[&Op] = &[
     &SERVER,
     &WHOAMI,
     &LIST_SNAPSHOTS,
+    &CREATE_SNAPSHOT,
+    &DELETE_SNAPSHOT,
     &GET_SNAPSHOT,
     &LIST_BRANCHES,
+    &CREATE_BRANCH,
+    &DELETE_BRANCH,
     &GET_BRANCH,
     &DIFF,
 ];
@@ -575,6 +610,8 @@ mod tests {
         check::<StoredQueryList>(&doc, "StoredQueryList");
         check::<BackupList>(&doc, "BackupList");
         check::<BackupFiles>(&doc, "BackupFiles");
+        check::<SnapshotRequest>(&doc, "SnapshotRequest");
+        check::<BranchCreate>(&doc, "BranchCreate");
         check::<SnapshotList>(&doc, "SnapshotList");
         check::<NamedSnapshot>(&doc, "NamedSnapshot");
         check::<BranchList>(&doc, "BranchList");
@@ -631,11 +668,47 @@ mod tests {
             (&BACKUP_FILES, "BackupFiles"),
             (&LIST_SNAPSHOTS, "SnapshotList"),
             (&GET_SNAPSHOT, "NamedSnapshot"),
+            (&CREATE_SNAPSHOT, "NamedSnapshot"),
             (&LIST_BRANCHES, "BranchList"),
             (&GET_BRANCH, "Branch"),
+            (&CREATE_BRANCH, "Branch"),
             (&DIFF, "Diff"),
         ] {
             assert_eq!(response_schema(&doc, op), schema, "{}", op.id);
+        }
+    }
+
+    #[test]
+    fn history_mutation_success_contracts() {
+        let doc = openapi();
+        for (op, status, schema) in [
+            (&CREATE_SNAPSHOT, "200", "NamedSnapshot"),
+            (&CREATE_SNAPSHOT, "201", "NamedSnapshot"),
+            (&CREATE_BRANCH, "201", "Branch"),
+        ] {
+            let operation = &doc["paths"][op.path][op.method.as_str().to_ascii_lowercase()];
+            let response = resolve(&doc, &operation["responses"][status]);
+            assert_eq!(
+                response["content"]["application/json"]["schema"]["$ref"],
+                format!("#/components/schemas/{schema}"),
+                "{} {status}",
+                op.id
+            );
+        }
+        for (op, schema) in [
+            (&CREATE_SNAPSHOT, "SnapshotRequest"),
+            (&CREATE_BRANCH, "BranchCreate"),
+        ] {
+            let operation = &doc["paths"][op.path][op.method.as_str().to_ascii_lowercase()];
+            let body = resolve(&doc, &operation["requestBody"]);
+            assert_eq!(
+                body["content"]["application/json"]["schema"]["$ref"],
+                format!("#/components/schemas/{schema}")
+            );
+        }
+        for op in [&DELETE_SNAPSHOT, &DELETE_BRANCH] {
+            let operation = &doc["paths"][op.path][op.method.as_str().to_ascii_lowercase()];
+            assert!(operation["responses"]["204"].is_object(), "{}", op.id);
         }
     }
 

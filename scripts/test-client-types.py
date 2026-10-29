@@ -17,13 +17,19 @@ class GeneratorTests(unittest.TestCase):
         self.assertEqual(self.generator.rust_type({"type": ["null", "integer"]}, "Count"), "Option<i128>")
         self.assertEqual(self.generator.rust_type({"oneOf": [{"type": "null"}, {"type": "string"}]}, "Name"), "Option<String>")
 
+    def test_scalar_unions_are_bounded_and_use_integer_decoder(self):
+        self.assertEqual(self.generator.rust_type({"type": ["string", "integer"]}, "At"), "At")
+        self.assertIn('Integer(#[serde(deserialize_with = "deserialize_integer")] i128)', self.generator.definitions["At"])
+        self.assertEqual(self.generator.rust_type({"type": ["boolean", "string"]}, "Warm"), "Warm")
+        self.assertIn("Boolean(bool)", self.generator.definitions["Warm"])
+
     def test_extensible_maps_and_strings(self):
         self.assertEqual(self.generator.rust_type({"type": "string", "enum": ["one"]}, "Kind"), "String")
         self.assertEqual(self.generator.rust_type({"type": "object"}, "Open"), "serde_json::Map<String, serde_json::Value>")
         self.assertEqual(self.generator.rust_type({"type": "object", "additionalProperties": {"type": "boolean"}}, "Map"), "std::collections::BTreeMap<String, bool>")
 
     def test_unsupported_shapes_fail_closed(self):
-        for schema in [{}, {"type": ["string", "integer"]}, {"allOf": []}, {"type": "string", "dependentSchemas": {}}]:
+        for schema in [{}, {"type": ["string", "number"]}, {"allOf": []}, {"type": "string", "dependentSchemas": {}}]:
             with self.subTest(schema=schema), self.assertRaises(ValueError):
                 self.generator.rust_type(schema, "Unsupported")
         with self.assertRaises(ValueError):

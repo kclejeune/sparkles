@@ -73,7 +73,7 @@ pub use endpoint::{
     Endpoint, Execution, QueryMethod, QueryOptions, ReadOptions, UpdateOptions, WriteOptions,
 };
 pub use error::{Error, Result, StatusError};
-pub use history::{DiffOptions, HistoryOptions};
+pub use history::{BranchDeleteOptions, DiffOptions, HistoryOptions};
 pub use results::{Quads, QueryResults, ResponseMeta, Solutions, Triples};
 pub use retry::{RateLimit, RetryPolicy};
 pub use types::{

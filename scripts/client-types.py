@@ -19,7 +19,7 @@ OUTPUT = ROOT / "crates/sparkles-client/src/types/generated.rs"
 ROOTS = (
     "SchemaSummary", "DatasetStats", "FusekiStats", "StoredQuery",
     "StoredQueryList", "BackupList", "BackupFiles",
-    "SnapshotList", "NamedSnapshot", "BranchList", "Branch", "Diff",
+    "SnapshotList", "NamedSnapshot", "SnapshotRequest", "BranchList", "Branch", "BranchCreate", "Diff",
 )
 
 
@@ -83,6 +83,8 @@ class Generator:
                 return self.model(name, schema)
         kind = schema.get("type")
         if isinstance(kind, list):
+            if len(kind) == 2 and set(kind) in ({"string", "integer"}, {"boolean", "string"}):
+                return self.model(name, schema)
             if len(kind) != 2 or "null" not in kind:
                 raise ValueError(f"{name}: unsupported type union {kind}")
             child = dict(schema, type=next(value for value in kind if value != "null"))
@@ -107,6 +109,15 @@ class Generator:
 
     def definition(self, name, schema):
         lines = [f"/// OpenAPI model `{name}`. Generated members retain unknown fields.", "#[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]"]
+        kinds = schema.get("type")
+        if isinstance(kinds, list) and set(kinds) in ({"string", "integer"}, {"boolean", "string"}):
+            lines += ["#[serde(untagged)]", f"pub enum {name} {{"]
+            for kind in kinds:
+                if kind == "integer":
+                    lines.append('    Integer(#[serde(deserialize_with = "deserialize_integer")] i128),')
+                else:
+                    lines.append(f"    {kind.title()}({dict(string='String', boolean='bool')[kind]}),")
+            return "\n".join(lines + ["}"])
         choices = schema.get("anyOf", schema.get("oneOf"))
         if choices:
             # Prefer specific alternatives so a general page cannot swallow a dataset

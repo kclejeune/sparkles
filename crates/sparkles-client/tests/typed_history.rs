@@ -6,9 +6,13 @@ use axum::response::Response;
 use bytes::Bytes;
 use futures_util::{StreamExt, stream};
 use serde_json::{Value, json};
-use sparkles_client::admin_types::{Diff, DiffGroupObject, NamedSnapshot};
+use sparkles_client::admin_types::{
+    BranchCreate, Diff, DiffGroupObject, NamedSnapshot, SnapshotRequest, SnapshotRequestAt,
+    SnapshotRequestExpires, SnapshotRequestWarm,
+};
 use sparkles_client::{
-    At, CancellationToken, Client, DiffOptions, Error, Graph, HistoryOptions, Method,
+    At, BranchDeleteOptions, CancellationToken, Client, DiffOptions, Error, Graph, HistoryOptions,
+    Method,
 };
 use std::collections::VecDeque;
 use std::sync::{Arc, Mutex};
@@ -18,6 +22,8 @@ use tokio::sync::Notify;
 #[derive(Clone)]
 enum Reply {
     Json(Value),
+    Created(Value),
+    Empty,
     Status(u16),
     Malformed,
     Stalled,
@@ -72,6 +78,8 @@ async fn handle(State(mock): State<Mock>, request: Request) -> Response {
         .expect("unexpected HTTP request");
     let (status, body) = match reply {
         Reply::Json(value) => (200, Body::from(value.to_string())),
+        Reply::Created(value) => (201, Body::from(value.to_string())),
+        Reply::Empty => (204, Body::empty()),
         Reply::Status(status) => (status, Body::from(json!({"error":"fixed refusal","code":"history-unavailable","detail":"retained origin","requestId":"history-fixture"}).to_string())),
         Reply::Malformed => (200, Body::from("{unfinished")),
         Reply::Stalled => {
@@ -433,5 +441,174 @@ async fn blocking_history_uses_the_same_wire_contract_and_types() {
     .await
     .unwrap();
     assert_eq!(mock.seen.lock().unwrap().len(), 5);
+    task.abort();
+}
+
+#[test]
+fn mutation_request_models_preserve_scalar_unions() {
+    let mut request = SnapshotRequest::new("");
+    assert_eq!(serde_json::to_value(&request).unwrap(), json!({"name":""}));
+    request.at = Some(SnapshotRequestAt::Integer(i128::from(u64::MAX)));
+    request.expires = Some(SnapshotRequestExpires::Integer(-1));
+    request.warm = Some(SnapshotRequestWarm::Boolean(false));
+    let value = json!({"name":"", "at":u64::MAX,"expires":-1,"warm":false});
+    assert_eq!(serde_json::to_value(&request).unwrap(), value);
+    assert_eq!(
+        serde_json::from_value::<SnapshotRequest>(value).unwrap(),
+        request
+    );
+    request.at = Some(SnapshotRequestAt::String("".into()));
+    request.expires = Some(SnapshotRequestExpires::String("0s".into()));
+    request.warm = Some(SnapshotRequestWarm::String("false".into()));
+    assert_eq!(
+        serde_json::from_value::<SnapshotRequest>(serde_json::to_value(&request).unwrap()).unwrap(),
+        request
+    );
+    for value in [json!(null), json!({}), json!([]), json!(1.5), json!(true)] {
+        assert!(serde_json::from_value::<SnapshotRequestAt>(value).is_err());
+    }
+    for value in [json!(null), json!({}), json!([]), json!(0), json!(1.5)] {
+        assert!(serde_json::from_value::<SnapshotRequestWarm>(value).is_err());
+    }
+    assert_eq!(
+        serde_json::to_value(BranchCreate::new("b")).unwrap(),
+        json!({"name":"b"})
+    );
+}
+
+#[tokio::test]
+async fn history_mutations_send_exact_requests_and_preserve_errors() {
+    let (client, mock, task) = start(vec![
+        Reply::Created(snapshot()),
+        Reply::Json(snapshot()),
+        Reply::Empty,
+        Reply::Created(branch()),
+        Reply::Empty,
+        Reply::Empty,
+        Reply::Status(409),
+        Reply::Status(404),
+    ])
+    .await;
+    let ds = client.dataset("data/é%");
+    let mut snapshot_request = SnapshotRequest::new("saved");
+    snapshot_request.at = Some(SnapshotRequestAt::Integer(0));
+    snapshot_request.warm = Some(SnapshotRequestWarm::Boolean(false));
+    ds.create_snapshot_with(
+        &snapshot_request,
+        &HistoryOptions::new().header("X-History-Test", "present"),
+    )
+    .await
+    .unwrap();
+    ds.create_snapshot(&SnapshotRequest::new("saved"))
+        .await
+        .unwrap();
+    ds.delete_snapshot("saved/é%").await.unwrap();
+    let mut create = BranchCreate::new("branch");
+    create.from = Some("main".into());
+    create.protected = Some(false);
+    ds.create_branch(&create).await.unwrap();
+    ds.delete_branch("topic/one").await.unwrap();
+    ds.delete_branch_with("topic/one", &BranchDeleteOptions::new().force().reparent())
+        .await
+        .unwrap();
+    assert!(matches!(
+        ds.create_branch(&create).await.unwrap_err(),
+        Error::Status(_)
+    ));
+    assert!(matches!(
+        ds.delete_snapshot("missing").await.unwrap_err(),
+        Error::Status(_)
+    ));
+    let seen = mock.seen.lock().unwrap();
+    assert_eq!(seen[0].method, Method::POST);
+    assert_eq!(seen[0].uri, "/prefix/$/snapshots/data%2F%C3%A9%25");
+    assert_eq!(seen[0].extra_header.as_deref(), Some("present"));
+    assert_eq!(
+        serde_json::from_slice::<Value>(&seen[0].body).unwrap(),
+        json!({"name":"saved","at":0,"warm":false})
+    );
+    assert_eq!(seen[2].method, Method::DELETE);
+    assert_eq!(
+        seen[2].uri,
+        "/prefix/$/snapshots/data%2F%C3%A9%25/saved%2F%C3%A9%25"
+    );
+    assert_eq!(
+        serde_json::from_slice::<Value>(&seen[3].body).unwrap(),
+        json!({"name":"branch","from":"main","protected":false})
+    );
+    assert!(seen[4].query.is_empty());
+    assert_eq!(
+        seen[5].query,
+        vec![
+            ("force".into(), "true".into()),
+            ("reparent".into(), "true".into())
+        ]
+    );
+    drop(seen);
+    task.abort();
+}
+
+#[cfg(feature = "blocking")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn blocking_mutations_share_wire_contract() {
+    let (client, mock, task) = start(vec![
+        Reply::Created(snapshot()),
+        Reply::Empty,
+        Reply::Created(branch()),
+        Reply::Empty,
+    ])
+    .await;
+    tokio::task::spawn_blocking(move || {
+        let ds = sparkles_client::blocking::Client::from_async(client)
+            .unwrap()
+            .dataset("ds");
+        ds.create_snapshot(&SnapshotRequest::new("s")).unwrap();
+        ds.delete_snapshot("s").unwrap();
+        ds.create_branch(&BranchCreate::new("b")).unwrap();
+        ds.delete_branch_with("b", &BranchDeleteOptions::new().force())
+            .unwrap();
+    })
+    .await
+    .unwrap();
+    let seen = mock.seen.lock().unwrap();
+    assert_eq!(seen.len(), 4);
+    assert_eq!(seen[3].query, vec![("force".into(), "true".into())]);
+    drop(seen);
+    task.abort();
+}
+
+#[tokio::test]
+async fn mutation_controls_cancel_deadline_and_do_not_retry_unknown_write() {
+    let (client, mock, task) = start(vec![Reply::Status(503), Reply::Stalled]).await;
+    let ds = client.dataset("ds");
+    let token = CancellationToken::new();
+    token.cancel();
+    assert!(matches!(
+        ds.create_branch_with(
+            &BranchCreate::new("b"),
+            &HistoryOptions::new().cancel(token)
+        )
+        .await
+        .unwrap_err(),
+        Error::Cancelled
+    ));
+    assert!(mock.seen.lock().unwrap().is_empty());
+    assert!(matches!(
+        ds.create_snapshot(&SnapshotRequest::new("s"))
+            .await
+            .unwrap_err(),
+        Error::Status(_)
+    ));
+    assert_eq!(mock.seen.lock().unwrap().len(), 1);
+    assert!(matches!(
+        ds.create_branch_with(
+            &BranchCreate::new("b"),
+            &HistoryOptions::new().deadline(Duration::from_millis(250))
+        )
+        .await
+        .unwrap_err(),
+        Error::Deadline(_)
+    ));
+    assert_eq!(mock.seen.lock().unwrap().len(), 2);
     task.abort();
 }

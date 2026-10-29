@@ -15,14 +15,14 @@
 //! ```
 
 use crate::admin_types::{
-    BackupFiles, BackupList, Branch, BranchList, DatasetStats, Diff, FusekiStats, NamedSnapshot,
-    SchemaSummary, SnapshotList, StoredQuery, StoredQueryList,
+    BackupFiles, BackupList, Branch, BranchCreate, BranchList, DatasetStats, Diff, FusekiStats,
+    NamedSnapshot, SchemaSummary, SnapshotList, SnapshotRequest, StoredQuery, StoredQueryList,
 };
 use crate::error::{Error, Result};
 use crate::{
-    At, CommitList, CommitsOptions, DatasetInfo, DatasetType, DiffOptions, Graph, HistoryOptions,
-    QueryOptions, QuerySolution, RdfBody, ReadOptions, Receipt, ResponseMeta, ServerInfo, Task,
-    UpdateOptions, UploadOptions, UploadPart, Whoami, WriteOptions,
+    At, BranchDeleteOptions, CommitList, CommitsOptions, DatasetInfo, DatasetType, DiffOptions,
+    Graph, HistoryOptions, QueryOptions, QuerySolution, RdfBody, ReadOptions, Receipt,
+    ResponseMeta, ServerInfo, Task, UpdateOptions, UploadOptions, UploadPart, Whoami, WriteOptions,
 };
 use oxrdf::{Quad, Triple, Variable};
 use serde_json::Value;
@@ -366,6 +366,38 @@ impl Dataset {
     }
     pub fn delete_stored_query(&self, name: &str) -> Result<()> {
         self.wait(self.ds().delete_stored_query(name))
+    }
+    pub fn create_snapshot(&self, body: &SnapshotRequest) -> Result<NamedSnapshot> {
+        self.wait(self.ds().create_snapshot(body))
+    }
+    pub fn create_snapshot_with(
+        &self,
+        body: &SnapshotRequest,
+        options: &HistoryOptions,
+    ) -> Result<NamedSnapshot> {
+        self.wait(self.ds().create_snapshot_with(body, options))
+    }
+    pub fn delete_snapshot(&self, name: &str) -> Result<()> {
+        self.wait(self.ds().delete_snapshot(name))
+    }
+    pub fn delete_snapshot_with(&self, name: &str, options: &HistoryOptions) -> Result<()> {
+        self.wait(self.ds().delete_snapshot_with(name, options))
+    }
+    pub fn create_branch(&self, body: &BranchCreate) -> Result<Branch> {
+        self.wait(self.ds().create_branch(body))
+    }
+    pub fn create_branch_with(
+        &self,
+        body: &BranchCreate,
+        options: &HistoryOptions,
+    ) -> Result<Branch> {
+        self.wait(self.ds().create_branch_with(body, options))
+    }
+    pub fn delete_branch(&self, name: &str) -> Result<()> {
+        self.wait(self.ds().delete_branch(name))
+    }
+    pub fn delete_branch_with(&self, name: &str, options: &BranchDeleteOptions) -> Result<()> {
+        self.wait(self.ds().delete_branch_with(name, options))
     }
     pub fn snapshots(&self) -> Result<SnapshotList> {
         self.wait(self.ds().snapshots())

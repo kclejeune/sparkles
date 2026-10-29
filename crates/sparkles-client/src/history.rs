@@ -1,11 +1,13 @@
 //! Typed reads of Sparkles history metadata and bounded JSON diffs.
-use crate::admin_types::{Branch, BranchList, Diff, NamedSnapshot, SnapshotList};
-use crate::client::{CallOptions, call_options, read_typed};
+use crate::admin_types::{
+    Branch, BranchCreate, BranchList, Diff, NamedSnapshot, SnapshotList, SnapshotRequest,
+};
+use crate::client::{CallOptions, ReqBody, call_options, read_bytes, read_typed};
 use crate::error::{Error, Result};
 use crate::{At, Dataset, Graph, routes};
 use oxrdf::Term;
 
-/// Per-call controls for snapshot and branch metadata reads.
+/// Per-call controls for snapshot and branch metadata operations.
 #[derive(Clone, Debug, Default)]
 pub struct HistoryOptions {
     call: CallOptions,
@@ -181,5 +183,137 @@ impl Dataset {
         request.accept = Some("application/json");
         request.call = options.call.clone();
         read_typed(self.client.send(request).await?).await
+    }
+}
+
+impl SnapshotRequest {
+    /// Construct a JSON request for a named snapshot.
+    pub fn new(name: impl Into<String>) -> Self {
+        Self {
+            name: Some(name.into()),
+            at: None,
+            expires: None,
+            note: None,
+            warm: None,
+            extra: Default::default(),
+        }
+    }
+}
+
+impl BranchCreate {
+    /// Construct a branch creation request using the server's defaults.
+    pub fn new(name: impl Into<String>) -> Self {
+        Self {
+            name: name.into(),
+            at: None,
+            from: None,
+            note: None,
+            protected: None,
+            extra: Default::default(),
+        }
+    }
+}
+
+/// Controls for deleting a branch and its dependent history.
+#[derive(Clone, Debug, Default)]
+pub struct BranchDeleteOptions {
+    force: bool,
+    reparent: bool,
+    call: CallOptions,
+}
+impl BranchDeleteOptions {
+    pub fn new() -> Self {
+        Self::default()
+    }
+    /// Delete a branch even if it has unmerged commits.
+    pub fn force(mut self) -> Self {
+        self.force = true;
+        self
+    }
+    /// Reparent branches that depend on the deleted branch.
+    pub fn reparent(mut self) -> Self {
+        self.reparent = true;
+        self
+    }
+}
+call_options!(BranchDeleteOptions);
+
+impl Dataset {
+    /// Create or return a named snapshot.
+    pub async fn create_snapshot(&self, body: &SnapshotRequest) -> Result<NamedSnapshot> {
+        self.create_snapshot_with(body, &HistoryOptions::new())
+            .await
+    }
+    pub async fn create_snapshot_with(
+        &self,
+        body: &SnapshotRequest,
+        options: &HistoryOptions,
+    ) -> Result<NamedSnapshot> {
+        let mut request = self
+            .client
+            .op_req(&routes::CREATE_SNAPSHOT, &[("ds", self.name())])?;
+        request.body(ReqBody::json(
+            &serde_json::to_value(body).map_err(|e| Error::parse("JSON", e))?,
+        ));
+        request.accept = Some("application/json");
+        request.call = options.call.clone();
+        read_typed(self.client.send(request).await?).await
+    }
+    pub async fn delete_snapshot(&self, name: &str) -> Result<()> {
+        self.delete_snapshot_with(name, &HistoryOptions::new())
+            .await
+    }
+    pub async fn delete_snapshot_with(&self, name: &str, options: &HistoryOptions) -> Result<()> {
+        let mut request = self.client.op_req(
+            &routes::DELETE_SNAPSHOT,
+            &[("ds", self.name()), ("name", name)],
+        )?;
+        request.accept = Some("application/json");
+        request.call = options.call.clone();
+        read_bytes(self.client.send(request).await?).await?;
+        Ok(())
+    }
+    /// Create a branch and return its metadata.
+    pub async fn create_branch(&self, body: &BranchCreate) -> Result<Branch> {
+        self.create_branch_with(body, &HistoryOptions::new()).await
+    }
+    pub async fn create_branch_with(
+        &self,
+        body: &BranchCreate,
+        options: &HistoryOptions,
+    ) -> Result<Branch> {
+        let mut request = self
+            .client
+            .op_req(&routes::CREATE_BRANCH, &[("ds", self.name())])?;
+        request.body(ReqBody::json(
+            &serde_json::to_value(body).map_err(|e| Error::parse("JSON", e))?,
+        ));
+        request.accept = Some("application/json");
+        request.call = options.call.clone();
+        read_typed(self.client.send(request).await?).await
+    }
+    pub async fn delete_branch(&self, name: &str) -> Result<()> {
+        self.delete_branch_with(name, &BranchDeleteOptions::new())
+            .await
+    }
+    pub async fn delete_branch_with(
+        &self,
+        name: &str,
+        options: &BranchDeleteOptions,
+    ) -> Result<()> {
+        let mut request = self.client.op_req(
+            &routes::DELETE_BRANCH,
+            &[("ds", self.name()), ("name", name)],
+        )?;
+        if options.force {
+            request.param("force", "true");
+        }
+        if options.reparent {
+            request.param("reparent", "true");
+        }
+        request.accept = Some("application/json");
+        request.call = options.call.clone();
+        read_bytes(self.client.send(request).await?).await?;
+        Ok(())
     }
 }
