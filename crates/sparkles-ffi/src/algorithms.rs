@@ -52,8 +52,9 @@ fn stats(
 ) -> FfiResult<Vec<u8>> {
     op.control.check()?;
     let req = request(bytes)?;
-    let mut prefixes: Vec<_> = sparkles::io::standard_prefixes().into_iter().collect();
+    let mut prefixes = sparkles::io::standard_prefixes();
     prefixes.extend(ds.store().prefixes());
+    let prefixes: Vec<_> = prefixes.into_iter().collect();
     let (query, _) = sparkles::sparql::algorun::query_text(&req, &prefixes, true)?;
     let result = sparkles::sparql::query(snap, &query, &options(ds, opts, op))?;
     let text = result
@@ -246,6 +247,40 @@ mod tests {
             .query("SELECT (COUNT(*) AS ?n) { GRAPH <urn:out> { ?s <urn:rank> ?o } }")
             .unwrap();
         result.rows()[0][0].as_ref().unwrap().to_string()
+    }
+    #[test]
+    fn stats_honours_dataset_override_of_standard_prefix() {
+        let ds = dataset();
+        let body =
+            serde_json::json!({"algorithm":"pageRank", "projection":{"predicates":["rdf:p"]}});
+        let bytes = serde_json::to_vec(&body).unwrap();
+        let run = || {
+            let value = ds
+                .algorithm_stats(bytes.clone(), opts(), FfiOperation::new(None))
+                .unwrap();
+            serde_json::from_slice::<serde_json::Value>(&value).unwrap()
+        };
+        assert_eq!(run()["nodes"], 0);
+        ds.set_prefix("rdf".into(), "urn:".into()).unwrap();
+        let req = AlgoRequest::from_json(body).unwrap();
+        assert!(
+            ds.inner
+                .ds
+                .algorithms()
+                .query_text(&req, false)
+                .unwrap()
+                .contains("<urn:p>")
+        );
+        let expected: serde_json::Value = serde_json::from_str(
+            &ds.inner
+                .ds
+                .algorithms()
+                .stats(&req, &QueryOptions::default())
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(expected["nodes"], 5);
+        assert_eq!(run()["nodes"], 5);
     }
     #[test]
     fn cancellation_after_first_batch_keeps_only_committed_rows() {

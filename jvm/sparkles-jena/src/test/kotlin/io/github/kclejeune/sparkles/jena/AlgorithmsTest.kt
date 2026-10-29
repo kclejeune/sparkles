@@ -17,6 +17,18 @@ class AlgorithmsTest {
     private val rank = JSON.parse("""{"algorithm":"pageRank","projection":"p"}""")
     private val write = JSON.parse("""{"algorithm":"pageRank","projection":"p","write":{"graph":"urn:out","predicates":{"score":"urn:rank"},"batchSize":2}}""")
 
+    @Test fun stats_honours_dataset_override_of_standard_prefix() {
+        SparklesDatasets.memory().use { ds ->
+            ds.load(ByteArrayInputStream(initial.toByteArray()), Lang.TURTLE)
+            val request = JSON.parse("""{"algorithm":"pageRank","projection":{"predicates":["rdf:p"]}}""")
+            assertEquals(0, ds.algorithms().stats(request).getNumber("nodes").toInt())
+            ds.prefixes().add("rdf", "urn:")
+            assertTrue(ds.algorithms().queryText(request).contains("<urn:p>"))
+            ds.algorithms().run(request).use { assertEquals(5, it.select().asSequence().count()) }
+            assertEquals(5, ds.algorithms().stats(request).getNumber("nodes").toInt())
+        }
+    }
+
     @Test fun algorithms_preserve_views_revisions_and_controls() {
         SparklesDatasets.memory().use { ds ->
             ds.load(ByteArrayInputStream(initial.toByteArray()), Lang.TURTLE)
