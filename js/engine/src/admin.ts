@@ -190,12 +190,30 @@ export interface GroupsAnswer {
   reason?: string;
   levels?: { level: number; communities: number }[];
 }
+export interface MappingInputs {
+  sources?: Record<string, string>;
+  connections?: Record<string, string>;
+  directory?: string;
+  base?: string;
+}
+export type MappingRunOptions = MappingInputs &
+  UpdateOptions & {
+    version?: number | bigint;
+    replace?: boolean;
+    author?: string;
+    message?: string;
+  };
+export interface MappingRun {
+  receipt: CommitReceipt;
+  stats: { rows: bigint; quads: bigint; warnings: string[]; joins: string[] };
+}
 export class Administration {
   readonly snapshots;
   readonly history;
   readonly settings;
   readonly prefixes;
   readonly queries;
+  readonly mappings;
   readonly algorithms;
   readonly graph;
   readonly branches;
@@ -322,6 +340,63 @@ export class Administration {
       },
       retention: setting(call, 'retention'),
       changeLog: setting(call, 'changeLog'),
+    };
+    this.mappings = {
+      list: (o?: OperationOptions) => call<Configuration[]>('mappings.list', {}, o, false),
+      get: (name: string, version?: number | bigint, o?: OperationOptions) =>
+        call<Configuration | null>(
+          'mappings.get',
+          { name, version: version === undefined ? undefined : unsigned(version) },
+          o,
+          false,
+        ),
+      versions: (name: string, o?: OperationOptions) =>
+        call<Configuration[] | null>('mappings.versions', { name }, o, false),
+      lastRun: (name: string, o?: OperationOptions) =>
+        call<Configuration | null>('mappings.lastRun', { name }, o, false),
+      put: (
+        name: string,
+        text: string,
+        options: UpdateOptions & {
+          kind?: string;
+          description?: string;
+          author?: string;
+          message?: string;
+          ifVersion?: number | bigint;
+        } = {},
+      ) =>
+        call<Configuration>(
+          'mappings.put',
+          {
+            ...options,
+            name,
+            text,
+            ifVersion: options.ifVersion === undefined ? undefined : unsigned(options.ifVersion),
+          },
+          options,
+          true,
+        ),
+      delete: (name: string, options: UpdateOptions & { ifVersion?: number | bigint } = {}) =>
+        call<boolean>(
+          'mappings.delete',
+          {
+            name,
+            ifVersion: options.ifVersion === undefined ? undefined : unsigned(options.ifVersion),
+          },
+          options,
+          true,
+        ),
+      run: (name: string, options: MappingRunOptions = {}) =>
+        call<MappingRun>(
+          'mappings.run',
+          {
+            ...options,
+            name,
+            version: options.version === undefined ? undefined : unsigned(options.version),
+          },
+          options,
+          true,
+        ),
     };
     this.queries = {
       run: (
@@ -643,6 +718,7 @@ const counts = new Set([
   'seq',
   'parent',
   'quads',
+  'rows',
   'inserted',
   'deleted',
   'head',

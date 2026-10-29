@@ -2,6 +2,8 @@
 //! nested field. The Java surface uses Jena's JSON trees and typed outer records.
 use crate::{ErrorKind, FfiDataset, FfiError, FfiOperation, FfiReadTxn, FfiResult, FfiWriteTxn};
 use std::sync::Arc;
+#[path = "mapping_control.rs"]
+mod mapping_control;
 pub(crate) fn encode<T: serde::Serialize>(value: &T) -> FfiResult<Vec<u8>> {
     serde_json::to_vec(value).map_err(|e| FfiError::new(ErrorKind::Invalid, e.to_string()))
 }
@@ -90,8 +92,181 @@ fn schema_request(
         ..Default::default()
     })
 }
+#[derive(Clone, Debug, uniffi::Record)]
+pub struct MappingInputs {
+    pub sources: std::collections::HashMap<String, String>,
+    pub connections: std::collections::HashMap<String, String>,
+    pub directory: Option<String>,
+    pub base: Option<String>,
+}
+#[derive(Clone, Debug, uniffi::Record)]
+pub struct MappingRunRequest {
+    pub version: Option<u64>,
+    pub inputs: MappingInputs,
+    pub replace: bool,
+    pub author: Option<String>,
+    pub message: Option<String>,
+}
+fn mapping_inputs(input: &MappingInputs) -> FfiResult<sparkles::mapping::Inputs> {
+    use sparkles::mapping::{Connection, Inputs, NamedConnection};
+    let connections = input
+        .connections
+        .iter()
+        .map(|(name, url)| {
+            let connection = Connection::from_url(url).map_err(|e| {
+                FfiError::new(ErrorKind::Invalid, format!("connection {name}: {e}"))
+            })?;
+            Ok(NamedConnection {
+                name: name.clone(),
+                connection,
+                jdbc_dsn: None,
+            })
+        })
+        .collect::<FfiResult<Vec<_>>>()?;
+    let mut files: Vec<_> = input
+        .sources
+        .iter()
+        .map(|(name, path)| (name.clone(), path.into()))
+        .collect();
+    files.sort_by(|a, b| a.0.cmp(&b.0));
+    Ok(Inputs {
+        files,
+        dir: input.directory.as_ref().map(Into::into),
+        connections,
+    })
+}
+fn mapping_kind(kind: Option<&str>) -> FfiResult<Option<sparkles::mapping::MappingKind>> {
+    kind.map(|k| {
+        sparkles::mapping::MappingKind::parse(k).ok_or_else(|| {
+            FfiError::new(
+                ErrorKind::Invalid,
+                format!("kind {k:?}: use rml, yarrrml, csvw or template"),
+            )
+        })
+    })
+    .transpose()
+}
+fn mapping_opts(input: &MappingInputs, operation: &FfiOperation) -> sparkles::mapping::RunOptions {
+    let control = operation.control.clone();
+    sparkles::mapping::RunOptions {
+        base: input.base.clone(),
+        check: Some(Arc::new(move || control.check())),
+        ..Default::default()
+    }
+}
 #[uniffi::export]
 impl FfiDataset {
+    pub fn mappings_list(&self) -> FfiResult<Vec<u8>> {
+        encode(&self.inner.ds.mappings().list().into_iter().map(|(name, stored, last)| serde_json::json!({"name": name, "kind": stored.definition.kind, "description": stored.definition.description, "version": stored.version, "lastRun": last})).collect::<Vec<_>>())
+    }
+    pub fn mappings_get(&self, name: String, version: Option<u64>) -> FfiResult<Option<Vec<u8>>> {
+        self.inner
+            .ds
+            .mappings()
+            .get(&name, version)
+            .as_ref()
+            .map(encode)
+            .transpose()
+    }
+    pub fn mappings_versions(&self, name: String) -> FfiResult<Option<Vec<u8>>> {
+        self.inner
+            .ds
+            .mappings()
+            .versions(&name)
+            .as_ref()
+            .map(encode)
+            .transpose()
+    }
+    pub fn mappings_last_run(&self, name: String) -> FfiResult<Option<Vec<u8>>> {
+        self.inner
+            .ds
+            .mappings()
+            .last_run(&name)
+            .as_ref()
+            .map(encode)
+            .transpose()
+    }
+    pub fn mappings_put(
+        &self,
+        name: String,
+        text: String,
+        kind: Option<String>,
+        description: Option<String>,
+        change: QueryChange,
+    ) -> FfiResult<Vec<u8>> {
+        self.inner.check_writable()?;
+        let kind = mapping_kind(kind.as_deref())?.or_else(|| sparkles::mapping::detect(&text)).ok_or_else(|| FfiError::new(ErrorKind::Invalid, "the text is not CSVW metadata, R2RML, RML, YARRRML or a CONSTRUCT template; give kind"))?;
+        let def = sparkles::stored_mappings::Definition {
+            kind: kind.name().to_string(),
+            text,
+            description,
+        };
+        let change = sparkles::stored_mappings::Change {
+            author: change.author,
+            message: change.message,
+            if_version: change.if_version,
+            dataset_commit: Some(self.inner.ds.head_commit().seq),
+        };
+        let r = self.inner.ds.mappings().put(&name, def, change)?;
+        encode(
+            &serde_json::json!({"stored": r.stored, "summary": r.summary, "created": r.created, "changed": r.changed}),
+        )
+    }
+    pub fn mappings_delete(&self, name: String, if_version: Option<u64>) -> FfiResult<bool> {
+        self.inner.check_writable()?;
+        Ok(self.inner.ds.mappings().delete(&name, if_version)?)
+    }
+    pub fn mappings_run(
+        &self,
+        name: String,
+        request: MappingRunRequest,
+        operation: Arc<FfiOperation>,
+    ) -> FfiResult<Vec<u8>> {
+        self.inner.check_writable()?;
+        operation.control.check()?;
+        let write = sparkles::guard::WriteOptions {
+            author: request.author.map(Into::into),
+            message: request.message.map(Into::into),
+            cancel: Some(operation.control.cancel.flag()),
+            deadline: operation.control.deadline,
+            ..Default::default()
+        };
+        let r = self.inner.ds.mappings().run(
+            &name,
+            request.version,
+            &mapping_inputs(&request.inputs)?,
+            &mapping_opts(&request.inputs, &operation),
+            request.replace,
+            &write,
+        )?;
+        encode(&serde_json::json!({"receipt": r.receipt, "stats": r.stats}))
+    }
+    pub fn run_mapping(
+        &self,
+        text: String,
+        kind: Option<String>,
+        input: MappingInputs,
+        graph: Option<String>,
+        operation: Arc<FfiOperation>,
+    ) -> FfiResult<Vec<u8>> {
+        self.inner.check_writable()?;
+        operation.control.check()?;
+        let write = sparkles::guard::WriteOptions {
+            cancel: Some(operation.control.cancel.flag()),
+            deadline: operation.control.deadline,
+            ..Default::default()
+        };
+        let r = mapping_control::run(
+            &self.inner.ds,
+            &text,
+            mapping_kind(kind.as_deref())?,
+            &mapping_inputs(&input)?,
+            &mapping_opts(&input, &operation),
+            graph.as_deref(),
+            &write,
+        )?;
+        encode(&serde_json::json!({"receipt": r.receipt, "stats": r.stats}))
+    }
     pub fn queries_list(&self) -> FfiResult<Vec<u8>> {
         encode(&self.inner.ds.queries().list())
     }

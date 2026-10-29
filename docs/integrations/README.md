@@ -58,6 +58,13 @@ dataset directory. In-memory branches share runtime ownership without a file loc
   The existing JSON methods keep their signatures. It retries as `Retry-After` and
   `RateLimit` direct, and never repeats a write whose outcome is unknown.
 
+The JVM `DatasetGraphSparkles.mappings()` and Node.js `Dataset.mappings` handles list,
+version, store, delete and run mappings. Their `runMapping` methods run mapping text.
+Both return the commit receipt and mapping statistics. The default JVM and Node.js
+packages do not enable SQLite or Parquet mapping sources. Their direct and stored runs
+carry cancellation and deadlines through conversion and the final load. The Rust
+`Dataset::run_mapping` conversion check does not reach its final load. Roadmap item 397.
+
 The [API compatibility policy](../DEVELOPMENT.md#api-compatibility) identifies the
 covered package roots and version rules. HTTP and standard CLI development-baseline
 checks are available. Public Rust and binding release comparisons remain under

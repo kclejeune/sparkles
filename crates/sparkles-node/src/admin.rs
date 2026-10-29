@@ -6,6 +6,7 @@ use sparkles::history::{At, SnapshotOptions};
 mod algo_stats_probe;
 #[cfg(test)]
 mod algo_stats_tests;
+mod mapping_control;
 fn value<T: Serialize>(v: T) -> sparkles::Result<Value> {
     serde_json::to_value(v).map_err(|e| EngineError::invalid(e.to_string()))
 }
@@ -146,6 +147,7 @@ fn u64_field(k: &str) -> bool {
         "seq"
             | "parent"
             | "quads"
+            | "rows"
             | "inserted"
             | "deleted"
             | "head"
@@ -204,6 +206,61 @@ fn config<T: serde::de::DeserializeOwned>(v: &Value) -> sparkles::Result<T> {
     serde_json::from_value(config_numbers(v.clone(), ""))
         .map_err(|e| EngineError::invalid(e.to_string()))
 }
+fn mapping_inputs(a: &Value) -> sparkles::Result<sparkles::mapping::Inputs> {
+    use sparkles::mapping::{Connection, Inputs, NamedConnection};
+    let files: std::collections::BTreeMap<String, std::path::PathBuf> = if a["sources"].is_null() {
+        Default::default()
+    } else {
+        decode(&a["sources"])?
+    };
+    let connections: std::collections::BTreeMap<String, String> = if a["connections"].is_null() {
+        Default::default()
+    } else {
+        decode(&a["connections"])?
+    };
+    let connections = connections
+        .into_iter()
+        .map(|(name, url)| {
+            let connection = Connection::from_url(&url)
+                .map_err(|e| EngineError::invalid(format!("connection {name}: {e}")))?;
+            Ok(NamedConnection {
+                name,
+                connection,
+                jdbc_dsn: None,
+            })
+        })
+        .collect::<sparkles::Result<Vec<_>>>()?;
+    Ok(Inputs {
+        files: files.into_iter().collect(),
+        dir: a["directory"].as_str().map(Into::into),
+        connections,
+    })
+}
+fn mapping_kind(a: &Value) -> sparkles::Result<Option<sparkles::mapping::MappingKind>> {
+    a["kind"]
+        .as_str()
+        .map(|kind| {
+            sparkles::mapping::MappingKind::parse(kind).ok_or_else(|| {
+                EngineError::invalid(format!("kind {kind:?}: use rml, yarrrml, csvw or template"))
+            })
+        })
+        .transpose()
+}
+fn mapping_options(a: &Value, ctl: &sparkles::task::Control) -> sparkles::mapping::RunOptions {
+    let ctl = ctl.clone();
+    sparkles::mapping::RunOptions {
+        base: a["base"].as_str().map(String::from),
+        check: Some(Arc::new(move || ctl.check())),
+        ..Default::default()
+    }
+}
+fn optional_number(a: &Value, key: &str) -> sparkles::Result<Option<u64>> {
+    if a[key].is_null() {
+        Ok(None)
+    } else {
+        number(a, key).map(Some)
+    }
+}
 fn writes(op: &str) -> bool {
     !matches!(
         op,
@@ -248,6 +305,10 @@ fn writes(op: &str) -> bool {
             | "settings.quota.get"
             | "settings.retention.get"
             | "settings.changeLog.get"
+            | "mappings.list"
+            | "mappings.get"
+            | "mappings.versions"
+            | "mappings.lastRun"
             | "queries.list"
             | "queries.get"
             | "queries.versions"
@@ -599,6 +660,33 @@ fn run_admin(
         "graph.groups" => {
             let req = sparkles::overview::GroupsRequest::from_json(&a["request"])?;
             ds.graph().groups(&req, &query_options(v, flag)?)?
+        }
+        "mappings.list" => value(ds.mappings().list().into_iter().map(|(name, stored, last)| json!({"name": name, "kind": stored.definition.kind, "description": stored.definition.description, "version": stored.version, "lastRun": last})).collect::<Vec<_>>())?,
+        "mappings.get" => value(ds.mappings().get(text(a, "name")?, optional_number(a, "version")?))?,
+        "mappings.versions" => value(ds.mappings().versions(text(a, "name")?))?,
+        "mappings.lastRun" => value(ds.mappings().last_run(text(a, "name")?))?,
+        "mappings.put" => {
+            let mapping_text = text(a, "text")?.to_string();
+            let kind = mapping_kind(a)?.or_else(|| sparkles::mapping::detect(&mapping_text)).ok_or_else(|| EngineError::invalid("the text is not CSVW metadata, R2RML, RML, YARRRML or a CONSTRUCT template; give kind"))?;
+            let def = sparkles::stored_mappings::Definition { kind: kind.name().to_string(), text: mapping_text, description: a["description"].as_str().map(String::from) };
+            let change = sparkles::stored_mappings::Change { author: a["author"].as_str().map(String::from), message: a["message"].as_str().map(String::from), if_version: optional_number(a, "ifVersion")?, dataset_commit: Some(ds.head_commit().seq) };
+            let saved = ds.mappings().put(text(a, "name")?, def, change)?;
+            json!({"stored": saved.stored, "summary": saved.summary, "created": saved.created, "changed": saved.changed})
+        }
+        "mappings.delete" => value(ds.mappings().delete(text(a, "name")?, optional_number(a, "ifVersion")?)?)?,
+        "mappings.run" => {
+            let mut write = write_options(v, flag.clone())?;
+            write.author = a["author"].as_str().map(Into::into);
+            write.message = a["message"].as_str().map(Into::into);
+            let r = ds.mappings().run(text(a, "name")?, optional_number(a, "version")?, &mapping_inputs(a)?, &mapping_options(a, ctl), a["replace"].as_bool().unwrap_or(false), &write)?;
+            json!({"receipt": r.receipt, "stats": r.stats})
+        }
+        "runMapping" => {
+            let mut write = write_options(v, ctl.cancel.flag())?;
+            // Retain the operation's absolute deadline across conversion and load.
+            write.deadline = ctl.deadline;
+            let r = mapping_control::run(ds, text(a, "text")?, mapping_kind(a)?, &mapping_inputs(a)?, &mapping_options(a, ctl), a["graph"].as_str(), &write)?;
+            json!({"receipt": r.receipt, "stats": r.stats})
         }
         "queries.list" => value(ds.queries().list())?,
         "queries.get" => value(ds.queries().get(

@@ -388,8 +388,8 @@ node = "Dataset.replace"
 
 ["dataset.run_mapping"]
 python = "Dataset.run_mapping"
-jvm = "planned: a typed handle after the Python one (ROADMAP item 231)"
-node = "planned: a typed handle after the Python one (ROADMAP item 231)"
+jvm = "DatasetGraphSparkles.runMapping"
+node = "Dataset.runMapping"
 
 ["dataset.select"]
 python = "Dataset.select"
@@ -653,33 +653,33 @@ node = "checkData"
 
 ["mappings.delete"]
 python = "Dataset.mappings.delete"
-jvm = "planned: a typed handle after the Python one (ROADMAP item 231)"
-node = "planned: a typed handle after the Python one (ROADMAP item 231)"
+jvm = "SparklesMappings.delete"
+node = "Dataset.mappings.delete"
 
 ["mappings.get"]
 python = "Dataset.mappings.get"
-jvm = "planned: a typed handle after the Python one (ROADMAP item 231)"
-node = "planned: a typed handle after the Python one (ROADMAP item 231)"
+jvm = "SparklesMappings.get"
+node = "Dataset.mappings.get"
 
 ["mappings.list"]
 python = "Dataset.mappings.list"
-jvm = "planned: a typed handle after the Python one (ROADMAP item 231)"
-node = "planned: a typed handle after the Python one (ROADMAP item 231)"
+jvm = "SparklesMappings.list"
+node = "Dataset.mappings.list"
 
 ["mappings.put"]
 python = "Dataset.mappings.put"
-jvm = "planned: a typed handle after the Python one (ROADMAP item 231)"
-node = "planned: a typed handle after the Python one (ROADMAP item 231)"
+jvm = "SparklesMappings.put"
+node = "Dataset.mappings.put"
 
 ["mappings.run"]
 python = "Dataset.mappings.run"
-jvm = "planned: a typed handle after the Python one (ROADMAP item 231)"
-node = "planned: a typed handle after the Python one (ROADMAP item 231)"
+jvm = "SparklesMappings.run"
+node = "Dataset.mappings.run"
 
 ["mappings.versions"]
 python = "Dataset.mappings.versions"
-jvm = "planned: a typed handle after the Python one (ROADMAP item 231)"
-node = "planned: a typed handle after the Python one (ROADMAP item 231)"
+jvm = "SparklesMappings.versions"
+node = "Dataset.mappings.versions"
 
 ["queries.delete"]
 python = "Dataset.queries.delete"

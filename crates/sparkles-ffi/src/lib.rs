@@ -45,7 +45,9 @@ pub use backups::{
 };
 pub use branches::{BranchInfo, ConflictCell, MergeInfo, MergeSettings};
 pub use catalog::{CatalogFile, DatasetInfo, FfiCatalog, FfiReservation, catalog_inspect};
-pub use documents::{BoundQuery, GroupsOpts, QueryChange, SchemaRequest};
+pub use documents::{
+    BoundQuery, GroupsOpts, MappingInputs, MappingRunRequest, QueryChange, SchemaRequest,
+};
 pub use settings::{CompactionSettings, QuotaInfo, RetentionSettings, SnapshotSchedule};
 mod cursor;
 mod jni_calls;

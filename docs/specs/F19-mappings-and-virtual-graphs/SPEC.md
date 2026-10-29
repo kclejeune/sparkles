@@ -937,7 +937,7 @@ design remains part of its original record.
 
 ## Outcome
 
-Materialized mappings over the implemented CSV, TSV, JSON, local Parquet and SQLite sources are available. Remaining Phase 1 source and administration gaps are tracked under items 230 to 239, and virtual graphs remain under item 43.
+Materialized mappings over the implemented CSV, TSV, JSON, local Parquet and SQLite sources are available. The JVM and Node.js bindings expose stored and direct mapping runs. Remaining Phase 1 source and administration gaps are tracked under items 230 and 232 to 239. Item 397 carries structured native Rust cancellation and deadlines through direct mapping conversion and final load. Virtual graphs remain under item 43.
 
 See the [delivery record](OUTCOME.md#outcome) for implementation departures,
 validation, measurements and the detailed follow-ups. The [landing page](README.md)

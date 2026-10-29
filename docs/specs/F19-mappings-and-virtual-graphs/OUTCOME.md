@@ -90,8 +90,12 @@ roadmap item 43.
   A stored run in replace mode replaces every graph its constant graph maps name in one
   commit through `ReplaceTarget::Graphs`, a new variant of `Store::replace`. The library
   has `Dataset::mappings`, `StoredMappings::run` and `Dataset::run_mapping`, and Python
-  has `Dataset.mappings` and `Dataset.run_mapping`. The JVM and Node.js bindings are
-  planned under roadmap item 231.
+  has `Dataset.mappings` and `Dataset.run_mapping`. The JVM and Node.js bindings also
+  expose stored mapping handles and direct mapping runs. Their default builds do not
+  enable SQLite or Parquet sources. The binding runs carry cancellation and deadlines
+  through conversion and the final load. The Rust `Dataset::run_mapping` conversion
+  check does not reach its final load. Roadmap item 397 adds structured cancellation
+  and deadlines through both steps.
 
 Decisions this spec left open, made during implementation:
 
@@ -162,7 +166,10 @@ Tests and conformance:
   Parquet, conversion round trips, refusals, functions and a 200,000-row run that
   streams. `tabular/tests.rs` covers A7 to A9. `tests/cli_map.rs` runs the command line,
   `http/router_tests/mappings.rs` covers the routes, A11 and the `connections` kind, and
-  `crates/sparkles-py/tests/test_mappings.py` covers Python.
+  `crates/sparkles-py/tests/test_mappings.py` covers Python. The Node administration
+  and JVM structured administration tests cover mapping revisions, runs and refusals.
+  `crates/sparkles/tests/mapping_binding_control.rs` checks cancellation and deadlines
+  at conversion and the final writer for the two binding adapters.
 * The W3C CSVW test suite is not vendored, which is roadmap item 235.
 
 Measurements:
