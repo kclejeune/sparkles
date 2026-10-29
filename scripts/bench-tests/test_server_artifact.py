@@ -420,6 +420,24 @@ class ArchiveContracts(unittest.TestCase):
         self.assertFalse(receipt["passed"])
         self.assertEqual(receipt["container_user"], {"uid": 1500, "gid": 1600})
 
+    def test_debian_receipt_records_trust_and_refusal_precedes_server(self):
+        self.fixture()
+        output = self.work / "debian-evidence"
+        fixture = {"version": 1, "sha256": "fixed"}
+        with patch.object(smoke, "debian_trust_fixture", return_value=(self.work / "ca.pem", fixture)), \
+             patch.object(smoke.Runtime, "start", side_effect=RuntimeError("stop before server")), \
+             patch.object(smoke.Runtime, "cleanup"):
+            with self.assertRaisesRegex(RuntimeError, "stop before server"):
+                smoke.smoke(self.archive, self.sums, self.version, "debian11", output)
+        receipt = json.loads((output / "receipt.json").read_text())
+        self.assertEqual(receipt["trust_fixture"], fixture)
+        self.assertFalse(receipt["passed"])
+        output = self.work / "bad-debian-evidence"
+        with patch.object(smoke, "debian_trust_fixture", side_effect=ValueError("bad trust")), \
+             patch.object(smoke, "Runtime", side_effect=AssertionError("server must not start")):
+            with self.assertRaisesRegex(ValueError, "bad trust"):
+                smoke.smoke(self.archive, self.sums, self.version, "debian11", output)
+
     def test_create_timeout_also_cleans_container(self):
         calls = []
 
@@ -486,6 +504,122 @@ class ArchiveContracts(unittest.TestCase):
         receipt = json.loads((output / "receipt.json").read_text())
         self.assertFalse(receipt["passed"])
         self.assertEqual(receipt["container_user"], {"uid": 0, "gid": 0})
+
+
+class RuntimeTrustAndReadiness(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.root = Path(self.tmp.name)
+        self.addCleanup(self.tmp.cleanup)
+
+    def runtime(self, execute):
+        return smoke.Runtime("image", self.root, self.root, self.root / "logs", execute, user=(1000, 100))
+
+    def test_startup_reset_then_ready_and_no_other_retry(self):
+        calls = []
+        def execute(command, **kwargs):
+            calls.append(command)
+            result = "127.0.0.1:3030" if command[1] == "port" else "true"
+            return subprocess.CompletedProcess(command, 0, result, "")
+        runtime = self.runtime(execute)
+        with patch.object(runtime, "request", side_effect=[ConnectionResetError(), (b"ok", "text/plain")]), \
+             patch.object(runtime, "binary", return_value=""), patch.object(smoke.time, "sleep"):
+            runtime.start()
+        self.assertEqual(sum(c[1] == "inspect" for c in calls), 1)
+        runtime = self.runtime(execute)
+        with patch.object(runtime, "request", return_value=(b"ok", "text/plain")), \
+             patch.object(runtime, "binary", side_effect=RuntimeError("ping failed")):
+            with self.assertRaisesRegex(RuntimeError, "ping failed"):
+                runtime.start()
+
+    def test_repeated_resets_timeout_and_stopped_container_refuses(self):
+        def execute(command, **kwargs):
+            return subprocess.CompletedProcess(command, 0, "127.0.0.1:3030" if command[1] == "port" else "true", "")
+        runtime = self.runtime(execute)
+        with patch.object(runtime, "request", side_effect=ConnectionResetError()), \
+             patch.object(smoke.time, "monotonic", side_effect=[0, 0, 121]), patch.object(smoke.time, "sleep"):
+            with self.assertRaisesRegex(RuntimeError, "120 seconds"):
+                runtime.start()
+        def stopped(command, **kwargs):
+            return subprocess.CompletedProcess(command, 0, "127.0.0.1:3030" if command[1] == "port" else "false", "")
+        runtime = self.runtime(stopped)
+        with patch.object(runtime, "request", side_effect=ConnectionResetError()):
+            with self.assertRaisesRegex(ValueError, "exited during startup"):
+                runtime.start()
+
+    def test_donor_cleanup_even_when_create_or_copy_times_out(self):
+        for step in ("create", "cp"):
+            calls = []
+            def execute(command, **kwargs):
+                calls.append(command)
+                if command[1] == step: raise subprocess.TimeoutExpired(command, 45)
+                return subprocess.CompletedProcess(command, 0, "", "")
+            with self.subTest(step=step), self.assertRaises(subprocess.TimeoutExpired):
+                smoke.debian_trust_fixture(self.root, execute)
+            self.assertEqual(calls[-1][1:3], ["rm", "--force"])
+            self.assertIn("--pull=never", calls[0])
+            self.assertEqual(calls[0][-1], artifact.IMAGES["runtimes"]["rocky8"])
+
+    def test_invalid_digest_and_pem_are_refused(self):
+        def execute(command, **kwargs):
+            if command[1] == "cp":
+                self.assertTrue(command[2].endswith(":/etc/pki/ca-trust/extracted/pem/tls-ca-bundle.pem"))
+                Path(command[3]).write_bytes(b"invalid")
+            return subprocess.CompletedProcess(command, 0, "", "")
+        with self.assertRaisesRegex(ValueError, "size or digest"):
+            smoke.debian_trust_fixture(self.root, execute)
+        fixture = dict(artifact.IMAGES["debian_trust_fixture"], size=7, sha256=hashlib.sha256(b"invalid").hexdigest())
+        with patch.dict(smoke.artifact.IMAGES, {"debian_trust_fixture": fixture}):
+            with self.assertRaises(smoke.ssl.SSLError):
+                smoke.debian_trust_fixture(self.root, execute)
+
+    def test_fixture_pin_and_refuse_nonregular_or_empty(self):
+        fixture = smoke.artifact.IMAGES["debian_trust_fixture"]
+        self.assertEqual(fixture["version"], 1)
+        self.assertEqual(fixture["donor_runtime"], "rocky8")
+        self.assertEqual(fixture["path"], "/etc/pki/ca-trust/extracted/pem/tls-ca-bundle.pem")
+        self.assertEqual(fixture["size"], 222082)
+        self.assertEqual(fixture["sha256"], "a0a9885edfce047620854ee7bb4214dfc2a19d666b7fc2c9def6f439c69e7739")
+        for kind in ("empty", "symlink"):
+            target = self.root / "debian-ca-bundle.pem"
+            target.unlink(missing_ok=True)
+            def execute(command, **kwargs):
+                if command[1] == "cp":
+                    if kind == "empty": target.write_bytes(b"")
+                    else: target.symlink_to(self.root / "missing")
+                return subprocess.CompletedProcess(command, 0, "", "")
+            with self.subTest(kind=kind), self.assertRaises(ValueError):
+                smoke.debian_trust_fixture(self.root, execute)
+
+    def test_data_requests_do_not_retry_connection_errors(self):
+        runtime = self.runtime(lambda *args, **kwargs: None)
+        runtime.base = "http://127.0.0.1:1"
+        with patch.object(smoke.urllib.request, "urlopen", side_effect=ConnectionResetError()) as call:
+            with self.assertRaises(ConnectionResetError): runtime.request("/ds/sparql")
+            self.assertEqual(call.call_count, 1)
+
+    def test_rocky_runtime_does_not_mount_trust_fixture(self):
+        calls = []
+        def execute(command, **kwargs):
+            calls.append(command)
+            return subprocess.CompletedProcess(command, 0, "127.0.0.1:3030", "")
+        runtime = self.runtime(execute)
+        with patch.object(runtime, "request", return_value=(b"", "")), patch.object(runtime, "binary", return_value=""):
+            runtime.start()
+        self.assertFalse(any("SSL_CERT_FILE" in arg or "sparkles-trust" in arg for arg in calls[0]))
+
+    def test_runtime_trust_is_single_read_only_mount(self):
+        calls = []
+        def execute(command, **kwargs):
+            calls.append(command)
+            return subprocess.CompletedProcess(command, 0, "127.0.0.1:3030", "")
+        runtime = smoke.Runtime("image", self.root, self.root, self.root / "logs", execute, user=(1000,100), trust_file=self.root / "ca.pem")
+        with patch.object(runtime, "request", return_value=(b"", "")), patch.object(runtime, "binary", return_value=""):
+            runtime.start()
+        command = calls[0]
+        self.assertIn(f"type=bind,source={self.root / 'ca.pem'},target=/opt/sparkles-trust/ca.pem,readonly", command)
+        self.assertIn("SSL_CERT_FILE=/opt/sparkles-trust/ca.pem", command)
+        self.assertNotIn(str(ROOT), " ".join(command))
 
 
 class ElfContracts(unittest.TestCase):

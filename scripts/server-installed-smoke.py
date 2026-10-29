@@ -7,6 +7,8 @@ import json
 import os
 from pathlib import Path
 import subprocess
+import ssl
+import stat
 import tempfile
 import time
 import urllib.error
@@ -31,12 +33,43 @@ def expected_bindings(extra=False):
             for subject, value in values]
 
 
+def debian_trust_fixture(output, execute=None):
+    """Extract one pinned public CA data file without starting the donor image."""
+    execute = execute or subprocess.run
+    fixture = artifact.IMAGES["debian_trust_fixture"]
+    artifact.require(fixture["version"] == 1 and fixture["donor_runtime"] == "rocky8", "unsupported trust fixture")
+    image = artifact.IMAGES["runtimes"][fixture["donor_runtime"]]
+    name = "sparkles-ca-donor-" + uuid.uuid4().hex
+    target = output / "debian-ca-bundle.pem"
+    def docker(*args, check=True):
+        result = execute(["docker", *map(str, args)], capture_output=True, text=True, timeout=45)
+        if check and result.returncode:
+            raise RuntimeError(f"docker {args[0]} failed: {result.stderr.strip()}")
+        return result
+    try:
+        docker("create", "--name", name, "--pull=never", "--platform=linux/amd64", image)
+        docker("cp", f"{name}:{fixture['path']}", target)
+    finally:
+        removal = docker("rm", "--force", name, check=False)
+        artifact.require(removal.returncode == 0 or "No such container" in removal.stderr,
+                         "failed to remove CA donor")
+    artifact.require(target.exists() and not target.is_symlink() and stat.S_ISREG(target.stat().st_mode),
+                     "trust fixture must be a regular file")
+    artifact.require(target.stat().st_size == fixture["size"] and artifact.sha256(target) == fixture["sha256"],
+                     "trust fixture size or digest mismatch")
+    context = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
+    context.load_verify_locations(cafile=str(target))
+    artifact.require(bool(context.get_ca_certs()), "trust fixture contains no CA certificates")
+    return target, {**fixture, "donor_image": image, "file": target.name}
+
+
 class Runtime:
-    def __init__(self, image, root, data, logs, execute=None, user=None):
+    def __init__(self, image, root, data, logs, execute=None, user=None, trust_file=None):
         self.image, self.root, self.data, self.logs = image, root, data, logs
         self.execute = execute or subprocess.run
         self.user = user if user is not None else (os.getuid(), os.getgid())
         self.name = "sparkles-installed-" + uuid.uuid4().hex
+        self.trust_file = trust_file
         self.created = False
         self.base = None
 
@@ -56,8 +89,11 @@ class Runtime:
                          "installed smoke requires a non-root host UID and GID")
         # Even a timed-out create may leave the uniquely named container behind.
         self.created = True
+        trust = (["--mount", f"type=bind,source={self.trust_file},target=/opt/sparkles-trust/ca.pem,readonly",
+                  "--env", "SSL_CERT_FILE=/opt/sparkles-trust/ca.pem"] if self.trust_file else [])
         self.docker("create", "--name", self.name, "--pull=never", "--platform=linux/amd64",
                     "--read-only", "--cap-drop=ALL", "--security-opt=no-new-privileges",
+                    "--memory=1g", "--memory-swap=1g", "--pids-limit=256", "--cpus=1",
                     "--user", f"{self.user[0]}:{self.user[1]}",
                     "--tmpfs", "/tmp:rw,nosuid,nodev,mode=1777",
                     "--mount", f"type=bind,source={self.root},target=/opt/sparkles,readonly",
@@ -65,7 +101,7 @@ class Runtime:
                     "--env", "XDG_CONFIG_HOME=/tmp/config", "--env", "XDG_CACHE_HOME=/tmp/cache",
                     "--env", "XDG_STATE_HOME=/tmp/state", "--env", "SPARKLES_UI_DIR=",
                     "--env", "LD_LIBRARY_PATH=", "--publish", "127.0.0.1::3030",
-                    "--entrypoint", "/opt/sparkles/bin/sparkles", self.image,
+                    *trust, "--entrypoint", "/opt/sparkles/bin/sparkles", self.image,
                     "--memory-profile", "small", "serve", "--data", "/data",
                     "--host", "0.0.0.0", "--port", "3030", "--allow-open-network")
         self.docker("start", self.name)
@@ -79,7 +115,7 @@ class Runtime:
                 self.request("/$/ready")
                 self.binary("ping", "--quiet", "--timeout", "4", "127.0.0.1:3030")
                 return
-            except (urllib.error.URLError, TimeoutError):
+            except (urllib.error.URLError, TimeoutError, ConnectionError):
                 state = self.docker("inspect", "--format={{.State.Running}}", self.name).stdout.strip()
                 artifact.require(state == "true", "installed server exited during startup")
                 time.sleep(0.2)
@@ -146,10 +182,13 @@ def smoke(archive, checksums, version, runtime, output):
             artifact.require(record.get("default_features_requested") is True, "defaults were not requested")
             receipt["commit"] = record["commit"]
             # The pinned runtime must already exist locally; pulling is a separate explicit step.
+            trust_file = None
+            if runtime == "debian11":
+                trust_file, receipt["trust_fixture"] = debian_trust_fixture(output)
             data = work / "data"
             data.mkdir()
             for generation in range(2):
-                process = Runtime(image, root, data, output / f"server-{generation}.log", user=user)
+                process = Runtime(image, root, data, output / f"server-{generation}.log", user=user, trust_file=trust_file)
                 try:
                     process.start()
                     artifact.require(process.binary("--version").strip() == f"sparkles {version}",

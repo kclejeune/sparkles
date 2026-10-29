@@ -849,9 +849,14 @@ mise run server:artifact:smoke -- \
   .artifacts/server-candidate/SHA256SUMS 0.1.0 rocky8 .artifacts/server-smoke-rocky8
 ```
 
-Repeat with `debian11` and a separate output directory. The receipts record the image
-digest, source commit, archive checksum and result. These commands define acceptance
-gates whose actual baseline and runtime evidence is pending. The wider platform
+Repeat with `debian11` and a separate output directory. Bare Debian also needs public
+CA data for the installed HTTP client. Pull the pinned Rocky image as the declared
+fixture donor before the Debian run. The controller copies its pinned CA bundle from a
+never-started donor, checks the file and mounts it read-only; it installs no runtime
+libraries. The receipt records the donor, package, digest and archive identity. This
+fixture is not Debian's default trust policy. Local replay of the same candidate passed
+both runtime checks with this fixture and the startup readiness retry. Repaired hosted
+acceptance remains pending. The wider platform
 matrix, signed provenance and published artifacts remain item 59 work.
 
 ## Engineering invariants

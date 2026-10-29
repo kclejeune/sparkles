@@ -639,6 +639,13 @@ attestations, the other Phase 1 server targets and verbose build information rem
 open. Phase 2 is not built. Phase 4a supplies HTTP and standard CLI development-baseline
 guards, and the rest of Phase 4 remains incomplete. See [ROADMAP](../ROADMAP.md) items 58–60.
 
+The bare Debian smoke fixture uses a declared, pinned public CA bundle copied from
+the pinned Rocky image without starting the donor container. The client needs CA data
+at initialization, including for the HTTP ping used by the smoke. The data is mounted
+read-only and does not add runtime libraries. The same candidate passed local two-generation
+smokes on Debian with that fixture and Rocky with startup connection-reset retry. Repaired
+hosted acceptance remains pending; the fixture is not Debian's default trust policy.
+
 ### Phase 1 candidate packaging
 
 `scripts/server-artifact.py` assembles the default-feature server with a required

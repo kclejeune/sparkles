@@ -3,5 +3,13 @@
   "runtimes": {
     "rocky8": "docker.io/library/rockylinux@sha256:9794037624aaa6212aeada1d28861ef5e0a935adaf93e4ef79837119f2a2d04c",
     "debian11": "docker.io/library/debian@sha256:6f519a81440354a85eb592c5f32109ab80605f6b892455983a6f618bf87fabe9"
+  },
+  "debian_trust_fixture": {
+    "version": 1,
+    "donor_runtime": "rocky8",
+    "path": "/etc/pki/ca-trust/extracted/pem/tls-ca-bundle.pem",
+    "package": "ca-certificates-2023.2.60_v7.0.306-80.0.el8_8.noarch",
+    "size": 222082,
+    "sha256": "a0a9885edfce047620854ee7bb4214dfc2a19d666b7fc2c9def6f439c69e7739"
   }
 }
