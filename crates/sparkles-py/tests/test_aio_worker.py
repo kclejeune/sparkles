@@ -13,6 +13,11 @@ import unittest
 from pathlib import Path
 
 _SOURCE = Path(__file__).parents[1] / "python/sparkles/_aio_worker.py"
+if not _SOURCE.is_file():
+    # The wheel gate copies tests outside the checkout and loads installed code.
+    _PACKAGE = importlib.util.find_spec("sparkles")
+    assert _PACKAGE is not None and _PACKAGE.origin is not None
+    _SOURCE = Path(_PACKAGE.origin).with_name("_aio_worker.py")
 _SPEC = importlib.util.spec_from_file_location("sparkles_aio_worker_contract", _SOURCE)
 assert _SPEC is not None and _SPEC.loader is not None
 _MODULE = importlib.util.module_from_spec(_SPEC)

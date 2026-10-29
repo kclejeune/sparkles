@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import importlib
+import importlib.util
 import sys
 import threading
 import types
@@ -243,7 +244,12 @@ def load(factory: Factory) -> Any:
         if existing == name or existing.startswith(name + "."):
             del sys.modules[existing]
     package = types.ModuleType(name)
-    package.__path__ = [str(Path(__file__).parents[1] / "python/sparkles")]
+    source = Path(__file__).parents[1] / "python/sparkles"
+    if not (source / "aio.py").is_file():
+        installed = importlib.util.find_spec("sparkles")
+        assert installed is not None and installed.origin is not None
+        source = Path(installed.origin).parent
+    package.__path__ = [str(source)]
     sys.modules[name] = package
     native = types.ModuleType(name + "._sparkles")
     native.CancelToken, native.Dataset = Token, factory.open

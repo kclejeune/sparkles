@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import os
+import site
 import subprocess
 import sys
 from pathlib import Path
@@ -67,8 +68,13 @@ def test_async_consumer_types(tmp_path: Path) -> None:
     env = dict(
         os.environ,
         MYPY_CACHE_DIR=str(tmp_path / "mypy-cache"),
-        MYPYPATH=str(Path(sparkles.__file__).parent.parent),
     )
+    env.pop("MYPYPATH", None)
+    package_parent = Path(sparkles.__file__).resolve().parent.parent
+    if package_parent not in {Path(path).resolve() for path in site.getsitepackages()}:
+        # Source-assembled packages need an explicit path. Installed PEP561
+        # packages use normal lookup; mypy refuses site-packages on MYPYPATH.
+        env["MYPYPATH"] = str(package_parent)
     command = [sys.executable, "-m", "mypy", "--no-incremental", str(source)]
     result = subprocess.run(
         command, capture_output=True, text=True, env=env, check=False, timeout=30
