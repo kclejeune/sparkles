@@ -215,7 +215,7 @@ fn private_adapters_keep_cancellation_and_deadline_during_final_writer_wait() {
             // Always release the held writer and join before asserting, even on failure.
             let while_held = receiver.recv_timeout(Duration::from_secs(3));
             let unchanged_head = ds.store().snapshot().commit == head;
-            let unchanged_data = ds.len() == 0;
+            let unchanged_data = ds.is_empty();
             drop(held);
             let result = match while_held {
                 Ok(result) => Some(result),
