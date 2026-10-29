@@ -666,6 +666,12 @@ capabilities and remaining work are described by the spec status and Outcome.
 
 ## Outcome
 
+The synchronous Python API and the initial `sparkles.aio` query, cursor and transaction
+surface are available. [Async datasets and cursors](#async-datasets-and-cursors) describes
+their delivered scope and acceptance. Reusable plans, the remaining per-call and memory
+work, further async administration and bulk coverage, and release/platform delivery
+remain under items 32, 33, 40 and 58.
+
 **Delivered.** Phase 1 landed on 2026-10-02 (`fa56e12`) as specified in §2 to §8:
 
 * `crates/sparkles-py`, a cdylib crate in its own cargo workspace, excluded from the root
@@ -1193,9 +1199,9 @@ without the `shacl` feature raises `UnsupportedError`.
     module declared as not using the GIL only after an audit of every `#[pyclass]` for
     shared mutable state without a lock, and with the concurrency tests run under the
     free-threaded interpreter.
-  * *Async wrappers.* A `sparkles.aio` module whose methods run the blocking calls with
-    `asyncio.to_thread` and connect task cancellation to the call's `CancelToken`, and
-    whose cursors are async iterators that fetch each batch the same way.
+  * *Async wrappers.* The initial `sparkles.aio` query, bounded cursor and transaction
+    surface is available. Further administration and bulk operations require their own
+    bounded control contracts and remain under item 58.
 
 ### Async wrapper contract
 
@@ -1252,3 +1258,34 @@ requires real native cancellation, writer admission, commit races, rollback, bou
 batches, retained handles, event-loop responsiveness and thread teardown. Standard
 library fake-backend tests establish wrapper ownership rules but do not replace those
 native and installed-wheel gates.
+
+### Async datasets and cursors
+
+`sparkles.aio` supplies the initial async dataset, query, update, cursor and transaction
+surface described by the contract above. Each dataset serializes native calls on its
+owned worker and binds its handles to one event loop. Queries retain native term and
+result types, cursors fetch bounded batches incrementally, and explicit async close
+settles submitted work and joins the last owned worker outside the event loop.
+Transactions retain the native writer guard and commit or roll back before their end
+is acknowledged. Successful native update and commit results survive cancellation
+that loses publication.
+
+Cancellation of a queued lazy-open waiter leaves the independent opener usable.
+Foreign-loop lifecycle calls refuse before changing cleanup ownership, tokens or
+buffered cursor state. Idle retained cursors and transactions remain usable after
+their parent dataset closes, until they release their own leases.
+
+The source build and a fresh offline installation of a dev-profile abi3 wheel each
+pass 131 selected affected tests on Linux with CPython 3.14.7. These include the native
+query, transaction, cursor, cancellation, thread and stub checks, plus observed native
+writer-admission cancellation and successful native update/commit publication before
+Python acknowledgement. The installed checks resolve runtime modules, type stubs and
+`py.typed` from the wheel, including positive and negative async consumer typing.
+The admission observation requires Linux procfs and is explicitly skipped elsewhere.
+Python 3.10 typing checks also pass. Further interpreter and platform release acceptance
+remains under item 58.
+
+The [usage guide](../USAGE.md#async-datasets-and-cursors) explains configuration,
+early-close behavior and cancellation. Async administration and bulk methods remain
+outside this initial surface. No artifact publication or full item 58 completion is
+included in this delivery.

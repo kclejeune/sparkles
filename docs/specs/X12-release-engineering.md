@@ -215,8 +215,9 @@ x86_64 and aarch64 and for macOS 11 on arm64, plus an sdist. Phase 2 adds:
   GIL on import with a warning, as CPython does for a module without the declaration.
 * **PyPy 3.11** wheels (`pp311`), which PyO3 supports, built for manylinux x86_64 and
   aarch64 and macOS arm64, and tested with the same suite.
-* **Async wrappers**, P01's remaining item, are API work rather than packaging. They
-  belong to P01's addendum.
+* **Async wrappers** belong to [P01](P01-python-bindings.md#async-datasets-and-cursors).
+  Its initial query, cursor and transaction surface is available. Further async
+  administration and bulk coverage remains under item 58.
 
 ### 3.3 JVM
 

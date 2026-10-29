@@ -5759,6 +5759,55 @@ nix build .#sparkles-py                            # or the flake's package for 
 `crates/sparkles-py/python/sparkles/_sparkles.pyi` are the API reference, and editors
 and type checkers read them.
 
+### Async datasets and cursors
+
+`sparkles.aio` provides awaited queries, updates, bounded cursors and transactions.
+The constructor opens the native dataset on its first awaited operation or async
+context entry. It takes the same `path`, `union_default_graph` and `group_commit`
+options as the synchronous constructor.
+
+```python
+import asyncio
+from sparkles import aio
+
+async def main():
+    async with aio.Dataset("mydb") as ds:
+        async with ds.transaction(timeout=5) as tx:
+            await tx.update("INSERT DATA { <urn:alice> <urn:name> 'Alice' }")
+        async with (await ds.select_cursor(
+            "SELECT ?s ?name { ?s <urn:name> ?name }",
+            batch_rows=256, batch_bytes=1 << 20, timeout=5,
+        )) as cursor:
+            async for row in cursor:
+                print(row["s"], row["name"])
+
+asyncio.run(main())
+```
+
+`query`, `select`, `ask` and `update` retain the synchronous API's query options,
+native terms and result types. Timeouts are in seconds and include time waiting for
+dispatch. `select_cursor` and `graph_cursor` fetch one bounded batch at a time.
+Their `stats`, `plan` and `aclose` methods are awaited, and SELECT cursor variables
+remain `Variable` objects. The async signatures are in
+`crates/sparkles-py/python/sparkles/aio.pyi`.
+
+Use async context management or `await cursor.aclose()` when stopping early. A bare
+`async for` followed by `break` does not immediately close its cursor. Transactions
+commit on normal context exit and roll back on an exception while still open.
+`await ds.aclose()` stops in-flight dataset work and rejects new calls. Idle retained
+cursors and transactions keep their captured state and worker lease until they end,
+so close those handles before reopening a persistent directory.
+
+Each dataset uses one worker for native submissions, and each async handle belongs to
+one event loop. Separate async datasets can run concurrently. Task cancellation sets
+an owned native cancellation flag and awaits execution and cleanup before propagating
+`asyncio.CancelledError`. A caller-supplied `CancelToken` stays unchanged. When a direct
+update or commit has already succeeded, its successful result is returned even if task
+cancellation races its acknowledgement. Other native errors keep their existing classes
+and fields.
+
+Further async administration and bulk entry points remain under roadmap item 58.
+
 ### Datasets, loading and queries
 
 ```python
