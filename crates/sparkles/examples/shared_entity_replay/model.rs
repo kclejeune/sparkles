@@ -115,6 +115,7 @@ pub(crate) const MAX_OUTPUT_BYTES: usize = 256 * 1024 * 1024;
 
 pub(crate) const SR: &str = "urn:x-sparkles:representation:";
 pub(crate) const EV: &str = "urn:x-sparkles:evidence:";
+const DESCRIPTION_FIELDS: &[&str] = &["selection", "sourceRevision", "describes"];
 pub(crate) const RDF_TYPE: &str = "http://www.w3.org/1999/02/22-rdf-syntax-ns#type";
 pub(crate) const PROV_REVISION: &str = "http://www.w3.org/ns/prov#wasRevisionOf";
 pub(crate) type ReplayResult<T> = std::result::Result<T, Failure>;
@@ -1247,11 +1248,7 @@ impl Graph {
                 &["jsonPointer", "valueDigest", "methodVersion"][..],
             ),
             (SR, "Entity", &["entityKind"][..]),
-            (
-                SR,
-                "Description",
-                &["selection", "sourceRevision", "describes"][..],
-            ),
+            (SR, "Description", DESCRIPTION_FIELDS),
             (
                 SR,
                 "Identifier",
@@ -1323,12 +1320,22 @@ impl Graph {
             result.extend(self.iris(id, "http://www.w3.org/ns/prov#wasDerivedFrom")?);
             for term in self.objects(id, "http://www.w3.org/1999/02/22-rdf-syntax-ns#reifies") {
                 operation.check()?;
-                if let oxrdf::Term::Triple(triple) = term
-                    && let oxrdf::NamedOrBlankNode::NamedNode(subject) = &triple.subject
-                {
+                if let oxrdf::Term::Triple(triple) = term {
+                    let is_report = triple.predicate.as_str() == format!("{SR}ReportAboutEpisode");
+                    let oxrdf::NamedOrBlankNode::NamedNode(subject) = &triple.subject else {
+                        if is_report {
+                            return Err(Failure::InvalidDomainRecord);
+                        }
+                        continue;
+                    };
                     let subject = subject.as_str();
-                    if self.has_type(subject, &format!("{SR}Description"))
-                        || !self.objects(subject, &format!("{SR}selection")).is_empty()
+                    if is_report {
+                        self.require_type(subject, SR, "Description")?;
+                        result.push(subject.to_owned());
+                    } else if self.has_type(subject, &format!("{SR}Description"))
+                        || DESCRIPTION_FIELDS
+                            .iter()
+                            .any(|field| !self.objects(subject, &format!("{SR}{field}")).is_empty())
                     {
                         result.push(subject.to_owned());
                     }

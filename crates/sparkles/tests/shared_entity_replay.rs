@@ -1920,3 +1920,59 @@ fn observation_header_regression_unknown_claim_kind_is_not_interpreted() {
         ));
     });
 }
+
+fn claim_only_description_refusal(remove_all_role_fields: bool) {
+    with_evolution_graph(|graph, operation| {
+        // No selected or supplied qualified Relation provides another path.
+        graph.records.remove(&ex("A10:reportRelation1"));
+        let view = ex("A10:claimOnlyView");
+        let declaration = supplied_view(
+            &ex("A10"),
+            &view,
+            &[
+                ex("A10:reportRelation1:claim"),
+                ex("A10:episode"),
+                ex("health1"),
+            ],
+            operation,
+        );
+        let delivery =
+            Graph::load_documents(&[(&declaration, oxrdfio::RdfFormat::Turtle)], operation)
+                .unwrap();
+        graph.merge_delivery(delivery, operation).unwrap();
+        let mut retained = RetainedSources::default();
+        retained
+            .insert(
+                graph,
+                &ex("health1"),
+                fixture("raw/health1.json").as_slice(),
+                operation,
+            )
+            .unwrap();
+        let manifest = format!("{view}:manifest");
+        retained
+            .verify_selected(graph, &manifest, operation)
+            .unwrap();
+        graph
+            .records
+            .get_mut(&ex("A10:report1"))
+            .unwrap()
+            .retain(|s| {
+                s.predicate != RDF_TYPE
+                    && s.predicate != format!("{SR}selection")
+                    && (!remove_all_role_fields || s.predicate != format!("{SR}sourceRevision"))
+            });
+        assert_eq!(
+            retained.verify_selected(graph, &manifest, operation),
+            Err(Failure::UnresolvedReference)
+        );
+    });
+}
+#[test]
+fn claim_only_regression_source_revision_field_still_requires_description_role() {
+    claim_only_description_refusal(false);
+}
+#[test]
+fn claim_only_regression_report_relation_requires_description_even_without_role_fields() {
+    claim_only_description_refusal(true);
+}
