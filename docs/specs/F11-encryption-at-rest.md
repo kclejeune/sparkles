@@ -1701,6 +1701,13 @@ recover historical/current epochs across file, environment, credential and comma
 without changing stored slot provenance. Independent review also exercises mixed-epoch reads,
 retirement recovery and provider migration through public interfaces.
 
+Concurrent initialization rechecks for a published repository after acquiring an
+initialization intent and when publication races prefix validation. A delayed caller
+authenticates and attaches the winner before publishing its own key slots. Successful
+attachment preserves the native directory durability fence and removes the obsolete
+intent without rewriting the winner. Wrong credentials, plaintext or malformed markers
+and unrelated objects in a prefix without a repository remain refused.
+
 Remaining Phase 1 work includes Vault, authorized API provider/key-management workflows,
 UI/Nix wiring, paper export and operator recovery workflows, metrics/audit, non-Linux
 protected-memory backends, FIPS operational-mode evidence and representative performance

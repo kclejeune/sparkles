@@ -485,6 +485,13 @@ pub(crate) async fn attach_or_init(
             Err(error) => return Err(error.into()),
         }
     }
+    // An initializer can finish and remove INIT while this caller is wrapping its
+    // keys. Creating a fresh intent afterward does not supersede its durable marker.
+    if let Some(winner) =
+        published_initialization_winner(store, cfg, env, keys, native_root).await?
+    {
+        return Ok(winner);
+    }
     let intent = intent.expect("created or recovered");
     if intent.format != 1
         || intent.kind != "sparkles-repo-initialization"
@@ -523,6 +530,14 @@ pub(crate) async fn attach_or_init(
     let mut listed = store.list(None);
     while let Some(meta) = listed.try_next().await? {
         if !allowed.contains(&meta.location) && meta.location != layout::marker_key() {
+            // Publication can also race the preceding marker check and this LIST.
+            // Ordinary objects belonging to an authenticated winner are valid.
+            drop(listed);
+            if let Some(winner) =
+                published_initialization_winner(store, cfg, env, keys, native_root).await?
+            {
+                return Ok(winner);
+            }
             return Err(BackupError::new(
                 Code::NotARepository,
                 "initialization prefix contains unrelated objects",
@@ -555,6 +570,35 @@ pub(crate) async fn attach_or_init(
     }
     finalize_initialization(store, &intent_key, cfg, native_root).await?;
     Ok(winner)
+}
+
+async fn published_initialization_winner(
+    store: &Arc<dyn ObjectStore>,
+    cfg: &RepoConfig,
+    env: &OpenEnv,
+    keys: &KeyState,
+    native_root: Option<&(std::path::PathBuf, Arc<std::fs::File>)>,
+) -> Result<Option<Marker>> {
+    let Some(bytes) =
+        read_bounded_optional(store, &layout::marker_key(), MAX_SLOT_BYTES as u64).await?
+    else {
+        return Ok(None);
+    };
+    let marker = parse_marker(&bytes)?;
+    if marker.encryption.as_ref().is_none_or(|v| v.is_null()) {
+        return Err(slots::config(
+            "encryption cannot be enabled on an existing plaintext repository",
+        ));
+    }
+    let dir = env
+        .cache_dir
+        .as_ref()
+        .map(|d| d.join(marker.id.to_string()));
+    keys.snapshot(store, marker.id, dir.as_deref()).await?;
+    // Authenticate before removing the intent, and retain the native durability
+    // fence without replacing a marker which may already have been rotated.
+    finalize_initialization(store, &Key::from(INIT), cfg, native_root).await?;
+    Ok(Some(marker))
 }
 
 async fn finalize_initialization(
@@ -629,6 +673,304 @@ pub(crate) async fn put_slot(store: &Arc<dyn ObjectStore>, slot: &Slot) -> Resul
 #[cfg(test)]
 mod tests {
     use super::*;
+    use futures::stream::BoxStream;
+    use object_store::{
+        CopyOptions, GetOptions, GetResult, ListResult, MultipartUpload, ObjectMeta,
+        PutMultipartOptions, PutResult,
+    };
+
+    #[derive(Clone, Copy, Debug)]
+    enum Pause {
+        IntentCreate,
+        PrefixValidation,
+    }
+
+    #[derive(Debug)]
+    struct DelayedIntent {
+        inner: Arc<dyn ObjectStore>,
+        pause: Pause,
+        lists: std::sync::atomic::AtomicUsize,
+        entered: Arc<tokio::sync::Notify>,
+        release: Arc<tokio::sync::Notify>,
+    }
+
+    impl std::fmt::Display for DelayedIntent {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            write!(f, "delayed intent ({})", self.inner)
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl ObjectStore for DelayedIntent {
+        async fn put_opts(
+            &self,
+            location: &Key,
+            payload: PutPayload,
+            opts: PutOptions,
+        ) -> object_store::Result<PutResult> {
+            if matches!(self.pause, Pause::IntentCreate)
+                && location == &Key::from(INIT)
+                && matches!(opts.mode, PutMode::Create)
+            {
+                self.entered.notify_one();
+                self.release.notified().await;
+            }
+            self.inner.put_opts(location, payload, opts).await
+        }
+
+        async fn put_multipart_opts(
+            &self,
+            location: &Key,
+            opts: PutMultipartOptions,
+        ) -> object_store::Result<Box<dyn MultipartUpload>> {
+            self.inner.put_multipart_opts(location, opts).await
+        }
+
+        async fn get_opts(
+            &self,
+            location: &Key,
+            options: GetOptions,
+        ) -> object_store::Result<GetResult> {
+            self.inner.get_opts(location, options).await
+        }
+
+        fn delete_stream(
+            &self,
+            locations: BoxStream<'static, object_store::Result<Key>>,
+        ) -> BoxStream<'static, object_store::Result<Key>> {
+            self.inner.delete_stream(locations)
+        }
+
+        fn list(
+            &self,
+            prefix: Option<&Key>,
+        ) -> BoxStream<'static, object_store::Result<ObjectMeta>> {
+            if matches!(self.pause, Pause::PrefixValidation)
+                && self.lists.fetch_add(1, std::sync::atomic::Ordering::SeqCst) == 1
+            {
+                let (inner, prefix, entered, release) = (
+                    self.inner.clone(),
+                    prefix.cloned(),
+                    self.entered.clone(),
+                    self.release.clone(),
+                );
+                return futures::stream::once(async move {
+                    entered.notify_one();
+                    release.notified().await;
+                    inner.list(prefix.as_ref())
+                })
+                .flatten()
+                .boxed();
+            }
+            self.inner.list(prefix)
+        }
+
+        async fn list_with_delimiter(
+            &self,
+            prefix: Option<&Key>,
+        ) -> object_store::Result<ListResult> {
+            self.inner.list_with_delimiter(prefix).await
+        }
+
+        async fn copy_opts(
+            &self,
+            from: &Key,
+            to: &Key,
+            options: CopyOptions,
+        ) -> object_store::Result<()> {
+            self.inner.copy_opts(from, to, options).await
+        }
+    }
+
+    #[tokio::test]
+    async fn delayed_initializer_attaches_winner_published_before_its_intent() {
+        delayed_initializer_case(Pause::IntentCreate).await;
+    }
+
+    #[tokio::test]
+    async fn initializer_accepts_winner_activity_during_prefix_validation() {
+        delayed_initializer_case(Pause::PrefixValidation).await;
+    }
+
+    async fn delayed_initializer_case(pause: Pause) {
+        tokio::time::timeout(std::time::Duration::from_secs(10), async {
+            let inner: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+            let delayed = Arc::new(DelayedIntent {
+                inner: inner.clone(),
+                pause,
+                lists: Default::default(),
+                entered: Default::default(),
+                release: Default::default(),
+            });
+            let store: Arc<dyn ObjectStore> = delayed.clone();
+            let cfg = RepoConfig {
+                name: "delayed".into(),
+                kind: crate::RepoType::Memory,
+                conditional_writes: true,
+                ..Default::default()
+            };
+            let env = OpenEnv::default();
+            let options = super::super::tests::options(47);
+            let delayed_keys = KeyState::new(options.clone());
+            let winner_keys = KeyState::new(options);
+            let (loser, winner) = tokio::join!(
+                attach_or_init(&store, &cfg, &env, &delayed_keys, None),
+                async {
+                    delayed.entered.notified().await;
+                    let winner = attach_or_init(&inner, &cfg, &env, &winner_keys, None)
+                        .await
+                        .unwrap();
+                    assert!(inner.head(&Key::from(INIT)).await.is_err());
+                    if matches!(pause, Pause::PrefixValidation) {
+                        inner
+                            .put(&Key::from("winner-activity"), PutPayload::from("retained"))
+                            .await
+                            .unwrap();
+                    }
+                    delayed.release.notify_one();
+                    winner
+                }
+            );
+            let loser = loser.unwrap();
+            assert_eq!(loser.id, winner.id);
+            assert_eq!(read_slots(&inner).await.unwrap().len(), 1);
+            assert!(inner.head(&Key::from(INIT)).await.is_err());
+            assert_eq!(
+                parse_marker(
+                    &read_bounded(&inner, &layout::marker_key(), MAX_SLOT_BYTES as u64)
+                        .await
+                        .unwrap()
+                )
+                .unwrap()
+                .id,
+                winner.id
+            );
+        })
+        .await
+        .expect("barrier-controlled initialization did not settle");
+    }
+
+    #[tokio::test]
+    async fn published_winner_must_authenticate_before_intent_cleanup() {
+        let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        let cfg = RepoConfig {
+            name: "winner-authentication".into(),
+            kind: crate::RepoType::Memory,
+            conditional_writes: true,
+            ..Default::default()
+        };
+        let env = OpenEnv::default();
+        let keys = KeyState::new(super::super::tests::options(48));
+        let winner = attach_or_init(&store, &cfg, &env, &keys, None)
+            .await
+            .unwrap();
+        let marker_before = read_bounded(&store, &layout::marker_key(), MAX_SLOT_BYTES as u64)
+            .await
+            .unwrap();
+        let slot_before = read_slots(&store).await.unwrap();
+        let slot_key = slot_key(slot_before[0].id);
+        let slot_before = read_bounded(&store, &slot_key, MAX_SLOT_BYTES as u64)
+            .await
+            .unwrap();
+        store
+            .put(&Key::from(INIT), PutPayload::from("delayed intent"))
+            .await
+            .unwrap();
+        let wrong = KeyState::new(super::super::tests::options(49));
+        let error = published_initialization_winner(&store, &cfg, &env, &wrong, None)
+            .await
+            .unwrap_err();
+        assert_eq!(error.code(), Code::WrongRepositoryKey);
+        assert!(store.head(&Key::from(INIT)).await.is_ok());
+        assert_eq!(
+            read_bounded(&store, &layout::marker_key(), MAX_SLOT_BYTES as u64)
+                .await
+                .unwrap(),
+            marker_before
+        );
+        assert_eq!(
+            read_bounded(&store, &slot_key, MAX_SLOT_BYTES as u64)
+                .await
+                .unwrap(),
+            slot_before
+        );
+        assert_eq!(
+            published_initialization_winner(&store, &cfg, &env, &keys, None)
+                .await
+                .unwrap()
+                .unwrap()
+                .id,
+            winner.id
+        );
+        assert!(store.head(&Key::from(INIT)).await.is_err());
+        assert_eq!(read_slots(&store).await.unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn encrypted_initialization_still_refuses_unrelated_prefix() {
+        let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        store
+            .put(&Key::from("unrelated"), PutPayload::from("retained"))
+            .await
+            .unwrap();
+        let cfg = RepoConfig {
+            name: "unrelated".into(),
+            kind: crate::RepoType::Memory,
+            conditional_writes: true,
+            ..Default::default()
+        };
+        let error = attach_or_init(
+            &store,
+            &cfg,
+            &OpenEnv::default(),
+            &KeyState::new(super::super::tests::options(50)),
+            None,
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(error.code(), Code::NotARepository);
+        assert!(store.head(&layout::marker_key()).await.is_err());
+        assert!(store.head(&Key::from(INIT)).await.is_err());
+        assert_eq!(
+            read_bounded(&store, &Key::from("unrelated"), MAX_SLOT_BYTES as u64)
+                .await
+                .unwrap(),
+            b"retained"
+        );
+    }
+
+    #[tokio::test]
+    async fn published_winner_refuses_plaintext_and_malformed_markers() {
+        for bytes in [
+            Marker::new(Uuid::new_v4(), crate::now_rfc3339()).to_bytes(),
+            b"{}".to_vec(),
+        ] {
+            let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+            store
+                .put(&layout::marker_key(), PutPayload::from(bytes.clone()))
+                .await
+                .unwrap();
+            store
+                .put(&Key::from(INIT), PutPayload::from("intent"))
+                .await
+                .unwrap();
+            let cfg = RepoConfig::default();
+            let keys = KeyState::new(super::super::tests::options(51));
+            assert!(
+                published_initialization_winner(&store, &cfg, &OpenEnv::default(), &keys, None)
+                    .await
+                    .is_err()
+            );
+            assert!(store.head(&Key::from(INIT)).await.is_ok());
+            assert_eq!(
+                read_bounded(&store, &layout::marker_key(), MAX_SLOT_BYTES as u64)
+                    .await
+                    .unwrap(),
+                bytes
+            );
+        }
+    }
+
     #[cfg(all(
         feature = "fs",
         any(target_os = "linux", target_os = "android", target_os = "macos")
