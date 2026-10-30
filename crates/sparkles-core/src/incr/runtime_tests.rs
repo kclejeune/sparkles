@@ -1590,3 +1590,108 @@ fn closing_wakes_every_async_reader() {
     assert_eq!(rx.recv_timeout(Duration::from_secs(10)), Ok((true, true)));
     t.join().unwrap();
 }
+
+/// A `view.json` on disk with an option this release does not run, written by hand or
+/// by another release at format 1, is checked when the views load: the view is
+/// marked failed with `unsupported-option` and never runs, while the other views of
+/// the dataset attach and run.
+#[test]
+fn unsupported_options_on_disk_do_not_run() {
+    use super::views::{Maintenance, ViewMode};
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().to_path_buf();
+    let s = persistent(dir.path(), true);
+    load(&s);
+    let base = || ViewDef::table(q(TEAM_SIZES));
+    let bad: Vec<(&str, ViewDef)> = vec![
+        ("graph-mode", {
+            let mut d = base();
+            d.mode = Some(ViewMode::Graph);
+            d
+        }),
+        ("graph-name", {
+            let mut d = base();
+            d.graph = Some("http://ex/g".into());
+            d
+        }),
+        ("at-commit", {
+            let mut d = base();
+            d.maintenance = Maintenance::Commit;
+            d
+        }),
+        ("branches", {
+            let mut d = base();
+            d.branches = vec!["main".into(), "dev".into()];
+            d
+        }),
+        ("keep-commits", {
+            let mut d = base();
+            d.keep_commits = 5;
+            d
+        }),
+        ("provenance", {
+            let mut d = base();
+            d.provenance = super::views::Provenance::Why;
+            d
+        }),
+    ];
+    for (name, def) in &bad {
+        assert!(def.check().is_err(), "{name} is refused by put");
+        // written as format 1, as an older or newer writer could leave it
+        super::views::write(&root, name, def).unwrap();
+        let bytes = std::fs::read(root.join("views").join(name).join("view.json")).unwrap();
+        let v: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(v["format"], 1);
+    }
+    super::views::write(&root, "good", &base()).unwrap();
+    let rt = runtime(&s, Some(root.clone()));
+    // before any round, the listing already shows the failure
+    for (name, _) in &bad {
+        match rt.get(&s, name).unwrap().state {
+            ViewState::Failed { error } => {
+                assert!(error.starts_with("unsupported-option"), "{name}: {error}")
+            }
+            other => panic!("{name}: {other:?} before the first round"),
+        }
+    }
+    rt.round(&s);
+    upd(&s, "INSERT DATA { :d org:memberOf :t2 }");
+    rt.round(&s);
+    assert_eq!(rt.stats(&s).circuits, 1, "only the good view runs");
+    assert_eq!(
+        read(&rt, &s, "good", None).unwrap(),
+        oracle(&s, TEAM_SIZES, None)
+    );
+    for (name, _) in &bad {
+        match rt.get(&s, name).unwrap().state {
+            ViewState::Failed { error } => {
+                assert!(error.starts_with("unsupported-option"), "{name}: {error}")
+            }
+            other => panic!("{name}: {other:?}"),
+        }
+        let e = read(&rt, &s, name, None).unwrap_err();
+        assert!(e.to_string().contains("unsupported-option"), "{name}: {e}");
+        assert!(
+            !root.join("views").join(name).join("main").exists(),
+            "{name} has no state"
+        );
+        // a rebuild checks the definition again and does not run it
+        rt.rebuild(name).unwrap();
+    }
+    rt.round(&s);
+    assert_eq!(rt.stats(&s).circuits, 1, "a rebuild does not run them");
+    for (name, _) in &bad {
+        assert!(
+            matches!(rt.get(&s, name).unwrap().state, ViewState::Failed { .. }),
+            "{name} after a rebuild"
+        );
+    }
+    // a corrected definition replaces the file and runs
+    rt.put(&s, "keep-commits", base()).unwrap();
+    rt.round(&s);
+    assert_eq!(
+        read(&rt, &s, "keep-commits", None).unwrap(),
+        oracle(&s, TEAM_SIZES, None)
+    );
+    rt.close(&s);
+}

@@ -638,6 +638,16 @@ fn key_of(q: &Query, text: &str, access: Option<&Arc<GraphAccess>>, whole: Optio
     u64::from_le_bytes(h.finalize()[..8].try_into().expect("8 bytes"))
 }
 
+/// Why definition `def` does not run in this release, as `{code}: {message}`: an
+/// option a later phase adds, such as a graph view or maintenance at commit
+/// (`unsupported-option`), or a definition that is not valid (`invalid-view`). `put`
+/// refuses such a definition, and a `view.json` on disk that holds one, written by
+/// hand or by another release at the same format, is marked failed instead of running
+/// as a table view.
+fn unsupported(def: &ViewDef) -> Option<String> {
+    def.check().err().map(|e| format!("{}: {e}", e.code()))
+}
+
 fn failure(e: &Error) -> (String, String) {
     let code = match e {
         Error::Timeout | Error::Cancelled => "pass-timeout",
@@ -658,6 +668,13 @@ impl Runtime {
                     for (name, def, paused) in defs {
                         // a restored or cloned view waits until it is resumed
                         let suspended = paused.as_ref().map(paused_reason);
+                        let error = unsupported(&def);
+                        if let Some(e) = &error {
+                            tracing::warn!(
+                                target: "sparkles::incr::runtime",
+                                "view {name}: {e}; it does not run until it is defined again"
+                            );
+                        }
                         reg.views.insert(
                             name,
                             ViewEntry {
@@ -665,7 +682,7 @@ impl Runtime {
                                 cell: None,
                                 access: None,
                                 suspended,
-                                error: None,
+                                error,
                                 checkpointed: 0,
                                 paused: paused.is_some(),
                             },
@@ -851,6 +868,13 @@ impl Runtime {
             return Ok(());
         };
         if entry.cell.is_some() || entry.suspended.is_some() {
+            return Ok(());
+        }
+        // checked again on every attach, since a change of the host's epoch or a
+        // rebuild clears the error
+        if let Some(e) = unsupported(&entry.def) {
+            let entry = reg.views.get_mut(name).expect("checked above");
+            entry.error = Some(e);
             return Ok(());
         }
         let def = entry.def.clone();
