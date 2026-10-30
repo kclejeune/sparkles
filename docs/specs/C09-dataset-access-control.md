@@ -2184,8 +2184,11 @@ principal records its credential's expiry at authentication: a token's end, a pr
 assertion's `exp`, or a session's absolute lifetime or idle timeout, whichever comes
 first. An open stream does not renew a session. Change feeds, live queries and long
 polls compare that instant with the clock before they send more data, which costs no
-store lookup. Quiet change feeds and long polls wake at the expiry, and live queries
-check it at their one-second tick and again for each event they read. The OIDC
+store lookup. Quiet change feeds and long polls check the caller's access against the
+auth clock every second while they wait, so they end within a second of the expiry,
+also when the clock moves forward during the wait. Live queries check it before every
+event they send, including each page of a snapshot, and every second while they
+coalesce diffs, and they drop data read under an access that has ended. The OIDC
 callback now decides admission and the session lifetime under a policy loaded after
 the provider exchange, and creates the session under the shared issue fence with that
 policy's generation. A reload completing in between makes it decide again, up to three

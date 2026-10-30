@@ -121,11 +121,20 @@ async fn wait_for_commit(
     rx: &mut tokio::sync::watch::Receiver<u64>,
     after: u64,
     until: Instant,
+    principal: &Principal,
 ) {
+    #[cfg(all(test, feature = "auth"))]
+    if let Some(a) = &st.auth {
+        a.run_hook(|h| &mut h.waiting);
+    }
     loop {
+        // The caller's access is checked on every tick against the auth clock, so a
+        // credential that expires or is revoked during a quiet wait ends it within a
+        // second, also when the clock moves forward in the meantime.
         if ds.store.snapshot().commit > after
             || Instant::now() >= until
             || st.phase() == crate::obs::Phase::Draining
+            || !st.access_current(principal)
         {
             return;
         }
@@ -212,13 +221,10 @@ pub(super) async fn changes(
     let mut rx = ds.store.subscribe_commits();
     let mut p = page(&ds, &ask).await?;
     if p.commits.is_empty() && !wait.is_zero() {
-        // a wait ends no later than the caller's credential, which then answers
-        // `access-changed` below
-        let mut until = Instant::now() + wait;
-        if let Some(deadline) = st.access_deadline(&caller) {
-            until = until.min(deadline + Duration::from_secs(1));
-        }
-        wait_for_commit(&st, &ds, &mut rx, after, until).await;
+        // a wait ends when the caller's access does, which answers `access-changed`
+        // below
+        let until = Instant::now() + wait;
+        wait_for_commit(&st, &ds, &mut rx, after, until, &caller).await;
         p = page(&ds, &ask).await?;
     }
     // the view was decided when the caller was authenticated: a page read after the
@@ -393,7 +399,15 @@ impl Feed {
             match page(&self.ds, &self.ask).await {
                 Ok(p) if p.commits.is_empty() => {
                     let (after, until) = (self.ask.after, self.until);
-                    wait_for_commit(&self.st, &self.ds, &mut self.rx, after, until).await;
+                    wait_for_commit(
+                        &self.st,
+                        &self.ds,
+                        &mut self.rx,
+                        after,
+                        until,
+                        &self.principal,
+                    )
+                    .await;
                 }
                 Ok(p) => {
                     for c in &p.commits {
@@ -435,12 +449,6 @@ fn event_stream(
     fmt: DiffFormat,
     principal: Principal,
 ) -> impl IntoResponse {
-    // A quiet stream wakes when its credential expires, a second after its last
-    // valid instant, and ends with `access-changed` before reading on.
-    let mut until = Instant::now() + MAX_STREAM;
-    if let Some(deadline) = st.access_deadline(&principal) {
-        until = until.min(deadline + Duration::from_secs(1));
-    }
     let feed = Feed {
         rx: ds.store.subscribe_commits(),
         st,
@@ -448,7 +456,7 @@ fn event_stream(
         ask,
         fmt,
         queue: Default::default(),
-        until,
+        until: Instant::now() + MAX_STREAM,
         done: false,
         principal,
         revoked: false,

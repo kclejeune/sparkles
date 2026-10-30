@@ -647,19 +647,6 @@ impl AppState {
         true
     }
 
-    /// When the credential a principal was authenticated with expires, as an
-    /// instant a long-lived read can wait for. `None` when it does not expire.
-    pub fn access_deadline(&self, p: &crate::auth::Principal) -> Option<std::time::Instant> {
-        #[cfg(feature = "auth")]
-        if let (Some(a), Some(expires)) = (&self.auth, p.info.expires) {
-            p.access_epoch()?;
-            let left = u64::try_from(expires.saturating_sub(a.now())).unwrap_or(0);
-            return Some(std::time::Instant::now() + std::time::Duration::from_secs(left));
-        }
-        let _ = p;
-        None
-    }
-
     #[cfg_attr(not(test), allow(dead_code))]
     pub fn new(
         data_dir: &Path,

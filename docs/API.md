@@ -3125,8 +3125,9 @@ a query. A stream ends when the server drains. It ends with an `access-changed` 
 when the access policy changes, or when the session or token the stream was opened with
 is revoked or expires, and the client then reconnects under the new grants. A session
 expires at its lifetime or at its idle timeout, counted from the request that opened
-the stream, since a stream does not renew the session. Other users signing in or out do
-not end it.
+the stream, since a stream does not renew the session. The stream ends within a second
+of the expiry and sends nothing read after it, including the rest of a paged snapshot
+and diffs being coalesced. Other users signing in or out do not end it.
 
 ## GraphQL
 

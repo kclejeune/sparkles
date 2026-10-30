@@ -695,6 +695,8 @@ pub struct TestHooks {
     /// after an OIDC callback's provider exchange and policy checks, before its
     /// session is created
     pub before_issue: Option<TestHook>,
+    /// when a change feed or long poll starts waiting for a commit
+    pub waiting: Option<TestHook>,
     /// when a live query starts coalescing events
     pub coalescing: Option<TestHook>,
 }

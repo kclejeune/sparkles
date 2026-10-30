@@ -594,3 +594,44 @@ async fn live_snapshot_pages_stop_at_expiry() {
     assert_eq!(event, "error", "a snapshot page was sent after expiry");
     assert!(data.contains("access-changed"), "{data}");
 }
+
+/// A change feed or long poll waiting through a quiet period ends at its
+/// credential's expiry by the auth clock, without a commit to wake it.
+#[tokio::test]
+async fn quiet_waits_end_at_expiry_by_the_auth_clock() {
+    let s = build(Fixture::default());
+    let (cookie, _) = password_session(&s, "bob").await;
+    let after = head(&s.state, "wiki");
+    let mut feed = open_stream(
+        &s,
+        &format!("/wiki/changes?after={after}"),
+        &[("cookie", &cookie)],
+    )
+    .await;
+    let mut buf = String::new();
+    let ran = Arc::new(tokio::sync::Notify::new());
+    s.auth().hooks.lock().waiting = Some(advance_once(43_200, ran));
+    let (event, data) = next_event(&mut feed, &mut buf).await;
+    assert_eq!(event, "error", "{data}");
+    assert!(data.contains("access-changed"), "{data}");
+
+    let s = build(Fixture::default());
+    let (cookie, _) = password_session(&s, "bob").await;
+    let after = head(&s.state, "wiki");
+    let ran = Arc::new(tokio::sync::Notify::new());
+    s.auth().hooks.lock().waiting = Some(advance_once(43_200, ran));
+    let r = tokio::time::timeout(
+        Duration::from_secs(10),
+        call(
+            &s.app,
+            "GET",
+            &format!("/wiki/changes?after={after}&wait=60"),
+            &[("cookie", &cookie)],
+            "",
+        ),
+    )
+    .await
+    .expect("a long poll must end at its credential's expiry");
+    assert_eq!(r.status, StatusCode::CONFLICT, "{}", r.text());
+    assert_eq!(r.err()["code"], "access-changed");
+}
