@@ -2353,3 +2353,69 @@ mod switch_tests {
         assert_eq!(rt.switched.load(Ordering::Acquire), 7);
     }
 }
+
+#[cfg(test)]
+mod compiler_tests {
+    use super::COMPILER;
+    use sha2::{Digest, Sha256};
+
+    /// Each compiler version with the fingerprint of the operator variant list it
+    /// compiles to, oldest first. A change to `ops::Op` changes what a circuit's state
+    /// holds, so it needs a new `COMPILER` and a new row here: a state checkpointed by
+    /// the old compiler is then refused by its fingerprint and the view is built
+    /// again, instead of being decoded into the wrong operators.
+    const VERSIONS: &[(&str, &str)] = &[("f13-phase1-2", "650d426b8dbb3bb3")];
+
+    /// The variants of `ops::Op` as the source declares them, without comments or
+    /// whitespace.
+    fn op_variants() -> String {
+        let src = include_str!("ops/mod.rs");
+        let start = src
+            .find("pub enum Op {")
+            .expect("ops::Op is declared in ops/mod.rs");
+        let body = &src[start..];
+        let end = body.find("\n}").expect("the end of ops::Op");
+        body[..end]
+            .lines()
+            .map(|l| l.split("//").next().unwrap_or(""))
+            .flat_map(|l| l.split_whitespace())
+            .collect::<Vec<_>>()
+            .join(" ")
+    }
+
+    fn fingerprint() -> String {
+        let h = Sha256::digest(op_variants().as_bytes());
+        h[..8].iter().map(|b| format!("{b:02x}")).collect()
+    }
+
+    /// The operator variants and `COMPILER` change together.
+    #[test]
+    fn compiler_version_follows_the_operators() {
+        let got = fingerprint();
+        let (version, pinned) = VERSIONS.last().expect("a version");
+        assert_eq!(
+            (*version, *pinned),
+            (COMPILER, got.as_str()),
+            "ops::Op changed ({}): bump COMPILER in incr/runtime.rs and add \
+             (\"<new COMPILER>\", \"{got}\") to VERSIONS",
+            op_variants()
+        );
+        // a version names one variant list; a bump for another reason, such as a
+        // change of an operator's state encoding, may keep the list
+        for (i, (v, _)) in VERSIONS.iter().enumerate() {
+            for (w, _) in &VERSIONS[i + 1..] {
+                assert_ne!(v, w, "COMPILER {v:?} is listed twice");
+            }
+        }
+    }
+
+    /// The fingerprint covers the variants and nothing around them.
+    #[test]
+    fn the_fingerprint_reads_the_variant_list() {
+        let v = op_variants();
+        assert!(v.starts_with("pub enum Op {"), "{v}");
+        assert!(v.contains("Bgp(Box<bgp::Bgp>),"), "{v}");
+        assert!(v.contains("Template(Box<template::Template>),"), "{v}");
+        assert!(!v.contains("impl"), "{v}");
+    }
+}
