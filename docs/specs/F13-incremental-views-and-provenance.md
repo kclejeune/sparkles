@@ -891,9 +891,10 @@ capabilities and remaining work are described by the spec status and Outcome.
 - Backups and persistent clones carry the view definitions, captured under the store's
   writer lock with the data (item 220, recorded in
   [F05](F05-snapshot-repositories/OUTCOME.md#recovery-of-managed-definitions)). A
-  restored or cloned view is suspended with the reason `restored` or `cloned`, kept in
-  `views/{name}/paused.json`, until a rebuild resumes it and its principal and stored
-  query resolve again. Checkpoints are not carried, and a resumed view is built from the
+  restored or cloned view is suspended with the reason `restored` or `cloned`, kept in a
+  paused `view.json` of format 2 that older releases refuse, until a rebuild resumes it,
+  writes format 1 again, and its principal and stored query resolve again. A definition
+  is at most 1 MiB. Checkpoints are not carried, and a resumed view is built from the
   data. In-memory clones carry no views, which item 401 tracks.
 - PUT starts a `view-build` task that waits for the first evaluation on the worker,
   rather than running the evaluation in the task.

@@ -22,10 +22,13 @@ spends none of the pre-authentication budget.
 
 Backups and persistent clones carry the views' definitions, captured under the store's
 writer lock with the data. Manifest entries name each definition's kind and file
-version, and the manifest requires the `definitions` feature, which older releases
-refuse to restore while still verifying and collecting such backups. Restored and
-cloned views stay suspended until a rebuild resumes them. Restores refuse unsafe,
-duplicate, unknown or damaged definition entries before publishing.
+version, and the manifest requires the `definitions` feature. Older releases refuse to
+restore or verify such backups, and their garbage collection keeps the blobs. Restored
+and cloned views stay suspended in a `view.json` of format 2, which older releases
+refuse, until a rebuild resumes them. Restores refuse unsafe, duplicate, unknown,
+oversized or damaged definition entries before publishing, and a backup whose
+definitions a restore would refuse fails before it uploads anything. View definitions
+are limited to 1 MiB, and a `--read-only` server refuses view rebuilds.
 
 Node graph overviews retain one absolute deadline across their native subqueries
 instead of renewing the timeout for each query.

@@ -3034,9 +3034,9 @@ operator `incremental` or `recompute`, with the reason.
 |---|---|---|---|
 | GET | `/$/views/{ds}` | `read` | `{dataset, views: [...]}`, each view with its definition and state but without its plan. |
 | GET | `/$/views/{ds}/{name}` | `read` | The view with its state, its columns, its rows counted with multiplicity, `stateBytes`, the passes run and skipped, `passMs`, `recomputeMs`, `evaluation` and its plan. A caller who may not read the view's rows gets neither `rows` nor `stateBytes`, here or in the list. |
-| PUT | `/$/views/{ds}/{name}` | `admin` | Defines or replaces the view and starts its first evaluation as a `view-build` task. `201` for a new view, `200` otherwise, with the plan and `task`. |
+| PUT | `/$/views/{ds}/{name}` | `admin` | Defines or replaces the view and starts its first evaluation as a `view-build` task. `201` for a new view, `200` otherwise, with the plan and `task`. A definition larger than 1 MiB is `400 invalid-view`. |
 | DELETE | `/$/views/{ds}/{name}` | `admin` | Removes the view and its state (`204`). |
-| POST | `/$/views/{ds}/{name}/rebuild` | `admin` | Evaluates the view again from scratch as a task and lifts a suspension (`202`). |
+| POST | `/$/views/{ds}/{name}/rebuild` | `admin` | Evaluates the view again from scratch as a task and lifts a suspension (`202`), including the pause of a restored or cloned view. A `--read-only` server answers `403`. |
 
 A view's `state` is `building` while it is evaluated, `current` at the head commit,
 `behind` with `commits` while its pass runs after a commit, `suspended` with a `reason`
@@ -3080,7 +3080,9 @@ view is built from the data. An in-memory dataset keeps view state in memory onl
 Backups and persistent clones carry the view definitions but not their checkpoints. A
 restored or cloned view is suspended with the reason `restored` or `cloned`, answers
 reads with `503 view-suspended`, and stays suspended across restarts until
-`POST /$/views/{ds}/{name}/rebuild` or a new definition resumes it. The view then
+`POST /$/views/{ds}/{name}/rebuild` or a new definition resumes it. A suspended
+definition is kept as `view.json` format 2, which releases from before backups of views
+refuse, so they never run it. A `--read-only` server refuses rebuilds with `403`. The view then
 resolves its principal and its stored query under the server's current policy, and is
 `failed` when either no longer resolves. In-memory clones carry no views.
 
@@ -4872,8 +4874,10 @@ changed meaning. `sparkles backup` works on repositories directly and calls no r
 * the view definitions (`views/{name}/view.json`), read under the writer lock with the
   captured commit, so each backup holds the definitions that were current at that
   commit. Each entry names its kind and file version in `definition`, and the manifest
-  then lists `definitions` in `requires`. Older releases refuse to restore such a
-  backup, and still verify it and keep its blobs during garbage collection.
+  then lists `definitions` in `requires`. Older releases refuse to restore or verify
+  such a backup, and keep its blobs during garbage collection. A definition that a
+  restore would refuse fails the backup with `400 invalid-request` before anything is
+  uploaded.
 
 The full-text index is left out and rebuilt when the restored dataset opens
 (`derived.text.rebuildOnRestore`). Older index generations, named snapshots and the

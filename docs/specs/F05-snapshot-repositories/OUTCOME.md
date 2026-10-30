@@ -250,14 +250,17 @@ entry, a live source and its own pause semantics when it is built.
 kind skips it after checking that its path is a plain relative one. A manifest with
 definition entries lists `definitions` in its `requires`. The manifest keeps `format`
 1, so a backup without views has the layout older releases wrote. The format registry
-lists the entry as `backup-definition`, the features in `BACKUP_MANIFEST_FEATURES`, the
-kinds in `DEFINITIONS` and the pause marker `paused.json` among the settings files.
+lists the entry as `backup-definition`, the features in `BACKUP_MANIFEST_FEATURES` and
+the kinds in `DEFINITIONS`. An entry always holds a definition as it runs, at format 1
+for a view.
 
-The manifest format stays 1 on purpose. Older releases ignore unknown members, so they
-read such a manifest, keep its blobs referenced during garbage collection and verify
-them. Their restore refuses it before writing anything, because the definition path is
-not one of the paths they allow. Raising the manifest format would instead make an older
-server's garbage collection stop at the first new manifest. A reader of this release
+The manifest format stays 1 on purpose. Older releases ignore unknown members, so their
+garbage collection parses such a manifest and keeps its blobs. Their validation refuses
+it, because the definition path is not one of the paths they allow. Their restore
+therefore refuses it before writing anything, and their verification reports the backup
+as invalid, so a whole-repository verification by an older release also counts the
+blobs only that backup references as orphans. Raising the manifest format would instead
+make an older server's garbage collection stop at the first new manifest. A reader of this release
 refuses a manifest that requires an unknown feature, a required definition of an unknown
 kind and a definition file newer than it reads, each with `422 incompatible-format`.
 
@@ -271,8 +274,13 @@ capture holds the writer lock for no longer than before. Definitions are uploade
 the lock is released, as the data files are. A definition changed during or after the
 capture is not the captured one. A store without a live source, such as a stopped
 database that `backup create --loc` opens, reads the definitions from its directory
-under the writer lock, while its process lock keeps other writers out. Definitions that
-cannot be read refuse the capture rather than being left out. Backups of in-memory
+under the writer lock, while its process lock keeps other writers out, and records a
+paused definition as it would run. Definitions that cannot be read refuse the capture
+rather than being left out. After the lock is released, and before anything is
+uploaded or a clone writes anything, every captured definition is checked as a restore
+would check it. A definition that a restore would refuse fails the backup with
+`400 invalid-request`, so no backup is published that cannot be restored. Defining a
+view refuses a definition larger than 1 MiB, the limit a restore enforces. Backups of in-memory
 datasets carry their views, which their runtime keeps in memory.
 
 **Restore.** The manifest is validated before anything is written. Restore refuses a
@@ -283,21 +291,33 @@ unpublished restore directory. Each directory is created there, an existing path
 is not a plain directory is refused, and files are created with `create_new`, so nothing
 is written through a link. Every blob is checked against its id and length and every
 file against its SHA-256. Each definition must then parse, carry a version this release
-reads and match the version its entry names. A missing or corrupt blob or a failed check
+reads, match the version its entry names, and deserialize as its kind's schema with
+options this release supports. A view's principal and stored query are resolved when it
+resumes, not at restore. A missing or corrupt blob or a failed check
 removes the directory, so the dataset is never published.
 
-**Paused views.** Each restored definition gets `views/{name}/paused.json` with the
-reason `restored`, and a clone writes the reason `cloned`. A paused view keeps its
+**Paused views.** Each restored definition is rewritten as a paused `view.json` of format
+2, which is format 1 with a `paused` member that holds the reason `restored` and the
+time. A clone writes the reason `cloned`. Releases from before item 220 read `view.json`
+only at format 1, so they refuse a paused one: the dataset's views do not attach there,
+while its data is served, which is how an older reader refuses a newer `view.json`.
+An older binary therefore never runs a view that waits for its checks, whether it opens
+a restored or cloned directory or the original. A paused view keeps its
 definition but has no circuit, runs no passes and answers reads with
 `503 view-suspended`. The pause survives restarts. `POST /$/views/{ds}/{name}/rebuild`
-resumes the view. The view then attaches on the next round, which resolves its principal
+resumes the view, which rewrites its `view.json` at format 1 atomically and syncs its
+directory before the suspension is lifted. A `--read-only` server refuses rebuilds with
+`403`, as it refuses view changes. The view then attaches on the next round, which resolves its principal
 under the server's current policy and its stored query, so a principal that does not
 exist or a query that does not resolve leaves the view `failed`. Replacing the view's
 definition also lifts the pause. Derived view checkpoints are not backed up, and a
 resumed view is built from the data.
 
 **Clones.** A persistent clone captures the definitions under the same writer lock as its
-snapshot and writes them paused before it publishes `CURRENT`. A clone of a past state
+snapshot, before it takes the history lease of a shared generation, so a capture that
+fails leaves no lease behind. It writes them paused and syncs the files and their
+directories before it publishes `CURRENT`. `BackupCapture::write_to` syncs them the
+same way. A clone of a past state
 carries the current definitions. In-memory clones carry no view definitions, as they
 carry no stored queries. Roadmap item 401 tracks them.
 
@@ -307,7 +327,9 @@ clone's new identity are not built and remain with
 two views with identical rows after resumption, the pause across a restart, a clone, an
 in-memory dataset, a backup without views that keeps the older layout, every refusal
 (traversal, duplicate, newer version, unknown kind, unknown feature, missing blob,
-corrupt blob, wrong digest, links during staging) and a definition change racing many
+corrupt blob, wrong digest, links during staging, schema mismatches, oversized
+definitions at definition and backup time), the paused format and its rewrite on resume,
+a read-only server's refused rebuild, the lease after a failed clone capture and a definition change racing many
 captures. That test checks that each capture holds the definition current at its commit
 or the one that followed it. A failpoint test changes a definition while the capture
 holds the writer lock and after it releases the lock, and the capture keeps the earlier
