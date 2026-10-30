@@ -2324,14 +2324,24 @@ fn dataset_ready(d: &crate::state::Dataset) -> J {
     v
 }
 
-/// The numbers of declared datasets that are open, opening and failed.
+/// The numbers of declared datasets that are open, opening and failed, each counted
+/// once by the state a request sees: a dataset that startup still holds back is
+/// opening, even once the catalog has it.
 fn dataset_states(st: &AppState) -> (usize, usize, usize) {
-    let opening = st.catalog.opening().len() + st.startup_pending.lock().len();
-    (
-        st.catalog.list().len(),
-        opening,
-        st.catalog.refusals().len(),
-    )
+    let unavailable = st.unavailable_datasets();
+    let opening = unavailable
+        .iter()
+        .filter(|(_, _, u)| matches!(u, crate::state::Unavailable::Opening))
+        .count();
+    let failed = unavailable.len() - opening;
+    let held = st.startup_pending.lock().clone();
+    let open = st
+        .catalog
+        .list()
+        .iter()
+        .filter(|d| !held.contains_key(&d.name))
+        .count();
+    (open, opening, failed)
 }
 
 /// The server's readiness status and whether it is ready (spec C01 §4.1). A server whose

@@ -638,3 +638,75 @@ fn a_shutdown_during_a_later_step_starts_no_further_step() {
     assert!(st.get("stepstop").is_none(), "startup released the dataset");
     assert_eq!(st.phase(), crate::obs::Phase::Draining);
 }
+
+/// Each declared dataset counts once in `sparkles_datasets`, by the state a request
+/// sees: one that startup holds back counts as opening, also once the catalog has it.
+#[tokio::test(flavor = "multi_thread")]
+async fn dataset_states_count_each_dataset_once() {
+    let dir = data_dir(&["cfg", "slow"], false);
+    let (st, pending) = deferred(dir.path(), false);
+    startup::hold(&st, &[], &["cfg".to_string()]).unwrap();
+    let app = router(st.clone());
+    let states = |app: Router| async move {
+        let r = send(
+            &app,
+            Request::get("/$/metrics").body(Body::empty()).unwrap(),
+        )
+        .await;
+        let text = r.text();
+        let n = |state: &str| -> u64 {
+            let key = format!("sparkles_datasets{{state=\"{state}\"}} ");
+            text.lines()
+                .find_map(|l| l.strip_prefix(&key))
+                .unwrap_or_else(|| panic!("no {key} in metrics"))
+                .parse()
+                .unwrap()
+        };
+        let prom = (n("open"), n("opening"), n("failed"));
+        let r = send(
+            &app,
+            Request::get("/$/metrics?format=json")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await;
+        let j = r.json()["datasetStates"].clone();
+        let json = (
+            j["open"].as_u64().unwrap(),
+            j["opening"].as_u64().unwrap(),
+            j["failed"].as_u64().unwrap(),
+        );
+        assert_eq!(prom, json, "the Prometheus and JSON counts differ");
+        prom
+    };
+    // before either dataset is published
+    assert_eq!(states(app.clone()).await, (0, 2, 0));
+
+    let gate = Gate::holding(&["slow"]);
+    let opening = startup::spawn(
+        st.clone(),
+        pending,
+        options(Some(&gate), 2),
+        |_, _| Ok(()),
+        |e| panic!("fatal: {e}"),
+    );
+    let (st2, gate2) = (st.clone(), gate.clone());
+    tokio::task::spawn_blocking(move || {
+        gate2.wait_entered("slow");
+        eventually("cfg is published", || st2.catalog.get("cfg").is_some());
+    })
+    .await
+    .unwrap();
+    // /cfg is in the catalog but held back, and /slow still opens
+    assert_eq!(states(app.clone()).await, (0, 2, 0));
+
+    gate.release("slow");
+    let st2 = st.clone();
+    tokio::task::spawn_blocking(move || {
+        eventually("ready", || st2.phase() == crate::obs::Phase::Ready)
+    })
+    .await
+    .unwrap();
+    assert_eq!(states(app.clone()).await, (2, 0, 0));
+    opening.stop_and_join();
+}

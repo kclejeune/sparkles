@@ -187,7 +187,8 @@ names paths, and other callers get a fixed sentence. `GET /$/server` lists the f
 datasets under `refusedDatasets` with their `kind`, and the ones still opening under
 `openingDatasets`, with the same rules. A caller that may not read a dataset gets the
 same `404` for an opening or failed dataset as for a missing one.
-`sparkles_datasets{state}` counts the datasets that are open, opening and failed.
+`sparkles_datasets{state}` counts each declared dataset once, by the state a request
+sees, so a dataset that startup still holds back counts as opening.
 
 A shutdown during startup stops it as soon as the shutdown begins, before the requests
 in flight drain. Startup opens no more datasets and starts no further step, such as the
