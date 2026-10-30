@@ -71,6 +71,31 @@ fn crash_point(_n: u8) -> Result<(), BackupError> {
     Ok(())
 }
 
+#[cfg(test)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum CloseStage {
+    /// Before the drain of an attempt.
+    Attempt,
+    /// After the drain, immediately before the ownership proof.
+    Proof,
+}
+#[cfg(test)]
+type CloseHook = Box<dyn FnMut(CloseStage, u32)>;
+#[cfg(test)]
+thread_local! {
+    /// Runs at each stage of each close attempt of an in-place swap.
+    pub(crate) static CLOSE_HOOK: std::cell::RefCell<Option<CloseHook>> =
+        const { std::cell::RefCell::new(None) };
+}
+#[cfg(test)]
+fn close_hook(stage: CloseStage, attempt: u32) {
+    CLOSE_HOOK.with_borrow_mut(|hook| {
+        if let Some(hook) = hook {
+            hook(stage, attempt);
+        }
+    });
+}
+
 /// [`replace_in_place`] with its drain time.
 pub(crate) fn replace_with(
     st: &Catalog,
@@ -107,20 +132,6 @@ pub(crate) fn replace_with(
             None => BackupError::internal(format!("no dataset /{name}")),
         });
     };
-    while old.in_use() {
-        if t0.elapsed() >= drain {
-            // it stays as it was
-            st.reinsert(name, old);
-            return Err(BackupError::new(
-                Code::DatasetBusy,
-                format!(
-                    "requests to /{name} did not finish within {} s; the dataset is unchanged",
-                    drain.as_secs()
-                ),
-            ));
-        }
-        std::thread::sleep(Duration::from_millis(5));
-    }
     let Some(root) = old.store().root().map(Path::to_path_buf) else {
         st.reinsert(name, old);
         return Err(BackupError::new(
@@ -157,22 +168,55 @@ pub(crate) fn replace_with(
     };
     // Drain is only a preflight. The final nonblocking proof must also exclude
     // raw Strong/Weak Store and BranchSet aliases before directory publication.
-    match old.close_for_disposal(|| {}) {
-        Ok(reasoning) => {
-            if let Some(detached) = st.inner.detached.lock().get_mut(name) {
-                detached.reasoning = reasoning;
+    // Built-in owners such as a views worker round take short-lived strong
+    // references that the preflight cannot exclude, so a refused proof waits and
+    // retries within the same drain time. Refusal restores every owner exactly.
+    let mut old = old;
+    #[cfg(test)]
+    let mut attempt = 0u32;
+    let reasoning = loop {
+        #[cfg(test)]
+        {
+            attempt += 1;
+            close_hook(CloseStage::Attempt, attempt);
+        }
+        while old.in_use() {
+            if t0.elapsed() >= drain {
+                // it stays as it was
+                st.reinsert(name, old);
+                return Err(BackupError::new(
+                    Code::DatasetBusy,
+                    format!(
+                        "requests to /{name} did not finish within {} s; the dataset is unchanged",
+                        drain.as_secs()
+                    ),
+                ));
+            }
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        #[cfg(test)]
+        close_hook(CloseStage::Proof, attempt);
+        match old.close_for_disposal(|| {}) {
+            Ok(reasoning) => break reasoning,
+            Err(refused) => {
+                old = refused.dataset;
+                if let Some(panic) = refused.panic {
+                    st.reinsert(name, old);
+                    std::panic::resume_unwind(panic);
+                }
+                if t0.elapsed() >= drain {
+                    st.reinsert(name, old);
+                    return Err(BackupError::new(
+                        Code::DatasetBusy,
+                        "the source family still has live owners; the dataset is unchanged",
+                    ));
+                }
+                std::thread::sleep(Duration::from_millis(5));
             }
         }
-        Err(refused) => {
-            st.reinsert(name, refused.dataset);
-            if let Some(panic) = refused.panic {
-                std::panic::resume_unwind(panic);
-            }
-            return Err(BackupError::new(
-                Code::DatasetBusy,
-                "the source family still has live owners; the dataset is unchanged",
-            ));
-        }
+    };
+    if let Some(detached) = st.inner.detached.lock().get_mut(name) {
+        detached.reasoning = reasoning;
     }
     // the storage quota is the operator's, not the backup's: the restored dataset keeps
     // the one it replaces
@@ -326,6 +370,47 @@ mod tests {
         let db = dir.path().join("databases");
         assert!(!tmp.exists() && !db.join(".replaced-ds-7").exists());
         assert!(db.join(".kept-ds-7").join("dataset.json").exists());
+    }
+
+    #[test]
+    fn a_transient_built_in_owner_at_the_proof_is_waited_for() {
+        use std::cell::RefCell;
+        use std::rc::Rc;
+        let dir = tempfile::tempdir().unwrap();
+        let st = state(dir.path());
+        let ds = st.create("ds", &CreateDataset::default()).unwrap();
+        let reference = ds.state_reference();
+        drop(ds);
+        let tmp = dir.path().join("databases").join(".restore-ds-8");
+        restored(&tmp, 3);
+        // A views worker round upgrades the state for its duration. Take that
+        // strong reference after the drain and release it before the next attempt.
+        let stages = Rc::new(RefCell::new(Vec::new()));
+        let seen = stages.clone();
+        let alias = Rc::new(RefCell::new(None));
+        let held = alias.clone();
+        super::CLOSE_HOOK.set(Some(Box::new(move |stage, attempt| {
+            seen.borrow_mut().push((stage, attempt));
+            match (stage, attempt) {
+                (super::CloseStage::Proof, 1) => *held.borrow_mut() = reference.upgrade(),
+                (super::CloseStage::Attempt, 2) => drop(held.borrow_mut().take().unwrap()),
+                _ => {}
+            }
+        })));
+        let swapped = replace_with(&st, "ds", &tmp, "8", false, Duration::from_secs(10));
+        super::CLOSE_HOOK.set(None);
+        assert!(alias.borrow().is_none());
+        let ds = swapped.unwrap();
+        assert_eq!(ds.len(), 3);
+        assert_eq!(
+            *stages.borrow(),
+            [
+                (super::CloseStage::Attempt, 1),
+                (super::CloseStage::Proof, 1),
+                (super::CloseStage::Attempt, 2),
+                (super::CloseStage::Proof, 2),
+            ]
+        );
     }
 
     #[test]

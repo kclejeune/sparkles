@@ -54,6 +54,10 @@ catalog reopens. Catalog startup refuses only a registered dataset whose directo
 CURRENT file is missing and serves the others. Retained delete bytes are named
 `.kept-<name>-<token>`.
 
+An in-place restore no longer fails with "the source family still has live owners" when
+a views worker round briefly holds the dataset as the swap closes it. The swap retries
+its ownership proof until the drain time ends.
+
 Spilled ORDER BY can retry a smaller sort piece after a transient decoding reservation
 fails. Infallible expression failures still stop the query, and memory caps stay enforced.
 
