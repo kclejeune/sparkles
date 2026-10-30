@@ -23,7 +23,7 @@
 //! assert!(text.contains("ex:name xsd:string [1..1] ."));
 //! ```
 
-mod lex;
+pub mod lex;
 mod read;
 mod vocab;
 mod write;
