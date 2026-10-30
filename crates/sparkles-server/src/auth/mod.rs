@@ -64,6 +64,8 @@ pub use routes::{Need, need};
 pub use handlers::MAX_AUTH_BODY;
 #[cfg(feature = "auth")]
 pub use handlers::SESSION_COOKIE;
+#[cfg(all(test, feature = "auth"))]
+pub use policy::AUTH_ATTEMPTS;
 #[cfg(feature = "auth")]
 pub use policy::Auth;
 #[cfg(all(not(test), feature = "auth"))]

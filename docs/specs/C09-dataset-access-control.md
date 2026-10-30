@@ -1273,7 +1273,7 @@ tell them apart. The UI's `Outcome` type gains `'denied'`.
 
 | Name | Type | Labels |
 |---|---|---|
-| `sparkles_auth_failures_total` | counter | `scheme` = `basic`\|`bearer`\|`session`\|`oidc`, `reason` = `malformed`\|`invalid`\|`expired`\|`busy`\|`state`\|`idp`\|`not_allowed` |
+| `sparkles_auth_failures_total` | counter | `scheme` = `basic`\|`bearer`\|`session`\|`oidc`, `reason` = `malformed`\|`invalid`\|`expired`\|`busy`\|`state`\|`idp`\|`not_allowed`\|`changed` |
 | `sparkles_auth_denied_total` | counter | `kind` = `unauthenticated`\|`forbidden`\|`hidden`\|`cross_origin`\|`csrf`\|`not_interactive` |
 | `sparkles_auth_logins_total` | counter | `method` = `oidc`\|`password`\|`token`, `result` = `ok`\|`denied`\|`error` |
 | `sparkles_auth_tokens_minted_total` | counter | `via` = `api`\|`ui`\|`cli-loopback`\|`cli-device` |
@@ -2158,6 +2158,25 @@ grants. Password/token session creation checks the original generation under the
 same mutation fence before eviction or persistence. Requests overlapping real
 authority changes are refused for retry. Last-used bookkeeping and unchanged group
 assertions do not advance the generation. Private auth file formats remain unchanged.
+
+The generation now moves only for changes that can alter more than one credential's
+rights. These are policy reloads, stored group changes and token reissue. Session
+creation and token minting hold a shared issue fence, compare the generation their
+authentication observed and fail only when an exclusive update completed in between.
+They no longer invalidate other principals' cached Basic credentials or streams.
+Logout, back-channel logout, eviction, expiry pruning and token revocation remove only
+the named credentials. Change feeds, live queries and long polls check that their own
+session or token is still stored as well as the generation, so only streams of a
+revoked credential end with `access-changed`. An authentication is
+accepted only when its session or token is still stored after the lookup. The check and
+the revocation take the same store mutex, so a credential revoked during its lookup is
+refused, and token logins and mints remove what they created from a credential revoked
+meanwhile. Basic authentication and password login that observe a generation change
+are computed again as a whole against the current state, with at most three password
+verifications for each request across the auth middleware and the login handler, instead of answering `invalid credentials`. A login
+takes its session lifetime from the policy its password was verified against. A request that still
+overlaps changes gets `503` with code `authority-changed` and `Retry-After: 1`, which
+does not count against the pre-authentication budget.
 
 **Deviations from the spec.**
 

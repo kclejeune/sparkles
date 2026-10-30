@@ -2,10 +2,16 @@
 //!
 //! A generation identifies one stable authority state. It grants no permission,
 //! credential identity, dataset access or write authority. Capture an even value
-//! before a lookup and require the same value afterwards. Every rights mutation
-//! must hold the same registry's update guard across its actual visible changes.
+//! before a lookup and require the same value afterwards. Every mutation that can
+//! change the rights of principals other than one revoked credential must hold the
+//! same registry's update guard across its actual visible changes.
+//!
+//! Issuing a credential adds authority without changing anyone's rights, so it
+//! holds the shared issue guard instead and leaves the generation unchanged. The
+//! issuer compares the generation its authentication observed with the guarded
+//! value and fails only when an exclusive update completed in between.
 
-use parking_lot::{RwLock, RwLockWriteGuard};
+use parking_lot::{RwLock, RwLockReadGuard, RwLockWriteGuard};
 use std::sync::atomic::{AtomicU64, Ordering};
 
 /// A common revocation fence for policy and credential changes.
@@ -42,6 +48,22 @@ impl Drop for AuthorityUpdate<'_> {
     }
 }
 
+/// Holds a registry's shared fence across one credential issuance.
+///
+/// Exclusive updates wait until it drops, and concurrent issuances share it. Do
+/// not acquire another guard of the same registry while holding this one.
+pub struct AuthorityIssue<'a> {
+    epoch: RwLockReadGuard<'a, u64>,
+}
+
+impl AuthorityIssue<'_> {
+    /// The stable generation that no exclusive update can change while this
+    /// guard is held. It is always even.
+    pub fn generation(&self) -> u64 {
+        *self.epoch
+    }
+}
+
 impl AuthorityRegistry {
     /// Observe without blocking, including while a read fence is already held
     /// and an updater is queued. Even values are stable. Odd values mean rights
@@ -63,6 +85,14 @@ impl AuthorityRegistry {
             epoch,
             generation: &self.generation,
             completed,
+        }
+    }
+
+    /// Serialize one issuance against exclusive updates without advancing the
+    /// generation. Waits while an exclusive update is in progress.
+    pub fn begin_issue(&self) -> AuthorityIssue<'_> {
+        AuthorityIssue {
+            epoch: self.epoch.read(),
         }
     }
 }
@@ -99,6 +129,31 @@ mod tests {
         assert_eq!(registry.generation(), original);
         drop(read);
         assert_eq!(registry.generation(), original);
+    }
+
+    #[test]
+    fn issuance_keeps_the_generation_and_excludes_updates_until_it_ends() {
+        let registry = Arc::new(AuthorityRegistry::default());
+        drop(registry.begin_update());
+        let issue = registry.begin_issue();
+        assert_eq!(issue.generation(), 2);
+        assert_eq!(registry.generation(), 2);
+        let update_registry = registry.clone();
+        let (tx, rx) = mpsc::channel();
+        let updater = std::thread::spawn(move || {
+            let update = update_registry.begin_update();
+            tx.send(update.previous_generation()).unwrap();
+        });
+        assert!(
+            rx.recv_timeout(Duration::from_millis(100)).is_err(),
+            "an exclusive update must wait for an issuance in progress"
+        );
+        assert_eq!(registry.generation(), 2);
+        drop(issue);
+        let previous = rx.recv_timeout(Duration::from_secs(2));
+        updater.join().unwrap();
+        assert_eq!(previous.unwrap(), 2);
+        assert_eq!(registry.generation(), 4);
     }
 
     #[test]

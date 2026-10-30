@@ -464,7 +464,7 @@ fn error_responses() -> Map<String, J> {
     put("TooManyRequests", many);
     put("NotImplemented", err("The build lacks the feature."));
     let mut unavailable = err(
-        "Cancelled, over a concurrency limit, offline, being restored, or the identity provider is unreachable.",
+        "Cancelled, over a concurrency limit, offline, being restored, the identity provider is unreachable, or authentication kept overlapping an authority change (`authority-changed`), which is safe to retry and is not a failed credential.",
     );
     unavailable["headers"] = retry;
     put("Unavailable", unavailable);

@@ -860,8 +860,8 @@ capabilities and remaining work are described by the spec status and Outcome.
   server.
 - An SSE row is `{"values": [...]}` with one SPARQL JSON term or `null` per variable, and
   `count` when it is not 1. ASK streams `{commit, value}`. A stream ends with an
-  `access-changed` error on a policy reload, and the client reconnects under the new
-  grants.
+  `access-changed` error on a policy reload or when the stream's own session or token
+  is revoked, and the client reconnects under the new grants.
 - `sparkles query --live` needs `--server`, since a local database sees no other
   writer's commits. It prints text blocks, or JSON lines with `--results json`.
 

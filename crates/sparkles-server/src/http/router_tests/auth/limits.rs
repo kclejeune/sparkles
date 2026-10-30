@@ -676,3 +676,43 @@ async fn device_logins_are_limited_per_network_without_preauth() {
     assert_eq!(start("2001:db8:1::1".into()).await.status, StatusCode::OK);
     assert_eq!(start("203.0.113.8".into()).await.status, StatusCode::OK);
 }
+
+/// A request that keeps overlapping an authority change is told to retry, and the
+/// refusal is not a failed credential: it spends none of the address's budget.
+#[tokio::test]
+async fn authority_changes_answer_a_retryable_status_without_spending_the_budget() {
+    let s = limited(Fixture::default(), &["preauth=1/min"]);
+    let auth = s.auth();
+    let ip = "203.0.113.9";
+    {
+        let _changing = auth.hold_authority_update();
+        for _ in 0..3 {
+            let r = ask_from(&s, ip, &b("bob")).await;
+            assert_eq!(r.status, StatusCode::SERVICE_UNAVAILABLE, "{}", r.text());
+            assert_eq!(r.header("retry-after"), "1");
+            assert_eq!(r.err()["code"], "authority-changed", "{}", r.text());
+            let r = call_from(
+                &s.app,
+                from(ip),
+                "POST",
+                "/$/auth/login",
+                &[("content-type", "application/json")],
+                r#"{"user":"bob","password":"bob-pw"}"#,
+            )
+            .await;
+            assert_eq!(r.status, StatusCode::SERVICE_UNAVAILABLE, "{}", r.text());
+            assert_eq!(r.err()["code"], "authority-changed", "{}", r.text());
+        }
+    }
+    // the address still has its one failure: a wrong password is checked, and only
+    // then is the budget spent
+    let wrong = basic("bob", "wrong");
+    assert_eq!(
+        ask_from(&s, ip, &wrong).await.status,
+        StatusCode::UNAUTHORIZED
+    );
+    assert_eq!(
+        ask_from(&s, ip, &wrong).await.status,
+        StatusCode::TOO_MANY_REQUESTS
+    );
+}

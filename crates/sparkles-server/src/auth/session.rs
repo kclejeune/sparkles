@@ -182,15 +182,6 @@ pub struct SessionStore {
     caps: (usize, usize),
 }
 
-#[derive(Debug)]
-pub(super) struct SessionGenerationChanged;
-impl std::fmt::Display for SessionGenerationChanged {
-    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        formatter.write_str("authentication changed before session creation")
-    }
-}
-impl std::error::Error for SessionGenerationChanged {}
-
 struct SessionCreation {
     method: Method,
     principal: Identity,
@@ -305,7 +296,9 @@ impl SessionStore {
     }
 
     /// Create from one original successful authentication generation. The
-    /// comparison happens under the same exclusive fence as visible issuance.
+    /// comparison happens under the shared issue fence, so it fails with
+    /// [`AuthorityChanged`](super::store::AuthorityChanged) only when an exclusive
+    /// authority update completed after that authentication.
     pub(super) fn create_checked(
         &self,
         original_generation: u64,
@@ -385,11 +378,11 @@ impl SessionStore {
             seq: 0,
         };
         let (max, per_owner) = self.caps;
-        let update = self.authority.begin_update();
-        if original_generation
-            .is_some_and(|original| original & 1 != 0 || original != update.previous_generation())
-        {
-            return Err(SessionGenerationChanged.into());
+        // Issuance changes no other principal's rights, so it shares the fence.
+        // Sessions it evicts are revoked one by one, like a logout.
+        let issue = self.authority.begin_issue();
+        if original_generation.is_some_and(|original| original != issue.generation()) {
+            return Err(super::store::AuthorityChanged.into());
         }
         rec.seq = self.next_seq.fetch_add(1, Ordering::Relaxed);
         let mut ended = Vec::new();
@@ -425,6 +418,7 @@ impl SessionStore {
             seen.remove(&k);
         }
         drop(ids);
+        drop(issue);
         saved?;
         Ok((raw, digest))
     }
@@ -445,8 +439,13 @@ impl SessionStore {
         Some(rec)
     }
 
+    /// Whether the session is still stored. Ending a session revokes only that
+    /// credential: streams bound to it check this instead of the global generation.
+    pub fn contains(&self, digest: &[u8; 32]) -> bool {
+        self.inner.lock().contains_key(digest)
+    }
+
     pub fn remove(&self, digest: &[u8; 32]) -> Result<Option<SessionRecord>> {
-        let _update = self.authority.begin_update();
         self.id_tokens.lock().remove(digest);
         self.seen.lock().remove(digest);
         let mut map = self.inner.lock();
@@ -461,7 +460,6 @@ impl SessionStore {
     /// `sid` (of subject `sub` when both are given), or every session of `sub`. Returns
     /// how many ended.
     pub fn end_oidc(&self, sid: Option<&str>, sub: Option<&str>) -> Result<usize> {
-        let _update = self.authority.begin_update();
         let mut map = self.inner.lock();
         let gone: Vec<[u8; 32]> = map
             .iter()
@@ -530,20 +528,9 @@ impl SessionStore {
     }
 
     /// Drop expired and idle sessions, and write the times of last use (hourly).
+    /// Lookups already refuse these sessions, so pruning them changes no rights
+    /// and leaves the authority generation unchanged.
     pub fn prune(&self, now: i64, idle: Option<i64>) -> Result<()> {
-        let removes_session = {
-            let map = self.inner.lock();
-            let seen = self.seen.lock();
-            map.iter().any(|(key, session)| {
-                session.ends_at_with_seen(idle, seen.get(key).copied()) <= now
-            })
-        };
-        // Flushing last use alone does not change rights. Release both store
-        // mutexes before either this flush or waiting for the common updater.
-        if !removes_session {
-            return self.flush();
-        }
-        let _update = self.authority.begin_update();
         let mut map = self.inner.lock();
         let before = map.len();
         let seen = self.seen.lock().clone();
@@ -614,7 +601,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn pruning_only_last_seen_does_not_revoke_but_actual_expiry_does() {
+    fn pruning_never_moves_the_generation_and_removes_only_ended_sessions() {
         let directory = tempfile::tempdir().unwrap();
         let path = directory.path().join("sessions.json");
         let registry = Arc::new(AuthorityRegistry::default());
@@ -647,7 +634,8 @@ mod tests {
         assert!(reopened.get(&digest, 118, Some(10)).is_some());
         drop(reopened);
         sessions.prune(119, Some(10)).unwrap();
-        assert_ne!(registry.generation(), accepted);
+        assert_eq!(registry.generation(), accepted);
+        assert!(!sessions.contains(&digest));
         assert!(sessions.get(&digest, 119, Some(10)).is_none());
         let reopened = SessionStore::open(path, 119).unwrap();
         assert_eq!(reopened.active(119), 0);
@@ -671,16 +659,26 @@ mod tests {
         let (_, kept) = sessions
             .create_checked(original, Method::Password, owner(), None, 100, 200)
             .unwrap();
+        assert_eq!(
+            registry.generation(),
+            original,
+            "issuance must not invalidate other authentications"
+        );
         let before = std::fs::read(&path).unwrap();
         let next_sequence = sessions.next_seq.load(Ordering::Relaxed);
 
-        // The accepted first issuance invalidated this original generation.
+        // A real authority update invalidates the original generation.
         // At cap=1 an accidental insertion would also evict the existing session.
+        drop(registry.begin_update());
         for rejected in [original, registry.generation() + 1] {
             let error = sessions
                 .create_checked(rejected, Method::Password, owner(), None, 100, 200)
                 .unwrap_err();
-            assert!(error.downcast_ref::<SessionGenerationChanged>().is_some());
+            assert!(
+                error
+                    .downcast_ref::<super::super::store::AuthorityChanged>()
+                    .is_some()
+            );
             assert_eq!(std::fs::read(&path).unwrap(), before);
             assert_eq!(sessions.next_seq.load(Ordering::Relaxed), next_sequence);
             assert!(sessions.get(&kept, 100, None).is_some());
