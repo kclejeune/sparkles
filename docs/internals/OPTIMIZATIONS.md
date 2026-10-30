@@ -246,10 +246,13 @@ Each of these can be switched off per query (`QueryOptions::optimizations`) or p
   pattern and its FILTERs reads the pattern in `?v` order and stops once the first k rows
   are proven (`IndexTopK`). The scan switches to a permutation sorted on `?v`. Inline
   integers, decimals of one scale and doubles of one sign sort by value within their id
-  segment, and each segment is read from its best end, a few rows at a time, until the
-  k-th candidate beats the best unread value. Vocabulary literals (non-canonical numerals,
-  other numeric types, strings), IRIs and blank nodes are not in value order by id, so
-  they are read whole. Candidates are ranked by the ordinary ORDER BY in the plain scan's
+  segment. The IRIs of the base vocabulary do too, because the vocabulary is sorted by
+  key and an IRI's key is its UTF-8 bytes after a `<`, which is the code point order
+  that ORDER BY gives IRIs. Each such segment is read from its best end, a few rows at a
+  time, until the k-th candidate beats the best unread value. Vocabulary literals
+  (non-canonical numerals, other numeric types, strings), blank nodes and the terms that
+  updates added since the last rebuild are not in value order by id, so they are read
+  whole. Candidates are ranked by the ordinary ORDER BY in the plain scan's
   row order, so ties come out the same. NaN, dates and durations have no total order and
   use the plain sort. The planner picks this operator, from exact row counts per segment,
   when it reads at most half of the pattern's rows.

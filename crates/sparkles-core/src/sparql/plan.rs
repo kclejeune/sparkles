@@ -114,11 +114,12 @@ pub struct IdRange {
 /// scan is read in the order of `?v`'s values, best first, until the first `k` rows are
 /// proven.
 ///
-/// The column's ids are split into pieces. In a strictly monotone numeric piece (inline
-/// integers, inline decimals of one scale, inline doubles of one sign) id order is value
-/// order, so the piece is read from its best end in geometrically growing steps, and only
-/// its best `k` rows (with their ties) are kept. Every other piece (vocabulary and delta
-/// literals, IRIs, blank nodes, NaN, dates…) is read whole. The candidates are ranked by
+/// The column's ids are split into pieces. In a strictly monotone piece (inline integers,
+/// inline decimals of one scale, inline doubles of one sign, the IRIs of the base
+/// vocabulary) id order is value order, so the piece is read from its best end in
+/// geometrically growing steps, and only its best `k` rows (with their ties) are kept.
+/// Every other piece (vocabulary literals, delta terms, blank nodes, NaN, dates…) is read
+/// whole. The candidates are ranked by
 /// the generic ORDER BY in the generic plan's row order, so ties break identically; a
 /// piece stops once the `k`-th candidate is strictly better than any of its unread
 /// values.
@@ -4583,9 +4584,15 @@ fn push_range(n: Node, exprs: Vec<Expr>, ctx: &Ctx) -> (Node, Vec<Expr>) {
 /// Id segments of a key column in id order, covering every id, with how ids order the
 /// values within each: `Some(true)` when larger ids are larger values, `Some(false)` when
 /// they are smaller (inline negative doubles: sign and magnitude), `None` when id order
-/// says nothing about value order (vocabulary and delta terms, NaN payloads, booleans,
-/// dates, blank nodes). Within a `Some` segment distinct ids are distinct numbers.
-fn value_order_segments() -> Vec<(u64, u64, Option<bool>)> {
+/// says nothing about value order (vocabulary literals, delta terms, NaN payloads,
+/// booleans, dates, blank nodes). Within a `Some` segment distinct ids are distinct
+/// values.
+///
+/// `iris` is the inclusive id range of the base vocabulary's IRIs, when it has any. The
+/// base vocabulary is sorted by key, and an IRI's key is `<` followed by the IRI's UTF-8
+/// bytes, so these ids are in the order of the IRIs' code points, which is the order
+/// ORDER BY gives IRIs. IRIs that updates added have delta ids and stay unordered.
+fn value_order_segments(iris: Option<(u64, u64)>) -> Vec<(u64, u64, Option<bool>)> {
     use crate::id::{PAYLOAD_BITS, PAYLOAD_MASK, TAG_BITS};
     let id = |tag: Tag, payload: u64| Id::new(tag, payload).0;
     let half = 1u64 << (PAYLOAD_BITS - 1);
@@ -4607,8 +4614,17 @@ fn value_order_segments() -> Vec<(u64, u64, Option<bool>)> {
             id(Tag::Double, PAYLOAD_MASK),
             None,
         ),
-        (id(Tag::BNode, 0), id(Tag::Decimal, 0) - 1, None),
     ];
+    // blank nodes, the base vocabulary, delta and local terms
+    let (terms_lo, terms_hi) = (id(Tag::BNode, 0), id(Tag::Decimal, 0) - 1);
+    match iris {
+        Some((lo, hi)) if terms_lo < lo && lo <= hi && hi < terms_hi => {
+            out.push((terms_lo, lo - 1, None));
+            out.push((lo, hi, Some(true)));
+            out.push((hi + 1, terms_hi, None));
+        }
+        _ => out.push((terms_lo, terms_hi, None)),
+    }
     // inline decimals: 4-bit scale, then a 56-bit two's complement mantissa
     const MANTISSA: u32 = 56;
     for scale in 0..16u64 {
@@ -4726,9 +4742,11 @@ fn ordered_topk(n: Node, ctx: &Ctx) -> Node {
         key
     };
     let sel = FILTER_SELECTIVITY.powi(filter.len() as i32);
+    let (lo, hi) = ctx.snap.iri_prefix_range("");
+    let segments = value_order_segments((lo < hi).then(|| (lo.0, hi.0 - 1)));
     let (mut pieces, mut total, mut read) = (Vec::new(), 0.0, 0.0);
     for d in &domain {
-        for (lo, hi, mono) in value_order_segments() {
+        for &(lo, hi, mono) in &segments {
             let (lo, hi) = (lo.max(d.lo), hi.min(d.hi));
             if lo > hi {
                 continue;
