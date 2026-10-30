@@ -295,7 +295,11 @@ and 50,000 relations. Decoded deliveries share a 64 MiB invocation cap, retained
 files have a 16 MiB cap each and operation memory is capped at 256 MiB. The
 `--limit-entities`, `--limit-descriptions`, `--limit-claims`, `--limit-decisions`,
 `--limit-relations`, `--limit-decoded`, `--limit-source` and `--limit-memory` flags
-accept lower caps. Supply byte limits as integer byte counts. `--deadline-ms` sets a
+accept lower caps. Supply byte limits as integer byte counts. The memory accounting
+charges each delivery about seven times its size before its statements, so the memory
+cap refuses deliveries above about 36 MiB before the decoded cap applies. Replay builds
+only complete views and refuses a missing input with `incomplete-input`, so its only
+unknown code is `possible-match`. `--deadline-ms` sets a
 relative deadline, and private helpers also honor the shared cancellation control. A
 refusal emits no
 partial comparison.
@@ -306,7 +310,8 @@ The availability rule accepts canonical fixed-width UTC timestamps. The observat
 adapter supports reported positive occurrences in the declared synthetic series and
 selects its unique terminal source revision. Unsupported headers or rules refuse or
 remain explicit unknowns. The separate Cargo.lock version 4 adapter checks supplied
-family and version bindings against the existing software-inventory bytes. These
+family and version bindings against the existing software-inventory bytes, whose
+manifest digests a test recomputes. Roadmap item 407 owns the review of that corpus. These
 bindings do not establish release, build, artifact or deployment evidence. The CLI
 emits resolution comparisons, while these evolution and mapping helpers are exercised
 through the [replay tests](../../crates/sparkles/tests/shared_entity_replay.rs).
