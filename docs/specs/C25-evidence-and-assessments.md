@@ -549,8 +549,43 @@ without a known expected UUID retain the supported legacy metadata upgrade only 
 CURRENT already exists.
 
 These checks establish runtime closure only. Durable source holds and consumer release,
-managed reader admission, operational observation, privacy visibility, protected typed
-writes and C25/C26 consumer composition remain separate dependencies.
+operational observation, privacy visibility, typed writes and C25/C26 consumer
+composition remain separate dependencies.
+
+The managed-write boundary and its reader admission are available as the first Phase 2
+step. `sparkles_core::managed` defines owner kinds, a `ManagedGraphs` registry and a
+`ManagedWrite` capability that only `Store::managed_writer` makes, for a registered
+owner and the registry installed at that moment. `Store::enable_managed` raises the
+dataset reader to 6 durably, writes the owner's settings file, writes `managed.json`
+format 1 as the commit point and installs the registry. One registry belongs to the
+dataset's runtime family, so main and every branch admit against it, including branches
+created before enablement, and branch directories do not copy it. Each owner entry
+records its profile, settings digest and graphs, and a `visibility` and `merge` member
+whose defaults `public` and `refuse` are the only values this build enforces.
+
+Every commit point admits the candidate before its dry-run return. These are ordinary
+transactions, bulk loads and replacements, whose source quads the builder checks as it
+reads them, RDF Patch, merges, replays and cherry-picks, including their previews.
+`bypass_validation` does not skip admission and merges get no exemption. Each distinct
+graph of a candidate is decoded once, and a store without a registry pays one atomic
+load and a `None` check. A managed graph changes only in a transaction that carries its
+owner's capability. Such a transaction starts from the durable head, is never grouped,
+and `WriteTxn::managed_stamp` fixes its sequence number and timestamp before publication.
+A newer `managed.json`, an unknown owner or profile, a reserved member value or a
+mismatched settings digest keeps reads and refuses every write as `managed-unavailable`.
+Enabling the owner again repairs a mismatched digest. `Store::detach_managed` returns a
+graph to ordinary writes. Backups, restores and clones carry the registry. The server
+answers `profile-managed-graph` with `409` and `managed-unavailable` with `503`. In
+library mode the capability guards against mistakes, not a hostile embedder.
+
+Failing-first tests cover SPARQL Update, Graph Store writes, uploads, LOAD into an empty
+store, bulk replacement, RDF Patch, merges, squash merges, replays, cherry-picks,
+validation bypass, dry runs, branches created before enablement, foreign, stale and
+wrong-owner capabilities, unenforceable registries, the reader refusal of a reader 5
+build, crashes between each enablement step, exact stamps under group commit, and
+backup, restore and clone protection. Replay refuses at the first replayed commit that
+changes a managed graph, so the commits before it stay replayed, as with other replay
+refusals.
 
 All 14 ownership tests pass without optional features and with `text,geo`. The
 control for retained members also passes in a separate exact run. Another 131 tests
@@ -562,8 +597,8 @@ while a member outlives main.
 Roadmap item 81 retains the rest of this contract. Phase 2 adds typed source, reference
 and claim creation with authenticated availability and guarded metadata, exact retained
 reference resolution, reader admission, idempotency, review, support ownership,
-projections and reversible identity decisions. C26 supplies the shared managed-write
-and admission boundary. Phase 3 integrates the new records with C17/C18, F22 and C22.
+projections and reversible identity decisions. The shared managed-write and admission
+boundary described above is the one C26 reuses for its control graphs. Phase 3 integrates the new records with C17/C18, F22 and C22.
 The state-machine, authorization, direct-write, crash and retry acceptance cases remain
 required before those runtime phases are complete.
 

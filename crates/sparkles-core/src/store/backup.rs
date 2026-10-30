@@ -212,7 +212,9 @@ pub struct BackupCapture {
     /// every file of the backup, in a stable order: the generation's files, then
     /// `commits.bin`, then the meta files (`CURRENT`, `dataset.json`, `prefixes.json`,
     /// and when present `annotations.bin`, `text.json`, `origin.json`, `validation.json`,
-    /// `validation-shapes.ttl`, `validation-schema.shex`, `validation-schema.json`).
+    /// `validation-shapes.ttl`, `validation-schema.shex`, `validation-schema.json`, and
+    /// the dataset's managed-graph registry, `managed.json` with its owners' settings,
+    /// whose `dataset.json` then needs reader 6).
     /// `reasoning.json` is the caller's to add (the server
     /// holds the current status and applies the "not after `s`" rule).
     pub files: Vec<CapturedFile>,

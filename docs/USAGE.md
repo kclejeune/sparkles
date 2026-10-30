@@ -6910,7 +6910,9 @@ opens it for writing, it records itself in `writtenBy` and raises `minimumReader
 because the generations it writes from then on start their logs with a header. From
 then on, releases that read only up to reader 4 refuse it. To go back to such a
 release, dump the database with `sparkles dump` and load the dump with the older
-release. [Upgrading databases](#upgrading-databases) describes the version window and
+release. A dataset whose graphs a profile manages through `managed.json` needs
+reader 6, so a release that cannot enforce that protection refuses it.
+[Upgrading databases](#upgrading-databases) describes the version window and
 `sparkles migrate`.
 
 ### Backing up the container's data

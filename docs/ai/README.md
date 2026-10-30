@@ -240,6 +240,23 @@ Evidence links distinguish support, contradiction and mention. Declared lineage 
 separate from an assessment of independence. Qualified confidence retains its evaluator
 and scale. Domain scope remains application RDF.
 
+Rust applications can hand named graphs to a profile owner with
+`Store::enable_managed`. A managed graph then refuses SPARQL Update, Graph Store
+writes, LOAD, RDF Patch, merges, replays and cherry-picks with
+`profile-managed-graph`, which the server answers with `409`. Dry runs report the
+same refusal, and skipping write-time validation does not skip it. The registry is
+recorded in `managed.json`, which needs dataset reader 6, and it covers main and every
+branch, including branches created before it. Backups and clones carry it. A registry
+that this build cannot enforce, such as a newer `managed.json` or an owner settings
+file whose digest does not match, keeps reads and refuses every write with
+`managed-unavailable` and `503`. `Store::detach_managed` returns one graph to
+ordinary writes. Only a transaction that carries the owner's `ManagedWrite` capability
+can change the owner's graphs. Its commit is published alone, and
+`WriteTxn::managed_stamp` gives its exact sequence number and time in advance. In
+library mode the capability guards against mistakes, not against code in the same
+process. No typed evidence operation uses it so far, so profile records remain
+ordinary RDF until one is enabled.
+
 These resources are ordinary caller-visible data under the existing access policy.
 Their shapes check structure, while the fixtures independently check source bytes and
 selectors. Loading a review decision or receipt does not authenticate it, admit facts
